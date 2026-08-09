@@ -31,6 +31,8 @@ from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
                             create_mesh_xy, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
+from .bse_serial import compute_pair_amplitude
+from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      make_w_densifier, pad_zone_mask_np)
@@ -136,42 +138,71 @@ def build_preconditioner_diagonal_sharded(
     include_W: bool = True,
     use_tda: bool = True,
 ) -> jax.Array:
-    eps_c = data["eps_c"]
-    eps_v = data["eps_v"]
+    """``diag(H_BSE)`` for the shifted GMRES preconditioner, from the payload.
+
+    THIS IS AN ADAPTER, NOT A SECOND IMPLEMENTATION.  It used to be one: eight
+    un-jitted einsums that assembled the same object as
+    :func:`bse_davidson_helpers.build_bse_exact_diagonal`, arrived independently
+    at the same ``+1/nk`` exchange / ``−1/nk`` direct normalisation, and paid
+    eight separate program constructions to do it (PRECOND_BUILD_FREE.md §7.1).
+    Measured against the canonical builder on the Si 4x4x4 record deck at P=4
+    BEFORE the two were merged, the real parts agreed to
+    ``max|Δ| = 1.11e-16 Ry = 1.5e-15 eV`` on a 0.62 Ry signal — floating-point
+    associativity, the same 1.5e-15 eV the canonical builder already scores
+    against the dense operator — so neither was wrong and there was nothing to
+    choose between them (FIX_construction_defects.md §2).
+
+    What the adapter keeps of FEAST's version, deliberately:
+
+    * **the complex diagonal.**  FEAST divides by ``z − diag`` at a complex
+      quadrature node, so it wants the operator's antihermitian residue
+      (``max|Im| = 1.13e-14 Ry`` here); Davidson takes ``real()``.  Carried by
+      ``complex_out=True``, not decided here;
+    * **the non-TDA stack** ``[diag, −diag]``, which is this route's shape and
+      has no Davidson counterpart;
+    * **``include_W=False``**, the RPA density-response route, which now drops
+      the direct contraction at trace time instead of adding a zero tile.
+
+    What it stops doing: rebuilding ``M_X`` / ``M_Y`` from ``psi`` locally.
+    Audit P3 hoisted those onto the payload precisely so nothing would, and
+    ``build_finite_q_data`` maintains them per q; the two forms are the same
+    ``compute_pair_amplitude`` call, which is why the agreement above is at
+    round-off.
+    """
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
 
-    psi_c_X = data["psi_c_X"]
-    psi_v_X = data["psi_v_X"]
-    psi_c_Y = data["psi_c_Y"]
-    psi_v_Y = data["psi_v_Y"]
+    # Hoisted pair amplitudes (audit P3).  The fallback is for payloads
+    # assembled outside the loader; it is the same contraction the loader runs.
+    M_X = data.get("M_X")
+    M_Y = data.get("M_Y")
+    if M_X is None or M_Y is None:
+        M_X = compute_pair_amplitude(data["psi_c_X"], data["psi_v_X"])
+        M_Y = compute_pair_amplitude(data["psi_c_Y"], data["psi_v_Y"])
 
-    M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_X)
-    M_Y = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_Y), psi_v_Y)
-
-    V_q0 = data["V_q0"]
-    # Diagonal of K^x = M V M†: conjugated vertex on the forward (encode) leg,
-    # bare vertex on the back-contract.  Not a no-op even on the diagonal — the
-    # two orders differ by 4·xᵀ Im(V) y whenever V_q0 carries an imaginary part.
-    S_v = jnp.einsum("MN,kcvN->kcvM", V_q0, jnp.conj(M_Y))
-    V_diag_kcv = jnp.einsum("kcvM,kcvM->kcv", M_X, S_v) / nk
-
+    W_q0 = None
     if include_W:
-        W_q0 = data["W_q"][:, :, 0, 0, 0]
-        rho_c = jnp.einsum("kcsm,kcsm->kcm", jnp.conj(psi_c_X), psi_c_X)
-        rho_v = jnp.einsum("kvsm,kvsm->kvm", jnp.conj(psi_v_Y), psi_v_Y)
-        S_w = jnp.einsum("MN,kvN->kvM", W_q0, rho_v)
-        W_diag_kcv = jnp.einsum("kcm,kvm->kcv", rho_c, S_w) / nk
-    else:
-        W_diag_kcv = jnp.zeros_like(V_diag_kcv)
+        # Prefer the slice the driver stashes before its donated ifft consumes
+        # W_q; fall back to slicing W_q here for payloads that never went
+        # through that path.  Deriving it from W_R instead would make the answer
+        # depend on the ifft's norm convention.
+        W_q0 = data.get("_W_q0_for_precond")
+        if W_q0 is None:
+            W_q = data.get("W_q")
+            if W_q is None:
+                raise ValueError(
+                    "build_preconditioner_diagonal_sharded(include_W=True) needs "
+                    "the q=0 slice of W_q, but this payload has neither "
+                    "'_W_q0_for_precond' nor 'W_q'.  Reload the payload.")
+            W_q0 = W_q[:, :, 0, 0, 0]
 
-    V_diag = V_diag_kcv.transpose(1, 2, 0)
-    W_diag = W_diag_kcv.transpose(1, 2, 0)
-    delta_E = energy_diff_cv_k(eps_c, eps_v)
-
-    diag_h = delta_E + V_diag - W_diag
+    tda_sharding = NamedSharding(mesh_xy, P("x", "y", None))
+    diag_h = build_bse_exact_diagonal(
+        data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
+        W_q0, M_X, M_Y, data["V_q0"], nk,
+        sharding=tda_sharding, complex_out=True, memo=False,
+    )
     if use_tda:
-        diag_sharding = NamedSharding(mesh_xy, P("x", "y", None))
-        return jax.lax.with_sharding_constraint(diag_h, diag_sharding)
+        return diag_h
 
     diag_full = jnp.stack([diag_h, -diag_h], axis=0)[:, None, ...]
     diag_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))

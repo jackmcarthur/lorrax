@@ -13,6 +13,71 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — `K^d_B` UNDER ζ SHARDING: REGISTERED AND STRUCK (2026-08-08)
+
+**`tests/test_bse_coupling_zeta_sharding.py` is registered here and struck in
+the same commit.**  Registering a defect nobody had ever seen fail needs a
+word of explanation: the non-TDA coupling block's screened-direct term
+`K^d_B` was **wrong at every P > 1** and had been since it was written, and it
+was not on this list because **no test in the tree applied the coupling block
+on a mesh with more than one device**.  The existing non-TDA gates all run on
+the 1×1 mesh `lx test`'s conftest pins, which is exactly the one configuration
+where the defect is invisible.  A row that only appears once someone writes
+the missing check is still a row: it is registered with its measured red, and
+struck with the fix, so the census carries the fingerprint rather than losing
+it to a green file.
+
+| | |
+|---|---|
+| machine | Perlmutter, lx pool (JID 56522011), 4×A100, Shifter, `lx test` |
+| module | `LX_BASE_MODULE=lorrax_J070`, jax 0.7.0 |
+| tree | `/pscratch/sd/j/jackm/kdb_0808/wt`, branch `fix/kdb-zeta-sharding-2026-08-08` off `main` @ `28ff477f` |
+| files | `src/bse/bse_ring_comm.py` (the coupling encode), `tests/test_bse_coupling_zeta_sharding.py` (new) |
+| prose record | `~/lorrax_bse_perf_2026-08-08/FIX_kdb_sharding.md` |
+
+**THE DEFECT — a ζ shard carried away by a `ppermute`, not a conjugation.**
+The coupling encode carries Henneke's `j_c ↔ j_v` swap, so the ζ index it
+builds from the conduction axis (sharded on `'x'`) is `ν` (sharded on `'y'`)
+and the one it builds from the valence axis (on `'y'`) is `μ` (on `'x'`) — the
+pairing is CROSSED relative to the resonant block's, where the ζ index a stage
+produces lands on the same mesh axis as the orbital axis it consumed.  The
+shipped chain therefore ring-rotated a partially-contracted intermediate along
+`'y'`, the very axis its `ν` shard lived on.  A `ppermute` moves **every** axis
+of the buffer it is handed, so each `'y'` rank accumulated its neighbours' ζ
+tiles against its own ζ shard.  At P=1 a `ppermute` is the identity, so the
+term was bit-exact there and nowhere else.
+
+**MEASURED, on the record deck (Si 4×4×4 SOC, `nontda/deck_clean`, N=1024),
+same payload, same process, 1×1 vs 2×2:**
+
+| quantity | pre-fix | post-fix |
+|---|---:|---:|
+| `K^d_B` ‖P1−P4‖/‖P1‖ | **5.525e-01** | **1.749e-15** |
+| `K^d_B` ‖K−Kᵀ‖/‖K‖ at 2×2 | **6.911e-01** | **2.864e-11** (= its P=1 value) |
+| coupling correction, state 1 | **−0.223277 meV** | **−0.697956 meV** |
+| max\|Im λ\| of the 2048-dim operator | 2.647e-06 Ry | 1.025e-13 Ry |
+| `A` (resonant), `K^x_B` (coupling exchange) | clean | **bit-identical to pre-fix** |
+
+The physics cost was two thirds of the coupling correction, lost silently, on
+exactly the configuration multi-process non-TDA exists to run.
+
+**THE FALSE CASE SHIPS WITH THE CHECK.**  `test_the_pre_fix_coupling_encode_is_caught`
+monkeypatches the 2026-08-08 chain back in and requires both gates to fire —
+cross-mesh `‖P1−P4‖/‖P1‖` ≥ 1e-3 and `‖K−Kᵀ‖/‖K‖` ≥ 1e-3 — **and** requires
+the twin to leave `A` and `K^x_B` bit-clean, so the red proves the gate is
+pointed at the coupling screened-direct term and not at the mesh in general.
+The gate is portable: synthetic payload, CPU host devices, no GPU, no restart
+file, no deck.
+
+**Struck on:** the new file green (6 passed) with its red twin red; the deck
+detector green at 2×2 on both encode routes (`low_mem` ring and `all_gather`);
+P=1 **bit-identical** to pre-fix on all four blocks (`0.000e+00`, exact array
+equality), which is the acceptance that says the fix touched only the P>1
+path; and the coupling correction at 2×2 reproducing the P=1 value to
+**0.0000 µeV** over all twenty states.
+
+---
+
 # AMENDMENT — `wq_resolvent` DIAGNOSED AND STRUCK (2026-08-08)
 
 **`test_bse_w0_resolvent::test_wq_resolvent_matches_restart_finite_q` is STRUCK
@@ -2680,3 +2745,78 @@ clause (iii) is what makes the gap harmless rather than silent: an entry ships
 sparse only if it uses strictly fewer nodes than the two composite rules it
 replaces, and `composite_node_count` is recorded on every entry so the
 comparison is a shipped number.
+---
+
+## Amendment — the BSE night's second consolidation checkpoint (2026-08-08)
+
+Written by the consolidation-2 worker. Four branches merged onto `ff8631fd`,
+two in-consolidation commits, one full census. `main` at **`581dc3cc`**.
+
+### The census
+
+`lx test --wait=1800` with no paths (⇒ `testpaths = ["tests", "services"]`,
+default xdist geometry — the same geometry the previous three checkpoints
+used), on Perlmutter, JID 56522011, Shifter, `LX_BASE_MODULE=lorrax_J070`,
+jax `0.7.0.dev20260808`, `LORRAX_FFTW3_SO` pinned, `LORRAX_CHECKOUT` verified
+in every leg's `[lx] source tree:` line.
+
+```
+21 failed, 2547 passed, 132 skipped, 1 xfailed in 543.37s   (head 581dc3cc)
+```
+
+**Zero unlisted reds.** All 21 are named in this document at the base tip
+`ff8631fd`. The accounting was cross-checked per `<testcase>` element rather
+than from the summary line — 21 `<failure>`, 0 `<error>`, 133 `<skipped>` out
+of 2701 testcases, and the per-cell list length equals the counters. (The
+previous amendment's WSL census mis-booked red cells into a collection bucket;
+counting from the per-cell list is what makes that visible.)
+
+The red set is SMALLER than the previous checkpoint's 27 by the nine
+`symmetry_maps` import-isolation cells, which `fef002e9` closed, and the
+`wq_resolvent` cell, which `28ff477f` closed. It is LARGER by the four MPA /
+minimax rows this document already carries as open (cells 1–4). Nothing in
+this landing is attributed to either direction.
+
+### The one red this consolidation created, and closed
+
+`tests/test_fft_shardmap_context::test_no_eager_local_fft_outside_shardmap_context`
+was red on the merge head `2a62e75e` and green on `581dc3cc`. It is a FALSE
+POSITIVE of that gate's lexical proxy, not a scaling regression: the non-TDA
+port factored the stack matvec's shared conv+decode out of
+`build_bse_stack_matvec._w_stack._body` into module-level `_conv_decode`, which
+is still called only from inside `shard_map` bodies. Recorded as a ratchet
+entry with its reason and with the durable fix named (teach the scanner the
+call graph, then delete the entry). It never appeared on
+`feat/sdy-nontda-solver-2026-08-08` because that branch's subset did not
+include this gate — the red belongs to that branch, not to the merge.
+
+### The K^d_B fix reached one of its two consumers, and now reaches both
+
+`fix/kdb-zeta-sharding-2026-08-08` repaired the coupling encode in
+`bse_ring_comm.py`. The SDY matrix-free route does not consume it: that lane
+had PORTED the same encode into `bse_stack_matvec.py`, defect included. On the
+merge head the two paths therefore disagreed at 2×2 by 47 % on the B block, the
+SDY ladder's own cross-path gate (rung a) FAILED, and the driver route still
+refused at `metric_sym_err = 9.834e-04` — SDY_SOLVER.md §7's pre-fix number,
+unmoved. Commit `3a8223e4` transplants the kdb lane's fix. After it, at 2×2:
+rung (a) B block `6.820e-15` PASS, `metric_sym_err` `1.968e-13` (its P=1 value
+is `1.970e-13`), the dense-exactness gate `0.0000 µeV`, and the coupling
+correction `−0.6980 meV` against the dense route's `−0.6980 meV`. P=1 is
+bit-identical across the port on all four blocks.
+
+**SDY_SOLVER.md §7's prediction is now satisfied**: the sharded-mesh refusal
+has gone quiet, and it went quiet because the operator was fixed, not because
+the check was relaxed. The detector is untouched — `src/bse/bse_nontda.py` and
+`src/solvers/bse_sp_lanczos.py` are byte-identical to the SDY branch tip — and
+its red twin still fires: reverting `_encode_T_B` to the pre-port form through
+the real driver at 2×2 returns `9.834e-04` and refuses.
+
+### Where the evidence lives
+
+Perlmutter, `/pscratch/sd/j/jackm/bse_consol2_0808/`: `_reports/` carries both
+census junitxmls (`census_2a62e75e.xml`, `census2_581dc3cc.xml`), the
+accounting/set-diff script (`setdiff.py`), the census delta (`delta.py`) and
+the pre-/post-port block dumps (`stk_{preport,postport,redtwin}_*.npy`);
+`work/_logs/` carries the deck legs (`c2_p1.log`, `c2_p4.log`,
+`c2_p1_post.log`, `c2_p4_post.log`, `rc_p4.log`, `rc_p4_post.log`,
+`rc_p4_redtwin.log`). WSL: `~/lorrax_bse_perf_2026-08-08/CONSOLIDATION2_REPORT.md`.

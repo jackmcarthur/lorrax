@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import replicate_to_mesh
-from common.fft_helpers import make_sharded_ifftn_3d
+from common.fft_helpers import get_donated_ifftn_3d
 
 from solvers.lanczos import (
     FULL_REORTH,
@@ -248,23 +248,12 @@ def solve_bse_sharded(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
         )
 
-    # W_R = ifft_q(W_q) computed ONCE inside the outer jit. Use the
-    # gw_jax custom-partitioned IFFT helper — plain ``jnp.fft.ifftn`` on
-    # a sharded tensor inserts a 337-MiB all-gather around the FFT under
-    # current JAX even when the FFT axes are unsharded; the helper hides
-    # the FFT in an opaque primitive so XLA only sees a per-device local
-    # FFT (axes (2,3,4) of W_q are replicated; (μ,ν) stay on x,y).
-    if include_W:
-        # 3D cuFFT in one shot rather than 3 sequential 1D custom_partitioning
-        # calls (the older ``make_jittable_local_ifftn_3d``).  Same correctness
-        # constraint (FFT axes replicated); ~5–10× fewer transposes in the
-        # generated HLO.
-        _W_local_ifftn = make_sharded_ifftn_3d(
-            mesh_xy, sh.W.spec, sh.W.spec, axes=(2, 3, 4), norm='ortho')
-    else:
-        _W_local_ifftn = None
-
     # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
+    # Why the sharded helper and not ``jnp.fft.ifftn``: a plain ifftn on a
+    # sharded tensor inserts a 337-MiB all-gather around the FFT under current
+    # JAX even when the transformed axes are unsharded.  The helper hides the
+    # transform in an opaque per-device primitive, so XLA only ever sees a local
+    # FFT (axes (2,3,4) of W_q are replicated; μ, ν stay on x, y).
     # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
     # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
     # owned by the caller for the whole call and XLA has no same-shape OUTPUT
@@ -276,18 +265,62 @@ def solve_bse_sharded(
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
+
+    # ``auto`` is resolved to one of the two real routes HERE, before anything
+    # else reads the flag, so every later branch sees only "bare" or "exact".
+    if davidson_precond == "auto":
+        from .bse_davidson_helpers import resolve_precond_route
+        _resolved = resolve_precond_route("auto", n_flat)
+        print(f"Davidson preconditioner: auto -> {_resolved} "
+              f"(bse_dim={n_flat})", flush=True)
+        davidson_precond = _resolved
+
     # The q=0 slice of W_q, kept for the exact-diagonal preconditioner.  It
     # must be taken HERE, before the donated ifft below consumes W_q: deriving
     # it from W_R instead would make the answer depend on that ifft's norm
     # convention, and it is a (mu, nu) slice of a (mu, nu, 4, 4, 4) tensor, so
     # keeping it costs 1/64 of one W_q.
-    _W_q0 = data["W_q"][:, :, 0, 0, 0] if (
-        include_W and solver_kind == "davidson"
-        and davidson_precond == "exact") else None
+    # STASHED ON THE PAYLOAD, not held in a local.  Two reasons, both
+    # measured on this branch (PRECOND_BUILD_FREE.md):
+    #  * the donated ifft below sets ``data["W_q"] = None``, so a SECOND
+    #    eigensolve over the same payload used to raise here — ``None`` is not
+    #    subscriptable.  The exact route was single-shot per payload;
+    #  * the exact-diagonal build memoises on operand IDENTITY, so a fresh
+    #    slice object every call would miss every time.  One stashed slice
+    #    makes the second and later builds free.
+    # It costs 1/64 of one W_q and is dropped with the payload.
+    _need_W_q0 = (include_W and solver_kind == "davidson"
+                  and davidson_precond == "exact")
+    if _need_W_q0 and data.get("_W_q0_for_precond") is None:
+        if data.get("W_q") is None:
+            raise ValueError(
+                "--davidson-precond exact needs the q=0 slice of W_q, but "
+                "this payload's W_q has already been consumed by the donated "
+                "ifft and no slice was stashed.  Reload the payload.")
+        data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
+    _W_q0 = data.get("_W_q0_for_precond") if _need_W_q0 else None
 
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
-            _W_ifft_donated = jax.jit(_W_local_ifftn, donate_argnums=(0,))
+            # 3-D cuFFT in one shot rather than three sequential rank-1
+            # custom_partitioning calls (the older ``make_jittable_local_ifftn_3d``).
+            # Same correctness constraint (the transformed axes are replicated);
+            # ~5-10x fewer transposes in the generated HLO.
+            #
+            # The transform and its donating jit come from the MEMOISED accessor,
+            # not from a fresh ``make_sharded_ifftn_3d`` + ``jax.jit`` pair built
+            # here.  Built here, the wrapper object was new on every call, so jax's
+            # dispatch cache started empty and a byte-identical program was
+            # re-traced, re-lowered and re-probed against the persistent compile
+            # cache every time this function ran — ~20-23 ms against ~1.0 ms of
+            # execution on the record deck at P=4, and flat across calls, which is
+            # the construction signature (FIX_construction_defects.md §1; the same
+            # defect PRECOND_BUILD_FREE.md §3.1 fixed for the exact-diagonal build
+            # and named at §7.2).  Donation is unchanged: the accessor sets
+            # ``donate_argnums=(0,)`` and the alias is gated in
+            # tests/test_bse_w_ifft_hoist.py.
+            _W_ifft_donated = get_donated_ifftn_3d(
+                mesh_xy, sh.W.spec, axes=(2, 3, 4), norm='ortho')
             W_R = _W_ifft_donated(data["W_q"])
             data["W_q"] = None          # release the caller-side reference
             _sec_wifft.watch(W_R)
@@ -332,13 +365,18 @@ def solve_bse_sharded(
                     "include_W=False, so diag(H) is just dE and the bare "
                     "route is already exact.")
             from .bse_davidson_helpers import build_bse_exact_diagonal
+            from .bse_davidson_helpers import exact_diagonal_memo_stats
+            _memo_before = exact_diagonal_memo_stats()["hits"]
             with timing.section("bse.solve.exact_diag"):
                 _diag_H = build_bse_exact_diagonal(
                     eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M_X, M_Y, V_q0,
                     nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
                 _diag_H.block_until_ready()
+            _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
             print(f"Davidson preconditioner: EXACT diag(H) "
-                  f"(dE + (V_x - W_d)/nk), assembled once", flush=True)
+                  f"(dE + (V_x - W_d)/nk), "
+                  f"{'from memo (same payload)' if _memoised else 'assembled'}",
+                  flush=True)
         else:
             print("Davidson preconditioner: bare dE", flush=True)
         if davidson_olsen:

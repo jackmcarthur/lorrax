@@ -425,8 +425,119 @@ def solve_nontda_product(A, B, n_eig):
     return omega[order], Z[:, order]
 
 
+# ---------------------------------------------------------------------------
+# The matrix-free route — SDY Algorithm 4 over the fused pair applier
+# ---------------------------------------------------------------------------
+# The dense route above costs 2N half-applications and O(N^2) memory, with
+# ``_DENSE_N_MAX = 4096`` a hard wall.  The matrix-free route costs a number of
+# applications set by the SPECTRUM rather than by N, and O(k N) memory.  On the
+# record deck (N = 1024) that is a ~2x win; at N = 1e5 the dense route does not
+# exist at all, so this is the difference between having a non-TDA capability at
+# production grid and not having one.
+#
+# It is OPT-IN and it stays opt-in until the guard below stops firing.  See
+# ``SDY_SOLVER.md``: the coupling block's screened-direct term ``K^d_B`` is
+# currently WRONG when the ζ axis is sharded (measured: bit-consistent at
+# px·py = 1, 55% different and 69% non-symmetric at 2x2, while the resonant
+# block A and the coupling EXCHANGE term are bit-consistent at both).  A
+# matrix-free non-TDA solve exists to run at scale, i.e. sharded, so shipping it
+# on by default would ship a wrong number on exactly the configuration it is
+# for.  The refusal is not a workaround for that defect -- it is the detector
+# for it, and it will go quiet by itself the day the defect is fixed.
+_MF_METRIC_TOL = 1e-8
+
+
+def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
+                              m_max=140, n_keep=40, n_restarts=3,
+                              metric_tol=_MF_METRIC_TOL, log=None):
+    """Lowest ``n_eig`` (omega, X, Y) with no dense assembly.
+
+    Returns ``(omega_Ry, Z (2N, n_eig))`` in the same convention
+    ``solve_nontda_definite_pencil`` returns, so the caller cannot tell the two
+    apart from their outputs -- which is the point of the gate that compares
+    them.
+    """
+    from functools import partial
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from .bse_stack_matvec import build_bse_stack_pair_matvec
+    from solvers.bse_sp_lanczos import (sdy_lanczos_eig, sdy_pair_applications,
+                                        sdy_steps)
+
+    nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
+    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz)
+    rep = NamedSharding(mesh_xy, P())
+    UV_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+    in_sh = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps,
+             sh.W, sh.V, sh.psi_x, sh.psi_y)
+    _l = log if log is not None else (lambda *_a, **_k: None)
+
+    @partial(jax.jit, in_shardings=in_sh)
+    def _go(*T):
+        sp = jnp.asarray(1.0)
+        sm = jnp.asarray(-1.0)
+        om, X, Y, dg = sdy_lanczos_eig(
+            lambda Z: pair(Z, sp, *T), lambda Z: pair(Z, sm, *T),
+            (nc, nv, nk), n_eig=n_eig, m_max=m_max, n_keep=n_keep,
+            n_restarts=n_restarts, sharding=UV_sh, announce=_l)
+        return (jax.lax.with_sharding_constraint(om, rep),
+                jax.lax.with_sharding_constraint(X, rep),
+                jax.lax.with_sharding_constraint(Y, rep),
+                {k: jax.lax.with_sharding_constraint(v, rep)
+                 for k, v in dg.items()})
+
+    with mesh_xy:
+        omega, X, Y, dg = _go(*args)
+    omega = np.asarray(jax.device_get(omega))
+    X = np.asarray(jax.device_get(X)).reshape(n_eig, -1)
+    Y = np.asarray(jax.device_get(Y)).reshape(n_eig, -1)
+    dg = {k: np.asarray(jax.device_get(v)) for k, v in dg.items()}
+
+    _l(f"  [nontda] matrix-free: {sdy_steps(m_max, n_keep, n_restarts)} SDY "
+       f"steps, {sdy_pair_applications(m_max, n_keep, n_restarts)} fused pair "
+       f"applications (m_max={m_max} n_keep={n_keep} "
+       f"n_restarts={n_restarts})")
+    _l(f"  [nontda] matrix-free invariants: metric_sym {float(dg['metric_sym_err']):.3e} "
+       f"orth {float(dg['orth_err']):.3e} im_uu {float(dg['im_uu']):.3e} "
+       f"im_vv {float(dg['im_vv']):.3e} drift {float(dg['imag_drift']):.3e}")
+
+    # --- the guards, in the order the derivation puts them ------------------
+    # (1) definiteness.  Re(x^H F(x)) <= 0 is a CERTIFICATE that K is not
+    #     positive definite: triplet/charge instability, imaginary excitation
+    #     energies.  Refuse, do not clamp -- the same reading and the same
+    #     refusal the dense pencil route already gives.
+    if float(dg["kappa_start"]) <= 0 or float(dg["beta_sq_min"]) <= 0:
+        raise ValueError(
+            f"non-TDA matrix-free: the kappa metric is not positive definite "
+            f"(kappa_start {float(dg['kappa_start']):.3e}, beta^2 min "
+            f"{float(dg['beta_sq_min']):.3e}).  K = [[A,B],[B*,A*]] is not "
+            "positive definite: triplet/charge instability, so BSE excitation "
+            "energies are imaginary.  This is physical — fix the "
+            "screening/window; not hidden.")
+    # (2) operator integrity.  The method needs A Hermitian AND B complex
+    #     SYMMETRIC, which together are exactly the statement that the kappa
+    #     metric Re(x^H F(x')) is symmetric.  One number covers both, and it is
+    #     measured on the operator the solve actually ran, for the price of one
+    #     pair application.
+    if float(dg["metric_sym_err"]) > metric_tol:
+        raise ValueError(
+            f"non-TDA matrix-free: the kappa metric is asymmetric at "
+            f"{float(dg['metric_sym_err']):.3e} (tol {metric_tol:g}).  The "
+            "method requires A = A^H and B = B^T; the metric's symmetry is "
+            "exactly that pair of conditions, so this number is the operator's "
+            "integrity, not the solver's convergence.  KNOWN CAUSE: the "
+            "coupling block's screened-direct term K^d_B is wrong when the "
+            "zeta axis is sharded (px*py > 1) — see SDY_SOLVER.md.  Re-run at "
+            "px = py = 1, or use the dense route, until that is fixed.")
+
+    Z = np.concatenate([X.T, Y.T], axis=0)          # (2N, n_eig)
+    order = np.argsort(omega)
+    return omega[order], Z[:, order]
+
+
 def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
-                             recip_tol=_NONTDA_RECIP_TOL, **_ignored):
+                             recip_tol=_NONTDA_RECIP_TOL, solver="dense",
+                             mf_m_max=140, mf_n_keep=40, mf_n_restarts=3,
+                             **_ignored):
     """Non-TDA (full BSE) lowest-eigenvalue solve — one entry, dispatched on B.
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
@@ -435,7 +546,26 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
 
     ``recip_tol`` is the restart preflight's threshold on
     ``max|W(q) - conj(W(-q))| / max|W|`` (:func:`check_restart_reciprocity`);
-    ``None`` measures without refusing."""
+    ``None`` measures without refusing.
+
+    ``solver`` selects the route:
+
+    ``'dense'`` (default)
+        Assemble ``A`` and ``B`` and diagonalise on the host.  ``O(N^2)``
+        memory, ``2N`` half-applications, hard-walled at
+        ``_DENSE_N_MAX``.  This is the ORACLE and it is not going away: it is
+        what the matrix-free route is gated against, and it is the only route
+        that returns the complete spectrum or individual matrix elements.
+
+    ``'matrixfree'``
+        SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
+        applier.  Cost set by the spectrum, not by ``N``; ``O(k N)`` memory.
+        OPT-IN, and it refuses on a sharded mesh today — see
+        ``_solve_nontda_matrix_free`` for why and for when that stops."""
+    if solver not in ("dense", "matrixfree"):
+        raise ValueError(
+            f"solve_bse_nontda_sharded: solver must be 'dense' or "
+            f"'matrixfree', got {solver!r}")
     sh = make_bse_shardings(mesh_xy)
     _log0 = print if jax.process_index() == 0 else (lambda *_a, **_k: None)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
@@ -449,6 +579,15 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
                                   input_file=data.get("input_file"))
     matvec, args, halves = _full_matvec_and_args(
         data, mesh_xy, sh, include_W=include_W, with_halves=True)
+    N = nc * nv * nk
+    if solver == "matrixfree":
+        omega, Z = _solve_nontda_matrix_free(
+            data, mesh_xy, sh, args, nc, nv, nk, n_eig,
+            m_max=mf_m_max, n_keep=mf_n_keep, n_restarts=mf_n_restarts,
+            log=_log0)
+        evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
+                          Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
+        return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
     with mesh_xy:
         A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
                                 mesh_xy=mesh_xy, log=_log0, halves=halves)
@@ -457,7 +596,6 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA
     else:
         omega, Z = solve_nontda_definite_pencil(A, B, n_eig)   # optical spinor
-    N = nc * nv * nk
     evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                       Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
     return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
