@@ -542,8 +542,17 @@ def wfn_fingerprint(wfn) -> str:
 
 
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
-                             nb_written, bispinor, skip_vnl, vnl_mode) -> None:
-    """Record what this ``dipole.h5`` was built from."""
+                             nb_written, bispinor, skip_vnl, vnl_mode,
+                             soc=None) -> None:
+    """Record what this ``dipole.h5`` was built from.
+
+    ``soc`` is the RESOLVED j-resolved/j-averaged mode, not the request:
+    a file built with no deck key and a file built with ``soc = true``
+    carry the same operator and must be indistinguishable here, while a
+    file built with ``soc = false`` carries a different one and must not
+    be mistaken for either.  ``None`` means the field was not recorded,
+    which is what every dipole.h5 written before the key existed says.
+    """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     h5.attrs["prov_wfn_file"] = str(wfn_path)
     h5.attrs["prov_nval"] = int(nval)
@@ -553,6 +562,8 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_bispinor"] = bool(bispinor)
     h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+    if soc is not None:
+        h5.attrs["prov_soc"] = bool(soc)
 
 
 def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
@@ -764,12 +775,32 @@ def main(argv=None):
 	gtab = padded_gvectors(wfn, k="full_bz")
 
 	# Build unified VNL setup once; radial tables and custom JAX JVPs stay centralized here.
+	#
+	# ``soc`` IS PLUMBED THROUGH, and it has to be.  ``resolve_soc_mode``
+	# ranks a caller-supplied ``soc=`` above every other signal precisely
+	# because nothing in a BerkeleyGW ``WFN.h5`` records ``lspinorb`` --
+	# ``mf_header`` carries ``nspinor`` and nothing else -- and this
+	# entry point reads a BGW file.  With no deck key the resolver has no
+	# authoritative signal at all and falls to its announced j-RESOLVED
+	# default, which is the wrong operator for the common case of a QE run
+	# with ``noncolin = .true., lspinorb = .false.``: QE then ran
+	# ``average_pp`` and the wavefunctions carry no spin-orbit, while a
+	# j-resolved V_NL splits degeneracies they do not have.  MEASURED on
+	# the si_bigcond_prep mean field, whose ``silicon.xml`` says
+	# ``<spinorbit>false</spinorbit>``: the pseudopotential's own
+	# ``max |D(l, j=l+1/2) - D(l, j=l-1/2)|`` is 0.148261 Ry = 2.017 eV,
+	# so this is not a rounding-scale choice.  Deck key ``soc``; omit it
+	# and the banner still fires, which is the pre-existing behaviour.
+	soc_param = params.get("soc", None)
+	if soc_param is not None and not isinstance(soc_param, bool):
+		soc_param = str(soc_param).strip().lower() in ("1", "true", "yes", "on")
 	vnl_setup = vnl_ops.build_vnl_setup(
 		wfn,
 		sym,
 		meta,
 		pseudos,
 		nspinor=int(wfn.nspinor),
+		soc=soc_param,
 	)
 
 	nk = int(sym.nk_tot)
@@ -1072,7 +1103,8 @@ def main(argv=None):
 		stamp_dipole_provenance(
 			h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
 			nband=nband, nb_written=nb, bispinor=bispinor,
-			skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode))
+			skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
+			soc=(None if vnl_setup is None else bool(vnl_setup.soc)))
 		if rho_cvkq is not None:
 			fq = h5.create_group('finite_q')
 			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)
