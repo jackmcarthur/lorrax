@@ -82,8 +82,48 @@ class RestartQStorage:
     capture: object | None = None
 
     def with_capture(self, capture) -> "RestartQStorage":
-        """This decision, bound to the pre-unfold block it describes."""
-        return dataclasses.replace(self, capture=capture)
+        """This decision, bound to the pre-unfold block it describes.
+
+        AND DEMOTED TO ``full`` WHEN THE CAPTURED WEDGE IS THE WHOLE BZ.
+        This is where the owner's ruling of 2026-08-08 ~13:20 becomes
+        arithmetic instead of a flag: "if symmetries are not to be used, the
+        wavefunction file should've been generated with no symmetries."
+
+        A WFN with ``ntran = 1`` takes ``SymMaps``' trivial branch, where
+        ``irr_idx_q`` is the identity and the q axis does not reduce.  The
+        centroid set of such a deck can still be orbit-closed — trivially,
+        under the identity op, and ``hbn_cohsex_debug`` is a REAL example
+        whose 12-op point group was recovered from the charge density while
+        its WFN stores one op — so the closure question answers "yes" and the
+        q-grid resolution reaches ``use_ibz``.  Nothing is wrong with any of
+        that; there is simply no wedge, because ``n_q_ibz == n_q_full``.
+
+        Storing "the wedge" there would write the full BZ under a q_irr stamp
+        and a table group, which is bytes and metadata for a reduction that
+        did not happen — and the format's own table validation would label
+        the file ``"full"`` from its SHAPE anyway, so the writer and the
+        reader would be describing the same file two different ways.
+        Demoting here makes them agree BY CONSTRUCTION: the writer applies
+        the reader's own test.
+        A no-symmetry deck's restart file is then byte-for-byte the file it
+        has always been, with no attrs and no table group, which is what
+        makes its red twin an equality rather than a tolerance.
+
+        ``capture is None`` is NOT demoted — that is a plumbing failure, not
+        a structural fact, and the writer refuses it by name.
+        """
+        if capture is None or self.mode != "ibz":
+            return dataclasses.replace(self, capture=capture)
+        import numpy as np
+        n_q_full = int(np.asarray(capture.irr_idx_q).shape[0])
+        n_q_ibz = int(np.asarray(capture.q_irr_frac).shape[0])
+        if n_q_ibz < n_q_full:
+            return dataclasses.replace(self, capture=capture)
+        return dataclasses.replace(
+            self, mode="full", capture=capture,
+            reason=(f"the q axis does not reduce ({n_q_ibz} IBZ q of "
+                    f"{n_q_full} full-BZ q), so there is no wedge to store "
+                    f"— the WFN carries no symmetry that reduces this grid"))
 
     @property
     def store_wedge(self) -> bool:
@@ -148,8 +188,9 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
     Closure says the μ permutation α EXISTS.  ``use_ibz`` says the run
     ACTUALLY computed on a wedge — a deck whose q-grid the group does not
     reduce (ntran=1, or a Γ-only grid) has a closed centroid set and no
-    wedge to store, and ``qirr_store._validate`` would label that file
-    ``"full"`` from its shape anyway.  Storing "the wedge" there would be
+    wedge to store, and ``symmetry_maps.validate_qirr_tables`` would label
+    that file ``"full"`` from its shape anyway.  Storing "the wedge" there
+    would be
     storing the full BZ under a different attr, which is the
     shape-versus-attr disagreement the format refuses on read.  So both are
     required, and the ``ibz`` refusal distinguishes them by name.
@@ -460,7 +501,56 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
             ("restart_q_storage", decision.mode, decision.requested, context),
             f"  [restart_write] {decision.describe()}",
             scope="rank0")
+        # THE DEPRECATION, AND ONLY FOR A DECK THAT ASKED.  The key is
+        # scheduled for DELETION, not for a better default (owner ruling
+        # 2026-08-08 ~13:20), so a deck that names it is building on
+        # something with an end date and should be told once.  A deck that
+        # does not name it sees nothing: warning on the default path would
+        # print this for every deck in the tree, which is how a deprecation
+        # notice becomes noise nobody reads — and the default is not what is
+        # being deprecated, the KEY is.
+        if _deck_named_the_key(config):
+            announce_once(
+                ("restart_q_storage_deprecated", decision.requested),
+                f"\n  *** LORRAX restart_q_storage = "
+                f"{decision.requested!r} is set explicitly by this deck, and "
+                f"this key is SCHEDULED FOR DELETION (owner ruling "
+                f"2026-08-08).\n"
+                f"      why:  symmetry never needed a mode switch — the WFN "
+                f"file already answers the question.  A deck-level\n"
+                f"            tri-state was always a second, weaker source "
+                f"of truth about the same fact.\n"
+                f"      then: restart storage will simply FOLLOW the WFN's "
+                f"own symmetry and both readers will always\n"
+                f"            unfold, after which this key goes away "
+                f"entirely.  Do not build on it.\n"
+                f"      see:  DESIGN_restart_consolidation.md; "
+                f"docs/input_reference.md. ***\n",
+                scope="rank0")
     return decision
+
+
+def _deck_named_the_key(config) -> bool:
+    """Did the DECK write ``restart_q_storage``, or is this just the default?
+
+    The deprecation above must fire for a deck that pins the key and stay
+    silent for one that never mentions it, and those two are
+    indistinguishable from the resolved value alone — a deck pinning ``full``
+    and a deck saying nothing both arrive here as ``"full"``.  The config
+    parser records the raw keys it saw, so the question is asked of that
+    rather than inferred from the value.
+
+    Conservative on purpose: a config object that carries no record of its
+    own raw keys answers ``False``, because a deprecation notice that fires
+    on every run is worse than one that fires on none.
+    """
+    seen = getattr(config, "raw_input_keys", None)
+    if seen is None:
+        return False
+    try:
+        return "restart_q_storage" in seen
+    except TypeError:                                    # pragma: no cover
+        return False
 
 
 __all__ = ["RESTART_Q_STORAGE", "RestartQStorage", "closure_for_restart",

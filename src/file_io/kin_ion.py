@@ -186,7 +186,7 @@ def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
 		trs_reference="ibz_slab")
 
 
-def read_star_map(h5_path: str, dataset: str = "kin_ion"):
+def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 	"""The unfold tables a stored-on-IBZ ``dataset`` needs, or ``None``.
 
 	``None`` means the dataset is stored on the full BZ and must be read
@@ -201,6 +201,16 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion"):
 	stored k axis that does not match the number of distinct stars the
 	tables describe, which is what a truncated or mislabelled slab looks
 	like from the outside.
+
+	``k_axis`` names WHICH axis of the stored dataset is the k axis, and
+	it exists because ``sigma_mnk.h5``'s dynamic cubes are
+	``(n_omega, nk, nb, nb)`` — axis 0 there is frequency, and a check
+	that read ``shape[0]`` would compare the star count against the
+	frequency count and refuse every correctly-written cube.  It defaults
+	to 0, which is every ``kin_ion.h5`` array, so no existing caller
+	changes.  ONE implementation of the stamp contract for both files was
+	the point: a second copy in ``sigma_output`` would be a second place
+	for the version, the table names and the refusals to drift.
 	"""
 	with h5py.File(h5_path, "r") as h5:
 		if dataset not in h5:
@@ -237,7 +247,11 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion"):
 				f"live elsewhere is a tensor that silently decays.")
 		irr = np.asarray(h5[IRR_IDX_DATASET][()], dtype=np.int32)
 		sidx = np.asarray(h5[SYM_IDX_DATASET][()], dtype=np.int32)
-		nk_stored = int(ds.shape[0])
+		if not (-ds.ndim <= k_axis < ds.ndim):
+			raise ValueError(
+				f"{os.path.basename(h5_path)}: {dataset} has {ds.ndim} axes, "
+				f"so k_axis={k_axis} names no axis of it.")
+		nk_stored = int(ds.shape[k_axis])
 	if irr.shape != sidx.shape or irr.ndim != 1:
 		raise ValueError(
 			f"{os.path.basename(h5_path)}: {IRR_IDX_DATASET} {irr.shape} and "

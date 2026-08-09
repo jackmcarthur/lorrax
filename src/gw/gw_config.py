@@ -1125,6 +1125,13 @@ _NORMALIZE_STR = {
 # ``default is None`` otherwise means "nullable float".
 _NULLABLE_BOOL = frozenset()
 
+#: Reserved slot in the params dict holding the set of deck keys the DECK
+#: named.  Leading underscore because it is not a deck key and must never
+#: match one: ``read_lorrax_input`` builds params from ``_DEFAULTS.items()``
+#: and every real key comes from there, so a name that cannot appear in
+#: ``_DEFAULTS`` cannot collide.  Read once, into ``GWConfig.raw_input_keys``.
+_DECK_NAMED_KEYS = "_deck_named_keys"
+
 
 # ---------------------------------------------------------------------------
 #  Input file parser
@@ -1369,8 +1376,20 @@ def read_lorrax_input(filename: str) -> dict:
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
+        # WHICH KEYS THE DECK ITSELF NAMED.  ``params`` cannot answer this
+        # afterwards — a deck pinning a key to its default and a deck that
+        # never mentions it produce the identical entry — and the difference
+        # matters to anything that must speak only to decks that opted in.
+        # Its first consumer is the ``restart_q_storage`` deprecation notice
+        # (owner ruling 2026-08-08: the key is scheduled for deletion), which
+        # must fire for a deck that pins it and stay silent for the other
+        # ~forty, or it is noise nobody reads.  Recorded here, where the
+        # answer is free, rather than re-parsed by each consumer.
+        named = set()
         for key, default in _DEFAULTS.items():
             raw = section.get(key, fallback=None)
+            if raw is not None:
+                named.add(key)
             if raw is None:
                 params[key] = default
             elif key in _NULLABLE_BOOL:
@@ -1391,8 +1410,10 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = str(raw)
             if key in _NORMALIZE_STR and isinstance(params[key], str):
                 params[key] = params[key].strip().lower()
+        params[_DECK_NAMED_KEYS] = frozenset(named)
     else:
         params = dict(_DEFAULTS)
+        params[_DECK_NAMED_KEYS] = frozenset()
 
     # Parse optional QE K_POINTS block
     if kp_idx is not None:
@@ -1797,6 +1818,13 @@ class LorraxConfig:
     #: resolution point rather than a fast path beside it.  Same ``_raw``
     #: convention as ``compute_mode_raw``.
     restart_q_storage_raw: str
+    #: The deck keys THIS DECK NAMED, as opposed to inherited from
+    #: ``_DEFAULTS``.  Empty for a config built from a hand-made params dict,
+    #: which is why every consumer must treat "absent" as "did not ask" — see
+    #: ``gw.restart_q_storage._deck_named_the_key``.  Exists so a key that is
+    #: on its way out can speak to the decks that pin it without speaking to
+    #: every other deck in the tree.
+    raw_input_keys: frozenset
     compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
@@ -2353,6 +2381,7 @@ class LorraxConfig:
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             restart_q_storage_raw=_restart_q_storage,
+            raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),

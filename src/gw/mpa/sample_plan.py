@@ -1,0 +1,445 @@
+"""The complex-frequency sampling object: R4's 2x2 table, as data.
+
+STAGING LOCATION; the minimax-service design decides the final home.
+``DESIGN_minimax.md`` R4 point 3 says this object "belongs in the
+service" because it is pure algebra on floats -- no jax, no physics, no
+bands -- and this module honours that: it imports ``numpy`` and
+``gw.mpa.sampling`` and nothing else.  It sits under ``gw/mpa`` only
+because that is where the rest of the MPA staging lives; moving it is a
+file move.
+
+WHAT THIS IS
+------------
+``DESIGN_minimax.md`` R4 draws the four analytic characters of a
+screening sample ``z = omega + i*varpi`` as a 2x2 table, and observes
+that LORRAX already implements three quarters of it as three unrelated
+code paths, with ``screening.py``'s *"complex-axis omega=... not
+supported"* standing in for the fourth::
+
+    |            |  omega = 0             |  omega != 0            |
+    |------------|------------------------|------------------------|
+    | varpi = 0  |  exponential_sum       |  sine_sum              |
+    |            |  target 1/x            |  target x/(x^2-w^2)    |
+    | varpi != 0 |  exponential_sum_imag  |  damped_line           |
+    |            |  target x/(x^2+p^2)    |  the MPA kernel        |
+
+The organising fact -- and the reason the four are ONE object rather
+than four paths -- is that the four targets are the same function of
+``Delta``, evaluated at four positions of ``z``.  Writing the MPA
+kernel of theory-plan section B in the form that makes this visible::
+
+    K_z(Delta) = -2 * integral_0^inf dt  e^{i z t} sin(Delta t)
+               = -2 * Delta / (Delta**2 - z**2)          (Im z > 0)
+
+and then walking the table:
+
+* ``z = 0``            -> ``K = -2 / Delta``                (1/x)
+* ``z = i*varpi``      -> ``K = -2 * Delta/(Delta^2+varpi^2)``
+* ``z = omega``        -> ``K = -2 * Delta/(Delta^2-omega^2)``
+* ``z = omega+i*varpi`` -> the strip; nothing existing evaluates it.
+
+So the three live families are exactly ``K_z / (-2)`` at their cell's
+``z``, and unifying them costs one constant, recorded here as
+``KERNEL_FACTOR``.  That is the whole content of "the existing real and
+imaginary families are CASES of the sampling object, not parallel
+paths": the table below dispatches on the analytic character of ``z``,
+and the ROUTE -- which machine evaluates the cell -- is a separate
+column from the TARGET, because three cells have a shipped machine and
+the fourth needs the damped-tau sweep of ``gw.mpa.evaluator``.
+
+WHAT IS A PLAN
+--------------
+A plan is a plain dict::
+
+    plan = {"label": str, "points": (point, ...)}
+    point = {"index": int, "role": str, "z": complex,
+             "omega": float, "varpi": float,
+             "character": str, "family": str, "route": str}
+
+The point tuple is ORDERED and that order is the contract: for
+``mpa_plan`` it is exactly ``sampling.double_parallel_grid``'s order
+(near line ascending, then far line), because the fit kernel indexes
+its diagnostics against that order.  Everything else -- which points
+share a damped-tau line, which take a shipped kernel -- is DERIVED by
+``plan_routes`` from the points themselves, so the grouping cannot
+drift out of step with the grid.
+
+The plan carries NO commitment to how a line is evaluated
+(``DESIGN_minimax.md`` section 5.1: "the sampling plan must not encode
+line-batching ... a per-point evaluator consuming the same plan is the
+fallback with no API change").  ``plan_routes`` reports the lines that
+EXIST in the geometry; whether the evaluator rides one sweep per line
+or one per point is the evaluator's argument, not the plan's.
+
+WHY EXACT ZERO DECIDES THE CHARACTER
+------------------------------------
+``sample_character`` tests ``omega == 0.0`` and ``varpi == 0.0``
+exactly, not against a tolerance.  Two reasons.  The protocol
+constructs its zeros exactly -- ``sampling.partition_fractions``
+returns ``Fraction(0)`` and ``float(Fraction(0))**alpha * omega_m`` is
+``0.0`` bit-for-bit -- so there is nothing to round.  And a sample that
+is merely NEAR an axis is analytically ON THE STRIP: the metals
+protocol's own origin shift ``z = i*1e-5 Ha`` is a case in point, and
+it is a genuine ``exponential_sum_imag`` point, not a static one, for
+exactly the reason the papers introduce it.  A tolerance here would
+silently reclassify it.
+"""
+
+import numpy as np
+
+from gw.mpa import sampling
+
+#: ``K_z(Delta) = KERNEL_FACTOR * target_of_the_cell(Delta)``.  The
+#: three shipped families all approximate the target WITHOUT this
+#: factor -- it lives in the chi0 builders today -- so every route
+#: adapter in ``gw.mpa.evaluator`` applies it once, in one place.
+KERNEL_FACTOR = -2.0
+
+#: R4's 2x2, as data.  ``cell`` is ``(omega_is_zero, varpi_is_zero)``.
+#: ``shipped_tables`` is the catalog census of ``DESIGN_minimax.md`` R4
+#: -- carried here because it is the difference between a lookup and a
+#: runtime solve, and the bottom-left zero is R1's structural hole.
+FAMILIES = {
+    "exponential_sum": {
+        "character": "static",
+        "cell": (True, True),
+        "target": "1/Delta",
+        "route": "existing-kernel",
+        "builder": "gw.minimax_screening.solve_laplace_minimax_interval",
+        "domain": "interval",
+        "shipped_tables": 26,
+        "precondition": None,
+    },
+    "exponential_sum_imag": {
+        "character": "imag",
+        "cell": (True, False),
+        "target": "Delta/(Delta**2 + varpi**2)",
+        "route": "existing-kernel",
+        "builder":
+            "gw.minimax_screening.solve_laplace_minimax_imag_interval",
+        "domain": "interval",
+        # R1's hole: the family solves at runtime on every call.
+        "shipped_tables": 0,
+        "precondition": None,
+    },
+    "sine_sum": {
+        "character": "real",
+        "cell": (False, True),
+        "target": "Delta/(Delta**2 - omega**2)",
+        "route": "existing-kernel",
+        "builder": "gw.minimax_screening.build_real_quadrature",
+        "domain": "interval",
+        "shipped_tables": 5,
+        # The shipped route decomposes into two 1/y minimaxes on
+        # [omega-Delta_max, omega-Delta_min] and [omega+Delta_min,
+        # omega+Delta_max], which requires omega above every
+        # transition.  Inside the band the target has a real pole and
+        # there is no quadrature of it at all.
+        "precondition": "omega > Delta_max",
+    },
+    "damped_line": {
+        "character": "strip",
+        "cell": (False, False),
+        "target": "Delta/(Delta**2 - z**2)",
+        "route": "damped-tau",
+        "builder": "gw.mpa.evaluator.damped_line_rule",
+        "domain": "bandwidth",
+        "shipped_tables": 0,
+        "precondition": None,
+    },
+}
+
+#: character -> family name.  The inverse of the ``character`` column,
+#: built once so ``family_for`` is a lookup and the two can never
+#: disagree.
+_FAMILY_BY_CHARACTER = {
+    spec["character"]: name for name, spec in FAMILIES.items()}
+
+
+def sample_character(z):
+    """Return ``'static'``, ``'imag'``, ``'real'`` or ``'strip'``.
+
+    The analytic character of ``z = omega + i*varpi`` -- which cell of
+    R4's table the point falls in.  See the module docstring for why
+    the zero tests are exact.
+
+    Refuses ``varpi < 0`` and non-finite ``z``.  The lower half plane
+    is not an empty cell of the table, it is the WRONG SHEET: the
+    time-ordered ``W_c`` is analytic in the upper half plane, the
+    damped-tau integral ``integral_0^inf e^{i z t} ...`` diverges for
+    ``Im z < 0``, and the fit kernel's own time-ordering guard exists
+    to keep fitted poles out of there.  A sample below the real axis is
+    a caller bug, and it is cheaper to say so here than to return a
+    number nobody can use.
+    """
+
+    zc = complex(z)
+    if not (np.isfinite(zc.real) and np.isfinite(zc.imag)):
+        raise ValueError(
+            f"GATE sample_finite: z={z!r} is not finite. FALSE case: "
+            "both components of the sample point are finite floats.")
+    if zc.imag < 0.0:
+        raise ValueError(
+            f"GATE sample_upper_half_plane: z={z!r} has varpi="
+            f"{zc.imag!r} < 0, which is not a cell of the sampling "
+            "table but the wrong analytic sheet -- W_c is analytic in "
+            "the upper half plane and the damped-tau integral "
+            "diverges below the real axis. FALSE case: Im z >= 0.")
+    omega_zero = (zc.real == 0.0)
+    varpi_zero = (zc.imag == 0.0)
+    for name, spec in FAMILIES.items():
+        if spec["cell"] == (omega_zero, varpi_zero):
+            return spec["character"]
+    raise AssertionError(f"unreachable: {name!r}")   # pragma: no cover
+
+
+def family_for(z):
+    """Return the R4 family name serving ``z``.  The 2x2 dispatch."""
+
+    return _FAMILY_BY_CHARACTER[sample_character(z)]
+
+
+def route_for(z):
+    """Return ``'existing-kernel'`` or ``'damped-tau'`` for ``z``.
+
+    The ROUTE is deliberately a separate column from the FAMILY:
+    theory-plan section B routes the special pure-imaginary samples --
+    ``z = 0`` for insulators, ``z = i*1e-5 Ha`` for metals, and the far
+    line's ``omega = 0`` point at ``i*varpi_2`` -- to "the existing
+    static and imaginary-axis kernels", and everything with a nonzero
+    real part to the damped-tau sweep.  That is this column, verbatim.
+    """
+
+    return FAMILIES[family_for(z)]["route"]
+
+
+def sample_point(z, role, *, index=0):
+    """One sample point, as a dict: the atom the plan is built from."""
+
+    zc = complex(z)
+    fam = family_for(zc)
+    return {
+        "index": int(index),
+        "role": str(role),
+        "z": zc,
+        "omega": float(zc.real),
+        "varpi": float(zc.imag),
+        "character": FAMILIES[fam]["character"],
+        "family": fam,
+        "route": FAMILIES[fam]["route"],
+    }
+
+
+def line_points(varpi, omegas, role_prefix, *, start_index=0):
+    """The points of one horizontal line, ascending in ``Re z``.
+
+    A "line" in the double-parallel protocol is a fixed ``varpi`` and a
+    tuple of ``omega`` -- the object the damped-tau sweep shares nodes
+    across.  It is returned as a plain tuple of points, not as a
+    wrapper, because everything downstream wants the points and
+    ``plan_routes`` recovers the grouping from ``varpi`` anyway.
+    """
+
+    v = float(varpi)
+    return tuple(
+        sample_point(complex(float(om), v), f"{role_prefix}_{k:02d}",
+                     index=start_index + k)
+        for k, om in enumerate(omegas))
+
+
+def sampling_plan(points, *, label):
+    """Freeze an ordered tuple of points into a plan dict.
+
+    Reindexes the points so ``point['index']`` is its position in the
+    plan -- the index the fit's diagnostics quote and the index into
+    the value array ``gw.mpa.evaluator.evaluate_samples`` returns.
+    Refuses duplicate roles, because a role is what Sigma looks a W up
+    by and a repeated one silently loses a sample.
+    """
+
+    pts = tuple(points)
+    roles = [p["role"] for p in pts]
+    if len(set(roles)) != len(roles):
+        dupes = sorted({r for r in roles if roles.count(r) > 1})
+        raise ValueError(
+            f"GATE distinct_roles: the plan repeats the role(s) "
+            f"{dupes} among {len(pts)} points. FALSE case: every "
+            "point carries a role no other point carries -- the role "
+            "is the key Sigma reads W back by.")
+    return {
+        "label": str(label),
+        "points": tuple(dict(p, index=k) for k, p in enumerate(pts)),
+    }
+
+
+def plan_points(plan):
+    """The plan's ordered points."""
+
+    return plan["points"]
+
+
+def plan_z(plan):
+    """The plan's sample grid as ``(n_points,)`` complex128.
+
+    This is the array the fit kernel takes as ``z_samples``; for
+    ``mpa_plan`` it is bit-identical to ``double_parallel_grid``'s
+    return, which ``tests/test_mpa_evaluator.py`` pins.
+    """
+
+    return np.asarray([p["z"] for p in plan["points"]],
+                      dtype=np.complex128)
+
+
+def plan_routes(plan):
+    """Group the plan by evaluation route.  DERIVED, never stored.
+
+    Returns ``{"existing": (point, ...), "lines": ((varpi, (point,
+    ...)), ...)}`` -- the shipped-kernel points in plan order, and the
+    damped-tau points grouped by their line height, lines ascending in
+    ``varpi``.  A per-point evaluator ignores the grouping and a
+    line-batched one uses it; both consume the same plan, which is the
+    property ``DESIGN_minimax.md`` section 5.1 asks the plan to have.
+    """
+
+    existing = tuple(p for p in plan["points"]
+                     if p["route"] == "existing-kernel")
+    by_varpi = {}
+    for p in plan["points"]:
+        if p["route"] != "damped-tau":
+            continue
+        by_varpi.setdefault(p["varpi"], []).append(p)
+    lines = tuple((v, tuple(by_varpi[v])) for v in sorted(by_varpi))
+    return {"existing": existing, "lines": lines}
+
+
+def refuse_unsupported(plan, *, delta_max=None):
+    """Refuse, by name, any point no family can serve.  F6.
+
+    Two things can be wrong, and both are checked BEFORE any physics
+    runs, which is the point of having the plan be pure float algebra:
+
+    1. A ``sine_sum`` point (``varpi = 0``, ``omega != 0``) at or below
+       the top transition.  The shipped real-axis route decomposes
+       ``Delta/(Delta**2-omega**2)`` into two ``1/y`` minimaxes and
+       needs ``omega`` above every transition to keep both branches
+       positive; inside the band the target has a real pole and no
+       quadrature of it exists.  ``delta_max`` is the top transition
+       energy in the caller's unit; passing ``None`` skips this check
+       and is only right when the plan has no such points.
+    2. Anything ``sample_character`` itself refuses -- non-finite, or
+       below the real axis.  Those already fired at construction, so
+       this pass re-runs them only to make the plan self-checking after
+       a hand edit.
+
+    Returns ``None``.  Raises ``ValueError`` naming the offending
+    ``z``, its role and its cell.
+    """
+
+    for p in plan["points"]:
+        sample_character(p["z"])
+        if p["family"] != "sine_sum" or delta_max is None:
+            continue
+        if p["omega"] <= float(delta_max):
+            raise ValueError(
+                f"GATE sine_sum_above_band: plan {plan['label']!r} "
+                f"point {p['role']!r} at z={p['z']!r} is a real-axis "
+                f"sample at omega={p['omega']!r}, which is not above "
+                f"the top transition Delta_max={float(delta_max)!r}. "
+                "The shipped real-axis route "
+                "(minimax_screening.build_real_quadrature) needs "
+                "omega > Delta_max so both 1/y branches stay "
+                "positive; at or below it the target has a real pole. "
+                "FALSE case: every varpi == 0, omega != 0 sample sits "
+                "above every transition energy.")
+
+
+def describe_plan(plan):
+    """A one-line-per-cell census of the plan.  For cost reports."""
+
+    counts = {}
+    for p in plan["points"]:
+        counts[p["family"]] = counts.get(p["family"], 0) + 1
+    cells = ", ".join(
+        f"{name}={counts.get(name, 0)}" for name in FAMILIES)
+    return (f"plan {plan['label']!r}: {len(plan['points'])} points "
+            f"[{cells}]")
+
+
+# ---------------------------------------------------------------------------
+# The three plans the pipeline actually asks for
+# ---------------------------------------------------------------------------
+
+def static_plan():
+    """Today's COHSEX request, as a plan.
+
+    ``screening.screening_requests_for(ComputeMode.COHSEX, ...)``
+    returns exactly this ``(omega_ry, role)`` pair; the test asserts
+    the identity rather than trusting the comment.
+    """
+
+    return sampling_plan(
+        (sample_point(0.0 + 0.0j, "static"),), label="cohsex-static")
+
+
+def gn_ppm_plan(omega_p_ry):
+    """Today's GN-PPM request, as a plan: static plus one imag probe."""
+
+    wp = float(omega_p_ry)
+    if not (wp > 0.0) or not np.isfinite(wp):
+        raise ValueError(
+            f"GATE gn_probe_positive: omega_p={omega_p_ry!r} is not a "
+            "finite positive plasmon frequency. FALSE case: "
+            "float(omega_p) > 0 -- the GN probe is on the imaginary "
+            "axis at i*omega_p.")
+    return sampling_plan(
+        (sample_point(0.0 + 0.0j, "static"),
+         sample_point(1j * wp, "probe")),
+        label="gn-ppm")
+
+
+def mpa_plan(
+    n_p,
+    omega_m,
+    *,
+    material_class="insulator",
+    alpha=1,
+    varpi_near=None,
+    varpi_far=None,
+    energy_unit="Ha",
+    ladder_floor_octaves=3,
+):
+    """The double-parallel MPA protocol, as a plan.
+
+    A thin projection of ``sampling.double_parallel_grid`` -- every
+    argument is forwarded verbatim and the point order is the grid's,
+    so ``plan_z(mpa_plan(...))`` is bit-identical to
+    ``double_parallel_grid(...)``.  The plan adds exactly one thing to
+    the grid: the per-point cell and route of R4's table.
+
+    WHAT THE CELLS COME OUT AS, and why that is the theory plan's
+    sentence rather than a choice made here.  For an insulator the near
+    line's first sample is ``z = 0`` -- the ``static`` cell -- and the
+    far line's first sample is ``i*varpi_2`` -- the ``imag`` cell;
+    every other sample has a nonzero real part and lands on the
+    ``strip``.  For a metal the near line's first sample is
+    ``i*1e-5 Ha``, which is ``imag`` and not ``static``.  That is
+    theory-plan section B's "the special pure-imaginary samples ... use
+    the existing static and imaginary-axis kernels" read off the table
+    instead of hand-listed, and it is why the fourth cell is the only
+    thing the MPA fit stage actually needed built.
+    """
+
+    grid = sampling.double_parallel_grid(
+        n_p, omega_m, material_class=material_class, alpha=alpha,
+        varpi_near=varpi_near, varpi_far=varpi_far,
+        energy_unit=energy_unit,
+        ladder_floor_octaves=ladder_floor_octaves)
+    n = int(n_p)
+    pts = tuple(
+        sample_point(z, f"{'near' if k < n else 'far'}_{k % n:02d}",
+                     index=k)
+        for k, z in enumerate(grid))
+    return sampling_plan(
+        pts,
+        label=(f"mpa-double-parallel-n_p={n}-{material_class}"
+               f"-alpha={int(alpha)}"))

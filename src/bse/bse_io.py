@@ -201,8 +201,12 @@ def restart_munu_full_bz(dset, name: str, restart_file: str):
     Callers here are on the host single-device path, so
     ``collectives.single_device_mesh()`` is what they get, named at the
     site.  The genuinely sharded transport does not come through here — see
-    ``_MunuSlabPlan``, which refuses a wedge rather than reading one it
-    cannot redistribute.
+    ``_MunuSlabPlan``, which refuses a wedge.  Note what that refusal is and
+    is not: the unfold CAN run sharded (it is an ``all_to_all`` kernel, and
+    ``file_io.tagged_arrays._unfold_wedge`` does exactly that on the GW read
+    side), so the BSE refusal is a held cost decision awaiting a measurement,
+    not an impossibility.  This host path meanwhile materialises the full BZ
+    once per caller per rank, which is why it is a stopgap.
 
     THE μ PAD IS NOT RE-APPLIED HERE.  The file stores the LOGICAL extent
     (652b731e / SHARDING_RULES §2) and every caller of this function pads on
@@ -1033,13 +1037,38 @@ class _MunuSlabPlan:
             # through SlabIO, and the unfold is a double-gather ACROSS the
             # μ and ν axes: a rank holding one (μ, ν) block does not hold
             # the elements its own block's images come from, so there is
-            # nothing this plan could ask SlabIO for that would let it
-            # reconstruct a full-BZ q.  Unfolding needs the whole tensor
-            # and a mesh (``bse_io.restart_munu_full_bz`` does that on the
-            # host path), which is a different transport, not a different
-            # offset.  A wedge file therefore reads through the serial
-            # h5py readers or not at all; ``restart_q_storage = full``
-            # writes a file this transport can take.
+            # nothing this plan could ask SlabIO FOR — no offset, no extent
+            # — that would reconstruct a full-BZ q.
+            #
+            # THAT IS A FACT ABOUT SlabIO AND NOT ABOUT THE UNFOLD, and
+            # this comment used to conclude otherwise ("structurally
+            # cannot").  ``unfold_isdf_operator`` is a ``shard_map`` over
+            # four ``lax.all_to_all`` collectives that redistribute exactly
+            # these axes volume-preservingly, never exceeding one tile per
+            # rank, and it takes and returns ``P(None,'x','y')`` — the spec
+            # ``request`` below already builds.  The producer runs it on the
+            # real distributed mesh twice per run, and the GW restart reader
+            # now does the same on the read side
+            # (``file_io.tagged_arrays._unfold_wedge``), measured
+            # bit-identical at 2x2, 4x1 and 1x4.  So the wedge does not need
+            # a different TRANSPORT: it needs the read to happen first and
+            # the collective to happen after, in jax, BEFORE the μ-major
+            # transpose in ``_slabio_read_munu`` (the unfold works q-major).
+            #
+            # WHY IT IS STILL REFUSED HERE.  Not correctness — cost.  Putting
+            # an all_to_all of an N_mu²-class object on the BSE load path is
+            # exactly what this module's comments otherwise forbid, and its
+            # price against the bytes the wedge saves has never been measured
+            # on a real interconnect (the only committed all_to_all baselines
+            # are WSL, and the 2x2 leg is emulated).  The design, including
+            # the single-q ``V_q0`` route, is
+            # DESIGN_restart_consolidation.md §4; it lands after one
+            # Perlmutter timing leg, with this refusal and the deck key.
+            # Until then a wedge file reads through the serial h5py readers
+            # — a stopgap, not an answer: they materialise the full-BZ
+            # tensor on the host, once per caller, per rank — or through the
+            # GW leg, which unfolds.  ``restart_q_storage = full`` writes a
+            # file this transport can take.
             _extra = ""
             if int(self.q_extent[0]) < self.nq:
                 _extra = (
