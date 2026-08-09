@@ -457,7 +457,8 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
     """
     fit_path = tmp_path / "gappy.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
+                          energy_unit="Ry")
 
     schedule = tiling.fit_schedule(n_q, n_mu, 2 * n_p)
     skipped = schedule[len(schedule) // 2]
@@ -497,7 +498,8 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     fit_path = tmp_path / "resumed.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
     n_omega = 2 * n_p
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
+                          energy_unit="Ry")
 
     budget = MS.choose_column_budget(n_mu, n_omega)
     assert budget < n_mu, "the walk must take more than one block"
@@ -783,7 +785,8 @@ def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
     """
     fit_path = tmp_path / "partial.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
+                          energy_unit="Ry")
     q, lo, hi = tiling.fit_schedule(n_q, n_mu, 2 * n_p)[0]
     fit_driver.fit_one_block(
         str(planted["w_path"]), _W_NAME, str(fit_path), q,

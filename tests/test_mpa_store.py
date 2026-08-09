@@ -847,6 +847,7 @@ def _fit_block(n_p, n_rows, n_cols, seed):
 def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None):
     """Walk the schedule, writing blocks; optionally stop early."""
     MS.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
+                          energy_unit="Ry",
                           grid_hash="sha256:deadbeef")
     truth = {}
     steps = [(q, lo, hi) for q in range(n_q)
@@ -983,7 +984,8 @@ def test_a_scattered_column_block_writes_and_reads_the_same_bytes(
     nobody checks and which the ledger (not the journal's span) is the
     authority on.
     """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=6, n_p=2)
+    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=6, n_p=2,
+                          energy_unit="Ry")
     Om, Bp, diag = _fit_block(2, 6, 3, seed=21)
     MS.write_fit_block(tmpdir_path, 0, [0, 3, 5], Om, Bp, diag)
     ledger = MS.fit_completion_ledger(tmpdir_path)
@@ -1018,7 +1020,8 @@ def test_the_diagnostics_are_required_and_must_be_finite(tmpdir_path):
     would pass the Σ stage's threshold comparison silently — the pole it
     describes would be certified by the absence of evidence.
     """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
+    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
+                          energy_unit="Ry")
     Om, Bp, diag = _fit_block(2, 4, 2, seed=5)
     with pytest.raises(ValueError, match="backward_error"):
         MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
@@ -1043,7 +1046,8 @@ def test_extra_diagnostics_survive_the_round_trip(tmpdir_path):
     counts — and a store that could only carry two would push the rest
     into a side channel nobody reads.
     """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
+    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
+                          energy_unit="Ry")
     Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
@@ -1059,7 +1063,8 @@ def test_the_diagnostic_set_may_not_change_mid_fit(tmpdir_path):
     Σ stage's certification would pass exactly the elements nobody
     measured — the failure mode is not a gap, it is a green light.
     """
-    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
+    MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
+                          energy_unit="Ry")
     Om, Bp, diag = _fit_block(2, 4, 2, seed=7)
     MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
                        dict(diag, held_out=np.zeros((4, 2))))

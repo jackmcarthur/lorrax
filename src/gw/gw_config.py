@@ -889,18 +889,23 @@ _DEFAULTS = {
     # BOTH a full-BZ pole axis and a ``__mpahead`` head axis, and the two
     # readers refuse it by name when it does not.
     "mpa_fit_file": "",
-    # What energy unit the fit store's Ω_p / B_p are stated in.  A KEY AND
-    # NOT A CONSTANT because the store does not record it: the
-    # ``__mpahead`` group carries no unit stamp, and the
-    # ``mpa_omega_units`` attr that does exist is stamped on the BODY
-    # W(ω) tensor by a different producer.  "Ry" is the default because
-    # the tree's only head producer (``gw.mpa.head_dipole``) fits against
-    # band-energy differences in Ry and the landed Σ pass loop
-    # (``gw.mpa.sigma_pass``) compares Re Ω_p against Ry band energies —
-    # so Ry is what every in-tree route means.  A store fitted on a
-    # Hartree axis says "Ha" here and the poles and residues are BOTH
-    # scaled by 2 (the residue carries one power of energy in the
-    # numerator); nothing guesses.  See ``gw.mpa.sigma_head``.
+    # What energy unit a LEGACY head set's poles are stated in.  SCOPE
+    # NARROWED 2026-08-09: the store now declares its own units — the
+    # BODY pole axis via ``mpa_fit_energy_unit`` (required at allocate;
+    # the fit driver inherits it from the W store's ``mpa_omega_units``
+    # stamp, and the body readers refuse an undeclared store by name —
+    # ``mpa_store.declare_fit_energy_unit`` is the one-time migration
+    # stamp), and a head set via its own attr when written with
+    # ``energy_unit=``.  A DECLARED head set comes back from
+    # ``read_head_poles`` already converted to Ry and this key is not
+    # consulted for it.  What remains this key's to say is the unit of a
+    # head set written BEFORE the declaration existed — the head has a
+    # working caller-owned conversion (``gw.mpa.sigma_head``) that
+    # predates the stamp, so legacy sets read rather than refuse, and
+    # this key is their unit.  The first-light heads were fitted on the
+    # W store's Hartree abscissae, so decks reading them say "Ha";
+    # both pole arrays scale by the same factor (the residue carries one
+    # power of energy in the numerator); nothing guesses.
     "mpa_pole_energy_unit": "Ry",
     # WHICH q → 0 HEAD SET, when the store carries more than one.  A fit
     # store's ``__mpahead`` group may be joined by ``__mpahead__<label>``

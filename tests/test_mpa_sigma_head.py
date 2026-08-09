@@ -327,7 +327,8 @@ def test_the_two_spellings_of_the_model_agree():
 def _fit_store(tmp_path, *, n_p=2, n_q=2, n_mu=3, head=True, name="fit.h5",
                labels=(None,)):
     path = str(tmp_path / name)
-    mpa_store.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p)
+    mpa_store.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
+                                 energy_unit="Ry")
     rng = np.random.default_rng(7)
     for q in range(n_q):
         cols = list(range(n_mu))

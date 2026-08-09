@@ -165,6 +165,42 @@ MPA_FIT_FORMAT_VERSION = 2
 #: would strand the first-light field for no gain.
 MPA_FIT_READABLE_VERSIONS = (1, 2)
 
+#: THE POLE-AXIS ENERGY UNIT, and why the store must declare it.  The
+#: first end-to-end MPA Sigma dispatch found the fit solved against the
+#: W(omega) store's abscissae -- stamped ``mpa_omega_units = "Ha"`` --
+#: while the Sigma pass loop fed ``Re Omega_p`` straight into its window
+#: planner beside Rydberg band energies and converted nothing.  Every
+#: pole entered Sigma at HALF its energy, silently, and mis-sized the
+#: width split and the Laplace buckets chosen from the same numbers.
+#: Settled by an EXTERNAL ORACLE, not by reading the code: the n_p = 1
+#: head pole reads 18.118 eV as Hartree against BerkeleyGW's own
+#: 18.009 eV, and would read 9.06 eV as Rydberg against a 16.7 eV
+#: measured plasmon.  No shape check, no finiteness check and no
+#: internal consistency gate can see a factor like that -- the model is
+#: invariant under rescaling z, Omega and B together -- so the unit is
+#: an attr the WRITER stamps and the READERS convert on, exactly once,
+#: and an unstamped store is refused by the converting readers rather
+#: than guessed at.
+#:
+#: BOTH tensors convert by the SAME factor: ``B_p`` carries one power of
+#: the frequency unit in its numerator (``W_c = sum_p B_p/(z - Omega_p)
+#: - ...`` with ``W_c`` itself an energy in Ry by the producers'
+#: convention), so Ha -> Ry doubles ``Omega_p`` AND ``B_p`` and leaves
+#: ``W_c`` invariant.  The table-closer's rescaled twin store verified
+#: the factor at an exact elementwise ratio of 2.000000.
+FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
+
+#: The attr carrying the declaration, on the fit store's root group.
+FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
+
+#: The head-set sibling of the declaration, per labelled ``__mpahead*``
+#: group.  Separate attrs because the two axes have separate producers
+#: and separate lifetimes: the body is fitted by the fit driver against
+#: the W store's grid, the head by the screening sweep's dipole route,
+#: and a store can legitimately hold a declared body beside a legacy
+#: undeclared head set.
+HEAD_ENERGY_UNIT_ATTR = "mpa_head_energy_unit"
+
 #: Sibling group holding the q -> 0 head: the ``2*n_p`` sampled values and
 #: the ``n_p`` poles fitted to them.
 MPA_HEAD_SUFFIX = "__mpahead"
@@ -1443,12 +1479,133 @@ def read_w_columns(
 # The staged B/Ω fit store
 # ---------------------------------------------------------------------------
 
+def canonical_energy_unit(unit, *, where):
+    """Normalise an energy-unit spelling to a :data:`FIT_ENERGY_UNITS` key.
+
+    Case-insensitive on input, canonical on output, and an unknown
+    spelling refuses rather than defaulting -- a default here is the
+    factor-of-two the declaration exists to kill.
+    """
+    if unit is None:
+        raise ValueError(
+            f"{where}: energy_unit is required and there is no default.  "
+            f"The pole axis's unit is the fact this attr exists to pin "
+            f"(see FIT_ENERGY_UNITS: a Hartree axis read as Rydberg "
+            f"halves every pole with no symptom); defaulting it would "
+            f"re-open exactly that hole.  Pass 'Ry' or 'Ha' -- the fit "
+            f"driver takes it from the W store's own mpa_omega_units "
+            f"stamp, which is where the abscissae's unit is recorded.")
+    raw = str(unit).strip()
+    for known in FIT_ENERGY_UNITS:
+        if raw.lower() == known.lower():
+            return known
+    raise ValueError(
+        f"{where}: energy_unit={unit!r} is not one of "
+        f"{sorted(FIT_ENERGY_UNITS)}.  Refusing rather than guessing: an "
+        f"unknown unit converted by a guessed factor is the same defect "
+        f"as no unit at all, wearing a declaration's clothes.")
+
+
+def _declared_fit_unit(grp):
+    """The store's declared pole-axis unit, or ``None`` for legacy."""
+    if FIT_ENERGY_UNIT_ATTR not in grp.attrs:
+        return None
+    return canonical_energy_unit(
+        _qs().qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
+        where="mpa_store (stored declaration)")
+
+
+def _fit_to_ry_factor(grp, where):
+    """The Ha/Ry -> Ry factor for this store's pole axis, or refuse.
+
+    THE ONE CONVERSION SEAM.  Every converting reader below calls this
+    and multiplies once; nothing downstream converts again, which is
+    what makes 'declared and converted once' a property of the format
+    rather than a discipline every consumer must remember.
+
+    An UNDECLARED store is refused by name, with both fixes stated,
+    because there is no safe reading of it: the first-light field was
+    fitted on Hartree abscissae while every synthetic test store is
+    Rydberg, so neither guess is even usually right, and the wrong one
+    is invisible to every internal gate (the model is invariant under
+    rescaling z, Omega and B together -- the only checks that can see
+    the factor are external oracles, which is how it was caught).
+    """
+    declared = _declared_fit_unit(grp)
+    if declared is None:
+        raise ValueError(
+            f"{where}: this fit store does not declare its pole-axis "
+            f"energy unit ({FIT_ENERGY_UNIT_ATTR} is unset), so its "
+            f"Omega_p/B_p cannot be converted to the Rydberg the Sigma "
+            f"stage computes in -- and they MUST be converted, not "
+            f"passed through: the first-light store's axis is Hartree "
+            f"(its W abscissae stamp mpa_omega_units='Ha'; the fitted "
+            f"n_p=1 head pole reads 18.118 eV as Ha against BerkeleyGW's "
+            f"18.009 eV, and 9.06 eV as Ry against a 16.7 eV measured "
+            f"plasmon), and reading it undeclared is how every pole "
+            f"entered Sigma at half its energy with no symptom.  Fix: "
+            f"stamp the store once with "
+            f"mpa_store.declare_fit_energy_unit(path, 'Ha' or 'Ry'), or "
+            f"re-fit with the current fit driver, which inherits the "
+            f"unit from the W store's own stamp.  Pass raw=True only to "
+            f"inspect the undeclared bytes deliberately.")
+    return float(FIT_ENERGY_UNITS[declared])
+
+
+def declare_fit_energy_unit(dest, unit, *, include_heads=True, mode="a"):
+    """Stamp a LEGACY store's pole-axis unit -- once, and never twice.
+
+    The migration path for stores written before the declaration
+    existed.  A store allocated by the current :func:`allocate_fit_store`
+    is stamped at birth and never needs this; a legacy store gets exactly
+    one declaration, because a re-declaration to a DIFFERENT value would
+    change what every subsequent read returns while the bytes stayed
+    put -- two claims about one axis, differing on the day one of them
+    is believed.  Re-declaring the SAME value is a no-op, so the call is
+    safe to leave in a setup script.
+
+    ``include_heads`` stamps every ``__mpahead*`` group that does not
+    already carry its own declaration with the same unit, because the
+    head sets on the first-light store were fitted against the same
+    abscissae as the body.  A head set that was fitted on a different
+    axis should be stamped individually (``write_head_axis`` takes
+    ``energy_unit=`` for new writes).
+
+    Returns the canonical unit stamped.
+    """
+    qs = _qs()
+    can = canonical_energy_unit(unit, where="declare_fit_energy_unit")
+    with qs.QirrDest(dest, mode) as grp:
+        _open_fit(grp)                     # a fit store, not any h5 file
+        declared = _declared_fit_unit(grp)
+        if declared is not None and declared != can:
+            raise ValueError(
+                f"declare_fit_energy_unit: this store already declares "
+                f"{declared!r} and the caller asked for {can!r}.  The "
+                f"bytes did not change, so at most one of the two "
+                f"declarations is true; refusing to replace a "
+                f"declaration is what keeps 'what unit is this axis in' "
+                f"a question with one answer.  If the first declaration "
+                f"was WRONG, that is a corrupted store: re-fit it, or "
+                f"copy the tensors into a fresh store with the right "
+                f"declaration and say so in its provenance.")
+        grp.attrs[FIT_ENERGY_UNIT_ATTR] = can
+        if include_heads:
+            for key in list(grp):
+                if str(key).startswith(MPA_HEAD_SUFFIX):
+                    hd = grp[key]
+                    if HEAD_ENERGY_UNIT_ATTR not in hd.attrs:
+                        hd.attrs[HEAD_ENERGY_UNIT_ATTR] = can
+        return can
+
+
 def allocate_fit_store(
     dest,
     *,
     n_q,
     n_mu,
     n_p,
+    energy_unit=None,
     grid_hash=None,
     table_hash=None,
     centroid_hash=None,
@@ -1479,12 +1636,19 @@ def allocate_fit_store(
     n_p
         Poles per element.  Si is 8 (scan 6–12), hBN and TiO₂ 10–11, Al
         and Na 8, Cu 12 (MPA_THEORY_PLAN §B).
+    energy_unit
+        REQUIRED: the unit the Ω_p/B_p this store will hold are stated
+        in ('Ry' or 'Ha') — see :data:`FIT_ENERGY_UNITS` for why there
+        is no default.  The fit driver passes the W store's own
+        ``mpa_omega_units`` stamp, because the poles come out in the
+        unit of the abscissae the fit was solved against.
     grid_hash, table_hash, centroid_hash
         The W(ω) file's stamps, carried here so the Σ stage can assert
         that these poles came from that screening on that centroid set.
         Optional only because a synthetic fit has no such file.
     """
     qs = _qs()
+    unit = canonical_energy_unit(energy_unit, where="allocate_fit_store")
     n_q = int(n_q)
     n_mu = int(n_mu)
     n_p = int(n_p)
@@ -1524,6 +1688,7 @@ def allocate_fit_store(
 
         grp.attrs["mpa_fit_format_version"] = np.int64(
             MPA_FIT_FORMAT_VERSION)
+        grp.attrs[FIT_ENERGY_UNIT_ATTR] = unit
         grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
         grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
         grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
@@ -1768,6 +1933,10 @@ def fit_completion_ledger(src, *, mode="r"):
                           dtype=np.float64)
         return {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
+            #: The DECLARED pole-axis unit, or None for a legacy store.
+            #: Informational here (the converting readers enforce it);
+            #: carried so a driver can announce it without a second open.
+            "energy_unit": _declared_fit_unit(grp),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
@@ -1871,18 +2040,28 @@ def _refuse_unfinalized(grp, ledger, allow_partial, where):
         f"caller can say which of it is real.")
 
 
-def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
-    """One column block's ``(Omega_p, B_p, diagnostics, ledger)``.
+def read_fit_block(src, q, mu_cols, *, allow_partial=False, raw=False,
+                   mode="r"):
+    """One column block's ``(Omega_p, B_p, diagnostics, ledger)``, in Ry.
 
     Refuses an unfinalized store unless ``allow_partial=True``, and
     when partial, refuses the specific columns that are not fitted —
     "the file is incomplete" and "the columns you asked for are
     incomplete" are different facts and a driver resuming a crashed fit
     needs the second one.
+
+    RETURNS RYDBERG.  ``Omega_p`` and ``B_p`` are converted from the
+    store's DECLARED pole-axis unit at this seam and nowhere else; an
+    undeclared store refuses by name (see :func:`_fit_to_ry_factor`).
+    ``raw=True`` skips both the refusal and the conversion and hands
+    back the stored bytes -- for format tooling and migration only,
+    never for a Σ consumer, and the flag's name is the audit trail.
     """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
+        scale = 1.0 if raw else _fit_to_ry_factor(
+            grp, f"read_fit_block(q={q})")
         _refuse_unfinalized(grp, ledger, allow_partial,
                             f"read_fit_block(q={q})")
         iq = int(q)
@@ -1904,6 +2083,9 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
         sel = slice(lo, hi) if contiguous else cols.tolist()
         Om = np.asarray(grp["Omega_p"][:, iq, :, sel])
         Bp = np.asarray(grp["B_p"][:, iq, :, sel])
+        if scale != 1.0:
+            Om = Om * scale
+            Bp = Bp * scale
         diag = {
             "condition": np.asarray(grp["fit_condition"][iq, :, sel]),
             "backward_error": np.asarray(
@@ -1917,8 +2099,8 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
         return Om, Bp, diag, ledger
 
 
-def read_pole_slice(src, p, *, allow_partial=False, mode="r"):
-    """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each.
+def read_pole_slice(src, p, *, allow_partial=False, raw=False, mode="r"):
+    """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each, in Ry.
 
     THE READ THE SIGMA ACCUMULATION ACTUALLY PERFORMS, and the reason the
     pole axis is leading on disk.  :func:`read_fit_block` is all ``n_p``
@@ -1934,10 +2116,23 @@ def read_pole_slice(src, p, *, allow_partial=False, mode="r"):
     function was written in ``gw.mpa.fit_driver`` as a named stopgap; it
     lives here now, beside the other two readers, and ``fit_driver``
     re-exports it so no caller moved.
+
+    AND THE UNIT CONVERSION COMES WITH IT TOO, since 2026-08-09.  This is
+    the read the Sigma pass loop performs once per pole, and it is the
+    read that fed Hartree poles into a Rydberg window planner on the
+    first end-to-end dispatch -- every pole at half its energy, the
+    width split and the Laplace buckets mis-sized from the same numbers,
+    and no internal gate able to see it.  So the returned ``Omega_p``
+    and ``B_p`` are RYDBERG, converted from the store's declared unit at
+    this seam and nowhere else; an undeclared store refuses by name with
+    both fixes stated, and ``raw=True`` is the tooling escape that skips
+    refusal and conversion together (never for a Σ consumer).
     """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
+        scale = 1.0 if raw else _fit_to_ry_factor(
+            grp, f"read_pole_slice(p={p})")
         _refuse_unfinalized(grp, ledger, allow_partial,
                             f"read_pole_slice(p={p})")
         ip = int(p)
@@ -1947,6 +2142,9 @@ def read_pole_slice(src, p, *, allow_partial=False, mode="r"):
                 f"the pass order is gw.mpa.fit_driver.pole_pass_order(n_p).")
         Om = np.asarray(grp["Omega_p"][ip])
         Bp = np.asarray(grp["B_p"][ip])
+        if scale != 1.0:
+            Om = Om * scale
+            Bp = Bp * scale
         return Om, Bp
 
 
@@ -1991,7 +2189,8 @@ def allocate_head_axis(dest, *, n_p, label=None, mode="a"):
 
 
 def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
-                    vhead=None, label=None, provenance=None, mode="a"):
+                    vhead=None, label=None, energy_unit=None,
+                    provenance=None, mode="a"):
     """Fill the head axis and mark it ready, in one call and only once.
 
     ``head_z`` / ``head_w`` are the ``2*n_p`` sample points and the head of
@@ -2037,6 +2236,17 @@ def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
                 "head's fit owes the same.")
         if vhead is not None:
             hd.attrs["mpa_head_vhead"] = complex(vhead)
+        # The POLE-AXIS unit of this head set: what z, Omega_p and B_p
+        # are stated in.  head_w and vhead are ENERGY VALUES of W and
+        # stay in the producers' Ry regardless -- the axis and the
+        # ordinate have different units and only the axis is being
+        # declared.  Optional (None writes a legacy, undeclared set)
+        # because the head has a working caller-owned fallback in the
+        # deck key; the body's declaration is required because the body
+        # readers have no such fallback.
+        if energy_unit is not None:
+            hd.attrs[HEAD_ENERGY_UNIT_ATTR] = canonical_energy_unit(
+                energy_unit, where="write_head_axis")
         for key, val in (provenance or {}).items():
             hd.attrs["prov_" + str(key)] = val
         hd.attrs["mpa_head_ready"] = True
@@ -2054,6 +2264,21 @@ def read_head_poles(src, *, label=None, mode="r"):
     enough about to inject BerkeleyGW's own ``vhead`` / ``whead_0freq``
     by hand.  There is no value to fall back to and no zero that means
     "absent", so this refuses by name instead of returning anything.
+
+    THE UNIT, IN BOTH REGIMES.  A head set written with
+    ``energy_unit=`` comes back CONVERTED TO RYDBERG -- ``z``,
+    ``Omega_p`` and ``B_p`` by the declared factor, ``w`` and ``vhead``
+    untouched because they are energy VALUES of W in the producers' Ry
+    and not points on the pole axis -- with ``energy_unit: "Ry"`` in the
+    dict saying so.  A LEGACY set (no declaration) comes back exactly as
+    stored with ``energy_unit: None``, and the caller owns the unit the
+    way it always has (the deck's ``mpa_pole_energy_unit`` through
+    ``gw.mpa.sigma_head``).  Returning rather than refusing on the
+    legacy half is deliberate and is the asymmetry with the body
+    readers: the head path HAS a working caller-owned conversion that
+    predates the declaration, and hard-refusing every store in the field
+    would retire it for no correctness gain -- ``None`` is a legible
+    "the file does not say", not a guess.
     """
     qs = _qs()
     gname = head_group_name(label)
@@ -2082,33 +2307,53 @@ def read_head_poles(src, *, label=None, mode="r"):
                 "pole is not an absent one, it is a head that contributes "
                 "nothing, which is exactly the reading a converged dark "
                 "channel would give.  Finish the head leg or refuse the run.")
+        declared = None
+        if HEAD_ENERGY_UNIT_ATTR in hd.attrs:
+            declared = canonical_energy_unit(
+                qs.qirr_attr_str(hd, HEAD_ENERGY_UNIT_ATTR),
+                where="read_head_poles (stored declaration)")
+        scale = FIT_ENERGY_UNITS[declared] if declared else 1.0
+        z = np.asarray(hd["head_z"][()])
+        Om = np.asarray(hd["head_Omega_p"][()])
+        Bp = np.asarray(hd["head_B_p"][()])
+        if scale != 1.0:
+            z, Om, Bp = z * scale, Om * scale, Bp * scale
         return {
             "label": qs.qirr_attr_str(hd, "mpa_head_label")
             if "mpa_head_label" in hd.attrs else MPA_HEAD_DEFAULT_LABEL,
             "group": gname,
+            #: "Ry" for a declared set (arrays already converted), None
+            #: for a legacy one (arrays as stored; caller owns the unit).
+            "energy_unit": "Ry" if declared else None,
             "n_p": int(hd.attrs["mpa_head_n_p"]),
-            "z": np.asarray(hd["head_z"][()]),
+            "z": z,
             "w": np.asarray(hd["head_w"][()]),
-            "Omega_p": np.asarray(hd["head_Omega_p"][()]),
-            "B_p": np.asarray(hd["head_B_p"][()]),
+            "Omega_p": Om,
+            "B_p": Bp,
             "vhead": hd.attrs.get("mpa_head_vhead", None),
             "written_utc": qs.qirr_attr_str(hd, "mpa_head_written_utc"),
         }
 
 
-def read_fit_tensors(src, *, allow_partial=False, mode="r"):
-    """The whole ``(Omega_p, B_p, diagnostics, ledger)``.
+def read_fit_tensors(src, *, allow_partial=False, raw=False, mode="r"):
+    """The whole ``(Omega_p, B_p, diagnostics, ledger)``, in Ry.
 
     For the Σ stage, which consumes every pole of every element at a q,
-    and for tests.  Same finalize refusal as :func:`read_fit_block`.
+    and for tests.  Same finalize refusal as :func:`read_fit_block`, and
+    the same unit seam: converted from the store's declared unit, an
+    undeclared store refused, ``raw=True`` the tooling escape.
     """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
+        scale = 1.0 if raw else _fit_to_ry_factor(grp, "read_fit_tensors")
         _refuse_unfinalized(grp, ledger, allow_partial,
                             "read_fit_tensors")
         Om = np.asarray(grp["Omega_p"][()])
         Bp = np.asarray(grp["B_p"][()])
+        if scale != 1.0:
+            Om = Om * scale
+            Bp = Bp * scale
         diag = {str(k)[len("fit_"):]: np.asarray(grp[k][()])
                 for k in grp if str(k).startswith("fit_")}
         return Om, Bp, diag, ledger

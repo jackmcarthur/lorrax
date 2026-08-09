@@ -343,6 +343,17 @@ def compute_mpa_sigma_pipeline(
         with timing.section("mpa.head_read"):
             head = mpa_store.read_head_poles(
                 path, label=(config.mpa_head_label or None))
+        # WHO OWNS THE HEAD'S UNIT.  A head set written with the
+        # declaration comes back from ``read_head_poles`` ALREADY IN
+        # RYDBERG and says so (``energy_unit: "Ry"``); the deck key is
+        # then not consulted, because a store that states its unit and a
+        # deck that states a different one is at most one truth and the
+        # bytes side with the store.  A LEGACY set (``energy_unit:
+        # None``) is exactly as stored and the deck key owns it, as it
+        # has since the seam landed.  The Σ head line below names which
+        # regime this run took.
+        head_unit = ("Ry" if head.get("energy_unit") == "Ry"
+                     else str(config.mpa_pole_energy_unit))
         ledger = mpa_store.fit_completion_ledger(path)
         # THE HEAD SET IS NAMED IN THE LOG, ALWAYS, and not only when it
         # is unusual.  A store may carry several q→0 head sets — the
@@ -359,7 +370,13 @@ def compute_mpa_sigma_pipeline(
             f"    q→0 head set '{head['label']}' (group {head['group']}): "
             f"{head['n_p']} poles fitted to "
             f"{np.asarray(head['z']).size} samples, written "
-            f"{head['written_utc']}")
+            f"{head['written_utc']}; pole-axis unit "
+            + ("store-declared (arrays returned in Ry)"
+               if head.get("energy_unit") == "Ry"
+               else f"deck-owned ('{head_unit}' via mpa_pole_energy_unit)")
+            + (f"; body axis declared '{ledger['energy_unit']}' "
+               f"(readers return Ry)" if ledger.get("energy_unit")
+               else "; body axis UNDECLARED (the pole readers refuse)"))
 
         # Step 2: the per-pole Σ^c(ω, k, m, n) pass loop.  ``quad`` is the
         # Σ-side quadrature config (``config.sigma_quadrature_config``),
@@ -380,7 +397,7 @@ def compute_mpa_sigma_pipeline(
             sigma_c_omega, head,
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
-            pole_energy_unit=str(config.mpa_pole_energy_unit),
+            pole_energy_unit=head_unit,
             print_fn=print_fn,
         )
 

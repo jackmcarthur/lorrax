@@ -290,6 +290,17 @@ def run_fit_driver(
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     mpa_store.allocate_fit_store(
         fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
+        # THE POLE AXIS INHERITS THE ABSCISSAE'S UNIT.  The Pade solve
+        # returns Omega_p in whatever unit the z samples were stated in
+        # and B_p carries one power of it, and the z samples are the W
+        # store's own stamped grid (asserted bit-equal above) -- so the
+        # unit is READ OFF THAT STAMP, never typed by a human.  This is
+        # the declaration the Sigma-side readers convert on; the
+        # first-light field was fitted on a Hartree grid and read as
+        # Rydberg, halving every pole with no symptom, which is the
+        # defect this line retires at the only seam that knows the
+        # answer for free.
+        energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
