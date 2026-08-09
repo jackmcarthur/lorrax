@@ -103,7 +103,84 @@ from scipy.sparse import csr_matrix, hstack, vstack
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "src" / "common" / "minimax_assets"
 FAMILY = "complex_laplace"
-CATALOG_NAME = "catalog_complex_laplace.json"
+
+#: THE TWO CLAUSES SHIP AS TWO CATALOGS, ONE FAMILY.  ``beta`` is one
+#: dimensionless number formed from two unrelated numerators -- a fitted
+#: pole WIDTH over a window edge on the Sigma side, a sampling line
+#: HEIGHT over a band gap on the chi0 and fit side -- and Gate 0 sec 2
+#: measured them two orders apart.  An entry swept for one certifies
+#: nothing about the other, and because the two ranges OVERLAP near 0.6
+#: a single catalog would let a width request match a height entry
+#: numerically.  Separate files, separate target versions, and the
+#: selector's ``CATALOG_CLAUSE`` stamps each; the stamp is per CATALOG
+#: because a sweep is per clause.
+CLAUSES = {
+    "height": {
+        "subdir": "complex_laplace",
+        "catalog": "catalog_complex_laplace.json",
+        "version": "complex_laplace/v1",
+        "numerator": "varpi / x_min -- a sampling line height over a "
+                     "band gap (the chi0 probe and the MPA fit stage)",
+        "beta_max": 64.0,
+        "derivation": (
+            "the height clause's edge is an OBSERVATION: the protocol "
+            "fixes varpi_1 = 0.2 Ry and varpi_2 = 1 Ha = 2 Ry, the "
+            "in-tree decks' gaps run 0.0497 to 0.3427 Ry, and the "
+            "resulting omega-hat runs 0.58 to 40.214 "
+            "(MINIMAX_REQUEST_CENSUS.md sec 7.2). 64 is the next rung "
+            "of a geometric ladder above the largest measured value."),
+    },
+    "width": {
+        "subdir": "complex_laplace_width",
+        "catalog": "catalog_complex_laplace_width.json",
+        "version": "complex_laplace_width/v1",
+        "numerator": "Gamma_p / x_min -- a fitted pole width over a "
+                     "window edge (the Sigma-stage Laplace complement)",
+        "beta_max": 1.0,
+        "derivation": (
+            "the width clause's edge is DERIVED and not observed, which "
+            "is why it is a rung worth building against. On a "
+            "sign-definite branch gw.mpa.sigma_routing.route_pole sets "
+            "x_min = min(E_A) + a_p with a_p = Re Omega_p and "
+            "min(E_A) >= 0, so x_min >= Re Omega_p. The fit's fourth "
+            "guard (gw.mpa.pade_fit, DEFAULT_GUARDS['width_ratio_max'] "
+            "= 1.0) caps |Im Omega_p| <= width_ratio_max * Re Omega_p. "
+            "Therefore beta = Gamma_p / x_min = |Im Omega_p| / x_min "
+            "<= width_ratio_max * Re Omega_p / Re Omega_p = "
+            "width_ratio_max = 1 for EVERY pole of EVERY field this "
+            "fitter can produce. The rung and the guard are the same "
+            "number, so the campaign is bounded by construction rather "
+            "than by a histogram that happens to fit. On the crossing "
+            "branches the same quantity is bounded more tightly still, "
+            "by 1/edge_factor, because those windows floor x_min at "
+            "edge_factor*Gamma_p."),
+    },
+}
+CLAUSE = "height"
+CATALOG_NAME = CLAUSES[CLAUSE]["catalog"]
+SUBDIR = CLAUSES[CLAUSE]["subdir"]
+
+
+def set_clause(name):
+    """Point the module's family constants at one clause's artifacts.
+
+    A module-level switch rather than a threaded argument because every
+    path here -- filenames, the catalog name, the ``file`` field on each
+    row, the recovery scan -- needs the same answer, and a sweep is
+    always for exactly one clause.
+    """
+
+    global CLAUSE, CATALOG_NAME, SUBDIR
+    if name not in CLAUSES:
+        raise ValueError(
+            f"GATE known_clause: clause={name!r} is not one of "
+            f"{sorted(CLAUSES)}. FALSE case: the envelope has exactly "
+            "two clauses and a sweep declares which one it is for, "
+            "because beta alone cannot say -- the two overlap near 0.6.")
+    CLAUSE = name
+    CATALOG_NAME = CLAUSES[name]["catalog"]
+    SUBDIR = CLAUSES[name]["subdir"]
+
 
 # The census's measured request table (MINIMAX_REQUEST_CENSUS.md sec 3.1):
 # three R buckets off the existing half-decade grid cover all seven deck
@@ -760,7 +837,7 @@ def entry_filename(R, beta, error_bound):
     cannot tell two requests apart is not a record.
     """
 
-    return (f"{FAMILY}_R_{_token(R)}_b_{_token(beta, 12)}"
+    return (f"{SUBDIR}_R_{_token(R)}_b_{_token(beta, 12)}"
             f"_eps_{_error_token(error_bound)}.npz")
 
 
@@ -879,7 +956,7 @@ def sweep(output_root, r_values, beta_values, error_bounds, prefer="btv",
     should be hostage to the cell after it.
     """
 
-    out_dir = Path(output_root) / FAMILY
+    out_dir = Path(output_root) / SUBDIR
     entries, ledger = [], []
     total_wall = 0.0
     for error_bound in error_bounds:
@@ -904,9 +981,23 @@ def catalog_document(entries, ledger, total_wall):
     return {
         "schema_version": 2,
         "family": FAMILY,
+        "clause": {
+            "name": CLAUSE,
+            "numerator": CLAUSES[CLAUSE]["numerator"],
+            "beta_max": CLAUSES[CLAUSE]["beta_max"],
+            "derivation": CLAUSES[CLAUSE]["derivation"],
+            "note": (
+                "beta is ONE dimensionless number formed from two "
+                "unrelated numerators, and the two ranges overlap near "
+                "0.6, so a request must say which clause it is asking "
+                "under. common.minimax_beta_selector.CATALOG_CLAUSE "
+                "stamps this catalog's target.version with the clause "
+                "above and refuses a request from the other one by "
+                "name."),
+        },
         "target": {
             "definition": "1/(u - i*beta) on u in [1, R]",
-            "version": "complex_laplace/v1",
+            "version": CLAUSES[CLAUSE]["version"],
             "real_part_alias": (
                 "Re 1/(u - i*beta) = u/(u^2 + beta^2) is "
                 "common.minimax._imag_target(u, omega_hat) at "
@@ -1012,7 +1103,7 @@ def _entry_record(R, beta, error_bound, info, cert, name):
         "certified": bool(cert["passes"]),
         "payload_sha256": cert["payload_sha256"],
         "beta_axis": info["beta_axis"],
-        "file": f"{FAMILY}/{name}",
+        "file": f"{SUBDIR}/{name}",
         "generation": {k: v for k, v in info.items()
                        if k not in ("rule", "kappa0_bound", "beta_axis")},
     }
@@ -1029,10 +1120,10 @@ def _parse_entry_filename(name):
     """
 
     stem = Path(name).stem
-    if not stem.startswith(f"{FAMILY}_R_"):
+    if not stem.startswith(f"{SUBDIR}_R_"):
         return None
     try:
-        rest = stem[len(f"{FAMILY}_R_"):]
+        rest = stem[len(f"{SUBDIR}_R_"):]
         r_tok, rest = rest.split("_b_", 1)
         b_tok, e_tok = rest.split("_eps_", 1)
         mant, expo = e_tok.split("e", 1)
@@ -1060,7 +1151,7 @@ def adopt_staged(output_root, verbose=True):
 
     root = Path(output_root)
     rows = []
-    for path in sorted((root / FAMILY).glob("*.npz")):
+    for path in sorted((root / SUBDIR).glob("*.npz")):
         parsed = _parse_entry_filename(path.name)
         if parsed is None:
             continue
@@ -1176,6 +1267,12 @@ def main(argv=None):
                         default=list(CENSUS_R_BUCKETS))
     parser.add_argument("--beta-values", type=float, nargs="+",
                         default=None)
+    parser.add_argument("--clause", choices=tuple(CLAUSES),
+                        default="height",
+                        help="which clause of the envelope this sweep is "
+                             "for. Sets the catalog file, the target "
+                             "version the selector stamps, and the "
+                             "directory the tables are staged in.")
     parser.add_argument("--beta-set", choices=("census", "fullprec"),
                         default="census",
                         help="'census' is the displayed three-decimal "
@@ -1202,6 +1299,7 @@ def main(argv=None):
                         help="re-score the staged tables and rewrite the "
                              "catalog without re-solving anything")
     args = parser.parse_args(argv)
+    set_clause(args.clause)
     if args.beta_values is None:
         args.beta_values = list(
             FULL_PRECISION_OMEGA_HAT if args.beta_set == "fullprec"

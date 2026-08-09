@@ -344,31 +344,61 @@ def test_red_twin_a_width_clause_request_refuses_a_height_clause_table():
     ask = dict(range_value=50.0, beta=1.0 / 3.0, target_error=1.0e-6,
                max_nodes=600)
 
-    refused = bs.select(beta_clause=bs.WIDTH, **ask)
-    assert isinstance(refused, bs.TableRefusal)
+    # BOTH clauses serve this number now -- the width campaign shipped --
+    # and that is a sharper test of discrimination than a refusal was:
+    # one arithmetic request, two clauses, two DIFFERENT catalogs, and
+    # neither entry is reachable from the other's clause.
+    as_width = bs.select(beta_clause=bs.WIDTH, **ask)
+    as_height = bs.select(beta_clause=bs.HEIGHT, **ask)
+    assert isinstance(as_width, bs.TableSelection)
+    assert isinstance(as_height, bs.TableSelection)
+    assert as_width.entry["file"] != as_height.entry["file"]
+    assert bs.CATALOG_FILES["width"].split(".")[0].endswith("width")
+    assert as_width.catalog_version == "complex_laplace_width/v1"
+    assert as_height.catalog_version == "complex_laplace/v1"
+    # The width entry is swept AT the clause's own edge; the height one
+    # is a line-height sweep that merely happens to cover 1/3.
+    assert as_width.entry["beta"] == 1.0
+    assert as_height.entry["beta"] > 1.0
+    assert as_width.node_count < as_height.node_count
+
+
+def test_a_clause_with_no_catalog_refuses_by_naming_the_one_that_has(
+        monkeypatch):
+    """The state the MPA-Sigma routing audit found, kept as a red twin.
+
+    Before the width campaign this was the shipped behaviour for every
+    MPA Laplace window: ``CATALOG_CLAUSE`` stamped the only catalog as
+    the HEIGHT clause end to end, so a width request refused on an empty
+    family whether its beta was 0.01 or 0.99 -- 81 432 576 poles, 62.25%
+    of the |B| mass, all of them.  The width catalog exists now, so the
+    state has to be simulated to keep the refusal tested; what must
+    never happen is that a missing width sweep silently serves a height
+    entry, because the two ranges overlap here.
+
+    Order matters too, and is asserted with it: the clause is settled
+    before the beta match, so a caller is told the important of its two
+    problems rather than the one whose obvious fix (generate this beta)
+    would produce a table that still could not legitimately serve it.
+    """
+
+    real = bs.load_catalog
+
+    def only_height(clause=bs.HEIGHT):
+        if clause == bs.WIDTH:
+            return None, "no width catalog staged (simulated)"
+        return real(clause)
+
+    monkeypatch.setattr(bs, "load_catalog", only_height)
+    refused = bs.select(range_value=50.0, beta=0.6, beta_clause=bs.WIDTH,
+                        target_error=1.0e-6, max_nodes=64)
     assert refused.code == "WrongClause"
     assert "Gamma_p / x_min" in refused.message
     assert "varpi / x_min" in refused.message
     assert bs.GENERATOR in refused.message
-
-    served = bs.select(beta_clause=bs.HEIGHT, **ask)
-    assert isinstance(served, bs.TableSelection)
-    assert served.entry["rule"] == "positive_composite"
-
-
-def test_the_wrong_clause_check_runs_before_the_beta_match():
-    """Order matters, so the order is asserted rather than assumed.
-
-    If the clause check ran after the beta match, a width request that
-    happened to miss on beta would be told about the beta -- the less
-    important of its two problems, and the one whose obvious fix
-    (generate this beta) would produce a table that still could not
-    legitimately serve it.
-    """
-
-    refused = bs.select(range_value=50.0, beta=0.6, beta_clause=bs.WIDTH,
-                        target_error=1.0e-6, max_nodes=64)
-    assert refused.code == "WrongClause"
+    # Not a beta complaint, and not an absent family.
+    assert "no certified table AT beta" not in refused.message
+    assert refused.code != "CatalogUnavailable"
 
 
 def test_a_beta_outside_its_own_clause_refuses_by_name():
@@ -556,7 +586,8 @@ def test_an_unknown_beta_axis_raises_rather_than_guessing(monkeypatch):
 
     doc = _fake_catalog(lambda d: d["tables"].__setitem__(
         0, {**d["tables"][0], "beta_axis": "envelope_v3"}))
-    monkeypatch.setattr(bs, "load_catalog", lambda: (doc, None))
+    monkeypatch.setattr(bs, "load_catalog",
+                        lambda *a, **k: (doc, None))
     with pytest.raises(bs.CatalogCorrupt, match="beta_axis"):
         bs.select(range_value=doc["tables"][0]["range_max"],
                   beta=doc["tables"][0]["beta"], beta_clause=bs.HEIGHT,
@@ -577,7 +608,8 @@ def test_a_missing_band_field_refuses_the_catalog_not_the_entry(monkeypatch):
         d["tables"][0] = entry
 
     doc = _fake_catalog(drop)
-    monkeypatch.setattr(bs, "load_catalog", lambda: (doc, None))
+    monkeypatch.setattr(bs, "load_catalog",
+                        lambda *a, **k: (doc, None))
     with pytest.raises(bs.CatalogCorrupt, match="beta_tolerance"):
         bs.select(range_value=doc["tables"][0]["range_max"],
                   beta=doc["tables"][0]["beta"], beta_clause=bs.HEIGHT,
@@ -590,7 +622,8 @@ def test_an_unreadable_payload_refuses_by_name(monkeypatch):
                           "file": "complex_laplace/not_a_table.npz"}
 
     doc = _fake_catalog(repoint)
-    monkeypatch.setattr(bs, "load_catalog", lambda: (doc, None))
+    monkeypatch.setattr(bs, "load_catalog",
+                        lambda *a, **k: (doc, None))
     got = bs.select(range_value=doc["tables"][0]["range_max"],
                     beta=doc["tables"][0]["beta"], beta_clause=bs.HEIGHT,
                     target_error=1.0e-6, max_nodes=64)
@@ -613,7 +646,8 @@ def test_a_stamped_band_that_does_not_hold_refuses(monkeypatch):
                               "beta_tolerance"]}
 
     doc = _fake_catalog(widen)
-    monkeypatch.setattr(bs, "load_catalog", lambda: (doc, None))
+    monkeypatch.setattr(bs, "load_catalog",
+                        lambda *a, **k: (doc, None))
     entry = doc["tables"][0]
     got = bs.select(range_value=entry["range_max"],
                     beta=entry["beta"] + 0.5 * entry["beta_tolerance"],
@@ -624,8 +658,14 @@ def test_a_stamped_band_that_does_not_hold_refuses(monkeypatch):
 
 
 def test_a_missing_catalog_refuses_with_the_path_it_tried(monkeypatch):
+    """No catalog for EITHER clause -- which is a different failure from
+    no catalog for THIS clause, and gets a different name.  The one-clause
+    case is ``WrongClause`` and is covered above; this is the family being
+    absent altogether."""
+
     monkeypatch.setattr(bs, "load_catalog",
-                        lambda: (None, "cannot read /nowhere: ENOENT"))
+                        lambda *a, **k: (None,
+                                         "cannot read /nowhere: ENOENT"))
     got = bs.select(range_value=42.0, beta=16.006, beta_clause=bs.HEIGHT,
                     target_error=1.0e-6, max_nodes=64)
     assert got.code == "CatalogUnavailable"
