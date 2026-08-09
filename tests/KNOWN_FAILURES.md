@@ -2198,6 +2198,18 @@ stage is standing outside — is still there.
   `tools/generate_damped_line_assets.py --spans 200 --merge` fills them without
   recomputing anything already here.  **This red closes when that command
   runs**; nothing else in the suite depends on it.
+- The wider minimax census at this head is `test_minimax_quadrature` **14
+  passed**, `test_minimax_beta_selector` **25 passed** (green after the axis
+  record was wired into it, which is the only edit this branch makes to that
+  door), and `test_minimax_imag_tables` **93 passed, 1 failed**.  That one
+  failure is the carried
+  `test_the_fit_stage_floor_is_no_longer_a_quadrature` row registered a few
+  sections above, and it is **not** this branch's: re-measured here in a clean
+  worktree at the branch point `8f2a651d` it fails identically, `recovery
+  9.984e-08 against a synthesis baseline of 8.652e-08`, which is the same
+  host-conditioning of the Pade fixture that row already diagnoses.  Named here
+  only so that a reader of the damped_line census is not surprised by a second
+  red elsewhere in the same suite.
 - Every entry's `kappa_0` is re-measured from its own shipped bytes and is at
   or under the `<= 2` shipping rule.  This family is the first where that cap
   BINDS: the uncapped selector produced live specimens at `kappa_0` of 406, 620
