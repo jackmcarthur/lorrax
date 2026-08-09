@@ -178,6 +178,14 @@ COMPLEX_LAPLACE = FamilyAxes(
              "beta-independent nodes",
              by_rule={"btv_minimax": EXACT,
                       "positive_composite": ROUND_DOWN}),
+        Axis("bin_ratio", ROUND_UP,
+             "the binned_width clause only. An entry certified as a "
+             "SUPREMUM over beta in [0, r'] with r' >= r certifies a "
+             "superset of the requested band, and the request's target "
+             "is its restriction -- the same reason R rounds up, on the "
+             "axis that says how wide a width bin the pane was cut at. "
+             "Absent on the height and width clauses, whose entries "
+             "certify a line rather than a band"),
     ),
 )
 
