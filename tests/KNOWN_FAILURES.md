@@ -1977,3 +1977,154 @@ symmetry-landing amendment closes
 DIFFERENT CELL in the same file — `w0`/static against `wq`/finite-q — so a
 reader scanning for "w0_resolvent" finds a row saying it was fixed.  Anyone
 adding a row for either cell should spell the full node id.
+
+
+## FIXES + MPA LANDING — four re-earned fixes and the MPA stack (2026-08-08)
+
+The 2026-08-08 fix queue and the multipole-W infrastructure, landed together
+on `main` @ `f23baab2`: five branches in a pinned order, plus two commits the
+landing owns.  Censused head **`12097f78`**, against base **`f23baab2`**, one
+full suite per leg.
+
+```
+head 12097f78 : 86 failed, 2214 passed, 257 skipped, 26 deselected, 1 xfailed, 35 errors in 627.10s
+base f23baab2 : 86 failed, 1993 passed, 248 skipped, 26 deselected, 1 xfailed, 35 errors in 291.42s
+```
+
+**UNEXPLAINED NEW REDS: ZERO.**  Set-diff by node id
+(`bwrun/setdiff_mc.py`, both junitxmls kept beside it — see *Where the
+evidence lives*).
+
+| n | class | disposition |
+|---:|---|---|
+| 0 | NEWLY RED | — |
+| 0 | newly green | see *the door red could not appear here*, below |
+| 0 | newly skipped / no longer skipped | — |
+| 0 | collected only at head, RED | — |
+| 232 | collected only at head, not red | the five branches' own gates, all green |
+| 2 | lost from collection | replaced by design, below |
+| 121 | red in BOTH | identical by name on both legs |
+
+The 121 carried reds are what says the two legs are comparable at all: same
+count, same names, both sides.  Collection moves 2363 → 2593 (+232 −2 = +230),
+and 230 = the +221 passed plus the +9 skipped, so every new cell is accounted
+for arithmetically as well as by name.
+
+### THE ENVIRONMENT IS A CAVEAT, AND A PERLMUTTER CENSUS IS OWED
+
+Both legs ran on **WSL CPU** (`JAX_PLATFORMS=cpu`, sequential, no xdist,
+identical invocation, only `PYTHONPATH`/cwd differing), NOT on Perlmutter.
+This was forced, not chosen: the shifter **image gateway went down at ~17:36
+PDT** (`shifterimg lookup` → "failed to contact the image gateway", reproduced
+on three attempts several minutes apart, and again ~20 minutes later), so no
+container step can start on any Perlmutter node — the `lx test` legs died at
+`FAILED to lookup docker image ghcr.io/nvidia/jax:jax-2025-07-21` in 8 s.  The
+ssh ControlPersist master survived the 18:18 cert expiry and the cluster was
+otherwise reachable; the blocker is the image service alone.
+
+What this costs, stated plainly: this box has no FFI build, so 86 F + 35 E of
+each leg are the FFI-absent family and every `@needs_host_ffi` /
+device-requiring cell is red or skipped on **both** sides.  The set-diff is
+therefore trustworthy — identical counts and identical names on both legs are
+what it is measuring — but it is blind to anything that only shows up with a
+real device, a real interconnect or a built `.so`.  Nothing in this landing
+touches the FFI, and the restart-consolidation branch's own sharded-BSE work
+is explicitly held pending a Perlmutter timing leg, so the exposure is
+bounded — but it is not zero.
+
+**REGISTERED AS OWED: a full-suite Perlmutter census of this head at the next
+checkpoint**, when the gateway is back.  It is set up and one command away —
+`/pscratch/sd/j/jackm/fixmpa_0808/` already carries both worktrees
+(`wt_head` @ `12097f78`, `wt_base` @ `f23baab2`), the pinned `env_common.sh`
+(restage_candidate `.so` pair, `LORRAX_FFTW3_SO`, `LX_BASE_MODULE=lorrax_J070`)
+and `census.sh <head|base>`.  Both legs' `[lx] source tree:` lines were
+verified correct before the image lookup failed, so the stale-`LORRAX_CHECKOUT`
+trap is already cleared for that run.
+
+### The door red could NOT appear as "newly green", and here is its measurement
+
+The landing's stated gate was that
+`tests/test_layering.py::test_lorrax_reaches_a_service_only_through_its_door`
+goes green.  It is green at the censused head — but it is green at the BASE
+too, and it was never red on `main`, so a base-vs-head set-diff cannot show
+it and reporting "newly green: 0" as if the gate were unmet would be wrong in
+the other direction.  The red is a property of an INTERMEDIATE state: it does
+not exist until merge 5 brings `file_io/mpa_store.py` into the tree, and it is
+gone by the head.  So it was measured directly instead, A/B on the two commits
+that bracket it:
+
+| tree | door test | `tests/test_mpa_store.py` |
+|---|---|---|
+| `34bf489d` (merge 5 tip, before the adaptation) | **FAILED** — `{'file_io.mpa_store': [('symmetry_maps.qirr_store', 190)]}` | **36 failed, 5 passed** |
+| `12097f78` (the adaptation commit) | **passed** | **41 passed** |
+
+The mechanism, named: `mpa_store` was written while the q_irr checkpoint was
+still landing and reached into `symmetry_maps.qirr_store` for thirty-four uses
+of five private symbols.  The rank-refusal branch published all five on the
+door (`_VERSION_ATTR` → `QIRR_VERSION_ATTR`, `_Dest` → `QirrDest`, `_attr_str`
+→ `qirr_attr_str`, `_generator_commit` → `qirr_generator_commit`, `_validate`
+→ `validate_qirr_tables`, with `QIRR_TABLE_SUFFIX` already there) and DELETED
+the old spellings rather than aliasing them.  So the door rule and the runtime
+agreed: those thirty-four sites were live `AttributeError`s, which is why the
+adaptation is worth thirty-six cells and not one.  `12097f78` switches every
+reach to the door and drops `mpa_store`'s copy of the version-1 rank refusal,
+which now lives in `qirr_store.read_tensor` where the unsuspecting consumer
+already calls it; `mpa_store` keeps version 2's rank and the `mpa_freq_axis`
+cross-check, which are the two things only it can know.
+
+### The two cells that left collection were REPLACED, not lost
+
+```
+tests.test_restart_qirr_consumers::test_the_gw_restart_reader_refuses_a_wedge_and_names_the_way_out
+tests.test_restart_qirr_consumers::test_the_gw_restart_reader_is_silent_on_every_file_that_exists_today
+```
+
+Both are retired by `536cbac9` ("GW restart reader: the wedge is UNFOLDED, not
+refused"), which changes the behaviour they pinned: the GW restart reader no
+longer refuses a wedge, it unfolds it.  A test asserting a refusal cannot
+survive the refusal being deleted on purpose.  Four cells replace them in the
+same file — `test_the_gw_restart_reader_unfolds_a_wedge_end_to_end`,
+`test_the_gw_reader_unfolds_a_wedge_bit_identically`,
+`test_the_gw_restart_reader_is_byte_identical_on_every_file_today` and
+`test_the_arms_between_them_exercise_every_unfold_branch` — and all four are
+green at the head.  This is the designed replacement of the symmetry lane's
+registered wedge-reader row, not an erosion of coverage.
+
+### OPEN ROW: the complex-Laplace catalog is SHIPPED BUT NOT WIRED
+
+`src/common/minimax_assets/catalog_complex_laplace.json` and its eighteen
+`complex_laplace/*.npz` tables land here, and **nothing selects them at run
+time**.  That is deliberate and it is the tables branch's own instruction —
+`55e9edae` says wiring "belongs to the landing commit, and deliberately so —
+today's selection rule has no beta axis and would otherwise serve a table
+fitted to a different function".  This landing declines to do it, because the
+precondition the branch named has not been met: `gw/minimax_screening.py`'s
+`_load_shipped_minimax_catalog` reads `catalog.json` and only `catalog.json`,
+and its selection has no β axis to match on.  The new catalog's own
+`selection_rule` block demands `"beta": "EXACT MATCH REQUIRED for
+rule='btv_minimax'.  The target is a different function at every beta, so a
+table at beta' != beta is not conservative, it is wrong."`  Wiring a β-indexed
+family into a β-blind selector would serve whichever entry happened to sort
+first.
+
+Production behaviour is verified UNCHANGED rather than assumed:
+`git diff f23baab2..HEAD` is empty for `catalog.json`, for both shipped table
+directories (`crossing/`, `noncrossing/`) and for `gw/minimax_screening.py`;
+the landing's 19 files under `minimax_assets/` are all additions; and
+`tests/test_minimax_quadrature.py` — the shipped-table suite — is **14 passed**
+at the head.  The 55 cells of `tests/test_minimax_imag_tables.py` certify the
+new tables from their own bytes without any runtime consumer.
+
+**The row belongs to the minimax service extraction**, which is where a
+selection rule that can carry a β axis will be designed.  Until then the
+tables are inert payload: they cost bytes in the tree and nothing else.
+
+### Where the evidence lives
+
+Local (WSL): `_reports/census_head.xml`, `_reports/census_base.xml`,
+`_reports/setdiff.txt` and `_reports/wsl_census.log` under this session's
+scratchpad, with `wsl_census.sh` — the single script that ran both legs — beside
+them.  Perlmutter: `/pscratch/sd/j/jackm/fixmpa_0808/` (both worktrees, the
+pinned env, `census.sh`, and `_reports/leg_{head,base}.log` showing the image
+gateway failure and the correct `[lx] source tree:` lines), staged for the owed
+census.  In-tree: this amendment.
