@@ -221,9 +221,11 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # This used to be an ``@jax.jit`` defined inside ``build_bse_exact_diagonal``.
 # A jit wrapper created in a function body is a NEW object every call, so its
 # trace / lower / compile-cache-probe cache is new every call too: the "build"
-# re-constructed its XLA program once per solve and that — not the ~0.30 GFLOP
-# of arithmetic, and not the ~5 MB of reductions — was the whole of the
-# measured cost.  The body below is character-identical to the old one, so the
+# re-constructed its XLA program on every call.  Measured on the record deck at
+# P=4, that re-construction is ~26 ms per call and the program it rebuilds runs
+# in 1.26 ms — arithmetic and both cross-rank reductions included.  The
+# reductions are two tupled reduce-scatters carrying 4.7 MiB, so they were never
+# the cost either.  The body below is character-identical to the old one, so the
 # diagonal it returns is bit-identical (np.array_equal, gated in
 # tests/test_bse_exact_diagonal.py).
 @partial(jax.jit, static_argnames=("nk", "sharding"))
@@ -359,10 +361,10 @@ def build_bse_exact_diagonal(
     COST — AND WHAT IT IS NOT
     -------------------------
     The arithmetic is ~0.30 GFLOP, under a third of one matvec.  The wall cost
-    is not the arithmetic and it is not the collectives either.  Measured, the
-    four cross-rank reductions this build emits move ~5 MB in total and cost
-    well under a millisecond; what used to cost ~0.4 s was **building the XLA
-    program**.  The jit wrapper lived INSIDE this function, so a fresh wrapper
+    is not the arithmetic and it is not the collectives either.  Measured on the
+    record deck at P=4, the whole program — both cross-rank reduce-scatters
+    included — executes in **1.26 ms**; what used to cost ~0.4 s was **building
+    the XLA program**.  The jit wrapper lived INSIDE this function, so a fresh wrapper
     object — and therefore a fresh trace/lower/compile-probe — was created on
     every call.  It is now at module scope (:func:`_exact_diagonal_kernel`),
     so a process pays program construction once and every later build is a
