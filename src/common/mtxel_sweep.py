@@ -640,9 +640,24 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
                     key=('vnl', geom.ngkmax, geom.ns, id(vnl_setup)))
 
 
+#: The shipped relative sign of the nonlocal commutator term inside
+#: :func:`dipole_operator`, as a named constant so the two arms of the
+#: open question can be spelled without a magic ``-1.0`` at four call
+#: sites.  ``-1.0`` is what every ``dipole.h5`` in the tree was built
+#: with and is the default everywhere; see that function's SIGN section
+#: for what is actually in dispute.
+VNL_VELOCITY_SIGN_SHIPPED = -1.0
+
+#: The other arm.  It is not "the fix" — the choice is the owner's — it
+#: is the second reproducible configuration, so that a measurement of
+#: the difference does not require patching a source file.
+VNL_VELOCITY_SIGN_FLIPPED = +1.0
+
+
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
-                    vnl_setup=None) -> Operator:
-    """``v ∘ ψ = 2(k+G)_cart ψ − (∂V_NL/∂K_cart) ψ`` — THREE components.
+                    vnl_setup=None,
+                    vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED) -> Operator:
+    """``v ∘ ψ = 2(k+G)_cart ψ ± (∂V_NL/∂K_cart) ψ`` — THREE components.
 
     The velocity matrix ``psp.get_dipole_mtxels`` writes is
     ``p + i[r, V_NL]``, assembled there as ``p_cart - v_NL_cart`` (the
@@ -657,12 +672,68 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
 
     The component axis is moved to the END, where the sweep's specs
     expect it; that is a transpose of the operator output, not of ψ.
+
+    THE SIGN, AND WHY IT IS A KNOB RATHER THAN A DECISION
+    -----------------------------------------------------
+    ``vnl_velocity_sign`` multiplies the nonlocal term and nothing else.
+    It takes exactly ``-1.0`` (the shipped assembly, the default, and
+    what every ``dipole.h5`` in the tree was built with) or ``+1.0``.
+    The default arm is not merely equivalent to the pre-knob code, it is
+    the SAME EXPRESSION: the two signs are separate branches so that
+    ``v - v_nl`` is still literally subtracted and no scalar multiply is
+    interposed on the path that produces the committed fixtures.
+
+    What is in dispute is real and it is measured, not argued.  On the
+    si_bigcond_prep mean field at the band window matched to the
+    BerkeleyGW contour-deformation reference (nval 8 / ncond 92 /
+    nband 100), against BerkeleyGW's own stored q → 0 head at all 265 CD
+    frequencies:
+
+        arm                        eps00(0)   omega_p    vs BGW
+        BerkeleyGW (reference)      24.2205   18.101 eV      --
+        p only (``--skip-vnl``)     27.8686   19.546 eV   +7.99 %
+        sign −1 (as shipped)        31.8204   21.259 eV  +17.45 %
+        sign +1 (flipped)           24.2208   18.101 eV   +0.00 %
+
+    ``gw.mpa.head_dipole.head_fsum_from_transitions`` carries the same
+    table and the f-sum saturations beside it.
+
+    WHAT THIS KNOB IS NOT.  It is not a claim about the per-(ψ, G-list)
+    projector contraction, which reproduces Quantum ESPRESSO to ~10
+    significant figures and which the standing project rule protects.
+    Only the sign with which the assembled term enters the velocity is
+    parameterised here.  Nor does the knob's existence choose an arm:
+    flipping the default would rewrite every ``dipole.h5`` in the tree,
+    the four read-only regression fixtures, the BSE absorption
+    references and the plasmon-pole head, which is an owner decision.
+    The knob exists so that both arms are reproducible from a deck and a
+    flag instead of from a patch, and so that a file built with either
+    can say which one it was.
+
+    THE CACHE HAZARD THE KEY CLOSES.  ``_operator_key`` is the sweep's
+    jit-cache identity, and two operators that hash the same share a
+    compiled program — which for a closed-over sign would mean the
+    second arm of an A/B silently re-running the first.  That is exactly
+    the defect class this project has already paid for twice, so the
+    sign joins the key.  Two sweeps at the two signs in one process is
+    a supported thing to do, and it is what the test does.
     """
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     from psp import vnl_ops
 
+    sign = float(vnl_velocity_sign)
+    if sign not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
+        raise ValueError(
+            f"GATE vnl_velocity_sign: got {vnl_velocity_sign!r}; the only "
+            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped) and "
+            f"{VNL_VELOCITY_SIGN_FLIPPED} (flipped).  This is a SIGN, not "
+            f"a scale: an arbitrary multiplier would let a run report a "
+            f"velocity operator that is neither arm of the open question "
+            f"and that no comparison with BerkeleyGW characterises.")
+
     B = jnp.asarray(np.asarray(bvec, dtype=np.float64) * float(blat),
                     dtype=jnp.float64)
+    flipped = sign > 0.0
 
     def op(psi_n, gvec, gmask, bidx, kvec, B):
         psi = _ket(psi_n, gmask)
@@ -673,12 +744,14 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
             ns_e = int(kdata.E_super.shape[0])
             v_nl = vnl_ops.apply_vnl_velocity_to_ket(
                 psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
-            v = v - _pad_spinor(v_nl, int(psi.shape[1]))
+            pad = _pad_spinor(v_nl, int(psi.shape[1]))
+            v = v + pad if flipped else v - pad
         return jnp.moveaxis(v, 0, -1)[None]
 
     return Operator(apply=op, post=1.0, ncomp=3, consts=(B,),
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
-                         None if vnl_setup is None else id(vnl_setup)))
+                         None if vnl_setup is None else id(vnl_setup),
+                         sign))
 
 
 def sum_operators(*ops: Operator) -> Operator:
