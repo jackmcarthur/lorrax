@@ -62,6 +62,30 @@ does not touch, extend, or depend on the fft gate's ratchet list.
 PORTABLE: synthetic payload on CPU host devices, no GPU, no deck, no restart
 file, no FFI requirement of its own.  Runs in the default census.
 
+  CAVEAT, MEASURED 2026-08-09 (landing-completeness audit) — "no FFI
+  requirement OF ITS OWN" is exact, and it is not the same as "runs anywhere".
+  On a box with NO built ``.so``, this file's result depends on COLLECTION
+  SCOPE, because what it calls does have an FFI requirement:
+  ``build_bse_ring_matvec_full`` -> ``contract_bands_block_reshard`` ->
+  ``gate.require`` refuses with "MKL batched-GEMM host backend unavailable"
+  unless ``LORRAX_BANDS_GEMM_FFI=0`` announces the debug opt-out.  Measured on
+  WSL, no ``.so``, same tree, same commit:
+
+      pytest tests/test_bse_coupling_routes_mesh_invariance.py   ->  13 failed, 2 passed
+      LORRAX_BANDS_GEMM_FFI=0 pytest <same file>                 ->  15 passed
+
+  It is green in the default census only because collecting
+  ``tests/test_contract_bands.py`` executes a MODULE-SCOPE
+  ``os.environ.setdefault("LORRAX_BANDS_GEMM_FFI", "0")`` (that file, top of
+  module) which leaks to the whole session.  So the 13-red is an artefact of
+  running this file alone on an FFI-less box, NOT a mesh-invariance failure and
+  NOT evidence that either K^d_B fix regressed.  Set the variable, or run the
+  full census, before reading a red here as a physics result.
+
+  The durable fix belongs to the OTHER file: move that ``setdefault`` into a
+  fixture so it cannot leak.  Left alone here because it changes another gate's
+  setup, not this one's.
+
 Evidence: ~/lorrax_bse_perf_2026-08-08/COUPLING_MESH_GATE.md
 """
 from __future__ import annotations
