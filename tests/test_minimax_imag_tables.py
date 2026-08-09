@@ -575,6 +575,31 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
     here) and stopped being a statement about quadrature at all --
     which is why the assertion is against ``worst_synth`` and not
     against an absolute number that would drift with the fixture.
+
+    AND UNTIL THIS COMMIT IT ALSO CARRIED AN ABSOLUTE 1e-8 THAT DID NOT
+    MEAN THAT, which is the registered open row.  The absolute bar asked
+    the sampled fit to beat, by nearly an order of magnitude, a floor the
+    EXACT fit does not reach on this host: `worst_synth` is 8.65e-08
+    here, so `worst_eval < 1e-8` was unsatisfiable no matter how good the
+    quadrature got.  It is removed, not widened.  The relative bar that
+    was already beside it is the whole assertion now, and it says what
+    the paragraph above always claimed it said.
+
+    THE TWO-HOST MEASUREMENT IS WHY THIS IS THE RIGHT SHAPE AND NOT JUST
+    THE CONVENIENT ONE.  The synthesis baseline is set by the Pade
+    fixture's conditioning, which is a property of the host's LAPACK, and
+    it moves by more than a decade between hosts.  Measured:
+
+        this host   recovery 9.98e-08   baseline 8.65e-08   ratio 1.15
+        the tables campaign's host
+                    recovery 3.33e-09   baseline 3.81e-09   ratio 0.87
+
+    The baselines are 23x apart; the RATIOS agree to within 30%, and the
+    absolute 1e-8 bar happens to fall between the two baselines -- which
+    is exactly why the same code passed that assertion on one host and
+    failed it on the other.  A bar on the ratio is a bar on the thing the
+    cell is about: whether the sampled fit has reached the exact fit's
+    floor.  A bar on the absolute error is a bar on whose machine it ran.
     """
 
     from gw.mpa import evaluator, pade_fit, sample_plan   # noqa: PLC0415
@@ -641,8 +666,14 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
           f"synthesis baseline of {worst_synth:.3e} at Pade condition "
           f"{cond:.2e}; {cost['kernel_nodes']} kernel nodes")
     assert sample_error < 1.0e-11
-    assert worst_eval < 1.0e-8
-    assert worst_eval < 2.0 * worst_synth
+    # RELATIVE TO THE CELL'S OWN SYNTHESIS BASELINE, and only that.  The
+    # absolute 1e-8 that used to sit here was below `worst_synth` on this
+    # host and above it on another; see the docstring.  2.0 covers the
+    # measured spread of 0.87 to 1.15 with ~1.7x of margin.
+    assert worst_eval < 2.0 * worst_synth, (
+        f"recovery {worst_eval:.3e} is {worst_eval / worst_synth:.2f}x the "
+        f"synthesis baseline {worst_synth:.3e}; the sampled fit has not "
+        f"reached the exact fit's floor")
 
 
 def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
@@ -734,8 +765,12 @@ def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
     assert picked["entry"]["rule"] == "positive_composite"
     assert picked["entry"]["beta_axis"] == "exact_phase_on_fixed_nodes"
     assert picked["err"] <= tol
-    assert worst_eval < 1.0e-8
-    assert worst_eval < 2.0 * worst_synth
+    # Relative, for the reason the sibling cell's docstring gives at
+    # length: the baseline is host conditioning and moves by a decade
+    # between machines, while the ratio does not.
+    assert worst_eval < 2.0 * worst_synth, (
+        f"recovery {worst_eval:.3e} is {worst_eval / worst_synth:.2f}x the "
+        f"synthesis baseline {worst_synth:.3e}")
 
 
 def test_the_catalog_carries_both_tiers_and_says_who_asks_for_each():
