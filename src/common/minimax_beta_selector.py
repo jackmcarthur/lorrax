@@ -65,11 +65,19 @@ import json
 
 import numpy as np
 
+from common import minimax_family_axes as _axes
+
 
 #: The catalog's family name, its file, and the campaign that made it.
-FAMILY = "complex_laplace"
-CATALOG_FILE = "catalog_complex_laplace.json"
-GENERATOR = "tools/generate_imag_minimax_assets.py"
+#: This family's AXIS RECORD.  ``FAMILY``/``CATALOG_FILE``/``GENERATOR``
+#: are read off it rather than restated, so which catalog this door opens
+#: and which way each of its axes rounds are declared in ONE place
+#: (``common.minimax_family_axes``) for every family, rather than once
+#: per door where the second copy drifts.
+_AXES = _axes.COMPLEX_LAPLACE
+FAMILY = _AXES.family
+CATALOG_FILE = _AXES.catalog_file
+GENERATOR = _AXES.generator
 
 #: The two clause names.  They are module constants rather than bare
 #: strings at the call sites so that a typo is an ImportError and not a
@@ -501,11 +509,21 @@ def select(
         node_count = _need(entry, index, "node_count", int)
         if not bool(entry.get("certified", False)):
             continue
-        if entry_range + 1.0e-12 < float(range_value):
+        # The three directions come from the family's AXIS RECORD rather
+        # than from three inequalities written out here, so this door and
+        # the damped_line door cannot drift apart on which way an axis
+        # rounds.  The comparisons themselves are unchanged: R up, tier
+        # down, nodes a ceiling.
+        if not _axes.covers(_AXES.direction_for("range_max"),
+                            entry_range, float(range_value),
+                            tol=1.0e-12):
             continue
-        if entry_err - 1.0e-18 > float(target_error):
+        if not _axes.covers(_AXES.direction_for("error_bound"),
+                            entry_err, float(target_error),
+                            tol=1.0e-18):
             continue
-        if node_count > int(max_nodes):
+        if not _axes.covers(_AXES.direction_for("node_count"),
+                            node_count, int(max_nodes)):
             continue
         in_shape.append((index, entry))
 
