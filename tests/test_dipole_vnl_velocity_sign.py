@@ -392,6 +392,75 @@ def test_producer_refuses_a_deck_key_that_is_not_a_sign(deck):
         resolve_vnl_velocity_sign(None, deck)
 
 
+def _deck(tmp_path, body):
+    p = tmp_path / "deck.in"
+    p.write_text("[cohsex]\nwfn_file = WFN.h5\n" + body)
+    return str(p)
+
+
+@pytest.mark.parametrize("written, want", [("+1", "+1"), ("-1", "-1"),
+                                           ("flipped", "flipped")])
+def test_the_deck_key_survives_the_deck_reader(tmp_path, written, want):
+    """The FALSE case a grep would have passed, and did.
+
+    ``read_lorrax_input`` builds its params dict from ``_DEFAULTS``
+    ALONE, so a key absent from that table is parsed, reported as
+    unrecognized and dropped -- and the producer then reads its own
+    default and runs the OTHER ARM while the deck says otherwise.  That
+    is not hypothetical: the first flipped-arm ``dipole.h5`` of this
+    campaign came back stamped ``-1.0``, with "1 unrecognized deck
+    key(s)" in the log, because the key had been plumbed everywhere
+    except into ``_DEFAULTS``.  Reading the value back verbatim -- not
+    folded to a bool, not coerced -- is what says the whole chain from
+    the deck line to the resolver is connected.
+    """
+    from gw.gw_config import read_lorrax_input
+
+    params = read_lorrax_input(
+        _deck(tmp_path, f"vnl_velocity_sign = {written}\n"))
+    assert params["vnl_velocity_sign"] == want
+
+
+def test_a_deck_that_omits_the_key_reads_as_not_declared(tmp_path):
+    """Empty is UNSET and must stay distinguishable from an explicit
+    ``-1``: the two produce the same operator and the same numbers, but
+    only one of them is a deck that made a choice."""
+    from gw.gw_config import read_lorrax_input
+
+    params = read_lorrax_input(_deck(tmp_path, ""))
+    assert params["vnl_velocity_sign"] == ""
+
+
+def test_strict_keys_accepts_a_deck_that_names_the_sign(tmp_path):
+    """``strict_keys = true`` REFUSES unknown keys by name, so a deck
+    that declares the sign under it is the sharpest witness that the key
+    is registered rather than merely tolerated."""
+    from gw.gw_config import read_lorrax_input
+
+    params = read_lorrax_input(_deck(
+        tmp_path, "vnl_velocity_sign = +1\nstrict_keys = true\n"))
+    assert params["vnl_velocity_sign"] == "+1"
+
+
+def test_the_whole_chain_from_deck_line_to_resolved_sign(tmp_path):
+    """Deck text in, arm out -- the two halves joined.
+
+    Each half is gated above; this is the cell that fails if they are
+    gated against different spellings of the key.
+    """
+    from gw.gw_config import read_lorrax_input
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+
+    for written, want in (("+1", VNL_VELOCITY_SIGN_FLIPPED),
+                          ("-1", VNL_VELOCITY_SIGN_SHIPPED),
+                          ("flipped", VNL_VELOCITY_SIGN_FLIPPED),
+                          ("", VNL_VELOCITY_SIGN_SHIPPED)):
+        line = f"vnl_velocity_sign = {written}\n" if written else ""
+        params = read_lorrax_input(_deck(tmp_path, line))
+        got = resolve_vnl_velocity_sign(None, params["vnl_velocity_sign"])
+        assert got == want, (written, got, want)
+
+
 # ---------------------------------------------------------------------------
 # 5. The stamp -- a dipole.h5 that cannot say which arm built it
 # ---------------------------------------------------------------------------

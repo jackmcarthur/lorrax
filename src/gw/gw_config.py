@@ -958,6 +958,25 @@ _DEFAULTS = {
     "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
+    # The relative sign of the i[r, V_NL] commutator in the assembled
+    # velocity, read by ``psp.get_dipole_mtxels`` and passed to
+    # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the shipped
+    # assembly and ``+1`` the arm that reproduces BerkeleyGW's q -> 0
+    # head; the words "shipped" / "flipped" spell the same two.  Empty is
+    # NOT DECLARED and resolves to the shipped sign -- and for that
+    # reason it must be a STRING default: a float default would make
+    # "unset" and an explicit "-1" indistinguishable, and the whole point
+    # of the stamp this feeds is to say which arm a dipole.h5 was built
+    # with.
+    #
+    # IT HAS TO BE HERE.  ``read_lorrax_input`` builds ``params`` from
+    # this table alone, so a key absent from it is parsed, reported as
+    # unrecognized and dropped -- the producer then reads its own default
+    # and the run is the other arm.  Measured, not argued: the first
+    # flipped-arm dipole.h5 came back stamped ``-1.0`` with
+    # "1 unrecognized deck key(s)" in the log, which is this project's
+    # named failure mode reproduced in one line of a deck.
+    "vnl_velocity_sign": "",
     "do_G0": True,
     # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
     # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
