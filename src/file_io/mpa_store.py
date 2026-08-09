@@ -169,6 +169,51 @@ MPA_FIT_READABLE_VERSIONS = (1, 2)
 #: the ``n_p`` poles fitted to them.
 MPA_HEAD_SUFFIX = "__mpahead"
 
+#: LABELLED head sets, and why the axis needed more than one slot.
+#:
+#: The q -> 0 head is built from the dipole matrix elements, and
+#: ``common.mtxel_sweep.dipole_operator`` assembles the velocity as
+#: ``v = 2(k+G) psi - dV_NL/dK psi``.  Measured against BerkeleyGW's own
+#: q0 head at all 265 contour-deformation frequencies on the matched
+#: nband = 100 deck, the shipped relative sign puts eps00(0) 31 % high with
+#: the SHAPE right (one global scale of 1.377 on eps - 1 leaves a 0.3 %
+#: median residual), while flipping it agrees to 1.0e-5 at z = 0 and a
+#: median 4.8e-6 on the imaginary axis.  That is what a sign looks like and
+#: not what a magnitude looks like -- but changing the character moves
+#: every ``dipole.h5`` in the tree, the four regression fixtures
+#: ``harness.protect_fixtures`` holds read-only, the BSE absorption
+#: references and the plasmon-pole head, so it is an OWNER decision and it
+#: is pending.
+#:
+#: A store that carried only one of the two would force that decision by
+#: omission, and a store that carried the wrong one silently would be
+#: indistinguishable from a store that carried the right one.  So the axis
+#: takes NAMED sets: the default label writes the group this format already
+#: had (a v2 store with one head is unchanged, byte for byte), and any
+#: other label writes a sibling beside it.  The consumer names which one it
+#: is using and that name reaches the output, so a number can always be
+#: attributed to a convention.
+MPA_HEAD_DEFAULT_LABEL = "as_shipped"
+
+
+def head_group_name(label=None):
+    """The group a head set with this label lives in.
+
+    ``None`` and the default label BOTH resolve to the bare
+    ``__mpahead``, which is what makes this backward compatible: a store
+    written before labels existed is a store with exactly one head set,
+    and it is the default one.
+    """
+    if label is None or str(label) == MPA_HEAD_DEFAULT_LABEL:
+        return MPA_HEAD_SUFFIX
+    lab = str(label)
+    if not lab or "/" in lab or lab != lab.strip():
+        raise ValueError(
+            f"head_group_name: {label!r} is not a usable head-set label; "
+            f"it becomes an HDF5 group name beside the tensor.")
+    return f"{MPA_HEAD_SUFFIX}__{lab}"
+
+
 #: Attr marking the leading frequency axis.  Its presence is the ATTR
 #: half of the rank cross-check, and the string names what is removable.
 _FREQ_ATTR = "mpa_freq_axis"
@@ -1905,7 +1950,7 @@ def read_pole_slice(src, p, *, allow_partial=False, mode="r"):
         return Om, Bp
 
 
-def allocate_head_axis(dest, *, n_p, mode="a"):
+def allocate_head_axis(dest, *, n_p, label=None, mode="a"):
     """Create the q -> 0 head's ``2*n_p`` sample slots and ``n_p`` pole slots.
 
     Separate from :func:`allocate_fit_store` on purpose: the head is a
@@ -1920,10 +1965,11 @@ def allocate_head_axis(dest, *, n_p, mode="a"):
     if n_p < 1:
         raise ValueError(
             f"allocate_head_axis: n_p={n_p} must be positive.")
+    gname = head_group_name(label)
     with qs.QirrDest(dest, mode) as grp:
-        if MPA_HEAD_SUFFIX in grp:
-            del grp[MPA_HEAD_SUFFIX]
-        hd = grp.create_group(MPA_HEAD_SUFFIX)
+        if gname in grp:
+            del grp[gname]
+        hd = grp.create_group(gname)
         # The 2*n_p SAMPLES: the double-parallel grid is complex, so the
         # frequency axis is complex too.  ``persist_w0_and_head`` stores a
         # float omega_grid because {0, i*omega_p} has one nonzero part per
@@ -1937,13 +1983,15 @@ def allocate_head_axis(dest, *, n_p, mode="a"):
         hd.create_dataset("head_B_p", shape=(n_p,), dtype=np.complex128)
         hd.attrs["mpa_head_n_p"] = np.int64(n_p)
         hd.attrs["mpa_head_ready"] = False
+        hd.attrs["mpa_head_label"] = str(
+            MPA_HEAD_DEFAULT_LABEL if label is None else label)
         grp.attrs["mpa_fit_format_version"] = np.int64(
             MPA_FIT_FORMAT_VERSION)
         return int(n_p)
 
 
 def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
-                    vhead=None, mode="a"):
+                    vhead=None, label=None, provenance=None, mode="a"):
     """Fill the head axis and mark it ready, in one call and only once.
 
     ``head_z`` / ``head_w`` are the ``2*n_p`` sample points and the head of
@@ -1953,12 +2001,15 @@ def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
     a store whose head nobody can certify.
     """
     qs = _qs()
+    gname = head_group_name(label)
     with qs.QirrDest(dest, mode) as grp:
-        if MPA_HEAD_SUFFIX not in grp:
+        if gname not in grp:
             raise ValueError(
-                "write_head_axis: no head axis is allocated on this store; "
-                "call allocate_head_axis(n_p=...) first.")
-        hd = grp[MPA_HEAD_SUFFIX]
+                f"write_head_axis: no head axis labelled "
+                f"{MPA_HEAD_DEFAULT_LABEL if label is None else label!r} is "
+                f"allocated on this store (group {gname!r}); call "
+                f"allocate_head_axis(n_p=..., label=...) first.")
+        hd = grp[gname]
         n_p = int(hd.attrs["mpa_head_n_p"])
         if bool(hd.attrs.get("mpa_head_ready", False)):
             raise ValueError(
@@ -1986,12 +2037,14 @@ def write_head_axis(dest, head_z, head_w, head_Omega_p, head_B_p, *,
                 "head's fit owes the same.")
         if vhead is not None:
             hd.attrs["mpa_head_vhead"] = complex(vhead)
+        for key, val in (provenance or {}).items():
+            hd.attrs["prov_" + str(key)] = val
         hd.attrs["mpa_head_ready"] = True
         hd.attrs["mpa_head_written_utc"] = _utc_now()
         return int(n_p)
 
 
-def read_head_poles(src, *, mode="r"):
+def read_head_poles(src, *, label=None, mode="r"):
     """The q -> 0 head's poles and samples, or a refusal that names the gap.
 
     THE RED TWIN THIS EXISTS FOR.  A fit store written before the head
@@ -2003,12 +2056,16 @@ def read_head_poles(src, *, mode="r"):
     "absent", so this refuses by name instead of returning anything.
     """
     qs = _qs()
+    gname = head_group_name(label)
     with qs.QirrDest(src, mode) as grp:
         version = int(grp.attrs.get("mpa_fit_format_version", -1))
-        if MPA_HEAD_SUFFIX not in grp:
+        if gname not in grp:
+            have = sorted(k for k in grp
+                          if str(k).startswith(MPA_HEAD_SUFFIX))
             raise ValueError(
                 f"read_head_poles: this fit store (format version {version}) "
-                f"carries no {MPA_HEAD_SUFFIX!r} group, so it has no q -> 0 "
+                f"carries no {gname!r} group (it has {have}), so the head "
+                f"set asked for is absent.  It has no q -> 0 "
                 f"head.  The MPA Sigma path REFUSES it by name rather than "
                 f"running head-less: the head is not a correction that can "
                 f"be omitted and noticed later -- Sigma_c would be missing "
@@ -2017,7 +2074,7 @@ def read_head_poles(src, *, mode="r"):
                 f"head leg against this store (allocate_head_axis + "
                 f"write_head_axis, format version {MPA_FIT_FORMAT_VERSION}), "
                 f"or use compute_mode = gn_ppm, whose head is analytic.")
-        hd = grp[MPA_HEAD_SUFFIX]
+        hd = grp[gname]
         if not bool(hd.attrs.get("mpa_head_ready", False)):
             raise ValueError(
                 "read_head_poles: the head axis is allocated but not stamped "
@@ -2026,6 +2083,9 @@ def read_head_poles(src, *, mode="r"):
                 "nothing, which is exactly the reading a converged dark "
                 "channel would give.  Finish the head leg or refuse the run.")
         return {
+            "label": qs.qirr_attr_str(hd, "mpa_head_label")
+            if "mpa_head_label" in hd.attrs else MPA_HEAD_DEFAULT_LABEL,
+            "group": gname,
             "n_p": int(hd.attrs["mpa_head_n_p"]),
             "z": np.asarray(hd["head_z"][()]),
             "w": np.asarray(hd["head_w"][()]),

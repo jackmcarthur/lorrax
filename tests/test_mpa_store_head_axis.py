@@ -179,3 +179,101 @@ def test_an_unknown_format_version_still_refuses(tmp_path):
         f.attrs["mpa_fit_format_version"] = np.int64(99)
     with pytest.raises(ValueError, match="format version 99"):
         mpa_store.fit_completion_ledger(path)
+
+
+# ---------------------------------------------------------------------------
+#  LABELLED head sets -- the two sign conventions living side by side
+# ---------------------------------------------------------------------------
+
+def _head_values(n_p, scale=1.0):
+    """A well-formed head set: 2*n_p samples and n_p fourth-quadrant poles."""
+    z = np.concatenate([np.linspace(0.0, 2.0, n_p),
+                        1.0j + np.linspace(0.0, 2.0, n_p)])
+    w = scale * (np.arange(2 * n_p) + 1.0) * (1.0 + 0.5j)
+    Om = scale * (np.arange(1, n_p + 1) - 0.1j)
+    B = scale * (np.arange(1, n_p + 1) + 0.25j)
+    return z, w, Om, B
+
+
+def test_the_default_label_is_the_group_this_format_already_had(tmp_path):
+    """Labels must not migrate a store that has one head.
+
+    The FALSE case is a format that renamed the group when labels arrived:
+    every v2 store written before today would then read as headless, and
+    ``read_head_poles`` would refuse a file whose head is right there.
+    """
+    assert mpa_store.head_group_name(None) == mpa_store.MPA_HEAD_SUFFIX
+    assert (mpa_store.head_group_name(mpa_store.MPA_HEAD_DEFAULT_LABEL)
+            == mpa_store.MPA_HEAD_SUFFIX)
+    assert (mpa_store.head_group_name("commutator_flipped")
+            == mpa_store.MPA_HEAD_SUFFIX + "__commutator_flipped")
+
+    path = _store(tmp_path, n_p=3)
+    z, w, Om, B = _head_values(3)
+    mpa_store.allocate_head_axis(path, n_p=3)
+    mpa_store.write_head_axis(path, z, w, Om, B, vhead=3303.7)
+    # Written with no label, read back with no label AND with the default
+    # label spelled out: the two must be the same object.
+    a = mpa_store.read_head_poles(path)
+    b = mpa_store.read_head_poles(path, label="as_shipped")
+    assert a["group"] == b["group"] == mpa_store.MPA_HEAD_SUFFIX
+    assert np.array_equal(a["Omega_p"], b["Omega_p"])
+
+
+def test_two_sign_conventions_coexist_and_are_told_apart(tmp_path):
+    """Both head sets in one store, each answering under its own name.
+
+    This is the whole point of the label: the owner's decision on the
+    nonlocal velocity commutator's sign is pending, so the table carries
+    both columns and neither convention is chosen by the file format.
+    """
+    n_p = 3
+    path = _store(tmp_path, n_p=n_p)
+    z, w, Om, B = _head_values(n_p, scale=1.0)
+    z2, w2, Om2, B2 = _head_values(n_p, scale=1.377)
+
+    mpa_store.allocate_head_axis(path, n_p=n_p)
+    mpa_store.write_head_axis(path, z, w, Om, B, vhead=3303.7,
+                              provenance={"velocity_sign": "as shipped"})
+    mpa_store.allocate_head_axis(path, n_p=n_p, label="commutator_flipped")
+    mpa_store.write_head_axis(path, z2, w2, Om2, B2, vhead=3303.7,
+                              label="commutator_flipped",
+                              provenance={"velocity_sign": "flipped"})
+
+    shipped = mpa_store.read_head_poles(path)
+    flipped = mpa_store.read_head_poles(path, label="commutator_flipped")
+
+    assert shipped["label"] == "as_shipped"
+    assert flipped["label"] == "commutator_flipped"
+    # The FALSE case this cell exists for: a label that is parsed, stored
+    # and never read would return the SAME numbers for both, which is
+    # exactly the "a key can be present and never read" failure the project
+    # has paid for twice.  So the two must actually differ.
+    assert not np.allclose(shipped["Omega_p"], flipped["Omega_p"])
+    assert np.allclose(flipped["Omega_p"], 1.377 * shipped["Omega_p"])
+    assert not np.allclose(shipped["w"], flipped["w"])
+
+
+def test_a_missing_label_refuses_and_names_what_the_store_does_have(tmp_path):
+    """Asking for a head set that was never written must not fall back.
+
+    Falling back to the default would hand a Sigma the OTHER sign
+    convention under the name of the one that was asked for -- finite,
+    smooth, and attributed to the wrong physics.
+    """
+    path = _store(tmp_path, n_p=3)
+    z, w, Om, B = _head_values(3)
+    mpa_store.allocate_head_axis(path, n_p=3)
+    mpa_store.write_head_axis(path, z, w, Om, B)
+    with pytest.raises(ValueError) as exc:
+        mpa_store.read_head_poles(path, label="commutator_flipped")
+    msg = str(exc.value)
+    assert "__mpahead__commutator_flipped" in msg
+    # and it says what IS there, so the operator can pick a real one
+    assert "__mpahead" in msg
+
+
+def test_an_unusable_label_is_refused_before_it_becomes_a_group(tmp_path):
+    for bad in ("", " leading_space", "with/slash"):
+        with pytest.raises(ValueError):
+            mpa_store.head_group_name(bad)
