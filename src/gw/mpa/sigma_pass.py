@@ -424,6 +424,49 @@ def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):
         f"at, not one worth 2^16 masks.")
 
 
+#: Ceiling on ``Gamma_hi/Gamma_lo`` within one CROSSING pane.  The
+#: crossing core's bandwidth is ``A = f_max/Gamma_lo`` with ``f_max``
+#: dominated by the pane ``T = omega_max + edge_factor*Gamma_hi``, so a
+#: pane mixing decades of width pays ``A ~ edge*Gamma_hi/Gamma_lo`` --
+#: the first fixed-tree verification leg measured A = 2485 needing
+#: 12 771 nodes against the 4 096 cap on exactly that mixture.  Binning
+#: the widths geometrically at this ratio bounds
+#: ``A <~ (2*omega_max + spread)/Gamma_lo + 2*edge*r`` at the two-point
+#: order the module docstring promises (``A_core = 2T/xi``): at the
+#: production xi and the +/-2 eV window that is ~50, i.e. a few hundred
+#: nodes.  4 is two octaves -- small enough to bound A, large enough
+#: that a field spanning four decades of width is ~7 panes, not 40.
+CROSSING_WIDTH_RATIO_MAX = 4.0
+
+
+def _geometric_width_bins(gamma_ry, mask, *, r_max=CROSSING_WIDTH_RATIO_MAX):
+    """Partition ``mask`` into width panes of bounded ratio -- directly.
+
+    ``np.digitize`` on ``log Gamma``, NO recursion: the bin count is
+    ``ceil(log_r(Gamma_hi/Gamma_lo))`` by construction and the returned
+    masks partition the input, so this cannot diverge the way the
+    clause-driven recursion did -- there is no predicate to satisfy,
+    only a ratio to respect.  Single-width sets (and empty ones) come
+    back whole.
+    """
+    g = np.asarray(gamma_ry, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return []
+    g_lo, g_hi = _stats(g, m)
+    if not (g_lo > 0.0) or g_hi <= g_lo * float(r_max):
+        return [m]
+    n_bins = int(np.ceil(np.log(g_hi / g_lo) / np.log(float(r_max))))
+    edges = g_lo * float(r_max) ** np.arange(1, n_bins)
+    which = np.digitize(g, edges)
+    out = []
+    for b in range(n_bins):
+        sub = m & (which == b)
+        if sub.any():
+            out.append(sub)
+    return out
+
+
 def _clause_safe_width_split(a_ry, gamma_ry, mask, *, e_lo, omega_max,
                              beta_max, depth=0):
     """Split a mode set by width until every part's width clause is inside.
@@ -775,7 +818,18 @@ def plan_branch_groups(
         # docstring argues (Gamma <= a per pole, so a wide-width
         # sub-bucket has a deep Laplace edge of its own).
         if R.denominator_can_cross(space, bool(neg_omega_half)):
-            subs = [bucket]
+            # ...but the crossing CORE has a sizing concern of its own,
+            # and the first fixed-tree verification leg met it: the pane
+            # is set by the bucket's WIDEST width (T = omega_max +
+            # edge*Gamma_hi) while the rule's bandwidth divides by its
+            # NARROWEST (A = f_max/Gamma_lo), so a bucket mixing decades
+            # of width pays A ~ edge*Gamma_hi/Gamma_lo -- measured
+            # A = 2485, 12 771 nodes demanded against the 4 096 cap.
+            # Geometric width panes bound the ratio, and with it A, at
+            # the two-point order; the binning is direct (digitize on
+            # log Gamma), so it cannot diverge -- there is no clause to
+            # chase, only a ratio to respect.
+            subs = _geometric_width_bins(g, bucket)
         else:
             subs = _clause_safe_width_split(
                 a, g, bucket, e_lo=e_lo_A, omega_max=0.0,

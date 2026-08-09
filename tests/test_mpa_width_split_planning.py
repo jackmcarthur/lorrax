@@ -182,6 +182,31 @@ def test_the_leaf_ceiling_refuses_by_name_on_a_field_outside_the_argument():
     assert "4096 modes" in msg
 
 
+def test_geometric_width_bins_partition_and_bound_the_ratio():
+    """The crossing panes' splitter: direct digitize, no recursion, no
+    clause -- it must partition the set and hold Gamma_hi/Gamma_lo at or
+    under the ratio in every pane.  Its FALSE case is the verification
+    leg's own field shape: decades of width in one pane, where the core
+    rule demanded 12 771 nodes against the 4 096 cap (A = 2485)."""
+    rng = np.random.default_rng(5)
+    g = np.exp(rng.uniform(np.log(3e-2), np.log(3e2), size=2048))
+    live = np.ones(g.size, dtype=bool)
+    bins = sigma_pass._geometric_width_bins(g, live)
+    assert 1 < len(bins) <= 20
+    total = np.zeros(g.size, dtype=int)
+    r = sigma_pass.CROSSING_WIDTH_RATIO_MAX
+    for m in bins:
+        total += m.astype(int)
+        g_lo = float(np.min(g, where=m, initial=np.inf))
+        g_hi = float(np.max(g, where=m, initial=0.0))
+        assert g_hi <= g_lo * r * (1 + 1e-12)
+    assert np.array_equal(total, live.astype(int))
+    # Single-width and empty sets come back whole / empty.
+    assert len(sigma_pass._geometric_width_bins(np.full(8, 0.5),
+                                                np.ones(8, bool))) == 1
+    assert sigma_pass._geometric_width_bins(g, np.zeros(g.size, bool)) == []
+
+
 def test_the_crossing_branchs_windows_cannot_trip_the_width_clause():
     """The structural half of the no-split rule, checked as arithmetic:
     every Laplace window a crossing bucket builds floors x_min at
