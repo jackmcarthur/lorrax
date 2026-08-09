@@ -527,6 +527,30 @@ def star_select_k_irr(values, rows_to_keep, *, k_axis=0):
 	return np.take(np.asarray(values), rows, axis=k_axis)
 
 
+def _slab_to_host(a):
+	"""Host numpy for one Sigma slab, whether it is replicated or SHARDED.
+
+	The star-spread statistic is measured on ONE omega slice (the caller
+	slices before calling, so the transfer is the slice, not the cube).  On
+	the ``sigma_omega_layout = sharded`` path at P > 1 that slice is still a
+	GLOBALLY sharded ``jax.Array`` whose devices are not all addressable
+	from this process, and a bare ``np.asarray`` on it raises
+	"Fetching value for `jax.Array` that spans non-addressable ... devices"
+	-- which is exactly how the sharded layout died at P=4 the first time
+	anyone ran it through the k_irr extraction (the extraction landed
+	2026-08-08, the sharded layout 2026-07-28, and the two had never met).
+
+	Same reconstruction ``ppm_windows._to_host_np`` uses, and for the same
+	reason; kept local because this module is numpy+h5py by charter and does
+	not import jax at module scope.  Replicated / numpy operands take the
+	fast path unchanged, so the default layout is byte-for-byte untouched.
+	"""
+	if getattr(a, "is_fully_addressable", True):
+		return np.asarray(a)
+	from jax.experimental import multihost_utils
+	return np.asarray(multihost_utils.process_allgather(a, tiled=True))
+
+
 def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
                             n_sym_spatial, *, k_axis=0, omega_index=None):
 	"""How far this array is from its own star relation.  FOUR numbers.
@@ -581,9 +605,9 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	if ndim == 4:
 		if omega_index is None:
 			omega_index = np.shape(values)[0] // 2
-		M = np.asarray(values[int(omega_index)])
+		M = _slab_to_host(values[int(omega_index)])
 	else:
-		M = np.asarray(values)
+		M = _slab_to_host(values)
 		omega_index = -1
 	if k_axis != 0:
 		M = np.moveaxis(M, k_axis - (1 if ndim == 4 else 0), 0)
