@@ -1,0 +1,830 @@
+{
+  "schema_version": 2,
+  "family": "complex_laplace",
+  "clause": {
+    "name": "width",
+    "numerator": "Gamma_p / x_min -- a fitted pole width over a window edge (the Sigma-stage Laplace complement)",
+    "beta_max": 1.0,
+    "derivation": "the width clause's edge is DERIVED and not observed, which is why it is a rung worth building against. On a sign-definite branch gw.mpa.sigma_routing.route_pole sets x_min = min(E_A) + a_p with a_p = Re Omega_p and min(E_A) >= 0, so x_min >= Re Omega_p. The fit's fourth guard (gw.mpa.pade_fit, DEFAULT_GUARDS['width_ratio_max'] = 1.0) caps |Im Omega_p| <= width_ratio_max * Re Omega_p. Therefore beta = Gamma_p / x_min = |Im Omega_p| / x_min <= width_ratio_max * Re Omega_p / Re Omega_p = width_ratio_max = 1 for EVERY pole of EVERY field this fitter can produce. The rung and the guard are the same number, so the campaign is bounded by construction rather than by a histogram that happens to fit. On the crossing branches the same quantity is bounded more tightly still, by 1/edge_factor, because those windows floor x_min at edge_factor*Gamma_p.",
+    "note": "beta is ONE dimensionless number formed from two unrelated numerators, and the two ranges overlap near 0.6, so a request must say which clause it is asking under. common.minimax_beta_selector.CATALOG_CLAUSE stamps this catalog's target.version with the clause above and refuses a request from the other one by name."
+  },
+  "target": {
+    "definition": "1/(u - i*beta) on u in [1, R]",
+    "version": "complex_laplace_width/v1",
+    "real_part_alias": "Re 1/(u - i*beta) = u/(u^2 + beta^2) is common.minimax._imag_target(u, omega_hat) at omega_hat = beta, so alpha.real serves the noncrossing_imag consumer from the same payload.",
+    "error_metric": "linf_abs_complex_modulus_scaled",
+    "physical_error_note": "runtime rescales from [1,R] to [x_min, x_max] by tau/x_min, alpha/x_min at omega_p = beta*x_min, so absolute error scales as max_error/x_min. The rescale_max_error_ratio field is that claim, measured over eleven decades of x_min."
+  },
+  "selection_rule": {
+    "range": "smallest_tabulated_ge_requested",
+    "error_bound": "largest_tabulated_le_requested",
+    "max_nodes": "table_node_count_must_not_exceed_request",
+    "beta": "|requested - entry beta| <= entry beta_tolerance, a MEASURED two-sided band and not a rounding rule. The target is a different function at every beta, so no direction is conservative; but d/dbeta of the target has modulus 1/(1 + beta^2) at the hard end of the interval, so an entry absorbs a mismatch of about error_bound*(1 + beta^2) -- 2.6e-4 at beta = 16 and the 1e-6 tier. Entries whose beta_axis is 'exact_phase_on_fixed_nodes' additionally serve the whole band [beta_min, beta] exactly, because there beta enters only as a unit-modulus phase on nodes chosen without reference to it."
+  },
+  "shipping_rule": {
+    "source": "MPA_THEORY_PLAN.md section E",
+    "kappa0_definition": "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
+    "kappa0_reference": "the pure-damping envelope integral 1/u, which is the same normalisation gw.mpa.evaluator.damped_line_rule uses for the strip; every certified shipped noncrossing table measures between 1.0000 and 1.0215 under it.",
+    "normal": 2.0,
+    "versioned_exception": 4.0,
+    "rejected_above": 4.0
+  },
+  "certification": {
+    "held_out_grid": "half-cell-offset log grid of 20001 points plus both endpoints, disjoint from every grid the solver saw",
+    "checks": [
+      "held_out_error",
+      "real_part_error",
+      "kappa0",
+      "moment",
+      "rescale",
+      "positive_nodes"
+    ],
+    "byte_identity": "payload_sha256 is SHA-256 over the little-endian float64 tau bytes followed by the complex128 alpha bytes. Cross-platform agreement is asserted on the TABLE, not on a re-solve."
+  },
+  "provenance": {
+    "tool": "tools/generate_imag_minimax_assets.py",
+    "tool_sha256": "3e1d93212c32354cdcbde6bed49247ffd9b59d78dac44481f381a0ee20d4e9bd",
+    "numpy": "2.4.3",
+    "scipy": "1.17.1",
+    "python": "3.12.3",
+    "lp_solver": "scipy.optimize.linprog(method='highs')",
+    "seed_policy": "no seed: both routes are deterministic convex programs or fixed Gauss-Legendre panels. The only randomness is the rescaling check's draw, which is seeded at 20260808 and is a test, not a solve."
+  },
+  "sweep": {
+    "solver_wall_seconds": 0.08,
+    "entries": 15,
+    "certified": 15,
+    "by_rule": {
+      "positive_composite": 15
+    },
+    "ledger": [
+      {
+        "range_max": 10.0,
+        "beta": 1.0,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 44,
+            "kappa0": 0.9999999991375473,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 1.0,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 50,
+            "kappa0": 0.9999999991058274,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 1.0,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 54,
+            "kappa0": 0.9999999991058156,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 1.0,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 60,
+            "kappa0": 0.9999999991058308,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 215.44346900318823,
+        "beta": 1.0,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 64,
+            "kappa0": 0.9999999992100849,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 10.0,
+        "beta": 1.0,
+        "error_bound": 1e-08,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 58,
+            "kappa0": 0.9999999999988424,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 1.0,
+        "error_bound": 1e-08,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 64,
+            "kappa0": 0.9999999999989501,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 1.0,
+        "error_bound": 1e-08,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 68,
+            "kappa0": 0.9999999999988589,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 1.0,
+        "error_bound": 1e-08,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 76,
+            "kappa0": 0.9999999999996042,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 215.44346900318823,
+        "beta": 1.0,
+        "error_bound": 1e-08,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 82,
+            "kappa0": 0.9999999999997244,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 10.0,
+        "beta": 1.0,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 84,
+            "kappa0": 1.0000000000000002,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 1.0,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 96,
+            "kappa0": 1.0000000000000002,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 1.0,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 106,
+            "kappa0": 1.0000000000000004,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 1.0,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 114,
+            "kappa0": 1.0000000000000004,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 215.44346900318823,
+        "beta": 1.0,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 126,
+            "kappa0": 1.0000000000000002,
+            "wall_s": 0.01
+          }
+        ]
+      }
+    ]
+  },
+  "tables": [
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 10.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 44,
+      "max_error": 1.5896470836802845e-07,
+      "real_part_max_error": 1.4983305263172042e-07,
+      "kappa0": 0.9999999991375473,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084168,
+      "moment_residual": 9.669159066245155e-08,
+      "moment_ceiling": 2.25e-06,
+      "rescale_max_error_ratio": 1.0000000017101591,
+      "beta_tolerance": 1.6689300537109375e-06,
+      "certified": true,
+      "payload_sha256": "0c02f9233f9ee878e2295f2f351ff19c89af7fb5fd0d382c6af79afea02b63ce",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_10p000000_b_1p000000000000_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 9,
+        "panel_orders": [
+          4,
+          6
+        ],
+        "sum_h": 15.201804919084168,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 50,
+      "max_error": 1.685618442989107e-07,
+      "real_part_max_error": 1.5679942988455764e-07,
+      "kappa0": 0.9999999991058274,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084163,
+      "moment_residual": 9.497668186841147e-08,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 1.0000000015901054,
+      "beta_tolerance": 1.6689300537109375e-06,
+      "certified": true,
+      "payload_sha256": "052db11c8668a77e5097d26f0506b981a2cfd8e4bdac9a3ed3b8cb0faa54a068",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_21p544347_b_1p000000000000_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 10,
+        "panel_orders": [
+          4,
+          6
+        ],
+        "sum_h": 15.201804919084163,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 54,
+      "max_error": 1.7200208350786628e-07,
+      "real_part_max_error": 1.6131885849368643e-07,
+      "kappa0": 0.9999999991058156,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084164,
+      "moment_residual": 6.993492493567972e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 1.00000000114955,
+      "beta_tolerance": 1.6689300537109375e-06,
+      "certified": true,
+      "payload_sha256": "58c958ac7a0779830061632bc24565ec6ee7f98b441dfa5f15db0a283a2ab201",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_46p415888_b_1p000000000000_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 11,
+        "panel_orders": [
+          4,
+          6
+        ],
+        "sum_h": 15.201804919084163,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 60,
+      "max_error": 1.8276681212038137e-07,
+      "real_part_max_error": 1.7358780313170286e-07,
+      "kappa0": 0.9999999991058308,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084164,
+      "moment_residual": 1.4598914926428745e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.0000000018853692,
+      "beta_tolerance": 1.6093254089355469e-06,
+      "certified": true,
+      "payload_sha256": "a709731f2c59c3e8f3ccf916ed112c8918c39ff57394a3f1cc314911a5000362",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_100p000000_b_1p000000000000_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 12,
+        "panel_orders": [
+          4,
+          6
+        ],
+        "sum_h": 15.201804919084164,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 64,
+      "max_error": 1.827024812401897e-07,
+      "real_part_max_error": 1.750805351807827e-07,
+      "kappa0": 0.9999999992100849,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084164,
+      "moment_residual": 2.222078579964996e-06,
+      "moment_ceiling": 5.361086725079705e-05,
+      "rescale_max_error_ratio": 1.0000000012152213,
+      "beta_tolerance": 1.6093254089355469e-06,
+      "certified": true,
+      "payload_sha256": "67b205c1be36084f4290afbcf7a63ac4f7ff52e3e5c469c75da096af6f823643",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_215p443469_b_1p000000000000_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 13,
+        "panel_orders": [
+          4,
+          6
+        ],
+        "sum_h": 15.201804919084164,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 10.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 58,
+      "max_error": 1.756062880072567e-09,
+      "real_part_max_error": 2.7618107800719827e-10,
+      "kappa0": 0.9999999999988424,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 19.806975105072258,
+      "moment_residual": 9.410387398652428e-10,
+      "moment_ceiling": 2.25e-08,
+      "rescale_max_error_ratio": 1.000000068145143,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "15d8b6d728dd354f3c93e2c230e8ae08eef557511443489588905a132eadabb8",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_10p000000_b_1p000000000000_eps_1p0em08.npz",
+      "generation": {
+        "t_max": 19.806975105072254,
+        "n_panels": 10,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 19.806975105072254,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 64,
+      "max_error": 1.6942694647335657e-09,
+      "real_part_max_error": 2.6466584479578614e-10,
+      "kappa0": 0.9999999999989501,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 19.806975105072254,
+      "moment_residual": 1.6288748449075667e-09,
+      "moment_ceiling": 5.136086725079708e-08,
+      "rescale_max_error_ratio": 1.000000120744275,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "2978b758d74cacadd557d05cd425918db37d6d1b14a0f6ac3497534bd53f0151",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_21p544347_b_1p000000000000_eps_1p0em08.npz",
+      "generation": {
+        "t_max": 19.806975105072254,
+        "n_panels": 11,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 19.806975105072254,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 68,
+      "max_error": 1.5969488410820697e-09,
+      "real_part_max_error": 3.6557601390541095e-10,
+      "kappa0": 0.9999999999988589,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 19.80697510507226,
+      "moment_residual": 4.581057946271317e-09,
+      "moment_ceiling": 1.1353972084031943e-07,
+      "rescale_max_error_ratio": 0.9999999666057547,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "7b9763b27016fe2630c157cf9cd34e02d0b7c19fd074e8784ee574659c1e0f25",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_46p415888_b_1p000000000000_eps_1p0em08.npz",
+      "generation": {
+        "t_max": 19.806975105072254,
+        "n_panels": 12,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 19.80697510507226,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 76,
+      "max_error": 1.7654858506608832e-09,
+      "real_part_max_error": 2.980387048268085e-10,
+      "kappa0": 0.9999999999996042,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 19.806975105072254,
+      "moment_residual": 5.254802781216923e-09,
+      "moment_ceiling": 2.475e-07,
+      "rescale_max_error_ratio": 1.0000000678498244,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "c4dee285c128938572032e62fb2b56cf0808fe405ef73c252d26d21926153d8d",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_100p000000_b_1p000000000000_eps_1p0em08.npz",
+      "generation": {
+        "t_max": 19.806975105072254,
+        "n_panels": 13,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 19.806975105072254,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 82,
+      "max_error": 1.7227998365677294e-09,
+      "real_part_max_error": 2.86788148784467e-10,
+      "kappa0": 0.9999999999997244,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 19.806975105072254,
+      "moment_residual": 5.932408329252311e-09,
+      "moment_ceiling": 5.361086725079706e-07,
+      "rescale_max_error_ratio": 1.0000001303363713,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "8a54eff761e91f00d66a1f36491d098bd5c2c7fbc598ba9f521ff12e40fbecf5",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_215p443469_b_1p000000000000_eps_1p0em08.npz",
+      "generation": {
+        "t_max": 19.806975105072254,
+        "n_panels": 14,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 19.806975105072254,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 10.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 84,
+      "max_error": 1.7341875551532303e-13,
+      "real_part_max_error": 3.391731340229853e-14,
+      "kappa0": 1.0000000000000002,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 5.899506196267762e-14,
+      "moment_ceiling": 2.25e-12,
+      "rescale_max_error_ratio": 1.0013466676632503,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "8cf830063d8750021ee86a3d3e4e51ca9a1650c9ccbdc7c9a7d5f5983e947307",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_10p000000_b_1p000000000000_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 11,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 96,
+      "max_error": 1.5877741935688893e-13,
+      "real_part_max_error": 1.6965595595053173e-14,
+      "kappa0": 1.0000000000000002,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 5.528152627077331e-14,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.000681204031459,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "8ca3a78b020fe2e7eda5317da97f6853b0a5f7a8295affec28aa81e70338a475",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_21p544347_b_1p000000000000_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 12,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.01731547704843,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 106,
+      "max_error": 1.7734765980963167e-13,
+      "real_part_max_error": 2.885885974635016e-14,
+      "kappa0": 1.0000000000000004,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 5.835639759691581e-13,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 1.000047972026919,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "59e20e4776fac1eaa7652ee6afb2b03507daefe622507663ad4955db633bfa6a",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_46p415888_b_1p000000000000_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 13,
+        "panel_orders": [
+          6,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 114,
+      "max_error": 1.7750327519039843e-13,
+      "real_part_max_error": 2.6704333189186968e-14,
+      "kappa0": 1.0000000000000004,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 1.1733697504621108e-12,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0006459502294471,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "7cbb6de27fa204ec7535992389b4f146d3991c8cf89d2c58097e941d156c0577",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_100p000000_b_1p000000000000_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 14,
+        "panel_orders": [
+          6,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 215.44346900318823,
+      "beta_param": "omega_hat",
+      "beta": 1.0,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 126,
+      "max_error": 1.7613669916078617e-13,
+      "real_part_max_error": 2.4768381789996852e-14,
+      "kappa0": 1.0000000000000002,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.01731547704844,
+      "moment_residual": 1.7612842914358322e-12,
+      "moment_ceiling": 5.361086725079706e-11,
+      "rescale_max_error_ratio": 1.0014662910971504,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "a81eb4ad5b88dc21fd2e3b99f15649e373bd1826ea56d7e7ba868804892b27ba",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace_width/complex_laplace_width_R_215p443469_b_1p000000000000_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 16,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.01731547704844,
+        "beta_min": 0.0
+      }
+    }
+  ]
+}

@@ -825,3 +825,191 @@ def test_the_composite_route_regenerates_byte_identically():
     assert gen.payload_digest(t1, w1) == gen.payload_digest(t2, w2)
     assert hashlib.sha256(t1.tobytes()).digest() == \
         hashlib.sha256(t2.tobytes()).digest()
+
+
+# ---------------------------------------------------------------------------
+# 8. The width clause, scored against the pole field that demanded it
+# ---------------------------------------------------------------------------
+
+#: The MPA-Sigma routing audit's demand histogram, transcribed from
+#: ``pole_envelope_audit.json`` (deck ``si_mpa_0808``, ``Omega_p`` at
+#: ``(8, 8, 1128, 1128)``, 81 432 576 live poles, ``omega_max = 5 eV``,
+#: ``edge_factor = 1.5``).  Only the two SIGN-DEFINITE branches are here:
+#: ``val,+w`` and ``cond,-w`` are the ones with no ``z_edge`` floor, and
+#: they are identical to the digit because the branch algebra is a
+#: reflection.  The crossing branches need no catalog at all -- their
+#: ``x_min`` is floored at ``edge_factor*Gamma_p``, so ``beta <=
+#: 1/edge_factor`` identically and not one of the 81 million exceeded it.
+#:
+#: Vendored rather than read from ``/pscratch`` because a test may not
+#: depend on a filesystem it cannot reach; the provenance is the point of
+#: the comment above.
+AUDIT_BETA_EDGES = (0.0, 0.001, 0.01, 0.05, 0.1, 1.0 / 6.0, 1.0 / 3.0,
+                    2.0 / 3.0, 1.0, 2.0, 5.0, 10.0, float("inf"))
+AUDIT_SIGN_DEFINITE_COUNTS = (230208, 2021117, 7973423, 9944265, 12282145,
+                              18732969, 20867972, 9380477, 0, 0, 0, 0)
+AUDIT_SIGN_DEFINITE_WEIGHT = (
+    2971045183.6680374, 27039475294.75481, 152908683782.57443,
+    458683222495.335, 2014685721155.0557, 7501552983745.58,
+    47229625628187.11, 94632463853207.27, 0.0, 0.0, 0.0, 0.0)
+#: What the shipped catalog's ``beta_max = 2/3`` refused, measured.
+AUDIT_REFUSED_WEIGHT_FRACTION = 0.6225003752572608
+
+#: The interval every sign-definite window lands on, from the audit's own
+#: geometry: ``x_min = min(E_A) + a_p``, ``x_max = max(E_A) + a_p +
+#: omega_max``, with ``min(E_A) = 0.3463710850496852 eV`` (half the gap),
+#: ``max(E_A) = 56.35956006764737 eV`` and ``omega_max = 5 eV``.  The
+#: shallowest pole in the field (``Re Omega = 0.2647 eV``) gives the
+#: largest R.
+AUDIT_R_RANGE = (1.0095, 100.8538)
+
+
+def _width_entries():
+    from minimax import beta_selector as bs      # noqa: PLC0415
+
+    doc, why = bs.load_catalog(bs.WIDTH)
+    assert doc is not None, why
+    return doc
+
+
+def test_the_width_clause_ships_and_is_stamped_as_its_own_sweep():
+    """One family, two clauses, two catalogs -- and the stamp proves it.
+
+    ``beta`` is one dimensionless number built from two unrelated
+    numerators, and Gate 0 sec 2 measured them two orders apart.  The
+    catalogs are separate files because the ranges OVERLAP near 0.6: a
+    merged catalog would let a width request match a height entry
+    arithmetically and be served a rule fitted to a different physical
+    quantity.
+    """
+
+    from minimax import beta_selector as bs      # noqa: PLC0415
+
+    doc = _width_entries()
+    assert doc["schema_version"] == 2
+    assert doc["family"] == "complex_laplace"
+    assert doc["target"]["version"] == "complex_laplace_width/v1"
+    assert bs.CATALOG_CLAUSE[doc["target"]["version"]] == bs.WIDTH
+    assert doc["clause"]["name"] == "width"
+    assert doc["clause"]["beta_max"] == 1.0
+    # The derivation is IN the artifact, not only in a design document.
+    derivation = doc["clause"]["derivation"]
+    assert "width_ratio_max" in derivation
+    assert "x_min >= Re Omega_p" in derivation
+    assert all(e["certified"] for e in doc["tables"])
+    # Every width entry is an envelope on the composite route: that is
+    # what lets one sweep per (R, tier) cover a CONTINUOUS beta axis.
+    for entry in doc["tables"]:
+        assert entry["rule"] == "positive_composite"
+        assert entry["beta_axis"] == "exact_phase_on_fixed_nodes"
+        assert entry["beta"] == 1.0
+        assert entry["beta_min"] == 0.0
+        assert entry["kappa0"] == pytest.approx(1.0, abs=1.0e-6)
+
+
+def test_the_width_clause_edge_is_derived_from_the_fitters_own_guard():
+    """``beta_max = 1`` is an identity, not a histogram fit.
+
+    On a sign-definite branch ``x_min = min(E_A) + a_p >= Re Omega_p``,
+    and the fit's fourth guard caps ``|Im Omega| <= width_ratio_max *
+    Re Omega`` at 1.0.  So ``beta = Gamma/x_min <= width_ratio_max`` for
+    every pole of every field this fitter can produce.  The rung and the
+    guard are the same number; this asserts they have not drifted apart.
+    """
+
+    from minimax import beta_selector as bs      # noqa: PLC0415
+    from gw.mpa import pade_fit                          # noqa: PLC0415
+
+    guard = float(pade_fit.DEFAULT_GUARDS["width_ratio_max"])
+    assert bs.BETA_CLAUSES[bs.WIDTH].beta_max == guard
+    # And the audit's field obeys it: nothing above bin (2/3, 1].
+    assert sum(AUDIT_SIGN_DEFINITE_COUNTS[8:]) == 0
+    assert sum(AUDIT_SIGN_DEFINITE_WEIGHT[8:]) == 0.0
+
+
+def test_the_width_clause_serves_the_audits_whole_demand_histogram():
+    """The 62.25% of |B| mass that refused must now be SERVED.
+
+    Scored bin by bin against the audit's own distribution rather than
+    against a spot check: for each beta bin the request is placed at the
+    bin's UPPER edge (the hardest point in it) and at the R extremes the
+    audit's geometry produces, and the entry that comes back must be a
+    width-clause entry meeting its bound.  The served |B| mass is then
+    summed and compared with the audit's total.
+    """
+
+    from minimax import beta_selector as bs      # noqa: PLC0415
+
+    total = sum(AUDIT_SIGN_DEFINITE_WEIGHT)
+    served_weight = 0.0
+    served_count = 0
+    rows = []
+    for i, (lo, hi) in enumerate(zip(AUDIT_BETA_EDGES,
+                                     AUDIT_BETA_EDGES[1:])):
+        w = AUDIT_SIGN_DEFINITE_WEIGHT[i]
+        n = AUDIT_SIGN_DEFINITE_COUNTS[i]
+        if n == 0:
+            continue
+        ok = True
+        worst = 0.0
+        for R in AUDIT_R_RANGE:
+            got = bs.select(range_value=R, beta=hi, beta_clause=bs.WIDTH,
+                            target_error=1.0e-8, max_nodes=4000)
+            if not isinstance(got, bs.TableSelection):
+                ok = False
+                rows.append((lo, hi, "REFUSED", got.code))
+                break
+            assert got.catalog_version == "complex_laplace_width/v1"
+            assert got.certified_error <= got.error_bound
+            worst = max(worst, got.certified_error)
+        if ok:
+            served_weight += w
+            served_count += n
+            rows.append((lo, hi, "served", f"Re E<={worst:.2e}"))
+    for lo, hi, verdict, note in rows:
+        print(f"[width clause] beta in ({lo:.4g}, {hi:.4g}]: "
+              f"{verdict:8s} {note}")
+    frac = served_weight / total
+    print(f"[width clause] |B| mass served: {frac:.6%} of "
+          f"{total:.4e}; poles served {served_count} / "
+          f"{sum(AUDIT_SIGN_DEFINITE_COUNTS)}; the shipped beta_max=2/3 "
+          f"refused {AUDIT_REFUSED_WEIGHT_FRACTION:.4%} of it")
+    assert served_count == sum(AUDIT_SIGN_DEFINITE_COUNTS)
+    assert frac == pytest.approx(1.0, abs=1e-12)
+
+
+def test_the_width_axis_is_a_continuum_which_is_why_it_is_composite():
+    """Why no BTV entry is generated here, argued from the demand.
+
+    MEASURED, BECAUSE THE INSTRUCTION WAS TO MEASURE.  The minimax route
+    IS cheaper in nodes here, and by a lot: solved at ``beta = 1`` it
+    lands at N = 14 (R = 100) and N = 16 (R = 215.4) with kappa_0 of
+    1.014 and 1.236, against the composite's 60 and 64.  Four times the
+    nodes looks like a bad trade until the other column is read.  Those
+    minimax entries carry a stamped band of 5.364e-07 and 6.557e-07 --
+    the certificate reaches that far in beta and no further.
+
+    The width demand is not a grid of six deck values the way the height
+    clause's is.  It is 81 432 576 poles with a continuous
+    ``Gamma_p / x_min``, populating every bin from 1e-3 to 1.  Covering
+    that with exact-match entries at a 5.4e-07 band needs of order two
+    million entries per ``(R, tier)``; one composite entry covers it.
+    So the route was not chosen on node count -- 4.3x the nodes buys
+    1.9e6 times the coverage -- and there is no cell where the node
+    count "hurts" enough to change that, because the alternative does
+    not serve the request at all.
+    """
+
+    from minimax import beta_selector as bs      # noqa: PLC0415
+
+    populated = sum(1 for n in AUDIT_SIGN_DEFINITE_COUNTS[:8] if n > 0)
+    assert populated == 8, "the demand spans every bin below the edge"
+
+    entry = _width_entries()["tables"][0]
+    band_if_minimax = entry["error_bound"] * (1.0 + 1.0 ** 2)
+    assert band_if_minimax < 1.0e-5
+    # ... and the composite entry covers the whole axis instead.
+    assert bs.beta_covers(entry, 0, 1.0)
+    assert bs.beta_covers(entry, 0, 0.5)
+    assert bs.beta_covers(entry, 0, 1.0e-6)
+    assert not bs.beta_covers(entry, 0, 1.5)

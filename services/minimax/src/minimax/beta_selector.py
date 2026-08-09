@@ -91,6 +91,19 @@ FAMILY = _AXES.family
 CATALOG_FILE = _AXES.catalog_file
 GENERATOR = _AXES.generator
 
+#: One family, one axis record -- and TWO catalogs, because a sweep is
+#: per CLAUSE.  ``_AXES.catalog_file`` names the height sweep, which is
+#: this family's first and the one the axis record was written against;
+#: the width sweep is a second file beside it.  They are not merged and
+#: must not be: ``beta`` is one dimensionless number formed from two
+#: unrelated numerators whose ranges OVERLAP near 0.6, so a merged
+#: catalog would let a width request match a height entry numerically
+#: and be served a rule fitted to a different physical quantity.
+CATALOG_FILES: dict[str, str] = {
+    "height": CATALOG_FILE,
+    "width": "catalog_complex_laplace_width.json",
+}
+
 #: The two clause names.  They are module constants rather than bare
 #: strings at the call sites so that a typo is an ImportError and not a
 #: silent refusal.
@@ -143,10 +156,28 @@ BETA_CLAUSES: dict[str, BetaClause] = {
         name=WIDTH,
         numerator="Gamma_p / x_min -- a fitted pole width over a window "
                   "edge (the Sigma-stage Laplace complement)",
-        beta_max=2.0 / 3.0,
-        qualified_at=(1.0 / 6.0, 1.0 / 3.0, 2.0 / 3.0),
-        measured_range=(1.0 / 6.0, 2.0 / 3.0),
-        source="MPA_THEORY_PLAN.md T-E, unchanged by GATE0 sec 2",
+        # DERIVED, NOT OBSERVED, AND THAT IS THE POINT.  On a
+        # sign-definite branch gw.mpa.sigma_routing.route_pole sets
+        # x_min = min(E_A) + a_p with a_p = Re Omega_p and min(E_A) >= 0,
+        # so x_min >= Re Omega_p; and gw.mpa.pade_fit's fourth guard caps
+        # |Im Omega_p| <= width_ratio_max * Re Omega_p at
+        # width_ratio_max = 1.0.  So
+        #     beta = Gamma_p/x_min <= Re Omega_p / Re Omega_p = 1
+        # for every pole of every field this fitter can produce.  The
+        # rung and the guard are the same number, which is a better
+        # reason for a catalog edge than a histogram that happens to fit.
+        #
+        # It used to read 2/3, inherited from the theory plan, and the
+        # MPA-Sigma routing audit measured what that cost: 11.52% of
+        # 81 432 576 real poles -- carrying 62.25% of the |B| mass --
+        # ask for beta in (2/3, 1] on the two sign-definite branches,
+        # and every one of them refused.
+        beta_max=1.0,
+        qualified_at=(1.0 / 6.0, 1.0 / 3.0, 2.0 / 3.0, 1.0),
+        measured_range=(3.6e-6, 1.0),
+        source="THEORY_mpa_implementation.md sec 5.1, derived from "
+               "sigma_routing.route_pole and pade_fit's fourth guard; "
+               "measured against pole_envelope_audit.json (si_mpa_0808)",
     ),
     HEIGHT: BetaClause(
         name=HEIGHT,
@@ -169,7 +200,10 @@ BETA_CLAUSES: dict[str, BetaClause] = {
 #: trusting it -- every entry's beta must sit inside the height clause and
 #: outside the width clause -- so this table cannot drift away from the
 #: bytes it describes.
-CATALOG_CLAUSE: dict[str, str] = {"complex_laplace/v1": HEIGHT}
+CATALOG_CLAUSE: dict[str, str] = {
+    "complex_laplace/v1": HEIGHT,
+    "complex_laplace_width/v1": WIDTH,
+}
 
 
 @dataclass(frozen=True)
@@ -238,13 +272,15 @@ class TableSelection:
 # The catalog, read once and never repaired
 # ---------------------------------------------------------------------------
 
-def _catalog_path():
+def _catalog_path(clause=HEIGHT):
+    # The union of the service move and the two-catalog clause split: the
+    # clause keys the file, the service's asset constants key the location.
     return importlib_resources.files(ASSET_PACKAGE).joinpath(
-        ASSET_DIR, CATALOG_FILE)
+        ASSET_DIR, CATALOG_FILES[clause])
 
 
-@lru_cache(maxsize=1)
-def load_catalog() -> tuple[dict | None, str | None]:
+@lru_cache(maxsize=4)
+def load_catalog(clause=HEIGHT) -> tuple[dict | None, str | None]:
     """Return ``(document, None)`` or ``(None, why_not)``.
 
     The failure is a VALUE and not a swallowed exception (R2): a run that
@@ -253,8 +289,11 @@ def load_catalog() -> tuple[dict | None, str | None]:
     indistinguishable from a request that legitimately has no table.
     """
 
+    if clause not in CATALOG_FILES:
+        return None, (f"no catalog file is declared for clause "
+                      f"{clause!r}; known: {sorted(CATALOG_FILES)}")
     try:
-        path = _catalog_path()
+        path = _catalog_path(clause)
     except Exception as exc:                       # pragma: no cover
         return None, f"cannot resolve the minimax_assets package: {exc!r}"
     try:
@@ -430,17 +469,8 @@ def select(
     swept for one of them certifies nothing about the other.
     """
 
-    doc, why_not = load_catalog()
-    if doc is None:
-        return _refuse(
-            "CatalogUnavailable",
-            f"minimax[{FAMILY}]: no catalog, so no certified table for "
-            f"R={range_value:.6g} at beta={beta:.9g}.\n"
-            f"  reason: {why_not}\n"
-            f"  the run continues on the uncertified runtime solve; "
-            f"nothing below has been checked.",
-            beta=float(beta), clause=str(beta_clause))
-
+    # The clause is validated FIRST, because it decides which catalog to
+    # open.  One family, two sweeps, two files: see CATALOG_FILES.
     clause = str(beta_clause)
     if clause not in BETA_CLAUSES:
         return _refuse(
@@ -451,6 +481,45 @@ def select(
             "caller must say which numerator its beta came from, because "
             "beta alone cannot say -- the two clauses overlap near 0.6.",
             beta=float(beta), clause=clause)
+
+    doc, why_not = load_catalog(clause)
+    if doc is None:
+        # A clause with no catalog is not the same failure as a family
+        # with no catalog.  If the OTHER clause has one, say so by name:
+        # that is the situation the MPA-Sigma routing audit found and it
+        # is a wrong-clause refusal, not an absent family.
+        other = next((c for c in CATALOG_FILES
+                      if c != clause and load_catalog(c)[0] is not None),
+                     None)
+        if other is not None:
+            spec = BETA_CLAUSES[clause]
+            theirs = BETA_CLAUSES[other]
+            return _refuse(
+                "WrongClause",
+                f"minimax[{FAMILY}]: this is a {clause}-clause request "
+                f"and no {clause}-clause catalog is staged; the family "
+                f"ships a {other}-clause sweep "
+                f"({CATALOG_FILES[other]}).\n"
+                f"  you asked with beta = {spec.numerator}\n"
+                f"  those tables were swept over  {theirs.numerator}\n"
+                "  the two are different physical quantities wearing one "
+                "dimensionless name, so an entry certified for one of "
+                "them certifies nothing about the other -- and because "
+                "the clauses overlap in beta, some of those entries "
+                "would otherwise MATCH this request numerically. That "
+                "near-match is the reason this check runs before the "
+                "beta match and not after it.\n"
+                f"  reason the {clause} catalog did not load: {why_not}\n"
+                + _generator_pointer(range_value, beta, target_error),
+                beta=float(beta), clause=clause)
+        return _refuse(
+            "CatalogUnavailable",
+            f"minimax[{FAMILY}]: no catalog, so no certified table for "
+            f"R={range_value:.6g} at beta={beta:.9g}.\n"
+            f"  reason: {why_not}\n"
+            f"  the run continues on the uncertified runtime solve; "
+            f"nothing below has been checked.",
+            beta=float(beta), clause=str(beta_clause))
 
     spec = BETA_CLAUSES[clause]
     if not (0.0 <= float(beta) <= spec.beta_max):
@@ -485,8 +554,8 @@ def select(
         return _refuse(
             "WrongClause",
             f"minimax[{FAMILY}]: this is a {clause}-clause request and the "
-            f"shipped catalog ({version}) is a {catalog_clause}-clause "
-            "sweep.\n"
+            f"catalog opened for it ({version}) is a {catalog_clause}-"
+            "clause sweep.\n"
             f"  you asked with beta = {spec.numerator}\n"
             f"  the tables were swept over  {other.numerator}\n"
             "  the two are different physical quantities wearing one "
