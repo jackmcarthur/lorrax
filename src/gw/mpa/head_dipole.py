@@ -580,15 +580,58 @@ def head_fsum_from_transitions(dipole_cart, delta, *, nelec, cell_volume,
     property of ``dipole.h5``, not of this module, and it caps what any
     head-channel number computed from that file can claim.
 
-    MEASURED, so that a later reader is not surprised: the committed Si
-    fixture gives 21.183 eV against the classical 16.601 eV, i.e. an
-    effective 13.03 electrons per cell against 8 -- the manifold
-    over-saturates by 1.63.  The committed hBN fixture over-saturates by
-    1.22 in plane and 1.07 along c.  The two ratios are different, so
-    this is not a constant missing from the convention; it is a property
-    of those two decks, and the standing project rule is that the
-    nonlocal-pseudopotential contraction is not the place to look for
-    it.
+    MEASURED, and the mechanism is now KNOWN -- read this before using
+    the number.  The committed Si fixture gives 21.183 eV against the
+    classical 16.601 eV, an effective 13.03 electrons per cell against
+    8, i.e. an over-saturation of 1.63.  That is NOT physics and it is
+    NOT this module: it is a SIGN on the nonlocal velocity commutator in
+    the producer.  ``common.mtxel_sweep.dipole_operator`` assembles the
+    velocity as ``v = 2(k+G) psi - dV_NL/dK psi``
+    (``src/common/mtxel_sweep.py:676``, ``v = v - _pad_spinor(v_nl,
+    ...)``), and the Hellmann-Feynman velocity of a nonlocal operator
+    adds that term rather than subtracting it.
+
+    THE MEASUREMENT THAT SETTLES IT, on the si_bigcond_prep mean field
+    at the band window matched to the BerkeleyGW contour-deformation
+    reference (nval 8 / ncond 92 / nband 100), against BGW's own stored
+    q0 head at all 265 CD frequencies:
+
+        arm                     eps00(0)   omega_p    vs BGW
+        BerkeleyGW (reference)   24.2205   18.101 eV      --
+        p only (--skip-vnl)      27.8686   19.546 eV   +7.99 %
+        p + i[r,V_NL] as shipped 31.8204   21.259 eV  +17.45 %
+        p - i[r,V_NL] flipped    24.2208   18.101 eV   +0.00 %
+
+    With the sign flipped the two codes agree to a relative 1.0e-5 at
+    z = 0, a median 4.8e-6 over the fourteen imaginary samples and a
+    median 4.5e-6 over the 250 real-axis samples -- and they are not
+    computing the same thing by the same route: this module takes the
+    analytic q -> 0 limit through the dipole at vertical transitions,
+    while BerkeleyGW evaluates a plane-wave overlap at a finite
+    q0 = 0.00025 against a separately-generated shifted-k WFNq and
+    inverts a 537x537 matrix per frequency.  Left as shipped, the same
+    comparison is off by 31 % with the SHAPE still right: one global
+    scale of 1.377 on (eps - 1) leaves a 0.3 % residual on the imaginary
+    axis, which is the signature of an oscillator-strength magnitude and
+    not of a structural error.
+
+    Two suspects are eliminated by measurement rather than by argument.
+    It is not spin-orbit: rebuilding with ``soc = false``, which
+    correctly discards 0.148261 Ry of j-splitting the wavefunctions do
+    not have, moves eps00(0) from 31.82045 to 31.82048.  And it is not
+    the projector contraction, which the standing project rule protects
+    and which this measurement independently supports -- with the
+    relative sign corrected, the f-sum saturation comes out at 1.1895
+    against BerkeleyGW's own 1.1888, so the residual excess over the
+    classical sum rule is the nonlocal pseudopotential's real
+    contribution to the f-sum and BOTH codes see it.
+
+    NOT FIXED HERE, deliberately.  One character in
+    ``mtxel_sweep.dipole_operator`` changes every ``dipole.h5`` in the
+    tree, the four committed regression fixtures that
+    ``harness.protect_fixtures`` holds read-only, the BSE absorption
+    references that consume the same file, and the plasmon-pole head.
+    That is an owner decision, not a worker's.
     """
 
     delta = np.asarray(delta, dtype=np.float64)

@@ -356,9 +356,20 @@ def test_fsum_diagnostic_is_reported_not_assumed():
     """The deck's own plasma frequency against the classical one.
 
     This is a property of ``dipole.h5`` and it caps what the physics
-    gate below can claim, so it is measured first and separately.  It is
-    asserted only loosely -- the point is that the number exists and is
-    reported, not that any particular deck saturates the sum rule.
+    gate below can claim, so it is measured first and separately.  The
+    bound is deliberately loose: the point is that the number exists and
+    is reported, not that any particular deck saturates the sum rule.
+
+    ON THIS FIXTURE THE NUMBER IS 1.63 AND THE MECHANISM IS KNOWN -- see
+    ``head_dipole.head_fsum_from_transitions``.  It is a sign on the
+    nonlocal velocity commutator in the producer
+    (``common/mtxel_sweep.py:676``), measured against BerkeleyGW at 265
+    frequencies on a matched deck, and it is an owner decision to fix
+    because one character there moves every dipole.h5 in the tree.  The
+    bound below is therefore written to pass BOTH before and after that
+    decision, on purpose: a gate that pinned 1.63 would freeze the
+    defect, and one that demanded 1.19 would ship red for a reason that
+    has nothing to do with this module.
     """
 
     deck = _deck("si_cohsex_debug")
@@ -367,7 +378,7 @@ def test_fsum_diagnostic_is_reported_not_assumed():
         cell_volume=deck["cell_volume"], nk_tot=deck["nk_tot"],
         nspin=deck["nspin"], nspinor=deck["nspinor"])
     assert rep["omega_p_classical_ry"] * RY_EV == pytest.approx(16.6, abs=0.1)
-    assert 0.5 < rep["saturation_ratio"] < 3.0, rep
+    assert 1.0 < rep["saturation_ratio"] < 2.0, rep
 
 
 def test_head_channel_pole_is_the_plasmon():
