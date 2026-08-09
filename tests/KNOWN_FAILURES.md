@@ -2599,3 +2599,84 @@ line), `leg.sh`, and `leg_{before,after}.log`.  The `fixmpa_0808/` tree was
 read only.  The `RUNS_INFLIGHT` row for the two arms is struck with its
 outcome.  In-tree: this amendment, and the two cells in
 `services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py`.
+
+> **PATHS UPDATED AT THE MPA-BATCH LANDING.**  This row was written against
+> `src/common/`, and the minimax service extraction merged one commit earlier
+> in the same batch moved the bundle, the axis record and both selectors into
+> `services/minimax/src/minimax/`.  The paths below are the post-move ones.
+> Nothing else in the row changed: the counts, the certification and the open
+> consumer question are as the branch measured them.
+
+### OPEN ROW: the `damped_line` catalog is SHIPPED AND WIRED, and the fit
+### stage is not yet calling it
+
+`services/minimax/src/minimax/minimax_assets/catalog_damped_line.json` and its 29
+`damped_line/*.npz` tables land here together with the door that serves them,
+`services/minimax/src/minimax/damped_line_selector.py`.  Unlike the complex-Laplace row
+above, this catalog is **not inert**: the selector is complete, it reads the
+family's axis record, and it refuses by name above the top of the `A` ladder.
+What has not happened yet is the consumer change — `gw.mpa.evaluator
+.evaluate_samples` still calls `damped_line_rule` once per line under
+`batching='per-line'` and runs two sweeps, where the catalog exists precisely
+so it can make one lookup and run one.
+
+That is deliberate and it is a scope boundary, not an oversight.  Wiring it
+changes the fit stage's cost report shape (`batching` gains a `'global'` mode
+and the per-line rows collapse to one shared row carrying the entry's identity,
+node count and worst-case `kappa_0`), and that belongs with the MPA fit driver
+rather than with the tables.  Until it happens the tables cost bytes in the
+tree and nothing else, and `src/gw/screening.py`'s
+`complex-axis omega ... not supported` refusal — the door the whole MPA fit
+stage is standing outside — is still there.
+
+**What IS true at this head**, so the row is not read as weaker than it is:
+
+- 29 of 29 shipped entries certify, on a held-out `Delta` grid disjoint from
+  every grid the solver saw and four times finer, at every one of the 55-to-58
+  shipped weight rows on **both** sampling lines.  17 ship sparse (1.70-2.49x
+  against one composite rule per line) and 12 ship composite (1.11-1.19x, from
+  the sharing alone).
+- **`tests/test_damped_line_tables.py` is 120 passed, 1 failed at this head**,
+  and the one red is `test_the_catalog_covers_the_span_and_tier_ladder`.  It is
+  the test doing its job: the ladder declares eight spans and the sweep landed
+  seven of them plus one tier of the eighth, so three cells (`A = 200` at
+  1e-8, 1e-10 and 1e-12) are absent.  They are absent for COST, not
+  feasibility — the sparse attempt at the top of the ladder spends its whole
+  wall budget in the prune before falling back — and
+  `tools/generate_damped_line_assets.py --spans 200 --merge` fills them without
+  recomputing anything already here.  **This red closes when that command
+  runs**; nothing else in the suite depends on it.
+- The wider minimax census at this head is `test_minimax_quadrature` **14
+  passed**, `test_minimax_beta_selector` **25 passed** (green after the axis
+  record was wired into it, which is the only edit this branch makes to that
+  door), and `test_minimax_imag_tables` **93 passed, 1 failed**.  That one
+  failure is the carried
+  `test_the_fit_stage_floor_is_no_longer_a_quadrature` row registered a few
+  sections above, and it is **not** this branch's: re-measured here in a clean
+  worktree at the branch point `8f2a651d` it fails identically, `recovery
+  9.984e-08 against a synthesis baseline of 8.652e-08`, which is the same
+  host-conditioning of the Pade fixture that row already diagnoses.  Named here
+  only so that a reader of the damped_line census is not surprised by a second
+  red elsewhere in the same suite.
+- Every entry's `kappa_0` is re-measured from its own shipped bytes and is at
+  or under the `<= 2` shipping rule.  This family is the first where that cap
+  BINDS: the uncapped selector produced live specimens at `kappa_0` of 406, 620
+  and 1267 that meet their sup-norm tolerance, and one of them is in the
+  harness as a red twin (`test_red_twin_from_the_gate_zero_specimen`).
+- `pyproject.toml`'s `[tool.setuptools.package-data]` gains
+  `minimax_assets/damped_line/*.npz` **and** `minimax_assets/complex_laplace/*.npz`.
+  The second is a pre-existing packaging defect this branch fixes in passing:
+  the complex-Laplace tables have been absent from every wheel install since
+  they landed, because `MANIFEST.in` covers the sdist and package-data covers
+  the wheel, and only the first listed them.
+
+**Registered, not taken:** at `A >= 100` and `10^-10`, and at `A = 20` and
+`10^-8`, the sparse route does not clear the composite and the composite ships.
+Those cells are correct and certified — the composite is a rule of the same
+family at the same cell, and one shared node set still beats one rule per line
+by 1.11-1.19x — but gate zero found a sparse rule at `A = 100`, `10^-10` on the
+near line alone, so a better search probably exists there.  The shipping rule's
+clause (iii) is what makes the gap harmless rather than silent: an entry ships
+sparse only if it uses strictly fewer nodes than the two composite rules it
+replaces, and `composite_node_count` is recorded on every entry so the
+comparison is a shipped number.

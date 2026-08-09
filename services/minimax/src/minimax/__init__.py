@@ -105,7 +105,15 @@ from minimax._catalog import (
 #: this IS the door for that family, and ``lookup(family=
 #: 'complex_laplace', ...)`` routes through it.  Importing it costs numpy
 #: and json, which the door already spends.
-from minimax import beta_selector
+#:
+#: ``damped_line_selector`` is here for the same reason and ``family_axes``
+#: because it is the DECLARATION both of them read -- which axis of which
+#: family rounds which way, in one place, so two doors cannot drift apart
+#: on it.  ``damped_line_selector`` has no production consumer yet (the fit
+#: stage still runs two sweeps where the catalog exists so it can run one);
+#: it is on the surface anyway, because a door nobody can reach is how a
+#: shipped catalog quietly becomes unreachable bytes.
+from minimax import beta_selector, damped_line_selector, family_axes
 from minimax.door import (
     RUNTIME_SOLVE_ENV,
     catalog,
@@ -217,7 +225,7 @@ __all__ = [
     "Quadrature", "Provenance", "CatalogView", "SOURCES",
     "runtime_provenance",
     # --- lookup, and only lookup -------------------------------------------
-    "beta_selector",
+    "beta_selector", "damped_line_selector", "family_axes",
     "lookup", "nearest_certified", "catalog", "serve", "solve_uncertified",
     "runtime_solve_allowed", "RUNTIME_SOLVE_ENV", "reset_announcements",
     # --- the catalog algebra, for the certification tier and the census ----
