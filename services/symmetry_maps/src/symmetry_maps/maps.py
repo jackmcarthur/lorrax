@@ -1157,15 +1157,79 @@ class SymMaps:
         self.nk_tot = int(self.unfolded_kpts.shape[0])
         self.nk_red = int(wfn.nkpts)
 
-        # Create mapping from irreducible k-points to full BZ indices
-        self.kirr_fullids = np.zeros(self.nk_red, dtype=np.int32)
+        # ``kirr_fullids[i]`` is the row of ``unfolded_kpts`` that IS the
+        # WFN file's irreducible k-point ``i``.  Every consumer states that
+        # contract in those words — ``gw_output.write_results`` ("the full-BZ
+        # index of IBZ point i", and it subsets every eqp{0,1}.dat column with
+        # it), ``qp_wfn``'s own dataset note, ``eqp_bgw``'s wedge subset — and
+        # the two properties they lean on are that
+        # ``unfolded_kpts[kirr_fullids]`` reproduces ``wfn.kpoints`` exactly
+        # and that ``sym_idx_k[kirr_fullids]`` is the identity, so a row taken
+        # here is the STORED wavefunction rather than a rotated or
+        # time-reversed image of it.
+        #
+        # THE ROW IS NOW FOUND BY MATCHING k ITSELF, not by reading the star
+        # labels, and that is the whole of the 2026-08-08 fix.  What stood
+        # here before was "the first full-BZ row carrying irreducible label
+        # ``i``", taken out of ``irr_idx_k``, with an identity fallback
+        # ``kirr_fullids[i] = i`` for any label no row carries.  Both halves
+        # are unsound.
+        #
+        # ``irr_idx_k`` is under no obligation to use every label.  It comes
+        # from ``find_symmetry_ops_simple``, whose op-selection policy is
+        # register-don't-touch (survey §8.1): the inner loop carries no
+        # ``break``, so a full-BZ row reachable from more than one entry of
+        # ``wfn.kpoints`` is labelled with the HIGHEST such entry, and the
+        # lower ones are left with no members at all.  A WFN's k-list is
+        # reduced by whatever code wrote the file and not by this class, so
+        # two stored entries lying in one orbit is ordinary rather than
+        # exotic, and every deck where it happens has orphaned labels.  For
+        # an orphaned label the fallback then wrote ``i`` — an unrelated
+        # full-BZ row — and said nothing about it.
+        #
+        # MEASURED on the four in-tree decks at bc37b4d3, which is why this
+        # is not a cosmetic change.  ``gnppm_debug`` and ``bispinor_debug``
+        # (9 k, ntran 2, stored IBZ list equal to the full grid) produced
+        # ``[0, 1, 1, 3, 4, 5, 3, 5, 4]`` where the answer is ``[0..8]``:
+        # four rows name a k a third of a reciprocal lattice vector away
+        # from the one they claim, three pairs of rows collide, and IBZ
+        # k 2, 6, 7 and 8 are never emitted at all.  ``cohsex_debug``
+        # produced ``[0, 1, 1, 4]`` for ``[0, 1, 2, 4]``.
+        # ``si_cohsex_debug`` came out right by luck: with 48 operations its
+        # eight stars are disjoint, no label is orphaned, and each star's
+        # first member happens to be the stored k.  An eqp{0,1}.dat written
+        # through the broken list carries duplicated and mislabelled wedge
+        # rows while the full-BZ arrays behind it are perfectly correct,
+        # which is the shape of defect that survives every norm, degeneracy
+        # and electron-count check downstream of it.
+        #
+        # The match is exact rather than nearest-neighbour.  ``unfolded_kpts``
+        # is the uniform grid this class generates from ``wfn.kgrid`` and
+        # ``wfn.shift``, so a stored IBZ point that is not ON it means the
+        # file's metadata disagrees with its own k-list; there is no useful
+        # row to return in that case and it raises instead of guessing.  The
+        # tolerance is ``find_symmetry_ops_simple``'s 1e-6, the same number
+        # the star map two lines up was built with.
+        kirr_fullids = np.empty(self.nk_red, dtype=np.int32)
+        _kpts_irr = np.asarray(wfn.kpoints, dtype=np.float64)
         for kirr in range(self.nk_red):
-            matches = np.where(self.irr_idx_k == kirr)[0]
-            if matches.size == 0:
-                # Fallback: identity mapping if not found
-                self.kirr_fullids[kirr] = kirr
-            else:
-                self.kirr_fullids[kirr] = matches[0]
+            metric = np.max(np.abs(self._periodic_delta(
+                self.unfolded_kpts, _kpts_irr[kirr])), axis=1)
+            hit = int(np.argmin(metric))
+            if metric[hit] > 1e-6:
+                raise RuntimeError(
+                    f"SymMaps: irreducible k-point {kirr} "
+                    f"{_kpts_irr[kirr].tolist()} is not on the uniform "
+                    f"{tuple(int(x) for x in np.asarray(wfn.kgrid))} k-grid "
+                    f"that this WFN's own kgrid/shift generate — the closest "
+                    f"full-BZ row is {hit} at "
+                    f"{self.unfolded_kpts[hit].tolist()}, off by "
+                    f"{metric[hit]:.3e}.  ``kirr_fullids`` cannot name a row "
+                    f"for it, and every wedge-shaped output (eqp0.dat, "
+                    f"eqp1.dat, WFN_qp.h5) would then be indexed with a "
+                    f"guess.  Fix the file's k-list or its kgrid/shift.")
+            kirr_fullids[kirr] = hit
+        self.kirr_fullids = kirr_fullids
 
         # useful maps:
         # k (full zone) to kbar 
