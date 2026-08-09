@@ -277,6 +277,44 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     return fn(sigma_w_kij, diag_rep)
 
 
+def add_band_diag(sigma_w_kij, diag_w_kn) -> jax.Array:
+    """``Σ_c(ω) += diag(d)`` on WHICHEVER layout the cube is in.
+
+    THE INJECTION MECHANICS, ONCE.  The q→0 head is band-diagonal on
+    every scheme that has one — ``M_{nm}(k, q→0, G=0) = δ_{nm}`` is a
+    statement about the matrix elements and not about how the head was
+    produced — so the only thing that differs between the two-point
+    plasmon-pole head and the multipole one is the ``(nω, nk, nb)``
+    array they hand in.  This function is the rest of it: read the
+    layout off the array itself (:func:`is_band_sharded_sigma_omega`,
+    the single source of truth), add rank-locally when it is the sharded
+    tile cube, embed and add densely when it is not.
+
+    It lives HERE rather than beside either producer because the branch
+    it takes is a LAYOUT decision, and both halves of that decision —
+    the predicate and the rank-local adder — are already this module's.
+    A second copy of it in a second pipeline is a second chance for the
+    sharded and dense arms to disagree, and they disagree silently: both
+    return a correctly shaped, finite Σ_c.
+
+    The two arms are element-for-element the same IEEE add.  The dense
+    arm's off-diagonal additions are exact ``+0.0``, which is why
+    embedding the diagonal into a zero-filled ``(nω, nk, nb, nb)`` cube
+    and adding it whole is bit-identical to touching the diagonal alone.
+
+    ``diag_w_kn`` is host numpy, bit-identical on every rank by
+    construction (a pure function of replicated inputs).
+    """
+    diag = np.asarray(diag_w_kn)
+    if is_band_sharded_sigma_omega(sigma_w_kij):
+        return add_band_diag_sharded(sigma_w_kij, diag)
+    n_w, nk, nb = diag.shape
+    dense = np.zeros((n_w, nk, nb, nb), dtype=np.complex128)
+    idx = np.arange(nb)
+    dense[:, :, idx, idx] = diag
+    return sigma_w_kij + jnp.asarray(dense, dtype=jnp.complex128)
+
+
 def gather_sigma_omega_replicated_host(sigma_w_kij: jax.Array) -> np.ndarray:
     """Explicit escape hatch: reconstruct the FULL Σ_c(ω,k,m,n) on every
     rank's host from the sharded layout (the memo's ``.replicated()`` seam).

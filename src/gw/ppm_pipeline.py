@@ -19,7 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from common.units import RYD_TO_EV
@@ -37,7 +36,18 @@ from .ppm_tau_kernel import precompile_sigma
 
 @dataclass(frozen=True)
 class PPMOutputs:
-    """Frequency-dependent PPM Σ^c results returned to the GW driver."""
+    """Frequency-dependent Σ^c results returned to the GW driver.
+
+    THE MULTIPOLE PIPELINE RETURNS THIS TOO, and the name is the only
+    part of it that says PPM.  Every field is a statement about a
+    dynamic Σ_c(ω) run — the cube, the diagonal interpolated at the DFT
+    energies, the head decomposition, the path of the file it was
+    written to — and none of them is a statement about how the poles
+    that produced it were obtained.  ``gw.mpa_pipeline`` therefore fills
+    the same container rather than introducing a second one, so
+    ``sigma_dispatch``'s tail (the QSGW build, the cube write, the
+    ``SigmaResult`` assembly) is one piece of code for both schemes.
+    """
 
     sigma_c_omega: jax.Array | None        # (n_omega, nk, nb, nb)  Ry
     sigma_c_at_dft_ev: np.ndarray | None   # (nk, nb)  diag(Σ_c) at E_DFT
@@ -156,13 +166,6 @@ def _inject_analytic_head(
         nk_tot=int(meta.nk_tot),
     )
 
-    def _embed_dense(diag_w_kn: np.ndarray) -> np.ndarray:
-        n_w, nk_h, nb_h = diag_w_kn.shape
-        dense = np.zeros((n_w, nk_h, nb_h, nb_h), dtype=np.complex128)
-        idx = np.arange(nb_h)
-        dense[:, :, idx, idx] = diag_w_kn
-        return dense
-
     # max|dense| == max|diag| (off-diagonals are exact zeros; |diag| >= 0),
     # so the diagnostic is unchanged on every path.
     head_max_ev = float(np.max(np.abs(head_sigma_diag_ry))) * RYD_TO_EV
@@ -177,24 +180,18 @@ def _inject_analytic_head(
     )
     head_diag_w_kn_ry = np.asarray(head_sigma_diag_ry)
 
-
-    from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
-    if is_band_sharded_sigma_omega(sigma_c_omega):
-        # Sharded layout (sigma_omega_layout=sharded): rank-local add of the
-        # band-diagonal head onto each rank's (m_X, n_Y) tile — zero
-        # communication, no dense head anywhere.  Element-for-element the
-        # same IEEE add as the dense path performs on the diagonal (its
-        # off-diagonal adds are exact +0.0).
-        return (
-            add_band_diag_sharded(sigma_c_omega, head_diag_w_kn_ry),
-            head_diag_w_kn_ry,
-        )
-
-    return (
-        sigma_c_omega + jnp.asarray(_embed_dense(head_diag_w_kn_ry),
-                                    dtype=jnp.complex128),
-        head_diag_w_kn_ry,
-    )
+    # THE INJECTION MECHANICS ARE NOT THIS FUNCTION'S ANY MORE, and the
+    # split is where the two heads this tree now has actually differ.
+    # What is specific to the plasmon-pole path is the PRODUCER above —
+    # one Godby-Needs pole, ``compute_ppm_head_sigma_diag``.  What follows
+    # it is a layout decision on the Σ_c cube, identical for any
+    # band-diagonal head, and it lives with the predicate it branches on
+    # (``qsgw_utils.add_band_diag``).  The multipole path
+    # (``gw.mpa_pipeline``) produces its diagonal from n_p complex poles
+    # and calls the same adder; there is one implementation of the
+    # sharded/dense choice rather than two that agree until they do not.
+    from .qsgw_utils import add_band_diag
+    return add_band_diag(sigma_c_omega, head_diag_w_kn_ry), head_diag_w_kn_ry
 
 
 def _eval_sigma_c_at_dft_energies(
