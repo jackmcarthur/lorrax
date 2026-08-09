@@ -242,16 +242,33 @@ def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     """Coupling-block ISDF encode -- the c<->v leg swap (Henneke Eq. 4-3).
 
     ``T[μ,ν,t,s,k] = Σ_v ψ^X_v[k,v,t,μ] Σ_c conj(ψ^Y_c[k,c,s,ν]) X[c,v,k]``,
-    ``Xb_b`` arriving as (c_full, v_loc, nk).  The legs swap but the SHARDING
-    does not: μ still rides 'x' (now from ``psi_v_X``) and ν still rides 'y'
-    (now from ``psi_c_Y``), so this T is add-compatible with ``_encode_T_A``'s
-    with no collective and no resharding.  That is the fusion's precondition
+    ``Xb_b`` arrives as (c_full, v_loc, nk) and is gathered to
+    (c_full, v_full, nk) here, so BOTH ζ legs stay stationary.  The legs
+    swap but the SHARDING does not: μ still rides 'x' (now from
+    ``psi_v_X``) and ν still rides 'y' (now from ``psi_c_Y``), so this T is
+    add-compatible with ``_encode_T_A``'s with no collective and no
+    resharding.  That is the fusion's precondition
     and it holds because LORRAX uses ONE ζ set for both legs (unlike Henneke's
     separate N_μ^vv / N_μ^cc / N_μ^vc).
     """
-    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_b)  # (v_loc,nk,ns,ν_loc)
-    Rv = lax.all_gather(R, "y", axis=0, tiled=True)            # (v_full,...)
-    return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, Rv)
+    # NEVER ring or gather a PARTIAL CONTRACTION along an axis its own ζ shard
+    # lives on.  ``R`` carries ν on 'y' (it comes from ``psi_c_Y``) as well as
+    # v on 'y', so ``all_gather(R, "y", axis=v)`` concatenates tiles whose ν
+    # shards differ: every 'y' rank then files its neighbours' ζ tiles against
+    # its own ν shard.  That was the 2026-08-08 K^d_B defect -- silent at P=1
+    # (a one-rank gather is the identity) and worth two thirds of the coupling
+    # correction at 2x2.  The communication goes on the TRIAL VECTOR instead,
+    # which carries no ζ axis at all: gather ``Xb`` on 'y' as well as 'x', so
+    # μ and ν are both produced into stationary accumulators and never travel.
+    #
+    # This mirrors ``bse_ring_comm._encode_T_B_gather`` / ``_ring_sum_B_encode``
+    # from fix/kdb-zeta-sharding-2026-08-08 @ 443a23fe (FIX_kdb_sharding.md);
+    # the port carried that file's defect here, so it takes that file's fix.
+    # X is the smallest tensor in the chain -- T carries TWO ζ axes, R carries
+    # one -- so this takes the T- and R-sized tensors off the wire entirely.
+    Xb_full = lax.all_gather(Xb_b, "y", axis=1, tiled=True)    # (c_full,v_full,nk)
+    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_full)  # (v_full,nk,ns,ν_loc)
+    return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, R)
 
 
 def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, nkx, nky, nkz, nk, sqrt_nk):
