@@ -113,6 +113,26 @@ gate's coverage had a hole before this branch and still has it; closing it
 means adding ``qsgw_utils`` here, which is a decision for whoever owns this
 contract, not one to take while moving code into the file it does not
 cover.  Registered, not fixed.
+
+THE THIRD RE-ANCHOR, 2026-08-09 (later the same day), AND THIS ONE MOVES A
+NUMBER ON PURPOSE.  ``fix/ppm-crossing-operator-im-2026-08-09`` @ 2fd22005,
+merged as 2115b65a, edits ``ppm_accumulators.py`` -- a KERNEL, the exact
+case the gate exists to make loud -- because the crossing window's tau-grid
+completion was the ELEMENTWISE imaginary part where the sine sum needs the
+operator one, ``(c*X - (c*X)^dagger)/2i``.  That is a physics fix,
+adjudicated in numbers before this re-anchor absorbed it
+(tests/KNOWN_FAILURES.md, 2026-08-09 amendment): Sigma_c star spread
+43.85 -> 0.0000 eV, the five non-TRIM k's non-Hermiticity 8.8-30.3 eV
+-> 0, |eqp0 - BGW GN twin| mean 5.03 -> 0.44 eV and max 20.25 -> 1.05 eV,
+the three TRIM rows unchanged to 2.6e-7 eV, sigX bit-identical.  THE
+INTER-FLEET CONSEQUENCE IS REAL: the peer fleet's gnppm sigTOT anchor
+(0.6439 meV MAE vs the BGW oracle) was anchored to the ELEMENTWISE bytes
+and is therefore SUPERSEDED, not drifted -- whoever quotes it next
+re-measures on a tree containing 2fd22005, expecting the non-TRIM k to
+move by the adjudicated amounts and TRIM to stay.  The gnppm/bispinor
+frozen references are red for the same reason, and their re-freeze is an
+OWNER row (adjudicated, registered in KNOWN_FAILURES.md), deliberately
+not taken with this re-anchor.
 """
 
 import hashlib
@@ -124,7 +144,7 @@ import pytest
 
 #: The tree this branch's gnppm bit-identity is anchored to.  Update this and
 #: the digests below TOGETHER, never one without the other.
-BASE_SHA = "e37c6a6e"
+BASE_SHA = "2115b65a"
 
 #: THE KERNELS: every module in which a floating-point operation of a gnppm
 #: Sigma actually happens.  Nothing on this branch may touch them, and both
@@ -137,7 +157,7 @@ SHARED_SIGMA_KERNELS = {
     "src/gw/ppm_tau_kernel.py":
         "d139ebdfb6cea959f6747f137dc9b73c5a10e2adef1ec97cad82e44f4ef1e289",
     "src/gw/ppm_accumulators.py":
-        "9d0def451087be4e3371cd57bd1e8f03db431823c7817e7045c4aa6ec19d06b0",
+        "1d17a6f3029965f0427d09309a82b57ed5447c0c5e891381cb29f2514cdf77ae",
     "src/gw/head_correction.py":
         "1c99e0758a93f4a76d04aa32ba781ee7bb1f94007846a5a362532fefed52e753",
     "src/gw/minimax_screening.py":
