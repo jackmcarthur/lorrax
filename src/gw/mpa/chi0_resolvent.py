@@ -96,14 +96,17 @@ import jax.numpy as jnp
 from gw.mpa import evaluator, sample_plan
 
 
-#: The ``1/sqrt(n_k)`` left over by ``_get_chi_minimax_kernel``'s three
-#: ``norm='ortho'`` FFTs.  Named because it is a convention of the
-#: production kernel, not a physical factor: reproduce it and
-#: ``solve_w`` is the same call on both routes; drop it and every W is
-#: wrong by ``sqrt(64) = 8`` on this deck, silently, because chi0 is
-#: never printed.
 def chi0_ortho_norm(n_k):
-    """The production kernel's FFT-normalisation residue, ``n_k**-0.5``."""
+    """The production kernel's FFT-normalisation residue, ``n_k**-0.5``.
+
+    Left over by ``_get_chi_minimax_kernel``'s three ``norm='ortho'``
+    FFTs (k->R on each G, R->q on chi) where the mathematics wants one
+    plain convolution.  It has a name because it is a convention of the
+    production kernel rather than a physical factor: reproduce it and
+    ``solve_w`` is the same call on both routes; drop it and every W on
+    a 64-k deck is wrong by a factor of 8, silently, because chi0 is
+    never printed.
+    """
 
     return float(n_k) ** -0.5
 
@@ -319,7 +322,6 @@ def cost_model(n_k, n_v, n_c, n_mu, n_z, n_q):
         "n_transitions_per_q": n_trans,
         "flops_per_sample_per_q": flops_per_qz,
         "flops_total": flops_per_qz * float(n_z) * float(n_q),
-        "pair_amplitude_bytes_per_kblock": None,
         "store_bytes": 16.0 * float(n_z) * float(n_q) * float(n_mu) ** 2,
         "n_logical_outputs": int(n_z) * int(n_q),
         "n_dyson_solves": int(n_z) * int(n_q),
