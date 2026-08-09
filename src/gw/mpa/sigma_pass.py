@@ -122,14 +122,19 @@ values.
 What this change is NOT is a cost fix for the tau loop, and the
 measurement says so plainly.  The mask-dependent stage of a tau node --
 building ``W(tau) = B e^{-i(Omega - E_ref)tau}`` over the field -- is
-4.6 ms of a 165 ms node on an idle A100 at production shapes; the other
-160 ms is the ``G(tau)`` formation, the k-axis transforms and the band
-projection, none of which know a mask exists.  A pane at 1/218 occupancy
-therefore costs what a full one costs, and it is the PANE COUNT, not the
-pane representation, that stands between this path and the two-point
-floor.  That count is the owner's registered row (a slab-aware width
-clause), and nothing here touches it: same panes, same membership, same
-nodes, same weights, bit-identical Sigma.
+4.6 to 11.0 ms across runs at production shapes, against a node of 139 to
+175 ms measured on a SOLO A100 (nid001044, 2026-08-09); the rest is the
+``G(tau)`` formation, the k-axis transforms and the band projection, none
+of which know a mask exists.  The direct form of the same statement: the
+kernel measures the same wall at ``mask=all`` as at ``mask=1/218`` and at
+``mask=1/2000``.  A pane at 1/218 occupancy therefore costs what a full
+one costs; the node runs at 2.4 TFLOP/s fp64, a quarter of that card's
+non-tensor peak, so the "0.4 % utilization" of the three-way table is a
+fraction of MODES and not a fraction of the machine.  What stands between
+this path and the two-point floor is the PANE COUNT, and that is the
+owner's registered row (a slab-aware width clause).  Nothing here touches
+it: same panes, same membership, same nodes, same weights, bit-identical
+Sigma.
 
 WHAT THIS MODULE DOES NOT DO
 -----------------------------
@@ -237,10 +242,7 @@ class WindowGroup:
         It is a method and not an attribute so that materializing 81.4 MB
         is something a caller does on purpose.
         """
-        shape = tuple(int(x) for x in self.field_shape)
-        m = np.zeros(int(np.prod(shape)) if shape else 0, dtype=bool)
-        m[np.asarray(self.idx_B, dtype=np.int64)] = True
-        return m.reshape(shape)
+        return _dense_from_index(self.idx_B, self.field_shape)
 
 
 @dataclass
