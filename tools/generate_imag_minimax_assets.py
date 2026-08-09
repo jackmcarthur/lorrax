@@ -101,7 +101,8 @@ from scipy.optimize import linprog
 from scipy.sparse import csr_matrix, hstack, vstack
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "src" / "common" / "minimax_assets"
+DEFAULT_OUTPUT_ROOT = (REPO_ROOT / "services" / "minimax" / "src"
+                       / "minimax" / "minimax_assets")
 FAMILY = "complex_laplace"
 CATALOG_NAME = "catalog_complex_laplace.json"
 

@@ -83,13 +83,13 @@ lorrax-centroids = "centroid.kmeans_cli:main"
 [tool.uv]
 package = true
 
+# NOTHING HERE.  ``common/minimax_assets/`` used to be declared as package
+# data on this line; the bundle rides with the ``minimax`` service now
+# (``services/minimax/pyproject.toml``), which is what let the door read it
+# through ``importlib.resources.files("minimax")`` and cut the single
+# production import edge into ``common``.  The table is kept, empty, because
+# it is the place a NEW package-data claim would have to go.
 [tool.setuptools.package-data]
-common = [
-    "minimax_assets/*.json",
-    "minimax_assets/*.md",
-    "minimax_assets/crossing/*.npz",
-    "minimax_assets/noncrossing/*.npz",
-]
 
 [tool.uv.workspace]
 members = [
@@ -127,6 +127,7 @@ markers = [
     "zeta_loader: the zeta_loader service suite (services/zeta_loader/tests)",
     "symmetry_maps: the symmetry_maps service suite (services/symmetry_maps/tests)",
     "vcoul: the vcoul service suite (services/vcoul/tests)",
+    "minimax: the minimax service suite (services/minimax/tests)",
 ]
 
 [dependency-groups]

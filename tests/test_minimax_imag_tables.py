@@ -54,7 +54,8 @@ import numpy as np
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
-_ASSETS = _REPO / "src" / "common" / "minimax_assets"
+_ASSETS = (_REPO / "services" / "minimax" / "src" / "minimax"
+           / "minimax_assets")
 _CATALOG = _ASSETS / "catalog_complex_laplace.json"
 
 
@@ -398,7 +399,7 @@ def test_certify_refuses_a_negative_node():
 
 @pytest.mark.parametrize("entry", ENTRIES, ids=_ids(ENTRIES))
 def test_the_real_part_is_the_noncrossing_imag_target(entry):
-    """``alpha.real`` fits ``common.minimax._imag_target`` at this beta.
+    """``alpha.real`` fits ``minimax._imag_target`` at this beta.
 
     R4's "one campaign" claim, discharged against the production
     module's own target function rather than against a restatement of
@@ -407,7 +408,7 @@ def test_the_real_part_is_the_noncrossing_imag_target(entry):
     merely a similar one.
     """
 
-    from common import minimax as production            # noqa: PLC0415
+    import minimax as production                        # noqa: PLC0415
 
     tau, alpha, _, _ = _load(entry)
     x = gen.held_out_grid(entry["range_max"], 4001)
@@ -502,7 +503,7 @@ def test_the_shipped_entry_beats_the_runtime_solve_on_amplification():
     compared is a solve and not an artefact from April.
     """
 
-    from common import minimax as production            # noqa: PLC0415
+    import minimax as production                        # noqa: PLC0415
 
     os.environ["LORRAX_DISABLE_MINIMAX_DISK_CACHE"] = "1"
     worst_ratio = 0.0
