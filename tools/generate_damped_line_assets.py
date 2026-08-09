@@ -1179,6 +1179,13 @@ def main(argv=None):
     ap.add_argument("--spans", type=float, nargs="*", default=SPANS)
     ap.add_argument("--tiers", type=float, nargs="*", default=TIERS)
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument(
+        "--merge", action="store_true",
+        help="keep the entries already in the catalog and compute only "
+             "the cells it is missing. A sweep interrupted at the "
+             "expensive top of the ladder is resumed rather than "
+             "restarted, which is the other half of writing the catalog "
+             "incrementally.")
     args = ap.parse_args(argv)
 
     cells = [(a, t) for a in args.spans for t in args.tiers]
@@ -1197,6 +1204,16 @@ def main(argv=None):
     # carries, and re-running fills the rest in.
     entries, ledger = [], []
     out = args.output_root / CATALOG_NAME
+    if args.merge and out.is_file():
+        prior = json.loads(out.read_text(encoding="utf-8"))
+        entries = list(prior.get("tables", []))
+        ledger = list(prior.get("sweep", {}).get("ledger", []))
+        have = {(float(e["A"]), float(e["error_bound"]))
+                for e in entries}
+        cells = [c for c in cells
+                 if (float(c[0]), float(c[1])) not in have]
+        print(f"  merging: {len(entries)} entries kept, "
+              f"{len(cells)} cells to compute", flush=True)
 
     def _record(cell, result):
         (a, tol) = cell
