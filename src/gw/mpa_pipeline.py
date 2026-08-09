@@ -414,6 +414,19 @@ def compute_mpa_sigma_pipeline(
         head_unit = ("Ry" if head.get("energy_unit") == "Ry"
                      else str(config.mpa_pole_energy_unit))
         ledger = mpa_store.fit_completion_ledger(path)
+        # WHICH SCREENING OBJECT THIS POLE FIELD IS A FIT TO, asked at the
+        # PIPELINE seam and not only inside the pass loop.  There are two
+        # routes from this store to a self-energy — walk the poles, or sum
+        # partial cubes somebody else walked — and only the first one goes
+        # through compute_mpa_sigma_c_omega_grid.  The partial route is
+        # exactly how the 2026-08-09 campaign's seven unpublished n_p = 8
+        # cubes would have reached a table: they were integrated against a
+        # pole field fitted to the full W, on a tree that could not ask.
+        # So the question is put here, where BOTH routes pass, before
+        # either is chosen.
+        mpa_store.require_correlation_part(
+            ledger.get("screening_content"),
+            where="compute_mpa_sigma_pipeline", source=str(path))
         # THE HEAD SET IS NAMED IN THE LOG, ALWAYS, and not only when it
         # is unusual.  A store may carry several q→0 head sets — the
         # velocity-commutator sign is an open owner decision and both
