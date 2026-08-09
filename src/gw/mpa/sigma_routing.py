@@ -143,7 +143,29 @@ SIGN_DEFINITE = "sign_definite"
 #: state its precondition without importing the service at import time.  The
 #: mirror is proved equal in ``tests/test_mpa_sigma_routing.py``; if the
 #: service moves its edge and this constant does not, that test fails.
-SHIPPED_WIDTH_BETA_MAX = 2.0 / 3.0
+#:
+#: IT WAS 2/3 AND IS NOW 1.0, and the change is a landing, not a widening.
+#: When this module was written the width clause was DECLARED at 2/3 and had
+#: zero shipped tables -- ``CATALOG_CLAUSE`` stamped the whole
+#: ``complex_laplace`` bundle as the *height* clause -- so every Laplace window
+#: on this path refused on an empty family whatever its beta.  The width sweep
+#: now ships as its own catalog (``catalog_complex_laplace_width.json``,
+#: ``complex_laplace_width/v1``): 15 ``positive_composite`` entries at
+#: ``beta = 1.0`` exactly, ``kappa0 = 1.0`` exactly, over
+#: ``R in {10, 21.54, 46.42, 100, 215.44}`` at the 1e-6, 1e-8 and 1e-12 tiers.
+#:
+#: THE EDGE IS DERIVED, WHICH IS WHY IT IS EXACTLY 1.  The clause's own record
+#: cites ``sigma_routing.route_pole`` and ``pade_fit``'s fourth guard: on a
+#: sign-definite branch ``x_min >= Re Omega_p``, and that guard caps
+#: ``|Im Omega| <= width_ratio_max * Re Omega`` at ``width_ratio_max = 1``, so
+#: ``beta = Gamma_p/x_min <= 1`` for any pole field this fitter can produce.
+#: The catalog's ``measured_range`` is ``(3.6e-06, 1.0)`` -- the audit's own
+#: field.  One entry covers the whole band rather than one per bucket because
+#: these entries' ``beta_axis`` is ``exact_phase_on_fixed_nodes``: on the
+#: composite route ``beta`` enters only as a unit-modulus phase on
+#: beta-independent nodes, so the ``beta = 1.0`` table serves every
+#: ``beta <= 1`` exactly.
+SHIPPED_WIDTH_BETA_MAX = 1.0
 
 #: ``pade_fit.DEFAULT_GUARDS["width_ratio_max"]`` -- the fourth guard's cap
 #: on ``|Im Omega| / Re Omega``, and therefore the exact closure of the width

@@ -27,13 +27,36 @@ measure the same two premises through a much longer lever and would only cover
 the one deck it ran.
 
 RE-ANCHORING IS EXPECTED, AND IS THE POINT OF RECORDING THE SHA.  When a peer
-lands a change to the shared core -- ``perf/sigma-ppm-2026-08-09``'s
-instrument-only timing rows are the next one -- these digests go stale BY
-DESIGN.  The fix is: rebase, confirm the incoming change is the one you meant
-to absorb, update ``BASE_SHA`` and the digests together in one commit that says
-whose change it absorbed.  What must never happen is a digest updated without a
-sha updated, because then the gate no longer says which tree it is anchored to
-and a future reader cannot tell a re-anchor from a regression.
+lands a change to the shared core these digests go stale BY DESIGN.  The fix
+is: rebase, confirm the incoming change is the one you meant to absorb, update
+``BASE_SHA`` and the digests together in one commit that says whose change it
+absorbed.  What must never happen is a digest updated without a sha updated,
+because then the gate no longer says which tree it is anchored to and a future
+reader cannot tell a re-anchor from a regression.
+
+THE ONE RE-ANCHOR PERFORMED SO FAR, 996ad826 -> e37c6a6e, and how it was
+checked.  Three of the eight modules moved, and the question the gate exists
+to ask is whether any of that motion can reach a floating-point result:
+
+  ``ppm_pipeline.py``   two lines -- the ``profile_section`` import and the
+                        context manager it wrapped ``sigma.exec`` in
+                        (1ec5ccfd, which deleted a profiler that produced no
+                        trace).  Instrumentation, removed.
+  ``ppm_sigma.py``      48 diff lines from 4f1c29e8's timing rows.  Checked by
+                        comparing the diff's added and removed lines as
+                        MULTISETS OF STRIPPED CONTENT: the difference is empty
+                        in both directions, so every one of those 48 lines is
+                        the same statement at a different indentation, wrapped
+                        in ``with timing.section(...)``.
+  ``head_correction.py`` same method, and the difference is not empty but is
+                        exhaustively five lines: one ``timing`` import and four
+                        ``with _tmg.section(...)`` openers.  Nothing removed.
+
+A ``with`` block changes the indentation of the statements inside it and
+nothing else about them -- no reassociation, no reordering, no change of
+operand -- so no sigma byte can move across this re-anchor.  That is the
+finding the brief asked for, and it is negative: there is nothing to report
+except that the digests moved for a reason that cannot affect a number.
 """
 
 import hashlib
@@ -45,7 +68,7 @@ import pytest
 
 #: The tree this branch's gnppm bit-identity is anchored to.  Update this and
 #: the digests below TOGETHER, never one without the other.
-BASE_SHA = "996ad826"
+BASE_SHA = "e37c6a6e"
 
 #: Every module the two-point plasmon-pole Sigma reaches on its way from
 #: ``sigma_dispatch`` to the bytes in sigma_mnk.h5.  Not "the files I happened
@@ -53,7 +76,7 @@ BASE_SHA = "996ad826"
 #: ``src/gw``, plus the dispatcher above it.
 SHARED_SIGMA_CORE = {
     "src/gw/ppm_sigma.py":
-        "965da5ae040f9fa63f681bf5a28adf977b16f4ee5fa73c3d5c6cb9af3a20bcaa",
+        "f0fecfde318a18fb370ef6839ec9c7adff2006da5dd5d2aeffbb454d0846c1c7",
     "src/gw/ppm_windows.py":
         "f0b6749ce16a6329b68d8a2c06a4c3dcc198dd962eceef2d5540bd03146fed17",
     "src/gw/ppm_tau_kernel.py":
@@ -61,11 +84,11 @@ SHARED_SIGMA_CORE = {
     "src/gw/ppm_accumulators.py":
         "9d0def451087be4e3371cd57bd1e8f03db431823c7817e7045c4aa6ec19d06b0",
     "src/gw/ppm_pipeline.py":
-        "0a5f226999ee1614908faf83e82c8566fa825eae27277b1f57fa9d7d083f7a81",
+        "448bcad9740941f787868d631a9cf8b23b16993eb34187637d9e3e82f20091da",
     "src/gw/sigma_dispatch.py":
         "9a6db9cd4db103a469c985eb14888f166683af0cbd775604a75ef4382b59e80a",
     "src/gw/head_correction.py":
-        "e7f9dfd3cf2ff5092bb62971fa928ebe8d65bd903653d721b8534f07a0c55e0b",
+        "1c99e0758a93f4a76d04aa32ba781ee7bb1f94007846a5a362532fefed52e753",
     "src/gw/minimax_screening.py":
         "8e7cfc4c9df71517f0fc83fd905748f3b82d92bf67a7fa1b957c929668040236",
 }

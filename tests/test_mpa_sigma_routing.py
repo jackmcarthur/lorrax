@@ -255,13 +255,18 @@ def test_crossing_branch_beta_is_capped_by_the_edge_factor():
 
 
 def test_sign_definite_branch_reaches_the_width_clause_ceiling():
-    """And here the audit's 62.25 % of |B| mass past 2/3 comes from.
+    """Where the audit's 62.25 % of |B| mass past 2/3 comes from, and that the
+    clause that now serves it reaches exactly as far as the fitter can ask.
 
-    On a sign-definite branch ``x_min = min(E_A) + a`` with no edge floor, and
-    ``min(E_A)`` is half the gap.  A pole at the fitter's own width guard
-    (``Gamma = Re Omega``) therefore asks for beta just under 1 -- outside the
-    shipped clause and exactly at ``width_ratio_max``, which is why the width
-    campaign's ceiling is a derived number.
+    On a sign-definite branch ``x_min = min(E_A) + a_p`` with no edge floor,
+    and ``min(E_A)`` is half the gap.  A pole at the fitter's own width guard
+    (``Gamma = Re Omega``) therefore asks for beta just under 1.  When this
+    cell was written that was OUTSIDE the shipped clause and the assertion
+    read ``2/3 < beta``; the width catalog has since landed at
+    ``beta_max = 1.0``, so what the cell pins now is the pair of facts that
+    survived the landing: the branch really does reach the ceiling, and the
+    ceiling really is the fitter's guard, so the request is served rather than
+    refused.
     """
     ryd = 13.605693122994
     e_min, e_max = 0.3464 / ryd, 12.32 / ryd     # the deck's own val spectrum
@@ -273,18 +278,36 @@ def test_sign_definite_branch_reaches_the_width_clause_ceiling():
         rel_tol=1e-6, max_nodes=1 << 16)
     assert len(plans) == 1 and plans[0].name == "single"
     beta = plans[0].beta
-    assert R.SHIPPED_WIDTH_BETA_MAX < beta <= R.FIT_WIDTH_RATIO_MAX
+    # Past the OLD 2/3 declaration -- the finding that motivated the campaign.
+    assert beta > 2.0 / 3.0
+    # And inside the clause as it now ships, which is the fitter's own guard.
+    assert beta <= R.SHIPPED_WIDTH_BETA_MAX
+    assert R.SHIPPED_WIDTH_BETA_MAX == R.FIT_WIDTH_RATIO_MAX
     assert beta > 0.9
 
 
 def test_edge_factor_below_the_envelope_refuses_by_name():
-    """Lowering the deck's edge factor moves the WHOLE field out at once."""
+    """Lowering the deck's edge factor moves the WHOLE field out at once.
+
+    The boundary moved with the clause: the crossing branches are bounded by
+    ``beta <= 1/edge_factor``, so the precondition is ``edge_factor >= 1/
+    beta_max``.  At the declared 2/3 that meant 1.5 -- exactly the deck
+    default, which is why the coincidence was worth checking.  At the landed
+    1.0 it means 1.0, so the deck now has headroom it did not have, and the
+    refusal bites only below that.
+    """
     with pytest.raises(R.RoutingRefusal) as exc:
-        R.refuse_edge_factor_below_envelope(1.0)
+        R.refuse_edge_factor_below_envelope(0.5)
     assert exc.value.code == "edge_factor_below_envelope"
     assert "sigma_window_edge_factor" in str(exc.value)
-    # 1.5 is the deck default and is exactly on the boundary -- admissible.
+    # 1.0 is the new boundary and is admissible; 1.5 is the deck default and
+    # now sits inside with room to spare.
+    assert R.refuse_edge_factor_below_envelope(1.0) == pytest.approx(1.0)
     assert R.refuse_edge_factor_below_envelope(1.5) == pytest.approx(2.0 / 3.0)
+    # The old edge, checked against the old clause, would still have refused
+    # at edge_factor = 1.0 -- pinned so the loosening is deliberate and dated.
+    with pytest.raises(R.RoutingRefusal):
+        R.refuse_edge_factor_below_envelope(1.0, beta_max=2.0 / 3.0)
 
 
 def test_vanishing_width_on_a_crossing_branch_refuses_by_name():
@@ -347,3 +370,105 @@ def test_the_minus_omega_half_carries_its_own_minus_one():
     assert [p.name for p in pos] == [p.name for p in neg]
     for p, n in zip(pos, neg):
         assert p.prefactor == -n.prefactor
+
+
+# ---------------------------------------------------------------------------
+#  GATE 6 -- the door is open: the audited field is SERVED, not refused
+# ---------------------------------------------------------------------------
+
+#: The measured percentile box of the first-light pole field (si_mpa_0808,
+#: 81 432 576 live poles), in eV.  Percentiles [0, 1, 25, 50, 75, 99, 100] of
+#: ``|Im Omega|`` and ``Re Omega``, straight out of pole_envelope_audit.json.
+#: Encoded here rather than read from /pscratch so the cell runs anywhere; the
+#: numbers are the audit's, and if the field is ever re-fitted they should be
+#: re-measured rather than adjusted to keep this green.
+AUDIT_GAMMA_EV = (3.959e-05, 0.06004, 1.418, 3.565, 16.27, 488.0, 4015.0)
+AUDIT_A_EV = (0.2647, 2.601, 10.53, 23.09, 38.64, 1112.0, 6451.0)
+AUDIT_E_COND_EV = (0.3464, 56.3596)
+AUDIT_H_VAL_EV = (0.3464, 12.3247)
+
+
+def _route_the_audited_box(max_nodes=R.DEFAULT_MAX_CROSSING_NODES):
+    """Route the field's percentile box on all four branches.
+
+    ``Gamma > Re Omega`` combinations are skipped, not because they would be
+    awkward but because ``pade_fit``'s fourth guard means they cannot exist.
+    """
+    ryd = 13.605693122994
+    branches = (
+        ("cond", False, AUDIT_E_COND_EV), ("val", False, AUDIT_H_VAL_EV),
+        ("cond", True, AUDIT_E_COND_EV), ("val", True, AUDIT_H_VAL_EV))
+    served, refused, betas = 0, [], []
+    for g in AUDIT_GAMMA_EV:
+        for a in AUDIT_A_EV:
+            if g > a:
+                continue
+            for space, neg, (e_lo, e_hi) in branches:
+                try:
+                    plans = R.route_pole(
+                        a_ry=a / ryd, gamma_ry=g / ryd, space=space,
+                        neg_omega_half=neg, omega_max_ry=5.0 / ryd,
+                        e_a_min_ry=e_lo / ryd, e_a_max_ry=e_hi / ryd,
+                        edge_factor=1.5, rel_tol=1e-8, max_nodes=max_nodes)
+                except R.RoutingRefusal as exc:
+                    refused.append((g, a, space, neg, exc))
+                    continue
+                served += 1
+                betas += [p.beta for p in plans if p.beta is not None]
+    return served, refused, betas
+
+
+def test_no_pole_of_the_audited_field_refuses_on_the_width_clause():
+    """THE DOOR IS OPEN, and this is the cell that says so by measurement.
+
+    Before the width catalog landed, every Laplace window on this path refused
+    on an empty family whatever its beta.  With ``complex_laplace_width/v1``
+    shipped at ``beta_max = 1.0``, the whole measured field must route without
+    a single clause refusal -- so a width-clause refusal on si_mpa_0808's field
+    is now a REGRESSION, not a gap, and that is what this asserts.
+    """
+    served, refused, betas = _route_the_audited_box()
+    assert served > 0 and betas
+    clause_refusals = [r for r in refused
+                       if r[4].code not in ("bandwidth_above_cap",)]
+    assert not clause_refusals, (
+        "a pole of the audited field was refused for a reason other than the "
+        "crossing bandwidth cap: "
+        + "; ".join(f"Gamma={g:g} eV a={a:g} eV {sp},neg={n}: {e.code}"
+                    for g, a, sp, n, e in clause_refusals))
+    worst = max(betas)
+    assert worst <= R.SHIPPED_WIDTH_BETA_MAX, (
+        f"worst width clause asked for is beta={worst:.6f}, above the shipped "
+        f"edge {R.SHIPPED_WIDTH_BETA_MAX}")
+    # Measured, and recorded so a drift is visible rather than merely absent:
+    # 0.694 is the worst the box asks for, against a clause edge of 1.0.
+    assert 0.60 < worst < 0.75
+
+
+def test_the_only_refusing_corner_is_the_fields_narrowest_width():
+    """And it is a cost statement, not a catalog gap.
+
+    The one corner that refuses is the field's ZEROTH percentile width,
+    Gamma = 3.96e-5 eV, on the crossing core, at a dimensionless bandwidth
+    A = 2.4e5.  It is not served at any node count -- raising the cap to
+    131 072 does not help -- because resolving a quarter of a million
+    oscillations is not the right answer at any price.  So the refusal is
+    correct, it names the generator, and it is confined: the audit's own
+    percentiles put A at or below 111 for 99 % of the worst pole and at or
+    below 10 for the other seven.
+    """
+    _, refused, _ = _route_the_audited_box()
+    assert refused, "the narrow-width corner should still refuse"
+    for g, _a, _sp, _neg, exc in refused:
+        assert exc.code == "bandwidth_above_cap"
+        assert exc.generator
+        assert "generate_imag_minimax_assets" in exc.generator
+        assert g == min(AUDIT_GAMMA_EV), (
+            f"a width other than the field's narrowest ({g} eV) refused; the "
+            f"corner is supposed to be the vanishing-width one alone")
+        assert exc.a_dim > 1e4
+
+    # Raising the cap by five octaves does not move it, which is what makes it
+    # a physics statement rather than a budget one.
+    _, refused_big, _ = _route_the_audited_box(max_nodes=1 << 17)
+    assert len(refused_big) == len(refused)
