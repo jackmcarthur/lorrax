@@ -41,9 +41,7 @@ Structure-preserving reduction, dispatched on B's symmetry:
   omega are the extreme eigenvalues of the Hermitian ``Shat = K^{-1/2} Sigma
   K^{-1/2}`` (eigenvalue ``1/omega``).  Solved densely for small windows — the
   BGW-parity regime, where BGW itself uses dense ScaLAPACK
-  (``BSE_NTDA_SOLVER_SSEIG``).  Matrix-free scale-out (FEAST-on-K / BSEPACK real
-  transform) is the fine-grid follow-on (prototype validated,
-  ``runs/MoS2/A_bse_nontda_2026-07-17/``).
+  (``BSE_NTDA_SOLVER_SSEIG``).
 
 * B Hermitian (real BSE / RPA density response): (A +- B) are Hermitian PD, so
   ``omega^2 = eig((A-B)(A+B))`` (Shao et al. LAA 488; BSEPACK product form) — the
@@ -53,6 +51,30 @@ Structure-preserving reduction, dispatched on B's symmetry:
 Eigenvectors: normalised (X, Y) pairs with the standard ``X^H X - Y^H Y = +1``
 convention, stacked ``(n_eig, 2, nc, nv, nk)`` and wired to
 ``bse_io.write_eigenvectors_stream`` (use_tda=0, honest).
+
+WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
+---------------------------------------------------------------------------
+* THE DENSE BUILD IS 3.30x FASTER — 333.4 s -> 101.1 s, driver ~347 s -> ~115 s
+  (~3.0x), both landed with red twins (``FIX_nontda_feature.md`` §0).  The
+  56 GiB ring-tensor path it used to take is gone.
+* A RESTART PREFLIGHT NOW GUARDS THAT BUILD.  ``check_restart_reciprocity``
+  runs BEFORE the O(N^2) assembly and refuses a stale W on
+  ``max|W(q) - conj(W(-q))| / max|W|`` (threshold ``recip_tol``; ``None``
+  measures without refusing).  The input decides whether ``A`` can be Hermitian
+  at all, so it is checked before anything expensive is built — and the refusal
+  names the regeneration command rather than reporting a number.  This replaced
+  a projection: a preflight tells you the artifact is stale, a projection
+  quietly makes a stale artifact look well-formed.
+* THE MATRIX-FREE ROUTE IS NO LONGER A PROTOTYPE.  ``solver='matrixfree'``
+  runs SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
+  applier ``bse_stack_matvec.build_bse_stack_pair_matvec``, at ``O(k N)`` memory
+  and a cost set by the spectrum rather than by ``N``.  It is OPT-IN and it
+  REFUSES on a sharded (px*py > 1) mesh — see ``_solve_nontda_matrix_free`` and
+  ``SDY_SOLVER.md`` for the ζ-sharding kernel defect behind that refusal.
+  ``'dense'`` remains the default AND the oracle: it is what the matrix-free
+  route is gated against, and the only route returning the complete spectrum.
+  Flipping that default is an owner decision with its own A/B; nothing here
+  moved it.
 """
 from __future__ import annotations
 

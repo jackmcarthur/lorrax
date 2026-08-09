@@ -61,20 +61,32 @@ shape-stable ``(μ_pad, ν_pad, nkx, nky, nkz)`` argument built ONCE outside the
 matvec, so W(ω) / ladder buildouts pass a different ``W_R`` with no change to
 encode/decode/scan.
 
-Retirement plan (NOTED, not yet executed) — the ring/gather/simple TDA matvecs
-existed only to bound ``T``'s peak; this scan bounds it strictly better, so they
-are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
+Retirement plan (PARTIALLY EXECUTED, 2026-08-08) — the ring/gather/simple TDA
+matvecs existed only to bound ``T``'s peak; this scan bounds it strictly better,
+so they are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
 (block-Lanczos + Davidson) and ``bse_feast`` (TDA GMRES contour solves +
-``_rayleigh_ritz`` subspace application).  Still live pending a follow-up:
-  * ``bse_ring_comm.build_bse_ring_matvec`` — used by
+``_rayleigh_ritz`` subspace application).  What the plan asked for, and where it
+now stands:
+  * DONE — ``bse_ring_comm.build_bse_ring_matvec_full`` (non-TDA
+    S=[[A,B],[-B†,-A†]]): the B-encode is PORTED HERE
+    (``build_bse_stack_pair_matvec``, 2026-08-08), which is what that retirement
+    note asked for -- the coupling block reuses this module's encode/decode
+    rather than its own.  The ring full matvec stays live BY DESIGN, not by
+    inertia: it is the ``_materialize_A_B`` oracle and the equality gate's twin,
+    and a fused identity that gates itself against nothing is not gated.
+  * DONE — the ``krep`` matvec option and the bare-``shard_map`` sites are
+    deleted, and the ``yhoist`` collective hoist is unconditional (``3a7704bb``,
+    ``8349b65c``, ``ac67fd3c``).  ``LORRAX_BSE_MATVEC_OPT`` survives because
+    ``gspmd`` remains — see the dial's own note below.
+  * STILL OPEN — ``bse_ring_comm.build_bse_ring_matvec`` (TDA), used by
     ``bse_feast.estimate_spectral_bounds_sharded`` (spectral-bound Lanczos) and
     the equality gates.  Repoint + delete together with ``bse_simple`` and the
-    ``matvec_kind`` data key once the spectral-bound Lanczos is moved over.
-  * ``bse_ring_comm.build_bse_ring_matvec_full`` (non-TDA S=[[A,B],[-B†,-A†]]):
-    the B-encode is now PORTED HERE (``build_bse_stack_pair_matvec``, 2026-08-08),
-    which is what that retirement note asked for -- the coupling block reuses
-    this module's encode/decode rather than its own.  The ring full matvec stays
-    live as the ``_materialize_A_B`` oracle and as the equality gate's twin.
+    ``matvec_kind`` CLI flag/data key once the spectral-bound Lanczos is moved
+    over.  The flag is ALREADY INERT on the sharded eigensolve path
+    (``bse_lanczos.py``, "the legacy ``matvec_kind`` selector is retired here"):
+    it is still parsed and still steers ``absorption_haydock``, so deleting it
+    is a driver-surface change, not a rename.  This is the one row of the plan
+    that needs an owner call rather than a follow-up commit.
 
 THE COUPLING BLOCK, AND THE FUSION THAT PAYS FOR IT
 ---------------------------------------------------

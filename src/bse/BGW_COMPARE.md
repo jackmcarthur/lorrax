@@ -57,7 +57,7 @@ LORRAX_NGPU=4 lxrun python3 -u -m bse.absorption_haydock \
 #     For fair vs-BGW comparison: use eigvals_to_eps2.py with matched n_max.
 LORRAX_NGPU=4 lxrun python3 -u -m bse.bse_jax \
     -i cohsex.in --eqp <bgw_run>/eqp.dat \
-    --bse --lanczos --tda --matvec-kind=simple \
+    --bse --lanczos --tda \
     --n-val 4 --n-cond 4 --n-occ 8 --n-reorth -1 \
     --max-lanczos-iter 2400 --n-eig 100 --px 2 --py 2 --write-eigs 100
 LORRAX_NGPU=1 lxrun python3 -u -m bse.absorption_eigvecs \

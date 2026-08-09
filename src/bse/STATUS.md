@@ -1,4 +1,4 @@
-# BSE module status — last revised 2026-07-22
+# BSE module status — last revised 2026-08-09
 
 > **Running a LORRAX-vs-BGW absorption comparison?** Read
 > [BGW_COMPARE.md](BGW_COMPARE.md) first. It enumerates six conventions
@@ -18,11 +18,11 @@ Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
 | File | Role | Status |
 |---|---|---|
 | `bse_jax.py`            | CLI entry, sharded driver, `_preview_lanczos` | working; `--n-reorth -1` (full reorth) is the right default for spinor BSE |
-| `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | fastest matvec, but opt-in via `--matvec-kind=simple`; the solver default is `ring`, not this (bse_lanczos.py:159) |
-| `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | the DEFAULT matvec (`--matvec-kind=ring`); also the memory-tight choice |
-| `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth |
-| `bse_stack_matvec.py`   | batched trial-stack matvec, one T-tensor regardless of `n_trials` | working |
-| `bse_nontda.py`         | structure-preserving non-TDA (full-BSE) eigensolver | working |
+| `bse_simple.py`         | plain-jit (μ,ν) matvec — XLA partitioner, no shard_map | **legacy.** Reachable only from `absorption_haydock --matvec-kind=simple` and `davidson_absorption`; the sharded eigensolve never builds it. Slated for deletion with `--matvec-kind` |
+| `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | **no longer the eigensolve matvec.** Still live and NOT retiring: `build_bse_ring_matvec` carries `bse_feast.estimate_spectral_bounds_sharded`, and `build_bse_ring_matvec_full` is the non-TDA `_materialize_A_B` oracle and the equality gates' twin |
+| `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth. Reorthogonalisation is **CGS2 by default** since 2026-08-08 (`LORRAX_LANCZOS_REORTH`; `mgs` is the legacy fallback) |
+| `bse_stack_matvec.py`   | batched trial-stack matvec, one T-tensor regardless of `n_trials`; also the non-TDA fused pair applier | **THE matvec.** Every sharded solve (Lanczos / block-Lanczos / Davidson / FEAST) applies H through it. `build_bse_stack_pair_matvec` adds the coupling block as one fused program (1.83× predicted over two ring applies) |
+| `bse_nontda.py`         | structure-preserving non-TDA (full-BSE) eigensolver | working; dense build **3.30× faster** and guarded by a restart-reciprocity **preflight** that refuses a stale W before the O(N²) build. `solver="matrixfree"` (SDY Alg. 4) is opt-in and refuses on a sharded mesh |
 | `bse_feast.py`          | FEAST contour-integration eigensolver | see `context/feast_accuracy_notes.md` |
 | `bse_kpm.py`            | KPM Chebyshev moments → BSE density of states | working |
 | `bse_pseudopoles.py`    | FEAST-based pseudopole construction, density-biased seeds | working |
@@ -118,7 +118,7 @@ In `/pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/04_si_4x4x4_bse/C_lorrax_bse_bgw
 # Run BSE solve, get eigenvectors.h5
 LORRAX_NGPU=4 lxrun python3 -u -m bse.bse_jax \
     -i cohsex_bse.in --eqp <bgw_eqp.dat> --n-occ <Nocc> \
-    --bse --lanczos --tda --matvec-kind=simple \
+    --bse --lanczos --tda \
     --n-val <Nv> --n-cond <Nc> --n-reorth -1 \
     --max-lanczos-iter <2-3x n_eig> --n-eig <Neig> \
     --px 2 --py 2 --write-eigs <Neig>
