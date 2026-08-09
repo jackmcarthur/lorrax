@@ -380,16 +380,30 @@ def _laplace_buckets(a_ry, mask, *, e_lo, e_hi, omega_max, r_max):
 
 
 #: Ceiling on the number of leaves one bucket's width split may return.
-#: Not a tuning knob: with the predicate aligned to the builder's own
-#: x_min (see the call site) a real field terminates in a handful of
-#: leaves, and each leaf is a full-size ``(n_q, N_mu, N_mu)`` boolean
-#: mask -- 81.4 MB on the Si production deck -- held live in the
-#: returned list.  64 leaves is ~5 GB of masks, an order below any
-#: node's memory; a field that asks for more is a field whose width
-#: clause cannot be satisfied by splitting, and it should say so in one
-#: line rather than accumulate masks until the OOM killer says it in
-#: none.
-MAX_WIDTH_SPLIT_LEAVES = 64
+#: A MEMORY guard, not a cost opinion, and its size is set by a
+#: measurement: on the real n_p = 1 field the ALIGNED predicate returns
+#: 208 leaves for one val-branch bucket, and that number is not a
+#: defect -- it is what the slab width clause DEMANDS.  For a pole with
+#: Gamma ~ a (the fitter's fourth guard allows Gamma up to a exactly),
+#: beta_p = Gamma/(e_lo + a) < 1 per pole always, but a PANE of such
+#: poles spanning ratio r has beta ~ r, so clause-satisfying panes need
+#: r -> 1 and a continuum of near-45-degree widths partitions into
+#: O(100) panes.  Each leaf is a full-size (n_q, N_mu, N_mu) bool mask
+#: (81.4 MB on the production deck): 208 of them is ~17 GB, bounded and
+#: survivable, and each becomes one cheap single-window Laplace group.
+#: The ceiling exists for the DIVERGENT regime the 2026-08-09 profile
+#: measured -- the floored predicate demanding 2^16 leaves and killing
+#: a 230 GB node -- where the count grows without a clause being
+#: satisfiable at all.  512 = the measured demand with 2.5x headroom,
+#: ~42 GB of masks worst case, still a third of the node.
+#:
+#: OWNER ROW, registered here because this constant is where the cost
+#: shows up: whether the slab width clause should stay the per-pole
+#: envelope (beta <= 1, forcing the O(100)-pane partition and its
+#: dispatch cost) or become slab-aware (beta <= r for a width-binned
+#: pane, derivation as above) is the routing design's call, not this
+#: guard's.
+MAX_WIDTH_SPLIT_LEAVES = 512
 
 
 def _refuse_width_split_explosion(n_leaves, mask, gamma_ry):

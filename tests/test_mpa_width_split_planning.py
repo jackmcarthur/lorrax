@@ -86,7 +86,13 @@ def test_the_old_predicate_diverges_on_the_measured_geometry():
     leaves = sigma_pass._clause_safe_width_split(
         geo["a_ry"], geo["gamma_ry"], geo["live_mask"],
         e_lo=e_lo, omega_max=0.147, beta_max=R.SHIPPED_WIDTH_BETA_MAX)
-    assert len(leaves) > sigma_pass.MAX_WIDTH_SPLIT_LEAVES, (
+    # 417 measured at this seed: the floored predicate bisects to
+    # (near-)single-width leaves -- 4 of every 5 modes end up alone.  The
+    # threshold is a COUNT, not the memory ceiling, because the ceiling
+    # was later re-sized to the real field's 208 clause-demanded panes
+    # (see MAX_WIDTH_SPLIT_LEAVES) and this cell pins the DIVERGENCE,
+    # which is a property of the predicate, not of the guard.
+    assert len(leaves) > 256, (
         f"the floored predicate no longer diverges ({len(leaves)} leaves) "
         f"-- if _clause_safe_width_split changed, this cell and the "
         f"aligned call site must move together")
@@ -107,6 +113,9 @@ def test_the_aligned_predicate_terminates_on_the_same_geometry():
     leaves = sigma_pass._clause_safe_width_split(
         geo["a_ry"], geo["gamma_ry"], geo["live_mask"],
         e_lo=e_lo, omega_max=0.0, beta_max=R.SHIPPED_WIDTH_BETA_MAX)
+    # The miniature field terminates well under the ceiling; the REAL
+    # field's val branch measures 208 clause-satisfying panes, which is
+    # what sized MAX_WIDTH_SPLIT_LEAVES -- see its docstring.
     assert 1 <= len(leaves) <= sigma_pass.MAX_WIDTH_SPLIT_LEAVES
     total = np.zeros(geo["live_mask"].shape, dtype=int)
     for m in leaves:
