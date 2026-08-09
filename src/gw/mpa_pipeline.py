@@ -133,6 +133,55 @@ def _parse_pole_subset(raw):
     return tuple(out) or None
 
 
+#: The bin ratios the certified catalog is qualified at.  Mirrored from
+#: ``gw.mpa.sigma_routing.BINNED_WIDTH_RATIOS`` at the parse site so a
+#: deck typo is refused HERE, at parse time with the deck's own key named,
+#: rather than four branches into a pass with a catalog refusal that reads
+#: like a missing table.
+_BINNED_WIDTH_RATIOS = (2.0, 4.0)
+
+
+def _parse_binned_width_clause(raw):
+    """``"off"``/``""`` -> ``None``; ``"2"``/``"4"`` -> the float ratio.
+
+    A STRING KEY AND NOT A FLOAT ONE, because ``off`` has to be spellable
+    and a float-typed deck key cannot carry it -- ``gw_config``'s coercion
+    loop reads the DEFAULT's Python type, so a float default would send
+    ``off`` through ``getfloat`` and raise on the one value the knob is
+    supposed to have by default.
+
+    The ratio is checked against the certified ladder here rather than
+    left to the door.  The door's refusal is correct and complete, but it
+    arrives per WINDOW, deep in the fourth branch of the first pass, and
+    says "no certified table" -- which reads like a bundle problem.  A
+    deck asking for r = 3 has made a typo, and it should hear that from
+    the key it typed.
+    """
+
+    text = str(raw or "").strip().lower()
+    if text in ("", "off", "none", "0"):
+        return None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"mpa_binned_width_clause={raw!r} is neither 'off' nor a bin "
+            f"ratio.  FALSE case: 'off' (the default -- the per-pole width "
+            f"clause) or one of {list(_BINNED_WIDTH_RATIOS)}, the ratios "
+            f"the shipped complex_laplace_binned_width catalog certifies a "
+            f"band over."
+        ) from exc
+    if not any(abs(value - r) <= 1.0e-12 for r in _BINNED_WIDTH_RATIOS):
+        raise ValueError(
+            f"mpa_binned_width_clause={raw!r} asks for bin ratio {value:g}, "
+            f"which no shipped entry certifies.  FALSE case: one of "
+            f"{list(_BINNED_WIDTH_RATIOS)}.  The clause's edge IS the bin "
+            f"ratio, so a ratio with no band certificate has nothing "
+            f"putting its beta under it -- generate the rung with "
+            f"tools/generate_binned_width_assets.py before asking for it.")
+    return value
+
+
 def _partial_paths_in(spec):
     """Every partial-cube file named by ``mpa_pass_partial_in``.
 
@@ -485,6 +534,8 @@ def compute_mpa_sigma_pipeline(
                     omega_grid_ry=config.omega_grid_ry,
                     pole_subset=_parse_pole_subset(
                         getattr(config, "mpa_pole_subset", "")),
+                    binned_width_clause=_parse_binned_width_clause(
+                        getattr(config, "mpa_binned_width_clause", "")),
                     print_fn=print_fn,
                 )
             if partial_out:

@@ -1684,7 +1684,8 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
 def compute_mpa_sigma_c_omega_grid(
     wfns, fit_src, meta, mesh_xy, *, ppm_cfg, quad, omega_grid_ry,
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
-    allow_partial=False, pole_subset=None, print_fn=print,
+    allow_partial=False, pole_subset=None, binned_width_clause=None,
+    print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -1808,6 +1809,7 @@ def compute_mpa_sigma_c_omega_grid(
                     neg_omega_half=br.neg_omega_half, xi_ry=xi_ry,
                     edge_factor=edge_factor, b_abs=b_abs, rel_tol=rel_tol,
                     laplace_ratio_max=laplace_ratio_max,
+                    binned_width_clause=binned_width_clause,
                     target_error=float(quad.target_error),
                     laplace_max_nodes=int(quad.max_nodes),
                     crossing_eps_q=float(quad.crossing_eps_q),

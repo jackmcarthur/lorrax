@@ -945,6 +945,21 @@ _DEFAULTS = {
     "mpa_pole_subset": "",
     "mpa_pass_partial_out": "",
     "mpa_pass_partial_in": "",
+    # THE WIDTH-BINNED SIGMA CLAUSE, AND IT IS OFF BY DEFAULT.  "off" is
+    # the shipped per-pole width clause: the non-crossing branches bisect
+    # each Laplace bucket in width until every leaf's beta fits under 1,
+    # which on the audited field is 218 panes on a typical branch and
+    # 1312 on pole 7 -- and a pane is a certified rule and a tau-node run
+    # of its own, which is where the measured 226x against GN-PPM lives.
+    # "2" or "4" bins the widths geometrically at that ratio instead and
+    # serves each bin with one rule whose clause edge IS the ratio (see
+    # gw.mpa.sigma_routing.BINNED_WIDTH_BETA_MAX for the derivation).
+    # Only where a certified band entry exists for the request: the
+    # planner refuses BY NAME otherwise rather than widening quietly.
+    # The value is a STRING and not a float because "off" has to be
+    # spellable; gw.mpa_pipeline._parse_binned_width_clause is the one
+    # place it becomes a number.
+    "mpa_binned_width_clause": "off",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -1562,6 +1577,9 @@ _NORMALIZE_STR = {
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
+    # "OFF" and "off" are the same answer; the ratios are numerals and
+    # folding them is a no-op.
+    "mpa_binned_width_clause",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -2306,6 +2324,9 @@ class LorraxConfig:
     #: order instead of integrating ("" = integrate).  See
     #: ``_DEFAULTS["mpa_pass_partial_in"]``.
     mpa_pass_partial_in: str
+    #: ``"off"`` (the default) or a bin ratio ``"2"``/``"4"``.  See
+    #: ``_DEFAULTS["mpa_binned_width_clause"]``.
+    mpa_binned_width_clause: str
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -2893,6 +2914,8 @@ class LorraxConfig:
             mpa_pass_partial_out=str(
                 _g("mpa_pass_partial_out") or "").strip(),
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),
+            mpa_binned_width_clause=str(
+                _g("mpa_binned_width_clause") or "").strip().lower(),
             # Sub-dataclass groups
             paths=paths,
             head=head,
