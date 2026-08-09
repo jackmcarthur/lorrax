@@ -690,8 +690,19 @@ def fit_zeta_to_h5(
     _gflat_ngkmax = None
     if zeta_cutoff_ry is not None and int(meta.sys_dim) != 0:
         from common.coulomb_sphere import compute_per_q_bare_coulomb_components
-        _bvec_for_sphere = np.asarray(
-            wfn.blat * wfn.bvec, dtype=np.float64)
+        # The Cartesian reciprocal ROWS off the vcoul door's geometry rather
+        # than a hand-written ``blat * bvec``, which ``docs/services/vcoul.md``
+        # names as an antipattern for a reason worth restating: a product
+        # every caller has to remember to take is a footgun, and the day one
+        # of them forgets, every G in this sphere is off by the lattice
+        # constant with no shape error to say so.  ``from_wfn`` is duck-typed
+        # on ``blat``/``bvec``/``cell_volume``; ``WfnLoader`` binds all three
+        # off the mf_header.  Only ``.bvec`` is read here — this site takes no
+        # Ω at all, so there is no ``cell_volume`` question to answer.
+        from ffi import _services
+        _services.ensure_on_path()
+        from vcoul import CoulombGeometry
+        _bvec_for_sphere = CoulombGeometry.from_wfn(wfn).bvec
         _sphere_pkg = compute_per_q_bare_coulomb_components(
             fft_grid=meta.fft_grid,
             bvec=_bvec_for_sphere,

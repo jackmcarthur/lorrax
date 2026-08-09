@@ -64,14 +64,33 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 
     Single signature handles both:
       * Charge / diagonal bispinor tiles: ``same_zeta=True``; caller
-        passes ``zeta_R_q is zeta_L_q`` and the kernel re-shards one
+        passes ``zeta_R_all is zeta_L_all`` and the kernel re-shards one
         buffer for the two operands of the einsum.
       * Bispinor off-diagonal tiles: ``same_zeta=False``; caller passes
-        two separate buffers (potentially different ``n_rmu_*``).
+        two separate slabs (potentially different ``n_rmu_*``).
 
-    Returns ``fn(V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q, q_idx)
+    Returns ``fn(V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_all, q_idx)
               -> (V_new, g0_new)``.
     Donates the two accumulators so the per-q update is in-place.
+
+    THE ζ SLICES ARE TAKEN INSIDE THIS JIT, off the already-traced
+    ``q_idx``, and the whole ``(n_q, μ, G)`` slabs come in whole.  The
+    caller used to slice them eagerly, which emitted one or two
+    ``dynamic_slice_in_dim`` executables plus a gather for ``v_q`` per q
+    outside any jit — O(n_q) dispatches and host round trips, and one
+    live ``(1, n_rmu_padded, ngkmax)`` device temporary per iteration
+    that only the caller's ``block_until_ready`` kept from queueing up
+    (3.28 GB global for a second copy of ζ_L at CrI3 6×6 80 Ry).  Moving
+    the slices in here is what makes gating that sync safe: the
+    temporaries now live and die inside one executable, and the donated
+    accumulator chain serialises the executions anyway.  Same shape as
+    the sibling per-q tier in ``isdf/core.py`` (``_solve_one_q_and_update``),
+    for the same reason: one compiled shape for the whole loop.
+
+    Only the three slice operands are new arguments; positions 0 and 1
+    are still the two donated accumulators, so ``donate_argnums`` is
+    unchanged — and the ζ slabs, which every iteration reuses, are
+    deliberately NOT donated.
     """
     key = (id(mesh_xy), int(n_rmu_L), int(n_rmu_R), int(ngkmax),
            int(g_chunk), bool(write_g0), bool(same_zeta))
@@ -86,15 +105,36 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
     g0_block_sh = NamedSharding(mesh_xy, P('x'))
     v_sh = NamedSharding(mesh_xy, P(None))
+    # The two slabs arrive exactly as ``ZetaLoader.read_zeta_G_slab``
+    # returns them — q replicated, μ over ('x','y') — and the v(q+G) table
+    # replicated by ``device_put_process_local``.  Now that the per-q slice
+    # is taken in here, the SLAB is what crosses the jit boundary, so the
+    # entry sharding is worth stating rather than inheriting: it is what
+    # keeps the reshard below on the one (μ, G) face instead of on the whole
+    # (n_q, μ, ngkmax) tensor.  Measured a no-op at the production layout on
+    # a 2×2 CPU mesh (identical HLO with and without) — it is a contract
+    # against a caller that hands the kernel a differently-sharded slab, not
+    # a fix for something GSPMD is doing today.
+    zeta_all_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    v_all_sh = NamedSharding(mesh_xy, P(None, None))
 
     n_chunks = ngkmax // g_chunk
 
     @partial(jax.jit, donate_argnums=(0, 1))
-    def fn(V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q, q_idx):
-        # zeta_*_q come in as (1, n_rmu_*, ngkmax) from per-q reads;
-        # drop the q axis.  In the same_zeta case ``zeta_R_q is
-        # zeta_L_q`` (caller-aliased); we still take separate views
-        # so the two reshardings below are explicit.
+    def fn(V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_all, q_idx):
+        q_idx_32 = q_idx.astype(jnp.int32)
+        zero32 = jnp.int32(0)
+
+        zeta_L_all = jax.lax.with_sharding_constraint(
+            zeta_L_all, zeta_all_sh)
+        zeta_R_src_all = zeta_L_all if same_zeta else (
+            jax.lax.with_sharding_constraint(zeta_R_all, zeta_all_sh))
+        v_q_all = jax.lax.with_sharding_constraint(v_q_all, v_all_sh)
+
+        # Per-q slices off the TRACED q.  ``zeta_*_q`` are (1, n_rmu_*,
+        # ngkmax); the size-1 q axis is dropped immediately below.
+        zeta_L_q = jax.lax.dynamic_slice_in_dim(
+            zeta_L_all, q_idx_32, 1, axis=0)
         # Drop the size-1 q axis FIRST, then reshard the real (μ, G) tensor to
         # μ-on-x (L) / μ-on-y (R).  The previous code staged through
         # P(('x','y'), None) — sharding the size-1 q axis over all 4 devices —
@@ -102,10 +142,34 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
         # full replicate-then-repartition ("[SPMD] Involuntary full
         # rematerialization" on the V_q g-flat tensor).  Indexing [0] first
         # keeps the reshard on the μ axis (a clean all-to-all / all-gather).
-        zeta_L = jax.lax.with_sharding_constraint(zeta_L_q[0], blk_x_sh)
-        zeta_R_src = zeta_L_q if same_zeta else zeta_R_q
-        zeta_R = jax.lax.with_sharding_constraint(zeta_R_src[0], blk_y_sh)
-        v_q = jax.lax.with_sharding_constraint(v_q, v_sh)
+        # THIS ORDER IS THE POINT — do not fold the [0] into the slice's
+        # sharding constraint.
+        #
+        # ONE ``[0]`` PER SLAB, BOUND TO A NAME, and in the same_zeta case
+        # the two operands share it; then an ``optimization_barrier`` on the
+        # (μ, ngkmax) face.  Both are there for the same measured reason and
+        # neither is cosmetic.  The (1, μ, G) slice has a degenerate leading
+        # axis, so XLA is free to prefer the ``{2,0,1}`` minor-to-major for
+        # it — which is a genuinely different physical layout for the
+        # (n_q, μ, G) slab it is sliced from — and it answers by copying the
+        # WHOLE parameter into that layout, once per call.  Measured in the
+        # optimized HLO on a 2×2 CPU mesh: two ``c128[n_q,μ/p,ngkmax] copy``
+        # ops on the distinct-ζ tile, one on the shared-ζ tile.  Binding the
+        # squeeze once removes the shared-ζ copy; the barrier removes both,
+        # and costs nothing at run time (it is a scheduling fence, not an op).
+        # The collectives are unchanged either way — 2 all-gather + 1
+        # collective-permute, identical to the eager-slice kernel this
+        # replaced.
+        zeta_L_face = jax.lax.optimization_barrier(zeta_L_q[0])
+        zeta_R_face = (zeta_L_face if same_zeta
+                       else jax.lax.optimization_barrier(
+                           jax.lax.dynamic_slice_in_dim(
+                               zeta_R_src_all, q_idx_32, 1, axis=0)[0]))
+        zeta_L = jax.lax.with_sharding_constraint(zeta_L_face, blk_x_sh)
+        zeta_R = jax.lax.with_sharding_constraint(zeta_R_face, blk_y_sh)
+        v_q = jax.lax.with_sharding_constraint(
+            jax.lax.dynamic_slice_in_dim(v_q_all, q_idx_32, 1, axis=0)[0],
+            v_sh)
 
         V_q = jnp.zeros((n_rmu_L, n_rmu_R), dtype=zeta_L.dtype)
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
@@ -130,8 +194,6 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
             _g_chunk_body, V_q, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
         V_q = jax.lax.with_sharding_constraint(V_q, V_block_sh)
 
-        q_idx_32 = q_idx.astype(jnp.int32)
-        zero32 = jnp.int32(0)
         V_new = jax.lax.dynamic_update_slice(
             V_acc, V_q[None, :, :], (q_idx_32, zero32, zero32))
         V_new = jax.lax.with_sharding_constraint(V_new, V_sh)
@@ -455,21 +517,45 @@ def _compute_V_q_g_flat_one_tile(
         print(f"    [{timing_label}] pre-read all {n_q_ibz} IBZ ζ̃ slabs "
               f"(1 batched call): {_read_total:.2f}s", flush=True)
 
-    # ---- Sync per-q kernel loop on device-resident ζ̃ ---------------
+    # ---- Per-q kernel loop on device-resident ζ̃ ---------------------
+    # The loop hands the kernel the WHOLE slabs and a traced q; the three
+    # per-q slices (ζ_L, ζ_R, v_q) happen inside its jit.  What used to be
+    # here was the eager form of exactly those slices — one or two
+    # ``dynamic_slice_in_dim`` executables and a ``v_q_dev[q]`` gather per
+    # iteration, outside any jit, plus a host→device transfer for the loop
+    # counter.
+    #
+    # THE SYNC AND THE SLICES MOVED TOGETHER, and the order matters.  The
+    # ``block_until_ready`` below is vestigial as a correctness device: it
+    # landed in ac735cca8 when the loop body still did a collective PHDF5
+    # read per q, and ordered the kernel before the next read; 0880066a1
+    # hoisted that read into ``read_all_ibz`` above and left the sync
+    # behind.  But while the slices were still eager it was also the only
+    # backpressure on them — drop it alone and up to n_q live
+    # ``(1, n_rmu_L_padded, ngkmax)`` temporaries queue, a second copy of
+    # ζ_L (3.28 GB global at CrI3 6×6 80 Ry).  With the slices inside the
+    # executable there is nothing left to queue: the donated (V_acc, g0_acc)
+    # chain makes each call depend on the previous one's output, so the
+    # executions serialise on their own and the transients live and die
+    # inside one program.  What is left for the sync to do is make the
+    # per-q number below a KERNEL time rather than a dispatch time — so it
+    # is gated on the same condition as the print it feeds.
+    #
+    # Multiplier for both: ``v_q_bispinor`` calls this function once per
+    # UNIQUE_TILE, so the counts here are per tile (7 tiles × 9 q = 63
+    # syncs on the MoS2 3×3 bispinor deck).
+    _time_each_q = bool(verbose) and jax.process_index() == 0
+    # Hoisted: ``jnp.int32(q)`` inside the loop was a host→device transfer
+    # per iteration.
+    q_idx_dev = [jnp.int32(q) for q in range(n_q_ibz)]
     for q in range(n_q_ibz):
         _t1 = _t.perf_counter()
-        zeta_L_q = jax.lax.dynamic_slice_in_dim(
-            zeta_L_all, q, 1, axis=0)                       # (1, n_rmu_L_padded, ngkmax)
-        zeta_R_q = (zeta_L_q if same_zeta
-                    else jax.lax.dynamic_slice_in_dim(
-                        zeta_R_all, q, 1, axis=0))
         V_acc, g0_acc = kernel(
-            V_acc, g0_acc, zeta_L_q, zeta_R_q, v_q_dev[q], jnp.int32(q))
-        jax.block_until_ready(V_acc)
-        _t_k = _t.perf_counter() - _t1
-        if verbose and jax.process_index() == 0:
+            V_acc, g0_acc, zeta_L_all, zeta_R_all, v_q_dev, q_idx_dev[q])
+        if _time_each_q:
+            jax.block_until_ready(V_acc)
             print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
-                  f"kernel={_t_k:.2f}s", flush=True)
+                  f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
     del zeta_L_all
     if not same_zeta:
         del zeta_R_all
