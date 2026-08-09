@@ -548,7 +548,10 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     #     ``UnspecifiedValue`` vs ``P(None, None)`` and re-compiles.
     #   * mask_A, scalars: at runtime go through ``jnp.asarray(numpy_val)``
     #     which stays uncommitted — leave as plain jnp to match.
-    #   * mask_B inherits Ω_q's sharding, same as ``_materialize_window_mask_B``.
+    #   * mask_B is ``base_mask_B`` at runtime and inherits Ω_q's sharding;
+    #     the all-true dummy here matches that.  (The per-window Ω split it
+    #     used to carry is now the Om_lo/Om_hi scalars below — see
+    #     ``ppm_windows.window_mask_B_bounds``.)
     #
     # Placement uses ``device_put_process_local``, NOT a bare
     # ``jax.device_put`` (AA.1 / AO.1): ``jnp.zeros(...)`` is an
