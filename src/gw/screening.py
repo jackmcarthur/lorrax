@@ -39,8 +39,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import jax_profile
 import common.timing as timing
-from .gw_config import (
-    ComputeMode, env_bool, refuse_unimplemented_compute_mode)
+from .gw_config import ComputeMode, env_bool
 
 
 # ---------------------------------------------------------------------------
@@ -100,17 +99,18 @@ def screening_requests_for(
     """Single source of truth for which W's each Σ scheme needs.
 
     Returns an empty list for unscreened schemes (``X_ONLY``); a single
-    static request for COHSEX; static + probe for the PPM schemes.
+    static request for COHSEX; static + probe for the PPM schemes; and an
+    empty list for MPA, which is a different reason for the same shape —
+    see that branch.
 
-    EVERY MODE IS NAMED HERE, INCLUDING THE ONES THAT REFUSE.  This
-    function is the first place a compute mode turns into work, so a mode
-    reaching it without a branch of its own would get its screening plan
-    from whichever ``if`` happened to sit last — which is how a new ansatz
-    silently becomes a run of an old one.  The MPA branch below therefore
-    refuses by name rather than being absent: ``mpa``'s W is sampled on
-    the double-parallel grid (``gw.mpa.sample_plan.mpa_plan``), not at
-    {0, probe}, and returning the PPM pair for it would be wrong in a way
-    no downstream stage could detect.
+    EVERY MODE IS NAMED HERE, AND TWO OF THEM RETURN NOTHING FOR OPPOSITE
+    REASONS.  This function is the first place a compute mode turns into
+    work, so a mode reaching it without a branch of its own would get its
+    screening plan from whichever ``if`` happened to sit last — which is
+    how a new ansatz silently becomes a run of an old one.  ``X_ONLY``
+    asks for no W because it has no screening; ``MPA`` asks for none
+    because its screening is already fitted and on disk.  Neither is the
+    absence of a decision.
 
     To add a new scheme, extend the dispatch here AND add a
     corresponding case to ``compute_sigma_xc`` that reads the W's by
@@ -128,14 +128,26 @@ def screening_requests_for(
         return [static, ScreeningRequest(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     if mode is ComputeMode.MPA:
-        # The sample plan exists (``gw.mpa.sample_plan.mpa_plan``); the
-        # fit stage that consumes it does not, so there is no honest
-        # ScreeningRequest list to return yet.
-        refuse_unimplemented_compute_mode(
-            mode, context="screening_requests_for")
-        raise NotImplementedError(              # pragma: no cover
-            "screening_requests_for: compute_mode = mpa has no screening "
-            "plan until the MPA fit stage lands.")
+        # NO REQUESTS, AND THE EMPTY LIST IS THE ANSWER RATHER THAN A GAP.
+        # The multipole scheme's screening is already computed and already
+        # fitted: its W lives in the staged (B_p, Ω_p) store the deck names
+        # with ``mpa_fit_file``, sampled on the double-parallel grid
+        # (``gw.mpa.sample_plan.mpa_plan``) by the fit driver, not at
+        # {0, probe} by this stage.  Returning the PPM pair would be wrong
+        # in a way no downstream stage could detect — the shapes and roles
+        # would all be right.
+        #
+        # AND THE STATIC CHANNELS DO NOT NEED ONE EITHER, which is the part
+        # worth stating because it is the question a reader asks here.  The
+        # channels ``mpa`` builds are ``{Σ_X, Σ_c(ω)}``
+        # (``MODE_SIGMA_CHANNELS``), so ``sigma_dispatch`` routes it to
+        # ``cohsex_sigma.compute_v_h_sigma_x`` — the V-only entry point,
+        # which touches W nowhere.  Σ_H and Σ_X are built from ``V_q`` and
+        # the exact static q→0 head terms alone.  A ``static`` W would be
+        # solved, allgathered and never read; the two PPM modes ask for one
+        # because their POLE FIT needs the ω = 0 anchor, not because Σ_X
+        # does.
+        return []
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")
 

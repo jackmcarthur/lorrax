@@ -515,30 +515,94 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # refuses MPA by name rather than relying on that entry check — the entry
 # check is the courtesy, the site-level refusals are the safety.
 #
-# REMOVING A ROW IS THE LANDING GESTURE.  When the MPA fit stage lands,
-# its author deletes this entry and the suite that pins the refusal fails
-# loudly until it is rewritten to pin the new behaviour.
-# THE REASON IS NOW A LIST OF TWO, NOT A STAGE THAT DOES NOT EXIST.  The
-# fit stage landed, and so did the Σ pass loop
-# (``gw.mpa.sigma_pass.compute_mpa_sigma_c_omega_grid``, gated against the
-# fused all-pole closed form at 6.8e-11).  What is left is two properties
-# of the STORE the loop reads, and both refuse by name where they are met
-# rather than here: a fit store on the symmetry wedge cannot be summed by a
-# kernel whose k-q sums index the full zone (``sigma_pass.
-# refuse_wedge_pole_slab`` — unfolding a pole field is not the operation
-# that unfolds W, and the conjugation on the time-reversed members is
-# uncertified), and a store with no ``__mpahead`` axis has no q → 0 head
+# REMOVING A ROW IS THE LANDING GESTURE.  When a mode's Σ stage lands, its
+# author deletes the entry and the suite that pins the refusal fails loudly
+# until it is rewritten to pin the new behaviour.
+#
+# THE DICT IS EMPTY, AND THAT IS A STATE AND NOT AN OMISSION.  ``mpa`` was
+# the last row and it came out when the driver seam landed: the fit stage,
+# the Σ pass loop (``gw.mpa.sigma_pass.compute_mpa_sigma_c_omega_grid``,
+# gated against the fused all-pole closed form at 6.8e-11), the q → 0 head
+# (``gw.mpa.sigma_head``) and the pipeline that sequences them
+# (``gw.mpa_pipeline``) are all in the tree, and ``sigma_dispatch`` has a
+# branch for the mode.
+#
+# WHAT USED TO BE HERE IS NOW REFUSED WHERE IT IS MET, which is the whole
+# reason the row could come out.  The two properties of the STORE that
+# blocked the mode are still refused BY NAME, by the code that reads each
+# of them: a fit store on the symmetry wedge cannot be summed by a kernel
+# whose k-q sums index the full zone (``sigma_pass.refuse_wedge_pole_slab``
+# — unfolding a pole field is not the operation that unfolds W, and the
+# conjugation on the time-reversed members is uncertified), and a store
+# with no ``__mpahead`` axis has no q → 0 head
 # (``mpa_store.read_head_poles``), which is not a correction that can be
-# omitted and noticed later.  This row comes out when a store with both
-# exists and the driver seam that points at it lands with it.
-UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
-    ComputeMode.MPA: (
-        "the Σ pass loop is built (gw.mpa.sigma_pass) and gated, but no "
-        "fit store yet carries BOTH a full-BZ pole axis and a __mpahead "
-        "head axis, and the driver seam that reads one is not wired; see "
-        "THEORY_mpa_implementation.md sections 7.5 and 5.1"
-    ),
-}
+# omitted and noticed later.  A deck that names no store at all is refused
+# by :func:`refuse_missing_mpa_fit_store` at driver entry.  Those are
+# refusals about a FILE, which is why they belong at the file and not on
+# an axis of modes.
+#
+# Keeping the dict (and every site that consults it) after it emptied is
+# deliberate: the machinery is what makes the next mode's landing a
+# one-line edit instead of a re-derivation, and an empty dict is the
+# cheapest possible fast-path check.
+UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {}
+
+
+#: The energy units a multipole fit store's pole axis can be stated in.
+#: The FACTORS live in ``gw.mpa.sigma_head.POLE_ENERGY_UNITS``, which is
+#: the module that applies them; this is only the parser's legal set, kept
+#: here so a deck typo is caught at parse time without the config layer
+#: importing the Σ stage.  ``test_mpa_sigma_head`` asserts the two agree.
+POLE_ENERGY_UNIT_SPELLINGS = ("Ry", "Ha")
+
+
+def coerce_pole_energy_unit(value) -> str:
+    """Normalise ``mpa_pole_energy_unit``; refuse an unknown spelling.
+
+    Case-insensitive on input and canonical on output, so a deck may
+    write ``ry`` / ``HA`` and every consumer downstream compares against
+    one spelling.  A typo raises rather than defaulting: the default is
+    the thing being chosen, and silently falling back to it would scale
+    every head pole by two with no other symptom.
+    """
+    raw = str(value if value is not None else "Ry").strip()
+    for known in POLE_ENERGY_UNIT_SPELLINGS:
+        if raw.lower() == known.lower():
+            return known
+    raise ValueError(
+        f"mpa_pole_energy_unit={value!r} is not a known energy unit; "
+        f"expected one of: {', '.join(POLE_ENERGY_UNIT_SPELLINGS)}.")
+
+
+def refuse_missing_mpa_fit_store(config, *, context: str = "this run") -> str:
+    """The MPA fit store path, or a refusal that names the missing key.
+
+    ``compute_mode = mpa`` reads its screening from a staged (B_p, Ω_p)
+    store and from nowhere else — :func:`gw.screening.screening_requests_for`
+    returns NO requests for it, so there is no W anywhere in the run to
+    fall back to.  A deck that selects the mode and names no store is
+    therefore not under-specified in a way the driver could paper over; it
+    has asked for a screened self-energy and supplied no screening.
+
+    Returns the raw (already input-dir-resolved) path for every other
+    mode's benefit too, so a caller need not branch on the mode to ask.
+    """
+    resolved = coerce_compute_mode(config.compute_mode)
+    path = getattr(config.paths, "mpa_fit_file", None)
+    if resolved is not ComputeMode.MPA:
+        return path
+    if path:
+        return path
+    raise ValueError(
+        f"compute_mode = mpa but the deck names no 'mpa_fit_file', so "
+        f"{context} has no screening at all: the multipole Σ_c is built "
+        f"from the complex poles (B_p, Ω_p) in a staged fit store, and "
+        f"screening_requests_for(mpa) deliberately asks the screening "
+        f"stage for nothing because that store already holds the answer.  "
+        f"Set mpa_fit_file to the store written by the MPA fit driver "
+        f"(file_io.mpa_store); it must carry both a full-BZ pole axis and "
+        f"a __mpahead head axis, and the readers refuse it by name when it "
+        f"does not.")
 
 
 def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
@@ -815,6 +879,42 @@ _DEFAULTS = {
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
+    # The staged multipole (B_p, Ω_p) fit store — ``compute_mode = mpa``
+    # reads its ENTIRE screening from this file and asks the screening
+    # stage for nothing, so a deck that selects that mode without naming
+    # one is refused by ``refuse_missing_mpa_fit_store`` rather than run
+    # against the bare Coulomb.  Empty string == "not set"; resolved
+    # relative to the deck's directory like every other path key.  Written
+    # by ``gw.mpa.fit_driver`` / ``file_io.mpa_store``; the file must carry
+    # BOTH a full-BZ pole axis and a ``__mpahead`` head axis, and the two
+    # readers refuse it by name when it does not.
+    "mpa_fit_file": "",
+    # What energy unit the fit store's Ω_p / B_p are stated in.  A KEY AND
+    # NOT A CONSTANT because the store does not record it: the
+    # ``__mpahead`` group carries no unit stamp, and the
+    # ``mpa_omega_units`` attr that does exist is stamped on the BODY
+    # W(ω) tensor by a different producer.  "Ry" is the default because
+    # the tree's only head producer (``gw.mpa.head_dipole``) fits against
+    # band-energy differences in Ry and the landed Σ pass loop
+    # (``gw.mpa.sigma_pass``) compares Re Ω_p against Ry band energies —
+    # so Ry is what every in-tree route means.  A store fitted on a
+    # Hartree axis says "Ha" here and the poles and residues are BOTH
+    # scaled by 2 (the residue carries one power of energy in the
+    # numerator); nothing guesses.  See ``gw.mpa.sigma_head``.
+    "mpa_pole_energy_unit": "Ry",
+    # WHICH q → 0 HEAD SET, when the store carries more than one.  A fit
+    # store's ``__mpahead`` group may be joined by ``__mpahead__<label>``
+    # siblings (``mpa_store.head_group_name``), and the reason they exist
+    # is an OPEN OWNER DECISION: the sign of the nonlocal velocity
+    # commutator in ``common.mtxel_sweep.dipole_operator`` moves the head
+    # pole by ~3 eV, so both conventions are fitted into ONE store as two
+    # named sets and the comparison table carries both columns without two
+    # 23 GB stores.  ``as_shipped`` is the bare group, which is also what a
+    # store written before labels existed holds — so the default reads
+    # every store there is.  The RESOLVED label is announced on the run's
+    # Σ head line: a head number that cannot be attributed to a convention
+    # is precisely what this arrangement exists to prevent.
+    "mpa_head_label": "as_shipped",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -1790,6 +1890,11 @@ class FilePaths:
     eqp0_file: str
     eqp1_file: str
     sigma_omega_h5_file: str
+    #: Staged multipole fit store for ``compute_mode = mpa``.  ``None``
+    #: means the deck did not name one, which is legal for every other
+    #: mode and refused for that one — see
+    #: :func:`refuse_missing_mpa_fit_store`.
+    mpa_fit_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2153,6 +2258,14 @@ class LorraxConfig:
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
     no_degen_averaging: bool
     degen_avg_tol_ry: float
+    #: Energy unit of the multipole fit store's poles and residues.  See
+    #: ``_DEFAULTS["mpa_pole_energy_unit"]`` for why this is a deck key
+    #: and not a constant, and ``gw.mpa.sigma_head`` for the conversion.
+    mpa_pole_energy_unit: str
+    #: Which named q→0 head set in the fit store to read.  See
+    #: ``_DEFAULTS["mpa_head_label"]``; ``as_shipped`` is the bare
+    #: ``__mpahead`` group and therefore also every pre-label store.
+    mpa_head_label: str
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -2406,6 +2519,11 @@ class LorraxConfig:
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
             sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
+            # Empty string is "not set", the same convention
+            # ``centroids_file_current`` uses — and the same reason: an
+            # absent optional path must be distinguishable from a path
+            # that happens to resolve to the deck's own directory.
+            mpa_fit_file=(str(_g("mpa_fit_file")) or None),
         )
         head = HeadConfig(
             wcoul0_source=str(_g("wcoul0_source")).strip().lower(),
@@ -2728,6 +2846,9 @@ class LorraxConfig:
             use_ppm_sigma=bool(_g("use_ppm_sigma")),
             no_degen_averaging=bool(_g("no_degen_averaging")),
             degen_avg_tol_ry=float(_g("degen_avg_tol_ry")),
+            mpa_pole_energy_unit=coerce_pole_energy_unit(
+                _g("mpa_pole_energy_unit")),
+            mpa_head_label=str(_g("mpa_head_label") or "").strip(),
             # Sub-dataclass groups
             paths=paths,
             head=head,

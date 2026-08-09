@@ -138,7 +138,9 @@ P-scaling at P=16 (b300 deck, 2979c/300b): the ζ charge factor executes q-paral
 | key (deck unless noted) | default | meaning |
 |---|---|---|
 | `nband` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ band-sum top / interior valence edge / σ conduction count; σ diagonals for [0, nelec+ncond) |
-| `compute_mode` | auto | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`; auto infers from `do_screened`/`use_ppm_sigma`/`ppm_model` and never infers `mpa`. `mpa` (multipole-W, the owner's "FF") is declared on the axis but REFUSES AT DRIVER ENTRY until its Σ stage lands — see [THEORY_mpa_implementation.md](theory/THEORY_mpa_implementation.md) |
+| `compute_mode` | auto | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`; auto infers from `do_screened`/`use_ppm_sigma`/`ppm_model` and never infers `mpa`. `mpa` (multipole-W, the owner's "FF") runs since 2026-08-09 and takes its whole screening from the staged pole store named by `mpa_fit_file`, so it asks the screening stage for nothing — see [THEORY_mpa_implementation.md](theory/THEORY_mpa_implementation.md) |
+| `mpa_fit_file` | (unset) | Staged multipole (B_p, Ω_p) fit store, resolved relative to the deck. REQUIRED by `compute_mode = mpa` and refused by name when absent: that mode has no screening-stage W to fall back to. The store must carry a full-BZ pole axis and a `__mpahead` q→0 head axis; a wedge-shaped or headless store is refused by name too. |
+| `mpa_pole_energy_unit` | Ry | Energy unit of the fit store's Ω_p / B_p. A key because the store does not record it; both arrays scale by the same factor (the residue carries one power of energy), so `Ha` doubles both. |
 | `qp_solver` | auto→one_shot_dft | `one_shot_dft` (G0W0 at E_DFT) \| `fixed_point` (on-shell solve) \| `self_consistent` (QSGW loop) |
 | `restart` | true | reuse `tmp/isdf_tensors_{n_rmu}.h5` (skip ζ-fit/V_q); stamp contract below |
 | `ppm_probe_chi_reuse` | off | opt-in `auto`: probe χ₀ folds into ONE fused τ sweep on static+k augmented nodes; pays only where per-node χ cost dominates (nets +1.2 s at b300 — planner cost; job 7885109) |

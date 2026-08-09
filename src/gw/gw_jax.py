@@ -68,7 +68,8 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
+	LorraxConfig, QPSolver, refuse_missing_mpa_fit_store,
+	refuse_unimplemented_compute_mode)
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
@@ -225,13 +226,23 @@ def main(argv=None):
 	input_dir = config.input_dir
 	qp_solver = config.qp_solver     # how QP energies are extracted from Σ
 	mode = config.compute_mode       # the self-energy ansatz
-	# A mode may be DECLARED on the axis before its Σ stage exists (today:
-	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
-	# any allocation is spent — is the difference between an operator
-	# learning in the first second and learning after the ζ fit.  The
-	# refusal names the mode; a typo'd mode value never reaches this line
-	# because ``config.compute_mode`` already raised on it.
+	# A mode may be DECLARED on the axis before its Σ stage exists.  None
+	# is today — ``mpa`` was the last and its seam landed — but refusing
+	# here, before the WFN read, before ISDF, before any allocation is
+	# spent, is the difference between an operator learning in the first
+	# second and learning after the ζ fit, and that is worth keeping for
+	# the mode after next.  The refusal names the mode; a typo'd mode
+	# value never reaches this line because ``config.compute_mode``
+	# already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+	# AND THE SAME COURTESY FOR A MODE THAT IS BUILT BUT UNDER-SPECIFIED.
+	# ``compute_mode = mpa`` reads its whole screening from the fit store
+	# the deck names; a deck that selects the mode and names none has
+	# asked for a screened self-energy and supplied no screening, and the
+	# only honest moment to say so is here rather than after the ISDF
+	# stage has run.  The Σ pipeline restates the refusal where it relies
+	# on it, for the benefit of any other caller.
+	refuse_missing_mpa_fit_store(config, context="the LORRAX GW driver")
 	do_screened = mode.needs_screening
 
 	# ---- The runtime is already up ----------------------------------------
@@ -429,12 +440,32 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	with timing.section("gw_jax.persist_w0"):
-		persist_w0_and_head(
-			W_by_role.get("static", V_q),
-			tensors_filename=tensors_filename, head_resolver=head_resolver,
-			config=config, meta=meta, mesh_xy=mesh_xy,
-			sym=sym, centroid_indices=centroid_indices, print_fn=print0)
+	# THE WRITER IS ONLY ASKED WHEN THERE IS A W0 TO WRITE.  This call used
+	# to pass ``W_by_role.get("static", V_q)`` unconditionally, and the
+	# default was a fallback nobody could reach: every screened mode
+	# requested a static W.  ``compute_mode = mpa`` is the first that does
+	# not — its screening is fitted and on disk (see
+	# ``screening_requests_for``) — and under the old form it would have
+	# stamped the BARE COULOMB into the restart file's ``W0_qmunu`` slot
+	# under the name of a screened one, then hit ``persist_w0_and_head``'s
+	# own refusal about the ω grid a few lines later.  Both are avoided by
+	# asking the question the writer is for: is there a static W?  The
+	# refusal inside that function stays exactly as it is, for a caller
+	# that reaches it with one.
+	if "static" in W_by_role:
+		with timing.section("gw_jax.persist_w0"):
+			persist_w0_and_head(
+				W_by_role["static"],
+				tensors_filename=tensors_filename,
+				head_resolver=head_resolver,
+				config=config, meta=meta, mesh_xy=mesh_xy,
+				sym=sym, centroid_indices=centroid_indices, print_fn=print0)
+	elif do_screened:
+		print0(
+			f"  W0 restart flush: skipped — compute_mode = "
+			f"{mode.value} requests no static W from the screening stage, "
+			f"so there is no W(ω=0) to persist.  Its screening lives in "
+			f"the fit store the deck named, with its own q→0 head axis.")
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was

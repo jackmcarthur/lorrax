@@ -1,13 +1,22 @@
 """Mode-orthogonal Σ_xc dispatch.
 
 A single entry point :func:`compute_sigma_xc` that the QSGW iteration
-map calls regardless of compute mode (X_ONLY, COHSEX, GN_PPM, HL_PPM).
-The dispatch decides which Σ kernel runs internally; the iteration map
-sees one signature and one result type.
+map calls regardless of compute mode (X_ONLY, COHSEX, GN_PPM, HL_PPM,
+MPA).  The dispatch decides which Σ kernel runs internally; the
+iteration map sees one signature and one result type.
 
 The dispatch is EXHAUSTIVE over ``gw_config.ComputeMode``: a mode with
-no kernel here is refused by name, not absorbed by the last branch.  MPA
-is that case today.
+no kernel here is refused by name, not absorbed by the last branch.
+Every member has one today — the multipole branch was the last to land —
+so the refusal currently guards nothing, and it stays for the mode after
+next.  A guard that is only written the day it is needed is a guard
+written by whoever is least likely to notice they need it.
+
+The two DYNAMIC schemes (the two-point plasmon-pole fit and the
+multipole one) differ only in how ``Σ_c(ω, k, m, n)`` is produced.
+Everything after the cube exists — the QSGW Hermitisation, the optional
+cube write, the ``SigmaResult`` assembly — is
+:func:`_finish_dynamic_sigma`, once.
 
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
@@ -368,8 +377,13 @@ def compute_sigma_xc(
         * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
           for the second fit point.
 
-        ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
-        means picking the role labels it needs in
+        ``X_ONLY`` ignores ``W_by_role`` entirely, and so does ``MPA``
+        — for the opposite reason: its screening is already fitted and
+        lives in the staged pole store the deck names with
+        ``mpa_fit_file``, so it asks the screening stage for nothing and
+        reads no role at all.
+
+        Adding a new mode means picking the role labels it needs in
         :func:`gw.screening.screening_requests_for`, giving it a row in
         ``gw_config.MODE_SIGMA_CHANNELS``, and reading the roles here —
         no plumbing changes elsewhere.  Until it has a branch here it is
@@ -401,7 +415,6 @@ def compute_sigma_xc(
     """
     from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
-    from .qsgw_utils import build_qsgw_sigma_xc
 
     # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
     # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
@@ -526,22 +539,48 @@ def compute_sigma_xc(
             sigma_coh_kij_ry=sig_coh,
         )
 
+    if mode is ComputeMode.MPA:
+        # THE MULTIPOLE BRANCH, AND WHY IT SITS ABOVE THE POLE-MODEL
+        # GUARD.  That guard's job is to turn away a mode with no Σ kernel
+        # of its own; ``mpa`` now has one, so it must be served before the
+        # guard rather than by widening it.  Nothing from ``W_by_role`` is
+        # read: this scheme's screening is the staged (B_p, Ω_p) fit store
+        # the deck names, and ``screening_requests_for(mpa)`` deliberately
+        # asks the screening stage for nothing.
+        from .mpa_pipeline import compute_mpa_sigma_pipeline
+
+        mpa_outputs = compute_mpa_sigma_pipeline(
+            wfns=wfns,
+            sig_x=sig_x, sig_h=sig_h,
+            config=config, meta=meta, mesh_xy=mesh_xy,
+            band_slices=band_slices, wfn=wfn, sym=sym,
+            input_dir=input_dir,
+            write_sigma_omega_h5=write_sigma_omega_h5,
+            print_fn=print_fn,
+        )
+        return _finish_dynamic_sigma(
+            mpa_outputs, mode=mode, sig_x=sig_x, sig_h=sig_h,
+            e_qp_ev=e_qp_ev, config=config, mesh_xy=mesh_xy, wfn=wfn,
+            write_sigma_omega_h5=write_sigma_omega_h5, print_fn=print_fn)
+
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
     # guard it was reached by ELSE: anything that was not X_ONLY and not
     # COHSEX ran it.  That is fine while the enum's only remaining members
     # ARE the two PPM fits, and it silently mis-runs the first member that
-    # is not — a multipole run would have taken a GN fit of two W samples
-    # and reported it as Σ_c(ω) with no stage able to tell.  So the pole
-    # model is now asked for by name: ``ppm_model`` is 'gn' or 'hl' for
-    # exactly the two PPM modes and None for every other member, present
-    # or future.
+    # is not — the multipole mode, had it arrived here, would have taken a
+    # GN fit of two W samples and reported it as Σ_c(ω) with no stage able
+    # to tell.  It no longer arrives: it is served by name above.  The
+    # guard stays for the mode AFTER it, present or future: ``ppm_model``
+    # is 'gn' or 'hl' for exactly the two PPM modes and None for every
+    # other member.
     if mode.ppm_model is None:
         raise NotImplementedError(
             f"compute_sigma_xc: compute_mode = "
             f"{getattr(mode, 'value', mode)} reaches the Σ dispatch with no "
             f"Σ kernel of its own.  The static channels are handled above "
-            f"(X_ONLY, COHSEX) and the dynamic branch below is the two-point "
+            f"(X_ONLY, COHSEX), the multipole channel is handled above "
+            f"(MPA), and the dynamic branch below is the two-point "
             f"plasmon-pole pipeline, which this mode is not; it is refused "
             f"here rather than run under another ansatz's name.  A new mode "
             f"needs its own branch here, a row in "
@@ -571,11 +610,38 @@ def compute_sigma_xc(
         write_sigma_omega_h5=write_sigma_omega_h5,
         print_fn=print_fn,
     )
+    return _finish_dynamic_sigma(
+        ppm_outputs, mode=mode, sig_x=sig_x, sig_h=sig_h,
+        e_qp_ev=e_qp_ev, config=config, mesh_xy=mesh_xy, wfn=wfn,
+        write_sigma_omega_h5=write_sigma_omega_h5, print_fn=print_fn)
+
+
+def _finish_dynamic_sigma(
+    outputs, *, mode, sig_x, sig_h, e_qp_ev, config, mesh_xy, wfn,
+    write_sigma_omega_h5: bool, print_fn,
+) -> SigmaResult:
+    """The tail every dynamic scheme shares: QSGW build, cube, result.
+
+    WHAT MAKES THIS ONE FUNCTION AND NOT TWO.  Everything below operates
+    on ``Σ_c(ω, k, m, n)``, the ω grid and ``Σ_x`` — objects that carry no
+    record of which ansatz produced the poles behind them, and should not.
+    The QSGW ansatz ``Σ_ij = ½[Σ_ij(E_i) + Σ_ij(E_j)]ʰ`` is a statement
+    about a frequency-dependent self-energy, not about a plasmon-pole one,
+    so a second copy of it beside the multipole branch would be a second
+    place for the Hermitisation, the E_F convention or the clipping report
+    to drift.
+    """
+    from .qsgw_utils import build_qsgw_sigma_xc
+
+    if e_qp_ev is None:
+        raise ValueError(
+            f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
+            "(QP energies for the QSGW Σ_c evaluation).")
 
     # QSGW Σ_xc^QSGW evaluated at e_qp_ev.  Static Σ_x is added inside
     # the kernel, so the result already includes Σ_x.  The E_F reference
     # is the LORRAX-canonical midgap (``wfn.efermi`` — the same value
-    # the PPM pipeline used for ``omega_dft_rel_ev``), so calling this
+    # the pipeline used for ``omega_dft_rel_ev``), so calling this
     # with ``e_qp_ev = E_DFT`` evaluates at exactly the pipeline's
     # at-DFT frequencies (textbook G0W0 / SC-iteration-1 equivalence).
     omega_grid_ev = np.asarray(
@@ -589,7 +655,7 @@ def compute_sigma_xc(
     sig_x_rep = device_put_process_local(
         sig_x, NamedSharding(mesh_xy, P(None, None, None)))
     sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
-        ppm_outputs.sigma_c_omega, sig_x_rep,
+        outputs.sigma_c_omega, sig_x_rep,
         omega_grid_ev, e_qp_rel_ev, mesh_xy,
     )
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
@@ -605,21 +671,21 @@ def compute_sigma_xc(
     if write_sigma_omega_h5:
         from .qsgw_utils import write_qsgw_sigma_cube
         write_qsgw_sigma_cube(
-            ppm_outputs.sigma_omega_h5_path, sigma_xc_qsgw,
+            outputs.sigma_omega_h5_path, sigma_xc_qsgw,
             config=config, print_fn=print_fn)
 
     return SigmaResult(
         v_h_kij_ry=sig_h,
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
-        sigma_c_omega_kij_ry=ppm_outputs.sigma_c_omega,
-        sigma_c_at_dft_diag_ev=ppm_outputs.sigma_c_at_dft_ev,
-        omega_dft_rel_ev=ppm_outputs.omega_dft_rel_ev,
+        sigma_c_omega_kij_ry=outputs.sigma_c_omega,
+        sigma_c_at_dft_diag_ev=outputs.sigma_c_at_dft_ev,
+        omega_dft_rel_ev=outputs.omega_dft_rel_ev,
         omega_grid_ev=config.omega_grid_ev,
         omega_grid_ry=config.omega_grid_ry,
-        head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
-        sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
-        efermi_dft_ev=ppm_outputs.efermi_dft_ev,
+        head_sigma_diag_w_kn_ry=outputs.head_sigma_diag_w_kn_ry,
+        sigma_omega_h5_path=outputs.sigma_omega_h5_path,
+        efermi_dft_ev=outputs.efermi_dft_ev,
     )
 
 
