@@ -228,7 +228,16 @@ commit range and with the FFI/sharded feature set on.
   additionally holds `n_omega * nk * nb^2 * 16` per rank (~11 GB at `nb=1024`,
   ~44 GB at `nb=2048`, 90 GB at `nb ~ 2929`). Planner-vs-measured agreement
   quoted for this model is an ISDF-stage statement only.
-- **The restart tensor is written unconditionally** and scales as `N_mu^2`:
-  26.5 GB (`N_mu` 6947), 56.6 GB (10015), 123.2 GB (15007), projected 564 GB at
-  32059. `restart = false` means *compute fresh AND write*; there is no key that
-  computes fresh without writing.
+- **The restart tensor** scales as `N_mu^2`: 26.5 GB (`N_mu` 6947), 56.6 GB
+  (10015), 123.2 GB (15007), projected 564 GB at 32059. `restart = false` means
+  *compute fresh AND write*. ~~there is no key that computes fresh without
+  writing.~~ **CORRECTED 2026-08-09: there is — `write_restart_tensors = false`
+  (`gw_config.py` `_DEFAULTS`, documented in `docs/input_reference.md`) skips
+  every dataset with one rank-0 line, measured at 4.5 s of a ~21 s Si warm wall
+  and 2.01 GB.** This paragraph is the one place that claim costs the most,
+  since it is the document about the regime where the artifact reaches hundreds
+  of GB. Note the two keys are independent and answer different questions:
+  `write_restart_tensors` decides *whether* the file is written at all (for runs
+  that DISCARD it — a BSE run against such a directory refuses on the missing
+  file), while `restart_q_storage` decides *on which q-set* it is stored for runs
+  that keep it.
