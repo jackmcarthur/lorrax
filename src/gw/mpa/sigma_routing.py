@@ -122,7 +122,10 @@ __all__ = [
     "SIGN_DEFINITE",
     "WindowPlan",
     "RoutingRefusal",
+    "BINNED_WIDTH_BETA_MAX",
+    "BINNED_WIDTH_RATIOS",
     "beta_for_window",
+    "binned_width_entry",
     "crossing_rule",
     "denominator_can_cross",
     "exact_resolvent",
@@ -166,6 +169,32 @@ SIGN_DEFINITE = "sign_definite"
 #: beta-independent nodes, so the ``beta = 1.0`` table serves every
 #: ``beta <= 1`` exactly.
 SHIPPED_WIDTH_BETA_MAX = 1.0
+
+#: The BINNED-WIDTH clause's edge, mirrored from
+#: ``minimax.beta_selector.BETA_CLAUSES['binned_width'].beta_max``, and the
+#: ratios that clause is qualified at.  Same mirror discipline as above and
+#: proved equal by the same test.
+#:
+#: WHAT IT IS AND WHY IT IS NOT A WIDENING.  The clause above is per POLE:
+#: ``beta <= 1`` holds element by element, and a PANE inherits it only if
+#: its own widest ``Gamma`` sits over its own shallowest ``x_min`` -- which
+#: is why ``sigma_pass._clause_safe_width_split`` has to bisect a Laplace
+#: bucket in width until every leaf satisfies it, and why the audited field
+#: answers with 218 panes on a typical non-crossing branch and 1312 on pole
+#: 7.  Bin the widths at a fixed ratio ``r`` FIRST and the same two facts
+#: give a pane-level bound directly: ``pade_fit``'s fourth guard puts
+#: ``Gamma_p <= a_p`` on every pole, so the pane's shallowest ``a`` is at
+#: least its smallest ``Gamma``, so
+#:
+#:     beta = Gamma_hi/x_min <= Gamma_hi/(min E_A + Gamma_lo) <= r.
+#:
+#: The bin ratio IS the clause edge, closed at the top, and at ``r = 1`` it
+#: reproduces the shipped width clause exactly.  The catalog behind it
+#: (``complex_laplace_binned_width/v1``) certifies a SUPREMUM over the whole
+#: ``(u, beta)`` band rather than a point, which is the difference a
+#: width-clause entry cannot make up by being asked more nicely.
+BINNED_WIDTH_BETA_MAX = 4.0
+BINNED_WIDTH_RATIOS = (2.0, 4.0)
 
 #: ``pade_fit.DEFAULT_GUARDS["width_ratio_max"]`` -- the fourth guard's cap
 #: on ``|Im Omega| / Re Omega``, and therefore the exact closure of the width
@@ -300,6 +329,51 @@ def refuse_edge_factor_below_envelope(edge_factor,
             code="edge_factor_below_envelope",
             beta=1.0 / ef)
     return float(1.0 / ef)
+
+
+def binned_width_entry(*, range_value, beta, bin_ratio, target_error,
+                       max_nodes):
+    """Ask the certified catalog whether a width-BINNED pane is served.
+
+    THE LOOKUP-AND-REFUSE DISCIPLINE, ARMED.  Everywhere else on this path
+    the rule is built rather than looked up -- the positive composite is
+    certified by its own ``kappa0 <= 1`` and needs no table -- and
+    ``_refuse_width_clause`` checks the per-pole envelope as a statement
+    about the field rather than as a gate on the build.  The binned clause
+    is different in exactly one way that makes the catalog load-bearing:
+    the pane is allowed a ``beta`` up to ``r`` instead of up to 1, and the
+    only thing that says a rule at that ``beta`` meets its tier ACROSS THE
+    WHOLE BAND the pane spans is a band certificate.  So the planner may
+    emit a binned pane only where an entry exists, and this is where it
+    asks.
+
+    Returns the ``TableSelection`` when one is served and the
+    ``TableRefusal`` when none is -- a VALUE either way, because the
+    caller (``_refuse_width_clause``) is the one that decides whether a
+    refusal is fatal, and a request made only to size a plan should not
+    raise.
+
+    The import is function-local on purpose: ``sigma_routing`` is imported
+    by the planner on every branch of every pass, and the two mirrored
+    constants above exist precisely so this module can state its
+    preconditions without paying an import at module scope.  It reaches
+    the selector as an ATTRIBUTE of the top-level package rather than as
+    ``from minimax import beta_selector``, which is the door rule
+    ``tests/test_layering.py`` enforces and which
+    ``gw.minimax_screening`` already spells the same way.
+    """
+
+    import minimax as _mm
+
+    _bs = _mm.beta_selector
+    return _bs.select(
+        range_value=float(range_value),
+        beta=float(beta),
+        beta_clause=_bs.BINNED_WIDTH,
+        target_error=float(target_error),
+        max_nodes=int(max_nodes),
+        bin_ratio=float(bin_ratio),
+    )
 
 
 def beta_for_window(gamma_ry, x_min_ry):
