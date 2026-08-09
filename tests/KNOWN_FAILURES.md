@@ -2119,6 +2119,36 @@ new tables from their own bytes without any runtime consumer.
 selection rule that can carry a β axis will be designed.  Until then the
 tables are inert payload: they cost bytes in the tree and nothing else.
 
+**CLOSED 2026-08-08 by `feat/minimax-beta-selector-2026-08-08`.**  The β axis
+now exists as its own module, `src/common/minimax_beta_selector.py`, and
+`solve_laplace_minimax_imag_interval` consults it.  The three things the row
+above said had to be true before wiring are true: β is matched against each
+entry's own stamped `beta_tolerance` band and never rounded for
+`rule='btv_minimax'`; the one entry that does round — the positive composite,
+whose β dependence is an exact phase on β-independent nodes — rounds downward
+only and is *re-phased* at the request rather than served as shipped; and the
+envelope's two clauses are checked before the β match, so a Σ-stage width
+request cannot be answered from a sampling-height sweep even where the two
+overlap numerically.  Everything the selector cannot certify still falls
+through to the same uncertified runtime solve on the same cache key, so R1's
+stage-2 refusal remains staged and unarmed.  `tests/test_minimax_quadrature.py`
+is still **14 passed** — the static and crossing selector is untouched — and
+`tests/test_minimax_beta_selector.py` adds 25 cells, of which the red twins are
+the neighbouring β, the wrong clause, the upward-rounded composite, the
+mis-stamped band, the unknown β axis and the unreadable payload.
+
+**Registered while closing it, and NOT caused by it:**
+`tests/test_minimax_imag_tables.py::test_the_fit_stage_floor_is_no_longer_a_quadrature`
+fails on this WSL host at `origin/main` itself (`f0435e9a`, measured with the
+branch stashed): it asserts `worst_eval < 1e-8` and reaches `9.98e-08`, but its
+own *synthesis* baseline — computed with no evaluator, no quadrature and no
+table anywhere in the path — is `8.65e-08` here against the `3.81e-09` the
+docstring records.  So what moved is the Padé fixture's conditioning on this
+host and not the quadrature the cell is about; the cell's third assertion,
+`worst_eval < 2 * worst_synth`, still holds.  The fix belongs with whoever owns
+that fixture: the absolute `1e-8` needs to become a statement relative to the
+synthesis baseline, which is what the docstring already says the cell means.
+
 ### Where the evidence lives
 
 Local (WSL): `_reports/census_head.xml`, `_reports/census_base.xml`,
