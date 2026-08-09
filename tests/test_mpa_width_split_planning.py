@@ -171,11 +171,13 @@ def test_the_leaf_ceiling_refuses_by_name_on_a_field_outside_the_argument():
     """The backstop's red twin: a field that DEFEATS the termination
     argument (widths far above their own Laplace edges, violating the
     fitter's ``Gamma <= a`` guard on purpose) must refuse with the
-    ceiling, the mask statistics and the word 'out-of-memory' -- not
-    accumulate masks.  Constructed through the call-site guard directly,
+    ceiling, the width statistics and the word 'out-of-memory' -- not
+    build sixteen thousand certified rules.  The field is sized to
+    exceed the RE-DERIVED ceiling (8192, six times the largest demand a
+    real pole field has made) rather than the old mask-memory one.  Constructed through the call-site guard directly,
     because ``plan_branch_groups`` can only reach it through a
     non-crossing branch whose field escaped the fitter's guards."""
-    n = 4096
+    n = 16384
     rng = np.random.default_rng(9)
     a = np.full(n, 1.0e-11)                      # Laplace edge ~ the floor
     g = np.exp(rng.uniform(np.log(1e-8), np.log(1e-1), size=n))
@@ -188,7 +190,7 @@ def test_the_leaf_ceiling_refuses_by_name_on_a_field_outside_the_argument():
     msg = str(exc.value)
     assert str(sigma_pass.MAX_WIDTH_SPLIT_LEAVES) in msg
     assert "out-of-memory" in msg
-    assert "4096 modes" in msg
+    assert "16384 modes" in msg
 
 
 def test_geometric_width_bins_partition_and_bound_the_ratio():

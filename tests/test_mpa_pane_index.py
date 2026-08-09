@@ -218,6 +218,57 @@ def test_the_partition_costs_one_index_per_live_mode_not_one_mask_per_pane():
     assert all(np.asarray(g.idx_B).dtype == np.int32 for g in groups)
 
 
+def test_a_tail_term_field_plans_past_the_old_mask_memory_ceiling():
+    """THE ACCEPTANCE CASE, in miniature: a Laplace bucket whose widths
+    span four decades.
+
+    Pole 7 of the si_mpa_0808 n_p = 8 fit is the tail term, and its one
+    Laplace bucket carries 81 360 063 of 81 432 576 modes with
+    ``Gamma`` from 1.84e-2 to 4.49e+2 Ry.  The width clause answers that
+    with **1312 panes**, and the old ceiling of 512 refused it by name --
+    correctly, when a pane was 81.4 MB of boolean and 1312 of them were
+    107 GB.  With panes as index sets the same partition costs one index
+    per live mode plus a few kB of plan apiece, so the ceiling was
+    re-derived (see ``MAX_WIDTH_SPLIT_LEAVES``) and the tail term plans.
+    This cell holds the shape of that field at a size a test can run,
+    and asserts the thing that changed: a four-decade width spread is
+    planned, not refused, and its panes still partition the live set.
+    """
+    rng = np.random.default_rng(7)
+    shape = (4, 40, 40)
+    a = np.full(shape, 2.0)                      # deep, so x_min is real
+    g = np.exp(rng.uniform(np.log(2.0e-2), np.log(2.0), size=shape))
+    fld = dict(
+        a_ry=a, gamma_ry=g, B=(rng.standard_normal(shape)
+                               + 1j * rng.standard_normal(shape)),
+        live_mask=np.ones(shape, dtype=bool),
+        E_A_host=np.linspace(0.0255, 4.1424, 16),
+        base_mask_A_host=np.ones(16, dtype=bool),
+        omega_nonneg_ry=np.linspace(0.0, 0.147, 5),
+        xi_ry=0.476 / 13.6056980659, edge_factor=4.0)
+    groups, _ = _plan(fld)
+    assert groups
+    tally = np.zeros(a.size, dtype=np.int64)
+    for grp in groups:
+        tally[np.asarray(grp.idx_B, dtype=np.int64)] += 1
+    assert np.array_equal(tally.reshape(shape), fld["live_mask"].astype(np.int64))
+    # the plan's own footprint, which is what the ceiling used to bound
+    idx_bytes = sum(int(np.asarray(g_.idx_B).nbytes) for g_ in groups)
+    assert idx_bytes <= int(fld["live_mask"].sum()) * 8
+
+
+def test_the_re_derived_ceiling_is_above_every_field_yet_measured():
+    """The number, and the two facts that place it.
+
+    It must clear the largest demand a real pole field has made (1312,
+    pole 7's Laplace bucket) and stay below the 2^16 the depth-16
+    recursion can structurally reach, so a field that defeats the
+    termination argument is still caught rather than built.
+    """
+    assert SP.MAX_WIDTH_SPLIT_LEAVES > 1312
+    assert SP.MAX_WIDTH_SPLIT_LEAVES < 2 ** 16
+
+
 @pytest.mark.parametrize("n_flat,want", [
     (10, np.int32), ((1 << 31) - 1, np.int32), (1 << 31, np.int64),
     (81_432_576, np.int32),

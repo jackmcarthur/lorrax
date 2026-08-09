@@ -457,20 +457,33 @@ def _laplace_buckets(a_values, *, e_lo, e_hi, omega_max, r_max):
 #: beta_p = Gamma/(e_lo + a) < 1 per pole always, but a PANE of such
 #: poles spanning ratio r has beta ~ r, so clause-satisfying panes need
 #: r -> 1 and a continuum of near-45-degree widths partitions into
-#: O(100) panes.  Each leaf USED TO BE a full-size (n_q, N_mu, N_mu)
-#: bool mask (81.4 MB on the production deck), which made 208 of them
-#: ~17 GB; since the panes became index sets a leaf costs 4 bytes per
-#: live mode and the whole partition costs one index per live mode,
-#: because the leaves partition the set.  The ceiling is therefore no
-#: longer a memory guard -- it is a DISPATCH-COUNT guard, and that is
-#: the cost it now bounds: every leaf becomes its own quadrature rule
-#: and its own tau-node run, and the 2026-08-09 table measured 0.165 s
-#: per tau node independently of how few modes are live.  The ceiling
-#: exists for the DIVERGENT regime that profile measured -- the floored
-#: predicate demanding 2^16 leaves and killing a 230 GB node -- where
-#: the count grows without a clause being satisfiable at all.  512 =
-#: the measured demand with 2.5x headroom; the value is unchanged
-#: because the panes it bounds are unchanged.
+#: O(100) panes.
+#:
+#: THE CEILING WAS RE-DERIVED WHEN THE PANES STOPPED BEING MASKS, and
+#: the old number was refusing real physics.  Each leaf USED TO BE a
+#: full-size (n_q, N_mu, N_mu) bool mask (81.4 MB on the production
+#: deck), so 512 of them was ~42 GB and the ceiling was a MEMORY guard
+#: sized against a 230 GB node.  A leaf now costs: its slice of the
+#: pass's ONE index array (4 bytes per live mode, and the leaves
+#: partition the live set, so that total does not grow with the leaf
+#: count at all), plus its plan -- one mask_A boolean per window over
+#: the A-side shape (nk x nb = 6.4 kB on the production deck), the
+#: window's nodes at 32 bytes each, and the group object.  That is
+#: ~8-10 kB per pane at production shapes, so 512 panes cost ~5 MB
+#: where they used to cost 42 GB, and memory has stopped being the
+#: reason for any number here.
+#:
+#: What the ceiling bounds NOW is the recursion, and through it the
+#: cost: a field that DEFEATS the termination argument bisects to the
+#: depth-16 cap, and each of those 2^16 leaves is a certified rule
+#: BUILT (a table lookup or a minimax solve) and a tau-node run at a
+#: measured 0.165 s per node that does not fall when the leaf is small.
+#: 8192 = 6.2x the largest demand a real field has produced (pole 7 of
+#: the si_mpa_0808 n_p = 8 fit: 1312 panes on one Laplace bucket
+#: spanning Gamma = [1.84e-2, 4.49e+2] Ry over 81 360 063 modes, which
+#: the 512 ceiling refused and which is not a pathology but the tail
+#: term's real width spread), 8x below the 2^16 the recursion can
+#: structurally reach, and ~74 MB of plan at production shapes.
 #:
 #: OWNER ROW, registered here because this constant is where the cost
 #: shows up: whether the slab width clause should stay the per-pole
@@ -478,7 +491,7 @@ def _laplace_buckets(a_values, *, e_lo, e_hi, omega_max, r_max):
 #: dispatch cost) or become slab-aware (beta <= r for a width-binned
 #: pane, derivation as above) is the routing design's call, not this
 #: guard's.
-MAX_WIDTH_SPLIT_LEAVES = 512
+MAX_WIDTH_SPLIT_LEAVES = 8192
 
 
 def _refuse_width_split_explosion(n_leaves, gamma_values):
