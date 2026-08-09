@@ -48,6 +48,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import tempfile
 import types
 
 import numpy as np
@@ -869,6 +870,72 @@ def _calls_of(path, name):
     return out
 
 
+def _through_private_helpers(path, names, depth=4):
+    """Resolve private helpers to the public entry that reaches them.
+
+    WHY THIS IS NOT A LOOSENING OF THE GATE.  :func:`_calls_of` reports the
+    name of the FUNCTION LEXICALLY CONTAINING the call, which is a proxy for
+    "which seam writes the cube" and stops being one the moment the tail of
+    a seam is factored into a helper.  That happened when
+    ``compute_mode = mpa`` landed: the one-shot write moved from
+    ``compute_sigma_xc`` into a private ``_finish_dynamic_sigma``, the cell
+    went red, and the invariant it guards was intact the whole time.  This
+    is the SECOND instance of that defect class in this tree (the first was
+    ``test_no_eager_local_fft_outside_shardmap_context``), which is why the
+    fix here is to teach the proxy about one level of indirection rather
+    than to widen the expected list and lose the gate.
+
+    THE GATE GETS STRICTER, NOT WEAKER, in one respect that matters: a
+    private helper is only resolved when it has EXACTLY ONE caller in the
+    file.  A helper reached from two places is a second write site wearing
+    one name, which is precisely what this cell exists to catch, so it is
+    reported rather than collapsed.  Public names are never resolved --
+    only ``_``-prefixed helpers, because a public function is a seam in its
+    own right and its callers are somebody else's business.
+    """
+    out = []
+    for name in names:
+        seen = []
+        cur = name
+        for _ in range(depth):
+            if not cur.startswith("_"):
+                break
+            callers = sorted(set(_calls_of(path, cur)))
+            if len(callers) != 1:
+                raise AssertionError(
+                    f"{path.name}: private helper {cur!r} has "
+                    f"{len(callers)} callers ({callers}), so it is not a "
+                    f"single seam and cannot be resolved to one.  Chain so "
+                    f"far: {seen}.  A helper reached from two places is a "
+                    f"second write site wearing one name.")
+            seen.append(cur)
+            cur = callers[0]
+        out.append(cur)
+    return sorted(set(out))
+
+
+def test_a_private_helper_with_two_callers_is_not_resolved_away():
+    """The FALSE case for the resolver, on a file written for it.
+
+    If ``_through_private_helpers`` collapsed any helper to its caller
+    regardless of how many callers it had, a genuine second write site
+    would vanish into the first and this cell would be the one that never
+    fired again.
+    """
+    src = (
+        "def _writer():\n    write_qsgw_sigma_cube()\n"
+        "def a():\n    _writer()\n"
+        "def b():\n    _writer()\n"
+    )
+    tmp = pathlib.Path(tempfile.mkdtemp()) / "twocallers.py"
+    tmp.write_text(src)
+    names = _calls_of(tmp, "write_qsgw_sigma_cube")
+    assert names == ["_writer"]
+    with pytest.raises(AssertionError) as exc:
+        _through_private_helpers(tmp, names)
+    assert "2 callers" in str(exc.value)
+
+
 def test_the_cube_is_written_at_both_seams_and_only_there():
     """One writer, two call sites, each in the basis its path is in.
 
@@ -881,10 +948,18 @@ def test_the_cube_is_written_at_both_seams_and_only_there():
     Σ dispatch for the mirror reason: that is where the file it appends
     to was just written.
     """
-    sc = _calls_of(_SRC / "gw" / "sc_iteration.py", "write_qsgw_sigma_cube")
-    disp = _calls_of(_SRC / "gw" / "sigma_dispatch.py",
-                     "write_qsgw_sigma_cube")
-    util = _calls_of(_SRC / "gw" / "qsgw_utils.py", "write_qsgw_sigma_cube")
+    # Each seam is resolved through at most one level of private
+    # indirection, because the tail of a seam may be factored into a helper
+    # without the seam moving -- see _through_private_helpers.
+    sc_path = _SRC / "gw" / "sc_iteration.py"
+    disp_path = _SRC / "gw" / "sigma_dispatch.py"
+    util_path = _SRC / "gw" / "qsgw_utils.py"
+    sc = _through_private_helpers(
+        sc_path, _calls_of(sc_path, "write_qsgw_sigma_cube"))
+    disp = _through_private_helpers(
+        disp_path, _calls_of(disp_path, "write_qsgw_sigma_cube"))
+    util = _through_private_helpers(
+        util_path, _calls_of(util_path, "write_qsgw_sigma_cube"))
     assert sc == ["dump_sigma_omega_h5_final"], sc
     assert disp == ["compute_sigma_xc"], disp
     # ``solve_qp``'s fixed_point branch rebuilds at the solved energies
