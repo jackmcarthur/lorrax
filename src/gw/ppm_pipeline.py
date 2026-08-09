@@ -27,7 +27,6 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
 from .gw_config import LorraxConfig
-from common.jax_profile import profile_section
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
@@ -425,7 +424,7 @@ def compute_ppm_sigma_pipeline(
         # Step 2: precompile + run Σ^c(ω, k, m, n)
         with timing.section("sigma.compile"):
             precompile_sigma(wfns, ppm, meta, mesh_xy)
-        with timing.section("sigma.exec"), profile_section("sigma_ppm", print_fn=print_fn):
+        with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
                 ppm_cfg=config.ppm,
