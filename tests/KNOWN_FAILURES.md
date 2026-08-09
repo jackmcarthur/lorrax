@@ -2634,3 +2634,79 @@ line), `leg.sh`, and `leg_{before,after}.log`.  The `fixmpa_0808/` tree was
 read only.  The `RUNS_INFLIGHT` row for the two arms is struck with its
 outcome.  In-tree: this amendment, and the two cells in
 `services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py`.
+
+---
+
+## Amendment — the BSE night's second consolidation checkpoint (2026-08-08)
+
+Written by the consolidation-2 worker. Four branches merged onto `ff8631fd`,
+two in-consolidation commits, one full census. `main` at **`581dc3cc`**.
+
+### The census
+
+`lx test --wait=1800` with no paths (⇒ `testpaths = ["tests", "services"]`,
+default xdist geometry — the same geometry the previous three checkpoints
+used), on Perlmutter, JID 56522011, Shifter, `LX_BASE_MODULE=lorrax_J070`,
+jax `0.7.0.dev20260808`, `LORRAX_FFTW3_SO` pinned, `LORRAX_CHECKOUT` verified
+in every leg's `[lx] source tree:` line.
+
+```
+21 failed, 2547 passed, 132 skipped, 1 xfailed in 543.37s   (head 581dc3cc)
+```
+
+**Zero unlisted reds.** All 21 are named in this document at the base tip
+`ff8631fd`. The accounting was cross-checked per `<testcase>` element rather
+than from the summary line — 21 `<failure>`, 0 `<error>`, 133 `<skipped>` out
+of 2701 testcases, and the per-cell list length equals the counters. (The
+previous amendment's WSL census mis-booked red cells into a collection bucket;
+counting from the per-cell list is what makes that visible.)
+
+The red set is SMALLER than the previous checkpoint's 27 by the nine
+`symmetry_maps` import-isolation cells, which `fef002e9` closed, and the
+`wq_resolvent` cell, which `28ff477f` closed. It is LARGER by the four MPA /
+minimax rows this document already carries as open (cells 1–4). Nothing in
+this landing is attributed to either direction.
+
+### The one red this consolidation created, and closed
+
+`tests/test_fft_shardmap_context::test_no_eager_local_fft_outside_shardmap_context`
+was red on the merge head `2a62e75e` and green on `581dc3cc`. It is a FALSE
+POSITIVE of that gate's lexical proxy, not a scaling regression: the non-TDA
+port factored the stack matvec's shared conv+decode out of
+`build_bse_stack_matvec._w_stack._body` into module-level `_conv_decode`, which
+is still called only from inside `shard_map` bodies. Recorded as a ratchet
+entry with its reason and with the durable fix named (teach the scanner the
+call graph, then delete the entry). It never appeared on
+`feat/sdy-nontda-solver-2026-08-08` because that branch's subset did not
+include this gate — the red belongs to that branch, not to the merge.
+
+### The K^d_B fix reached one of its two consumers, and now reaches both
+
+`fix/kdb-zeta-sharding-2026-08-08` repaired the coupling encode in
+`bse_ring_comm.py`. The SDY matrix-free route does not consume it: that lane
+had PORTED the same encode into `bse_stack_matvec.py`, defect included. On the
+merge head the two paths therefore disagreed at 2×2 by 47 % on the B block, the
+SDY ladder's own cross-path gate (rung a) FAILED, and the driver route still
+refused at `metric_sym_err = 9.834e-04` — SDY_SOLVER.md §7's pre-fix number,
+unmoved. Commit `3a8223e4` transplants the kdb lane's fix. After it, at 2×2:
+rung (a) B block `6.820e-15` PASS, `metric_sym_err` `1.968e-13` (its P=1 value
+is `1.970e-13`), the dense-exactness gate `0.0000 µeV`, and the coupling
+correction `−0.6980 meV` against the dense route's `−0.6980 meV`. P=1 is
+bit-identical across the port on all four blocks.
+
+**SDY_SOLVER.md §7's prediction is now satisfied**: the sharded-mesh refusal
+has gone quiet, and it went quiet because the operator was fixed, not because
+the check was relaxed. The detector is untouched — `src/bse/bse_nontda.py` and
+`src/solvers/bse_sp_lanczos.py` are byte-identical to the SDY branch tip — and
+its red twin still fires: reverting `_encode_T_B` to the pre-port form through
+the real driver at 2×2 returns `9.834e-04` and refuses.
+
+### Where the evidence lives
+
+Perlmutter, `/pscratch/sd/j/jackm/bse_consol2_0808/`: `_reports/` carries both
+census junitxmls (`census_2a62e75e.xml`, `census2_581dc3cc.xml`), the
+accounting/set-diff script (`setdiff.py`), the census delta (`delta.py`) and
+the pre-/post-port block dumps (`stk_{preport,postport,redtwin}_*.npy`);
+`work/_logs/` carries the deck legs (`c2_p1.log`, `c2_p4.log`,
+`c2_p1_post.log`, `c2_p4_post.log`, `rc_p4.log`, `rc_p4_post.log`,
+`rc_p4_redtwin.log`). WSL: `~/lorrax_bse_perf_2026-08-08/CONSOLIDATION2_REPORT.md`.
