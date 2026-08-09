@@ -31,19 +31,51 @@ Pre-existing at `59fa874b`.  Gates: `tests/test_ppm_crossing_completion.py`
 reduction with the conjugate-crossed red twin `(c̄X − cX†)/2i` and the
 `−Im_op` sign twin, scalar-channel preservation, dispatch guards).
 
-**WHAT THIS TURNS RED, by design — two Tier-1 freezes are stale, not the
-code.**  `test_gnppm_matches_reference` and
-`test_bispinor_gnppm_matches_reference` pin `sigma_diag_gnppm_ref.dat` /
-`sigma_diag_bispinor_ref.dat` frozen FROM THE ELEMENTWISE FORM.  The MoS2
-3×3 deck's non-Γ k carry ~1e-3 eV of the defect (measured max|A−A†|
-0.0039–0.0078 eV at the four non-Γ k, exactly 4e-5-scale at Γ), so the
-fixed tree must disagree with those references at ~1e-3 eV against
-`_XMACHINE_ATOL_EV = 1e-5` — at the non-TRIM k only, Γ rows preserved.
-That is the fix landing, not a regression; the references need an
-adjudicated re-freeze (owner row).  Everything at nb=1 (the
-`test_mpa_sigma_pass` scalar τ-loop analogue) is preserved to fp roundoff
-— its channels are real, where Im_op degenerates to the elementwise Im —
-pinned by `test_scalar_channel_unchanged`.
+**WHAT THIS TURNS RED, by design — three gates are stale, not the code.**
+
+1. `test_gnppm_matches_reference` / `test_bispinor_gnppm_matches_reference`
+   pin `sigma_diag_gnppm_ref.dat` / `sigma_diag_bispinor_ref.dat` frozen
+   FROM THE ELEMENTWISE FORM.  Measured on the fixed tree
+   (`/pscratch/sd/j/jackm/sigc_star_0809/mos2_fixed/`): sigX bit-identical
+   (max|Δ| = 0.0 — the static path is untouched, the control the fix must
+   pass), sigC moves 2.9e-3 eV at Γ and up to 2.98e-2 eV at the other k,
+   against `_XMACHINE_ATOL_EV = 1e-5` → RED.  Note Γ moves too: on MoS2
+   (no inversion; nspinor=2 TRS carries the spinor rotation) σ^τ_Γ is only
+   APPROXIMATELY complex-symmetric, so the TRIM reduction is exact-to-fp
+   only where it is exact in the operator sense — on the Si arm-b deck the
+   three TRIM k reproduced to 2.6e-7 eV, on MoS2 Γ inherits a few-1e-3 eV
+   correction of its own.  That is the fix landing, not a regression; the
+   references need an adjudicated re-freeze (owner row).
+2. `test_mpa_sigma_costs_gnppm_nothing`'s source-digest gate: this branch
+   EDITS the shared two-point Σ core (`ppm_accumulators.py`) on purpose —
+   the exact case the gate exists to make loud.  The inter-fleet
+   consequence is real, not clerical: the peer fleet's gnppm sigTOT anchor
+   (0.6439 meV MAE vs the BGW oracle) is anchored to the elementwise
+   bytes and moves with this fix.  The re-anchor (BASE_SHA + digests, one
+   commit naming this change) belongs to the MPA branch after
+   adjudication, not to this branch.
+
+Everything at nb=1 (the `test_mpa_sigma_pass` scalar τ-loop analogue) is
+preserved to fp roundoff — its channels are real, where Im_op degenerates
+to the elementwise Im — pinned by `test_scalar_channel_unchanged`.
+
+**THE ADJUDICATION, measured (2026-08-09, all arms on this branch's tree
+with the restage-candidate `.so` pair; evidence
+`/pscratch/sd/j/jackm/sigc_star_0809/_reports/`).**  Green arm, full Si
+arm-b deck: Σ_c star spread 46.7623 raw / 43.8463 diag eV → **0.0000 /
+0.0000**; max|A−A†| at the five non-TRIM k 8.8–30.3 eV → 0 (η floor);
+eqp0's exact-Emf degeneracy spread 67.64 / 10.50 eV → 0.0000; the three
+TRIM k rows of eqp0 unchanged to 2.6e-7 eV; task #16's
+band-9-below-band-8 inversion, present at exactly the five non-TRIM k,
+gone at all eight; |eqp0 − BGW GN twin| over 16 bands × 8 k max 20.25 →
+1.05 eV, mean 5.03 → 0.44 eV, with the five non-TRIM k landing in the
+SAME residual band as the TRIM three — no per-k structure survives.
+Cluster red twin (conjugation crossed, `(c̄X − cX†)/2i`): Hermitian at
+the η floor AND star spread exactly 0.0000 — both internal symmetry
+checks are structurally blind to a wrong equivariant completion — while
+the TRIM rows move 7.4–19.7 eV.  TRIM invariance is therefore the
+discriminating gate, which is why it is pinned in the test file rather
+than any spread statistic.
 
 **Still open at this seam (pre-existing, separate row):** the completion
 is exact only up to the `Omega_q` hermiticity residual, measured at
