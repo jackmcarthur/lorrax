@@ -93,6 +93,19 @@ from minimax._catalog import (
     provenance_for,
     select_entry,
 )
+#: The ``complex_laplace`` family's selection rule, as a NAMED MODULE and
+#: not as a handful of names on the door.  It is on the public surface —
+#: ``from minimax import beta_selector`` — because it is one family's rule
+#: and it carries its own small vocabulary: two clause constants, a
+#: selection record and a refusal record, each of which would collide with
+#: or blur a generic name here (``select`` beside ``select_entry``,
+#: ``load_catalog`` beside ``load_catalog_dict``, a second
+#: ``reset_announcements``).  A module is the honest shape for that, and
+#: it is not the door rule's "consumer reaches a submodule" violation:
+#: this IS the door for that family, and ``lookup(family=
+#: 'complex_laplace', ...)`` routes through it.  Importing it costs numpy
+#: and json, which the door already spends.
+from minimax import beta_selector
 from minimax.door import (
     RUNTIME_SOLVE_ENV,
     catalog,
@@ -204,6 +217,7 @@ __all__ = [
     "Quadrature", "Provenance", "CatalogView", "SOURCES",
     "runtime_provenance",
     # --- lookup, and only lookup -------------------------------------------
+    "beta_selector",
     "lookup", "nearest_certified", "catalog", "serve", "solve_uncertified",
     "runtime_solve_allowed", "RUNTIME_SOLVE_ENV", "reset_announcements",
     # --- the catalog algebra, for the certification tier and the census ----

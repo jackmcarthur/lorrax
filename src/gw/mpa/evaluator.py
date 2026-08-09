@@ -553,9 +553,15 @@ def existing_kernel_rule(point, *, delta_min, delta_max,
             max_nodes=int(max_nodes),
             use_shipped_tables=bool(use_shipped_tables))
     elif fam == "exponential_sum_imag":
+        # ``varpi`` is a sampling line height over the transition floor,
+        # so this request carries the height clause of the beta envelope
+        # (GATE0_IMAG_ENVELOPE.md sec 2).  At the fit stage's 1e-12 tier
+        # nothing is tabulated yet, so the selector refuses by name and
+        # this falls through to the runtime solve exactly as before.
         quad = solve_laplace_minimax_imag_interval(
             lo, hi, point["varpi"], target_error=float(target_error),
-            max_nodes=int(max_nodes))
+            max_nodes=int(max_nodes),
+            use_shipped_tables=bool(use_shipped_tables))
     else:
         # sine_sum.  build_real_quadrature shifts an existing 1/y
         # minimax on [delta_min, delta_max] by +/- omega, so the

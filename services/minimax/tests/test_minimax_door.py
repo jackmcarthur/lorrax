@@ -318,11 +318,18 @@ def test_use_shipped_false_is_an_explicit_request_for_the_hatch(
 
 def test_a_family_with_no_in_process_solver_refuses_rather_than_hanging(
         monkeypatch):
-    """``complex_laplace`` is unwired AND has no in-process solver, so the
-    hatch cannot rescue it.  The refusal names the generator instead of
-    the flag, because the flag is not the fix here."""
+    """``complex_laplace`` has no in-process solver, so the hatch cannot
+    rescue a request no shipped table covers.  The refusal names the
+    generator instead of the flag, because the flag is not the fix here.
+
+    The request is fully specified and OFF the tabulated β ladder: since
+    the beta axis landed, an under-specified request refuses earlier and
+    for a different reason (``UnknownTarget``, not the hatch), so it would
+    no longer exercise this path at all.
+    """
     monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
     with pytest.raises(M.UncertifiedSolveRefused) as excinfo:
         M.serve(family="complex_laplace", target="complex_laplace",
-                range_value=21.544346900318832, error_bound=1.0e-6, n_max=64)
+                range_value=21.544346900318832, error_bound=1.0e-6, n_max=64,
+                beta=7.5, beta_clause=M.beta_selector.HEIGHT)
     assert "generate_imag_minimax_assets.py" in str(excinfo.value)

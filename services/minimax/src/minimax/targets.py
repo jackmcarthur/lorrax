@@ -205,11 +205,17 @@ FAMILIES: Mapping[str, FamilySpec] = MappingProxyType({
         range_param="R",
         catalog="catalog_complex_laplace.json",
         shipped=True,
-        # STAGED, NOT WIRED.  Eighteen certified entries ship, and the
-        # selection rule has no beta axis; a beta-blind lookup would serve a
-        # table fitted to a different function, which is worse than refusing.
-        # `feat/minimax-beta-selector-2026-08-08` is the branch that wires it.
-        wired=False,
+        # WIRED, and the axis it was waiting for is `minimax.beta_selector`.
+        # It stayed unwired while the selection rule had only R, tier and
+        # node count -- three axes that round safely -- because beta does
+        # not round: the target is a different function at every beta, so a
+        # beta-blind match serves a table fitted to something else.  The
+        # rule that answers this family is therefore NOT `_catalog`'s; the
+        # door routes `complex_laplace` to the beta axis and refuses a
+        # lookup that names no beta at all, which is the same safety
+        # property the `wired=False` row used to buy, now bought by a rule
+        # that can also say yes.
+        wired=True,
         range_lever=("lower R, or move beta onto the tabulated ladder"),
         generator_hint=("tools/generate_imag_minimax_assets.py --r <R> "
                         "--beta <beta> --error-tier <eps>"),

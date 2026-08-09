@@ -385,24 +385,50 @@ def test_f6_a_character_that_is_not_one_of_the_four_refuses():
     assert "not an analytic character" in str(excinfo.value)
 
 
-def test_the_staged_but_unwired_family_refuses_and_says_which_it_is():
-    """``complex_laplace`` ships eighteen CERTIFIED entries and is still
-    not selectable, because the selection rule has no β axis.
+def test_the_wired_beta_family_still_refuses_a_beta_blind_lookup():
+    """``complex_laplace`` is WIRED now, and a β-blind lookup still cannot
+    reach one of its tables.
 
-    That is a deliberate state, not an oversight: β is not a conservative
-    axis — the target is a different function at every β — so a β-blind
-    match would serve a table fitted to something else, which is worse
-    than refusing.  Wiring it is
-    ``feat/minimax-beta-selector-2026-08-08``'s commit.
+    This cell replaces the one that asserted ``wired is False``, and it
+    is deliberately the same property under a rule that can also say yes.
+    The reason the family stayed unwired was never "no rule": it was that
+    the only rule available matched on three axes that round safely, and
+    β rounds neither way — ``1/(u - iβ)`` is a different function at every
+    β — so a β-blind match serves a table fitted to something else.
+    ``minimax.beta_selector`` is that axis, and the door routes this
+    family to it.  What must remain impossible is asking for one of these
+    eighteen entries WITHOUT saying which β and which clause you meant, so
+    that is what is asserted: not a refusal because nothing can serve it,
+    but a refusal because the request is under-specified.  The clause
+    matters as much as the number — the two clauses of the envelope
+    overlap around β ≈ 0.6, so neither can be inferred from the other.
     """
     assert M.FAMILIES["complex_laplace"].shipped is True
-    assert M.FAMILIES["complex_laplace"].wired is False
-    with pytest.raises(M.NoCertifiedTable) as excinfo:
+    assert M.FAMILIES["complex_laplace"].wired is True
+
+    with pytest.raises(M.UnknownTarget) as no_beta:
         M.lookup(family="complex_laplace", target="complex_laplace",
                  range_value=21.544346900318832, error_bound=1.0e-6,
                  n_max=64)
-    assert "NOT WIRED" in str(excinfo.value)
-    assert "staged in the bundle" in str(excinfo.value)
+    assert "no beta" in str(no_beta.value)
+    assert "does not round" in str(no_beta.value)
+
+    with pytest.raises(M.UnknownTarget) as no_clause:
+        M.lookup(family="complex_laplace", target="complex_laplace",
+                 range_value=21.544346900318832, error_bound=1.0e-6,
+                 n_max=64, beta=0.5)
+    assert "no beta_clause" in str(no_clause.value)
+
+    # The FALSE case: fully specified, the same request is served.  A
+    # refusal cell whose positive twin is missing cannot tell "correctly
+    # strict" from "broken".
+    quad = M.lookup(family="complex_laplace", target="complex_laplace",
+                    range_value=21.544346900318832, error_bound=1.0e-6,
+                    n_max=64, beta=5.836,
+                    beta_clause=M.beta_selector.HEIGHT)
+    assert quad.family == "complex_laplace"
+    assert quad.provenance.source == "shipped"
+    assert quad.node_count > 0
 
 
 # ---------------------------------------------------------------------------

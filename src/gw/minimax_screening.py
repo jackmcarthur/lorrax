@@ -46,6 +46,14 @@ _services.ensure_on_path()
 import minimax as _mm                                        # noqa: E402
 from .minimax_config import MinimaxConfig                     # noqa: E402
 
+#: The ``complex_laplace`` family's selection rule, off the DOOR rather
+#: than by `from minimax import beta_selector` -- which is a submodule
+#: reach and which `test_layering` refuses, correctly.  The service
+#: publishes this module as part of its public surface for exactly this
+#: consumer; binding it here keeps the call sites short without spending
+#: the door rule to do it.
+_beta_selector = _mm.beta_selector
+
 
 _TINY = 1.0e-12
 
@@ -531,6 +539,16 @@ def solve_laplace_minimax_interval(
     )
 
 
+#: The most recent refusal from the ``complex_laplace`` selector, kept so
+#: that a caller (or a test, or the census shim) can read WHY a request
+#: fell through to the runtime solve without the door having to raise.
+#: Under R1 stage 2 this refusal becomes the error; today it is only the
+#: explanation, because arming the refusal is a separate, staged decision
+#: and this commit changes nothing about what the default path computes
+#: except where a certified table now answers.
+LAST_IMAG_TABLE_REFUSAL: _beta_selector.TableRefusal | None = None
+
+
 def solve_laplace_minimax_imag_interval(
     x_min: float,
     x_max: float,
@@ -538,12 +556,30 @@ def solve_laplace_minimax_imag_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
+    use_shipped_tables: bool = True,
+    beta_clause: str = _beta_selector.HEIGHT,
+    print_fn=None,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``x/(x^2+omega_p^2) ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
     Used for chi0(i*omega_p) where the resonant+antiresonant sum gives
     2*x/(x^2+omega_p^2) with x = E_c - E_v.
+
+    THE BETA AXIS.  On the scaled interval this is ``u/(u^2 + beta^2)``
+    with ``beta = omega_p / x_min``, which is the real part of the
+    ``complex_laplace`` catalog's ``1/(u - i beta)`` -- one payload, two
+    consumers, so ``alpha.real`` off a certified complex table is exactly
+    what this function has always solved for.  ``beta_clause`` defaults to
+    ``height`` because ``omega_p`` is a sampling line height over a band
+    gap and not a pole width; see ``minimax.beta_selector`` for why
+    that word has to be said rather than inferred.
+
+    When no certified table covers the request the selector refuses in
+    prose and this function does exactly what it did before: the same
+    uncertified runtime solve, through the same cache, with the same key.
     """
+
+    global LAST_IMAG_TABLE_REFUSAL
 
     x_min = max(float(x_min), _TINY)
     x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
@@ -554,21 +590,50 @@ def solve_laplace_minimax_imag_interval(
     R = x_max / x_min
     omega_hat = omega_p / x_min
 
-    # THE STRUCTURAL HOLE, and it is on the path of every GN-PPM run there
-    # has ever been.  `catalog.json` ships 31 entries in two families,
-    # {'crossing': 5, 'noncrossing': 26}; there is no `noncrossing_imag`
-    # family at all, so this call has never consulted a table and never
-    # could.  Under R1 stage 1 the door serves it through the announced
-    # escape hatch -- which is the FIRST time this path has said out loud
-    # that it is an uncertified in-process solve.  Arming stage 2 is gated
-    # on the ~18-entry generator campaign the WP1 census sized, not on this
-    # commit.
-    served = _mm.serve(
-        family="noncrossing_imag", target="inverse_imag",
-        range_value=R, error_bound=target_error, n_max=max_nodes,
-        omega_hat=omega_hat,
-    )
-    tau_hat, w_hat, err_hat = served.nodes, served.weights, served.max_error
+    # THE STRUCTURAL HOLE, AND THE HALF OF IT THIS BATCH CLOSES.
+    # `catalog.json` ships 31 entries in two families, {'crossing': 5,
+    # 'noncrossing': 26}; there is no `noncrossing_imag` family in it at
+    # all, so this call never consulted a table and never could.  The
+    # `complex_laplace` bundle is the campaign that answers it -- its
+    # target's real part IS this function -- and the beta axis is what
+    # makes those entries selectable.  So the path is two-branch now: ask
+    # the axis for a certified table, and fall through to the door's
+    # announced escape hatch when it refuses.  A refusal costs an
+    # explanation and nothing else; under R1 stage 2 it becomes the error.
+    picked = None
+    if use_shipped_tables:
+        picked = _beta_selector.select(
+            range_value=R,
+            beta=omega_hat,
+            beta_clause=beta_clause,
+            target_error=target_error,
+            max_nodes=max_nodes,
+        )
+    if isinstance(picked, _beta_selector.TableSelection):
+        LAST_IMAG_TABLE_REFUSAL = None
+        _beta_selector.announce(picked, print_fn=print_fn)
+        # The catalog's own alias: Re 1/(u - i beta) = u/(u^2 + beta^2) is
+        # ``minimax._imag_target`` character for character, so this
+        # consumer takes the real part of the same certified payload the
+        # Sigma-side complex consumer takes whole.
+        tau_hat = np.asarray(picked.tau, dtype=np.float64)
+        w_hat = np.ascontiguousarray(np.real(picked.alpha), dtype=np.float64)
+        err_hat = float(picked.certified_error)
+        provenance = picked.one_line()
+    else:
+        LAST_IMAG_TABLE_REFUSAL = picked
+        # `use_shipped=use_shipped_tables`, not the default: with the deck
+        # key clear the caller asked for the uncertified path explicitly,
+        # and the door should announce THAT rather than report a miss it
+        # was never allowed to look for.
+        served = _mm.serve(
+            family="noncrossing_imag", target="inverse_imag",
+            range_value=R, error_bound=target_error, n_max=max_nodes,
+            omega_hat=omega_hat, use_shipped=use_shipped_tables,
+        )
+        tau_hat, w_hat, err_hat = (served.nodes, served.weights,
+                                   served.max_error)
+        provenance = served.provenance.one_line()
 
     tau = tau_hat / x_min
     alpha = w_hat / x_min
@@ -580,7 +645,7 @@ def solve_laplace_minimax_imag_interval(
         tau=np.asarray(tau, dtype=np.float64),
         alpha=np.asarray(alpha, dtype=np.float64),
         max_error=float(err_abs),
-        provenance=served.provenance.one_line(),
+        provenance=provenance,
     )
 
 
@@ -731,6 +796,8 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None):
         quad.x_min, quad.x_max, float(omega_p),
         target_error=float(minimax_config.target_error),
         max_nodes=int(minimax_config.max_nodes),
+        use_shipped_tables=bool(minimax_config.use_shipped_tables),
+        print_fn=print_fn,
     )
     if print_fn is not None:
         R = quad_imag.x_max / quad_imag.x_min

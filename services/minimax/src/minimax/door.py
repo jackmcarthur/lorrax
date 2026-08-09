@@ -174,16 +174,96 @@ def _check_amplification(entry, view) -> None:
             f"explicitly.")
 
 
+def _lookup_beta_axis(spec, target: str, *, range_value: float,
+                      error_bound: float, n_max: int,
+                      beta: float, beta_clause: str) -> Quadrature:
+    """``complex_laplace``, through the axis that does not round.
+
+    THIS FAMILY DOES NOT USE ``_catalog.select_entry`` AND THAT IS THE
+    POINT.  The generic rule matches on three axes that all round safely —
+    ``R`` up, the tier down, the node count as a ceiling — and ``beta``
+    rounds neither way, because ``1/(u - i beta)`` is a different function
+    at every ``beta``.  So the rule for this family lives in
+    :mod:`minimax.beta_selector`, which matches ``beta`` against each
+    entry's own measured tolerance band and refuses when nothing covers
+    the request.  Routing here is what makes ``wired=True`` safe: the
+    family is selectable, and it is still impossible to select one of its
+    tables without saying which ``beta`` and which clause you meant.
+    """
+    from minimax import beta_selector as _beta          # noqa: PLC0415
+
+    picked = _beta.select(range_value=float(range_value), beta=float(beta),
+                          beta_clause=str(beta_clause),
+                          target_error=float(error_bound),
+                          max_nodes=int(n_max))
+    if isinstance(picked, _beta.TableRefusal):
+        # The selector's refusals already carry what F1 promises: the
+        # request, the nearest certified beta and its band, and the two
+        # levers.  Re-wording them here would be a second, worse copy.
+        raise NoCertifiedTable(picked.message)
+
+    entry = picked.entry
+    typed = _cat.CatalogEntry(
+        index=-1, family=spec.name, range_max=float(entry["range_max"]),
+        error_bound=float(entry["error_bound"]),
+        node_count=int(entry["node_count"]), file=str(entry["file"]),
+        range_param=spec.range_param, target_kind=None, eps_q=None,
+        claimed_max_error=None, kappa0=entry.get("kappa0"),
+        certified=bool(entry.get("certified", False)),
+        catalog_name=spec.catalog, raw=entry)
+    prov = _cat.provenance_for(
+        typed, f"sha256:{str(entry.get('payload_sha256', 'unrecorded'))}",
+        _cat.load_catalog_dict(spec.catalog))
+    quad = Quadrature(
+        nodes=picked.tau, weights=picked.alpha, family=spec.name,
+        target=target, range_param=spec.range_param,
+        range_value=float(range_value), error_bound=float(error_bound),
+        # The error MEASURED at the request's beta, not the entry's own
+        # stamp: a number measured somewhere else is not a measurement of
+        # this request.  `beta_selector.TableSelection` says the same.
+        max_error=float(picked.modulus_error),
+        kappa0=(float(entry["kappa0"]) if entry.get("kappa0") is not None
+                else None),
+        kappa1=None, provenance=prov)
+    _check_amplification(typed, catalog(spec.catalog))
+    _announce(quad)
+    return quad
+
+
 def lookup(*, family: str, target: str, range_value: float,
            error_bound: float, n_max: int, **family_kw) -> Quadrature:
     """The whole runtime surface.  Refuses (F1–F4) or returns.  NEVER solves.
 
     ``family_kw`` carries the family's own discriminants — ``eps_q`` for
-    the crossing family today.  Unknown keywords are refused rather than
-    ignored: a silently-dropped selector is how you serve a table fitted
-    to a different function.
+    the crossing family, ``beta``/``beta_clause`` for ``complex_laplace``.
+    Unknown keywords are refused rather than ignored: a silently-dropped
+    selector is how you serve a table fitted to a different function.
     """
     spec, target_kind = _resolve(family, target)
+
+    if spec.name == "complex_laplace":
+        beta = family_kw.pop("beta", None)
+        beta_clause = family_kw.pop("beta_clause", None)
+        if family_kw:
+            raise UnknownTarget(
+                f"minimax: family {family!r} takes no {sorted(family_kw)} "
+                f"selector.  Silently ignoring one would serve a table "
+                f"fitted to a different function.")
+        if beta is None or beta_clause is None:
+            raise UnknownTarget(
+                f"minimax: family {family!r} is selected on (R, beta, "
+                f"clause, tier, nodes) and this request names "
+                + ("no beta" if beta is None else "no beta_clause") + ".\n"
+                "  beta does not round -- the target is a different "
+                "function at every beta -- and the two clauses of the "
+                "envelope (width = Gamma_p/x_min, height = varpi/x_min) "
+                "OVERLAP near 0.6, so neither can be inferred from the "
+                "other or from the number alone.  The caller says which, "
+                "because only the caller knows what its numerator was.")
+        return _lookup_beta_axis(
+            spec, target, range_value=range_value, error_bound=error_bound,
+            n_max=n_max, beta=beta, beta_clause=beta_clause)
+
     eps_q = family_kw.pop("eps_q", None)
     if family_kw:
         raise UnknownTarget(
@@ -346,13 +426,16 @@ def serve(*, family: str, target: str, range_value: float,
     spec, target_kind = _resolve(family, target)
     eps_q = family_kw.get("eps_q")
     omega_hat = family_kw.get("omega_hat")
+    beta_kw = {k: family_kw[k] for k in ("beta", "beta_clause")
+               if k in family_kw}
 
     if use_shipped and spec.wired:
         try:
             return lookup(family=family, target=target,
                           range_value=range_value, error_bound=error_bound,
                           n_max=n_max,
-                          **({"eps_q": eps_q} if eps_q is not None else {}))
+                          **({"eps_q": eps_q} if eps_q is not None else {}),
+                          **beta_kw)
         except NoCertifiedTable as miss:
             reason = str(miss)
     else:
