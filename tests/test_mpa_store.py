@@ -194,7 +194,8 @@ def _write_w(path, name="W_qmunu_omega", n_omega=6, ready=True, seed=17):
     MS.allocate_w_omega(
         path, name, n_omega=n_omega, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
         tables=tables, omega=omega, sampling=_SAMPLING, omega_line=line,
-        closure_verdict=verdict, provenance={"deck": "synthetic-glide"})
+        closure_verdict=verdict, screening_content="W_c",
+        provenance={"deck": "synthetic-glide"})
     for i in range(n_omega):
         MS.write_w_slab(path, name, i, W[i], ready=ready)
     return W, tables, verdict, n_mu, omega, line
@@ -294,7 +295,8 @@ def test_the_leading_axis_is_removable(tmpdir_path):
     assert np.array_equal(got, ref), (
         "the frequency slab is not the bytes a frequency-free file holds")
 
-    exempt = {QS.QIRR_VERSION_ATTR, MS._FREQ_ATTR} | set(MS._MPA_OWNED_ATTRS)
+    exempt = ({QS.QIRR_VERSION_ATTR, MS._FREQ_ATTR}
+              | set(MS._MPA_OWNED_ATTRS) | set(MS._MPA_OPTIONAL_ATTRS))
     # Volatile by construction — a timestamp and a writer name, which say
     # WHEN and BY WHAT and not WHAT.
     exempt |= {"qirr_written_utc", "qirr_writer", "mpa_writer"}
@@ -596,7 +598,8 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
     MS.allocate_w_omega(
         tmpdir_path, name, n_omega=n_omega, n_q_on_disk=_N_Q_IBZ,
         n_mu=n_mu, tables=tables, omega=np.arange(n_omega) * 0.3 + 0.1j,
-        sampling=_SAMPLING, closure_verdict=verdict)
+        sampling=_SAMPLING, closure_verdict=verdict,
+        screening_content="W_c")
     for i in range(n_omega):
         MS.write_w_slab(tmpdir_path, name, i, W[i])
     # Forge the version attr back to 1 — a writer that gained the axis
@@ -779,7 +782,7 @@ def test_a_grid_of_the_wrong_length_refuses(tmpdir_path):
             tmpdir_path, "W_qmunu_omega", n_omega=4,
             n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
             omega=[0.1j, 0.2j], sampling=_SAMPLING,
-            closure_verdict=verdict)
+            closure_verdict=verdict, screening_content="W_c")
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +850,7 @@ def _fit_block(n_p, n_rows, n_cols, seed):
 def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None):
     """Walk the schedule, writing blocks; optionally stop early."""
     MS.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          energy_unit="Ry",
+                          energy_unit="Ry", screening_content="W_c",
                           grid_hash="sha256:deadbeef")
     truth = {}
     steps = [(q, lo, hi) for q in range(n_q)
@@ -985,7 +988,7 @@ def test_a_scattered_column_block_writes_and_reads_the_same_bytes(
     authority on.
     """
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=6, n_p=2,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
     Om, Bp, diag = _fit_block(2, 6, 3, seed=21)
     MS.write_fit_block(tmpdir_path, 0, [0, 3, 5], Om, Bp, diag)
     ledger = MS.fit_completion_ledger(tmpdir_path)
@@ -1021,7 +1024,7 @@ def test_the_diagnostics_are_required_and_must_be_finite(tmpdir_path):
     describes would be certified by the absence of evidence.
     """
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
     Om, Bp, diag = _fit_block(2, 4, 2, seed=5)
     with pytest.raises(ValueError, match="backward_error"):
         MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
@@ -1047,7 +1050,7 @@ def test_extra_diagnostics_survive_the_round_trip(tmpdir_path):
     into a side channel nobody reads.
     """
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
     Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
@@ -1064,7 +1067,7 @@ def test_the_diagnostic_set_may_not_change_mid_fit(tmpdir_path):
     measured — the failure mode is not a gap, it is a green light.
     """
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
     Om, Bp, diag = _fit_block(2, 4, 2, seed=7)
     MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
                        dict(diag, held_out=np.zeros((4, 2))))
@@ -1133,7 +1136,7 @@ def test_the_writer_still_refuses_a_non_closed_centroid_set(tmpdir_path):
             tmpdir_path, "W_qmunu_omega", n_omega=2,
             n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
             omega=[0.1j, 1.0j], sampling=_SAMPLING,
-            closure_verdict=verdict)
+            closure_verdict=verdict, screening_content="W_c")
     # AND IT LEFT NOTHING BEHIND.  A refused allocation that dropped a
     # correctly-shaped dataset on disk would be the all-zero-screening
     # hazard wearing this format's clothes.

@@ -15,7 +15,7 @@ from file_io import mpa_store
 def _store(tmp_path, n_p=3, n_q=2, n_mu=4, seed=0):
     path = str(tmp_path / "fit.h5")
     mpa_store.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                                 energy_unit="Ry")
+                                 energy_unit="Ry", screening_content="W_c")
     rng = np.random.default_rng(seed)
     for q in range(n_q):
         cols = list(range(n_mu))
@@ -50,7 +50,7 @@ def test_read_pole_slice_is_the_leading_axis_slab(tmp_path):
 def test_read_pole_slice_refuses_an_unfinalized_store(tmp_path):
     path = str(tmp_path / "partial.h5")
     mpa_store.allocate_fit_store(path, n_q=1, n_mu=2, n_p=2,
-                                 energy_unit="Ry")
+                                 energy_unit="Ry", screening_content="W_c")
     with pytest.raises(ValueError, match="NOT FINALIZED"):
         mpa_store.read_pole_slice(path, 0)
     Om, Bp = mpa_store.read_pole_slice(path, 0, allow_partial=True)

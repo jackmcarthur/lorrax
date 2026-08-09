@@ -214,7 +214,7 @@ def _write_w_file(path, n_p=_N_P):
         str(path), _W_NAME, n_omega=2 * n_p, n_q_on_disk=_N_Q_IBZ,
         n_mu=n_mu, tables=tables, omega=z,
         sampling=dict(_SAMPLING, n_p=n_p), omega_line=line,
-        closure_verdict=verdict,
+        closure_verdict=verdict, screening_content="W_c",
         provenance={"deck": "synthetic-glide-mpa-driver"})
     for i in range(2 * n_p):
         MS.write_w_slab(str(path), _W_NAME, i, W[i], ready=True)
@@ -458,7 +458,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
     fit_path = tmp_path / "gappy.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
     MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
 
     schedule = tiling.fit_schedule(n_q, n_mu, 2 * n_p)
     skipped = schedule[len(schedule) // 2]
@@ -499,7 +499,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
     n_omega = 2 * n_p
     MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
 
     budget = MS.choose_column_budget(n_mu, n_omega)
     assert budget < n_mu, "the walk must take more than one block"
@@ -786,7 +786,7 @@ def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
     fit_path = tmp_path / "partial.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
     MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          energy_unit="Ry")
+                          energy_unit="Ry", screening_content="W_c")
     q, lo, hi = tiling.fit_schedule(n_q, n_mu, 2 * n_p)[0]
     fit_driver.fit_one_block(
         str(planted["w_path"]), _W_NAME, str(fit_path), q,
@@ -835,3 +835,91 @@ def test_the_planted_field_is_symmetric_in_mu_nu(planted):
     W = planted["W"]
     np.testing.assert_allclose(W, np.swapaxes(W, -1, -2),
                                rtol=1e-13, atol=1e-13)
+
+
+# ---------------------------------------------------------------------------
+# THE SCREENING-CONTENT TWINS, at the seam that would have caught it
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-09 bridge defect entered here and nowhere else: the W(omega)
+# store was filled from the Dyson solve, i.e. with the FULL W, and the fit
+# driver fitted it without ever asking which object it was.  Everything
+# downstream then behaved perfectly -- backward error 4.0e-16, Hermitian
+# tensors, fourth-quadrant poles, an intact k-star relation -- on a pole
+# field that was overwhelmingly a fit to the bare Coulomb interaction
+# (|v| = 104-119 % of |W| at the probe frequency on that deck).  So the
+# driver asks, and refuses, and the two twins below are the two shapes the
+# wrong answer comes in.
+
+def test_the_driver_refuses_a_W_store_by_name(tmp_path, planted):
+    """A store declared 'W' is turned away with the subtraction named."""
+    import h5py
+
+    w2 = tmp_path / "W_is_full.h5"
+    with h5py.File(str(planted["w_path"]), "r") as src, \
+            h5py.File(str(w2), "w") as dst:
+        for key in src:
+            src.copy(key, dst, name=key)
+    # The copy inherits the fixture's 'W_c'; a re-declaration to a
+    # DIFFERENT value is refused (that is its own twin, in
+    # test_mpa_screening_content), so this file is un-declared first and
+    # then declared for what it now claims to be.
+    with h5py.File(str(w2), "a") as f:
+        del f[_W_NAME].attrs[MS.W_SCREENING_CONTENT_ATTR]
+    MS.declare_w_screening_content(str(w2), _W_NAME, "W")
+    assert MS.read_w_header(str(w2), _W_NAME)["screening_content"] == "W"
+
+    with pytest.raises(ValueError) as exc:
+        fit_driver.run_fit_driver(
+            str(w2), _W_NAME, str(tmp_path / "fit.h5"),
+            planted["z"], planted["n_p"])
+    msg = str(exc.value)
+    assert "W_c = W - v" in msg and "Wc0_q = W0_q - V_q" in msg
+    assert not (tmp_path / "fit.h5").exists(), (
+        "the refusal must happen BEFORE the store is allocated; a refused "
+        "run that leaves a correctly-shaped fit file behind is the hazard "
+        "the allocate-then-fill ledger exists to avoid")
+
+
+def test_the_driver_refuses_an_UNDECLARED_W_store(tmp_path, planted):
+    """Silence is refused, not read as 'the correlation part, obviously'.
+
+    Every W(omega) store written before the declaration existed is
+    undeclared, and the two on the 2026-08-09 production deck hold W.  A
+    driver that treated absence as W_c would fit exactly those.
+    """
+    import h5py
+
+    w2 = tmp_path / "W_undeclared.h5"
+    with h5py.File(str(planted["w_path"]), "r") as src, \
+            h5py.File(str(w2), "w") as dst:
+        for key in src:
+            src.copy(key, dst, name=key)
+    with h5py.File(str(w2), "a") as f:
+        del f[_W_NAME].attrs[MS.W_SCREENING_CONTENT_ATTR]
+    assert MS.read_w_header(str(w2), _W_NAME)["screening_content"] is None
+
+    with pytest.raises(ValueError, match="does not declare"):
+        fit_driver.run_fit_driver(
+            str(w2), _W_NAME, str(tmp_path / "fit.h5"),
+            planted["z"], planted["n_p"])
+
+
+def test_a_declared_store_carries_its_content_into_the_fit_store(tmp_path,
+                                                                 planted):
+    """The declaration reaches Sigma without re-opening the W file.
+
+    By the time the Sigma pass runs, the 20 GB W store it came from may be
+    gone; the pole file therefore says for itself what it was fitted to,
+    and this driver is the only thing in the pipeline that can know.
+    """
+    fit_path = tmp_path / "fit_ok.h5"
+    ledger, report = fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path),
+        planted["z"], planted["n_p"])
+    assert report["screening_content"] == "W_c"
+    assert ledger["complete"]
+    assert MS.fit_completion_ledger(str(fit_path))["screening_content"] == "W_c"
+    assert MS.require_correlation_part(
+        MS.fit_completion_ledger(str(fit_path))["screening_content"],
+        where="test") == "W_c"

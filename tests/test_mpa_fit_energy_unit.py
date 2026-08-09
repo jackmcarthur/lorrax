@@ -45,7 +45,8 @@ def _filled_store(path, *, energy_unit, scale=1.0, n_p=2, n_q=3, n_mu=4,
     """
     rng = np.random.default_rng(seed)
     mpa_store.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                                 energy_unit=energy_unit)
+                                 energy_unit=energy_unit,
+                                 screening_content="W_c")
     for q in range(n_q):
         cols = list(range(n_mu))
         a = np.sort(rng.uniform(0.2, 3.0, size=(n_p, n_mu, n_mu)), axis=0)
@@ -163,7 +164,8 @@ def test_an_undeclared_store_is_refused_by_name_with_both_fixes(tmp_path):
 def test_allocate_without_a_unit_refuses_and_names_the_fit_driver(tmp_path):
     with pytest.raises(ValueError) as exc:
         mpa_store.allocate_fit_store(str(tmp_path / "x.h5"),
-                                     n_q=1, n_mu=2, n_p=1)
+                                     n_q=1, n_mu=2, n_p=1,
+                                     screening_content="W_c")
     msg = str(exc.value)
     assert "energy_unit" in msg and "no default" in msg
     assert "mpa_omega_units" in msg
@@ -172,7 +174,8 @@ def test_allocate_without_a_unit_refuses_and_names_the_fit_driver(tmp_path):
 def test_an_unknown_unit_spelling_refuses_everywhere(tmp_path):
     with pytest.raises(ValueError, match="not one of"):
         mpa_store.allocate_fit_store(str(tmp_path / "x.h5"),
-                                     n_q=1, n_mu=2, n_p=1, energy_unit="eV")
+                                     n_q=1, n_mu=2, n_p=1, energy_unit="eV",
+                                     screening_content="W_c")
     with pytest.raises(ValueError, match="not one of"):
         mpa_store.canonical_energy_unit("hartrees", where="test")
     # Case-insensitive on input, canonical out -- a deck's 'ha' is 'Ha'.
