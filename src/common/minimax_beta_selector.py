@@ -581,13 +581,26 @@ def select(
             clause=clause)
 
     # Rank: nearest larger range, then the loosest acceptable tier, then
-    # the fewest nodes.  The last term is what keeps a 566-node composite
-    # from displacing a 10-node minimax entry that covers the same
-    # request -- every node here is one chi0 build in the consumer.
+    # the fewest nodes, then the closest beta.  The node term is what
+    # keeps a 566-node composite from displacing a 10-node minimax entry
+    # that covers the same request -- every node here is one chi0 build
+    # in the consumer.
+    #
+    # THE LAST TERM IS NOT DECORATION.  The catalog carries both the
+    # census's DISPLAYED beta grid and the decks' own full-precision
+    # omega-hats, and near a rounded value the two entries can cost the
+    # same node count and both cover the request.  Without this term the
+    # tie went to file order, so gnppm was served by the rounded 16.006
+    # entry at 14.7% of its band while an entry measured AT
+    # 16.00601826286684 sat beside it spending none.  Among equally
+    # cheap certified rules, the one whose certificate was measured
+    # closest to the request is the one to serve; nothing else in the
+    # ranking can express that.
     matched.sort(key=lambda item: (
         _need(item[1], item[0], "range_max", float),
         -_need(item[1], item[0], "error_bound", float),
         _need(item[1], item[0], "node_count", int),
+        abs(_need(item[1], item[0], "beta", float) - float(beta)),
     ))
     index, entry = matched[0]
 

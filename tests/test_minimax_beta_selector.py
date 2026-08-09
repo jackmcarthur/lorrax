@@ -147,13 +147,19 @@ def test_the_announcement_is_pinned_and_happens_exactly_once():
     line = printed[0]
     for token in (
             "minimax[complex_laplace]: SHIPPED TABLE",
-            "complex_laplace/complex_laplace_R_46p415888_b_16p0060"
+            # The deck's OWN omega-hat, twelve decimals of it, not the
+            # census's displayed 16.006.  Before the tables campaign
+            # regenerated at full precision this request was served by
+            # the rounded entry at 14.7% of its band; it is now served
+            # by an entry measured at the request itself.
+            "complex_laplace/complex_laplace_R_46p415888_b_16p006018262867"
             "_eps_1p0em06.npz",
             "rule=btv_minimax",
             "certified=True",
             "N=10",
             "[height clause]",
-            "beta=16.006",
+            "beta=16.00601826286684",
+            "request at 0.0% of it",
             "re-measured HERE at this beta",
             "exact-match axis; no rounding",
             "catalog complex_laplace/v1 schema 2",
@@ -224,38 +230,76 @@ def test_the_near_miss_is_a_real_error_and_not_a_bookkeeping_rule():
     assert off > entry["error_bound"]
 
 
-def test_the_full_precision_deck_sweep_is_recorded_rather_than_rounded():
-    """Gate 0 sec 9's warning, executable, and it bites four of seven.
+#: The census's x_min column, and the R each deck asks for.  omega-hat is
+#: DERIVED as ``2 Ry / x_min`` rather than transcribed, for the reason
+#: this file's header gives: three decimals is a display, not a
+#: specification.
+DECK_SWEEP = {
+    "hbn": (0.342664, 14.19), "cohsex": (0.141617, 37.12),
+    "gnppm": (0.124953, 42.68), "bispinor": (0.122161, 38.77),
+    "si_fast": (0.050916, 33.18), "si_test": (0.050916, 72.75),
+    "si_bse": (0.049734, 74.48),
+}
 
-    The catalog's beta grid was generated at the census's DISPLAYED three
-    decimals.  Recomputing each deck's omega-hat at full precision --
-    ``2 Ry / x_min`` from the census's own x_min column -- three land
-    inside their entry's stamped band and four miss it, hbn by 32 bands.
-    That is not a defect in this selector; it is the selector making
-    visible what serving the neighbour would have hidden, and it is the
-    measurement behind Gate 0's recommendation to generate at the deck's
-    omega-hat to full precision.
+
+def test_the_full_precision_deck_sweep_is_served_end_to_end():
+    """Gate 0 sec 9's warning, executable -- and now discharged.
+
+    THE HISTORY IS THE POINT AND IS KEPT HERE ON PURPOSE.  The catalog's
+    first beta grid was generated at the census's DISPLAYED three
+    decimals.  Scored at ``2 Ry / x_min``, three decks landed inside
+    their entry's stamped band and four missed: hbn by 32 bands, cohsex
+    by 4.2, si_fast and si_test by 2.9.  Nothing was wrong with the
+    selector then -- it was making visible exactly what serving the
+    neighbour would have hidden, which is what a band is for.
+
+    The tables campaign then regenerated at the deck's own omega-hat,
+    and this cell is the other end of that: all seven decks served, each
+    by an entry whose beta IS the request's to the last digit the census
+    carries, so every band fraction is ~0 rather than the 98.7% that
+    ``bispinor`` was spending against the rounded grid.
     """
 
-    decks = {
-        "hbn": (0.342664, 14.19), "cohsex": (0.141617, 37.12),
-        "gnppm": (0.124953, 42.68), "bispinor": (0.122161, 38.77),
-        "si_fast": (0.050916, 33.18), "si_test": (0.050916, 72.75),
-        "si_bse": (0.049734, 74.48),
-    }
-    served, refused = [], []
-    for name, (x_min, R) in sorted(decks.items()):
+    served, refused = {}, []
+    for name, (x_min, R) in sorted(DECK_SWEEP.items()):
         got = bs.select(range_value=R, beta=2.0 / x_min,
                         beta_clause=bs.HEIGHT, target_error=1.0e-6,
                         max_nodes=64)
-        (served if isinstance(got, bs.TableSelection) else refused).append(
-            name)
         if isinstance(got, bs.TableRefusal):
-            assert got.code == "BetaNearMiss"
-    assert set(served) == {"gnppm", "bispinor", "si_bse"}
-    assert set(refused) == {"hbn", "cohsex", "si_fast", "si_test"}
-    # The two the census measured as production requests are both served.
-    assert {"gnppm", "bispinor"} <= set(served)
+            refused.append((name, got.code, got.message.splitlines()[0]))
+            continue
+        served[name] = got
+        print(f"[beta selector] {name:9s} R={R:7.2f} "
+              f"omega_hat={2.0 / x_min!r} -> {got.entry['file'].split('/')[-1]}"
+              f" N={got.node_count:3d} band_frac={got.band_fraction:.3%} "
+              f"Re E={got.certified_error:.3e} <= {got.error_bound:.0e}")
+    assert not refused, refused
+    assert set(served) == set(DECK_SWEEP)
+    for name, got in served.items():
+        # An entry generated AT the request's beta spends essentially
+        # none of its band; anything else means the sweep rounded.
+        assert got.band_fraction < 0.02, (name, got.band_fraction)
+        assert got.certified_error <= got.error_bound
+        assert got.node_count <= 64
+
+
+def test_the_two_census_production_requests_are_still_the_easy_case():
+    """gnppm and bispinor were served before the regeneration too.
+
+    They are the two C sec 2.2 measured refusing at runtime, and they
+    are the reason the campaign existed.  Keeping them as their own cell
+    means a regression that broke only them could not hide inside the
+    seven-deck sweep above.
+    """
+
+    for name in ("gnppm", "bispinor"):
+        x_min, R = DECK_SWEEP[name]
+        got = bs.select(range_value=R, beta=2.0 / x_min,
+                        beta_clause=bs.HEIGHT, target_error=1.0e-6,
+                        max_nodes=64)
+        assert isinstance(got, bs.TableSelection), name
+        assert got.entry["rule"] == "btv_minimax"
+        assert got.entry["kappa0"] <= 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -356,25 +400,40 @@ def test_a_beta_outside_its_own_clause_refuses_by_name():
 # 4. Off catalog, and the generator pointer
 # ---------------------------------------------------------------------------
 
-def test_an_off_catalog_request_refuses_with_the_generator_campaign():
-    """The fit stage's 1e-12 tier, which is exactly this refusal.
+def test_the_fit_stage_tier_is_now_tabulated_and_the_budget_is_the_gate():
+    """The refusal this cell used to assert has been generated away.
 
-    Gate 0 sec 3 registered the tier axis as three values and not two --
-    1e-6 and 2e-7 for production, 1e-10/1e-12 for the MPA fit stage --
-    and only the 1e-6 tier is generated.  So the fit stage's imaginary
-    cell lands here, is told what exists and what would have to be run,
-    and falls through to the runtime solve it uses today.  Nothing about
-    that path changes in this commit; what changes is that it now says so.
+    It read: Gate 0 sec 3 registered the tier axis as three values and
+    not two, only 1e-6 was generated, so the fit stage's imaginary cell
+    refused and was told what to run.  The tables campaign ran it.  The
+    1e-12 tier now exists as positive-composite entries -- 238 to 1420
+    nodes at kappa_0 = 1.0000 -- and the refusal that remains is the
+    honest one: at a 64-node budget nothing that accurate can fit, and
+    the door says node counts rather than pretending the tier is absent.
+
+    Raise the budget and the same request is served, by an entry swept
+    at a LARGER beta and re-phased down to this one, which is the
+    composite route's envelope doing the work it was generated for: the
+    fixture's ``beta = 3.33`` is no deck's omega-hat and is below every
+    tabulated one.
     """
 
-    refused = bs.select(range_value=11.666, beta=3.3333333333333335,
-                        beta_clause=bs.HEIGHT, target_error=1.0e-12,
-                        max_nodes=64)
+    ask = dict(range_value=11.666, beta=3.3333333333333335,
+               beta_clause=bs.HEIGHT, target_error=1.0e-12)
+
+    refused = bs.select(max_nodes=64, **ask)
     assert refused.code == "NoCertifiedTable"
-    assert "tabulated tiers:     [1e-06]" in refused.message
+    assert "node counts on hand" in refused.message
     assert "the tier rounds DOWN" in refused.message
     assert bs.GENERATOR in refused.message
-    assert "--error-bound 1e-12" in refused.message
+
+    served = bs.select(max_nodes=4000, **ask)
+    assert isinstance(served, bs.TableSelection), served.message
+    assert served.entry["error_bound"] == 1.0e-12
+    assert served.entry["rule"] == "positive_composite"
+    assert served.entry["beta_min"] == 0.0
+    assert served.entry["beta"] > 3.3333333333333335
+    assert served.certified_error <= 1.0e-12
 
     over_R = bs.select(range_value=1.0e4, beta=16.006,
                        beta_clause=bs.HEIGHT, target_error=1.0e-6,
@@ -580,15 +639,24 @@ def test_a_missing_catalog_refuses_with_the_path_it_tried(monkeypatch):
 def test_a_refused_request_is_byte_identical_to_the_runtime_solve():
     """The A/B claim, pinned where it can never drift.
 
-    "Everything else unchanged" is asserted against the definition of the
-    pre-change behaviour -- ``noncrossing_imag_grids`` on the rounded
-    keys, rescaled by ``x_min`` -- rather than against a recorded
-    snapshot, so it keeps meaning something after the fixture ages.  The
-    request is hBN's, whose full-precision omega-hat misses its entry's
-    band by 32 widths.
+    "Everything else unchanged" is asserted against the DEFINITION of
+    the pre-change behaviour -- ``noncrossing_imag_grids`` on the
+    rounded keys, rescaled by ``x_min`` -- rather than against a
+    recorded snapshot, so it keeps meaning something after the fixture
+    ages.
+
+    THE FIXTURE HAD TO MOVE ONCE, AND THAT IS WORTH SAYING.  It used to
+    be hBN's own request, which missed its entry's band by 32 widths
+    back when the catalog's beta grid was the census's three-decimal
+    display.  The tables campaign generated at the decks' own
+    omega-hats, so hBN is served now and is no longer a refusal to
+    measure.  The request here is deliberately BETWEEN two tabulated
+    betas instead -- far outside every band, and no deck's -- because
+    what this cell pins is the refusal PATH, and that path must keep
+    working for requests the catalog was never swept for.
     """
 
-    x_min, R, omega_p = 0.342664, 14.19, 2.0
+    x_min, R, omega_p = 0.342664, 14.19, 2.0 * (1.0 + 3.0e-3)
     quad = ms.solve_laplace_minimax_imag_interval(
         x_min, x_min * R, omega_p, target_error=1.0e-6, max_nodes=64)
     assert ms.LAST_IMAG_TABLE_REFUSAL is not None
