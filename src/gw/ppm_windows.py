@@ -92,6 +92,18 @@ class _SigmaWindow:
     mask_B_mode: str = "all"
     mask_B_threshold: float | None = None
     crossing_kind: str | None = None
+    #: The ACHIEVED error of the quadrature behind this window, and where
+    #: that quadrature came from.  Both trailing and defaulted, so every
+    #: existing construction site and the frozen G2 tile flattening (which
+    #: names its fields explicitly) are untouched.
+    #:
+    #: These exist because the per-window log line used to print
+    #: ``err<{target_error:.0e}`` -- the bound that was REQUESTED.  A window
+    #: whose rule missed its target by four orders printed the same line as
+    #: one that met it, which is half of how the minimax module came to be
+    #: trusted for the wrong reason.
+    max_error: float | None = None
+    provenance: str | None = None
 
     @property
     def n_tau(self) -> int:
@@ -293,6 +305,8 @@ def _build_single_sigma_window(
             project="full",
             prefactor=float(prefactor),
             mask_B_mode="all",
+            max_error=float(q.max_error),
+            provenance=q.provenance,
         )
     ]
 
@@ -365,6 +379,7 @@ def _build_three_sigma_windows(
                 target_kind="hgl",
                 use_shipped_tables=use_shipped_tables,
             )
+            win_quad = q_cross
             raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
             # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
             nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
@@ -381,6 +396,7 @@ def _build_three_sigma_windows(
                 max_nodes=max_nodes,
                 use_shipped_tables=use_shipped_tables,
             )
+            win_quad = q
             nodes = q.to_minimax_nodes(time_axis='imag')
             project = "full"
             prefactor = +1.0 * neg
@@ -398,6 +414,8 @@ def _build_three_sigma_windows(
                 mask_B_mode=mask_B_mode,
                 mask_B_threshold=float(T),
                 crossing_kind="hgl" if name == "core" else None,
+                max_error=float(win_quad.max_error),
+                provenance=win_quad.provenance,
             )
         )
     return windows
@@ -491,10 +509,19 @@ def _build_windows_for_branch(
     for win in windows:
         A_vals = E_A_host[win.mask_A]
         kind = "crossing" if win.crossing_kind else "Laplace"
+        # ACHIEVED, not requested (R2).  The old line said
+        # ``err<{target_error:.0e}``, which is what was ASKED for -- so a
+        # window served by an uncertified solve that missed its target by
+        # orders printed exactly the same string as one served by a
+        # certified table that met it.
+        achieved = (
+            "err~unrecorded" if win.max_error is None
+            else f"err~{win.max_error:.2e} (asked <{target_error:.0e})")
         print_fn(
             f"    {log_tag} window \"{win.name}\" ({kind}): "
-            f"{win.n_tau} nodes, err<{target_error:.0e}, "
+            f"{win.n_tau} nodes, {achieved}, "
             f"E_A=[{float(np.min(A_vals)):.4f}, {float(np.max(A_vals)):.4f}] Ry, "
             f"project={win.project}"
+            f"  [{win.provenance or 'provenance unrecorded'}]"
         )
     return windows

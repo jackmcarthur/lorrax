@@ -451,8 +451,72 @@ def test_holdout_refuses_np_below_two():
 # (d) VMAP == LOOP, BIT-IDENTICALLY
 # ---------------------------------------------------------------------------
 
+#: The batched kernel's agreement with the per-element loop, as a REDUCTION
+#: ORDER tolerance rather than as bit-identity.  Sized from measurement, and
+#: the measurement is in the cell's docstring below.  Relative, because the
+#: quantities are O(1) pole energies and residues whose scale is set by the
+#: planted field and not by this kernel.
+_VMAP_REDUCTION_RTOL = 1.0e-8
+_VMAP_REDUCTION_ATOL = 1.0e-8
+
+
 @pytest.mark.parametrize("n_elements", [1, 5, 32])
 def test_vmap_batch_equals_loop_bit_identical(n_elements):
+    """One element or many, the batched kernel answers the same question.
+
+    THIS CELL USED TO CLAIM BIT-IDENTITY AND THE CLAIM IS FALSE.  It is
+    kept, renamed in spirit rather than in file, because the property it
+    was reaching for is real and worth pinning -- but at the strength the
+    hardware actually supports.
+
+    THE REGISTERED DIAGNOSIS WAS CLOSE AND NOT RIGHT, and correcting it is
+    most of this commit's value.  The open row read: ``[1]`` passes because
+    a batch of one lowers to the same kernel as the loop, ``[5]`` and
+    ``[32]`` fail because a batch of many lowers to a batched
+    linear-algebra kernel with a different reduction order.  The first half
+    does not survive measurement.  Run this file six times on this host's
+    GPU, changing nothing, and ``[1]`` fails three times and passes three
+    times, always by the same 7.99e-11 -- so the gap is NOT a function of
+    batch size.  It is XLA choosing a different GEMM implementation between
+    processes; the reduction order is not fixed by the program, and a
+    bit-identity contract was never a thing this kernel could keep.  The
+    CPU lowering IS bit-identical at every batch size, which is the control
+    that makes this a statement about the GPU backend rather than about the
+    fit.
+
+    So the tolerance is uniform across batch sizes, because the mechanism
+    is uniform across batch sizes.  Making ``[1]`` a special case would
+    have encoded the wrong diagnosis in the one place it would be believed.
+
+    WHAT STAYS EXACT, AND IT IS THE PART THAT MATTERS.  ``valid`` -- the
+    discriminant deciding which poles are kept -- is asserted EXACTLY equal
+    at every batch size, and is measured to hold at 1, 2, 5, 17, 32 and 64
+    across every run taken.  A 1e-10 gap in the reduction must never move a
+    keep/drop decision; if it ever does, the discriminant is being read too
+    close to a threshold and that is a real defect, not weather.  Relaxing
+    that alongside the numerics is exactly the silent widening this cell
+    was registered to avoid.
+
+    THE NUMBER, SIZED FROM MEASUREMENT.  Worst gap at ``n_p = 6``,
+    ``cond_pade = 2.58e6``, on this host's GPU:
+
+        n=1   Omega 8.0e-11  B 1.2e-10   (run-to-run; 0 on other runs)
+        n=2   Omega 4.5e-11  B 1.8e-10
+        n=5   Omega 7.7e-11  B 2.5e-10
+        n=17  Omega 5.6e-11  B 1.8e-10
+        n=32  Omega 7.1e-11  B 2.1e-10
+        n=64  Omega 7.1e-11  B 2.3e-10
+
+    The gap does not grow with batch size -- n=64 is n=5 -- which is what a
+    difference in reduction order looks like and what an accumulating error
+    does not.  Worst relative gap measured: 2.2e-10.  The bar is 1e-8,
+    about 45x that, chosen to survive the spread already on record for this
+    kernel across hosts (Perlmutter measured 1.0e-11 on the same
+    comparison, a decade tighter than here) without being so loose that a
+    genuine algorithm change could hide under it.  A gap that GROWS with
+    ``n_elements``, or one that reaches 1e-8, is not reduction order and
+    this cell should say so.
+    """
     n_p = 6
     z = _grid(n_p, omega_m=4.0)
     rng = np.random.default_rng(7)
@@ -467,12 +531,19 @@ def test_vmap_batch_equals_loop_bit_identical(n_elements):
     B_b = np.asarray(B_b)
     for e in range(n_elements):
         O_s, B_s, d_s = pade_fit.fit_mpa_poles(tile[e], z, n_p)
-        np.testing.assert_array_equal(O_b[e], np.asarray(O_s))
-        np.testing.assert_array_equal(B_b[e], np.asarray(B_s))
+        # Same answer, and the reduction order is not the program's to fix.
+        np.testing.assert_allclose(
+            O_b[e], np.asarray(O_s),
+            rtol=_VMAP_REDUCTION_RTOL, atol=_VMAP_REDUCTION_ATOL)
+        np.testing.assert_allclose(
+            B_b[e], np.asarray(B_s),
+            rtol=_VMAP_REDUCTION_RTOL, atol=_VMAP_REDUCTION_ATOL)
+        # The discriminant does not move.  Never relaxed.
         np.testing.assert_array_equal(
             np.asarray(d_b["valid"])[e], np.asarray(d_s["valid"]))
-        assert (np.asarray(d_b["cond_pade"])[e]
-                == np.asarray(d_s["cond_pade"]))
+        np.testing.assert_allclose(
+            np.asarray(d_b["cond_pade"])[e], np.asarray(d_s["cond_pade"]),
+            rtol=_VMAP_REDUCTION_RTOL, atol=_VMAP_REDUCTION_ATOL)
     del rng
 
 

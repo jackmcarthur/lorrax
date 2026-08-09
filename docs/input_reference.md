@@ -75,7 +75,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 
 | key | default | meaning |
 |---|---|---|
-| `compute_mode` | `"auto"` | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags. |
+| `compute_mode` | `"auto"` | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags and never infers mpa. mpa is the multipole-W ansatz (the complex-pole fit of W): it parses today and REFUSES TO RUN today, naming itself, because its Sigma stage has not landed -- it is on the axis so that every mode-dispatch site in the tree has to handle it explicitly rather than absorbing it into a plasmon-pole branch. Spelled mpa rather than full_freq because every value on this axis names the ansatz, and full_freq names a family of them; see the ComputeMode docstring. |
 | `no_degen_averaging` | false | Disable BGW-style averaging of diagonal Sigma within degenerate sets. |
 | `degen_avg_tol_ry` | `1e-06` | Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry). |
 | `ppm_sigma_target_error` | `1e-06` | Target error of the PPM Sigma^c tau-quadrature. |

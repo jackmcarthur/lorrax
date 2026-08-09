@@ -555,12 +555,22 @@ def test_a_module_scope_consumer_reaches_the_door_in_a_bare_launch(
 #: The wave-1 shim paths, deleted 2026-08-08 by the phase-wide cleanup.
 #: dotted module -> the door that replaced it.  A path listed here must not
 #: appear in any ``src/`` import again, and must not exist as a file.
+#:
+#: ``common.minimax`` is NOT a wave-1 shim -- it never became one.  It joined
+#: this table with the sixth extraction (2026-08-08) because the phase-wide
+#: cleanup had already settled the question a shim would have re-opened: the
+#: module moved to ``services/minimax/`` and its ONE production importer,
+#: ``gw.minimax_screening``, was repointed at the door in the same commit, so
+#: there was nothing left for a transitional shim to bridge.  The ratchet
+#: does the same job here as for the five above -- it stops the old path
+#: being re-created to green a branch.
 _RETIRED_SHIM_PATHS = {
     "file_io.wfn_loader":           "wfn_loader",
     "file_io.zeta_loader":          "zeta_loader",
     "common.symmetry_maps":         "symmetry_maps",
     "centroid.orbit_syms":          "symmetry_maps",
     "common.density_symmetry_check": "symmetry_maps",
+    "common.minimax":               "minimax",
 }
 
 
@@ -616,6 +626,8 @@ def test_the_retired_shim_files_are_gone():
         "src/common/symmetry_maps.py",
         "src/centroid/orbit_syms.py",
         "src/common/density_symmetry_check.py",
+        # The sixth extraction, 2026-08-08.  See _RETIRED_SHIM_PATHS.
+        "src/common/minimax.py",
     ) if (_REPO / rel).exists()]
     assert not present, (
         f"wave-1 transitional shims are back: {present}.  These were deleted "

@@ -12,6 +12,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from common.units import RYD_TO_EV
+# The channel-availability table (L1, jax-free) — the writers below ask it
+# which Σ channels a run built instead of hand-checking mode strings.
+from .gw_config import (
+    ComputeMode, SigmaChannel, UNIMPLEMENTED_MODES, explain_missing_channels,
+    mode_builds_channels, sigma_channels_for)
 
 # ---------------------------------------------------------------------------
 # Results container
@@ -343,8 +348,6 @@ def persist_w0_and_head(
     reuses tensors it did not write, and would otherwise re-stamp a W0 into
     a file the deck said to leave alone.
     """
-    from .gw_config import ComputeMode
-
     if not config.do_screened:
         return
     if not restart_tensor_writes_enabled(config, tensors_filename):
@@ -384,10 +387,17 @@ def persist_w0_and_head(
                          qirr=_qirr.with_capture(
                              take_pre_unfold("W0_qmunu")))
     head_static = head_resolver.at(0.0 + 0.0j)
-    if config.compute_mode.is_dynamic:
+    # THE STORED ω GRID IS THE PROBE SET, so it is the POLE MODEL that
+    # decides it, not "is this run dynamic".  The two questions agreed for
+    # as long as every dynamic mode was a two-point plasmon-pole fit; MPA
+    # is dynamic and samples W on the double-parallel grid instead, so a
+    # dynamic-else-GN read here would stamp {0, iω_p} onto a file whose W
+    # was never evaluated there — a restart artifact that lies quietly.
+    ppm_model = config.compute_mode.ppm_model
+    if ppm_model is not None:
         # GN-PPM: probe at iωp on the imaginary axis.
         # HL-PPM: probe at Ω on the real axis (above all transitions).
-        if config.compute_mode is ComputeMode.HL_PPM:
+        if ppm_model == "hl":
             omega_imp = complex(float(config.ppm.omega_p), 0.0)
             _omega_grid_entry = float(omega_imp.real)
         else:
@@ -397,6 +407,19 @@ def persist_w0_and_head(
         whead_arr = np.array(
             [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
+    elif config.compute_mode.is_dynamic:
+        # Dynamic, but not a two-point pole fit: MPA today.  There is no
+        # probe frequency to record, and inventing one would be worse than
+        # a refusal — this is the file the next run reads W's head back
+        # from.  Unreachable from the driver (the mode is refused at
+        # entry); it stands so that landing the MPA Σ stage has to answer
+        # this question rather than inherit an answer.
+        raise NotImplementedError(
+            f"persist_w0_and_head: compute_mode = "
+            f"{config.compute_mode.value} builds Σ_c(ω) without a two-point "
+            f"plasmon-pole probe, so the {{0, probe}} head grid this writer "
+            f"stores is not its sample set.  Give the mode its own head "
+            f"persistence when its Σ stage lands.")
     else:
         whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0], dtype=np.float64)
@@ -610,6 +633,21 @@ def write_freq_debug(
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
+def _runnable_modes_building(*channels: SigmaChannel) -> str:
+    """The deck spellings an operator could switch to, read off the table.
+
+    "Runnable" excludes the modes that are declared but refuse to run
+    (``UNIMPLEMENTED_MODES``), because this string ends up in advice: a
+    message that tells an operator to try ``mpa`` today would send them
+    into the entry refusal.  When a mode's Σ stage lands and its row
+    leaves that dict, this advice picks it up with no edit here.
+    """
+    names = [m.value for m in ComputeMode
+             if m not in UNIMPLEMENTED_MODES
+             and all(c in sigma_channels_for(m) for c in channels)]
+    return " / ".join(names)
+
+
 # ---------------------------------------------------------------------------
 # The QP ladders of sigma_mnk.h5's plotting appendix
 # ---------------------------------------------------------------------------
@@ -631,6 +669,15 @@ def write_freq_debug(
 # a name here (``qp_omega0_ev``), and a plot that plots one quantity twice
 # under two labels is worse than a plot with one curve missing.  So a run
 # that did not build the channels omits the dataset and says so.
+#
+# WHICH RUNS THOSE ARE IS NOT DECIDED HERE ANY MORE.  This writer used to
+# ask ``results.use_ppm`` — a proxy that was correct for the four modes
+# that existed and would have gone on being asked as more arrived.  The
+# question it was really asking, "did this run build Σ_SX and Σ_COH", now
+# has a table: ``gw_config.MODE_SIGMA_CHANNELS``.  Asking the table means
+# a mode that builds those channels by a route nobody has written yet gets
+# the dataset, and a mode that does not gets the same named omission this
+# writer has always printed, without anyone editing this file.
 
 def write_qsgw_qp_ladders(
     results: "GWResults",
@@ -660,8 +707,9 @@ def write_qsgw_qp_ladders(
         print_fn(
             "  write_qsgw_datasets = true, but compute_mode "
             f"{config.compute_mode.value} writes no sigma_mnk.h5 — the QP "
-            "ladders have no file to go in.  Use a dynamic mode (gn_ppm / "
-            "hl_ppm) for the appendix.")
+            "ladders have no file to go in.  Use one of the modes that "
+            f"builds Σ_c(ω) ({_runnable_modes_building(SigmaChannel.C_OMEGA)})"
+            " for the appendix.")
         return []
     from file_io import append_qsgw_datasets_h5
     from .qsgw_utils import (
@@ -675,14 +723,19 @@ def write_qsgw_qp_ladders(
     omitted: list[str] = []
 
     # ---- qp_static_cohsex_ev: H₀ + Σ_SX + Σ_COH -----------------------
-    # ``use_ppm`` is the mode question spelled the way GWResults spells
-    # it; in a dynamic run sig_sx / sig_coh are the zeros ``gw_jax``
-    # substitutes for the Nones, and an eigh of kin_ion + V_H alone is
-    # not the static COHSEX ladder by any reading.
-    if results.use_ppm:
+    # THE TABLE ANSWERS IT.  In a run that does not build these two
+    # channels ``sig_sx`` / ``sig_coh`` are the zeros ``gw_jax``
+    # substitutes for the Nones, and an eigh of kin_ion + V_H alone is not
+    # the static COHSEX ladder by any reading — so the question is which
+    # runs build them, and that is one row of MODE_SIGMA_CHANNELS rather
+    # than this writer's own reading of ``results.use_ppm``.
+    if not mode_builds_channels(config.compute_mode,
+                                SigmaChannel.SX, SigmaChannel.COH):
         omitted.append(
-            f"qp_static_cohsex_ev (Σ_SX/Σ_COH are not built by compute_mode "
-            f"= {getattr(config.compute_mode, 'value', config.compute_mode)})")
+            "qp_static_cohsex_ev ("
+            + explain_missing_channels(config.compute_mode,
+                                       SigmaChannel.SX, SigmaChannel.COH)
+            + ")")
     else:
         payload["qp_static_cohsex_ev"] = _eigen_ladder_ev(
             kin_ion + sig_h + np.asarray(results.sig_sx)

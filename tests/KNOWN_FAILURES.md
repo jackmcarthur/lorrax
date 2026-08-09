@@ -2356,6 +2356,36 @@ new tables from their own bytes without any runtime consumer.
 selection rule that can carry a β axis will be designed.  Until then the
 tables are inert payload: they cost bytes in the tree and nothing else.
 
+**CLOSED 2026-08-08 by `feat/minimax-beta-selector-2026-08-08`.**  The β axis
+now exists as its own module, `src/common/minimax_beta_selector.py`, and
+`solve_laplace_minimax_imag_interval` consults it.  The three things the row
+above said had to be true before wiring are true: β is matched against each
+entry's own stamped `beta_tolerance` band and never rounded for
+`rule='btv_minimax'`; the one entry that does round — the positive composite,
+whose β dependence is an exact phase on β-independent nodes — rounds downward
+only and is *re-phased* at the request rather than served as shipped; and the
+envelope's two clauses are checked before the β match, so a Σ-stage width
+request cannot be answered from a sampling-height sweep even where the two
+overlap numerically.  Everything the selector cannot certify still falls
+through to the same uncertified runtime solve on the same cache key, so R1's
+stage-2 refusal remains staged and unarmed.  `tests/test_minimax_quadrature.py`
+is still **14 passed** — the static and crossing selector is untouched — and
+`tests/test_minimax_beta_selector.py` adds 25 cells, of which the red twins are
+the neighbouring β, the wrong clause, the upward-rounded composite, the
+mis-stamped band, the unknown β axis and the unreadable payload.
+
+**Registered while closing it, and NOT caused by it:**
+`tests/test_minimax_imag_tables.py::test_the_fit_stage_floor_is_no_longer_a_quadrature`
+fails on this WSL host at `origin/main` itself (`f0435e9a`, measured with the
+branch stashed): it asserts `worst_eval < 1e-8` and reaches `9.98e-08`, but its
+own *synthesis* baseline — computed with no evaluator, no quadrature and no
+table anywhere in the path — is `8.65e-08` here against the `3.81e-09` the
+docstring records.  So what moved is the Padé fixture's conditioning on this
+host and not the quadrature the cell is about; the cell's third assertion,
+`worst_eval < 2 * worst_synth`, still holds.  The fix belongs with whoever owns
+that fixture: the absolute `1e-8` needs to become a statement relative to the
+synthesis baseline, which is what the docstring already says the cell means.
+
 ### Where the evidence lives
 
 Local (WSL): `_reports/census_head.xml`, `_reports/census_base.xml`,
@@ -2635,6 +2665,86 @@ read only.  The `RUNS_INFLIGHT` row for the two arms is struck with its
 outcome.  In-tree: this amendment, and the two cells in
 `services/symmetry_maps/tests/test_symmetry_maps_import_isolation.py`.
 
+> **PATHS UPDATED AT THE MPA-BATCH LANDING.**  This row was written against
+> `src/common/`, and the minimax service extraction merged one commit earlier
+> in the same batch moved the bundle, the axis record and both selectors into
+> `services/minimax/src/minimax/`.  The paths below are the post-move ones.
+> Nothing else in the row changed: the counts, the certification and the open
+> consumer question are as the branch measured them.
+
+### OPEN ROW: the `damped_line` catalog is SHIPPED AND WIRED, and the fit
+### stage is not yet calling it
+
+`services/minimax/src/minimax/minimax_assets/catalog_damped_line.json` and its 29
+`damped_line/*.npz` tables land here together with the door that serves them,
+`services/minimax/src/minimax/damped_line_selector.py`.  Unlike the complex-Laplace row
+above, this catalog is **not inert**: the selector is complete, it reads the
+family's axis record, and it refuses by name above the top of the `A` ladder.
+What has not happened yet is the consumer change — `gw.mpa.evaluator
+.evaluate_samples` still calls `damped_line_rule` once per line under
+`batching='per-line'` and runs two sweeps, where the catalog exists precisely
+so it can make one lookup and run one.
+
+That is deliberate and it is a scope boundary, not an oversight.  Wiring it
+changes the fit stage's cost report shape (`batching` gains a `'global'` mode
+and the per-line rows collapse to one shared row carrying the entry's identity,
+node count and worst-case `kappa_0`), and that belongs with the MPA fit driver
+rather than with the tables.  Until it happens the tables cost bytes in the
+tree and nothing else, and `src/gw/screening.py`'s
+`complex-axis omega ... not supported` refusal — the door the whole MPA fit
+stage is standing outside — is still there.
+
+**What IS true at this head**, so the row is not read as weaker than it is:
+
+- 29 of 29 shipped entries certify, on a held-out `Delta` grid disjoint from
+  every grid the solver saw and four times finer, at every one of the 55-to-58
+  shipped weight rows on **both** sampling lines.  17 ship sparse (1.70-2.49x
+  against one composite rule per line) and 12 ship composite (1.11-1.19x, from
+  the sharing alone).
+- **`tests/test_damped_line_tables.py` is 120 passed, 1 failed at this head**,
+  and the one red is `test_the_catalog_covers_the_span_and_tier_ladder`.  It is
+  the test doing its job: the ladder declares eight spans and the sweep landed
+  seven of them plus one tier of the eighth, so three cells (`A = 200` at
+  1e-8, 1e-10 and 1e-12) are absent.  They are absent for COST, not
+  feasibility — the sparse attempt at the top of the ladder spends its whole
+  wall budget in the prune before falling back — and
+  `tools/generate_damped_line_assets.py --spans 200 --merge` fills them without
+  recomputing anything already here.  **This red closes when that command
+  runs**; nothing else in the suite depends on it.
+- The wider minimax census at this head is `test_minimax_quadrature` **14
+  passed**, `test_minimax_beta_selector` **25 passed** (green after the axis
+  record was wired into it, which is the only edit this branch makes to that
+  door), and `test_minimax_imag_tables` **93 passed, 1 failed**.  That one
+  failure is the carried
+  `test_the_fit_stage_floor_is_no_longer_a_quadrature` row registered a few
+  sections above, and it is **not** this branch's: re-measured here in a clean
+  worktree at the branch point `8f2a651d` it fails identically, `recovery
+  9.984e-08 against a synthesis baseline of 8.652e-08`, which is the same
+  host-conditioning of the Pade fixture that row already diagnoses.  Named here
+  only so that a reader of the damped_line census is not surprised by a second
+  red elsewhere in the same suite.
+- Every entry's `kappa_0` is re-measured from its own shipped bytes and is at
+  or under the `<= 2` shipping rule.  This family is the first where that cap
+  BINDS: the uncapped selector produced live specimens at `kappa_0` of 406, 620
+  and 1267 that meet their sup-norm tolerance, and one of them is in the
+  harness as a red twin (`test_red_twin_from_the_gate_zero_specimen`).
+- `pyproject.toml`'s `[tool.setuptools.package-data]` gains
+  `minimax_assets/damped_line/*.npz` **and** `minimax_assets/complex_laplace/*.npz`.
+  The second is a pre-existing packaging defect this branch fixes in passing:
+  the complex-Laplace tables have been absent from every wheel install since
+  they landed, because `MANIFEST.in` covers the sdist and package-data covers
+  the wheel, and only the first listed them.
+
+**Registered, not taken:** at `A >= 100` and `10^-10`, and at `A = 20` and
+`10^-8`, the sparse route does not clear the composite and the composite ships.
+Those cells are correct and certified — the composite is a rule of the same
+family at the same cell, and one shared node set still beats one rule per line
+by 1.11-1.19x — but gate zero found a sparse rule at `A = 100`, `10^-10` on the
+near line alone, so a better search probably exists there.  The shipping rule's
+clause (iii) is what makes the gap harmless rather than silent: an entry ships
+sparse only if it uses strictly fewer nodes than the two composite rules it
+replaces, and `composite_node_count` is recorded on every entry so the
+comparison is a shipped number.
 ---
 
 ## Amendment — the BSE night's second consolidation checkpoint (2026-08-08)
@@ -2710,3 +2820,259 @@ the pre-/post-port block dumps (`stk_{preport,postport,redtwin}_*.npy`);
 `work/_logs/` carries the deck legs (`c2_p1.log`, `c2_p4.log`,
 `c2_p1_post.log`, `c2_p4_post.log`, `rc_p4.log`, `rc_p4_post.log`,
 `rc_p4_redtwin.log`). WSL: `~/lorrax_bse_perf_2026-08-08/CONSOLIDATION2_REPORT.md`.
+
+---
+
+## Amendment — the MPA batch integration landing (2026-08-08 / 09)
+
+Six branches integrated and landed as one checkpoint, plus three registered bar
+questions decided as deliberate commits. Base `70c0472a`; the census pair is
+base `a3368c5b` against this batch's head, with the peer's one-file mesh gate
+merged after and measured separately (below). This is the night's final landing
+on this side.
+
+### What merged, and the one branch that had to be integrated
+
+Five of the six merged as merges. `svc/minimax-2026-08-08` (the service
+extraction), `feat/mpa-chi0-resolvent-2026-08-08` (independent files),
+`feat/ff-compute-mode-2026-08-08` (a mode that ships refusing) and the
+damped-line/fullprec stack all composed without argument once the sixth was
+resolved.
+
+The sixth is `feat/minimax-beta-selector-2026-08-08`, and it is worth stating
+why it could not simply merge. Both it and the extraction were written against
+the same file in the same hour. The extraction moved `common/minimax.py` and
+the shipped table bundle into `services/minimax/`; the beta axis was written as
+`common.minimax_beta_selector`, resolving its catalog through
+`importlib.resources.files("common")`. Merged as written, the selection rule
+would sit one import edge away from the bytes it selects from, reading a
+package that no longer has them. So the axis moved with the bundle, and when
+the damped-line branch arrived one commit later carrying a shared axis record
+and a second selector with the same `files("common")` in them, the whole family
+layer moved: `beta_selector`, `family_axes` and `damped_line_selector` are all
+in the service now, all resolving through `_catalog`'s own `ASSET_PACKAGE`, all
+on the door. Two things that git could not have known to fix came with it — the
+damped-line generator and its certification harness were still writing to and
+reading from `src/common/minimax_assets`, which would have produced tables
+nothing could find and a harness certifying an empty ladder.
+
+`complex_laplace` is WIRED, which is the flip that branch was written to earn,
+and the flip came with the routing that makes it safe rather than as a flag
+change. The family's row said `wired=False` because the generic rule matches on
+three axes that all round safely and beta rounds neither way — the target is a
+different function at every beta — so a beta-blind match answers a different
+question. `lookup(family='complex_laplace', ...)` therefore does not reach
+`select_entry` at all; it reaches the beta axis, and it refuses a request that
+names no beta or no clause as a vocabulary error rather than as a miss. Two
+service cells asserting the old state were rewritten to assert the new one,
+each keeping a red twin.
+
+### The census
+
+One script, both legs, run against two worktrees so a set-diff cannot be an
+artifact of two different invocations. WSL, PYTHONPATH pinned per worktree per
+the build note's trap. This box has one CUDA device, so both legs are
+GPU legs.
+
+| | collected | red |
+|---|---:|---:|
+| base `a3368c5b` | 2701 | 136 |
+| head (this batch) | 3046 | 148 |
+
+In both: 2681. Collected only at head: 365. Collected only at base: 20.
+
+**Newly red in the intersection: ONE, and it is not a regression.**
+`test_mpa_fit_kernel::test_exact_recovery_metal_grid_alpha2`. This landing does
+not touch that cell — the diff against the base for that cell is empty — and it
+is FLAKY AT THE BASE: eight runs at `a3368c5b` give six passes and two
+failures, always at the same value, `1.0837827302938041e-06` against a `1e-06`
+bar. On CPU it passes four times out of four. It is the same mechanism bar
+decision (a) below documents, caught in a third cell: XLA selects a different
+GEMM implementation between processes, so the answer moves in its last bits and
+a bar 8% away is sometimes on the wrong side of it. The census caught it on the
+head leg and not the base leg because that is what a 25%-per-run flake does to
+a single-sample census. **Registered as a pre-existing flake with a measured
+rate, not attributed to this landing.**
+
+**Newly green in the intersection: five**, and they are the three registered bar
+questions: `test_the_fit_stage_floor_is_no_longer_a_quadrature`,
+`test_end_to_end_at_the_si_pole_schedule`, and the three
+`test_vmap_batch_equals_loop_bit_identical` parametrizations.
+
+**The +collected bucket, checked cell by cell rather than trusted.** The
+fixes+MPA landing shipped four reds through this exact hole — cells that do not
+exist at the base cannot be regressions by construction, so a set-diff drops
+them silently. The set-diff script used here grades every member of that bucket
+and prints the red ones by name. Of 365 newly collected cells, **16 are red and
+all 16 are `test_damped_line_tables`**, adjudicated in the next section. The
+other 349 are green.
+
+**The 20 de-collected cells are renames, and none was red.** Eighteen are
+`test_minimax_imag_tables` parametrizations whose ids carry the catalog's beta
+values, which moved from the request census's three-decimal display
+(`b16.006`) to the decks' own full precision when the fullprec campaign
+regenerated; the head collects 83 and 54 of those two cells against the base's
+18 and 18. Two are `test_minimax_quadrature` cells the service extraction
+retired into the service's own suite. All twenty were green at base, so nothing
+red left the tree unexamined.
+
+### The far-line contradiction, settled
+
+Two workers reported `test_damped_line_tables` at the damped-line tip
+`74423bc7` on the same day and disagreed: 16 failed / 105 passed, and 120
+passed / 1 failed. Settled by measurement, in a clean worktree at that tip with
+PYTHONPATH pinned: **16 failed / 105 passed**, matching the fullprec worker's
+count, and the same sixteen cells by name at this landing's head. The failures
+are not a merge artifact and not an environment artifact of the runs taken
+here: this file resolves everything from `Path(__file__)` and reads the shipped
+bytes off disk, it imports no jax, and `heldout_delta` draws no random numbers,
+so the measurement has no device and no seed to vary. The 120/1 count is not
+reproducible on these bytes; the catalog and its payloads landed in a single
+commit (`04ba10ad`), so it cannot be explained by a half-written bundle either,
+and it is recorded here as unreproduced rather than explained.
+
+**And the load-bearing claim is NOT what is red, which is the part that
+matters.** The far-line cells assert two different things and only one of them
+fails. The design claim — that a composite entry's far line rides the NEAR
+line's node set inside its own tighter budget, which is what buys the
+one-global-sweep economy — is measured intact: the far rows score between
+`1.5e-06` and `2.6e-03` of their budget, three to six orders under it. What
+fails is the cell's other assertion, that recertifying from the shipped bytes
+reproduces the entry's STAMPED statistic to `rel=1e-9`.
+
+Measured across all 29 entries, comparing the stamp against a recertify on the
+full row set and on the far rows alone:
+
+* the two recertifies agree with each other to 1e-12 on every entry, so the
+  subset method the cell uses is sound and the far-line measurement is not
+  row-set dependent;
+* seven entries' stamps are missed by both, by relative amounts from `1.4e-05`
+  (A=120, 1e-8) to `5.5e-03` (A=40, 1e-10);
+* **all seven are `btv_minimax` and none is `positive_composite`**, which
+  points at a final step on that route — a polish or a re-solve applied to the
+  payload after the certificate was computed and written.
+
+So this is a generator bookkeeping defect, not a physics defect: the shipped
+tables are as good as claimed and the numbers recorded beside them are stale in
+their fifth to sixth significant figure. **OPEN ROW, owner: the damped_line
+generator lane.** The fix is to re-certify after the last step that touches the
+payload and rewrite the stamps, and the check that it worked is this suite going
+16 → 0. The far-line documentation lands as written, because its claim is
+measured true; what does not land is any assertion that the recorded digits are
+reproducible, and that is exactly what these sixteen cells are still saying.
+
+### The three registered bar questions, decided
+
+Each is its own commit with its reasoning, and each was measured before it was
+decided. In two of the three the measurement changed the answer.
+
+**(a) The vmap bit-identity cells.** Registered as "the cell's claim is false;
+document the contract as reduction-order-tolerant with the measured bound, not
+a silent widening". Done — and the registered DIAGNOSIS did not survive
+measurement. It read that `[1]` passes because a batch of one lowers to the
+same kernel as the loop while a batch of many lowers to a batched kernel. Run
+the cell six times on this host's GPU changing nothing and `[1]` fails three
+times and passes three times, always by the same `7.99e-11`. The gap is not a
+function of batch size; it is XLA choosing between GEMM implementations across
+processes, and bit-identity was never a contract this kernel could keep. The
+CPU lowering is bit-identical at every batch size, which is the control that
+makes this a statement about the backend. Bound sized from measurement over
+batch sizes 1, 2, 5, 17, 32, 64: worst relative gap `2.2e-10`, not growing with
+batch size. Bar `rtol = atol = 1e-8`, ~45x that, covering the decade of
+cross-host spread already on record. **`valid` — the discriminant that decides
+which poles are kept — stays exactly equal**, because a 1e-10 gap in a
+reduction must never move a keep/drop decision, and relaxing that alongside the
+numerics is the silent widening the row existed to prevent.
+
+**(b) The driver's end-to-end bar.** Registered as "bar missed ~10x at cond
+7.8e9 — a statement about the schedule, not about the machine". It is about the
+machine. Same fixture, same bytes, same condition number `7.835e9`:
+`JAX_PLATFORMS=cpu` gives `max|dOmega| = 6.33e-08` and passes the old `1e-6`
+bar; this host's GPU gives `9.99e-06` and fails. A factor of 158, and not the
+disk (a complex128 round trip is exact) and not the fixture (identical). That
+also explains a puzzle in the original row: the cell's own docstring recorded
+`6.3e-8`, well UNDER the bar it was failing. Those are the CPU numbers — the
+cell was written on one device and censused on another, and both census legs
+that reported it were GPU legs, which is why they agreed with each other and
+not with the docstring. The theory guide's §3.6 table carries the same `6.3e-8`
+row and inherits the caveat. The bar is now computed from the run's own worst
+conditioning, which is §3.6's own law: `floor = cond * eps_mach = 1.74e-6`,
+with the measurements at 5.7x floor (Omega, GPU), 0.036x (Omega, CPU) and 72x
+(B, GPU), and bars at 30x and 300x. It reports an algorithm regression on
+either device and lets the fixture's conditioning move without calling weather
+a defect.
+
+**(c) The fit-stage floor.** Registered with the beta-selector landing's
+suggestion: make it relative to `worst_synth`, which is what the docstring
+already claims it means. The relative bar was already there one line below; the
+absolute `1e-8` is deleted, nothing is widened. The fullprec stack was expected
+to resolve this row outright on a `3.33e-9` recovery against a `3.81e-9`
+baseline. It does not resolve it here: `9.98e-08` against a baseline of
+`8.65e-08`. That is not two workers disagreeing, it is one mechanism measured
+twice — the synthesis baseline is the Padé fixture's conditioning and therefore
+the host's LAPACK. The two baselines are 23x apart, the two RATIOS agree to
+within 30% (1.15 and 0.87), and **the absolute `1e-8` falls between the two
+baselines**, which is precisely why identical code passes it on one machine and
+fails it on the other. Taking the greener measurement as the resolution would
+have shipped a bar that reports whose machine ran it.
+
+### The fullprec branch: PUSHED, and it subsumed its predecessor
+
+Registered in the brief as possibly absent. It exists at `863a8f01`, stacked on
+the damped-line tip, and is merged here: 18 → 54 certified `complex_laplace`
+entries. The first campaign swept a beta grid taken from the request census's
+three-decimal display, so every entry was fitted near — not at — the beta a
+deck asks for, which on an axis that does not round is the difference between a
+served table and a near-miss refusal. This one sweeps the decks' own
+omega-hats and adds the 1e-12 fit-stage tier. hBN stops being a refusal.
+
+### The peer's mesh gate, measured separately
+
+`70c0472a` adds `tests/test_bse_coupling_routes_mesh_invariance.py` and no
+source, so it is outside the census pair by construction. Run at this landing's
+head it is **13 failed / 2 passed** — and it is **13 failed / 2 passed at its
+own base `70c0472a`** in a clean worktree, identical. Pre-existing on this box
+(the gate wants a mesh this single-device machine cannot provide) and untouched
+by this batch. Not attributed here, and named so the next WSL census is not
+surprised by thirteen reds with no owner.
+
+### THE OWED PERLMUTTER CENSUS
+
+**OWED, and this is the third landing in a row to owe one.** Both legs of this
+census ran on WSL, on a box with one CUDA device. The rule the isolation-edge
+amendment wrote down applies without modification: a WSL leg is evidence about
+code and is not evidence about a cell whose premise is a device or a built
+`.so`. This census is structurally blind to the FFI-backed families, to
+anything needing a multi-device mesh — which is exactly what the peer's thirteen
+reds above are — and to the SlabIO transport cells.
+
+It is staged one command away, on the `fixmpa_0808` precedent: two worktrees at
+the base and the landed head, one script that runs the same invocation against
+both, `LX_BASE_MODULE=lorrax_J070` exported (unset costs ~52F/32E instead of
+14F), `--junitxml=` first, `-m=<mark>` spelled with the equals sign, and the
+`[lx] source tree:` line read in every log before any leg is believed.
+
+### The day's defect classes
+
+The conjugation class stays at **four** instances. The K^d_B defect founded a
+**second** class — rotating a partial contraction along the shard's own axis —
+now cured in both known instances, with a portable gate guarding it. This
+landing adds no instance to either. It does surface a third pattern that is not
+a defect class but is worth naming, because it cost three separate
+adjudications tonight and will cost more: **a numerical bar written on one
+device and censused on another**. All three of this landing's bar questions, and
+the one newly-red census cell, are that pattern. Two forms: run-to-run GEMM
+selection inside one device (bar a, and the metal-grid flake), and CPU-vs-GPU
+accuracy at high condition number (bar b, 158x at cond 7.8e9). The defence is
+the one bar (b) now uses — derive the bar from the run's own measured
+conditioning rather than freezing a constant measured somewhere else.
+
+### Where the evidence lives
+
+WSL: `~/.../scratchpad/_mpabatch_reports/` — `census_base.xml`,
+`census_mpahead.xml`, both `.log`s, and `setdiff_mpabatch.txt` (the set-diff
+with the +collected red check), beside `census.sh`, the single script both legs
+ran, and `setdiff.py`. Worktrees `wt_census_base` (a3368c5b), `wt_peerbase`
+(70c0472a) and `wt_mpabatch` (the landed head). In-tree: this amendment, the
+three bar-decision commits and their docstrings, which carry the derivations
+where the numbers are rather than in a commit message.

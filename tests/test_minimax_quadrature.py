@@ -13,10 +13,24 @@ from __future__ import annotations
 
 import numpy as np
 
+import minimax as mm
 from gw import minimax_screening as ms
 
 
-def test_find_shipped_table_entry_prefers_smallest_range_then_loosest_error(monkeypatch):
+def _typed(catalog):
+    """The synthetic catalogs below, through the door's own parser.
+
+    The selection rule moved to ``services/minimax/`` with the extraction
+    and runs on TYPED entries now, so these cells hand it typed entries.
+    That is not a weaker test: ``parse_catalog`` is where a malformed row
+    became a refusal instead of a silent skip, and the cells that exercise
+    THAT live in the service's own suite
+    (``services/minimax/tests/test_minimax_catalog_refusals.py``).
+    """
+    return mm.parse_catalog(catalog, catalog_name="synthetic")
+
+
+def test_find_shipped_table_entry_prefers_smallest_range_then_loosest_error():
     catalog = {
         "tables": [
             {
@@ -42,9 +56,9 @@ def test_find_shipped_table_entry_prefers_smallest_range_then_loosest_error(monk
             },
         ],
     }
-    monkeypatch.setattr(ms, "_load_shipped_minimax_catalog", lambda: catalog)
 
-    entry = ms._find_shipped_table_entry(
+    entry = mm.select_entry(
+        _typed(catalog),
         "noncrossing",
         range_value=80.0,
         target_error=1.0e-6,
@@ -52,10 +66,10 @@ def test_find_shipped_table_entry_prefers_smallest_range_then_loosest_error(monk
     )
 
     assert entry is not None
-    assert entry["file"] == "noncrossing/loose.npz"
+    assert entry.file == "noncrossing/loose.npz"
 
 
-def test_find_shipped_table_entry_filters_crossing_metadata(monkeypatch):
+def test_find_shipped_table_entry_filters_crossing_metadata():
     catalog = {
         "tables": [
             {
@@ -96,9 +110,9 @@ def test_find_shipped_table_entry_filters_crossing_metadata(monkeypatch):
             },
         ],
     }
-    monkeypatch.setattr(ms, "_load_shipped_minimax_catalog", lambda: catalog)
 
-    entry = ms._find_shipped_table_entry(
+    entry = mm.select_entry(
+        _typed(catalog),
         "crossing",
         range_value=60.0,
         target_error=1.0e-6,
@@ -108,24 +122,39 @@ def test_find_shipped_table_entry_filters_crossing_metadata(monkeypatch):
     )
 
     assert entry is not None
-    assert entry["file"] == "crossing/good.npz"
+    assert entry.file == "crossing/good.npz"
+
+
+def _served(tau, alpha, err, *, family="noncrossing", target="inverse",
+            source="shipped"):
+    """A ``Quadrature`` standing in for whatever the door would have served."""
+    return mm.Quadrature(
+        nodes=tau, weights=alpha, family=family, target=target,
+        range_param="R", range_value=10.0, error_bound=1.0e-6,
+        max_error=err, kappa0=None, kappa1=None,
+        provenance=mm.Provenance(
+            source=source, catalog_entry="synthetic/fixture.npz",
+            table_hash="sha256:0000000000000000",
+            generator_commit="test", generation_backend="test",
+            certified=False))
 
 
 def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypatch):
+    """THE RESCALE IS WHAT STAYED HERE, so it is what this cell tests.
+
+    The door serves tables in the scaled units the catalog tabulates; the
+    wrapper divides by ``x_min``.  Standing a ``Quadrature`` in for the
+    door is the whole coupling between the two halves after the
+    extraction, and getting the division wrong is the one way this module
+    can still move a number.
+    """
     tau_hat = np.array([1.0, 2.0], dtype=np.float64)
     alpha_hat = np.array([0.25, 0.5], dtype=np.float64)
     err_hat = 5.0e-7
 
     monkeypatch.setattr(
-        ms,
-        "_pick_shipped_table",
-        lambda *args, **kwargs: (tau_hat, alpha_hat, err_hat),
-    )
-
-    def _unexpected_solver(*args, **kwargs):
-        raise AssertionError("Exact noncrossing solver should not run when a shipped table matches.")
-
-    monkeypatch.setattr(ms, "_solve_noncrossing_scaled_cached", _unexpected_solver)
+        ms._mm, "serve",
+        lambda **kw: _served(tau_hat, alpha_hat, err_hat))
 
     quad = ms.solve_laplace_minimax_interval(
         2.0,
@@ -138,48 +167,65 @@ def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypa
     np.testing.assert_allclose(quad.tau, tau_hat / 2.0)
     np.testing.assert_allclose(quad.alpha, alpha_hat / 2.0)
     assert quad.max_error == err_hat / 2.0
+    # R2: the rule now says where it came from, and the driver prints it.
+    assert "synthetic/fixture.npz" in quad.provenance
 
 
-def test_solve_phase_minimax_bandwidth_falls_back_when_no_shipped_table(monkeypatch):
+def test_solve_phase_minimax_bandwidth_carries_the_crossing_table_unrescaled():
+    """The crossing wrapper does NOT divide -- ξ enters at the consumer.
+
+    ``ppm_windows`` applies ``t = τ/ξ`` itself, so a division here would
+    apply it twice.  The asymmetry with the Laplace wrapper above is the
+    reason both cells exist.
+    """
     tau_hat = np.array([0.5, 1.5], dtype=np.float64)
     alpha_hat = np.array([0.1, 0.2], dtype=np.float64)
     err_hat = 9.0e-7
 
-    monkeypatch.setattr(ms, "_pick_shipped_table", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        ms,
-        "_solve_crossing_scaled_cached",
-        lambda *args, **kwargs: (tau_hat, alpha_hat, err_hat),
-    )
-
-    quad = ms.solve_phase_minimax_bandwidth(
-        83.0,
-        target_error=1.0e-6,
-        max_nodes=500,
-        eps_q=1.0e-3,
-        target_kind="hgl",
-    )
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(ms._mm, "serve",
+                   lambda **kw: _served(tau_hat, alpha_hat, err_hat,
+                                        family="crossing", target="hgl",
+                                        source="runtime-uncertified"))
+        quad = ms.solve_phase_minimax_bandwidth(
+            83.0,
+            target_error=1.0e-6,
+            max_nodes=500,
+            eps_q=1.0e-3,
+            target_kind="hgl",
+        )
+    finally:
+        mp.undo()
 
     np.testing.assert_allclose(quad.tau, tau_hat)
     np.testing.assert_allclose(quad.alpha, alpha_hat)
     assert quad.max_error == err_hat
     assert quad.target_kind == "hgl"
+    assert "runtime solve" in quad.provenance
 
 
-def test_solve_laplace_minimax_interval_skips_shipped_lookup_when_disabled(monkeypatch):
+def test_solve_laplace_minimax_interval_forwards_the_shipped_table_flag(monkeypatch):
+    """``use_shipped_tables=False`` reaches the door as ``use_shipped=False``.
+
+    The deck key ``regenerate_minimax_tables`` is an explicit request for
+    the uncertified path.  Dropping it in the wrapper would silently serve
+    a shipped table to a run that asked to re-solve -- which is the exact
+    inverse of the defect this extraction exists to fix, and just as
+    invisible.
+    """
     tau_hat = np.array([0.75, 1.25], dtype=np.float64)
     alpha_hat = np.array([0.3, 0.4], dtype=np.float64)
     err_hat = 2.5e-7
+    seen = {}
 
-    def _unexpected_pick(*args, **kwargs):
-        raise AssertionError("Shipped lookup should stay disabled when use_shipped_tables=False.")
+    def _capture(**kw):
+        seen.update(kw)
+        return _served(tau_hat, alpha_hat, err_hat,
+                       source="runtime-uncertified")
 
-    monkeypatch.setattr(ms, "_pick_shipped_table", _unexpected_pick)
-    monkeypatch.setattr(
-        ms,
-        "_solve_noncrossing_scaled_cached",
-        lambda *args, **kwargs: (tau_hat, alpha_hat, err_hat),
-    )
+    monkeypatch.setattr(ms._mm, "serve", _capture)
 
     quad = ms.solve_laplace_minimax_interval(
         1.0,
@@ -189,9 +235,12 @@ def test_solve_laplace_minimax_interval_skips_shipped_lookup_when_disabled(monke
         use_shipped_tables=False,
     )
 
+    assert seen["use_shipped"] is False
+    assert seen["family"] == "noncrossing" and seen["target"] == "inverse"
     np.testing.assert_allclose(quad.tau, tau_hat)
     np.testing.assert_allclose(quad.alpha, alpha_hat)
     assert quad.max_error == err_hat
+
 
 # ===========================================================================
 #  real-axis quadrature vs analytic kernel (was test_real_axis_quadrature.py)

@@ -94,7 +94,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "bgw_vcoul_file": ("Screening", "Path of the BGW vcoul file for use_bgw_vcoul."),
     "bgw_vcoul_sym_wfn": ("Screening", "Aux WFN supplying the full symmetry group to fold LORRAX q's onto BGW's IBZ q-list."),
     # ---- Sigma ----
-    "compute_mode": ("Sigma", "Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags."),
+    "compute_mode": ("Sigma", "Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags and never infers mpa. mpa is the multipole-W ansatz (the complex-pole fit of W): it parses today and REFUSES TO RUN today, naming itself, because its Sigma stage has not landed -- it is on the axis so that every mode-dispatch site in the tree has to handle it explicitly rather than absorbing it into a plasmon-pole branch. Spelled mpa rather than full_freq because every value on this axis names the ansatz, and full_freq names a family of them; see the ComputeMode docstring."),
     "ppm_sigma_target_error": ("Sigma", "Target error of the PPM Sigma^c tau-quadrature."),
     "ppm_sigma_max_nodes": ("Sigma", "Node-count cap for the PPM Sigma^c quadrature."),
     "sigma_omega_min_ev": ("Sigma", "Sigma(omega) grid lower edge (eV, relative to E_DFT)."),

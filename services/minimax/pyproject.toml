@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimax"
+version = "0.1.0"
+description = "Certified minimax quadrature: the shipped table catalog with provenance and refusals, and the offline solvers that generated it"
+requires-python = ">=3.12"
+
+# THE QUARANTINE, DECLARED.  numpy is the only runtime dependency, and that
+# is a statement about the DOOR rather than about the package: `lookup` reads
+# a JSON catalog and an `.npz` payload, and neither needs anything else.
+#
+# scipy is NOT here and NOT an install-time dependency.  It is reached from
+# exactly one place — `minimax.solver`, the offline solver half — and that
+# module is imported LAZILY, only when the R1 escape hatch actually runs a
+# solve.  So an installed `minimax` on a machine with no scipy imports fine,
+# serves every certified table in the bundle, and refuses exactly one path by
+# name (`UncertifiedSolveRefused` / the missing-scipy message).  The
+# `services/minimax/tests/test_minimax_import_isolation.py` cell MEASURES
+# that rather than asserting it.
+#
+# NOT depended on, deliberately: jax.  Unlike `vcoul`, `import minimax` never
+# touches jax at all — the whole service is host float64 arithmetic on tables,
+# and the complex128 `MinimaxNodes` pytree that jax cares about stays in
+# `gw.minimax_screening`, which is what keeps this package jax-free.  That is
+# the SERVICE_FORM.md:12 pin ("stdlib-only at import time, jax lazy") arriving
+# by extraction rather than by engineering: `common/__init__.py` was dragging
+# jax in behind `common.minimax`'s back, and the package boundary removed it.
+#
+# NOT depended on, deliberately: lxkit.  minimax owns no `.so`, probes no
+# device and counts no processes; there is no capability gate to share.
+# `lxkit.testing` is a TEST-time dependency (the import-isolation cell), which
+# is what the `test` extra is for.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# The OFFLINE solver half.  Needed to GENERATE a table, never to SERVE one.
+# `minimax.solver` is imported lazily behind the R1 escape hatch, so this
+# extra is what a generator campaign installs and what a production lookup
+# does not.
+solve = ["scipy>=1.16.0"]
+test = ["pytest>=8.0.0", "numpy", "scipy>=1.16.0", "lxkit"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The shipped bundle rides with the package (DESIGN_minimax.md §3.3).  It
+# used to live at `src/common/minimax_assets/` and be reached through
+# `importlib.resources.files("common")`, which is the import edge the
+# extraction cut.
+minimax = [
+    "minimax_assets/*.json",
+    "minimax_assets/*.md",
+    "minimax_assets/crossing/*.npz",
+    "minimax_assets/noncrossing/*.npz",
+    "minimax_assets/complex_laplace/*.npz",
+    # `damped_line` arrives with the second family's catalog.  Its row
+    # exists because `feat/damped-line-tables` found the FIRST one missing:
+    # MANIFEST.in covers the sdist but package-data is what a WHEEL install
+    # carries, so between the complex_laplace campaign landing and that
+    # branch, every wheel shipped a catalog whose payloads were absent.  A
+    # selector that finds its catalog and not its tables refuses with
+    # "TableUnreadable", which reads like a corrupt artifact rather than
+    # like a packaging bug -- an expensive way to learn one glob is missing.
+    "minimax_assets/damped_line/*.npz",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/minimax/tests` from the monorepo root picks THIS
+# file as its rootdir config (it is the nearest pyproject.toml above the
+# argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "minimax: the minimax service suite",
+]

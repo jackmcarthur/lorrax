@@ -1,0 +1,2843 @@
+{
+  "schema_version": 2,
+  "family": "complex_laplace",
+  "target": {
+    "definition": "1/(u - i*beta) on u in [1, R]",
+    "version": "complex_laplace/v1",
+    "real_part_alias": "Re 1/(u - i*beta) = u/(u^2 + beta^2) is common.minimax._imag_target(u, omega_hat) at omega_hat = beta, so alpha.real serves the noncrossing_imag consumer from the same payload.",
+    "error_metric": "linf_abs_complex_modulus_scaled",
+    "physical_error_note": "runtime rescales from [1,R] to [x_min, x_max] by tau/x_min, alpha/x_min at omega_p = beta*x_min, so absolute error scales as max_error/x_min. The rescale_max_error_ratio field is that claim, measured over eleven decades of x_min."
+  },
+  "selection_rule": {
+    "range": "smallest_tabulated_ge_requested",
+    "error_bound": "largest_tabulated_le_requested",
+    "max_nodes": "table_node_count_must_not_exceed_request",
+    "beta": "|requested - entry beta| <= entry beta_tolerance, a MEASURED two-sided band and not a rounding rule. The target is a different function at every beta, so no direction is conservative; but d/dbeta of the target has modulus 1/(1 + beta^2) at the hard end of the interval, so an entry absorbs a mismatch of about error_bound*(1 + beta^2) -- 2.6e-4 at beta = 16 and the 1e-6 tier. Entries whose beta_axis is 'exact_phase_on_fixed_nodes' additionally serve the whole band [beta_min, beta] exactly, because there beta enters only as a unit-modulus phase on nodes chosen without reference to it."
+  },
+  "shipping_rule": {
+    "source": "MPA_THEORY_PLAN.md section E",
+    "kappa0_definition": "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
+    "kappa0_reference": "the pure-damping envelope integral 1/u, which is the same normalisation gw.mpa.evaluator.damped_line_rule uses for the strip; every certified shipped noncrossing table measures between 1.0000 and 1.0215 under it.",
+    "normal": 2.0,
+    "versioned_exception": 4.0,
+    "rejected_above": 4.0
+  },
+  "certification": {
+    "held_out_grid": "half-cell-offset log grid of 20001 points plus both endpoints, disjoint from every grid the solver saw",
+    "checks": [
+      "held_out_error",
+      "real_part_error",
+      "kappa0",
+      "moment",
+      "rescale",
+      "positive_nodes"
+    ],
+    "byte_identity": "payload_sha256 is SHA-256 over the little-endian float64 tau bytes followed by the complex128 alpha bytes. Cross-platform agreement is asserted on the TABLE, not on a re-solve."
+  },
+  "provenance": {
+    "tool": "tools/generate_imag_minimax_assets.py",
+    "tool_sha256": "44d2cc71b59a83b8cdc93efa7c233f4f4b4abe0179aa0a719ce540e57e1dd7f6",
+    "numpy": "2.4.3",
+    "scipy": "1.17.1",
+    "python": "3.12.3",
+    "lp_solver": "scipy.optimize.linprog(method='highs')",
+    "seed_policy": "no seed: both routes are deterministic convex programs or fixed Gauss-Legendre panels. The only randomness is the rescaling check's draw, which is seeded at 20260808 and is a test, not a solve."
+  },
+  "sweep": {
+    "solver_wall_seconds": 0.11,
+    "entries": 54,
+    "certified": 54,
+    "by_rule": {
+      "btv_minimax": 35,
+      "positive_composite": 19
+    },
+    "ledger": [
+      {
+        "range_max": 21.544346900318832,
+        "beta": 5.836,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 11,
+            "kappa0": 1.192864166736969,
+            "wall_s": 66.35
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 14.122,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 9,
+            "kappa0": 1.0864622436290714,
+            "wall_s": 65.6
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.006,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 9,
+            "kappa0": 1.2009651115065962,
+            "wall_s": 76.07
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.372,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.2057135074848002,
+            "wall_s": 75.06
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 39.284,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 6,
+            "kappa0": 1.2424267331063745,
+            "wall_s": 74.58
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 40.214,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 6,
+            "kappa0": 1.2446037941825576,
+            "wall_s": 78.52
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 5.836,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.2666581195423352,
+            "wall_s": 78.54
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 14.122,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.1473937186199925,
+            "wall_s": 78.24
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.006,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.0901907959138029,
+            "wall_s": 77.73
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.372,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.0769154335200826,
+            "wall_s": 77.88
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 39.284,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.2545374707946695,
+            "wall_s": 80.15
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 40.214,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 7,
+            "kappa0": 1.3519483518173245,
+            "wall_s": 105.41
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 5.836,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 14,
+            "kappa0": 1.1288709843960951,
+            "wall_s": 123.53
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 14.122,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.146496690004666,
+            "wall_s": 89.84
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.006,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.1256054488424634,
+            "wall_s": 74.75
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.372,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.1275154601124242,
+            "wall_s": 78.29
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 39.284,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "infeasible",
+            "wall_s": 15.54
+          },
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 4.0,
+            "outcome": "infeasible",
+            "wall_s": 13.76
+          },
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 566,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 40.214,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.1597757274434621,
+            "wall_s": 64.39
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 11,
+            "kappa0": 1.1884699074535148,
+            "wall_s": 69.35
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 9,
+            "kappa0": 1.1211085402143137,
+            "wall_s": 66.63
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 9,
+            "kappa0": 1.2009660416765107,
+            "wall_s": 62.63
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.205789488803182,
+            "wall_s": 61.63
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 6,
+            "kappa0": 1.242483895985346,
+            "wall_s": 61.19
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 6,
+            "kappa0": 1.2446048626470598,
+            "wall_s": 60.92
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.1659310330692265,
+            "wall_s": 61.23
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.1474240587429874,
+            "wall_s": 61.23
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.0901899963278043,
+            "wall_s": 60.7
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 10,
+            "kappa0": 1.0769206686643917,
+            "wall_s": 60.86
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.2546533530344839,
+            "wall_s": 61.34
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 7,
+            "kappa0": 1.351946803262871,
+            "wall_s": 64.37
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 14,
+            "kappa0": 1.1288923255076675,
+            "wall_s": 61.26
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.1468249458013926,
+            "wall_s": 60.99
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.125605003226598,
+            "wall_s": 60.8
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.1275205158468273,
+            "wall_s": 60.64
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 9,
+            "kappa0": 1.412657461202947,
+            "wall_s": 61.07
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-06,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 8,
+            "kappa0": 1.1597758107432912,
+            "wall_s": 61.04
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 238,
+            "kappa0": 1.0000000000000007,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 514,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 580,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 586,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1374,
+            "kappa0": 1.000000000000001,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 21.544346900318832,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1408,
+            "kappa0": 1.000000000000001,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 246,
+            "kappa0": 1.0000000000000004,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 524,
+            "kappa0": 1.0000000000000007,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 588,
+            "kappa0": 1.0000000000000007,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 598,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1380,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 46.41588833612777,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1412,
+            "kappa0": 1.000000000000001,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 5.836621296663787,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 254,
+            "kappa0": 1.0000000000000004,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 14.122598275630752,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 532,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.00601826286684,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 596,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 16.37183716570755,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 606,
+            "kappa0": 1.0000000000000007,
+            "wall_s": 0.0
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 39.28038337654175,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1392,
+            "kappa0": 1.000000000000001,
+            "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 100.0,
+        "beta": 40.21393815096312,
+        "error_bound": 1e-12,
+        "attempts": [
+          {
+            "rule": "positive_composite",
+            "kappa_cap": 4.0,
+            "outcome": "pass",
+            "node_count": 1420,
+            "kappa0": 1.0000000000000009,
+            "wall_s": 0.01
+          }
+        ]
+      }
+    ]
+  },
+  "tables": [
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 5.836,
+      "beta_min": 5.836,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 11,
+      "max_error": 4.7140090797195464e-07,
+      "real_part_max_error": 3.394852180968466e-07,
+      "kappa0": 1.192864166736969,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 1.9172271476541225,
+      "moment_residual": 4.6190519303764465e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999977099009488,
+      "certified": true,
+      "payload_sha256": "15e49d4622bdb7d426a98d76c9646e5f04f4d22b22c8b87f99ab58bcad94f6f9",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_5p8360_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 1.9131898880004884e-05
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 5.836621296663787,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 11,
+      "max_error": 4.2078251197263305e-07,
+      "real_part_max_error": 2.9478799025428604e-07,
+      "kappa0": 1.1884699074535148,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 1.9194592740770315,
+      "moment_residual": 3.283561966113455e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999960686102042,
+      "beta_tolerance": 2.1221274083643618e-05,
+      "certified": true,
+      "payload_sha256": "94b7c549c8e78ad4a2401f3f2c5711a9513f6d960089c91d08e0f5fcb875bb3c",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_5p836621296664_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 14.122,
+      "beta_min": 14.122,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 9,
+      "max_error": 3.618720198647879e-07,
+      "real_part_max_error": 2.768142544655114e-07,
+      "kappa0": 1.0864622436290714,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.7002795020279292,
+      "moment_residual": 3.9914735686706646e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999235498725,
+      "certified": true,
+      "payload_sha256": "f4148afabb6ed8aed548fea4a7674bf6451b2241b545663dab14bfe3583f5f92",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_14p1220_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00013299441337585448
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 14.122598275630752,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 9,
+      "max_error": 4.604015641930611e-07,
+      "real_part_max_error": 3.637937550406145e-07,
+      "kappa0": 1.1211085402143137,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6588454409832,
+      "moment_residual": 3.8187464162196514e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 1.0000000000821772,
+      "beta_tolerance": 0.00011868991594695663,
+      "certified": true,
+      "payload_sha256": "f815e422f4ace189dfebdb9cfc55c557b3c3d6580ab5a482a82e5530da6dbdbc",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_14p122598275631_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.006,
+      "beta_min": 16.006,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 9,
+      "max_error": 4.1897765416695106e-07,
+      "real_part_max_error": 3.1201848123274534e-07,
+      "kappa0": 1.2009651115065962,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6962780586588563,
+      "moment_residual": 3.5277478802434156e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999387655829,
+      "certified": true,
+      "payload_sha256": "2e7cb76ce118ef069df4059a46e2ea7b369219d4fc820d042a689c31ec5ecadb",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p0060_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00018699026107788086
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 16.00601826286684,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 9,
+      "max_error": 4.1899534761689705e-07,
+      "real_part_max_error": 3.120186519746382e-07,
+      "kappa0": 1.2009660416765107,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6962788431602122,
+      "moment_residual": 3.5274811825762145e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999316468938,
+      "beta_tolerance": 0.0001869904744340122,
+      "certified": true,
+      "payload_sha256": "ac2b8616deec26949131809f614d4a27d69e6f961076e44ee0605074e00e3cfd",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p006018262867_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 16.37183716570755,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 7.895293011003466e-07,
+      "real_part_max_error": 6.004928362925155e-07,
+      "kappa0": 1.205789488803182,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6697705164473706,
+      "moment_residual": 4.300111539159077e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999998808967774,
+      "beta_tolerance": 7.70911655480204e-05,
+      "certified": true,
+      "payload_sha256": "d0fc29fea1c6dea0e3c0ced3c194feff24de326dc0eb9ea532fd9b5efeb1692c",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p371837165708_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.372,
+      "beta_min": 16.372,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 7.910224749099639e-07,
+      "real_part_max_error": 5.927199558629359e-07,
+      "kappa0": 1.2057135074848002,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6696301469125643,
+      "moment_residual": 4.109062561060171e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999086601219,
+      "certified": true,
+      "payload_sha256": "867f73a3acb028c43e9e427cf5883cedce3004318c2947753f2bb6ef884d3a84",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p3720_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 7.709193229675292e-05
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 39.28038337654175,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 6,
+      "max_error": 3.771731187970271e-07,
+      "real_part_max_error": 2.791322492945794e-07,
+      "kappa0": 1.242483895985346,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.17945269523074356,
+      "moment_residual": 5.04865753750863e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999901879101,
+      "beta_tolerance": 0.0010208038778407695,
+      "certified": true,
+      "payload_sha256": "00a2332f0469da0e6dc0e77553f4f9b7f3040c5850f68d80cf6b119d43360e46",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_39p280383376542_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 39.284,
+      "beta_min": 39.284,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 6,
+      "max_error": 3.770989142337743e-07,
+      "real_part_max_error": 2.789833770892175e-07,
+      "kappa0": 1.2424267331063745,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.17942072289711142,
+      "moment_residual": 5.047619445817106e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999968343573,
+      "certified": true,
+      "payload_sha256": "9ca29f2ff294545abe77dde7268c88e4edc46a50a626517ee1f6ce71bf0431de",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_39p2840_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0010208978652954102
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 40.21393815096312,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 6,
+      "max_error": 3.611487995028928e-07,
+      "real_part_max_error": 3.0543978624683957e-07,
+      "kappa0": 1.2446048626470598,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.17833221692567744,
+      "moment_residual": 6.105494474356614e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999075700662,
+      "beta_tolerance": 0.0011241636868001047,
+      "certified": true,
+      "payload_sha256": "6e9eabffa59e91e7b9119b67b9b361034c1ca700f20fc2e7b2c86c49647bda51",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_40p213938150963_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 40.214,
+      "beta_min": 40.214,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 6,
+      "max_error": 3.611454829825446e-07,
+      "real_part_max_error": 3.0543658467848886e-07,
+      "kappa0": 1.2446037941825576,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.178331692416497,
+      "moment_residual": 6.10546091500535e-07,
+      "moment_ceiling": 5.136086725079707e-06,
+      "rescale_max_error_ratio": 0.9999999091306178,
+      "certified": true,
+      "payload_sha256": "dfedb383636b7634e50f94054e2bd8c469b5770695920b7f37f9c3efc825ad6a",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_40p2140_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00046415888336127795,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.001124165415763855
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 5.836,
+      "beta_min": 5.836,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 5.312096181868917e-07,
+      "real_part_max_error": 3.88225862499314e-07,
+      "kappa0": 1.2666581195423352,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 2.8556506093790586,
+      "moment_residual": 7.550739505612946e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999973478132352,
+      "certified": true,
+      "payload_sha256": "9291a84203e812e776cd1e47e61fb2c23e4f7cd1110b2b03ced2259e530e8d15",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_5p8360_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 1.739263534545899e-05
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 5.836621296663787,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 6.399641876493668e-07,
+      "real_part_max_error": 5.04341399976127e-07,
+      "kappa0": 1.1659310330692265,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 2.459852034508099,
+      "moment_residual": 1.1595360101659844e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.999998794645159,
+      "beta_tolerance": 1.809026643195849e-05,
+      "certified": true,
+      "payload_sha256": "0fb6e5782807a1ec549e729dcce4e9eb33ce8103ef2d136c99633a05bbf9f30a",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_5p836621296664_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 14.122,
+      "beta_min": 14.122,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 3.7299216562804123e-07,
+      "real_part_max_error": 2.656540334794455e-07,
+      "kappa0": 1.1473937186199925,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.9618650287462914,
+      "moment_residual": 1.375238390336031e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.999999110698377,
+      "certified": true,
+      "payload_sha256": "5ee44470d616f8f3a123127fb61811d993c1a7e9af5cc24e6970157d5b402dd1",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_14p1220_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00014309525489807128
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 14.122598275630752,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 3.730756934808944e-07,
+      "real_part_max_error": 2.657380736292847e-07,
+      "kappa0": 1.1474240587429874,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.9619021023080313,
+      "moment_residual": 1.3812929170342826e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999992332039566,
+      "beta_tolerance": 0.0001431013170991676,
+      "certified": true,
+      "payload_sha256": "79baf7981a5a5c229ecde1137d8309b781a4f63f63219c0bc342e20875c60541",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_14p122598275631_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.006,
+      "beta_min": 16.006,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 5.655811304755775e-07,
+      "real_part_max_error": 4.5199399758069636e-07,
+      "kappa0": 1.0901907959138029,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6697623624068708,
+      "moment_residual": 1.4322892261462423e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999987891349428,
+      "certified": true,
+      "payload_sha256": "907ebc16e37015cd4838be97fb81f478cec672d3832b96efbac170b04c696a6d",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p0060_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0001240241527557373
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 16.00601826286684,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 5.655802014148466e-07,
+      "real_part_max_error": 4.519924975583678e-07,
+      "kappa0": 1.0901899963278043,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6697596827323422,
+      "moment_residual": 1.433413189126323e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999987973687828,
+      "beta_tolerance": 0.00012402429426745706,
+      "certified": true,
+      "payload_sha256": "65b1e675ab8b93fa081079e4930ce73dd590154e9199cf1d5c924cd4763b2e8e",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p006018262867_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 16.37183716570755,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 4.423469453644734e-07,
+      "real_part_max_error": 3.5440468958668203e-07,
+      "kappa0": 1.0769206686643917,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6587219042292771,
+      "moment_residual": 5.51258987155019e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.99999792593111,
+      "beta_tolerance": 0.00016491654402044873,
+      "certified": true,
+      "payload_sha256": "122705d1b199f36755595b2ff0451461fcd68eaddf796d077b1b7047af20ca61",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p371837165708_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.372,
+      "beta_min": 16.372,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 10,
+      "max_error": 4.423346094914263e-07,
+      "real_part_max_error": 3.5439011101569273e-07,
+      "kappa0": 1.0769154335200826,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6587061007536766,
+      "moment_residual": 5.520390151534208e-07,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.999997864001881,
+      "certified": true,
+      "payload_sha256": "31578bc95cf5f7f12e4be73403e31cfd93b6d707b4436b6f7d2a03072a1c8dce",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p3720_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0001649181842803955
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 39.28038337654175,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 2.8592728646950737e-07,
+      "real_part_max_error": 2.666056036961656e-07,
+      "kappa0": 1.2546533530344839,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.25870999412979934,
+      "moment_residual": 1.4396408404469262e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999999202791298,
+      "beta_tolerance": 0.0012432267411317628,
+      "certified": true,
+      "payload_sha256": "5f73b4d0e503b9fd30e3f6b826ee29a924172719fda9d10587b34eb99345f550",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_39p280383376542_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 39.284,
+      "beta_min": 39.284,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 2.8570066162239117e-07,
+      "real_part_max_error": 2.665169569725234e-07,
+      "kappa0": 1.2545374707946695,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.2586654005155159,
+      "moment_residual": 1.4381453564397668e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999999718803766,
+      "certified": true,
+      "payload_sha256": "750190efec286261e07d47701c68580802070404ee3f8e63b26337dac4f4fd95",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_39p2840_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0012433412075042722
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 40.21393815096312,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 7,
+      "max_error": 7.832454760000636e-07,
+      "real_part_max_error": 5.722410288616989e-07,
+      "kappa0": 1.351946803262871,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.2217392527080502,
+      "moment_residual": 4.163907431340381e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999989575023647,
+      "beta_tolerance": 0.0003835099997612297,
+      "certified": true,
+      "payload_sha256": "956f9e43627761cde054c0e7bf8d30cfb75ccf13eae15dfed093812e54122a88",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_40p213938150963_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 40.214,
+      "beta_min": 40.214,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 7,
+      "max_error": 7.825098819635645e-07,
+      "real_part_max_error": 5.712621401090905e-07,
+      "kappa0": 1.3519483518173245,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.22173961621920826,
+      "moment_residual": 4.15001733407196e-06,
+      "moment_ceiling": 1.1353972084031942e-05,
+      "rescale_max_error_ratio": 0.9999990502311309,
+      "certified": true,
+      "payload_sha256": "45431f9e7b522a4359eb7dad441616e08317f28014107592215272e93864e903",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_40p2140_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.0002154434690031884,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0003859075307846069
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 5.836,
+      "beta_min": 5.836,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 14,
+      "max_error": 5.742125643891799e-07,
+      "real_part_max_error": 4.4219938560852157e-07,
+      "kappa0": 1.1288709843960951,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 1.9980961615627686,
+      "moment_residual": 2.5108084473750954e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 0.9999974788406107,
+      "certified": true,
+      "payload_sha256": "93667a0fef426ab59309842b49b60111d584fb5efcec325307f327ac3b4b33f8",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_5p8360_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 2.0523309707641606e-05
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 5.836621296663787,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 14,
+      "max_error": 5.740184542138251e-07,
+      "real_part_max_error": 4.422441999413218e-07,
+      "kappa0": 1.1288923255076675,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 1.9977558743676134,
+      "moment_residual": 2.5108361382996775e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 0.9999980148347176,
+      "beta_tolerance": 2.0525494605491367e-05,
+      "certified": true,
+      "payload_sha256": "ff6f44f5dc700b131efea1fefd574d81fa9aa0ab435e46479977c49437c041c0",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_5p836621296664_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 14.122,
+      "beta_min": 14.122,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 5.14699032303115e-07,
+      "real_part_max_error": 3.712150461951391e-07,
+      "kappa0": 1.146496690004666,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.9468680797734129,
+      "moment_residual": 5.2965840278231e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 0.9999936470062686,
+      "certified": true,
+      "payload_sha256": "d03c27e8c35d7f9dd56e3d841e9275926dbf5262b5d1dc58426825c6d5a10d5c",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_14p1220_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00011195099353790284
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 14.122598275630752,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 4.9941539405024e-07,
+      "real_part_max_error": 3.7109833673013015e-07,
+      "kappa0": 1.1468249458013926,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.9465329678095984,
+      "moment_residual": 7.268296339205156e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.000000000003817,
+      "beta_tolerance": 0.00011195573631876052,
+      "certified": true,
+      "payload_sha256": "50283f20970c6eee32276d41ef4810f57c792320d6c5114e09d183b6a0721916",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_14p122598275631_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.006,
+      "beta_min": 16.006,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 3.9916017255276944e-07,
+      "real_part_max_error": 2.869281142160729e-07,
+      "kappa0": 1.1256054488424634,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.7985207330548916,
+      "moment_residual": 1.7971646876867617e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.000000136001338,
+      "certified": true,
+      "payload_sha256": "6b6205bc0c41676ba278ab6b2f06cdf22675217e1bff18a6e5c44e2892dac030",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p0060_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00016695559024810792
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 16.00601826286684,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 3.991567972015795e-07,
+      "real_part_max_error": 2.869252652571569e-07,
+      "kappa0": 1.125605003226598,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.7985179897424959,
+      "moment_residual": 1.7971088223608735e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.000000135812844,
+      "beta_tolerance": 0.00016695578074465376,
+      "certified": true,
+      "payload_sha256": "e55d258562347bf85bc28e7eca5182b3d6c505ed48b7ed96e417d35a27e5dcce",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p006018262867_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 16.37183716570755,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 3.422135632284277e-07,
+      "real_part_max_error": 2.7943422820780883e-07,
+      "kappa0": 1.1275205158468273,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.7868234378925383,
+      "moment_residual": 7.133889576336693e-07,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 0.9999999263910229,
+      "beta_tolerance": 0.00019516750771650734,
+      "certified": true,
+      "payload_sha256": "c7b455c8656fec72557eddf8f8f96a659123eb1eaea468e70189f617d662daae",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p371837165708_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.372,
+      "beta_min": 16.372,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 3.4218515877093025e-07,
+      "real_part_max_error": 2.794065277061941e-07,
+      "kappa0": 1.1275154601124242,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.7867993943188664,
+      "moment_residual": 7.142641179824053e-07,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 0.9999999232297413,
+      "certified": true,
+      "payload_sha256": "35a89712b90a939130748c00676e01d9a4ede97b1efcdb3f9fa4b1aadc786a99",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p3720_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.00019516944885253907
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 39.28038337654175,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 9,
+      "max_error": 5.537628851362556e-07,
+      "real_part_max_error": 4.456341192587976e-07,
+      "kappa0": 1.412657461202947,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.3300931941581619,
+      "moment_residual": 1.42279223991988e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.0000000000287508,
+      "beta_tolerance": 0.0007983810145497761,
+      "certified": true,
+      "payload_sha256": "cb797909824ec03a421b9db06197b224e301b6029d2f55fd58829e91f3635f54",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_39p280383376542_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 400,
+        "dictionary_retries": 1,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 39.284,
+      "beta_min": 0.0,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 566,
+      "max_error": 6.639095056964643e-08,
+      "real_part_max_error": 6.563311269122685e-08,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 15.201804919084164,
+      "moment_residual": 1.601547033273154e-08,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.0000000001889284,
+      "certified": true,
+      "payload_sha256": "f388b1c0df7b2c2e410aecbf129790df14e4a24529afa9002aa674c893b3d0b4",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_39p2840_eps_1p0em06.npz",
+      "generation": {
+        "t_max": 15.201804919084164,
+        "n_panels": 100,
+        "panel_orders": [
+          4,
+          8
+        ],
+        "sum_h": 15.201804919084164,
+        "beta_min": 0.0
+      },
+      "beta_tolerance": 0.0015196392536163334
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 40.21393815096312,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 7.243187576835051e-07,
+      "real_part_max_error": 6.002637534512772e-07,
+      "kappa0": 1.1597758107432912,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.2754426876921837,
+      "moment_residual": 3.0381728235633643e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.0000000000247444,
+      "beta_tolerance": 0.0005441048121612448,
+      "certified": true,
+      "payload_sha256": "fad2b58ebe976f5bb8d9283570b030ea61c15fd34f7bbfa528db77045993b5b3",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_40p213938150963_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 40.214,
+      "beta_min": 40.214,
+      "error_bound": 1e-06,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 8,
+      "max_error": 7.243098279874177e-07,
+      "real_part_max_error": 6.002520276330442e-07,
+      "kappa0": 1.1597757274434621,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.2754425688557888,
+      "moment_residual": 3.0380586552926654e-06,
+      "moment_ceiling": 2.475e-05,
+      "rescale_max_error_ratio": 1.000000000019571,
+      "certified": true,
+      "payload_sha256": "7ace8fad6faa9b6d38fa951e870b34e95df3407048232121a0da8d3be5ff5a49",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_40p2140_eps_1p0em06.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_range": [
+          0.00010000000000000009,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 5.5e-07,
+        "reweight_rounds": 5
+      },
+      "beta_tolerance": 0.0005441056489944459
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 238,
+      "max_error": 7.695096194946137e-14,
+      "real_part_max_error": 2.9341112872671715e-14,
+      "kappa0": 1.0000000000000007,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 1.0886980803209723e-14,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.0029907098742108,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "2d5792c01c5219f2c99ad5f3acbdddfce4edf8bee041846191b2dd8d4b04a147",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_5p836621296664_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 32,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.01731547704844,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 514,
+      "max_error": 5.799702872932225e-14,
+      "real_part_max_error": 3.175584795123143e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 2.5170496906211946e-15,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.0019464702620964,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "67c6aac64df37b3584df2e0beb04dbc5879a638dfb5a53ceb265850bb036424f",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_14p122598275631_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 69,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 580,
+      "max_error": 3.727562757531976e-14,
+      "real_part_max_error": 3.6265695307902135e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 3.2215603803613454e-15,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.0009519379007767,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "e50392d4970fbef868ccb15f207d083f54c406e866924ab0a0920c4c42d74037",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p006018262867_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 78,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 586,
+      "max_error": 5.440143123988793e-14,
+      "real_part_max_error": 4.423328023306361e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.01731547704844,
+      "moment_residual": 5.6664895687563036e-15,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.0007577249379844,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "da8da0aef772c82c20af1739fdc3f4bd310285ed4a31b09c69a576447b1aa81a",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_16p371837165708_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 79,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.01731547704844,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1374,
+      "max_error": 6.341214531120001e-14,
+      "real_part_max_error": 1.666299476871247e-14,
+      "kappa0": 1.000000000000001,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 7.321845092596903e-15,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.001197932936779,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "9d7c08471465ee81e74999dec6df8a98439da29263f8d0bb8cf56ee7346831af",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_39p280383376542_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 184,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 21.544346900318832,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1408,
+      "max_error": 5.450020376361357e-14,
+      "real_part_max_error": 3.627957309570995e-15,
+      "kappa0": 1.000000000000001,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 8.474182240805184e-15,
+      "moment_ceiling": 5.136086725079708e-12,
+      "rescale_max_error_ratio": 1.000543572373486,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "056020b4dd00e1ba2efe875ce84b842ec68a387f677b3e356e4b9b0a653fde25",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_21p544347_b_40p213938150963_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 188,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 246,
+      "max_error": 7.861165266615267e-14,
+      "real_part_max_error": 4.9883708275189065e-14,
+      "kappa0": 1.0000000000000004,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.01731547704844,
+      "moment_residual": 5.611581615037378e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 1.001546307754052,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "d7fae04fc6722c5ac12404e7491e300bcb1be861e7fddd0577e167d4f7997304",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_5p836621296664_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 33,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.01731547704844,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 524,
+      "max_error": 4.375776805880916e-14,
+      "real_part_max_error": 2.5292268279741847e-15,
+      "kappa0": 1.0000000000000007,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 1.385423108662431e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 0.9999283979001925,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "3cb5210e2afbef8125c56d92dfe67f7dc5115a40bdee3f97cbb5a47f66d0421f",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_14p122598275631_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 70,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 588,
+      "max_error": 5.2440874307803165e-14,
+      "real_part_max_error": 2.579533808777512e-14,
+      "kappa0": 1.0000000000000007,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 1.8580238255935936e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 0.9994223968866066,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "2f3fc6861d8db4f292675a675a0ba50aa49d15fdc0ed3944ca977c06082302d8",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p006018262867_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 79,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 598,
+      "max_error": 3.269362493958013e-14,
+      "real_part_max_error": 3.0357660829594124e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 1.8741406512043205e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 1.0011194927003273,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "bb1ca08d727a0251b45ad9fc78877dc0b6845c9096af095f8ff56993725c4c09",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_16p371837165708_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 80,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1380,
+      "max_error": 6.164442146686847e-14,
+      "real_part_max_error": 4.181908725559014e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 1.2270978232071462e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 1.0005509389499887,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "e2b18ce9c815072a0ca1ae5341c7003aa0ebc1c2c5ef7575135c3b6f81f9351c",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_39p280383376542_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 185,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 46.41588833612777,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1412,
+      "max_error": 5.131501476851614e-14,
+      "real_part_max_error": 2.41253414814957e-14,
+      "kappa0": 1.000000000000001,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 1.3345785898812088e-14,
+      "moment_ceiling": 1.1353972084031943e-11,
+      "rescale_max_error_ratio": 1.000726542167446,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "f95540b77957fb89ae433eae40fa92ec50ce11ed2bdafc6a46776090d721d26d",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_46p415888_b_40p213938150963_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 189,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 5.836621296663787,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 254,
+      "max_error": 7.326253160424943e-14,
+      "real_part_max_error": 6.121839146722152e-14,
+      "kappa0": 1.0000000000000004,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 5.887799407754644e-13,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0007370649608158,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "06e9b7eb3ee7c2fd013909779881891979dd28cc5dffb3009844f5dd22f4ac19",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_5p836621296664_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 34,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 14.122598275630752,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 532,
+      "max_error": 3.357671470141642e-14,
+      "real_part_max_error": 2.2233950791594737e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 5.717422216188117e-14,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.002735134374255,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "7e1f5aea13dca60a8650cec3b6476820e6f02aff7ea9ab0b9b4223e1aab4c1dc",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_14p122598275631_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 71,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.00601826286684,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 596,
+      "max_error": 6.303195989873342e-14,
+      "real_part_max_error": 7.461045670176247e-15,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 5.700322247392618e-14,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0010219100136426,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "c60bcf214646b8d86b659314e6d5fd43673fb3ffa4333f7a5fda242430bf71e7",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p006018262867_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 80,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 16.37183716570755,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 606,
+      "max_error": 3.518652245133447e-14,
+      "real_part_max_error": 5.195496810550537e-15,
+      "kappa0": 1.0000000000000007,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 5.880829458754515e-14,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0016203951653213,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "a827ba5ae8bc98137d9a1b02c263cc357ad40306e1510e538d012691bb44de96",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_16p371837165708_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 81,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 39.28038337654175,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1392,
+      "max_error": 5.576274867807581e-14,
+      "real_part_max_error": 5.165149991742668e-14,
+      "kappa0": 1.000000000000001,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048438,
+      "moment_residual": 1.910358019528985e-14,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0003479029291031,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "b393e3a256a2136cf91791743ae0134a7a2cbe6b8d4e87296190f46311fd4ec9",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_39p280383376542_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 186,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048438,
+        "beta_min": 0.0
+      }
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "positive_composite",
+      "range_param": "R",
+      "range_max": 100.0,
+      "beta_param": "omega_hat",
+      "beta": 40.21393815096312,
+      "beta_min": 0.0,
+      "error_bound": 1e-12,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 1420,
+      "max_error": 4.9447258686115844e-14,
+      "real_part_max_error": 4.246646437278123e-14,
+      "kappa0": 1.0000000000000009,
+      "kappa0_bound": 1.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 29.017315477048435,
+      "moment_residual": 1.8893373431245885e-14,
+      "moment_ceiling": 2.475e-11,
+      "rescale_max_error_ratio": 1.0005392643817554,
+      "beta_tolerance": 0.0,
+      "certified": true,
+      "payload_sha256": "1da2095aaa790bc4a1e2070f03c27fc476552cf1b9f48413cf1f81dcf06c3d18",
+      "beta_axis": "exact_phase_on_fixed_nodes",
+      "file": "complex_laplace/complex_laplace_R_100p000000_b_40p213938150963_eps_1p0em12.npz",
+      "generation": {
+        "t_max": 29.017315477048438,
+        "n_panels": 190,
+        "panel_orders": [
+          4,
+          10
+        ],
+        "sum_h": 29.017315477048435,
+        "beta_min": 0.0
+      }
+    }
+  ]
+}

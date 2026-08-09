@@ -54,7 +54,8 @@ import numpy as np
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
-_ASSETS = _REPO / "src" / "common" / "minimax_assets"
+_ASSETS = (_REPO / "services" / "minimax" / "src" / "minimax"
+           / "minimax_assets")
 _CATALOG = _ASSETS / "catalog_complex_laplace.json"
 
 
@@ -103,13 +104,23 @@ ENTRIES = _entries() if _CATALOG.exists() else []
 # ---------------------------------------------------------------------------
 
 def test_the_catalog_covers_the_census_request_table():
-    """Three R buckets x six omega-hat points, which is the arming gap.
+    """Three R buckets, two beta grids, two tiers -- and why each exists.
 
-    ``MINIMAX_REQUEST_CENSUS.md`` sec 3.1 sizes the hole at exactly
-    this grid: the R axis rounds up so three buckets off the existing
-    half-decade ladder cover all seven in-tree deck spans, and six
-    distinct omega-hat values are demanded by those decks at
-    ``ppm_omega_p = 2 Ry``.
+    ``MINIMAX_REQUEST_CENSUS.md`` sec 3.1 sizes the arming hole at three
+    R buckets by six omega-hats: the R axis rounds up, so three buckets
+    off the existing half-decade ladder cover all seven in-tree deck
+    spans.  The beta axis turned out to need TWO grids and the reason is
+    the campaign's subject.  The census DISPLAYS its six omega-hats to
+    three decimals, and the first sweep took the display for the
+    specification; the beta selector then scored the decks at
+    ``2 Ry / x_min`` and four of seven missed their nearest band.  Both
+    grids are kept: the rounded one because it is certified and other
+    cells pin behaviour against it, the full-precision one because it is
+    what a request actually carries.
+
+    And two tiers, which are two different consumers: 1e-6 is
+    production's -- C sec 2.6 measured that no in-tree request has ever
+    asked for another -- and 1e-12 is the MPA fit stage's alone.
     """
 
     doc = _catalog()
@@ -117,9 +128,19 @@ def test_the_catalog_covers_the_census_request_table():
     assert doc["family"] == "complex_laplace"
     got_r = sorted({e["range_max"] for e in doc["tables"]})
     got_b = sorted({e["beta"] for e in doc["tables"]})
+    tiers = sorted({e["error_bound"] for e in doc["tables"]})
     assert got_r == sorted(gen.CENSUS_R_BUCKETS)
-    assert got_b == sorted(gen.CENSUS_OMEGA_HAT)
-    assert len(doc["tables"]) == len(got_r) * len(got_b)
+    assert tiers == sorted({1.0e-6, gen.FIT_STAGE_ERROR_BOUND})
+    # Both beta grids are present in full.
+    assert set(gen.CENSUS_OMEGA_HAT) <= set(got_b)
+    assert set(gen.FULL_PRECISION_OMEGA_HAT) <= set(got_b)
+    # Every deck's own omega-hat is tabulated at every R bucket, at both
+    # tiers -- which is what makes the R axis's rounding usable.
+    for beta in gen.DECK_OMEGA_HAT.values():
+        for tier in tiers:
+            covered = {e["range_max"] for e in doc["tables"]
+                       if e["beta"] == beta and e["error_bound"] == tier}
+            assert covered == set(gen.CENSUS_R_BUCKETS), (beta, tier)
     assert all(e["certified"] for e in doc["tables"])
 
 
@@ -236,8 +257,14 @@ def test_red_twin_wrong_beta_fails_because_the_target_moved():
     """
 
     entry = _first("btv_minimax")
+    # A NEIGHBOUR, NOT MERELY A DIFFERENT NUMBER.  The catalog now holds
+    # the census's rounded grid and the decks' full-precision omega-hats
+    # side by side, and those pairs differ by less than a band -- which
+    # is the whole reason the band is measured.  The twin has to move
+    # beta by more than any band to be testing what it claims.
     betas = sorted({e["beta"] for e in _entries()})
-    other = next(b for b in betas if b != entry["beta"])
+    other = next(b for b in betas
+                 if abs(b - entry["beta"]) > 100.0 * entry["beta_tolerance"])
     tau, alpha, _, _ = _load(entry)
     cert = gen.certify(tau, alpha, entry["range_max"], other,
                        entry["error_bound"], kappa_max=gen.KAPPA_EXCEPTION)
@@ -398,7 +425,7 @@ def test_certify_refuses_a_negative_node():
 
 @pytest.mark.parametrize("entry", ENTRIES, ids=_ids(ENTRIES))
 def test_the_real_part_is_the_noncrossing_imag_target(entry):
-    """``alpha.real`` fits ``common.minimax._imag_target`` at this beta.
+    """``alpha.real`` fits ``minimax._imag_target`` at this beta.
 
     R4's "one campaign" claim, discharged against the production
     module's own target function rather than against a restatement of
@@ -407,7 +434,7 @@ def test_the_real_part_is_the_noncrossing_imag_target(entry):
     merely a similar one.
     """
 
-    from common import minimax as production            # noqa: PLC0415
+    import minimax as production                        # noqa: PLC0415
 
     tau, alpha, _, _ = _load(entry)
     x = gen.held_out_grid(entry["range_max"], 4001)
@@ -502,7 +529,7 @@ def test_the_shipped_entry_beats_the_runtime_solve_on_amplification():
     compared is a solve and not an artefact from April.
     """
 
-    from common import minimax as production            # noqa: PLC0415
+    import minimax as production                        # noqa: PLC0415
 
     os.environ["LORRAX_DISABLE_MINIMAX_DISK_CACHE"] = "1"
     worst_ratio = 0.0
@@ -548,6 +575,31 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
     here) and stopped being a statement about quadrature at all --
     which is why the assertion is against ``worst_synth`` and not
     against an absolute number that would drift with the fixture.
+
+    AND UNTIL THIS COMMIT IT ALSO CARRIED AN ABSOLUTE 1e-8 THAT DID NOT
+    MEAN THAT, which is the registered open row.  The absolute bar asked
+    the sampled fit to beat, by nearly an order of magnitude, a floor the
+    EXACT fit does not reach on this host: `worst_synth` is 8.65e-08
+    here, so `worst_eval < 1e-8` was unsatisfiable no matter how good the
+    quadrature got.  It is removed, not widened.  The relative bar that
+    was already beside it is the whole assertion now, and it says what
+    the paragraph above always claimed it said.
+
+    THE TWO-HOST MEASUREMENT IS WHY THIS IS THE RIGHT SHAPE AND NOT JUST
+    THE CONVENIENT ONE.  The synthesis baseline is set by the Pade
+    fixture's conditioning, which is a property of the host's LAPACK, and
+    it moves by more than a decade between hosts.  Measured:
+
+        this host   recovery 9.98e-08   baseline 8.65e-08   ratio 1.15
+        the tables campaign's host
+                    recovery 3.33e-09   baseline 3.81e-09   ratio 0.87
+
+    The baselines are 23x apart; the RATIOS agree to within 30%, and the
+    absolute 1e-8 bar happens to fall between the two baselines -- which
+    is exactly why the same code passed that assertion on one host and
+    failed it on the other.  A bar on the ratio is a bar on the thing the
+    cell is about: whether the sampled fit has reached the exact fit's
+    floor.  A bar on the absolute error is a bar on whose machine it ran.
     """
 
     from gw.mpa import evaluator, pade_fit, sample_plan   # noqa: PLC0415
@@ -614,8 +666,144 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
           f"synthesis baseline of {worst_synth:.3e} at Pade condition "
           f"{cond:.2e}; {cost['kernel_nodes']} kernel nodes")
     assert sample_error < 1.0e-11
-    assert worst_eval < 1.0e-8
-    assert worst_eval < 2.0 * worst_synth
+    # RELATIVE TO THE CELL'S OWN SYNTHESIS BASELINE, and only that.  The
+    # absolute 1e-8 that used to sit here was below `worst_synth` on this
+    # host and above it on another; see the docstring.  2.0 covers the
+    # measured spread of 0.87 to 1.15 with ~1.7x of margin.
+    assert worst_eval < 2.0 * worst_synth, (
+        f"recovery {worst_eval:.3e} is {worst_eval / worst_synth:.2f}x the "
+        f"synthesis baseline {worst_synth:.3e}; the sampled fit has not "
+        f"reached the exact fit's floor")
+
+
+def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
+    """The same floor, but with the shipped catalog and selector in it.
+
+    The cell above generates its rule inline, which proves the physics
+    and nothing about the bundle.  This one asks the beta selector for a
+    ``1e-12`` table the way a driver would, gets one, and runs the fit
+    on it -- so what is measured is the artefact that ships.
+
+    THE FIXTURE'S REQUEST IS NOT ON THE GRID, AND THAT IS THE POINT.
+    The toy spectrum's transition span gives ``R = 11.67`` and the far
+    line gives ``beta = 3.33``, which is no deck's omega-hat and is
+    below every tabulated one.  It is served anyway, by the downward
+    rounding a ``positive_composite`` entry carries: those nodes were
+    chosen without reference to beta and beta enters only as the phase
+    ``e^{i beta t_l}``, so re-phasing an entry swept at a larger beta to
+    this one is the rule that route would have built here.  That is the
+    property the 1e-12 tier was generated to exploit, and this is it
+    being exploited.
+    """
+
+    # The selector moved into the service with the bundle it reads;
+    # reached off the DOOR, which is the production import edge.
+    import minimax as _mm                               # noqa: PLC0415
+    bs = _mm.beta_selector
+    from gw.mpa import evaluator, pade_fit, sample_plan  # noqa: PLC0415
+
+    n_p, tol = 8, gen.FIT_STAGE_ERROR_BOUND
+    rng = np.random.default_rng(3)
+    delta = np.linspace(0.6, 7.0, n_p)
+    weight = 0.2 + 0.6 * rng.random((n_p, 3))
+    plan = sample_plan.mpa_plan(n_p, float(delta.max()), energy_unit="Ry")
+    z = sample_plan.plan_z(plan)
+    original = evaluator.existing_kernel_rule
+    picked = {}
+
+    def from_catalog(point, *, delta_min, delta_max, target_error,
+                     max_nodes=64, use_shipped_tables=True):
+        if point["family"] != "exponential_sum_imag":
+            return original(point, delta_min=delta_min,
+                            delta_max=delta_max,
+                            target_error=target_error,
+                            max_nodes=max_nodes,
+                            use_shipped_tables=use_shipped_tables)
+        R = float(delta_max) / float(delta_min)
+        beta = float(point["varpi"]) / float(delta_min)
+        got = bs.select(range_value=R, beta=beta, beta_clause=bs.HEIGHT,
+                        target_error=tol, max_nodes=100000)
+        assert isinstance(got, bs.TableSelection), getattr(
+            got, "message", got)
+        picked.update(entry=got.entry, n=got.node_count,
+                      err=got.certified_error, line=got.one_line())
+        return {"t": got.tau / delta_min,
+                "h": np.real(got.alpha) / delta_min,
+                "n_nodes": got.node_count, "family": point["family"],
+                "max_error": got.certified_error / delta_min,
+                "delta_min": float(delta_min),
+                "delta_max": float(delta_max), "target_error": tol}
+
+    evaluator.existing_kernel_rule = from_catalog
+    try:
+        values, _cost = evaluator.evaluate_samples(
+            plan, delta, weight, rel_tol=tol, kernel_target_error=tol)
+    finally:
+        evaluator.existing_kernel_rule = original
+
+    values = np.asarray(values)
+    k = evaluator.damped_kernel(np.asarray(z)[:, None], delta)
+    exact = np.tensordot(k, weight, axes=(1, 0))
+
+    worst_eval = worst_synth = 0.0
+    for ch in range(weight.shape[1]):
+        om_e, b_e, _ = pade_fit.fit_mpa_poles(values[:, ch], z, n_p)
+        om_s, b_s, _ = pade_fit.fit_mpa_poles(exact[:, ch], z, n_p)
+        worst_eval = max(worst_eval,
+                         float(np.max(np.abs(np.asarray(om_e) - delta))),
+                         float(np.max(np.abs(np.asarray(b_e)
+                                             - weight[:, ch]))))
+        worst_synth = max(worst_synth,
+                          float(np.max(np.abs(np.asarray(om_s) - delta))),
+                          float(np.max(np.abs(np.asarray(b_s)
+                                              - weight[:, ch]))))
+
+    print(f"[imag tables] fit floor THROUGH THE DOOR: {picked['line']}")
+    print(f"[imag tables]   recovery {worst_eval:.3e} against a "
+          f"synthesis baseline of {worst_synth:.3e}")
+    assert picked["entry"]["error_bound"] == tol
+    assert picked["entry"]["rule"] == "positive_composite"
+    assert picked["entry"]["beta_axis"] == "exact_phase_on_fixed_nodes"
+    assert picked["err"] <= tol
+    # Relative, for the reason the sibling cell's docstring gives at
+    # length: the baseline is host conditioning and moves by a decade
+    # between machines, while the ratio does not.
+    assert worst_eval < 2.0 * worst_synth, (
+        f"recovery {worst_eval:.3e} is {worst_eval / worst_synth:.2f}x the "
+        f"synthesis baseline {worst_synth:.3e}")
+
+
+def test_the_catalog_carries_both_tiers_and_says_who_asks_for_each():
+    """Production has one tier and the fit stage has another.
+
+    C sec 2.6 measured that no in-tree request has ever asked for a tier
+    other than 1e-6, and build note V measured that the fit stage's floor
+    lives at 1e-12.  Both are in the catalog and they are not
+    interchangeable: the 1e-6 rows are minimax, because every node there
+    is one chi0 build repeated per q and per band pair, and the 1e-12
+    rows are composite, because the fit stage evaluates 2n_p samples once
+    and buys the beta envelope with the nodes it saves nothing on.
+    """
+
+    by_tier = {}
+    for entry in _entries():
+        by_tier.setdefault(entry["error_bound"], []).append(entry)
+    assert set(by_tier) == {1.0e-6, gen.FIT_STAGE_ERROR_BOUND}
+    for tier, rows in sorted(by_tier.items()):
+        rules = {r["rule"] for r in rows}
+        nodes = sorted(r["node_count"] for r in rows)
+        print(f"[imag tables] tier {tier:.0e}: {len(rows)} entries, "
+              f"rules {sorted(rules)}, nodes {nodes[0]}-{nodes[-1]}, "
+              f"kappa0 <= {max(r['kappa0'] for r in rows):.4f}")
+        assert all(r["certified"] for r in rows)
+        assert all(r["kappa0"] <= gen.KAPPA_EXCEPTION for r in rows)
+    # Every 1e-12 row is an envelope: it reaches down to beta = 0, which
+    # is what lets an off-grid fit-stage request be served at all.
+    for row in by_tier[gen.FIT_STAGE_ERROR_BOUND]:
+        assert row["rule"] == "positive_composite"
+        assert row["beta_min"] == 0.0
+        assert row["beta_axis"] == "exact_phase_on_fixed_nodes"
+        assert row["kappa0"] == pytest.approx(1.0, abs=1.0e-6)
 
 
 # ---------------------------------------------------------------------------

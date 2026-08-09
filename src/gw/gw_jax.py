@@ -17,9 +17,10 @@ in this file, in execution order:
     eqp0/eqp1/σ.dat = write_results(...)                   # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
-self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``) —
-and ``qp_solver`` — how QP energies are extracted from Σ
-(``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
+self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``,
+plus ``mpa``, which is declared on the axis and refused at entry until
+its Σ stage lands) — and ``qp_solver`` — how QP energies are extracted
+from Σ (``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
 self-consistent path iterates the same ``compute_sigma_xc`` dispatch;
 iteration 1 reproduces the one-shot result exactly (gated by
 ``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``).
@@ -66,7 +67,8 @@ from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
-from .gw_config import ComputeMode, LorraxConfig, QPSolver
+from .gw_config import (
+	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
@@ -167,9 +169,13 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 
 
 def main(argv=None):
-	argp = argparse.ArgumentParser(allow_abbrev=False,
-		description="LORRAX GW driver — COHSEX / GN-PPM / HL-PPM self-energy, "
-		            "one-shot or self-consistent (see gw_config.ComputeMode / QPSolver)")
+	_description = (
+		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM self-energy, "
+		"one-shot or self-consistent (see gw_config.ComputeMode / "
+		"QPSolver).  compute_mode = mpa is declared but refuses to run "
+		"until its Σ stage lands.")
+	argp = argparse.ArgumentParser(
+		allow_abbrev=False, description=_description)
 	argp.add_argument(
 		"-i",
 		"--input",
@@ -219,7 +225,14 @@ def main(argv=None):
 	input_dir = config.input_dir
 	qp_solver = config.qp_solver     # how QP energies are extracted from Σ
 	mode = config.compute_mode       # the self-energy ansatz
-	do_screened = mode is not ComputeMode.X_ONLY
+	# A mode may be DECLARED on the axis before its Σ stage exists (today:
+	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
+	# any allocation is spent — is the difference between an operator
+	# learning in the first second and learning after the ζ fit.  The
+	# refusal names the mode; a typo'd mode value never reaches this line
+	# because ``config.compute_mode`` already raised on it.
+	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+	do_screened = mode.needs_screening
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
