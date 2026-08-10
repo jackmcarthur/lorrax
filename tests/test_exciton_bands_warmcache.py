@@ -71,21 +71,44 @@ def _mesh(px=1, py=1):
 
 
 def _operands(seed=0):
+    """Operands that make the BSE Hamiltonian genuinely HERMITIAN.
+
+    The two kernel tiles have to be Hermitized or ``H`` is not Hermitian and
+    the α-Hermiticity gate refuses the operator — correctly.  (It did, on the
+    first run of this file: random tiles gave dev/scale = 1.665, and the gate
+    named the operator rather than the algorithm.  That refusal is itself
+    evidence the invariant survived being hoisted out of the jit, but it makes
+    for a useless fixture.)
+
+    At a 1×1×1 k-grid ``R`` has a single point, so the real-space condition
+    ``W_{μν}(R) = conj(W_{νμ}(−R))`` collapses to "``W_R[:, :, 0,0,0]`` is
+    Hermitian"; ``V_Q`` is Hermitized per Q, which is what the production
+    driver does to the interpolated tiles anyway.
+    """
     rng = np.random.default_rng(seed)
 
     def c(*shape):
         return jnp.asarray(rng.standard_normal(shape)
                            + 1j * rng.standard_normal(shape))
 
+    def herm_mn(a):                       # Hermitize the trailing (μ, ν) pair
+        return 0.5 * (a + jnp.conj(jnp.swapaxes(a, -2, -1)))
+
+    nk = NKX * NKY * NKZ
+    # The X and Y legs are the SAME ψ under two shardings in production, so
+    # they must carry the same VALUES here or H is not Hermitian either.
+    psi_c = c(NQ, nk, NC, NS, NMU)
+    psi_v = c(nk, NV, NS, NMU)
+    V_Q = herm_mn(c(NQ, NMU, NMU))
+    W_R = herm_mn(c(NMU, NMU))[:, :, None, None, None]
+
     return (
-        c(NQ, NKX * NKY * NKZ, NC, NS, NMU),                 # psi_cQ_X
-        c(NQ, NKX * NKY * NKZ, NC, NS, NMU),                 # psi_cQ_Y
-        jnp.asarray(rng.standard_normal((NQ, NKX * NKY * NKZ, NC)) + 2.0),
-        c(NQ, NMU, NMU),                                     # V_Q
-        c(NKX * NKY * NKZ, NV, NS, NMU),                     # psi_v_X
-        c(NKX * NKY * NKZ, NV, NS, NMU),                     # psi_v_Y
-        jnp.asarray(rng.standard_normal((NKX * NKY * NKZ, NV)) - 2.0),
-        c(NMU, NMU, NKX, NKY, NKZ),                          # W_R
+        psi_c, psi_c,
+        jnp.asarray(rng.standard_normal((NQ, nk, NC)) + 2.0),
+        V_Q,
+        psi_v, psi_v,
+        jnp.asarray(rng.standard_normal((nk, NV)) - 2.0),
+        W_R,
     )
 
 
