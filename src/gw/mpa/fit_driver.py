@@ -168,9 +168,11 @@ def fit_one_block(
     returned them.  One logical block therefore cost TWO complete fits
     and THREE Pade solves per element where one fit and two solves
     supply every quantity written.  Measured on the production W_c
-    store, one A100, BFC@0.85: 120.8 microseconds per element before,
-    65.6 after, with the poles, residues and both stored diagnostics
-    byte-identical.
+    store, one A100, BFC@0.85, on the 78 960-element column block the
+    production walk takes: 120.1 microseconds per element before, 65.1
+    after, with the poles, the residues and all four stored diagnostics
+    byte-identical -- against the shipped production pole field itself,
+    not against a reference computed for the occasion.
 
     The remaining second solve is the one whose solution vector the
     backward error needs and the fit does not return; see

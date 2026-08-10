@@ -19,8 +19,10 @@ second pair of residue least-squares solves, a second guard pass.
 The driver then throws that second fit's three outputs away.  It reads
 ``cond`` and ``backward_error`` from ``solve_conditioning`` and takes
 ``residual`` and ``n_valid`` from the FIRST fit, which already returned
-them.  So the second fit was computed for nobody, at a measured 55.5 of
-the block's 120.8 microseconds per element.
+them.  So the second fit was computed for nobody, at a measured 55.2 of
+the block's 120.1 microseconds per element -- measured on the production
+W_c store, one A100, BFC@0.85, on the 78 960-element column block the
+production walk actually takes.
 
 WHAT THIS MODULE DOES INSTEAD.  :func:`solve_conditioning_only` is
 ``solve_conditioning`` with the second fit deleted and NOTHING ELSE
