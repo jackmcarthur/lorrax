@@ -182,8 +182,15 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	element-wise by :func:`_zeta_reuse_ok` — a hash here would only add a
 	second, weaker check.
 
-	``wfn_bytes`` identifies the source WFN.h5 without reading it.  mtime
-	is deliberately NOT included: copying/restoring a WFN.h5 changes mtime
+	``wfn_file`` is the RESOLVED path (``realpath``, not ``abspath``) and
+	``wfn_bytes`` its size, which together identify the source WFN.h5
+	without reading it.  Resolving matters because the fleet stages each
+	leg behind its own directory or symlink: under ``abspath`` the same
+	file arrived spelled differently on every launch, and the reuse check
+	read that as a changed input.  ``_same_wfn_file`` re-resolves both
+	sides at comparison time as well, so a stamp written before this line
+	— which holds an unresolved path — is still read correctly.  mtime is
+	deliberately NOT included: copying/restoring a WFN.h5 changes mtime
 	without changing content, and a spurious multi-hour refit is a worse
 	outcome than the (contrived) same-path-same-size-different-content
 	case.
@@ -341,10 +348,102 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'fft_grid':             [int(x) for x in np.asarray(meta.fft_grid).reshape(3)],
 		'ecutwfc':              round(float(wfn.ecutwfc), 9),
 		'ecutrho':              round(float(wfn.ecutrho), 9),
-		'wfn_file':             os.path.abspath(wfn_path) if wfn_path else '',
+		# RESOLVED, not as-typed.  ``abspath`` only prepends the cwd; it
+		# leaves every symlink in place, so the same WFN.h5 reached through
+		# a per-run staging link stamped a different string on every launch
+		# and the comparison below refit for a rename (2026-08-09).  See
+		# :func:`_same_wfn_file` for the identity this key now carries and
+		# for how a stamp written before this line is still read correctly.
+		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
 	return json.dumps(prov, sort_keys=True)
+
+
+def _wfn_path_identity(path):
+	"""``(realpath, size, mtime_ns)`` for one recorded ``wfn_file`` string.
+
+	Never raises.  A path taken off an old stamp routinely no longer
+	exists — the run directory was cleaned, the staging link was torn
+	down — and that is "cannot prove anything about this spelling", not
+	an error.  The stat fields are ``None`` in that case and the caller
+	decides what silence means.
+	"""
+	real = os.path.realpath(path) if path else ''
+	try:
+		st = os.stat(real)
+	except OSError:
+		return real, None, None
+	return real, int(st.st_size), int(st.st_mtime_ns)
+
+
+def _same_wfn_file(old_path, new_path, *, old_bytes=None, new_bytes=None):
+	"""Do two recorded ``wfn_file`` spellings name the SAME WFN.h5?
+
+	Returns ``(verdict, why)``; ``why`` is a sentence naming BOTH paths,
+	because the only useful thing to say about a refusal here is which
+	two files the run thinks it is choosing between.
+
+	A path string is not an identity.  The fleet stages each leg's inputs
+	behind its own directory or symlink, so one WFN.h5 arrives spelled a
+	different way on every launch; comparing the strings charged a full
+	ζ re-fit (16.81 GiB on the production deck) for a rename, on runs
+	where every spelling resolved to the same bytes.  Identity is
+	therefore taken in two steps, cheapest first:
+
+	1. **Resolved name.**  ``os.path.realpath`` collapses symlinks and
+	   ``..`` segments, which is every case the staging layout produces.
+	2. **Same inode.**  Two spellings can survive step 1 and still be one
+	   file — a bind mount, a hard link, two mount points onto the same
+	   backing store.  ``os.path.samefile`` (device + inode) settles
+	   those, and costs one ``stat`` each.
+
+	Then the CONTENT stamp, which answers the different question: the
+	name may be stable while the bytes behind it are not.  ``wfn_bytes``
+	(the size recorded at fit time, passed in here) is compared against
+	the size this run recorded for its own input, and the resolved file's
+	size and mtime go into the refusal message so a real replacement is
+	legible rather than mysterious.  The bound is the same one
+	:func:`_zeta_fit_provenance` already declares: a same-size,
+	same-path replacement is not caught, and a spurious multi-hour refit
+	was judged the worse outcome than that contrived case.
+	"""
+	if not old_path or not new_path:
+		return False, ("one of the two stamps records no WFN path at all "
+		               f"(on-disk stamp {old_path!r}, this run {new_path!r})")
+	old_real, old_size, old_mtime = _wfn_path_identity(old_path)
+	new_real, new_size, new_mtime = _wfn_path_identity(new_path)
+	_sizes_known = old_bytes is not None and new_bytes is not None
+	if _sizes_known and int(old_bytes) != int(new_bytes):
+		return False, (
+			f"the on-disk stamp was fit from {old_path!r} at "
+			f"{old_bytes} bytes and this run reads {new_path!r} at "
+			f"{new_bytes} bytes — different files")
+	if old_real != new_real:
+		# Different resolved names, but possibly one file underneath.
+		try:
+			if os.path.samefile(old_real, new_real):
+				return True, (f"{old_path!r} and {new_path!r} resolve to "
+				              f"different names ({old_real!r}, {new_real!r}) "
+				              f"but to the SAME file (device+inode)")
+		except OSError:
+			pass
+		return False, (
+			f"they name different files: the on-disk stamp was fit from "
+			f"{old_path!r} (resolves to {old_real!r}, "
+			f"{'missing' if old_size is None else f'{old_size} bytes'}) and "
+			f"this run reads {new_path!r} (resolves to {new_real!r}, "
+			f"{'missing' if new_size is None else f'{new_size} bytes'})")
+	if new_size is None:
+		# Both spell the same resolved name and neither can be stat'd.
+		# The names agree and the recorded sizes agree, which is every
+		# check this door has; say so rather than refit on absence.
+		return True, (f"{old_path!r} and {new_path!r} both resolve to "
+		              f"{new_real!r}, which is not present on this node — "
+		              f"the recorded sizes agree, so the spellings are read "
+		              f"as the same file")
+	return True, (f"{old_path!r} and {new_path!r} both resolve to "
+	              f"{new_real!r} ({new_size} bytes, mtime_ns {new_mtime})")
 
 
 def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
@@ -358,11 +457,15 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	  3. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
 	  4. ``fit_provenance`` is present AND byte-identical to this run's —
-	     with ONE named exception, the legacy-key table below: a stamp
-	     that differs ONLY by keys added after it was written is read as
-	     having run each of those keys' legacy value, so old run dirs
-	     stay reusable by a rerun that asks for exactly those values
-	     (announced) while any other request refits, naming the key;
+	     with TWO named exceptions, both announced when they fire.  The
+	     legacy-key table below: a stamp that differs ONLY by keys added
+	     after it was written is read as having run each of those keys'
+	     legacy value, so old run dirs stay reusable by a rerun that asks
+	     for exactly those values while any other request refits, naming
+	     the key.  And path SPELLING: ``wfn_file`` records a name, and one
+	     file has many names, so two spellings that resolve to the same
+	     file are not a difference (:func:`_same_wfn_file`) — while two
+	     that resolve to different files refit, naming BOTH paths;
 	  5. the on-disk centroid table equals this run's centroid indices;
 	  6. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
 	     The header and the dataset are written by two different calls,
@@ -428,6 +531,31 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			_dropped = sorted(set(old) - set(new))     # stamp is NEWER
 			diff = sorted(k for k in (set(old) & set(new))
 			              if old[k] != new[k])
+			# PATH SPELLING IS NOT FILE IDENTITY (2026-08-09).  ``wfn_file``
+			# is the one key whose value is a NAME rather than a number, and
+			# a name has more than one spelling: the fleet stages each leg
+			# behind its own directory or symlink, so the same WFN.h5 landed
+			# in this list on every comparison and every such run paid a full
+			# 16.81 GiB re-fit for a rename.  Resolve the two spellings and
+			# ask what they actually name; a genuine difference stays in the
+			# list (and is refused below naming BOTH paths), so this only
+			# ever removes a difference that was never real.  Done BEFORE the
+			# legacy-key exception so that a stamp which both predates a key
+			# AND was written under a different spelling still reuses.
+			if 'wfn_file' in diff:
+				_same, _why = _same_wfn_file(
+					old.get('wfn_file'), new.get('wfn_file'),
+					old_bytes=old.get('wfn_bytes'),
+					new_bytes=new.get('wfn_bytes'))
+				if _same:
+					print_fn(f"    [zeta reuse] {zeta_h5_path}: the WFN path "
+					         f"differs only in SPELLING — {_why}; not a "
+					         f"reason to refit.")
+					diff.remove('wfn_file')
+				else:
+					print_fn(f"    [zeta reuse] {zeta_h5_path} was fit from a "
+					         f"DIFFERENT WFN — {_why} — refitting.")
+					return False
 			detail = "; ".join(
 				[f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}"
 				 for k in diff]
@@ -479,10 +607,21 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# added key has a declared legacy meaning.  A stamp carrying a key
 		# this LORRAX no longer writes came from a NEWER build and gets no
 		# exception — its meaning is unknown here.
+		# The two stamps' BYTES differ but, after the path-spelling
+		# resolution above, nothing they say differs.  This needs its own
+		# arm: the legacy exception below requires a non-empty ``_added``,
+		# so without this an all-spelling difference would fall through to
+		# the generic refit with an EMPTY "Changed:" detail — the same
+		# shape as the 2026-08-04 regression this branch already carries a
+		# test for, and the same outcome (a refit for nothing).
+		_only_spelling = (old is not None and not diff and not _added
+		                  and not _dropped)
 		_legacy_shaped = (
 			old is not None and not diff and not _dropped and _added
 			and all(k in _LEGACY_KEY_DEFAULTS for k in _added))
-		if _legacy_shaped:
+		if _only_spelling:
+			pass
+		elif _legacy_shaped:
 			_mismatch = [k for k in _added
 			             if new.get(k) != _LEGACY_KEY_DEFAULTS[k]]
 			if not _mismatch:

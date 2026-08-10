@@ -83,8 +83,8 @@ def _tid(cfg, cents_T=CENTS_T, solver_kind="lu"):
 
 
 def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
-          cents_T=CENTS_T, solver_kind="lu"):
-    wfn = SimpleNamespace(_filename="", ecutwfc=30.0, ecutrho=120.0)
+          cents_T=CENTS_T, solver_kind="lu", wfn_path=""):
+    wfn = SimpleNamespace(_filename=wfn_path, ecutwfc=30.0, ecutrho=120.0)
     meta = SimpleNamespace(
         n_rmu=(CENTS.shape[0] if n_rmu is None else int(n_rmu)),
         fft_grid=np.array([9, 9, 45]))
@@ -394,6 +394,185 @@ def test_dataset_extent_probe_declines_reuse(stub_reader, tmp_path):
         # Without the probe the wrong-extent file would be REUSED — that
         # is what the new argument buys.
         assert gw_init._zeta_reuse_ok(p2, new, CENTS, print_fn=quiet) is True
+
+
+# ---------------------------------------------------------------------------
+# WFN path SPELLING vs WFN file IDENTITY (2026-08-09)
+# ---------------------------------------------------------------------------
+# ``wfn_file`` is the one stamp entry whose value is a name, and a name has
+# more than one spelling.  The fleet stages each leg's inputs behind its own
+# directory or symlink, so the same WFN.h5 arrived spelled differently on
+# every launch and the byte comparison read it as a changed input — a full
+# 16.81 GiB ζ re-fit charged for a rename.  The twins below are the whole
+# claim: a spelling difference is not a difference, and a real one still is.
+
+
+def _wfn(tmp_path, name, nbytes=4096, fill=b"\0"):
+    p = tmp_path / name
+    p.write_bytes(fill * nbytes)
+    return str(p)
+
+
+def _respell(prov_json, raw_path):
+    """The stamp as the PRE-2026-08-09 build wrote it: ``wfn_file`` holds
+    the path as typed (``abspath``), symlinks and all.  Every ζ on disk
+    today carries one of these, so the comparison has to read them."""
+    d = json.loads(prov_json)
+    d["wfn_file"] = os.path.abspath(raw_path)
+    return json.dumps(d, sort_keys=True)
+
+
+def test_symlinked_wfn_is_the_same_file_and_reuses(stub_reader, tmp_path):
+    """RED TWIN 1 — one file, two spellings: REUSE.
+
+    The on-disk ζ was stamped with the staging symlink's spelling (which
+    is what every ζ fit before this change carries); the rerun names the
+    file directly.  Under the old string compare this refit every time.
+    """
+    real = _wfn(tmp_path, "WFN.h5")
+    link = str(tmp_path / "run77_WFN.h5")
+    os.symlink(real, link)
+
+    cfg = _cfg(bispinor=False)
+    new = _prov(cfg, wfn_path=real)
+    path = stub_reader(_respell(new, link))
+    msgs = []
+    assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    # And it says why, rather than reusing silently.
+    assert any("SPELLING" in m for m in msgs)
+    assert not any("refitting" in m for m in msgs)
+
+
+def test_two_staging_links_to_one_wfn_reuse(stub_reader, tmp_path):
+    """The production shape: consecutive legs each stage the same WFN
+    behind their OWN per-run link, so neither spelling is the real path
+    and the two differ from each other."""
+    real = _wfn(tmp_path, "WFN.h5")
+    leg1 = str(tmp_path / "leg1_WFN.h5")
+    leg2 = str(tmp_path / "leg2_WFN.h5")
+    os.symlink(real, leg1)
+    os.symlink(real, leg2)
+
+    cfg = _cfg(bispinor=False)
+    new = _prov(cfg, wfn_path=leg2)
+    path = stub_reader(_respell(new, leg1))
+    msgs = []
+    assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    assert any("SPELLING" in m for m in msgs)
+
+
+def test_different_wfn_at_a_new_path_still_refits(stub_reader, tmp_path):
+    """RED TWIN 2 — two genuinely different files: REFIT, naming BOTH.
+
+    Same directory, same stamp in every other entry; only the WFN differs.
+    The refusal has to name both paths, because the one useful thing to
+    say is which two files the run is choosing between.
+    """
+    first = _wfn(tmp_path, "WFN_a.h5", nbytes=4096, fill=b"\0")
+    other = _wfn(tmp_path, "WFN_b.h5", nbytes=8192, fill=b"\1")
+
+    cfg = _cfg(bispinor=False)
+    old = _prov(cfg, wfn_path=first)
+    new = _prov(cfg, wfn_path=other)
+    path = stub_reader(old)
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    joined = " ".join(msgs)
+    assert first in joined and other in joined
+    assert "refitting" in joined
+
+
+def test_repointed_symlink_refits(stub_reader, tmp_path):
+    """The same spelling, repointed at a different file, is NOT reuse.
+
+    This is the case a realpath-only comparison would get right and a
+    path-string comparison would get WRONG in the dangerous direction:
+    the recorded name matches, so a string compare would reuse a ζ fit
+    from another WFN entirely.
+    """
+    a = _wfn(tmp_path, "A.h5", nbytes=4096)
+    b = _wfn(tmp_path, "B.h5", nbytes=4096)
+    link = str(tmp_path / "current_WFN.h5")
+
+    cfg = _cfg(bispinor=False)
+    os.symlink(a, link)
+    old = _prov(cfg, wfn_path=link)
+    os.unlink(link)
+    os.symlink(b, link)
+    new = _prov(cfg, wfn_path=link)
+
+    # Same spelling on both launches, and the two files are the same size,
+    # so ONLY the resolution can tell them apart.
+    assert json.loads(old)["wfn_bytes"] == json.loads(new)["wfn_bytes"]
+    path = stub_reader(old)
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    joined = " ".join(msgs)
+    assert a in joined and b in joined
+
+
+def test_hardlinked_wfn_reuses(stub_reader, tmp_path):
+    """Two names, two resolved paths, ONE inode: still one file."""
+    real = _wfn(tmp_path, "WFN.h5")
+    hard = str(tmp_path / "staged_WFN.h5")
+    os.link(real, hard)
+
+    cfg = _cfg(bispinor=False)
+    old = _prov(cfg, wfn_path=real)
+    new = _prov(cfg, wfn_path=hard)
+    assert json.loads(old)["wfn_file"] != json.loads(new)["wfn_file"]
+    path = stub_reader(old)
+    msgs = []
+    assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    assert any("SAME file" in m for m in msgs)
+
+
+def test_spelling_difference_composes_with_the_legacy_key_exception(
+        stub_reader, tmp_path):
+    """A stamp that BOTH predates keys and was written under another
+    spelling still reuses — the two exceptions have to compose, and the
+    spelling one runs first so the legacy arm sees a clean difference."""
+    real = _wfn(tmp_path, "WFN.h5")
+    link = str(tmp_path / "leg_WFN.h5")
+    os.symlink(real, link)
+
+    cfg = _cfg(bispinor=False)
+    new = _prov(cfg, wfn_path=real)
+    old = _strip(_respell(new, link), _T_KEYS)
+    path = stub_reader(old)
+    msgs = []
+    assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    joined = " ".join(msgs)
+    assert "SPELLING" in joined and "legacy stamp" in joined
+
+
+def test_stamp_records_the_resolved_path(tmp_path):
+    """The stamp itself is written resolved, so a leg launched through a
+    staging link records what an unlinked launch would have recorded."""
+    real = _wfn(tmp_path, "WFN.h5")
+    link = str(tmp_path / "staged" / "WFN.h5")
+    os.makedirs(os.path.dirname(link))
+    os.symlink(real, link)
+    cfg = _cfg(bispinor=False)
+    assert json.loads(_prov(cfg, wfn_path=link))["wfn_file"] == \
+        os.path.realpath(real)
+
+
+def test_spelling_exception_does_not_absorb_a_real_input_change(
+        stub_reader, tmp_path):
+    """The spelling arm must not become a way for other changes to ride
+    in: a real key difference alongside a mere rename still refits."""
+    real = _wfn(tmp_path, "WFN.h5")
+    link = str(tmp_path / "leg_WFN.h5")
+    os.symlink(real, link)
+
+    new = _prov(_cfg(bispinor=False), wfn_path=real)
+    old = json.loads(_respell(new, link))
+    old["zeta_cutoff_ry"] = 40.0
+    path = stub_reader(json.dumps(old, sort_keys=True))
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    assert any("zeta_cutoff_ry" in m for m in msgs)
 
 
 if __name__ == "__main__":
