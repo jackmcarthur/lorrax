@@ -1,20 +1,33 @@
 # Quickstart
 
-This runs one complete static-COHSEX calculation end-to-end on a fresh clone — the bundled
-regression fixture — with **no GPU and no native (FFI) build**. It is the one command
-guaranteed to exist and succeed, and the fastest way to confirm LORRAX works on your
-machine.
+This runs one complete static-COHSEX calculation end-to-end on the bundled regression
+fixture, with **no GPU**. It is the fastest way to confirm LORRAX works on your machine.
+
+It is not, however, a zero-dependency run, and this page used to say it was. The native
+(FFI) layer became **required** on 2026-08-01 — see
+[Design decisions](architecture/decisions.md) — so `uv sync` on its own gets you a tree
+that refuses at startup. Build the host library first; §1 says how, and
+[Installation](installation/index.md) carries the platform tracks.
 
 If you have a crystal rather than a fixture, the step *before* this one — getting a
 `WFN.h5` out of a DFT code — is [Preparing inputs from DFT](preprocessing.md).
 
-## 1. Install (pure-JAX, CPU)
+## 1. Install (CPU)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh    # one-time
 git clone <lorrax-repo-url> && cd lorrax
 uv sync                                            # editable install; puts src/ on sys.path
+bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu   # SLATE, gpu_backend=none
+bash src/ffi/cpp/build_host.sh                     # -> liblorrax_ffi_host.so
 ```
+
+The last two lines are the part that used to be absent from this page. Verified
+2026-08-10 on a fresh clone at `88f28325`: without them, §2's command exits 1 with
+`RuntimeError: The required FFTW3-ABI host backend is unavailable … Could not locate
+liblorrax_ffi_host.so`, listing the six paths it searched; and `build_host.sh` run on a
+tree with no SLATE install refuses with `ERROR: SLATE gpu_backend=none install not found`,
+naming the line above it as the fix.
 
 ## 2. Run the bundled fixture
 
@@ -126,8 +139,15 @@ you produce three preprocessing artifacts, then run GW:
 3. **Kinetic + ionic** — `python -m gw.kin_ion_io -i cohsex.in` → `kin_ion.h5`
 4. **GW** — `python -m gw.gw_jax -i cohsex.in`
 
-On NERSC Perlmutter, `lxpre cohsex.in <N>` bundles steps 1–3; `lx run` is how you launch
-any of them ([Perlmutter §1](environment/machines/perlmutter.md#1-entry-point-lx)).
+On NERSC Perlmutter, `lx run` is how you launch any of them
+([Perlmutter §1](environment/machines/perlmutter.md#1-entry-point-lx)) — one `lx run` per
+step, in the order above. This page used to offer `lxpre cohsex.in <N>` as a way to bundle
+steps 1–3; do not reach for it. `lxpre` is part of the older `module load lorrax`
+workflow, and measured 2026-08-10 there is no plain `lorrax` module on Perlmutter to load
+(the installed set is `lorrax_B`, `lorrax_C`, `lorrax_J070`, `lorrax_mainbase`,
+`lorrax_occam`, `lorrax_rulesbase`, `lorrax_agent`), so `lxpre`, `lxrun` and `lxalloc`
+resolve to nothing on a fresh login. [Perlmutter §1](environment/machines/perlmutter.md#1-entry-point-lx)
+records why that workflow is not the entry point to hand a newcomer anyway.
 
 !!! danger "Three of these four steps have defects that bite on a first run"
     All three were reproduced on Perlmutter 2026-08-06 against the bundled fixture. They
