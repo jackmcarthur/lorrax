@@ -29,9 +29,14 @@ walk takes — 70 columns × 1128 rows = 78 960 elements:
 `gw/mpa/fit_conditioning.py` is `solve_conditioning` with the refit
 deleted and nothing else touched, so the four values it returns are
 byte-identical rather than close, and the suite asserts that as byte
-equality. Five cells in `tests/test_mpa_fit_driver.py` section (d2)
+equality. Four cells in `tests/test_mpa_fit_driver.py` section (d2)
 carry it, including the end-to-end one that compares every byte of the
 finalized store against a reference computed by the old composition.
+
+On the production deck the same comparison was made against the SHIPPED
+pole field rather than against a reference: twenty-five byte comparisons
+over all 64 q of `mpa_wcprod_0809/stores/mpa_fit_np8_wc.h5`, six datasets
+each, every one BYTE-IDENTICAL and none DIFFERS.
 
 ## TRAP 1 — the MPA fit is NOT bit-identical under `jax.jit`, and the poles move at 5e-9
 
