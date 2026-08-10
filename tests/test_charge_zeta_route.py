@@ -51,6 +51,7 @@ _OVER_CAP = dict(nq=144, n_rmu=2412)       # 13.4 GiB stack; ~90 MiB per q-batch
 _OVER_FACTOR_CAP = dict(nq=144, n_rmu=17000)
 
 
+@pytest.mark.mesh(4)   # every cell here builds a 2x2; _mesh() skipped in EVERY suite run
 class TestReplicatedRouteReachable:
     """Below the cap the replicated route must win -- on any backend."""
 
@@ -79,6 +80,7 @@ class TestReplicatedRouteReachable:
         assert seen == {"replicated_rank_truncate"}
 
 
+@pytest.mark.mesh(4)   # every cell here builds a 2x2; _mesh() skipped in EVERY suite run
 class TestOverridesStillHonoured:
     """Explicit overrides keep their documented meaning."""
 
@@ -98,6 +100,7 @@ class TestOverridesStillHonoured:
         assert "rank_truncate" not in under
 
 
+@pytest.mark.mesh(4)   # every cell here builds a 2x2; _mesh() skipped in EVERY suite run
 class TestAboveCap:
     """Above the cap the replicated route cannot be used."""
 

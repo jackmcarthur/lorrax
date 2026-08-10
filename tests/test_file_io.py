@@ -1058,6 +1058,7 @@ def test_read_slab_without_shape_rounds_up_to_the_mesh(
     np.testing.assert_array_equal(auto, a)
 
 
+@pytest.mark.mesh(4)   # 2x2; the inline guard below fired in EVERY suite run
 def test_mesh_divisible_shape_rounds_each_axis_by_its_own_divisor():
     """The rounding rule itself, without a file.
 

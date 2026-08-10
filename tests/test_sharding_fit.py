@@ -171,11 +171,11 @@ def test_the_announcement_fires_once_per_site_not_once_per_call(capsys):
 # ---------------------------------------------------------------------------
 # the fact the whole module rests on: jax really does refuse
 # ---------------------------------------------------------------------------
-_ND = jax.device_count()
-needs4 = pytest.mark.skipif(
-    _ND < 4,
-    reason=f"needs >=4 devices to build a 2x2 mesh (have {_ND}); run with "
-           f"XLA_FLAGS=--xla_force_host_platform_device_count=16")
+# Was a ``skipif(jax.device_count() < 4)``, which skipped in every suite run
+# regardless of the node — tests/conftest.py pins each test process to one
+# GPU, so ``device_count()`` is 1 by construction.  The marker states the
+# requirement and the conftest supplies it; see the mesh section there.
+needs4 = pytest.mark.mesh(4)
 
 
 @needs4
