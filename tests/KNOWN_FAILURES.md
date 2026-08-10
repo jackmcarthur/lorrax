@@ -7,10 +7,33 @@
 > the services' suites); it is a strict SUBSET of the census and it is not
 > what this file counts. **Nothing about this file's meaning, scope or
 > accounting changed with that split** — `--census` collects exactly the set
-> a bare `pytest` collected before it, verified node id by node id (3330 in,
-> 3330 out, zero missing). Do not reconcile a KNOWN_FAILURES row against a
-> default-gate run; it will be short by ~2400 cells for reasons that have
-> nothing to do with the row.
+> a bare `pytest` collected before it, plus this branch's own two new
+> selection cells and nothing else. Re-measured after the 2026-08-10 rebase
+> onto `chore/anchor-window-pin-2026-08-09`: a bare `pytest` at the base
+> collects 3369 cells over 203 files, `--census` here collects 3371 over the
+> same 203, and the whole difference is
+> `tests/test_service_selection.py` going 14 → 16 — the two cells this branch
+> adds to prove its own claim. `-m census` collects the identical 3371, and
+> `--no-services` and `LX_SKIP_SERVICES=1` collect the identical 2441.
+> Do not reconcile a KNOWN_FAILURES row against a default-gate run; it will be
+> short by ~2400 cells for reasons that have nothing to do with the row.
+> Evidence: `/pscratch/sd/j/jackm/fastgate_rebase_0810/collect_*.raw`.
+>
+> **WHAT A DEFAULT-GATE RUN LOOKS LIKE AT THIS HEAD (2026-08-10).** A bare
+> `lx test` collects 935 — 930 service cells and the five end-to-end driver
+> cells — and comes back **0 failed across `tests/`**, which includes the Si
+> BSE anchor now that `chore/anchor-window-pin-2026-08-09` pins its band
+> window. The nine reds it does report are all in `services/`, and they are
+> **pre-existing, not this branch's**: the same three suites run at the base
+> commit, under the same module and the same `.so` pair, return nine reds too,
+> seven of them the identical node ids and the other two swapping between rows
+> this file already lists. Neither this branch nor the pin branch changes a
+> single file under `src/` or `services/`, so neither could have caused them.
+> Evidence: `log_default_gate.txt` and `log_svc_base.txt` in the directory
+> above. Note also that the run needs the site `.so` pair supplied — with no
+> `LORRAX_FFI_SO` the FFI gate refuses before any driver starts, and every
+> end-to-end cell fails on that refusal rather than on its numbers
+> (`log_default_gate_nofficonf.txt`, kept as the negative control).
 
 Two censuses live in this file.  The **Perlmutter** one is authoritative for
 this tree; the **Frontera** one below it is the historical record from

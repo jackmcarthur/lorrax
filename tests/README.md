@@ -16,7 +16,8 @@ pytest                 # DEFAULT GATE — minutes.  The Si end-to-end test
                        # calculation for the drivers this branch TOUCHED,
                        # plus every service's own suite.
 pytest --census        # THE CENSUS — everything.  Byte-for-byte the run a
-pytest -m census       # bare `pytest` was before the split (3330 cells).
+pytest -m census       # bare `pytest` was before the split (3371 cells at
+                       # the 2026-08-10 rebase; the count tracks the tree).
 lx test                # Perlmutter: the default gate on a compute node
 lx test --census       # Perlmutter: the census
 ```
