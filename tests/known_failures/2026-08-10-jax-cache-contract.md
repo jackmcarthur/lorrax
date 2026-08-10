@@ -39,7 +39,12 @@ neither had a gate that would catch the next one:
 **Gates landed.**
 
 * `tests/test_jax_cache_contract.py` — the contract. Parametrized over every driver in
-  `tests/fast_gate.py`'s roster, `mesh(4)`-marked, census-class. Each decked driver's
+  `tests/fast_gate.py`'s roster, `procs(4)`-marked, census-class. **`procs(n)`, not the
+  `mesh(n)` that landed at `a6b87fa9`**: `mesh(n)` widens ONE process to n devices, where
+  `jax.process_count()` is 1, the compile-cache agreement layer is never installed and
+  `ArrayImpl._multi_slice` is never reached — so every defect this contract gates is
+  invisible to it, as that marker's own definition says. A separate marker rather than a
+  redefinition, because the cells that pass under `mesh(n)` depend on what it means. Each decked driver's
   Si smoke deck runs TWICE at P=4 against a fresh cache directory and the second run
   must show `xla_compiles=0`, `vetoed=0` on every rank AND an identical cache-key set
   across ranks. Undecked drivers are named and skipped with `fast_gate.UNDECKED`'s own

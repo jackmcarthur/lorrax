@@ -46,6 +46,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: The session's pre-pin device list, recorded by ``tests/conftest.py`` for
+#: the ``mesh(n)`` runner.  Named here rather than imported so this module
+#: stays importable with no pytest session (it is also driven from scripts).
+#: ``tests/test_jax_cache_contract.py`` asserts the two spellings agree.
+_SESSION_DEVICES_ENV = "LORRAX_SESSION_DEVICES"
+
 #: Four processes under ``srun`` inside an existing Slurm allocation.  The
 #: landing-evidence mode: real devices, real NCCL, real one-GPU-per-process.
 SRUN = "srun"
@@ -78,21 +84,25 @@ NPROC = 4
 def visible_gpus(env: dict, probe=None) -> list:
     """The GPU ordinals this leg may use, in order.
 
-    ``LORRAX_TEST_VISIBLE_GPUS`` FIRST, because under pytest the obvious
+    ``harness.SESSION_DEVICES_ENV`` FIRST, because under pytest the obvious
     source has already been destroyed: ``tests/conftest.py`` pins this
     process to ONE device before any test runs (three separate things need
     that), so ``CUDA_VISIBLE_DEVICES`` reads "0" on a node that granted
     four.  MEASURED on Perlmutter 2026-08-10, step ``lx-Xg4-154342``: the
     whole contract skipped itself with "no four-process launch available
-    here" immediately after printing four A100s.  A `mesh(4)` cell computes
-    on none of them — it orchestrates four SUBPROCESSES, one per device — so
-    the pin is right for the cell and wrong for the question, and conftest
-    records the pre-pin list for exactly this reader.
+    here" immediately after printing four A100s.
+
+    THE PRE-PIN LIST IS NOT CAPTURED HERE.  ``pytest_configure`` already
+    records it as ``LORRAX_SESSION_DEVICES`` for the ``mesh(n)`` runner
+    (``harness.session_devices``), and that is the same fact read at the
+    same hook — so this reads THEIRS rather than taking a second snapshot.
+    Two captures of one fact is the two-copy disease, and the copy that
+    goes stale is always the one nobody is looking at.
 
     Then ``CUDA_VISIBLE_DEVICES`` — inside a Slurm step it is authoritative
     and ``nvidia-smi`` is not (it enumerates the node, not the cgroup).
     """
-    stashed = env.get("LORRAX_TEST_VISIBLE_GPUS")
+    stashed = env.get(_SESSION_DEVICES_ENV)
     if stashed is not None:
         return [d for d in stashed.split(",") if d.strip() != ""]
     preset = env.get("CUDA_VISIBLE_DEVICES")

@@ -51,14 +51,26 @@ All three are real four-process programs run against a real persistent cache
 (``tests/_cache_contract_probe.py``), never mocks, so this gate also fails if
 jax changes its own rules out from under the contract.
 
-WHY P=4 AND NOT "a 2x2 mesh"
-----------------------------
-``--px 2 --py 2`` under plain pytest is ONE process with four local devices.
-``jax.process_count()`` is 1 there, the agreement layer is never installed,
-and ``ArrayImpl._multi_slice`` — the canonical class-B site — is never even
-reached.  The defect class does not exist below two PROCESSES, so the gate
-launches real ones (``tests/mesh_launch.py``), and it says which mode it got
-in every failure message so a CPU leg can never be quoted as the GPU one.
+WHY ``procs(4)`` AND NOT ``mesh(4)``
+------------------------------------
+They are different contracts and the difference is the whole subject of this
+file.  ``mesh(n)`` — landed 2026-08-10, a6b87fa9 — widens ONE process to n
+DEVICES, in a child when the suite's pin has narrowed this one.  That is the
+right instrument for a cell that needs a 2x2 device mesh, and it is the
+wrong one here: in an n-device single process ``jax.process_count()`` is 1,
+so the compile-cache agreement layer is never installed, only process 0
+exists to write entries, and ``ArrayImpl._multi_slice`` — the canonical
+class-B site — is never even reached.  Every failure this file exists to
+catch is invisible to it.  The landed marker says so itself ("NOT a
+substitute for a multi-process P=n leg").
+
+So this file declares ``procs(4)``: n real PROCESSES, launched by
+``tests/mesh_launch.py`` (srun inside an allocation; otherwise n local
+processes wired by an explicit jax coordinator, one GPU each on a whole
+node).  A separate marker rather than a redefinition, because the cells that
+passed under ``mesh(n)`` depend on what it means.  Every failure message
+names the launch mode it got, so a CPU leg can never be quoted as the GPU
+one.
 
 UNDECKED DRIVERS ARE NAMED, NOT SKIPPED SILENTLY
 ------------------------------------------------
@@ -69,6 +81,7 @@ handing back a quiet green over four of seven drivers.
 """
 from __future__ import annotations
 
+import ast
 import shutil
 import sys
 from pathlib import Path
@@ -82,11 +95,11 @@ from harness import REG, copy_fixture                       # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: THE WHOLE FILE NEEDS FOUR PROCESSES.  ``mesh(4)`` is a requirement
-#: declaration, not a selector: it lets a launcher pick these cells out
-#: (``pytest -m "mesh"``) and it makes the four-GPU rule checkable by
-#: reading the marker instead of reading the body.
-pytestmark = pytest.mark.mesh(4)
+#: THE WHOLE FILE NEEDS FOUR PROCESSES — see the docstring for why that is
+#: not ``mesh(4)``.  A requirement declaration, not a selector: it lets a
+#: launcher pick these cells out (``pytest -m procs``) and it makes the
+#: four-GPU rule checkable by reading the marker instead of the body.
+pytestmark = pytest.mark.procs(4)
 
 #: Generous, because a driver deck is a driver deck.  A hang inside the
 #: contract is the very thing it is looking for, so the timeout must be a
@@ -341,14 +354,14 @@ def test_the_gpu_leg_gives_each_process_exactly_one_device():
     assert mesh_launch.visible_gpus({"CUDA_VISIBLE_DEVICES": ""}) == []
     assert mesh_launch.visible_gpus({}, lambda: 4) == ["0", "1", "2", "3"]
     # THE PIN MUST NOT HIDE THE NODE.  conftest pins this process to one
-    # device before any cell runs; the pre-pin list is what a mesh(4) cell
+    # device before any cell runs; the pre-pin list is what a procs(4) cell
     # has to see, and reading the pinned value instead is what made the
     # whole contract skip itself on a four-A100 node.
     assert mesh_launch.visible_gpus(
         {"CUDA_VISIBLE_DEVICES": "0",
-         "LORRAX_TEST_VISIBLE_GPUS": "0,1,2,3"}) == ["0", "1", "2", "3"]
+         "LORRAX_SESSION_DEVICES": "0,1,2,3"}) == ["0", "1", "2", "3"]
     assert mesh_launch.choose_mode(
-        {"CUDA_VISIBLE_DEVICES": "0", "LORRAX_TEST_VISIBLE_GPUS": "0,1,2,3",
+        {"CUDA_VISIBLE_DEVICES": "0", "LORRAX_SESSION_DEVICES": "0,1,2,3",
          "SLURM_JOB_ID": "1", "SLURM_STEP_ID": "0"},
         lambda _n: None, lambda: 0)[0] == mesh_launch.LOCAL_GPU
 
@@ -387,3 +400,56 @@ def test_the_probe_kinds_are_all_reachable(kind):
     assert probe.is_file()
     assert kind in probe.read_text()
     assert shutil.which(sys.executable) or Path(sys.executable).exists()
+
+
+def test_the_session_device_list_is_read_and_not_re_captured():
+    """ONE capture of the pre-pin device list, and this reads it.
+
+    ``tests/conftest.py`` records it as ``LORRAX_SESSION_DEVICES`` for the
+    ``mesh(n)`` runner (``harness.session_devices``).  This file needs the
+    same fact for a different reason, and takes THEIRS: a second snapshot of
+    one fact is the two-copy disease, and the copy that goes stale is always
+    the one nobody is looking at.
+    """
+    import harness
+    assert mesh_launch._SESSION_DEVICES_ENV == harness.SESSION_DEVICES_ENV, (
+        "mesh_launch reads a different variable than conftest writes")
+    conftest_src = (REPO_ROOT / "tests" / "conftest.py").read_text()
+    assert conftest_src.count("SESSION_DEVICES_ENV") >= 1
+    assert "LORRAX_TEST_VISIBLE_GPUS" not in conftest_src, (
+        "a second pre-pin capture is back in conftest")
+
+
+def test_procs_and_mesh_are_distinct_contracts():
+    """``procs(n)`` must not be read as, or silently become, ``mesh(n)``.
+
+    The landed ``mesh(n)`` gives ONE process n devices.  Every defect this
+    file gates is invisible there, because ``jax.process_count()`` is 1 and
+    the agreement layer that the whole contract measures is never installed.
+    Both markers are registered, separately, with their own definitions.
+    """
+    markers = (REPO_ROOT / "pyproject.toml").read_text()
+    assert '"mesh(n):' in markers and '"procs(n):' in markers, (
+        "both markers must be registered separately")
+    assert "SINGLE-PROCESS" in markers.split('"mesh(n):')[1][:400]
+    procs_def = markers.split('"procs(n):')[1][:600]
+    assert "real PROCESSES" in procs_def
+    assert "process_count() is 1" in procs_def or "jax.process_count" in procs_def
+    # And this module declares the process one.  Asserted on the MARKER
+    # OBJECTS and on the AST, never on the file's text: this cell has to
+    # name the marker it is refusing, so any substring test for
+    # ``pytest.mark.mesh`` matches its own body and fails on a correct file.
+    marks = pytestmark if isinstance(pytestmark, list) else [pytestmark]
+    assert {m.name for m in marks} == {"procs"}, (
+        f"module markers are {[m.name for m in marks]}; the cache contract "
+        f"must declare procs(n) and not mesh(n) — an n-device single "
+        f"process cannot express rank divergence at all")
+    assert marks[0].args == (4,), f"procs({marks[0].args}) — want procs(4)"
+
+    tree = ast.parse(Path(__file__).read_text())
+    for node in ast.walk(tree):
+        for dec in getattr(node, "decorator_list", []):
+            fn = dec.func if isinstance(dec, ast.Call) else dec
+            assert not (isinstance(fn, ast.Attribute) and fn.attr == "mesh"), (
+                f"{getattr(node, 'name', '?')} is decorated mesh(n); a cell "
+                f"in this file needs procs(n)")
