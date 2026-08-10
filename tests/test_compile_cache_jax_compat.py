@@ -383,23 +383,55 @@ def test_peer_rebind_degradation_is_removed():
 
 
 def test_only_one_compat_announcement_site_is_left():
-    """The module documents ONE surviving shim; count the announcement sites.
+    """Every ``_compat`` announcement site must be one somebody decided on.
 
-    A sixth ``_compat`` call appearing without a decision would be a
-    compatibility layer growing back by accident, which is the thing being
-    removed.  Counted from the AST, not from a substring, so a mention in a
-    comment or a docstring cannot move the number.
+    A ``_compat`` call appearing without a decision would be a compatibility
+    layer growing back by accident, which is the thing being removed.  This
+    used to be a COUNT (``== 1``, the one surviving jax 0.5.3-era shim).  It is
+    now the SET OF KEYS, which is a strictly stronger guard for the same
+    purpose: a bare number goes green again as soon as someone deletes one site
+    and adds another, and it cannot say which sites are sanctioned.  Read from
+    the AST, not from a substring, so a mention in a comment or a docstring
+    cannot move it.
+
+    AMENDED 2026-08-09 (fix/multislice-cachekey): the shard-slice patch added
+    the two ``shard-slice-*`` keys.  Neither is a version shim — they announce
+    a RUN-TIME fallback (the canonical slicer declining a shape it did not
+    anticipate) and the absence of ``ArrayImpl._multi_slice`` on some future
+    jax.  They are here because ``_compat`` is this file's once-per-run,
+    rank-0-only announcer and the alternative was a second one just like it.
     """
     import ast
     import inspect as _inspect
+
+    sanctioned = {
+        # the one surviving jax 0.5.3-era shim: VerificationCache /
+        # compilation_cache_check_contents, absent from every container
+        "compilation_cache.verification",
+        # the shard-slice canonicalization's two non-silent exits
+        "shard-slice-fallback",
+        "shard-slice-absent",
+    }
 
     tree = ast.parse(_inspect.getsource(jcc))
     sites = [n for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "_compat"]
-    assert len(sites) == 1, (
-        "expected exactly one _compat() announcement site after the four "
-        "jax 0.5.3 shims were removed, found %d" % len(sites))
+    keys = set()
+    for n in sites:
+        assert n.args and isinstance(n.args[0], ast.Constant), (
+            "a _compat() site must name its key as a literal, so this test "
+            "can see it")
+        keys.add(n.args[0].value)
+
+    assert keys == sanctioned, (
+        f"unsanctioned _compat() announcement site(s): "
+        f"{sorted(keys - sanctioned)}; missing: {sorted(sanctioned - keys)}.  "
+        f"Adding one is a decision — record it in the docstring above and in "
+        f"the module's 'jax._src surface this file patches' block.")
+    assert len(sites) == len(sanctioned), (
+        f"{len(sites)} _compat() sites for {len(sanctioned)} keys — a key is "
+        f"announced from two places, which makes the memo do the deciding")
 
 
 # ---------------------------------------------------------------------------
