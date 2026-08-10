@@ -673,4 +673,7 @@ main                                       [gw/gw_jax.py]
 - FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
 - GN-PPM Σ details: see developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
 - Current BGW-vs-LORRAX status: see developer notes under `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md`
-- Agent todos: see developer notes under `docs/dev/notes/AGENT_TODO.md`
+- Agent todos: `docs/dev/notes/AGENT_TODO.md` is **superseded** and should not be
+  worked from — it describes a `src/isdf/` package layout the tree no longer has,
+  and one of its suggestions is now forbidden by a test. It carries a banner
+  explaining why. Current work items live in the campaign ledgers, not here.

@@ -1,19 +1,20 @@
-# Advanced Topics
+# Advanced Topics (legacy folder index)
 
-This folder contains documentation for advanced usage scenarios and specialized derivations.
+> **SUPERSEDED — this is a signpost, not a document (banner added
+> 2026-08-09).** It was the README of an `advanced/` folder that no longer
+> exists, and it survived the reorganisation only as a redirect. Both of the
+> documents it indexes have since moved again, and one of the two links below
+> was dead: `../../architecture/multihost.md` does not exist. The links are
+> corrected here so the page at least points somewhere real, but there is
+> nothing here that the live navigation does not already give you, and this
+> file is a candidate for outright deletion on the owner's word.
 
-## Contents
+The two documents this index used to front now live at their own paths:
 
-- **[`jax_multihost.md`](../../architecture/multihost.md)** (39 KB)
-  Multi-host JAX distributed computing patterns, SLURM integration, and multi-GPU coordination
+- **[`jax_multihost_thirdparty_tutorial.md`](../jax_multihost_thirdparty_tutorial.md)**
+  Multi-host JAX distributed computing patterns, SLURM integration, and multi-GPU coordination.
 
-- **[`HL_GPP_derivation.md`](../../theory/hl-gpp-derivation.md)** (9 KB)
-  Hedin-Lundqvist Generalized Plasmon Pole (GPP) model derivation
-
-## Usage
-
-Read these only if:
-- Working on multi-node/multi-GPU parallelization → `jax_multihost.md`
-- Implementing or debugging GPP models → `HL_GPP_derivation.md`
+- **[`hl-gpp-derivation.md`](../../theory/hl-gpp-derivation.md)**
+  Hedin-Lundqvist Generalized Plasmon Pole (GPP) model derivation.
 
 For standard single-node usage, see [`environment/overview.md`](../../environment/overview.md) instead.

@@ -1,3 +1,17 @@
+# Profiling suggestions (memory-model audit)
+
+> **SUPERSEDED — historical only (banner added 2026-08-09).** Every array this
+> audit is about has since been removed from the code. `psi_coh_rtot_Y`,
+> `psi_v_rtot_Y` and `psi_c_rtot_Y` — the three "UNUSED, ~20 GB wasted"
+> findings that are the whole point of the document — now have zero
+> occurrences anywhere under `src/`, `services/`, `tools/`, `scripts/` or
+> `tests/`, and so does the `FFT_BUFFERS` constant whose value finding 6
+> disputes. The findings were acted on; what is left is the record of an
+> audit, not a list of work. Nothing in the tree links here. For the current
+> picture read `docs/architecture/memory-model.md`; for how to profile today
+> read `PROFILING_TOOLS.md` in the BSE-perf campaign directory. This file is a
+> candidate for outright deletion on the owner's word.
+
 ## Executive Summary
 
 The memory model is **overengineered for the zeta-fitting stage** but **completely ignores the sigma-computation stage**, currently the dominant memory consumer. Several arrays are held unnecessarily or have inefficient reshardings.
