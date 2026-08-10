@@ -36,6 +36,14 @@ direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 
 ## Two test tiers: the default gate and the census
 
+> **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** It applies to
+> both tiers below. A P=1-only verification is never sufficient for landing;
+> unit and CPU cells are exempt. The owner's rationale, verbatim: *"use four
+> gpus for 100% of all testing so that never ever do we run something on one
+> GPU and then learn it doesn't generalize later"*. `lx test` already takes all
+> four GPUs on the node; a driver leg wants `-G 4` rather than the one-GPU
+> default.
+
 There are exactly two ways to run the suite, and they answer different
 questions.
 

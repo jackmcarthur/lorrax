@@ -1,5 +1,18 @@
 # LORRAX test suite
 
+> ## ⚠ THE FOUR-GPU RULE — every GPU leg runs at P=4
+>
+> Whichever tier you run, **every GPU verification leg runs at P=4**. A
+> P=1-only verification is never sufficient for landing; unit and CPU cells
+> are exempt. The owner's rationale, verbatim:
+>
+> > *"use four gpus for 100% of all testing so that never ever do we run
+> > something on one GPU and then learn it doesn't generalize later"*
+>
+> `lx test` already takes all four GPUs on the node; a driver leg wants
+> `-G 4` rather than the one-GPU default. See
+> [`AGENT_PREAMBLE.md`](../AGENT_PREAMBLE.md).
+
 ## Two tiers: the default gate, and the census (2026-08-09)
 
 The owner's instruction, verbatim:

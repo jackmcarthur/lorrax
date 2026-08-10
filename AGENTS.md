@@ -7,6 +7,14 @@ You are most likely arriving here from the `lorrax_sandbox` project, where test 
 and BGW comparisons are organized. This repo contains the source code you may need to
 read or modify. Read this file upon first inspection of the LORRAX source before editing any code.
 
+> **If you are a dispatched lane, read [`AGENT_PREAMBLE.md`](AGENT_PREAMBLE.md)
+> first.** It is the standard environment preamble — certificate check, pool
+> discovery, the trap inventory, release-by-job-ID, EXIT verification, the
+> allocator statement rule and the file-boundary etiquette — and it opens with
+> **THE FOUR-GPU RULE: every GPU verification leg runs at P=4**, because
+> *"never ever do we run something on one GPU and then learn it doesn't
+> generalize later"*. This file covers the code; that one covers the machine.
+
 ## Where things are
 
 | Path | What | When to read |
@@ -178,6 +186,9 @@ Run `uv run python -m pytest -q` after long running branches (5+ small commits) 
 DEFAULT GATE (Si end-to-end smoke for the drivers you touched + the services' suites; minutes).
 Run `uv run python -m pytest -q --census` -- the full suite, and the run KNOWN_FAILURES.md
 accounts for -- before asking for a landing.  See `tests/README.md` and `docs/contributing.md`.
+**Every GPU verification leg runs at P=4** -- a P=1-only verification is never
+sufficient for landing (unit and CPU cells are exempt), because "never ever do we
+run something on one GPU and then learn it doesn't generalize later".
 Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment
