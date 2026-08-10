@@ -10,6 +10,69 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-08-10 — The long-range channel criterion is an energy cutoff with a two-shell floor
+
+Asked and **ruled**, 2026-08-10. This settles the open decision the
+2026-08-08 BSE performance campaign left behind, which that campaign's
+consolidated list carries as B5 and which its own report called "the
+physics call".
+
+The owner's words were that the criterion for `vq_interp`'s long-range
+channels "should probably be an energy cutoff, but I want it to reliably
+capture the first at least 2 G shells, because we need to capture G=0,
+which rolls by an umklapp vector at BZ boundaries." The ruling is
+therefore both halves together, and neither is decoration:
+
+> fit channel *n* if and only if `(n·|b₃|)² ≤ E_eff`, where
+> `E_eff = max(E_cut, (2·|b₃|)²·(1 + margin))`.
+
+**What it replaces.** The fitted channel set used to be read off the keys
+of `DEG_B26P`, which is to say a hardcoded `|G_z| ≤ 3` — a fixed shell
+*count* spanning a cell-dependent energy window. Because `|b₃| = 2π/c`
+shrinks as a slab's vacuum grows, three shells cover 0.69 Ry on the MoS2
+reference cell but only 0.077 Ry once the vacuum is tripled, while the
+superset's own isotropic 6.63 Ry cutoff keeps widening. Stage 1 subtracts
+the full-sphere `V_LR` and stage 3 adds back only the fitted channels, so
+everything in between was weight that was subtracted and never returned:
+**17.93 % of the long-range weight at 3× vacuum**, and silently, because
+the null that looked like it was watching this was testing the sampled
+form factors rather than the fitted model. Tying the count to an energy
+makes it follow `1/|b₃|` instead of standing still.
+
+**Why the floor is not redundant.** The head slot is `argmin_G |Q+G|`, and
+at a zone boundary that is not `G=0` — it rolls onto a neighbouring
+reciprocal-lattice vector. A criterion that captured only the literal
+first shell would leave the rolled channel unfitted, its form factor
+identically zero, and the head magnitude would be multiplied away without
+a word. The floor makes that unreachable for any cutoff and any cell. Two
+shells rather than one is also exactly what the bulk control needs, and
+the two constraints agree: on Si the long-range weight lost is 48.4 % at a
+zero-shell floor, 1.37 % at one shell, and 0.000 % at two, and a third
+shell buys nothing because the superset itself stops at `|G_z| = 2`.
+
+**The default is `E_CUT_FIT = 1.0` Ry, not the 0.5 Ry of the sketch.** The
+default has to reproduce today's channel set on the MoS2 reference deck,
+which pins it to `[0.691, 1.229)` Ry there, and it has to hold the
+3×-vacuum loss under 1 %. 0.5 Ry fails both ends: it drops the `|G_z| = 3`
+channel on the reference deck — making that deck *worse*, 0.24 % → 1.90 %
+— and still strands 2.04 % at 3× vacuum. At 1.0 Ry the measured loss is
+0.240 % on the reference deck (unchanged), and **17.93 % → 0.290 % at 3×
+vacuum**, a 62-fold reduction. The extra channels enter at polynomial
+degree zero, one complex coefficient each, so the fit's solve is unchanged
+and the cost is paid only in the regime that needs it.
+
+**Implemented and landed** on `fix/vqinterp-ecut-criterion-2026-08-10`,
+in `src/bse/vq_interp.py::lr_fit_degrees` — the single site that decides
+the fitted set, which the superset trim, the fit and the mini-BZ
+head-slot guard all now read, so they cannot drift apart. Bit-identical
+in production: on the real MoS2 reference deck the criterion returns
+exactly `DEG_B26P`, and the fitted model agrees with today's rule to
+`max|Δ| = 0.000e+00` at every Q tested, zone-boundary Q included.
+
+Licenses deleting: any second opinion about which `|G_z|` channels the
+long-range model fits. `DEG_B26P` remains the in-plane *degree ladder*
+and must not be read as a channel set again.
+
 ## 2026-08-06 — There is deliberately no `LORRAX_EXTRA_BAND_PAD`
 
 Asked and **declined**, 2026-08-06 (ledger 0169), even though the band
