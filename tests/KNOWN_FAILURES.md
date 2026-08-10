@@ -133,6 +133,31 @@ the absence of any second literal that could shadow it.  The anchor deck's own
 pin: `off` is what a measurement standard wants, because it runs the window its
 references were cut from without the guard having an opinion either way.
 
+**MEASURED at `912f6c79`** on the shared pool under the conditions the
+attribution and anchor-pin lanes used (`LX_BASE_MODULE=lorrax_J070`, the
+canonical `.so` pair, `LORRAX_CHECKOUT`), evidence in
+`/pscratch/sd/j/jackm/degenstrict_0810/`:
+
+* **the deck now refuses with no flag** (`log_probe_ab.txt`, `probe_out.txt`) —
+  `si_bse_debug` at 4v4c exits **rc=1** with
+  `BandWindowDegeneracyError: … the conduction boundary at band 12 cuts a
+  multiplet (gap 0.000 meV at k=0, tol 1.000 meV) … Fix: use --n-val 4
+  --n-cond 8, or pass --band-degeneracy snap to widen to those counts
+  automatically, or --band-degeneracy off …`;
+* **the opt-in is byte-identical to the pre-flip default.**  Explicit
+  `--band-degeneracy snap` on the same deck snaps 4c → 8c, runs to rc=0, and
+  returns the same twenty eigenvalues the pre-flip `snap` arm returned at
+  `01e1e609` — `2.34696443 ×2, 2.34802375 ×3, 2.34977621 ×3, …, 2.40415288`,
+  max abs vs the frozen pin **0.09064299 eV**, matching
+  `bsegate_attrib_0809/log_degen_snap.txt` digit for digit;
+* **the anchor deck is unchanged** (`log_c_anchor.txt`) — the `off`-pinned cell
+  passes both arms with **zero `[band-window]` lines in the log**, the same
+  signature the pin was measured with at `29723072`;
+* **the default fast gate is set-identical to `main`** (`log_d_fastgate.txt`
+  vs `log_d_baseline_main.txt` at `a65a5326`): the same nine `services/` reds
+  on both sides and nothing else, so the flip adds no red; the guard's own
+  census cells pass (`log_e_census.txt`).
+
 | item | mechanism, at this tree | disposition |
 |---|---|---|
 | **`tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw` — was RED on `main`, both arms; **FIXED** by pinning the deck's window at `29723072`** | **The default `--band-degeneracy snap` silently doubles the deck's BSE problem.**  `99d73f95` (in the `824032b7` merge) installs `common.band_degeneracy.resolve_band_window` at the band-window choke point with `mode="snap"` as the default, so a window boundary landing inside a degenerate multiplet is widened OUTWARD.  On `si_bse_debug` it fires, and the run says so in its own words: *"[band-window] `_load_ring_subset`: requested n_val=4 n_cond=4 (bands [4, 12) of 60) is not multiplet-safe … the conduction boundary at band 12 cuts a multiplet (gap 0.000 meV at k=0, tol 1.000 meV); the multiplet ends at band 16, so n_cond 4 → 8 … SNAPPED OUTWARD to n_val=4 n_cond=8 (bands [4, 16) of 60).  The BSE problem is now 32 pairs per k instead of 16."*  The gate's Hamiltonian therefore goes from 1024 to 2048 dimensions, the extra transitions fill the bottom of the spectrum, and every one of the lowest twenty moves down: 20/20 cells over the pin, max abs **0.09064299 eV** against `ATOL_FROZEN_EV = 1e-6` (index 0: 2.34696443 actual vs 2.35372258 frozen).  The signature is diagnostic on its own — the returned list acquires multiplicities the frozen list does not have (2.346964 ×2, 2.348024 ×3, 2.349776 ×3) and the four BerkeleyGW states at 2.470–2.484 eV are pushed out of the lowest-20 window entirely | **NOT ATTRIBUTABLE TO ANY BRANCH — it is `main`'s.**  **Attributed to `824032b7`** by walking the day's mainline with the `.so` pair, the deck and the test file all held fixed and only `src/` varying (`/pscratch/sd/j/jackm/bsegate_attrib_0809/`, `probe.sh` + per-commit `log_<sha>.txt`): GREEN at `e37c6a6e`, `7ac49f5e` and `4bcc5b40` (`= 824032b7^1`), RED with byte-identical numbers at `824032b7`, `9024deee`, `2ad51ef9`, `01e1e609` and — re-checked after `origin/main` moved during this lane — `d9d418db`.  **Mechanism proven by A/B on the cell itself** at `01e1e609`, the knob the only variable: `--band-degeneracy off` → **PASSES both arms**, zero guard lines in the log; `--band-degeneracy snap` → the failure above.  So with the window the deck asks for, current `main` still reproduces the frozen pin to better than 1e-6 eV — nothing else in `src/` has drifted.  **The re-cut trap, measured**: against the external reference, the snapped spectrum sits at MAE **21.729 meV** / max **80.803 meV** versus bands of 10 / 25, where the frozen reference itself sits at 6.522 / 9.840 — and the `_assert_aligned` guard does *not* divert it (best-drop ratio 0.913 against a 0.5 threshold), so the BerkeleyGW assert is genuinely reached and genuinely fails.  Freezing the new numbers would trade a red frozen arm for a red band arm.  **DECISION (1) TAKEN, 2026-08-10: the anchor deck pins `--band-degeneracy off`** — BerkeleyGW produced `bgw_eigenvalues_dft_ref.dat` at 4v4c and a silently widened window compares two different problems, which is the same confounding that `97735e01` refused for the q=0 head override on this very deck.  **DECISION (2) TAKEN, 2026-08-10** (owner, verbatim: "do strict"): **`strict` is the default** — a window that cuts a degenerate multiplet refuses with an actionable message naming the counts that would work, and never silently widens the calculation; `snap` stays as an explicit opt-in, `off` unchanged.  The question it closes is the one this row opened, and the evidence for it is this row plus the parity deck's false 28.6 meV "regression": `snap` silently re-windowed two BGW-parity decks in one day.  Landed as one name, `common.band_degeneracy.DEFAULT_MODE`, read by both drivers' `--band-degeneracy` and by every choke-point keyword default.  The `--band-degeneracy off` pin on this deck is unaffected and stays.  **The landing's neutrality control could not have caught this**: `EXCITON_BANDS_FEATURES.md` §1.6 compares base @ `f1e07bb6` at `--n-val 4 --n-cond 4` against the branch snapping *into* 4v4c on the MoS₂ deck and gets bit-identity, which proves the guard changes only *which* window is selected — true, and blind by construction to a deck where the selected window changes.  The five default-gate e2e cells were not run on that branch.  Evidence: `/pscratch/sd/j/jackm/bsegate_attrib_0809/` (`probe.sh`, `mech.sh`, `log_<sha>.txt`, `log_degen_off.txt` / `log_degen_snap.txt`, `dump_off.txt` / `dump_snap.txt`) |
