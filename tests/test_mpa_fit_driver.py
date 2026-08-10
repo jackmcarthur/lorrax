@@ -48,7 +48,8 @@ from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
-from gw.mpa import fit_driver, pade_fit, sampling, tiling         # noqa: E402
+from gw.mpa import (diagnostics, fit_driver, pade_fit,            # noqa: E402
+                    sampling, tiling)
 
 #: The synthetic FFT grid the centroid set lives on.
 _FFT = np.array([12, 12, 12], dtype=np.int64)
@@ -259,8 +260,21 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     kernel, staged block by block through ``write_fit_block``, and read
     again through ``read_fit_tensors`` after ``finalize_fit_store``.
     Nothing in this assertion touches an in-memory shortcut.
+
+    THE READ IS ``raw=True`` AND THAT IS NOT A SHORTCUT.
+    ``read_fit_tensors`` converts from the store's DECLARED energy unit to
+    Rydberg, and the planted field on this fixture is in Hartree (the
+    store stamps ``mpa_fit_energy_unit = 'Ha'``), so the default read
+    returns the planted poles multiplied by EXACTLY TWO.  This cell had
+    been red at that factor since the unit seam landed, and being red for
+    a unit reason masked the conditioning miss ``KNOWN_FAILURES.md``
+    row 3 records -- a bar missed by one order at ``cond ~ 8e9``, which
+    is a statement about the schedule and is the finding worth keeping.
+    Reading raw compares two Hartree quantities and lets the real bar be
+    the one under test.
     """
-    Om, Bp, diag, ledger = MS.read_fit_tensors(str(fitted["path"]))
+    Om, Bp, diag, ledger = MS.read_fit_tensors(str(fitted["path"]),
+                                               raw=True)
     assert ledger["complete"]
     assert Om.shape == planted["Omega"].shape
     assert Bp.shape == planted["B"].shape
@@ -367,7 +381,9 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys):
     assert report["n_cols_budget"] == 1
     assert report["blocks_walked"] == field["n_q"] * field["n_mu"]
 
-    Om, Bp, diag, _ = MS.read_fit_tensors(str(fit_path))
+    # raw=True: the planted field is in Hartree and the reader converts to
+    # Rydberg (see the end-to-end cell above for the full note).
+    Om, Bp, diag, _ = MS.read_fit_tensors(str(fit_path), raw=True)
     d_omega = float(np.max(np.abs(Om - field["Omega"])))
     d_b = float(np.max(np.abs(Bp - field["B"])))
     with capsys.disabled():
@@ -923,3 +939,114 @@ def test_a_declared_store_carries_its_content_into_the_fit_store(tmp_path,
     assert MS.require_correlation_part(
         MS.fit_completion_ledger(str(fit_path))["screening_content"],
         where="test") == "W_c"
+
+
+# ---------------------------------------------------------------------------
+# THE HARDENERS: the solve is named, stamped, and refused when unknown
+# ---------------------------------------------------------------------------
+
+def test_the_solve_mode_is_stamped_into_the_store(planted, tmp_path):
+    """A fit store can say which algebra made it.
+
+    The kernel gained a second denominator algebra on 2026-08-10 and
+    production reaches it through a CHANGED DEFAULT -- no deck key, no
+    stamp, no banner, which is the shape of change this campaign has
+    learned to treat as an emergency.  The stamp closes it, and it costs
+    no schema change: ``allocate_fit_store`` already writes every
+    ``provenance`` key as ``prov_<key>``, so the wedge lane's reader does
+    not move.
+
+    Asserted on the conditioning number too, because that is the field
+    the stamp makes interpretable: ``condition`` means the 2n x 2n
+    cross-multiplied system in one mode and the n x n Loewner matrix in
+    the other, and a reader with no stamp cannot tell which number it is
+    holding.
+    """
+    import h5py
+
+    for solve, affine in (("loewner", True), ("pade", False)):
+        dest = tmp_path / f"fit_{solve}_{affine}.h5"
+        fit_driver.run_fit_driver(
+            str(planted["w_path"]), _W_NAME, str(dest),
+            planted["z"], planted["n_p"], solve=solve, affine=affine)
+        with h5py.File(str(dest), "r") as h:
+            assert h.attrs["prov_solve_mode"] == solve
+            assert bool(h.attrs["prov_solve_affine"]) is affine
+            assert float(h.attrs["prov_solve_rcond"]) > 0.0
+
+
+def test_an_unknown_solve_mode_is_refused_not_defaulted(planted, tmp_path):
+    """A typo in the deck must not read as the default.
+
+    The refusal is the point: silently substituting the default for an
+    unrecognised name is exactly how a store gets written that cannot say
+    which algebra made it, which is the hazard the stamp above exists to
+    close.
+    """
+    with pytest.raises(ValueError, match="GATE fit_solve_mode_known"):
+        fit_driver.run_fit_driver(
+            str(planted["w_path"]), _W_NAME, str(tmp_path / "no.h5"),
+            planted["z"], planted["n_p"], solve="barycentric")
+
+
+def test_the_solve_is_named_in_the_cost_report(planted, fitted):
+    """An A/B arm's log is evidence of which arm it was."""
+    assert "solve " in fitted["text"]
+    assert "prov_solve_mode" in fitted["text"]
+
+
+def test_hardeners_leave_the_conditioning_call_path_alone(planted, tmp_path):
+    """OBLIGATION (a), by test: ``fit_one_block`` still asks
+    ``diagnostics.solve_conditioning`` for the store's two required
+    numbers, and asks it exactly once per block.
+
+    Inherited from the perf fleet's 1-fit-1-solve restructure, which
+    lands on top of these hardeners: the restructure's contract is that
+    the driver keeps calling the conditioning door and the door gets
+    cheap, NOT that the driver stops calling it.  A hardener that
+    quietly took the call out would leave that branch rebasing onto a
+    seam it expects to still be there.
+    """
+    calls = []
+    real = diagnostics.solve_conditioning
+
+    def spy(*a, **k):
+        calls.append(k.get("solve", "default"))
+        return real(*a, **k)
+
+    fit_driver.diagnostics.solve_conditioning = spy
+    try:
+        fit_driver.run_fit_driver(
+            str(planted["w_path"]), _W_NAME, str(tmp_path / "cp.h5"),
+            planted["z"], planted["n_p"], solve="loewner")
+    finally:
+        fit_driver.diagnostics.solve_conditioning = real
+
+    assert calls, "the driver stopped asking the conditioning door"
+    assert set(calls) == {"loewner"}, calls
+
+
+def test_hardeners_leave_the_store_format_surface_alone(planted, tmp_path):
+    """OBLIGATION (b), by test: the ledger semantics and the slab layout
+    the wedge reader depends on are byte-for-byte what they were.
+
+    A fit written with the hardeners present must be indistinguishable,
+    in SHAPE and in LEDGER, from one written without them -- the stamp is
+    additive metadata and nothing else.  The wedge lane reads
+    ``Omega_p`` / ``B_p`` as ``(n_p, n_q, N_mu, N_mu)`` and the ledger's
+    completion counts; both are asserted here rather than reviewed.
+    """
+    dest = tmp_path / "surface.h5"
+    ledger, _ = fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(dest),
+        planted["z"], planted["n_p"], solve="loewner")
+
+    Om, Bp, diag, led = MS.read_fit_tensors(str(dest), raw=True)
+    assert Om.shape == (planted["n_p"], planted["n_q"],
+                        planted["n_mu"], planted["n_mu"])
+    assert Bp.shape == Om.shape
+    assert led["complete"] and led["n_done"] == led["n_total"]
+    assert set(diag) >= {"condition", "backward_error", "residual",
+                         "n_valid"}
+    assert diag["condition"].shape == (planted["n_q"], planted["n_mu"],
+                                       planted["n_mu"])

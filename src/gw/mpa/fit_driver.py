@@ -110,6 +110,8 @@ def fit_one_block(
     guards=None,
     rcond=1.0e-13,
     out_spec=None,
+    solve=pade_fit.SOLVE_MODES[0],
+    affine=True,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -192,9 +194,10 @@ def fit_one_block(
 
     t_fit = time.perf_counter()
     Omega, B, diag = pade_fit.fit_mpa_poles_batched(
-        tile, z, n, guards=guards, rcond=rcond)
+        tile, z, n, guards=guards, rcond=rcond, solve=solve, affine=affine)
     cond_diag = diagnostics.diagnostics_batched(
-        diagnostics.solve_conditioning, tile, z, n, rcond=rcond)
+        diagnostics.solve_conditioning, tile, z, n, rcond=rcond,
+        solve=solve, affine=affine)
     Omega = np.asarray(Omega)
     B = np.asarray(B)
     t_fit = time.perf_counter() - t_fit
@@ -249,6 +252,8 @@ def run_fit_driver(
     certification=None,
     provenance=None,
     report_stream=None,
+    solve=pade_fit.SOLVE_MODES[0],
+    affine=True,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
 
@@ -265,6 +270,15 @@ def run_fit_driver(
     is given; a memory decision that only appears in a traceback is a
     decision nobody reads.
     """
+    if solve not in pade_fit.SOLVE_MODES:
+        raise ValueError(
+            f"GATE fit_solve_mode_known: solve={solve!r} is not one of "
+            f"{pade_fit.SOLVE_MODES}.  FALSE case: the deck names a "
+            "denominator algebra the fit kernel implements.  This is a "
+            "REFUSAL and not a fallback on purpose: the whole hazard the "
+            "stamp below exists to close is a fit store that cannot say "
+            "which algebra made it, and silently substituting the default "
+            "for a typo is how that store gets written.")
     n = int(n_p)
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
@@ -324,9 +338,15 @@ def run_fit_driver(
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
-        provenance=provenance)
+        provenance=dict(provenance or {},
+                        solve_mode=str(solve),
+                        solve_affine=bool(affine),
+                        solve_rcond=float(rcond)))
 
     report = {
+        "solve": str(solve),
+        "affine": bool(affine),
+        "rcond": float(rcond),
         "screening_content": content,
         "n_q": int(n_q),
         "n_mu": int(n_mu),
@@ -355,7 +375,7 @@ def run_fit_driver(
         stats = fit_one_block(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
             tile_bytes=tile_bytes, guards=guards, rcond=rcond,
-            out_spec=spec)
+            out_spec=spec, solve=solve, affine=affine)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1
         report["columns_read"] += stats["n_cols"]
@@ -425,6 +445,17 @@ def format_cost_report(report):
         "-" * 60,
         f"  geometry        n_q={r['n_q']} N_mu={r['n_mu']} "
         f"n_omega={r['n_omega']} n_p={r['n_p']}",
+        # THE SOLVE, NAMED, IN THE LOG.  The kernel gained a second
+        # denominator algebra on 2026-08-10 and production reaches it
+        # through a DEFAULT, so without this line an A/B arm's log is not
+        # evidence of which arm it was -- and the standing spec gap is
+        # that an unknown deck key logs and proceeds, which means a typo
+        # in the deck reads as the default everywhere except here.
+        f"  solve           {r['solve']}"
+        + (f" (affine={r['affine']})" if r['solve'] == 'pade' else "")
+        + f", rcond={r['rcond']:.1e}"
+        + "  [stamped as prov_solve_mode / prov_solve_affine /"
+        " prov_solve_rcond]",
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "
         f"{r['n_cols_budget']} columns per block",

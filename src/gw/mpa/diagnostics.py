@@ -31,25 +31,48 @@ import jax.numpy as jnp
 from . import pade_fit
 
 
-def solve_conditioning(W_samples, z_samples, n_p, *, rcond=1.0e-13):
-    """Conditioning and backward error of the Pade-in-z^2 linear solve.
+def solve_conditioning(
+    W_samples,
+    z_samples,
+    n_p,
+    *,
+    rcond=1.0e-13,
+    solve=pade_fit.SOLVE_MODES[0],
+    affine=True,
+):
+    """Conditioning and backward error of the DENOMINATOR solve.
+
+    Follows ``solve`` (and ``affine``) so that the number stamped into a
+    fit store is the conditioning of the algebra that actually produced
+    that store's poles.  Reporting the Pade system's condition beside
+    Loewner poles would be a measurement of a matrix nobody inverted.
 
     Returns a dict with
 
     ``cond``
-        2-norm condition number of the row-equilibrated cross-multiplied
-        system.  This is the number that decides whether the companion
-        roots mean anything: the theory plan's ranked risk 6 is precisely
-        "Vandermonde/companion conditioning fails at any scheduled n_p",
-        and the papers' ``n_p <= 15`` range is not evidence of safety.
+        2-norm condition number of the matrix the chosen mode inverts:
+        the row-equilibrated ``2n x 2n`` cross-multiplied system for
+        ``solve="pade"``, the ``n x n`` Loewner matrix ``L`` for
+        ``solve="loewner"``.  This is the number that decides whether the
+        recovered poles mean anything: the theory plan's ranked risk 6 is
+        precisely "Vandermonde/companion conditioning fails at any
+        scheduled n_p", and the papers' ``n_p <= 15`` range is not
+        evidence of safety.  It is also the number that measured the
+        2026-08-10 rung-10 failure -- ``9.02e19`` on the shipped solve,
+        past ``1/eps`` in double.
     ``sigma_max``, ``sigma_min``
         The extreme singular values behind ``cond``.
     ``backward_error``
+        The relative size of the perturbation to the solved system for
+        which the computed answer is the exact solution:
         ``||A y - rhs|| / (||A|| ||y|| + ||rhs||)`` on the equilibrated
-        system -- the relative size of the perturbation to ``(A, rhs)``
-        for which the computed ``y`` is the exact solution.  A small
-        backward error with a large ``cond`` is the signature to report:
-        the solve was done correctly and the ANSWER is still untrustworthy.
+        Pade system, and ``||L X - sL|| / (||L|| ||X|| + ||sL||)`` on the
+        Loewner reduction.  A small backward error with a large ``cond``
+        is the signature to report: the solve was done correctly and the
+        ANSWER is still untrustworthy.  That pairing is exactly what the
+        rung-10 measurement found (backward error 1.48e-12 at
+        ``cond = 9.02e19``), and it is why the repair had to be a change
+        of algebra rather than a more careful solve of the same system.
     ``forward_residual``
         ``max_j |W_model(z_j) - W_c(z_j)|`` of the finished fit, i.e.
         after roots, guards and the residue refit.  Kept alongside the
@@ -62,27 +85,98 @@ def solve_conditioning(W_samples, z_samples, n_p, *, rcond=1.0e-13):
     w = jnp.asarray(W_samples, dtype=jnp.complex128)
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
 
-    A, rhs, _, _ = pade_fit.build_pade_system(w, z, n)
-    row_norm = jnp.linalg.norm(A, axis=1)
-    row_norm = jnp.where(row_norm > 0, row_norm, 1.0)
-    A_n = A / row_norm[:, None]
-    rhs_n = rhs / row_norm
-
-    y, cond, s_max, s_min = pade_fit._solve_normalised(A, rhs, rcond)
-    num = jnp.linalg.norm(A_n @ y - rhs_n)
-    den = (jnp.linalg.norm(A_n) * jnp.linalg.norm(y)
-           + jnp.linalg.norm(rhs_n))
-    den = jnp.where(den > 0, den, 1.0)
-
-    Omega, B, diag = pade_fit.fit_mpa_poles(w, z, n, rcond=rcond)
+    # ONE FIT, ONE SOLVE.  Every field below is now something
+    # ``fit_mpa_poles`` already computed on its way to the poles, so this
+    # function no longer re-solves the system and no longer refits the
+    # element -- which is what the driver's cost report called out as the
+    # seam the design review could remove, and what the perf lane's
+    # §FIT-EFFICIENCY diff removes.  The backward error agrees with the
+    # fit's BY CONSTRUCTION rather than by an argument about operand
+    # order, because it IS the fit's.
+    _, _, diag = pade_fit.fit_mpa_poles(
+        w, z, n, rcond=rcond, solve=solve, affine=affine)
     return {
-        "cond": cond,
-        "sigma_max": s_max,
-        "sigma_min": s_min,
-        "backward_error": num / den,
+        "cond": diag["cond_pade"],
+        "sigma_max": diag["sigma_max_pade"],
+        "sigma_min": diag["sigma_min_pade"],
+        "backward_error": diag["backward_error"],
         "forward_residual": diag["max_abs_residual"],
         "rel_rms_residual": diag["rel_rms_residual"],
+        "rsd_eq28": diag["rsd_eq28"],
         "n_valid": diag["n_valid"],
+    }
+
+
+#: Hartree -> eV, for the width census only.  The fit itself never
+#: converts units; ``Omega_p`` is in whatever unit ``z_samples`` was.
+_HA_EV = 27.211386245988
+
+
+def residue_width_census(
+    Omega, B, valid=None, *, edges_ev=(4.0, 16.0), energy_unit="Ha"
+):
+    """WHERE THE RESIDUE MASS SITS, resolved by fitted width.
+
+    An AGGREGATION over elements, unlike everything else in this module,
+    and it is here rather than in a reporting script because it is the
+    instrument that saw the 2026-08-10 rung-10 failure in its physical
+    form: at ``n_p = 8`` the shipped fit put 1.5 % of ``sum_p |B_p|`` on
+    poles wider than 16 eV, and at ``n_p = 10`` it put **49 %** there.
+    Two extra poles bought no structure; the fit spent them on modes
+    broader than the plasmon itself, which is what an ill-conditioned
+    rational fit does with freedom the data cannot determine.  A
+    conditioning number alone would not have said that, and a residual
+    alone would not have said it either.
+
+    Parameters
+    ----------
+    Omega, B
+        ``(..., n_p)`` -- a batch of fitted pole sets and residues, e.g.
+        straight off ``fit_mpa_poles_batched``.
+    valid
+        ``(..., n_p)`` bool; pruned poles carry ``B_p = 0`` already, so
+        this only makes the intent explicit.
+    edges_ev
+        Width thresholds in eV.  ``Gamma = |Im Omega|``, the fitted
+        half-width, on the same convention as the campaign's tables.
+    energy_unit
+        Unit of ``Omega``; ``"Ha"`` or ``"eV"``.
+
+    Returns
+    -------
+    dict
+        ``mass_fraction_above`` -- one entry per edge, the fraction of
+        total ``|B|`` on poles wider than that edge; plus the live-mode
+        count and the ``|B|``-weighted width percentiles the campaign's
+        census tables quote.
+    """
+
+    if energy_unit not in ("Ha", "eV"):
+        raise ValueError(
+            f"GATE census_energy_unit: energy_unit={energy_unit!r} is not "
+            "one of ('Ha', 'eV'). FALSE case: the caller names the unit "
+            "Omega is in -- the census thresholds are in eV and the fit "
+            "never converted anything.")
+    to_ev = _HA_EV if energy_unit == "Ha" else 1.0
+
+    om = jnp.asarray(Omega, dtype=jnp.complex128)
+    b = jnp.asarray(B, dtype=jnp.complex128)
+    live = jnp.ones(om.shape, dtype=bool) if valid is None else jnp.asarray(
+        valid)
+    mag = jnp.where(live, jnp.abs(b), 0.0)
+    gamma_ev = jnp.abs(jnp.imag(om)) * to_ev
+    total = jnp.sum(mag)
+    total = jnp.where(total > 0, total, 1.0)
+
+    return {
+        "n_live": jnp.sum(live.astype(jnp.int32)),
+        "mass_total": jnp.sum(mag),
+        "mass_fraction_above": {
+            float(e): jnp.sum(jnp.where(gamma_ev > e, mag, 0.0)) / total
+            for e in edges_ev
+        },
+        "gamma_ev_p50": jnp.median(jnp.where(live, gamma_ev, jnp.nan)),
+        "gamma_ev_weighted_mean": jnp.sum(mag * gamma_ev) / total,
     }
 
 
@@ -107,7 +201,8 @@ def default_holdout_indices(n_p):
 
 
 def holdout_residual(
-    W_samples, z_samples, n_p, *, holdout=None, rcond=1.0e-13
+    W_samples, z_samples, n_p, *, holdout=None, rcond=1.0e-13,
+    solve=pade_fit.SOLVE_MODES[0], affine=True,
 ):
     """Fit on ``2*n_p - 2`` samples, evaluate on the 2 held out.
 
@@ -148,7 +243,8 @@ def holdout_residual(
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
 
     Omega, B, diag = pade_fit.fit_mpa_poles(
-        w[keep_arr], z[keep_arr], n - 1, rcond=rcond)
+        w[keep_arr], z[keep_arr], n - 1, rcond=rcond, solve=solve,
+        affine=affine)
     model = pade_fit.eval_mpa_model(
         Omega, B, z[held_arr], valid=diag["valid"])
     ref = w[held_arr]
@@ -190,6 +286,8 @@ def perturbation_refit(
     error_vector,
     *,
     rcond=1.0e-13,
+    solve=pade_fit.SOLVE_MODES[0],
+    affine=True,
 ):
     """Refit under a certified sample-error vector; report the movement.
 
@@ -233,8 +331,9 @@ def perturbation_refit(
             "error_vector.shape == (2*n_p,) -- one certified complex error "
             "per sample, absolute and in the units of W_samples.")
 
-    Om0, B0, d0 = pade_fit.fit_mpa_poles(w, z, n, rcond=rcond)
-    Om1, B1, d1 = pade_fit.fit_mpa_poles(w + dw, z, n, rcond=rcond)
+    kw = dict(rcond=rcond, solve=solve, affine=affine)
+    Om0, B0, d0 = pade_fit.fit_mpa_poles(w, z, n, **kw)
+    Om1, B1, d1 = pade_fit.fit_mpa_poles(w + dw, z, n, **kw)
 
     d_omega, live = _match_poles(Om0, Om1, d0["valid"], d1["valid"])
     d_b, _ = _match_poles(B0, B1, d0["valid"], d1["valid"])

@@ -15,15 +15,19 @@ claim:
 * the nested-partition property.
 
 PRECISION NOTE.  "Near machine precision" for this kernel means
-``cond(A) * eps``, not ``eps``.  The Pade-in-z^2 system at ``n_p = 8``
-over a Si-like span has a condition number of order ``5e7`` even after
-the z_max rescaling and row equilibration -- that is a property of the
-monomial Vandermonde the published method prescribes, not of this
-implementation, and it is exactly the theory plan's ranked risk 6.  The
-measured recovery below is ``|dOmega| ~ 3e-9`` and ``|dB| ~ 1e-8``,
-which is the conditioning limit; the asserted tolerances sit one decade
-above the measurement so the test reports a regression rather than
-weather.
+``cond * eps``, not ``eps``, and WHICH ``cond`` depends on the solve.
+The published Pade-in-z^2 system at ``n_p = 8`` over a Si-like span has
+a condition number of order ``1e8`` even after the z_max rescaling and
+row equilibration -- a property of the monomial Vandermonde the papers
+prescribe, not of this implementation, and exactly the theory plan's
+ranked risk 6.  The default solve is the Loewner pencil, which on the
+same element reports ``9.6e4``; the recovery below moves with it, from
+``|dOmega| ~ 1.7e-9`` on the shipped solve to ``7.3e-13``.  Tolerances
+are asserted one decade above the WORST mode a cell exercises, so a
+test reports a regression rather than weather -- and the reconditioning
+ladder has a cell of its own
+(``test_reconditioning_lowers_the_condition_number``) so the improvement
+is asserted somewhere rather than only enjoyed everywhere.
 """
 
 import time
@@ -391,22 +395,175 @@ def test_noise_robustness_bounded_pole_movement(capsys):
 
 
 def test_diagnostics_conditioning_and_backward_error():
-    """A correct solve of an ill-conditioned system reports BOTH facts."""
+    """A correct solve of an ill-conditioned system reports BOTH facts.
+
+    The claim under test is the PAIRING, and it is checked on the solve
+    that has the disease.  ``solve="pade", affine=False`` is the shipped
+    2026-08-09 algebra: a tiny backward error -- the linear algebra was
+    done right -- beside a condition number large enough that the ANSWER
+    is only good to ``cond * eps``.  A small backward error on its own
+    would look like a clean bill of health, which is why both are
+    reported and why this test asserts both.
+    """
 
     n_p = 8
     z = _grid(n_p, omega_m=4.0)
     Omega_t, B_t = _si_like_poles(n_p)
     W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
 
-    cnd = diagnostics.solve_conditioning(W, z, n_p)
-    # Tiny backward error: the linear algebra was done right.
+    cnd = diagnostics.solve_conditioning(W, z, n_p, solve="pade",
+                                         affine=False)
     assert float(cnd["backward_error"]) < 1.0e-12
-    # Large condition number: the ANSWER is still only good to cond*eps.
-    # This pairing is the whole point of reporting both -- a small
-    # backward error alone would look like a clean bill of health.
     assert float(cnd["cond"]) > 1.0e6
     assert float(cnd["forward_residual"]) < 1.0e-7
     assert int(cnd["n_valid"]) == n_p
+
+
+def test_reconditioning_lowers_the_condition_number(capsys):
+    """THE LADDER, on synthesized data: each mode against the shipped one.
+
+    Ordered as the 2026-08-10 design ordered them -- the affine domain
+    map first, the Loewner pencil second -- and asserted as a strict
+    descent, because a reconditioning that does not recondition is the
+    failure this test exists to catch.  The margins asserted sit well
+    inside the measured ones (at ``n_p = 8`` on this synthetic element:
+    1.17e8 -> 4.16e6 -> 9.64e4) so the test reports a regression rather
+    than weather.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    ref_O, _ = _sorted_like_fit(Omega_t, B_t)
+
+    conds, errs = {}, {}
+    for name, kw in (("shipped", dict(solve="pade", affine=False)),
+                     ("affine", dict(solve="pade", affine=True)),
+                     ("loewner", dict(solve="loewner"))):
+        Omega, B, diag = pade_fit.fit_mpa_poles(W, z, n_p, **kw)
+        conds[name] = float(diag["cond_pade"])
+        errs[name] = float(np.max(np.abs(np.asarray(Omega) - ref_O)))
+        # Whatever the algebra, the guards saw a healthy pole set.
+        assert int(diag["n_valid"]) == n_p
+
+    with capsys.disabled():
+        print("\n[recondition ladder n_p=8] "
+              + "  ".join(f"{k}: cond={conds[k]:.3e} |dOmega|={errs[k]:.3e}"
+                          for k in ("shipped", "affine", "loewner")))
+
+    # Each step improves the conditioning by at least a decade.
+    assert conds["affine"] < conds["shipped"] / 10.0
+    assert conds["loewner"] < conds["affine"] / 10.0
+    # And the recovered poles are no worse for it.
+    assert errs["affine"] <= errs["shipped"]
+    assert errs["loewner"] <= errs["shipped"]
+
+
+@pytest.mark.parametrize("n_p", [1, 2, 4, 8, 10, 12])
+def test_loewner_recovers_planted_poles(n_p):
+    """The default solve, across the whole scheduled range and past it.
+
+    ``n_p = 10`` and ``12`` are the rungs where the shipped solve went
+    numerically singular on the production deck, so they are in the
+    parametrisation deliberately: this is the range the reconditioning
+    was for.
+    """
+
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    Omega, B, diag = pade_fit.fit_mpa_poles(W, z, n_p)
+    ref_O, ref_B = _sorted_like_fit(Omega_t, B_t)
+
+    assert int(diag["n_valid"]) == n_p
+    assert np.max(np.abs(np.asarray(Omega) - ref_O)) < 1.0e-6
+    assert np.max(np.abs(np.asarray(B) - ref_B)) < 1.0e-5
+
+
+def test_solve_mode_leaves_the_representation_alone():
+    """Same shapes, same dtypes, same diagnostic keys, either mode.
+
+    The representation contract: the fit's OUTPUT is ``(Omega_p, B_p)``
+    and a diagnostics pytree, and nothing downstream may be able to tell
+    which algebra produced them.  A mode that quietly grew a key would
+    break ``mpa_store.write_fit_block``, which stamps the diagnostic key
+    set on the first block and refuses a later block reporting another.
+    """
+
+    n_p = 6
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+
+    ref = pade_fit.fit_mpa_poles(W, z, n_p, solve="pade")
+    new = pade_fit.fit_mpa_poles(W, z, n_p, solve="loewner")
+    for a, b in zip(ref[:2], new[:2]):
+        assert a.shape == b.shape and a.dtype == b.dtype
+    assert set(ref[2]) == set(new[2])
+    for k in ref[2]:
+        assert np.shape(ref[2][k]) == np.shape(new[2][k]), k
+
+
+def test_loewner_is_jit_and_vmap_clean():
+    """``jit`` over the batched fit, with ``n_p`` static.
+
+    The perf lane jits this path, so static shapes and a trace-time-only
+    branch on ``solve`` are a design constraint rather than a nicety.
+    Asserted bit-identically against the un-jitted call: a jit that
+    changed an answer would be a different kernel, not a faster one.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    tile = np.stack([W, 1.5 * W, 0.1 * W])
+
+    eager = pade_fit.fit_mpa_poles_batched(tile, z, n_p)
+    fn = jax.jit(
+        lambda t, zz: pade_fit.fit_mpa_poles_batched(t, zz, n_p),
+    )
+    jitted = fn(jnp.asarray(tile), jnp.asarray(z))
+    for a, b in zip(eager[:2], jitted[:2]):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_gate_solve_mode_known():
+    """An unknown solve mode is refused by name, not silently defaulted."""
+
+    n_p = 4
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    with pytest.raises(ValueError, match="GATE solve_mode_known"):
+        pade_fit.fit_mpa_poles(W, z, n_p, solve="barycentric")
+
+
+def test_residue_width_census_locates_the_mass():
+    """The census puts the mass where the planted broad mode is.
+
+    Two poles, one narrow and one broad, with the broad one carrying
+    three quarters of ``|B|``.  The census must report that fraction
+    above the 16 eV edge and nothing above it when the broad mode is
+    removed -- this is the instrument that read 49 % at rung 10, and an
+    instrument that cannot be pointed at a known answer is not one.
+    """
+
+    ha_ev = 27.211386245988
+    Omega = np.asarray([[0.5 - 0.05j, 1.5 - 1.0j]], dtype=np.complex128)
+    B = np.asarray([[0.25 + 0j, 0.75 + 0j]], dtype=np.complex128)
+    assert 0.05 * ha_ev < 16.0 < 1.0 * ha_ev
+
+    census = diagnostics.residue_width_census(Omega, B)
+    assert float(census["mass_fraction_above"][16.0]) == pytest.approx(0.75)
+    assert float(census["mass_fraction_above"][4.0]) == pytest.approx(0.75)
+    assert int(census["n_live"]) == 2
+
+    dead = diagnostics.residue_width_census(
+        Omega, B, valid=np.asarray([[True, False]]))
+    assert float(dead["mass_fraction_above"][16.0]) == pytest.approx(0.0)
+    assert int(dead["n_live"]) == 1
 
 
 def test_diagnostics_holdout_discriminates():
@@ -716,3 +873,113 @@ def test_gate_synthesis_off_pole():
     # FALSE case: a pole with a finite width is off every sample.
     pade_fit.synthesize_w_samples(
         np.array([1.0 - 0.1j]), np.array([1.0 + 0.0j]), z)
+
+
+def test_fit_reports_its_own_backward_error():
+    """One fit, one solve: the diagnostics no longer re-derive the fit.
+
+    The perf lane's §FIT-EFFICIENCY finding, folded: the store REQUIRES a
+    backward error, the kernel used to return only the condition number,
+    and the only supplier re-solved the system and refit the element to
+    report a forward residual beside it -- two fits and three solves per
+    element for one block.  The fit now carries the key, and
+    ``solve_conditioning`` reads it, so the two agree BY CONSTRUCTION.
+    Asserted for both modes, because a mode that grew a different
+    definition would be a second definition wearing one name.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+
+    for kw in (dict(solve="pade", affine=False),
+               dict(solve="pade", affine=True),
+               dict(solve="loewner")):
+        diag = pade_fit.fit_mpa_poles(W, z, n_p, **kw)[2]
+        cnd = diagnostics.solve_conditioning(W, z, n_p, **kw)
+        assert "backward_error" in diag
+        assert float(diag["backward_error"]) < 1.0e-12
+        for a, b in (("backward_error", "backward_error"),
+                     ("cond_pade", "cond"),
+                     ("sigma_max_pade", "sigma_max"),
+                     ("sigma_min_pade", "sigma_min")):
+            assert float(diag[a]) == float(cnd[b]), (kw, a)
+
+
+@pytest.mark.parametrize("n_true,n_p", [(1, 8), (2, 8), (3, 10), (5, 12)])
+def test_red_twin_more_poles_than_the_data_has(n_true, n_p):
+    """RED TWIN: fewer true poles than fitted poles, the silent failure.
+
+    Plant ``n_true`` poles and ask for ``n_p > n_true``.  The Loewner
+    matrix is then rank-deficient by construction, the truncated
+    pseudo-inverse makes ``L^+ sL`` rank-deficient too, and an ``n x n``
+    matrix of rank ``r`` has ``n - r`` eigenvalues at EXACTLY zero --
+    which rounding scatters to ``|b| ~ eps``.  ``sqrt`` then turns those
+    into ``|Omega|/scale ~ 1e-8``, which the admissible box's low edge
+    (a floor on ``|Omega|``, hence ``1e-20`` on ``|b|``) never sees.
+
+    WHY IT IS NOT MERELY UNTIDY.  The insulator grid puts a sample at
+    ``z = 0`` exactly, so ``x_hat = 0`` is a sample point, and a
+    surviving pole at ``b ~ 1e-18`` gives the residue system a column
+    ``1/(x_hat_j - b_p)`` of norm ``~1e18``.  The truncated-SVD residue
+    solve then discards the real poles' directions as the small ones and
+    puts EVERY bit of the residue mass on the artefact.  Measured before
+    the ``prune_null`` guard existed: ``n_true = 3``, ``n_p = 10``,
+    100 % of the mass on one spurious pole and the samples reproduced to
+    a relative 1.0 -- i.e. not at all, silently, with a finite smooth
+    plausible-looking pole set.
+
+    The assertions are the ones that catch that: the count of live poles,
+    the rebuilt W at the samples, and the mass on anything unplanted.
+    """
+
+    z = sampling.double_parallel_grid(n_p, 2.524)
+    rng = np.random.default_rng(3)
+    a = np.linspace(0.4, 1.8, n_true)
+    Omega_t = (a - 1j * (0.05 + 0.05 * np.arange(n_true))).astype(
+        np.complex128)
+    B_t = ((0.5 + rng.random(n_true))
+           * np.exp(2j * np.pi * rng.random(n_true))).astype(np.complex128)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    scale = float(np.sqrt(np.max(np.abs(z * z))))
+
+    Omega, B, diag = pade_fit.fit_mpa_poles(W, z, n_p, solve="loewner")
+    Omega, B = np.asarray(Omega), np.asarray(B)
+    valid = np.asarray(diag["valid"])
+
+    # The invented poles are pruned and the true ones are not.
+    assert int(diag["n_valid"]) == n_true
+    assert int(diag["n_pruned_null"]) == n_p - n_true
+
+    # The rebuilt W is the honest gate and it is at round-off.
+    model = np.asarray(pade_fit.eval_mpa_model(Omega, B, z, valid=valid))
+    assert np.max(np.abs(model - W)) <= 1.0e-12 * np.max(np.abs(W))
+
+    # No residue mass sits anywhere but on a planted pole.
+    live = np.abs(np.where(valid, B, 0.0))
+    far = np.min(np.abs(Omega[:, None] - Omega_t[None, :]), axis=1)
+    leaked = live[valid & (far > 1.0e-3 * scale)].sum()
+    assert leaked <= 1.0e-10 * max(live.sum(), 1.0e-300)
+
+
+def test_null_guard_is_inert_on_a_well_posed_fit():
+    """The safety net must not catch anything it was not built for.
+
+    Measured on the production ``W_c`` store: the guard fires on ZERO of
+    758,016 poles across rungs 1, 2, 8 and 10 in both solve modes, and
+    ``B_p`` is bit-identical with the guard disabled.  That is what makes
+    it safe to add to a solve whose fits are already on disk.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    for kw in (dict(solve="pade", affine=False), dict(solve="loewner")):
+        on = pade_fit.fit_mpa_poles(W, z, n_p, **kw)
+        off = pade_fit.fit_mpa_poles(
+            W, z, n_p, guards={"prune_null": False}, **kw)
+        assert int(on[2]["n_pruned_null"]) == 0
+        assert np.array_equal(np.asarray(on[1]), np.asarray(off[1]))
+        assert np.array_equal(np.asarray(on[0]), np.asarray(off[0]))
