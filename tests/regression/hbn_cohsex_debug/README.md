@@ -1,14 +1,27 @@
 hBN 3x3x2 COHSEX regression fixture — the NON-CUBIC cell
 =========================================================
 
-**FROZEN 2026-08-07, OWNER-AUTHORIZED.**  `eqp_hbn_ref.dat` is the frozen
-reference.  It is a byte copy of the candidate produced by the
-reference-generation run of 2026-08-07/08
-(`/pscratch/sd/j/jackm/svc_vcoul/hbn_fixture_prep/eqp_hbn_ref.candidate.dat`,
+**RE-FROZEN 2026-08-09, OWNER-AUTHORIZED.**  `eqp_hbn_ref.dat` is the frozen
+reference.  It is a byte copy of the candidate produced by the re-freeze run
+of 2026-08-09 (`/pscratch/sd/j/jackm/refreeze_0809/hbn_run1/eqp_hbn_test.dat`,
+whole-file md5 `ed4726a9b3f25a91b6f9c118516892bb`, data-lines md5
+`26f241dbb01bdeb8a44b75e04bbcb829`), made at `main` `9a730da8` with the deck's
+own "Reproducing by hand" recipe below.
+
+**Why it was re-frozen.**  `9a730da8` re-cut this deck's `dipole.h5` on the
+`+1` nonlocal-velocity arm, and this reference still encoded the legacy `-1`
+arm, so the freeze gate was red on `main` from that commit onward.  The owner
+authorised the re-freeze on 2026-08-09.  The movement is measured and split
+in "What the re-freeze absorbed" below — read that section before quoting any
+number here as a comparison against the 2026-08-07 freeze.
+
+The first freeze (2026-08-07, superseded) was a byte copy of
+`/pscratch/sd/j/jackm/svc_vcoul/hbn_fixture_prep/eqp_hbn_ref.candidate.dat`,
 whole-file md5 `14035d12ca40a45e392b54528ee3c76c`, data-lines md5
-`d4a7e4502a277e4aa203303042e792ec`).  The full 381-line evidence record is
+`d4a7e4502a277e4aa203303042e792ec`.  Its full 381-line evidence record is
 `candidate.README` in that directory; the plan and its execution log are
-`README_PLAN.md` here.
+`README_PLAN.md` here, and everything they say about *why this fixture exists*
+still stands unchanged — only the pinned digits moved.
 
 Why this fixture exists, in one paragraph
 -----------------------------------------
@@ -69,10 +82,10 @@ What is in this directory
 |---|---|---|
 | `WFN.h5` | `ff4f745bea20ee2892db0ea852452e06` | mean field, 67.6 MB (see "Why the binaries are tracked") |
 | `kin_ion.h5` | `cb5e7f7c0276087c14f5a73a824941f4` | kinetic + ionic + V_H |
-| `dipole.h5` | `a38de4bae19713cb1765570f2bc816c6` | dipole matrix elements |
+| `dipole.h5` | `24ba16ec14464649f0a679d7800ce106` | dipole matrix elements, **`+1` arm** (re-cut at `9a730da8`; the legacy `-1` file was `a38de4bae19713cb1765570f2bc816c6`) |
 | `centroids_frac_330.txt` | `2bbfee1219eec8091d269a876ba04eed` | the ISDF centroid set |
 | `cohsex_hbn_test.in` | — | the deck (as run, minus the retired `output_file` key) |
-| `eqp_hbn_ref.dat` | `14035d12ca40a45e392b54528ee3c76c` | **the frozen reference** |
+| `eqp_hbn_ref.dat` | `ed4726a9b3f25a91b6f9c118516892bb` | **the frozen reference** (re-frozen 2026-08-09; the superseded one was `14035d12ca40a45e392b54528ee3c76c`) |
 | `qe/{scf,nscf,pw2bgw}.in` | — | the mean-field inputs AS RUN |
 | `README_PLAN.md` | — | the plan + the 2026-08-07 execution record |
 
@@ -97,6 +110,31 @@ is exactly the shape of the 2026-07-25 incident it was written for.
 
 Provenance — every number below is measured, not assumed
 ---------------------------------------------------------
+
+### The 2026-08-09 re-freeze — where the CURRENT `eqp_hbn_ref.dat` came from
+
+| item | value |
+|---|---|
+| generated | 2026-08-09, Perlmutter |
+| tree | `/pscratch/sd/j/jackm/refreeze_0809/wt_main`, detached at `main` `9a730da8` |
+| **OWNER AUTHORIZATION** | **2026-08-09** — the owner authorised re-freezing this reference on the `+1` velocity-sign arm after that arm landed at `9a730da8` |
+| module / `.so` pin | `LX_BASE_MODULE=lorrax_J070`; `LORRAX_FFI_SO` + `LORRAX_FFI_HOST_SO` from `/pscratch/sd/j/jackm/restage_candidate_2026-08-08/` (md5 `c680c229…` device, `91f330c3…` host) — the pair BUILD_NOTES requires for any tree at or past the merge checkpoint, and the pair `9a730da8` itself was cut under |
+| allocation | `56554959` (`lx-alloc-jackm`, the shared pool) |
+| lx steps | re-freeze run1 `lx-Xg1-225308-2063270-9342` (1×1 mesh, 20 s), run2 `lx-Xg1-225331-2064639-7758` (1×1, 20 s), run3 `lx-Xg4-225352-2065203-2665` (2×2 / 4 processes, 41 s), legacy-arm attribution leg `lx-Xg1-225740-2074839-6963` |
+| working directory | `/pscratch/sd/j/jackm/refreeze_0809/{hbn_run1,hbn_run2,hbn_run3,hbn_legacy}` + the `.log` beside each |
+
+**Which of the three runs is the file.**  `hbn_run1`, the 1×1-mesh
+single-process one — the mesh `tests/conftest.py` makes the gate run on.  The
+data lines are identical in all three, so the choice cannot move a digit; it
+is made this way so the frozen bytes and the gate's own arithmetic come from
+the same device count.
+
+### The original 2026-08-07 generation — mean field, centroids, and inputs
+
+Everything in this table still describes the tracked `WFN.h5`, `kin_ion.h5`
+and `centroids_frac_330.txt`, which the re-freeze did **not** regenerate.  The
+`deck run1`/`run2`/`arm A`/`arm B` steps in it produced the SUPERSEDED
+reference and the perturbation-arm numbers quoted further down.
 
 | item | value |
 |---|---|
@@ -179,24 +217,69 @@ Reproducibility — why the reference supports a tight pin
 ---------------------------------------------------------
 
 **THREE independent runs, all byte-identical on the data lines**, at
-data-lines md5 `d4a7e4502a277e4aa203303042e792ec`:
+data-lines md5 `26f241dbb01bdeb8a44b75e04bbcb829`.  The re-freeze repeated
+the property the first freeze established, on the new arm:
 
 | run | mesh | processes | step | data-lines md5 |
 |---|---|---|---|---|
-| run1 (**the reference**) | 2x2 | 4 | `lx-Xg4-203742-806888-1087` | `d4a7e450…` |
-| run2 | 2x2 | 4 | `lx-Xg4-203837-812302-1290` | `d4a7e450…` |
-| freeze-time reproduction | 1x1 | 1 | `lx-Xg1-224004-2009716-2551` | `d4a7e450…` |
+| run1 (**the reference**) | 1x1 | 1 | `lx-Xg1-225308-2063270-9342` | `26f241db…` |
+| run2 | 1x1 | 1 | `lx-Xg1-225331-2064639-7758` | `26f241db…` |
+| run3 | 2x2 | 4 | `lx-Xg4-225352-2065203-2665` | `26f241db…` |
 
-`delta_run2_vs_run1.txt`: every column MAE, max|Δ| and rms **exactly 0.000000
-meV** over all 1440 rows.  The third run matters on its own: the pytest
-harness pins **one** GPU per process (`tests/conftest.py::pytest_configure`),
-so the gate runs this deck on a 1-device mesh while the reference was made on
-a 2x2 one.  It was verified at the freeze that the two agree byte for byte,
-so the gate is comparing like with like.  Whole-file md5s differ between runs
-for exactly one reason — line 1 is
+One hash, three runs, both process counts.  That third run is the one that
+matters on its own: the pytest harness pins **one** GPU per process
+(`tests/conftest.py::pytest_configure`), so the gate runs this deck on a
+1-device mesh, and pinning a reference cut on a 2x2 mesh would only be honest
+if the two agree.  They do, on this arm as on the last one.  Whole-file md5s
+differ between runs for exactly one reason — line 1 is
 `# Generated by LORRAX unknown at <UTC timestamp>`.
 
+The first freeze recorded the same three-way agreement at
+`d4a7e4502a277e4aa203303042e792ec` (runs `lx-Xg4-203742-806888-1087`,
+`lx-Xg4-203837-812302-1290`, `lx-Xg1-224004-2009716-2551`, with
+`delta_run2_vs_run1.txt` reading exactly 0.000000 meV in every column over all
+1440 rows).
+
+### What the re-freeze absorbed — and the part of it that is NOT the sign flip
+
+The re-freeze was authorised for one reason, the `+1` velocity-sign arm, but
+the reference had drifted for **two**.  Both were measured here, single
+variable each, same machine and same `.so` pair:
+
+| step | what differs | sigSX MAE / max | sigCOH MAE / max | sigTOT MAE / max | VH, Eo |
+|---|---|---|---|---|---|
+| **A** superseded reference → this tree on the LEGACY `-1` dipole | everything that moved between `a31ec236` (2026-08-07) and `9a730da8` **except** the dipole | 10.879 / 56.253 | 65.406 / 117.856 | **75.178 / 128.098** | 0.000000 |
+| **B** legacy `-1` dipole → committed `+1` dipole, both at `9a730da8` | the velocity-sign flip **alone** | 32.820 / 164.101 | 82.050 / 82.051 | **82.050 / 82.051** | 0.000000 |
+| **A+B** superseded reference → the file frozen here | both | 23.127 / 121.758 | 147.456 / 199.906 | **124.408 / 199.734** | 0.000000 |
+
+All in meV.  Arm A was produced by checking out
+`9a730da8^:tests/regression/hbn_cohsex_debug/dipole.h5` (md5
+`a38de4bae19713cb1765570f2bc816c6`, the documented legacy file) into an
+otherwise untouched copy of this deck and running it at `9a730da8`.
+
+**`VH` and `Eo` are exactly 0.000000 in every arm.**  That is the control: the
+mean field and the DFT eigenvalues are untouched, so both movements are in Σ,
+which is where a dipole/head change has to land and where a corrupted input
+would not.
+
+**Row A is an owner row, not a finding this lane closed.**  75 meV MAE of
+sigTOT moved on this deck between 2026-08-07 and `9a730da8` with the dipole
+held fixed, and nobody re-cut the reference for it — so the freeze gate was
+already red before the sign flip made it redder.  This deck is the tree's only
+end-to-end run of the native q→0 head ladder, so an already-landed head fix
+(the `minibz` head rows of 2026-08-09 are the obvious candidates) would show
+up here and nowhere else, which would make row A correct behaviour that simply
+outran its reference.  **That is a hypothesis; it was not bisected.**  This
+re-freeze pins row A along with row B, and whoever wants row A attributed
+should bisect `a31ec236…9a730da8` against this deck rather than trust the
+guess above.
+
 ### THE PERTURBATION ARMS — what the frozen digits mean
+
+**Measured at the 2026-08-07 freeze, on the legacy `-1` dipole arm, and not
+re-run by the re-freeze.**  They are what set this fixture's two tolerances,
+and both tolerances survive the re-freeze because the negative-control gate
+re-measures the arm-A knob on every run and stays green (see below).
 
 | arm | what moved | sigTOT MAE | sigTOT max\|Δ\| |
 |---|---|---|---|
@@ -219,6 +302,13 @@ The gates
 
 Both live in `tests/test_gw_jax_regression.py` and share nothing but the
 fixture directory; each runs the deck once, fresh.
+
+Both were run green against the file frozen here, on Perlmutter at
+`lx-Xg1-230142-2088617-9833`: `test_hbn_matches_frozen_reference` reported
+`max |Δ| = 0.000e+00 vs atol 1e-05 (0 of 8640 cells differ at all)` — the
+byte-identity path, not the tolerance path — and
+`test_hbn_mc_average_vcoul_body_moves_sigma` passed with the numbers quoted
+under it below.
 
 ### `test_hbn_matches_frozen_reference` — the self-freeze, `atol = 1e-5 eV`
 
@@ -263,6 +353,18 @@ if you want the value, that is what the frozen reference is for.  It also
 asserts `VH` is unmoved to 1e-5 eV — measured exactly 0.000000 — which is
 the falsification that the effect is the Coulomb head and not a global
 perturbation of the run.
+
+**And this is why the loose pin was the right call.**  The cell re-measures
+the knob on every run and prints what it saw.  At the 2026-08-09 re-freeze it
+read **sigSX 18.699/97.782, sigCOH 55.536/144.353, sigTOT 70.943/143.170 meV
+(MAE/max)** — five times the effect the 2026-08-07 freeze measured, on the
+same deck and the same key.  A cell pinned at 13.995 would have gone red for
+that; this one stayed green and reported the number, which is exactly the
+division of labour intended between it and the frozen reference.  The growth
+is the same movement the "What the re-freeze absorbed" section records as row
+A, seen through the knob instead of through Σ, and it strengthens rather than
+weakens the case that the head ladder is live on this cell.  **Do not tighten
+this floor toward the new number either.**
 
 Both cells skip, loudly and with a reason, if `WFN.h5` is missing from this
 directory.  On a full checkout it never is; the guard exists so a partial
