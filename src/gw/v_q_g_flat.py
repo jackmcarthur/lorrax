@@ -611,6 +611,18 @@ def _compute_V_q_g_flat_one_tile(
 # Public charge entry point (CC tile only)
 # ---------------------------------------------------------------------------
 
+#: Refusal thresholds for the ``use_bgw_vcoul`` overlay.  COVERAGE is the
+#: fraction of the live (q,G) slots the dump must supply: a dump laid out
+#: for this run covers essentially all of them, and a mis-laid-out one
+#: covers almost none, so anything in between is already a question.  MAX
+#: DEVIATION is the ratio at which "this is a different averaging
+#: convention" stops being a possible explanation — BerkeleyGW's own
+#: mini-BZ average against the point value was measured at 25.6% worst on
+#: hBN (design note 4.1), two orders below this bar.
+_BGW_VCOUL_MIN_COVERAGE = 0.50
+_BGW_VCOUL_MAX_DEVIATION = 10.0
+
+
 def compute_all_V_q_g_flat(
     zeta_loader,                       # ZetaLoader (G-flat)
     *,
@@ -680,8 +692,27 @@ def compute_all_V_q_g_flat(
         )                                                   # (n_q_ibz, ngkmax) f64
         # Optional BGW vcoul overlay — host-side scatter from BGW's
         # full-FFT-grid v into the per-q WFN.h5 sphere positions.
+        #
+        # DECLARED PROVENANCE + RED TWIN.  The scatter keeps LORRAX's own
+        # value wherever the file has none (``v_at_sphere == 0``), which is
+        # correct for slots the dump legitimately does not carry — it is
+        # written at BerkeleyGW's bare-Coulomb cutoff, which can be smaller
+        # than the ζ sphere that built ``gvec_components``, and
+        # ``fill_v_grid_for_q`` zeroes the q=0/G=0 head on purpose because
+        # that head is the separate rank-1 Σ_X term.  But the SAME fallback
+        # is what a mis-laid-out file produces: wrong Miller convention,
+        # wrong FFT grid, or a dump from another cell all land their values
+        # somewhere else and leave the sphere reading LORRAX's own array.
+        # A silent override and a broken override are then the same run.
+        # So: count what was actually replaced inside the bare-Coulomb
+        # cutoff, measure how far the imported values sit from the analytic
+        # point Coulomb they are replacing, print both, and refuse when the
+        # file cannot be the array this run needs.
         if bgw_v_grid_fn is not None:
             nx, ny, nz = (int(s) for s in fft_grid)
+            n_live = n_hit = 0
+            worst = 0.0
+            devs = []
             for qi in range(q_irr_frac.shape[0]):
                 v_full = np.asarray(
                     bgw_v_grid_fn(tuple(q_irr_frac[qi]))).reshape(-1)
@@ -690,7 +721,54 @@ def compute_all_V_q_g_flat(
                 iy = miller[1] % ny
                 iz = miller[2] % nz
                 v_at_sphere = v_full[ix * ny * nz + iy * nz + iz]
-                v[qi] = np.where(v_at_sphere != 0.0, v_at_sphere, v[qi])
+                hit = v_at_sphere != 0.0
+                # "live" = a slot this run's V_q actually sums over: inside
+                # the bare-Coulomb cutoff (v != 0 after masking) and not the
+                # zeroed q=0/G=0 head.  Pad slots carry ζ̃ = 0 and are not
+                # counted either way.
+                live = v[qi] != 0.0
+                both = hit & live
+                if np.any(both):
+                    rel = np.abs(v_at_sphere[both] - v[qi][both]) / np.abs(
+                        v[qi][both])
+                    devs.append(rel)
+                    worst = max(worst, float(rel.max()))
+                n_live += int(live.sum())
+                n_hit += int(both.sum())
+                v[qi] = np.where(hit, v_at_sphere, v[qi])
+            cov = (n_hit / n_live) if n_live else 0.0
+            med = float(np.median(np.concatenate(devs))) if devs else 0.0
+            print(f"  vcoul_source = bgw_file: {n_hit} of {n_live} live "
+                  f"(q,G) slots inside the bare-Coulomb cutoff were taken "
+                  f"from the dump ({100.0 * cov:.1f}% coverage); against "
+                  f"LORRAX's own v(q+G) the imported values differ by "
+                  f"{100.0 * med:.4f}% median, {100.0 * worst:.2f}% worst. "
+                  f"A dump written at BerkeleyGW's cell_average_cutoff "
+                  f"default averages most slots and should show percent-"
+                  f"level deviations; one written at 1d-12 averages only "
+                  f"q+G=0 and should agree with the analytic point value "
+                  f"to its own print precision.")
+            if cov < _BGW_VCOUL_MIN_COVERAGE:
+                raise ValueError(
+                    f"use_bgw_vcoul: the vcoul dump covers only "
+                    f"{100.0 * cov:.1f}% of the {n_live} (q,G) slots this "
+                    f"run's V_q sums over, below the "
+                    f"{100.0 * _BGW_VCOUL_MIN_COVERAGE:.0f}% floor.  A dump "
+                    f"laid out for this run covers nearly all of them; a "
+                    f"dump from a different FFT grid, Miller convention or "
+                    f"cell covers almost none and would be silently "
+                    f"IGNORED here rather than used.  Check that the file "
+                    f"came from a BerkeleyGW run on this mean field with a "
+                    f"bare_coulomb_cutoff at least as large as this deck's.")
+            if worst > _BGW_VCOUL_MAX_DEVIATION:
+                raise ValueError(
+                    f"use_bgw_vcoul: an imported v(q+G) differs from "
+                    f"LORRAX's own by {100.0 * worst:.1f}% at some slot.  "
+                    f"Mini-BZ averaging moves v by tens of percent at the "
+                    f"smallest |q+G| and by nothing at all at large |q+G|; "
+                    f"a factor of {_BGW_VCOUL_MAX_DEVIATION:.0f} is not an "
+                    f"averaging convention, it is a G-index mismatch — the "
+                    f"file's values are landing on the wrong slots.")
         return v.astype(np.complex128)
 
     return _compute_V_q_g_flat_one_tile(
