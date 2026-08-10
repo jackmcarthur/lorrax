@@ -213,6 +213,44 @@ def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
         return np.asarray(jax.device_get(a), dtype=dtype)
 
 
+def _already_on_host(a, dtype):
+    """The A-side operand as host numpy, gathering it only if it is not.
+
+    THE DEFECT THIS EXISTS FOR, measured at four processes (C1, 2026-08-10).
+    ``_to_host_np(x, tiled=False)`` goes through ``process_allgather``, and
+    for a FULLY ADDRESSABLE operand that call prepends an axis of length
+    ``jax.process_count()``.  For the two-point driver that never bites
+    above one process, because its ``E_A``/``base_mask_A`` are mesh-global
+    arrays: not fully addressable, so ``_to_host_np`` forces ``tiled=True``
+    and the reconstructed global array comes back at its own shape.  At one
+    process the same arrays ARE fully addressable and the prepended axis has
+    length 1, which ``build_G_tau``'s ``jnp.reshape(mask, enk.shape)``
+    silently absorbs.
+
+    The MPA pass loop's legacy-routed group is the caller that broke the
+    symmetry.  It has already gathered its A-side operands to host (through
+    ``mpa.sigma_pass._host_at_source_shape``, which strips exactly this
+    axis) and used to hand them back down as ``jnp.asarray(host_array)`` --
+    a PROCESS-LOCAL device array, fully addressable at any process count.
+    So the gather here re-invented the axis at its true length: at ``P=1``
+    the reshape absorbed a leading 1 and nobody noticed, and at ``P=4``
+    every rank died on the first tau dispatch with
+
+        TypeError: cannot reshape array of shape (4, 64, 100) (size 25600)
+                   into shape (64, 100) (size 6400)
+
+    A one-by-one mesh had been hiding a process-axis bug by making it look
+    like a spin axis.  The repair is to stop the round trip: an operand that
+    is ALREADY host numpy is already at its source shape and is taken as-is,
+    and a device operand is gathered exactly as it always was -- so the
+    two-point path's bytes, and its frozen window-tile reference, do not
+    move at all.
+    """
+    if isinstance(a, np.ndarray):
+        return np.asarray(a, dtype=dtype)
+    return _to_host_np(a, dtype=dtype, tiled=False)
+
+
 def _to_host_scalar(a, dtype=float):
     np_dtype = np.dtype(dtype)
     gathered = _to_host_np(jnp.asarray(a), dtype=np_dtype, tiled=False)
@@ -459,8 +497,8 @@ def _build_three_sigma_windows(
 def _build_windows_for_branch(
     *,
     omega_nonneg_ry: np.ndarray,
-    E_A: jax.Array,
-    base_mask_A: jax.Array,
+    E_A: jax.Array | np.ndarray,
+    base_mask_A: jax.Array | np.ndarray,
     Omega_q: jax.Array,
     base_mask_B: jax.Array,
     space: str,
@@ -483,6 +521,12 @@ def _build_windows_for_branch(
     (otherwise, or when the ω range is negligible).  Prints a one-line summary
     per returned window.
 
+    ``E_A`` and ``base_mask_A`` may arrive as device arrays (the two-point
+    driver, which holds them on the mesh) or as host numpy (the MPA pass
+    loop, which has already gathered them).  A host array is taken as it
+    stands; only a device array is gathered — see ``_already_on_host`` for
+    the process axis that gathering an already-gathered array invents.
+
     Which case applies is a physical fact about the branch, not a stored sign:
     the pole S = E_A + Ω crosses the evaluation point (denominator ω̃ − S) for
     the conduction (empty) A-space on the +ω half and for the valence
@@ -492,8 +536,8 @@ def _build_windows_for_branch(
     if omega_nonneg_ry.size == 0:
         return []
 
-    E_A_host = _to_host_np(E_A, dtype=np.float64, tiled=False)
-    base_A_host = _to_host_np(base_mask_A, dtype=bool, tiled=False)
+    E_A_host = _already_on_host(E_A, np.float64)
+    base_A_host = _already_on_host(base_mask_A, bool)
 
     _, mask_B_all_count, mask_B_all_min, mask_B_all_max = _masked_stats_device(
         Omega_q, base_mask_B)

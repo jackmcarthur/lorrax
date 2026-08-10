@@ -162,9 +162,14 @@ def test_build_G_tau_unmasked_is_a_bit_exact_no_op(psis, enk, tag, t):
 
 @pytest.mark.parametrize("tag,t", TIMES[:2], ids=[x[0] for x in TIMES[:2]])
 def test_build_G_tau_band_identity_mask_is_a_bit_exact_no_op(psis, enk, tag, t):
-    """Σ's ``mask_A`` call signature, and the ``(1,nk,nb)`` 1×1-mesh reshape
-    path (the nspin axis a 2×2 mesh squeezes and a 1×1 mesh does not — an
-    unreshaped mask broadcast phases to 3-D and crashed GN-PPM on one GPU)."""
+    """Σ's ``mask_A`` call signature, and the ``(1,nk,nb)`` reshape path (an
+    unreshaped mask broadcast phases to 3-D and crashed GN-PPM on one GPU).
+
+    That leading axis is the PROCESS axis ``process_allgather(tiled=False)``
+    prepends, not an nspin axis — see the comment at the reshape and
+    ``ppm_windows._already_on_host``.  This cell pins the guard, which is why
+    it still passes a rank-3 mask on purpose.
+    """
     xn, yr = psis
     rng = np.random.default_rng(5)
     mA = jnp.asarray(rng.random((NK, NB)) > 0.4)

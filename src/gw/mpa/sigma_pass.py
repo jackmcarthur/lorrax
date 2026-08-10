@@ -989,10 +989,22 @@ def plan_branch_groups(
 
     groups = []
     if narrow.any():
+        # THE A-SIDE OPERANDS GO DOWN AS HOST NUMPY, NOT BACK ONTO A DEVICE.
+        # They were gathered at their source shape a few frames up
+        # (``_host_at_source_shape``); ``jnp.asarray`` here used to put them
+        # back on THIS PROCESS's device, where they are fully addressable at
+        # any process count, and the window builder's own
+        # ``process_allgather(tiled=False)`` then prepended an axis of length
+        # ``jax.process_count()``.  At one process that axis is 1 and
+        # ``build_G_tau``'s reshape absorbed it; at four it is 4 and every
+        # rank died on the first tau dispatch (C1, 2026-08-10).  The B-side
+        # operands stay on device: their only consumers are the scalar
+        # ``_masked_stats_device`` reductions, which end in ``.reshape(-1)[0]``
+        # and to which a leading axis of replicated values is invisible.
         wins = _build_windows_for_branch(
             omega_nonneg_ry=np.asarray(omega_nonneg_ry, dtype=np.float64),
-            E_A=jnp.asarray(E_A_host, dtype=jnp.float64),
-            base_mask_A=jnp.asarray(base_mask_A_host, dtype=bool),
+            E_A=np.asarray(E_A_host, dtype=np.float64),
+            base_mask_A=np.asarray(base_mask_A_host, dtype=bool),
             Omega_q=jnp.asarray(a, dtype=jnp.float64),
             base_mask_B=jnp.asarray(narrow, dtype=bool),
             space=space, neg_omega_half=bool(neg_omega_half),

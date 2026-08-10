@@ -127,11 +127,25 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     """
     phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref)
     if mask is not None:
-        # mask gates phases per (k, n), so it must share enk's shape.  Some Σ
-        # branches deliver it as (1, nk, nb) on a 1×1 processor mesh — the occ
-        # array carries a leading nspin axis that a 2×2 mesh squeezes but a 1×1
-        # mesh does not.  Reshape first so ``where`` can't broadcast phases up to
-        # 3-D and violate build_G's 'ksxn,kn,knty' contract (crashed GN-PPM on 1 GPU).
+        # mask gates phases per (k, n), so it must share enk's shape.  Reshape
+        # first so ``where`` can't broadcast phases up to 3-D and violate
+        # build_G's 'ksxn,kn,knty' contract (crashed GN-PPM on 1 GPU).
+        #
+        # THE LEADING AXIS THIS ABSORBS IS THE PROCESS AXIS, NOT nspin.  An
+        # earlier revision of this comment attributed the ``(1, nk, nb)`` a Σ
+        # branch can deliver to "a leading nspin axis that a 2×2 mesh squeezes
+        # but a 1×1 mesh does not", and that reading cost a lane a day.  The
+        # real source is ``ppm_windows._to_host_np(x, tiled=False)``, whose
+        # ``process_allgather`` prepends an axis of length
+        # ``jax.process_count()`` to any FULLY ADDRESSABLE operand — length 1
+        # at one process, which is what makes it look like a squeezable spin
+        # axis, and length P at P processes, where this reshape stops being a
+        # no-op and raises.  A mesh does not squeeze it; a mesh-GLOBAL array
+        # avoids it, because ``_to_host_np`` forces ``tiled=True`` on an array
+        # that is not fully addressable and gets the global shape back.  See
+        # ``ppm_windows._already_on_host`` (C1, 2026-08-10).  Every Σ window
+        # source now hands this kernel a mask at ``enk``'s own shape, so this
+        # reshape is a no-op in production and is kept as the guard it was.
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))

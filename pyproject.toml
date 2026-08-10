@@ -138,6 +138,7 @@ markers = [
     "symmetry_maps: the symmetry_maps service suite (services/symmetry_maps/tests)",
     "vcoul: the vcoul service suite (services/vcoul/tests)",
     "minimax: the minimax service suite (services/minimax/tests)",
+    "mesh: a cell that needs a real multi-device mesh (>=4 devices) rather than the one-GPU pin tests/conftest.py applies — the activation semantics belong to fix/conftest-mesh-cells-2026-08-10, which is what lets these RUN on a >=4-device allocation instead of skipping",
 ]
 
 [dependency-groups]
