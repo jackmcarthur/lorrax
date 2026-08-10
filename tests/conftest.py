@@ -361,9 +361,16 @@ def _explicit_selection(config) -> str:
         return "explicit path(s)"
     # The service flags are census instruments: `--no-services` is how the
     # census's no-srun leg runs lorrax's own tests, and `--only-service`
-    # names a suite outright.  Both already say what they want.
+    # names a suite outright.  Both already say what they want.  ALL THREE
+    # SPELLINGS, not two: the conftest above documents LX_SKIP_SERVICES and
+    # --no-services as one knob, and a knob that means "census minus
+    # services" one way and "five cells" the other is the kind of split
+    # that only shows up as a suspiciously small green number.
     if config.getoption("--no-services"):
         return "--no-services"
+    if (os.environ.get("LX_SKIP_SERVICES", "") or "").strip() not in (
+            "", "0", "false", "no"):
+        return "LX_SKIP_SERVICES"
     if (config.getoption("--only-service") or "").strip():
         return "--only-service"
     return ""
