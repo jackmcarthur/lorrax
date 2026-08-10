@@ -74,6 +74,7 @@ nav:
       - Minimax quadrature: theory/minimax-quadrature.md
       - Symmetry: theory/symmetry.md
       - S-tensor convention: theory/s-tensor-convention.md
+      - LT splitting and the exchange head: theory/lt-exchange-head.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - MPA compute mode (declared, not yet runnable): theory/THEORY_mpa_implementation.md
   - Architecture:
