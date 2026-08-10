@@ -17,10 +17,16 @@ any other, so every BSE consumer downstream reads it with no code change, no
 flag and no knowledge that a downfold happened. You point the BSE driver at a
 different directory and everything else is as it was.
 
-On the shipped silicon fixture, compressing a 480-centroid basis onto the ~194
-directions that a 20-band window actually contains makes every (μ, μ) tensor
-about six times smaller in each dimension, which is a factor of thirty-eight in
-storage and rather more than that in the cost of the kernels that eat them.
+Measured on silicon with a 960-centroid parent and a 20-band retained window:
+191 centroids out, a five-fold reduction in μ and a twenty-five-fold one in the
+storage of every (μ, μ) tensor, with the lowest twenty exciton eigenvalues
+drifting 37 meV. **How much you can compress depends entirely on whether the
+parent basis was over-complete for your window**, and it is worth reading
+`DOWNFOLD_S1.md` §3(c) before sizing a run: the same deck's shipped
+480-centroid set has no redundancy on a 20-band window at all, and downfolding
+it destroys the spectrum rather than compressing it. The driver tells you which
+situation you are in — that is what the refusal and the error bar below are
+for — but it cannot create redundancy that the parent does not have.
 
 ```
 python3 -m gw.downfold_cli -i downfold.in
@@ -272,6 +278,14 @@ One consequence worth stating out loud, because it is the reason the code
 applies no ridge anywhere on this path: a ridge would destroy the orthogonality
 that makes the identity exact, and `eps_W` would go on printing a plausible
 number that means nothing.
+
+And one caveat, measured: `eps_W` is a **tripwire, not a transferable gate**.
+Within one parent bundle and one cut it ranks configurations monotonically, but
+the same `eps_W` of about one per cent produced a 37 meV exciton drift on one
+parent and a 1.7 eV drift on another (`DOWNFOLD_S1.md` §3(c)). Set
+`residual_refuse_above` to catch a downfold that has gone badly wrong; do not
+read it as a promise about meV. The only admissible evidence for choosing the
+cut remains convergence in the energy itself.
 
 At q = 0 the head divergence contaminates both norms identically, so the ratio
 stays meaningful there; the absolute norms at q = 0 are head-dominated and
