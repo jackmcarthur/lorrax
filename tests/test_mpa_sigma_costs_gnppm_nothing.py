@@ -212,7 +212,24 @@ import pytest
 
 #: The tree this branch's gnppm bit-identity is anchored to.  Update this and
 #: the digests below TOGETHER, never one without the other.
-BASE_SHA = "0a96c6ca"
+#  RE-ANCHOR 2026-08-10 (the consolidation), and whose change it absorbed.
+#  BASE_SHA moves 0a96c6ca -> 729ae5d3, the consolidation's ANCHOR-0.  Three
+#  kernel digests move with it and NONE of them is a change made by any MPA
+#  lane: between those two shas the tree absorbed origin/main, which carried
+#  85112489 (the windowed_exp_iEt (lo, hi] boundary flip -- a deliberate
+#  Sigma-byte-moving fix, owned by its own branch and landed on main) and the
+#  P>1 pass fix's ppm_windows edit.  head_correction.py, ppm_tau_kernel.py
+#  and ppm_windows.py are re-pinned at their ANCHOR-0 contents.
+#
+#  What the gate now certifies, which is the thing it exists to certify:
+#  measured against ANCHOR-0, the consolidated tree changes NO shared
+#  two-point Sigma kernel and NO seam -- ppm_sigma, ppm_accumulators,
+#  minimax_screening, ppm_pipeline and sigma_dispatch all still carry their
+#  pinned digests unchanged.  The six merges in this stack move only
+#  gw/mpa/, the fit store, the ISDF/centroid path and v_q_g_flat, so a gnppm
+#  run through this tree is bit-identical to one through ANCHOR-0.
+
+BASE_SHA = "729ae5d3"
 
 #: THE KERNELS: every module in which a floating-point operation of a gnppm
 #: Sigma actually happens.  Nothing on this branch may touch them, and both
@@ -221,13 +238,13 @@ SHARED_SIGMA_KERNELS = {
     "src/gw/ppm_sigma.py":
         "f255ef2944808d114574101a8c45aff44e14ae9bc1583efe376715b34181b87e",
     "src/gw/ppm_windows.py":
-        "da7037626e37773a0b684e6065bc035422e762584fc03d00b4c902e73f61021e",
+        "65558706399b91be03066a4c5d48bd7a554591efa4bdd394a42a28bb8b55c9aa",
     "src/gw/ppm_tau_kernel.py":
-        "583425f1f5f06690ee050d56dc494c1fbed2cd07ef3cf9d134047bce8fa0c700",
+        "e71da20f80094832b2b1ebd3bdfac713de26c7e2b5c88b90068f7728f87b2b72",
     "src/gw/ppm_accumulators.py":
         "f75a91503834fe1a466d9441ee58ffa92f3a7f34bf47fef7863efe32ef9835fd",
     "src/gw/head_correction.py":
-        "1c99e0758a93f4a76d04aa32ba781ee7bb1f94007846a5a362532fefed52e753",
+        "0e35c40735c45556fd70545a4134f81ac020ceec6e6d6de06df2b4056107a81f",
     "src/gw/minimax_screening.py":
         "8e7cfc4c9df71517f0fc83fd905748f3b82d92bf67a7fa1b957c929668040236",
 }
@@ -251,6 +268,22 @@ SHARED_SIGMA_CORE = {**SHARED_SIGMA_KERNELS, **SHARED_SIGMA_SEAMS}
 #: and this one can be checked disjoint, which is what is left of the
 #: original one-assertion contract.
 THIS_BRANCH_TOUCHES = (
+    # ---- ADDED BY THE CONSOLIDATION (2026-08-10). None is a Sigma kernel;
+    # each is on an MPA, ISDF or fit-store path a gnppm run does not enter.
+    "src/gw/mpa/diagnostics.py",
+    "src/gw/mpa/pade_fit.py",
+    "src/gw/mpa/plan_store.py",
+    "src/gw/mpa/window_farm.py",
+    "src/gw/gflat_memory_model.py",
+    "src/gw/isdf_fitting.py",
+    "src/gw/gw_init.py",
+    "src/gw/v_q_g_flat.py",
+    "src/isdf/core.py",
+    "src/centroid/grid_pool.py",
+    "src/centroid/kmeans_cli.py",
+    "src/centroid/pivoted_cholesky.py",
+    "src/file_io/centroids.py",
+    "src/file_io/__init__.py",
     "src/gw/mpa/sigma_routing.py",
     "src/gw/mpa/sigma_pass.py",
     # The complex-frequency chi0 route.  Not a Sigma kernel and not on a
