@@ -110,14 +110,31 @@ silent overwrite.
     allocation is refused `LX-CPUALLOC` by name before any `srun` runs
     (both arms measured 2026-08-10).
     [ops incidents, 2026-08-08; OWED_LEGS_BATCH.md; BUILD_NOTES 2026-08-09]
-12. **`windowed_exp_iEt` boundary alignment** — the convention is now
-    DECIDED and landed by the clause-certification lane: half-open,
-    **closed at the top `(lo, hi]`** (a pane must contain its supremum,
-    since every rule is built at max(Γ) over its pane; recorded in the
-    catalog's `bin_convention` field, branch aa24c099). Our helper
-    landed as `[lo, hi)` and must flip to match — one line + its gate,
-    with a boundary-pole red twin. Currently moves nothing (no real
-    pole sits exactly on an edge — measured), so batch-class.
+12. ~~**`windowed_exp_iEt` boundary alignment**~~ **FIXED** at `85112489`
+    on `fix/windowed-exp-boundary-2026-08-10` (unmerged). The predicate
+    is now `(E > E_min) & (E <= E_max)` — half-open, **closed at the top
+    `(lo, hi]`**, the convention the clause-certification lane decided
+    and recorded in the catalog's `bin_convention` field (branch
+    aa24c099): a pane must contain its supremum, since every rule is
+    built at max(Γ) over its pane. The flip also ends the mismatch
+    inside Σ — `ppm_windows.window_mask_B_bounds` was already `(lo, hi]`,
+    so the A and B sides used to send a threshold pole in opposite
+    directions; the B side is untouched and the three comments that
+    documented the mismatch as deliberate now document the agreement.
+    As predicted it moves nothing numerically: no production caller
+    passes `E_min`/`E_max` at all (every `build_G_tau` call site uses the
+    band-identity `mask=` route), and with the pre-flip predicate
+    reinstalled in the same tree the 19 non-boundary gates stay green
+    while exactly the 4 boundary ones go red. Gates 21 → 23 cells: the
+    old boundary twin flips direction, plus the boundary-pole twin this
+    row asked for (a pole planted on each interior edge of an abutting
+    cover is carried by the pane BELOW it, exactly once) and a cross-side
+    twin that feeds `window_mask_B_bounds`' own bounds through the helper,
+    so the two sides of Σ cannot drift apart again without a red.
+    Regression sweep, both arms run: base `8bbff76d` 106 passed / 3
+    failed, branch 108 passed / 3 failed, identical failure set, all
+    three pre-existing (`test_g2_branch_window_tiles_are_frozen` P1b and
+    two `test_pad_parity_gates` env rows, all in KNOWN_FAILURES).
     [WINDOWED_EXP_SWEEP.md; peer decision 2026-08-09]
 13. **Wheel-content check** — the peer found `complex_laplace_width/*.npz`
     never declared in package-data: every wheel since that sweep shipped
