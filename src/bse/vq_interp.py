@@ -43,15 +43,18 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
             V_SRc(q_j) = conj(S) [V_ref − V_LR] conj(S)
         LR confined to the FIXED Miller superset 𝒢(α) =
         {G : min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR)}, intersected
-        with the G_z channels the b26p model fits (``DEG_B26P``) —
-        the rest are model-zero and contribute exact 0.0 (``lr_gset``).
+        with the G_z channels the b26p model fits (``lr_fit_degrees``:
+        an energy cutoff with a hard two-shell floor) — the rest are
+        model-zero and contribute exact 0.0 (``lr_gset``).
     (c) phase-factored LR form-factor samples on 𝒢(α):
             F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
         (centroid winding phase carried analytically — the g0-winding cure).
 
   stage 2  ``fit_lr_model`` — ONE weighted LSQ over all coarse samples:
         M_μ(K_∥, G_z) ≈ Σ_b c_b[μ,G_z] (K_x/2α)^p (K_y/2α)^r,
-        degrees {|G_z|=0:3, 1:2, 2:0, 3:0} → 26 complex coefficients per μ
+        degree ladder {|G_z|=0:3, 1:2, 2:0, 3:0} → 26 complex coefficients
+        per μ on a cell whose criterion stops at |G_z|=3; channels beyond
+        the ladder enter at degree 0, one coefficient each
         TOTAL, weight w = v_LR(q+G) (the objective is then exactly
         ‖ΔA‖²_F of the LR tile factor A = ζ̃√v_LR).  Per-q normal blocks
         keep leave-one-out refits honest at O(n_b²).
@@ -100,9 +103,17 @@ from distrib_la import plan as linalg_plan                          # noqa: E402
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
 EPS_TIK = 1e-4        # relative Tikhonov filter width (fit gauge, §13.1)
 EPS_LR = 1e-8         # Gaussian weight bound defining the LR G-superset
-DEG_B26P = {0: 3, 1: 2, 2: 0, 3: 0}   # in-plane poly degree per |G_z|
+DEG_B26P = {0: 3, 1: 2, 2: 0, 3: 0}   # in-plane poly DEGREE per |G_z|
 RIDGE = 1e-11         # normal-equation ridge (lr_prep.ChannelFit.RIDGE)
 RY2MEV = 13605.693
+
+# Which |G_z| channels the long-range model FITS -- see :func:`lr_fit_degrees`.
+# ``DEG_B26P`` above is the degree LADDER (how rich the in-plane polynomial is
+# per channel); it no longer decides WHICH channels exist.  Channels above its
+# top entry enter at degree 0, one complex coefficient each.
+E_CUT_FIT = 1.0       # Ry -- default channel-fitting cutoff (validated below)
+FIT_SHELL_FLOOR = 2   # hard floor: |G_z| shells always fitted (umklapp roll)
+FIT_FLOOR_MARGIN = 1e-6   # lifts the floor off exact equality at |n| = floor
 
 
 def relF(a, b):
@@ -842,6 +853,95 @@ def run_gates(zx, C_q):
 # ===========================================================================
 # STAGE 1 — offline preparation at the coarse grid points
 # ===========================================================================
+def lr_fit_degrees(zx, *, e_cut=None, shell_floor=FIT_SHELL_FLOOR):
+    """THE CRITERION: which ``|G_z|`` channels the long-range model fits, and
+    at what in-plane polynomial degree.  Returns ``{|G_z|: degree}``.  This is
+    the ONE site that decides the fitted channel set; everything else
+    (:func:`lr_gset`'s trim, :func:`lr_design_blocks`, the mini-BZ head-slot
+    guard) reads the dict this returns, so they cannot drift apart.
+
+        fit channel n  iff  (n·|b₃|)² ≤ E_eff,
+        E_eff = max(e_cut, (shell_floor·|b₃|)²·(1 + FIT_FLOOR_MARGIN))
+
+    **An energy cutoff, with a hard two-shell floor.**  That shape is the
+    owner's ruling of 2026-08-10 — ``docs/architecture/decisions.md``, "The
+    long-range channel criterion is an energy cutoff with a two-shell floor",
+    which is the entry to cite; this docstring does not mint it — and both
+    halves of it are load-bearing.
+
+    *Why an energy cutoff.*  What this replaces was a hardcoded ``|G_z| ≤ 3``
+    read off ``DEG_B26P``'s keys — a fixed shell COUNT spanning a
+    cell-dependent energy window.  ``|b₃| = 2π/c`` shrinks as a slab's vacuum
+    padding grows, so three shells cover 0.69 Ry on the MoS2 reference cell but
+    only 0.077 Ry once the vacuum is tripled, while the LR superset's own
+    (isotropic, 6.63 Ry) cutoff keeps widening.  Stage 1 subtracts the
+    FULL-sphere ``V_LR`` and stage 3 adds back only the FITTED channels, so
+    every unfitted channel is weight that is subtracted and never returned:
+    measured **17.93 % of the long-range weight lost at 3× vacuum**, silently,
+    because ``run_nulls`` tests the sampled ``Fch`` rather than the fitted
+    model.  Tying the shell count to an ENERGY makes it follow ``1/|b₃|``
+    instead of standing still, which is what closes that gap.
+
+    *Why the floor, in the owner's own terms.*  The requirement is that the fit
+    "reliably capture the first at least 2 G shells, because we need to capture
+    G=0, which rolls by an umklapp vector at BZ boundaries."  The head slot is
+    ``G* = argmin_G |Q+G|``, and at a zone boundary that argmin is NOT ``G=0``:
+    it rolls onto a neighbouring reciprocal-lattice vector.  Past the boundary
+    along z (``q_z = 0.6``) the argmin lands on ``G = [0,0,-1]``, i.e. the
+    ``|G_z| = 1`` channel.  A criterion that captured only the literal first
+    shell would leave that channel unfitted, its form factor identically zero,
+    and the head magnitude would be multiplied by zero and dropped in silence.
+    The floor is what makes the criterion incapable of that, whatever ``e_cut``
+    or whatever cell it is handed.
+
+    Two shells rather than one is also what the bulk control demands, and the
+    two constraints agree: on Si (``|b₃| = 1.06``, where a 1 Ry cutoff alone
+    would keep only ``|G_z| = 0``) the LR weight lost is **48.4 % at a
+    zero-shell floor, 1.37 % at one shell, and 0.000 % at two** — two shells is
+    the smallest floor that leaves a bulk cell bit-identical to today, and a
+    third shell buys nothing there because the superset itself stops at
+    ``|G_z| = 2``.  ``FIT_FLOOR_MARGIN`` only lifts the comparison off exact
+    floating-point equality at ``|n| = shell_floor``.
+
+    Worth knowing which half is carrying the guarantee where: on a THICK SLAB
+    ``|b₃|`` is small, so the cutoff alone already reaches well past the rolled
+    channel and the floor never binds.  It is on BULK and thin cells — large
+    ``|b₃|``, few shells inside any reasonable energy — that the cutoff would
+    strand the roll and the floor is the whole of the protection.  The floor
+    costs nothing where it does not bind, which is why it is unconditional
+    rather than a regime test.
+
+    *The default, and why it is 1.0 Ry and not the 0.5 Ry sketch.*  The default
+    has to sit in ``[0.691, 1.229) Ry`` to reproduce today's channel set
+    exactly on the MoS2 reference deck — those bounds are ``(3|b₃|)²`` and
+    ``(4|b₃|)²`` there — and it has to hold the 3×-vacuum loss under 1 %.
+    **0.5 Ry fails both**: it drops the ``|G_z| = 3`` channel on the reference
+    deck (161 → 115 columns, and the reference deck's own loss RISES 0.24 % →
+    1.90 %), and it still leaves 2.04 % lost at 3× vacuum.  ``E_CUT_FIT = 1.0``
+    is a round value mid-window, bit-identical on both reference decks, and
+    measured (7×7 in-plane q sample, the metric of FIX_vq_interp.md §B.3):
+
+        cell              fitted   nG    LR weight lost
+        Si bulk           ≤2       123   0.000 %  (floor-dominated; today 0.00 %)
+        MoS2 reference    ≤3       161   0.240 %  (today 0.24 % — identical set)
+        MoS2 vacuum ×1.5  ≤5       253   0.189 %  (today 2.61 %)
+        MoS2 vacuum ×2    ≤7       345   0.164 %  (today 7.17 %)
+        MoS2 vacuum ×3    ≤10      483   0.290 %  (today 17.93 %)
+
+    The extra channels enter at degree 0 — one complex coefficient each — so
+    stage 2's solve is unchanged in practice; the cost is nG in the stage-3
+    GEMM and in the host ``Fch`` block, and it is paid only in the regime that
+    needs it (nothing on Si, nothing on the reference slab).
+    """
+    e_cut = E_CUT_FIT if e_cut is None else float(e_cut)
+    if not e_cut > 0.0:
+        raise ValueError(f"vq_interp fit cutoff must be positive, got {e_cut}")
+    b3 = float(np.linalg.norm(np.asarray(zx["bvec"], dtype=np.float64)[2]))
+    e_eff = max(e_cut, (int(shell_floor) * b3) ** 2 * (1.0 + FIT_FLOOR_MARGIN))
+    nmax = int(np.floor(np.sqrt(e_eff) / b3))
+    return {n: DEG_B26P.get(n, 0) for n in range(nmax + 1)}
+
+
 def lr_gset(zx, alpha=ALPHA, degrees=None):
     """Fixed global Miller superset of the LR channel: all G with
     min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR), minimised over a 13×13
@@ -912,7 +1012,7 @@ def lr_gset(zx, alpha=ALPHA, degrees=None):
             m = np.minimum(m, np.sum(K * K, axis=0))
     keep = m <= K2max
     if os.environ.get("LORRAX_VQ_LR_GZ_TRIM", "0") == "1":
-        deg = DEG_B26P if degrees is None else degrees
+        deg = lr_fit_degrees(zx) if degrees is None else degrees
         keep = keep & np.isin(np.abs(Gall[2]),
                               np.asarray(sorted({abs(int(g)) for g in deg})))
     return np.ascontiguousarray(Gall[:, keep])
@@ -952,7 +1052,8 @@ def _to_host(x):
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48,
-                   keep_host_mirrors: bool = True, degrees=None):
+                   keep_host_mirrors: bool = True, degrees=None,
+                   fit_ecut=None):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
                                nulls only) — ``None`` without host mirrors
@@ -1012,7 +1113,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     # ``degrees`` reaches the superset builder as well as the fit, so the two
     # cannot disagree about which G_z channels exist (see lr_gset's G_z trim).
-    degrees = DEG_B26P if degrees is None else degrees
+    degrees = lr_fit_degrees(zx, e_cut=fit_ecut) if degrees is None else degrees
     GS = lr_gset(zx, alpha, degrees=degrees)
     nG = GS.shape[1]
     # q-batched layout: every device owns whole matrices for its own q.  That
@@ -1177,6 +1278,11 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             # refuses a wider request against it (silent-narrowing guard)
             "lr_gz_degrees": (degrees if os.environ.get(
                 "LORRAX_VQ_LR_GZ_TRIM", "0") == "1" else None),
+            # THE fitted channel set (:func:`lr_fit_degrees`), always present.
+            # Every consumer of "which |G_z| does the model fit?" reads this —
+            # the fit itself and the mini-BZ head-slot guard — so the criterion
+            # is applied once, here, and never re-derived downstream.
+            "fit_degrees": dict(degrees),
             "gz_cols": {int(g): np.where(GS[2] == g)[0]
                         for g in np.unique(GS[2])}}
 
@@ -1206,7 +1312,8 @@ def lr_design_blocks(zx, prep, degrees=None):
     ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
     honest (target's samples excluded) at O(nb²) cost."""
     if degrees is None:
-        degrees = prep.get("lr_gz_degrees") or DEG_B26P
+        degrees = (prep.get("lr_gz_degrees") or prep.get("fit_degrees")
+                   or DEG_B26P)
     # SILENT-NARROWING GUARD.  When ``prepare_coarse`` trimmed the superset to
     # a degrees dict, asking here for a WIDER one would not raise anywhere: the
     # loop below iterates ``prep['gz_cols']``, so a channel the superset no
@@ -1465,12 +1572,20 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     # factor and drop it silently.  For a q_z=0 slab the argmin is always a
     # G_z=0 slot, so this cannot fire in scope; it fires if the caller leaves
     # that scope.  (Nothing checked this before.)
-    if int(abs(GS[2, gstar])) not in DEG_B26P:
+    # THE UMKLAPP CONSTRAINT (owner ruling 2026-08-10, docs/architecture/
+    # decisions.md).  ``gstar`` is the head slot, and at a BZ boundary it is
+    # NOT G=0 — it rolls onto a neighbouring reciprocal-lattice vector, which
+    # is exactly why :func:`lr_fit_degrees` carries a hard two-shell floor.
+    # The check now reads the criterion's own resolved set rather than
+    # ``DEG_B26P``'s keys, so widening the criterion widens the guard with it.
+    _fitdeg = prep.get("fit_degrees") or DEG_B26P
+    if int(abs(GS[2, gstar])) not in _fitdeg:
         raise ValueError(
             f"mini-BZ head slot G*={GS[:, gstar].astype(int).tolist()} is in "
             f"the |G_z|={int(abs(GS[2, gstar]))} channel, which the b26p model "
-            f"does not fit (DEG_B26P={sorted(DEG_B26P)}).  Its form factor is "
-            f"model-zero, so the head magnitude would be silently dropped.  "
+            f"does not fit (fitted channels={sorted(_fitdeg)}).  Its form "
+            f"factor is model-zero, so the head magnitude would be silently "
+            f"dropped.  "
             f"Target Q={Qf.tolist()} is outside the slab pipeline's q_z=0 "
             f"scope.")
     shift_cart = K[:, gstar]                               # cartesian Q+G*
@@ -1653,7 +1768,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
 def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
                        *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
-                       run_diagnostics=True, log_fn=print):
+                       run_diagnostics=True, log_fn=print, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
     This is the SINGLE orchestration of the ``vq_interp`` pipeline
@@ -1696,7 +1811,8 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # The host mirrors exist for run_nulls / eval_vq_host only — same switch.
     prep = prepare_coarse(zx, C_q, mesh_xy, alpha=alpha, eps_tik=eps_tik,
                           eigh_backend=eigh_backend,
-                          keep_host_mirrors=run_diagnostics)
+                          keep_host_mirrors=run_diagnostics,
+                          fit_ecut=fit_ecut)
     des = lr_design_blocks(zx, prep)
     coeffs = fit_lr_model(des)
     if run_diagnostics:
