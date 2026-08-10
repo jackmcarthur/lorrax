@@ -22,6 +22,33 @@ WF = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(WF)
 
 
+def _plan_inputs(census):
+    """The manifest rows that declare the farm's window plans.
+
+    Spelled out here rather than imported from ``gw.mpa.plan_store``
+    because this script is deliberately stdlib-only -- it runs on a login
+    node between two farms, and importing the plan store would pull numpy
+    and h5py in to write four strings.  The shape is the module's
+    ``declared_plan_inputs`` and the cell in
+    ``tests/test_mpa_plan_store.py`` holds them to the same one.
+    """
+    rows = []
+    for key in sorted((census.get("plans") or {}),
+                      key=lambda k: (int(k.split(".")[0]),
+                                     WF.BRANCH_KEYS.index(k.split(".")[1]))):
+        info = census["plans"][key]
+        pole, bkey = key.split(".")
+        rows.append({
+            "id": f"plan {key}",
+            "kind": "plan",
+            "range_label": (f"pole {pole} {bkey} window plan, address "
+                            f"{info['address']}"),
+            "address": str(info["address"]),
+            "output": str(info["path"]),
+        })
+    return rows
+
+
 def main():
     census_dir, n_legs, partial_dir, out = sys.argv[1:5]
     paths = sorted(glob.glob(os.path.join(census_dir, "*.json")))
@@ -47,13 +74,25 @@ def main():
     ideal = total / len(legs)
     print(f"balance: {len(legs)} legs, max {max(taus)}, min {min(taus)}, "
           f"ideal {ideal:.0f}, imbalance {max(taus) / ideal:.4f}")
+    inputs = _plan_inputs(census)
+    missing = [r for r in inputs if not os.path.exists(r["output"])]
+    if missing:
+        raise SystemExit(
+            "balance.py: the census declared "
+            f"{len(inputs)} window plans and {len(missing)} of them are not "
+            "on disk:\n"
+            + "\n".join(f"  {r['id']} -> {r['output']}" for r in missing)
+            + "\nA farm launched against this manifest would refuse leg by "
+              "leg at run time, sixteen times, having taken sixteen "
+              "allocations to find out.  Re-run the census farm with "
+              "mpa_plan_store set.")
     WF.write_manifest(
         out, legs, kind="pass", fit_store=census["fit_store"],
         n_p=census["n_p"], sha=census["sha"], out_dir=partial_dir,
-        census=census,
+        census=census, inputs=inputs,
         extra={"projected_max_leg_tau": max(taus),
                "projected_imbalance": max(taus) / ideal})
-    print(f"manifest: {out}")
+    print(f"manifest: {out}  ({len(inputs)} window plans declared as inputs)")
     for leg in WF.read_manifest(out)["legs"]:
         print(f"  {leg['id']}: {leg['n_tau']:>6d} tau  "
               f"{leg['n_groups']:>4d} groups  poles {leg['poles']}  "
