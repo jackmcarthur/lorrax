@@ -85,38 +85,21 @@ def solve_conditioning(
     w = jnp.asarray(W_samples, dtype=jnp.complex128)
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
 
-    if solve == "loewner":
-        x, x_max = pade_fit._x_normalisation(z)
-        x_hat = x / x_max.astype(jnp.complex128)
-        L, sL = pade_fit._loewner_pencil(w, x_hat, n)
-        _, cond, s_max, s_min = pade_fit._loewner_roots(w, x_hat, n, rcond)
-        u, s, vh = jnp.linalg.svd(L, full_matrices=False)
-        s_inv = jnp.where(
-            s > rcond * s[0], 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
-        X = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * (u.conj().T @ sL))
-        num = jnp.linalg.norm(L @ X - sL)
-        den = jnp.linalg.norm(L) * jnp.linalg.norm(X) + jnp.linalg.norm(sL)
-    else:
-        A, rhs, _t, _c, _s = pade_fit.build_pade_system(
-            w, z, n, affine=affine)
-        row_norm = jnp.linalg.norm(A, axis=1)
-        row_norm = jnp.where(row_norm > 0, row_norm, 1.0)
-        A_n = A / row_norm[:, None]
-        rhs_n = rhs / row_norm
-
-        y, cond, s_max, s_min = pade_fit._solve_normalised(A, rhs, rcond)
-        num = jnp.linalg.norm(A_n @ y - rhs_n)
-        den = (jnp.linalg.norm(A_n) * jnp.linalg.norm(y)
-               + jnp.linalg.norm(rhs_n))
-    den = jnp.where(den > 0, den, 1.0)
-
-    Omega, B, diag = pade_fit.fit_mpa_poles(
+    # ONE FIT, ONE SOLVE.  Every field below is now something
+    # ``fit_mpa_poles`` already computed on its way to the poles, so this
+    # function no longer re-solves the system and no longer refits the
+    # element -- which is what the driver's cost report called out as the
+    # seam the design review could remove, and what the perf lane's
+    # §FIT-EFFICIENCY diff removes.  The backward error agrees with the
+    # fit's BY CONSTRUCTION rather than by an argument about operand
+    # order, because it IS the fit's.
+    _, _, diag = pade_fit.fit_mpa_poles(
         w, z, n, rcond=rcond, solve=solve, affine=affine)
     return {
-        "cond": cond,
-        "sigma_max": s_max,
-        "sigma_min": s_min,
-        "backward_error": num / den,
+        "cond": diag["cond_pade"],
+        "sigma_max": diag["sigma_max_pade"],
+        "sigma_min": diag["sigma_min_pade"],
+        "backward_error": diag["backward_error"],
         "forward_residual": diag["max_abs_residual"],
         "rel_rms_residual": diag["rel_rms_residual"],
         "rsd_eq28": diag["rsd_eq28"],

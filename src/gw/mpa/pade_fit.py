@@ -391,6 +391,45 @@ def build_pade_system(W_samples, z_samples, n_p, *, affine=True):
     return A, rhs, t, centre, scale
 
 
+def _backward_error(A, rhs, y):
+    """``||A y - rhs|| / (||A|| ||y|| + ||rhs||)`` on the ROW-EQUILIBRATED
+    system -- the relative perturbation of ``(A, rhs)`` for which the
+    computed ``y`` is exact.
+
+    ONE DEFINITION, TWO CALLERS, and that is the point.  The fit reports
+    this beside the condition number it already computes, and
+    ``diagnostics.solve_conditioning`` reads the fit's value rather than
+    recomputing it, so the two agree by construction instead of by an
+    argument about operand order.  Retiring that second computation is
+    the perf lane's proposed ``pade_fit`` diff (MPA_16GPU_PLAN
+    §FIT-EFFICIENCY), folded here; it removes a whole redundant fit and
+    a whole redundant solve per element, because the only reason
+    ``solve_conditioning`` existed as a separate pass was that this
+    number was not returned.
+    """
+
+    row_norm = jnp.linalg.norm(A, axis=1)
+    row_norm = jnp.where(row_norm > 0, row_norm, 1.0)
+    A_n = A / row_norm[:, None]
+    rhs_n = rhs / row_norm
+    num = jnp.linalg.norm(A_n @ y - rhs_n)
+    den = jnp.linalg.norm(A_n) * jnp.linalg.norm(y) + jnp.linalg.norm(rhs_n)
+    return num / jnp.where(den > 0, den, 1.0)
+
+
+def _matrix_backward_error(L, sL, X):
+    """The same quantity for the Loewner reduction ``L X = sL``.
+
+    Not row-equilibrated: the Loewner matrix is not a cross-multiplied
+    system whose rows span decades of ``|W|``, it is a divided-difference
+    table whose rows are already commensurate.
+    """
+
+    num = jnp.linalg.norm(L @ X - sL)
+    den = jnp.linalg.norm(L) * jnp.linalg.norm(X) + jnp.linalg.norm(sL)
+    return num / jnp.where(den > 0, den, 1.0)
+
+
 def _loewner_pencil(w, x_hat, n):
     """The fixed-support Loewner pencil ``(L, sL)``, ``n`` by ``n`` each.
 
@@ -458,7 +497,9 @@ def _loewner_roots(w, x_hat, n, rcond):
     s_inv = jnp.where(s > rcond * s_max, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
     L_pinv = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * u.conj().T)
     cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
-    return jnp.linalg.eigvals(L_pinv @ sL), cond, s_max, s_min
+    X = L_pinv @ sL
+    return (jnp.linalg.eigvals(X), cond, s_max, s_min,
+            _matrix_backward_error(L, sL, X))
 
 
 def _companion_roots(c_coeffs):
@@ -673,11 +714,12 @@ def fit_mpa_poles(
     # Python string, so it is resolved at trace time and both arms are
     # static-shape -- this stays one jit/vmap kernel either way.
     if solve == "loewner":
-        b_hat, cond, s_max, s_min = _loewner_roots(w, x_hat, n, rcond)
+        b_hat, cond, s_max, s_min, bwd = _loewner_roots(w, x_hat, n, rcond)
     else:
         A, rhs, _t, x_centre, x_scale = build_pade_system(
             w, z, n, affine=affine)
         coef, cond, s_max, s_min = _solve_normalised(A, rhs, rcond)
+        bwd = _backward_error(A, rhs, coef)
         # Roots come back in the t plane; ``b_hat`` lives in the x/x_max
         # plane.  Composing the two scalars BEFORE touching the roots
         # keeps ``affine=False`` bit-identical to the shipped solve,
@@ -752,6 +794,14 @@ def fit_mpa_poles(
         "valid": valid,
         "n_valid": jnp.sum(valid.astype(jnp.int32)),
         "cond_pade": cond,
+        # THE BACKWARD ERROR, BESIDE THE CONDITION NUMBER IT IS READ WITH.
+        # ``mpa_store.write_fit_block`` requires both and this kernel used
+        # to return only the second, so the only supplier was a function
+        # that re-solved this system AND refit the element to report a
+        # forward residual beside it -- two fits and three solves per
+        # element for one block.  Returning it here is the perf lane's
+        # proposed diff (MPA_16GPU_PLAN §FIT-EFFICIENCY), folded.
+        "backward_error": bwd,
         "sigma_max_pade": s_max,
         "sigma_min_pade": s_min,
         "x_max": x_max,

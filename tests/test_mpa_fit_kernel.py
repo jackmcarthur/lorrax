@@ -873,3 +873,35 @@ def test_gate_synthesis_off_pole():
     # FALSE case: a pole with a finite width is off every sample.
     pade_fit.synthesize_w_samples(
         np.array([1.0 - 0.1j]), np.array([1.0 + 0.0j]), z)
+
+
+def test_fit_reports_its_own_backward_error():
+    """One fit, one solve: the diagnostics no longer re-derive the fit.
+
+    The perf lane's §FIT-EFFICIENCY finding, folded: the store REQUIRES a
+    backward error, the kernel used to return only the condition number,
+    and the only supplier re-solved the system and refit the element to
+    report a forward residual beside it -- two fits and three solves per
+    element for one block.  The fit now carries the key, and
+    ``solve_conditioning`` reads it, so the two agree BY CONSTRUCTION.
+    Asserted for both modes, because a mode that grew a different
+    definition would be a second definition wearing one name.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+
+    for kw in (dict(solve="pade", affine=False),
+               dict(solve="pade", affine=True),
+               dict(solve="loewner")):
+        diag = pade_fit.fit_mpa_poles(W, z, n_p, **kw)[2]
+        cnd = diagnostics.solve_conditioning(W, z, n_p, **kw)
+        assert "backward_error" in diag
+        assert float(diag["backward_error"]) < 1.0e-12
+        for a, b in (("backward_error", "backward_error"),
+                     ("cond_pade", "cond"),
+                     ("sigma_max_pade", "sigma_max"),
+                     ("sigma_min_pade", "sigma_min")):
+            assert float(diag[a]) == float(cnd[b]), (kw, a)
