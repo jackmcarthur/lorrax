@@ -199,9 +199,20 @@ def main(argv=None) -> int:
            f"[{cfg.band_range_left[0]}, {cfg.band_range_left[1]}) x "
            f"[{cfg.band_range_right[0]}, {cfg.band_range_right[1]})")
     print0(f"  output      {result.output_file}")
+    if result.zeta_file:
+        print0(f"  zeta        {result.zeta_file}  (transported to the small "
+               f"basis; bse.exciton_bands --vq-mode interp reads it)")
+    if result.centroid_file:
+        print0(f"  centroids   {result.centroid_file}  (kept rows, for a "
+               f"fresh GW on the small basis)")
     print0("  point any BSE consumer at "
            f"{os.path.dirname(os.path.dirname(result.output_file))} — the "
            "bundle format is unchanged, so nothing downstream needs a flag.")
+    if not result.parent_centroid_file:
+        print0("  NOTE: no parent centroid table was resolved, so "
+               "bse.exciton_bands cannot open this bundle — its htransform "
+               "leg refits psi in the PARENT ISDF basis and needs those "
+               "coordinates.  Set parent_centroids_file and re-run.")
     print0("-" * 72)
     _print_validation_recipe(result, print_fn=print0)
     if getattr(result.selection, "requested_auto", False):

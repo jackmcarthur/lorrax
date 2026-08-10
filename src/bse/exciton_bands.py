@@ -359,13 +359,193 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     return np.conj(np.transpose(d_vec, (3, 1, 2, 0)))      # (k, c, v, 3)
 
 
+def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
+                       log=print):
+    """``(centroid_table, keep_idx | None)`` — WHICH ISDF basis to fit ψ in.
+
+    On a natively-fitted bundle this is the deck's ``centroids_file`` and
+    nothing else happens: the restart's μ basis IS the deck's centroid set,
+    and ``keep_idx`` is ``None``.  That arm is byte-for-byte the program this
+    driver has always run.
+
+    ON A DOWNFOLDED BUNDLE THE TWO ARE DIFFERENT OBJECTS, and conflating them
+    is the second of the three ways this driver failed on one (measured
+    2026-08-10, PIPELINE_HEALTH.md).  The small bundle's basis is a SUBSET of
+    the parent's centroid points — ``downfold.md``: "the new
+    wavefunction-at-centroid coefficients are a literal column slice of the
+    ones already on disk" — and the htransform leg does not read the stored
+    coefficients, it REFITS ψ against the centroid table it is handed.  That
+    fit needs a Galerkin basis spanning ``nk·nb``, which is a completely
+    different sizing criterion from the retained window's PAIR-DENSITY rank
+    that μ_S was chosen against, and is much larger: 1280 against μ_S = 189
+    on the walk's silicon deck, where the fit failed the ``build_fH_R``
+    orthonormality gate rather than merely losing accuracy.
+
+    So the basis to FIT in is the parent's, and the answer is then sliced to
+    the kept rows — which lands exactly on the columns the bundle stores,
+    because that slice is the downfold's own definition of them.  μ_S buys
+    the (μ, μ) tensors and the BSE matvec; it does not and cannot buy the
+    interpolation fit, and this function is where that is stated.
+
+    The parent's table comes off the bundle's own ``downfold_provenance``,
+    not off the deck: a deck copied beside the small bundle names a file that
+    is not there (the walk's first failure — a bare ``FileNotFoundError`` out
+    of ``np.loadtxt``, with nothing to say it was a downfold consequence).
+    The deck is still honoured when it names a readable table of the right
+    size, so a user who has arranged their own is not overruled.
+    """
+    from file_io import read_downfold_provenance
+
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+
+    def _resolve(p):
+        return p if os.path.isabs(p) else os.path.join(input_dir, p)
+
+    deck_path = _resolve(str(params.get("centroids_file",
+                                        "centroids_frac.txt")))
+    prov = read_downfold_provenance(restart_file)
+
+    if prov is None:
+        if not os.path.isfile(deck_path):
+            raise SystemExit(
+                f"exciton_bands: the deck's centroids_file resolves to "
+                f"{deck_path}, which does not exist.  This driver refits "
+                f"psi(k+Q) at the centroid points rather than reading the "
+                f"stored coefficients, so it needs the coordinate table the "
+                f"restart's ISDF basis was built on.  Point centroids_file "
+                f"at it, or copy it beside {os.path.basename(input_file)}.  "
+                f"(bse.bse_jax reads this bundle without a centroid table at "
+                f"all, which is why the two drivers disagree about whether "
+                f"this file is needed.)")
+        return deck_path, None
+
+    keep_idx = prov.get("keep_idx")
+    mu_parent = int(prov.get("parent_mu", 0))
+    if keep_idx is None:
+        raise SystemExit(
+            f"exciton_bands: {restart_file} carries a downfold_provenance "
+            f"group with no keep_idx dataset, so there is no way to map its "
+            f"mu={n_rmu_bundle} basis back to the parent's centroid points.  "
+            f"The bundle predates the stamp; re-run gw.downfold_cli on the "
+            f"parent to produce one this driver can open.")
+    keep_idx = np.asarray(keep_idx, dtype=np.int64)
+    if keep_idx.shape[0] != int(n_rmu_bundle):
+        raise SystemExit(
+            f"exciton_bands: {restart_file} stores mu={n_rmu_bundle} but its "
+            f"downfold_provenance keeps {keep_idx.shape[0]} parent centroid "
+            f"rows.  The bundle and its provenance describe different bases; "
+            f"re-run the downfold rather than trusting either.")
+
+    # The parent table: the bundle's own record first, the deck second.
+    cands = []
+    stamped = prov.get("parent_centroids_file")
+    if stamped:
+        cands.append((str(stamped), "downfold_provenance"))
+    cands.append((deck_path, "the deck's centroids_file"))
+    for path, whence in cands:
+        if not os.path.isfile(path):
+            continue
+        n_rows = int(np.loadtxt(path, ndmin=2).shape[0])
+        if mu_parent and n_rows != mu_parent:
+            log(f"  [downfold] {path} ({whence}) has {n_rows} rows, not the "
+                f"parent's {mu_parent} — not the table this bundle was "
+                f"downfolded from; skipped.")
+            continue
+        log(f"  [downfold] this bundle is a DOWNFOLD of {prov.get('parent_file', '?')} "
+            f"(mu {mu_parent} -> {n_rmu_bundle}).  The htransform leg refits "
+            f"psi in the PARENT basis from {path} ({whence}) and the result "
+            f"is sliced to the {keep_idx.shape[0]} kept centroid rows — the "
+            f"same column slice that defines the bundle's own psi_full_y.  "
+            f"mu_S sizes the (mu,mu) tensors and the BSE matvec; the "
+            f"interpolation fit is sized by nk*nb and cannot use it.")
+        return path, keep_idx
+
+    raise SystemExit(
+        f"exciton_bands: {restart_file} is a downfolded bundle (mu "
+        f"{mu_parent} -> {n_rmu_bundle}) and this driver needs the PARENT "
+        f"run's centroid table to refit psi(k+Q); none of "
+        f"{[c[0] for c in cands]} is a readable {mu_parent}-row table.\n"
+        f"  Why the parent's and not the small one: the htransform Galerkin "
+        f"fit needs a basis spanning nk*nb, which is a different (and much "
+        f"larger) criterion than the retained window's pair-density rank "
+        f"that mu_S was chosen against.  The fit runs at the parent's mu and "
+        f"its output is then sliced to this bundle's kept rows.\n"
+        f"  Fix: re-run gw.downfold_cli with parent_centroids_file set to "
+        f"the parent deck's centroids_file (the driver then records its path "
+        f"on the bundle and this resolves itself), or point this deck's "
+        f"centroids_file at that table directly.")
+
+
+def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
+    """The ζ file the off-grid exchange needs — or a refusal that explains it.
+
+    ANNOUNCE OR REFUSE, BEFORE h5py GETS TO SAY IT ITS WAY.
+    ``vq_interp.build_vq_evaluator`` looks for ``zeta_q.h5`` beside the
+    restart, and a missing one is not an exotic condition: it is what EVERY
+    downfolded bundle written before 2026-08-10 looks like, and what one
+    whose parent's ζ was stored on the q-IBZ wedge still looks like.  The
+    bare ``OSError`` from that path names a file and nothing else — no hint
+    that the absence is a downfold consequence, and no hint that
+    ``--vq-mode=ongrid`` needs no ζ at all.  Third of the three ways this
+    driver failed on a downfolded bundle (PIPELINE_HEALTH.md, 2026-08-10).
+
+    A separate function rather than an inline block so the refusal can be
+    gated without a solve — same reason ``rerun_check_enabled`` is one.
+    """
+    if vq_mode == "ongrid":
+        return ""
+    path = os.path.join(os.path.dirname(os.path.abspath(restart_file)),
+                        "zeta_q.h5")
+    if os.path.isfile(path):
+        return path
+    prov = None
+    try:
+        from file_io import read_downfold_provenance
+        prov = read_downfold_provenance(restart_file)
+    except Exception:                                          # noqa: BLE001
+        pass
+    nx, ny, nz = (int(v) for v in kgrid)
+    raise SystemExit(
+        f"exciton_bands: --vq-mode={vq_mode} builds the exchange tile at "
+        f"arbitrary Q by interpolating the stored zeta, and there is no "
+        f"{path}.\n"
+        + ("  This bundle is a DOWNFOLD.  gw.downfold_cli transports zeta "
+           "into the small basis (zeta_S = conj(T[q]) zeta_L) and writes it "
+           "beside the bundle, so a bundle without one was either written "
+           "before that existed or has a PARENT whose zeta is stored on the "
+           "q-IBZ wedge — which vq_interp refuses on the parent too, so "
+           "--vq-mode=interp was never available on this lineage.  Re-fit "
+           "the parent with LORRAX_FORCE_FULL_BZ=1 and re-run the "
+           "downfold.\n"
+           if prov is not None else
+           "  The GW run that wrote this bundle left no zeta_q.h5 beside it "
+           "(a moved tmp/, or a restart written without the fit).\n")
+        + f"  --vq-mode=ongrid needs no zeta at all and is EXACT at every Q "
+          f"that lands on the {nx}x{ny}x{nz} BSE grid.")
+
+
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
-                            n_rmu_pad, mesh_xy):
+                            n_rmu_pad, mesh_xy, *, keep_idx=None):
     """Reshape the htransform bundle over the concatenated {k+Q} list into
     per-Q conduction caches, padded to the loader's mesh extents — one
     jitted reshape+pad+reshard, no host round-trip (the bundle stays on
     device; at 40 path points the old device_get→np.pad→2×device_put moved
     ~1.7 GB through the host).
+
+    ``keep_idx`` (downfolded bundles only) is the column slice from the
+    parent ISDF basis the htransform fitted in to the basis the RESTART
+    stores — see :func:`resolve_isdf_basis` for why those differ.  It runs
+    inside the same jit, before the pad, so the parent-width ψ never lands
+    in a second host buffer and the μ axis reaches its sharding constraint
+    already at the small extent.
+
+    THE RESTART'S μ IS THE AUTHORITY, and the assertion below says so: the
+    htransform's basis is an input to this function, ``n_rmu`` is what every
+    other operand in the solve was sized by, and a mismatch is a wrong-basis
+    contraction that every shape check downstream would pass once the pad
+    absorbed it.  (Same shape of reasoning as the post-snap window authority
+    at 7449ece0: one place resolves the extent, everything else asserts
+    against it rather than re-deriving it.)
 
     Returns (psi_cQ_X, psi_cQ_Y, eps_cQ):
         psi_cQ_[XY]: (nQ, nk, nc_pad, ns, n_rmu_pad), μ on x / y
@@ -375,10 +555,33 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
     rep = NamedSharding(mesh_xy, P())
 
+    # HOST numpy, closed over — NOT a ``jnp.asarray`` outside the jit.  An
+    # eager ``device_put`` of a host array is the AA.1 hidden-all-gather site
+    # this driver already documents at its refit rows; a numpy array closed
+    # over by the trace becomes an HLO constant instead, which is process-local
+    # by construction and costs nothing at any P.
+    n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
+    keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
+    n_after = n_rmu_src if keep is None else int(keep.shape[0])
+    if n_after != int(n_rmu):
+        raise ValueError(
+            f"exciton_bands: the htransform fitted psi at {n_rmu_src} "
+            f"centroid point(s)"
+            + ("" if keep is None else
+               f", of which {n_after} are kept")
+            + f", but the restart bundle stores mu={n_rmu}.  The conduction "
+              f"caches would be contracted against a W and V in a different "
+              f"basis.  The restart's mu is the authority here: point the "
+              f"deck's centroids_file at the table this bundle's basis came "
+              f"from (a downfolded bundle records the parent's path in its "
+              f"downfold_provenance group).")
+
     @partial(jax.jit, out_shardings=(x5, y5, rep))
     def _stacks(psi, eps):
         ns = psi.shape[2]
-        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu)
+        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu_src)
+        if keep is not None:
+            psi = jnp.take(psi, keep, axis=4)
         eps = eps.reshape(nQ, nk, n_cond)
         psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
                             (0, 0), (0, n_rmu_pad - n_rmu)))
@@ -884,6 +1087,17 @@ def main(argv=None):
                 f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
 
+    # ── which ISDF basis the htransform fits in ──────────────────────────
+    # BEFORE initialize_wfns, because that call is the one that reads the
+    # centroid table.  On a plain bundle this returns the deck's own path
+    # and ``None``, and the program below is unchanged; on a downfolded one
+    # it returns the PARENT's table and the column slice back to this
+    # bundle's basis.  See resolve_isdf_basis for why those are different
+    # questions and why the deck alone cannot answer the second.
+    centroids_path, keep_idx = resolve_isdf_basis(
+        restart_file, params, args.input, n_rmu_bundle=n_rmu, log=log)
+    params["centroids_file"] = centroids_path
+
     # ── htransform setup + Q path ────────────────────────────────────────
     t0 = time.time()
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
@@ -1002,7 +1216,8 @@ def main(argv=None):
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
-        bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+        bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
+        keep_idx=keep_idx)
     # Everything the htransform produced is now copied into the conduction
     # stacks and nothing below reads it again.  Drop it before the V_Q model
     # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
@@ -1063,6 +1278,7 @@ def main(argv=None):
                     else bool(params.get("head_minibz_average", False)))
         log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
             f"(head_minibz_average={head_mbz})")
+        require_zeta_for_interp(restart_file, args.vq_mode, (nkx, nky, nkz))
         vqm = vq_interp.build_vq_evaluator(
             restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
             eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,

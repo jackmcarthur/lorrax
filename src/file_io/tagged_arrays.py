@@ -226,6 +226,56 @@ def read_coulomb_policy_from_h5(filename) -> dict | None:
         return None
 
 
+#: The group ``gw.downfold_run`` stamps on a compressed bundle.  Named here,
+#: beside the Coulomb-policy stamp, because it is part of the RESTART FORMAT
+#: and has two sides: the downfold writes it and the BSE drivers read it.  A
+#: reader that needed its own copy of the group name would be a second owner
+#: of a format detail, which is the drift this module exists to prevent.
+DOWNFOLD_PROVENANCE_GROUP = "downfold_provenance"
+
+
+def read_downfold_provenance(filename) -> dict | None:
+    """The ``downfold_provenance`` group of a restart bundle; ``None`` if absent.
+
+    ``None`` means "natively fitted, as far as this file says" — a bundle
+    written by ``gw.gw_jax`` carries no such group, and so does one written
+    by a downfold predating the stamp.  Both are read as not-downfolded,
+    which is the safe direction: every consumer's existing behaviour is what
+    it gets.
+
+    WHY A READER LIVES HERE AT ALL.  A downfolded bundle is deliberately
+    indistinguishable from a natively fitted one BY SHAPE — that is what
+    makes it a drop-in for ``bse.bse_jax``.  But two facts about it are not
+    derivable from shape and are load-bearing for any consumer that has to
+    build something NEW in the same ISDF basis rather than only read the
+    stored tensors: which centroid table the parent basis came from, and
+    which of the parent's centroid rows survived.  ``bse.exciton_bands``
+    needs both (its htransform leg fits ψ in the PARENT basis and slices the
+    result to the kept rows), and this is the one place either is recorded.
+
+    Serial h5py, no SlabIO handle, no collective — the same contract as
+    :func:`read_coulomb_policy_from_h5`, so it is safe to call on any rank
+    before the tensors move.
+
+    Returns the group's attributes as a plain dict (bytes decoded to str),
+    plus ``keep_idx`` / ``retained_rank_per_q`` as numpy arrays when present.
+    """
+    try:
+        with h5py.File(filename, "r") as f:
+            if DOWNFOLD_PROVENANCE_GROUP not in f:
+                return None
+            g = f[DOWNFOLD_PROVENANCE_GROUP]
+            out = {}
+            for k, v in g.attrs.items():
+                out[k] = v.decode("utf-8") if isinstance(v, bytes) else v
+            for name in ("keep_idx", "retained_rank_per_q"):
+                if name in g:
+                    out[name] = np.asarray(g[name][:])
+            return out
+    except (OSError, KeyError):
+        return None
+
+
 def describe_coulomb_policy_stamp(filename) -> str:
     """One line naming the Coulomb policy a restart file's tensors carry.
 

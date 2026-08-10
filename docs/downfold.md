@@ -17,20 +17,52 @@ any other, so `bse.bse_jax` reads it with no code change, no flag and no
 knowledge that a downfold happened. You point that driver at a different
 directory and everything else is as it was.
 
-!!! warning "`bse.exciton_bands` does not yet read a downfolded bundle"
-    This page used to promise the drop-in for *every* BSE consumer. Measured
-    2026-08-10 on a 936 → 189 downfold of a silicon 4×4×4 parent, the exciton-band
-    driver refuses on the small bundle for three separate reasons, and only the
-    first has a workaround: it reads the deck's `centroids_file`, which the bundle
-    carries only when the downfold was given `parent_centroids_file`; its
-    htransform leg needs a Galerkin basis spanning `nk·nb` (1280 there against
-    μ_S = 189) and refuses with `the Galerkin coefficients are NOT orthonormal`
-    even after the htransform window is narrowed to the retained window; and its
-    default `--vq-mode interp` needs a full-BZ `zeta_q.h5`, which the downfold
-    does not write. μ_S is sized against the retained window's pair-density rank,
-    which is a much smaller number than the Galerkin bound, so these are
-    different criteria rather than a tuning problem. Today the small bundle
-    serves `bse.bse_jax`; the exciton bands still want the parent.
+`bse.exciton_bands` reads one too, as of 2026-08-10. It used not to, in three
+separate ways, and the reason is worth stating because it explains what the
+downfold now writes: `bse_jax` only *reads* the stored tensors, while the
+exciton driver *rebuilds* objects in the same ISDF basis — ψ at finite Q, and
+the exchange tile off the grid — and rebuilding needs two things that reading
+does not.
+
+The first is the parent's centroid coordinates. The htransform leg fits ψ
+against a coordinate table, and that Galerkin fit needs a basis spanning
+`nk·nb` — 1280 on the silicon deck measured here — which is a completely
+different sizing criterion from the retained window's pair-density rank that
+μ_S = 189 was chosen against. So the fit runs in the **parent** basis and its
+output is sliced to the kept rows afterwards, which is exact because the small
+basis's ψ-at-centroids is that same column slice by definition (see `mode`
+below). The downfold therefore writes the parent's table out beside the small
+bundle, taken from the parent's own `zeta_q.h5` header and content-verified
+against the bundle's `centroids_charge_md5`, and records its path in
+`downfold_provenance`. μ_S buys the (μ, μ) tensors and the BSE matvec; it does
+not and cannot buy the interpolation fit.
+
+The second is ζ. Off-grid exchange interpolates a stored `zeta_q.h5`, and the
+parent's is the wrong basis, so the downfold transports it:
+`ζ_S = conj(T) ζ_L`, the same map the head vector `g0` takes, applied at every
+G rather than only at G = 0. Substituting it into `V = ζ† v ζ` gives back
+`V_S = T V_L T†` exactly — the congruence the bundle already stores — so the
+two descriptions of one interaction cannot drift apart, and the writer
+cross-checks its q = 0, G = 0 column against the independently transported
+`g0_S` on every run.
+
+!!! note "One case where ζ is not transported"
+    A parent whose ζ was written on the q-IBZ wedge cannot be transported: `T`
+    is indexed by the restart's flat-q axis and mapping the two is the deferred
+    IBZ-ζ unfold. The run says so and the small bundle carries no ζ. Nothing is
+    lost relative to the parent — `vq_interp` refuses an IBZ ζ outright, so
+    `--vq-mode interp` was never available on that lineage — and
+    `--vq-mode ongrid` needs no ζ at all and is exact at every Q on the BSE
+    grid. Re-fit the parent under `LORRAX_FORCE_FULL_BZ=1` if you want the
+    off-grid path.
+
+What the drop-in does **not** fix is how large μ_S has to be. Measured on the
+silicon deck below, the downfolded exciton bands at Q = 0 come out at 0.2579 eV
+for μ_S = 189 and 1.2605 eV for μ_S = 624 against the parent's 2.3451 eV — the
+same μ_S convergence curve `bse.bse_jax` shows on the same bundles, to six
+figures. The driver now runs and reports the bundle it was given faithfully;
+sizing the bundle is still the user's problem and is what the `mu_small`
+section below is about.
 
 Measured on silicon with a 960-centroid parent and a 20-band retained window:
 191 centroids out, a five-fold reduction in μ and a twenty-five-fold one in the
@@ -370,27 +402,31 @@ means report and always write, which is the current default because nobody has
 yet measured what a good error bar looks like on a production deck. Set it once
 you know.
 
-### `parent_centroids_file` — optional
+### `parent_centroids_file` — optional, and an override rather than a switch
 
-The parent run's centroid coordinate table. When you give it, the driver writes
-the kept rows out as a sibling centroid file and stamps its checksum onto the
-small bundle, so the small basis can later be handed to a fresh GW run.
+The parent run's centroid coordinate table. You do not normally need to set it:
+the parent's `zeta_q.h5` carries that table in its own `isdf_header`, so the
+driver takes it from there, checks it against the parent bundle's
+`centroids_charge_md5` — which hashes the FFT-index table, not the text file —
+and writes it out as
+`<output_restart>/tmp/centroids_frac_<μ_L>_parent.txt`. That is the table
+`bse.exciton_bands` fits its htransform leg in, and having it beside the child
+is what makes the child directory self-contained.
 
-Without it the bundle is still complete for `bse.bse_jax` — the bundle format
-carries no coordinates at all, only their checksum — and the driver says so
-rather than stamping the parent's checksum, which would be a lie about which
-points the tensors describe.
+Alongside it the driver writes the **kept** rows to
+`<output_restart>/tmp/centroids_frac_<μ_S>_downfold.txt` and stamps that file's
+checksum onto the small bundle, so the small basis can later be handed to a
+fresh GW run. Both paths, and the transported ζ, are recorded in the bundle's
+`downfold_provenance` group, so no consuming deck has to be repointed at
+anything.
 
-It is **not** optional if you intend to run `bse.exciton_bands`, which reads the
-deck's `centroids_file` directly. Measured 2026-08-10, a small bundle written
-without this key fails there in `file_io/centroids.py` with a bare
-`FileNotFoundError: …/centroids_frac_936.txt not found.` — a naked numpy
-traceback carrying none of the announce-or-refuse framing the rest of the tree
-uses, and no hint that the missing file is a consequence of how the downfold was
-configured. When you do give the key, the kept rows are written to
-`<output_restart>/tmp/centroids_frac_<μ_S>_downfold.txt`, so the consuming deck's
-`centroids_file` has to be repointed at that path as well; "nothing else moves"
-does not hold on this path.
+Set the key when you want a specific table used — a parent with no `zeta_q.h5`
+at all, or a table you have curated yourself. It wins over everything else. If
+neither route produces a table, the run says so and names the consequence:
+`bse.bse_jax` is unaffected (the bundle format holds no coordinates, only their
+hash), and `bse.exciton_bands` will refuse with the same explanation rather
+than with the bare `FileNotFoundError: …/centroids_frac_936.txt not found.`
+out of `np.loadtxt` that this used to produce.
 
 ## What it prints, and what to read
 
@@ -447,6 +483,13 @@ A restart bundle in the unchanged format, at the smaller μ: `V_qmunu`,
 `psi_full_y` sliced to the kept centroids, `enk_full` and the head scalars
 carried through verbatim, the parent's Coulomb-kernel policy string re-stamped,
 and the parent's band-window stamp preserved.
+
+Three siblings land in the same `tmp/` directory: `zeta_q.h5` transported to the
+small basis, `centroids_frac_<μ_L>_parent.txt` (the basis the exciton driver's
+htransform leg fits in), and `centroids_frac_<μ_S>_downfold.txt` (the kept rows,
+for a fresh GW). They are not part of the bundle format — nothing in it holds a
+coordinate or a ζ — but they are what makes the output directory self-contained
+for every consumer rather than only for the ones that read tensors.
 
 The band axis is **not** truncated. The retained window decides what the
 compression is faithful to; it is not a truncation of the stored bands. Cutting
