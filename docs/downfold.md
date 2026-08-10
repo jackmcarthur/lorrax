@@ -110,9 +110,18 @@ output_restart = /path/to/the/small/bundle
 band_range_left  = 0:20
 band_range_right = 0:20
 
-mu_small       = auto
+# An EXPLICIT integer, and the number you sweep.  189 is this deck's measured
+# rank ceiling at the rcond below — it is also the value that came out 2.09 eV
+# wrong on the observable (see `mu_small`), so treat it as where a sweep starts.
+# Write the number in the deck rather than hiding it behind `auto`, and check
+# the result against the parent before you use it.
+mu_small       = 189
 downfold_rcond = 1.1e-6
 ```
+
+The one thing this file will not do for you is choose that number. `mu_small`
+is a physics choice, the driver has no accuracy instrument to make it with, and
+the section below is about how to make it and how to check that you were right.
 
 `python3 -m gw.downfold_cli --print-schema` lists every key with its default.
 
@@ -182,10 +191,32 @@ There is no default. This is a physics choice and the driver cannot guess it.
 
 How many centroids the small basis should have, or the word `auto`.
 
+**The recommendation is an explicit integer, validated against the parent by
+comparing the observable.** This page used to recommend `auto`, and that
+recommendation is withdrawn: it produced a 2.087 eV error in the lowest BSE
+eigenvalue on the standard silicon walk, with nothing refusing anywhere. Write
+the number in the deck, and then check it — the check is *How to validate a
+μ_S* below, and it is one command.
+
+The recommendation carries a precondition, and it is the same one this page's
+opening section states: **the parent basis has to be over-complete for your
+retained window**, or there is no redundancy to compress and every μ_S you can
+legally ask for is too small. The driver cannot create redundancy the parent
+does not have, it does not measure whether the parent has any, and nothing in
+this tree tells you how to build a parent that does — that gap is named at the
+top of this page and it is still open. A downfold of a parent that was merely
+adequate for its window is not a compression; it is a truncation with a
+compression's reporting.
+
 `auto` means "as many as the retained window has independent pair-density
-directions at `downfold_rcond`". It is the only value you can choose without
-having read the measurement report, and it is the largest value the driver will
-accept — but read the next paragraph before treating it as a safe default.
+directions at `downfold_rcond`" — the eigenvalue-rank **ceiling**, and the
+largest value the driver will accept. It is sized by rank. It is not sized by
+accuracy, it consults no observable, and it is not a safe default. Since
+2026-08-10 it prints a loud warning at selection time and again in the
+end-of-run summary saying exactly that, and the run still proceeds, because
+`auto` is an explicit choice and this driver does not overrule explicit
+choices. Use it to *learn the ceiling* — the largest basis this parent can
+support — and then sweep downward from it against the observable.
 
 !!! danger "`auto` is a ceiling, not a recommendation, and it silently produced a 2.1 eV error"
     Measured 2026-08-10, following this page's own guidance end to end. A silicon
@@ -213,6 +244,36 @@ accept — but read the next paragraph before treating it as a safe default.
     observable, exactly as the `downfold_rcond` section below insists, and treat
     a downfold whose observable has not been checked against its parent as
     unvalidated.
+
+#### How to validate a μ_S — the one command
+
+Solve the same BSE twice, once on the parent and once on the small bundle, with
+the same deck and identical flags, and compare the lowest eigenvalue against
+your accuracy bar. Production BSE work wants better than 1 meV; only
+full-frequency, MPA-class studies have any business tolerating something like
+10 meV. The driver prints this line at the end of every run with that run's own
+paths substituted in, so you do not have to reconstruct it:
+
+```bash
+for d in /path/to/the/gw/run /path/to/the/small/bundle; do (cd "$d" && python3 -u -m bse.bse_jax -i cohsex.in --n-val 4 --n-cond 4 --lanczos 2>&1 | tail -40); done
+```
+
+Both directories need the same BSE deck, and every flag has to match on both
+legs or the comparison is measuring something else. The band counts above are
+the example's, not a recommendation: under the default `--band-degeneracy
+strict` a deck that cuts a multiplet is refused, and the refusal names the
+counts that work — use those, on both legs. If the two lowest
+eigenvalues do not agree to your bar, the compression is too aggressive for
+this parent: raise μ_S, widen the window, or build a parent that is genuinely
+over-complete for it. `eps_W` does not answer this question — see the tripwire
+paragraph at the end of this page for the three measured cases where it read
+about one per cent beside errors of 37 meV, 1.7 eV and 2.09 eV.
+
+There is no target-accuracy mode in this driver today. The planned one — you
+state a meV bar and the driver sizes μ_S by sweeping it against the parent
+observable — is the stage-4 target-accuracy item on the downfold roadmap and is
+not built. Until it lands, the sweep above is manual, and it is the only
+accuracy evidence there is.
 
 **The driver refuses when you ask for more directions than the window
 contains**, and prints the number it measured. That refusal is not a failure

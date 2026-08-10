@@ -34,7 +34,19 @@ Three numbers, every run, and they are not interchangeable:
   downfolded observable on the retained window, computed exactly from
   mu x mu traces, with no reference calculation anywhere.
 
-If you read only one, read the third.
+If you read only one, read the third — but read the next paragraph before
+you read it as an accuracy gate, because it is not one.
+
+NONE OF THOSE THREE IS AN ACCURACY GATE, so the run ends by printing the
+comparison that is.  ``mu_small = auto`` sizes by RANK: it is the ceiling
+the parent can represent, and on a parent that is not over-complete for the
+window it has produced eV-scale BSE errors with ``eps_W`` reading about one
+per cent and nothing refusing (``PIPELINE_HEALTH.md``, 2026-08-10 — 2.3449
+eV to 0.2579 eV on the standard si walk).  ``eps_W`` is a tripwire for a
+downfold that has gone badly wrong, not a promise about meV.  The honest
+instrument is solving the same BSE on the parent and on the small bundle and
+comparing the observable, and :func:`_print_validation_recipe` prints that
+command, with this run's own paths in it, at the end of every run.
 """
 from __future__ import annotations
 
@@ -75,6 +87,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-schema", action="store_true",
                    help="list every input-file key with its default and exit")
     return p
+
+
+def _run_dir_of(h5_path: str) -> str:
+    """``<run>/tmp/isdf_tensors_<mu>.h5`` → ``<run>``; anything else → its dir.
+
+    The BSE drivers resolve their restart bundle from the directory holding
+    their INPUT FILE (``bse_io._find_restart_file`` globs ``tmp/`` first,
+    then the directory itself), so this is the directory a validation deck
+    has to sit in for each leg of the comparison.
+    """
+    d = os.path.dirname(os.path.abspath(h5_path))
+    return os.path.dirname(d) if os.path.basename(d) == "tmp" else d
+
+
+def _print_validation_recipe(result, print_fn=print) -> None:
+    """The observable comparison, as one copy-pasteable line.
+
+    THIS IS THE ACCURACY INSTRUMENT.  Neither ``mu_small`` nor ``eps_W``
+    is one: ``mu_small = auto`` sizes by rank, and ``eps_W`` is a tripwire
+    that read about one per cent on a bundle whose lowest BSE eigenvalue
+    was wrong by 2.087 eV (``PIPELINE_HEALTH.md``, 2026-08-10).  A downfold
+    whose observable has not been compared against its parent's is
+    unvalidated, so the run that produced it ends by printing the command
+    that would validate it rather than leaving the reader to invent one.
+    """
+    parent = _run_dir_of(result.source_file)
+    small = _run_dir_of(result.output_file)
+    print_fn("  VALIDATE THIS BUNDLE BEFORE YOU TRUST IT — solve the same "
+             "BSE on the parent and")
+    print_fn("  on the small bundle and compare the lowest eigenvalue "
+             "against your accuracy bar")
+    print_fn("  (production BSE work wants better than 1 meV).  Copy-paste, "
+             "after putting the SAME")
+    print_fn("  BSE deck in both directories and keeping every flag "
+             "identical on both legs:")
+    print_fn(f"    for d in {parent} {small}; do (cd \"$d\" && python3 -u -m "
+             f"bse.bse_jax -i cohsex.in --n-val 4 --n-cond 4 --lanczos "
+             f"2>&1 | tail -40); done")
+    print_fn("  The band counts are yours; if the strict band-degeneracy "
+             "guard refuses them it")
+    print_fn("  names the counts that work — use those, on BOTH legs, or the "
+             "comparison is")
+    print_fn("  measuring two different calculations.")
+    print_fn("  If the two lowest eigenvalues do not agree to your bar, the "
+             "compression is too")
+    print_fn("  aggressive for this parent — raise mu_small, or widen the "
+             "window, or build a")
+    print_fn("  parent that is genuinely over-complete for it.  eps_W above "
+             "does NOT answer this.")
 
 
 def _print_schema(print_fn=print) -> None:
@@ -141,6 +202,20 @@ def main(argv=None) -> int:
     print0("  point any BSE consumer at "
            f"{os.path.dirname(os.path.dirname(result.output_file))} — the "
            "bundle format is unchanged, so nothing downstream needs a flag.")
+    print0("-" * 72)
+    _print_validation_recipe(result, print_fn=print0)
+    if getattr(result.selection, "requested_auto", False):
+        # Repeated at the END as well as at selection time: the selection
+        # banner is thousands of log lines back by now, and this is the
+        # last thing a user reads before they go and use the bundle.
+        from gw.downfold import AUTO_HAZARD
+
+        print0("-" * 72)
+        print0("  THIS RUN USED mu_small = auto, so it was sized by RANK and "
+               "not by accuracy:")
+        print0(f"  {AUTO_HAZARD}.")
+        print0("  The comparison above is the only accuracy evidence this "
+               "run can offer.")
     if rank0:
         timing.report(print_fn=print, title="--- downfold timing (s) ---")
     barrier("downfold.outputs_written")

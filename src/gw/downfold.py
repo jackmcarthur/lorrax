@@ -158,6 +158,8 @@ __all__ = [
     "observable_norm2",
     "epsilon_w",
     "R19_ANCHOR",
+    "AUTO_HAZARD",
+    "describe_auto_hazard",
     "DEFAULT_RCOND",
 ]
 
@@ -172,6 +174,96 @@ DEFAULT_RCOND = 1.1e-6
 #: Printed beside every margin, because the margin is only meaningful next to
 #: a case where loosening the cut destroyed the answer.
 R19_ANCHOR = "R19 anchor: +41% retained rank moved a 2.2 eV gap by 5000 eV"
+
+#: THE HAZARD ``mu_small = auto`` CARRIES, in one sentence, stated once so
+#: that the driver, the end-of-run summary, ``docs/downfold.md`` and the test
+#: that guards them cannot drift apart.  Measured 2026-08-10 on the standard
+#: si pipeline walk and written down in ``PIPELINE_HEALTH.md``; the mechanism
+#: is in ``DOWNFOLD_S1.md`` §3(c) and the rank probe.  ``auto`` is the
+#: EIGENVALUE-RANK CEILING — a statement about how many directions the parent
+#: can still represent — and rank completeness at that ceiling does not imply
+#: accuracy in any observable unless the parent was over-complete for the
+#: window, which nothing in this driver measures.
+AUTO_HAZARD = (
+    "auto sizes by rank, not by observable accuracy; on a non-redundant "
+    "parent this has produced eV-scale errors with epsilon_W silent — "
+    "validate against the parent with a direct comparison before trusting "
+    "any downfolded result")
+
+#: The banner.  Wide and ugly on purpose: this has to survive being scrolled
+#: past in a job log.
+_BANG_TITLE = ("!!  WARNING — mu_small = auto SIZED THIS RUN BY RANK, "
+               "NOT BY ACCURACY  !!")
+_BANG = "  " + "!" * len(_BANG_TITLE)
+
+
+def describe_auto_hazard(mu_S: int, rcond: float) -> str:
+    """The loud block ``mu_small = auto`` prints at SELECTION time.
+
+    Not a refusal — ``auto`` remains an explicit user choice and this driver
+    does not overrule explicit choices.  It is the warning that was missing
+    when the standard pipeline walk followed the tree's own guidance end to
+    end and got a 2.087 eV error in the lowest BSE eigenvalue with nothing
+    anywhere refusing and ``eps_W`` reading about one per cent.
+
+    Fires ONLY on ``auto``.  An explicit integer ``mu_small`` prints none of
+    this: the user who typed a number has already made the sizing decision
+    this block exists to interrupt, and a warning that fires on every run is
+    a warning nobody reads.  ``tests/test_downfold.py`` holds both arms.
+    """
+    return "\n".join([
+        _BANG,
+        "  " + _BANG_TITLE,
+        _BANG,
+        f"  [downfold/select] mu_small = auto -> {mu_S}: the number of "
+        f"independent pair-density",
+        f"      directions the retained window holds at rcond={rcond:g}.  "
+        f"That is the CEILING",
+        "      the parent can still represent, and the largest value this "
+        "driver accepts.  It",
+        "      is NOT a recommendation, and it is NOT a statement about the "
+        "accuracy of",
+        "      anything you will compute from the bundle this run is about "
+        "to write.",
+        "  [downfold/select] THE MEASURED HAZARD, verbatim:",
+        f"      {AUTO_HAZARD}.",
+        "  [downfold/select] THE MEASUREMENT (PIPELINE_HEALTH.md, "
+        "2026-08-10, si_bse_debug",
+        "      4x4x4, a 936-centroid parent on a 0:20 window, following this "
+        "tree's own",
+        "      documented guidance end to end): auto -> 189 at rcond=1.1e-6 "
+        "moved the lowest",
+        "      BSE eigenvalue from the parent's 2.3449 eV to 0.2579 eV — "
+        "WRONG BY 2.087 eV —",
+        "      while eps_W read 1.33e-2 and NOTHING refused.  Tightening to "
+        "rcond=1e-8 (auto",
+        "      -> 624, a compression of only 1.5x) still left 1.08 eV of "
+        "error.  Rank",
+        "      completeness at the eigenvalue ceiling implies observable "
+        "accuracy only on a",
+        "      parent that is OVER-COMPLETE for your window; whether yours "
+        "is, this driver",
+        "      does not measure and cannot tell you.",
+        "  [downfold/select] eps_W IS A TRIPWIRE, NOT AN ACCURACY GATE.  It "
+        "reported about one",
+        "      per cent in the row that was wrong by 2 eV.  The honest "
+        "accuracy instrument is",
+        "      the observable comparison against the parent, and auto never "
+        "consults it.",
+        "  [downfold/select] THERE IS NO ACCURACY-SIZED MODE IN THIS DRIVER "
+        "TODAY.  The planned",
+        "      one — state a meV bar and let the driver size mu_S by "
+        "sweeping it against the",
+        "      parent observable — is the stage-4 target-accuracy item on "
+        "the downfold",
+        "      roadmap and IS NOT BUILT.  Until it lands, auto is where a "
+        "sweep STARTS and",
+        "      never where it ends, and the comparison this run prints at "
+        "the end is the only",
+        "      accuracy evidence there is.  Production BSE work wants better "
+        "than 1 meV.",
+        _BANG,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +397,8 @@ class SelectionReport:
         lines = [
             f"{indent}[downfold/select] CUR selection from the parent set: "
             f"mu_L={self.mu_large} -> mu_S={self.mu_small}"
-            + ("  (mu_small = auto, set to the certified eigenvalue rank)"
+            + ("  (mu_small = auto: sized by the certified eigenvalue RANK, "
+               "not by observable accuracy — see the warning above)"
                if self.requested_auto else ""),
             f"{indent}[downfold/select] TWO DIFFERENT RANKS, and they are "
             f"not the same knob:",
@@ -357,8 +450,12 @@ def select_cur_centroids(
     q = 0 the MINIMUM on hBN.  μ_S does not need sizing by a worst q.
 
     ``mu_small`` may be the string ``"auto"``, meaning "μ_S = the rank
-    certified at ``rcond``" — on the probe's evidence that is the only value
-    a user can choose without having read the probe.
+    certified at ``rcond``".  That is a CEILING, not a recommendation: it is
+    sized by rank and says nothing about the accuracy of any observable, and
+    on a parent that is not over-complete for the window it has produced
+    eV-scale BSE errors with ``eps_W`` silent (``PIPELINE_HEALTH.md``,
+    2026-08-10).  ``auto`` therefore prints :func:`describe_auto_hazard`
+    loudly at selection time; an explicit integer prints nothing.
 
     REFUSES, loudly and before any of the expensive stages, when the
     requested μ_S exceeds the eigenvalue rank the window actually holds.
@@ -396,12 +493,10 @@ def select_cur_centroids(
     requested_auto = isinstance(mu_small, str) and str(mu_small).strip().lower() == "auto"
     if requested_auto:
         mu_S = ceiling
-        print_fn(
-            f"  [downfold/select] mu_small = auto -> {mu_S}, the number of "
-            f"independent pair-density directions the window "
-            f"holds at rcond={rcond:g}.  This is the only setting a user can "
-            f"choose without knowing the rank probe exists; every larger "
-            f"number is a request for directions that are not there.")
+        # LOUD, at selection time, before the expensive stages — because the
+        # thing this warns about is invisible everywhere downstream.  Fires
+        # only here; an explicit integer mu_small prints none of it.
+        print_fn(describe_auto_hazard(mu_S, float(rcond)))
     else:
         mu_S = int(mu_small)
 
@@ -426,7 +521,11 @@ def select_cur_centroids(
             f"basis' would be a fiction.\n"
             f"  THREE HONEST FIXES, in order of preference:\n"
             f"   (1) set mu_small = {ceiling} (or mu_small = auto, which "
-            f"does exactly that);\n"
+            f"does exactly that) — but note that {ceiling} is a RANK "
+            f"ceiling, not an accuracy answer: it is the most this parent "
+            f"can represent, and whether it is enough for your observable "
+            f"is a question only a comparison against the parent can "
+            f"settle;\n"
             f"   (2) widen the retained band window — the ceiling scales as "
             f"roughly nb^0.8 (RANK_PROBE §8), so it is the WINDOW that sets "
             f"it, not the number of centroids;\n"

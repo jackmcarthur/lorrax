@@ -299,8 +299,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             f"{mu_S} kept centroids add no independent direction at "
             f"rcond={cfg.downfold_rcond:g}.  The transfer solve will "
             f"truncate about that many modes per q; the small basis is "
-            f"smaller than it looks, and mu_small = auto would have said so "
-            f"up front.")
+            f"smaller than it looks, and mu_small = auto would have reported "
+            f"that ceiling up front — a RANK statement, not an accuracy one.")
     if mu_S_pad != mu_S:
         print_fn(
             f"  [downfold] mu_S {mu_S} -> {mu_S_pad} in memory (+"

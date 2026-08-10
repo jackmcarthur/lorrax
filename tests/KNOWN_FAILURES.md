@@ -46,6 +46,31 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — `mu_small = auto` IS RANK-SIZED, NOT ACCURACY-SIZED (2026-08-10) — **OPEN**
+
+**One row, and it is not a red — it is a wrong physical number produced by
+following this tree's own documented guidance, with nothing anywhere
+refusing.**  It is filed here rather than as a small-issues row because it
+implicates physics: the setting `docs/downfold.md` recommended until this
+branch sized a downfold whose lowest BSE eigenvalue came out 2.087 eV wrong,
+and the owner's bar for production BSE is under 1 meV.  Nothing in the suite
+could have caught it, and that is the durable part.  `tests/test_downfold.py`
+is deck-free by design — it gates the algebra (T = I on a full keep, the
+congruence, the Pythagorean identity and their red twins) and the rank
+refusal, none of which is an accuracy statement about a real deck.  The one
+cell that would have caught this, "downfold `si_bse_debug`, run the BSE
+driver on the small bundle unchanged, compare against the parent", needs a
+GPU and a finished GW run and lives in the campaign report rather than in
+`tests/`.  So the tree has no gate anywhere that compares a downfolded
+observable against its parent's, and until the sizing mode below lands, the
+only instrument is a user running that comparison by hand.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`mu_small = auto` sizes μ_S by the eigenvalue rank ceiling, which is not an accuracy criterion, and the docs recommended it** | `auto` sets μ_S to the number of independent pair-density directions the retained window holds at `downfold_rcond` — the largest value the driver will accept, and a statement about what the parent can still *represent*.  Rank completeness at that ceiling implies observable accuracy only on a parent that is OVER-COMPLETE for the window; nothing in the driver measures whether the parent is, and on a parent that is merely adequate the "compression" is a truncation with a compression's reporting.  Measured on the standard si pipeline walk (`~/lorrax_bse_perf_2026-08-08/PIPELINE_HEALTH.md`, 2026-08-10, `si_bse_debug` 4×4×4, a 936-centroid parent on a `0:20` window): `auto` → 189 at `downfold_rcond = 1.1e-6` moved the lowest BSE eigenvalue from the parent's **2.3449 eV to 0.2579 eV**, an error of **2.087 eV**, and the run exited 0 with a clean log.  `eps_W` read **1.33e-2** — about one per cent — which is the tripwire behaving exactly as documented and is the third measured case in which a ~1 % `eps_W` sat beside an error of 37 meV, 1.7 eV and now 2.09 eV; it is not an accuracy gate and was never claimed to be one.  Tightening to `rcond = 1e-8` (`auto` → 624, a compression of only **1.5×**) still left **1.08 eV**.  The error falls with μ_S, so the transfer solve is doing its job and this is a sizing defect rather than a numerical one — but on this deck the accuracy a BSE needs and the compression the downfold offers did not overlap at any μ_S the driver would accept.  Caveat on the record from the walk: that parent was pruned on the deck's Σ window (`8 / 52`) because it is the only invocation the tree documents, not on the 20-band window the downfold was fitted to; whether a differently-pruned parent behaves better is exactly the question the docs do not answer | **OPEN**, and it stays open until a **target-accuracy sizing mode** exists — the planned stage-4 item on the downfold roadmap, in which the user states a meV bar and the driver sizes μ_S by sweeping it against the parent observable.  Nothing in this tree sizes μ_S for accuracy until that lands.  What `fix/downfold-auto-guard-2026-08-10` does in the meantime is safety only, and refuses nothing: (1) `auto` prints a LOUD warning at selection time, before the expensive stages, carrying the measured hazard verbatim (`gw.downfold.AUTO_HAZARD`), the numbers above, the over-complete-parent precondition and the fact that the accuracy-sized mode does not exist; it repeats at the end of the run, where the reader actually is.  (2) `docs/downfold.md`, `docs/drivers.md` and `docs/input_reference.md` **stop recommending `auto`** — the recommendation is now an explicit integer validated by the observable comparison, the page's own example deck carries an explicit number rather than `auto`, and the over-complete-parent requirement is restated at the recommendation site.  (3) Every run now ends by printing the one-line, copy-pasteable observable comparison (parent and small bundle, same deck, same flags, compare the lowest eigenvalue), with that run's own paths substituted in, because the three numbers the driver prints are all rank or projection statements and none of them is an accuracy gate.  Gate: `tests/test_downfold.py::test_auto_prints_the_loud_accuracy_warning` with its **red twin** `::test_auto_warning_red_twin_an_explicit_mu_small_says_nothing` — the same rank-deficient pool, μ_S spelled as an integer instead of `auto`, must print nothing at all, so the warning cannot decay into a banner that fires on every run.  32 cells in that file, **32 passed** on WSL CPU.  Evidence: `PIPELINE_HEALTH.md` (the walk and its punch table), `DOWNFOLD_S1.md` §3(c) and `DOWNFOLD_RANK_PROBE.md` (campaign reports, not carried in this repository) |
+
+---
+
 # AMENDMENT — THE SHARDED BSE LOADER INJECTED A SCREENED HEAD ONTO THE BARE-V FALLBACK (2026-08-10) — **FOUND AND FIXED ON THIS BRANCH**
 
 **One row, and it was never a red — it was a silent wrong number on a path

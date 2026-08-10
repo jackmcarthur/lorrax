@@ -597,6 +597,75 @@ def test_mu_small_auto_lands_on_the_certified_rank():
     assert rep.requested_auto
 
 
+def _rank_deficient_selection(mu_small, printed):
+    """The rank-deficient pool of the two cells above, with prints captured.
+
+    Eight centroids carrying four independent directions, so ``auto`` lands
+    on 4 and an explicit 4 is legal — the two arms differ ONLY in how μ_S
+    was spelled, which is the whole point of the pair below.
+    """
+    mesh = resolve_mesh()
+    rng = np.random.default_rng(31)
+    half = (rng.normal(size=(NK, NB, NS, 4))
+            + 1j * rng.normal(size=(NK, NB, NS, 4)))
+    y = np.concatenate([half, half], axis=-1)
+    psi_Y = jax.lax.with_sharding_constraint(
+        jnp.asarray(y), NamedSharding(mesh, P(None, None, None, "y")))
+    psi_X = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_Y).transpose(0, 3, 1, 2),
+        NamedSharding(mesh, P(None, "x", None, None)))
+    win = BandWindow(left=(0, NB), right=(0, NB))
+    S = downfold.pair_density_gram(psi_X, psi_Y, win, kgrid=KGRID,
+                                   mesh_xy=mesh)
+    S_q0 = jax.lax.with_sharding_constraint(
+        S[0], NamedSharding(mesh, P("x", "y")))
+    return downfold.select_cur_centroids(
+        S_q0, mu_small, rcond=1e-8, select_tol=None, mesh_xy=mesh,
+        mu_large_logical=MU, print_fn=lambda *a: printed.append(" ".join(
+            str(x) for x in a)))
+
+
+def test_auto_prints_the_loud_accuracy_warning():
+    """``mu_small = auto`` must SAY that it sized by rank, not by accuracy.
+
+    The measured reason this cell exists (``PIPELINE_HEALTH.md``,
+    2026-08-10): following this tree's own guidance end to end, `auto` on a
+    936-centroid si parent produced a bundle whose lowest BSE eigenvalue was
+    2.087 eV wrong — 2.3449 eV down to 0.2579 eV — with ``eps_W`` reading
+    1.33e-2 and NOTHING anywhere refusing.  The driver still runs, because
+    ``auto`` is an explicit user choice; what it may not do is stay quiet.
+    """
+    printed = []
+    _keep, rep = _rank_deficient_selection("auto", printed)
+    assert rep.requested_auto
+    blob = "\n".join(printed)
+    assert downfold.AUTO_HAZARD in blob, blob
+    assert "WARNING" in blob and "NOT BY ACCURACY" in blob, blob
+    # The measurement travels with the warning, or a reader has to take it
+    # on faith.
+    for needle in ("PIPELINE_HEALTH.md", "2.3449", "0.2579", "1.33e-2",
+                   "624", "target-accuracy"):
+        assert needle in blob, f"{needle!r} missing from the auto warning"
+
+
+def test_auto_warning_red_twin_an_explicit_mu_small_says_nothing():
+    """RED TWIN: the same pool, μ_S spelled as an integer, prints no warning.
+
+    A warning that fires on every run is a warning nobody reads.  The user
+    who typed a number has already made the sizing decision the block exists
+    to interrupt, so the block must not fire — and the two cells differ in
+    exactly one argument.
+    """
+    printed = []
+    _keep, rep = _rank_deficient_selection(4, printed)
+    assert not rep.requested_auto
+    assert rep.mu_small == 4
+    blob = "\n".join(printed)
+    assert downfold.AUTO_HAZARD not in blob, blob
+    assert "WARNING" not in blob, blob
+    assert "!!!!" not in blob, blob
+
+
 def test_the_two_tolerances_are_different_knobs():
     """The selection certificate and the eigenvalue rank must DISAGREE.
 
