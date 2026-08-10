@@ -1134,7 +1134,8 @@ def _resolve_solver_kind_charge(
                        backend.  EXPLICIT choice: fails loudly if the
                        FFI/library is absent or the mesh geometry is the
                        guarded 1×q case (SLATE stride assert; see
-                       tests/test_ffi_linalg_contract.py) rather than
+                       services/distrib_la/tests/test_distrib_la_contract.py,
+                       where that pin now lives) rather than
                        silently running a different backend.
       ``auto`` (default) → replicated dense for fit-size stacks, else
                        cuSolverMp on true 2D / sharded otherwise (neither

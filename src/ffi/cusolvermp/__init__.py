@@ -4,7 +4,10 @@
 ``batched.py`` into one backend module, the shape ``_slate`` and
 ``_scalapack`` already had.  ``distrib_la.backend_module('cusolvermp')``
 hands out that module; this package keeps the old import path working for
-the bench drivers and ``tests/test_ffi_linalg_contract.py``.
+the bench drivers under ``tests/bench/``.  It used to also serve
+``tests/test_ffi_linalg_contract.py``; that file migrated to
+``services/distrib_la/tests/test_distrib_la_contract.py`` (marker
+``distrib_la``) and no longer reaches this path.
 
 Deletion is the replumb-complete gate.  **cuSOLVERMp itself is NOT a
 deletion candidate** — ``ffi_layout.md`` §5 once listed it and the phase
