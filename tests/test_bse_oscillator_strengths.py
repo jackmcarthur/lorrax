@@ -31,12 +31,27 @@ strength ``|d|^2`` cannot see a conjugation: ``|conj(d)|^2 == |d|^2``
 exactly, so a gate built on ``|d|^2`` alone would sit green through the
 precise defect class this project has already paid for -- a bra that
 stopped being conjugated.  So the reference also pins the COMPLEX
-projection ``<0|r_a|S> = sum_cvk A^S_cvk d^a_cvk`` against a fixed
+projection ``<0|r_a|S> = sum_cvk A^S_cvk conj(d^a_cvk)`` against a fixed
 probe ``A``, which is conjugation-sensitive, and
 ``test_a_conjugated_dipole_is_caught`` is the cell that would have
 failed.  The probe ``A`` is not a physical eigenvector and does not
 pretend to be: it is a fixed complex contraction whose only job is to
 carry phase information into a real number.
+
+THE ``proj`` REFERENCES WERE RE-CUT ON 2026-08-09, AND NO FIXTURE MOVED.
+When this file was written the two absorption drivers disagreed about
+where that conjugate belongs, and this file's references were cut with
+``absorption_eigvecs``'s spelling -- ``sum_t A_t d_t``, no conjugate
+anywhere -- with the disagreement recorded rather than resolved.  It has
+since been adjudicated against the spectral representation and the
+resolvent identity (``tests/test_absorption_conjugation.py``, and
+``absorption_common.exciton_dipole_projections`` for the derivation):
+that spelling was the WRONG one.  So the twelve ``proj`` numbers per
+fixture below are re-cut, while ``sum_f``, ``max_f`` and
+``de_bounds_Ry`` are untouched to the last bit -- the movement is a
+convention being corrected in the reader, not a ``dipole.h5`` being
+regenerated.  Both facts together are the check: a change that moved the
+sums as well would not be this fix.
 
 THE REFERENCES ARE NOW TWO DIFFERENT ARMS, ON PURPOSE.  This file was
 first cut with all four fixtures on the legacy ``-1`` arm.  On
@@ -111,9 +126,9 @@ REFS = {
         max_f=1.945919115651e+01,
         de_bounds_Ry=(1.867165110504e-01, 6.277285155045e-01),
         proj=(
-            (-8.1473178843e-02+4.3506264072e-01j, +8.7061092818e-02-2.0531532932e+00j, -4.1556500792e-01-8.7522737751e-01j),
-            (+8.6222914864e-01+1.1507803035e+00j, -1.0235331983e+00-1.8972444434e-01j, +7.6654109083e-01-2.8389212268e-01j),
-            (-1.7982384365e-01+5.4482772538e-01j, +3.4816587983e-01-1.6309848830e+00j, -6.7688265308e-01+1.6589765858e+00j),
+            (+2.1773175146e+00-5.2355133418e-01j, -3.2330540801e-01-2.3793315546e-01j, -4.9214374231e-01-1.3457611777e+00j),
+            (-1.4696741254e-01-2.3036993205e-01j, -2.6019104888e-01+8.6590320694e-01j, -8.7905593882e-01-1.3702241706e-01j),
+            (+6.4290630171e-01+5.2889570610e-01j, -6.7387578095e-01+3.8855564017e-01j, -6.5087234113e-01-9.8260745476e-01j),
         ),
     ),
     "cohsex_debug": _Ref(
@@ -122,9 +137,9 @@ REFS = {
         max_f=1.711752678590e+01,
         de_bounds_Ry=(1.416169052037e-01, 4.237078164396e-01),
         proj=(
-            (-2.0716647250e-01-4.0826852116e-01j, -7.6207706341e-01+7.3024288558e-02j, -1.2428336413e-01+1.4608299471e-01j),
-            (-4.3308667555e-01-1.1197147061e+00j, -2.0287672018e-01-8.3193396992e-02j, +5.4429980147e-03-6.2401642528e-02j),
-            (+2.9179754827e-01-7.7754056233e-02j, -6.4976000902e-01-2.2711261760e-01j, +8.1830428365e-02+1.7513071519e-01j),
+            (+1.1767038008e+00-8.6197311831e-01j, -9.5160821399e-01+6.1750819109e-01j, +1.6022401044e-01-1.9339608169e-01j),
+            (+2.0090552564e-01-2.1537693770e-01j, +3.2235600592e-02-6.0643406194e-01j, -1.8742029401e-02+1.1650832917e-01j),
+            (-1.5766050670e-02+4.2141446274e-01j, -1.2731123386e-01+1.1206067694e+00j, -1.5557208846e-01-9.2676111995e-02j),
         ),
     ),
     "gnppm_debug": _Ref(
@@ -133,9 +148,9 @@ REFS = {
         max_f=2.008907399830e+01,
         de_bounds_Ry=(1.249527013538e-01, 3.872730886117e-01),
         proj=(
-            (-2.5441766486e-01-3.5388704773e-01j, +1.5580880111e+00+6.0736994943e-01j, +3.7218197577e-02+1.3237353342e-01j),
-            (-3.2231100175e-01-6.8331772564e-01j, -1.6286923089e+00+1.4344278987e+00j, +1.3477378104e-01-3.2327133470e-02j),
-            (-2.0612052375e-01-1.1928367539e-01j, +6.6824594171e-02-2.3419304085e-01j, +2.4954075399e-03-2.7458830896e-01j),
+            (-2.7700661975e-01+1.0279966686e+00j, +4.7692705008e-01-7.0768505726e-01j, +1.9323997566e-01+1.1991717967e-01j),
+            (+2.8224994997e-01+4.9796397795e-01j, +3.0607581904e-01+6.0228150425e-01j, -1.2537366457e-01+7.0051313667e-02j),
+            (+2.5294293247e-01+1.0349084510e+00j, -7.0891256190e-01-1.6893661625e+00j, +1.6969524115e-01-6.5938093556e-02j),
         ),
     ),
     # RE-CUT 2026-08-09 on the +1 arm, from cohsex_hbn_test.in.
@@ -145,9 +160,9 @@ REFS = {
         max_f=4.059144537110e+00,
         de_bounds_Ry=(3.426640012554e-01, 8.544664902677e-01),
         proj=(
-            (+5.1190317085e-02+2.2722378962e-01j, -1.2279832001e-02-4.0651096205e-01j, -1.4101370170e-01-2.9938006648e-01j),
-            (+1.9882890238e-01-3.9317769537e-01j, -1.0501860190e+00+1.6645496767e-01j, -4.4040177053e-02-1.8603892443e-01j),
-            (+1.7590866050e-01+5.7823628905e-01j, +3.6098486363e-01+5.8863601203e-01j, -1.2124171766e-01+2.2788542138e-01j),
+            (+2.8553044346e-01+4.6721797679e-01j, +2.7705123380e-01-4.9844932952e-01j, -2.2450746557e-01-3.7938516102e-02j),
+            (+4.1362644126e-01+2.1857995605e-01j, -2.0460875920e-01-5.5959062813e-01j, -1.3605505522e-02+1.8887472718e-01j),
+            (-1.5362492214e-01-1.0083685263e-01j, -1.4728355940e-01-2.6792712743e-01j, +2.0589795044e-01+9.3477156397e-02j),
         ),
     ),
 }
@@ -292,29 +307,40 @@ def test_a_conjugated_dipole_is_caught(name):
         f"gate the defect class it was written for.")
 
 
-def test_the_two_projection_routes_disagree_and_this_one_is_pinned():
-    """CROSSED-CONVENTION TWIN, on a real in-tree divergence.
+def test_the_two_projection_routes_now_agree_and_the_wrong_one_still_fails():
+    """CROSSED-CONVENTION TWIN, on the divergence this file first recorded.
 
-    ``absorption_eigvecs.compute_dipole_projections`` contracts
-    ``einsum("Nkcv,akcv->Na", A, d)`` with NO conjugate on ``A``, while
-    ``davidson_absorption`` (:214) contracts ``eigvecs.conj()`` against
-    a transposed block.  For complex ``A`` those are different numbers,
-    not two spellings of one -- so "the oscillator strength" is
-    ambiguous in this tree until somebody says which.  This file's
-    reference is cut with the ``absorption_eigvecs`` convention, and
-    this cell is where that choice is written down and where a silent
-    swap of the two routes would fail.
+    When this cell was written the two drivers disagreed: this one
+    contracted ``einsum("Nkcv,akcv->Na", A, d)`` with no conjugate
+    anywhere, ``davidson_absorption`` contracted ``eigvecs.conj()``
+    against a transposed block, and which was right was open.  It is
+    closed (``tests/test_absorption_conjugation.py`` runs the identity
+    that closes it): the conjugate belongs on the DIPOLE, both drivers
+    now route through ``exciton_dipole_projections``, and the two
+    spellings that survive -- ``A conj(d)`` and ``conj(A) d`` -- are
+    complex conjugates, so they agree in the modulus that ε₂ consumes.
+
+    What must still fail is the arm that shipped: ``A d``, conjugating
+    NEITHER factor, differs in modulus and not merely in phase.  That is
+    the FALSE arm, and this is where a silent return to it fails.
     """
     ref, d_alpha, _ = _load("si_cohsex_debug")
     A = _probe_A(ref.nk)
 
     pinned = compute_dipole_projections(A, d_alpha)
-    conjugated = np.einsum("Nkcv,akcv->Na", A.conj(), d_alpha, optimize=True)
+    davidson_spelling = np.einsum("Nkcv,akcv->Na", A.conj(), d_alpha,
+                                  optimize=True)
+    false_arm = np.einsum("Nkcv,akcv->Na", A, d_alpha, optimize=True)
 
     np.testing.assert_allclose(pinned, np.asarray(ref.proj), rtol=RTOL)
-    assert not np.allclose(pinned, conjugated, rtol=1.0e-6), (
-        "the two in-tree projection conventions agreed, which for a "
-        "complex A can only mean the probe lost its imaginary part")
+    np.testing.assert_allclose(
+        np.abs(pinned), np.abs(davidson_spelling), rtol=1.0e-13,
+        err_msg="the two surviving spellings must be complex conjugates, so "
+                "their moduli -- the only part ε₂ reads -- must be identical")
+    assert not np.allclose(np.abs(pinned), np.abs(false_arm), rtol=1.0e-6), (
+        "the unconjugated contraction reproduced the corrected one in "
+        "modulus, which for a complex probe can only mean the probe lost "
+        "its imaginary part")
 
 
 # ---------------------------------------------------------------------------

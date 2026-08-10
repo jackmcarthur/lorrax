@@ -15,6 +15,18 @@ Mirrors BGW's ``BSE/haydock.f90 → iterate.f90 → absh.f90`` pathway:
 The Haydock trick: never form a single eigenvector; spectrum lives in
 the (α_n, β_n) recurrence.
 
+THIS ROUTE IS THE CONVENTION-FREE WITNESS, and it needed no change when
+the two eigenvector routes were adjudicated on 2026-08-09.  It never
+forms an ``A``, so it cannot conjugate one wrongly: it evaluates
+``⟨d|(z − H)⁻¹|d⟩`` with the seed ``|d⟩ = Σ_t d_t |t⟩`` taken straight
+from ``slice_dipole_to_bse_window`` (correct, because
+``⟨t|r̂|0⟩ = ⟨ck|r̂|vk⟩ = d_t``) and the Lanczos inner product
+``⟨s|H|s⟩`` conjugating the bra as usual.  Its spectral weights are
+therefore ``|⟨S|d⟩|² = |Σ_t conj(A_t) d_t|²``, which is exactly
+``|⟨0|r̂|S⟩|²`` for the contraction in
+``absorption_common.exciton_dipole_projections``.  Any sum-over-states
+ε₂ that disagrees with this route disagrees with the resolvent.
+
 Convention on ``n_spin`` vs ``n_spinor``: BGW's ``n_spin`` is 2 only for
 collinear spin-polarised calcs.  For our spinor calcs ``n_spin = 1`` and
 ``n_spinor = 2``.

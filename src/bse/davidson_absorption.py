@@ -35,7 +35,10 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from solvers.davidson import davidson, warmup_davidson_jit
-from .absorption_common import load_dipole_h5, slice_dipole_to_bse_window, write_eigenvalues_dat
+from .absorption_common import (
+    exciton_dipole_projections, load_dipole_h5, slice_dipole_to_bse_window,
+    write_eigenvalues_dat,
+)
 from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 from .bse_io import (
     _find_restart_file,
@@ -211,7 +214,15 @@ def main(argv=None):
     d_alpha, _ = slice_dipole_to_bse_window(
         dipole_cart, deltaE, n_occ=n_occ_for_slice, n_val=nv_pad, n_cond=nc_pad)
     d_block = np.transpose(d_alpha, (0, 2, 3, 1))   # (3, nc, nv, nk)
-    proj = np.einsum("Scvk,acvk->Sa", eigvecs_np.conj(), d_block, optimize=True)
+    # ⟨0|r̂_α|S⟩ = Σ_t A^S_t conj(d_t), through the one shared site.  This
+    # line used to read ``einsum("Scvk,acvk->Sa", eigvecs_np.conj(), d_block)``
+    # — the conjugate on A rather than on d.  Its MODULUS was right (the two
+    # spellings are complex conjugates, and |·|² is what ε₂ consumes), so this
+    # driver's spectra do not move; what moves is the sign of the ``Im``
+    # column in the BGW-format eigenvalues_b*.dat, which now matches BGW's own
+    # spelling at BSE/diag.f90:711.  The other driver, ``absorption_eigvecs``,
+    # conjugated NEITHER factor and was wrong in modulus too.
+    proj = exciton_dipole_projections(eigvecs_np, d_block)
 
     V_super = args.V_cell * nk
     for a, suffix in enumerate(("b1", "b2", "b3")):

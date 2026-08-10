@@ -23,6 +23,89 @@ import numpy as np
 RYD2EV = 13.6056980659
 
 
+def exciton_dipole_projections(A, d_alpha):
+    """⟨0|r̂_α|S⟩ — THE contraction of a BSE eigenvector against the dipole.
+
+    THIS IS THE SINGLE SITE.  Every absorption driver that owns explicit
+    eigenvectors calls this and nothing else, because the tree has already
+    paid once for two drivers spelling this contraction differently
+    (``KNOWN_FAILURES.md``, "THE TWO ABSORPTION DRIVERS DISAGREE ON A
+    CONJUGATION").  The conjugate sits on the DIPOLE, not on ``A``.
+
+    DERIVATION, from the spectral representation and this tree's own
+    storage conventions — not from BerkeleyGW habit:
+
+      * The exciton state is ``|S⟩ = Σ_t A^S_t â†_ck â_vk |0⟩`` over
+        transitions ``t = (c, v, k)``.  That ``A`` is the amplitude in
+        THAT basis is fixed by LORRAX's own kernel, not assumed: the
+        exchange term is assembled as ``K^x = M V M†`` with
+        ``M_t = conj(ψ_c) ψ_v`` (``bse_simple.py``'s V-term, and the
+        direct term ``K^d_{tt'} = −Σ conj(ψ_c[k]) ψ_c'[k'] W
+        ψ_v[k] conj(ψ_v'[k'])`` documented at ``bse_nontda.py:169``).
+        Both are the standard ``⟨t|H|t'⟩`` with the CONDUCTION index on
+        the bra, so the operator the solvers diagonalise is H itself and
+        not its complex conjugate, and ``A`` is the amplitude and not its
+        conjugate.
+      * ``slice_dipole_to_bse_window`` returns
+        ``d_t = ⟨ck|v̂_α|vk⟩ / ΔE`` — conduction on the BRA (the producer's
+        own convention, ``dipole_cart[α,k,m,n] = ⟨mk|v̂_α|nk⟩``).
+      * Therefore
+        ``⟨0|r̂_α|S⟩ = Σ_t A^S_t ⟨0|r̂_α â†_c â_v|0⟩ = Σ_t A^S_t ⟨vk|r̂_α|ck⟩
+                     = Σ_t A^S_t · conj(d^α_t)``.
+
+    Two independent witnesses agree with that line, and they are the
+    reason this is a verdict rather than a preference:
+
+      * BerkeleyGW does the identical contraction —
+        ``BSE/diag.f90:711`` is ``dipoles_r = Σ u_r · MYCONJG(s1)``, and
+        ``Common/mtxel_optical.f90``'s ``mtxel_m``/``mtxel_v`` build
+        ``s0(ic,iv) = ⟨ic,k|…|iv,k⟩ / ΔE``, the same index order as ours.
+      * The Haydock route needs no eigenvector convention at all: it
+        evaluates ``⟨d|(z−H)⁻¹|d⟩``, whose spectral weights are
+        ``|⟨S|d⟩|² = |Σ_t conj(A_t) d_t|²`` — the modulus of the
+        expression above.  A sum-over-states spectrum built any other way
+        does not reproduce the resolvent, which is what
+        ``tests/test_absorption_conjugation.py`` measures.
+
+    Note the phase convention: ``Σ_t A_t conj(d_t)`` and
+    ``Σ_t conj(A_t) d_t`` have the SAME modulus (they are complex
+    conjugates), so ε₂ cannot tell them apart — but the BGW-format
+    ``eigenvalues_b*.dat`` writes ``Re`` and ``Im`` in separate columns,
+    so the tree emits the BGW-side spelling.  What is NOT a phase choice,
+    and is the defect this function closes, is contracting ``A`` with a
+    bare ``d``: ``Σ_t A_t d_t`` is a different number in modulus too,
+    measured at up to 6.8× per element on the committed fixtures.
+
+    Parameters
+    ----------
+    A : (N, *T) complex
+        Eigenvectors.  Leading axis is the state; the trailing axes are
+        the transition block in whatever order the caller holds it.
+    d_alpha : (3, *T) complex
+        Dipole ``d^α_t``, with the SAME trailing transition axes as ``A``
+        (the two drivers hold them in different orders — ``(nk, nc, nv)``
+        and ``(nc, nv, nk)`` — and this function is layout-agnostic
+        precisely so neither has to reshape at the call site).
+
+    Returns
+    -------
+    (N, 3) complex128 — ⟨0|r̂_α|S⟩ per state, per polarisation.
+    """
+    A = np.asarray(A)
+    d_alpha = np.asarray(d_alpha)
+    if A.shape[1:] != d_alpha.shape[1:]:
+        raise ValueError(
+            f"eigenvector transition axes {A.shape[1:]} do not match the "
+            f"dipole's {d_alpha.shape[1:]}.  Both must be indexed over the "
+            f"same (c, v, k) block in the same order; a transpose here is a "
+            f"silently wrong oscillator strength, not a broadcast.")
+    n_state = A.shape[0]
+    n_trans = int(np.prod(A.shape[1:])) if A.ndim > 1 else 1
+    return (A.reshape(n_state, n_trans)
+            @ np.conj(d_alpha.reshape(d_alpha.shape[0], n_trans)).T
+            ).astype(np.complex128)
+
+
 def load_eigenvectors_h5(path: str | Path):
     """Load BGW-format eigenvectors.h5 (TDA, single Q, single spin assumed).
 
@@ -35,10 +118,40 @@ def load_eigenvectors_h5(path: str | Path):
     Note: BGW convention ``ns`` is the spin index (=2 for collinear-spin,
     =1 for spinor or non-spin), distinct from ``nspinor`` (=2 for spinor,
     inferred here from ``spin_kernel == 3``).
+
+    NON-TDA FILES ARE REFUSED, not silently truncated.  ``bse_io``'s
+    writer persists the resonant ``X`` to ``exciton_data/eigenvectors``
+    and the coupling ``Y`` to a sibling ``eigenvectors_coupling``; this
+    reader only ever returned the first.  Reading a non-TDA file and
+    contracting ``X`` alone gives the TDA answer for a non-TDA solve,
+    which is wrong by the whole anti-resonant channel — see the
+    ``NotImplementedError`` below for the contraction it would need.
     """
     with h5py.File(str(path), "r") as f:
         eigvals_eV = np.asarray(f["exciton_data/eigenvalues"][:], dtype=np.float64)
         evecs = np.asarray(f["exciton_data/eigenvectors"][:])  # (nQ,N,nk,nc,nv,ns,2)
+        has_coupling = "eigenvectors_coupling" in f["exciton_data"]
+        # ``use_tda`` is ours (and BGW's) but not guaranteed on every writer's
+        # output, so the presence of the coupling block is the second witness.
+        use_tda_ds = f.get("exciton_header/params/use_tda")
+        use_tda = True if use_tda_ds is None else bool(int(use_tda_ds[()]))
+        if has_coupling or not use_tda:
+            raise NotImplementedError(
+                f"{path!s} is a NON-TDA eigenvector file "
+                f"(use_tda={use_tda}, coupling block "
+                f"{'present' if has_coupling else 'absent'}), and the "
+                f"sum-over-states absorption route is TDA-only.\n"
+                f"The full-BSE oscillator strength is NOT |Σ_t X_t conj(d_t)|²: "
+                f"it needs both halves of the paired vector and both the left "
+                f"and right solutions,\n"
+                f"    ⟨0|r|S⟩_r = Σ_t X^S_t conj(d_t) − Σ_t Y^S_t d_t\n"
+                f"    ⟨0|r|S⟩_l = Σ_t X̃^S_t conj(d_t) + Σ_t Ỹ^S_t d_t\n"
+                f"    f_S       = Re[ conj(⟨0|r|S⟩_l) · ⟨0|r|S⟩_r ]\n"
+                f"(the anti-resonant dipole is −conj(d) because "
+                f"s_(c→v) = −conj(s_(v→c)), BerkeleyGW BSE/diag.f90:722-731), "
+                f"and no driver in this tree assembles it yet.  Solve with "
+                f"--tda, or add the coupling contraction before reading this "
+                f"file for absorption.")
         spin_kernel = int(f["exciton_header/params/spin_kernel"][()])
         params = {
             "nc": int(f["exciton_header/params/nc"][()]),
@@ -238,6 +351,7 @@ def write_absorption_h5(
 
 __all__ = [
     "RYD2EV",
+    "exciton_dipole_projections",
     "load_eigenvectors_h5",
     "load_dipole_h5",
     "slice_dipole_to_bse_window",
