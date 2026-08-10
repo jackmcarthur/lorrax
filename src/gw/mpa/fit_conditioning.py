@@ -32,10 +32,12 @@ numerator and denominator, in the same order.  It is therefore not an
 approximation of the shipped diagnostic — it is the same expression
 tree, and the values it returns are bit-identical to the ones the
 shipped path wrote.  That claim is a gate, not a hope:
-``tests/test_mpa_fit_one_fit.py`` asserts byte-equality of ``cond`` and
-``backward_error`` against ``diagnostics.solve_conditioning`` on the
-same samples, and the production evidence checks it again on a real
-column block.
+section (d2) of ``tests/test_mpa_fit_driver.py`` asserts byte-equality
+of ``cond`` and ``backward_error`` against
+``diagnostics.solve_conditioning``, and then asserts it again on every
+byte of a finalized store against one the old composition would have
+written.  On the production deck the same comparison was made against
+the SHIPPED pole field itself, and came back byte-identical.
 
 THE ONE SOLVE THAT IS STILL PAID TWICE, and where it goes.  After this
 module the block costs ONE fit and TWO solves of the Pade-in-z^2 system:
