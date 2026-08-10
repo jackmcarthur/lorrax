@@ -812,6 +812,15 @@ def flat_index_dtype(n_flat):
     return np.int32 if int(n_flat) < (1 << 31) else np.int64
 
 
+#: Below this many modes the width sort stays on the host: the device
+#: round trip costs more than a numpy sort of a small selection, and the
+#: planner's own unit fields are hundreds of modes.  Above it the sort is
+#: the planner's dominant term (a stable argsort of ~80 million float64 is
+#: seconds of single-threaded numpy, against ~50 ms of GPU sort plus its
+#: transfers), which is what makes the branch plan ~16 s.
+_DEVICE_SORT_MIN_MODES = 1 << 20
+
+
 def _sorted_by_width(g_flat, idx):
     """``(idx, gamma)`` for one selection, sorted ascending in ``Gamma``.
 
@@ -820,11 +829,64 @@ def _sorted_by_width(g_flat, idx):
     edges -- so sorting once turns every later split into a slice.  The
     sort is stable, so equal widths keep their field order and the
     partition is reproducible run to run.
+
+    THE SORT RUNS ON THE DEVICE WHEN THE SELECTION IS LARGE, AND THAT IS A
+    BIT-IDENTICAL SUBSTITUTION RATHER THAN A NUMERICAL ONE.  A stable sort
+    of a fixed key vector is a UNIQUELY DETERMINED permutation -- ties
+    resolve to ascending source position by definition of stability, and
+    the keys here are the same float64 values gathered from the same
+    array -- so ``jnp.argsort(..., stable=True)`` and
+    ``np.argsort(..., kind='stable')`` cannot return different orders.
+    Nothing is summed, nothing is rounded, and no reduction is
+    re-associated: the planner downstream of this call sees the identical
+    index array, hence the identical panes, hence the identical certified
+    rules.  ``tests/test_mpa_jax_native.py`` pins the two against each
+    other, including on a selection engineered to be mostly ties.
+
+    The device path is skipped, silently and without changing the answer,
+    when the selection is small or when jax cannot serve it (no backend,
+    or an allocator that refuses the transient).  A fallback that returns
+    the same permutation is a performance decision and not a correctness
+    one, which is the only reason it is allowed to be silent.
     """
     ix = np.asarray(idx, dtype=np.int64)
-    g_v = np.asarray(g_flat, dtype=np.float64)[ix]
+    g_all = np.asarray(g_flat, dtype=np.float64)
+    if ix.size >= _DEVICE_SORT_MIN_MODES:
+        out = _sorted_by_width_device(g_all, ix)
+        if out is not None:
+            return out
+    g_v = g_all[ix]
     order = np.argsort(g_v, kind="stable")
     return ix[order], g_v[order]
+
+
+def _sorted_by_width_device(g_all, ix):
+    """:func:`_sorted_by_width`'s gather-and-stable-sort, on the device.
+
+    Returns ``None`` rather than raising if the device cannot serve the
+    transient, because the host path computes the same permutation and a
+    planner that refuses to plan because a sort did not fit would be
+    trading a correct answer for a faster one.
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+
+        if not jax.default_backend():                # pragma: no cover
+            return None
+        ix_d = jnp.asarray(ix)
+        g_v = jnp.take(jnp.asarray(g_all), ix_d, axis=0)
+        order = jnp.argsort(g_v, stable=True)
+        ix_s = jnp.take(ix_d, order, axis=0)
+        g_s = jnp.take(g_v, order, axis=0)
+        return (np.asarray(jax.device_get(ix_s), dtype=np.int64),
+                np.asarray(jax.device_get(g_s), dtype=np.float64))
+    except Exception:                                # pragma: no cover
+        # Any device-side refusal (OOM on the transient, no backend, an
+        # unsupported dtype) falls back to the host, which is the same
+        # permutation.  It is caught here rather than at the call site so
+        # the planner never learns that the sort has two implementations.
+        return None
 
 
 def _dense_from_index(idx, shape):
@@ -833,6 +895,134 @@ def _dense_from_index(idx, shape):
     m = np.zeros(int(np.prod(shape)) if shape else 0, dtype=bool)
     m[np.asarray(idx, dtype=np.int64)] = True
     return m.reshape(shape)
+
+
+# ---------------------------------------------------------------------------
+#  The group selector, on the device that consumes it
+# ---------------------------------------------------------------------------
+#
+#  THE COST THIS REPLACES, WHICH IS A DISPATCH COST AND NOT A KERNEL ONE.
+#  ``run_pass_branch`` used to hand ``_integrate_tau_windows_for_branch`` a
+#  freshly built HOST boolean per group -- ``_dense_from_index`` allocates
+#  the full ``(n_q, N_mu, N_mu)`` field (81.4 MB on the production deck),
+#  scatters the group's index set into it, and ``jnp.asarray`` then copies
+#  all 81.4 MB across PCIe.  918 groups over an n_p = 8 pass is 74 GB of
+#  host materialisation and 74 GB of pageable H2D to describe a partition
+#  whose whole index representation is 0.32 GB -- which is the memory the
+#  compact pane index was built to stop spending, spent again one level
+#  down at dispatch time.
+#
+#  The selector is the same boolean.  It is built where it is read, from
+#  the index set the planner already produced, by one scatter whose entire
+#  H2D payload is 4 bytes per live mode.
+#
+#  WHY THE INDEX IS PADDED, AND WHY TO A POWER OF TWO.  ``jax.jit`` keys on
+#  shape, and a group's live-mode count is a property of the physics: 918
+#  groups have ~918 distinct sizes, so an unpadded selector would compile
+#  918 XLA modules per pass and populate a persistent cache with entries no
+#  second run can hit.  Padding to the next power of two bounds the number
+#  of distinct signatures at ``log2(n_flat)`` -- 27 on any field this code
+#  can address, a handful in practice -- and the pad entries are the
+#  out-of-range index ``n_flat``, which ``mode="drop"`` discards.  The
+#  capacity ladder is a function of the GROUP's mode count and the FIELD's
+#  size, both of which every rank computes identically from the same
+#  replicated pole slab: no signature here depends on a process's rank or
+#  on the device count, which is the multi_slice lesson stated as a
+#  constraint rather than remembered as an incident.
+#
+#  It carries no host callback, so a persistent compile cache serves it on
+#  the second run (FIX_warmcache.md's sink pattern: values in, values out,
+#  nothing traced that reaches the host).
+
+def _selector_capacity(n_live):
+    """The padded index length a group of ``n_live`` modes compiles at."""
+    n = int(n_live)
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _make_selector_fn():
+    """``(idx_padded, n_flat) -> flat bool selector``, jitted, cached.
+
+    A module-level ``jax.jit`` object rather than a fresh one per call, so
+    the trace cache is shared by every group of every branch of every pole
+    in a process -- the second group of a given capacity is a cache hit and
+    the second RUN is a persistent-cache hit.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    global _SELECTOR_FN
+    if _SELECTOR_FN is None:
+        def _scatter(idx_padded, n_flat):
+            return (jnp.zeros((n_flat,), dtype=bool)
+                    .at[idx_padded].set(True, mode="drop"))
+
+        _SELECTOR_FN = jax.jit(_scatter, static_argnums=(1,))
+    return _SELECTOR_FN
+
+
+_SELECTOR_FN = None
+
+
+def group_selector_device(idx_B, field_shape):
+    """The dense selector ``idx_B`` stands for, built on the device.
+
+    Bit-for-bit :meth:`WindowGroup.dense_mask_B` -- a boolean that is
+    ``True`` exactly at the group's flat indices -- and the equality is
+    exact rather than approximate because a scatter of ``True`` into zeros
+    has no arithmetic in it.  ``tests/test_mpa_jax_native.py`` holds the
+    two against each other on a field with duplicate-free ascending
+    indices, an empty group and a full one.
+    """
+    import jax.numpy as jnp
+
+    shape = tuple(int(x) for x in field_shape)
+    n_flat = int(np.prod(shape)) if shape else 0
+    idx = np.asarray(idx_B, dtype=np.int64)
+    cap = _selector_capacity(idx.size)
+    if idx.size < cap:
+        # The pad is the one index that cannot be a mode: ``n_flat``.
+        pad = np.full((cap - idx.size,), n_flat, dtype=np.int64)
+        idx = np.concatenate([idx, pad])
+    flat = _make_selector_fn()(jnp.asarray(idx), n_flat)
+    return flat.reshape(shape)
+
+
+class _BranchOperandCache:
+    """One device copy of each distinct ``omega_operand`` in a branch.
+
+    THE OPERAND IS A FIELD, NOT A GROUP PROPERTY.  Every MPA-routed group
+    of a pass shares one ``Omega_p = a - i*Gamma`` array and every
+    legacy-routed group shares one ``a``; the planner hands each group a
+    REFERENCE to the same object.  Uploading per group re-copied 1.3 GB of
+    complex128 (or 0.65 GB of float64) across PCIe once per group -- 918
+    times on an n_p = 8 pass, to put the identical bytes on the identical
+    device.  Keyed by object identity, which is exact here: the planner's
+    arrays are alive for the whole loop because the groups hold them, so
+    no id can be recycled underneath this cache.
+
+    The cached array is the same ``jnp.asarray`` of the same host buffer
+    that the per-group path produced, so the operand the tau kernel reads
+    is byte-identical and the seam to
+    ``ppm_sigma._integrate_tau_windows_for_branch`` does not move.
+    """
+
+    def __init__(self):
+        self._by_id = {}
+
+    def device(self, host_array):
+        import jax.numpy as jnp
+
+        key = id(host_array)
+        hit = self._by_id.get(key)
+        if hit is None:
+            # The host array is kept alive by the cache entry itself, which
+            # is what makes ``id`` a legal key for the loop's lifetime.
+            hit = (host_array, jnp.asarray(host_array))
+            self._by_id[key] = hit
+        return hit[1]
 
 
 def _sigma_window(*, name, plan_t, plan_alpha, mask_A, e_ref_a, e_ref_b,
@@ -1242,16 +1432,20 @@ def plan_branch_groups(
     wide_idx = np.flatnonzero(np.ravel(wide)).astype(ix_dtype)
     wide_a = a_flat[wide_idx]
     wide_g = g_flat[wide_idx]
+    # The A-side edges are a property of the BRANCH, not of a bucket: they
+    # were being recomputed three times per bucket off arguments no loop
+    # iteration touches.  Cheap either way (E_A is nk x nb), hoisted
+    # because a loop-invariant read of loop-invariant data is exactly the
+    # kind of thing that stops being cheap when a field grows.
+    e_lo_A, e_hi_A = _stats(E_A_host, base_mask_A_host)
     for a_lo, a_hi in _laplace_buckets(
-            wide_a, e_lo=_stats(E_A_host, base_mask_A_host)[0],
-            e_hi=_stats(E_A_host, base_mask_A_host)[1],
+            wide_a, e_lo=e_lo_A, e_hi=e_hi_A,
             omega_max=omega_max, r_max=float(laplace_ratio_max)):
         in_bucket = (wide_a >= a_lo) & (wide_a <= a_hi)
         if not in_bucket.any():
             continue
         bucket_idx = wide_idx[in_bucket]
         bucket_g = wide_g[in_bucket]
-        e_lo_A = _stats(E_A_host, base_mask_A_host)[0]
         # THE SPLIT RUNS ONLY WHERE A WINDOW WILL PAY ITS CLAUSE, at the
         # x_min THAT WINDOW WILL PAY.  This loop OOM-killed a 230 GB
         # Perlmutter node eleven times before either condition was
@@ -1423,6 +1617,19 @@ def run_pass_branch(
     is the only structural difference, and it exists because a group is
     what carries an explicit ``mask_B`` and its own ``Omega_q`` operand
     (real for the legacy-routed poles, complex for the rest).
+
+    WHERE THE GROUP'S TWO OPERANDS COME FROM, AND WHY IT IS NOT THE HOST.
+    Both are now built on the device that reads them: the selector by
+    :func:`group_selector_device` (a jitted scatter of the group's index
+    set) and the pole operand by :class:`_BranchOperandCache` (one upload
+    per distinct field, not one per group).  The call below is otherwise
+    the call that was here before -- same keywords, same dtypes, same
+    order, same integrator -- because the correctness argument for this
+    module is that a window group reaches ``ppm_sigma``'s tau loop
+    UNCHANGED, and a performance refactor that moved that seam would owe
+    the shared-kernel digest gate a re-anchor.  It does not move it: the
+    bytes in both operands are what the host path produced, and
+    ``tests/test_mpa_jax_native.py`` holds them against it.
     """
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -1445,20 +1652,24 @@ def run_pass_branch(
         omega_vec=jnp.asarray(omega_nonneg_ry, dtype=jnp.float64), sink=sink)
 
     tau_kernel, tau_kernel_x = tau_kernels
+    operands = _BranchOperandCache()
     for grp in groups:
         # ONE selector resident, and only while its group is integrating.
         # The group carries an index set; the tau loop wants the boolean
-        # that index set stands for, so it is built here and dropped when
-        # the loop returns -- 81.4 MB at a time on the production deck
-        # instead of 218 of them held for the whole branch.
+        # that index set stands for, so it is built here -- on the device,
+        # from the index -- and dropped when the loop returns.
+        with timing.section("mpa.group_operands"):
+            omega_q_dev = operands.device(grp.omega_operand)
+            mask_b_dev = group_selector_device(grp.idx_B, grp.field_shape)
         _integrate_tau_windows_for_branch(
             windows=grp.windows, accumulator=accumulator, E_A=E_A,
-            B_q=B_p, Omega_q=jnp.asarray(grp.omega_operand),
-            base_mask_B=jnp.asarray(grp.dense_mask_B(), dtype=bool),
+            B_q=B_p, Omega_q=omega_q_dev,
+            base_mask_B=mask_b_dev,
             psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
             psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
             tau_kernel=tau_kernel, tau_kernel_x=tau_kernel_x,
             log_tag=f"{log_tag} {grp.name}", print_fn=print_fn)
+        del omega_q_dev, mask_b_dev
 
     with timing.section("sigma.finalize"):
         tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()

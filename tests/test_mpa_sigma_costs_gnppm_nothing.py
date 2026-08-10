@@ -156,6 +156,51 @@ are now byte-identical to ``origin/main`` @ 965d7beb, which is what this
 BASE_SHA now names; the two SEAMS keep their branch-pinned digests.  The
 gnppm/bispinor frozen references named above are no longer red: main
 re-froze them at ``1e64d83a`` against the corrected form.
+
+THE FIFTH RE-ANCHOR, 2026-08-10, ABSORBING THE P>1 PASS FIX -- AND THE GATE
+WAS RED BEFORE IT.  ``fix/mpa-pass-p4-2026-08-10`` (``1fb7c75f``, landed on
+the integration branch as ``7c497a7f``) edits ``ppm_windows.py``, a KERNEL,
+and landed WITHOUT the re-anchor this file's own procedure asks for.  So
+both cells below have been failing on the integration tip since that
+landing, on a change nobody on the failing branch made -- which is the
+state ``refactor/mpa-jax-native-2026-08-10`` inherited and which is fixed
+here rather than reported around, because a gate that is red for a reason
+unrelated to the branch under test cannot certify that branch's contract.
+
+WHAT WAS ABSORBED, checked by the same method the earlier re-anchors used.
+``ppm_windows.py`` is the only one of the six kernels that moved between
+``965d7beb`` and ``0a96c6ca``; the other five are byte-identical, as are
+both seams.  Its diff is exhaustively three things:
+
+  new ``_already_on_host(a, dtype)``  ``return np.asarray(a, dtype)`` when
+                        the operand is already ``np.ndarray``, and
+                        ``_to_host_np(a, dtype=dtype, tiled=False)``
+                        otherwise -- i.e. the call that was there before,
+                        unchanged, on everything that is not host numpy.
+  two annotations       ``E_A`` and ``base_mask_A`` widen to
+                        ``jax.Array | np.ndarray``.  Annotations are not
+                        evaluated at call time.
+  two call sites        ``_to_host_np(E_A, dtype=np.float64, tiled=False)``
+                        -> ``_already_on_host(E_A, np.float64)``, and the
+                        same for ``base_mask_A``.
+
+THE TWO-POINT DRIVER HOLDS BOTH OPERANDS ON THE MESH, so they are jax
+arrays and not ``np.ndarray``; the ``isinstance`` test is False on every
+gnppm call and the function it dispatches to is the identical
+``_to_host_np`` with the identical arguments.  A gnppm run therefore
+executes the same statements on the same operands in the same order, and no
+floating-point result can move.  That is an argument, and the P>1 lane
+already supplied the measurement it predicts: a ``-G=1`` pass leg pre-fix
+and post-fix on the same deck, **BYTE-IDENTICAL, 0 of 5 760 000 elements
+differ** (its gate (c), the splash proof, in
+``/pscratch/sd/j/jackm/mpa_p4fix_0810/``).  The re-anchor absorbs a change
+whose no-op-on-this-path status was measured and not merely asserted.
+
+``BASE_SHA`` moves to ``0a96c6ca``, the integration tip this branch is cut
+from, because that is now the tree at which all six kernels match -- naming
+``965d7beb`` would be naming a tree one of the six no longer agrees with,
+which is exactly the ambiguity the "never update a digest without the sha"
+rule exists to prevent.
 """
 
 import hashlib
@@ -167,7 +212,7 @@ import pytest
 
 #: The tree this branch's gnppm bit-identity is anchored to.  Update this and
 #: the digests below TOGETHER, never one without the other.
-BASE_SHA = "965d7beb"
+BASE_SHA = "0a96c6ca"
 
 #: THE KERNELS: every module in which a floating-point operation of a gnppm
 #: Sigma actually happens.  Nothing on this branch may touch them, and both
@@ -176,7 +221,7 @@ SHARED_SIGMA_KERNELS = {
     "src/gw/ppm_sigma.py":
         "f255ef2944808d114574101a8c45aff44e14ae9bc1583efe376715b34181b87e",
     "src/gw/ppm_windows.py":
-        "0290ba57190e3c617b7d3f568fc5024aaf8a6bfb152d3adc807af4668800e7be",
+        "da7037626e37773a0b684e6065bc035422e762584fc03d00b4c902e73f61021e",
     "src/gw/ppm_tau_kernel.py":
         "583425f1f5f06690ee050d56dc494c1fbed2cd07ef3cf9d134047bce8fa0c700",
     "src/gw/ppm_accumulators.py":
@@ -208,6 +253,13 @@ SHARED_SIGMA_CORE = {**SHARED_SIGMA_KERNELS, **SHARED_SIGMA_SEAMS}
 THIS_BRANCH_TOUCHES = (
     "src/gw/mpa/sigma_routing.py",
     "src/gw/mpa/sigma_pass.py",
+    # The complex-frequency chi0 route.  Not a Sigma kernel and not on a
+    # gnppm run's path at all: the two-point screening stage builds chi0
+    # from imaginary-time Green's functions in ``w_isdf``, and nothing in
+    # ``ppm_pipeline``'s import closure reaches this module.  It is here
+    # because the jax-native lane fused its k-block walk, and this list is
+    # a declaration of intent rather than a permission.
+    "src/gw/mpa/chi0_resolvent.py",
     "src/gw/mpa/sigma_head.py",
     "src/gw/mpa/head_dipole.py",
     "src/gw/mpa_pipeline.py",
