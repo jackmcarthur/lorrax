@@ -547,6 +547,91 @@ def test_a_wedge_store_with_no_tables_refuses_by_name(wedge, tmp_path):
     assert "stamp_fit_unfold_tables" in str(exc.value)
 
 
+@pytest.mark.parametrize("kill", [[1], [0, 2]])
+def test_a_q_with_no_fit_data_refuses_by_name(wedge, tmp_path, kill):
+    """RED TWIN for the farm-fit hole: delete a q, demand the q back.
+
+    The 2026-08-10 sixteen-way farm fit lost one leg to a pool timeout
+    and left ``q[48, 52)`` unfitted, and nothing downstream could tell —
+    *a fit store missing four q looks exactly like a fit store.*  The
+    ledger knew (``blocks_done`` is per (q, column)) and no whole-q
+    reader asked it: ``_refuse_unfinalized`` asks only whether the FILE
+    is stamped complete, and ``allow_partial=True`` — which the Σ pass
+    passes — turns even that off.
+
+    So: clear a q's ledger row, leave everything else alone, and demand
+    the pole slice.  It must refuse and NAME the q.  Both spellings of
+    the escape hatch are checked too, because a refusal with no way past
+    it is a refusal that gets deleted: ``raw=True`` reads the holes
+    deliberately, and ``allow_partial=True`` must NOT be enough.
+    """
+    import shutil
+    holed = tmp_path / f"holed_{'_'.join(map(str, kill))}.h5"
+    shutil.copy(wedge["fit_path"], holed)
+    # THE LEG NEVER RAN, so neither its ledger bits nor its bytes are
+    # there -- which is exactly what a lost farm leg leaves behind, and
+    # is why the zeros below are the thing the refusal is about.
+    with h5py.File(holed, "a") as f:
+        done = f[MS.MPA_FIT_SUFFIX]["blocks_done"]
+        arr = np.asarray(done[()])
+        for q in kill:
+            arr[q] = False
+            f["Omega_p"][:, q] = 0.0
+            f["B_p"][:, q] = 0.0
+        done[...] = arr
+
+    led = MS.fit_completion_ledger(str(holed))
+    assert led["q_missing"].tolist() == sorted(kill)
+    assert led["q_done"].sum() == _N_Q_IBZ - len(kill)
+
+    with pytest.raises(ValueError) as exc:
+        MS.read_pole_slice(str(holed), 0, unfold=True, mesh_xy=_mesh())
+    msg = str(exc.value)
+    for q in kill:
+        assert str(q) in msg, f"the refusal does not name q={q}: {msg}"
+    assert "zero pole is not an absent pole" in msg
+    # A WEDGE hole is worse than a full-BZ hole and the message says so.
+    assert "every full-BZ q that folds onto it" in msg
+
+    # allow_partial is about the FILE and must not open this door...
+    with pytest.raises(ValueError, match="NO fit data"):
+        MS.read_pole_slice(str(holed), 0, allow_partial=True)
+    # ...and raw= is the escape, which returns the holes as they are.
+    Om, Bp = MS.read_pole_slice(str(holed), 0, raw=True)
+    for q in kill:
+        assert not np.any(Om[q]) and not np.any(Bp[q]), (
+            "the escape hatch should hand back exactly the zeros the "
+            "refusal is about")
+
+
+def test_the_whole_tensor_reader_refuses_the_same_hole(wedge, tmp_path):
+    """``read_fit_tensors`` is a whole-q reader too, and had the same hole."""
+    import shutil
+    holed = tmp_path / "holed_tensors.h5"
+    shutil.copy(wedge["fit_path"], holed)
+    with h5py.File(holed, "a") as f:
+        done = f[MS.MPA_FIT_SUFFIX]["blocks_done"]
+        arr = np.asarray(done[()])
+        arr[2] = False
+        done[...] = arr
+    with pytest.raises(ValueError, match="NO fit data"):
+        MS.read_fit_tensors(str(holed), allow_partial=True)
+
+
+def test_a_complete_store_is_not_refused(wedge):
+    """The other half of the twin: the honest store still reads.
+
+    A refusal that fires on good data is worse than the hole it closes,
+    so the fixture's own store — every (q, column) fitted — must come
+    back through the same seam with nothing said.
+    """
+    led = MS.fit_completion_ledger(str(wedge["fit_path"]))
+    assert led["q_missing"].size == 0 and bool(led["q_done"].all())
+    Om, Bp = MS.read_pole_slice(str(wedge["fit_path"]), 0,
+                                unfold=True, mesh_xy=_mesh())
+    assert Om.shape[0] == _N_Q_FULL and np.any(Om)
+
+
 def test_the_unfold_needs_a_mesh_and_says_so(wedge):
     with pytest.raises(ValueError, match="needs a mesh"):
         MS.read_pole_slice(str(wedge["fit_path"]), 0, unfold=True)

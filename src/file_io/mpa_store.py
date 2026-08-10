@@ -2245,6 +2245,15 @@ def fit_completion_ledger(src, *, mode="r"):
             #: have to be handed.  ``stamp_fit_unfold_tables`` is the
             #: only thing that can make this ``'ibz'``, and it gets the
             #: verdict from the symmetry service's own validator.
+            #: WHICH q HAVE FIT DATA — ``blocks_done`` reduced along the
+            #: column axis, which is the granularity every whole-q reader
+            #: works at.  Not a second ledger: the same bools, summarised
+            #: at the axis the q-major readers index.  A farm fit that
+            #: loses a leg loses whole q, and "a fit store missing four q
+            #: looks exactly like a fit store" unless someone asks this.
+            "q_done": done.all(axis=1) if done.ndim == 2 else done,
+            "q_missing": (np.flatnonzero(~done.all(axis=1))
+                          if done.ndim == 2 else np.flatnonzero(~done)),
             "q_storage": qs.qirr_attr_str(grp, "mpa_fit_q_storage") or "full",
             "n_q_full": int(grp.attrs.get("mpa_fit_n_q_full",
                                           grp.attrs["mpa_fit_n_q"])),
@@ -2350,6 +2359,55 @@ def _refuse_unfinalized(grp, ledger, allow_partial, where):
         f"caller can say which of it is real.")
 
 
+def _refuse_missing_q(ledger, where, *, unfolding=False):
+    """Refuse a whole-q read whose q axis has holes, and NAME them.
+
+    THE HOLE THIS CLOSES.  ``_refuse_unfinalized`` asks one question —
+    "is this store stamped complete" — and ``allow_partial=True`` turns
+    it off entirely, which is how the Σ pass reads a staged store.
+    Neither path ever looked at ``blocks_done``.  So a store that is
+    stamped complete but has whole q of zeros in it, or a staged store
+    read with ``allow_partial``, hands the pass loop a q of ``B_p = 0``
+    at ``Ω_p = 0``, which contributes nothing to ``W(τ) = Σ_p B_p
+    e^{−iΩ_p τ}`` and is therefore indistinguishable from a screening
+    channel that is genuinely dark.  A farm fit reaches that state by
+    LOSING A LEG: the 2026-08-10 sixteen-way run dropped one leg to a
+    pool timeout and left ``q[48, 52)`` unfitted, and nothing downstream
+    could tell, because a fit store missing four q looks exactly like a
+    fit store.
+
+    Per q and not per file, because that is the granularity a whole-q
+    reader works at and the granularity a farm loses things at.  Named
+    and not counted, because "which q" is the only question the operator
+    of a re-run actually has.
+
+    ``unfolding`` sharpens the message: on a wedge store one missing IBZ
+    parent is not one missing row, it is every full-BZ row that folds
+    onto it — up to ``n_sym`` of them from a single hole.
+    """
+    missing = np.asarray(ledger.get("q_missing", ()), dtype=np.int64)
+    if missing.size == 0:
+        return
+    n_q = int(ledger["n_q"])
+    extra = ""
+    if unfolding:
+        extra = (f"  This store is a WEDGE and the read was going to "
+                 f"unfold it, so each missing q is not one row of the "
+                 f"answer but every full-BZ q that folds onto it — one "
+                 f"hole here becomes a whole star of zeros in Σ.")
+    raise ValueError(
+        f"{where}: {missing.size} of {n_q} q have NO fit data — q "
+        f"{_ranges(missing)}.  They read back as zeros, and a zero pole "
+        f"is not an absent pole: B_p = 0 at Omega_p = 0 contributes "
+        f"nothing to W(tau) = sum_p B_p exp(-i Omega_p tau) and so looks "
+        f"exactly like a screening channel that is genuinely dark.  This "
+        f"is the state a farm fit reaches by losing a leg.{extra}  Re-run "
+        f"the missing q into this store (the ledger is per (q, column), "
+        f"so a resumed walk fits exactly the blocks that are absent), or "
+        f"pass raw=True to inspect the holes deliberately."
+    )
+
+
 def read_fit_block(src, q, mu_cols, *, allow_partial=False, raw=False,
                    mode="r"):
     """One column block's ``(Omega_p, B_p, diagnostics, ledger)``, in Ry.
@@ -2449,12 +2507,23 @@ def read_pole_slice(src, p, *, unfold=False, mesh_xy=None,
     wedge store with fit data simply works" a property of this reader
     rather than of every consumer of it.
 
+    AND EVERY q IT RETURNS IS CHECKED FOR HAVING BEEN FITTED AT ALL.
+    This read hands back the whole q axis, so a q with no fit data is a
+    slab of zeros inside an otherwise real answer — indistinguishable
+    from a dark screening channel, and the state a farm fit reaches by
+    losing a leg.  :func:`_refuse_missing_q` names the q, and it is NOT
+    gated on ``allow_partial``: that flag is a statement about the file
+    not being finalized, and this is a statement about the data the
+    caller is about to integrate.
+
     Parameters
     ----------
     unfold
         Expand the stored q wedge to the full zone.  Needs ``mesh_xy``
         and needs the store to carry its unfold tables
         (:func:`stamp_fit_unfold_tables`); both are refused by name.
+        On a wedge, the missing-q refusal is sharper for a reason: one
+        unfitted IBZ parent becomes every full-BZ q that folds onto it.
     mesh_xy
         Device mesh for the sharded unfold.  Ignored when the store is
         already full-BZ.
@@ -2471,6 +2540,16 @@ def read_pole_slice(src, p, *, unfold=False, mesh_xy=None,
             raise IndexError(
                 f"read_pole_slice: p={ip} is outside [0, {ledger['n_p']}); "
                 f"the pass order is gw.mpa.fit_driver.pole_pass_order(n_p).")
+        # EVERY q COMES BACK FROM THIS READ, so every q has to be real.
+        # Deliberately NOT gated on allow_partial: that flag says "this
+        # store is not finalized and I know it", which is a statement
+        # about the FILE, and this is a statement about the DATA the
+        # caller is about to integrate.  raw=True is the escape, and its
+        # name is the audit trail.
+        if not raw:
+            _refuse_missing_q(ledger, f"read_pole_slice(p={ip})",
+                              unfolding=bool(unfold)
+                              and ledger["q_storage"] == "ibz")
         Om = np.asarray(grp["Omega_p"][ip])
         Bp = np.asarray(grp["B_p"][ip])
         if scale != 1.0:
@@ -2858,6 +2937,9 @@ def read_fit_tensors(src, *, allow_partial=False, raw=False, mode="r"):
         scale = 1.0 if raw else _fit_to_ry_factor(grp, "read_fit_tensors")
         _refuse_unfinalized(grp, ledger, allow_partial,
                             "read_fit_tensors")
+        # Whole-q reader, same hole, same refusal — see read_pole_slice.
+        if not raw:
+            _refuse_missing_q(ledger, "read_fit_tensors")
         Om = np.asarray(grp["Omega_p"][()])
         Bp = np.asarray(grp["B_p"][()])
         if scale != 1.0:

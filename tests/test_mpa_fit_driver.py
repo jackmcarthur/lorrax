@@ -794,8 +794,19 @@ def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
 
     with pytest.raises(ValueError, match="NOT FINALIZED"):
         fit_driver.read_pole_slice(str(fit_path), 0)
-    Omega_p, B_p = fit_driver.read_pole_slice(
-        str(fit_path), 0, allow_partial=True)
+
+    # AND ``allow_partial`` NO LONGER OPENS THIS DOOR, since 2026-08-10.
+    # One block of one q is fitted here, so every other q of the slab
+    # this read returns is zeros — and a zero pole is not an absent
+    # pole.  The flag is a statement about the FILE; the refusal below
+    # is about the DATA, and it names the q.
+    with pytest.raises(ValueError, match="NO fit data"):
+        fit_driver.read_pole_slice(str(fit_path), 0, allow_partial=True)
+    # Both keywords, because they answer different questions: the file
+    # is not finalized (allow_partial) AND the caller wants the bytes as
+    # they are, holes included (raw).
+    Omega_p, B_p = MS.read_pole_slice(str(fit_path), 0,
+                                      allow_partial=True, raw=True)
     assert Omega_p.shape == (n_q, n_mu, n_mu)
     assert B_p.shape == (n_q, n_mu, n_mu)
 

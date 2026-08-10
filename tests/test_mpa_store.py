@@ -919,10 +919,21 @@ def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
     with pytest.raises(ValueError, match="NOT FINALIZED"):
         MS.read_fit_block(tmpdir_path, 0, [0, 1])
 
+    # AND THE ANNOUNCED DOOR IS NARROWER THAN IT WAS, since 2026-08-10.
+    # ``allow_partial`` says "this FILE is not finalized and I know it";
+    # it never said anything about the DATA, and the whole-q readers
+    # never asked.  A farm fit that loses a leg leaves whole q of zeros
+    # in a file that is otherwise real, so those readers now refuse on
+    # ``blocks_done`` too and name the q.  ``read_fit_block``, which
+    # reads the columns the caller asked for and no others, is unchanged
+    # — it always checked its own columns.
+    with pytest.raises(ValueError, match="NO fit data"):
+        MS.read_fit_tensors(tmpdir_path, allow_partial=True)
     Om, Bp, diag, ledger = MS.read_fit_tensors(tmpdir_path,
-                                               allow_partial=True)
+                                               allow_partial=True, raw=True)
     assert not ledger["complete"]
     assert ledger["n_done"] == 4 * 2
+    assert ledger["q_missing"].size > 0
     (q, lo, hi) = steps[0]
     gOm, _, _, _ = MS.read_fit_block(tmpdir_path, q, list(range(lo, hi)),
                                      allow_partial=True)
