@@ -673,6 +673,16 @@ def main(argv=None):
 		     "absorption comparison.",
 	)
 	parser.add_argument(
+		"--pseudo-dir", "--pseudo_dir",
+		dest="pseudo_dir",
+		default=None,
+		help="Directory holding the deck's *.upf files.  Default: the input "
+		     "file's own directory, then ../qe/scf and ../qe/nscf.  THREE OF "
+		     "THE FOUR tests/regression decks do not carry their UPFs (only "
+		     "cohsex_debug does), so a fixture re-cut from a clean checkout "
+		     "needs this flag — see gw.kin_ion_io, which has had it all along.",
+	)
+	parser.add_argument(
 		"--out",
 		type=str,
 		default="dipole.h5",
@@ -745,15 +755,73 @@ def main(argv=None):
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
 
 	print("\nScanning for pseudopotential files...")
-	pseudos = load_pseudopotentials(str(input_path.parent))
-	if not pseudos:
+	searched = [str(args.pseudo_dir)] if args.pseudo_dir else [str(input_path.parent)]
+	pseudos = load_pseudopotentials(searched[0])
+	if not pseudos and not args.pseudo_dir:
 		# Also try the QE subdirectory (common sandbox layout)
 		for fallback in [str(input_path.parent / '..' / 'qe' / 'scf'),
 						 str(input_path.parent / '..' / 'qe' / 'nscf')]:
+			searched.append(fallback)
 			pseudos = load_pseudopotentials(fallback)
 			if pseudos:
 				print(f"Found pseudopotentials in {fallback}")
 				break
+
+	# ── PRE-FLIGHT.  THE ONE CHECK THIS DRIVER NEVER RAN. ────────────────
+	# ``psp.operator_checks`` was written for exactly three callers and its
+	# own module docstring names them: "before computing kin+ion, DIPOLE
+	# matrix elements, or any other quantity that depends on
+	# pseudopotentials".  ``gw.kin_ion_io`` and ``psp.get_DFT_mtxels`` call
+	# it; this driver never did, and that omission is the whole defect
+	# behind the 2026-08-09 ``kdata.dZ is None`` blocker.
+	#
+	# WITHOUT PSEUDOS THIS DRIVER DOES NOT REFUSE — IT PRODUCES THREE
+	# DIFFERENT WRONG THINGS, one per arm, and only one of them is loud:
+	#
+	#   --vnl-mode analytic (DEFAULT)  ``build_vnl_setup`` returns a setup
+	#       with ``channels == []``, so ``_build_vnl_kdata_core`` has no
+	#       ``dZ`` block to concatenate and hands back ``dZ=None``.  Thirty
+	#       seconds later ``apply_vnl_velocity_to_ket`` conjugates it:
+	#       ``TypeError: conjugate requires ndarray or scalar arguments,
+	#       got <class 'NoneType'>`` — a stack six frames inside a jitted
+	#       einsum that names neither the deck nor the missing file.
+	#   --vnl-mode numeric   finite-differences a projector set that is
+	#       EMPTY, so V_NL ≡ 0.  rc=0, an h5 written, and
+	#       ``prov_skip_vnl=False`` stamped on a file that has no V_NL in
+	#       it.  MEASURED on si_cohsex_debug: that artifact agrees with the
+	#       ``--skip-vnl`` run to 5.8e-15 — i.e. it IS the --skip-vnl run,
+	#       wearing the other arm's provenance.
+	#   --skip-vnl           correct, and the only arm entitled to run
+	#       without pseudopotentials at all.
+	#
+	# So the refusal is gated on ``--skip-vnl``, not on the mode: the p̂-only
+	# arm genuinely needs no projectors, and every other arm needs them or
+	# it is lying in its provenance block.
+	if not args.skip_vnl:
+		# Imported here, not at module scope, for the same reason
+		# ``get_DFT_mtxels`` does it: ``operator_checks`` runs
+		# ``_services.ensure_on_path()`` at import time and this module's
+		# own ``ffi`` bootstrap is further down the import block.
+		from psp.operator_checks import validate_operator_inputs
+		try:
+			sys_dim = int(params.get("sys_dim", 3))
+		except (TypeError, ValueError):
+			sys_dim = 3
+		try:
+			validate_operator_inputs(pseudos=pseudos, wfn=wfn,
+			                          sys_dim=sys_dim,
+			                          caller="get_dipole_mtxels")
+		except RuntimeError as exc:
+			raise SystemExit(
+				f"{exc}\n"
+				f"  searched: {', '.join(searched)}\n"
+				"  The dipole is p + i[r, V_NL]; without projectors the "
+				"nonlocal half is silently zero (--vnl-mode numeric) or "
+				"crashes inside the sweep with 'conjugate ... got NoneType' "
+				"(--vnl-mode analytic).\n"
+				"  Fix: stage the deck's *.upf next to the input file, pass "
+				"--pseudo-dir DIR, or ask for p̂ only with --skip-vnl."
+			) from exc
 
 	# Structure summary (reuse DFT helper)
 	print_atomic_structure(wfn, pseudos)

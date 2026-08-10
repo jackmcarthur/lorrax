@@ -88,8 +88,13 @@ class VNLKData:
     E_super: jax.Array              # (nspinor, nspinor, total_R, total_R)
     nG: int
     total_R: int
-    # Optional: Cartesian k-derivatives for velocity
-    dZ: jax.Array | None            # (3, total_R, nG) or None
+    # Optional: Cartesian k-derivatives for velocity.  ``None`` IF AND ONLY
+    # IF the builder was called with ``compute_dZ=False`` — a builder asked
+    # for dZ always returns a ``(3, total_R, nG)`` array, including the
+    # degenerate ``total_R == 0`` case (no channels), where it is the empty
+    # array rather than ``None``.  Consumers may therefore branch on
+    # ``compute_dZ``, never on ``dZ is None`` after asking for it.
+    dZ: jax.Array | None            # (3, total_R, nG), or None iff not asked for
     # 1 on the k's physical G, 0 on the ngkmax pad — None when the G-list
     # was the k's own ragged sphere.  Set by ``build_vnl_kdata`` (the
     # SymMaps path), which ALSO zeroes Z/dZ on the pad columns, so this
@@ -633,7 +638,30 @@ def _build_vnl_kdata_core(
             radS = G_bG[:, None, :] * S[None, :, :]
             dZ_phase = c_il * radS[None, None, :, :, :] * dphase[:, :, None, None, :]
             dZ_blocks.append((dZ_core + dZ_phase).transpose(1, 0, 2, 3, 4).reshape(3, ch.natoms * R, nG))
-        dZ_j = jnp.concatenate(dZ_blocks, axis=1) if dZ_blocks else None
+        # ``compute_dZ=True`` PROMISES AN ARRAY, and the empty-channel case
+        # used to break that promise silently.  A setup with no channels
+        # (no pseudopotentials loaded, or none covering the structure)
+        # produces ``dZ_blocks == []``; returning ``None`` there handed a
+        # `NoneType` to ``apply_vnl_velocity_to_ket``, which conjugates its
+        # ``dZ`` argument — so the failure surfaced ~30 s later as
+        # ``TypeError: conjugate requires ndarray or scalar arguments`` six
+        # frames inside a jitted einsum, naming neither the deck nor the
+        # missing file.  ``Z`` already degrades gracefully in that case (it
+        # is the ``(0, nG)`` empty projector matrix and every contraction
+        # through it is zero); ``dZ`` now degrades the SAME way, at
+        # ``(3, total_R, nG)`` with ``total_R == 0``.
+        #
+        # THIS IS THE SECOND LINE OF DEFENCE, NOT THE FIX.  A zero V_NL
+        # velocity is the arithmetically correct answer for an empty
+        # projector set and the wrong ANSWER for a real deck, which is why
+        # the drivers must refuse the empty set up front —
+        # ``psp.operator_checks.validate_operator_inputs``, now called by
+        # ``get_dipole_mtxels`` as it already was by ``gw.kin_ion_io`` and
+        # ``get_DFT_mtxels``.  What this branch buys is that the kernel's
+        # documented contract is true for every caller, including the ones
+        # that legitimately hold no projectors.
+        dZ_j = (jnp.concatenate(dZ_blocks, axis=1) if dZ_blocks
+                else jnp.zeros((3, int(setup.total_R), nG), dtype=Z.dtype))
 
     return VNLKData(
         Z=Z, E_super=setup.E_super, nG=nG,
