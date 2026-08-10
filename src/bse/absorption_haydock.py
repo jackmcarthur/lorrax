@@ -202,13 +202,25 @@ def run_haydock(
     nk = nkx * nky * nkz
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])
+    # The window the loader RESOLVED — clamped to the file and then widened by
+    # ``--band-degeneracy`` at a cut multiplet.  The dipole slice below has to
+    # agree with the Hamiltonian's window band-for-band, so it reads these and
+    # not the ``n_val``/``n_cond`` REQUEST: on a snapping deck the request cuts
+    # the dipole over a narrower, differently-placed window and
+    # ``build_dipole_vector_bse`` then zero-pads the slots the BSE window is
+    # really using.  That is silently wrong absorption, not a crash — the same
+    # pre-snap assumption ``bse_jax``'s ``--write-eigs`` path made loudly.
+    n_val_eff = int(data["n_val"])
+    n_cond_eff = int(data["n_cond"])
     print(f"[haydock] mesh {grid_x}x{grid_y}, problem "
           f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
 
     # Build the dipole seed vectors |d^α⟩ in BSE basis with proper padding.
     dipole_cart, deltaE, _ = load_dipole_h5(dipole_file)
-    d_alpha, de_cv = slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond)
-    print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond}, nv={n_val})")
+    d_alpha, de_cv = slice_dipole_to_bse_window(
+        dipole_cart, deltaE, n_occ, n_val_eff, n_cond_eff)
+    print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
+          f"nv={n_val_eff})")
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
     d_block = jnp.asarray(d_block_np)                                         # (3, nc_pad, nv_pad, nk)
 

@@ -211,6 +211,14 @@ def _preview_lanczos(
         nk = nkx * nky * nkz
         nc_pad = int(data["n_cond_pad"])
         nv_pad = int(data["n_val_pad"])
+        # The window this run is ACTUALLY solving, read off the loader — which
+        # clamped the request to what the file holds and then, under
+        # ``--band-degeneracy snap`` (the default), widened it outward past any
+        # cut multiplet.  Everything downstream of the load that needs to name
+        # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
+        # the request, and the request is stale the moment the guard fires.
+        n_val_eff = int(data["n_val"])
+        n_cond_eff = int(data["n_cond"])
         bse_dim = nc_pad * nv_pad * nk
         print(f"BSE problem (sharded {grid_x}x{grid_y}): "
               f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
@@ -281,6 +289,12 @@ def _preview_lanczos(
         nkz = payload["nkz"]
 
         nk = nkx * nky * nkz
+        # Same rule as the sharded branch: the loader's resolved window, not
+        # the request.  ``psi_c.shape[1]`` is the PADDED extent (px=py=1 here,
+        # so the two coincide today — but naming the padded number as if it
+        # were a band count is how this defect got written the first time).
+        n_val_eff = int(payload["n_val"])
+        n_cond_eff = int(payload["n_cond"])
         nc_actual = psi_c.shape[1]
         nv_actual = psi_v.shape[1]
         bse_dim = nc_actual * nv_actual * nk
@@ -308,8 +322,8 @@ def _preview_lanczos(
                 "eigenvectors.h5",
                 eigenvalues,
                 eigenvectors,
-                n_val,
-                n_cond,
+                n_val_eff,
+                n_cond_eff,
                 nkx,
                 nky,
                 nkz,

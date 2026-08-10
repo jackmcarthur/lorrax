@@ -276,6 +276,45 @@ def write_eigenvectors_stream(
     n_write: int,
     use_tda: bool = True,
 ) -> None:
+    # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
+    # The LOGICAL, POST-SNAP one.  ``n_val``/``n_cond`` become BGW's ``nv``/
+    # ``nc`` header fields, and ``absorption_eigvecs`` slices ``dipole.h5``
+    # with exactly those against ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and
+    # ``[n_occ, n_occ + nc)``.  So they have to name REAL bands, which means
+    # the counts the loader RESOLVED (``data['n_val']`` / ``data['n_cond']``),
+    # after ``--band-degeneracy`` widened them at a cut multiplet.
+    #
+    # Two other numbers get mistaken for them and neither belongs in the file:
+    #
+    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-snap.  This
+    #     was the caller-side defect: ``bse_jax._preview_lanczos`` passed the
+    #     request, so on any snapping deck (Si ``--n-cond 4`` snaps to 8) the
+    #     dataset was created at the requested ``nc`` and the write of the
+    #     real component died with ``TypeError: Can't broadcast``, leaving a
+    #     truncated ``eigenvectors.h5`` behind — worse than writing none.
+    #
+    #   * the mesh-rounded PAD extents ``n_cond_pad``/``n_val_pad``, which is
+    #     what the incoming array is actually shaped by.  Those are not bands:
+    #     ``pad_zone_mask``'s block is decoupled by construction (ψ pad = 0)
+    #     and its amplitudes are exact zero, so writing them would put a
+    #     column of zeros in the file under a band label the dipole file has
+    #     no matching entry for.  They are dropped BY COUNT here, the same
+    #     spelling as ``pad_zone_mask_np`` — never by thresholding a value.
+    #
+    # Hence: the caller declares the logical counts, and this writer TRIMS the
+    # component to them (see ``_to_bgw``).  A writer that instead trusted the
+    # array's own shape would silently re-export the pad.
+    #
+    # AND THE TRIM IS CHECKED, because the two reasons an incoming component is
+    # WIDER than the declared window need opposite treatment and cannot be told
+    # apart by shape: mesh pad must be dropped, a stale pre-snap count must be
+    # REFUSED (the bands it drops are real and carry weight).  What separates
+    # them is a value, and it separates them exactly: the pad block is
+    # decoupled by construction and its amplitudes are EXACT zero, so a
+    # discarded block with any weight in it is not pad.  Trading the old loud
+    # ``Can't broadcast`` for a silent truncation would be a worse bug than the
+    # one being fixed.
+    #
     # ``use_tda`` is written HONESTLY (was hardcoded 1).  TDA eigenvectors arrive
     # as ``(n_write, 1, nc, nv, nk)`` (resonant X only); full-BSE (non-TDA) as
     # ``(n_write, 2, nc, nv, nk)`` = the paired (X, Y) with X^H X - Y^H Y = +1.
@@ -292,6 +331,19 @@ def write_eigenvectors_stream(
     # replicated Lanczos arrays and on Davidson's already-host eigenvalues the
     # helper degrades to the plain ``device_get`` that was here before.
     eigenvalues = gather_to_host(eigenvalues[:n_write]) * RYD2EV
+    # The declared window must FIT inside what the solver actually carried.
+    # ``>=`` is the pad (trimmed in ``_to_bgw``); ``<`` is a caller that named
+    # more bands than it solved, which h5py would have reported five frames
+    # deeper as an unattributable "Can't broadcast".
+    n_cond, n_val = int(n_cond), int(n_val)
+    _nc_arr, _nv_arr = (int(s) for s in eigenvectors.shape[-3:-1])
+    if _nc_arr < n_cond or _nv_arr < n_val:
+        raise ValueError(
+            f"write_eigenvectors_stream: declared window n_cond={n_cond} "
+            f"n_val={n_val} does not fit the eigenvectors' (nc, nv) = "
+            f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
+            f"(data['n_cond'] / data['n_val']), not the CLI request — the "
+            f"band-degeneracy guard may have widened the window.")
     kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -303,6 +355,58 @@ def write_eigenvectors_stream(
 
     kpts_fortran = kpts.T.copy()
     exciton_Q_shifts = np.zeros((1, 3), dtype=np.float64)
+
+    def _to_bgw(comp, which):
+        # comp: (nc_pad, nv_pad, nk) -> BGW (nk, nc, nv, ns) layout.
+        #
+        # TRIM FIRST, FLIP SECOND, and the order is load-bearing.  The pad is
+        # appended at the TOP of each band axis, while BGW's convention
+        # reverses the valence axis (v=0 = highest valence,
+        # BSE/input_fi.f90:407) where our internal slice puts v=0 at the
+        # deepest valence.  Flipping before the trim would slide the pad
+        # columns to the FRONT and then keep them as the "highest valence"
+        # bands — zeros written under real band labels, silently.
+        comp = np.asarray(comp)
+        kept = comp[:n_cond, :n_val, :]
+        if comp.shape[0] > n_cond or comp.shape[1] > n_val:
+            # Everything outside the kept block, in one number.  The reference
+            # is the KEPT block's own scale, so this is a statement about
+            # weight and not about units.
+            w_kept = float(np.max(np.abs(kept))) if kept.size else 0.0
+            w_drop = max(
+                float(np.max(np.abs(comp[n_cond:, :, :])))
+                if comp.shape[0] > n_cond else 0.0,
+                float(np.max(np.abs(comp[:, n_val:, :])))
+                if comp.shape[1] > n_val else 0.0)
+            if w_drop > 1.0e-10 * max(w_kept, 1.0e-300):
+                raise ValueError(
+                    f"write_eigenvectors_stream: trimming eigenvector {which} "
+                    f"from (nc, nv) = ({comp.shape[0]}, {comp.shape[1]}) down "
+                    f"to the declared window ({n_cond}, {n_val}) would DISCARD "
+                    f"amplitude {w_drop:.3e} against a kept scale of "
+                    f"{w_kept:.3e}.  The mesh pad is exactly zero, so this is "
+                    f"not pad: the declared window is narrower than the one "
+                    f"that was solved.  Pass the LOADER's resolved counts "
+                    f"(data['n_cond'] / data['n_val']) — the band-degeneracy "
+                    f"guard widens the CLI request.")
+        c = np.transpose(kept, (2, 0, 1))[:, :, ::-1][..., None]
+        return c.real, c.imag
+
+    # ── PRE-FLIGHT, before any file exists ────────────────────────────────
+    # The declared window is a property of the RUN, not of a state, so state 0
+    # settles it for all of them — and settling it here means a wrong window
+    # refuses with nothing on disk instead of leaving the truncated
+    # ``eigenvectors.h5`` that the pre-fix crash left behind.  Runs on EVERY
+    # rank, above the rank-0 gate, for the lockstep reason set out below: the
+    # gather is a global collective and the refusal is a function of shapes and
+    # values every rank holds identically, so all ranks raise together.
+    if n_write > 0:
+        _v0 = gather_to_host(eigenvectors[0])
+        if use_tda:
+            _to_bgw(_v0[0] if np.ndim(_v0) == 4 else _v0, "0 (resonant X)")
+        else:
+            _to_bgw(_v0[0], "0 (resonant X)")
+            _to_bgw(_v0[1], "0 (coupling Y)")
 
     # ── ONE writer ────────────────────────────────────────────────────────
     # Every rank used to reach the ``h5py.File(output_file, "w")`` below on the
@@ -383,13 +487,6 @@ def write_eigenvectors_stream(
                 dtype=np.float64,
             )
 
-        def _to_bgw(comp):
-            # comp: (nc, nv, nk) -> BGW (nk, nc, nv, ns) layout.  BGW convention:
-            # valence axis reversed (v=0 = highest valence, BSE/input_fi.f90:407);
-            # our internal slice puts v=0 at deepest valence, so flip on write.
-            c = np.transpose(comp, (2, 0, 1))[:, :, ::-1][..., None]
-            return c.real, c.imag
-
         for i in range(n_write):
             vec = gather_to_host(eigenvectors[i])
             if use_tda:
@@ -399,11 +496,11 @@ def write_eigenvectors_stream(
             else:
                 # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
                 Xc, Yc = vec[0], vec[1]
-            re, im = _to_bgw(Xc)
+            re, im = _to_bgw(Xc, f"{i} (resonant X)")
             evec_dset[0, i, :, :, :, :, 0] = re
             evec_dset[0, i, :, :, :, :, 1] = im
             if Yc is not None:
-                re, im = _to_bgw(Yc)
+                re, im = _to_bgw(Yc, f"{i} (coupling Y)")
                 coupling_dset[0, i, :, :, :, :, 0] = re
                 coupling_dset[0, i, :, :, :, :, 1] = im
 
@@ -2443,6 +2540,13 @@ def _load_ring_subset(
         key, (1, n_cond_pad, n_val_pad, nk)
     )
 
+    # The RESOLVED window travels with the bundle, under the same four names
+    # ``load_bse_data_from_restart_sharded`` uses.  ``n_val``/``n_cond`` here
+    # are post-clamp AND post-snap (``resolve_band_window`` above rebound
+    # them); ``*_pad`` are the mesh-rounded extents the ψ/ε arrays are shaped
+    # by.  Callers had to re-derive these from ``psi_c.shape[1]`` — which is
+    # the padded number, and is why ``tests/bench/test_bse.py`` backfilled
+    # them by hand — or, worse, keep using their own pre-snap CLI request.
     return {
         "psi_c": psi_c,
         "psi_v": psi_v,
@@ -2451,6 +2555,10 @@ def _load_ring_subset(
         "W_q": W_q,
         "V_q0": V_q0,
         "X": X,
+        "n_val": n_val,
+        "n_cond": n_cond,
+        "n_val_pad": n_val_pad,
+        "n_cond_pad": n_cond_pad,
         "nkx": nkx,
         "nky": nky,
         "nkz": nkz,
