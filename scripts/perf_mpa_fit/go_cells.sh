@@ -27,11 +27,11 @@ echo "=== source tree: $LORRAX_CHECKOUT ==="
 echo "=== sha: $(git -C $LORRAX_CHECKOUT rev-parse --short HEAD) ==="
 date +"=== launch %H:%M:%S ==="
 echo "--- (1) DEFAULT FAST GATE ---"
-~/bin/lx test 2>&1 | tee $REPORTS/cells_fastgate_${TAG}_${SUFFIX}.log
+~/bin/lx test --wait 5400 2>&1 | tee $REPORTS/cells_fastgate_${TAG}_${SUFFIX}.log
 echo "=== fast gate rc=${PIPESTATUS[0]} ==="
 if [ "$MODE" != "--base" ]; then
   echo "--- (2) THE FIT'S OWN SUITES, CENSUS TIER ---"
-  ~/bin/lx test --census tests/test_mpa_fit_driver.py \
+  ~/bin/lx test --wait 5400 --census tests/test_mpa_fit_driver.py \
     tests/test_mpa_fit_kernel.py tests/test_mpa_fit_energy_unit.py \
     tests/test_mpa_store.py tests/test_mpa_screening_content.py \
     2>&1 | tee $REPORTS/cells_fit_${TAG}.log
