@@ -359,14 +359,25 @@ def slab_scope_violations(bvec, qfr=None, policy=None) -> list[str]:
             f"truncation (v_slab_on_set) and has no other kernel; the stored "
             f"V_qmunu was built with the sys_dim={sys_dim} kernel, so the two "
             f"are different operators")
-    offdiag = float(max(np.max(np.abs(bvec[2, :2])),
-                        np.max(np.abs(bvec[:2, 2]))) / abs(bvec[2, 2]))
-    if offdiag > 1e-12:
+    # ``b3_z`` is the denominator of ``run_gates``' ``slab_axes_offdiag`` AND
+    # of the truncation length ``z_c = π/b3_z``; a cell with no z-projection
+    # on b3 at all has neither, so it is named rather than divided by.
+    b3z = abs(float(bvec[2, 2]))
+    if b3z <= 1e-12 * float(np.max(np.abs(bvec))):
         out.append(
-            f"the cell's axes are not slab-separable: max|b3_xy|/|b3_z| and "
-            f"max|b1_z, b2_z|/|b3_z| reach {offdiag:.3e} (slab_axes_offdiag, "
-            f"tolerance 1e-12), so K_z is not constant within a |G_z| channel "
-            f"and the per-channel in-plane fit has an unmodelled variable")
+            f"b3 has no z-projection to speak of (|b3_z| = {b3z:.3e}), so the "
+            f"slab truncation length z_c = π/b3_z is undefined and there is no "
+            f"axis for the |G_z| channels to be channels of")
+    else:
+        offdiag = float(max(np.max(np.abs(bvec[2, :2])),
+                            np.max(np.abs(bvec[:2, 2]))) / b3z)
+        if offdiag > 1e-12:
+            out.append(
+                f"the cell's axes are not slab-separable: max|b3_xy|/|b3_z| "
+                f"and max|b1_z, b2_z|/|b3_z| reach {offdiag:.3e} "
+                f"(slab_axes_offdiag, tolerance 1e-12), so K_z is not constant "
+                f"within a |G_z| channel and the per-channel in-plane fit has "
+                f"an unmodelled variable")
     if qfr is not None:
         qz = float(np.max(np.abs(np.asarray(qfr, dtype=np.float64)[:, 2])))
         if qz > 1e-12:
@@ -391,9 +402,10 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
     raise ValueError(
         "vq_interp is a SLAB model and this deck is not a slab" + where
         + ".  " + "  ".join(f"({i + 1}) {w}." for i, w in enumerate(why))
-        + "  Neither is a tuning problem and no change to the long-range fit "
-          "reaches them; use `--vq-mode ongrid` (exact at every Q on the BSE "
-          "grid) or `--vq-mode refit` (the per-Q zeta refit) on this deck.  "
+        + "  None of these is a tuning problem and no change to the long-range "
+          "fit reaches them; use `--vq-mode ongrid` (exact at every Q on the "
+          "BSE grid) or `--vq-mode refit` (the per-Q zeta refit) on this deck. "
+          " "
           "See the module docstring's SCOPE note and PIPELINE_HEALTH.md punch "
           "row 23, which is this refusal's measured history.")
 

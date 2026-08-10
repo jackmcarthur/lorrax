@@ -169,3 +169,12 @@ def test_the_scope_check_is_wired_into_the_loader():
     assert "assert_slab_scope" in called, (
         "load_zeta_coarse no longer applies the slab-scope refusal; every "
         "vq_interp entry point reaches the model through it")
+
+
+def test_a_cell_with_no_z_axis_at_all_is_named_not_divided_by():
+    """``b3_z`` is the denominator of both ``slab_axes_offdiag`` and the
+    truncation length ``z_c = pi/b3_z``.  A cell whose b3 lies in the plane has
+    neither, and must come back as a sentence rather than as a division."""
+    b = np.array([[0.9, 0., 0.], [0., 0.9, 0.], [0., 0.3, 0.]])
+    why = V.slab_scope_violations(b, qfr=_planar_q(), policy=SLAB_POLICY)
+    assert len(why) == 1 and "no z-projection" in why[0]
