@@ -143,6 +143,34 @@ def _pair_amplitude(psi_c, psi_v):
 
 
 @jax.jit
+def _block_step(acc, psi_c_blk, psi_v_blk, eps_c_blk, eps_v_blk, z_values):
+    """One k-block, from psi to the running total, in ONE dispatch.
+
+    THE STAGE THIS FUSES, AND WHY THE FUSION IS FREE OF NUMERICS.  The
+    k-block walk used to emit four device programs per block -- the pair
+    amplitude's einsum, the transition-energy outer difference, the
+    z-scan, and the accumulate -- with the host materialising the energy
+    difference in numpy and three intermediates round-tripping through
+    device buffers between them.  Each is a value-in/value-out expression
+    on the same operands, so composing them changes WHEN they are
+    scheduled and not WHAT they compute: the einsum is the same
+    ``dot_general``, the scan is the same scan over the same z in the same
+    order, and the accumulate is still ``acc + block`` at the same point
+    in the same ascending k-block fold.  The fold order is the semantics
+    here -- ``chi0`` is a sum over k blocks and a sum over transitions --
+    and the fold is untouched: block ``i`` is added to the total before
+    block ``i+1`` is built, exactly as before.
+
+    ``tests/test_mpa_chi0_resolvent_jax.py`` gates that as byte-equality
+    against the unfused expression rather than asserting it here.
+    """
+
+    M = _pair_amplitude(psi_c_blk, psi_v_blk)
+    delta = eps_c_blk[:, :, None] - eps_v_blk[:, None, :]
+    return acc + _accumulate_block(M, delta, z_values)
+
+
+@jax.jit
 def _accumulate_block(M, delta, z_values):
     """One k-block's contribution to chi0 at every sample, unnormalised.
 
@@ -251,15 +279,23 @@ def chi0_resolvent(psi, enk, slices, z_values, q_int, kgrid, *,
     z = jnp.asarray(np.asarray(z_values, dtype=np.complex128))
     acc = jnp.zeros((z.shape[0], n_mu, n_mu), dtype=jnp.complex128)
 
+    # THE BLOCK WALK IS THE FOLD, AND THE FOLD IS PINNED.  Ascending k
+    # blocks, each added to the running total before the next is built --
+    # the same association ``accumulate_over_pole_passes`` pins on the
+    # pole axis and for the same reason: it is exact in exact arithmetic
+    # and not bit-exact in double, so the ORDER is part of the answer.
+    # What changed is that a block is now one device program instead of
+    # four, and the transition-energy difference is formed where it is
+    # consumed instead of in host numpy.
     for k0 in range(0, n_k, int(k_block)):
         k1 = min(k0 + int(k_block), n_k)
-        M = _pair_amplitude(
+        acc = _block_step(
+            acc,
             jnp.asarray(psi_c_q[k0:k1], dtype=jnp.complex128),
-            jnp.asarray(psi_v[k0:k1], dtype=jnp.complex128))
-        delta = jnp.asarray(
-            eps_c_q[k0:k1][:, :, None] - eps_v[k0:k1][:, None, :],
-            dtype=jnp.float64)
-        acc = acc + _accumulate_block(M, delta, z)
+            jnp.asarray(psi_v[k0:k1], dtype=jnp.complex128),
+            jnp.asarray(eps_c_q[k0:k1], dtype=jnp.float64),
+            jnp.asarray(eps_v[k0:k1], dtype=jnp.float64),
+            z)
 
     return acc * chi0_ortho_norm(n_k)
 
