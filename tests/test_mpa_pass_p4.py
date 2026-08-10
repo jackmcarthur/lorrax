@@ -70,8 +70,17 @@ needs_mesh = pytest.mark.skipif(
 #  A small pass problem, at production SHAPES rather than production size.
 # ---------------------------------------------------------------------------
 
-NKX, NKY, NKZ = 2, 2, 2
+NKX, NKY, NKZ = 4, 4, 4
 NK = NKX * NKY * NKZ          # = n_q as well: the pass integrates over all k
+# THE K-GRID IS THE PRODUCTION ONE ON PURPOSE.  Everything else here is
+# shrunk to suite size, but the flat-k FFT goes through the cuFFT strided
+# FFI handler -- which is the REQUIRED layer (`LORRAX_FFT_FFI=0` is a
+# refusal: there is nothing to opt out to) and which fails to plan a toy
+# transform: measured CUFFT_EXEC_FAILED on an A100 at 2x2x1 and at 2x2x2,
+# in both the fused and the decomposed modes, and the failure is a process
+# ABORT rather than an exception a cell could catch.  4x4x4 is the deck's
+# own grid and is served.  Shrink the centroids and the bands, never the
+# k-grid.
 NS = 1                        # spinor axis, replicated on the mesh
 NMU = 8                       # ISDF centroids — divisible by both mesh axes
 NB_FULL = 6                   # the A-space band extent
@@ -220,24 +229,6 @@ def test_the_installed_gather_really_does_prepend_the_process_axis():
 #  THE MESH LEG — the pass's own answer, 2×2 against one shard.
 # ---------------------------------------------------------------------------
 
-def _pin_decomposed_fft(monkeypatch):
-    """Take the FUSED tau-FFT handler out of the comparison, by name.
-
-    ``LORRAX_FFT_FFI_FUSED=0`` is the documented opt-out to the decomposed
-    three-transform chain, which is itself FFI-served, and the dial is part
-    of every kernel cache key so flipping it mid-process rebuilds rather
-    than serving a stale backend.  It is pinned here because this cell's
-    problem is deliberately TINY -- a 2x2x2 k-grid with eight centroids --
-    and the fused cuFFT handler refuses a plan that small
-    (``CUFFT_EXEC_FAILED`` on the ``gw_conv W ifft``, measured on an A100,
-    2026-08-10).  That is a plan-size limit of the handler on a toy shape
-    and not a statement about the mesh, which is what this cell scores; a
-    production-sized deck uses the fused path and is covered by the driver
-    leg in the lane report.
-    """
-    monkeypatch.setenv("LORRAX_FFT_FFI_FUSED", "0")
-
-
 def _run_branch(op, groups, mesh):
     """``run_pass_branch`` on ``mesh``, assembled back to the global cube."""
     from gw.ppm_tau_kernel import _get_sigma_tau_kernel
@@ -269,7 +260,7 @@ def _run_branch(op, groups, mesh):
 
 @pytest.mark.mesh
 @needs_mesh
-def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device(monkeypatch):
+def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device():
     """The pass's answer must not depend on the mesh it was computed on.
 
     The sink is declared ``P(None, None, 'x', 'y')``, so the band axes shard
@@ -285,7 +276,6 @@ def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device(monkeypatch):
     cell would not have caught it — see
     :func:`test_the_pass_loop_survives_a_four_process_gather`, which does.
     """
-    _pin_decomposed_fft(monkeypatch)
     devs = jax.devices()[:4]
     mesh4 = Mesh(np.asarray(devs).reshape(2, 2), ('x', 'y'))
     mesh1 = Mesh(np.asarray(devs[:1]).reshape(1, 1), ('x', 'y'))
@@ -306,14 +296,13 @@ def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device(monkeypatch):
 
 @pytest.mark.mesh
 @needs_mesh
-def test_the_pass_sink_shards_the_band_axes_it_says_it_does(monkeypatch):
+def test_the_pass_sink_shards_the_band_axes_it_says_it_does():
     """The premise of the cell above: on 2×2 there really are four shards.
 
     If the pass silently ran replicated on a mesh, the comparison would be
     trivially green and would score nothing.  Four devices, four tiles, and
     each tile a quarter of the band block.
     """
-    _pin_decomposed_fft(monkeypatch)
     devs = jax.devices()[:4]
     mesh4 = Mesh(np.asarray(devs).reshape(2, 2), ('x', 'y'))
     op = _operands()
