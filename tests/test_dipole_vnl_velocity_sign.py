@@ -1,16 +1,20 @@
 """The relative sign of i[r, V_NL] in the assembled velocity, as a knob.
 
-WHAT IS ACTUALLY IN DISPUTE.  ``common.mtxel_sweep.dipole_operator``
-assembles the velocity as ``p`` MINUS the nonlocal commutator term, and
-measured against BerkeleyGW's own q -> 0 head at all 265 contour-
-deformation frequencies on the si_bigcond_prep mean field (nval 8 /
-ncond 92 / nband 100) that arm is 17.45 % high in eps00(0) while the
-other arm agrees to 1.0e-5.  ``gw.mpa.head_dipole.head_fsum_from_
-transitions`` carries the whole four-arm table.  The owner's decision on
-which sign SHIPS is pending, and this file does not take it: what it
-gates is that both arms are reachable from a keyword, a CLI flag and a
-deck key without anybody patching a source file, and that the default is
-the one every ``dipole.h5`` in the tree was built with.
+WHAT WAS IN DISPUTE, AND HOW IT WAS SETTLED.
+``common.mtxel_sweep.dipole_operator`` used to assemble the velocity as
+``p`` MINUS the nonlocal commutator term.  Measured against BerkeleyGW's
+own q -> 0 head at all 265 contour-deformation frequencies on the
+si_bigcond_prep mean field (nval 8 / ncond 92 / nband 100), that arm is
+31.38 % high in eps00(0) and 17.45 % high in omega_p, while the other
+agrees to 1.0e-5.  ``gw.mpa.head_dipole.head_fsum_from_transitions``
+carries the whole four-arm table.  **The owner ruled on 2026-08-09 and
+the default is now the PLUS arm.**  This file no longer gates "the
+default is the legacy sign"; it gates that both arms remain reachable
+from a keyword, a CLI flag and a deck key without anybody patching a
+source file, that the default really is the new one at the operator's
+cache key, and that the LEGACY arm is still bit-identical to the
+pre-knob expression -- which is what keeps every ``dipole.h5`` built
+before the flip reproducible.
 
 THE FALSE CASE, WHICH IS THE WHOLE POINT.  This project's named failure
 mode is a key that is parsed, stored and never read -- ``x_only`` was a
@@ -18,10 +22,10 @@ value of ``compute_mode`` while 62 decks wrote ``x_only = false``
 believing it a switch, and ``screening_method = ctsp`` reached a typed
 field no reader touched and silently ran minimax.  Grepping for
 references does not prove a knob is live.  So every assertion below is
-paired: the default arm must be BIT-IDENTICAL to the expression the
-code had before the knob existed, and the flipped arm must MOVE the
-matrix elements by a margin no rounding could produce.  A knob that
-passed the first and failed the second would be exactly the defect.
+paired: the legacy arm must be BIT-IDENTICAL to the expression the code
+had before the knob existed, and the two arms must DIFFER by a margin
+no rounding could produce.  A knob that passed the first and failed the
+second would be exactly the defect.
 
 THE CACHE COLLISION IS A REAL HAZARD HERE, not a hypothetical one.  The
 sweep's jit cache is keyed on ``_operator_key``, and a sign closed over
@@ -200,28 +204,43 @@ def _mtxel(ket_out, psi, gmask):
 # ---------------------------------------------------------------------------
 
 def test_default_arm_is_bit_identical_to_the_pre_knob_assembly():
+    """The DEFAULT is the flipped arm; the LEGACY arm is still exact.
+
+    Two assertions that used to be one.  Before 2026-08-09 the default
+    was the legacy sign and this cell proved the knob had not disturbed
+    it.  The default has since moved -- so what needs proving is (a)
+    that it really moved, at the operator's cache key and not merely in
+    a docstring, and (b) that the legacy arm, explicitly requested, is
+    STILL the pre-knob expression bit for bit.  (b) is the promise that
+    keeps every ``dipole.h5`` committed before the flip reproducible,
+    and it is the one that would quietly rot if nobody checked it.
+    """
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
         op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup)
-        assert op.key[-1] == VNL_VELOCITY_SIGN_SHIPPED, (
-            "the default must BE the shipped sign, not merely behave like "
-            "it: a default that resolved elsewhere and happened to agree "
-            "on this fixture would pass every assertion below")
+        assert op.key[-1] == VNL_VELOCITY_SIGN_FLIPPED, (
+            "the default must BE the flipped sign, not merely behave "
+            "like it: a default that resolved elsewhere and happened to "
+            "agree on this fixture would pass every assertion below")
+
+        legacy = dipole_operator(geom, bvec=bvec, blat=blat,
+                                 vnl_setup=setup,
+                                 vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
         for ik in range(NK):
-            got = _apply_one_k(op, psi[ik], gv[ik], gmask[ik], bidx[ik],
-                               kvecs[ik])
+            got = _apply_one_k(legacy, psi[ik], gv[ik], gmask[ik],
+                               bidx[ik], kvecs[ik])
             ref = _pre_knob_ket(psi[ik], gv[ik], gmask[ik], kvecs[ik],
                                 bvec, blat, setup,
                                 VNL_VELOCITY_SIGN_SHIPPED)
             assert np.array_equal(got, ref), (
-                f"k={ik}: the default arm moved off the pre-knob "
+                f"k={ik}: the legacy arm moved off the pre-knob "
                 f"expression by {np.max(np.abs(got - ref)):.3e}.  This "
                 f"assertion is bit-identity and not a tolerance, because "
-                f"the promise the knob makes is that every dipole.h5 in "
-                f"the tree is still reproducible from an unflagged run.")
+                f"the promise it keeps is that every dipole.h5 built "
+                f"before the flip is still reproducible.")
 
 
 def test_the_bit_identity_reference_can_fail():
@@ -231,13 +250,20 @@ def test_the_bit_identity_reference_can_fail():
     reference can disagree.  Feed the same reference builder the other
     sign and it must not match -- otherwise the comparison is between
     two spellings of one number and proves nothing about either arm.
+
+    It follows the primary cell onto the LEGACY arm: since the default
+    moved to ``+1`` this must compare the legacy operator against the
+    flipped reference, or it would be handing the builder the very sign
+    the operator now uses and asserting they differ, which is a cell
+    that fails for the wrong reason.
     """
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
     setup = _vnl_setup()
     with mesh:
         geom = _geom(mesh)
-        op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup)
+        op = dipole_operator(geom, bvec=bvec, blat=blat, vnl_setup=setup,
+                             vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED)
         got = _apply_one_k(op, psi[0], gv[0], gmask[0], bidx[0], kvecs[0])
         wrong = _pre_knob_ket(psi[0], gv[0], gmask[0], kvecs[0], bvec, blat,
                               setup, VNL_VELOCITY_SIGN_FLIPPED)
@@ -368,8 +394,8 @@ def test_operator_refuses_anything_that_is_not_a_sign(bad):
 
 
 @pytest.mark.parametrize("cli, deck, want", [
-    (None, "", VNL_VELOCITY_SIGN_SHIPPED),          # neither: as shipped
-    (None, None, VNL_VELOCITY_SIGN_SHIPPED),        # absent key
+    (None, "", VNL_VELOCITY_SIGN_FLIPPED),          # neither: the default
+    (None, None, VNL_VELOCITY_SIGN_FLIPPED),        # absent key
     (None, "-1", VNL_VELOCITY_SIGN_SHIPPED),
     (None, "+1", VNL_VELOCITY_SIGN_FLIPPED),
     (None, "flipped", VNL_VELOCITY_SIGN_FLIPPED),
@@ -454,7 +480,7 @@ def test_the_whole_chain_from_deck_line_to_resolved_sign(tmp_path):
     for written, want in (("+1", VNL_VELOCITY_SIGN_FLIPPED),
                           ("-1", VNL_VELOCITY_SIGN_SHIPPED),
                           ("flipped", VNL_VELOCITY_SIGN_FLIPPED),
-                          ("", VNL_VELOCITY_SIGN_SHIPPED)):
+                          ("", VNL_VELOCITY_SIGN_FLIPPED)):
         line = f"vnl_velocity_sign = {written}\n" if written else ""
         params = read_lorrax_input(_deck(tmp_path, line))
         got = resolve_vnl_velocity_sign(None, params["vnl_velocity_sign"])

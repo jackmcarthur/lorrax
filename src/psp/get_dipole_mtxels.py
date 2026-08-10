@@ -546,13 +546,13 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
 
     Three tiers, in the order a reader would guess: an explicit
     ``--vnl-velocity-sign`` beats the deck key ``vnl_velocity_sign``,
-    which beats the shipped default.  ``None`` and the empty string both
-    mean NOT DECLARED, so a deck that has never heard of the key and a
-    deck that omits it are the same run -- the same reading
+    which beats the default.  ``None`` and the empty string both mean
+    NOT DECLARED, so a deck that has never heard of the key and a deck
+    that omits it are the same run -- the same reading
     ``resolve_soc_mode`` gives ``soc``.
 
     The default is
-    :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_SHIPPED`, and it is read
+    :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_FLIPPED`, and it is read
     from there rather than written here so that the producer and the
     operator cannot disagree about what "as shipped" means.  The value
     is stamped into ``dipole.h5`` by :func:`stamp_dipole_provenance`,
@@ -565,7 +565,7 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
         raw = raw.strip().lower()
         raw = _VNL_SIGN_WORDS.get(raw, raw)
     if raw is None or raw == "":
-        return VNL_VELOCITY_SIGN_SHIPPED
+        return VNL_VELOCITY_SIGN_FLIPPED
     try:
         val = float(raw)
     except (TypeError, ValueError):
@@ -813,8 +813,8 @@ def main(argv=None):
 	# carries -- the internal assembly returns -(∂_q + ∂_q') V_NL and the
 	# knob multiplies that.  Both spellings are printed together so a log
 	# can be read against the table without doing the flip in one's head.
-	_arm = ("p + i[r, V_NL]  (as shipped)" if vnl_velocity_sign < 0.0
-	        else "p - i[r, V_NL]  (FLIPPED)")
+	_arm = ("p + i[r, V_NL]  (LEGACY -1 arm)" if vnl_velocity_sign < 0.0
+	        else "p - i[r, V_NL]  (default since 2026-08-09)")
 	if not args.skip_vnl:
 		print(f"  velocity assembly: {_arm}, "
 		      f"vnl_velocity_sign = {vnl_velocity_sign:+.1f}")
@@ -1062,7 +1062,7 @@ def main(argv=None):
 			print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
 
 	def _dipole_block(i):
-		"""⟨mk|v|nk⟩ = p + i[r, V_NL] for ONE k — ``(3, nb, nb)`` on device.
+		"""⟨mk|v|nk⟩ at this run's arm, for ONE k — ``(3, nb, nb)`` on device.
 
 		THE LOCAL PLAN, kept for two callers only: ``--vnl-mode=numeric``
 		(whose finite difference picks its step from THIS k's median |K|

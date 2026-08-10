@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 """
-Utilities to compute S_{alpha,beta}(omega) from dipole.h5 (p + i[r,V_NL]).
+Utilities to compute S_{alpha,beta}(omega) from dipole.h5.
+
+The velocity convention is the FILE's, not this module's: read it from
+the h5's ``prov_vnl_velocity_sign`` attribute (-1 is the legacy arm, +1
+the default since 2026-08-09; an absent attribute means a file written
+before the stamp existed, which is the legacy arm).
 
 Public API
 ----------

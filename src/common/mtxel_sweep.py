@@ -656,13 +656,15 @@ VNL_VELOCITY_SIGN_FLIPPED = +1.0
 
 def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     vnl_setup=None,
-                    vnl_velocity_sign=VNL_VELOCITY_SIGN_SHIPPED) -> Operator:
+                    vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED) -> Operator:
     """``v ∘ ψ = 2(k+G)_cart ψ ± (∂V_NL/∂K_cart) ψ`` — THREE components.
 
     The velocity matrix ``psp.get_dipole_mtxels`` writes is
-    ``p + i[r, V_NL]``, assembled there as ``p_cart - v_NL_cart`` (the
-    sign flip at its ``vNL_cart = -vNL_cart`` line, which exists so the
-    stored convention matches BGW's).  Both halves already have
+    ``p - i[r, V_NL]`` in the stored convention, assembled here as
+    ``p_cart + v_NL_cart``.  WHICH ARM A FILE WAS BUILT WITH IS NOT A
+    PROPERTY OF THIS DOCSTRING: it is stamped into every ``dipole.h5``
+    as ``prov_vnl_velocity_sign``, and files written before that stamp
+    existed are the ``-1`` arm.  Both halves already have
     apply-to-ket kernels — ``dft_operators.apply_kinetic_velocity_to_ket``
     and ``vnl_ops.apply_vnl_velocity_to_ket``, each ``(3, nb, ns, nG)`` —
     so this operator is their difference and no velocity physics is
@@ -673,27 +675,36 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     The component axis is moved to the END, where the sweep's specs
     expect it; that is a transpose of the operator output, not of ψ.
 
-    THE SIGN, AND WHY IT IS A KNOB RATHER THAN A DECISION
-    -----------------------------------------------------
+    THE SIGN, WHICH WAS AN OPEN QUESTION AND IS NOW DECIDED
+    -------------------------------------------------------
     ``vnl_velocity_sign`` multiplies the nonlocal term and nothing else.
-    It takes exactly ``-1.0`` (the shipped assembly, the default, and
-    what every ``dipole.h5`` in the tree was built with) or ``+1.0``.
-    The default arm is not merely equivalent to the pre-knob code, it is
-    the SAME EXPRESSION: the two signs are separate branches so that
-    ``v - v_nl`` is still literally subtracted and no scalar multiply is
-    interposed on the path that produces the committed fixtures.
+    It takes exactly ``+1.0`` (the DEFAULT since 2026-08-09) or ``-1.0``
+    (the arm every ``dipole.h5`` committed before that date was built
+    with, kept reachable so those files stay reproducible).  The two
+    signs are separate branches rather than a scalar multiply, so the
+    legacy arm still executes the literal subtraction it always did.
 
-    What is in dispute is real and it is measured, not argued.  On the
-    si_bigcond_prep mean field at the band window matched to the
-    BerkeleyGW contour-deformation reference (nval 8 / ncond 92 /
-    nband 100), against BerkeleyGW's own stored q → 0 head at all 265 CD
-    frequencies:
+    The decision was measured, not argued.  On the si_bigcond_prep mean
+    field at the band window matched to the BerkeleyGW contour-
+    deformation reference (nval 8 / ncond 92 / nband 100), against
+    BerkeleyGW's own stored q → 0 head at all 265 CD frequencies —
+    the two percentage columns are eps00 and omega_p SEPARATELY, which
+    an earlier draft of this table collapsed into one and thereby
+    understated the shipped arm's eps00 error by half:
 
-        arm                        eps00(0)   omega_p    vs BGW
-        BerkeleyGW (reference)      24.2205   18.101 eV      --
-        p only (``--skip-vnl``)     27.8686   19.546 eV   +7.99 %
-        sign −1 (as shipped)        31.8204   21.259 eV  +17.45 %
-        sign +1 (flipped)           24.2208   18.101 eV   +0.00 %
+        arm                       eps00(0)   d_eps    omega_p    d_wp
+        BerkeleyGW (reference)     24.2205      --   18.101 eV     --
+        p only (``--skip-vnl``)    27.8686  +15.06%  19.546 eV  +7.99%
+        sign −1 (legacy)           31.8204  +31.38%  21.259 eV +17.45%
+        sign +1 (DEFAULT)          24.2208   +0.00%  18.101 eV  +0.00%
+
+    The structural argument is the sharpest: dropping the term entirely
+    is BETTER than including it with the legacy sign, which is the
+    signature of a sign and not of a magnitude.  Four further witnesses
+    agree, three of them internal to this tree — ``velocity_matrix_k``
+    and ``orbital_magnetization`` both assemble ``p + dV_NL/dK`` and
+    call it canonical, and ``--vnl-mode numeric`` did too (by way of a
+    double negation nobody had noticed).
 
     ``gw.mpa.head_dipole.head_fsum_from_transitions`` carries the same
     table and the f-sum saturations beside it.
@@ -702,13 +713,15 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     projector contraction, which reproduces Quantum ESPRESSO to ~10
     significant figures and which the standing project rule protects.
     Only the sign with which the assembled term enters the velocity is
-    parameterised here.  Nor does the knob's existence choose an arm:
-    flipping the default would rewrite every ``dipole.h5`` in the tree,
-    the four read-only regression fixtures, the BSE absorption
-    references and the plasmon-pole head, which is an owner decision.
-    The knob exists so that both arms are reproducible from a deck and a
-    flag instead of from a patch, and so that a file built with either
-    can say which one it was.
+    parameterised here.
+
+    WHAT THE DEFAULT CHANGE DID NOT DO.  It did not re-cut the committed
+    fixtures.  Every ``dipole.h5`` under ``tests/regression`` was built
+    with ``-1`` and still is, so until those are regenerated a bare run
+    of this operator and the files in the tree are two different
+    operators — which is precisely what ``prov_vnl_velocity_sign`` on
+    the h5 exists to make visible, and what
+    ``tests/test_bse_oscillator_strengths.py`` exists to notice.
 
     THE CACHE HAZARD THE KEY CLOSES.  ``_operator_key`` is the sweep's
     jit-cache identity, and two operators that hash the same share a

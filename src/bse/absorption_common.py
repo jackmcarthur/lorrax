@@ -72,7 +72,8 @@ def load_dipole_h5(path: str | Path):
 
     Returns
     -------
-    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|p̂_α + i[r,V_NL]_α|nk⟩ (Ry).
+    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), at the arm
+                  the file was built with (its ``prov_vnl_velocity_sign``).
     deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry).
     attrs       : dict with ``nbands, nk``.
     """
@@ -85,7 +86,7 @@ def load_dipole_h5(path: str | Path):
             f"--out {Path(path).name}\n"
             f"``--skip-vnl`` writes the momentum operator only, which is the "
             f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
-            f"the full p + i[r, V_NL].")
+            f"the full velocity including the nonlocal commutator.")
     with h5py.File(str(path), "r") as f:
         dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
         deltaE = np.asarray(f["deltaE"][:], dtype=np.float64)
