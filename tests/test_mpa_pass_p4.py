@@ -41,6 +41,8 @@ structural gap this defect exposes in the ≥4-GPU rule:
     gate, and only a multi-rank driver leg exercises the gather natively.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -65,6 +67,37 @@ needs_mesh = pytest.mark.skipif(
     jax.device_count() < 4,
     reason="needs >=4 devices: XLA_FLAGS=--xla_force_host_platform_device_count=4")
 
+# THE SITE'S FLAT-K FFT HANDLER CANNOT SERVE A MULTI-DEVICE MESH INSIDE ONE
+# PROCESS, and that is a measurement, not a suspicion.  Probed on an A100
+# node, 2026-08-10, `scripts/probe_fft.py` in this lane's evidence directory,
+# one `make_flat_k_ifftn` per subprocess:
+#
+#     mu =  8  16  32  64 128 256 512
+#     1x1  OK  OK  OK  OK  OK  OK  OK
+#     2x2  --  --  --  --  --  --  --      CUFFT_EXEC_FAILED, every one
+#
+# So it is not a plan-size limit: it is every shape, and only when the mesh
+# spans more than one device of THIS process.  Production is unaffected
+# because a `-G=4 -n=4` run is four processes of one device each, and each
+# replica's transform is single-device -- which is exactly the one-process-
+# per-GPU model JAX and this handler are written for.  The consequence for
+# TESTING is sharp: pytest is one process, so any cell whose path reaches
+# the flat-k FFT aborts (SIGABRT, uncatchable) on a >=4-device allocation.
+# The two cells below are therefore skipped rather than run, with the
+# measurement named, and the mesh-versus-one-device NUMBERS this lane owes
+# are carried by the production driver leg instead (P=4 against P=1 on the
+# real deck: 2.94e-15 relative, in the lane report).  `LORRAX_FFT_FFI=0` is
+# not an escape -- that dial refuses, because the native flat-k duplicate
+# was deleted when the FFI layer became required.
+_one_process_multi_device = (
+    jax.process_count() == 1 and jax.local_device_count() > 1)
+needs_flat_k_fft_on_a_mesh = pytest.mark.skipif(
+    _one_process_multi_device,
+    reason="the site's cuFFT strided flat-k FFI handler fails on a "
+           "multi-device mesh inside one process (measured at every mu from "
+           "8 to 512, 2026-08-10); the abort is a SIGABRT, so the cell is "
+           "skipped rather than run")
+
 
 # ---------------------------------------------------------------------------
 #  A small pass problem, at production SHAPES rather than production size.
@@ -72,15 +105,7 @@ needs_mesh = pytest.mark.skipif(
 
 NKX, NKY, NKZ = 4, 4, 4
 NK = NKX * NKY * NKZ          # = n_q as well: the pass integrates over all k
-# THE K-GRID IS THE PRODUCTION ONE ON PURPOSE.  Everything else here is
-# shrunk to suite size, but the flat-k FFT goes through the cuFFT strided
-# FFI handler -- which is the REQUIRED layer (`LORRAX_FFT_FFI=0` is a
-# refusal: there is nothing to opt out to) and which fails to plan a toy
-# transform: measured CUFFT_EXEC_FAILED on an A100 at 2x2x1 and at 2x2x2,
-# in both the fused and the decomposed modes, and the failure is a process
-# ABORT rather than an exception a cell could catch.  4x4x4 is the deck's
-# own grid and is served.  Shrink the centroids and the bands, never the
-# k-grid.
+# The deck's own k-grid, so the flat-k transform is the production one.
 NS = 1                        # spinor axis, replicated on the mesh
 NMU = 8                       # ISDF centroids — divisible by both mesh axes
 NB_FULL = 6                   # the A-space band extent
@@ -182,7 +207,14 @@ def test_the_pass_loop_survives_a_four_process_gather(monkeypatch):
     # is where the MPA families build their own windows from
     # base_mask_A_host directly.
     narrow = _operands()
-    wide = _operands(gamma_scale=1.0)
+    # 0.10 Ry straddles the 0.5 eV smearing this cell plans against, so the
+    # same field carries both families.  It is also BELOW the width clause
+    # the sign-definite window pays: beta = Gamma_max / x_min with
+    # x_min = e_lo + a_lo ~ 0.145 Ry here, so a wider field is refused by
+    # `_refuse_width_clause` (measured: gamma_scale 1.0 gives beta 1.087 and
+    # the planner says so) -- which is the planner being right about an
+    # unphysical field, not a bug to route around.
+    wide = _operands(gamma_scale=0.10)
     plans = [("narrow/cond", narrow, _plan(narrow)[0]),
              ("wide/val", wide, _plan(wide, space="val")[0])]
 
@@ -260,6 +292,7 @@ def _run_branch(op, groups, mesh):
 
 @pytest.mark.mesh
 @needs_mesh
+@needs_flat_k_fft_on_a_mesh
 def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device():
     """The pass's answer must not depend on the mesh it was computed on.
 
@@ -296,6 +329,7 @@ def test_mpa_pass_branch_on_a_2x2_mesh_matches_one_device():
 
 @pytest.mark.mesh
 @needs_mesh
+@needs_flat_k_fft_on_a_mesh
 def test_the_pass_sink_shards_the_band_axes_it_says_it_does():
     """The premise of the cell above: on 2×2 there really are four shards.
 
@@ -328,3 +362,67 @@ def test_the_pass_sink_shards_the_band_axes_it_says_it_does():
     assert len(tiles.tiles) == 4, [np.shape(t) for t in tiles.tiles]
     for t in tiles.tiles:
         assert np.shape(t)[-2:] == (NB_PROJ // 2, NB_PROJ // 2), np.shape(t)
+
+
+@pytest.mark.mesh
+@needs_mesh
+def test_the_pass_sink_tiles_a_2x2_mesh_the_same_as_one_device():
+    """The pass's OWN sink, on a real 2×2 mesh, against one shard.
+
+    This is the mesh cell that runs today.  It stops short of the τ kernel
+    on purpose — everything past the ψ-projection reaches the flat-k FFT
+    handler, which cannot serve a multi-device mesh in one process (see the
+    measurement at the top of this file) — and takes the piece of
+    ``run_pass_branch`` that a mesh actually changes: the sink is declared
+    ``P(None, None, 'x', 'y')``, so on 2×2 the band block arrives as four
+    tiles that have to be placed back in the right corners of the global
+    cube.  A sharding regression there is silent: the cube is finite,
+    smooth and the wrong shape of wrong.
+
+    It joins the two sharded cells in tests/test_ppm_crossing_completion.py
+    as acceptance for the ``mesh`` marker.
+    """
+    from gw.ppm_accumulators import _MemoryTileSink, _TauAccumulator
+
+    devs = jax.devices()[:4]
+    mesh4 = Mesh(np.asarray(devs).reshape(2, 2), ('x', 'y'))
+    mesh1 = Mesh(np.asarray(devs[:1]).reshape(1, 1), ('x', 'y'))
+
+    n_omega, nb = 3, 8
+    omega = np.linspace(0.0, 0.2, n_omega)
+    rng = np.random.default_rng(3)
+    S_R = (rng.random((NK, nb, nb)) + 1j * rng.random((NK, nb, nb)))
+    S_I = (rng.random((NK, nb, nb)) + 1j * rng.random((NK, nb, nb)))
+    win = SimpleNamespace(omega_sign=+1, prefactor=-1.0, project_code=1)
+
+    def run(mesh):
+        band = NamedSharding(mesh, P(None, 'x', 'y'))
+        sink = _MemoryTileSink(
+            shape=(n_omega, NK, nb, nb),
+            sharding=NamedSharding(mesh, P(None, None, 'x', 'y')))
+        acc = _TauAccumulator(
+            omega_vec=jnp.asarray(omega, dtype=jnp.float64), sink=sink)
+        acc.begin_window(win)
+        for t in (0.25, 0.5, 0.75):
+            acc.add_tau(jax.device_put(S_R, band), jax.device_put(S_I, band),
+                        complex(0.0, t), complex(0.7, -0.3))
+        acc.end_window()
+        tiles, index, _devices = acc.finalize_host_tiles()
+        full = np.zeros((n_omega, NK, nb, nb), dtype=np.complex128)
+        for tile, ix in zip(tiles, index):
+            full[ix] = tile
+        return full, tiles
+
+    got4, tiles4 = run(mesh4)
+    got1, tiles1 = run(mesh1)
+
+    assert len(tiles4) == 4, [np.shape(t) for t in tiles4]
+    assert len(tiles1) == 1, [np.shape(t) for t in tiles1]
+    for t in tiles4:
+        assert np.shape(t)[-2:] == (nb // 2, nb // 2), np.shape(t)
+
+    scale = float(np.max(np.abs(got1))) or 1.0
+    delta = float(np.max(np.abs(got4 - got1)))
+    assert delta / scale < 1.0e-13, (
+        f"2x2 mesh and one device disagree by {delta:.3e} "
+        f"({delta / scale:.3e} relative) in the pass sink")
