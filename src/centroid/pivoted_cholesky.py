@@ -1446,14 +1446,24 @@ def build_gram_q0_via_loadwfns(
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
             psi_r_rmu_Y.block_until_ready()
+        # ``pair_density`` is a ``jax.jit`` with EXPLICIT ``in_shardings``, and
+        # pjit does not implicitly reshard an argument that arrives laid out
+        # differently — it refuses by name.  Slicing the column axis is exactly
+        # such a case: JAX hands back the block REPLICATED (measured: a
+        # ``complex128[64,8,2,302]`` slice of a 'y'-sharded array came back
+        # ``PartitionSpec()``), so the block has to be placed back onto 'y'
+        # before the call.  On one device this is a no-op, which is why the
+        # single-device path never had to say it.
+        col_y = NamedSharding(mesh_xy, PartitionSpec(None, None, None, 'y'))
         with timing.section("q0_sum"):
             g_blocks = []
             for c0 in range(0, M_cols, col_block):
                 c1 = min(c0 + col_block, M_cols)
-                P_l_b = pair_density(
-                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
-                P_r_b = pair_density(
-                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
+                blk_l = jax.device_put(psi_l_rmu_Y[..., c0:c1], col_y)
+                blk_r = jax.device_put(psi_r_rmu_Y[..., c0:c1], col_y)
+                P_l_b = pair_density(psi_l_rmuT_X, blk_l, mesh_xy)
+                P_r_b = pair_density(psi_r_rmuT_X, blk_r, mesh_xy)
+                del blk_l, blk_r
                 G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
                                         symmetrize=False)
                 G_b.block_until_ready()
