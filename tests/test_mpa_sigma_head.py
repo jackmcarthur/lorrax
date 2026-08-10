@@ -404,16 +404,23 @@ def test_a_headless_store_refuses_by_name_before_any_pole_is_integrated(
 def test_a_wedge_shaped_store_refuses_by_name_in_the_pass_loop(tmp_path):
     """The other store refusal, reached through the same entry point.
 
-    ``n_q = 2`` against a full zone of ``nk_tot = 8`` is a wedge, and
-    unfolding a POLE FIELD is not the operation that unfolds W.  Same
-    ``wfns=None`` argument as above: the refusal has to come before the
-    psi padding or this cell reports an AttributeError.
+    SUPERSEDED CLAUSE, STRICTER OUTCOME.  This cell was written when
+    unfolding a POLE FIELD was not an operation this code had, so the
+    refusal was a ``NotImplementedError`` naming the missing capability.
+    ``feat/mpa-wedge-pole-unfold-2026-08-10`` implemented it, and the
+    refusal became a ``ValueError`` about THIS store: a pole axis of
+    ``n_q = 2`` that declares ``q_storage='full'`` over a zone of 8 is
+    neither the zone nor a wedge of it, so there is no q to unfold it
+    from.  The store is still refused at the same seam and before the psi
+    padding -- what changed is that the message now names the door a
+    genuine wedge would come through (stamped unfold tables) instead of
+    saying the door does not exist.
     """
     from gw.mpa_pipeline import compute_mpa_sigma_pipeline
 
     path = _fit_store(tmp_path, n_q=2)
     config, meta = _config(path, nk_tot=8)
-    with pytest.raises(NotImplementedError) as exc:
+    with pytest.raises(ValueError) as exc:
         compute_mpa_sigma_pipeline(
             wfns=None, sig_x=None, sig_h=None, config=config, meta=meta,
             mesh_xy=None, band_slices=None, wfn=None, sym=None,
@@ -421,8 +428,9 @@ def test_a_wedge_shaped_store_refuses_by_name_in_the_pass_loop(tmp_path):
     msg = str(exc.value)
     assert "refuse" not in msg.lower()[:10]      # it names the situation
     assert "n_q=2" in msg and "n_k_tot=8" in msg
-    assert "unfold_isdf_operator" in msg
-    assert "exp(+Gamma*tau)" in msg
+    # The remedy is named, so a reader with a REAL wedge knows what to do.
+    assert "read_pole_slice" in msg and "unfold=True" in msg
+    assert "stamp_fit_unfold_tables" in msg
 
 
 def test_a_two_point_mode_cannot_borrow_the_multipole_pipeline(tmp_path):
@@ -521,7 +529,7 @@ def test_the_deck_chooses_which_head_set_and_a_missing_one_refuses(tmp_path):
     # announcement -- so the log line is produced and then the pipeline
     # halts without ever needing a wavefunction bundle.
     config, meta = _config(path, nk_tot=8, head_label="commutator_flipped")
-    with pytest.raises(NotImplementedError):     # the wedge refusal, later
+    with pytest.raises(ValueError):              # the wedge refusal, later
         compute_mpa_sigma_pipeline(
             wfns=None, sig_x=None, sig_h=None, config=config, meta=meta,
             mesh_xy=None, band_slices=None, wfn=None, sym=None,

@@ -48,12 +48,44 @@ def test_read_pole_slice_is_the_leading_axis_slab(tmp_path):
 
 
 def test_read_pole_slice_refuses_an_unfinalized_store(tmp_path):
+    """A store with no fit data in it is refused, not served as zeros.
+
+    TWO GUARDS NOW STAND HERE, AND THE CELL PINS THE PROPERTY RATHER THAN
+    WHICH ONE WINS.  This cell used to match "NOT FINALIZED", the
+    finalize-flag refusal.  The wedge lane
+    (feat/mpa-wedge-pole-unfold-2026-08-10) added a second, stricter one:
+    the q_done completeness check, which names WHICH q have no data
+    instead of reporting a flag.  An empty store trips both, and which
+    fires first depends on the ledger's ``complete`` reading -- observed
+    both ways on this fixture between a bare interpreter and a pytest
+    session, which is a difference worth its own row and not worth a cell
+    pinning one answer.
+
+    What must never change, and is what is asserted: a freshly allocated
+    store is REFUSED, not served as a field of zero poles.  A zero pole is
+    not an absent pole -- it looks exactly like a screening channel that
+    is genuinely dark -- so serving one silently is the failure this cell
+    exists to forbid, and either message forbids it.
+
+    THE ESCAPE HATCH MOVED, and that is the second half of this cell.
+    ``allow_partial=True`` used to serve the holes; the wedge lane split
+    the two questions deliberately, because they are not the same
+    question.  ``allow_partial`` says "this file is mid-fit and I know
+    it"; it does NOT say "serve me q that contain no data", because a
+    resumed farm fit is mid-file by design and must still never integrate
+    a hole.  ``raw=True`` is now the deliberate-holes escape.  Asserted
+    here so the split is pinned rather than inferred.
+    """
     path = str(tmp_path / "partial.h5")
     mpa_store.allocate_fit_store(path, n_q=1, n_mu=2, n_p=2,
                                  energy_unit="Ry", screening_content="W_c")
-    with pytest.raises(ValueError, match="NOT FINALIZED"):
+    with pytest.raises(ValueError, match="NOT FINALIZED|NO fit data"):
         mpa_store.read_pole_slice(path, 0)
-    Om, Bp = mpa_store.read_pole_slice(path, 0, allow_partial=True)
+    # allow_partial alone is NOT enough once a q is empty -- it answers the
+    # finalize question, not the missing-data one.
+    with pytest.raises(ValueError, match="NO fit data"):
+        mpa_store.read_pole_slice(path, 0, allow_partial=True)
+    Om, Bp = mpa_store.read_pole_slice(path, 0, allow_partial=True, raw=True)
     assert Om.shape == (1, 2, 2)
 
 
