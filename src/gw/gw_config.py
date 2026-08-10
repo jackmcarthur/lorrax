@@ -530,10 +530,11 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # WHAT USED TO BE HERE IS NOW REFUSED WHERE IT IS MET, which is the whole
 # reason the row could come out.  The two properties of the STORE that
 # blocked the mode are still refused BY NAME, by the code that reads each
-# of them: a fit store on the symmetry wedge cannot be summed by a kernel
-# whose k-q sums index the full zone (``sigma_pass.refuse_wedge_pole_slab``
-# — unfolding a pole field is not the operation that unfolds W, and the
-# conjugation on the time-reversed members is uncertified), and a store
+# of them: a fit store fitted on a DIFFERENT zone than this run's cannot be
+# summed by a kernel whose k-q sums index this one
+# (``sigma_pass.resolve_pole_q_axis``; a wedge OF this zone is served to
+# the full BZ by the certified pole unfold and is no longer refused), and
+# a store
 # with no ``__mpahead`` axis has no q → 0 head
 # (``mpa_store.read_head_poles``), which is not a correction that can be
 # omitted and noticed later.  A deck that names no store at all is refused

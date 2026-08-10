@@ -134,7 +134,20 @@ def _hermitian_ibz(n_rmu, n_q=3, seed=17):
     return 0.5 * (a + np.swapaxes(a.conj(), -1, -2))
 
 
-def _hand_unfold(V_ibz, *, perm, L, n_rmu):
+def _nonhermitian_ibz(n_rmu, n_q=3, seed=23):
+    """The SAME shape with no Hermitian projection applied.
+
+    The discriminating input: ``conj`` and ``pair_transpose`` are the same
+    map on a Hermitian operator and only on one, so a suite built entirely
+    out of ``_hermitian_ibz`` cannot tell the two apart — which is exactly
+    the state this service's TRS half was certified in.
+    """
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal((n_q, n_rmu, n_rmu))
+            + 1j * rng.standard_normal((n_q, n_rmu, n_rmu)))
+
+
+def _hand_unfold(V_ibz, *, perm, L, n_rmu, trs_rule="conj"):
     """The per-element reference, in plain numpy.
 
     Same expression as ``tests/test_symmetry_unfold.py``'s
@@ -144,8 +157,12 @@ def _hand_unfold(V_ibz, *, perm, L, n_rmu):
         V_full[q, μ, ν] = exp(2πi q_irr·(L_{s,μ} − L_{s,ν}))
                           · V_ibz[i(q), α_s(μ), α_s(ν)]
 
-    conjugated on TRS rows.  It is a reference and not a reimplementation
-    of the kernel: no mesh, no all_to_all, no jit.
+    completed on the TRS rows by ``trs_rule``: ``"conj"`` takes the
+    elementwise conjugate of the spatial image, ``"pair_transpose"`` takes
+    its (μ, ν) transpose.  Both are written here because the whole point
+    of the pair is that they DIFFER off the Hermitian case.  It is a
+    reference and not a reimplementation of the kernel: no mesh, no
+    all_to_all, no jit.
     """
     out = np.zeros((len(_IRR), n_rmu, n_rmu), dtype=V_ibz.dtype)
     for iq in range(len(_IRR)):
@@ -155,7 +172,9 @@ def _hand_unfold(V_ibz, *, perm, L, n_rmu):
         ph = np.exp(2j * np.pi * qL)
         blk = V_ibz[parent][np.ix_(p, p)]
         blk = ph[:, None] * blk * np.conj(ph)[None, :]
-        out[iq] = np.conj(blk) if s >= _NTRAN else blk
+        if s >= _NTRAN:
+            blk = np.conj(blk) if trs_rule == "conj" else blk.T
+        out[iq] = blk
     return out
 
 
@@ -248,6 +267,123 @@ def test_the_conj_wrap_on_trs_rows_is_live():
     assert rel > 1e-3, (
         f"removing the conjugation on the TRS rows changed nothing "
         f"({rel:.3e}); the antiunitary branch is not live")
+
+
+# ---------------------------------------------------------------------------
+# The TRS rule is an argument, because the operator decides it
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("px,py", [(1, 1), (2, 2), (4, 1)])
+def test_the_pair_transpose_rule_matches_its_own_reference(px, py):
+    """``trs_rule='pair_transpose'`` on a NON-Hermitian operator.
+
+    Same three mesh shapes as the conj arm, because the pair transpose
+    rides on an extra gather and a concatenated source pool — a
+    redistribution that lost a tile would show here and nowhere else.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(px, py)
+    perm, L, n_rmu = _divisible_geometry()
+    V = _nonhermitian_ibz(n_rmu)
+    ref = _hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu,
+                       trs_rule="pair_transpose")
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN,
+        trs_rule="pair_transpose"))
+    rel = float(np.abs(got - ref).max() / np.abs(ref).max())
+    assert rel < 1e-13, f"{px}x{py}: pair_transpose differs by {rel:.3e}"
+
+
+def test_the_two_trs_rules_coincide_on_a_hermitian_operator_and_only_there():
+    """WHY the rule has to be an argument, in one cell.
+
+    On a Hermitian operator ``conj`` IS the (μ, ν) transpose, so the two
+    rules must agree to round-off — that is the whole content of the
+    original derivation, and it is why every certification this service
+    carries (static ``V_q`` to 1e-3 on CrI3, the unit arms at 1e-13, the
+    q_irr round trip at bit equality) could not tell them apart.  On a
+    non-Hermitian operator they must disagree by O(1), because the
+    difference is ``conj(A) − Aᵀ = 2i·Im(A)`` on the pair.  A
+    ``W_c(q, z)`` slab at a multipole sample point is the second case:
+    the production Si 4³ store measures 0.58–1.69 relative
+    non-Hermiticity at the double-parallel samples.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(1, 1)
+    perm, L, n_rmu = _divisible_geometry()
+    kw = dict(irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+              q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN)
+    trs_rows = np.where(_SYM >= _NTRAN)[0]
+    assert trs_rows.size >= 2, "PRECONDITION: this map must use TRS rows"
+
+    herm = _hermitian_ibz(n_rmu)
+    a = np.asarray(unfold_isdf_operator(jnp.asarray(herm),
+                                        trs_rule="conj", **kw))
+    b = np.asarray(unfold_isdf_operator(jnp.asarray(herm),
+                                        trs_rule="pair_transpose", **kw))
+    same = float(np.abs(a - b).max() / np.abs(a).max())
+    assert same < 1e-13, (
+        f"the two TRS rules disagree by {same:.3e} on a HERMITIAN "
+        f"operator, where conj(A) = Aᵀ identically — one of them is "
+        f"not the map its docstring claims")
+
+    nonh = _nonhermitian_ibz(n_rmu)
+    c = np.asarray(unfold_isdf_operator(jnp.asarray(nonh),
+                                        trs_rule="conj", **kw))
+    d = np.asarray(unfold_isdf_operator(jnp.asarray(nonh),
+                                        trs_rule="pair_transpose", **kw))
+    diff = float(np.abs(c - d).max() / np.abs(c).max())
+    assert diff > 1e-3, (
+        f"the two TRS rules agree to {diff:.3e} on a NON-Hermitian "
+        f"operator; then this suite cannot see the difference the "
+        f"argument exists to express")
+
+    # ...and the disagreement is CONFINED to the time-reversed rows.  A
+    # spatial row that moved would mean the new branch had reached past
+    # the half it is allowed to touch.  The bar is round-off and not bit
+    # equality: the two rules are two compiled modules, so the same
+    # phase-times-tile product is fused in a different order.
+    spatial = np.setdiff1d(np.arange(len(_IRR)), trs_rows)
+    moved = float(np.abs(c[spatial] - d[spatial]).max()
+                  / np.abs(c[spatial]).max())
+    assert moved < 1e-15, (
+        f"the pair-transpose rule moved a SPATIAL row by {moved:.3e}; the "
+        f"two rules differ on the antiunitary half and nowhere else")
+
+
+def test_no_trs_row_means_the_rule_cannot_matter():
+    """A centrosymmetric zone folds with zero TRS rows — Si 4³ is one.
+
+    Both rules must then return the SAME BYTES, and by construction and
+    not by luck: the helper collapses to the default so the deck stays on
+    one compiled module whichever rule a caller declares.
+    """
+    import jax.numpy as jnp
+    mesh = _mesh(1, 1)
+    perm, L, n_rmu = _divisible_geometry()
+    sym_spatial = np.where(_SYM >= _NTRAN, _SYM - _NTRAN, _SYM)
+    assert (sym_spatial < _NTRAN).all()
+    kw = dict(irr_idx=_IRR, sym_idx=sym_spatial, sym_perm=perm, L_table=L,
+              q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN)
+    V = _nonhermitian_ibz(n_rmu)
+    a = np.asarray(unfold_isdf_operator(jnp.asarray(V),
+                                        trs_rule="conj", **kw))
+    b = np.asarray(unfold_isdf_operator(jnp.asarray(V),
+                                        trs_rule="pair_transpose", **kw))
+    assert float(np.abs(a - b).max()) == 0.0
+
+
+def test_an_unknown_trs_rule_is_refused():
+    """There are two completions and no third to guess between."""
+    import jax.numpy as jnp
+    mesh = _mesh(1, 1)
+    perm, L, n_rmu = _divisible_geometry()
+    with pytest.raises(ValueError, match="trs_rule"):
+        unfold_isdf_operator(
+            jnp.asarray(_hermitian_ibz(n_rmu)), irr_idx=_IRR, sym_idx=_SYM,
+            sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+            n_sym_spatial=_NTRAN, trs_rule="conj_transpose")
 
 
 def test_the_trivial_map_short_circuits_to_its_input():

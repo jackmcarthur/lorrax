@@ -37,9 +37,12 @@ Both of the store properties that kept ``compute_mode = mpa`` on
 ``gw_config.UNIMPLEMENTED_MODES`` are still refused, by the code that
 owns each of them and not by a second copy here:
 
-* a WEDGE-SHAPED pole axis — ``sigma_pass.refuse_wedge_pole_slab``,
-  because unfolding a pole field is not the operation that unfolds W and
-  the conjugation on the time-reversed members is uncertified;
+* a pole axis on a zone that is NOT this run's —
+  ``sigma_pass.resolve_pole_q_axis``.  A wedge OF this zone is no longer
+  among them: the pole unfold was certified on 2026-08-10 and a wedge
+  store is served to the full BZ by ``mpa_store.read_pole_slice(...,
+  unfold=True)``.  What survives is the identity question, which the
+  unfold cannot answer for itself;
 * a HEADLESS store — ``mpa_store.read_head_poles``, because a Σ_c with
   no q→0 term is finite, smooth and wrong by ~200 meV on silicon.
 

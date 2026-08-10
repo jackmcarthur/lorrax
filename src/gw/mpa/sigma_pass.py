@@ -12,7 +12,8 @@ THE SHAPE OF THE LOOP, AND WHY IT IS THIS SHAPE
 ``THEORY_mpa_implementation`` section 7.5 fixes it::
 
     for p in fit_driver.pole_pass_order(n_p):          # ascending, pinned
-        Omega_p, B_p = mpa_store.read_pole_slice(fit, p)
+        Omega_p, B_p = mpa_store.read_pole_slice(       # wedge -> full BZ
+            fit, p, unfold=unfold_q, mesh_xy=mesh_xy)
         for branch in the four (A-space x omega-half) branches:
             for group in the branch's window groups:
                 integrate the group's tau nodes into the branch tiles
@@ -136,18 +137,28 @@ owner's registered row (a slab-aware width clause).  Nothing here touches
 it: same panes, same membership, same nodes, same weights, bit-identical
 Sigma.
 
-WHAT THIS MODULE DOES NOT DO
------------------------------
-It does not unfold the store's q axis.  A fit store written on the symmetry
-wedge carries ``n_q = 8`` where the Sigma kernel's k-q sums want the full
-BZ, and unfolding a POLE FIELD is not the same operation as unfolding
-``W``: the residues ``B_p`` transform as ``W`` does (centroid double
-permute, L-phase, and a conjugation on the time-reversed members) while the
-pole POSITIONS only permute -- and what time reversal does to a pole in the
-closed fourth quadrant is precisely the question this tree has got wrong
-four times in other guises.  :func:`refuse_wedge_pole_slab` therefore
-refuses a wedge store by name and says what has to be certified first,
-rather than guessing a conjugation and returning a finite, plausible Sigma.
+THE STORE'S q AXIS, WEDGE OR FULL
+----------------------------------
+A fit store written on the symmetry wedge carries ``n_q = 8`` where this
+module's k-q sums want the full BZ, and until 2026-08-10 that store was
+refused by name: unfolding a POLE FIELD is not the same operation as
+unfolding ``W``, and what time reversal does to a pole in the closed
+fourth quadrant was the half nobody had certified.
+
+It is certified now, and the answer removed the hazard instead of
+managing it.  Time reversal acts on a ``(mu, nu)`` operator as the PAIR
+TRANSPOSE at the same frequency; the elementwise conjugate the W unfold
+applied is the Hermitian shorthand for that swap, and ``W_c`` at a
+complex sample is not Hermitian.  Under the corrected rule the unfold
+multiplies each element by a FREQUENCY-INDEPENDENT scalar, so ``Omega_p``
+carries the permutation alone and ``B_p`` the permutation and the phase,
+with no conjugation anywhere -- ``Im Omega_p < 0`` is preserved by
+construction and ``e^{+Gamma*tau}`` is unreachable.
+:func:`resolve_pole_q_axis` decides which zone the store is on and the
+pass loop reads its slices with ``unfold=`` set accordingly; the map
+itself lives in ``file_io.mpa_store.unfold_pole_field`` and its rule in
+``symmetry_maps.unfold_isdf_operator``, so this module still does not
+own an opinion about the symmetry.
 """
 
 from __future__ import annotations
@@ -171,7 +182,7 @@ __all__ = [
     "format_pass_report",
     "narrow_pole_threshold_ry",
     "plan_branch_groups",
-    "refuse_wedge_pole_slab",
+    "resolve_pole_q_axis",
     "resolve_pole_subset",
     "resolve_pass_poles",
     "run_pass_branch",
@@ -360,48 +371,57 @@ def _host_at_source_shape(a, dtype, to_host):
     return out.reshape(want)
 
 
-def refuse_wedge_pole_slab(n_q_store, n_k_tot):
-    """Refuse a wedge-shaped pole slab by name, and say what would fix it.
+def resolve_pole_q_axis(ledger, n_k_tot):
+    """Does this pole store need unfolding to reach the Sigma kernel's zone?
 
-    The Sigma kernel's k-q sums index the FULL Bloch zone.  ``W`` reaches
-    that shape through ``symmetry_maps.unfold_isdf_operator`` -- centroid
-    double permute, L-phase, and a conjugation on the time-reversed star
-    members.  A pole field is two objects under that map and only one of
-    them is ``W``: the residues ``B_p`` carry the phase and the
-    conjugation, while the pole POSITIONS carry only the permutation, and
-    the conjugation is the half nobody has certified.  Time reversal sends
-    ``W_c(q, z)`` to a relation between ``W_c(-q, z)`` and a conjugated
-    argument, and a fourth-quadrant pole ``a - i*Gamma`` conjugated
-    naively becomes ``a + i*Gamma``, which enters the tau stage as
-    ``e^{+Gamma*tau}`` and grows -- the failure ``write_head_axis`` already
-    refuses by name at the other end of the pipeline.
+    Returns ``True`` when the store is on the symmetry wedge and its
+    slices must be read with ``unfold=True``.  Refuses, by name, a store
+    whose q extent is neither the full zone nor a declared wedge of it.
 
-    So this is refused rather than guessed.  The gate that would retire the
-    refusal is cheap and is named here so it is not re-derived: rebuild
-    ``W_c(q, z_j)`` from the UNFOLDED poles at the store's own ``2*n_p``
-    sample points and compare against the same store's ``W`` unfolded by
-    ``unfold_isdf_operator``.  Agreement at the fit's own backward error
-    certifies both halves of the pole unfold at once; disagreement on the
-    time-reversed members alone localizes it to the conjugation.
+    THE REFUSAL THIS REPLACES, AND WHY IT IS GONE.  Until 2026-08-10 this
+    was ``refuse_wedge_pole_slab``, which turned a wedge store away
+    outright: unfolding a pole field is not the operation that unfolds
+    ``W``, the residues were thought to carry a conjugation on the
+    time-reversed star members, and *"a fourth-quadrant pole conjugated
+    the wrong way becomes exp(+Gamma*tau), which grows"*.  The named
+    retirement gate was to rebuild ``W_c(q, z_j)`` from the unfolded
+    poles at the store's own ``2*n_p`` samples and compare against the
+    same store's ``W`` unfolded by ``unfold_isdf_operator``.
+
+    That gate was run, and it retired the refusal by DISSOLVING its
+    premise rather than by clearing it.  There is no conjugation.  Time
+    reversal acts on a ``(mu, nu)`` operator as the PAIR TRANSPOSE at the
+    same frequency -- ``O(-q, z)_{mu nu} = O(q, z)_{nu mu}`` -- and the
+    elementwise conjugate the unfold applied was the Hermitian shorthand
+    for that swap, exact for every static object the map had been
+    certified on and wrong by O(1) for a ``W_c`` slab at a complex
+    sample.  Under the corrected rule the unfold's action on any element
+    is a FREQUENCY-INDEPENDENT scalar times another element's value, so
+    ``Omega_p`` permutes and ``B_p`` permutes and takes a phase, and
+    NOTHING is conjugated: ``Im Omega_p < 0`` survives the unfold by
+    construction, and ``exp(+Gamma*tau)`` is not reachable from here.
+    See ``file_io.mpa_store.unfold_pole_field`` for the map and
+    ``symmetry_maps.unfold_isdf_operator`` for the rule.
     """
-    if int(n_q_store) == int(n_k_tot):
-        return
-    raise NotImplementedError(
-        f"MPA Sigma: the fit store's pole axis has n_q={int(n_q_store)} but "
-        f"the Sigma kernel sums over the full Bloch zone, n_k_tot="
-        f"{int(n_k_tot)}.  This store is on the symmetry wedge, and "
-        f"unfolding a POLE FIELD is not the operation that unfolds W: the "
-        f"residues B_p carry the centroid permutation, the L-phase and a "
-        f"conjugation on the time-reversed star members, while the pole "
-        f"positions carry only the permutation -- and a fourth-quadrant "
-        f"pole conjugated the wrong way becomes exp(+Gamma*tau), which "
-        f"grows.  That conjugation is not certified, so it is refused here "
-        f"rather than guessed into a finite, plausible Sigma.  The gate "
-        f"that retires this: rebuild W_c(q, z_j) from the unfolded poles at "
-        f"the store's own 2*n_p sample points and compare against the same "
-        f"store's W unfolded by symmetry_maps.unfold_isdf_operator.  Until "
-        f"then, fit a full-BZ store (allocate_fit_store with n_q = "
-        f"{int(n_k_tot)}).")
+    n_q = int(ledger["n_q"])
+    n_k_tot = int(n_k_tot)
+    if n_q == n_k_tot:
+        return False
+    n_q_full = int(ledger["n_q_full"])
+    if ledger["q_storage"] == "ibz" and n_q_full == n_k_tot:
+        return True
+    raise ValueError(
+        f"MPA Sigma: the fit store's pole axis has n_q={n_q} but the "
+        f"Sigma kernel sums over the full Bloch zone, n_k_tot={n_k_tot}. "
+        f"The store declares q_storage={ledger['q_storage']!r} over a "
+        f"zone of {n_q_full} points, so it is neither that zone nor a "
+        f"wedge of it, and unfolding it would be guessing which q each "
+        f"row is.  A wedge store reaches the full zone through "
+        f"mpa_store.read_pole_slice(..., unfold=True), which needs the "
+        f"W(omega) file's unfold tables stamped beside the poles "
+        f"(mpa_store.stamp_fit_unfold_tables); a store fitted against a "
+        f"DIFFERENT k-grid than this run's is not a store this Sigma can "
+        f"use at all.")
 
 
 def _laplace_buckets(a_values, *, e_lo, e_hi, omega_max, r_max):
@@ -1777,7 +1797,17 @@ def compute_mpa_sigma_c_omega_grid(
     mpa_store.require_correlation_part(
         ledger.get("screening_content"),
         where="compute_mpa_sigma_c_omega_grid", source=str(fit_src))
-    refuse_wedge_pole_slab(int(ledger["n_q"]), int(meta.nk_tot))
+    unfold_q = resolve_pole_q_axis(ledger, int(meta.nk_tot))
+    if unfold_q:
+        # ANNOUNCED, because a run whose screening reached the full zone
+        # through a symmetry map should say so in its own log rather
+        # than leave it to be inferred from a store path.
+        print_fn(
+            f"  MPA Σ: the pole store is on the symmetry WEDGE — "
+            f"{ledger['n_q']} of {ledger['n_q_full']} q — and its slices "
+            f"are unfolded per pole (permutation and L-phase on B_p, "
+            f"permutation alone on Ω_p; nothing conjugated, so the "
+            f"fourth quadrant is preserved).  Tables {ledger['table_hash']}.")
 
     s = wfns.slices
     psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
@@ -1836,7 +1866,8 @@ def compute_mpa_sigma_c_omega_grid(
         t_read = time.perf_counter()
         with timing.section("mpa.pass_read"):
             Omega_p, B_p = mpa_store.read_pole_slice(
-                fit_src, p, allow_partial=allow_partial)
+                fit_src, p, unfold=unfold_q, mesh_xy=mesh_xy,
+                allow_partial=allow_partial)
         a_host = np.asarray(np.real(Omega_p), dtype=np.float64)
         g_host = np.abs(np.asarray(np.imag(Omega_p), dtype=np.float64))
         b_abs = np.abs(np.asarray(B_p))

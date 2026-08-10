@@ -165,6 +165,24 @@ MPA_FIT_FORMAT_VERSION = 2
 #: would strand the first-light field for no gain.
 MPA_FIT_READABLE_VERSIONS = (1, 2)
 
+#: The name the fit store's q-wedge unfold tables are filed under, so
+#: that ``symmetry_maps.qirr_store.read_tables`` reads them with its own
+#: code -- its own key list, its own missing-table refusal, its own
+#: digest.  ``"Omega_p"`` and not ``"B_p"`` because the tables describe a
+#: q axis both datasets share and a group has to be filed under one of
+#: them; the pole POSITIONS are the half that carries no phase, so they
+#: are the honest owner of a table group that is pure geometry.
+#:
+#: THE TABLES ARE NOT A VERSION BUMP, and the criterion is the one this
+#: format already applies to its W side: a version exists when an OLDER
+#: READER WOULD MISREAD the newer bytes.  A v2 reader handed a fit store
+#: that carries this group ignores an unknown sibling group and reads
+#: exactly the wedge it read before -- there is no shape it can mistake
+#: for something else, because the poles themselves did not move.  What
+#: refuses instead is the CONSUMER: a wedge fit store with no tables
+#: cannot be unfolded and :func:`read_pole_slice` says so by name.
+FIT_TABLE_OWNER = "Omega_p"
+
 #: THE POLE-AXIS ENERGY UNIT, and why the store must declare it.  The
 #: first end-to-end MPA Sigma dispatch found the fit solved against the
 #: W(omega) store's abscissae -- stamped ``mpa_omega_units = "Ha"`` --
@@ -1337,6 +1355,18 @@ def read_w_slab(
         q_irr_frac=can.q_irr_frac,
         mesh_xy=mesh_xy,
         n_sym_spatial=int(can.n_sym_spatial),
+        # THE PAIR TRANSPOSE, BECAUSE THIS SLAB IS NOT HERMITIAN.  The
+        # unfold's default completion of a time-reversed row is the
+        # elementwise conjugate, which equals the (μ, ν) transpose it is
+        # standing in for exactly when the operator is Hermitian.  A W_c
+        # slab is Hermitian at ω = 0 and NOT at a double-parallel sample:
+        # measured on mpa_wcprod_0809/stores/W_omega_full_wc.h5, relative
+        # non-Hermiticity 5.9e-13 at z = 0 against 0.58 at z = 0.3155 +
+        # 0.1i and 1.69 at z = 2.524 + 1i.  Taking the default here would
+        # be wrong by O(1) on every TRS row of a wedge store, at every
+        # frequency but the one where the two rules agree — which is
+        # exactly the frequency the existing arms all test at.
+        trs_rule="pair_transpose",
     )
     return full, header
 
@@ -1843,6 +1873,7 @@ def allocate_fit_store(
     grid_hash=None,
     table_hash=None,
     centroid_hash=None,
+    unfold_tables=None,
     dtype=None,
     provenance=None,
     mode="a",
@@ -1889,6 +1920,11 @@ def allocate_fit_store(
         The W(ω) file's stamps, carried here so the Σ stage can assert
         that these poles came from that screening on that centroid set.
         Optional only because a synthetic fit has no such file.
+    unfold_tables
+        The W(ω) file's own :class:`QirrTables`, stamped beside the
+        poles by :func:`stamp_fit_unfold_tables` so a WEDGE fit store
+        can be served to the full Bloch zone later without that file.
+        ``None`` for a full-BZ fit, which needs no map back.
     """
     qs = _qs()
     unit = canonical_energy_unit(energy_unit, where="allocate_fit_store")
@@ -1908,10 +1944,18 @@ def allocate_fit_store(
         # behind would leave a full-size array of ITS numbers indexed by
         # THIS run's ledger, and the Σ stage would certify the new poles
         # against the old evidence.
-        for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX] + [
+        # ...AND THE UNFOLD TABLES GO WITH THEM.  They describe the q
+        # axis of the poles being deleted; left behind, they would
+        # describe the NEW allocation's q axis by coincidence of extent
+        # and be validated against it without complaint.
+        for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX,
+                    FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX] + [
                 k for k in grp if str(k).startswith("fit_")]:
             if key in grp:
                 del grp[key]
+        for key in ("mpa_fit_table_hash", "mpa_fit_q_storage",
+                    "mpa_fit_n_q_full"):
+            grp.attrs.pop(key, None)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -1949,6 +1993,8 @@ def allocate_fit_store(
                 grp.attrs["mpa_fit_w_" + label] = str(val)
         for key, val in (provenance or {}).items():
             grp.attrs["prov_" + str(key)] = val
+        if unfold_tables is not None:
+            stamp_fit_unfold_tables(grp, unfold_tables)
         return fit_completion_ledger(grp)
 
 
@@ -2191,6 +2237,27 @@ def fit_completion_ledger(src, *, mode="r"):
                 grp, FIT_SCREENING_CONTENT_ATTR),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
+            #: WHICH ZONE THE q AXIS IS, and how big the full one is.
+            #: ``'full'`` for a store with no unfold tables — which is
+            #: what every store written before they existed is, and what
+            #: a full-BZ fit legitimately is — so a consumer reads one
+            #: key instead of comparing ``n_q`` against a k-grid it would
+            #: have to be handed.  ``stamp_fit_unfold_tables`` is the
+            #: only thing that can make this ``'ibz'``, and it gets the
+            #: verdict from the symmetry service's own validator.
+            #: WHICH q HAVE FIT DATA — ``blocks_done`` reduced along the
+            #: column axis, which is the granularity every whole-q reader
+            #: works at.  Not a second ledger: the same bools, summarised
+            #: at the axis the q-major readers index.  A farm fit that
+            #: loses a leg loses whole q, and "a fit store missing four q
+            #: looks exactly like a fit store" unless someone asks this.
+            "q_done": done.all(axis=1) if done.ndim == 2 else done,
+            "q_missing": (np.flatnonzero(~done.all(axis=1))
+                          if done.ndim == 2 else np.flatnonzero(~done)),
+            "q_storage": qs.qirr_attr_str(grp, "mpa_fit_q_storage") or "full",
+            "n_q_full": int(grp.attrs.get("mpa_fit_n_q_full",
+                                          grp.attrs["mpa_fit_n_q"])),
+            "table_hash": qs.qirr_attr_str(grp, "mpa_fit_table_hash"),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
             "blocks_done": done,
@@ -2292,6 +2359,55 @@ def _refuse_unfinalized(grp, ledger, allow_partial, where):
         f"caller can say which of it is real.")
 
 
+def _refuse_missing_q(ledger, where, *, unfolding=False):
+    """Refuse a whole-q read whose q axis has holes, and NAME them.
+
+    THE HOLE THIS CLOSES.  ``_refuse_unfinalized`` asks one question —
+    "is this store stamped complete" — and ``allow_partial=True`` turns
+    it off entirely, which is how the Σ pass reads a staged store.
+    Neither path ever looked at ``blocks_done``.  So a store that is
+    stamped complete but has whole q of zeros in it, or a staged store
+    read with ``allow_partial``, hands the pass loop a q of ``B_p = 0``
+    at ``Ω_p = 0``, which contributes nothing to ``W(τ) = Σ_p B_p
+    e^{−iΩ_p τ}`` and is therefore indistinguishable from a screening
+    channel that is genuinely dark.  A farm fit reaches that state by
+    LOSING A LEG: the 2026-08-10 sixteen-way run dropped one leg to a
+    pool timeout and left ``q[48, 52)`` unfitted, and nothing downstream
+    could tell, because a fit store missing four q looks exactly like a
+    fit store.
+
+    Per q and not per file, because that is the granularity a whole-q
+    reader works at and the granularity a farm loses things at.  Named
+    and not counted, because "which q" is the only question the operator
+    of a re-run actually has.
+
+    ``unfolding`` sharpens the message: on a wedge store one missing IBZ
+    parent is not one missing row, it is every full-BZ row that folds
+    onto it — up to ``n_sym`` of them from a single hole.
+    """
+    missing = np.asarray(ledger.get("q_missing", ()), dtype=np.int64)
+    if missing.size == 0:
+        return
+    n_q = int(ledger["n_q"])
+    extra = ""
+    if unfolding:
+        extra = (f"  This store is a WEDGE and the read was going to "
+                 f"unfold it, so each missing q is not one row of the "
+                 f"answer but every full-BZ q that folds onto it — one "
+                 f"hole here becomes a whole star of zeros in Σ.")
+    raise ValueError(
+        f"{where}: {missing.size} of {n_q} q have NO fit data — q "
+        f"{_ranges(missing)}.  They read back as zeros, and a zero pole "
+        f"is not an absent pole: B_p = 0 at Omega_p = 0 contributes "
+        f"nothing to W(tau) = sum_p B_p exp(-i Omega_p tau) and so looks "
+        f"exactly like a screening channel that is genuinely dark.  This "
+        f"is the state a farm fit reaches by losing a leg.{extra}  Re-run "
+        f"the missing q into this store (the ledger is per (q, column), "
+        f"so a resumed walk fits exactly the blocks that are absent), or "
+        f"pass raw=True to inspect the holes deliberately."
+    )
+
+
 def read_fit_block(src, q, mu_cols, *, allow_partial=False, raw=False,
                    mode="r"):
     """One column block's ``(Omega_p, B_p, diagnostics, ledger)``, in Ry.
@@ -2351,7 +2467,8 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, raw=False,
         return Om, Bp, diag, ledger
 
 
-def read_pole_slice(src, p, *, allow_partial=False, raw=False, mode="r"):
+def read_pole_slice(src, p, *, unfold=False, mesh_xy=None,
+                    allow_partial=False, raw=False, mode="r"):
     """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each, in Ry.
 
     THE READ THE SIGMA ACCUMULATION ACTUALLY PERFORMS, and the reason the
@@ -2379,6 +2496,37 @@ def read_pole_slice(src, p, *, allow_partial=False, raw=False, mode="r"):
     this seam and nowhere else; an undeclared store refuses by name with
     both fixes stated, and ``raw=True`` is the tooling escape that skips
     refusal and conversion together (never for a Σ consumer).
+
+    AND THE q WEDGE IS UNFOLDED HERE, WHEN ASKED.  ``unfold=True`` serves
+    the FULL Bloch zone out of a store written on the symmetry wedge, by
+    :func:`unfold_pole_field` — the same ``symmetry_maps`` map the W
+    unfold uses, applied twice (with the lattice wrap for ``B_p``, with
+    it zeroed for ``Omega_p``).  A store already at full BZ returns
+    unchanged, so the flag is safe to pass unconditionally and the
+    CALLER never branches on the store's shape; that is what makes "a
+    wedge store with fit data simply works" a property of this reader
+    rather than of every consumer of it.
+
+    AND EVERY q IT RETURNS IS CHECKED FOR HAVING BEEN FITTED AT ALL.
+    This read hands back the whole q axis, so a q with no fit data is a
+    slab of zeros inside an otherwise real answer — indistinguishable
+    from a dark screening channel, and the state a farm fit reaches by
+    losing a leg.  :func:`_refuse_missing_q` names the q, and it is NOT
+    gated on ``allow_partial``: that flag is a statement about the file
+    not being finalized, and this is a statement about the data the
+    caller is about to integrate.
+
+    Parameters
+    ----------
+    unfold
+        Expand the stored q wedge to the full zone.  Needs ``mesh_xy``
+        and needs the store to carry its unfold tables
+        (:func:`stamp_fit_unfold_tables`); both are refused by name.
+        On a wedge, the missing-q refusal is sharper for a reason: one
+        unfitted IBZ parent becomes every full-BZ q that folds onto it.
+    mesh_xy
+        Device mesh for the sharded unfold.  Ignored when the store is
+        already full-BZ.
     """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
@@ -2392,12 +2540,200 @@ def read_pole_slice(src, p, *, allow_partial=False, raw=False, mode="r"):
             raise IndexError(
                 f"read_pole_slice: p={ip} is outside [0, {ledger['n_p']}); "
                 f"the pass order is gw.mpa.fit_driver.pole_pass_order(n_p).")
+        # EVERY q COMES BACK FROM THIS READ, so every q has to be real.
+        # Deliberately NOT gated on allow_partial: that flag says "this
+        # store is not finalized and I know it", which is a statement
+        # about the FILE, and this is a statement about the DATA the
+        # caller is about to integrate.  raw=True is the escape, and its
+        # name is the audit trail.
+        if not raw:
+            _refuse_missing_q(ledger, f"read_pole_slice(p={ip})",
+                              unfolding=bool(unfold)
+                              and ledger["q_storage"] == "ibz")
         Om = np.asarray(grp["Omega_p"][ip])
         Bp = np.asarray(grp["B_p"][ip])
         if scale != 1.0:
             Om = Om * scale
             Bp = Bp * scale
-        return Om, Bp
+        if not unfold or ledger["q_storage"] == "full":
+            return Om, Bp
+
+        tables = read_fit_unfold_tables(grp)
+        if tables is None:
+            raise ValueError(
+                f"read_pole_slice: this store holds n_q={ledger['n_q']} "
+                f"of a {ledger['n_q_full']}-point zone — it is on the "
+                f"symmetry wedge — and carries no unfold tables, so there "
+                f"is no way back to the full zone from these bytes alone. "
+                f"The tables are the W(ω) file's own "
+                f"{FIT_TABLE_OWNER}{qs.QIRR_TABLE_SUFFIX} group; stamp "
+                f"them with mpa_store.stamp_fit_unfold_tables(store, "
+                f"mpa_store.read_w_tables(w_src, w_name)) while that file "
+                f"still exists.  Re-deriving them from a k-grid here "
+                f"would put a second opinion about the symmetry map in "
+                f"the tree, which is what the service exists to prevent.")
+        if mesh_xy is None:
+            raise ValueError(
+                f"read_pole_slice: unfolding the pole wedge "
+                f"({ledger['n_q']} of {ledger['n_q_full']} q) is a "
+                f"sharded gather and needs a mesh; pass mesh_xy= or "
+                f"unfold=False to take the wedge as stored.")
+        Om_f, B_f = unfold_pole_field(Om, Bp, tables, mesh_xy=mesh_xy)
+        # HOST NUMPY, as the wedge read already returned.  The pass loop's
+        # next move is host-side window planning off Re/Im Ω, so handing
+        # back a device array would only move the gather, not remove it.
+        return np.asarray(Om_f), np.asarray(B_f)
+
+
+def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
+    """Put the q-wedge unfold tables BESIDE the poles, once and for good.
+
+    A wedge fit store is ``n_q_ibz`` rows of a zone the Sigma kernel sums
+    over in full, and the map back is the same ``irr_idx``/``sym_idx``/
+    ``sym_perm``/``L_table``/``q_irr_frac`` group the W(omega) file it was
+    fitted from already carries.  Copying it here is the rule this format
+    states for its own W side, applied to the poles: *a tensor whose
+    reconstruction tables live anywhere but beside it silently decays
+    when anything upstream is regenerated.*  By the time Sigma runs, the
+    W file may be gone; :func:`read_pole_slice` must not need it.
+
+    Filed under :data:`FIT_TABLE_OWNER` so ``qirr_store.read_tables``
+    reads it back verbatim -- the tables are validated by that service's
+    own :func:`~symmetry_maps.qirr_store.validate_qirr_tables` against
+    THIS store's ``n_q`` and ``n_mu``, so a table group from a different
+    deck refuses on the extents rather than unfolding into plausible
+    nonsense.
+
+    Re-stamping the SAME tables is a no-op, so the call is safe to leave
+    in a driver.  Re-stamping DIFFERENT tables refuses, for the reason
+    every declaration in this format refuses one: the poles did not
+    change, so at most one of the two table groups describes them.
+
+    Returns the canonical :class:`~symmetry_maps.qirr_store.QirrTables`
+    stamped.
+    """
+    qs = _qs()
+    can = tables.canonical()
+    with qs.QirrDest(dest, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        n_q, n_mu = int(ledger["n_q"]), int(ledger["n_mu"])
+        # The service's own validator decides ibz-vs-full from the extents.
+        q_storage = qs.validate_qirr_tables(can, n_q, n_mu)
+        digest = can.digest()
+        stamped = qs.qirr_attr_str(grp, "mpa_fit_table_hash")
+        if stamped is not None and stamped != digest:
+            raise ValueError(
+                f"stamp_fit_unfold_tables: this store already carries "
+                f"unfold tables with digest {stamped} and the caller "
+                f"offered {digest}.  The poles did not change, so at "
+                f"most one of the two groups describes the q axis they "
+                f"live on; unfolding with the wrong one returns a "
+                f"finite, plausible, wrongly-permuted pole field.  If "
+                f"the first stamp was wrong, that is a corrupted store: "
+                f"rebuild it and say so in its provenance.")
+        tgrp_name = FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX
+        if tgrp_name in grp:
+            del grp[tgrp_name]
+        tgrp = grp.create_group(tgrp_name)
+        for key in ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm",
+                    "L_table"):
+            tgrp.create_dataset(key, data=getattr(can, key))
+        tgrp.attrs["n_sym_spatial"] = np.int64(can.n_sym_spatial)
+        tgrp.attrs["table_hash"] = digest
+        grp.attrs["mpa_fit_table_hash"] = digest
+        grp.attrs["mpa_fit_q_storage"] = q_storage
+        grp.attrs["mpa_fit_n_q_full"] = np.int64(can.n_q_full)
+        return can
+
+
+def read_fit_unfold_tables(src, *, mode="r"):
+    """The stored q-wedge unfold tables, or ``None`` when there are none.
+
+    ``None`` is a legitimate answer and not an error: a full-BZ fit store
+    needs no tables and every store written before
+    :func:`stamp_fit_unfold_tables` existed has none.  The refusal for
+    "wedge, and no way back to the full zone" belongs to the consumer,
+    which is :func:`read_pole_slice`, because only it knows the caller
+    actually asked to unfold.
+    """
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        if FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX not in grp:
+            return None
+        return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
+
+
+def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
+    """One pole's ``(Omega, B)`` wedge slab -> the full Bloch zone.
+
+    THE MAP, AND WHY IT IS TWO CALLS TO ONE HELPER.  The per-element
+    multipole model is ``W_c(z) = sum_p 2*Omega_p*B_p / (z**2 -
+    Omega_p**2)``, and every entry of the unfold's action on ``W`` is a
+    z-INDEPENDENT scalar times the value of a DIFFERENT element::
+
+        W_full[q, mu, nu](z) = c(q, mu, nu) * W_ibz[i(q), a(mu), a(nu)](z)
+
+    with ``c = exp(2*pi*i*q_irr.(L_mu - L_nu))`` on a spatial row, and on
+    a time-reversed row ``conj(c)`` against the TRANSPOSED element
+    ``[a(nu), a(mu))]`` -- the pair-transpose rule, derived and measured
+    in ``symmetry_maps.unfold_isdf_operator``.  A z-independent scalar
+    multiple of a multipole model is a multipole model with the SAME
+    poles and scaled residues, so::
+
+        Omega'_p = Omega_p[parent element]        (permutation only)
+        B'_p     = c * B_p[parent element]        (permutation + phase)
+
+    and NOTHING IS CONJUGATED -- not the residues and, decisively, not
+    the pole positions.  ``Im Omega_p < 0`` is preserved by construction
+    rather than by a guard, so the failure the wedge refusal was written
+    against -- a fourth-quadrant pole conjugated into ``exp(+Gamma*tau)``,
+    which grows -- cannot be reached from here.  Time reversal never
+    conjugated a pole; it swapped a pair of centroid indices, and the
+    conjugate was the Hermitian shorthand for that swap.
+
+    So this is ONE map applied twice, not two maps: ``B_p`` goes through
+    ``unfold_isdf_operator`` with the store's own ``L_table``, and
+    ``Omega_p`` goes through the same call with the lattice wrap ZEROED,
+    which is exactly what "the pole positions carry only the
+    permutation" means when written as code.  Re-deriving the
+    permutation here instead would put a second opinion about the
+    symmetry map in the tree, which is the thing the service exists to
+    prevent.
+
+    Parameters
+    ----------
+    Omega_p, B_p
+        ``(n_q_ibz, N_mu, N_mu)`` complex -- one pole's wedge slab, at
+        the store's LOGICAL centroid extent.
+    tables
+        The store's :class:`~symmetry_maps.qirr_store.QirrTables`.
+    mesh_xy
+        Device mesh; the unfold is sharded ``P(None, 'x', 'y')``.
+
+    Returns
+    -------
+    ``(Omega_full, B_full)``, each ``(n_q_full, N_mu, N_mu)``.
+    """
+    import jax.numpy as jnp
+    # THROUGH THE SERVICE'S DOOR, never a submodule -- the same import
+    # ``read_w_slab`` makes, so both unfolds are the same code.
+    from symmetry_maps import unfold_isdf_operator
+
+    can = tables.canonical()
+    kw = dict(irr_idx=can.irr_idx_q, sym_idx=can.sym_idx_q,
+              sym_perm=can.sym_perm, q_irr_frac=can.q_irr_frac,
+              mesh_xy=mesh_xy, n_sym_spatial=int(can.n_sym_spatial),
+              # W_c(q, z) at a multipole sample is NOT Hermitian -- 0.58
+              # to 1.69 relative on the production Si store -- so the
+              # elementwise-conj completion of the time-reversed rows is
+              # wrong for it by O(1).  Its residues inherit that.
+              trs_rule="pair_transpose")
+    L_zero = np.zeros_like(np.asarray(can.L_table))
+    Omega_full = unfold_isdf_operator(
+        jnp.asarray(Omega_p), L_table=L_zero, **kw)
+    B_full = unfold_isdf_operator(
+        jnp.asarray(B_p), L_table=can.L_table, **kw)
+    return Omega_full, B_full
 
 
 def allocate_head_axis(dest, *, n_p, label=None, mode="a"):
@@ -2601,6 +2937,9 @@ def read_fit_tensors(src, *, allow_partial=False, raw=False, mode="r"):
         scale = 1.0 if raw else _fit_to_ry_factor(grp, "read_fit_tensors")
         _refuse_unfinalized(grp, ledger, allow_partial,
                             "read_fit_tensors")
+        # Whole-q reader, same hole, same refusal — see read_pole_slice.
+        if not raw:
+            _refuse_missing_q(ledger, "read_fit_tensors")
         Om = np.asarray(grp["Omega_p"][()])
         Bp = np.asarray(grp["B_p"][()])
         if scale != 1.0:
