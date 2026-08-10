@@ -54,7 +54,7 @@ from jax.sharding import Mesh
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 _VQ_INTERP = _SRC / "bse" / "vq_interp.py"
-_BSE_IO = _SRC / "bse" / "bse_io.py"
+_BSE_IO = _SRC / "bse" / "bse_loading.py"
 
 N_MU = 4
 NQ = 2
@@ -277,7 +277,7 @@ def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does():
 
     io_guards = _guards_on_w0_ready(_BSE_IO.read_text(), "wq_key")
     assert any(io_guards), (
-        "bse/bse_io.py no longer gates its W0 selection on W0_ready")
+        "bse/bse_loading.py no longer gates its W0 selection on W0_ready")
 
 
 def test_the_ast_matcher_detects_the_pre_fix_shape():

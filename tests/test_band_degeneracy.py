@@ -204,7 +204,8 @@ def test_no_second_default_lurks_anywhere_p1():
                                                              "off"):
             offenders.append(f"{what} -> {node.value!r} (line {node.lineno})")
 
-    for rel in ("common/band_degeneracy.py", "bse/bse_io.py", "bse/bse_jax.py",
+    for rel in ("common/band_degeneracy.py", "bse/bse_loading.py",
+                "bse/bse_window.py", "bse/bse_jax.py",
                 "bse/exciton_bands.py"):
         tree = ast.parse((src / rel).read_text())
         for node in ast.walk(tree):

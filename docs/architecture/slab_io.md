@@ -185,12 +185,12 @@ stale artifact, is not a fallback. The correct response to a stale `.so`
 is a refusal naming it, which is the repo-wide contract (CLAIMS 81) and is
 what `assert_available` now does.
 
-**Not deleted, and not a tier:** `bse_io`'s serial h5py readers. They
+**Not deleted, and not a tier:** `bse_loading`'s serial h5py readers. They
 hyperslab exactly one rank's (μ, ν) tile, allgather nothing, and are
 memory-correct at any process count — they are simply ~17× slower
 (0.17 GiB/s at P=4, CLAIMS 76, vs 2.919 GiB/s for the tile path at 16
 ranks, CLAIMS 69) because they issue `nq × μ/px` short row-runs one at a
-time with no collective buffering. `bse_io` falls back to them, loudly,
+time with no collective buffering. `bse_loading` falls back to them, loudly,
 when `probe_availability()` declines. Slow and correct is a legitimate
 fallback; the tier that was deleted was neither.
 
@@ -211,7 +211,7 @@ rank**, silently. At the envelope (N_mu=20000, nq=64) the same read is
 It was therefore *guarded off* above one process, which removed a
 capability that had worked at deck scale and left `restart = true` with no
 P>1 story. It is now on the tile path, following
-`bse_io.load_bse_data_from_restart_sharded`:
+`bse_loading.load_bse_data_from_restart_sharded`:
 
 1. one serial-h5py pass reads **shapes** and the small replicated arrays
    (`enk_full`, `G0_mu_nu`, the stamps), then closes — two live handles on

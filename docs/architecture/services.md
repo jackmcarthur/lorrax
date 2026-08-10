@@ -614,7 +614,7 @@ not which backend serves it (one refusal wording, owned by `GATE`). Both
 dials are factory-time reads and MUST be in every consumer cache key
 (`ffi.ffi_dial_key()`). Parity gates: unit 1e-16, h5 ≤ 2.5e-14 eV.
 
-**The `make_w_densifier` consumer pattern** (`bse/bse_io.py`): the
+**The `make_w_densifier` consumer pattern** (`bse/bse_densify.py`): the
 coarse→fine W densifier composes the `shard_map`-interior kernels —
 `make_sharded_ifftn_3d` → zero-pad in R → `make_sharded_fftn_3d` — inside
 ONE `jax.jit` whose `out_shardings` pins the (μ,ν) spec, so per-rank peak
