@@ -76,11 +76,25 @@ NPROC = 4
 
 
 def visible_gpus(env: dict, probe=None) -> list:
-    """The GPU ordinals this process may use, in order.
+    """The GPU ordinals this leg may use, in order.
 
-    ``CUDA_VISIBLE_DEVICES`` first — inside a Slurm step it is authoritative
+    ``LORRAX_TEST_VISIBLE_GPUS`` FIRST, because under pytest the obvious
+    source has already been destroyed: ``tests/conftest.py`` pins this
+    process to ONE device before any test runs (three separate things need
+    that), so ``CUDA_VISIBLE_DEVICES`` reads "0" on a node that granted
+    four.  MEASURED on Perlmutter 2026-08-10, step ``lx-Xg4-154342``: the
+    whole contract skipped itself with "no four-process launch available
+    here" immediately after printing four A100s.  A `mesh(4)` cell computes
+    on none of them — it orchestrates four SUBPROCESSES, one per device — so
+    the pin is right for the cell and wrong for the question, and conftest
+    records the pre-pin list for exactly this reader.
+
+    Then ``CUDA_VISIBLE_DEVICES`` — inside a Slurm step it is authoritative
     and ``nvidia-smi`` is not (it enumerates the node, not the cgroup).
     """
+    stashed = env.get("LORRAX_TEST_VISIBLE_GPUS")
+    if stashed is not None:
+        return [d for d in stashed.split(",") if d.strip() != ""]
     preset = env.get("CUDA_VISIBLE_DEVICES")
     if preset is not None:
         return [d for d in preset.split(",") if d.strip() != ""]

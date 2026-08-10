@@ -340,6 +340,17 @@ def test_the_gpu_leg_gives_each_process_exactly_one_device():
     assert gpus == ["2", "3", "5", "7"]
     assert mesh_launch.visible_gpus({"CUDA_VISIBLE_DEVICES": ""}) == []
     assert mesh_launch.visible_gpus({}, lambda: 4) == ["0", "1", "2", "3"]
+    # THE PIN MUST NOT HIDE THE NODE.  conftest pins this process to one
+    # device before any cell runs; the pre-pin list is what a mesh(4) cell
+    # has to see, and reading the pinned value instead is what made the
+    # whole contract skip itself on a four-A100 node.
+    assert mesh_launch.visible_gpus(
+        {"CUDA_VISIBLE_DEVICES": "0",
+         "LORRAX_TEST_VISIBLE_GPUS": "0,1,2,3"}) == ["0", "1", "2", "3"]
+    assert mesh_launch.choose_mode(
+        {"CUDA_VISIBLE_DEVICES": "0", "LORRAX_TEST_VISIBLE_GPUS": "0,1,2,3",
+         "SLURM_JOB_ID": "1", "SLURM_STEP_ID": "0"},
+        lambda _n: None, lambda: 0)[0] == mesh_launch.LOCAL_GPU
 
 
 def test_the_verdict_function_fails_a_missing_rank():
