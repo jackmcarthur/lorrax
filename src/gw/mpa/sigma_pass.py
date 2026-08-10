@@ -1851,17 +1851,6 @@ def compute_mpa_sigma_c_omega_grid(
         omega_complex_host = (a_host - 1j * g_host
                               if (plan_dir is not None
                                   and census_out is None) else None)
-        # The pole-level half of the plan address, taken once for the four
-        # branches that share these arrays.  Four times over it cost
-        # 12.56 s a pole against 3.14 s once (2026-08-10), and the four
-        # branches genuinely read the same Re Omega, Gamma, live mask and
-        # |B| -- only E_A, its mask and the ω half-grid differ.
-        slab_dig = None
-        if plan_dir is not None:
-            t_slab = time.perf_counter()
-            slab_dig = PS.slab_digest(
-                a_ry=a_host, gamma_ry=g_host, live_mask=live, b_abs=b_abs)
-            fixed["addr_s"] += time.perf_counter() - t_slab
         state = _prepare_sigma_state(
             jnp.asarray(wfns.enk[:, s.full]), jnp.asarray(wfns.occ[:, s.full]),
             jnp.asarray(B_p, dtype=jnp.complex128),
@@ -1870,6 +1859,19 @@ def compute_mpa_sigma_c_omega_grid(
             jnp.asarray(str(ppm_cfg.fermi_reference) == "midgap", dtype=bool),
             jnp.asarray(True, dtype=bool))
         live = _host_at_source_shape(state.B_mask, bool, _to_host_np)
+        # The pole-level half of the plan address, taken once for the four
+        # branches that share these arrays -- and here rather than beside
+        # the read, because ``live`` is the store's B mask and comes from
+        # ``_prepare_sigma_state``, not from the slab.  Four times over
+        # the hash cost 12.56 s a pole against 3.14 s once (2026-08-10);
+        # the four branches genuinely read the same Re Omega, Gamma, live
+        # mask and |B|, and only E_A, its mask and the ω half-grid differ.
+        slab_dig = None
+        if plan_dir is not None:
+            t_slab = time.perf_counter()
+            slab_dig = PS.slab_digest(
+                a_ry=a_host, gamma_ry=g_host, live_mask=live, b_abs=b_abs)
+            fixed["addr_s"] += time.perf_counter() - t_slab
         rec = PassRecord(
             pole_index=int(p),
             re_omega_min_ev=float(np.min(a_host, where=live, initial=np.inf))
