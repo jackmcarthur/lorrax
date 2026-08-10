@@ -1560,6 +1560,16 @@ def compute_mpa_sigma_c_omega_grid(
         ledger.get("screening_content"),
         where="compute_mpa_sigma_c_omega_grid", source=str(fit_src))
     unfold_q = resolve_pole_q_axis(ledger, int(meta.nk_tot))
+    if unfold_q:
+        # ANNOUNCED, because a run whose screening reached the full zone
+        # through a symmetry map should say so in its own log rather
+        # than leave it to be inferred from a store path.
+        print_fn(
+            f"  MPA Σ: the pole store is on the symmetry WEDGE — "
+            f"{ledger['n_q']} of {ledger['n_q_full']} q — and its slices "
+            f"are unfolded per pole (permutation and L-phase on B_p, "
+            f"permutation alone on Ω_p; nothing conjugated, so the "
+            f"fourth quadrant is preserved).  Tables {ledger['table_hash']}.")
 
     s = wfns.slices
     psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
