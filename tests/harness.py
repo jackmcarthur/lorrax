@@ -221,6 +221,268 @@ def pin_one_gpu(preset: str | None, worker_id: str = "", probe=None,
     i = int(tail) % len(devs) if tail.isdigit() else 0
     return devs[i]
 
+
+def session_devices(preset: str | None, probe=None) -> list:
+    """Every device the SESSION may use, read BEFORE ``pin_one_gpu`` narrows it.
+
+    The pin above is the reason a mesh cell cannot simply look at
+    ``jax.devices()`` and find four: by the time any test module imports
+    jax, this process has already been narrowed to one.  So the list is
+    read once, in ``pytest_configure``, and carried in the environment
+    (``LORRAX_SESSION_DEVICES``) for the one consumer that needs it — the
+    mesh runner below, which spends it on a subprocess.
+    """
+    return _visible_gpus(preset, probe or _probe_nvidia_smi)
+
+
+#: The env var that carries :func:`session_devices` past the pin, and the
+#: sentinel that marks a process the mesh runner started.  ``LORRAX_`` and
+#: not ``CUDA_``: it is read at CALL time, never latched by a backend.
+SESSION_DEVICES_ENV = "LORRAX_SESSION_DEVICES"
+MESH_CELL_ENV = "LORRAX_MESH_CELL"
+
+#: The CALLER's device-shape environment, snapshotted in ``pytest_configure``
+#: and handed to the mesh child verbatim.  MEASURED, Perlmutter 2026-08-10,
+#: and it is the difference between a mesh cell and a lie about one.
+#:
+#: These two are latched at ``import jax``, so a test module that needs a CPU
+#: platform or four emulated devices has to set them at MODULE SCOPE — and a
+#: module-scope write never unwinds (that is the P19 hazard the collection
+#: guard above documents; ``JAX_``/``XLA_`` are on the allowlist precisely
+#: because there is nowhere else to put them).  ``tests/test_contract_bands``
+#: and ``tests/test_sanity_gates_jax`` both do it.  So by the time ANY test
+#: runs in a census, the process environment says ``JAX_PLATFORMS=cpu`` and
+#: ``XLA_FLAGS=--xla_force_host_platform_device_count=4``, whatever the
+#: caller asked for — and a child started from that environment comes up on
+#: FOUR EMULATED HOST DEVICES and passes, on a node with four A100s, while
+#: reporting itself as a mesh run.  That is the exact substitution the
+#: four-GPU rule exists to forbid, and it is invisible in the verdict.
+#:
+#: ``pytest_configure`` runs BEFORE collection, so the value read there is
+#: the caller's own and no module has spoken yet.  A caller who exported
+#: ``JAX_PLATFORMS=cpu`` keeps it; a module that set it during collection
+#: does not follow the child.  ``None`` means "the caller had none", and the
+#: child gets it UNSET rather than inheriting the leak.
+SESSION_JAX_ENV = "LORRAX_SESSION_JAX_ENV"
+JAX_SHAPE_VARS = ("JAX_PLATFORMS", "XLA_FLAGS")
+
+#: Platforms that count as "the real devices the session promised".
+_REAL_PLATFORMS = frozenset({"gpu", "cuda", "rocm"})
+
+
+def mesh_plan(want: int, have_here: int, session_devs, *, inner: bool = False,
+              platform: str = ""):
+    """Where a ``@pytest.mark.mesh(want)`` cell has to run.  PURE.
+
+    Returns ``(verb, payload)`` with ``verb`` one of:
+
+    ``"here"``
+        This process already sees ``want`` devices — a direct invocation
+        with ``--xla_force_host_platform_device_count``, or the mesh
+        subprocess itself.  Run the cell normally; payload is ``None``.
+    ``"subprocess"``
+        This process is PINNED below ``want`` but the session's node has
+        enough.  Payload is the device list to hand a subprocess.  This is
+        the case the suite hits under ``lx test``: four GPUs on the node,
+        one per xdist worker, so no worker can build a 2x2 by itself.
+    ``"skip"``
+        The hardware is not there at all (a laptop, a one-GPU leg).
+        Payload is the reason string.
+    ``"fail"``
+        We ARE the mesh subprocess and we still do not have the devices we
+        were started for.  Payload is the reason.  A skip here would be a
+        lie — the run that was supposed to supply the mesh did not, and a
+        green-with-a-skip is exactly how this cell went unexercised for a
+        month.  It also bounds the recursion: the subprocess can never
+        start another one.
+
+    WHY A SUBPROCESS AND NOT A FIXTURE THAT HANDS BACK THE DEVICES.
+    ``CUDA_VISIBLE_DEVICES`` is read ONCE, when the backend is built, and
+    the first test module to be collected imports jax.  A fixture runs
+    hundreds of items later.  There is no in-process moment between "the
+    markers are known" (collection) and "the device list is still
+    changeable" (before the first jax import), so a per-cell device set is
+    a per-PROCESS fact and the only honest per-cell handle on it is a
+    process.  Every other consumer of the pin — the xdist fan-out, the
+    1-GPU-frozen references, SLATE's refusal at >1 visible device — keeps
+    exactly the pin it has today, because this process never widens.
+    """
+    devs = list(session_devs or [])
+    here = have_here
+    # A PROCESS THAT IS NOT ON THE SESSION'S DEVICES HAS NONE OF THEM, however
+    # many it can count.  MEASURED, Perlmutter 2026-08-10: several test modules
+    # set ``JAX_PLATFORMS=cpu`` and four emulated host devices at MODULE SCOPE
+    # (they must — the values latch at ``import jax``) and a module-scope write
+    # never unwinds, so after collection EVERY process in a census carries
+    # them.  ``jax.device_count()`` then answers 4, and a mesh cell on a node
+    # with four A100s runs on four emulated CPU devices and passes.  Four is
+    # four: only the platform separates honouring the four-GPU rule from
+    # quietly substituting for it.  ``session_devs`` is empty exactly when
+    # there is nothing to substitute FOR — no GPUs, or a caller who asked for
+    # a host platform on purpose — and then the count is the whole story and
+    # emulated legs keep working unchanged.
+    if devs and platform not in _REAL_PLATFORMS:
+        here = 0
+    if here >= want:
+        return ("here", None)
+    if inner:
+        return ("fail",
+                f"the mesh child was started for {len(devs)} device(s) and "
+                f"jax came up with {have_here} on platform "
+                f"'{platform or 'none'}'.  A mesh({want}) cell is not allowed "
+                "to be quietly emulated and this is not a skip — check "
+                "JAX_PLATFORMS / XLA_FLAGS in the child's environment.")
+    if len(devs) >= want:
+        return ("subprocess", devs[:want])
+    return ("skip",
+            f"needs >= {want} devices: this process has {have_here} on "
+            f"'{platform or 'none'}' and the session has {len(devs)} visible "
+            f"GPU(s).  On a >= {want}-GPU node the suite runs this cell on "
+            "the real mesh; off one, run it directly with "
+            f"XLA_FLAGS=--xla_force_host_platform_device_count={want}.")
+
+
+def mesh_subprocess_env(base_env: dict, devices, caller_jax_env=None) -> dict:
+    """The environment the mesh subprocess runs under.  PURE.
+
+    Four edits and each one is load-bearing:
+
+    * ``CUDA_VISIBLE_DEVICES`` back to the session's full list — the whole
+      point.  The parent's pin stays where it is; only the child widens.
+    * ``JAX_PLATFORMS`` / ``XLA_FLAGS`` reset to what the CALLER had, which
+      ``pytest_configure`` snapshotted before collection.  See
+      :data:`SESSION_JAX_ENV`: without this the child inherits the
+      collection-time leak, comes up on four EMULATED host devices, and
+      passes while measuring nothing about the mesh it was started for.
+    * the xdist worker bookkeeping dropped, so the child is a plain
+      single-process run and not a worker that reports to a controller
+      that is not listening.
+    * ``XLA_PYTHON_CLIENT_ALLOCATOR=platform``.  The child is a CO-TENANT:
+      under ``lx test`` four pinned workers are already computing on these
+      same cards, and BFC preallocates a fraction of every visible device
+      at backend init, so a fifth process that preallocates would OOM the
+      node rather than measure anything.  ``platform`` allocates on demand,
+      which is right for cells whose arrays are kilobytes — and it is what
+      the lx container already exports, so this states the default rather
+      than departing from it.  A mesh cell is a CORRECTNESS gate, never a
+      timing.
+    """
+    env = dict(base_env)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    env[MESH_CELL_ENV] = "1"
+    env["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # THE FLAT-K FFT FFI IS REFUSED IN THE CHILD, not left to abort.
+    # MEASURED by the perf fleet, 2026-08-10: an IN-PROCESS multi-device mesh
+    # cannot execute the flat-k cuFFT handler — every in-process 2x2 dies
+    # CUFFT_EXEC_FAILED at every size, and it is an uncatchable SIGABRT, while
+    # the production multi-PROCESS legs (one process per device) are fine.  A
+    # child is exactly an in-process multi-device mesh, so a cell that wandered
+    # into `make_flat_k_*` would take the whole child down and every verdict in
+    # it with it, attributable to nothing.  `LORRAX_FFT_FFI=0` REFUSES (the XLA
+    # flat-k twin was deleted by the 2026-08-01 ruling, so there is nothing to
+    # fall back to) — and a refusal names the cell that caused it, which an
+    # abort cannot.  A gate that genuinely needs the flat-k FFT at P=n is a
+    # MULTI-PROCESS gate and belongs in tests/multi_device/, not behind this
+    # marker.
+    env["LORRAX_FFT_FFI"] = "0"
+    for name in JAX_SHAPE_VARS:
+        value = (caller_jax_env or {}).get(name)
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    for k in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT",
+              "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST"):
+        env.pop(k, None)
+    return env
+
+
+def junit_outcomes(xml_path, module_relpath: str) -> dict:
+    """``{nodeid: (outcome, detail)}`` from a junit-xml the mesh child wrote.
+
+    junit is pytest's own report format, so the child needs no plugin and
+    no protocol of ours.  ``xunit2`` drops the ``file`` attribute, so the
+    nodeid is rebuilt from the module path we asked for plus whatever
+    ``classname`` carries beyond it (a class, when there is one).
+    """
+    import xml.etree.ElementTree as ET
+
+    mod = module_relpath[:-3].replace(os.sep, ".").replace("/", ".")
+    out = {}
+    root = ET.parse(str(xml_path)).getroot()
+    for case in root.iter("testcase"):
+        name = case.get("name", "")
+        classname = case.get("classname", "") or mod
+        extra = ([p for p in classname[len(mod) + 1:].split(".") if p]
+                 if classname.startswith(mod) else [])
+        nodeid = "::".join([module_relpath] + extra + [name])
+        outcome, detail = "passed", ""
+        for child in case:
+            tag = child.tag
+            if tag in ("failure", "error"):
+                outcome = "failed"
+                detail = (child.get("message") or "") + "\n" + (child.text or "")
+                break
+            if tag == "skipped":
+                outcome = "skipped"
+                detail = child.get("message") or ""
+                break
+        out[nodeid] = (outcome, detail.strip())
+    return out
+
+
+def run_mesh_group(nodeids, devices, *, cwd, out_dir, timeout=1800):
+    """Run ``nodeids`` in ONE subprocess that owns ``devices``.
+
+    ONE process per module rather than one per cell: a GPU backend costs
+    seconds to build and these modules carry ~40 cells between them, so
+    per-cell processes would put ten minutes of pure jax init on the
+    critical path of every census.  Per-cell VERDICTS survive anyway —
+    they come back through junit-xml, keyed by nodeid.
+
+    Serialised node-wide with an exclusive lock: under ``lx test`` several
+    xdist workers can reach their mesh cells at once, and two children
+    each taking every GPU on the node is the co-tenancy failure the pin
+    exists to prevent, reintroduced by the fix for it.
+    """
+    import fcntl
+    import json
+    import time
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    xml = out_dir / ("mesh_%d.xml" % os.getpid())
+    node_tmp = Path(os.environ.get("TMPDIR", "/tmp"))
+    lock_path = node_tmp / ("lorrax-mesh-%s.lock" % os.environ.get("USER", "x"))
+    cmd = [sys.executable, "-u", "-m", "pytest", "-q", "--no-header",
+           "-p", "no:cacheprovider", f"--junitxml={xml}", *nodeids]
+    env = mesh_subprocess_env(
+        os.environ, devices,
+        json.loads(os.environ.get(SESSION_JAX_ENV, "{}") or "{}"))
+    t0 = time.time()
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            res = subprocess.run(cmd, cwd=str(cwd), env=env, timeout=timeout,
+                                 capture_output=True, text=True)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    # One line per child, on the node, so a census can be ASKED what its mesh
+    # cells cost and how many children it paid for.  Duplicate children for
+    # one module mean the xdist grouping did not hold, which is a cost the
+    # run should be able to show rather than a thing to infer from wall time.
+    try:
+        with open(node_tmp / ("lorrax-mesh-%s.log" % os.environ.get("USER", "x")),
+                  "a") as log:
+            log.write("pid=%d cells=%d rc=%d secs=%.1f devs=%s first=%s\n"
+                      % (os.getpid(), len(nodeids), res.returncode,
+                         time.time() - t0, ",".join(devices),
+                         nodeids[0] if nodeids else "-"))
+    except Exception:                                          # noqa: BLE001
+        pass
+    return res, xml
+
+
 # Output files never copied from a fixture dir into a run dir.
 _FIXTURE_IGNORE = (
     "tmp", "eqp_test.dat", "eqp0_test.dat", "eqp1_test.dat",
