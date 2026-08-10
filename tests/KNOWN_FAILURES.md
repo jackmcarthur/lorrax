@@ -11,6 +11,42 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — THE SI BSE ANCHOR IS RED ON `main`, AND THE BAND-WINDOW SNAP IS WHY (2026-08-09)
+
+**One row, and it is a live red on `main` rather than a branch's own red.**
+The fast-gate lane reported `test_bse_matches_frozen_and_bgw` failing at
+0.0906 eV against a 1e-6 eV pin and correctly declined to attribute it, since
+its branch changes no `src/` file; it flagged the number as worth a look on a
+properly site-built tree.  It was looked at.  The red reproduces to the digit
+on a clean checkout of `main` @ `01e1e609` with the canonical
+`restage_candidate_2026-08-08` `.so` pair, so it is neither the fast-gate
+branch nor that lane's borrowed 2026-08-07 libraries.  It arrived at
+`824032b7`, the `feat/exciton-bands-2026-08-09` merge, and the mechanism is
+that merge's new band-window guard running in its default `snap` mode.
+
+The part that matters most is that **this red is not re-cuttable.**  The hbn
+row two amendments down is the shape people will reach for — correct behaviour
+outrunning a stale reference, closed by an owner-authorized re-freeze.  This is
+not that.  The moved spectrum fails the gate's *external* BerkeleyGW band as
+well as its frozen pin, so adopting the new numbers as the reference would
+leave the cell red on its second arm.  The gate is the tree's only cross-code
+BSE anchor and it is currently anchored to nothing.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw` — RED on `main`, both arms** | **The default `--band-degeneracy snap` silently doubles the deck's BSE problem.**  `99d73f95` (in the `824032b7` merge) installs `common.band_degeneracy.resolve_band_window` at the band-window choke point with `mode="snap"` as the default, so a window boundary landing inside a degenerate multiplet is widened OUTWARD.  On `si_bse_debug` it fires, and the run says so in its own words: *"[band-window] `_load_ring_subset`: requested n_val=4 n_cond=4 (bands [4, 12) of 60) is not multiplet-safe … the conduction boundary at band 12 cuts a multiplet (gap 0.000 meV at k=0, tol 1.000 meV); the multiplet ends at band 16, so n_cond 4 → 8 … SNAPPED OUTWARD to n_val=4 n_cond=8 (bands [4, 16) of 60).  The BSE problem is now 32 pairs per k instead of 16."*  The gate's Hamiltonian therefore goes from 1024 to 2048 dimensions, the extra transitions fill the bottom of the spectrum, and every one of the lowest twenty moves down: 20/20 cells over the pin, max abs **0.09064299 eV** against `ATOL_FROZEN_EV = 1e-6` (index 0: 2.34696443 actual vs 2.35372258 frozen).  The signature is diagnostic on its own — the returned list acquires multiplicities the frozen list does not have (2.346964 ×2, 2.348024 ×3, 2.349776 ×3) and the four BerkeleyGW states at 2.470–2.484 eV are pushed out of the lowest-20 window entirely | **NOT ATTRIBUTABLE TO ANY BRANCH — it is `main`'s.**  **Attributed to `824032b7`** by walking the day's mainline with the `.so` pair, the deck and the test file all held fixed and only `src/` varying (`/pscratch/sd/j/jackm/bsegate_attrib_0809/`, `probe.sh` + per-commit `log_<sha>.txt`): GREEN at `e37c6a6e`, `7ac49f5e` and `4bcc5b40` (`= 824032b7^1`), RED with byte-identical numbers at `824032b7`, `9024deee`, `2ad51ef9`, `01e1e609` and — re-checked after `origin/main` moved during this lane — `d9d418db`.  **Mechanism proven by A/B on the cell itself** at `01e1e609`, the knob the only variable: `--band-degeneracy off` → **PASSES both arms**, zero guard lines in the log; `--band-degeneracy snap` → the failure above.  So with the window the deck asks for, current `main` still reproduces the frozen pin to better than 1e-6 eV — nothing else in `src/` has drifted.  **The re-cut trap, measured**: against the external reference, the snapped spectrum sits at MAE **21.729 meV** / max **80.803 meV** versus bands of 10 / 25, where the frozen reference itself sits at 6.522 / 9.840 — and the `_assert_aligned` guard does *not* divert it (best-drop ratio 0.913 against a 0.5 threshold), so the BerkeleyGW assert is genuinely reached and genuinely fails.  Freezing the new numbers would trade a red frozen arm for a red band arm.  **OWNER ROW — two decisions, neither taken here.**  (1) Whether the anchor deck should pin `--band-degeneracy off`, since BerkeleyGW produced `bgw_eigenvalues_dft_ref.dat` at 4v4c and a silently widened window compares two different problems — which is the same confounding that `97735e01` refused for the q=0 head override on this very deck.  (2) Whether `snap` is the right *default* for a driver flag at all, or whether `strict` is, given that the guard's whole argument is that a cut multiplet is not a thing to fix quietly.  **The landing's neutrality control could not have caught this**: `EXCITON_BANDS_FEATURES.md` §1.6 compares base @ `f1e07bb6` at `--n-val 4 --n-cond 4` against the branch snapping *into* 4v4c on the MoS₂ deck and gets bit-identity, which proves the guard changes only *which* window is selected — true, and blind by construction to a deck where the selected window changes.  The five default-gate e2e cells were not run on that branch.  Evidence: `/pscratch/sd/j/jackm/bsegate_attrib_0809/` (`probe.sh`, `mech.sh`, `log_<sha>.txt`, `log_degen_off.txt` / `log_degen_snap.txt`, `dump_off.txt` / `dump_snap.txt`) |
+
+**The other four default-gate cells are GREEN on clean `main` @ `01e1e609`**,
+measured in the same lane and the same pool: the three Si COHSEX cells
+(`test_si_fast_matches_frozen_reference`,
+`test_si_production_matches_frozen_reference`, and the BerkeleyGW anchor
+`test_si_production_matches_berkeleygw`) and the dipole sweep smoke
+(`test_the_default_analytic_sweep_writes_a_valid_dipole_h5`) all pass —
+`/pscratch/sd/j/jackm/bsegate_attrib_0809/log_other4.txt`.  So one of the five
+is red, it is this one, and the fast gate's own accounting is otherwise sound.
+
+---
+
 # AMENDMENT — THE DIPOLE PRODUCER HAD NO PSEUDOPOTENTIAL PRE-FLIGHT (2026-08-09)
 
 **One row, and it is the FIXED successor to the `dZ is None` row the sign-flip
