@@ -11,6 +11,19 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — THE TWO ABSORPTION DRIVERS DISAGREE ON A CONJUGATION (2026-08-09)
+
+**One row, from the oscillator-strength gate build (`FIX_dipole_vnl_sign.md`).**
+This is the fifth member of the campaign's most expensive defect class
+(crossed conventions), found because the new gate pins two quantities
+precisely so that conjugation blindness in `|d|²` cannot hide it.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`absorption_eigvecs` contracts `A` without a conjugate; `davidson_absorption:214` uses `.conj()`** | The two absorption drivers assemble oscillator strengths from the eigenvector contraction with OPPOSITE conjugation conventions — genuinely different numbers on the same eigenvectors, not a representation difference.  Which one is right is NOT adjudicated yet; the new gate `tests/test_bse_oscillator_strengths.py` (on the `fix/dipole-vnl-sign-2026-08-09` branch) pins BOTH so the disagreement is measured rather than silent | **OPEN, PHYSICS-IMPLICATING, crossed-convention class** — needs its own bounded lane: derive the correct contraction from the spectral representation, fix the wrong driver, ship the crossed red twin (campaign policy for this class).  Found 2026-08-09 by the sign-flip lane and deliberately NOT fixed there (out of its work order).  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_dipole_vnl_sign.md` |
+
+---
+
 # AMENDMENT — THE MINI-BZ EXCHANGE-HEAD AVERAGE IS THE WRONG MOMENT (2026-08-09)
 
 **One row, from the exciton-bands lane's LT-splitting derivation
