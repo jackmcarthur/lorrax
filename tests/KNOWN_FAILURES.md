@@ -11,6 +11,17 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — `exciton_bands` AT P=4 NEVER EXITS (2026-08-09)
+
+**One row, from the owed-legs batch (`OWED_LEGS_BATCH.md`), and it explains an
+entire evening of phantom "pool contention."**
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`bse.exciton_bands` at P=4 completes its payload and then never exits** | The driver finishes cleanly — the full `TOTAL` stage table prints and every output file is written — and then all four ranks spin at ~100 % CPU indefinitely, holding the step's GPUs until the allocation dies.  Teardown/exit path, not physics: outputs are complete and correct.  **Pre-existing**: reproduced at base `f1e07bb6` (`wt_xb_base`, step `.73`), so it is not the 2026-08-09 feature branch; two of the three wild instances had no `LORRAX_JAX_CACHE_EXPLAIN`, so it is not the cache-explain path either | **OPEN, DEADLOCK-OPS CLASS.**  Evidence: JID 56546766 steps `.35`/`.53`/`.73`, started 18:41/18:50/18:57, driver logs end within seconds of payload completion, `sstat` at 19:53 shows `AveCPU` ≥ 1 h over `NTasks 4`; a fourth instance reproduced deliberately by the batch lane, harvested, and `scancel`led.  The three wild ones held 12–16 GPUs for ~3 h and masqueraded as pool contention for the whole 2026-08-09 evening — every "pool saturated" refusal that night traces here.  Ops rule until fixed: after any `exciton_bands` P≥4 leg, verify the step EXITED, not just that outputs exist; reclaim hung steps by exact step ID after harvesting.  Needs its own bounded lane on the exit path (suspects: distributed/coordination-service teardown ordering).  Evidence: `~/lorrax_bse_perf_2026-08-08/OWED_LEGS_BATCH.md` |
+
+---
+
 # AMENDMENT — THE TWO ABSORPTION DRIVERS DISAGREE ON A CONJUGATION (2026-08-09)
 
 **One row, from the oscillator-strength gate build (`FIX_dipole_vnl_sign.md`).**
