@@ -34,9 +34,25 @@ census)
   ;;
 balance)
   python3 $BASE/scripts/balance.py $CENSUS 16 $PARTIALS $MAN
+  # The second arm's manifest is struck from the SAME census, so its
+  # partition is the same partition -- only the cubes' directory differs.
+  # Two manifests rather than one because a leg's output path comes out of
+  # the manifest, and the two arms must not write into each other.
+  mkdir -p $BASE/partials_replan
+  python3 $BASE/scripts/balance.py $CENSUS 16 $BASE/partials_replan \
+    $BASE/manifest16_replan.json
   ;;
 farm)
   PLAN_ONCE=1 bash $BASE/scripts/farm.sh window $MAN
+  ;;
+farm_replan)
+  # The A/B arm: the same sixteen legs on the pre-plan-store route, at
+  # THIS sha and this anchor.  It is what the plan-once arm's cubes are
+  # compared against and where the "before" fixed term and wall come
+  # from -- both re-cut here rather than quoted from §9, because the
+  # anchor's windowed_exp_iEt flip moved Σ bytes and a pre-anchor cube is
+  # not admissible as either arm.
+  PLAN_ONCE=0 bash $BASE/scripts/farm.sh window $BASE/manifest16_replan.json
   ;;
 verify)
   LEG=${1:-leg00}
@@ -65,10 +81,21 @@ for L in json.load(open(sys.argv[1]))['legs']:
     "${LEG}_replan" "$POLES" "$GSUB" "$OUT" "$MAN"
   ;;
 gate)
-  ~/bin/lx run -G=1 --wait 3600 -- $(bfc_env) \
+  # Host-side: a merge, three red twins and two comparisons, none of which
+  # touches a device.  -G=0 is a container step that reserves no GPU, so
+  # the gate does not take a card off the farm to do arithmetic on cubes.
+  ~/bin/lx run -G=0 --wait 3600 -- env JAX_PLATFORMS=cpu \
     python -u $BASE/scripts/merge_and_gate.py \
       "$MAN" "$POLEPARTS" "$BASE/gate_out" "$REF_NPY" "$REF_DIR" \
     2>&1 | tee $REPORTS/GATES.log
+  ;;
+gate_replan)
+  # Arm B merged on its own, to produce the reference Σ_c the plan-once
+  # arm is then compared against.
+  ~/bin/lx run -G=0 --wait 3600 -- env JAX_PLATFORMS=cpu \
+    python -u $BASE/scripts/merge_and_gate.py \
+      "$BASE/manifest16_replan.json" "$POLEPARTS" "$BASE/gate_out_replan" \
+    2>&1 | tee $REPORTS/GATES_REPLAN.log
   ;;
 *)
   echo "planonce.sh: unknown stage '$STAGE'"; exit 2 ;;

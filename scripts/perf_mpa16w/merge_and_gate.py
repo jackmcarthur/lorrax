@@ -136,21 +136,36 @@ def main():
     tot_w, order, audit_w = combine_pass_partials(
         win_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src,
         manifest=manifest)
-    print("GATE (a) -- the pole farm, same deck, same sha")
-    tot_p, _order, audit_p = combine_pass_partials(
-        pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src)
+    # THE POLE ARM IS OPTIONAL, AND SAYING SO IS NOT A WEAKENING.  Gate (a)
+    # asks whether the window split reproduces the pole split; a lane whose
+    # change is upstream of the split (where the groups came FROM, not how
+    # they are cut) answers a different question, against another farm over
+    # the same partition, and re-running an eight-leg pole farm whose
+    # dearest leg is 26 minutes to re-answer a settled one is not free.
+    # When the directory is there the comparison runs exactly as before.
+    mx = rel = 0.0
+    n_diff = 0
+    tot_p = None
+    if pole_paths:
+        print("GATE (a) -- the pole farm, same deck, same sha")
+        tot_p, _order, audit_p = combine_pass_partials(
+            pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src)
 
-    print("-" * 72)
-    print("window-farmed Σ_c against pole-farmed Σ_c:")
-    mx, rel, n_diff = _cmp("total", tot_p, tot_w)
-    print(f"  for scale, the combiner's own re-association audit on the "
-          f"SAME cubes:")
-    print(f"    pole farm, ascending vs descending: "
-          f"{audit_p['reassoc_descending_max_abs_ry']:.6e} Ry "
-          f"({audit_p['reassoc_descending_rel']:.3e} rel)")
-    print(f"    pole farm, ascending vs shuffled:   "
-          f"{audit_p['reassoc_shuffled_max_abs_ry']:.6e} Ry "
-          f"({audit_p['reassoc_shuffled_rel']:.3e} rel)")
+        print("-" * 72)
+        print("window-farmed Σ_c against pole-farmed Σ_c:")
+        mx, rel, n_diff = _cmp("total", tot_p, tot_w)
+        print("  for scale, the combiner's own re-association audit on the "
+              "SAME cubes:")
+        print(f"    pole farm, ascending vs descending: "
+              f"{audit_p['reassoc_descending_max_abs_ry']:.6e} Ry "
+              f"({audit_p['reassoc_descending_rel']:.3e} rel)")
+        print(f"    pole farm, ascending vs shuffled:   "
+              f"{audit_p['reassoc_shuffled_max_abs_ry']:.6e} Ry "
+              f"({audit_p['reassoc_shuffled_rel']:.3e} rel)")
+    else:
+        print("-" * 72)
+        print(f"no pole-farm cubes in {pole_dir}: gate (a)'s pole arm is "
+              f"NOT run here and nothing below stands in for it.")
     print(f"    window farm, ascending vs shuffled: "
           f"{audit_w['reassoc_shuffled_max_abs_ry']:.6e} Ry "
           f"({audit_w['reassoc_shuffled_rel']:.3e} rel)")
