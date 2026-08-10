@@ -636,6 +636,11 @@ has got wrong four times in other guises.
 
 ## 6. The gate ecosystem, and why each gate exists
 
+The measurement discipline these gates grew out of is codified, with its
+incidents, in `AGENT_PREAMBLE.md` at the repository root — read that first if
+you are about to run or compare anything; this section explains the gates
+themselves.
+
 Every gate here was placed after something came back **finite, smooth, plausible
 and wrong**. That is the selection criterion: a defect that crashes needs no gate.
 
