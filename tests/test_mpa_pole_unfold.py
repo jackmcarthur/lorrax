@@ -61,6 +61,7 @@ jax = pytest.importorskip("jax")
 from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
                            verify_centroid_orbit_closure)
 from symmetry_maps import qirr_store as QS                        # noqa: E402
+from lxkit.testing import require_devices                         # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import fit_driver, sampling                           # noqa: E402
@@ -130,9 +131,27 @@ def _geometry():
     return tables, verdict, int(cent.shape[0])
 
 
-def _mesh():
+def _mesh(px=1, py=1):
+    """A ``(px, py)`` mesh, skipping when the devices are not there.
+
+    THE UNFOLD IS A ``shard_map`` AND 1x1 TAKES NEITHER OF ITS BRANCHES.
+    ``unfold_isdf_operator`` redistributes the mu and the nu axis through
+    ``lax.all_to_all`` so no rank ever holds a full centroid axis, and
+    both of those paths are skipped entirely at one device -- so a gate
+    that only ever runs at 1x1 has certified the arithmetic and nothing
+    about the sharding.  The per-shard crossing defect is the precedent:
+    it passed every single-device gate.  ``n_mu`` is 16 here, divisible
+    by 4, which is what lets the 2x2 and 4x1 arms exist at all.
+    """
     from jax.sharding import Mesh
-    return Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
+    if px * py > 1:
+        require_devices(px * py, platform="cpu")
+    devs = np.asarray(jax.devices("cpu")[:px * py]).reshape(px, py)
+    return Mesh(devs, ("x", "y"))
+
+
+#: The meshes every arm that touches the unfold is parametrized over.
+_MESHES = [(1, 1), (2, 2), (4, 1)]
 
 
 # ---------------------------------------------------------------------------
@@ -301,13 +320,14 @@ def _z_in_pole_units(wedge):
 # (A) THE GATE
 # ---------------------------------------------------------------------------
 
-def test_the_unfolded_poles_rebuild_the_unfolded_W(wedge):
+@pytest.mark.parametrize("px,py", _MESHES)
+def test_the_unfolded_poles_rebuild_the_unfolded_W(wedge, px, py):
     """The retirement gate for ``refuse_wedge_pole_slab``, run in full.
 
     Every full-BZ q, every one of the store's ``2*n_p`` samples, every
     element -- against the FLOOR the same fit sets on its own wedge.
     """
-    mesh = _mesh()
+    mesh = _mesh(px, py)
     assert wedge["ledger"]["q_storage"] == "ibz"
     assert wedge["ledger"]["n_q_full"] == _N_Q_FULL
     z = _z_in_pole_units(wedge)
@@ -339,14 +359,15 @@ def test_the_unfolded_poles_rebuild_the_unfolded_W(wedge):
         f"spatial rows localizes it to the permutation or the phase.")
 
 
-def test_the_shipped_unfold_is_the_pair_transpose_map(wedge):
+@pytest.mark.parametrize("px,py", _MESHES)
+def test_the_shipped_unfold_is_the_pair_transpose_map(wedge, px, py):
     """The production read against the hand map, element by element.
 
     Arm A compares two ROUTES to W; this compares the pole field itself
     against the map written out in numpy, so a defect that happened to
     cancel in the rebuild would still be caught.
     """
-    mesh = _mesh()
+    mesh = _mesh(px, py)
     Om_f, B_f = _read_unfolded_poles(wedge["fit_path"], _N_P, mesh)
     Om_w, B_w = _read_wedge_poles(wedge["fit_path"], _N_P)
     Om_h, B_h = _hand_unfold_poles(Om_w, B_w, wedge["tables"])
@@ -481,7 +502,8 @@ def test_the_conjugation_twin_is_the_growing_exponential(wedge):
 # (C) The rows the map leaves alone
 # ---------------------------------------------------------------------------
 
-def test_the_self_parent_rows_are_bit_identical_to_the_wedge(wedge):
+@pytest.mark.parametrize("px,py", _MESHES)
+def test_the_self_parent_rows_are_bit_identical_to_the_wedge(wedge, px, py):
     """Zero differing elements -- the property the W unfold already proved.
 
     A q that is its own IBZ representative folds through the identity:
@@ -492,7 +514,7 @@ def test_the_self_parent_rows_are_bit_identical_to_the_wedge(wedge):
     business doing.  Counted, not normed: two conjugation defects in this
     tree were diagonal-preserving and off-diagonal-destroying.
     """
-    mesh = _mesh()
+    mesh = _mesh(px, py)
     Om_f, B_f = _read_unfolded_poles(wedge["fit_path"], _N_P, mesh)
     Om_w, B_w = _read_wedge_poles(wedge["fit_path"], _N_P)
     assert _SELF_ROWS.size >= 2, "PRECONDITION: the zone must have such rows"
