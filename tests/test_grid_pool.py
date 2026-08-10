@@ -7,6 +7,9 @@ not map the grid to itself is REFUSED rather than rounded onto it.  The
 device-side gate (two full runs producing byte-identical centroid files)
 lives with the run; this is the part that can be checked in a second.
 """
+import ast
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -132,3 +135,112 @@ def test_orbit_block_pivots_deliver_a_closed_full_rank_set():
     # One pivot per orbit cannot do better than one direction per orbit.
     _, _, rank_orbit, *_ = pivoted_cholesky_select(gram, 12, orbit_id)
     assert int(rank_orbit) == n_orb < 12
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# The selector option, end to end on the host: flag -> stamp -> deck key
+# ─────────────────────────────────────────────────────────────────────────
+
+def _stamped(tmp_path, stamp):
+    """A centroid file with the header `kmeans_cli` writes, minus the table."""
+    p = tmp_path / "centroids_frac_4.txt"
+    p.write_text(
+        "# x y z (snapped to FFT grid (4, 4, 4), 4 unique)\n"
+        f"# centroid_source: {stamp}\n"
+        "# determinism: no RNG on this path\n"
+        "0.000000 0.000000 0.000000\n0.250000 0.250000 0.250000\n")
+    return str(p)
+
+
+def _cli_flag(name):
+    """The `add_argument` call for one flag, read by AST.
+
+    The CLI module cannot be IMPORTED here: it opens with
+    `initialize_communicator_stack()`, which needs the built FFI, so a plain
+    import turns this host-only test into a cluster-only one.  The parser is
+    a literal in the source, so read it as one — the same no-import AST
+    approach `tools/gen_input_reference.py` uses on the deck defaults, and
+    for the same reason.
+    """
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "src" / "centroid" / "kmeans_cli.py").read_text()
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == name):
+            return {k.arg: k.value for k in node.keywords}
+    raise AssertionError(f"{name} is not in the parser")
+
+
+def test_selector_flag_round_trips_from_cli_to_deck_assertion(tmp_path):
+    """`--centroid-selector X` -> `centroid_source:` -> `centroid_selector = X`.
+
+    The three names have to agree across two modules and a text file, and
+    nothing else checks that: a typo in the writer's stamp or the reader's
+    table would make the deck assertion quietly unsatisfiable — or worse,
+    quietly satisfiable by the wrong selector, which is a wrong-basis run
+    that no other gate would catch.
+    """
+    from file_io.centroids import (
+        CENTROID_SOURCE_STAMPS, assert_centroid_selector, read_centroid_source,
+    )
+
+    choices = _cli_flag("--centroid-selector")["choices"]
+    assert {e.value for e in choices.elts} == set(CENTROID_SOURCE_STAMPS)
+
+    for selector, stamp in CENTROID_SOURCE_STAMPS.items():
+        f = _stamped(tmp_path, stamp)
+        assert read_centroid_source(f) == stamp
+        assert_centroid_selector(f, selector, print_fn=lambda *_: None)
+        # ...and the OTHER selector's deck key must not accept this file.
+        other = next(k for k in CENTROID_SOURCE_STAMPS if k != selector)
+        with pytest.raises(ValueError, match="was written by"):
+            assert_centroid_selector(f, other, print_fn=lambda *_: None)
+
+
+def test_the_writer_takes_its_stamp_from_the_shared_table():
+    """No stamp literal outside `file_io.centroids`.
+
+    The whole point of the shared table is that writer and reader cannot
+    drift; a hand-written stamp string in the generator would restore
+    exactly the drift the table removes, while still passing every test
+    above on the day it was written.
+    """
+    root = pathlib.Path(__file__).resolve().parent.parent
+    from file_io.centroids import CENTROID_SOURCE_STAMPS
+
+    owner = root / "src" / "file_io" / "centroids.py"
+    for stamp in CENTROID_SOURCE_STAMPS.values():
+        holders = {py for py in (root / "src").rglob("*.py")
+                   if f'"{stamp}"' in py.read_text()
+                   or f"'{stamp}'" in py.read_text()}
+        assert holders <= {owner}, (
+            f"{stamp!r} is written out in {sorted(str(h) for h in holders)}; "
+            f"it belongs only in {owner}")
+
+
+def test_the_default_selector_is_the_historical_one():
+    """Defaulting to current behaviour is the whole contract for existing decks."""
+    assert _cli_flag("--centroid-selector")["default"].value == "kmeans"
+    # Granularity is resolved FROM the selector in main(), so the parser
+    # default must stay None — a literal here would silently pin the
+    # whole-grid selector to the granularity measured WORSE on it.
+    assert _cli_flag("--pivot-granularity")["default"].value is None
+
+
+def test_an_empty_deck_key_asserts_nothing_and_an_unstamped_file_refuses(tmp_path):
+    from file_io.centroids import assert_centroid_selector
+
+    bare = tmp_path / "legacy.txt"
+    bare.write_text("0.000000 0.000000 0.000000\n")
+    # Every deck that predates the stamp: no key, no assertion, no refusal.
+    assert_centroid_selector(str(bare), "", print_fn=lambda *_: None)
+    # But a deck that DOES claim a selector may not be satisfied by silence.
+    with pytest.raises(ValueError, match="no `centroid_source:` stamp"):
+        assert_centroid_selector(str(bare), "kmeans", print_fn=lambda *_: None)
+    with pytest.raises(ValueError, match="is not a selector"):
+        assert_centroid_selector(_stamped(tmp_path, "kmeans_pivoted_cholesky"),
+                                 "typo", print_fn=lambda *_: None)

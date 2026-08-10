@@ -793,6 +793,14 @@ _DEFAULTS = {
     # File paths
     "wfn_file": "WFN.h5",
     "centroids_file": "centroids_frac.txt",
+    # WHICH selector the deck ASSERTS produced ``centroids_file``, checked
+    # against the ``centroid_source:`` stamp the generator writes.  Empty
+    # (default) asserts nothing, which is what every existing deck does and
+    # keeps doing.  This key cannot GENERATE centroids -- ``kmeans_cli`` does
+    # not read the deck, by design -- so its whole job is to stop a run that
+    # believes it is on the deterministic basis from silently proceeding on a
+    # seeded one.  Values: "" | "kmeans" | "pivoted_full_grid".
+    "centroid_selector": "",
     # Optional second centroid file used by the bispinor pipeline:
     # μ_L=1,2,3 (transverse) ζ-fits use Gordon-current-density centroids
     # rather than the charge-density centroids in ``centroids_file``.
@@ -1780,6 +1788,9 @@ class FilePaths:
     """Output filenames + non-WFN inputs.  Resolved to absolute paths."""
     wfn_file: str
     centroids_file: str
+    # Which selector the deck asserts produced ``centroids_file``; "" = no
+    # assertion.  Checked against the file's own ``centroid_source:`` stamp.
+    centroid_selector: str
     # Bispinor: optional Gordon-current-density centroid file for μ_L=1,2,3.
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
@@ -2415,6 +2426,7 @@ class LorraxConfig:
         paths = FilePaths(
             wfn_file=str(_g("wfn_file")),
             centroids_file=str(_g("centroids_file")),
+            centroid_selector=str(_g("centroid_selector") or "").strip(),
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),

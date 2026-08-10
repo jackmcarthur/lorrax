@@ -38,6 +38,46 @@ moves is visible. Source-of-truth citations are inlined as
 
 ---
 
+## 11.0 Where the centroids come from
+
+Everything below takes `{r_μ}` as given. It is chosen by `centroid.kmeans_cli`
+before any of this runs, and by one of two selectors
+(`--centroid-selector`, [drivers → centroids](../drivers.md#centroids--centroidkmeans_cli)):
+
+* **`kmeans`** (default) — a density-weighted Lloyd iteration produces an
+  over-sampled candidate pool, which greedy pivoted Cholesky on the q=0
+  pair-density Gram prunes to `n_rmu`. Seeded, and the seed is not a
+  formality: on Si 4×4×4 the seed alone moves Σ_x by tens of meV, which is
+  why the standing recipe is best-of-five draws ranked by the generator's
+  own independent-direction count.
+* **`pivoted_full_grid`** — the same greedy, with the candidate pool taken to
+  be the *whole* real-space grid in C-order and orbits consumed member by
+  member, so the delivered set is orbit-closed and every point in it is a
+  certified independent direction. No RNG anywhere.
+
+What the ζ-fit cares about is the second column of that choice: the number
+of **independent directions** the point set spans, because the ζ back-solve
+truncates every mode below `zeta_rcond` and a point that adds no direction
+adds a truncated mode instead of a basis function. Measured on Si 4×4×4 at
+24³ with `nband = 100` (§7.7.12): a 1692-point seeded set spans 1246
+directions and the back-solve keeps 1246 of 1692 per q; the deterministic
+1394-point set spans 1282 and keeps **1394 of 1394**.
+
+The reason `pivoted_full_grid` is a backup and not the default belongs to
+§11.2's memory model rather than to the physics: its candidate Gram is
+`O(n_rtot²)`, which is 3.06 GB at `n_rtot = 13824` and roughly 200 GB at
+`n_rtot = 110592`. It is affordable on small, high-symmetry cells at modest
+cutoff, and on nothing else. The Gram build is column-blocked on every mesh
+(`build_gram_q0_via_loadwfns`), so the binding object is the assembled
+`(M, M)` Gram itself and not the pair-density transients.
+
+The hard ceiling on this axis is the Gram's own numerical rank — 1474 on
+that deck at that band window. No point set on that grid, chosen by any
+rule, spans more directions than that, so `n_rmu` beyond it buys redundancy
+and the truncation that goes with it.
+
+---
+
 ## 11.1 Pipeline overview
 
 The pipeline is **r-chunked** (r is the dominant memory axis) and

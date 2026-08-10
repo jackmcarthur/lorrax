@@ -46,6 +46,7 @@ page has to read it from.
 |---|---|---|
 | `centroids_file` | `"centroids_frac.txt"` | Charge-channel ISDF centroid table written by centroid.kmeans_cli. |
 | `centroids_file_current` | `""` | Second centroid table (Gordon-current weight) for the bispinor transverse channels; empty = not set. |
+| `centroid_selector` | `""` | Which selector this deck ASSERTS produced `centroids_file`, checked against the `centroid_source:` stamp the generator writes: `kmeans` (seeded k-means draw pruned by pivoted Cholesky) or `pivoted_full_grid` (the deterministic whole-grid pivot, `centroid.kmeans_cli --centroid-selector pivoted_full_grid`). Empty (default) asserts nothing, which is what every existing deck does. The key cannot GENERATE centroids -- `kmeans_cli` does not read the deck, by design -- so its whole job is to stop a run that believes it is on the deterministic basis from proceeding on a seeded one; the two put the points in different places and Sigma_x differs by tens of meV between them. An UNSTAMPED file under a non-empty assertion is refused rather than passed: "the file does not say" and "the file says what you asked for" are different facts. |
 | `gflat_chunk_size` | `0` | Flat-axis chunk of the r-chunk G-accumulation; 0 = planner-chosen, explicit > 0 wins. |
 | `vq_g_chunk_size` | `0` | V_q inner G-axis GEMM chunk; 0 = auto (largest divisor of ngkmax <= 4096). |
 | `zeta_ridge` | `0.0` | Opt-in Tikhonov ridge epsilon on the charge CCT (fraction of mean diagonal); 0 = bit-identical historical factor. Env LORRAX_ZETA_RIDGE. |

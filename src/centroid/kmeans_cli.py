@@ -1,14 +1,27 @@
-"""CLI driver for the weighted k-means ISDF point selector.
+"""CLI driver for the ISDF interpolation-point selectors.
 
-Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.
+Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.  Two selectors, on
+``--centroid-selector``; both end in the same greedy pivoted Cholesky on the
+q=0 pair-density Gram, and differ in what they hand it.
 
-The physics, in the order it happens: pick the density that decides WHERE
-the ISDF quadrature gets points; run a density-weighted k-means over the
+``kmeans`` (DEFAULT, and the historical path).  Pick the density that decides
+WHERE the ISDF quadrature gets points; run a density-weighted k-means over the
 real-space FFT grid, optionally in orbit representatives so the answer is
-closed under the crystal point group; snap to the grid and unfold; then
-prune the over-sampled candidate pool down to N_c by pivoted Cholesky on
-the pair-density Gram, which keeps the points that span the band window
-Σ actually consumes.
+closed under the crystal point group; snap to the grid and unfold; then prune
+the over-sampled candidate pool down to N_c by pivoted Cholesky, which keeps
+the points that span the band window Σ actually consumes.
+
+``pivoted_full_grid``.  Skip all of that: the candidate pool is the WHOLE
+real-space grid in C-order, and the greedy picks the points out of it directly
+in orbit-block order.  No RNG anywhere, so the same deck returns the same
+points byte for byte, and ``--seed`` is inert.  It is the maximum-robustness
+BACKUP rather than the default because its Gram is ``O(N_grid²)`` — 3 GB at
+24³, ~200 GB at 48³ — so it is affordable on small, high-symmetry cells at
+modest cutoff and on nothing else.  See :mod:`centroid.grid_pool` for the pool
+and ``docs/drivers.md`` for the affordability rule and the measured numbers.
+
+Either way the choice is stamped into the output file as ``centroid_source:``,
+which the GW deck key ``centroid_selector`` asserts back.
 
 Device meshes, sharding and placement live in :mod:`centroid.distribution`.
 """
@@ -101,21 +114,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="k-means runs for ⌈N_c·oversample⌉ then prunes via "
                         "pivoted Cholesky (default 1.5). Set to 1.0 to "
                         "disable pivoted-Cholesky pruning.")
-    p.add_argument("--candidate-pool", choices=("kmeans", "full_grid"),
-                   default="kmeans",
-                   help="WHERE the pivoted-Cholesky select picks from. "
-                        "'kmeans' (default) prunes an over-sampled seeded "
-                        "k-means draw — the historical path, and a lottery: "
-                        "the seed alone moves Si Sigma_x by tens of meV, "
-                        "which is why the standing recipe is best-of-five "
-                        "draws. 'full_grid' is the DETERMINISTIC selector: "
+    p.add_argument("--centroid-selector",
+                   choices=("kmeans", "pivoted_full_grid"), default="kmeans",
+                   help="WHICH selector chooses the interpolation points, and "
+                        "the one name that reaches the whole recipe. 'kmeans' "
+                        "(DEFAULT, unchanged behaviour) prunes an "
+                        "over-sampled seeded k-means draw — a lottery: the "
+                        "seed alone moves Si Sigma_x by tens of meV, which is "
+                        "why the standing recipe is best-of-five draws. "
+                        "'pivoted_full_grid' is the DETERMINISTIC selector: "
                         "the candidate pool is every point of the real-space "
-                        "FFT grid, in C-order, and the greedy pivot picks the "
-                        "interpolation points out of it directly. No RNG "
-                        "anywhere — same points every run — and --seed, "
+                        "FFT grid, in C-order, and the greedy pivoted "
+                        "Cholesky on the pair-density Gram picks the points "
+                        "out of it directly, in orbit-block order. No RNG "
+                        "anywhere — the same points every run — so --seed, "
                         "--oversample, --rho-power and the k-means weight are "
-                        "all inert. Costs an O(M^2) Gram on M = the whole "
-                        "grid instead of on 1.5*N_mu points.")
+                        "all inert, and the choice is stamped into the output "
+                        "file as centroid_source. IT IS THE BACKUP, NOT THE "
+                        "DEFAULT: the Gram is O(N_grid^2), which is 3 GB at "
+                        "24^3 and ~200 GB at 48^3, so it is affordable only "
+                        "on small, high-symmetry cells at modest cutoff. See "
+                        "docs/drivers.md.")
     p.add_argument("--score-centroid-file", action="append", default=None,
                    metavar="FILE",
                    help="Also report the independent-direction count of an "
@@ -125,13 +144,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "one instrument — the rank floor is tol*max(diag G) "
                         "and two candidate pools have different diagonal "
                         "maxima — so comparing two generators' logs compares "
-                        "their instruments too. A --candidate-pool full_grid "
+                        "their instruments too. A --centroid-selector "
+                        "pivoted_full_grid "
                         "run contains every other set on that grid and can "
                         "score them all. Points not in this run's candidate "
                         "pool are reported, not silently dropped.")
     p.add_argument("--pivot-granularity",
                    choices=("orbit", "point", "orbit_block"),
-                   default="orbit",
+                   default=None,
                    help="WHAT the greedy pivots on. 'orbit' (default, the "
                         "historical behaviour) takes one pivot per orbit and "
                         "removes the whole orbit from contention — it "
@@ -148,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "draw at the same N spans 1084-1246, because the "
                         "largest residual diagonals sit on special-position "
                         "orbits, which are the most redundant ones. "
+                        "DEFAULTS by selector: 'orbit' under "
+                        "--centroid-selector kmeans (unchanged behaviour) and "
+                        "'orbit_block' under pivoted_full_grid, which is the "
+                        "combination that was measured. "
                         "'orbit_block' is the one that maximises the "
                         "DELIVERED set's rank: it walks orbits in residual "
                         "order but deflates every member of an orbit "
@@ -160,8 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "'point' — instead of deriving it from N_c and the "
                         "pool size. Orbit closure quantises the delivered "
                         "point count (up to 48 points per orbit on Si), so "
-                        "this is the knob that lands a --candidate-pool "
-                        "full_grid run on the same delivered N as the arm it "
+                        "this is the knob that lands a --centroid-selector "
+                        "pivoted_full_grid run on the same delivered N as the arm it "
                         "is being compared against. The select is greedy and "
                         "therefore NESTED, so the '[pivot ladder]' line of "
                         "any one run gives the delivered N for every value "
@@ -479,7 +503,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
     # Σ orbit_size over the picked orbits (≈ N_c by construction).
-    _pg = getattr(args, "pivot_granularity", "orbit")
+    _pg = getattr(args, "pivot_granularity", None) or "orbit"
     point_pivots = (_pg == "point" and orbit_id is not None)
     orbit_block = (_pg == "orbit_block" and orbit_id is not None)
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
@@ -555,7 +579,23 @@ def main():
     timing.reset()
 
     N_c = int(args.N_c)
-    deterministic = (args.candidate_pool == "full_grid")
+    deterministic = (args.centroid_selector == "pivoted_full_grid")
+    # ONE NAME REACHES THE WHOLE RECIPE.  ``--centroid-selector`` is the knob
+    # a user is expected to set; the pivot granularity is an internal of each
+    # selector and defaults to the combination that selector was MEASURED in
+    # — 'orbit' for k-means (unchanged behaviour, every existing deck) and
+    # 'orbit_block' for the whole-grid pivot, where one-pivot-per-orbit was
+    # measured at 801 independent directions against orbit-block's 1282.
+    # Setting it explicitly still wins, and is announced so a run that took
+    # an untested combination says so in its own log.
+    if args.pivot_granularity is None:
+        args.pivot_granularity = "orbit_block" if deterministic else "orbit"
+    elif deterministic and args.pivot_granularity != "orbit_block":
+        print(f"--pivot-granularity {args.pivot_granularity} overrides the "
+              f"whole-grid selector's measured default 'orbit_block'.  The "
+              f"other granularities were MEASURED WORSE on this route "
+              f"(BGW_CD_COMPARISON_DESIGN 7.7.12): 'orbit' delivers 801 "
+              f"independent directions and 'point' 1105, against 1282.")
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
     if deterministic:
@@ -624,7 +664,7 @@ def main():
         # Lloyd on this path.  What the mesh has to carry here is an O(M²)
         # Gram over the whole grid, which is the opposite regime, so the
         # floor is simply the wrong test and is not consulted.
-        print("--candidate-pool full_grid: sharding is forced (the k-means "
+        print("--centroid-selector pivoted_full_grid: sharding is forced (the k-means "
               "latency floor does not apply — this path's work is the O(M²) "
               "Gram, not a Lloyd step).")
     mesh = dist.build_mesh(int(np.prod(fft_grid)),
@@ -786,8 +826,10 @@ def main():
     # this, and did a seed decide it" has to be readable off the file rather
     # than reconstructed from a log that may not have been kept.  ``#`` is a
     # comment to ``np.loadtxt``, so this costs nothing downstream.
-    centroid_source = ("pivoted_cholesky_full_grid" if deterministic
-                       else "kmeans_pivoted_cholesky")
+    # ONE table for the stamp, shared with the reader that asserts it
+    # (``file_io.centroids``), so writer and deck key cannot drift apart.
+    from file_io.centroids import CENTROID_SOURCE_STAMPS
+    centroid_source = CENTROID_SOURCE_STAMPS[args.centroid_selector]
     header = (
         f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)\n"
         f"centroid_source: {centroid_source}\n"
