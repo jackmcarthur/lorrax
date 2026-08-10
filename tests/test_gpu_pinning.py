@@ -403,6 +403,22 @@ def test_the_child_env_widens_only_the_child():
     assert "JAX_PLATFORMS" not in env and "XLA_FLAGS" not in env
 
 
+def test_the_child_refuses_the_flat_k_fft_instead_of_aborting_on_it():
+    """MEASURED by the perf fleet, 2026-08-10: an IN-PROCESS multi-device mesh
+    cannot execute the flat-k cuFFT handler.  Every in-process 2x2 dies
+    CUFFT_EXEC_FAILED at every size, as an UNCATCHABLE SIGABRT, while the
+    production multi-process legs are fine.
+
+    The child is exactly an in-process multi-device mesh, so a cell that
+    wandered into `make_flat_k_*` would take the child down and every verdict
+    in it with it, attributable to nothing.  `LORRAX_FFT_FFI=0` refuses by
+    design (the XLA flat-k twin was deleted by the 2026-08-01 ruling), and a
+    refusal names the cell that caused it.  A gate that genuinely needs the
+    flat-k FFT at P=n is MULTI-PROCESS and belongs in tests/multi_device/."""
+    env = harness.mesh_subprocess_env({}, ["0", "1", "2", "3"])
+    assert env["LORRAX_FFT_FFI"] == "0"
+
+
 def test_a_caller_who_asked_for_a_platform_still_gets_it():
     """The snapshot is of the CALLER's environment, not a blanket erase: an
     explicit `JAX_PLATFORMS=cpu` on the command line is a choice, and the

@@ -261,6 +261,19 @@ import pytest
 # and runs under the `platform` allocator, because under `lx test` four
 # pinned workers are already computing on those same cards.
 #
+# WHAT THIS MARKER IS NOT.  `mesh(n)` is an n-device SINGLE-PROCESS mesh, and
+# that is a strictly weaker thing than the production P=n geometry (n
+# processes, one device each).  The difference is not academic: the perf fleet
+# measured on 2026-08-10 that an in-process multi-device mesh CANNOT execute
+# the flat-k cuFFT handler — every in-process 2x2 dies CUFFT_EXEC_FAILED, at
+# every size, as an uncatchable SIGABRT — while the multi-process legs are
+# fine.  So the child refuses that path outright (`LORRAX_FFT_FFI=0`, see
+# harness.mesh_subprocess_env) rather than letting a stray call take the whole
+# child down and every verdict in it with it.  A gate that needs the flat-k
+# FFT at P=n is a MULTI-PROCESS gate: it belongs in tests/multi_device/, which
+# is what that directory is for, and this marker must not be used to pretend
+# otherwise.
+#
 # THE DECISION IS A PURE FUNCTION (`harness.mesh_plan`), same doctrine as the
 # pin: a side effect in a conftest that nothing can construct a case for is
 # unfalsifiable.  `tests/test_gpu_pinning.py` holds its cases.
@@ -339,12 +352,23 @@ def _mesh_verdict(item, want: int, devices):
         try:
             cache[module] = harness.junit_outcomes(xml, module)
         except Exception as exc:                               # noqa: BLE001
-            cache[module] = {}
-            cache[module]["__launch__"] = (
+            # A child that died before writing junit takes EVERY verdict in it
+            # with it, so the failure has to carry the child's own output and
+            # name the one way this is known to happen: an in-process
+            # multi-device mesh reaching the flat-k cuFFT handler, which is an
+            # uncatchable SIGABRT (perf fleet, 2026-08-10).  The child already
+            # refuses that path (harness.mesh_subprocess_env); a negative
+            # return code here means something else killed it.
+            cache[module] = {"__launch__": (
                 "failed",
                 f"the mesh child produced no readable junit ({exc}).\n"
-                f"rc={res.returncode}\n--- stdout ---\n{res.stdout[-4000:]}\n"
-                f"--- stderr ---\n{res.stderr[-4000:]}")
+                f"rc={res.returncode}"
+                + ("  (killed by signal — an in-process multi-device mesh that "
+                   "reaches the flat-k FFT aborts uncatchably; such a gate is "
+                   "MULTI-PROCESS and belongs in tests/multi_device/)"
+                   if res.returncode < 0 else "")
+                + f"\n--- stdout ---\n{res.stdout[-4000:]}\n"
+                f"--- stderr ---\n{res.stderr[-4000:]}")}
     verdicts = cache[module]
     if "__launch__" in verdicts:
         return verdicts["__launch__"]

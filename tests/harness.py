@@ -371,6 +371,20 @@ def mesh_subprocess_env(base_env: dict, devices, caller_jax_env=None) -> dict:
     env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     env[MESH_CELL_ENV] = "1"
     env["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # THE FLAT-K FFT FFI IS REFUSED IN THE CHILD, not left to abort.
+    # MEASURED by the perf fleet, 2026-08-10: an IN-PROCESS multi-device mesh
+    # cannot execute the flat-k cuFFT handler — every in-process 2x2 dies
+    # CUFFT_EXEC_FAILED at every size, and it is an uncatchable SIGABRT, while
+    # the production multi-PROCESS legs (one process per device) are fine.  A
+    # child is exactly an in-process multi-device mesh, so a cell that wandered
+    # into `make_flat_k_*` would take the whole child down and every verdict in
+    # it with it, attributable to nothing.  `LORRAX_FFT_FFI=0` REFUSES (the XLA
+    # flat-k twin was deleted by the 2026-08-01 ruling, so there is nothing to
+    # fall back to) — and a refusal names the cell that caused it, which an
+    # abort cannot.  A gate that genuinely needs the flat-k FFT at P=n is a
+    # MULTI-PROCESS gate and belongs in tests/multi_device/, not behind this
+    # marker.
+    env["LORRAX_FFT_FFI"] = "0"
     for name in JAX_SHAPE_VARS:
         value = (caller_jax_env or {}).get(name)
         if value is None:
