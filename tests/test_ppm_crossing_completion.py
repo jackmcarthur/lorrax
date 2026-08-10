@@ -356,9 +356,15 @@ def test_kstar_relation_is_green_at_trim_for_BOTH_forms():
 #  The placement: the adjoint is NOT a per-shard operation.
 # ---------------------------------------------------------------------------
 
-pytest_sharded = pytest.mark.skipif(
-    jax.device_count() < 4,
-    reason="needs >=4 devices: XLA_FLAGS=--xla_force_host_platform_device_count=4")
+#: FOUR DEVICES, and the suite is now able to supply them.  This was a
+#: ``skipif(jax.device_count() < 4)``, which SKIPPED in every suite run
+#: whatever the node had: tests/conftest.py pins each test process to one
+#: GPU, so ``device_count()`` is 1 by construction and the placement half of
+#: this file was never exercised except by hand.  The marker states the
+#: requirement and lets the conftest satisfy it (real GPUs on a >=4-GPU
+#: node, emulated devices when the caller supplied them, skip only when the
+#: hardware is genuinely absent).
+pytest_sharded = pytest.mark.mesh(4)
 
 
 class _RecordingSink:

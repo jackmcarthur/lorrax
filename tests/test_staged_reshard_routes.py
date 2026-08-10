@@ -37,9 +37,12 @@ from common.staged_reshard import (
     face_to_batch_reshard_supported,
 )
 
-pytestmark = pytest.mark.skipif(
-    jax.device_count() < 4,
-    reason="needs >=4 devices: XLA_FLAGS=--xla_force_host_platform_device_count=4")
+# FOUR DEVICES.  Was a ``skipif(jax.device_count() < 4)``, which skipped in
+# every suite run regardless of the node — tests/conftest.py pins each test
+# process to one GPU, so ``device_count()`` is 1 by construction.  The marker
+# states the requirement and the conftest supplies it; see the mesh section
+# there.
+pytestmark = pytest.mark.mesh(4)
 
 FACE = P(None, 'x', 'y')
 BATCH = P(('x', 'y'), None, None)

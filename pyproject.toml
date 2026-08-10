@@ -130,6 +130,7 @@ markers = [
     "census: the periodic FULL accounting — applied automatically by tests/conftest.py to every cell that is not `extra`, so `-m census` collects exactly what a bare `pytest` collected before the 2026-08-09 default-gate split",
     "regression: end-to-end physics regression tests with reference files",
     "gpu: tests that require a CUDA-capable JAX backend",
+    "mesh(n): needs an n-device mesh (default 4).  tests/conftest.py runs the cell on the session's real devices — in a child process when this one is pinned to a single GPU — and skips only when the node genuinely has fewer than n.  Replaces `skipif(jax.device_count() < 4)`, which skipped in EVERY suite run because the pin makes device_count() 1",
     "extra: staged/tooling suites deselected by default (run with -m extra)",
     "services: a standalone service's own suite, staged into this one",
     "distrib_la: the distrib_la service suite (services/distrib_la/tests)",

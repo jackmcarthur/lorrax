@@ -1034,6 +1034,7 @@ if __name__ == "__main__":
     raise SystemExit(_main())
 
 
+@pytest.mark.mesh(4)
 def test_check_hermitian_sharded_no_full_gather():
     """The hermiticity gate must never materialise a replicated (n, n) tile.
 
@@ -1048,9 +1049,10 @@ def test_check_hermitian_sharded_no_full_gather():
     the optimized HLO carries no all-gather with the full (n, n) extent —
     the same predicate wk_AN/colltable.py applies to production dumps.
     """
-    if len(jax.devices()) < 4:
-        import pytest
-        pytest.skip("needs 4 (emulated) devices")
+    # The device requirement is the ``mesh(4)`` marker now.  The inline
+    # ``skip`` it replaces fired in every suite run — the conftest pin makes
+    # ``len(jax.devices())`` 1 in every test process — so this gate has never
+    # once run under `lx test`.
     mesh = _mesh(2, 2)
     n = 64
     sh = NamedSharding(mesh, P("x", "y"))

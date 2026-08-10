@@ -301,6 +301,99 @@ def test_the_probe_is_not_consulted_when_the_env_already_says():
 
 
 # ---------------------------------------------------------------------------
+#  …and what the pin costs: the cells that need a MESH  (2026-08-10)
+# ---------------------------------------------------------------------------
+# The pin's price was a whole class of cell that could not run under the
+# suite at all: pinned to one GPU, `jax.device_count()` is 1, and every
+# `skipif(device_count() < 4)` fired on every node however many GPUs it had.
+# `harness.mesh_plan` is where that is now decided, and these are its cases.
+# The decision is a pure function for the same reason `pin_one_gpu` is: its
+# caller is a side effect in a conftest, which nothing can construct a case
+# for.
+
+def test_a_pinned_worker_on_a_four_gpu_node_gets_a_child_not_a_skip():
+    """THE MEASURED GAP.  One device here, four on the node: the old spelling
+    skipped, and the suite reported green with the cell never run."""
+    assert harness.mesh_plan(4, 1, ["0", "1", "2", "3"]) == (
+        "subprocess", ["0", "1", "2", "3"])
+
+
+def test_a_process_that_already_has_the_mesh_runs_the_cell_itself():
+    """The direct invocation — `XLA_FLAGS=--xla_force_host_platform_device_
+    count=4 pytest ...` — must keep behaving exactly as it does today, and
+    so must the child, which is the same case seen from inside."""
+    assert harness.mesh_plan(4, 4, ["0", "1", "2", "3"]) == ("here", None)
+    assert harness.mesh_plan(4, 4, []) == ("here", None)
+    assert harness.mesh_plan(2, 8, []) == ("here", None)
+
+
+def test_a_node_without_the_devices_still_skips_and_says_so():
+    """A laptop, the WSL box, a one-GPU leg.  Skipping is the honest verdict
+    there; the reason has to name both counts, or the next reader cannot tell
+    "no hardware" from "the pin ate it"."""
+    verb, why = harness.mesh_plan(4, 1, ["0"])
+    assert verb == "skip"
+    assert "has 1" in why and "session has 1" in why
+
+
+def test_the_child_never_starts_another_child_and_never_skips():
+    """Bounds the recursion, and refuses the one outcome that would rebuild
+    the defect: a child that did not get its devices reporting a SKIP would
+    put the cell back in the silently-unexercised set, this time with a
+    mechanism that looks like it works."""
+    verb, why = harness.mesh_plan(4, 1, ["0", "1", "2", "3"], inner=True)
+    assert verb == "fail"
+    assert "not a skip" in why
+
+
+def test_the_child_env_widens_only_the_child():
+    """The parent's pin is not touched — the child gets its own environment —
+    and the three edits that make a fifth process safe on a busy node are
+    all present."""
+    base = {"CUDA_VISIBLE_DEVICES": "2", "PYTEST_XDIST_WORKER": "gw2",
+            "JAX_ENABLE_X64": "1"}
+    env = harness.mesh_subprocess_env(base, ["0", "1", "2", "3"])
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert base["CUDA_VISIBLE_DEVICES"] == "2"          # caller untouched
+    assert env[harness.MESH_CELL_ENV] == "1"
+    assert env["XLA_PYTHON_CLIENT_ALLOCATOR"] == "platform"
+    assert "PYTEST_XDIST_WORKER" not in env
+    assert env["JAX_ENABLE_X64"] == "1"
+
+
+def test_the_session_device_list_is_read_before_the_pin_narrows_it():
+    """`session_devices` is the same reading `pin_one_gpu` starts from, kept
+    whole.  After the pin there is nothing left to ask."""
+    assert harness.session_devices("0,1,2,3") == ["0", "1", "2", "3"]
+    assert harness.session_devices(None, probe=_probe(4)) == [
+        "0", "1", "2", "3"]
+    assert harness.session_devices("") == []
+
+
+def test_junit_outcomes_reads_the_childs_verdicts_by_nodeid(tmp_path):
+    """The child reports through pytest's own junit-xml, so there is no
+    protocol of ours to drift.  xunit2 drops the `file` attribute, so the
+    nodeid is rebuilt from the module we asked for — parametrised names and
+    class nesting included."""
+    xml = tmp_path / "m.xml"
+    xml.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite name="pytest">'
+        '<testcase classname="tests.test_x" name="test_a"/>'
+        '<testcase classname="tests.test_x" name="test_b[2-3]">'
+        '<failure message="boom">tb</failure></testcase>'
+        '<testcase classname="tests.test_x" name="test_c">'
+        '<skipped message="no deck"/></testcase>'
+        '<testcase classname="tests.test_x.TestK" name="test_d"/>'
+        '</testsuite></testsuites>')
+    got = harness.junit_outcomes(xml, "tests/test_x.py")
+    assert got["tests/test_x.py::test_a"][0] == "passed"
+    assert got["tests/test_x.py::test_b[2-3]"][0] == "failed"
+    assert "boom" in got["tests/test_x.py::test_b[2-3]"][1]
+    assert got["tests/test_x.py::test_c"] == ("skipped", "no deck")
+    assert got["tests/test_x.py::TestK::test_d"][0] == "passed"
+
+
+# ---------------------------------------------------------------------------
 #  …and the OTHER thing that decides whether SLATE can see the device
 # ---------------------------------------------------------------------------
 # One visible GPU is necessary and not sufficient.  ``liblorrax_ffi.so`` and

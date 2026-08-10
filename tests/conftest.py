@@ -112,7 +112,22 @@ def pytest_configure(config):
     ``config.option.dist`` is ``"no"`` for a plain run and for ``-n 0``,
     and ``PYTEST_XDIST_WORKER`` is set in every worker's environment — so
     the two together separate the three cases the pin has to tell apart.
+
+    THE SESSION'S DEVICE LIST IS READ FIRST, before the pin narrows it, and
+    carried in the environment for the mesh runner at the bottom of this
+    file.  After the pin there is no way left to ask how many GPUs the node
+    had, which is why a ``mesh`` cell could never find four.
     """
+    os.environ.setdefault(
+        harness.SESSION_DEVICES_ENV,
+        ",".join(harness.session_devices(
+            os.environ.get("CUDA_VISIBLE_DEVICES"))))
+
+    # The mesh subprocess IS the widened process.  Pinning it would undo the
+    # only thing it was started to do.
+    if os.environ.get(harness.MESH_CELL_ENV):
+        return
+
     pinned = harness.pin_one_gpu(
         os.environ.get("CUDA_VISIBLE_DEVICES"),
         os.environ.get("PYTEST_XDIST_WORKER", ""),
@@ -121,6 +136,16 @@ def pytest_configure(config):
             getattr(config.option, "dist", "no")))
     if pinned is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = pinned
+
+    # ``loadgroup`` so the ``xdist_group`` the mesh marker adds below is
+    # honoured: every mesh cell then lands on ONE worker, which runs ONE
+    # subprocess per module instead of up to four workers each running
+    # their own.  For a cell with no group loadgroup IS load — xdist's
+    # LoadGroupScheduling subclasses LoadScheduling and differs only in
+    # where grouped items go — so this changes the schedule of nothing
+    # else.  Only reached when xdist is already active (``dist != "no"``).
+    if getattr(config.option, "dist", "no") == "load":
+        config.option.dist = "loadgroup"
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +214,172 @@ def pytest_collection_finish(session):
 from types import SimpleNamespace as _NS
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# `@pytest.mark.mesh(n)` — THE CELLS THE PIN ABOVE USED TO SILENCE  (2026-08-10)
+# ---------------------------------------------------------------------------
+# THE GAP, measured by the perf fleet: a cell that needs a >=4-device mesh
+# CANNOT RUN UNDER THE SUITE.  The pin gives every test process exactly one
+# GPU, `jax.device_count()` is therefore 1 in every worker, and the
+# `skipif(jax.device_count() < 4)` those cells carried made them SKIP —
+# silently, in every census, on every node, no matter how many GPUs the node
+# had.  They passed only when someone invoked the file directly with
+# `XLA_FLAGS=--xla_force_host_platform_device_count=4`.  So the suite could
+# not exercise the four-GPU rule (AGENT_PREAMBLE) even in principle, and a
+# per-shard defect is exactly the class of bug that rule exists to catch.
+#
+# WHY THE FIX IS A PROCESS AND NOT A FIXTURE.  `CUDA_VISIBLE_DEVICES` is read
+# ONCE, when the backend is built, and collection imports jax long before any
+# fixture runs.  There is no moment in this process that is both after the
+# markers are known and before the device list is latched.  A per-cell device
+# count is therefore a per-PROCESS fact, and the honest per-cell handle on it
+# is a process: a `mesh(n)` cell that finds itself pinned below `n` runs in a
+# CHILD that gets the session's full device list, and reports that child's
+# verdict as its own.  Nothing widens in this process, so all four reasons the
+# pin exists — xdist fan-out, the 1-GPU-frozen references, SLATE's refusal
+# above one visible device, and the controller exclusion — are untouched.
+#
+# The subprocess is not a new idiom here: a dozen test modules in this tree
+# already re-launch themselves to get a device count (test_contract_bands,
+# test_zeta_mesh_invariance, test_downfold, ...).  What is new is that the
+# MARKER, not each module, decides — so the suite can be asked which cells
+# want a mesh, and it can be measured that they ran.
+#
+# ONE CHILD PER MODULE, not per cell: a GPU backend costs seconds to build
+# and these modules carry ~40 cells.  Per-cell verdicts survive through
+# junit-xml, keyed by nodeid.  The child is serialised node-wide with a lock
+# and runs under the `platform` allocator, because under `lx test` four
+# pinned workers are already computing on those same cards.
+#
+# THE DECISION IS A PURE FUNCTION (`harness.mesh_plan`), same doctrine as the
+# pin: a side effect in a conftest that nothing can construct a case for is
+# unfalsifiable.  `tests/test_gpu_pinning.py` holds its cases.
+# ---------------------------------------------------------------------------
+
+#: Per-module verdicts brought back from a mesh child, keyed module -> {nodeid:
+#: (outcome, detail)}.  Cached because every cell of a module shares one child.
+_MESH_VERDICTS = pytest.StashKey[dict]()
+
+
+def _mesh_want(item):
+    """The device count this item's ``mesh`` marker asks for, or ``None``."""
+    marker = item.get_closest_marker("mesh")
+    if marker is None:
+        return None
+    return int(marker.args[0]) if marker.args else 4
+
+
+def _device_count_now() -> int:
+    """How many devices THIS process actually has.
+
+    ``jax.device_count()`` and not ``len(CUDA_VISIBLE_DEVICES)``, because a
+    direct invocation with ``--xla_force_host_platform_device_count=4`` has
+    four devices and no GPUs at all, and that leg must keep working exactly
+    as it does today.
+    """
+    try:
+        import jax
+
+        return int(jax.device_count())
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def _mesh_plan_for(item, want: int):
+    return harness.mesh_plan(
+        want, _device_count_now(),
+        [d for d in os.environ.get(harness.SESSION_DEVICES_ENV, "").split(",")
+         if d],
+        inner=bool(os.environ.get(harness.MESH_CELL_ENV)))
+
+
+def _mesh_verdict(item, want: int, devices):
+    """This cell's outcome, running its module's mesh cells if needed."""
+    module = item.nodeid.split("::", 1)[0]
+    cache = item.config.stash.setdefault(_MESH_VERDICTS, {})
+    if module not in cache:
+        group = sorted({
+            it.nodeid for it in item.session.items
+            if it.nodeid.split("::", 1)[0] == module
+            and _mesh_want(it) is not None})
+        res, xml = harness.run_mesh_group(
+            group, devices, cwd=str(item.config.rootpath),
+            out_dir=_Path(os.environ.get("TMPDIR", "/tmp"))
+            / ("lorrax-mesh-%d" % os.getpid()))
+        try:
+            cache[module] = harness.junit_outcomes(xml, module)
+        except Exception as exc:                               # noqa: BLE001
+            cache[module] = {}
+            cache[module]["__launch__"] = (
+                "failed",
+                f"the mesh child produced no readable junit ({exc}).\n"
+                f"rc={res.returncode}\n--- stdout ---\n{res.stdout[-4000:]}\n"
+                f"--- stderr ---\n{res.stderr[-4000:]}")
+    verdicts = cache[module]
+    if "__launch__" in verdicts:
+        return verdicts["__launch__"]
+    return verdicts.get(
+        item.nodeid,
+        ("failed", "the mesh child reported no verdict for this cell — it "
+                   "was not collected there.  A cell that cannot be named to "
+                   "the child is a cell the suite is not running."))
+
+
+def pytest_runtest_setup(item):
+    """Skip (or refuse) a ``mesh`` cell before its fixtures are built."""
+    want = _mesh_want(item)
+    if want is None:
+        return
+    verb, payload = _mesh_plan_for(item, want)
+    if verb == "skip":
+        pytest.skip(payload)
+    if verb == "fail":
+        pytest.fail(payload, pytrace=False)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Run a pinned-process ``mesh`` cell in the child that has the devices.
+
+    ``pytest_pyfunc_call`` is pytest's own "replace the call" hook, so the
+    cell keeps its normal setup/teardown and its normal report line; only
+    the body runs elsewhere.  A ``mesh`` cell is therefore expected to be
+    self-contained — it must not lean on a session fixture, since the
+    fixture would be built in THIS process and consumed in the other one.
+    """
+    want = _mesh_want(pyfuncitem)
+    if want is None:
+        return None
+    verb, payload = _mesh_plan_for(pyfuncitem, want)
+    if verb != "subprocess":
+        return None                       # already on a mesh: run right here
+    outcome, detail = _mesh_verdict(pyfuncitem, want, payload)
+    pyfuncitem.user_properties.append(("mesh_devices", ",".join(payload)))
+    if outcome == "skipped":
+        pytest.skip(f"[mesh({want}) child] {detail}")
+    if outcome != "passed":
+        pytest.fail(
+            f"[mesh({want}) child, CUDA_VISIBLE_DEVICES={','.join(payload)}] "
+            f"{detail}", pytrace=False)
+    return True
+
+
+def _group_mesh_items(config, items):
+    """Put every ``mesh`` cell in one xdist group, so one worker owns them.
+
+    Without this the cells scatter across workers and each worker starts
+    its own child for the same module.  ``pytest_configure`` above asks for
+    ``loadgroup`` when xdist is active, which is where the group takes
+    effect; applied only when xdist is installed, because ``xdist_group``
+    is xdist's marker and stamping it without xdist is just a warning on
+    every mesh cell of every laptop run.
+    """
+    if not config.pluginmanager.hasplugin("xdist"):
+        return
+    for item in items:
+        if item.get_closest_marker("mesh") is not None:
+            item.add_marker(pytest.mark.xdist_group("lorrax-mesh"))
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +635,7 @@ def _apply_default_gate(config, items):
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     _stamp_census(items)
+    _group_mesh_items(config, items)
     _apply_default_gate(config, items)
 
     only = (config.getoption("--only-service") or "").strip()
