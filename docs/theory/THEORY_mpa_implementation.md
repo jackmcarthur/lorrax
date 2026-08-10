@@ -1,5 +1,9 @@
 # The MPA compute mode: what exists, what refuses, what lands next
 
+> **This page predates the working method and is kept for the compute-mode
+> reasoning only. For what MPA is and how the landed code works, read
+> [the method guide](../mpa_method_guide.md).**
+
 This is the page the driver points at when you set `compute_mode = mpa` and
 it stops. It exists so that the refusal is a pointer to an explanation
 rather than a dead end.

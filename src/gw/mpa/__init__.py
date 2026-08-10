@@ -1,5 +1,9 @@
 """Multipole-W (MPA) staging area — the fit kernel, the schedule, the driver.
 
+READ ``docs/mpa_method_guide.md`` FIRST.  It is the current, lecture-style
+account of the method — the model, the sampling, the fit, the head, the
+integration and the gates — and it names the defect behind each of them.
+
 STAGING LOCATION, SAID ONCE AT THE PACKAGE LEVEL SO EVERY MODULE
 INHERITS IT.  ``gw/mpa/`` and ``file_io/mpa_store.py`` are the two
 halves of the multipole-W infrastructure landed ahead of the
