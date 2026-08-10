@@ -13,6 +13,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
+from common.band_degeneracy import (DEGENERACY_TOL_RY, check_band_window,
+                                    resolve_band_window)
 from common.collectives import gather_to_host
 from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 
@@ -1465,6 +1467,8 @@ def load_bse_data_from_restart_sharded(
     inject_head: bool = True,
     load_v_full: bool = False,
     bse_k_grid=None,
+    degeneracy_mode: str = "snap",
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
 
@@ -1579,6 +1583,15 @@ def load_bse_data_from_restart_sharded(
                 f"No valence ({n_val_available}) or conduction ({n_cond_available}) bands "
                 f"resolved (n_occ={n_occ}, total={nb_total})."
             )
+        # THE degeneracy choke point.  Every BSE driver reaches its band
+        # window through this function, so the multiplet guard sits here —
+        # before the index arrays exist, and therefore before the ψ hyperslab
+        # read is sized.  A snap here resizes the read, which is what makes it
+        # free; a guard placed after the read could only complain.
+        n_val, n_cond = resolve_band_window(
+            enk_full, n_occ, n_val, n_cond,
+            tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+            where="load_bse_data_from_restart_sharded")
         val_indices = np.arange(n_occ - n_val, n_occ)
         cond_indices = np.arange(n_occ, n_occ + n_cond)
 
@@ -2078,6 +2091,8 @@ def apply_eqp_and_reslice_bands(
     n_occ: Optional[int],
     grid_x: int,
     grid_y: int,
+    degeneracy_mode: str = "snap",
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> tuple[jax.Array, jax.Array, int]:
     """Apply BGW ``eqp1.dat`` corrections and re-slice the BSE band window.
 
@@ -2098,6 +2113,18 @@ def apply_eqp_and_reslice_bands(
         enk_full_np = np.asarray(f["enk_full"][:])
     enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
     n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
+    # Degeneracy guard, REPORT-ONLY here by construction.  The loader already
+    # snapped the window on the DFT spectrum and ψ has been read at those
+    # shapes; this function only re-derives ENERGIES, so widening now would
+    # desynchronise eps from psi.  What is new at this seam is that the QP
+    # shifts can open or close a near-degeneracy the DFT spectrum did not
+    # have, and that is worth a warning even though it cannot be repaired
+    # without re-reading ψ with a wider window.
+    check_band_window(
+        enk_full_np, n_occ_eff - n_val, n_occ_eff + n_cond,
+        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+        where="apply_eqp_and_reslice_bands (QP-corrected spectrum; re-run "
+              "with a wider --n-val/--n-cond to repair)")
     val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
     cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
     eps_v = jnp.asarray(enk_full_np[:, val_idx])
@@ -2160,6 +2187,8 @@ def _load_ring_subset(
     eqp_file: Optional[str] = None,
     n_occ: Optional[int] = None,
     input_file: Optional[str] = None,
+    degeneracy_mode: str = "snap",
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load a single-device BSE subset from canonical gw_jax restart state.
 
@@ -2272,6 +2301,14 @@ def _load_ring_subset(
         print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
     n_val = min(n_val, n_val_available)
     n_cond = min(n_cond, n_cond_available)
+    # The 1-device escape from the sharded loader's choke point: same guard,
+    # same defaults, so the two routes cannot disagree about what window a
+    # given (n_val, n_cond) request means.  ``enk_full_np`` is the host copy
+    # that ``resolve_n_occ`` above already read (eqp-corrected when --eqp).
+    n_val, n_cond = resolve_band_window(
+        enk_full_np, n_occ, n_val, n_cond,
+        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+        where="_load_ring_subset")
     val_indices = jnp.arange(n_occ - n_val, n_occ)
     cond_indices = jnp.arange(n_occ, n_occ + n_cond)
 

@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 
 import common.timing as timing
+from common.band_degeneracy import DEGENERACY_TOL_RY, MODES
 
 from .bse_ring_comm import (
     build_bse_ring_matvec,
@@ -129,6 +130,8 @@ def _preview_lanczos(
     trlan_m_max: int | None = None,
     trlan_n_keep: int | None = None,
     tda: bool = True,
+    degeneracy_mode: str = "snap",
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> None:
     # ---- Stage timing --------------------------------------------------
     # This driver printed NO timing table at all, which is why the release
@@ -187,6 +190,8 @@ def _preview_lanczos(
             data = load_bse_data_from_restart_sharded(
                 restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
                 input_file=input_file, n_occ=n_occ,
+                degeneracy_mode=degeneracy_mode,
+                degeneracy_tol_ry=degeneracy_tol_ry,
             )
             # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
             data["matvec_kind"] = matvec_kind
@@ -199,7 +204,9 @@ def _preview_lanczos(
                 from .bse_io import apply_eqp_and_reslice_bands
                 data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
                     restart_file, eqp_file, input_file,
-                    int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x, grid_y)
+                    int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
+                    grid_y, degeneracy_mode=degeneracy_mode,
+                    degeneracy_tol_ry=degeneracy_tol_ry)
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
         nk = nkx * nky * nkz
         nc_pad = int(data["n_cond_pad"])
@@ -260,6 +267,8 @@ def _preview_lanczos(
                 eqp_file=eqp_file,
                 n_occ=n_occ,
                 input_file=input_file,
+                degeneracy_mode=degeneracy_mode,
+                degeneracy_tol_ry=degeneracy_tol_ry,
             )
         psi_c = payload["psi_c"]
         psi_v = payload["psi_v"]
@@ -325,6 +334,16 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--input", help="COHSEX input file (for canonical isdf_tensors_*.h5 lookup)")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
+    parser.add_argument("--band-degeneracy", choices=MODES, default="snap",
+                        help="what to do when --n-val/--n-cond cut a "
+                             "degenerate multiplet: 'snap' (default) widens "
+                             "OUTWARD to the multiplet boundary and says so; "
+                             "'strict' errors; 'off' proceeds on the cut "
+                             "multiplet.  Same guard, same defaults as "
+                             "bse.exciton_bands.")
+    parser.add_argument("--degeneracy-tol-ry", type=float,
+                        default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
+                        help="'same multiplet' tolerance in Ry (default 1 meV)")
     parser.add_argument("--px", type=int, default=1)
     parser.add_argument("--py", type=int, default=1)
     parser.add_argument("--n-eig", type=int, default=5)
@@ -668,6 +687,8 @@ if __name__ == "__main__":
         davidson_eps_shift=args.davidson_eps_shift,
         trlan_m_max=args.trlan_m_max,
         trlan_n_keep=args.trlan_n_keep,
+        degeneracy_mode=args.band_degeneracy,
+        degeneracy_tol_ry=args.degeneracy_tol_ry,
         tda=use_tda,
     )
     raise SystemExit(0)

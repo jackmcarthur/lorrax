@@ -94,7 +94,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
 
-from solvers.lanczos import block_lanczos_eig_jit
+from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
+                             report_alpha_herm, split_alpha_sink)
+from common.band_degeneracy import (DEGENERACY_TOL_RY, MODES,
+                                    check_band_window)
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
@@ -163,7 +166,14 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     """One jitted ``solve_path`` for a whole Q list.
 
         solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R) -> evs (nQ, n_eig)
+                   psi_v_X, psi_v_Y, eps_v, W_R)
+            -> (evs (nQ, n_eig), alpha (per-Q α-Hermiticity scalars))
+
+    The second output is the α-Hermiticity report as DATA: it is what keeps
+    this program free of host callbacks and therefore persistable in JAX's
+    compilation cache.  Feed it to :func:`_report_alpha_over_path` together
+    with ``solve_path.alpha_labels`` (filled at trace time) to run the gate on
+    the host.  Nothing about the invariant changes — only where it is emitted.
 
     The scan body per Q: hoist the exchange pair amplitudes M_X/M_Y from
     the Q-shifted conduction ψ (audit-P3 contract — matvec args, computed
@@ -184,6 +194,9 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         # O(M·n·bs²) — negligible next to the matvec at every BSE size.
         n_reorth = max_iter
     matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
+    # Filled at TRACE time by the sink below (see the module note on the
+    # persistable-scan fix); the static half of the α-Hermiticity report.
+    alpha_labels: list = []
 
     @jax.jit
     def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
@@ -206,15 +219,57 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                 HX = HX.reshape(block_size, -1)
                 return HX
 
-            evs, _ = block_lanczos_eig_jit(
-                matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
-                max_iter=max_iter, n_reorth=n_reorth)
-            return carry, evs[:n_eig].real
+            # The α-Hermiticity report leaves the trace as DATA, not as a host
+            # callback.  jax._src.compiler._cache_write refuses to persist any
+            # module carrying a host callback, and this jit wraps a lax.scan
+            # over the whole Q path — the single most expensive compile in the
+            # driver.  Un-sunk, it was rebuilt on every warm run.  The sink is
+            # opened INSIDE the scan body because that is the trace the solver
+            # is traced in; the three scalars per Q ride out as scan ys.
+            with alpha_herm_sink() as _sink:
+                evs, _ = block_lanczos_eig_jit(
+                    matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
+                    max_iter=max_iter, n_reorth=n_reorth)
+            _labels, _payload = split_alpha_sink(_sink)
+            alpha_labels[:] = _labels
+            return carry, (evs[:n_eig].real, _payload)
 
-        _, evs_all = lax.scan(body, None, (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
-        return evs_all
+        _, (evs_all, alpha_all) = lax.scan(
+            body, None, (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
+        return evs_all, alpha_all
 
+    solve_path.alpha_labels = alpha_labels
     return solve_path
+
+
+def _report_alpha_over_path(labels, alpha_all, log=print):
+    """Run the α-Hermiticity gate on the per-Q scalars the scan returned.
+
+    ``alpha_all`` is the scan-stacked payload: one ``(dev, scale, worst)``
+    triple per label, each of shape ``(nQ,)``.  The gate's verdict is a
+    per-solve ratio ``dev/scale`` against ``ALPHA_HERM_RTOL``, so reporting the
+    Q that MAXIMISES that ratio reports the worst violator on the whole path —
+    a stricter statement than any single Q, in one line instead of nQ lines.
+    The Q index is named so a failure is locatable.
+
+    Returns True only if the worst Q on every label passes (and therefore, the
+    ratio being maximised, only if every Q passes).
+    """
+    if not labels:
+        return True
+    ok = True
+    for (name, form), (dev, scale, worst) in zip(labels, alpha_all):
+        dev = np.asarray(dev)
+        scale = np.asarray(scale)
+        worst = np.asarray(worst)
+        rel = dev / np.maximum(scale, np.finfo(dev.dtype).tiny)
+        iq = int(np.argmax(rel))
+        log(f"[alpha-herm] worst of {dev.size} Q is Q#{iq} "
+            f"(dev/scale = {rel[iq]:.3e})")
+        ok = report_alpha_herm(
+            ((name, f"{form}, worst of {dev.size} Q at Q#{iq}"),),
+            ((dev[iq], scale[iq], worst[iq]),)) and ok
+    return ok
 
 
 # ===========================================================================
@@ -467,6 +522,22 @@ def build_parser():
                     help="cohsex.in with a K_POINTS crystal_b Q-path block")
     ap.add_argument("--n-val", type=int, default=4)
     ap.add_argument("--n-cond", type=int, default=4)
+    ap.add_argument("--band-degeneracy", choices=MODES, default="snap",
+                    help="what to do when --n-val/--n-cond cut a degenerate "
+                         "multiplet (Kramers pair under SOC+TRS, any irrep "
+                         "of dimension > 1): 'snap' (default) widens the "
+                         "window OUTWARD to the multiplet boundary and says "
+                         "so loudly; 'strict' errors instead; 'off' proceeds "
+                         "on the cut multiplet.  Half a multiplet breaks the "
+                         "exciton multiplets by an amount with no "
+                         "convergence parameter (Si 12x12 SOC: eV-scale "
+                         "off-grid).")
+    ap.add_argument("--degeneracy-tol-ry", type=float,
+                    default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
+                    help=f"'same multiplet' tolerance in Ry (default "
+                         f"{DEGENERACY_TOL_RY:.4e} = 1 meV; the smallest "
+                         f"between-pair boundary gap measured on the Si "
+                         f"12x12 SOC deck was 5.9 meV)")
     ap.add_argument("--n-eig", type=int, default=6)
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=40,
@@ -658,7 +729,9 @@ def main(argv=None):
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
         mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
-        load_v_full=(args.vq_mode == "ongrid"))
+        load_v_full=(args.vq_mode == "ongrid"),
+        degeneracy_mode=args.band_degeneracy,
+        degeneracy_tol_ry=args.degeneracy_tol_ry)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -693,7 +766,9 @@ def main(argv=None):
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
         data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
             restart_file, args.eqp, None, n_val, n_cond, n_occ_in,
-            mesh_xy.devices.shape[0], mesh_xy.devices.shape[1])
+            mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
+            degeneracy_mode=args.band_degeneracy,
+            degeneracy_tol_ry=args.degeneracy_tol_ry)
         enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
@@ -785,6 +860,19 @@ def main(argv=None):
             f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
             f"fH window ({nb_window} bands): raise nband in {args.input} to "
             f">= {b_max}, or drop --n-cond to <= {nb_window - nval_in}")
+    # The htransform window is the SECOND place a band boundary is cut in this
+    # driver, and it is cut in a different index space (window-relative, not
+    # absolute), so the loader's snap does not automatically make it safe.
+    # ``enk_sigma`` is (nb, nk) in the SAME window-relative indexing as
+    # b_min/b_max, so the check is exact here.  Report-only: b_max is pinned to
+    # the already-resolved n_cond, and widening it here would desynchronise the
+    # conduction caches from the BSE window the loader sized.  The prose above
+    # has warned about exactly this failure since the Si root-cause; this makes
+    # it a measurement instead of a warning about a possibility.
+    check_band_window(
+        np.asarray(enk_sigma).T, b_min, b_max,
+        tol_ry=args.degeneracy_tol_ry, mode=args.band_degeneracy,
+        where="exciton_bands htransform conduction window", log=log)
     if n_guard < 4:
         log(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
             f"selection — a selection boundary near a Kramers pair can ring "
@@ -1009,8 +1097,9 @@ def main(argv=None):
         block_size=args.block_size, max_iter=args.max_iter)
     tick("w_r_and_build", t0)
     t_c0 = time.time()
-    evs_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                     data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)
+    evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+                                data["psi_v_X"], data["psi_v_Y"],
+                                data["eps_v"], W_R)
     # The block-Lanczos Ritz values come from a small replicated eigh(T) — the
     # scan output is fully addressable on every process, so the rank-0
     # ``device_get`` below reconstructs the whole (n_solve, n_eig) table
@@ -1018,6 +1107,11 @@ def main(argv=None):
     log(f"[dist] evs sharding={evs_dev.sharding}, "
         f"fully_addressable={evs_dev.is_fully_addressable}")
     evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry
+    # The α-Hermiticity invariant, replayed on the host from scalars the scan
+    # returned.  Same tolerance, same message, same LORRAX_SANITY=strict raise
+    # as the in-jit callback it replaces — see _report_alpha_over_path.
+    _report_alpha_over_path(solver.alpha_labels, jax.device_get(alpha_dev),
+                            log=log)
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
     if rerun_check_enabled(args):
@@ -1031,7 +1125,7 @@ def main(argv=None):
         t_w0 = time.time()
         evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R))
+                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)[0])
         t_warm = time.time() - t_w0
         tick("solve_scan_warm", t_w0)
         assert np.allclose(evs2, evs_all, atol=1e-10), \
