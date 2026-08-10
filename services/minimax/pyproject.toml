@@ -57,6 +57,23 @@ minimax = [
     "minimax_assets/crossing/*.npz",
     "minimax_assets/noncrossing/*.npz",
     "minimax_assets/complex_laplace/*.npz",
+    # THE WIDTH CLAUSE'S OWN PAYLOADS, AND THIS LINE WAS MISSING.  Found
+    # while adding the row below it, which is the same defect's second
+    # occurrence: `catalog_complex_laplace_width.json` is matched by the
+    # `*.json` glob above and has been shipping since the width sweep
+    # landed, but `complex_laplace_width/*.npz` was never declared, so
+    # every WHEEL built since then carries that catalog with none of its
+    # fifteen tables.  A source checkout cannot see it -- the files are
+    # on disk either way -- which is why it survived the campaign that
+    # wrote the `damped_line` warning three lines down.
+    "minimax_assets/complex_laplace_width/*.npz",
+    # The BINNED-WIDTH clause: the third sweep of the complex_laplace
+    # family, in its own subdir because a sweep is per clause.  The
+    # `damped_line` row below records what a MISSING glob costs -- a
+    # wheel that carries a catalog and not its payloads refuses with
+    # "TableUnreadable", which reads like a corrupt artifact rather
+    # than like a packaging bug -- so this line lands with the bytes.
+    "minimax_assets/complex_laplace_binned_width/*.npz",
     # `damped_line` arrives with the second family's catalog.  Its row
     # exists because `feat/damped-line-tables` found the FIRST one missing:
     # MANIFEST.in covers the sdist but package-data is what a WHEEL install

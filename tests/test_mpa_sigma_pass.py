@@ -88,7 +88,8 @@ def _integrate_group(group, omega_vec, *, E_A, mask_A, B):
 
 
 def _sigma_through_the_loop(*, omega_ry, E_cond, E_val, omega_p, b_p, xi_ry,
-                            edge_factor=1.5, order=None, rel_tol=1e-10):
+                            edge_factor=1.5, order=None, rel_tol=1e-10,
+                            binned_width_clause=None):
     """Run the real planner over the real branches, one pole per pass.
 
     ``omega_p`` / ``b_p`` are ``(n_p, n_modes)``; the pass loop walks the
@@ -114,7 +115,8 @@ def _sigma_through_the_loop(*, omega_ry, E_cond, E_val, omega_p, b_p, xi_ry,
             groups, _ = plan(
                 a=a, g=g, live=live, E_A=E_A, omega_abs=omega_abs,
                 space=space, neg=neg, xi_ry=xi_ry, edge_factor=edge_factor,
-                rel_tol=rel_tol)
+                rel_tol=rel_tol,
+                binned_width_clause=binned_width_clause)
             mask_A = np.ones(E_A.shape, dtype=bool)
             for grp in groups:
                 total[idx] += _integrate_group(
@@ -123,13 +125,14 @@ def _sigma_through_the_loop(*, omega_ry, E_cond, E_val, omega_p, b_p, xi_ry,
 
 
 def plan(*, a, g, live, E_A, omega_abs, space, neg, xi_ry, edge_factor,
-         rel_tol):
+         rel_tol, binned_width_clause=None):
     """``plan_branch_groups`` with the test's fixed quadrature knobs."""
     return SP.plan_branch_groups(
         a_ry=a, gamma_ry=g, live_mask=live, E_A_host=E_A,
         base_mask_A_host=np.ones(E_A.shape, dtype=bool),
         omega_nonneg_ry=omega_abs, space=space, neg_omega_half=neg,
         xi_ry=xi_ry, edge_factor=edge_factor, rel_tol=rel_tol,
+        binned_width_clause=binned_width_clause,
         target_error=1e-8, laplace_max_nodes=64, crossing_eps_q=1e-10,
         crossing_max_nodes=400, use_shipped_minimax_tables=True,
         log_tag="", print_fn=lambda *a, **k: None)

@@ -35,10 +35,25 @@ through it:
 
 Two orders of separation between them is not an error in either number;
 it is what happens when a dimensionless ratio is formed from two
-unrelated numerators.  The envelope therefore has two clauses and not one
-wider one, the two OVERLAP in ``beta`` around 0.6, and a request cannot
-be assigned to a clause by looking at its ``beta``.  The caller says
-which one it is, because only the caller knows what its numerator was.
+unrelated numerators.  The envelope therefore has separate clauses and
+not one wider one, they OVERLAP in ``beta``, and a request cannot be
+assigned to a clause by looking at its ``beta``.  The caller says which
+one it is, because only the caller knows what its numerator was.
+
+A THIRD CLAUSE ARRIVED FOR A DIFFERENT REASON, and the difference is
+worth stating because it changes what "clause" has to mean here.
+``width`` and ``height`` differ in their NUMERATOR.  ``binned_width``
+has the same numerator as ``width`` and differs in WHAT AN ENTRY
+CERTIFIES: a width entry certifies a line, and is asked for by a pane
+that had to be cut until its own ``beta`` fitted under 1; a binned_width
+entry certifies a SUPREMUM over a two-dimensional band, and is asked for
+by a pane cut on its width RATIO instead, whose ``beta`` is then bounded
+by that ratio.  That is what buys the pane collapse the MPA Sigma pass
+needs -- the shipped width clause demands 218 panes on a typical
+non-crossing branch of the audited field and 1312 on its worst -- and it
+is why the two may not share a catalog even though they share a
+numerator.  Band clauses carry a fourth axis, ``bin_ratio``, which is
+required on a band request and refused on a line one.
 
 WHAT THIS MODULE NEVER DOES.  It never solves, it never falls back, and
 it never serves a neighbour.  Every path out of ``select`` is either a
@@ -102,13 +117,27 @@ GENERATOR = _AXES.generator
 CATALOG_FILES: dict[str, str] = {
     "height": CATALOG_FILE,
     "width": "catalog_complex_laplace_width.json",
+    "binned_width": "catalog_complex_laplace_binned_width.json",
 }
 
-#: The two clause names.  They are module constants rather than bare
+#: The three clause names.  They are module constants rather than bare
 #: strings at the call sites so that a typo is an ImportError and not a
 #: silent refusal.
 WIDTH = "width"
 HEIGHT = "height"
+
+#: The third clause, and the one that is NOT merely a third range of the
+#: same ratio.  ``width`` and ``height`` differ in their numerator; this
+#: one differs in what an entry CERTIFIES.  A width or height entry
+#: certifies a LINE -- one beta, or a band traversed by an exact phase on
+#: fixed nodes -- and is asked for by a pane that had to be cut until its
+#: own beta fitted under 1.  A binned_width entry certifies a SUPREMUM
+#: over a two-dimensional band, and is asked for by a pane cut on the
+#: WIDTH RATIO instead, whose beta is then bounded by that ratio rather
+#: than by 1.  Same target, same payload keys, a different certificate --
+#: which is exactly why it may not be served from the width catalog and
+#: why the refusal below names it.
+BINNED_WIDTH = "binned_width"
 
 
 class CatalogCorrupt(ValueError):
@@ -189,7 +218,60 @@ BETA_CLAUSES: dict[str, BetaClause] = {
         source="GATE0_IMAG_ENVELOPE.md sec 2, against "
                "MINIMAX_REQUEST_CENSUS.md sec 7.2",
     ),
+    BINNED_WIDTH: BetaClause(
+        name=BINNED_WIDTH,
+        numerator="Gamma_hi / x_min over a WIDTH-BINNED pane -- the "
+                  "largest width in a pane whose widths span at most the "
+                  "bin ratio r, over that pane's Laplace edge",
+        # DERIVED FROM THE SAME TWO FACTS AS THE WIDTH CLAUSE, and it
+        # lands on the bin ratio instead of on 1.  gw.mpa.pade_fit's
+        # fourth guard gives Gamma_p <= a_p for every pole, and on a
+        # sign-definite branch x_min = min(E_A) + a_lo with min(E_A) >= 0.
+        # The pole attaining a_lo carries some width Gamma >= Gamma_lo, so
+        # a_lo >= Gamma_lo, so
+        #     beta = Gamma_hi/x_min <= Gamma_hi/Gamma_lo <= r.
+        # The bin ratio and the clause edge are the SAME NUMBER, closed at
+        # the top -- which is what makes this a clause rather than a
+        # widening of the last one, and what makes r = 1 reproduce the
+        # width clause exactly.
+        #
+        # WHY IT EXISTS: the width clause forces the Sigma planner to
+        # bisect a Laplace bucket in width until every leaf's beta fits
+        # under 1, and the audited field answers that with 218 panes on a
+        # typical non-crossing branch and 1312 on pole 7 -- a pane being
+        # a certified rule and a tau-node run of its own.
+        #
+        # THAT AUDITED FIELD IS A DEFECTIVE STORE.  fix/mpa-qaxis-2026-08-09
+        # @ 1e79e8fc found it fitted to the full screened W rather than to
+        # W_c = W - v (|v| is 104-119% of |W|), so its four-decade Gamma
+        # spread is the bare-Coulomb tail; on the W_c refit every pole
+        # narrows 80-90x.  Nothing here depends on that -- this clause's
+        # entries certify a supremum over a (u, beta) band and no pole
+        # field enters the certificate.
+        #
+        # RE-MEASURED ON THE W_c FIELD: the shipped width clause SUFFICES
+        # there.  mpa_fit_np8_wc.h5 needs 43 leaves on pole 7 and 40 on
+        # pole 0 against that clause's own 512 ceiling, where the
+        # defective store demanded 1312.  This clause is therefore a
+        # ROBUSTNESS ASSET rather than a necessity for Si -- it still buys
+        # ~6x in tau nodes and it is the headroom for wider-Gamma physics
+        # (metals) -- and adopting it is an economics decision, not a
+        # blocked-path one.
+        beta_max=4.0,
+        qualified_at=(2.0, 4.0),
+        measured_range=(0.0, 4.0),
+        source="the owner row registered at "
+               "gw.mpa.sigma_pass.MAX_WIDTH_SPLIT_LEAVES; certified by "
+               "tools/generate_binned_width_assets.py as a SUPREMUM over "
+               "the whole (u, beta) band, not at a point",
+    ),
 }
+
+#: The clauses whose entries certify a BAND rather than a line, and which
+#: therefore carry a ``bin_ratio`` axis.  A request under one of these
+#: must say which ratio its pane was binned at, because that number is
+#: what bounds its beta and it cannot be recovered from the beta itself.
+BAND_CLAUSES: frozenset = frozenset({BINNED_WIDTH})
 
 #: Which clause the shipped catalog's beta grid belongs to, keyed by the
 #: catalog's own ``target.version``.  This is a stamp on the CATALOG and
@@ -203,6 +285,7 @@ BETA_CLAUSES: dict[str, BetaClause] = {
 CATALOG_CLAUSE: dict[str, str] = {
     "complex_laplace/v1": HEIGHT,
     "complex_laplace_width/v1": WIDTH,
+    "complex_laplace_binned_width/v1": BINNED_WIDTH,
 }
 
 
@@ -222,6 +305,7 @@ class TableRefusal:
     nearest_beta: float | None = None
     nearest_band: float | None = None
     clause: str | None = None
+    bin_ratio: float | None = None
 
     def one_line(self) -> str:
         return self.message.strip().splitlines()[0]
@@ -256,6 +340,12 @@ class TableSelection:
     real_part_max_error: float
     band_fraction: float
     catalog_version: str
+    #: The bin ratio the ENTRY certifies over, on a band clause; ``None``
+    #: on the line clauses, which have no such axis.  It is not the
+    #: request's own ratio: the axis rounds up, so an ``r = 2`` pane may
+    #: be served by an ``r = 4`` entry, and which one answered is a fact
+    #: the caller's provenance line has to be able to state.
+    bin_ratio: float | None = None
     _line: str = field(default="", repr=False)
 
     @property
@@ -437,7 +527,17 @@ def _read_payload(entry: dict) -> tuple[np.ndarray, np.ndarray] | str:
 # ---------------------------------------------------------------------------
 
 def _generator_pointer(range_value: float, beta: float,
-                       target_error: float) -> str:
+                       target_error: float,
+                       bin_ratio: float | None = None) -> str:
+    if bin_ratio is not None:
+        return ("  or generate: tools/generate_binned_width_assets.py "
+                "--sweep\n"
+                f"               (the band this asks for is R <= "
+                f"{range_value:.6g}, r >= {float(bin_ratio):.6g}, tier "
+                f"{target_error:.0e}; edit R_LADDER / BIN_RATIOS / "
+                "ERROR_BOUNDS to reach it. The whole 30-entry certified "
+                "sweep cost 35 s of one core, offline, of which 0.03 s "
+                "was solving and the rest was certifying the band)")
     return (f"  or generate: {GENERATOR} --range-max {range_value:.6g} "
             f"--omega-hat {beta!r} --error-bound {target_error:.0e}\n"
             "               (the whole 18-entry certified sweep cost 23 "
@@ -450,7 +550,7 @@ def _refuse(code, message, **kw) -> TableRefusal:
 
 def select(
     *, range_value: float, beta: float, beta_clause: str,
-    target_error: float, max_nodes: int,
+    target_error: float, max_nodes: int, bin_ratio: float | None = None,
 ) -> TableSelection | TableRefusal:
     """Serve one certified ``complex_laplace`` table, or refuse in prose.
 
@@ -467,20 +567,64 @@ def select(
     pole width and a sampling line height are different physical
     quantities that happen to share a dimensionless name, and an entry
     swept for one of them certifies nothing about the other.
+
+    ``bin_ratio`` is the fourth axis and it exists only on a BAND clause
+    (``BAND_CLAUSES``).  There it is required, because it is the number
+    that bounds the request's beta and cannot be recovered from the beta:
+    a pane at ``beta = 1.7`` cut at ratio 2 and one cut at ratio 4 make
+    different claims about what a single rule has to cover, and only the
+    caller knows which cut it made.  It rounds UP, like ``R``.  Passing
+    it on a line clause is refused rather than ignored -- an axis a
+    catalog does not have cannot be honoured, and silently dropping it
+    would serve a line certificate to a band request.
     """
 
     # The clause is validated FIRST, because it decides which catalog to
-    # open.  One family, two sweeps, two files: see CATALOG_FILES.
+    # open.  One family, three sweeps, three files: see CATALOG_FILES.
     clause = str(beta_clause)
     if clause not in BETA_CLAUSES:
         return _refuse(
             "UnknownClause",
             f"minimax[{FAMILY}]: beta_clause={clause!r} is not a clause of "
             "the envelope.\n"
-            f"  the envelope has exactly two: {sorted(BETA_CLAUSES)}. A "
-            "caller must say which numerator its beta came from, because "
-            "beta alone cannot say -- the two clauses overlap near 0.6.",
+            f"  the envelope has exactly {len(BETA_CLAUSES)}: "
+            f"{sorted(BETA_CLAUSES)}. A caller must say which numerator "
+            "its beta came from and what an entry has to certify, because "
+            "beta alone cannot say -- the clauses overlap in beta.",
             beta=float(beta), clause=clause)
+
+    # The band axis, before the catalog is opened: a request that cannot
+    # state its bin ratio has not made a band request, and a request that
+    # states one on a line clause is asking for a certificate the opened
+    # catalog does not carry.
+    if clause in BAND_CLAUSES and bin_ratio is None:
+        spec = BETA_CLAUSES[clause]
+        return _refuse(
+            "MissingBinRatio",
+            f"minimax[{FAMILY}]: this is a {clause}-clause request and it "
+            "carries no bin_ratio.\n"
+            f"  that clause's beta is {spec.numerator}\n"
+            "  its entries certify a SUPREMUM over beta in [0, r], and r "
+            "is the ratio the pane's widths were binned at. It is not "
+            "recoverable from beta: a pane at beta = 1.7 binned at r = 2 "
+            "and one binned at r = 4 ask a single rule to cover different "
+            "bands, and only the planner knows which cut it made.\n"
+            f"  certified ratios: {list(spec.qualified_at)}",
+            beta=float(beta), clause=clause)
+    if clause not in BAND_CLAUSES and bin_ratio is not None:
+        return _refuse(
+            "BinRatioOnLineClause",
+            f"minimax[{FAMILY}]: bin_ratio={bin_ratio!r} was passed with "
+            f"the {clause} clause, whose entries certify a LINE and have "
+            "no such axis.\n"
+            "  an axis the opened catalog does not carry cannot be "
+            "honoured, and dropping it silently would serve a line "
+            "certificate to a band request -- which is the same class of "
+            "error as serving a height entry to a width request, and is "
+            f"refused for the same reason.\n"
+            f"  the band clauses are: {sorted(BAND_CLAUSES)}",
+            beta=float(beta), clause=clause,
+            bin_ratio=float(bin_ratio))
 
     doc, why_not = load_catalog(clause)
     if doc is None:
@@ -510,7 +654,8 @@ def select(
                 "near-match is the reason this check runs before the "
                 "beta match and not after it.\n"
                 f"  reason the {clause} catalog did not load: {why_not}\n"
-                + _generator_pointer(range_value, beta, target_error),
+                + _generator_pointer(range_value, beta, target_error,
+                                     bin_ratio=bin_ratio),
                 beta=float(beta), clause=clause)
         return _refuse(
             "CatalogUnavailable",
@@ -535,7 +680,8 @@ def select(
                "request to tabulate, and this refusal is the clamp "
                "becoming visible rather than a missing table.\n"
                if float(beta) > 1.0e6 else "")
-            + _generator_pointer(range_value, beta, target_error),
+            + _generator_pointer(range_value, beta, target_error,
+                                 bin_ratio=bin_ratio),
             beta=float(beta), clause=clause)
 
     version = catalog_version(doc)
@@ -565,7 +711,8 @@ def select(
             "otherwise MATCH this request numerically. That near-match is "
             "the reason this check runs before the beta match and not "
             "after it.\n"
-            + _generator_pointer(range_value, beta, target_error),
+            + _generator_pointer(range_value, beta, target_error,
+                                 bin_ratio=bin_ratio),
             beta=float(beta), clause=clause)
 
     entries = doc.get("tables")
@@ -606,6 +753,18 @@ def select(
         if not _axes.covers(_AXES.direction_for("node_count"),
                             node_count, int(max_nodes)):
             continue
+        if clause in BAND_CLAUSES:
+            # The band axis.  Rounds UP for the same reason R does: an
+            # entry certified as a supremum over [0, r'] with r' >= r
+            # certifies a superset of the requested band.  A band entry
+            # without the field is CatalogCorrupt, not absent -- a band
+            # certificate that will not say how wide a band it covers is
+            # not a certificate.
+            entry_ratio = _need(entry, index, "bin_ratio", float)
+            if not _axes.covers(_AXES.direction_for("bin_ratio"),
+                                entry_ratio, float(bin_ratio),
+                                tol=1.0e-12):
+                continue
         in_shape.append((index, entry))
 
     if not in_shape:
@@ -616,19 +775,29 @@ def select(
         tiers = sorted({float(e.get("error_bound", float("nan")))
                         for e in entries})
         nodes = sorted({int(e.get("node_count", 0)) for e in entries})
+        ratios = sorted({float(e["bin_ratio"]) for e in entries
+                         if "bin_ratio" in e})
         return _refuse(
             "NoCertifiedTable",
             f"minimax[{FAMILY}]: no certified table for R={range_value:.6g} "
             f"at tier {float(target_error):.0e} within {int(max_nodes)} "
-            "nodes.\n"
+            "nodes"
+            + (f" at bin ratio r={float(bin_ratio):.6g}"
+               if clause in BAND_CLAUSES else "") + ".\n"
             f"  tabulated R buckets: {ranges} (R rounds UP, so the request "
             "must be at or below one of them)\n"
             f"  tabulated tiers:     {tiers} (the tier rounds DOWN, so a "
             "request tighter than every tabulated bound has no table)\n"
             f"  node counts on hand: {nodes[0]} ... {nodes[-1]}\n"
             f"  tabulated betas:     {betas}\n"
-            + _generator_pointer(range_value, beta, target_error),
-            beta=float(beta), clause=clause)
+            + (f"  tabulated bin ratios: {ratios} (r rounds UP; a pane "
+               "binned wider than every tabulated ratio has no entry "
+               "certifying its band, and is refused rather than served by "
+               "a narrower one)\n" if clause in BAND_CLAUSES else "")
+            + _generator_pointer(range_value, beta, target_error,
+                                 bin_ratio=bin_ratio),
+            beta=float(beta), clause=clause,
+            bin_ratio=None if bin_ratio is None else float(bin_ratio))
 
     # Pass two: the axis that does not round.
     matched = [(i, e) for i, e in in_shape if beta_covers(e, i, beta)]
@@ -657,7 +826,8 @@ def select(
             f"  reachable by: beta = {nb!r} exactly, i.e. varpi = "
             f"{nb!r} * x_min -- the probe frequency is a free convention "
             "and x_min is not\n"
-            + _generator_pointer(range_value, beta, target_error),
+            + _generator_pointer(range_value, beta, target_error,
+                                 bin_ratio=bin_ratio),
             beta=float(beta), nearest_beta=nb, nearest_band=band,
             clause=clause)
 
@@ -711,6 +881,8 @@ def select(
     # composite entry is an INTERVAL that rounds downward and a "fraction
     # of the band" would be a category error there.
     axis = str(entry.get("beta_axis"))
+    entry_ratio = (_need(entry, index, "bin_ratio", float)
+                   if clause in BAND_CLAUSES else None)
     if axis == "exact_phase_on_fixed_nodes" and not exact:
         # THE RE-PHASING, AND WHY IT IS NOT OPTIONAL.  A composite entry's
         # weights are ``h_l * e^{i beta_entry t_l}`` with ``h_l > 0`` chosen
@@ -755,7 +927,8 @@ def select(
             "  the band is a measurement, and this is the measurement "
             "disagreeing with it. The table is NOT served: a stamped "
             "band that does not hold is worse than no band at all.\n"
-            + _generator_pointer(range_value, beta, target_error),
+            + _generator_pointer(range_value, beta, target_error,
+                                 bin_ratio=bin_ratio),
             beta=float(beta), nearest_beta=beta_entry, nearest_band=band,
             clause=clause)
     certified_error = real_error
@@ -772,7 +945,15 @@ def select(
         f"| re-measured HERE at this beta: |E|={modulus_error:.3e}, "
         f"Re E={certified_error:.3e} "
         f"| {beta_note} "
-        f"| sha256:{str(entry.get('payload_sha256', ''))[:12]} "
+        + ("" if entry_ratio is None else
+           f"| BAND certificate: sup over beta in "
+           f"[{_need(entry, index, 'band_beta_min', float):.6g}, "
+           f"{_need(entry, index, 'band_beta_max', float):.6g}] at entry "
+           f"r={entry_ratio:.6g} serving request r="
+           f"{float(bin_ratio):.6g} "
+           f"(closure slack "
+           f"{_need(entry, index, 'band_closure_slack', float):.1e}) ")
+        + f"| sha256:{str(entry.get('payload_sha256', ''))[:12]} "
         f"catalog {catalog_version(doc)} schema {doc.get('schema_version')}"
     )
 
@@ -789,6 +970,7 @@ def select(
         real_part_max_error=float(measured),
         band_fraction=float(frac),
         catalog_version=catalog_version(doc),
+        bin_ratio=entry_ratio,
         _line=line,
     )
 

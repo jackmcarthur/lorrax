@@ -596,9 +596,30 @@ def _geometric_width_bins_sorted(g_sorted, idx_sorted, *,
         return [idx_sorted]
     n_bins = int(np.ceil(np.log(g_hi / g_lo) / np.log(float(r_max))))
     edges = g_lo * float(r_max) ** np.arange(1, n_bins)
-    # digitize's bin b is [edges[b-1], edges[b]) -- left-closed -- which
-    # is exactly what side='left' names on an ascending array.
-    cuts = ([0] + [int(c) for c in np.searchsorted(g_sorted, edges, side="left")]
+    # THE BOUNDARY CONVENTION, AND IT IS UPPER-CLOSED: bin b is
+    # ``(edges[b-1], edges[b]]``, which is what ``side='right'`` names on
+    # an ascending array.  One sentence decides it -- A PANE'S CERTIFIED
+    # PARAMETER IS ITS SUPREMUM, SO A PANE MUST CONTAIN ITS SUPREMUM.
+    # Every rule this module builds is built at the pane's LARGEST width
+    # (``g_hi = max(g_v)`` in _mpa_groups_for_bucket) and the crossing
+    # pane at its largest ``Re Omega`` (the ``a_v <= T`` predicate, which
+    # has always been upper-closed), so a pole sitting exactly on a bin
+    # edge belongs to the interval whose certificate was built AT its own
+    # width: covered inclusively, by exactly one rule, never by neither
+    # and never by both.  The binned clause's bound is closed at the top
+    # for the same reason (``beta <= r``, inclusive), and the catalog's
+    # own ``beta_covers`` compares inclusively, so the three agree.
+    #
+    # IT USED TO BE ``side='left'`` and the two halves of the pane
+    # assignment path disagreed: the width axis was ``[lo, hi)`` while
+    # Sigma's B-side predicate was ``(lo, hi]``, so a pole exactly on a
+    # threshold was assigned in OPPOSITE directions by the two.  Only a
+    # width that lands exactly on ``g_lo * r**k`` in float64 can tell the
+    # difference -- which is not never, because ``r = 4`` makes those
+    # edges exact binary shifts -- so the flag-off byte-identity gate is
+    # also the measurement of whether any production pole sits on one.
+    cuts = ([0]
+            + [int(c) for c in np.searchsorted(g_sorted, edges, side="right")]
             + [int(idx_sorted.size)])
     out = []
     for b in range(n_bins):
@@ -606,6 +627,52 @@ def _geometric_width_bins_sorted(g_sorted, idx_sorted, *,
         if hi > lo:
             out.append(idx_sorted[lo:hi])
     return out
+
+
+def _refuse_mis_binned_pane(g_lo, g_hi, r_max, *, where, beta=None):
+    """A pane whose widths do not fit the bin it claims.  Refuse it.
+
+    THE FALSE CASE THIS GUARD IS FOR is not a bug in the binning; it is a
+    pane reaching the rule builder by some route that did not bin it, or
+    binned it at a different ratio than the one the catalog entry was
+    fetched for.  Either way the derivation that licenses ``beta <= r``
+    has stopped holding -- it needs ``Gamma_hi/Gamma_lo <= r`` and
+    nothing else supplies it -- so the certificate on the entry is
+    certifying a band the pane does not sit inside.  That is a wrong
+    number rather than a slow one, which is why it is checked at the
+    pane and not inferred from the beta afterwards.
+
+    The comparison is inclusive at ``r`` and carries one ulp of slack,
+    because the bin edges are ``g_lo * r**k`` and a pole sitting exactly
+    on one is IN the bin by this module's upper-closed convention.
+    """
+
+    lo, hi, r = float(g_lo), float(g_hi), float(r_max)
+    if not (lo > 0.0) or not np.isfinite(hi):
+        from . import sigma_routing as R
+        raise R.RoutingRefusal(
+            f"MPA {where} window: the pane's width range [{lo:.6g}, "
+            f"{hi:.6g}] Ry is not a positive finite interval, so no bin "
+            f"ratio can be formed for it.",
+            code="mis_binned_pane")
+    ratio = hi / lo
+    if ratio <= r * (1.0 + 1.0e-12):
+        return float(ratio)
+    from . import sigma_routing as R
+    raise R.RoutingRefusal(
+        f"MPA {where} window: the binned-width clause was asked for at "
+        f"bin ratio r={r:g}, but this pane's widths span "
+        f"Gamma_hi/Gamma_lo = {ratio:.6g} (Gamma in [{lo:.6g}, {hi:.6g}] "
+        f"Ry)"
+        + ("" if beta is None else f", beta={float(beta):.6g}")
+        + ".  The clause's edge IS the bin ratio: beta <= "
+        "Gamma_hi/Gamma_lo holds only because pade_fit's fourth guard "
+        "puts Gamma_p <= a_p on every pole, so a pane wider than r has "
+        "no derivation putting its beta under r and the band certificate "
+        "fetched for r does not cover it.  This is a pane that reached "
+        "the rule builder without being binned, or binned at a different "
+        "ratio than the entry was fetched for -- not a physics corner.",
+        code="mis_binned_pane", beta=None if beta is None else float(beta))
 
 
 def _geometric_width_bins(gamma_ry, mask, *, r_max=CROSSING_WIDTH_RATIO_MAX):
@@ -799,6 +866,7 @@ def _sigma_window(*, name, plan_t, plan_alpha, mask_A, e_ref_a, e_ref_b,
 def _mpa_groups_for_bucket(
     *, idx, a_v, g_v, E_A_host, base_mask_A_host,
     omega_max, space, neg_omega_half, edge_factor, rel_tol, max_nodes,
+    binned_width_clause=None,
 ):
     """The up-to-three MPA windows serving one ``Re Omega`` bucket.
 
@@ -815,6 +883,43 @@ def _mpa_groups_for_bucket(
     e_lo, e_hi = _stats(E_A_host, base_mask_A_host)
     groups = []
 
+    # THE BINNED CLAUSE IS FOR THE NON-CROSSING BRANCHES, AND ONLY THEM.
+    # A branch that can cross floors every Laplace window's ``x_min`` at
+    # ``z_edge = edge_factor * Gamma_hi``, so ``beta <= 1/edge_factor``
+    # holds STRUCTURALLY there -- the audit found zero of 81 million
+    # poles outside the per-pole clause on those branches -- and the
+    # width clause cannot fire, so there is nothing for a wider clause to
+    # buy.  Their panes are already binned, at ``CROSSING_WIDTH_RATIO_MAX``,
+    # for an unrelated reason (bounding the crossing core's bandwidth
+    # ``A = f_max/Gamma_lo``), and that ratio is NOT the flag: fetching a
+    # band certificate at the flag's ``r`` for a pane binned at the
+    # crossing constant is exactly the mis-binning the guard refuses, and
+    # it did, on the first run of this branch's digest tool at ``r = 2``.
+    # So the crossing branches keep the per-pole clause whatever the flag
+    # says, which also makes them byte-identical with the flag ON.
+    _binned = (None if R.denominator_can_cross(space, bool(neg_omega_half))
+               else binned_width_clause)
+
+    def _clause(x_min, x_max, g_hi_pane, g_lo_pane):
+        """The width clause this window owes, in the form it is checked.
+
+        ``None`` when the binned clause is off or the branch is a
+        crossing one, which is the shipped path and the byte-identical
+        one.  Otherwise the tuple ``_refuse_width_clause`` needs to fetch
+        a band certificate: the ratio, the PANE's own width range (not
+        the window's ``g_hi`` alone -- the derivation needs both ends),
+        and the request the entry has to cover, whose ``R`` is this
+        window's own interval ratio because that is what the catalog
+        rescales by.
+        """
+        if _binned is None:
+            return None
+        return (float(_binned), float(g_lo_pane),
+                float(g_hi_pane), float(x_max) / float(x_min),
+                float(rel_tol), int(max_nodes))
+
+    g_lo_pane = float(np.min(g_v))
+
     if not R.denominator_can_cross(space, bool(neg_omega_half)):
         a_lo, a_hi = float(np.min(a_v)), float(np.max(a_v))
         g_hi = float(np.max(g_v))
@@ -823,7 +928,8 @@ def _mpa_groups_for_bucket(
         t, alpha, rule = R.sign_definite_rule(
             x_min, x_max, g_hi, rel_tol=rel_tol, max_nodes=max_nodes)
         beta = R.beta_for_window(g_hi, x_min)
-        _refuse_width_clause(beta, "single", x_min, g_hi)
+        _refuse_width_clause(beta, "single", x_min, g_hi,
+                             binned=_clause(x_min, x_max, g_hi, g_lo_pane))
         win = _sigma_window(
             name="single", plan_t=t, plan_alpha=alpha,
             mask_A=base_mask_A_host, e_ref_a=e_lo, e_ref_b=a_lo,
@@ -885,7 +991,9 @@ def _mpa_groups_for_bucket(
             t, alpha, rule = R.sign_definite_rule(
                 x_min, x_max, g_hi, rel_tol=rel_tol, max_nodes=max_nodes)
             beta = R.beta_for_window(g_hi, x_min)
-            _refuse_width_clause(beta, "a_stripe", x_min, g_hi)
+            _refuse_width_clause(beta, "a_stripe", x_min, g_hi,
+                                 binned=_clause(x_min, x_max, g_hi,
+                                                g_lo_pane))
             wins.append(_sigma_window(
                 name="a_stripe", plan_t=t, plan_alpha=alpha,
                 mask_A=stripe_A, e_ref_a=s_lo, e_ref_b=a_lo,
@@ -906,7 +1014,8 @@ def _mpa_groups_for_bucket(
         t, alpha, rule = R.sign_definite_rule(
             x_min, x_max, g_hi, rel_tol=rel_tol, max_nodes=max_nodes)
         beta = R.beta_for_window(g_hi, x_min)
-        _refuse_width_clause(beta, "b_slab", x_min, g_hi)
+        _refuse_width_clause(beta, "b_slab", x_min, g_hi,
+                             binned=_clause(x_min, x_max, g_hi, g_lo_pane))
         groups.append((("b_slab",), [_sigma_window(
             name="b_slab", plan_t=t, plan_alpha=alpha,
             mask_A=base_mask_A_host, e_ref_a=e_lo, e_ref_b=a_lo,
@@ -918,7 +1027,7 @@ def _mpa_groups_for_bucket(
     return groups
 
 
-def _refuse_width_clause(beta, where, x_min, gamma):
+def _refuse_width_clause(beta, where, x_min, gamma, *, binned=None):
     """The width clause, checked where the window is built rather than later.
 
     The rule this module builds is the positive composite one, certified by
@@ -929,21 +1038,76 @@ def _refuse_width_clause(beta, where, x_min, gamma):
     have not walked outside the pole field the routing was scored on.  A
     slab whose ``beta`` exceeds it is a bucketing failure, not a physics
     one, and it should say so here rather than 4000 tau nodes later.
+
+    ``binned`` ARMS THE SECOND CLAUSE, and when it is None -- the default,
+    and the flag's default -- not one line below the first ``return``
+    executes and this function is character for character the one that
+    shipped.  When it is present it is
+    ``(r, g_lo, g_hi, range_value, target_error, max_nodes)``: the pane's
+    bin ratio and width range, and the request the band certificate has to
+    cover.  Three things then have to be true and each is checked here
+    rather than assumed:
+
+    1. the pane really is binned at ``r`` (``_refuse_mis_binned_pane``) --
+       the derivation ``beta <= r`` has no other support;
+    2. ``beta <= r``, inclusive, which is that derivation's conclusion and
+       the catalog clause's edge;
+    3. a certified entry EXISTS for ``(R, r, tier)``.  This is the
+       lookup-and-refuse discipline arriving on the Sigma path: the pane
+       is allowed its wider clause only where something certified the band
+       it spans, and a request one hair outside the certified grid refuses
+       BY NAME with the catalog's own message rather than being served by
+       a narrower entry.
     """
     from . import sigma_routing as R
 
-    if float(beta) <= R.SHIPPED_WIDTH_BETA_MAX + 1.0e-12:
-        return
+    if binned is None:
+        if float(beta) <= R.SHIPPED_WIDTH_BETA_MAX + 1.0e-12:
+            return
+        raise R.RoutingRefusal(
+            f"MPA {where} window: the slab's width clause is beta = "
+            f"Gamma_max/x_min = {float(beta):.6f}, above the envelope "
+            f"beta_max={R.SHIPPED_WIDTH_BETA_MAX} that the fitter's own "
+            f"fourth guard closes at (x_min={float(x_min):.6g} Ry, "
+            f"Gamma={float(gamma):.6g} Ry).  For a SINGLE pole this is "
+            f"structurally impossible; for a slab it means the bucket "
+            f"mixes a shallow Laplace edge with a wide pole.  Narrow the "
+            f"buckets (lower mpa_laplace_ratio_max) rather than widening "
+            f"the clause.",
+            code="slab_width_clause", beta=float(beta))
+
+    r, g_lo, g_hi, range_value, target_error, max_nodes = binned
+    _refuse_mis_binned_pane(g_lo, g_hi, r, where=where, beta=beta)
+    if float(beta) > float(r) * (1.0 + 1.0e-12):
+        raise R.RoutingRefusal(
+            f"MPA {where} window: the binned-width clause is beta = "
+            f"Gamma_hi/x_min = {float(beta):.6f}, above its own edge "
+            f"r={float(r):g} (x_min={float(x_min):.6g} Ry, "
+            f"Gamma={float(gamma):.6g} Ry).  The bin ratio IS the clause "
+            f"edge: pade_fit's fourth guard gives Gamma_p <= a_p, so "
+            f"x_min = min(E_A) + a_lo >= Gamma_lo and beta <= "
+            f"Gamma_hi/Gamma_lo <= r.  A beta above r with the pane "
+            f"correctly binned means x_min is NOT min(E_A) + a_lo on this "
+            f"window -- which is the crossing branches' z_edge floor, "
+            f"where the clause is 1/edge_factor and tighter still.",
+            code="binned_width_clause", beta=float(beta))
+    got = R.binned_width_entry(
+        range_value=range_value, beta=float(beta), bin_ratio=float(r),
+        target_error=float(target_error), max_nodes=int(max_nodes))
+    if getattr(got, "code", None) is None:
+        return got
     raise R.RoutingRefusal(
-        f"MPA {where} window: the slab's width clause is beta = "
-        f"Gamma_max/x_min = {float(beta):.6f}, above the envelope "
-        f"beta_max={R.SHIPPED_WIDTH_BETA_MAX} that the fitter's own fourth "
-        f"guard closes at (x_min={float(x_min):.6g} Ry, "
-        f"Gamma={float(gamma):.6g} Ry).  For a SINGLE pole this is "
-        f"structurally impossible; for a slab it means the bucket mixes a "
-        f"shallow Laplace edge with a wide pole.  Narrow the buckets "
-        f"(lower mpa_laplace_ratio_max) rather than widening the clause.",
-        code="slab_width_clause", beta=float(beta))
+        f"MPA {where} window: the binned-width clause was asked for at "
+        f"r={float(r):g}, R={float(range_value):.6g}, tier "
+        f"{float(target_error):.0e}, beta={float(beta):.6f}, and the "
+        f"certified catalog refused it.\n"
+        f"{got.message}\n"
+        f"  the planner emits a width-BINNED pane only where an entry "
+        f"certifies the band that pane spans, so this refusal is the "
+        f"clause working rather than a table being missing by accident.  "
+        f"Set the binned_width_clause flag off to fall back to the "
+        f"per-pole width clause, which costs panes and refuses nothing.",
+        code="binned_width_no_entry", beta=float(beta))
 
 
 def plan_branch_groups(
@@ -962,6 +1126,7 @@ def plan_branch_groups(
     rel_tol=1.0e-8,
     max_nodes=None,
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX,
+    binned_width_clause=None,
     target_error=1.0e-6,
     laplace_max_nodes=64,
     crossing_eps_q=1.0e-10,
@@ -975,6 +1140,22 @@ def plan_branch_groups(
     Returns ``(groups, stats)``.  ``groups`` is a list of
     :class:`WindowGroup`; ``stats`` records the narrow/wide split so the
     pass announcement can name it.
+
+    ``binned_width_clause`` is the flag, and it DEFAULTS OFF.  ``None``
+    means the shipped per-pole width clause: the non-crossing branches
+    bisect each Laplace bucket in width until every leaf's ``beta`` fits
+    under 1, which is what produces 218 panes on a typical branch of the
+    audited field and 1312 on pole 7, and a pane is a certified rule and
+    a tau-node run of its own.  A float ``r`` (2 or 4, the ratios the
+    catalog is qualified at) means the BINNED clause instead: bin the
+    widths geometrically at ratio ``r`` and emit one pane per (window,
+    bin), with the clause edge at ``r`` rather than 1 -- but only where a
+    band certificate exists for the request, which
+    ``_refuse_width_clause`` fetches per window and refuses by name
+    without.  Nothing else moves: the mandatory-refit guard, all four fit
+    guards, the Laplace bucketing, the crossing branches' own width
+    binning and every rule builder are untouched, and with the flag off
+    this function's plan is byte-identical to the one that shipped.
 
     The legacy group comes first and is built by the two-point path's own
     ``_build_windows_for_branch``, called with the REAL parts of the narrow
@@ -1114,6 +1295,20 @@ def plan_branch_groups(
             # chase, only a ratio to respect.
             b_idx, b_g = _sorted_by_width(g_flat, bucket_idx)
             subs = _geometric_width_bins_sorted(b_g, b_idx)
+        elif binned_width_clause is not None:
+            # THE BINNED CLAUSE, ON.  The same direct binning the crossing
+            # branches have always used, at the flag's ratio, in place of
+            # the clause-driven bisection -- so the pane count becomes
+            # ceil(log_r(Gamma_hi/Gamma_lo)) by construction rather than
+            # whatever satisfying beta <= 1 costs.  It cannot diverge for
+            # the same reason the crossing one cannot: there is no
+            # predicate to chase, only a ratio to respect, and the leaf
+            # ceiling below is left in place as the backstop it always
+            # was rather than removed because this arm makes it quiet.
+            b_idx, b_g = _sorted_by_width(g_flat, bucket_idx)
+            subs = _geometric_width_bins_sorted(
+                b_g, b_idx, r_max=float(binned_width_clause))
+            _refuse_width_split_explosion(len(subs), bucket_g)
         else:
             b_idx, b_g = _sorted_by_width(g_flat, bucket_idx)
             subs = _clause_safe_width_split_sorted(
@@ -1128,7 +1323,8 @@ def plan_branch_groups(
                     base_mask_A_host=base_mask_A_host, omega_max=omega_max,
                     space=space, neg_omega_half=neg_omega_half,
                     edge_factor=edge_factor, rel_tol=rel_tol,
-                    max_nodes=max_nodes):
+                    max_nodes=max_nodes,
+                    binned_width_clause=binned_width_clause):
                 g_sub_lo, g_sub_hi = float(np.min(sub_g)), float(np.max(sub_g))
                 # Ascending flat order inside the group: it is the order a
                 # dense mask would have handed the kernel, so the selector
@@ -1154,6 +1350,12 @@ def plan_branch_groups(
         "wide_b_mass": _mass(wide),
         "xi_ev": float(xi_ry) * RYD_TO_EV,
         "n_tau": int(sum(w.n_tau for grp in groups for w in grp.windows)),
+        # The two numbers the owner's ruling is made on, per branch, so a
+        # run announces its own pane collapse instead of it having to be
+        # counted out of a log afterwards.
+        "n_panes": int(len(groups)),
+        "binned_width_clause": (None if binned_width_clause is None
+                                else float(binned_width_clause)),
     }
     return groups, stats
 
@@ -1703,7 +1905,7 @@ def compute_mpa_sigma_c_omega_grid(
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
     allow_partial=False, pole_subset=None, group_subset=None,
     group_digests=None, census_out=None, census_sha="", plan_store=None,
-    plan_verify=False, print_fn=print,
+    plan_verify=False, binned_width_clause=None, print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -1948,6 +2150,7 @@ def compute_mpa_sigma_c_omega_grid(
                         neg_omega_half=br.neg_omega_half, xi_ry=xi_ry,
                         edge_factor=edge_factor, b_abs=b_abs, rel_tol=rel_tol,
                         laplace_ratio_max=laplace_ratio_max,
+                        binned_width_clause=binned_width_clause,
                         target_error=float(quad.target_error),
                         laplace_max_nodes=int(quad.max_nodes),
                         crossing_eps_q=float(quad.crossing_eps_q),
@@ -1981,6 +2184,17 @@ def compute_mpa_sigma_c_omega_grid(
                             quad.use_shipped_tables),
                         "space": str(br.space),
                         "neg_omega_half": bool(br.neg_omega_half),
+                        # THE CLAUSE IS PART OF THE PLAN, SO IT IS PART OF
+                        # THE ADDRESS.  The binned width clause changes
+                        # pane membership when it is on; a cached plan
+                        # keyed without it would serve a clause-off plan
+                        # to a clause-on leg and the leg would never know.
+                        # -1.0 is the off sentinel (the knob is a positive
+                        # ratio when set), so the shipped default keeps a
+                        # stable address.
+                        "binned_width_clause": (
+                            -1.0 if binned_width_clause is None
+                            else float(binned_width_clause)),
                     })
                 fixed["addr_s"] += time.perf_counter() - t_addr
                 plan_file = PS.plan_path(plan_dir, pole=p, bkey=bkey,
