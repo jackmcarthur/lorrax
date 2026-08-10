@@ -220,13 +220,14 @@ import symmetry_maps                                            # noqa: E402
 # at 0.165 s on a production Gram it is 3-4 % of the driver's wall).
 
 
-@partial(jax.jit, static_argnames=('k_keep', 'tol_rel'))
+@partial(jax.jit, static_argnames=('k_keep', 'tol_rel', 'orbit_block'))
 def pivoted_cholesky_select(
     G: jnp.ndarray,
     k_keep: int,
     orbit_id: jnp.ndarray | None = None,
     *,
     tol_rel: float | None = None,
+    orbit_block: bool = False,
 ):
     """Greedy pivoted Cholesky on an Hermitian PSD ``G``. STOPS at the
     numerical-rank floor. Returns ``(piv, L, rank, d_final, d_taken,
@@ -293,11 +294,23 @@ def pivoted_cholesky_select(
     )
     col_ids = jnp.arange(k_keep)
 
+    if orbit_block:
+        init = init + (jnp.int32(-1),)          # cur_orbit: none open yet
+
     def body(j, carry):
-        (d, L, piv, active, d_taken, trR_over_trG,
-         d_min_raw, d_min_at, d_min_j) = carry
+        if orbit_block:
+            (d, L, piv, active, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j, cur_orbit) = carry
+        else:
+            (d, L, piv, active, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j) = carry
 
         masked_d = jnp.where(active, d, minus_inf)
+        if orbit_block:
+            masked_o = jnp.where(active & (orbit_id == cur_orbit),
+                                 d, minus_inf)
+            more = jnp.isfinite(jnp.max(masked_o))
+            masked_d = jnp.where(more, masked_o, masked_d)
         p = jnp.argmax(masked_d)
         # THE STOP.  ``pivot_val`` clamps at ``floor`` (not ``eps``), so on a
         # healthy input this is bit-for-bit the old arithmetic and past the
@@ -338,16 +351,26 @@ def pivoted_cholesky_select(
         # value instead of going −inf/NaN.
         d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
         trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
-        # Mark p (or its whole orbit, if orbit_id was provided) inactive.
-        kill_mask = (orbit_id == orbit_id[p]) & take
+        # Mark p inactive — its whole orbit in one-pivot-per-orbit mode,
+        # p alone under ``orbit_block`` (where the orbit is consumed member
+        # by member) and under the plain point mode.
+        if orbit_block:
+            kill_mask = (jnp.arange(M) == p) & take
+        else:
+            kill_mask = (orbit_id == orbit_id[p]) & take
         d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
         active = active & ~kill_mask
 
+        if orbit_block:
+            cur_orbit = jnp.where(more & take, cur_orbit, orbit_id[p])
+            return (d, L, piv, active, d_taken, trR_over_trG,
+                    d_min_raw, d_min_at, d_min_j, cur_orbit)
         return (d, L, piv, active, d_taken, trR_over_trG,
                 d_min_raw, d_min_at, d_min_j)
 
+    _out = lax.fori_loop(0, k_keep, body, init)
     (d, L, piv, _, d_taken, trR_over_trG,
-     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(0, k_keep, body, init)
+     d_min_raw, d_min_at, d_min_j) = _out[:9]
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
     # Effective rank = #pivots taken.  With the stopping rule above this is
     # exactly the loop's trip count: ``d_taken[j] > floor`` for every taken
@@ -609,6 +632,7 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     score_point_sets: dict | None = None,
     close_orbits_after=None,
+    orbit_block: bool = False,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -771,6 +795,7 @@ def prune_candidates_by_pivoted_cholesky(
     with timing.section("prune.select"):
         select_step = make_sharded_pivoted_cholesky_select(
             mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,
+            orbit_block=orbit_block,
         )
         # Pad mask: real candidates active, pads inactive.  None when n_pad==0
         # so the P=1 / already-divisible paths take the byte-identical old
@@ -824,9 +849,15 @@ def prune_candidates_by_pivoted_cholesky(
     rank_i = int(rank)
     refuse_unless_select_certified(
         piv_np, rank_i, psd_host, n_keep=n_keep, M=M, M_pad=M_pad,
-        orbit_id=orbit_id, d0max=float(diag_host.max()), tol_rel=tol_rel)
+        # In orbit-BLOCK mode the pivots are points that happen to be walked
+        # in orbit order, so the pool the request has to fit inside is the
+        # candidate list, not the orbit list — passing ``orbit_id`` here
+        # would compare a point count against an orbit count and refuse a
+        # legitimate request.
+        orbit_id=None if orbit_block else orbit_id,
+        d0max=float(diag_host.max()), tol_rel=tol_rel)
 
-    if orbit_id is None and close_orbits_after is not None:
+    if close_orbits_after is not None:
         # ── POINT PIVOTS, ORBIT CLOSURE AFTERWARDS ──────────────────────
         # WHY THIS MODE EXISTS, measured.  Orbit-mode pivoting deflates ONE
         # direction per pick while removing a whole orbit from contention,
@@ -849,13 +880,31 @@ def prune_candidates_by_pivoted_cholesky(
         # quadrature needs — V_H is only point-group symmetric across a
         # k-star if {r_mu} is closed.
         orbit_id_np = np.asarray(close_orbits_after)
+        sizes_all = np.bincount(orbit_id_np,
+                                minlength=int(orbit_id_np.max()) + 1)
         picked_orbits = np.unique(orbit_id_np[piv_np])
+        dropped = 0
+        if orbit_block:
+            # The block order consumes an orbit ENTIRELY before opening the
+            # next, so at most the last one is partial — and a partial orbit
+            # is the one thing this mode must not deliver, because then the
+            # set is no longer closed and ⟨nk|V_H|nk⟩ stops being point-group
+            # symmetric across the k-star.  Drop it rather than round the
+            # count up with points that were never pivoted.
+            n_piv_in = np.bincount(orbit_id_np[piv_np],
+                                   minlength=sizes_all.size)
+            complete = np.flatnonzero(n_piv_in == sizes_all)
+            complete = complete[np.isin(complete, picked_orbits)]
+            dropped = int(picked_orbits.size - complete.size)
+            picked_orbits = complete
         in_kept = np.isin(orbit_id_np, picked_orbits)
         keep_idx = np.asarray(cand_idx)[in_kept]
         if verbose:
-            print(f"[pivoted_cholesky] point pivots + closure: {len(piv_np)} "
-                  f"point pivots in {picked_orbits.size} orbits → "
-                  f"{len(keep_idx)} centroids (orbit-closed)")
+            mode = "orbit-block pivots" if orbit_block else "point pivots"
+            print(f"[pivoted_cholesky] {mode} + closure: {len(piv_np)} "
+                  f"point pivots in {picked_orbits.size} complete orbits → "
+                  f"{len(keep_idx)} centroids (orbit-closed"
+                  f"{f'; {dropped} partial orbit dropped' if dropped else ''})")
             # The nested-prefix ladder again, but on the CLOSURE: pivot j's
             # rung is the size of the union of orbits of the first j pivots,
             # which is the delivered N for every smaller --n-pivot-keep.
@@ -992,6 +1041,7 @@ def make_sharded_pivoted_cholesky_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    orbit_block: bool = False,
 ):
     """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
     numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
@@ -1084,13 +1134,35 @@ def make_sharded_pivoted_cholesky_select(
                 jnp.int32(-1),
             )
 
+            if orbit_block:
+                init = init + (jnp.int32(-1),)      # cur_orbit: none open yet
+
             def body(j, carry):
-                (d, L, piv, active, d_taken, trR_over_trG,
-                 d_min_raw, d_min_at, d_min_j) = carry
+                if orbit_block:
+                    (d, L, piv, active, d_taken, trR_over_trG,
+                     d_min_raw, d_min_at, d_min_j, cur_orbit) = carry
+                else:
+                    (d, L, piv, active, d_taken, trR_over_trG,
+                     d_min_raw, d_min_at, d_min_j) = carry
 
                 # Pick global pivot: per-device argmax then pmax + tie-break
                 # to lowest global index.
                 masked_d = jnp.where(active, d, minus_inf)
+                if orbit_block:
+                    # ORBIT-BLOCK ORDER.  Finish the orbit in progress before
+                    # opening a new one; when none is in progress, open the
+                    # one holding the largest residual.  Deflation stays
+                    # RANK-1 per point, so every member of a picked orbit is
+                    # a certified independent direction — which is what makes
+                    # the CLOSED set's rank equal the pivot count, rather
+                    # than the pivot count being the rank of a set fifteen
+                    # times smaller than what gets delivered.
+                    in_orb = active & (orbit_id_slab == cur_orbit)
+                    masked_o = jnp.where(in_orb, d, minus_inf)
+                    loc_o = jnp.argmax(masked_o)
+                    glob_ov = lax.pmax(masked_o[loc_o], mesh_axis)
+                    more = jnp.isfinite(glob_ov)
+                    masked_d = jnp.where(more, masked_o, masked_d)
                 local_p_idx = jnp.argmax(masked_d)
                 local_pv = masked_d[local_p_idx]
                 global_pv = lax.pmax(local_pv, mesh_axis)
@@ -1168,7 +1240,7 @@ def make_sharded_pivoted_cholesky_select(
                 # collective round trip per iteration for a number nobody
                 # reads until the end was the cheapest 25% on the hot path.
                 trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new))
-                if orbit_id_slab is None:
+                if orbit_id_slab is None or orbit_block:
                     kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
                 else:
                     # ``orbit_id_p`` came back on the FUSED psum above.
@@ -1177,13 +1249,20 @@ def make_sharded_pivoted_cholesky_select(
                 active = active & ~kill_mask
                 d = jnp.where(kill_mask, minus_inf,
                               jnp.where(take, d_new, d))
+                if orbit_block:
+                    # ``more`` says the pivot came from the orbit already in
+                    # progress; otherwise this pivot OPENED an orbit and its
+                    # id (off the same fused psum) becomes the current one.
+                    cur_orbit = jnp.where(more & take, cur_orbit, orbit_id_p)
+                    return (d, L, piv, active, d_taken, trR_over_trG,
+                            d_min_raw, d_min_at, d_min_j, cur_orbit)
 
                 return (d, L, piv, active, d_taken, trR_over_trG,
                         d_min_raw, d_min_at, d_min_j)
 
+            _out = lax.fori_loop(0, k_keep, body, init)
             (d_final, L_out, piv_out, _, d_taken, trR_over_trG,
-             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
-                0, k_keep, body, init)
+             d_min_raw, d_min_at, d_min_j) = _out[:9]
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
             # The one psum the per-iteration diagnostic was costing.
             trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG

@@ -129,7 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "run contains every other set on that grid and can "
                         "score them all. Points not in this run's candidate "
                         "pool are reported, not silently dropped.")
-    p.add_argument("--pivot-granularity", choices=("orbit", "point"),
+    p.add_argument("--pivot-granularity",
+                   choices=("orbit", "point", "orbit_block"),
                    default="orbit",
                    help="WHAT the greedy pivots on. 'orbit' (default, the "
                         "historical behaviour) takes one pivot per orbit and "
@@ -146,7 +147,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "directions on Si 4x4x4 where every recorded k-means "
                         "draw at the same N spans 1084-1246, because the "
                         "largest residual diagonals sit on special-position "
-                        "orbits, which are the most redundant ones.")
+                        "orbits, which are the most redundant ones. "
+                        "'orbit_block' is the one that maximises the "
+                        "DELIVERED set's rank: it walks orbits in residual "
+                        "order but deflates every member of an orbit "
+                        "individually before opening the next, so the "
+                        "delivered set is orbit-closed AND every point in it "
+                        "is a certified independent direction.")
     p.add_argument("--n-pivot-keep", type=int, default=None,
                    help="Pin the number of pivots the select keeps — orbits "
                         "under --pivot-granularity orbit, points under "
@@ -472,16 +479,17 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
     # Σ orbit_size over the picked orbits (≈ N_c by construction).
-    point_pivots = (getattr(args, "pivot_granularity", "orbit") == "point"
-                    and orbit_id is not None)
+    _pg = getattr(args, "pivot_granularity", "orbit")
+    point_pivots = (_pg == "point" and orbit_id is not None)
+    orbit_block = (_pg == "orbit_block" and orbit_id is not None)
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
-    if point_pivots:
+    if point_pivots or orbit_block:
         # One pivot per POINT, closure afterwards: the target is a point
         # count, and the delivered set is that set closed under the group,
         # so it comes out somewhat larger.  Read the '[pivot ladder]' line
         # and pin with --n-pivot-keep to land on a chosen N.
         n_keep = N_c
-        unit = "point pivots"
+        unit = ("orbit-block point pivots" if orbit_block else "point pivots")
     else:
         n_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
                   if orbit_id is not None else N_c)
@@ -499,7 +507,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     kwargs: dict = dict(
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_keep, mesh=mesh,
         orbit_id=None if point_pivots else orbit_id,
-        close_orbits_after=orbit_id if point_pivots else None,
+        close_orbits_after=orbit_id if (point_pivots or orbit_block) else None,
+        orbit_block=orbit_block,
         use_phdf5=args.use_phdf5,
         score_point_sets=_rival_point_sets(args, wfn, cand_idx),
     )

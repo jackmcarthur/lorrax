@@ -92,3 +92,43 @@ def test_a_commensurate_glide_is_accepted():
     cand = grid_pool.full_grid_candidates(GRID)
     orbit_id, sizes = grid_pool.grid_orbit_ids(cand, Rinv, tau, GRID)
     assert int(sizes.sum()) == cand.shape[0]
+
+
+def test_orbit_block_pivots_deliver_a_closed_full_rank_set():
+    """``orbit_block`` consumes an orbit entirely before opening the next.
+
+    That is the property that makes the DELIVERED (orbit-closed) set
+    full-rank.  One-pivot-per-orbit certifies one direction per orbit and
+    then delivers all its members, so most delivered points are symmetry
+    images whose independence was never checked — measured on Si 4x4x4 at
+    24^3 as 1676 points spanning 801 directions.  Here, on a random PSD
+    Gram with six orbits of four, the two modes are asked for the same
+    twelve pivots and only one of them can certify twelve.
+    """
+    import jax.numpy as jnp
+    from centroid.pivoted_cholesky import pivoted_cholesky_select
+
+    rng = np.random.default_rng(0)
+    m, n_orb, orb_size = 24, 6, 4
+    a = rng.normal(size=(40, m)) + 1j * rng.normal(size=(40, m))
+    gram = jnp.asarray(a.conj().T @ a)
+    gram = 0.5 * (gram + gram.conj().T)
+    orbit_id = jnp.asarray(np.repeat(np.arange(n_orb), orb_size)
+                           .astype(np.int32))
+
+    piv, _, rank, *_ = pivoted_cholesky_select(
+        gram, 12, orbit_id, orbit_block=True)
+    piv = np.asarray(piv)
+    assert int(rank) == 12                       # every pivot a direction
+    assert len(set(piv.tolist())) == piv.size    # no pivot taken twice
+    counts = np.bincount(np.asarray(orbit_id)[piv], minlength=n_orb)
+    # Orbits are consumed whole: every touched orbit is complete.
+    assert set(counts[counts > 0].tolist()) == {orb_size}
+    # ...and contiguously, so at most the LAST orbit could be partial.
+    seq = np.asarray(orbit_id)[piv]
+    assert (np.diff(np.flatnonzero(np.r_[True, seq[1:] != seq[:-1]]))
+            == orb_size).all()
+
+    # One pivot per orbit cannot do better than one direction per orbit.
+    _, _, rank_orbit, *_ = pivoted_cholesky_select(gram, 12, orbit_id)
+    assert int(rank_orbit) == n_orb < 12
