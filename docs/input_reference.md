@@ -8,6 +8,13 @@ is reported in one aggregated rank-0 warning and ignored; `strict_keys = true`
 upgrades this to a refusal naming every unknown key.
 Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 
+The last section of this page is a **different input file**. The downfold
+driver takes its own `[downfold]` section rather than a GW deck, its keys are
+`downfold_config.DOWNFOLD_DEFAULTS` and share nothing with `_DEFAULTS`, and an
+unknown key there is refused rather than warned about. That table is
+transcribed from `DOWNFOLD_DEFAULTS`, which is where anything regenerating this
+page has to read it from.
+
 
 ## System
 
@@ -145,3 +152,30 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 | `wfn_fi_max` | `0` | Sub-window upper edge, exclusive; 0 = full window. |
 | `kgrid_fi` | `""` | "nx ny nz" fine k-grid for the wfn recovery; empty = none. |
 | `wfn_fi_q_chunk` | `0` | Fine-grid q-points per f(H(q)) build; 0 = N_q_coarse (same per-rank residency as fH_R); floor, rounded to device count. |
+
+## Downfold — the `[downfold]` input file
+
+Not a GW deck. These are the keys of `gw.downfold_cli`, the driver that
+compresses a finished GW calculation onto a smaller ISDF basis so that BSE and
+exciton-band work runs in a basis sized for its own band window; the section
+header must be `[downfold]`, a `[cohsex]` section is refused by name, and an
+unrecognised key is refused rather than ignored. `--print-schema` prints the
+same list. Each key's default is argued for in prose, with the measurements
+behind it, in [downfold.md](downfold.md).
+
+| key | default | meaning |
+|---|---|---|
+| `source_restart` | None | REQUIRED. The finished GW run to compress: the run directory, or its `tmp/isdf_tensors_<mu>.h5` directly. REFUSES on more than one bundle in the directory rather than taking the newest. Relative paths resolve against the input file's own directory. |
+| `output_restart` | None | REQUIRED. An output DIRECTORY; the driver writes `<dir>/tmp/isdf_tensors_<mu_S>.h5`, the layout every BSE consumer already looks for. May not be the source directory. |
+| `parent_centroids_file` | `""` | The parent's centroid coordinate table. When given, the kept rows are written as a sibling centroid file and its md5 stamped onto the small bundle. Without it the bundle carries no centroid hash and says so, rather than inheriting the parent's, which would name the wrong points. |
+| `n_val` | None | Valence/conduction shorthand for the retained window: left = (0, n_val). Exactly one of the two spellings may appear; giving both refuses. |
+| `n_cond` | None | The other half of the shorthand: right = (n_val, n_val + n_cond). |
+| `band_range_left` | `""` | Left leg of the retained band window, `lo:hi`, half-open, ABSOLUTE band indices into `psi_full_y`/`enk_full`. This is what the compression is faithful to, and it has no default because it is a physics choice. |
+| `band_range_right` | `""` | Right leg of the same window — the two are the legs of the pair density. EQUAL for BSE work; an asymmetric window is the Sigma-serving shape, accepted and announced as unvalidated, at about 2x the mu_S. |
+| `mu_small` | None | REQUIRED. Centroid count of the small basis, or `auto` = the eigenvalue rank of the retained window's Gram at `downfold_rcond` (the recommended setting). Asking for more directions than the window holds REFUSES before any expensive stage and prints the measured ceiling. |
+| `downfold_rcond` | `1.1e-06` | Relative eigenvalue cut on the small basis's Gram: a cap on the truncated pseudo-inverse's amplification (1/rcond) by construction, NOT a gap-finder. The measured 20-band ceiling is ~190 directions on two decks, and loosening the cut to 1e-8 bought 3.2x more centroids and a slightly worse spectrum. |
+| `downfold_select_tol` | None | Pivoted Cholesky's stopping tolerance; None = the kernel's own sqrt(eps). NOT the same knob as `downfold_rcond` and it does not give the same rank — the selection certificate runs about 3x the eigenvalue rank at the same nominal number, which is why both are printed, labelled differently, on every run. |
+| `mode` | `"cur"` | How the small basis is chosen: `cur` takes a SUBSET of the parent's centroids, so both fit operands are submatrices of one object and no second zeta fit exists anywhere. `refit` (fresh narrow-window k-means plus a second zeta fit) is REFUSED rather than demoted, so that nobody reads a CUR result as a refit one. |
+| `plan` | `"auto"` | `auto`/`local` = the local plan: no block-cyclic factorisation, no dependence on the process grid. `distributed` (mu tiled over a 2-D grid) is later work and REFUSES rather than demoting, because a different factorisation is a different numerical gauge. |
+| `report_residual` | true | Compute and print the per-q Pythagorean error bar `eps_W`. Two GEMMs at mu_L per q; leave it on — it is the only answer to "did this work" that needs no reference calculation. |
+| `residual_refuse_above` | None | Refuse to WRITE the small bundle when the worst-q `eps_W` exceeds this; empty = report and always write. A tripwire against a compression that has gone badly wrong, NOT a transferable statement about meV: the same 1% `eps_W` sat on 37 meV of exciton drift on one parent and 1.7 eV on another. |

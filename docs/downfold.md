@@ -20,13 +20,29 @@ different directory and everything else is as it was.
 Measured on silicon with a 960-centroid parent and a 20-band retained window:
 191 centroids out, a five-fold reduction in μ and a twenty-five-fold one in the
 storage of every (μ, μ) tensor, with the lowest twenty exciton eigenvalues
-drifting 37 meV. **How much you can compress depends entirely on whether the
+drifting 37.4 meV MAE. **How much you can compress depends entirely on whether the
 parent basis was over-complete for your window**, and it is worth reading
 `DOWNFOLD_S1.md` §3(c) before sizing a run: the same deck's shipped
 480-centroid set has no redundancy on a 20-band window at all, and downfolding
 it destroys the spectrum rather than compressing it. The driver tells you which
 situation you are in — that is what the refusal and the error bar below are
 for — but it cannot create redundancy that the parent does not have.
+
+Two numbers put that 37.4 meV in proportion, and it is worth holding both
+before you choose a cut. The first is the floor of the machinery rather than of
+the compression: a downfold that keeps every centroid over the full band window
+reproduces the parent's own lowest twenty excitons to **0.010 meV** MAE, end to
+end through an unmodified BSE driver. That is round-off through a pseudo-inverse
+and nothing else, so none of the Gram, the selection, the solve, the congruence
+or the writer is costing you anything measurable; the whole of that 37.4 meV is
+what a five-fold cut in μ_S bought. The second number is the bar it has to
+clear. Production BSE work wants better than 1 meV, and it is only
+full-frequency, MPA-class studies that have any business tolerating something
+like 10 meV. So read the aggressive demo as a demonstration of the mechanism
+rather than as a recommended setting: choose μ_S for the accuracy target and
+confirm the choice in the observable. That is the same rule `downfold_rcond`
+and `eps_W` are both held to further down this page, and for these three
+questions it is the only admissible evidence there is.
 
 ```
 python3 -m gw.downfold_cli -i downfold.in
@@ -323,3 +339,15 @@ from one basis to another. Downfold the linear objects — V, W(0), W(probe),
 each frequency or time slice — and re-fit the pole model in the small basis,
 which is cheap at that size. Anyone who transforms `Omega_q` will get numbers
 that look entirely plausible and are meaningless.
+
+It also does not yet serve Σ. What the compression is faithful to is the window
+it was fitted on, and that window is the BSE's shape — both BSE kernels contract
+ψ legs that lie inside the retained window, so a symmetric fit covers them
+exactly. Σ is the other shape, because its internal band sum runs over the full
+window while its outer projection does not, and the asymmetric window that
+expresses it is the one this driver accepts and announces as unvalidated for
+precisely this reason: the algebra is identical, the measured price is about
+twice the μ_S, and no end-to-end Σ gate has been run on it. So nothing here is
+a claim about quasiparticle energies. Re-fitting Σ in a downfolded basis is
+real, buildable, later work; today the small bundle serves the retained-window
+BSE and the exciton bands built on it, and nothing upstream of them.
