@@ -26,16 +26,31 @@ the requested counts and returns counts whose boundaries are clean, by
 widening OUTWARD (never inward — narrowing would silently drop physics the
 user asked for).  Three modes:
 
-``"snap"`` (default)
+``"strict"`` (default)
+    Refuse.  Raise, naming the multiplet, the k at which it is tightest, and
+    the counts that would work, so the user re-runs the window they meant.
+    Nothing about the calculation changes behind their back.
+``"snap"``
     Widen to the multiplet boundary and say so, loudly, naming the new
-    counts, the offending multiplet and the k at which it is tightest.
-``"strict"``
-    Raise instead of widening.  For runs where the window is a pinned
-    quantity and a silent change of problem size is worse than a stop.
+    counts, the offending multiplet and the k at which it is tightest.  An
+    explicit opt-in since 2026-08-10; it was the default before that.
 ``"off"``
     No check.  Kept because a deliberately half-multiplet window is a
     legitimate *debugging* configuration, and because a guard with no
     off switch gets deleted rather than configured.
+
+WHY STRICT IS THE DEFAULT (the owner, 2026-08-10).  ``snap`` shipped as the
+default with the exciton-features landing ``824032b7``, and inside one day it
+silently re-windowed two decks that were being used as measurement standards.
+On ``si_bse_debug`` it turned the BerkeleyGW-parity deck's requested 4v4c into
+4v8c — a 1024-dimension problem became a 2048-dimension one, every one of the
+lowest twenty excitons moved, and the gate read as an 0.0906 eV code
+regression that no branch had caused (``tests/KNOWN_FAILURES.md``, the anchor
+row).  The parity deck's false 28.6 meV "regression" was the same mechanism
+seen from the other side.  A widened window is not a repair: it is a
+DIFFERENT CALCULATION, and the whole argument for this guard is that a cut
+multiplet is not a thing to fix quietly.  So the default now refuses and says
+which counts would work, and widening is something a user asks for by name.
 
 WHY OUTWARD.  The multiplet is a subspace; the window must contain all of it
 or none of it.  Given a requested count that splits one, the two repairs are
@@ -78,7 +93,19 @@ _EV_PER_RY = 13.6056980659
 DEGENERACY_TOL_RY: float = 1.0e-3 / _EV_PER_RY      # ≈ 7.3499e-05 Ry
 
 #: The three modes, in the order they appear in the docstring.
-MODES = ("snap", "strict", "off")
+MODES = ("strict", "snap", "off")
+
+#: The mode every caller gets when nobody says otherwise: **strict**.
+#:
+#: THE ONE PLACE THIS IS DECIDED.  Every function default and every driver's
+#: ``--band-degeneracy`` default reads this name; there is no second literal
+#: in the tree, because the way ``snap`` survived a day as an unwanted default
+#: was that "the default" was spelled six times in three files and changing it
+#: meant finding all six.  Flipping this line flips the flag everywhere.
+#:
+#: Owner ruling, 2026-08-10 — see "WHY STRICT IS THE DEFAULT" in the module
+#: docstring.
+DEFAULT_MODE: str = "strict"
 
 
 class BandWindowDegeneracyError(RuntimeError):
@@ -127,7 +154,7 @@ def resolve_band_window(
     n_cond: int,
     *,
     tol_ry: float = DEGENERACY_TOL_RY,
-    mode: str = "snap",
+    mode: str = DEFAULT_MODE,
     where: str = "band window",
     log=print,
 ) -> tuple[int, int]:
@@ -145,8 +172,9 @@ def resolve_band_window(
         Requested counts, already clamped to what is available.
     tol_ry : float
         Two bands are "the same multiplet" if they are within this in Ry.
-    mode : {"snap", "strict", "off"}
-        See the module docstring.
+    mode : {"strict", "snap", "off"}
+        See the module docstring.  Defaults to :data:`DEFAULT_MODE`
+        (``"strict"``): a cut multiplet stops the run rather than resizing it.
     where : str
         Caller name, quoted in every message so a warning is locatable.
     log : callable
@@ -161,7 +189,8 @@ def resolve_band_window(
     Raises
     ------
     BandWindowDegeneracyError
-        In ``strict`` mode, if either boundary splits a multiplet.
+        In ``strict`` mode — the default — if either boundary splits a
+        multiplet.
     ValueError
         If ``mode`` is not one of :data:`MODES`.
     """
@@ -184,8 +213,10 @@ def resolve_band_window(
     # — it IS the window's midline — so it is reported and never snapped.  A
     # degeneracy here means the deck has no gap at that k (a metal, or a wrong
     # n_occ), which is a different problem with a different fix.
+    unrepairable = False
     if 0 < n_occ < nb and gaps[n_occ] <= tol:
         k, g = _tightest_k(e, n_occ)
+        unrepairable = True
         findings.append(
             f"the valence/conduction split at band {n_occ} is itself "
             f"degenerate (gap {g * 1e3 * _EV_PER_RY:.3f} meV at k={k}) — the "
@@ -222,6 +253,7 @@ def resolve_band_window(
     # this: boundary 0 is +inf, so the downward walk always terminates on a
     # clean boundary.)
     if hi_new == nb and hi_new != hi and nb >= 2 and gaps[nb - 1] <= tol:
+        unrepairable = True
         findings.append(
             f"the conduction multiplet is still open at the TOP of the "
             f"available {nb} bands — the input does not contain the whole "
@@ -236,12 +268,30 @@ def resolve_band_window(
     body = "\n".join(f"  - {f}" for f in findings)
 
     if mode == "strict":
-        raise BandWindowDegeneracyError(
-            f"{head}\n{body}\n"
-            f"  Fix: use --n-val {n_val_new} --n-cond {n_cond_new}, or pass "
-            f"--band-degeneracy snap to widen automatically, or "
-            f"--band-degeneracy off to proceed on a cut multiplet "
-            f"deliberately.")
+        # The counts line is the whole point of refusing rather than snapping,
+        # so it has to be TRUE.  Two of the findings above are not repairable
+        # by widening at all — a gapless midline, and a multiplet still open
+        # at the top of the input — and on those a "Fix: use --n-val X" line
+        # is worse than no line: the user re-runs with the counts it names,
+        # gets the same refusal, and concludes the guard is broken.  So the
+        # fix line is only a counts line when the counts actually fix it.
+        if not unrepairable:
+            fix = (f"  Fix: use --n-val {n_val_new} --n-cond {n_cond_new}, or "
+                   f"pass --band-degeneracy snap to widen to those counts "
+                   f"automatically, or --band-degeneracy off to proceed on a "
+                   f"cut multiplet deliberately.")
+        else:
+            reach = (f"--band-degeneracy snap would reach n_val={n_val_new} "
+                     f"n_cond={n_cond_new} and the window would STILL be cut"
+                     if (n_val_new, n_cond_new) != (n_val, n_cond) else
+                     "--band-degeneracy snap would return the counts you "
+                     "asked for")
+            fix = (f"  Fix: widening cannot clear everything above "
+                   f"({reach}).  What has to change is the INPUT — more bands "
+                   f"(nband) above the window, or the right n_occ — not the "
+                   f"window counts.  --band-degeneracy off proceeds on a cut "
+                   f"multiplet deliberately.")
+        raise BandWindowDegeneracyError(f"{head}\n{body}\n{fix}")
     log(f"*** {head}")
     for f in findings:
         log(f"***   - {f}")
@@ -249,8 +299,10 @@ def resolve_band_window(
         log(f"*** SNAPPED OUTWARD to n_val={n_val_new} n_cond={n_cond_new} "
             f"(bands [{lo_new}, {hi_new}) of {nb}).  The BSE problem is now "
             f"{n_val_new * n_cond_new} pairs per k instead of "
-            f"{n_val * n_cond}.  Pass --band-degeneracy strict to make this "
-            f"an error, or off to keep the requested counts. ***")
+            f"{n_val * n_cond} — this is NOT the calculation you asked for, "
+            f"and you are seeing it because --band-degeneracy snap was passed "
+            f"explicitly.  The default (strict) refuses here; off keeps the "
+            f"requested counts. ***")
     else:
         # Everything found was un-snappable (the midline, or a multiplet that
         # runs off the end).  Printing "SNAPPED to the same numbers" here
@@ -266,7 +318,7 @@ def check_band_window(
     b_max: int,
     *,
     tol_ry: float = DEGENERACY_TOL_RY,
-    mode: str = "snap",
+    mode: str = DEFAULT_MODE,
     where: str = "band window",
     log=print,
 ) -> None:
@@ -278,8 +330,12 @@ def check_band_window(
     to say the boundary is unsafe and let the caller's own window resolution
     (which does snap) be the thing that fixes it.
 
-    ``mode="strict"`` raises; ``"snap"`` warns (there is nothing to snap here,
-    so it degrades to a warning by design); ``"off"`` is silent.
+    ``mode="strict"`` — the default since 2026-08-10 — raises; ``"snap"``
+    warns (there is nothing to snap here, so it degrades to a warning by
+    design); ``"off"`` is silent.  This twin takes its mode from the SAME
+    ``--band-degeneracy`` flag as the resolver, deliberately: one flag that
+    means two things depending on which seam it reaches is how a user comes to
+    believe a run refused everything unsafe when one seam only whispered.
     """
     if mode not in MODES:
         raise ValueError(

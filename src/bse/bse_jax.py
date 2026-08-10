@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 
 import common.timing as timing
-from common.band_degeneracy import DEGENERACY_TOL_RY, MODES
+from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
 
 from .bse_ring_comm import (
     build_bse_ring_matvec,
@@ -130,7 +130,7 @@ def _preview_lanczos(
     trlan_m_max: int | None = None,
     trlan_n_keep: int | None = None,
     tda: bool = True,
-    degeneracy_mode: str = "snap",
+    degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> None:
     # ---- Stage timing --------------------------------------------------
@@ -212,9 +212,9 @@ def _preview_lanczos(
         nc_pad = int(data["n_cond_pad"])
         nv_pad = int(data["n_val_pad"])
         # The window this run is ACTUALLY solving, read off the loader — which
-        # clamped the request to what the file holds and then, under
-        # ``--band-degeneracy snap`` (the default), widened it outward past any
-        # cut multiplet.  Everything downstream of the load that needs to name
+        # clamped the request to what the file holds and then, under an
+        # explicit ``--band-degeneracy snap``, may have widened it outward past
+        # a cut multiplet.  Everything downstream that needs to name
         # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
         # the request, and the request is stale the moment the guard fires.
         n_val_eff = int(data["n_val"])
@@ -348,12 +348,16 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--input", help="COHSEX input file (for canonical isdf_tensors_*.h5 lookup)")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
-    parser.add_argument("--band-degeneracy", choices=MODES, default="snap",
+    parser.add_argument("--band-degeneracy", choices=MODES,
+                        default=DEFAULT_MODE,
                         help="what to do when --n-val/--n-cond cut a "
-                             "degenerate multiplet: 'snap' (default) widens "
+                             "degenerate multiplet: 'strict' (the default "
+                             "since 2026-08-10) refuses and names the counts "
+                             "that would work; 'snap' widens the window "
                              "OUTWARD to the multiplet boundary and says so; "
-                             "'strict' errors; 'off' proceeds on the cut "
-                             "multiplet.  Same guard, same defaults as "
+                             "'off' proceeds on the cut multiplet.  A widened "
+                             "window is a different calculation, so widening "
+                             "is opt-in.  Same guard, same defaults as "
                              "bse.exciton_bands.")
     parser.add_argument("--degeneracy-tol-ry", type=float,
                         default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",

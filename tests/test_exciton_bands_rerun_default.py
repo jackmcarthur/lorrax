@@ -1,7 +1,15 @@
-"""Gate: the exciton-bands warm re-run check is OFF by default, ON on request.
+"""Gate: the exciton-bands defaults the owner flipped, pinned so they stay so.
 
-The warm re-run at ``exciton_bands.solve_path`` re-solves the ENTIRE Q scan a
-second time and asserts the two tables agree to 1e-10.  It buys no physics.
+Two flips live here, and the second one is at the bottom of the file: the
+warm re-run check (2026-08-08, off by default) and ``--band-degeneracy``
+(2026-08-10, ``strict``).  They share a home because they share a failure
+mode — a flipped default that quietly flips back — and because this is the
+one place in the suite that reads them through the driver's OWN argparse
+rather than through a restatement of it.
+
+THE FIRST FLIP, which most of this file is about.  The warm re-run at
+``exciton_bands.solve_path`` re-solves the ENTIRE Q scan a second time and
+asserts the two tables agree to 1e-10.  It buys no physics.
 ``PROFILE_htransform_exciton.md`` measured it at **37.7 % of driver wall** at
 P=4 / 41 Q, confirming the 38.1 % seen at P=64 / 91 Q in job 7882533 — the
 largest single row in the driver's stage table, in both geometries.
@@ -25,6 +33,14 @@ different directions, and this file pins both:
    ``if`` that guards the real re-run and insists its test is a call to
    ``rerun_check_enabled``.  That is the assertion that makes this a red twin
    for the flip rather than for a helper.
+
+THE SECOND FLIP, in section (3).  ``--band-degeneracy`` now defaults to
+``strict``: a band window that cuts a degenerate multiplet refuses and names
+the counts that would work, instead of widening the window and running a
+different calculation.  The guard itself, its modes and the "no second default
+literal" gate live in ``tests/test_band_degeneracy.py``, which is pure numpy
+and imports no driver; the two cells here are the half of it that only the
+real parser can answer.
 
 Source-level plus argparse only: no solve, no fixture, no GPU.  The behaviour
 under a real solve is covered by ``test_exciton_bands.py``, which is
@@ -182,3 +198,50 @@ def test_the_skip_branch_still_reports_itself():
     assert "--rerun-check" in text, (
         "the skip path does not name --rerun-check; a reader who wants the "
         "check back has nothing to search for")
+
+
+# ---------------------------------------------------------------------------
+# (3) the SECOND flip: --band-degeneracy defaults to strict (owner, 2026-08-10)
+# ---------------------------------------------------------------------------
+
+def test_band_degeneracy_defaults_to_strict():
+    """A bare command line refuses a cut multiplet; it does not widen one.
+
+    Owner, 2026-08-10 ("do strict").  ``snap`` — which widens the band window
+    outward past a cut multiplet — shipped as the default with ``824032b7``
+    and inside one day silently re-windowed two BGW-parity decks, turning the
+    ``si_bse_debug`` anchor's 4v4c into 4v8c and reading as an 0.0906 eV code
+    regression nobody had caused (``tests/KNOWN_FAILURES.md``).  A widened
+    window is a different calculation, so widening is now opt-in.
+
+    Read through the parser, not through ``band_degeneracy.DEFAULT_MODE``:
+    ``tests/test_band_degeneracy.py`` pins the constant and pins that no
+    literal shadows it, and this cell pins that the CLI still consults it.
+    """
+    exciton_bands = _driver()
+    args = exciton_bands.build_parser().parse_args(BASE_ARGV)
+    assert args.band_degeneracy == "strict", (
+        f"a bare exciton_bands command line asks for "
+        f"{args.band_degeneracy!r}; the guard's whole argument is that a cut "
+        f"multiplet is not a thing to fix quietly")
+
+
+def test_band_degeneracy_snap_is_still_reachable_and_still_named():
+    """The opt-in has to opt in, and ``--help`` has to say what the default is.
+
+    Deleting ``snap`` was never the ruling — it stays available for the runs
+    that genuinely want the widened window, and a flip nobody can read out of
+    ``--help`` is a flip that only exists in git.
+    """
+    exciton_bands = _driver()
+    parser = exciton_bands.build_parser()
+    for mode in ("strict", "snap", "off"):
+        assert parser.parse_args(
+            BASE_ARGV + ["--band-degeneracy", mode]).band_degeneracy == mode, (
+            f"--band-degeneracy {mode} is no longer reachable from the CLI")
+    action = {a.dest: a for a in parser._actions}["band_degeneracy"]
+    assert action.default == "strict"
+    help_text = (action.help or "").lower()
+    assert "default" in help_text and "strict" in help_text, (
+        f"--band-degeneracy's help does not name strict as the default, so "
+        f"the flip is invisible from --help; got: {action.help!r}")

@@ -97,7 +97,7 @@ jax.config.update("jax_enable_x64", True)
 
 from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
-from common.band_degeneracy import (DEGENERACY_TOL_RY, MODES,
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
                                     check_band_window)
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
@@ -606,16 +606,18 @@ def build_parser():
                     help="cohsex.in with a K_POINTS crystal_b Q-path block")
     ap.add_argument("--n-val", type=int, default=4)
     ap.add_argument("--n-cond", type=int, default=4)
-    ap.add_argument("--band-degeneracy", choices=MODES, default="snap",
+    ap.add_argument("--band-degeneracy", choices=MODES, default=DEFAULT_MODE,
                     help="what to do when --n-val/--n-cond cut a degenerate "
                          "multiplet (Kramers pair under SOC+TRS, any irrep "
-                         "of dimension > 1): 'snap' (default) widens the "
-                         "window OUTWARD to the multiplet boundary and says "
-                         "so loudly; 'strict' errors instead; 'off' proceeds "
-                         "on the cut multiplet.  Half a multiplet breaks the "
-                         "exciton multiplets by an amount with no "
+                         "of dimension > 1): 'strict' (the default since "
+                         "2026-08-10) refuses, naming the counts that would "
+                         "work; 'snap' widens the window OUTWARD to the "
+                         "multiplet boundary and says so loudly; 'off' "
+                         "proceeds on the cut multiplet.  Half a multiplet "
+                         "breaks the exciton multiplets by an amount with no "
                          "convergence parameter (Si 12x12 SOC: eV-scale "
-                         "off-grid).")
+                         "off-grid), and a widened window is a different "
+                         "calculation, so widening is something you ask for.")
     ap.add_argument("--degeneracy-tol-ry", type=float,
                     default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
                     help=f"'same multiplet' tolerance in Ry (default "

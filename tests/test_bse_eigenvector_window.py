@@ -2,8 +2,12 @@
 
 THE DEFECT THIS FILE CLOSES.  ``--n-val``/``--n-cond`` are a REQUEST.  The
 loader clamps it to what the restart file holds and then, under
-``--band-degeneracy snap`` (the default since ``824032b7``), widens it outward
-past any cut multiplet — on the flagship Si deck ``n_cond 4`` becomes ``8``.
+``--band-degeneracy snap`` (the default from ``824032b7`` until the owner
+flipped it to ``strict`` on 2026-08-10, and an explicit opt-in since), widens
+it outward past any cut multiplet — on the flagship Si deck ``n_cond 4``
+becomes ``8``.  The flip narrows how often the gap between request and
+resolved window opens; it does not close it, because ``snap`` still exists and
+the clamp is unconditional, so every cell below still stands.
 ``bse_jax._preview_lanczos`` nonetheless handed ``write_eigenvectors_stream``
 the *request*, so the HDF5 dataset was created at the requested ``nc`` and the
 write of the real component died with ``TypeError: Can't broadcast``, leaving a

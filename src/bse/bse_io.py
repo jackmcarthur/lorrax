@@ -13,8 +13,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
-from common.band_degeneracy import (DEGENERACY_TOL_RY, check_band_window,
-                                    resolve_band_window)
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
+                                    check_band_window, resolve_band_window)
 
 
 def _log0(*a, **k):
@@ -1632,7 +1632,7 @@ def load_bse_data_from_restart_sharded(
     inject_head: bool = True,
     load_v_full: bool = False,
     bse_k_grid=None,
-    degeneracy_mode: str = "snap",
+    degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
@@ -2256,7 +2256,7 @@ def apply_eqp_and_reslice_bands(
     n_occ: Optional[int],
     grid_x: int,
     grid_y: int,
-    degeneracy_mode: str = "snap",
+    degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> tuple[jax.Array, jax.Array, int]:
     """Apply BGW ``eqp1.dat`` corrections and re-slice the BSE band window.
@@ -2352,7 +2352,7 @@ def _load_ring_subset(
     eqp_file: Optional[str] = None,
     n_occ: Optional[int] = None,
     input_file: Optional[str] = None,
-    degeneracy_mode: str = "snap",
+    degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load a single-device BSE subset from canonical gw_jax restart state.
