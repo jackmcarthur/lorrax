@@ -154,6 +154,34 @@ Large-N_mu / fully distributed operation — every distributed key per stage, pe
 New-user failure modes: restart refusals naming a changed band window or centroid table ("same count, different points") → rerun `restart = false`; bispinor runs refuse on missing `psi_full_y_transverse`/`v_q_bispinor.h5` (Σ^B would silently drop); sanity gates kill runs with non-negative Σ_x diagonals or NaN kin_ion/Σ before eigh; sharded-layout ValueErrors quote the divisibility/backend fix.
 Fastloop stage: `gw` (~40 s cold) — the mini-deck exercises the standing bare-launch path for SlabIO's availability probe (the `slab_io` deck key was removed 2026-08-06; there is one transport).
 
+## downfold — `gw.downfold_cli`
+
+Compresses a FINISHED GW calculation onto a smaller ISDF centroid basis, so that BSE and exciton-band work on a few-dozen-band window runs in a basis sized for that window rather than for Σ. It reads the parent run's `isdf_tensors_<mu_L>.h5`, selects μ_S of the parent's centroids by pivoted Cholesky against the RETAINED band window, solves the least-squares transfer `T = S_SS⁻¹ S_cross` in the PAIR-DENSITY metric (the three Grams are `isdf.core.c_q_from_psi_sm` with its ψ operands sliced to the window — no new kernel, no second ζ fit, no WFN read), and writes `V_qmunu`, `W0_qmunu`, the `_nohead` twins where the parent had them, `G0_mu_nu` and a sliced `psi_full_y` through the congruence `A_S = T A_L T†` into a restart bundle **in the unchanged format at the smaller μ**. Every BSE consumer is therefore a zero-change drop-in: point `bse.bse_jax` at the output directory and nothing else moves. `enk_full`, the head scalars and the parent's Coulomb-policy and band-window stamps ride through verbatim; the band axis is NOT truncated (the window is the FIT window, not a band cut — truncating it would renumber every band index and move the stamp `assert_restart_window_matches` refuses on).
+
+Takes its OWN input file (`[downfold]`), not a GW deck — a `[cohsex]` section is refused by name, and unknown keys are REFUSED rather than warned about. Full key reference and the reasoning behind each default: `docs/downfold.md`. `--print-schema` lists them.
+
+Three numbers on every run, and they are not interchangeable: the EIGENVALUE rank of the retained window's Gram (what μ_S is validated against — the driver REFUSES when you ask for more directions than the window holds, and `mu_small = auto` sets it to exactly that), pivoted Cholesky's SELECTION certificate (necessary, not sufficient; ~3× larger at the same nominal tolerance — `DOWNFOLD_RANK_PROBE.md` §7), and `eps_W(q)`, the per-q Pythagorean error bar. The last one is exact rather than an estimate: the fit is an orthogonal projection, so `‖𝒲‖² − ‖𝒲_S‖² = ‖𝒲 − 𝒲_S‖²` and `eps_W = sqrt(1 − ‖𝒲_S‖²/‖𝒲‖²)` is computable from μ×μ traces with no reference calculation and without ever forming the N×N observable. A ridge would destroy the orthogonality that makes it exact, which is why no ridge is applied anywhere on this path.
+
+Invoke: `python3 -u -m gw.downfold_cli -i downfold.in`. Mesh = the run's square startup mesh, or `--px/--py` (square only, `RUNTIME.reshape`).
+
+| key / flag | default | meaning |
+|---|---|---|
+| `source_restart` | **required** | the parent GW run directory, or its `isdf_tensors_<mu>.h5`. REFUSES on more than one bundle in the directory rather than taking the newest — this driver is the one most likely to create that ambiguity |
+| `output_restart` | **required** | output DIRECTORY; writes `<dir>/tmp/isdf_tensors_<mu_S>.h5`. May not equal the source |
+| `band_range_left` / `band_range_right` | **required** (or `n_val`/`n_cond`) | the retained window, `lo:hi`, half-open, ABSOLUTE band indices. Equal for BSE work. Asymmetric = the Σ-serving shape: accepted, announced as unvalidated, ~2× the μ_S |
+| `mu_small` | **required** | integer or `auto` (= the eigenvalue rank at `downfold_rcond`, the recommended setting) |
+| `downfold_rcond` | `1.1e-6` | relative eigenvalue cut on S_SS = a cap on pseudo-inverse amplification, NOT a gap-finder. The measured 20-band ceiling is ~190 directions on two decks; at 1e-8 and below the "rank" tracks the pool size rather than the physics |
+| `downfold_select_tol` | `sqrt(eps)` | pivoted-Cholesky stopping tolerance. NOT the same knob as `downfold_rcond` |
+| `mode` | `cur` | subset selection from the parent's centroids. `refit` (fresh narrow-window k-means + a second ζ fit) is REFUSED, not demoted |
+| `plan` | `auto` | `auto`/`local` = the local plan. `distributed` (μ over a 2-D `distrib_la` grid) is later work and REFUSES rather than demoting — a block-cyclic factorisation is a different numerical gauge |
+| `report_residual` | `true` | compute `eps_W`. Two GEMMs at μ_L per q; leave it on |
+| `residual_refuse_above` | none | refuse to WRITE when the worst-q `eps_W` exceeds this |
+| `parent_centroids_file` | none | when given, writes the kept rows as a sibling centroid table and stamps its md5; without it the bundle carries no `centroids_charge_md5` (and says so) rather than inheriting the parent's, which would name the wrong points |
+
+Failure modes, all loud: `mu_small` above the window's eigenvalue rank refuses and prints the measured ceiling with three named fixes; a parent whose `W0_ready` is False refuses (that dataset is the all-zeros placeholder, and downfolding it would pass every shape check); a parent with no `kgrid` stamp refuses (the Gram build is a convolution over k and cannot guess the split). The output bundle carries a `downfold_provenance` group with the parent file, the kept indices, the window, both tolerances, all three ranks, the per-q retained rank and the per-q `eps_W` — a downfolded bundle is deliberately indistinguishable by SHAPE from a natively fitted one, which is what makes it a drop-in, but a reader that wants to know can ask.
+
+Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and would transform, but `Omega_q` is a pole POSITION per matrix element and no change of basis maps a table of pole frequencies. Downfold the linear objects and re-fit the pole model in the small basis.
+
 ## htransform — `bandstructure.htransform`
 
 Galerkin QP bandstructure interpolation to an arbitrary k-path from coarse-grid data: Galerkin-projects ψ onto the ISDF centroid basis (since 62ba395 a Gram-eigh of A Aᴴ — nk·nb square, N_μ-free, through the `ffi.linalg` eigh plan under the same `eigh_backend` deck key as fH_q — with Vᴴ/`B_at_mu` μ-sharded; rank ≤ nk·nb), builds the f-transformed Hamiltonian fH_k = Σ_n f(ε_nk) c_nk c_nkᴴ, IFFTs to lattice fH_R, then per path-q eigvalsh + Newton inversion of f recovers ε_n(q); with `--eqp-file` the anchoring ε are GW QP energies, giving the QP bandstructure.

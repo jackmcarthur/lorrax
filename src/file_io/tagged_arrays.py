@@ -1077,6 +1077,53 @@ def read_restart_state_from_h5(filename, mesh_xy):
             psi_full_y_transverse, n_rmu_T_disk)
 
 
+def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
+    """Read ONE ``(…, μ, ν)`` restart tensor, sharded, wedge unfolded.
+
+    ``read_restart_state_from_h5`` reads the fixed set of tensors ``gw_init``
+    writes on its ``mode="w"`` pass and deliberately does not know about
+    ``W0_qmunu`` — W is written later, by a different function, once the
+    Dyson solve has produced it.  Every consumer that wants W back has
+    therefore had to re-derive the slab request, the legacy-layout collapse
+    and the wedge unfold for itself (``bse_io`` does, at its own scale).
+    This is that read, named once, on the same three private helpers the
+    canonical reader uses, so a fourth consumer does not spell it a fourth
+    way.
+
+    Returns ``None`` when the dataset is absent — which is the normal case
+    for ``V_qmunu_nohead`` / ``W0_qmunu_nohead``, an opt-in pair nothing
+    in-tree writes.  Callers that REQUIRE the tensor say so themselves; a
+    reader that raised here could not serve the optional ones.
+
+    Padding, sharding and the wedge follow the canonical reader exactly:
+    disk holds the LOGICAL μ extent, memory holds
+    ``padded_mu_extent(μ, device_count)`` with zero pad rows, output is
+    ``P(None,'x','y')``, and an IBZ-wedge dataset comes back on the FULL BZ
+    with the caller none the wiser.
+
+    ``n_rmu_logical`` overrides the μ extent read off the dataset — pass it
+    only when the dataset itself is the thing under suspicion.
+    """
+    from .slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
+
+    with h5py.File(filename, "r") as f:
+        if name not in f:
+            return None
+        ds_shape = tuple(int(s) for s in f[name].shape)
+        ds_dtype = f[name].dtype
+        wedge_tables = _qirr_wedge_tables(f)
+
+    n_rmu_disk = int(ds_shape[-1] if n_rmu_logical is None else n_rmu_logical)
+    n_rmu_pad = padded_mu_extent(n_rmu_disk, int(jax.device_count()))
+    off, shape, spec = _munu_slab_request(ds_shape, n_rmu_pad)
+    with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
+        arr = io.read_slab(name, shape=shape, dtype=ds_dtype, offset=off,
+                           mesh=mesh_xy, partition_spec=spec)
+    arr = _collapse_leading(arr, ds_shape, mesh_xy)
+    return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
+
+
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
                               n_rmu_logical=None):
     """Load canonical restart state and reshape wavefunctions into the

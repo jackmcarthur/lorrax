@@ -534,6 +534,7 @@ _DRIVER_PLUMBING_BUDGET = {
     "gw.eqp_bgw": 0,
     "gw.compute_vcoul_0d": 0,
     "postprocess.rotate_wfn_to_qp": 0,
+    "gw.downfold_cli": 0,
 
     # --- not clean, with the reason ---------------------------------------
     # ``from jax.sharding import Mesh, NamedSharding, PartitionSpec`` at :90.
