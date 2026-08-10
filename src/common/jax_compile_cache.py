@@ -772,7 +772,11 @@ def _canon_slice_jit():
 
     import jax
 
-    def _body(self, sizes, removed_dims, starts):
+    # NAMED, not `_body`: the jit's name becomes the XLA module name and the
+    # cache-key prefix, and `jit__multi_slice` being distinctive is the only
+    # reason this defect was ever findable in an explain log.  A module called
+    # `jit__body` would hide the next one.
+    def _lorrax_canonical_shard_slice(self, sizes, removed_dims, starts):
         out = []
         for sz, rm, st in zip(sizes, removed_dims, starts):
             sliced = jax.lax.dynamic_slice(self, st, sz)
@@ -781,7 +785,8 @@ def _canon_slice_jit():
             out.append(sliced)
         return out
 
-    _CANON_SLICE_JIT = jax.jit(_body, static_argnums=(1, 2))
+    _CANON_SLICE_JIT = jax.jit(_lorrax_canonical_shard_slice,
+                               static_argnums=(1, 2))
     return _CANON_SLICE_JIT
 
 
