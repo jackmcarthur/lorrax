@@ -266,8 +266,10 @@ def _report_alpha_over_path(labels, alpha_all, log=print):
         iq = int(np.argmax(rel))
         log(f"[alpha-herm] worst of {dev.size} Q is Q#{iq} "
             f"(dev/scale = {rel[iq]:.3e})")
+        # ``form`` is a LOOKUP KEY into solvers.lanczos._ALPHA_FORMS, not free
+        # text; the per-path context goes in ``name``, which is.
         ok = report_alpha_herm(
-            ((name, f"{form}, worst of {dev.size} Q at Q#{iq}"),),
+            ((f"{name} (worst of {dev.size} Q, at Q#{iq})", form),),
             ((dev[iq], scale[iq], worst[iq]),)) and ok
     return ok
 

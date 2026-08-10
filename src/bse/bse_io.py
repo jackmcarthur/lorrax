@@ -15,6 +15,23 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import padded_mu_extent
 from common.band_degeneracy import (DEGENERACY_TOL_RY, check_band_window,
                                     resolve_band_window)
+
+
+def _log0(*a, **k):
+    """``print`` on process 0 only.
+
+    The band-window guard emits a four-line block; every rank resolves the
+    same window from the same energies, so without this the warning arrives
+    64 times at P=64 and reads as 64 different problems.  ``band_degeneracy``
+    itself stays pure-numpy and jax-free, which is why the rank filter is
+    injected here rather than living in the guard.
+    """
+    try:
+        first = jax.process_index() == 0
+    except Exception:
+        first = True
+    if first:
+        print(*a, **k)
 from common.collectives import gather_to_host
 from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 
@@ -1591,7 +1608,7 @@ def load_bse_data_from_restart_sharded(
         n_val, n_cond = resolve_band_window(
             enk_full, n_occ, n_val, n_cond,
             tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
-            where="load_bse_data_from_restart_sharded")
+            where="load_bse_data_from_restart_sharded", log=_log0)
         val_indices = np.arange(n_occ - n_val, n_occ)
         cond_indices = np.arange(n_occ, n_occ + n_cond)
 
@@ -2124,7 +2141,7 @@ def apply_eqp_and_reslice_bands(
         enk_full_np, n_occ_eff - n_val, n_occ_eff + n_cond,
         tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
         where="apply_eqp_and_reslice_bands (QP-corrected spectrum; re-run "
-              "with a wider --n-val/--n-cond to repair)")
+              "with a wider --n-val/--n-cond to repair)", log=_log0)
     val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
     cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
     eps_v = jnp.asarray(enk_full_np[:, val_idx])
@@ -2308,7 +2325,7 @@ def _load_ring_subset(
     n_val, n_cond = resolve_band_window(
         enk_full_np, n_occ, n_val, n_cond,
         tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
-        where="_load_ring_subset")
+        where="_load_ring_subset", log=_log0)
     val_indices = jnp.arange(n_occ - n_val, n_occ)
     cond_indices = jnp.arange(n_occ, n_occ + n_cond)
 
