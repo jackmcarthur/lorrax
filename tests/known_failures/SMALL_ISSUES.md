@@ -31,11 +31,26 @@ silent overwrite.
    9 tests silently skip (`contract_bands` ×7, `projection_lgemm` ×2);
    a fixture provably cannot fix it; needs a launcher-level or
    lazy-import solution. [FIX_p19_env_leak.md]
-4. **`lx test --help` is not a help flag** — it attempts a real full-suite
-   run against `~/software/lorrax_P/tests` (the wrong tree); only a full
-   pool has prevented it so far. [final-batch report, 2026-08-09]
-5. **`pytest` is not on the container PATH** — `python -m pytest` works;
-   `lx run ... pytest` dies with a remapped exit 89. [final-batch report]
+4. ~~**`lx test --help` is not a help flag**~~ **FIXED** by the
+   harness-hardening lane at `0835d2b` on sandbox_v2
+   `fix/lx-harness-traps-2026-08-10` (pushed, unmerged). `-h`/`--help` is
+   now intercepted for every subcommand before dispatch and prints the help
+   text, launching nothing; anything after `--` still belongs to the
+   payload, so `lx test -- --help` remains the way to reach pytest's own
+   help. Before/after measured 2026-08-10: at the pre-fix tree
+   `lx test --help` built
+   `... in_container.sh python3 -u -m pytest -q -n 4 --help
+   /global/homes/j/jackm/software/lorrax_P/tests` — a real containerised
+   whole-node run against the base module's tree — and at the fixed tree
+   it prints help with zero `srun` lines and rc=0.
+   [final-batch report, 2026-08-09; harness-hardening lane 2026-08-10]
+5. ~~**`pytest` is not on the container PATH**~~ **FIXED** at the same
+   commit. `lx run` translates a leading bare `pytest` to
+   `python3 -m pytest` and says so. Measured: pre-fix,
+   `lx run -G 1 pytest --version` → `in_container.sh: exec: pytest: not
+   found`, exit 127, reported as 89; post-fix, the same command prints
+   `pytest 9.0.3` and returns 0. (The 127→89 laundering was the same
+   defect as row 26 and is fixed with it.) [final-batch report]
 6. **Two malformed KNOWN_FAILURES table rows** — 6 pipes where the header
    declares 4 columns; lines 168 and 1089 at `d25d8d6a`. Pre-existing.
    [final-batch report]
@@ -72,14 +87,29 @@ silent overwrite.
     rank 0 on multi-node meshes** — worked around by the trace-section
     allowlist; root cause open. [SIGMA_SCALING.md §9; KNOWN_FAILURES
     2026-08-09 amendment]
-11. **`lx status` co-tenant rendering ambiguity** — misreading it caused
-    two kill-the-wrong-process incidents in one day; kill-by-PID
-    (`pgrep -af srun`) is the adopted rule, but clearer rendering would
-    remove the trap at the source. **Second, costlier symptom
-    (2026-08-09): the table cannot distinguish a working step from a
-    hung one** — the three exciton_bands never-exit steps (KNOWN_FAILURES
-    2026-08-09 amendment) rendered as healthy occupancy all evening.
-    [ops incidents, 2026-08-08; OWED_LEGS_BATCH.md]
+11. ~~**`lx status` co-tenant rendering ambiguity**~~ **FIXED** at
+    `0835d2b`, both symptoms, plus the CPU-allocation trap from
+    BUILD_NOTES that belongs with them.
+    (a) Co-tenants are no longer hidden: `(+1)` used to be the whole story
+    a reader got about a second step on a node, and every co-tenant now
+    gets its own indented line naming it.
+    (b) `lx status --verify` answers the working-vs-hung question the
+    table could not: two `sstat` samples six seconds apart, and a per-step
+    delta of CPU time and disk I/O. Measured 2026-08-10 on one node
+    holding two 1-GPU steps that render identically as `busy` — a
+    `sleep 300` and a compute+write loop — the column reads
+    `[idle: +0.0s cpu, +0B io]` and `[working: +6.0s cpu, +9.7kB io]`.
+    Read the labels as evidence, not verdict: a collective deadlock spins
+    in a barrier, so it burns CPU and moves no bytes (`cpu-only`), and so
+    does a long kernel. The banner prints that caveat under the table.
+    (c) The banner now names the partition kind. A CPU allocation used to
+    render `1 nodes · 1/1 free`, the same shape as a GPU pool entry — the
+    reading that sent a census leg to job 56530826 to die on `Invalid
+    generic resource (gres) specification`. It now reads
+    `1 nodes · cpu · 1/1 nodes free`, and a GPU launch pinned to a CPU
+    allocation is refused `LX-CPUALLOC` by name before any `srun` runs
+    (both arms measured 2026-08-10).
+    [ops incidents, 2026-08-08; OWED_LEGS_BATCH.md; BUILD_NOTES 2026-08-09]
 12. **`windowed_exp_iEt` boundary alignment** — the convention is now
     DECIDED and landed by the clause-certification lane: half-open,
     **closed at the top `(lo, hi]`** (a pane must contain its supremum,
@@ -215,25 +245,75 @@ silent overwrite.
     defect class, corrected alongside the tensor work).
     [LT_HEAD_PROBLEM.md appendix; HEAD_TENSOR_IMPL.md]
 
-25. **`lx run --wait` abandons its wait on a transient `lx_pool: timeout
-    running scontrol` and refuses instantly with `LX-ALLOCFAIL`** — the
-    wait loop should treat a slow scontrol as "still waiting", not as
-    failure; sibling of the `lx_pool` squeue-timeout abort in
-    BUILD_NOTES. Fix = retry inside the wait, or at least distinguish
-    the two exit reasons. [OWED_LEGS_BATCH.md, 2026-08-09]
-26. **Two JAX-distributed steps co-placed on one node collide** —
-    `different incarnation` coordination-service error; one step dies
-    with exit 134 laundered to rc 89 by the harness. Needs either
-    per-step coordination ports or an lx-level no-coplacement rule for
-    P>1 steps. [OWED_LEGS_BATCH.md, 2026-08-09]
-27. **With two allocations live, `lx run --wait` sits on one while the
-    other has 4/4 GPUs free** — and pinning via `SLURM_JOBID=<jid>`
-    turns the wait into an outright `LX-EXPIRED`. The waiter should
-    consider every live allocation it could satisfy.
+25. ~~**`lx run --wait` abandons its wait on a transient `lx_pool: timeout
+    running scontrol`**~~ **FIXED** at `0835d2b`. Two changes: a probe that
+    times out is retried (`LX_PROBE_RETRIES`, default 2 extra attempts),
+    and a probe that still will not answer exits 3 rather than 2, so `lx`
+    can tell "SLURM would not answer me" from "I asked and the answer was
+    no". The former is now waited out inside the `--wait` budget — which
+    also covers attach and probe, not just node selection as before — and
+    if the budget runs out the refusal is `LX-ALLOCTIMEOUT`, whose text
+    says explicitly that nothing has been asserted about the pool.
+    Measured 2026-08-10 with a shim making the first `squeue` take 20 s:
+    pre-fix, `lx run -G 1 --wait 120` refused `LX-ALLOCFAIL` after 15 s
+    saying "no usable allocation could be attached to or created" while a
+    4-node allocation with 2h48m left sat RUNNING; post-fix the same
+    invocation absorbs three slow probes and launches, in 57 s.
     [OWED_LEGS_BATCH.md, 2026-08-09]
-28. **`-G 0` does not buy a CPU-only slot on a full pool** — a
-    CPU-only step should not compete for GPU capacity; today it queues
-    behind GPU legs. [OWED_LEGS_BATCH.md, 2026-08-09]
+26. ~~**Two JAX-distributed steps co-placed on one node collide**~~
+    **FIXED** at `0835d2b`, both halves.
+    The laundering first, because it is what hid everything else: the
+    remap test was `rc >= 90`, which swallowed not just the reserved
+    90-99 refusal band but every code above it, so all signal deaths
+    arrived as 89. It is now `90 <= rc <= 99`, and a signal death is
+    reported intact and named (`payload died on signal 6 (exit 134):
+    SIGABRT`). Measured: a step that `kill -ABRT`s itself returned 89
+    pre-fix and 134 post-fix.
+    The co-placement rule second: `lx` passes `--exclusive-distributed`
+    for any P>1 launch and `lx_pool` skips nodes already hosting a
+    multi-rank step, read from `scontrol show step`'s `Tasks=` field.
+    Per-step coordination ports were the alternative and are not
+    available to `lx`: JAX derives the coordinator port from
+    SLURM_JOB_ID, so two steps in one allocation compute the same port
+    and nothing inside either can avoid it — the same shape as the
+    physical-GPU collision, and the launcher is again the only party who
+    can see both. Measured with a live P=2 step on nid008277: pre-fix a
+    second P=2 step was placed on that same node; post-fix the node is
+    excluded by name and the leg goes elsewhere. `LX_ALLOW_COPLACEMENT=1`
+    opts out. Narrow by construction — single-rank and whole-node
+    launches never take this path. [OWED_LEGS_BATCH.md, 2026-08-09]
+27. ~~**With two allocations live, `lx run --wait` sits on one while the
+    other has 4/4 GPUs free**~~ **FIXED** at `0835d2b`, both halves.
+    The waiter now polls every allocation that could satisfy the launch —
+    filtered by the same size and kind rules `resolve_allocation` already
+    used, so nothing is considered that `lx` would not have been willing
+    to choose — and reports which one it took. Measured 2026-08-10 with
+    two live allocations: pre-fix, `-G 4 -n 4 --wait 30` sat on the full
+    one for the whole budget and refused `LX-POOLFULL` while the other
+    had three 4/4-free nodes; post-fix it says "using JID 56575336
+    instead of 56578991 — it is the one with room" and launches in 6 s.
+    `LX_SINGLE_ALLOC=1` restores the old behaviour.
+    The `SLURM_JOBID` pin second: `get_allocation` now separates "the
+    controller answered and does not know this job" from "the controller
+    did not answer", and only the first is `LX-EXPIRED`. Measured with a
+    shim failing the first `squeue -j`: pre-fix, a pinned allocation with
+    3h01m left was reported `LX-EXPIRED: JID 56575336 is no longer a
+    running allocation`; post-fix the failure is named, retried inside
+    the budget, and the leg launches. [OWED_LEGS_BATCH.md, 2026-08-09]
+28. ~~**`-G 0` does not buy a CPU-only slot on a full pool**~~ **FIXED**
+    at `0835d2b`. `-G 0` is now a zero-GPU *container* step — which is
+    what the fleet actually wants, since `--cpu` allocations carry no
+    image and therefore no jax: `--gres=none` so the step does not
+    inherit the job's GPUs, no `select_gpu.sh`, `MPICH_GPU_SUPPORT_ENABLED=0`
+    for the reason the `--cpu` path sets it, one rank per node instead of
+    the `nodes × 0 = 0` that would have built `srun -n 0`, and the pool
+    charges it 0 GPUs so it is placed on any node with room, emptiest
+    first. Measured 2026-08-10: pre-fix, `lx run -G 0` was refused
+    `LX-POOLFULL — no node in JID 56575336 has 0 GPU(s) free` because it
+    fell through to the wholly-idle-node branch; post-fix it runs, rc=0
+    in 3 s, with `CUDA_VISIBLE_DEVICES` unset in the payload. Set
+    `JAX_PLATFORMS=cpu` yourself if the payload uses JAX.
+    [OWED_LEGS_BATCH.md, 2026-08-09]
 
 29. **Two committed `dipole.h5` fixtures have no deck that reproduces
     them** — gnppm_debug and cohsex_debug: no in-tree deck produces
@@ -244,14 +324,30 @@ silent overwrite.
     regenerated — owner input needed on where their generating decks
     live or whether to retire them. [FIX_dz_none_dipole.md §7]
 
-31. **`lx release --all` cancels the SHARED pool, not just your own
-    allocations** — measured cost 2026-08-09 night: one lane's cleanup
+31. ~~**`lx release --all` cancels the SHARED pool, not just your own
+    allocations**~~ — measured cost 2026-08-09 night: one lane's cleanup
     script cancelled pool 56554959 and killed another lane's 23-minute
-    leg (restored as 56555953). Harness fix: `--all` should scope to
-    allocations the caller created, or demand confirmation when a
-    pool-tagged allocation is in the set. Until then the RULE is in
-    BUILD_NOTES: never `lx release --all` while a shared pool is live —
-    release by explicit job ID. [refreeze lane incident, 2026-08-09]
+    leg (restored as 56555953). **FIXED** at `0835d2b` on sandbox_v2
+    `fix/lx-harness-traps-2026-08-10` (pushed, unmerged).
+    The root cause was that "this tool created it" was one step too weak
+    a test. The created-ledger is a single file, `~/.lorrax/created.jsonl`,
+    in a `$HOME` every lane shares, so every `lx` that ever allocated
+    wrote into it and `--all` meant "everything any lane ever created".
+    Ledger rows now record the creating **agent**, `--all` reaches only
+    that agent's allocations, and anything else is listed, left alone, and
+    reachable only by naming its jobid to `--include-pool <jid>` — naming
+    it is the confirmation, and the cancellation is announced in red.
+    Measured 2026-08-10 both ways, with `scancel` shimmed so the shared
+    pool was never at risk: pre-fix, an agent that had created nothing ran
+    `lx release --all` and `scancel 56575336` — the live shared pool — was
+    invoked; post-fix the same call cancels nothing and prints the pool as
+    "NOT cancelling ... this agent did not create". The positive control
+    matters as much: an agent that HAD created two allocations released
+    exactly those two and left both live `lx-alloc-jackm` pools running.
+    `_reconcile` got the same scoping, since it could cancel another
+    lane's seconds-old allocation by the same reasoning.
+    **The BUILD_NOTES rule stands until the branch is deployed** — the
+    fix is not in `~/lx_deploy` yet. [refreeze lane incident, 2026-08-09]
 
 32. ~~**`bse_jax --write-eigs` crashes on any deck whose band window
     SNAPS**~~ **FIXED** at `d71f99d0` on
@@ -323,7 +419,56 @@ silent overwrite.
     those two directions are symmetry-equivalent, so the spread is
     residual, not physics. [LT_LADDER_ACROSS_THE_CELL_2026-08-10.md]
 
+35. **NOT A DEFECT — `-G=4` is not a parsing quirk.** Recorded because
+    the opposite was believed for a day and cost eleven OOM-killed
+    attempts. BUILD_NOTES 2026-08-09 says "`-G=4` gets you a QUARTER of
+    the memory (59 GB), not four times it", read as an `lx` argument
+    parsing bug. Measured 2026-08-10: `-G=4`, `-G 4`, `-G4` and
+    `--gpus=4` all parse to the same thing and all emit
+    `--gres=gpu:4` with the job name `lx-Xg4` — argparse splits on `=`
+    for short options exactly as it does for long ones. The real
+    mechanism is the GEOMETRY: `-G 4` is four ranks of one GPU each,
+    because `select_gpu.sh` pins one device per rank, so each rank sees
+    one device's memory. One process across all four devices is
+    `-G 4 -n 1`, which `lx` already supported and already announced. The
+    converse note was the one missing, and `0835d2b` adds it: every
+    multi-GPU launch now prints its rank×device geometry and points at
+    `-G 4 -n 1`. Nothing was changed in the parser, and refusing the `=`
+    form by name would have been wrong — it works.
+    [BUILD_NOTES 2026-08-09; ASIDES_AUDIT.md §A13; harness-hardening lane]
+
 ## Fixed (strike-in-place graveyard — newest first)
+
+- Rows 4, 5, 11, 25, 26, 27, 28, 31 (the `lx` harness trap inventory) —
+  fixed together at `0835d2b` on sandbox_v2
+  `fix/lx-harness-traps-2026-08-10`, 2026-08-10, branch pushed and
+  deliberately NOT merged. Struck in place above, each with its own
+  before/after measurement. Two things worth carrying forward.
+  **The branch is not deployed.** `~/lx_deploy` is a plain copy, not a
+  checkout, so the live `lx` every lane runs is still `744591a` and every
+  BUILD_NOTES interim rule — above all "never `lx release --all` while a
+  shared pool is live" — stands until the owner deploys. Deploying is
+  `cp` of two files from the branch; it is an owner action because it
+  changes the tool under every running lane at once.
+  **What makes these eight one commit rather than eight.** Six of the
+  eight are the same mistake in different clothes: a check that cannot
+  tell "I asked and the answer was no" from "I could not ask", or from
+  "the answer was about something else". `>= 90` could not tell a refusal
+  from a signal death; a timed-out `squeue` could not tell an empty pool
+  from an unreachable controller; a created-ledger keyed on the tool
+  could not tell one lane's allocation from another's; a `busy` column
+  could not tell occupancy from progress. Where a distinction was
+  missing, the fix was to make it and name both sides, which is why every
+  one of them shows up as new text in a message rather than only as new
+  behaviour.
+  Regression evidence: the `srun` line this branch emits is BYTE-IDENTICAL
+  to the pre-fix one for `-G 1`, `-G 4 -n 4`, `lx test` and `--cpu`
+  (diffed with job name and nodelist normalised), and the normal-path
+  smoke matrix is green — `run -G 1` rc=0; a P=4 GPU leg rc=0 with the
+  four ranks on four distinct devices (`CUDA_VISIBLE_DEVICES` 0/1/2/3);
+  `lx test tests/test_band_partition.py` 5 passed; `lx status`;
+  `--wait 60` against a live allocation in 9 s; release-by-agent
+  cancelling exactly its own two allocations.
 
 - Row 30 (`bandstructure.htransform` exit-hang shape) — fixed at
   `80e9a319` on `chore/refreeze-and-htransform-2026-08-09`, 2026-08-09.
