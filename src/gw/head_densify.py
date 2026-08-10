@@ -133,7 +133,7 @@ _services.ensure_on_path()
 
 import vcoul                                                  # noqa: E402
 from vcoul import CoulombGeometry                             # noqa: E402
-from vcoul.minibz import wrap_points_to_voronoi               # noqa: E402
+from vcoul import wrap_points_to_voronoi                      # noqa: E402
 
 __all__ = [
     "head_scalar_pointwise",
@@ -594,7 +594,7 @@ def _refuse_non_bulk(sys_dim) -> None:
     """Bulk 3D only, said out loud.  See ``build_fine_head_scalars``."""
     if sys_dim is None:
         return
-    from vcoul.base import SysDim
+    from vcoul import SysDim
     try:
         sd = SysDim(int(sys_dim))
     except (TypeError, ValueError):
