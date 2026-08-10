@@ -125,7 +125,7 @@ def bitcmp(name, a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sections", default="ABCDEF")
+    ap.add_argument("--sections", default="ABCDEFG")
     ap.add_argument("--n-elements", type=int, default=0,
                     help="subsample the block's elements; 0 = the whole block")
     ap.add_argument("--q", type=int, default=0)
@@ -247,32 +247,64 @@ def main():
     # ---------------------------------------------------------------- C
     if "C" in args.sections:
         banner("C. WHAT THE COMPILED FIT ACTUALLY CALLS (HLO census)")
+        import re
+        from collections import Counter
+
+        def census(text, label):
+            targets = re.findall(
+                r'custom_call_target\s*=\s*"([^"]+)"', text)
+            targets += re.findall(
+                r'stablehlo\.custom_call\s+@([A-Za-z0-9_.$]+)', text)
+            targets += re.findall(r'mhlo\.custom_call\s+@([A-Za-z0-9_.$]+)',
+                                  text)
+            for name, cnt in sorted(Counter(targets).items()):
+                print(f"  [{label}] custom_call {name:34s} x{cnt}",
+                      flush=True)
+            if not targets:
+                print(f"  [{label}] no custom calls found by name",
+                      flush=True)
+            for probe in ("eig", "svd", "lapack", "magma", "cusolver",
+                          "host", "TransferTo", "callback", "while"):
+                n = len(re.findall(probe, text, flags=re.IGNORECASE))
+                if n:
+                    print(f"  [{label}] token {probe:12s} x{n}", flush=True)
+            for line in text.splitlines():
+                low = line.lower()
+                if ("custom_call" in low or "magma" in low
+                        or "cusolver" in low or "callback" in low):
+                    print(f"  [{label}] | {line.strip()[:200]}", flush=True)
+
         try:
             text = jax.jit(
                 lambda t: pade_fit.fit_mpa_poles_batched(t, zj, n_p)
             ).lower(tile).as_text()
-            import re
-            targets = re.findall(r'custom_call_target\s*=\s*"([^"]+)"', text)
-            from collections import Counter
-            for name, cnt in sorted(Counter(targets).items()):
-                print(f"  custom_call {name:40s} x{cnt}", flush=True)
-            if not targets:
-                print("  (no custom calls in the lowered StableHLO)",
-                      flush=True)
-            for probe in ("eig", "svd", "lapack", "magma", "cusolver",
-                          "host", "TransferTo", "while", "sort"):
-                n = len(re.findall(probe, text, flags=re.IGNORECASE))
-                print(f"  token {probe:12s} appears {n} times", flush=True)
-            # And the eigvals call on its own, which is the question.
-            comp = jnp.zeros((n_p, n_p), dtype=jnp.complex128)
-            etext = jax.jit(jnp.linalg.eigvals).lower(comp).as_text()
-            etargets = re.findall(
-                r'custom_call_target\s*=\s*"([^"]+)"', etext)
-            print(f"  eigvals(8x8) lowering custom calls: "
-                  f"{sorted(set(etargets)) or 'NONE'}", flush=True)
+            census(text, "fit")
         except Exception as exc:  # noqa: BLE001
-            print(f"  HLO census failed: {type(exc).__name__}: {exc}",
+            print(f"  fit HLO census failed: {type(exc).__name__}: {exc}",
                   flush=True)
+        try:
+            comp = jnp.zeros((256, n_p, n_p), dtype=jnp.complex128)
+            etext = jax.jit(jnp.linalg.eigvals).lower(comp).as_text()
+            census(etext, "eigvals")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  eigvals HLO census failed: {type(exc).__name__}: "
+                  f"{exc}", flush=True)
+        try:
+            comp = jnp.zeros((256, n_p, n_p), dtype=jnp.complex128)
+            ctext = jax.jit(jnp.linalg.eigvals).lower(
+                comp).compile().as_text()
+            for probe in ("magma", "cusolver", "lapack", "custom-call",
+                          "eig", "host"):
+                n = len(re.findall(probe, ctext, flags=re.IGNORECASE))
+                print(f"  [eigvals-COMPILED] token {probe:12s} x{n}",
+                      flush=True)
+            for line in ctext.splitlines():
+                if "custom-call" in line or "custom_call" in line:
+                    print(f"  [eigvals-COMPILED] | {line.strip()[:200]}",
+                          flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  compiled-eigvals census failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
 
     # ---------------------------------------------------------------- D
     if "D" in args.sections:
@@ -474,6 +506,50 @@ def main():
                 bitcmp("B", jfused_out[1], shipped_fit[1])
         except Exception as exc:  # noqa: BLE001
             print(f"  jitted fused failed: {type(exc).__name__}: {exc}",
+                  flush=True)
+
+    # ---------------------------------------------------------------- G
+    if "G" in args.sections:
+        banner("G. WHERE jit STOPS BEING BIT-IDENTICAL, STAGE BY STAGE")
+        small = tile[:4096]
+
+        def stage_solve(t):
+            def one(w):
+                A, rhs, _, _ = pade_fit.build_pade_system(w, zj, n_p)
+                coef, cond, _, _ = pade_fit._solve_normalised(A, rhs, 1.0e-13)
+                return coef, cond
+            return jax.vmap(one)(t)
+
+        def stage_roots(t):
+            def one(w):
+                A, rhs, _, _ = pade_fit.build_pade_system(w, zj, n_p)
+                coef, _, _, _ = pade_fit._solve_normalised(A, rhs, 1.0e-13)
+                return pade_fit._companion_roots(coef[n_p:])
+            return jax.vmap(one)(t)
+
+        for label, fn in (("pade solve (coef)", stage_solve),
+                          ("companion roots", stage_roots)):
+            try:
+                eager = fn(small)
+                jitted = jax.jit(fn)(small)
+                leaves_e = jax.tree_util.tree_leaves(eager)
+                leaves_j = jax.tree_util.tree_leaves(jitted)
+                for i, (a, b) in enumerate(zip(leaves_j, leaves_e)):
+                    bitcmp(f"{label}[{i}]", a, b)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {label}: {type(exc).__name__}: {exc}", flush=True)
+
+        try:
+            rng = np.random.default_rng(7)
+            mats = jnp.asarray(
+                rng.standard_normal((4096, n_p, n_p))
+                + 1j * rng.standard_normal((4096, n_p, n_p)),
+                dtype=jnp.complex128)
+            bitcmp("eigvals jit vs eager",
+                   jax.jit(jnp.linalg.eigvals)(mats),
+                   jnp.linalg.eigvals(mats))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  eigvals bit check: {type(exc).__name__}: {exc}",
                   flush=True)
 
     banner("PROBE COMPLETE")
