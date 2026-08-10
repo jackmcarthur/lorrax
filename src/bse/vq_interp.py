@@ -1369,16 +1369,37 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
 
 
 def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
-                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None):
+                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None,
+                    moment=False):
     """RANK-PARALLEL mini-BZ CELL AVERAGE of the LR-slab head at target Q.
 
-    Returns ``(gstar, head_val)``:
+    Returns ``(gstar, head_val)``, or ``(gstar, head_val, M_ab)`` when
+    ``moment=True``:
 
       ``gstar``    = ``argmin_G |Q+G|²`` over the stored Miller superset
                      ``prep['GS']`` — the umklapp bringing Q nearest Γ.
       ``head_val`` = ``<v_LR(Q+G*)>_mBZ / celvol`` (real), in the SAME units
                      as ``eval_vq``'s stored ``v[gstar]`` point value, so the
                      evaluator injects it by a straight slot replacement.
+      ``M_ab``     = ``<v_LR(q) q_a q_b>_mBZ / celvol`` (real symmetric 3x3,
+                     ``moment=True`` only), on the SAME kept samples and with
+                     ``q = Q+G*+δq`` the full Cartesian momentum.
+
+    THE SCALAR IS THE WRONG MOMENT, AND ``M_ab`` IS THE RIGHT ONE.  The head
+    the exchange kernel actually wants averaged is ``v(q)·|q·d|²``, not
+    ``v(q)`` — the pair amplitude vanishes linearly at Γ and its square is
+    what tames the pole.  Averaging ``v`` alone and evaluating the amplitude
+    at the cell CENTRE keeps one direction out of the cell's whole
+    distribution and weights the radius at the sample instead of by ``v``;
+    the two errors are independent, one angular and one radial, so neither
+    is fixable alone (``LT_HEAD_PROBLEM.md`` §2.2).  Because the dipole is a
+    property of the transition and not of the integration variable, the true
+    average factorises exactly onto ``conj(d_a) M_ab d_b``.  ``M_ab``
+    therefore cannot be injected through ``eval_vq`` — that seam is a scalar
+    under a square root — and is consumed instead as a rank-three term over
+    the transition index (``bse_stack_matvec``'s ``head_tensor``).  The
+    scalar return is kept because the pre-tensor arm is the object under
+    repair and its baseline must not move.
 
     2D slab: pure in-plane adaptive MC (the head is a ``|Q|`` cusp, not a
     ``1/q²`` pole — no analytic sphere, BGW ``minibzaverage_2d``).  Only the
@@ -1481,19 +1502,32 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
                                    alpha=alpha, zc=float(np.pi / bvec[2, 2]))
         local_sum = float(np.sum(v))
         local_cnt = float(v.shape[0])
+        if moment:
+            K = shift_cart[None, :] + dq                     # (N, 3) momentum
+            local_mom = (K * v[:, None]).T @ K               # (3, 3)
+        else:
+            local_mom = np.zeros((3, 3))
     else:
         local_sum = local_cnt = 0.0
+        local_mom = np.zeros((3, 3))
 
     if nranks > 1:
         from jax.experimental import multihost_utils
-        g = np.asarray(multihost_utils.process_allgather(
-            np.asarray([local_sum, local_cnt], dtype=np.float64),
-            tiled=False))
+        payload = np.concatenate(
+            [np.asarray([local_sum, local_cnt], dtype=np.float64),
+             local_mom.reshape(-1)]) if moment else \
+            np.asarray([local_sum, local_cnt], dtype=np.float64)
+        g = np.asarray(multihost_utils.process_allgather(payload, tiled=False))
         tot_sum = float(g[:, 0].sum())
         tot_cnt = float(g[:, 1].sum())
+        tot_mom = g[:, 2:].sum(axis=0).reshape(3, 3) if moment \
+            else np.zeros((3, 3))
     else:
         tot_sum, tot_cnt = local_sum, local_cnt
+        tot_mom = local_mom
     head_bare = tot_sum / tot_cnt                            # mean over kept
+    if moment:
+        return gstar, head_bare / celvol, (tot_mom / tot_cnt) / celvol
     return gstar, head_bare / celvol
 
 

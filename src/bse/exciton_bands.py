@@ -74,6 +74,7 @@ import os
 import time
 from functools import partial
 
+import h5py
 import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, SLURM-aware
@@ -162,12 +163,22 @@ def _gather_host(x):
 # ===========================================================================
 def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                       nc_pad: int, nv_pad: int, *, n_eig: int,
-                      block_size: int, max_iter: int, n_reorth: int | None = None):
+                      block_size: int, max_iter: int, n_reorth: int | None = None,
+                      head_tensor: bool = False):
     """One jitted ``solve_path`` for a whole Q list.
 
         solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R)
+                   psi_v_X, psi_v_Y, eps_v, W_R)              (default)
+        solve_path(..., W_R, D_head, M_Q)                     (head_tensor)
             -> (evs (nQ, n_eig), alpha (per-Q α-Hermiticity scalars))
+
+    ``head_tensor`` adds the cell-averaged nonanalytic exchange head as a
+    rank-three-over-transitions term (``bse_stack_matvec``'s ``head_tensor``).
+    ``D_head`` is ``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)``,
+    Q-INDEPENDENT — it is the q→0 coefficient of the pair amplitude, a
+    property of the k-point transition — while ``M_Q`` is the per-Q cell
+    moment ``(nQ, 3, 3)`` and therefore rides the scan xs beside ``V_Q``.
+    Default False traces the pre-existing program unchanged.
 
     The second output is the α-Hermiticity report as DATA: it is what keeps
     this program free of host callbacks and therefore persistable in JAX's
@@ -193,16 +204,21 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         # saturation breeds ghost duplicates.  Full reorth costs
         # O(M·n·bs²) — negligible next to the matvec at every BSE size.
         n_reorth = max_iter
-    matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
+    matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
+                                    head_tensor=head_tensor)
     # Filled at TRACE time by the sink below (see the module note on the
     # persistable-scan fix); the static half of the α-Hermiticity report.
     alpha_labels: list = []
 
     @jax.jit
     def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R):
+                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
         def body(carry, xs):
-            psi_c_X, psi_c_Y, eps_c, V = xs
+            if head_tensor:
+                psi_c_X, psi_c_Y, eps_c, V, M_head = xs
+            else:
+                psi_c_X, psi_c_Y, eps_c, V = xs
+                M_head = None
             psi_c_X = lax.with_sharding_constraint(psi_c_X, sh.psi_x)
             psi_c_Y = lax.with_sharding_constraint(psi_c_Y, sh.psi_y)
             V = lax.with_sharding_constraint(V, sh.V)
@@ -214,8 +230,9 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             def matvec_block(Vb):
                 X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
+                extra = (D_head, M_head) if head_tensor else ()
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                            eps_c, eps_v, W_R, V, M_X, M_Y)
+                            eps_c, eps_v, W_R, V, M_X, M_Y, *extra)
                 HX = HX.reshape(block_size, -1)
                 return HX
 
@@ -234,8 +251,9 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             alpha_labels[:] = _labels
             return carry, (evs[:n_eig].real, _payload)
 
-        _, (evs_all, alpha_all) = lax.scan(
-            body, None, (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
+        xs = ((psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q, M_Q) if head_tensor
+              else (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
+        _, (evs_all, alpha_all) = lax.scan(body, None, xs)
         return evs_all, alpha_all
 
     solve_path.alpha_labels = alpha_labels
@@ -277,6 +295,70 @@ def _report_alpha_over_path(labels, alpha_all, log=print):
 # ===========================================================================
 # stacks: htransform conduction caches + V_Q tiles for the whole path
 # ===========================================================================
+def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
+                              *, log=print):
+    """``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)`` complex.
+
+    The cell-averaged exchange head is
+    ``K^head_{t,t'} = (1/N_k) conj(d_a(t)) M_ab d_b(t')``, and ``d`` is the
+    dipole LORRAX already computes and ships in ``dipole.h5``: the head's
+    q-linear coefficient is exactly ``∂_q M_cv(k,q,0)|_0 = -i d``, so the
+    ``∂_q ζ̃`` the μ-basis route would have needed never appears
+    (``LT_HEAD_PROBLEM.md`` §6).
+
+    Returned pre-conjugated and in ``M_X``'s ``(k, c, v, ·)`` layout, with a
+    Cartesian axis of length 3 where μ was, so the matvec's head term reads
+    exactly as its exchange term (``bse_stack_matvec``, ``head_tensor``).
+    The ``(c, v)`` window and its padding match the loader's:
+    ``val_indices = arange(n_occ-n_val, n_occ)`` lowest-first, which is the
+    same slice ``slice_dipole_to_bse_window`` takes.
+
+    REPRESENTATION CONSISTENCY, STATED RATHER THAN GLOSSED.  The exchange
+    BODY lives in the ISDF centroid basis and this head does not — the
+    dipoles are exact Cartesian matrix elements on the G-sphere.  That is a
+    deliberate, controlled inconsistency (``LT_HEAD_PROBLEM.md`` §6.4): the
+    μ-basis reconstruction of ``lim_{q→0} M_cv`` is precisely the quantity
+    whose failure to vanish leaves the spurious Γ residual, and the exact
+    dipole has no such residual, so the trade favours the dipole.  Two
+    consequences follow and are real: head and body no longer cancel each
+    other's ISDF error, and no run with the head on is bit-comparable to one
+    without it.  That is why the feature is opt-in and why the off arm is
+    gated bit-identical.
+
+    The dipoles also carry the velocity-sign convention of the FILE they came
+    from.  Since the head is quadratic in ``d`` it inherits that convention
+    at full strength.  As of 2026-08-09 the tree's default arm is ``+1`` and
+    the tracked fixtures were re-cut on it, so the provenance stamp is read
+    and logged rather than assumed.
+    """
+    from .absorption_common import (build_dipole_vector_bse, load_dipole_h5,
+                                    slice_dipole_to_bse_window)
+    from .bse_io import resolve_n_occ
+
+    path = args.dipole if getattr(args, "dipole", None) else \
+        os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
+    dipole_cart, deltaE, attrs = load_dipole_h5(path)
+    with h5py.File(path, "r") as f:
+        sign = f.attrs.get("prov_vnl_velocity_sign", None)
+        skip_vnl = f.attrs.get("skip_vnl", None)
+    if int(attrs["nk"]) != int(nk):
+        raise SystemExit(
+            f"{path} has nk={attrs['nk']} but the BSE grid has nk={nk}.  The "
+            f"head tensor contracts the dipole against the BSE transition "
+            f"index, so the two k-lists must be the same list in the same "
+            f"order.  Rebuild the dipole from this deck's WFN.")
+    n_occ = resolve_n_occ(None, input_file=args.input)
+    d_alpha, _ = slice_dipole_to_bse_window(dipole_cart, deltaE,
+                                            n_occ, n_val, n_cond)
+    d_vec = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad,
+                                    n_val_pad=nv_pad)      # (3, c, v, k)
+    log(f"  [head-tensor] dipoles from {os.path.basename(path)} "
+        f"(nk={attrs['nk']}, nbands={attrs['nbands']}, n_occ={n_occ}, "
+        f"velocity_sign={sign!r}, skip_vnl={skip_vnl!r}); "
+        f"max|d|^2 = {float(np.max(np.abs(d_vec)**2)):.4g} bohr^2")
+    return np.conj(np.transpose(d_vec, (3, 1, 2, 0)))      # (k, c, v, 3)
+
+
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
                             n_rmu_pad, mesh_xy):
     """Reshape the htransform bundle over the concatenated {k+Q} list into
@@ -581,6 +663,12 @@ def build_parser():
                          "4-13%% near-Γ/zone-boundary head error, "
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
+    ap.add_argument("--dipole", default=None,
+                    help="dipole.h5 for the mini-BZ head TENSOR (only read "
+                         "when head_minibz_average is ON).  Default: "
+                         "dipole.h5 beside the input file.  The head's "
+                         "q-linear coefficient IS this dipole, which is why "
+                         "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--eigh-backend", default=None,
                     choices=eigh_backend_choices(),
                     help="OVERRIDES the input-file ``eigh_backend`` key "
@@ -988,6 +1076,12 @@ def main(argv=None):
 
     t0 = time.time()
     V_rows = []
+    # Per-Q cell moment for the tensor head.  Zero for Γ and for every Q on
+    # the OFF arm, which makes the head term an exact no-op there — the Γ
+    # endpoint keeps the production q=0 tile and its rank-one head, as its
+    # own docstring promises.
+    M_rows = np.zeros((nQ, 3, 3), dtype=np.float64)
+    head_scalars: list = []
     v_gamma = jax.device_put(data["V_q0"], grid_xy)
     n_eval_calls = 0
     for iQ in range(nQ):
@@ -1006,12 +1100,18 @@ def main(argv=None):
             continue
         q_tile = jnp.asarray(q_tile_np)
         if head_mbz:
-            gstar, head_val = vq_interp.minibz_head_vlr(
-                zx, prep, q_tile_np, alpha=args.alpha)
+            gstar, head_val, M_ab = vq_interp.minibz_head_vlr(
+                zx, prep, q_tile_np, alpha=args.alpha, moment=True)
+            # The head channel leaves the mu basis entirely: v[gstar] -> 0
+            # removes the LR G* column from the tile, and the cell-averaged
+            # head comes back as the rank-three tensor term in the matvec.
+            # Injecting BOTH would double-count the head.
+            M_rows[iQ] = M_ab
             V_rows.append(_hermitize(eval_vq(
                 q_tile, prep["V_SRc"], pinvF, coeffs_packed,
-                jnp.asarray(head_val, dtype=jnp.float64),
+                jnp.asarray(0.0, dtype=jnp.float64),
                 jnp.asarray(gstar, dtype=jnp.int32))))
+            head_scalars.append((iQ, float(head_val), float(np.trace(M_ab))))
         else:
             V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
                                              coeffs_packed)))
@@ -1042,6 +1142,16 @@ def main(argv=None):
     n_solve = nQ + len(refit_idx)
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))
+    if head_mbz:
+        # refit rows carry no head tensor (they are the ground-truth
+        # point-value comparison); zero is an exact no-op in the term.
+        M_stack = np.concatenate(
+            [M_rows, np.zeros((len(refit_idx), 3, 3))], axis=0)
+        for iQ, hv, trM in head_scalars[:4]:
+            log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
+                f"tr M_ab = {trM:.6e} Ry/bohr^2")
+        if len(head_scalars) > 4:
+            log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
     tick("vq_eval", t0)
 
     # refit rows reuse their Q's conduction caches: extend the scan xs
@@ -1094,14 +1204,25 @@ def main(argv=None):
             W_R = densify_W(W_q_coarse)
             log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
                 f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine grid)")
+    # ── the tensor head's transition-side operand: conj(d) on the BSE window ──
+    # Q-INDEPENDENT.  d is the q→0 coefficient of the pair amplitude
+    # (LT_HEAD_PROBLEM.md §6.1), so it belongs to the k-point transition, and
+    # only the cell moment M_ab carries Q.
+    head_args = ()
+    if head_mbz:
+        D_head = build_head_dipole_operand(
+            args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
+        head_args = (jnp.asarray(D_head),
+                     jnp.asarray(M_stack, dtype=jnp.float64))
     solver = build_path_solver(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
-        block_size=args.block_size, max_iter=args.max_iter)
+        block_size=args.block_size, max_iter=args.max_iter,
+        head_tensor=head_mbz)
     tick("w_r_and_build", t0)
     t_c0 = time.time()
     evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                 data["psi_v_X"], data["psi_v_Y"],
-                                data["eps_v"], W_R)
+                                data["eps_v"], W_R, *head_args)
     # The block-Lanczos Ritz values come from a small replicated eigh(T) — the
     # scan output is fully addressable on every process, so the rank-0
     # ``device_get`` below reconstructs the whole (n_solve, n_eig) table
@@ -1127,7 +1248,8 @@ def main(argv=None):
         t_w0 = time.time()
         evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)[0])
+                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R,
+                   *head_args)[0])
         t_warm = time.time() - t_w0
         tick("solve_scan_warm", t_w0)
         assert np.allclose(evs2, evs_all, atol=1e-10), \
@@ -1145,7 +1267,7 @@ def main(argv=None):
     t0 = time.time()
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
-                       W_R).compile().memory_analysis()
+                       W_R, *head_args).compile().memory_analysis()
     log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
         f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
         f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
