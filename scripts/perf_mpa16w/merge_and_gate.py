@@ -122,42 +122,50 @@ def main():
           f"{audit_w['reassoc_shuffled_max_abs_ry']:.6e} Ry "
           f"({audit_w['reassoc_shuffled_rel']:.3e} rel)")
 
-    # Pole by pole: the window legs of pole p against the single-leg
-    # computation of pole p.  This is the finest comparison the two arms
-    # admit, and it is where a genuine defect would show as a jump of
-    # orders rather than as a last-bit.
+    # Pole by pole, where the partition allows it.  A pole leg's cube IS
+    # the single-process computation of that pole, so comparing it against
+    # the sum of the window legs covering that pole is the single-leg arm
+    # of the gate.  IT IS ONLY A COMPARISON WHERE THE POLE IS COVERED
+    # EXCLUSIVELY: a balanced contiguous partition puts leg boundaries
+    # inside poles, so most poles are shared with a leg that also carries
+    # part of the next one, and summing only the legs that touch nothing
+    # else would compare a fraction of a pole against all of it.  That is
+    # not a small difference and it is not a defect — it is the wrong
+    # question, so it is not asked.
     print("-" * 72)
-    print("per pole: Σ of that pole's window legs against its pole leg")
-    per_pole = {}
+    print("per pole, where the partition covers a pole exclusively:")
+    legs_by_pole, exclusive = {}, {}
     for leg in manifest["legs"]:
         spec = WF.parse_group_subset(leg["group_subset"])
-        with h5py.File(leg["output"], "r") as f:
-            cube = np.asarray(f["sigma_c_partial"][()], dtype=np.complex128)
         poles_here = {p for (p, _b) in spec}
-        if len(poles_here) == 1:
-            key = min((WF.BRANCH_KEYS.index(b), lo)
-                      for (_p, b), (lo, _hi, _t) in spec.items())
-            per_pole.setdefault(poles_here.pop(), []).append((key, cube))
-        else:
-            per_pole.setdefault("mixed", []).append(((0, 0), cube))
+        key = min((p, WF.BRANCH_KEYS.index(b), lo)
+                  for (p, b), (lo, _hi, _t) in spec.items())
+        for p in poles_here:
+            legs_by_pole.setdefault(p, []).append((key, leg, len(poles_here)))
+    for p, entries in legs_by_pole.items():
+        if all(n == 1 for _k, _l, n in entries):
+            exclusive[p] = sorted(entries, key=lambda e: e[0])
     worst = 0.0
     for path in pole_paths:
         with h5py.File(path, "r") as f:
             poles = np.asarray(f.attrs["mpa_partial_poles"]).tolist()
             ref = np.asarray(f["sigma_c_partial"][()], dtype=np.complex128)
-        if len(poles) != 1 or poles[0] not in per_pole:
+        if len(poles) != 1 or poles[0] not in exclusive:
             continue
-        p = poles[0]
         acc = np.zeros_like(ref)
-        for _k, cube in sorted(per_pole[p], key=lambda kv: kv[0]):
-            acc = acc + cube
-        mxp, relp, ndp = _cmp(f"pole {p}", ref, acc)
+        for _k, leg, _n in exclusive[poles[0]]:
+            with h5py.File(leg["output"], "r") as f:
+                acc = acc + np.asarray(f["sigma_c_partial"][()],
+                                       dtype=np.complex128)
+        _mxp, relp, _ndp = _cmp(
+            f"pole {poles[0]} ({len(exclusive[poles[0]])} window legs)",
+            ref, acc)
         worst = max(worst, relp)
-    print(f"  worst per-pole relative difference: {worst:.3e}")
-    if "mixed" in per_pole:
-        print(f"  ({len(per_pole['mixed'])} leg(s) span more than one pole "
-              f"and are covered by the total comparison above, not by the "
-              f"per-pole one)")
+    shared = sorted(set(legs_by_pole) - set(exclusive))
+    print(f"  worst exclusively-covered pole, relative: {worst:.3e}")
+    print(f"  poles {shared} are split across legs that also carry a "
+          f"neighbouring pole, so they have no single-pole arm; they are "
+          f"covered by the total comparison above.")
 
     np.save(os.path.join(out_dir, "sigma_c_window.npy"), tot_w)
     np.save(os.path.join(out_dir, "sigma_c_pole.npy"), tot_p)
