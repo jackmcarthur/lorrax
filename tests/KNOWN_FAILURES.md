@@ -11,6 +11,32 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — FOUR ROWS TRANSCRIBED OUT OF THE ASIDES AUDIT (2026-08-09)
+
+**No code moved for this amendment; these four were already true at `main` and
+had no row anywhere.**  An archaeology pass over the two-fleet campaign
+transcripts (`~/lorrax_bse_perf_2026-08-08/ASIDES_AUDIT.md`) found thirteen
+things that were said out loud in a worker report — under headings its own
+authors wrote as *"listed, not chased"*, *"registered defect"*, *"worth
+flagging upward"* — and then never reached a ledger.  Two of the thirteen are
+physics or deadlock class and do not belong in a small-issues list; two more
+already have a decision or a write-up somewhere a census reader does not look.
+Those four are transcribed here.  The rest went to
+`~/lorrax_service_phase/SMALL_ISSUES.md`, the punch list and `BUILD_NOTES.md`;
+the audit's own *→ Routed* section says which went where.
+
+Verified against the tree at `f1e07bb6` (every line number below was re-read,
+not copied out of the report).
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **Σ_c breaks the k-star relation at the five non-TRIM k** | `src/gw/ppm_accumulators.py:104-105` completes a one-sided τ grid with an ELEMENTWISE `Im` — `contrib = coeff_re * sigma_im + coeff_im * sigma_re` under a comment reading *"Crossing window — keep Im[coeff·σ]"* — where the sine sum needs `(Z − Z†)/2i`.  **The two coincide only at k = −k.**  That discriminator rides this row on purpose: a check taken at the TRIM k alone comes back green and says NOTHING about the other five, so a TRIM-only green must never be read as coverage.  Found by the MPA three-way-table lane 2026-08-09 by running the thing | **OPEN, PHYSICS-IMPLICATING, OWNER.**  It moves a production quantity at five of the eight k on the deck the cross-code table was being built on.  `git log -- src/gw/ppm_accumulators.py` shows no commit since the diagnosis, and the tree contains no `(Z − Z†)/2i` completion.  The independent confirmation and the gated fix went to `integration/mpa-table-2026-08-09`, which that lane recorded as **pushed, not merged** — so nothing at `main` carries either.  **Owner decision required: the fix moves `eqp0`.**  Evidence: `ASIDES_AUDIT.md` §A1 |
+| **`jit__multi_slice` has a rank-dependent persistent-cache key** | Three distinct keys for one module name, one per non-zero rank, while rank 0 hits its own: measured warm at P=4 as `rank 0: xla_compiles=1 … hits=36` against `rank 1,2,3: xla_compiles=2 … hits=35`, the second vetoed module being `jit__multi_slice`.  **Asymmetric hit/miss across ranks is the deadlock condition, not a performance nit** — XLA:GPU compilation is a COLLECTIVE, and `docs/dev/env_vars.md:244` documents this exact divergence (scorecard AG) as producing a **permanent silent hang**.  It survives the invariant-key patch, and it costs only 0.07–0.20 s of wall, which is why it reads as a perf nit and is not one | **OPEN, DEADLOCK-CLASS, needs an owner ruling or its own worker.**  Reproducer, one command: **any warm P=4 BSE run with `LORRAX_JAX_CACHE_EXPLAIN=1`**, then read the `PERSISTENT COMPILATION CACHE MISS for 'jit__multi_slice'` lines and compare the key across ranks.  *Provenance note, so the next reader does not hunt for it:* this row was ordered with the reproducer cited to `FIX_warmcache.md` **§10 item 1**, and it is NOT there — item 1 says only *"Named and reproducible now"* and carries no command.  The command, and the measured key triple, are in **§1.2** of the same report.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_warmcache.md` §1.2 and §10 item 1; `ASIDES_AUDIT.md` §A4 |
+| **POINTER — LORRAX cannot read an `nspinor = 1` WFN.h5** | `services/symmetry_maps/src/symmetry_maps/maps.py:912` carries the comment *"For ns=1 (non-SOC), U_eff is the 1×1 identity and this einsum is a no-op"*.  That claim is false: `spinor_rotation_for_sym_row` (`:692`) returns `(2, 2)` or `(nk, 2, 2)` **unconditionally**, so the full-BZ unfold rotates a one-component slab with a two-component matrix.  **Every in-tree fixture is nspinor = 2, so the suite structurally cannot see this** — which is the whole argument for a row here rather than a fixture README | **OPEN.  Pointer row only** — the full write-ups already exist at `tests/regression/hbn_cohsex_debug/README.md:274` and `tests/regression/hbn_cohsex_debug/README_PLAN.md:115` (both cite the pre-drift `maps.py:907`; the comment is at `:912` today) and in the sandbox's `KNOWN_SANDBOX_ERRORS.md`.  It is transcribed here because a fixture README is not where a census reader looks, and this is the top unfixed onboarding trap for anyone arriving with a standard scalar QE run.  `ASIDES_AUDIT.md` §B2 |
+| **POINTER — the velocity-commutator sign at `src/common/mtxel_sweep.py:676`** | The `v = v - _pad_spinor(v_nl, …)` sign in the dipole operator's non-local term.  The measurement exists and is not in the tree: the head moves **+31.4% → 0.00%** across it.  Splash radius, as the finding worker named it: *"one character moves every `dipole.h5`, the protected fixtures, BSE absorption, and the PPM head"* | **OWNER — the decision is on the owner's list, and no code moves here.  Pointer row only**, so that a census reader who meets a dipole discrepancy finds the measurement instead of re-deriving it.  `ASIDES_AUDIT.md` §B6 |
+
+---
+
 # AMENDMENT — THE CERTIFIED TABLES LINEAGE LANDS (2026-08-09)
 
 The three stacked table campaigns (damped-line global sets, full-precision
@@ -884,17 +910,43 @@ it prevents is.  See THE RE-CUT WAVE amendment at the top of this file.
 
 ## Registered defects (found by the perf lane's convergence census, in passing)
 
-- `davidson --write-eigs` dies at P>1 (`device_get` on non-addressable
+> **ALL THREE STRUCK 2026-08-09.**  The same campaign that registered them
+> also fixed them, and this block spent the interval describing fixed defects
+> as open — the exact failure mode the SlabIO lander named when it closed its
+> own rows: *a ledger listing a fixed defect as open burns the next reader's
+> budget the same way the reverse does.*  Struck in place, per this file's
+> convention.  Audit that caught it:
+> `~/lorrax_bse_perf_2026-08-08/ASIDES_AUDIT.md` §B1.
+
+- ~~`davidson --write-eigs` dies at P>1 (`device_get` on non-addressable
   arrays in `write_eigenvectors_stream`).  Flag-path; the suite never
-  exercises it, which is how it stayed hidden.
-- `bse_feast --feast-ritz` cannot run multi-process at all
-  (`_get_feast_runner` closes over non-addressable arrays).  Same class.
-- `bse_w_exact.py:634`'s `max_gmres` column is a LOGGING defect, not a
+  exercises it, which is how it stayed hidden.~~  **FIXED by `df361cd9`**
+  ("the eigenvector writer stops trusting one solver's layout"), which is in
+  `main`; `src/bse/bse_io.py:298-320` documents the fix at length — the
+  writer fetches through `common.collectives.gather_to_host` instead of
+  assuming a solver's layout, and `bse_lanczos` pins the Davidson branch to
+  the same replicated convention.  **A SEPARATE, UNCONFIRMED `--write-eigs`
+  HANG AT P=4 SHARDED PREDATES THIS FIX** — observed at `995f9e9d`, which is
+  not a descendant of `df361cd9` — so a reader whose run **hangs** (killed in
+  the eigensolve, no `eigenvectors.h5`) rather than dying with a
+  non-addressable-array error is **not** looking at this fixed defect; that
+  observation owes one confirmation leg and carries its own row in
+  `~/lorrax_service_phase/SMALL_ISSUES.md` (row 14).
+- ~~`bse_feast --feast-ritz` cannot run multi-process at all
+  (`_get_feast_runner` closes over non-addressable arrays).  Same class.~~
+  **FIXED by `feb69f70`** ("the FEAST runner takes its operands instead of
+  baking them in"), which is in `main`; `src/bse/bse_feast.py:106-132` now
+  threads the ten operands through as RUNTIME ARGUMENTS (`matvec_operands`)
+  instead of closing over the `data` dict.
+- ~~`bse_w_exact.py:634`'s `max_gmres` column is a LOGGING defect, not a
   solver defect: the column is filled with a residual while `:248` discards
   the real iteration count — a two-line driver fix.  It is why the census
-  had to lift the cap to measure convergence at all.
+  had to lift the cap to measure convergence at all.~~  **FIXED**;
+  `src/bse/bse_w_exact.py:716` carries the *"``max_resid`` was headed
+  ``max_gmres``"* note and the column is now headed for what it holds.
 
-Evidence for all three: `~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`.
+Evidence for all three as originally registered:
+`~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`.
 
 # AMENDMENT — BSE-PERF MERGE, `integration/bse-perf-merge-2026-08-08` @ `e69a867f` (2026-08-08)
 
