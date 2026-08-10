@@ -67,7 +67,12 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
 SCOPE: slab systems with q_z = 0 coarse grids (per-G_z channels exact
 there); FULL-BZ stored ζ (nq == nk).  IBZ-only ζ storage (the IBZ cascade)
 is rejected with a clear error — unfolding ζ through the one canonical
-SymMaps sym-action is deferred work, not a parallel helper here.
+SymMaps sym-action is deferred work, not a parallel helper here.  The slab
+half of that scope is ENFORCED, not merely stated, by
+:func:`slab_scope_violations` (see its docstring for the three conditions
+and what each one costs when it is violated); a 3-D bulk deck is refused at
+load with the reason named, instead of surfacing three functions later as
+an unexplained ``run_gates`` residual.
 
 The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
 — a per-Q ζ refit from htransform full-r wavefunctions — lives in this
@@ -293,6 +298,107 @@ class _ZetaGTiles:
 
 
 # ===========================================================================
+# SCOPE — is this deck a slab at all?
+# ===========================================================================
+def slab_scope_violations(bvec, qfr=None, policy=None) -> list[str]:
+    """Every way this deck falls outside ``vq_interp``'s slab scope, in prose.
+
+    Empty list = in scope.  Pure: plain arrays and the parsed Coulomb-policy
+    dict in, strings out, no file handles — so the conditions are testable on
+    cell geometry alone, which is how they are gated
+    (``tests/test_bse_vq_interp_scope.py``).
+
+    THE MODULE IS SLAB-ONLY IN TWO INDEPENDENT WAYS, and until 2026-08-10
+    neither said so out loud.
+
+    1. **The kernel is hardwired.**  :func:`v_slab_on_set` — every ``v`` in
+       this module, the SR/LR split included — is the Ismail-Beigi 2-D
+       truncation ``8π/K² · f2d / Ω`` with ``f2d = 1 − e^{−z_c|K_∥|}
+       cos(K_z z_c)``, ``z_c = π/b3_z``.  There is no ``sys_dim`` anywhere in
+       this file.  A deck with ``sys_dim = 3`` built its stored ``V_qmunu``
+       from the BULK kernel (``vcoul.bulk_3d``, no ``f2d``), so the two are
+       different operators and ``run_gates``' ``makeVq_vs_disk`` compares
+       apples to oranges.  MEASURED on the ``si_bse_debug`` parent
+       (``/pscratch/sd/j/jackm/xd_parent``, nq = 64, n_μ = 936): the slab
+       kernel gives **3.218e-01** against a 5e-6 tolerance — the number
+       ``PIPELINE_HEALTH.md`` punch row 23 opened with — and rebuilding the
+       same tiles with the bulk kernel instead drops it to **4.593e-02**,
+       with the remainder attributable to the deck's own
+       ``mc_average_vcoul_body = true`` mini-BZ head-slot injection, which
+       this module does not model either.  Neither number is evidence about
+       the interpolation: ``makeVq_vs_disk`` is an ON-GRID check of the
+       stored ζ against the stored tiles and runs before any fit.
+
+    2. **The long-range model's channels only exist on a slab.**  Stage 2
+       fits ``M_μ(K_x, K_y)`` once per ``|G_z|`` channel.  That is exact only
+       when ``K_z`` is CONSTANT within a channel, which needs ``b3 ∥ z``,
+       ``b1, b2 ⊥ z`` AND ``q_z = 0`` on the coarse grid — then
+       ``K_z = G_z·|b3|`` identically.  On an fcc cell neither holds:
+       ``si_bse_debug``'s ``b3 = 0.6123·(1, −1, 1)`` has in-plane components
+       of exactly its own length, so ``run_gates``' ``slab_axes_offdiag``
+       reads **1.000e+00** — not a small number that might be tightened away,
+       but the ratio a cubic reciprocal lattice takes by construction.  The
+       in-plane polynomial would be fitting a ``K_z`` it cannot see.
+
+    So a bulk deck is not a tuning problem, and no change to the fit reaches
+    it.  ``--vq-mode ongrid`` (exact at every Q on the BSE grid) and
+    ``--vq-mode refit`` (the per-Q ζ refit) are the modes that serve one.
+
+    ``policy`` is :func:`file_io.read_coulomb_policy_from_h5`'s dict, or
+    ``None`` for a restart written before the stamp; an unstamped file is
+    judged on geometry alone, which is the safe direction — condition 2 is
+    the one that cannot be worked around, and it needs no stamp to see.
+    """
+    out = []
+    bvec = np.asarray(bvec, dtype=np.float64)
+    sys_dim = (policy or {}).get("sys_dim", "")
+    if str(sys_dim).strip() not in ("", "2"):
+        out.append(
+            f"the restart's Coulomb-policy stamp says sys_dim={sys_dim}, but "
+            f"this module builds every v(q+G) with the 2-D Ismail-Beigi slab "
+            f"truncation (v_slab_on_set) and has no other kernel; the stored "
+            f"V_qmunu was built with the sys_dim={sys_dim} kernel, so the two "
+            f"are different operators")
+    offdiag = float(max(np.max(np.abs(bvec[2, :2])),
+                        np.max(np.abs(bvec[:2, 2]))) / abs(bvec[2, 2]))
+    if offdiag > 1e-12:
+        out.append(
+            f"the cell's axes are not slab-separable: max|b3_xy|/|b3_z| and "
+            f"max|b1_z, b2_z|/|b3_z| reach {offdiag:.3e} (slab_axes_offdiag, "
+            f"tolerance 1e-12), so K_z is not constant within a |G_z| channel "
+            f"and the per-channel in-plane fit has an unmodelled variable")
+    if qfr is not None:
+        qz = float(np.max(np.abs(np.asarray(qfr, dtype=np.float64)[:, 2])))
+        if qz > 1e-12:
+            out.append(
+                f"the coarse q-grid is not planar: max|q_z| = {qz:.3e}, so "
+                f"K_z = q_z·b3_z + G_z·|b3| varies across the samples of one "
+                f"|G_z| channel even on slab-separable axes")
+    return out
+
+
+def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
+    """Refuse an out-of-scope deck by name.  See :func:`slab_scope_violations`.
+
+    THE ONE SITE.  ``load_zeta_coarse`` calls this before anything expensive
+    runs, so the refusal arrives instead of ``build_cq`` + a gate battery
+    whose numbers are consequences rather than causes.
+    """
+    why = slab_scope_violations(bvec, qfr=qfr, policy=policy)
+    if not why:
+        return
+    where = f" ({source})" if source else ""
+    raise ValueError(
+        "vq_interp is a SLAB model and this deck is not a slab" + where
+        + ".  " + "  ".join(f"({i + 1}) {w}." for i, w in enumerate(why))
+        + "  Neither is a tuning problem and no change to the long-range fit "
+          "reaches them; use `--vq-mode ongrid` (exact at every Q on the BSE "
+          "grid) or `--vq-mode refit` (the per-Q zeta refit) on this deck.  "
+          "See the module docstring's SCOPE note and PIPELINE_HEALTH.md punch "
+          "row 23, which is this refusal's measured history.")
+
+
+# ===========================================================================
 # coarse-data loading (reference load_fixture, with paths as arguments)
 # ===========================================================================
 def load_zeta_coarse(restart_file: str, zeta_file: str, *,
@@ -493,6 +599,18 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     zx["nv"] = int(ifmax.ravel()[0])
     assert np.all(ifmax == zx["nv"]), "ifmax not uniform over k"
     _fix_sphere_wrap(zx)
+    # SCOPE, before anything expensive.  The stamp is scalar metadata read
+    # with serial h5py (safe on every rank, no SlabIO handle), and it is the
+    # deck's own record of which Coulomb kernel built ``V_qmunu`` — the one
+    # fact this module cannot derive from geometry.  NOT re-announced here:
+    # ``bse_io`` already prints ``describe_coulomb_policy_stamp`` once per
+    # driver run, and the row-23 log shows that line sitting one screen above
+    # the gate failures it explained.  The stamp was never missing; nothing
+    # READ it.  So the fix is a refusal that quotes it, not a second copy.
+    from file_io import read_coulomb_policy_from_h5
+    assert_slab_scope(zx["bvec"], qfr=zx["qfr"],
+                      policy=read_coulomb_policy_from_h5(restart_file),
+                      source=restart_file)
     return zx
 
 
@@ -842,7 +960,17 @@ def run_gates(zx, C_q):
         log(f"vSR+vLR==v_q{q}",
             float(np.max(np.abs(vs[:n] + vl[:n] - v[:n]))
                   / max(np.max(np.abs(v[:n])), 1e-300)), 1e-13)
-    # slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane)
+    # Slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane).
+    # BELT AND BRACES SINCE 2026-08-10, not the guard: ``load_zeta_coarse``
+    # refuses a non-slab cell outright (:func:`assert_slab_scope`), naming
+    # this ratio and the two other conditions, so on any deck that reaches
+    # here the line below reads 0.000e+00.  It stays because a battery that
+    # prints every quantity it depends on is how the row-23 attribution was
+    # possible at all — and because deleting a gate is how the next one goes
+    # unwatched.  Do NOT read a FAIL here as an interpolation defect: it is
+    # cell geometry, and so is the ``makeVq_vs_disk`` residual that
+    # accompanies it on a bulk deck (both measured in
+    # :func:`slab_scope_violations`).
     bv = zx["bvec"]
     log("slab_axes_offdiag", float(max(np.max(np.abs(bv[2, :2])),
                                        np.max(np.abs(bv[:2, 2])))
