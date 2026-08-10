@@ -1337,51 +1337,92 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
 
-    # ---- Single-device column-blocked path (size-ladder wall fix) ----
+    # ---- Column-blocked Gram build (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
-    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
-    # Per-element contraction order is unchanged by blocking the OUTPUT
-    # columns, so G is numerically the same map; only materialization moves.
-    # Multi-device meshes keep the original path untouched (the 'y'-sharded
-    # column axis must not be sliced locally).
+    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309),
+    # and 196 GB EACH at M = 13824, which is what a WHOLE-GRID candidate pool
+    # (``--candidate-pool full_grid``) is on a 24³ deck.  Per-element
+    # contraction order is unchanged by blocking the OUTPUT columns, so G is
+    # numerically the same map; only materialization moves.
+    #
+    # THE COLUMN AXIS IS FREE ON EVERY MESH.  This used to be gated on
+    # ``n_dev_total == 1`` with the reason "the 'y'-sharded column axis must
+    # not be sliced locally".  That is true INSIDE a ``shard_map``, where a
+    # local slice would silently mean different columns on different devices
+    # — and false here, because ``psi_l_rmu_Y[..., c0:c1]`` is a slice of a
+    # GLOBALLY sharded array in ordinary JAX tracing: the compiler owns the
+    # reshard and the block is the same columns everywhere.  Leaving the gate
+    # in place meant a multi-device run had no blocking at all and therefore a
+    # LOWER ceiling on M than a single-device run — the whole point of a mesh
+    # inverted.  ``col_block`` is rounded to a multiple of the 'y' axis so
+    # every block, including the ragged last one, still divides the mesh.
     n_dev_total = mesh_xy.devices.size
-    col_block = 0
-    if n_dev_total == 1:
-        # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
-        # means "no override", i.e. the auto budget below.  This USED to be a bare
-        # presence test — ``=0`` and ``=off`` are the two spellings a user
-        # reaches for to DISABLE a knob, and they did the opposite or
-        # crashed: "0" is a non-empty string, so it took the override
-        # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
-        # block (maximum blocking), while "off" died in ``int()`` mid-run
-        # after the left window had already been loaded.  Same falsy
-        # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
-        env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-        if env_cb.lower() in ("", "0", "false", "no", "off"):
-            env_cb = ""
-        if env_cb:
-            try:
-                col_block = max(256, int(env_cb))
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                    f"integer column width nor a falsy token "
-                    f"('', 0, false, no, off)."
-                ) from None
+    n_y = int(mesh_xy.shape.get('y', 1))
+    # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
+    # means "no override", i.e. the auto budget below.  This USED to be a bare
+    # presence test — ``=0`` and ``=off`` are the two spellings a user
+    # reaches for to DISABLE a knob, and they did the opposite or
+    # crashed: "0" is a non-empty string, so it took the override
+    # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
+    # block (maximum blocking), while "off" died in ``int()`` mid-run
+    # after the left window had already been loaded.  Same falsy
+    # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
+    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+    if env_cb.lower() in ("", "0", "false", "no", "off"):
+        env_cb = ""
+    nk_, _, ns_, M_ = psi_l_rmu_Y.shape
+    # Two pair tensors (left and right) are live at once, each
+    # (nk, ns, ns, M, cols) complex128 — hence the leading 2 and the ns².
+    bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16 / max(n_dev_total, 1)
+    budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
+    cb_budget = int(budget_bytes // max(bytes_per_col, 1))
+    waived = False
+    if env_cb:
+        try:
+            col_block = max(1, int(env_cb))
+        except ValueError:
+            raise ValueError(
+                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
+                f"integer column width nor a falsy token "
+                f"('', 0, false, no, off)."
+            ) from None
+    else:
+        # 256 is a PERFORMANCE floor — narrower blocks under-fill the
+        # einsum — and it is not a correctness one.  It used to be applied
+        # with ``max(256, ...)``, i.e. clamped UP past a budget that could
+        # not pay for it, which is the same defect the ISDF planner had at
+        # Stage C: the knob that exists to keep the run inside memory was
+        # overridden by a speed preference and the run OOMed at a width
+        # nothing had authorised.  Waive it, loudly, when the budget says so.
+        col_block = max(1, cb_budget)
+        if col_block < 256:
+            waived = True
         else:
-            nk_, _, ns_, M_ = psi_l_rmu_Y.shape
-            bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
-            budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
-            col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
-        if col_block >= psi_l_rmu_Y.shape[3]:
-            col_block = 0  # one full block == the original computation
+            col_block = max(256, col_block)
+    # Round to a multiple of the 'y' mesh extent so both the full blocks and
+    # the ragged tail shard evenly (M itself is already a multiple of n_dev).
+    if n_y > 1 and col_block % n_y:
+        col_block = max(n_y, (col_block // n_y) * n_y)
+    if col_block >= psi_l_rmu_Y.shape[3]:
+        col_block = 0  # one full block == the original computation
 
     if col_block:
         M_cols = psi_l_rmu_Y.shape[3]
         if verbose:
             print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
                   f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; single-device path)")
+                  f"({-(-M_cols // col_block)} blocks; {n_dev_total} device"
+                  f"{'' if n_dev_total == 1 else 's'}, "
+                  f"{bytes_per_col / 1e6:.1f} MB/col/device)")
+            if waived:
+                print(f"[pivoted_cholesky] the 256-column PERFORMANCE floor "
+                      f"is WAIVED: the "
+                      f"{meta.memory_per_device_gb:g} GB/device budget pays "
+                      f"for {cb_budget} columns, and clamping up to 256 "
+                      f"would have asked for "
+                      f"{256 * bytes_per_col / 1e9:.1f} GB/device of pair "
+                      f"tensors against a {budget_bytes / 1e9:.1f} GB "
+                      f"allowance.  Narrower blocks are slower, not wrong.")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
