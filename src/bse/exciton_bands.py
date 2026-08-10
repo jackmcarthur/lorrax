@@ -102,7 +102,8 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
-                     PAD_EPS_GUARD_RY)
+                     build_w_head_channel, resolve_w_head_densify,
+                     _resolve_head_params, PAD_EPS_GUARD_RY)
 from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -921,7 +922,77 @@ def build_parser():
                          "interpolation) for the direct term.  Enables cheap "
                          "coarse-W + fine exciton sampling.  Default (unset) "
                          "keeps the native fine W byte-identical.")
+    ap.add_argument("--w-head-densify", type=str, default=None,
+                    choices=("c1", "legacy"),
+                    help="How W's Γ head crosses the coarse→fine densifier. "
+                         "'c1' (default) splits it off first and re-attaches "
+                         "it analytically per fine q — the head is never "
+                         "interpolated, which is what BerkeleyGW's kernel.x / "
+                         "intkernel split exists to guarantee.  'legacy' lets "
+                         "the Kronecker-delta head ride through the "
+                         "trigonometric interpolant: that is the documented "
+                         "defect and this arm exists ONLY as the A/B control "
+                         "that prices it.  No effect without "
+                         "--w-coarse-grid.")
+    ap.add_argument("--w-head-gamma-cell", type=str, default="fine",
+                    choices=("fine", "coarse"),
+                    help="Which mini-BZ cell the re-attached Γ head is "
+                         "averaged over.  'fine' (default) is correct.  "
+                         "'coarse' is the design's RED TWIN — invisible when "
+                         "the grids are equal, and it breaks the head sum "
+                         "rule everywhere else.  For gate work only.")
     return ap
+
+
+def _gamma_only_grid(kgrid, value):
+    """A head-scalar grid that is ``value`` at Γ and zero everywhere else.
+
+    The array shape :func:`gw.head_densify.attach_head_channel` consumes, used
+    here to SUBTRACT the head the loader already injected (pass a negative
+    value) so the densifier's operand is the body alone.  Spelled through the
+    same attach helper rather than as a bespoke ``.at[...,0,0,0].add()`` so the
+    detach and the re-attach cannot disagree about which slice, which
+    projector, or which 1/Ω the head lives on — a mismatched pair here would
+    leave a residual rank-one term with no shape error to catch it.
+    """
+    S = np.zeros(tuple(int(s) for s in kgrid), dtype=np.float64)
+    S[0, 0, 0] = float(value)
+    return S
+
+
+def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
+    """The ``whead`` the loader injected into this NATIVE-grid restart's W.
+
+    ``--w-coarse-grid`` decimates a natively fine W, so the head sitting in
+    ``data["W_q"][:,:,0,0,0]`` is the FINE cell's average — the number C1 has
+    to remove before sub-sampling and put back after densifying.  Returns
+    ``None`` (with a reason logged) when there is no head to move, in which
+    case the caller runs the plain densifier and nothing is lost.
+    """
+    try:
+        import h5py
+        with h5py.File(restart_file, "r") as f:
+            whead_restart = (np.asarray(f["whead"][:], dtype=np.complex128)
+                             if "whead" in f else None)
+            w0_ready = bool(f["W0_qmunu"].attrs.get("W0_ready", False)
+                            if "W0_qmunu" in f else False)
+    except Exception as exc:
+        log(f"[coarse-W] cannot read the restart's head ({exc}); "
+            f"falling back to w_head_densify=legacy for this run")
+        return None
+    if not w0_ready:
+        log("[coarse-W] the restart carries no ready screened W0, so the "
+            "loader injected no whead and there is no head to split off; "
+            "the densifier operand is already head-free")
+        return None
+    _vhead, whead, cell_volume, _src = _resolve_head_params(
+        input_file, None, whead_restart, float(wfn.cell_volume))
+    if whead is None or cell_volume is None:
+        log("[coarse-W] no whead resolved (no deck override, no restart "
+            "scalar); the densifier operand is already head-free")
+        return None
+    return {"whead": float(complex(whead[0]).real),
+            "cell_volume": float(cell_volume)}
 
 
 def main(argv=None):
@@ -1416,12 +1487,69 @@ def main(argv=None):
             # + device_put re-shard).  The convolution then runs on the fine
             # grid with the fine (nkx,nky,nkz) solver — cheap coarse W, fine
             # excitons.
-            W_q_coarse = decimate_W_q_to_subgrid(data["W_q"], cg)
+            #
+            # C1 (default, ``--w-head-densify c1``).  The Γ head is SPLIT OFF
+            # before the sub-sampling, so what gets trig-interpolated is the
+            # body alone, and the head is re-attached analytically at every
+            # fine q inside the coarse Γ cell (gw.head_densify).  Note the
+            # asymmetry with the ``bse_k_grid`` path: there the loader can
+            # DEFER the injection because it knows a densification is coming,
+            # whereas here the restart is natively fine and the loader has
+            # already injected — so the head is subtracted back off, using the
+            # same rank-one object with the same scalar.  That subtraction is
+            # float-inexact at the 1e-16 level and is inherent to the harness,
+            # not to C1; the legacy arm carries the identical rounding because
+            # it decimates the very same injected tile.
+            # Imported HERE, not at module scope.  ``gw.head_densify``
+            # bootstraps the service search path at import time
+            # (``ffi._services.ensure_on_path()``), and doing that from a
+            # driver's import block reorders sys.path for every run of the
+            # driver, including the ones that never densify.  Measured: it
+            # moved the X-point exciton cluster of the default path by 3e-5 eV
+            # — reproducibly, on a near-degenerate sextet, with no array in
+            # the code changed.  A feature that is off by default must not be
+            # able to do that, so the import lives inside the branch that
+            # uses it.
+            from gw.head_densify import attach_head_channel
+            w_head_mode = resolve_w_head_densify(args.w_head_densify, params)
+            W_q_fine_in = data["W_q"]
+            head_ch = None
+            if w_head_mode == "c1":
+                head_ch = _resolve_native_w_head(
+                    restart_file, args.input, wfn, log=log)
+            if head_ch is not None:
+                W_q_fine_in = attach_head_channel(
+                    W_q_fine_in, data["g0_X"], data["g0_Y"],
+                    _gamma_only_grid((nkx, nky, nkz), -head_ch["whead"]),
+                    head_ch["cell_volume"])
+            W_q_coarse = decimate_W_q_to_subgrid(W_q_fine_in, cg)
             densify_W = make_w_densifier(mesh_xy, sh.W.spec, (nkx, nky, nkz),
-                                         output="R")
-            W_R = densify_W(W_q_coarse)
+                                         output="k" if head_ch else "R")
+            W_dense = densify_W(W_q_coarse)
+            if head_ch is not None:
+                S_fine = build_w_head_channel(
+                    wfn, sym, meta, params, coarse_grid=cg,
+                    fine_grid=(nkx, nky, nkz), whead=head_ch["whead"],
+                    # THE REFERENCE GRID IS THE FINE ONE HERE.  The restart is
+                    # natively fine, so its whead is the fine cell's average —
+                    # which makes C1's Γ entry reproduce it EXACTLY, i.e. the
+                    # arm that simulates a coarse W puts back the head the
+                    # fine run really had.  Passing the coarse grid instead
+                    # would silently rescale the head by ~m².
+                    ref_grid=(nkx, nky, nkz),
+                    input_file=args.input, restart_file=restart_file,
+                    gamma_cell=args.w_head_gamma_cell, log_fn=log)
+                W_dense = attach_head_channel(
+                    W_dense, data["g0_X"], data["g0_Y"], S_fine,
+                    head_ch["cell_volume"])
+                W_R = _ifftn(W_dense)
+            else:
+                W_R = W_dense
             log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
-                f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine grid)")
+                f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine "
+                f"grid) [w_head_densify={w_head_mode}"
+                + (f", gamma_cell={args.w_head_gamma_cell}]"
+                   if head_ch else "]"))
     # ── the tensor head's transition-side operand: conj(d) on the BSE window ──
     # Q-INDEPENDENT.  d is the q→0 coefficient of the pair amplitude
     # (LT_HEAD_PROBLEM.md §6.1), so it belongs to the k-point transition, and

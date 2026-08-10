@@ -38,6 +38,16 @@ class HeadSample:
     wcoul0: complex
     source: str
     omega: complex
+    #: The Cartesian q²-coefficient tensor ``S(ω)`` that PRODUCED ``wcoul0``,
+    #: when there was one — ``(3, 3)`` complex, the convention of
+    #: ``docs/theory/s-tensor-convention.md``.  ``None`` on the ``epshead``
+    #: branch, which has no tensor (it fits an isotropic γ instead).
+    #:
+    #: Carried because ``wcoul0`` alone is the cell average on ONE grid, and
+    #: the coarse→fine W densifier (``gw.head_densify``) needs the INTEGRAND
+    #: to re-attach the head per fine q.  Persisted to the restart by
+    #: ``file_io.write_head_scalars_to_h5`` so the BSE need not rebuild it.
+    S_cart: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -298,38 +308,12 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
         if not os.path.exists(dipole_path):
             print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
             return None
-        from common.chi_from_dipole import read_dipole_h5, compute_S_omega
         from gw.vcoul import compute_q0_averages
 
         from common import timing as _tmg
-        with _tmg.section("head.read_dipole"):
-            dipole_cart, deltaE = read_dipole_h5(dipole_path)
-        nk_tot = int(sym.nk_tot)
-        nb = int(dipole_cart.shape[2])
-        nelec = int(wfn.nelec)
-        with _tmg.section("head.checks"):
-            _check_dipole_coverage(
-                dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
-                nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
-                nelec=nelec, print_fn=print_fn)
-            _check_dipole_provenance(dipole_path, params=params, wfn=wfn,
-                                     print_fn=print_fn)
-        occ = np.zeros((nk_tot, nb), dtype=float)
-        occ[:, :max(0, min(nelec, nb))] = 1.0
-        f_nk = jnp.asarray(occ, dtype=jnp.float64)
-        omega_grid = jnp.asarray([omega_val], dtype=jnp.complex128)
-        with _tmg.section("head.S_omega"):
-            S_cart_omega = compute_S_omega(
-                dipole_cart,
-                deltaE,
-                f_nk,
-                float(wfn.cell_volume),
-                int(sym.nk_tot),
-                int(wfn.nspin),
-                int(wfn.nspinor),
-                omega_grid,
-                eta=eta,
-            )[0]
+        S_cart_omega = build_S_cart_omega(
+            wfn, sym, meta, params, dipole_path, omega_val, eta=eta,
+            print_fn=print_fn)
         with _tmg.section("head.q0_avg"):
             vc0_mean, wcoul0 = compute_q0_averages(
                 wfn,
@@ -344,6 +328,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             wcoul0=complex(wcoul0),
             source=source,
             omega=omega_val,
+            S_cart=np.asarray(S_cart_omega, dtype=np.complex128),
         )
 
     source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
@@ -355,6 +340,125 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
     raise RuntimeError(
         "Failed to resolve q=0 Coulomb head: neither explicit overrides nor supported sources are available."
     )
+
+
+def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
+                       *, eta: float = 0.0, print_fn=print) -> np.ndarray:
+    """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``.
+
+    THE ONE SPELLING of the dipole → ``S(ω)`` build.  It has two consumers and
+    they must not drift: ``resolve_head_sample``'s ``s_tensor`` branch (the GW
+    run, which then averages it into ``wcoul0``) and
+    :func:`resolve_head_S_cart` (the BSE, which needs the integrand itself to
+    re-attach W's head per fine q under ``gw.head_densify``).  A second copy
+    would be a tensor that agrees with the run's head everywhere except where
+    it matters.
+
+    Units and convention are ``docs/theory/s-tensor-convention.md``: Cartesian,
+    the canonical form, ``1/(Ry·bohr²)`` such that ``v(q)·qᵀSq`` is
+    dimensionless.
+
+    Parameters
+    ----------
+    wfn, sym, meta
+        The run's loader / symmetry table / system parameters.
+    params : dict
+        Deck keys; read for the dipole provenance check only.
+    dipole_path : str
+        Absolute path to ``dipole.h5``.
+    omega : complex
+        Frequency in Ry.  0 for the static head this stage consumes.
+    eta : float
+        Broadening in Ry (deck ``wcoul0_eta``).  Non-zero makes ``S`` complex.
+
+    Returns
+    -------
+    numpy.ndarray, shape (3, 3), complex128
+    """
+    from common.chi_from_dipole import read_dipole_h5, compute_S_omega
+    from common import timing as _tmg
+
+    with _tmg.section("head.read_dipole"):
+        dipole_cart, deltaE = read_dipole_h5(dipole_path)
+    nk_tot = int(sym.nk_tot)
+    nb = int(dipole_cart.shape[2])
+    nelec = int(wfn.nelec)
+    with _tmg.section("head.checks"):
+        _check_dipole_coverage(
+            dipole_path, nb_file=nb, nk_file=int(dipole_cart.shape[1]),
+            nk_run=nk_tot, nb_run=int(getattr(meta, "nb_sigma", 0) or 0),
+            nelec=nelec, print_fn=print_fn)
+        _check_dipole_provenance(dipole_path, params=params or {}, wfn=wfn,
+                                 print_fn=print_fn)
+    occ = np.zeros((nk_tot, nb), dtype=float)
+    occ[:, :max(0, min(nelec, nb))] = 1.0
+    f_nk = jnp.asarray(occ, dtype=jnp.float64)
+    omega_grid = jnp.asarray([complex(omega)], dtype=jnp.complex128)
+    with _tmg.section("head.S_omega"):
+        S_cart_omega = compute_S_omega(
+            dipole_cart, deltaE, f_nk, float(wfn.cell_volume), int(sym.nk_tot),
+            int(wfn.nspin), int(wfn.nspinor), omega_grid, eta=float(eta),
+        )[0]
+    return np.asarray(S_cart_omega, dtype=np.complex128)
+
+
+def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
+                        sym=None, meta=None, params=None, print_fn=print):
+    """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it.
+
+    ``whead`` alone is the head CELL AVERAGE on one grid.  A coarse→fine
+    densification needs the INTEGRAND that average was taken of, so it can be
+    re-evaluated on a different cell and pointwise inside the old one — that
+    integrand is ``v/(1 − v qᵀS q)`` and this returns its ``S``.
+
+    Two routes, in order, because the first is exact and free and the second
+    exists for restarts written before the first one did:
+
+    1. **The restart's own ``S_cart_head``** — written beside ``vhead`` /
+       ``whead`` by :func:`file_io.write_head_scalars_to_h5` since this change.
+       This is the tensor that PRODUCED that ``whead``, so the provenance ratio
+       is 1 by construction and nothing has to be recomputed.
+    2. **Rebuilt from ``dipole.h5``** through :func:`build_S_cart_omega`, the
+       same call the GW run made.  Needs ``wfn``/``sym``/``meta`` (the BSE
+       coarse→fine paths already load all three for the htransform leg) and a
+       ``dipole.h5`` beside the deck.  The rebuild is deterministic, so the
+       provenance ratio it produces is a real check on whether the head in the
+       restart and this tensor describe the same screening.
+
+    Returns
+    -------
+    tuple[numpy.ndarray | None, str]
+        ``(S_cart, provenance)``.  ``S_cart`` is ``(3, 3)`` complex128 or
+        ``None`` when neither route is available; ``provenance`` names which
+        route ran, or why none did, and is meant to be logged verbatim.
+    """
+    if restart_file is not None:
+        try:
+            import h5py
+            with h5py.File(restart_file, "r") as f:
+                if "S_cart_head" in f:
+                    S = np.asarray(f["S_cart_head"][:], dtype=np.complex128)
+                    if S.shape == (3, 3):
+                        return S, f"restart S_cart_head ({os.path.basename(restart_file)})"
+                    print_fn(f"BSE head: restart S_cart_head has shape "
+                             f"{S.shape}, expected (3,3); ignoring it")
+        except Exception as exc:                    # never crash a load on this
+            print_fn(f"BSE head: could not read S_cart_head ({exc})")
+
+    if wfn is None or sym is None or meta is None or input_file is None:
+        return None, ("no S_cart: the restart carries none and the caller "
+                      "passed no wfn/sym/meta to rebuild one from dipole.h5")
+    dipole_path = os.path.join(os.path.dirname(os.path.abspath(input_file)),
+                               "dipole.h5")
+    if not os.path.exists(dipole_path):
+        return None, f"no S_cart: restart carries none and {dipole_path} is absent"
+    try:
+        S = build_S_cart_omega(wfn, sym, meta, params or {}, dipole_path, 0.0,
+                               eta=float((params or {}).get("wcoul0_eta", 0.0) or 0.0),
+                               print_fn=print_fn)
+    except Exception as exc:
+        return None, f"no S_cart: rebuild from dipole.h5 failed ({exc})"
+    return S, "rebuilt from dipole.h5 (S(ω=0), the GW run's own route)"
 
 
 class HeadResolver:

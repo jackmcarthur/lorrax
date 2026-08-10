@@ -1393,6 +1393,23 @@ def _parse_grid_spec(spec) -> Optional[tuple[int, int, int]]:
     return tuple(int(x) for x in parts)
 
 
+def _read_lorrax_input_quietly(input_file: Optional[str]) -> dict:
+    """The deck as a dict, or ``{}`` — a config read must never crash a load.
+
+    Same tolerance as :func:`_resolve_bse_k_grid`'s own read: the loader has
+    to work on a restart with no deck beside it, and a malformed key is a
+    reason to fall back to defaults loudly, not to lose the tensors.
+    """
+    if input_file is None or not os.path.isfile(input_file):
+        return {}
+    try:
+        from gw.gw_config import read_lorrax_input
+        return read_lorrax_input(input_file) or {}
+    except Exception as exc:
+        print(f"BSE: deck read failed ({exc}); using defaults")
+        return {}
+
+
 def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
     """Resolve the fine grid: explicit ``bse_k_grid`` arg wins; else read the
     ``bse_k_grid`` key from ``input_file`` (cohsex.in).  Returns a 3-tuple or
@@ -1409,6 +1426,166 @@ def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
     return None
 
 
+#: Deck / CLI values for ``w_head_densify``.  ``c1`` is the default and is the
+#: repaired path; ``legacy`` is the pre-C1 behaviour, kept ONLY so the A/B that
+#: prices the repair can run both arms through the shipped driver.  It is not a
+#: supported production choice and says so when it fires.
+W_HEAD_DENSIFY_MODES = ("c1", "legacy")
+
+
+def resolve_w_head_densify(mode, params=None) -> str:
+    """Resolve the coarse→fine W head treatment: ``'c1'`` (default) or
+    ``'legacy'``.
+
+    Explicit argument wins; else the deck's ``w_head_densify`` key; else
+    ``'c1'``.  ``'legacy'`` re-enables trigonometric interpolation of the
+    Kronecker-delta head — the defect ``gw.head_densify`` documents — and
+    exists so the densified-versus-native A/B has a control arm that is the
+    SHIPPED code path rather than a reconstruction of it.
+    """
+    val = mode
+    if val is None and params is not None:
+        val = params.get("w_head_densify")
+    if val is None:
+        return "c1"
+    val = str(val).strip().lower()
+    if val not in W_HEAD_DENSIFY_MODES:
+        raise ValueError(
+            f"w_head_densify = {mode!r} is not one of {W_HEAD_DENSIFY_MODES}. "
+            f"'c1' splits the Γ head off before the densifier and re-attaches "
+            f"it per fine q; 'legacy' trigonometrically interpolates it, which "
+            f"is the documented defect and is kept only as an A/B control.")
+    return val
+
+
+def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
+                         whead, ref_grid, input_file, restart_file,
+                         gamma_cell: str = "fine", log_fn=print):
+    """The C1 head channel ``S_fine(q)`` for a coarse→fine W, end to end.
+
+    ONE composer for BOTH shipping densification paths — the ``bse_k_grid``
+    bundle densification (:func:`_interpolate_bse_data_to_grid`) and
+    ``exciton_bands --w-coarse-grid``.  They differ only in which grid the
+    reference head was measured on (``ref_grid``), and that difference is an
+    argument rather than two code paths.
+
+    Resolves ``S_cart`` (restart dataset, else a ``dipole.h5`` rebuild),
+    evaluates the integrand's own cell average on ``ref_grid`` so the caller's
+    ``whead`` can be checked against it, and hands the anchored per-q scalars
+    back.  Everything it prints is meant to be read: the provenance ratio is
+    the one number that says whether the head being re-attached describes the
+    same screening the run solved with.
+
+    Parameters
+    ----------
+    wfn, sym, meta : loader / symmetry table / system parameters
+        ``wfn`` supplies the Coulomb geometry (``blat·bvec`` rows and Ω) via
+        :meth:`vcoul.CoulombGeometry.from_wfn`; ``meta.sys_dim`` gates the
+        bulk-3D-only refusal; ``sym`` is read only by the ``dipole.h5``
+        fallback route for ``S_cart`` (a restart that carries
+        ``S_cart_head`` never touches it).  Both densification call sites
+        already hold all three from their htransform leg.
+    params : dict
+        Deck keys.  ``head_minibz_average`` must match the GW run — it selects
+        the Baldereschi-Tosatti analytic-sphere branch of the estimator.
+    coarse_grid, fine_grid, ref_grid : tuple[int, int, int]
+    whead : float
+        The head scalar the loader injects, Ry·bohr³, real.
+    gamma_cell : {"fine", "coarse"}
+        ``"coarse"`` is the red twin; see
+        :func:`gw.head_densify.build_fine_head_scalars`.
+
+    Returns
+    -------
+    numpy.ndarray, shape ``fine_grid``, float64
+    """
+    from gw import head_densify
+    from gw.head_correction import resolve_head_S_cart
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import CoulombGeometry
+
+    params = params or {}
+    S_cart, prov = resolve_head_S_cart(
+        restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
+        params=params, print_fn=log_fn)
+    if S_cart is None:
+        raise ValueError(
+            f"w_head_densify = c1 needs the head's S tensor and could not get "
+            f"one: {prov}.  C1 re-attaches W's Γ head per fine q from the "
+            f"integrand ⟨v/(1 − v qᵀSq)⟩, and without S there is no integrand "
+            f"— only the coarse cell AVERAGE, which is the number the "
+            f"trigonometric interpolant already mishandles.  Fix by rerunning "
+            f"GW so the restart carries S_cart_head, or by putting the run's "
+            f"dipole.h5 beside the deck.  To proceed anyway with the "
+            f"documented defect, set w_head_densify = legacy and read the "
+            f"result knowing the Γ head is interpolated.")
+
+    geom = CoulombGeometry.from_wfn(wfn)
+    analytic_sphere = bool(params.get("head_minibz_average", False))
+    gamma_ref = head_densify.gamma_cell_head_scalar(
+        geom, ref_grid, S_cart, analytic_sphere=analytic_sphere)
+    ratio = float(whead) / gamma_ref
+
+    S_fine = head_densify.build_fine_head_scalars(
+        geom, coarse_grid, fine_grid, S_cart,
+        head_ref=float(whead), gamma_ref=gamma_ref, ref_grid=ref_grid,
+        sys_dim=getattr(meta, "sys_dim", None),
+        analytic_sphere=analytic_sphere, gamma_cell=gamma_cell)
+
+    # THE SUM RULE, reported on the deck.  The head channel's zone average is
+    # a property of the material and the cell, and the grid-independent number
+    # it converges to is (1/N_c)·⟨S⟩ over the COARSE cell — so the target has
+    # to be expressed on the coarse cell even when the reference head was
+    # measured on a different one (which is exactly the ``--w-coarse-grid``
+    # case, where a natively fine restart is decimated).  Getting this wrong
+    # does not change a single number that ships; it changes what the log
+    # claims, which is worse, because a diagnostic nobody can trust is a
+    # diagnostic nobody reads.
+    cg = tuple(coarse_grid)
+    gamma_coarse = (gamma_ref if tuple(ref_grid) == cg
+                    else head_densify.gamma_cell_head_scalar(
+                        geom, cg, S_cart, analytic_sphere=analytic_sphere))
+    n_c = cg[0] * cg[1] * cg[2]
+    target = float(whead) * (gamma_coarse / gamma_ref) / n_c
+    weight = head_densify.coarse_gamma_cell_weights(
+        head_densify.fine_q_cart(geom.bvec, fine_grid), cg, fine_grid)
+    zone = head_densify.head_channel_zone_average(S_fine)
+    log_fn(
+        f"[w-head-c1] S_cart: {prov}; provenance ratio whead/⟨v/(1−vqSq)⟩ on "
+        f"{tuple(ref_grid)} = {ratio:.6f} (1.0 means the restart's head and "
+        f"this S are the same screening)")
+    log_fn(
+        f"[w-head-c1] head channel re-attached at "
+        f"{int(np.count_nonzero(S_fine))} fine q carrying total weight "
+        f"{float(np.sum(weight)):.6f} (= [Λ_f:Λ_c] = "
+        f"{fine_grid[0]*fine_grid[1]*fine_grid[2] // n_c}; more points than "
+        f"weight means boundary q sharing 1/k), of "
+        f"{fine_grid[0]*fine_grid[1]*fine_grid[2]} fine q total")
+    log_fn(
+        f"[w-head-c1] S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected "
+        f"{float(whead):.4f} Ry·bohr³ (×{S_fine[0, 0, 0]/float(whead):.3f} "
+        f"for a {(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.0f}× finer "
+        f"cell); SUM RULE: zone average {zone:.6f} vs the grid-independent "
+        f"{target:.6f} ({100.0*abs(zone/target - 1.0):.1f}% — a midpoint "
+        f"quadrature error that shrinks under refinement, 0 when fine == "
+        f"coarse) [gamma_cell={gamma_cell}]")
+    if abs(ratio - 1.0) > 0.05:
+        import warnings
+        msg = (f"w_head_densify = c1: the injected head and the S tensor "
+               f"disagree by {100*abs(ratio-1.0):.1f}% on {tuple(ref_grid)} "
+               f"(whead={float(whead):.4f}, integrand={gamma_ref:.4f} "
+               f"Ry·bohr³).  The re-attached head keeps the INJECTED scale, "
+               f"so nothing silently changes magnitude, but its q-dependence "
+               f"comes from an S that does not reproduce it — most often a "
+               f"deck vhead/whead_0freq override pinned to an external value, "
+               f"or a head_minibz_average / wcoul0_source that differs from "
+               f"the GW run's.")
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        log_fn(f"[w-head-c1] [WARN] {msg}")
+    return S_fine
+
+
 def _interpolate_bse_data_to_grid(
     data: dict,
     fine_grid: tuple[int, int, int],
@@ -1416,6 +1593,7 @@ def _interpolate_bse_data_to_grid(
     input_file: str,
     mesh_xy: Mesh,
     *,
+    head_channel: dict | None = None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -1449,10 +1627,24 @@ def _interpolate_bse_data_to_grid(
         sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
         flag runs the SAME factory with ``output='R'``.  ``bse_k_grid`` drives
         it automatically (the banner below is the "W-pad fired" proof).
+        Its operand is the head-EXCLUDED body and the Γ head is re-attached
+        analytically afterwards — see ``head_channel`` below.
 
     Band dims (n_val/n_cond and their mesh-pads), n_rmu(_pad), and the q=0 head
     projectors g0 are grid-INVARIANT and carried through untouched; only the k
     axis (and W's k-axes) change.  Returns a new bundle with the SAME keys.
+
+    Parameters
+    ----------
+    head_channel : dict or None
+        C1's split-and-reattach hand-off from the loader, ``None`` on the
+        ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
+        loader would have injected at q=0, Ry·bohr³), ``cell_volume`` (Ω), and
+        optionally ``gamma_cell`` (``"fine"`` = C1, ``"coarse"`` = the red
+        twin).  Its presence is also the SIGNAL that the loader deferred the
+        injection, so the W tile in ``data`` is the pre-injection body; the two
+        must not disagree, which is why one dict carries both the decision and
+        the numbers rather than a flag beside a value.
     """
     from bandstructure import htransform as ht
     from bandstructure.bse_setup import compute_wfns_fi
@@ -1604,6 +1796,34 @@ def _interpolate_bse_data_to_grid(
            f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
            f"(exact trig-interp; direct term now on the fine grid)")
 
+    # ── C1: re-attach W's Γ head, per fine q, on the densified BODY ────────
+    # The loader DEFERRED the rank-1 whead injection when it saw a pending
+    # densification (``_inject_q0_head(defer_whead=True)``), so ``data["W_q"]``
+    # above is the pre-injection body and what the trig interpolant just
+    # handled carried no Kronecker delta.  Now the head goes back on, with a
+    # per-fine-q scalar from the one ratified integrand (gw.head_densify).
+    #
+    # ``head_channel`` is None on the ``legacy`` arm, where the loader injected
+    # as before and the delta went through the interpolant — the documented
+    # defect, kept only so the A/B has a shipped control.
+    if head_channel is not None:
+        from gw.head_densify import attach_head_channel
+        S_fine = build_w_head_channel(
+            wfn, sym, meta, params,
+            coarse_grid=coarse_grid, fine_grid=fine_grid,
+            whead=head_channel["whead"], ref_grid=coarse_grid,
+            input_file=input_file, restart_file=restart_file,
+            gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn)
+        W_q_fine = attach_head_channel(
+            W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
+            head_channel["cell_volume"])
+        log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
+               "the interpolant saw the body only, and the head is analytic "
+               "at every fine q inside the coarse Γ cell.  This also changes "
+               "the Davidson/FEAST preconditioner diagonal, which reads "
+               "W_q[:,:,0,0,0] directly — correctness-neutral, convergence-"
+               "relevant.")
+
     out = dict(data)
     out.update({
         "psi_c_X": psi_c_X, "psi_c_Y": psi_c_Y,
@@ -1632,6 +1852,8 @@ def load_bse_data_from_restart_sharded(
     inject_head: bool = True,
     load_v_full: bool = False,
     bse_k_grid=None,
+    w_head_densify=None,
+    w_head_gamma_cell: str = "fine",
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
@@ -1844,6 +2066,22 @@ def load_bse_data_from_restart_sharded(
     psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
+    # ── Is a coarse→fine densification pending?  Resolved HERE, before the
+    # head injection, because the answer changes what the injection does.
+    # C1 (the default) hands the densifier the head-EXCLUDED body and
+    # re-attaches the head per fine q afterwards, so on a densifying run the
+    # rank-1 whead must NOT go on now.  With the feature off, or the fine grid
+    # equal to the coarse one, ``densify_pending`` is False and every line
+    # below runs exactly as it did before this existed — that is the on-grid
+    # bit-identity, and it is structural rather than checked.
+    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
+    densify_pending = (fine_grid is not None
+                       and fine_grid != (nkx, nky, nkz))
+    w_head_mode = resolve_w_head_densify(
+        w_head_densify, _read_lorrax_input_quietly(input_file))
+    defer_whead = densify_pending and w_head_mode == "c1"
+    head_channel = None
+
     if g0_X is not None and inject_head:
         vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
@@ -1854,10 +2092,16 @@ def load_bse_data_from_restart_sharded(
             # same helper, as the single-device loader.
             V_q0, W_q, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
-                w0_ready=w0_ready)
+                w0_ready=w0_ready, defer_whead=defer_whead)
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {head_str} "
                   f"[source: {head_src}]")
+            if defer_whead and w0_ready and whead is not None:
+                head_channel = {
+                    "whead": float(complex(whead[0]).real),
+                    "cell_volume": float(cell_volume),
+                    "gamma_cell": w_head_gamma_cell,
+                }
         else:
             # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
             # True, but the rank-1 head was NOT injected because vhead/whead
@@ -1924,17 +2168,27 @@ def load_bse_data_from_restart_sharded(
     }
 
     # ── bse_k_grid coarse→fine densification (general BSE init) ───────────
-    # Explicit arg wins; else read the ``bse_k_grid`` key from the cohsex.in.
-    # None/unset or == the coarse grid → return the coarse bundle above
-    # UNTOUCHED (fast path, byte-identical — the on-grid identity guarantee).
-    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
-    if fine_grid is not None and fine_grid != (nkx, nky, nkz):
+    # ``densify_pending`` was resolved BEFORE the head injection above, since
+    # it decides whether the head was deferred.  None/unset or == the coarse
+    # grid → return the coarse bundle above UNTOUCHED (fast path,
+    # byte-identical — the on-grid identity guarantee).
+    if densify_pending:
         if input_file is None:
             raise ValueError(
                 "bse_k_grid densification needs input_file (cohsex.in) to run "
                 "the htransform ψ/ε and vq_interp V_Q interpolation.")
+        if w_head_mode == "legacy":
+            print("BSE-sharded: [WARN] w_head_densify = legacy — W's Γ head "
+                  "rides through the trigonometric interpolant as a Kronecker "
+                  "delta.  That is the documented defect (gw.head_densify): "
+                  "the interpolant of a delta is a Dirichlet kernel, so a "
+                  "fraction of the head's ~10^3 meV prefactor is deposited at "
+                  "fine q that should carry none of it, and the 1/q² rise "
+                  "inside the coarse Γ cell is missing entirely.  This arm "
+                  "exists to price the repair, not to be run for physics.")
         data = _interpolate_bse_data_to_grid(
-            data, fine_grid, restart_file, input_file, mesh_xy)
+            data, fine_grid, restart_file, input_file, mesh_xy,
+            head_channel=head_channel)
     return data
 
 
@@ -2185,6 +2439,7 @@ def _inject_q0_head(
     cell_volume: float,
     *,
     w0_ready: bool,
+    defer_whead: bool = False,
 ):
     """Inject the rank-1 q=0 head, with ``whead`` gated on ``w0_ready``.
 
@@ -2225,6 +2480,23 @@ def _inject_q0_head(
         As resolved by :func:`_resolve_head_params` — Ry and Bohr³.
     w0_ready : bool
         Did a real screened ``W0`` load, or is ``W_q`` the bare-V fallback?
+    defer_whead : bool
+        A coarse→fine densification is pending and will re-attach W's head
+        itself, per fine q (C1, :mod:`gw.head_densify`).  The W tile must then
+        reach the densifier as the PRE-injection body, because what the
+        densifier does to a Kronecker-delta head is exactly the defect C1
+        exists to remove — so the head is not added here and
+        :func:`_interpolate_bse_data_to_grid` adds the fine-grid one instead.
+
+        DEFERRAL IS NOT THE ``w0_ready`` GATE and must not be spelled as one.
+        ``w0_ready = False`` means "this W is bare V, a screened head does not
+        belong on it at all"; deferral means "the head belongs on it, just not
+        yet, and not as a delta".  Passing ``w0_ready=False`` to get the skip
+        would put the wrong reason in the log on a tile that is perfectly
+        screened, and would make the two conditions indistinguishable to the
+        next reader.  ``vhead`` is unaffected either way: the q=0 exchange
+        tile is carried through the densifier unchanged (it is k-grid
+        invariant), so its head is injected here as always.
 
     Returns
     -------
@@ -2234,15 +2506,21 @@ def _inject_q0_head(
     """
     from gw.head_correction import apply_q0_head_rank1_sharded
 
+    apply_w = w0_ready and not defer_whead
     V_q0, W_head = apply_q0_head_rank1_sharded(
-        V_q0, W_q if w0_ready else None, g0_mu, g0_nu,
+        V_q0, W_q if apply_w else None, g0_mu, g0_nu,
         vhead, whead, cell_volume, omega_index=0)
-    if w0_ready:
+    if apply_w:
         W_q = W_head
     v_str = (f"vhead={complex(vhead).real:.6f}"
              if vhead is not None else "vhead=skipped")
-    w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
-             if (whead is not None and w0_ready) else "whead=skipped")
+    if whead is None or not w0_ready:
+        w_str = "whead=skipped"
+    elif defer_whead:
+        w_str = (f"whead[0]={complex(whead[0]).real:.6f} DEFERRED to the "
+                 f"coarse→fine densifier (C1)")
+    else:
+        w_str = f"whead[0]={complex(whead[0]).real:.6f}"
     return V_q0, W_q, f"{v_str}, {w_str}"
 
 
