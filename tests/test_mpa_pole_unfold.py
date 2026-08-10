@@ -38,7 +38,15 @@ operator-Im fix, where ``Im`` elementwise stood in for
 ``(cX - cX^dagger)/2i`` and cost 43.8 eV of star spread.  This is the
 same class and the same answer: time reversal acts on a ``(mu, nu)``
 operator as the pair transpose, the conjugate is its Hermitian shorthand,
-and under the correct rule NOTHING in a pole field is conjugated.
+and under the correct rule NOTHING in a pole field is conjugated.  So the
+red twins in arm B are not decoration.  They exhibit, in order: the
+conjugation applied to the time-reversed members (the rule the refusal
+feared), the conjugation applied to the members that are NOT time
+reversed (the predicate inverted, which is how the 183.61 eV kin_ion
+defect actually happened), the pair transpose skipped, and the umklapp
+phase dropped.  Each must fail the gate loudly, and the first two must
+fail on DISJOINT sets of q -- the localization the refusal promised as
+its diagnostic.
 """
 
 from __future__ import annotations
@@ -369,6 +377,104 @@ def test_the_unfold_cannot_leave_the_fourth_quadrant(wedge):
         # per-q multiplicities the map assigns.
         assert np.isin(np.round(got, 12),
                        np.round(Om_w[p].ravel(), 12)).all()
+
+
+# ---------------------------------------------------------------------------
+# (B) RED TWINS -- crossed conventions, each with its own teeth
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "label,kw,expect_rows",
+    [("conjugate the time-reversed members",
+      dict(conj_extra="trs"), "trs"),
+     ("conjugate everything BUT the time-reversed members",
+      dict(conj_extra="spatial"), "spatial"),
+     ("skip the pair transpose on the time-reversed members",
+      dict(swap=False), "trs"),
+     ("drop the umklapp phase",
+      dict(phase=False), "any")])
+def test_a_crossed_convention_fails_the_gate_loudly(wedge, label, kw,
+                                                    expect_rows):
+    """Three wrong maps, and the gate must reject all three.
+
+    A gate that only ever sees the right answer is measuring nothing.
+    Each twin here is a convention this tree has actually shipped
+    somewhere: the conjugation on the antiunitary rows (the W unfold's
+    own default, correct for a Hermitian operator and not for this one),
+    the same conjugation with the predicate INVERTED (the kin_ion defect,
+    183.61 eV with the diagonal exactly zero), and the missing umklapp
+    phase (~unity relative error on CrI3 V_q before the 2026-05 fix).
+    """
+    mesh = _mesh()
+    Om_w, B_w = _read_wedge_poles(wedge["fit_path"], _N_P)
+    Om_t, B_t = _hand_unfold_poles(Om_w, B_w, wedge["tables"], **kw)
+    per_q = _rebuild_residual(Om_t, B_t, _reference_W(wedge, mesh),
+                              _z_in_pole_units(wedge))
+    worst = float(per_q.max())
+    assert worst > 1e-3, (
+        f"'{label}' changed the answer by only {worst:.3e}; this "
+        f"geometry cannot see that convention and the gate has no teeth "
+        f"against it")
+
+    bad = np.flatnonzero(per_q > 1e-9)
+    spatial = np.setdiff1d(np.arange(_N_Q_FULL), _TRS_ROWS)
+    if expect_rows == "trs":
+        # THE DIAGNOSTIC THE REFUSAL PROMISED: a wrong conjugation on the
+        # time-reversed members moves those rows and no others.
+        assert set(bad.tolist()) == set(_TRS_ROWS.tolist()), (
+            f"'{label}' moved rows {bad.tolist()}, not the time-reversed "
+            f"rows {_TRS_ROWS.tolist()}; the localization the gate's "
+            f"failure message offers would point at the wrong half")
+    elif expect_rows == "spatial":
+        assert not set(bad.tolist()) & set(_TRS_ROWS.tolist()), (
+            f"'{label}' moved a TIME-REVERSED row ({bad.tolist()}); the "
+            f"inverted predicate must show up on the other half")
+        assert set(bad.tolist()) <= set(spatial.tolist())
+        assert bad.size >= 1
+
+
+def test_the_two_conjugation_twins_fail_on_disjoint_rows(wedge):
+    """The localization, stated as one fact rather than two.
+
+    "Disagreement confined to the time-reversed members localizes to the
+    conjugation" is only a usable diagnostic if the OTHER mistake --
+    conjugating the wrong half -- lands somewhere else.  It does, and the
+    two sets are disjoint and together cover every q that the map does
+    not leave alone.
+    """
+    mesh = _mesh()
+    ref = _reference_W(wedge, mesh)
+    z = _z_in_pole_units(wedge)
+    Om_w, B_w = _read_wedge_poles(wedge["fit_path"], _N_P)
+
+    def rows(**kw):
+        o, b = _hand_unfold_poles(Om_w, B_w, wedge["tables"], **kw)
+        return set(np.flatnonzero(
+            _rebuild_residual(o, b, ref, z) > 1e-9).tolist())
+
+    a = rows(conj_extra="trs")
+    b = rows(conj_extra="spatial")
+    assert a and b and not (a & b)
+    assert a == set(_TRS_ROWS.tolist())
+
+
+def test_the_conjugation_twin_is_the_growing_exponential(wedge):
+    """WHY the wrong conjugation was worth a refusal, in one number.
+
+    ``Omega_p = a - i*Gamma`` conjugated is ``a + i*Gamma``, and the tau
+    stage reads ``W(tau) = sum_p B_p exp(-i*Omega_p*tau)`` -- so the twin
+    does not merely disagree, it puts a GROWING exponential into the
+    integrand.  Counted here rather than described: the twin's field has
+    poles above the real axis and the certified map's has none.
+    """
+    Om_w, B_w = _read_wedge_poles(wedge["fit_path"], _N_P)
+    good, _ = _hand_unfold_poles(Om_w, B_w, wedge["tables"])
+    bad, _ = _hand_unfold_poles(Om_w, B_w, wedge["tables"], conj_extra="trs")
+    assert int(np.count_nonzero(good.imag > 0)) == 0
+    n_bad = int(np.count_nonzero(bad.imag > 0))
+    assert n_bad == _N_P * _TRS_ROWS.size * _N_MU * _N_MU, (
+        f"{n_bad} poles crossed the real axis; the twin should put every "
+        f"element of every time-reversed row up there")
 
 
 # ---------------------------------------------------------------------------
