@@ -822,6 +822,20 @@ def prune_candidates_by_pivoted_cholesky(
         if verbose:
             print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
+            # THE PREFIX LADDER.  Greedy pivoting is NESTED: the first j
+            # pivots of a k-pivot run are exactly the pivots a j-pivot run
+            # would have taken.  So the cumulative point count below is not a
+            # diagnostic of this run alone — it is the delivered N for EVERY
+            # smaller orbit target, read off one run.  Without it, landing a
+            # selector on a target N (which orbit closure quantises, in steps
+            # of up to n_sym points) costs one full run per guess.
+            _sizes = np.bincount(orbit_id_np)[orbit_id_np[piv_np]]
+            _cum = np.cumsum(_sizes)
+            _rungs = [f"{j + 1}:{int(_cum[j])}" for j in range(len(_cum))
+                      if (j + 1) % 5 == 0 or j == len(_cum) - 1]
+            print(f"  [orbit ladder] picked orbit sizes {list(map(int, _sizes))}")
+            print(f"  [orbit ladder] delivered points at n_orbit_keep = "
+                  f"{', '.join(_rungs)}  (--n-orbit-keep pins it)")
         # R2 — certify at POINT granularity, which is the granularity of the
         # FILE being written.  Orbit mode only: in point mode ``rank`` is
         # already the point count and there is nothing to reconcile.
