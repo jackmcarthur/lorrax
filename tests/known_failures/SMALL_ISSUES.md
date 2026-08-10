@@ -465,6 +465,17 @@ silent overwrite.
     stderr only, never an exit code, never a refusal.
     [AGENT_PREAMBLE.md efficiency doctrine rule 1]
 
+37. **`lx batch` v2 improvements, measured-and-specified by v1** — three
+    items from the first live batch (evidence lxbatch_0810): (a) probe
+    the pool ONCE per batch, not per leg (per-leg launcher overhead
+    7.8→42.9 s at P=4 — the control plane, not GPUs, became binding);
+    (b) claim devices once for the whole batch instead of N launchers
+    racing the claim/step window (the actual mechanism of the six
+    unplaced legs — capacity and device decisions read different
+    snapshots inside the 180 s grace); (c) the claim refusal prints
+    the claim table it just read, so the next occurrence self-diagnoses.
+    [batch lane report, 2026-08-10]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - Rows 4, 5, 11, 25, 26, 27, 28, 31 (the `lx` harness trap inventory) —
