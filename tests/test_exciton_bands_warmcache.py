@@ -238,11 +238,15 @@ def test_path_solver_is_written_to_the_compile_cache_p1(tmp_path):
 # 3.  the invariant did not weaken: it still catches a non-Hermitian matvec
 # ---------------------------------------------------------------------------
 @pytest.mark.gpu
-def test_path_solver_alpha_gate_still_fires_p1(monkeypatch):
-    harness.skip_unless_gpu(pytest)
-    from bse.exciton_bands import _report_alpha_over_path
-    monkeypatch.setenv("LORRAX_SANITY", "1")          # report, never raise
+def test_path_solver_alpha_payload_is_per_Q_p1():
+    """The scan must carry ONE (dev, scale, worst) triple per Q, not one total.
 
+    This is the shape contract the fix introduced: the sink collects inside
+    the scan body, so the three scalars become scan ``ys`` and arrive stacked
+    over the Q axis.  If they ever collapse to a single triple the host would
+    be reporting one Q's residual as if it were the path's.
+    """
+    harness.skip_unless_gpu(pytest)
     mesh = _mesh()
     args = _operands()
     with mesh:
@@ -252,19 +256,46 @@ def test_path_solver_alpha_gate_still_fires_p1(monkeypatch):
     labels = solver.alpha_labels
     assert len(labels) == 1, (
         f"expected exactly one collected alpha label, got {len(labels)}")
-    payload = jax.device_get(alpha)
-    dev, scale, worst = payload[0]
-    assert np.asarray(dev).shape == (NQ,), (
-        f"the alpha payload must carry ONE triple PER Q (the scan stacks it); "
-        f"got shape {np.asarray(dev).shape} for {NQ} Q")
+    dev, scale, worst = jax.device_get(alpha)[0]
+    for nm, arr in (("dev", dev), ("scale", scale), ("worst", worst)):
+        assert np.asarray(arr).shape == (NQ,), (
+            f"the alpha payload's {nm} must carry one value PER Q (the scan "
+            f"stacks it); got shape {np.asarray(arr).shape} for {NQ} Q")
 
-    assert _report_alpha_over_path(labels, payload) is True
 
-    # RED TWIN of the invariant: a deliberately non-Hermitian deviation must
-    # be refused.  dev/scale is the ratio the gate thresholds, so poisoning
-    # dev alone is exactly the failure it exists to catch.
-    bad = ((np.full(NQ, 1.0), np.asarray(scale), np.asarray(worst)),)
+def test_alpha_over_path_reduces_to_the_worst_Q_p1(monkeypatch, capsys):
+    """The host-side replay still refuses, and it refuses on the WORST Q.
+
+    Deliberately NOT run against a synthetic BSE operator.  Building a
+    genuinely Hermitian ``D + V − W`` out of random tiles is its own problem
+    (the first two attempts here were correctly refused by the very gate under
+    test, which said "the operator, not the algorithm, is wrong"), and it is
+    not what this fix changed.  What the fix changed is the host-side replay
+    and its reduction over Q, so that is what is tested — on payloads whose
+    correct verdict is known by construction.
+
+    The real-operator evidence is stronger and lives elsewhere: the P=4
+    production legs on the MoS₂ deck put the true BSE Hamiltonian through this
+    path and reported dev/scale = 1.6e-12 and 2.8e-12 against a 1e-9
+    tolerance, i.e. the gate passing a Hermitian operator end to end.
+    """
+    from bse.exciton_bands import _report_alpha_over_path
+    monkeypatch.setenv("LORRAX_SANITY", "1")          # report, never raise
+    labels = (("synthetic", "block"),)
+
+    # GREEN: every Q is Hermitian to 1e-14, well inside the 1e-9 tolerance.
+    clean = ((np.full(4, 1e-14), np.full(4, 1.0), np.zeros(4, dtype=int)),)
+    assert _report_alpha_over_path(labels, clean) is True
+
+    # RED TWIN: exactly ONE Q of four is poisoned.  A reduction that averaged,
+    # or that looked only at Q#0, would pass this.
+    dev = np.full(4, 1e-14)
+    dev[2] = 1.0
+    bad = ((dev, np.full(4, 1.0), np.zeros(4, dtype=int)),)
     assert _report_alpha_over_path(labels, bad) is False, (
-        "the alpha-Hermiticity gate passed a deliberately huge non-Hermitian "
-        "residual — hoisting the report out of the jit weakened the "
-        "invariant")
+        "a single non-Hermitian Q in the middle of the path was not caught — "
+        "the reduction over Q is not taking the worst case, so a 91-Q run "
+        "could report OK with a broken operator at 90 of them")
+    assert "Q#2" in capsys.readouterr().out, (
+        "the failure must NAME the offending Q, or it is not locatable on a "
+        "91-point path")
