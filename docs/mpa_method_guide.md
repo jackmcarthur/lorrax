@@ -768,6 +768,29 @@ recombination stops at the head-sample gate.
 5. **Allocator regime.** The BFC-versus-`platform` A/B is not settled by anything
    in the MPA campaign, and nothing there is evidence against the BSE fleet's
    recommendation.
+6. **The Σ pass loop has only ever run single-process** (found 2026-08-10, by a
+   lane that wanted a four-GPU gate and could not have one). Every number this
+   campaign published was produced by `-G=1` legs — one pole to a process, the
+   partials recombined — and that is not a preference, it is the only shape the
+   loop runs in. At `-G=4` (`Devices: 4  Mesh: 2×2  Processes: 4`) it reaches the
+   pass and dies in
+
+   ```
+   TypeError: cannot reshape array of shape (4, 64, 100) (size 25600)
+              into shape (64, 100) (size 6400)
+   ```
+
+   — a per-process gather of an `(n_k_tot, n_band)` host array arriving with a
+   leading process axis, in the host-shape handling around
+   `_prepare_sigma_state`. `-G=4 -n=1` is not a way round it: the driver refuses
+   a mesh whose size is not the process count (`mesh 2×2=4 !=
+   jax.process_count()=1`). It reproduces on the **full-BZ** store, so it is
+   upstream of the wedge unfold and independent of it. Evidence:
+   `/pscratch/sd/j/jackm/mpa_poleunfold_0810/_reports/e2e_full.log`. Until it is
+   fixed, any end-to-end Σ_c comparison on this path is a one-device measurement
+   and should say so; the sharded certification that IS available is the unit
+   level, where `tests/test_mpa_pole_unfold.py` runs the unfold on 1×1, 2×2 and
+   4×1 meshes.
 
 **Where to look.**
 
