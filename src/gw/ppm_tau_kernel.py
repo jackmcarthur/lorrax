@@ -141,19 +141,22 @@ def _make_project_ri_reduce_scatter(
     * ``merged_x=False`` → primitive ``channels="split_reim"``: σ^τ is
       split elementwise into σ_R = Re σ^τ, σ_I = Im σ^τ BEFORE projection
       and each real channel rides its own de-promoted GEMM chain,
-      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  REQUIRED for crossing (HGL core)
-      windows: their host consumer (``_project_tau_onto_omega_np``,
-      project_code=1) weights S_R and S_I with two INDEPENDENT real
-      ω-vectors (Re(c)·S_I + Im(c)·S_R), and no per-slice symmetry can
-      reconstruct the pair — the crossing phases enter σ^τ symmetrically
-      under (μ,ν)→(ν,μ), so σ^τ is neither Hermitian nor
-      complex-symmetric per slice; the only surviving relation
-      σ^τ† = σ^{−τ} pairs different abscissae on a one-sided grid and
-      buys nothing.  Nor is the pair recoverable from X = ψ†σψ: X
-      carries 2n² real dof against the 4n² needed, and the
-      Hermitian/anti-Hermitian split of X fails structurally (for
-      Laplace windows both S_R and i·S_I are Hermitian → it returns
-      (X, 0)).
+      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  What crossing (HGL core) windows
+      dispatch — but NO LONGER because they must.  This bullet used to
+      argue that the crossing consumer weights S_R and S_I with two
+      INDEPENDENT real ω-vectors (Re(c)·S_I + Im(c)·S_R) and that the
+      pair is unrecoverable from X (2n² real dof against 4n²).  That
+      independent-weight consumer WAS THE DEFECT: it is the elementwise
+      Im[c·σ], which completes the crossing window's one-sided τ grid
+      only where σ^τ is complex-symmetric, i.e. only at k ≡ −k
+      (KNOWN_FAILURES, fixed 2026-08-09).  The correct completion,
+      (Z − Z†)/2i with Z = Σ_τ c·X, reads ONLY X — so the dof argument
+      no longer applies to this window either, and the split survives
+      here as a channel-plan/perf choice.  Collapsing crossing onto the
+      merged kernel is a real option and an owner-scoped change (it moves
+      the collective payloads and the D2H volume); until it is taken,
+      ``_project_tau_onto_omega_np``'s cross-pairing guards keep the
+      carrier contract honest.
     * ``merged_x=True`` → primitive ``channels="none"``: the single
       complex chain X = ψ†σψ = S_R + i·S_I — the path EVERY Laplace
       (project="full") window dispatches, licensed by BILINEARITY alone

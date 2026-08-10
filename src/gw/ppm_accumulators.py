@@ -16,9 +16,11 @@ imports the driver or the device kernel.
 from __future__ import annotations
 
 from collections import deque
+from functools import lru_cache
 
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
@@ -46,26 +48,43 @@ def _project_tau_onto_omega_np(
                          here, which is what licenses the merged single-chain
                          plan (the default and only Laplace path — owner
                          order 2026-07-28).
-        code=1 ("imag")  Crossing window — keep only Im[coeff·σ]
-                         = coeff_re·σ_im + coeff_im·σ_re (real, up-cast to
-                         c128): S_R and S_I are weighted by two INDEPENDENT
-                         real ω-vectors, so both channels must arrive
-                         separately (they cannot be recovered from X — see the
-                         channel-plan doc in
-                         ppm_tau_kernel._make_project_ri_reduce_scatter).
+        code=1 ("imag")  Crossing window — return the ONE-SIDED half
+                         Z_τ = coeff·X with X = S_R + i·S_I, i.e. exactly
+                         the same complex product as code=0.  The crossing
+                         window's τ grid is one-sided (τ_j > 0), and the
+                         quadrature it stands in for is a SINE sum,
+                         G(u) ≈ Σ_l α_l sin(τ_l u) at the pole argument
+                         u_μν = ω̃ − E_A − Ω_μν; sin(τu) = (e^{iτu} −
+                         e^{−iτu})/2i, and only the e^{+iτu} half is on the
+                         grid.  The missing half is the BAND ADJOINT of the
+                         first — see :func:`_complete_one_sided_tau` for
+                         the derivation — so the window is closed by
+                         (Z − Z†)/2i with Z = Σ_τ Z_τ, applied ONCE per
+                         window by the accumulator (linearity: the
+                         completion commutes with the τ sum) and, crucially,
+                         on the GLOBAL band matrix rather than per shard.
+                         This consumer therefore returns an INCOMPLETE
+                         contribution and must not be used by anything that
+                         does not close the window that way.
 
     Channel carriers mirror the codes one-to-one.  Laplace (code=0): the
     merged kernel ships X = S_R + i·S_I as ONE complex tile —
     ``sigma_im is None`` and ``sigma_re`` carries X (bilinearity:
     ψ†σψ = ψ†σ_Rψ + i·ψ†σ_Iψ, so coeff·X equals the recombined two-channel
     product to GEMM-association roundoff; gated at 1e-12).  Crossing
-    (code=1): σ^τ arrives as the real/imag pair ``(sigma_re, sigma_im)`` —
-    that consumer needs the split, and carrying complex σ^τ through the FFT
-    pipeline would double memory for no benefit.  Any cross-pairing is a
-    dispatch bug and raises: a merged tile at code=1 (the load-bearing
-    guard — the crossing math CANNOT be recovered from X), and a
-    two-channel pair at code=0 (its recombine branch died when the merge
-    became the default).
+    (code=1): σ^τ arrives as the real/imag pair ``(sigma_re, sigma_im)``,
+    and this consumer recombines them into X on host.  Since the crossing
+    completion turned out to need only X (2026-08-09), that split is now a
+    channel-plan/perf choice, NOT a mathematical necessity — the old
+    rationale ("the crossing math cannot be recovered from X") was the
+    elementwise-Im defect talking, and collapsing crossing onto the merged
+    single-chain kernel is a real, owner-scoped option that is deliberately
+    NOT taken here (it would move the τ-kernel dispatch, the collective
+    payloads and the D2H volume, none of which this physics fix should
+    touch).  Until it is taken, the carrier contract stands and any
+    cross-pairing is a dispatch bug and raises: a merged tile at code=1,
+    and a two-channel pair at code=0 (whose recombine branch died when the
+    merge became the default).
     """
     omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
@@ -99,11 +118,143 @@ def _project_tau_onto_omega_np(
             "(ppm_sigma window dispatch bug).")
     if project_code != 1:
         raise ValueError(f"Unknown project_code {project_code}")
-    coeff_re = np.real(coeff).reshape(-1, 1, 1, 1)
-    coeff_im = np.imag(coeff).reshape(-1, 1, 1, 1)
-    # Crossing window — keep Im[coeff·σ]
-    contrib = coeff_re * sigma_im[None, ...] + coeff_im * sigma_re[None, ...]
+    # Crossing window — the ONE-SIDED half Z_τ = coeff·X only.  What used to
+    # stand here,
+    #     contrib = coeff_re·S_I + coeff_im·S_R,
+    # is the ELEMENTWISE Im[coeff·σ(μ,ν)] taken scalar by scalar before the
+    # ψ projection.  That is the completion of the sine sum only where σ^τ is
+    # complex-symmetric — under time reversal, only at k ≡ −k mod G — so it
+    # broke the Σ_c k-star relation at every non-TRIM k while leaving the
+    # TRIM k exact (KNOWN_FAILURES, 2026-08-09).  The correct completion is
+    # the band-adjoint one in _complete_one_sided_tau, and it is a WINDOW-level
+    # operator: it couples element (i, j) to element (j, i), which the
+    # (m_X, n_Y)-sharded per-shard tiles here cannot see.
+    X = sigma_re + 1j * sigma_im
+    contrib = coeff.reshape(-1, 1, 1, 1) * X[None, ...]
     return np.asarray(contrib, dtype=np.complex128)
+
+
+# ---------------------------------------------------------------------------
+#  The crossing window's one-sided-τ completion.
+# ---------------------------------------------------------------------------
+
+def _band_axis_partition_counts(sigma_sharding) -> tuple[int, int]:
+    """How many mesh slices σ^τ's two band axes ``(m, n)`` are cut into.
+
+    ``sigma_sharding`` is whatever sharding the (nk, m_X, n_Y) σ^τ tiles
+    arrived with — ``P(None, 'x', 'y')`` on the production mesh.  A sharding
+    we cannot read (``None``, or anything that is not a ``NamedSharding``)
+    is reported as UNSPLIT, which is correct for the single-device and
+    plain-numpy callers and is why the caller must never manufacture one.
+    """
+    mesh = getattr(sigma_sharding, 'mesh', None)
+    spec = getattr(sigma_sharding, 'spec', None)
+    if mesh is None or spec is None or len(spec) < 3:
+        return 1, 1
+
+    def _count(entry) -> int:
+        if entry is None:
+            return 1
+        names = (entry,) if isinstance(entry, str) else tuple(entry)
+        n = 1
+        for a in names:
+            n *= int(mesh.shape[a])
+        return n
+
+    return _count(spec[1]), _count(spec[2])
+
+
+@lru_cache(maxsize=8)
+def _antiherm_band_fn(sharding: NamedSharding):
+    """``Z -> (Z − Z†)/2i`` on the trailing (i, j) axes, output re-sharded back.
+
+    Cached per sharding so the resharding collective is compiled once per Σ
+    stage rather than once per window.
+    """
+    return jax.jit(
+        lambda Z: (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j,
+        out_shardings=sharding,
+    )
+
+
+def _complete_one_sided_tau(win_shards, shard_devices, sigma_sharding):
+    """Close a crossing window: ``Z -> (Z − Z†)/2i`` on the GLOBAL band matrix.
+
+    **What is being completed.**  A crossing (HGL) window's minimax rule fits
+    its regularization target as a SINE sum on a one-sided grid,
+    ``G(u) ≈ Σ_l α_l sin(τ_l u)`` with ``τ_l > 0``
+    (``minimax_screening.solve_phase_minimax_bandwidth``).  Collecting every
+    phase the τ kernel and this module apply — ``e^{i·sign·ω·τ}`` from the
+    ω-kernel, ``e^{-iτ(E_A - E_ref_A)}`` from ``build_G_tau``,
+    ``e^{-iτ(Ω_q - E_ref_B)}`` from ``_build_W_t_q``, and the
+    ``e^{-i·E_ref_sum·τ}`` folded into α_eff, whose reference shifts cancel
+    exactly — one τ node contributes, per band pair (i, j),
+
+        Z_τ(i,j) = pref·α_l · Σ_{n,q,μ,ν} [ψ*_i(μ)ψ_n(μ)][ψ*_n(ν)ψ_j(ν)]
+                                          · B_q(μ,ν) · e^{+iτ·u},
+        u = sign·ω − E_A(k−q, n) − Ω_q(μ,ν),
+
+    which is the ``e^{+iτu}`` half of ``sin(τu) = (e^{+iτu} − e^{−iτu})/2i``.
+    The half that is NOT on the grid is obtained by conjugating the (i, j)
+    pair, not each scalar: writing out ``conj(Z_τ(j,i))``, relabelling
+    μ ↔ ν and using the two premises the GN-PPM fit already carries —
+    ``B_q† = B_q`` and ``Ω_q`` real symmetric (derived in
+    ``docs/dev/notes/DERIVATION_channel_hermiticity.md`` §1.3, the same
+    premises that make ``[σ^τ]† = σ^{−τ}``) — returns exactly the same sum
+    with ``e^{−iτu}``.  Hence
+
+        Σ_c^{crossing} = (Z − Z†)/2i,      Z = Σ_τ Z_τ,
+
+    with † the adjoint on the QP band pair.  The completion is LINEAR, so
+    applying it once to the window's τ-sum is identical to applying it per τ,
+    and one application per window is what this function is.
+
+    **Why it cannot live in the per-τ projector.**  ``(Z − Z†)`` couples
+    element (i, j) to element (j, i).  Σ_c tiles are sharded
+    ``P(None, None, 'x', 'y')`` — m over ``'x'``, n over ``'y'``
+    (``ppm_tau_kernel._make_project_ri_reduce_scatter``) — so rank (a, b)
+    holds the band BLOCK (rows a, cols b) and the partner of every one of
+    its elements is on rank (b, a).  A ``swapaxes(-1, -2)`` inside
+    ``_project_tau_onto_omega_np`` would transpose within the local block:
+    on a square mesh the shapes match and it returns a WRONG answer in
+    silence; on a non-square mesh it raises a broadcast error.  Both were
+    verified on a 2×2 CPU mesh (``tests/test_ppm_crossing_completion.py``).
+    So the adjoint is taken here, on the assembled array:
+
+      * band axes unsplit (``p_m = p_n = 1`` — single device, or any mesh
+        that does not cut the QP band window): pure numpy, no device hop,
+        which is also the path every unit test exercises;
+      * band axes split: the per-rank tiles are published as ONE sharded
+        ``jax.Array`` (``make_array_from_single_device_arrays``, each process
+        supplying exactly its addressable shards — correct single-process
+        multi-GPU and multi-process alike, same idiom as
+        ``_MemoryTileSink.result``), the adjoint is taken there so XLA owns
+        the transpose collective, and the result is read back to the same
+        per-rank tiles.
+
+    Cost, stated because this module's contract is "no collectives in the τ
+    loop": ONE round trip per crossing window, and crossing windows are one
+    window on each of two branches (cond +ω, val −ω), i.e. **2 per Σ stage**
+    — not per τ, of which there are hundreds.  The transient is one window's
+    Σ tile, the same object ``_MemoryTileSink.result`` already device_puts.
+    """
+    p_m, p_n = _band_axis_partition_counts(sigma_sharding)
+    if p_m == 1 and p_n == 1:
+        # The whole band matrix is local: the numpy adjoint IS the global one.
+        return [(t - np.conj(np.swapaxes(t, -1, -2))) / 2j for t in win_shards]
+    mesh = sigma_sharding.mesh
+    spec = tuple(sigma_sharding.spec)
+    # σ^τ is (nk, m, n); the window tiles carry the leading ω axis.
+    sharding4 = NamedSharding(mesh, P(None, *spec))
+    t0 = win_shards[0]
+    gshape = (int(t0.shape[0]), int(t0.shape[1]),
+              int(t0.shape[2]) * p_m, int(t0.shape[3]) * p_n)
+    arrays = [jax.device_put(t, d) for t, d in zip(win_shards, shard_devices)]
+    completed = _antiherm_band_fn(sharding4)(
+        jax.make_array_from_single_device_arrays(gshape, sharding4, arrays))
+    by_device = {s.device: np.asarray(s.data)
+                 for s in completed.addressable_shards}
+    return [by_device[d] for d in shard_devices]
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +346,18 @@ class _TauAccumulator(_SigmaAccumulator):
     Only the BRANCH tail (``finalize``/``finalize_host_tiles``) flushes.
 
     The ω-kernel + accumulate runs entirely in numpy on host — no JAX sharding
-    machinery, no collectives, no shard_map.  Each shard's contribution is
-    independent (the projector is elementwise in (k, i, j) times the ω-kernel),
-    so per-shard projection is exact.
+    machinery, no collectives, no shard_map IN THE τ LOOP.  Each shard's
+    per-τ contribution is independent (the projector is elementwise in
+    (k, i, j) times the ω-kernel), so per-shard projection is exact.
+
+    The one thing that is NOT elementwise in (i, j) is a crossing window's
+    completion of its one-sided τ grid, ``(Z − Z†)/2i``, which pairs band
+    element (i, j) with (j, i) and therefore rank (a, b) with rank (b, a).
+    That is a WINDOW-level operator (linearity lets it commute out of the τ
+    sum), it runs in :meth:`_finish_window` via
+    :func:`_complete_one_sided_tau`, and it is the sole place this class
+    touches a collective — twice per Σ stage, at window boundaries, never
+    inside the τ loop.
     """
 
     def __init__(self, omega_vec: jax.Array, sink: '_WindowSink', *, lag: int = 2):
@@ -208,6 +368,10 @@ class _TauAccumulator(_SigmaAccumulator):
         self._pending: deque = deque()
         self._shard_index: list[tuple] | None = None
         self._shard_devices: list | None = None
+        # σ^τ's own sharding, captured off the first tile: the ONLY thing that
+        # says whether the QP band axes are split across ranks, which is what
+        # _complete_one_sided_tau has to know to take a global band adjoint.
+        self._sigma_sharding = None
         # Current (open) window context; pending entries hold their own.
         self._cur: _WindowAccum | None = None
 
@@ -233,6 +397,7 @@ class _TauAccumulator(_SigmaAccumulator):
         if self._shard_index is None:
             self._shard_index = [s.index for s in shards_re]
             self._shard_devices = [s.device for s in shards_re]
+            self._sigma_sharding = getattr(sigma_re, 'sharding', None)
         handles = []
         if shards_im is None:
             for sr in shards_re:
@@ -284,9 +449,25 @@ class _TauAccumulator(_SigmaAccumulator):
         if wctx.closed and wctx.pending_count == 0:
             # Last τ of a closed window: hand its tiles to the sink now.
             # FIFO drains ⇒ windows complete in dispatch order.
-            self._sink.consume_window(
-                wctx.win_shards, self._shard_index, self._shard_devices)
-            wctx.win_shards = None
+            self._finish_window(wctx)
+
+    def _finish_window(self, wctx: _WindowAccum) -> None:
+        """Every path out of a window goes through here — sink the tiles, and
+        for a CROSSING window complete its one-sided τ grid first.
+
+        The completion (``(Z − Z†)/2i``, :func:`_complete_one_sided_tau`) is
+        a window-level operator on the global band matrix, not a per-τ
+        elementwise one, so this is the only place it can run: after the
+        window's last τ has drained and before the sink adds the window into
+        the running Σ total.  Laplace windows pass straight through.
+        """
+        shards = wctx.win_shards
+        if wctx.project_code == 1:
+            shards = _complete_one_sided_tau(
+                shards, self._shard_devices, self._sigma_sharding)
+        self._sink.consume_window(
+            shards, self._shard_index, self._shard_devices)
+        wctx.win_shards = None
 
     def end_window(self) -> None:
         # No flush: close the window and keep the pipeline primed.  The
@@ -299,9 +480,7 @@ class _TauAccumulator(_SigmaAccumulator):
             # Every τ of this window already drained (short window vs lag).
             # A window always has ≥1 τ, so its tiles exist.
             assert self._cur.win_shards is not None
-            self._sink.consume_window(
-                self._cur.win_shards, self._shard_index, self._shard_devices)
-            self._cur.win_shards = None
+            self._finish_window(self._cur)
 
     def _drain_all(self) -> None:
         while self._pending:
