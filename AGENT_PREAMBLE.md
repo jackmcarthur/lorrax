@@ -16,9 +16,9 @@ path. Numbers: `docs/warm_worker.md` (2,183 steps, 1,904 banners, 2026-08-06→1
 | 2 | **ONE COMBINED P=4 LEG** does a lane's whole verification — gates + driver + red twin in one dispatch, not one leg per gate | each extra dispatch re-pays the 16 s floor for nothing | `lx run -N 1 -G 4 -n 4`; `lx test` |
 | 3 | **HARVEST BEFORE MEASURING**; grepping a reports dir raw is the anti-pattern (it is how a superseded number gets quoted) | 82 reports indexed with explicit *superseded by* markers; ~230 scratch dirs classified | `~/lorrax_bse_perf_2026-08-08/INDEX.md`, then its `EVIDENCE_MANIFEST.md` |
 | 4 | **WARM WORKER** when the same geometry runs more than twice; landing evidence still comes from a cold leg | **2.40 s warm vs 20.94 s cold**; 16 s cold floor is `initialize_communicator_stack`, not queue/container; 3-leg light lane 63.17 s → 10.71 s | `lx warm start`, `lx warm submit` |
-| 5 | **LANE WEIGHT** chosen when the lane is planned and named in the report's first line | light = mechanical fix/rename/one number → **five lines**: changed, proof, evidence path, owed, branch. heavy = design/investigation → full report + index entry | the five-line report |
+| 5 | **LANE WEIGHT** chosen when the lane is planned and named in the report's first line | light = mechanical fix/rename/one number → **five lines** — one sentence each, ~35 words, not five paragraphs: changed, proof, evidence path, owed, branch. heavy = design/investigation → full report + index entry | the five-line report |
 | 6 | **ENVIRONMENT CONTRACT READ ONCE** — this file. If it is wrong, correct it on your branch | four different accounts of the same pool, from working around it silently | this page |
-| 7 | **LEDGER AS YOU GO** — dated amendment file, in-repo small issues, evidence path in every report | 3 `KNOWN_FAILURES.md` conflicts hand-resolved in one night; 4 orphan `/pscratch` workspaces, 2 frozen refs now unregenerable | `tests/known_failures/<date>-<slug>.md`; `tests/known_failures/SMALL_ISSUES.md` (canonical, only copy); `EVIDENCE_MANIFEST.md` |
+| 7 | **LEDGER AS YOU GO** — dated amendment file, in-repo small issues, evidence path in every report; a supersession goes in the INDEX row, not only the report body | 3 `KNOWN_FAILURES.md` conflicts hand-resolved in one night; 4 orphan `/pscratch` workspaces, 2 frozen refs now unregenerable | `tests/known_failures/<date>-<slug>.md`; `tests/known_failures/SMALL_ISSUES.md` (canonical, only copy); `EVIDENCE_MANIFEST.md` |
 
 Rules 1 and 2 are complements, not exceptions: **fan out across independent work,
 combine within one verification.** A lane that splits its own gates into four legs and
@@ -55,7 +55,8 @@ integration branches, not main — `git show feat/mpa-wedge-pole-unfold-2026-08-
 
 - **Every GPU verification leg runs at P=4.** Not P=1 with P=4 owed; not "P=1 first".
 - **A P=1-only verification never lands.** Report it unverified, however green.
-- **Unit and CPU cells are exempt**; emulated CPU meshes
+- **Unit and CPU cells are exempt** — a lane claiming no P=4 leg is owed names this
+  clause and the reason it applies; emulated CPU meshes
   (`--xla_force_host_platform_device_count`) are fine for device-count *logic*, and do
   not substitute for the P=4 leg on a real GPU path.
 - Why: co-tenancy, sharded-vs-single loader drift, collectives and allocator behaviour
@@ -75,6 +76,7 @@ integration branches, not main — `git show feat/mpa-wedge-pole-unfold-2026-08-
 | EXIT first | 0–89 the command's; 90–98 the step never ran (`LX-WRONGSITE` 90, `NOSLURM` 91, `NESTED` 92, `ALLOCFAIL` 93, `LOCKHELD` 94, `TOOSMALL` 95, `POOLFULL` 96, `SITEENV` 97, `EXPIRED` 98). An `LX-*` code is an absence, never a measurement |
 | artifact size, not rc | `$HOME` is 40 GiB; full `$HOME` gives a 38-byte junitxml that parses as zero tests |
 | traps | `~/lorrax_service_phase/BUILD_NOTES.md` **before planning any cluster leg**: `.so` pair tables + ABI stamp, `LX_BASE_MODULE=lorrax_J070` (without it: wrong jax, ~52F/32E instead of 14F), the WSL worktree-`PYTHONPATH` trap, `-G=4` = a **quarter** of the memory, co-tenancy + its retirement, gateway outage, suite sharding |
+| WSL bench | your own worktree, always: `git worktree add -b <branch> <scratchpad>/wt_<slug> origin/main` — never `git worktree list` to decide where (sixty rows, all other lanes'). Tests run `/home/jackm/projects/lorrax/.venv/bin/python -m pytest` with `PYTHONPATH=<wt>/src` and `JAX_PLATFORMS=cpu`; the bare `python3` has no jax. Prove the pin before measuring: `python -c "import <mod>; print(<mod>.__file__)"` must print a path inside your worktree |
 | band degeneracy | defaults `strict` (owner ruling 2026-08-10). `snap` turned a 4v4c anchor into 4v8c and the gate read it as an 0.0906 eV regression no branch caused. **Never set `snap` to make a gate pass** |
 | allocator | every wall-time carries its allocator in the same sentence — `BFC@0.85` is the campaign default. Unstated allocator = not comparable to any other timing, including its own re-run |
 
@@ -82,7 +84,7 @@ integration branches, not main — `git show feat/mpa-wedge-pole-unfold-2026-08-
 
 - **Your own worktree.** Never `/home/jackm/projects/lorrax` (shared clone; a lane's
   commit already landed on another's ref there); never `/pscratch/sd/j/jackm/wt_int0808_bgw`.
-- **`RUNS_INFLIGHT.md` row before you submit**, struck when the claim lands — it is also
+- **`RUNS_INFLIGHT.md` row before any cluster submit** (canonical: `/pscratch/sd/j/jackm/sandbox_v2_rescue_2026-08-06/RUNS_INFLIGHT.md`) — struck when the claim
   how a peer discovers its legs can ride along with yours (rule 1).
 - **Push feature branches freely; `main` needs owner approval.** Conflating those into
   "never push" cost a night. `git merge-base --is-ancestor <c> origin/main` is the only
@@ -98,6 +100,7 @@ integration branches, not main — `git show feat/mpa-wedge-pole-unfold-2026-08-
 | what a report already settled | `~/lorrax_bse_perf_2026-08-08/INDEX.md` |
 | is this evidence path still live | `~/lorrax_bse_perf_2026-08-08/EVIDENCE_MANIFEST.md` |
 | traps already sprung | `~/lorrax_service_phase/BUILD_NOTES.md` |
+| is this red already known | `tests/KNOWN_FAILURES.md` — note the path: one level **above** `tests/known_failures/` |
 | the code: modules, conventions, running | `AGENTS.md` |
 | is this claim/check any good | `docs/dev/QUALITY_PATTERNS.md` |
 | which page owns a documented fact | `docs/index.md` register table |
