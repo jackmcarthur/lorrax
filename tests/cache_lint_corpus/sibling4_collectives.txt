@@ -1,0 +1,123 @@
+# CORPUS SNAPSHOT — DO NOT EDIT TO MAKE THE LINT PASS.
+# source : src/common/collectives.py
+# spans  : local_share L911-914; sweep_local_k L917-982; gather_k_blocks L985-1024
+# commit : aca88841 = origin/main, 2026-08-10 — the FOUND state
+# why    : the class-B authoring pattern tests/cache_key_lint.py must
+#          flag.  The live file is FIXED on this branch, so the lint's
+#          POSITIVE direction has nowhere else to live.  Stored as .txt,
+#          not .py, so nothing imports, collects or flake8s it.
+
+def local_share(items):
+    """This process's round-robin share of ``items`` (see the note above)."""
+    rank, world = process_rank_world()
+    return list(items)[rank::world]
+
+
+def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
+                  lookahead: int | None = None,
+                  print_fn=print, label: str = "k"):
+    """Run ``per_k(ik)`` over this rank's local k — **ONE host readback**.
+
+    ``per_k`` returns k's ``item_shape`` block (``(nb, nb)`` for every caller
+    today) as a **device** array and must not force it.  The blocks are
+    collected lazily and copied to the host in a single transfer at the end,
+    so a sweep over ``n`` local k costs ONE device→host copy instead of ``n``
+    blocking ones.  Returns ``(vals, idx)`` in exactly the layout
+    :func:`gather_indexed_blocks` consumes: ``vals`` is ``(blk, *item_shape)``
+    with unused rows zero, ``idx`` is ``(blk,)`` with ``-1`` in the unused
+    slots.
+
+    ``item_shape`` is REQUIRED rather than inferred from the first block
+    because a rank can legitimately draw NO k: ``world > nk`` (P=64 on a 16-k
+    deck) leaves ``world - nk`` ranks with an empty list, and the gather is a
+    collective — every rank must contribute the same shape or it
+    mis-assembles.  An empty rank has no block to infer from.
+
+    WHY THE PER-K READBACK WAS THE COST, not the transfer volume.  Each
+    ``np.asarray(H_k)`` is a full host synchronisation: it drains the device
+    queue, so the *next* k's ψ read (h5py, host-side, hundreds of ms) could
+    not start until the *current* k's FFTs had finished.  The two are
+    independent — a k block of ⟨mk|O|nk⟩ touches no other k — and deferring
+    the copy lets them overlap.  This is only legal once every k presents the
+    SAME operand shapes; with a ragged ``ngk`` each k was a distinct XLA
+    executable and the loop was a sequence of unrelated dispatches (owner
+    decision D10).
+
+    ``lookahead`` bounds how far the host may run ahead of the device.  It
+    matters because the operand being held in flight is the ψ FFT box —
+    ``nb·nspinor·nx·ny·nz·16`` B, 189 MB at MoS₂ 4×4/256 bands — and an
+    unbounded queue would hold one per pending k.  ``2`` is the smallest value
+    that still overlaps read *k+1* with compute *k*; it caps the extra
+    residency at one box.  Note ``block_until_ready`` is a synchronisation,
+    NOT a transfer, so the one-readback contract holds for any lookahead.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+
+    ks_local = [int(v) for v in ks_local]
+    blk = int(blk)
+    shape = (blk,) + tuple(int(s) for s in item_shape)
+    depth = sweep_lookahead() if lookahead is None else max(1, int(lookahead))
+    blocks: list = []
+    for j, ik in enumerate(ks_local):
+        if j % 16 == 0:
+            print_fn(f"    {label}: local {j + 1}/{len(ks_local)} "
+                     f"(global k={ik + 1})...")
+        blocks.append(per_k(ik))
+        if j >= depth:
+            blocks[j - depth].block_until_ready()
+
+    vals = np.zeros(shape, dtype=np.complex128)
+    if blocks:
+        stacked = np.asarray(jnp.stack(blocks))          # <-- the ONE readback
+        if stacked.shape[1:] != shape[1:]:
+            raise ValueError(
+                f"{label}: per_k returned {stacked.shape[1:]} but "
+                f"item_shape={shape[1:]} was declared; the gather is a "
+                f"collective and would mis-assemble.")
+        vals[: stacked.shape[0]] = stacked
+    idx = np.full((blk,), -1, dtype=np.int32)
+    idx[: len(ks_local)] = np.asarray(ks_local, dtype=np.int32)
+    return vals, idx
+
+
+def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
+                    lookahead: int | None = None, print_fn=print,
+                    owner_only: bool = False):
+    """``per_k(ik)`` for EVERY ``ik`` in ``range(n_k)`` → the whole array.
+
+    The entire k-partition contract in one call, and the only one a physics
+    driver should need: the work is spread round-robin over the processes,
+    each rank's share is swept behind a single host readback
+    (:func:`sweep_local_k`), and the result is returned as an
+    ``(n_k, *item_shape)`` host array **identical on every rank**
+    (:func:`gather_indexed_blocks`).  No reduction is involved anywhere — a k
+    block of ⟨mk|O|nk⟩ is independent of every other, so this is
+    embarrassingly parallel with one indexed gather at the end.
+
+    ``owner_only=True`` assembles on rank 0 alone and returns ``None`` on
+    every other rank (:func:`gather_indexed_blocks_to_owner`) — the mode
+    for sweeps whose only consumer is the rank-0 file write.  A caller
+    that needs the table as a replicated operand (the driver's gspace
+    V_H route) must keep the default.
+
+    ``per_k`` must return a device array of ``item_shape`` and must not force
+    it.  ``label`` names the two timing sections (``{label}_k`` and
+    ``{label}_gather``) and the progress lines, so a driver gets its sweep and
+    its gather in the timing table without opening a section by hand.
+    """
+    from common import timing
+
+    n_k = int(n_k)
+    world = process_count()
+    ks_local = local_share(range(n_k))
+    print_fn(f"\nProcessing {n_k} k-points over P={world} rank"
+             f"{'s' if world != 1 else ''} ({len(ks_local)} on this rank)...")
+    with timing.section(f"{label}_k"):
+        vals, idx = sweep_local_k(ks_local, max(1, -(-n_k // world)),
+                                  item_shape, per_k, lookahead=lookahead,
+                                  print_fn=print_fn, label=label)
+    with timing.section(f"{label}_gather"):
+        if owner_only:
+            return gather_indexed_blocks_to_owner(vals, idx, n_k)
+        return gather_indexed_blocks(vals, idx, n_k)

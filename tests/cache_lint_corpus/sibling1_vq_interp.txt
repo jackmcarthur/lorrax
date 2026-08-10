@@ -1,0 +1,249 @@
+# CORPUS SNAPSHOT — DO NOT EDIT TO MAKE THE LINT PASS.
+# source : src/bse/vq_interp.py
+# spans  : _mbz_draw_u L1547-1561; _mbz_dq L1564-1615; minibz_head_vlr L1618-1786
+# commit : aca88841 = origin/main, 2026-08-10 — the FOUND state
+# why    : the class-B authoring pattern tests/cache_key_lint.py must
+#          flag.  The live file is FIXED on this branch, so the lint's
+#          POSITIVE direction has nowhere else to live.  Stored as .txt,
+#          not .py, so nothing imports, collects or flake8s it.
+
+@jax.jit
+def _mbz_draw_u(gidx, base_key):
+    """``(local, 3)`` uniforms, one per GLOBAL slot index.
+
+    The sharded sobol/threefry idiom: per-sample keys folded off one root
+    key, so the draw for a given global slot is the same no matter which
+    rank makes it.  MODULE-LEVEL and taking ``base_key`` as a runtime
+    argument — the closure this replaced was rebuilt inside
+    :func:`minibz_head_vlr` on every call, and JAX keys its trace cache on
+    callable identity, so every target Q paid a fresh trace.
+    """
+    def one(i):
+        return jax.random.uniform(jax.random.fold_in(base_key, i),
+                                  (3,), dtype=jnp.float64)
+    return jax.vmap(one)(gidx)
+
+
+def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
+    """This rank's mini-BZ offsets ``δq`` for slab ``[lo, hi)`` — MEMOISED.
+
+    NOTHING here depends on the target Q.  The draws are indexed by global
+    slot only; the Voronoi wrap and the ``randlims`` affine map are pure cell
+    geometry.  Only the final ``_minibz_kernel_bare(shift_cart, dq, …)`` in
+    :func:`minibz_head_vlr` sees Q at all.  Yet the whole construction used to
+    be rebuilt per target Q, and it is expensive in exactly the way a Q loop
+    cannot amortise: a ``(local, 3)`` threefry draw on device, a 63 MB
+    device→host pull, a 2.6M-point host matmul, a device round trip through
+    ``wrap_points_to_voronoi`` whose ``(N, 27, 3)`` candidate tensor is 1.7 GB
+    at the production sample count, and a second 63 MB pull — measured
+    **1.40 s per Q** at ``nsamples=2**18, qmc_reps=10`` on the MoS2 3×3 slab
+    deck, independent of ``n_μ``.
+
+    The key carries every input the arrays depend on, INCLUDING ``n_q`` and
+    the rank slab, so a hit returns the array today's code would have built
+    element for element and in the same order.  The reduction that consumes
+    it is therefore **bit-identical**, not merely close — which is why the
+    cache can be keyed rather than the samples re-derived by prefix slicing.
+
+    Bounded to ``_MBZ_DQ_CACHE_MAX`` entries: ``dq`` is ``(hi-lo, 3)`` f64,
+    63 MB per entry at the production sample count divided by the rank count.
+    ``n_q`` is BGW's adaptive per-batch count and clamps to ``nsamples`` for
+    every Q whose ``|Q+G*|`` is small enough (all 8 probed Q on the reference
+    slab deck), so a Q path normally lives in a single entry.
+    """
+    from vcoul import wrap_points_to_voronoi
+    key = (bvec.tobytes(), tuple(int(s) for s in kgrid), int(n_q),
+           int(nsamples), int(qmc_reps), int(seed_offset), int(lo), int(hi))
+    hit = _MBZ_DQ_CACHE.get(key)
+    if hit is not None:
+        return hit
+    base_key = jax.random.PRNGKey(int(seed_offset))
+    slots = jnp.arange(lo, hi, dtype=jnp.uint32)
+    rep = slots // np.uint32(n_q)                       # replicate batch
+    loc = slots % np.uint32(n_q)                        # in-batch draw
+    gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
+    U = np.asarray(_mbz_draw_u(gidx, base_key), dtype=np.float64)
+    # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
+    # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
+    randcart = (bvec.T @ U.T).T
+    wrapped = np.asarray(wrap_points_to_voronoi(
+        jnp.asarray(randcart), jnp.asarray(bvec), nmax=3), dtype=np.float64)
+    randlims = bvec.T @ (np.diag(1.0 / np.asarray(kgrid, np.float64))
+                         @ np.linalg.inv(bvec.T))
+    dq = (randlims @ wrapped.T).T
+    dq[:, 2] = 0.0                                       # 2D slab: qz = 0
+    if len(_MBZ_DQ_CACHE) >= _MBZ_DQ_CACHE_MAX:
+        _MBZ_DQ_CACHE.pop(next(iter(_MBZ_DQ_CACHE)))
+    _MBZ_DQ_CACHE[key] = dq
+    return dq
+
+
+def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
+                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None,
+                    moment=False):
+    """RANK-PARALLEL mini-BZ CELL AVERAGE of the LR-slab head at target Q.
+
+    Returns ``(gstar, head_val)``, or ``(gstar, head_val, M_ab)`` when
+    ``moment=True``:
+
+      ``gstar``    = ``argmin_G |Q+G|²`` over the stored Miller superset
+                     ``prep['GS']`` — the umklapp bringing Q nearest Γ.
+      ``head_val`` = ``<v_LR(Q+G*)>_mBZ / celvol`` (real), in the SAME units
+                     as ``eval_vq``'s stored ``v[gstar]`` point value, so the
+                     evaluator injects it by a straight slot replacement.
+      ``M_ab``     = ``<v_LR(q) q_a q_b>_mBZ / celvol`` (real symmetric 3x3,
+                     ``moment=True`` only), on the SAME kept samples and with
+                     ``q = Q+G*+δq`` the full Cartesian momentum.
+
+    THE SCALAR IS THE WRONG MOMENT, AND ``M_ab`` IS THE RIGHT ONE.  The head
+    the exchange kernel actually wants averaged is ``v(q)·|q·d|²``, not
+    ``v(q)`` — the pair amplitude vanishes linearly at Γ and its square is
+    what tames the pole.  Averaging ``v`` alone and evaluating the amplitude
+    at the cell CENTRE keeps one direction out of the cell's whole
+    distribution and weights the radius at the sample instead of by ``v``;
+    the two errors are independent, one angular and one radial, so neither
+    is fixable alone (``LT_HEAD_PROBLEM.md`` §2.2).  Because the dipole is a
+    property of the transition and not of the integration variable, the true
+    average factorises exactly onto ``conj(d_a) M_ab d_b``.  ``M_ab``
+    therefore cannot be injected through ``eval_vq`` — that seam is a scalar
+    under a square root — and is consumed instead as a rank-three term over
+    the transition index (``bse_stack_matvec``'s ``head_tensor``).  The
+    scalar return is kept because the pre-tensor arm is the object under
+    repair and its baseline must not move.
+
+    2D slab: pure in-plane adaptive MC (the head is a ``|Q|`` cusp, not a
+    ``1/q²`` pole — no analytic sphere, BGW ``minibzaverage_2d``).  Only the
+    LR channel is averaged; the SR body already carries ``v_SR(Q+G*)`` once
+    (arbitrary_q_bse.md §16 no-double-count).  The winding ``e^{-i2θ}`` is
+    untouched — it rides the phase-factored ζ̃ model in ``eval_vq``; this
+    scalar supplies the magnitude only.
+
+    ONE source of truth for the PHYSICS: the bare LR-slab kernel is
+    :func:`vcoul._minibz_kernel_bare` (the same
+    ``8π·f2d·e^{−K²/4α²}/|K|²`` GW's Coulomb head uses), the mini-BZ affine
+    wrap is :func:`vcoul.wrap_points_to_voronoi` + the same
+    ``randlims`` map as :func:`vcoul.minibz_voronoi_batches` (all through
+    the service door since the 2026-08-07 replumb), and
+    the inscribed-sphere / adaptive-``n_q`` rule matches
+    :func:`vcoul.minibz_average` (``minibzaverage.f90:63-75``).
+
+    RANK-PARALLELISM (this routine used to run the FULL serial host Sobol QMC
+    redundantly on every process): the estimator is the mean of the bare
+    kernel over ``qmc_reps`` replicate batches, each keeping its first
+    ``n_q`` mini-BZ δq draws — equivalently a single mean over the
+    ``reps·n_q`` kept samples, since ``n_q`` is the same for every rep.  Each
+    kept sample carries a GLOBAL slot index whose randomness comes ONLY from
+    that index, via ``jax.random.fold_in(PRNGKey(seed), gidx)`` (the sharded
+    sobol/threefry idiom: per-sample keys folded off one root key, no
+    per-rank reseeding).  Ranks own disjoint contiguous slabs of the
+    kept-slot range and evaluate only their slab; the per-rank partial sums
+    are all-reduced across processes (``process_allgather`` + sum).  Because
+    the sample for a given global slot is identical no matter which rank
+    draws it, the result is DETERMINISTIC and rank-count invariant (bit-equal
+    up to float summation reorder ~1e-13), just ``1/nranks`` the work.
+
+    ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
+    ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
+    exchange head is the (smaller) fine mini-BZ average, not the coarse one
+    (the head magnitude scales with the mini-BZ cell area).  That init reaches
+    this function only on the ``head_minibz_average`` OPT-IN arm; with the key
+    off (the default) it carries the coarse q=0 tile through untouched and
+    never calls here (bse_io._interpolate_bse_data_to_grid).  Default None uses
+    the stored coarse grid (the exciton_bands Q-path convention, unchanged).
+    """
+    # Replumbed 2026-08-07: these are pure service symbols; the door is
+    # the true dependency (the gw.coulomb.base / gw.vcoul spellings are
+    # compat shims kept for sibling branches this phase).  The Voronoi wrap
+    # moved into :func:`_mbz_dq` with the rest of the Q-independent geometry.
+    from vcoul import _minibz_kernel_bare, minibz_inscribed_sphere_r2
+    if alpha is None:
+        alpha = float(prep["alpha"])
+    GS = np.asarray(prep["GS"], dtype=np.float64)          # (3, nG)
+    bvec = np.asarray(zx["bvec"], dtype=np.float64)
+    celvol = float(zx["celvol"])
+    kgrid = (tuple(int(s) for s in zx["kgrid"]) if kgrid is None
+             else tuple(int(s) for s in kgrid))
+    Qf = np.asarray(Qfrac, dtype=np.float64)
+    K = bvec.T @ (Qf[:, None] + GS)                        # (3, nG) cartesian Q+G
+    K2 = np.sum(K * K, axis=0)
+    gstar = int(np.argmin(K2))
+    # The head magnitude is injected onto the LR column ``gstar`` by
+    # ``eval_vq`` (``v = where(arange(nG)==gstar, head_val, v)``), and that
+    # column's form factor is ``M[:, gstar]`` — which the b26p model leaves at
+    # ZERO for any |G_z| it does not fit.  Landing the head on such a column
+    # would multiply the cell-averaged magnitude by an identically-zero form
+    # factor and drop it silently.  For a q_z=0 slab the argmin is always a
+    # G_z=0 slot, so this cannot fire in scope; it fires if the caller leaves
+    # that scope.  (Nothing checked this before.)
+    # THE UMKLAPP CONSTRAINT (owner ruling 2026-08-10, docs/architecture/
+    # decisions.md).  ``gstar`` is the head slot, and at a BZ boundary it is
+    # NOT G=0 — it rolls onto a neighbouring reciprocal-lattice vector, which
+    # is exactly why :func:`lr_fit_degrees` carries a hard two-shell floor.
+    # The check now reads the criterion's own resolved set rather than
+    # ``DEG_B26P``'s keys, so widening the criterion widens the guard with it.
+    _fitdeg = prep.get("fit_degrees") or DEG_B26P
+    if int(abs(GS[2, gstar])) not in _fitdeg:
+        raise ValueError(
+            f"mini-BZ head slot G*={GS[:, gstar].astype(int).tolist()} is in "
+            f"the |G_z|={int(abs(GS[2, gstar]))} channel, which the b26p model "
+            f"does not fit (fitted channels={sorted(_fitdeg)}).  Its form "
+            f"factor is model-zero, so the head magnitude would be silently "
+            f"dropped.  "
+            f"Target Q={Qf.tolist()} is outside the slab pipeline's q_z=0 "
+            f"scope.")
+    shift_cart = K[:, gstar]                               # cartesian Q+G*
+    len_shift2 = float(shift_cart @ shift_cart)
+    q0sph2 = minibz_inscribed_sphere_r2(bvec, kgrid, is_2d=True)
+
+    # BGW adaptive per-batch sample count (minibzaverage.f90:63-75); the 2D
+    # slab head always takes this (non-analytic-sphere) branch.
+    if len_shift2 > 1e-12:
+        n_q = int(round(n_coarse * 4.0 * q0sph2 / len_shift2))
+        n_q = max(1, min(n_q, int(nsamples)))
+    else:
+        n_q = int(nsamples)
+
+    rank = int(jax.process_index())
+    nranks = int(jax.process_count())
+    n_kept = int(qmc_reps) * n_q
+    lo = rank * n_kept // nranks                            # disjoint, union
+    hi = (rank + 1) * n_kept // nranks                      # = [0, n_kept)
+
+    if hi > lo:
+        # Q-INDEPENDENT and memoised: the draws, the Voronoi wrap and the
+        # mini-BZ affine map are pure cell geometry indexed by global slot.
+        # Only the kernel evaluation below sees Q.
+        dq = _mbz_dq(bvec, kgrid, n_q=n_q, nsamples=nsamples,
+                     qmc_reps=qmc_reps, seed_offset=seed_offset,
+                     lo=lo, hi=hi)
+        v, _ = _minibz_kernel_bare(shift_cart, dq, kind="slab_lr",
+                                   alpha=alpha, zc=float(np.pi / bvec[2, 2]))
+        local_sum = float(np.sum(v))
+        local_cnt = float(v.shape[0])
+        if moment:
+            K = shift_cart[None, :] + dq                     # (N, 3) momentum
+            local_mom = (K * v[:, None]).T @ K               # (3, 3)
+        else:
+            local_mom = np.zeros((3, 3))
+    else:
+        local_sum = local_cnt = 0.0
+        local_mom = np.zeros((3, 3))
+
+    if nranks > 1:
+        from jax.experimental import multihost_utils
+        payload = np.concatenate(
+            [np.asarray([local_sum, local_cnt], dtype=np.float64),
+             local_mom.reshape(-1)]) if moment else \
+            np.asarray([local_sum, local_cnt], dtype=np.float64)
+        g = np.asarray(multihost_utils.process_allgather(payload, tiled=False))
+        tot_sum = float(g[:, 0].sum())
+        tot_cnt = float(g[:, 1].sum())
+        tot_mom = g[:, 2:].sum(axis=0).reshape(3, 3) if moment \
+            else np.zeros((3, 3))
+    else:
+        tot_sum, tot_cnt = local_sum, local_cnt
+        tot_mom = local_mom
+    head_bare = tot_sum / tot_cnt                            # mean over kept
+    if moment:
+        return gstar, head_bare / celvol, (tot_mom / tot_cnt) / celvol
+    return gstar, head_bare / celvol

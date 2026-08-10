@@ -114,6 +114,59 @@ SI_SMOKE: dict[str, tuple[str, ...]] = {
     ),
 }
 
+
+# ---------------------------------------------------------------------------
+# THE CONTRACT DECKS — the same smoke, expressed as a LAUNCH instead of a
+# node id, because the JAX CACHE CONTRACT has to run the driver as four
+# PROCESSES and a pytest node id runs it as one.
+#
+# Same rule as SI_SMOKE above: existing decks, existing arguments, nothing
+# authored.  Each entry is the ordered list of STAGES that make one run of
+# that driver's smoke deck; every stage is launched at P=4 and every stage
+# is held to the contract, because a two-stage deck that is symmetric in
+# its second stage and divergent in its first is exactly the state a
+# single end-of-run check cannot see.
+#
+# ``tests/test_jax_cache_contract.py`` consumes this; a gate in that file
+# asserts CONTRACT_DECKS and SI_SMOKE cover the same drivers, so the two
+# rosters cannot drift apart silently.
+# ---------------------------------------------------------------------------
+CONTRACT_DECKS: dict[str, tuple[dict, ...]] = {
+    # The FAST Si deck (20 bands, 144 centroids, ~12 s at P=1), not the
+    # production one: the contract is about cache keys, not about physics
+    # numbers, and the production deck's extra minutes buy this gate
+    # nothing it can measure.
+    "gw.gw_jax": (
+        {"stage": "gw", "deck": "si_cohsex_debug", "module": "gw.gw_jax",
+         "argv": ("-i", "cohsex_si_fast.in")},
+    ),
+    # TWO stages on ONE run dir, exactly as
+    # ``test_bse_bgw_regression.test_bse_matches_frozen_and_bgw`` does it:
+    # the BSE direct term reads W0_qmunu back from what the GW stage
+    # persisted, so the stages are not independent and cannot be split.
+    # ``--band-degeneracy off`` and the 4v4c window are that cell's pins,
+    # restated here for the same reason it states them.
+    "bse.bse_jax": (
+        {"stage": "gw", "deck": "si_bse_debug", "module": "gw.gw_jax",
+         "argv": ("-i", "bse_si_test.in")},
+        {"stage": "bse", "deck": "si_bse_debug", "module": "bse.bse_jax",
+         "argv": ("-i", "bse_si_test.in", "--bse", "--lanczos", "--tda",
+                  "--matvec-kind=ring", "--n-val", "4", "--n-cond", "4",
+                  "--n-occ", "4", "--band-degeneracy", "off",
+                  "--n-reorth", "-1", "--max-lanczos-iter", "60",
+                  "--n-eig", "8", "--px", "2", "--py", "2")},
+    ),
+    # NOT Si, for the reason SI_SMOKE gives above: this driver needs the
+    # deck's ``*.upf`` and ``cohsex_debug`` is the only deck that ships
+    # them.  It also needs the host FFI library, so the cell skips with
+    # that reason rather than failing when the .so is absent.
+    "psp.get_dipole_mtxels": (
+        {"stage": "dipole", "deck": "cohsex_debug",
+         "module": "psp.get_dipole_mtxels",
+         "argv": ("-i", "cohsex_test.in", "--out", "dipole_regen.h5")},
+    ),
+}
+
 #: Drivers with NO end-to-end deck a clean checkout can run, and why.
 #: Reported by ``pytest_report_header`` whenever one of them is touched, so
 #: a branch that changes an undecked driver is told that the default gate

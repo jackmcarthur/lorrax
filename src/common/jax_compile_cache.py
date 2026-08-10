@@ -29,6 +29,16 @@ Knobs (all optional):
                                           the deadlock reproducer; never use
                                           it in production.
   ``LORRAX_JAX_CACHE_EXPLAIN=1``        — turn on ``jax_explain_cache_misses``.
+  ``LORRAX_JAX_CACHE_KEYDUMP=<dir>``    — every rank writes the SET of
+                                          persistent-cache keys it asked
+                                          about to ``<dir>/rank{i}_of{N}.json``
+                                          at exit.  This is what makes the
+                                          key-symmetry invariant falsifiable:
+                                          ``LORRAX_JAX_CACHE_EXPLAIN`` names
+                                          only the keys that MISSED, so on a
+                                          healthy warm run it prints nothing
+                                          and two ranks asking about
+                                          different programs look identical.
   ``LORRAX_JAX_CACHE_SHARD_SLICE=0``    — TEST HOOK (red twin): leave JAX's
                                           ``ArrayImpl._multi_slice`` alone, so
                                           each rank bakes its own shard
@@ -231,6 +241,7 @@ they were cut from.  ``jax.version.__version_info__`` is the honest tuple.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import sys
 import time
@@ -273,6 +284,13 @@ class _CacheState:
         self.read_secs = 0.0   # time spent loading executables from disk
         self.prefetch_secs = 0.0
         self.agreed: frozenset[str] = frozenset()
+        # THE KEY SET.  Every persistent-cache key this rank asked about,
+        # hit or miss.  The counters above cannot express the invariant the
+        # cache contract is actually about: two ranks can both report
+        # ``xla_compiles=0 vetoed=0`` while asking about DIFFERENT programs,
+        # which is the state that precedes the collective-compile deadlock.
+        # A set of keys is the only observable that separates those.
+        self.probe_keys: set[str] = set()
 
 
 _STATE = _CacheState()
@@ -926,6 +944,7 @@ def _install_agreement_patch() -> None:
     # untouched, which is exact for any arity.
     def _agreed_get(cache_key, *passthrough):
         _STATE.probes += 1
+        _STATE.probe_keys.add(cache_key)
         if cache_key not in _STATE.agreed:
             _STATE.blocked += 1
             return None, None
@@ -944,6 +963,7 @@ def _install_agreement_patch() -> None:
         return executable, compile_time
 
     def _agreed_in_cache(backend, cache_key):
+        _STATE.probe_keys.add(cache_key)
         if cache_key not in _STATE.agreed:
             return False
         return _orig_in_cache(backend, cache_key)
@@ -1100,6 +1120,62 @@ def _report() -> None:
         _report_impl()
     except Exception:
         pass
+    try:
+        _dump_keys()
+    except Exception:
+        pass
+
+
+#: Filename a rank writes under ``LORRAX_JAX_CACHE_KEYDUMP``.  Spelled once,
+#: here, because the contract gate globs for it and a launcher that renamed
+#: it would give the gate an empty directory to be green about.
+def keydump_name(proc_idx: int, n_proc: int) -> str:
+    return f"rank{int(proc_idx):03d}_of{int(n_proc):03d}.json"
+
+
+def _dump_keys() -> None:
+    """Write this rank's cache-key set, when ``LORRAX_JAX_CACHE_KEYDUMP`` asks.
+
+    THE POINT.  ``xla_compiles`` and ``vetoed`` are per-rank COUNTS, and the
+    defect class this dump exists for is invisible to counts: four ranks
+    that each compiled a different program report the same four numbers as
+    four ranks that shared one.  What separates them is WHICH keys each rank
+    named, so that is what gets written.
+
+    Not the explain log.  ``jax_explain_cache_misses`` prints only the keys
+    that MISSED; a run where every rank hits every one of its own private
+    entries prints nothing at all on any rank, which is exactly the state
+    this dump has to be able to fail on.
+    """
+    dest = (os.environ.get("LORRAX_JAX_CACHE_KEYDUMP") or "").strip()
+    if not dest:
+        return
+    s = _STATE
+    path = Path(dest)
+    path.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "proc_idx": s.proc_idx,
+        "n_proc": s.n_proc,
+        "enabled": s.enabled,
+        "dir": s.dir,
+        "bound_dir": bound_cache_dir(),
+        "xla_compiles": s.compiles,
+        "probes": s.probes,
+        "hits": s.hits,
+        "vetoed": s.blocked,
+        "n_seen": s.n_seen,
+        "n_agreed": s.n_agreed,
+        # SORTED, so a reader diffing two ranks' files sees the divergence
+        # and not an iteration order.
+        "keys": sorted(s.probe_keys),
+    }
+    # Same tmp+rename discipline as the cache writes themselves: four ranks
+    # write into one directory and the gate globs it, so a reader must never
+    # be able to observe a half-written file and call it a short key set.
+    final = path / keydump_name(s.proc_idx, s.n_proc)
+    tmp = path / f".{final.name}.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(payload, indent=1, sort_keys=True))
+    os.replace(str(tmp), str(final))
 
 
 def bound_cache_dir() -> str:
@@ -1153,6 +1229,7 @@ def compile_cache_stats() -> dict:
         "compiles": s.compiles, "compile_secs": s.compile_secs,
         "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
         "bound_dir": bound_cache_dir(),
+        "keys": sorted(s.probe_keys),
     }
 
 
