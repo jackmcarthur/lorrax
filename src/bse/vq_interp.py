@@ -1414,7 +1414,10 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
     ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
     exchange head is the (smaller) fine mini-BZ average, not the coarse one
-    (the head magnitude scales with the mini-BZ cell area).  Default None uses
+    (the head magnitude scales with the mini-BZ cell area).  That init reaches
+    this function only on the ``head_minibz_average`` OPT-IN arm; with the key
+    off (the default) it carries the coarse q=0 tile through untouched and
+    never calls here (bse_io._interpolate_bse_data_to_grid).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
     # Replumbed 2026-08-07: these are pure service symbols; the door is
@@ -1623,8 +1626,9 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     (``load_zeta_coarse`` → ``build_cq`` → gates → ``prepare_coarse`` →
     ``lr_design_blocks`` → ``fit_lr_model`` → nulls → ``make_eval_vq`` +
     stencil pieces).  BOTH the ``exciton_bands`` Q-path driver and the general
-    BSE init's ``bse_k_grid`` coarse→fine densification call this — there is no
-    second copy of the setup sequence.
+    BSE init's ``bse_k_grid`` coarse→fine densification (on its
+    ``head_minibz_average`` opt-in arm only) call this — there is no second
+    copy of the setup sequence.
 
     Returns a ``SimpleNamespace`` with every handle the per-Q evaluation needs:
         .zx, .prep, .des, .coeffs        the fitted coarse-side model
