@@ -30,6 +30,26 @@ bit-identical to fresh).  The fixed-point ref preserves the pre-toggle
 same code whose fixed_point path reproduced the pre-toggle behavior on
 the old fixture.
 
+## 2026-08-09 re-freeze — the k-star completion (owner-authorized)
+
+`sigma_diag_gnppm_ref.dat` was re-cut a second time, and **not** for a
+fixture change: every input in this directory is untouched.  `dd727216`
+landed the k-star `(Z − Z†)/2i` completion in `src/gw/ppm_accumulators.py`,
+which had been closing a one-sided τ grid with an elementwise `Im` — the
+pair adjoint only at k = −k — so the non-TRIM k of this deck carried a
+wrong Σ_c.  The correction moves sigC by max **2.9794e-02 eV** over 412 of
+414 rows and leaves sigX and VH bit-identical; the reference now holds the
+corrected values, and the gate is green on them.
+
+The values were cut at `dd727216` and **re-verified bit-exact** against
+`main` @ `5b135f8e` before the freeze (max |Δ| = 0.000e+00, 0 of 2484 cells
+differing at all).  The `9a730da8` dipole re-cut does not reach this deck:
+`dipole.h5` here is unchanged — that commit records it as
+re-cut-blocked-no-deck — and the velocity sign it flipped lives in the
+dipole PRODUCER (`psp.get_dipole_mtxels`), which nothing on the Σ path
+calls.  Full provenance, **including the one thing this reference cannot
+see**, is in the file's own header; read it there rather than here.
+
 ## Shrink validation (all on 1 GPU, A100)
 
 * Fresh run twice → `sigma_diag`, `eqp0/1.dat` **bit-identical**
