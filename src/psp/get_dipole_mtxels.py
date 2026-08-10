@@ -340,6 +340,7 @@ def compute_finite_q_mtxels(
     iq_list: list[int],
     nv_block: int,
     nc_block: int,
+    vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
     verbose: bool = True,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
@@ -442,14 +443,23 @@ def compute_finite_q_mtxels(
             np.asarray(Gk_int, dtype=int),
             vnl_setup, compute_dZ=True,
         )
-        # vnl_ops applies a global sign flip relative to the BGW convention
-        # (see comment in main(): vNL_cart = -vNL_cart). Match here.
-        v_NL_v = -vnl_ops.apply_vnl_velocity_to_ket(
+        # THE SAME KNOB THE q = 0 ROUTES READ.  These tables feed the SOS
+        # chi head/wing pipeline, which is a consumer of the assembled
+        # velocity exactly like ``dipole_cart`` is, so a sign that moved
+        # at q = 0 and not here would leave one run's head and its wings
+        # built from two different operators.  Written as a branch rather
+        # than a multiply so the shipped arm executes the SAME negation
+        # it always did.
+        _vel_v = vnl_ops.apply_vnl_velocity_to_ket(
             psi_v[:, :int(kdata.E_super.shape[0])],
             kdata.Z, kdata.dZ, kdata.E_super)
-        v_NL_c = -vnl_ops.apply_vnl_velocity_to_ket(
+        _vel_c = vnl_ops.apply_vnl_velocity_to_ket(
             psi_c[:, :int(kdata.E_super.shape[0])],
             kdata.Z, kdata.dZ, kdata.E_super)
+        if vnl_velocity_sign < 0.0:
+            v_NL_v, v_NL_c = -_vel_v, -_vel_c
+        else:
+            v_NL_v, v_NL_c = _vel_v, _vel_c
         # The VNL apply may return only nspinor_E spinors; pad to full nspinor.
         if v_NL_v.shape[2] < v_kin_v.shape[2]:
             pad = v_kin_v.shape[2] - v_NL_v.shape[2]
@@ -1100,6 +1110,24 @@ def main(argv=None):
 			h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
 			h1 = h_base
 			h2 = 0.5 * h_base
+			# ONE INTERNAL CONVENTION FOR BOTH MODES: ``vNL_cart`` means
+			# ``+dV_NL/dK_cart``, which is what the analytic branch below
+			# returns (``compute_vnl_velocity_cart``'s docstring, and
+			# ``orbital_magnetization.py:601`` records it verified
+			# off-diagonally at ratio 1.000).  These differences used to
+			# carry a leading MINUS, which made ``--vnl-mode numeric``
+			# the arithmetic negative of ``--vnl-mode analytic``: both
+			# then passed through the same knob-controlled flip and the
+			# same ``p_cart + vNL_cart``, so the two modes came out on
+			# OPPOSITE arms of the very sign question this file's knob
+			# parameterises.  Two implementations of one derivative
+			# cannot both be right, and nothing in the tree compared
+			# them, which is why it survived.  The finite difference is
+			# the unambiguous one -- it is a literal numerical
+			# derivative of ``compute_vnl_matrix_from_setup``, which
+			# returns <m|V_NL(k)|n> with no sign convention of its own --
+			# so the analytic branch is the definition both now share
+			# and the numeric branch stops negating.
 			for ic in range(3):
 				# D1 at h1
 				d1 = np.zeros((3,), dtype=float); d1[ic] = h1
@@ -1108,7 +1136,7 @@ def main(argv=None):
 				km1 = np.asarray(kpoint, dtype=float) - d1c
 				Vp1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp1, vnl_setup, g_mask=g_mask)
 				Vm1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km1, vnl_setup, g_mask=g_mask)
-				D1 = - (Vp1 - Vm1) / (2.0 * h1)
+				D1 = (Vp1 - Vm1) / (2.0 * h1)
 				if args.vnl_num_scheme == "richardson":
 					# D2 at h2
 					d2 = np.zeros((3,), dtype=float); d2[ic] = h2
@@ -1117,7 +1145,7 @@ def main(argv=None):
 					km2 = np.asarray(kpoint, dtype=float) - d2c
 					Vp2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp2, vnl_setup, g_mask=g_mask)
 					Vm2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km2, vnl_setup, g_mask=g_mask)
-					D2 = - (Vp2 - Vm2) / (2.0 * h2)
+					D2 = (Vp2 - Vm2) / (2.0 * h2)
 					vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
 				else:
 					vNL_cart[ic] = D1
@@ -1211,6 +1239,7 @@ def main(argv=None):
 			iq_list=iq_list,
 			nv_block=int(nval),
 			nc_block=int(ncond),
+			vnl_velocity_sign=vnl_velocity_sign,
 			verbose=True,
 		)
 		cv_meta = {
