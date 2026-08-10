@@ -206,6 +206,69 @@ def test_squeeze_path_preserved(tmp_path, monkeypatch):
     assert np.array_equal(np.asarray(out), host[2, :])
 
 
+def test_several_addressable_shards_per_process(tmp_path, monkeypatch):
+    """A rank with MORE THAN ONE addressable device still gets one program.
+
+    The production launch is one GPU per process, but ``-G=4 -n=2`` and the
+    forced-CPU-device meshes give a rank several shards at once, and then
+    ``_multi_slice`` is called with a tuple of several index triples rather
+    than one.  Two ranks of two devices each: the SIZES tuple is the same on
+    both, only the offsets differ, so the canonicalization still collapses
+    them to a single key.
+    """
+    jcc._install_shard_slice_patch()
+
+    seen: list[str] = []
+    orig_get = jax_cache_key.get
+    monkeypatch.setattr(jax_cache_key, "get",
+                        lambda *a, **k: (lambda v: (seen.append(v), v)[1])(
+                            orig_get(*a, **k)))
+
+    host = np.arange(int(np.prod(_SHAPE)), dtype=np.float32).reshape(_SHAPE)
+    x = jnp.asarray(host)
+
+    # rank 0 owns rows 0:2 and 2:4; rank 1 owns 4:6 and 6:8
+    per_rank = [
+        [(slice(0, 2), slice(0, 5)), (slice(2, 4), slice(0, 5))],
+        [(slice(4, 6), slice(0, 5)), (slice(6, 8), slice(0, 5))],
+    ]
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    knobs = {
+        "jax_compilation_cache_dir": str(tmp_path),
+        "jax_persistent_cache_min_compile_time_secs": 0.0,
+        "jax_persistent_cache_min_entry_size_bytes": 0,
+    }
+    saved = {k: getattr(jax.config, k) for k in knobs}
+    for k, v in knobs.items():
+        jax.config.update(k, v)
+    from jax._src import compilation_cache as _cc
+    _cc.reset_cache()
+    keys = []
+    try:
+        for idxs in per_rank:
+            trips = [jax_array.as_slice_indices(np.zeros(_SHAPE), i)
+                     for i in idxs]
+            st = tuple(t[0] for t in trips)
+            li = tuple(t[1] for t in trips)
+            rm = tuple(t[2] for t in trips)
+            jax.clear_caches()
+            del seen[:]
+            shards = x._multi_slice(st, li, rm)
+            jax.block_until_ready(shards)
+            assert seen
+            keys.append(seen[-1])
+            for shard, (lo, hi) in zip(shards, [(s[0].start, s[0].stop)
+                                                for s in idxs]):
+                assert np.array_equal(np.asarray(shard), host[lo:hi, :])
+    finally:
+        for k, v in saved.items():
+            jax.config.update(k, v)
+        _cc.reset_cache()
+
+    assert len(set(keys)) == 1, f"two ranks, two shards each, {len(set(keys))} keys"
+
+
 def test_fallback_announces_and_stays_correct(monkeypatch):
     """A shape the canonical slicer declines must fall back LOUDLY, not quietly.
 
