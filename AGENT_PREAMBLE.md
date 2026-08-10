@@ -164,6 +164,25 @@ under the interim one-leg-per-node rule buys concurrency only by taking whole
 nodes. Combine first; split a leg only when it genuinely cannot be combined,
 and say why when you do.
 
+## Name your evidence directory, in the report
+
+**Every lane report names the directory its evidence lives in**, spelled out as
+a path, in the report itself. A number quoted without the workspace that
+produced it is unverifiable the moment the lane ends.
+
+This is not a filing preference. The evidence-purge lane found four orphan
+workspaces on `/pscratch` that existed only because the reports leaning on them
+never wrote their paths down — and one of those sits behind two committed
+frozen references whose provenance headers name the fix sha but not the
+workspace, so the references cannot be regenerated from what is written down.
+So the rule has a second half: **a frozen reference's provenance header names
+the workspace that produced it**, not just the commit.
+
+Register the directory in **`/pscratch/sd/j/jackm/EVIDENCE_MANIFEST.md`**,
+which is the index of what is load-bearing on scratch and what is not. A path
+that is not in the manifest and not cited in a report is indistinguishable from
+dead, and will eventually be treated as dead.
+
 ## File-boundary etiquette
 
 Several lanes usually run at once, so before you edit a file that is not
