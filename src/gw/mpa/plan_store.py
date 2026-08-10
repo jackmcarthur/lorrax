@@ -83,6 +83,7 @@ __all__ = [
     "PLAN_FORMAT",
     "PlanMissing",
     "branch_address",
+    "slab_digest",
     "declared_plan_inputs",
     "plan_path",
     "read_branch_plan",
@@ -153,16 +154,41 @@ def _feed(h, label, value):
         h.update(f"str={value!s}".encode())
 
 
-def branch_address(*, source_sha, fit_store, n_p, pole, bkey, arrays, scalars):
+def slab_digest(**arrays):
+    """The digest of the POLE-LEVEL planner inputs, taken once per pole.
+
+    ``Re Omega``, ``Gamma``, the live mask and ``|B|`` are the same four
+    arrays for all four branches of a pole and they are the large ones --
+    2.0 GB on the production deck, against a few kilobytes for everything
+    the branch contributes.  Hashing them per branch cost 12.56 s a pole
+    where hashing them once costs 3.14 s (measured 2026-08-10, census leg
+    of pole 0), so the address is built in two stages: this digest, and
+    then :func:`branch_address` over it plus what the branch adds.
+
+    The address still covers every byte of every planner input.  Nothing
+    is summarized away — the staging is an order of operations, not a
+    weaker guarantee.
+    """
+    h = hashlib.blake2b(digest_size=32)
+    h.update(f"{PLAN_FORMAT}/slab\n".encode())
+    for key in sorted(arrays):
+        _feed(h, f"array.{key}", np.asarray(arrays[key]))
+    return h.hexdigest()
+
+
+def branch_address(*, source_sha, fit_store, n_p, pole, bkey, slab,
+                   arrays, scalars):
     """The content address of one (pole, branch) plan, over ALL its inputs.
 
-    ``arrays`` and ``scalars`` are the arguments ``plan_branch_groups``
-    reads, and the digest covers the array BYTES rather than any summary of
-    them.  That is the expensive-looking choice and it is the correct one:
-    a summary (a shape, a min and a max, a store path and an mtime) is
-    exactly what a stale plan can match while being a different plan, and
-    the failure it would let through is a self-energy that is wrong by the
-    size of whatever moved and looks like every other self-energy.
+    ``slab`` is :func:`slab_digest` of the pole-level arrays; ``arrays``
+    and ``scalars`` are what the branch adds.  Between them they are every
+    argument ``plan_branch_groups`` reads, and the digest covers the array
+    BYTES rather than any summary of them.  That is the expensive-looking
+    choice and it is the correct one: a summary (a shape, a min and a max,
+    a store path and an mtime) is exactly what a stale plan can match while
+    being a different plan, and the failure it would let through is a
+    self-energy that is wrong by the size of whatever moved and looks like
+    every other self-energy.
 
     The cost is one streaming hash of arrays the leg has ALREADY read --
     the pole slab it is about to integrate against -- so it adds a pass
@@ -171,6 +197,7 @@ def branch_address(*, source_sha, fit_store, n_p, pole, bkey, arrays, scalars):
     """
     h = hashlib.blake2b(digest_size=16)
     h.update(f"{PLAN_FORMAT}\n".encode())
+    _feed(h, "slab", str(slab))
     _feed(h, "source_sha", str(source_sha))
     _feed(h, "fit_store", str(fit_store))
     _feed(h, "n_p", int(n_p))

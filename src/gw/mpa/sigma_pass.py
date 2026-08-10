@@ -1851,6 +1851,17 @@ def compute_mpa_sigma_c_omega_grid(
         omega_complex_host = (a_host - 1j * g_host
                               if (plan_dir is not None
                                   and census_out is None) else None)
+        # The pole-level half of the plan address, taken once for the four
+        # branches that share these arrays.  Four times over it cost
+        # 12.56 s a pole against 3.14 s once (2026-08-10), and the four
+        # branches genuinely read the same Re Omega, Gamma, live mask and
+        # |B| -- only E_A, its mask and the ω half-grid differ.
+        slab_dig = None
+        if plan_dir is not None:
+            t_slab = time.perf_counter()
+            slab_dig = PS.slab_digest(
+                a_ry=a_host, gamma_ry=g_host, live_mask=live, b_abs=b_abs)
+            fixed["addr_s"] += time.perf_counter() - t_slab
         state = _prepare_sigma_state(
             jnp.asarray(wfns.enk[:, s.full]), jnp.asarray(wfns.occ[:, s.full]),
             jnp.asarray(B_p, dtype=jnp.complex128),
@@ -1917,14 +1928,12 @@ def compute_mpa_sigma_c_omega_grid(
                 t_addr = time.perf_counter()
                 plan_addr = PS.branch_address(
                     source_sha=census_sha, fit_store=fit_src, n_p=n_p,
-                    pole=p, bkey=bkey,
+                    pole=p, bkey=bkey, slab=slab_dig,
                     arrays={
-                        "a_ry": a_host, "gamma_ry": g_host,
-                        "live_mask": live, "E_A_host": E_A_host,
+                        "E_A_host": E_A_host,
                         "base_mask_A_host": mask_A_host,
                         "omega_nonneg_ry": np.asarray(br.omega_abs,
                                                       dtype=np.float64),
-                        "b_abs": b_abs,
                     },
                     scalars={
                         "xi_ry": float(xi_ry),

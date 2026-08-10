@@ -88,10 +88,11 @@ def _address(a, g, live, E_A, omega_abs, *, space="cond", neg=False,
     scalars.update(override)
     return PS.branch_address(
         source_sha=sha, fit_store=store, n_p=8, pole=pole, bkey=bkey,
-        arrays={"a_ry": a, "gamma_ry": g, "live_mask": live,
-                "E_A_host": E_A,
+        slab=PS.slab_digest(a_ry=a, gamma_ry=g, live_mask=live,
+                            b_abs=np.abs(a) + 0.5),
+        arrays={"E_A_host": E_A,
                 "base_mask_A_host": np.ones(E_A.shape, dtype=bool),
-                "omega_nonneg_ry": omega_abs, "b_abs": np.abs(a) + 0.5},
+                "omega_nonneg_ry": omega_abs},
         scalars=scalars)
 
 
