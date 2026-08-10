@@ -54,7 +54,7 @@ def main():
         extra={"projected_max_leg_tau": max(taus),
                "projected_imbalance": max(taus) / ideal})
     print(f"manifest: {out}")
-    for leg in legs:
+    for leg in WF.read_manifest(out)["legs"]:
         print(f"  {leg['id']}: {leg['n_tau']:>6d} tau  "
               f"{leg['n_groups']:>4d} groups  poles {leg['poles']}  "
               f"-> {os.path.basename(leg['output'])}")
