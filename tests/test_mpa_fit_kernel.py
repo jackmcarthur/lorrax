@@ -905,3 +905,81 @@ def test_fit_reports_its_own_backward_error():
                      ("sigma_max_pade", "sigma_max"),
                      ("sigma_min_pade", "sigma_min")):
             assert float(diag[a]) == float(cnd[b]), (kw, a)
+
+
+@pytest.mark.parametrize("n_true,n_p", [(1, 8), (2, 8), (3, 10), (5, 12)])
+def test_red_twin_more_poles_than_the_data_has(n_true, n_p):
+    """RED TWIN: fewer true poles than fitted poles, the silent failure.
+
+    Plant ``n_true`` poles and ask for ``n_p > n_true``.  The Loewner
+    matrix is then rank-deficient by construction, the truncated
+    pseudo-inverse makes ``L^+ sL`` rank-deficient too, and an ``n x n``
+    matrix of rank ``r`` has ``n - r`` eigenvalues at EXACTLY zero --
+    which rounding scatters to ``|b| ~ eps``.  ``sqrt`` then turns those
+    into ``|Omega|/scale ~ 1e-8``, which the admissible box's low edge
+    (a floor on ``|Omega|``, hence ``1e-20`` on ``|b|``) never sees.
+
+    WHY IT IS NOT MERELY UNTIDY.  The insulator grid puts a sample at
+    ``z = 0`` exactly, so ``x_hat = 0`` is a sample point, and a
+    surviving pole at ``b ~ 1e-18`` gives the residue system a column
+    ``1/(x_hat_j - b_p)`` of norm ``~1e18``.  The truncated-SVD residue
+    solve then discards the real poles' directions as the small ones and
+    puts EVERY bit of the residue mass on the artefact.  Measured before
+    the ``prune_null`` guard existed: ``n_true = 3``, ``n_p = 10``,
+    100 % of the mass on one spurious pole and the samples reproduced to
+    a relative 1.0 -- i.e. not at all, silently, with a finite smooth
+    plausible-looking pole set.
+
+    The assertions are the ones that catch that: the count of live poles,
+    the rebuilt W at the samples, and the mass on anything unplanted.
+    """
+
+    z = sampling.double_parallel_grid(n_p, 2.524)
+    rng = np.random.default_rng(3)
+    a = np.linspace(0.4, 1.8, n_true)
+    Omega_t = (a - 1j * (0.05 + 0.05 * np.arange(n_true))).astype(
+        np.complex128)
+    B_t = ((0.5 + rng.random(n_true))
+           * np.exp(2j * np.pi * rng.random(n_true))).astype(np.complex128)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    scale = float(np.sqrt(np.max(np.abs(z * z))))
+
+    Omega, B, diag = pade_fit.fit_mpa_poles(W, z, n_p, solve="loewner")
+    Omega, B = np.asarray(Omega), np.asarray(B)
+    valid = np.asarray(diag["valid"])
+
+    # The invented poles are pruned and the true ones are not.
+    assert int(diag["n_valid"]) == n_true
+    assert int(diag["n_pruned_null"]) == n_p - n_true
+
+    # The rebuilt W is the honest gate and it is at round-off.
+    model = np.asarray(pade_fit.eval_mpa_model(Omega, B, z, valid=valid))
+    assert np.max(np.abs(model - W)) <= 1.0e-12 * np.max(np.abs(W))
+
+    # No residue mass sits anywhere but on a planted pole.
+    live = np.abs(np.where(valid, B, 0.0))
+    far = np.min(np.abs(Omega[:, None] - Omega_t[None, :]), axis=1)
+    leaked = live[valid & (far > 1.0e-3 * scale)].sum()
+    assert leaked <= 1.0e-10 * max(live.sum(), 1.0e-300)
+
+
+def test_null_guard_is_inert_on_a_well_posed_fit():
+    """The safety net must not catch anything it was not built for.
+
+    Measured on the production ``W_c`` store: the guard fires on ZERO of
+    758,016 poles across rungs 1, 2, 8 and 10 in both solve modes, and
+    ``B_p`` is bit-identical with the guard disabled.  That is what makes
+    it safe to add to a solve whose fits are already on disk.
+    """
+
+    n_p = 8
+    z = _grid(n_p, omega_m=4.0)
+    Omega_t, B_t = _si_like_poles(n_p)
+    W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    for kw in (dict(solve="pade", affine=False), dict(solve="loewner")):
+        on = pade_fit.fit_mpa_poles(W, z, n_p, **kw)
+        off = pade_fit.fit_mpa_poles(
+            W, z, n_p, guards={"prune_null": False}, **kw)
+        assert int(on[2]["n_pruned_null"]) == 0
+        assert np.array_equal(np.asarray(on[1]), np.asarray(off[1]))
+        assert np.array_equal(np.asarray(on[0]), np.asarray(off[0]))

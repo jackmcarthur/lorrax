@@ -102,6 +102,12 @@ is separately switchable so its red twin can be exhibited:
 4. ``prune_out_of_range``.  Poles outside the admissible box -- see
    ``_guard_prune_out_of_range`` -- carry no support from the sampled
    data and are dropped.
+5. ``prune_null``.  Poles the DENOMINATOR SOLVE invented rather than
+   fitted: a truncated rank-deficient system returns its missing
+   directions as eigenvalues at zero, and ``|b_p| < null_pole_floor``
+   is what those look like after rounding.  Applied in ``b`` units,
+   before the square root, because ``sqrt`` turns ``1e-16`` into a
+   plausible-looking small ``Omega``.  See ``_guard_prune_null``.
 
 MANDATORY RESIDUE REFIT.  Whenever ANY guard fires, the residues are
 re-solved by the all-2*n_p-point complex least-squares problem with the
@@ -133,6 +139,7 @@ DEFAULT_GUARDS = {
     "time_order": True,
     "prune_coincident": True,
     "prune_out_of_range": True,
+    "prune_null": True,
     # Two poles within this fraction of the frequency scale are one pole.
     "coincident_tol": 1.0e-6,
     # Upper edge of the admissible |Re Omega| box, as a multiple of the
@@ -140,6 +147,21 @@ DEFAULT_GUARDS = {
     "range_factor_hi": 2.0,
     # |Omega| below this fraction of the scale is a numerical zero.
     "range_factor_lo": 1.0e-10,
+    # THE NULL-POLE FLOOR, and it is in b = Omega**2 UNITS ON PURPOSE.
+    # ``range_factor_lo`` reads as a floor on |Omega| and is therefore a
+    # floor of ``range_factor_lo**2`` on |b_hat| -- 1e-20 at the default,
+    # which is to say no floor at all.  A denominator solve that has
+    # truncated a rank-deficient system returns the missing directions as
+    # eigenvalues AT ZERO, which rounding scatters to |b_hat| ~ eps (or
+    # ~sqrt(eps) if the zero cluster is defective), and those land far
+    # above 1e-20 and survive.  They are not modes; they are the null
+    # space wearing a pole's clothes, and one of them sitting near the
+    # x = 0 sample gives the residue system a column of norm 1/|b_hat|
+    # that captures every bit of the |B| mass.  Measured: with n_p = 10
+    # fitted to data carrying 3 true poles, an unfloored Loewner solve
+    # puts 100 % of the residue mass on one such pole and reproduces the
+    # samples to a relative 1.0 -- i.e. not at all.
+    "null_pole_floor": 1.0e-12,
     # The papers' "poles in the vicinity of the real frequency axis"
     # condition, quoted for MPA-Sigma as zeta/varsigma < -1 and
     # equivalent to |Im Omega| <= width_ratio_max * Re Omega.  Guard 1
@@ -507,11 +529,14 @@ def _companion_roots(c_coeffs):
 
     Companion matrix exactly as sigma-paper Eq. (S8): ones on the
     subdiagonal, ``-c`` in the last column.  ``jnp.linalg.eigvals`` is
-    non-symmetric; on CPU it is both jittable and vmappable, which is why
-    the whole kernel can stay in jax here.  (A GPU deployment must
-    revisit this -- non-symmetric ``eig`` has no GPU lowering -- but the
-    fit stage is disk-staged and cheap, so that is a placement question
-    for the design review, not a correctness one.)
+    non-symmetric; it is both jittable and vmappable, which is why the
+    whole kernel can stay in jax here.  (The "no GPU lowering" caveat
+    this docstring used to carry was refuted by the perf fleet's fit
+    lane on 2026-08-10: the batched non-symmetric ``eigvals`` does lower
+    to GPU, at 28.1 us/element scaling about ``n_p**1.87``, and CPU and
+    GPU agree to three digits rather than bitwise -- which is why the
+    reproduction gate for this module is stated in the
+    W-rebuild-at-samples norm and not on the pole positions.)
     """
 
     n = c_coeffs.shape[0]
@@ -545,6 +570,31 @@ def _guard_time_order(b_hat):
 
     bad = jnp.imag(b_hat) > 0.0
     return jnp.where(bad, jnp.conj(b_hat), b_hat), bad
+
+
+def _guard_prune_null(b_hat, valid, floor):
+    """Guard 3a -- drop the null space of a truncated denominator solve.
+
+    Returns ``(valid, fired)``.  Applied in ``b = Omega**2`` units and
+    BEFORE the square root, because that is where the artefact is
+    recognisable: a rank-deficient system's missing directions come back
+    as eigenvalues at zero, and ``sqrt`` turns ``|b| ~ 1e-16`` into
+    ``|Omega|/scale ~ 1e-8``, which looks like a small pole rather than
+    like nothing.
+
+    WHY THIS IS NOT A SMALLER ``range_factor_lo``.  It could have been
+    written that way and it would have been the wrong shape: the low
+    edge of the admissible box is a statement about which EXCITATIONS the
+    sampled data supports, and this is a statement about which
+    eigenvalues the linear algebra invented.  They want different
+    constants, they fire for different reasons, and a reader who sees
+    ``n_pruned_null > 0`` should learn "the solve was rank-deficient
+    here", which is a model-order finding, not "this deck has a soft
+    mode".
+    """
+
+    dropped = (jnp.abs(b_hat) < floor) & valid
+    return valid & ~dropped, dropped
 
 
 def _guard_prune_coincident(Omega, valid, scale, tol):
@@ -760,6 +810,10 @@ def fit_mpa_poles(
     valid = jnp.ones((n,), dtype=bool)
     fired_coincident = jnp.zeros((n,), dtype=bool)
     fired_range = jnp.zeros((n,), dtype=bool)
+    fired_null = jnp.zeros((n,), dtype=bool)
+    if cfg["prune_null"]:
+        valid, fired_null = _guard_prune_null(
+            b_hat, valid, cfg["null_pole_floor"])
     if cfg["prune_coincident"]:
         valid, fired_coincident = _guard_prune_coincident(
             Omega, valid, scale, cfg["coincident_tol"])
@@ -769,7 +823,8 @@ def fit_mpa_poles(
 
     any_correction = (
         jnp.any(fired_reflection) | jnp.any(fired_time_order)
-        | jnp.any(fired_coincident) | jnp.any(fired_range))
+        | jnp.any(fired_coincident) | jnp.any(fired_range)
+        | jnp.any(fired_null))
 
     # --- Stage 5: THE MANDATORY RESIDUE REFIT.  Any guard that fired
     # moved a pole or removed a column, so the pre-guard residues are
@@ -809,6 +864,7 @@ def fit_mpa_poles(
         "n_time_order_flipped": jnp.sum(fired_time_order.astype(jnp.int32)),
         "n_pruned_coincident": jnp.sum(fired_coincident.astype(jnp.int32)),
         "n_pruned_out_of_range": jnp.sum(fired_range.astype(jnp.int32)),
+        "n_pruned_null": jnp.sum(fired_null.astype(jnp.int32)),
         "any_correction": any_correction,
         "refit_performed": refit_performed,
         "max_abs_residual": jnp.max(resid),
