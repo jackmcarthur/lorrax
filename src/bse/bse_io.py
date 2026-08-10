@@ -1533,20 +1533,43 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
         sys_dim=getattr(meta, "sys_dim", None),
         analytic_sphere=analytic_sphere, gamma_cell=gamma_cell)
 
-    n_in = int(np.count_nonzero(S_fine))
-    n_c = coarse_grid[0] * coarse_grid[1] * coarse_grid[2]
+    # THE SUM RULE, reported on the deck.  The head channel's zone average is
+    # a property of the material and the cell, and the grid-independent number
+    # it converges to is (1/N_c)·⟨S⟩ over the COARSE cell — so the target has
+    # to be expressed on the coarse cell even when the reference head was
+    # measured on a different one (which is exactly the ``--w-coarse-grid``
+    # case, where a natively fine restart is decimated).  Getting this wrong
+    # does not change a single number that ships; it changes what the log
+    # claims, which is worse, because a diagnostic nobody can trust is a
+    # diagnostic nobody reads.
+    cg = tuple(coarse_grid)
+    gamma_coarse = (gamma_ref if tuple(ref_grid) == cg
+                    else head_densify.gamma_cell_head_scalar(
+                        geom, cg, S_cart, analytic_sphere=analytic_sphere))
+    n_c = cg[0] * cg[1] * cg[2]
+    target = float(whead) * (gamma_coarse / gamma_ref) / n_c
+    weight = head_densify.coarse_gamma_cell_weights(
+        head_densify.fine_q_cart(geom.bvec, fine_grid), cg, fine_grid)
     zone = head_densify.head_channel_zone_average(S_fine)
     log_fn(
         f"[w-head-c1] S_cart: {prov}; provenance ratio whead/⟨v/(1−vqSq)⟩ on "
         f"{tuple(ref_grid)} = {ratio:.6f} (1.0 means the restart's head and "
         f"this S are the same screening)")
     log_fn(
-        f"[w-head-c1] head channel re-attached at {n_in} fine q inside the "
-        f"coarse Γ cell (of {fine_grid[0]*fine_grid[1]*fine_grid[2]}); "
-        f"S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected {float(whead):.4f} "
-        f"Ry·bohr³ (×{S_fine[0, 0, 0]/float(whead):.3f}); zone average "
-        f"{zone:.6f} vs the grid-independent {float(whead)/n_c:.6f} "
-        f"[gamma_cell={gamma_cell}]")
+        f"[w-head-c1] head channel re-attached at "
+        f"{int(np.count_nonzero(S_fine))} fine q carrying total weight "
+        f"{float(np.sum(weight)):.6f} (= [Λ_f:Λ_c] = "
+        f"{fine_grid[0]*fine_grid[1]*fine_grid[2] // n_c}; more points than "
+        f"weight means boundary q sharing 1/k), of "
+        f"{fine_grid[0]*fine_grid[1]*fine_grid[2]} fine q total")
+    log_fn(
+        f"[w-head-c1] S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected "
+        f"{float(whead):.4f} Ry·bohr³ (×{S_fine[0, 0, 0]/float(whead):.3f} "
+        f"for a {(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.0f}× finer "
+        f"cell); SUM RULE: zone average {zone:.6f} vs the grid-independent "
+        f"{target:.6f} ({100.0*abs(zone/target - 1.0):.1f}% — a midpoint "
+        f"quadrature error that shrinks under refinement, 0 when fine == "
+        f"coarse) [gamma_cell={gamma_cell}]")
     if abs(ratio - 1.0) > 0.05:
         import warnings
         msg = (f"w_head_densify = c1: the injected head and the S tensor "

@@ -104,7 +104,6 @@ from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
                      _resolve_head_params, PAD_EPS_GUARD_RY)
-from gw.head_densify import attach_head_channel
 from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -1501,6 +1500,17 @@ def main(argv=None):
             # float-inexact at the 1e-16 level and is inherent to the harness,
             # not to C1; the legacy arm carries the identical rounding because
             # it decimates the very same injected tile.
+            # Imported HERE, not at module scope.  ``gw.head_densify``
+            # bootstraps the service search path at import time
+            # (``ffi._services.ensure_on_path()``), and doing that from a
+            # driver's import block reorders sys.path for every run of the
+            # driver, including the ones that never densify.  Measured: it
+            # moved the X-point exciton cluster of the default path by 3e-5 eV
+            # — reproducibly, on a near-degenerate sextet, with no array in
+            # the code changed.  A feature that is off by default must not be
+            # able to do that, so the import lives inside the branch that
+            # uses it.
+            from gw.head_densify import attach_head_channel
             w_head_mode = resolve_w_head_densify(args.w_head_densify, params)
             W_q_fine_in = data["W_q"]
             head_ch = None
