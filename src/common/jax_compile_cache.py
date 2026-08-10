@@ -516,6 +516,36 @@ def _host_target_id() -> str:
     return _HOST_TARGET_ID
 
 
+#: PER-PROCESS ENVIRONMENT THAT CHANGES THE EMITTED MODULE, by name.
+#:
+#: Everything else in :func:`_key_env_fingerprint` is about the cache KEY of
+#: the same module.  These are different and worse: they change the module
+#: ITSELF.  ``LORRAX_FFT_FFI_FUSED`` picks between a fused host-FFI
+#: ``ffi_call`` and a native three-FFT ``jnp`` chain inside
+#: ``gw.ppm_tau_kernel`` / ``gw.cohsex_sigma`` / ``gw.w_isdf``, so a rank
+#: launched with a different value emits different HLO, compiles a different
+#: program, and misses where its peers hit — ``jit__multi_slice``'s
+#: divergence (FIX_multislice_cachekey.md §6.1, sibling 5) arriving through
+#: the environment rather than through a shard offset.
+#:
+#: These are also the ones the GEMM/FFT autotuner actually sees: the affected
+#: kernels are Σ_kij, Σ_τ, the cohsex Σ chain and χ⁰, i.e. the modules with
+#: the largest autotune candidate sets in the tree.  A divergent autotune set
+#: is the deadlock one level below the cache (module docstring, above).
+#:
+#: THE SOURCE OF TRUTH IS ``src/ffi/__init__.py::FFI_DIAL_ENV`` and this list
+#: mirrors it; ``tests/cache_key_lint.py``'s ``env-dial`` rule fails when the
+#: two disagree.  Mirrored rather than imported because this function runs
+#: during the agreement, on every rank, on machines with no FFI library
+#: present — an ImportError here would turn the cache off for a reason that
+#: has nothing to do with the cache.
+RANK_FINGERPRINT_ENV = (
+    "LORRAX_FFT_FFI",
+    "LORRAX_FFT_FFI_FUSED",
+    "LORRAX_BANDS_GEMM_FFI",
+)
+
+
 def _key_env_fingerprint() -> bytes:
     """32-byte digest of everything OUTSIDE the module that feeds the cache key.
 
@@ -550,6 +580,14 @@ def _key_env_fingerprint() -> bytes:
     h.update(("|".join(sorted(flags))).encode("utf-8"))
     h.update(("|".join(sorted(prefixes))).encode("utf-8"))
     h.update(_host_target_id().encode("utf-8"))
+    # The per-process dials that change the emitted MODULE, not just its key.
+    # Unset and empty are folded to the same token deliberately: the gates
+    # (``ffi/gate.py::Gate.mode``) treat "" as "take the default", so two
+    # ranks that differ only in whether the variable exists are NOT
+    # divergent and must not be reported as such.
+    for name in RANK_FINGERPRINT_ENV:
+        val = os.environ.get(name, "").strip().lower()
+        h.update(f"{name}={val};".encode("utf-8"))
     try:
         from jax._src.lib import version_str as _jaxlib_version_str
         h.update(_jaxlib_version_str.encode("utf-8"))
@@ -642,11 +680,13 @@ def _agree_on_entries(cache_path: Path, n_proc: int, proc_idx: int,
         # degrade to cache-off together — which is always correct.
         raise _KeyEnvMismatch(
             "the ranks were launched with DIFFERENT key-affecting environment "
-            "(XLA_FLAGS / jaxlib version / jax cache config), so they would "
-            "compute different cache keys for the same module and their "
-            "hit/miss patterns would diverge — the scorecard-AG deadlock. "
-            "Make the environment identical on every rank (a rank-0-only "
-            "XLA_FLAGS for an HLO dump is the usual cause)")
+            "(XLA_FLAGS / jaxlib version / jax cache config / the per-process "
+            f"FFI dials {list(RANK_FINGERPRINT_ENV)}), so they would compute "
+            "different cache keys — and in the FFI-dial case a different "
+            "emitted MODULE — for the same computation, and their hit/miss "
+            "patterns would diverge: the scorecard-AG deadlock. Make the "
+            "environment identical on every rank (a rank-0-only XLA_FLAGS for "
+            "an HLO dump is the usual cause; a per-node FFI dial is the other)")
 
     agreed = frozenset(k for i, k in enumerate(keys) if _bit(final, i))
     return len(keys), agreed

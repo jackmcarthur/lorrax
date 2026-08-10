@@ -1561,8 +1561,33 @@ def _mbz_draw_u(gidx, base_key):
     return jax.vmap(one)(gidx)
 
 
-def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
-    """This rank's mini-BZ offsets ``δq`` for slab ``[lo, hi)`` — MEMOISED.
+def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, chunk):
+    """This rank's mini-BZ offsets ``δq`` for slab ``[lo, lo+chunk)`` — MEMOISED.
+
+    ``chunk`` IS THE SAME ON EVERY RANK, and that is a cache-contract
+    requirement.  It used to be ``hi - lo`` with ``lo = rank*n_kept//nranks``,
+    i.e. a rank slab, and that extent is the SHAPE of two jits:
+    :func:`_mbz_draw_u` traces at ``(hi-lo,) uint32`` and
+    ``vcoul.wrap_points_to_voronoi`` at ``(hi-lo, 3) f64``.  ``n_kept =
+    qmc_reps * n_q`` with ``n_q`` an adaptive per-Q clamp, so it does not
+    divide the rank count in general, the slabs differed by one band across
+    ranks, and each distinct extent was a separate compiled program with a
+    separate persistent-cache key — held by some ranks and not others, which
+    is the collective-compile deadlock precondition
+    (FIX_multislice_cachekey.md §6.1, sibling 1).
+
+    Now the extent is ``chunk = ceil(n_kept/nranks)`` everywhere and the
+    caller masks the slots that ran past ``n_kept``.  Those surplus slots are
+    ordinary further QMC draws — finite, in range, and simply not counted —
+    so nothing here has to defend against them.
+
+    ``lo`` IS DELIBERATELY NOT IN THE KEY.  It is ``rank * chunk``, and both
+    of those are constant within a process, so within the only scope this
+    dict has it is a function of ``chunk``.  Keeping it in the key would put
+    the rank slab back into a cache key for no lookup that could ever
+    benefit — a host memo is per-process and cross-rank sharing was never on
+    offer — and ``tests/cache_key_lint.py``'s ``rank-cache-key`` rule would
+    be right to say so.
 
     NOTHING here depends on the target Q.  The draws are indexed by global
     slot only; the Voronoi wrap and the ``randlims`` affine map are pure cell
@@ -1577,12 +1602,13 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
     deck, independent of ``n_μ``.
 
     The key carries every input the arrays depend on, INCLUDING ``n_q`` and
-    the rank slab, so a hit returns the array today's code would have built
-    element for element and in the same order.  The reduction that consumes
-    it is therefore **bit-identical**, not merely close — which is why the
-    cache can be keyed rather than the samples re-derived by prefix slicing.
+    the (rank-invariant) chunk width, so a hit returns the array today's code
+    would have built element for element and in the same order.  The
+    reduction that consumes it is therefore **bit-identical**, not merely
+    close — which is why the cache can be keyed rather than the samples
+    re-derived by prefix slicing.
 
-    Bounded to ``_MBZ_DQ_CACHE_MAX`` entries: ``dq`` is ``(hi-lo, 3)`` f64,
+    Bounded to ``_MBZ_DQ_CACHE_MAX`` entries: ``dq`` is ``(chunk, 3)`` f64,
     63 MB per entry at the production sample count divided by the rank count.
     ``n_q`` is BGW's adaptive per-batch count and clamps to ``nsamples`` for
     every Q whose ``|Q+G*|`` is small enough (all 8 probed Q on the reference
@@ -1590,12 +1616,15 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
     """
     from vcoul import wrap_points_to_voronoi
     key = (bvec.tobytes(), tuple(int(s) for s in kgrid), int(n_q),
-           int(nsamples), int(qmc_reps), int(seed_offset), int(lo), int(hi))
+           int(nsamples), int(qmc_reps), int(seed_offset), int(chunk))
     hit = _MBZ_DQ_CACHE.get(key)
     if hit is not None:
         return hit
     base_key = jax.random.PRNGKey(int(seed_offset))
-    slots = jnp.arange(lo, hi, dtype=jnp.uint32)
+    # ONE extent on every rank: the offset rides in as a VALUE, which is an
+    # operand, while the count is the shape.  Same split as the canonical
+    # ``jit__multi_slice`` fix (sizes static, offsets dynamic).
+    slots = int(lo) + jnp.arange(int(chunk), dtype=jnp.uint32)
     rep = slots // np.uint32(n_q)                       # replicate batch
     loc = slots % np.uint32(n_q)                        # in-batch draw
     gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
@@ -1743,27 +1772,41 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     rank = int(jax.process_index())
     nranks = int(jax.process_count())
     n_kept = int(qmc_reps) * n_q
-    lo = rank * n_kept // nranks                            # disjoint, union
-    hi = (rank + 1) * n_kept // nranks                      # = [0, n_kept)
+    # ONE CHUNK WIDTH FOR EVERY RANK — the cache contract.  The old bounds
+    # were ``rank*n_kept//nranks`` … ``(rank+1)*n_kept//nranks``: a balanced
+    # partition, but a RAGGED one, and the width is the traced shape of
+    # ``_mbz_draw_u`` and ``wrap_points_to_voronoi``.  A uniform ceil-width
+    # chunk covers exactly the same global slots [0, n_kept) exactly once
+    # once the tail is masked, so no sample is gained or lost; what changes
+    # is that every rank now compiles ONE program instead of one per slab
+    # width, and the ranks past ``n_kept`` compile it too instead of
+    # compiling nothing at all (FIX_multislice_cachekey.md §6.1, sibling 1).
+    chunk = max(1, -(-n_kept // max(nranks, 1)))
+    lo = rank * chunk
+    # The mask, not a shorter array: slots at or past ``n_kept`` are drawn
+    # and then not counted.  ``keep`` is all-False on a surplus rank, which
+    # reproduces the old ``else:`` branch's zeros exactly — and reaches it
+    # through the same compiles its peers did.
+    keep = (lo + np.arange(chunk)) < n_kept
 
-    if hi > lo:
-        # Q-INDEPENDENT and memoised: the draws, the Voronoi wrap and the
-        # mini-BZ affine map are pure cell geometry indexed by global slot.
-        # Only the kernel evaluation below sees Q.
-        dq = _mbz_dq(bvec, kgrid, n_q=n_q, nsamples=nsamples,
-                     qmc_reps=qmc_reps, seed_offset=seed_offset,
-                     lo=lo, hi=hi)
-        v, _ = _minibz_kernel_bare(shift_cart, dq, kind="slab_lr",
-                                   alpha=alpha, zc=float(np.pi / bvec[2, 2]))
-        local_sum = float(np.sum(v))
-        local_cnt = float(v.shape[0])
-        if moment:
-            K = shift_cart[None, :] + dq                     # (N, 3) momentum
-            local_mom = (K * v[:, None]).T @ K               # (3, 3)
-        else:
-            local_mom = np.zeros((3, 3))
+    # Q-INDEPENDENT and memoised: the draws, the Voronoi wrap and the
+    # mini-BZ affine map are pure cell geometry indexed by global slot.
+    # Only the kernel evaluation below sees Q.
+    dq = _mbz_dq(bvec, kgrid, n_q=n_q, nsamples=nsamples,
+                 qmc_reps=qmc_reps, seed_offset=seed_offset,
+                 lo=lo, chunk=chunk)
+    v, _ = _minibz_kernel_bare(shift_cart, dq, kind="slab_lr",
+                               alpha=alpha, zc=float(np.pi / bvec[2, 2]))
+    # Host-side masking: ``_minibz_kernel_bare`` is pure numpy, so dropping
+    # the padded rows here costs no module and no shape.
+    v = v[keep]
+    dq = dq[keep]
+    local_sum = float(np.sum(v))
+    local_cnt = float(v.shape[0])
+    if moment:
+        K = shift_cart[None, :] + dq                         # (N, 3) momentum
+        local_mom = (K * v[:, None]).T @ K                   # (3, 3)
     else:
-        local_sum = local_cnt = 0.0
         local_mom = np.zeros((3, 3))
 
     if nranks > 1:

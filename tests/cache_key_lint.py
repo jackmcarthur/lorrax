@@ -235,24 +235,60 @@ class AllowRow:
     ledger: str        # the dated ledger file that carries the full account
 
 
+#: ONE CONDITION, THREE SPELLINGS.  Every row below is the same thing: a
+#: rank that draws NO WORK compiles none of the loop body its peers compile.
+#: That is sibling 4 of FIX_multislice_cachekey.md §6.1 — ``local_share``'s
+#: sanctioned empty share — appearing once at its carrier and twice at call
+#: sites that spell the partition inline.  The other four siblings are fixed
+#: on this branch and have no row here.
+_EMPTY_SHARE = (
+    "THE SANCTIONED EMPTY SHARE.  At world > n_items a rank draws nothing "
+    "and therefore compiles nothing, while its peers compile the whole loop "
+    "body — maximal hit/miss asymmetry.  The design sanctions the empty "
+    "share explicitly (common/collectives.py's own note: 'P=64 on a 16-k "
+    "deck leaves world-nk ranks with an empty list') and TWO cells pin it as "
+    "CORRECT: test_kin_ion_padded_gvectors::test_sweep_local_k_empty_rank_"
+    "keeps_the_collective_shape and test_collectives_distribution's "
+    "round-robin pin.  The COLLECTIVE is already protected — item_shape is "
+    "required precisely so an empty rank contributes the right shape.  The "
+    "COMPILE is not, and closing it needs either a padded work list with a "
+    "sentinel item every consumer must be taught to execute, or a per-"
+    "consumer warm-up trace: a second, parallel notion of 'the work list'.  "
+    "Either is a contract change to common.collectives plus edits in every "
+    "consumer, and either invalidates the two pinning cells.  RED-LISTED "
+    "rather than forced.  ")
+
 ALLOW: tuple[AllowRow, ...] = (
     AllowRow(
         path="src/common/collectives.py", rule="rank-branch",
         dated="2026-08-10",
-        reason=(
-            "local_share's EMPTY SHARE at world > len(items) is sanctioned by "
-            "the design and pinned as CORRECT by two cells "
-            "(test_kin_ion_padded_gvectors::test_sweep_local_k_empty_rank_"
-            "keeps_the_collective_shape, test_collectives_distribution's "
-            "round-robin pin).  The collective is already protected — "
-            "item_shape is required precisely so an empty rank contributes "
-            "the right shape.  What is NOT protected is the COMPILE, and "
-            "closing that means either a padded work list with a sentinel "
-            "item every consumer must be taught to execute, or a warm-up "
-            "trace, i.e. a second parallel notion of the work list.  Both "
-            "are contract changes to common.collectives plus edits in "
-            "gw.kin_ion_io and psp.get_dipole_mtxels, and both invalidate "
-            "the two cells above.  RED-LISTED rather than forced."),
+        reason=_EMPTY_SHARE + (
+            "THE CARRIER: sweep_local_k runs per_k(ik) once per item of "
+            "local_share's round-robin share, and per_k is a caller-supplied "
+            "callback this module cannot see inside."),
+        ledger="tests/known_failures/2026-08-10-jax-cache-contract.md"),
+    AllowRow(
+        path="src/gw/kin_ion_io.py", rule="rank-branch",
+        dated="2026-08-10",
+        reason=_EMPTY_SHARE + (
+            "A CONSUMER.  The other half of this site — the RAGGED band "
+            "chunk, which gave the rank holding the short chunk its own "
+            "compiled FFT and its own cache key — IS fixed on this branch "
+            "(rho_work_items now snaps n_bchunk to a divisor of nocc, so "
+            "every chunk is the same width).  What is left is only the "
+            "empty-share half, which belongs to the carrier above."),
+        ledger="tests/known_failures/2026-08-10-jax-cache-contract.md"),
+    AllowRow(
+        path="src/psp/run_nscf.py", rule="rank-branch",
+        dated="2026-08-10",
+        reason=_EMPTY_SHARE + (
+            "FOUND BY THIS LINT, not by the campaign: run_nscf spells the "
+            "same partition inline as `if ik % n_proc != rank: continue` "
+            "around the per-k Davidson solve.  Every k has the same shape, "
+            "so there is no ragged-extent half here at all — the only "
+            "divergence is nk < n_proc, i.e. exactly the empty share.  "
+            "RAISED AS AN OWNER ROW in the ledger; it is a sixth site and "
+            "was not in this lane's scope to redesign."),
         ledger="tests/known_failures/2026-08-10-jax-cache-contract.md"),
 )
 

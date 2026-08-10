@@ -201,6 +201,50 @@ def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
     return (acc / ops.shape[0]).reshape(f.shape)
 
 
+def _uniform_band_windows(b_lo: int, b_hi: int, width: int) -> list:
+    """Equal-width band windows covering ``[b_lo, b_hi)`` exactly once.
+
+    Returns ``[(lo, mask)]`` where every ``lo`` starts a window of exactly
+    ``width`` bands and ``mask`` is a ``(width,)`` float64 array of ones and
+    zeros selecting the bands this window is responsible for.
+
+    WHY EQUAL WIDTH IS THE POINT.  The obvious chunking —
+    ``min(lo + width, b_hi)`` — makes the last window SHORT whenever the
+    range does not divide, and a short window is a different array shape, a
+    different compiled ``to_rbox`` kernel, and a different persistent
+    compile-cache key held by exactly one rank.  Overlapping instead of
+    shortening keeps one shape for every window on every rank; the mask is
+    what stops the overlap being counted twice.
+
+    Exactness: masked rows are multiplied by ``0.0`` and the summands are
+    ``|ψ|²·w_k ≥ 0`` and finite, so a masked row contributes exactly zero.
+    The band-axis reduction of the final window sees the same nonzero values
+    it saw before at different offsets, so the result is equal up to XLA's
+    freedom to reassociate that reduction — the same order of perturbation
+    (~3 ulp, measured 6.6e-16 relative) the distributed sweep already
+    documents against the serial left-fold, and for the same reason.  The
+    REPLICATED path is not routed through here and stays byte-identical.
+
+    >>> [(lo, list(m)) for lo, m in _uniform_band_windows(0, 10, 4)]
+    [(0, [1.0, 1.0, 1.0, 1.0]), (4, [1.0, 1.0, 1.0, 1.0]), \
+(6, [0.0, 0.0, 1.0, 1.0])]
+    """
+    b_lo, b_hi = int(b_lo), int(b_hi)
+    span = b_hi - b_lo
+    if span <= 0:
+        return []
+    width = int(min(max(1, int(width)), span))
+    out, counted = [], b_lo
+    while counted < b_hi:
+        lo = min(counted, b_hi - width)   # clamp: never short, may overlap
+        hi = lo + width
+        mask = np.zeros(width, dtype=np.float64)
+        mask[counted - lo:hi - lo] = 1.0
+        out.append((lo, mask))
+        counted = hi
+    return out
+
+
 def rho_from_band_range(
     wfn: WfnLoader,
     band_range: tuple[int, int],
@@ -377,16 +421,50 @@ def rho_from_band_range(
             # 6.6e-16 relative, ~3 ulp).  The weight is a SAMPLING DENSITY
             # whose consumers snap to grid points, so the gate that matters
             # is "the centroid set does not move", not bit-identity.
+            # ONE COMPILED PROGRAM, ON EVERY RANK — the cache contract.
+            #
+            # The chunk list above is canonical, but its LAST entry is short
+            # whenever the band range does not divide, and `i % world` gave
+            # that short entry to exactly one rank.  ``to_rbox`` keys its
+            # kernel cache on ``psi.shape`` (common/wfn_transforms.py), so
+            # that one rank compiled a SECOND to_rbox — a 3-D IFFT over a
+            # band batch no peer ever compiled — held a persistent-cache key
+            # no peer held, and, because JAX writes entries from process 0
+            # only, missed where its peers hit.  Asymmetric hit/miss across
+            # ranks is the collective-compile deadlock precondition
+            # (FIX_multislice_cachekey.md; this is its §6.1 sibling 3).
+            # The `continue` was the other half: with fewer chunks than
+            # ranks, the surplus ranks compiled NOTHING at all.
+            #
+            # Both are removed by making the WINDOW uniform instead of the
+            # chunk: every window is exactly ``width`` bands, the last one
+            # OVERLAPS its predecessor rather than being short, and a
+            # per-window 0/1 band mask removes the overlap from the sum.
+            # Every rank then runs the same number of rounds of the same
+            # program, and a rank with no work runs one fully-masked round.
+            windows = _uniform_band_windows(b_lo, b_hi, nb_chunk)
+            width = int(windows[0][1].shape[0])
+            n_rounds = -(-len(windows) // world)
             w_loc = jnp.zeros(fft_grid, dtype=jnp.float64)
-            for i, (lo, hi) in enumerate(chunks):
-                if (i % world) != rank:
-                    continue
-                psi = loader.load_process_local(bands=(lo, hi), k="ibz")
+            for r in range(n_rounds):
+                i = r * world + rank          # the same round-robin as before
+                if i < len(windows):
+                    lo, band_mask = windows[i]
+                else:
+                    # SURPLUS RANK.  Re-run window 0 with an all-zero mask:
+                    # it costs one chunk and it buys the symmetry, which is
+                    # the entire point of this loop's shape.
+                    lo = windows[0][0]
+                    band_mask = np.zeros(width, dtype=np.float64)
+                psi = loader.load_process_local(bands=(lo, lo + width),
+                                                k="ibz")
                 psi_r = to_rbox(psi, g_index, fft_grid, mesh=mesh,
                                 norm="ortho")
-                psi_r = psi_r[:, :hi - lo] * scale
+                psi_r = psi_r[:, :width] * scale
+                mask_j = jnp.asarray(band_mask).reshape(1, -1, 1, 1, 1, 1)
                 w_loc = w_loc + jnp.sum(
-                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j, axis=(0, 1, 2))
+                    (psi_r.real ** 2 + psi_r.imag ** 2) * kw_j * mask_j,
+                    axis=(0, 1, 2))
             w = psum_replicate(
                 np.asarray(jax.device_get(w_loc), dtype=np.float64), dist_mesh)
 

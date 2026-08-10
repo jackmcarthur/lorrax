@@ -459,13 +459,42 @@ def rho_work_items(nk: int, nocc: int, world: int) -> list[tuple[int, int, int]]
     ``ceil(world/nk)`` contiguous band chunks so ranks beyond the k
     count still get work; ``valence_density_from_kpoint`` sums whatever
     bands it is handed, so no band-index bookkeeping leaks out of here.
+
+    EVERY CHUNK IS THE SAME WIDTH, and that is a cache-contract
+    requirement rather than a tidiness preference.  The band extent of an
+    item is the SHAPE of two compiled programs — ``common.wfn_transforms``
+    keys its ``to_box`` kernel cache on ``psi.shape``, and
+    ``psp.get_DFT_mtxels._valence_density_kernel`` is a 3-D IFFT whose
+    batch axis is the band count.  The old ``nocc*i//n_bchunk`` bounds are
+    ragged whenever ``n_bchunk`` does not divide ``nocc`` (``nocc=26`` at
+    ``n_bchunk=4`` gives 6,7,6,7), ``local_share`` hands each rank a
+    disjoint subset of the items, and so the rank holding a 7-band chunk
+    compiled an FFT module no rank holding a 6-band chunk ever compiled —
+    a persistent-cache key it alone held, missed while its peers hit,
+    which is the collective-compile deadlock precondition
+    (FIX_multislice_cachekey.md §6.1, sibling 2).
+
+    So ``n_bchunk`` is snapped DOWN to a divisor of ``nocc``.  The cost is
+    stated rather than hidden: when ``nocc`` has no divisor near
+    ``ceil(world/nk)`` the split is coarser than asked for (``nocc=26``,
+    target 4, gives 2), and at prime ``nocc`` it collapses to 1, which
+    leaves ranks past ``nk`` with no item at all.  That residual is the
+    SANCTIONED EMPTY SHARE of ``common.collectives.local_share`` — the
+    red-listed sibling 4 — and not a new condition introduced here.
+
+    The three properties this function is pinned on are unchanged: every
+    band is covered exactly once (uniform division of ``nocc`` by one of
+    its divisors), ``world <= nk`` is still one whole-band item per k, and
+    the round-robin share is still balanced to within one item.
     """
     nk = int(nk)
     nocc = int(nocc)
-    n_bchunk = max(1, -(-int(world) // max(nk, 1)))
-    n_bchunk = max(1, min(n_bchunk, nocc))
-    bounds = [(nocc * i // n_bchunk, nocc * (i + 1) // n_bchunk)
-              for i in range(n_bchunk)]
+    target = max(1, min(-(-int(world) // max(nk, 1)), nocc))
+    # The largest divisor of nocc that is <= target.  ``1`` always
+    # qualifies, so the loop cannot fall through.
+    n_bchunk = next(d for d in range(target, 0, -1) if nocc % d == 0)
+    width = nocc // n_bchunk
+    bounds = [(i * width, (i + 1) * width) for i in range(n_bchunk)]
     return [(ik, lo, hi) for ik in range(nk) for lo, hi in bounds if hi > lo]
 
 

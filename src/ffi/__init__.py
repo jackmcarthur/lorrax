@@ -4,6 +4,37 @@ See `AGENTS.md` for the directory layout and how to add a new target.
 """
 
 
+#: THE PER-PROCESS DIALS, BY NAME — the declaration this subpackage owes the
+#: rest of the tree.
+#:
+#: Every name here is read from ``os.environ`` at kernel-FACTORY time, and
+#: flipping one changes the emitted HLO BODY, not merely which cached
+#: callable is handed back: ``LORRAX_FFT_FFI_FUSED`` is the difference
+#: between one fused host-FFI ``ffi_call`` custom call and a native
+#: three-FFT ``jnp`` chain.  So a rank whose dial differs from its peers'
+#: compiles a DIFFERENT MODULE, holds a different persistent-cache key, and
+#: — because JAX writes entries from process 0 only — misses where its peers
+#: hit.  That is ``jit__multi_slice``'s divergence
+#: (FIX_multislice_cachekey.md) arriving through the environment instead of
+#: through a shard offset, and nothing used to compare it across ranks.
+#:
+#: ``common/jax_compile_cache.py::RANK_FINGERPRINT_ENV`` now folds these into
+#: the cross-rank fingerprint, so a non-uniform dial turns the cache off on
+#: every rank LOUDLY instead of silently diverging.  The two lists are kept
+#: in agreement by ``tests/cache_key_lint.py``'s ``env-dial`` rule, which is
+#: why this tuple exists as data rather than being spelled inside
+#: :func:`ffi_dial_key`'s body: a lint that has to execute the function
+#: cannot run on a machine with no FFI library, which is exactly the machine
+#: someone adds a dial on.
+#:
+#: ADD A DIAL HERE WHEN YOU ADD ONE BELOW.  The lint fails otherwise.
+FFI_DIAL_ENV = (
+    "LORRAX_FFT_FFI",
+    "LORRAX_FFT_FFI_FUSED",
+    "LORRAX_BANDS_GEMM_FFI",
+)
+
+
 def ffi_dial_key() -> tuple:
     """The ONE cache-key component capturing every factory-time FFI dial.
 
@@ -34,4 +65,4 @@ def ffi_dial_key() -> tuple:
     )
 
 
-__all__ = ["ffi_dial_key"]
+__all__ = ["FFI_DIAL_ENV", "ffi_dial_key"]
