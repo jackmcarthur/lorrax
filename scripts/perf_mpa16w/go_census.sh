@@ -6,12 +6,24 @@
 # skipped or guessed: a window group's cost is its tau-node count, and
 # that number only exists once the group's certified rule has been built.
 # A census leg exits 0 after writing its table and says so in a banner.
+#
+# IT IS ALSO THE PLANNING STEP.  With mpa_plan_store set, the plan this
+# leg computes for each of its pole's four branches is written to the
+# store, addressed by a digest over every input the planner read.  The
+# integrating legs then LOAD their groups instead of re-deriving them --
+# which is the ~65 s per pole-touch a sixteen-leg farm otherwise paid
+# sixteen times over for eight poles of planning (§9.5).  Nothing about
+# the census itself changes: the same call, the same table, the same
+# digests.
 set -u
 source $(dirname "$0")/env.sh
 P=$1; TAG=$2
 RUN=$BASE/runs/$TAG; mkrun "$RUN"; cd "$RUN"
 mkdeck "$TAG" "$P" ""
 echo "mpa_pass_census_out = $CENSUS/${TAG}.json" >> deck.in
+if [ "${PLAN_ONCE:-1}" = "1" ]; then
+  echo "mpa_plan_store = $PLANS" >> deck.in
+fi
 echo "=== census leg $TAG : pole $P ==="
 echo "=== allocator regime: BFC@0.85 ==="
 echo "=== source sha: $(git -C $WT rev-parse HEAD) ==="

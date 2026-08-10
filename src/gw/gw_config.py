@@ -967,10 +967,26 @@ _DEFAULTS = {
     # of cubes can say which groups it holds and cannot say how many legs
     # there were supposed to be — which is exactly the shape of the
     # 2026-08-10 fit farm that silently lost leg 12 and its q [48, 52).
+    # ``mpa_plan_store`` — the directory of window-plan artifacts.  On a
+    # census run the planner's output is WRITTEN there, one file per
+    # (pole, branch), named by a digest over every input the planner
+    # reads; on an integrating run the groups are LOADED from it instead
+    # of re-derived.  That is the ~65 s per pole-touch a sixteen-leg farm
+    # otherwise pays sixteen times over for eight poles of planning.  A
+    # plan that is absent is refused by name; a plan built from other
+    # inputs has another address and is therefore not a file any leg on
+    # this deck asks for.
+    # ``mpa_plan_verify`` — plan the branch BOTH ways and refuse unless
+    # the loaded plan fingerprints, to the last bit of every τ node,
+    # weight, mask and index set, as the plan this tree computes.  The
+    # gate, not a production knob: it costs exactly the planning time the
+    # store exists to save.
     "mpa_pole_subset": "",
     "mpa_group_subset": "",
     "mpa_pass_census_out": "",
     "mpa_farm_manifest": "",
+    "mpa_plan_store": "",
+    "mpa_plan_verify": False,
     "mpa_pass_partial_out": "",
     "mpa_pass_partial_in": "",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
@@ -2380,6 +2396,13 @@ class LorraxConfig:
     #: The farm manifest a recombination checks its cubes against; ""
     #: is a pole-farm stack.  See ``_DEFAULTS["mpa_farm_manifest"]``.
     mpa_farm_manifest: str
+    #: The directory of window-plan artifacts: written by a census run,
+    #: read by an integrating one; "" plans in every leg, which is what
+    #: the farm used to do.  See ``_DEFAULTS["mpa_plan_store"]``.
+    mpa_plan_store: str
+    #: Plan both ways and refuse unless the loaded plan is bit-identical
+    #: to the computed one.  See ``_DEFAULTS["mpa_plan_verify"]``.
+    mpa_plan_verify: bool
     #: Where this process writes its partial Σ_c cube (""= not a partial
     #: run).  See ``_DEFAULTS["mpa_pass_partial_out"]``.
     mpa_pass_partial_out: str
@@ -2979,6 +3002,8 @@ class LorraxConfig:
             mpa_pass_census_out=str(
                 _g("mpa_pass_census_out") or "").strip(),
             mpa_farm_manifest=str(_g("mpa_farm_manifest") or "").strip(),
+            mpa_plan_store=str(_g("mpa_plan_store") or "").strip(),
+            mpa_plan_verify=bool(_g("mpa_plan_verify")),
             mpa_pass_partial_out=str(
                 _g("mpa_pass_partial_out") or "").strip(),
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),

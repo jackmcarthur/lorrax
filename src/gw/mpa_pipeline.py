@@ -524,6 +524,15 @@ def compute_mpa_sigma_pipeline(
         partial_out = str(getattr(config, "mpa_pass_partial_out", "") or "")
         census_out = str(getattr(config, "mpa_pass_census_out", "") or "")
         manifest_path = str(getattr(config, "mpa_farm_manifest", "") or "")
+        plan_store = str(getattr(config, "mpa_plan_store", "") or "")
+        plan_verify = bool(getattr(config, "mpa_plan_verify", False))
+        if plan_verify and not plan_store:
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: mpa_plan_verify is set without "
+                "mpa_plan_store.  The verification compares a LOADED plan "
+                "against a freshly computed one, so with no store there is "
+                "nothing to load and the check would silently pass by "
+                "comparing the fresh plan with itself.")
         group_subset = window_farm.parse_group_subset(
             getattr(config, "mpa_group_subset", ""))
         manifest = (window_farm.read_manifest(manifest_path)
@@ -557,6 +566,7 @@ def compute_mpa_sigma_pipeline(
                         getattr(config, "mpa_pole_subset", "")),
                     census_out=census_out,
                     census_sha=_source_sha(),
+                    plan_store=plan_store or None,
                     print_fn=print_fn,
                 )
             del _cube, _records
@@ -597,6 +607,9 @@ def compute_mpa_sigma_pipeline(
                         getattr(config, "mpa_pole_subset", "")),
                     group_subset=group_subset,
                     group_digests=(manifest or {}).get("digests"),
+                    census_sha=_source_sha(),
+                    plan_store=plan_store or None,
+                    plan_verify=plan_verify,
                     print_fn=print_fn,
                 )
             if partial_out:

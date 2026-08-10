@@ -17,6 +17,19 @@ mkdeck "$LEG" "$POLES" "$OUT"
   echo "mpa_group_subset = $GSUB"
   echo "mpa_farm_manifest = $MAN"
 } >> deck.in
+# PLAN_ONCE=1 (the default) loads this leg's window groups from the plan
+# store the census farm wrote; PLAN_ONCE=0 is the pre-2026-08-10 route,
+# kept as the A/B arm because the whole claim of this lane is a
+# difference between the two.  PLAN_VERIFY=1 additionally plans every
+# owned branch the old way and refuses unless the loaded plan is
+# bit-identical -- it costs exactly the time the store saves, so it is a
+# gate leg and not a production one.
+if [ "${PLAN_ONCE:-1}" = "1" ]; then
+  echo "mpa_plan_store = $PLANS" >> deck.in
+  if [ "${PLAN_VERIFY:-0}" = "1" ]; then
+    echo "mpa_plan_verify = true" >> deck.in
+  fi
+fi
 echo "=== window-farm leg $LEG : poles [$POLES] ==="
 echo "=== groups: $GSUB ==="
 echo "=== allocator regime: BFC@0.85 ==="

@@ -6,12 +6,20 @@ The three gates of this lane, in one step so they share one allocation:
   (a) the window-farmed Σ_c against the pole-farmed Σ_c and, pole by pole,
       against the single-leg computation of that pole;
   (c) the manifest refusal — one leg's output is moved aside and the merge
-      must refuse BY NAME, on both the pass manifest (a group range) and a
-      fit manifest (a q range, the [48, 52) that went missing on
-      2026-08-10);
+      must refuse BY NAME, on the pass manifest (a group range), a fit
+      manifest (a q range, the [48, 52) that went missing on 2026-08-10),
+      and a declared INPUT (a window plan the farm read);
   and the recombination audit the combiner prints either way.
 
+With a reference given, the merge additionally answers the question this
+lane exists to answer: whether the farm's arithmetic can tell that its
+window groups came off disk instead of out of the planner.  It cannot —
+the partition is the same partition and the recombination order is the
+same order — so the comparison is against BIT-IDENTITY and not against
+the re-association floor §9.6 documents, per leg cube and in total.
+
 Usage: merge_and_gate.py <manifest.json> <pole_partial_dir> <out_dir>
+                         [<reference_sigma.npy> [<reference_partial_dir>]]
 """
 from __future__ import annotations
 
@@ -48,6 +56,8 @@ def _cmp(name, a, b):
 
 def main():
     man_path, pole_dir, out_dir = sys.argv[1:4]
+    ref_npy = sys.argv[4] if len(sys.argv) > 4 else ""
+    ref_dir = sys.argv[5] if len(sys.argv) > 5 else ""
     os.makedirs(out_dir, exist_ok=True)
     manifest = WF.read_manifest(man_path)
     win_paths = [leg["output"] for leg in manifest["legs"]]
@@ -98,26 +108,64 @@ def main():
     else:
         raise SystemExit("*** GATE (c) FAILED on the fit side ***")
 
+    if manifest.get("inputs"):
+        print("=" * 72)
+        print("GATE (c) RED TWIN 3 -- a declared INPUT removed (a window plan)")
+        vic = manifest["inputs"][len(manifest["inputs"]) // 2]
+        hid = os.path.join(out_dir, "hidden_" + os.path.basename(vic["output"]))
+        shutil.move(vic["output"], hid)
+        try:
+            WF.refuse_incomplete(manifest)
+        except WF.FarmIncomplete as exc:
+            print("REFUSED, as it must:")
+            print(str(exc))
+            assert vic["id"] in str(exc), "the refusal did not name the plan"
+            assert vic["address"] in str(exc), \
+                "the refusal did not name the plan's address"
+            print(f"twin verdict: RED as designed -- named {vic['id']} and "
+                  f"its address")
+        else:
+            raise SystemExit(
+                "*** GATE (c) FAILED: the merge accepted a farm whose plan "
+                "is gone ***")
+        finally:
+            shutil.move(hid, vic["output"])
+
     print("=" * 72)
     print("GATE (a) -- the window farm merged under its manifest")
     tot_w, order, audit_w = combine_pass_partials(
         win_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src,
         manifest=manifest)
-    print("GATE (a) -- the pole farm, same deck, same sha")
-    tot_p, _order, audit_p = combine_pass_partials(
-        pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src)
+    # THE POLE ARM IS OPTIONAL, AND SAYING SO IS NOT A WEAKENING.  Gate (a)
+    # asks whether the window split reproduces the pole split; a lane whose
+    # change is upstream of the split (where the groups came FROM, not how
+    # they are cut) answers a different question, against another farm over
+    # the same partition, and re-running an eight-leg pole farm whose
+    # dearest leg is 26 minutes to re-answer a settled one is not free.
+    # When the directory is there the comparison runs exactly as before.
+    mx = rel = 0.0
+    n_diff = 0
+    tot_p = None
+    if pole_paths:
+        print("GATE (a) -- the pole farm, same deck, same sha")
+        tot_p, _order, audit_p = combine_pass_partials(
+            pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src)
 
-    print("-" * 72)
-    print("window-farmed Σ_c against pole-farmed Σ_c:")
-    mx, rel, n_diff = _cmp("total", tot_p, tot_w)
-    print(f"  for scale, the combiner's own re-association audit on the "
-          f"SAME cubes:")
-    print(f"    pole farm, ascending vs descending: "
-          f"{audit_p['reassoc_descending_max_abs_ry']:.6e} Ry "
-          f"({audit_p['reassoc_descending_rel']:.3e} rel)")
-    print(f"    pole farm, ascending vs shuffled:   "
-          f"{audit_p['reassoc_shuffled_max_abs_ry']:.6e} Ry "
-          f"({audit_p['reassoc_shuffled_rel']:.3e} rel)")
+        print("-" * 72)
+        print("window-farmed Σ_c against pole-farmed Σ_c:")
+        mx, rel, n_diff = _cmp("total", tot_p, tot_w)
+        print("  for scale, the combiner's own re-association audit on the "
+              "SAME cubes:")
+        print(f"    pole farm, ascending vs descending: "
+              f"{audit_p['reassoc_descending_max_abs_ry']:.6e} Ry "
+              f"({audit_p['reassoc_descending_rel']:.3e} rel)")
+        print(f"    pole farm, ascending vs shuffled:   "
+              f"{audit_p['reassoc_shuffled_max_abs_ry']:.6e} Ry "
+              f"({audit_p['reassoc_shuffled_rel']:.3e} rel)")
+    else:
+        print("-" * 72)
+        print(f"no pole-farm cubes in {pole_dir}: gate (a)'s pole arm is "
+              f"NOT run here and nothing below stands in for it.")
     print(f"    window farm, ascending vs shuffled: "
           f"{audit_w['reassoc_shuffled_max_abs_ry']:.6e} Ry "
           f"({audit_w['reassoc_shuffled_rel']:.3e} rel)")
@@ -169,6 +217,53 @@ def main():
 
     np.save(os.path.join(out_dir, "sigma_c_window.npy"), tot_w)
     np.save(os.path.join(out_dir, "sigma_c_pole.npy"), tot_p)
+
+    # THE PLAN-ONCE GATE.  A reference is another farm's cubes over the
+    # same manifest partition.  Where the split is identical the two runs
+    # differ only in where the window groups came from, so the answer must
+    # be exact equality: any nonzero difference is a difference in what a
+    # certified rule was, not a re-association, and §9.6's floor is the
+    # wrong scale to judge it on.
+    if ref_npy:
+        print("=" * 72)
+        print(f"PLAN-ONCE GATE -- this farm against {ref_npy}")
+        ref = np.load(ref_npy)
+        if ref.shape != tot_w.shape:
+            raise SystemExit(
+                f"*** reference Σ_c has shape {ref.shape} against this "
+                f"farm's {tot_w.shape}: these are not the same "
+                f"calculation ***")
+        rmx, rrel, rnd = _cmp("merged Σ_c vs reference", ref, tot_w)
+        if rnd != 0:
+            print("*** NOT BIT-IDENTICAL.  For scale, the re-association "
+                  "floor of this same recombination: "
+                  f"{audit_w['reassoc_shuffled_max_abs_ry']:.6e} Ry ***")
+        else:
+            print("  verdict: BIT-IDENTICAL -- the farm cannot tell that "
+                  "its window groups came off disk.")
+        del rmx, rrel
+    if ref_dir:
+        print("-" * 72)
+        print(f"per leg cube, against {ref_dir}")
+        worst_leg, n_bad = 0.0, 0
+        for leg in manifest["legs"]:
+            base = os.path.basename(leg["output"])
+            other = os.path.join(ref_dir, base)
+            if not os.path.exists(other):
+                print(f"  {leg['id']}: no reference cube at {other}")
+                continue
+            with h5py.File(leg["output"], "r") as f:
+                mine = np.asarray(f["sigma_c_partial"][()],
+                                  dtype=np.complex128)
+            with h5py.File(other, "r") as f:
+                theirs = np.asarray(f["sigma_c_partial"][()],
+                                    dtype=np.complex128)
+            mx, _rel, nd = _cmp(f"{leg['id']}", theirs, mine)
+            worst_leg = max(worst_leg, mx)
+            n_bad += (nd != 0)
+        print(f"  {len(manifest['legs']) - n_bad} of "
+              f"{len(manifest['legs'])} leg cubes bit-identical; worst "
+              f"max|Δ| = {worst_leg:.6e} Ry")
     print("=" * 72)
     print(f"VERDICT total: max|Δ| = {mx:.6e} Ry, relative {rel:.3e}, "
           f"{n_diff} elements differ of {tot_w.size}")

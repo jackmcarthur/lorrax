@@ -14,7 +14,7 @@
 # walls to within 2 %).  CUDA_VISIBLE_DEVICES is NOT set; lx passes
 # LORRAX_GPU_DEVICE and select_gpu.sh honours it.
 set -u
-export BASE=/pscratch/sd/j/jackm/mpa_winfarm_0810
+export BASE=${MPA_FARM_BASE:-/pscratch/sd/j/jackm/mpa_winfarm_0810}
 export WT=$BASE/wt
 export LORRAX_CHECKOUT=$WT
 export LX_BASE_MODULE=lorrax_J070
@@ -31,7 +31,13 @@ export CENSUS=$BASE/census
 export PARTIALS=$BASE/partials
 export POLEPARTS=$BASE/partials_pole
 export REPORTS=$BASE/_reports
-mkdir -p "$CENSUS" "$PARTIALS" "$POLEPARTS" "$REPORTS" "$BASE/runs"
+# THE PLAN STORE.  Written by the census farm (which already plans every
+# branch of every pole) and read by every integrating leg.  It is a
+# directory of content-addressed artifacts, so it is safe to leave one
+# lane's store beside another's: an address is a digest over every planner
+# input, and a leg only ever asks for the one file its own inputs name.
+export PLANS=${MPA_PLAN_STORE:-$BASE/plans}
+mkdir -p "$CENSUS" "$PARTIALS" "$POLEPARTS" "$REPORTS" "$PLANS" "$BASE/runs"
 
 bfc_env() {
   echo "env -u XLA_PYTHON_CLIENT_ALLOCATOR -u TF_GPU_ALLOCATOR XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 JAX_ENABLE_X64=1 LORRAX_FFI_SO=$FFI_DEV LORRAX_FFI_HOST_SO=$FFI_HOST"
