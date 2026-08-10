@@ -245,15 +245,27 @@ def test_the_producers_two_modes_agree_at_the_kernel_boundary():
     """
     from psp.get_dipole_mtxels import (compute_vnl_matrix_from_setup,
                                        compute_vnl_velocity_cart)
-    from tests.test_dipole_vnl_velocity_sign import _fixture, _vnl_setup
+    from tests.test_dipole_vnl_velocity_sign import (GRID, NGK, NS, _fixture,
+                                                     _vnl_setup)
 
     setup = _vnl_setup()
     psi, gv, gmask, _bidx, kvecs, bvec, blat = _fixture()
     B = np.asarray(bvec, dtype=np.float64) * float(blat)
     Binv = np.linalg.inv(B)
     ik, nb = 0, 2
-    wfn_k = jnp.asarray(psi[ik])[:nb]
     gm = gmask[ik]
+
+    # These two take an FFT-BOX state and gather it onto the G-sphere
+    # themselves, so the fixture's sphere-layout psi has to be scattered
+    # back into a box first.  Only the NGK physical columns are placed:
+    # the pad columns carry no amplitude and the mask zeroes them on the
+    # way out, which is the same thing the cells above rely on.
+    nx, ny, nz = GRID
+    box = np.zeros((nb, NS, nx, ny, nz), dtype=np.complex128)
+    for i in range(NGK):
+        gx, gy, gz = (int(c) for c in gv[ik][i])
+        box[:, :, gx, gy, gz] = psi[ik][:nb, :, i]
+    wfn_k = jnp.asarray(box)
 
     analytic = np.asarray(jax.device_get(compute_vnl_velocity_cart(
         wfn_k, gv[ik], kvecs[ik], setup, g_mask=gm)))
