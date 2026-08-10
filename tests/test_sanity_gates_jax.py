@@ -1034,7 +1034,6 @@ if __name__ == "__main__":
     raise SystemExit(_main())
 
 
-@pytest.mark.mesh(4)
 def test_check_hermitian_sharded_no_full_gather():
     """The hermiticity gate must never materialise a replicated (n, n) tile.
 
@@ -1049,10 +1048,28 @@ def test_check_hermitian_sharded_no_full_gather():
     the optimized HLO carries no all-gather with the full (n, n) extent —
     the same predicate wk_AN/colltable.py applies to production dumps.
     """
-    # The device requirement is the ``mesh(4)`` marker now.  The inline
-    # ``skip`` it replaces fired in every suite run — the conftest pin makes
-    # ``len(jax.devices())`` 1 in every test process — so this gate has never
-    # once run under `lx test`.
+    # NOT a ``mesh(4)`` cell, and the reason is at the top of this file:
+    # line 40 pins ``JAX_PLATFORMS=cpu`` for the whole module, at import,
+    # because that is the only place it can be set.  So this gate is an
+    # EMULATED-device gate by construction — it asks the CPU backend for four
+    # host devices — and the mesh marker would hand it to a child started for
+    # four A100s, which then refuses to be quietly emulated (correctly) and
+    # reports a red that is about the marker rather than about the code.
+    # MEASURED, Perlmutter 2026-08-10: exactly that, `came up with 1 on
+    # platform 'cpu'`.
+    #
+    # It therefore keeps the inline guard AND its old behaviour: in a census
+    # some earlier module has already built the CUDA backend, this module's
+    # `JAX_PLATFORMS` write is inert, `len(jax.devices())` is 1, and the cell
+    # skips.  That is a real loss and it is NOT fixed here — it is the
+    # separate problem of a module that must own the whole process's platform
+    # to run at all, which no per-cell marker can solve.  Recorded as an owner
+    # row rather than papered over.
+    if len(jax.devices()) < 4:
+        import pytest
+        pytest.skip("needs 4 (emulated) devices; this module pins "
+                    "JAX_PLATFORMS=cpu at import, so under the suite the "
+                    "backend is already CUDA and the pin is inert")
     mesh = _mesh(2, 2)
     n = 64
     sh = NamedSharding(mesh, P("x", "y"))
