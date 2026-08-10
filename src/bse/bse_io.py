@@ -1335,11 +1335,18 @@ def _interpolate_bse_data_to_grid(
         ``bandstructure.bse_setup.compute_wfns_fi`` with ``kgrid_fi=fine_grid``);
         the fH is built over the full loaded band window and only the BSE
         sub-window [nval−n_val, nval+n_cond) is returned (interior, guarded).
-      * V_Q exchange q=0 tile ← ``bse.vq_interp.build_vq_evaluator`` (the SAME
-        builder exciton_bands calls) evaluated at Q=0 with the FINE mini-BZ
-        head (``minibz_head_vlr(..., kgrid=fine_grid)``).  A Q=0 exciton's
-        exchange is the single q=0 tile (dense in k,k'); the fine k-grid's
-        exchange "q-set" is therefore just q=0.
+      * V_Q exchange q=0 tile ← CARRIED THROUGH unchanged by default.  A Q=0
+        exciton's exchange is the single q=0 tile (dense in k,k'), and that
+        tile's BODY is built from the centroids and the G-sphere alone, so it
+        is k-grid-INVARIANT: densifying it is unnecessary.  Only the rank-1
+        head scalar ``<v>_mBZ`` is grid-dependent (the cell is BZ/N_k).  The
+        deck's ``head_minibz_average`` key (default off) chooses: OFF keeps the
+        coarse bundle's tile exactly, deck ``vhead`` and all; ON rebuilds it
+        through ``bse.vq_interp.build_vq_evaluator`` (the SAME builder
+        exciton_bands calls) at Q=0 with the FINE mini-BZ head
+        (``minibz_head_vlr(..., kgrid=fine_grid)``), replacing the disk body
+        and the deck head.  Until 2026-08-09 this path forced the ON branch
+        unconditionally, ignoring the key — see the block comment below.
       * W direct ← ``make_w_densifier(output='k')`` — the ONE sharded
         coarse→fine densifier (shard_map FFTs + jitted R zero-pad, (μ,ν)
         sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
@@ -1423,26 +1430,70 @@ def _interpolate_bse_data_to_grid(
     M_Y = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_Y, psi_v_Y), y4)
 
-    # ── V_Q exchange q=0 tile on the fine grid (SAME vq_interp builder) ───
+    # ── V_Q exchange q=0 tile on the fine grid ────────────────────────────
     # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
     # tile (bse_serial.apply_bse_hamiltonian_single_device); so the fine
-    # k-grid's exchange q-set is just q=0.  We eval it with the FINE mini-BZ
-    # head (the head magnitude scales with the mini-BZ cell area, which shrinks
-    # coarse→fine); the body is the b26p/stencil model reproduced at the q=0
-    # training point (run_nulls certifies the reproduction).
-    vqm = vq_interp.build_vq_evaluator(
-        restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
-        log_fn=log_fn)
-    gstar, head_val = vq_interp.minibz_head_vlr(
-        vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
-    V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
-                       vqm.coeffs_packed,
-                       jnp.asarray(head_val, dtype=jnp.float64),
-                       jnp.asarray(gstar, dtype=jnp.int32))
-    V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)     # Hermitize (stencil residue)
-    V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
-    log_fn(f"[bse_k_grid] V_q0 exchange tile via vq_interp eval_vq(Q=0), "
-           f"fine mini-BZ head <v_LR>={head_val:.4f} (gstar={gstar})")
+    # k-grid's exchange q-set is just q=0.
+    #
+    # WHAT IS AND IS NOT GRID-DEPENDENT.  The q=0 exchange BODY
+    # V_{μν} = Σ_{G≠0} conj(ζ̃_{0,μ}(G)) v(G) ζ̃_{0,ν}(G) is built from the
+    # centroids and the G-sphere alone — it never sees the k-grid, so it needs
+    # no densification and the coarse bundle's tile is already the fine grid's
+    # answer.  The ONE k-grid-dependent piece is the rank-1 HEAD scalar, whose
+    # mini-BZ cell average <v>_mBZ is taken over BZ/N_k and therefore shrinks
+    # coarse→fine.  That rescale is what the original rebuild (964c682b,
+    # 2026-07-20) was after, and its comment said so.
+    #
+    # It bought the rescale by forcing ``head_minibz_average=True`` and
+    # REPLACING the whole tile, which cost two things the deck never agreed to:
+    # (i) the opt-in mini-BZ head average — documented in KNOWN_FAILURES as
+    # averaging the WRONG MOMENT (a scalar <v> where the nonanalytic head needs
+    # the 3×3 second moment <v q_a q_b>) — reached every coarse→fine user who
+    # had not set the key; and (ii) the deck's exact disk body and its
+    # loader-injected ``vhead`` rank-1 head (:1689-1704 above) were discarded
+    # and substituted by an LR-only model reconstruction.
+    #
+    # Both now follow the deck's ``head_minibz_average`` key, default off, like
+    # every other reader of that key in the tree (exciton_bands.py:971-973,
+    # head_correction.py:284,339, vq_interp.py:1498).  What the OFF arm gives
+    # up is only the head RESCALE, and at Q=0 the head is annihilated by
+    # ⟨u_ck|u_vk⟩ = 0 up to the ISDF orthogonality residual
+    # (LT_HEAD_PROBLEM.md §2.1) — so a stale head SCALE is inert to that
+    # residual, while a replaced BODY is not.
+    head_mbz = bool(params.get("head_minibz_average", False))
+    if head_mbz:
+        # Opt-in: rebuild the tile with the FINE mini-BZ head via the SAME
+        # vq_interp builder exciton_bands uses; the body is the b26p/stencil
+        # model reproduced at the q=0 training point (run_nulls certifies the
+        # reproduction).  This arm is bit-for-bit the pre-2026-08-09 behaviour.
+        vqm = vq_interp.build_vq_evaluator(
+            restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
+            log_fn=log_fn)
+        gstar, head_val = vq_interp.minibz_head_vlr(
+            vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
+        V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
+                           vqm.coeffs_packed,
+                           jnp.asarray(head_val, dtype=jnp.float64),
+                           jnp.asarray(gstar, dtype=jnp.int32))
+        V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)   # Hermitize (stencil residue)
+        V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
+        log_fn(f"[bse_k_grid] V_q0 exchange tile REBUILT via vq_interp "
+               f"eval_vq(Q=0), fine mini-BZ head <v_LR>={head_val:.4f} "
+               f"(gstar={gstar}) — head_minibz_average=true (deck opt-in).  "
+               f"The deck's disk body and vhead rank-1 head are REPLACED; that "
+               f"average is the scalar <v>, not the moment tensor the head "
+               f"needs (tests/KNOWN_FAILURES.md).")
+    else:
+        V_q0 = data["V_q0"]
+        log_fn("[bse_k_grid] V_q0 exchange tile CARRIED THROUGH from the "
+               "coarse bundle unchanged (head_minibz_average off = the "
+               "default): the q=0 body is k-grid-independent and the deck's "
+               "loader-injected vhead rank-1 head is preserved exactly.  The "
+               "head SCALE carried is the coarse mini-BZ <v>; at Q=0 the head "
+               "is annihilated by ISDF orthogonality, so the stale scale is "
+               "inert to the orthogonality residual (LT_HEAD_PROBLEM.md §2.1). "
+               "Set head_minibz_average=true to rebuild with the fine mini-BZ "
+               "head instead.")
 
     # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back, all
     # inside the ONE sharded densifier (shard_map FFTs + jitted pad with

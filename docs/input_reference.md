@@ -139,7 +139,7 @@ Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 
 | key | default | meaning |
 |---|---|---|
-| `bse_k_grid` | `""` | "NX NY NZ" fine grid: densify the whole BSE bundle (psi/eps, V_Q, W) from the coarse restart grid before any solve; empty = coarse, byte-identical. |
+| `bse_k_grid` | `""` | "NX NY NZ" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical. |
 | `get_centroids_fi` | false | htransform -> BSE handoff: also compute fine-grid psi at the coarse centroids (bse_setup.compute_wfns_fi). |
 | `wfn_fi_min` | `0` | Sub-window lower edge on the htransform band axis (0-based). |
 | `wfn_fi_max` | `0` | Sub-window upper edge, exclusive; 0 = full window. |

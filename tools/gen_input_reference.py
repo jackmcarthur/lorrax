@@ -143,7 +143,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "distributed_cholesky": ("Solver", "Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate."),
     "distributed_lu": ("Solver", "Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only)."),
     # ---- BSE ----
-    "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the whole BSE bundle (psi/eps, V_Q, W) from the coarse restart grid before any solve; empty = coarse, byte-identical."),
+    "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical."),
     "get_centroids_fi": ("BSE", "htransform -> BSE handoff: also compute fine-grid psi at the coarse centroids (bse_setup.compute_wfns_fi)."),
     "wfn_fi_min": ("BSE", "Sub-window lower edge on the htransform band axis (0-based)."),
     "wfn_fi_max": ("BSE", "Sub-window upper edge, exclusive; 0 = full window."),
