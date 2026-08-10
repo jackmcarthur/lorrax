@@ -42,6 +42,8 @@ from .epsreader import EPSReader
 from .tagged_arrays import (
     COULOMB_POLICY_DATASET,
     COULOMB_POLICY_KEYS,
+    DOWNFOLD_PROVENANCE_GROUP,
+    read_downfold_provenance,
     assert_restart_window_matches,
     compare_coulomb_policy,
     coulomb_policy_from_config,

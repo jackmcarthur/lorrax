@@ -10,6 +10,7 @@ up in the standard timing report beside ``zeta_fit`` and ``sigma.exec``:
     downfold.congruence  V, W, the _nohead twins and g0 through T
     downfold.residual    the per-q Pythagorean error bar
     downfold.write       the small bundle, in the SAME format at smaller mu
+    downfold.zeta        zeta transported to the small basis, beside it
 
 THE HEADLINE PROPERTY, and the thing to protect if anyone proposes changing
 this file: the output is a restart bundle in the **unchanged format** at a
@@ -19,6 +20,19 @@ every existing BSE consumer a zero-change drop-in —
 plans it, the ring and stack matvecs eat it, and none of them learns that a
 downfold happened.  If a reviewer proposes a bespoke ``.h5`` for downfolded
 objects, the answer is no.
+
+AND WHERE THAT PROPERTY IS NOT ENOUGH, which is the 2026-08-10 lesson.  It
+covers every consumer that only READS the stored tensors.  It does not cover
+one that REBUILDS an object in the same ISDF basis, because rebuilding needs
+two things that are not in the bundle format at all and never were: the
+CENTROID COORDINATES (``bse.exciton_bands`` refits psi at finite Q against a
+coordinate table, and its Galerkin fit is sized by nk*nb, so it must run in
+the PARENT basis and slice) and ZETA (the off-grid exchange interpolates it).
+So stages D6 and the centroid writer below produce those two beside the
+bundle.  They are SIBLINGS, not bundle datasets — the format is still
+unchanged, and the answer above is still no — but without them the drop-in
+promise held for ``bse_jax`` and failed for the driver the compression was
+built to serve.
 
 WHAT THE BAND AXIS DOES *NOT* DO, in stage 1.  The retained band window is
 the FIT window — it decides which pair densities the compression is faithful
@@ -70,7 +84,13 @@ from gw.downfold import (
 __all__ = ["DownfoldResult", "resolve_restart_file", "run_downfold"]
 
 #: Bumped when the provenance group's contents change meaning.
-DOWNFOLD_PROVENANCE_VERSION = 1
+#: 2 (2026-08-10) adds the ISDF-basis paths — ``parent_centroids_file``,
+#: ``parent_centroids_md5``, ``centroids_file``, ``zeta_file`` — which is
+#: what a consumer needs to rebuild something NEW in this basis rather than
+#: only read the tensors already in it.  Purely additive: every version-1
+#: field keeps its meaning, so a reader that only wants ``keep_idx`` need not
+#: look at the version at all.
+DOWNFOLD_PROVENANCE_VERSION = 2
 
 #: The two-point tensors a downfold transports.  Each is a LINEAR object in
 #: the centroid basis and therefore transforms by congruence.  A plasmon-pole
@@ -98,6 +118,8 @@ class DownfoldResult:
     norms: dict = field(default_factory=dict)
     wrote_nohead: tuple = ()
     centroid_file: str = ""
+    parent_centroid_file: str = ""
+    zeta_file: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -386,15 +408,28 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             mesh_xy, sel=sel, rank_per_q=rank_per_q, eps=eps,
             print_fn=print_fn)
 
-    cent_file = _write_centroid_subset(cfg, keep_idx, out_file,
-                                       print_fn=print_fn)
+    parent_table, fft_grid = resolve_parent_centroids(
+        cfg, src, mu_L, geom, os.path.dirname(out_file), print_fn=print_fn)
+    cent_file, parent_file = _write_centroid_subset(
+        cfg, keep_idx, out_file, parent_table, fft_grid, print_fn=print_fn)
+
+    # ---- D6: the finite-Q leg's operand ----------------------------------
+    with timing.section("downfold.zeta", announce=True,
+                        label="zeta transported to the small basis"):
+        zeta_file = write_downfolded_zeta(
+            src, out_file, T_x, keep_idx, mu_S, n_q, geom["kgrid"], g0_S,
+            print_fn=print_fn)
+
+    _stamp_isdf_basis(out_file, parent_file, cent_file, zeta_file,
+                      print_fn=print_fn)
 
     return DownfoldResult(
         source_file=src, output_file=out_file, mu_large=mu_L, mu_small=mu_S,
         n_q=n_q, n_bands=geom["nb"], keep_idx=keep_idx, selection=sel,
         rank_per_q=rank_per_q, eps_w=eps, norms=norms,
         wrote_nohead=tuple(n for n in small if n.endswith("_nohead")),
-        centroid_file=cent_file)
+        centroid_file=cent_file, parent_centroid_file=parent_file,
+        zeta_file=zeta_file)
 
 
 def _announce_residual(eps: dict, print_fn) -> None:
@@ -533,31 +568,556 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
     barrier("downfold.provenance")
 
 
-def _write_centroid_subset(cfg, keep_idx, out_file, *, print_fn):
-    """The kept rows of the parent's centroid table, when we were given it.
+def _stamp_isdf_basis(filename, parent_table, kept_table, zeta_file, *,
+                      print_fn=print):
+    """Where the small bundle's ISDF basis CAME FROM, on the same group.
+
+    ``keep_idx`` says which of the parent's centroid rows survived; these
+    three paths say which table those indices index, which table the kept
+    rows were written to, and where the transported ζ went.  Together they
+    are what lets a consumer rebuild something new in this basis instead of
+    only reading the tensors already in it — which is the whole difference
+    between ``bse.bse_jax`` (reads) and ``bse.exciton_bands`` (rebuilds ψ at
+    finite Q, in the PARENT basis, then slices).
+
+    Absolute paths, deliberately.  They are provenance — a record of what
+    this bundle was made from — and a consumer that finds them stale is
+    better off being told which file has moved than being handed a relative
+    path that silently resolves somewhere else.  Every reader treats a
+    missing file as "not available" and says so; none of them requires it.
+    """
+    if process_rank() != 0:
+        barrier("downfold.isdf_basis")
+        return
+    with h5py.File(filename, "a") as f:
+        g = f["downfold_provenance"]
+        if parent_table:
+            g.attrs["parent_centroids_file"] = str(os.path.abspath(parent_table))
+            g.attrs["parent_centroids_md5"] = _md5(parent_table)
+        if kept_table:
+            g.attrs["centroids_file"] = str(os.path.abspath(kept_table))
+        if zeta_file:
+            g.attrs["zeta_file"] = str(os.path.abspath(zeta_file))
+    have = [n for n, v in (("parent centroid table", parent_table),
+                           ("kept centroid table", kept_table),
+                           ("transported zeta_q.h5", zeta_file)) if v]
+    miss = [n for n, v in (("parent centroid table", parent_table),
+                           ("kept centroid table", kept_table),
+                           ("transported zeta_q.h5", zeta_file)) if not v]
+    print_fn(f"  [downfold] ISDF-basis provenance stamped: "
+             f"{', '.join(have) if have else 'nothing'}"
+             + (f"; MISSING {', '.join(miss)}" if miss else ""))
+    barrier("downfold.isdf_basis")
+
+
+def _md5(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.md5(fh.read()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# D6 — ζ, the one object the finite-Q consumer reads that is not in the bundle
+# ---------------------------------------------------------------------------
+
+def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
+                          kgrid, g0_S, *, print_fn=print) -> str:
+    """``zeta_q.h5`` in the small basis, beside the small bundle.
+
+    THE TRANSFORM IS THE HEAD VECTOR'S, AT EVERY G.  ``G0_mu_nu`` is the
+    single G = 0 column of ζ̃ and :func:`gw.downfold.transform_head_vector`
+    already establishes that it rides ``g0_S = conj(T[q]) g0_L``.  Nothing in
+    that derivation used G = 0, so the whole sphere goes the same way:
+
+        zeta_S[q, sigma, G] = conj(T[q])[sigma, mu] * zeta_L[q, mu, G]
+
+    and the consistency is not a hope.  ``V_{mu nu}(q) = sum_G conj(zeta_mu)
+    v(q+G) zeta_nu`` gives, on substitution,
+    ``V_S = T V_L T-dagger`` — EXACTLY the congruence stage D4 applied to the
+    stored tile.  So ``vq_interp``'s own per-q makeVq-vs-disk gate (which
+    rebuilds V from ζ and compares against the stored ``V_qmunu`` at 5e-6)
+    is a check on this function, and it is the reason no separate numerical
+    tolerance is invented here.  The q = 0 / G = 0 column is compared against
+    the independently-transported ``g0_S`` before the file is closed, which
+    is the cheap end of the same statement.
+
+    WHY THE DOWNFOLD HAS TO DO THIS AT ALL.  ζ is where the finite-Q exchange
+    comes from: ``bse.exciton_bands --vq-mode interp`` builds V(Q) off the
+    grid by interpolating the stored ζ, and it looks for ``zeta_q.h5`` beside
+    the restart file.  A downfolded bundle that carries none is not a drop-in
+    for that driver, and the parent's ζ is the WRONG BASIS — μ_L wide against
+    a μ_S bundle — so copying it would be worse than leaving it out.
+    Transporting it is the only answer that keeps the small bundle honest.
+
+    ONLY WHEN THE PARENT'S ζ IS ONE THIS CAN TRANSPORT.  ``T`` is indexed by
+    the restart's flat-q axis; a ζ written on the q-IBZ wedge is indexed by
+    the irreducible list, and mapping between them is the deferred IBZ-unfold
+    (one SymMaps sym-action).  When the parent's ζ is IBZ-only the small
+    bundle gets none and this says so, naming the parent's limitation rather
+    than presenting it as the downfold's — ``vq_interp`` refuses an IBZ ζ
+    outright, so ``--vq-mode interp`` was unavailable on the PARENT too and
+    the downfold has taken nothing away.
+
+    Returns the written path, or ``""`` when no ζ was transported.
+    """
+    from file_io.isdf_header import (IsdfHeader, mark_zeta_done,
+                                     read_isdf_header, write_isdf_header)
+    from file_io.mf_header import copy_mf_header
+
+    src_zeta = os.path.join(os.path.dirname(os.path.abspath(src_restart)),
+                            "zeta_q.h5")
+    if not os.path.isfile(src_zeta):
+        print_fn(
+            f"  [downfold/zeta] the parent run has no {src_zeta} — nothing "
+            f"to transport, and the small bundle carries no zeta_q.h5.  "
+            f"bse.bse_jax does not read one; bse.exciton_bands --vq-mode "
+            f"interp does, and it was equally unavailable on the parent.")
+        return ""
+
+    hdr = read_isdf_header(src_zeta)
+    if hdr.zeta_layout != "G_flat":
+        print_fn(
+            f"  [downfold/zeta] parent zeta_q.h5 has zeta_layout="
+            f"{hdr.zeta_layout!r}, not 'G_flat'.  No reader in this tree "
+            f"consumes an r-space ζ, so there is nothing a transported copy "
+            f"would serve; skipped.")
+        return ""
+    if not bool(hdr.zeta_is_done):
+        print_fn(
+            "  [downfold/zeta] parent zeta_q.h5 has zeta_is_done = False — "
+            "the fit did not finish, so its contents are not ζ.  Skipped; "
+            "re-run the parent's ζ fit to completion.")
+        return ""
+
+    keep = np.asarray(keep_idx, dtype=np.int64)
+    mu_L_file = int(hdr.n_rmu)
+    if int(keep.max()) >= mu_L_file:
+        raise ValueError(
+            f"downfold: the parent's zeta_q.h5 holds {mu_L_file} centroids "
+            f"but the kept index set reaches {int(keep.max())}.  That ζ was "
+            f"fitted on a DIFFERENT centroid table than the tensors this "
+            f"downfold read; transporting it would attach the wrong "
+            f"interpolation vectors to the right numbers.")
+
+    from zeta_loader import ZetaLoader
+    zl = ZetaLoader(src_zeta, mesh=None)
+    try:
+        nq_disk = int(np.asarray(zl.ngk_per_q).shape[0])
+        if nq_disk != int(n_q):
+            print_fn(
+                f"  [downfold/zeta] parent zeta_q.h5 stores {nq_disk} q "
+                f"against the bundle's {n_q} — the q-IBZ wedge.  The "
+                f"transfer T is indexed by the restart's flat-q axis and "
+                f"mapping the two is the deferred IBZ-zeta unfold, so no ζ "
+                f"is transported.  vq_interp refuses an IBZ ζ outright, so "
+                f"--vq-mode interp was already unavailable on the PARENT; "
+                f"this downfold has taken nothing away.  Re-fit the parent "
+                f"with LORRAX_FORCE_FULL_BZ=1 to get a ζ both can use.")
+            return ""
+
+        # T[q] at the LOGICAL extents.  The transfer carries the device-legal
+        # μ pads on both axes; ζ on disk is logical on both, and the pad rows
+        # are exactly zero, so the slice is a restriction and not a choice.
+        #
+        # ``gather_to_host``, NOT ``jax.device_get``.  ``T_x`` is μ_L-SHARDED
+        # on 'x', so at P>1 its shards live on other processes and
+        # ``device_get`` RAISES on it — the trap ``exciton_bands._gather_host``
+        # documents at length.  The service branches on
+        # ``is_fully_addressable`` and issues the collective only when it is
+        # needed, so every rank calls this and they stay in lockstep; the
+        # per-rank cost is one (nq, μ_S, μ_L) host buffer, bounded by the
+        # dimension this whole exercise makes small.
+        from common.collectives import gather_to_host
+        T_np = np.asarray(gather_to_host(T_x))[:, :int(mu_S), :mu_L_file]
+        perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, print_fn=print_fn)
+
+        ngkmax = int(zl.ngkmax_zeta)
+        out_zeta = os.path.join(os.path.dirname(out_file), "zeta_q.h5")
+        small_hdr = IsdfHeader.build(
+            r_mu_fft_idx=np.asarray(hdr.r_mu_fft_idx)[keep],
+            fft_grid=_fft_grid_of(hdr),
+            density=hdr.density, vertex_mu_L=int(hdr.vertex_mu_L),
+            zeta_layout="G_flat",
+            gvec_components=np.asarray(hdr.gvec_components),
+            ngk_per_q=np.asarray(hdr.ngk_per_q),
+            zeta_cutoff_ry=float(hdr.zeta_cutoff_ry))
+
+        if process_rank() == 0:
+            if os.path.exists(out_zeta):
+                os.remove(out_zeta)
+            copy_mf_header(src_zeta, out_zeta, dst_mode="w")
+            write_isdf_header(out_zeta, small_hdr, mode="a")
+            with h5py.File(out_zeta, "a") as f:
+                ds = f.create_dataset(
+                    "zeta_q_G", shape=(nq_disk, int(mu_S), ngkmax),
+                    dtype=np.complex128, chunks=(1, int(mu_S), ngkmax))
+                g0_chk = None
+                for q in range(nq_disk):
+                    z_L = np.asarray(zl.read_zeta_G_local(q))   # (mu_L, ngk)
+                    z_S = np.conj(T_np[perm[q]]) @ z_L[:mu_L_file]
+                    ds[q] = z_S
+                    if perm[q] == 0:
+                        g0_chk = z_S[:, 0].copy()
+            mark_zeta_done(out_zeta)
+            _gate_g0_against_zeta(g0_chk, g0_S, print_fn)
+            print_fn(
+                f"  [downfold/zeta] wrote {out_zeta}  (zeta_S = conj(T[q]) "
+                f"zeta_L over {nq_disk} q, mu {mu_L_file} -> {mu_S}, "
+                f"ngkmax {ngkmax}).  V rebuilt from it is T V_L T-dagger by "
+                f"construction — vq_interp's per-q makeVq-vs-disk gate is "
+                f"the end-to-end check.")
+    finally:
+        zl.close()
+    barrier("downfold.zeta_written")
+    return out_zeta
+
+
+def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, print_fn=print):
+    """``perm[i]`` = the restart's flat-q index of ζ's q slot ``i``.
+
+    THE TWO AXES ARE NOT THE SAME OBJECT AND ONE OF THEM IS RECONSTRUCTED.
+    The restart's q axis is the FFT's own C-order ``(kx, ky, kz)`` flattening
+    of ``kgrid`` — that is the axis ``T`` is indexed by.  ζ's q axis is the
+    fit writer's, labelled in ``mf_header/kpoints/rk``, which is copied
+    VERBATIM from the WFN and therefore holds the IBZ list whenever the
+    mean-field run used symmetry, even though the ζ beside it is full-BZ.
+
+    So: when ``rk`` is long enough to label every stored q, MATCH on it (an
+    exact wrapped-integer match, no tolerance games).  When it is short, the
+    writer's own full-BZ order is the wrapped C-order grid — the same
+    reconstruction ``vq_interp.load_zeta_coarse`` makes on the read side, and
+    the same one its per-q makeVq-vs-disk gate verifies — so the identity is
+    the answer and this says which branch it took.
+
+    Refusing beats guessing here: a permuted q axis writes each q's ζ against
+    a different q's transfer, which is a bundle full of plausible numbers.
+    """
+    kg = np.asarray(kgrid, dtype=np.int64)
+    idx = np.stack(np.meshgrid(np.arange(kg[0]), np.arange(kg[1]),
+                               np.arange(kg[2]), indexing="ij"),
+                   axis=-1).reshape(-1, 3)
+    keyed = {tuple(int(v) for v in row): i for i, row in enumerate(idx)}
+    qraw = np.asarray(zl.kpoints, dtype=np.float64)
+    if qraw.shape[0] < nq_disk:
+        print_fn(
+            f"  [downfold/zeta] mf_header/kpoints/rk labels only "
+            f"{qraw.shape[0]} of the {nq_disk} stored q (the WFN is "
+            f"symmetry-reduced).  Taking the writer's full-BZ order as the "
+            f"wrapped C-order {tuple(int(v) for v in kg)} grid — the same "
+            f"reconstruction vq_interp makes on the read side.")
+        return np.arange(nq_disk, dtype=np.int64)
+    perm = np.empty(nq_disk, dtype=np.int64)
+    for i in range(nq_disk):
+        key = tuple(int(v) % int(kg[a])
+                    for a, v in enumerate(np.rint(qraw[i] * kg)))
+        if key not in keyed:
+            raise ValueError(
+                f"downfold: zeta_q.h5's q #{i} = {qraw[i]} is not on the "
+                f"bundle's {tuple(int(v) for v in kg)} grid, so its ζ cannot "
+                f"be matched to a column of the transfer T.  The two files "
+                f"do not describe the same k-grid.")
+        perm[i] = keyed[key]
+    if len(set(perm.tolist())) != nq_disk:
+        raise ValueError(
+            "downfold: zeta_q.h5's q labels are not a permutation of the "
+            "bundle's q grid (duplicates after wrapping), so no unique "
+            "assignment of T to ζ exists.")
+    return perm
+
+
+def _isdf_fft_grid(src_restart):
+    """The FFT grid off the parent's ISDF header, or ``None`` if there is none.
+
+    Only needed on the ``parent_centroids_file`` arm, where the table came
+    from the user rather than from the header, and the grid is still wanted so
+    the kept subset can be stamped in the hash algebra the tree's own reader
+    uses.
+    """
+    zeta = os.path.join(os.path.dirname(os.path.abspath(src_restart)),
+                        "zeta_q.h5")
+    if not os.path.isfile(zeta):
+        return None
+    try:
+        from file_io.isdf_header import read_isdf_header
+        return _fft_grid_of(read_isdf_header(zeta))
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _fft_grid_of(hdr):
+    """The FFT grid an ``IsdfHeader`` was built against.
+
+    ``r_mu_crystal = r_mu_fft_idx / fft_grid`` is the only place the grid
+    survives in the header, so recover it by division rather than by asking
+    the caller for a number it would have to get from somewhere else and
+    could get wrong.  Integer-exact: both operands come off the same file.
+    """
+    idx = np.asarray(hdr.r_mu_fft_idx, dtype=np.float64)
+    cry = np.asarray(hdr.r_mu_crystal, dtype=np.float64)
+    nz = idx != 0.0
+    grid = np.zeros(3, dtype=np.float64)
+    for a in range(3):
+        m = nz[:, a]
+        if not np.any(m):
+            raise ValueError(
+                "downfold: the parent zeta_q.h5 isdf_header has an all-zero "
+                "centroid column, so its FFT grid cannot be recovered from "
+                "r_mu_fft_idx / r_mu_crystal.")
+        grid[a] = np.round(np.median(idx[m, a] / cry[m, a]))
+    return grid
+
+
+def _gate_g0_against_zeta(g0_from_zeta, g0_S, print_fn) -> None:
+    """ζ_S(q=0, G=0) against the independently-transported ``g0_S``.
+
+    Two routes to the same vector: this file's per-q ``conj(T) ζ_L`` and
+    stage D4's ``transform_head_vector``.  They are the same algebra, which
+    is exactly why comparing them is worth the two lines — it catches a
+    transposed T, a missing conjugate, or a q-axis that is not the one T is
+    indexed by, at the moment of writing rather than in an exciton spectrum.
+    Reported, not asserted: ``G0_mu_nu`` is absent from bundles whose parent
+    never wrote one, and the open 'g0_mu placement' owner row means its
+    storage convention is not yet settled enough to hard-fail on.
+    """
+    if g0_S is None or g0_from_zeta is None:
+        return
+    g0 = np.asarray(jax.device_get(g0_S)).ravel()[:g0_from_zeta.shape[0]]
+    denom = max(float(np.max(np.abs(g0))), 1e-300)
+    rel = float(np.max(np.abs(g0_from_zeta - g0))) / denom
+    verdict = "AGREE" if rel < 1e-10 else "DISAGREE"
+    print_fn(f"  [downfold/zeta] g0 cross-check: zeta_S(q=0, G=0) vs the "
+             f"transported g0_S -> {verdict} (max rel {rel:.3e}).  Both are "
+             f"conj(T[0]) applied to the same parent column.")
+
+
+def _frac_to_fft_idx(rows, fft_grid):
+    """Fractional centroid coordinates -> FFT-grid indices.
+
+    ``file_io.centroids.load_centroids``'s arithmetic, restated on host numpy
+    so this module can reproduce the index table a consumer will derive from a
+    coordinate file — including its wrap of an index that rounds up ONTO the
+    grid extent.  Restated rather than imported for the same reason
+    :func:`_centroid_table_md5` is: what has to agree is the FORMULA, and
+    spelling it here is what makes a disagreement visible in review.
+    """
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    idx = np.rint(np.asarray(rows, dtype=np.float64)[:, :3]
+                  * fg[None, :]).astype(np.int64)
+    for a in range(3):
+        idx[idx[:, a] == fg[a], a] = 0
+    return idx
+
+
+def _centroid_table_md5(fft_idx) -> str:
+    """The parent bundle's ``centroids_charge_md5``, recomputed.
+
+    ONE-LINE COPY OF ``gw_init._centroid_table_md5`` AND THAT IS DELIBERATE
+    — but it is a copy of the FORMULA, not of a number: int64, C-order
+    bytes, md5.  It is restated here rather than imported because
+    ``gw.gw_init`` is the GW driver's setup module and pulls the whole
+    fitting stack in behind it, and because this file needs the hash for the
+    opposite purpose: gw_init STAMPS it, this VERIFIES it.
+
+    The thing worth writing down is what the hash is OF.  It is not the
+    content of ``centroids_frac_*.txt``: that file holds FRACTIONAL
+    coordinates and the stamp hashes the FFT-GRID INDICES they round to.
+    Comparing a text file's own md5 against the stamp therefore never
+    matches, which is a mistake this function exists to make unavailable.
+    """
+    import hashlib
+    arr = np.ascontiguousarray(np.asarray(fft_idx, dtype=np.int64))
+    return hashlib.md5(arr.tobytes()).hexdigest()
+
+
+def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
+                             print_fn=print) -> tuple:
+    """The PARENT basis's centroid coordinates, made available beside the child.
+
+    WHY THE PARENT'S AND NOT THE KEPT SUBSET'S.  ``bse.exciton_bands`` refits
+    psi(k+Q) against a centroid table rather than reading the stored
+    coefficients, and that Galerkin fit needs a basis spanning ``nk*nb`` —
+    a completely different (and much larger) criterion than the retained
+    window's pair-density rank that mu_S was chosen against.  So the fit runs
+    at the PARENT's mu and its output is sliced to the kept rows afterwards.
+    Without the parent's coordinates that driver cannot open the small bundle
+    at all: measured 2026-08-10, a bare ``FileNotFoundError`` out of
+    ``np.loadtxt`` naming a file the deck mentioned and the directory did not
+    contain, with nothing to say it was a downfold consequence.
+
+    THE COORDINATES ARE NOT HUNTED FOR, THEY ARE DERIVED.  The parent's
+    ``zeta_q.h5`` carries ``isdf_header/centroids/r_mu_crystal``, which IS
+    the fractional table — ``r_mu_fft_idx / fft_grid``, and
+    ``file_io.centroids.load_centroids`` rounds that straight back to the
+    same indices — so the table is written out from the parent's own ISDF
+    header and the child directory becomes SELF-CONTAINED.  That matters more
+    than it sounds: "point the driver at a different directory and everything
+    else is as it was" is the downfold's whole promise, and it cannot hold if
+    the child needs a file that only exists next to the parent.
+
+    ``parent_centroids_file`` still wins when it is set, because a user who
+    has arranged their own table should not be overruled.  When neither is
+    available — a parent with no zeta_q.h5 and no named table — the run says
+    so and names the consequence rather than leaving it to be discovered.
+
+    Every route is CHECKED against the parent bundle's ``centroids_charge_md5``
+    when it carries one: the hash is over the int64 FFT-index table (see
+    :func:`_centroid_table_md5`), so a table with the right row count and the
+    wrong points is rejected rather than silently attached to the right
+    numbers.
+
+    Returns ``(path, fft_grid)``; the path is ``""`` when nothing could be
+    resolved, and the grid is ``None`` when the parent carried no ISDF header
+    to read one from (it is what turns fractional coordinates into the index
+    table ``centroids_charge_md5`` hashes, so a caller without it must not
+    stamp).
+    """
+    stamped = geom.get("centroids_charge_md5")
+    if isinstance(stamped, bytes):
+        stamped = stamped.decode("utf-8")
+
+    def _verdict(fft_idx):
+        """(ok, how) for a candidate's FFT-index table against the stamp."""
+        if stamped is None:
+            return True, (f"row count {mu_large} only — the parent bundle "
+                          f"carries no centroids_charge_md5 to check against")
+        if _centroid_table_md5(fft_idx) == stamped:
+            return True, "content-verified against centroids_charge_md5"
+        return False, "content does NOT match centroids_charge_md5"
+
+    named = str(cfg.parent_centroids_file or "").strip()
+    if named:
+        if not os.path.isfile(named):
+            raise FileNotFoundError(
+                f"downfold: parent_centroids_file = {named} does not exist.  "
+                f"It names the PARENT run's centroid coordinate table (the "
+                f"one its cohsex.in points centroids_file at), not the small "
+                f"basis this run is about to produce.")
+        print_fn(f"  [downfold] parent centroid table: {named} "
+                 f"(named by parent_centroids_file).")
+        return named, _isdf_fft_grid(src_restart)
+
+    # The parent's own ISDF header, which is the table by construction.
+    src_zeta = os.path.join(os.path.dirname(os.path.abspath(src_restart)),
+                            "zeta_q.h5")
+    if os.path.isfile(src_zeta):
+        try:
+            from file_io.isdf_header import read_isdf_header
+            hdr = read_isdf_header(src_zeta)
+        except (OSError, KeyError, ValueError) as exc:      # noqa: BLE001
+            hdr = None
+            print_fn(f"  [downfold] parent zeta_q.h5 has no readable "
+                     f"isdf_header ({type(exc).__name__}: {exc}); falling "
+                     f"back to a search beside the parent bundle.")
+        if hdr is not None:
+            idx = np.asarray(hdr.r_mu_fft_idx, dtype=np.int64)
+            if idx.shape[0] != int(mu_large):
+                print_fn(
+                    f"  [downfold] parent zeta_q.h5 describes "
+                    f"{idx.shape[0]} centroids but the bundle holds "
+                    f"{mu_large}; the two are not the same ISDF basis, so "
+                    f"its centroid table is not written out.")
+            else:
+                ok, how = _verdict(idx)
+                if not ok:
+                    print_fn(
+                        f"  [downfold] parent zeta_q.h5's centroid table "
+                        f"{how} — the zeta beside the parent bundle was "
+                        f"fitted on different points than its tensors.  Not "
+                        f"written out; name the right table with "
+                        f"parent_centroids_file.")
+                else:
+                    out = os.path.join(out_dir,
+                                       f"centroids_frac_{mu_large}_parent.txt")
+                    if process_rank() == 0:
+                        np.savetxt(out, np.asarray(hdr.r_mu_crystal,
+                                                   dtype=np.float64),
+                                   fmt="%.12f")
+                    barrier("downfold.parent_centroids")
+                    print_fn(
+                        f"  [downfold] wrote {out} — the PARENT basis's "
+                        f"{mu_large} centroid coordinates, taken from its own "
+                        f"zeta_q.h5 isdf_header ({how}).  bse.exciton_bands "
+                        f"fits its htransform leg in this basis and slices "
+                        f"the result to the kept rows, so the child directory "
+                        f"is now self-contained for it.")
+                    return out, _fft_grid_of(hdr)
+
+    # Last resort: the table the parent GW run was given, if it is still
+    # beside its bundle.  Needs the FFT grid to reproduce the stamp, and
+    # without a zeta header there is none — so this arm can only check the
+    # row count, and says so.
+    bundle_dir = os.path.dirname(os.path.abspath(src_restart))
+    search_dirs = [bundle_dir, os.path.dirname(bundle_dir)]
+    cands: list = []
+    for d in search_dirs:
+        cands += sorted(glob.glob(
+            os.path.join(d, f"centroids_frac_{mu_large}*.txt")))
+    seen = set()
+    cands = [c for c in cands if not (c in seen or seen.add(c))]
+    for c in cands:
+        try:
+            rows = np.loadtxt(c, ndmin=2)
+        except (OSError, ValueError):
+            continue
+        if int(rows.shape[0]) != int(mu_large):
+            continue
+        print_fn(
+            f"  [downfold] parent centroid table found beside the parent "
+            f"bundle: {c}.  CHECKED ON ROW COUNT ONLY — the parent has no "
+            f"zeta_q.h5, so there is no FFT grid here to turn these "
+            f"fractional coordinates into the index table centroids_charge_md5 "
+            f"hashes.  A regenerated table with the same count and different "
+            f"points would pass this check.")
+        return c, None
+
+    print_fn(
+        f"  [downfold] no parent centroid table: parent_centroids_file is "
+        f"unset, the parent has no readable zeta_q.h5 isdf_header, and no "
+        f"matching centroids_frac_{mu_large}*.txt was found in "
+        f"{' or '.join(search_dirs)}.  The small bundle will serve "
+        f"bse.bse_jax exactly as before, but bse.exciton_bands cannot open "
+        f"it — its htransform leg needs the PARENT basis's coordinates.  Set "
+        f"parent_centroids_file to the parent deck's centroids_file.")
+    return "", None
+
+
+def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
+                           print_fn):
+    """The kept rows of the parent's centroid table, and the parent's own path.
 
     The bundle format carries no centroid COORDINATES — only a content hash
     of the table they came from — so a downfolded bundle is complete for
-    every BSE consumer without this.  What it is NOT complete for is a fresh
-    GW run on the small basis, which needs the points.  Writing them costs a
-    slice, and stamping the new file's md5 is what lets the small bundle
-    claim a centroid table honestly.  Stamping the PARENT's hash would be a
-    lie about which points these tensors describe, so when no parent table is
-    given the stamp is simply absent and the run says so.
+    ``bse.bse_jax`` without this.  It is NOT complete for a fresh GW run on
+    the small basis, which needs the kept points, nor for
+    ``bse.exciton_bands``, which needs the PARENT's points.  Writing the
+    kept rows costs a slice, and stamping the new table's content hash is
+    what lets the small bundle claim a centroid table honestly.  Stamping the
+    PARENT's hash would be a lie about which points these tensors describe, so
+    when no parent table can be resolved the stamp is simply absent and the
+    run says so.
+
+    THE STAMP IS THE FFT-INDEX HASH, NOT THE TEXT FILE'S.  This function used
+    to write ``md5(bytes of the .txt)``, which is a perfectly good hash of a
+    different object: ``centroids_charge_md5`` is defined by
+    ``gw_init._centroid_table_md5`` as md5 over the int64 FFT-GRID INDICES,
+    and ``gw_init`` compares against it in exactly that algebra.  A bundle
+    stamped the other way can never match, so the stamp was not merely
+    unverifiable but actively false — a downfolded bundle handed to a fresh
+    GW run would have been told its own centroid table was a different one.
+    Found 2026-08-10 while teaching the driver to VERIFY a parent table with
+    the same hash; the two sides now use one spelling (:func:`_centroid_table_md5`).
+
+    ``fft_grid`` is what turns fractional coordinates into those indices.  It
+    comes from the parent's ISDF header; without it there is no stamp, and the
+    run says that rather than stamping something in the wrong algebra.
+
+    Returns ``(kept_table_path, parent_table_path)``; either may be ``""``.
     """
-    if not cfg.parent_centroids_file:
-        print_fn(
-            "  [downfold] no parent_centroids_file given, so the small "
-            "bundle carries no centroids_charge_md5.  It is complete for "
-            "every BSE consumer (the bundle format holds no coordinates, "
-            "only their hash); a GW run on the small basis would need the "
-            "kept coordinates, and naming the parent's table in the input "
-            "file is what produces them.")
-        return ""
+    if not parent_table:
+        return "", ""
     # Validated on EVERY rank — a refusal raised only on rank 0 would hang
     # the others on the barrier below.  np.loadtxt of a centroid table is
     # host-local and cheap; only the write is rank-gated.
-    src = cfg.parent_centroids_file
+    src = parent_table
     rows = np.loadtxt(src)
     if rows.ndim == 1:
         rows = rows.reshape(1, -1)
@@ -570,13 +1130,23 @@ def _write_centroid_subset(cfg, keep_idx, out_file, *, print_fn):
             f"coordinates to the right numbers.")
     out = os.path.join(os.path.dirname(out_file),
                        f"centroids_frac_{len(keep_idx)}_downfold.txt")
+    kept = rows[np.asarray(keep_idx)]
     if process_rank() == 0:
-        np.savetxt(out, rows[np.asarray(keep_idx)], fmt="%.12f")
-        with open(out, "rb") as fh:
-            md5 = hashlib.md5(fh.read()).hexdigest()
-        with h5py.File(out_file, "a") as f:
-            f.attrs["centroids_charge_md5"] = md5
-        print_fn(f"  [downfold] wrote {out} ({len(keep_idx)} kept centroids, "
-                 f"md5 {md5[:12]}...) and stamped it on the bundle")
+        np.savetxt(out, kept, fmt="%.12f")
+        if fft_grid is None:
+            print_fn(
+                f"  [downfold] wrote {out} ({len(keep_idx)} kept centroids) "
+                f"but stamped NO centroids_charge_md5: that hash is over the "
+                f"FFT-grid INDEX table and no FFT grid was available here "
+                f"(the parent has no readable zeta_q.h5 isdf_header).  A "
+                f"fresh GW run on this basis will re-derive the indices "
+                f"itself; it simply has no stamp to check them against.")
+        else:
+            md5 = _centroid_table_md5(_frac_to_fft_idx(kept, fft_grid))
+            with h5py.File(out_file, "a") as f:
+                f.attrs["centroids_charge_md5"] = md5
+            print_fn(f"  [downfold] wrote {out} ({len(keep_idx)} kept "
+                     f"centroids, centroids_charge_md5 {md5[:12]}...) and "
+                     f"stamped it on the bundle")
     barrier("downfold.centroids")
-    return out
+    return out, os.path.abspath(src)
