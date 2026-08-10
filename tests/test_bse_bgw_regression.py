@@ -192,6 +192,13 @@ def test_bse_matches_frozen_and_bgw(tmp_path):
         "bse.bse_jax", "-i", INPUT_NAME,
         "--bse", "--lanczos", "--tda", "--matvec-kind=ring",
         "--n-val", str(N_VAL), "--n-cond", str(N_COND), "--n-occ", str(N_OCC),
+        # PINNED, NOT DEFAULTED.  BerkeleyGW produced bgw_eigenvalues_dft_ref.dat
+        # at 4v4c, so this parity deck must run 4v4c: the default
+        # --band-degeneracy snap widens the conduction window 4c -> 8c at the
+        # multiplet band 12 cuts, which compares a 2048-dimension calculation
+        # against references cut from a 1024-dimension one.  See
+        # tests/KNOWN_FAILURES.md, the 2026-08-09 band-window amendment.
+        "--band-degeneracy", "off",
         "--n-reorth", "-1",
         "--max-lanczos-iter", str(N_ITER), "--n-eig", str(N_EIG),
         "--px", "2", "--py", "2",

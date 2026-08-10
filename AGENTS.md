@@ -68,8 +68,13 @@ uv run python -m gw.kin_ion_io -i cohsex.in
 # GW calculation
 uv run python -m gw.gw_jax -i cohsex.in
 
-# Tests (~15s, JAX compilation overhead)
+# Tests -- the DEFAULT GATE: the Si end-to-end calculation for the drivers
+# this branch touched, plus the services' own suites.  Minutes.
 uv run python -m pytest -q
+
+# The CENSUS: everything.  What a bare `pytest` used to be, and what
+# tests/KNOWN_FAILURES.md accounts for.
+uv run python -m pytest -q --census
 ```
 
 ### Perlmutter (Shifter via Lmod module)
@@ -169,7 +174,10 @@ pipeline; the old refactor-map reports directory was purged.
 
 ## Before committing
 
-Run `uv run python -m pytest -q` after long running branches (5+ small commits); it takes 15 seconds.
+Run `uv run python -m pytest -q` after long running branches (5+ small commits) -- that is the
+DEFAULT GATE (Si end-to-end smoke for the drivers you touched + the services' suites; minutes).
+Run `uv run python -m pytest -q --census` -- the full suite, and the run KNOWN_FAILURES.md
+accounts for -- before asking for a landing.  See `tests/README.md` and `docs/contributing.md`.
 Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment

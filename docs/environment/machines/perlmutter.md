@@ -32,7 +32,8 @@ calling it twice never double-allocates.
 
 ```bash
 lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
-lx test                                       # the suite, on a compute node, in cwd
+lx test                                       # the default gate, on a compute node, in cwd
+lx test --census                              # the full census (see docs/contributing.md)
 lx status                                     # who is running where
 lx doctor                                     # verify site, module, helpers
 lx shell -G 4                                 # interactive pty on a compute node

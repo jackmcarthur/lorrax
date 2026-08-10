@@ -109,8 +109,11 @@ The same fixture is wrapped as a pytest regression (it shells out to the driver 
 CPU-capable):
 
 ```bash
-uv run python -m pytest -q       # regression smoke test (CPU, ~1-2 min)
-lx test                          # on Perlmutter: the suite, on a compute node, in cwd
+uv run python -m pytest -q       # the DEFAULT GATE: the Si end-to-end calculation for
+                                 # the drivers you touched + the services' suites
+uv run python -m pytest -q --census   # the CENSUS: everything (see docs/contributing.md)
+lx test                          # on Perlmutter: the default gate, on a compute node, in cwd
+lx test --census                 # on Perlmutter: the census
 ```
 
 ## Your first real calculation {#your-first-real-calculation}

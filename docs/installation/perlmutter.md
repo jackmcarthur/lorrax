@@ -29,7 +29,8 @@ To install several checkouts side-by-side, set a distinct `LORRAX_MODULE_NAME`
 ```bash
 lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
 lx run -G 4 python3 -u -m gw.gw_jax -i cohsex.in   # whole node, 4 GPUs
-lx test                                       # the suite, on a compute node, in cwd
+lx test                                       # the default gate, on a compute node, in cwd
+lx test --census                              # the full census (see docs/contributing.md)
 lx doctor                                     # which checkout will actually run
 ```
 
