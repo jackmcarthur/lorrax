@@ -129,15 +129,36 @@ def build_parser() -> argparse.ArgumentParser:
                         "run contains every other set on that grid and can "
                         "score them all. Points not in this run's candidate "
                         "pool are reported, not silently dropped.")
-    p.add_argument("--n-orbit-keep", type=int, default=None,
-                   help="Pin the number of ORBITS the pivoted-Cholesky select "
-                        "keeps, instead of deriving it from N_c and the pool "
-                        "size. Orbit closure quantises the delivered point "
-                        "count (48 points per generic orbit on Si), so this "
-                        "is the knob that lands a --candidate-pool full_grid "
-                        "run on the same delivered N as an arm it is being "
-                        "compared against. Ignored when the point group is "
-                        "trivial.")
+    p.add_argument("--pivot-granularity", choices=("orbit", "point"),
+                   default="orbit",
+                   help="WHAT the greedy pivots on. 'orbit' (default, the "
+                        "historical behaviour) takes one pivot per orbit and "
+                        "removes the whole orbit from contention — it "
+                        "maximises the rank of the orbit-REPRESENTATIVE "
+                        "subspace, and orbit closure then delivers points "
+                        "that are symmetry images rather than new "
+                        "directions. 'point' pivots on points, so every "
+                        "pivot deflates the direction it consumes and the "
+                        "delivered rank is the pivot count by construction; "
+                        "orbit closure is applied AFTER selection. On a "
+                        "whole-grid pool the difference is large and "
+                        "measured: orbit mode gave 1676 points spanning 801 "
+                        "directions on Si 4x4x4 where every recorded k-means "
+                        "draw at the same N spans 1084-1246, because the "
+                        "largest residual diagonals sit on special-position "
+                        "orbits, which are the most redundant ones.")
+    p.add_argument("--n-pivot-keep", type=int, default=None,
+                   help="Pin the number of pivots the select keeps — orbits "
+                        "under --pivot-granularity orbit, points under "
+                        "'point' — instead of deriving it from N_c and the "
+                        "pool size. Orbit closure quantises the delivered "
+                        "point count (up to 48 points per orbit on Si), so "
+                        "this is the knob that lands a --candidate-pool "
+                        "full_grid run on the same delivered N as the arm it "
+                        "is being compared against. The select is greedy and "
+                        "therefore NESTED, so the '[pivot ladder]' line of "
+                        "any one run gives the delivered N for every value "
+                        "of this flag below its own.")
     p.add_argument("--prune-n-val", type=int, default=None,
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
@@ -444,32 +465,42 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
     the achieved rank is the number it actually certified.  Returns
-    ``(indices, n_kept, rank, n_orbit_keep, n_val, max_band)`` — the last
+    ``(indices, n_kept, rank, n_keep, n_val, max_band)`` — the last
     four feed the rank gate in ``main()``.
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
     # Σ orbit_size over the picked orbits (≈ N_c by construction).
+    point_pivots = (getattr(args, "pivot_granularity", "orbit") == "point"
+                    and orbit_id is not None)
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
-    n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
-                    if orbit_id is not None else N_c)
-    if orbit_id is not None and getattr(args, "n_orbit_keep", None):
-        # Orbit closure quantises the delivered point count, so the derived
-        # target cannot hit an arbitrary N.  An explicit pin is the control
-        # that puts two selectors on the same delivered N.
-        n_orbit_keep = int(args.n_orbit_keep)
-        print(f"  orbit target PINNED to {n_orbit_keep} by --n-orbit-keep "
-              f"(derived value would have been "
-              f"{max(1, int(np.ceil(N_c * n_orbits / n_unique)))})")
-    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-          f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
+    if point_pivots:
+        # One pivot per POINT, closure afterwards: the target is a point
+        # count, and the delivered set is that set closed under the group,
+        # so it comes out somewhat larger.  Read the '[pivot ladder]' line
+        # and pin with --n-pivot-keep to land on a chosen N.
+        n_keep = N_c
+        unit = "point pivots"
+    else:
+        n_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
+                  if orbit_id is not None else N_c)
+        unit = "orbits" if orbit_id is not None else "points"
+    if getattr(args, "n_pivot_keep", None):
+        derived = n_keep
+        n_keep = int(args.n_pivot_keep)
+        print(f"  pivot target PINNED to {n_keep} {unit} by --n-pivot-keep "
+              f"(derived value would have been {derived})")
+    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c} "
+          f"(target {n_keep} {unit})")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     max_band = n_val + n_cond
     kwargs: dict = dict(
-        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
-        orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_keep, mesh=mesh,
+        orbit_id=None if point_pivots else orbit_id,
+        close_orbits_after=orbit_id if point_pivots else None,
+        use_phdf5=args.use_phdf5,
         score_point_sets=_rival_point_sets(args, wfn, cand_idx),
     )
     if args.prune_window == "v_x_vc":
@@ -492,9 +523,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     print(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
-    # The rank gate in main() compares rank against n_orbit_keep and names
+    # The rank gate in main() compares rank against n_keep and names
     # the effective prune window in its refusal — return all four.
-    return indices, indices.shape[0], int(rank), n_orbit_keep, n_val, max_band
+    return indices, indices.shape[0], int(rank), n_keep, n_val, max_band
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -690,7 +721,7 @@ def main():
                                  Rinv, tau, n_sym, M_cand)
 
     if deterministic or (oversample > 1.0 and n_unique > N_c):
-        (centroid_indices, n_unique, rank, n_orbit_keep,
+        (centroid_indices, n_unique, rank, n_keep_eff,
          _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
@@ -708,14 +739,14 @@ def main():
         # the whole campaign and read by nobody, while Σ_c produced a QP gap
         # of 0.36 eV against a true ~3.2-3.6 eV.  Refuse instead.
         _rank_tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
-        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_orbit_keep))
+        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_keep_eff))
         if int(rank) < _rank_floor:
             raise SystemExit(
                 f"\nFATAL: pivoted-Cholesky rank deficiency — the candidate "
                 f"pool cannot supply the independence you asked for.\n"
-                f"  requested : {n_orbit_keep} "
+                f"  requested : {n_keep_eff} "
                 f"{'orbits' if orbit_id_arr is not None else 'points'}\n"
-                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_orbit_keep):.1f}%"
+                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_keep_eff):.1f}%"
                 f", floor {_rank_floor} at tol {_rank_tol:g})\n"
                 f"  prune window: left=(0,{_n_val_eff}) right=(0,{_max_band}) "
                 f"[{args.prune_window}]\n"
@@ -733,7 +764,7 @@ def main():
                 f"lower N so you ask for fewer directions\n"
                 f"To override deliberately (NOT recommended for production): "
                 f"LORRAX_CENTROID_RANK_TOL=<fraction>.\n")
-        print(f"  [rank gate] {rank}/{n_orbit_keep} directions certified "
+        print(f"  [rank gate] {rank}/{n_keep_eff} directions certified "
               f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
 
     # Default suffix follows --density-mode unless the user overrode it.

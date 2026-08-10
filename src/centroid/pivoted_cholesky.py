@@ -608,6 +608,7 @@ def prune_candidates_by_pivoted_cholesky(
     use_phdf5: bool = False,
     tol_rel: float | None = None,
     score_point_sets: dict | None = None,
+    close_orbits_after=None,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -825,7 +826,66 @@ def prune_candidates_by_pivoted_cholesky(
         piv_np, rank_i, psd_host, n_keep=n_keep, M=M, M_pad=M_pad,
         orbit_id=orbit_id, d0max=float(diag_host.max()), tol_rel=tol_rel)
 
-    if orbit_id is None:
+    if orbit_id is None and close_orbits_after is not None:
+        # ── POINT PIVOTS, ORBIT CLOSURE AFTERWARDS ──────────────────────
+        # WHY THIS MODE EXISTS, measured.  Orbit-mode pivoting deflates ONE
+        # direction per pick while removing a whole orbit from contention,
+        # so what it maximises is the rank of the orbit-REPRESENTATIVE
+        # subspace — and orbit closure then delivers points that are
+        # symmetry images rather than new directions.  On a whole-grid pool
+        # it is much worse than that sounds, because the residual diagonal
+        # is largest at high-symmetry sites (bond centres, atom sites) and
+        # those sit on SPECIAL-POSITION orbits, whose members are the most
+        # redundant of all.  Measured on Si 4x4x4 at 24^3, nband = 100:
+        # 44 orbits, 1676 delivered points, and only 801 independent
+        # directions — 47.8 % of the points, against 68-76 % for every one
+        # of the eighteen recorded k-means draws at the same N.
+        #
+        # Pivoting on POINTS deflates the direction it actually consumes,
+        # so every pivot is a certified new direction and the count is the
+        # pivot count by construction.  Closure is then applied to the
+        # SELECTED set, which is the order the k-means path also ends up in
+        # (it closes candidates, then selects) and which is what a centroid
+        # quadrature needs — V_H is only point-group symmetric across a
+        # k-star if {r_mu} is closed.
+        orbit_id_np = np.asarray(close_orbits_after)
+        picked_orbits = np.unique(orbit_id_np[piv_np])
+        in_kept = np.isin(orbit_id_np, picked_orbits)
+        keep_idx = np.asarray(cand_idx)[in_kept]
+        if verbose:
+            print(f"[pivoted_cholesky] point pivots + closure: {len(piv_np)} "
+                  f"point pivots in {picked_orbits.size} orbits → "
+                  f"{len(keep_idx)} centroids (orbit-closed)")
+            # The nested-prefix ladder again, but on the CLOSURE: pivot j's
+            # rung is the size of the union of orbits of the first j pivots,
+            # which is the delivered N for every smaller --n-pivot-keep.
+            seen = np.zeros(int(orbit_id_np.max()) + 1, dtype=bool)
+            sizes = np.bincount(orbit_id_np,
+                                minlength=int(orbit_id_np.max()) + 1)
+            cum, tot = [], 0
+            for p in piv_np:
+                o = int(orbit_id_np[p])
+                if not seen[o]:
+                    seen[o] = True
+                    tot += int(sizes[o])
+                cum.append(tot)
+            step = max(1, len(cum) // 30)
+            rungs = [f"{j + 1}:{cum[j]}" for j in range(len(cum))
+                     if (j + 1) % step == 0 or j == len(cum) - 1]
+            print(f"  [pivot ladder] delivered points at n_pivot_keep = "
+                  f"{', '.join(rungs)}  (--n-pivot-keep pins it)")
+        pt_rank, n_pts, why = point_granularity_rank(
+            G, in_kept, tol_rel=tol_rel, mesh=mesh)
+        if verbose:
+            if pt_rank is None:
+                print(f"  [point rank] {len(piv_np)} pivots, {n_pts} points, "
+                      f"independent directions NOT MEASURED — {why}")
+            else:
+                print(f"  [point rank] {len(piv_np)} pivots, {n_pts} points, "
+                      f"{pt_rank} independent directions "
+                      f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the "
+                      f"points)")
+    elif orbit_id is None:
         keep_idx = np.asarray(cand_idx)[piv_np]
     else:
         # Unfold: kept = union of orbits of picked pivots.
