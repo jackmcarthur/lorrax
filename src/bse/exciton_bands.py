@@ -1253,8 +1253,48 @@ def main(argv=None):
     # is not on any solver path: one sync, once, after all the physics.
     from common.collectives import barrier
     barrier("exciton_bands.outputs_written")
+
+    # CLOSE THE LOADER HERE, EXPLICITLY, WHILE THE RANKS ARE STILL IN STEP.
+    # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``
+    # (``htransform.setup_wfn_and_sym`` -> ``WfnLoader(wfn_file, mesh=mesh_xy)``),
+    # so at P>1 it picks the phdf5 backend and owns a ``SlabIO`` whose
+    # ``close()`` runs an UNCONDITIONAL COLLECTIVE barrier
+    # (``file_io/_slab_io_ffi.py``, ``_barrier("slab_io_ffi_close_attrs")``).
+    # Left to ``WfnLoader.__del__``, that collective fires whenever the
+    # garbage collector happens to drop the object during interpreter
+    # shutdown — a moment no two ranks agree on.  Measured on this tree
+    # (jobs 56550230 steps .9/.10, 2026-08-09): three ranks parked in
+    # ``__del__`` -> ``SlabIO.close`` -> ``sync_global_devices`` (NCCL,
+    # spinning in ``cuStreamSynchronize``) while the fourth had already
+    # reached ``ffi.io._atexit_close_all`` -> ``phdf5_close`` -> ``H5Fclose``
+    # -> ``MPI_File_close`` -> ``MPI_Barrier`` (spinning in ``sched_yield``).
+    # Two disjoint collective domains, neither ever satisfied: the payload
+    # was complete and every output written, and the step then held its four
+    # GPUs at 4x100% CPU until the allocation died.
+    #
+    # AFTER the barrier above, not before: that barrier is what guarantees
+    # rank 0's matplotlib/.dat block has finished, so every rank enters this
+    # close at the same point.  ``close()`` is idempotent and nulls the
+    # handles, so the later ``__del__`` becomes a no-op on every rank and
+    # nothing collective is left to interpreter shutdown.  A no-op at P=1,
+    # where the SlabIO barrier is already a no-op.
+    try:
+        wfn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  [exciton_bands] WfnLoader.close() failed "
+              f"({type(exc).__name__}: {exc}); continuing to exit")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ``runtime.finalize_process``, not a bare ``SystemExit``: the explicit
+    # ``wfn.close()`` above removes the collective from ``__del__``, and this
+    # removes the SECOND unordered collective — ``ffi.io._atexit_close_all``,
+    # whose ``H5Fclose`` on the restart/zeta contexts is collective too and
+    # otherwise runs at whatever point each rank's interpreter teardown
+    # reaches it.  ``finalize_process`` runs the effects barrier, the
+    # distributed shutdown and the atexit hooks in ONE stated order on every
+    # rank and then ends with ``os._exit``.  Same adopter pattern as
+    # ``gw.gw_jax``, which is the sibling driver that has never hung.
+    from runtime import finalize_process
+    finalize_process(main())
