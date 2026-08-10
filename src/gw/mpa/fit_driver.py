@@ -37,7 +37,11 @@ re-entry into ``run_fit_driver``.
 WHAT THIS MODULE DOES NOT DO.  It does not unfold — poles fitted on the
 q wedge unfold the way W does, per q, and the staged store is explicit
 that doing it at write time would store ``n_q_full`` copies of a tensor
-the symmetry says is ``n_q_ibz`` of them.  It does not choose ``n_p``;
+the symmetry says is ``n_q_ibz`` of them.  What it DOES do, since the
+wedge unfold was certified, is carry the map: a wedge fit store leaves
+here with the W file's own unfold tables stamped beside its poles, so
+``mpa_store.read_pole_slice(..., unfold=True)`` can serve the full zone
+on demand long after the W file is gone.  It does not choose ``n_p``;
 that is the deck's (``sampling.POLE_SCHEDULE``).  It does not evaluate
 W — the samples arrive on disk from the screening sweep, and the
 protocol grid they were evaluated on is stamped beside them.
@@ -324,6 +328,15 @@ def run_fit_driver(
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
+        # THE MAP BACK TO THE FULL ZONE TRAVELS WITH THE POLES.  A wedge
+        # fit is n_q_ibz rows of a zone the Sigma kernel sums over in
+        # full, and the tables that expand it are the W file's own; by
+        # the time Sigma runs, that file may be gone.  Copied at birth,
+        # so no store is ever a wedge with no way back.  A full-BZ W
+        # needs none and gets none -- the tables it carries are the
+        # identity, and a store that says 'full' never unfolds.
+        unfold_tables=(mpa_store.read_w_tables(w_src, w_name)
+                       if header["q_storage"] == "ibz" else None),
         provenance=provenance)
 
     report = {
@@ -506,7 +519,8 @@ def _as_group(src, mode="r"):
         yield handle
 
 
-def read_pole_slice(fit_src, p, *, allow_partial=False):
+def read_pole_slice(fit_src, p, *, unfold=False, mesh_xy=None,
+                    allow_partial=False):
     """``(Omega_p, B_p)`` for ONE pole -- ``(n_q, N_mu, N_mu)`` each.
 
     THE STOPGAP IS OVER: this is now
@@ -514,10 +528,13 @@ def read_pole_slice(fit_src, p, *, allow_partial=False):
     docstring this replaces said it belonged -- beside the other two
     readers, sharing their ledger refusal instead of restating it.  The
     name stays exported here because the pass loop below is its caller
-    and the design review named it at this address.
+    and the design review named it at this address.  ``unfold`` and
+    ``mesh_xy`` pass straight through: a WEDGE store served to the full
+    Bloch zone is a property of the reader, not of its callers.
     """
     return mpa_store.read_pole_slice(
-        fit_src, p, allow_partial=allow_partial)
+        fit_src, p, unfold=unfold, mesh_xy=mesh_xy,
+        allow_partial=allow_partial)
 
 
 def accumulate_over_pole_passes(

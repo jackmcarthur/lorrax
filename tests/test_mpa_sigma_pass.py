@@ -429,14 +429,32 @@ def test_the_laplace_buckets_bound_the_interval_ratio():
     assert covered.all(), "a pole fell outside every bucket"
 
 
-def test_a_wedge_shaped_store_refuses_by_name():
-    """The q-axis unfold is owed, and is refused rather than guessed."""
-    SP.refuse_wedge_pole_slab(64, 64)          # full BZ: no refusal
-    with pytest.raises(NotImplementedError) as exc:
-        SP.refuse_wedge_pole_slab(8, 64)
-    msg = str(exc.value)
-    assert "unfold_isdf_operator" in msg
-    assert "exp(+Gamma*tau)" in msg
+def test_the_q_axis_verdict_names_the_three_cases():
+    """Full BZ, declared wedge of THIS zone, and neither.
+
+    The refusal this replaces (``refuse_wedge_pole_slab``) turned away
+    every store with ``n_q != n_k_tot``.  What is left to refuse is
+    narrower and is about IDENTITY rather than about the unfold: a store
+    whose zone is not this run's zone cannot be unfolded into it, and
+    reading its rows as if it were would sum a different crystal's
+    screening.
+    """
+    full = {"n_q": 64, "n_q_full": 64, "q_storage": "full"}
+    wedge = {"n_q": 8, "n_q_full": 64, "q_storage": "ibz"}
+    assert SP.resolve_pole_q_axis(full, 64) is False
+    assert SP.resolve_pole_q_axis(wedge, 64) is True
+
+    # A wedge of a DIFFERENT zone: 8 of 32 offered to a 64-point run.
+    with pytest.raises(ValueError) as exc:
+        SP.resolve_pole_q_axis({"n_q": 8, "n_q_full": 32,
+                                "q_storage": "ibz"}, 64)
+    assert "neither that zone nor a wedge of it" in str(exc.value)
+
+    # An undeclared short axis: no tables, so no way to know what it is.
+    with pytest.raises(ValueError) as exc:
+        SP.resolve_pole_q_axis({"n_q": 8, "n_q_full": 8,
+                                "q_storage": "full"}, 64)
+    assert "stamp_fit_unfold_tables" in str(exc.value)
 
 
 def test_the_pass_report_names_the_legacy_routed_count():
