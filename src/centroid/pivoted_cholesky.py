@@ -521,7 +521,7 @@ def refuse_unless_select_certified(
 POINT_RANK_CAP_DEFAULT = 4096
 
 
-def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
+def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None, mesh=None):
     """Independent directions in the DELIVERED POINT SET, not in the orbits.
 
     THE CONFUSION THIS REMOVES.  In orbit mode the greedy select deflates
@@ -559,7 +559,20 @@ def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
                 f"skipped: {n_pts} points exceeds the O(n^3) cap {int(cap)} "
                 f"(raise LORRAX_CENTROID_POINT_RANK_CAP to measure anyway)")
     try:
-        sub = np.asarray(jax.device_get(G))[np.ix_(keep_mask, keep_mask)]
+        # TAKE ON THE DEVICE, GATHER THE SUBMATRIX — not the other way round.
+        # ``jax.device_get(G)`` refuses outright at P > 1 ("Fetching value for
+        # a jax.Array that spans non-addressable devices"), so this number
+        # went MISSING on exactly the multi-process runs that most need it,
+        # and the graceful skip meant a log with no direction count looked
+        # like a log with a fine one.  It is also the wrong shape of work:
+        # the whole Gram is O(M²) — 3.06 GB for a whole-grid candidate pool —
+        # while the submatrix being measured is (n_pts, n_pts), 45 MB.
+        idx = jnp.asarray(np.flatnonzero(keep_mask))
+        sub_dev = jnp.take(jnp.take(G, idx, axis=0), idx, axis=1)
+        if mesh is not None:
+            sub_dev = jax.device_put(
+                sub_dev, NamedSharding(mesh, PartitionSpec()))
+        sub = np.asarray(jax.device_get(sub_dev))
     except Exception as exc:                                  # noqa: BLE001
         return None, n_pts, f"skipped: could not gather the Gram ({exc})"
     d0max = float(np.real(np.diag(sub)).max())
@@ -594,6 +607,7 @@ def prune_candidates_by_pivoted_cholesky(
     orbit_id: np.ndarray | None = None,
     use_phdf5: bool = False,
     tol_rel: float | None = None,
+    score_point_sets: dict | None = None,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -840,7 +854,7 @@ def prune_candidates_by_pivoted_cholesky(
         # FILE being written.  Orbit mode only: in point mode ``rank`` is
         # already the point count and there is nothing to reconcile.
         pt_rank, n_pts, why = point_granularity_rank(
-            G, in_kept, tol_rel=tol_rel)
+            G, in_kept, tol_rel=tol_rel, mesh=mesh)
         if verbose:
             if pt_rank is None:
                 print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
@@ -857,6 +871,28 @@ def prune_candidates_by_pivoted_cholesky(
                           f"back-solve will truncate about that many modes "
                           f"per q; D3 shipped a 7 GiB restart file to learn "
                           f"the same thing downstream.")
+    # ---- Rival point sets, scored on THIS Gram --------------------------
+    # The direction count is only comparable between two point sets when both
+    # were measured on the same Gram: the stopping floor is
+    # ``tol · max(diag G)``, and two candidate pools have different diagonal
+    # maxima (9.570e-06 for a whole-grid pool against 8.153e-06 for a
+    # k-means one on the same Si deck), so two logs' counts differ by their
+    # instruments as well as by their sets.  A whole-grid pool CONTAINS every
+    # other set on that grid, so it can score them all on one instrument, for
+    # the cost of an eigendecomposition of an (n, n) submatrix.
+    if score_point_sets and verbose:
+        for label, mask in score_point_sets.items():
+            r_x, n_x, why_x = point_granularity_rank(
+                G, mask, tol_rel=tol_rel, mesh=mesh)
+            if r_x is None:
+                print(f"  [point rank | rival] {label}: {n_x} points, "
+                      f"NOT MEASURED — {why_x}")
+            else:
+                print(f"  [point rank | rival] {label}: {n_x} points, "
+                      f"{r_x} independent directions "
+                      f"({100.0 * r_x / max(1, n_x):.1f}% of the points), "
+                      f"scored on THIS run's Gram")
+
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one

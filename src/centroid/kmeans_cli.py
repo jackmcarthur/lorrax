@@ -116,6 +116,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "--oversample, --rho-power and the k-means weight are "
                         "all inert. Costs an O(M^2) Gram on M = the whole "
                         "grid instead of on 1.5*N_mu points.")
+    p.add_argument("--score-centroid-file", action="append", default=None,
+                   metavar="FILE",
+                   help="Also report the independent-direction count of an "
+                        "EXISTING centroid file, measured on THIS run's Gram. "
+                        "Repeatable. The direction count is only comparable "
+                        "between two point sets when both were measured on "
+                        "one instrument — the rank floor is tol*max(diag G) "
+                        "and two candidate pools have different diagonal "
+                        "maxima — so comparing two generators' logs compares "
+                        "their instruments too. A --candidate-pool full_grid "
+                        "run contains every other set on that grid and can "
+                        "score them all. Points not in this run's candidate "
+                        "pool are reported, not silently dropped.")
     p.add_argument("--n-orbit-keep", type=int, default=None,
                    help="Pin the number of ORBITS the pivoted-Cholesky select "
                         "keeps, instead of deriving it from N_c and the pool "
@@ -381,6 +394,50 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
     return indices, snapped, snapped.shape[0], None
 
 
+def _rival_point_sets(args, wfn, cand_idx):
+    """``--score-centroid-file`` → ``{label: boolean mask over cand_idx}``.
+
+    Exists so two selectors' independent-direction counts can be read off
+    ONE instrument.  A count is measured against a floor of
+    ``tol · max(diag G)``, and ``max(diag G)`` is a property of the
+    candidate pool, so two generators' logs are not strictly comparable
+    even when both ran the same code.  A whole-grid pool contains every
+    other point set on that grid and can therefore score them all.
+
+    A file whose points are not all in this run's pool is REPORTED and
+    skipped, never partially scored — the rank of a subset is not the rank
+    of the set, and a quietly-truncated comparison is worse than none.
+    """
+    paths = getattr(args, "score_centroid_file", None)
+    if not paths:
+        return None
+    grid = np.asarray([int(v) for v in wfn.fft_grid], dtype=np.int64)
+    cand = np.asarray(cand_idx, dtype=np.int64)
+    flat_pool = (cand[:, 0] * grid[1] + cand[:, 1]) * grid[2] + cand[:, 2]
+    pos = {int(f): i for i, f in enumerate(flat_pool)}
+    out = {}
+    for path in paths:
+        frac = np.loadtxt(path)
+        idxs = np.round(frac * grid).astype(np.int64) % grid
+        flat = (idxs[:, 0] * grid[1] + idxs[:, 1]) * grid[2] + idxs[:, 2]
+        uniq = np.unique(flat)
+        missing = [int(f) for f in uniq if int(f) not in pos]
+        label = os.path.basename(path)
+        if missing:
+            print(f"  [rival] {label}: {len(missing)} of {uniq.size} distinct "
+                  f"points are not in this run's candidate pool — NOT scored "
+                  f"(a subset's rank is not the set's rank)")
+            continue
+        mask = np.zeros(flat_pool.shape[0], dtype=bool)
+        mask[[pos[int(f)] for f in uniq]] = True
+        if uniq.size != flat.size:
+            print(f"  [rival] {label}: {flat.size - uniq.size} of "
+                  f"{flat.size} rows snap to a grid point another row already "
+                  f"holds; scoring the {uniq.size} distinct points")
+        out[label] = mask
+    return out or None
+
+
 def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     """Pivoted-Cholesky prune of the over-sampled candidate pool to N_c.
 
@@ -413,6 +470,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     kwargs: dict = dict(
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
         orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+        score_point_sets=_rival_point_sets(args, wfn, cand_idx),
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = (0, n_val)
