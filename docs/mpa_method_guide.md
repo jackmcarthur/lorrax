@@ -241,7 +241,60 @@ their columns, whereupon the pseudo-inverse returns exactly zero for them as the
 minimum-norm solution, so pruning needs no shape change and the kernel stays
 `vmap`-able over a leading element axis.
 
-### 3.2 The four guards, and the quadrant algebra
+### 3.1a The second algebra, and why the published one stays reachable
+
+The paragraph above describes the papers' route and it is still in the tree,
+but it is no longer the default, because on 2026-08-10 it stopped working at
+the top of the pole range the papers say the answer converges in. Cross
+multiplication is a Vandermonde solve wearing different clothes: on the
+production Si deck its condition number ran `1.34e16` at `n_p = 8` and
+`9.02e19` at `n_p = 10`, past `1/ε` in double. The symptom was not noise but
+its opposite — the pruning guards fell silent, the backward error stayed at
+`1.5e-12`, and the fit's own sample residual *rose* from eight poles to ten
+while 58 % of the residue mass moved onto poles broader than the plasmon. A
+backward-stable solve of a problem that has itself gone singular returns the
+exact answer to a nearby question, and the nearby question was no longer this
+one.
+
+So the pole-finding became selectable while everything else — the model, the
+guards, the canonical sort, the mandatory residue refit, the returned
+`(B_p, Ω_p)` — stayed shared and unchanged. The default is a **fixed-support
+Loewner pencil**: take all `2n_p` samples as support, even indices left and
+odd right, build the divided-difference pair
+
+    L[i,j]  = (f(λ_i) − f(μ_j)) / (λ_i − μ_j)
+    σL[i,j] = (λ_i f(λ_i) − μ_j f(μ_j)) / (λ_i − μ_j)
+
+and read the poles off the `n_p × n_p` pencil `(σL, L)`. It interpolates the
+same `2n_p` values with the same `n_p` poles — the Loewner interpolant of a
+scalar dataset is exactly the type `(n_p−1, n_p)` rational function this model
+already is — and it never forms a power of `x`, so the Vandermonde
+conditioning is not improved but absent. Measured on 315,840 production
+elements at `n_p = 10`: condition number `4.4e15 → 3.3e8` in the geometric
+mean, `⟨RSD⟩` `1.85e-03 → 5.6e-04`, and the `>16 eV` residue mass
+`58 % → 0.04 %`.
+
+**Why the published route stays reachable.** Two reasons, and neither is
+sentiment. It is what the papers specify, so a reader comparing this
+implementation against them needs to be able to run it; and
+`solve="pade", affine=False` reproduces the shipped 2026-08-09 solve
+bit-for-bit, which is the only way to keep exhibiting the pathology the
+reconditioning cures — a cure whose instruments cannot see the disease is not
+evidence. It is a **red twin and a fallback, not a co-equal option**: even
+with the affine domain map that improves it by two orders, it is back past
+the conditioning cliff by about `n_p ≈ 12`, where the Loewner pencil still
+has four orders of headroom, so it is the Loewner route and not the Padé one
+that keeps the papers' eight-to-eleven range open.
+
+A Chebyshev basis in the affine variable, with colleague-matrix roots, was
+built and measured and is **not** in the tree: `x = z²` maps the two parallel
+sample lines onto two arcs reaching `|Im t| ≈ 1.37` in the scaled variable,
+and Chebyshev polynomials are well conditioned *on* their interval and grow
+like `ρ^k` off it with `ρ ≈ 3` at that distance. Its advantage needs the
+samples to lie on the interval; the double-parallel protocol puts them beside
+it.
+
+### 3.2 The five guards, and the quadrant algebra
 
 The linear algebra knows no physics and will return poles in the wrong half
 plane. Four guards act in fixed order on `b = Ω²`, which is what makes them clean:
@@ -258,6 +311,22 @@ plane. Four guards act in fixed order on `b = Ω²`, which is what makes them cl
    `Re Ω` below a multiple of the sampled span (above it the fit extrapolates and
    the residue is unconstrained); and
    `|Im Ω| ≤ \texttt{width\_ratio\_max}·Re Ω` at `width_ratio_max = 1`.
+5. **Null-pole pruning**, added 2026-08-10 with the second algebra and stated
+   in `b = Ω²` units rather than in `Ω`. When a denominator solve truncates a
+   rank-deficient system — which is what "more freedom than the data can
+   determine" looks like to the linear algebra — the missing directions come
+   back as eigenvalues at *exactly* zero, which rounding scatters to
+   `|b| ~ ε`. Guard 4's low edge cannot see them: it reads as a floor on
+   `|Ω|` and is therefore a floor of `10⁻²⁰` on `|b|`, while `√` turns
+   `10⁻¹⁶` into `|Ω|/scale ~ 10⁻⁸`, which looks like a soft mode. The insulator
+   grid then finishes the job, because it samples `z = 0` exactly: a surviving
+   pole at `b ~ 10⁻¹⁸` hands the residue system a column of norm `~10¹⁸`, the
+   truncated-SVD residue solve discards the *real* poles' directions as the
+   small ones, and the fit puts every bit of its `|B|` mass on the artefact
+   while reproducing the samples not at all. Measured before the guard
+   existed, at three true poles fitted with ten. It fires on **zero** of the
+   758,016 poles of the production store, so it is a net for the
+   over-parameterised regime rather than a change to any fit on disk.
 
 The first two are precisely the two conjugations carrying `b` into the closed
 fourth quadrant, after which the principal square root lands in
