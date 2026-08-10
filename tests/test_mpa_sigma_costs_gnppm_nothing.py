@@ -133,6 +133,29 @@ move by the adjudicated amounts and TRIM to stay.  The gnppm/bispinor
 frozen references are red for the same reason, and their re-freeze is an
 OWNER row (adjudicated, registered in KNOWN_FAILURES.md), deliberately
 not taken with this re-anchor.
+
+THE FOURTH RE-ANCHOR, 2026-08-10, AND IT WITHDRAWS THE THIRD'S PLACEMENT.
+This branch merged ``origin/main`` @ 965d7beb, which carries ``c80601b8``
+-- the same crossing completion, derived independently, with the PLACEMENT
+corrected.  The third re-anchor's ``2fd22005`` took the adjoint per-tau
+INSIDE ``_project_tau_onto_omega_np``, i.e. inside the per-shard
+projector; ``(Z - Z^dagger)`` pairs band element (i,j) with (j,i) and
+Sigma_c tiles are sharded over the band axes, so that placement is the
+band adjoint only when the mesh does not cut the band window -- true on
+the -G=1 leg every measurement above was taken on, and silently wrong at
+P>1 (0.132-0.257 eV Hermiticity violation at ALL EIGHT k, breaking the
+three TRIM k the pre-fix code got exactly right).  ``c80601b8`` makes the
+completion a WINDOW-level operator instead: the consumer returns the
+one-sided half and ``_TauAccumulator._finish_window`` closes the window.
+The ALGEBRA of the third re-anchor is unchanged and so are all of its
+adjudicated numbers -- they were measured single-shard, where the two
+placements agree -- so nothing quoted above is withdrawn except the
+placement itself.  Four kernels move here (``ppm_accumulators``,
+``ppm_sigma``, ``ppm_tau_kernel``, ``ppm_windows``) and ALL SIX kernels
+are now byte-identical to ``origin/main`` @ 965d7beb, which is what this
+BASE_SHA now names; the two SEAMS keep their branch-pinned digests.  The
+gnppm/bispinor frozen references named above are no longer red: main
+re-froze them at ``1e64d83a`` against the corrected form.
 """
 
 import hashlib
@@ -144,20 +167,20 @@ import pytest
 
 #: The tree this branch's gnppm bit-identity is anchored to.  Update this and
 #: the digests below TOGETHER, never one without the other.
-BASE_SHA = "2115b65a"
+BASE_SHA = "965d7beb"
 
 #: THE KERNELS: every module in which a floating-point operation of a gnppm
 #: Sigma actually happens.  Nothing on this branch may touch them, and both
 #: checks below apply -- the digest and the git one.
 SHARED_SIGMA_KERNELS = {
     "src/gw/ppm_sigma.py":
-        "f0fecfde318a18fb370ef6839ec9c7adff2006da5dd5d2aeffbb454d0846c1c7",
+        "f255ef2944808d114574101a8c45aff44e14ae9bc1583efe376715b34181b87e",
     "src/gw/ppm_windows.py":
-        "f0b6749ce16a6329b68d8a2c06a4c3dcc198dd962eceef2d5540bd03146fed17",
+        "0290ba57190e3c617b7d3f568fc5024aaf8a6bfb152d3adc807af4668800e7be",
     "src/gw/ppm_tau_kernel.py":
-        "d139ebdfb6cea959f6747f137dc9b73c5a10e2adef1ec97cad82e44f4ef1e289",
+        "583425f1f5f06690ee050d56dc494c1fbed2cd07ef3cf9d134047bce8fa0c700",
     "src/gw/ppm_accumulators.py":
-        "1d17a6f3029965f0427d09309a82b57ed5447c0c5e891381cb29f2514cdf77ae",
+        "f75a91503834fe1a466d9441ee58ffa92f3a7f34bf47fef7863efe32ef9835fd",
     "src/gw/head_correction.py":
         "1c99e0758a93f4a76d04aa32ba781ee7bb1f94007846a5a362532fefed52e753",
     "src/gw/minimax_screening.py":
