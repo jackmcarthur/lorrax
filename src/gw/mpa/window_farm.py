@@ -83,9 +83,14 @@ __all__ = [
     "balance_legs",
     "branch_key",
     "census_rows_from_groups",
+    "check_partition",
     "format_group_subset",
+    "full_plan_digest",
     "group_plan_digest",
+    "group_plan_digest_from_rows",
+    "group_range",
     "merge_census_files",
+    "plan_digest_rows",
     "parse_group_subset",
     "plan_fit_legs",
     "read_census",
@@ -136,6 +141,28 @@ def branch_key(space, neg_omega_half):
     return key
 
 
+def plan_digest_rows(groups):
+    """``(name, n_modes, n_tau)`` per group — what the partition digest is of.
+
+    Split out from :func:`group_plan_digest` so a plan READ BACK FROM A
+    FILE can be fingerprinted from its header, without materializing the
+    hundreds of megabytes of index sets the groups themselves carry.  Both
+    callers hash the identical byte stream, which is the point: a loaded
+    plan and a freshly computed one are comparable because there is one
+    digest and not two.
+    """
+    return [(str(g.name), int(g.n_modes),
+             int(sum(int(w.n_tau) for w in g.windows))) for g in groups]
+
+
+def group_plan_digest_from_rows(rows):
+    """The partition digest of ``(name, n_modes, n_tau)`` rows."""
+    h = hashlib.sha256()
+    for i, (name, n_modes, n_tau) in enumerate(rows):
+        h.update(f"{i}|{name}|{int(n_modes)}|{int(n_tau)}\n".encode())
+    return h.hexdigest()[:32]
+
+
 def group_plan_digest(groups):
     """A fingerprint of one branch's planned groups, in planner order.
 
@@ -155,10 +182,52 @@ def group_plan_digest(groups):
     stamp, and a digest over eighty million poles would cost more than the
     plan it is guarding.
     """
+    return group_plan_digest_from_rows(plan_digest_rows(groups))
+
+
+def full_plan_digest(groups):
+    """A fingerprint of EVERY number the integrator reads out of a plan.
+
+    :func:`group_plan_digest` is the partition digest and is deliberately
+    cheap: it answers "are these the same groups?", which is the question a
+    manifest's ranges depend on.  This one answers a different and stricter
+    question — "is this the same plan, to the last bit?" — and it exists
+    because the plan is now an ARTIFACT that can be written once and loaded
+    by sixteen legs.  The claim that a loaded plan is the plan the planner
+    would have computed is a claim about the τ nodes, the weights, the
+    masks, the reference energies, the prefactors and the selections, not
+    about the group count; so the gate that establishes it hashes those.
+
+    It is not a replacement for the partition digest and does not become
+    one: it costs a pass over the index sets, which is why the per-leg
+    check remains the cheap digest and this is what the verification leg
+    runs.
+    """
+    import numpy as np
+
     h = hashlib.sha256()
     for i, g in enumerate(groups):
-        n_tau = int(sum(int(w.n_tau) for w in g.windows))
-        h.update(f"{i}|{g.name}|{int(g.n_modes)}|{n_tau}\n".encode())
+        idx = np.ascontiguousarray(g.idx_B)
+        h.update(f"G{i}|{g.name}|{int(g.n_modes)}|{float(g.b_mass)!r}|"
+                 f"{tuple(int(x) for x in g.field_shape)}|{g.provenance}|"
+                 f"{idx.dtype.str}|{idx.size}\n".encode())
+        h.update(memoryview(idx).cast("B"))
+        op = np.asarray(g.omega_operand)
+        h.update(f"|operand:{op.dtype.str}{op.shape}\n".encode())
+        for j, w in enumerate(g.windows):
+            h.update(
+                f"W{j}|{w.name}|{float(w.E_ref_A)!r}|{float(w.E_ref_B)!r}|"
+                f"{int(w.omega_sign)}|{w.project}|{float(w.prefactor)!r}|"
+                f"{w.mask_B_mode}|{w.mask_B_threshold!r}|{w.crossing_kind!r}|"
+                f"{w.max_error!r}|{w.provenance!r}\n".encode())
+            for name in ("t", "alpha"):
+                arr = np.ascontiguousarray(
+                    np.asarray(getattr(w.nodes, name), dtype=np.complex128))
+                h.update(f"|{name}{arr.shape}".encode())
+                h.update(memoryview(arr).cast("B"))
+            mask = np.ascontiguousarray(np.asarray(w.mask_A, dtype=bool))
+            h.update(f"|mask_A{mask.shape}".encode())
+            h.update(memoryview(mask).cast("B"))
     return h.hexdigest()[:32]
 
 
@@ -230,6 +299,54 @@ def format_group_subset(spec):
     return ",".join(f"{p}.{b}:{lo}-{hi}/{tot}" for (p, b), (lo, hi, tot) in items)
 
 
+def group_range(spec, *, pole, bkey, n_groups):
+    """``(lo, hi, total)`` for one (pole, branch), or ``None`` if unowned.
+
+    ``spec is None`` — the unsplit walk — owns everything, so it returns
+    the whole range.  Split out so the plan-loading route can learn what a
+    leg owns from the header of an artifact, before it reads any of it,
+    and still be checked by exactly the code below.
+    """
+    if spec is None:
+        return (0, int(n_groups), int(n_groups))
+    got = spec.get((int(pole), str(bkey)))
+    if got is None:
+        return None
+    return (int(got[0]), int(got[1]), int(got[2]))
+
+
+def check_partition(*, n_groups, digest_got, pole, bkey, total, lo, hi,
+                    digest=None, source="the planner"):
+    """The two anti-stale refusals, in one place because there are two callers.
+
+    A leg either PLANS its groups or LOADS them from a plan artifact, and
+    the failure both routes have to refuse is identical: the partition this
+    leg is looking at is not the partition its manifest's ranges were
+    written against.  One copy of the refusal, so the two routes cannot
+    drift into checking different things — the load route is newer and
+    would have been the one to drift.
+    """
+    if int(n_groups) != int(total):
+        raise ValueError(
+            f"mpa_group_subset: this leg was told pole {pole} branch {bkey} "
+            f"has {total} window groups and would integrate [{lo}, {hi}) of "
+            f"them, but {source} returned {int(n_groups)}.  The manifest "
+            f"this leg is running under was balanced from a DIFFERENT "
+            f"partition, so its ranges no longer name the groups it meant — "
+            f"and every leg would still succeed, leaving a merged Σ that is "
+            f"smooth, finite and wrong by the size of whatever moved.  "
+            f"Re-take the census against this store and this sha, re-balance, "
+            f"and re-run the farm; do not widen this check.")
+    if digest is not None and str(digest_got) != str(digest):
+        raise ValueError(
+            f"mpa_group_subset: pole {pole} branch {bkey} came back from "
+            f"{source} with {int(n_groups)} groups as the manifest said, but "
+            f"their names, mode counts and tau-node counts fingerprint to "
+            f"{digest_got} against the census's {digest}.  Same count, "
+            f"different partition — which is the stale-census failure "
+            f"that a count alone cannot see.")
+
+
 def select_branch_groups(groups, *, pole, bkey, spec, digest=None):
     """The groups of one (pole, branch) this leg owns, in planner order.
 
@@ -242,33 +359,16 @@ def select_branch_groups(groups, *, pole, bkey, spec, digest=None):
     caller skips the branch entirely — it does not plan it, it does not
     integrate it, and by linearity its contribution to this leg is zero.
     """
-    if spec is None:
-        return list(groups), 0
-    key = (int(pole), str(bkey))
-    if key not in spec:
+    rng = group_range(spec, pole=pole, bkey=bkey, n_groups=len(groups))
+    if rng is None:
         return [], 0
-    lo, hi, total = spec[key]
-    if len(groups) != total:
-        raise ValueError(
-            f"mpa_group_subset: this leg was told pole {pole} branch {bkey} "
-            f"has {total} window groups and would integrate [{lo}, {hi}) of "
-            f"them, but the planner returned {len(groups)}.  The manifest "
-            f"this leg is running under was balanced from a DIFFERENT "
-            f"partition, so its ranges no longer name the groups it meant — "
-            f"and every leg would still succeed, leaving a merged Σ that is "
-            f"smooth, finite and wrong by the size of whatever moved.  "
-            f"Re-take the census against this store and this sha, re-balance, "
-            f"and re-run the farm; do not widen this check.")
-    if digest is not None:
-        got = group_plan_digest(groups)
-        if got != str(digest):
-            raise ValueError(
-                f"mpa_group_subset: pole {pole} branch {bkey} planned "
-                f"{len(groups)} groups as the manifest said, but their "
-                f"names, mode counts and tau-node counts fingerprint to "
-                f"{got} against the census's {digest}.  Same count, "
-                f"different partition — which is the stale-census failure "
-                f"that a count alone cannot see.")
+    lo, hi, total = rng
+    if spec is not None:
+        check_partition(
+            n_groups=len(groups),
+            digest_got=(group_plan_digest(groups) if digest is not None
+                        else None),
+            pole=pole, bkey=bkey, total=total, lo=lo, hi=hi, digest=digest)
     return list(groups)[lo:hi], lo
 
 
@@ -346,6 +446,7 @@ def merge_census_files(paths):
     this module exists to close.
     """
     rows, digests, stores, n_ps, shas, seen = [], {}, set(), set(), set(), {}
+    plans = {}
     for p in sorted(str(x) for x in paths):
         doc = read_census(p)
         stores.add(str(doc["fit_store"]))
@@ -353,6 +454,18 @@ def merge_census_files(paths):
         shas.add(str(doc.get("sha", "")))
         for key, dig in (doc.get("digests") or {}).items():
             digests[key] = dig
+        for key, info in (doc.get("plans") or {}).items():
+            prev = plans.setdefault(key, info)
+            if str(prev.get("address")) != str(info.get("address")):
+                raise ValueError(
+                    f"merge_census_files: {key} has two plan artifacts with "
+                    f"different addresses ({prev.get('address')} and "
+                    f"{info.get('address')}).  An address is a digest over "
+                    f"every planner input, so two of them for one "
+                    f"(pole, branch) means these census files were taken "
+                    f"against different inputs and the balance struck from "
+                    f"them would name group ranges of two different "
+                    f"partitions.")
         for r in doc["rows"]:
             owner = seen.setdefault((int(r["pole"]), str(r["branch"]),
                                      int(r["index"])), p)
@@ -383,6 +496,7 @@ def merge_census_files(paths):
         "written_utc": datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
         "digests": digests,
+        "plans": plans,
         "rows": sorted(rows, key=_row_sort_key),
     }
 
@@ -558,13 +672,24 @@ def plan_fit_legs(n_q, n_legs):
 # ---------------------------------------------------------------------------
 
 def write_manifest(path, legs, *, kind, fit_store, n_p=None, sha="",
-                   out_dir=None, out_suffix=".h5", census=None, extra=None):
+                   out_dir=None, out_suffix=".h5", census=None, inputs=None,
+                   extra=None):
     """Declare every leg and its expected output BEFORE the farm launches.
 
     The manifest is written first and read by the merge.  That ordering is
     the whole mechanism: a leg that never started leaves a row with no file
     beside it, which is a refusal; a farm that was never declared leaves
     nothing to check against, which is how [48, 52) went missing.
+
+    ``inputs`` DECLARES WHAT THE FARM READS, on the same terms.  Since
+    2026-08-10 a leg does not plan its own window groups: it loads them
+    from a plan artifact addressed by the planner's inputs, so the farm's
+    result depends on files that are not its own outputs.  A declared
+    input is a row with an id, a label and a path, probed by
+    :func:`refuse_incomplete` exactly as a leg's output is, because "the
+    plan this farm ran against is gone" and "a leg did not land" are the
+    same failure seen from the two ends — in both cases what is on disk no
+    longer says what was computed.
     """
     rows = []
     for leg in legs:
@@ -585,6 +710,13 @@ def write_manifest(path, legs, *, kind, fit_store, n_p=None, sha="",
             f"write_manifest: leg ids are not unique ({ids}).  Two legs "
             f"sharing an id share an output path, so one silently "
             f"overwrites the other and the farm still looks complete.")
+    input_rows = [dict(r) for r in (inputs or [])]
+    for r in input_rows:
+        if not r.get("id") or not r.get("output"):
+            raise ValueError(
+                f"write_manifest: declared input {r!r} has no id or no path.  "
+                f"An input that cannot be named cannot be refused by name, "
+                f"which is the only thing declaring it achieves.")
     doc = {
         "format": MANIFEST_FORMAT,
         "kind": str(kind),
@@ -595,6 +727,7 @@ def write_manifest(path, legs, *, kind, fit_store, n_p=None, sha="",
         "total_n_tau": int(sum(int(r.get("n_tau", 0)) for r in rows)),
         "written_utc": datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
+        "inputs": input_rows,
         "legs": rows,
     }
     if census is not None:
@@ -654,6 +787,27 @@ def refuse_incomplete(manifest, *, probe=None, print_fn=print):
     """
     probe = probe or _default_probe
     legs = list(manifest["legs"])
+    inputs = list(manifest.get("inputs") or [])
+    gone = [(r, why) for r, why in
+            ((r, probe(str(r["output"]))) for r in inputs) if not why[0]]
+    if gone:
+        lines = [
+            f"{manifest.get('kind', '?')} farm inputs missing: "
+            f"{len(gone)} of {len(inputs)} declared inputs are not there.  "
+            f"These are the artifacts the legs READ — the window plans "
+            f"their group ranges are ranges into — so without them the "
+            f"cubes on disk cannot be shown to be the partition this "
+            f"manifest declares, and nothing about the cubes themselves "
+            f"would say otherwise.",
+        ]
+        for r, (_ok, why) in gone:
+            lines.append(
+                f"  MISSING input {r['id']}: {r.get('range_label', '?')} "
+                f"-> {r['output']} ({why})")
+        lines.append(
+            "  Re-run the planning step against this deck and sha; do not "
+            "merge cubes whose plan is gone.")
+        raise FarmIncomplete("\n".join(lines))
     missing = []
     for leg in legs:
         ok, why = probe(str(leg["output"]))
@@ -681,5 +835,7 @@ def refuse_incomplete(manifest, *, probe=None, print_fn=print):
         f"  farm completeness: all {len(legs)} declared "
         f"{manifest.get('kind', '?')} legs landed "
         f"(manifest {manifest.get('written_utc', '?')}, "
-        f"{manifest.get('total_n_tau', 0)} tau dispatches declared).")
+        f"{manifest.get('total_n_tau', 0)} tau dispatches declared)"
+        + (f", and all {len(inputs)} declared inputs are present."
+           if inputs else "."))
     return legs

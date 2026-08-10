@@ -152,6 +152,7 @@ rather than guessing a conjugation and returning a finite, plausible Sigma.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1681,7 +1682,8 @@ def compute_mpa_sigma_c_omega_grid(
     wfns, fit_src, meta, mesh_xy, *, ppm_cfg, quad, omega_grid_ry,
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
     allow_partial=False, pole_subset=None, group_subset=None,
-    group_digests=None, census_out=None, census_sha="", print_fn=print,
+    group_digests=None, census_out=None, census_sha="", plan_store=None,
+    plan_verify=False, print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -1720,12 +1722,30 @@ def compute_mpa_sigma_c_omega_grid(
     The balance cannot be struck without it — ``n_tau`` per group is only
     known once the rules are built — and it is the one thing in this path
     that must be measured before any of it is scheduled.
+
+    ``plan_store`` IS WHAT STOPS THE PLAN FROM MULTIPLYING WITH THE FARM.
+    The planner is a pure function of one pole's slab, the branch's A-side
+    arrays, the ω half-grid and a handful of scalars; nothing it reads is
+    the split.  So a census run with ``plan_store`` set writes each
+    (pole, branch) plan to an artifact addressed by those very inputs, and
+    an integrating leg with the same key set LOADS the groups it owns
+    instead of re-deriving them — which is the ~65 s per pole-touch that
+    §9.5 of the 16-GPU plan measured a sixteen-leg farm paying sixteen
+    times for eight poles' worth of work.  The artifact is addressed by a
+    digest over every planner input, so a plan built from anything else is
+    a file this leg does not ask for; a plan that is simply absent is
+    refused by name rather than quietly re-planned.  ``plan_verify``
+    additionally plans the branch the old way and compares the two, which
+    is the gate that establishes the loaded plan IS the computed one.
     """
+    import time
+
     import jax
     import jax.numpy as jnp
 
     from common import timing
     from file_io import mpa_store
+    from . import plan_store as PS
     from . import window_farm as WF
     from ..ppm_sigma import (
         _iter_branches, _prepare_sigma_state, pad_sigma_window,
@@ -1787,6 +1807,18 @@ def compute_mpa_sigma_c_omega_grid(
     # associate the same way within each process.
     walk = resolve_pass_poles(n_p, pole_subset, group_subset)
     census_rows, census_digests = [], {}
+    # THE PER-LEG FIXED TERM, ACCOUNTED RATHER THAN INFERRED.  §9.5 of the
+    # 16-GPU plan had to back it out of a census leg's total (106-115 s
+    # minus a ~42 s bring-up) because nothing in the run said where the
+    # time went.  These four counters and the line they print at the end
+    # are that measurement, per leg, in every log — read, plan, load, and
+    # the address hash the plan store pays for its own staleness guard.
+    fixed = {"read_s": 0.0, "plan_s": 0.0, "load_s": 0.0, "addr_s": 0.0,
+             "verify_s": 0.0, "poles": 0, "branches": 0, "loaded": 0}
+    plan_dir = str(plan_store or "") or None
+    if plan_dir is not None and census_out is not None:
+        os.makedirs(plan_dir, exist_ok=True)
+    plan_written = {}
     if census_out is not None:
         print_fn(
             f"  MPA Σ: CENSUS ONLY over poles {list(walk)} -- every branch "
@@ -1801,12 +1833,24 @@ def compute_mpa_sigma_c_omega_grid(
                f"{WF.format_group_subset(group_subset)}"
                if group_subset is not None else ""))
     for p in walk:
+        t_read = time.perf_counter()
         with timing.section("mpa.pass_read"):
             Omega_p, B_p = mpa_store.read_pole_slice(
                 fit_src, p, allow_partial=allow_partial)
         a_host = np.asarray(np.real(Omega_p), dtype=np.float64)
         g_host = np.abs(np.asarray(np.imag(Omega_p), dtype=np.float64))
         b_abs = np.abs(np.asarray(B_p))
+        fixed["read_s"] += time.perf_counter() - t_read
+        fixed["poles"] += 1
+        print_fn(f"  MPA pass read: pole {int(p)} slab in "
+                 f"{time.perf_counter() - t_read:.2f} s")
+        # The complex operand the MPA-routed groups take, built once per
+        # pole rather than once per branch, and only on the route that
+        # needs it: a loaded plan names which of the two slab operands
+        # each group takes and the loader rebuilds it from these arrays.
+        omega_complex_host = (a_host - 1j * g_host
+                              if (plan_dir is not None
+                                  and census_out is None) else None)
         state = _prepare_sigma_state(
             jnp.asarray(wfns.enk[:, s.full]), jnp.asarray(wfns.occ[:, s.full]),
             jnp.asarray(B_p, dtype=jnp.complex128),
@@ -1848,20 +1892,153 @@ def compute_mpa_sigma_c_omega_grid(
             E_A_host = _host_at_source_shape(br.E_A, np.float64, _to_host_np)
             mask_A_host = _host_at_source_shape(
                 br.base_mask_A, bool, _to_host_np)
-            with timing.section("mpa.windows"):
-                groups, stats = plan_branch_groups(
-                    a_ry=a_host, gamma_ry=g_host, live_mask=live,
-                    E_A_host=E_A_host, base_mask_A_host=mask_A_host,
-                    omega_nonneg_ry=br.omega_abs, space=br.space,
-                    neg_omega_half=br.neg_omega_half, xi_ry=xi_ry,
-                    edge_factor=edge_factor, b_abs=b_abs, rel_tol=rel_tol,
-                    laplace_ratio_max=laplace_ratio_max,
-                    target_error=float(quad.target_error),
-                    laplace_max_nodes=int(quad.max_nodes),
-                    crossing_eps_q=float(quad.crossing_eps_q),
-                    crossing_max_nodes=int(quad.crossing_max_nodes),
-                    use_shipped_minimax_tables=bool(quad.use_shipped_tables),
-                    log_tag=f"p{p} {br.tag}", print_fn=print_fn)
+            fixed["branches"] += 1
+
+            def _plan_this_branch():
+                """``plan_branch_groups`` at this (pole, branch), verbatim."""
+                with timing.section("mpa.windows"):
+                    return plan_branch_groups(
+                        a_ry=a_host, gamma_ry=g_host, live_mask=live,
+                        E_A_host=E_A_host, base_mask_A_host=mask_A_host,
+                        omega_nonneg_ry=br.omega_abs, space=br.space,
+                        neg_omega_half=br.neg_omega_half, xi_ry=xi_ry,
+                        edge_factor=edge_factor, b_abs=b_abs, rel_tol=rel_tol,
+                        laplace_ratio_max=laplace_ratio_max,
+                        target_error=float(quad.target_error),
+                        laplace_max_nodes=int(quad.max_nodes),
+                        crossing_eps_q=float(quad.crossing_eps_q),
+                        crossing_max_nodes=int(quad.crossing_max_nodes),
+                        use_shipped_minimax_tables=bool(
+                            quad.use_shipped_tables),
+                        log_tag=f"p{p} {br.tag}", print_fn=print_fn)
+
+            plan_addr, plan_file = None, None
+            if plan_dir is not None:
+                t_addr = time.perf_counter()
+                plan_addr = PS.branch_address(
+                    source_sha=census_sha, fit_store=fit_src, n_p=n_p,
+                    pole=p, bkey=bkey,
+                    arrays={
+                        "a_ry": a_host, "gamma_ry": g_host,
+                        "live_mask": live, "E_A_host": E_A_host,
+                        "base_mask_A_host": mask_A_host,
+                        "omega_nonneg_ry": np.asarray(br.omega_abs,
+                                                      dtype=np.float64),
+                        "b_abs": b_abs,
+                    },
+                    scalars={
+                        "xi_ry": float(xi_ry),
+                        "edge_factor": float(edge_factor),
+                        "rel_tol": float(rel_tol),
+                        "laplace_ratio_max": float(laplace_ratio_max),
+                        "target_error": float(quad.target_error),
+                        "laplace_max_nodes": int(quad.max_nodes),
+                        "crossing_eps_q": float(quad.crossing_eps_q),
+                        "crossing_max_nodes": int(quad.crossing_max_nodes),
+                        "use_shipped_minimax_tables": bool(
+                            quad.use_shipped_tables),
+                        "space": str(br.space),
+                        "neg_omega_half": bool(br.neg_omega_half),
+                    })
+                fixed["addr_s"] += time.perf_counter() - t_addr
+                plan_file = PS.plan_path(plan_dir, pole=p, bkey=bkey,
+                                         address=plan_addr)
+
+            loaded_lo = None
+            if plan_dir is not None and census_out is None:
+                # THE LOAD ROUTE.  The groups this leg owns come off disk;
+                # the ones it does not are never read at all, which is why
+                # the artifact stores each group's index set as its own
+                # dataset rather than one array per branch.
+                if not os.path.exists(plan_file):
+                    PS.refuse_missing_plan(plan_dir, pole=p, bkey=bkey,
+                                           address=plan_addr)
+                t_load = time.perf_counter()
+                header = PS.read_plan_header(plan_file)
+                rng = WF.group_range(group_subset, pole=p, bkey=bkey,
+                                     n_groups=header["n_groups"])
+                if rng is None:                  # pragma: no cover - guarded
+                    continue                     # above by the branch skip
+                lo_i, hi_i, total_i = rng
+                WF.check_partition(
+                    n_groups=header["n_groups"],
+                    digest_got=WF.group_plan_digest_from_rows(header["rows"]),
+                    pole=p, bkey=bkey, total=total_i, lo=lo_i, hi=hi_i,
+                    digest=(group_digests or {}).get(f"{int(p)}.{bkey}"),
+                    source="the stored plan")
+                groups = PS.read_branch_plan(
+                    plan_file, lo=lo_i, hi=hi_i, a_ry=a_host,
+                    omega_complex=omega_complex_host)
+                stats = header["stats"]
+                loaded_lo = lo_i
+                dt_load = time.perf_counter() - t_load
+                fixed["load_s"] += dt_load
+                fixed["loaded"] += 1
+                print_fn(
+                    f"  MPA plan p{p} {br.tag} ({bkey}): LOADED groups "
+                    f"[{lo_i}, {hi_i}) of {total_i} in {dt_load:.2f} s "
+                    f"(address {plan_addr[:12]}, digest "
+                    f"{header['group_plan_digest']})")
+                if plan_verify:
+                    # THE GATE, RUN WHERE THE REAL INPUTS ARE.  Plan the
+                    # branch the old way and fingerprint both to the last
+                    # bit: the τ nodes, the weights, the A-masks, both
+                    # reference energies, the prefactors and the index
+                    # sets.  A verification that only compared group
+                    # counts would pass for a plan whose every rule had
+                    # moved.
+                    t_ver = time.perf_counter()
+                    fresh, fresh_stats = _plan_this_branch()
+                    got = WF.full_plan_digest(fresh[lo_i:hi_i])
+                    want = WF.full_plan_digest(groups)
+                    whole = WF.full_plan_digest(fresh)
+                    dt_ver = time.perf_counter() - t_ver
+                    # The same seconds under two names on purpose: a
+                    # verifying leg is the only one that pays BOTH routes,
+                    # so it is also the cleanest A/B of them, and the
+                    # summary line says which is a subset of which.
+                    fixed["verify_s"] += dt_ver
+                    fixed["plan_s"] += dt_ver
+                    ok = (got == want)
+                    stats_same = all(
+                        float(fresh_stats[k]) == float(stats[k])
+                        for k in ("n_narrow", "n_wide", "narrow_b_mass",
+                                  "wide_b_mass", "n_tau"))
+                    print_fn(
+                        f"  PLAN-VERIFY p{p} {bkey}: loaded {want} vs "
+                        f"freshly planned {got} over groups "
+                        f"[{lo_i}, {hi_i}) -- "
+                        f"{'BIT-IDENTICAL' if ok else '*** DIFFERENT ***'}"
+                        f"; whole-branch fresh digest {whole}; planner "
+                        f"stats {'match' if stats_same else '*** DIFFER ***'}"
+                        f"; fresh plan cost {dt_ver:.2f} s against "
+                        f"{dt_load:.2f} s to load")
+                    if not ok:
+                        raise ValueError(
+                            f"mpa_plan_verify: the plan loaded for pole {p} "
+                            f"branch {bkey} is not the plan this tree "
+                            f"computes from the same inputs.  The artifact "
+                            f"is addressed by a digest over every planner "
+                            f"input, so this cannot be a stale store; it is "
+                            f"a serialization defect, and every leg that "
+                            f"loaded it integrated certified rules that are "
+                            f"not the ones the planner built.")
+            else:
+                t_plan = time.perf_counter()
+                groups, stats = _plan_this_branch()
+                fixed["plan_s"] += time.perf_counter() - t_plan
+                print_fn(f"  MPA plan p{p} {br.tag} ({bkey}): PLANNED "
+                         f"{len(groups)} groups in "
+                         f"{time.perf_counter() - t_plan:.2f} s")
+                if plan_dir is not None and census_out is not None:
+                    PS.write_branch_plan(
+                        plan_file, groups, address=plan_addr, pole=p,
+                        bkey=bkey, source_sha=census_sha, fit_store=fit_src,
+                        n_p=n_p, stats=stats, a_ry=a_host,
+                        omega_complex=a_host - 1j * g_host,
+                        print_fn=print_fn)
+                    plan_written[f"{int(p)}.{bkey}"] = {
+                        "path": plan_file, "address": plan_addr}
             rec.n_legacy_modes = stats["n_narrow"]
             rec.n_mpa_modes = stats["n_wide"]
             rec.legacy_b_mass = stats["narrow_b_mass"]
@@ -1875,9 +2052,12 @@ def compute_mpa_sigma_c_omega_grid(
                     f"  MPA census p{p} {br.tag} ({bkey}): {len(groups)} "
                     f"window groups, {stats['n_tau']} tau dispatches")
                 continue
-            groups, group_lo = WF.select_branch_groups(
-                groups, pole=p, bkey=bkey, spec=group_subset,
-                digest=(group_digests or {}).get(f"{int(p)}.{bkey}"))
+            if loaded_lo is None:
+                groups, group_lo = WF.select_branch_groups(
+                    groups, pole=p, bkey=bkey, spec=group_subset,
+                    digest=(group_digests or {}).get(f"{int(p)}.{bkey}"))
+            else:
+                group_lo = loaded_lo
             if not groups:
                 continue
             rec.n_tau_nodes += int(sum(int(w.n_tau) for g in groups
@@ -1899,13 +2079,26 @@ def compute_mpa_sigma_c_omega_grid(
                 for d, t in enumerate(branch_tiles.tiles):
                     tile_acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
         records.append(rec)
+        del omega_complex_host
+
+    # THE LINE §10 IS WRITTEN FROM.  One greppable row per leg, so the
+    # fixed term is a measurement in the log rather than a subtraction
+    # performed afterwards by whoever reads it.
+    print_fn(
+        f"  MPA-FIXED-TERM: poles={fixed['poles']} branches="
+        f"{fixed['branches']} read={fixed['read_s']:.2f}s "
+        f"plan={fixed['plan_s']:.2f}s load={fixed['load_s']:.2f}s "
+        f"({fixed['loaded']} branches) address_hash={fixed['addr_s']:.2f}s "
+        f"verify={fixed['verify_s']:.2f}s (a subset of plan) total_fixed="
+        f"{fixed['read_s'] + fixed['plan_s'] + fixed['load_s'] + fixed['addr_s']:.2f}s")
 
     if census_out is not None:
         WF.write_census(
             census_out, census_rows, fit_store=str(fit_src), n_p=n_p,
             sha=str(census_sha), digests=census_digests,
             extra={"poles": [int(x) for x in walk],
-                   "omega_grid_ry": [float(x) for x in omega_req]})
+                   "omega_grid_ry": [float(x) for x in omega_req],
+                   "plans": plan_written})
         print_fn(
             f"  MPA pass census written: {census_out}\n"
             f"    {len(census_rows)} window groups over poles "
