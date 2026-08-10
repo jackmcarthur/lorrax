@@ -35,7 +35,7 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
     """``exp(-t·(E - e_ref))`` inside the energy window, EXACTLY zero outside.
 
         windowed_exp_iEt(E, t, E_min, E_max)
-            = where((E >= E_min) & (E < E_max), exp(-t·(E - e_ref)), 0)
+            = where((E > E_min) & (E <= E_max), exp(-t·(E - e_ref)), 0)
 
     THE POINT IS THAT THE WINDOW IS NEVER MATERIALISED.  The caller used to
     build a boolean array the shape of ``E``, keep it alive as a jit operand,
@@ -50,10 +50,26 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
     operand in the same fused loop and spend the register/cache headroom
     that makes the predicate+exp fusion free (owner ruling 2026-08-09).
 
-    Window convention: HALF-OPEN ``[E_min, E_max)``, so abutting windows
-    tile an energy axis without double-counting a band that lands exactly on
-    a boundary.  Either bound may be ``None`` for a one-sided window; both
-    ``None`` returns the bare (unwindowed) phase factor.
+    Window convention: HALF-OPEN AND CLOSED AT THE TOP, ``(E_min, E_max]``.
+    Abutting windows still tile an energy axis without double-counting a band
+    that lands exactly on a boundary; what the closed top additionally fixes is
+    the DIRECTION in which such a band is assigned — downward, into the pane
+    whose supremum it is.  That direction is not free: every certified
+    quadrature rule in this core is built at max(Γ) over its own pane, so a
+    pane that did not contain its supremum would evaluate a boundary pole under
+    a rule that was never certified to cover it.  Decided and recorded in the
+    catalog's ``bin_convention`` field (peer decision 2026-08-09); this helper
+    landed as ``[lo, hi)`` and was flipped to match.
+
+    It therefore now AGREES with ``ppm_windows.window_mask_B_bounds``, the
+    Σ B-side Ω selector, which has always been ``(lo, hi]``.  The two sides of
+    Σ used to assign a pole sitting exactly on a threshold in opposite
+    directions; they no longer do, and ``tests/test_windowed_exp_iEt.py`` gates
+    that agreement against the B-side helper itself rather than against a
+    copied bound.
+
+    Either bound may be ``None`` for a one-sided window; both ``None``
+    returns the bare (unwindowed) phase factor.
 
     Parameters
     ----------
@@ -65,9 +81,9 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
         evolution (Σ_c).  The sign convention is the caller's, matching
         ``build_G_tau``: the exponent is ``-t·(E - e_ref)``.
     E_min, E_max : scalar or None
-        Half-open window bounds, in the SAME units and the SAME reference
-        as ``E`` (i.e. NOT shifted by ``e_ref`` — ``e_ref`` moves only the
-        phase origin, never the window).
+        Window bounds ``(E_min, E_max]``, in the SAME units and the SAME
+        reference as ``E`` (i.e. NOT shifted by ``e_ref`` — ``e_ref`` moves
+        only the phase origin, never the window).
     e_ref : scalar
         Energy reference subtracted from ``E`` before the exponential.
 
@@ -83,11 +99,11 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
     if E_min is None and E_max is None:
         return phase
     if E_min is None:
-        pred = E < E_max
+        pred = E <= E_max
     elif E_max is None:
-        pred = E >= E_min
+        pred = E > E_min
     else:
-        pred = (E >= E_min) & (E < E_max)
+        pred = (E > E_min) & (E <= E_max)
     return jnp.where(pred, phase,
                      jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
 
@@ -109,8 +125,8 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     t:       scalar              complex evolution time
     e_ref:   scalar              energy reference subtracted from enk before phase
     E_min,
-    E_max:   scalar or None      half-open energy window [E_min, E_max) applied to
-                                 enk WITHOUT materialising a mask — see
+    E_max:   scalar or None      energy window (E_min, E_max] — closed at the top —
+                                 applied to enk WITHOUT materialising a mask; see
                                  ``windowed_exp_iEt``.  This is the preferred
                                  spelling for any window that is an ENERGY RANGE.
     mask:    (nk, nb) bool or None   band-IDENTITY selector (Σ's ``mask_A``:

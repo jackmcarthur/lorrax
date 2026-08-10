@@ -124,16 +124,17 @@ def test_bse_eigenvector_writer_has_no_bare_device_get():
     Davidson route, and ``--solver davidson --write-eigs`` died on every rank
     at P>1.  A writer must not depend on a solver's layout to be correct.
     """
-    from bse import bse_io
+    from bse import bse_window
 
-    src = inspect.getsource(bse_io)
+    src = inspect.getsource(bse_window)
     hits = _bare_device_get_lines(src)
     assert not hits, (
-        f"bare jax.device_get in bse_io at source line(s) {hits}.  This module "
+        f"bare jax.device_get in bse_window at source line(s) {hits}.  This "
+        f"module "
         f"writes what the solvers return, and not every solver returns "
         f"replicated arrays -- route it through gather_to_host.")
     assert "gather_to_host" in src, (
-        "bse_io no longer references gather_to_host at all, so it is clean "
+        "bse_window no longer references gather_to_host at all, so it is clean "
         "only because the host fetches moved somewhere unexamined")
 
 

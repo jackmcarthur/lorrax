@@ -27,6 +27,15 @@ LIVE repo src by default, `LORRAX_SRC` overrides). Exit 0 = pass, 1 = numeric
 drift (per-file deltas printed), 2 = a stage failed (the log names the driver).
 BSE and exciton bands are NOT in the chain yet.
 
+> **THE FOUR-GPU RULE — every GPU verification leg for any driver on this page
+> runs at P=4.** A P=1-only verification is never sufficient for landing; unit
+> and CPU cells are exempt. The owner's rationale, verbatim: *"use four gpus
+> for 100% of all testing so that never ever do we run something on one GPU and
+> then learn it doesn't generalize later"*. The fastloop chain above checks P=1
+> and a 2×2 host-device mesh, which is a portability check and not the P=4 leg.
+> On Perlmutter ask for the whole node with `-G 4`; see `AGENT_PREAMBLE.md` at
+> the repository root.
+
 ## centroids — `centroid.kmeans_cli`
 
 Selects the N_c real-space ISDF interpolation points: a density-weighted k-means over the WFN FFT grid

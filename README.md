@@ -29,8 +29,7 @@ the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction, so
 machine. Everything distributed (sharded HDF5, distributed `eigh`, SLATE) additionally
 requires the native FFI stack — see [`docs/environment/overview.md`](docs/environment/overview.md).
 
-Perlmutter workflow (lxrun/module) — on Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
-On NERSC Perlmutter: `module load lorrax` then use `lxrun` / `lxpre`. See [`config/README.md`](config/README.md).
+On NERSC Perlmutter the harness is `lx`: `lx run <cmd>` puts one step on a compute node, `lx test` runs the default gate there. See [`docs/environment/machines/perlmutter.md`](docs/environment/machines/perlmutter.md) — the older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre` workflow is superseded and documented there as history. On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 
 On TACC Frontera (CPU, apptainer + srun), working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`, the mos2_4x4_test sbatch family):
 

@@ -688,6 +688,7 @@ def write_head_scalars_to_h5(
     vhead: complex | None = None,
     whead: np.ndarray | jnp.ndarray | None = None,
     omega_grid: np.ndarray | jnp.ndarray | None = None,
+    S_cart: np.ndarray | jnp.ndarray | None = None,
 ):
     """Persist q=0 Coulomb head scalars to the restart file.
 
@@ -700,6 +701,21 @@ def write_head_scalars_to_h5(
     - ``omega_grid``: optional ``(n_omega,)`` array of the ω values
       (in Ry) corresponding to ``whead`` — written as an attribute on
       the ``whead`` dataset for consumer interpretation.
+    - ``S_cart``: optional ``(3, 3)`` complex — the Cartesian q²-coefficient
+      tensor that PRODUCED ``whead[0]``, in the canonical convention of
+      ``docs/theory/s-tensor-convention.md``.  ``None`` on the ``epshead``
+      head branch, which fits an isotropic γ and has no tensor.
+
+      WHY A TENSOR JOINS TWO SCALARS HERE.  ``whead`` is the cell average
+      ``⟨v/(1 − v qᵀSq)⟩`` over ONE mini-BZ, so it is bound to the grid it was
+      computed on.  Any consumer that changes the grid — and the BSE's
+      coarse→fine W densifier does exactly that — needs the INTEGRAND, not the
+      average, and rebuilding it means re-reading ``dipole.h5`` and redoing
+      the ``S(ω)`` sum.  Nine numbers on a multi-GB restart make that
+      unnecessary and, more importantly, make the re-attached head provably
+      the same screening the run solved with rather than a re-derivation that
+      merely ought to agree.  Absent on restarts written before this existed;
+      ``head_correction.resolve_head_S_cart`` falls back to the rebuild.
 
     Rank-0-only write (these are tiny; no MPI-IO needed).
     """
@@ -718,6 +734,13 @@ def write_head_scalars_to_h5(
             ds = f.create_dataset("whead", data=arr)
             if omega_grid is not None:
                 ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
+        if S_cart is not None:
+            if "S_cart_head" in f:
+                del f["S_cart_head"]
+            S = np.asarray(S_cart, dtype=np.complex128).reshape(3, 3)
+            sd = f.create_dataset("S_cart_head", data=S)
+            sd.attrs["convention"] = "cartesian_q2_coefficient"
+            sd.attrs["omega_ry"] = 0.0
     barrier("restart_head_scalars")
 
 

@@ -214,6 +214,15 @@ def _read_geometry(filename: str) -> dict:
             "omega_grid": (np.asarray(f["whead"].attrs["omega_grid"])
                            if "whead" in f and "omega_grid" in f["whead"].attrs
                            else None),
+            # The head INTEGRAND's S tensor.  It rides through a downfold
+            # untouched for the same reason vhead/whead do: the head channel
+            # is a property of the cell and the screening, not of the ISDF
+            # basis the tensors were compressed into.  Dropping it would make
+            # a downfolded bundle silently unable to densify W (the child
+            # would have to rebuild S from dipole.h5, which a bundle-only
+            # consumer has no path to).
+            "S_cart": (np.asarray(f["S_cart_head"][:])
+                       if "S_cart_head" in f else None),
             "centroids_charge_md5": f.attrs.get("centroids_charge_md5"),
             "present": tuple(n for n in _MUNU_TENSORS if n in f),
         }
@@ -499,10 +508,11 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
         if name in small:
             _append_munu(out_file, name, small[name], mu_S, mesh_xy)
 
-    if geom["vhead"] is not None or geom["whead"] is not None:
+    if (geom["vhead"] is not None or geom["whead"] is not None
+            or geom["S_cart"] is not None):
         write_head_scalars_to_h5(
             out_file, vhead=geom["vhead"], whead=geom["whead"],
-            omega_grid=geom["omega_grid"])
+            omega_grid=geom["omega_grid"], S_cart=geom["S_cart"])
 
     _stamp_downfold_provenance(out_file, cfg, geom, keep_idx, mu_S,
                                sel=sel, rank_per_q=rank_per_q, eps=eps)

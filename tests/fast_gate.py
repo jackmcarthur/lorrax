@@ -1,5 +1,17 @@
 """The DEFAULT gate: the Si test calculation, for the drivers a branch touched.
 
+THE FOUR-GPU RULE — EVERY GPU LEG RUNS AT P=4
+---------------------------------------------
+Whichever tier selects them, **every GPU verification leg runs at P=4**.  A
+P=1-only verification is never sufficient for landing; unit and CPU cells are
+exempt.  The owner's rationale, verbatim:
+
+    "use four gpus for 100% of all testing so that never ever do we run
+     something on one GPU and then learn it doesn't generalize later"
+
+This module chooses WHICH cells run, never how many devices they run on --
+see ``AGENT_PREAMBLE.md`` at the repository root for the rule itself.
+
 WHY THIS FILE EXISTS (the owner, 2026-08-09)
 --------------------------------------------
     "the test suite for lorrax became a super clodgy mess because of the

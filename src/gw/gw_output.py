@@ -444,6 +444,11 @@ def persist_w0_and_head(
             vhead=complex(head_static.vc0),
             whead=whead_arr,
             omega_grid=omega_grid,
+            # The integrand behind whead[ω=0], not just its cell average, so a
+            # coarse→fine consumer can re-attach the head per fine q without
+            # rebuilding S(ω) from dipole.h5 (gw.head_densify).  None on the
+            # epshead branch, which has no tensor; the writer skips it then.
+            S_cart=head_static.S_cart,
         )
     print_fn(
         f"  Persisted W0_qmunu + q=0 head scalars: "

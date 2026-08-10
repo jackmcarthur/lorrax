@@ -59,7 +59,7 @@ import pytest
 # jax imported here would be the pytest session's backend, not the worker's.
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_BSE_IO = _REPO_ROOT / "src" / "bse" / "bse_io.py"
+_BSE_LOADING = _REPO_ROOT / "src" / "bse" / "bse_loading.py"
 
 # ---------------------------------------------------------------------------
 # The fixture.  Small enough to be instant, big enough that the μ axis does
@@ -132,7 +132,7 @@ def _worker(px: int, py: int) -> dict:
     import jax.numpy as jnp
     from jax.sharding import Mesh
 
-    from bse import bse_io
+    from bse import bse_loading
 
     mesh = Mesh(np.asarray(jax.devices()[:px * py]).reshape(px, py),
                 axis_names=("x", "y"))
@@ -169,7 +169,7 @@ def _worker(px: int, py: int) -> dict:
                 "padded_extent": int(W_q.shape[0]),
             }
 
-        _record(f"sharded/{arm}", bse_io.load_bse_data_from_restart_sharded(
+        _record(f"sharded/{arm}", bse_loading.load_bse_data_from_restart_sharded(
             path, n_val=N_VAL, n_cond=N_COND, mesh_xy=mesh, n_occ=N_OCC,
             cell_volume=CELL_VOLUME))
 
@@ -179,19 +179,19 @@ def _worker(px: int, py: int) -> dict:
             # by a deck, and this fixture has neither; supply THAT ONE
             # NUMBER and leave the rest of the resolution real, so the two
             # loaders are compared on identical head inputs.
-            _real = bse_io._resolve_head_params
+            _real = bse_loading._resolve_head_params
 
             def _with_cell_volume(input_file, vhead_restart, whead_restart,
                                   cell_volume=None):
                 return _real(input_file, vhead_restart, whead_restart,
                              CELL_VOLUME if cell_volume is None else cell_volume)
 
-            bse_io._resolve_head_params = _with_cell_volume
+            bse_loading._resolve_head_params = _with_cell_volume
             try:
-                _record(f"ring/{arm}", bse_io._load_ring_subset(
+                _record(f"ring/{arm}", bse_loading._load_ring_subset(
                     path, n_val=N_VAL, n_cond=N_COND, px=1, py=1, n_occ=N_OCC))
             finally:
-                bse_io._resolve_head_params = _real
+                bse_loading._resolve_head_params = _real
 
         if arm == "fallback":
             # THE RED TWIN, EXECUTED.  ``_inject_q0_head`` with its gate
@@ -201,20 +201,20 @@ def _worker(px: int, py: int) -> dict:
             # state.  If it stops showing the injected head, the fixture
             # has stopped constructing the hazard and every green cell
             # below is vacuous.
-            _real_inject = bse_io._inject_q0_head
+            _real_inject = bse_loading._inject_q0_head
 
             def _ungated(*args, **kwargs):
                 kwargs["w0_ready"] = True
                 return _real_inject(*args, **kwargs)
 
-            bse_io._inject_q0_head = _ungated
+            bse_loading._inject_q0_head = _ungated
             try:
                 _record("prefix/fallback",
-                        bse_io.load_bse_data_from_restart_sharded(
+                        bse_loading.load_bse_data_from_restart_sharded(
                             path, n_val=N_VAL, n_cond=N_COND, mesh_xy=mesh,
                             n_occ=N_OCC, cell_volume=CELL_VOLUME))
             finally:
-                bse_io._inject_q0_head = _real_inject
+                bse_loading._inject_q0_head = _real_inject
 
     return out
 
@@ -369,7 +369,7 @@ def test_neither_loader_reaches_past_the_shared_injector():
     twin.  A structural check, and it governs only WHERE the gate lives;
     every cell above decides whether it is right.
     """
-    tree = ast.parse(_BSE_IO.read_text())
+    tree = ast.parse(_BSE_LOADING.read_text())
     for name in ("load_bse_data_from_restart_sharded", "_load_ring_subset"):
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == name)

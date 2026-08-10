@@ -10,6 +10,56 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-08-10 — `bse/bse_io.py` is split into four modules; the old name is a facade
+
+`bse_io.py` had become the BSE's single choke point: restart discovery and
+reading, band-window authority, q=0 head injection, coarse-to-fine
+densification and restart policy all in one file that had reached 2917 lines,
+with five separate lanes colliding in it or re-learning it inside two days. It
+is now four modules, each holding one responsibility and stating one authority
+rule at the top of its own file. **`bse_window`** owns which bands are in the
+window and how its axes are padded — the window a run solved is the window
+everything downstream names, and the signed `PAD_EPS_GUARD_RY` sentinel, the
+pad masks and counts, the `--eqp` re-slice and the eigenvector writer's
+declared window are all there because they are one convention.
+**`bse_head`** owns the q=0 rank-1 Coulomb head: `vhead` goes on the exchange
+tile unconditionally, `whead` goes on `W` only when a real screened `W0`
+loaded, one spelling of that gate serves both loaders, and `defer_whead` is
+kept deliberately distinct from it — "not yet, and not as a delta" is a
+different statement from "not at all". **`bse_densify`** owns coarse to fine:
+the interpolation is a zero-pad in real space, it is the identity on the
+coarse sub-grid, there is exactly one sharded densifier, the interpolant is
+shown only the smooth body, and C1's analytic per-fine-q head channel
+re-attaches Γ afterwards. **`bse_loading`** owns reading a restart into a
+bundle: a tensor is refused unless the file says its data was persisted, the
+q-storage question is asked once and answered once, the SlabIO and serial
+transports are held to bit equality, and whether a densification is pending is
+resolved before the head injection because the answer changes what that
+injection does.
+
+`bse_io.py` remains as a compatibility facade that re-exports every name it
+exported before, resolving to the same function objects, so **no consumer's
+import anywhere in the tree changed**. Write new code against the module that
+owns the behaviour. Retiring the facade — repointing the import sites and
+deleting the file — is a separate decision that has **not** been taken, and one
+in-package consumer (`bse/vq_interp.py`'s lazy `from . import bse_io`) is still
+on it deliberately.
+
+Older prose that points at `bse_io.py` for a specific function should be read
+against this map: the pad helpers, `resolve_n_occ` and
+`write_eigenvectors_stream` are in `bse_window`; `make_w_densifier`,
+`pad_W_R_to_grid`, `resolve_w_head_densify` and `build_w_head_channel` are in
+`bse_densify`; `_inject_q0_head` and the `vhead`/`whead_0freq` deck keys are in
+`bse_head`; the two loaders, the sharded readers and `_find_restart_file` are
+in `bse_loading`. In particular the 2026-08-06 `LORRAX_EXTRA_BAND_PAD` entry
+below names `bse/bse_io.py` as the home of the hand-rolled
+`_pad_axis_to_multiple`; that ruling stands unchanged and its precondition now
+reads `bse_window`.
+
+Behaviour-preserving by construction: every function and class moved verbatim,
+only module headers are new, and the structural gates that had been pinned to
+`bse_io.py` by path follow the code rather than the filename.
+
 ## 2026-08-10 — The long-range channel criterion is an energy cutoff with a two-shell floor
 
 Asked and **ruled**, 2026-08-10. This settles the open decision the

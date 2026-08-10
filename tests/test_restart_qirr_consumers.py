@@ -51,7 +51,7 @@ import pytest
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SVC_TESTS = _ROOT / "services" / "symmetry_maps" / "tests"
 _STAR_TABLES = _SVC_TESTS / "data" / "star_tables_e9340d1.json"
-_BSE_IO = _ROOT / "src" / "bse" / "bse_io.py"
+_BSE_IO = _ROOT / "src" / "bse" / "bse_loading.py"
 _VQ_INTERP = _ROOT / "src" / "bse" / "vq_interp.py"
 _TAGGED_ARRAYS = _ROOT / "src" / "file_io" / "tagged_arrays.py"
 

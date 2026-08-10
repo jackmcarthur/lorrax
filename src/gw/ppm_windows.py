@@ -289,13 +289,17 @@ def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
         mode "gt_t"  ->  (T, +inf)      ->  (Ω > T)    & (Ω <= +inf)  == Ω > T
 
     so ONE data-driven predicate reproduces all three bit-for-bit, with no
-    static argument and therefore no extra compile.  Note this is the
-    MIRROR of ``greens_function_kernel.windowed_exp_iEt``'s ``[lo, hi)``:
-    the two sides of Σ assign a boundary pole in opposite directions, and
-    that assignment belongs to the window PLAN (which pole goes in which
-    certified-quadrature interval), not to kernel hygiene.  It is
-    preserved here exactly as found; reconciling the two conventions is a
-    question for whoever owns the quadrature rule, not a refactor.
+    static argument and therefore no extra compile.
+
+    This is now the convention on BOTH sides of Σ.  It used to be the mirror
+    of ``greens_function_kernel.windowed_exp_iEt``'s ``[lo, hi)``, so the A
+    and B sides assigned a pole sitting exactly on a threshold in opposite
+    directions.  That assignment belongs to the window PLAN — which pole goes
+    into which certified-quadrature interval — and the plan's owner decided
+    it downward: a pane must contain its own supremum, because every rule is
+    built at max(Γ) over its pane.  ``windowed_exp_iEt`` was flipped to match
+    this side (2026-08-10); the B side is unchanged, and
+    ``tests/test_windowed_exp_iEt.py`` gates the two against each other.
 
     Ω is finite and non-negative by construction (it is
     ``where(good, sqrt(ω²), fallback)`` out of the GN-PPM fit, with

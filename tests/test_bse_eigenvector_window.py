@@ -241,13 +241,16 @@ def test_the_loaders_agree_on_the_names_the_resolved_window_travels_under_p1():
     its window differently from the sharded loader is how the two routes come
     to disagree about what a given request means.
     """
-    tree = ast.parse((SRC / "bse_io.py").read_text())
+    tree = ast.parse((SRC / "bse_loading.py").read_text())
     wanted = {"n_val", "n_cond", "n_val_pad", "n_cond_pad"}
+    loaders = {"_load_ring_subset", "load_bse_data_from_restart_sharded"}
+    seen = set()
     for fn in ast.walk(tree):
         if not isinstance(fn, ast.FunctionDef):
             continue
-        if fn.name not in ("_load_ring_subset", "load_bse_data_from_restart_sharded"):
+        if fn.name not in loaders:
             continue
+        seen.add(fn.name)
         keys = set()
         for node in ast.walk(fn):
             if isinstance(node, ast.Dict):
@@ -255,3 +258,9 @@ def test_the_loaders_agree_on_the_names_the_resolved_window_travels_under_p1():
                          if isinstance(k, ast.Constant) and isinstance(k.value, str)}
         assert wanted <= keys, (
             f"{fn.name} does not publish {sorted(wanted - keys)} in its bundle")
+    # Both loaders must have BEEN THERE to be measured.  Without this the cell
+    # passes vacuously the day either one is renamed or moved to another file —
+    # which is exactly what the 2026-08-10 bse_io split would have done to it.
+    assert seen == loaders, (
+        f"only {sorted(seen)} found in bse/bse_loading.py; this cell measures "
+        f"nothing about {sorted(loaders - seen)} and has gone stale")

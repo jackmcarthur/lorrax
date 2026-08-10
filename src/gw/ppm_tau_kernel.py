@@ -440,8 +440,10 @@ def _get_sigma_tau_kernel(
         the scan (~148 MiB/rank at μ_pad = 24,960 / P = 64, live through
         the most memory-intensive stage of Σ).  See
         ``ppm_windows.window_mask_B_bounds`` for the ``(lo, hi]``
-        convention and why it is NOT the ``[lo, hi)`` one that
-        ``windowed_exp_iEt`` uses on the A side.
+        convention, which since 2026-08-10 is also the one
+        ``windowed_exp_iEt`` uses on the A side — both sides of Σ now
+        assign a boundary pole downward, into the pane whose supremum
+        it is.
 
         ``mask_B`` stays an array: it is the fit-VALIDITY selector
         (``|Ω| > 1e-14`` ∧ the GN-PPM ``good`` flag), which is a property

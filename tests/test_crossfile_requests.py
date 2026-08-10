@@ -9,7 +9,7 @@ RUNNABLE ON THE LOGIN NODE with plain ``python3`` — no jax, no h5py::
 
 Why source-level
 ----------------
-Every file these requests touch — ``gw/gw_jax.py``, ``bse/bse_io.py``,
+Every file these requests touch — ``gw/gw_jax.py``, ``bse/bse_loading.py``,
 ``file_io/_slab_io_ffi.py``, ``gw/isdf_fitting.py`` — imports jax at module
 scope, so importing them needs a compute node.  Parsing them does not.  The
 two requests that are *behavioural* rather than structural
@@ -344,7 +344,7 @@ def _audit_addressability_guard(src, name="<mod>"):
 def test_bse_io_refuses_a_mesh_with_no_addressable_device():
     """R2.  Hardening, not a live bug: these readers are called with the run's
     full 2-D mesh, so every rank is addressable today."""
-    assert _audit_addressability_guard(_read("bse/bse_io.py"), "bse_io") == []
+    assert _audit_addressability_guard(_read("bse/bse_loading.py"), "bse_loading") == []
 
 
 def test_auditor_addressability_guard_can_fail():
@@ -372,10 +372,10 @@ def test_auditor_addressability_guard_can_fail():
 
 
 def test_bse_io_guard_comes_from_the_service():
-    src = _read("bse/bse_io.py")
+    src = _read("bse/bse_loading.py")
     assert "_require_addressable" in _imported_from(src and _tree(src),
                                                     "common.collectives"), (
-        "bse_io must use collectives._require_addressable, not a private copy")
+        "bse_loading must use collectives._require_addressable, not a private copy")
 
 
 # ===========================================================================

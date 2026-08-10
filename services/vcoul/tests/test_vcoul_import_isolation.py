@@ -128,7 +128,12 @@ def test_the_whole_public_surface_answers_with_no_lorrax():
             "import os; os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
             "import numpy as np\n"
             "import vcoul as V\n"
-            "assert len(V.__all__) == 30, V.__all__\n"
+            # 33 = the 30 of the original door + wrap_points_to_voronoi,
+            # SysDim and the moment-tensor entry, each widened deliberately
+            # (2026-08-09/10 head-tensor and head-densify landings).  Bump
+            # this count IN THE SAME COMMIT as any door change — a stale
+            # pin here reads as an isolation break and is not one.
+            "assert len(V.__all__) == 33, V.__all__\n"
             "for _n in V.__all__:\n"
             "    assert hasattr(V, _n), _n\n"
             "class W:\n"

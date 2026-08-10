@@ -6,6 +6,13 @@ sections). The point is not the war stories — it is that these ten classes
 predicted or explained every one of the ~14 failures, so they are the checklist
 against which new code and new claims should be assessed.*
 
+> **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** A P=1-only
+> verification is never sufficient for landing; unit and CPU cells are exempt.
+> The owner's rationale, verbatim: *"use four gpus for 100% of all testing so
+> that never ever do we run something on one GPU and then learn it doesn't
+> generalize later"* — which is this page's §2 and §9 stated as an operating
+> rule rather than a lesson. See `AGENT_PREAMBLE.md` at the repository root.
+
 ## 1. The silent-symmetry class — bugs invisible to every invariant you check
 The nosym ψ*(−r) corruption (Q) preserved norms, overlaps, ⟨T⟩ and ⟨V_H⟩
 *exactly* — by symmetry — while destroying every τ-dependent term. Months of
