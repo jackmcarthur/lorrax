@@ -54,9 +54,25 @@ silent overwrite.
 6. **Two malformed KNOWN_FAILURES table rows** — 6 pipes where the header
    declares 4 columns; lines 168 and 1089 at `d25d8d6a`. Pre-existing.
    [final-batch report]
-7. **`tests/tools/` duplicate of `tools/profile_gw_xprof.py`** — orphan
-   copy (dead-proof recorded: zero importers, not collected); dedupe or
-   delete. [COMPLETENESS_AUDIT.md orphan inventory]
+7. ~~**`tests/tools/` duplicate of `tools/profile_gw_xprof.py`**~~ **FIXED**
+   by deleting the whole `tests/tools/` directory on
+   `chore/tools-dedupe-2026-08-10`. It held two files, not one, and both
+   were orphan copies of their `tools/` equivalents. The dead-proof was
+   re-run at `fc3ade69` and again at this branch's base `5eac02a5`, and
+   still holds both times: `git grep -n "tests/tools"` now
+   matches only this ledger row, `git grep -nE "from tests\.tools|import
+   tests\.tools"` returns nothing, and pointing pytest straight at the
+   directory under the census gate collects nothing, because neither file
+   carries a `test_` prefix and nothing overrides `python_files`.
+   `analyze_xprof_memory.py` was byte-identical to the canonical copy, and
+   the canonical `tools/profile_gw_xprof.py` is now a strict superset of
+   the orphan — the two comment lines recording the `gw_isdf` → `gw`
+   rename were added at `83981f0c`. That commit removed the one reason the
+   audit gave for not deleting blindly, which was that the orphan had
+   briefly been the more current of the two. Both surviving `tools/`
+   scripts compile, and `tools/profile_gw_xprof.py --help` prints its
+   usage. This closes punch-list item P15.
+   [COMPLETENESS_AUDIT.md orphan inventory, §P15]
 8. **Ambient `lorrax_sandbox` PYTHONPATH entry from the `lx` harness** —
    sits last on `sys.path`, shadows nothing today; the no-precede gate
    guards the dangerous direction; removal is an lx/modulefile change
