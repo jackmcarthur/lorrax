@@ -86,6 +86,7 @@ __all__ = [
     "sample_minibz_qpoints",
     "minibz_inscribed_sphere_r2",
     "minibz_average",
+    "minibz_moment_tensor",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
 ]
@@ -425,6 +426,107 @@ def minibz_average(
                 n_q = n_tot
             per_batch.append(float(np.mean(v[:n_q])))
     return float(np.mean(per_batch))
+
+
+def minibz_moment_tensor(
+    shift_cart, dq_batches, *,
+    kind: str,
+    celvol: float,
+    n_kpts: int,
+    q0sph2: float,
+    alpha: float | None = None,
+    zc: float | None = None,
+    analytic_sphere: bool = False,
+    adaptive: bool = True,
+    n_coarse: int = 250_000,
+) -> np.ndarray:
+    """Mini-BZ Voronoi CELL AVERAGE of ``v(q) q_a q_b`` — the (3,3) moment.
+
+    The second moment of the Coulomb kernel over the same cell, on the same
+    draws, in the same **bare** units as :func:`minibz_average` (no
+    ``1/celvol``; the caller applies its own volume convention).  ``q`` is
+    the FULL Cartesian momentum ``shift_cart + δq``, not the offset — the
+    tensor is the coefficient of a dipole bilinear at the cell's own
+    location, so it must carry the cell's absolute position.
+
+    WHY A TENSOR AND NOT A SCALAR.  The BSE exchange head at momentum Q is
+    ``v(q)·|q·d|²`` with ``d`` the transition dipole, and the cell average
+    of that is not ``⟨v⟩·|Q·d|²``.  Because ``d`` is a property of the
+    transition and not of the integration variable, the average factorises
+    exactly:
+
+        ⟨ v(q) |q·d|² ⟩_cell  =  conj(d_a) · M_ab · d_b ,
+        M_ab = ⟨ v(q) q_a q_b ⟩_cell ,
+
+    with no small-q expansion.  Replacing ``M_ab`` by ``⟨v⟩ q̂_a q̂_b |Q|²``
+    — which is what a scalar average amounts to — throws away every
+    direction in the cell but the one sampled point's, AND weights the
+    radius at the sample rather than by ``v``.  The two errors are
+    independent (one angular, one radial), so neither is fixable alone.
+    See ``LT_HEAD_PROBLEM.md`` §2.2 and §3.
+
+    THE TRACE IS A FREE, EXACT DIAGNOSTIC.  In 3D bulk ``v(q) q² = 8π``
+    identically, so
+
+        tr M = 8π   (bare)   =   8π/Ω   after the caller's 1/celvol,
+
+    for any cell shape and any shift.  On the plain-MC branch that holds
+    pointwise and only checks the algebra; on the Baldereschi
+    analytic-sphere branch it is a real test of the estimator, because the
+    analytic term has to supply exactly the trace the MC drops by skipping
+    the inscribed sphere.  Under the 2D slab truncation the same trace
+    becomes ``⟨8π·f2d⟩ → 8π z_c ⟨|q∥|⟩``, which vanishes LINEARLY with the
+    cell, and ``M_zz`` is identically zero for the ``q_z = 0`` slab — the
+    rank-two structure a scalar cannot represent.  No dimensional branch:
+    the geometry arrives entirely through ``kind`` and the draws.
+
+    ESTIMATOR.  Deliberately the same two BGW branches as
+    :func:`minibz_average`, sample for sample, so the tensor and the scalar
+    are the same average of different integrands and can be compared:
+
+    * ``|shift|² < TOL`` and ``analytic_sphere`` (3D only) — MC of
+      ``v·q_a q_b`` OUTSIDE the inscribed sphere divided by the FULL sample
+      count, plus the closed-form sphere term.  The scalar's
+      ``4·√q0sph2·celvol·N_k/π`` has an isotropic tensor twin,
+
+          ∫_{|q|<q0} (8π/q²) q_a q_b d³q / V_mBZ
+              = δ_ab · (4/9π) · q0³ · celvol · N_k ,
+
+      whose trace is exactly the sphere's share of ``8π``, which is why the
+      trace diagnostic closes on this branch.
+    * else — pure adaptive MC on the first ``n_q`` draws, ``n_q`` by the
+      same clamp.
+
+    Returns a real ``(3, 3)`` symmetric ``numpy`` array, meaned over the
+    replicate batches (the same free error bar as the scalar).
+    """
+    shift = np.asarray(shift_cart, dtype=np.float64)
+    len_shift2 = float(np.dot(shift, shift))
+    head_branch = (len_shift2 < 1e-12) and analytic_sphere
+    per_batch = []
+    for dq in dq_batches:
+        dq = np.asarray(dq, dtype=np.float64)
+        n_tot = dq.shape[0]
+        v, len2 = _minibz_kernel_bare(shift, dq, kind=kind,
+                                      alpha=alpha, zc=zc)
+        K = shift[None, :] + dq                       # (N, 3) full momentum
+        if head_branch:
+            w = np.where(len2 > q0sph2, v, 0.0)
+            M = (K * w[:, None]).T @ K / float(n_tot)
+            # Baldereschi tensor twin: isotropic, trace = the sphere's share
+            # of 8π, so tr M stays 8π across the split.
+            M = M + np.eye(3) * (4.0 / (9.0 * np.pi)) * q0sph2 ** 1.5 \
+                * float(celvol) * float(n_kpts)
+        else:
+            if adaptive and len_shift2 > 1e-12:
+                n_q = int(round(n_coarse * 4.0 * q0sph2 / len_shift2))
+                n_q = max(1, min(n_q, n_tot))
+            else:
+                n_q = n_tot
+            Kq = K[:n_q]
+            M = (Kq * v[:n_q, None]).T @ Kq / float(n_q)
+        per_batch.append(M)
+    return np.mean(np.stack(per_batch, axis=0), axis=0)
 
 
 def build_miniBZ_dq_cart(
