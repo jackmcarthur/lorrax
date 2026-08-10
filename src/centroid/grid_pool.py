@@ -38,11 +38,30 @@ WHAT IS DETERMINISTIC, STATED.
 
 The cost is the Gram, which is ``O(M^2)`` in the pool size, and the pool is now
 the grid rather than ``1.5 x N_mu`` points.  On the Si 4x4x4 24^3 deck that is
-M = 13824 instead of M = 1992 — about fifty times the Gram work, three or four
-minutes instead of ten seconds, and still cheaper than the five k-means draws
-plus five Sigma evaluations the lottery would otherwise cost.  The Gram build
-is column-blocked (see ``build_gram_q0_via_loadwfns``), which is what keeps the
-(nk, ns, ns, M, cols) pair tensors inside one device's budget.
+M = 13824 instead of M = 1992.  The Gram build is column-blocked (see
+``build_gram_q0_via_loadwfns``), which is what keeps the (nk, ns, ns, M, cols)
+pair tensors inside one device's budget.
+
+MEASURED, Si 4x4x4, 24^3, nband = 100, four A100s (2026-08-10; the harness of
+``BGW_CD_COMPARISON_DESIGN`` 7.7.11, whose own seed-57 row this tree reproduces
+to every printed digit as a control):
+
+    pool                13824 points in 374 orbits (sizes 2..48)
+    selection           35.3 s of recorded work, of which 27.2 s is the Gram
+                        and 1.6 s the select; 55 s of leg wall, ONCE
+    delivered           1394 points spanning 1282 independent directions (92 %)
+    the same, seeded    1572-1692 points spanning 1084-1246 (66-76 %),
+                        over the eighteen recorded draws at this N
+    Sigma_x vs BGW      mean |d| = 4.77 meV bare, 0.17 meV with 7.7.11's exact
+                        BerkeleyGW head, against a thirteen-draw seeded
+                        distribution of 7.79 / 16.31 / 51.10 meV (min /
+                        median / max) bare and a best-ever 3.13 meV with the
+                        head.  Two runs of this selector are byte-identical.
+
+The ceiling on this route is the Gram's own numerical rank, measured here at
+1474: no point set on this grid, chosen by any rule, spans more directions than
+that at this band window.  Asking for more points than that does not buy more
+of them — it buys the redundancy the seeded draws already carry.
 
 Pure NumPy on purpose: nothing here needs a device, so it can be tested without
 one.
