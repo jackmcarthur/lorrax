@@ -386,6 +386,237 @@ def test_unfold_psi_refuses_a_sym_table_that_is_not_twice_ntran():
 
 
 # ---------------------------------------------------------------------------
+# nspinor = 1 — the scalar (non-SOC) unfold, and the defect it replaced
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT, registered 2026-08-08 and fixed 2026-08-09.
+# ``spinor_rotation_for_sym_row`` returned a 2x2 UNCONDITIONALLY, while a
+# comment above its consumer's einsum claimed "for ns=1 U_eff is the 1x1
+# identity and this einsum is a no-op".  It was not: numpy and JAX both
+# BROADCAST a size-1 labelled einsum axis rather than raising, so a scalar
+# WFN came back 2-component holding ``(U[j,0]+U[j,1])·psi``.  The loud end
+# of it was a slab-write ``ValueError: could not broadcast (8,2,1457) into
+# (8,1,1457)`` in ``WfnLoader._eager_build``, with nothing in the message
+# about spinors.
+#
+# EVERY FIXTURE IN THIS TREE IS nspinor=2, so the deck suite structurally
+# cannot see this path.  These cells are the whole in-tree gate on it and
+# are therefore SYNTHETIC BY NECESSITY, not by preference — see the
+# fixed-at-unit-level row in ``tests/KNOWN_FAILURES.md`` for the QE
+# scalar-deck leg that is still owed.
+
+
+def _ns1_deck(rng):
+    """A 2-op synthetic deck with a scalar psi and every knob non-trivial.
+
+    Non-identity spatial rotation, a genuine SU(2) spinor matrix for it
+    (so a leaked spinor factor cannot hide behind an identity), non-zero
+    tau (so the phase is live), and a TRS-augmented table of length
+    ``2*n_tran`` so all four row kinds are reachable.
+    """
+    S1 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.int32)
+    sym_mats_k = np.stack([np.eye(3, dtype=np.int32), S1,
+                           -np.eye(3, dtype=np.int32), -S1])
+    U_sp = np.stack([np.eye(2, dtype=np.complex128), _su2(rng)])
+    translations = np.array([[0.0, 0.0, 0.0],
+                             [np.pi / 3, -np.pi / 5, np.pi / 7]])
+    g = np.array([[0, 0, 0], [1, 0, 0], [0, 2, -1], [-1, 1, 3]],
+                 dtype=np.int32)
+    cnk = (rng.standard_normal((3, 1, 4))
+           + 1j * rng.standard_normal((3, 1, 4))).astype(np.complex128)
+    return sym_mats_k, U_sp, translations, g, cnk
+
+
+def _ns1_reference(sym_mats_k, translations, g, cnk, sym_idx):
+    """Hand reference for the scalar rule — no spinor factor anywhere.
+
+    Spatial:  psi_full = exp(-i (S·G)·tau) · psi_kbar
+    TRS:      psi_full = exp(+i (S·G)·tau) · conj(psi_kbar)
+
+    Written out with ``np.exp`` rather than through ``tau_phase_row`` so
+    this is an independent statement and not a restatement of the code.
+    """
+    n_tran = len(sym_mats_k) // 2
+    is_trs = sym_idx >= n_tran
+    s_sp = sym_idx - n_tran if is_trs else sym_idx
+    S_spatial = np.asarray(sym_mats_k[s_sp], dtype=np.float64)
+    tau = translations[s_sp]
+    ph = np.exp(-1j * ((S_spatial @ g.T).T @ tau))              # (ngk,)
+    if is_trs:
+        return np.conj(cnk) * np.conj(ph)[None, None, :]
+    return cnk * ph[None, None, :]
+
+
+def test_the_scalar_spinor_factor_is_the_1x1_identity_on_every_row_kind():
+    """ns=1: one factor, it is 1, and it does not look at ``U_spinor``.
+
+    Both row kinds and both call spellings (scalar ``sym_idx`` for
+    ``unfold_psi``'s per-k path, array for ``WfnLoader``'s device table).
+    The independence from ``U_spinor_spatial`` is asserted rather than
+    assumed: those matrices are built from the CARTESIAN rotations and
+    exist whatever ``nspinor`` is, so a scalar deck still has a full
+    ``(ntran, 2, 2)`` table sitting there ready to be used by mistake.
+    """
+    rng = np.random.default_rng(11)
+    U = (rng.standard_normal((3, 2, 2)) + 1j * rng.standard_normal((3, 2, 2)))
+    one = np.array([[1.0 + 0.0j]])
+    for s in range(6):                       # 0..2 spatial, 3..5 TRS
+        got = spinor_rotation_for_sym_row(U, s, 3, nspinor=1)
+        assert got.shape == (1, 1), f"row {s} returned {got.shape}, not (1,1)"
+        np.testing.assert_array_equal(got, one)
+    batch = spinor_rotation_for_sym_row(U, np.arange(6), 3, nspinor=1)
+    assert batch.shape == (6, 1, 1)
+    np.testing.assert_array_equal(batch, np.ones((6, 1, 1), dtype=complex))
+
+    # Same answer from a completely different U — the factor is not a
+    # function of the spatial spinor table at all.
+    other = (rng.standard_normal((3, 2, 2))
+             + 1j * rng.standard_normal((3, 2, 2)))
+    np.testing.assert_array_equal(
+        spinor_rotation_for_sym_row(other, np.arange(6), 3, nspinor=1), batch)
+
+    # And the 2-spinor answer is unchanged by the parameter existing.
+    for s in range(6):
+        np.testing.assert_array_equal(
+            spinor_rotation_for_sym_row(U, s, 3, nspinor=2),
+            spinor_rotation_for_sym_row(U, s, 3))
+
+
+def test_spinless_time_reversal_squares_to_PLUS_one():
+    """The ns=1 TRS row is a DIFFERENT operator, not a truncated iso_y.
+
+    ``test_the_trs_spinor_factor_squares_to_minus_one`` above pins
+    Theta^2 = -1 for the 2-component rep (Kramers).  For a scalar field
+    Theta = K, so Theta^2 = +1 and there is no Kramers pair to protect.
+    Squaring is again the ANTIunitary composition ``M conj(M conj(v))``,
+    not ``M @ M``.  If someone ever "fixes" ns=1 by slicing the 2x2 down
+    to its [0,0] element, this cell is what says that is not the same
+    thing: iso_y's [0,0] is 0, not 1.
+    """
+    rng = np.random.default_rng(12)
+    U = np.stack([np.eye(2, dtype=np.complex128), _su2(rng)])
+    v = rng.standard_normal(1) + 1j * rng.standard_normal(1)
+    for s in (0, 1, 2, 3):
+        theta = spinor_rotation_for_sym_row(U, s, 2, nspinor=1)
+        np.testing.assert_allclose(
+            theta @ np.conj(theta @ np.conj(v)), v, atol=1e-15)
+    assert _I_SIGMA_Y[0, 0] == 0.0, (
+        "PRECONDITION: iso_y's [0,0] is 0 — truncating the 2x2 would "
+        "ANNIHILATE a scalar wavefunction on a TRS row, which is why the "
+        "ns=1 factor is built rather than sliced")
+
+
+@pytest.mark.parametrize("sym_idx", [0, 1, 2, 3])
+def test_unfold_psi_transforms_a_scalar_psi_with_no_spinor_factor(sym_idx):
+    """The fix, stated as the thing the loader actually needs.
+
+    A scalar psi through ``unfold_psi`` must come back scalar, equal to
+    the hand rule (phase, and conjugation on TRS rows) with NOTHING from
+    ``U_spinor``.  Row 1 carries both a non-identity SU(2) and a non-zero
+    tau; row 3 is that same op time-reversed.
+    """
+    rng = np.random.default_rng(13)
+    sym_mats_k, U_sp, translations, g, cnk = _ns1_deck(rng)
+    out = unfold_psi(cnk, sym_idx=sym_idx, g_kbar=g, sym_mats_k=sym_mats_k,
+                     translations=translations, U_spinor_spatial=U_sp)
+    assert out.shape == cnk.shape == (3, 1, 4), (
+        f"scalar psi came back {out.shape}; the spinor axis must survive "
+        f"the unfold at width 1")
+    np.testing.assert_allclose(
+        out, _ns1_reference(sym_mats_k, translations, g, cnk, sym_idx),
+        atol=1e-14, rtol=0.0)
+    # Norm is preserved per band — a scalar unfold is a phase (and maybe a
+    # conjugation), so it cannot move any |c|.
+    np.testing.assert_allclose(np.abs(out), np.abs(cnk), atol=1e-14)
+
+
+@pytest.mark.parametrize("sym_idx", [1, 3])
+def test_RED_TWIN_the_unconditional_2x2_silently_broadcasts_over_a_scalar_psi(
+        sym_idx):
+    """RED TWIN.  Reproduce the defect and show it is silent, then caught.
+
+    Three statements, in the order that makes the bug's shape clear:
+
+    1. numpy does NOT protect you.  The exact einsum the consumer runs,
+       handed a 2x2 and a size-1 spinor axis, returns without raising.
+    2. What it returns is wrong twice over: the spinor axis has WIDENED
+       to 2, and each output component is ``sum_k U[j,k]·psi[n,0,l]`` —
+       the two spinor columns summed — which is not the scalar answer by
+       a wide margin.  On row 3 (TRS) the summing is done by
+       ``iso_y·conj(U)``'s off-diagonals.
+    3. Post-fix that state is unreachable through ``unfold_psi`` (it asks
+       for the factor at the psi's own ns), so the guard is exercised by
+       putting the PRE-FIX helper back with a monkeypatch.  Without this
+       third part the guard would be untested code.
+    """
+    rng = np.random.default_rng(14)
+    sym_mats_k, U_sp, translations, g, cnk = _ns1_deck(rng)
+    n_tran = len(sym_mats_k) // 2
+    good = _ns1_reference(sym_mats_k, translations, g, cnk, sym_idx)
+
+    # --- 1 + 2: the raw contraction, exactly as the consumer spells it.
+    U_bad = spinor_rotation_for_sym_row(U_sp, sym_idx, n_tran)   # 2x2
+    assert U_bad.shape == (2, 2), (
+        "PRECONDITION: the un-told helper must still hand back a 2x2 — "
+        "that is the pre-fix behaviour this twin reproduces")
+    pre = np.conj(cnk) if sym_idx >= n_tran else cnk
+    S_full = np.asarray(sym_mats_k[sym_idx], dtype=np.float64)
+    s_sp = sym_idx % n_tran
+    pre = pre * np.exp(
+        -1j * ((S_full @ g.T).T @ translations[s_sp]))[None, None, :]
+    broadcast = np.einsum("jk,nkl->njl", U_bad, pre)     # does NOT raise
+    assert broadcast.shape == (3, 2, 4), (
+        f"the broadcast produced {broadcast.shape}; the whole point is "
+        f"that the spinor axis widens 1 -> 2 without a word")
+    np.testing.assert_allclose(
+        broadcast,
+        np.stack([(U_bad[j, 0] + U_bad[j, 1]) * pre[:, 0, :]
+                  for j in range(2)], axis=1), atol=1e-14)
+    assert not np.allclose(broadcast[:, :1, :], good, atol=1e-6), (
+        "the leading component of the broadcast happens to equal the "
+        "scalar answer — pick a deck where it does not, or this twin is "
+        "not red")
+
+    # --- 3: through the real entry point, with the pre-fix helper restored.
+    import symmetry_maps.maps as _maps
+
+    def _prefix_helper(U_spatial, idx, ntran, *, nspinor=2):
+        return spinor_rotation_for_sym_row(U_spatial, idx, ntran)  # always 2x2
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(_maps, "spinor_rotation_for_sym_row", _prefix_helper)
+        with pytest.raises(ValueError, match="BROADCAST"):
+            _maps.unfold_psi(cnk, sym_idx=sym_idx, g_kbar=g,
+                             sym_mats_k=sym_mats_k,
+                             translations=translations,
+                             U_spinor_spatial=U_sp)
+    finally:
+        mp.undo()
+
+    # Unpatched, the same call is correct — the monkeypatch was the defect,
+    # not the deck.
+    np.testing.assert_allclose(
+        unfold_psi(cnk, sym_idx=sym_idx, g_kbar=g, sym_mats_k=sym_mats_k,
+                   translations=translations, U_spinor_spatial=U_sp),
+        good, atol=1e-14)
+
+
+def test_the_helper_refuses_an_nspinor_it_has_no_representation_for():
+    """4-spinor never comes through here — say so rather than guess.
+
+    ``WfnLoader.load(bispinor=True)`` lifts 2 -> 4 components DOWNSTREAM
+    of the unfold, so an ``nspinor=4`` arriving here means a caller has
+    confused the two stages.  Silently returning the 2x2 would put a
+    4-component psi through the broadcast trap this whole section is about.
+    """
+    U = np.eye(2, dtype=np.complex128)[None]
+    for bad in (0, 3, 4):
+        with pytest.raises(ValueError, match="nspinor must be 1"):
+            spinor_rotation_for_sym_row(U, 0, 1, nspinor=bad)
+
+
+# ---------------------------------------------------------------------------
 # S6 — the centroid orbit-closure refusal, both halves, synthetically
 # ---------------------------------------------------------------------------
 

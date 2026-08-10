@@ -990,6 +990,143 @@ def test_the_gnppm_deck_loads_and_its_pad_slots_are_the_sentinel(gnppm_wfn):
                 f"k={kk}: gvecs pad rows are not the sentinel {sentinel}")
 
 
+# ---------------------------------------------------------------------------
+#  nspinor = 1 — the scalar WFN this loader could not read until 2026-08-09
+# ---------------------------------------------------------------------------
+
+def _scalar_wfn_from(spinor_path, dst):
+    """A genuine ``nspinor = 1`` WFN.h5, built in tmp from a spinor deck.
+
+    EVERY CHECKED-IN FIXTURE IS nspinor=2, which is exactly why the defect
+    below survived: the deck suite structurally cannot reach the scalar
+    path.  Rather than add a seventh fixture (the owner's QE scalar deck
+    is a separate, owed piece of work — see ``tests/KNOWN_FAILURES.md``),
+    this makes one for the duration of a single test: keep spinor
+    component 0, renormalize each (band, k) block to unit norm — slicing a
+    normalized 2-spinor otherwise leaves a sub-unit scalar that the
+    density invariant would rightly reject — and stamp ``nspinor = 1``.
+
+    What this file IS: a scalar WFN with a real symmetry table, real
+    G-lists, ragged ``ngk``, and TRS-augmented rows that the full-BZ
+    unfold actually uses.  That is all the loader path under test reads.
+    What it is NOT: a self-consistent DFT solution.  Half of an SOC
+    density does not respect the parent deck's σ_z mirror, so the
+    file-level density-symmetry check would (correctly) object to the
+    FILE; the cell disables it, because the subject here is the loader's
+    unfold and not the provenance of a fixture that lives for one test.
+    """
+    import shutil
+    shutil.copyfile(spinor_path, dst)
+    os.chmod(dst, 0o644)
+    with h5py.File(dst, "r+") as f:
+        ngk = f["mf_header/kpoints/ngk"][:]
+        starts = np.concatenate([[0], np.cumsum(ngk)])
+        c = f["wfns/coeffs"][:, :1, :, :]
+        z = c[..., 0] + 1j * c[..., 1]
+        for i in range(len(ngk)):
+            s, e = int(starts[i]), int(starts[i + 1])
+            n = np.linalg.norm(z[:, 0, s:e], axis=1, keepdims=True)
+            z[:, 0, s:e] /= np.where(n > 0.0, n, 1.0)
+        del f["wfns/coeffs"]
+        f.create_dataset("wfns/coeffs",
+                         data=np.stack([z.real, z.imag], axis=-1))
+        f["mf_header/kpoints/nspinor"][()] = 1
+    return dst
+
+
+def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(
+        gnppm_wfn, tmp_path, monkeypatch):
+    """The registered nspinor=1 defect, end to end, on a real HDF5 file.
+
+    UNTIL 2026-08-09 THIS RAISED.  ``symmetry_maps.unfold_psi`` asked for
+    a spinor rotation without saying how many components ψ had, got the
+    2x2 back unconditionally, and numpy's einsum BROADCAST the size-1
+    spinor axis instead of raising — so the unfold returned a
+    2-COMPONENT block and ``_eager_build``'s slab write died with
+
+        ValueError: could not broadcast input array from shape (8,2,1947)
+                    into shape (8,1,1947)
+
+    which says nothing about spinors and sent two readers to the slab
+    arithmetic.  (The registered report has 1457 where this deck has
+    1947; same defect, different ``ngk``.)
+
+    What is asserted is the scalar rule itself, not merely that nothing
+    raised.  ``gnppm`` has τ = 0 and uses sym rows {0, 2} with ntran = 2,
+    so row 2 is TIME REVERSAL — and for a scalar field time reversal is
+    Θ = K with no iσ_y.  The whole unfold therefore collapses to
+    "identity, or plain conjugation", exactly, with no tolerance:
+    ``unfold_psi`` returns on the IBZ G-axis, so the comparison is
+    element-for-element against the IBZ block it came from.
+    """
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")   # see _scalar_wfn_from
+    path = _scalar_wfn_from(gnppm_wfn, str(tmp_path / "WFN_ns1.h5"))
+
+    with WfnLoader(path, backend="eager") as loader:
+        assert int(loader.nspinor) == 1, "the fixture surgery did not take"
+        assert not np.any(np.abs(loader.translations) > 1e-12), (
+            "PRECONDITION: this deck must be symmorphic for the exact "
+            "comparison below (a live τ-phase would need a tolerance)")
+        sym = loader._ensure_sym()
+        n_tran = int(sym.sym_matrices.shape[0])
+        rows = sorted({int(s) for s in sym.sym_idx_k})
+        assert any(r >= n_tran for r in rows), (
+            f"PRECONDITION: no TRS row in {rows} with ntran={n_tran}, so "
+            f"the Θ = K half of the scalar rule would go untested")
+
+        full = np.asarray(loader.load(bands=(0, 8), k="full_bz"))
+        ibz = np.asarray(loader.load(bands=(0, 8), k="ibz"))
+
+        assert full.shape[2] == 1, (
+            f"the spinor axis came back at width {full.shape[2]}; a scalar "
+            f"ψ must stay scalar through the unfold — width 2 here IS the "
+            f"defect, and the slab write is only where it surfaces")
+        assert full.shape == (int(sym.nk_tot), 8, 1, int(loader.ngkmax))
+
+        for nk in range(full.shape[0]):
+            s = int(sym.sym_idx_k[nk])
+            src = ibz[int(sym.irr_idx_k[nk])]
+            expect = np.conj(src) if s >= n_tran else src
+            np.testing.assert_array_equal(
+                full[nk], expect,
+                err_msg=f"full-BZ k={nk} (sym row {s}, "
+                        f"{'TRS' if s >= n_tran else 'spatial'}) is not the "
+                        f"scalar rule applied to IBZ k={int(sym.irr_idx_k[nk])}")
+
+
+def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
+        gnppm_wfn, tmp_path, monkeypatch):
+    """The OTHER consumer — the phdf5 path — carries the same defect.
+
+    ``_ensure_phdf5_static`` builds one spinor matrix per full-BZ k and
+    the jitted unfold contracts it as ``einsum("kac,bckg->bakg", ...)``.
+    jax broadcasts a size-1 labelled axis exactly as numpy does, so a 2x2
+    table there is the same bug on the collective path — and that path has
+    no cheap slab-write to trip over it.  The table build is pure numpy
+    (its docstring says so: "Touches NO FFI"), so it is reachable at P=1
+    with a 1-device mesh and no ``.so``.
+    """
+    import jax
+    from jax.sharding import Mesh
+
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
+    path = _scalar_wfn_from(gnppm_wfn, str(tmp_path / "WFN_ns1_dev.h5"))
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+    with WfnLoader(path, backend="eager", mesh=mesh) as loader:
+        static = loader._ensure_phdf5_static()
+        U = np.asarray(static["U_per_full"])
+        assert U.shape[1:] == (1, 1), (
+            f"device spinor table is {U.shape[1:]} per k on an nspinor=1 "
+            f"file; the unfold kernel's einsum would broadcast it")
+        np.testing.assert_array_equal(U, np.ones_like(U))
+        # Non-vacuity: the same deck at nspinor=2 must give 2x2, or this
+        # cell would pass on a table that is 1x1 for the wrong reason.
+        with WfnLoader(gnppm_wfn, backend="eager", mesh=mesh) as spinor:
+            assert np.asarray(
+                spinor._ensure_phdf5_static()["U_per_full"]).shape[1:] == (2, 2)
+
+
 def test_the_loader_kept_no_second_copy_of_the_per_rank_band_clamp():
     """STRUCTURAL, and the only structural cell this service keeps.
 
