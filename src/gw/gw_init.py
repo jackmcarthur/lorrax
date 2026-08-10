@@ -1012,6 +1012,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
 			zeta_rcond=cfg.backend.zeta_rcond,
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
+			cct_col_chunk=int(chunks.get('cct_col_chunk', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
@@ -1771,6 +1772,7 @@ def prepare_isdf_and_wavefunctions(
 				'chunk_r': int(gflat_plan.r_chunk),
 				'q_chunk': int(gflat_plan.q_chunk),
 				'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
+				'cct_col_chunk': int(gflat_plan.cct_col_chunk),
 				'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
 				'memory_estimate': {
 					'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,

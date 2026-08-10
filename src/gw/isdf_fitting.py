@@ -26,6 +26,7 @@ from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_boo
 
 from isdf.core import (
     c_q_from_psi_sm,
+    c_q_from_psi_sm_colblocked,
     host_rss_gb as _host_rss_gb,
     factor_c_q,
     fit_one_rchunk,
@@ -169,6 +170,7 @@ def fit_zeta_to_h5(
     transverse_zeta_solve: str = "ridge",
     transverse_zeta_rcond: float = 1e-10,
     gflat_chunk_size: int = 0,
+    cct_col_chunk: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
 ):
@@ -401,18 +403,29 @@ def fit_zeta_to_h5(
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
         print(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
+        # ``cct_col_chunk`` comes from the planner (0 = unblocked, the
+        # byte-unchanged default).  It is the ONLY knob that reaches this
+        # allocation: ``chunk_r`` sizes the per-r-chunk fit downstream and
+        # has never been able to lower the (μ, ν) pair density built here,
+        # which is what set the "single-A100 centroid ceiling" measured in
+        # BGW_CD_COMPARISON_DESIGN 7.7.9.
+        if cct_col_chunk:
+            print(f"  Stage-B pair density column-blocked at "
+                  f"{cct_col_chunk} of {int(psi_l_rmu_Y_fit.shape[3])} "
+                  f"columns (planner budget); the fit is exact at any "
+                  f"block size.")
         if vertex_mu_L == 0:
-            C_q = c_q_from_psi_sm(
+            C_q = c_q_from_psi_sm_colblocked(
                 psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
                 psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
-                kgrid=kgrid, mesh_xy=mesh_xy)
+                kgrid=kgrid, mesh_xy=mesh_xy, col_chunk=cct_col_chunk)
         else:
             gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
-            C_q = c_q_from_psi_sm(
+            C_q = c_q_from_psi_sm_colblocked(
                 psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
                 psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
                 gamma_mu, gamma_mu,
-                kgrid=kgrid, mesh_xy=mesh_xy)
+                kgrid=kgrid, mesh_xy=mesh_xy, col_chunk=cct_col_chunk)
         C_q.block_until_ready()
         # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
         # pad rows/cols.
