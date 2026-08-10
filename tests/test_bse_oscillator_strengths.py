@@ -38,12 +38,22 @@ failed.  The probe ``A`` is not a physical eigenvector and does not
 pretend to be: it is a fixed complex contraction whose only job is to
 carry phase information into a real number.
 
-THE REFERENCE IS THE SHIPPED ARM.  Every number below was cut from the
-fixtures as they stand, which is to say from the ``p - dV_NL/dK`` arm
-that built them.  If the velocity sign flips, the fixtures are
-regenerated and THESE NUMBERS MUST MOVE -- that movement is the
-measurement, not a regression.  Re-cutting them is a deliberate act with
-the four fixture regenerations, never a fix for a red gate.
+THE REFERENCES ARE NOW TWO DIFFERENT ARMS, ON PURPOSE.  This file was
+first cut with all four fixtures on the legacy ``-1`` arm.  On
+2026-08-09 the default flipped and ``si_cohsex_debug`` and
+``hbn_cohsex_debug`` were regenerated, so their references are re-cut
+here on the ``+1`` arm and their ``dipole.h5`` carries
+``prov_vnl_velocity_sign = +1.0``.  ``gnppm_debug`` and ``cohsex_debug``
+were NOT regenerated -- their committed fixtures were cut at band counts
+no deck in the tree still requests, so nothing can reproduce them and
+inventing a deck to do it would be worse than leaving them -- and their
+references remain on the legacy arm.  **Read the arm off the file, never
+off this docstring**: every fixture's h5 stamps it.
+
+That split is not tidy and it is not hidden.  When the two blocked decks
+get a deck that reproduces them, their references move too, and the
+movement is the measurement.  Re-cutting any of these is a deliberate
+act paired with a fixture regeneration, never a fix for a red gate.
 """
 from __future__ import annotations
 
@@ -94,15 +104,16 @@ class _Ref:
 #: so a wrong window here fails loudly instead of quietly slicing a
 #: metallic block and dividing by a ~1e-14 energy denominator.
 REFS = {
+    # RE-CUT 2026-08-09 on the +1 arm, from cohsex_si_test.in (nband 60).
     "si_cohsex_debug": _Ref(
         n_occ=8, nk=64,
-        sum_f=(2.262665367089e+03, 2.248954715561e+03, 2.257512723595e+03),
-        max_f=2.586482092333e+01,
+        sum_f=(1.719138509280e+03, 1.710456094893e+03, 1.716160361438e+03),
+        max_f=1.945919115651e+01,
         de_bounds_Ry=(1.867165110504e-01, 6.277285155045e-01),
         proj=(
-            (-6.0249034443e-02+5.6924445472e-01j, +6.6336723520e-02-2.3078457363e+00j, -5.0554456824e-01-1.0441475874e+00j),
-            (+9.6850735373e-01+1.3621130388e+00j, -1.1799676537e+00-1.9655944525e-01j, +8.3873453589e-01-3.4944651489e-01j),
-            (-2.0035778998e-01+6.2799664087e-01j, +4.1730304739e-01-1.8188335912e+00j, -7.4087812249e-01+1.9006811621e+00j),
+            (-8.1473178843e-02+4.3506264072e-01j, +8.7061092818e-02-2.0531532932e+00j, -4.1556500792e-01-8.7522737751e-01j),
+            (+8.6222914864e-01+1.1507803035e+00j, -1.0235331983e+00-1.8972444434e-01j, +7.6654109083e-01-2.8389212268e-01j),
+            (-1.7982384365e-01+5.4482772538e-01j, +3.4816587983e-01-1.6309848830e+00j, -6.7688265308e-01+1.6589765858e+00j),
         ),
     ),
     "cohsex_debug": _Ref(
@@ -127,15 +138,16 @@ REFS = {
             (-2.0612052375e-01-1.1928367539e-01j, +6.6824594171e-02-2.3419304085e-01j, +2.4954075399e-03-2.7458830896e-01j),
         ),
     ),
+    # RE-CUT 2026-08-09 on the +1 arm, from cohsex_hbn_test.in.
     "hbn_cohsex_debug": _Ref(
         n_occ=16, nk=18,
-        sum_f=(8.988955164909e+01, 9.793769195724e+01, 2.283749959815e+01),
-        max_f=3.986165178707e+00,
+        sum_f=(8.619436160739e+01, 8.812618329195e+01, 1.672053024993e+01),
+        max_f=4.059144537110e+00,
         de_bounds_Ry=(3.426640012554e-01, 8.544664902677e-01),
         proj=(
-            (-2.5843204926e-02+1.4996789438e-01j, +1.1478100488e-02-3.5165647329e-01j, -1.6472918232e-01-3.4802897308e-01j),
-            (+1.2023603421e-01-3.8645716990e-01j, -9.7345639179e-01+2.7833036576e-01j, -4.7276480243e-02-2.2385712751e-01j),
-            (+1.1204535169e-01+5.9169233046e-01j, +4.9324141788e-01+6.3593101093e-01j, -1.4488692983e-01+2.6819317493e-01j),
+            (+5.1190317085e-02+2.2722378962e-01j, -1.2279832001e-02-4.0651096205e-01j, -1.4101370170e-01-2.9938006648e-01j),
+            (+1.9882890238e-01-3.9317769537e-01j, -1.0501860190e+00+1.6645496767e-01j, -4.4040177053e-02-1.8603892443e-01j),
+            (+1.7590866050e-01+5.7823628905e-01j, +3.6098486363e-01+5.8863601203e-01j, -1.2124171766e-01+2.2788542138e-01j),
         ),
     ),
 }
