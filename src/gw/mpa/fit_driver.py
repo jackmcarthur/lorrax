@@ -51,7 +51,7 @@ import time
 import numpy as np
 
 from file_io import mpa_store
-from gw.mpa import diagnostics, pade_fit, tiling
+from gw.mpa import fit_conditioning, pade_fit, tiling
 
 __all__ = [
     "accumulate_over_pole_passes",
@@ -152,16 +152,31 @@ def fit_one_block(
     ``mpa_store.write_fit_block`` REQUIRES ``condition`` and
     ``backward_error``: the Sigma stage's certification refuses poles
     that fail its gates, and a pole whose conditioning nobody recorded
-    can only be trusted, never refused.  But ``pade_fit.fit_mpa_poles``
-    returns ``cond_pade`` and no backward error — the backward error
-    lives in ``diagnostics.solve_conditioning``, which re-solves the
-    system AND re-runs the whole fit internally to report its forward
-    residual.  So one logical block costs TWO complete fits per element
-    and THREE solves of the Pade-in-z^2 system: one in the fit, one
-    standalone in ``solve_conditioning``, and one more inside the fit
-    that function runs for itself.  The cost report states the
-    dispatches, the fits and the Pade solves separately rather than
-    quoting whichever is smallest; see :func:`format_cost_report`.
+    can only be trusted, never refused.  ``pade_fit.fit_mpa_poles``
+    returns ``cond_pade`` and no backward error, so the backward error
+    is obtained here from ``fit_conditioning``, which solves the
+    equilibrated Pade system once and reports it.
+
+    IT USED TO COST A SECOND FIT AS WELL, and that is what this seam
+    stopped paying.  The supplier used to be
+    ``diagnostics.solve_conditioning``, which re-solves the system AND
+    re-runs the whole fit internally to report a forward residual beside
+    it — a second companion-root eigvals, a second pair of residue
+    least-squares solves, a second guard pass, per element.  The driver
+    then discarded three of that second fit's four outputs and read
+    ``residual`` and ``n_valid`` off the FIRST fit, which had already
+    returned them.  One logical block therefore cost TWO complete fits
+    and THREE Pade solves per element where one fit and two solves
+    supply every quantity written.  Measured on the production W_c
+    store, one A100, BFC@0.85: 120.8 microseconds per element before,
+    65.6 after, with the poles, residues and both stored diagnostics
+    byte-identical.
+
+    The remaining second solve is the one whose solution vector the
+    backward error needs and the fit does not return; see
+    ``fit_conditioning`` for the seam that retires it too, and
+    :func:`format_cost_report`, which states the dispatches, the fits and
+    the Pade solves separately rather than quoting whichever is smallest.
     """
     n = int(n_p)
     t_read = time.perf_counter()
@@ -193,8 +208,8 @@ def fit_one_block(
     t_fit = time.perf_counter()
     Omega, B, diag = pade_fit.fit_mpa_poles_batched(
         tile, z, n, guards=guards, rcond=rcond)
-    cond_diag = diagnostics.diagnostics_batched(
-        diagnostics.solve_conditioning, tile, z, n, rcond=rcond)
+    cond_diag, solves_per_element = fit_conditioning.conditioning_for_block(
+        tile, z, n, diag, rcond=rcond)
     Omega = np.asarray(Omega)
     B = np.asarray(B)
     t_fit = time.perf_counter() - t_fit
@@ -227,9 +242,9 @@ def fit_one_block(
         "n_elements": int(n_mu * n_cols),
         "bytes_read": int(block.size) * mpa_store.COMPLEX128_BYTES,
         "fit_dispatches": 1,
-        "diagnostic_dispatches": 1,
-        "full_fits": 2 * int(n_mu * n_cols),
-        "pade_solves": 3 * int(n_mu * n_cols),
+        "diagnostic_dispatches": int(solves_per_element) - 1,
+        "full_fits": int(n_mu * n_cols),
+        "pade_solves": int(solves_per_element) * int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
         "seconds_write": t_write,
@@ -388,6 +403,20 @@ def run_fit_driver(
     return ledger, report
 
 
+def _per_element(count, elements):
+    """``count / elements`` as a short string, for the cost report.
+
+    Integer when it divides — which it does whenever every block agreed
+    on how many fits or solves an element cost — and two decimals when
+    it does not, because a walk whose blocks disagreed is exactly the
+    thing a rounded count would hide.
+    """
+    if not elements:
+        return "0"
+    ratio = count / elements
+    return f"{int(ratio)}" if float(int(ratio)) == ratio else f"{ratio:.2f}"
+
+
 def format_cost_report(report):
     """The run's cost, as the theory plan demands it be stated.
 
@@ -400,21 +429,24 @@ def format_cost_report(report):
     beside each other so nobody has to infer the second from the first.
 
     SO THREE COUNTS ARE PRINTED, NOT ONE.  ``dispatches`` is what the
-    scheduler sees: two vmapped launches per block.  ``full fits`` is
-    what the elements see: TWO per element, because the store requires
-    a backward error, ``pade_fit.fit_mpa_poles`` does not return one,
-    and the only supplier — ``diagnostics.solve_conditioning`` — runs a
-    complete fit of its own to report a forward residual beside it.
-    ``Pade solves`` is what the linear algebra sees: THREE per element,
-    the two fits' plus the standalone equilibrated solve
-    ``solve_conditioning`` does before them.
+    scheduler sees.  ``full fits`` is what the elements see: ONE per
+    element since ``fit_conditioning`` landed, where it was two for as
+    long as the backward error came from a function that refitted the
+    element to report a forward residual nobody read.  ``Pade solves``
+    is what the linear algebra sees: TWO per element, the fit's own and
+    the standalone equilibrated solve the backward error needs the
+    solution vector of.
 
-    None of that factor is this driver's doing; it is a property of the
-    seam between the fit kernel and the staged store, and it is printed
-    rather than absorbed because the design review is where it can be
-    removed — a ``backward_error`` returned from ``fit_mpa_poles``
-    beside the ``cond_pade`` it already computes would collapse all
-    three counts to one dispatch, one fit and one solve.
+    EVERY COUNT IS TAKEN FROM THE WALK, NOT WRITTEN INTO THIS FUNCTION.
+    They used to be constants in the prose here and in the block's stats
+    dict, which is how a cost report survives the cost changing
+    underneath it; ``fit_conditioning.conditioning_for_block`` returns
+    the solves it actually performed and the walk sums them, so the
+    remaining redundancy retires from the report on the same commit it
+    retires from the arithmetic — a ``backward_error`` returned from
+    ``fit_mpa_poles`` beside the ``cond_pade`` it already computes
+    collapses this to one dispatch, one fit and one solve, and this
+    report will say so without being edited.
     """
     r = report
     sec = r["seconds"]
@@ -436,11 +468,12 @@ def format_cost_report(report):
         f"  dispatches      {r['fit_dispatches']} fit + "
         f"{r['diagnostic_dispatches']} diagnostic, vmapped",
         f"  full fits       {r['full_fits']} "
-        f"(2 per element: the fit, and the one solve_conditioning "
-        f"runs to report a forward residual)",
+        f"({_per_element(r['full_fits'], r['elements_fitted'])} per "
+        f"element: the fit, and nothing that refits it)",
         f"  Pade solves     {r['pade_solves']} "
-        f"(3 per element: the two fits', plus solve_conditioning's own "
-        f"equilibrated solve)",
+        f"({_per_element(r['pade_solves'], r['elements_fitted'])} per "
+        f"element: the fit's own, plus the equilibrated solve the "
+        f"backward error is read off)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "

@@ -48,7 +48,8 @@ from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
-from gw.mpa import fit_driver, pade_fit, sampling, tiling         # noqa: E402
+from gw.mpa import (diagnostics, fit_conditioning, fit_driver,   # noqa: E402
+                    pade_fit, sampling, tiling)
 
 #: The synthetic FFT grid the centroid set lives on.
 _FFT = np.array([12, 12, 12], dtype=np.int64)
@@ -583,14 +584,17 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
                                * MS.COMPLEX128_BYTES)
     assert r["bytes_budget_total"] == r["blocks_walked"] * r["tile_bytes"]
 
-    # One vmapped dispatch per block for the fit, one for the
-    # diagnostics — and behind them two complete fits and three Pade
-    # solves per element, because the store requires a backward error
-    # the fit kernel does not return.
+    # One vmapped dispatch per block for the fit and one for the
+    # backward error — and behind them ONE complete fit and TWO Pade
+    # solves per element: the fit's own, plus the equilibrated solve the
+    # backward error is read off, which the fit kernel does not return.
+    # It was two fits and three solves until ``fit_conditioning`` landed;
+    # the extra fit was recomputing three quantities the first fit had
+    # already returned, which the next cell but one demonstrates.
     assert r["fit_dispatches"] == r["blocks_walked"]
     assert r["diagnostic_dispatches"] == r["blocks_walked"]
-    assert r["full_fits"] == 2 * r["elements_fitted"]
-    assert r["pade_solves"] == 3 * r["elements_fitted"]
+    assert r["full_fits"] == r["elements_fitted"]
+    assert r["pade_solves"] == 2 * r["elements_fitted"]
 
     sec = r["seconds"]
     parts = sec["read"] + sec["fit"] + sec["write"] + sec["finalize"]
@@ -610,6 +614,174 @@ def test_cost_report_text_states_what_the_plan_demands(fitted, capsys):
     assert str(fitted["report"]["blocks_walked"]) in text
     with capsys.disabled():
         print(text)
+
+
+# ---------------------------------------------------------------------------
+# (d2) ONE FIT, NOT TWO — and the bytes are the same bytes
+#
+# The driver used to buy its backward error by refitting every element:
+# ``diagnostics.solve_conditioning`` runs a complete ``fit_mpa_poles`` of
+# its own to report a forward residual beside the backward error, and the
+# driver discarded that forward residual, its rel-RMS twin and its
+# ``n_valid``, reading all three off the FIRST fit instead.  These cells
+# hold the replacement to the only standard that matters for a stage
+# whose output another lane is already reading: the same bytes.
+# ---------------------------------------------------------------------------
+
+def _one_tile(planted, q=0):
+    """The first column block of one q, in the fit kernel's shape."""
+    plan = tiling.plan_column_walk(planted["n_mu"], 2 * planted["n_p"])
+    lo, hi = plan["blocks"][0]
+    block = MS.read_w_columns(
+        str(planted["w_path"]), _W_NAME, q, np.arange(lo, hi),
+        out_spec=tiling.row_shard_spec())
+    return fit_driver._elements_from_block(block)
+
+
+def _same_bytes(a, b):
+    a = np.asarray(a)
+    b = np.asarray(b)
+    return (a.dtype == b.dtype and a.shape == b.shape
+            and np.array_equal(a.view(np.uint8), b.view(np.uint8)))
+
+
+def test_the_lean_conditioning_is_byte_identical_to_the_shipped_one(
+        planted):
+    """Not close: identical.  It is the same expression tree.
+
+    ``fit_conditioning.solve_conditioning_only`` is
+    ``diagnostics.solve_conditioning`` with its ``fit_mpa_poles`` call
+    deleted and nothing else touched — same system, same equilibration,
+    same ``rcond``, same numerator and denominator in the same order.
+    Bit-equality is therefore a claim about the edit rather than about
+    floating point, and asserting anything weaker (a tolerance) would
+    pass just as well if the edit had changed the arithmetic.
+    """
+    tile = _one_tile(planted)
+    z, n_p = planted["z"], planted["n_p"]
+    shipped = diagnostics.diagnostics_batched(
+        diagnostics.solve_conditioning, tile, z, n_p)
+    lean = fit_conditioning.conditioning_batched(tile, z, n_p)
+    for key in ("cond", "backward_error", "sigma_max", "sigma_min"):
+        assert _same_bytes(lean[key], shipped[key]), key
+
+
+def test_the_discarded_second_fit_was_recomputing_the_first_ones_answers(
+        planted):
+    """The three outputs the driver dropped, shown to be duplicates.
+
+    This is the cell that justifies the deletion rather than merely
+    surviving it.  ``solve_conditioning``'s ``forward_residual``,
+    ``rel_rms_residual`` and ``n_valid`` come out of a second
+    ``fit_mpa_poles`` on the same samples at the same ``rcond``, so they
+    are byte-for-byte the ``max_abs_residual``, ``rel_rms_residual`` and
+    ``n_valid`` the FIRST fit already returned — which is exactly why
+    the driver could read them off the first fit and did.
+    """
+    tile = _one_tile(planted)
+    z, n_p = planted["z"], planted["n_p"]
+    _, _, diag = pade_fit.fit_mpa_poles_batched(tile, z, n_p)
+    shipped = diagnostics.diagnostics_batched(
+        diagnostics.solve_conditioning, tile, z, n_p)
+    assert _same_bytes(diag["max_abs_residual"], shipped["forward_residual"])
+    assert _same_bytes(diag["rel_rms_residual"], shipped["rel_rms_residual"])
+    assert _same_bytes(diag["n_valid"], shipped["n_valid"])
+    # And the condition number the store writes is the fit's own, so the
+    # seam in ``fit_conditioning`` may read either.
+    assert _same_bytes(diag["cond_pade"], shipped["cond"])
+
+
+def _two_fit_reference(planted):
+    """What the pre-restructure driver would have written, block by block.
+
+    The shipped composition, called directly: ``fit_mpa_poles_batched``
+    for the poles, residues, residual and ``n_valid``, and
+    ``diagnostics.solve_conditioning`` for the condition number and the
+    backward error.  Assembled into the store's own axes with the
+    driver's own ``_block_from_elements`` so the comparison is against
+    the store's layout and not against a rearrangement of it.
+    """
+    n_p, n_mu, n_q = planted["n_p"], planted["n_mu"], planted["n_q"]
+    z = np.asarray(planted["z"], dtype=np.complex128)
+    Om = np.zeros((n_p, n_q, n_mu, n_mu), dtype=np.complex128)
+    Bp = np.zeros_like(Om)
+    diag = {k: np.zeros((n_q, n_mu, n_mu), dtype=np.float64)
+            for k in ("condition", "backward_error", "residual", "n_valid")}
+    spec = tiling.row_shard_spec()
+    for q, lo, hi in tiling.fit_schedule(n_q, n_mu, 2 * n_p):
+        block = MS.read_w_columns(
+            str(planted["w_path"]), _W_NAME, q, np.arange(lo, hi),
+            out_spec=spec)
+        tile = fit_driver._elements_from_block(block)
+        O, B, d = pade_fit.fit_mpa_poles_batched(tile, z, n_p)
+        c = diagnostics.diagnostics_batched(
+            diagnostics.solve_conditioning, tile, z, n_p)
+        n_cols = hi - lo
+        Om[:, q, :, lo:hi] = fit_driver._block_from_elements(
+            np.asarray(O), n_mu, n_cols)
+        Bp[:, q, :, lo:hi] = fit_driver._block_from_elements(
+            np.asarray(B), n_mu, n_cols)
+        for key, arr in (("condition", c["cond"]),
+                         ("backward_error", c["backward_error"]),
+                         ("residual", d["max_abs_residual"]),
+                         ("n_valid", d["n_valid"])):
+            diag[key][q, :, lo:hi] = np.asarray(
+                arr, dtype=np.float64).reshape(n_mu, n_cols)
+    return Om, Bp, diag
+
+
+def test_the_store_holds_exactly_what_the_two_fit_path_would_have_written(
+        planted, fitted):
+    """THE GATE.  Every byte of the finalized store, against the old path.
+
+    The wedge lane reads this store, so the restructure's obligation is
+    not "the fit is still good" but "the file is the same file".  Poles,
+    residues and all four stored diagnostics are compared as BYTES —
+    ``np.array_equal`` on the uint8 view — over the whole (n_p, n_q,
+    N_mu, N_mu) tensor, against a reference computed here by the
+    composition the driver used before this branch.
+    """
+    Om_ref, B_ref, diag_ref = _two_fit_reference(planted)
+    Om, B, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
+
+    assert _same_bytes(Om, Om_ref), "Omega_p is not byte-identical"
+    assert _same_bytes(B, B_ref), "B_p is not byte-identical"
+    for key in ("condition", "backward_error", "residual", "n_valid"):
+        assert _same_bytes(diag[key], diag_ref[key]), key
+
+
+def test_a_fit_that_reports_its_own_backward_error_is_not_solved_again(
+        planted):
+    """The seam, exercised from both sides.
+
+    ``fit_conditioning.conditioning_for_block`` asks the fit's own
+    diagnostics whether they carry a backward error.  Today's
+    ``pade_fit`` does not, so the block pays two Pade solves and the
+    count says two.  Handed a diagnostics pytree that DOES carry one —
+    which is what the proposed three-line ``pade_fit`` change makes it
+    carry — the same function returns that value untouched and reports
+    one solve, so the cost report tells the truth on the commit that
+    changes the cost rather than on a later one.
+    """
+    tile = _one_tile(planted)
+    z, n_p = planted["z"], planted["n_p"]
+    _, _, diag = pade_fit.fit_mpa_poles_batched(tile, z, n_p)
+
+    lean, n_solves = fit_conditioning.conditioning_for_block(
+        tile, z, n_p, diag)
+    assert n_solves == 2
+    shipped = diagnostics.diagnostics_batched(
+        diagnostics.solve_conditioning, tile, z, n_p)
+    assert _same_bytes(lean["cond"], shipped["cond"])
+    assert _same_bytes(lean["backward_error"], shipped["backward_error"])
+
+    enriched = dict(diag)
+    enriched["backward_error"] = shipped["backward_error"]
+    taken, n_solves = fit_conditioning.conditioning_for_block(
+        tile, z, n_p, enriched)
+    assert n_solves == 1
+    assert _same_bytes(taken["backward_error"], shipped["backward_error"])
+    assert _same_bytes(taken["cond"], shipped["cond"])
 
 
 # ---------------------------------------------------------------------------
