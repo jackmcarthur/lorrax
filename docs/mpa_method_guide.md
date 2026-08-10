@@ -626,11 +626,38 @@ twins next door could not catch it: they score each quadrature against the
 analytic object it reproduces, with no prefactor in the expression at all. The
 new gate is **relative** — one window's sign against the other three.
 
-Also: `refuse_wedge_pole_slab` refuses a symmetry-wedge pole store **by name**.
-Unfolding a pole field is not the same operation as unfolding `W` — residues
-transform as `W` does while pole *positions* only permute, and what time reversal
-does to a pole in the closed fourth quadrant is precisely the question this tree
-has got wrong four times in other guises.
+**The wedge pole unfold** (2026-08-10), which is the third seam and the one that
+retired a refusal. A fit store written on the symmetry wedge carries eight q
+where the Σ kernel's k−q sums want sixty-four, and `refuse_wedge_pole_slab` used
+to turn such a store away: unfolding a pole field is not the operation that
+unfolds `W`, the residues were thought to carry a conjugation on the
+time-reversed star members, and a fourth-quadrant pole conjugated the wrong way
+becomes `exp(+Γτ)`, which grows. The named retirement gate — rebuild
+`W_c(q, z_j)` from the unfolded poles at the store's own `2n_p` samples and
+compare against the same store's `W` — has now been run, and it retired the
+refusal by dissolving its premise rather than by clearing it. **There is no
+conjugation.** Time reversal acts on a `(μ, ν)` operator as the *pair transpose*
+at the same frequency, `O(−q, z)_{μν} = O(q, z)_{νμ}`; the elementwise conjugate
+`unfold_isdf_operator` applied is that swap's Hermitian shorthand, exact for
+every static object the map had been certified on and wrong by O(1) for a `W_c`
+slab at a complex sample — measured non-Hermiticity 0.58 to 1.69 on the
+production store against 5.9e-13 at `ω = 0`. This is the same defect class as the
+crossing operator-Im fix two paragraphs up, and the same answer. Under the
+corrected rule the unfold multiplies each element by a *frequency-independent*
+scalar, so `Ω_p` carries the permutation alone, `B_p` carries the permutation and
+the phase, and nothing is conjugated: `Im Ω_p < 0` survives by construction and
+`exp(+Γτ)` is unreachable. The gate reads, at production scale on Si 4³, a
+rebuild residual from the unfolded wedge poles that does not exceed the one the
+full-BZ refit sets on the same bytes, and the eight IBZ parent rows come back
+bit-identical. What is left to refuse is narrower and is about identity rather
+than about the unfold — `resolve_pole_q_axis` turns away a store whose zone is
+not this run's zone, because no map can say which q an unlabelled row is. One
+caveat worth carrying: **silicon folds its zone with zero time-reversed rows**
+(the 48 spatial operations of a centrosymmetric crystal already close it), so the
+production arm certifies the spatial half only; the pair-transpose half is
+certified on a synthetic time-reversal-active deck in
+`tests/test_mpa_pole_unfold.py`, where four crossed conventions each fail the gate
+by O(1) and the two conjugation twins fail on disjoint sets of q.
 
 ---
 

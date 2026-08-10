@@ -12,7 +12,8 @@ THE SHAPE OF THE LOOP, AND WHY IT IS THIS SHAPE
 ``THEORY_mpa_implementation`` section 7.5 fixes it::
 
     for p in fit_driver.pole_pass_order(n_p):          # ascending, pinned
-        Omega_p, B_p = mpa_store.read_pole_slice(fit, p)
+        Omega_p, B_p = mpa_store.read_pole_slice(       # wedge -> full BZ
+            fit, p, unfold=unfold_q, mesh_xy=mesh_xy)
         for branch in the four (A-space x omega-half) branches:
             for group in the branch's window groups:
                 integrate the group's tau nodes into the branch tiles
