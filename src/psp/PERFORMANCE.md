@@ -1,4 +1,14 @@
-# `psp.run_sternheimer` performance — current state & next targets
+# `psp.run_sternheimer` performance — a 2026-04-25 measurement record
+
+> **Every number below is historical; the methodology is not (banner added
+> 2026-08-09).** Like its companion `src/gw/PERFORMANCE.md`, this was measured
+> on 2026-04-25, before the services layer existed, and
+> `PROFILING_TOOLS.md` §12 in the BSE-perf campaign directory flags both files
+> as pre-services and their figures as historical. The profiling commands
+> below call `scripts/profiling/analyze_compile_log.py`, which no longer
+> exists — that directory now holds only `aot_cufft_sanity.py` — and the run
+> directory the reference workload names is gone with the rest of the `runs/`
+> tree. Read the method, not the milliseconds.
 
 Last updated: 2026-04-25 (agent-B/sternheimer-solver).
 

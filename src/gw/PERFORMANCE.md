@@ -1,4 +1,23 @@
-# `gw.gw_jax` performance — current state, profiling notes & next targets
+# `gw.gw_jax` performance — a 2026-04-25 measurement record
+
+> **Every number below is historical; the methodology is not (banner added
+> 2026-08-09).** This document was last measured on 2026-04-25, before the
+> services layer existed, so the timings, the compile counts and the
+> next-target backlog all describe a tree that has since been restructured —
+> `PROFILING_TOOLS.md` §12 in the BSE-perf campaign directory reaches the same
+> verdict and is the reason this banner exists. Read the *approach* here (find
+> the eager-pjit sites, jit-wrap the small helpers, re-measure the cache-miss
+> count) and take none of the figures as a current baseline.
+>
+> The tooling this document invokes is also gone. `scripts/profiling/` now
+> holds a single file, `aot_cufft_sanity.py`; the `pf.py`,
+> `analyze_compile_log.py` and `run_profiled.py` scripts the commands below
+> call no longer exist in the tree or in the sandbox path they are spelled
+> with. The run directories (`runs/Si/…`) are gone too — there is no `runs/`
+> tree — and the `lorrax_B` / `lorrax_X` modulefiles have been replaced by the
+> single `lorrax` module under `config/modulefiles/`. The commands are kept
+> as written because they record what was actually run; they will not execute
+> as-is.
 
 Last updated: 2026-04-25 (agent-B/sternheimer-solver).
 Companion to `src/psp/PERFORMANCE.md` (sister doc on the Sternheimer
@@ -162,5 +181,9 @@ jit-wrap pattern of fixes since they don't change op order).
 ## Cross-references
 
   - `src/psp/PERFORMANCE.md` — Sternheimer side, parallel arc
-  - `runs/Si/B_compile_floor_check/` — profile runs + summaries
-  - `scripts/profiling/{pf.py, analyze_compile_log.py, run_profiled.py}` — the canonical tooling
+  - `runs/Si/B_compile_floor_check/` — where the profile runs and summaries
+    lived. The `runs/` tree no longer exists; this is a provenance note.
+  - `scripts/profiling/{pf.py, analyze_compile_log.py, run_profiled.py}` — the
+    tooling these measurements were taken with. None of the three survives;
+    `scripts/profiling/` now holds only `aot_cufft_sanity.py`. For profiling
+    today, start from `PROFILING_TOOLS.md` in the BSE-perf campaign directory.
