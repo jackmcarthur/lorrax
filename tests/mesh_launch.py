@@ -17,9 +17,10 @@ THE FOUR-GPU RULE AND THIS MODULE
 ``AGENT_PREAMBLE.md``: every GPU verification leg runs at P=4, and emulated
 CPU meshes are fine for device-count LOGIC but never substitute for the P=4
 leg on a real GPU path.  This module implements both halves and keeps them
-apart by NAME, never by accident: :data:`SRUN` is the GPU leg, :data:`LOCAL`
-is four local CPU processes, and every result carries which one it was so a
-report cannot quote a CPU leg as the GPU one.
+apart by NAME, never by accident: :data:`LOCAL_GPU` and :data:`SRUN` are
+real four-device legs, :data:`LOCAL` is four local CPU processes, and every
+result carries which one it was so a report cannot quote a CPU leg as the
+GPU one.
 
 THE DECISION, AND WHY IT IS A PURE FUNCTION
 -------------------------------------------
@@ -54,6 +55,18 @@ SRUN = "srun"
 #: GPU path (AGENT_PREAMBLE, the four-GPU rule's unit/CPU clause).
 LOCAL = "local-cpu"
 
+#: Four local processes, ONE REAL GPU EACH, on a whole node.
+#:
+#: THIS IS THE LANDING-EVIDENCE MODE, and it exists because the obvious
+#: route does not work here: a whole-node step is already an ``srun`` step,
+#: so a cell inside it cannot spawn a nested one, and running pytest on a
+#: login node instead loses the container the drivers need.  Four processes
+#: pinned to four devices of the node the step already holds is the same
+#: measurement with none of that: real devices, real NCCL, real
+#: one-GPU-per-process, ``jax.process_count() == 4``.  Launch it with
+#: ``lx run -N 1 -G 4 -n 1 -- pytest tests/test_jax_cache_contract.py``.
+LOCAL_GPU = "local-gpu"
+
 #: No four-process launch is available here.
 NONE = "none"
 
@@ -62,40 +75,71 @@ NONE = "none"
 NPROC = 4
 
 
-def choose_mode(env: dict, which=shutil.which) -> tuple[str, str]:
-    """``(mode, why)`` for the environment ``env``.  Pure.
+def visible_gpus(env: dict, probe=None) -> list:
+    """The GPU ordinals this process may use, in order.
 
-    ``LX_MESH4_MODE`` forces the answer (``srun`` / ``local-cpu`` / ``none``)
-    so a leg can pin what it measured instead of inheriting it.
+    ``CUDA_VISIBLE_DEVICES`` first — inside a Slurm step it is authoritative
+    and ``nvidia-smi`` is not (it enumerates the node, not the cgroup).
+    """
+    preset = env.get("CUDA_VISIBLE_DEVICES")
+    if preset is not None:
+        return [d for d in preset.split(",") if d.strip() != ""]
+    if probe is None:
+        probe = _probe_nvidia_smi
+    return [str(i) for i in range(probe())]
 
-    ORDER MATTERS AND IS NOT A PREFERENCE.  ``srun`` wins whenever it is
-    usable, because a machine that can run the real thing must not quietly
-    hand back the emulation — that substitution is the exact shape the
-    four-GPU rule exists to refuse, and it would be invisible in a green
-    report.
+
+def _probe_nvidia_smi() -> int:
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=10).stdout
+        return len(out.strip().splitlines()) if out.strip() else 0
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
+def choose_mode(env: dict, which=shutil.which, probe=None) -> tuple[str, str]:
+    """``(mode, why)`` for the environment ``env``.  Pure given its probes.
+
+    ``LX_MESH4_MODE`` forces the answer so a leg can PIN what it measured
+    instead of inheriting it — the mode is quoted in every failure message
+    for the same reason.
+
+    ORDER MATTERS AND IS NOT A PREFERENCE.  A real four-device leg wins
+    whenever one is available, because a machine that can run the real thing
+    must never quietly hand back the emulation.  That substitution is the
+    exact shape the four-GPU rule exists to refuse and it would be invisible
+    in a green report.
     """
     forced = (env.get("LX_MESH4_MODE") or "").strip()
     if forced:
-        if forced not in (SRUN, LOCAL, NONE):
+        if forced not in (SRUN, LOCAL, LOCAL_GPU, NONE):
             raise ValueError(
                 f"LX_MESH4_MODE={forced!r} is not one of "
-                f"{[SRUN, LOCAL, NONE]}")
+                f"{[SRUN, LOCAL, LOCAL_GPU, NONE]}")
         return forced, f"LX_MESH4_MODE={forced}"
+
+    gpus = visible_gpus(env, probe)
+    if len(gpus) >= NPROC:
+        return LOCAL_GPU, (
+            f"{len(gpus)} GPUs visible ({','.join(gpus[:NPROC])}) — "
+            f"{NPROC} processes, one real device each")
 
     job = (env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID") or "").strip()
     if job and which("srun"):
         # Inside a STEP already (SLURM_STEP_ID set by srun itself) a nested
-        # srun is the launcher's `LX-NESTED` refusal, not a launch.  Say so
-        # here rather than discovering it as exit 92 four decks in.
+        # srun is the launcher's `LX-NESTED` refusal, not a launch.  Only
+        # reachable with FEWER than four GPUs visible, since a whole-node
+        # step took the branch above.
         if (env.get("SLURM_STEP_ID") or "").strip():
             return NONE, (
-                "already inside an srun STEP (SLURM_STEP_ID is set) — a "
-                "nested srun refuses (LX-NESTED); launch this leg as its "
-                "own step, e.g. `lx run -N 1 -G 4 -n 1 -- pytest ...`, so "
-                "the cell is the one that spawns the four ranks")
+                f"inside an srun STEP with only {len(gpus)} GPU(s) visible: "
+                f"a nested srun refuses (LX-NESTED) and there are not "
+                f"{NPROC} devices here.  Take the whole node — "
+                f"`lx run -N 1 -G 4 -n 1 -- pytest ...`")
         return SRUN, f"SLURM_JOB_ID={job} and srun is on PATH"
     if job:
-        return NONE, (f"SLURM_JOB_ID={job} but no srun on PATH")
+        return NONE, f"SLURM_JOB_ID={job} but no srun on PATH"
     return LOCAL, "no Slurm allocation — four local processes on the CPU backend"
 
 
@@ -167,16 +211,25 @@ def run_mesh4(argv, *, cwd, env=None, timeout=1800, mode=None,
                            stdout=proc.stdout, stderr=proc.stderr,
                            wall_s=time.monotonic() - t0)
 
-    if mode == LOCAL:
+    if mode in (LOCAL, LOCAL_GPU):
         port = _free_port()
+        gpus = visible_gpus(base) if mode == LOCAL_GPU else []
         procs, outs = [], []
         for i in range(NPROC):
             renv = dict(base)
             renv["JAX_PROCESS_COUNT"] = str(NPROC)
             renv["JAX_PROCESS_INDEX"] = str(i)
             renv["JAX_COORDINATOR_ADDRESS"] = f"127.0.0.1:{port}"
-            renv["JAX_PLATFORMS"] = "cpu"
-            renv["JAX_PLATFORM_NAME"] = "cpu"
+            if mode == LOCAL_GPU:
+                # ONE DEVICE PER PROCESS -- the production launch shape, and
+                # what makes this a P=4 GPU leg rather than a four-device
+                # single process.
+                renv["CUDA_VISIBLE_DEVICES"] = gpus[i]
+                renv.pop("JAX_PLATFORMS", None)
+                renv.pop("JAX_PLATFORM_NAME", None)
+            else:
+                renv["JAX_PLATFORMS"] = "cpu"
+                renv["JAX_PLATFORM_NAME"] = "cpu"
             renv.setdefault("JAX_ENABLE_X64", "1")
             renv.setdefault("PYTHONUNBUFFERED", "1")
             procs.append(subprocess.Popen(

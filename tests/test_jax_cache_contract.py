@@ -298,23 +298,48 @@ def test_every_contract_deck_exists_on_disk():
 
 
 def test_the_launch_decision_is_falsifiable():
-    """``choose_mode`` is a pure function and these are its three answers."""
-    which_yes = lambda _n: "/usr/bin/srun"      # noqa: E731
-    which_no = lambda _n: None                  # noqa: E731
-    assert mesh_launch.choose_mode({"SLURM_JOB_ID": "1"}, which_yes)[0] \
-        == mesh_launch.SRUN
-    assert mesh_launch.choose_mode({}, which_no)[0] == mesh_launch.LOCAL
-    assert mesh_launch.choose_mode({"SLURM_JOB_ID": "1"}, which_no)[0] \
-        == mesh_launch.NONE
-    # Inside a STEP already: a nested srun refuses (LX-NESTED), and saying
-    # so here is cheaper than discovering it as exit 92 four decks in.
-    nested = mesh_launch.choose_mode(
-        {"SLURM_JOB_ID": "1", "SLURM_STEP_ID": "0"}, which_yes)
-    assert nested[0] == mesh_launch.NONE and "NESTED" in nested[1]
-    # srun WINS when it is available: the emulation must never quietly
-    # stand in for the real thing.
-    assert mesh_launch.choose_mode(
-        {"SLURM_JOB_ID": "7"}, which_yes)[0] == mesh_launch.SRUN
+    """``choose_mode`` is pure given its probes, and these are its answers."""
+    yes = lambda _n: "/usr/bin/srun"            # noqa: E731
+    no = lambda _n: None                        # noqa: E731
+    none = lambda: 0                            # noqa: E731
+    M = mesh_launch
+
+    # FOUR REAL DEVICES WIN, always: that is the landing-evidence leg.
+    assert M.choose_mode({"CUDA_VISIBLE_DEVICES": "0,1,2,3"}, no, none)[0] \
+        == M.LOCAL_GPU
+    # ...even inside a step, which is exactly where a whole-node leg runs.
+    assert M.choose_mode(
+        {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "SLURM_JOB_ID": "1",
+         "SLURM_STEP_ID": "0"}, yes, none)[0] == M.LOCAL_GPU
+    # An allocation, on a login node, with no devices here: srun.
+    assert M.choose_mode({"SLURM_JOB_ID": "1"}, yes, none)[0] == M.SRUN
+    # Nothing at all: the CPU emulation, which is never landing evidence.
+    assert M.choose_mode({}, no, none)[0] == M.LOCAL
+    # An allocation but no launcher, and no devices: refuse, do not emulate.
+    assert M.choose_mode({"SLURM_JOB_ID": "1"}, no, none)[0] == M.NONE
+    # Inside a step with too few devices: a nested srun refuses (LX-NESTED),
+    # and saying so is cheaper than discovering it as exit 92 four decks in.
+    nested = M.choose_mode(
+        {"SLURM_JOB_ID": "1", "SLURM_STEP_ID": "0",
+         "CUDA_VISIBLE_DEVICES": "0"}, yes, none)
+    assert nested[0] == M.NONE and "LX-NESTED" in nested[1]
+    # THE SUBSTITUTION THE FOUR-GPU RULE REFUSES: a CPU emulation must never
+    # be handed back where four devices exist.
+    assert M.choose_mode({"CUDA_VISIBLE_DEVICES": "0,1,2,3"}, yes, none)[0] \
+        != M.LOCAL
+
+
+def test_the_gpu_leg_gives_each_process_exactly_one_device():
+    """One GPU per process is the production launch shape.
+
+    Four devices in ONE process is the arrangement this whole contract
+    cannot see (``jax.process_count()`` is 1 there), so the split has to be
+    checked, not assumed.
+    """
+    gpus = mesh_launch.visible_gpus({"CUDA_VISIBLE_DEVICES": "2,3,5,7"})
+    assert gpus == ["2", "3", "5", "7"]
+    assert mesh_launch.visible_gpus({"CUDA_VISIBLE_DEVICES": ""}) == []
+    assert mesh_launch.visible_gpus({}, lambda: 4) == ["0", "1", "2", "3"]
 
 
 def test_the_verdict_function_fails_a_missing_rank():
