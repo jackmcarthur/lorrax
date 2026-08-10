@@ -262,17 +262,36 @@ mean field and the DFT eigenvalues are untouched, so both movements are in Σ,
 which is where a dipole/head change has to land and where a corrupted input
 would not.
 
-**Row A is an owner row, not a finding this lane closed.**  75 meV MAE of
-sigTOT moved on this deck between 2026-08-07 and `9a730da8` with the dipole
-held fixed, and nobody re-cut the reference for it — so the freeze gate was
-already red before the sign flip made it redder.  This deck is the tree's only
-end-to-end run of the native q→0 head ladder, so an already-landed head fix
-(the `minibz` head rows of 2026-08-09 are the obvious candidates) would show
-up here and nowhere else, which would make row A correct behaviour that simply
-outran its reference.  **That is a hypothesis; it was not bisected.**  This
-re-freeze pins row A along with row B, and whoever wants row A attributed
-should bisect `a31ec236…9a730da8` against this deck rather than trust the
-guess above.
+**Row A is attributed, and it is one commit** (walked 2026-08-09, evidence at
+`/pscratch/sd/j/jackm/hbn_attrib_0809/`).  All 75.178 meV of it landed at
+`cb704fbd`, the `feat/vcoul-minibz-head-2026-08-08` merge that moved the
+mini-BZ Coulomb head from the slot labelled Miller `(0,0,0)` to the
+argmin|q+G| slots with tied slots sharing their mean.  Walking `main` from
+`0fe41a76` to `9a730da8^` with every deck input held byte-fixed at the
+freeze-era set, the legacy `-1` dipole included, this deck prints the
+superseded reference *exactly* through `cb704fbd^` (`724e5bcb`) and is
+byte-identical to `9a730da8^` from `cb704fbd` onward at six checkpoints spread
+over the remaining 101 commits — so the head-channel trio (`aae8f136`,
+`1f073e82`, `7ac49f5e`), the 2026-08-09 `minibz`/`bse_k_grid` head rows the
+old guess named, the `wq_resolvent` conjugation fix, `kirr-fullids` and the
+k-star completion each move nothing here, and the unexplained residual is
+0.000 meV rather than merely a small one.  That commit is correction-class and
+had already measured this exact number:
+`~/lorrax_service_phase/HBN_HEAD_ANCHOR_2026-08-08.md` records "sigTOT max
+0.128098 eV, MAE 0.075178, with VH and Eo at exactly zero", its landing
+message calls it "hBN eqp by 0.128098 eV TOWARD BerkeleyGW", and `013aad92`
+registered it in `tests/KNOWN_FAILURES.md` as red until re-frozen — on
+acceptance arms of V_q reciprocity failing at 63 of 64 q → 0 of 64, an
+α-Hermiticity sanity failure 1.155e-06 → 3.165e-14, and a rule 1.42x closer to
+BerkeleyGW on sigTOT and 3.71x on sigCOH with 18 of 18 k-points closer at
+converged ISDF.  Row A was therefore correct behaviour outrunning its
+reference, exactly as the hypothesis supposed; it simply belonged to the
+2026-08-08 head landing rather than the 2026-08-09 rows, and this re-freeze is
+the re-cut that landing asked for.  One further byte-level movement in the
+same window carries no physics: at `cd521a2f` the Σ writer began padding real
+columns to the width a complex column would occupy, measured here at exactly
+0.000000 meV in sigSX, sigCOH, sigTOT, VH and Eo, and whitespace-identical on
+either side of it.
 
 ### THE PERTURBATION ARMS — what the frozen digits mean
 
