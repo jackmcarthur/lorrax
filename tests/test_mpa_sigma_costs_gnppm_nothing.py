@@ -253,6 +253,13 @@ SHARED_SIGMA_CORE = {**SHARED_SIGMA_KERNELS, **SHARED_SIGMA_SEAMS}
 THIS_BRANCH_TOUCHES = (
     "src/gw/mpa/sigma_routing.py",
     "src/gw/mpa/sigma_pass.py",
+    # The complex-frequency chi0 route.  Not a Sigma kernel and not on a
+    # gnppm run's path at all: the two-point screening stage builds chi0
+    # from imaginary-time Green's functions in ``w_isdf``, and nothing in
+    # ``ppm_pipeline``'s import closure reaches this module.  It is here
+    # because the jax-native lane fused its k-block walk, and this list is
+    # a declaration of intent rather than a permission.
+    "src/gw/mpa/chi0_resolvent.py",
     "src/gw/mpa/sigma_head.py",
     "src/gw/mpa/head_dipole.py",
     "src/gw/mpa_pipeline.py",
