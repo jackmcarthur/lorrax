@@ -66,6 +66,7 @@ nav:
   - User guide:
       - Drivers: drivers.md
       - Input reference: input_reference.md
+      - Downfold driver: downfold.md
   - Theory:
       - Overview: theory/overview.md
       - Physics: theory/physics.md

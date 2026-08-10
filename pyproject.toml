@@ -73,6 +73,7 @@ cuda13 = ["jax[cuda13]>=0.7.0,<0.10.0"]
 lorrax-gw = "gw.gw_jax:main"
 gw_jax = "gw.gw_jax:main"
 lorrax-centroids = "centroid.kmeans_cli:main"
+lorrax-downfold = "gw.downfold_cli:main"
 # NOTE: `lorrax-bse` was removed. Its former target `bse.bse_isdf:main` was
 # deleted (commit a0da0a5; it was a deprecation shim with no main()). The
 # current BSE driver `bse.bse_jax` keeps its CLI inside an
