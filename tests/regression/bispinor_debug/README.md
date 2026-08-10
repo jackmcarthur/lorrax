@@ -40,6 +40,26 @@ the fixed cost is the per-channel r-chunk streaming over the 30×30×120
 grid at 60 Ry / ngkmax 5545), so the better-conditioned 256/209 set is
 kept.  Warm wall ≈ 40 s recorded (was ≈ 100 s at 640/668 static COHSEX).
 
+## 2026-08-09 re-freeze — the k-star completion (owner-authorized)
+
+`sigma_diag_bispinor_ref.dat` was re-cut, and **not** for a fixture change:
+every input in this directory is untouched.  `dd727216` landed the k-star
+`(Z − Z†)/2i` completion in `src/gw/ppm_accumulators.py`, which had been
+closing a one-sided τ grid with an elementwise `Im` — the pair adjoint only
+at k = −k.  The correction moves sigC by max **7.7240e-03 eV** over 268 of
+270 rows and leaves sigX and VH bit-identical.  Γ moves by 8.530e-04 eV
+rather than by zero, which is this deck behaving correctly: MoS2 has no
+inversion, TRS carries the spinor rotation, and σ^τ at Γ is only
+approximately complex-symmetric, so Γ inherits a correction of its own.
+
+The values were cut at `dd727216` and **re-verified bit-exact** against
+`main` @ `5b135f8e` before the freeze (max |Δ| = 0.000e+00, 0 of 1620 cells
+differing at all).  The `9a730da8` dipole re-cut cannot reach this deck at
+all — `bispinor_test.in` takes the explicit head bypass (`vhead` =
+`whead_0freq` = `whead_imfreq` = 0) and the fixture ships no `dipole.h5`.
+Full provenance, **including the one thing this reference cannot see**, is
+in the file's own header; read it there rather than here.
+
 ## Shrink validation (all on 1 GPU, A100)
 
 * Fresh run twice → `sigma_diag`, `eqp0/1.dat` **bit-identical**.
