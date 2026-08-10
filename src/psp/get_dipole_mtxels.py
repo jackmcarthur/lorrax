@@ -718,7 +718,14 @@ def main(argv=None):
 		"--vnl-mode",
 		choices=["analytic", "numeric"],
 		default="analytic",
-		help="Choose nonlocal velocity evaluation: analytic (dZ) or numeric FD(Z)",
+		help="Nonlocal velocity evaluation.  `analytic` (dZ) is the "
+		     "production arm and the default -- every dipole.h5 in the "
+		     "tree is built with it.  `numeric` is the FINITE-DIFFERENCE "
+		     "VALIDATION ARM for the analytic path: it exists to check "
+		     "that the analytic derivative is implemented right, it is "
+		     "far slower, and it is NOT FOR PRODUCTION RUNS.  The two "
+		     "are gated against each other by "
+		     "tests/test_vnl_velocity_fd_agreement.py.",
 	)
 	parser.add_argument(
 		"--vnl-h",
