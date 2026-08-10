@@ -91,6 +91,98 @@ second, parallel notion of "the work list". Either is a contract change to
 `common.collectives` plus edits in every consumer, and either invalidates the two
 pinning cells. That is a design decision with an owner, not a mechanical canonicalization.
 
+## §6.1's OPEN QUESTION, per site
+
+`FIX_multislice_cachekey.md` §6.1 answered "is a divergent key here a HANG or only
+cache-key pollution?" for `_multi_slice` alone — `parameter -> kLoop fusion(slice)`, no
+autotune candidates, so `AutotunerPass` has no work to shard — and said explicitly that
+it does not generalise, "because several of them compile real physics kernels with gemms
+in them".
+
+XLA's autotune candidates are GENERATED FROM dots and convolutions. A module whose HLO
+contains neither has no candidates on **any** backend, so the *benign* half of the answer
+is device-independent and was measured here, on CPU, at the two extents a ragged slab
+actually produced. `fft` is counted and deliberately NOT treated as a candidate: cuFFT
+picks its plan inside the library and never enters XLA's multi-process autotuner. The
+*live* half — how many candidates, and how long the handshake takes — is a GPU question
+and is DEFERRED (below).
+
+Evidence: `~/lorrax_cache_contract_2026-08-10/autotune_census_cpu.json`, produced by
+`autotune_cpu.py` in the same directory. Two controls ran in the same pass: a
+slice-only module (0 candidates, reproducing §6.1's finding) and a plain GEMM (3), so
+the counter is known to be able to answer both ways.
+
+| site | divergent module | dot | conv | fft | verdict |
+|---|---|---:|---:|---:|---|
+| 1 | `jit__mbz_draw_u` (threefry + vmap) | 0 | 0 | 0 | **BENIGN** — no candidates at all, exactly `jit__multi_slice`'s case |
+| 1 | `jit_wrap_points_to_voronoi` | 2 | 0 | 0 | **BENIGN, and the reason is specific**: both dots are `f64[343,3]`, i.e. the `(2·nmax+1)³ = 343` candidate-shift × lattice matmul. That shape is a function of `nmax` ONLY and does not move with the rank slab, so ranks compiling different modules still present the autotuner the SAME dot. Divergent module, rank-INVARIANT candidate set. |
+| 2, 3 | `_valence_density_kernel` / `to_rbox` | 0 | 0 | 6 | **BENIGN as a deadlock risk.** FFT-bearing, and the FFT batch axis IS the divergent one — but an FFT is not an autotune candidate. The cost was a real recompile and a per-rank cache key, not a hang. |
+| 4 | `_dipole_block` via `sweep_local_k` | — | — | — | **LIVE, NOT MEASURED.** FFT plus band–band contractions, i.e. GEMM-bearing by construction, and this is the site still RED-LISTED. Needs the deferred GPU leg to quantify; the qualitative answer (a GEMM-bearing module with a rank-dependent compile is a live autotune-divergence hazard) already follows and is the reason the red-list row matters. |
+| 5 | Σ_kij / Σ_τ / cohsex Σ / χ⁰ | — | — | — | **LIVE, NOT MEASURED — but CLOSED by the fix.** These carry the largest autotune candidate sets in the tree (`contract_bands` right-GEMMs). The divergence is now refused symmetrically by the fingerprint, so the hazard no longer has a route; measuring its size would be measuring a state the branch removed. |
+
+Read the table with its bound: it says these modules have no autotune candidates and that
+two controls behaved as expected. It does not prove XLA never blocks for a
+non-autotunable module — the same bound §6.1 put on its own answer.
+
+## DEFERRED P=4 LEGS (owner priority directive, 2026-08-10)
+
+The MPA acceptance chain took fleet-wide GPU priority mid-lane. Every leg below is
+ready-to-run and none was submitted; the branch is **contract-armed-but-unrun** on GPU,
+which the contract itself reports honestly (the deck arms skip naming the four-GPU rule
+rather than passing vacuously). One `lx run` had been submitted and was **killed by PID
+before it placed any step** (`squeue --me` showed no `Xg4` step at any point); no
+allocation was created.
+
+Worktree already staged at `/pscratch/sd/j/jackm/cachecontract_0810/wt`; evidence dir
+`/pscratch/sd/j/jackm/cachecontract_0810/_reports/`. Set `LX_BASE_MODULE=lorrax_J070`
+first — without it the leg gets the wrong jax.
+
+**LEG 1 — THE CONTRACT, all decked drivers, P=4.** The headline gate. One combined
+dispatch (doctrine rule 2); ~20 min, dominated by the two BSE stages run twice.
+
+    cd /pscratch/sd/j/jackm/cachecontract_0810/wt && git fetch origin \
+      feat/cache-contract-2026-08-10 && git checkout --detach FETCH_HEAD
+    LX_BASE_MODULE=lorrax_J070 lx run -N 1 -G 4 -n 1 --wait 900 -- \
+      bash /pscratch/sd/j/jackm/cachecontract_0810/leg.sh
+
+`leg.sh` is in the evidence dir and sets `LX_MESH4_DECKS=1`. GREEN means, per driver and
+per stage: `xla_compiles=0 vetoed=0` on all four ranks and one shared cache-key set.
+**Expect `mesh_launch` mode `local-gpu`** — four processes, one A100 each, on the node
+the step already holds; a nested `srun` is not available inside a step and the mode line
+is printed in every failure message. The lint half of this file already ran green on GPU
+(step `lx-Xg4-154342`, 24 passed / 10 skipped, `_reports/contract.xml`); it is the deck
+arms that are owed.
+
+**LEG 2 — BIT-IDENTITY per fixed sibling, P=4 vs P=1.** Sites 1 and 3 regroup a floating
+sum across ranks, so the claim is agreement at the tolerance each site already documents,
+not bit-identity — and it has to be measured, not asserted:
+
+    lx run -N 1 -G 4 -n 1 -- python -m gw.gw_jax -i cohsex_si_fast.in   # in si_cohsex_debug
+    lx run -N 1 -G 1 -n 1 -- python -m gw.gw_jax -i cohsex_si_fast.in
+
+and diff `eqp*.dat`. Site 2 (`rho_work_items`) only changes behaviour at `world > nk`, so
+its arm needs a deck with `nk < 4` or an explicit `world` override. Site 5 changes no
+arithmetic at all and needs no bit-identity arm.
+
+**LEG 3 — the autotuner census on GPU.** `~/lorrax_cache_contract_2026-08-10/autotune_probe.py`
+is the GPU version of the CPU census above: same modules, but counting
+`__cublas$`/Triton/`__cudnn$` in the after-optimizations HLO. It answers the two rows
+marked LIVE, NOT MEASURED.
+
+    lx run -N 1 -G 1 -n 1 -- python autotune_probe.py
+
+**LEG 4 — default gate + census zero-delta.** The branch touches `src/bse`, `src/gw`,
+`src/centroid`, `src/ffi`, `src/common`, so the default gate selects every driver:
+
+    lx test              # the default gate
+    lx test --census     # against a same-day origin/main run, set-diff by node id
+
+Owed because three of the touched files cannot even be IMPORTED on WSL — `src/ffi/gate.py`
+refuses without the host `.so`, which is deliberate — so no off-cluster run can speak for
+them. The pure functions inside them ARE gated off-cluster, by
+`tests/test_cache_sibling_canonicalization.py` (46 cells), which lifts them out of the
+module precisely to dodge that import.
+
 ## OWNER ROWS
 
 1. **`src/psp/run_nscf.py:321` is a SIXTH class-B site** and was not on the campaign's
