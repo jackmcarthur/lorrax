@@ -176,6 +176,12 @@ def slab_digest(**arrays):
     return h.hexdigest()
 
 
+#: Attribute naming the stats keys whose value was ``None``.  Kept out
+#: of the address on purpose: it is a property of how the stats are
+#: SPELLED on disk, not of the plan the address identifies.
+_NONE_KEYS_ATTR = "_none_valued_keys"
+
+
 def branch_address(*, source_sha, fit_store, n_p, pole, bkey, slab,
                    arrays, scalars):
     """The content address of one (pole, branch) plan, over ALL its inputs.
@@ -363,8 +369,21 @@ def write_branch_plan(path, groups, *, address, pole, bkey, source_sha,
         f.attrs["written_utc"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
         st = f.create_group("stats")
+        # A STAT MAY BE ABSENT, AND ABSENT IS A VALUE.  The planner's stats
+        # are whatever the planner reports, and a knob that is OFF reports
+        # ``None`` -- ``binned_width_clause`` is the live example, pinned
+        # ``is None`` by its own lane's cell.  h5py has no native object
+        # dtype, so writing it raw raises "Object dtype has no native HDF5
+        # equivalent" and the plan store becomes the thing that decides
+        # which stats a planner is allowed to have.  It is recorded as a
+        # sentinel name instead and read back as ``None``, so the stats a
+        # leg loads are the stats the planner produced.
+        none_keys = sorted(k for k, v in dict(stats or {}).items()
+                           if v is None)
         for k, v in dict(stats or {}).items():
-            st.attrs[k] = v
+            if v is not None:
+                st.attrs[k] = v
+        st.attrs[_NONE_KEYS_ATTR] = ",".join(none_keys)
         gg = f.create_group("groups")
         for i, g in enumerate(groups):
             node = gg.create_group(str(i))
@@ -440,7 +459,12 @@ def read_plan_header(path):
         rows = [(str(gg[str(i)].attrs["name"]),
                  int(gg[str(i)].attrs["n_modes"]),
                  int(gg[str(i)].attrs["n_tau"])) for i in range(n_groups)]
-        stats = {k: _unwrap(v) for k, v in f["stats"].attrs.items()}
+        stats = {k: _unwrap(v) for k, v in f["stats"].attrs.items()
+                 if k != _NONE_KEYS_ATTR}
+        for k in str(_unwrap(
+                f["stats"].attrs.get(_NONE_KEYS_ATTR, ""))).split(","):
+            if k:
+                stats[k] = None
         head = {
             "path": str(path),
             "address": str(f.attrs["address"]),
