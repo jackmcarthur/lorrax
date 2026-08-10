@@ -38,14 +38,21 @@ _REPO = Path(__file__).resolve().parent.parent
 _SERVICES = _REPO / "services"
 
 
-def _collect(*args, env_extra=None) -> set[str]:
-    """Node ids ``pytest --collect-only`` selects with ``args``."""
+def _collect(*args, census=True, env_extra=None) -> set[str]:
+    """Node ids ``pytest --collect-only`` selects with ``args``.
+
+    ``census=True`` (the default) prepends ``--census``, because the tier
+    these cells measure is the CENSUS: since 2026-08-09 a bare ``pytest``
+    is the fast default gate (Si smoke + services), and comparing a service
+    flag against THAT baseline would be asking a different question.
+    ``census=False`` is how the cells about the default gate itself run.
+    """
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_REPO / "src"))
     env.update(env_extra or {})
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q",
-         "-p", "no:cacheprovider", *args],
+         "-p", "no:cacheprovider", *(["--census"] if census else []), *args],
         cwd=str(_REPO), env=env, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, timeout=900)
     ids = {ln.strip() for ln in proc.stdout.splitlines()
@@ -59,6 +66,60 @@ def _collect(*args, env_extra=None) -> set[str]:
 @pytest.fixture(scope="module")
 def baseline():
     return _collect()
+
+
+# ---------------------------------------------------------------------------
+# THE DEFAULT GATE vs THE CENSUS  (2026-08-09)
+# ---------------------------------------------------------------------------
+# The same instrument, pointed at the second collection hook in this tree.
+# The risk is identical in shape and worse in consequence: the default gate
+# is what runs on every branch, so if it silently narrows to the wrong set
+# the loss is invisible AND continuous.  Two facts pin it, and they are the
+# two that can actually go wrong:
+#
+#   1. the default run is a strict SUBSET of the census (nothing runs by
+#      default that the census would not also run), and
+#   2. the census still contains everything — checked here as "the default
+#      gate's own cells are in it", with the whole-set equality measured at
+#      the split and recorded in the FAST_GATE report.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def default_gate():
+    return _collect(census=False)
+
+
+def test_the_default_gate_is_a_strict_subset_of_the_census(
+        default_gate, baseline):
+    lost = sorted(default_gate - baseline)
+    assert not lost, (
+        "the default gate runs cells the census does not:\n  "
+        + "\n  ".join(lost))
+    assert len(default_gate) < len(baseline), (
+        "the default gate collected the whole census — the narrowing hook "
+        "did not fire, and every branch is paying the full price")
+
+
+def test_the_default_gate_is_the_si_smoke_plus_the_services(default_gate):
+    """The owner's sentence, as a measurement.
+
+    "run that Si test calculation (granted for all drivers that were
+     touched since last ran) and the tests for the services and have that
+     basically be it."
+
+    ``LX_GATE_DRIVERS=all`` pins the widest form of the default tier, so
+    this cell does not depend on what the branch happens to have touched.
+    """
+    import fast_gate
+
+    wide = _collect(census=False, env_extra={"LX_GATE_DRIVERS": "all"})
+    own = {n for n in wide if not _is_service(n)}
+    roster = fast_gate.smoke_node_ids(fast_gate.DRIVERS)
+    assert own == roster, (
+        "the default tier's non-service half is not the fast_gate roster.\n"
+        f"  only in the run:    {sorted(own - roster)}\n"
+        f"  only in the roster: {sorted(roster - own)}")
+    assert {n for n in wide if _is_service(n)}, (
+        "the default gate dropped the service suites, which are half of it")
 
 
 def _is_service(nodeid: str) -> bool:

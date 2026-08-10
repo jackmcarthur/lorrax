@@ -1,5 +1,17 @@
 # Known test failures — full-suite census
 
+> **WHICH RUN THIS FILE ACCOUNTS FOR (unchanged, restated 2026-08-09).**
+> Every row below is about the **CENSUS** — `pytest --census`, equivalently
+> `pytest -m census`. Since 2026-08-09 a bare `pytest` is the fast default
+> gate (the Si end-to-end calculation for the drivers a branch touched, plus
+> the services' suites); it is a strict SUBSET of the census and it is not
+> what this file counts. **Nothing about this file's meaning, scope or
+> accounting changed with that split** — `--census` collects exactly the set
+> a bare `pytest` collected before it, verified node id by node id (3330 in,
+> 3330 out, zero missing). Do not reconcile a KNOWN_FAILURES row against a
+> default-gate run; it will be short by ~2400 cells for reasons that have
+> nothing to do with the row.
+
 Two censuses live in this file.  The **Perlmutter** one is authoritative for
 this tree; the **Frontera** one below it is the historical record from
 2026-08-01 and is kept because several of today's reds are only legible

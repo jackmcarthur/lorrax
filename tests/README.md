@@ -1,17 +1,60 @@
 # LORRAX test suite
 
+## Two tiers: the default gate, and the census (2026-08-09)
+
+The owner's instruction, verbatim:
+
+> the test suite for lorrax became a super clodgy mess because of the llm
+> test-for-everything habit; really we should run that Si test calculation
+> (granted for all drivers that were touched since last ran) and the tests
+> for the services and have that basically be it.
+
+So:
+
+```bash
+pytest                 # DEFAULT GATE — minutes.  The Si end-to-end test
+                       # calculation for the drivers this branch TOUCHED,
+                       # plus every service's own suite.
+pytest --census        # THE CENSUS — everything.  Byte-for-byte the run a
+pytest -m census       # bare `pytest` was before the split (3330 cells).
+lx test                # Perlmutter: the default gate on a compute node
+lx test --census       # Perlmutter: the census
+```
+
+Nothing was deleted and nothing changed meaning. **`tests/KNOWN_FAILURES.md`
+accounts for the CENSUS run**, and that accounting is untouched: `--census`
+collects exactly the set the old default collected, measured node id by node
+id at the split.
+
+The default gate's roster and its file→driver map live in
+[`fast_gate.py`](fast_gate.py); the twenty lines of pytest wiring are in
+[`conftest.py`](conftest.py). Every cell the default gate runs already
+existed — no deck and no tolerance was authored for this split. Drivers with
+no runnable in-tree deck are named in `fast_gate.UNDECKED` and the run says
+so out loud when you touch one.
+
+The gate stands down — you get the census — whenever you have already said
+what you want: `--census`, `-m`, `-k`, a named path, `--no-services`,
+`--only-service`, or `LX_CENSUS=1`. Override the driver selection directly
+with `LX_GATE_DRIVERS=all|none|<comma list>`, and the diff base with
+`LX_GATE_REF` (default: merge-base with `origin/main`).
+
+---
+
+## The census, in detail
+
 Redesigned 2026-07-09 (see `lorrax_sandbox/reports/test_suite_redesign_2026-07-09/`).
 Plain invocation, one GPU, no xdist/srun overrides required:
 
 ```bash
-LORRAX_NGPU=1 lxrun python3 -m pytest -q tests      # Perlmutter (~4 min)
-uv run python -m pytest -q tests                    # local dev
+LORRAX_NGPU=1 lxrun python3 -m pytest -q --census tests   # Perlmutter (~4 min)
+uv run python -m pytest -q --census tests                 # local dev
 ```
 
 Optional 4-GPU parallel run (kept working, never required):
 
 ```bash
-lxrun python3 -m pytest -q tests -p xdist -n 4      # conftest pins worker→GPU
+lxrun python3 -m pytest -q --census tests -p xdist -n 4   # conftest pins worker→GPU
 ```
 
 ## Architecture — three tiers
