@@ -164,6 +164,54 @@ under the interim one-leg-per-node rule buys concurrency only by taking whole
 nodes. Combine first; split a leg only when it genuinely cannot be combined,
 and say why when you do.
 
+## …and independent legs go out together
+
+That rule is about one branch's own verification, which is several steps that
+share a bring-up and are read as a single answer. It is not about legs that do
+not depend on each other — the two arms of an A/B, the ten points of a sweep,
+a battery of decks. **Those go out at the same time, and the default for them
+is fan-out rather than a queue.**
+
+The reason is measured, and it is the largest single number this fleet has put
+on its own overhead. Of the 152 evidence directories on `/pscratch` with three
+or more steps, 115 — three quarters — never ran two steps at once; across them
+the gaps *between* steps total 32.4 hours against 17.5 hours of actual step
+wall, for a median duty cycle of 0.41. The fleet spends nearly twice as long
+waiting for an agent to read one result and submit the next as it does
+computing. `docs/warm_worker.md` has the derivation, and the examples are
+unambiguous: `import_audit_0809/_reports` ran ten independent A/B legs strictly
+back to back with about 1,000 s recoverable, and `mpa_gamma_0809/_reports`
+fired 41 one-GPU legs that never used more than two GPUs at once.
+
+Nothing about the machine required that. The one-leg-per-node rule above was an
+interim measure for a real defect — Slurm hands every co-tenant one-GPU step
+the same physical device — and that defect was fixed on 2026-08-09: `lx` now
+claims a distinct device per leg and passes it in as `LORRAX_GPU_DEVICE`, so
+four one-GPU legs on a node genuinely get four GPUs. `mpa_farm16_0810` fired
+sixteen legs three seconds apart for an occupancy of 5.97. Co-tenancy is free;
+what remains is that agents keep submitting one leg at a time.
+
+**`lx batch <manifest>` is the verb.** The manifest is JSON lines — one object
+per independent leg, carrying its `argv`, its `workdir` and optionally the
+environment it declares it needs — and `lx batch` fires them concurrently up to
+`-P` (default 4), giving each leg its own log and printing one summary that
+names every leg in the manifest. It refuses by name on any leg that failed or
+never ran, because a batch missing legs must never read as a completed batch.
+`-P 1` is the same code path run serially, which is how a batched-versus-serial
+claim stays one variable.
+
+Two habits go with it. Pass `--wait`, so a leg that meets a momentarily full
+pool queues instead of coming back `LX-POOLFULL` and being counted as a leg
+that never ran. And keep reading the per-leg EXIT codes: a batch summary is a
+table of legs, not a verdict about physics.
+
+Where a warm worker is already up, `lx batch` submits into its queue instead of
+firing cold legs (`--mode auto`; see `docs/warm_worker.md` and `lx warm start`).
+That is the cheap case — a warm leg answers in about 2.4 s against roughly 21 s
+cold — but it is one quartet serving one geometry from one source tree, so it
+is for the iteration between landings. Landing evidence still comes from cold
+legs, and those are what `lx batch` fans out.
+
 ## Name your evidence directory, in the report
 
 **Every lane report names the directory its evidence lives in**, spelled out as
