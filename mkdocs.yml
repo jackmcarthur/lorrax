@@ -37,6 +37,13 @@ plugins:
             show_source: false
 
 markdown_extensions:
+  # attr_list is what turns `## Heading {#custom-id}` into an actual anchor.
+  # Without it every explicit anchor in the tree silently became literal text
+  # and `mkdocs build --strict` aborted on 25 "does not contain an anchor"
+  # warnings -- including the register table's own `index.md#register`, which
+  # most pages link to. Measured 2026-08-10: adding this line takes the strict
+  # build from 25 warnings to clean.
+  - attr_list
   - admonition
   - pymdownx.details
   - pymdownx.superfences

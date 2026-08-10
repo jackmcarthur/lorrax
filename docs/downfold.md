@@ -13,20 +13,52 @@ bundle, chooses a small centroid set against the bands you actually intend to
 consume, redefines the wavefunction-at-centroid coefficients on that smaller
 set, and writes a restart bundle **in the same format at the smaller size**.
 That last point is the whole design: the small bundle is a restart bundle like
-any other, so every BSE consumer downstream reads it with no code change, no
-flag and no knowledge that a downfold happened. You point the BSE driver at a
-different directory and everything else is as it was.
+any other, so `bse.bse_jax` reads it with no code change, no flag and no
+knowledge that a downfold happened. You point that driver at a different
+directory and everything else is as it was.
+
+!!! warning "`bse.exciton_bands` does not yet read a downfolded bundle"
+    This page used to promise the drop-in for *every* BSE consumer. Measured
+    2026-08-10 on a 936 → 189 downfold of a silicon 4×4×4 parent, the exciton-band
+    driver refuses on the small bundle for three separate reasons, and only the
+    first has a workaround: it reads the deck's `centroids_file`, which the bundle
+    carries only when the downfold was given `parent_centroids_file`; its
+    htransform leg needs a Galerkin basis spanning `nk·nb` (1280 there against
+    μ_S = 189) and refuses with `the Galerkin coefficients are NOT orthonormal`
+    even after the htransform window is narrowed to the retained window; and its
+    default `--vq-mode interp` needs a full-BZ `zeta_q.h5`, which the downfold
+    does not write. μ_S is sized against the retained window's pair-density rank,
+    which is a much smaller number than the Galerkin bound, so these are
+    different criteria rather than a tuning problem. Today the small bundle
+    serves `bse.bse_jax`; the exciton bands still want the parent.
 
 Measured on silicon with a 960-centroid parent and a 20-band retained window:
 191 centroids out, a five-fold reduction in μ and a twenty-five-fold one in the
 storage of every (μ, μ) tensor, with the lowest twenty exciton eigenvalues
 drifting 37.4 meV MAE. **How much you can compress depends entirely on whether the
-parent basis was over-complete for your window**, and it is worth reading
-`DOWNFOLD_S1.md` §3(c) before sizing a run: the same deck's shipped
+parent basis was over-complete for your window**: the same deck's shipped
 480-centroid set has no redundancy on a 20-band window at all, and downfolding
 it destroys the spectrum rather than compressing it. The driver tells you which
 situation you are in — that is what the refusal and the error bar below are
 for — but it cannot create redundancy that the parent does not have.
+
+The measurement behind that paragraph is `DOWNFOLD_S1.md` §3(c), which is a
+**campaign report and is not in this repository** — it lives with the rest of the
+2026-08-08 BSE campaign artifacts. Nothing on this page depends on reading it, and
+where a number from it is quoted here it is quoted in full, but do not go looking
+for the file in a checkout.
+
+Nowhere does this tree tell you how to *build* an over-complete parent, and that
+gap is worth naming because it is the first thing a reader of this page needs.
+The guidance in [drivers.md](drivers.md) is "run the GW stage at a generous μ_L",
+with no number and no invocation, and the one concrete figure anywhere — the
+960-centroid parent above — is reported as a measurement rather than as a recipe.
+For orientation, the parent used for the 2026-08-10 measurements on this page was
+built with `python3 -m centroid.kmeans_cli 900 --seed 42 --prune-n-val 8
+--prune-n-cond 52` on the `si_bse_debug` WFN, which in orbit mode delivered 936
+points; that produced a window rank of 189, and, as the `mu_small` section below
+records, was still not enough for a usable BSE spectrum after compression. Sizing
+a parent for a downfold is unsettled work, not a documented procedure.
 
 Two numbers put that 37.4 meV in proportion, and it is worth holding both
 before you choose a cut. The first is the floor of the machinery rather than of
@@ -151,9 +183,36 @@ There is no default. This is a physics choice and the driver cannot guess it.
 How many centroids the small basis should have, or the word `auto`.
 
 `auto` means "as many as the retained window has independent pair-density
-directions at `downfold_rcond`". On the evidence below, that is the only value
-you can choose without having read the measurement report, and it is the
-recommended setting.
+directions at `downfold_rcond`". It is the only value you can choose without
+having read the measurement report, and it is the largest value the driver will
+accept — but read the next paragraph before treating it as a safe default.
+
+!!! danger "`auto` is a ceiling, not a recommendation, and it silently produced a 2.1 eV error"
+    Measured 2026-08-10, following this page's own guidance end to end. A silicon
+    4×4×4 parent was built at 936 centroids, downfolded on a `0:20` window at
+    `mu_small = auto` (→ 189) and `downfold_rcond = 1.1e-6`, and the lowest BSE
+    eigenvalue compared against the same parent solved at identical settings:
+
+    | bundle | μ | worst-q `eps_W` | lowest BSE eigenvalue |
+    |---|---|---|---|
+    | parent | 936 | — | **2.3449 eV** |
+    | `rcond = 1.1e-6`, `auto` | 189 | 1.33e-2 | **0.2579 eV** (−2.09 eV) |
+    | `rcond = 1e-8`, `auto` | 624 | 3.26e-3 | **1.2605 eV** (−1.08 eV) |
+
+    Nothing refused. `eps_W` reported about one per cent and the bundle was
+    written, which is the tripwire behaving exactly as the section below
+    describes it — and is also why that section's warning deserves to be read as
+    a hard limit on what `eps_W` can tell you rather than as a caveat. The error
+    does fall as μ_S rises, so this is a sizing problem and not a defect in the
+    transfer solve; but it falls slowly, and at μ_S = 624 — a compression of
+    only 1.5× — the spectrum was still wrong by an eV.
+
+    The honest reading is that on this deck the `auto` ceiling and the accuracy
+    a BSE needs did not overlap anywhere, and that `auto` is where a sweep
+    starts rather than where it ends. Size μ_S by sweeping it against the
+    observable, exactly as the `downfold_rcond` section below insists, and treat
+    a downfold whose observable has not been checked against its parent as
+    unvalidated.
 
 **The driver refuses when you ask for more directions than the window
 contains**, and prints the number it measured. That refusal is not a failure
@@ -256,10 +315,21 @@ The parent run's centroid coordinate table. When you give it, the driver writes
 the kept rows out as a sibling centroid file and stamps its checksum onto the
 small bundle, so the small basis can later be handed to a fresh GW run.
 
-Without it the bundle is still complete for every BSE consumer — the bundle
-format carries no coordinates at all, only their checksum — and the driver
-says so rather than stamping the parent's checksum, which would be a lie about
-which points the tensors describe.
+Without it the bundle is still complete for `bse.bse_jax` — the bundle format
+carries no coordinates at all, only their checksum — and the driver says so
+rather than stamping the parent's checksum, which would be a lie about which
+points the tensors describe.
+
+It is **not** optional if you intend to run `bse.exciton_bands`, which reads the
+deck's `centroids_file` directly. Measured 2026-08-10, a small bundle written
+without this key fails there in `file_io/centroids.py` with a bare
+`FileNotFoundError: …/centroids_frac_936.txt not found.` — a naked numpy
+traceback carrying none of the announce-or-refuse framing the rest of the tree
+uses, and no hint that the missing file is a consequence of how the downfold was
+configured. When you do give the key, the kept rows are written to
+`<output_restart>/tmp/centroids_frac_<μ_S>_downfold.txt`, so the consuming deck's
+`centroids_file` has to be repointed at that path as well; "nothing else moves"
+does not hold on this path.
 
 ## What it prints, and what to read
 
@@ -298,7 +368,9 @@ number that means nothing.
 And one caveat, measured: `eps_W` is a **tripwire, not a transferable gate**.
 Within one parent bundle and one cut it ranks configurations monotonically, but
 the same `eps_W` of about one per cent produced a 37 meV exciton drift on one
-parent and a 1.7 eV drift on another (`DOWNFOLD_S1.md` §3(c)). Set
+parent and a 1.7 eV drift on another (`DOWNFOLD_S1.md` §3(c), a campaign report
+not carried in this repository), and a third case is tabulated under `mu_small`
+above, where `eps_W` of 1.3e-2 accompanied a 2.09 eV error. Set
 `residual_refuse_above` to catch a downfold that has gone badly wrong; do not
 read it as a promise about meV. The only admissible evidence for choosing the
 cut remains convergence in the energy itself.

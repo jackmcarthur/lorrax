@@ -1,9 +1,24 @@
 # Installation
 
-LORRAX has two layers: a **pure-JAX core** (centroids, wavefunction loading, serial GW)
-that needs only Python + JAX, and a **native FFI stack** (cuSolverMp, parallel HDF5, SLATE)
-required for distributed `eigh`, sharded HDF5 I/O, and SLATE linear algebra. Pick a track
-from the matrix below; the pure-JAX core works with zero native libraries.
+LORRAX needs Python + JAX **and** a native FFI stack (FFT/GEMM on the host library;
+cuSolverMp, parallel HDF5 and SLATE for the distributed features). Pick a track from the
+matrix below.
+
+!!! danger "The 'pure-JAX, zero native libs' track described below no longer exists"
+    This page was written when the FFI layer was optional and the JAX fallbacks were
+    live. [Design decisions, 2026-08-01](../architecture/decisions.md) reversed that:
+    where a certified FFI path exists the JAX path "is not maintained and may be
+    deleted", and a missing library "is a refusal at startup, not a silent demotion".
+    The same ruling is explicit that this binds at **P=1** — "the code must still run on
+    one process: the required libraries must build and load for P=1".
+
+    Verified 2026-08-10 at `88f28325` on a CPU-only machine, a fresh `uv sync` clone
+    running the bundled single-process CPU fixture refuses in
+    `runtime.initialize_communicator_stack` → `ffi.gate.enforce`, before the first
+    `jit`, with `Could not locate liblorrax_ffi_host.so`. The `Pure-JAX (no FFI)` row
+    below and the "zero native libs" sentence under the matrix are **stale**; they are
+    left in place only because the rows around them are still accurate about OS/CUDA/MPI
+    pairings. Treat "FFI features: none (serial only)" as "will not start".
 
 !!! note "TODO"
     This page is a Tier-2 scaffold assembled from the portability and
@@ -65,9 +80,19 @@ Only the pure-JAX path works with **zero native libs**. Everything distributed n
 
 !!! warning "The `liblorrax_ffi.so` build cliff"
     A fresh `git clone` has **no** `liblorrax_ffi.so` (it is a gitignored build artifact).
-    The pure-JAX path never touches it (all FFI imports are lazy), but the first time you
-    run a distributed / FFI-I/O code path you will hit
-    `FileNotFoundError … Build with: bash src/ffi/cpp/build.sh`.
+    Since the 2026-08-01 ruling this is a cliff you hit on the **first run of anything**,
+    not on the first distributed run: the gate refuses at startup naming the library and
+    the build script (`build_host.sh` → `liblorrax_ffi_host.so` for the host leg,
+    `build.sh` → `liblorrax_ffi.so` for the CUDA leg).
+
+    Two things the refusal does not tell you, both measured 2026-08-10:
+    `build_host.sh` requires a SLATE `gpu_backend=none` install and refuses without one,
+    naming `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu`; and on Perlmutter
+    `build.sh` refuses until `LORRAX_NVHPC_ROOT` names a staged CUDA tree, printing the
+    stages it can see. With that variable set, the CUDA leg builds in ~40 s on a compute
+    node (`LORRAX_NVHPC_ROOT=/lorrax_nvhpc/25.5_cuda12.9 lx run bash src/ffi/cpp/build.sh`);
+    on a **login** node it fails in Shifter's bind-mount setup instead, which is a
+    node-type error rather than a build error.
     Build the native library per [FFI native libraries](ffi-native-libs.md) before
     using those features.
 
