@@ -11,6 +11,23 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
+# AMENDMENT — THE MINI-BZ EXCHANGE-HEAD AVERAGE IS THE WRONG MOMENT (2026-08-09)
+
+**One row, from the exciton-bands lane's LT-splitting derivation
+(`~/lorrax_bse_perf_2026-08-08/EXCITON_BANDS_FEATURES.md` §2).**  The
+derivation's headline is a clean acquittal that this row must protect: the
+DEFAULT finite-Q exchange path is **already exact** — the driver evaluates
+`v(Q)` and the pair-density factor at the true finite Q with G=0 kept, so the
+product it forms is exactly `|Q|² v(Q) |q̂·d|²`, the full nonanalytic
+(LT-splitting) head.  **Do not "fix" the default; a flagged head there would
+be a no-op or a double count.**
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`--head-minibz-average` averages the wrong moment on the exchange head** | With the flag ON, the mini-BZ cell average applied to the exchange head is the scalar `⟨v⟩`, where the object the nonanalytic structure requires is the 3×3 second moment `⟨v q̂_a q̂_b⟩` — the scalar throws away exactly the direction dependence the head carries.  A correct implementation needs a rank-three head built from `∂_q ζ(q, μ, 0)`, **which nothing in the tree computes today**.  Anchored to Qiu 2021, Rohlfing–Louie 2000, Strinati 1988 in the derivation | **OPEN, PHYSICS-IMPLICATING, opt-in path only** — the flag defaults off and the default path is proven exact (bit-identical control vs `main` in the same lane).  Sequencing constraint: `SMALL_ISSUES.md` row 22 records that the two S-tensor builders disagree in representation with no reader for one of them — settle that before building the tensor average on either.  Evidence: `EXCITON_BANDS_FEATURES.md` §2 |
+
+---
+
 # AMENDMENT — FOUR ROWS TRANSCRIBED OUT OF THE ASIDES AUDIT (2026-08-09)
 
 **No code moved for this amendment; these four were already true at `main` and
