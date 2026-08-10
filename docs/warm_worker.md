@@ -57,6 +57,69 @@ across three cold runs. Against a ~16 s floor, that leg is roughly three
 quarters bring-up and one quarter physics. The GW stage on the same deck took
 32 s cold, so it is about half bring-up.
 
+## Where this floor sits among all the legs the fleet actually ran
+
+The decomposition above is one instrumented leg, so it was checked against the
+corpus: 2,183 `[lx] step … exit … in N s` lines and 1,904 runtime startup
+banners across roughly 2,198 logs under `/pscratch/sd/j/jackm` dated 2026-08-06
+to 2026-08-10. Three corrections come out of that, and the first is a
+correction to this note's own headline.
+
+**Sixteen seconds is the P=4 cold-cache floor, not the typical leg.** The
+median step in the corpus is 31 s end to end with a median bring-up of 4.5 s,
+because most legs are P=1 or hit a populated compile cache; the median
+bring-up share is 19.5%. It is the P=4 legs that look like the measurement
+above — the paired arms in `/pscratch/sd/j/jackm/import_audit_0809/_reports/`
+spend 9.3–12.0 s of a 14.4–17.5 s wall on bring-up, so 65–70%, against 44–46%
+for the P=1 arms of the same battery. Since the four-GPU rule makes every
+verification leg P=4, the floor this note attacks is the right one to attack —
+but it is the verification-leg floor, not a fleet-wide average, and quoting it
+as the latter would be the same overreach the brief made.
+
+**The "two to four minutes" figure appears to be inherited from two true
+statements about other things.** `bin/lx`'s own header records 8–21 minutes of
+`sbatch` queue wait for 30-second jobs, measured 2026-08-05 — before the pool
+existed, which is the mechanism `lx` was built to delete. And
+`tests/test_import_time_gate.py` says roughly four-fifths of a warm driver's
+wall is bring-up rather than physics, which is a correct *ratio*; the wall it
+is a ratio of is about fifteen seconds. A ratio and a queue-wait measurement
+combined into an absolute, and the absolute survived.
+
+**The claim is true for exactly one leg class, and it is rare.** Cold
+compile-cache arming can genuinely cost minutes:
+`/pscratch/sd/j/jackm/xd_parent/downfold_f.log` spent 292.4 s of a 313 s step
+in bring-up, 284.5 s of it arming the cache. That is the only banner above 40 s
+in 1,904, so about one leg in two thousand. The runner-up class is first-touch
+mesh and NCCL setup at 25–36 s. Neither P=16 nor the pytest suite is an
+exception — no P=16 banner exists in the corpus, and the largest
+`env_and_distributed` row anywhere is 11.1 s.
+
+### The larger prize is not bring-up at all
+
+Worth recording alongside, because it dwarfs what this worker recovers. Of the
+152 evidence directories with three or more steps, 115 — three quarters — are
+strictly serial, never running two steps at once. Across them the inter-step
+gaps total **32.4 hours against 17.5 hours of actual step wall**: the fleet
+spends nearly twice as long waiting for an agent to read a result and submit
+the next leg as it does computing. Median duty cycle is 0.41.
+
+The examples are unambiguous. `/pscratch/sd/j/jackm/import_audit_0809/_reports`
+ran ten independent A/B legs strictly back to back — `before_1`, `after_1`,
+`before_2`, `after_2`, `before_3` at 02:36:43, 02:37:06, 02:37:25, 02:37:47,
+02:38:05 — arms interleaved in order but never in time, with about 1,000 s
+recoverable. `/pscratch/sd/j/jackm/perf_bse_0808/ab_final/_reports` ran 55
+whole-node legs one at a time on a four-node pool. And
+`/pscratch/sd/j/jackm/mpa_gamma_0809/_reports` fired 41 one-GPU legs that never
+used more than two GPUs at once. That lanes *can* do better is settled by
+`/pscratch/sd/j/jackm/mpa_farm16_0810/_reports`, which fired 16 one-GPU legs
+three seconds apart for an occupancy of 5.97.
+
+So a warm worker is the right fix for the bring-up term and it is not the
+biggest lever available. Since co-tenancy became free with GPU placement on
+2026-08-10, the larger recovery is fan-out, and the two compose: a worker that
+answers in seconds makes a batched submit worth building, because the round
+trip stops being amortised by a twenty-second leg.
+
 ## What the worker is
 
 `lx warm start` launches an ordinary `lx run -N 1 -G 4 -n 4` whose payload
