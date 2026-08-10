@@ -6,6 +6,7 @@ process, otherwise ``jnp.complex128`` silently degrades to complex64
 into one process, so the first import wins — set the env here.
 """
 
+import json as _json
 import os
 import sys as _sys
 from pathlib import Path as _Path
@@ -122,6 +123,14 @@ def pytest_configure(config):
         harness.SESSION_DEVICES_ENV,
         ",".join(harness.session_devices(
             os.environ.get("CUDA_VISIBLE_DEVICES"))))
+    # And the CALLER's device-shape env, for the same reason and at the same
+    # moment: this hook runs before collection, so nothing has leaked yet.
+    # See harness.SESSION_JAX_ENV — without this the mesh child inherits a
+    # JAX_PLATFORMS=cpu that a test module set at import and runs on emulated
+    # devices while claiming the node's GPUs.
+    os.environ.setdefault(
+        harness.SESSION_JAX_ENV,
+        _json.dumps({k: os.environ.get(k) for k in harness.JAX_SHAPE_VARS}))
 
     # The mesh subprocess IS the widened process.  Pinning it would undo the
     # only thing it was started to do.
@@ -270,28 +279,48 @@ def _mesh_want(item):
     return int(marker.args[0]) if marker.args else 4
 
 
-def _device_count_now() -> int:
-    """How many devices THIS process actually has.
+def _devices_now():
+    """``(count, platform)`` for THIS process.
 
     ``jax.device_count()`` and not ``len(CUDA_VISIBLE_DEVICES)``, because a
     direct invocation with ``--xla_force_host_platform_device_count=4`` has
     four devices and no GPUs at all, and that leg must keep working exactly
-    as it does today.
+    as it does today.  The PLATFORM comes along because in the child the
+    count alone cannot tell four A100s from four emulated host devices.
     """
     try:
         import jax
 
-        return int(jax.device_count())
+        devs = jax.devices()
+        return len(devs), (getattr(devs[0], "platform", "") if devs else "")
     except Exception:                                          # noqa: BLE001
-        return 0
+        return 0, ""
+
+
+def _session_real_devices():
+    """The session's REAL devices — or none, when the caller asked for a
+    platform that is not them.
+
+    A caller who exported ``JAX_PLATFORMS=cpu`` on a GPU node has said what
+    they want, and the emulated arm is a legitimate thing to run; that is a
+    different fact from a test module having set the same variable at import,
+    which is the leak the snapshot exists to exclude.  The snapshot is the
+    only place the two can still be told apart.
+    """
+    caller = _json.loads(os.environ.get(harness.SESSION_JAX_ENV, "{}") or "{}")
+    plat = (caller.get("JAX_PLATFORMS") or "").lower()
+    if plat and not any(p in plat for p in ("cuda", "gpu", "rocm")):
+        return []
+    return [d for d in os.environ.get(
+        harness.SESSION_DEVICES_ENV, "").split(",") if d]
 
 
 def _mesh_plan_for(item, want: int):
+    have, platform = _devices_now()
     return harness.mesh_plan(
-        want, _device_count_now(),
-        [d for d in os.environ.get(harness.SESSION_DEVICES_ENV, "").split(",")
-         if d],
-        inner=bool(os.environ.get(harness.MESH_CELL_ENV)))
+        want, have, _session_real_devices(),
+        inner=bool(os.environ.get(harness.MESH_CELL_ENV)),
+        platform=platform)
 
 
 def _mesh_verdict(item, want: int, devices):

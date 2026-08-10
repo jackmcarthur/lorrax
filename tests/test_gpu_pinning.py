@@ -314,7 +314,7 @@ def test_the_probe_is_not_consulted_when_the_env_already_says():
 def test_a_pinned_worker_on_a_four_gpu_node_gets_a_child_not_a_skip():
     """THE MEASURED GAP.  One device here, four on the node: the old spelling
     skipped, and the suite reported green with the cell never run."""
-    assert harness.mesh_plan(4, 1, ["0", "1", "2", "3"]) == (
+    assert harness.mesh_plan(4, 1, ["0", "1", "2", "3"], platform="cuda") == (
         "subprocess", ["0", "1", "2", "3"])
 
 
@@ -322,16 +322,30 @@ def test_a_process_that_already_has_the_mesh_runs_the_cell_itself():
     """The direct invocation — `XLA_FLAGS=--xla_force_host_platform_device_
     count=4 pytest ...` — must keep behaving exactly as it does today, and
     so must the child, which is the same case seen from inside."""
-    assert harness.mesh_plan(4, 4, ["0", "1", "2", "3"]) == ("here", None)
-    assert harness.mesh_plan(4, 4, []) == ("here", None)
-    assert harness.mesh_plan(2, 8, []) == ("here", None)
+    assert harness.mesh_plan(4, 4, [], platform="cpu") == ("here", None)
+    assert harness.mesh_plan(2, 8, [], platform="cpu") == ("here", None)
+    assert harness.mesh_plan(4, 4, ["0", "1", "2", "3"],
+                             platform="cuda") == ("here", None)
+
+
+def test_emulated_devices_do_not_stand_in_for_the_nodes_real_ones():
+    """The PARENT half of the same defect the child is checked for.
+
+    A census worker carries `JAX_PLATFORMS=cpu` and four emulated host devices
+    the moment collection has imported the modules that set them, so
+    `jax.device_count()` answers 4 on a node with four A100s.  Counting alone,
+    the cell would run right here on the emulated mesh and report a pass that
+    says nothing about the hardware.  The session's own device list is what
+    breaks the tie."""
+    assert harness.mesh_plan(4, 4, ["0", "1", "2", "3"], platform="cpu") == (
+        "subprocess", ["0", "1", "2", "3"])
 
 
 def test_a_node_without_the_devices_still_skips_and_says_so():
     """A laptop, the WSL box, a one-GPU leg.  Skipping is the honest verdict
     there; the reason has to name both counts, or the next reader cannot tell
     "no hardware" from "the pin ate it"."""
-    verb, why = harness.mesh_plan(4, 1, ["0"])
+    verb, why = harness.mesh_plan(4, 1, ["0"], platform="cuda")
     assert verb == "skip"
     assert "has 1" in why and "session has 1" in why
 
@@ -341,24 +355,63 @@ def test_the_child_never_starts_another_child_and_never_skips():
     the defect: a child that did not get its devices reporting a SKIP would
     put the cell back in the silently-unexercised set, this time with a
     mechanism that looks like it works."""
-    verb, why = harness.mesh_plan(4, 1, ["0", "1", "2", "3"], inner=True)
+    verb, why = harness.mesh_plan(
+        4, 1, ["0", "1", "2", "3"], inner=True, platform="cpu")
     assert verb == "fail"
     assert "not a skip" in why
 
 
+def test_a_child_that_came_up_emulated_is_a_failure_not_a_pass():
+    """MEASURED, Perlmutter 2026-08-10, and the reason the child is checked on
+    its PLATFORM and not only its count.
+
+    ``tests/test_contract_bands`` and ``tests/test_sanity_gates_jax`` set
+    ``JAX_PLATFORMS=cpu`` and four emulated host devices at MODULE SCOPE —
+    they have to, the values are latched at ``import jax`` — and a module-scope
+    write never unwinds.  So in a census every later child inherited them,
+    came up with four HOST devices on a node with four A100s, and would have
+    passed every mesh cell while measuring the emulated arm.  Four is four:
+    only the platform separates the run that honours the four-GPU rule from
+    the run that quietly substitutes for it."""
+    verb, why = harness.mesh_plan(4, 4, ["0", "1", "2", "3"], inner=True,
+                                  platform="cpu")
+    assert verb == "fail"
+    assert "quietly emulated" in why and "platform 'cpu'" in why
+    assert harness.mesh_plan(4, 4, ["0", "1", "2", "3"], inner=True,
+                             platform="cuda") == ("here", None)
+
+
 def test_the_child_env_widens_only_the_child():
     """The parent's pin is not touched — the child gets its own environment —
-    and the three edits that make a fifth process safe on a busy node are
-    all present."""
+    and the four edits that make a fifth process safe, and honest, on a busy
+    node are all present."""
     base = {"CUDA_VISIBLE_DEVICES": "2", "PYTEST_XDIST_WORKER": "gw2",
-            "JAX_ENABLE_X64": "1"}
-    env = harness.mesh_subprocess_env(base, ["0", "1", "2", "3"])
+            "JAX_ENABLE_X64": "1",
+            # what a census's collection leaves behind, which the child must
+            # NOT inherit:
+            "JAX_PLATFORMS": "cpu",
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
+    env = harness.mesh_subprocess_env(
+        base, ["0", "1", "2", "3"],
+        {"JAX_PLATFORMS": None, "XLA_FLAGS": None})   # the caller had none
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
     assert base["CUDA_VISIBLE_DEVICES"] == "2"          # caller untouched
     assert env[harness.MESH_CELL_ENV] == "1"
     assert env["XLA_PYTHON_CLIENT_ALLOCATOR"] == "platform"
     assert "PYTEST_XDIST_WORKER" not in env
     assert env["JAX_ENABLE_X64"] == "1"
+    assert "JAX_PLATFORMS" not in env and "XLA_FLAGS" not in env
+
+
+def test_a_caller_who_asked_for_a_platform_still_gets_it():
+    """The snapshot is of the CALLER's environment, not a blanket erase: an
+    explicit `JAX_PLATFORMS=cpu` on the command line is a choice, and the
+    child honours it.  Only what collection added is dropped."""
+    base = {"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--leaked"}
+    env = harness.mesh_subprocess_env(
+        base, ["0", "1"], {"JAX_PLATFORMS": "cpu", "XLA_FLAGS": None})
+    assert env["JAX_PLATFORMS"] == "cpu"
+    assert "XLA_FLAGS" not in env
 
 
 def test_the_session_device_list_is_read_before_the_pin_narrows_it():
