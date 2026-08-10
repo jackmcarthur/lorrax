@@ -142,12 +142,30 @@ where ``B·M·N`` replicated per rank is the binding cost — and the
 measured domain is CPU/``impl=mpi``/2 ranks per node; no GPU walltime of
 this module exists.  Values: byte-identical .dat at both P.
 
+Those two ``involuntary-remat lines N -> 0`` counts are HISTORY, not a
+check that can be re-run.  They were read off Frontera's XLA in
+2026-07-31, where the partitioner still printed the line quoted above.
+The shipped stack no longer prints it at all — see below — so an A/B that
+greps for it today reads zero on both arms.
+
 Gate: ``tests/test_staged_reshard.py`` — value parity against the
-unstaged chain, an HLO pin (2 ``all-to-all``, zero full-batch
-``all-gather``), and a RED TWIN that compiles the unstaged chain in a
-subprocess and requires the compiler's own
-``Involuntary full rematerialization`` line to appear.  An instrument
-that has not been shown failing is not an instrument (wk_REL README §5.1).
+unstaged chain, and a pin on the compiled module: exactly two
+``all-to-all`` ISSUE SITES and no other collective, no per-device buffer
+larger than one shard, and a temp allocation below the size of the whole
+array.  Its RED TWIN puts the unstaged chain through the same assertion
+helper and requires it to raise, in-process and again as a cold compile at
+this docstring's own deck geometry.  An instrument that has not been shown
+failing is not an instrument (wk_REL README §5.1).
+
+That pin used to be written as a count of the string ``all-to-all(`` plus
+a grep of the compiler's ``Involuntary full rematerialization`` warning,
+and BOTH were vacuous on CUDA — the count because XLA:GPU spells its
+collectives ``all-to-all-start``/``-done`` and read 0 of 2, the grep
+because the warning is absent on this XLA on every platform and under both
+partitioners even while the replication it announced is still there.  Both
+were repaired GPU-first on 2026-08-10; the measurement is
+``/pscratch/sd/j/jackm/reshard_instr_0810/`` and the reasoning is at the
+head of each section of the gate file.
 """
 from __future__ import annotations
 
