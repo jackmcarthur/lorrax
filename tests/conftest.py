@@ -146,15 +146,22 @@ def pytest_configure(config):
     if pinned is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = pinned
 
-    # ``loadgroup`` so the ``xdist_group`` the mesh marker adds below is
-    # honoured: every mesh cell then lands on ONE worker, which runs ONE
-    # subprocess per module instead of up to four workers each running
-    # their own.  For a cell with no group loadgroup IS load — xdist's
-    # LoadGroupScheduling subclasses LoadScheduling and differs only in
-    # where grouped items go — so this changes the schedule of nothing
-    # else.  Only reached when xdist is already active (``dist != "no"``).
-    if getattr(config.option, "dist", "no") == "load":
-        config.option.dist = "loadgroup"
+    # THE SUITE DOES NOT PROMOTE ``load`` TO ``loadgroup`` HERE, and the
+    # reason is measured rather than argued.  Promoting it looked like the
+    # way to make the ``xdist_group`` the mesh marker adds below concentrate
+    # every mesh cell on one worker — one child per module instead of one per
+    # (worker, module).  MEASURED on Perlmutter 2026-08-10, nid002460: it did
+    # not take.  ``tests/test_charge_zeta_route.py``'s eight cells ran in FOUR
+    # separate children (pids 233898/233901/233904/233907, the mesh-child log
+    # in the node's TMPDIR), so the group never reached the scheduler.
+    #
+    # Left out rather than left in, because a mechanism that is asserted and
+    # does not work is worse than one that is absent: it makes the next reader
+    # believe a cost is paid that is not.  The cost is small and is now
+    # stated instead — each child is 4-15 s, and a census pays on the order of
+    # fifteen of them.  The marker stays: under an EXPLICIT ``--dist
+    # loadgroup`` the grouping does work, and ``_plain_nodeid`` below keeps
+    # that arrangement correct.
 
 
 # ---------------------------------------------------------------------------
@@ -336,14 +343,32 @@ def _mesh_plan_for(item, want: int):
         platform=platform)
 
 
+_MESH_GROUP = "lorrax-mesh"
+
+
+def _plain_nodeid(item) -> str:
+    """The item's nodeid as PYTEST spells it, not as xdist may have.
+
+    Under ``--dist loadgroup`` xdist rewrites every grouped item's nodeid to
+    ``<nodeid>@<group>`` so its scheduler can read the group back off it.
+    That spelling is xdist's, and no pytest can resolve it — handing it to
+    the child would collect nothing and turn a whole module red for a
+    bookkeeping reason.  Anchored on OUR group name, so a parametrised id
+    that happens to contain an ``@`` is untouched.
+    """
+    nodeid = item.nodeid
+    suffix = "@" + _MESH_GROUP
+    return nodeid[:-len(suffix)] if nodeid.endswith(suffix) else nodeid
+
+
 def _mesh_verdict(item, want: int, devices):
     """This cell's outcome, running its module's mesh cells if needed."""
-    module = item.nodeid.split("::", 1)[0]
+    module = _plain_nodeid(item).split("::", 1)[0]
     cache = item.config.stash.setdefault(_MESH_VERDICTS, {})
     if module not in cache:
         group = sorted({
-            it.nodeid for it in item.session.items
-            if it.nodeid.split("::", 1)[0] == module
+            _plain_nodeid(it) for it in item.session.items
+            if _plain_nodeid(it).split("::", 1)[0] == module
             and _mesh_want(it) is not None})
         res, xml = harness.run_mesh_group(
             group, devices, cwd=str(item.config.rootpath),
@@ -373,7 +398,7 @@ def _mesh_verdict(item, want: int, devices):
     if "__launch__" in verdicts:
         return verdicts["__launch__"]
     return verdicts.get(
-        item.nodeid,
+        _plain_nodeid(item),
         ("failed", "the mesh child reported no verdict for this cell — it "
                    "was not collected there.  A cell that cannot be named to "
                    "the child is a cell the suite is not running."))
@@ -432,7 +457,7 @@ def _group_mesh_items(config, items):
         return
     for item in items:
         if item.get_closest_marker("mesh") is not None:
-            item.add_marker(pytest.mark.xdist_group("lorrax-mesh"))
+            item.add_marker(pytest.mark.xdist_group(_MESH_GROUP))
 
 
 # ---------------------------------------------------------------------------
