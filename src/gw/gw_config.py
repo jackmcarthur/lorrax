@@ -942,7 +942,35 @@ _DEFAULTS = {
     # cover the store's pass order exactly once, because a missing or
     # doubled pole returns a finite, smooth, plausible Σ that differs by
     # tens of meV — the size of the effect these runs measure.
+    #
+    # THE SAME SPLIT, ONE LEVEL FINER, because eight poles cannot fill
+    # sixteen devices and 918 window groups can.  The 2026-08-10 farm
+    # measurement put the number on it: a sixteen-GPU pool runs an n_p=8
+    # pass at 26.5 % utilisation and the wall does not move at all from
+    # eight GPUs to sixteen.
+    # ``mpa_group_subset`` — which of the pass loop's window groups this
+    # process integrates, as ``<pole>.<branch>:<lo>-<hi>/<total>`` items
+    # (branch is pos_cond/pos_val/neg_cond/neg_val).  The planner runs
+    # unchanged and its output is sliced, so the groups, their membership,
+    # their certified rules and their tau nodes are the ones the unsplit
+    # walk uses.  ``<total>`` is part of the address and is checked: a
+    # manifest balanced against a different partition is refused rather
+    # than silently clipped.
+    # ``mpa_pass_census_out`` — plan every branch of the poles this
+    # process walks, write the per-group tau-dispatch table there, and
+    # integrate NOTHING.  The farm balancer cannot be struck without it,
+    # because a group's cost is its node count and that is only known once
+    # its rule is built.  A run with this set exits 0 after the census and
+    # announces, loudly, that it produced no self-energy.
+    # ``mpa_farm_manifest`` — the farm manifest a recombination checks
+    # against.  Required when the cubes are window-farmed, because a stack
+    # of cubes can say which groups it holds and cannot say how many legs
+    # there were supposed to be — which is exactly the shape of the
+    # 2026-08-10 fit farm that silently lost leg 12 and its q [48, 52).
     "mpa_pole_subset": "",
+    "mpa_group_subset": "",
+    "mpa_pass_census_out": "",
+    "mpa_farm_manifest": "",
     "mpa_pass_partial_out": "",
     "mpa_pass_partial_in": "",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
@@ -2342,6 +2370,16 @@ class LorraxConfig:
     #: Which poles this process integrates, comma separated; "" is every
     #: pole.  See ``_DEFAULTS["mpa_pole_subset"]``.
     mpa_pole_subset: str
+    #: Which window groups of which (pole, branch) this process
+    #: integrates; "" is every group of every pole it walks.  See
+    #: ``_DEFAULTS["mpa_group_subset"]``.
+    mpa_group_subset: str
+    #: Where this process writes the window-group census and stops; "" is
+    #: a normal integrating run.  See ``_DEFAULTS["mpa_pass_census_out"]``.
+    mpa_pass_census_out: str
+    #: The farm manifest a recombination checks its cubes against; ""
+    #: is a pole-farm stack.  See ``_DEFAULTS["mpa_farm_manifest"]``.
+    mpa_farm_manifest: str
     #: Where this process writes its partial Σ_c cube (""= not a partial
     #: run).  See ``_DEFAULTS["mpa_pass_partial_out"]``.
     mpa_pass_partial_out: str
@@ -2937,6 +2975,10 @@ class LorraxConfig:
                 _g("mpa_pole_energy_unit")),
             mpa_head_label=str(_g("mpa_head_label") or "").strip(),
             mpa_pole_subset=str(_g("mpa_pole_subset") or "").strip(),
+            mpa_group_subset=str(_g("mpa_group_subset") or "").strip(),
+            mpa_pass_census_out=str(
+                _g("mpa_pass_census_out") or "").strip(),
+            mpa_farm_manifest=str(_g("mpa_farm_manifest") or "").strip(),
             mpa_pass_partial_out=str(
                 _g("mpa_pass_partial_out") or "").strip(),
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),

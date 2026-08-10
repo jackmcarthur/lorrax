@@ -172,6 +172,7 @@ __all__ = [
     "plan_branch_groups",
     "refuse_wedge_pole_slab",
     "resolve_pole_subset",
+    "resolve_pass_poles",
     "run_pass_branch",
     "split_pass_by_width",
     "write_pass_partial",
@@ -1285,8 +1286,46 @@ def resolve_pole_subset(n_p, subset):
     return tuple(p for p in order if p in set(want))
 
 
+def resolve_pass_poles(n_p, pole_subset, group_subset):
+    """The poles one leg walks, given both subset keys.
+
+    A WINDOW-GROUP LEG NAMES ITS POLES TWICE and the two must agree.  The
+    group spec already says which (pole, branch) pairs the leg owns, so
+    the poles are derivable from it; ``mpa_pole_subset`` is still accepted
+    beside it because it is the key the pole farm uses and a leg spelling
+    both is the normal case.  What is refused is a DISAGREEMENT — a leg
+    told to walk pole 3 while owning groups of pole 4 would read one
+    pole's slab and integrate none of it, report success, and leave pole
+    4's groups uncovered with every other leg reporting success too.
+    """
+    order = resolve_pole_subset(n_p, pole_subset)
+    if group_subset is None:
+        return order
+    want = sorted({int(p) for (p, _b) in group_subset})
+    bad = [p for p in want if p not in resolve_pole_subset(n_p, None)]
+    if bad:
+        raise ValueError(
+            f"mpa_group_subset: pole index/indices {bad} are outside this "
+            f"store's pinned pass order (n_p={int(n_p)}).")
+    if pole_subset:
+        extra = sorted(set(want) - set(order))
+        idle = sorted(set(order) - set(want))
+        if extra or idle:
+            raise ValueError(
+                f"this leg's mpa_pole_subset walks poles {list(order)} but "
+                f"its mpa_group_subset owns groups of poles {want}"
+                + (f"; poles {extra} would never be read" if extra else "")
+                + (f"; poles {idle} would be read and never integrated"
+                   if idle else "")
+                + ".  Both are coverage errors that finish with rc=0 and a "
+                  "plausible cube, so the two keys are required to name the "
+                  "same poles rather than being reconciled here.")
+    return tuple(p for p in resolve_pole_subset(n_p, None) if p in set(want))
+
+
 def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
-                       omega_grid_ry, fit_src, print_fn=print):
+                       omega_grid_ry, fit_src, group_spec=None, leg_id=None,
+                       print_fn=print):
     """Write ONE process's partial Σ_c cube, with the manifest that makes
     it recombinable and the refusals that make it non-mistakable.
 
@@ -1306,6 +1345,17 @@ def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
     store's ``n_p``, the ω grid in Ry, the fit store path, and the per-pass
     provenance triples the pass report prints.  :func:`combine_pass_partials`
     checks every one of them.
+
+    ``group_spec`` IS THE SAME STAMP ONE LEVEL DOWN.  When the pass is
+    farmed at window-group granularity a pole no longer names a cube:
+    several cubes carry pole 3, each holding a different run of its window
+    groups, and the pole list alone would then read as "pole 3 counted
+    four times" to a coverage check that only knows about poles.  So a
+    window-farmed leg stamps the group ranges it integrated, in the
+    canonical ``<pole>.<branch>:<lo>-<hi>/<total>`` spelling, and
+    :func:`combine_pass_partials` checks coverage at that granularity
+    against the farm's manifest.  A cube with no group stamp is a
+    whole-pole cube and is checked the way it always was.
     """
     import datetime
     import h5py
@@ -1318,6 +1368,10 @@ def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
         f.attrs["mpa_partial_poles"] = np.asarray(poles, dtype=np.int64)
         f.attrs["mpa_partial_n_p"] = int(n_p)
         f.attrs["mpa_partial_fit_store"] = str(fit_src)
+        if group_spec:
+            f.attrs["mpa_partial_group_spec"] = str(group_spec)
+        if leg_id:
+            f.attrs["mpa_partial_leg_id"] = str(leg_id)
         f.attrs["mpa_partial_written_utc"] = (
             datetime.datetime.now(datetime.timezone.utc).isoformat())
         f.create_dataset("omega_grid_ry", data=om)
@@ -1341,12 +1395,97 @@ def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
         f"  MPA pass partial written: {path}\n"
         f"    poles {list(poles)} of n_p={int(n_p)}; Σ_c shape "
         f"{tuple(int(x) for x in arr.shape)}; this cube is a PARTIAL SUM "
-        f"and is not a self-energy until it is combined with the rest.")
+        f"and is not a self-energy until it is combined with the rest."
+        + (f"\n    window-group range: {group_spec}" if group_spec else ""))
     return str(path)
 
 
+def _group_sort_key(spec):
+    """A window-farmed cube's position in the pinned walk.
+
+    Its lowest address: pole ascending, branch in ``_iter_branches`` order,
+    then the planner's own group index.  The legs are contiguous runs of
+    that walk, so sorting on the lowest address puts the cubes back in the
+    order a single process would have summed their contents in — which is
+    what "the ascending recombination" means once the split is finer than
+    a pole.
+    """
+    from . import window_farm as WF
+
+    return min((p, WF.BRANCH_KEYS.index(b), lo)
+               for (p, b), (lo, _hi, _tot) in spec.items())
+
+
+def _refuse_group_coverage(group_specs, *, order, manifest):
+    """Every planned window group summed exactly once, or a refusal by name.
+
+    The pole-level check cannot see this failure and the leg-level one
+    cannot see it either: sixteen legs that all report success can still
+    leave a hole, because a leg that dies before writing is caught by the
+    manifest while a leg that ran the WRONG RANGE is not.  So the ranges
+    themselves are tiled here — per (pole, branch), the union of the legs'
+    ``[lo, hi)`` must be exactly ``[0, total)`` with no overlap — and the
+    branch totals must agree with the manifest's universe.
+    """
+    if manifest is None:
+        raise ValueError(
+            "combine_pass_partials: these cubes are window-farmed (they "
+            "carry group ranges) but no manifest was given.  The cubes can "
+            "say which groups they hold and cannot say how many legs there "
+            "were meant to be, so without the manifest a farm that lost a "
+            "leg and a farm that was always this size are the same stack of "
+            "files.  Pass the manifest the farm was launched from.")
+    universe = {tuple(k.split(".", 1)): int(v)
+                for k, v in (manifest.get("universe") or {}).items()}
+    universe = {(int(p), b): n for (p, b), n in universe.items()}
+    if not universe:
+        raise ValueError(
+            "combine_pass_partials: the manifest declares no group "
+            "universe, so there is nothing to check coverage against.")
+    seen = {}
+    for path, spec in sorted(group_specs.items()):
+        for key, (lo, hi, total) in spec.items():
+            if key in universe and total != universe[key]:
+                raise ValueError(
+                    f"combine_pass_partials: {path} says pole {key[0]} "
+                    f"branch {key[1]} has {total} window groups; the "
+                    f"manifest says {universe[key]}.  The cube was "
+                    f"integrated against a different partition than the one "
+                    f"this farm was balanced for.")
+            for g in range(lo, hi):
+                prev = seen.setdefault((key, g), path)
+                if prev != path:
+                    raise ValueError(
+                        f"combine_pass_partials: pole {key[0]} branch "
+                        f"{key[1]} group {g} appears in both {prev} and "
+                        f"{path}.  A window group summed twice is a smooth, "
+                        f"finite Σ with one group's contribution doubled, "
+                        f"which no shape, Hermiticity or magnitude check "
+                        f"downstream can see.")
+    holes = []
+    for key, n in sorted(universe.items()):
+        missing = [g for g in range(n) if (key, g) not in seen]
+        if missing:
+            holes.append(f"pole {key[0]} branch {key[1]}: groups "
+                         f"{missing[:8]}{' ...' if len(missing) > 8 else ''} "
+                         f"of {n}")
+    if holes:
+        raise ValueError(
+            "combine_pass_partials: the window-farmed cubes do not cover "
+            "the pass's window groups exactly once — "
+            + "; ".join(holes)
+            + ".  Every leg that ran may have succeeded and the missing "
+              "groups still be missing; that is what this check is for.")
+    poles_seen = sorted({key[0] for (key, _g) in seen})
+    if tuple(poles_seen) != tuple(order):
+        raise ValueError(
+            f"combine_pass_partials: the window-farmed cubes cover poles "
+            f"{poles_seen}, not the store's pinned pass order "
+            f"{list(order)}.")
+
+
 def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
-                          print_fn=print):
+                          manifest=None, print_fn=print):
     """Sum per-pole partial cubes in the PINNED ascending order.
 
     Returns ``(sigma_c_total, poles, audit)``.
@@ -1370,15 +1509,44 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
     downstream gate can distinguish from the right one; the FALSE case of
     this check is precisely those, and the red twins in
     ``tests/test_mpa_pass_partials.py`` construct each of them.
+
+    AT WINDOW-GROUP GRANULARITY THE POLE IS NO LONGER THE UNIT, and the
+    check follows the split down.  When the cubes carry
+    ``mpa_partial_group_spec`` stamps, several of them hold the same pole
+    and the pole-level check would read that as a duplicate; so coverage
+    is then asked of the (pole, branch, group) addresses, which must tile
+    each branch's ``[0, n_groups)`` exactly once, and a MANIFEST is
+    required — because the partials themselves cannot say how many legs
+    there were supposed to be, and "every group I was given is accounted
+    for" is precisely the sentence a farm that silently lost a leg can
+    also say.  ``manifest`` is a farm manifest as
+    ``gw.mpa.window_farm.write_manifest`` writes it; the completeness
+    refusal runs before a single cube is added.
     """
     import h5py
 
     from .fit_driver import pole_pass_order
+    from . import window_farm as WF
 
     order = pole_pass_order(n_p)
     om_want = np.asarray(omega_grid_ry, dtype=np.float64)
+    paths = sorted(str(p) for p in paths)
+    if manifest is not None:
+        WF.refuse_incomplete(manifest, print_fn=print_fn)
+        declared = {str(leg["output"]) for leg in manifest["legs"]}
+        stray = sorted(set(paths) - declared)
+        if stray:
+            raise ValueError(
+                f"combine_pass_partials: {len(stray)} cube(s) were handed to "
+                f"the merge that the manifest never declared: {stray}.  A "
+                f"cube from a previous farm has the same shape, dtype and "
+                f"units as one from this farm and adds a whole extra pass "
+                f"to the sum; the manifest is the list of what belongs and "
+                f"this is not on it.")
+        paths = [str(leg["output"]) for leg in manifest["legs"]]
     loaded = []                     # (pole, path, cube) with one row per pole
-    for path in sorted(str(p) for p in paths):
+    group_specs = {}                # path -> parsed group spec, when stamped
+    for path in paths:
         with h5py.File(path, "r") as f:
             version = int(f.attrs.get("mpa_partial_format_version", -1))
             if version != PARTIAL_FORMAT_VERSION:
@@ -1408,6 +1576,9 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
                     f"grid than this run.  The partials are summed elementwise "
                     f"on that axis, so a mismatched grid adds two different "
                     f"frequencies together.")
+            spec_txt = str(f.attrs.get("mpa_partial_group_spec", "") or "")
+            if spec_txt:
+                group_specs[path] = WF.parse_group_subset(spec_txt)
             cube = np.asarray(f["sigma_c_partial"][()], dtype=np.complex128)
             for p in np.asarray(f.attrs["mpa_partial_poles"]).tolist():
                 loaded.append((int(p), path, cube))
@@ -1423,20 +1594,35 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
         if cube is not None:
             entry["cube"] = cube
 
-    covered = sorted(p for e in by_path.values() for p in e["poles"])
-    if tuple(covered) != order:
-        missing = sorted(set(order) - set(covered))
-        twice = sorted({p for p in covered if covered.count(p) > 1})
-        raise ValueError(
-            f"combine_pass_partials: the partials do not cover the store's "
-            f"pass order exactly once.  Pinned order {order}; found "
-            f"{covered}; missing {missing}; duplicated {twice}.  A missing "
-            f"pole and a doubled pole both return a finite, smooth Σ of the "
-            f"same shape as the right one — the difference is tens of meV, "
-            f"which is the size of the effect being measured — so coverage "
-            f"is refused here rather than checked downstream.")
-
-    ordered = sorted(by_path.items(), key=lambda kv: min(kv[1]["poles"]))
+    if group_specs:
+        if len(group_specs) != len(by_path):
+            plain = sorted(set(by_path) - set(group_specs))
+            raise ValueError(
+                f"combine_pass_partials: this stack mixes window-farmed "
+                f"cubes with whole-pole cubes ({plain} carry no group "
+                f"stamp).  A whole-pole cube and the group-range cubes of "
+                f"the same pole sum that pole twice, which is a finite, "
+                f"smooth Σ wrong by one pole's worth; the two farm "
+                f"granularities are not combinable and are refused rather "
+                f"than reconciled.")
+        _refuse_group_coverage(group_specs, order=order, manifest=manifest)
+        ordered = sorted(by_path.items(),
+                         key=lambda kv: _group_sort_key(group_specs[kv[0]]))
+    else:
+        covered = sorted(p for e in by_path.values() for p in e["poles"])
+        if tuple(covered) != order:
+            missing = sorted(set(order) - set(covered))
+            twice = sorted({p for p in covered if covered.count(p) > 1})
+            raise ValueError(
+                f"combine_pass_partials: the partials do not cover the "
+                f"store's pass order exactly once.  Pinned order {order}; "
+                f"found {covered}; missing {missing}; duplicated {twice}.  A "
+                f"missing pole and a doubled pole both return a finite, "
+                f"smooth Σ of the same shape as the right one — the "
+                f"difference is tens of meV, which is the size of the effect "
+                f"being measured — so coverage is refused here rather than "
+                f"checked downstream.")
+        ordered = sorted(by_path.items(), key=lambda kv: min(kv[1]["poles"]))
     total = np.zeros_like(ordered[0][1]["cube"])
     for _, e in ordered:                       # THE PINNED ORDER
         total = total + e["cube"]
@@ -1482,7 +1668,8 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
 def compute_mpa_sigma_c_omega_grid(
     wfns, fit_src, meta, mesh_xy, *, ppm_cfg, quad, omega_grid_ry,
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
-    allow_partial=False, pole_subset=None, print_fn=print,
+    allow_partial=False, pole_subset=None, group_subset=None,
+    group_digests=None, census_out=None, census_sha="", print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -1503,12 +1690,31 @@ def compute_mpa_sigma_c_omega_grid(
     self-energy, which is exactly why the partial writer stamps a manifest
     and the combiner refuses anything that does not cover the store's pass
     order exactly once.
+
+    ``group_subset`` SPLITS THE SAME WALK ONE LEVEL FINER, and it is the
+    key that lets a pass fill more devices than it has poles.  It names,
+    per (pole, branch), a half-open range of the planner's window groups;
+    the planner is called with the identical arguments and its output is
+    sliced, so the groups, their membership, their rules and their node
+    counts are the ones the unsplit walk would have used, and the leg
+    integrates them in the order the unsplit walk would have.  A (pole,
+    branch) the subset does not name is not planned at all — by linearity
+    its contribution to THIS leg is zero, and skipping the plan is what
+    keeps a sixteen-leg farm from paying the planning cost sixteen times.
+
+    ``census_out`` is the other half of the mechanism and does no
+    integration: it plans every branch of the poles it walks, writes the
+    per-group tau-dispatch table that the farm balancer needs, and stops.
+    The balance cannot be struck without it — ``n_tau`` per group is only
+    known once the rules are built — and it is the one thing in this path
+    that must be measured before any of it is scheduled.
     """
     import jax
     import jax.numpy as jnp
 
     from common import timing
     from file_io import mpa_store
+    from . import window_farm as WF
     from ..ppm_sigma import (
         _iter_branches, _prepare_sigma_state, pad_sigma_window,
         strip_sigma_window)
@@ -1567,12 +1773,21 @@ def compute_mpa_sigma_c_omega_grid(
     # the order it walks them in -- ``resolve_pole_subset`` returns a
     # subsequence of the pinned order, so a split run and a whole run
     # associate the same way within each process.
-    walk = resolve_pole_subset(n_p, pole_subset)
-    if len(walk) != n_p:
+    walk = resolve_pass_poles(n_p, pole_subset, group_subset)
+    census_rows, census_digests = [], {}
+    if census_out is not None:
+        print_fn(
+            f"  MPA Σ: CENSUS ONLY over poles {list(walk)} -- every branch "
+            f"is planned and NOTHING is integrated.  This run produces the "
+            f"window-group table a farm balances on and no self-energy.")
+    elif len(walk) != n_p or group_subset is not None:
         print_fn(
             f"  MPA Σ: this process integrates poles {list(walk)} of "
             f"{n_p} -- a PARTIAL sum over the pole axis.  Its Σ_c is not "
-            f"a self-energy until every other pole's partial is added.")
+            f"a self-energy until every other pole's partial is added."
+            + (f"\n    window-group range: "
+               f"{WF.format_group_subset(group_subset)}"
+               if group_subset is not None else ""))
     for p in walk:
         with timing.section("mpa.pass_read"):
             Omega_p, B_p = mpa_store.read_pole_slice(
@@ -1608,6 +1823,16 @@ def compute_mpa_sigma_c_omega_grid(
                 idx_neg=idx_neg,
                 E_cond=state.E_cond, H_val=state.H_val,
                 cond_mask=state.cond_mask, val_mask=state.val_mask):
+            bkey = WF.branch_key(br.space, br.neg_omega_half)
+            # A BRANCH THIS LEG DOES NOT OWN IS NOT PLANNED, and that is
+            # the difference between a sixteen-leg farm that pays the
+            # planner once per pole and one that pays it once per leg.
+            # Skipping is exact rather than approximate: this leg's
+            # contribution to a branch it holds no groups of is zero by
+            # linearity, and the leg that does hold them plans them.
+            if (census_out is None and group_subset is not None
+                    and (int(p), bkey) not in group_subset):
+                continue
             E_A_host = _host_at_source_shape(br.E_A, np.float64, _to_host_np)
             mask_A_host = _host_at_source_shape(
                 br.base_mask_A, bool, _to_host_np)
@@ -1629,8 +1854,24 @@ def compute_mpa_sigma_c_omega_grid(
             rec.n_mpa_modes = stats["n_wide"]
             rec.legacy_b_mass = stats["narrow_b_mass"]
             rec.mpa_b_mass = stats["wide_b_mass"]
-            rec.n_tau_nodes += stats["n_tau"]
+            if census_out is not None:
+                census_rows += WF.census_rows_from_groups(
+                    groups, pole=p, bkey=bkey, branch_tag=br.tag)
+                census_digests[f"{int(p)}.{bkey}"] = WF.group_plan_digest(
+                    groups)
+                print_fn(
+                    f"  MPA census p{p} {br.tag} ({bkey}): {len(groups)} "
+                    f"window groups, {stats['n_tau']} tau dispatches")
+                continue
+            groups, group_lo = WF.select_branch_groups(
+                groups, pole=p, bkey=bkey, spec=group_subset,
+                digest=(group_digests or {}).get(f"{int(p)}.{bkey}"))
+            if not groups:
+                continue
+            rec.n_tau_nodes += int(sum(int(w.n_tau) for g in groups
+                                       for w in g.windows))
             rec.groups += [g.name for g in groups]
+            del group_lo
             branch_tiles = run_pass_branch(
                 groups=groups, omega_nonneg_ry=br.omega_abs, E_A=br.E_A,
                 B_p=B_dev, psi=psi, tau_kernels=tau_kernels,
@@ -1646,6 +1887,20 @@ def compute_mpa_sigma_c_omega_grid(
                 for d, t in enumerate(branch_tiles.tiles):
                     tile_acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
         records.append(rec)
+
+    if census_out is not None:
+        WF.write_census(
+            census_out, census_rows, fit_store=str(fit_src), n_p=n_p,
+            sha=str(census_sha), digests=census_digests,
+            extra={"poles": [int(x) for x in walk],
+                   "omega_grid_ry": [float(x) for x in omega_req]})
+        print_fn(
+            f"  MPA pass census written: {census_out}\n"
+            f"    {len(census_rows)} window groups over poles "
+            f"{list(walk)}, "
+            f"{sum(int(r['n_tau']) for r in census_rows)} tau dispatches.  "
+            f"NO Σ was integrated by this run.")
+        return None, records
 
     if tile_acc is None:
         raise RuntimeError(

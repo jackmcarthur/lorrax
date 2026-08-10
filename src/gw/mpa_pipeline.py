@@ -133,6 +133,34 @@ def _parse_pole_subset(raw):
     return tuple(out) or None
 
 
+def _source_sha():
+    """The tree the census was taken from, best effort.
+
+    Stamped into the census because the planner IS source: a manifest
+    balanced from a census taken at one sha and run by legs built from
+    another names group ranges that may no longer be the same groups.
+    ``merge_census_files`` refuses a set of censuses that disagree on it,
+    and the per-branch digest catches the case this string misses (a
+    dirty tree at one sha).
+    """
+    import subprocess
+
+    for env_key in ("LORRAX_SOURCE_SHA", "LORRAX_CHECKOUT"):
+        val = os.environ.get(env_key, "")
+        if env_key == "LORRAX_SOURCE_SHA" and val:
+            return val.strip()
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=20)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:                           # pragma: no cover - advisory
+        pass
+    return "unknown"
+
+
 def _partial_paths_in(spec):
     """Every partial-cube file named by ``mpa_pass_partial_in``.
 
@@ -353,8 +381,11 @@ def compute_mpa_sigma_pipeline(
     a caller that has already resolved the path, and ``None`` (the
     default) means "ask the deck", which is the production route.
     """
+    import sys
+
     from file_io import mpa_store
     from .gw_output import print_section
+    from .mpa import window_farm
     from .mpa.sigma_pass import (
         combine_pass_partials,
         compute_mpa_sigma_c_omega_grid,
@@ -491,6 +522,52 @@ def compute_mpa_sigma_pipeline(
         # the split because it is what the combiner sums in.
         partial_in = str(getattr(config, "mpa_pass_partial_in", "") or "")
         partial_out = str(getattr(config, "mpa_pass_partial_out", "") or "")
+        census_out = str(getattr(config, "mpa_pass_census_out", "") or "")
+        manifest_path = str(getattr(config, "mpa_farm_manifest", "") or "")
+        group_subset = window_farm.parse_group_subset(
+            getattr(config, "mpa_group_subset", ""))
+        manifest = (window_farm.read_manifest(manifest_path)
+                    if manifest_path else None)
+        if census_out and (partial_in or partial_out):
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: mpa_pass_census_out is set "
+                "beside a partial key.  A census run integrates nothing and "
+                "writes no cube; a run that did both would leave a partial "
+                "path named in a manifest with no partial behind it, which "
+                "is the exact shape of the failure the manifest exists to "
+                "catch.")
+        if census_out:
+            # THE CENSUS RUN, AND WHY IT EXITS RATHER THAN RETURNING.
+            # Everything after this point — the head, the at-DFT
+            # interpolation, sigma_mnk.h5 — is computed FROM a Σ_c cube,
+            # and this run deliberately produces none.  Continuing with a
+            # zero cube would write an eqp table that is finite, smooth
+            # and entirely wrong, so the run stops here, in the shape the
+            # tree already uses for a deliberate early exit
+            # (``LORRAX_EXIT_AFTER_ZETA``): a loud, greppable banner on
+            # both streams and rc = 0, because the census IS this run's
+            # product and it succeeded.
+            with timing.section("sigma.exec"):
+                _cube, _records = compute_mpa_sigma_c_omega_grid(
+                    wfns, path, meta, mesh_xy,
+                    ppm_cfg=config.ppm,
+                    quad=config.sigma_quadrature_config,
+                    omega_grid_ry=config.omega_grid_ry,
+                    pole_subset=_parse_pole_subset(
+                        getattr(config, "mpa_pole_subset", "")),
+                    census_out=census_out,
+                    census_sha=_source_sha(),
+                    print_fn=print_fn,
+                )
+            del _cube, _records
+            banner = (
+                "*** LORRAX EARLY EXIT: mpa_pass_census_out — the window-"
+                f"group census was written to {census_out} and NOTHING was "
+                "integrated.  This run produced no self-energy: no Σ_c "
+                "cube, no head, no eqp table. ***")
+            print_fn(banner)
+            print(banner, file=sys.stderr, flush=True)
+            raise SystemExit(0)
         if partial_in and partial_out:
             raise ValueError(
                 "compute_mpa_sigma_pipeline: mpa_pass_partial_in and "
@@ -504,7 +581,7 @@ def compute_mpa_sigma_pipeline(
                 total, _poles, audit = combine_pass_partials(
                     paths, n_p=int(ledger["n_p"]),
                     omega_grid_ry=config.omega_grid_ry, fit_src=path,
-                    print_fn=print_fn)
+                    manifest=manifest, print_fn=print_fn)
             import jax.numpy as _jnp
             sigma_c_omega = _jnp.asarray(total, dtype=_jnp.complex128)
             records = []
@@ -518,6 +595,8 @@ def compute_mpa_sigma_pipeline(
                     omega_grid_ry=config.omega_grid_ry,
                     pole_subset=_parse_pole_subset(
                         getattr(config, "mpa_pole_subset", "")),
+                    group_subset=group_subset,
+                    group_digests=(manifest or {}).get("digests"),
                     print_fn=print_fn,
                 )
             if partial_out:
@@ -526,6 +605,9 @@ def compute_mpa_sigma_pipeline(
                     n_p=int(ledger["n_p"]),
                     poles=[int(r.pole_index) for r in records],
                     omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                    group_spec=(window_farm.format_group_subset(group_subset)
+                                if group_subset is not None else None),
+                    leg_id=str(getattr(config, "mpa_leg_id", "") or "") or None,
                     print_fn=print_fn)
                 print_fn(
                     "  ⚠ THIS RUN IS A PARTIAL PASS.  Everything printed "
