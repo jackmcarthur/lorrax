@@ -689,7 +689,8 @@ def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
-def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran):
+def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
+                                nspinor=2):
     """Per-op spinor rotation matrix with the TRS augmentation baked in.
 
     Single source of the ψ-unfold spinor rule (see :func:`unfold_psi`).
@@ -702,24 +703,69 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran):
     :func:`unfold_psi`) or a 1-D array of ``sym_idx`` (device per-full-BZ-k
     table build in ``WfnLoader._ensure_phdf5_static``).
 
+    NON-SOC IS A DIFFERENT REPRESENTATION, NOT A DEGENERATE CASE OF THIS
+    ONE.  Everything above is the spin-1/2 (SU(2)) rule.  A scalar
+    wavefunction — ``nspinor = 1``, non-SOC — carries no spinor index at
+    all: a spatial op acts on it through the τ-phase and the G-relabel
+    alone, and its time reversal is ``Θ = K``, plain conjugation with
+    ``Θ² = +1``, NOT ``iσ_y K`` with ``Θ² = −1``.  So the effective factor
+    at ``nspinor = 1`` is the 1×1 identity on BOTH row kinds, spatial and
+    time-reversed, and this function returns exactly that.
+
+    RETURNING THE 2×2 ANYWAY IS NOT A HARMLESS OVER-APPROXIMATION.  Both
+    consumers contract this matrix against ψ's spinor axis, and both
+    ``numpy.einsum`` and ``jax.numpy.einsum`` BROADCAST a size-1 labelled
+    axis instead of raising.  A 2×2 fed a 1-component ψ therefore returns
+    a 2-component ψ holding ``(U[j,0] + U[j,1]) · ψ`` — wrong in value and
+    wrong in shape, and on the TRS rows it is ``iσ_y·conj(U)``'s two
+    off-diagonal entries doing the summing.  That is the registered
+    nspinor=1 loader defect (``tests/KNOWN_FAILURES.md``;
+    ``tests/regression/hbn_cohsex_debug/README.md``), fixed here on
+    2026-08-09.  ``nspinor`` defaults to 2 because that is what this
+    function was before the parameter existed and what every deck in this
+    tree is — it is the back-compatible spelling, not a claim that 2 is
+    the safe guess when the caller does not know.
+
     Parameters
     ----------
     U_spinor_spatial : (n_tran, 2, 2) complex
-        Spatial-only spinor rotation matrices.
+        Spatial-only spinor rotation matrices.  Ignored (they are SU(2)
+        objects with nothing to say about a scalar field) when
+        ``nspinor == 1``.
     sym_idx : int or (nk,) int array
         Row(s) in the TRS-augmented row space ``[0, 2·n_tran)``.
     n_tran : int
         Count of spatial-only sym ops.
+    nspinor : int, keyword-only, default 2
+        Spinor components ψ actually has.  ``2`` for SOC/bispinor decks,
+        ``1`` for scalar (non-SOC) wavefunctions.  Anything else is a
+        raise: the 4-component bispinor lift happens downstream of the
+        unfold (``WfnLoader.load(bispinor=True)``) and never reaches here.
 
     Returns
     -------
-    (2, 2) or (nk, 2, 2) complex
-        Effective spinor rotation(s).  Scalar ``sym_idx`` → ``(2, 2)``.
+    (ns, ns) or (nk, ns, ns) complex
+        Effective spinor rotation(s), ``ns = nspinor``.  Scalar
+        ``sym_idx`` → ``(ns, ns)``.
     """
+    nspinor = int(nspinor)
+    if nspinor not in (1, 2):
+        raise ValueError(
+            f"spinor_rotation_for_sym_row: nspinor must be 1 (scalar/non-SOC) "
+            f"or 2 (SOC); got {nspinor}.  The 4-component bispinor lift is "
+            f"applied downstream of the unfold and does not come through "
+            f"here.")
     U_spatial = np.asarray(U_spinor_spatial)
     idx = np.asarray(sym_idx)
     scalar = idx.ndim == 0
     idx1 = np.atleast_1d(idx)
+    if nspinor == 1:
+        # Scalar ψ: one factor, and it is 1, for spatial AND TRS rows
+        # alike (Θ = K carries no iσ_y).  Shaped (1, 1) / (nk, 1, 1) so the
+        # consumers' einsum contracts a matching axis and is a true no-op
+        # rather than a silent broadcast.
+        out = np.ones((idx1.size, 1, 1), dtype=np.complex128)
+        return out[0] if scalar else out
     # ``% n_tran`` folds a TRS row (idx ≥ n_tran) back to its spatial op;
     # guard the degenerate no-symmetry case (n_tran == 0, single identity
     # row) so it doesn't divide-by-zero — only idx == 0 is valid there and
@@ -813,6 +859,32 @@ def unfold_psi(
         hard raise rather than a warning: the ONLY thing that keeps the two
         halves in step is ``len(sym_mats_k) == 2·len(U_spinor_spatial)``.
 
+        NON-SOC (ns = 1) IS A DIFFERENT REPRESENTATION, NOT A SPECIAL
+        CASE. A scalar wavefunction has no spinor index, so the spatial
+        rule loses its U:
+
+            ψ_full(G_rot) = exp(-i (S·G_kbar)·τ) · ψ_kbar(G_kbar)
+
+        and its time reversal is Θ = K — plain conjugation, Θ² = +1, no
+        Kramers pair to protect — so the TRS rule loses its iσ_y too:
+
+            ψ_full(G_rot) = exp(+i (S·G_kbar)·τ) · conj(ψ_kbar(G_kbar))
+
+        The G-LIST NEGATION half of (★) is unchanged: it follows from Θ
+        being antiunitary, which has nothing to do with spin. Only the
+        spinor half disappears. Both lines are what this function already
+        computes once ``spinor_rotation_for_sym_row`` is told ``ns = 1``
+        and hands back the 1×1 identity instead of a 2×2 — see the
+        einsum below and that helper's own docstring for the defect this
+        replaced (registered 2026-08-08, fixed 2026-08-09).
+
+        Note that ns = 1 does NOT switch the TRS rows off. A scalar
+        nspin=1 deck is spin-degenerate by construction, so
+        ``density_symmetry_check`` returns ``TRS = HOLDS`` on basis
+        ``'spin-degenerate'`` (m ≡ 0 identically) and the TRS rows stay in
+        ``SymMaps``'s search set. The ns=1 TRS branch above is live code
+        on any scalar deck, not a documented impossibility.
+
         NON-SYMMORPHIC τ UNDER TRS. ``tau_phase_row`` is fed ``S_full``
         (= −S on a TRS row), so ``exp(−i (−S·G)·τ) = exp(+i (S·G)·τ)`` —
         the conjugate of the spatial phase — which is what (★) demands
@@ -842,8 +914,11 @@ def unfold_psi(
     ----------
     cnk_kbar : (nb, ns, ngk) complex
         IBZ ψ coefficients on the IBZ G-list. ``ns`` is the spinor axis;
-        ``ns = 1`` for non-SOC (the spinor rotation is a no-op then), ``ns = 2``
-        for SOC.
+        ``ns = 1`` for non-SOC, ``ns = 2`` for SOC.  ``ns`` is read off THIS
+        array and handed to :func:`spinor_rotation_for_sym_row`, which is
+        what makes the ``ns = 1`` spinor factor a genuine 1×1 identity (see
+        NON-SOC in Math above) instead of a 2×2 broadcast against a size-1
+        axis.
     sym_idx : int
         Row in ``sym_mats_k`` (length ``2·n_sym_spatial``).
     n_sym_spatial : int
@@ -905,12 +980,32 @@ def unfold_psi(
     else:
         if phase is not None:
             cnk = cnk * phase[None, None, :]
-    # Spinor rotation with the TRS augmentation single-sourced.
+    # Spinor rotation with the TRS augmentation single-sourced.  ``ns`` is
+    # READ OFF THE DATA rather than taken from a parameter: it is the axis
+    # the einsum below contracts, so the array itself is the only source
+    # that cannot disagree with what is about to be multiplied.
+    ns = int(np.shape(cnk)[1])
     U_eff = spinor_rotation_for_sym_row(
-        U_spinor_spatial, sym_idx, n_sym_spatial)
+        U_spinor_spatial, sym_idx, n_sym_spatial, nspinor=ns)
 
-    # Spinor rotation. For ns=1 (non-SOC), U_eff is the 1×1 identity and
-    # this einsum is a no-op (callers can still pass it without special-casing).
+    # Spinor rotation.  For ns=1 (non-SOC) ``U_eff`` genuinely IS the 1x1
+    # identity — the helper is told ``ns`` and returns it — so this einsum
+    # is a true no-op and callers still need no special case.  Before
+    # 2026-08-09 that sentence stood here and was FALSE: the helper
+    # returned the 2x2 unconditionally, numpy broadcast the size-1 spinor
+    # axis instead of raising, and a scalar WFN came back (nb, 2, ngk).
+    #
+    # The guard is the anti-regression, not decoration: a mismatch here is
+    # invisible to einsum (it broadcasts) and only surfaces downstream as
+    # a slab-write ValueError with no mention of spinors, which is exactly
+    # how the original defect presented.
+    if int(np.shape(U_eff)[-1]) != ns:
+        raise ValueError(
+            f"unfold_psi: spinor factor is {np.shape(U_eff)[-1]}x"
+            f"{np.shape(U_eff)[-1]} but psi has ns={ns} spinor components. "
+            f"einsum would BROADCAST the size-1 axis rather than raise, "
+            f"returning sum_k U[j,k]*psi[n,0,l] on an ns-wrong output "
+            f"shape.  See spinor_rotation_for_sym_row's nspinor argument.")
     cnk = np.einsum("jk,nkl->njl", U_eff, cnk)
     return cnk
 

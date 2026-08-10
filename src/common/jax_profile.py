@@ -10,12 +10,38 @@ import jax
 
 
 _PROFILE_DIR_ENV = "ISDF_JAX_PROFILE_DIR"
+_PROFILE_SECTIONS_ENV = "ISDF_JAX_PROFILE_SECTIONS"
 _warned_trace_failure = False
+
+
+def _section_selected(section: str) -> bool:
+	"""True unless an allowlist is set and this section is not on it.
+
+	``ISDF_JAX_PROFILE_SECTIONS`` is a comma-separated list of substrings;
+	only sections containing one of them open a profiler session.  Unset
+	(the default) traces every section, which is what every existing
+	caller already gets.
+
+	The knob exists because a profiler session is not side-effect-free at
+	every call site.  On a multi-node mesh a session that is live across
+	the phdf5 collective write inside ``zeta_fit`` segfaults rank 0
+	(reproduced twice at a 3x3 mesh over three nodes, 2026-08-09; a 2x2
+	single-node mesh is unaffected).  Tracing the sigma tau kernel above
+	P=4 is therefore impossible without being able to say which sections
+	to open, and this is the smallest thing that makes it obtainable.
+	"""
+	allow = os.environ.get(_PROFILE_SECTIONS_ENV, "").strip()
+	if not allow:
+		return True
+	wanted = [w.strip() for w in allow.split(",") if w.strip()]
+	return any(w in section for w in wanted)
 
 
 def _trace_path(section: str) -> Path | None:
 	base = os.environ.get(_PROFILE_DIR_ENV)
 	if not base:
+		return None
+	if not _section_selected(section):
 		return None
 	base_path = Path(base).expanduser()
 	timestamp = time.strftime("%Y%m%d-%H%M%S")

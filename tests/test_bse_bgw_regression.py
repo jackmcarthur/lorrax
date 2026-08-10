@@ -192,6 +192,18 @@ def test_bse_matches_frozen_and_bgw(tmp_path):
         "bse.bse_jax", "-i", INPUT_NAME,
         "--bse", "--lanczos", "--tda", "--matvec-kind=ring",
         "--n-val", str(N_VAL), "--n-cond", str(N_COND), "--n-occ", str(N_OCC),
+        # PINNED, NOT DEFAULTED, AND STILL PINNED AFTER THE 2026-08-10 FLIP.
+        # BerkeleyGW produced bgw_eigenvalues_dft_ref.dat at 4v4c, so this
+        # parity deck must run 4v4c.  The conduction boundary at band 12 cuts
+        # a multiplet, so the guard has an opinion about this deck whatever
+        # its mode: `snap` (the default until 2026-08-10) widened 4c -> 8c and
+        # compared a 2048-dimension calculation against references cut from a
+        # 1024-dimension one, and `strict` (the default since) would refuse to
+        # run the deck at all.  `off` is what a measurement standard wants —
+        # run the window the references were cut from, guard silent.  See
+        # tests/KNOWN_FAILURES.md, the 2026-08-09 band-window amendment and
+        # its DECISION (1) / DECISION (2) rows.
+        "--band-degeneracy", "off",
         "--n-reorth", "-1",
         "--max-lanczos-iter", str(N_ITER), "--n-eig", str(N_EIG),
         "--px", "2", "--py", "2",

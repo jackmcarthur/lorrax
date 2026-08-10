@@ -706,8 +706,157 @@ def compute_all_V_q_g_flat(
     )
 
 
+def compute_head_channel_zeta(
+    zeta_loader,
+    *,
+    kgrid: tuple[int, int, int],
+    fft_grid: tuple[int, int, int],
+    bvec: np.ndarray,
+    cell_volume: float,
+    mesh_xy: Mesh,
+    sys_dim: int,
+    bdot: np.ndarray | None = None,
+    bare_coulomb_cutoff_ry: float | None = None,
+    mc_average_vcoul_body: bool = True,
+    sym=None,
+    centroid_indices: np.ndarray | None = None,
+    verbose: bool = True,
+):
+    """The q != 0 Coulomb head channel, in the centroid basis, on the full BZ.
+
+    Returns ``(g_head, table)`` where ``g_head`` is
+    ``(n_q_full, k, n_rmu_padded)`` complex128 at ``P(None, None, 'x')`` and
+    ``table`` is the :class:`vcoul.HeadSlotTable` on the IBZ q-list.
+    ``g_head[q, j, :]`` is ``zeta(q, mu, G_j)`` for the j-th slot attaining
+    ``argmin |q+G|``, already multiplied by the tie mask — so padding
+    columns, Γ, and any q whose head slot the bare-Coulomb cutoff zeroes are
+    EXACT zeros and the projector
+
+        P_q = sum_j conj(g_head[q, j]) (x) g_head[q, j]
+
+    is the head-slot part of ``V_q`` divided by the value ``v_qG_table`` put
+    there.  Consumed by ``gw.head_channel``; built only when a deck turns
+    ``mc_average_placement`` on, which is why this is a second short read of
+    the same ζ slabs rather than a third output of the V_q hot loop — the
+    default V_q path stays byte-for-byte and compile-for-compile unchanged.
+
+    THE MISSING TAU PHASE IS EXACT HERE, NOT AN APPROXIMATION.
+    ``_unfold_g0_ibz_to_full`` applies the centroid permutation and omits
+    the ``exp(-i (Sq + SG) . tau)`` phase, with a docstring noting that the
+    only historical consumer was Γ.  It is reused unchanged because every
+    term of ``P_q`` is ``conj(zeta(G_j)) * zeta(G_j)`` — the SAME column
+    conjugated against itself — so the phase cancels term by term, for any
+    G and any symmetry operation.  Under TRS the helper conjugates, and
+    ``P -> conj(P)``, which is the ``V_{-q} = conj(V_q)`` rule.  A tied set
+    maps onto a tied set under the little group (``|q+G|`` is invariant), so
+    the SUM over j is invariant under the relabelling the unfold induces.
+    """
+    from .compute_vcoul import compute_v_q_per_G  # bootstrap, see the CC path
+    from vcoul import (CoulombGeometry, build_v_head_miniBZ_fn_3d, get_kernel,
+                       head_slot_table)
+
+    del compute_v_q_per_G  # imported for the service-path bootstrap only
+
+    if str(getattr(zeta_loader, 'zeta_layout', '')) != 'G_flat':
+        raise ValueError(
+            "compute_head_channel_zeta: zeta layout must be 'G_flat'; got "
+            f"{getattr(zeta_loader, 'zeta_layout', None)!r}")
+
+    (_q_int, q_irr_frac,
+     full_to_irr_idx, full_to_irr_sym,
+     sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_indices,
+        kgrid=kgrid, fft_grid=fft_grid,
+        context="head-channel zeta")
+    n_q_ibz = int(q_irr_frac.shape[0])
+    gvec_components = np.asarray(zeta_loader.gvec_components, dtype=np.int32)
+
+    # THE SAME estimator object the V_q path builds — same seed, same draw
+    # count, same centrosymmetrisation.  Built here rather than shared
+    # because the two calls are in different stages and a deterministic pure
+    # function is cheaper to rebuild than to thread.
+    #
+    # NOT GATED ON ``mc_average_vcoul_body``.  That flag decides whether the
+    # average is substituted into V — i.e. what Sigma_X receives — and the
+    # placement mode decides where the average lands in W.  Gating the head
+    # function on the flag made ``mc_average_placement = bgw`` with the flag
+    # off a silent no-op (<v> == v_c => r == 1), which is precisely the
+    # "knob that quietly does nothing" failure this feature is supposed to
+    # be immune to.  The flag is honoured where it belongs: in ``v_in_V``,
+    # the value the production tile actually carries.
+    v_head_fn = None
+    if sys_dim == 3:
+        v_head_fn = build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume)
+    del mc_average_vcoul_body
+
+    table = head_slot_table(
+        get_kernel(sys_dim), q_irr_frac, gvec_components,
+        geometry=CoulombGeometry(bvec=bvec, cell_volume=cell_volume,
+                                 bdot=bdot, fft_grid=fft_grid),
+        vcoul_cutoff_ry=bare_coulomb_cutoff_ry,
+        v_head_fn=v_head_fn,
+    )
+
+    from runtime.padding import padded_mu_extent
+    n_rmu_padded = padded_mu_extent(
+        int(zeta_loader.n_rmu),
+        int(mesh_xy.shape['x']) * int(mesh_xy.shape['y']))
+
+    read_all = _make_read_all_ibz(zeta_loader, n_rmu_padded, mesh_xy)
+    zeta_all = read_all(n_q_ibz)              # (n_q_ibz, mu_pad, ngkmax)
+
+    sel_dev = jnp.asarray(np.asarray(table.sel, dtype=np.int32))
+    mask_dev = jnp.asarray(np.asarray(table.mask, dtype=np.float64),
+                           dtype=jnp.complex128)
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+
+    # (n_q, mu, k) gather on the UNSHARDED G axis, then transpose.  Done
+    # per j so each intermediate is (n_q, mu) — the same class as g0_acc —
+    # and so the sharding constraint lands on the shape the unfold wants.
+    cols = []
+    for j in range(int(table.sel.shape[1])):
+        col = jnp.take_along_axis(
+            zeta_all, sel_dev[:, None, j:j + 1], axis=2)[:, :, 0]
+        col = col * mask_dev[:, j:j + 1]
+        col = jax.lax.with_sharding_constraint(col, g0_sh)
+        if use_ibz:
+            n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+            col = _unfold_g0_ibz_to_full(
+                col, full_to_irr_idx=full_to_irr_idx,
+                full_to_irr_sym=full_to_irr_sym,
+                sym_perm=sym_perm, mesh_xy=mesh_xy,
+                n_sym_spatial=n_sym_spatial)
+        cols.append(jax.lax.with_sharding_constraint(col, g0_sh))
+    del zeta_all
+
+    g_head = jnp.stack(cols, axis=1)          # (n_q_full, k, mu)
+    g_head = jax.lax.with_sharding_constraint(
+        g_head, NamedSharding(mesh_xy, P(None, None, 'x')))
+    if verbose and jax.process_index() == 0:
+        live = np.asarray(table.v_bare) > 0.0
+        eta = np.zeros_like(np.asarray(table.v_bare))
+        eta[live] = (np.asarray(table.v_avg)[live]
+                     / np.asarray(table.v_bare)[live] - 1.0)
+        print(f"  head channel: {int((table.mult > 0).sum())}/{n_q_ibz} IBZ q "
+              f"carry a head slot, k={int(table.sel.shape[1])}, "
+              f"tie histogram="
+              f"{dict(zip(*[c.tolist() for c in np.unique(table.mult, return_counts=True)]))}",
+              flush=True)
+        # Per-shell eta, printed as data rather than summarised: it is the
+        # ONE input the whole rescale is a function of, it is directly
+        # comparable to BerkeleyGW's own vcoul dumps, and a run whose log
+        # carries it can be audited without re-running anything.
+        for qi in np.nonzero(live)[0]:
+            print(f"    head slot q[{qi}] |q+G|^2={float(table.len2[qi]):.6f} "
+                  f"mult={int(table.mult[qi])} v_c={float(table.v_bare[qi]):.6f} "
+                  f"<v>={float(table.v_avg[qi]):.6f} eta={eta[qi]:.6f}",
+                  flush=True)
+    return g_head, table, full_to_irr_idx
+
+
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
-            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz"]
+            "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz",
+            "compute_head_channel_zeta"]
 
 
 # Relocated from the deleted gw/v_q_tile.py (2026-07-02) — the only

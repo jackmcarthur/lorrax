@@ -1,5 +1,21 @@
 # Agent TODO Suggestions
 
+> **SUPERSEDED — do not act on anything below (banner added 2026-08-09).**
+> This file has not been touched since the documentation scaffold that
+> introduced it, and the tree it describes is gone. Every path it names sits
+> under a `src/isdf/` package layout that no longer exists: there is no
+> `src/isdf/common/`, no `src/isdf/config/`, and no `load_wfns.py` anywhere in
+> the tree (the facade was deleted at `bb043998`). Its two size claims are
+> wrong by roughly a factor of three — it calls `src/gw/gw_jax.py` a
+> 2389-line file, and that file is 818 lines. Most seriously, the profiling
+> suggestion below asks for a `profile_section` context manager: that helper
+> was written, shipped, found to produce no trace while injecting a sandbox
+> directory at `sys.path[0]`, and deleted, and a red twin
+> (`tests/test_no_sandbox_path_injection.py::test_profile_section_stays_deleted`)
+> now fails if it comes back. Following this document would break the build
+> it claims to improve. It is kept only so the links that point here do not
+> dangle; it is a candidate for outright deletion on the owner's word.
+
 **NOTE**: These are **suggested improvements** identified by AI agents during code analysis. They are **NOT the user's current priorities**. This document serves as a parking lot for ideas that may be useful in the future.
 
 ---

@@ -67,7 +67,7 @@ from .ppm_windows import (
     _SigmaWindow,
     _iter_branches,
     _build_windows_for_branch,
-    _materialize_window_mask_B,
+    window_mask_B_bounds,
     _to_host_np,
     _CROSSING_A_MAX,
     crossing_regularization_floor,
@@ -457,8 +457,14 @@ def _integrate_tau_windows_for_branch(
             ):
                 with timing.section("sigma.window_operands"):
                     mask_A_j    = jnp.asarray(win.mask_A)
-                    mask_B_j    = _materialize_window_mask_B(
-                        win, base_mask_B=base_mask_B, Omega_q=Omega_q)
+                    # The B-side Ω window is TWO SCALARS, not a
+                    # (nq, μ_pad, μ_pad) bool tile built here and pinned
+                    # across the whole τ scan.  The predicate is rebuilt
+                    # from Ω_q inside _build_W_t_q, where it fuses into
+                    # the select that was already there.
+                    _om_lo, _om_hi = window_mask_B_bounds(win)
+                    Om_lo_j     = jnp.asarray(_om_lo, dtype=jnp.float64)
+                    Om_hi_j     = jnp.asarray(_om_hi, dtype=jnp.float64)
                     E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                     E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
 
@@ -471,7 +477,8 @@ def _integrate_tau_windows_for_branch(
                     out = kern(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
-                        E_A, mask_A_j, B_q, Omega_q, mask_B_j,
+                        E_A, mask_A_j, B_q, Omega_q, base_mask_B,
+                        Om_lo_j, Om_hi_j,
                         E_ref_A_j, E_ref_B_j, t_j,
                     )
                     # Merged kernel emits the single complex X = ψ†σψ; the

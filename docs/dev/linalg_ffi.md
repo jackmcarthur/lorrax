@@ -741,5 +741,7 @@ you to edit (`src/ffi/<name>/`, `ffi/linalg/resolve.py`,
   ladder, route pinning, config threading; CPU, no FFI build needed.
 * `tests/test_charge_zeta_route.py`, `tests/test_zeta_mesh_invariance.py`
   — route-string pins (run with 4+ host devices).
-* `tests/test_ffi_linalg_contract.py` — wrapper shape/layout contracts
-  against the real FFI builds.
+* `services/distrib_la/tests/test_distrib_la_contract.py` (marker
+  `distrib_la`) — wrapper shape/layout contracts against the real FFI
+  builds. This is the migrated `tests/test_ffi_linalg_contract.py`; see the
+  translation table at the top of this document.

@@ -423,7 +423,8 @@ def main(argv=None):
 		W_by_role = compute_screening(
 			wfns, V_q, requests, quad=quad, e_ref=e_ref,
 			sym=sym, centroid_indices=centroid_indices,
-			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0,
+			head_channel=getattr(isdf, 'head_channel', None))
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
@@ -614,6 +615,7 @@ def main(argv=None):
 		                    label="self-consistent QSGW driver"):
 			sigma_result, sigma_total, _ = run_sc_driver(
 				wfns, V_q, kin_ion,
+				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,

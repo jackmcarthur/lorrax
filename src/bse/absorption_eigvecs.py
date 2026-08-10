@@ -3,7 +3,7 @@
 Mirrors BGW's ``BSE/diag.f90 → absp.f90`` pathway:
 
   d^α_{cvk}     = ⟨c|v̂_α|v⟩ / (E_c − E_v)              (r-form, Ry-bohr)
-  ⟨0|r^α|S⟩    = Σ_{cvk} A^S_{cvk} · d^α_{cvk}
+  ⟨0|r^α|S⟩    = Σ_{cvk} A^S_{cvk} · conj(d^α_{cvk})
   f_S^α        = |⟨0|r^α|S⟩|²
   ε_2^α(ω)     = (16π² / (V_cell · N_k · n_spin · n_spinor))
                  × Σ_S f_S^α · L(ω − E_S, η)
@@ -25,6 +25,7 @@ import numpy as np
 
 from .absorption_common import (
     RYD2EV,
+    exciton_dipole_projections,
     kramers_kronig_eps1,
     load_dipole_h5,
     load_eigenvectors_h5,
@@ -37,14 +38,22 @@ from .absorption_common import (
 
 
 def compute_dipole_projections(A, d_alpha):
-    """⟨0|r̂_α|S⟩ = Σ_{cvk} A^S_{cvk} · d^α_{cvk}
+    """⟨0|r̂_α|S⟩ = Σ_{cvk} A^S_{cvk} · conj(d^α_{cvk})
 
     A       : (N, nk, nc, nv) complex
     d_alpha : (3, nk, nc, nv) complex
 
     Returns: (N, 3) complex — per-state, per-polarisation projection.
+
+    A thin name-preserving wrapper: the contraction itself, and the
+    derivation of where the conjugate belongs, live at the one site in
+    ``absorption_common.exciton_dipole_projections`` that
+    ``davidson_absorption`` also calls.  Until 2026-08-09 this function
+    contracted a BARE ``d`` while ``davidson_absorption`` conjugated
+    ``A``, so the two drivers reported genuinely different oscillator
+    strengths from the same eigenvectors.  This one was the wrong half.
     """
-    return np.einsum("Nkcv,akcv->Na", A, d_alpha, optimize=True).astype(np.complex128)
+    return exciton_dipole_projections(A, d_alpha)
 
 
 def compute_oscillator_strengths(A, d_alpha):

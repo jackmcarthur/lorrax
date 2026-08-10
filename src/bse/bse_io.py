@@ -13,6 +13,25 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from runtime.padding import padded_mu_extent
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
+                                    check_band_window, resolve_band_window)
+
+
+def _log0(*a, **k):
+    """``print`` on process 0 only.
+
+    The band-window guard emits a four-line block; every rank resolves the
+    same window from the same energies, so without this the warning arrives
+    64 times at P=64 and reads as 64 different problems.  ``band_degeneracy``
+    itself stays pure-numpy and jax-free, which is why the rank filter is
+    injected here rather than living in the guard.
+    """
+    try:
+        first = jax.process_index() == 0
+    except Exception:
+        first = True
+    if first:
+        print(*a, **k)
 from common.collectives import gather_to_host
 from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
 
@@ -257,6 +276,45 @@ def write_eigenvectors_stream(
     n_write: int,
     use_tda: bool = True,
 ) -> None:
+    # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
+    # The LOGICAL, POST-SNAP one.  ``n_val``/``n_cond`` become BGW's ``nv``/
+    # ``nc`` header fields, and ``absorption_eigvecs`` slices ``dipole.h5``
+    # with exactly those against ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and
+    # ``[n_occ, n_occ + nc)``.  So they have to name REAL bands, which means
+    # the counts the loader RESOLVED (``data['n_val']`` / ``data['n_cond']``),
+    # after ``--band-degeneracy`` widened them at a cut multiplet.
+    #
+    # Two other numbers get mistaken for them and neither belongs in the file:
+    #
+    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-snap.  This
+    #     was the caller-side defect: ``bse_jax._preview_lanczos`` passed the
+    #     request, so on any snapping deck (Si ``--n-cond 4`` snaps to 8) the
+    #     dataset was created at the requested ``nc`` and the write of the
+    #     real component died with ``TypeError: Can't broadcast``, leaving a
+    #     truncated ``eigenvectors.h5`` behind — worse than writing none.
+    #
+    #   * the mesh-rounded PAD extents ``n_cond_pad``/``n_val_pad``, which is
+    #     what the incoming array is actually shaped by.  Those are not bands:
+    #     ``pad_zone_mask``'s block is decoupled by construction (ψ pad = 0)
+    #     and its amplitudes are exact zero, so writing them would put a
+    #     column of zeros in the file under a band label the dipole file has
+    #     no matching entry for.  They are dropped BY COUNT here, the same
+    #     spelling as ``pad_zone_mask_np`` — never by thresholding a value.
+    #
+    # Hence: the caller declares the logical counts, and this writer TRIMS the
+    # component to them (see ``_to_bgw``).  A writer that instead trusted the
+    # array's own shape would silently re-export the pad.
+    #
+    # AND THE TRIM IS CHECKED, because the two reasons an incoming component is
+    # WIDER than the declared window need opposite treatment and cannot be told
+    # apart by shape: mesh pad must be dropped, a stale pre-snap count must be
+    # REFUSED (the bands it drops are real and carry weight).  What separates
+    # them is a value, and it separates them exactly: the pad block is
+    # decoupled by construction and its amplitudes are EXACT zero, so a
+    # discarded block with any weight in it is not pad.  Trading the old loud
+    # ``Can't broadcast`` for a silent truncation would be a worse bug than the
+    # one being fixed.
+    #
     # ``use_tda`` is written HONESTLY (was hardcoded 1).  TDA eigenvectors arrive
     # as ``(n_write, 1, nc, nv, nk)`` (resonant X only); full-BSE (non-TDA) as
     # ``(n_write, 2, nc, nv, nk)`` = the paired (X, Y) with X^H X - Y^H Y = +1.
@@ -273,6 +331,19 @@ def write_eigenvectors_stream(
     # replicated Lanczos arrays and on Davidson's already-host eigenvalues the
     # helper degrades to the plain ``device_get`` that was here before.
     eigenvalues = gather_to_host(eigenvalues[:n_write]) * RYD2EV
+    # The declared window must FIT inside what the solver actually carried.
+    # ``>=`` is the pad (trimmed in ``_to_bgw``); ``<`` is a caller that named
+    # more bands than it solved, which h5py would have reported five frames
+    # deeper as an unattributable "Can't broadcast".
+    n_cond, n_val = int(n_cond), int(n_val)
+    _nc_arr, _nv_arr = (int(s) for s in eigenvectors.shape[-3:-1])
+    if _nc_arr < n_cond or _nv_arr < n_val:
+        raise ValueError(
+            f"write_eigenvectors_stream: declared window n_cond={n_cond} "
+            f"n_val={n_val} does not fit the eigenvectors' (nc, nv) = "
+            f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
+            f"(data['n_cond'] / data['n_val']), not the CLI request — the "
+            f"band-degeneracy guard may have widened the window.")
     kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -284,6 +355,58 @@ def write_eigenvectors_stream(
 
     kpts_fortran = kpts.T.copy()
     exciton_Q_shifts = np.zeros((1, 3), dtype=np.float64)
+
+    def _to_bgw(comp, which):
+        # comp: (nc_pad, nv_pad, nk) -> BGW (nk, nc, nv, ns) layout.
+        #
+        # TRIM FIRST, FLIP SECOND, and the order is load-bearing.  The pad is
+        # appended at the TOP of each band axis, while BGW's convention
+        # reverses the valence axis (v=0 = highest valence,
+        # BSE/input_fi.f90:407) where our internal slice puts v=0 at the
+        # deepest valence.  Flipping before the trim would slide the pad
+        # columns to the FRONT and then keep them as the "highest valence"
+        # bands — zeros written under real band labels, silently.
+        comp = np.asarray(comp)
+        kept = comp[:n_cond, :n_val, :]
+        if comp.shape[0] > n_cond or comp.shape[1] > n_val:
+            # Everything outside the kept block, in one number.  The reference
+            # is the KEPT block's own scale, so this is a statement about
+            # weight and not about units.
+            w_kept = float(np.max(np.abs(kept))) if kept.size else 0.0
+            w_drop = max(
+                float(np.max(np.abs(comp[n_cond:, :, :])))
+                if comp.shape[0] > n_cond else 0.0,
+                float(np.max(np.abs(comp[:, n_val:, :])))
+                if comp.shape[1] > n_val else 0.0)
+            if w_drop > 1.0e-10 * max(w_kept, 1.0e-300):
+                raise ValueError(
+                    f"write_eigenvectors_stream: trimming eigenvector {which} "
+                    f"from (nc, nv) = ({comp.shape[0]}, {comp.shape[1]}) down "
+                    f"to the declared window ({n_cond}, {n_val}) would DISCARD "
+                    f"amplitude {w_drop:.3e} against a kept scale of "
+                    f"{w_kept:.3e}.  The mesh pad is exactly zero, so this is "
+                    f"not pad: the declared window is narrower than the one "
+                    f"that was solved.  Pass the LOADER's resolved counts "
+                    f"(data['n_cond'] / data['n_val']) — the band-degeneracy "
+                    f"guard widens the CLI request.")
+        c = np.transpose(kept, (2, 0, 1))[:, :, ::-1][..., None]
+        return c.real, c.imag
+
+    # ── PRE-FLIGHT, before any file exists ────────────────────────────────
+    # The declared window is a property of the RUN, not of a state, so state 0
+    # settles it for all of them — and settling it here means a wrong window
+    # refuses with nothing on disk instead of leaving the truncated
+    # ``eigenvectors.h5`` that the pre-fix crash left behind.  Runs on EVERY
+    # rank, above the rank-0 gate, for the lockstep reason set out below: the
+    # gather is a global collective and the refusal is a function of shapes and
+    # values every rank holds identically, so all ranks raise together.
+    if n_write > 0:
+        _v0 = gather_to_host(eigenvectors[0])
+        if use_tda:
+            _to_bgw(_v0[0] if np.ndim(_v0) == 4 else _v0, "0 (resonant X)")
+        else:
+            _to_bgw(_v0[0], "0 (resonant X)")
+            _to_bgw(_v0[1], "0 (coupling Y)")
 
     # ── ONE writer ────────────────────────────────────────────────────────
     # Every rank used to reach the ``h5py.File(output_file, "w")`` below on the
@@ -364,13 +487,6 @@ def write_eigenvectors_stream(
                 dtype=np.float64,
             )
 
-        def _to_bgw(comp):
-            # comp: (nc, nv, nk) -> BGW (nk, nc, nv, ns) layout.  BGW convention:
-            # valence axis reversed (v=0 = highest valence, BSE/input_fi.f90:407);
-            # our internal slice puts v=0 at deepest valence, so flip on write.
-            c = np.transpose(comp, (2, 0, 1))[:, :, ::-1][..., None]
-            return c.real, c.imag
-
         for i in range(n_write):
             vec = gather_to_host(eigenvectors[i])
             if use_tda:
@@ -380,11 +496,11 @@ def write_eigenvectors_stream(
             else:
                 # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
                 Xc, Yc = vec[0], vec[1]
-            re, im = _to_bgw(Xc)
+            re, im = _to_bgw(Xc, f"{i} (resonant X)")
             evec_dset[0, i, :, :, :, :, 0] = re
             evec_dset[0, i, :, :, :, :, 1] = im
             if Yc is not None:
-                re, im = _to_bgw(Yc)
+                re, im = _to_bgw(Yc, f"{i} (coupling Y)")
                 coupling_dset[0, i, :, :, :, :, 0] = re
                 coupling_dset[0, i, :, :, :, :, 1] = im
 
@@ -1316,11 +1432,18 @@ def _interpolate_bse_data_to_grid(
         ``bandstructure.bse_setup.compute_wfns_fi`` with ``kgrid_fi=fine_grid``);
         the fH is built over the full loaded band window and only the BSE
         sub-window [nval−n_val, nval+n_cond) is returned (interior, guarded).
-      * V_Q exchange q=0 tile ← ``bse.vq_interp.build_vq_evaluator`` (the SAME
-        builder exciton_bands calls) evaluated at Q=0 with the FINE mini-BZ
-        head (``minibz_head_vlr(..., kgrid=fine_grid)``).  A Q=0 exciton's
-        exchange is the single q=0 tile (dense in k,k'); the fine k-grid's
-        exchange "q-set" is therefore just q=0.
+      * V_Q exchange q=0 tile ← CARRIED THROUGH unchanged by default.  A Q=0
+        exciton's exchange is the single q=0 tile (dense in k,k'), and that
+        tile's BODY is built from the centroids and the G-sphere alone, so it
+        is k-grid-INVARIANT: densifying it is unnecessary.  Only the rank-1
+        head scalar ``<v>_mBZ`` is grid-dependent (the cell is BZ/N_k).  The
+        deck's ``head_minibz_average`` key (default off) chooses: OFF keeps the
+        coarse bundle's tile exactly, deck ``vhead`` and all; ON rebuilds it
+        through ``bse.vq_interp.build_vq_evaluator`` (the SAME builder
+        exciton_bands calls) at Q=0 with the FINE mini-BZ head
+        (``minibz_head_vlr(..., kgrid=fine_grid)``), replacing the disk body
+        and the deck head.  Until 2026-08-09 this path forced the ON branch
+        unconditionally, ignoring the key — see the block comment below.
       * W direct ← ``make_w_densifier(output='k')`` — the ONE sharded
         coarse→fine densifier (shard_map FFTs + jitted R zero-pad, (μ,ν)
         sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
@@ -1404,26 +1527,70 @@ def _interpolate_bse_data_to_grid(
     M_Y = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_Y, psi_v_Y), y4)
 
-    # ── V_Q exchange q=0 tile on the fine grid (SAME vq_interp builder) ───
+    # ── V_Q exchange q=0 tile on the fine grid ────────────────────────────
     # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
     # tile (bse_serial.apply_bse_hamiltonian_single_device); so the fine
-    # k-grid's exchange q-set is just q=0.  We eval it with the FINE mini-BZ
-    # head (the head magnitude scales with the mini-BZ cell area, which shrinks
-    # coarse→fine); the body is the b26p/stencil model reproduced at the q=0
-    # training point (run_nulls certifies the reproduction).
-    vqm = vq_interp.build_vq_evaluator(
-        restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
-        log_fn=log_fn)
-    gstar, head_val = vq_interp.minibz_head_vlr(
-        vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
-    V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
-                       vqm.coeffs_packed,
-                       jnp.asarray(head_val, dtype=jnp.float64),
-                       jnp.asarray(gstar, dtype=jnp.int32))
-    V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)     # Hermitize (stencil residue)
-    V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
-    log_fn(f"[bse_k_grid] V_q0 exchange tile via vq_interp eval_vq(Q=0), "
-           f"fine mini-BZ head <v_LR>={head_val:.4f} (gstar={gstar})")
+    # k-grid's exchange q-set is just q=0.
+    #
+    # WHAT IS AND IS NOT GRID-DEPENDENT.  The q=0 exchange BODY
+    # V_{μν} = Σ_{G≠0} conj(ζ̃_{0,μ}(G)) v(G) ζ̃_{0,ν}(G) is built from the
+    # centroids and the G-sphere alone — it never sees the k-grid, so it needs
+    # no densification and the coarse bundle's tile is already the fine grid's
+    # answer.  The ONE k-grid-dependent piece is the rank-1 HEAD scalar, whose
+    # mini-BZ cell average <v>_mBZ is taken over BZ/N_k and therefore shrinks
+    # coarse→fine.  That rescale is what the original rebuild (964c682b,
+    # 2026-07-20) was after, and its comment said so.
+    #
+    # It bought the rescale by forcing ``head_minibz_average=True`` and
+    # REPLACING the whole tile, which cost two things the deck never agreed to:
+    # (i) the opt-in mini-BZ head average — documented in KNOWN_FAILURES as
+    # averaging the WRONG MOMENT (a scalar <v> where the nonanalytic head needs
+    # the 3×3 second moment <v q_a q_b>) — reached every coarse→fine user who
+    # had not set the key; and (ii) the deck's exact disk body and its
+    # loader-injected ``vhead`` rank-1 head (:1689-1704 above) were discarded
+    # and substituted by an LR-only model reconstruction.
+    #
+    # Both now follow the deck's ``head_minibz_average`` key, default off, like
+    # every other reader of that key in the tree (exciton_bands.py:971-973,
+    # head_correction.py:284,339, vq_interp.py:1498).  What the OFF arm gives
+    # up is only the head RESCALE, and at Q=0 the head is annihilated by
+    # ⟨u_ck|u_vk⟩ = 0 up to the ISDF orthogonality residual
+    # (LT_HEAD_PROBLEM.md §2.1) — so a stale head SCALE is inert to that
+    # residual, while a replaced BODY is not.
+    head_mbz = bool(params.get("head_minibz_average", False))
+    if head_mbz:
+        # Opt-in: rebuild the tile with the FINE mini-BZ head via the SAME
+        # vq_interp builder exciton_bands uses; the body is the b26p/stencil
+        # model reproduced at the q=0 training point (run_nulls certifies the
+        # reproduction).  This arm is bit-for-bit the pre-2026-08-09 behaviour.
+        vqm = vq_interp.build_vq_evaluator(
+            restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
+            log_fn=log_fn)
+        gstar, head_val = vq_interp.minibz_head_vlr(
+            vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
+        V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
+                           vqm.coeffs_packed,
+                           jnp.asarray(head_val, dtype=jnp.float64),
+                           jnp.asarray(gstar, dtype=jnp.int32))
+        V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)   # Hermitize (stencil residue)
+        V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
+        log_fn(f"[bse_k_grid] V_q0 exchange tile REBUILT via vq_interp "
+               f"eval_vq(Q=0), fine mini-BZ head <v_LR>={head_val:.4f} "
+               f"(gstar={gstar}) — head_minibz_average=true (deck opt-in).  "
+               f"The deck's disk body and vhead rank-1 head are REPLACED; that "
+               f"average is the scalar <v>, not the moment tensor the head "
+               f"needs (tests/KNOWN_FAILURES.md).")
+    else:
+        V_q0 = data["V_q0"]
+        log_fn("[bse_k_grid] V_q0 exchange tile CARRIED THROUGH from the "
+               "coarse bundle unchanged (head_minibz_average off = the "
+               "default): the q=0 body is k-grid-independent and the deck's "
+               "loader-injected vhead rank-1 head is preserved exactly.  The "
+               "head SCALE carried is the coarse mini-BZ <v>; at Q=0 the head "
+               "is annihilated by ISDF orthogonality, so the stale scale is "
+               "inert to the orthogonality residual (LT_HEAD_PROBLEM.md §2.1). "
+               "Set head_minibz_average=true to rebuild with the fine mini-BZ "
+               "head instead.")
 
     # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back, all
     # inside the ONE sharded densifier (shard_map FFTs + jitted pad with
@@ -1465,6 +1632,8 @@ def load_bse_data_from_restart_sharded(
     inject_head: bool = True,
     load_v_full: bool = False,
     bse_k_grid=None,
+    degeneracy_mode: str = DEFAULT_MODE,
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
 
@@ -1504,6 +1673,23 @@ def load_bse_data_from_restart_sharded(
             wq_key = "W0_qmunu_nohead"
         elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             wq_key = "W0_qmunu"
+        # WHICH COULOMB CONVENTION THIS W WAS BUILT UNDER.  The BSE does not
+        # compute W — it reads it off the GW restart — so it has no Coulomb
+        # config of its own to check against and the honest disclosure is the
+        # stored policy itself.  Printed once per load, rank 0 only.
+        if jax.process_index() == 0:
+            from file_io import describe_coulomb_policy_stamp
+            print(describe_coulomb_policy_stamp(restart_file))
+        # THE GATE, ASKED ONCE.  ``wq_key is not None`` here means a real
+        # screened W0 passed the ``W0_ready`` check above; below it is also
+        # the name of the bare-V dataset, because the fallback aliases the
+        # key.  Capture the answer before that aliasing destroys it — the
+        # head injection at the bottom of this function needs to know which
+        # tensor it is adding a SCREENED head to, and once the else branch
+        # below has run the key alone can no longer tell it.  Same question,
+        # same spelling as ``_load_ring_subset``'s
+        # ``w0_ready = W0_qmunu is not None``.
+        w0_ready = wq_key is not None
         if wq_key is not None:
             wq_dset = f[wq_key]
         else:
@@ -1572,6 +1758,15 @@ def load_bse_data_from_restart_sharded(
                 f"No valence ({n_val_available}) or conduction ({n_cond_available}) bands "
                 f"resolved (n_occ={n_occ}, total={nb_total})."
             )
+        # THE degeneracy choke point.  Every BSE driver reaches its band
+        # window through this function, so the multiplet guard sits here —
+        # before the index arrays exist, and therefore before the ψ hyperslab
+        # read is sized.  A snap here resizes the read, which is what makes it
+        # free; a guard placed after the read could only complain.
+        n_val, n_cond = resolve_band_window(
+            enk_full, n_occ, n_val, n_cond,
+            tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+            where="load_bse_data_from_restart_sharded", log=_log0)
         val_indices = np.arange(n_occ - n_val, n_occ)
         cond_indices = np.arange(n_occ, n_occ + n_cond)
 
@@ -1650,20 +1845,19 @@ def load_bse_data_from_restart_sharded(
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
     if g0_X is not None and inject_head:
-        vhead, whead, cell_volume = _resolve_head_params(
+        vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
 
         if cell_volume is not None and (vhead is not None or whead is not None):
-            from gw.head_correction import apply_q0_head_rank1_sharded
-            V_q0, W_q = apply_q0_head_rank1_sharded(
+            # ``w0_ready`` is the answer the dataset-selection block above
+            # recorded: whead goes on a SCREENED W or nowhere.  Same gate,
+            # same helper, as the single-device loader.
+            V_q0, W_q, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
-                omega_index=0)
-            v_str = (f"vhead={complex(vhead).real:.3f}"
-                     if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
-                     if whead is not None else "whead=skipped")
+                w0_ready=w0_ready)
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
-                  f"V_cell={cell_volume:.2f}): {v_str}, {w_str}")
+                  f"V_cell={cell_volume:.2f}): {head_str} "
+                  f"[source: {head_src}]")
         else:
             # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
             # True, but the rank-1 head was NOT injected because vhead/whead
@@ -1880,28 +2074,58 @@ def _parse_head_overrides(input_file: Optional[str]):
     Returns ``(vhead, whead_0freq)`` where each is ``complex`` or ``None``
     if the key is absent / blank. These take precedence over any
     restart-file head values when assembling the q=0 rank-1 update.
+
+    These are the SAME two deck keys the GW side reads
+    (``gw_config.HeadConfig.vhead`` / ``.whead_0freq``), so this reader
+    holds itself to the GW reader's parsing contract.  Two rules follow
+    from that, and both are corrections made 2026-08-09:
+
+    * **Inline comments are stripped**, because ``gw_config`` builds its
+      ``ConfigParser`` with ``inline_comment_prefixes=('#',)`` (see the
+      note at ``gw_config.py``: "the latter silently voided flags — a
+      real footgun").  A deck line written ``vhead = 3303.748102  # BGW``
+      previously overrode the GW side and was silently dropped here: the
+      deck asked for BerkeleyGW's head, Σ got it, and the BSE quietly
+      used the restart's own value instead.  The two sides now agree on
+      any deck, or neither does.
+    * **A malformed value refuses** instead of falling back to the
+      restart.  A head override that silently does nothing is precisely
+      the failure mode this feature exists to rule out — it is a
+      validation knob, and a validation knob that no-ops without a word
+      is worse than no knob at all.
     """
     if input_file is None or not os.path.isfile(input_file):
         return None, None
     vhead = None
     whead0 = None
     with open(input_file) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
             key, _, val = stripped.partition("=")
             key = key.strip().lower()
-            val = val.strip()
+            if key not in ("vhead", "whead_0freq"):
+                continue
+            val = val.partition("#")[0].strip()   # GW-parity: inline comment
             if not val:
                 continue
             try:
-                if key == "vhead":
-                    vhead = complex(float(val))
-                elif key == "whead_0freq":
-                    whead0 = complex(float(val))
+                parsed = complex(float(val))
             except ValueError:
-                continue
+                raise ValueError(
+                    f"{input_file}:{lineno}: q=0 head override {key!r} has a "
+                    f"non-numeric value {val!r}.  This key pins the q=0 "
+                    f"Coulomb head to an externally supplied scalar (e.g. "
+                    f"BerkeleyGW's) and is read by BOTH the GW and the BSE "
+                    f"side; refusing rather than silently falling back to the "
+                    f"restart's own head, which would leave the two sides "
+                    f"screening with different q=0 heads."
+                ) from None
+            if key == "vhead":
+                vhead = parsed
+            else:
+                whead0 = parsed
     return vhead, whead0
 
 
@@ -1911,12 +2135,21 @@ def _resolve_head_params(
     whead_restart,
     cell_volume: Optional[float] = None,
 ):
-    """Resolve ``(vhead, whead, cell_volume)`` for q=0 head injection.
+    """Resolve ``(vhead, whead, cell_volume, source)`` for q=0 head injection.
 
     cohsex.in ``vhead``/``whead_0freq`` overrides take precedence over the
     restart-file head values; ``cell_volume`` (Bohr³) is pulled from the WFN
-    when not supplied.  Any of the three may return ``None`` (head skipped).
-    Single-sourced by both the sharded and single-device restart loaders.
+    when not supplied.  Any of the first three may return ``None`` (head
+    skipped).  Single-sourced by both the sharded and single-device restart
+    loaders.
+
+    ``source`` is a short human-readable provenance string ("deck" /
+    "restart" / "none" per channel).  It exists because the override is a
+    cross-code validation knob: the one question a reader of the log has
+    is whether the head that was actually injected is the deck's pinned
+    external value or the run's own computed one, and printing the value
+    alone does not answer it (the two agree to 8 digits on the anchor
+    deck by construction, which is exactly when confusing them is easy).
     """
     vhead_in, whead0_in = _parse_head_overrides(input_file)
     vhead = vhead_in if vhead_in is not None else vhead_restart
@@ -1924,6 +2157,12 @@ def _resolve_head_params(
         whead = jnp.asarray([whead0_in], dtype=jnp.complex128)
     else:
         whead = whead_restart
+    source = "v:{}, w:{}".format(
+        "deck" if vhead_in is not None else
+        ("restart" if vhead_restart is not None else "none"),
+        "deck" if whead0_in is not None else
+        ("restart" if whead_restart is not None else "none"),
+    )
     if cell_volume is None and input_file is not None:
         try:
             from ffi import _services
@@ -1933,7 +2172,78 @@ def _resolve_head_params(
         except Exception as exc:
             print(f"BSE head: cell_volume unresolved ({exc}); skipping head")
             cell_volume = None
-    return vhead, whead, cell_volume
+    return vhead, whead, cell_volume, source
+
+
+def _inject_q0_head(
+    V_q0,
+    W_q,
+    g0_mu,
+    g0_nu,
+    vhead,
+    whead,
+    cell_volume: float,
+    *,
+    w0_ready: bool,
+):
+    """Inject the rank-1 q=0 head, with ``whead`` gated on ``w0_ready``.
+
+    ``(V_q0, W_q, log_fragment)``.  One authoritative spelling of the head
+    injection for both restart loaders: the sharded one
+    (:func:`load_bse_data_from_restart_sharded`) and the single-device
+    full-file one (:func:`_load_ring_subset`).
+
+    THE GATE IS THE POINT.  ``vhead`` belongs on ``V_q0`` unconditionally —
+    ``compute_vcoul`` zeroes ``v(G=G'=0)`` at q=0 before the Dyson solve and
+    this reinstates the mini-BZ-averaged head that was removed, so the tile
+    is bare Coulomb either way.  ``whead`` is the head of the SCREENED
+    interaction, and both loaders fall back to bare ``V`` for ``W`` when the
+    restart carries no ready ``W0_qmunu``.  Adding a screened head to an
+    unscreened tile is not a smaller error than the fallback it rides on: it
+    is a different, silent one, on a tile the caller has already been warned
+    is not physical.  So ``w0_ready`` False means the W tile is returned
+    exactly as it was read, and the log says ``whead=skipped``.
+
+    Passing ``W_q=None`` into the injector (rather than dropping the returned
+    array) is what makes the skip total: the helper then computes no ``w``
+    scalar and touches no W element, so the returned tile is the input object
+    and not a re-derived copy of it.
+
+    Parameters
+    ----------
+    V_q0 : jax.Array
+        ``(n_μ, n_ν)`` q=0 exchange tile.  Sharded ``P("x", "y")`` on the
+        sharded path, unsharded on the single-device one.
+    W_q : jax.Array
+        ``(n_μ, n_ν, nkx, nky, nkz)`` screened tensor; only the ``(0, 0, 0)``
+        k-slice is ever written, and only when ``w0_ready``.
+    g0_mu, g0_nu : jax.Array
+        ``ζ(0, μ, G=0)`` on the μ- and ν-axis respectively (the same vector
+        twice; two copies so the rank-1 update is process-local when the
+        tensors are dual-sharded).
+    vhead, whead, cell_volume :
+        As resolved by :func:`_resolve_head_params` — Ry and Bohr³.
+    w0_ready : bool
+        Did a real screened ``W0`` load, or is ``W_q`` the bare-V fallback?
+
+    Returns
+    -------
+    tuple
+        ``(V_q0, W_q, log_fragment)``; the fragment is the
+        ``"vhead=…, whead=…"`` half of each loader's own log line.
+    """
+    from gw.head_correction import apply_q0_head_rank1_sharded
+
+    V_q0, W_head = apply_q0_head_rank1_sharded(
+        V_q0, W_q if w0_ready else None, g0_mu, g0_nu,
+        vhead, whead, cell_volume, omega_index=0)
+    if w0_ready:
+        W_q = W_head
+    v_str = (f"vhead={complex(vhead).real:.6f}"
+             if vhead is not None else "vhead=skipped")
+    w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
+             if (whead is not None and w0_ready) else "whead=skipped")
+    return V_q0, W_q, f"{v_str}, {w_str}"
 
 
 def apply_eqp_corrections(
@@ -2025,6 +2335,8 @@ def apply_eqp_and_reslice_bands(
     n_occ: Optional[int],
     grid_x: int,
     grid_y: int,
+    degeneracy_mode: str = DEFAULT_MODE,
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> tuple[jax.Array, jax.Array, int]:
     """Apply BGW ``eqp1.dat`` corrections and re-slice the BSE band window.
 
@@ -2045,6 +2357,18 @@ def apply_eqp_and_reslice_bands(
         enk_full_np = np.asarray(f["enk_full"][:])
     enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
     n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
+    # Degeneracy guard, REPORT-ONLY here by construction.  The loader already
+    # snapped the window on the DFT spectrum and ψ has been read at those
+    # shapes; this function only re-derives ENERGIES, so widening now would
+    # desynchronise eps from psi.  What is new at this seam is that the QP
+    # shifts can open or close a near-degeneracy the DFT spectrum did not
+    # have, and that is worth a warning even though it cannot be repaired
+    # without re-reading ψ with a wider window.
+    check_band_window(
+        enk_full_np, n_occ_eff - n_val, n_occ_eff + n_cond,
+        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+        where="apply_eqp_and_reslice_bands (QP-corrected spectrum; re-run "
+              "with a wider --n-val/--n-cond to repair)", log=_log0)
     val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
     cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
     eps_v = jnp.asarray(enk_full_np[:, val_idx])
@@ -2107,6 +2431,8 @@ def _load_ring_subset(
     eqp_file: Optional[str] = None,
     n_occ: Optional[int] = None,
     input_file: Optional[str] = None,
+    degeneracy_mode: str = DEFAULT_MODE,
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
 ) -> dict:
     """Load a single-device BSE subset from canonical gw_jax restart state.
 
@@ -2139,6 +2465,8 @@ def _load_ring_subset(
         # shape it already had.
         V_qmunu = jnp.asarray(
             restart_munu_full_bz(f["V_qmunu"], "V_qmunu", restart_file))
+        from file_io import describe_coulomb_policy_stamp
+        print(describe_coulomb_policy_stamp(restart_file))
         if "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             W0_qmunu = jnp.asarray(
                 restart_munu_full_bz(f["W0_qmunu"], "W0_qmunu", restart_file))
@@ -2217,6 +2545,14 @@ def _load_ring_subset(
         print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
     n_val = min(n_val, n_val_available)
     n_cond = min(n_cond, n_cond_available)
+    # The 1-device escape from the sharded loader's choke point: same guard,
+    # same defaults, so the two routes cannot disagree about what window a
+    # given (n_val, n_cond) request means.  ``enk_full_np`` is the host copy
+    # that ``resolve_n_occ`` above already read (eqp-corrected when --eqp).
+    n_val, n_cond = resolve_band_window(
+        enk_full_np, n_occ, n_val, n_cond,
+        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+        where="_load_ring_subset", log=_log0)
     val_indices = jnp.arange(n_occ - n_val, n_occ)
     cond_indices = jnp.arange(n_occ, n_occ + n_cond)
 
@@ -2257,32 +2593,32 @@ def _load_ring_subset(
     # injected into W_q only when a real screened W0 is present (not the
     # bare-V fallback).  Source priority: cohsex.in overrides > restart-file.
     if G0_mu_nu is not None:
-        vhead, whead, cell_volume = _resolve_head_params(
+        vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart)
         if cell_volume is None:
             print("BSE: head injection skipped — could not resolve cell_volume "
                   "(input_file required)")
         elif vhead is not None or whead is not None:
-            from gw.head_correction import apply_q0_head_rank1_sharded
             g0_pad = _pad_last_axis(G0_mu_nu, n_rmu_pad)
             w0_ready = W0_qmunu is not None
-            V_q0, W_head = apply_q0_head_rank1_sharded(
-                V_q0, W_q if w0_ready else None, g0_pad, g0_pad,
-                vhead, whead, cell_volume, omega_index=0)
-            if w0_ready:
-                W_q = W_head
-            v_str = (f"vhead={complex(vhead).real:.3f}"
-                     if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.3f}"
-                     if (whead is not None and w0_ready) else "whead=skipped")
+            V_q0, W_q, head_str = _inject_q0_head(
+                V_q0, W_q, g0_pad, g0_pad, vhead, whead, cell_volume,
+                w0_ready=w0_ready)
             print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
-                  f"{v_str}, {w_str}")
+                  f"{head_str} [source: {head_src}]")
 
     key = jax.random.PRNGKey(0)
     X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(
         key, (1, n_cond_pad, n_val_pad, nk)
     )
 
+    # The RESOLVED window travels with the bundle, under the same four names
+    # ``load_bse_data_from_restart_sharded`` uses.  ``n_val``/``n_cond`` here
+    # are post-clamp AND post-snap (``resolve_band_window`` above rebound
+    # them); ``*_pad`` are the mesh-rounded extents the ψ/ε arrays are shaped
+    # by.  Callers had to re-derive these from ``psi_c.shape[1]`` — which is
+    # the padded number, and is why ``tests/bench/test_bse.py`` backfilled
+    # them by hand — or, worse, keep using their own pre-snap CLI request.
     return {
         "psi_c": psi_c,
         "psi_v": psi_v,
@@ -2291,6 +2627,10 @@ def _load_ring_subset(
         "W_q": W_q,
         "V_q0": V_q0,
         "X": X,
+        "n_val": n_val,
+        "n_cond": n_cond,
+        "n_val_pad": n_val_pad,
+        "n_cond_pad": n_cond_pad,
         "nkx": nkx,
         "nky": nky,
         "nkz": nkz,

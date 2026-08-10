@@ -1,5 +1,40 @@
 # Known test failures — full-suite census
 
+> **WHICH RUN THIS FILE ACCOUNTS FOR (unchanged, restated 2026-08-09).**
+> Every row below is about the **CENSUS** — `pytest --census`, equivalently
+> `pytest -m census`. Since 2026-08-09 a bare `pytest` is the fast default
+> gate (the Si end-to-end calculation for the drivers a branch touched, plus
+> the services' suites); it is a strict SUBSET of the census and it is not
+> what this file counts. **Nothing about this file's meaning, scope or
+> accounting changed with that split** — `--census` collects exactly the set
+> a bare `pytest` collected before it, plus this branch's own two new
+> selection cells and nothing else. Re-measured after the 2026-08-10 rebase
+> onto `chore/anchor-window-pin-2026-08-09`: a bare `pytest` at the base
+> collects 3369 cells over 203 files, `--census` here collects 3371 over the
+> same 203, and the whole difference is
+> `tests/test_service_selection.py` going 14 → 16 — the two cells this branch
+> adds to prove its own claim. `-m census` collects the identical 3371, and
+> `--no-services` and `LX_SKIP_SERVICES=1` collect the identical 2441.
+> Do not reconcile a KNOWN_FAILURES row against a default-gate run; it will be
+> short by ~2400 cells for reasons that have nothing to do with the row.
+> Evidence: `/pscratch/sd/j/jackm/fastgate_rebase_0810/collect_*.raw`.
+>
+> **WHAT A DEFAULT-GATE RUN LOOKS LIKE AT THIS HEAD (2026-08-10).** A bare
+> `lx test` collects 935 — 930 service cells and the five end-to-end driver
+> cells — and comes back **0 failed across `tests/`**, which includes the Si
+> BSE anchor now that `chore/anchor-window-pin-2026-08-09` pins its band
+> window. The nine reds it does report are all in `services/`, and they are
+> **pre-existing, not this branch's**: the same three suites run at the base
+> commit, under the same module and the same `.so` pair, return nine reds too,
+> seven of them the identical node ids and the other two swapping between rows
+> this file already lists. Neither this branch nor the pin branch changes a
+> single file under `src/` or `services/`, so neither could have caused them.
+> Evidence: `log_default_gate.txt` and `log_svc_base.txt` in the directory
+> above. Note also that the run needs the site `.so` pair supplied — with no
+> `LORRAX_FFI_SO` the FFI gate refuses before any driver starts, and every
+> end-to-end cell fails on that refusal rather than on its numbers
+> (`log_default_gate_nofficonf.txt`, kept as the negative control).
+
 Two censuses live in this file.  The **Perlmutter** one is authoritative for
 this tree; the **Frontera** one below it is the historical record from
 2026-08-01 and is kept because several of today's reds are only legible
@@ -11,87 +46,292 @@ claim carries the arm in which it comes out FALSE.
 
 ---
 
-# AMENDMENT — THE CROSSING COMPLETION WAS ELEMENTWISE, AND TWO PPM FREEZES MUST MOVE (2026-08-09)
+# AMENDMENT — `mu_small = auto` IS RANK-SIZED, NOT ACCURACY-SIZED (2026-08-10) — **OPEN**
 
-`fix/ppm-crossing-operator-im-2026-08-09`, off `integration/mpa-table-2026-08-09`
-@ `3ed30c39`.  One physics change: the crossing (HGL, `project="imag"`)
-consumer in `gw.ppm_accumulators._project_tau_onto_omega_np` completed its
-one-sided τ grid with the ELEMENTWISE imaginary part where the sine sum
-needs the operator one, `Im_op[c·X] = (c·X − (c·X)†)/2i` — the missing
-exponential is the (μ,ν) PAIR adjoint (exact for Hermitian `B_q`, measured
-8.6e-10).  The two coincide only where σ^τ is complex-symmetric, i.e. only
-at k ≡ −k mod G.  On the Si 4×4×4 arm-b deck the elementwise form left Σ_c
-non-Hermitian by 8.8–30.3 eV at the five non-TRIM k (star spread 43.85 eV
-diag), which is registered task #16's eqp0 anomaly (`Emf` right everywhere,
-`eqp0` breaking exact degeneracies by up to 67.6 eV); §7.7.7's re-closure
-of that task as a file-reading error is thereby withdrawn a second time —
-the reading error was real, but a code defect sat underneath it.
-Pre-existing at `59fa874b`.  Gates: `tests/test_ppm_crossing_completion.py`
-(physics derivation, Hermiticity with the elementwise red twin, the TRIM
-reduction with the conjugate-crossed red twin `(c̄X − cX†)/2i` and the
-`−Im_op` sign twin, scalar-channel preservation, dispatch guards).
+**One row, and it is not a red — it is a wrong physical number produced by
+following this tree's own documented guidance, with nothing anywhere
+refusing.**  It is filed here rather than as a small-issues row because it
+implicates physics: the setting `docs/downfold.md` recommended until this
+branch sized a downfold whose lowest BSE eigenvalue came out 2.087 eV wrong,
+and the owner's bar for production BSE is under 1 meV.  Nothing in the suite
+could have caught it, and that is the durable part.  `tests/test_downfold.py`
+is deck-free by design — it gates the algebra (T = I on a full keep, the
+congruence, the Pythagorean identity and their red twins) and the rank
+refusal, none of which is an accuracy statement about a real deck.  The one
+cell that would have caught this, "downfold `si_bse_debug`, run the BSE
+driver on the small bundle unchanged, compare against the parent", needs a
+GPU and a finished GW run and lives in the campaign report rather than in
+`tests/`.  So the tree has no gate anywhere that compares a downfolded
+observable against its parent's, and until the sizing mode below lands, the
+only instrument is a user running that comparison by hand.
 
-**WHAT THIS TURNS RED, by design — three gates are stale, not the code.**
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`mu_small = auto` sizes μ_S by the eigenvalue rank ceiling, which is not an accuracy criterion, and the docs recommended it** | `auto` sets μ_S to the number of independent pair-density directions the retained window holds at `downfold_rcond` — the largest value the driver will accept, and a statement about what the parent can still *represent*.  Rank completeness at that ceiling implies observable accuracy only on a parent that is OVER-COMPLETE for the window; nothing in the driver measures whether the parent is, and on a parent that is merely adequate the "compression" is a truncation with a compression's reporting.  Measured on the standard si pipeline walk (`~/lorrax_bse_perf_2026-08-08/PIPELINE_HEALTH.md`, 2026-08-10, `si_bse_debug` 4×4×4, a 936-centroid parent on a `0:20` window): `auto` → 189 at `downfold_rcond = 1.1e-6` moved the lowest BSE eigenvalue from the parent's **2.3449 eV to 0.2579 eV**, an error of **2.087 eV**, and the run exited 0 with a clean log.  `eps_W` read **1.33e-2** — about one per cent — which is the tripwire behaving exactly as documented and is the third measured case in which a ~1 % `eps_W` sat beside an error of 37 meV, 1.7 eV and now 2.09 eV; it is not an accuracy gate and was never claimed to be one.  Tightening to `rcond = 1e-8` (`auto` → 624, a compression of only **1.5×**) still left **1.08 eV**.  The error falls with μ_S, so the transfer solve is doing its job and this is a sizing defect rather than a numerical one — but on this deck the accuracy a BSE needs and the compression the downfold offers did not overlap at any μ_S the driver would accept.  Caveat on the record from the walk: that parent was pruned on the deck's Σ window (`8 / 52`) because it is the only invocation the tree documents, not on the 20-band window the downfold was fitted to; whether a differently-pruned parent behaves better is exactly the question the docs do not answer | **OPEN**, and it stays open until a **target-accuracy sizing mode** exists — the planned stage-4 item on the downfold roadmap, in which the user states a meV bar and the driver sizes μ_S by sweeping it against the parent observable.  Nothing in this tree sizes μ_S for accuracy until that lands.  What `fix/downfold-auto-guard-2026-08-10` does in the meantime is safety only, and refuses nothing: (1) `auto` prints a LOUD warning at selection time, before the expensive stages, carrying the measured hazard verbatim (`gw.downfold.AUTO_HAZARD`), the numbers above, the over-complete-parent precondition and the fact that the accuracy-sized mode does not exist; it repeats at the end of the run, where the reader actually is.  (2) `docs/downfold.md`, `docs/drivers.md` and `docs/input_reference.md` **stop recommending `auto`** — the recommendation is now an explicit integer validated by the observable comparison, the page's own example deck carries an explicit number rather than `auto`, and the over-complete-parent requirement is restated at the recommendation site.  (3) Every run now ends by printing the one-line, copy-pasteable observable comparison (parent and small bundle, same deck, same flags, compare the lowest eigenvalue), with that run's own paths substituted in, because the three numbers the driver prints are all rank or projection statements and none of them is an accuracy gate.  Gate: `tests/test_downfold.py::test_auto_prints_the_loud_accuracy_warning` with its **red twin** `::test_auto_warning_red_twin_an_explicit_mu_small_says_nothing` — the same rank-deficient pool, μ_S spelled as an integer instead of `auto`, must print nothing at all, so the warning cannot decay into a banner that fires on every run.  32 cells in that file, **32 passed** on WSL CPU.  Evidence: `PIPELINE_HEALTH.md` (the walk and its punch table), `DOWNFOLD_S1.md` §3(c) and `DOWNFOLD_RANK_PROBE.md` (campaign reports, not carried in this repository) |
 
-1. `test_gnppm_matches_reference` / `test_bispinor_gnppm_matches_reference`
-   pin `sigma_diag_gnppm_ref.dat` / `sigma_diag_bispinor_ref.dat` frozen
-   FROM THE ELEMENTWISE FORM.  Measured on the fixed tree
-   (`/pscratch/sd/j/jackm/sigc_star_0809/mos2_fixed/`): sigX bit-identical
-   (max|Δ| = 0.0 — the static path is untouched, the control the fix must
-   pass), sigC moves 2.9e-3 eV at Γ and up to 2.98e-2 eV at the other k,
-   against `_XMACHINE_ATOL_EV = 1e-5` → RED.  Note Γ moves too: on MoS2
-   (no inversion; nspinor=2 TRS carries the spinor rotation) σ^τ_Γ is only
-   APPROXIMATELY complex-symmetric, so the TRIM reduction is exact-to-fp
-   only where it is exact in the operator sense — on the Si arm-b deck the
-   three TRIM k reproduced to 2.6e-7 eV, on MoS2 Γ inherits a few-1e-3 eV
-   correction of its own.  That is the fix landing, not a regression; the
-   references need an adjudicated re-freeze (owner row).
-2. `test_mpa_sigma_costs_gnppm_nothing`'s source-digest gate: this branch
-   EDITS the shared two-point Σ core (`ppm_accumulators.py`) on purpose —
-   the exact case the gate exists to make loud.  The inter-fleet
-   consequence is real, not clerical: the peer fleet's gnppm sigTOT anchor
-   (0.6439 meV MAE vs the BGW oracle) is anchored to the elementwise
-   bytes and moves with this fix.  The re-anchor (BASE_SHA + digests, one
-   commit naming this change) belongs to the MPA branch after
-   adjudication, not to this branch.
+---
 
-Everything at nb=1 (the `test_mpa_sigma_pass` scalar τ-loop analogue) is
-preserved to fp roundoff — its channels are real, where Im_op degenerates
-to the elementwise Im — pinned by `test_scalar_channel_unchanged`.
+# AMENDMENT — `bse.exciton_bands` COULD NOT READ A DOWNFOLDED BUNDLE, THREE WAYS (2026-08-10) — **FOUND AND FIXED ON THIS BRANCH**
 
-**THE ADJUDICATION, measured (2026-08-09, all arms on this branch's tree
-with the restage-candidate `.so` pair; evidence
-`/pscratch/sd/j/jackm/sigc_star_0809/_reports/`).**  Green arm, full Si
-arm-b deck: Σ_c star spread 46.7623 raw / 43.8463 diag eV → **0.0000 /
-0.0000**; max|A−A†| at the five non-TRIM k 8.8–30.3 eV → 0 (η floor);
-eqp0's exact-Emf degeneracy spread 67.64 / 10.50 eV → 0.0000; the three
-TRIM k rows of eqp0 unchanged to 2.6e-7 eV; task #16's
-band-9-below-band-8 inversion, present at exactly the five non-TRIM k,
-gone at all eight; |eqp0 − BGW GN twin| over 16 bands × 8 k max 20.25 →
-1.05 eV, mean 5.03 → 0.44 eV, with the five non-TRIM k landing in the
-SAME residual band as the TRIM three — no per-k structure survives.
-Cluster red twin (conjugation crossed, `(c̄X − cX†)/2i`): Hermitian at
-the η floor AND star spread exactly 0.0000 — both internal symmetry
-checks are structurally blind to a wrong equivariant completion — while
-the TRIM rows move 7.4–19.7 eV.  TRIM invariance is therefore the
-discriminating gate, which is why it is pinned in the test file rather
-than any spread statistic.
+**One row, and not one of the three was ever a red.**  `PIPELINE_HEALTH.md`
+step 5 records the whole defect: on a 936 → 189 downfold of the shipped
+`si_bse_debug` parent, `bse.exciton_bands` refused three separate ways while
+`bse.bse_jax` read the same bundle fine.  Nothing in the suite could have
+caught any of them — the downfold's own cells are deck-free algebra, and the
+one exciton-bands driver cell is gated on an MoS2 fixture that is not a
+downfold — so the whole defect lived in the gap between two suites that each
+looked complete.  It broke the drop-in promise for exactly the driver the
+compression exists to serve.
 
-**Still open at this seam (pre-existing, separate row) — RE-DESCRIBED
-2026-08-09:** the 1.6e-2 figure measured on the arm-b deck
-(`LORRAX_PPM_HERM_DIAG=1`) is a **χ₀ ratio IQR at q=0**, and it is already
-attributed: it comes from inverse-Dyson conditioning at the one q that has
-the G=0 component removed (`FIX_wq_resolvent.md:128,138`).  It was
-previously written up here as an `Omega_q` hermiticity seam at the LU Dyson
-solve; that description is wrong and is **corrected per
-`TRACE_vavg_consumers.md`**, which pins the attribution on file:line
-evidence.  The completion's exactness is not what this number bounds.  The
-tree's actual hermiticity seams, for anyone who comes looking for them, are
-`screening.py:666` (1e-6), `screening.py:691` (1e-5), `bse_nontda.py:190`
-(1e-6) and `ALPHA_HERM_RTOL` (1e-9).  And the crossing dispatch
-could now ride the merged X kernel (`Im_op[c·X]` needs only X), which
-would retire the two-channel plan — an owner-scoped channel-plan change,
-deliberately not folded into the fix.
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`bse.exciton_bands` refused a downfolded bundle three ways: no centroid table, a Galerkin basis that cannot span `nk·nb`, and no `zeta_q.h5`** | The three share one cause. `bse_jax` only READS the stored tensors; `exciton_bands` REBUILDS objects in the same ISDF basis — ψ at finite Q via htransform, and the exchange tile off the grid via `vq_interp` — and rebuilding needs two things the bundle format does not carry and never did. (1) COORDINATES: the htransform leg fits ψ against a centroid table, and a downfolded bundle carried one only when the run had been given `parent_centroids_file`; without it `file_io/centroids.py` raised a bare `FileNotFoundError` on a path the deck named and the child directory did not contain, with nothing to say it was a downfold consequence. (2) THE BASIS THAT FIT RUNS IN: that Galerkin fit needs a basis spanning `nk·nb` — 1280 on this deck — which is a completely different sizing criterion from the retained window's PAIR-DENSITY rank that μ_S = 189 was chosen against, so the fit in the small basis failed `build_fH_R`'s orthonormality gate outright. (3) ζ: `--vq-mode interp` interpolates a stored `zeta_q.h5` beside the restart, and the downfold wrote none; the parent's is the wrong basis, μ_L wide against a μ_S bundle, so copying it would have been worse than leaving it out | **FIXED on `fix/exciton-bands-downfold-2026-08-10`, PUSHED, NOT MERGED.**  Two of the three are completed on the WRITER, which is where the design says the restart contract lives. (1) `gw.downfold_run.resolve_parent_centroids` takes the parent's coordinates from the parent's OWN `zeta_q.h5` `isdf_header` — `r_mu_crystal` is that table by construction — content-verifies them against the bundle's `centroids_charge_md5` (which hashes the int64 FFT-INDEX table, not the text file; comparing a file md5 against it never matches, and `_centroid_table_md5` exists so that mistake is unavailable), and writes them beside the small bundle. `parent_centroids_file` becomes an override rather than a requirement. (3) `write_downfolded_zeta` transports ζ as `ζ_S = conj(T[q]) ζ_L` — `transform_head_vector`'s map at every G rather than only at G = 0 — which substituted into `V = ζ† v ζ` gives back `V_S = T V_L T†`, the congruence the bundle already stores, so the two descriptions cannot drift; the writer cross-checks its q=0/G=0 column against the independently transported `g0_S` on every run (**AGREE, 1.4e-15**, real deck). On a parent whose ζ is q-IBZ-only the transport is refused and says so — nothing is lost, since `vq_interp` refuses an IBZ ζ on the parent too. (2) is necessarily reader-side, because the reader is what runs the fit: `exciton_bands.resolve_isdf_basis` reads the bundle's `downfold_provenance`, fits the htransform leg in the PARENT basis, and `build_conduction_stacks` slices the result to `keep_idx` inside the same jit — exact, because that column slice is the downfold's own definition of the small basis's ψ (`downfold.md`, `mode = cur`). The restart's μ is the authority on the result and a mismatch refuses rather than padding its way out (post-snap window-authority pattern, `7449ece0`). **GATES, all on Perlmutter, shared pool.** (a) END-TO-END on the walk's exact recipe (GW → downfold → `exciton_bands`), **rc=0**, and the Q=0 point of the downfolded exciton bands is `0.257866 0.258312 0.261277 0.597959` eV against `bse_jax --tda --bse` on the SAME bundle at `0.25786551 0.25831244 0.26127694 0.59795887` — agreeing to **5e-7 eV**, i.e. identical at the `.dat`'s own print precision. Same Hamiltonian, same answer. (b) SPLASH PROOF: the parent-basis run's `.dat` AND `.png` are **byte-identical** between base `d1e375ad` and this branch. (c) IDENTITY DOWNFOLD (μ_S = μ_L = 936, T = I) through `exciton_bands` reproduces the parent driver on **all 10 Q rows × 4 eigenvalues**, identical to print precision; the same holds for a synthetic identity `keep_idx` stamped on the parent bundle itself. ζ's transport is verified independently of any gate battery: the transfer recovered from the two on-disk ζ files ALONE (`conj(T) = ζ_S pinv(ζ_L)`, no knowledge of the downfold's `T`) congruences the parent's stored `V_qmunu` into the child's to **5.1e-11 relative at every one of 64 q**. (d) `tests/test_exciton_bands_downfold_dropin.py`, 16 cells, one per mechanism plus a red twin each — **46 passed** on Perlmutter with `tests/test_downfold.py` beside it, 6 of them also green on a WSL CPU box (the other 10 import the driver and need the FFI). (e) **DEFAULT FAST GATE: ZERO DELTA.** 16 unique FAILED node ids on the branch and the IDENTICAL 16 at base `d1e375ad`, `diff` empty; **none of them is under `tests/`** — all sixteen are the pre-existing `distrib_la` / `vcoul` / `wfn_loader` / `zeta_loader` / `symmetry_maps` service reds this file already lists. Note the selection is NOT symmetric and cannot be: the branch touches `src/file_io/` and `tests/`, which map to ALL, so its gate runs all five end-to-end driver cells while base (no diff against main) runs only the services. Every driver cell the branch's gate selects is green. A FIRST branch run showed `test_bse_matches_frozen_and_bgw` red; that is xdist contention on a shared node, not this branch — the cell passes ALONE on the branch AND alone at base, and the repeat full-gate run at the same head is green on it. `mkdocs build --strict`: 25 warnings, the documented baseline, unchanged. **WHAT THIS DOES NOT FIX, stated because the number is alarming and belongs to a different row:** the downfolded exciton bands at μ_S = 189 sit 2.09 eV below the parent's. That is `PIPELINE_HEALTH.md` punch row 3, the open `mu_small` sizing guard, not this defect — measured here as a μ_S sweep, 0.2579 eV at 189 → 1.2605 eV at 624 → 2.3451 eV at 936, which is the SAME curve `bse_jax` traces on the same three bundles, to six figures. The driver now reports the bundle it was given, faithfully; sizing the bundle is still the user's problem. **One pre-existing failure was found and is NOT this branch's:** `--vq-mode interp` on this deck fails `vq_interp`'s `makeVq_vs_disk_Vqmunu_allq_max` and `slab_axes_offdiag` gates — **identically on the PARENT** (3.218e-01 / 1.000e+00) and on the child (4.799e-01 / 1.000e+00) — so the off-grid path is blocked on `si_bse_debug` for reasons that predate the downfold, and the end-to-end gate above runs `--vq-mode ongrid`, which is exact at every Q on the BSE grid. Evidence: `/pscratch/sd/j/jackm/xw_parent`, `xw_small`, `xw_ident`, `xd_parent`, `xd_small`, `xd_small8` |
+
+---
+
+# AMENDMENT — THE SHARDED BSE LOADER INJECTED A SCREENED HEAD ONTO THE BARE-V FALLBACK (2026-08-10) — **FOUND AND FIXED ON THIS BRANCH**
+
+**One row, and it was never a red — it was a silent wrong number on a path
+that already knew it was in trouble.**  The Schur design pass over the BSE's
+q=0 head (`~/lorrax_bse_perf_2026-08-08/SCHUR_BSE_DESIGN.md` §5(a)) read the
+two restart loaders side by side and found that only one of them asks whether
+the `W` it is about to decorate is screening at all.  Nothing in the suite
+could have caught it: every behavioural cell that exercises
+`load_bse_data_from_restart_sharded` runs on a fixture whose `W0_qmunu` is
+ready, which is the one state in which the missing gate is invisible.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`load_bse_data_from_restart_sharded` added the screened head `whead` to a `W` tile that is bare Coulomb `V`** | Both loaders fall back to bare `V` for `W` when the restart carries no ready `W0_qmunu` — the April all-zero-screening gate, `W0_ready`, whose reading side `tests/test_bse_w0_ready_gate.py` pins.  Both then re-attach the q=0 Coulomb head that `compute_vcoul` removes before the Dyson solve, as the rank-one update `(head/V_cell)·conj(g0)⊗g0`.  `vhead` belongs on the exchange tile either way, because that tile is bare Coulomb by construction; `whead` is the head of the SCREENED interaction and belongs on `W` only when a screened `W` was loaded.  The single-device reader `_load_ring_subset` asked exactly that (`w0_ready = W0_qmunu is not None`, and it passed `None` for `W` when the answer was no).  The sharded reader — the P>1 path, and the one production runs at scale — passed `W_q` into the injector unconditionally, so a fallback run got a screened head of the same geometric size as the Si deck's 2600 meV and the MoS2 slab's 3564 meV sitting on an unscreened tile.  The fallback itself warns loudly; the head on top of it was silent, and it is not a smaller error than the fallback it rides on but a **different** one, on the q=0 tile exciton binding is most sensitive to.  Not attributable to a commit: the sharded loader has carried the ungated call since it was written, and the single-device gate was added to its twin without being ported | **FIXED on `fix/sharded-whead-gate-2026-08-10`, PUSHED, NOT MERGED.**  Gate parity, in one authoritative spelling: the new `bse_io._inject_q0_head` owns both the injection and its `w0_ready` condition, and both loaders now call it — so the two cannot drift apart again, and an AST cell refuses either of them reaching past it to `apply_q0_head_rank1_sharded`.  The sharded side records `w0_ready = wq_key is not None` at the dataset-selection block, before the fallback aliases that key to `V_qmunu` and destroys the evidence.  Gate: `tests/test_sharded_whead_gate.py`, 11 cells, **11 passed** on WSL CPU — behavioural, fixture-free, one CPU worker subprocess per device count (`--xla_force_host_platform_device_count`), running the real loader on a synthetic restart in both `W0_ready` states at 1x1 and 2x2.  **Red twin, executed at P=4 through the shipped loader** with the gate monkeypatched back open: the returned q=0 tile is not the bare `V` on disk and is bit-for-bit `V` plus the rank-one head, which is the defect reproduced rather than described.  Post-fix the same arm returns the disk bytes **exactly**, and matches what `_load_ring_subset` composes on the same file, at both meshes.  **Blast radius, measured rather than argued:** of the 44 arrays in the returned bundle, hashed pre-fix and post-fix at 1x1 and at 2x2, **exactly one moves** — `W_q` on the fallback arm.  Every array on the ready arm, and `V_q0` on both arms, is bit-identical, so `vhead` still reaches the exchange tile on a fallback run and the normal path does not move at any mesh.  The only other visible change is the log, which now says `whead=skipped` where it used to print a value — the single-device loader's own spelling.  **Default gate, run on both arms of the same box** (WSL, no site `.so` pair, so this is the header's `LORRAX_FFI_SO`-absent negative control rather than a physics leg): 935 collected, **8 failed / 787 passed / 3 errors on the branch and the IDENTICAL eleven node ids at base `e266fbce`** — the six `distrib_la` contract cells, the `vcoul` import-isolation cell, the Si BSE anchor and the three `gw_jax` regression errors, all of which need the built FFI.  Nothing this branch touches appears in that set.  Evidence: `SCHUR_BSE_DESIGN.md` §5(a), which also records §5(b) (bind the Coulomb policy stamp to the head scalars) as still open |
+
+---
+
+# AMENDMENT — THE SI BSE ANCHOR WAS RED ON `main`; THE ANCHOR DECK NOW PINS ITS WINDOW (2026-08-09, **CLOSED 2026-08-10** on `chore/anchor-window-pin-2026-08-09`)
+
+**One row, and it was a live red on `main` rather than a branch's own red.**
+The fast-gate lane reported `test_bse_matches_frozen_and_bgw` failing at
+0.0906 eV against a 1e-6 eV pin and correctly declined to attribute it, since
+its branch changes no `src/` file; it flagged the number as worth a look on a
+properly site-built tree.  It was looked at.  The red reproduced to the digit
+on a clean checkout of `main` @ `01e1e609` with the canonical
+`restage_candidate_2026-08-08` `.so` pair, so it was neither the fast-gate
+branch nor that lane's borrowed 2026-08-07 libraries.  It arrived at
+`824032b7`, the `feat/exciton-bands-2026-08-09` merge, and the mechanism is
+that merge's new band-window guard running in its default `snap` mode.
+
+The part that mattered most is that **this red was not re-cuttable.**  The hbn
+row two amendments down is the shape people will reach for — correct behaviour
+outrunning a stale reference, closed by an owner-authorized re-freeze.  This was
+not that.  The moved spectrum fails the gate's *external* BerkeleyGW band as
+well as its frozen pin, so adopting the new numbers as the reference would have
+left the cell red on its second arm.  The gate is the tree's only cross-code
+BSE anchor, and for the eighteen hours between `824032b7` and the pin below it
+was anchored to nothing.
+
+**HOW IT IS CLOSED.**  The anchor deck's invocation now pins
+`--band-degeneracy off`, and the pin carries its reason at the call site.  The
+owner's standing rule decides this one: a reference deck is a measurement
+standard, so it has to run the calculation its references were cut from.
+BerkeleyGW produced `bgw_eigenvalues_dft_ref.dat` at 4v4c and the frozen
+`bse_eigenvalues_ref.dat` is that same 1024-dimension problem, so a guard that
+silently rewrites the window to 8c is not making the gate safer — it is
+substituting a different calculation for the one being measured, which is
+exactly the confounding `97735e01` refused for the q=0 head override on this
+very deck.  Nothing in `src/` changed; the whole fix is one flag and one
+comment in `tests/test_bse_bgw_regression.py`.  **Measured green** at
+`29723072` on the shared pool with the same conditions the attribution used
+(`LX_BASE_MODULE=lorrax_J070`, the canonical `.so` pair,
+`LORRAX_CHECKOUT=/pscratch/sd/j/jackm/anchorpin_0810/wt`): the cell passes both
+arms with **zero `[band-window]` lines in the log**, which is the same
+signature the A/B's `log_degen_off.txt` showed, and the other four default-gate
+cells pass unchanged in the same tree
+(`/pscratch/sd/j/jackm/anchorpin_0810/log_anchor_pin.txt`,
+`log_other4_pin.txt`).
+
+**THE OTHER REFERENCE DECKS WERE SWEPT FOR THE SAME EXPOSURE, AND NONE OF THEM
+HAS IT.**  The exposure needs two things at once — a cell that reaches the
+guard, and a requested window whose boundary cuts a multiplet — and the sweep
+checked both rather than assuming either.  On reachability, the guard's only
+call sites in the tree are `bse_io.resolve_band_window` (twice) and
+`bse_io.check_band_window` / `exciton_bands.check_band_window`, all of them
+inside `src/bse/`; `gw.gw_jax` does not import `bse_io`, so the four COHSEX and
+Σ decks whose frozen references the suite pins — `si_cohsex_debug` (all three
+cells, including the BerkeleyGW anchor), `cohsex_debug`, `hbn_cohsex_debug` and
+`bispinor_debug` — cannot reach it at all, whatever their spectra look like.
+On the one other deck that does reach it, the answer is measured rather than
+argued: `gnppm_debug` is loaded at 2v2c by `conftest.bse_dense_state`,
+`test_bse_kgrid` and `test_bse_nontda_restart_preflight`, and running the
+guard's own `boundary_min_gaps` over that deck's `WFN.h5` puts its valence
+boundary (band 24) at **305.171 meV** and its conduction boundary (band 28) at
+**75.758 meV**, both five decades clear of the 1 meV tolerance — so `snap` runs
+there on every invocation and has never fired.  For contrast the same script
+reproduces the anchor's defect exactly: `si_bse_debug` at 4v4c is clean at the
+valence boundary (band 4, 47.961 meV) and **0.000 meV at the conduction
+boundary, band 12**.  `si_bse_debug` is therefore the only deck pinned, and the
+rest are left untouched deliberately.  Sweep evidence:
+`/pscratch/sd/j/jackm/anchorpin_0810/sweep_windows.py` and its output
+`log_deck_sweep.txt`, which reads each fixture's `mf_header/kpoints/el` and
+`ifmax` and calls the shipped `boundary_min_gaps` rather than reimplementing it.
+
+**THE SECOND OWNER ROW IS NOW CLOSED TOO.**  It asked whether `snap` was the
+right *default* for a driver flag at all, or whether `strict` was, given that
+the guard's whole argument is that a cut multiplet is not a thing to fix
+quietly.  Pinning the anchor deck removed the tree's one measured victim of the
+default but did not answer the question — the next deck someone wrote with a
+boundary inside a multiplet would have hit the same silent doubling without a
+frozen reference to notice it with.  **DECISION (2) TAKEN, 2026-08-10 (owner,
+verbatim: "do strict"): the default is `strict`.**  A window that cuts a
+degenerate multiplet now REFUSES, naming the counts that would work, and never
+silently widens the calculation.  `snap` remains available as an explicit
+opt-in and `off` is unchanged.  The reason on record is this row and the parity
+deck's false 28.6 meV "regression": `snap` silently re-windowed two BGW-parity
+decks in one day.  The flip is one name — `common.band_degeneracy.DEFAULT_MODE`
+— read by both drivers' `--band-degeneracy` and by every keyword default at the
+choke point, with `tests/test_band_degeneracy.py` pinning both the value and
+the absence of any second literal that could shadow it.  The anchor deck's own
+`--band-degeneracy off` pin from DECISION (1) is untouched and still the right
+pin: `off` is what a measurement standard wants, because it runs the window its
+references were cut from without the guard having an opinion either way.
+
+**MEASURED at `912f6c79`** on the shared pool under the conditions the
+attribution and anchor-pin lanes used (`LX_BASE_MODULE=lorrax_J070`, the
+canonical `.so` pair, `LORRAX_CHECKOUT`), evidence in
+`/pscratch/sd/j/jackm/degenstrict_0810/`:
+
+* **the deck now refuses with no flag** (`log_probe_ab.txt`, `probe_out.txt`) —
+  `si_bse_debug` at 4v4c exits **rc=1** with
+  `BandWindowDegeneracyError: … the conduction boundary at band 12 cuts a
+  multiplet (gap 0.000 meV at k=0, tol 1.000 meV) … Fix: use --n-val 4
+  --n-cond 8, or pass --band-degeneracy snap to widen to those counts
+  automatically, or --band-degeneracy off …`;
+* **the opt-in is byte-identical to the pre-flip default.**  Explicit
+  `--band-degeneracy snap` on the same deck snaps 4c → 8c, runs to rc=0, and
+  returns the same twenty eigenvalues the pre-flip `snap` arm returned at
+  `01e1e609` — `2.34696443 ×2, 2.34802375 ×3, 2.34977621 ×3, …, 2.40415288`,
+  max abs vs the frozen pin **0.09064299 eV**, matching
+  `bsegate_attrib_0809/log_degen_snap.txt` digit for digit;
+* **the anchor deck is unchanged** (`log_c_anchor.txt`) — the `off`-pinned cell
+  passes both arms with **zero `[band-window]` lines in the log**, the same
+  signature the pin was measured with at `29723072`;
+* **the default fast gate is set-identical to `main`** (`log_d_fastgate.txt`
+  vs `log_d_baseline_main.txt` at `a65a5326`): the same nine `services/` reds
+  on both sides and nothing else, so the flip adds no red; the guard's own
+  census cells pass (`log_e_census.txt`).
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`tests/test_bse_bgw_regression.py::test_bse_matches_frozen_and_bgw` — was RED on `main`, both arms; **FIXED** by pinning the deck's window at `29723072`** | **The default `--band-degeneracy snap` silently doubles the deck's BSE problem.**  `99d73f95` (in the `824032b7` merge) installs `common.band_degeneracy.resolve_band_window` at the band-window choke point with `mode="snap"` as the default, so a window boundary landing inside a degenerate multiplet is widened OUTWARD.  On `si_bse_debug` it fires, and the run says so in its own words: *"[band-window] `_load_ring_subset`: requested n_val=4 n_cond=4 (bands [4, 12) of 60) is not multiplet-safe … the conduction boundary at band 12 cuts a multiplet (gap 0.000 meV at k=0, tol 1.000 meV); the multiplet ends at band 16, so n_cond 4 → 8 … SNAPPED OUTWARD to n_val=4 n_cond=8 (bands [4, 16) of 60).  The BSE problem is now 32 pairs per k instead of 16."*  The gate's Hamiltonian therefore goes from 1024 to 2048 dimensions, the extra transitions fill the bottom of the spectrum, and every one of the lowest twenty moves down: 20/20 cells over the pin, max abs **0.09064299 eV** against `ATOL_FROZEN_EV = 1e-6` (index 0: 2.34696443 actual vs 2.35372258 frozen).  The signature is diagnostic on its own — the returned list acquires multiplicities the frozen list does not have (2.346964 ×2, 2.348024 ×3, 2.349776 ×3) and the four BerkeleyGW states at 2.470–2.484 eV are pushed out of the lowest-20 window entirely | **NOT ATTRIBUTABLE TO ANY BRANCH — it is `main`'s.**  **Attributed to `824032b7`** by walking the day's mainline with the `.so` pair, the deck and the test file all held fixed and only `src/` varying (`/pscratch/sd/j/jackm/bsegate_attrib_0809/`, `probe.sh` + per-commit `log_<sha>.txt`): GREEN at `e37c6a6e`, `7ac49f5e` and `4bcc5b40` (`= 824032b7^1`), RED with byte-identical numbers at `824032b7`, `9024deee`, `2ad51ef9`, `01e1e609` and — re-checked after `origin/main` moved during this lane — `d9d418db`.  **Mechanism proven by A/B on the cell itself** at `01e1e609`, the knob the only variable: `--band-degeneracy off` → **PASSES both arms**, zero guard lines in the log; `--band-degeneracy snap` → the failure above.  So with the window the deck asks for, current `main` still reproduces the frozen pin to better than 1e-6 eV — nothing else in `src/` has drifted.  **The re-cut trap, measured**: against the external reference, the snapped spectrum sits at MAE **21.729 meV** / max **80.803 meV** versus bands of 10 / 25, where the frozen reference itself sits at 6.522 / 9.840 — and the `_assert_aligned` guard does *not* divert it (best-drop ratio 0.913 against a 0.5 threshold), so the BerkeleyGW assert is genuinely reached and genuinely fails.  Freezing the new numbers would trade a red frozen arm for a red band arm.  **DECISION (1) TAKEN, 2026-08-10: the anchor deck pins `--band-degeneracy off`** — BerkeleyGW produced `bgw_eigenvalues_dft_ref.dat` at 4v4c and a silently widened window compares two different problems, which is the same confounding that `97735e01` refused for the q=0 head override on this very deck.  **DECISION (2) TAKEN, 2026-08-10** (owner, verbatim: "do strict"): **`strict` is the default** — a window that cuts a degenerate multiplet refuses with an actionable message naming the counts that would work, and never silently widens the calculation; `snap` stays as an explicit opt-in, `off` unchanged.  The question it closes is the one this row opened, and the evidence for it is this row plus the parity deck's false 28.6 meV "regression": `snap` silently re-windowed two BGW-parity decks in one day.  Landed as one name, `common.band_degeneracy.DEFAULT_MODE`, read by both drivers' `--band-degeneracy` and by every choke-point keyword default.  The `--band-degeneracy off` pin on this deck is unaffected and stays.  **The landing's neutrality control could not have caught this**: `EXCITON_BANDS_FEATURES.md` §1.6 compares base @ `f1e07bb6` at `--n-val 4 --n-cond 4` against the branch snapping *into* 4v4c on the MoS₂ deck and gets bit-identity, which proves the guard changes only *which* window is selected — true, and blind by construction to a deck where the selected window changes.  The five default-gate e2e cells were not run on that branch.  Evidence: `/pscratch/sd/j/jackm/bsegate_attrib_0809/` (`probe.sh`, `mech.sh`, `log_<sha>.txt`, `log_degen_off.txt` / `log_degen_snap.txt`, `dump_off.txt` / `dump_snap.txt`) |
+
+**The other four default-gate cells are GREEN on clean `main` @ `01e1e609`**,
+measured in the same lane and the same pool: the three Si COHSEX cells
+(`test_si_fast_matches_frozen_reference`,
+`test_si_production_matches_frozen_reference`, and the BerkeleyGW anchor
+`test_si_production_matches_berkeleygw`) and the dipole sweep smoke
+(`test_the_default_analytic_sweep_writes_a_valid_dipole_h5`) all pass —
+`/pscratch/sd/j/jackm/bsegate_attrib_0809/log_other4.txt`.  So one of the five
+was red, it was this one, and the fast gate's own accounting is otherwise
+sound.  Those four were re-measured at `29723072` alongside the pinned cell and
+are still green (`/pscratch/sd/j/jackm/anchorpin_0810/log_other4_pin.txt`), so
+**all five default-gate cells are now green** and this row leaves no live red
+behind it.
+
+---
+
+# AMENDMENT — THE DIPOLE PRODUCER HAD NO PSEUDOPOTENTIAL PRE-FLIGHT (2026-08-09)
+
+**One row, and it is the FIXED successor to the `dZ is None` row the sign-flip
+lane opened on `fix/dipole-vnl-sign-2026-08-09` (`3cfcafe2`) — not a second
+row for the same defect.**  That lane found the failure by measurement and
+handed it over correctly; what changed on investigation is the diagnosis, and
+three claims in the original row come out FALSE and are corrected below.  The
+short version is that nothing regressed and nothing about tracing is at fault:
+`psp.get_dipole_mtxels` is the only one of the tree's three operator drivers
+that never called the shared pseudopotential pre-flight, so a deck directory
+with no `*.upf` in it reached the sweep instead of being refused, and three of
+the four regression decks do not carry their UPFs.
+
+The reason this matters beyond one traceback is that the loud arm was the safe
+one.  A missing pseudopotential set crashed the default analytic sweep, but it
+made `--vnl-mode numeric` finite-difference an empty projector set and write a
+`dipole.h5` with V_NL identically zero, stamped `prov_skip_vnl=False`.  On
+si_cohsex_debug that artifact agrees with the `--skip-vnl` artifact to 5.8e-15:
+it *is* the p̂-only run wearing the other arm's provenance.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`psp.get_dipole_mtxels` ran no pseudopotential pre-flight, so a deck with no `*.upf` died inside the sweep at `kdata.dZ is None`** | `psp.operator_checks.validate_operator_inputs` exists for exactly this, and its own module docstring names this caller — *"before computing kin+ion, DIPOLE matrix elements, or any other quantity that depends on pseudopotentials"*.  `gw.kin_ion_io` calls it; `psp.get_DFT_mtxels` calls it; the dipole driver never has, and it is also the only one of the three with no `--pseudo_dir` flag.  With no pseudos, `build_vnl_setup` returns `channels=[]`, `_build_vnl_kdata_core` has no block to concatenate and returns `dZ=None`, and ~30 s later `apply_vnl_velocity_to_ket` conjugates it: *TypeError: conjugate requires ndarray or scalar arguments, got NoneType*, six frames inside a jitted einsum that names neither the deck nor the missing file.  **Deck-dependence explained**: `cohsex_debug` is the only regression deck that commits its UPFs (`Mo_ONCV_PBE_FR-1.0.upf`, `S_ONCV_PBE_FR-1.1.upf`, added with the fixture in `906dd31b`), which is exactly the deck that kept working; si_cohsex_debug / gnppm_debug / hbn_cohsex_debug have never carried theirs, and the cluster log says so in as many words — *"No pseudopotentials (\*.upf) found in …, …/../qe/scf, …/../qe/nscf; Pseudopotentials: none found"*.  **NO COMMIT BROKE THIS.**  `git log -S validate_operator_inputs -- src/psp/get_dipole_mtxels.py` is empty over the whole history: the wiring was never there, the committed fixtures were cut in staging directories that happened to hold the UPFs (hbn's provenance still names one, `/pscratch/…/hbn_fixture_prep`), and from a clean checkout the regeneration path has never worked | **FIXED on `fix/dz-none-dipole-2026-08-09`, PUSHED, NOT MERGED.**  Two levels: the driver now runs `validate_operator_inputs` unless `--skip-vnl` — the one arm entitled to hold no projectors — and gains `--pseudo-dir`, which is what actually unblocks the four `dipole.h5` re-cuts; and `_build_vnl_kdata_core` with `compute_dZ=True` now returns a `(3, total_R, nG)` zero array instead of `None`, so the kernel's documented contract holds for every caller (`Z` already degraded this way as the `(0, nG)` empty projector matrix).  Gate: `tests/test_dipole_regeneration_gate.py`, 8 cells, **8 passed on Perlmutter**; FALSE arm against the pre-fix sources on WSL CPU is **5 failed, 1 passed, 2 skipped**, the single pass being the live-channel control that must be green on both arms.  Cluster legs, `/pscratch/sd/j/jackm/dznone_0809/`: the sign-flip lane's exact command on si_cohsex_debug gives **rc=1 with the TypeError at clean `origin/main`**, **rc=1 with a named refusal post-fix**, and **rc=0 writing a valid `dipole.h5` post-fix with `--pseudo-dir`** — the first time the default analytic sweep has produced one on that deck.  V_NL demonstrably enters it: max|analytic − skip-vnl| is **12.3 % relative**, against 5.8e-15 for the numeric arm before the fix.  **THREE CORRECTIONS to the row this supersedes** (`3cfcafe2`): *(1)* it is **not** a traced-path defect — the eager `build_vnl_kdata_from_kvec` returns `dZ=None` identically on an empty channel set, and the gate carries both cells to say so; *(2)* `--vnl-mode numeric` did not "succeed with V_NL", it succeeded with V_NL **identically zero**, which makes it the more dangerous arm, not the working one; *(3)* "no test catches it because every in-tree fixture builds a non-empty `channels`" is false — `tests/test_psp_padded_gvectors.py` has built a `channels=[]` setup all along and simply never asked it for `dZ`.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_dz_none_dipole.md` |
+
+---
+
+# AMENDMENT — `exciton_bands` AT P=4 NEVER EXITS (2026-08-09) — **DIAGNOSED AND FIXED ON THIS BRANCH**
+
+**One row, from the owed-legs batch (`OWED_LEGS_BATCH.md`), and it explains an
+entire evening of phantom "pool contention."**  The exit-path lane took it,
+reproduced it twice on the base tree, captured per-rank stacks, and closed it;
+the row below now records what it actually was.  The suspect the batch named —
+`jax.distributed` / coordination-service teardown — was **wrong**, and so was
+the "XLA:CPU pool shutdown" deadlock `runtime.finalize_process` was written
+for: nothing spins in a worker pool here, only the four MAIN threads do.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`bse.exciton_bands` at P=4 completes its payload and then never exits** | **A COLLECTIVE RUN FROM `__del__`.**  `htransform.initialize_wfns` returns a MESH-AWARE `WfnLoader` (`setup_wfn_and_sym` → `WfnLoader(wfn_file, mesh=mesh_xy)`), so at P>1 it takes the phdf5 backend and owns a `SlabIO` whose `close()` runs an **unconditional collective barrier** (`file_io/_slab_io_ffi.py`, `_barrier("slab_io_ffi_close_attrs")`).  The driver never closed it, so the collective fell to `WfnLoader.__del__` — i.e. it fired whenever the garbage collector happened to drop the object during interpreter shutdown, a moment no two ranks agree on.  Captured live at the hang (JID 56550230 steps `.9`/`.10`): **three ranks** in `exciton_bands.py:<module>` → `loader.py:318 __del__` → `loader.py:306 close` → `slab_io.py:116 close` → `_slab_io_ffi.py:2385 close` → `collectives.py:172 barrier` → `multihost_utils.py:83 broadcast_one_to_all`, spinning in `cuStreamSynchronize` on a NCCL collective; **the fourth rank** already past that and in `ffi/io.py:207 _atexit_close_all` → `ffi_loader.py:1119 phdf5_close` → `H5Fclose` → `H5FD__mpio_close` → `PMPI_File_close` → `MPI_Barrier` → **`sched_yield`**, which is the 100 % CPU.  Two disjoint collective domains, neither ever satisfied.  Teardown/exit path, not physics: outputs are complete and correct.  **Pre-existing**: reproduced at base `f1e07bb6`, so it is not the 2026-08-09 feature branch; two of the three wild instances had no `LORRAX_JAX_CACHE_EXPLAIN`, so it is not the cache-explain path either | **FIXED on `fix/exciton-exit-hang-2026-08-09`** (`b3813d8f`).  Two lines at the driver's tail: an explicit `wfn.close()` **after** the existing outputs barrier, so the `SlabIO` collective runs at a point every rank reaches in lockstep and `__del__` becomes a no-op; and `runtime.finalize_process(main())` in place of the bare `SystemExit`, so the SECOND unordered collective (`_atexit_close_all`'s `H5Fclose` on the restart and zeta contexts) runs in one stated order on every rank and GC-driven `__del__`s at shutdown never run at all — which is what covers the `--refit-points` path, where `vq_interp.refit_prepare` builds a second mesh-aware loader nothing closes.  Gates, all on `f1e07bb6`: P=4 fixed **exits rc=0 in 31 s**; P=4 unfixed **times out at 240 s** (red twin); P=1 rc=0 on both trees; all six `.dat` outputs bit-identical (md5 `b84fc42e7c2931b7ace0801e764e5b4d`).  **Sibling verdict**: only two production sites build a mesh-aware `WfnLoader` — `htransform.setup_wfn_and_sym` and `gw/gw_jax.py:269`.  `gw.gw_jax` has never hung because it already ends in `finalize_process` → `os._exit`.  `bse.bse_jax` has never hung because its loader path (`bse_io.load_bse_data_from_restart_sharded`) builds `WfnLoader(wfn_path)` with **no mesh** → eager backend → no `SlabIO` → a collective-free `close()`.  **STILL EXPOSED, NOT FIXED HERE**: `bandstructure.htransform`'s own `main()` (it calls `initialize_wfns` at line 1800 and ends `raise SystemExit(main())`) has the identical shape and should hang the same way at P>1.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_exciton_exit_hang.md`, `OWED_LEGS_BATCH.md` §3 |
+
+---
+
+# AMENDMENT — THE TWO ABSORPTION DRIVERS DISAGREE ON A CONJUGATION (2026-08-09)
+
+**One row, from the oscillator-strength gate build (`FIX_dipole_vnl_sign.md`).**
+This is the fifth member of the campaign's most expensive defect class
+(crossed conventions), found because the new gate pins two quantities
+precisely so that conjugation blindness in `|d|²` cannot hide it.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`absorption_eigvecs` contracts `A` without a conjugate; `davidson_absorption:214` uses `.conj()`** | The two absorption drivers assemble oscillator strengths from the eigenvector contraction with OPPOSITE conjugation conventions — genuinely different numbers on the same eigenvectors, not a representation difference.  Which one is right is NOT adjudicated yet; the new gate `tests/test_bse_oscillator_strengths.py` (on the `fix/dipole-vnl-sign-2026-08-09` branch) pins BOTH so the disagreement is measured rather than silent | **FIXED on `fix/absorption-conjugation-2026-08-09`.**  **`absorption_eigvecs` was the wrong driver.**  The correct contraction is `⟨0|r̂_α|S⟩ = Σ_t A^S_t · conj(d^α_t)`: the exciton state is `|S⟩ = Σ_t A^S_t â†_c â_v|0⟩`, so `⟨0|r̂|S⟩` picks up `⟨vk|r̂|ck⟩ = conj(d_t)` where `d_t = ⟨ck|v̂|vk⟩/ΔE` is what `slice_dipole_to_bse_window` returns.  That `A` really is the amplitude in that basis (and not its conjugate) is read off LORRAX's own kernel, not assumed: the exchange term is assembled as `K^x = M V M†` with `M_t = conj(ψ_c)ψ_v` (`bse_simple.py`) and the direct term as `K^d_{tt'} = −Σ conj(ψ_c[k])ψ_c'[k'] W ψ_v[k] conj(ψ_v'[k'])` (`bse_nontda.py:169`), both the standard `⟨t|H|t'⟩` with the conduction index on the bra.  Three independent witnesses agree — BerkeleyGW's `BSE/diag.f90:711` (`Σ u_r·MYCONJG(s1)`, with `s1 = ⟨ck|…|vk⟩/ΔE` from `Common/mtxel_optical.f90`), the convention-free resolvent identity `⟨d|(z−H)⁻¹|d⟩ = Σ_S |⟨S|d⟩|²/(z−E_S)`, and the Haydock route which evaluates that resolvent and needed no change.  **`davidson_absorption` had the right MODULUS** (`Σ conj(A) d` is the complex conjugate of the correct expression, and ε₂ reads only `|·|²`), so its spectra do not move; only the sign of the `Im` column in its BGW-format `eigenvalues_b*.dat` moves, onto BGW's spelling.  Both drivers now route through the one site `absorption_common.exciton_dipole_projections`, which carries the derivation; an AST cell refuses `davidson_absorption` growing a private einsum again.  Crossed red twin: `tests/test_absorption_conjugation.py` runs the FALSE arm (`Σ A d`) against the resolvent identity and shows it fails by ~10⁰, and the mutation check confirms three cells go red when the shared site is flipped.  **Pins that moved, and only these:** the twelve `proj` numbers per fixture in `tests/test_bse_oscillator_strengths.py` were cut with the wrong driver's spelling and are re-cut (movement up to 6.8× per element); `sum_f`, `max_f` and `de_bounds_Ry` are bit-unchanged, and no `dipole.h5` was regenerated.  **Adjacent gap closed in the same pass:** `load_eigenvectors_h5` silently returned the resonant `X` alone from a non-TDA file, giving the TDA answer for a full-BSE solve; it now refuses such a file and names the `(X, Y)` contraction it would need.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_absorption_conjugation.md` |
+
+---
+
+# AMENDMENT — THE MINI-BZ EXCHANGE-HEAD AVERAGE IS THE WRONG MOMENT (2026-08-09)
+
+**One row, from the exciton-bands lane's LT-splitting derivation
+(`~/lorrax_bse_perf_2026-08-08/EXCITON_BANDS_FEATURES.md` §2).**  The
+derivation's headline is a clean acquittal that this row must protect: the
+DEFAULT finite-Q exchange path is **already exact** — the driver evaluates
+`v(Q)` and the pair-density factor at the true finite Q with G=0 kept, so the
+product it forms is exactly `|Q|² v(Q) |q̂·d|²`, the full nonanalytic
+(LT-splitting) head.  **Do not "fix" the default; a flagged head there would
+be a no-op or a double count.**
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`--head-minibz-average` averaged the wrong moment on the exchange head** — BOTH halves now FIXED (pending land) | With the flag ON, the mini-BZ cell average applied to the exchange head is the scalar `⟨v⟩`, where the object the nonanalytic structure requires is the 3×3 second moment `M_ab = ⟨v q_a q_b⟩` — the scalar is wrong in both direction (single sampled q̂ vs the cell's distribution) and magnitude (sampled vs v-weighted).  **The correct implementation needs NO `∂_qζ`**: the head's q-linear coefficient is the dipole already shipped in `dipole.h5`, so the averaged head is `K^head_{tt'} = (1/N_k)·d*_a(t) M_ab d_b(t')` — rank-three over transitions, never entering the μ basis (`LT_HEAD_PROBLEM.md` §6, which supersedes the ∂_qζ framing this row first carried).  Magnitude on the Si 4×4×4 fixture, computed locally: 512 meV brightest transition point-value, 253 meV cell-averaged — not small against ~50 meV binding energies | **FIXED (pending land), both halves.**  The unconditional-enable half landed first (`fix/bsekgrid-head-key-2026-08-09`); the wrong-moment half is `feat/head-moment-tensor-2026-08-09`.  *Fixed:* `bse_io._interpolate_bse_data_to_grid` no longer forces `head_minibz_average=True` on the `bse_k_grid` coarse→fine path — it reads the deck key (default off, like every other reader) and, with the key off, carries the coarse q=0 tile through untouched instead of replacing it, so the deck's `vhead` survives.  Branch `fix/bsekgrid-head-key-2026-08-09`, three red twins (a fixture-free AST gate plus bit-identity gates on both arms); the opt-in arm is preserved BIT-FOR-BIT because it is the object still under repair.  **The history verdict on why the forcing existed:** `964c682b` (2026-07-20) wanted the FINE mini-BZ head scalar, and said so — a real need, but the q=0 exchange BODY is built from centroids and the G-sphere alone and is k-grid-INVARIANT, so nothing needed densifying, and at Q=0 the head is annihilated by orthogonality anyway, so its SCALE is inert.  What the override actually cost was the BODY: it substituted a b26p/stencil model reconstruction for the exact disk tile.  Deck A/B (MoS2 3x3x1 -> 6x6x1, exact dense diagonalisation): the exciton spectrum moves by at most **1.20 meV** (≈0.1 meV on the low-lying states), NOT the hundreds of meV the LT_HEAD_PROBLEM §7.2 finite-Q figures would suggest — because those figures are the head at a SAMPLED finite Q, and this path evaluates exactly Q=0 where the head is annihilated; the ~1 meV that survives is the model body's reproduction error, and the head channel itself is worth ~0.01 meV.  It also made `bse_k_grid` unusable on IBZ-only-ζ restarts, since `vq_interp` refuses those; the default arm no longer touches ζ.  *Fixed (2026-08-09, branch `feat/head-moment-tensor-2026-08-09`):* the wrong-moment half.  With the key ON the head channel now leaves the μ basis entirely (`eval_vq` gets `head_val=0` at `gstar`, zeroing the LR G* column) and comes back as `K^head_{t,t'} = (1/N_k)·conj(d_a(t)) M_ab d_b(t')`, rank three over TRANSITIONS, assembled from the `dipole.h5` dipoles and the new `vcoul.minibz_moment_tensor` — six components on the SAME mini-BZ Voronoi draws, same two BGW branches, `minibz_average` itself untouched so no existing head number moves.  Gated on identities, not reference files: `tr M = 8π/Ω` reproduces 0.09304729699 against 0.09304729699 on Si 4x4x4 plain MC and to 1.5e-5 relative on the Baldereschi branch (whose closed-form tensor twin `δ_ab (4/9π) q0^3 Ω N_k` had to be written); the hBN slab gives tr M = 6.669e-2 / 4.318e-2 / 2.492e-2 Ry/bohr² at 3x3 / 6x6 / 12x12 with M_zz identically 0, i.e. rank two and vanishing linearly with the cell.  Four crossed-convention red twins on the contraction (transposed encode, unconjugated encode, conjugated decode, transposed moment), plus the offset-vs-momentum twin the trace identity exists to catch.  **Sequencing gate cleared first:** `SMALL_ISSUES.md` row 22 is settled in its own commit — the Cartesian q²-coefficient is canonical (it is the one with readers) and `run_sternheimer` converts its crystal Hessian at the write site; the convention is written down in `docs/theory/s-tensor-convention.md`.  **Deck validation** (MoS2 3x3x1 640-centroid slab, matched-|Q| ladder along Γ→M and Γ→K, dipoles at velocity_sign=+1 / skip_vnl=False): the OFF arm is bit-identical across trees (max|Δ| = 0.000000 eV, every Q, all 6 states) and Γ does not move on either ON arm (0.000 meV) — the Q=0 annihilation residual cannot have grown, since this branch does not touch the Γ tile.  α-Hermiticity 2.8e-12.  tr M is constant to four digits (2.5419 / 2.5415 / 2.5428 e-2 Ry/bohr²) across the near-Γ cells while the point-value head scales as |Q|, which is why the two arms cannot agree inside the Γ cell.  At the smallest ladder point the two lowest states move +0.006 and +0.003 meV while two others shift by tens of meV — the rank-≤3 PSD structure measured directly (dark states untouched, bright states shifted).  The OLD scalar arm turns out to be nearly INERT at finite Q too: ≤0.2 meV on every state at every Q but one, where it moves −8.4 meV (negative, because inside the Γ cell the point value exceeds the cell average) — the finite-Q counterpart of the Q=0 annihilation, and the reason a wrong-moment average survived unnoticed.  Cost: solve 1.07 s with the head vs 1.06 s without.  **Two limits, stated:** the opt-in arm runs through `vq_interp`, which is the truncated-SLAB evaluator, so bulk 3D decks never reach it (the tracked hBN deck is bulk 3D and cannot); and the dipole route linearises the pair amplitude across the cell, an O(Δ²)+O(sΔ) statement that is controlled near Γ and degrades as the cell centre moves out — which is where the cell average stops being needed anyway.  **Also found and corrected:** `EXCITON_BANDS_FEATURES.md` §2.4 and `LT_HEAD_PROBLEM.md` §7.4(3) prescribe the matched-|Q| pair as (0,t,0) vs (t,t,0); on a cell whose b1·b2 angle is 60° that pair differs by √3 in |Q|.  The matched pair is (0,t,0) vs (t,−t,0), and the correction moves the apparent direction spread from 21–220 meV to 1.2–11.8 meV (genuine trigonal warping).  Evidence: `HEAD_TENSOR_IMPL.md`, `THEORY_LT_HEAD_TENSOR.md`.  *Retired by measurement:* the Q=0 cancellation residual is no longer unmeasured.  On the MoS2 3x3x1 640-centroid deck (Ω=702.20 bohr³, N_k=9, `vhead`=1655.33 Ry·bohr³ ⇒ prefactor `vhead/(ΩN_k)` = 0.26193 Ry = **3563.7 meV**, the same geometric constant as the Si deck's 2600 meV), the orthogonality residual `absA = abs(Σ_μ C_μ conj(g0_μ))` is **max 4.88e-3 / rms 2.50e-3** on the BSE window and 1.14e-2 over the whole 26occ×20unocc block, so the spurious rank-one contamination the Γ tile carries is **0.085 meV worst-transition and 0.022 meV rms** (0.46 meV worst over the wide block) — the "nothing here" branch of `LT_HEAD_PROBLEM.md` §7.4(1).  Free normalisation check: the same contraction on the diagonal returns the norm `⟨u_b,u_b⟩ = 1` to max 1.4e-2 across the deck's whole `nband=40` window.  Sequencing unchanged.  Evidence: `EXCITON_BANDS_FEATURES.md` §2; `LT_HEAD_PROBLEM.md`; `FIX_bsekgrid_head_key.md` |
+
+---
+
+# AMENDMENT — FOUR ROWS TRANSCRIBED OUT OF THE ASIDES AUDIT (2026-08-09)
+
+**No code moved for this amendment; these four were already true at `main` and
+had no row anywhere.**  An archaeology pass over the two-fleet campaign
+transcripts (`~/lorrax_bse_perf_2026-08-08/ASIDES_AUDIT.md`) found thirteen
+things that were said out loud in a worker report — under headings its own
+authors wrote as *"listed, not chased"*, *"registered defect"*, *"worth
+flagging upward"* — and then never reached a ledger.  Two of the thirteen are
+physics or deadlock class and do not belong in a small-issues list; two more
+already have a decision or a write-up somewhere a census reader does not look.
+Those four are transcribed here.  The rest went to
+`~/lorrax_service_phase/SMALL_ISSUES.md`, the punch list and `BUILD_NOTES.md`;
+the audit's own *→ Routed* section says which went where.
+
+Verified against the tree at `f1e07bb6` (every line number below was re-read,
+not copied out of the report).
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **Σ_c breaks the k-star relation at the five non-TRIM k** | `src/gw/ppm_accumulators.py:104-105` completed a one-sided τ grid with an ELEMENTWISE `Im` — `contrib = coeff_re * sigma_im + coeff_im * sigma_re` under a comment reading *"Crossing window — keep Im[coeff·σ]"* — where the sine sum needs `(Z − Z†)/2i`.  **The two coincide only at k = −k.**  That discriminator rides this row on purpose: a check taken at the TRIM k alone comes back green and says NOTHING about the other five, so a TRIM-only green must never be read as coverage.  Found by the MPA three-way-table lane 2026-08-09 by running the thing | **CLOSED 2026-08-09 — the fix is landed, mesh-invariance is proven, the two references are frozen, and NO OWNER ACTION IS OUTSTANDING.**  *Fixed and landed* on `main` @ `dd727216` (fix commit `c80601b8`; derived independently; the algebra agrees with `integration/mpa-table-2026-08-09`'s `27bd0984`, whose PLACEMENT it corrects — that one takes the adjoint per-τ inside the per-shard projector, which is the band adjoint only when the mesh does not cut the QP band window, i.e. only at the `-G=1` leg it was measured on).  Gates: `tests/test_ppm_crossing_completion.py` (12, incl. the sharded pair).  Measured on the Si 4×4×4 arm-b deck, `/pscratch/sd/j/jackm/sigma_kstar_0809/`: Σ_c star spread **46.7623 raw / 43.8463 diag eV → 0.0000 / 0.0000**; exact-Emf eqp0 degeneracy spread 67.64 / 10.50 eV → 0.0000; the band-9-below-band-8 inversion present at exactly the five non-TRIM k, gone at all eight; TRIM rows held to **2.59e-07 eV** while non-TRIM eqp0 moves up to **20.63 eV** (bands 1–16).  *Mesh-invariance proven* at a 2×2 mesh by the completion pass's `fix_g4b` leg: the fix reproduces its own `-G=1` `eqp0` to **1.10e-06 eV** against the pre-fix control's 9.97e-07, and sits at the η floor (1.26e-06–1.80e-06 eV) on all eight k rather than on the three TRIM k alone.  *References frozen* (owner-authorized 2026-08-09, ``1e64d83a`` on `chore/gnppm-freeze-2026-08-09`): `test_gnppm_matches_reference` and `test_bispinor_gnppm_matches_reference` were frozen FROM the elementwise form and had been red-by-correction since `dd727216`; they now carry the corrected values and are green.  The values frozen are the ones cut at `dd727216` and preserved at `/pscratch/sd/j/jackm/sigma_kstar_0809/_pytest_recut2/`, **re-verified against current `main` @ `5b135f8e` before the freeze and bit-exact** — max|Δ| = 0.000e+00 with 0 of 2484 (gnppm) and 0 of 1620 (bispinor) compared cells differing at all — which settles the one live question the freeze had: the intervening `9a730da8` dipole re-cut does NOT reach either deck.  It re-cut si and hbn only, `gnppm_debug/dipole.h5` is unchanged there (recorded as re-cut-blocked-no-deck) and `mtxel_sweep.dipole_operator` is called by `psp.get_dipole_mtxels` and by nothing on the Σ path, while `bispinor_test.in` takes the explicit head bypass and ships no `dipole.h5` at all.  The movement the two references record is gnppm **2.9794e-02 eV** and bispinor **7.7240e-03 eV** against `_XMACHINE_ATOL_EV = 1e-5`, with **sigX and VH bit-identical (max|Δ| = 0.000e+00)** on both — the control that the static path is untouched — and the per-k movement matching the peer's independent prediction cell for cell.  **THE PEER-PLACEMENT WARNING IS KEPT AS PERMANENT RECORD, and it is why these two green gates are not coverage.**  The per-shard placement's damage is INVISIBLE to `eqp0`: `peer_g4b`'s `eqp0.dat` is **byte-identical** to `fix_g4b`'s, because `swapaxes(-1,-2)` is the correct band adjoint exactly on the DIAGONAL shard blocks and a `one_shot` `eqp0` reads only Σ_c(i,i).  It shows up on Hermiticity: `max|Σ_c − Σ_c†|` at ω = 0 is **1.3e-06–1.8e-06 eV at all eight k under the fix** against **0.132–0.257 eV at all eight under the per-shard form** — which breaks the three TRIM k that the PRE-FIX code got exactly right — and `max|Σ_c(fix) − Σ_c(peer)|` over the whole cube is **5.2333 eV**.  **A diagonal-Σ deck observable can never discriminate the two placements; the 2×2 unit gate is the only thing that can.**  The two references frozen above are themselves `sigma_diag` files, so they stay green under BOTH placements: they pin the corrected VALUES and they are not, and must never be read as, coverage of the off-diagonal defect class — that is `tests/test_ppm_crossing_completion.py`'s sharded Hermiticity pair, and each reference carries the caveat in its own provenance header so the point survives without this row.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_sigma_kstar.md` (§COMPLETION), `ASIDES_AUDIT.md` §A1 |
+| **`jit__multi_slice` has a rank-dependent persistent-cache key** | **ROOT-CAUSED AND FIXED 2026-08-09 (`fix/multislice-cachekey-2026-08-09`), row kept for the mechanism and for the two corrections it forced.**  `jit__multi_slice` is **not LORRAX code**: it is jax's own `ArrayImpl._multi_slice` (`jax/_src/numpy/array_methods.py`), declared `@jit(static_argnums=(1,2,3))`, and `jax/_src/array.py::shard_device_array` calls it with `sharding.addressable_devices_indices_map(x.shape)` — **this rank's** shard bounds.  So the shard offsets are static arguments, rank *r* compiles `slice(x, [r·n/P, 0], [(r+1)·n/P, m])`, and the ranks hold different keys for different programs.  Writes are process-0-only, hence rank 0 hits while the peers miss.  It is reached whenever a **single-device, fully addressable** `jax.Array` meets a **partitioned** multi-device sharding; a fully-replicated target short-circuits before the jit, and a **numpy** source takes `pxla._shard_np_array`, which does not jit at all | **FIXED on the branch, PUSHED, NOT MERGED.**  The canonicalization keeps the shard SIZES static and passes the OFFSETS as dynamic `lax.dynamic_slice` operands, so every rank compiles one program (`jit__lorrax_canonical_shard_slice`); `common/jax_compile_cache.py::_install_shard_slice_patch`, armed at P>1 only, red twin `LORRAX_JAX_CACHE_SHARD_SLICE=0`, gates in `tests/test_compile_cache_shard_slice.py`.  **MEASURED A/B, one env var apart, same tree, same deck** (`si444`, P=4, warm): red `rank 0: xla_compiles=0 hits=36` vs `ranks 1,2,3: xla_compiles=1 hits=35 vetoed=1` with three distinct `jit__multi_slice-*` keys — the registered defect, reproduced; green **`xla_compiles=0 hits=38 vetoed=0` on all four ranks** and zero `jit__multi_slice` keys.  Eigenvalues identical across all four legs.  **CORRECTION 1 — the wall cost in the old row was wrong in the safe direction and the framing was wrong in the unsafe one.**  This row said *permanent silent hang*.  It is the documented deadlock **precondition**, but the hang has **not** been observed for this module and structurally would not be: the compiled module is `parameter → kLoop fusion(slice)` (dumped 2026-08-09) with **no autotune candidates**, so `AutotunerPass` has no work to shard and nothing blocks on `MultiProcessKeyValueStore`.  Both P=4 legs run with the divergence deliberately present completed `rc=0`.  What justifies the fix is that it is exactly the divergence shape `jax_compile_cache.py` exists to prevent, nothing pins the module's contents against a future jax, and it is now free.  **CORRECTION 2 — the reproducer is not BSE-specific.**  `runtime/__init__.py::nccl_warmup` puts `jnp.ones(...)` onto a partitioned `NamedSharding` at mesh bootstrap, so **any** P>1 GPU run reaches this path before any physics.  Evidence: `~/lorrax_bse_perf_2026-08-08/FIX_multislice_cachekey.md`; `FIX_warmcache.md` §1.2; `ASIDES_AUDIT.md` §A4 |
+| ~~**POINTER — LORRAX cannot read an `nspinor = 1` WFN.h5**~~ | ~~`services/symmetry_maps/src/symmetry_maps/maps.py:912` carries the comment *"For ns=1 (non-SOC), U_eff is the 1×1 identity and this einsum is a no-op"*.  That claim is false: `spinor_rotation_for_sym_row` (`:692`) returns `(2, 2)` or `(nk, 2, 2)` **unconditionally**, so the full-BZ unfold rotates a one-component slab with a two-component matrix.~~  **Every in-tree fixture is nspinor = 2, so the suite structurally cannot see this** — which is still the whole argument for a row here rather than a fixture README.  The comment was true of nothing: numpy's *and* JAX's `einsum` BROADCAST a size-1 labelled axis instead of raising, so a scalar ψ came back 2-component holding `(U[j,0]+U[j,1])·ψ`, and on a TRS row the summing was done by `iσ_y·conj(U)`'s off-diagonals | **FIXED AT UNIT LEVEL, 2026-08-09, `fix/nspinor1-loader-2026-08-09` — DECK LEG OWED.**  `spinor_rotation_for_sym_row` now takes `nspinor` and returns a true 1×1 identity for scalar ψ on **both** row kinds (spinless time reversal is Θ = K, not iσ_y K — a different representation, not a truncation), which fixes the host path (`unfold_psi`) and the device path (`WfnLoader._ensure_phdf5_static` → the phdf5 unfold kernel's `einsum("kac,bckg->bakg", …)`, which carried the same defect and is **not** named in the original write-ups) from one place; `unfold_psi` now raises on a spinor/ψ width mismatch rather than letting einsum broadcast it.  **Gates:** ns=1 correctness is synthetic by necessity — 8 unit cells in `services/symmetry_maps/tests/test_symmetry_maps_algebra.py` (incl. a red twin that reproduces the broadcast and its wrong values) plus 2 end-to-end cells in `services/wfn_loader/tests/test_wfn_loader_contract.py` that build a real `nspinor = 1` HDF5 in `tmp_path` and read it through `WfnLoader`; ns=2 splash is proven by **bit-identical** full-BZ ψ pre/post on all six checked-in decks.  **What is still owed, and why it is not a claim this row makes:** no deck-level validation on a genuine scalar QE run — no such fixture was built (deliberately, per the fix worker's brief), so *"LORRAX reads a real QE scalar WFN and gets the right Σ"* remains UNMEASURED.  The evidence area for that leg is still `/pscratch/sd/j/jackm/svc_vcoul/hbn_fixture_prep/qe_scalar_nspinor1_ATTEMPT/`.  Full write-up: `~/lorrax_bse_perf_2026-08-08/FIX_nspinor1_loader.md`.  Prior write-ups at `tests/regression/hbn_cohsex_debug/README.md:274` and `README_PLAN.md:115` (both cite the pre-drift `maps.py:907`) are now stale on the mechanism and are left as provenance.  `ASIDES_AUDIT.md` §B2 |
+| **the velocity-commutator sign at `src/common/mtxel_sweep.py:676`** | The dipole operator's non-local term.  Four sign sites across two producer routes; the `vnl_velocity_sign` knob now reaches all of them and **the default is the `+1` arm** — `p + ∂V_NL/∂K`, which `velocity_matrix_k` and `orbital_magnetization` already called canonical and which reproduces BerkeleyGW's q→0 head (ε₀₀ 24.2208 against BGW's 24.2205, versus 31.8204 on the old arm).  A thing the pointer row never said, found by the pre-sweep: `--vnl-mode numeric` was the arithmetic negative of `--vnl-mode analytic`, so the two modes sat on opposite arms; normalised in the same change | **FLIPPED on `fix/dipole-vnl-sign-2026-08-09`, PENDING THE FIXTURE RE-CUT.**  The four protected `dipole.h5` fixtures and the gnppm/cohsex/hbn frozen references have NOT been regenerated, so this tree's default operator and its committed fixtures are different operators — visible rather than silent via `prov_vnl_velocity_sign` on the h5 and `tests/test_bse_oscillator_strengths.py`, which holds the before-picture and goes red when they are re-cut.  The `-1` arm stays reachable from a deck key and stays bit-identical to the pre-knob expression.  `~/lorrax_bse_perf_2026-08-08/FIX_dipole_vnl_sign.md`.  The re-cut was blocked by the missing pseudopotential pre-flight (row above, FIXED at `a5c68576`); with `--pseudo-dir` it is unblocked, and **only hbn and si are re-cuttable at all** — `gnppm_debug` and `cohsex_debug` committed their fixtures at band counts no deck in the tree still requests, so those two are **re-cut-blocked-no-deck** and are an owner row, not a worker improvisation. |
 
 ---
 
@@ -385,8 +625,26 @@ for.
 | tree | `/pscratch/sd/j/jackm/perf_bse_0808/wt_recut`, branch `chore/recut-wave-2026-08-08` off `main` @ `81a285af`.  The `[lx] source tree:` line was read on every leg |
 | `.so` pins | the restage candidate, unchanged: device md5 `c680c229…`, host md5 `91f330c3…` |
 | `LORRAX_FFTW3_SO` | PINNED on every leg |
-| artifacts | `/pscratch/sd/j/jackm/perf_bse_0808/recut/` — `_logs/` (gw, bse_400, bse_200, dense, gate_green, gate_red, census), `deck_cut/dense_eigs_ev_recut.npy`, `deck_cut/H_dense_recut.npy` |
+| artifacts | `/pscratch/sd/j/jackm/perf_bse_0808/recut/` — `_logs/` (gw, bse_400, bse_200, dense, gate_green, gate_red, census), `deck_cut/dense_eigs_ev_recut.npy` (**read the convention warning below before scoring anything against it**), `deck_cut/H_dense_recut.npy` |
 | prose record | `~/lorrax_bse_perf_2026-08-08/RECUT_WAVE.md` |
+
+**A warning about `dense_eigs_ev_recut.npy`, added 2026-08-09.**  That file was
+cut at the deck's DEFAULT `mc_average_vcoul_body = true`, and its filename says
+nothing about it.  It is therefore payload-matched only to cells that share
+that flag, and it is **not** a valid reference for the convention-matched cells
+that run `mc_average_vcoul_body = false`: scoring one against the other returns
+the mc-average difference, not a solver error, and nothing in the file or its
+name will tell you which of the two you just measured.
+
+A later lane walked straight into this.  Scoring a 480-centroid,
+`rcond = 1e-10`, convention-matched cell against this file it read 0.717041 meV
+MAE and 1.303 meV max — six orders above the 4.8 neV that the 400-iteration
+budget is certified to below — and on tracing the discrepancy found the number
+was not solver error at all but an independent six-digit reproduction of the
+attribution's separately measured 0.7170 meV flag difference.  Solver error
+proper stays certified exactly where this amendment puts it: 400 iterations sit
+mid-plateau, 4.8 neV from the exact dense spectrum **on a matched payload**.
+Recorded in `~/lorrax_bse_perf_2026-08-08/W_HEAD_ISDF_FLOOR.md` §3.5.
 
 ## What the geometry prescription actually names
 
@@ -950,17 +1208,43 @@ it prevents is.  See THE RE-CUT WAVE amendment at the top of this file.
 
 ## Registered defects (found by the perf lane's convergence census, in passing)
 
-- `davidson --write-eigs` dies at P>1 (`device_get` on non-addressable
+> **ALL THREE STRUCK 2026-08-09.**  The same campaign that registered them
+> also fixed them, and this block spent the interval describing fixed defects
+> as open — the exact failure mode the SlabIO lander named when it closed its
+> own rows: *a ledger listing a fixed defect as open burns the next reader's
+> budget the same way the reverse does.*  Struck in place, per this file's
+> convention.  Audit that caught it:
+> `~/lorrax_bse_perf_2026-08-08/ASIDES_AUDIT.md` §B1.
+
+- ~~`davidson --write-eigs` dies at P>1 (`device_get` on non-addressable
   arrays in `write_eigenvectors_stream`).  Flag-path; the suite never
-  exercises it, which is how it stayed hidden.
-- `bse_feast --feast-ritz` cannot run multi-process at all
-  (`_get_feast_runner` closes over non-addressable arrays).  Same class.
-- `bse_w_exact.py:634`'s `max_gmres` column is a LOGGING defect, not a
+  exercises it, which is how it stayed hidden.~~  **FIXED by `df361cd9`**
+  ("the eigenvector writer stops trusting one solver's layout"), which is in
+  `main`; `src/bse/bse_io.py:298-320` documents the fix at length — the
+  writer fetches through `common.collectives.gather_to_host` instead of
+  assuming a solver's layout, and `bse_lanczos` pins the Davidson branch to
+  the same replicated convention.  **A SEPARATE, UNCONFIRMED `--write-eigs`
+  HANG AT P=4 SHARDED PREDATES THIS FIX** — observed at `995f9e9d`, which is
+  not a descendant of `df361cd9` — so a reader whose run **hangs** (killed in
+  the eigensolve, no `eigenvectors.h5`) rather than dying with a
+  non-addressable-array error is **not** looking at this fixed defect; that
+  observation owes one confirmation leg and carries its own row in
+  `~/lorrax_service_phase/SMALL_ISSUES.md` (row 14).
+- ~~`bse_feast --feast-ritz` cannot run multi-process at all
+  (`_get_feast_runner` closes over non-addressable arrays).  Same class.~~
+  **FIXED by `feb69f70`** ("the FEAST runner takes its operands instead of
+  baking them in"), which is in `main`; `src/bse/bse_feast.py:106-132` now
+  threads the ten operands through as RUNTIME ARGUMENTS (`matvec_operands`)
+  instead of closing over the `data` dict.
+- ~~`bse_w_exact.py:634`'s `max_gmres` column is a LOGGING defect, not a
   solver defect: the column is filled with a residual while `:248` discards
   the real iteration count — a two-line driver fix.  It is why the census
-  had to lift the cap to measure convergence at all.
+  had to lift the cap to measure convergence at all.~~  **FIXED**;
+  `src/bse/bse_w_exact.py:716` carries the *"``max_resid`` was headed
+  ``max_gmres``"* note and the column is now headed for what it holds.
 
-Evidence for all three: `~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`.
+Evidence for all three as originally registered:
+`~/lorrax_bse_perf_2026-08-08/CONVERGENCE_CENSUS.md`.
 
 # AMENDMENT — BSE-PERF MERGE, `integration/bse-perf-merge-2026-08-08` @ `e69a867f` (2026-08-08)
 
@@ -3414,3 +3698,209 @@ Perlmutter, read-only: `/pscratch/sd/j/jackm/mpa_census_0809/` —
 `setdiff.txt`, `reds_base.txt`, `_verify/qsgw_{base,tip}.{xml,log}`, `_logs/`.
 The RUNS_INFLIGHT row was appended before first submission and struck with
 results.
+
+## 2026-08-09 amendment — two runtime defects from the Σ scaling lane, neither of them a test red
+
+The sigma GN-PPM scaling lane (`perf/sigma-scaling-2026-08-09`, workspace
+`/pscratch/sd/j/jackm/sigma_scaling_0809/`, prose record
+`~/lorrax_bse_perf_2026-08-08/SIGMA_SCALING.md`) landed one instrumentation
+commit and, on the way to it, hit two defects that no cell in this suite
+currently catches.  Both are registered here rather than as reds, because
+neither turns a test red and both will silently waste an allocation for
+whoever meets them next.  The lane's instrument commit is included in the same
+landing as this amendment; the two defects below are **not** fixed by it.
+
+### 1. `distributed_eigh` hangs at a 3×3 mesh for every n ≥ 3072
+
+A 3×3 cuSOLVERMp `syevd` completes n = 2049 in 6.9 s and then never returns at
+n = 3072 or anything larger.  It does not fail — it hangs silently, with the
+cuSOLVERMp banner printed (`library 0.7.2, NCCL 2.27.3, comm path: NCCL,
+grid: 3x3 (col-major)`) and nothing after it, on a card reporting 36.4 GiB
+free at the moment of the call.  So this is neither memory starvation nor the
+`status=7` failure the older record remembers, and the break is bracketed
+between n = 2049 and n = 3072.
+
+| mesh | grid reported by cuSOLVERMp | n | allocator arm | result |
+|---|---|---|---|---|
+| 2×2 | 2x2 (col-major) | 8192 | recommended (`default`, MEM_FRACTION 0.85) | **PASS**, 9.347 s, max eigenvalue error 1.31e−10 |
+| 3×3 | 3x3 (col-major) | 2049 | recommended | **PASS**, 6.935 s, max eigenvalue error 1.50e−11 |
+| 3×3 | 3x3 (col-major) | 3072 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 4098 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 6144 | recommended | **HANG** — killed at 420 s |
+| 3×3 | 3x3 (col-major) | 8190 | recommended | **HANG** — killed at 900 s |
+| 3×3 | 3x3 (col-major) | 8190 | `platform` (fleet default) | **HANG** — killed at 420 s |
+
+**The allocator is exonerated and the defect is pre-existing.**  The last row
+is the load-bearing one: the hang reproduces identically under `platform`,
+which is what the fleet runs today, so whatever is wrong at 3×3 was wrong
+before the allocator question was ever asked and will still be wrong if the
+allocator recommendation is rejected.  This is a `distrib_la` solver defect,
+it belongs to whoever owns `distrib_la`, and until it is owned, **no LORRAX
+stage that calls `eigh` should be run at a 3×3 mesh on a large matrix** — which
+is what makes it a blocker for large decks rather than a curiosity.  The Σ
+deck the lane measured never calls `eigh` at that size, so none of the lane's
+timing conclusions depend on it.
+
+One lead, offered as a lead and not as a finding: cuSOLVERMp distributes 2-D
+block-cyclic, and at a 3×3 grid n = 2049 gives a local block of 683 — below
+the usual 1024 tile — while n = 3072 gives exactly 1024 per rank and therefore
+more than one block column per rank for the first time.  A hang appearing
+exactly where the block-cyclic distribution stops being trivial on a
+non-power-of-two grid is a plausible library-side story, but it was not
+confirmed.  The control that would separate "3×3 is odd" from "any grid past
+2×2" is a 4×4 leg at n = 8192; it never got a placement before the lane's
+window closed, and its log carries no cuSOLVERMp line at all, so its non-zero
+exit is a queue artifact and must not be read as a hang.
+
+Evidence: `/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` legs
+`la_p4_bfc85`, `la_p9_bfc85`, `la_p9_platform`, `la_p9_small_bfc85`,
+`la_p9_3072`, `la_p9_mid` (n = 4098) and `la_p9_6144`; the probe is
+`sigma_scaling_0809/probe_pressure_sq.py`, which is the allocator lane's
+`probe_pressure.py` with one change — its `build_mesh` picked `(n, 1)` for any
+device count other than 1 or 4, which would have measured a 9×1 cuSOLVERMp
+grid rather than the 3×3 grid LORRAX actually runs.  Prose:
+`SIGMA_SCALING.md` §8.  The `la_p16_8192` leg is the one that did not run.
+
+### 2. A profiler session live across the phdf5 collective close segfaults rank 0
+
+Setting `ISDF_JAX_PROFILE_DIR` opens a profiler session at *every*
+`trace_section` call site in a run, and the first of those is `zeta_fit`.  On
+a multi-node mesh that session is live across `zeta_q.h5`'s phdf5 collective
+close, and rank 0 segfaults there.  Reproduced three times at a 3×3 mesh over
+three nodes, always immediately after `[SlabIO.close] H5Fclose returned in
+0.0 s` and always about twenty seconds in; a 2×2 single-node mesh traces
+cleanly, so single-node tracing is unaffected.  What the geometry evidence
+strictly pins is "3×3 over three nodes segfaults, 2×2 on one node does not" —
+mesh size and node count were not separated by a control, and a lane that
+needs that distinction should measure it rather than quote this row.
+
+The practical consequence was total: the section anybody actually wants, the
+sigma tau kernel, is nine sections later and was never reached, so tracing the
+production GN-PPM Σ deck above a 2×2 mesh was not slow or noisy but
+**impossible**.
+
+**Worked around, not fixed.**  The instrument commit in this landing adds
+`ISDF_JAX_PROFILE_SECTIONS`, a comma-separated allowlist of substrings
+consulted by `_trace_path` alongside the directory, which makes the tau kernel
+reachable at P > 4 by not opening a session at `zeta_fit` at all.  Unset —
+which is what every existing caller passes — every section still traces, so no
+call site changes behaviour.  **The root cause is open**: why a profiler
+session interacting with the phdf5 FFI's collective close should segfault rank
+0 is unanswered, and the allowlist only routes around it.  Anyone who sets
+`ISDF_JAX_PROFILE_DIR` on a multi-node mesh without also setting
+`ISDF_JAX_PROFILE_SECTIONS` will still meet this.
+
+Evidence: `/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` — the red twin's
+gates `gate_allowlist.log` / `.xml` (branch, 6 passed) and
+`gate_allowlist_PRE.log` / `.xml` (pre-fix base `3e5e98ba`, 4 failed / 2
+passed).  The absence is evidence too: there is no `_traces/tr_p9` or
+`_traces/tr_p16` under that workspace, only `_traces/tr_p4/`, and the
+`tr_p16` / `tr_p9b` logs record `LX-POOLFULL` with no step rather than a
+misleading exit code.  Prose: `SIGMA_SCALING.md` §9.  The guarding cells are
+`tests/test_jax_profile_section_allowlist.py`, six of them; they pin the
+allowlist's behaviour, including that an empty or whitespace value means
+"unset" rather than "trace nothing", and they say nothing about the segfault.
+
+---
+
+# AMENDMENT — `--vq-mode interp` IS NOT AVAILABLE ON A 3-D BULK DECK, AND PUNCH ROW 23 WAS NEVER AN OFF-GRID DEFECT (2026-08-10) — **MEASURED, ATTRIBUTED AND REFUSED ON THIS BRANCH**
+
+`PIPELINE_HEALTH.md` punch row 23 opened as a **High** blocker: on
+`si_bse_debug`, `bse.exciton_bands --vq-mode interp` failed two of
+`vq_interp`'s gates — `makeVq_vs_disk_Vqmunu_allq_max` at 3.218e-01 against a
+5e-6 tolerance and `slab_axes_offdiag` at 1.000e+00 against 1e-12 — and did so
+identically on the parent bundle and on a downfolded child. The row read that
+as "a defect of the off-grid exchange on this deck". It is not a defect, and
+it is not off-grid. Both numbers are `vq_interp`'s slab assumption meeting a
+3-D fcc cell, and both are produced by `run_gates`, which runs on the coarse
+data before any interpolation has happened at all.
+
+**The first suspect was the wrong one, and the model was already innocent.**
+The obvious hypothesis was that the long-range model interpolates the product
+of the form factor with the Coulomb kernel, so that the kernel's structure
+pollutes a fit that should only ever see a smooth amplitude. It does not.
+Stage 1 samples `Fch = e^{+2πi(q+G)·s_μ} (S_q ζ̃)_μ(q+G)` — the phase-factored
+cleaned form factor, with no `v` in it; stage 2 solves a least-squares problem
+whose right-hand side is exactly those samples and whose *weight* is
+`v_LR(q+G)`, so the objective is `‖ΔA‖²_F` for the tile factor without the
+kernel ever entering the fitted object; and stage 3 rebuilds
+`v = 8π/K² · f2d/Ω · e^{−K²/4α²}` in closed form at the target Q and applies it
+as `A = zt·√v`. The stripped-amplitude design was already in force, at one
+site, and nothing in this landing changes the fit.
+
+**What the residual actually is, measured three ways on the real deck.**
+Rebuilding the stored `V_qmunu` from the stored ζ at all 64 q of the
+`si_bse_debug` parent (n_μ = 936), varying only which `v(q+G)` is used:
+
+| `v(q+G)` used to rebuild the tiles | `makeVq_vs_disk` max |
+|---|---|
+| `vq_interp`'s hardwired 2-D Ismail-Beigi slab kernel | **3.218e-01** — reproduces the punch row exactly |
+| bulk 3-D `8π/K²/Ω` with the deck's 25 Ry bare-Coulomb mask | 4.593e-02 |
+| the same, plus the deck's mini-BZ head-slot injection | **1.504e-15** |
+
+So the gate is measuring kernel bookkeeping and nothing else: given the `v`
+the deck actually built its tiles with, the stored ζ reproduces the stored
+`V_qmunu` to machine precision. The dominant term is the truncation family —
+`vq_interp` has no `sys_dim` anywhere in it and applies the slab `f2d` to a
+bulk cell — and the remainder is the deck's own `mc_average_vcoul_body = true`
+mini-BZ average, which the row's own "next step" column had already guessed at
+and which turns out to be the smaller half.
+
+**The second gate cannot be tightened away, and is the one that closes the
+question.** `slab_axes_offdiag` = 1.000e+00 is not a small number near a
+strict tolerance. On `si_bse_debug`'s reciprocal lattice
+`b3 = 0.6123·(1, −1, 1)`, so `b3`'s in-plane components equal its own
+z-component by construction, and `b1`, `b2` carry z-components of the same
+size. The long-range model fits one in-plane polynomial `M_μ(K_x, K_y)` per
+`|G_z|` channel, which is exact only where `K_z` is constant inside a channel —
+i.e. `b3 ∥ z`, `b1, b2 ⊥ z`, and `q_z = 0` on the coarse grid, which together
+give `K_z = G_z·|b3|` identically. On this cell none of the three holds
+(`max|q_z| = 0.5`), so the fit would be regressing against a variable it cannot
+see. **No change to the Coulomb kernel reaches that**, which is why fixing the
+kernel alone would have moved 3.218e-01 to 4.593e-02 and still failed.
+
+**Disposition: refused by name, at the loader, before anything expensive.**
+`vq_interp.slab_scope_violations` states the three conditions once — the
+restart's own Coulomb-policy stamp, the axis ratio, and the planarity of the
+coarse q-grid — and `load_zeta_coarse` applies them, so the deck now gets a
+sentence naming each violated condition and the two modes that do serve it
+(`--vq-mode ongrid`, exact at every Q on the BSE grid, and `--vq-mode refit`)
+instead of a gate battery whose numbers are consequences. Worth saying plainly,
+because it is the part that stings: the stamp that answers this was **already
+printed in the failing run's own log**, one screen above the gate lines
+(`sys_dim=3`, `mc_average_vcoul_body=true`). Nothing was missing. Nothing read
+it. The fix is therefore a refusal that quotes the stamp, not a second copy of
+it.
+
+| item | mechanism, at this tree | disposition |
+|---|---|---|
+| **`bse.exciton_bands --vq-mode interp` refuses on `si_bse_debug` and on every 3-D bulk deck** | `vq_interp` is a slab model in two independent ways: its only Coulomb kernel is the 2-D Ismail-Beigi truncation, and its long-range model's per-`\|G_z\|` channels are exact only on slab-separable axes with a planar coarse q-grid. A bulk deck violates both. | **BY DESIGN, and now said out loud.** The refusal names all three violated conditions and the two working modes. `--vq-mode ongrid` is exact at every Q on the BSE grid and is what the walk's step 6 already used successfully on this deck. Making `interp` serve a bulk cell is not a tuning change — it needs a long-range model whose channels are not keyed on `G_z`, which is owner-ruled work and is not registered as in progress. |
+
+**Gates.** All on Perlmutter, shared pool, one GPU each. (a) The row-23 pair
+re-measured on the parent's own artifacts, with the three-arm ladder above;
+the arms differ only in `v(q+G)`, everything else is the deck's stored data.
+(b) **Zero delta on a served deck, byte-level**: the MoS2 3×3 slab control ran
+`bse.exciton_bands --vq-mode interp` end to end at base `c3e8bda6` and on this
+branch, and `xs_slab_base.dat` / `.png` are md5-identical to
+`xs_slab_interp.dat` / `.png`; its gate battery reads `makeVq_vs_disk`
+1.304e-09 and `slab_axes_offdiag` 0.000e+00 on both, and all three
+`run_nulls` are green. That deck's restart is **unstamped**, which also
+exercises the `policy=None` arm on real data — an unstamped file is judged on
+geometry alone and is not refused for lacking a stamp. (c) The fixture-gated
+`tests/test_bse_vq_interp.py` LOO ladder returns **bit-identical** numbers at
+base and on the branch (LOO median `0.07956779918419911` on both), which is
+the strongest available statement that the arithmetic did not move; that cell
+is the pre-existing red this file already carries and it is left standing.
+(d) `tests/test_bse_vq_interp_scope.py`, ten fixture-free cells on cell
+geometry alone, including the tetragonal twins that separate the kernel
+condition from the geometry one. (e) The BerkeleyGW parity deck structurally
+cannot execute this module: `bse.bse_jax --bse` reads the stored tensors
+on-grid, and `bse_io`'s only `build_vq_evaluator` call sits inside
+`_interpolate_bse_data_to_grid` behind `head_minibz_average`, which that deck
+sets neither of.
+
+Evidence: `/pscratch/sd/j/jackm/xd_parent` (the punch row's own run and its
+`xb_parent_interp.log`), `/pscratch/sd/j/jackm/xs_scope` (the refusal, on the
+branch), `/pscratch/sd/j/jackm/xs_slab` (the MoS2 control, base and branch),
+and `/pscratch/sd/j/jackm/row23_measure.py` + `row23_arm3.py` (the three-arm
+ladder, numpy and `vcoul` respectively).

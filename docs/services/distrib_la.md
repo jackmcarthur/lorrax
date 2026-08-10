@@ -6,6 +6,60 @@ vendor library it can reach — ScaLAPACK, SLATE, cuSOLVERMp — appears in
 exactly one dependency edge (`distrib_la.loader`, which `dlopen`s a `.so`
 by path) and in zero declared dependencies.
 
+## Known limitation — `distributed_eigh` hangs at a 3×3 mesh for n ≥ 3072
+
+**Read this before you plan a large deck.** `distributed_eigh` is not
+currently safe on a 3×3 device mesh once the matrix reaches n = 3072. It does
+not fail and it does not raise; it hangs silently and forever. The cuSOLVERMp
+banner prints, nothing follows it, and the job sits there until the scheduler
+or a human kills it. Runs were killed at 420 s and, in one case, at 900 s
+without the call ever returning.
+
+The break is bracketed tightly. At a 3×3 mesh, n = 2049 completes in 6.9 s
+with a maximum eigenvalue error of 1.5e−11, and n = 3072 never returns. Every
+larger size tested at that mesh — 3072, 4098, 6144, 8190 — hangs the same way.
+A 2×2 mesh at n = 8192 is fine, finishing in 9.3 s, so this is specific to the
+3×3 geometry rather than a general size ceiling.
+
+**The allocator is exonerated.** The hang reproduces identically under the
+`platform` allocator, which is what the fleet runs today, and under the
+recommended BFC settings. Whatever is wrong at 3×3 was wrong before the
+allocator question was ever asked, and it will still be wrong if the allocator
+recommendation is rejected. The card reported 36.4 GiB free at the moment of
+the call, so this is not memory starvation either.
+
+What this means in practice is that **large-deck users must not assume
+`distributed_eigh` works past roughly n ≈ 2k until this is closed.** If your
+stage calls `eigh` on a big matrix, run it on a 2×2 mesh, or keep the matrix
+below the bracket, or use a non-distributed route. A 3×3 mesh with a large
+matrix will not give you a wrong answer — it will give you no answer at all,
+which in a batch queue is an expensive way to find out.
+
+Two things are still owed here. The first is a control: a 4×4 leg at n = 8192
+is what separates "3×3 is odd because it is not a power of two" from "anything
+past 2×2 is broken". That leg never got a placement before the measuring
+window closed, and the log it did leave carries no cuSOLVERMp line at all, so
+its non-zero exit is a queue artifact and must not be read as a hang. The
+second is the root cause itself, which needs a multi-node GPU allocation to
+chase and therefore has not been attempted. One unconfirmed lead, offered as a
+lead: at a 3×3 grid, n = 2049 gives a local block of 683, below the usual 1024
+tile, while n = 3072 gives exactly 1024 per rank and so more than one block
+column per rank for the first time. A hang appearing exactly where the 2-D
+block-cyclic distribution stops being trivial on a non-power-of-two grid is a
+plausible library-side story, but nobody has confirmed it.
+
+The owner's disposition is **revisit soon**. This is a `distrib_la` solver
+defect and it belongs to whoever owns `distrib_la`.
+
+The seven-leg evidence table, the exact reproduction and the probe live in the
+2026-08-09 amendment to `tests/KNOWN_FAILURES.md` (§1, "`distributed_eigh`
+hangs at a 3×3 mesh for every n ≥ 3072"). The run artifacts are under
+`/pscratch/sd/j/jackm/sigma_scaling_0809/_reports/` in legs `la_p4_bfc85`,
+`la_p9_bfc85`, `la_p9_platform`, `la_p9_small_bfc85`, `la_p9_3072`,
+`la_p9_mid` and `la_p9_6144`; the probe is
+`sigma_scaling_0809/probe_pressure_sq.py`, and the prose write-up is
+`SIGMA_SCALING.md` §8. `la_p16_8192` is the leg that did not run.
+
 ## Purpose
 
 One door for `eigh`, `cholesky` and `solve_lu` on an `('x','y')` device
@@ -305,6 +359,11 @@ explicit requests are never demoted.
 8. **The (2048, 4096] window for bug L-4.** SLATE CUDA eigh's true crash
    threshold is somewhere in there; 4096 is just the smallest size anyone
    watched it die at.
+9. **The 4×4 control at n = 8192.** Owed to the 3×3 hang written up at the
+   top of this document. Until someone runs it, we cannot say whether the
+   hang is a non-power-of-two-grid problem or a "anything past 2×2"
+   problem, and those two have very different blast radii. Root-causing
+   the hang itself needs a multi-node GPU allocation.
 
 ### The batched surface is a scan, and the route toggle is one place
 

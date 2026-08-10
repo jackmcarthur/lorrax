@@ -29,6 +29,13 @@ Knobs (all optional):
                                           the deadlock reproducer; never use
                                           it in production.
   ``LORRAX_JAX_CACHE_EXPLAIN=1``        — turn on ``jax_explain_cache_misses``.
+  ``LORRAX_JAX_CACHE_SHARD_SLICE=0``    — TEST HOOK (red twin): leave JAX's
+                                          ``ArrayImpl._multi_slice`` alone, so
+                                          each rank bakes its own shard
+                                          offsets into the jit signature and
+                                          gets its own ``jit__multi_slice``
+                                          cache key.  That is the divergent
+                                          hit/miss pattern; never in production.
   ``LORRAX_JAX_CACHE_INVARIANT_KEY=0``  — TEST HOOK: do NOT make the cache key
                                           process-invariant.  At P > 1 this
                                           also switches the cache OFF, because
@@ -294,7 +301,13 @@ def _say(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # jax._src surface this file patches
 # ---------------------------------------------------------------------------
-# This file monkeypatches four ``jax._src`` privates.  It used to carry FIVE
+# This file monkeypatches five ``jax._src`` privates.  The fifth,
+# ``ArrayImpl._multi_slice`` (see :func:`_install_shard_slice_patch`), is not
+# about the cache LAYER at all — it is about the ranks compiling the same
+# module — but it lives here because it defends the same invariant as
+# everything else in this file and would be invisible anywhere else.
+#
+# It used to carry FIVE
 # named compatibility shims so that one source ran on both the jax 0.5.3 line
 # (Perlmutter's old ``nvcr.io/nvidia/jax:25.04-py3``) and the jax 0.9 line.
 # **Four of the five are gone**: the GPU leg moved to
@@ -735,6 +748,160 @@ def _install_invariant_key_patch() -> None:
     _ck._hash_serialized_compile_options = _stripped
     _ck._hash_accelerator_config = _canonical_accelerator
     _ck._lorrax_invariant_key_installed = True
+
+
+# ---------------------------------------------------------------------------
+# the shard-slice patch: one ``jit__multi_slice`` program for every rank
+# ---------------------------------------------------------------------------
+# Everything above makes the ranks compute the same KEY for the same MODULE.
+# This one is the other half of the same safety property: it makes them
+# compile the same MODULE in the first place, for the one JAX-internal jit
+# whose program is built out of per-rank shard offsets.
+_CANON_SLICE_JIT = None
+
+
+def _canon_slice_jit():
+    """The rank-invariant slicer: shard SIZES static, shard OFFSETS dynamic.
+
+    Built once, lazily, because importing jax at this module's import time is
+    something the rest of the file is careful not to do.
+    """
+    global _CANON_SLICE_JIT
+    if _CANON_SLICE_JIT is not None:
+        return _CANON_SLICE_JIT
+
+    import jax
+
+    # NAMED, not `_body`: the jit's name becomes the XLA module name and the
+    # cache-key prefix, and `jit__multi_slice` being distinctive is the only
+    # reason this defect was ever findable in an explain log.  A module called
+    # `jit__body` would hide the next one.
+    def _lorrax_canonical_shard_slice(self, sizes, removed_dims, starts):
+        out = []
+        for sz, rm, st in zip(sizes, removed_dims, starts):
+            sliced = jax.lax.dynamic_slice(self, st, sz)
+            if rm:
+                sliced = jax.lax.squeeze(sliced, rm)
+            out.append(sliced)
+        return out
+
+    _CANON_SLICE_JIT = jax.jit(_lorrax_canonical_shard_slice,
+                               static_argnums=(1, 2))
+    return _CANON_SLICE_JIT
+
+
+def _slice_index_dtype(shape):
+    """Index dtype for the dynamic offsets — chosen from the GLOBAL shape.
+
+    It has to be picked from something every rank agrees on.  ``shape`` is the
+    global array's shape and is identical on every rank; the OFFSETS are not,
+    so sizing the dtype to ``max(local offsets)`` would put the rank back in
+    the signature through the back door.
+    """
+    import numpy as np
+
+    return np.int64 if (shape and max(shape) >= 2 ** 31) else np.int32
+
+
+def _install_shard_slice_patch() -> None:
+    """Make JAX's device-array resharding compile ONE program on every rank.
+
+    THE DEFECT.  When a **single-device, fully addressable** ``jax.Array`` is
+    handed to a consumer with a multi-device sharding — a jit with
+    ``in_shardings``, or a bare ``jax.device_put(arr, NamedSharding(...))`` —
+    ``jax/_src/array.py::_array_shard_arg`` takes its resharding path::
+
+        indices = sharding.addressable_devices_indices_map(x.shape).values()
+        if dispatch.is_single_device_sharding(x.sharding):
+          results.append(shard_device_array(x, devices, indices, sharding))
+
+    and ``shard_device_array`` turns those indices into slice bounds and
+    passes them to ``ArrayImpl._multi_slice``, which is::
+
+        @api.jit(static_argnums=(1,2,3))
+        def _multi_slice(self, start_indices, limit_indices, removed_dims):
+
+    ``addressable_devices_indices_map`` is ADDRESSABLE — on the production
+    one-GPU-per-process launch it is this rank's single shard.  So the shard
+    OFFSETS are baked into the jit signature as static arguments, rank r
+    compiles ``slice(x, [r*n/P, 0], [(r+1)*n/P, m])``, and the four ranks of a
+    P=4 run compile four DIFFERENT modules and therefore hold four different
+    persistent-cache keys.  Writes are process-0-only
+    (``jax/_src/compiler.py::_cache_write``), so on a warm run rank 0 HITS its
+    own key while ranks 1..P-1 MISS and compile.
+
+    That divergent hit/miss pattern is the scorecard-AG deadlock condition
+    this whole file exists to prevent, arriving by a route the agreement layer
+    structurally cannot see: the agreement makes hit/miss identical for a
+    GIVEN key, and here the ranks are asking about genuinely different
+    programs.  MEASURED warm at P=4 (``FIX_warmcache.md`` §1.2): rank 0
+    ``xla_compiles=1 hits=36`` against ranks 1,2,3 ``xla_compiles=2 hits=35``,
+    with three distinct ``jit__multi_slice-*`` keys in the explain log.
+
+    THE CANONICALIZATION.  Rebind ``ArrayImpl._multi_slice`` to a form that
+    keeps the shard SIZES static — they are what the output shapes are made
+    of, and they are equal on every rank whenever the mesh axis divides the
+    array evenly — and passes the shard OFFSETS as ordinary dynamic operands
+    to ``lax.dynamic_slice``.  One program, one key, every rank.
+
+    Bit-identity: ``lax.dynamic_slice`` with in-bounds start indices and unit
+    strides is exactly ``lax.slice`` — both are a copy, neither does
+    arithmetic on the values — and the offsets are in bounds by construction
+    (they came from a sharding's own index map).  The ``lax.squeeze`` of
+    ``removed_dims`` is unchanged.
+
+    RESIDUAL, stated rather than hidden: what is left in the signature is the
+    tuple of shard SHAPES.  On a ragged sharding (a mesh axis that does not
+    divide the array evenly) those still differ across ranks and the keys
+    still diverge — strictly no worse than before this patch, but not fixed
+    by it.  No single program can serve differently-shaped outputs; that case
+    needs padding at the call site, not a patch here.
+
+    Not applied at P == 1, where there is nothing to make invariant — which is
+    also why this cannot perturb a single-process run.
+    """
+    from jax._src.array import ArrayImpl
+
+    if getattr(ArrayImpl, "_lorrax_shard_slice_installed", False):
+        return
+
+    orig = ArrayImpl.__dict__.get("_multi_slice")
+    if orig is None:
+        _compat("shard-slice-absent",
+                f"jax {_jax_generation()} has no ArrayImpl._multi_slice; the "
+                f"rank-dependent shard-slice key cannot arise here and the "
+                f"patch is not installed.")
+        return
+
+    def _canonical_multi_slice(self, start_indices, limit_indices,
+                               removed_dims):
+        import numpy as np
+
+        try:
+            sizes = tuple(
+                tuple(int(hi) - int(lo) for lo, hi in zip(st, li))
+                for st, li in zip(start_indices, limit_indices))
+            removed = tuple(tuple(int(d) for d in rm) for rm in removed_dims)
+            idx_dtype = _slice_index_dtype(tuple(self.shape))
+            starts = tuple(
+                tuple(np.array(int(v), idx_dtype) for v in st)
+                for st in start_indices)
+            return _canon_slice_jit()(self, sizes, removed, starts)
+        except Exception as exc:                                # noqa: BLE001
+            # Correctness first: any shape we did not anticipate goes back to
+            # JAX's own slicer, which is right and merely rank-dependent.  It
+            # ANNOUNCES, because a compatibility path nobody can see in the
+            # log is indistinguishable from the bug it replaced.
+            _compat("shard-slice-fallback",
+                    f"the canonical shard slicer declined "
+                    f"({type(exc).__name__}: {exc}); falling back to JAX's "
+                    f"rank-dependent ArrayImpl._multi_slice.  Expect one "
+                    f"jit__multi_slice cache key PER RANK.")
+            return orig(self, start_indices, limit_indices, removed_dims)
+
+    ArrayImpl._multi_slice = _canonical_multi_slice
+    ArrayImpl._lorrax_shard_slice_orig = orig
+    ArrayImpl._lorrax_shard_slice_installed = True
 
 
 def _install_agreement_patch() -> None:
@@ -1203,6 +1370,22 @@ def ensure_jax_compile_cache() -> None:
     if n_proc == 1:
         _STATE.enabled = True
         return
+
+    # Make the ranks compile the SAME MODULE before making them agree on which
+    # keys they may use.  This is not part of the agreement and does not
+    # depend on its outcome: the agreement equalises hit/miss for a given key,
+    # and `jit__multi_slice` diverges one level below that, by building a
+    # different program per rank out of that rank's own shard offsets.  See
+    # `_install_shard_slice_patch` for the mechanism and the measurement.
+    # It is installed on every P>1 path, including the degraded ones, because
+    # fewer distinct modules is never the wrong direction.
+    if _truthy("LORRAX_JAX_CACHE_SHARD_SLICE", "1"):
+        _install_shard_slice_patch()
+    elif proc_idx == 0:
+        _say("LORRAX_JAX_CACHE_SHARD_SLICE=0: JAX's rank-dependent "
+             "ArrayImpl._multi_slice is left in place.  Expect one "
+             "jit__multi_slice cache key PER RANK — this is the red twin of "
+             "the shard-slice canonicalization, not a supported mode.")
 
     # NOTE for anyone re-reading the P>1 path.  There used to be a fifth
     # compatibility shim here: a whole-cache degradation for a jax whose

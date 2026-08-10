@@ -340,6 +340,7 @@ def compute_finite_q_mtxels(
     iq_list: list[int],
     nv_block: int,
     nc_block: int,
+    vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
     verbose: bool = True,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
@@ -442,14 +443,23 @@ def compute_finite_q_mtxels(
             np.asarray(Gk_int, dtype=int),
             vnl_setup, compute_dZ=True,
         )
-        # vnl_ops applies a global sign flip relative to the BGW convention
-        # (see comment in main(): vNL_cart = -vNL_cart). Match here.
-        v_NL_v = -vnl_ops.apply_vnl_velocity_to_ket(
+        # THE SAME KNOB THE q = 0 ROUTES READ.  These tables feed the SOS
+        # chi head/wing pipeline, which is a consumer of the assembled
+        # velocity exactly like ``dipole_cart`` is, so a sign that moved
+        # at q = 0 and not here would leave one run's head and its wings
+        # built from two different operators.  Written as a branch rather
+        # than a multiply so the shipped arm executes the SAME negation
+        # it always did.
+        _vel_v = vnl_ops.apply_vnl_velocity_to_ket(
             psi_v[:, :int(kdata.E_super.shape[0])],
             kdata.Z, kdata.dZ, kdata.E_super)
-        v_NL_c = -vnl_ops.apply_vnl_velocity_to_ket(
+        _vel_c = vnl_ops.apply_vnl_velocity_to_ket(
             psi_c[:, :int(kdata.E_super.shape[0])],
             kdata.Z, kdata.dZ, kdata.E_super)
+        if vnl_velocity_sign < 0.0:
+            v_NL_v, v_NL_c = -_vel_v, -_vel_c
+        else:
+            v_NL_v, v_NL_c = _vel_v, _vel_c
         # The VNL apply may return only nspinor_E spinors; pad to full nspinor.
         if v_NL_v.shape[2] < v_kin_v.shape[2]:
             pad = v_kin_v.shape[2] - v_NL_v.shape[2]
@@ -536,13 +546,13 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
 
     Three tiers, in the order a reader would guess: an explicit
     ``--vnl-velocity-sign`` beats the deck key ``vnl_velocity_sign``,
-    which beats the shipped default.  ``None`` and the empty string both
-    mean NOT DECLARED, so a deck that has never heard of the key and a
-    deck that omits it are the same run -- the same reading
+    which beats the default.  ``None`` and the empty string both mean
+    NOT DECLARED, so a deck that has never heard of the key and a deck
+    that omits it are the same run -- the same reading
     ``resolve_soc_mode`` gives ``soc``.
 
     The default is
-    :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_SHIPPED`, and it is read
+    :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_FLIPPED`, and it is read
     from there rather than written here so that the producer and the
     operator cannot disagree about what "as shipped" means.  The value
     is stamped into ``dipole.h5`` by :func:`stamp_dipole_provenance`,
@@ -555,7 +565,7 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
         raw = raw.strip().lower()
         raw = _VNL_SIGN_WORDS.get(raw, raw)
     if raw is None or raw == "":
-        return VNL_VELOCITY_SIGN_SHIPPED
+        return VNL_VELOCITY_SIGN_FLIPPED
     try:
         val = float(raw)
     except (TypeError, ValueError):
@@ -609,8 +619,8 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     unconditionally once resolved because the two arms differ by 31 % in
     eps00(0) on silicon with the SHAPE of the frequency dependence still
     right -- one global scale of 1.377 on (eps - 1) leaves a 0.3 %
-    residual -- so nothing downstream will notice which arm it was
-    handed.
+    median residual ON THE IMAGINARY AXIS -- so nothing downstream will
+    notice which arm it was handed.
     """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     h5.attrs["prov_wfn_file"] = str(wfn_path)
@@ -717,7 +727,14 @@ def main(argv=None):
 		"--vnl-mode",
 		choices=["analytic", "numeric"],
 		default="analytic",
-		help="Choose nonlocal velocity evaluation: analytic (dZ) or numeric FD(Z)",
+		help="Nonlocal velocity evaluation.  `analytic` (dZ) is the "
+		     "production arm and the default -- every dipole.h5 in the "
+		     "tree is built with it.  `numeric` is the FINITE-DIFFERENCE "
+		     "VALIDATION ARM for the analytic path: it exists to check "
+		     "that the analytic derivative is implemented right, it is "
+		     "far slower, and it is NOT FOR PRODUCTION RUNS.  The two "
+		     "are gated against each other by "
+		     "tests/test_vnl_velocity_fd_agreement.py.",
 	)
 	parser.add_argument(
 		"--vnl-h",
@@ -743,6 +760,16 @@ def main(argv=None):
 		help="Skip the i[r,V_NL] commutator term — write p̂ only. Used to "
 		     "match BGW's `use_momentum` keyword for apples-to-apples "
 		     "absorption comparison.",
+	)
+	parser.add_argument(
+		"--pseudo-dir", "--pseudo_dir",
+		dest="pseudo_dir",
+		default=None,
+		help="Directory holding the deck's *.upf files.  Default: the input "
+		     "file's own directory, then ../qe/scf and ../qe/nscf.  THREE OF "
+		     "THE FOUR tests/regression decks do not carry their UPFs (only "
+		     "cohsex_debug does), so a fixture re-cut from a clean checkout "
+		     "needs this flag — see gw.kin_ion_io, which has had it all along.",
 	)
 	parser.add_argument(
 		"--vnl-velocity-sign",
@@ -802,8 +829,8 @@ def main(argv=None):
 	# carries -- the internal assembly returns -(∂_q + ∂_q') V_NL and the
 	# knob multiplies that.  Both spellings are printed together so a log
 	# can be read against the table without doing the flip in one's head.
-	_arm = ("p + i[r, V_NL]  (as shipped)" if vnl_velocity_sign < 0.0
-	        else "p - i[r, V_NL]  (FLIPPED)")
+	_arm = ("p + i[r, V_NL]  (LEGACY -1 arm)" if vnl_velocity_sign < 0.0
+	        else "p - i[r, V_NL]  (default since 2026-08-09)")
 	if not args.skip_vnl:
 		print(f"  velocity assembly: {_arm}, "
 		      f"vnl_velocity_sign = {vnl_velocity_sign:+.1f}")
@@ -848,15 +875,73 @@ def main(argv=None):
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
 
 	print("\nScanning for pseudopotential files...")
-	pseudos = load_pseudopotentials(str(input_path.parent))
-	if not pseudos:
+	searched = [str(args.pseudo_dir)] if args.pseudo_dir else [str(input_path.parent)]
+	pseudos = load_pseudopotentials(searched[0])
+	if not pseudos and not args.pseudo_dir:
 		# Also try the QE subdirectory (common sandbox layout)
 		for fallback in [str(input_path.parent / '..' / 'qe' / 'scf'),
 						 str(input_path.parent / '..' / 'qe' / 'nscf')]:
+			searched.append(fallback)
 			pseudos = load_pseudopotentials(fallback)
 			if pseudos:
 				print(f"Found pseudopotentials in {fallback}")
 				break
+
+	# ── PRE-FLIGHT.  THE ONE CHECK THIS DRIVER NEVER RAN. ────────────────
+	# ``psp.operator_checks`` was written for exactly three callers and its
+	# own module docstring names them: "before computing kin+ion, DIPOLE
+	# matrix elements, or any other quantity that depends on
+	# pseudopotentials".  ``gw.kin_ion_io`` and ``psp.get_DFT_mtxels`` call
+	# it; this driver never did, and that omission is the whole defect
+	# behind the 2026-08-09 ``kdata.dZ is None`` blocker.
+	#
+	# WITHOUT PSEUDOS THIS DRIVER DOES NOT REFUSE — IT PRODUCES THREE
+	# DIFFERENT WRONG THINGS, one per arm, and only one of them is loud:
+	#
+	#   --vnl-mode analytic (DEFAULT)  ``build_vnl_setup`` returns a setup
+	#       with ``channels == []``, so ``_build_vnl_kdata_core`` has no
+	#       ``dZ`` block to concatenate and hands back ``dZ=None``.  Thirty
+	#       seconds later ``apply_vnl_velocity_to_ket`` conjugates it:
+	#       ``TypeError: conjugate requires ndarray or scalar arguments,
+	#       got <class 'NoneType'>`` — a stack six frames inside a jitted
+	#       einsum that names neither the deck nor the missing file.
+	#   --vnl-mode numeric   finite-differences a projector set that is
+	#       EMPTY, so V_NL ≡ 0.  rc=0, an h5 written, and
+	#       ``prov_skip_vnl=False`` stamped on a file that has no V_NL in
+	#       it.  MEASURED on si_cohsex_debug: that artifact agrees with the
+	#       ``--skip-vnl`` run to 5.8e-15 — i.e. it IS the --skip-vnl run,
+	#       wearing the other arm's provenance.
+	#   --skip-vnl           correct, and the only arm entitled to run
+	#       without pseudopotentials at all.
+	#
+	# So the refusal is gated on ``--skip-vnl``, not on the mode: the p̂-only
+	# arm genuinely needs no projectors, and every other arm needs them or
+	# it is lying in its provenance block.
+	if not args.skip_vnl:
+		# Imported here, not at module scope, for the same reason
+		# ``get_DFT_mtxels`` does it: ``operator_checks`` runs
+		# ``_services.ensure_on_path()`` at import time and this module's
+		# own ``ffi`` bootstrap is further down the import block.
+		from psp.operator_checks import validate_operator_inputs
+		try:
+			sys_dim = int(params.get("sys_dim", 3))
+		except (TypeError, ValueError):
+			sys_dim = 3
+		try:
+			validate_operator_inputs(pseudos=pseudos, wfn=wfn,
+			                          sys_dim=sys_dim,
+			                          caller="get_dipole_mtxels")
+		except RuntimeError as exc:
+			raise SystemExit(
+				f"{exc}\n"
+				f"  searched: {', '.join(searched)}\n"
+				"  The dipole is p + i[r, V_NL]; without projectors the "
+				"nonlocal half is silently zero (--vnl-mode numeric) or "
+				"crashes inside the sweep with 'conjugate ... got NoneType' "
+				"(--vnl-mode analytic).\n"
+				"  Fix: stage the deck's *.upf next to the input file, pass "
+				"--pseudo-dir DIR, or ask for p̂ only with --skip-vnl."
+			) from exc
 
 	# Structure summary (reuse DFT helper)
 	print_atomic_structure(wfn, pseudos)
@@ -1017,7 +1102,7 @@ def main(argv=None):
 			print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
 
 	def _dipole_block(i):
-		"""⟨mk|v|nk⟩ = p + i[r, V_NL] for ONE k — ``(3, nb, nb)`` on device.
+		"""⟨mk|v|nk⟩ at this run's arm, for ONE k — ``(3, nb, nb)`` on device.
 
 		THE LOCAL PLAN, kept for two callers only: ``--vnl-mode=numeric``
 		(whose finite difference picks its step from THIS k's median |K|
@@ -1065,6 +1150,24 @@ def main(argv=None):
 			h_base = max(float(args.vnl_h), float(args.vnl_h_rel) * max(K_med, 1.0))
 			h1 = h_base
 			h2 = 0.5 * h_base
+			# ONE INTERNAL CONVENTION FOR BOTH MODES: ``vNL_cart`` means
+			# ``+dV_NL/dK_cart``, which is what the analytic branch below
+			# returns (``compute_vnl_velocity_cart``'s docstring, and
+			# ``orbital_magnetization.py:601`` records it verified
+			# off-diagonally at ratio 1.000).  These differences used to
+			# carry a leading MINUS, which made ``--vnl-mode numeric``
+			# the arithmetic negative of ``--vnl-mode analytic``: both
+			# then passed through the same knob-controlled flip and the
+			# same ``p_cart + vNL_cart``, so the two modes came out on
+			# OPPOSITE arms of the very sign question this file's knob
+			# parameterises.  Two implementations of one derivative
+			# cannot both be right, and nothing in the tree compared
+			# them, which is why it survived.  The finite difference is
+			# the unambiguous one -- it is a literal numerical
+			# derivative of ``compute_vnl_matrix_from_setup``, which
+			# returns <m|V_NL(k)|n> with no sign convention of its own --
+			# so the analytic branch is the definition both now share
+			# and the numeric branch stops negating.
 			for ic in range(3):
 				# D1 at h1
 				d1 = np.zeros((3,), dtype=float); d1[ic] = h1
@@ -1073,7 +1176,7 @@ def main(argv=None):
 				km1 = np.asarray(kpoint, dtype=float) - d1c
 				Vp1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp1, vnl_setup, g_mask=g_mask)
 				Vm1 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km1, vnl_setup, g_mask=g_mask)
-				D1 = - (Vp1 - Vm1) / (2.0 * h1)
+				D1 = (Vp1 - Vm1) / (2.0 * h1)
 				if args.vnl_num_scheme == "richardson":
 					# D2 at h2
 					d2 = np.zeros((3,), dtype=float); d2[ic] = h2
@@ -1082,7 +1185,7 @@ def main(argv=None):
 					km2 = np.asarray(kpoint, dtype=float) - d2c
 					Vp2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, kp2, vnl_setup, g_mask=g_mask)
 					Vm2 = compute_vnl_matrix_from_setup(wfn_k, Gk_crys, km2, vnl_setup, g_mask=g_mask)
-					D2 = - (Vp2 - Vm2) / (2.0 * h2)
+					D2 = (Vp2 - Vm2) / (2.0 * h2)
 					vNL_cart[ic] = (4.0 * D2 - D1) / 3.0
 				else:
 					vNL_cart[ic] = D1
@@ -1176,6 +1279,7 @@ def main(argv=None):
 			iq_list=iq_list,
 			nv_block=int(nval),
 			nc_block=int(ncond),
+			vnl_velocity_sign=vnl_velocity_sign,
 			verbose=True,
 		)
 		cv_meta = {

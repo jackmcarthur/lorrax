@@ -1878,6 +1878,42 @@ def main(argv=None):
             kpath_data[1],
         )
 
+    # ── Outputs barrier, then CLOSE THE LOADER EXPLICITLY ─────────────
+    # The block above is rank-0-only, so without this barrier the other
+    # ranks arrive at the collective close while rank 0 is still writing
+    # ``bandstructure.dat``.  The barrier is what makes every rank enter
+    # the close at the same point; the close is the load-bearing half.
+    #
+    # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``
+    # (``setup_wfn_and_sym`` -> ``WfnLoader(wfn_file, mesh=mesh_xy)``, and
+    # this driver passes ``mesh_xy=None`` so ``initialize_wfns`` builds the
+    # mesh itself), so at P>1 the loader picks the phdf5 backend and owns a
+    # ``SlabIO`` whose ``close()`` runs an UNCONDITIONAL COLLECTIVE barrier
+    # (``file_io/_slab_io_ffi.py``, ``_barrier("slab_io_ffi_close_attrs")``).
+    # Left to ``WfnLoader.__del__``, that collective fires whenever the
+    # garbage collector happens to drop the object during interpreter
+    # shutdown — a moment no two ranks agree on, and rank 0's object graph
+    # differs from the others' because of the writer block above.
+    #
+    # This is the defect measured and cured in ``bse.exciton_bands`` at
+    # ``b3813d8f`` (FIX_exciton_exit_hang.md): three ranks parked in
+    # ``__del__`` -> ``SlabIO.close`` -> ``sync_global_devices`` while the
+    # fourth had already reached ``ffi.io._atexit_close_all`` ->
+    # ``H5Fclose`` -> ``MPI_Barrier``; two disjoint collective domains,
+    # neither ever satisfied, the payload complete and every output written,
+    # and the step holding its GPUs at 4x100% CPU until the allocation died.
+    # That report's §6 named THIS driver as the one remaining sibling with
+    # the identical shape.  ``close()`` is idempotent and nulls the handles,
+    # so the later ``__del__`` becomes a no-op on every rank; at P=1 both
+    # the barrier and the SlabIO collective are already no-ops.
+    from common.collectives import barrier
+    barrier("htransform.outputs_written")
+    try:
+        wfn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  [htransform] WfnLoader.close() failed "
+              f"({type(exc).__name__}: {exc}); continuing to exit")
+
     summary = f"HT complete: {result['nb_keep']} bands, nk={result['nk_total']}, fermi={result['fermi_energy']:.6f} Ry"
     if result['path_range'] is not None:
         summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
@@ -1909,4 +1945,15 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ``runtime.finalize_process``, not a bare ``SystemExit``: the explicit
+    # ``wfn.close()`` above removes the collective from ``__del__``, and this
+    # removes the SECOND unordered collective — ``ffi.io._atexit_close_all``,
+    # whose ``H5Fclose`` on the restart/zeta contexts is collective too and
+    # otherwise runs at whatever point each rank's interpreter teardown
+    # reaches it.  ``finalize_process`` runs the effects barrier, the
+    # distributed shutdown and the atexit hooks in ONE stated order on every
+    # rank and then ends with ``os._exit``, so GC-driven ``__del__``s at
+    # shutdown never run at all.  Same pattern as ``bse.exciton_bands``
+    # (``b3813d8f``) and ``gw.gw_jax``, the sibling that has never hung.
+    from runtime import finalize_process
+    finalize_process(main())

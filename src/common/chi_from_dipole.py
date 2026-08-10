@@ -1,7 +1,39 @@
 from __future__ import annotations
 
 """
-Utilities to compute S_{alpha,beta}(omega) from dipole.h5 (p + i[r,V_NL]).
+Utilities to compute S_{alpha,beta}(omega) from dipole.h5.
+
+THE S-TENSOR CONVENTION LIVES HERE.  There is exactly one representation
+of the density-response S-tensor in this tree, and it is the one
+``compute_S_omega`` returns: the **Cartesian q²-coefficient**
+
+    chi_{G'=0}(q -> 0, omega)  =  q_a  S_ab(omega)  q_b ,
+
+with ``q`` in Cartesian 1/bohr and ``S`` a symmetric (3, 3) complex
+array per frequency.  Every reader assumes exactly that — ``gw.
+head_correction`` passes it straight through as ``S_cart``, and
+``vcoul.Bulk3D.q0_average`` contracts it as ``einsum('qi,ij,qj->q', rq,
+S, rq)`` against Cartesian mini-BZ draws to form ``W = v/(1 - v·qSq)``.
+
+The second builder in the tree, ``psp.run_sternheimer``'s
+``compute_s_tensor_contrib_at_q0``, computes the same physical object by
+an independent (Sternheimer) route, but its kernel naturally produces the
+**crystal-coordinate Hessian** ``H_ij = d2 chi / dq_i dq_j``, which
+differs by a factor 2 and a frame change.  Until 2026-08-09 that raw
+Hessian was written to ``sternheimer.h5:s_tensor_q0`` and had no reader,
+so the two builders could not be consumed consistently (SMALL_ISSUES.md
+row 22).  That driver now converts at the write site —
+``S = 0.5 * Binv @ H @ Binv.T`` with ``B = blat*bvec`` — so the dataset
+on disk is in THIS convention and the two routes are interchangeable and
+directly comparable.  Any further rank-two q-space tensor added to this
+family — the mini-BZ exchange-head moment ``M_ab = <v(q) q_a q_b>_cell``
+is the next one — is Cartesian, and states its power of q, by the same
+rule.
+
+The velocity convention is the FILE's, not this module's: read it from
+the h5's ``prov_vnl_velocity_sign`` attribute (-1 is the legacy arm, +1
+the default since 2026-08-09; an absent attribute means a file written
+before the stamp existed, which is the legacy arm).
 
 Public API
 ----------
@@ -19,7 +51,14 @@ Public API
 # Concretely:
 #
 #   dipole_cart[α, k, m, n] = ⟨ψ^DFT_m,k | v_α | ψ^DFT_n,k⟩      (3, nk, nb, nb)
-#   deltaE[k, m, n]         = E^DFT_n,k − E^DFT_m,k               (nk, nb, nb)
+#   deltaE[k, m, n]         = E^DFT_m,k − E^DFT_n,k               (nk, nb, nb)
+#                             (m minus n — the writer's order, ``psp.
+#                             get_dipole_mtxels`` ``e_b[:,None] -
+#                             e_b[None,:]``, and what makes ``dE_cv``
+#                             below positive.  This line said n − m until
+#                             2026-08-09; the code was always right and
+#                             only the comment was inverted, but anything
+#                             built on the comment picks up a sign.)
 #   f_nk[k, n]              = occupation at DFT eigenvalue        (nk, nb)
 #
 # For a one-shot G0W0 / single-cycle QSGW, this is fine — the bra/ket states
@@ -135,6 +174,33 @@ def _compute_S_omega_jit(
     return jax.vmap(S_one, in_axes=0, out_axes=0)(omegas)
 
 
+def s_tensor_crystal_hessian_to_cartesian_q2(H_crys, bvec_cart):
+    """Crystal-coordinate Hessian → the canonical Cartesian q²-coefficient.
+
+    The ONE place the two S-tensor representations are reconciled, so the
+    factor of two and the frame change are decidable by reading a single
+    function (SMALL_ISSUES.md row 22; docs/theory/s-tensor-convention.md).
+
+    ``H_crys`` is ``H_ij = ∂²χ_{00}/∂q_i∂q_j`` with ``q`` in CRYSTAL
+    coordinates, i.e. ``χ = ½ q_i H_ij q_j`` — what
+    ``psp.run_sternheimer.compute_s_tensor_contrib_at_q0`` produces.
+    ``bvec_cart`` is the (3, 3) Cartesian reciprocal lattice with the
+    reciprocal vectors as ROWS (``blat * wfn.bvec``, 1/bohr), the same row
+    convention as ``vcoul.minibz_frac_to_cart``.
+
+    Returns ``S_ab`` with ``χ_{00}(q→0) = q_a S_ab q_b``, ``q`` Cartesian:
+    the representation :func:`compute_S_omega` returns and every reader
+    consumes.  Since ``q_crys = q_cart · B⁻¹``,
+
+        S = ½ · B⁻¹ · H · B⁻ᵀ .
+
+    Shape and dtype are preserved (complex in, complex out).
+    """
+    Binv = np.linalg.inv(np.asarray(bvec_cart, dtype=np.float64))
+    H = np.asarray(H_crys)
+    return 0.5 * (Binv @ H @ Binv.T)
+
+
 def compute_S_omega(
     dipole_cart: jnp.ndarray,
     deltaE: jnp.ndarray,
@@ -165,5 +231,6 @@ def compute_S_omega(
 __all__ = [
     "read_dipole_h5",
     "compute_S_omega",
+    "s_tensor_crystal_hessian_to_cartesian_q2",
 ]
 

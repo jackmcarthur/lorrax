@@ -11,17 +11,34 @@ or GN-PPM (Godby–Needs Generalized Plasmon Pole) frequency dependence.
 - **Core idea**: replace dense charge-density products with a compact ISDF basis defined by centroids $r_\mu$
 - **Outcome**: exchange and screened-exchange self-energy matrix elements and band-edge corrections
 
-## Try it in 60 seconds
+## Try it
 
-The fastest way to confirm LORRAX works on your machine — runs a complete static-COHSEX
-calculation end-to-end on a fresh clone with **no GPU and no native (FFI) build**
-(the bundled fixture sets `use_ffi_io = false` — the deprecated spelling of
-`slab_io = h5py_allgather`, the serial writer — and ships its own wavefunction):
+The fastest way to confirm LORRAX works on your machine — a complete static-COHSEX
+calculation end-to-end on the bundled fixture, which ships its own wavefunction and
+needs no GPU:
 
 ```bash
 uv sync
+bash src/ffi/cpp/build_host.sh      # see below: this step is NOT optional
 uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 ```
+
+!!! warning "There is no longer a pure-JAX path that skips the native build"
+    `uv sync` alone is not enough, on any platform, at any process count.
+    [Design decisions, 2026-08-01](architecture/decisions.md) made the FFI layer
+    **required**: a missing or unloadable library is a refusal at startup, not a
+    demotion to a JAX fallback, because the fallback paths were deleted. Verified
+    2026-08-10 on a fresh clone at `88f28325`, the command above without the build
+    step refuses with `RuntimeError: The required FFTW3-ABI host backend is
+    unavailable … Could not locate liblorrax_ffi_host.so`, and the fixture's own
+    `use_ffi_io = false` line no longer selects anything — that key became
+    warn-and-ignore on 2026-08-06, when the three I/O tiers collapsed to one
+    transport.
+
+    `build_host.sh` needs a SLATE `gpu_backend=none` install and refuses without
+    one, naming `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu` as the step
+    before it. Budget for that: the 60-second promise this section used to make
+    was measured against a tree that no longer exists.
 
 See the [Quickstart](quickstart.md) for the worked example, and
 [Installation](installation/index.md) for the GPU / distributed / from-source tracks.

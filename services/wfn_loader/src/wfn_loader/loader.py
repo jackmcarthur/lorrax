@@ -890,9 +890,20 @@ class WfnLoader:
         # See ``common.symmetry_maps.{unfold_psi,trs_augment_U}`` and
         # ``reports/trs_sym_audit_2026-05-14`` Sites #5–#7.  ``sym.U_spinor``
         # is length ``ntran`` (PR3); the TRS half is built inside the helper.
+        # ``nspinor`` is NOT optional here.  ``sym.U_spinor`` is always
+        # (ntran, 2, 2) — it is built from the CARTESIAN rotations and
+        # knows nothing about how many components psi has — so on a scalar
+        # (nspinor=1) WFN the un-told helper hands back a 2x2, the unfold
+        # kernel's ``einsum("kac,bckg->bakg", ...)`` BROADCASTS the size-1
+        # spinor axis instead of raising, and psi comes back 2-component
+        # holding ``U[a,0]+U[a,1]`` times itself.  Told ``nspinor``, the
+        # helper returns the 1x1 identity and the same einsum is a genuine
+        # no-op.  Registered nspinor=1 loader defect, fixed 2026-08-09;
+        # see ``tests/KNOWN_FAILURES.md``.
         from symmetry_maps import trs_augment_U
         U_per = trs_augment_U(
-            sym.U_spinor, sym_idx_per_full, n_tran)                      # (nk_full, 2, 2)
+            sym.U_spinor, sym_idx_per_full, n_tran,
+            nspinor=int(self.nspinor))                        # (nk_full, ns, ns)
 
         # τ-phase per full-BZ k on the ibz-source ngkmax-padded G-list.
         # Use the SAME formula for spatial and TRS rows:

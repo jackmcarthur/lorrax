@@ -80,6 +80,251 @@ def _log_restart_write(name, shape, dtype, dt) -> None:
           flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Coulomb-kernel policy stamp
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  The restart file records ``V_ready``, the band
+# window, ``n_rmu``, the k-grid, the q-set symmetry tables and the centroid
+# md5s — and, until this stamp, NOTHING about the Coulomb kernel.  A
+# ``restart = true`` run reuses ``V_qmunu`` verbatim and never re-runs
+# ``compute_V_q`` (``gw_init.py``'s restart branch), so ANY change of
+# averaging policy — ``mc_average_vcoul_body``, the mini-BZ placement, the
+# bare-Coulomb cutoff, the BGW vcoul overlay — is inherited silently by
+# every existing restart, with every current guard passing.  This is the
+# same defect class as the band-window bug the file's own comments cite
+# (job 7874375: window-70 tensors reused at window 80 gave a QP gap of
+# -135 eV while every stage reported success).
+#
+# It is a WARNING, not a refusal, and the asymmetry is deliberate.  The
+# band window changes what the tensors are INDEXED by, so reusing them is
+# wrong with no way to be right.  A Coulomb-policy change makes the stored
+# V a legitimate tensor built under a different convention — sometimes
+# exactly what the operator wants (re-scoring an old restart against a new
+# Sigma path), sometimes a silent physics change.  The failure to remove is
+# the SILENCE, so the stamp is loud and the decision stays the operator's.
+#
+# Files written before the stamp read as legacy and get one line saying so,
+# because "no stamp" and "a stamp that matches" are different facts and a
+# reader that conflates them has re-created the original defect one level up.
+
+COULOMB_POLICY_DATASET = "coulomb_policy"
+COULOMB_POLICY_VERSION = 1
+
+#: The keys stamped, in order.  Anything that changes ``v(q+G)`` or where
+#: its mini-BZ average lands belongs here; anything that does not, does not.
+COULOMB_POLICY_KEYS = (
+    "mc_average_vcoul_body",
+    "mc_average_placement",
+    "mc_average_placement_vcoul",
+    "head_minibz_average",
+    "bare_coulomb_cutoff",
+    "use_bgw_vcoul",
+    "bgw_vcoul_file",
+    "sys_dim",
+)
+
+
+def coulomb_policy_from_config(cfg, meta=None) -> dict:
+    """The Coulomb-kernel policy of a running config, as a flat str dict.
+
+    Reads ``cfg.head`` (and ``meta.sys_dim``) rather than being handed the
+    values, so a key added to ``HeadConfig`` and to
+    :data:`COULOMB_POLICY_KEYS` is stamped without a third edit at every
+    call site.
+    """
+    head = getattr(cfg, "head", None)
+    out = {}
+    for k in COULOMB_POLICY_KEYS:
+        if k == "sys_dim":
+            v = getattr(meta, "sys_dim", None) if meta is not None else None
+        else:
+            v = getattr(head, k, None)
+        out[k] = _policy_scalar(v)
+    return out
+
+
+def _policy_scalar(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return repr(float(v))
+    return str(v)
+
+
+def format_coulomb_policy(policy: dict) -> str:
+    """``v1;key=value;...`` — one line, sorted by :data:`COULOMB_POLICY_KEYS`.
+
+    Deliberately a readable string rather than JSON or a pickle: the whole
+    point of a provenance stamp is that ``h5dump`` answers the question
+    without LORRAX in the loop.
+    """
+    body = ";".join(
+        f"{k}={_policy_scalar(policy.get(k))}" for k in COULOMB_POLICY_KEYS)
+    return f"v{COULOMB_POLICY_VERSION};{body}"
+
+
+def parse_coulomb_policy(raw) -> dict | None:
+    """Inverse of :func:`format_coulomb_policy`; ``None`` for an unstamped file.
+
+    Tolerates unknown keys (a file written by a newer LORRAX) and missing
+    keys (an older one) — both come back in the dict as they are, and the
+    comparison below reports them as differences rather than crashing.  A
+    stamp is provenance; failing to READ one must never be worse than not
+    having it.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    elif isinstance(raw, np.ndarray):
+        raw = bytes(raw.tobytes()).decode("utf-8", "replace").rstrip("\x00")
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    parts = raw.split(";")
+    if parts and parts[0].startswith("v"):
+        parts = parts[1:]
+    out = {}
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, _, v = p.partition("=")
+        out[k.strip()] = v.strip()
+    return out or None
+
+
+def compare_coulomb_policy(stamped: dict | None, running: dict) -> list:
+    """Return ``[(key, stamped, running), ...]`` for every disagreement.
+
+    Empty list means the file was built under this run's Coulomb policy.
+    ``stamped is None`` (legacy file) is NOT a disagreement — it is the
+    absence of evidence, and the caller says so in its own words.
+    """
+    if stamped is None:
+        return []
+    keys = list(dict.fromkeys(list(stamped.keys()) + list(running.keys())))
+    return [(k, stamped.get(k, "<absent>"), running.get(k, "<absent>"))
+            for k in keys if stamped.get(k, "<absent>") != running.get(k, "<absent>")]
+
+
+def read_coulomb_policy_from_h5(filename) -> dict | None:
+    """Read the stamp off a restart file with serial h5py; ``None`` if absent.
+
+    Scalar-class metadata, read the same way ``assert_restart_window_matches``
+    reads the band window — no SlabIO handle, no collective, safe to call on
+    any rank before the tensors move.
+    """
+    try:
+        with h5py.File(filename, "r") as f:
+            if COULOMB_POLICY_DATASET not in f:
+                return None
+            return parse_coulomb_policy(f[COULOMB_POLICY_DATASET][()])
+    except (OSError, KeyError):
+        return None
+
+
+#: The group ``gw.downfold_run`` stamps on a compressed bundle.  Named here,
+#: beside the Coulomb-policy stamp, because it is part of the RESTART FORMAT
+#: and has two sides: the downfold writes it and the BSE drivers read it.  A
+#: reader that needed its own copy of the group name would be a second owner
+#: of a format detail, which is the drift this module exists to prevent.
+DOWNFOLD_PROVENANCE_GROUP = "downfold_provenance"
+
+
+def read_downfold_provenance(filename) -> dict | None:
+    """The ``downfold_provenance`` group of a restart bundle; ``None`` if absent.
+
+    ``None`` means "natively fitted, as far as this file says" — a bundle
+    written by ``gw.gw_jax`` carries no such group, and so does one written
+    by a downfold predating the stamp.  Both are read as not-downfolded,
+    which is the safe direction: every consumer's existing behaviour is what
+    it gets.
+
+    WHY A READER LIVES HERE AT ALL.  A downfolded bundle is deliberately
+    indistinguishable from a natively fitted one BY SHAPE — that is what
+    makes it a drop-in for ``bse.bse_jax``.  But two facts about it are not
+    derivable from shape and are load-bearing for any consumer that has to
+    build something NEW in the same ISDF basis rather than only read the
+    stored tensors: which centroid table the parent basis came from, and
+    which of the parent's centroid rows survived.  ``bse.exciton_bands``
+    needs both (its htransform leg fits ψ in the PARENT basis and slices the
+    result to the kept rows), and this is the one place either is recorded.
+
+    Serial h5py, no SlabIO handle, no collective — the same contract as
+    :func:`read_coulomb_policy_from_h5`, so it is safe to call on any rank
+    before the tensors move.
+
+    Returns the group's attributes as a plain dict (bytes decoded to str),
+    plus ``keep_idx`` / ``retained_rank_per_q`` as numpy arrays when present.
+    """
+    try:
+        with h5py.File(filename, "r") as f:
+            if DOWNFOLD_PROVENANCE_GROUP not in f:
+                return None
+            g = f[DOWNFOLD_PROVENANCE_GROUP]
+            out = {}
+            for k, v in g.attrs.items():
+                out[k] = v.decode("utf-8") if isinstance(v, bytes) else v
+            for name in ("keep_idx", "retained_rank_per_q"):
+                if name in g:
+                    out[name] = np.asarray(g[name][:])
+            return out
+    except (OSError, KeyError):
+        return None
+
+
+def describe_coulomb_policy_stamp(filename) -> str:
+    """One line naming the Coulomb policy a restart file's tensors carry.
+
+    For readers that CONSUME W rather than rebuild V — the BSE, which by
+    its own note "does NOT compute W, it READS it off the GW restart".
+    They have no Coulomb config of their own to compare against, so the
+    honest disclosure is the stored policy itself, not a match verdict.
+    Without this line a BSE run's log has no record of which averaging
+    convention its screening was built under, which is exactly the gap
+    that made the cross-code residual arguable in the first place.
+    """
+    stamped = read_coulomb_policy_from_h5(filename)
+    if stamped is None:
+        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
+                "(GW restart predates the stamp) - the screening in this "
+                "file was built under an unrecorded averaging convention.")
+    return ("  [restart stamp] screening built under Coulomb policy: "
+            + ";".join(f"{k}={v}" for k, v in stamped.items()))
+
+
+def describe_coulomb_policy_match(filename, cfg, meta=None) -> str:
+    """One line for a restart log: matched, mismatched, or legacy-unstamped.
+
+    Returns the text; the caller prints it, so this stays importable from
+    the BSE side (which reads the same file and owes the same disclosure)
+    without either side owning the other's print function.
+    """
+    running = coulomb_policy_from_config(cfg, meta)
+    stamped = read_coulomb_policy_from_h5(filename)
+    if stamped is None:
+        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
+                "(file predates the stamp). Read as legacy — the stored V/W "
+                "were built under whatever averaging policy that run used, "
+                "and this run cannot tell which. Running policy is "
+                f"{format_coulomb_policy(running)}")
+    diffs = compare_coulomb_policy(stamped, running)
+    if not diffs:
+        return (f"  [restart stamp] Coulomb-kernel policy matches: "
+                f"{format_coulomb_policy(stamped)}")
+    detail = "; ".join(f"{k}: file={a!r} run={b!r}" for k, a, b in diffs)
+    return (
+        "  [restart stamp] WARNING - Coulomb-kernel policy MISMATCH between "
+        "this restart file and the running config. The restart reuses "
+        "V_qmunu verbatim and never re-runs compute_V_q, so the stored "
+        "tensors carry the FILE's policy and every other guard will pass. "
+        f"Differences -> {detail}. Rerun with restart = false if the "
+        "running policy is the one you meant.")
+
+
 def write_restart_state_to_h5(
     filename,
     *,
@@ -99,6 +344,7 @@ def write_restart_state_to_h5(
     kgrid: tuple[int, int, int] | None = None,
     band_slices=None,
     qirr=None,
+    coulomb_policy=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -190,6 +436,17 @@ def write_restart_state_to_h5(
                  int(band_slices.b4)], dtype=np.int64))
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
+        # COULOMB-KERNEL PROVENANCE.  Unconditional on the ``w`` pass: a
+        # restart written without it is exactly the file this stamp exists
+        # to stop producing, so there is no opt-in.  Callers that pass
+        # nothing get the stamp with empty values, which still records
+        # "this writer knew about the policy and was handed none" — a
+        # different and more useful fact than an absent dataset.
+        if mode == "w":
+            io.write_attr(
+                COULOMB_POLICY_DATASET,
+                np.asarray(format_coulomb_policy(coulomb_policy or {})
+                           .encode("utf-8"), dtype="S"))
 
         # PER-DATASET LIVENESS (scorecard AF.4c): every dataset below
         # emits one [restart_write] line naming its size as it is handed
@@ -868,6 +1125,53 @@ def read_restart_state_from_h5(filename, mesh_xy):
     del nspinor  # gated above; the extent itself rides on the arrays
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
             psi_full_y_transverse, n_rmu_T_disk)
+
+
+def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
+    """Read ONE ``(…, μ, ν)`` restart tensor, sharded, wedge unfolded.
+
+    ``read_restart_state_from_h5`` reads the fixed set of tensors ``gw_init``
+    writes on its ``mode="w"`` pass and deliberately does not know about
+    ``W0_qmunu`` — W is written later, by a different function, once the
+    Dyson solve has produced it.  Every consumer that wants W back has
+    therefore had to re-derive the slab request, the legacy-layout collapse
+    and the wedge unfold for itself (``bse_io`` does, at its own scale).
+    This is that read, named once, on the same three private helpers the
+    canonical reader uses, so a fourth consumer does not spell it a fourth
+    way.
+
+    Returns ``None`` when the dataset is absent — which is the normal case
+    for ``V_qmunu_nohead`` / ``W0_qmunu_nohead``, an opt-in pair nothing
+    in-tree writes.  Callers that REQUIRE the tensor say so themselves; a
+    reader that raised here could not serve the optional ones.
+
+    Padding, sharding and the wedge follow the canonical reader exactly:
+    disk holds the LOGICAL μ extent, memory holds
+    ``padded_mu_extent(μ, device_count)`` with zero pad rows, output is
+    ``P(None,'x','y')``, and an IBZ-wedge dataset comes back on the FULL BZ
+    with the caller none the wiser.
+
+    ``n_rmu_logical`` overrides the μ extent read off the dataset — pass it
+    only when the dataset itself is the thing under suspicion.
+    """
+    from .slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
+
+    with h5py.File(filename, "r") as f:
+        if name not in f:
+            return None
+        ds_shape = tuple(int(s) for s in f[name].shape)
+        ds_dtype = f[name].dtype
+        wedge_tables = _qirr_wedge_tables(f)
+
+    n_rmu_disk = int(ds_shape[-1] if n_rmu_logical is None else n_rmu_logical)
+    n_rmu_pad = padded_mu_extent(n_rmu_disk, int(jax.device_count()))
+    off, shape, spec = _munu_slab_request(ds_shape, n_rmu_pad)
+    with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
+        arr = io.read_slab(name, shape=shape, dtype=ds_dtype, offset=off,
+                           mesh=mesh_xy, partition_spec=spec)
+    arr = _collapse_leading(arr, ds_shape, mesh_xy)
+    return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,

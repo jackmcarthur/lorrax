@@ -331,6 +331,7 @@ def build_bse_stack_matvec(
     nkz: int,
     *,
     kernel: str = "bse",
+    head_tensor: bool = False,
 ):
     """Build the trial-stack BSE matvec.
 
@@ -339,6 +340,35 @@ def build_bse_stack_matvec(
     kernel : {'bse', 'rpa'}
         ``'bse'`` returns ``D + V - W`` (screened direct term); ``'rpa'`` returns
         ``D + V`` (the W-term ``shard_map`` is not built).
+    head_tensor : bool
+        Add the cell-averaged nonanalytic exchange head as a rank-three term
+        over the TRANSITION index, and take two extra runtime arguments
+        ``(D_head, M_head)`` to carry it.  Default False traces a program with
+        no head contraction in it at all — not a zero-valued one — so the
+        off path is bit-identical, exactly as ``W_q0=None`` does for the
+        screened-direct term in ``bse_davidson_helpers``.
+
+        THE HEAD CANNOT LIVE IN THE μ BASIS, WHICH IS WHY IT IS A SEPARATE
+        TERM.  The exchange tile's head channel is rank one in μ with a
+        SCALAR Coulomb coefficient, and the object the cell average actually
+        needs is ``M_ab = <v(q) q_a q_b>_cell`` — a tensor, whose contraction
+        through μ would need ``∂_a ζ̃_μ`` and would break ``eval_vq``'s
+        ``A = zt·√v`` factorisation.  It does not have to: the head's
+        q-linear coefficient is the transition dipole, so
+
+            K^head_{t,t'} = (1/N_k) · conj(d_a(t)) · M_ab · d_b(t')
+
+        is rank three over transitions and belongs beside ``M_X``/``M_Y``,
+        where this matvec already carries rank-three objects
+        (``LT_HEAD_PROBLEM.md`` §6).
+
+        Structurally it IS the exchange term with ``(M_X, M_Y, V_q0)``
+        replaced by ``(D_head, D_head, M_head)``, which is why it reuses the
+        same encode/decode shape and the same ``1/N_k``.  ``D_head`` is
+        ``conj(d)`` with the same ``(k, c, v, a)`` layout as ``M_X`` and a
+        Cartesian axis of length 3 where μ was; ``M_head`` is the real
+        symmetric ``(3, 3)`` cell moment.  Hermiticity of the added term is
+        then automatic: ``M`` real symmetric ⇒ ``K^head`` Hermitian.
     """
     if kernel not in ("rpa", "bse"):
         raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
@@ -454,7 +484,7 @@ def build_bse_stack_matvec(
         w_stack = _w_gspmd
 
     def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                M_X, M_Y):
+                M_X, M_Y, D_head=None, M_head=None):
         # M_X (μ on x) / M_Y (ν on y): hoisted exchange pair amplitudes, precomputed
         # once per solve (audit P3). psi_c_Y / psi_v_X are now unused here — kept for
         # a uniform matvec signature with the ring paths; psi_c_X / psi_v_Y still
@@ -476,16 +506,35 @@ def build_bse_stack_matvec(
         VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                 # broadcast over k
         VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
 
+        if head_tensor:
+            # ── Head term: the SAME contraction with (D_head, M_head) in
+            #    place of (M_Y, V_q0, M_X).  Three Cartesian components stand
+            #    where μ stood, so this is three inner products per trial
+            #    vector and a 3x3 — free next to everything above.  The
+            #    conjugation follows the V term's exactly, and must: the
+            #    encode leg carries the conjugated vertex.
+            # D_head = conj(d), so conj(D_head) is the bare dipole and the
+            # two legs read exactly as M_Y / M_X do above.
+            Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X) / sqrt_nk
+            Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
+            HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
+            VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
+
         if not include_W:
             return D_term + VX
 
         WX = w_stack(X, psi_c_X, psi_v_Y, W_R)
         return D_term + VX - WX
 
+    in_sh = [sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+             sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y]
+    if head_tensor:
+        # D_head / M_head are small and replicated: three Cartesian channels
+        # over (k, c, v) and a 3x3.  No mesh axis to tile them on.
+        in_sh += [None, None]
     return jax.jit(
         _matvec,
-        in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y),
+        in_shardings=tuple(in_sh),
         out_shardings=sh.X,
     )
 

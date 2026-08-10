@@ -26,7 +26,7 @@ translation and keep their old wfn/meta-facing spellings.
 from __future__ import annotations
 
 import enum
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +35,7 @@ import numpy as np
 from vcoul.geometry import CoulombGeometry
 
 __all__ = ["SysDim", "CoulombKernel", "get_kernel", "v_qG_table",
-           "v_qG_single"]
+           "v_qG_single", "HeadSlotTable", "head_slot_table"]
 
 
 class SysDim(int, enum.Enum):
@@ -316,6 +316,148 @@ def v_qG_table(
             v = np.where(denom > float(vcoul_cutoff_ry), 0.0, v)
         out[qi] = v
     return out
+
+
+class HeadSlotTable(NamedTuple):
+    """Which G-slots carry the Coulomb head at each q, and at what value.
+
+    Produced by :func:`head_slot_table`, which re-runs *exactly* the slot
+    selection :func:`v_qG_table` performs (same ``_v_bare_per_q``, same
+    ``denom``, same argmin-plus-tie rule, same tied-set mean) and reports
+    it instead of consuming it.  Nothing here changes ``v(q+G)``.
+
+    Fields, all with a leading ``n_q`` axis matching ``q_irr_frac``:
+
+    ``sel``    ``(n_q, k_max)`` int32 — slot indices attaining the argmin,
+               right-padded by repeating ``sel[:, 0]`` so the array is
+               rectangular.  Read it together with ``mask``.
+    ``mask``   ``(n_q, k_max)`` float64 — 1.0 on a genuine tied slot, 0.0
+               on padding, and identically 0 on every q with no head slot
+               (Γ, and any q whose head slot the bare-Coulomb cutoff
+               zeroes).  ``Σ_j mask[q, j] == mult[q]``.
+    ``v_bare`` ``(n_q,)`` float64 — the UNAVERAGED ``v`` at the head slot,
+               i.e. what ``v_qG_table`` would leave there with
+               ``v_head_fn=None``.  Zero where ``mask`` is all-zero.
+    ``v_avg``  ``(n_q,)`` float64 — the value ``v_qG_table`` actually
+               injects: the tied-set mean of ``v_head_fn`` when one is
+               given, and ``v_bare`` when it is not.
+    ``mult``   ``(n_q,)`` int32 — the tie multiplicity (0 where skipped).
+    ``len2``   ``(n_q,)`` float64 — ``|q+G|²`` at the head slot, the shell
+               label.  Zero where ``mask`` is all-zero.  Carried because the
+               BGW-parity route matches its ``vcoul`` dump to LORRAX's head
+               slots by shell rather than by index order.
+
+    The consumer of record is the head-channel Coulomb placement in
+    ``gw.head_channel``: ``v_avg / v_bare`` is the per-cell mini-BZ
+    enhancement ``1 + η(q)`` that BerkeleyGW applies to W's head channel
+    AFTER the Dyson solve, and ``sel``/``mask`` name the ζ columns that
+    span that channel.
+    """
+    sel: np.ndarray
+    mask: np.ndarray
+    v_bare: np.ndarray
+    v_avg: np.ndarray
+    mult: np.ndarray
+    len2: np.ndarray
+
+
+def head_slot_table(
+    kernel,
+    q_irr_frac,
+    gvec_components,
+    *,
+    geometry: CoulombGeometry,
+    vcoul_cutoff_ry: float | None = None,
+    v_head_fn=None,
+    head_tie_rtol: float = 1e-9,
+    k_max: int | None = None,
+) -> HeadSlotTable:
+    """Report :func:`v_qG_table`'s head-slot selection without applying it.
+
+    Same arguments, same arithmetic, same guards — the two functions share
+    ``kernel._v_bare_per_q`` and the identical ``d2min``/``tie_rtol``
+    predicate, so a slot is in ``sel`` here if and only if ``v_qG_table``
+    would overwrite it there.  Splitting the two rather than returning a
+    second value from ``v_qG_table`` keeps the production ``v(q+G)`` path
+    byte-for-byte unchanged: this function has no caller unless a deck
+    turns the head-channel placement on.
+
+    ``k_max`` fixes the second axis of ``sel``/``mask``.  Default is the
+    measured maximum multiplicity over the supplied q's (1, 2 or 4 on
+    every even k-grid tested — see :func:`v_qG_table`'s HEAD SLOT note);
+    pass it explicitly to pin a shape across calls.  A multiplicity above
+    ``k_max`` is a refusal, not a truncation, because silently dropping a
+    tied slot re-creates exactly the q → −q asymmetry the tied-set rule
+    exists to remove.
+    """
+    q_irr_frac = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
+    gvec = np.asarray(gvec_components, dtype=np.float64)
+    if gvec.ndim != 3 or gvec.shape[1] != 3:
+        raise ValueError(
+            f"head_slot_table: gvec_components must be (n_q, 3, ngkmax); "
+            f"got {gvec.shape}")
+    n_q = gvec.shape[0]
+    bvec_f = np.asarray(geometry.bvec, dtype=np.float64)
+    fact = 1.0 / float(geometry.cell_volume)
+    tie_rtol = float(head_tie_rtol)
+
+    sels = []
+    v_bare = np.zeros(n_q)
+    v_avg = np.zeros(n_q)
+    len2 = np.zeros(n_q)
+    mult = np.zeros(n_q, np.int32)
+    for qi in range(n_q):
+        qf = q_irr_frac[qi]
+        v, denom = kernel._v_bare_per_q(
+            qf, gvec[qi], bvec_f=bvec_f, fact=fact,
+            bdot=geometry.bdot, fft_grid=geometry.fft_grid)
+        d2min = float(np.min(denom))
+        if d2min <= 1e-12:
+            # Γ.  ``v_qG_table`` skips it; the head there is the owner's
+            # separate rank-1 term and is not this machinery's business.
+            sels.append(np.zeros(0, dtype=np.int32))
+            continue
+        if vcoul_cutoff_ry is not None and d2min > float(vcoul_cutoff_ry):
+            # The head slot is outside the bare-Coulomb cutoff, so
+            # ``v_qG_table``'s cutoff mask zeroes it after injecting —
+            # there is no head channel at this q.
+            sels.append(np.zeros(0, dtype=np.int32))
+            continue
+        sel = np.nonzero(np.asarray(denom) <= d2min * (1.0 + tie_rtol))[0]
+        sels.append(sel.astype(np.int32))
+        mult[qi] = sel.size
+        len2[qi] = d2min
+        # All tied slots share |q+G|², hence share the bare value; take
+        # the mean anyway so this is the same statistic as ``v_avg``.
+        v_bare[qi] = float(np.mean(np.asarray(v)[sel]))
+        if v_head_fn is None:
+            v_avg[qi] = v_bare[qi]
+        else:
+            K_sel = (qf[:, None] + gvec[qi][:, sel]).T @ bvec_f
+            h = np.asarray(v_head_fn(K_sel), dtype=np.float64)
+            # ``h`` is (m,) even at m == 1 — v_head_fn's contract is a
+            # 1-D return.  The mean over a one-element tied set is that
+            # element, so this is the tied-set rule with no branch.
+            v_avg[qi] = float(np.mean(h))
+
+    k_meas = int(mult.max()) if n_q else 0
+    k = int(k_max) if k_max else max(1, k_meas)
+    if k_meas > k:
+        raise ValueError(
+            f"head_slot_table: measured argmin |q+G| tie multiplicity "
+            f"{k_meas} exceeds k_max={k}. Raise k_max — truncating the "
+            f"tied set would break the q -> -q equivariance the tied-set "
+            f"rule guarantees (see v_qG_table's HEAD SLOT note).")
+
+    sel_out = np.zeros((n_q, k), dtype=np.int32)
+    mask_out = np.zeros((n_q, k), dtype=np.float64)
+    for qi, sel in enumerate(sels):
+        if sel.size:
+            sel_out[qi, :sel.size] = sel
+            sel_out[qi, sel.size:] = sel[0]
+            mask_out[qi, :sel.size] = 1.0
+    return HeadSlotTable(sel=sel_out, mask=mask_out, v_bare=v_bare,
+                         v_avg=v_avg, mult=mult, len2=len2)
 
 
 def v_qG_single(kernel, geometry: CoulombGeometry, qvec_wrapped,

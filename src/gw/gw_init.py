@@ -182,8 +182,15 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	element-wise by :func:`_zeta_reuse_ok` — a hash here would only add a
 	second, weaker check.
 
-	``wfn_bytes`` identifies the source WFN.h5 without reading it.  mtime
-	is deliberately NOT included: copying/restoring a WFN.h5 changes mtime
+	``wfn_file`` is the RESOLVED path (``realpath``, not ``abspath``) and
+	``wfn_bytes`` its size, which together identify the source WFN.h5
+	without reading it.  Resolving matters because the fleet stages each
+	leg behind its own directory or symlink: under ``abspath`` the same
+	file arrived spelled differently on every launch, and the reuse check
+	read that as a changed input.  ``_same_wfn_file`` re-resolves both
+	sides at comparison time as well, so a stamp written before this line
+	— which holds an unresolved path — is still read correctly.  mtime is
+	deliberately NOT included: copying/restoring a WFN.h5 changes mtime
 	without changing content, and a spurious multi-hour refit is a worse
 	outcome than the (contrived) same-path-same-size-different-content
 	case.
@@ -341,10 +348,102 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'fft_grid':             [int(x) for x in np.asarray(meta.fft_grid).reshape(3)],
 		'ecutwfc':              round(float(wfn.ecutwfc), 9),
 		'ecutrho':              round(float(wfn.ecutrho), 9),
-		'wfn_file':             os.path.abspath(wfn_path) if wfn_path else '',
+		# RESOLVED, not as-typed.  ``abspath`` only prepends the cwd; it
+		# leaves every symlink in place, so the same WFN.h5 reached through
+		# a per-run staging link stamped a different string on every launch
+		# and the comparison below refit for a rename (2026-08-09).  See
+		# :func:`_same_wfn_file` for the identity this key now carries and
+		# for how a stamp written before this line is still read correctly.
+		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
 	return json.dumps(prov, sort_keys=True)
+
+
+def _wfn_path_identity(path):
+	"""``(realpath, size, mtime_ns)`` for one recorded ``wfn_file`` string.
+
+	Never raises.  A path taken off an old stamp routinely no longer
+	exists — the run directory was cleaned, the staging link was torn
+	down — and that is "cannot prove anything about this spelling", not
+	an error.  The stat fields are ``None`` in that case and the caller
+	decides what silence means.
+	"""
+	real = os.path.realpath(path) if path else ''
+	try:
+		st = os.stat(real)
+	except OSError:
+		return real, None, None
+	return real, int(st.st_size), int(st.st_mtime_ns)
+
+
+def _same_wfn_file(old_path, new_path, *, old_bytes=None, new_bytes=None):
+	"""Do two recorded ``wfn_file`` spellings name the SAME WFN.h5?
+
+	Returns ``(verdict, why)``; ``why`` is a sentence naming BOTH paths,
+	because the only useful thing to say about a refusal here is which
+	two files the run thinks it is choosing between.
+
+	A path string is not an identity.  The fleet stages each leg's inputs
+	behind its own directory or symlink, so one WFN.h5 arrives spelled a
+	different way on every launch; comparing the strings charged a full
+	ζ re-fit (16.81 GiB on the production deck) for a rename, on runs
+	where every spelling resolved to the same bytes.  Identity is
+	therefore taken in two steps, cheapest first:
+
+	1. **Resolved name.**  ``os.path.realpath`` collapses symlinks and
+	   ``..`` segments, which is every case the staging layout produces.
+	2. **Same inode.**  Two spellings can survive step 1 and still be one
+	   file — a bind mount, a hard link, two mount points onto the same
+	   backing store.  ``os.path.samefile`` (device + inode) settles
+	   those, and costs one ``stat`` each.
+
+	Then the CONTENT stamp, which answers the different question: the
+	name may be stable while the bytes behind it are not.  ``wfn_bytes``
+	(the size recorded at fit time, passed in here) is compared against
+	the size this run recorded for its own input, and the resolved file's
+	size and mtime go into the refusal message so a real replacement is
+	legible rather than mysterious.  The bound is the same one
+	:func:`_zeta_fit_provenance` already declares: a same-size,
+	same-path replacement is not caught, and a spurious multi-hour refit
+	was judged the worse outcome than that contrived case.
+	"""
+	if not old_path or not new_path:
+		return False, ("one of the two stamps records no WFN path at all "
+		               f"(on-disk stamp {old_path!r}, this run {new_path!r})")
+	old_real, old_size, old_mtime = _wfn_path_identity(old_path)
+	new_real, new_size, new_mtime = _wfn_path_identity(new_path)
+	_sizes_known = old_bytes is not None and new_bytes is not None
+	if _sizes_known and int(old_bytes) != int(new_bytes):
+		return False, (
+			f"the on-disk stamp was fit from {old_path!r} at "
+			f"{old_bytes} bytes and this run reads {new_path!r} at "
+			f"{new_bytes} bytes — different files")
+	if old_real != new_real:
+		# Different resolved names, but possibly one file underneath.
+		try:
+			if os.path.samefile(old_real, new_real):
+				return True, (f"{old_path!r} and {new_path!r} resolve to "
+				              f"different names ({old_real!r}, {new_real!r}) "
+				              f"but to the SAME file (device+inode)")
+		except OSError:
+			pass
+		return False, (
+			f"they name different files: the on-disk stamp was fit from "
+			f"{old_path!r} (resolves to {old_real!r}, "
+			f"{'missing' if old_size is None else f'{old_size} bytes'}) and "
+			f"this run reads {new_path!r} (resolves to {new_real!r}, "
+			f"{'missing' if new_size is None else f'{new_size} bytes'})")
+	if new_size is None:
+		# Both spell the same resolved name and neither can be stat'd.
+		# The names agree and the recorded sizes agree, which is every
+		# check this door has; say so rather than refit on absence.
+		return True, (f"{old_path!r} and {new_path!r} both resolve to "
+		              f"{new_real!r}, which is not present on this node — "
+		              f"the recorded sizes agree, so the spellings are read "
+		              f"as the same file")
+	return True, (f"{old_path!r} and {new_path!r} both resolve to "
+	              f"{new_real!r} ({new_size} bytes, mtime_ns {new_mtime})")
 
 
 def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
@@ -358,11 +457,15 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	  3. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
 	  4. ``fit_provenance`` is present AND byte-identical to this run's —
-	     with ONE named exception, the legacy-key table below: a stamp
-	     that differs ONLY by keys added after it was written is read as
-	     having run each of those keys' legacy value, so old run dirs
-	     stay reusable by a rerun that asks for exactly those values
-	     (announced) while any other request refits, naming the key;
+	     with TWO named exceptions, both announced when they fire.  The
+	     legacy-key table below: a stamp that differs ONLY by keys added
+	     after it was written is read as having run each of those keys'
+	     legacy value, so old run dirs stay reusable by a rerun that asks
+	     for exactly those values while any other request refits, naming
+	     the key.  And path SPELLING: ``wfn_file`` records a name, and one
+	     file has many names, so two spellings that resolve to the same
+	     file are not a difference (:func:`_same_wfn_file`) — while two
+	     that resolve to different files refit, naming BOTH paths;
 	  5. the on-disk centroid table equals this run's centroid indices;
 	  6. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
 	     The header and the dataset are written by two different calls,
@@ -428,6 +531,31 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			_dropped = sorted(set(old) - set(new))     # stamp is NEWER
 			diff = sorted(k for k in (set(old) & set(new))
 			              if old[k] != new[k])
+			# PATH SPELLING IS NOT FILE IDENTITY (2026-08-09).  ``wfn_file``
+			# is the one key whose value is a NAME rather than a number, and
+			# a name has more than one spelling: the fleet stages each leg
+			# behind its own directory or symlink, so the same WFN.h5 landed
+			# in this list on every comparison and every such run paid a full
+			# 16.81 GiB re-fit for a rename.  Resolve the two spellings and
+			# ask what they actually name; a genuine difference stays in the
+			# list (and is refused below naming BOTH paths), so this only
+			# ever removes a difference that was never real.  Done BEFORE the
+			# legacy-key exception so that a stamp which both predates a key
+			# AND was written under a different spelling still reuses.
+			if 'wfn_file' in diff:
+				_same, _why = _same_wfn_file(
+					old.get('wfn_file'), new.get('wfn_file'),
+					old_bytes=old.get('wfn_bytes'),
+					new_bytes=new.get('wfn_bytes'))
+				if _same:
+					print_fn(f"    [zeta reuse] {zeta_h5_path}: the WFN path "
+					         f"differs only in SPELLING — {_why}; not a "
+					         f"reason to refit.")
+					diff.remove('wfn_file')
+				else:
+					print_fn(f"    [zeta reuse] {zeta_h5_path} was fit from a "
+					         f"DIFFERENT WFN — {_why} — refitting.")
+					return False
 			detail = "; ".join(
 				[f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}"
 				 for k in diff]
@@ -479,10 +607,21 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# added key has a declared legacy meaning.  A stamp carrying a key
 		# this LORRAX no longer writes came from a NEWER build and gets no
 		# exception — its meaning is unknown here.
+		# The two stamps' BYTES differ but, after the path-spelling
+		# resolution above, nothing they say differs.  This needs its own
+		# arm: the legacy exception below requires a non-empty ``_added``,
+		# so without this an all-spelling difference would fall through to
+		# the generic refit with an EMPTY "Changed:" detail — the same
+		# shape as the 2026-08-04 regression this branch already carries a
+		# test for, and the same outcome (a refit for nothing).
+		_only_spelling = (old is not None and not diff and not _added
+		                  and not _dropped)
 		_legacy_shaped = (
 			old is not None and not diff and not _dropped and _added
 			and all(k in _LEGACY_KEY_DEFAULTS for k in _added))
-		if _legacy_shaped:
+		if _only_spelling:
+			pass
+		elif _legacy_shaped:
 			_mismatch = [k for k in _added
 			             if new.get(k) != _LEGACY_KEY_DEFAULTS[k]]
 			if not _mismatch:
@@ -1089,11 +1228,78 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
 
+def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
+                        centroid_indices, vcoul_cutoff_ry, print_fn=print):
+	"""Build the q != 0 Coulomb head channel, or ``None`` on the default path.
+
+	``mc_average_placement = off`` returns ``None`` before anything is read,
+	so the shipped path costs one string comparison.  Any other mode reads
+	the ζ head-slot columns (``v_q_g_flat.compute_head_channel_zeta``), pairs
+	them with the head-slot ``v`` table, expands the per-IBZ-q scalars onto
+	the full BZ, and optionally re-sources the mini-BZ enhancement from a
+	BerkeleyGW ``vcoul`` dump.
+
+	``schur_avg`` is refused HERE rather than at the solve, so a deck that
+	asks for it fails in the first minute of the run instead of after χ₀.
+	"""
+	from .head_channel import (PLACEMENT_OFF, HeadChannel,
+	                           head_ratio_from_bgw_dump,
+	                           refuse_if_unimplemented)
+
+	mode = str(getattr(cfg.head, 'mc_average_placement', PLACEMENT_OFF))
+	if mode == PLACEMENT_OFF:
+		return None
+	refuse_if_unimplemented(mode)
+	if int(meta.sys_dim) != 3:
+		raise NotImplementedError(
+			f"mc_average_placement = {mode!r} is a 3D-bulk knob (it moves the "
+			f"mini-BZ average of 8*pi/|q+G|^2 onto W's head channel); this "
+			f"deck has sys_dim = {int(meta.sys_dim)}.  The 2D f2d->0 "
+			f"regularisation already removes the divergence at G=0, so there "
+			f"is no q != 0 head slot for the rescale to act on.")
+
+	from .v_q_g_flat import compute_head_channel_zeta
+	g_head, table, full_to_irr_idx = compute_head_channel_zeta(
+		zeta_io,
+		kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+		bvec=bvec, cell_volume=meta.cell_volume,
+		mesh_xy=mesh_xy, sys_dim=meta.sys_dim,
+		bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+		      if meta.sys_dim == 0 else None),
+		bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+		mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+		sym=sym, centroid_indices=centroid_indices,
+		verbose=(jax.process_index() == 0),
+	)
+	# IBZ -> full BZ for the per-q scalars.  |q+G| is a class function of
+	# the shell and the tied-set MEAN makes <v> one too, so the expansion is
+	# a gather, not an unfold: v(q) == v(S q) exactly.
+	idx = np.asarray(full_to_irr_idx, dtype=np.int64)
+	v_bare = np.asarray(table.v_bare)[idx]
+	v_avg = np.asarray(table.v_avg)[idx]
+	len2 = np.asarray(table.len2)[idx]
+	mult = np.asarray(table.mult)[idx]
+	# What V ACTUALLY carries in those slots — the same predicate
+	# ``v_q_g_flat`` gates ``v_head_fn`` on.
+	v_in_V = (v_avg if (cfg.head.mc_average_vcoul_body and meta.sys_dim == 3)
+	          else v_bare)
+	hc = HeadChannel(g_head=g_head, v_bare=v_bare, v_avg=v_avg,
+	                 v_in_V=v_in_V, mult=mult, len2=len2, mode=mode)
+	dump = getattr(cfg.head, 'mc_average_placement_vcoul', None)
+	if dump:
+		hc = head_ratio_from_bgw_dump(dump, hc, bvec=bvec)
+	print_fn(hc.summary())
+	return hc
+
+
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
-	Returns (V_qmunu, G0) where V_qmunu has shape (nq, μ, μ) (flat-q)
-	and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  Downstream consumers that need
+	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
+	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
+	``gw.head_channel.HeadChannel`` when the deck sets
+	``mc_average_placement`` to something other than ``off``, and ``None``
+	otherwise — nothing is computed for it on the default path.  Downstream consumers that need
 	the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
 
 	The legacy ``(1, npol, npol, …)`` leading axes are gone — bispinor
@@ -1308,6 +1514,22 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
 			G0_all = jnp.pad(G0_all,
 			                 ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
+		# ``mc_average_placement`` is refused on the bispinor builder, not
+		# silently skipped.  ``v_q_bispinor`` does not pass ``v_head_fn`` at
+		# all, so with ``mc_average_vcoul_body`` on in 3D the bispinor CC tile
+		# and the scalar V_q ALREADY diverge in the G=0 slot of every q != 0
+		# (see the note at the head of this file).  Adding a second, quieter
+		# copy of that divergence is exactly what COULOMB_AVG_ARCHITECTURE.md
+		# section 4.6(b) says not to do.
+		head_channel = None
+		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
+			raise NotImplementedError(
+				"mc_average_placement is not implemented on the bispinor V_q "
+				"builder: v_q_bispinor.py passes no v_head_fn, so its CC tile "
+				"already carries a different G=0 slot from the scalar V_q at "
+				"every q != 0.  Deciding the placement for one builder and not "
+				"the other would make that divergence permanent.  Run with "
+				"bispinor = false, or land the bispinor v_head_fn first.")
 	else:
 		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
 		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
@@ -1317,6 +1539,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                ) as zeta_io:
+				_cent_idx_np = (
+					np.asarray(jax.device_get(centroid_indices),
+					           dtype=np.int32)
+					if centroid_indices is not None else None)
 				with mesh_xy:
 					V_q_raw, G0_all = compute_all_V_q(
 						zeta_io,
@@ -1330,12 +1556,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
 						sym=sym,
-						centroid_indices=(
-							np.asarray(jax.device_get(centroid_indices),
-							           dtype=np.int32)
-							if centroid_indices is not None else None),
+						centroid_indices=_cent_idx_np,
 						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
 					)
+					# The q != 0 head channel, for ``mc_average_placement``.
+					# Gated on the mode so the default path neither reads ζ a
+					# second time nor compiles a single extra kernel.  It sits
+					# INSIDE the loader scope because that is the only place
+					# ζ is open, and before ``V_q_raw`` is padded so the μ
+					# extents agree by construction.
+					head_channel = _build_head_channel(
+						zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+						mesh_xy=mesh_xy, sym=sym,
+						centroid_indices=_cent_idx_np,
+						vcoul_cutoff_ry=vcoul_cutoff_ry,
+						print_fn=print_fn)
 
 	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
 	# attr path (small; rank-0-only after MPI-IO file is closed).
@@ -1429,7 +1664,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0
+	return V_qmunu, G0, head_channel
 
 
 def build_wavefunction_bundle(
@@ -1595,7 +1830,7 @@ def prepare_isdf_and_wavefunctions(
 			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0 = compute_V_q(
+			V_qmunu, G0, head_channel = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
@@ -1647,9 +1882,16 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
+				from file_io import coulomb_policy_from_config
 				write_restart_state_to_h5(
 					tensors_filename,
 					n_rmu_logical=int(meta.n_rmu),
+					# THE COULOMB-KERNEL POLICY, stamped with the tensors it
+					# describes.  V_qmunu is reused verbatim by every later
+					# restart and compute_V_q never re-runs, so without this
+					# an averaging-policy change is inherited in silence with
+					# every other guard passing.
+					coulomb_policy=coulomb_policy_from_config(cfg, meta),
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -1729,6 +1971,23 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
+		# ``mc_average_placement`` needs the ζ head-slot columns, and a
+		# restart deliberately does NOT re-run ``compute_V_q``
+		# (gw_init.py's restart branch reuses ``V_qmunu`` verbatim), so
+		# there is nothing to build them from.  Refuse rather than run the
+		# default placement under a deck that asked for another one — that
+		# silent inheritance is the exact defect class the restart
+		# Coulomb-policy stamp exists to make loud.
+		head_channel = None
+		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
+			raise RuntimeError(
+				"mc_average_placement = "
+				f"{cfg.head.mc_average_placement!r} with restart = true: the "
+				"restart path reuses V_qmunu verbatim and never re-runs "
+				"compute_V_q, so the head-channel ζ columns the rescale needs "
+				"are not available.  Rerun with restart = false (the placement "
+				"changes W, so an inherited W0 would be the wrong object "
+				"anyway).")
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
@@ -1736,6 +1995,15 @@ def prepare_isdf_and_wavefunctions(
 				n_rmu_logical=int(meta.n_rmu))
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
+			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
+			# line on a match, and a NAMED "not stamped" on a legacy file —
+			# the three are different facts and the log says which.  A
+			# warning rather than a refusal: a policy change makes the
+			# stored V a legitimate tensor built under another convention,
+			# and which one the operator wants is not this seam's call.
+			# What is removed is the silence.
+			from file_io import describe_coulomb_policy_match
+			print0(describe_coulomb_policy_match(tensors_filename, cfg, meta))
 			# Restart is the seam where "rc=0 but garbage" was born (job
 			# 7874375: a changed band window silently reused tensors built
 			# under the old one).  The band-window attrs guard inside
@@ -1875,4 +2143,5 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		head_channel=head_channel,
 	)

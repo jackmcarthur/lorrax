@@ -43,15 +43,18 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
             V_SRc(q_j) = conj(S) [V_ref − V_LR] conj(S)
         LR confined to the FIXED Miller superset 𝒢(α) =
         {G : min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR)}, intersected
-        with the G_z channels the b26p model fits (``DEG_B26P``) —
-        the rest are model-zero and contribute exact 0.0 (``lr_gset``).
+        with the G_z channels the b26p model fits (``lr_fit_degrees``:
+        an energy cutoff with a hard two-shell floor) — the rest are
+        model-zero and contribute exact 0.0 (``lr_gset``).
     (c) phase-factored LR form-factor samples on 𝒢(α):
             F_μ(q_j;G) = e^{+2πi (q_j+G)·s_μ} (S_q ζ̃)_μ(q_j+G)
         (centroid winding phase carried analytically — the g0-winding cure).
 
   stage 2  ``fit_lr_model`` — ONE weighted LSQ over all coarse samples:
         M_μ(K_∥, G_z) ≈ Σ_b c_b[μ,G_z] (K_x/2α)^p (K_y/2α)^r,
-        degrees {|G_z|=0:3, 1:2, 2:0, 3:0} → 26 complex coefficients per μ
+        degree ladder {|G_z|=0:3, 1:2, 2:0, 3:0} → 26 complex coefficients
+        per μ on a cell whose criterion stops at |G_z|=3; channels beyond
+        the ladder enter at degree 0, one coefficient each
         TOTAL, weight w = v_LR(q+G) (the objective is then exactly
         ‖ΔA‖²_F of the LR tile factor A = ζ̃√v_LR).  Per-q normal blocks
         keep leave-one-out refits honest at O(n_b²).
@@ -64,7 +67,12 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
 SCOPE: slab systems with q_z = 0 coarse grids (per-G_z channels exact
 there); FULL-BZ stored ζ (nq == nk).  IBZ-only ζ storage (the IBZ cascade)
 is rejected with a clear error — unfolding ζ through the one canonical
-SymMaps sym-action is deferred work, not a parallel helper here.
+SymMaps sym-action is deferred work, not a parallel helper here.  The slab
+half of that scope is ENFORCED, not merely stated, by
+:func:`slab_scope_violations` (see its docstring for the three conditions
+and what each one costs when it is violated); a 3-D bulk deck is refused at
+load with the reason named, instead of surfacing three functions later as
+an unexplained ``run_gates`` residual.
 
 The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
 — a per-Q ζ refit from htransform full-r wavefunctions — lives in this
@@ -100,9 +108,17 @@ from distrib_la import plan as linalg_plan                          # noqa: E402
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
 EPS_TIK = 1e-4        # relative Tikhonov filter width (fit gauge, §13.1)
 EPS_LR = 1e-8         # Gaussian weight bound defining the LR G-superset
-DEG_B26P = {0: 3, 1: 2, 2: 0, 3: 0}   # in-plane poly degree per |G_z|
+DEG_B26P = {0: 3, 1: 2, 2: 0, 3: 0}   # in-plane poly DEGREE per |G_z|
 RIDGE = 1e-11         # normal-equation ridge (lr_prep.ChannelFit.RIDGE)
 RY2MEV = 13605.693
+
+# Which |G_z| channels the long-range model FITS -- see :func:`lr_fit_degrees`.
+# ``DEG_B26P`` above is the degree LADDER (how rich the in-plane polynomial is
+# per channel); it no longer decides WHICH channels exist.  Channels above its
+# top entry enter at degree 0, one complex coefficient each.
+E_CUT_FIT = 1.0       # Ry -- default channel-fitting cutoff (validated below)
+FIT_SHELL_FLOOR = 2   # hard floor: |G_z| shells always fitted (umklapp roll)
+FIT_FLOOR_MARGIN = 1e-6   # lifts the floor off exact equality at |n| = floor
 
 
 def relF(a, b):
@@ -279,6 +295,119 @@ class _ZetaGTiles:
         no-op and the ownership statement stays true from either end.
         """
         self._loader.close()
+
+
+# ===========================================================================
+# SCOPE — is this deck a slab at all?
+# ===========================================================================
+def slab_scope_violations(bvec, qfr=None, policy=None) -> list[str]:
+    """Every way this deck falls outside ``vq_interp``'s slab scope, in prose.
+
+    Empty list = in scope.  Pure: plain arrays and the parsed Coulomb-policy
+    dict in, strings out, no file handles — so the conditions are testable on
+    cell geometry alone, which is how they are gated
+    (``tests/test_bse_vq_interp_scope.py``).
+
+    THE MODULE IS SLAB-ONLY IN TWO INDEPENDENT WAYS, and until 2026-08-10
+    neither said so out loud.
+
+    1. **The kernel is hardwired.**  :func:`v_slab_on_set` — every ``v`` in
+       this module, the SR/LR split included — is the Ismail-Beigi 2-D
+       truncation ``8π/K² · f2d / Ω`` with ``f2d = 1 − e^{−z_c|K_∥|}
+       cos(K_z z_c)``, ``z_c = π/b3_z``.  There is no ``sys_dim`` anywhere in
+       this file.  A deck with ``sys_dim = 3`` built its stored ``V_qmunu``
+       from the BULK kernel (``vcoul.bulk_3d``, no ``f2d``), so the two are
+       different operators and ``run_gates``' ``makeVq_vs_disk`` compares
+       apples to oranges.  MEASURED on the ``si_bse_debug`` parent
+       (``/pscratch/sd/j/jackm/xd_parent``, nq = 64, n_μ = 936): the slab
+       kernel gives **3.218e-01** against a 5e-6 tolerance — the number
+       ``PIPELINE_HEALTH.md`` punch row 23 opened with — and rebuilding the
+       same tiles with the bulk kernel instead drops it to **4.593e-02**,
+       with the remainder attributable to the deck's own
+       ``mc_average_vcoul_body = true`` mini-BZ head-slot injection, which
+       this module does not model either.  Neither number is evidence about
+       the interpolation: ``makeVq_vs_disk`` is an ON-GRID check of the
+       stored ζ against the stored tiles and runs before any fit.
+
+    2. **The long-range model's channels only exist on a slab.**  Stage 2
+       fits ``M_μ(K_x, K_y)`` once per ``|G_z|`` channel.  That is exact only
+       when ``K_z`` is CONSTANT within a channel, which needs ``b3 ∥ z``,
+       ``b1, b2 ⊥ z`` AND ``q_z = 0`` on the coarse grid — then
+       ``K_z = G_z·|b3|`` identically.  On an fcc cell neither holds:
+       ``si_bse_debug``'s ``b3 = 0.6123·(1, −1, 1)`` has in-plane components
+       of exactly its own length, so ``run_gates``' ``slab_axes_offdiag``
+       reads **1.000e+00** — not a small number that might be tightened away,
+       but the ratio a cubic reciprocal lattice takes by construction.  The
+       in-plane polynomial would be fitting a ``K_z`` it cannot see.
+
+    So a bulk deck is not a tuning problem, and no change to the fit reaches
+    it.  ``--vq-mode ongrid`` (exact at every Q on the BSE grid) and
+    ``--vq-mode refit`` (the per-Q ζ refit) are the modes that serve one.
+
+    ``policy`` is :func:`file_io.read_coulomb_policy_from_h5`'s dict, or
+    ``None`` for a restart written before the stamp; an unstamped file is
+    judged on geometry alone, which is the safe direction — condition 2 is
+    the one that cannot be worked around, and it needs no stamp to see.
+    """
+    out = []
+    bvec = np.asarray(bvec, dtype=np.float64)
+    sys_dim = (policy or {}).get("sys_dim", "")
+    if str(sys_dim).strip() not in ("", "2"):
+        out.append(
+            f"the restart's Coulomb-policy stamp says sys_dim={sys_dim}, but "
+            f"this module builds every v(q+G) with the 2-D Ismail-Beigi slab "
+            f"truncation (v_slab_on_set) and has no other kernel; the stored "
+            f"V_qmunu was built with the sys_dim={sys_dim} kernel, so the two "
+            f"are different operators")
+    # ``b3_z`` is the denominator of ``run_gates``' ``slab_axes_offdiag`` AND
+    # of the truncation length ``z_c = π/b3_z``; a cell with no z-projection
+    # on b3 at all has neither, so it is named rather than divided by.
+    b3z = abs(float(bvec[2, 2]))
+    if b3z <= 1e-12 * float(np.max(np.abs(bvec))):
+        out.append(
+            f"b3 has no z-projection to speak of (|b3_z| = {b3z:.3e}), so the "
+            f"slab truncation length z_c = π/b3_z is undefined and there is no "
+            f"axis for the |G_z| channels to be channels of")
+    else:
+        offdiag = float(max(np.max(np.abs(bvec[2, :2])),
+                            np.max(np.abs(bvec[:2, 2]))) / b3z)
+        if offdiag > 1e-12:
+            out.append(
+                f"the cell's axes are not slab-separable: max|b3_xy|/|b3_z| "
+                f"and max|b1_z, b2_z|/|b3_z| reach {offdiag:.3e} "
+                f"(slab_axes_offdiag, tolerance 1e-12), so K_z is not constant "
+                f"within a |G_z| channel and the per-channel in-plane fit has "
+                f"an unmodelled variable")
+    if qfr is not None:
+        qz = float(np.max(np.abs(np.asarray(qfr, dtype=np.float64)[:, 2])))
+        if qz > 1e-12:
+            out.append(
+                f"the coarse q-grid is not planar: max|q_z| = {qz:.3e}, so "
+                f"K_z = q_z·b3_z + G_z·|b3| varies across the samples of one "
+                f"|G_z| channel even on slab-separable axes")
+    return out
+
+
+def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
+    """Refuse an out-of-scope deck by name.  See :func:`slab_scope_violations`.
+
+    THE ONE SITE.  ``load_zeta_coarse`` calls this before anything expensive
+    runs, so the refusal arrives instead of ``build_cq`` + a gate battery
+    whose numbers are consequences rather than causes.
+    """
+    why = slab_scope_violations(bvec, qfr=qfr, policy=policy)
+    if not why:
+        return
+    where = f" ({source})" if source else ""
+    raise ValueError(
+        "vq_interp is a SLAB model and this deck is not a slab" + where
+        + ".  " + "  ".join(f"({i + 1}) {w}." for i, w in enumerate(why))
+        + "  None of these is a tuning problem and no change to the long-range "
+          "fit reaches them; use `--vq-mode ongrid` (exact at every Q on the "
+          "BSE grid) or `--vq-mode refit` (the per-Q zeta refit) on this deck. "
+          " "
+          "See the module docstring's SCOPE note and PIPELINE_HEALTH.md punch "
+          "row 23, which is this refusal's measured history.")
 
 
 # ===========================================================================
@@ -482,6 +611,18 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     zx["nv"] = int(ifmax.ravel()[0])
     assert np.all(ifmax == zx["nv"]), "ifmax not uniform over k"
     _fix_sphere_wrap(zx)
+    # SCOPE, before anything expensive.  The stamp is scalar metadata read
+    # with serial h5py (safe on every rank, no SlabIO handle), and it is the
+    # deck's own record of which Coulomb kernel built ``V_qmunu`` — the one
+    # fact this module cannot derive from geometry.  NOT re-announced here:
+    # ``bse_io`` already prints ``describe_coulomb_policy_stamp`` once per
+    # driver run, and the row-23 log shows that line sitting one screen above
+    # the gate failures it explained.  The stamp was never missing; nothing
+    # READ it.  So the fix is a refusal that quotes it, not a second copy.
+    from file_io import read_coulomb_policy_from_h5
+    assert_slab_scope(zx["bvec"], qfr=zx["qfr"],
+                      policy=read_coulomb_policy_from_h5(restart_file),
+                      source=restart_file)
     return zx
 
 
@@ -831,7 +972,17 @@ def run_gates(zx, C_q):
         log(f"vSR+vLR==v_q{q}",
             float(np.max(np.abs(vs[:n] + vl[:n] - v[:n]))
                   / max(np.max(np.abs(v[:n])), 1e-300)), 1e-13)
-    # slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane)
+    # Slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane).
+    # BELT AND BRACES SINCE 2026-08-10, not the guard: ``load_zeta_coarse``
+    # refuses a non-slab cell outright (:func:`assert_slab_scope`), naming
+    # this ratio and the two other conditions, so on any deck that reaches
+    # here the line below reads 0.000e+00.  It stays because a battery that
+    # prints every quantity it depends on is how the row-23 attribution was
+    # possible at all — and because deleting a gate is how the next one goes
+    # unwatched.  Do NOT read a FAIL here as an interpolation defect: it is
+    # cell geometry, and so is the ``makeVq_vs_disk`` residual that
+    # accompanies it on a bulk deck (both measured in
+    # :func:`slab_scope_violations`).
     bv = zx["bvec"]
     log("slab_axes_offdiag", float(max(np.max(np.abs(bv[2, :2])),
                                        np.max(np.abs(bv[:2, 2])))
@@ -842,6 +993,95 @@ def run_gates(zx, C_q):
 # ===========================================================================
 # STAGE 1 — offline preparation at the coarse grid points
 # ===========================================================================
+def lr_fit_degrees(zx, *, e_cut=None, shell_floor=FIT_SHELL_FLOOR):
+    """THE CRITERION: which ``|G_z|`` channels the long-range model fits, and
+    at what in-plane polynomial degree.  Returns ``{|G_z|: degree}``.  This is
+    the ONE site that decides the fitted channel set; everything else
+    (:func:`lr_gset`'s trim, :func:`lr_design_blocks`, the mini-BZ head-slot
+    guard) reads the dict this returns, so they cannot drift apart.
+
+        fit channel n  iff  (n·|b₃|)² ≤ E_eff,
+        E_eff = max(e_cut, (shell_floor·|b₃|)²·(1 + FIT_FLOOR_MARGIN))
+
+    **An energy cutoff, with a hard two-shell floor.**  That shape is the
+    owner's ruling of 2026-08-10 — ``docs/architecture/decisions.md``, "The
+    long-range channel criterion is an energy cutoff with a two-shell floor",
+    which is the entry to cite; this docstring does not mint it — and both
+    halves of it are load-bearing.
+
+    *Why an energy cutoff.*  What this replaces was a hardcoded ``|G_z| ≤ 3``
+    read off ``DEG_B26P``'s keys — a fixed shell COUNT spanning a
+    cell-dependent energy window.  ``|b₃| = 2π/c`` shrinks as a slab's vacuum
+    padding grows, so three shells cover 0.69 Ry on the MoS2 reference cell but
+    only 0.077 Ry once the vacuum is tripled, while the LR superset's own
+    (isotropic, 6.63 Ry) cutoff keeps widening.  Stage 1 subtracts the
+    FULL-sphere ``V_LR`` and stage 3 adds back only the FITTED channels, so
+    every unfitted channel is weight that is subtracted and never returned:
+    measured **17.93 % of the long-range weight lost at 3× vacuum**, silently,
+    because ``run_nulls`` tests the sampled ``Fch`` rather than the fitted
+    model.  Tying the shell count to an ENERGY makes it follow ``1/|b₃|``
+    instead of standing still, which is what closes that gap.
+
+    *Why the floor, in the owner's own terms.*  The requirement is that the fit
+    "reliably capture the first at least 2 G shells, because we need to capture
+    G=0, which rolls by an umklapp vector at BZ boundaries."  The head slot is
+    ``G* = argmin_G |Q+G|``, and at a zone boundary that argmin is NOT ``G=0``:
+    it rolls onto a neighbouring reciprocal-lattice vector.  Past the boundary
+    along z (``q_z = 0.6``) the argmin lands on ``G = [0,0,-1]``, i.e. the
+    ``|G_z| = 1`` channel.  A criterion that captured only the literal first
+    shell would leave that channel unfitted, its form factor identically zero,
+    and the head magnitude would be multiplied by zero and dropped in silence.
+    The floor is what makes the criterion incapable of that, whatever ``e_cut``
+    or whatever cell it is handed.
+
+    Two shells rather than one is also what the bulk control demands, and the
+    two constraints agree: on Si (``|b₃| = 1.06``, where a 1 Ry cutoff alone
+    would keep only ``|G_z| = 0``) the LR weight lost is **48.4 % at a
+    zero-shell floor, 1.37 % at one shell, and 0.000 % at two** — two shells is
+    the smallest floor that leaves a bulk cell bit-identical to today, and a
+    third shell buys nothing there because the superset itself stops at
+    ``|G_z| = 2``.  ``FIT_FLOOR_MARGIN`` only lifts the comparison off exact
+    floating-point equality at ``|n| = shell_floor``.
+
+    Worth knowing which half is carrying the guarantee where: on a THICK SLAB
+    ``|b₃|`` is small, so the cutoff alone already reaches well past the rolled
+    channel and the floor never binds.  It is on BULK and thin cells — large
+    ``|b₃|``, few shells inside any reasonable energy — that the cutoff would
+    strand the roll and the floor is the whole of the protection.  The floor
+    costs nothing where it does not bind, which is why it is unconditional
+    rather than a regime test.
+
+    *The default, and why it is 1.0 Ry and not the 0.5 Ry sketch.*  The default
+    has to sit in ``[0.691, 1.229) Ry`` to reproduce today's channel set
+    exactly on the MoS2 reference deck — those bounds are ``(3|b₃|)²`` and
+    ``(4|b₃|)²`` there — and it has to hold the 3×-vacuum loss under 1 %.
+    **0.5 Ry fails both**: it drops the ``|G_z| = 3`` channel on the reference
+    deck (161 → 115 columns, and the reference deck's own loss RISES 0.24 % →
+    1.90 %), and it still leaves 2.04 % lost at 3× vacuum.  ``E_CUT_FIT = 1.0``
+    is a round value mid-window, bit-identical on both reference decks, and
+    measured (7×7 in-plane q sample, the metric of FIX_vq_interp.md §B.3):
+
+        cell              fitted   nG    LR weight lost
+        Si bulk           ≤2       123   0.000 %  (floor-dominated; today 0.00 %)
+        MoS2 reference    ≤3       161   0.240 %  (today 0.24 % — identical set)
+        MoS2 vacuum ×1.5  ≤5       253   0.189 %  (today 2.61 %)
+        MoS2 vacuum ×2    ≤7       345   0.164 %  (today 7.17 %)
+        MoS2 vacuum ×3    ≤10      483   0.290 %  (today 17.93 %)
+
+    The extra channels enter at degree 0 — one complex coefficient each — so
+    stage 2's solve is unchanged in practice; the cost is nG in the stage-3
+    GEMM and in the host ``Fch`` block, and it is paid only in the regime that
+    needs it (nothing on Si, nothing on the reference slab).
+    """
+    e_cut = E_CUT_FIT if e_cut is None else float(e_cut)
+    if not e_cut > 0.0:
+        raise ValueError(f"vq_interp fit cutoff must be positive, got {e_cut}")
+    b3 = float(np.linalg.norm(np.asarray(zx["bvec"], dtype=np.float64)[2]))
+    e_eff = max(e_cut, (int(shell_floor) * b3) ** 2 * (1.0 + FIT_FLOOR_MARGIN))
+    nmax = int(np.floor(np.sqrt(e_eff) / b3))
+    return {n: DEG_B26P.get(n, 0) for n in range(nmax + 1)}
+
+
 def lr_gset(zx, alpha=ALPHA, degrees=None):
     """Fixed global Miller superset of the LR channel: all G with
     min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR), minimised over a 13×13
@@ -912,7 +1152,7 @@ def lr_gset(zx, alpha=ALPHA, degrees=None):
             m = np.minimum(m, np.sum(K * K, axis=0))
     keep = m <= K2max
     if os.environ.get("LORRAX_VQ_LR_GZ_TRIM", "0") == "1":
-        deg = DEG_B26P if degrees is None else degrees
+        deg = lr_fit_degrees(zx) if degrees is None else degrees
         keep = keep & np.isin(np.abs(Gall[2]),
                               np.asarray(sorted({abs(int(g)) for g in deg})))
     return np.ascontiguousarray(Gall[:, keep])
@@ -952,7 +1192,8 @@ def _to_host(x):
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48,
-                   keep_host_mirrors: bool = True, degrees=None):
+                   keep_host_mirrors: bool = True, degrees=None,
+                   fit_ecut=None):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
       S        (nq, n_μ, n_μ)  Tikhonov cleaning operators S_q (host copy,
                                nulls only) — ``None`` without host mirrors
@@ -1012,7 +1253,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
     # ``degrees`` reaches the superset builder as well as the fit, so the two
     # cannot disagree about which G_z channels exist (see lr_gset's G_z trim).
-    degrees = DEG_B26P if degrees is None else degrees
+    degrees = lr_fit_degrees(zx, e_cut=fit_ecut) if degrees is None else degrees
     GS = lr_gset(zx, alpha, degrees=degrees)
     nG = GS.shape[1]
     # q-batched layout: every device owns whole matrices for its own q.  That
@@ -1177,6 +1418,11 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             # refuses a wider request against it (silent-narrowing guard)
             "lr_gz_degrees": (degrees if os.environ.get(
                 "LORRAX_VQ_LR_GZ_TRIM", "0") == "1" else None),
+            # THE fitted channel set (:func:`lr_fit_degrees`), always present.
+            # Every consumer of "which |G_z| does the model fit?" reads this —
+            # the fit itself and the mini-BZ head-slot guard — so the criterion
+            # is applied once, here, and never re-derived downstream.
+            "fit_degrees": dict(degrees),
             "gz_cols": {int(g): np.where(GS[2] == g)[0]
                         for g in np.unique(GS[2])}}
 
@@ -1206,7 +1452,8 @@ def lr_design_blocks(zx, prep, degrees=None):
     ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
     honest (target's samples excluded) at O(nb²) cost."""
     if degrees is None:
-        degrees = prep.get("lr_gz_degrees") or DEG_B26P
+        degrees = (prep.get("lr_gz_degrees") or prep.get("fit_degrees")
+                   or DEG_B26P)
     # SILENT-NARROWING GUARD.  When ``prepare_coarse`` trimmed the superset to
     # a degrees dict, asking here for a WIDER one would not raise anywhere: the
     # loop below iterates ``prep['gz_cols']``, so a channel the superset no
@@ -1369,16 +1616,37 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, hi):
 
 
 def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
-                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None):
+                    qmc_reps=10, n_coarse=250_000, seed_offset=0, kgrid=None,
+                    moment=False):
     """RANK-PARALLEL mini-BZ CELL AVERAGE of the LR-slab head at target Q.
 
-    Returns ``(gstar, head_val)``:
+    Returns ``(gstar, head_val)``, or ``(gstar, head_val, M_ab)`` when
+    ``moment=True``:
 
       ``gstar``    = ``argmin_G |Q+G|²`` over the stored Miller superset
                      ``prep['GS']`` — the umklapp bringing Q nearest Γ.
       ``head_val`` = ``<v_LR(Q+G*)>_mBZ / celvol`` (real), in the SAME units
                      as ``eval_vq``'s stored ``v[gstar]`` point value, so the
                      evaluator injects it by a straight slot replacement.
+      ``M_ab``     = ``<v_LR(q) q_a q_b>_mBZ / celvol`` (real symmetric 3x3,
+                     ``moment=True`` only), on the SAME kept samples and with
+                     ``q = Q+G*+δq`` the full Cartesian momentum.
+
+    THE SCALAR IS THE WRONG MOMENT, AND ``M_ab`` IS THE RIGHT ONE.  The head
+    the exchange kernel actually wants averaged is ``v(q)·|q·d|²``, not
+    ``v(q)`` — the pair amplitude vanishes linearly at Γ and its square is
+    what tames the pole.  Averaging ``v`` alone and evaluating the amplitude
+    at the cell CENTRE keeps one direction out of the cell's whole
+    distribution and weights the radius at the sample instead of by ``v``;
+    the two errors are independent, one angular and one radial, so neither
+    is fixable alone (``LT_HEAD_PROBLEM.md`` §2.2).  Because the dipole is a
+    property of the transition and not of the integration variable, the true
+    average factorises exactly onto ``conj(d_a) M_ab d_b``.  ``M_ab``
+    therefore cannot be injected through ``eval_vq`` — that seam is a scalar
+    under a square root — and is consumed instead as a rank-three term over
+    the transition index (``bse_stack_matvec``'s ``head_tensor``).  The
+    scalar return is kept because the pre-tensor arm is the object under
+    repair and its baseline must not move.
 
     2D slab: pure in-plane adaptive MC (the head is a ``|Q|`` cusp, not a
     ``1/q²`` pole — no analytic sphere, BGW ``minibzaverage_2d``).  Only the
@@ -1414,7 +1682,10 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
     ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
     exchange head is the (smaller) fine mini-BZ average, not the coarse one
-    (the head magnitude scales with the mini-BZ cell area).  Default None uses
+    (the head magnitude scales with the mini-BZ cell area).  That init reaches
+    this function only on the ``head_minibz_average`` OPT-IN arm; with the key
+    off (the default) it carries the coarse q=0 tile through untouched and
+    never calls here (bse_io._interpolate_bse_data_to_grid).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
     # Replumbed 2026-08-07: these are pure service symbols; the door is
@@ -1441,12 +1712,20 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     # factor and drop it silently.  For a q_z=0 slab the argmin is always a
     # G_z=0 slot, so this cannot fire in scope; it fires if the caller leaves
     # that scope.  (Nothing checked this before.)
-    if int(abs(GS[2, gstar])) not in DEG_B26P:
+    # THE UMKLAPP CONSTRAINT (owner ruling 2026-08-10, docs/architecture/
+    # decisions.md).  ``gstar`` is the head slot, and at a BZ boundary it is
+    # NOT G=0 — it rolls onto a neighbouring reciprocal-lattice vector, which
+    # is exactly why :func:`lr_fit_degrees` carries a hard two-shell floor.
+    # The check now reads the criterion's own resolved set rather than
+    # ``DEG_B26P``'s keys, so widening the criterion widens the guard with it.
+    _fitdeg = prep.get("fit_degrees") or DEG_B26P
+    if int(abs(GS[2, gstar])) not in _fitdeg:
         raise ValueError(
             f"mini-BZ head slot G*={GS[:, gstar].astype(int).tolist()} is in "
             f"the |G_z|={int(abs(GS[2, gstar]))} channel, which the b26p model "
-            f"does not fit (DEG_B26P={sorted(DEG_B26P)}).  Its form factor is "
-            f"model-zero, so the head magnitude would be silently dropped.  "
+            f"does not fit (fitted channels={sorted(_fitdeg)}).  Its form "
+            f"factor is model-zero, so the head magnitude would be silently "
+            f"dropped.  "
             f"Target Q={Qf.tolist()} is outside the slab pipeline's q_z=0 "
             f"scope.")
     shift_cart = K[:, gstar]                               # cartesian Q+G*
@@ -1478,19 +1757,32 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
                                    alpha=alpha, zc=float(np.pi / bvec[2, 2]))
         local_sum = float(np.sum(v))
         local_cnt = float(v.shape[0])
+        if moment:
+            K = shift_cart[None, :] + dq                     # (N, 3) momentum
+            local_mom = (K * v[:, None]).T @ K               # (3, 3)
+        else:
+            local_mom = np.zeros((3, 3))
     else:
         local_sum = local_cnt = 0.0
+        local_mom = np.zeros((3, 3))
 
     if nranks > 1:
         from jax.experimental import multihost_utils
-        g = np.asarray(multihost_utils.process_allgather(
-            np.asarray([local_sum, local_cnt], dtype=np.float64),
-            tiled=False))
+        payload = np.concatenate(
+            [np.asarray([local_sum, local_cnt], dtype=np.float64),
+             local_mom.reshape(-1)]) if moment else \
+            np.asarray([local_sum, local_cnt], dtype=np.float64)
+        g = np.asarray(multihost_utils.process_allgather(payload, tiled=False))
         tot_sum = float(g[:, 0].sum())
         tot_cnt = float(g[:, 1].sum())
+        tot_mom = g[:, 2:].sum(axis=0).reshape(3, 3) if moment \
+            else np.zeros((3, 3))
     else:
         tot_sum, tot_cnt = local_sum, local_cnt
+        tot_mom = local_mom
     head_bare = tot_sum / tot_cnt                            # mean over kept
+    if moment:
+        return gstar, head_bare / celvol, (tot_mom / tot_cnt) / celvol
     return gstar, head_bare / celvol
 
 
@@ -1616,15 +1908,16 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
 def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
                        *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
-                       run_diagnostics=True, log_fn=print):
+                       run_diagnostics=True, log_fn=print, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
     This is the SINGLE orchestration of the ``vq_interp`` pipeline
     (``load_zeta_coarse`` → ``build_cq`` → gates → ``prepare_coarse`` →
     ``lr_design_blocks`` → ``fit_lr_model`` → nulls → ``make_eval_vq`` +
     stencil pieces).  BOTH the ``exciton_bands`` Q-path driver and the general
-    BSE init's ``bse_k_grid`` coarse→fine densification call this — there is no
-    second copy of the setup sequence.
+    BSE init's ``bse_k_grid`` coarse→fine densification (on its
+    ``head_minibz_average`` opt-in arm only) call this — there is no second
+    copy of the setup sequence.
 
     Returns a ``SimpleNamespace`` with every handle the per-Q evaluation needs:
         .zx, .prep, .des, .coeffs        the fitted coarse-side model
@@ -1658,7 +1951,8 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # The host mirrors exist for run_nulls / eval_vq_host only — same switch.
     prep = prepare_coarse(zx, C_q, mesh_xy, alpha=alpha, eps_tik=eps_tik,
                           eigh_backend=eigh_backend,
-                          keep_host_mirrors=run_diagnostics)
+                          keep_host_mirrors=run_diagnostics,
+                          fit_ecut=fit_ecut)
     des = lr_design_blocks(zx, prep)
     coeffs = fit_lr_model(des)
     if run_diagnostics:

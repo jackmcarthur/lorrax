@@ -1,0 +1,529 @@
+# The downfold driver
+
+## What it is for
+
+You run a GW calculation once, with hundreds of bands and a large ISDF
+centroid set, because that is what Σ needs. Then you want to do exciton bands
+and BSE work, and the BSE only ever looks at a few dozen bands around the gap.
+Carrying the full centroid basis into that work is paying Σ's price for the
+BSE's problem, over and over, every time you change a BSE parameter.
+
+The downfold is the step in between. It reads the large calculation's restart
+bundle, chooses a small centroid set against the bands you actually intend to
+consume, redefines the wavefunction-at-centroid coefficients on that smaller
+set, and writes a restart bundle **in the same format at the smaller size**.
+That last point is the whole design: the small bundle is a restart bundle like
+any other, so `bse.bse_jax` reads it with no code change, no flag and no
+knowledge that a downfold happened. You point that driver at a different
+directory and everything else is as it was.
+
+`bse.exciton_bands` reads one too, as of 2026-08-10. It used not to, in three
+separate ways, and the reason is worth stating because it explains what the
+downfold now writes: `bse_jax` only *reads* the stored tensors, while the
+exciton driver *rebuilds* objects in the same ISDF basis — ψ at finite Q, and
+the exchange tile off the grid — and rebuilding needs two things that reading
+does not.
+
+The first is the parent's centroid coordinates. The htransform leg fits ψ
+against a coordinate table, and that Galerkin fit needs a basis spanning
+`nk·nb` — 1280 on the silicon deck measured here — which is a completely
+different sizing criterion from the retained window's pair-density rank that
+μ_S = 189 was chosen against. So the fit runs in the **parent** basis and its
+output is sliced to the kept rows afterwards, which is exact because the small
+basis's ψ-at-centroids is that same column slice by definition (see `mode`
+below). The downfold therefore writes the parent's table out beside the small
+bundle, taken from the parent's own `zeta_q.h5` header and content-verified
+against the bundle's `centroids_charge_md5`, and records its path in
+`downfold_provenance`. μ_S buys the (μ, μ) tensors and the BSE matvec; it does
+not and cannot buy the interpolation fit.
+
+The second is ζ. Off-grid exchange interpolates a stored `zeta_q.h5`, and the
+parent's is the wrong basis, so the downfold transports it:
+`ζ_S = conj(T) ζ_L`, the same map the head vector `g0` takes, applied at every
+G rather than only at G = 0. Substituting it into `V = ζ† v ζ` gives back
+`V_S = T V_L T†` exactly — the congruence the bundle already stores — so the
+two descriptions of one interaction cannot drift apart, and the writer
+cross-checks its q = 0, G = 0 column against the independently transported
+`g0_S` on every run.
+
+!!! note "One case where ζ is not transported"
+    A parent whose ζ was written on the q-IBZ wedge cannot be transported: `T`
+    is indexed by the restart's flat-q axis and mapping the two is the deferred
+    IBZ-ζ unfold. The run says so and the small bundle carries no ζ. Nothing is
+    lost relative to the parent — `vq_interp` refuses an IBZ ζ outright, so
+    `--vq-mode interp` was never available on that lineage — and
+    `--vq-mode ongrid` needs no ζ at all and is exact at every Q on the BSE
+    grid. Re-fit the parent under `LORRAX_FORCE_FULL_BZ=1` if you want the
+    off-grid path.
+
+What the drop-in does **not** fix is how large μ_S has to be. Measured on the
+silicon deck below, the downfolded exciton bands at Q = 0 come out at 0.2579 eV
+for μ_S = 189 and 1.2605 eV for μ_S = 624 against the parent's 2.3451 eV — the
+same μ_S convergence curve `bse.bse_jax` shows on the same bundles, to six
+figures. The driver now runs and reports the bundle it was given faithfully;
+sizing the bundle is still the user's problem and is what the `mu_small`
+section below is about.
+
+Measured on silicon with a 960-centroid parent and a 20-band retained window:
+191 centroids out, a five-fold reduction in μ and a twenty-five-fold one in the
+storage of every (μ, μ) tensor, with the lowest twenty exciton eigenvalues
+drifting 37.4 meV MAE. **How much you can compress depends entirely on whether the
+parent basis was over-complete for your window**: the same deck's shipped
+480-centroid set has no redundancy on a 20-band window at all, and downfolding
+it destroys the spectrum rather than compressing it. The driver tells you which
+situation you are in — that is what the refusal and the error bar below are
+for — but it cannot create redundancy that the parent does not have.
+
+The measurement behind that paragraph is `DOWNFOLD_S1.md` §3(c), which is a
+**campaign report and is not in this repository** — it lives with the rest of the
+2026-08-08 BSE campaign artifacts. Nothing on this page depends on reading it, and
+where a number from it is quoted here it is quoted in full, but do not go looking
+for the file in a checkout.
+
+Nowhere does this tree tell you how to *build* an over-complete parent, and that
+gap is worth naming because it is the first thing a reader of this page needs.
+The guidance in [drivers.md](drivers.md) is "run the GW stage at a generous μ_L",
+with no number and no invocation, and the one concrete figure anywhere — the
+960-centroid parent above — is reported as a measurement rather than as a recipe.
+For orientation, the parent used for the 2026-08-10 measurements on this page was
+built with `python3 -m centroid.kmeans_cli 900 --seed 42 --prune-n-val 8
+--prune-n-cond 52` on the `si_bse_debug` WFN, which in orbit mode delivered 936
+points; that produced a window rank of 189, and, as the `mu_small` section below
+records, was still not enough for a usable BSE spectrum after compression. Sizing
+a parent for a downfold is unsettled work, not a documented procedure.
+
+Two numbers put that 37.4 meV in proportion, and it is worth holding both
+before you choose a cut. The first is the floor of the machinery rather than of
+the compression: a downfold that keeps every centroid over the full band window
+reproduces the parent's own lowest twenty excitons to **0.010 meV** MAE, end to
+end through an unmodified BSE driver. That is round-off through a pseudo-inverse
+and nothing else, so none of the Gram, the selection, the solve, the congruence
+or the writer is costing you anything measurable; the whole of that 37.4 meV is
+what a five-fold cut in μ_S bought. The second number is the bar it has to
+clear. Production BSE work wants better than 1 meV, and it is only
+full-frequency, MPA-class studies that have any business tolerating something
+like 10 meV. So read the aggressive demo as a demonstration of the mechanism
+rather than as a recommended setting: choose μ_S for the accuracy target and
+confirm the choice in the observable. That is the same rule `downfold_rcond`
+and `eps_W` are both held to further down this page, and for these three
+questions it is the only admissible evidence there is.
+
+```
+python3 -m gw.downfold_cli -i downfold.in
+```
+
+## It takes its own input file
+
+The downfold is not a GW run and it does not read a GW deck. It reads a
+finished calculation off disk, so the only things it needs to be told are where
+that calculation is, which bands must stay faithful, how small the answer
+should be, how much round-off amplification you authorise, and where to put the
+result. That is six facts. A GW deck carries a hundred and forty, and pointing
+this driver at one would make every one of them look like an input to a
+compression that none of them bears on. Handing it a `[cohsex]` section is
+refused by name.
+
+The format is the same INI-ish text every LORRAX deck uses — one section
+header, `key = value` lines, `#` comments — so if you can read a GW deck you can
+read this one. Unlike a GW deck, an unrecognised key is **refused rather than
+ignored**: this schema has no decade of history to protect, and a misspelt
+`downfold_rcond` that silently keeps its default is exactly the class of quiet
+wrong answer the rest of this work exists to prevent.
+
+A complete input file for the silicon fixture:
+
+```ini
+# Downfold the si_bse_debug GW run onto the directions a 20-band window holds.
+[downfold]
+
+source_restart = /path/to/the/gw/run
+output_restart = /path/to/the/small/bundle
+
+band_range_left  = 0:20
+band_range_right = 0:20
+
+# An EXPLICIT integer, and the number you sweep.  189 is this deck's measured
+# rank ceiling at the rcond below — it is also the value that came out 2.09 eV
+# wrong on the observable (see `mu_small`), so treat it as where a sweep starts.
+# Write the number in the deck rather than hiding it behind `auto`, and check
+# the result against the parent before you use it.
+mu_small       = 189
+downfold_rcond = 1.1e-6
+```
+
+The one thing this file will not do for you is choose that number. `mu_small`
+is a physics choice, the driver has no accuracy instrument to make it with, and
+the section below is about how to make it and how to check that you were right.
+
+`python3 -m gw.downfold_cli --print-schema` lists every key with its default.
+
+## Input reference
+
+### `source_restart` — required, no default
+
+The finished GW calculation to compress. Either the run directory, in which
+case the driver looks for `tmp/isdf_tensors_*.h5` inside it, or that `.h5` file
+directly.
+
+Restart bundles are named by centroid count rather than by run, so a directory
+can legitimately hold several. The BSE driver resolves that ambiguity by taking
+the newest and printing a loud warning, which is the right call for a driver
+whose input file already named the run. This driver **refuses** instead, on the
+grounds that it is the tool most likely to create the ambiguity in the first
+place: its entire job is to put a second bundle at a different μ somewhere
+nearby. If there is more than one, name the file.
+
+Relative paths resolve against the directory holding the input file, so a
+downfold deck sitting beside the GW run can say `source_restart = .`.
+
+### `output_restart` — required, no default
+
+A **directory**. The driver creates `<dir>/tmp/isdf_tensors_<μ_S>.h5` inside
+it, which is the layout every BSE consumer already looks for. It may not be the
+same directory as the source, for the reason just given.
+
+### `band_range_left`, `band_range_right` — or `n_val`, `n_cond`
+
+The retained band window, and the most important key in the file.
+
+This is what the compression is faithful **to**. The small basis is selected
+against this window and the transfer solve preserves the observable on this
+window; bands outside it are not represented and were never meant to be. A
+basis selected against one window and consumed on another is a measured
+failure, not a hypothetical one: a GW run at `nband = 1024` whose centroids had
+been pruned against a 26 × 52 window produced a quasiparticle gap of 0.36 eV
+where the answer is around 3.1 to 3.7 eV, with a negative `eqp1`, and it passed
+every gate in the suite. Rebuilding at identical everything and changing only
+the prune window moved the answer from 0.3645 to 3.1350 to 3.7227 eV, monotone
+in window width. A downfold is that same operation performed deliberately, and
+this key is where the deliberation is written down.
+
+Two spellings, and exactly one of them may appear:
+
+- `band_range_left = lo:hi` and `band_range_right = lo:hi` — half-open,
+  **absolute** band indices into the bundle's `psi_full_y` and `enk_full`,
+  counting from zero. `0:20` means bands 0 through 19.
+- `n_val = N` and `n_cond = M` — the valence/conduction shorthand, meaning
+  `left = (0, N)` and `right = (N, N+M)`.
+
+The two ranges are the two legs of the pair density ρ_mn = ψ*_m ψ_n. For BSE
+work they should be **equal**: the BSE's direct and exchange kernels both
+contract ψ legs that lie inside the retained window, so a symmetric fit covers
+them exactly.
+
+An **asymmetric** window (the retained bands on one leg, all bands on the
+other) is what Σ would need, because Σ's internal band sum runs over the full
+window while its outer projection does not. The driver accepts it, and says
+loudly that no end-to-end Σ gate has been run on it. Measured cost, if you want
+it: about a factor of two in μ_S, not the order of magnitude that was feared.
+
+There is no default. This is a physics choice and the driver cannot guess it.
+
+### `mu_small` — required, no default
+
+How many centroids the small basis should have, or the word `auto`.
+
+**The recommendation is an explicit integer, validated against the parent by
+comparing the observable.** This page used to recommend `auto`, and that
+recommendation is withdrawn: it produced a 2.087 eV error in the lowest BSE
+eigenvalue on the standard silicon walk, with nothing refusing anywhere. Write
+the number in the deck, and then check it — the check is *How to validate a
+μ_S* below, and it is one command.
+
+The recommendation carries a precondition, and it is the same one this page's
+opening section states: **the parent basis has to be over-complete for your
+retained window**, or there is no redundancy to compress and every μ_S you can
+legally ask for is too small. The driver cannot create redundancy the parent
+does not have, it does not measure whether the parent has any, and nothing in
+this tree tells you how to build a parent that does — that gap is named at the
+top of this page and it is still open. A downfold of a parent that was merely
+adequate for its window is not a compression; it is a truncation with a
+compression's reporting.
+
+`auto` means "as many as the retained window has independent pair-density
+directions at `downfold_rcond`" — the eigenvalue-rank **ceiling**, and the
+largest value the driver will accept. It is sized by rank. It is not sized by
+accuracy, it consults no observable, and it is not a safe default. Since
+2026-08-10 it prints a loud warning at selection time and again in the
+end-of-run summary saying exactly that, and the run still proceeds, because
+`auto` is an explicit choice and this driver does not overrule explicit
+choices. Use it to *learn the ceiling* — the largest basis this parent can
+support — and then sweep downward from it against the observable.
+
+!!! danger "`auto` is a ceiling, not a recommendation, and it silently produced a 2.1 eV error"
+    Measured 2026-08-10, following this page's own guidance end to end. A silicon
+    4×4×4 parent was built at 936 centroids, downfolded on a `0:20` window at
+    `mu_small = auto` (→ 189) and `downfold_rcond = 1.1e-6`, and the lowest BSE
+    eigenvalue compared against the same parent solved at identical settings:
+
+    | bundle | μ | worst-q `eps_W` | lowest BSE eigenvalue |
+    |---|---|---|---|
+    | parent | 936 | — | **2.3449 eV** |
+    | `rcond = 1.1e-6`, `auto` | 189 | 1.33e-2 | **0.2579 eV** (−2.09 eV) |
+    | `rcond = 1e-8`, `auto` | 624 | 3.26e-3 | **1.2605 eV** (−1.08 eV) |
+
+    Nothing refused. `eps_W` reported about one per cent and the bundle was
+    written, which is the tripwire behaving exactly as the section below
+    describes it — and is also why that section's warning deserves to be read as
+    a hard limit on what `eps_W` can tell you rather than as a caveat. The error
+    does fall as μ_S rises, so this is a sizing problem and not a defect in the
+    transfer solve; but it falls slowly, and at μ_S = 624 — a compression of
+    only 1.5× — the spectrum was still wrong by an eV.
+
+    The honest reading is that on this deck the `auto` ceiling and the accuracy
+    a BSE needs did not overlap anywhere, and that `auto` is where a sweep
+    starts rather than where it ends. Size μ_S by sweeping it against the
+    observable, exactly as the `downfold_rcond` section below insists, and treat
+    a downfold whose observable has not been checked against its parent as
+    unvalidated.
+
+#### How to validate a μ_S — the one command
+
+Solve the same BSE twice, once on the parent and once on the small bundle, with
+the same deck and identical flags, and compare the lowest eigenvalue against
+your accuracy bar. Production BSE work wants better than 1 meV; only
+full-frequency, MPA-class studies have any business tolerating something like
+10 meV. The driver prints this line at the end of every run with that run's own
+paths substituted in, so you do not have to reconstruct it:
+
+```bash
+for d in /path/to/the/gw/run /path/to/the/small/bundle; do (cd "$d" && python3 -u -m bse.bse_jax -i cohsex.in --n-val 4 --n-cond 4 --lanczos 2>&1 | tail -40); done
+```
+
+Both directories need the same BSE deck, and every flag has to match on both
+legs or the comparison is measuring something else. The band counts above are
+the example's, not a recommendation: under the default `--band-degeneracy
+strict` a deck that cuts a multiplet is refused, and the refusal names the
+counts that work — use those, on both legs. If the two lowest
+eigenvalues do not agree to your bar, the compression is too aggressive for
+this parent: raise μ_S, widen the window, or build a parent that is genuinely
+over-complete for it. `eps_W` does not answer this question — see the tripwire
+paragraph at the end of this page for the three measured cases where it read
+about one per cent beside errors of 37 meV, 1.7 eV and 2.09 eV.
+
+There is no target-accuracy mode in this driver today. The planned one — you
+state a meV bar and the driver sizes μ_S by sweeping it against the parent
+observable — is the stage-4 target-accuracy item on the downfold roadmap and is
+not built. Until it lands, the sweep above is manual, and it is the only
+accuracy evidence there is.
+
+**The driver refuses when you ask for more directions than the window
+contains**, and prints the number it measured. That refusal is not a failure
+mode; it is the point of the exercise arriving early and cheaply. A 20-band
+window holds roughly 190 independent directions on both decks that have been
+measured — 196 on silicon, 185 on hexagonal boron nitride — and the numbers are
+stable to two per cent as the pool of candidate points grows by a factor of nine
+to twelve. A nominal "500-centroid small basis" on such a window is a fiction in
+which two thirds of the basis is truncated away by the very solve that consumes
+it.
+
+### `downfold_rcond` — default `1.1e-6`
+
+The relative eigenvalue threshold on the small basis's Gram: directions with
+λ ≤ `rcond` · λ_max are discarded, so the truncated pseudo-inverse amplifies
+round-off by at most 1/`rcond` **by construction**.
+
+It is a cap on amplification, **not** a gap-finder. ISDF pair-density spectra
+are smooth and have no knee, elbow or plateau to cut at, so every criterion
+phrased as "cut at the separation" is inapplicable here; `common/rank_criterion.py`
+carries the derivation and the measurements that refute the discrepancy
+principle, the L-curve and generalised cross-validation against this exact
+failure mode.
+
+The default is a measured number rather than a round one. At a 20-band window
+silicon holds 196 independent directions at 1e-6 and hBN holds 185, and both are
+real ceilings — they do not move when you add candidate points. At 1e-8 the same
+silicon window reports 693 and at 1e-10 it reports 1208, and neither of those is
+a ceiling at all: they keep climbing with the size of the pool you were willing
+to pay for. Buying μ_S = 500 on a 20-band window means keeping directions whose
+eigenvalue is 3.5e-8 of the largest, and the anchor for what that costs is a
+sweep in which retaining 41 % more rank moved a 2.2 eV gap by 5000 eV.
+
+The only admissible evidence for changing this value is **observable**
+convergence: sweep it and take the plateau in the energy, not in the spectrum.
+That sweep is later work. This default is where it starts.
+
+### `downfold_select_tol` — default: the kernel's own √ε
+
+The pivoted-Cholesky stopping tolerance, relative to the largest initial Gram
+diagonal. You will not normally set it.
+
+**It is not the same knob as `downfold_rcond`, and it does not produce the same
+rank.** Pivoted Cholesky stops on a residual Schur diagonal; the truncation
+stops on an eigenvalue; and the residual decays much more slowly than the
+spectrum. Measured on one Gram, the selection rank runs about three times the
+eigenvalue rank at the same nominal number: at 1e-6, 588 selected points of
+which about 195 carry an eigenvalue above 1e-6 of the largest. Setting both
+knobs to the same value is the most natural mistake available here, which is
+why the driver prints the two ranks side by side, labelled differently, on
+every run.
+
+`μ_small` is validated against the **eigenvalue** rank. The selection
+certificate is a necessary condition, not a sufficient one: a basis can pass the
+selection and still be two thirds rank-deficient at the solve.
+
+### `mode` — default `cur`
+
+`cur` selects the small basis as a **subset** of the parent's centroids. Both
+operands of the fit are then submatrices of a single object, no second ζ fit is
+needed anywhere, the new wavefunction-at-centroid coefficients are a literal
+column slice of the ones already on disk, and the exact-reproduction test
+becomes an algebraic identity rather than a hopeful tolerance.
+
+`refit` — a fresh narrow-window k-means and a fresh ζ fit — is **refused**, and
+refused rather than quietly demoted so that nobody reads a CUR result as a
+refit one. The measured case against it: the parent's own k-means set already
+certifies 194 of the 196 directions a 20-band window contains, so a refit would
+buy at most one per cent more rank for the price of a second ζ fit. The key
+exists so that the door stays open and so that anyone who wants it can ask for
+it by name.
+
+### `plan` — default `auto`
+
+`auto` and `local` both mean the local plan, which is what exists today: the
+linear algebra emits no block-cyclic factorisation and the result does not
+depend on the process grid. `distributed` — μ tiled over a two-dimensional
+process grid — is later work and is refused rather than demoted, because a
+block-cyclic factorisation is a different (equally valid) numerical gauge and
+silently changing gauge under an explicit request is precisely what this
+codebase's demotion doctrine forbids.
+
+### `report_residual` — default `true`
+
+Compute and print the per-q error bar. Leave it on. See below for what it is;
+its cost is two matrix multiplications at μ_L per q, the same cost class as the
+compression itself, and turning it off leaves the run with no answer to "did
+this work" that does not require a second calculation to compare against.
+
+### `residual_refuse_above` — default: report only
+
+Refuse to write the small bundle when the worst-q error bar exceeds this. Empty
+means report and always write, which is the current default because nobody has
+yet measured what a good error bar looks like on a production deck. Set it once
+you know.
+
+### `parent_centroids_file` — optional, and an override rather than a switch
+
+The parent run's centroid coordinate table. You do not normally need to set it:
+the parent's `zeta_q.h5` carries that table in its own `isdf_header`, so the
+driver takes it from there, checks it against the parent bundle's
+`centroids_charge_md5` — which hashes the FFT-index table, not the text file —
+and writes it out as
+`<output_restart>/tmp/centroids_frac_<μ_L>_parent.txt`. That is the table
+`bse.exciton_bands` fits its htransform leg in, and having it beside the child
+is what makes the child directory self-contained.
+
+Alongside it the driver writes the **kept** rows to
+`<output_restart>/tmp/centroids_frac_<μ_S>_downfold.txt` and stamps that file's
+checksum onto the small bundle, so the small basis can later be handed to a
+fresh GW run. Both paths, and the transported ζ, are recorded in the bundle's
+`downfold_provenance` group, so no consuming deck has to be repointed at
+anything.
+
+Set the key when you want a specific table used — a parent with no `zeta_q.h5`
+at all, or a table you have curated yourself. It wins over everything else. If
+neither route produces a table, the run says so and names the consequence:
+`bse.bse_jax` is unaffected (the bundle format holds no coordinates, only their
+hash), and `bse.exciton_bands` will refuse with the same explanation rather
+than with the bare `FileNotFoundError: …/centroids_frac_936.txt not found.`
+out of `np.loadtxt` that this used to produce.
+
+## What it prints, and what to read
+
+Three numbers matter, and they are not interchangeable.
+
+**The eigenvalue rank of the retained window's Gram.** How many independent
+pair-density directions the window actually holds. `mu_small` is validated
+against this one and the run refuses when you ask for more.
+
+**The pivoted-Cholesky selection certificate.** A necessary but not sufficient
+condition, roughly three times larger at the same nominal tolerance. It is
+printed beside the first so the two cannot be confused.
+
+**`eps_W(q)`, the error bar.** The relative error of the downfolded observable
+on the retained window, per momentum transfer.
+
+If you read only one, read the third. It is worth understanding why it exists,
+because it is unusual: it needs no reference calculation. Substituting the
+solution back into the fit shows that the downfolded observable is the
+orthogonal projection of the exact one onto the space the small basis spans.
+The residual is therefore orthogonal to the fit, Pythagoras holds exactly, and
+
+    eps_W(q) = sqrt(1 - ||W_S||^2 / ||W||^2)
+
+is not an estimate of the error — it *is* the error, computed from traces of
+μ × μ objects, without ever forming the exact observable (which has millions of
+rows). So every run carries its own accuracy statement, and a downfold that
+was too aggressive says so on the spot rather than three hours later in an
+exciton spectrum.
+
+One consequence worth stating out loud, because it is the reason the code
+applies no ridge anywhere on this path: a ridge would destroy the orthogonality
+that makes the identity exact, and `eps_W` would go on printing a plausible
+number that means nothing.
+
+And one caveat, measured: `eps_W` is a **tripwire, not a transferable gate**.
+Within one parent bundle and one cut it ranks configurations monotonically, but
+the same `eps_W` of about one per cent produced a 37 meV exciton drift on one
+parent and a 1.7 eV drift on another (`DOWNFOLD_S1.md` §3(c), a campaign report
+not carried in this repository), and a third case is tabulated under `mu_small`
+above, where `eps_W` of 1.3e-2 accompanied a 2.09 eV error. Set
+`residual_refuse_above` to catch a downfold that has gone badly wrong; do not
+read it as a promise about meV. The only admissible evidence for choosing the
+cut remains convergence in the energy itself.
+
+At q = 0 the head divergence contaminates both norms identically, so the ratio
+stays meaningful there; the absolute norms at q = 0 are head-dominated and
+should not be compared across q.
+
+## What comes out
+
+A restart bundle in the unchanged format, at the smaller μ: `V_qmunu`,
+`W0_qmunu` with their readiness flags, `G0_mu_nu` transported as a vector,
+`psi_full_y` sliced to the kept centroids, `enk_full` and the head scalars
+carried through verbatim, the parent's Coulomb-kernel policy string re-stamped,
+and the parent's band-window stamp preserved.
+
+Three siblings land in the same `tmp/` directory: `zeta_q.h5` transported to the
+small basis, `centroids_frac_<μ_L>_parent.txt` (the basis the exciton driver's
+htransform leg fits in), and `centroids_frac_<μ_S>_downfold.txt` (the kept rows,
+for a fresh GW). They are not part of the bundle format — nothing in it holds a
+coordinate or a ζ — but they are what makes the output directory self-contained
+for every consumer rather than only for the ones that read tensors.
+
+The band axis is **not** truncated. The retained window decides what the
+compression is faithful to; it is not a truncation of the stored bands. Cutting
+the band axis would renumber every band index in the bundle and move the stamp
+that guards against exactly that class of mistake, so a consumer asking for
+eight occupied states would silently get different states. Band-axis truncation
+is separate, later work with its own renumbering contract.
+
+Alongside the standard datasets the bundle carries a `downfold_provenance`
+group recording what it is: the parent file and its centroid count, the kept
+indices, the window, both tolerances, all three ranks, the retained rank at
+every q and the error bar at every q. A downfolded bundle is deliberately
+indistinguishable from a natively fitted one by shape — that is what makes it a
+drop-in — but it is not the same object, and a reader that wants to know can
+ask.
+
+## Where it does not apply
+
+Plasmon-pole and multipole reductions cannot be downfolded. `B_q` is a residue
+and would transform correctly, but `Omega_q` is a pole *position* per matrix
+element, and there is no change of basis that maps a table of pole frequencies
+from one basis to another. Downfold the linear objects — V, W(0), W(probe),
+each frequency or time slice — and re-fit the pole model in the small basis,
+which is cheap at that size. Anyone who transforms `Omega_q` will get numbers
+that look entirely plausible and are meaningless.
+
+It also does not yet serve Σ. What the compression is faithful to is the window
+it was fitted on, and that window is the BSE's shape — both BSE kernels contract
+ψ legs that lie inside the retained window, so a symmetric fit covers them
+exactly. Σ is the other shape, because its internal band sum runs over the full
+window while its outer projection does not, and the asymmetric window that
+expresses it is the one this driver accepts and announces as unvalidated for
+precisely this reason: the algebra is identical, the measured price is about
+twice the μ_S, and no end-to-end Σ gate has been run on it. So nothing here is
+a claim about quasiparticle energies. Re-fitting Σ in a downfolded basis is
+real, buildable, later work; today the small bundle serves the retained-window
+BSE and the exciton bands built on it, and nothing upstream of them.

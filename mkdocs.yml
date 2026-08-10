@@ -37,6 +37,13 @@ plugins:
             show_source: false
 
 markdown_extensions:
+  # attr_list is what turns `## Heading {#custom-id}` into an actual anchor.
+  # Without it every explicit anchor in the tree silently became literal text
+  # and `mkdocs build --strict` aborted on 25 "does not contain an anchor"
+  # warnings -- including the register table's own `index.md#register`, which
+  # most pages link to. Measured 2026-08-10: adding this line takes the strict
+  # build from 25 warnings to clean.
+  - attr_list
   - admonition
   - pymdownx.details
   - pymdownx.superfences
@@ -66,12 +73,15 @@ nav:
   - User guide:
       - Drivers: drivers.md
       - Input reference: input_reference.md
+      - Downfold driver: downfold.md
   - Theory:
       - Overview: theory/overview.md
       - Physics: theory/physics.md
       - ISDF / zeta-V(q): theory/isdf-zeta-vq.md
       - Minimax quadrature: theory/minimax-quadrature.md
       - Symmetry: theory/symmetry.md
+      - S-tensor convention: theory/s-tensor-convention.md
+      - LT splitting and the exchange head: theory/lt-exchange-head.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - MPA method guide (start here for multipole W): mpa_method_guide.md
       - MPA compute mode (how the mode was declared): theory/THEORY_mpa_implementation.md

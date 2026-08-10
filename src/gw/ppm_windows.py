@@ -230,21 +230,50 @@ def _masked_stats_device(values: jax.Array, mask: jax.Array) -> tuple[int, int, 
     return total, count, min_val, max_val
 
 
-def _materialize_window_mask_B(
-    window: _SigmaWindow,
-    *,
-    base_mask_B: jax.Array,
-    Omega_q: jax.Array,
-) -> jax.Array:
-    """Build one window's B-side selector lazily on device."""
+def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
+    """One window's B-side Ω selector, as the SCALAR bounds ``(lo, hi)``.
+
+    Replaces the old ``_materialize_window_mask_B``, which built a full
+    ``(nq, μ_pad, μ_pad)`` boolean tile on device — per window, eagerly,
+    outside any jit — and kept it alive as a kernel operand for every τ
+    node of that window's scan.  That tile is ~148 MiB/rank at the MoS₂
+    4×4 / μ_pad = 24,960 / P = 64 reference shape, resident straight
+    through the most memory-intensive stage of Σ.  The window it encodes
+    is TWO NUMBERS.  Ship the two numbers; let the predicate be recomputed
+    from ``Omega_q`` inside the kernel, where it fuses into the select that
+    was already there and never becomes a buffer.
+
+    THE CONVENTION IS HALF-OPEN ON THE LOW SIDE, ``(lo, hi]``, because
+    that is what the three existing modes already are, exactly:
+
+        mode "all"   ->  (-inf, +inf)   ->  (Ω > -inf) & (Ω <= +inf)  == all
+        mode "le_t"  ->  (-inf, T)      ->  (Ω > -inf) & (Ω <= T)     == Ω <= T
+        mode "gt_t"  ->  (T, +inf)      ->  (Ω > T)    & (Ω <= +inf)  == Ω > T
+
+    so ONE data-driven predicate reproduces all three bit-for-bit, with no
+    static argument and therefore no extra compile.  Note this is the
+    MIRROR of ``greens_function_kernel.windowed_exp_iEt``'s ``[lo, hi)``:
+    the two sides of Σ assign a boundary pole in opposite directions, and
+    that assignment belongs to the window PLAN (which pole goes in which
+    certified-quadrature interval), not to kernel hygiene.  It is
+    preserved here exactly as found; reconciling the two conventions is a
+    question for whoever owns the quadrature rule, not a refactor.
+
+    Ω is finite and non-negative by construction (it is
+    ``where(good, sqrt(ω²), fallback)`` out of the GN-PPM fit, with
+    ``good`` gating on ``isfinite``), so the ±inf sentinels are safe: no
+    lane can compare false against both of them.
+    """
     mode = str(window.mask_B_mode)
     if mode == "all":
-        return jnp.asarray(base_mask_B, dtype=bool)
-    threshold = jnp.asarray(window.mask_B_threshold, dtype=Omega_q.dtype)
+        return (-np.inf, np.inf)
+    if window.mask_B_threshold is None:
+        raise ValueError(f"mask_B_mode={mode!r} requires a mask_B_threshold")
+    T = float(window.mask_B_threshold)
     if mode == "le_t":
-        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_q <= threshold)
+        return (-np.inf, T)
     if mode == "gt_t":
-        return jnp.asarray(base_mask_B, dtype=bool) & (Omega_q > threshold)
+        return (T, np.inf)
     raise ValueError(f"Unknown mask_B_mode={mode!r}")
 
 

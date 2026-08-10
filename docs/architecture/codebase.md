@@ -63,7 +63,7 @@ src/
 ├── common/               # Shared kernels + utilities
 │   ├── meta.py                Meta dataclass (system params, band edges)
 │   ├── (symmetry_maps.py, density_symmetry_check.py → services/symmetry_maps/, 2026-08-07)
-│   ├── load_wfns.py           WFN.h5 reads, per-k FFT, kchunk helpers
+│   ├── wfn_transforms.py      WFN.h5 reads, per-k FFT, kchunk helpers (was load_wfns.py)
 │   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
 │   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
 │   ├── fft_helpers.py         flat-k ↔ 3D k FFT helpers via custom_partitioning
@@ -531,8 +531,8 @@ lxrun python3 -m common.phdf5_write_test
 ```
 prepare_isdf_and_wavefunctions          [gw/gw_init.py]
  ├─ fit_zeta_chunked_to_h5               [common/isdf_fitting.py]
- │   ├─ load_centroids_band_chunked       [common/load_wfns.py]
- │   │   └─ read_Gvecs_to_devices           [common/load_wfns.py]
+ │   ├─ load_centroids_band_chunked       [common/wfn_transforms.py]
+ │   │   └─ read_Gvecs_to_devices           [common/wfn_transforms.py]
  │   ├─ compute_pair_density_spin_{traced,matrix}  [common/isdf_fitting.py]
  │   ├─ compute_CCT_from_left_right[_spin_matrix]  [common/isdf_fitting.py]
  │   │   └─ make_flat_k_{fftn,ifftn}        [common/fft_helpers.py]
@@ -673,4 +673,7 @@ main                                       [gw/gw_jax.py]
 - FFI internals: [`../src/ffi/AGENTS.md`](../../src/ffi/AGENTS.md)
 - GN-PPM Σ details: see developer notes under `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md`
 - Current BGW-vs-LORRAX status: see developer notes under `docs/dev/progress/SIGMA_FREQ_AUDIT_STATUS.md`
-- Agent todos: see developer notes under `docs/dev/notes/AGENT_TODO.md`
+- Agent todos: `docs/dev/notes/AGENT_TODO.md` is **superseded** and should not be
+  worked from — it describes a `src/isdf/` package layout the tree no longer has,
+  and one of its suggestions is now forbidden by a test. It carries a banner
+  explaining why. Current work items live in the campaign ledgers, not here.

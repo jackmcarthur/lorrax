@@ -74,6 +74,7 @@ import os
 import time
 from functools import partial
 
+import h5py
 import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, SLURM-aware
@@ -94,7 +95,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
 
-from solvers.lanczos import block_lanczos_eig_jit
+from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
+                             report_alpha_herm, split_alpha_sink)
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
+                                    check_band_window)
 from common.fft_helpers import make_sharded_ifftn_3d
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
@@ -159,11 +163,28 @@ def _gather_host(x):
 # ===========================================================================
 def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                       nc_pad: int, nv_pad: int, *, n_eig: int,
-                      block_size: int, max_iter: int, n_reorth: int | None = None):
+                      block_size: int, max_iter: int, n_reorth: int | None = None,
+                      head_tensor: bool = False):
     """One jitted ``solve_path`` for a whole Q list.
 
         solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R) -> evs (nQ, n_eig)
+                   psi_v_X, psi_v_Y, eps_v, W_R)              (default)
+        solve_path(..., W_R, D_head, M_Q)                     (head_tensor)
+            -> (evs (nQ, n_eig), alpha (per-Q α-Hermiticity scalars))
+
+    ``head_tensor`` adds the cell-averaged nonanalytic exchange head as a
+    rank-three-over-transitions term (``bse_stack_matvec``'s ``head_tensor``).
+    ``D_head`` is ``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)``,
+    Q-INDEPENDENT — it is the q→0 coefficient of the pair amplitude, a
+    property of the k-point transition — while ``M_Q`` is the per-Q cell
+    moment ``(nQ, 3, 3)`` and therefore rides the scan xs beside ``V_Q``.
+    Default False traces the pre-existing program unchanged.
+
+    The second output is the α-Hermiticity report as DATA: it is what keeps
+    this program free of host callbacks and therefore persistable in JAX's
+    compilation cache.  Feed it to :func:`_report_alpha_over_path` together
+    with ``solve_path.alpha_labels`` (filled at trace time) to run the gate on
+    the host.  Nothing about the invariant changes — only where it is emitted.
 
     The scan body per Q: hoist the exchange pair amplitudes M_X/M_Y from
     the Q-shifted conduction ψ (audit-P3 contract — matvec args, computed
@@ -183,13 +204,21 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         # saturation breeds ghost duplicates.  Full reorth costs
         # O(M·n·bs²) — negligible next to the matvec at every BSE size.
         n_reorth = max_iter
-    matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse")
+    matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
+                                    head_tensor=head_tensor)
+    # Filled at TRACE time by the sink below (see the module note on the
+    # persistable-scan fix); the static half of the α-Hermiticity report.
+    alpha_labels: list = []
 
     @jax.jit
     def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R):
+                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
         def body(carry, xs):
-            psi_c_X, psi_c_Y, eps_c, V = xs
+            if head_tensor:
+                psi_c_X, psi_c_Y, eps_c, V, M_head = xs
+            else:
+                psi_c_X, psi_c_Y, eps_c, V = xs
+                M_head = None
             psi_c_X = lax.with_sharding_constraint(psi_c_X, sh.psi_x)
             psi_c_Y = lax.with_sharding_constraint(psi_c_Y, sh.psi_y)
             V = lax.with_sharding_constraint(V, sh.V)
@@ -201,32 +230,322 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             def matvec_block(Vb):
                 X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
+                extra = (D_head, M_head) if head_tensor else ()
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                            eps_c, eps_v, W_R, V, M_X, M_Y)
+                            eps_c, eps_v, W_R, V, M_X, M_Y, *extra)
                 HX = HX.reshape(block_size, -1)
                 return HX
 
-            evs, _ = block_lanczos_eig_jit(
-                matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
-                max_iter=max_iter, n_reorth=n_reorth)
-            return carry, evs[:n_eig].real
+            # The α-Hermiticity report leaves the trace as DATA, not as a host
+            # callback.  jax._src.compiler._cache_write refuses to persist any
+            # module carrying a host callback, and this jit wraps a lax.scan
+            # over the whole Q path — the single most expensive compile in the
+            # driver.  Un-sunk, it was rebuilt on every warm run.  The sink is
+            # opened INSIDE the scan body because that is the trace the solver
+            # is traced in; the three scalars per Q ride out as scan ys.
+            with alpha_herm_sink() as _sink:
+                evs, _ = block_lanczos_eig_jit(
+                    matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
+                    max_iter=max_iter, n_reorth=n_reorth)
+            _labels, _payload = split_alpha_sink(_sink)
+            alpha_labels[:] = _labels
+            return carry, (evs[:n_eig].real, _payload)
 
-        _, evs_all = lax.scan(body, None, (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
-        return evs_all
+        xs = ((psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q, M_Q) if head_tensor
+              else (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
+        _, (evs_all, alpha_all) = lax.scan(body, None, xs)
+        return evs_all, alpha_all
 
+    solve_path.alpha_labels = alpha_labels
     return solve_path
+
+
+def _report_alpha_over_path(labels, alpha_all, log=print):
+    """Run the α-Hermiticity gate on the per-Q scalars the scan returned.
+
+    ``alpha_all`` is the scan-stacked payload: one ``(dev, scale, worst)``
+    triple per label, each of shape ``(nQ,)``.  The gate's verdict is a
+    per-solve ratio ``dev/scale`` against ``ALPHA_HERM_RTOL``, so reporting the
+    Q that MAXIMISES that ratio reports the worst violator on the whole path —
+    a stricter statement than any single Q, in one line instead of nQ lines.
+    The Q index is named so a failure is locatable.
+
+    Returns True only if the worst Q on every label passes (and therefore, the
+    ratio being maximised, only if every Q passes).
+    """
+    if not labels:
+        return True
+    ok = True
+    for (name, form), (dev, scale, worst) in zip(labels, alpha_all):
+        dev = np.asarray(dev)
+        scale = np.asarray(scale)
+        worst = np.asarray(worst)
+        rel = dev / np.maximum(scale, np.finfo(dev.dtype).tiny)
+        iq = int(np.argmax(rel))
+        log(f"[alpha-herm] worst of {dev.size} Q is Q#{iq} "
+            f"(dev/scale = {rel[iq]:.3e})")
+        # ``form`` is a LOOKUP KEY into solvers.lanczos._ALPHA_FORMS, not free
+        # text; the per-path context goes in ``name``, which is.
+        ok = report_alpha_herm(
+            ((f"{name} (worst of {dev.size} Q, at Q#{iq})", form),),
+            ((dev[iq], scale[iq], worst[iq]),)) and ok
+    return ok
 
 
 # ===========================================================================
 # stacks: htransform conduction caches + V_Q tiles for the whole path
 # ===========================================================================
+def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
+                              *, log=print):
+    """``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)`` complex.
+
+    The cell-averaged exchange head is
+    ``K^head_{t,t'} = (1/N_k) conj(d_a(t)) M_ab d_b(t')``, and ``d`` is the
+    dipole LORRAX already computes and ships in ``dipole.h5``: the head's
+    q-linear coefficient is exactly ``∂_q M_cv(k,q,0)|_0 = -i d``, so the
+    ``∂_q ζ̃`` the μ-basis route would have needed never appears
+    (``LT_HEAD_PROBLEM.md`` §6).
+
+    Returned pre-conjugated and in ``M_X``'s ``(k, c, v, ·)`` layout, with a
+    Cartesian axis of length 3 where μ was, so the matvec's head term reads
+    exactly as its exchange term (``bse_stack_matvec``, ``head_tensor``).
+    The ``(c, v)`` window and its padding match the loader's:
+    ``val_indices = arange(n_occ-n_val, n_occ)`` lowest-first, which is the
+    same slice ``slice_dipole_to_bse_window`` takes.
+
+    REPRESENTATION CONSISTENCY, STATED RATHER THAN GLOSSED.  The exchange
+    BODY lives in the ISDF centroid basis and this head does not — the
+    dipoles are exact Cartesian matrix elements on the G-sphere.  That is a
+    deliberate, controlled inconsistency (``LT_HEAD_PROBLEM.md`` §6.4): the
+    μ-basis reconstruction of ``lim_{q→0} M_cv`` is precisely the quantity
+    whose failure to vanish leaves the spurious Γ residual, and the exact
+    dipole has no such residual, so the trade favours the dipole.  Two
+    consequences follow and are real: head and body no longer cancel each
+    other's ISDF error, and no run with the head on is bit-comparable to one
+    without it.  That is why the feature is opt-in and why the off arm is
+    gated bit-identical.
+
+    The dipoles also carry the velocity-sign convention of the FILE they came
+    from.  Since the head is quadratic in ``d`` it inherits that convention
+    at full strength.  As of 2026-08-09 the tree's default arm is ``+1`` and
+    the tracked fixtures were re-cut on it, so the provenance stamp is read
+    and logged rather than assumed.
+    """
+    from .absorption_common import (build_dipole_vector_bse, load_dipole_h5,
+                                    slice_dipole_to_bse_window)
+    from .bse_io import resolve_n_occ
+
+    path = args.dipole if getattr(args, "dipole", None) else \
+        os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
+    dipole_cart, deltaE, attrs = load_dipole_h5(path)
+    with h5py.File(path, "r") as f:
+        sign = f.attrs.get("prov_vnl_velocity_sign", None)
+        skip_vnl = f.attrs.get("skip_vnl", None)
+    if int(attrs["nk"]) != int(nk):
+        raise SystemExit(
+            f"{path} has nk={attrs['nk']} but the BSE grid has nk={nk}.  The "
+            f"head tensor contracts the dipole against the BSE transition "
+            f"index, so the two k-lists must be the same list in the same "
+            f"order.  Rebuild the dipole from this deck's WFN.")
+    n_occ = resolve_n_occ(None, input_file=args.input)
+    d_alpha, _ = slice_dipole_to_bse_window(dipole_cart, deltaE,
+                                            n_occ, n_val, n_cond)
+    d_vec = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad,
+                                    n_val_pad=nv_pad)      # (3, c, v, k)
+    log(f"  [head-tensor] dipoles from {os.path.basename(path)} "
+        f"(nk={attrs['nk']}, nbands={attrs['nbands']}, n_occ={n_occ}, "
+        f"velocity_sign={sign!r}, skip_vnl={skip_vnl!r}); "
+        f"max|d|^2 = {float(np.max(np.abs(d_vec)**2)):.4g} bohr^2")
+    return np.conj(np.transpose(d_vec, (3, 1, 2, 0)))      # (k, c, v, 3)
+
+
+def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
+                       log=print):
+    """``(centroid_table, keep_idx | None)`` — WHICH ISDF basis to fit ψ in.
+
+    On a natively-fitted bundle this is the deck's ``centroids_file`` and
+    nothing else happens: the restart's μ basis IS the deck's centroid set,
+    and ``keep_idx`` is ``None``.  That arm is byte-for-byte the program this
+    driver has always run.
+
+    ON A DOWNFOLDED BUNDLE THE TWO ARE DIFFERENT OBJECTS, and conflating them
+    is the second of the three ways this driver failed on one (measured
+    2026-08-10, PIPELINE_HEALTH.md).  The small bundle's basis is a SUBSET of
+    the parent's centroid points — ``downfold.md``: "the new
+    wavefunction-at-centroid coefficients are a literal column slice of the
+    ones already on disk" — and the htransform leg does not read the stored
+    coefficients, it REFITS ψ against the centroid table it is handed.  That
+    fit needs a Galerkin basis spanning ``nk·nb``, which is a completely
+    different sizing criterion from the retained window's PAIR-DENSITY rank
+    that μ_S was chosen against, and is much larger: 1280 against μ_S = 189
+    on the walk's silicon deck, where the fit failed the ``build_fH_R``
+    orthonormality gate rather than merely losing accuracy.
+
+    So the basis to FIT in is the parent's, and the answer is then sliced to
+    the kept rows — which lands exactly on the columns the bundle stores,
+    because that slice is the downfold's own definition of them.  μ_S buys
+    the (μ, μ) tensors and the BSE matvec; it does not and cannot buy the
+    interpolation fit, and this function is where that is stated.
+
+    The parent's table comes off the bundle's own ``downfold_provenance``,
+    not off the deck: a deck copied beside the small bundle names a file that
+    is not there (the walk's first failure — a bare ``FileNotFoundError`` out
+    of ``np.loadtxt``, with nothing to say it was a downfold consequence).
+    The deck is still honoured when it names a readable table of the right
+    size, so a user who has arranged their own is not overruled.
+    """
+    from file_io import read_downfold_provenance
+
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+
+    def _resolve(p):
+        return p if os.path.isabs(p) else os.path.join(input_dir, p)
+
+    deck_path = _resolve(str(params.get("centroids_file",
+                                        "centroids_frac.txt")))
+    prov = read_downfold_provenance(restart_file)
+
+    if prov is None:
+        if not os.path.isfile(deck_path):
+            raise SystemExit(
+                f"exciton_bands: the deck's centroids_file resolves to "
+                f"{deck_path}, which does not exist.  This driver refits "
+                f"psi(k+Q) at the centroid points rather than reading the "
+                f"stored coefficients, so it needs the coordinate table the "
+                f"restart's ISDF basis was built on.  Point centroids_file "
+                f"at it, or copy it beside {os.path.basename(input_file)}.  "
+                f"(bse.bse_jax reads this bundle without a centroid table at "
+                f"all, which is why the two drivers disagree about whether "
+                f"this file is needed.)")
+        return deck_path, None
+
+    keep_idx = prov.get("keep_idx")
+    mu_parent = int(prov.get("parent_mu", 0))
+    if keep_idx is None:
+        raise SystemExit(
+            f"exciton_bands: {restart_file} carries a downfold_provenance "
+            f"group with no keep_idx dataset, so there is no way to map its "
+            f"mu={n_rmu_bundle} basis back to the parent's centroid points.  "
+            f"The bundle predates the stamp; re-run gw.downfold_cli on the "
+            f"parent to produce one this driver can open.")
+    keep_idx = np.asarray(keep_idx, dtype=np.int64)
+    if keep_idx.shape[0] != int(n_rmu_bundle):
+        raise SystemExit(
+            f"exciton_bands: {restart_file} stores mu={n_rmu_bundle} but its "
+            f"downfold_provenance keeps {keep_idx.shape[0]} parent centroid "
+            f"rows.  The bundle and its provenance describe different bases; "
+            f"re-run the downfold rather than trusting either.")
+
+    # The parent table: the bundle's own record first, the deck second.
+    cands = []
+    stamped = prov.get("parent_centroids_file")
+    if stamped:
+        cands.append((str(stamped), "downfold_provenance"))
+    cands.append((deck_path, "the deck's centroids_file"))
+    for path, whence in cands:
+        if not os.path.isfile(path):
+            continue
+        n_rows = int(np.loadtxt(path, ndmin=2).shape[0])
+        if mu_parent and n_rows != mu_parent:
+            log(f"  [downfold] {path} ({whence}) has {n_rows} rows, not the "
+                f"parent's {mu_parent} — not the table this bundle was "
+                f"downfolded from; skipped.")
+            continue
+        log(f"  [downfold] this bundle is a DOWNFOLD of {prov.get('parent_file', '?')} "
+            f"(mu {mu_parent} -> {n_rmu_bundle}).  The htransform leg refits "
+            f"psi in the PARENT basis from {path} ({whence}) and the result "
+            f"is sliced to the {keep_idx.shape[0]} kept centroid rows — the "
+            f"same column slice that defines the bundle's own psi_full_y.  "
+            f"mu_S sizes the (mu,mu) tensors and the BSE matvec; the "
+            f"interpolation fit is sized by nk*nb and cannot use it.")
+        return path, keep_idx
+
+    raise SystemExit(
+        f"exciton_bands: {restart_file} is a downfolded bundle (mu "
+        f"{mu_parent} -> {n_rmu_bundle}) and this driver needs the PARENT "
+        f"run's centroid table to refit psi(k+Q); none of "
+        f"{[c[0] for c in cands]} is a readable {mu_parent}-row table.\n"
+        f"  Why the parent's and not the small one: the htransform Galerkin "
+        f"fit needs a basis spanning nk*nb, which is a different (and much "
+        f"larger) criterion than the retained window's pair-density rank "
+        f"that mu_S was chosen against.  The fit runs at the parent's mu and "
+        f"its output is then sliced to this bundle's kept rows.\n"
+        f"  Fix: re-run gw.downfold_cli with parent_centroids_file set to "
+        f"the parent deck's centroids_file (the driver then records its path "
+        f"on the bundle and this resolves itself), or point this deck's "
+        f"centroids_file at that table directly.")
+
+
+def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
+    """The ζ file the off-grid exchange needs — or a refusal that explains it.
+
+    ANNOUNCE OR REFUSE, BEFORE h5py GETS TO SAY IT ITS WAY.
+    ``vq_interp.build_vq_evaluator`` looks for ``zeta_q.h5`` beside the
+    restart, and a missing one is not an exotic condition: it is what EVERY
+    downfolded bundle written before 2026-08-10 looks like, and what one
+    whose parent's ζ was stored on the q-IBZ wedge still looks like.  The
+    bare ``OSError`` from that path names a file and nothing else — no hint
+    that the absence is a downfold consequence, and no hint that
+    ``--vq-mode=ongrid`` needs no ζ at all.  Third of the three ways this
+    driver failed on a downfolded bundle (PIPELINE_HEALTH.md, 2026-08-10).
+
+    A separate function rather than an inline block so the refusal can be
+    gated without a solve — same reason ``rerun_check_enabled`` is one.
+    """
+    if vq_mode == "ongrid":
+        return ""
+    path = os.path.join(os.path.dirname(os.path.abspath(restart_file)),
+                        "zeta_q.h5")
+    if os.path.isfile(path):
+        return path
+    prov = None
+    try:
+        from file_io import read_downfold_provenance
+        prov = read_downfold_provenance(restart_file)
+    except Exception:                                          # noqa: BLE001
+        pass
+    nx, ny, nz = (int(v) for v in kgrid)
+    raise SystemExit(
+        f"exciton_bands: --vq-mode={vq_mode} builds the exchange tile at "
+        f"arbitrary Q by interpolating the stored zeta, and there is no "
+        f"{path}.\n"
+        + ("  This bundle is a DOWNFOLD.  gw.downfold_cli transports zeta "
+           "into the small basis (zeta_S = conj(T[q]) zeta_L) and writes it "
+           "beside the bundle, so a bundle without one was either written "
+           "before that existed or has a PARENT whose zeta is stored on the "
+           "q-IBZ wedge — which vq_interp refuses on the parent too, so "
+           "--vq-mode=interp was never available on this lineage.  Re-fit "
+           "the parent with LORRAX_FORCE_FULL_BZ=1 and re-run the "
+           "downfold.\n"
+           if prov is not None else
+           "  The GW run that wrote this bundle left no zeta_q.h5 beside it "
+           "(a moved tmp/, or a restart written without the fit).\n")
+        + f"  --vq-mode=ongrid needs no zeta at all and is EXACT at every Q "
+          f"that lands on the {nx}x{ny}x{nz} BSE grid.")
+
+
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
-                            n_rmu_pad, mesh_xy):
+                            n_rmu_pad, mesh_xy, *, keep_idx=None):
     """Reshape the htransform bundle over the concatenated {k+Q} list into
     per-Q conduction caches, padded to the loader's mesh extents — one
     jitted reshape+pad+reshard, no host round-trip (the bundle stays on
     device; at 40 path points the old device_get→np.pad→2×device_put moved
     ~1.7 GB through the host).
+
+    ``keep_idx`` (downfolded bundles only) is the column slice from the
+    parent ISDF basis the htransform fitted in to the basis the RESTART
+    stores — see :func:`resolve_isdf_basis` for why those differ.  It runs
+    inside the same jit, before the pad, so the parent-width ψ never lands
+    in a second host buffer and the μ axis reaches its sharding constraint
+    already at the small extent.
+
+    THE RESTART'S μ IS THE AUTHORITY, and the assertion below says so: the
+    htransform's basis is an input to this function, ``n_rmu`` is what every
+    other operand in the solve was sized by, and a mismatch is a wrong-basis
+    contraction that every shape check downstream would pass once the pad
+    absorbed it.  (Same shape of reasoning as the post-snap window authority
+    at 7449ece0: one place resolves the extent, everything else asserts
+    against it rather than re-deriving it.)
 
     Returns (psi_cQ_X, psi_cQ_Y, eps_cQ):
         psi_cQ_[XY]: (nQ, nk, nc_pad, ns, n_rmu_pad), μ on x / y
@@ -236,10 +555,33 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
     rep = NamedSharding(mesh_xy, P())
 
+    # HOST numpy, closed over — NOT a ``jnp.asarray`` outside the jit.  An
+    # eager ``device_put`` of a host array is the AA.1 hidden-all-gather site
+    # this driver already documents at its refit rows; a numpy array closed
+    # over by the trace becomes an HLO constant instead, which is process-local
+    # by construction and costs nothing at any P.
+    n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
+    keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
+    n_after = n_rmu_src if keep is None else int(keep.shape[0])
+    if n_after != int(n_rmu):
+        raise ValueError(
+            f"exciton_bands: the htransform fitted psi at {n_rmu_src} "
+            f"centroid point(s)"
+            + ("" if keep is None else
+               f", of which {n_after} are kept")
+            + f", but the restart bundle stores mu={n_rmu}.  The conduction "
+              f"caches would be contracted against a W and V in a different "
+              f"basis.  The restart's mu is the authority here: point the "
+              f"deck's centroids_file at the table this bundle's basis came "
+              f"from (a downfolded bundle records the parent's path in its "
+              f"downfold_provenance group).")
+
     @partial(jax.jit, out_shardings=(x5, y5, rep))
     def _stacks(psi, eps):
         ns = psi.shape[2]
-        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu)
+        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu_src)
+        if keep is not None:
+            psi = jnp.take(psi, keep, axis=4)
         eps = eps.reshape(nQ, nk, n_cond)
         psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
                             (0, 0), (0, n_rmu_pad - n_rmu)))
@@ -467,6 +809,24 @@ def build_parser():
                     help="cohsex.in with a K_POINTS crystal_b Q-path block")
     ap.add_argument("--n-val", type=int, default=4)
     ap.add_argument("--n-cond", type=int, default=4)
+    ap.add_argument("--band-degeneracy", choices=MODES, default=DEFAULT_MODE,
+                    help="what to do when --n-val/--n-cond cut a degenerate "
+                         "multiplet (Kramers pair under SOC+TRS, any irrep "
+                         "of dimension > 1): 'strict' (the default since "
+                         "2026-08-10) refuses, naming the counts that would "
+                         "work; 'snap' widens the window OUTWARD to the "
+                         "multiplet boundary and says so loudly; 'off' "
+                         "proceeds on the cut multiplet.  Half a multiplet "
+                         "breaks the exciton multiplets by an amount with no "
+                         "convergence parameter (Si 12x12 SOC: eV-scale "
+                         "off-grid), and a widened window is a different "
+                         "calculation, so widening is something you ask for.")
+    ap.add_argument("--degeneracy-tol-ry", type=float,
+                    default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
+                    help=f"'same multiplet' tolerance in Ry (default "
+                         f"{DEGENERACY_TOL_RY:.4e} = 1 meV; the smallest "
+                         f"between-pair boundary gap measured on the Si "
+                         f"12x12 SOC deck was 5.9 meV)")
     ap.add_argument("--n-eig", type=int, default=6)
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=40,
@@ -508,6 +868,12 @@ def build_parser():
                          "4-13%% near-Γ/zone-boundary head error, "
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
+    ap.add_argument("--dipole", default=None,
+                    help="dipole.h5 for the mini-BZ head TENSOR (only read "
+                         "when head_minibz_average is ON).  Default: "
+                         "dipole.h5 beside the input file.  The head's "
+                         "q-linear coefficient IS this dipole, which is why "
+                         "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--eigh-backend", default=None,
                     choices=eigh_backend_choices(),
                     help="OVERRIDES the input-file ``eigh_backend`` key "
@@ -658,7 +1024,9 @@ def main(argv=None):
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
         mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
-        load_v_full=(args.vq_mode == "ongrid"))
+        load_v_full=(args.vq_mode == "ongrid"),
+        degeneracy_mode=args.band_degeneracy,
+        degeneracy_tol_ry=args.degeneracy_tol_ry)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -693,7 +1061,9 @@ def main(argv=None):
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
         data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
             restart_file, args.eqp, None, n_val, n_cond, n_occ_in,
-            mesh_xy.devices.shape[0], mesh_xy.devices.shape[1])
+            mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
+            degeneracy_mode=args.band_degeneracy,
+            degeneracy_tol_ry=args.degeneracy_tol_ry)
         enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
@@ -716,6 +1086,17 @@ def main(argv=None):
                 f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
                 f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
+
+    # ── which ISDF basis the htransform fits in ──────────────────────────
+    # BEFORE initialize_wfns, because that call is the one that reads the
+    # centroid table.  On a plain bundle this returns the deck's own path
+    # and ``None``, and the program below is unchanged; on a downfolded one
+    # it returns the PARENT's table and the column slice back to this
+    # bundle's basis.  See resolve_isdf_basis for why those are different
+    # questions and why the deck alone cannot answer the second.
+    centroids_path, keep_idx = resolve_isdf_basis(
+        restart_file, params, args.input, n_rmu_bundle=n_rmu, log=log)
+    params["centroids_file"] = centroids_path
 
     # ── htransform setup + Q path ────────────────────────────────────────
     t0 = time.time()
@@ -785,6 +1166,19 @@ def main(argv=None):
             f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
             f"fH window ({nb_window} bands): raise nband in {args.input} to "
             f">= {b_max}, or drop --n-cond to <= {nb_window - nval_in}")
+    # The htransform window is the SECOND place a band boundary is cut in this
+    # driver, and it is cut in a different index space (window-relative, not
+    # absolute), so the loader's snap does not automatically make it safe.
+    # ``enk_sigma`` is (nb, nk) in the SAME window-relative indexing as
+    # b_min/b_max, so the check is exact here.  Report-only: b_max is pinned to
+    # the already-resolved n_cond, and widening it here would desynchronise the
+    # conduction caches from the BSE window the loader sized.  The prose above
+    # has warned about exactly this failure since the Si root-cause; this makes
+    # it a measurement instead of a warning about a possibility.
+    check_band_window(
+        np.asarray(enk_sigma).T, b_min, b_max,
+        tol_ry=args.degeneracy_tol_ry, mode=args.band_degeneracy,
+        where="exciton_bands htransform conduction window", log=log)
     if n_guard < 4:
         log(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
             f"selection — a selection boundary near a Kramers pair can ring "
@@ -822,7 +1216,8 @@ def main(argv=None):
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
-        bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+        bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
+        keep_idx=keep_idx)
     # Everything the htransform produced is now copied into the conduction
     # stacks and nothing below reads it again.  Drop it before the V_Q model
     # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
@@ -883,6 +1278,7 @@ def main(argv=None):
                     else bool(params.get("head_minibz_average", False)))
         log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
             f"(head_minibz_average={head_mbz})")
+        require_zeta_for_interp(restart_file, args.vq_mode, (nkx, nky, nkz))
         vqm = vq_interp.build_vq_evaluator(
             restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
             eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
@@ -898,6 +1294,12 @@ def main(argv=None):
 
     t0 = time.time()
     V_rows = []
+    # Per-Q cell moment for the tensor head.  Zero for Γ and for every Q on
+    # the OFF arm, which makes the head term an exact no-op there — the Γ
+    # endpoint keeps the production q=0 tile and its rank-one head, as its
+    # own docstring promises.
+    M_rows = np.zeros((nQ, 3, 3), dtype=np.float64)
+    head_scalars: list = []
     v_gamma = jax.device_put(data["V_q0"], grid_xy)
     n_eval_calls = 0
     for iQ in range(nQ):
@@ -916,12 +1318,18 @@ def main(argv=None):
             continue
         q_tile = jnp.asarray(q_tile_np)
         if head_mbz:
-            gstar, head_val = vq_interp.minibz_head_vlr(
-                zx, prep, q_tile_np, alpha=args.alpha)
+            gstar, head_val, M_ab = vq_interp.minibz_head_vlr(
+                zx, prep, q_tile_np, alpha=args.alpha, moment=True)
+            # The head channel leaves the mu basis entirely: v[gstar] -> 0
+            # removes the LR G* column from the tile, and the cell-averaged
+            # head comes back as the rank-three tensor term in the matvec.
+            # Injecting BOTH would double-count the head.
+            M_rows[iQ] = M_ab
             V_rows.append(_hermitize(eval_vq(
                 q_tile, prep["V_SRc"], pinvF, coeffs_packed,
-                jnp.asarray(head_val, dtype=jnp.float64),
+                jnp.asarray(0.0, dtype=jnp.float64),
                 jnp.asarray(gstar, dtype=jnp.int32))))
+            head_scalars.append((iQ, float(head_val), float(np.trace(M_ab))))
         else:
             V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
                                              coeffs_packed)))
@@ -952,6 +1360,16 @@ def main(argv=None):
     n_solve = nQ + len(refit_idx)
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))
+    if head_mbz:
+        # refit rows carry no head tensor (they are the ground-truth
+        # point-value comparison); zero is an exact no-op in the term.
+        M_stack = np.concatenate(
+            [M_rows, np.zeros((len(refit_idx), 3, 3))], axis=0)
+        for iQ, hv, trM in head_scalars[:4]:
+            log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
+                f"tr M_ab = {trM:.6e} Ry/bohr^2")
+        if len(head_scalars) > 4:
+            log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
     tick("vq_eval", t0)
 
     # refit rows reuse their Q's conduction caches: extend the scan xs
@@ -1004,13 +1422,25 @@ def main(argv=None):
             W_R = densify_W(W_q_coarse)
             log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
                 f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine grid)")
+    # ── the tensor head's transition-side operand: conj(d) on the BSE window ──
+    # Q-INDEPENDENT.  d is the q→0 coefficient of the pair amplitude
+    # (LT_HEAD_PROBLEM.md §6.1), so it belongs to the k-point transition, and
+    # only the cell moment M_ab carries Q.
+    head_args = ()
+    if head_mbz:
+        D_head = build_head_dipole_operand(
+            args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
+        head_args = (jnp.asarray(D_head),
+                     jnp.asarray(M_stack, dtype=jnp.float64))
     solver = build_path_solver(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
-        block_size=args.block_size, max_iter=args.max_iter)
+        block_size=args.block_size, max_iter=args.max_iter,
+        head_tensor=head_mbz)
     tick("w_r_and_build", t0)
     t_c0 = time.time()
-    evs_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                     data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R)
+    evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+                                data["psi_v_X"], data["psi_v_Y"],
+                                data["eps_v"], W_R, *head_args)
     # The block-Lanczos Ritz values come from a small replicated eigh(T) — the
     # scan output is fully addressable on every process, so the rank-0
     # ``device_get`` below reconstructs the whole (n_solve, n_eig) table
@@ -1018,6 +1448,11 @@ def main(argv=None):
     log(f"[dist] evs sharding={evs_dev.sharding}, "
         f"fully_addressable={evs_dev.is_fully_addressable}")
     evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry
+    # The α-Hermiticity invariant, replayed on the host from scalars the scan
+    # returned.  Same tolerance, same message, same LORRAX_SANITY=strict raise
+    # as the in-jit callback it replaces — see _report_alpha_over_path.
+    _report_alpha_over_path(solver.alpha_labels, jax.device_get(alpha_dev),
+                            log=log)
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
     if rerun_check_enabled(args):
@@ -1031,7 +1466,8 @@ def main(argv=None):
         t_w0 = time.time()
         evs2 = _gather_host(
             solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R))
+                   data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R,
+                   *head_args)[0])
         t_warm = time.time() - t_w0
         tick("solve_scan_warm", t_w0)
         assert np.allclose(evs2, evs_all, atol=1e-10), \
@@ -1049,7 +1485,7 @@ def main(argv=None):
     t0 = time.time()
     mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
-                       W_R).compile().memory_analysis()
+                       W_R, *head_args).compile().memory_analysis()
     log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
         f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
         f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
@@ -1157,8 +1593,48 @@ def main(argv=None):
     # is not on any solver path: one sync, once, after all the physics.
     from common.collectives import barrier
     barrier("exciton_bands.outputs_written")
+
+    # CLOSE THE LOADER HERE, EXPLICITLY, WHILE THE RANKS ARE STILL IN STEP.
+    # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``
+    # (``htransform.setup_wfn_and_sym`` -> ``WfnLoader(wfn_file, mesh=mesh_xy)``),
+    # so at P>1 it picks the phdf5 backend and owns a ``SlabIO`` whose
+    # ``close()`` runs an UNCONDITIONAL COLLECTIVE barrier
+    # (``file_io/_slab_io_ffi.py``, ``_barrier("slab_io_ffi_close_attrs")``).
+    # Left to ``WfnLoader.__del__``, that collective fires whenever the
+    # garbage collector happens to drop the object during interpreter
+    # shutdown — a moment no two ranks agree on.  Measured on this tree
+    # (jobs 56550230 steps .9/.10, 2026-08-09): three ranks parked in
+    # ``__del__`` -> ``SlabIO.close`` -> ``sync_global_devices`` (NCCL,
+    # spinning in ``cuStreamSynchronize``) while the fourth had already
+    # reached ``ffi.io._atexit_close_all`` -> ``phdf5_close`` -> ``H5Fclose``
+    # -> ``MPI_File_close`` -> ``MPI_Barrier`` (spinning in ``sched_yield``).
+    # Two disjoint collective domains, neither ever satisfied: the payload
+    # was complete and every output written, and the step then held its four
+    # GPUs at 4x100% CPU until the allocation died.
+    #
+    # AFTER the barrier above, not before: that barrier is what guarantees
+    # rank 0's matplotlib/.dat block has finished, so every rank enters this
+    # close at the same point.  ``close()`` is idempotent and nulls the
+    # handles, so the later ``__del__`` becomes a no-op on every rank and
+    # nothing collective is left to interpreter shutdown.  A no-op at P=1,
+    # where the SlabIO barrier is already a no-op.
+    try:
+        wfn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  [exciton_bands] WfnLoader.close() failed "
+              f"({type(exc).__name__}: {exc}); continuing to exit")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ``runtime.finalize_process``, not a bare ``SystemExit``: the explicit
+    # ``wfn.close()`` above removes the collective from ``__del__``, and this
+    # removes the SECOND unordered collective — ``ffi.io._atexit_close_all``,
+    # whose ``H5Fclose`` on the restart/zeta contexts is collective too and
+    # otherwise runs at whatever point each rank's interpreter teardown
+    # reaches it.  ``finalize_process`` runs the effects barrier, the
+    # distributed shutdown and the atexit hooks in ONE stated order on every
+    # rank and then ends with ``os._exit``.  Same adopter pattern as
+    # ``gw.gw_jax``, which is the sibling driver that has never hung.
+    from runtime import finalize_process
+    finalize_process(main())

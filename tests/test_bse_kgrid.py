@@ -152,3 +152,134 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
     assert np.all(np.isfinite(evs))
     assert np.all(np.diff(evs) >= -1e-6)               # ascending
     assert evs[0] > 0.0                                # bound state above zero
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The ``head_minibz_average`` key on the coarse→fine path (2026-08-09).
+#
+# Until 2026-08-09 ``_interpolate_bse_data_to_grid`` passed
+# ``head_minibz_average=True`` UNCONDITIONALLY to ``build_vq_evaluator`` and
+# then REPLACED ``V_q0`` outright, so (i) the opt-in, documented-defective
+# scalar-<v> head average (tests/KNOWN_FAILURES.md) reached every coarse→fine
+# user who never set the key, and (ii) the deck's exact disk body and its
+# loader-injected ``vhead`` rank-1 head were silently discarded.  The three
+# gates below are the red twins: each one FAILS on the pre-fix tree.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_kgrid_head_key_is_read_not_forced():
+    """RED TWIN (fixture-free, login-safe): the coarse→fine V_q0 leg must READ
+    the deck ``head_minibz_average`` key, and every ``build_vq_evaluator`` call
+    on that path must sit under a conditional.  Pre-fix the function contained
+    no key read at all and the call was unconditional."""
+    import ast
+    import inspect
+    from bse import bse_io
+
+    tree = ast.parse(inspect.getsource(bse_io._interpolate_bse_data_to_grid))
+    fn = tree.body[0]
+
+    # (1) the deck key is read on this path
+    reads = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute) and n.func.attr == "get"
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == "head_minibz_average"
+    ]
+    assert reads, (
+        "_interpolate_bse_data_to_grid never reads the deck "
+        "``head_minibz_average`` key — the coarse→fine path is forcing it")
+
+    # (2) no build_vq_evaluator call escapes a conditional
+    def _calls_under_if(node, guarded):
+        out = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If):
+                out += _calls_under_if(child, True)
+            else:
+                if (isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "build_vq_evaluator"):
+                    out.append(guarded)
+                out += _calls_under_if(child, guarded)
+        return out
+
+    guards = _calls_under_if(fn, False)
+    assert guards, "no build_vq_evaluator call found on the coarse→fine path"
+    assert all(guards), (
+        "a build_vq_evaluator call on the coarse→fine path is UNCONDITIONAL — "
+        "the deck key is being ignored")
+
+
+@pytest.mark.gpu
+def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
+    """RED TWIN (a): with ``head_minibz_average`` unset (the default), a
+    coarse→fine densification must carry the deck's ``V_q0`` — disk body plus
+    the loader-injected ``vhead`` rank-1 head — through BIT-IDENTICALLY.
+
+    Pre-fix this tile was replaced by a vq_interp model reconstruction carrying
+    an LR-only fine mini-BZ head, so the assert below was provably false."""
+    harness.skip_unless_gpu(pytest)
+    from bse.bse_w_exact import _create_mesh_xy
+    run = _make_run(tmp_path)
+    restart = str(run / "tmp" / "isdf_tensors_640.h5")
+    inp = run / "cohsex_kg.in"
+    assert "head_minibz_average" not in (run / "cohsex_kg.in").read_text()
+    mesh_xy = _create_mesh_xy(1, 1)
+    d0 = _load(restart, inp, mesh_xy, None)          # coarse 3×3×1
+    df = _load(restart, inp, mesh_xy, (6, 6, 1))     # densified 6×6×1
+
+    a = np.asarray(jax.device_get(d0["V_q0"]))
+    b = np.asarray(jax.device_get(df["V_q0"]))
+    assert np.array_equal(a, b), (
+        "coarse→fine REPLACED the deck's V_q0 with the key unset; "
+        f"max|Δ| = {np.max(np.abs(a - b)):.6e}")
+
+    # and the rest of the bundle really did densify (the fix is scoped to V_q0)
+    assert (int(df["nkx"]), int(df["nky"]), int(df["nkz"])) == (6, 6, 1)
+    assert df["psi_c_X"].shape[0] == 36
+    assert tuple(df["W_q"].shape[-3:]) == (6, 6, 1)
+
+
+@pytest.mark.gpu
+def test_densify_optin_matches_prefix_construction(tmp_path):
+    """GATE (b): with ``head_minibz_average = true`` explicitly set, the
+    coarse→fine V_q0 must be BIT-IDENTICAL to the pre-fix construction — the
+    opt-in path stays reachable and stays exactly as defective as documented.
+
+    The reference is built here by replaying the pre-fix statements verbatim."""
+    harness.skip_unless_gpu(pytest)
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from bse.bse_w_exact import _create_mesh_xy
+    from bse import vq_interp
+
+    run = _make_run(tmp_path)
+    inp = run / "cohsex_on.in"
+    inp.write_text(_KG_INPUT + "head_minibz_average = true\n")
+    restart = str(run / "tmp" / "isdf_tensors_640.h5")
+    mesh_xy = _create_mesh_xy(1, 1)
+    d0 = _load(restart, inp, mesh_xy, None)
+    df = _load(restart, inp, mesh_xy, (6, 6, 1))
+
+    # ── the pre-fix statements, replayed ────────────────────────────────
+    n_rmu_pad = int(d0["n_rmu_pad"])
+    vqm = vq_interp.build_vq_evaluator(
+        restart, mesh_xy, n_rmu_pad, head_minibz_average=True, log_fn=print)
+    gstar, head_val = vq_interp.minibz_head_vlr(
+        vqm.zx, vqm.prep, np.zeros(3), kgrid=(6, 6, 1))
+    ref = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,
+                      vqm.coeffs_packed,
+                      jnp.asarray(head_val, dtype=jnp.float64),
+                      jnp.asarray(gstar, dtype=jnp.int32))
+    ref = 0.5 * (ref + jnp.conj(ref).T)
+    ref = jax.device_put(ref, NamedSharding(mesh_xy, P("x", "y")))
+
+    got = np.asarray(jax.device_get(df["V_q0"]))
+    ref = np.asarray(jax.device_get(ref))
+    assert np.array_equal(got, ref), (
+        "the head_minibz_average=true arm no longer reproduces the pre-fix "
+        f"construction; max|Δ| = {np.max(np.abs(got - ref)):.6e}")
+
+    # the opt-in arm really does move the tile off the deck's
+    assert not np.array_equal(got, np.asarray(jax.device_get(d0["V_q0"])))

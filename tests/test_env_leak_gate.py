@@ -115,8 +115,13 @@ def test_the_current_suite_is_collection_inert():
     cost.  A new module-scope ``os.environ`` write anywhere under ``tests/``
     or ``services/`` turns this red at the commit that introduces it,
     instead of turning some unrelated gate red three arrangements later.
+
+    ``--census`` because the leak SURFACE is the census: a bare ``pytest``
+    is the fast default gate since 2026-08-09 and imports a few dozen
+    modules, so collecting without it would shrink exactly the thing this
+    cell is measuring.
     """
-    proc = _child_pytest("--collect-only", "-q")
+    proc = _child_pytest("--census", "--collect-only", "-q")
     out = proc.stdout + proc.stderr
     assert "MUTATED os.environ AT COLLECTION TIME" not in out, (
         "a test module now reconfigures the session at collection time:\n"

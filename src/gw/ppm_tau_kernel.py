@@ -141,19 +141,22 @@ def _make_project_ri_reduce_scatter(
     * ``merged_x=False`` → primitive ``channels="split_reim"``: σ^τ is
       split elementwise into σ_R = Re σ^τ, σ_I = Im σ^τ BEFORE projection
       and each real channel rides its own de-promoted GEMM chain,
-      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  REQUIRED for crossing (HGL core)
-      windows: their host consumer (``_project_tau_onto_omega_np``,
-      project_code=1) weights S_R and S_I with two INDEPENDENT real
-      ω-vectors (Re(c)·S_I + Im(c)·S_R), and no per-slice symmetry can
-      reconstruct the pair — the crossing phases enter σ^τ symmetrically
-      under (μ,ν)→(ν,μ), so σ^τ is neither Hermitian nor
-      complex-symmetric per slice; the only surviving relation
-      σ^τ† = σ^{−τ} pairs different abscissae on a one-sided grid and
-      buys nothing.  Nor is the pair recoverable from X = ψ†σψ: X
-      carries 2n² real dof against the 4n² needed, and the
-      Hermitian/anti-Hermitian split of X fails structurally (for
-      Laplace windows both S_R and i·S_I are Hermitian → it returns
-      (X, 0)).
+      S_R = ψ†σ_Rψ, S_I = ψ†σ_Iψ.  What crossing (HGL core) windows
+      dispatch — but NO LONGER because they must.  This bullet used to
+      argue that the crossing consumer weights S_R and S_I with two
+      INDEPENDENT real ω-vectors (Re(c)·S_I + Im(c)·S_R) and that the
+      pair is unrecoverable from X (2n² real dof against 4n²).  That
+      independent-weight consumer WAS THE DEFECT: it is the elementwise
+      Im[c·σ], which completes the crossing window's one-sided τ grid
+      only where σ^τ is complex-symmetric, i.e. only at k ≡ −k
+      (KNOWN_FAILURES, fixed 2026-08-09).  The correct completion,
+      (Z − Z†)/2i with Z = Σ_τ c·X, reads ONLY X — so the dof argument
+      no longer applies to this window either, and the split survives
+      here as a channel-plan/perf choice.  Collapsing crossing onto the
+      merged kernel is a real option and an owner-scoped change (it moves
+      the collective payloads and the D2H volume); until it is taken,
+      ``_project_tau_onto_omega_np``'s cross-pairing guards keep the
+      carrier contract honest.
     * ``merged_x=True`` → primitive ``channels="none"``: the single
       complex chain X = ψ†σψ = S_R + i·S_I — the path EVERY Laplace
       (project="full") window dispatches, licensed by BILINEARITY alone
@@ -421,14 +424,34 @@ def _get_sigma_tau_kernel(
                                              merged_x=merged_x)
 
     @jax.jit
-    def _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node):
-        """W(τ) = Σ_q B_q · exp(-i·(Ω_q - E_ref_B)·τ) · mask_B.
+    def _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi, E_ref_B, t_node):
+        """W(τ) = Σ_q B_q · exp(-i·(Ω_q - E_ref_B)·τ), windowed to (Om_lo, Om_hi].
 
         (A-side G now built inside sigma_kij_kernel via build_G_tau, so
         the tau-operand helper only shapes the PPM-pole-sum B-side.)
+
+        THE WINDOW IS NOT MATERIALISED.  ``Om_lo``/``Om_hi`` are two f64
+        SCALARS; the per-pole predicate is recomputed from ``Omega_q``
+        right here and ANDed into the select that already existed, so XLA
+        fuses it into that select's predicate and it never becomes a
+        buffer.  What they replace was a full ``(nq, μ_pad, μ_pad)`` bool
+        tile — ``base_mask_B & (Ω ≤ T)`` — built eagerly per window in
+        ``ppm_sigma`` and pinned as a kernel operand for every τ node of
+        the scan (~148 MiB/rank at μ_pad = 24,960 / P = 64, live through
+        the most memory-intensive stage of Σ).  See
+        ``ppm_windows.window_mask_B_bounds`` for the ``(lo, hi]``
+        convention and why it is NOT the ``[lo, hi)`` one that
+        ``windowed_exp_iEt`` uses on the A side.
+
+        ``mask_B`` stays an array: it is the fit-VALIDITY selector
+        (``|Ω| > 1e-14`` ∧ the GN-PPM ``good`` flag), which is a property
+        of each fitted pole and not an interval in Ω, so there are no two
+        numbers to ship.  It is also ONE tile for the whole Σ stage
+        rather than one per window.
         """
         phase_B = jnp.exp(-1j * (Omega_q - E_ref_B) * t_node)
-        W_t_q = jnp.where(mask_B, B_q * phase_B,
+        in_window = (Omega_q > Om_lo) & (Omega_q <= Om_hi)
+        W_t_q = jnp.where(mask_B & in_window, B_q * phase_B,
                           jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
         return jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
 
@@ -436,10 +459,11 @@ def _get_sigma_tau_kernel(
     def _tau_kernel(
         psi_coh_xn, psi_coh_yr,
         psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, B_q, Omega_q, mask_B,
+        E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
         E_ref_A, E_ref_B, t_node,
     ):
-        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
+        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                             E_ref_B, t_node)
         return sigma_kij_kernel(
             psi_coh_xn, psi_coh_yr,
             psi_proj_xr, psi_proj_yn,
@@ -456,11 +480,12 @@ def _get_sigma_tau_kernel(
         def _tau_kernel_staged(
             psi_coh_xn, psi_coh_yr,
             psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, B_q, Omega_q, mask_B,
+            E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
             E_ref_A, E_ref_B, t_node,
         ):
             with timing.section("sigma.tau.w_phase") as sec:
-                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, E_ref_B, t_node)
+                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                                     E_ref_B, t_node)
                 sec.watch(W_t_q)
             return sigma_kij_kernel(
                 psi_coh_xn, psi_coh_yr,
@@ -526,7 +551,10 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     #     ``UnspecifiedValue`` vs ``P(None, None)`` and re-compiles.
     #   * mask_A, scalars: at runtime go through ``jnp.asarray(numpy_val)``
     #     which stays uncommitted — leave as plain jnp to match.
-    #   * mask_B inherits Ω_q's sharding, same as ``_materialize_window_mask_B``.
+    #   * mask_B is ``base_mask_B`` at runtime and inherits Ω_q's sharding;
+    #     the all-true dummy here matches that.  (The per-window Ω split it
+    #     used to carry is now the Om_lo/Om_hi scalars below — see
+    #     ``ppm_windows.window_mask_B_bounds``.)
     #
     # Placement uses ``device_put_process_local``, NOT a bare
     # ``jax.device_put`` (AA.1 / AO.1): ``jnp.zeros(...)`` is an
@@ -545,6 +573,12 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
         np.zeros((int(meta.nk_tot), nb_full), dtype=np.float64), rep_2d)
     mask_A  = jnp.ones((int(meta.nk_tot), nb_full), dtype=bool)
     mask_B  = jnp.ones_like(ppm.Omega_q, dtype=bool)
+    # The Ω window is two SCALARS now, not a (nq, μ, μ) tile — see
+    # ``ppm_windows.window_mask_B_bounds``.  ±inf is the "all" window and
+    # matches the runtime dtype/uncommitted-ness of the ``jnp.asarray``
+    # the branch loop does, so the AOT signature still matches exactly.
+    Om_lo   = jnp.asarray(-np.inf, dtype=jnp.float64)
+    Om_hi   = jnp.asarray(np.inf, dtype=jnp.float64)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
@@ -553,7 +587,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
         if hasattr(tau_kernel, "lower"):
             tau_kernel.lower(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
                 E_ref_A, E_ref_B, t_node,
             ).compile()
         else:
@@ -568,7 +602,7 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
             # collective-safe.  Output is discarded.
             out = tau_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B,
+                E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
                 E_ref_A, E_ref_B, t_node,
             )
             jax.block_until_ready(out)

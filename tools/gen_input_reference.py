@@ -50,6 +50,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "sys_dim": ("System", "System dimensionality (2 = slab): selects the Coulomb truncation."),
     "ecutrho": ("System", "Density-grid cutoff (Ry) for the psp tools (kin_ion/dipole); None = the WFN's own ecutwfc."),
     "bispinor": ("System", "Bispinor (4-spinor) run: 4-channel zeta-fit, Sigma^B transverse channels, two centroid files."),
+    "vnl_velocity_sign": ("System", "Relative sign of the i[r, V_NL] commutator in the assembled velocity, read by `psp.get_dipole_mtxels` (CLI `--vnl-velocity-sign` overrides). `-1`/`shipped` is the shipped assembly, `+1`/`flipped` the arm reproducing BerkeleyGW's q->0 head; empty means NOT DECLARED and resolves to the shipped sign, which is why the default is a string rather than a float."),
     "fermi_reference": ("System", "Where E_F sits inside the gap for the G/W time kernels (midgap default)."),
     # ---- ISDF / zeta ----
     "centroids_file": ("ISDF / zeta", "Charge-channel ISDF centroid table written by centroid.kmeans_cli."),
@@ -143,7 +144,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "distributed_cholesky": ("Solver", "Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate."),
     "distributed_lu": ("Solver", "Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only)."),
     # ---- BSE ----
-    "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the whole BSE bundle (psi/eps, V_Q, W) from the coarse restart grid before any solve; empty = coarse, byte-identical."),
+    "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical."),
     "get_centroids_fi": ("BSE", "htransform -> BSE handoff: also compute fine-grid psi at the coarse centroids (bse_setup.compute_wfns_fi)."),
     "wfn_fi_min": ("BSE", "Sub-window lower edge on the htransform band axis (0-based)."),
     "wfn_fi_max": ("BSE", "Sub-window upper edge, exclusive; 0 = full window."),
@@ -153,12 +154,59 @@ KEYS: dict[str, tuple[str, str]] = {
 
 
 def harvest_defaults(path: Path) -> dict[str, object]:
+    """Read ``_DEFAULTS`` out of gw_config.py without importing it (no jax).
+
+    Some entries are module-level constants rather than literals
+    (``"zeta_rcond": ZETA_RCOND_DEFAULT``), which ``ast.literal_eval``
+    refuses on the whole dict.  Collect the simple ``NAME = <literal>``
+    assignments first and resolve those references per value, so one
+    non-literal entry cannot take the whole generator down — that is what
+    it did between the constant's introduction and 2026-08-10, leaving
+    this page hand-edited while still calling itself generated.
+    """
     tree = ast.parse(path.read_text())
+
+    consts: dict[str, object] = {}
+    for node in tree.body:
+        target = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            # ``ZETA_RCOND_DEFAULT: float = 1e-8`` is an AnnAssign, not an
+            # Assign; missing this node type is what broke the generator.
+            target, value = node.target, node.value
+        if isinstance(target, ast.Name) and value is not None:
+            try:
+                consts[target.id] = ast.literal_eval(value)
+            except ValueError:
+                pass
+
     for node in ast.walk(tree):
         if (isinstance(node, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id == "_DEFAULTS"
                         for t in node.targets)):
-            return ast.literal_eval(node.value)
+            dict_node = node.value
+            if not isinstance(dict_node, ast.Dict):
+                raise SystemExit(f"_DEFAULTS in {path} is not a dict literal")
+            out: dict[str, object] = {}
+            for k_node, v_node in zip(dict_node.keys, dict_node.values):
+                key = ast.literal_eval(k_node)
+                if isinstance(v_node, ast.Name) and v_node.id in consts:
+                    out[key] = consts[v_node.id]
+                else:
+                    try:
+                        out[key] = ast.literal_eval(v_node)
+                    except ValueError as exc:
+                        raise SystemExit(
+                            f"gen_input_reference: cannot evaluate the default "
+                            f"for '{key}' in {path} (line "
+                            f"{getattr(v_node, 'lineno', '?')}).  It is neither a "
+                            f"literal nor a module-level constant this reader "
+                            f"collected; give it a literal default or hoist the "
+                            f"expression into a module-level NAME = <literal>."
+                        ) from exc
+            return out
     raise SystemExit(f"_DEFAULTS dict not found in {path}")
 
 

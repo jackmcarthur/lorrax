@@ -29,6 +29,11 @@ For up-to-date information, see:
 - **CTSP quadrature / minimax**: [`minimax-quadrature.md`](../../theory/minimax-quadrature.md)
 
 ### Other Resources
-- **Advanced topics**: [`advanced_README_legacy.md`](../notes/advanced_README_legacy.md)
 - **Reference papers**: [`misc/references/`](misc/references/)
-- **Agent suggestions**: [`AGENT_TODO.md`](../notes/AGENT_TODO.md)
+
+Two files that used to be listed here as current resources are not current, and
+as of 2026-08-09 each carries a banner saying so: `../notes/AGENT_TODO.md`
+(written against a `src/isdf/` package layout the tree no longer has) and
+`../notes/advanced_README_legacy.md` (the README of a folder that no longer
+exists). Both belong with the superseded files above rather than under current
+documentation, and both are candidates for deletion.

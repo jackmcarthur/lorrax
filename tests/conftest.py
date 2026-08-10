@@ -18,6 +18,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # Safe at this point: harness imports stdlib + numpy and no jax, so
 # nothing has initialised a CUDA backend yet.
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+import fast_gate  # noqa: E402
 import harness  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -235,6 +236,144 @@ def pytest_addoption(parser):
         help="run ONLY the named service's suite (e.g. --only-service="
              "distrib_la).  Deselects lorrax's own tests and every other "
              "service.")
+    gate = parser.getgroup("gate", "LORRAX default gate vs census")
+    gate.addoption(
+        "--census", action="store_true", default=False,
+        help="run the FULL census — exactly what a bare `pytest` collected "
+             "before 2026-08-09, and what tests/KNOWN_FAILURES.md accounts "
+             "for.  `-m census` is the same thing.")
+
+
+# ---------------------------------------------------------------------------
+# THE DEFAULT GATE  (the owner, 2026-08-09)
+# ---------------------------------------------------------------------------
+#     "really we should run that Si test calculation (granted for all
+#      drivers that were touched since last ran) and the tests for the
+#      services and have that basically be it."
+#
+# TWO TIERS, and the split is a SELECTION, not a deletion:
+#
+#   pytest                 -> the Si end-to-end test calculation for the
+#                             drivers this branch touched, plus every
+#                             service's own suite.  Minutes.
+#   pytest --census        -> byte-for-byte the run `pytest` used to be.
+#   pytest -m census       -> the same thing (see `census` below).
+#
+# WHY THE DESELECTION IS A HOOK AND NOT A SECOND `-m`.  Same reason the
+# service deselection above is: pyproject sets `addopts = "-m 'not extra'"`,
+# and an explicit `-m` on the command line REPLACES that default rather than
+# composing with it.  Spelling the default tier as `-m "not census"` would
+# therefore silently re-enable the whole `extra` tier while looking like it
+# had narrowed the run.  A hook acts on the items `-m` already selected, so
+# it composes by construction.
+#
+# WHY EVERY CELL CARRIES `census` RATHER THAN ONLY THE ZOO.  So that
+# `pytest -m census` means what the owner said it means — EVERYTHING —
+# instead of "everything except the Si gates", which is the one shape of
+# census that could not account for KNOWN_FAILURES.md.  The marker is
+# applied to every collected item EXCEPT those already carrying `extra`,
+# which keeps `-m census` collecting exactly the set `-m 'not extra'` did.
+#
+# WHEN THE GATE STANDS DOWN.  The default tier applies to a BARE `pytest`
+# and to nothing else.  Naming paths, `-m`, `-k`, `--census` or
+# `LX_CENSUS=1` all mean the caller has already said what they want, and a
+# second opinion from this hook would only be a way to lose tests they
+# asked for.
+def _stamp_census(items):
+    """Stamp `census` on every collected cell that is not already `extra`.
+
+    ``extra`` is skipped so that ``-m census`` selects exactly the set
+    ``addopts = "-m 'not extra'"`` selects — today's full run, neither 26
+    cells short nor 26 cells long.
+
+    THIS RUNS FROM ``pytest_collection_modifyitems``, and it has to.  The
+    per-item hook (``pytest_itemcollected``) is dispatched through the
+    COLLECTOR's hook proxy, so a conftest under ``tests/`` never sees an
+    item under ``services/`` — MEASURED: stamping there marked 2400 of the
+    3356 cells and ``-m census`` silently dropped all 930 service cells.
+    ``pytest_collection_modifyitems`` is a session-level hook and sees every
+    item, which is also why the service deselection below lives there.
+
+    Ordering against pytest's own `-m` filter, which is the other
+    implementation of this same hook: ours is ``tryfirst``, so the marker
+    exists before ``deselect_by_mark`` reads it.  Without that, ``-m
+    census`` would collect NOTHING — a green run of zero tests.
+    """
+    for item in items:
+        if item.get_closest_marker("extra") is None:
+            item.add_marker(pytest.mark.census)
+
+
+def _cmdline_select_flags(args) -> list:
+    """``-m`` / ``-k`` SPELLINGS ON THE RAW COMMAND LINE, as (flag, value).
+
+    Raw args and not ``config.option``, because addopts has already been
+    folded into the latter: `-m 'not extra'` is there on every run and is
+    indistinguishable from a `-m` the caller typed.
+
+    Spelled out rather than done with ``startswith`` on a tuple, because
+    ``--maxfail=1`` starts with ``-m`` and a naive prefix test hands the
+    whole default gate away to it.  The short forms are the ones that can
+    be glued to their value (``-mfoo``, ``-kfoo``); the long forms cannot,
+    so ``--`` is disqualifying for them.
+    """
+    out, i, n = [], 0, len(args)
+    while i < n:
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < n else ""
+        if a in ("-m", "--markexpr"):
+            out.append(("-m", nxt.strip()))
+            i += 2
+            continue
+        if a == "-k":
+            out.append(("-k", nxt.strip()))
+            i += 2
+            continue
+        if a.startswith("--markexpr="):
+            out.append(("-m", a.split("=", 1)[1].strip()))
+        elif not a.startswith("--") and a.startswith("-m") and len(a) > 2:
+            out.append(("-m", a[2:].strip()))
+        elif not a.startswith("--") and a.startswith("-k") and len(a) > 2:
+            out.append(("-k", a[2:].strip()))
+        i += 1
+    return out
+
+
+def _explicit_selection(config) -> str:
+    """Why this hook should stand down, or "" to run the default gate."""
+    if config.getoption("--census"):
+        return "--census"
+    if (os.environ.get("LX_CENSUS", "") or "").strip() not in (
+            "", "0", "false", "no"):
+        return "LX_CENSUS"
+    flags = _cmdline_select_flags(
+        list(getattr(config.invocation_params, "args", ()) or ()))
+    for flag, value in flags:
+        # `-m census` is the owner's spelling of the full run.  It needs no
+        # special handling to WORK — every non-`extra` cell carries the
+        # marker, so pytest's own filter already selects the whole census —
+        # it is named here only so the header says CENSUS rather than
+        # pretending the fast gate is what stood down.
+        if flag == "-m" and value == "census":
+            return "-m census"
+        return flag
+    if getattr(config.option, "file_or_dir", None):
+        return "explicit path(s)"
+    # The service flags are census instruments: `--no-services` is how the
+    # census's no-srun leg runs lorrax's own tests, and `--only-service`
+    # names a suite outright.  Both already say what they want.  ALL THREE
+    # SPELLINGS, not two: the conftest above documents LX_SKIP_SERVICES and
+    # --no-services as one knob, and a knob that means "census minus
+    # services" one way and "five cells" the other is the kind of split
+    # that only shows up as a suspiciously small green number.
+    if config.getoption("--no-services"):
+        return "--no-services"
+    if (os.environ.get("LX_SKIP_SERVICES", "") or "").strip() not in (
+            "", "0", "false", "no"):
+        return "LX_SKIP_SERVICES"
+    if (config.getoption("--only-service") or "").strip():
+        return "--only-service"
+    return ""
 
 
 def _service_of(item) -> str:
@@ -250,7 +389,63 @@ def _service_of(item) -> str:
     return path[len(_SERVICES_ROOT) + 1:].split(os.sep)[0]
 
 
+_GATE_NOTE = pytest.StashKey[list]()
+
+
+def _apply_default_gate(config, items):
+    """Narrow a bare ``pytest`` to the default tier.  No-op otherwise."""
+    stood_down = _explicit_selection(config)
+    drivers, why = fast_gate.selected_drivers(fast_gate.REPO_ROOT)
+    roster = fast_gate.smoke_node_ids(drivers)
+    undecked = sorted(d for d in drivers if d in fast_gate.UNDECKED)
+    note = config.stash.setdefault(_GATE_NOTE, [])
+    if stood_down:
+        note.append(f"gate: CENSUS ({stood_down}) — full suite, "
+                    "KNOWN_FAILURES.md accounting applies")
+        return
+    note.append(
+        "gate: DEFAULT (fast) — Si e2e smoke for "
+        + (", ".join(sorted(drivers)) if drivers else "NO drivers")
+        + f" [{why}] + every services/ suite.  Full set: pytest --census")
+    for d in undecked:
+        note.append(f"gate: {d} was touched but has NO runnable in-tree "
+                    f"deck — {fast_gate.UNDECKED[d]}")
+
+    keep, drop, hit = [], [], set()
+    for item in items:
+        nodeid = item.nodeid
+        if fast_gate.is_service_item(nodeid):
+            keep.append(item)
+        elif fast_gate.matches(nodeid, roster):
+            keep.append(item)
+            hit.add(nodeid.split("[", 1)[0])
+        else:
+            drop.append(item)
+
+    # A ROSTER ENTRY THAT MATCHES NOTHING IS A SILENTLY EMPTY GATE, which is
+    # the one failure mode a fast gate cannot be allowed to have: a renamed
+    # cell would leave the driver un-smoked and the run green.  `lx` already
+    # refuses pytest's rc=5; this refuses the case rc=5 cannot see, where the
+    # SERVICE half still collects and the run looks populated.
+    missing = sorted(roster - hit)
+    if missing:
+        raise pytest.UsageError(
+            "tests/fast_gate.py names cells that do not exist:\n    "
+            + "\n    ".join(missing)
+            + "\n\nThe default gate would run without them and report green. "
+              "Fix the roster (or the rename) — do not delete the entry.")
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
+        note.append(f"gate: deselected {len(drop)} census cell(s); "
+                    f"{len(keep)} selected")
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    _stamp_census(items)
+    _apply_default_gate(config, items)
+
     only = (config.getoption("--only-service") or "").strip()
     skip_env = (os.environ.get("LX_SKIP_SERVICES", "") or "").strip()
     no_services = (config.getoption("--no-services")
@@ -289,6 +484,17 @@ def pytest_report_header(config):
             "LX_SKIP_SERVICES", "").strip() not in ("", "0", "false", "no"):
         return "services: DESELECTED (--no-services / LX_SKIP_SERVICES)"
     return None
+
+
+def pytest_report_collectionfinish(config, items):
+    """Which tier this run is, and what it narrowed to — AFTER collection.
+
+    Not ``pytest_report_header``: that runs before collection, so it cannot
+    say how many cells the gate set aside.  Same doctrine as the service
+    deselection above — a run that quietly dropped a tier and reported a
+    smaller green number is the exact shape of loss this tree keeps finding.
+    """
+    return list(config.stash.get(_GATE_NOTE, []))
 
 
 def pytest_sessionstart(session):

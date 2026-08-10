@@ -32,7 +32,8 @@ calling it twice never double-allocates.
 
 ```bash
 lx run python3 -u -m gw.gw_jax -i cohsex.in   # one step on a compute node
-lx test                                       # the suite, on a compute node, in cwd
+lx test                                       # the default gate, on a compute node, in cwd
+lx test --census                              # the full census (see docs/contributing.md)
 lx status                                     # who is running where
 lx doctor                                     # verify site, module, helpers
 lx shell -G 4                                 # interactive pty on a compute node
@@ -48,25 +49,51 @@ actually inherit.
 
 > ### `lx` runs the checkout its *base module* names, not the one you are standing in
 >
-> **Verified 2026-08-06.** `lx` obtains `LORRAX_ROOT` and the assembled
-> Shifter string from an installed base modulefile, and bakes the resulting
-> `PYTHONPATH` into the `srun` line. It does **not** derive them from `cwd`.
-> On this machine `lx run --dry-run` emits
-> `--env=PYTHONPATH=$HOME/software/lorrax_P/src:…` regardless of which
-> worktree you launch from.
+> **Re-measured 2026-08-10 — `lx` now prefers the checkout you are standing
+> in, and this warning used to say the opposite.** The resolution order is
+> `LORRAX_CHECKOUT`, then the checkout `cwd` sits inside, then the base
+> module's tree, where "a checkout" means a directory holding both
+> `src/gw/__init__.py` and `tests/`. `lx` announces which one it picked on
+> every invocation, tagged with the reason:
 >
-> So `cd`-ing into your worktree and running `lx run` executes **`lorrax_P`'s
-> source**, and the run succeeds — against a tree you may not be editing. Two
-> things make this visible rather than silent:
+> ```text
+> [lx] source tree: /pscratch/sd/j/jackm/lorrax_pipehealth/src  [cwd]
+> [lx] source tree: /pscratch/sd/j/jackm/lorrax_pipehealth/src  [LORRAX_CHECKOUT]
+> [lx] source tree: /global/u2/j/jackm/software/lorrax_P/src    [module default (cwd is not in a checkout)]
+> ```
 >
-> * `lx doctor` prints `base module` and `LORRAX_ROOT` before you run anything.
-> * every run's [startup block](../overview.md#startup-block) prints the path
->   of the `.so` it loaded, which is inside that same tree.
+> The trap the old warning was reaching for is still real, but it is narrower
+> and it bites in the opposite place: **a data directory is not a checkout.**
+> Real calculations run in a scratch directory holding `WFN.h5` and a deck, so
+> `lx run` there silently resolves to the base module's tree — which on this
+> machine is `lorrax_P`, measured 2026-08-10 sitting **624 commits behind
+> `main`** and old enough to predate the `jax_support` window check and to have
+> no `gw/downfold_cli.py` at all. Running a current pipeline from a data
+> directory therefore runs old code without saying so beyond that one line.
 >
-> Point it somewhere else with `LX_BASE_MODULE=lorrax_A|_B|_C …`, or
-> `LORRAX_DEFAULT_BASE` for the default. `lx test` is the exception that does
-> use `cwd`: it runs pytest in the current directory, and only falls back to
-> `$LORRAX_ROOT/tests` when `cwd` has no `tests/`.
+> `LORRAX_CHECKOUT=/path/to/tree` is the fix, and it is the only one that works
+> from a data directory; `LX_BASE_MODULE=lorrax_B|_C|_J070|…` swaps the base
+> module (and with it the container image), and `LORRAX_DEFAULT_BASE` sets the
+> default. Two other things stay visible: `lx doctor` prints `base module` and
+> `LORRAX_ROOT` before you run anything, and every run's
+> [startup block](../overview.md#startup-block) prints the path of the `.so` it
+> loaded. `lx test` is the exception that has always used `cwd`: it runs pytest
+> in the current directory, and only falls back to `$LORRAX_ROOT/tests` when
+> `cwd` has no `tests/`.
+>
+> One pairing is worth writing down because it costs an afternoon to find. The
+> default base module's image ships JAX 0.5.3, which current `main` **refuses**
+> (`REFUSED: jax-support.version … want jax >= 0.7.0, < 0.10.0`), so a current
+> checkout needs `LX_BASE_MODULE=lorrax_J070` for the
+> `ghcr.io/nvidia/jax:jax-2025-07-21` image. That module swaps the image only —
+> its `LORRAX_ROOT` still points at `lorrax_P` — so the working combination for
+> running current source on this machine is both variables together, plus an
+> FFI library built from that same checkout:
+>
+> ```bash
+> export LX_BASE_MODULE=lorrax_J070
+> export LORRAX_CHECKOUT=/path/to/your/checkout
+> ```
 
 ### Do not start from `module load lorrax`
 

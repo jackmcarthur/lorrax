@@ -535,6 +535,18 @@ def compute_s_tensor_contrib_at_q0(
     S-tensor  S_{ij} = ∂²χ_{00}/∂q_i∂q_j|_0  (in units of
     ``Σ_v <grad_v_i | δu̇_v_j>``, pre-``prefactor``).
 
+    REPRESENTATION — this is an intermediate, not the shipped object.  What
+    comes out of here is the **crystal-coordinate HESSIAN**, because the
+    derivative is taken with respect to the crystal ``kvec`` the traced
+    operator is built at.  The tree's canonical S-tensor is the **Cartesian
+    q²-coefficient** ``S_ab`` with ``χ_{00}(q→0) = q_a S_ab q_b`` — see
+    ``common.chi_from_dipole`` for the statement of that convention and
+    ``docs/theory/s_tensor_convention.md`` for both.  ``run_sternheimer``
+    converts (halve, then ``B⁻¹ · H · B⁻ᵀ``) at the write site, so
+    ``s_tensor_q0`` on disk is canonical and this function's raw output
+    never leaves the driver.  Do not hand this array to a reader of
+    ``compute_S_omega`` without that conversion.
+
     Physics — why we don't need Hess.  At q = 0 the primal Sternheimer solve
     has b = Q_k · u_{v,k} = 0 and δu(0) = 0.  The naive quadratic expansion
     δu(q) = q_i · δu̇_i + (1/2) q_i q_j · δü_ij   in a *fixed* k-basis
@@ -1433,18 +1445,48 @@ def run_sternheimer(
             U_extra_G_full, eps_extra_full,
         )
         S_per_k.block_until_ready()
-        S_total = prefactor_st_val * np.asarray(jnp.sum(S_per_k, axis=0))
+        S_hess_crys = prefactor_st_val * np.asarray(jnp.sum(S_per_k, axis=0))
+        # ── Canonicalise to the Cartesian q²-coefficient ──────────────────
+        # ``s_tensor_convention`` (docs/theory/s_tensor_convention.md): the
+        # ONE S-tensor representation in this tree is the Cartesian
+        # q²-coefficient S_ab with  χ_{00}(q→0) = q_a S_ab q_b  (q in
+        # Cartesian 1/bohr), which is what ``common.chi_from_dipole.
+        # compute_S_omega`` returns and what every reader
+        # (``gw.head_correction``, ``vcoul.Bulk3D.q0_average``'s
+        # ``einsum('qi,ij,qj->q', rq, S, rq)``) consumes.  The kernel above
+        # naturally produces the CRYSTAL-coordinate HESSIAN
+        # ``H_ij = ∂²χ_{00}/∂q_i∂q_j``, which is a different object by two
+        # transformations, both applied here so the file never carries the
+        # unconverted form:
+        #   * a factor 1/2, because χ = ½ q_i H_ij q_j;
+        #   * the frame change  q_crys = q_cart · B⁻¹  with B = blat·bvec
+        #     (rows are the Cartesian reciprocal vectors), giving
+        #     S_ab = ½ (B⁻¹ H B⁻ᵀ)_ab.
+        # Before 2026-08-09 the raw crystal Hessian was written out under
+        # this same name with a note saying so, and there was no reader —
+        # so nothing could consume the two builders consistently.  See
+        # ``SMALL_ISSUES.md`` row 22.
+        from common.chi_from_dipole import (
+            s_tensor_crystal_hessian_to_cartesian_q2)
+        B_cart = float(wfn.blat) * np.asarray(wfn.bvec, dtype=np.float64)
+        S_total = s_tensor_crystal_hessian_to_cartesian_q2(S_hess_crys, B_cart)
         if verbose:
             dt = time.perf_counter() - t_S
-            print(f"  S-tensor (crystal coords, real, t={dt:.2f}s):")
+            print(f"  S-tensor (Cartesian q²-coefficient, t={dt:.2f}s):")
             for row in S_total.real:
                 print(f"    {row[0]:+.4e}  {row[1]:+.4e}  {row[2]:+.4e}")
             print(f"  imag max: {float(np.max(np.abs(S_total.imag))):.2e}")
         out_h5.create_dataset('s_tensor_q0', data=S_total)
+        out_h5.attrs['s_tensor_convention'] = "cartesian_q2_coefficient"
         out_h5.attrs['s_tensor_note'] = (
-            "S_ij = ∂²χ_{G'=0}/∂q_i∂q_j |_{q=0}  in CRYSTAL coords; "
-            "convention = Hessian (NOT q²-coefficient).  See "
-            "compute_s_tensor_contrib_at_q0 docstring.")
+            "S_ab: CARTESIAN q²-coefficient, chi_{G'=0}(q->0) = q_a S_ab q_b "
+            "with q in Cartesian 1/bohr.  Same representation as "
+            "common.chi_from_dipole.compute_S_omega, so this dataset and that "
+            "function's output are directly comparable and interchangeable at "
+            "every reader.  The kernel computes the crystal-coordinate "
+            "Hessian d2chi/dq_i dq_j; the driver converts it here by "
+            "S = 0.5 * Binv @ H @ Binv.T with B = blat*bvec.  Written in the "
+            "crystal-Hessian convention before 2026-08-09.")
 
     out_h5.close()
     if verbose:
@@ -1480,9 +1522,13 @@ def main(argv=None):
                              "jax.linearize (3 cartesian-crystal directions, "
                              "shared primal trace).")
     parser.add_argument("--s-tensor", action="store_true",
-                        help="Also compute the S-tensor at q=0  "
-                             "S_ij = ∂²χ_{G'=0}/∂q_i∂q_j  via the explicit "
-                             "P_val-rotation formula.")
+                        help="Also compute the S-tensor at q=0 via the "
+                             "explicit P_val-rotation formula, and write it "
+                             "as the CANONICAL Cartesian q²-coefficient "
+                             "S_ab (χ_{G'=0} = q_a S_ab q_b) — the same "
+                             "representation common.chi_from_dipole."
+                             "compute_S_omega returns, so the two are "
+                             "interchangeable at every reader.")
     parser.add_argument("--sos-only", action="store_true",
                         help="Use the explicit cond-N projector (= "
                              "truncated sum-over-states over the loaded "

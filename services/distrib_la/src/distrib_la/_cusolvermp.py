@@ -160,8 +160,10 @@ the returned eigenvalues are correct.
 
 The eigenVECTORS inherit the same untransposed layout: the returned ``Q``
 raw buffer satisfies ``Q.conj().T[:, i] = i-th eigenvector`` (for F64,
-``Q.T[:, i]``) — verified on 1x1 and 2x2 meshes, pinned by
-``tests/test_ffi_linalg_contract.py``.  Callers that need conventional
+``Q.T[:, i]``) — verified on 1x1 and 2x2 meshes, pinned by this service's
+own ``tests/test_distrib_la_contract.py`` (the pin migrated here with the
+backend; it was ``tests/test_ffi_linalg_contract.py`` in LORRAX).  Callers
+that need conventional
 column eigenvectors must conj-transpose; :func:`distrib_la.plan._eigh_columns`
 is the ONE place that knows it.  (The SLATE eigh returns TRUE column
 eigenvectors — the two wrappers share shapes but NOT the Q convention.)

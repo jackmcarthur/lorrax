@@ -43,6 +43,11 @@ WHO CALLS WHAT
     The BGW ``Common/minibzaverage.f90`` port.  Used by the 3D and 2D
     ``q0_average`` above, and directly by ``bse.vq_interp.minibz_head_vlr``
     for the 2D slab per-Q exchange head.
+``minibz_moment_tensor(shift_cart, dq_batches, ...)``
+    The SECOND moment ``M_ab = <v(q) q_a q_b>_cell`` on the same draws and
+    the same two BGW branches as ``minibz_average`` — six numbers instead
+    of one, which is what the BSE exchange head's cell average actually
+    needs (``LT_HEAD_PROBLEM.md`` §3).  Bare units, like the scalar.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -71,8 +76,10 @@ from __future__ import annotations
 
 from vcoul.base import (
     CoulombKernel,
+    HeadSlotTable,
     SysDim,
     get_kernel,
+    head_slot_table,
     v_qG_single,
     v_qG_table,
 )
@@ -94,6 +101,7 @@ from vcoul.minibz import (
     minibz_cell_affine,
     minibz_frac_to_cart,
     minibz_inscribed_sphere_r2,
+    minibz_moment_tensor,
     minibz_voronoi_batches,
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
@@ -117,11 +125,12 @@ __all__ = [
     "CoulombGeometry",
     # dispatch + the v(q+G) driver
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
+    "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
     # mini-BZ sampling / averaging
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
-    "minibz_average", "_minibz_kernel_bare",
+    "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
