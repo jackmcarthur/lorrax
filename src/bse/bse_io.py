@@ -1680,6 +1680,16 @@ def load_bse_data_from_restart_sharded(
         if jax.process_index() == 0:
             from file_io import describe_coulomb_policy_stamp
             print(describe_coulomb_policy_stamp(restart_file))
+        # THE GATE, ASKED ONCE.  ``wq_key is not None`` here means a real
+        # screened W0 passed the ``W0_ready`` check above; below it is also
+        # the name of the bare-V dataset, because the fallback aliases the
+        # key.  Capture the answer before that aliasing destroys it — the
+        # head injection at the bottom of this function needs to know which
+        # tensor it is adding a SCREENED head to, and once the else branch
+        # below has run the key alone can no longer tell it.  Same question,
+        # same spelling as ``_load_ring_subset``'s
+        # ``w0_ready = W0_qmunu is not None``.
+        w0_ready = wq_key is not None
         if wq_key is not None:
             wq_dset = f[wq_key]
         else:
@@ -1839,16 +1849,14 @@ def load_bse_data_from_restart_sharded(
             input_file, vhead_restart, whead_restart, cell_volume)
 
         if cell_volume is not None and (vhead is not None or whead is not None):
-            from gw.head_correction import apply_q0_head_rank1_sharded
-            V_q0, W_q = apply_q0_head_rank1_sharded(
+            # ``w0_ready`` is the answer the dataset-selection block above
+            # recorded: whead goes on a SCREENED W or nowhere.  Same gate,
+            # same helper, as the single-device loader.
+            V_q0, W_q, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
-                omega_index=0)
-            v_str = (f"vhead={complex(vhead).real:.6f}"
-                     if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
-                     if whead is not None else "whead=skipped")
+                w0_ready=w0_ready)
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
-                  f"V_cell={cell_volume:.2f}): {v_str}, {w_str} "
+                  f"V_cell={cell_volume:.2f}): {head_str} "
                   f"[source: {head_src}]")
         else:
             # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
@@ -2165,6 +2173,77 @@ def _resolve_head_params(
             print(f"BSE head: cell_volume unresolved ({exc}); skipping head")
             cell_volume = None
     return vhead, whead, cell_volume, source
+
+
+def _inject_q0_head(
+    V_q0,
+    W_q,
+    g0_mu,
+    g0_nu,
+    vhead,
+    whead,
+    cell_volume: float,
+    *,
+    w0_ready: bool,
+):
+    """Inject the rank-1 q=0 head, with ``whead`` gated on ``w0_ready``.
+
+    ``(V_q0, W_q, log_fragment)``.  One authoritative spelling of the head
+    injection for both restart loaders: the sharded one
+    (:func:`load_bse_data_from_restart_sharded`) and the single-device
+    full-file one (:func:`_load_ring_subset`).
+
+    THE GATE IS THE POINT.  ``vhead`` belongs on ``V_q0`` unconditionally —
+    ``compute_vcoul`` zeroes ``v(G=G'=0)`` at q=0 before the Dyson solve and
+    this reinstates the mini-BZ-averaged head that was removed, so the tile
+    is bare Coulomb either way.  ``whead`` is the head of the SCREENED
+    interaction, and both loaders fall back to bare ``V`` for ``W`` when the
+    restart carries no ready ``W0_qmunu``.  Adding a screened head to an
+    unscreened tile is not a smaller error than the fallback it rides on: it
+    is a different, silent one, on a tile the caller has already been warned
+    is not physical.  So ``w0_ready`` False means the W tile is returned
+    exactly as it was read, and the log says ``whead=skipped``.
+
+    Passing ``W_q=None`` into the injector (rather than dropping the returned
+    array) is what makes the skip total: the helper then computes no ``w``
+    scalar and touches no W element, so the returned tile is the input object
+    and not a re-derived copy of it.
+
+    Parameters
+    ----------
+    V_q0 : jax.Array
+        ``(n_μ, n_ν)`` q=0 exchange tile.  Sharded ``P("x", "y")`` on the
+        sharded path, unsharded on the single-device one.
+    W_q : jax.Array
+        ``(n_μ, n_ν, nkx, nky, nkz)`` screened tensor; only the ``(0, 0, 0)``
+        k-slice is ever written, and only when ``w0_ready``.
+    g0_mu, g0_nu : jax.Array
+        ``ζ(0, μ, G=0)`` on the μ- and ν-axis respectively (the same vector
+        twice; two copies so the rank-1 update is process-local when the
+        tensors are dual-sharded).
+    vhead, whead, cell_volume :
+        As resolved by :func:`_resolve_head_params` — Ry and Bohr³.
+    w0_ready : bool
+        Did a real screened ``W0`` load, or is ``W_q`` the bare-V fallback?
+
+    Returns
+    -------
+    tuple
+        ``(V_q0, W_q, log_fragment)``; the fragment is the
+        ``"vhead=…, whead=…"`` half of each loader's own log line.
+    """
+    from gw.head_correction import apply_q0_head_rank1_sharded
+
+    V_q0, W_head = apply_q0_head_rank1_sharded(
+        V_q0, W_q if w0_ready else None, g0_mu, g0_nu,
+        vhead, whead, cell_volume, omega_index=0)
+    if w0_ready:
+        W_q = W_head
+    v_str = (f"vhead={complex(vhead).real:.6f}"
+             if vhead is not None else "vhead=skipped")
+    w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
+             if (whead is not None and w0_ready) else "whead=skipped")
+    return V_q0, W_q, f"{v_str}, {w_str}"
 
 
 def apply_eqp_corrections(
@@ -2520,20 +2599,13 @@ def _load_ring_subset(
             print("BSE: head injection skipped — could not resolve cell_volume "
                   "(input_file required)")
         elif vhead is not None or whead is not None:
-            from gw.head_correction import apply_q0_head_rank1_sharded
             g0_pad = _pad_last_axis(G0_mu_nu, n_rmu_pad)
             w0_ready = W0_qmunu is not None
-            V_q0, W_head = apply_q0_head_rank1_sharded(
-                V_q0, W_q if w0_ready else None, g0_pad, g0_pad,
-                vhead, whead, cell_volume, omega_index=0)
-            if w0_ready:
-                W_q = W_head
-            v_str = (f"vhead={complex(vhead).real:.6f}"
-                     if vhead is not None else "vhead=skipped")
-            w_str = (f"whead[0]={complex(whead[0]).real:.6f}"
-                     if (whead is not None and w0_ready) else "whead=skipped")
+            V_q0, W_q, head_str = _inject_q0_head(
+                V_q0, W_q, g0_pad, g0_pad, vhead, whead, cell_volume,
+                w0_ready=w0_ready)
             print(f"BSE: q=0 head injected (rank-1 in μν, V_cell={cell_volume:.2f}): "
-                  f"{v_str}, {w_str} [source: {head_src}]")
+                  f"{head_str} [source: {head_src}]")
 
     key = jax.random.PRNGKey(0)
     X = jax.random.normal(key, (1, n_cond_pad, n_val_pad, nk)) + 1j * jax.random.normal(

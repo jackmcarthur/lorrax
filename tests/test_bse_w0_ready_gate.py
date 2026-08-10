@@ -29,6 +29,14 @@ that rots.  The same choice, for the same reason, as
 ``test_kin_ion_star_broadcast.py``'s AST check on the ``"ibz_slab"``
 literal — and like that one, it comes with a red twin showing the matcher
 detects the pre-fix shape.
+
+THE OTHER HALF OF THIS FLAG lives in ``tests/test_sharded_whead_gate.py``.
+Everything here is about READING: which tensor the loaders bind when the flag
+says the screening was never persisted.  What they then DO with the bare-V
+fallback they bound is a second question, and the sharded loader used to
+answer it differently from the single-device one — it injected the SCREENED
+q=0 head on top of the unscreened tile.  That file gates the composition
+behaviourally, at P=1 and P=4; this one gates the reading.
 """
 
 from __future__ import annotations
