@@ -7,13 +7,15 @@ You are most likely arriving here from the `lorrax_sandbox` project, where test 
 and BGW comparisons are organized. This repo contains the source code you may need to
 read or modify. Read this file upon first inspection of the LORRAX source before editing any code.
 
-> **If you are a dispatched lane, read [`AGENT_PREAMBLE.md`](AGENT_PREAMBLE.md)
-> first.** It is the standard environment preamble — certificate check, pool
-> discovery, the trap inventory, release-by-job-ID, EXIT verification, the
-> allocator statement rule and the file-boundary etiquette — and it opens with
-> **THE FOUR-GPU RULE: every GPU verification leg runs at P=4**, because
-> *"never ever do we run something on one GPU and then learn it doesn't
-> generalize later"*. This file covers the code; that one covers the machine.
+> **If you are a dispatched lane, [`AGENT_PREAMBLE.md`](AGENT_PREAMBLE.md) is the
+> entry document — read it first, once.** It carries the **efficiency doctrine**
+> (fan out independent legs — measured duty cycle 0.41, 32.4 h idle vs 17.5 h
+> compute; one combined P=4 leg per lane; harvest the index before measuring; warm
+> worker for repeated legs, 2.4 s vs 16 s; lane weights; this contract read once;
+> ledger discipline), the **measurement-discipline** rules, **THE FOUR-GPU RULE**
+> (*"never ever do we run something on one GPU and then learn it doesn't generalize
+> later"*), and the machine — certificate, pool, EXIT codes, traps, allocator,
+> etiquette. This file covers the code; that one covers the method and the machine.
 
 ## Where things are
 
@@ -85,17 +87,22 @@ uv run python -m pytest -q
 uv run python -m pytest -q --census
 ```
 
-### Perlmutter (Shifter via Lmod module)
-
-Perlmutter workflow (lxrun/module) — on Frontera this differs; see `docs/environment/machines/frontera.md` and the working examples below.
+### Perlmutter (Shifter, via the `lx` harness)
 
 ```bash
-module load lorrax_X           # X = A | B | C
-lxalloc                        # 1 node / 4 GPUs / 2 h
-lxpre cohsex.in 640            # all 3 preprocessing steps (single-GPU)
-lxrun python3 -u -m gw.gw_jax -i cohsex.in        # 4-GPU GW
-LORRAX_NGPU=1 lxrun ...                           # single-GPU override
+export LX_BASE_MODULE=lorrax_J070             # without it you get the wrong jax
+lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in   # one P=4 step, allocates or attaches
+lx test                                       # the default gate, on a compute node, in cwd
+lx status                                     # who is running where
 ```
+
+`lx` allocates or attaches by itself, so never `sbatch` an iteration and never
+`lx release --all`. The older `module load lorrax_X` + `lxalloc`/`lxrun`/`lxpre`
+workflow is superseded; `docs/environment/machines/perlmutter.md` is the current
+reference and keeps the old one as history. Fan out independent legs rather than
+running them serially, and combine one branch's verification into one P=4 leg —
+`AGENT_PREAMBLE.md` has the measurements. On Frontera this differs entirely; see
+`docs/environment/machines/frontera.md` and the examples below.
 
 See [`config/README.md`](config/README.md) for the full cluster reference. Docs: [`docs/environment/overview.md`](docs/environment/overview.md).
 
@@ -186,9 +193,10 @@ Run `uv run python -m pytest -q` after long running branches (5+ small commits) 
 DEFAULT GATE (Si end-to-end smoke for the drivers you touched + the services' suites; minutes).
 Run `uv run python -m pytest -q --census` -- the full suite, and the run KNOWN_FAILURES.md
 accounts for -- before asking for a landing.  See `tests/README.md` and `docs/contributing.md`.
-**Every GPU verification leg runs at P=4** -- a P=1-only verification is never
-sufficient for landing (unit and CPU cells are exempt), because "never ever do we
-run something on one GPU and then learn it doesn't generalize later".
+**Every GPU verification leg runs at P=4, in ONE combined leg** -- gates, driver and red
+twin together, not one leg per gate; a P=1-only verification is never sufficient for
+landing (unit and CPU cells are exempt). `AGENT_PREAMBLE.md` owns that rule and its
+rationale. Name your evidence directory, as a path, in the report.
 Do not commit `__pycache__/`, `.venv/`, or `uv_cache/`, etc. directories.
 
 ## Environment

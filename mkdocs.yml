@@ -68,6 +68,7 @@ nav:
   - Environment:
       - Overview: environment/overview.md
       - Collective transports: environment/transports.md
+      - Per-leg bring-up floor and the warm worker: warm_worker.md
       - Frontera (TACC): environment/machines/frontera.md
       - Perlmutter (NERSC): environment/machines/perlmutter.md
   - User guide:

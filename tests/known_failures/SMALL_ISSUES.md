@@ -436,6 +436,17 @@ silent overwrite.
     `-G 4 -n 1`. Nothing was changed in the parser, and refusing the `=`
     form by name would have been wrong — it works.
     [BUILD_NOTES 2026-08-09; ASIDES_AUDIT.md §A13; harness-hardening lane]
+36. **SPEC, not a defect — `lx` should hint when it sees the serial
+    anti-pattern.** The fleet's median duty cycle is 0.41 and 115 of 152
+    evidence directories are strictly serial (`docs/warm_worker.md`), so
+    the cheapest guardrail is one line of output: on a second sequential
+    `lx run` from the same workdir within N minutes with no overlap, print
+    `independent legs? try lx batch`. Specified, deliberately not
+    implemented here, for the lane building `lx batch` —
+    `docs/SPEC_lx_fanout_hint.md` on sandbox_v2
+    `docs/agent-efficiency-2026-08-10`. Non-behavioural by construction:
+    stderr only, never an exit code, never a refusal.
+    [AGENT_PREAMBLE.md efficiency doctrine rule 1]
 
 ## Fixed (strike-in-place graveyard — newest first)
 

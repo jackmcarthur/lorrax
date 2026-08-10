@@ -67,6 +67,7 @@ for the mechanism, the evidence and the disposition, all of which are unchanged.
 
 | date | what it records | status |
 |---|---|---|
+| 2026-08-10 | [SPEC: an unknown deck key should REFUSE, not log-and-proceed — the corollary of `AGENT_PREAMBLE.md` measurement-discipline rule 1](known_failures/2026-08-10-unknown-deck-key-refusal-spec.md) | **PROPOSAL, owner ruling owed** |
 | 2026-08-10 | [`mu_small = auto` sizes a downfold by rank, not by accuracy — and the docs recommended it, on a deck that came out 2.087 eV wrong](known_failures/2026-08-10-mu-small-auto-rank-sized.md) | **OPEN** |
 | 2026-08-10 | [`bse.exciton_bands` could not read a downfolded bundle, three ways, and not one of them was ever a red](known_failures/2026-08-10-exciton-bands-downfolded-bundle.md) | FIXED, pushed |
 | 2026-08-10 | [The sharded BSE loader injected a screened q=0 head onto the bare-Coulomb fallback tile](known_failures/2026-08-10-sharded-whead-on-bare-v-fallback.md) | FIXED, pushed |

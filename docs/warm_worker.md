@@ -1,5 +1,9 @@
 # The warm worker, and what the per-leg floor actually costs
 
+*This note is the measurement behind rules 1 and 4 of the efficiency doctrine in
+`AGENT_PREAMBLE.md`, which is the entry document and states both rules in one line
+each. Read that first; read this when you want to check them.*
+
 This note records what a four-GPU verification leg spends before it reaches
 any physics, why the usual explanation for that cost is wrong, and what a
 persistent worker does about it. Everything below was measured on Perlmutter
