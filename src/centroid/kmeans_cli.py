@@ -1,14 +1,27 @@
-"""CLI driver for the weighted k-means ISDF point selector.
+"""CLI driver for the ISDF interpolation-point selectors.
 
-Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.
+Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.  Two selectors, on
+``--centroid-selector``; both end in the same greedy pivoted Cholesky on the
+q=0 pair-density Gram, and differ in what they hand it.
 
-The physics, in the order it happens: pick the density that decides WHERE
-the ISDF quadrature gets points; run a density-weighted k-means over the
+``kmeans`` (DEFAULT, and the historical path).  Pick the density that decides
+WHERE the ISDF quadrature gets points; run a density-weighted k-means over the
 real-space FFT grid, optionally in orbit representatives so the answer is
-closed under the crystal point group; snap to the grid and unfold; then
-prune the over-sampled candidate pool down to N_c by pivoted Cholesky on
-the pair-density Gram, which keeps the points that span the band window
-Σ actually consumes.
+closed under the crystal point group; snap to the grid and unfold; then prune
+the over-sampled candidate pool down to N_c by pivoted Cholesky, which keeps
+the points that span the band window Σ actually consumes.
+
+``pivoted_full_grid``.  Skip all of that: the candidate pool is the WHOLE
+real-space grid in C-order, and the greedy picks the points out of it directly
+in orbit-block order.  No RNG anywhere, so the same deck returns the same
+points byte for byte, and ``--seed`` is inert.  It is the maximum-robustness
+BACKUP rather than the default because its Gram is ``O(N_grid²)`` — 3 GB at
+24³, ~200 GB at 48³ — so it is affordable on small, high-symmetry cells at
+modest cutoff and on nothing else.  See :mod:`centroid.grid_pool` for the pool
+and ``docs/drivers.md`` for the affordability rule and the measured numbers.
+
+Either way the choice is stamped into the output file as ``centroid_source:``,
+which the GW deck key ``centroid_selector`` asserts back.
 
 Device meshes, sharding and placement live in :mod:`centroid.distribution`.
 """
@@ -101,6 +114,82 @@ def build_parser() -> argparse.ArgumentParser:
                    help="k-means runs for ⌈N_c·oversample⌉ then prunes via "
                         "pivoted Cholesky (default 1.5). Set to 1.0 to "
                         "disable pivoted-Cholesky pruning.")
+    p.add_argument("--centroid-selector",
+                   choices=("kmeans", "pivoted_full_grid"), default="kmeans",
+                   help="WHICH selector chooses the interpolation points, and "
+                        "the one name that reaches the whole recipe. 'kmeans' "
+                        "(DEFAULT, unchanged behaviour) prunes an "
+                        "over-sampled seeded k-means draw — a lottery: the "
+                        "seed alone moves Si Sigma_x by tens of meV, which is "
+                        "why the standing recipe is best-of-five draws. "
+                        "'pivoted_full_grid' is the DETERMINISTIC selector: "
+                        "the candidate pool is every point of the real-space "
+                        "FFT grid, in C-order, and the greedy pivoted "
+                        "Cholesky on the pair-density Gram picks the points "
+                        "out of it directly, in orbit-block order. No RNG "
+                        "anywhere — the same points every run — so --seed, "
+                        "--oversample, --rho-power and the k-means weight are "
+                        "all inert, and the choice is stamped into the output "
+                        "file as centroid_source. IT IS THE BACKUP, NOT THE "
+                        "DEFAULT: the Gram is O(N_grid^2), which is 3 GB at "
+                        "24^3 and ~200 GB at 48^3, so it is affordable only "
+                        "on small, high-symmetry cells at modest cutoff. See "
+                        "docs/drivers.md.")
+    p.add_argument("--score-centroid-file", action="append", default=None,
+                   metavar="FILE",
+                   help="Also report the independent-direction count of an "
+                        "EXISTING centroid file, measured on THIS run's Gram. "
+                        "Repeatable. The direction count is only comparable "
+                        "between two point sets when both were measured on "
+                        "one instrument — the rank floor is tol*max(diag G) "
+                        "and two candidate pools have different diagonal "
+                        "maxima — so comparing two generators' logs compares "
+                        "their instruments too. A --centroid-selector "
+                        "pivoted_full_grid "
+                        "run contains every other set on that grid and can "
+                        "score them all. Points not in this run's candidate "
+                        "pool are reported, not silently dropped.")
+    p.add_argument("--pivot-granularity",
+                   choices=("orbit", "point", "orbit_block"),
+                   default=None,
+                   help="WHAT the greedy pivots on. 'orbit' (default, the "
+                        "historical behaviour) takes one pivot per orbit and "
+                        "removes the whole orbit from contention — it "
+                        "maximises the rank of the orbit-REPRESENTATIVE "
+                        "subspace, and orbit closure then delivers points "
+                        "that are symmetry images rather than new "
+                        "directions. 'point' pivots on points, so every "
+                        "pivot deflates the direction it consumes and the "
+                        "delivered rank is the pivot count by construction; "
+                        "orbit closure is applied AFTER selection. On a "
+                        "whole-grid pool the difference is large and "
+                        "measured: orbit mode gave 1676 points spanning 801 "
+                        "directions on Si 4x4x4 where every recorded k-means "
+                        "draw at the same N spans 1084-1246, because the "
+                        "largest residual diagonals sit on special-position "
+                        "orbits, which are the most redundant ones. "
+                        "DEFAULTS by selector: 'orbit' under "
+                        "--centroid-selector kmeans (unchanged behaviour) and "
+                        "'orbit_block' under pivoted_full_grid, which is the "
+                        "combination that was measured. "
+                        "'orbit_block' is the one that maximises the "
+                        "DELIVERED set's rank: it walks orbits in residual "
+                        "order but deflates every member of an orbit "
+                        "individually before opening the next, so the "
+                        "delivered set is orbit-closed AND every point in it "
+                        "is a certified independent direction.")
+    p.add_argument("--n-pivot-keep", type=int, default=None,
+                   help="Pin the number of pivots the select keeps — orbits "
+                        "under --pivot-granularity orbit, points under "
+                        "'point' — instead of deriving it from N_c and the "
+                        "pool size. Orbit closure quantises the delivered "
+                        "point count (up to 48 points per orbit on Si), so "
+                        "this is the knob that lands a --centroid-selector "
+                        "pivoted_full_grid run on the same delivered N as the arm it "
+                        "is being compared against. The select is greedy and "
+                        "therefore NESTED, so the '[pivot ladder]' line of "
+                        "any one run gives the delivered N for every value "
+                        "of this flag below its own.")
     p.add_argument("--prune-n-val", type=int, default=None,
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec).")
     p.add_argument("--prune-n-cond", type=int, default=None,
@@ -357,30 +446,95 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
     return indices, snapped, snapped.shape[0], None
 
 
+def _rival_point_sets(args, wfn, cand_idx):
+    """``--score-centroid-file`` → ``{label: boolean mask over cand_idx}``.
+
+    Exists so two selectors' independent-direction counts can be read off
+    ONE instrument.  A count is measured against a floor of
+    ``tol · max(diag G)``, and ``max(diag G)`` is a property of the
+    candidate pool, so two generators' logs are not strictly comparable
+    even when both ran the same code.  A whole-grid pool contains every
+    other point set on that grid and can therefore score them all.
+
+    A file whose points are not all in this run's pool is REPORTED and
+    skipped, never partially scored — the rank of a subset is not the rank
+    of the set, and a quietly-truncated comparison is worse than none.
+    """
+    paths = getattr(args, "score_centroid_file", None)
+    if not paths:
+        return None
+    grid = np.asarray([int(v) for v in wfn.fft_grid], dtype=np.int64)
+    cand = np.asarray(cand_idx, dtype=np.int64)
+    flat_pool = (cand[:, 0] * grid[1] + cand[:, 1]) * grid[2] + cand[:, 2]
+    pos = {int(f): i for i, f in enumerate(flat_pool)}
+    out = {}
+    for path in paths:
+        frac = np.loadtxt(path)
+        idxs = np.round(frac * grid).astype(np.int64) % grid
+        flat = (idxs[:, 0] * grid[1] + idxs[:, 1]) * grid[2] + idxs[:, 2]
+        uniq = np.unique(flat)
+        missing = [int(f) for f in uniq if int(f) not in pos]
+        label = os.path.basename(path)
+        if missing:
+            print(f"  [rival] {label}: {len(missing)} of {uniq.size} distinct "
+                  f"points are not in this run's candidate pool — NOT scored "
+                  f"(a subset's rank is not the set's rank)")
+            continue
+        mask = np.zeros(flat_pool.shape[0], dtype=bool)
+        mask[[pos[int(f)] for f in uniq]] = True
+        if uniq.size != flat.size:
+            print(f"  [rival] {label}: {flat.size - uniq.size} of "
+                  f"{flat.size} rows snap to a grid point another row already "
+                  f"holds; scoring the {uniq.size} distinct points")
+        out[label] = mask
+    return out or None
+
+
 def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     """Pivoted-Cholesky prune of the over-sampled candidate pool to N_c.
 
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
     the achieved rank is the number it actually certified.  Returns
-    ``(indices, n_kept, rank, n_orbit_keep, n_val, max_band)`` — the last
+    ``(indices, n_kept, rank, n_keep, n_val, max_band)`` — the last
     four feed the rank gate in ``main()``.
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
     # Σ orbit_size over the picked orbits (≈ N_c by construction).
+    _pg = getattr(args, "pivot_granularity", None) or "orbit"
+    point_pivots = (_pg == "point" and orbit_id is not None)
+    orbit_block = (_pg == "orbit_block" and orbit_id is not None)
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
-    n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
-                    if orbit_id is not None else N_c)
-    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-          f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
+    if point_pivots or orbit_block:
+        # One pivot per POINT, closure afterwards: the target is a point
+        # count, and the delivered set is that set closed under the group,
+        # so it comes out somewhat larger.  Read the '[pivot ladder]' line
+        # and pin with --n-pivot-keep to land on a chosen N.
+        n_keep = N_c
+        unit = ("orbit-block point pivots" if orbit_block else "point pivots")
+    else:
+        n_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
+                  if orbit_id is not None else N_c)
+        unit = "orbits" if orbit_id is not None else "points"
+    if getattr(args, "n_pivot_keep", None):
+        derived = n_keep
+        n_keep = int(args.n_pivot_keep)
+        print(f"  pivot target PINNED to {n_keep} {unit} by --n-pivot-keep "
+              f"(derived value would have been {derived})")
+    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c} "
+          f"(target {n_keep} {unit})")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     max_band = n_val + n_cond
     kwargs: dict = dict(
-        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
-        orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_keep, mesh=mesh,
+        orbit_id=None if point_pivots else orbit_id,
+        close_orbits_after=orbit_id if (point_pivots or orbit_block) else None,
+        orbit_block=orbit_block,
+        use_phdf5=args.use_phdf5,
+        score_point_sets=_rival_point_sets(args, wfn, cand_idx),
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = (0, n_val)
@@ -402,9 +556,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     print(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
-    # The rank gate in main() compares rank against n_orbit_keep and names
+    # The rank gate in main() compares rank against n_keep and names
     # the effective prune window in its refusal — return all four.
-    return indices, indices.shape[0], int(rank), n_orbit_keep, n_val, max_band
+    return indices, indices.shape[0], int(rank), n_keep, n_val, max_band
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -425,9 +579,38 @@ def main():
     timing.reset()
 
     N_c = int(args.N_c)
+    deterministic = (args.centroid_selector == "pivoted_full_grid")
+    # ONE NAME REACHES THE WHOLE RECIPE.  ``--centroid-selector`` is the knob
+    # a user is expected to set; the pivot granularity is an internal of each
+    # selector and defaults to the combination that selector was MEASURED in
+    # — 'orbit' for k-means (unchanged behaviour, every existing deck) and
+    # 'orbit_block' for the whole-grid pivot, where one-pivot-per-orbit was
+    # measured at 801 independent directions against orbit-block's 1282.
+    # Setting it explicitly still wins, and is announced so a run that took
+    # an untested combination says so in its own log.
+    if args.pivot_granularity is None:
+        args.pivot_granularity = "orbit_block" if deterministic else "orbit"
+    elif deterministic and args.pivot_granularity != "orbit_block":
+        print(f"--pivot-granularity {args.pivot_granularity} overrides the "
+              f"whole-grid selector's measured default 'orbit_block'.  The "
+              f"other granularities were MEASURED WORSE on this route "
+              f"(BGW_CD_COMPARISON_DESIGN 7.7.12): 'orbit' delivers 801 "
+              f"independent directions and 'point' 1105, against 1282.")
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
-    if M_cand != N_c:
+    if deterministic:
+        # Say it once, at the top, and name every knob the choice silences —
+        # a run whose --seed did nothing must not look like a run whose
+        # --seed did something.
+        print("Candidate pool: FULL GRID (deterministic selector).  The "
+              "pivoted-Cholesky greedy picks the interpolation points out of "
+              "every real-space grid point directly; there is no k-means and "
+              "no RNG on this path, so the point set is a pure function of "
+              "the mean field, the band window and N.\n"
+              f"  INERT on this path: --seed ({args.seed}), --oversample "
+              f"({oversample:g}), --rho-power ({args.rho_power:g}), "
+              f"--centroid-weight, --weight-bands.")
+    elif M_cand != N_c:
         print(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
               f"(ratio {oversample:g})")
     else:
@@ -438,12 +621,14 @@ def main():
         sym = symmetry_maps.SymMaps(wfn)
 
         n_rtot = int(np.prod(wfn.fft_grid))
-        init_method, init_msg = _decide_init_method(N_c, n_rtot)
-        if init_msg is not None:
-            print(init_msg)
-        dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
-        if dense_warn is not None:
-            print(dense_warn)
+        init_method = None
+        if not deterministic:
+            init_method, init_msg = _decide_init_method(N_c, n_rtot)
+            if init_msg is not None:
+                print(init_msg)
+            dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
+            if dense_warn is not None:
+                print(dense_warn)
 
     with timing.section("setup.charge_density"):
         if args.density_mode == "current":
@@ -472,9 +657,19 @@ def main():
     print(f"Charge density shape: {charge_density.shape}")
     print(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
 
+    if deterministic and not args.force_shard and not args.no_shard:
+        # ``build_mesh``'s latency floor is a measurement of the LLOYD step:
+        # at 3456 grid points per device the k-means allreduce costs more
+        # than the local work, so it falls back to one device.  There is no
+        # Lloyd on this path.  What the mesh has to carry here is an O(M²)
+        # Gram over the whole grid, which is the opposite regime, so the
+        # floor is simply the wrong test and is not consulted.
+        print("--centroid-selector pivoted_full_grid: sharding is forced (the k-means "
+              "latency floor does not apply — this path's work is the O(M²) "
+              "Gram, not a Lloyd step).")
     mesh = dist.build_mesh(int(np.prod(fft_grid)),
                            shard=not args.no_shard,
-                           force_shard=args.force_shard)
+                           force_shard=args.force_shard or deterministic)
     mesh_axis = dist.MESH_AXES
 
     # The loader was necessarily built mesh-less (the mesh is sized from
@@ -487,26 +682,58 @@ def main():
     R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(
         args, wfn, sym, charge_density)
 
-    with timing.section("setup.weight"):
-        if args.centroid_weight is None:      # scalar defaults to band_range
-            args.centroid_weight = ("band_range" if args.density_mode == "scalar"
-                                    else "charge_density")
-        weight, weight_label = _resolve_weight(
-            args, wfn, charge_density, Rinv, tau, dist_mesh=mesh)
+    if args.centroid_weight is None:          # scalar defaults to band_range
+        args.centroid_weight = ("band_range" if args.density_mode == "scalar"
+                                else "charge_density")
+    if deterministic:
+        # No weight is consulted: the pool is the whole grid and the pivot
+        # order comes from the pair-density Gram, which IS the quantity the
+        # ISDF fit has to represent.  ``charge_density`` is still carried
+        # because ``_resolve_symmetry`` recovered the point group from it.
+        weight = charge_density
+        weight_label = ("none — the full grid is the candidate pool and the "
+                        "pair-density Gram sets the pivot order")
+        args.centroid_weight = "n/a (full_grid pool)"
+    else:
+        with timing.section("setup.weight"):
+            weight, weight_label = _resolve_weight(
+                args, wfn, charge_density, Rinv, tau, dist_mesh=mesh)
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
     # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
     # Only the k-means sees the power; ``weight`` itself stays as measured,
     # because it is also what breaks ties when snapped centroids collide.
     kmeans_weight = weight
-    if args.rho_power != 1.0:
+    if args.rho_power != 1.0 and not deterministic:
         # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
         kmeans_weight = np.maximum(
             np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
         print(f"k-means weight: (weight)^{args.rho_power:g} "
               f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
 
-    if orbit_aware:
+    if deterministic:
+        # ── THE DETERMINISTIC SELECTOR ─────────────────────────────────
+        # No Lloyd, no draw, no snap: the candidate pool IS the grid, and
+        # the greedy pivot on the pair-density Gram is the whole selector.
+        # Orbit closure is applied by the SAME mechanism the k-means path
+        # uses (one pivot per orbit inside the select, delivered set = the
+        # union of the picked orbits), so the two arms differ in where the
+        # candidates came from and in nothing else.
+        from . import grid_pool
+        with timing.section("grid_pool"):
+            centroid_indices = grid_pool.full_grid_candidates(fft_grid)
+            if orbit_aware:
+                orbit_id_arr, orbit_sizes = grid_pool.grid_orbit_ids(
+                    centroid_indices, np.asarray(Rinv), np.asarray(tau),
+                    fft_grid)
+            else:
+                orbit_id_arr, orbit_sizes = None, None
+            n_unique = int(centroid_indices.shape[0])
+            print(grid_pool.describe_pool(centroid_indices, orbit_id_arr,
+                                          fft_grid))
+        centroids_snapped = (centroid_indices.astype(float)
+                             / np.asarray(fft_grid))
+    elif orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
         # may inflate by up to n_sym. Adjust kmeans target so the final
         # unfolded centroid count is roughly N_c.
@@ -527,22 +754,23 @@ def main():
     else:
         kmeans_target = M_cand
 
-    with timing.section("kmeans"):
-        _, centroids, _, _ = weighted_kmeans_jax(
-            avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
-            mesh=mesh, mesh_axis=mesh_axis,
-            init_method=init_method,
-            R=R, Rinv=Rinv, tau=tau,
-        )
-    centroids_frac = np.asarray(centroids)
+    if not deterministic:
+        with timing.section("kmeans"):
+            _, centroids, _, _ = weighted_kmeans_jax(
+                avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
+                mesh=mesh, mesh_axis=mesh_axis,
+                init_method=init_method,
+                R=R, Rinv=Rinv, tau=tau,
+            )
+        centroids_frac = np.asarray(centroids)
 
-    with timing.section("snap_unfold"):
-        centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
-            _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
-                             Rinv, tau, n_sym, M_cand)
+        with timing.section("snap_unfold"):
+            centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
+                _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
+                                 Rinv, tau, n_sym, M_cand)
 
-    if oversample > 1.0 and n_unique > N_c:
-        (centroid_indices, n_unique, rank, n_orbit_keep,
+    if deterministic or (oversample > 1.0 and n_unique > N_c):
+        (centroid_indices, n_unique, rank, n_keep_eff,
          _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
@@ -560,14 +788,14 @@ def main():
         # the whole campaign and read by nobody, while Σ_c produced a QP gap
         # of 0.36 eV against a true ~3.2-3.6 eV.  Refuse instead.
         _rank_tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
-        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_orbit_keep))
+        _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_keep_eff))
         if int(rank) < _rank_floor:
             raise SystemExit(
                 f"\nFATAL: pivoted-Cholesky rank deficiency — the candidate "
                 f"pool cannot supply the independence you asked for.\n"
-                f"  requested : {n_orbit_keep} "
+                f"  requested : {n_keep_eff} "
                 f"{'orbits' if orbit_id_arr is not None else 'points'}\n"
-                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_orbit_keep):.1f}%"
+                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_keep_eff):.1f}%"
                 f", floor {_rank_floor} at tol {_rank_tol:g})\n"
                 f"  prune window: left=(0,{_n_val_eff}) right=(0,{_max_band}) "
                 f"[{args.prune_window}]\n"
@@ -585,7 +813,7 @@ def main():
                 f"lower N so you ask for fewer directions\n"
                 f"To override deliberately (NOT recommended for production): "
                 f"LORRAX_CENTROID_RANK_TOL=<fraction>.\n")
-        print(f"  [rank gate] {rank}/{n_orbit_keep} directions certified "
+        print(f"  [rank gate] {rank}/{n_keep_eff} directions certified "
               f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
 
     # Default suffix follows --density-mode unless the user overrode it.
@@ -593,8 +821,19 @@ def main():
                   if args.out_suffix is not None
                   else ("" if args.density_mode == "scalar" else "_current"))
     out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
+    # PROVENANCE, in the artifact.  A centroid file is consumed months later
+    # by a deck that names it and nothing else; "which selector produced
+    # this, and did a seed decide it" has to be readable off the file rather
+    # than reconstructed from a log that may not have been kept.  ``#`` is a
+    # comment to ``np.loadtxt``, so this costs nothing downstream.
+    # ONE table for the stamp, shared with the reader that asserts it
+    # (``file_io.centroids``), so writer and deck key cannot drift apart.
+    from file_io.centroids import CENTROID_SOURCE_STAMPS
+    centroid_source = CENTROID_SOURCE_STAMPS[args.centroid_selector]
     header = (
         f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)\n"
+        f"centroid_source: {centroid_source}\n"
+        f"determinism: {'no RNG on this path — the candidate pool is the whole grid in C-order and the pivot order is the pair-density Gram; seed is inert' if deterministic else f'seeded k-means draw, seed={args.seed} — a different seed gives a different set'}\n"
         f"density: {args.density_mode}  centroid-weight: {args.centroid_weight}\n"
         f"weight: {weight_label}\n"
         f"intended channels: "

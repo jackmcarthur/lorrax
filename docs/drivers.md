@@ -38,10 +38,21 @@ BSE and exciton bands are NOT in the chain yet.
 
 ## centroids — `centroid.kmeans_cli`
 
-Selects the N_c real-space ISDF interpolation points: a density-weighted k-means over the WFN FFT grid
-(optionally on symmetry-orbit representatives so the set is closed under the crystal point group, recovered
-from the density rather than the possibly-truncated WFN group), snapped to the grid, then an oversampled
-candidate pool is pruned to N_c by pivoted Cholesky on the pair-density Gram over the sigma band window.
+Selects the N_c real-space ISDF interpolation points. Two selectors, chosen with `--centroid-selector`:
+
+`kmeans` (DEFAULT, unchanged) — a density-weighted k-means over the WFN FFT grid (optionally on
+symmetry-orbit representatives so the set is closed under the crystal point group, recovered from the density
+rather than the possibly-truncated WFN group), snapped to the grid, then an oversampled candidate pool pruned
+to N_c by pivoted Cholesky on the pair-density Gram over the sigma band window.
+
+`pivoted_full_grid` — the DETERMINISTIC selector. The candidate pool is *every* point of the FFT grid, in
+C-order, and the same greedy pivoted Cholesky picks the points out of it directly, in orbit-block order
+(orbits opened in residual order, every member pivoted before the next opens, so the delivered set is
+orbit-closed **and** every point in it is a certified independent direction). There is no RNG anywhere on
+this path — the pool, the pivot order and the tie-break are all pure functions of the mean field, the band
+window and N — so `--seed`, `--oversample`, `--rho-power` and the k-means weight are inert, and two runs give
+byte-identical files. See [the affordability caveat](#the-deterministic-selector-when-to-reach-for-it) below:
+it is the maximum-robustness BACKUP, not the default.
 It does NOT read the deck: it opens `WFN.h5` (fixed name, cwd) and optionally the QE `<prefix>.save` density;
 the sigma window is resolved from the WFN (`n_val = wfn.nelec`, `n_cond = wfn.nbands - n_val`) or the
 `--prune-n-*` flags. Output: `centroids_frac_<n>[<suffix>].txt`, consumed by the GW run via deck keys
@@ -60,7 +71,11 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | flag | default | meaning |
 |---|---|---|
 | `N_c` (positional) | 400 | number of centroids after pruning |
-| `--oversample` | 1.5 | k-means runs at ceil(N_c*x), pruned back; 1.0 disables pruning |
+| `--centroid-selector` | `kmeans` | `kmeans` (seeded draw + pivoted-Cholesky prune) or `pivoted_full_grid` (deterministic whole-grid pivot, no RNG). Stamped into the output as `centroid_source:`; the GW deck key `centroid_selector` asserts it back |
+| `--pivot-granularity` | by selector: `orbit` (kmeans) / `orbit_block` (full grid) | what the greedy pivots on. `orbit` = one pivot per orbit; `point` = per point, closure after; `orbit_block` = orbits consumed member-by-member, the only one whose DELIVERED set is full-rank. Setting it against the selector's measured default is announced |
+| `--n-pivot-keep` | derived from N_c | pin the pivot count (orbits or points, by granularity). Orbit closure quantises the delivered N; the greedy is nested, so one run's `[pivot ladder]` line gives the delivered N for every smaller value |
+| `--score-centroid-file` | none | also report an EXISTING centroid file's independent-direction count on THIS run's Gram (repeatable). Two pools have different `max(diag G)`, so comparing two generators' logs compares their instruments too; a whole-grid pool contains every other set on the grid and can score them all |
+| `--oversample` | 1.5 | k-means runs at ceil(N_c*x), pruned back; 1.0 disables pruning. **Inert under `pivoted_full_grid`** |
 | `--prune-n-cond` | `nbands - n_val` (full WFN conduction window) | Cholesky window conduction extent; the pre-2026-07-29 `min(n_val, nb-n_val)` default was a 30%-rank-deficiency bug |
 | `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c` (legacy) / `v_x_vc` (adds v×v for V_H) / `vc_x_vc` (full sigma square, use when ncond >> nval) |
 | `--centroid-weight` | `band_range` (scalar mode) | k-means weight: sigma-window Sum|psi|^2 vs occupied-only `charge_density` (slabs: occupied-only gives zero vacuum support, V_H sign-wrong) |
@@ -74,6 +89,48 @@ Invariant: the selection window must span the sigma window `[0, nelec+ncond)` th
 is a superset of any deck's `ncond`, so a shortfall means it was narrowed explicitly. Main refusal: "FATAL:
 pivoted-Cholesky rank deficiency" (certified rank < requested orbits) — widen `--prune-n-cond`, use
 `vc_x_vc`, or raise `--oversample`. Also fatal: FFT-grid mismatch rho vs WFN (needs ecutrho = 4*ecutwfc).
+
+### The deterministic selector: when to reach for it
+
+**It is the maximum-robustness BACKUP, not the default, and the reason is cost.** The whole-grid pool means
+the candidate Gram is `O(N_grid^2)`: 13824 points at 24³ is a 3.06 GB Gram, which one node absorbs without
+noticing — and 110592 points at 48³ is roughly **200 GB**, which it does not. The Si 4×4×4 deck it was
+measured on is *uniquely* affordable — a small cell, high symmetry (48 operations, so the pool collapses to
+374 orbits), and a modest 25 Ry cutoff — and that combination is what makes the Gram fit at all. Reach for
+`pivoted_full_grid` when a result has to be reproducible point-for-point, or when a seeded draw is suspected
+of setting the error floor, and check the `[grid pool]` line's own "Gram is N GB" before committing a large
+cell to it. On anything bigger, the standing recipe stays best-of-five k-means draws ranked by
+independent-direction count ([`BGW_CD_COMPARISON_DESIGN`](#) §7.7.10).
+
+The Gram build is column-blocked on every mesh and the block width is sized against the per-device budget
+(`LORRAX_GRAM_COL_BLOCK` overrides; the planner announces when it waives its own 256-column performance floor
+because the budget cannot pay for it), so the binding constraint is the assembled `(M, M)` Gram itself, not
+the pair-density transients.
+
+Measured on Si 4×4×4, 24³, `nband = 100`, four A100s (§7.7.12; the Σ_x harness and the exact-`vhead`
+instrument are §7.7.11's, whose own seed-57 row that tree reproduces to every printed digit as a control):
+
+| | seeded k-means, 18 recorded draws | `pivoted_full_grid` |
+|---|---|---|
+| points delivered | 1572–1692 | **1394** |
+| independent directions | 1084–1246 (66–76 % of points) | **1282 (92 %)** |
+| Σ_x vs BerkeleyGW, mean \|Δ\|, bare | 7.79 / 16.31 / 51.10 meV (min / median / max) | **4.77 meV** |
+| Σ_x vs BerkeleyGW, mean \|Δ\|, exact head | 3.13 meV (best draw on record) | **0.17 meV** |
+| selection cost | ~15 s ×5 draws, five leg acquisitions | 35 s of work, one leg, once |
+
+Two numbers to carry away. The deterministic set is **below the minimum** of the seeded distribution, not
+somewhere inside it — and that minimum is itself the best of thirteen. And the whole-grid Gram's own
+numerical rank on this deck at this band window is **1474**: that is a hard ceiling on independent
+interpolation directions for *any* point set on this grid chosen by *any* rule, so asking for more points
+than that does not buy more directions, it buys the redundancy the seeded draws already carry. The ζ log is
+where this shows up downstream — the deterministic set reports `n_keep/q = 1394 of 1394` at `rcond = 1e-10`,
+no truncation at all, where a 1692-point seeded set carries 446 points that add no direction and get
+truncated per q.
+
+Provenance is not optional on this path. Every centroid file now carries a `centroid_source:` line naming the
+selector and a `determinism:` line saying whether a seed decided it; the GW deck key `centroid_selector`
+(see [input reference](input_reference.md)) asserts the stamp back and refuses a mismatch — or an unstamped
+file, which is a different fact from a matching one.
 
 ## dipole — `psp.get_dipole_mtxels`
 

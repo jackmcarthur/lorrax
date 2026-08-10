@@ -56,7 +56,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from file_io import (
-    load_kin_ion_submatrix, load_centroids,
+    load_kin_ion_submatrix, load_centroids, assert_centroid_selector,
 )
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
@@ -280,6 +280,8 @@ def main(argv=None):
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
+	assert_centroid_selector(config.paths.centroids_file,
+	                         config.paths.centroid_selector, print_fn=print0)
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")

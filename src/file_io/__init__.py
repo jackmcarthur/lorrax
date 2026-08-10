@@ -99,6 +99,11 @@ from .kin_ion import (
     read_kin_ion_provenance,
     validate_kin_ion_against_run,
 )
-from .centroids import load_centroids
+from .centroids import (
+    load_centroids,
+    read_centroid_source,
+    assert_centroid_selector,
+    CENTROID_SOURCE_STAMPS,
+)
 from .paths import resolve_input_paths
 from .read_bgw_vcoul import read_bgw_vcoul, fill_v_grid_for_q, BGWVcoulTable

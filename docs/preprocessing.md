@@ -27,6 +27,14 @@ Then, from `WFN.h5`, LORRAX's own three preprocessing steps produce `centroids_f
 [Quickstart → Your first real calculation](quickstart.md#your-first-real-calculation),
 **including the three defects in that chain you should know about before you run it.**
 
+The centroid step has two selectors, `centroid.kmeans_cli --centroid-selector kmeans | pivoted_full_grid`.
+The default is the seeded k-means draw and is unchanged; `pivoted_full_grid` is a deterministic whole-grid
+pivoted Cholesky that uses no RNG at all, so the same deck gives byte-identical points every run. It is the
+maximum-robustness backup rather than the default because its Gram is `O(N_grid^2)` — about 3 GB at a 24³
+grid, about 200 GB at 48³. Both selectors stamp `centroid_source:` into the output file, and the GW deck key
+`centroid_selector` asserts that stamp back. Full flag table, the affordability rule and the measured Σ_x
+numbers: [drivers → centroids](drivers.md#the-deterministic-selector-when-to-reach-for-it).
+
 ## 1. What `WFN.h5` must contain — *verified*
 
 Read directly from the bundled fixture `tests/regression/cohsex_debug/WFNsmall.h5`

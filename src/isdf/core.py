@@ -405,6 +405,90 @@ def c_q_from_psi_sm(
 		perm_L, phase_L, perm_R, phase_R)
 
 
+def c_q_from_psi_sm_colblocked(
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	gamma_L: tuple[jax.Array, jax.Array] | None = None,
+	gamma_R: tuple[jax.Array, jax.Array] | None = None,
+	*,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+	col_chunk: int = 0,
+) -> jax.Array:
+	"""``c_q_from_psi_sm`` with the column (nu) axis walked in blocks.
+
+	WHY THIS EXISTS.  ``c_q_from_psi_sm`` builds the whole (mu, nu) block in
+	one shot, and XLA keeps THREE concurrent rank-5 pair densities of shape
+	``(nk, ns, n_col, n_rmu, ns)`` alive inside it.  At the CCT call, where
+	``n_col == n_rmu == mu``, that transient is ``3 * nk * ns^2 * mu^2 * 16``
+	bytes -- quadratic in the centroid count and chunked by nothing.  On Si
+	4x4x4 at mu = 2244 it is 57.63 GiB in ONE request, which is precisely
+	the allocation that ended the N = 2244 rung of
+	``BGW_CD_COMPARISON_DESIGN`` 7.7.9 and put the "single-A100 ceiling" at
+	N ~ 1630.  That ceiling is an artifact of this function, not of the
+	physics: the r-chunk knob does not reach here (it sizes Stage C, the
+	per-r-chunk fit), so no deck setting could lower it.
+
+	WHY BLOCKING IS EXACT.  Inside the pipeline the column axis is a pure
+	spectator: ``P_l`` / ``P_r`` are built by an einsum whose ``r`` (column)
+	index is a free index, the IFFT/FFT pair runs over the three k axes, and
+	``gamma_double_contract`` reduces only the two spin axes.  Nothing
+	couples one column to another, so ``C_q[:, :, c0:c1]`` computed from
+	``psi_*_Y[..., c0:c1]`` is the same array as the corresponding slice of
+	the unblocked result.  The only inexactness available is floating-point
+	summation order, and there is no summation over the column axis at all,
+	so the blocked result is expected BIT-IDENTICAL.  ``col_chunk <= 0`` or
+	``>= n_col`` short-circuits to the unblocked call, so the default path
+	is byte-unchanged.
+
+	SHARDING.  The column axis carries the mesh's ``y`` shard, so a block
+	must stay a multiple of ``p_y`` for the shard_map to keep dividing it.
+	The block size is rounded UP to that multiple; a mesh with ``p_y >
+	n_col`` is left to the unblocked path.
+	"""
+	n_col = int(psi_l_Y.shape[3])
+	p_y = int(mesh_xy.shape['y'])
+	if col_chunk <= 0 or col_chunk >= n_col:
+		return c_q_from_psi_sm(
+			psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, gamma_L, gamma_R,
+			kgrid=kgrid, mesh_xy=mesh_xy)
+	if p_y > 1:
+		col_chunk = ((col_chunk + p_y - 1) // p_y) * p_y
+		if col_chunk >= n_col or n_col % p_y != 0:
+			return c_q_from_psi_sm(
+				psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, gamma_L, gamma_R,
+				kgrid=kgrid, mesh_xy=mesh_xy)
+		# Every block must divide the y axis, so walk in equal blocks.
+		n_blocks = (n_col + col_chunk - 1) // col_chunk
+		col_chunk = ((n_col // n_blocks + p_y - 1) // p_y) * p_y
+
+	# Accumulate in place.  A ``jnp.concatenate`` over the blocks would hold
+	# every block AND the assembled square live at once, doubling the (nq,
+	# mu, mu) footprint at the exact moment this routine is trying to shrink
+	# it; a donated ``dynamic_update_slice`` writes into the one buffer.
+	nq = int(psi_l_X.shape[0])
+	n_rmu = int(psi_l_X.shape[1])
+	out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+	out = jax.device_put(
+		jnp.zeros((nq, n_rmu, n_col), dtype=jnp.complex128), out_sh)
+
+	@partial(jax.jit, donate_argnums=(0,))
+	def _place(dst, blk, c0):
+		return jax.lax.dynamic_update_slice(
+			dst, blk, (jnp.int32(0), jnp.int32(0), c0))
+
+	for c0 in range(0, n_col, col_chunk):
+		c1 = min(c0 + col_chunk, n_col)
+		blk = c_q_from_psi_sm(
+			psi_l_X, psi_l_Y[..., c0:c1], psi_r_X, psi_r_Y[..., c0:c1],
+			gamma_L, gamma_R, kgrid=kgrid, mesh_xy=mesh_xy)
+		out = _place(out, blk, jnp.int32(c0))
+		del blk
+	return out
+
+
 def z_q_from_psi_sm(
 	psi_l_X: jax.Array,
 	psi_r_X: jax.Array,

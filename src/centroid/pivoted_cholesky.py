@@ -220,13 +220,14 @@ import symmetry_maps                                            # noqa: E402
 # at 0.165 s on a production Gram it is 3-4 % of the driver's wall).
 
 
-@partial(jax.jit, static_argnames=('k_keep', 'tol_rel'))
+@partial(jax.jit, static_argnames=('k_keep', 'tol_rel', 'orbit_block'))
 def pivoted_cholesky_select(
     G: jnp.ndarray,
     k_keep: int,
     orbit_id: jnp.ndarray | None = None,
     *,
     tol_rel: float | None = None,
+    orbit_block: bool = False,
 ):
     """Greedy pivoted Cholesky on an Hermitian PSD ``G``. STOPS at the
     numerical-rank floor. Returns ``(piv, L, rank, d_final, d_taken,
@@ -293,11 +294,23 @@ def pivoted_cholesky_select(
     )
     col_ids = jnp.arange(k_keep)
 
+    if orbit_block:
+        init = init + (jnp.int32(-1),)          # cur_orbit: none open yet
+
     def body(j, carry):
-        (d, L, piv, active, d_taken, trR_over_trG,
-         d_min_raw, d_min_at, d_min_j) = carry
+        if orbit_block:
+            (d, L, piv, active, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j, cur_orbit) = carry
+        else:
+            (d, L, piv, active, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j) = carry
 
         masked_d = jnp.where(active, d, minus_inf)
+        if orbit_block:
+            masked_o = jnp.where(active & (orbit_id == cur_orbit),
+                                 d, minus_inf)
+            more = jnp.isfinite(jnp.max(masked_o))
+            masked_d = jnp.where(more, masked_o, masked_d)
         p = jnp.argmax(masked_d)
         # THE STOP.  ``pivot_val`` clamps at ``floor`` (not ``eps``), so on a
         # healthy input this is bit-for-bit the old arithmetic and past the
@@ -338,16 +351,26 @@ def pivoted_cholesky_select(
         # value instead of going −inf/NaN.
         d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
         trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
-        # Mark p (or its whole orbit, if orbit_id was provided) inactive.
-        kill_mask = (orbit_id == orbit_id[p]) & take
+        # Mark p inactive — its whole orbit in one-pivot-per-orbit mode,
+        # p alone under ``orbit_block`` (where the orbit is consumed member
+        # by member) and under the plain point mode.
+        if orbit_block:
+            kill_mask = (jnp.arange(M) == p) & take
+        else:
+            kill_mask = (orbit_id == orbit_id[p]) & take
         d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
         active = active & ~kill_mask
 
+        if orbit_block:
+            cur_orbit = jnp.where(more & take, cur_orbit, orbit_id[p])
+            return (d, L, piv, active, d_taken, trR_over_trG,
+                    d_min_raw, d_min_at, d_min_j, cur_orbit)
         return (d, L, piv, active, d_taken, trR_over_trG,
                 d_min_raw, d_min_at, d_min_j)
 
+    _out = lax.fori_loop(0, k_keep, body, init)
     (d, L, piv, _, d_taken, trR_over_trG,
-     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(0, k_keep, body, init)
+     d_min_raw, d_min_at, d_min_j) = _out[:9]
     d_final = jnp.where(jnp.isfinite(d), d, 0.0)
     # Effective rank = #pivots taken.  With the stopping rule above this is
     # exactly the loop's trip count: ``d_taken[j] > floor`` for every taken
@@ -521,7 +544,7 @@ def refuse_unless_select_certified(
 POINT_RANK_CAP_DEFAULT = 4096
 
 
-def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
+def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None, mesh=None):
     """Independent directions in the DELIVERED POINT SET, not in the orbits.
 
     THE CONFUSION THIS REMOVES.  In orbit mode the greedy select deflates
@@ -559,7 +582,20 @@ def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
                 f"skipped: {n_pts} points exceeds the O(n^3) cap {int(cap)} "
                 f"(raise LORRAX_CENTROID_POINT_RANK_CAP to measure anyway)")
     try:
-        sub = np.asarray(jax.device_get(G))[np.ix_(keep_mask, keep_mask)]
+        # TAKE ON THE DEVICE, GATHER THE SUBMATRIX — not the other way round.
+        # ``jax.device_get(G)`` refuses outright at P > 1 ("Fetching value for
+        # a jax.Array that spans non-addressable devices"), so this number
+        # went MISSING on exactly the multi-process runs that most need it,
+        # and the graceful skip meant a log with no direction count looked
+        # like a log with a fine one.  It is also the wrong shape of work:
+        # the whole Gram is O(M²) — 3.06 GB for a whole-grid candidate pool —
+        # while the submatrix being measured is (n_pts, n_pts), 45 MB.
+        idx = jnp.asarray(np.flatnonzero(keep_mask))
+        sub_dev = jnp.take(jnp.take(G, idx, axis=0), idx, axis=1)
+        if mesh is not None:
+            sub_dev = jax.device_put(
+                sub_dev, NamedSharding(mesh, PartitionSpec()))
+        sub = np.asarray(jax.device_get(sub_dev))
     except Exception as exc:                                  # noqa: BLE001
         return None, n_pts, f"skipped: could not gather the Gram ({exc})"
     d0max = float(np.real(np.diag(sub)).max())
@@ -594,6 +630,9 @@ def prune_candidates_by_pivoted_cholesky(
     orbit_id: np.ndarray | None = None,
     use_phdf5: bool = False,
     tol_rel: float | None = None,
+    score_point_sets: dict | None = None,
+    close_orbits_after=None,
+    orbit_block: bool = False,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -756,6 +795,7 @@ def prune_candidates_by_pivoted_cholesky(
     with timing.section("prune.select"):
         select_step = make_sharded_pivoted_cholesky_select(
             mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,
+            orbit_block=orbit_block,
         )
         # Pad mask: real candidates active, pads inactive.  None when n_pad==0
         # so the P=1 / already-divisible paths take the byte-identical old
@@ -809,9 +849,92 @@ def prune_candidates_by_pivoted_cholesky(
     rank_i = int(rank)
     refuse_unless_select_certified(
         piv_np, rank_i, psd_host, n_keep=n_keep, M=M, M_pad=M_pad,
-        orbit_id=orbit_id, d0max=float(diag_host.max()), tol_rel=tol_rel)
+        # In orbit-BLOCK mode the pivots are points that happen to be walked
+        # in orbit order, so the pool the request has to fit inside is the
+        # candidate list, not the orbit list — passing ``orbit_id`` here
+        # would compare a point count against an orbit count and refuse a
+        # legitimate request.
+        orbit_id=None if orbit_block else orbit_id,
+        d0max=float(diag_host.max()), tol_rel=tol_rel)
 
-    if orbit_id is None:
+    if close_orbits_after is not None:
+        # ── POINT PIVOTS, ORBIT CLOSURE AFTERWARDS ──────────────────────
+        # WHY THIS MODE EXISTS, measured.  Orbit-mode pivoting deflates ONE
+        # direction per pick while removing a whole orbit from contention,
+        # so what it maximises is the rank of the orbit-REPRESENTATIVE
+        # subspace — and orbit closure then delivers points that are
+        # symmetry images rather than new directions.  On a whole-grid pool
+        # it is much worse than that sounds, because the residual diagonal
+        # is largest at high-symmetry sites (bond centres, atom sites) and
+        # those sit on SPECIAL-POSITION orbits, whose members are the most
+        # redundant of all.  Measured on Si 4x4x4 at 24^3, nband = 100:
+        # 44 orbits, 1676 delivered points, and only 801 independent
+        # directions — 47.8 % of the points, against 68-76 % for every one
+        # of the eighteen recorded k-means draws at the same N.
+        #
+        # Pivoting on POINTS deflates the direction it actually consumes,
+        # so every pivot is a certified new direction and the count is the
+        # pivot count by construction.  Closure is then applied to the
+        # SELECTED set, which is the order the k-means path also ends up in
+        # (it closes candidates, then selects) and which is what a centroid
+        # quadrature needs — V_H is only point-group symmetric across a
+        # k-star if {r_mu} is closed.
+        orbit_id_np = np.asarray(close_orbits_after)
+        sizes_all = np.bincount(orbit_id_np,
+                                minlength=int(orbit_id_np.max()) + 1)
+        picked_orbits = np.unique(orbit_id_np[piv_np])
+        dropped = 0
+        if orbit_block:
+            # The block order consumes an orbit ENTIRELY before opening the
+            # next, so at most the last one is partial — and a partial orbit
+            # is the one thing this mode must not deliver, because then the
+            # set is no longer closed and ⟨nk|V_H|nk⟩ stops being point-group
+            # symmetric across the k-star.  Drop it rather than round the
+            # count up with points that were never pivoted.
+            n_piv_in = np.bincount(orbit_id_np[piv_np],
+                                   minlength=sizes_all.size)
+            complete = np.flatnonzero(n_piv_in == sizes_all)
+            complete = complete[np.isin(complete, picked_orbits)]
+            dropped = int(picked_orbits.size - complete.size)
+            picked_orbits = complete
+        in_kept = np.isin(orbit_id_np, picked_orbits)
+        keep_idx = np.asarray(cand_idx)[in_kept]
+        if verbose:
+            mode = "orbit-block pivots" if orbit_block else "point pivots"
+            print(f"[pivoted_cholesky] {mode} + closure: {len(piv_np)} "
+                  f"point pivots in {picked_orbits.size} complete orbits → "
+                  f"{len(keep_idx)} centroids (orbit-closed"
+                  f"{f'; {dropped} partial orbit dropped' if dropped else ''})")
+            # The nested-prefix ladder again, but on the CLOSURE: pivot j's
+            # rung is the size of the union of orbits of the first j pivots,
+            # which is the delivered N for every smaller --n-pivot-keep.
+            seen = np.zeros(int(orbit_id_np.max()) + 1, dtype=bool)
+            sizes = np.bincount(orbit_id_np,
+                                minlength=int(orbit_id_np.max()) + 1)
+            cum, tot = [], 0
+            for p in piv_np:
+                o = int(orbit_id_np[p])
+                if not seen[o]:
+                    seen[o] = True
+                    tot += int(sizes[o])
+                cum.append(tot)
+            step = max(1, len(cum) // 30)
+            rungs = [f"{j + 1}:{cum[j]}" for j in range(len(cum))
+                     if (j + 1) % step == 0 or j == len(cum) - 1]
+            print(f"  [pivot ladder] delivered points at n_pivot_keep = "
+                  f"{', '.join(rungs)}  (--n-pivot-keep pins it)")
+        pt_rank, n_pts, why = point_granularity_rank(
+            G, in_kept, tol_rel=tol_rel, mesh=mesh)
+        if verbose:
+            if pt_rank is None:
+                print(f"  [point rank] {len(piv_np)} pivots, {n_pts} points, "
+                      f"independent directions NOT MEASURED — {why}")
+            else:
+                print(f"  [point rank] {len(piv_np)} pivots, {n_pts} points, "
+                      f"{pt_rank} independent directions "
+                      f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the "
+                      f"points)")
+    elif orbit_id is None:
         keep_idx = np.asarray(cand_idx)[piv_np]
     else:
         # Unfold: kept = union of orbits of picked pivots.
@@ -822,11 +945,25 @@ def prune_candidates_by_pivoted_cholesky(
         if verbose:
             print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
+            # THE PREFIX LADDER.  Greedy pivoting is NESTED: the first j
+            # pivots of a k-pivot run are exactly the pivots a j-pivot run
+            # would have taken.  So the cumulative point count below is not a
+            # diagnostic of this run alone — it is the delivered N for EVERY
+            # smaller orbit target, read off one run.  Without it, landing a
+            # selector on a target N (which orbit closure quantises, in steps
+            # of up to n_sym points) costs one full run per guess.
+            _sizes = np.bincount(orbit_id_np)[orbit_id_np[piv_np]]
+            _cum = np.cumsum(_sizes)
+            _rungs = [f"{j + 1}:{int(_cum[j])}" for j in range(len(_cum))
+                      if (j + 1) % 5 == 0 or j == len(_cum) - 1]
+            print(f"  [orbit ladder] picked orbit sizes {list(map(int, _sizes))}")
+            print(f"  [orbit ladder] delivered points at n_orbit_keep = "
+                  f"{', '.join(_rungs)}  (--n-orbit-keep pins it)")
         # R2 — certify at POINT granularity, which is the granularity of the
         # FILE being written.  Orbit mode only: in point mode ``rank`` is
         # already the point count and there is nothing to reconcile.
         pt_rank, n_pts, why = point_granularity_rank(
-            G, in_kept, tol_rel=tol_rel)
+            G, in_kept, tol_rel=tol_rel, mesh=mesh)
         if verbose:
             if pt_rank is None:
                 print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
@@ -843,6 +980,28 @@ def prune_candidates_by_pivoted_cholesky(
                           f"back-solve will truncate about that many modes "
                           f"per q; D3 shipped a 7 GiB restart file to learn "
                           f"the same thing downstream.")
+    # ---- Rival point sets, scored on THIS Gram --------------------------
+    # The direction count is only comparable between two point sets when both
+    # were measured on the same Gram: the stopping floor is
+    # ``tol · max(diag G)``, and two candidate pools have different diagonal
+    # maxima (9.570e-06 for a whole-grid pool against 8.153e-06 for a
+    # k-means one on the same Si deck), so two logs' counts differ by their
+    # instruments as well as by their sets.  A whole-grid pool CONTAINS every
+    # other set on that grid, so it can score them all on one instrument, for
+    # the cost of an eigendecomposition of an (n, n) submatrix.
+    if score_point_sets and verbose:
+        for label, mask in score_point_sets.items():
+            r_x, n_x, why_x = point_granularity_rank(
+                G, mask, tol_rel=tol_rel, mesh=mesh)
+            if r_x is None:
+                print(f"  [point rank | rival] {label}: {n_x} points, "
+                      f"NOT MEASURED — {why_x}")
+            else:
+                print(f"  [point rank | rival] {label}: {n_x} points, "
+                      f"{r_x} independent directions "
+                      f"({100.0 * r_x / max(1, n_x):.1f}% of the points), "
+                      f"scored on THIS run's Gram")
+
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
@@ -882,6 +1041,7 @@ def make_sharded_pivoted_cholesky_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    orbit_block: bool = False,
 ):
     """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
     numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
@@ -974,13 +1134,35 @@ def make_sharded_pivoted_cholesky_select(
                 jnp.int32(-1),
             )
 
+            if orbit_block:
+                init = init + (jnp.int32(-1),)      # cur_orbit: none open yet
+
             def body(j, carry):
-                (d, L, piv, active, d_taken, trR_over_trG,
-                 d_min_raw, d_min_at, d_min_j) = carry
+                if orbit_block:
+                    (d, L, piv, active, d_taken, trR_over_trG,
+                     d_min_raw, d_min_at, d_min_j, cur_orbit) = carry
+                else:
+                    (d, L, piv, active, d_taken, trR_over_trG,
+                     d_min_raw, d_min_at, d_min_j) = carry
 
                 # Pick global pivot: per-device argmax then pmax + tie-break
                 # to lowest global index.
                 masked_d = jnp.where(active, d, minus_inf)
+                if orbit_block:
+                    # ORBIT-BLOCK ORDER.  Finish the orbit in progress before
+                    # opening a new one; when none is in progress, open the
+                    # one holding the largest residual.  Deflation stays
+                    # RANK-1 per point, so every member of a picked orbit is
+                    # a certified independent direction — which is what makes
+                    # the CLOSED set's rank equal the pivot count, rather
+                    # than the pivot count being the rank of a set fifteen
+                    # times smaller than what gets delivered.
+                    in_orb = active & (orbit_id_slab == cur_orbit)
+                    masked_o = jnp.where(in_orb, d, minus_inf)
+                    loc_o = jnp.argmax(masked_o)
+                    glob_ov = lax.pmax(masked_o[loc_o], mesh_axis)
+                    more = jnp.isfinite(glob_ov)
+                    masked_d = jnp.where(more, masked_o, masked_d)
                 local_p_idx = jnp.argmax(masked_d)
                 local_pv = masked_d[local_p_idx]
                 global_pv = lax.pmax(local_pv, mesh_axis)
@@ -1058,7 +1240,7 @@ def make_sharded_pivoted_cholesky_select(
                 # collective round trip per iteration for a number nobody
                 # reads until the end was the cheapest 25% on the hot path.
                 trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new))
-                if orbit_id_slab is None:
+                if orbit_id_slab is None or orbit_block:
                     kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
                 else:
                     # ``orbit_id_p`` came back on the FUSED psum above.
@@ -1067,13 +1249,20 @@ def make_sharded_pivoted_cholesky_select(
                 active = active & ~kill_mask
                 d = jnp.where(kill_mask, minus_inf,
                               jnp.where(take, d_new, d))
+                if orbit_block:
+                    # ``more`` says the pivot came from the orbit already in
+                    # progress; otherwise this pivot OPENED an orbit and its
+                    # id (off the same fused psum) becomes the current one.
+                    cur_orbit = jnp.where(more & take, cur_orbit, orbit_id_p)
+                    return (d, L, piv, active, d_taken, trR_over_trG,
+                            d_min_raw, d_min_at, d_min_j, cur_orbit)
 
                 return (d, L, piv, active, d_taken, trR_over_trG,
                         d_min_raw, d_min_at, d_min_j)
 
+            _out = lax.fori_loop(0, k_keep, body, init)
             (d_final, L_out, piv_out, _, d_taken, trR_over_trG,
-             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
-                0, k_keep, body, init)
+             d_min_raw, d_min_at, d_min_j) = _out[:9]
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
             # The one psum the per-iteration diagnostic was costing.
             trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG
@@ -1337,51 +1526,92 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
 
-    # ---- Single-device column-blocked path (size-ladder wall fix) ----
+    # ---- Column-blocked Gram build (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
-    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
-    # Per-element contraction order is unchanged by blocking the OUTPUT
-    # columns, so G is numerically the same map; only materialization moves.
-    # Multi-device meshes keep the original path untouched (the 'y'-sharded
-    # column axis must not be sliced locally).
+    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309),
+    # and 196 GB EACH at M = 13824, which is what a WHOLE-GRID candidate pool
+    # (``--candidate-pool full_grid``) is on a 24³ deck.  Per-element
+    # contraction order is unchanged by blocking the OUTPUT columns, so G is
+    # numerically the same map; only materialization moves.
+    #
+    # THE COLUMN AXIS IS FREE ON EVERY MESH.  This used to be gated on
+    # ``n_dev_total == 1`` with the reason "the 'y'-sharded column axis must
+    # not be sliced locally".  That is true INSIDE a ``shard_map``, where a
+    # local slice would silently mean different columns on different devices
+    # — and false here, because ``psi_l_rmu_Y[..., c0:c1]`` is a slice of a
+    # GLOBALLY sharded array in ordinary JAX tracing: the compiler owns the
+    # reshard and the block is the same columns everywhere.  Leaving the gate
+    # in place meant a multi-device run had no blocking at all and therefore a
+    # LOWER ceiling on M than a single-device run — the whole point of a mesh
+    # inverted.  ``col_block`` is rounded to a multiple of the 'y' axis so
+    # every block, including the ragged last one, still divides the mesh.
     n_dev_total = mesh_xy.devices.size
-    col_block = 0
-    if n_dev_total == 1:
-        # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
-        # means "no override", i.e. the auto budget below.  This USED to be a bare
-        # presence test — ``=0`` and ``=off`` are the two spellings a user
-        # reaches for to DISABLE a knob, and they did the opposite or
-        # crashed: "0" is a non-empty string, so it took the override
-        # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
-        # block (maximum blocking), while "off" died in ``int()`` mid-run
-        # after the left window had already been loaded.  Same falsy
-        # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
-        env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-        if env_cb.lower() in ("", "0", "false", "no", "off"):
-            env_cb = ""
-        if env_cb:
-            try:
-                col_block = max(256, int(env_cb))
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                    f"integer column width nor a falsy token "
-                    f"('', 0, false, no, off)."
-                ) from None
+    n_y = int(mesh_xy.shape.get('y', 1))
+    # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
+    # means "no override", i.e. the auto budget below.  This USED to be a bare
+    # presence test — ``=0`` and ``=off`` are the two spellings a user
+    # reaches for to DISABLE a knob, and they did the opposite or
+    # crashed: "0" is a non-empty string, so it took the override
+    # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
+    # block (maximum blocking), while "off" died in ``int()`` mid-run
+    # after the left window had already been loaded.  Same falsy
+    # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
+    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+    if env_cb.lower() in ("", "0", "false", "no", "off"):
+        env_cb = ""
+    nk_, _, ns_, M_ = psi_l_rmu_Y.shape
+    # Two pair tensors (left and right) are live at once, each
+    # (nk, ns, ns, M, cols) complex128 — hence the leading 2 and the ns².
+    bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16 / max(n_dev_total, 1)
+    budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
+    cb_budget = int(budget_bytes // max(bytes_per_col, 1))
+    waived = False
+    if env_cb:
+        try:
+            col_block = max(1, int(env_cb))
+        except ValueError:
+            raise ValueError(
+                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
+                f"integer column width nor a falsy token "
+                f"('', 0, false, no, off)."
+            ) from None
+    else:
+        # 256 is a PERFORMANCE floor — narrower blocks under-fill the
+        # einsum — and it is not a correctness one.  It used to be applied
+        # with ``max(256, ...)``, i.e. clamped UP past a budget that could
+        # not pay for it, which is the same defect the ISDF planner had at
+        # Stage C: the knob that exists to keep the run inside memory was
+        # overridden by a speed preference and the run OOMed at a width
+        # nothing had authorised.  Waive it, loudly, when the budget says so.
+        col_block = max(1, cb_budget)
+        if col_block < 256:
+            waived = True
         else:
-            nk_, _, ns_, M_ = psi_l_rmu_Y.shape
-            bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
-            budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
-            col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
-        if col_block >= psi_l_rmu_Y.shape[3]:
-            col_block = 0  # one full block == the original computation
+            col_block = max(256, col_block)
+    # Round to a multiple of the 'y' mesh extent so both the full blocks and
+    # the ragged tail shard evenly (M itself is already a multiple of n_dev).
+    if n_y > 1 and col_block % n_y:
+        col_block = max(n_y, (col_block // n_y) * n_y)
+    if col_block >= psi_l_rmu_Y.shape[3]:
+        col_block = 0  # one full block == the original computation
 
     if col_block:
         M_cols = psi_l_rmu_Y.shape[3]
         if verbose:
             print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
                   f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; single-device path)")
+                  f"({-(-M_cols // col_block)} blocks; {n_dev_total} device"
+                  f"{'' if n_dev_total == 1 else 's'}, "
+                  f"{bytes_per_col / 1e6:.1f} MB/col/device)")
+            if waived:
+                print(f"[pivoted_cholesky] the 256-column PERFORMANCE floor "
+                      f"is WAIVED: the "
+                      f"{meta.memory_per_device_gb:g} GB/device budget pays "
+                      f"for {cb_budget} columns, and clamping up to 256 "
+                      f"would have asked for "
+                      f"{256 * bytes_per_col / 1e9:.1f} GB/device of pair "
+                      f"tensors against a {budget_bytes / 1e9:.1f} GB "
+                      f"allowance.  Narrower blocks are slower, not wrong.")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
@@ -1391,14 +1621,24 @@ def build_gram_q0_via_loadwfns(
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
             psi_r_rmu_Y.block_until_ready()
+        # ``pair_density`` is a ``jax.jit`` with EXPLICIT ``in_shardings``, and
+        # pjit does not implicitly reshard an argument that arrives laid out
+        # differently — it refuses by name.  Slicing the column axis is exactly
+        # such a case: JAX hands back the block REPLICATED (measured: a
+        # ``complex128[64,8,2,302]`` slice of a 'y'-sharded array came back
+        # ``PartitionSpec()``), so the block has to be placed back onto 'y'
+        # before the call.  On one device this is a no-op, which is why the
+        # single-device path never had to say it.
+        col_y = NamedSharding(mesh_xy, PartitionSpec(None, None, None, 'y'))
         with timing.section("q0_sum"):
             g_blocks = []
             for c0 in range(0, M_cols, col_block):
                 c1 = min(c0 + col_block, M_cols)
-                P_l_b = pair_density(
-                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
-                P_r_b = pair_density(
-                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
+                blk_l = jax.device_put(psi_l_rmu_Y[..., c0:c1], col_y)
+                blk_r = jax.device_put(psi_r_rmu_Y[..., c0:c1], col_y)
+                P_l_b = pair_density(psi_l_rmuT_X, blk_l, mesh_xy)
+                P_r_b = pair_density(psi_r_rmuT_X, blk_r, mesh_xy)
+                del blk_l, blk_r
                 G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
                                         symmetrize=False)
                 G_b.block_until_ready()

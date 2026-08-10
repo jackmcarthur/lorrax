@@ -19,18 +19,47 @@ The whole model is two things summed:
 co-exist, so the HWM takes a ``max``, not a sum:
 
     A  centroid load    fit FFT box (nk, bc, ns, n_rtot)      knob: band_chunk
-    B  CCT + Cholesky   C_q + full-(μ,μ) pair density
-    C  fit_one_rchunk   slots·(nk,ns²,μ,cr) + Z_q (nq,μ,cr)   knob: chunk_r  ← binder
+    B  CCT + Cholesky   C_q (nq,μ,μ) + slots·(nk,ns²,μ,cc)    knob: cct_col_chunk
+    C  fit_one_rchunk   slots·(nk,ns²,μ,cr) + Z_q (nq,μ,cr)   knob: chunk_r
     D  accumulate       accumulate FFT box (cs, n_rtot)       knob: gflat_chunk_size
     E  V_q per tile     V_acc + resharded ζ slabs   (own base, post-fit)
+
+**Which stage binds is a function of μ, and B is not always the small one.**
+Stage C used to be labelled "the binder" here on the strength of decks with
+μ ≲ 1500.  Stages B and C carry the SAME ``slots`` concurrent
+``(nk, ns², μ, ·)`` pair-density arenas — ``slots`` is 3 on GPU, an HLO
+BufferAssignment fact — and they differ only in what fills the last axis:
+Stage C's is ``cr``, which ``chunk_r`` dials, and Stage B's is the CENTROID
+axis itself, which until 2026-08-10 nothing dialled.  So Stage B grows as
+μ² while Stage C grows as μ·cr, and past μ ≈ 1600 on a 40 GB card B is the
+binder and always was: at μ = 2244 on Si 4×4×4 it asked for a single
+57.63 GiB allocation and no deck key could reach it (measured; the
+"single-A100 centroid ceiling" of ``BGW_CD_COMPARISON_DESIGN`` §7.7.9 is
+that allocation and not a physics limit).  ``cct_col_chunk`` is the knob
+that reaches it, and the column axis is a free index through the whole
+Stage-B pipeline, so blocking it is EXACT — see
+``isdf.core.c_q_from_psi_sm_colblocked``.
 
 Two-phase picker (§2):
 
     Phase 1 — rank floor.  ``persistent(P)`` is un-chunkable; the smallest
               mesh ``P`` with ``persistent(P) ≤ util·budget`` is ``P_min``.
               If the requested ``P < P_min`` → infeasible.
-    Phase 2 — dial ``chunk_r`` down from ``n_rtot`` against Stage C's slope
-              so ``HWM ≤ util·budget``; report the binding stage.
+    Phase 2 — dial ``chunk_r`` down from ``n_rtot`` against Stage C's slope,
+              then ``cct_col_chunk`` down from ``μ`` against Stage B's, so
+              ``HWM ≤ util·budget``; report the binding stage.
+
+**Budget beats performance floor, in both phases.**  Each knob has a shape
+preference — ``r_lo = min(μ, n_rtot)`` keeps Stage C's GEMM from going
+skinny, ``_CCT_COL_FLOOR`` keeps Stage B's rank-5 einsum filling the SMs —
+and each preference used to be applied as an unconditional ``max(floor,
+budget_answer)``.  That inverts the planner: the clamp fires exactly when
+the budget is tightest, and the model then prints a number it has itself
+computed to be over budget and runs anyway (measured: ``HWM estimate =
+78.00 GB/dev (279% of budget)`` at μ = 2244, followed by an OOM).  The
+floors are now PREFERENCES — taken whenever the budget can pay, waived with
+an ``_announce`` when it cannot.  A narrower chunk is slower; an
+over-budget one is an OOM, and the fit is exact at every chunk width.
 
 Bispinor (§1b): the fit loop (A–D) runs the charge channel only — the 3
 transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
@@ -42,7 +71,12 @@ the Stage-A/D FFT box (``_fft_box_bytes`` compiles the production FFT helper
 at the real shape/mesh and reads XLA's buffer peak *plus* the cuFFT plan
 workspace, via ``common.fft_helpers.query_fft_peak_bytes`` ->
 ``runtime.aot_memory.aot_kernel_peak_bytes``) and the pair-density ``slots``
-count (3 GPU / 4 CPU, an XLA BufferAssignment fact).  Where a measurement is
+count (3 GPU / 4 CPU, an XLA BufferAssignment fact), which is charged to
+Stage B and Stage C ALIKE.  Stage B's count used to be hard-coded to 2 here
+while Stage C read the measurement; that under-reported Stage B by one whole
+``(nk, ns², μ, μ)`` buffer — 19.2 GB of a 57 GB estimate at μ = 2244 — and
+the request that actually killed that rung was 3 × 20.63 GB = 57.63 GiB,
+which the corrected accounting matches to the byte.  Where a measurement is
 unavailable the model demotes to an analytic bound and ANNOUNCES it from the
 rank it happened on — an un-measured term here is a silent OOM later.
 """
@@ -50,6 +84,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 from typing import Optional
 
 import jax.numpy as jnp
@@ -73,9 +108,19 @@ def _c128(*dims, shard: int = 1) -> float:
 
 
 def _pair_density_slots() -> int:
-    """Concurrent rank-5 ``(nk, ns², μ, cr)`` pair-density slots XLA keeps
-    live at the Stage-C peak — 3 on GPU, 4 on CPU.  This is a
-    BufferAssignment fact (HLO-calibrated), not shape algebra."""
+    """Concurrent rank-5 pair-density slots XLA keeps live inside ONE
+    ``shard_map`` of the CCT pipeline — 3 on GPU, 4 on CPU.  A
+    BufferAssignment fact (HLO-calibrated), not shape algebra.
+
+    THE SAME COUNT APPLIES TO BOTH STAGES THAT RUN THAT PIPELINE.  Stage C
+    (``fit_one_rchunk``) holds ``slots·(nk, ns², μ, cr)``; Stage B
+    (``c_q_from_psi_sm``, the CCT pair density) holds
+    ``slots·(nk, ns², μ, cc)`` where ``cc`` is the centroid column block and
+    equals μ when unblocked.  Only the last axis differs — it is the same
+    einsum on the same operands — so charging Stage B a different number was
+    never defensible; it was charged 2 until 2026-08-10 and the missing third
+    slot is exactly the gap between the model's estimate and the allocation
+    that OOMed at μ = 2244."""
     try:
         import jax
         return 4 if jax.default_backend() == "cpu" else 3
@@ -99,6 +144,13 @@ _FFT_CUFFT_FACTOR = 4.0
 # scratch grows non-linearly (cs=1414 OOM'd at production CrI3 80Ry).
 GFLAT_CHUNK_SIZE_CAP = 100
 _GFLAT_CHUNK_FLOOR = 4  # cuFFT plan amortisation
+#: Smallest Stage-B column block worth compiling.  Below ~64 columns the
+#: rank-5 einsum stops filling an A100's SMs and the k-space FFT batch
+#: amortises badly.  A PREFERENCE, not a bound: when the budget cannot pay
+#: for 64 columns the planner goes narrower and announces it, because the
+#: pair density is exact at every block width and the alternative is an OOM.
+#: A deck that lands here is asking for a bigger mesh; it still gets a run.
+_CCT_COL_FLOOR = 64
 
 
 def _factor_mesh(pp: int) -> tuple[int, int]:
@@ -182,9 +234,14 @@ _GATHERED_PSI_SLOTS = 2
 
 
 def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
-    """Per-``cr`` bytes of the Stage-C transient (the binder): the ``slots``
-    concurrent pair-density accumulators, the Z_q output, and the two psi(r)
-    slabs the band-gather machinery keeps live.
+    """Per-``cr`` bytes of the Stage-C transient: the ``slots`` concurrent
+    pair-density accumulators, the Z_q output, and the two psi(r) slabs the
+    band-gather machinery keeps live.
+
+    A SLOPE, NOT THE BINDER.  Stage C is linear in ``cr``, which is why it
+    is the stage Phase 2 dials first — but it is only the binding stage while
+    Stage B's μ² term is smaller, i.e. below μ ≈ 1600 on a 40 GB card.  See
+    the module docstring's stage table for who binds where.
 
     THE GATHERED psi(r) SLAB IS SHARDED ON 'y' ONLY -- 1/p_y, not 1/P.
     ``z_q_from_psi_sm`` computes each rank's 1/P band block over the FULL
@@ -227,6 +284,7 @@ class GFlatChunkPlan:
     p_min: int                    # rank floor
     budget_bytes: float
     target_utilization: float
+    cct_col_chunk: int = 0      # 0 = Stage B unblocked (the byte-unchanged default)
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -235,6 +293,9 @@ class GFlatChunkPlan:
             "  ISDF memory model — chunk plan + HWM estimate",
             f"    band_chunk    = {self.band_chunk}",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
+            (f"    cct_col_chunk = {self.cct_col_chunk}"
+             if self.cct_col_chunk else
+             "    cct_col_chunk = 0  (Stage B unblocked)"),
             f"    q_chunk       = {self.q_chunk}",
             f"    gflat_cs      = {self.gflat_chunk_size}",
             f"    P_min (floor) = {self.p_min}",
@@ -375,17 +436,102 @@ def plan_gflat_chunks(
     C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
                              p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
     headroom_C = max(target - persistent_total, 0.0)
-    r_lo = min(mu, n_rtot)                      # performance floor (§3)
+    # A GEMM-shape PREFERENCE (§3), not a bound — see the waiver below.
+    r_lo = min(mu, n_rtot)
     if r_chunk_override and r_chunk_override > 0:
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
         r_from_budget = int(headroom_C / C_slope) if C_slope > 0 else n_rtot
-        r_chunk = max(r_lo, min(n_rtot, r_from_budget))
+        r_chunk = max(1, min(n_rtot, r_from_budget))
+        # THE PERFORMANCE FLOOR IS A PREFERENCE; THE BUDGET IS NOT.
+        # ``r_lo`` keeps Stage C's GEMM from going too skinny, and lifting
+        # ``chunk_r`` up to it is free whenever the budget can pay.  It used
+        # to be applied as an unconditional ``max(r_lo, ...)``, which
+        # inverts the planner exactly where Stage C's slope is largest:
+        # that slope is linear in ``mu``, so a clamp at ``cr = mu`` makes
+        # the transient quadratic in ``mu`` and the model sails past its own
+        # budget.  MEASURED on Si 4x4x4 at mu = 2244: the budget asked for
+        # cr = 469, the floor forced 2244, and the plan printed
+        # ``HWM estimate = 78.00 GB/dev (279% of budget)`` -- and then ran.
+        # Column-blocking the fit is EXACT (``cr`` blocks the RHS of a solve
+        # whose (mu, mu) factor is built once in Stage B), so paying in
+        # passes is always available and always beats an OOM.
+        if r_chunk < r_lo:
+            _announce(
+                f"chunk_r-floor-waived:{mu}",
+                f"Stage-C budget wants chunk_r = "
+                f"{r_chunk} at mu = {mu}; the performance floor "
+                f"min(mu, n_rtot) = {r_lo} is HIGHER and is being waived. "
+                f"The floor is a GEMM-shape preference and the fit is exact "
+                f"at any chunk_r, while exceeding the budget is an OOM. "
+                f"Expect narrower Stage-C GEMMs over more r-chunks.")
+        else:
+            r_chunk = max(r_lo, r_chunk)
         r_chunk = max(r_chunk, math.ceil(n_rtot / max_chunks))
         r_chunk = min(r_chunk, n_rtot)
     if p_xy > 1:
         r_chunk = max(p_xy, r_chunk - r_chunk % p_xy)
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
+
+    # ---- cct_col_chunk (Stage B pair density) --------------------------
+    # THE KNOB 7.7.9's "single-A100 ceiling" DID NOT HAVE.  Stage B builds
+    # the (μ, ν) pair density in one shot and nothing chunked it, so the
+    # ceiling on μ was set by an allocation no deck key could reach.  The
+    # column axis is a free index all the way through that pipeline (see
+    # ``isdf.core.c_q_from_psi_sm_colblocked``), so it blocks exactly; this
+    # picks the largest block that leaves Stage B inside the budget
+    # alongside the assembled C_q, and 0 means "no blocking needed".
+    # ``B_slope`` is the per-COLUMN cost of ONE pair-density arena; XLA keeps
+    # ``slots`` of them live, the same count Stage C is charged, so the
+    # divisor below is ``slots · B_slope`` and not ``2 · B_slope``.
+    B_assembled = _c128(nq, mu, mu, shard=p_xy)
+    B_slope = _c128(nk, ns, ns, mu, shard=p_xy)         # per column, per slot
+    headroom_B = max(target - persistent_total - B_assembled, 0.0)
+    col_full = int(headroom_B / (slots * B_slope)) if B_slope > 0 else mu
+    if col_full >= mu:
+        col_chunk_B = mu                                # unblocked
+        cct_col_chunk = 0
+    else:
+        # THE SAME PREFERENCE-VS-BUDGET RULE THE chunk_r FLOOR NOW FOLLOWS.
+        # ``_CCT_COL_FLOOR`` is an SM-occupancy preference; applying it as an
+        # unconditional ``max`` would reintroduce, on this knob, exactly the
+        # defect that made the μ = 2244 plan print 279 % of budget and run:
+        # the clamp fires only when the budget is tightest, which is the one
+        # case where it must not.  Take the floor when the budget can pay it,
+        # waive it loudly when it cannot.
+        col_chunk_B = min(mu, max(1, col_full))
+        if col_chunk_B < _CCT_COL_FLOOR:
+            _announce(
+                f"cct-col-floor-waived:{mu}",
+                f"Stage-B budget wants a {col_chunk_B}-column block at "
+                f"mu = {mu}; the occupancy floor {_CCT_COL_FLOOR} is HIGHER "
+                f"and is being waived.  Narrow blocks under-fill the rank-5 "
+                f"einsum and this deck will be slow in Stage B -- but the "
+                f"pair density is exact at any block width, and a block the "
+                f"budget cannot pay for is an OOM.  A bigger mesh is the "
+                f"real fix.")
+        else:
+            col_chunk_B = max(_CCT_COL_FLOOR, col_chunk_B)
+        cct_col_chunk = int(col_chunk_B)
+    # PROBE OVERRIDE.  The blocked and unblocked Stage-B paths must agree
+    # bit for bit -- the column axis is a free index all the way through
+    # that pipeline (see ``isdf.core.c_q_from_psi_sm_colblocked``) -- and
+    # the only way to TEST that claim is to force blocking at a size the
+    # budget would never choose, on a deck small enough that the unblocked
+    # run also exists.  An env knob rather than a deck key on purpose: this
+    # is a gate, not a physics setting, and it must not become a number
+    # that decks carry around.
+    _env_cc = os.environ.get("LORRAX_CCT_COL_CHUNK", "").strip()
+    if _env_cc:
+        _auto = ("unblocked" if col_full >= mu
+                 else str(int(max(_CCT_COL_FLOOR, min(mu, col_full)))))
+        cct_col_chunk = int(_env_cc)
+        col_chunk_B = mu if cct_col_chunk <= 0 else min(mu, cct_col_chunk)
+        _announce(
+            f"cct-col-chunk-env:{_env_cc}",
+            f"LORRAX_CCT_COL_CHUNK={_env_cc} overrides "
+            f"the Stage-B column block; the planner would have chosen "
+            f"{_auto}.")
 
     # ---- gflat_chunk_size (Stage D FFT box) ----------------------------
     fft_per_row = _c128(n_rtot) * 2.0   # accumulate box has no ns axis
@@ -408,8 +554,16 @@ def plan_gflat_chunks(
 
     # ---- stage transients + per-stage peaks ----------------------------
     A_t = fft_box_A
-    B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
-           + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
+    # Stage B's pair density carries the SAME concurrent-slot count XLA
+    # keeps in Stage C -- ``slots``, an HLO BufferAssignment fact, 3 on GPU.
+    # It was hard-coded to 2 here, which under-reported the stage by one
+    # full (nk, ns², μ, μ) buffer: at μ = 2244 on Si 4×4×4 that is 19.2 GB
+    # missing from a 57 GB estimate, and the request that actually killed
+    # the N = 2244 rung was 3 × 20.63 GB = 57.63 GiB, matched to the byte
+    # once the third slot is counted.
+    B_slot = _c128(nk, ns, ns, mu, col_chunk_B, shard=p_xy)
+    B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q (assembled)
+           + slots * B_slot)                           # (μ, col) pair density
     C_t = C_slope * r_chunk
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
     # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit;
@@ -456,6 +610,7 @@ def plan_gflat_chunks(
         band_chunk=int(band_chunk),
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
+        cct_col_chunk=int(cct_col_chunk),
         q_chunk=int(q_chunk),
         gflat_chunk_size=int(gflat_cs),
         hwm_bytes=float(hwm),
