@@ -78,8 +78,16 @@ NB_FULL = 6                   # the A-space band extent
 NB_PROJ = 4                   # the Σ window — m_pad / n_pad, mesh-divisible
 
 
-def _operands(seed=11):
-    """E_A / masks / pole field / ψ for a whole pass branch, host side."""
+def _operands(seed=11, gamma_scale=0.02):
+    """E_A / masks / pole field / ψ for a whole pass branch, host side.
+
+    ``gamma_scale`` sets the pole widths against the smearing ``xi`` the
+    planner is given: the default puts every pole BELOW it, so the whole
+    field routes through the legacy group -- which is the group that
+    re-enters ``_build_windows_for_branch`` and therefore the one that
+    carried C1.  A larger scale straddles ``xi`` and produces the MPA
+    families beside it.
+    """
     rng = np.random.default_rng(seed)
 
     # E_A ≥ 0 (energy above the Fermi level) with a genuine spread, so the
@@ -91,7 +99,7 @@ def _operands(seed=11):
     # The pole field: Re Ω spread across the crossing threshold, Γ small
     # enough that some poles route legacy and some route MPA.
     a = np.abs(rng.random((NK, NMU, NMU))) * 2.0 + 0.05
-    g = np.abs(rng.random((NK, NMU, NMU))) * 0.02 + 1.0e-4
+    g = np.abs(rng.random((NK, NMU, NMU))) * gamma_scale + 1.0e-4
     live = np.ones(a.shape, dtype=bool)
     B = (rng.random(a.shape) + 1j * rng.random(a.shape)).astype(np.complex128)
 
@@ -158,33 +166,40 @@ def test_the_pass_loop_survives_a_four_process_gather(monkeypatch):
 
     monkeypatch.setattr(PW, "_to_host_np", _four_process_allgather)
 
-    op = _operands()
-    groups, _stats = _plan(op)
-    assert groups, "the planner produced no groups to check"
+    # Two fields, so BOTH window families are scored.  The narrow one routes
+    # entirely through the legacy group -- the group that re-enters
+    # _build_windows_for_branch, and the one that broke.  The wide one is
+    # planned on the sign-definite branch ("val" on the +omega half), which
+    # is where the MPA families build their own windows from
+    # base_mask_A_host directly.
+    narrow = _operands()
+    wide = _operands(gamma_scale=1.0)
+    plans = [("narrow/cond", narrow, _plan(narrow)[0]),
+             ("wide/val", wide, _plan(wide, space="val")[0])]
 
-    # Both families must be present, or the cell is only scoring one of
-    # them: 'legacy' is the group that re-enters _build_windows_for_branch
-    # (the one that broke), the 'mpa[...]' groups build their own windows.
-    names = [g.name for g in groups]
-    assert any(n == "legacy" for n in names), names
-    assert any(n.startswith("mpa[") for n in names), names
+    names = {tag: [g.name for g in gs] for tag, _op, gs in plans}
+    assert any(n == "legacy" for n in names["narrow/cond"]), names
+    assert any(n.startswith("mpa[") for n in names["wide/val"]), names
 
-    want = op["E_A"].shape
-    for grp in groups:
-        for win in grp.windows:
-            assert np.shape(win.mask_A) == want, (
-                f"{grp.name}:{win.name} mask_A is {np.shape(win.mask_A)}, not "
-                f"{want} — a gather has put the process axis back on it")
+    for tag, op, groups in plans:
+        assert groups, f"{tag}: the planner produced no groups to check"
+        want = op["E_A"].shape
+        for grp in groups:
+            for win in grp.windows:
+                assert np.shape(win.mask_A) == want, (
+                    f"{tag} {grp.name}:{win.name} mask_A is "
+                    f"{np.shape(win.mask_A)}, not {want} — a gather has put "
+                    f"the process axis back on it")
 
-    # And the production consumer, which is where it actually died.
-    xn, yr, _xr, _yn = op["psi"]
-    enk = jnp.asarray(op["E_A"])
-    for grp in groups:
-        for win in grp.windows:
-            G = build_G_tau(jnp.asarray(xn), jnp.asarray(yr), enk,
-                            1j * 0.25, e_ref=float(win.E_ref_A),
-                            mask=jnp.asarray(win.mask_A))
-            assert G.shape == (NK, NS, NMU, NS, NMU)
+        # And the production consumer, which is where it actually died.
+        xn, yr, _xr, _yn = op["psi"]
+        enk = jnp.asarray(op["E_A"])
+        for grp in groups:
+            for win in grp.windows:
+                G = build_G_tau(jnp.asarray(xn), jnp.asarray(yr), enk,
+                                1j * 0.25, e_ref=float(win.E_ref_A),
+                                mask=jnp.asarray(win.mask_A))
+                assert G.shape == (NK, NS, NMU, NS, NMU)
 
 
 def test_the_installed_gather_really_does_prepend_the_process_axis():
