@@ -154,3 +154,49 @@ base arm was taken in a worktree that turned out to sit at `ad8d342f`, ten
 commits behind, and reported a +17 delta. A stale arm is not a control
 (`AGENT_PREAMBLE`, measurement discipline rule 4); the numbers above are from a
 worktree checked out at `7a7fe7a8` with `git rev-parse HEAD` printed.
+
+**FOUR REAL GPUs, FOUR PROCESSES, ON THE DECK — and the number was predicted
+before the run.** Workspace `/pscratch/sd/j/jackm/wedgechild_0811/`, tree at
+`0f44bc16`, whose `HEAD^{tree}` is `b877a2dd15e4e0ae415faa6c21118ac162a6c949`
+— **identical to the pushed branch's tree**, so the patch-applied cluster tree
+and the branch are the same bytes. `git dirty-count: 0` on all four ranks;
+`mesh 2x2 over 4 device(s), 4 process(es)`; the deck is the orbit-floor lane's
+own `df_floor.in` with only the output path changed, reading
+`owedlegs_0810/parent_auto` READ-ONLY. `_logs/df_fixed3.log`, rc=0 in 52 s.
+
+| quantity | before (orbit-floor lane) | after (this fix) | host-chain PREDICTION |
+|---|---|---|---|
+| composition gate, `V_qmunu` | **1.170e+00** | **3.729e-08** | 3.721e-08 |
+| composition gate, `W0_qmunu` | **1.241e+00** | **3.004e-08** | 3.001e-08 |
+
+The prediction was recorded from the host chain before the leg ran and is
+matched to three digits on both tensors. Everything the run is supposed to hold
+fixed did: μ_S requested 185 → realized **168** (4 orbits, 48+48+48+24),
+ORBIT-CLOSED under all 96 ops, retained rank per q **120/123/124**, spectral
+closure "cut falls in a gap on all 64 q", control **0.000e+00**.
+
+**THE GATE STILL READS `REFUTED`, AND THE TOLERANCE IS NOT MOVED.** 3.729e-08
+is above `CHILD_COVARIANCE_TOL = 1e-9`, so the verdict line is unchanged even
+though the defect it was reporting is gone. That tolerance was "chosen in the
+empty decades between the synthetic floor 1.7e-15 and the red twin 8.6e-01" —
+but the synthetic gate runs at a condition number of order 20, and this deck
+runs at `kappa_eff = 8.9e+05`. The pinv's perturbation is second order in the
+condition number, so the honest floor here is the one measured in the sweep
+above (8.9e5 → 3.7e-08, 9.9e1 → 1.2e-09, 2.0e1 → 3.9e-10), not 1e-15.
+**1e-9 is unreachable on this deck at this rcond, by arithmetic and not by any
+defect.** Loosening it to make the gate green is exactly what
+`AGENT_PREAMBLE`'s standing rule forbids, so it is left where it is and the
+question is handed over as an OWNER ROW: the tolerance should be a function of
+the run's own `kappa_eff` rather than a constant, and until it is, this gate
+cannot pass on a production-conditioned deck. **That is a separate defect from
+the one this row fixes, and it is now quantified rather than guessed.**
+
+**AND THE ERROR BAR MOVED, UPWARD, BECAUSE IT IS NOW MEASURING WHAT IT CLAIMS.**
+`eps_W(W0)` min/median/max went from 9.983e-02 / **1.273e-01** / 2.391e-01
+against the orbit-floor lane's 3.205e-02 / 4.319e-02 / 1.328e-01. That is not a
+regression: `epsilon_w` contracts the tensor at q against the Gram at q, and
+before this fix the Gram it was handed was at −q, so the pre-fix `eps_W` was not
+the Pythagorean residual of anything. **Every `eps_W` recorded for any
+downfolded child before 2026-08-11 is void**, including both arms of the
+comparison in the orbit economics row. The real accuracy of this deck at
+μ_S = 168 is ~13 %, not ~4 %.
