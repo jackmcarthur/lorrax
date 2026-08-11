@@ -491,6 +491,25 @@ def compute_mpa_sigma_pipeline(
     if path is None:
         path = _resolve_fit_store(config, input_dir)
 
+    # THE RESTART DECISION, TAKEN ONCE, BEFORE ANY STAGE IS SKIPPED.
+    # ``mpa_fit_file`` names a BUNDLE, not only a pole field: the fit
+    # allocator deletes ``Omega_p``/``B_p``/``fit_*`` and nothing else, so
+    # a W(z) tensor and the poles fitted from it live in one file and the
+    # deck says where its multipole screening is exactly once.  What the
+    # file holds decides what this run must do, and the resolver refuses a
+    # store swept from another WFN, on another grid, half-swept, or
+    # holding W instead of W_c — every one of those by the format's own
+    # check rather than a copy of it (``gw.mpa.w_restart``).
+    from .mpa import w_restart
+
+    restart = w_restart.resolve_mpa_restart(
+        path, identity=w_restart.wfn_identity(wfn))
+    if restart.stage == w_restart.STAGE_FIT:
+        w_restart.fit_from_w_omega(restart, print_fn=print_fn)
+        restart = w_restart.resolve_mpa_restart(
+            path, identity=w_restart.wfn_identity(wfn))
+    restart.announce(print_fn)
+
     print_section("MULTIPOLE (MPA) FREQUENCY-INTEGRATED SIGMA", print_fn)
 
     with timing.section("gw_jax.mpa_sigma"):

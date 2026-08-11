@@ -122,6 +122,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "eqp1_file": ("IO / restart", "BGW-format Z-linearized QP energies output (Z=1 in static COHSEX)."),
     "sigma_omega_h5_file": ("IO / restart", "Sigma_c(omega,k,m,n) HDF5 output."),
     "restart": ("IO / restart", "Reuse tmp/isdf_tensors_{n_rmu}.h5 (skip zeta-fit/V_q); guarded by band-window attrs + centroid-table md5 stamps."),
+    "write_restart_tensors": ("IO / restart", "Persist tmp/isdf_tensors_{n_rmu}.h5 at all; false skips every dataset in it with one rank-0 line. For runs that DISCARD the artifact — nothing in the GW driver reads it back, and a BSE run against the directory then refuses on the missing file. Independent of restart_q_storage, which decides the q-set it is stored ON."),
+    "restart_q_storage": ("IO / restart", "On WHICH q-set V_qmunu / W0_qmunu are stored: full (default, every full-BZ q) | auto (the pre-unfold IBZ wedge when this run's q path reduced, full otherwise) | ibz (auto that REFUSES instead of falling back). The GW reader always unfolds, so a wedge file and a full-BZ file are indistinguishable to gw_init; bse_io._MunuSlabPlan still refuses a wedge. TRANSITIONAL KEY, scheduled for deletion (owner ruling 2026-08-08) — storage is to follow the WFN's own symmetry instead. See docs/input_reference.md for the full account."),
     "use_ffi_io": ("IO / restart", "DEPRECATED tri-state, superseded by slab_io; explicit false = h5py_allgather."),
     "slab_io": ("IO / restart", "Distributed HDF5 routing: auto (capability-probed) | phdf5_ffi | phdf5_host | h5py_allgather; explicit values fail loudly if unavailable."),
     "gspace_mode": ("IO / restart", "psi(G) host lifecycle: host_cache (resident, default) | file_reread (rebuild per r-chunk; zero persistent residency)."),
