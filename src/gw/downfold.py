@@ -153,6 +153,7 @@ __all__ = [
     "SelectionReport",
     "StarStability",
     "pair_density_gram",
+    "negate_q_index",
     "select_cur_centroids",
     "centroid_orbit_id",
     "star_stability",
@@ -288,16 +289,46 @@ class BandWindow:
     n_cond)`` spelling is ``left = (0, n_val)``, ``right = (n_val, n_val +
     n_cond)``.
 
-    NOTE ON THE LEG MAPPING INTO ``c_q_from_psi_sm``.  That kernel's ``l``
-    operands carry the factor ``Σ_band ψ(μ) conj(ψ(ν))`` and its ``r``
-    operands carry ``Σ_band conj(ψ(μ)) ψ(ν)`` (the conjugation lands on
-    ``P_l`` *after* the k→R transform, ``isdf/core.py``).  Matching that
-    against ``S[μ,ν] = Σ_{mnk} X[μ,a] conj(X[ν,a])`` factorised as
-    ``[Σ_m conj(ψ_m(μ)) ψ_m(ν)]·[Σ_n ψ_n(μ) conj(ψ_n(ν))]`` puts the
-    ``left`` (m) window on the kernel's **r** legs and the ``right`` (n)
-    window on its **l** legs.  It is symmetric in the symmetric case, which
-    is stage 1's only case; the mapping is written down here so the
-    asymmetric Σ-serving stage does not have to rediscover it.
+    THE LEG MAPPING INTO ``c_q_from_psi_sm``, AND THE SIGN OF q IT FIXES.
+    ``S[μ,ν] = Σ_{mnk} X[μ,a] conj(X[ν,a])`` with
+    ``X[μ, (mnk)] = conj(ψ_m(k, r_μ)) ψ_n(k+q, r_μ)`` factorises as
+
+        S[q][μ,ν] = Σ_k A_m(k)[μ,ν] · B_n(k+q)[μ,ν]
+
+    with the ``left`` (m) window in the factor evaluated at **k** and the
+    ``right`` (n) window in the factor evaluated at **k+q**.  The kernel
+    forms its ``l`` factor at ``k`` and its ``r`` factor at ``k+q``, so
+    ``left`` goes on the **l** legs and ``right`` on the **r** legs.
+
+    **AND THEN THE q AXIS IS REVERSED, BECAUSE THE KERNEL RETURNS S(−q).**
+    That is the defect this function shipped with from 2026-08-09
+    (``0dd61f20``) to 2026-08-11, and it is a labelling error, not an
+    algebra one: the leg mapping above is right, ``c_q_from_psi_sm`` is
+    right for ITS OWN caller (the ISDF fit, self-consistent in that
+    labelling and untouched here), and the downfold is the caller that has
+    to agree with something else — the RESTART TENSORS' q axis, because it
+    multiplies this Gram's transfer into ``V_qmunu[q]``.  Nobody checked
+    the two against each other.
+
+    Consequence: ``T`` was the transfer belonging to ``−q`` — that is,
+    ``conj(T)`` — applied to the tensor at ``+q``, at every q with
+    ``−q ≢ q``, which on a 4×4×4 grid is 56 of 64.  MEASURED on
+    ``si_bse_debug`` (μ_L = 480, μ_S = 168, ``downfold_rcond = 1.1e-6``):
+    the shipped child is reproduced on ALL 64 q by ``conj(T) V Tᵀ`` to
+    **7.5e-05** (``W0``: 1.7e-04), its wedge-composition covariance is
+    **1.170e+00** (``W0``: 1.241e+00), and the same chain with the q axis
+    corrected measures **3.7e-08** (``W0``: 3.0e-08).  The 8 q with
+    ``−q ≡ q`` — the 3 stars ``q_irr`` (0,0,0), (0,0,½), (0,½,½) — were
+    the only ones intact, and that signature is what named the mechanism:
+    it tracks ``−q ≡ q`` and not the umklapp wrap count, which is what a
+    missing-unfold-phase would have tracked.
+
+    WHY IT SURVIVED A SUITE THAT HAS A "MATCHES THE DEFINITION" CELL: the
+    dense reference in ``tests/test_downfold.py`` was written from the same
+    hand and carried the same q-sign, so the two agreed.  The cell that
+    cannot be written that way is the closed form,
+    ``test_the_gram_is_labelled_by_PLUS_q_analytically``.
+    See ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md``.
     """
 
     left: tuple[int, int]
@@ -366,13 +397,37 @@ def pair_density_gram(psi_X, psi_Y, window: BandWindow, *, kgrid, mesh_xy):
     from isdf.core import c_q_from_psi_sm
 
     (bl0, bl1), (br0, br1) = window.left, window.right
+    grid = tuple(int(v) for v in kgrid)
     # left (m) window -> the kernel's r legs; right (n) window -> its l legs.
-    # See BandWindow's docstring for why, and do not swap these without
-    # re-deriving it.
-    return c_q_from_psi_sm(
+    # This mapping is correct and is NOT what was wrong; see the docstring.
+    C = c_q_from_psi_sm(
         psi_X[:, :, br0:br1, :], psi_Y[:, br0:br1, :, :],
         psi_X[:, :, bl0:bl1, :], psi_Y[:, bl0:bl1, :, :],
-        kgrid=tuple(int(v) for v in kgrid), mesh_xy=mesh_xy)
+        kgrid=grid, mesh_xy=mesh_xy)
+    # ...AND THE q AXIS IS THEN REVERSED, WHICH IS THE WHOLE FIX.  Measured
+    # against the closed form and against a dense double loop on an
+    # ASYMMETRIC window (the only shape that can see it):
+    # ``c_q_from_psi_sm`` returns S(-q).  Its own caller, the ISDF fit, is
+    # self-consistent in that labelling and is untouched here; the downfold
+    # is the caller that must agree with the RESTART TENSORS' q axis,
+    # because it multiplies this Gram's transfer into V_qmunu[q].
+    return jax.lax.with_sharding_constraint(
+        jnp.take(C, jnp.asarray(negate_q_index(grid)), axis=0),
+        NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+def negate_q_index(kgrid) -> np.ndarray:
+    """``idx[q]`` = the flat index of ``-q`` on the C-order (kx,ky,kz) grid.
+
+    A pure relabel, so it is exact and works for any window; ``conj`` happens
+    to coincide with it on a SYMMETRIC window (``S(-q) = conj(S(q))``) and
+    does not in general, which is why the relabel is what ships.
+    """
+    n1, n2, n3 = (int(v) for v in kgrid)
+    lin = np.arange(n1 * n2 * n3).reshape(n1, n2, n3)
+    return lin[np.ix_((-np.arange(n1)) % n1,
+                      (-np.arange(n2)) % n2,
+                      (-np.arange(n3)) % n3)].ravel()
 
 
 # ---------------------------------------------------------------------------

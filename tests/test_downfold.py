@@ -112,11 +112,21 @@ def _dense_gram(psi_y_host, window, *, mu_rows=None):
     """The Gram, built the slow honest way, straight off the definition.
 
     ``S(q)[mu,nu] = sum_{m in L, n in R, k} X[mu,a] conj(X[nu,a])`` with
-    ``X[mu,a] = conj(psi_m(k-q, mu)) psi_n(k, mu)``, factorised through the
+    ``X[mu,a] = conj(psi_m(k, mu)) psi_n(k+q, mu)``, factorised through the
     Khatri-Rao identity the kernel exploits.  Written out with every index
     visible, because this reference is the only thing in the suite that
     pins the CONJUGATION CONVENTION — and the campaign has been bitten twice
     by conjugation conventions hidden behind time-reversal symmetry at q=0.
+
+    **THIS REFERENCE CARRIED THE SAME q-SIGN ERROR AS THE IMPLEMENTATION IT
+    CHECKS, 2026-08-09 to 2026-08-11.**  Its prose said "m at ``k-q``, n at
+    ``k``" and its code put the LEFT (m) window at ``k+q`` and the RIGHT (n)
+    window at ``k`` — the ``q -> -q`` relabelling — so the three cells below
+    agreed with a Gram built at ``-q`` and reported a green.  A reference
+    written from the same hand as the code is not a reference; the cell that
+    could not be written that way is
+    :func:`test_the_gram_is_labelled_by_PLUS_q_analytically`, which has a
+    closed form.  See ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md``.
     """
     (bl0, bl1), (br0, br1) = window.left, window.right
     nk, nb, ns, mu = psi_y_host.shape
@@ -128,12 +138,12 @@ def _dense_gram(psi_y_host, window, *, mu_rows=None):
         acc = np.zeros((rows, mu), dtype=np.complex128)
         for k in range(nk):
             kq = (k + q) % nk
-            # sum over the RIGHT (n) window at k
-            right = np.einsum("nm,nv->mv", psi[k, br0:br1, :rows],
-                              np.conj(psi[k, br0:br1, :]))
-            # sum over the LEFT (m) window at k(+)q
-            left = np.einsum("nm,nv->mv", np.conj(psi[kq, bl0:bl1, :rows]),
-                             psi[kq, bl0:bl1, :])
+            # sum over the RIGHT (n) window at k+q
+            right = np.einsum("nm,nv->mv", psi[kq, br0:br1, :rows],
+                              np.conj(psi[kq, br0:br1, :]))
+            # sum over the LEFT (m) window at k
+            left = np.einsum("nm,nv->mv", np.conj(psi[k, bl0:bl1, :rows]),
+                             psi[k, bl0:bl1, :])
             acc += right * left
         out[q] = acc
     return out
@@ -158,6 +168,115 @@ def _transfer_dense(S_SS, S_cross, rcond):
 # ---------------------------------------------------------------------------
 # 1.  The Gram: the conjugation convention, pinned against the definition
 # ---------------------------------------------------------------------------
+
+def _plane_wave_psi(mesh, R):
+    """One band, ``psi(k, r_mu) = exp(2 pi i k R_mu)`` on the KGRID k-axis.
+
+    Chosen because the Gram then has a CLOSED FORM (see the cell below), so
+    the reference is an identity rather than a second transcription of the
+    code under test.
+    """
+    k = np.arange(NK) / NK
+    y = np.exp(2j * np.pi * np.outer(k, np.asarray(R, dtype=float)))
+    y = y.reshape(NK, 1, 1, len(R))                       # (nk, nb=1, ns=1, mu)
+    psi_Y = jax.lax.with_sharding_constraint(
+        jnp.asarray(y), NamedSharding(mesh, P(None, None, None, "y")))
+    psi_X = jax.lax.with_sharding_constraint(
+        jnp.conj(jnp.asarray(y)).transpose(0, 3, 1, 2),
+        NamedSharding(mesh, P(None, "x", None, None)))
+    return psi_X, psi_Y
+
+
+def test_the_gram_is_labelled_by_PLUS_q_analytically():
+    """THE SIGN OF q, against a CLOSED FORM — the cell the suite was missing.
+
+    With one band and ``psi(k, r_mu) = exp(2 pi i k R_mu)`` the pair density
+    at momentum transfer q is ``X[mu, k] = conj(psi(k, r_mu)) psi(k+q, r_mu)
+    = exp(2 pi i q R_mu)``, so straight from the definition
+
+        S(q)[mu, nu] = sum_k X[mu,k] conj(X[nu,k])
+                     = nk * exp(2 pi i q (R_mu - R_nu)).
+
+    That is NOT invariant under ``q -> -q``, which is the whole point: every
+    other Gram cell in this file compares against a hand-written double loop,
+    and from 2026-08-09 to 2026-08-11 that loop and the kernel call carried
+    the SAME ``q -> -q`` error, so they agreed and the suite was green while
+    every downfolded child was built from the transfer belonging to ``-q``.
+    A closed form cannot be written from the implementation's hand.
+
+    Measured consequence on ``si_bse_debug``: wedge-composition covariance
+    1.170e+00 before, 3.7e-08 after (``tests/known_failures/
+    2026-08-11-downfold-gram-q-sign.md``).
+    """
+    mesh = resolve_mesh()
+    R = np.arange(1, MU + 1, dtype=float)
+    psi_X, psi_Y = _plane_wave_psi(mesh, R)
+    win = BandWindow(left=(0, 1), right=(0, 1))
+    got = _S_all(mesh, psi_X, psi_Y, win)
+    q = np.arange(NK) / NK
+    want = NK * np.exp(2j * np.pi * q[:, None, None]
+                       * (R[None, :, None] - R[None, None, :]))
+    assert got.shape == want.shape
+    assert np.max(np.abs(got - want)) < 1e-10 * NK
+
+
+def test_RED_TWIN_the_raw_kernel_labels_the_gram_by_MINUS_q():
+    """The shipped defect, held as a twin: the kernel's q axis runs backwards.
+
+    This is verbatim what ``pair_density_gram`` returned until 2026-08-11 —
+    the kernel's output with NO q-axis relabel — and it must MISS the closed
+    form by order one at every q with ``-q != q``.  If it ever agreed, the
+    cell above would be testing arithmetic and not the labelling of q.
+
+    It also pins WHY the error hid for two days, and the pin is the shape of
+    the failure rather than its size: at the q with ``-q == q`` (here q=0 and
+    q=1/2) the two labellings agree EXACTLY.  On ``si_bse_debug`` those were
+    8 of 64 q — the three stars ``q_irr`` (0,0,0), (0,0,1/2), (0,1/2,1/2) —
+    and they were the only blocks of the shipped child that the real-deck
+    probe found intact.  A missing unfold phase would have tracked the
+    umklapp wrap count instead; it does not.
+    """
+    from isdf.core import c_q_from_psi_sm
+
+    mesh = resolve_mesh()
+    R = np.arange(1, MU + 1, dtype=float)
+    psi_X, psi_Y = _plane_wave_psi(mesh, R)
+    raw = np.asarray(jax.device_get(c_q_from_psi_sm(
+        psi_X[:, :, 0:1, :], psi_Y[:, 0:1, :, :],
+        psi_X[:, :, 0:1, :], psi_Y[:, 0:1, :, :],
+        kgrid=KGRID, mesh_xy=mesh)))
+    q = np.arange(NK) / NK
+    want = NK * np.exp(2j * np.pi * q[:, None, None]
+                       * (R[None, :, None] - R[None, None, :]))
+    self_inv = np.array([qi for qi in range(NK) if (-qi) % NK == qi])
+    other = np.array([qi for qi in range(NK) if (-qi) % NK != qi])
+    assert self_inv.size and other.size
+    assert np.max(np.abs(raw[self_inv] - want[self_inv])) < 1e-10 * NK
+    assert np.max(np.abs(raw[other] - want[other])) > 0.5 * NK
+    # and it is EXACTLY want relabelled by q -> -q, which is the mechanism.
+    neg = downfold.negate_q_index(KGRID)
+    assert np.max(np.abs(raw - want[neg])) < 1e-10 * NK
+
+
+def test_the_q_relabel_is_an_involution_and_fixes_only_self_inverse_q():
+    """``negate_q_index`` is the relabel, and it is checked as one.
+
+    Cheap, and it is the only piece of the repair that is index arithmetic
+    rather than a measurement: applying it twice must be the identity, and
+    its fixed points must be exactly the q with ``-q == q`` on that grid.
+    """
+    for grid in ((4, 1, 1), (4, 4, 4), (2, 3, 1), (1, 1, 1), (6, 2, 3)):
+        idx = downfold.negate_q_index(grid)
+        n = grid[0] * grid[1] * grid[2]
+        assert idx.shape == (n,)
+        assert np.array_equal(idx[idx], np.arange(n))
+        n1, n2, n3 = grid
+        want_fixed = {
+            (i * n2 + j) * n3 + k
+            for i in range(n1) for j in range(n2) for k in range(n3)
+            if (-i) % n1 == i and (-j) % n2 == j and (-k) % n3 == k}
+        assert set(np.flatnonzero(idx == np.arange(n)).tolist()) == want_fixed
+
 
 def test_gram_matches_the_definition():
     mesh = resolve_mesh()
