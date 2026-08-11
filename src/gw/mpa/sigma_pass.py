@@ -180,8 +180,11 @@ __all__ = [
     "compute_mpa_sigma_c_omega_grid",
     "flat_index_dtype",
     "format_pass_report",
+    "gather_pass_tiles",
     "narrow_pole_threshold_ry",
     "plan_branch_groups",
+    "pole_partial_path",
+    "read_pole_partial",
     "resolve_pole_q_axis",
     "resolve_pole_subset",
     "resolve_pass_poles",
@@ -1846,6 +1849,127 @@ def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
     return str(path)
 
 
+def pole_partial_path(part_dir, pole):
+    """Where the looped-with-partials route keeps pole ``pole``'s cube.
+
+    One name, computed the same way by the writer and by the resume
+    check, because those two are the only readers that must agree: a
+    resumed run recognises a finished pole by finding THIS path and
+    nothing else.  The zero padding keeps a directory listing in the
+    pinned ascending order, which is the order the manifest tooling and
+    ``mpa_pass_partial_in`` already glob in.
+    """
+    return os.path.join(str(part_dir), f"partial_p{int(pole):04d}.h5")
+
+
+def read_pole_partial(path, *, pole, n_p, omega_grid_ry, fit_src):
+    """One finished pole's partial cube and its :class:`PassRecord`.
+
+    THE RESUME DOOR, AND IT IS CHECKED LIKE THE COMBINER'S.  A partial
+    cube has the shape, dtype and units of a finished self-energy, so a
+    file left in the directory by a different store, a different ω grid
+    or a different pole is not distinguishable from this pole's own
+    result by anything except its stamps — and folding the wrong one in
+    returns a smooth, finite Σ wrong by tens of meV, which is the size
+    of the effect being measured.  So every stamp
+    :func:`combine_pass_partials` checks is checked here too, plus the
+    two that only matter to a resume: that the cube carries EXACTLY this
+    one pole, and that it is a whole-pole cube rather than a
+    window-farmed fragment (a fragment is a valid partial and is not a
+    pole, and summing it as one silently drops the pole's other groups).
+    """
+    import h5py
+
+    om_want = np.asarray(omega_grid_ry, dtype=np.float64)
+    with h5py.File(str(path), "r") as f:
+        version = int(f.attrs.get("mpa_partial_format_version", -1))
+        if version != PARTIAL_FORMAT_VERSION:
+            raise ValueError(
+                f"read_pole_partial: {path} declares partial format version "
+                f"{version}, not {PARTIAL_FORMAT_VERSION}.")
+        store = str(f.attrs.get("mpa_partial_fit_store", ""))
+        if store != str(fit_src):
+            raise ValueError(
+                f"read_pole_partial: {path} was integrated against fit store "
+                f"{store!r}, not {str(fit_src)!r}.  Resuming across stores "
+                f"returns a Σ whose poles came from two screenings.")
+        n_p_file = int(f.attrs.get("mpa_partial_n_p", -1))
+        if n_p_file != int(n_p):
+            raise ValueError(
+                f"read_pole_partial: {path} was written from a store with "
+                f"n_p={n_p_file}, against n_p={int(n_p)} here.")
+        om = np.asarray(f["omega_grid_ry"][()], dtype=np.float64)
+        if om.shape != om_want.shape or not np.array_equal(om, om_want):
+            raise ValueError(
+                f"read_pole_partial: {path} carries a different Σ ω grid "
+                f"than this run.  The cubes are summed elementwise on that "
+                f"axis, so a mismatched grid adds two different frequencies.")
+        if str(f.attrs.get("mpa_partial_group_spec", "") or ""):
+            raise ValueError(
+                f"read_pole_partial: {path} is a WINDOW-FARMED fragment "
+                f"(it stamps a group range), not a whole-pole cube.  Folding "
+                f"it in as pole {int(pole)} would drop every window group the "
+                f"fragment does not hold and the result would still be a "
+                f"smooth, finite self-energy.")
+        got = [int(x) for x in np.asarray(f.attrs["mpa_partial_poles"]
+                                          ).tolist()]
+        if got != [int(pole)]:
+            raise ValueError(
+                f"read_pole_partial: {path} carries poles {got}, not "
+                f"[{int(pole)}] alone.  The looped route folds one pole per "
+                f"file and a file holding another pole's sum would add it "
+                f"twice.")
+        cube = np.asarray(f["sigma_c_partial"][()], dtype=np.complex128)
+        g = f["pass_records"][str(int(pole))]
+        rec = PassRecord(
+            pole_index=int(pole),
+            n_legacy_modes=int(g.attrs["n_legacy_modes"]),
+            n_mpa_modes=int(g.attrs["n_mpa_modes"]),
+            legacy_b_mass=float(g.attrs["legacy_b_mass"]),
+            mpa_b_mass=float(g.attrs["mpa_b_mass"]),
+            n_tau_nodes=int(g.attrs["n_tau_nodes"]),
+            # h5py hands a variable-length string attr back as bytes on
+            # this version and as str on others; the group names go into
+            # the pass report, so ``b'core0'`` would be a visible lie.
+            groups=[x.decode() if isinstance(x, bytes) else str(x)
+                    for x in np.asarray(g.attrs["groups"]).tolist()],
+            re_omega_min_ev=float(g.attrs["re_omega_min_ev"]),
+            re_omega_max_ev=float(g.attrs["re_omega_max_ev"]),
+            gamma_min_ev=float(g.attrs["gamma_min_ev"]),
+            gamma_max_ev=float(g.attrs["gamma_max_ev"]))
+    return cube, rec
+
+
+def gather_pass_tiles(tile_acc, tile_meta, n_omega):
+    """The per-device Σ tiles placed back into ONE padded host cube.
+
+    Factored out of the pass loop's tail because the looped-with-partials
+    route performs this gather once per pole and the whole-walk route
+    once at the end, and the two must be the SAME placement or a resumed
+    run and a fresh one would differ.  They are, and cheaply so: this is
+    a pure scatter with no arithmetic in it, so summing tiles and then
+    gathering is bit-for-bit the same as gathering and then summing
+    cubes — which is exactly why a per-pole gather can be folded into a
+    host-space total and still equal a farm's recombination.
+    """
+    import jax
+
+    from ..ppm_windows import _to_host_np
+
+    padded = (int(n_omega),) + tuple(int(x) for x in tile_meta.spatial_padded)
+    full_pad = np.zeros(padded, dtype=np.complex128)
+    if int(jax.process_count()) == 1:
+        for t, ix in zip(tile_acc, tile_meta.tile_index):
+            full_pad[ix] = t
+    else:                                        # pragma: no cover - multihost
+        arrays = [jax.device_put(t, d)
+                  for t, d in zip(tile_acc, tile_meta.devices)]
+        full_pad = np.asarray(_to_host_np(
+            jax.make_array_from_single_device_arrays(
+                padded, tile_meta.sharding, arrays), tiled=False))
+    return full_pad
+
+
 def _group_sort_key(spec):
     """A window-farmed cube's position in the pinned walk.
 
@@ -2116,7 +2240,8 @@ def compute_mpa_sigma_c_omega_grid(
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
     allow_partial=False, pole_subset=None, group_subset=None,
     group_digests=None, census_out=None, census_sha="", plan_store=None,
-    plan_verify=False, binned_width_clause=None, print_fn=print,
+    plan_verify=False, binned_width_clause=None, pass_partial_dir=None,
+    leg_id=None, print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -2170,10 +2295,38 @@ def compute_mpa_sigma_c_omega_grid(
     refused by name rather than quietly re-planned.  ``plan_verify``
     additionally plans the branch the old way and compares the two, which
     is the gate that establishes the loaded plan IS the computed one.
+
+    ``pass_partial_dir`` IS THE FARM'S ARITHMETIC WITHOUT THE FARM.  The
+    walk above is already one process stepping the whole pole axis with
+    one pole's slab resident; what the multi-leg farm adds is not a
+    different sum but a checkpoint between the terms of it.  With this
+    set the loop keeps a PER-POLE accumulator, gathers and strips it at
+    the end of each ``for p`` iteration, writes it through
+    :func:`write_pass_partial` in exactly the single-pole format a farm
+    leg writes — so ``mpa_pass_partial_in``, the farm manifest and the
+    hole-filling tooling read these files without knowing which route
+    produced them — and only then folds it into the running total.  The
+    total is therefore the sum of the same per-pole cubes a farm would
+    have produced, taken in the same pinned ascending order, which is
+    what makes the two routes' results comparable at the bit.  A pole
+    whose partial is already on disk is not read, not planned and not
+    integrated: it is folded from the file, which is the resume.
+
+    THE MEMORY MODEL CHANGES, AND NOT IN THE DIRECTION "UNCHANGED".  The
+    pole axis stays streamed — ``read_pole_slice`` still brings in one
+    pole's ``(B_p, Omega_p)`` and the full ``(n_p, n_mu, n_mu)`` B tensor
+    is never resident, which is the constraint this whole design exists
+    under — but the Sigma side now carries TWO cubes where the unlooped
+    walk carries one: the per-pole tile accumulator and the host-space
+    running total, live at the same time.  On the production deck
+    (``Sigma_c`` of shape (9, 64, 100, 100), complex128) that is 92 MB of
+    additional host residency, plus the padded gather buffer that the
+    unlooped route also allocates but only once at the end.  It is paid
+    for a checkpoint per pole and it is not free; a deck that cannot
+    afford it should leave this key unset and use the farm.
     """
     import time
 
-    import jax
     import jax.numpy as jnp
 
     from common import timing
@@ -2189,6 +2342,36 @@ def compute_mpa_sigma_c_omega_grid(
     omega_req = np.asarray(omega_grid_ry, dtype=np.float64)
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_grid_ry must be a 1D non-empty array.")
+
+    # THE LOOPED-WITH-PARTIALS ROUTE, AND THE THREE KEYS IT REFUSES TO
+    # SHARE A RUN WITH — asked here, before the store is opened, because
+    # the answer does not depend on anything in it and a refusal that
+    # arrives after a 2 GB read is a refusal nobody runs into early.
+    # Each of these redefines what a cube in the directory MEANS while
+    # leaving its shape, dtype and units alone, which is the one failure
+    # mode this file is organised around: a census integrates nothing, so
+    # its per-pole cubes would be zeros; a ``pole_subset`` walk returns a
+    # partial sum, so the total this route folds and hands to the head
+    # would be one; a ``group_subset`` leg's cubes are window-group
+    # fragments, and a fragment written under a whole-pole name is a pole
+    # silently missing most of its groups.
+    part_dir = str(pass_partial_dir or "") or None
+    if part_dir is not None:
+        bad = [k for k, v in (("mpa_pass_census_out", census_out),
+                              ("mpa_pole_subset", pole_subset),
+                              ("mpa_group_subset", group_subset))
+               if v is not None]
+        if bad:
+            raise ValueError(
+                f"compute_mpa_sigma_c_omega_grid: pass_partial_dir is set "
+                f"beside {', '.join(bad)}.  The looped route walks EVERY "
+                f"pole and folds one whole-pole cube per iteration into a "
+                f"finished self-energy; each of those keys makes the cubes "
+                f"it writes mean something else while leaving their shape, "
+                f"dtype and units identical, which no downstream check can "
+                f"see.")
+        os.makedirs(part_dir, exist_ok=True)
+
     omega_max_ry = float(np.max(np.abs(omega_req)))
     edge_factor = float(ppm_cfg.window_edge_factor)
     xi_ry = narrow_pole_threshold_ry(
@@ -2236,8 +2419,11 @@ def compute_mpa_sigma_c_omega_grid(
     idx_neg = np.where(omega_req < 0.0)[0]
     n_omega = int(omega_req.size)
     tile_acc = None
+    pole_acc = None
+    sigma_total = None
     tile_meta = None
     records = []
+    resumed = []
 
     # THE PINNED ORDER.  Ascending pole index: the store's leading axis,
     # the fitter's own sort, and the better-conditioned accumulation
@@ -2275,7 +2461,36 @@ def compute_mpa_sigma_c_omega_grid(
             + (f"\n    window-group range: "
                f"{WF.format_group_subset(group_subset)}"
                if group_subset is not None else ""))
+    if part_dir is not None:
+        print_fn(
+            f"  MPA Σ: LOOPED WITH PARTIALS over all {n_p} poles in this "
+            f"process; each pole's cube is checkpointed under {part_dir} in "
+            f"the single-pole partial format, and a pole whose cube is "
+            f"already there is folded from disk rather than integrated.")
     for p in walk:
+        pole_acc = None
+        if part_dir is not None:
+            part_path = pole_partial_path(part_dir, p)
+            if os.path.exists(part_path):
+                # THE RESUME, AND IT IS A SKIP RATHER THAN A SHORTCUT.
+                # Nothing about this pole is read, planned or integrated:
+                # its whole contribution to the sum is the cube on disk,
+                # which is the same object the integrating branch of this
+                # loop would have written.
+                cube, rec = read_pole_partial(
+                    part_path, pole=p, n_p=n_p, omega_grid_ry=omega_req,
+                    fit_src=fit_src)
+                if sigma_total is None:
+                    sigma_total = np.zeros_like(cube)
+                sigma_total = sigma_total + cube
+                records.append(rec)
+                resumed.append(int(p))
+                print_fn(
+                    f"  MPA pass RESUME: pole {int(p)} folded from "
+                    f"{part_path}; its slab was not read and its windows "
+                    f"were not planned.")
+                del cube
+                continue
         t_read = time.perf_counter()
         with timing.section("mpa.pass_read"):
             Omega_p, B_p = mpa_store.read_pole_slice(
@@ -2537,16 +2752,59 @@ def compute_mpa_sigma_c_omega_grid(
                 mesh_xy=mesh_xy, log_tag=f"p{p} {br.tag}", print_fn=print_fn)
             if branch_tiles is None:
                 continue
-            if tile_acc is None:
+            if tile_meta is None:
                 tile_meta = branch_tiles
-                tile_acc = [np.zeros((n_omega,) + t.shape[1:],
-                                     dtype=np.complex128)
-                            for t in branch_tiles.tiles]
+            # WHICH ACCUMULATOR, and the association that follows from it.
+            # Unlooped, the branches of every pole fold into one running
+            # tile accumulator and the walk's floating-point association
+            # is branch-by-branch straight through — unchanged from
+            # before this key existed, which is why that route is written
+            # here without an ``if`` in its arithmetic.  Looped, each
+            # pole's branches sum among themselves first and the poles are
+            # added as cubes, which is the FARM's association: a looped
+            # total and a stack of single-pole legs agree to the bit, and
+            # both differ from the unlooped walk by the re-association
+            # ``combine_pass_partials`` measures and prints.
+            if part_dir is not None:
+                if pole_acc is None:
+                    pole_acc = [np.zeros((n_omega,) + t.shape[1:],
+                                         dtype=np.complex128)
+                                for t in branch_tiles.tiles]
+                acc = pole_acc
+            else:
+                if tile_acc is None:
+                    tile_acc = [np.zeros((n_omega,) + t.shape[1:],
+                                         dtype=np.complex128)
+                                for t in branch_tiles.tiles]
+                acc = tile_acc
             with timing.section("mpa.branch_fold"):
                 for d, t in enumerate(branch_tiles.tiles):
-                    tile_acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
+                    acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
+            del acc
         records.append(rec)
         del omega_complex_host
+        if part_dir is not None:
+            if pole_acc is None:
+                raise RuntimeError(
+                    f"MPA Σ: pole {int(p)} produced no tile, so its partial "
+                    f"would be a cube of zeros — indistinguishable, once it "
+                    f"is on disk, from a pole that genuinely contributes "
+                    f"nothing, and a resume would then fold the zeros and "
+                    f"never revisit it.  Refused instead of written.")
+            with timing.section("mpa.host_gather"):
+                pole_cube = strip_sigma_window(
+                    gather_pass_tiles(pole_acc, tile_meta, n_omega),
+                    tile_meta.nb_real)
+            pole_acc = None
+            write_pass_partial(
+                pole_partial_path(part_dir, p), pole_cube, [rec],
+                n_p=n_p, poles=[int(p)], omega_grid_ry=omega_req,
+                fit_src=fit_src, leg_id=(str(leg_id) if leg_id else None),
+                print_fn=print_fn)
+            if sigma_total is None:
+                sigma_total = np.zeros_like(pole_cube)
+            sigma_total = sigma_total + pole_cube      # THE PINNED ORDER
+            del pole_cube
 
     # THE LINE §10 IS WRITTEN FROM.  One greppable row per leg, so the
     # fixed term is a measurement in the log rather than a subtraction
@@ -2574,6 +2832,22 @@ def compute_mpa_sigma_c_omega_grid(
             f"NO Σ was integrated by this run.")
         return None, records
 
+    if part_dir is not None:
+        if sigma_total is None:
+            raise RuntimeError(
+                "MPA Sigma: the looped route folded no pole, so no "
+                "self-energy was accumulated.  A pole field with no live "
+                "modes reads back as zero, which is indistinguishable from "
+                "a converged dark channel; it is refused instead.")
+        print_fn(
+            f"  MPA pass looped total: {len(records)} poles folded in the "
+            f"pinned ascending order, {len(resumed)} of them resumed from "
+            f"disk ({resumed if resumed else 'none'}); the partials under "
+            f"{part_dir} are the same single-pole cubes a farm writes and "
+            f"recombine identically through mpa_pass_partial_in.")
+        print_fn(format_pass_report(records, xi_ev=xi_ry * RYD_TO_EV))
+        return jnp.asarray(sigma_total, dtype=jnp.complex128), records
+
     if tile_acc is None:
         raise RuntimeError(
             "MPA Sigma: no branch produced a tile, so no self-energy was "
@@ -2582,17 +2856,7 @@ def compute_mpa_sigma_c_omega_grid(
             "channel; it is refused instead.")
 
     with timing.section("mpa.host_gather"):
-        padded = (n_omega,) + tuple(int(x) for x in tile_meta.spatial_padded)
-        full_pad = np.zeros(padded, dtype=np.complex128)
-        if int(jax.process_count()) == 1:
-            for t, ix in zip(tile_acc, tile_meta.tile_index):
-                full_pad[ix] = t
-        else:                                    # pragma: no cover - multihost
-            arrays = [jax.device_put(t, d)
-                      for t, d in zip(tile_acc, tile_meta.devices)]
-            full_pad = np.asarray(_to_host_np(
-                jax.make_array_from_single_device_arrays(
-                    padded, tile_meta.sharding, arrays), tiled=False))
+        full_pad = gather_pass_tiles(tile_acc, tile_meta, n_omega)
     sigma_c = strip_sigma_window(full_pad, tile_meta.nb_real)
     print_fn(format_pass_report(records, xi_ev=xi_ry * RYD_TO_EV))
     return jnp.asarray(sigma_c, dtype=jnp.complex128), records

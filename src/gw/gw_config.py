@@ -990,6 +990,23 @@ _DEFAULTS = {
     # weight, mask and index set, as the plan this tree computes.  The
     # gate, not a production knob: it costs exactly the planning time the
     # store exists to save.
+    #
+    # THE FARM'S ARITHMETIC WITHOUT THE FARM.
+    # ``mpa_pass_partial_dir`` — walk EVERY pole in this one process and
+    # checkpoint each pole's cube in that directory, in the same
+    # single-pole format a farm leg writes, before folding it into the
+    # running total.  The run returns a finished self-energy, so steps
+    # 3–5 are reached normally and no recombination pass is needed; the
+    # cubes are left behind so that a run killed at pole 5 of 10 resumes
+    # by folding 0–4 from disk without reading a slab or planning a
+    # window, and so that ``mpa_pass_partial_in`` can recombine them
+    # afterwards if a leg-shaped answer is wanted.  It is refused beside
+    # ``mpa_pole_subset``, ``mpa_group_subset``, ``mpa_pass_partial_out``,
+    # ``mpa_pass_partial_in`` and ``mpa_pass_census_out``: each of those
+    # changes what a cube in that directory MEANS while leaving its shape,
+    # dtype and units untouched.  It costs one extra Σ_c cube of host
+    # residency (92 MB on the production deck) against the unsplit walk —
+    # the pole axis stays streamed either way.
     "mpa_pole_subset": "",
     "mpa_group_subset": "",
     "mpa_pass_census_out": "",
@@ -998,6 +1015,7 @@ _DEFAULTS = {
     "mpa_plan_verify": False,
     "mpa_pass_partial_out": "",
     "mpa_pass_partial_in": "",
+    "mpa_pass_partial_dir": "",
     # THE WIDTH-BINNED SIGMA CLAUSE, AND IT IS OFF BY DEFAULT.  "off" is
     # the shipped per-pole width clause: the non-crossing branches bisect
     # each Laplace bucket in width until every leaf's beta fits under 1,
@@ -2443,6 +2461,10 @@ class LorraxConfig:
     #: order instead of integrating ("" = integrate).  See
     #: ``_DEFAULTS["mpa_pass_partial_in"]``.
     mpa_pass_partial_in: str
+    #: Walk every pole in ONE process and checkpoint each pole's cube
+    #: here, resuming from whatever is already there ("" = the unsplit
+    #: walk, no checkpoints).  See ``_DEFAULTS["mpa_pass_partial_dir"]``.
+    mpa_pass_partial_dir: str
     #: ``"off"`` (the default) or a bin ratio ``"2"``/``"4"``.  See
     #: ``_DEFAULTS["mpa_binned_width_clause"]``.
     mpa_binned_width_clause: str
@@ -3044,6 +3066,8 @@ class LorraxConfig:
             mpa_pass_partial_out=str(
                 _g("mpa_pass_partial_out") or "").strip(),
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),
+            mpa_pass_partial_dir=str(
+                _g("mpa_pass_partial_dir") or "").strip(),
             mpa_binned_width_clause=str(
                 _g("mpa_binned_width_clause") or "").strip().lower(),
             # Sub-dataclass groups

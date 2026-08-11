@@ -570,8 +570,23 @@ def compute_mpa_sigma_pipeline(
         # and before the writer, so nothing downstream can tell a split
         # run from a whole one, and the pinned order is preserved through
         # the split because it is what the combiner sums in.
+        # ``mpa_pass_partial_dir`` IS THE THIRD DOOR AND IT OPENS ON THE
+        # SAME LOOP.  The pass loop already walks the whole pole axis in
+        # one process with one pole's slab resident; the farm's only
+        # structural addition is a checkpoint between the terms of that
+        # sum.  This key adds the checkpoint without the farm: every pole
+        # in this process, one whole-pole cube per iteration written in
+        # the format a leg writes, folded into a running total that IS a
+        # self-energy — so steps 3–5 below are reached by the same object
+        # a whole run reaches them by, and no recombination pass is
+        # needed.  What the cubes buy is a resume (a run killed at pole 5
+        # of 10 folds 0–4 from disk and reads no slab for them) and the
+        # option of recombining them afterwards through
+        # ``mpa_pass_partial_in``, since they are byte-compatible with
+        # what the farm produces.
         partial_in = str(getattr(config, "mpa_pass_partial_in", "") or "")
         partial_out = str(getattr(config, "mpa_pass_partial_out", "") or "")
+        partial_dir = str(getattr(config, "mpa_pass_partial_dir", "") or "")
         census_out = str(getattr(config, "mpa_pass_census_out", "") or "")
         manifest_path = str(getattr(config, "mpa_farm_manifest", "") or "")
         plan_store = str(getattr(config, "mpa_plan_store", "") or "")
@@ -635,6 +650,37 @@ def compute_mpa_sigma_pipeline(
                 "partial and the other to CONSUME a set of them; a run that "
                 "did both would write a partial of a total and there is no "
                 "reading of that which is a self-energy.")
+        if partial_dir:
+            # EVERY ONE OF THESE PRODUCES A DIRECTORY OF CUBES THAT LOOK
+            # RIGHT.  A pole-subset or group-subset run would fill the
+            # directory with cubes whose names claim whole poles they do
+            # not hold; a census run would fill it with zeros; a
+            # partial_out run would then write a partial OF a total; and a
+            # partial_in run integrates nothing at all, so there would be
+            # nothing to checkpoint.  Each is refused by name here, where
+            # the deck keys are, rather than left to a downstream check
+            # that cannot see any of them — every one of those directories
+            # recombines to a smooth, finite, plausible Σ.
+            clash = [k for k, v in (
+                ("mpa_pole_subset",
+                 str(getattr(config, "mpa_pole_subset", "") or "")),
+                ("mpa_group_subset",
+                 str(getattr(config, "mpa_group_subset", "") or "")),
+                ("mpa_pass_partial_out", partial_out),
+                ("mpa_pass_partial_in", partial_in),
+                ("mpa_pass_census_out", census_out)) if v]
+            if clash:
+                raise ValueError(
+                    f"compute_mpa_sigma_pipeline: mpa_pass_partial_dir is "
+                    f"set beside {', '.join(clash)}.  The looped route walks "
+                    f"EVERY pole in this process and checkpoints one "
+                    f"whole-pole cube per iteration; each of those keys "
+                    f"changes what a cube in that directory means while "
+                    f"leaving its shape, dtype and units identical to a "
+                    f"correct one, which is the one failure this pipeline's "
+                    f"partial machinery exists to refuse.  Use the farm "
+                    f"(mpa_pole_subset + mpa_pass_partial_out per leg, then "
+                    f"mpa_pass_partial_in) or this key, not both.")
         if partial_in:
             paths = _partial_paths_in(partial_in)
             with timing.section("sigma.exec"):
@@ -662,6 +708,8 @@ def compute_mpa_sigma_pipeline(
                     plan_verify=plan_verify,
                     binned_width_clause=_parse_binned_width_clause(
                         getattr(config, "mpa_binned_width_clause", "")),
+                    pass_partial_dir=partial_dir or None,
+                    leg_id=str(getattr(config, "mpa_leg_id", "") or "") or None,
                     print_fn=print_fn,
                 )
             if partial_out:
