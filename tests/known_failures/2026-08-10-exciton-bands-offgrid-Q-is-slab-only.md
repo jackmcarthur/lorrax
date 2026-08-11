@@ -124,11 +124,69 @@ must be the GW's **ζ-fit** window, because the refit re-fits ζ from that
 window's pair densities — a narrower BSE window gives a different ζ and the
 on-grid null would correctly refuse it.
 
-**OWED, and the reason this is a known-failures row and not a report:** no
-exciton table has yet been produced through the refit path. The kernel table
-above is the only measurement here; the null has not been run under the
-driver, and the per-Q refit cost at ~129 Q is unmeasured. The delivery legs
-were placed on `/pscratch/sd/j/jackm/xbdense_0810/` (allocation 56612363) and
-sat behind other lanes' one-GPU co-tenants — a scheduling accident, not a
-result. **Do not quote a refit exciton number until the driver's own
-`[refit-null]` line has been read.**
+## AND A THIRD WALL, WHICH IS THE ONE THAT STOPS THIS DECK
+
+The refit ran.  It placed at P=4 across two nodes (`lx run -N 2 -G=2 -n=4` —
+the geometry that fits when two long-lived one-GPU co-tenants are pinning a
+GPU on each of your own two nodes; worth knowing) and refused inside the
+htransform:
+
+```
+ValueError: build_fH_R: the Galerkin coefficients are NOT orthonormal —
+max|C Cᴴ − I| = 1.568e-03 over all k, above the 1.0e-06 cap
+```
+
+That is `docs/drivers.md`'s already-documented rank bound, arriving from a new
+direction.  Chain the three requirements and they close on each other:
+
+* the refit re-fits ζ at the target Q **from the pair densities of the ζ-fit
+  window**, so the htransform window has to BE that window — here `nb = 60`,
+  the parent GW's own `nband`;
+* the htransform Galerkin leg needs a basis spanning `nk·nb` = 64 × 60 =
+  **3840**;
+* the basis it fits in is the parent ISDF one, `n_μ · n_s` = 960 × 2 =
+  **1920**.
+
+1920 < 3840, by exactly a factor of two, so the projection cannot be
+orthonormal and the driver refuses rather than silently returning energies
+wrong by the 14.1 meV it prints.  The campaign's earlier 20-band runs cleared
+this because 64 × 20 = 1280 ≤ 1920 — but a 20-band htransform is not the ζ-fit
+window, so **the window that makes the refit meaningful is exactly the window
+that breaks its htransform leg**.  On this lineage the refit is unreachable,
+and no flag reaches it.
+
+The condition to state, since it is written nowhere else:
+
+> `--vq-mode refit` needs **`n_μ,parent · n_s ≥ nk · nb_ζ`** — the parent ISDF
+> basis must be at least the Galerkin rank bound of the ζ-fit window.  On a
+> 4×4×4 SOC deck with a 60-band GW that is ≳ 1920 centroids; this lineage has
+> 960.
+
+Two ways out, both a GW re-run, neither free: a parent fitted with a large
+enough centroid set (the fleet already has 1104- and 1128-centroid Si bundles,
+e.g. `bandwin666_0810/armF`), or a parent whose ζ-fit window is narrow enough
+that `nk·nb_ζ` fits the basis it has.  Either changes the bundle, so neither is
+a drop-in for the owner's `child191`, and **which one is right is an owner call
+about what the delivered curve is a curve OF** — not something to decide inside
+a plot-regeneration lane.
+
+## OWED
+
+**No exciton table has been produced through the refit path**, so there is no
+refit exciton number to quote and none appears here.  The kernel table above is
+the only physics measurement in this row, and it is an on-grid TILE comparison,
+not an energy.  The `[refit-null]` gate has never executed under the driver —
+the run refused upstream of it, in the htransform.
+
+The `--q-per-segment` half of the lane IS verified: **17 of 17 cells green** on
+a cluster leg (`/pscratch/sd/j/jackm/xbdense_0810/_logs/gates3.log`), of which
+10 are that file's pre-existing cells and 7 are this lane's.
+
+**Environment note, cheap, and it cost this lane two legs:** passing
+`PYTHONPATH=<worktree>/src` to a containerised `lx run` leg REPLACES the
+container's own path, and the leg then has no `h5py` — which surfaces as 13
+unrelated test failures with nothing in them about paths.  On the cluster the
+worktree is pinned by `LORRAX_CHECKOUT` and `PYTHONPATH` must be left alone.
+That is the exact mirror of the WSL trap in `BUILD_NOTES.md`, where
+`PYTHONPATH` must be set — so the two boxes want opposite things and neither
+page said so.
