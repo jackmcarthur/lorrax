@@ -233,3 +233,97 @@ def test_recorded_invalid_zeta_carries_its_reason():
     d = WR.resolve_mpa_restart("/nonexistent/bundle.h5", zeta=st)
     assert d.stage == WR.STAGE_BUILD
     assert any("centroids_md5" in r for r in d.drops)
+
+
+# --------------------------------------------------------------------------
+# The OTHER seam: the path that BUILDS its screening reads the verdict too
+# --------------------------------------------------------------------------
+# ``screening_requests_for(MPA)`` asks the screening stage for nothing, so
+# ``mpa_pipeline``'s seam is reached only by the mode that does NOT build
+# its own W.  Every mode that DOES build one ran with the zeta verdict
+# recorded and nobody reading it.  These pin the driver-side seam without
+# a mesh, a WFN or an ISDF fit: it takes VALUES, announces, and returns.
+
+class _Cfg:
+    """The four attributes the announcement reads off a deck."""
+
+    def __init__(self, *, restart=False, mpa_fit_file=""):
+        self.restart = bool(restart)
+        self.paths = type("_P", (), {"mpa_fit_file": mpa_fit_file})()
+        self.restart_q_storage = "full"
+
+
+class _Meta:
+    n_rmu = 144
+
+
+class _Mode:
+    value = "cohsex"
+
+
+def _announce(cfg, requests=("static",), tensors="/nonexistent/isdf.h5"):
+    """Run the driver seam, collecting what it printed."""
+    from gw import screening
+
+    lines = []
+    out = screening.announce_restart_entry_stage(
+        cfg, meta=_Meta(), wfn=None, mode=_Mode(), requests=list(requests),
+        input_dir="/nonexistent", tensors_filename=tensors,
+        print_fn=lines.append)
+    return out, lines
+
+
+def test_build_path_announces_the_reused_zeta_rung():
+    """A reused zeta is the one rung this path can honour -- so it says so."""
+    WR.record_zeta_state(present=True, valid=True)
+    decision, lines = _announce(_Cfg())
+    assert decision is not None and decision.stage == WR.STAGE_BUILD_W
+    assert any("entry stage = build_w" in ln for ln in lines), lines
+    assert not any("pole fit" in ln for ln in lines), (
+        "a COHSEX run's banner must not claim a pole fit runs here -- the "
+        "multipole seam's wording is not this path's")
+
+
+def test_build_path_announces_the_drop_and_its_key():
+    WR.record_zeta_state(present=True, valid=False, reason="centroids_md5")
+    decision, lines = _announce(_Cfg())
+    assert decision.stage == WR.STAGE_BUILD
+    assert any("centroids_md5" in ln for ln in lines), lines
+    assert any("entry stage = build" in ln for ln in lines), lines
+
+
+def test_build_path_consumes_the_verdict_exactly_once():
+    """The recorder is single-use, and this seam is one of its two users."""
+    WR.record_zeta_state(present=True, valid=True)
+    _announce(_Cfg())
+    assert WR.take_zeta_state() is None
+
+
+def test_x_only_and_restart_decks_stay_silent():
+    """No screening to build, or nothing this seam can say -- so nothing."""
+    WR.record_zeta_state(present=True, valid=True)
+    assert _announce(_Cfg(), requests=()) == (None, [])
+    WR.record_zeta_state(present=True, valid=True)
+    assert _announce(_Cfg(restart=True)) == (None, []), (
+        "a restart = true run never calls fit_zeta, so no verdict was "
+        "taken; 'cannot say' must stay silent rather than report "
+        "'nothing to resume from' about a run that resumed everything")
+    WR.take_zeta_state()
+
+
+def test_a_refusing_bundle_does_not_end_a_run_that_is_not_resuming_it(tmp_path):
+    """The ladder is an announcement here; its refusals are not fatal."""
+    import h5py
+
+    from file_io import mpa_store
+
+    bad = tmp_path / "bundle.h5"
+    with h5py.File(bad, "w") as f:
+        # a W(omega) dataset with none of the header the reader requires
+        f.create_dataset(WR.W_OMEGA_DATASET, data=np.zeros((1, 1, 2, 2),
+                                                           dtype=np.complex128))
+    assert mpa_store is not None
+    WR.record_zeta_state(present=True, valid=True)
+    decision, lines = _announce(_Cfg(), tensors=str(bad))
+    assert decision is None
+    assert any("not resolved" in ln for ln in lines), lines

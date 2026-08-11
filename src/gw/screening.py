@@ -153,6 +153,119 @@ def screening_requests_for(
 
 
 # ---------------------------------------------------------------------------
+# The restart ladder's entry rung, on the path that builds its own W
+# ---------------------------------------------------------------------------
+# THE OTHER HALF OF A SEAM THAT HAD ONLY ONE.  ``gw_init`` records the ζ
+# reuse verdict at the moment it takes it and ``gw.mpa_pipeline`` reads it
+# — but the branch above asks this stage for NOTHING under MPA, so that
+# seam is reached only by the one mode that does not build its screening
+# here.  Every mode that DOES build it ran with the verdict recorded and
+# nobody reading it: a reused ζ and a refit one produced the same banner
+# and differed only in the wall clock, which is the shape of a restart
+# that quietly resumed the wrong thing.  This lives beside
+# ``screening_requests_for`` because that function is where a mode becomes
+# work, and this is the sentence that says which of that work was already
+# done.
+
+#: What the ladder's entry rung MEANS on the path that builds its own
+#: screening — one sentence per rung, in this stage's vocabulary and not
+#: the multipole seam's.  The same ``STAGE_BUILD_W`` that tells
+#: ``mpa_pipeline`` "sweep and fit" tells this path "the ISDF fit was
+#: skipped and the screening stage runs", and a banner announcing a pole
+#: fit on a COHSEX run would be false in the one place an operator reads
+#: to find out what was skipped.
+_RESTART_ENTRY_MEANING = {
+    "build": ("no reusable ζ/ISDF fit — the ISDF fit and this screening "
+              "stage both run in full"),
+    "build_w": ("the ζ/ISDF fit was REUSED — the ISDF fit was skipped and "
+                "this screening stage builds W from it"),
+    "fit": ("this deck's multipole bundle already holds its W(ω) samples; "
+            "this screening stage still builds this mode's own W"),
+    "sigma": ("this deck's multipole bundle already holds its pole field; "
+              "this screening stage still builds this mode's own W"),
+}
+
+
+def announce_restart_entry_stage(config, *, meta, wfn, mode, requests,
+                                 input_dir, tensors_filename,
+                                 print_fn=print):
+    """Name the rung this run entered on, on the SCREENING-BUILDING path.
+
+    ONE LINE AND NO CONTROL FLOW.  What this path skips was already
+    decided — by ``gw.gw_init._zeta_reuse_ok`` and by
+    ``prepare_isdf_and_wavefunctions`` — before this function is called.
+    The ladder does not re-decide it here; it NAMES it, in the run banner,
+    beside the drop lines that say which key refused a rung.  So this
+    cannot change what the run computes, only what the log says it did.
+
+    THE VERDICT IS TAKEN HERE OR AT THE MULTIPOLE SEAM, NEVER BOTH.  The
+    recorder is single-use by design (``w_restart.take_zeta_state``) and
+    the two readers are mutually exclusive by construction: this one runs
+    only when the screening stage has W's to build, the multipole seam
+    only under ``compute_mode = mpa``, which asks it for none.  An
+    ``x_only`` deck has no screening at all and is silent here.
+
+    ``restart = true`` IS DELIBERATELY NOT ANSWERED.  Such a run never
+    calls ``fit_zeta``: the whole ISDF stage is read back from
+    ``isdf_tensors_*.h5``, so no ζ verdict is taken and the recorder is
+    empty.  ``None`` then means what it always means — "the caller cannot
+    say" — and this seam stays quiet rather than reporting "nothing to
+    resume from" about a run that resumed everything.
+    """
+    if not requests or bool(getattr(config, "restart", False)):
+        return None
+    import os
+
+    from .mpa import w_restart
+
+    # THE BUNDLE THIS DECK NAMES, if it names one.  Only ``compute_mode =
+    # mpa`` reads ``mpa_fit_file``, and that mode does not reach here — so
+    # in practice this is the run's own restart tensors file and the
+    # ladder lands on its ζ rung, which is the only rung this path can
+    # honour.  Resolved anyway, relative to the deck like every other path
+    # key, so a deck that names one has it named in the banner instead of
+    # silently ignored.
+    bundle = str(getattr(config.paths, "mpa_fit_file", "") or "")
+    if bundle and not os.path.isabs(bundle):
+        bundle = os.path.join(input_dir, bundle)
+    if not bundle:
+        bundle = tensors_filename
+    # ANYTHING THE DECK CANNOT STATE STAYS None — "cannot say" — exactly
+    # as at the multipole seam, and for a sharper reason here: there is no
+    # deck key for the multipole ω grid at all.  The sweep is not a driver
+    # stage, so no deck states its abscissae, and ``omega`` is therefore
+    # None on every deck today; the sampling rung degrades to the two keys
+    # a deck CAN state.  Declaring a grid this driver does not own would
+    # be inventing an expectation, which is how a ladder comes to grant a
+    # skip nobody checked.
+    sampling = w_restart.SamplingExpectation(
+        omega=getattr(config, "mpa_omega_grid", None),
+        keys={"n_rmu": int(getattr(meta, "n_rmu", 0)) or None,
+              "q_storage": getattr(config, "restart_q_storage", None)})
+    try:
+        decision = w_restart.resolve_mpa_restart(
+            bundle, identity=w_restart.wfn_identity(wfn),
+            context=f"compute_mode = {mode.value}",
+            zeta=w_restart.take_zeta_state(), sampling=sampling)
+    except Exception as exc:                                   # noqa: BLE001
+        # THE LADDER IS AN ANNOUNCEMENT ON THIS PATH, so its refusals must
+        # not end a run that resumes nothing from the store they refuse.
+        # ``compute_mode = mpa`` is where those refusals are load-bearing,
+        # and that mode never reaches here.
+        print_fn(f"  [mpa_restart] entry stage not resolved ({exc}); the "
+                 f"run is unaffected — nothing on this path resumes from "
+                 f"that bundle.")
+        return None
+    # THE DROPS COME FIRST, in the module's own words, because a refused
+    # rung is invisible in the result: the run simply rebuilds.
+    decision.announce_drops(print_fn)
+    print_fn(f"  [mpa_restart] entry stage = {decision.stage} — "
+             f"{_RESTART_ENTRY_MEANING.get(decision.stage, '')} "
+             f"({os.path.basename(bundle)})")
+    return decision
+
+
+# ---------------------------------------------------------------------------
 # Static W with the IBZ fast path
 # ---------------------------------------------------------------------------
 
@@ -754,6 +867,7 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
 
 __all__ = [
     "ScreeningRequest",
+    "announce_restart_entry_stage",
     "screening_requests_for",
     "compute_static_w",
     "compute_screening",

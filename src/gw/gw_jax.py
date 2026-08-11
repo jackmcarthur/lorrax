@@ -73,7 +73,11 @@ from .gw_config import (
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
-from .screening import compute_screening, screening_requests_for
+from .screening import (
+	announce_restart_entry_stage,
+	compute_screening,
+	screening_requests_for,
+)
 from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
 from .degen_average import (
@@ -420,6 +424,10 @@ def main(argv=None):
 	requests = screening_requests_for(mode, config)
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		requests = [r for r in requests if r.role == "static"]
+	announce_restart_entry_stage(
+		config, meta=meta, wfn=wfn, mode=mode, requests=requests,
+		input_dir=input_dir, tensors_filename=tensors_filename,
+		print_fn=print0)
 	with timing.section("gw_jax.screening", announce=True,
 	                    label="screening (chi0 -> W)"):
 		W_by_role = compute_screening(
