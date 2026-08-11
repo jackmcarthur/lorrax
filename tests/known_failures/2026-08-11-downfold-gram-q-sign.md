@@ -371,4 +371,47 @@ sides. The base arm was taken in a worktree checked out at `0578bc89` with
 `git rev-parse HEAD` printed, because a stale arm is not a control and this
 row already paid for that lesson once.
 
-*(the four-GPU leg is recorded below)*
+**THE SUITES AT FOUR REAL GPUs, ONE COMBINED LEG.** Same four suites in ONE
+process holding four `CudaDevice`s — `DEVICE_COUNT 4`, `PROCESS_COUNT 1`,
+`resolve_mesh()` to `{'x': 2, 'y': 2}`, all asserted in-leg before pytest was
+allowed to start — on `nid001005`, tree at `41dde3e2` with `git dirty-count:
+0` and `gw.downfold_run.__file__` printed from the worktree:
+**204 passed, 0 failed, 0 skipped**, 126.6 s, `_logs/gates_p4b.log`. Collected
+is checked against the expected set rather than read off a green bar: WSL
+reports 194 passed + 10 skipped = **204 collected** on the same four suites,
+and the 10 WSL skips are the documented `liblorrax_ffi_host.so` driver-import
+cells, which run here. Same 204 both sides, so the green is over the same set.
+
+**AND THE FIRST ATTEMPT AT THAT LEG WAS THROWN AWAY, because it measured
+nothing.** It reported 3 failed / 191 passed / 10 skipped, and the failures
+were an XLA HLO-verifier `RET_CHECK` inside `slice_psi_to_centroids` in the
+mesh-invariance subprocess cells. The cause was in the harness, not the tree:
+the leg ran under **jax 0.5.3.dev from `/opt/jax`**, outside the supported
+window, because `LX_BASE_MODULE=lorrax_J070` was exported inside the step's
+own `env.sh` — which runs after `lx` has already chosen the container image.
+The variable has to be set on the LOGIN NODE, before `lx run`. Note the tell
+and how close it came to being banked as a real red: the ten skips carried a
+`jax-support.version` REFUSED banner rather than the usual
+`liblorrax_ffi_host.so` reason, and a lane that had only counted the skips
+would not have seen the difference. With the module pinned host-side the same
+tree, same node and same command give 204/204.
+
+**THE DECK ITSELF, AT FOUR REAL GPUs AND FOUR PROCESSES.** The claim "the
+fixed production deck now prints PASS" is not left as arithmetic on filed
+numbers — the deck was re-run, because the driver's wiring of `kappa_eff` into
+the gate is three lines that no unit cell reaches. `lorrax-downfold` on the
+orbit-floor lane's own deck, reading `owedlegs_0810/parent_auto` READ-ONLY,
+`mesh {'x': 2, 'y': 2} on 4 device(s), 4 process(es)`, provenance version 3
+printed in-leg. It reproduces this row's numbers to the digit — μ_S 480 to
+168, ORBIT-CLOSED under 96 ops, `kappa_eff` max **8.945e+05**, `V_qmunu`
+**3.729e-08**, `W0_qmunu` **3.004e-08**, control **0.000e+00** — and the
+verdict line now reads
+
+    [downfold/star] VERDICT: PASS (worst 3.729e-08 against tol 2.031e-07).
+
+The bundle it wrote carries the pair the verdict needs to stay readable:
+`kappa_eff_per_q` over 64 q spanning 7.292e+05 to 8.945e+05, and beside the
+child's tables `covariance_kappa_eff = 894486.8`, `covariance_tol =
+2.0311e-07`, `covariance_verdict = PASS`. Evidence
+`/pscratch/sd/j/jackm/covtol_0811/_logs/driver_p4.log`, bundle
+`child_covtol/tmp/isdf_tensors_168.h5`.
