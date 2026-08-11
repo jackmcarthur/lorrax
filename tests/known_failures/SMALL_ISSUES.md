@@ -492,8 +492,34 @@ silent overwrite.
     the claim table it just read, so the next occurrence self-diagnoses.
     [batch lane report, 2026-08-10]
 
-39. **`vq_interp.refit_vq` cannot run at P>1 unless the basis size happens
-    to defeat sharding** — `src/bse/vq_interp.py:2778` does a bare
+39. ~~**`vq_interp.refit_vq` cannot run at P>1 unless the basis size happens
+    to defeat sharding**~~ **FIXED** by the refit-sharding + cert-grade lane
+    on `fix/refit-shard-and-cert-grade-2026-08-11` (pushed, unmerged): the
+    fetch is `_to_host` (= `common.collectives.gather_to_host`), whose three
+    arms cover all three layouts — `device_get` when fully addressable (P=1),
+    `addressable_data(0)` when replicated (the odd-μ arm, still no
+    collective), `process_allgather(tiled=True)` when genuinely sharded. The
+    mechanism is now written down where it bit: **`Array._value` serves a
+    fully REPLICATED array out of the local shard before it ever reaches the
+    addressability check**, which is exactly why odd n_μ worked and even n_μ
+    did not, and why no amount of P=4 coverage on the μ=191 child could have
+    caught it. **Red twin, and it is an even-n_μ FOUR-PROCESS cell**:
+    `tests/test_refit_vq_shard_p4.py` drives `tests/_refit_shard_twin.py`
+    through `tests/mesh_launch.py`; on the pre-fix tree it dies at
+    `tree_base/src/bse/vq_interp.py:2778` with the production traceback and
+    on the post-fix tree it is 6 passed, both at four real A100s in four
+    processes (`refitshard_0811/_logs/twin_pre.log`, `twin_post.log`). The
+    twin also refuses to bank a green unless the even arm's ζ'(G) box really
+    was non-addressable and non-replicated, so it cannot go vacuously green
+    the way the old coverage did. **Note for anyone reproducing on a bench:
+    the μ sharding survives to ζ on XLA:GPU and does NOT on XLA:CPU** — an
+    emulated CPU mesh replicates at the Cholesky and shows nothing, which is
+    a second reason this needed a real four-GPU leg. One import was narrowed
+    in passing (`compute_wfns_fi` now imported in the htransform branch that
+    uses it, not at function scope), because dragging the communicator stack
+    and its required-FFI gate into the `"stored"` leg is what made the twin
+    unrunnable anywhere but a compute node. Original report follows.
+    `src/bse/vq_interp.py:2778` did a bare
     `jax.device_get(ztG_box[:, jnp.asarray(fi)])` on a globally sharded
     array and dies with `RuntimeError: Fetching value for jax.Array that
     spans non-addressable (non process local) devices`. It is the sibling
@@ -551,9 +577,16 @@ silent overwrite.
     with `ssh -o ControlPath=none` rather than evicting the master; and before
     relaunching anything that "died", check the **log** and `sacct` for the
     step, not just the rc file. Give a relaunch a distinct leg id so it cannot
-    overwrite the original's log. Worth a line in `AGENT_PREAMBLE`'s
-    certificate row next time that file is edited.
-    [qsign re-measurement lane, 2026-08-11]
+    overwrite the original's log. **The `AGENT_PREAMBLE` line is now
+    CORRECTED** — refit-sharding + cert-grade lane,
+    `fix/refit-shard-and-cert-grade-2026-08-11` (pushed, unmerged): the
+    certificate row's misleading clause is replaced IN PLACE with `ssh -o
+    ControlPath=none perlmutter true` plus a named refusal of `ssh -O exit`
+    and the reason, so the page gains no line. The rest of this row stands:
+    the file could only ever carry the one-line rule, and the incident is
+    here.
+    [qsign re-measurement lane, 2026-08-11; corrected by the refit-sharding
+    lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 

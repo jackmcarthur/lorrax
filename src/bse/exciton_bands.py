@@ -667,7 +667,10 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"Galerkin full-r residual from refit_prepare;\n"
             f"    * or the BSE window itself cuts a multiplet — check the "
             f"band-window lines above.\n"
-            f"  Report the number.  Neither grade is a tolerance to edit.")
+            f"  Report the number.  Do not raise REFIT_CERT_TOL_MEV, and do "
+            f"not read --cert-grade as a way to: it selects between two "
+            f"NAMED grades that mean different things about the artefact, "
+            f"and neither of them is a number to edit.")
     log(f"  [refit-cert] {cert_grade_stamp(grade, worst)} — stamped into the "
         f"provenance line, the .dat header and the plot below, so no figure "
         f"from this run can be separated from the tolerance it was drawn "

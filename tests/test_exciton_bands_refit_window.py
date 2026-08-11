@@ -248,30 +248,37 @@ def _cert(delta_ry, n_eig=8):
 
 
 def test_the_certification_passes_when_the_routes_agree():
-    rows = _cert(0.0)
+    rows, worst = _cert(0.0)
     assert len(rows) == 2
     assert all(r[2] == pytest.approx(0.0, abs=1e-12) for r in rows)
     # the rows carry the TILE index, which is what makes them auditable
     assert rows[0][1] == (0, 2, 2) and rows[1][1] == (2, 2, 2)
+    # the worst travels back beside them, because the stamp needs the NUMBER
+    assert worst == pytest.approx(0.0, abs=1e-12)
 
 
 def test_the_certification_refuses_above_the_gate():
-    """0.02 meV against a 0.01 meV gate: refuse, and say the number."""
+    """0.02 meV against a 0.01 meV gate: refuse, and say the number.
+
+    The gate now names its GRADE too — "0.01 meV reference gate" — so a
+    reader of the refusal can tell which of the two lines was missed.
+    """
     eb = _driver()
     delta_ry = 0.02e-3 / RY2EV
     with pytest.raises(SystemExit) as e:
         _cert(delta_ry)
     msg = str(e.value)
     assert "0.020" in msg, msg
-    assert f"{eb.REFIT_CERT_TOL_MEV:g} meV gate" in msg
+    assert f"{eb.REFIT_CERT_TOL_MEV:g} meV reference gate" in msg
     assert "not a tolerance to widen" in msg
 
 
 def test_the_certification_accepts_just_under_the_gate():
     """The bracket is real in both directions — a gate that never passes is
     not a gate."""
-    rows = _cert(0.008e-3 / RY2EV)
+    rows, worst = _cert(0.008e-3 / RY2EV)
     assert max(r[2] for r in rows) == pytest.approx(0.008, rel=1e-3)
+    assert worst == pytest.approx(0.008, rel=1e-3)
 
 
 def test_the_refusal_names_the_window_and_the_basis_not_the_tolerance():
@@ -282,6 +289,8 @@ def test_the_refusal_names_the_window_and_the_basis_not_the_tolerance():
     assert "nval/ncond" in msg
     assert "orthonormality" in msg
     assert "Do not raise REFIT_CERT_TOL_MEV" in msg
+    # ...and the second grade must not read as the escape hatch either.
+    assert "not read --cert-grade as a way to" in msg
 
 
 # ---------------------------------------------------------------------------
