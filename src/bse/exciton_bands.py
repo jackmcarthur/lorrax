@@ -477,6 +477,64 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
         f"centroids_file at that table directly.")
 
 
+def apply_q_per_segment(params, q_per_segment, log=print) -> int:
+    """Raise every ``K_POINTS crystal_b`` segment to at least N points.
+
+    IT IS A BANDSTRUCTURE, SO SAMPLE IT LIKE ONE.  The deck format carries a
+    per-segment point count, and the decks in this campaign carried counts of
+    one and two — which draws Γ–X–W–L–Γ–Σ with eight diagonalisations in
+    total and produces a plot of straight lines between corners.  The owner's
+    reading of that plot ("it looks like shit ... i thought that was
+    obvious") is the reason this floor exists and is on by default.
+
+    A FLOOR, not an override, and the distinction is the whole gate:
+
+      * a segment the deck leaves sparser than ``q_per_segment`` is raised to
+        it, so the DEFAULT (16) draws at least 16 diagonalisations per
+        segment on every deck that ever ran, without editing any deck;
+      * a segment the deck already asks for MORE points on keeps its own
+        count, so a hand-tuned dense deck is not silently coarsened;
+      * ``--q-per-segment 1`` is the identity — every deck count is already
+        >= 1 — so the sparse behaviour is still reachable, by asking for it
+        explicitly and only that way.
+
+    Only ``bse.exciton_bands`` calls this.  The mutation is on the parsed
+    ``params`` dict this driver owns for the length of one run, so the
+    single-particle bandstructure driver reading the same deck is untouched.
+
+    Returns the number of path points the raised path will carry.
+    """
+    seginfo = params.get("kpoints_crystal_b") or {}
+    segs = seginfo.get("segments", [])
+    if len(segs) < 2:
+        return 0
+    floor = int(q_per_segment)
+    if floor < 1:
+        raise SystemExit(
+            f"exciton_bands: --q-per-segment={floor} is not a point count.  "
+            f"1 is the identity (every deck count is already >= 1) and 16 is "
+            f"the default.")
+    # segs[0] is the path's first corner; segs[i>0] carries the count for the
+    # segment that ENDS at it (generate_kpath_from_qe_segments).
+    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[1:]]
+    for seg, n_deck in zip(segs[1:], deck_counts):
+        seg["n"] = max(n_deck, floor)
+    raised = [(i, a, max(a, floor))
+              for i, a in enumerate(deck_counts, start=1) if a < floor]
+    n_pts = 1 + sum(max(a, floor) for a in deck_counts)
+    if raised:
+        log(f"  [q-per-segment] floor {floor}: raised {len(raised)} of "
+            f"{len(deck_counts)} segment(s) "
+            f"({', '.join(f'#{i}: {a}->{b}' for i, a, b in raised)}); "
+            f"the path now carries {n_pts} Q "
+            f"(deck alone: {1 + sum(deck_counts)}).  It is a bandstructure — "
+            f"pass --q-per-segment 1 for the deck's own counts.")
+    else:
+        log(f"  [q-per-segment] floor {floor}: every deck segment already "
+            f"asks for at least that many; path unchanged at {n_pts} Q.")
+    return n_pts
+
+
 def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
     """The ζ file the off-grid exchange needs — or a refusal that explains it.
 
@@ -828,6 +886,24 @@ def build_parser():
                          f"{DEGENERACY_TOL_RY:.4e} = 1 meV; the smallest "
                          f"between-pair boundary gap measured on the Si "
                          f"12x12 SOC deck was 5.9 meV)")
+    ap.add_argument("--q-per-segment", type=int, default=16,
+                    dest="q_per_segment",
+                    help="MINIMUM number of Q the driver puts on each "
+                         "K_POINTS crystal_b segment (default 16).  It is a "
+                         "FLOOR on the deck's own per-segment counts, not an "
+                         "override: a segment the deck asks for MORE points "
+                         "on keeps its own count, and '--q-per-segment 1' is "
+                         "the identity, which is the only way to get the "
+                         "deck's counts verbatim.  The default exists "
+                         "because E_S(Q) along a high-symmetry path is a "
+                         "BANDSTRUCTURE: the decks in tree carried counts of "
+                         "1 and 2, which drew Γ-X-W-L-Γ-Σ with eight "
+                         "diagonalisations and straight lines between them.  "
+                         "Each extra Q is one more row of the SAME compiled "
+                         "solve scan (no extra compile), so density is "
+                         "cheap; it is the htransform ψ_c(k+Q) cache that "
+                         "grows linearly, and that is what to watch on a "
+                         "densified (bse_k_grid) bundle.")
     ap.add_argument("--n-eig", type=int, default=6)
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=40,
@@ -1081,6 +1157,11 @@ def main(argv=None):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "
                          "the htransform bandstructure driver)")
+    # Sampling density BEFORE the path is generated: a floor on the deck's
+    # per-segment counts, default 16, so the default output is a
+    # bandstructure rather than a line drawing between corners.  See
+    # apply_q_per_segment for why this is a floor and not an override.
+    apply_q_per_segment(params, args.q_per_segment, log=log)
 
     # Everything above — the startup call, jax.distributed, mesh creation and its
     # MPI clique warm-up, the input parse — is the driver prologue.  Named
@@ -1360,7 +1441,13 @@ def main(argv=None):
                 f"create exchange tiles at new q.  Use a K_POINTS block whose "
                 f"segments land on the coarse grid, or --vq-mode=interp (which "
                 f"needs FULL-BZ ζ storage and an exchange model valid for this "
-                f"cell).")
+                f"cell).\n"
+                f"  CHECK --q-per-segment FIRST if this deck used to run: it "
+                f"floors every segment at {args.q_per_segment} points by "
+                f"default (2026-08-10 — E_S(Q) on a path is a bandstructure), "
+                f"and a floor above ~2 puts most Q off any coarse grid.  "
+                f"--q-per-segment 1 restores the deck's own counts exactly; "
+                f"the dense path is what needs the full-BZ ζ.")
         log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
             f"({nQ} Q, all on the "
             f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} grid = {vq_src}) "
