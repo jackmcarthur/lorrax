@@ -1343,6 +1343,356 @@ def test_qirr_orbit_completion_restores_closure_at_a_bounded_cost():
 
 
 # ---------------------------------------------------------------------------
+# 6b. §κ — the child-covariance gate's TOLERANCE, and that it still bites
+# ---------------------------------------------------------------------------
+#
+# OWNER RULING, 2026-08-11: *"make it scale if you think that is the most
+# likely thing to be more robust to say 100x more atoms and centroids."*
+#
+# WHAT WENT WRONG WITH THE CONSTANT, because the repair only makes sense
+# against it.  ``CHILD_COVARIANCE_TOL = 1e-9`` was chosen "in the empty
+# decades between the synthetic floor 1.7e-15 and the red twin 8.6e-01" — on
+# the synthetic in section 6, whose transfer solve runs at a condition number
+# of order 20.  The quantity the gate measures is a PSEUDO-INVERSE
+# perturbation, so its floor is a function of the solve's conditioning, and
+# the production deck runs at ``kappa_eff = 8.9e+05``.  Consequence, filed in
+# ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md``: after the
+# q-sign defect was fixed the deck achieved **3.729e-08**, the gate compared
+# that against 1e-9, and printed **REFUTED on a correct result**.
+#
+# The cells below hold the repair to three things, in order of how easy each
+# is to get wrong:
+#
+#   (i)   the EXPONENT is the one the filed measurements support (0.41), not
+#         the one the same row's prose reasons to (2, "second order in the
+#         condition number").  A tolerance whose exponent came from theory
+#         while the data said otherwise would be a fit to nothing.
+#   (ii)  the FLOOR still holds at small kappa, so section 6's own synthetic
+#         is gated no more loosely than it was before this ruling.
+#   (iii) THE GATE STILL BITES AT PRODUCTION CONDITIONING.  This is the one
+#         that matters and it gets a live red twin, not an arithmetic one:
+#         the shipped q-sign defect, reproduced at a kappa_eff comparable to
+#         the production deck's, run through the DRIVER'S OWN gate function,
+#         must still print REFUTED — and by millions, not by a whisker.
+#
+# WHAT THESE CELLS CANNOT SHOW, stated so nobody reads more into the green
+# than is there: the synthetic parent of section 6 is covariant to machine
+# precision BY CONSTRUCTION (the full BZ is defined as the unfold of the
+# wedge), so its correct arm sits near 1e-11 even at kappa_eff = 7e5 and
+# would pass at 1e-9 too.  The scaling's NECESSITY is a property of a real
+# pair-density Gram, which carries a 3.1e-10 covariance residual of its own
+# for the pinv to amplify; that evidence is the production deck's, it is
+# filed, and the cell that reads it here reads it as filed numbers.
+
+#: The production deck's own numbers, quoted from
+#: ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md`` (deck
+#: ``si_bse_debug``, mu_L 480 -> mu_S 168, ``downfold_rcond`` 1.1e-6, four
+#: real GPUs, workspace ``/pscratch/sd/j/jackm/wedgechild_0811/``).
+PROD_KAPPA_EFF = 8.945e5
+PROD_WORST_REL_FIXED = {"V_qmunu": 3.729e-08, "W0_qmunu": 3.004e-08}
+PROD_WORST_REL_BROKEN = {"V_qmunu": 1.170e+00, "W0_qmunu": 1.241e+00}
+#: The three-point rcond sweep the exponent is fitted to, same row.
+PROD_KAPPA_SWEEP = ((2.0e1, 3.9e-10), (9.9e1, 1.2e-09), (8.9e5, 3.7e-08))
+
+
+def test_child_covariance_tol_covers_the_filed_kappa_sweep():
+    """(i) THE FIT, against the measurements it claims to come from.
+
+    Every point of the filed sweep must sit UNDER the tolerance the formula
+    gives at its own kappa — that is what "calibrated to the data" means
+    here — and none may sit absurdly far under, because a tolerance three
+    decades above every measurement is not a fit, it is an abdication.
+    """
+    from gw import downfold_run as dr
+    for kap, achieved in PROD_KAPPA_SWEEP:
+        tol = dr.child_covariance_tol(kap)
+        assert achieved < tol, (
+            f"the filed floor {achieved:.3e} at kappa_eff {kap:.3e} is ABOVE "
+            f"the tolerance {tol:.3e} the formula gives there, so the gate "
+            f"still refutes a measurement it was fitted to")
+        assert tol / achieved < 1.0e3, (
+            f"tol/achieved = {tol / achieved:.3e} at kappa_eff {kap:.3e} — "
+            f"the formula has stopped tracking the data it was fitted to")
+
+
+def test_child_covariance_tol_uses_the_MEASURED_exponent_not_the_theory_one():
+    """(i) The exponent is 0.41 from the fit, and NOT 2 from the prose.
+
+    ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md`` reasons that
+    "the pinv's perturbation is second order in the condition number" and
+    then reports a sweep whose log-log slope is 0.409.  The ruling's design
+    constraint is that the exponent comes from the measurements, so this cell
+    pins that it did: a decade of kappa must move the tolerance by about
+    10**0.41, and emphatically not by 10**2.
+
+    It also pins the DIRECTION of the extrapolation error, which is the part
+    the owner's "100x more atoms and centroids" turns on.  The measured local
+    slope FALLS with kappa (0.70 across the first decade of the sweep, 0.38
+    across the last four), so a single global 0.41 opens the gate slightly
+    faster than the data does at large kappa — the safe direction.
+    """
+    from gw import downfold_run as dr
+    lo, hi = dr.child_covariance_tol(1.0e4), dr.child_covariance_tol(1.0e5)
+    slope = np.log10(hi / lo)
+    assert abs(slope - dr.CHILD_COVARIANCE_KAPPA_EXPONENT) < 1e-9
+    assert 0.35 < slope < 0.50, (
+        f"a decade of kappa moves the tolerance by 10**{slope:.3f}; the "
+        f"filed sweep's least-squares slope is 0.409 and the pairwise "
+        f"slopes span 0.38..0.70")
+    assert slope < 1.0, (
+        "the exponent is at or above 1 — that is the theory sentence, not "
+        "the measurement, and at production kappa it would cost the gate "
+        "the discrimination the red twin below demands")
+    # monotone, so a worse-conditioned run never gets a TIGHTER gate
+    kaps = np.geomspace(1.0, 1e12, 40)
+    tols = np.array([dr.child_covariance_tol(k) for k in kaps])
+    assert np.all(np.diff(tols) >= 0.0)
+
+
+def test_child_covariance_tol_floors_at_the_old_absolute_value():
+    """(ii) THE FLOOR, so a tiny-kappa synthetic is not gated vacuously tight.
+
+    And the fallback, which is the other half of "kappa is a measurement, not
+    a knob": handed no kappa, or a NaN, or a nonsense one, the tolerance does
+    NOT guess — it returns the floor, and the gate's own verdict line says
+    the tolerance was not scaled.  A gate that invented a kappa in order to
+    open itself would be the loosening this whole row exists to refuse.
+    """
+    from gw import downfold_run as dr
+    assert dr.CHILD_COVARIANCE_TOL == 1e-9
+    for bad in (None, float("nan"), 0.0, -1.0, "not a number"):
+        assert dr.child_covariance_tol(bad) == 1e-9, bad
+    assert dr.child_covariance_tol(1e-30) == 1e-9
+    assert dr.child_covariance_tol(1.0) == 1e-9
+    # and it is a FLOOR, not a clamp: it only ever raises
+    for k in (1e2, 1e4, 1e6, 1e9):
+        assert dr.child_covariance_tol(k) >= 1e-9
+
+
+def test_the_FIXED_PRODUCTION_DECK_now_passes_and_its_defect_still_does_not():
+    """(iii-a) THE RULING'S OWN CASE, on the deck's filed numbers.
+
+    Both halves, because either alone is worthless.  The FIXED deck —
+    3.729e-08 and 3.004e-08 at kappa_eff 8.945e+05 — must now read PASS,
+    which is the defect this ruling repairs.  The SAME deck's pre-fix
+    numbers — 1.170e+00 and 1.241e+00, the child built from the transfer
+    belonging to -q — must still read REFUTED at the SAME kappa, because the
+    tolerance moved and the deck's conditioning did not.
+
+    That pair is the whole claim: the gate stopped reporting kappa_eff and
+    did not stop reporting breakage.
+    """
+    from gw import downfold_run as dr
+    tol = dr.child_covariance_tol(PROD_KAPPA_EFF)
+    for name, worst in PROD_WORST_REL_FIXED.items():
+        assert worst < tol, (
+            f"the FIXED production deck's {name} covariance {worst:.3e} "
+            f"still refutes against tol {tol:.3e} at kappa_eff "
+            f"{PROD_KAPPA_EFF:.3e} — the ruling is not implemented")
+    for name, worst in PROD_WORST_REL_BROKEN.items():
+        assert worst > tol, (
+            f"the BROKEN production deck's {name} covariance {worst:.3e} "
+            f"passes against tol {tol:.3e} — the scaling has eaten the gate")
+    # and the margin on each side is not a whisker
+    assert tol / max(PROD_WORST_REL_FIXED.values()) > 2.0
+    assert min(PROD_WORST_REL_BROKEN.values()) / tol > 1.0e6, (
+        "the gate has under 1e6 of discrimination against the real defect "
+        "at production conditioning")
+
+
+def _qirr_ill_conditioned_parent(mesh, kappa_design=3.0e8, seed=3):
+    """A wedge parent like ``_qirr_parent`` but with a DESIGNED spectrum.
+
+    ``_qirr_parent`` builds ``a a^H + mu I``, which lands at kappa_eff ~ 11 —
+    the regime the 1e-9 constant was calibrated in, and the regime that
+    cannot say anything about a production deck.  This builds the same object
+    (Hermitian positive definite, one block per wedge q) with a geometric
+    eigenvalue ladder instead, so the transfer solve below runs at a
+    kappa_eff the caller MEASURES and asserts rather than assumes.
+
+    ``W`` is left exactly as ``_qirr_parent`` builds it: the operand under
+    congruence is not what is being conditioned.
+    """
+    rng = np.random.default_rng(seed)
+    n_ibz = QIRR_Q_IRR_FRAC.shape[0]
+    S_ibz = np.empty((n_ibz, QIRR_MU, QIRR_MU), dtype=np.complex128)
+    for q in range(n_ibz):
+        a = (rng.normal(size=(QIRR_MU, QIRR_MU))
+             + 1j * rng.normal(size=(QIRR_MU, QIRR_MU)))
+        U, _ = np.linalg.qr(a)
+        lam = np.geomspace(1.0, 1.0 / kappa_design, QIRR_MU)
+        M = U @ np.diag(lam) @ U.conj().T
+        S_ibz[q] = 0.5 * (M + M.conj().T)
+    b = (rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU))
+         + 1j * rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU)))
+    W_ibz = b + np.conj(np.swapaxes(b, 1, 2))
+    munu = NamedSharding(mesh, P(None, "x", "y"))
+    return (jax.lax.with_sharding_constraint(jnp.asarray(S_ibz), munu),
+            jax.lax.with_sharding_constraint(jnp.asarray(W_ibz), munu))
+
+
+def _qirr_child_through_the_shipping_gate(mesh, *, q_sign_break):
+    """Build a full-BZ child at production conditioning and GATE it.
+
+    Returns ``(verdict_lines, worst_rel, kappa_max, tol)``, where the verdict
+    comes from ``downfold_run._gate_child_wedge_storability`` — the driver's
+    OWN function, not a reimplementation of it, so a green here is about the
+    gate that runs in production and not about a second transcription of it.
+
+    ``q_sign_break=True`` reproduces THE SHIPPED DEFECT of 2026-08-09..11: the
+    transfer is solved from the Gram belonging to ``-q`` and then applied to
+    the tensor at ``+q``.  That is exactly what ``pair_density_gram`` did
+    before the ``negate_q_index`` relabel — the "bare conj(T) construction" —
+    and it is a GENUINE covariance break rather than a scaled-up round-off,
+    which is what makes it the right red twin for a tolerance change.
+    """
+    from gw import downfold_run as dr
+    from types import SimpleNamespace
+
+    sym_perm, L_table = _qirr_tables()
+    S_ibz, W_ibz = _qirr_ill_conditioned_parent(mesh)
+    S_full = np.asarray(jax.device_get(
+        _qirr_unfold(S_ibz, mesh, sym_perm, L_table)))
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    keep = QIRR_KEEP_CLOSED
+
+    S_SS = S_full[:, keep, :][:, :, keep]
+    S_cross = S_full[:, keep, :]
+    if q_sign_break:
+        # the q axis run backwards, which is what the kernel returned
+        neg = downfold.negate_q_index((QIRR_NQ_FULL, 1, 1))
+        assert np.array_equal(neg[neg], np.arange(QIRR_NQ_FULL))
+        n_moved = int(np.sum(neg != np.arange(QIRR_NQ_FULL)))
+        assert 0 < n_moved < QIRR_NQ_FULL, (
+            "the relabel must move SOME q and fix others, as it does on a "
+            "deck — that partial shape is what named the mechanism")
+        S_SS, S_cross = S_SS[neg], S_cross[neg]
+
+    munu = NamedSharding(mesh, P(None, "x", "y"))
+    # rcond well below the designed conditioning, so nothing is truncated and
+    # kappa_eff is the Gram's own condition number rather than the cap.
+    T_x, T_y, reports = downfold.build_transfer(
+        jax.lax.with_sharding_constraint(jnp.asarray(S_SS), munu),
+        jax.lax.with_sharding_constraint(jnp.asarray(S_cross), munu),
+        mesh, rcond=1e-14, announce=False)
+    W_S = downfold.congruence(mesh, T_x, T_y)(W_full)
+
+    tables = SimpleNamespace(
+        sym_perm=sym_perm, L_table=L_table, irr_idx_q=QIRR_IRR_IDX,
+        sym_idx_q=QIRR_SYM_IDX, q_irr_frac=QIRR_Q_IRR_FRAC,
+        n_sym_spatial=QIRR_ORB)
+    kappa_per_q = np.array([r.kappa_eff for r in reports], dtype=np.float64)
+    rank_per_q = np.array([r.rank_criterion for r in reports], dtype=np.int64)
+    out = []
+    _cp, _cl, _slots, worst_rel, kap_max, tol = \
+        dr._gate_child_wedge_storability(
+            {"W0_qmunu": W_S}, keep, tables, mesh, keep.size, keep.size,
+            rank_per_q=rank_per_q, kappa_per_q=kappa_per_q,
+            parent_tensor=W_full, mu_L=QIRR_MU, print_fn=out.append)
+    return "\n".join(out), worst_rel, kap_max, tol
+
+
+def test_qirr_the_gate_PASSES_a_correct_child_at_PRODUCTION_kappa():
+    """(iii-b) The scaled gate is not vacuous: a correct child at high kappa.
+
+    The conditioning is MEASURED, not assumed — the cell asserts the solve
+    actually reached a kappa_eff within an order of magnitude of the
+    production deck's 8.9e+05 before it reads anything into the verdict.  A
+    "high-kappa" cell that quietly ran at kappa 11 would be the shape of
+    failure this whole section is about.
+    """
+    mesh = resolve_mesh()
+    log, worst_rel, kap, tol = _qirr_child_through_the_shipping_gate(
+        mesh, q_sign_break=False)
+    assert kap > 1.0e5, (
+        f"the ill-conditioned synthetic only reached kappa_eff {kap:.3e}; it "
+        f"is not testing production conditioning and its verdict says "
+        f"nothing about the ruling")
+    assert "VERDICT: PASS" in log, log
+    assert worst_rel < tol
+    # The CONTROL ran and is at the unscaled floor: the harness is exonerated
+    # independently of the tolerance under test.
+    assert "NOT TAKEN" not in log
+    assert "THE CONTROL FAILED" not in log
+
+
+def test_qirr_RED_TWIN_a_q_sign_break_at_PRODUCTION_kappa_is_still_REFUTED():
+    """(iii-c) THE RED TWIN THE RULING DEMANDS, and it is a real defect.
+
+    Same deck-scale conditioning, same tables, same shipping gate — and the
+    transfer built at ``-q`` and applied at ``+q``, which is the defect that
+    poisoned every downfolded child between 2026-08-09 and 2026-08-11.  It
+    must still print REFUTED, and the margin is asserted rather than admired:
+    a scaled tolerance that merely happened to stay below an order-one number
+    would be one deck away from not doing so.
+
+    Note the shape as well as the size, which is what named the mechanism on
+    the real deck: the relabel is an involution that fixes some q and moves
+    others, so this twin is a partial break — the honest hard case — and not
+    a uniformly corrupted tensor.
+    """
+    mesh = resolve_mesh()
+    log, worst_rel, kap, tol = _qirr_child_through_the_shipping_gate(
+        mesh, q_sign_break=True)
+    assert kap > 1.0e5, f"red twin ran at kappa_eff {kap:.3e}, not production"
+    assert "VERDICT: REFUTED" in log, log
+    assert worst_rel > 0.1, (
+        f"the q-sign break only moved the covariance to {worst_rel:.3e} on "
+        f"this synthetic — if that is real it is not the order-one defect "
+        f"the production deck showed, and this twin is not testing it")
+    assert worst_rel / tol > 1.0e6, (
+        f"the red twin clears the scaled tolerance by only "
+        f"{worst_rel / tol:.3e}x at kappa_eff {kap:.3e}.  The gate is "
+        f"supposed to keep enormous discrimination against real breakage "
+        f"after this ruling, not squeak past it")
+    # and the log says so LOUDLY, with the mechanism, not just a number
+    assert "THE CHILD IS NOT WEDGE-STORABLE" in log
+    assert "x the tolerance THIS run's own conditioning allows" in log
+
+
+def test_the_gate_does_NOT_scale_without_a_measured_kappa():
+    """kappa is a measurement or it is nothing — handed none, the gate says so.
+
+    Constraint from the ruling: ``kappa_eff`` is the number recorded in this
+    run's provenance and is never estimated inside the gate.  So the caller
+    that fails to supply it gets the OLD absolute floor and a verdict line
+    that names the absence, rather than a silently scaled tolerance built on
+    a guess.
+    """
+    mesh = resolve_mesh()
+    from gw import downfold_run as dr
+    from types import SimpleNamespace
+    sym_perm, L_table = _qirr_tables()
+    S_ibz, W_ibz = _qirr_parent(mesh)
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    S_full = np.asarray(jax.device_get(
+        _qirr_unfold(S_ibz, mesh, sym_perm, L_table)))
+    keep = QIRR_KEEP_CLOSED
+    munu = NamedSharding(mesh, P(None, "x", "y"))
+    T_x, T_y, _r = downfold.build_transfer(
+        jax.lax.with_sharding_constraint(
+            jnp.asarray(S_full[:, keep, :][:, :, keep]), munu),
+        jax.lax.with_sharding_constraint(jnp.asarray(S_full[:, keep, :]),
+                                         munu),
+        mesh, rcond=1e-10, announce=False)
+    W_S = downfold.congruence(mesh, T_x, T_y)(W_full)
+    tables = SimpleNamespace(
+        sym_perm=sym_perm, L_table=L_table, irr_idx_q=QIRR_IRR_IDX,
+        sym_idx_q=QIRR_SYM_IDX, q_irr_frac=QIRR_Q_IRR_FRAC,
+        n_sym_spatial=QIRR_ORB)
+    out = []
+    *_rest, _worst, kap_max, tol = dr._gate_child_wedge_storability(
+        {"W0_qmunu": W_S}, keep, tables, mesh, keep.size, keep.size,
+        rank_per_q=np.zeros(QIRR_NQ_FULL, dtype=np.int64), kappa_per_q=None,
+        parent_tensor=W_full, mu_L=QIRR_MU, print_fn=out.append)
+    log = "\n".join(out)
+    assert np.isnan(kap_max)
+    assert tol == dr.CHILD_COVARIANCE_TOL
+    assert "kappa_eff was NOT SUPPLIED" in log, log
+    assert "is NOT scaled" in log
+
+
+# ---------------------------------------------------------------------------
 # 7.  Multi-device: the whole chain, P=1 against P>1
 # ---------------------------------------------------------------------------
 

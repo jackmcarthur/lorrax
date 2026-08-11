@@ -191,6 +191,17 @@ the run's own `kappa_eff` rather than a constant, and until it is, this gate
 cannot pass on a production-conditioned deck. **That is a separate defect from
 the one this row fixes, and it is now quantified rather than guessed.**
 
+> **DECISION TAKEN, 2026-08-11 — the owner ruled that it should scale.** In
+> his words: *"make it scale if you think that is the most likely thing to be
+> more robust to say 100x more atoms and centroids."* Implemented on branch
+> `fix/child-covariance-tol-kappa-2026-08-11`; see the amendment at the foot
+> of this row for what shipped and what it was measured against. The paragraph
+> above stands as written — it is the record of the state the ruling was taken
+> from, and nothing in it was retracted. **Note that this row's own sentence
+> "the pinv's perturbation is second order in the condition number" is
+> REFUTED by this row's own sweep**: the three points fit a log-log slope of
+> **0.409**, not 2. The exponent that shipped came from the measurements.
+
 **AND THE ERROR BAR MOVED, UPWARD, BECAUSE IT IS NOW MEASURING WHAT IT CLAIMS.**
 `eps_W(W0)` min/median/max went from 9.983e-02 / **1.273e-01** / 2.391e-01
 against the orbit-floor lane's 3.205e-02 / 4.319e-02 / 1.328e-01. That is not a
@@ -221,9 +232,12 @@ in-log.
 
 ## Owed after this lane
 
-1. **The tolerance.** `CHILD_COVARIANCE_TOL = 1e-9` is unreachable at
-   production conditioning and should be a function of the run's `kappa_eff`.
-   Owner row; the number is measured above and no gate was loosened to hide it.
+1. ~~**The tolerance.**~~ **DECISION TAKEN AND IMPLEMENTED, 2026-08-11 —
+   see the amendment below.** `CHILD_COVARIANCE_TOL = 1e-9` was unreachable at
+   production conditioning; the owner ruled *"make it scale if you think that
+   is the most likely thing to be more robust to say 100x more atoms and
+   centroids"*, and it now does. Branch
+   `fix/child-covariance-tol-kappa-2026-08-11`, pushed, NOT merged.
 2. **The comparison this poisons.** The orbit-floored-vs-point-picked accuracy
    comparison must be re-taken; it is now cheap and it was NOT re-run here.
 3. **A second deck.** `xbwin_0811` reports a BSE-window refit certification
@@ -236,3 +250,168 @@ in-log.
    half-lattice points); Σ is not one of them, which is consistent with Σ being
    that child's worst point. Checkable against their existing per-q numbers
    without re-running anything.
+
+---
+
+## Amendment, 2026-08-11 — the tolerance now scales with `kappa_eff`
+
+This closes owed item 1 above. Branch
+`fix/child-covariance-tol-kappa-2026-08-11` at `2c7a7417`, off `origin/main`
+`0578bc89`, pushed and **not merged**. Evidence
+`/pscratch/sd/j/jackm/covtol_0811/`.
+
+### What the gate does now
+
+The child-covariance gate compares the run's own measured covariance residual
+against
+
+    tol(kappa) = max(1e-9, 4.0 * 8.3e5 * kappa**0.41 * eps_mach)
+
+which is a module-level function, `gw.downfold_run.child_covariance_tol`.
+There is no CLI flag, no environment variable and no deck key that reaches it,
+which is the same discipline the refit-window certification tolerance keeps.
+`CHILD_COVARIANCE_TOL` survives as the **floor**, so a well-conditioned
+synthetic is gated no more loosely than it was before this ruling, and the
+floor is reached below about `kappa = 2`, which no real solve sees.
+
+### Where the exponent came from, which is the part worth arguing about
+
+Not from theory. The three-point rcond sweep recorded higher up this page —
+`kappa_eff` 2.0e1 to 3.9e-10, 9.9e1 to 1.2e-09, 8.9e5 to 3.7e-08 — has a
+least-squares slope in log-log of **0.4087**, and 0.41 is what ships. That
+number contradicts this row's own prose, which reasons that the pseudo-inverse
+perturbation is "second order in the condition number". The prose is a
+hypothesis and the sweep is a measurement, and where they disagree the
+measurement wins; a tolerance fitted to an exponent of 2 would have been three
+decades too loose at production conditioning and would have cost the gate most
+of its discrimination for no reason anyone had measured.
+
+The extrapolation error also runs in the safe direction, which matters because
+the owner's question was explicitly about a hundredfold larger system. The
+measured local slope falls as `kappa` rises — 0.70 across the first decade of
+the sweep and 0.38 across the last four — so a single global 0.41 opens the
+gate slightly faster than the data actually does out at large `kappa`.
+
+The coefficient `8.3e5` (in units of machine epsilon) is simply the smallest
+constant for which the fitted power law covers all three filed points; the
+three implied constants are 5.14e5, 8.21e5 and 6.06e5. The **4x safety factor
+is a separate named constant** rather than being folded into that coefficient,
+so a reader can audit the fit and the margin apart from one another. Four is
+modest on purpose: all three points come from one deck at three values of
+`rcond`, so deck-to-deck spread is genuinely unmeasured, and 4x covers the
+1.6x spread of the fit itself with room over.
+
+### `kappa_eff` is a measurement and never a knob
+
+The gate is handed the achieved amplification the transfer solve already
+computes — the max over q of `sigma_max / sigma_min_kept` from the same
+`common.rank_criterion` reports that the `[downfold/solve]` banner prints — so
+the number in the verdict line is the number in the solve's own banner. It is
+not estimated inside the gate and it cannot be supplied by a deck. A caller
+that fails to supply it gets the old absolute floor **and a verdict line that
+says out loud that the tolerance was not scaled**, because an absence is not a
+measurement and a gate that invented a `kappa` in order to open itself would
+be precisely the loosening this row refuses.
+
+Because the verdict is now a comparison against a run-dependent number, the
+residual alone is no longer readable after the fact, so the bundle records the
+pair. `downfold_provenance` gains `kappa_eff_per_q`, and the child's table
+group gains `covariance_kappa_eff`, `covariance_tol` and
+`covariance_verdict` beside the `covariance_worst_rel` it already carried.
+Provenance version goes 2 to 3; the change is purely additive.
+
+One thing deliberately did **not** scale: the gate's control. The control
+slices the parent's own tensor and unfolds it — a permutation and a
+unit-modulus phase, with no pseudo-inverse anywhere on that route — so its
+honest floor is a few ulp at any conditioning. Scaling it with a `kappa` it
+does not depend on would blunt the one check that separates "this harness is
+wrong" from "the child is not covariant".
+
+### What this was verified against
+
+On the deck this row is about, the arithmetic is now decided: at
+`kappa_eff = 8.945e+05` the tolerance is **2.031e-07**, so the fixed deck's
+3.729e-08 and 3.004e-08 both read **PASS**, with 5.4x of margin. The same
+deck's pre-fix numbers, 1.170e+00 and 1.241e+00, read **REFUTED** at that same
+tolerance and miss it by **5.8e+06**. That pair is the whole claim: the gate
+stopped reporting `kappa_eff` and did not stop reporting breakage.
+
+The red twin the ruling demanded is not an arithmetic one. It is a live
+synthetic run through the driver's own gate function at production-scale
+conditioning: an ill-conditioned wedge parent whose keep-block solve reaches a
+**measured** `kappa_eff` of **7.054e+05**, with the transfer built from the
+Gram belonging to `-q` and applied at `+q` — the shipped defect this row
+convicts, the bare `conj(T)` construction. It lands at a covariance of
+**4.877e-01** and prints REFUTED, clearing the scaled tolerance by
+**2.6e+06**. The correct arm of the same synthetic, at the same conditioning,
+sits at 1.135e-11 and passes.
+
+That synthetic cannot demonstrate the scaling's *necessity*, and the cell says
+so rather than letting a green imply it: its parent is covariant to machine
+precision by construction, so its correct arm would have passed at 1e-9 too.
+The necessity is a property of a real pair-density Gram, which carries a
+3.1e-10 covariance residual of its own for the pinv to amplify, and that
+evidence is this deck's and is filed above.
+
+### Gates
+
+**WSL CPU A/B, both arms run, worktree pin proven by `__file__` before
+measuring.** Suites `tests/test_downfold.py` +
+`tests/test_exciton_bands_downfold_dropin.py` + `tests/test_spectral_closure.py`
++ `tests/test_layering.py`.
+
+| arm | HEAD | result | collected |
+|---|---|---|---|
+| base | `0578bc89` | **187 passed, 10 skipped** | 197 |
+| branch | `2c7a7417` | **194 passed, 10 skipped** | 204 |
+
+The delta is exactly the seven new cells and there are zero regressions. The
+10 skips are the same documented WSL `liblorrax_ffi_host.so` condition on both
+sides. The base arm was taken in a worktree checked out at `0578bc89` with
+`git rev-parse HEAD` printed, because a stale arm is not a control and this
+row already paid for that lesson once.
+
+**THE SUITES AT FOUR REAL GPUs, ONE COMBINED LEG.** Same four suites in ONE
+process holding four `CudaDevice`s — `DEVICE_COUNT 4`, `PROCESS_COUNT 1`,
+`resolve_mesh()` to `{'x': 2, 'y': 2}`, all asserted in-leg before pytest was
+allowed to start — on `nid001005`, tree at `41dde3e2` with `git dirty-count:
+0` and `gw.downfold_run.__file__` printed from the worktree:
+**204 passed, 0 failed, 0 skipped**, 126.6 s, `_logs/gates_p4b.log`. Collected
+is checked against the expected set rather than read off a green bar: WSL
+reports 194 passed + 10 skipped = **204 collected** on the same four suites,
+and the 10 WSL skips are the documented `liblorrax_ffi_host.so` driver-import
+cells, which run here. Same 204 both sides, so the green is over the same set.
+
+**AND THE FIRST ATTEMPT AT THAT LEG WAS THROWN AWAY, because it measured
+nothing.** It reported 3 failed / 191 passed / 10 skipped, and the failures
+were an XLA HLO-verifier `RET_CHECK` inside `slice_psi_to_centroids` in the
+mesh-invariance subprocess cells. The cause was in the harness, not the tree:
+the leg ran under **jax 0.5.3.dev from `/opt/jax`**, outside the supported
+window, because `LX_BASE_MODULE=lorrax_J070` was exported inside the step's
+own `env.sh` — which runs after `lx` has already chosen the container image.
+The variable has to be set on the LOGIN NODE, before `lx run`. Note the tell
+and how close it came to being banked as a real red: the ten skips carried a
+`jax-support.version` REFUSED banner rather than the usual
+`liblorrax_ffi_host.so` reason, and a lane that had only counted the skips
+would not have seen the difference. With the module pinned host-side the same
+tree, same node and same command give 204/204.
+
+**THE DECK ITSELF, AT FOUR REAL GPUs AND FOUR PROCESSES.** The claim "the
+fixed production deck now prints PASS" is not left as arithmetic on filed
+numbers — the deck was re-run, because the driver's wiring of `kappa_eff` into
+the gate is three lines that no unit cell reaches. `lorrax-downfold` on the
+orbit-floor lane's own deck, reading `owedlegs_0810/parent_auto` READ-ONLY,
+`mesh {'x': 2, 'y': 2} on 4 device(s), 4 process(es)`, provenance version 3
+printed in-leg. It reproduces this row's numbers to the digit — μ_S 480 to
+168, ORBIT-CLOSED under 96 ops, `kappa_eff` max **8.945e+05**, `V_qmunu`
+**3.729e-08**, `W0_qmunu` **3.004e-08**, control **0.000e+00** — and the
+verdict line now reads
+
+    [downfold/star] VERDICT: PASS (worst 3.729e-08 against tol 2.031e-07).
+
+The bundle it wrote carries the pair the verdict needs to stay readable:
+`kappa_eff_per_q` over 64 q spanning 7.292e+05 to 8.945e+05, and beside the
+child's tables `covariance_kappa_eff = 894486.8`, `covariance_tol =
+2.0311e-07`, `covariance_verdict = PASS`. Evidence
+`/pscratch/sd/j/jackm/covtol_0811/_logs/driver_p4.log`, bundle
+`child_covtol/tmp/isdf_tensors_168.h5`.
