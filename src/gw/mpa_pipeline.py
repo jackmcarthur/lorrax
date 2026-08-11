@@ -713,15 +713,34 @@ def compute_mpa_sigma_pipeline(
                     print_fn=print_fn,
                 )
             if partial_out:
-                write_pass_partial(
-                    partial_out, np.asarray(sigma_c_omega), records,
-                    n_p=int(ledger["n_p"]),
-                    poles=[int(r.pole_index) for r in records],
-                    omega_grid_ry=config.omega_grid_ry, fit_src=path,
-                    group_spec=(window_farm.format_group_subset(group_subset)
-                                if group_subset is not None else None),
-                    leg_id=str(getattr(config, "mpa_leg_id", "") or "") or None,
-                    print_fn=print_fn)
+                # ONE WRITER, and this is a FIX rather than a tidy-up.
+                # ``compute_mpa_sigma_c_omega_grid`` returns the gathered
+                # cube on EVERY rank, so at four ranks all four opened
+                # this one path with ``h5py.File(path, "w")``.  Measured
+                # 2026-08-11 on a `-G 4 -n 4` leg of the n_p=2 store: two
+                # ranks died in ``h5f.create`` with "truncated file: eof =
+                # 96 ... stored_eof = 2048" and "file signature not
+                # found" while a third won the race and wrote a cube that
+                # looked entirely normal.  Production farm legs have
+                # always run ``-G=4 -n=1`` — one process — which is why
+                # this has never bitten and why a farm that moves to
+                # multi-rank legs would have found it as a leg that
+                # sometimes dies and sometimes writes.  Nothing about the
+                # single-process behaviour changes: at one rank
+                # ``process_index()`` is 0.
+                import jax as _jax
+                if int(_jax.process_index()) == 0:
+                    write_pass_partial(
+                        partial_out, np.asarray(sigma_c_omega), records,
+                        n_p=int(ledger["n_p"]),
+                        poles=[int(r.pole_index) for r in records],
+                        omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                        group_spec=(
+                            window_farm.format_group_subset(group_subset)
+                            if group_subset is not None else None),
+                        leg_id=str(
+                            getattr(config, "mpa_leg_id", "") or "") or None,
+                        print_fn=print_fn)
                 print_fn(
                     "  ⚠ THIS RUN IS A PARTIAL PASS.  Everything printed "
                     "below — the head, the QP energies, eqp0/eqp1, "
