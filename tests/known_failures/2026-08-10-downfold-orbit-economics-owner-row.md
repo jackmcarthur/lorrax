@@ -1,4 +1,19 @@
-# OWNER ROW — closing the downfold's star symmetry by COMPLETION is uneconomical on a deck with few orbits, and the alternative is to select in orbit blocks (2026-08-10) — **SPEC ONLY, NOTHING IMPLEMENTED**
+# OWNER ROW — closing the downfold's star symmetry by COMPLETION is uneconomical on a deck with few orbits, and the alternative is to select in orbit blocks (2026-08-10) — **DECISION TAKEN, IMPLEMENTED**
+
+> **THE RULING, 2026-08-10, VERBATIM.**  "everything the user has input on
+> they should be specifying in units of points, and we should be choosing the
+> quantity of orbits that comes closest to that number of points without
+> exceeding it."
+
+**STATUS: CLOSED.**  The four questions this row put to the owner are answered
+below under "The ruling, applied", each beside the part of the tree that now
+carries it.  Everything above that heading is the row as it was written, kept
+verbatim because it is the measurement the ruling was made on and a
+measurement is worth more standing than edited.  Implementation:
+`feat/downfold-orbit-floor-2026-08-10`, pushed, **NOT merged**.
+
+---
+
 
 This is a decision to be made by whoever owns the downfold's centroid selection. It
 is not a defect report and it is not a change: the branch that carries this file
@@ -147,3 +162,155 @@ measurement this row rests on lives with the amendment it settles,
 is `/pscratch/sd/j/jackm/owedlegs_0810/` (`closure_auto.json`, `orbits.json` and the
 logs named in the table above), registered in
 `/pscratch/sd/j/jackm/EVIDENCE_MANIFEST.md`.
+
+---
+
+# The ruling, applied (2026-08-10)
+
+Branch `feat/downfold-orbit-floor-2026-08-10`, off `origin/main` `9709ff0b`,
+pushed and **NOT merged**.  What follows answers the four questions in "What
+the owner has to rule on", in that order, and then records the gates.
+
+## The shape of the change
+
+`select_cur_centroids` passed `None` where the sharded select wanted
+`orbit_id`, exactly as this row said, and the change is that argument plus the
+floor semantics around it.  The orbit labels are the connected components of
+the action of `sym_perm`'s rows (`gw.downfold.centroid_orbit_id`, union-find,
+the same table `star_stability` already takes), the kernel picks one pivot per
+orbit and retires that orbit's whole membership, and the delivered set is the
+union of the orbits of the longest PREFIX of the pivot order whose POINT total
+does not exceed `mu_small`.
+
+A prefix and not a knapsack, and the reason is the certificate rather than
+convenience: the pivot order is a quality ranking produced by deflating the
+Schur complement in that order, so skipping orbit *k* to fit a smaller orbit
+*k+1* would use a residual computed under the assumption that *k* was taken.
+The ruling asks for "the quantity of orbits" — a COUNT, in the order the
+selection ranks them — and prefix totals are strictly increasing, so the
+largest admissible count answers both readings at once.
+
+**Orbit COMPLETION is off the selection path.**  `orbit_complete_keep` and
+`star_stability` both remain: the first as an offline instrument for a keep set
+that arrived from somewhere else, the second as the verdict
+`select_cur_centroids` still takes on what it delivered — a guarantee that
+lives in another module's loop is measured here rather than inherited.
+
+## 1. Which rank certificate governs μ_S in orbit mode
+
+**The eigenvalue rank of the pool Gram, in POINTS, at the REALIZED count** —
+the knob-trap discipline this row warned about, unchanged.  Three numbers now
+print with their units attached and the orbit one is labelled as not
+comparable:
+
+* `eigen_rank_pool` — POINTS.  The ceiling, resolved through
+  `common/spectral_closure`, and the number the user's request is validated
+  against.  The refusal above it fires on the number the user typed and can
+  fire on nothing else, because `realized <= requested <= ceiling` holds by
+  construction once the floor is inward.
+* `select_rank` — **ORBITS** in orbit mode, and the report says so in the same
+  breath, naming `centroid.pivoted_cholesky.point_granularity_rank` and the
+  incident that instrument exists for (a gate passing at "42 of 42 directions
+  certified" on a file holding 1908 points).
+* `eigen_rank_kept` — POINTS, on the REALIZED set: `S_SS[keep, keep]` at q = 0.
+  This is the one comparable to μ_S and it is the one the solve will act on.
+
+The floor's own point-granularity validation is asserted rather than assumed
+(`realized <= ceiling`), because "cannot fail by construction" is exactly what
+the previous design believed about completion's cost before it was measured.
+
+## 2. Whether μ_S is allowed to be quantised at all
+
+**Yes, and the spelling is the one this row proposed**: `mu_small` stays a
+request in centroids — the deck key and its type are unchanged — and the
+resolver reports the rung it landed on, loudly, on every run:
+
+```
+  *** [downfold/select] ORBIT-FLOORED: mu_S requested 185 points -> REALIZED 168 (4 orbits: 48+48+48+24) ***
+  [downfold/select] mu_small is a request in POINTS and the realized basis is the largest union of WHOLE
+      symmetry orbits that does not exceed it — 17 of the 185 points you budgeted were not spent.  The next
+      orbit in the pivot order holds 48, and 168 + 48 = 216 would exceed 185.
+  [downfold/select] parent census: 11 orbits: 2 x 24 + 9 x 48 = 480.  Legal point counts at or below the
+      ceiling 185: 24, 48, 72, 96, 120, 144, 168.
+```
+
+The last line is the direct answer to this row's complaint that the shipping
+refusal "is a request that the user find the orbit ladder by bisection, one
+downfold at a time, without ever being told that a ladder is what they are
+searching".  The ladder is printed.  Both numbers are also stamped in the
+child's `downfold_provenance` group (`mu_small_requested`, `mu_small`,
+`n_orbits_kept`, `n_orbits_pool`, `parent_orbit_sizes`,
+`selection_granularity`), so a reader who finds 168 in a deck that says 185 can
+learn why without re-running anything.
+
+**The direction is INWARD and it is stated in only one place.**  An earlier
+draft of this work argued the floor was "deliberately opposite" to
+`common/spectral_closure`'s snap-outward on the rank cut.  That contrast was
+retired within the hour — a parallel lane is aligning `spectral_closure` to
+floor as well, on this same ruling — and the code now states its own direction
+and takes the ceiling AS RESOLVED, whatever resolves it.  A direction asserted
+in two modules is a direction that will disagree with itself; there is a
+comment at the site saying so.
+
+## 3. Whether the quantisation costs anything physical
+
+THE DECIDING LEG.  See "The deciding leg" below.
+
+## 4. Regeneration
+
+Unchanged in kind and now smaller in blast radius, and it is worth being exact
+about who is affected.
+
+* **Existing downfolded CHILDREN are in a different basis than a re-run would
+  produce.**  That is true and unavoidable: a different selection rule picks a
+  different subset.  The mitigation is that a child says so — every bundle
+  carries `keep_idx` and now `selection_granularity` in its provenance, so
+  "was this made under the point rule or the orbit rule" is a question an
+  artifact can answer about itself rather than one answered from a date.
+* **Existing PARENT centroid files are untouched.**  The generator's floor
+  (below) changes what a NEW `--orbit` run delivers; it does not touch a file
+  already written, and nothing in this branch regenerates one.
+* **Nothing was regenerated by this lane.**  The gates below run against the
+  shipped `si_bse_debug` 480-centroid set as it stands.
+
+## The sweep: other user-facing counts that orbit-quantise
+
+One other site, and it had the same defect pointing the other way.
+
+| site | user-facing count | before | after |
+|---|---|---|---|
+| `gw/downfold.py::select_cur_centroids` | `mu_small` (deck key) | points, then completed OUTWARD to whole orbits — 185 → 480 on `si_bse_debug`, then refused | **FLOORED**: largest whole-orbit union ≤ the request, both numbers printed and stamped |
+| `centroid/kmeans_cli.py::_prune` → `prune_candidates_by_pivoted_cholesky` | `N_c` (positional CLI arg) | orbit target `ceil(N_c · n_orbits / n_unique)`, then the delivered POINT count is Σ orbit_size over whatever the greedy picked — **can overrun `N_c`** | **FLOORED** via the new `n_point_budget=` argument: the pivot prefix is truncated to `N_c` points |
+| `gw/downfold.py` `downfold_rcond`, `downfold_select_tol` | tolerances, not counts | — | not applicable: they are thresholds on a spectrum, not quantities bought |
+| `mu_S` device padding (`padded_mu_extent`) | not user-facing | — | out of scope: the pad is exact-zero rows that never reach disk |
+
+On the generator the orbit TARGET is deliberately left exactly as it was, so
+that `refuse_unless_select_certified` and the rank gate in `main()` are still
+stated against the same number; the floor can then only ever TRUNCATE, which
+means the generator now delivers at most `N_c` points and never more, with
+every existing refusal reading exactly as before.  `n_point_budget=None` is the
+historical behaviour, so no other caller of that kernel changes.
+
+## Gates
+
+**WSL CPU, 1×1, both sides run, worktree pin proven by `__file__` before
+measuring.**  Base `origin/main` `9709ff0b`: `tests/test_downfold.py` +
+`tests/test_exciton_bands_downfold_dropin.py` + `tests/test_spectral_closure.py`
+= **3 failed, 87 passed, 10 skipped** (100 collected); branch: **95 passed, 10
+skipped** (105 collected).  The three base failures are the three cells that
+asserted the retired completion behaviour, and they are rewritten rather than
+deleted — the retirement is gated, not merely described:
+
+| cell | what it now measures |
+|---|---|
+| `test_TRUE_a_mid_orbit_request_is_FLOORED_INWARD` | realized ≤ requested at every μ_S, realized is the LARGEST legal rung ≤ the request, the delivered set is orbit-closed, and the report carries BOTH numbers |
+| `test_RED_TWIN_a_selection_that_would_exceed_the_budget_floors_LOUDLY` | **the red twin the ruling names.**  At μ_S = 11 the point-granular selection is asserted NOT orbit-closed first (so the cell is exercising the case the floor exists for), then orbit mode must come back smaller, closed, and must PRINT `ORBIT-FLOORED`, both numbers and the unspent budget |
+| `test_the_floor_can_NEVER_exceed_the_rank_ceiling` | the knob trap, over a deliberately rank-deficient window: realized ≤ `eigen_rank_pool` at every admissible μ_S, any refusal is on the REQUEST and never on a number the floor invented, and `describe()` says ORBITS where it means orbits |
+| `test_qirr_THE_COMPOSITION_...` (×3, §6) | **the composition.**  The covariance gate with the keep set coming from the SHIPPING selection at a request between rungs, instead of the hand-picked `QIRR_KEEP_CLOSED` every other cell in that section uses |
+| `test_qirr_RED_TWIN_the_point_granular_selection_still_cuts_orbits` | the control arm: same Gram, same μ_S, `sym_perm=None` — the delivered set breaks closure and `child_unfold_tables` refuses it, so the floor is shown to have bought something |
+| `tests/test_layering.py` | 80 passed — the new import edges cross no layer |
+
+The count is verified against the expected set rather than read off a green
+bar: 100 collected on base, 105 on branch, +5 = three parametrised composition
+cells, one composition red twin, and a net +1 in `test_spectral_closure.py`
+(two cells replaced by three).
