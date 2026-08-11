@@ -1785,8 +1785,47 @@ def main(argv=None):
                 "there is nothing to check the off-grid tiles against.  Load a "
                 "bundle with the exchange tensor, or use --vq-mode=ongrid.")
         if args.refit_window == "zeta":
+            # CERTIFY ON THE POPULATION THE PATH ACTUALLY TRAVERSES.
+            # ``refit_ongrid_null``'s own default q_list is Γ plus the three
+            # coarse q FURTHEST from Γ — a deliberate pick of the
+            # head-dominated and zone-boundary slots, and it is the same
+            # shape of four-point sample that
+            # ``2026-08-11-refit-vq-sharded-fetch-and-cert-grades.md`` §4
+            # showed had missed the worst point by a factor of 27 on the
+            # windowed route: v(Q) ~ 1/|Q|² amplifies a ζ-fit error most at
+            # SMALL |Q|, and the small-|Q| tiles are exactly the ones
+            # "furthest from Γ" excludes.  So the null is additionally taken
+            # at every distinct coarse tile this path lands on, de-duplicated
+            # by tile momentum — the same population the ``bse``-window
+            # branch below certifies its contracted object on.  This only
+            # ADDS q to a gate; no bracket is touched.
+            _frac = Qpath[:nQ_path] * kgrid_vq[None, :]
+            _on = (np.max(np.abs(_frac - np.round(_frac)), axis=1) < 1e-6)
+            _seen, _qlist = set(), []
+            for _i in np.nonzero(_on)[0]:
+                _key = tuple(int(v) for v in
+                             (np.round((-Qpath[_i]) * kgrid_vq).astype(int)
+                              % kgrid_vq))
+                if _key not in _seen:
+                    _seen.add(_key)
+                    _qlist.append(_key)
+            _kg = np.asarray(kgrid_vq, dtype=int)
+            _idx = np.stack(np.meshgrid(*[np.arange(k) for k in _kg],
+                                        indexing="ij"), axis=-1).reshape(-1, 3)
+            _far = np.argsort(-np.sum(np.minimum(_idx, _kg[None, :] - _idx)**2,
+                                      axis=1))
+            for _j in [0] + [int(v) for v in _far[:3]]:
+                _key = tuple(int(v) for v in _idx[_j])
+                if _key not in _seen:
+                    _seen.add(_key)
+                    _qlist.append(_key)
+            log(f"  [refit-null] tile null over {len(_qlist)} coarse q: every "
+                f"distinct on-grid tile of the {nQ_path}-Q path, plus the "
+                f"function's own default sample (Γ and the three q furthest "
+                f"from it).  The path's small-|Q| tiles are the ones the "
+                f"default sample cannot reach and the ones 1/|Q|² amplifies.")
             vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
-                                        log_fn=log)
+                                        log_fn=log, q_list=_qlist)
         else:
             # THE GATE MOVES UP ONE LEVEL.  ζ' is fitted on the BSE window, so
             # it is not the producer's ζ and cannot return the producer's
