@@ -49,6 +49,17 @@ src/
 │   ├── ppm_sigma.py           GN-PPM build + Σ^c(ω) branch/window/τ pipeline
 │   ├── greens_function_kernel.py  build_G (single entry point)
 │   ├── head_correction.py     q→0 head sample + exact static head terms
+│   ├── head_channel.py        WHERE the mini-BZ q≠0 average is applied (mc_average_placement)
+│   ├── head_densify.py        Γ head split off before the coarse→fine densifier, re-attached analytically
+│   ├── downfold.py            transfer solve, orbit-floored selection, child unfold tables
+│   ├── downfold_run.py        the driver's stages + its gates (see docs/downfold.md)
+│   ├── downfold_cli.py / downfold_config.py   entry point and deck
+│   ├── experimental/head_wing_schur.py
+│   │                          sharded head/wing/body Schur reconstruction of W in the
+│   │                          centroid basis. NOT in the BSE and NOT wired into
+│   │                          production W: it is an algebraic kernel behind the
+│   │                          pytest `extra` marker (tests/test_head_wing_schur.py).
+│   │                          head_channel.py reuses its extract_V_body_sharded
 │   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies); project, project_ri (band-space contractions)
 │   ├── coulomb/               dimension-aware Coulomb kernels behind get_kernel():
 │   │                            base.py (SysDim, dispatcher, mini-BZ sampler),

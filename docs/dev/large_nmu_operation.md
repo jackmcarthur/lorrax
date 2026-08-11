@@ -320,32 +320,35 @@ one, and it is the local one.  `build_vq_evaluator` is on the
 `exciton_bands` and `bse_k_grid` paths, so this is reachable from a
 production deck, and it is the BSE stage's INVARIANTS-row-6 defect:
 
-1. `vq_interp.py:147` — `zx["psi"] = fr["psi_full_y"][()]`: the WHOLE
-   `(nk, nb, ns, mu)` ψ read into host numpy on EVERY rank,
+1. `zx["psi"] = fr["psi_full_y"][()]` in the ζ-transport reader: the
+   WHOLE `(nk, nb, ns, mu)` ψ into host numpy on EVERY rank,
    unconditionally.  The module docstring quotes 3.7 GB at the MoS2
    reference.  Ungated.
-2. `vq_interp.py:773,775` — `S_np` and `V_SRc_np`, two `(nq, mu, mu)`
-   host mirrors, i.e. **two full `mu²·nq` tensors per process**.  The
-   docstring at `:669-675` puts the pair at 26.8 GB/proc and names it
-   as the node OOM.  Gated on `run_diagnostics` only.
-3. `vq_interp.py:778` — `Fch`, `(nq, mu, nG)` host, **ungated**: it is
-   allocated whether or not diagnostics run.
-4. `vq_interp.py:822-826` — `_to_host(S_b/V_b/F_b)` is a
-   `process_allgather` of `(q_chunk, mu, mu)` onto every process.
-   Under the 2026-08-05 ruling an allgather is a refusal, not a
-   fallback; this one is not even announced.
-5. `vq_interp.py:1477-1608` — `refit_vq` (`--vq-mode=both`) accepts
-   `mesh_xy` and applies **no sharding constraint at all**: `C=(mu,mu)`,
-   `Z=(mu,n_rp)`, `zeta=(mu,n_rtot)`, `ztG_box=(mu,n_rtot)` are
-   whole-array device buffers on every rank.
+2. `S_np` and `V_SRc_np`, two `(nq, mu, mu)` host mirrors, i.e. **two
+   full `mu²·nq` tensors per process** — the evaluator's own docstring
+   puts the pair at 26.8 GB/proc and names it as the node OOM.  Gated on
+   `run_diagnostics` only.
+3. `Fch`, `(nq, mu, nG)` host, **ungated**: allocated whether or not
+   diagnostics run.
+4. `_to_host(S_b/V_b/F_b)` gathers `(q_chunk, mu, mu)` onto every
+   process.  Since 2026-08-11 `_to_host` is one line of delegation to
+   `common.collectives.gather_to_host`, so the gather is the sanctioned
+   L3 one and it announces itself; the memory it costs is unchanged and
+   is what this row is still about.
+5. `refit_vq` accepts `mesh_xy` and applies **no sharding constraint at
+   all**: `C=(mu,mu)`, `Z=(mu,n_rp)`, `zeta=(mu,n_rtot)`,
+   `ztG_box=(mu,n_rtot)` are whole-array device buffers on every rank.
+   Its host fetches are no longer the problem — the last bare
+   `device_get` on a μ-sharded array was replaced by `gather_to_host` at
+   `93f8b572`, which is why `refit_vq` runs at P>1 at all — but nothing
+   constrains the sharding of the arrays themselves.
 
 The design for closing it is the charge-zeta family's, unchanged: keep
-the `(q, mu, mu)` stacks 2-D-sharded on `('x','y')` end to end — they
-already are on the device side (`V_SRc` at `vq_interp.py:831-838`,
-`C_q` at `:434`, `P_R` at `:452`) — and delete the host mirrors rather
+the `(q, mu, mu)` stacks 2-D-sharded on `('x','y')` end to end — `V_SRc`,
+`C_q` and `P_R` already are on the device side — and delete the host mirrors rather
 than gate them, replacing the diagnostics that consume them with
 on-device reductions of the kind `exciton_bands._gate_stats_on_device`
-(`exciton_bands.py:291-328`) already uses.  Item 1 is a per-rank
+already uses.  Item 1 is a per-rank
 `(nk, nb_window, ns, mu/px)` hyperslab read through the same
 `_read_psi_mu_sharded` the BSE loader uses.  Item 4 disappears with the
 mirrors.  Item 5 needs the same `with_sharding_constraint` treatment
