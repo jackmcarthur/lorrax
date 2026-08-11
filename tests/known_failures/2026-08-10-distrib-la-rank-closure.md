@@ -1,3 +1,30 @@
+> ## REVERTED WHOLE, ON THE OWNER'S RULING (2026-08-11)
+>
+> **Everything below shipped and has been deleted again.** `rank_cut`,
+> `cholesky_pivot_spectrum`, `lu_rank_spectrum`, `distrib_la/closure.py`, the
+> `closure=` kwargs on `plan()` / `factor()`, the `Plan.rank_cut` and
+> `FactorToken.rank_cut` methods, the `LORRAX_DISTRIB_LA_CLOSURE` dial, the
+> `distrib_la` closure suite and the monorepo consistency cell that pinned the
+> two copies field-for-field — all reverted, a net deletion of ~1958 lines.
+>
+> **The one sentence of why: the rule belongs at the sites that decide a
+> truncation, and `distrib_la` has none.** The service factors and solves; it
+> never chooses a rank. The surface below existed so that a guard could be
+> wired into it, which is scope invention — it built the decision in order to
+> have something to guard. The degeneracy-closure rule lives once, in
+> `common/spectral_closure`, at the monorepo call sites that actually cut
+> (`2026-08-10-spectral-cut-closure.md` and its 2026-08-11 direction
+> amendment), and a monorepo caller that wants a closed rank off a
+> `distrib_la` factor takes the spectrum out through that backend's own
+> documented route and calls the monorepo guard on it — which is what the
+> "copy, do not import" argument below was working around rather than solving.
+>
+> This page is kept rather than deleted because the reasoning is the record of
+> why the surface was tried, and a future lane reading only the owner's
+> original "i guess this could even be a feature wired directly into
+> distrib_la?" would otherwise build it again. **The answer to that question is
+> no, and this is the file that says so.** Read the rest as history.
+
 # AMENDMENT — THE DEGENERACY-CLOSURE GUARD BECOMES A `distrib_la` FEATURE, OPT-IN AND OFF (2026-08-10)
 
 **The owner's line was "i guess this could even be a feature wired directly

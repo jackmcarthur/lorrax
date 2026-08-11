@@ -360,9 +360,11 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # phases (rotations inside degenerate σ groups)".  That rotation freedom
     # is harmless while a degenerate group is retained WHOLE — every physical
     # output is invariant under it — and is exactly what breaks covariance
-    # when the group is split.  Snapping outward costs at most the block's
-    # relative span in κ_eff (1e-6-scale), which is why the default repairs
-    # rather than refuses; see that module on why its sibling refuses instead.
+    # when the group is split.  The repair drops the straddled group whole
+    # (owner ruling 2026-08-10), so ``rank_phys`` comes DOWN and the κ_cap
+    # this criterion just enforced holds with room to spare; the padding
+    # below then aligns whatever survives.  See that module's TWO-RULE FAMILY
+    # on why the BAND-window guard rounds the other way and refuses instead.
     rank_phys, _sc = spectral_closure.resolve_spectral_cut(
         s_host, rank_phys, where="htransform psi@centroids Gram-eigh sigma",
         rcond=rtol, log=log_fn)
@@ -459,27 +461,38 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # (the documented `nband`-is-an-absolute-index trap, in which the SVD of
     # an all-zero ψ window returns rank 0 and everything downstream is
     # meaningless).
+    # ``n_dropped_closure`` is what keeps check 2 meaningful after the
+    # closure guard started lowering the rank: the block members it dropped
+    # are a deficit against the criterion, and without this attribution
+    # ``violations()`` would read them as a device-grid round-down and refuse
+    # the run.  They are not — the mesh had no part in choosing them — and
+    # anything left over after this subtraction is still a real violation.
     _trunc = rank_criterion.rank_report(
         s_host, rtol, label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
                             f"{nspinor*n_mu})",
         quantity="singular values", rank_used=rank,
-        n_rows=nk * nb, n_cols=nspinor * n_mu)
+        n_rows=nk * nb, n_cols=nspinor * n_mu,
+        n_dropped_closure=max(0, _sc["n_keep"] - _sc["n_keep_closed"]))
     log_fn(f"  Gram-eigh σ of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
            + (f" (+{n_pad} null pad → carried extent {rank}, "
               f"mesh-aligned to {align})" if n_pad else "")
            + f" ({time.time()-t1:.2f}s)")
     log_fn(_trunc.describe())
     if _sc["fired"]:
-        # ``rank_report`` measures the AMPLIFICATION CAP and knows nothing
-        # about the closure snap, so it counts the snapped directions in its
-        # "null pad" column (``rank_used > rank_criterion`` reads as padding,
-        # which it never raises on).  Split the number here rather than teach
-        # it a second criterion: the two guards stay orthogonal, and a reader
-        # is not left believing real retained directions are null.
-        log_fn(f"  [rank]   of the +{_trunc.n_padded_alignment} shown as null "
-               f"pad above, {_sc['n_keep_snapped'] - _sc['n_keep']} are "
-               f"spectral-closure snaps (REAL retained directions, sigma > 0) "
-               f"and {n_pad} are the mesh-alignment nulls.")
+        # The two guards stay orthogonal and the reader is told which took
+        # what.  ``rank_report`` now carries the closure deficit in its own
+        # column (see ``n_dropped_closure``), so this line names the block
+        # rather than re-deriving the arithmetic.
+        log_fn(f"  [rank]   of the directions not carried, "
+               f"{_trunc.n_dropped_closure} were "
+               f"DROPPED BY DEGENERACY CLOSURE — the members of a block of "
+               f"{len(_sc['members'])} that the cut at {_sc['n_keep']} "
+               f"straddled (relative span {_sc['span_rel']:.3e}).  They are "
+               f"real directions with sigma > 0, discarded so the retained "
+               f"span is a representation of the point group; the other "
+               f"legal cut was {_sc['n_keep_kept']}, and the ruling of "
+               f"2026-08-10 takes the lower.  The {n_pad} null pad above is "
+               f"mesh alignment and unrelated.")
     _bad = _trunc.violations()
     if _bad:
         raise ValueError(

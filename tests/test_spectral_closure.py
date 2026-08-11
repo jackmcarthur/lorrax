@@ -54,16 +54,77 @@ def _with_block(n=64, decades=12.0, at=20, size=4, rel=1e-9):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cut_offset", [1, 2, 3])
-def test_TRUE_a_cut_inside_a_block_fires_and_snaps_outward(cut_offset):
-    """A cut strictly inside a planted block snaps past its bottom."""
+def test_TRUE_a_cut_inside_a_block_fires_and_DROPS_the_block(cut_offset):
+    """A cut strictly inside a planted block moves to the block's TOP.
+
+    THE DIRECTION IS THE OWNER'S RULING OF 2026-08-10 and this is the cell
+    that pins it: "if we're truncating in the middle of a block of degenerate
+    singular values we should truncate the whole block."  The guard landed
+    (1e0d9e23) doing the opposite, so a keep-more result here is not a
+    near-miss — it is the defect this gate exists to catch, and the
+    ``!= 24`` assertion below says so by name.
+    """
     s = _with_block(at=20, size=4, rel=1e-9)
     info = sc.cluster_at_cut(s, 20 + cut_offset)
     assert info["fired"], "a cut inside a 4-fold block must fire"
-    assert info["n_keep_snapped"] == 24, (
+    assert info["n_keep_closed"] == 20, (
         f"the block occupies sorted positions 20..23, so any cut inside it "
-        f"must snap OUTWARD to 24 (keep-more); got {info['n_keep_snapped']}")
-    assert info["n_keep_snapped"] > info["n_keep"], "outward, never inward"
+        f"must move to 20 — the whole block DROPPED; got "
+        f"{info['n_keep_closed']}")
+    assert info["n_keep_closed"] != 24, (
+        "the cut kept the straddled block whole (the pre-ruling direction, "
+        "landed at 1e0d9e23).  The ruling is to DROP it: keep fewer, floor "
+        "semantics, because a block sitting at the rcond boundary is "
+        "noise-adjacent and keeping it adds ill-conditioned directions")
+    assert info["n_keep_closed"] < info["n_keep"], "inward, never outward"
     assert len(info["members"]) == 4
+    # Both legal cuts are always reported, whichever one is taken.
+    assert info["n_keep_dropped"] == 20 and info["n_keep_kept"] == 24
+    assert info["direction"] == "drop_block" == sc.DEFAULT_DIRECTION
+
+
+@pytest.mark.parametrize("cut_offset", [1, 2, 3])
+def test_the_keep_block_direction_is_reachable_but_is_NOT_the_default(
+        cut_offset):
+    """The opt-out exists, is correct, and is not what any site gets.
+
+    ``keep_block`` is retained for a call site with a measured reason to
+    differ.  This cell proves it still works — so that a future lane with
+    such a reason is not reaching for dead code — and the wiring ratchet
+    below proves no site is using it.
+    """
+    s = _with_block(at=20, size=4, rel=1e-9)
+    info = sc.cluster_at_cut(s, 20 + cut_offset, direction="keep_block")
+    assert info["fired"] and info["n_keep_closed"] == 24
+    assert info["direction"] == "keep_block"
+    assert sc.DEFAULT_DIRECTION == "drop_block", (
+        "the default direction moved; the owner's ruling of 2026-08-10 is "
+        "drop_block and this constant is the one place it is decided")
+
+
+def test_a_misspelled_direction_raises_rather_than_meaning_the_default():
+    with pytest.raises(ValueError):
+        sc.resolve_direction("outward")
+    with pytest.raises(ValueError):
+        sc.cluster_at_cut(_smooth(), 20, direction="drop")
+
+
+def test_the_direction_is_not_reachable_from_the_environment(monkeypatch):
+    """A ruling an env var can reverse is not a ruling.
+
+    The MODE is a dial (a user may audit a deck under ``strict``); the
+    DIRECTION is not.  Nothing in the module reads an environment variable
+    for it, and this asserts the absence rather than trusting it.
+    """
+    import pathlib
+    src = pathlib.Path(sc.__file__).read_text()
+    body = src.split("def resolve_direction", 1)[1].split("\ndef ", 1)[0]
+    assert "os.environ" not in body and "getenv" not in body
+    monkeypatch.setenv("LORRAX_SPECTRAL_CLOSURE_DIRECTION", "keep_block")
+    monkeypatch.setenv(sc.MODE_ENV, "snap")
+    assert sc.resolve_direction() == "drop_block"
+    s = _with_block(at=20, size=4, rel=1e-9)
+    assert sc.cluster_at_cut(s, 22)["n_keep_closed"] == 20
 
 
 @pytest.mark.parametrize("cut", [1, 5, 20, 24, 40, 63])
@@ -73,8 +134,8 @@ def test_FALSE_a_smooth_spectrum_never_fires_anywhere(cut):
     assert not info["fired"], (
         f"the guard fired at cut={cut} on a spectrum with a clean 1.5-decade "
         f"ratio between every neighbour — it is finding blocks that are not "
-        f"there, and every site would snap to full rank")
-    assert info["n_keep_snapped"] == cut
+        f"there, and every site would move its cut")
+    assert info["n_keep_closed"] == cut
 
 
 def test_FALSE_a_cut_at_the_block_boundary_is_silent():
@@ -87,13 +148,19 @@ def test_FALSE_a_cut_at_the_block_boundary_is_silent():
             f"guard fired on it")
 
 
-def test_the_cut_the_guard_moves_to_is_itself_clean():
-    """The snap must land in a gap, or it has moved the problem, not fixed it."""
+@pytest.mark.parametrize("direction", sc.DIRECTIONS)
+def test_the_cut_the_guard_moves_to_is_itself_clean(direction):
+    """The move must land in a gap, or it has relocated the problem.
+
+    Parametrized over BOTH directions: the walk that finds the block's top
+    edge is a different walk from the one that finds its bottom, and an
+    off-by-one in either would leave the new cut inside the block.
+    """
     s = _with_block(at=20, size=4, rel=1e-9)
-    info = sc.cluster_at_cut(s, 22)
+    info = sc.cluster_at_cut(s, 22, direction=direction)
     assert info["gap_rel"] <= info["rtol"], "precondition: the old cut is dirty"
-    assert info["gap_rel_snapped"] > info["rtol"], (
-        "the guard snapped to a cut that is ITSELF inside a block — the walk "
+    assert info["gap_rel_closed"] > info["rtol"], (
+        "the guard moved to a cut that is ITSELF inside a block — the walk "
         "stopped early and the retained span is still not invariant")
 
 
@@ -115,7 +182,10 @@ def test_strict_refuses_and_names_the_block_and_the_rank_that_works():
         sc.resolve_spectral_cut(s, 22, mode="strict", where="gate")
     msg = str(e.value)
     assert "gate" in msg, "the message must locate itself"
-    assert "24" in msg, "strict must name the rank that would work"
+    assert "keep 20 instead of 22" in msg, (
+        "strict must name the rank that would work, and it is the DROPPED "
+        "one — a strict refusal that sends the user to keep-more contradicts "
+        "the ruling the snap path follows")
     assert "block holds 4 values" in msg, "strict must name the block"
 
 
@@ -124,10 +194,46 @@ def test_snap_repairs_loudly_and_names_the_move():
     lines = []
     k, info = sc.resolve_spectral_cut(s, 22, mode="snap", where="gate",
                                       log=lines.append)
-    assert k == 24 and info["fired"]
+    assert k == 20 and info["fired"]
     body = "\n".join(lines)
-    assert "SNAPPED OUTWARD" in body, "a silent repair is the failure mode"
-    assert "22 -> 24" in body
+    assert "DROPPED THE BLOCK" in body, "a silent repair is the failure mode"
+    assert "22 -> 20" in body
+    assert "SNAPPED OUTWARD" not in body, (
+        "the pre-ruling banner survived the flip; a log line that says "
+        "OUTWARD while the rank goes down is worse than no log line")
+
+
+def test_a_block_that_reaches_sigma_max_REFUSES_rather_than_returning_zero():
+    """The one failure the drop direction has and the keep direction does not.
+
+    If every value from the top of the spectrum down to the cut is one
+    degenerate block, dropping it leaves rank zero.  That is not a repair,
+    and no mode but ``off`` may return it.
+    """
+    s = np.array([1.0, 1.0, 1.0, 1e-9])
+    for mode in ("snap", "strict"):
+        with pytest.raises(sc.SpectralBlockEmptiesCut) as e:
+            sc.resolve_spectral_cut(s, 2, mode=mode, where="gate")
+        assert "rank 0" in str(e.value) or "ZERO" in str(e.value)
+        assert "raise rcond" in str(e.value), (
+            "the refusal must name a fix; a bare refusal on a flat spectrum "
+            "sends the user to loosen the guard")
+    # ``off`` still returns the proposal, because ``off`` looks at nothing.
+    k, _ = sc.resolve_spectral_cut(s, 2, mode="off", where="gate")
+    assert k == 2
+    # And the info dict says so without raising, for a caller that wants to
+    # decide for itself.
+    info = sc.cluster_at_cut(s, 2)
+    assert info["empties"] and info["n_keep_dropped"] == 0
+    # ``empties`` describes the BLOCK (it reaches sigma_max), so it is
+    # reported in both directions; only ``drop_block`` is refused on it,
+    # because only ``drop_block`` would act on it.
+    keep_info = sc.cluster_at_cut(s, 2, direction="keep_block")
+    assert keep_info["empties"] and keep_info["n_keep_closed"] == 3
+    k2, _ = sc.resolve_spectral_cut(s, 2, mode="snap", where="gate",
+                                    direction="keep_block",
+                                    log=lambda *_: None)
+    assert k2 == 3, "keep_block has no empty case here and must not refuse"
 
 
 def test_off_is_silent_and_changes_nothing():
@@ -203,31 +309,60 @@ def test_the_armC_style_exact_degeneracy_does_fire():
     s = np.concatenate([_smooth(40, 8.0),
                         np.array([1e-9, 1e-9, 1e-9, 1e-13])])
     info = sc.cluster_at_cut(s, 41)
-    assert info["fired"] and info["n_keep_snapped"] == 43
+    assert info["fired"] and info["n_keep_closed"] == 40, (
+        "the exact-degeneracy twin must fire and DROP the block back to 40")
+    assert info["n_keep_kept"] == 43, "both legal cuts are still reported"
 
 
 # ---------------------------------------------------------------------------
-# 4. The bound that makes SNAP the default rather than STRICT
+# 4. WHAT THE FLIP DID TO kappa_eff — the two directions are not symmetric
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("size", [2, 4, 8, 48])
-def test_a_snap_moves_kappa_by_at_most_the_block_span(size):
-    """The whole argument for snapping by default, as an assertion.
+def test_dropping_the_block_can_only_LOWER_kappa(size):
+    """The direction's own argument, as an assertion.
 
-    ``rank_criterion``'s R19 anchor is that +41 % of retained rank cost
-    5000 eV.  A closure snap is not in that class: every direction it admits
-    is within ``rtol`` of one already retained, so ``kappa_eff`` moves by at
-    most ``(1+rtol)**m`` over an m-member block.  At 1e-6 that is under one
-    part in 10^4 for any block a crystal can produce.
+    The old note recorded that a KEEP-snap moved ``kappa_eff`` by under 1e-4
+    — bounded by ``(1+rtol)**m`` over an m-member block, which is true and is
+    re-asserted below on the same construction.  This is that measurement's
+    equivalent for the DROP direction, and the point is that it is not merely
+    smaller: it has the opposite SIGN.  Dropping the block removes the
+    smallest retained values, so ``lam_min(kept)`` rises and ``kappa_eff``
+    falls.  The amplification cap ``rank_criterion`` sized the cut by is
+    therefore satisfied by construction afterwards, with no slack term — the
+    call sites assert it bare.
     """
     s = _with_block(n=128, at=40, size=size, rel=sc.DEFAULT_RTOL / 4)
-    info = sc.cluster_at_cut(s, 41)
-    assert info["fired"]
-    bound = (1.0 + sc.DEFAULT_RTOL) ** (info["n_keep_snapped"] - info["n_keep"])
-    assert info["kappa_snapped"] / info["kappa"] <= bound * (1 + 1e-12), (
-        "a closure snap moved kappa_eff by more than the block's own span — "
-        "the bound that justifies snapping by default does not hold")
-    assert info["kappa_snapped"] / info["kappa"] < 1.0001
+    drop = sc.cluster_at_cut(s, 41)
+    keep = sc.cluster_at_cut(s, 41, direction="keep_block")
+    assert drop["fired"] and keep["fired"]
+
+    # DROP: kappa can only improve, and it is bounded by the same block span.
+    ratio_drop = drop["kappa_closed"] / drop["kappa"]
+    assert ratio_drop <= 1.0, (
+        f"dropping the block RAISED kappa_eff (ratio {ratio_drop:.6f}) — the "
+        f"whole reason the ruling's direction is the safe one for a kept-set "
+        f"quantity is that it cannot")
+    # And the improvement is exactly the gap the cut moved ACROSS: the new
+    # lam_min(kept) is the value just above the block, so the ratio is
+    # (1 - gap_at_the_new_cut) to within the block's own span.  That is the
+    # drop direction's equivalent of the old note's "<1e-4" number, and it is
+    # a different KIND of number — a real gap rather than an rtol-scale
+    # perturbation, because the cut crosses the block instead of sliding
+    # inside it.
+    assert ratio_drop == pytest.approx(1.0 - drop["gap_rel_closed"],
+                                       abs=drop["span_rel"] + 1e-12)
+
+    # KEEP: the landed direction's own bound, restated on the same case so
+    # the two numbers are comparable rather than merely both true.
+    bound = (1.0 + sc.DEFAULT_RTOL) ** (keep["n_keep_closed"] - keep["n_keep"])
+    ratio_keep = keep["kappa_closed"] / keep["kappa"]
+    assert 1.0 <= ratio_keep <= bound * (1 + 1e-12)
+    assert ratio_keep < 1.0001, "the old note's number, unchanged"
+
+    # The sign is the finding: one direction is >= 1 and the other <= 1, and
+    # they bracket the unmoved cut.
+    assert ratio_drop <= 1.0 <= ratio_keep
 
 
 def test_the_noise_floor_is_reported_and_is_rcond_dependent():
@@ -280,15 +415,15 @@ def test_the_jit_face_matches_the_host_face(order, cut):
         arr = s.copy()
 
     keep = _keep_top(arr, cut)
-    dev = jax.jit(sc.snap_keep_outward)(jnp.asarray(arr)[None, :],
-                                        jnp.asarray(keep)[None, :])
+    dev = jax.jit(sc.close_keep_mask)(jnp.asarray(arr)[None, :],
+                                      jnp.asarray(keep)[None, :])
     keep_out, n_pre, n_post = (np.asarray(x) for x in dev)
     host = sc.cluster_at_cut(arr, cut)
     assert int(n_pre[0]) == cut
-    assert int(n_post[0]) == host["n_keep_snapped"], (
-        f"jit face returned {int(n_post[0])}, host face {host['n_keep_snapped']} "
+    assert int(n_post[0]) == host["n_keep_closed"], (
+        f"jit face returned {int(n_post[0])}, host face {host['n_keep_closed']} "
         f"on the same spectrum ({order}) — the two surfaces have drifted")
-    assert int(keep_out[0].sum()) == host["n_keep_snapped"]
+    assert int(keep_out[0].sum()) == host["n_keep_closed"]
     # The snapped set must be exactly "the largest n_post by magnitude".
     assert set(np.flatnonzero(keep_out[0])) == set(
         np.argsort(-np.abs(arr))[:int(n_post[0])])
@@ -301,9 +436,9 @@ def test_the_jit_face_handles_an_indefinite_spectrum():
     s = _with_block(at=20, size=4, rel=1e-9)
     signed = s * np.where(np.arange(len(s)) % 2, 1.0, -1.0)
     keep = _keep_top(signed, 22)
-    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.snap_keep_outward)(
+    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.close_keep_mask)(
         jnp.asarray(signed)[None, :], jnp.asarray(keep)[None, :]))
-    assert int(n_pre[0]) == 22 and int(n_post[0]) == 24, (
+    assert int(n_pre[0]) == 22 and int(n_post[0]) == 20, (
         "the guard must cut on |lambda| for the indefinite transverse channel")
 
 
@@ -315,10 +450,10 @@ def test_the_jit_face_is_batched_and_independent_per_q():
     clean = _smooth()
     batch = np.stack([dirty, clean, dirty, clean])
     keep = np.stack([_keep_top(r, 22) for r in batch])
-    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.snap_keep_outward)(
+    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.close_keep_mask)(
         jnp.asarray(batch), jnp.asarray(keep)))
     assert list(n_pre) == [22, 22, 22, 22]
-    assert list(n_post) == [24, 22, 24, 22], (
+    assert list(n_post) == [20, 22, 20, 22], (
         "a per-q guard leaked across the batch axis — on a real run that is "
         "a retained rank that depends on which q share a chunk")
 
@@ -334,7 +469,7 @@ def test_the_jit_face_never_snaps_through_an_exactly_null_tail():
     jnp = jax.numpy
     s = np.concatenate([_smooth(20, 6.0), np.zeros(12)])
     keep = _keep_top(s, 20)
-    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.snap_keep_outward)(
+    _, n_pre, n_post = (np.asarray(x) for x in jax.jit(sc.close_keep_mask)(
         jnp.asarray(s)[None, :], jnp.asarray(keep)[None, :]))
     assert int(n_post[0]) == 20, (
         f"the guard swept {int(n_post[0]) - 20} exactly-null pad directions "
@@ -609,9 +744,9 @@ def test_every_wired_site_imports_the_shared_guard():
     root = pathlib.Path(__file__).resolve().parents[1] / "src"
     manifest = {
         "isdf/core.py": ["_close_the_cut", "_close_the_cut_padded"],
-        "common/zeta_projection.py": ["snap_keep_outward"],
+        "common/zeta_projection.py": ["close_keep_mask"],
         "gw/downfold.py": ["resolve_spectral_cut", "cluster_at_cut",
-                           "orbit_complete_keep", "star_stability"],
+                           "star_stability"],
         "bandstructure/htransform.py": ["resolve_spectral_cut"],
         "centroid/pivoted_cholesky.py": ["point_rank_closure_note"],
     }
@@ -622,3 +757,50 @@ def test_every_wired_site_imports_the_shared_guard():
             if needle not in text:
                 missing.append(f"{rel} lost its call to {needle}")
     assert not missing, "\n".join(missing)
+
+
+def test_NO_wired_site_opts_out_of_the_ruling_direction():
+    """The ratchet that makes ``keep_block`` an exception rather than a habit.
+
+    The owner's ruling is the default and every site takes it.  A site with a
+    measured reason to differ may pass ``direction="keep_block"`` — and when
+    one does, this gate fails and forces the reason to be written down here
+    rather than discovered later in a log.  **Today the correct list is
+    empty.**
+    """
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "src"
+    offenders = []
+    for path in root.rglob("*.py"):
+        if path.name == "spectral_closure.py":
+            continue           # the guard documents its own opt-out
+        text = path.read_text()
+        if ('direction="keep_block"' in text
+                or "direction='keep_block'" in text):
+            offenders.append(str(path.relative_to(root)))
+    assert not offenders, (
+        "these sites opt out of the ruling's direction (drop the straddled "
+        "block) and none is recorded as having a measured reason:\n  "
+        + "\n  ".join(offenders)
+        + "\nIf the reason is real, add the site here with the measurement. "
+          "If a site NEEDS keep-more to stay correct, that is a finding about "
+          "what consumes its retained span, and it is reported rather than "
+          "flagged away.")
+
+
+def test_the_default_direction_is_spelled_exactly_once():
+    """Same ratchet the mode has: the way a default survives unwanted is that
+    it is spelled six times in three files."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "src"
+    literals = []
+    for path in root.rglob("*.py"):
+        if path.name == "spectral_closure.py":
+            continue
+        text = path.read_text()
+        if 'direction="drop_block"' in text or "direction='drop_block'" in text:
+            literals.append(str(path.relative_to(root)))
+    assert not literals, (
+        "these sites re-spell the default direction as a literal instead of "
+        "letting spectral_closure.DEFAULT_DIRECTION decide:\n  "
+        + "\n  ".join(literals))

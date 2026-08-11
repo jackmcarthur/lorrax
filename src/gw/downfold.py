@@ -521,15 +521,23 @@ def select_cur_centroids(
     # arbitrary slice of an eigenspace, S_SS is not a representation of the
     # point group, and the CUR pivot order — which is what actually picks the
     # centroids — is choosing between directions the spectrum cannot
-    # distinguish.  ``common/spectral_closure`` moves the ceiling OUTWARD past
-    # the block, which is the keep-more direction and admits at most the
-    # block's relative span (1e-6-scale) of extra amplification.
+    # distinguish.  ``common/spectral_closure`` moves the ceiling off the
+    # block by DROPPING the block whole (owner ruling 2026-08-10), so the
+    # ceiling comes DOWN and every μ_S is validated against a rank the pool
+    # Gram can support without a symmetry-arbitrary direction in it.
     #
     # This is the answer to the CUR-pivot symmetry-stability question the
     # q_irr-native lane runs into: pivot stability inside a degenerate block
     # is not recoverable by choosing pivots more carefully, because the block
     # has no preferred basis.  The only stable choices are "all of it" or
     # "none of it", and this is the seam that enforces that.
+    #
+    # THE TWO QUANTISATIONS ON THIS PATH NOW POINT THE SAME WAY, which they
+    # did not when this guard landed.  The ceiling floors (here) and μ_S
+    # floors onto whole orbits, so the realized basis is ≤ the request is ≤ a
+    # ceiling that is itself ≤ what rank_criterion proposed.  Both are
+    # kept-set quantities and both round DOWN; ``common/spectral_closure``'s
+    # TWO-RULE FAMILY section carries the rule and the band-window exception.
     _pool_ev = np.linalg.eigvalsh(
         0.5 * (G_host[:mu_L, :mu_L] + G_host[:mu_L, :mu_L].conj().T))
     ceiling, _sc_pool = spectral_closure.resolve_spectral_cut(
@@ -1085,13 +1093,15 @@ def _announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
              for q in range(len(reports))]
     fired = [q for q, i in enumerate(infos) if i["fired"]]
     if fired:
-        worst = max(fired, key=lambda q: infos[q]["n_keep_snapped"] - infos[q]["n_keep"])
+        worst = max(fired,
+                    key=lambda q: abs(infos[q]["n_keep_closed"]
+                                      - infos[q]["n_keep"]))
         w = infos[worst]
         print_fn(
             f"  *** [downfold/solve] SPECTRAL CLOSURE: the rank cut falls "
             f"inside a degenerate block of S_SS on {len(fired)} of "
             f"{len(reports)} q.  Worst q={worst}: rank {w['n_keep']} -> "
-            f"{w['n_keep_snapped']}, block of {len(w['members'])} eigenvalues "
+            f"{w['n_keep_closed']}, block of {len(w['members'])} eigenvalues "
             f"spanning {w['span_rel']:.3e} relative.  A cut through a "
             f"degenerate block makes the retained span a round-off-chosen "
             f"slice of an eigenspace, so W_S projects onto a different "

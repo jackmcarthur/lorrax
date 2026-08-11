@@ -1662,28 +1662,42 @@ _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
 
 
 def _close_the_cut(spectrum, keep, *, where: str):
-    """Move a ζ rank cut outward past any degenerate block it slices.
+    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block.
 
     The device face of ``common/spectral_closure``, wrapped once so all four
     ζ truncation sites (charge / transverse × replicated / distributed) get
     the same criterion, the same message and the same mode.
 
+    THE DIRECTION IS THE MODULE'S DEFAULT, not a choice made here — the
+    owner's ruling of 2026-08-10, that a cut landing mid-block truncates the
+    whole block.  So the retained rank comes DOWN, never up, and the
+    amplification cap ``rank_criterion`` sized it by is satisfied by
+    construction afterwards.  Nothing at this seam passes ``direction=``: a
+    site that needs the other one is a finding to report, and the wiring
+    ratchet in ``tests/test_spectral_closure.py`` asserts no site does.
+
     WHY IT IS SHAPED LIKE THIS.  The cut lives inside a jitted kernel whose
-    eigenvalues never reach host, so the snap has to be pure ``jnp`` — it is,
-    and it is a prefix-AND over adjacency links with no data-dependent trip
-    count, so it costs one sort and one cumprod per q against the ``eigh``'s
-    O(n³).  A jitted kernel also cannot raise, which is the division of
-    labour ``centroid/pivoted_cholesky`` already documents ("a jitted kernel
-    cannot raise, so it reports and this refuses"): under ``strict`` the
-    firing is recorded through a host callback and refused by
+    eigenvalues never reach host, so the move has to be pure ``jnp`` — it is,
+    and it is a cumulative AND over adjacency links with no data-dependent
+    trip count, so it costs one sort and one cumprod per q against the
+    ``eigh``'s O(n³).  A jitted kernel also cannot raise, which is the
+    division of labour ``centroid/pivoted_cholesky`` already documents ("a
+    jitted kernel cannot raise, so it reports and this refuses"): under
+    ``strict`` the firing is recorded through a host callback and refused by
     ``spectral_closure.raise_if_pending`` at the next host seam, so the flag
     means the same thing here as at the host sites.
 
-    MESH INVARIANCE.  ``snap_keep_outward`` is elementwise plus a sort and a
+    THE ONE CASE THE DROP DIRECTION ADDS is a block that reaches ``λ_max``,
+    where dropping it would leave rank zero.  The host face raises on it; a
+    kernel cannot, so the count is carried out and ``_charge_factor_math``'s
+    existing zero-rank refusal catches it — which is why that refusal now
+    names closure as a possible cause.
+
+    MESH INVARIANCE.  ``close_keep_mask`` is elementwise plus a sort and a
     cumulative product over the SPECTRUM axis, which is never the sharded
     axis on any of these routes — the replicated tiers factor whole logical
     blocks, and the distributed tier's ``_masks`` runs on the replicated
-    ``lam``.  So the snapped mask is bit-identical across device counts, and
+    ``lam``.  So the moved mask is bit-identical across device counts, and
     the factor keeps the mesh-invariance contract it had before.
     """
     # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
@@ -1694,15 +1708,19 @@ def _close_the_cut(spectrum, keep, *, where: str):
         os.environ.get(spectral_closure.MODE_ENV))
     if mode == "off":
         return keep
-    keep_new, n_pre, n_post = spectral_closure.snap_keep_outward(
+    keep_new, n_pre, n_post = spectral_closure.close_keep_mask(
         spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    fired = jnp.any(n_post > n_pre)
+    # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
+    # here would have read every firing as silence after the flip, which is
+    # the shape of a guard that reports a clean bill for the wrong reason.
+    fired = jnp.any(n_post != n_pre)
 
     def _say(_):
         jax.debug.print(
             "*** [spectral-closure] " + where + ": the rank cut falls INSIDE "
             "a degenerate block of the ISDF Gram on at least one q of this "
-            "batch — retained rank/q {a} would close at {b}.  A cut through a "
+            "batch — retained rank/q {a} closes at {b} (the whole straddled "
+            "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
             "degenerate block retains a symmetry-ARBITRARY slice of an "
             "eigenspace, so zeta's span differs between q and Sq and the "
             "k-star identity fails for W and Sigma_x alike.  Mode=" + mode
@@ -1725,11 +1743,14 @@ def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
     identity-padded matrix ``[C_log 0; 0 I]``, whose spectrum is
     ``spec(C_log) ∪ {1.0}×(n_pad − n_log)``.  Those pad eigenvalues are
     **exactly 1.0 and therefore exactly degenerate with each other**, so a
-    block walk that reached them would swallow all ``n_pad − n_log`` of them
-    at once and the retained rank would become a function of the DEVICE
-    COUNT — the precise defect this route's ``lam_max`` note exists to
-    prevent, and the one ``rank_criterion.violations()`` reports as
-    ``n_dropped_alignment``.
+    block walk that reached them would move all ``n_pad − n_log`` of them at
+    once — admitting them under ``keep_block``, discarding them under the
+    default ``drop_block``, and in EITHER direction making the retained rank
+    a function of the DEVICE COUNT.  That is the precise defect this route's
+    ``lam_max`` note exists to prevent, and the one
+    ``rank_criterion.violations()`` reports as ``n_dropped_alignment``.  The
+    withdrawal below is therefore direction-independent, and so is the gate
+    on it.
 
     So the pad is withdrawn from the walk before it starts.  ``lam`` is
     ascending, so its exact-1.0 entries are contiguous; the first
