@@ -2303,13 +2303,122 @@ def exciton_evs(zx, D, Hdir, B, nstate=4):
 # fit-scale GEMM chain per Q.  It is the EXPENSIVE mode by design; the
 # fixture-scale target is 1 GPU, minutes per Q.
 
+def refit_window_view(zx, band_range, log_fn=print,
+                      degeneracy_mode: str = "strict",
+                      degeneracy_tol_ry: float | None = None):
+    """A band-axis VIEW of ``zx`` on a SUB-WINDOW of the ζ-fit window.
+
+    THE REFIT DOES NOT HAVE TO FIT THE WHOLE ζ-FIT WINDOW.  ``refit_vq``
+    re-fits ζ at the target q from the pair densities of whatever band window
+    it is handed; the ζ-fit window is the window that reproduces the
+    producer's ζ, and therefore the producer's stored ``V_qmunu`` tiles, but
+    it is not the only *legal* window.  For an exciton band structure the
+    object being built is a BSE-window object — the exchange kernel contracts
+    BSE-window (c, v) pairs and nothing else — so a ζ' fitted on the BSE
+    window (plus the htransform's conduction guard bands, which is exactly
+    what the deck's ``nval``/``ncond`` name) carries every pair density the
+    kernel will ever ask it for.
+
+    WHY THIS EXISTS AT ALL: the Galerkin rank bound.  ``build_fH_R`` needs the
+    parent ISDF basis to span ``nk·nb``, i.e. ``n_μ,parent · n_s ≥ nk · nb``.
+    On the Si 4×4×4 / 960-centroid lineage that is 1920 ≥ 64·nb, so the ζ-fit
+    window (nb = 60, bound 3840) is unreachable and a 20-band window
+    (bound 1280) is comfortable.  The window that makes the refit reproduce
+    the stored tiles is exactly the window that breaks its htransform leg —
+    see ``tests/known_failures/2026-08-10-exciton-bands-offgrid-Q-is-slab-only.md``.
+
+    WHAT IT COSTS, AND WHERE THAT IS PAID.  ζ' ≠ ζ, so the refit will NOT
+    reproduce the stored ``V_qmunu`` tiles and :func:`refit_ongrid_null` — a
+    TILE-level identity — is not the gate for this mode and must not be run
+    with a widened tolerance to make it pass.  The gate moves up one level, to
+    the contracted object: on-grid BSE eigenvalues through the refit route
+    against the same eigenvalues through the stored tiles.  ``exciton_bands``
+    owns that gate because the contraction is its.
+
+    ``band_range`` is the deck's ABSOLUTE band range ``(b_lo, b_hi)`` — the
+    same ``(nelec − nval, nelec + ncond)`` ``initialize_wfns`` used.  It is
+    located inside the ζ-fit window through the restart's own ``band_window``
+    stamp (``tagged_arrays``' five canonical edges), never by assuming the two
+    windows share an origin.
+
+    Both edges of the sub-window are degeneracy-checked at
+    ``degeneracy_mode`` (default ``strict``): a refit window that cuts a
+    Kramers pair fits ζ' on half a multiplet, which is not a subspace of
+    anything.  Edges that coincide with the ζ-fit window's own edges are
+    boundaries of the calculation, not cuts, and are skipped by
+    :func:`common.band_degeneracy.check_band_window` itself.
+    """
+    from common.band_degeneracy import DEGENERACY_TOL_RY, check_band_window
+
+    b_lo, b_hi = int(band_range[0]), int(band_range[1])
+    fr = zx.get("_h5_restart")
+    if fr is None or "band_window" not in fr:
+        raise SystemExit(
+            f"exciton_bands --refit-window=bse: {zx.get('restart_file')} "
+            f"carries no ``band_window`` stamp, so the deck's absolute band "
+            f"range ({b_lo}, {b_hi}) cannot be located inside the stored "
+            f"psi_full_y's {zx['nb']}-band ζ-fit window.  Without that offset "
+            f"the band axis would be sliced from an assumed origin and the "
+            f"refit would fit ζ' on the wrong bands — silently, since every "
+            f"shape still matches.  The stamp is written by "
+            f"tagged_arrays.write_restart_state_to_h5; re-run the GW to get a "
+            f"bundle that carries one, or run --refit-window=zeta.")
+    bw = [int(v) for v in np.asarray(fr["band_window"]).ravel()]
+    z_lo, z_hi = bw[0], bw[4]
+    if (z_hi - z_lo) != int(zx["nb"]):
+        raise SystemExit(
+            f"exciton_bands --refit-window=bse: the restart's band_window "
+            f"stamp {tuple(bw)} spans {z_hi - z_lo} bands but psi_full_y "
+            f"carries nb={zx['nb']}.  The stamp and the tensor disagree about "
+            f"the window they were written under, so no slice of the band "
+            f"axis can be trusted.")
+    if not (z_lo <= b_lo < b_hi <= z_hi):
+        raise SystemExit(
+            f"exciton_bands --refit-window=bse: the deck's band window "
+            f"[{b_lo}, {b_hi}) is not contained in the bundle's ζ-fit window "
+            f"[{z_lo}, {z_hi}).  The refit fits ζ' from the STORED "
+            f"psi_full_y, so it can only narrow that window, never reach "
+            f"outside it.  Lower the deck's nval/ncond into the stored range.")
+    lo, hi = b_lo - z_lo, b_hi - z_lo
+    if (hi - lo) == int(zx["nb"]):
+        return zx                       # identity slice: the ζ-fit window
+    # Degeneracy on the REFIT window's own edges.  ``enk`` is (nk, nb_ζ) Ry in
+    # the ζ-fit window's indexing, which is the indexing ``lo``/``hi`` are in.
+    check_band_window(
+        np.asarray(zx["enk"]), lo, hi,
+        tol_ry=(DEGENERACY_TOL_RY if degeneracy_tol_ry is None
+                else float(degeneracy_tol_ry)),
+        mode=degeneracy_mode,
+        where="exciton_bands refit zeta-fit window", log=log_fn)
+    zw = dict(zx)
+    zw["psi"] = zx["psi"][:, lo:hi]
+    zw["enk"] = np.asarray(zx["enk"])[:, lo:hi]
+    zw["nb"] = hi - lo
+    zw["_refit_window_abs"] = (b_lo, b_hi)
+    log_fn(f"  [refit] BSE-WINDOW refit: ζ' is re-fitted on absolute bands "
+           f"[{b_lo}, {b_hi}) ({hi - lo} of the ζ-fit window's {zx['nb']}), "
+           f"so the Galerkin rank bound is nk·nb = {zx['nk']}·{hi - lo} = "
+           f"{zx['nk'] * (hi - lo)} instead of {zx['nk'] * zx['nb']}.  ζ' is "
+           f"NOT the producer's ζ and the stored V_qmunu tiles will NOT come "
+           f"back — the certification is the contracted on-grid eigenvalue "
+           f"gate in exciton_bands, not the tile null.")
+    return zw
+
+
 def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
-                  r_chunk: int = 2048, policy=None, keep_idx=None):
+                  r_chunk: int = 2048, policy=None, keep_idx=None,
+                  window_mode: str = "zeta",
+                  degeneracy_mode: str = "strict",
+                  degeneracy_tol_ry: float | None = None):
     """One-time refit state: htransform handles + full-r α-basis.
 
     Returns ``rst`` dict:
+      zx_fit   the band-axis view of ``zx`` the refit actually fits in — the
+          bundle itself under ``window_mode="zeta"``, a sub-window view under
+          ``"bse"`` (:func:`refit_window_view`).  EVERY later ``refit_vq``
+          call must be handed this, not the caller's ``zx``.
       ctilde, B_at_mu, enk_sigma, kgrid_co — htransform setup (window ==
-          the ζ-fit window; asserted against ``zx``)
+          the refit window; asserted against ``zx_fit``)
       psi_r    (nk·nb, ns·n_rp)  stored-window u on the full r-grid, device,
                                  zero-padded on r to a multiple of r_chunk
       B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r
@@ -2341,27 +2450,49 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     assert nk == zx["nk"] and ns == zx["ns"], \
         (f"htransform window (nk={nk}, ns={ns}) != zeta-fit window "
          f"(nk={zx['nk']}, ns={zx['ns']})")
+    # The deck's ABSOLUTE band range — the window ``initialize_wfns`` just
+    # built ``ctilde`` over, and the window the ψ stream below reads.
+    nelec = int(wfn.nelec)
+    band_range = (nelec - int(params["nval"]), nelec + int(params["ncond"]))
+    if window_mode not in ("zeta", "bse"):
+        raise SystemExit(
+            f"refit_prepare: window_mode={window_mode!r} is not 'zeta' or "
+            f"'bse'.")
+    if window_mode == "bse":
+        # ζ' on the deck's (narrower) window; the tile null does not apply and
+        # the driver's contracted eigenvalue gate is the certification.
+        zx = refit_window_view(zx, band_range, log_fn=log_fn,
+                               degeneracy_mode=degeneracy_mode,
+                               degeneracy_tol_ry=degeneracy_tol_ry)
     if nb != zx["nb"]:
         raise SystemExit(
             f"exciton_bands --vq-mode=refit: the htransform band window is "
-            f"nb={nb} (deck nval+ncond) but the bundle's stored psi_full_y "
-            f"carries nb={zx['nb']}.  The refit RE-FITS zeta at the target Q "
-            f"from the pair densities of that window, so it has to be the "
-            f"window the producer fitted in, not a narrower BSE one — a "
-            f"narrower window gives a different zeta and the on-grid null "
-            f"would (correctly) refuse it.  Set the deck's nval/ncond to the "
-            f"GW run's ({zx['nb']} bands total); --n-val/--n-cond still choose "
-            f"the BSE window inside it.")
+            f"nb={nb} (deck nval+ncond) but the ζ the refit fits against "
+            f"carries nb={zx['nb']}.  Under the default "
+            f"``--refit-window=zeta`` the refit RE-FITS zeta at the target Q "
+            f"from the pair densities of the PRODUCER's window, so it has to "
+            f"be that window — a narrower one gives a different zeta and the "
+            f"on-grid TILE null would (correctly) refuse it.  Two ways "
+            f"forward:\n"
+            f"  * set the deck's nval/ncond to the GW run's "
+            f"({zx['nb']} bands total); --n-val/--n-cond still choose the BSE "
+            f"window inside it.  Needs n_mu,parent*n_s >= nk*nb = "
+            f"{zx['nk'] * zx['nb']} for the htransform Galerkin leg;\n"
+            f"  * or ``--refit-window=bse``, which fits ζ' on the DECK's "
+            f"window instead (the BSE window plus its guard bands) and "
+            f"certifies on the CONTRACTED object — on-grid BSE eigenvalues, "
+            f"refit route vs stored route — because a windowed ζ' cannot and "
+            f"must not reproduce the stored V_qmunu tiles.")
     fg = tuple(int(x) for x in meta.fft_grid)
     assert fg == (zx["nx"], zx["ny"], zx["nz"]), \
         f"WFN FFT grid {fg} != zeta_q.h5 grid {(zx['nx'], zx['ny'], zx['nz'])}"
     n_rtot = zx["n_rtot"]
 
-    # Stream the stored window ψ onto the full r-grid (host assembly, one
-    # band chunk at a time), then push once to device.  Window = the σ/fit
-    # window (nelec − nval, nelec + ncond) — same as initialize_wfns used.
-    nelec = int(wfn.nelec)
-    band_range = (nelec - int(params["nval"]), nelec + int(params["ncond"]))
+    # Stream the ψ of the REFIT window onto the full r-grid (host assembly,
+    # one band chunk at a time), then push once to device.  ``band_range`` is
+    # the deck's (nelec − nval, nelec + ncond), i.e. exactly the window
+    # ``initialize_wfns`` built ``ctilde`` over and — after the check above —
+    # exactly the window ``zx`` now carries on its band axis.
     psi_r_host = np.empty((nk, nb, ns, n_rtot), dtype=np.complex128)
     for bc_range, psi_bc in iter_psi_rchunk_bandwise(
             wfn, sym, meta, mesh_xy, band_range, 0, n_rtot,
@@ -2387,7 +2518,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     gal = float(jnp.linalg.norm(rec - psi_r) / jnp.linalg.norm(psi_r))
     log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} "
            f"(refit-vs-stored on-grid floor is bounded by this)")
-    return {"ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
+    return {"zx_fit": zx, "window_mode": window_mode,
+            "window_abs": (int(band_range[0]), int(band_range[1])),
+            "ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
             "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
             "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
@@ -2416,8 +2549,25 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
     lands at 3.3e-14, so anything above that is the ψ representation, not the
     Coulomb.)
 
+    NOT APPLICABLE TO A WINDOWED REFIT, and this refuses rather than being
+    re-tuned.  ``--refit-window=bse`` fits ζ' on the BSE window, so ζ' ≠ ζ and
+    the stored tiles — a full-ζ-fit-window object — are not the answer this
+    call is computing.  A lane that reached for ``tol`` here to make that pass
+    would be widening a bracket around a comparison that has no reason to
+    hold.  The gate for that mode is the contracted eigenvalue certification
+    in ``exciton_bands``; see :func:`refit_window_view`.
+
     Returns the list of (q_index, relative error).
     """
+    if rst.get("window_mode", "zeta") != "zeta":
+        raise SystemExit(
+            f"refit_ongrid_null: this is a TILE-level identity against the "
+            f"producer's stored V_qmunu, and this refit state was prepared "
+            f"with window_mode={rst.get('window_mode')!r} — ζ' is fitted on "
+            f"bands {rst.get('window_abs')}, not on the ζ-fit window, so it "
+            f"is a DIFFERENT ζ and the stored tiles are not what it computes. "
+            f"Certify the contracted object instead (on-grid BSE eigenvalues, "
+            f"refit route vs stored route); do not widen ``tol`` here.")
     kg = np.asarray(kgrid_vq, dtype=int)
     if q_list is None:
         # Γ plus the three coarse q furthest from it — the head-dominated

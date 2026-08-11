@@ -39,6 +39,27 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
     the tile at TILE momentum q = wrap(−Q) (reference-metric convention,
     ``vq_interp`` docstrings); on-grid this is exactly the stored
     ``V_qmunu[wrap(−Q)]`` slot.
+
+    WHICH WINDOW THE REFIT FITS ζ' ON — ``--refit-window``, and it decides
+    which gate certifies the run.  ``zeta`` (default) fits on the producer's
+    own ζ-fit window, reproduces the stored ``V_qmunu`` tiles, and is
+    certified BY that tile identity (``vq_interp.refit_ongrid_null``).  That
+    needs the parent ISDF basis to span the ζ-fit window's Galerkin rank
+    bound, ``n_μ,parent · n_s ≥ nk · nb_ζ``, and a wide GW window can exceed
+    it — on the Si 4×4×4 / 960-centroid / 60-band lineage the bound is 3840
+    against a basis of 1920 and ``build_fH_R`` correctly refuses.  ``bse``
+    fits ζ' on the DECK's window instead, i.e. the BSE window plus its
+    conduction guards: the exchange contracts BSE-window pairs and nothing
+    else, so that window carries every pair density the kernel will ask for,
+    and the bound drops with it.  The price is that ζ' ≠ ζ, so the stored
+    tiles do NOT come back and the tile null is unavailable — the gate moves
+    up to the CONTRACTED object (:func:`_certify_refit_against_stored`): at
+    every path Q that lands on the coarse exchange-tile grid the BSE is solved
+    twice in the same scan, once through the refit exchange and once through
+    the producer's stored tile, and the eigenvalues must agree to
+    ``REFIT_CERT_TOL_MEV``.  The two modes are not a tolerance apart; they
+    certify different objects, and the windowed one certifies the object that
+    is published.
   * **Γ endpoint** — at exactly Γ the production q=0 tile is used (stored
     head-body convention: compute_vcoul zeroes G=0, the mini-BZ-averaged
     head is the loader's rank-1 injection).  At every finite Q the G=0 term
@@ -116,6 +137,22 @@ RY2EV = 13.6056980659
 # only one that knew the loader's zero ε pad was a wrong number and repaired
 # it locally; the loader is correct now, so the constant belongs at the seam
 # and every BSE driver inherits the guard instead of one of nine.
+
+#: ``--refit-window=bse`` certification tolerance, in meV, on the CONTRACTED
+#: object: BSE eigenvalues at an on-grid Q through the refit exchange against
+#: the same eigenvalues through the producer's stored ``V_qmunu`` tile.
+#:
+#: NOT A FLAG, DELIBERATELY.  A windowed ζ' does not reproduce the stored
+#: TILES (see ``vq_interp.refit_window_view``), so the tile-level bracket is
+#: unavailable and this is the only thing standing between a re-fitted ζ' and
+#: a published curve.  A CLI knob on it is a knob for making a failed
+#: certification pass, and the failure mode it guards — an off-grid exchange
+#: built on a ζ' that is subtly not the same operator — is silent by
+#: construction.  0.01 meV is two orders below the ~1 meV scale on which
+#: exciton multiplets are resolved on this lineage and four below the 14.1 meV
+#: the un-orthonormal Galerkin route would have printed.  If it fails, the
+#: window is wrong or the basis cannot span it; report, do not widen.
+REFIT_CERT_TOL_MEV = 0.01
 
 
 def _gather_host(x):
@@ -475,6 +512,78 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
         f"the parent deck's centroids_file (the driver then records its path "
         f"on the bundle and this resolves itself), or point this deck's "
         f"centroids_file at that table directly.")
+
+
+def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
+                                  evs_stored_route, kgrid_vq, log=print,
+                                  tol_mev: float = REFIT_CERT_TOL_MEV):
+    """THE gate for ``--refit-window=bse``: contracted, not tile-level.
+
+    CERTIFY WHERE CONSUMED, one level up.  With ζ' fitted on the BSE window
+    the refit no longer computes the producer's ``V_qmunu``, so the tile
+    identity that guards ``--refit-window=zeta`` is unavailable — and widening
+    its bracket would be widening a comparison that has no reason to hold.
+    What is still exactly comparable is the thing the driver actually
+    delivers: at a Q that lies ON the coarse exchange-tile grid, the producer
+    wrote an exact tile, so the BSE at that Q can be solved twice — once with
+    the refit's tile and once with the producer's — with every other operand
+    (ψ_c(k+Q), ε_c(k+Q), W_R, the solver, the Lanczos block) literally the
+    same array. The eigenvalue difference is then attributable to the exchange
+    and to nothing else, and it is measured in the units the curve is
+    published in.
+
+    The tolerance is a MODULE CONSTANT and this function takes no route to
+    relaxing it; see :data:`REFIT_CERT_TOL_MEV`.  A failure here means the
+    windowed ζ' is not the same exchange operator on the BSE pair space — the
+    window is wrong, or the parent basis cannot span it — and the honest
+    response is to report the number, not to move the line.
+
+    Returns the per-Q rows ``(iQ, tile_index, max|Δ| meV)`` so the caller can
+    put them in the ``.dat`` header: a certification whose numbers do not
+    travel with the data is a claim, not a record.
+    """
+    kg = np.asarray(kgrid_vq, dtype=int)
+    rows, worst, worst_iQ = [], 0.0, -1
+    for j, iQ in enumerate(cert_idx):
+        q_tile = -Qpath[iQ] - np.round(-Qpath[iQ])
+        tile = tuple(int(v) for v in
+                     (np.round(q_tile * kg).astype(int) % kg))
+        d_mev = np.abs(np.asarray(evs_refit_route[iQ])
+                       - np.asarray(evs_stored_route[j])) * RY2EV * 1e3
+        dmax = float(np.max(d_mev))
+        rows.append((int(iQ), tile, dmax))
+        if dmax > worst:
+            worst, worst_iQ = dmax, int(iQ)
+        log(f"  [refit-cert] Q#{iQ} = "
+            f"{np.array2string(Qpath[iQ], precision=4)} (tile {tile}): "
+            f"max|ΔE_S| refit-route vs stored-route = {dmax:.5f} meV "
+            f"over {len(d_mev)} levels")
+    log(f"  [refit-cert] WORST {worst:.5f} meV at Q#{worst_iQ} over "
+        f"{len(rows)} on-grid Q, gate {tol_mev:g} meV — this is the "
+        f"BSE-window ζ' certification, and it replaces (does not relax) the "
+        f"tile-level on-grid null, which a windowed ζ' cannot satisfy.")
+    if not np.isfinite(worst) or worst > float(tol_mev):
+        raise SystemExit(
+            f"exciton_bands --refit-window=bse: the BSE-window ζ' refit does "
+            f"NOT reproduce the stored-tile BSE eigenvalues on the coarse "
+            f"grid — worst max|ΔE_S| = {worst:.5f} meV at Q#{worst_iQ} "
+            f"against the {tol_mev:g} meV gate.  Every OFF-grid exchange tile "
+            f"in this run comes from the same ζ', so nothing on this path is "
+            f"worth plotting.\n"
+            f"  This is not a tolerance to widen.  What it says is that the "
+            f"re-fitted ζ' is not the same exchange operator on the BSE pair "
+            f"space as the producer's ζ, which is a statement about the "
+            f"WINDOW and the BASIS:\n"
+            f"    * the refit window may be too narrow to carry the BSE "
+            f"window's pair densities — widen the deck's nval/ncond (keeping "
+            f"nk*nb <= n_mu,parent*n_s) and re-run;\n"
+            f"    * or the parent ISDF basis may not span even this window — "
+            f"check the ctilde orthonormality line from build_fH_R and the "
+            f"Galerkin full-r residual from refit_prepare;\n"
+            f"    * or the BSE window itself cuts a multiplet — check the "
+            f"band-window lines above.\n"
+            f"  Report the number.  Do not raise REFIT_CERT_TOL_MEV.")
+    return rows
 
 
 def apply_q_per_segment(params, q_per_segment, log=print) -> int:
@@ -921,6 +1030,25 @@ def build_parser():
     ap.add_argument("--refit-points", type=str, default=None,
                     help="comma list of path indices to refit "
                          "(vq-mode=both; default ~5 evenly spaced)")
+    ap.add_argument("--refit-window", choices=("zeta", "bse"), default="zeta",
+                    help="which band window the per-Q exchange REFIT fits "
+                         "zeta' on.  'zeta' (default, unchanged): the "
+                         "producer's own zeta-fit window, so the refit "
+                         "reproduces the stored V_qmunu tiles and is "
+                         "certified BY that tile null.  Needs "
+                         "n_mu,parent*n_s >= nk*nb_zeta for the htransform "
+                         "Galerkin leg, which a wide GW window can exceed.  "
+                         "'bse': fit zeta' on the DECK's window (the BSE "
+                         "window plus its conduction guards).  The exchange "
+                         "only ever contracts BSE-window pairs, so that "
+                         "window carries every pair density the kernel asks "
+                         "for -- but zeta' is NOT the producer's zeta, the "
+                         "stored tiles will NOT come back, and the "
+                         "certification moves up to the CONTRACTED object: "
+                         "on-grid BSE eigenvalues through the refit route "
+                         "against the same eigenvalues through the stored "
+                         "tiles, at "
+                         f"{REFIT_CERT_TOL_MEV:g} meV.")
     ap.add_argument("--refit-r-chunk", type=int, default=2048,
                     help="r-grid chunk of the refit Z build (vq_interp."
                          "refit_prepare); the per-chunk pair-density temp "
@@ -1413,6 +1541,14 @@ def main(argv=None):
     # exchange on a bulk deck — the ONLY one, because the interpolation model
     # is slab-only — and it is what a dense Q path on a 3-D crystal runs.
     pure_refit = (args.vq_mode == "refit")
+    if args.refit_window == "bse" and not pure_refit:
+        raise SystemExit(
+            f"exciton_bands: --refit-window=bse only means anything under "
+            f"--vq-mode=refit, and this run is --vq-mode={args.vq_mode}.  In "
+            f"--vq-mode=both the refit rows are the GROUND TRUTH the "
+            f"interpolation model is scored against, so re-fitting them on a "
+            f"different window would score interp against a moved reference; "
+            f"in ongrid/interp no refit runs at all.")
     kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
     # WHICH GRID INDEXES THE EXCHANGE TILES.  Normally the bundle's own.  After
     # a ``bse_k_grid`` coarse→fine densification the bundle's grid is the FINE
@@ -1497,20 +1633,85 @@ def main(argv=None):
 
     # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
     rst = None
+    zx_fit = zx
+    cert_idx: list[int] = []
     if pure_refit:
         t0 = time.time()
         rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
                                       r_chunk=args.refit_r_chunk, log_fn=log,
                                       policy=zx.get("policy"),
-                                      keep_idx=keep_idx)
+                                      keep_idx=keep_idx,
+                                      window_mode=args.refit_window,
+                                      degeneracy_mode=args.band_degeneracy,
+                                      degeneracy_tol_ry=args.degeneracy_tol_ry)
+        # THE ζ THE REFIT ACTUALLY FITS IN.  Identical to ``zx`` under
+        # ``--refit-window=zeta``; a band-axis sub-window VIEW of it under
+        # ``bse``.  Every refit_vq call below takes this, not ``zx`` — handing
+        # it the unsliced bundle would fit ζ' on the wrong band count with no
+        # shape error (the pair-density axes are contracted away).
+        zx_fit = rst["zx_fit"]
         if V_ongrid is None:
             raise SystemExit(
                 "exciton_bands: --vq-mode=refit certifies itself against the "
                 "stored V_qmunu at on-grid q and this bundle carries none, so "
                 "there is nothing to check the off-grid tiles against.  Load a "
                 "bundle with the exchange tensor, or use --vq-mode=ongrid.")
-        vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
-                                    log_fn=log)
+        if args.refit_window == "zeta":
+            vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
+                                        log_fn=log)
+        else:
+            # THE GATE MOVES UP ONE LEVEL.  ζ' is fitted on the BSE window, so
+            # it is not the producer's ζ and cannot return the producer's
+            # TILES — that identity is gone and re-tuning its bracket would be
+            # widening a comparison with no reason to hold.  What CAN be
+            # certified is the object this driver actually delivers: the BSE
+            # eigenvalues.  Every path Q that happens to land on the coarse
+            # exchange-tile grid gets a TWIN solve row carrying the producer's
+            # own stored tile, and the two eigenvalue sets are compared after
+            # the scan (``_certify_refit_against_stored``).  CERTIFY WHERE
+            # CONSUMED: the refit's only consumer is that contraction, the
+            # twins ride the same single-compile scan, and they reuse the
+            # path's own conduction caches, so the gate costs no cache and no
+            # compile — only |cert| extra Lanczos solves.
+            frac = Qpath[:nQ_path] * kgrid_vq[None, :]
+            on_grid = (np.max(np.abs(frac - np.round(frac)), axis=1) < 1e-6)
+            finite = (np.linalg.norm(Qpath[:nQ_path]
+                                     - np.round(Qpath[:nQ_path]), axis=1)
+                      >= 1e-9)
+            cert_idx = [int(i) for i in np.nonzero(on_grid & finite)[0]]
+            # De-duplicate by TILE momentum: a path that passes through the
+            # same coarse q twice (Γ appears twice on Γ–X–W–L–Γ–Σ, and its
+            # neighbours can repeat) would otherwise pay for the same
+            # comparison more than once.
+            seen, uniq = set(), []
+            for i in cert_idx:
+                key = tuple(np.round((-Qpath[i]) * kgrid_vq).astype(int)
+                            % kgrid_vq)
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(i)
+            cert_idx = uniq
+            if not cert_idx:
+                raise SystemExit(
+                    f"exciton_bands --refit-window=bse: not one of the "
+                    f"{nQ_path} path Q is a FINITE point of the "
+                    f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} exchange-tile "
+                    f"grid, so there is nowhere the refit route and the "
+                    f"producer's stored tiles can be compared and nothing "
+                    f"certifies this run.  A windowed ζ' cannot be checked "
+                    f"tile-by-tile (it is a different ζ), so the contracted "
+                    f"gate is the only one, and it needs at least one shared "
+                    f"Q.  Use a K_POINTS path whose corners are on the coarse "
+                    f"grid — the standard Γ–X–W–L–Γ–Σ corners all are — or "
+                    f"run --refit-window=zeta on a bundle whose parent basis "
+                    f"spans nk·nb_ζ.")
+            log(f"  [refit-cert] BSE-window ζ': the tile null does NOT apply "
+                f"(ζ' ≠ ζ).  Certifying the CONTRACTED object instead at "
+                f"{len(cert_idx)} on-grid path Q "
+                f"{[int(i) for i in cert_idx]} — each solved twice, once "
+                f"through the refit exchange and once through the stored "
+                f"V_qmunu tile, in the same scan.  Gate: "
+                f"{REFIT_CERT_TOL_MEV:g} meV on every eigenvalue.")
         tick("refit_prepare_and_null", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
@@ -1543,7 +1744,8 @@ def main(argv=None):
             n_eval_calls += 1
             continue
         if pure_refit:
-            V_np = vq_interp.refit_vq(zx, rst, q_tile_np, mesh_xy, log_fn=log)
+            V_np = vq_interp.refit_vq(zx_fit, rst, q_tile_np, mesh_xy,
+                                      log_fn=log)
             V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
             V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
                                            + V_np[:n_rmu, :n_rmu].conj().T)
@@ -1572,7 +1774,22 @@ def main(argv=None):
     if pure_refit:
         log(f"  exchange: per-Q ζ REFIT at all {n_eval_calls} finite Q "
             f"(compute-don't-interpolate; Γ keeps the production q=0 tile), "
-            f"certified against the stored V_qmunu by the on-grid null above")
+            + ("certified against the stored V_qmunu by the on-grid tile null "
+               "above" if args.refit_window == "zeta" else
+               f"ζ' on bands {rst['window_abs']}; certification is the "
+               f"contracted eigenvalue gate after the scan"))
+    # CERTIFICATION TWINS.  One extra solve row per certification Q carrying
+    # the PRODUCER's stored tile at that same wrap(−Q).  Appended after every
+    # path row so ``evs_all[nQ + j]`` is the stored-route answer for
+    # ``cert_idx[j]``, whose refit-route answer is already at ``evs_all[i]``.
+    # Nothing else about the row differs — same conduction caches, same W_R,
+    # same solver, same scan — so the eigenvalue difference is attributable to
+    # the exchange tile and to nothing else.
+    for iQ in cert_idx:
+        q_tile_np = -Qpath[iQ] - np.round(-Qpath[iQ])
+        ix, iy, iz = np.round(q_tile_np * kgrid_vq).astype(int) % kgrid_vq
+        V_rows.append(_hermitize(
+            jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
     refit_idx = []
     if args.vq_mode == "both":
         if args.refit_points:
@@ -1595,14 +1812,26 @@ def main(argv=None):
             # all-gather.  LORRAX_CHECK_REPLICA=1 re-arms it.
             from common.collectives import device_put_process_local
             V_rows.append(device_put_process_local(V_pad, grid_xy))
-    n_solve = nQ + len(refit_idx)
+    # Row order in the stack, and the ONE place it is written down:
+    #   [0, nQ)                                   the path (+ --extra-q)
+    #   [nQ, nQ + n_cert)                         certification twins, stored
+    #                                             tile at cert_idx[j]
+    #   [nQ + n_cert, nQ + n_cert + n_refit)      --vq-mode=both refit spots
+    # ``cert_idx`` and ``refit_idx`` are never both non-empty (one belongs to
+    # --vq-mode=refit, the other to =both), but the readers below index off
+    # this layout rather than off that fact.
+    n_cert = len(cert_idx)
+    n_solve = nQ + n_cert + len(refit_idx)
+    assert len(V_rows) == n_solve, (
+        f"V_rows {len(V_rows)} != n_solve {n_solve} "
+        f"(nQ={nQ}, cert={n_cert}, refit={len(refit_idx)})")
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))
     if head_mbz:
-        # refit rows carry no head tensor (they are the ground-truth
+        # refit/cert rows carry no head tensor (they are the ground-truth
         # point-value comparison); zero is an exact no-op in the term.
         M_stack = np.concatenate(
-            [M_rows, np.zeros((len(refit_idx), 3, 3))], axis=0)
+            [M_rows, np.zeros((n_cert + len(refit_idx), 3, 3))], axis=0)
         for iQ, hv, trM in head_scalars[:4]:
             log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
                 f"tr M_ab = {trM:.6e} Ry/bohr^2")
@@ -1610,9 +1839,12 @@ def main(argv=None):
             log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
     tick("vq_eval", t0)
 
-    # refit rows reuse their Q's conduction caches: extend the scan xs
-    if refit_idx:
-        sel = jnp.asarray(list(range(nQ)) + refit_idx)
+    # cert twins and refit rows reuse their Q's conduction caches: extend the
+    # scan xs in the row order fixed above.  This is what makes the twin an
+    # exchange-only comparison — the ψ_c(k+Q), ε_c(k+Q) operands are literally
+    # the same rows, not a recomputation of them.
+    if cert_idx or refit_idx:
+        sel = jnp.asarray(list(range(nQ)) + list(cert_idx) + refit_idx)
         psi_cQ_X = psi_cQ_X[sel]
         psi_cQ_Y = psi_cQ_Y[sel]
         eps_cQ = eps_cQ[sel]
@@ -1793,7 +2025,17 @@ def main(argv=None):
     t_out0 = time.time()
 
     evs_path = evs_all[:nQ]
-    evs_refit = {iQ: evs_all[nQ + j] for j, iQ in enumerate(refit_idx)}
+    evs_refit = {iQ: evs_all[nQ + n_cert + j]
+                 for j, iQ in enumerate(refit_idx)}
+
+    # ── THE CERTIFICATION for --refit-window=bse, before a single number is
+    #    written.  Refit route (already in ``evs_path``) against stored route
+    #    (the twin rows) at the same Q, same caches, same solver. ──────────
+    cert_rows = []
+    if cert_idx:
+        cert_rows = _certify_refit_against_stored(
+            cert_idx, Qpath, evs_path, evs_all[nQ:nQ + n_cert],
+            kgrid_vq, log=log)
 
     # ── outputs (rank 0 ONLY — the .dat / .png writes and the plot must not
     #    race across the 16 processes; evs_all is fully addressable on every
@@ -1806,6 +2048,25 @@ def main(argv=None):
             fh.write(f"# input: {os.path.abspath(args.input)}\n")
             fh.write(f"# window: n_val={n_val} n_cond={n_cond}; n_eig={args.n_eig}; "
                      f"kgrid {nkx}x{nky}x{nkz}; vq_mode={args.vq_mode}\n")
+            if pure_refit:
+                fh.write(f"# refit: window={args.refit_window}"
+                         + (f" (zeta' re-fitted on absolute bands "
+                            f"[{rst['window_abs'][0]}, {rst['window_abs'][1]})"
+                            f", Galerkin bound nk*nb="
+                            f"{zx_fit['nk'] * zx_fit['nb']})"
+                            if args.refit_window == "bse" else
+                            " (producer's zeta-fit window)") + "\n")
+            if cert_rows:
+                # THE CERTIFICATION TRAVELS WITH THE DATA.  A gate whose
+                # numbers live only in a log is a claim about a file nobody
+                # has; these are the numbers that say this curve is trusted.
+                fh.write(f"# refit-cert: contracted on-grid gate, refit route "
+                         f"vs stored V_qmunu route, {REFIT_CERT_TOL_MEV:g} meV; "
+                         f"worst {max(r[2] for r in cert_rows):.5f} meV over "
+                         f"{len(cert_rows)} Q\n")
+                for iQ, tile, dmax in cert_rows:
+                    fh.write(f"#   Q#{iQ} tile {tile}: "
+                             f"max|dE_S| = {dmax:.5f} meV\n")
             fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) "
                      "keeps G=0 at finite Q (energy_loss); Gamma uses the "
                      "production q=0 head-body tile; energies in eV\n")
