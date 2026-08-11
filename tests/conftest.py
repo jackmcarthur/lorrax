@@ -21,6 +21,26 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import fast_gate  # noqa: E402
 import harness  # noqa: E402
 
+# THE SERVICE SOURCE ROOTS, ON THE PATH BEFORE ANY TEST MODULE IMPORTS.
+# MEASURED, 2026-08-10, ``lx test`` at P=4 on nid001156: ``symmetry_maps``
+# is not importable at module scope inside the container, so four suites
+# that probe for it with ``pytest.importorskip`` at module scope —
+# ``test_mpa_w_restart``, ``test_mpa_fit_driver``, ``test_mpa_store``,
+# ``test_mpa_pole_unfold`` — were COLLECTION-skipped on every cluster leg
+# and the run reported green having asserted nothing about the MPA store
+# or the fit driver.  A collection skip is invisible in a pass count,
+# which is exactly the shape of a gate that has quietly stopped gating.
+# ``ffi._services.ensure_on_path`` is the tree's own answer, called by
+# every ``src`` consumer, idempotent, and stdlib-only — it appends paths
+# and imports nothing, so it cannot disturb the x64-before-jax ordering
+# this file exists to enforce.  It is deliberately NOT wrapped in a
+# try/except: if the service roots cannot be found, the suites that need
+# them should say so here rather than each self-skipping into silence.
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+from ffi import _services as _lorrax_services  # noqa: E402
+
+_lorrax_services.ensure_on_path()
+
 # ---------------------------------------------------------------------------
 # ONE GPU PER PROCESS THAT RUNS TESTS.  Not a preference — three separate
 # things require it, and a fourth requires that the xdist CONTROLLER be
