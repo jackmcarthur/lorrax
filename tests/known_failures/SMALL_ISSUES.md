@@ -491,6 +491,21 @@ silent overwrite.
     snapshots inside the 180 s grace); (c) the claim refusal prints
     the claim table it just read, so the next occurrence self-diagnoses.
     [batch lane report, 2026-08-10]
+38. **`centroid.pivoted_cholesky` drags h5py into every pure-LA caller,
+    for an annotation it never evaluates.** Line 59 does
+    `from wfn_loader import WfnLoader` at module scope, so
+    `gw.downfold.select_cur_centroids` — pure linear algebra on a Gram,
+    reads no file — cannot be imported unless the whole HDF5 stack is
+    importable. The module has `from __future__ import annotations`
+    (line 41) and `WfnLoader` appears in exactly two places, both
+    parameter annotations (lines 615, 1198), so under PEP 563 the name
+    is never evaluated at runtime: `if TYPE_CHECKING:` is behaviour-
+    preserving. Not cosmetic — this edge is what turned a dropped h5py
+    on Perlmutter into three RED cells in
+    `tests/test_spectral_closure.py` and a false platform-divergence
+    hunt on 2026-08-10. Central module owned by another lane, so it is
+    registered rather than taken, and it owes a P=4 leg.
+    [/pscratch/sd/j/jackm/spcl_platform_0810/EVIDENCE.md]
 
 ## Fixed (strike-in-place graveyard — newest first)
 
