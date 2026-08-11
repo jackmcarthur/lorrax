@@ -238,10 +238,17 @@ def announce_restart_entry_stage(config, *, meta, wfn, mode, requests,
     # a deck CAN state.  Declaring a grid this driver does not own would
     # be inventing an expectation, which is how a ladder comes to grant a
     # skip nobody checked.
+    # ``restart_q_storage_raw`` AND NOT ``restart_q_storage``: the config
+    # has no attribute by the latter name (``auto`` resolves late, so the
+    # deck's request is parked under the ``_raw`` suffix), and a getattr
+    # that misses reads None on every deck — a key that silently means
+    # "cannot say" and is indistinguishable, in the log, from one that was
+    # compared and agreed.  Same correction at the multipole seam.
     sampling = w_restart.SamplingExpectation(
         omega=getattr(config, "mpa_omega_grid", None),
         keys={"n_rmu": int(getattr(meta, "n_rmu", 0)) or None,
-              "q_storage": getattr(config, "restart_q_storage", None)})
+              "restart_q_storage_raw": getattr(
+                  config, "restart_q_storage_raw", None)})
     try:
         decision = w_restart.resolve_mpa_restart(
             bundle, identity=w_restart.wfn_identity(wfn),

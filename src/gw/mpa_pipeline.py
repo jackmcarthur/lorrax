@@ -507,11 +507,25 @@ def compute_mpa_sigma_pipeline(
     # own, and anything the deck cannot state stays ``None`` — "cannot
     # say", which leaves the ladder exactly as it was before these
     # existed rather than silently granting a skip.
+    # THE ATTRIBUTE IS ``restart_q_storage_raw`` AND THE SPELLING MATTERS.
+    # ``LorraxConfig`` has no ``restart_q_storage``; the deck's request is
+    # parked under the ``_raw`` suffix because ``auto`` resolves LATE
+    # (``gw.restart_q_storage``), so a ``getattr(config,
+    # "restart_q_storage", None)`` reads None on every deck ever written
+    # and the key is compared against nothing.  A key that silently
+    # evaluates to "cannot say" is the exact shape this ladder exists to
+    # refuse, and it is invisible: the run announces a skip, the ladder
+    # reports no mismatch, and nothing distinguishes "checked and agreed"
+    # from "never asked".  The dict key is renamed to the attribute's own
+    # name for the same reason — this is the deck's REQUEST, not the
+    # resolved q-set, and a producer stamping the resolved value under
+    # ``q_storage`` must not be compared against it.
     _zeta = w_restart.take_zeta_state()
     _sampling = w_restart.SamplingExpectation(
         omega=getattr(config, "mpa_omega_grid", None),
         keys={"n_rmu": int(getattr(meta, "n_rmu", 0)) or None,
-              "q_storage": getattr(config, "restart_q_storage", None)})
+              "restart_q_storage_raw": getattr(
+                  config, "restart_q_storage_raw", None)})
     restart = w_restart.resolve_mpa_restart(
         path, identity=w_restart.wfn_identity(wfn),
         zeta=_zeta, sampling=_sampling)

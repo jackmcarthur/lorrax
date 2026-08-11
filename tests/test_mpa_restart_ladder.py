@@ -327,3 +327,45 @@ def test_a_refusing_bundle_does_not_end_a_run_that_is_not_resuming_it(tmp_path):
     decision, lines = _announce(_Cfg(), tensors=str(bad))
     assert decision is None
     assert any("not resolved" in ln for ln in lines), lines
+
+
+def test_the_q_storage_key_reads_an_attribute_the_config_actually_has():
+    """RED-FIRST: the old spelling read None on every deck ever written.
+
+    ``LorraxConfig`` parks the deck's request under ``restart_q_storage_raw``
+    because ``auto`` resolves late.  A seam reading ``restart_q_storage``
+    therefore declares None -- "cannot say" -- and the key is compared
+    against nothing, which in the log is indistinguishable from a key that
+    was compared and agreed.  This asserts BOTH halves: the attribute that
+    exists is declared, and the one that does not is not silently relied on.
+    """
+    from gw import screening
+    from gw.gw_config import LorraxConfig
+    from gw.mpa import w_restart as _WR
+
+    assert "restart_q_storage" not in getattr(LorraxConfig, "__annotations__", {}), (
+        "if LorraxConfig ever grows a resolved 'restart_q_storage', the two "
+        "seams must choose deliberately between the deck's REQUEST and the "
+        "resolved q-set -- they are not the same value")
+
+    seen = {}
+
+    def _spy(path, **kw):
+        seen.update(kw)
+        return _WR.MpaRestartDecision(path=path, stage=_WR.STAGE_BUILD)
+
+    cfg = _Cfg()
+    cfg.restart_q_storage_raw = "ibz"
+    real = _WR.resolve_mpa_restart
+    _WR.resolve_mpa_restart = _spy
+    try:
+        _WR.record_zeta_state(present=False, valid=False)
+        screening.announce_restart_entry_stage(
+            cfg, meta=_Meta(), wfn=None, mode=_Mode(), requests=["static"],
+            input_dir="/nonexistent", tensors_filename="/nonexistent/t.h5",
+            print_fn=lambda *_a, **_k: None)
+    finally:
+        _WR.resolve_mpa_restart = real
+    keys = seen["sampling"].keys
+    assert keys["restart_q_storage_raw"] == "ibz", keys
+    assert keys["n_rmu"] == 144, keys
