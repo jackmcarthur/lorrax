@@ -27,7 +27,7 @@ Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
 | `bse_kpm.py`            | KPM Chebyshev moments → BSE density of states | working |
 | `bse_pseudopoles.py`    | FEAST-based pseudopole construction, density-biased seeds | working |
 | `bse_io.py`             | restart-bundle reader, padding utils, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below); also `pad_W_R_to_grid` / `bse_k_grid` coarse→fine |
-| `absorption_common.py`  | h5 readers + Lorentzian + Kramers-Kronig + BGW-format `.dat` writers | working |
+| `absorption_common.py`  | h5 readers + Lorentzian + JDOS + Kramers-Kronig + BGW-format `.dat` writers | working. **The single site** for the three formulas both drivers share: `exciton_dipole_projections` (the ⟨0\|r̂\|S⟩ contraction), `lorentzian_broaden`, and `jdos_from_transitions` (the 4th `absorption_*.dat` column). The two drivers and `eigvals_to_eps2` each carried their own copy of the last two until 2026-08-11 |
 | `absorption_eigvecs.py` | ε₂(ω) via Σ_S \|⟨0\|r̂\|S⟩\|²·L (sum-over-states) | working |
 | `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n), no eigvecs | *the* method to use vs BGW |
 | `eigenvectors.h5.spec`  | BGW spec, kept verbatim | reference |

@@ -39,6 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .absorption_common import RYD2EV, lorentzian_broaden as lorentzian
+
 
 def read_bgw_eigvals(path):
     """Return (E_eV, |d|², V_super_bohr3, n_spin, n_spinor, n_eig_in_file)."""
@@ -53,12 +55,6 @@ def read_bgw_eigvals(path):
     E_eV = data[:, 0]
     f_S = data[:, 1]
     return E_eV, f_S, V_super, n_spin, n_spinor, n_eig
-
-
-def lorentzian(omegas, energies, weights, eta):
-    delta = omegas[:, None] - energies[None, :]
-    L = (eta / np.pi) / (delta ** 2 + eta ** 2)
-    return L @ weights
 
 
 def gaussian(omegas, energies, weights, eta):
@@ -82,13 +78,12 @@ def compute_eps2(E_eV, f_S, V_super, n_spin, n_spinor,
     kernel : "lorentzian" or "gaussian". Default "lorentzian" (BGW
         default). With "gaussian", ``eta_eV`` is the Gaussian std-dev σ.
     """
-    ryd2ev = 13.6056980659
     if n_max is not None:
         E_eV = E_eV[:n_max]
         f_S = f_S[:n_max]
-    omegas_Ry = omegas_eV / ryd2ev
-    E_Ry = E_eV / ryd2ev
-    eta_Ry = eta_eV / ryd2ev
+    omegas_Ry = omegas_eV / RYD2EV
+    E_Ry = E_eV / RYD2EV
+    eta_Ry = eta_eV / RYD2EV
     pref = 16.0 * np.pi ** 2 / (V_super * n_spin * n_spinor)
     broaden = gaussian if kernel == "gaussian" else lorentzian
     return pref * broaden(omegas_Ry, E_Ry, f_S, eta_Ry)

@@ -288,12 +288,12 @@ def thick_restart_lanczos_eig(
         return T
 
     def _restart(Q, T, beta_last):
-        _tally('restart')
         """Rotate the basis onto the lowest n_keep Ritz vectors.
 
         Returns the new basis, the retained Ritz values, and the arrow
         couplings for the next cycle.
         """
+        _tally('restart')
         T = 0.5 * (T + jnp.conj(T).T)
         theta, Y = jnp.linalg.eigh(T)
         theta_k = theta[:n_keep]

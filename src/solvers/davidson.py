@@ -41,6 +41,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from common.collectives import gather_to_host
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Instrumentation (BSE perf campaign, 2026-08-08)
@@ -108,26 +110,6 @@ def instrumentation_summary() -> str:
 #: trial vector.  That is cheap at bse_dim = 1024 and is NOT cheap at
 #: production bse_dim; DAVIDSON_COMPETITIVE.md prices the crossover.
 DEFAULT_M_MAX_FACTOR = 10
-
-
-def _to_host(arr) -> np.ndarray:
-    """Bring a (possibly multi-process) jax.Array to host as numpy.
-
-    Delegates to :func:`common.collectives.gather_to_host`.
-
-    The docstring this replaces said it mirrored
-    ``common.collectives.gather_to_host`` — but that one uses
-    ``tiled=True`` and this one used ``tiled=False``, so it mirrored the
-    reference incorrectly, and the same mis-citation appears in two other
-    copies of the same body.  ``tiled=False`` raises on an array whose shards
-    live on other processes; ``process_count()`` does not answer that
-    question, ``is_fully_addressable`` does.  One implementation, in the
-    service, with the branch and the reason for it in one place.
-    """
-    if isinstance(arr, np.ndarray):
-        return arr
-    from common.collectives import gather_to_host
-    return gather_to_host(arr)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -624,8 +606,8 @@ def davidson(
             P = precond_fn(R, Lambda)
 
         # ── convergence check (CPU) ──
-        res_np = _to_host(res)
-        Lambda_np = _to_host(Lambda)
+        res_np = gather_to_host(res)
+        Lambda_np = gather_to_host(Lambda)
         rel_tol = tol * np.maximum(1.0, np.abs(Lambda_np))
         conv = res_np < rel_tol
         # Count EVERY converged root, not the leading run of them.  The old
