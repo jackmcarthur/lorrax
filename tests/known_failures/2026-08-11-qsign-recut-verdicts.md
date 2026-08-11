@@ -111,6 +111,17 @@ P=1, the shape the parent control has always been taken at.
 | L (½, ½, ½) | **yes** | 0.37907 | **2.66313** | **+2.284** |
 | Σ (¼, ½, ¼) | no | 0.03410 | 0.01690 | −0.017 |
 
+**The parent column was re-measured on the fixed tree and came back
+identical to five decimals on all four Q** — 0.03899 / 0.85783 / 0.37907 /
+0.03410, against `xbwin_0811/_logs/ctl_parent.log`'s 0.03899 / 0.85783 /
+0.37907 / 0.03410, same worst point at Q#2. **That is the sharpest control this
+lane has, and it runs in the opposite direction to every other measurement
+here: the q-sign fix changed the child by up to 457x and changed the
+un-downfolded parent by nothing at all, on the same tree, the same deck and the
+same route.** The fix is surgical, exactly as its own row claimed
+(`pair_density_gram` has no caller outside `gw/downfold*.py`), and this is that
+claim measured on a production deck rather than argued.
+
 **The entire remaining child-vs-parent gap is one point, and it is L.** At the
 other three Q the fixed child is within 0.26 meV of the un-downfolded parent
 and is actually *better* than it at two of them, including at W where the
@@ -246,7 +257,7 @@ plus ledger. Every leg printed `git rev-parse HEAD` = `0578bc89` and
 | `bse_floor168b` | 4 devices, 2x2, 4 processes | 0 | 37 s |
 | `bse_point185b` | 4 devices, 2x2, 4 processes | 0 | 37 s |
 | `bse_parentb` | 4 devices, 2x2, 4 processes | 0 | 44 s |
-| `xb_ctl_parent3` (control) | 1 device — see §4 | — | — |
+| `xb_ctl_parent3` (control) | 1 device — see §4 | 1 = the gate refusing | 442 s |
 
 **What was collected, not just what was green.** Every one of the seven P=4
 legs above shows **four** per-rank `compile-cache ... summary` lines, so all
