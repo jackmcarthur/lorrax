@@ -1016,6 +1016,32 @@ _DEFAULTS = {
     # spellable; gw.mpa_pipeline._parse_binned_width_clause is the one
     # place it becomes a number.
     "mpa_binned_width_clause": "off",
+
+    # --- the CONSUMPTION HEIGHT of the body poles, in eV ------------------
+    # Sigma is evaluated at ``omega + i(eta + Gamma_p)`` instead of at the
+    # literal fitted ``Gamma_p``.  DIAGNOSTIC, and it defaults to the
+    # shipped behaviour (0.0 = consume at the fitted width), because it
+    # changes what functional of the pole field Sigma is, not how well that
+    # functional is computed.
+    #
+    # WHY IT IS HERE AT ALL.  The published multipole self-energy -- Yambo's,
+    # and the one the 2021 paper's eight-to-eleven-pole "under 1 meV"
+    # convergence claim is a claim ABOUT -- consumes every pole at a fixed
+    # additional height of 0.1 eV on top of its own fitted width.  This tree
+    # has always consumed at the fitted width alone.  A pole-count ladder
+    # measured on one of those functionals cannot be compared against a
+    # convergence claim made about the other, and this key is what makes the
+    # two measurable side by side WITHOUT refitting: the stored poles never
+    # move, eta is a property of the read.
+    #
+    # WHAT IT DOES NOT REACH, stated here because nothing downstream will
+    # say so: poles narrower than ``sigma_regularization_ev`` are routed to
+    # the two-point machinery and keep that smearing instead (0.25 eV by
+    # default, i.e. already above Yambo's eta); and the certified quadrature
+    # rules are still sized from the unbroadened width, so on the crossing
+    # core the integrand is more damped than its own error certificate
+    # assumes.  See ``mpa.sigma_pass.plan_branch_groups``.
+    "mpa_body_eta_ev": 0.0,
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -2446,6 +2472,10 @@ class LorraxConfig:
     #: ``"off"`` (the default) or a bin ratio ``"2"``/``"4"``.  See
     #: ``_DEFAULTS["mpa_binned_width_clause"]``.
     mpa_binned_width_clause: str
+    #: Extra height, in eV, added to every WIDE body pole's width at
+    #: Sigma consumption; 0.0 is the shipped behaviour.  See
+    #: ``_DEFAULTS["mpa_body_eta_ev"]``.
+    mpa_body_eta_ev: float
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -3046,6 +3076,7 @@ class LorraxConfig:
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),
             mpa_binned_width_clause=str(
                 _g("mpa_binned_width_clause") or "").strip().lower(),
+            mpa_body_eta_ev=float(_g("mpa_body_eta_ev") or 0.0),
             # Sub-dataclass groups
             paths=paths,
             head=head,

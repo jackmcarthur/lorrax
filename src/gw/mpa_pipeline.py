@@ -617,6 +617,8 @@ def compute_mpa_sigma_pipeline(
                     census_out=census_out,
                     census_sha=_source_sha(),
                     plan_store=plan_store or None,
+                    body_eta_ry=float(getattr(
+                        config, "mpa_body_eta_ev", 0.0)) / RYD_TO_EV,
                     print_fn=print_fn,
                 )
             del _cube, _records
@@ -662,6 +664,8 @@ def compute_mpa_sigma_pipeline(
                     plan_verify=plan_verify,
                     binned_width_clause=_parse_binned_width_clause(
                         getattr(config, "mpa_binned_width_clause", "")),
+                    body_eta_ry=float(getattr(
+                        config, "mpa_body_eta_ev", 0.0)) / RYD_TO_EV,
                     print_fn=print_fn,
                 )
             if partial_out:

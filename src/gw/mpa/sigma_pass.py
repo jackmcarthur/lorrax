@@ -1322,6 +1322,7 @@ def plan_branch_groups(
     crossing_eps_q=1.0e-10,
     crossing_max_nodes=200,
     use_shipped_minimax_tables=True,
+    body_eta_ry=0.0,
     log_tag="",
     print_fn=print,
 ):
@@ -1421,7 +1422,57 @@ def plan_branch_groups(
                             "poles are narrower than the smearing and are "
                             "not distinguishable from real ones")))
 
-    omega_complex = a - 1j * g
+    # THE CONSUMPTION HEIGHT.  ``body_eta_ry`` is added to the WIDTH of every
+    # wide pole at the moment the operand is built, and nowhere else, so this
+    # is Sigma evaluated at ``omega + i(eta + Gamma_p)`` rather than at the
+    # literal fitted ``Gamma_p``.
+    #
+    # WHY THE KNOB EXISTS.  The published multipole self-energy -- Yambo's,
+    # and the one [I]'s eight-to-eleven-pole "under 1 meV" convergence claim
+    # is a claim ABOUT -- consumes its poles at a fixed additional height,
+    # 0.1 eV, on top of each pole's own fitted width.  This project has
+    # always consumed at the fitted width alone.  Those are two different
+    # functionals of the same pole field, and a pole-count ladder measured on
+    # one of them cannot be compared with a convergence claim made about the
+    # other.  The knob makes the comparison possible without refitting
+    # anything: the stored poles are untouched, and eta is a property of the
+    # READ.
+    #
+    # WHY HERE AND NOT AT ``g``.  ``g`` is a first-class planner input:
+    # ``split_pass_by_width`` routes on it, the crossing and sign-definite
+    # rules are sized from it, the width panes are cut from it, and
+    # ``plan_store.slab_digest`` hashes it.  Adding eta there would change
+    # which quadrature every pole is served by and would move every cached
+    # plan's address -- a different calculation, not a different reading of
+    # the same one.  Added to the OPERAND, eta changes the integrand and
+    # nothing else: no rule is re-sized, no group re-routed, no plan address
+    # moved.  That is what makes the arm a clean measurement of consumption
+    # height alone.
+    #
+    # TWO CONSEQUENCES THAT MUST BE REPORTED WITH ANY NUMBER THIS PRODUCES.
+    # (1) The narrow poles do not receive it.  Poles with Gamma < xi are
+    # routed to the legacy two-point machinery above, whose operand is real
+    # and whose smearing is xi = 0.25 eV -- already at or above the 0.1 eV
+    # this arm adds, so they are not "unbroadened", they are broadened by a
+    # different and larger constant that the shipped code has always applied.
+    # (2) The certified quadrature rules were sized for the unbroadened
+    # width.  On the Laplace and sign-definite branches that is conservative
+    # (the decay is set by x_min, which eta does not touch).  On the crossing
+    # core, where the fitted width is the only damping in the integrand, the
+    # rule is now over-damped relative to its certificate: convergence is
+    # helped, but the error bound is no longer the one that was proved.
+    #
+    # NOTHING IN THE RUN WOULD OTHERWISE SAY THIS HAPPENED -- the plan
+    # digests hash the operand's dtype and shape and not its values -- so the
+    # value is printed on its own line whenever it is nonzero.
+    eta = float(body_eta_ry)
+    omega_complex = a - 1j * (g + eta)
+    if eta != 0.0 and log_tag:
+        print_fn(f"  MPA consumption height {log_tag}: eta = "
+                 f"{eta * RYD_TO_EV:.6f} eV added to the width of "
+                 f"{int(np.count_nonzero(~narrow))} wide poles; "
+                 f"{int(np.count_nonzero(narrow))} narrow poles keep the "
+                 f"shipped xi = {float(xi_ry) * RYD_TO_EV:.4f} eV smearing")
     # THE ONE GATHER THIS PLANNER PERFORMS.  Everything after it works on
     # the wide set's own values and its own index array: the bucket edges,
     # the width panes, the rule statistics and the group membership.  The
@@ -2116,7 +2167,8 @@ def compute_mpa_sigma_c_omega_grid(
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
     allow_partial=False, pole_subset=None, group_subset=None,
     group_digests=None, census_out=None, census_sha="", plan_store=None,
-    plan_verify=False, binned_width_clause=None, print_fn=print,
+    plan_verify=False, binned_width_clause=None, body_eta_ry=0.0,
+    print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -2292,7 +2344,8 @@ def compute_mpa_sigma_c_omega_grid(
         # pole rather than once per branch, and only on the route that
         # needs it: a loaded plan names which of the two slab operands
         # each group takes and the loader rebuilds it from these arrays.
-        omega_complex_host = (a_host - 1j * g_host
+        omega_complex_host = (a_host - 1j * (g_host
+                                            + float(body_eta_ry))
                               if (plan_dir is not None
                                   and census_out is None) else None)
         state = _prepare_sigma_state(
@@ -2366,6 +2419,7 @@ def compute_mpa_sigma_c_omega_grid(
                         laplace_max_nodes=int(quad.max_nodes),
                         crossing_eps_q=float(quad.crossing_eps_q),
                         crossing_max_nodes=int(quad.crossing_max_nodes),
+                        body_eta_ry=float(body_eta_ry),
                         use_shipped_minimax_tables=bool(
                             quad.use_shipped_tables),
                         log_tag=f"p{p} {br.tag}", print_fn=print_fn)
@@ -2502,7 +2556,8 @@ def compute_mpa_sigma_c_omega_grid(
                         plan_file, groups, address=plan_addr, pole=p,
                         bkey=bkey, source_sha=census_sha, fit_store=fit_src,
                         n_p=n_p, stats=stats, a_ry=a_host,
-                        omega_complex=a_host - 1j * g_host,
+                        omega_complex=a_host - 1j * (
+                            g_host + float(body_eta_ry)),
                         print_fn=print_fn)
                     plan_written[f"{int(p)}.{bkey}"] = {
                         "path": plan_file, "address": plan_addr}
