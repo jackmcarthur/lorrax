@@ -162,17 +162,26 @@ REFIT_CERT_TOL_MEV = 0.01
 #: lowest, how the multiplets order along the path.  A curve certified here is
 #: NOT a reference number and must never be quoted as one.
 #:
-#: WHY IT EXISTS.  On this lineage the ROUTE's own floor is 0.858 meV on the
-#: un-downfolded μ=960 parent (``tests/known_failures/
-#: 2026-08-11-qsign-recut-verdicts.md`` §2): the windowed-ζ' representability
-#: error, with no downfold anywhere in it, measured at four on-grid Q and
-#: reproduced to five decimals across two trees and two mesh shapes.  Against
-#: :data:`REFIT_CERT_TOL_MEV` that refuses by 86x, so at reference grade this
-#: route produces no picture at all, and the only path to 0.01 meV off-grid is
-#: a 2x-centroid GW re-run.  Refusing to draw a 10 meV feature because a
-#: 0.9 meV floor is not a 0.01 meV floor is the wrong trade for a picture and
-#: the right one for a number, so both are named and the default stays the
-#: number.
+#: WHY IT EXISTS.  The windowed-ζ' route carries a representability error with
+#: no downfold in it at all, and on the Si 4×4×4 / μ=960 lineage it was 0.858
+#: meV — 86x over :data:`REFIT_CERT_TOL_MEV`, so at reference grade that route
+#: produces no picture, and the only path to 0.01 meV off-grid is a
+#: 2x-centroid GW re-run.  Refusing to draw a 10 meV feature because a 0.9 meV
+#: floor is not a 0.01 meV floor is the wrong trade for a picture and the right
+#: one for a number, so both are named and the default stays the number.
+#:
+#: **1.0 meV IS NOT A CLAIM THAT ANY PARTICULAR DECK CLEARS IT, and on that
+#: deck it does not.**  The 0.858 meV was measured at the four on-grid Q a
+#: ``--q-per-segment 1`` path reaches, all of them segment CORNERS.  Run the
+#: same parent on a real bandstructure path (``--q-per-segment 16``, which is
+#: the default) and the interior on-grid Q are a different population: 22.952
+#: meV at (0, ¼, ¼) and 6.110 meV at (¼, ¼, ¼), against 0.841 / 0.034 / 0.020
+#: at the corners the old control shared.  See
+#: ``tests/known_failures/2026-08-11-refit-vq-sharded-fetch-and-cert-grades.md``
+#: §4.  So this grade is a statement about what a PICTURE needs, never a
+#: prediction about a route, and a deck that misses it is telling you its
+#: exchange error is the size of the features — which is the one thing a
+#: figure must not be drawn through.
 #:
 #: WHAT IT IS NOT.  Not a free dial: there are exactly TWO grades, both module
 #: constants, and ``--cert-grade`` selects between them by name.  Nothing on

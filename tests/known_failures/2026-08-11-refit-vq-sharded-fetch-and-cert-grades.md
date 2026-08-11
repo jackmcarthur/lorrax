@@ -103,7 +103,66 @@ an explicit "these levels are NOT reference numbers" line), and the rendered
 `.png`. The figure is the artefact that leaves the directory, so it is the one
 that must not be able to arrive without its grade.
 
-## 4. What the parent arms measured
+## 4. THE PLOTS ARE STILL OWED, AND THE 0.858 meV "ROUTE FLOOR" WAS A FOUR-POINT SAMPLE
 
-See §5 of this file's companion rows in `EVIDENCE_MANIFEST.md`; the numbers
-and the PNG paths are in the lane's strike row.
+**The parent arm at `--cert-grade=visualization` REFUSES at 22.95202 meV, and
+the honest reading is that the 1.0 meV grade was calibrated against a
+certification set that did not contain the worst point.** The fix in §1 did
+its job — this is the first time the un-downfolded μ=960 parent has ever run
+the refit path at four real GPUs in four processes, and it ran the whole scan
+(87 Q, 79 off-grid refits at 0.8–1.9 s each, `solve_path: cold 2108.16 s`)
+before its own gate stopped it.
+
+`--q-per-segment 1` puts only the six path CORNERS on the path, four of which
+are on the coarse exchange-tile grid, and every earlier number on this route —
+the 0.858 meV parent control, the 2.593 meV child — was measured on exactly
+those four. `--q-per-segment 16` is a bandstructure, so the path now crosses
+on-grid Q in the segment INTERIORS, and those are a different population:
+
+| Q | fractional | tile | this run | the 4-corner control (`xbwin_0811`/`qsign_recut_0811`, P=1) |
+|---|---|---|---|---|
+| Q#8 | (0, ¼, ¼) | (0,3,3) | **22.95202** | *never sampled* |
+| Q#16 | X (0, ½, ½) | (0,2,2) | 0.01989 | 0.03899 |
+| Q#32 | (¼, ¾, ½) | (3,1,2) | 0.84095 | 0.85783 |
+| Q#48 | L (½, ½, ½) | (2,2,2) | **1.00649** | 0.37907 |
+| Q#56 | (¼, ¼, ¼) | (3,3,3) | **6.10956** | *never sampled* |
+| Q#80 | Σ (¼, ½, ¼) | (3,2,3) | 0.03420 | 0.03410 |
+
+**The three Q that the control also sampled reproduce it** — Σ to five
+decimals, (¼,¾,½) to 2 %, X to within its own scale — so this is the same
+route on the same bundle and not a new configuration. **The two Q the control
+could not reach are 6.1 and 23.0 meV**, and they are what the owner's dense
+path actually traverses. L moved too (0.379 → 1.006), which is worth a second
+look: L is on both lists, so either the k-sum/window differs between the two
+runs in a way not yet identified, or the L value is sensitive in a way the
+single P=1 measurement did not show. **Do not quote the L pair as a clean
+comparison until that is chased.**
+
+So the verdict is NOT "the gate is too tight". It is: **the windowed-ζ'
+representability error on this deck is ~23 meV at its worst on-grid Q, which
+is the same order as the features the picture is meant to show, and the
+picture is therefore not defensible at any grade.** A 1.0 meV grade cannot be
+argued into existence against a 23 meV error, and raising it to 25 meV would
+be the exact knob both constants' docstrings refuse. The grade machinery is
+correct and did its job: it ran the dual solve, it refused, and it wrote no
+`.dat` and no `.png`.
+
+**What would change the answer** (none of it is a tolerance):
+
+* the 2x-centroid GW re-run, which is what §3 already names as the only route
+  to a genuinely small off-grid exchange error — now with a much larger
+  measured gap to close than the 0.858 meV headline suggested;
+* a wider refit window: this deck is at nb = 20 against a Galerkin bound of
+  nk·nb = 1280 vs n_μ·n_s = 1920, so there is room to 28–30 bands, and the
+  `xbwin_0811` window ladder (nb 20→24 bought 12 %) was itself scored only on
+  the corner set and should be re-scored on this one;
+* re-measuring the ladder **on the interior on-grid Q**, because every
+  previous window/basis conclusion on this route was scored against a
+  four-point sample that missed a 23 meV point.
+
+Cost note for whoever takes it: the coarse arm's scan is 2108 s for 87 Q at
+P=4 (24.2 s/Q, `BFC@0.85`, four A100-40GB in four processes). The densified
+`bse_k_grid 8 8 8` arm was priced from `triangle_0810` at ~5x that and was
+**not run** — it consumes the same ζ' and would refuse at the same gate for
+the same reason, so it would have bought a three-hour confirmation of a
+number already in hand.
