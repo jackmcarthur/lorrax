@@ -61,19 +61,26 @@ lane did not promise plots.
 
 ### The per-Q table, which is where the physics is
 
-| Q | fractional | −q ≡ q | before (P=4) | after (P=4) | factor |
-|---|---|---|---|---|---|
-| Q#1 | X (0, ½, ½) | **yes** | 1.07403 | 0.40475 | 2.7x |
-| Q#2 | (¼, ¾, ½) | no | 1.27721 | 0.22834 | 5.6x |
-| Q#3 | L (½, ½, ½) | **yes** | 3.05016 | **2.59335** | 1.2x |
-| Q#5 | Σ (¼, ½, ¼) | no | **6.81943** | 0.01654 | **412x** |
+Taken at **both** shapes, because the original headline was a P=1 leg (7.719)
+and its P=4 twin was 6.819, so a shape-matched comparison is the only honest
+one. Both shapes tell the same story.
 
-The two q the defect could not touch improved by a mean factor of **1.9**; the
-two it did touch improved by a mean factor of **209**. That is a **109-fold
-separation on the predictor**, and the worst point moved from Σ — the
-non-self-inverse point that was 6.819 meV — to L, which is self-inverse and so
-was never corrupted. Σ is now 0.01654 meV, within a factor of two of the gate
-itself.
+| Q | fractional | −q ≡ q | P=4 before | P=4 after | factor | P=1 before | P=1 after | factor |
+|---|---|---|---|---|---|---|---|---|
+| Q#1 | X (0, ½, ½) | **yes** | 1.07403 | 0.40475 | 2.7x | 0.99700 | 0.29551 | 3.4x |
+| Q#2 | (¼, ¾, ½) | no | 1.27721 | 0.22834 | 5.6x | 1.34498 | 0.22049 | 6.1x |
+| Q#3 | L (½, ½, ½) | **yes** | 3.05016 | **2.59335** | 1.2x | 3.20314 | **2.66313** | 1.2x |
+| Q#5 | Σ (¼, ½, ¼) | no | **6.81943** | 0.01654 | **412x** | **7.71905** | 0.01690 | **457x** |
+
+At P=4 the two q the defect could not touch improved by a mean factor of
+**1.9** and the two it did touch by a mean factor of **209** — a **109-fold
+separation on the predictor**. At P=1 the same numbers are **2.3** and
+**231**, a **101-fold separation**. The worst point moved from Σ — the
+non-self-inverse point that carried the whole headline — to L, which is
+self-inverse and so was never corrupted, and Σ itself is now 0.0165 meV, within
+a factor of two of the gate. **The agreement between the two shapes is the
+point: a mesh artefact would not reproduce a 100-fold predictor separation
+twice.**
 
 **So the attribution is settled: the q-sign defect was the whole of the
 anomaly, and what remains at 2.593 meV is the windowed-ζ' representability
@@ -81,19 +88,39 @@ error of the route, which is a separate and already-registered question**
 (`2026-08-10-exciton-bands-offgrid-Q-is-slab-only.md`). The remaining error now
 lives where no downfold can be blamed for it.
 
-### The decomposition, restated
+### The decomposition, restated — and the statistic the old one used was wrong
 
-Against the parent control's 0.858 meV, the old split attributed ~89 % of
-7.719 meV to the child. The child's worst Q is now 2.593 meV against the same
-control, so the child-attributed excess has fallen from ~89 % to **~67 %** of a
-number that is itself **2.6x smaller** — and, read per-Q rather than on the
-maximum, the fixed child is now *better than its own parent* at two of the four
-Q (0.22834 vs 0.85783 at Q#2; 0.01654 vs 0.03410 at Q#5). The single worst
-point, L, is the one the defect never touched. Pre-registered prediction 1B
-said the child-attributed share would fall below 50 % and it did not; it fell
-to 67 %. **That prediction is scored WRONG and is left standing as wrong**,
-because the share is a ratio of maxima taken at different Q and it was the
-wrong statistic to have committed to — the per-Q table above is the honest one.
+The old split compared maxima: 7.719 meV for the child against 0.858 meV for
+the parent, "~89 % attributed to the child". **Those two maxima are at
+different Q** — the child's was at Σ and the parent's is at W — so the ratio was
+never a decomposition of one quantity into two. Now that the defect is gone the
+per-Q comparison is available and it is unambiguous. Both columns below are
+P=1, the shape the parent control has always been taken at.
+
+| Q | −q ≡ q | parent μ960 | fixed child μ191 | child − parent |
+|---|---|---|---|---|
+| X (0, ½, ½) | **yes** | 0.03899 | 0.29551 | +0.257 |
+| (¼, ¾, ½) | no | **0.85783** | 0.22049 | **−0.637** |
+| L (½, ½, ½) | **yes** | 0.37907 | **2.66313** | **+2.284** |
+| Σ (¼, ½, ¼) | no | 0.03410 | 0.01690 | −0.017 |
+
+**The entire remaining child-vs-parent gap is one point, and it is L.** At the
+other three Q the fixed child is within 0.26 meV of the un-downfolded parent
+and is actually *better* than it at two of them, including at W where the
+parent has its own worst point. L contributes +2.284 meV of the +1.89 meV total
+excess — more than all of it, because the other three are net negative.
+
+**And L is self-inverse, so the q-sign defect could never have touched it.**
+The downfold's remaining contribution on this deck is therefore concentrated
+entirely at a q where the bug was provably absent, which is as clean a
+statement as this measurement can make: whatever is left is basis truncation at
+μ 191 against 960, not the defect and not a q-labelling error.
+
+Pre-registered prediction 1B said the child-attributed share would fall below
+50 %; on the maxima ratio it fell to ~68 %, so **1B is scored WRONG and left
+standing as wrong.** It deserved to be: it committed to a ratio of maxima taken
+at different Q, which is the same bad statistic the original 89 % used. The
+table above is what should have been predicted.
 
 ## 3. JOB 2 — the orbit-floor deciding leg
 
@@ -248,6 +275,17 @@ was banked from a collided leg.
 **Allocations: this lane created none and cancelled none.** `salloc` was
 refused `QOSMaxSubmitJobPerUserLimit` with two peer allocations already live —
 the trap `owedlegs_0810` hit and recorded — so it attached pools 56624724 and
-56612363 by explicit ID, as designed co-tenancy. `xbdense_0810`,
-`owedlegs_0810`, `downfold_s1`, `triangle_0810`, `xbwin_0811` and
-`orbitfloor_0810` were read-only inputs throughout.
+56612363 by explicit ID, as designed co-tenancy. One leg was lost to pool
+56612363 expiring under it and was re-run on the surviving pool.
+
+**Everything this lane wrote, named.** It is sole writer of
+`/pscratch/sd/j/jackm/qsign_recut_0811/`. Outside that directory it made four
+deliberate ledger writes and nothing else: this file and its siblings on branch
+`ledger/qsign-recut-2026-08-11`; the VOID-BY-Q-SIGN-FIX amendment appended to
+`orbitfloor_0810/manifest_row.md`; a new `xbwin_0811/SUPERSEDED.md`; and rows
+in `/pscratch/sd/j/jackm/EVIDENCE_MANIFEST.md` and the canonical
+`RUNS_INFLIGHT.md`. `xbdense_0810`, `owedlegs_0810`, `downfold_s1`,
+`triangle_0810` and the measurement files of `xbwin_0811` and
+`orbitfloor_0810` were read-only inputs throughout — no log, no bundle and no
+recorded number in either of those workspaces was altered or deleted, only
+annotated.
