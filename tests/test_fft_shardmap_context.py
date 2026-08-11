@@ -54,8 +54,16 @@ _SANCTIONED_EAGER = {
     # Single-device REFERENCE matvec ("single-device reference, values
     # byte-identical" — its own comment); operands are unsharded by contract.
     ("bse/bse_serial.py", "apply_bse_hamiltonian_single_device"): 3,
-    # ζ box is a replicated fit product (host round-trip follows on the next
-    # line); no (μ,ν)-sharded operand reaches this FFT.
+    # ζ box is NOT replicated, and the old excuse here said it was.  It
+    # inherits ``bse_setup.psi_rmu_Y``'s μ sharding, so at P>1 on an EVEN n_μ
+    # this FFT runs on a genuinely (μ)-sharded operand — measured 2026-08-11,
+    # SMALL_ISSUES row 39, where the host round-trip on the next line was a
+    # bare ``device_get`` and died on exactly that.  The call is STILL
+    # sanctioned and for a stronger reason than the one it replaces: the
+    # sharded axis is μ (axis 0) and the FFT axes are (1, 2, 3), so this is a
+    # batched transform over a sharded BATCH axis and needs no cross-shard
+    # communication at all — which is the condition ``make_sharded_fftn_3d``
+    # exists to enforce, met here without it.
     ("bse/vq_interp.py", "refit_vq"): 1,
     # (The former KNOWN-DEBT block — bse_feast.ensure_W_R, bse_kpm.run_kpm_dos,
     # bse_pseudopoles._feast_filter/run_pseudopoles — was closed 2026-08-01:
