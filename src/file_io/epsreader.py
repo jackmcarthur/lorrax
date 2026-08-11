@@ -1,6 +1,8 @@
 import h5py
 import numpy as np
 
+from common.units import RYD_TO_EV
+
 class EPSReader:
     def __init__(self, filename):
         """Initialize EPSMATReader with epsmat.h5 file."""
@@ -67,8 +69,12 @@ class EPSReader:
         self.matrix = self._file['mats/matrix'][:]
         self.matrix_diagonal = self._file['mats/matrix-diagonal'][:]
 
-        # you should only really want this for eps0. TODO: frequency dep.
-        self.epshead = self.matrix[0,0,0,0,0,0] + 1j * self.matrix[0,0,0,0,0,1]
+        # Backward-compatible static spelling.  Dynamic head consumers must
+        # call ``get_epsinv_head`` with the frequency they actually need;
+        # silently reusing this zero-frequency slot at i*omega_p collapses a
+        # two-point GN fit onto one sample and produces an arbitrarily large
+        # pole.
+        self.epshead = self.get_epsinv_head(0.0 + 0.0j)
         
         # Optional matrix elements if using subspace approximation
         if self.subspace:
@@ -98,6 +104,68 @@ class EPSReader:
         nmtx_q = self.nmtx[iq]
         mat = self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,0] + 1j * self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,1]
         return mat
+
+    def _frequency_points_ev(self):
+        """Return the stored complex-frequency axis in eV.
+
+        BerkeleyGW HDF5 files store ``freqs`` as ``(nfreq, 2)`` real/imag
+        pairs.  Accept a native complex vector too so the reader has one
+        normalized representation rather than teaching every consumer the
+        on-disk spelling.
+        """
+        raw = np.asarray(self.freqs)
+        if np.iscomplexobj(raw):
+            points = raw.reshape(-1).astype(np.complex128)
+        elif raw.ndim == 2 and raw.shape[1] == 2:
+            points = (raw[:, 0] + 1j * raw[:, 1]).astype(np.complex128)
+        else:
+            points = raw.reshape(-1).astype(np.float64).astype(np.complex128)
+        if points.size != int(self.nfreq):
+            raise ValueError(
+                f"eps frequency axis has {points.size} entries but nfreq="
+                f"{int(self.nfreq)}")
+        return points
+
+    def frequency_index(self, omega_ry, *, rtol=1.0e-6, atol_ev=1.0e-8):
+        """Return the stored index matching complex ``omega_ry``.
+
+        Frequencies in ``eps0mat.h5`` are in eV while GWJAX's head resolver
+        works in Ry.  The tolerance covers the rounded physical constants in
+        BerkeleyGW files (the shipped ``2 i Ry`` point differs from the
+        current conversion constant by about 1e-6 eV) without ever selecting
+        a genuinely different frequency.
+        """
+        target_ev = complex(omega_ry) * RYD_TO_EV
+        points = self._frequency_points_ev()
+        distance = np.abs(points - target_ev)
+        index = int(np.argmin(distance))
+        tolerance = float(atol_ev) + float(rtol) * max(1.0, abs(target_ev))
+        if float(distance[index]) > tolerance:
+            available = ", ".join(f"{z.real:g}{z.imag:+g}i" for z in points)
+            raise ValueError(
+                f"eps0mat carries no frequency matching {target_ev.real:g}"
+                f"{target_ev.imag:+g}i eV (nearest distance "
+                f"{float(distance[index]):.3e} eV, tolerance "
+                f"{tolerance:.3e} eV); available: [{available}]")
+        return index
+
+    def get_epsinv_head(self, omega_ry=0.0 + 0.0j):
+        """Return ``epsilon^-1_00(omega)`` at q=Gamma.
+
+        The scalar is meaningful as a screened-Coulomb head only when the
+        file declares ``matrix_type = 0`` (epsilon inverse).  Refuse the
+        other BGW matrix types rather than interpreting epsilon or chi0 as
+        epsilon inverse merely because they occupy the same HDF5 slot.
+        """
+        if int(self.matrix_type) != 0:
+            raise ValueError(
+                f"eps head requires matrix_type=0 (epsilon inverse), got "
+                f"{int(self.matrix_type)}")
+        ifreq = self.frequency_index(omega_ry)
+        return complex(
+            self.matrix[0, 0, ifreq, 0, 0, 0]
+            + 1j * self.matrix[0, 0, ifreq, 0, 0, 1]
+        )
     
     def get_eps_minus_delta_matrix(self, iq, ifreq=0, imatrix=0):
         """Get the epsilon matrix for a specific q-point and frequency.
@@ -159,4 +227,4 @@ if __name__ == "__main__":
     
     # Get epsilon matrix for first q-point
     eps_q0 = eps.get_eps_matrix(0)
-    print(f"Shape of epsilon matrix for q=0: {eps_q0.shape}") 
+    print(f"Shape of epsilon matrix for q=0: {eps_q0.shape}")

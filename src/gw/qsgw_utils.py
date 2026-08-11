@@ -32,6 +32,56 @@ from common.units import RYD_TO_EV
 # Vectorised per-(k, n) ω-axis linear interpolation — shared helper
 # ---------------------------------------------------------------------------
 
+OMEGA_EVAL_EXACT = np.uint8(0)
+OMEGA_EVAL_INTERPOLATED = np.uint8(1)
+OMEGA_EVAL_OUTSIDE = np.uint8(2)
+
+
+def omega_evaluation_status(
+    omega_grid: np.ndarray,
+    eval_points: np.ndarray,
+) -> np.ndarray:
+    """Classify each self-energy evaluation point against its ω grid.
+
+    The returned uint8 array has the shape of ``eval_points``: 0 denotes an
+    exact stored node, 1 an in-grid linear interpolation, and 2 an out-of-grid
+    request.  The shared interpolator currently edge-clamps state 2; reports
+    render it as ``#*`` so it cannot masquerade as ordinary interpolation.
+    """
+    omega = np.asarray(omega_grid, dtype=np.float64)
+    points = np.asarray(eval_points, dtype=np.float64)
+    if omega.ndim != 1 or omega.size < 2:
+        raise ValueError(
+            f"omega_grid must be a 1-D axis with at least two nodes; got "
+            f"shape {omega.shape}")
+    if np.any(np.diff(omega) <= 0.0):
+        raise ValueError("omega_grid must be strictly increasing")
+
+    outside = (points < omega[0]) | (points > omega[-1])
+    hi = np.clip(np.searchsorted(omega, points, side="left"), 0, omega.size - 1)
+    lo = np.clip(hi - 1, 0, omega.size - 1)
+    nearest = np.minimum(np.abs(points - omega[lo]), np.abs(points - omega[hi]))
+    scale = max(1.0, float(np.max(np.abs(omega))))
+    exact = nearest <= 64.0 * np.finfo(np.float64).eps * scale
+    return np.where(
+        outside,
+        OMEGA_EVAL_OUTSIDE,
+        np.where(exact, OMEGA_EVAL_EXACT, OMEGA_EVAL_INTERPOLATED),
+    ).astype(np.uint8)
+
+
+def omega_status_marker(status) -> str:
+    """Return the human-readable marker for an ω-evaluation status."""
+    value = int(status)
+    if value == int(OMEGA_EVAL_EXACT):
+        return ""
+    if value == int(OMEGA_EVAL_INTERPOLATED):
+        return "*"
+    if value == int(OMEGA_EVAL_OUTSIDE):
+        return "#*"
+    raise ValueError(f"unknown omega evaluation status {value}")
+
+
 def interp_along_omega(
     values_w_kn: np.ndarray,
     omega_grid: np.ndarray,
@@ -807,9 +857,14 @@ def plot_qp_energy_comparison(
 
 
 __all__ = [
+    "OMEGA_EVAL_EXACT",
+    "OMEGA_EVAL_INTERPOLATED",
+    "OMEGA_EVAL_OUTSIDE",
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
     "interp_along_omega",
+    "omega_evaluation_status",
+    "omega_status_marker",
     "plot_qp_energy_comparison",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",

@@ -80,6 +80,7 @@ def write_sigma_to_file(
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
+	omega_status_kn=None,
 ):
 	"""Write self-energy components to file.
 
@@ -96,8 +97,18 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+		omega_status_kn: Optional ``(nk, nb)`` status from
+			``gw.qsgw_utils.omega_evaluation_status``.  ``*`` marks in-grid
+			interpolation and ``#*`` marks an out-of-grid edge clamp.
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
+	status = None
+	if omega_status_kn is not None:
+		status = np.asarray(omega_status_kn, dtype=np.uint8)
+		if status.shape != (nk, nbands):
+			raise ValueError(
+				f"omega_status_kn shape {status.shape} != ({nk}, {nbands})")
+		from gw.qsgw_utils import omega_status_marker
 
 	# ------------------------------------------------------------------
 	# REAL-VS-COMPLEX IS ONE DECISION PER COLUMN, TAKEN OVER THE WHOLE ARRAY
@@ -167,6 +178,9 @@ def write_sigma_to_file(
 		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		if status is not None:
+			f.write("# omega status: * = interpolated inside Sigma grid; "
+			        "#* = outside grid and edge-clamped\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write("-" * 100 + "\n")
@@ -199,6 +213,10 @@ def write_sigma_to_file(
 				# existing sigSX/sigCOH/sigTOT/VH parsers are unaffected.
 				if energies_dft_ev is not None:
 					line += f"  Eo={float(energies_dft_ev[k, n]):>12.6f}"
+				if status is not None:
+					marker = omega_status_marker(status[k, n])
+					if marker:
+						line += f"  {marker}"
 
 				f.write(line + "\n")
 
@@ -207,6 +225,8 @@ def write_eqp_g0w0(
 	eqp_path,
 	energies_dft_ev,
 	g0w0_diag_ev,
+	*,
+	omega_status_kn=None,
 ):
 	"""Write E_DFT next to diagonal (H0 + Sigma_xc(E_DFT)) for G0W0 comparisons.
 
@@ -225,6 +245,14 @@ def write_eqp_g0w0(
 		raise ValueError(
 			f"Shape mismatch for eqp_g0w0: DFT {energies_dft_ev.shape} vs G0W0 {g0w0_diag_ev.shape}"
 		)
+	status = None
+	if omega_status_kn is not None:
+		status = np.asarray(omega_status_kn, dtype=np.uint8)
+		if status.shape != energies_dft_ev.shape:
+			raise ValueError(
+				f"omega_status_kn shape {status.shape} != "
+				f"{energies_dft_ev.shape}")
+		from gw.qsgw_utils import omega_status_marker
 
 	abs_path = os.path.abspath(eqp_path)
 	dirname = os.path.dirname(abs_path)
@@ -235,21 +263,32 @@ def write_eqp_g0w0(
 		f.write(provenance_header())
 		f.write("# G0W0 diagonal energies (eV)\n")
 		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
+		if status is not None:
+			f.write("# omega status: * = interpolated inside Sigma grid; "
+			        "#* = outside grid and edge-clamped\n")
 		for k in range(energies_dft_ev.shape[0]):
 			f.write(f"\nk-point {k}:\n")
 			f.write("-" * 80 + "\n")
 			for n in range(energies_dft_ev.shape[1]):
 				e_dft = float(energies_dft_ev[k, n])
 				val = complex(g0w0_diag_ev[k, n])
-				f.write(
-					f"n={n:<3}  E_DFT={e_dft:>12.6f}  Re={val.real:>12.6f}  Im={val.imag:>12.6f}\n"
+				line = (
+					f"n={n:<3}  E_DFT={e_dft:>12.6f}  "
+					f"Re={val.real:>12.6f}  Im={val.imag:>12.6f}"
 				)
+				if status is not None:
+					marker = omega_status_marker(status[k, n])
+					if marker:
+						line += f"  {marker}"
+				f.write(line + "\n")
 	return abs_path
 
 
 def write_sigma_freq_debug_table(
 	filepath: str,
 	columns: list[tuple[str, np.ndarray]],
+	*,
+	omega_status_kn=None,
 ) -> str:
 	"""Write a per-(k, n) decomposition table.
 
@@ -277,6 +316,13 @@ def write_sigma_freq_debug_table(
 		if arr.shape != (nk, nb):
 			raise ValueError(
 				f"column {name!r}: shape {arr.shape} != ({nk}, {nb})")
+	status = None
+	if omega_status_kn is not None:
+		status = np.asarray(omega_status_kn, dtype=np.uint8)
+		if status.shape != (nk, nb):
+			raise ValueError(
+				f"omega_status_kn shape {status.shape} != ({nk}, {nb})")
+		from gw.qsgw_utils import omega_status_marker
 
 	# Column header — Re/Im split for complex arrays.
 	header = ["k", "n"]
@@ -285,6 +331,8 @@ def write_sigma_freq_debug_table(
 			header += [f"{name}.Re", f"{name}.Im"]
 		else:
 			header.append(name)
+	if status is not None:
+		header.append("omega_status")
 
 	abs_path = os.path.abspath(filepath)
 	dirname = os.path.dirname(abs_path)
@@ -311,6 +359,9 @@ def write_sigma_freq_debug_table(
 			"# Sigma frequency debug decomposition (per-(k, n) diagonals; all "
 			"energies in eV).\n"
 		)
+		if status is not None:
+			f.write("# omega status: * = interpolated inside Sigma grid; "
+			        "#* = outside grid and edge-clamped\n")
 		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
@@ -322,6 +373,8 @@ def write_sigma_freq_debug_table(
 						row += [_val(v.real), _val(v.imag)]
 					else:
 						row.append(_val(v))
+				if status is not None:
+					row.append(f"{omega_status_marker(status[ik, ib]):>{col_w}s}")
 				f.write("\t".join(row) + "\n")
 
 	return abs_path

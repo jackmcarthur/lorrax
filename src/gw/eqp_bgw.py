@@ -175,6 +175,50 @@ def write_bgw_eqp(
 	return abs_path
 
 
+def write_omega_status_sidecar(
+	eqp_path: str,
+	kpoints_irr_frac: np.ndarray,
+	status_kn: np.ndarray,
+	*,
+	band_offset: int,
+	nspin: int = 1,
+) -> str:
+	"""Write one parser-safe status row beside every BGW-format QP row.
+
+	The numeric ``eqp0.dat`` / ``eqp1.dat`` files remain byte-for-byte in
+	BerkeleyGW's four-column format.  Appending a fifth ``*`` token there
+	would break whitespace parsers, while an inline comment is not guaranteed
+	to be accepted by Fortran readers.  The one-to-one ``.status`` companion
+	therefore carries the marker without weakening interchange compatibility.
+	"""
+	from .qsgw_utils import omega_status_marker
+
+	kpts = np.asarray(kpoints_irr_frac, dtype=np.float64)
+	status = np.asarray(status_kn, dtype=np.uint8)
+	if status.ndim != 2:
+		raise ValueError(f"status_kn must have shape (nk, nb); got {status.shape}")
+	nk, nb = status.shape
+	if kpts.shape != (nk, 3):
+		raise ValueError(
+			f"kpoints shape {kpts.shape} does not match status {(nk, 3)}")
+
+	path = os.path.abspath(str(eqp_path) + ".status")
+	with open(path, "w") as fh:
+		fh.write(provenance_header())
+		fh.write(f"# Sigma-grid evaluation status for {os.path.basename(eqp_path)}\n")
+		fh.write("# = exact stored omega node; * in-grid interpolation; "
+		         "#* outside grid and edge-clamped\n")
+		fh.write("# columns: k-point spin band status\n")
+		for ik in range(nk):
+			for ispin in range(1, int(nspin) + 1):
+				for ib in range(nb):
+					marker = omega_status_marker(status[ik, ib]) or "="
+					fh.write(
+						f"{ik:8d}{ispin:8d}{band_offset + ib + 1:8d} "
+						f"{marker}\n")
+	return path
+
+
 def verify_eqp_file(
 	path: str, *, nk: int, nb: int, nspin: int = 1,
 	print_fn=print,
@@ -493,6 +537,8 @@ class EqpAssembly:
 	z_factor: np.ndarray | None
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
+	eqp0_omega_status: np.ndarray | None = None
+	eqp1_omega_status: np.ndarray | None = None
 	nspin: int = 1
 
 	def write(self, *, eqp0_path: str, eqp1_path: str) -> tuple[str, str]:
@@ -503,6 +549,8 @@ class EqpAssembly:
 			e_dft_ev=self.e_dft_ev,
 			eqp0_ev=self.eqp0_ev, eqp1_ev=self.eqp1_ev,
 			band_offset=self.band_offset, nspin=self.nspin,
+			eqp0_omega_status=self.eqp0_omega_status,
+			eqp1_omega_status=self.eqp1_omega_status,
 		)
 
 
@@ -572,6 +620,8 @@ def assemble_eqp(
 		# for the post-hoc CLI alike.  O's policy kept, its duplicate
 		# wording dropped.
 
+	eqp0_omega_status = None
+	eqp1_omega_status = None
 	if sigma_c_omega_diag_ev is None:
 		# Static mode: no ω-grid, Z = 1 trivially.
 		if sigma_c_at_dft_diag_ev is None:
@@ -593,6 +643,17 @@ def assemble_eqp(
 			e_dft_rel_ev=e_dft_rel_ev,
 			dE_ev=dE_ev,
 		)
+		from .qsgw_utils import omega_evaluation_status
+		eqp0_omega_status = omega_evaluation_status(
+			omega_rel_ev, e_dft_rel_ev)
+		# eqp1 uses Sigma at E_DFT and at both central-difference points.
+		# The strongest status wins: outside-grid (2) > interpolation (1)
+		# > an exact stored node (0).
+		eqp1_omega_status = np.maximum.reduce([
+			eqp0_omega_status,
+			omega_evaluation_status(omega_rel_ev, e_dft_rel_ev - dE_ev),
+			omega_evaluation_status(omega_rel_ev, e_dft_rel_ev + dE_ev),
+		])
 
 	eqp0_ev, eqp1_ev = compute_eqp_diag(
 		kin_ion_diag_ev=kin_ion_diag_ev,
@@ -614,6 +675,8 @@ def assemble_eqp(
 		z_factor=z_factor,
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
+		eqp0_omega_status=eqp0_omega_status,
+		eqp1_omega_status=eqp1_omega_status,
 		nspin=int(nspin),
 	)
 
@@ -650,6 +713,8 @@ def write_eqp_bgw_pair(
 	eqp1_ev: np.ndarray,
 	band_offset: int,
 	nspin: int = 1,
+	eqp0_omega_status: np.ndarray | None = None,
+	eqp1_omega_status: np.ndarray | None = None,
 ) -> tuple[str, str]:
 	"""Write the BGW-format eqp0.dat + eqp1.dat pair from precomputed arrays.
 
@@ -661,6 +726,14 @@ def write_eqp_bgw_pair(
 	              band_offset=band_offset, nspin=nspin)
 	write_bgw_eqp(eqp1_path, kpoints_irr_frac, e_dft_ev, eqp1_ev,
 	              band_offset=band_offset, nspin=nspin)
+	if eqp0_omega_status is not None:
+		write_omega_status_sidecar(
+			eqp0_path, kpoints_irr_frac, eqp0_omega_status,
+			band_offset=band_offset, nspin=nspin)
+	if eqp1_omega_status is not None:
+		write_omega_status_sidecar(
+			eqp1_path, kpoints_irr_frac, eqp1_omega_status,
+			band_offset=band_offset, nspin=nspin)
 	return eqp0_path, eqp1_path
 
 

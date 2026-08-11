@@ -568,6 +568,7 @@ def write_freq_debug(
         ("V_H", _v_h_diag_ev),
         ("x_bare", _sig_x_diag_ev),
     ]
+    _omega_status = None
     if static_head_terms is not None:
         _cols.append((
             "x_head",
@@ -580,6 +581,9 @@ def write_freq_debug(
         # interp produces a numerically slightly different value (~10
         # meV) due to a different vectorisation path.
         _e_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+        from .qsgw_utils import omega_evaluation_status
+        _omega_status = omega_evaluation_status(
+            results.omega_rel_ev, _e_dft_rel_ev)
         _sigma_c_at_dft_for_eqp, _z_factor = (
             compute_z_factor_from_omega_grid(
                 sigma_c_omega_diag_ev=np.asarray(
@@ -650,7 +654,8 @@ def write_freq_debug(
     _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
     _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
     write_sigma_freq_debug_table(
-        config.debug.sigma_freq_debug_file, _cols)
+        config.debug.sigma_freq_debug_file, _cols,
+        omega_status_kn=_omega_status)
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
@@ -1087,6 +1092,19 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
+    omega_status_full = None
+    if (
+        results.use_ppm
+        and results.omega_rel_ev is not None
+        and results.efermi_ev is not None
+    ):
+        from .qsgw_utils import omega_evaluation_status
+        omega_status_full = omega_evaluation_status(
+            results.omega_rel_ev,
+            np.asarray(results.E_dft_ry, dtype=np.float64) * r2e
+            - float(results.efermi_ev),
+        )
+
     write_sigma_to_file(
         sx_out,
         sigma_diag_file,
@@ -1096,6 +1114,7 @@ def write_results(
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
+        omega_status_kn=omega_status_full,
     )
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
@@ -1212,6 +1231,7 @@ def write_results(
             g0w0_path,
             results.E_dft_ry * r2e,
             h0_diag + results.sigma_xc_at_dft_ev,
+            omega_status_kn=omega_status_full,
         )
         print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
@@ -1233,6 +1253,8 @@ def write_results(
     print_fn(f"\n  Sigma diag:   {sigma_diag_file}")
     print_fn(f"  BGW eqp0:     {eqp0_file}")
     print_fn(f"  BGW eqp1:     {eqp1_file}")
+    if omega_status_full is not None:
+        print_fn(f"  Sigma-grid status: {eqp0_file}.status, {eqp1_file}.status")
     if results.sigma_omega_h5_path:
         print_fn(f"  Sigma(ω):     {results.sigma_omega_h5_path}")
     if results.tensors_filename:

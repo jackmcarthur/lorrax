@@ -1,5 +1,7 @@
 import numpy as np
+import pytest
 
+from file_io.epsreader import EPSReader
 from gw.head_correction import (
     HeadSample,
     compute_static_head_terms,
@@ -8,6 +10,20 @@ from gw.head_correction import (
     resolve_head_override,
     static_head_terms_to_kij,
 )
+
+
+def test_epsreader_uses_the_requested_gn_head_frequency():
+    reader = EPSReader.__new__(EPSReader)
+    reader.matrix_type = 0
+    reader.nfreq = 2
+    reader.freqs = np.array([[0.0, 0.0], [0.0, 27.21138506]])
+    reader.matrix = np.zeros((1, 1, 2, 1, 1, 2))
+    reader.matrix[0, 0, 0, 0, 0, 0] = 0.04542265779876707
+    reader.matrix[0, 0, 1, 0, 0, 0] = 0.709235103168
+    assert reader.get_epsinv_head(0.0) == complex(0.04542265779876707)
+    assert reader.get_epsinv_head(2.0j) == complex(0.709235103168)
+    with pytest.raises(ValueError, match="no frequency matching"):
+        reader.get_epsinv_head(1.0j)
 
 
 def test_compute_static_head_terms_matches_cohsex_formulas():

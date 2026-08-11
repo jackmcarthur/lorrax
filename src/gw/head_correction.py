@@ -278,22 +278,22 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
         if not os.path.exists(eps0_path):
             return None
         try:
-            if abs(omega_val) > 1.0e-14:
-                print_fn(
-                    f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
-                )
             from file_io.epsreader import EPSReader
             from gw.vcoul import compute_q0_averages
 
             eps0 = EPSReader(eps0_path)
+            epsinv_head = eps0.get_epsinv_head(omega_val)
             vc0_mean, wcoul0 = compute_q0_averages(
                 wfn,
-                jnp.asarray(eps0.epshead, dtype=jnp.complex128),
+                jnp.asarray(epsinv_head, dtype=jnp.complex128),
                 meta,
                 S_cart=None,
                 analytic_sphere=bool(params.get("head_minibz_average", False)),
             )
-            source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
+            source = (
+                "epshead" if abs(omega_val) <= 1.0e-14
+                else f"epshead(omega={omega_val} Ry)"
+            )
             return HeadSample(
                 vc0=complex(vc0_mean),
                 wcoul0=complex(wcoul0),
@@ -490,6 +490,35 @@ class HeadResolver:
             "whead_imfreq": head.whead_imfreq,
             "head_minibz_average": head.head_minibz_average,
         }
+        if getattr(config.compute_mode, "ppm_model", None) == "gn":
+            probe_omega = 1j * float(config.ppm.omega_p)
+            override_values = (
+                self._params["vhead"],
+                self._params["whead_0freq"],
+                self._params["whead_imfreq"],
+            )
+            n_override = sum(value is not None for value in override_values)
+            if 0 < n_override < 3:
+                print_fn(
+                    "  [head] GN-PPM received a partial explicit head "
+                    "override. Ignoring the partial tuple and computing "
+                    "both W_h(0) and W_h(i*omega_p) through one "
+                    f"wcoul0_source={head.wcoul0_source} pipeline."
+                )
+                self._params["vhead"] = None
+                self._params["whead_0freq"] = None
+                self._params["whead_imfreq"] = None
+            if n_override != 3 and head.wcoul0_source == "epshead":
+                try:
+                    from file_io.epsreader import EPSReader
+                    eps0 = EPSReader(os.path.join(input_dir, "eps0mat.h5"))
+                    eps0.get_epsinv_head(0.0)
+                    eps0.get_epsinv_head(probe_omega)
+                except Exception as exc:
+                    self._params["wcoul0_source"] = "s_tensor"
+                    print_fn(
+                        "  [head] eps0mat cannot supply both GN frequencies "
+                        f"({exc}); computing both through s_tensor instead.")
         self._input_dir = input_dir
         self._wfn = wfn
         self._sym = sym
