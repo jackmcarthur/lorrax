@@ -281,8 +281,12 @@ def main(argv=None):
 	sym = symmetry_maps.SymMaps(wfn)
 	centroids_frac, centroid_indices, n_rmu = load_centroids(
 		config.paths.centroids_file, wfn.fft_grid)
-	centroid_hash = symmetry_maps.centroid_set_hash(
-		centroids_frac, np.asarray(wfn.fft_grid, dtype=np.int64))
+	# The screening artifacts identify the ISDF basis by its canonical
+	# wrapped-fractional set (``f:``), independent of the FFT grid used to
+	# represent it.  Use that same producer convention here: the grid form
+	# (``g:``) is a deliberately different identity and must not be compared
+	# directly with the ``qirr_centroid_hash`` carried W -> fit -> Sigma.
+	centroid_hash = symmetry_maps.centroid_set_hash(centroids_frac)
 	assert_centroid_selector(config.paths.centroids_file,
 	                         config.paths.centroid_selector, print_fn=print0)
 	tmp_dir = os.path.join(input_dir, "tmp")
