@@ -23,6 +23,7 @@ from common.shard_map import shard_map
 from jax.experimental import io_callback as _io_callback
 
 from common import Meta
+from common import spectral_closure
 from common import timing
 from runtime.padding import pad_last_axis_to, round_up, solve_at_logical
 from common.gamma_matrices import (
@@ -1660,6 +1661,99 @@ def _resolve_zeta_gather(
 _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
 
 
+def _close_the_cut(spectrum, keep, *, where: str):
+    """Move a ζ rank cut outward past any degenerate block it slices.
+
+    The device face of ``common/spectral_closure``, wrapped once so all four
+    ζ truncation sites (charge / transverse × replicated / distributed) get
+    the same criterion, the same message and the same mode.
+
+    WHY IT IS SHAPED LIKE THIS.  The cut lives inside a jitted kernel whose
+    eigenvalues never reach host, so the snap has to be pure ``jnp`` — it is,
+    and it is a prefix-AND over adjacency links with no data-dependent trip
+    count, so it costs one sort and one cumprod per q against the ``eigh``'s
+    O(n³).  A jitted kernel also cannot raise, which is the division of
+    labour ``centroid/pivoted_cholesky`` already documents ("a jitted kernel
+    cannot raise, so it reports and this refuses"): under ``strict`` the
+    firing is recorded through a host callback and refused by
+    ``spectral_closure.raise_if_pending`` at the next host seam, so the flag
+    means the same thing here as at the host sites.
+
+    MESH INVARIANCE.  ``snap_keep_outward`` is elementwise plus a sort and a
+    cumulative product over the SPECTRUM axis, which is never the sharded
+    axis on any of these routes — the replicated tiers factor whole logical
+    blocks, and the distributed tier's ``_masks`` runs on the replicated
+    ``lam``.  So the snapped mask is bit-identical across device counts, and
+    the factor keeps the mesh-invariance contract it had before.
+    """
+    # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
+    # L2 mathematics and ``tests/test_layering.py`` requires it to be a
+    # function of its arguments.  The variable's NAME is still declared once,
+    # in the guard module, so nothing is duplicated but the lookup itself.
+    mode = spectral_closure.resolve_mode(
+        os.environ.get(spectral_closure.MODE_ENV))
+    if mode == "off":
+        return keep
+    keep_new, n_pre, n_post = spectral_closure.snap_keep_outward(
+        spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
+    fired = jnp.any(n_post > n_pre)
+
+    def _say(_):
+        jax.debug.print(
+            "*** [spectral-closure] " + where + ": the rank cut falls INSIDE "
+            "a degenerate block of the ISDF Gram on at least one q of this "
+            "batch — retained rank/q {a} would close at {b}.  A cut through a "
+            "degenerate block retains a symmetry-ARBITRARY slice of an "
+            "eigenspace, so zeta's span differs between q and Sq and the "
+            "k-star identity fails for W and Sigma_x alike.  Mode=" + mode
+            + ". ***",
+            a=n_pre, b=n_post, ordered=False)
+        if mode == "strict":
+            jax.debug.callback(
+                lambda p, q: spectral_closure.note_device_snap(where, p.max(), q.max()),
+                n_pre, n_post)
+        return 0
+
+    jax.lax.cond(fired, _say, lambda _: 0, 0)
+    return keep_new if mode == "snap" else keep
+
+
+def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
+    """:func:`_close_the_cut` for the distributed tier's PADDED spectrum.
+
+    The distributed route never forms the logical block alone: it eighs the
+    identity-padded matrix ``[C_log 0; 0 I]``, whose spectrum is
+    ``spec(C_log) ∪ {1.0}×(n_pad − n_log)``.  Those pad eigenvalues are
+    **exactly 1.0 and therefore exactly degenerate with each other**, so a
+    block walk that reached them would swallow all ``n_pad − n_log`` of them
+    at once and the retained rank would become a function of the DEVICE
+    COUNT — the precise defect this route's ``lam_max`` note exists to
+    prevent, and the one ``rank_criterion.violations()`` reports as
+    ``n_dropped_alignment``.
+
+    So the pad is withdrawn from the walk before it starts.  ``lam`` is
+    ascending, so its exact-1.0 entries are contiguous; the first
+    ``n_pad − n_log`` of them are taken as the pad and demoted to magnitude
+    zero, which puts them below every cut and makes them un-linkable (the
+    guard never links a pair whose larger member is zero).  If a PHYSICAL
+    eigenvalue also happens to be exactly 1.0 the choice of which duplicates
+    to demote is immaterial — the values are identical, so the multiset the
+    walk sees is the same either way.
+
+    Whatever the original cut decided about the pad is preserved: a kept pad
+    direction inverts to ``1/1.0 = 1`` against an identity block and is inert
+    by construction, and this guard has no business changing it.
+    """
+    n_extra = int(n_pad) - int(n_log)
+    if n_extra <= 0:
+        return _close_the_cut(lam, keep, where=where)
+    is_one = (lam == 1.0)
+    pad = is_one & (jnp.cumsum(is_one.astype(jnp.int32), axis=-1) <= n_extra)
+    spec_phys = jnp.where(pad, 0.0, lam)
+    keep_phys = _close_the_cut(spec_phys, keep & ~pad, where=where)
+    return keep_phys | (keep & pad)
+
+
 def _charge_factor_math(C_log, *, mode: str, n_log: int,
                         ridge_extra: float, rcond: float, rank_log: bool):
     """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit
@@ -1695,6 +1789,7 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         sig = jnp.abs(lam)
         sig_max = jnp.max(sig, axis=-1, keepdims=True)
         keep = sig > (rcond * sig_max)
+        keep = _close_the_cut(lam, keep, where="zeta transverse rank_truncate")
         inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
         if rank_log:
             # Same conditioning signal as the charge route: n_keep/q is
@@ -1726,6 +1821,20 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
         lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
         keep = lam > (rcond * lam_max)       # near-null cut
+        # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
+        # IS THE SEAM the 6×6×6 saga's §6 conjectured about
+        # (tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-\
+        # 6x6x6.md): C_q commutes with the point group when the centroid set
+        # is orbit-closed and the band window degeneracy-closed, so a
+        # symmetry maps each C_q eigenspace onto itself and mixes a degenerate
+        # block's members freely.  Cut between blocks and ζ's retained span is
+        # invariant, so C_{Sq} = P C_q P† survives the truncation; cut THROUGH
+        # a block and the span is a round-off-chosen slice that differs
+        # between q and Sq, and the k-star identity fails for W and Σ_x alike.
+        # That deck turned out to be covariant by luck — 0 of 16 q-stars
+        # carried a non-constant n_keep, MEASURED after the fact, enforced by
+        # nothing.  This is the enforcement.
+        keep = _close_the_cut(lam, keep, where="zeta rank_truncate")
         # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
         # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
         inv_sqrt = jnp.where(
@@ -2804,6 +2913,9 @@ def _factor_c_q_distributed_rank_truncate(
                 sig = jnp.abs(lam)
                 sig_max = jnp.max(sig, axis=-1, keepdims=True)
                 keep = sig > (rcond * sig_max)
+                keep = _close_the_cut(
+                    lam, keep,
+                    where="zeta transverse rank_truncate/distributed")
                 inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
                 if rank_log:
                     sig_keep_min = jnp.min(
@@ -2832,6 +2944,9 @@ def _factor_c_q_distributed_rank_truncate(
                                 lam[..., -1:],
                                 lam[..., n_log - 1:n_log])
             keep = lam > (rcond * lam_max)
+            keep = _close_the_cut_padded(
+                lam, keep, n_log=n_log, n_pad=n_pad,
+                where="zeta rank_truncate/distributed")
             inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
             if rank_log:
                 # Same conditioning signal the replicated route prints —

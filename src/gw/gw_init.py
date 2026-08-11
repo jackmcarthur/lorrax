@@ -16,6 +16,7 @@ import numpy as np
 import h5py
 
 import common.timing as timing
+from common import spectral_closure
 from common import jax_profile
 # Named-barrier helper: annotates failures with the barrier name and
 # no-ops at P=1; also avoids relying on ``jax.experimental.multihost_utils``
@@ -1071,6 +1072,41 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 		)
+
+	# ── THE ζ RANK CUT'S CLOSURE VERDICT, refused HERE if it must be ──────
+	# The four ζ truncation sites live inside jitted kernels, which cannot
+	# raise; under ``LORRAX_SPECTRAL_CLOSURE=strict`` they record the finding
+	# through a host callback and this is the seam that refuses on it — the
+	# same division of labour ``centroid/pivoted_cholesky`` documents for the
+	# select kernel.  Placed immediately after the fit and BEFORE ζ is
+	# consumed by anything, so ``strict`` stops the run rather than letting W
+	# be built on a basis whose span is not point-group invariant.
+	#
+	# Under the default (``snap``) this prints any firing and continues; the
+	# cut has already been moved outward inside the kernel.  On a deck whose
+	# cut falls in a gap it does nothing at all, which is what the Si 6×6×6
+	# ``armF`` (nband=68) arm is expected to show — its tightest cut has a
+	# relative gap of 0.315 against a tolerance of 1e-6.
+	_sc_mode = spectral_closure.resolve_mode(
+		os.environ.get(spectral_closure.MODE_ENV))
+	# Read the findings BEFORE the refusal clears them, so the "clean" line
+	# below cannot contradict a snap that just fired one line above it.
+	_sc_fired = bool(spectral_closure.pending())
+	spectral_closure.raise_if_pending(
+		"the ζ fit's rank truncation", mode=_sc_mode, log=print_fn)
+	if _sc_mode == "off":
+		print_fn("    ζ rank-cut closure: guard is OFF "
+		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
+		         "absence and not a pass.")
+	elif _sc_fired:
+		print_fn(f"    ζ rank-cut closure: guard fired above and the cut was "
+		         f"moved OUTWARD (mode={_sc_mode}).  ζ's retained span is "
+		         f"point-group invariant; the rank it carries is NOT the one "
+		         f"zeta_rcond alone would have chosen.")
+	else:
+		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
+		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
+		         f"fell inside a degenerate block of C_q on any q.")
 
 	# Stamp what this ζ was fit FOR, so a later run can reuse it.  AFTER
 	# the fit (and therefore after ``mark_zeta_done`` inside

@@ -54,6 +54,15 @@ anchor deck's level. **The breakage is in `C_q` itself**, upstream of the ζ
 back-solve, which is consistent with Σ_x carrying it and with W merely
 amplifying it 500–1000×.
 
+### AMENDMENT 2026-08-10 — the hazard §6 named now has a guard
+
+§6's suspect was refuted as the CAUSE here, and the refutation showed the
+6×6×6 ζ truncation was whole-star covariant **by measurement after the fact**,
+not by enforcement.  `common/spectral_closure` is that enforcement, wired at
+every spectral-truncation site in the tree, and this deck's `armF` arm re-runs
+under it SILENT with its retained ranks unchanged at {1095, 1098}.  See
+`tests/known_failures/2026-08-10-spectral-cut-closure.md`.
+
 ### Why §6's prime suspect is refuted, stated as its own measurement
 
 §6 conjectured that the rank cut through the over-complete basis was not

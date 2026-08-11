@@ -317,10 +317,33 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         # be flat in q, so the q = 0 Gram is the right selection Gram.
         S_q0 = jax.lax.with_sharding_constraint(
             S_LL[0], NamedSharding(mesh_xy, P("x", "y")))
+        # ORBIT CLOSURE OF THE SELECTION — passed when the driver can build
+        # the parent's centroid source map, and NOT BUILT HERE.
+        #
+        # ``select_cur_centroids`` completes the kept set to whole orbits when
+        # it is given ``sym_perm``, and re-takes the rank certificate and the
+        # auto ceiling on the completed set; that is the spectral-closure
+        # lane's row and it is done.  Producing the table is the OTHER half —
+        # it needs the parent's symmetry ops and centroid table together
+        # (``symmetry_maps.centroid_source_map_and_wrap``), which this driver
+        # does not load today, and it belongs with the q_irr wedge-writer
+        # plumbing rather than here.  Until it arrives, closure is UNMEASURED
+        # and this says so: an absence must not read like a pass.
+        print_fn(
+            "  [downfold/star] centroid orbit closure NOT CHECKED: this "
+            "driver does not build the parent's centroid source map, so "
+            "select_cur_centroids received no sym_perm.  THAT IS AN ABSENCE, "
+            "NOT A PASS — the CUR selection stops at exactly mu_S and "
+            "generically lands mid-orbit, and a child written on the q wedge "
+            "from a non-closed keep reads back as a permutation of the WRONG "
+            "centroids (tests/known_failures/"
+            "2026-08-10-downfold-qirr-star-stability.md).  Every child is "
+            "written on the FULL BZ today, which is correct and merely "
+            "larger, so nothing here is wrong — it is unverified.")
         keep_idx, sel = select_cur_centroids(
             S_q0, cfg.mu_small, rcond=cfg.downfold_rcond,
             select_tol=cfg.downfold_select_tol, mesh_xy=mesh_xy,
-            mu_large_logical=mu_L, print_fn=print_fn)
+            mu_large_logical=mu_L, print_fn=print_fn, sym_perm=None)
         mu_S = int(sel.mu_small)
         mu_S_pad = int(padded_mu_extent(mu_S, int(jax.device_count())))
     print_fn(sel.describe())

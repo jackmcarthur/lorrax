@@ -130,6 +130,7 @@ order of magnitude the design feared) and the ``refit`` mode.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -140,6 +141,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import rank_criterion
+from common import spectral_closure
 from common.zeta_projection import (
     least_squares_transfer,
     project_w_between_zeta_bases,
@@ -396,6 +398,11 @@ class SelectionReport:
     pool_report: rank_criterion.RankReport | None = None
     kept_report: rank_criterion.RankReport | None = None
     requested_auto: bool = False
+    #: Orbit-closure verdict on the DELIVERED set, or ``None`` when no
+    #: ``sym_perm`` was supplied — in which case closure is UNMEASURED, which
+    #: is an absence and not a pass.  When completion fired, ``mu_small``
+    #: above is the completed count.
+    star: "StarStability | None" = None
 
     def describe(self, indent="  ") -> str:
         lines = [
@@ -441,7 +448,7 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 
 def select_cur_centroids(
     S_q0, mu_small, *, rcond: float, select_tol: float | None,
-    mesh_xy, mu_large_logical: int, print_fn=print,
+    mesh_xy, mu_large_logical: int, print_fn=print, sym_perm=None,
 ):
     """Pick μ_S of the parent's centroids against the retained window.
 
@@ -468,8 +475,21 @@ def select_cur_centroids(
     be SELECTED against the band window actually consumed") applied on
     purpose instead of by accident, and the accident cost 2.8 eV.
 
+    ``sym_perm`` is the parent's ``(n_sym, n_rmu)`` centroid source map.  When
+    it is given, the selection is ORBIT-COMPLETED — μ_S moves OUTWARD to whole
+    orbits — and the rank certificate and the ``auto`` ceiling are re-taken on
+    the completed set.  That is not a nicety: at q = 0 the selection Gram
+    commutes with the whole group, so an orbit's members are exactly
+    degenerate and the pivot order's tie-break between them is arbitrary; a
+    half-orbit makes the child unstorable on the q wedge and, if written
+    anyway, read back as a permutation of the WRONG centroids.  Leaving it
+    ``None`` keeps the historical behaviour and says nothing about closure,
+    which is an ABSENCE, not a pass.
+
     Returns ``(keep_idx, SelectionReport)`` with ``keep_idx`` a sorted
-    ``int64`` array of parent centroid indices.
+    ``int64`` array of parent centroid indices.  **``len(keep_idx)`` is the
+    authority on μ_S, not the number the caller passed** — orbit completion
+    moves it, the same way a band-window resolver moves the counts.
     """
     from centroid import distribution as dist
     from centroid.pivoted_cholesky import (
@@ -493,6 +513,31 @@ def select_cur_centroids(
     pool_rep = _eigen_rank(G_host, rcond, label="downfold pool Gram (q=0)",
                            n_logical=mu_L)
     ceiling = int(pool_rep.rank_criterion)
+
+    # ---- 1b. THE CEILING MUST NOT LAND MID-MULTIPLET. -------------------
+    # The ceiling is a rank cut through the pool Gram's eigenvalue spectrum,
+    # and it is the number every μ_S is validated against.  If that cut falls
+    # inside a degenerate block, then μ_S = ceiling selects a symmetry-
+    # arbitrary slice of an eigenspace, S_SS is not a representation of the
+    # point group, and the CUR pivot order — which is what actually picks the
+    # centroids — is choosing between directions the spectrum cannot
+    # distinguish.  ``common/spectral_closure`` moves the ceiling OUTWARD past
+    # the block, which is the keep-more direction and admits at most the
+    # block's relative span (1e-6-scale) of extra amplification.
+    #
+    # This is the answer to the CUR-pivot symmetry-stability question the
+    # q_irr-native lane runs into: pivot stability inside a degenerate block
+    # is not recoverable by choosing pivots more carefully, because the block
+    # has no preferred basis.  The only stable choices are "all of it" or
+    # "none of it", and this is the seam that enforces that.
+    _pool_ev = np.linalg.eigvalsh(
+        0.5 * (G_host[:mu_L, :mu_L] + G_host[:mu_L, :mu_L].conj().T))
+    ceiling, _sc_pool = spectral_closure.resolve_spectral_cut(
+        _pool_ev, ceiling, where="downfold pool Gram (q=0) rank ceiling",
+        rcond=float(rcond), log=print_fn)
+    if not _sc_pool["fired"]:
+        print_fn(spectral_closure.describe_clean(
+            _sc_pool, where="downfold pool Gram (q=0) rank ceiling"))
 
     requested_auto = isinstance(mu_small, str) and str(mu_small).strip().lower() == "auto"
     if requested_auto:
@@ -582,7 +627,87 @@ def select_cur_centroids(
         tol_rel=tol)
     keep_idx = np.sort(piv_np.astype(np.int64))
 
+    # ---- 2b. ORBIT COMPLETION: snap-outward, one index over. ------------
+    # THIS IS THE SAME DISEASE THIS MODULE'S SPECTRAL GUARD TREATS, and the
+    # identification is exact rather than an analogy.  At q = 0 the selection
+    # Gram commutes with the whole point group, so every member of a centroid
+    # ORBIT carries the identical Schur diagonal — they are degenerate, and
+    # pivoted Cholesky's index-order tie-break picks between them.  Stopping
+    # at exactly ``mu_S`` therefore lands mid-orbit for a generic ``mu_S``
+    # (measured: 7 of 46 admissible values came back closed on the synthetic
+    # 8-orbit × 6 group), and a half-orbit is a subset chosen by index order
+    # out of a set the spectrum cannot distinguish — a symmetry-arbitrary
+    # slice of a degenerate block, which is exactly what
+    # ``common/spectral_closure`` refuses to let a rank cut be.
+    #
+    # So the repair is the same repair: complete OUTWARD to whole orbits.
+    # ``orbit_complete_keep`` is the walk; the reason it must ADD rather than
+    # drop is the reason the spectral guard widens rather than narrows —
+    # dropping would shrink the retained subspace below what the rank refusal
+    # above certified.
+    #
+    # Fence: the q_irr lane owns the plumbing this enables (child unfold
+    # tables, the wedge writer); this lane owns the completion and the
+    # re-certification it forces.
+    star = None
+    if sym_perm is not None:
+        star = star_stability(keep_idx, sym_perm)
+        print_fn(star.describe())
+        if not star.closed:
+            keep_idx = orbit_complete_keep(keep_idx, sym_perm)
+            mu_S_completed = int(keep_idx.size)
+            print_fn(
+                f"  *** [downfold/select] ORBIT-COMPLETED OUTWARD: mu_S "
+                f"{mu_S} -> {mu_S_completed} (+{mu_S_completed - mu_S} "
+                f"centroids).  A half-orbit is a symmetry-arbitrary slice of "
+                f"a set the q=0 Gram cannot distinguish; completing it is the "
+                f"same keep-more repair common/spectral_closure applies to a "
+                f"rank cut, and it is what makes the child wedge-storable. ***")
+            # RE-TAKE THE CERTIFICATE ON THE COMPLETED SET, against the
+            # EIGENVALUE rank and not the selection certificate — the
+            # knob-trap discipline this function is built around.  The
+            # completed set was never certified by the pivoted Cholesky
+            # (it stopped at mu_S), and the ceiling is the only number that
+            # was ever the right one to validate mu_S against.
+            if mu_S_completed > ceiling:
+                raise ValueError(
+                    f"downfold: REFUSING mu_small={mu_S}.  Orbit completion "
+                    f"needs {mu_S_completed} centroids to close the orbit the "
+                    f"selection stopped inside, but the retained band window "
+                    f"holds only {ceiling} numerically independent "
+                    f"pair-density directions at downfold_rcond={rcond:g}.  "
+                    f"The requested mu_S is not itself over the ceiling; the "
+                    f"SYMMETRY-LEGAL mu_S nearest it is, and a non-closed "
+                    f"selection is not an option — a child written on the q "
+                    f"wedge from one reads back as a permutation of the WRONG "
+                    f"centroids, silently, because every shape agrees.\n"
+                    f"  FIXES: (1) lower mu_small so that completion lands at "
+                    f"or under {ceiling} — the orbit boundaries below it are "
+                    f"the legal values, the same way degeneracy-closed nband "
+                    f"values are the legal band windows; (2) widen the "
+                    f"retained band window, which is what sets the ceiling "
+                    f"(~nb^0.8, RANK_PROBE §8).  Do NOT loosen "
+                    f"downfold_rcond to buy the difference: {R19_ANCHOR}.")
+            if mu_S_completed > mu_L:
+                raise ValueError(
+                    f"downfold: orbit completion of mu_small={mu_S} needs "
+                    f"{mu_S_completed} centroids, more than the parent basis "
+                    f"mu_L={mu_L} holds.  The parent's own centroid set is "
+                    f"not orbit-closed, which is a defect upstream of the "
+                    f"downfold — check the parent's centroid generation.")
+            mu_S = mu_S_completed
+            star = star_stability(keep_idx, sym_perm)
+            if not star.closed:                       # belt and braces
+                raise ValueError(
+                    "downfold: orbit completion did not produce an "
+                    "orbit-closed set — sym_perm is not a group action on "
+                    "the parent's centroid table.")
+            print_fn(star.describe())
+
     # ---- 3. What the SOLVE will actually retain, at q = 0. --------------
+    # On the COMPLETED set when completion fired: the number that matters is
+    # what the solve retains from the centroids actually carried, not from the
+    # ones the pivot order happened to stop at.
     kept_rep = _eigen_rank(G_host[np.ix_(keep_idx, keep_idx)], rcond,
                            label="downfold S_SS (q=0)")
 
@@ -591,7 +716,7 @@ def select_cur_centroids(
         eigen_rank_pool=ceiling, select_rank=int(rank),
         eigen_rank_kept=int(kept_rep.rank_criterion),
         pool_report=pool_rep, kept_report=kept_rep,
-        requested_auto=requested_auto)
+        requested_auto=requested_auto, star=star)
     return keep_idx, rep
 
 
@@ -880,7 +1005,7 @@ def build_transfer(S_SS, S_cross, mesh_xy, *, rcond: float,
         ev[q], rcond, label=f"downfold S_SS q={q}", quantity="eigenvalues",
         n_rows=int(ev.shape[-1])) for q in range(int(ev.shape[0]))]
     if announce:
-        _announce_ranks(reports, rcond, int(gram.shape[-1]), print_fn)
+        _announce_ranks(reports, rcond, int(gram.shape[-1]), print_fn, ev=ev)
 
     T_x = least_squares_transfer(gram, cross_x, mesh_xy, ax_x, rcond=rcond,
                                  print_fn=lambda *a, **k: None)
@@ -889,7 +1014,7 @@ def build_transfer(S_SS, S_cross, mesh_xy, *, rcond: float,
     return T_x, T_y, reports
 
 
-def _announce_ranks(reports, rcond, mu_s_pad, print_fn) -> None:
+def _announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
     ranks = np.array([r.rank_criterion for r in reports], dtype=np.int64)
     kap = np.array([r.kappa_eff if r.kappa_eff is not None else np.nan
                     for r in reports])
@@ -911,6 +1036,41 @@ def _announce_ranks(reports, rcond, mu_s_pad, print_fn) -> None:
         for q, vs in list(viol.items())[:4]:
             for v in vs:
                 print_fn(f"  [downfold/solve]   ** VIOLATION q={q}: {v}")
+
+    # The closure verdict, RESTATED HERE.  ``build_transfer`` suppresses
+    # ``least_squares_transfer``'s own log line and prints this report
+    # instead, so without this the guard would fire inside the solve and the
+    # downfold's authoritative report would say nothing about it — which is
+    # precisely the "one seam only whispered" failure ``band_degeneracy``
+    # names in its own ``check_band_window`` docstring.  The solve is where
+    # the snap is APPLIED; this is where the downfold admits it happened.
+    if ev is None:
+        return
+    infos = [spectral_closure.cluster_at_cut(ev[q], int(ranks[q]))
+             for q in range(len(reports))]
+    fired = [q for q, i in enumerate(infos) if i["fired"]]
+    if fired:
+        worst = max(fired, key=lambda q: infos[q]["n_keep_snapped"] - infos[q]["n_keep"])
+        w = infos[worst]
+        print_fn(
+            f"  *** [downfold/solve] SPECTRAL CLOSURE: the rank cut falls "
+            f"inside a degenerate block of S_SS on {len(fired)} of "
+            f"{len(reports)} q.  Worst q={worst}: rank {w['n_keep']} -> "
+            f"{w['n_keep_snapped']}, block of {len(w['members'])} eigenvalues "
+            f"spanning {w['span_rel']:.3e} relative.  A cut through a "
+            f"degenerate block makes the retained span a round-off-chosen "
+            f"slice of an eigenspace, so W_S projects onto a different "
+            f"subspace at q than at Sq.  ``common/spectral_closure`` in "
+            f"{spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))} "
+            f"mode. ***")
+    else:
+        print_fn(
+            f"  [downfold/solve] spectral closure: the cut falls in a gap on "
+            f"all {len(reports)} q at rtol {spectral_closure.DEFAULT_RTOL:.1e} "
+            f"(min relative gap over q "
+            f"{min(i['gap_rel'] for i in infos):.3e}; noise floor eps/rcond = "
+            f"{spectral_closure.degeneracy_noise_rtol(rcond):.2e}) — no "
+            f"degenerate block is cut.")
 
 
 # ---------------------------------------------------------------------------
