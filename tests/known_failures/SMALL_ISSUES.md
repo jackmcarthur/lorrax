@@ -610,7 +610,7 @@ silent overwrite.
     that has a docs edit in flight, so it wants its own bounded pass rather
     than a ride-along. [ζ-solve + `zeta_nband` lane, 2026-08-11]
 
-42. **The 2-D slab Coulomb kernel exists twice, and unifying it is NOT
+51. **The 2-D slab Coulomb kernel exists twice, and unifying it is NOT
     free.** `bse.vq_interp.v_slab_on_set(kind="slab")` and
     `vcoul.Slab2D._v_bare_per_q` compute the same Ismail-Beigi truncation
     from the same inputs, but in different arithmetic order — the service
