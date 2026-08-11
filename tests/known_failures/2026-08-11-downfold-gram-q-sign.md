@@ -200,3 +200,39 @@ the Pythagorean residual of anything. **Every `eps_W` recorded for any
 downfolded child before 2026-08-11 is void**, including both arms of the
 comparison in the orbit economics row. The real accuracy of this deck at
 μ_S = 168 is ~13 %, not ~4 %.
+
+**THE SUITES AT FOUR REAL GPUs.** `tests/test_downfold.py` +
+`tests/test_exciton_bands_downfold_dropin.py` + `tests/test_spectral_closure.py`
+in ONE process holding four `CudaDevice`s (`[inleg] jax device_count: 4`, so
+`resolve_mesh()` builds a genuine 2×2 over real cards):
+**117 passed, 0 failed, 0 skipped**, rc=0 in 81 s, `_logs/gates_gpu4b.log`.
+Collected is checked against the expected set rather than read off a green bar:
+WSL reports 107 passed + 10 skipped = **117 collected** on the same three
+suites, and the 10 WSL skips are the documented `liblorrax_ffi_host.so`
+driver-import cells, which run here. Same 117 both sides, so the green is over
+the same set and not a smaller one.
+
+Note the shape rule that applies in both directions on this branch, and it is
+the one `orbitfloor_0810` paid a round for: for **pytest** the real P=4 shape is
+`-G 4 -n 1` (one process, four devices), and for the **driver** it is
+`-G 4 -n 4` (four processes) — `lorrax-downfold` refuses a four-device single
+process. Both legs above are at their own correct shape and both assert it
+in-log.
+
+## Owed after this lane
+
+1. **The tolerance.** `CHILD_COVARIANCE_TOL = 1e-9` is unreachable at
+   production conditioning and should be a function of the run's `kappa_eff`.
+   Owner row; the number is measured above and no gate was loosened to hide it.
+2. **The comparison this poisons.** The orbit-floored-vs-point-picked accuracy
+   comparison must be re-taken; it is now cheap and it was NOT re-run here.
+3. **A second deck.** `xbwin_0811` reports a BSE-window refit certification
+   failing 7.719 meV with ~89 % attributed to a downfolded child (μ 960→191)
+   against 0.858 meV for the un-downfolded parent on the identical route, and a
+   per-q error ordering that REARRANGES between child and parent. That is the
+   signature of this defect and not of a wrap phase; the predictor to correlate
+   is **`−q ≡ q`**, not the umklapp wrap count. On their grid the q that should
+   be clean are exactly the ones fixed by inversion (Γ and the zone-boundary
+   half-lattice points); Σ is not one of them, which is consistent with Σ being
+   that child's worst point. Checkable against their existing per-q numbers
+   without re-running anything.
