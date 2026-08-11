@@ -226,11 +226,14 @@ suites, `test_bse_setup_qchunk`, `test_refit_vq_shard_p4`, `test_layering`,
 
 | tree | result |
 |---|---|
-| branch | **17 failed / 1220 passed / 13 skipped / 1 xfailed** |
-| base `0cd4c503` | **17 failed / 1203 passed / 13 skipped / 1 xfailed** |
+| branch, final HEAD | **17 failed / 1221 passed / 13 skipped / 1 xfailed** (254 s) |
+| branch, mid-lane HEAD `3e586e7e` | 17 failed / 1220 passed / 13 skipped / 1 xfailed |
+| base `0cd4c503` | **17 failed / 1203 passed / 13 skipped / 1 xfailed** (263 s) |
 
-**The failure NAME sets are identical — empty set-diff — and 1220 − 1203 = 17
-is exactly this branch's new cells**, which is also the collected-count check:
+**The failure NAME sets are identical — empty set-diff — and 1221 − 1203 = 18
+is exactly this branch's new cells**, which is also the collected-count check
+(the mid-lane row is the same file one cell earlier, before the ψ-chunk cell
+was added, and 1220 − 1203 = 17 there):
 the base arm's suite list omits `tests/test_f_shoulder_two_window.py` because
 the base tree does not have it, so the difference IS the file. Two of the
 seventeen reds are `test_bse_setup_qchunk` ×2, which this lane added to the
