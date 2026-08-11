@@ -30,10 +30,22 @@ That is why ``src/ffi/cufft/`` has no Python module of its own — see its
 WHY the service exists: XLA:CPU's ``fft`` custom-call requires the
 transformed axes minor-most, so every ``dot`` (k-major flat) ↔ ``fft``
 (k-minor 3-D) boundary in the Σ τ kernel pays a full transpose copy of the
-~398 MB/rank μ² tile — measured 60-65% of ``sigma.exec`` at nb=128/P=64 and
-CLOSED as structural for any XLA-side arrangement
+~398 MB/rank μ² tile — measured 65% of the STAGED τ DISPATCH (191.9 s of
+295.0 s) at nb=128/P=64 and CLOSED as structural for any XLA-side arrangement
 (``wk_REL/sigma_perf_results.md``).  Stride descriptors read the dot-layout
 tile where it lies, so the transposes disappear instead of moving.
+
+MIND THE DENOMINATOR, and mind the tense.  These lines said "60-65% of
+``sigma.exec``" until 2026-08-11; 191.9 s is 65% of the staged τ dispatch and
+70.5% of ``sigma.exec`` (272.0 s), so the quoted range belonged to neither
+(``wk_REL/FFI_EVIDENCE_AUDIT.md`` F26).  More importantly it is the number
+from BEFORE this service existed, and reading it as current is how a lane
+concludes the τ kernel is still FFT-bound and proposes wiring in the FFI that
+is already wired.  AFTER: 15.1% (decomposed) / 7.6% (fused) of the staged τ
+dispatch at nb=128/P=64 on cpu (F25), and 16.5% / 26.4% at four processes on
+A100s on the in-tree GN-PPM deck — where the whole FFT cost is 32 ms of a
+44.9 s driver wall (2026-08-11,
+``tests/known_failures/2026-08-11-gnppm-fft-is-already-on-the-ffi.md``).
 
 Two entry LAYERS, and the gate reaches only one — stated because it is
 structural, not a TODO.  ``make_flat_k_*`` wraps its own ``shard_map`` and

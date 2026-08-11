@@ -363,7 +363,10 @@ def make_sharded_fftn_3d(
 # register the SAME target names, so the call sites are platform-agnostic.
 # WHY: XLA's fft custom-call wants the transformed axes minor-most, so every
 # dot(k-major) <-> fft(k-minor) boundary in the Σ τ kernel pays a full
-# transpose of the ~398 MB/rank μ² tile (60-65% of sigma.exec at nb=128/P=64).
+# transpose of the ~398 MB/rank μ² tile — 65% of the STAGED τ DISPATCH at
+# nb=128/P=64, BEFORE this service existed (the line said "of sigma.exec"
+# until 2026-08-11; see the denominator note in ffi/fft.py).  Today the FFT is
+# 7.6-16.5% of that dispatch and 32 ms of a 44.9 s GN-PPM driver wall at P=4.
 # Stride descriptors read the dot-layout tile where it lies, so the transposes
 # disappear instead of moving.  Contract: ``docs/dev/flat_k_fft_service.md``.
 #

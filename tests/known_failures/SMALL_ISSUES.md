@@ -674,6 +674,22 @@ silent overwrite.
     two concurrent batches at `-P 2` and `-P 1` was not. The tell is rc
     143/134 at ~30–45 s with `RegisterTask` errors in the log, and the legs
     measure nothing. [two-window lane, 2026-08-11]
+46. **Killing a waiting `lx batch`'s `launch.sh` and its current `lx run`
+    leaves the `lx batch` process itself alive, and it fires the next leg.**
+    A lane that decides mid-wait to move its batch onto a different
+    allocation naturally kills what `pgrep -af "launch.sh"` shows it: the
+    wrapper, and the `lx run` currently queued for capacity. Neither is the
+    batch. `lx batch` is its own long-lived `python3 .../lx batch ...`
+    process, it survives both, and when a node frees it launches leg 2 of a
+    manifest whose leg 1 the lane has already re-run elsewhere — a duplicate
+    leg against a pool the lane no longer thinks it is using, and (row 45) a
+    second concurrent batch on that pool. Found the honest way: 25 minutes
+    after the relaunch, `ps -eo pid,cmd | grep <workspace>` still showed the
+    orphaned `lx batch` plus a queued `lx run` for the arm that had already
+    reported. Kill the `lx batch` PID first and the children after, and
+    verify with `ps` against the WORKSPACE PATH rather than against
+    `launch.sh` — the wrapper's name is the one thing every process in the
+    tree does not share. [gnppmfft lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 
