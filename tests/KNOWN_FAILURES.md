@@ -67,6 +67,7 @@ for the mechanism, the evidence and the disposition, all of which are unchanged.
 
 | date | what it records | status |
 |---|---|---|
+| 2026-08-10 | [The IBZ cascade and the forced full-BZ path disagree by 110 meV on Σ at Si 6×6×6 — adjudicated on the 4×4×4 anchor, where they agree to 7.6 µeV; at 6×6×6 BOTH arms break the Σ k-star identity and the breakage is already in Σ_x, upstream of W](known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md) | **ADJUDICATED — neither code path implicated; the Si 6×6×6 bundle is NOT valid as a reference, suspect is its over-complete ζ basis, one cheap leg named** |
 | 2026-08-10 | [The two staged-reshard instruments were never true on a GPU — the HLO pin counted a spelling CUDA does not use, and the remat red twin cannot go red on any platform (retires P4)](known_failures/2026-08-10-staged-reshard-instruments-were-cpu-shaped.md) | FIXED, pushed |
 | 2026-08-10 | [SPEC: an unknown deck key should REFUSE, not log-and-proceed — the corollary of `AGENT_PREAMBLE.md` measurement-discipline rule 1](known_failures/2026-08-10-unknown-deck-key-refusal-spec.md) | **PROPOSAL, owner ruling owed** |
 | 2026-08-10 | [`mu_small = auto` sizes a downfold by rank, not by accuracy — and the docs recommended it, on a deck that came out 2.087 eV wrong](known_failures/2026-08-10-mu-small-auto-rank-sized.md) | **OPEN** |
