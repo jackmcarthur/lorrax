@@ -180,13 +180,19 @@ fire); the same pair agree that a generic HPD's cuts are all clean under
 `strict`; arming changes not one bit of the factor.
 
 **L-c, `test_distrib_la_multiproc.py`** — `check_closure_agrees_across_backends`
-plus a `_CLI_CELLS` row. This is the claim that makes the guard a service
-feature rather than a utility function: **every backend must snap the cut
-to the same place**, or the retained subspace becomes a function of which
-library was compiled. It plants a known block in a diagonal HPD (whose
-Cholesky is exactly `diag(√d)`, so the spectrum every backend must
-reproduce is analytic), and defers by name any backend this machine cannot
-resolve — an absence, never a pass.
+plus a `_CLI_CELLS` row and a 1×1 pytest cell. This is the claim that makes
+the guard a service feature rather than a utility function: **every backend
+must snap the cut to the same place**, or the retained subspace becomes a
+function of which library was compiled. It plants a known block in a
+diagonal HPD (whose Cholesky is exactly `diag(√d)`, so the spectrum every
+backend must reproduce is analytic, and a disagreement is attributable to
+the factorization rather than to two reduction orders seeing a random
+matrix differently), asserts per backend that the spectrum matches that
+analytic `d` **before** comparing any rank, that the guard actually FIRED,
+and that the snapped rank is the block edge — and defers by name any
+backend this machine cannot resolve. The FALSE arm rides along on the same
+mesh and the same backends: a spectrum with no cluster must be silent
+under `strict` at three cuts.
 
 ## Suite A/B, both sides run
 
@@ -203,9 +209,117 @@ unchanged. **The 6 failures are PRE-EXISTING and identical on both arms** —
 `test_distrib_la_contract.py` loader cells that need a pinned `.so`, which
 WSL has none of; they are not this branch's and they are not new.
 
-## The cluster leg
+## The cluster legs — P=4, the FFI backends, and both A/B arms
 
-EVIDENCE_PATH_PLACEHOLDER
+**P=4 on every distributed leg** (the four-GPU rule), on real 4-process 2×2
+meshes. Worktree `/pscratch/sd/j/jackm/distrib_la_closure_0810/wt`,
+BUILD_NOTES `.so` pins (deployed device lib + the h200 host lib),
+`LX_BASE_MODULE=lorrax_J070`. `git rev-parse HEAD` and dirty-count printed
+from inside the allocation; `[lx] source tree:` confirmed the worktree on
+every leg. **Ran in the shared pools 56612363 / 56606148 — no allocation
+was created or cancelled by this lane.**
+
+**Arm 1 — the backend-agreement gate on a HOST 2×2**, `mp_cpu_p4`, exit 0
+in 41 s, `done: 14 cells ran, 0 failures`. The cell's own report, both
+dtypes:
+
+    PASS closure_backend_agreement[2x2,complex128]
+      {'ranks': {'native': 36, 'slate': 36},
+       'deferred': {'cusolvermp': "cholesky backend 'cusolvermp' is
+                    CUDA-only but the mesh devices are 'cpu' ..."},
+       'edge': 36, 'backends_run': ['native', 'slate']}
+
+**`native` and SLATE — two different libraries, one written in C++ against
+its own block-cyclic layout — snapped the planted cut to the same 36.** The
+backend that could not run is deferred BY NAME with the resolver's own
+sentence, which is an absence and not a pass.
+
+**Arm 2 — the same gate on a CUDA 2×2**, `mp_gpu_p4` at `fdbee04c`, exit 0
+in 56 s, `done: 12 cells ran, 0 failures`. **All three backends, nothing
+deferred:**
+
+    PASS closure_backend_agreement[2x2,complex128]
+      {'ranks': {'native': 36, 'cusolvermp': 36, 'slate': 36},
+       'deferred': {}, 'edge': 36,
+       'backends_run': ['cusolvermp', 'native', 'slate']}
+
+and identically at `float64`. **`native`, cuSOLVERMp and SLATE — three
+libraries, three block-cyclic layouts, one C++ batched potrf and one
+per-tile potrf — snapped the planted cut to the same 36, and each one's
+pivot spectrum matched the analytic `diag(A)` to better than 1e-12 before
+the rank was compared at all.** That is the gate this feature needed and
+it is now paid rather than asserted.
+
+The rest of the L-c matrix was green on the same leg: SLATE's trsm
+back-solve at 1.03e-15 / 6.86e-16 per q, cuSOLVERMp potrf/potrs residual
+6.0e-16, hostile extents 5 refused / 3 ran.
+
+Read together, the two arms cover every backend the package has: SLATE and
+`native` on the host mesh, SLATE and cuSOLVERMp and `native` on CUDA. No
+named leg is deferred.
+
+**Arm 3 — the A/B, BOTH SIDES RUN, same box, same pins.**
+`services/distrib_la/tests` + `tests/test_spectral_closure.py`:
+
+| arm | tree | passed | skipped | failed |
+|---|---|---|---|---|
+| branch | `f91186f6` | **352** | 4 | 16 |
+| base | `ad8d342f` (this branch's parent) | **202** | 4 | 16 |
+
+Delta **+150 passed**, which is exactly the 132 service cells plus the 18
+lorrax-side consistency cells. **The FAILED SETS ARE IDENTICAL — the same
+sixteen names on both arms**, compared as sets and not as counts. Thirteen
+are `.so`-shaped contract/acceptance cells; three are
+`test_spectral_closure.py`'s CUR-selection completion cells
+(`test_TRUE_a_mid_orbit_selection_is_completed_outward`,
+`test_FALSE_an_already_closed_selection_is_untouched`,
+`test_completion_that_would_exceed_the_rank_ceiling_REFUSES`).
+
+> **INCIDENTAL FINDING, not this lane's and not this lane's to fix: those
+> three cells are RED ON `main` ON PERLMUTTER and GREEN ON WSL.** They
+> landed with `1e0d9e23`. This lane measured them red on the base arm
+> before touching anything, so they are neither caused nor masked here.
+> Whoever owns the spectral-closure landing should look; a
+> platform-dependent red in a guard's own suite is worth more than a row
+> in someone else's amendment.
+
+**Evidence:** `/pscratch/sd/j/jackm/distrib_la_closure_0810/` — `wt/` (the
+branch worktree), `wt_base/` (the base arm, pinned to `ad8d342f`),
+`legs*.jsonl` (the exact manifests, including per-leg env),
+`_logs/{mp_gpu_p4,mp_cpu_p4,suites,base_suites,prov}.log` and `_logs2/`.
+
+### The defect the GPU leg found, which is the leg's whole argument
+
+The first GPU arm reported `done: 10 cells ran, 0 failures` where the CPU
+arm ran 14 — **and "0 failures" was true.** The two closure cells had
+raised
+
+    GUARD closure_backend_agreement[2x2,complex128]:
+      Array has been deleted with shape=complex128[2,64,64].
+
+`cholesky` **DONATES argument 0** (`distrib_la.DONATES`) — the factors are
+written over the operand's buffer wherever the library supports it — and
+the check body built ONE device operand and handed it to every backend, so
+cuSOLVERMp's potrf consumed it and SLATE's call then found it gone. The CLI
+runner files a `RuntimeError` under `GUARD`, because a resolve-time refusal
+genuinely IS the contract for an unsupported mesh class; so the cell
+reported neither PASS nor FAIL and **vanished from the count**.
+
+Nothing failed. The only thing that said so was `done: N cells ran` — the
+line this file's own docstring justifies with "0 failures out of 0 cells is
+the shape of every artifact-free green in this tree's history". It worked,
+and it is why the CPU arm's 14 was worth comparing against.
+
+Fixed two ways, because one of them is a bug and the other is a hole:
+
+1. **A fresh operand per backend call**, which is simply the documented
+   contract ("a donated operand must be a fresh value at the call site").
+2. **Past `resolve_backend`, a `RuntimeError` is re-raised as an
+   `AssertionError`.** Resolution in this package is a PROMISE that the
+   subsequent call cannot fail for an availability or geometry reason, so
+   anything raising after it is a DEFECT and must reach the runner as FAIL
+   rather than disappear into GUARD. Without this, the same class of bug
+   would hide again in a different cell.
 
 ## Limits, stated rather than buried
 
