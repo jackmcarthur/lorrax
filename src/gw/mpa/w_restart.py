@@ -123,6 +123,8 @@ __all__ = [
     "STAGE_BUILD",
     "STAGE_BUILD_W",
     "ZetaState",
+    "record_zeta_state",
+    "take_zeta_state",
     "STAGE_FIT",
     "STAGE_SIGMA",
     "W_OMEGA_DATASET",
@@ -199,6 +201,41 @@ class SamplingExpectation:
 
     omega: object = None
     keys: dict | None = None
+
+
+#: The zeta verdict, recorded where it is TAKEN and read where it is
+#: USED.  These are far apart: ``gw_init`` decides reuse deep inside the
+#: ISDF path, and the ladder consumes it at the multipole seam, with six
+#: call signatures in between that have no other reason to carry it.
+#: Threading it through all of them would be a larger change than the
+#: ladder it feeds, so it is recorded here instead -- in the module that
+#: owns the ladder, so there is still exactly one owner.
+#:
+#: Reset at the start of every resolve so a second run in one process
+#: cannot inherit the first's verdict; a caller that never records gets
+#: ``None``, which is the same "cannot say" the parameter already means.
+_RECORDED_ZETA: "ZetaState | None" = None
+
+
+def record_zeta_state(present, valid, reason=None):
+    """Called by ``gw_init`` at the moment it decides zeta reuse."""
+    global _RECORDED_ZETA
+    _RECORDED_ZETA = ZetaState(present=bool(present), valid=bool(valid),
+                               reason=reason)
+    return _RECORDED_ZETA
+
+
+def take_zeta_state():
+    """Read and clear the recorded verdict.  Clearing is the point.
+
+    A stale verdict is exactly the failure this ladder exists to prevent,
+    so the recorder is single-use: a second seam in the same process that
+    did not run an ISDF stage gets ``None`` ("cannot say") rather than
+    the previous run's answer.
+    """
+    global _RECORDED_ZETA
+    out, _RECORDED_ZETA = _RECORDED_ZETA, None
+    return out
 
 
 def _sampling_mismatch(expect, w_header):

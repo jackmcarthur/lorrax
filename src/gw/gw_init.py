@@ -955,6 +955,21 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_reuse = _zeta_reuse_ok(
 		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn,
 		n_rmu_expected=int(meta.n_rmu))
+	# THE VERDICT TRAVELS to the multipole restart ladder, which decides
+	# from it whether this run may start at STAGE_BUILD_W (sweep and fit,
+	# ISDF fit skipped).  Recorded rather than returned because the ζ
+	# decision is taken here and consumed six call frames away, and the
+	# rule itself stays here: this hands over an ANSWER, not a copy of the
+	# check.  ``_zeta_reuse_ok`` has already printed WHY when it says no.
+	try:
+		from .mpa import w_restart as _wr
+		_wr.record_zeta_state(
+			present=os.path.exists(zeta_h5_path), valid=bool(_reuse),
+			reason=None if _reuse else "the ζ fit_provenance/centroid check")
+	except Exception:                                          # noqa: BLE001
+		# The ladder is an optimisation; a run must not fail because its
+		# bookkeeping could not be recorded.
+		pass
 	if _reuse and cfg.bispinor:
 		for mu_L, _zeta_T_path in _zeta_T_paths.items():
 			if not _zeta_reuse_ok(

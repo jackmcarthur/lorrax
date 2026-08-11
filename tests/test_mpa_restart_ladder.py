@@ -210,3 +210,26 @@ def test_every_stage_describes_itself(stage):
                               if stage == WR.STAGE_SIGMA else None)
     text = WR.describe(d)
     assert "b.h5" in text and len(text) > 40
+
+
+# --------------------------------------------------------------------------
+# The seam: the verdict travels, and does not linger
+# --------------------------------------------------------------------------
+
+def test_recorded_zeta_state_is_single_use():
+    """A stale verdict is the failure this ladder exists to prevent."""
+    WR.record_zeta_state(present=True, valid=True)
+    first = WR.take_zeta_state()
+    assert first is not None and first.valid
+    assert WR.take_zeta_state() is None, (
+        "a second seam that ran no ISDF stage must get 'cannot say', not "
+        "the previous run's answer")
+
+
+def test_recorded_invalid_zeta_carries_its_reason():
+    WR.record_zeta_state(present=True, valid=False, reason="centroids_md5")
+    st = WR.take_zeta_state()
+    assert st.present and not st.valid and st.reason == "centroids_md5"
+    d = WR.resolve_mpa_restart("/nonexistent/bundle.h5", zeta=st)
+    assert d.stage == WR.STAGE_BUILD
+    assert any("centroids_md5" in r for r in d.drops)

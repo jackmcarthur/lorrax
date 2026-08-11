@@ -502,12 +502,28 @@ def compute_mpa_sigma_pipeline(
     # check rather than a copy of it (``gw.mpa.w_restart``).
     from .mpa import w_restart
 
+    # WHAT THIS RUN MAY SKIP, decided once.  The ζ verdict comes from
+    # ``gw_init``, which took it; the sampling expectation is this deck's
+    # own, and anything the deck cannot state stays ``None`` — "cannot
+    # say", which leaves the ladder exactly as it was before these
+    # existed rather than silently granting a skip.
+    _zeta = w_restart.take_zeta_state()
+    _sampling = w_restart.SamplingExpectation(
+        omega=getattr(config, "mpa_omega_grid", None),
+        keys={"n_rmu": int(getattr(meta, "n_rmu", 0)) or None,
+              "q_storage": getattr(config, "restart_q_storage", None)})
     restart = w_restart.resolve_mpa_restart(
-        path, identity=w_restart.wfn_identity(wfn))
+        path, identity=w_restart.wfn_identity(wfn),
+        zeta=_zeta, sampling=_sampling)
+    # THE DROPS ARE ANNOUNCED BEFORE THE SKIP, because a rung that was
+    # refused is invisible in the result: the run simply rebuilds, which
+    # reads exactly like a run that had nothing to resume.
+    restart.announce_drops(print_fn)
     if restart.stage == w_restart.STAGE_FIT:
         w_restart.fit_from_w_omega(restart, print_fn=print_fn)
         restart = w_restart.resolve_mpa_restart(
-            path, identity=w_restart.wfn_identity(wfn))
+            path, identity=w_restart.wfn_identity(wfn),
+            zeta=_zeta, sampling=_sampling)
     restart.announce(print_fn)
 
     print_section("MULTIPOLE (MPA) FREQUENCY-INTEGRATED SIGMA", print_fn)
