@@ -295,6 +295,14 @@ THIS_BRANCH_TOUCHES = (
     "src/gw/mpa/chi0_resolvent.py",
     "src/gw/mpa/sigma_head.py",
     "src/gw/mpa/head_dipole.py",
+    # The multipole lane's restart seam (2026-08-11).  A NEW module, and
+    # a gnppm run cannot reach it in either sense: nothing in
+    # ``ppm_pipeline``'s import closure names it, and its only caller is
+    # ``mpa_pipeline``, which refuses a mode with a two-point pole model
+    # at its own entry.  It performs no floating-point arithmetic at all
+    # — it reads h5 attrs, compares two file identities and decides
+    # which stage runs.
+    "src/gw/mpa/w_restart.py",
     "src/gw/mpa_pipeline.py",
     "src/file_io/mpa_store.py",
     "src/file_io/paths.py",
