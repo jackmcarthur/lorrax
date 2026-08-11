@@ -88,7 +88,13 @@ gap, not a preference: XLA:CPU lowers it through Eigen dots that saturate
 **1.6–1.9× below vendor BLAS at full threads** (bare-dot probe, job
 7879008; the in-module production rate is a further ~2× below the bare
 dot), i.e. 295 GF/s promoted zgemm / ~172 GF/s split dgemm against 1263
-GF/s MKL (memo Sec. 4.4/4.5).  Job 7879008 also showed the client
+GF/s MKL (memo Sec. 4.4/4.5).
+[AUDIT G1/G18, banner 2026-08-11: the 295-vs-1263 GF/s RATIO is
+arithmetically wrong.  `wk_REL/FFI_EVIDENCE_AUDIT.md` recomputes the
+Eigen rate at ~631 GF/s, so the gap is ~2.1x, not 4.3x; the WALL-CLOCKS
+(43.2->38.7 s, 29.4->19.6 s) are measured and stand.  G18 named this the
+highest-priority repo-doc fix and it went uncorrected for two weeks.]
+Job 7879008 also showed the client
 thread-pool scaling is near-linear, so this is **not** a pool-wiring defect
 that could be fixed on the XLA side.
 

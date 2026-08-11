@@ -568,10 +568,15 @@ it checked, which is why these dials do not fold into `ffi.linalg`.
 
 ## ffi.fft {#ffifft}
 
-**Purpose.** The flat-k batched 3-D FFT service: MKL FFT (DFTI API) on cpu
-meshes, cuFFT advanced layout on CUDA, under the same target names —
-stride descriptors read the dot-layout tile in place, deleting XLA's
-layout transposes (sigma.exec 272 → 71.9 s at nb=128/P=64).
+**Purpose.** The flat-k batched 3-D FFT service: the **FFTW3 ABI** on cpu
+meshes (bound by `dlsym` — *which* library answers is a run-time question, see
+`ffi_layout.md` §3; this line said "MKL FFT (DFTI API)" until 2026-08-11, false
+since the DFTI code was deleted 2026-08-05), cuFFT advanced layout on CUDA,
+under the same target names — stride descriptors read the dot-layout tile in
+place, deleting XLA's layout transposes (**on CPU**: sigma.exec 272 → 71.9 s at
+nb=128/P=64; there is no comparable GPU A/B and
+`wk_REL/cufft_mirror_notes.md:194` says nothing like that 3.78× should ever be
+claimed there).
 
 **Public API** (`src/ffi/fft.py`; `ffi.mklfft` is a shim. Physics code
 enters via `common.fft_helpers`, which delegates its gated bodies here —

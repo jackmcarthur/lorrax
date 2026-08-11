@@ -86,9 +86,11 @@ Encoded policies (each measured; evidence cited inline)
 Gated CPU GEMM body (LORRAX_BANDS_GEMM_FFI; AUTO default 2026-07-29)
 --------------------------------------------------------------------
 The large right contraction is the measured wall of this pattern — 71% of
-the Σ project_rs row, running 4.3–7.3× below the node's BLAS roofline
+the Σ project_rs row, running ~2.1× below the node's BLAS roofline
 through XLA:CPU's Eigen dots (295 GF/s promoted zgemm / ~172 GF/s split
-dgemm vs 1263 GF/s MKL, memo Sec. 4.4/4.5; the bare Eigen dot saturates
+dgemm vs 1263 GF/s MKL as first written, but that RATIO is wrong — the
+audit recomputes Eigen at ~631 GF/s, FFI_EVIDENCE_AUDIT.md G1/G18,
+corrected 2026-08-11; the wall-clocks stand.  memo Sec. 4.4/4.5; the bare Eigen dot saturates
 1.6–1.9× below vendor BLAS at full threads — jobs 7879008/7879010).
 The dial routes ONLY that right contraction through the vendor-BLAS GEMM
 host FFI handler; everything else — channel algebra, collectives, the

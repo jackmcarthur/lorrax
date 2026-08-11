@@ -159,7 +159,13 @@ required flops.  HLO-proven: the promoted
 `c128[16,1248,128] dot(%convert_bitcast_fusion ...)` pair in the
 reshard-ubench dump `module_0009.jit__project_ri_reduce_scatter`; Eigen
 zgemm 295 GF/s vs 1263 GF/s BLAS for the same contraction (memo
-Sec. 4.4).  Whenever a real operand would meet a complex one in the
+Sec. 4.4).
+[AUDIT G1/G18, banner 2026-08-11: the 295-vs-1263 GF/s RATIO is
+arithmetically wrong.  `wk_REL/FFI_EVIDENCE_AUDIT.md` recomputes the
+Eigen rate at ~631 GF/s, so the gap is ~2.1x, not 4.3x; the WALL-CLOCKS
+(43.2->38.7 s, 29.4->19.6 s) are measured and stand.  G18 named this the
+highest-priority repo-doc fix and it went uncorrected for two weeks.]
+Whenever a real operand would meet a complex one in the
 large right GEMM, this module splits the COMPLEX operand into f64 parts
 and issues pure-f64 dgemms + one `lax.complex` recombine.  Measured:
 project_rs 43.2→38.7 s at nb=128 (job 7878942).  The split is NOT

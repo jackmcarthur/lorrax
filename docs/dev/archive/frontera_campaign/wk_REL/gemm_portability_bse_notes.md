@@ -457,7 +457,7 @@ k-leading and call the EXISTING fused conv handler.*
 |---|---|---|
 | operand form | `(nk, *trail)`, k **flattened and LEADING** | arbitrary rank, FFT over 3 axes given by `axes=` |
 | FFT axes in memory | k-MAJOR: element strides `{nky·nkz·T, nkz·T, T}`, transforms batched over the trail at **distance 1** | k-MINOR-MOST at **every** BSE/vq call site on disk — `axes=(2,3,4)` of a rank-5 `W_q`, `(5,6,7)` of the rank-8 `T_k`, `(4,5,6)` of the rank-7 stack `T_k`, `(1,2,3)` of `zeta_box`: i.e. contiguous k-block, batch = product of the LEADING dims, distance `nk` |
-| why the FFI exists | XLA:CPU's `fft` (DUCC) demands the transformed axes minor-most, so a k-major tile pays a full-tile transpose in and out — *measured 60–65 % of the Σ τ kernel* | **the pathology is absent by construction**: the axes are already minor-most, so XLA's own path pays no transpose |
+| why the FFI exists | XLA:CPU's `fft` (DUCC) demands the transformed axes minor-most, so a k-major tile pays a full-tile transpose in and out — *measured 65 % of the STAGED τ DISPATCH (191.9 s of 295.0 s) at nb=128/P=64 on XLA:CPU, BEFORE the FFI — corrected 2026-08-11, it was written “60–65 % of the Σ τ kernel” with no denominator and no date* | **the pathology is absent by construction**: the axes are already minor-most, so XLA's own path pays no transpose |
 
 ### (1a) MEASURED: HLO at the actual call sites (jobs 7879363 / 7879370)
 
@@ -666,9 +666,14 @@ jobs.**  BSE's instrumentation stops at term granularity
 ifft / multiply / fft inside `_apply_W_from_T` are not separately timed,
 and a grep of `lorrax_setup/{SPEEDUP_SCORECARD.md, SESSION_REPORT*,
 wk_*/}` and the run dirs found no BSE log carrying those rows.  Stating
-it plainly rather than borrowing the Σ number: the Σ τ kernel's 60–65 %
-FFT share is **not** transferable, because that share is dominated by
-layout churn BSE does not currently pay.
+it plainly rather than borrowing the Σ number: the Σ τ kernel's pre-FFI
+65 %-of-staged-τ-dispatch FFT share is **not** transferable, because that
+share is dominated by layout churn BSE does not currently pay.
+[2026-08-11: the borrowed number was doubly untransferable — it is also
+pre-FFI, and post-FFI the Σ share is not a single number at all but runs
+16 %/60 %/85 % of the τ dispatch at 9/64/216 k-points
+(`2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`).  The
+conclusion — do not borrow it — is unchanged and was right.]
 
 ### (4) Effort / payoff, and the gates such a change would need
 

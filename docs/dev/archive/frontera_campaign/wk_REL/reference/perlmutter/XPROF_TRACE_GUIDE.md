@@ -301,13 +301,20 @@ pattern used in the 4×4×4 profiling session.
 
 ### Known LORRAX cost centers
 
-| Cost center | Location | Cold time | With fix | Status |
-|-------------|----------|-----------|----------|--------|
-| Eager tau-loop compilation | `ppm_sigma.py:_convolve_sigma_branch_kij` | ~410 s | ~2 s | **Fixed** (`@jax.jit` on `profile_ppm`) |
-| Crossing minimax solver | `minimax.py:solve_crossing` via `_build_three_sigma_windows` | ~95 s | ~0 s (cache/shipped) | **Fixed** (disk cache + shipped tables) |
-| Actual GPU sigma work | tau-loop einsums + FFTs | ~5 s | ~2 s | Healthy |
-| ISDF fitting | `gw_init.py` | 2-5 s | — | Healthy |
-| chi0 + W screening | `w_isdf.py:compute_chi0_minimax` | 1-3 s | — | Healthy |
+**DELETED 2026-08-11.** This table carried five undated rows — "Eager tau-loop
+compilation ~410 s", "Actual GPU sigma work ~5 s — Healthy", and three others —
+presented as *current* cost centers. They were the 2026-04-05 numbers from
+`ppm_sigma_profiling_2026-04-05.md`, four months and an architecture old, and
+nothing on the page said so. Two of them are now actively false:
+`LORRAX_FRONTERA_ADVICE.md:185` records "compilation is not a bottleneck in this
+code", and `sigma.compile` measures 0.14–0.80 s across three decks at P=4
+(2026-08-11); and "GPU sigma work ~5 s — Healthy" is contradicted by a τ-kernel
+device wall of 31.5 s at Si 6×6×6.
+
+For a dated decomposition at three system sizes, read
+`tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`.
+For the April profile as history, read `ppm_sigma_profiling_2026-04-05.md`,
+which at least carries its date in its filename.
 
 ## Step 4: Checkpoint
 

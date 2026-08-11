@@ -132,7 +132,17 @@ Unified nb-scaling picture for rung 2+: the projection GEMMs scale
 ∝ nb·μ² (share 16% → 39% from nb=128→256 at μ²/4) and become the σ wall;
 their re/im channel structure is OWNER-HELD (derivation-level work, AK.9 /
 candidates #2 — the "half the zgemm flops" lever).  FFT/layout buckets
-scale ∝ μ² and are CLOSED as structural on XLA:CPU (see below).  Band
+scale ∝ μ² and are CLOSED as structural on XLA:CPU (see below).
+[**REFUTED 2026-07-29, banner added 2026-08-11.** "CLOSED as structural"
+survived about 24 h: the MKL-DFTI FFT FFI (job 7878727) took the trio 191.9 s →
+4.99 s, `FFI_EVIDENCE_AUDIT.md` F22.  Two further corrections from
+2026-08-11: the scaling is ∝ μ² **and ∝ nk**, and nk is the axis that
+dominates — the FFT is 16%/60%/85% of the τ dispatch at 9/64/216 k-points on
+GPU; and the projection GEMMs do NOT "become the σ wall" at every scale —
+`project_rs` falls to 9% of the τ dispatch at Si 6×6×6 while the FFT rises to
+85%.  See
+`tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`.]
+Band
 slicing (owner item 3): the FFTs never see nb; the only full-nb-under-mask
 cost is G_build = 7.1 s/91 s at nb=256 → a ~3-5 s win costing per-extent
 recompiles — sized, available, not landed (below envelope threshold).
@@ -185,6 +195,10 @@ confirm.  The dot↔fft layout alternation is CLOSED as not-removable on
 this backend without changing what the kernel computes (owner-held) or
 the backend (GPU relowers layouts differently — re-open there if the GPU
 lattice campaign needs it).
+[**REFUTED, banner added 2026-08-11.** The FFI removed it on this very
+backend the next day (`FFI_EVIDENCE_AUDIT.md` F22).  The "re-open there"
+invitation was taken up on GPU and the answer is that the FFT is 85% of the τ
+dispatch at Si 6×6×6/216 k — `2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`.]
 Owner item (3), band slicing: the FFTs never see the band axis (they act on
 the μ² pair object); the full-nb-under-mask cost sits ONLY in the G-build
 GEMM (contracts all nb with masked phases — val branch uses ~26 of 128).

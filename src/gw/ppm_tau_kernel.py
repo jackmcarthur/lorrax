@@ -69,9 +69,9 @@ def _stage_timing_enabled() -> bool:
 
 def _fft_ffi_fused_enabled() -> bool:
     """``LORRAX_FFT_FFI_FUSED=1`` routes the τ kernel's IFFT·(G·W)·FFT step
-    through ONE fused MKL FFT (DFTI API) host-FFI entry point
+    through ONE fused FFTW3-ABI host-FFI entry point
     (``common.fft_helpers.make_flat_k_gw_conv``) so the R-space G tile never
-    materializes.  O(N log N) FFTs via MKL's DFTI descriptor API reading the
+    materializes.  O(N log N) FFTs via the FFTW3 advanced-layout plans reading the
     dot-layout tile directly (NOT a DFT-as-matmul) — see the backend block
     in fft_helpers.  Independent of ``LORRAX_FFT_FFI``; default ON since
     the FFI-required ruling (decisions.md 2026-08-01) — ``=0`` opts out to
@@ -251,7 +251,7 @@ def _get_sigma_kij_kernel(
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
     use_fused_ffi = _fft_ffi_fused_enabled()
     if use_fused_ffi:
-        # ONE fused MKL FFT (DFTI API) host-FFI call per rank per τ:
+        # ONE fused FFTW3-ABI (host) / cuFFT (CUDA) FFI call per rank per τ:
         # sigma_k = fftn(ifftn(G_k)·ifftn(W_q)[:,None,:,None,:]·inv_sqrt_nk)
         # with the R-space G tile chunked away inside the handler.  The
         # decomposed helpers below are deliberately NOT built on this route
@@ -342,7 +342,7 @@ def _get_sigma_kij_kernel(
     #     the fused module may keep in fft-native layout, so staged wall
     #     ≠ fused wall; the rows are for RATIO attribution.
     #   * LORRAX_FFT_FFI_FUSED=1: the three FFT-adjacent rows collapse into
-    #     ONE row ``sigma.tau.GW_conv_ffi`` (the fused MKL FFT (DFTI API)
+    #     ONE row ``sigma.tau.GW_conv_ffi`` (the fused FFT-FFI
     #     handler does IFFT·multiply·FFT in one call) — A/B against the
     #     sum G_ifft + V_ifft + GW_mult_fft of the reference table.
     # Scale-neutral: per-τ host overhead is O(#stages), independent of
