@@ -1042,6 +1042,16 @@ _DEFAULTS = {
     # core the integrand is more damped than its own error certificate
     # assumes.  See ``mpa.sigma_pass.plan_branch_groups``.
     "mpa_body_eta_ev": 0.0,
+
+    # --- the head-gate bypass, which is an ATTRIBUTION and not a tolerance --
+    # Empty (the default) means the shipped refusal stands.  A non-empty
+    # string means some named authority has ruled that the sample-
+    # interpolation criterion does not apply to the head this run is using,
+    # and that string is stamped into the run and into anything built from
+    # it.  It is a string rather than a bool on purpose: "who decided, and
+    # when" is the whole content of the decision, and a bool records neither.
+    # The residual is still measured and printed; only the refusal is lifted.
+    "mpa_head_gate_bypass": "",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -2476,6 +2486,10 @@ class LorraxConfig:
     #: Sigma consumption; 0.0 is the shipped behaviour.  See
     #: ``_DEFAULTS["mpa_body_eta_ev"]``.
     mpa_body_eta_ev: float
+    #: Named authority lifting the head sample-interpolation refusal
+    #: ("" = the refusal stands).  See
+    #: ``_DEFAULTS["mpa_head_gate_bypass"]``.
+    mpa_head_gate_bypass: str
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -3077,6 +3091,8 @@ class LorraxConfig:
             mpa_binned_width_clause=str(
                 _g("mpa_binned_width_clause") or "").strip().lower(),
             mpa_body_eta_ev=float(_g("mpa_body_eta_ev") or 0.0),
+            mpa_head_gate_bypass=str(
+                _g("mpa_head_gate_bypass") or "").strip(),
             # Sub-dataclass groups
             paths=paths,
             head=head,

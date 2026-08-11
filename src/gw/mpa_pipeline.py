@@ -267,7 +267,40 @@ def _inject_mpa_head(
     # NOT pin — in particular it is blind to a common rescaling of the
     # pole axis, which is why the f-sum line below is printed beside it.
     resid = head_sample_residual(head, pole_energy_unit=pole_energy_unit)
-    if resid["max_rel_residual"] > HEAD_SAMPLE_REL_TOL:
+    # THE DELEGATED BYPASS, and what it is and is not.
+    #
+    # The gate below asks whether the head's poles reproduce the head's own
+    # stored samples.  It is the right question for a head that was FITTED TO
+    # THOSE SAMPLES, and it is the wrong question for a head that was not:
+    # a head fitted on a dense axis, or corrected for local fields through a
+    # different construction, is not trying to interpolate the sixteen
+    # protocol points and will miss them by an amount that says nothing about
+    # its accuracy.  The 2026-08-10 real-axis study measured exactly that
+    # divergence -- three models within 1.0 % of each other ON the protocol
+    # line differ by 17.85 % on the strip Sigma actually reads.
+    #
+    # So the bypass exists, and it is deliberately NOT a loosened tolerance.
+    # A tolerance says "close enough"; this says "the criterion does not
+    # apply to this store, and here is who decided that".  The deck must name
+    # the string, the string is stamped into the run and into any table built
+    # from it, and the sample residual is still MEASURED and PRINTED beside
+    # it, because the number remains informative even when it is not
+    # disqualifying.  A run that takes this door announces it in the same
+    # breath as the number it is declining to be refused by.
+    bypass = str(getattr(config, "mpa_head_gate_bypass", "") or "").strip()
+    if bypass and resid["max_rel_residual"] > HEAD_SAMPLE_REL_TOL:
+        print_fn(
+            f"  MPA head gate: BYPASSED BY DECK — head_gate={bypass!r}.  The "
+            f"stored head misses its own samples by "
+            f"{resid['max_rel_residual']:.4e} over {resid['n_samples']} "
+            f"samples against a tolerance of {HEAD_SAMPLE_REL_TOL:.1e}, and "
+            f"this run proceeds anyway on that named authority.  The "
+            f"criterion is a sample-interpolation criterion and applies to a "
+            f"head fitted to these samples; it is not a strip-accuracy "
+            f"criterion and does not bound the error where Sigma reads the "
+            f"head.  Every quasiparticle number this run produces carries "
+            f"this string.")
+    elif resid["max_rel_residual"] > HEAD_SAMPLE_REL_TOL:
         raise ValueError(
             f"compute_mpa_sigma_pipeline: the fit store's head poles do not "
             f"reproduce the head samples stored beside them — worst "
