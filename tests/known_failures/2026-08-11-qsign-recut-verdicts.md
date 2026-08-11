@@ -33,6 +33,18 @@ min/median/max = 4.582e-03 / 4.817e-03 / 6.205e-03 and keeps 173 independent
 directions of 191. The certification was then re-run on it with the same deck
 and the same flags as the arm that produced 6.819 meV.
 
+**The comparison has exactly one variable, and that is checked rather than
+assumed.** The regenerated child's kept-centroid table is **bit-identical** to
+the one the poisoned child shipped —
+`centroids_frac_191_downfold.txt` md5 `922208c126563f9a75e375c08a0e4cac` on
+both, and the parent basis table `centroids_frac_960_parent.txt` md5
+`4d8da1404b43b651a27bcc60af21e4cf` on both. The CUR selection is deterministic
+given the parent bundle and `rcond`, and both are the same bytes, so the keep
+set did not move. **The only thing that differs between the 6.819 meV arm and
+the 2.593 meV arm is the q-sign relabel**, which is what makes the per-Q table
+below readable as a statement about the defect rather than about two different
+bases.
+
 **The new number is 2.593 meV, and the 0.01 meV gate still reads REFUSED.**
 The gate was not touched, no `.dat` and no `.png` were written, and per the
 dispatch the dense band-structure arms were NOT run. The driver refuses to
@@ -103,6 +115,17 @@ harness, and it holds, so the rest of Job 2 is readable.
 | retained rank per q (min/med/max) | 120/123/124 | 171/173/175 | point |
 | lowest exciton, 4v8c | **3.492286 eV** | **3.532525 eV** | — |
 | vs parent 3.575096 eV | **−82.8 meV** | **−42.6 meV** | point, by 1.9x |
+| `E_max` (Lanczos raw), parent 12.980 eV | 17.516 eV (**+35 %**) | 12.979 eV (**+0.0 %**) | point |
+
+The `E_max` row is worth reading beside its own noise floor. It comes from a
+Lanczos bound with a random start vector, and the parent — which is not
+downfolded and should not have moved at all — came back at 12.980 eV against
+13.001 eV before, so **0.16 % is about what this instrument's repeatability
+is**. On that scale the point-picked arm's +0.0 % is no distortion at all
+(it was +11 % before the fix) while the orbit-floored arm's +35 % is far
+outside it (it was +47 %). All three arms converged with no `LinAlgError` and
+comparable residuals, so this is three arms measured on one instrument rather
+than two arms and an excuse.
 
 **THE VERDICT IS UNCHANGED IN DIRECTION AND STRONGER IN MARGIN: the
 symmetric-but-smaller orbit-floored basis is beaten, not matched, on every
@@ -189,7 +212,20 @@ plus ledger. Every leg printed `git rev-parse HEAD` = `0578bc89` and
 | `bse_floor168b` | 4 devices, 2x2, 4 processes | 0 | 37 s |
 | `bse_point185b` | 4 devices, 2x2, 4 processes | 0 | 37 s |
 | `bse_parentb` | 4 devices, 2x2, 4 processes | 0 | 44 s |
-| `xb_ctl_parent2` (control) | 1 device — see §4 | — | — |
+| `xb_ctl_parent3` (control) | 1 device — see §4 | — | — |
+
+**What was collected, not just what was green.** Every one of the seven P=4
+legs above shows **four** per-rank `compile-cache ... summary` lines, so all
+four ranks reached the end of their work rather than one rank reporting for a
+quartet that had already lost members. `xb_cert2` — the leg the headline number
+comes from — carries the shape in its own words,
+`jax.device_count()=4 process_count()=4 local_device_count()=1;
+mesh_xy.shape={'x': 2, 'y': 2}`, together with
+`evs sharding=... fully_addressable=False`, which is the part that cannot be
+faked by four independent single-device sessions wearing a P=4 label. Its
+wrapper prints no `MESH_SHAPE check` line **by design**: rc is non-zero because
+the certification gate refused, and on a non-zero rc the wrapper stands down
+and lets the payload's own result be the result.
 
 **A harness defect of this lane's own, recorded because it nearly cost a
 verdict.** The first in-leg wrapper asserted the mesh by grepping for
