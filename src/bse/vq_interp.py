@@ -2499,7 +2499,16 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             bool(params.get("bispinor", False)), band_chunk_size=16):
         lo = bc_range[0] - band_range[0]
         hi = bc_range[1] - band_range[0]
-        psi_r_host[:, lo:hi] = np.asarray(jax.device_get(psi_bc))
+        # _to_host (= common.collectives.gather_to_host), NOT device_get.  ``iter_psi_rchunk_bandwise`` yields
+        # a mesh-sharded global array, so on a MULTI-PROCESS run its shards
+        # live on other processes and ``jax.device_get`` raises
+        # ("Fetching value for a jax.Array that spans non-addressable
+        # devices") — measured at P=4/4-process, job 56612363 step .59, the
+        # first time this function ever ran under the driver.  Its three-arm
+        # branch is also why the naive repair is wrong: ``process_allgather(
+        # tiled=True)`` on the fully-addressable P=1 array would concatenate
+        # this process's whole copy and multiply the k axis by P.
+        psi_r_host[:, lo:hi] = _to_host(psi_bc)
     n_rp = ((n_rtot + r_chunk - 1) // r_chunk) * r_chunk
     if n_rp > n_rtot:
         psi_r_host = np.concatenate(
