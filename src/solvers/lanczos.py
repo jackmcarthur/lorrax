@@ -777,6 +777,64 @@ def _cgs2_block(Q_all, Z, sel):
     return _pass(_pass(Z))
 
 
+def _block_lanczos_step(j, Q_all, alpha_all, beta_all, *, matvec, kind,
+                        n_slots: int, n_reorth: int, bs: int):
+    """One block-Lanczos iteration, shared by both jitted block variants.
+
+    Reads ``Q_all[j]``, writes ``alpha_all[j]``, ``beta_all[j]`` and
+    ``Q_all[j + 1]``.  ``n_slots`` is the basis buffer's leading extent
+    (``max_iter + 1``); ``kind``, ``n_slots``, ``n_reorth`` and ``bs`` are
+    static, ``j`` is traced.
+
+    ONE copy, because the fixed-iteration and convergence-driven variants ran
+    byte-identical bodies including the ``mgs`` fallback sweep, and a reorth
+    fix applied to one of them would silently have missed the other.
+    """
+    Q_j = Q_all[j]                                     # (n, bs)
+    # Block matvec over (bs, n) → (bs, n); transpose to (n, bs).
+    Z = matvec(Q_j.T).T
+
+    alpha_j = jnp.conj(Q_j).T @ Z                      # (bs, bs)
+    alpha_all = alpha_all.at[j].set(alpha_j)
+    Z = Z - Q_j @ alpha_j
+
+    # Subtract Q_{j-1} · β_{j-1}^H (skip on j=0).
+    Q_jm1 = Q_all[jnp.maximum(j - 1, 0)]
+    beta_prev = beta_all[jnp.maximum(j - 1, 0)]
+    Z = jnp.where(j > 0, Z - Q_jm1 @ jnp.conj(beta_prev).T, Z)
+
+    if kind == "cgs2":
+        Z = _cgs2_block(Q_all, Z, _reorth_window(j, n_slots, n_reorth))
+    else:
+        def reorth_body(i, Z_acc):
+            valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
+            Q_i = Q_all[i]
+            proj = jnp.where(valid, jnp.conj(Q_i).T @ Z_acc,
+                             jnp.zeros((bs, bs), dtype=Z_acc.dtype))
+            return Z_acc - Q_i @ proj
+        Z = lax.fori_loop(jnp.maximum(0, j - n_reorth), j + 1, reorth_body, Z)
+
+    # QR(Z) → next block + β_j.  Write to slot j+1 (always valid with the
+    # +1 buffer, 1..max_iter) — no clobber of the current Q_j.
+    Q_next, beta_j = jnp.linalg.qr(Z)                  # (n, bs), (bs, bs)
+    return (Q_all.at[j + 1].set(Q_next),
+            alpha_all,
+            beta_all.at[j].set(beta_j))
+
+
+def _mask_inactive_tail(T, n_active: int):
+    """Push the never-written tail of ``T`` out of the low spectrum.
+
+    Slots past ``n_active`` are exactly zero, so ``sort()[:n_eig]`` would
+    return that zero as a Ritz value below the true spectrum.  Adding a large
+    constant to their diagonal moves them out of the way instead.  ``T`` is
+    the block-tridiagonal, ``n_active`` the number of ROWS actually filled.
+    """
+    LARGE = jnp.asarray(1.0e6, dtype=T.real.dtype)
+    mask = (jnp.arange(T.shape[0]) >= n_active).astype(T.real.dtype) * LARGE
+    return T + jnp.diag(mask).astype(T.dtype)
+
+
 def block_lanczos_eig(
     matvec: Callable[[jax.Array], jax.Array],
     shape: tuple[int, ...],
@@ -1023,14 +1081,14 @@ def lanczos_eig_jit(
         Default ``FULL_REORTH`` (-1) = the whole basis; a finite window is a
         deliberate memory/time trade, not something you should get by not
         choosing.  See "Reorthogonalisation WINDOW" above for the measurement.
-        Default ``FULL_REORTH`` (-1) = the whole basis; a finite window is a
-        deliberate memory/time trade, not something you should get by not
-        choosing.  See "Reorthogonalisation WINDOW" above for the measurement.
     reorth : {'cgs2', 'mgs'} or None
-        Reorthogonalisation route; ``None`` reads ``LORRAX_LANCZOS_REORTH``
-        and defaults to ``'cgs2'``.  See the route section above — ``'cgs2'``
-        issues ``2 * max_iter`` collectives where the legacy ``'mgs'`` sweep
-        issues ``max_iter (max_iter + 1) / 2``, over the SAME basis window.
+        Reorthogonalisation route TOKEN; ``None`` selects ``'cgs2'``.  This
+        module reads no environment (see "WHERE THE DIAL IS READ"); the BSE
+        caller resolves ``LORRAX_LANCZOS_REORTH`` in
+        ``bse.bse_lanczos.reorth_route`` and passes the token here.
+        ``'cgs2'`` issues ``2 * max_iter`` collectives where the legacy
+        ``'mgs'`` sweep issues ``max_iter (max_iter + 1) / 2``, over the SAME
+        basis window.
 
     Returns
     -------
@@ -1194,7 +1252,10 @@ def block_lanczos_eig_jit(
         always projected out as well, at no collective cost -- see the route
         section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
         Default ``FULL_REORTH`` (-1) = the whole basis.
-        Default ``FULL_REORTH`` (-1) = the whole basis.
+    reorth : {'cgs2', 'mgs'} or None
+        Reorthogonalisation route TOKEN; ``None`` selects ``'cgs2'``.  Same
+        contract as :func:`lanczos_eig_jit` — this module reads no
+        environment; the caller resolves the dial and passes the token.
 
     Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
     space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
@@ -1230,39 +1291,9 @@ def block_lanczos_eig_jit(
     beta_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
 
     def body(j, carry):
-        Q_all, alpha_all, beta_all = carry
-        Q_j = Q_all[j]                                 # (n, bs)
-        # Block matvec over (bs, n) → (bs, n); transpose to (n, bs).
-        Z = matvec(Q_j.T).T                            # (n, bs)
-
-        alpha_j = jnp.conj(Q_j).T @ Z                  # (bs, bs)
-        alpha_all = alpha_all.at[j].set(alpha_j)
-        Z = Z - Q_j @ alpha_j
-
-        # Subtract Q_{j-1} · β_{j-1}^H (skip on j=0).
-        Q_jm1 = Q_all[jnp.maximum(j - 1, 0)]
-        beta_prev = beta_all[jnp.maximum(j - 1, 0)]
-        Z = jnp.where(j > 0, Z - Q_jm1 @ jnp.conj(beta_prev).T, Z)
-
-        # Partial reorth over the last n_reorth blocks.
-        if kind == "cgs2":
-            Z = _cgs2_block(
-                Q_all, Z, _reorth_window(j, int(max_iter) + 1, n_reorth))
-        else:
-            def reorth_body(i, Z_acc):
-                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
-                Q_i = Q_all[i]
-                proj = jnp.where(valid, jnp.conj(Q_i).T @ Z_acc, jnp.zeros((bs, bs), dtype=Z_acc.dtype))
-                return Z_acc - Q_i @ proj
-            start = jnp.maximum(0, j - n_reorth)
-            Z = lax.fori_loop(start, j + 1, reorth_body, Z)
-
-        # QR(Z) → next block + β_j.  Write to slot j+1 (always valid with the
-        # +1 buffer, 1..max_iter) — no clobber of the current Q_j.
-        Q_next, beta_j = jnp.linalg.qr(Z)              # (n, bs), (bs, bs)
-        beta_all = beta_all.at[j].set(beta_j)
-        Q_all = Q_all.at[j + 1].set(Q_next)
-        return (Q_all, alpha_all, beta_all)
+        return _block_lanczos_step(
+            j, *carry, matvec=matvec, kind=kind,
+            n_slots=int(max_iter) + 1, n_reorth=n_reorth, bs=bs)
 
     Q_all, alpha_all, beta_all = lax.fori_loop(
         0, int(max_iter), body, (Q_all, alpha_all, beta_all))
@@ -1317,6 +1348,9 @@ def block_lanczos_eig_jit_converged(
     the ``while_loop`` carry includes the running iteration count and
     the previous Ritz values for comparison.
 
+    ``n_reorth`` and ``reorth`` carry exactly the meanings
+    :func:`block_lanczos_eig_jit` documents.
+
     Returns (eigenvalues, eigenvectors, n_iter_done) — the third value
     is the actual block iteration count where the loop exited (≤
     ``max_iter``).
@@ -1348,32 +1382,9 @@ def block_lanczos_eig_jit_converged(
     converged = jnp.bool_(False)
 
     def step(j, Q_all, alpha_all, beta_all):
-        Q_j = Q_all[j]
-        Z = matvec(Q_j.T).T
-        alpha_j = jnp.conj(Q_j).T @ Z
-        alpha_all = alpha_all.at[j].set(alpha_j)
-        Z = Z - Q_j @ alpha_j
-        Q_jm1 = Q_all[jnp.maximum(j - 1, 0)]
-        beta_prev = beta_all[jnp.maximum(j - 1, 0)]
-        Z = jnp.where(j > 0, Z - Q_jm1 @ jnp.conj(beta_prev).T, Z)
-
-        if kind == "cgs2":
-            Z = _cgs2_block(Q_all, Z, _reorth_window(j, M + 1, n_reorth))
-        else:
-            def reorth_body(i, Z_acc):
-                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
-                Q_i = Q_all[i]
-                proj = jnp.where(
-                    valid, jnp.conj(Q_i).T @ Z_acc,
-                    jnp.zeros((bs, bs), dtype=Z_acc.dtype))
-                return Z_acc - Q_i @ proj
-            start = jnp.maximum(0, j - n_reorth)
-            Z = lax.fori_loop(start, j + 1, reorth_body, Z)
-
-        Q_next, beta_j = jnp.linalg.qr(Z)
-        beta_all = beta_all.at[j].set(beta_j)
-        Q_all = Q_all.at[j + 1].set(Q_next)
-        return Q_all, alpha_all, beta_all
+        return _block_lanczos_step(
+            j, Q_all, alpha_all, beta_all, matvec=matvec, kind=kind,
+            n_slots=M + 1, n_reorth=n_reorth, bs=bs)
 
     def cond(state):
         j, _, _, _, _, conv = state
@@ -1393,15 +1404,9 @@ def block_lanczos_eig_jit_converged(
 
         def _check_branch(args):
             alpha_all, beta_all, last_evals, j_done = args
-            T = _build_block_tridiag(alpha_all, beta_all, M, bs)
-            # Mask inactive (zero) part of T by adding a large constant
-            # to its diagonal — pushes inactive eigvals out of the
-            # spectrum so jnp.sort()[:n_eig] picks only real Ritz vals.
-            LARGE = jnp.asarray(1.0e6, dtype=T.real.dtype)
-            pos = jnp.arange(M * bs)
-            active = (j_done + 1) * bs                        # completed iters × bs
-            mask = (pos >= active).astype(T.real.dtype) * LARGE
-            T = T + jnp.diag(mask).astype(T.dtype)
+            T = _mask_inactive_tail(
+                _build_block_tridiag(alpha_all, beta_all, M, bs),
+                (j_done + 1) * bs)                            # completed iters × bs
             ev = jnp.linalg.eigvalsh(T)
             ev = jnp.sort(ev)[:n_eig]
             scale = jnp.maximum(jnp.abs(ev), atol)
@@ -1428,15 +1433,9 @@ def block_lanczos_eig_jit_converged(
     _emit_alpha_herm("block_lanczos_eig_jit_converged",
                      *_block_alpha_stats(alpha_all), form="block")
 
-    # Final eigh — mask inactive blocks the same way as the convergence
-    # check, otherwise the zero eigvals from unfilled iters dominate
-    # ``sort()[:n_eig]``.
-    T = _build_block_tridiag(alpha_all, beta_all, M, bs)
-    LARGE_F = jnp.asarray(1.0e6, dtype=T.real.dtype)
-    pos_F = jnp.arange(T_size)
-    active_F = j_final * bs
-    mask_F = (pos_F >= active_F).astype(T.real.dtype) * LARGE_F
-    T = T + jnp.diag(mask_F).astype(T.dtype)
+    # Final eigh — same inactive-tail mask as the convergence check.
+    T = _mask_inactive_tail(
+        _build_block_tridiag(alpha_all, beta_all, M, bs), j_final * bs)
     evals_T, vecs_T = jnp.linalg.eigh(T)
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]

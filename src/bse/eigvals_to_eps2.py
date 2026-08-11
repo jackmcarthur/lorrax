@@ -39,6 +39,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .absorption_common import lorentzian_broaden as lorentzian
+
 
 def read_bgw_eigvals(path):
     """Return (E_eV, |d|², V_super_bohr3, n_spin, n_spinor, n_eig_in_file)."""
@@ -53,12 +55,6 @@ def read_bgw_eigvals(path):
     E_eV = data[:, 0]
     f_S = data[:, 1]
     return E_eV, f_S, V_super, n_spin, n_spinor, n_eig
-
-
-def lorentzian(omegas, energies, weights, eta):
-    delta = omegas[:, None] - energies[None, :]
-    L = (eta / np.pi) / (delta ** 2 + eta ** 2)
-    return L @ weights
 
 
 def gaussian(omegas, energies, weights, eta):

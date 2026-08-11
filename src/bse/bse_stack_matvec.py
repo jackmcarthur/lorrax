@@ -154,16 +154,9 @@ from .bse_ring_comm import make_bse_shardings
 # and be running the baseline.  A perf dial that can be misspelled into a
 # no-op makes every A/B built on it void.
 #
-#   [densek REMOVED 2026-07-31 — owner directive, no exceptions.]  It replaced
-#           the k-space FFT pair with a dense (nk x nk) DFT contraction.  It
-#           was correct and measured 2.30x on the matvec, and that is exactly
-#           why it is gone: dense is O(nk^2) against the FFT's O(nk log nk),
-#           so it wins only because this deck has nk = 16 and it inverts at
-#           the thousand-k-point sizes LORRAX targets.  Do not reintroduce a
-#           DFT-as-GEMM path under any name or on any measurement.  If the
-#           k-transform is hot, fix the FFT (batching, an FFI handler, fewer
-#           dispatches) -- 331 ns per four-point transform is dispatch
-#           overhead, not arithmetic.
+#   [densek REMOVED 2026-07-31 — owner directive, no exceptions.  The ruling
+#           and the numbers behind it are stated once, at the site it governs:
+#           ``_conv_decode``'s "THIS IS AN FFT AND IT STAYS AN FFT".]
 #
 # The 'y'-axis collective hoist is PERMANENT (was ``yhoist``, made
 # unconditional 2026-08-08).  ``all_gather(X_b,'y')`` and the final

@@ -139,11 +139,10 @@ def solve_bse(
         include_W=include_W,
     )
 
-    matvec_block = partial(
-        lambda X: apply_bse_hamiltonian_single_device(
+    def matvec_block(X):
+        return apply_bse_hamiltonian_single_device(
             X, psi_c, psi_v, eps_c, eps_v, W_q, V_q0, nkx, nky, nkz, include_W
         )
-    )
 
     if use_block:
         eigenvalues, eigenvectors = block_lanczos_eig(
@@ -248,24 +247,6 @@ def solve_bse_sharded(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
         )
 
-    # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
-    # Why the sharded helper and not ``jnp.fft.ifftn``: a plain ifftn on a
-    # sharded tensor inserts a 337-MiB all-gather around the FFT under current
-    # JAX even when the transformed axes are unsharded.  The helper hides the
-    # transform in an opaque per-device primitive, so XLA only ever sees a local
-    # FFT (axes (2,3,4) of W_q are replicated; μ, ν stay on x, y).
-    # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
-    # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
-    # owned by the caller for the whole call and XLA has no same-shape OUTPUT
-    # to alias it to — the in-code note at the old ``_full_run`` decorator
-    # records exactly that ("donation was always declined").  The result was
-    # BOTH W_q and W_R resident for the entire Lanczos: 2 x (μ_pad/p_x) x
-    # (ν_pad/p_y) x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64;
-    # ∝ μ²/P, so 2 x 4.1 GB at μ=32k).  Hoisting the transform into its own
-    # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
-    # drop the Python reference, so only ONE copy survives into the solve.
-    # Value-identical: same helper, same axes, same norm, same operand.
-
     # ``auto`` is resolved to one of the two real routes HERE, before anything
     # else reads the flag, so every later branch sees only "bare" or "exact".
     if davidson_precond == "auto":
@@ -300,12 +281,26 @@ def solve_bse_sharded(
         data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
     _W_q0 = data.get("_W_q0_for_precond") if _need_W_q0 else None
 
+    # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
+    # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
+    # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
+    # owned by the caller for the whole call and XLA has no same-shape OUTPUT
+    # to alias it to ("donation was always declined").  The result was BOTH
+    # W_q and W_R resident for the entire Lanczos: 2 x (μ_pad/p_x) x
+    # (ν_pad/p_y) x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64;
+    # ∝ μ²/P, so 2 x 4.1 GB at μ=32k).  Hoisting the transform into its own
+    # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
+    # drop the Python reference, so only ONE copy survives into the solve.
+    # Value-identical: same helper, same axes, same norm, same operand.
     if include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
-            # 3-D cuFFT in one shot rather than three sequential rank-1
-            # custom_partitioning calls (the older ``make_jittable_local_ifftn_3d``).
-            # Same correctness constraint (the transformed axes are replicated);
-            # ~5-10x fewer transposes in the generated HLO.
+            # The sharded helper, not ``jnp.fft.ifftn``: a plain ifftn on a
+            # sharded tensor inserts a 337-MiB all-gather around the FFT under
+            # current JAX even when the transformed axes are unsharded.  The
+            # helper hides the transform in an opaque per-device primitive, so
+            # XLA only ever sees a local FFT (axes (2,3,4) of W_q are
+            # replicated; μ, ν stay on x, y), 3-D in one shot rather than three
+            # sequential rank-1 custom_partitioning calls.
             #
             # The transform and its donating jit come from the MEMOISED accessor,
             # not from a fresh ``make_sharded_ifftn_3d`` + ``jax.jit`` pair built

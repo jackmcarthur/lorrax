@@ -55,6 +55,7 @@ from common.fft_helpers import make_sharded_ifftn_3d
 from .absorption_common import (
     RYD2EV,
     build_dipole_vector_bse,
+    jdos_from_transitions,
     kramers_kronig_eps1,
     load_dipole_h5,
     slice_dipole_to_bse_window,
@@ -130,20 +131,6 @@ def absorption_from_haydock(
         g = 1.0 / (z - alphas[a, 0] - cf)
         eps2[:, a] = -pref * (norms[a] ** 2) * g.imag / np.pi
     return eps2
-
-
-def jdos_from_dipole(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry, n_spin, n_spinor):
-    """Independent-particle ε₂^0(ω) for the 4th column of absorption_*.dat."""
-    pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
-    de_flat = np.asarray(de_cv).flatten()
-    f_alpha = (np.abs(np.asarray(d_alpha)) ** 2).astype(np.float64)
-    jdos = np.zeros((omegas_Ry.size, 3), dtype=np.float64)
-    for a in range(3):
-        weights = f_alpha[a].flatten()
-        delta = omegas_Ry[:, None] - de_flat[None, :]
-        L = (eta_Ry / np.pi) / (delta * delta + eta_Ry * eta_Ry)
-        jdos[:, a] = pref * (L @ weights)
-    return jdos
 
 
 def run_haydock(
@@ -283,7 +270,7 @@ def run_haydock(
         omegas_Ry, eta_Ry, alphas, betas, norms,
         V_cell, nk, n_spin, n_spinor,
     )
-    jdos = jdos_from_dipole(
+    jdos = jdos_from_transitions(
         d_alpha, de_cv, omegas_Ry, V_cell, nk, eta_Ry, n_spin, n_spinor,
     )
     if no_eps1:

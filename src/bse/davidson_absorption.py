@@ -46,20 +46,8 @@ from .bse_io import (
 )
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
 from .bse_simple import build_bse_simple_matvec
+from common.collectives import gather_to_host
 from common.fft_helpers import make_sharded_ifftn_3d
-
-
-def _gather_to_host(arr):
-    """ONE gather (:func:`common.collectives.gather_to_host`).
-
-    Was a ``process_allgather(tiled=False)`` + squeeze-row-0 copy branching on
-    ``process_count()``; that raises on a process-spanning array, which is
-    what ``eigvecs`` (nc, nv, nk under the BSE mesh sharding) is at P>1.
-    """
-    if isinstance(arr, np.ndarray):
-        return arr
-    from common.collectives import gather_to_host
-    return gather_to_host(arr)
 
 
 def main(argv=None):
@@ -197,8 +185,8 @@ def main(argv=None):
     if rank0:
         print(f"[davidson_absorption] Davidson done in {time.time()-t0:.1f}s", flush=True)
 
-    eigvals_np = _gather_to_host(eigvals)
-    eigvecs_np = _gather_to_host(eigvecs)
+    eigvals_np = gather_to_host(eigvals)
+    eigvecs_np = gather_to_host(eigvecs)
 
     if not rank0:
         return
@@ -210,7 +198,7 @@ def main(argv=None):
     # Dipole projection on each eigvec.
     dipole_cart, deltaE, _ = load_dipole_h5(args.dipole)
     n_occ_for_slice = args.n_occ if args.n_occ is not None else resolve_n_occ(
-        np.asarray(_gather_to_host(eps_v)), input_file=args.input)
+        np.asarray(gather_to_host(eps_v)), input_file=args.input)
     d_alpha, _ = slice_dipole_to_bse_window(
         dipole_cart, deltaE, n_occ=n_occ_for_slice, n_val=nv_pad, n_cond=nc_pad)
     d_block = np.transpose(d_alpha, (0, 2, 3, 1))   # (3, nc, nv, nk)

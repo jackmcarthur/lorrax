@@ -26,6 +26,7 @@ import numpy as np
 from .absorption_common import (
     RYD2EV,
     exciton_dipole_projections,
+    jdos_from_transitions,
     kramers_kronig_eps1,
     load_dipole_h5,
     load_eigenvectors_h5,
@@ -85,15 +86,13 @@ def compute_eps2(
 
 
 def compute_jdos(d_alpha, de_cv, omegas_Ry, V_cell, eta_Ry, n_spin, n_spinor, n_k):
-    """Independent-particle ε₂^0(ω) (the "JDOS" column in BGW absorption_*.dat)."""
-    f_alpha = compute_jdos_oscillators(d_alpha)                # (3, nk, nc, nv)
-    pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
-    de_flat = de_cv.flatten()
-    jdos = np.zeros((omegas_Ry.size, 3), dtype=np.float64)
-    for a in range(3):
-        weights = f_alpha[a].flatten()
-        jdos[:, a] = pref * lorentzian_broaden(omegas_Ry, de_flat, weights, eta_Ry)
-    return jdos
+    """Independent-particle ε₂^0(ω) (the "JDOS" column in BGW absorption_*.dat).
+
+    Argument-order adapter over ``absorption_common.jdos_from_transitions``,
+    which is the single site.
+    """
+    return jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k,
+                                 eta_Ry, n_spin, n_spinor)
 
 
 def main(argv=None):

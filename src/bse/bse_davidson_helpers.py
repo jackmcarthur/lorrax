@@ -35,34 +35,12 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import gather_to_host
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Initial subspace: lowest (c, v, k) transitions + random tail
 # ═══════════════════════════════════════════════════════════════════════
-
-def _gather_to_host(arr) -> np.ndarray:
-    """Bring a (possibly multi-process) jax.Array to host as numpy.
-
-    Delegates to :func:`common.collectives.gather_to_host`.
-
-    WHAT THIS USED TO BE, AND WHY IT WAS WRONG.  It branched on
-    ``process_count() == 1`` and then called ``process_allgather(tiled=False)``,
-    which stacks each process's copy to ``(world, *shape)`` and needed a
-    ``host.ndim == len(shape)+1`` heuristic to squeeze row 0 back off.  That
-    round trip is correct only for a REPLICATED array; on a
-    process-SPANNING one ``tiled=False`` raises outright
-    ("Gathering global non-fully-addressable arrays only supports
-    tiled=True").  Its own caller feeds it exactly that: ``init_bse_subspace``
-    passes the loader's k-sharded ``eps_c``/``eps_v``.  The correct predicate
-    is ``is_fully_addressable``, not the process count — a single process can
-    still hold the whole array, and 16 processes can still each hold a shard
-    of one.  The service has that branch and the reasoning behind it.
-    """
-    if isinstance(arr, np.ndarray):
-        return arr
-    from common.collectives import gather_to_host
-    return gather_to_host(arr)
-
 
 def init_bse_subspace(
     eps_c,
@@ -112,8 +90,8 @@ def init_bse_subspace(
     V : (n_eig, nc, nv, nk) — unit-norm complex jax array, sharded if
         ``sharding`` was provided.
     """
-    eps_c_np = _gather_to_host(eps_c)
-    eps_v_np = _gather_to_host(eps_v)
+    eps_c_np = gather_to_host(eps_c)
+    eps_v_np = gather_to_host(eps_v)
     nk, nc = eps_c_np.shape
     _, nv = eps_v_np.shape
 

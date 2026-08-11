@@ -250,6 +250,31 @@ def lorentzian_broaden(omegas, energies, weights, eta):
     return L @ weights
 
 
+def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
+                          n_spin, n_spinor):
+    """Independent-particle ε₂⁰(ω) — the 4th column of BGW's absorption_*.dat.
+
+    THIS IS THE SINGLE SITE, for the same reason
+    :func:`exciton_dipole_projections` is: the two absorption drivers
+    (``absorption_eigvecs``, ``absorption_haydock``) each carried their own
+    copy of this formula with the arguments in a different order, and one of
+    them inlined the Lorentzian instead of calling
+    :func:`lorentzian_broaden`.
+
+    ``f^α_{cvk} = |d^α_{cvk}|²`` at transition energies ``ΔE_cv``, broadened
+    with the same prefactor ``16π²/(V·N_k·n_spin·n_spinor)`` the interacting
+    ε₂ uses.  Returns ``(n_omega, 3)``.
+    """
+    pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
+    de_flat = np.asarray(de_cv).flatten()
+    f_alpha = (np.abs(np.asarray(d_alpha)) ** 2).astype(np.float64)
+    jdos = np.zeros((np.asarray(omegas_Ry).size, 3), dtype=np.float64)
+    for a in range(3):
+        jdos[:, a] = pref * lorentzian_broaden(
+            omegas_Ry, de_flat, f_alpha[a].flatten(), eta_Ry)
+    return jdos
+
+
 def kramers_kronig_eps1(omegas, eps2):
     """Naive principal-value KK: ε₁(ω) = 1 + (2/π) P ∫ ω' ε₂(ω')/(ω'² - ω²) dω'.
 
@@ -357,6 +382,7 @@ __all__ = [
     "slice_dipole_to_bse_window",
     "build_dipole_vector_bse",
     "lorentzian_broaden",
+    "jdos_from_transitions",
     "kramers_kronig_eps1",
     "write_absorption_dat",
     "write_absorption_h5",
