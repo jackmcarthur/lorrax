@@ -283,6 +283,19 @@ payload's own rc is non-zero** — reporting 95 over a real traceback hides the
 defect underneath, which is precisely how §4 nearly went unnoticed. The
 measurements above are all from the repaired wrapper.
 
+**A third, and it is the one most worth carrying.** Issuing
+`ssh -O exit perlmutter` — which `AGENT_PREAMBLE`'s certificate row recommends
+— tore down this lane's login-node launchers, but **not** the Slurm steps they
+had started. The parent control's `lx batch` wrapper vanished, so no rc file
+and no summary ever appeared, while the step itself ran on to completion in
+976 s and wrote its full certification block. Reading "no rc file" as "the leg
+died", this lane relaunched it, and the duplicate then raced the original for
+the same `<logdir>/<id>.log`. **The banked log was checked rather than
+trusted**: it contains exactly one `refit-cert WORST` block, one Q#2 value and
+one step id (`lx-Xg1-010647`), so the numbers reported here come from a single
+clean 976 s run and not from two interleaved ones. Registered as SMALL_ISSUES
+row 41, with the rule that a relaunch must carry a distinct leg id.
+
 Separately, two legs died on the JAX coordination service
 (`ALREADY_EXISTS: request from a newer incarnation`) because two of this lane's
 own launchers put P=4 steps on one node in the same second. The coordinator

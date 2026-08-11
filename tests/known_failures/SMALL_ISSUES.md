@@ -527,21 +527,32 @@ silent overwrite.
     `/pscratch/sd/j/jackm/qsign_recut_0811/inleg.sh`.
     [qsign re-measurement lane, 2026-08-11]
 
-41. **`ssh -O exit perlmutter` KILLS every backgrounded launcher on the login
-    node, and `AGENT_PREAMBLE` recommends it without saying so.** The
+41. **`ssh -O exit perlmutter` kills every backgrounded LAUNCHER on the login
+    node but NOT the Slurm step it launched — which is worse than killing
+    both, and `AGENT_PREAMBLE` recommends the command without saying so.** The
     certificate row says "a working `ssh` is not evidence — `ControlPersist`
-    answers past expiry; re-probe with `ssh -O exit perlmutter`". That advice
-    is correct about certificates and expensive about work: tearing down the
+    answers past expiry; re-probe with `ssh -O exit perlmutter`". That is
+    correct about certificates and expensive about work: tearing down the
     ControlMaster tears down every multiplexed session with it, and `nohup
-    ... &` does **not** survive it. Measured here — a 14-minute `bse.exciton_bands`
-    control leg died mid-Lanczos with no rc file, and the Slurm allocation
-    stayed up with only `.extern` running, so `squeue` looked healthy while the
-    step was gone. **Two cheap mitigations, both used after the fact:** launch
-    with `setsid nohup ... < /dev/null &` so the launcher leaves the ssh
-    session's process group, and never issue `ssh -O exit` while any leg is in
-    flight — re-probe the certificate with a fresh `ssh -o ControlPath=none`
-    instead, which tests the credential without evicting anyone. Worth a line
-    in `AGENT_PREAMBLE`'s certificate row next time that file is edited.
+    ... &` does **not** survive it. What is left behind is a **half-observed
+    run**: the `lx batch` wrapper is gone, so no rc file, no `summary.json` and
+    no completion signal ever appear, while the `srun` step keeps running on
+    the compute node and finishes normally. Measured here — the wrapper for a
+    `bse.exciton_bands` control leg died at 01:19, `squeue --me -s` showed only
+    `.extern`, and the step nonetheless completed at 976 s and wrote its full
+    certification block to the log. **The trap is what that invites**: reading
+    "no rc file" as "the leg died" and relaunching, which is exactly what this
+    lane did — the duplicate then raced the original for the same
+    `<logdir>/<id>.log`. Only luck (the duplicate never placed before the
+    original finished) kept the evidence file coherent, and a `grep -c` for the
+    number of certification blocks in the log is what established that.
+    **Mitigations:** launch with `setsid nohup ... < /dev/null &` so the
+    launcher leaves the ssh session's process group; re-probe the certificate
+    with `ssh -o ControlPath=none` rather than evicting the master; and before
+    relaunching anything that "died", check the **log** and `sacct` for the
+    step, not just the rc file. Give a relaunch a distinct leg id so it cannot
+    overwrite the original's log. Worth a line in `AGENT_PREAMBLE`'s
+    certificate row next time that file is edited.
     [qsign re-measurement lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
