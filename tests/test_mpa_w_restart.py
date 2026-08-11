@@ -251,6 +251,44 @@ def test_a_store_swept_from_another_wfn_is_refused_by_name(bundle,
     assert str(wfn_b._filename) in msg
 
 
+def test_silence_on_either_side_is_not_a_mismatch(bundle, tmp_path,
+                                                  wfn_a):
+    """Only a store that CLAIMS a WFN can contradict a run that claims one.
+
+    Both directions have a real case and ``_same_wfn_file`` answers
+    False on an empty path, so without the guard each would be a false
+    refusal.  The STORE's side is the one that matters today: all seven
+    resumable W(z) stores on Perlmutter predate the stamp and carry
+    ``producer`` / ``route`` / ``source_store`` / ``why`` and no
+    ``wfn_file``, so refusing them would have made this seam's arrival
+    delete the fleet's resumable inventory.
+    """
+    # (i) the run cannot say — a caller holding a bundle it built.
+    d = w_restart.resolve_mpa_restart(
+        str(bundle["path"]), identity=w_restart.wfn_identity(_Wfn("")))
+    assert d.stage in (w_restart.STAGE_FIT, w_restart.STAGE_SIGMA)
+
+    # (ii) the store cannot say — a pre-stamp production store.
+    path = tmp_path / "prestamp.h5"
+    tables, verdict, n_mu = _geometry()
+    z = _protocol_grid(_N_P)
+    Omega, B = _planted_field(_N_P, _N_Q_IBZ, n_mu)
+    W = _synthesize_w(Omega, B, z)
+    MS.allocate_w_omega(
+        str(path), _W_NAME, n_omega=2 * _N_P, n_q_on_disk=_N_Q_IBZ,
+        n_mu=n_mu, tables=tables, omega=z, sampling=_SAMPLING,
+        omega_line=np.array([0] * _N_P + [1] * _N_P, dtype=np.int32),
+        closure_verdict=verdict, screening_content="W_c",
+        provenance={"producer": "probe-script", "route": "resolvent"})
+    for i in range(2 * _N_P):
+        MS.write_w_slab(str(path), _W_NAME, i, W[i], ready=True)
+    d2 = w_restart.resolve_mpa_restart(
+        str(path), identity=w_restart.wfn_identity(wfn_a))
+    assert d2.stage == w_restart.STAGE_FIT
+    assert "wfn=?" in w_restart.describe(d2), (
+        "a pre-stamp store must resume AND say it cannot name its WFN")
+
+
 def test_a_half_swept_store_is_refused_and_names_the_slab(tmp_path,
                                                           wfn_a):
     path = tmp_path / "half.h5"

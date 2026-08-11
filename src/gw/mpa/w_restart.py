@@ -403,12 +403,25 @@ def _refuse_a_foreign_wfn(prov, identity, *, path, name, context):
     if not identity:
         return
     stamped = str(prov.get("wfn_file", "") or "")
-    if not stamped:
+    mine = str(identity.get("wfn_file", "") or "")
+    # SILENCE ON EITHER SIDE IS "CANNOT PROVE ANYTHING", NOT "DIFFERENT",
+    # and both directions have a real case.  The store's side is the one
+    # that matters today: every W(z) store the campaign produced before
+    # this stamp existed carries ``producer`` / ``route`` /
+    # ``source_store`` / ``why`` and no ``wfn_file`` -- measured, all
+    # seven resumable ones on Perlmutter -- and refusing those would
+    # make this seam's arrival delete the fleet's resumable inventory.
+    # This run's side: ``wfn._filename`` is absent for a caller holding
+    # a bundle it built rather than loaded, and ``_same_wfn_file``
+    # answers False on an empty path, so without this line such a caller
+    # would be refused for a fact nobody asserted.  Only a store that
+    # CLAIMS a WFN can contradict a run that CLAIMS one.
+    if not stamped or not mine:
         return
     from gw.gw_init import _same_wfn_file
 
     same, why = _same_wfn_file(
-        stamped, str(identity.get("wfn_file", "") or ""),
+        stamped, mine,
         old_bytes=prov.get("wfn_bytes"),
         new_bytes=identity.get("wfn_bytes"))
     if not same:
