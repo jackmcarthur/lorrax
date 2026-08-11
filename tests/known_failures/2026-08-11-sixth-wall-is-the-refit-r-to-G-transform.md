@@ -227,7 +227,7 @@ Two things then stopped it, in order:
 1. **A GPU OOM after 60 off-grid Q**, `RESOURCE_EXHAUSTED … 15.41GiB` inside
    `refit_vq`'s `cq_and_x` — under the `platform` allocator the modulefile
    ships, which the startup banner itself flags as not the campaign default
-   (`SMALL_ISSUES` row 48). One bounded relaunch with
+   (`SMALL_ISSUES` row 49). One bounded relaunch with
    `XLA_PYTHON_CLIENT_ALLOCATOR=default` was made; the override is visible on
    the leg's own `lx run` line.
 2. **The relaunch never got a node.** A peer agent's one-GPU legs occupy all
