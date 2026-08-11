@@ -492,6 +492,69 @@ silent overwrite.
     the claim table it just read, so the next occurrence self-diagnoses.
     [batch lane report, 2026-08-10]
 
+39. **`vq_interp.refit_vq` cannot run at P>1 unless the basis size happens
+    to defeat sharding** — `src/bse/vq_interp.py:2778` does a bare
+    `jax.device_get(ztG_box[:, jnp.asarray(fi)])` on a globally sharded
+    array and dies with `RuntimeError: Fetching value for jax.Array that
+    spans non-addressable (non process local) devices`. It is the sibling
+    of the `refit_prepare` fix on `feat/xbands-bse-window-refit-2026-08-10`
+    (`_to_host`, not `device_get`) and was missed because **the failure
+    depends on n_μ parity**: the μ=191 child is odd, so `sharding_fit`
+    declines to shard it (`191 % 2 != 0` → replicated), the array is fully
+    addressable and the call accidentally works; the μ=960 parent is even,
+    shards for real, and the call fails. Every P=4 leg the refit path has
+    ever had was the odd-μ child arm, so the whole existing coverage is
+    blind to it by construction. Cost paid: this lane's parent control had
+    to be taken at P=1. Fix is one call site plus a cell that exercises
+    `refit_vq` at P>1 on an EVEN n_μ. Not physics — the P=1 arithmetic is
+    unaffected — but it blocks a four-GPU control, so it is not cosmetic.
+    [qsign re-measurement lane, 2026-08-11;
+    `/pscratch/sd/j/jackm/qsign_recut_0811/_logs/xb_ctl_parent.log`;
+    `tests/known_failures/2026-08-11-qsign-recut-verdicts.md` §4]
+
+40. **An in-leg mesh assert that knows only one driver's banner produces
+    FALSE REFUSALS** — the three drivers announce their shape in three
+    dialects (`exciton_bands`: `[dist] jax.device_count()=4 ...
+    mesh_xy.shape={...}`; `downfold_cli`: `mesh {'x': 2, 'y': 2} on 4
+    device(s), 4 process(es)`; `bse_jax`: `This is rank 0 of 4, and it
+    addresses 1 of the 4 devices`). A wrapper grepping for one of them
+    killed two `bse_jax` legs that had already **completed their physics**,
+    reporting exit 95 as if the shape were wrong. Two lessons worth
+    carrying, both cheap: parse all three dialects, and **never let a shape
+    assert overwrite a non-zero payload rc** — reporting 95 over a real
+    traceback hides the defect underneath, which is exactly how row 39
+    nearly went unnoticed. Reference implementation:
+    `/pscratch/sd/j/jackm/qsign_recut_0811/inleg.sh`.
+    [qsign re-measurement lane, 2026-08-11]
+
+41. **`ssh -O exit perlmutter` kills every backgrounded LAUNCHER on the login
+    node but NOT the Slurm step it launched — which is worse than killing
+    both, and `AGENT_PREAMBLE` recommends the command without saying so.** The
+    certificate row says "a working `ssh` is not evidence — `ControlPersist`
+    answers past expiry; re-probe with `ssh -O exit perlmutter`". That is
+    correct about certificates and expensive about work: tearing down the
+    ControlMaster tears down every multiplexed session with it, and `nohup
+    ... &` does **not** survive it. What is left behind is a **half-observed
+    run**: the `lx batch` wrapper is gone, so no rc file, no `summary.json` and
+    no completion signal ever appear, while the `srun` step keeps running on
+    the compute node and finishes normally. Measured here — the wrapper for a
+    `bse.exciton_bands` control leg died at 01:19, `squeue --me -s` showed only
+    `.extern`, and the step nonetheless completed at 976 s and wrote its full
+    certification block to the log. **The trap is what that invites**: reading
+    "no rc file" as "the leg died" and relaunching, which is exactly what this
+    lane did — the duplicate then raced the original for the same
+    `<logdir>/<id>.log`. Only luck (the duplicate never placed before the
+    original finished) kept the evidence file coherent, and a `grep -c` for the
+    number of certification blocks in the log is what established that.
+    **Mitigations:** launch with `setsid nohup ... < /dev/null &` so the
+    launcher leaves the ssh session's process group; re-probe the certificate
+    with `ssh -o ControlPath=none` rather than evicting the master; and before
+    relaunching anything that "died", check the **log** and `sacct` for the
+    step, not just the rc file. Give a relaunch a distinct leg id so it cannot
+    overwrite the original's log. Worth a line in `AGENT_PREAMBLE`'s
+    certificate row next time that file is edited.
+    [qsign re-measurement lane, 2026-08-11]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module

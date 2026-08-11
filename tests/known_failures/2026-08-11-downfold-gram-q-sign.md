@@ -415,3 +415,55 @@ child's tables `covariance_kappa_eff = 894486.8`, `covariance_tol =
 2.0311e-07`, `covariance_verdict = PASS`. Evidence
 `/pscratch/sd/j/jackm/covtol_0811/_logs/driver_p4.log`, bundle
 `child_covtol/tmp/isdf_tensors_168.h5`.
+---
+
+## CLOSED 2026-08-11 — rows 2 and 3 discharged, and the predictor is confirmed at 109x
+
+Owed rows 2 and 3 above were both taken by the re-measurement lane; the numbers
+are in `tests/known_failures/2026-08-11-qsign-recut-verdicts.md` and the
+evidence is `/pscratch/sd/j/jackm/qsign_recut_0811/`. Row 1, the `kappa_eff`
+tolerance, was closed by the amendment above this section (the
+`kappa**0.41` scaling), which merged separately; the two amendments
+crossed in flight, which is why this one still calls it open.
+
+**Row 2 — the comparison this poisons.** Re-taken. The orbit-floored-168 vs
+point-picked-185 verdict is unchanged in direction and stronger in margin, but
+the −348.6 meV became −42.6 meV and the FEAST non-convergence cleared entirely.
+The amendment is on
+`tests/known_failures/2026-08-10-downfold-orbit-economics-owner-row.md`.
+
+**Row 3 — the second deck, and the predictor this row named.** Confirmed, and
+more sharply than the row dared claim. Correlating `xbwin_0811`'s existing
+per-Q errors against **−q ≡ q** costs nothing and was done first: on the
+LEVEL of the errors the predictor does **not** separate the four Q cleanly —
+the two self-inverse Q are elevated 8–26x over the parent, which no q-sign
+story explains — but on the **ORDERING** it separates completely. The mean rank
+shift between the parent's per-Q ordering and the child's was **0.50 for the
+self-inverse Q against 2.50 for the non-self-inverse Q**: Σ went parent-best to
+child-worst (4→1) and W went parent-worst to child-3rd (1→3), while L stayed at
+2 and X moved only 3→4. **The rearrangement this row flagged as the signature
+was carried entirely by the q the defect could act on**, and the residual
+elevation at the self-inverse Q is the child's own basis truncation
+(μ 191 against 960), not a wrap phase.
+
+Re-running the certification on a fixed child then arbitrated it outright:
+
+| Q | −q ≡ q | before (P=4) | after (P=4) | factor |
+|---|---|---|---|---|
+| X (0, ½, ½) | **yes** | 1.07403 | 0.40475 | 2.7x |
+| (¼, ¾, ½) | no | 1.27721 | 0.22834 | 5.6x |
+| L (½, ½, ½) | **yes** | 3.05016 | 2.59335 | 1.2x |
+| Σ (¼, ½, ¼) | no | **6.81943** | 0.01654 | **412x** |
+
+Mean improvement **1.9x at the self-inverse Q against 209x at the rest — a
+109-fold separation on the predictor** — and the worst point moved from Σ to L,
+which is self-inverse and was therefore never corrupted. Σ, this row's named
+suspect, fell to within a factor of two of the 0.01 meV gate itself. **The
+predictor was right and the umklapp wrap count was not needed.**
+
+The certification still fails, at 2.593 meV against 0.01 meV, and that residue
+is the windowed-ζ' representability error of the refit route — visible on the
+un-downfolded parent at 0.858 meV, where there is no downfold to blame. That is
+a different, already-registered question
+(`2026-08-10-exciton-bands-offgrid-Q-is-slab-only.md`), and the dense exciton
+band plots stay OWED behind it.
