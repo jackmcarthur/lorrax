@@ -1408,6 +1408,11 @@ def main(argv=None):
     # D3h-orbit-closure cascade), which ``vq_interp`` refuses.  Cost: the full
     # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
     ongrid = (args.vq_mode == "ongrid")
+    # ``refit`` used to refuse ("not wired") and to be unusable anyway: its
+    # kernel was the slab one.  Since 2026-08-10 it is the exact arbitrary-Q
+    # exchange on a bulk deck — the ONLY one, because the interpolation model
+    # is slab-only — and it is what a dense Q path on a 3-D crystal runs.
+    pure_refit = (args.vq_mode == "refit")
     kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
     # WHICH GRID INDEXES THE EXCHANGE TILES.  Normally the bundle's own.  After
     # a ``bse_k_grid`` coarse→fine densification the bundle's grid is the FINE
@@ -1462,14 +1467,51 @@ def main(argv=None):
                     else bool(params.get("head_minibz_average", False)))
         log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
             f"(head_minibz_average={head_mbz})")
-        require_zeta_for_interp(restart_file, args.vq_mode, (nkx, nky, nkz))
-        vqm = vq_interp.build_vq_evaluator(
-            restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
-            eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
-            head_minibz_average=head_mbz, log_fn=log)
-        zx, prep = vqm.zx, vqm.prep
-        eval_vq, pinvF, coeffs_packed = vqm.eval_vq, vqm.pinvF, vqm.coeffs_packed
+        zeta_path = require_zeta_for_interp(restart_file, args.vq_mode,
+                                            (nkx, nky, nkz))
+        if pure_refit:
+            # NO interpolation model is built at all.  The b26p long-range fit
+            # is the slab-only half of vq_interp; the refit path fits ζ at the
+            # target Q from the htransform ψ and contracts it with the
+            # producer's own Coulomb door.  So this branch loads ζ and stops.
+            zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
+                                            mesh=mesh_xy, log_fn=log,
+                                            require_slab=False)
+            prep = eval_vq = pinvF = coeffs_packed = None
+            if head_mbz:
+                raise SystemExit(
+                    "exciton_bands: --head-minibz-average needs the "
+                    "interpolation model's long-range pieces (minibz_head_vlr "
+                    "reads prep), which --vq-mode=refit does not build.  The "
+                    "refit keeps the full v(Q+G) including G=0 at every Q, "
+                    "which is the pointwise head this flag would replace.")
+        else:
+            vqm = vq_interp.build_vq_evaluator(
+                restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
+                eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
+                head_minibz_average=head_mbz, log_fn=log)
+            zx, prep = vqm.zx, vqm.prep
+            eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
+                                             vqm.coeffs_packed)
     tick("vq_prepare", t0)
+
+    # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
+    rst = None
+    if pure_refit:
+        t0 = time.time()
+        rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
+                                      r_chunk=args.refit_r_chunk, log_fn=log,
+                                      policy=zx.get("policy"),
+                                      keep_idx=keep_idx)
+        if V_ongrid is None:
+            raise SystemExit(
+                "exciton_bands: --vq-mode=refit certifies itself against the "
+                "stored V_qmunu at on-grid q and this bundle carries none, so "
+                "there is nothing to check the off-grid tiles against.  Load a "
+                "bundle with the exchange tensor, or use --vq-mode=ongrid.")
+        vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
+                                    log_fn=log)
+        tick("refit_prepare_and_null", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
 
@@ -1500,6 +1542,15 @@ def main(argv=None):
                 jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
             n_eval_calls += 1
             continue
+        if pure_refit:
+            V_np = vq_interp.refit_vq(zx, rst, q_tile_np, mesh_xy, log_fn=log)
+            V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
+            V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
+                                           + V_np[:n_rmu, :n_rmu].conj().T)
+            from common.collectives import device_put_process_local
+            V_rows.append(device_put_process_local(V_pad, grid_xy))
+            n_eval_calls += 1
+            continue
         q_tile = jnp.asarray(q_tile_np)
         if head_mbz:
             gstar, head_val, M_ab = vq_interp.minibz_head_vlr(
@@ -1518,9 +1569,10 @@ def main(argv=None):
             V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
                                              coeffs_packed)))
         n_eval_calls += 1
-    if args.vq_mode == "refit":
-        raise SystemExit("--vq-mode=refit alone is not wired; use "
-                         "--vq-mode=both (interp path + refit spot checks)")
+    if pure_refit:
+        log(f"  exchange: per-Q ζ REFIT at all {n_eval_calls} finite Q "
+            f"(compute-don't-interpolate; Γ keeps the production q=0 tile), "
+            f"certified against the stored V_qmunu by the on-grid null above")
     refit_idx = []
     if args.vq_mode == "both":
         if args.refit_points:
@@ -1530,7 +1582,9 @@ def main(argv=None):
             refit_idx = sorted({int(i) for i in
                                 np.linspace(1, nQ - 2, 5).round()})
         rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
-                                      r_chunk=args.refit_r_chunk)
+                                      r_chunk=args.refit_r_chunk,
+                                      policy=zx.get("policy"),
+                                      keep_idx=keep_idx)
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
