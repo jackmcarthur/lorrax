@@ -519,7 +519,10 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
     Omitting it is legal and pins the gate at the 1e-9 floor, which the
     verdict line then says out loud.
 
-    Returns ``(child_perm, child_L, slots, worst_rel)``.
+    Returns ``(child_perm, child_L, slots, worst_rel, kappa_max, tol)`` — the
+    residual, the conditioning it was taken at and the tolerance it was
+    judged against, because after this ruling the residual alone is not a
+    verdict and storing it alone would not be provenance.
     """
     from ffi import _services
     _services.ensure_on_path()

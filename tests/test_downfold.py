@@ -1562,8 +1562,10 @@ def _qirr_child_through_the_shipping_gate(mesh, *, q_sign_break):
         # the q axis run backwards, which is what the kernel returned
         neg = downfold.negate_q_index((QIRR_NQ_FULL, 1, 1))
         assert np.array_equal(neg[neg], np.arange(QIRR_NQ_FULL))
-        assert 0 < int(np.sum(neg != np.arange(QIRR_NQ_FULL))) < QIRR_NQ_FULL,\
-            "the relabel must move SOME q and fix others, as it does on a deck"
+        n_moved = int(np.sum(neg != np.arange(QIRR_NQ_FULL)))
+        assert 0 < n_moved < QIRR_NQ_FULL, (
+            "the relabel must move SOME q and fix others, as it does on a "
+            "deck — that partial shape is what named the mechanism")
         S_SS, S_cross = S_SS[neg], S_cross[neg]
 
     munu = NamedSharding(mesh, P(None, "x", "y"))
