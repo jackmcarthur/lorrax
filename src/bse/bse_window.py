@@ -3,12 +3,14 @@
 AUTHORITY RULE — the window a run SOLVED is the window everything downstream
 names.  A caller asks for ``n_val``/``n_cond``; this module turns that request
 into a real band range, and every number that leaves it is post-clamp and
-post-snap.  ``resolve_n_occ`` settles where the gap is, the band-degeneracy
-guard may widen the request so that a boundary never cuts a degenerate
-multiplet, and ``apply_eqp_and_reslice_bands`` re-asks both questions on the
-quasiparticle spectrum when ``--eqp`` moved the energies.  Nothing else in the
-BSE is allowed to re-derive a window from an array's shape: the shapes carry
-the mesh PAD, not the bands.
+post-guard.  ``resolve_n_occ`` settles where the gap is; the band-degeneracy
+guard keeps a window boundary from cutting a degenerate multiplet — under the
+default ``--band-degeneracy strict`` it REFUSES such a window, and only the
+explicit ``snap`` opt-in widens the request outward
+(:mod:`common.band_degeneracy`); and ``apply_eqp_and_reslice_bands`` re-asks
+both questions on the quasiparticle spectrum when ``--eqp`` moved the
+energies.  Nothing else in the BSE is allowed to re-derive a window from an
+array's shape: the shapes carry the mesh PAD, not the bands.
 
 That is the second half of what lives here.  The band axes are rounded up to a
 mesh multiple, and the pad is not inert — ``H_BSE``'s diagonal is a difference
@@ -85,30 +87,20 @@ def _log0(*a, **k):
 #     any physical window, so the padded modes are dropped BY COUNT
 #     (n_cond_pad·n_val_pad − n_cond·n_val per k) and never by value.
 #
-# Value: 1e3 Ry ≈ 13.6 keV.  This is the constant the exciton-bands driver
-# already shipped (it was defined there, and that driver ALSO carried a
-# hand-rolled repair of this loader's zero ε_v pad — the repair is now an
-# assertion that the loader did it).
+# FINITE, and that is the constraint on the value.  These pad energies are
+# KEPT: they are stored in the bundle as ``data['eps_c']``/``['eps_v']``,
+# handed to every driver, and ``bse_preconditioner`` builds exactly a
+# resolvent out of them, 1/(ΔE − λ + ε_shift).  So an absurd value is not
+# free here the way it is on a pad that never leaves the function writing
+# it (``psp/dft_operators.py`` uses 1e10 on ``T_diag``, an argsort basis
+# for a selection); ``common/wfn_transforms.get_enk_bandrange`` pads band
+# energies that DO flow downstream and gives this same reason for its
+# finite ``max(real ε) + 1 Ry``.
 #
-# FINITE, and that is the point.  The tree has two sentinel families and
-# they are chosen on whether the pad SURVIVES the function that writes it:
-#
-#   * ``psp/dft_operators.py`` uses 1e10 on ``T_diag`` — a preconditioner
-#     diagonal and an argsort basis for a selection.  The pad entries do
-#     not leave; an absurd value is free.
-#   * ``common/wfn_transforms.py:1644-1651`` pads band ENERGIES with
-#     ``max(real ε) + 1 Ry`` and its comment says why it is not ∞:
-#     "keeps PPM resolvent arithmetic 1/(ω − e + iη) safe under fp
-#     warnings".  Those pad energies are KEPT and flow downstream.
-#
-# The BSE ε pad is the SECOND family, unambiguously: it is stored in the
-# bundle as ``data['eps_c']``/``['eps_v']`` and handed to every driver,
-# and ``bse_preconditioner`` builds exactly a resolvent from it,
-# 1/(ΔE − λ + ε_shift).  So the sentinel must stay finite and in scale.
-# 1e3 Ry is seven orders above the widest QP window this code will ever
-# see, keeps the float32 KPM leg's ΔE well inside single precision, and
-# matching the in-tree BSE value means the loader now AGREES with the one
-# BSE driver that had this right rather than moving its numbers.
+# 1e3 Ry ≈ 13.6 keV is seven orders above the widest QP window this code
+# will ever see and keeps the float32 KPM leg's ΔE well inside single
+# precision.  ``exciton_bands`` asserts the ε_v pad is below
+# ``-0.5 * PAD_EPS_GUARD_RY``, i.e. that the loader signed it at all.
 PAD_EPS_GUARD_RY = 1.0e3
 
 
@@ -176,21 +168,20 @@ def write_eigenvectors_stream(
     use_tda: bool = True,
 ) -> None:
     # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
-    # The LOGICAL, POST-SNAP one.  ``n_val``/``n_cond`` become BGW's ``nv``/
-    # ``nc`` header fields, and ``absorption_eigvecs`` slices ``dipole.h5``
-    # with exactly those against ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and
-    # ``[n_occ, n_occ + nc)``.  So they have to name REAL bands, which means
-    # the counts the loader RESOLVED (``data['n_val']`` / ``data['n_cond']``),
-    # after ``--band-degeneracy`` widened them at a cut multiplet.
+    # The LOGICAL one the loader RESOLVED (``data['n_val']``/``data['n_cond']``).
+    # These become BGW's ``nv``/``nc`` header fields, and
+    # ``absorption_eigvecs`` slices ``dipole.h5`` with exactly those against
+    # ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and ``[n_occ, n_occ + nc)`` —
+    # so they have to name REAL bands.
     #
     # Two other numbers get mistaken for them and neither belongs in the file:
     #
-    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-snap.  This
-    #     was the caller-side defect: ``bse_jax._preview_lanczos`` passed the
-    #     request, so on any snapping deck (Si ``--n-cond 4`` snaps to 8) the
-    #     dataset was created at the requested ``nc`` and the write of the
-    #     real component died with ``TypeError: Can't broadcast``, leaving a
-    #     truncated ``eigenvectors.h5`` behind — worse than writing none.
+    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-guard and so
+    #     can be NARROWER than what was solved whenever ``--band-degeneracy
+    #     snap`` widened it (on the Si deck ``--n-cond 4`` becomes 8).
+    #     Declaring the request created the dataset at the wrong ``nc`` and
+    #     the write died part-way, leaving a truncated ``eigenvectors.h5``
+    #     behind — worse than writing none.
     #
     #   * the mesh-rounded PAD extents ``n_cond_pad``/``n_val_pad``, which is
     #     what the incoming array is actually shaped by.  Those are not bands:
@@ -200,30 +191,26 @@ def write_eigenvectors_stream(
     #     no matching entry for.  They are dropped BY COUNT here, the same
     #     spelling as ``pad_zone_mask_np`` — never by thresholding a value.
     #
-    # Hence: the caller declares the logical counts, and this writer TRIMS the
-    # component to them (see ``_to_bgw``).  A writer that instead trusted the
-    # array's own shape would silently re-export the pad.
+    # So the caller declares the logical counts and this writer TRIMS to them
+    # (see ``_to_bgw``); trusting the array's own shape would re-export the pad.
     #
     # AND THE TRIM IS CHECKED, because the two reasons an incoming component is
     # WIDER than the declared window need opposite treatment and cannot be told
-    # apart by shape: mesh pad must be dropped, a stale pre-snap count must be
+    # apart by shape: mesh pad must be dropped, a stale pre-guard count must be
     # REFUSED (the bands it drops are real and carry weight).  What separates
     # them is a value, and it separates them exactly: the pad block is
     # decoupled by construction and its amplitudes are EXACT zero, so a
-    # discarded block with any weight in it is not pad.  Trading the old loud
-    # ``Can't broadcast`` for a silent truncation would be a worse bug than the
-    # one being fixed.
+    # discarded block with any weight in it is not pad.  A silent truncation
+    # here would be a worse bug than the loud broadcast error it replaced.
     #
-    # ``use_tda`` is written HONESTLY (was hardcoded 1).  TDA eigenvectors arrive
-    # as ``(n_write, 1, nc, nv, nk)`` (resonant X only); full-BSE (non-TDA) as
-    # ``(n_write, 2, nc, nv, nk)`` = the paired (X, Y) with X^H X - Y^H Y = +1.
-    # For non-TDA the resonant X is written to ``eigenvectors`` (so the
-    # sum-over-states absorption reads the dominant part) and the coupling Y to a
-    # sibling ``eigenvectors_coupling`` dataset (both components persisted).
-    # BGW eigenvectors.h5 stores eigenvalues in eV (header text in
-    # ``eigenvalues.dat`` says "eig (eV)"; matches BGW's BSE/diag.f90
-    # write path).  Our solvers return Ry — convert here so a downstream
-    # consumer using BGW conventions reads the right number.
+    # TDA eigenvectors arrive as ``(n_write, 1, nc, nv, nk)`` (resonant X
+    # only); full-BSE (non-TDA) as ``(n_write, 2, nc, nv, nk)`` = the paired
+    # (X, Y) with X^H X - Y^H Y = +1.  For non-TDA the resonant X is written
+    # to ``eigenvectors`` (so the sum-over-states absorption reads the
+    # dominant part) and the coupling Y to a sibling ``eigenvectors_coupling``
+    # dataset, so both components are persisted.  BGW eigenvectors.h5 stores
+    # eigenvalues in eV (BSE/diag.f90's write path; ``eigenvalues.dat``'s
+    # header says "eig (eV)") and our solvers return Ry — convert here.
     RYD2EV = 13.6056980659
     # ``gather_to_host``, not ``device_get``: see the ONE-writer note below for
     # why this writer must not assume any particular solver's sharding.  On the
@@ -241,8 +228,8 @@ def write_eigenvectors_stream(
             f"write_eigenvectors_stream: declared window n_cond={n_cond} "
             f"n_val={n_val} does not fit the eigenvectors' (nc, nv) = "
             f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
-            f"(data['n_cond'] / data['n_val']), not the CLI request — the "
-            f"band-degeneracy guard may have widened the window.")
+            f"(data['n_cond'] / data['n_val']), not the CLI request — under "
+            f"--band-degeneracy snap the resolved window is the wider one.")
     kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -286,8 +273,8 @@ def write_eigenvectors_stream(
                     f"{w_kept:.3e}.  The mesh pad is exactly zero, so this is "
                     f"not pad: the declared window is narrower than the one "
                     f"that was solved.  Pass the LOADER's resolved counts "
-                    f"(data['n_cond'] / data['n_val']) — the band-degeneracy "
-                    f"guard widens the CLI request.")
+                    f"(data['n_cond'] / data['n_val']) — under "
+                    f"--band-degeneracy snap they exceed the CLI request.")
         c = np.transpose(kept, (2, 0, 1))[:, :, ::-1][..., None]
         return c.real, c.imag
 
@@ -308,31 +295,24 @@ def write_eigenvectors_stream(
             _to_bgw(_v0[1], "0 (coupling Y)")
 
     # ── ONE writer ────────────────────────────────────────────────────────
-    # Every rank used to reach the ``h5py.File(output_file, "w")`` below on the
-    # same shared path.  MEASURED at P=64 / N_mu=10015 (job 7879470, leg
-    # m24x64): the solve finishes and prints its eigenvalues, then the ranks
-    # race each other truncating one file and the step exits rc=1 with
-    #     OSError: Unable to synchronously create file (file signature not found)
-    #     OSError: ... (truncated file: eof = 96, ..., stored_eof = 2048)
-    # leaving an eigenvectors.h5 written by whichever rank won.  That is
-    # QUALITY_PATTERNS #7 ("P ranks overwrote one output file") in production.
+    # Only rank 0 may open ``output_file``.  MEASURED at P=64 / N_mu=10015
+    # (job 7879470, leg m24x64) when every rank reached the ``h5py.File(...,
+    # "w")`` below on one shared path: the ranks race each other truncating
+    # it and the step exits rc=1 with "Unable to synchronously create file
+    # (file signature not found)" — QUALITY_PATTERNS #7 in production.
     #
-    # WHY ``gather_to_host`` AND NOT ``jax.device_get``.  This comment used to
-    # read "``solve_bse_sharded`` pins ``out_shardings=(rep_eig, rep_eig,
-    # rep_eig)`` … so eigenvalues/eigenvectors are REPLICATED", and took that as
-    # licence to fetch with a bare ``device_get``.  That is true of the Lanczos
-    # routes and FALSE of the ``--solver davidson`` route, which returns ``X``
-    # on the solve sharding ``P(None,"x","y",None)``; ``--solver davidson
-    # --write-eigs`` therefore died on every rank at P>1 with "Fetching value
-    # for `jax.Array` that spans non-addressable (non process local) devices".
-    # ``bse_lanczos`` now pins the Davidson branch to the same replicated
-    # convention (that is the root-cause half of the fix), but a WRITER must not
-    # depend on a solver's layout to be correct: any future solver, or any
-    # caller that hands this function a solve-sharded array directly, would
-    # resurrect the same crash.  ``common.collectives.gather_to_host`` answers
-    # "does this process hold all of it?" instead of assuming, and its arms
-    # degrade to exactly the ``device_get`` that was here before whenever the
-    # array is replicated or single-process — so the 1-GPU path is unchanged.
+    # WHY ``gather_to_host`` AND NOT ``jax.device_get``.  A writer must not
+    # depend on a solver's layout to be correct.  Replication holds on the
+    # Lanczos routes but NOT on ``--solver davidson``, which returns ``X`` on
+    # the solve sharding ``P(None,"x","y",None)``; a bare ``device_get`` died
+    # there on every rank at P>1 with "Fetching value for `jax.Array` that
+    # spans non-addressable (non process local) devices".  ``bse_lanczos``
+    # now pins Davidson to the replicated convention too, but any future
+    # solver — or any caller handing this function a solve-sharded array —
+    # would resurrect the crash.  ``common.collectives.gather_to_host`` asks
+    # "does this process hold all of it?" instead of assuming, and degrades
+    # to exactly ``device_get`` when the array is replicated or
+    # single-process, so the 1-GPU path is unchanged.
     #
     # The fetches stay UNGATED on both branches on purpose: ``eigenvectors[i]``
     # slices a GLOBAL array, which dispatches an XLA computation every process
@@ -428,8 +408,8 @@ def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int,
     # Return the PADDED extent (size + pad), not the pre-pad size: every
     # consumer binds this to n_val_pad/n_cond_pad and relies on it being the
     # mesh-rounded value (e.g. bse_ring_comm's `n_cond_pad % px == 0` guard).
-    # Previously wrong only when the band count was not already a mesh
-    # multiple — invisible on all mesh-divisible validated runs.
+    # The two differ only when the band count is not already a mesh multiple,
+    # so getting it wrong is invisible on every mesh-divisible deck.
     #
     # NOTE the opposite convention to ``runtime.padding.pad_axis_to``,
     # which returns the LOGICAL extent (n_orig) from the same position.
@@ -523,11 +503,11 @@ def resolve_n_occ(
       3. **``mean_enk < fermi_energy``** if ``fermi_energy`` is explicitly
          passed (Ry). Caller's responsibility to pass a sane reference.
 
-    Raises ``ValueError`` if none of the above resolves. The previous
-    "auto-detect" heuristic (``mean_enk < 0`` or "largest gap") was
-    silently broken for systems whose pseudopotential reference puts the
-    valence well above zero (most QE setups, e.g. Si): it returned only
-    the deepest semicore states. We now require an explicit source.
+    Raises ``ValueError`` if none of the above resolves — there is
+    deliberately no zero-argument auto-detect.  Guessing from the spectrum
+    alone (``mean_enk < 0``, or the largest gap) is silently wrong wherever
+    the pseudopotential reference puts the valence above zero, which is most
+    QE setups including Si: it returns only the deepest semicore states.
 
     Parameters
     ----------
@@ -629,14 +609,11 @@ def apply_eqp_corrections(
                     if not np.isnan(e_qp_ibz[best_ibz, ib]):
                         enk_qp[ik_full, ib] = e_qp_ibz[best_ibz, ib] / ry_to_ev
 
-        # ``matched`` used to be written and never read: a k-point whose DFT
-        # energies did not match any IBZ block within ``tol_ev`` simply kept
-        # its DFT energies, and the run continued as if it were a QP
-        # calculation.  That is a silent mean-field/quasiparticle mix -- the
-        # exact class of error that makes a cross-code comparison stop being
-        # apples-to-apples without anything in the log saying so.  On Si the
-        # DFT->QP shift is ~0.6 eV, so a single unmatched k-point moves the
-        # excitons it carries by hundreds of meV.  Fail instead.
+        # EVERY k-point must match, or the run is a silent mean-field /
+        # quasiparticle mix: an unmatched k-point keeps its DFT energies
+        # inside what the caller believes is a QP calculation, with nothing
+        # in the log to say so.  On Si the DFT->QP shift is ~0.6 eV, so one
+        # unmatched k-point moves the excitons it carries by hundreds of meV.
         if not matched.all():
             bad = np.flatnonzero(~matched)
             raise ValueError(

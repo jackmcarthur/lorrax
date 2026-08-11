@@ -44,22 +44,21 @@ def _parse_head_overrides(input_file: Optional[str]):
 
     These are the SAME two deck keys the GW side reads
     (``gw_config.HeadConfig.vhead`` / ``.whead_0freq``), so this reader
-    holds itself to the GW reader's parsing contract.  Two rules follow
-    from that, and both are corrections made 2026-08-09:
+    holds itself to the GW reader's parsing contract: the two sides agree
+    on any deck or neither does, which
+    ``tests/test_bse_head_override.py`` asserts against ``gw_config``'s
+    own reader deck by deck.  Two rules follow:
 
     * **Inline comments are stripped**, because ``gw_config`` builds its
-      ``ConfigParser`` with ``inline_comment_prefixes=('#',)`` (see the
-      note at ``gw_config.py``: "the latter silently voided flags — a
-      real footgun").  A deck line written ``vhead = 3303.748102  # BGW``
-      previously overrode the GW side and was silently dropped here: the
-      deck asked for BerkeleyGW's head, Σ got it, and the BSE quietly
-      used the restart's own value instead.  The two sides now agree on
-      any deck, or neither does.
-    * **A malformed value refuses** instead of falling back to the
-      restart.  A head override that silently does nothing is precisely
-      the failure mode this feature exists to rule out — it is a
-      validation knob, and a validation knob that no-ops without a word
-      is worse than no knob at all.
+      ``ConfigParser`` with ``inline_comment_prefixes=('#',)``.  A deck
+      line written ``vhead = 3303.748102  # BGW`` would otherwise pin Σ's
+      head and not the BSE's — one run screening with two q=0 heads.
+    * **A malformed value refuses**, naming the file, line and key,
+      rather than falling back to the restart.  A validation knob that
+      no-ops without a word is worse than no knob at all.  That refusal
+      is also why this reader is not simply ``read_lorrax_input``, whose
+      ValueError names neither the key nor the line
+      (``tests/known_failures/2026-08-11-bse-head-deck-reader-duplication.md``).
     """
     if input_file is None or not os.path.isfile(input_file):
         return None, None
@@ -156,21 +155,11 @@ def _inject_q0_head(
 ):
     """Inject the rank-1 q=0 head, with ``whead`` gated on ``w0_ready``.
 
-    ``(V_q0, W_q, log_fragment)``.  One authoritative spelling of the head
-    injection for both restart loaders: the sharded one
-    (:func:`load_bse_data_from_restart_sharded`) and the single-device
-    full-file one (:func:`_load_ring_subset`).
-
-    THE GATE IS THE POINT.  ``vhead`` belongs on ``V_q0`` unconditionally —
-    ``compute_vcoul`` zeroes ``v(G=G'=0)`` at q=0 before the Dyson solve and
-    this reinstates the mini-BZ-averaged head that was removed, so the tile
-    is bare Coulomb either way.  ``whead`` is the head of the SCREENED
-    interaction, and both loaders fall back to bare ``V`` for ``W`` when the
-    restart carries no ready ``W0_qmunu``.  Adding a screened head to an
-    unscreened tile is not a smaller error than the fallback it rides on: it
-    is a different, silent one, on a tile the caller has already been warned
-    is not physical.  So ``w0_ready`` False means the W tile is returned
-    exactly as it was read, and the log says ``whead=skipped``.
+    One authoritative spelling of the head injection for both restart
+    loaders: the sharded one (:func:`load_bse_data_from_restart_sharded`)
+    and the single-device full-file one (:func:`_load_ring_subset`).  The
+    module docstring states why the gate is here and why ``defer_whead`` is
+    kept distinct from it.
 
     Passing ``W_q=None`` into the injector (rather than dropping the returned
     array) is what makes the skip total: the helper then computes no ``w``
@@ -193,6 +182,8 @@ def _inject_q0_head(
         As resolved by :func:`_resolve_head_params` — Ry and Bohr³.
     w0_ready : bool
         Did a real screened ``W0`` load, or is ``W_q`` the bare-V fallback?
+        False returns the W tile exactly as it was read and logs
+        ``whead=skipped``.
     defer_whead : bool
         A coarse→fine densification is pending and will re-attach W's head
         itself, per fine q (C1, :mod:`gw.head_densify`).  The W tile must then
@@ -200,16 +191,11 @@ def _inject_q0_head(
         densifier does to a Kronecker-delta head is exactly the defect C1
         exists to remove — so the head is not added here and
         :func:`_interpolate_bse_data_to_grid` adds the fine-grid one instead.
-
-        DEFERRAL IS NOT THE ``w0_ready`` GATE and must not be spelled as one.
-        ``w0_ready = False`` means "this W is bare V, a screened head does not
-        belong on it at all"; deferral means "the head belongs on it, just not
-        yet, and not as a delta".  Passing ``w0_ready=False`` to get the skip
-        would put the wrong reason in the log on a tile that is perfectly
-        screened, and would make the two conditions indistinguishable to the
-        next reader.  ``vhead`` is unaffected either way: the q=0 exchange
-        tile is carried through the densifier unchanged (it is k-grid
-        invariant), so its head is injected here as always.
+        Do NOT spell this as ``w0_ready=False``: that would put the wrong
+        reason in the log on a perfectly screened tile.  ``vhead`` is
+        unaffected either way — the q=0 exchange tile is k-grid invariant and
+        is carried through the densifier unchanged, so its head is injected
+        here as always.
 
     Returns
     -------
