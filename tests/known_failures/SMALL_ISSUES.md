@@ -542,10 +542,16 @@ silent overwrite.
     `.extern`, and the step nonetheless completed at 976 s and wrote its full
     certification block to the log. **The trap is what that invites**: reading
     "no rc file" as "the leg died" and relaunching, which is exactly what this
-    lane did — the duplicate then raced the original for the same
-    `<logdir>/<id>.log`. Only luck (the duplicate never placed before the
-    original finished) kept the evidence file coherent, and a `grep -c` for the
-    number of certification blocks in the log is what established that.
+    lane did — and the duplicate **overwrote the original's
+    `<logdir>/<id>.log` from byte 16461 onward**, because `lx batch` names the
+    per-leg log after the leg id and a relaunch under the same id reuses it.
+    The original's log survives **only** because this lane had copied it aside
+    before the duplicate finished writing. The overwrite is confirmed, not
+    near-missed: the live file now carries step `lx-Xg1-012101` (973 s) and the
+    copy carries `lx-Xg1-010647` (976 s). It cost nothing here — the two runs
+    are the same deterministic deck and agree to five decimals on all four Q,
+    so the accident produced a free independent replicate — but a relaunch that
+    overwrites the log of a run you have not read yet destroys the evidence.
     **Mitigations:** launch with `setsid nohup ... < /dev/null &` so the
     launcher leaves the ssh session's process group; re-probe the certificate
     with `ssh -o ControlPath=none` rather than evicting the master; and before
