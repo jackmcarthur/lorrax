@@ -690,6 +690,50 @@ silent overwrite.
     verify with `ps` against the WORKSPACE PATH rather than against
     `launch.sh` — the wrapper's name is the one thing every process in the
     tree does not share. [gnppmfft lane, 2026-08-11]
+47. **A base ARM needs its own LAUNCHER, not its own manifest row: `lx`
+    resolves the source tree from the AMBIENT `LORRAX_CHECKOUT`.** A batch
+    leg carrying `"env": {"LORRAX_CHECKOUT": "<basetree>"}` gets that value
+    inside the container — but `lx run` has already chosen which `src` to put
+    on the path, from the environment the batch was FIRED in, and a lane's
+    `env.sh` normally points that at the fix tree. The result is an A/B whose
+    two arms run the same code. It is visible in the leg's own log and only
+    there, as two adjacent lines that disagree: `[inleg] git HEAD:
+    f09bec97…` (the per-leg env, so the base commit) next to `[lx] source
+    tree: …/**tree**/src [LORRAX_CHECKOUT]` (the ambient one, so the fix
+    tree). Measured here: the base arm of an all-64-q tile null printed the
+    fix arm's 64 numbers to every digit. The fix is a second launcher that
+    exports `LORRAX_CHECKOUT=<basetree>` before `lx batch`; the durable guard
+    is to print the imported module's own `__file__` and a fix-marker
+    (`hasattr(v, 'zeta_r_to_sphere_q')`) from inside every leg, so the two
+    instruments cannot disagree silently. [sixth-wall lane, 2026-08-11]
+48. **Editing an in-flight `inleg.sh`/`launch.sh` corrupts the running leg.**
+    bash reads a script incrementally, so patching the wrapper while a leg is
+    executing it makes the shell resume at a byte offset that is no longer a
+    statement boundary: measured here as `inleg.sh: line 25: syntax error near
+    unexpected token '('` on a leg whose pytest had already finished and
+    reported (15 failed / 1203 passed), turning a green gate into rc 2. The
+    file was syntactically valid before and after — `bash -n` passes on the
+    patched copy. Patch wrappers between waves, never during one, and judge a
+    leg that dies this way by its artefacts. [sixth-wall lane, 2026-08-11]
+49. **The `lorrax_*` modulefiles set `XLA_PYTHON_CLIENT_ALLOCATOR=platform`,
+    which is NOT the campaign default, and a long per-Q refit run dies of it.**
+    `modulefiles/lorrax_J070/*.lua:189` does `setenv(
+    "XLA_PYTHON_CLIENT_ALLOCATOR", "platform")` and repeats it as a
+    `--env=` on the shifter line; the startup banner already says so in as
+    many words — *"NOT LORRAX's canonical pair, which is preallocate=false
+    with the allocator left unset (BFC); a caller overrode it"* — and nothing
+    reads that line. `platform` is cudaMalloc/cudaFree per buffer with no
+    pooling, so a driver that allocates and frees a large tensor once per Q
+    fragments. Measured: `exciton_bands --vq-mode refit --q-per-segment 16`
+    on the μ=2988 parent ran **60 off-grid Q and then died**
+    `RESOURCE_EXHAUSTED: Failed to allocate request for 15.41GiB` inside
+    `refit_vq`'s `cq_and_x`, on a 40 GB card at `mem_fraction 0.85` — i.e.
+    with ~34 GB nominally available and the same allocation having succeeded
+    sixty times. Per-leg `env` `XLA_PYTHON_CLIENT_ALLOCATOR=default` reaches
+    it (lx applies the leg env inside the container, after the module).
+    Whether to change the modulefile is an owner call — it moves every
+    wall-time on the fleet, and every timing in the corpus was taken under
+    `platform`. [sixth-wall lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 
