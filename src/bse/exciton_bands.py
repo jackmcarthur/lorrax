@@ -1304,7 +1304,16 @@ def main(argv=None):
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
         mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
-        load_v_full=(args.vq_mode == "ongrid"),
+        # ``refit`` NEEDS the stored exchange tensor as much as ``ongrid``
+        # does, and for a stricter reason: ongrid CONSUMES it, refit is
+        # CERTIFIED AGAINST it — the tile null under --refit-window=zeta, the
+        # contracted on-grid eigenvalue gate under =bse.  Both read
+        # ``V_q_full`` (or, after a bse_k_grid densification, the coarse tiles
+        # the densifier parks in ``V_q_coarse``, which is that same array), so
+        # a refit run that did not ask for it reached its own gate and refused
+        # itself for the bundle "carrying none" — measured, job 56612363 step
+        # .60, the first time the refit ever got that far.
+        load_v_full=(args.vq_mode in ("ongrid", "refit")),
         degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
