@@ -719,7 +719,10 @@ class CentroidClosureVerdict:
         return self.describe()
 
 
-def _centroid_hash(frac: np.ndarray, fft_grid: np.ndarray | None) -> str:
+def centroid_set_hash(
+    frac: np.ndarray,
+    fft_grid: np.ndarray | None = None,
+) -> str:
     """sha256 of the centroid set, canonicalised so it is reproducible.
 
     On the grid when a grid is given (integers — exactly reproducible from
@@ -729,16 +732,24 @@ def _centroid_hash(frac: np.ndarray, fft_grid: np.ndarray | None) -> str:
     purpose: a ``g:`` hash and an ``f:`` hash of the same point set are not
     interchangeable and must never silently compare equal.
     """
+    cent = np.asarray(frac, dtype=np.float64)
+    if cent.ndim != 2 or cent.shape[1] != 3:
+        raise ValueError(
+            f"centroid_set_hash: centroids must be (n_mu, 3); got "
+            f"{cent.shape}.")
     h = hashlib.sha256()
     if fft_grid is not None:
         grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
-        idx = np.rint(np.asarray(frac, dtype=np.float64) * grid[None, :])
+        if np.any(grid <= 0):
+            raise ValueError(
+                f"centroid_set_hash: fft_grid must be positive; got "
+                f"{grid.tolist()}.")
+        idx = np.rint(cent * grid[None, :])
         idx = (idx.astype(np.int64) % grid[None, :])
         h.update(np.ascontiguousarray(idx, dtype=np.int64).tobytes())
         h.update(np.ascontiguousarray(grid, dtype=np.int64).tobytes())
         return "g:" + h.hexdigest()
-    can = np.round(np.asarray(frac, dtype=np.float64) % 1.0,
-                   _CLOSURE_KEY_DECIMALS) % 1.0
+    can = np.round(cent % 1.0, _CLOSURE_KEY_DECIMALS) % 1.0
     h.update(np.ascontiguousarray(can, dtype=np.float64).tobytes())
     return "f:" + h.hexdigest()
 
@@ -968,7 +979,7 @@ def verify_centroid_orbit_closure(
         worst_op=worst_op,
         violating_ops=violating,
         residual_by_op=residual_by_op,
-        centroid_hash=_centroid_hash(cent, grid),
+        centroid_hash=centroid_set_hash(cent, grid),
     )
 
 

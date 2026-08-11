@@ -137,28 +137,47 @@ def _parse_pole_subset(raw):
 
 
 def _source_sha():
-    """The tree the census was taken from, best effort.
+    """Immutable identity of the source tree the planner executed.
 
     Stamped into the census because the planner IS source: a manifest
     balanced from a census taken at one sha and run by legs built from
     another names group ranges that may no longer be the same groups.
-    ``merge_census_files`` refuses a set of censuses that disagree on it,
-    and the per-branch digest catches the case this string misses (a
-    dirty tree at one sha).
+    A clean checkout is named by HEAD.  A dirty checkout is HEAD plus a
+    digest of the tracked diff and any untracked source under ``src/`` or
+    ``services/``; otherwise two planners at one commit could resolve the
+    same stored plan while executing different code.
     """
+    import hashlib
     import subprocess
 
-    for env_key in ("LORRAX_SOURCE_SHA", "LORRAX_CHECKOUT"):
-        val = os.environ.get(env_key, "")
-        if env_key == "LORRAX_SOURCE_SHA" and val:
-            return val.strip()
+    declared = os.environ.get("LORRAX_SOURCE_SHA", "").strip()
+    if declared:
+        return declared
     try:
         root = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
-        out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
-                             capture_output=True, text=True, timeout=20)
-        if out.returncode == 0:
-            return out.stdout.strip()
+        head = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=20, check=True
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "-C", root, "diff", "--binary", "--no-ext-diff",
+             "HEAD", "--"], capture_output=True, timeout=20, check=True
+        ).stdout
+        untracked = subprocess.run(
+            ["git", "-C", root, "ls-files", "--others",
+             "--exclude-standard", "--", "src", "services"],
+            capture_output=True, text=True, timeout=20, check=True
+        ).stdout.splitlines()
+        if not diff and not untracked:
+            return head
+        digest = hashlib.sha256(diff)
+        for rel in sorted(untracked):
+            digest.update(rel.encode("utf-8") + b"\0")
+            with open(os.path.join(root, rel), "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(chunk)
+        return f"{head}+dirty.{digest.hexdigest()[:16]}"
     except Exception:                           # pragma: no cover - advisory
         pass
     return "unknown"
@@ -406,6 +425,7 @@ def compute_mpa_sigma_pipeline(
     band_slices,
     wfn,
     sym,
+    centroid_hash: str | None = None,
     input_dir: str,
     fit_store_path: str | None = None,
     write_sigma_omega_h5: bool = True,
@@ -515,6 +535,13 @@ def compute_mpa_sigma_pipeline(
         head_unit = ("Ry" if head.get("energy_unit") == "Ry"
                      else str(config.mpa_pole_energy_unit))
         ledger = mpa_store.fit_completion_ledger(path)
+        if not ledger["complete"]:
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: the fit store is incomplete "
+                f"({ledger['n_done']} of {ledger['n_total']} q-column "
+                "entries are finalized).  Both the direct pole walk and "
+                "the partial-cube route require one immutable completed "
+                "allocation; finish the fit before computing Sigma.")
         # WHICH SCREENING OBJECT THIS POLE FIELD IS A FIT TO, asked at the
         # PIPELINE seam and not only inside the pass loop.  There are two
         # routes from this store to a self-energy — walk the poles, or sum
@@ -528,6 +555,26 @@ def compute_mpa_sigma_pipeline(
         mpa_store.require_correlation_part(
             ledger.get("screening_content"),
             where="compute_mpa_sigma_pipeline", source=str(path))
+        fit_centroid_hash = ledger.get("centroid_hash")
+        if centroid_hash is not None and fit_centroid_hash is None:
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: this run identifies its "
+                f"centroid set as {centroid_hash}, but the fit store carries "
+                "no mpa_fit_w_centroid_hash.  Equal centroid counts do not "
+                "identify the ISDF basis; refit from an identified W store "
+                "or migrate the fit provenance from its producing table.")
+        if fit_centroid_hash is not None:
+            if centroid_hash != fit_centroid_hash:
+                raise ValueError(
+                    "compute_mpa_sigma_pipeline: the pole store was fitted "
+                    f"on centroid set {fit_centroid_hash}, but this run's "
+                    f"wavefunctions use {centroid_hash}.  The tables have "
+                    f"the same declared size n_mu={ledger['n_mu']}, so "
+                    "shape checks cannot distinguish them; use the "
+                    "centroid table that produced the fitted W, or refit "
+                    "the poles on this run's table.")
+            print_fn(
+                f"    centroid identity matched: {fit_centroid_hash[:18]}…")
         # THE HEAD SET IS NAMED IN THE LOG, ALWAYS, and not only when it
         # is unusual.  A store may carry several q→0 head sets — the
         # velocity-commutator sign is an open owner decision and both
@@ -570,12 +617,20 @@ def compute_mpa_sigma_pipeline(
         # and before the writer, so nothing downstream can tell a split
         # run from a whole one, and the pinned order is preserved through
         # the split because it is what the combiner sums in.
-        partial_in = str(getattr(config, "mpa_pass_partial_in", "") or "")
-        partial_out = str(getattr(config, "mpa_pass_partial_out", "") or "")
-        census_out = str(getattr(config, "mpa_pass_census_out", "") or "")
-        manifest_path = str(getattr(config, "mpa_farm_manifest", "") or "")
-        plan_store = str(getattr(config, "mpa_plan_store", "") or "")
-        plan_verify = bool(getattr(config, "mpa_plan_verify", False))
+        partial_in = str(config.mpa_pass_partial_in or "")
+        partial_out = str(config.mpa_pass_partial_out or "")
+        census_out = str(config.mpa_pass_census_out or "")
+        manifest_path = str(config.mpa_farm_manifest or "")
+        plan_store = str(config.mpa_plan_store or "")
+        plan_verify = bool(config.mpa_plan_verify)
+        if (partial_in or partial_out) and not ledger.get("fit_id"):
+            raise ValueError(
+                "compute_mpa_sigma_pipeline: partial Sigma artifacts require "
+                "the fit allocation's mpa_fit_id, but this completed legacy "
+                "store predates that identity.  Run "
+                "mpa_store.stamp_legacy_fit_id(path) once before launching "
+                "the partial producer or consumer; refusing here avoids an "
+                "expensive pass whose output could only be rejected.")
         if plan_verify and not plan_store:
             raise ValueError(
                 "compute_mpa_sigma_pipeline: mpa_plan_verify is set without "
@@ -584,9 +639,30 @@ def compute_mpa_sigma_pipeline(
                 "nothing to load and the check would silently pass by "
                 "comparing the fresh plan with itself.")
         group_subset = window_farm.parse_group_subset(
-            getattr(config, "mpa_group_subset", ""))
+            config.mpa_group_subset)
         manifest = (window_farm.read_manifest(manifest_path)
                     if manifest_path else None)
+        source_identity = _source_sha()
+        artifact_route = bool(
+            census_out or plan_store or partial_in or partial_out
+            or manifest_path)
+        if artifact_route:
+            if source_identity == "unknown":
+                raise ValueError(
+                    "compute_mpa_sigma_pipeline: source identity is unknown, "
+                    "so this run cannot safely produce or consume a plan, "
+                    "census, manifest, or partial cube.  Run from a readable "
+                    "git tree or set LORRAX_SOURCE_SHA to an immutable "
+                    "deployment identity.")
+            print_fn(f"  MPA artifact source identity: {source_identity}")
+        if manifest is not None:
+            manifest_sha = str(manifest.get("sha", ""))
+            if manifest_sha != source_identity:
+                raise ValueError(
+                    "compute_mpa_sigma_pipeline: the farm manifest declares "
+                    f"source {manifest_sha!r}, but this run is "
+                    f"{source_identity!r}.  Its group ranges and plan "
+                    "addresses cannot cross source states.")
         if census_out and (partial_in or partial_out):
             raise ValueError(
                 "compute_mpa_sigma_pipeline: mpa_pass_census_out is set "
@@ -613,10 +689,11 @@ def compute_mpa_sigma_pipeline(
                     quad=config.sigma_quadrature_config,
                     omega_grid_ry=config.omega_grid_ry,
                     pole_subset=_parse_pole_subset(
-                        getattr(config, "mpa_pole_subset", "")),
+                        config.mpa_pole_subset),
                     census_out=census_out,
-                    census_sha=_source_sha(),
+                    census_sha=source_identity,
                     plan_store=plan_store or None,
+                    windowing=config.mpa_sigma_windowing,
                     print_fn=print_fn,
                 )
             del _cube, _records
@@ -641,6 +718,9 @@ def compute_mpa_sigma_pipeline(
                 total, _poles, audit = combine_pass_partials(
                     paths, n_p=int(ledger["n_p"]),
                     omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                    windowing=config.mpa_sigma_windowing,
+                    fit_id=ledger.get("fit_id"),
+                    source_identity=source_identity,
                     manifest=manifest, print_fn=print_fn)
             import jax.numpy as _jnp
             sigma_c_omega = _jnp.asarray(total, dtype=_jnp.complex128)
@@ -654,33 +734,49 @@ def compute_mpa_sigma_pipeline(
                     quad=config.sigma_quadrature_config,
                     omega_grid_ry=config.omega_grid_ry,
                     pole_subset=_parse_pole_subset(
-                        getattr(config, "mpa_pole_subset", "")),
+                        config.mpa_pole_subset),
                     group_subset=group_subset,
                     group_digests=(manifest or {}).get("digests"),
-                    census_sha=_source_sha(),
+                    census_sha=source_identity,
                     plan_store=plan_store or None,
                     plan_verify=plan_verify,
                     binned_width_clause=_parse_binned_width_clause(
-                        getattr(config, "mpa_binned_width_clause", "")),
+                        config.mpa_binned_width_clause),
+                    windowing=config.mpa_sigma_windowing,
                     print_fn=print_fn,
                 )
             if partial_out:
-                write_pass_partial(
-                    partial_out, np.asarray(sigma_c_omega), records,
-                    n_p=int(ledger["n_p"]),
-                    poles=[int(r.pole_index) for r in records],
-                    omega_grid_ry=config.omega_grid_ry, fit_src=path,
-                    group_spec=(window_farm.format_group_subset(group_subset)
-                                if group_subset is not None else None),
-                    leg_id=str(getattr(config, "mpa_leg_id", "") or "") or None,
-                    print_fn=print_fn)
-                print_fn(
-                    "  ⚠ THIS RUN IS A PARTIAL PASS.  Everything printed "
-                    "below — the head, the QP energies, eqp0/eqp1, "
-                    "sigma_mnk.h5 — is computed from a partial sum over the "
-                    "pole axis and is NOT a self-energy.  The number this "
-                    "run exists to produce is the partial cube named above; "
-                    "read nothing else from it.")
+                import jax as _jax
+                from common.collectives import barrier as _barrier
+
+                # One artifact, one owner.  Every process has the same
+                # gathered cube, but concurrent h5py truncation is not a
+                # distributed write protocol and has corrupted production
+                # partials.  Rank 0 owns the serial writer; the barrier makes
+                # the successful file durable before any peer exits.
+                if int(_jax.process_index()) == 0:
+                    write_pass_partial(
+                        partial_out, np.asarray(sigma_c_omega), records,
+                        n_p=int(ledger["n_p"]),
+                        poles=[int(r.pole_index) for r in records],
+                        omega_grid_ry=config.omega_grid_ry, fit_src=path,
+                        group_spec=(window_farm.format_group_subset(
+                            group_subset)
+                            if group_subset is not None else None),
+                        windowing=config.mpa_sigma_windowing,
+                        fit_id=ledger.get("fit_id"),
+                        source_identity=source_identity,
+                        print_fn=print_fn)
+                _barrier("mpa_pass_partial_written", print_fn=print_fn)
+                banner = (
+                    "*** LORRAX EARLY EXIT: mpa_pass_partial_out — the "
+                    f"partial Sigma cube was written to {partial_out}.  "
+                    "This run stops before the q→0 head, QP solve and all "
+                    "final self-energy outputs; combine complete pole "
+                    "coverage with mpa_pass_partial_in. ***")
+                print_fn(banner)
+                print(banner, file=sys.stderr, flush=True)
+                raise SystemExit(0)
 
         # Step 3: q→0 head injection from the store's own pole axis.
         sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_mpa_head(

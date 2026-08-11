@@ -50,6 +50,7 @@ so reaching *past* the door is the thing that still flags.
 | `slice_q_full_to_ibz` | Full-BZ → IBZ q-axis gather, sharding-preserving and jit-cached. |
 | `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `find_irreducible_bz_points` | The pure-numpy primitives. `find_irreducible_bz_points`' anchored branch reproduces `find_symmetry_ops_simple`'s op-selection policy bit-for-bit — deliberately (see Contract). |
 | `compute_centroid_sym_perm`, `compute_rgrid_sym_perm`, `build_real_space_syms`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `recover_symmorphic_density_point_group` | Real-space orbit machinery. `compute_centroid_sym_perm(validate=True)` REFUSES a non-orbit-closed centroid set and names the regeneration fix. |
+| `centroid_set_hash` | Canonical, order-sensitive centroid identity: exact FFT-grid indices (`g:`) when a grid is supplied, wrapped fractional coordinates (`f:`) otherwise. |
 | `check_density_symmetries`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `trs_check_mode` | The TRS measurement — the only MEASUREMENT, as opposed to inference, in the symmetry stack. Quadrature is injectable (`valence_density_fn`, `spin_degeneracy_fn`); `None` preserves the lazy `psp.get_DFT_mtxels` import verbatim for in-tree callers. |
 
 `SymMaps.validate_kgrid_unfolding` is public surface on the class and is

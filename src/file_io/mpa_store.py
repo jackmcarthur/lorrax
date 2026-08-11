@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import uuid
 
 import numpy as np
 
@@ -1862,6 +1863,33 @@ def declare_fit_screening_content(dest, content, *, mode="a"):
         return can
 
 
+def stamp_legacy_fit_id(dest, *, mode="a"):
+    """Give one completed pre-identity fit allocation a permanent ID.
+
+    New allocations receive ``mpa_fit_id`` at birth.  This explicit
+    migration exists for completed stores made before that stamp: the path
+    is not an allocation identity because the fitter may deliberately reuse
+    it, while partial Sigma cubes can outlive the allocation they read.
+    Repeating the migration is an idempotent read of the existing ID; an
+    incomplete store is refused because its allocation is still mutable.
+    """
+    qs = _qs()
+    with qs.QirrDest(dest, mode) as grp:
+        _open_fit(grp)
+        existing = qs.qirr_attr_str(grp, "mpa_fit_id")
+        if existing:
+            return existing
+        if not bool(grp.attrs.get("mpa_fit_complete", False)):
+            raise ValueError(
+                "stamp_legacy_fit_id: the fit store is incomplete.  Its "
+                "pole field is still mutable, so it cannot be assigned the "
+                "permanent allocation identity carried by partial Sigma "
+                "artifacts; finalize it first.")
+        fit_id = "fit-" + uuid.uuid4().hex
+        grp.attrs["mpa_fit_id"] = fit_id
+        return fit_id
+
+
 def allocate_fit_store(
     dest,
     *,
@@ -1953,9 +1981,14 @@ def allocate_fit_store(
                 k for k in grp if str(k).startswith("fit_")]:
             if key in grp:
                 del grp[key]
-        for key in ("mpa_fit_table_hash", "mpa_fit_q_storage",
-                    "mpa_fit_n_q_full"):
-            grp.attrs.pop(key, None)
+        # Root attrs are allocation-owned just as surely as the tensors.
+        # In particular, leaving ``mpa_fit_finalized_utc`` or a certificate
+        # behind makes a newly empty store present itself as the completed
+        # allocation formerly at this path.  Clear the three namespaces the
+        # fit writer owns, then state the new allocation from scratch below.
+        for key in tuple(grp.attrs):
+            if str(key).startswith(("mpa_fit_", "mpa_cert_", "prov_")):
+                del grp.attrs[key]
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -1983,6 +2016,7 @@ def allocate_fit_store(
         grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
         grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
         grp.attrs["mpa_fit_complete"] = False
+        grp.attrs["mpa_fit_id"] = "fit-" + uuid.uuid4().hex
         grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
         grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
         grp.attrs["mpa_fit_allocated_utc"] = _utc_now()
@@ -2258,6 +2292,15 @@ def fit_completion_ledger(src, *, mode="r"):
             "n_q_full": int(grp.attrs.get("mpa_fit_n_q_full",
                                           grp.attrs["mpa_fit_n_q"])),
             "table_hash": qs.qirr_attr_str(grp, "mpa_fit_table_hash"),
+            # The ISDF basis the fitted W used.  Counts are insufficient:
+            # two centroid tables of the same size define different B_p
+            # matrix elements, yet every tensor shape still agrees.
+            "centroid_hash": qs.qirr_attr_str(
+                grp, "mpa_fit_w_centroid_hash"),
+            # The allocation, not its reusable filesystem path.  Partial
+            # Sigma cubes carry this ID so a later fit allocated at the same
+            # path cannot impersonate the poles they integrated.
+            "fit_id": qs.qirr_attr_str(grp, "mpa_fit_id"),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
             "blocks_done": done,

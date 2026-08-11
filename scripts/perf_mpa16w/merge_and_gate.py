@@ -39,7 +39,9 @@ def _read_grid(path):
     with h5py.File(path, "r") as f:
         return (np.asarray(f["omega_grid_ry"][()], dtype=np.float64),
                 str(f.attrs["mpa_partial_fit_store"]),
-                int(f.attrs["mpa_partial_n_p"]))
+                int(f.attrs["mpa_partial_n_p"]),
+                str(f.attrs["mpa_partial_fit_id"]),
+                str(f.attrs["mpa_partial_source_identity"]))
 
 
 def _cmp(name, a, b):
@@ -62,7 +64,7 @@ def main():
     manifest = WF.read_manifest(man_path)
     win_paths = [leg["output"] for leg in manifest["legs"]]
     pole_paths = sorted(glob.glob(os.path.join(pole_dir, "*.h5")))
-    om, fit_src, n_p = _read_grid(win_paths[0])
+    om, fit_src, n_p, fit_id, source_identity = _read_grid(win_paths[0])
 
     print("=" * 72)
     print("GATE (c) RED TWIN 1 -- pass manifest, one leg's output removed")
@@ -71,7 +73,9 @@ def main():
     shutil.move(victim["output"], hidden)
     try:
         combine_pass_partials(win_paths, n_p=n_p, omega_grid_ry=om,
-                              fit_src=fit_src, manifest=manifest)
+                              fit_src=fit_src, fit_id=fit_id,
+                              source_identity=source_identity,
+                              manifest=manifest)
     except WF.FarmIncomplete as exc:
         print("REFUSED, as it must:")
         print(str(exc))
@@ -135,7 +139,7 @@ def main():
     print("GATE (a) -- the window farm merged under its manifest")
     tot_w, order, audit_w = combine_pass_partials(
         win_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src,
-        manifest=manifest)
+        fit_id=fit_id, source_identity=source_identity, manifest=manifest)
     # THE POLE ARM IS OPTIONAL, AND SAYING SO IS NOT A WEAKENING.  Gate (a)
     # asks whether the window split reproduces the pole split; a lane whose
     # change is upstream of the split (where the groups came FROM, not how
@@ -149,7 +153,8 @@ def main():
     if pole_paths:
         print("GATE (a) -- the pole farm, same deck, same sha")
         tot_p, _order, audit_p = combine_pass_partials(
-            pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src)
+            pole_paths, n_p=n_p, omega_grid_ry=om, fit_src=fit_src,
+            fit_id=fit_id, source_identity=source_identity)
 
         print("-" * 72)
         print("window-farmed Σ_c against pole-farmed Σ_c:")

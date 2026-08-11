@@ -1016,6 +1016,13 @@ _DEFAULTS = {
     # spellable; gw.mpa_pipeline._parse_binned_width_clause is the one
     # place it becomes a number.
     "mpa_binned_width_clause": "off",
+    # Sigma window geometry for the elementwise multipole poles.
+    #   pane   — accepted path: recursive sign-definite width panes and the
+    #            Gamma<xi two-point substitution.
+    #   sector — experimental better-windowed path: fixed GN branch geometry,
+    #            one pi/4 sector rule per sign-definite piece, while keeping
+    #            the accepted Gamma<xi route fixed for the speed/BGW A/B.
+    "mpa_sigma_windowing": "pane",
     # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
     # a ~500 eV cancellation, so this is an explicit, validated choice
     # rather than something inferred from what happens to be on disk.
@@ -1662,6 +1669,7 @@ _NORMALIZE_STR = {
     # "OFF" and "off" are the same answer; the ratios are numerals and
     # folding them is a no-op.
     "mpa_binned_width_clause",
+    "mpa_sigma_windowing",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -2446,6 +2454,9 @@ class LorraxConfig:
     #: ``"off"`` (the default) or a bin ratio ``"2"``/``"4"``.  See
     #: ``_DEFAULTS["mpa_binned_width_clause"]``.
     mpa_binned_width_clause: str
+    #: ``"pane"`` (accepted) or ``"sector"`` (experimental fixed geometry).
+    #: See ``_DEFAULTS["mpa_sigma_windowing"]``.
+    mpa_sigma_windowing: str
 
     # --- Sub-dataclass groups (everything else) ---
     paths: FilePaths
@@ -3008,6 +3019,21 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
+        mpa_binned_width_clause = str(
+            _g("mpa_binned_width_clause") or "").strip().lower()
+        mpa_sigma_windowing = str(
+            _g("mpa_sigma_windowing") or "").strip().lower()
+        if mpa_sigma_windowing not in ("pane", "sector"):
+            raise ValueError(
+                f"mpa_sigma_windowing={mpa_sigma_windowing!r}; expected "
+                "'pane' or 'sector'.")
+        if (mpa_sigma_windowing == "sector"
+                and mpa_binned_width_clause not in
+                ("", "off", "none", "false", "0")):
+            raise ValueError(
+                "mpa_binned_width_clause is a pane-window coarsening and "
+                "cannot be set with mpa_sigma_windowing='sector'.")
+
         return cls(
             # Top-level: system + mode flags
             nval=int(_g("nval")),
@@ -3044,8 +3070,8 @@ class LorraxConfig:
             mpa_pass_partial_out=str(
                 _g("mpa_pass_partial_out") or "").strip(),
             mpa_pass_partial_in=str(_g("mpa_pass_partial_in") or "").strip(),
-            mpa_binned_width_clause=str(
-                _g("mpa_binned_width_clause") or "").strip().lower(),
+            mpa_binned_width_clause=mpa_binned_width_clause,
+            mpa_sigma_windowing=mpa_sigma_windowing,
             # Sub-dataclass groups
             paths=paths,
             head=head,

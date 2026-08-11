@@ -991,7 +991,7 @@ def group_selector_device(idx_B, field_shape):
 
 
 class _BranchOperandCache:
-    """One device copy of each distinct ``omega_operand`` in a branch.
+    """One named-sharded device copy of each pole ``omega_operand``.
 
     THE OPERAND IS A FIELD, NOT A GROUP PROPERTY.  Every MPA-routed group
     of a pass shares one ``Omega_p = a - i*Gamma`` array and every
@@ -1003,14 +1003,25 @@ class _BranchOperandCache:
     arrays are alive for the whole loop because the groups hold them, so
     no id can be recycled underneath this cache.
 
-    The cached array is the same ``jnp.asarray`` of the same host buffer
-    that the per-group path produced, so the operand the tau kernel reads
-    is byte-identical and the seam to
-    ``ppm_sigma._integrate_tau_windows_for_branch`` does not move.
+    The cache is created once per pole and shared by all four branches.
+    Production placement is ``P(None, 'x', 'y')`` through
+    ``device_put_process_local``: every rank read the identical global pole
+    slab, so no equality all-gather is required.  ``mesh_xy=None`` keeps the
+    small standalone planning cells on their ordinary local JAX device.
     """
 
-    def __init__(self):
+    def __init__(self, mesh_xy=None):
         self._by_id = {}
+        if mesh_xy is None:
+            self._sharding = None
+        else:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+
+            self._sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+    def seed(self, host_array, device_array):
+        """Record an array already placed by the pole-state preparation."""
+        self._by_id[id(host_array)] = (host_array, device_array)
 
     def device(self, host_array):
         import jax.numpy as jnp
@@ -1020,7 +1031,14 @@ class _BranchOperandCache:
         if hit is None:
             # The host array is kept alive by the cache entry itself, which
             # is what makes ``id`` a legal key for the loop's lifetime.
-            hit = (host_array, jnp.asarray(host_array))
+            if self._sharding is None:
+                device_array = jnp.asarray(host_array)
+            else:
+                from common.collectives import device_put_process_local
+
+                device_array = device_put_process_local(
+                    host_array, self._sharding)
+            hit = (host_array, device_array)
             self._by_id[key] = hit
         return hit[1]
 
@@ -1300,6 +1318,182 @@ def _refuse_width_clause(beta, where, x_min, gamma, *, binned=None):
         code="binned_width_no_entry", beta=float(beta))
 
 
+def _plan_sector_branch_groups(
+    *, a, g, live_mask, E_A_host, base_mask_A_host, omega_nonneg_ry,
+    omega_max, omega_complex,
+    space, neg_omega_half, b_abs, xi_ry, edge_factor, rel_tol, max_nodes,
+    target_error, laplace_max_nodes, crossing_eps_q, crossing_max_nodes,
+    use_shipped_minimax_tables, log_tag, print_fn,
+):
+    """Fixed GN geometry with sector rules on every sign-definite piece.
+
+    The pole field stays coupled as ``(Re Omega_p, Gamma_p)`` when radial
+    bounds are formed.  Widths therefore choose the scalar integrand but never
+    create a pane.  Only a genuinely crossing core is divided into geometric
+    width bands, which retain each pole's exact ``exp(-Gamma_p*t)`` damping.
+    """
+    from . import sigma_routing as R
+
+    field_shape = tuple(int(x) for x in np.shape(a))
+    ix_dtype = flat_index_dtype(int(np.prod(field_shape)))
+    a_flat = np.ravel(np.asarray(a, dtype=np.float64))
+    g_flat = np.ravel(np.asarray(g, dtype=np.float64))
+    narrow, wide = split_pass_by_width(g, live_mask, xi_ry)
+    idx_live = np.flatnonzero(np.ravel(wide)).astype(ix_dtype)
+    idx_all = np.flatnonzero(
+        np.ravel(np.asarray(live_mask, dtype=bool))).astype(ix_dtype)
+    mass_flat = (None if b_abs is None
+                 else np.ravel(np.abs(np.asarray(b_abs, dtype=np.float64))))
+    e_all_lo, e_all_hi = _stats(E_A_host, base_mask_A_host)
+    neg = -1.0 if neg_omega_half else 1.0
+    groups = []
+
+    def _mass(idx):
+        return 0.0 if mass_flat is None else float(np.sum(mass_flat[idx]))
+
+    def _group(name, idx, windows):
+        idx = np.sort(np.asarray(idx, dtype=ix_dtype))
+        groups.append(WindowGroup(
+            name=name, windows=windows, idx_B=idx, field_shape=field_shape,
+            omega_operand=omega_complex, n_modes=int(idx.size),
+            b_mass=_mass(idx),
+            provenance="; ".join(w.provenance for w in windows)))
+
+    def _sector_window(name, idx, mask_A, e_lo, e_hi, *, omega_sign,
+                       prefactor):
+        av, gv = a_flat[idx], g_flat[idx]
+        if omega_sign < 0:
+            x_lo = e_lo + av
+            x_hi = e_hi + av + omega_max
+        else:
+            x_lo = e_lo + av - omega_max
+            x_hi = e_hi + av
+        radial_min = float(np.min(np.hypot(x_lo, gv)))
+        radial_max = float(np.max(np.hypot(x_hi, gv)))
+        t, alpha, rule = R.sector_sign_definite_rule(
+            radial_min, radial_max, rel_tol=rel_tol, max_nodes=max_nodes)
+        return _sigma_window(
+            name=name, plan_t=t, plan_alpha=alpha, mask_A=mask_A,
+            e_ref_a=e_lo, e_ref_b=float(np.min(av)),
+            omega_sign=omega_sign, project="full", prefactor=prefactor,
+            max_error=rule["error_bound"],
+            provenance=(f"MPA pi/4 sector sinc, {rule['n_nodes']} nodes, "
+                        f"|d|={radial_min:.4g}..{radial_max:.4g} Ry, "
+                        f"R={rule['radial_ratio']:.3g}, "
+                        f"bound={rule['error_bound']:.2e}, "
+                        f"kappa0={rule['kappa0']:.6f}"))
+
+    # Speed-first compatibility bridge: preserve the accepted Gamma<xi
+    # substitution exactly while removing the 44,842-node sign-definite pane
+    # explosion.  These modes cost only 0.9% of the audited nodes.  The strict
+    # fitted-width crossing limit remains a separate, explicitly scored
+    # physics change rather than being smuggled into a performance A/B.
+    if narrow.any():
+        from ..ppm_windows import _build_windows_for_branch
+        import jax.numpy as jnp
+
+        wins = _build_windows_for_branch(
+            omega_nonneg_ry=np.asarray(
+                omega_nonneg_ry, dtype=np.float64),
+            E_A=np.asarray(E_A_host, dtype=np.float64),
+            base_mask_A=np.asarray(base_mask_A_host, dtype=bool),
+            space=space, neg_omega_half=bool(neg_omega_half),
+            Omega_q=jnp.asarray(a, dtype=jnp.float64),
+            base_mask_B=jnp.asarray(narrow, dtype=bool),
+            regularization_width_ry=float(xi_ry),
+            edge_factor=float(edge_factor), target_error=float(target_error),
+            max_nodes=int(laplace_max_nodes),
+            crossing_eps_q=float(crossing_eps_q),
+            crossing_max_nodes=int(crossing_max_nodes),
+            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+            log_tag=f"{log_tag} legacy-routed", print_fn=print_fn)
+        if wins:
+            idx = np.flatnonzero(np.ravel(narrow)).astype(ix_dtype)
+            groups.append(WindowGroup(
+                name="legacy", windows=wins, idx_B=idx,
+                field_shape=field_shape, omega_operand=np.asarray(a),
+                n_modes=int(idx.size), b_mass=_mass(idx),
+                provenance=("accepted two-point Gamma<xi substitution kept "
+                            "fixed for the speed-first sector A/B")))
+
+    if idx_live.size == 0:
+        return groups, {
+            "n_narrow": int(np.count_nonzero(narrow)), "n_wide": 0,
+            "narrow_b_mass": _mass(idx_all), "wide_b_mass": 0.0,
+            "xi_ev": float(xi_ry) * RYD_TO_EV,
+            "n_tau": int(sum(w.n_tau for q in groups for w in q.windows)),
+            "n_panes": int(len(groups)), "binned_width_clause": None,
+            "windowing": "sector",
+        }
+
+    crossing = R.denominator_can_cross(space, bool(neg_omega_half))
+    if not crossing:
+        win = _sector_window(
+            "single", idx_live, np.asarray(base_mask_A_host, dtype=bool),
+            e_all_lo, e_all_hi, omega_sign=-1, prefactor=-1.0 * neg)
+        _group("sector:single", idx_live, [win])
+    else:
+        T = float(omega_max)
+        shallow = idx_live[a_flat[idx_live] <= T]
+        deep = idx_live[a_flat[idx_live] > T]
+        core_A = (np.asarray(base_mask_A_host, dtype=bool)
+                  & (np.asarray(E_A_host) <= T))
+        stripe_A = (np.asarray(base_mask_A_host, dtype=bool)
+                    & (np.asarray(E_A_host) > T))
+
+        if shallow.size and core_A.any():
+            core_e_lo, _ = _stats(E_A_host, core_A)
+            sorted_idx, sorted_g = _sorted_by_width(g_flat, shallow)
+            for band, idx in enumerate(_geometric_width_bins_sorted(
+                    sorted_g, sorted_idx)):
+                av, gv = a_flat[idx], g_flat[idx]
+                f_max = (omega_max + max(T - core_e_lo, 0.0)
+                         + float(np.max(av) - np.min(av)))
+                t, alpha, rule = R.crossing_rule(
+                    float(np.min(gv)), f_max, rel_tol=rel_tol,
+                    max_nodes=max_nodes)
+                win = _sigma_window(
+                    name="core", plan_t=t, plan_alpha=alpha,
+                    mask_A=core_A, e_ref_a=core_e_lo,
+                    e_ref_b=float(np.min(av)), omega_sign=+1,
+                    project="full", prefactor=-1.0 * neg,
+                    max_error=rule["rel_tol"],
+                    provenance=(f"MPA exact-width crossing core, "
+                                f"{rule['n_nodes']} nodes, "
+                                f"Gamma={np.min(gv):.4g}.."
+                                f"{np.max(gv):.4g} Ry, "
+                                f"A={rule['a_dim']:.4g}"))
+                _group(f"sector:core:g{band}", idx, [win])
+
+        if shallow.size and stripe_A.any():
+            stripe_lo, stripe_hi = _stats(E_A_host, stripe_A)
+            win = _sector_window(
+                "a_stripe", shallow, stripe_A, stripe_lo, stripe_hi,
+                omega_sign=+1, prefactor=+1.0 * neg)
+            _group("sector:a_stripe", shallow, [win])
+
+        if deep.size:
+            win = _sector_window(
+                "b_slab", deep, np.asarray(base_mask_A_host, dtype=bool),
+                e_all_lo, e_all_hi, omega_sign=+1,
+                prefactor=+1.0 * neg)
+            _group("sector:b_slab", deep, [win])
+
+    live_mass = _mass(idx_live)
+    narrow_idx = np.flatnonzero(np.ravel(narrow)).astype(ix_dtype)
+    return groups, {
+        "n_narrow": int(narrow_idx.size),
+        "n_wide": int(idx_live.size),
+        "narrow_b_mass": _mass(narrow_idx),
+        "wide_b_mass": live_mass,
+        "xi_ev": float(xi_ry) * RYD_TO_EV,
+        "n_tau": int(sum(w.n_tau for grp in groups for w in grp.windows)),
+        "n_panes": int(len(groups)),
+        "binned_width_clause": None,
+        "windowing": "sector",
+    }
+
+
 def plan_branch_groups(
     *,
     a_ry,
@@ -1322,6 +1516,7 @@ def plan_branch_groups(
     crossing_eps_q=1.0e-10,
     crossing_max_nodes=200,
     use_shipped_minimax_tables=True,
+    windowing="pane", omega_complex=None,
     log_tag="",
     print_fn=print,
 ):
@@ -1369,6 +1564,27 @@ def plan_branch_groups(
                  if np.size(omega_nonneg_ry) else 0.0)
     max_nodes = (R.DEFAULT_MAX_CROSSING_NODES if max_nodes is None
                  else int(max_nodes))
+    if windowing == "sector":
+        omega_complex = (a - 1j * g if omega_complex is None
+                         else np.asarray(omega_complex,
+                                         dtype=np.complex128))
+        return _plan_sector_branch_groups(
+            a=a, g=g, live_mask=live_mask, E_A_host=E_A_host,
+            base_mask_A_host=base_mask_A_host,
+            omega_nonneg_ry=omega_nonneg_ry, omega_max=omega_max,
+            omega_complex=omega_complex,
+            space=space, neg_omega_half=neg_omega_half, b_abs=b_abs,
+            xi_ry=xi_ry, edge_factor=edge_factor, rel_tol=rel_tol,
+            max_nodes=max_nodes, target_error=target_error,
+            laplace_max_nodes=laplace_max_nodes,
+            crossing_eps_q=crossing_eps_q,
+            crossing_max_nodes=crossing_max_nodes,
+            use_shipped_minimax_tables=use_shipped_minimax_tables,
+            log_tag=log_tag, print_fn=print_fn)
+    if windowing != "pane":
+        raise ValueError(
+            f"plan_branch_groups: windowing={windowing!r}; expected 'pane' "
+            "or 'sector'.")
     narrow, wide = split_pass_by_width(g, live_mask, xi_ry)
     mass = (np.abs(np.asarray(b_abs, dtype=np.float64))
             if b_abs is not None else None)
@@ -1421,7 +1637,8 @@ def plan_branch_groups(
                             "poles are narrower than the smearing and are "
                             "not distinguishable from real ones")))
 
-    omega_complex = a - 1j * g
+    omega_complex = (a - 1j * g if omega_complex is None
+                     else np.asarray(omega_complex, dtype=np.complex128))
     # THE ONE GATHER THIS PLANNER PERFORMS.  Everything after it works on
     # the wide set's own values and its own index array: the bucket edges,
     # the width panes, the rule statistics and the group membership.  The
@@ -1550,11 +1767,12 @@ def plan_branch_groups(
         "n_panes": int(len(groups)),
         "binned_width_clause": (None if binned_width_clause is None
                                 else float(binned_width_clause)),
+        "windowing": "pane",
     }
     return groups, stats
 
 
-def format_pass_report(records, *, xi_ev):
+def format_pass_report(records, *, xi_ev, windowing="pane"):
     """The per-pass announcement, including the legacy-routed count.
 
     The legacy count is printed whether it is zero or not.  A run in which
@@ -1565,8 +1783,11 @@ def format_pass_report(records, *, xi_ev):
     lines = [
         "",
         "-" * 72,
-        f"MPA Sigma: {len(records)} pole passes, narrow-pole threshold "
-        f"xi = {float(xi_ev):.4f} eV",
+        (f"MPA Sigma: {len(records)} pole passes, windowing={windowing}"
+         + (f", narrow-pole threshold xi = {float(xi_ev):.4f} eV"
+            if windowing == "pane" else
+            ", fixed sign-definite sectors; accepted Gamma<xi crossing "
+            "substitution retained for the speed/BGW-parity milestone")),
         f"{'pass':>4}  {'Re Omega (eV)':>20}  {'Gamma (eV)':>18}  "
         f"{'legacy':>8}  {'complex':>9}  {'tau':>6}",
     ]
@@ -1583,9 +1804,11 @@ def format_pass_report(records, *, xi_ev):
     total = tot_legacy + tot_mpa
     frac = (100.0 * tot_legacy / total) if total else 0.0
     lines += [
-        f"  legacy-routed modes: {tot_legacy} of {total} ({frac:.2f} %) "
-        f"-- poles with Gamma < xi, summed by the two-point crossing "
-        f"machinery at that xi",
+        (f"  legacy-routed modes: {tot_legacy} of {total} ({frac:.2f} %) "
+         + ("-- poles with Gamma < xi, summed by the two-point crossing "
+            "machinery at that xi" if windowing == "pane" else
+            "-- sector windowing retains this accepted compatibility route "
+            "only for the narrow modes")),
         f"  tau dispatches: {tot_tau}",
         "-" * 72,
         "",
@@ -1609,6 +1832,7 @@ def run_pass_branch(
     mesh_xy,
     log_tag,
     print_fn,
+    operand_cache=None,
 ):
     """Integrate one pass's window groups on one branch; return host tiles.
 
@@ -1652,7 +1876,8 @@ def run_pass_branch(
         omega_vec=jnp.asarray(omega_nonneg_ry, dtype=jnp.float64), sink=sink)
 
     tau_kernel, tau_kernel_x = tau_kernels
-    operands = _BranchOperandCache()
+    operands = (_BranchOperandCache(mesh_xy) if operand_cache is None
+                else operand_cache)
     for grp in groups:
         # ONE selector resident, and only while its group is integrating.
         # The group carries an index set; the tau loop wants the boolean
@@ -1687,7 +1912,7 @@ def run_pass_branch(
 #: the finished one.  Nothing downstream could tell a stack of partials
 #: written under a changed convention from a stack written under this one,
 #: so the convention is named in the bytes.
-PARTIAL_FORMAT_VERSION = 1
+PARTIAL_FORMAT_VERSION = 3
 
 
 def resolve_pole_subset(n_p, subset):
@@ -1770,7 +1995,8 @@ def resolve_pass_poles(n_p, pole_subset, group_subset):
 
 
 def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
-                       omega_grid_ry, fit_src, group_spec=None, leg_id=None,
+                       omega_grid_ry, fit_src, fit_id, source_identity,
+                       group_spec=None, leg_id=None, windowing="pane",
                        print_fn=print):
     """Write ONE process's partial Σ_c cube, with the manifest that makes
     it recombinable and the refusals that make it non-mistakable.
@@ -1809,11 +2035,27 @@ def write_pass_partial(path, sigma_c_kij, records, *, n_p, poles,
     arr = np.asarray(sigma_c_kij)
     om = np.asarray(omega_grid_ry, dtype=np.float64)
     poles = tuple(int(p) for p in poles)
+    fit_id = str(fit_id or "")
+    source_identity = str(source_identity or "")
+    if not fit_id:
+        raise ValueError(
+            "write_pass_partial: the fit store has no allocation identity.  "
+            "A reusable path cannot distinguish these poles from a later "
+            "fit written there; migrate the completed legacy store with "
+            "mpa_store.stamp_legacy_fit_id before producing partials.")
+    if not source_identity or source_identity == "unknown":
+        raise ValueError(
+            "write_pass_partial: source identity is unknown.  A partial "
+            "must name the exact clean commit or dirty-tree digest whose "
+            "quadrature it integrated.")
     with h5py.File(str(path), "w") as f:
         f.attrs["mpa_partial_format_version"] = int(PARTIAL_FORMAT_VERSION)
         f.attrs["mpa_partial_poles"] = np.asarray(poles, dtype=np.int64)
         f.attrs["mpa_partial_n_p"] = int(n_p)
         f.attrs["mpa_partial_fit_store"] = str(fit_src)
+        f.attrs["mpa_partial_fit_id"] = fit_id
+        f.attrs["mpa_partial_source_identity"] = source_identity
+        f.attrs["mpa_partial_windowing"] = str(windowing)
         if group_spec:
             f.attrs["mpa_partial_group_spec"] = str(group_spec)
         if leg_id:
@@ -1930,7 +2172,8 @@ def _refuse_group_coverage(group_specs, *, order, manifest):
             f"{list(order)}.")
 
 
-def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
+def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src, fit_id,
+                          source_identity, windowing="pane",
                           manifest=None, print_fn=print):
     """Sum per-pole partial cubes in the PINNED ascending order.
 
@@ -1976,8 +2219,27 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
 
     order = pole_pass_order(n_p)
     om_want = np.asarray(omega_grid_ry, dtype=np.float64)
+    fit_id = str(fit_id or "")
+    source_identity = str(source_identity or "")
+    if not fit_id:
+        raise ValueError(
+            "combine_pass_partials: the current fit store has no allocation "
+            "identity.  Its path may have been reused since these cubes "
+            "were written; migrate a completed legacy store explicitly.")
+    if not source_identity or source_identity == "unknown":
+        raise ValueError(
+            "combine_pass_partials: source identity is unknown, so the "
+            "quadrature implementation that produced these cubes cannot be "
+            "matched to this run.")
     paths = sorted(str(p) for p in paths)
     if manifest is not None:
+        manifest_sha = str(manifest.get("sha", ""))
+        if manifest_sha != source_identity:
+            raise ValueError(
+                "combine_pass_partials: the farm manifest declares source "
+                f"{manifest_sha!r}, but this run is {source_identity!r}.  "
+                "Group ranges and their cubes belong to the exact planner "
+                "tree that declared them and cannot cross source states.")
         WF.refuse_incomplete(manifest, print_fn=print_fn)
         declared = {str(leg["output"]) for leg in manifest["legs"]}
         stray = sorted(set(paths) - declared)
@@ -2010,6 +2272,29 @@ def combine_pass_partials(paths, *, n_p, omega_grid_ry, fit_src,
                     f"fit store {store!r}, not {str(fit_src)!r}.  Summing "
                     f"partials from two stores returns a self-energy of no "
                     f"screening at all.")
+            partial_fit_id = str(f.attrs.get("mpa_partial_fit_id", ""))
+            if partial_fit_id != fit_id:
+                raise ValueError(
+                    f"combine_pass_partials: {path} belongs to fit allocation "
+                    f"{partial_fit_id!r}, but {str(fit_src)!r} now names "
+                    f"allocation {fit_id!r}.  A fit path can be reused; its "
+                    "old partials cannot be combined with the new poles.")
+            partial_source = str(
+                f.attrs.get("mpa_partial_source_identity", ""))
+            if partial_source != source_identity:
+                raise ValueError(
+                    f"combine_pass_partials: {path} was integrated by source "
+                    f"{partial_source!r}, not this run's {source_identity!r}.  "
+                    "Partial cubes from different quadrature source states "
+                    "cannot be mixed.")
+            partial_windowing = str(
+                f.attrs.get("mpa_partial_windowing", ""))
+            if partial_windowing != str(windowing):
+                raise ValueError(
+                    f"combine_pass_partials: {path} was integrated with MPA "
+                    f"windowing={partial_windowing!r}, not {str(windowing)!r}. "
+                    "The pane and sector plans are different quadrature "
+                    "partitions and cannot be summed into one self-energy.")
             n_p_file = int(f.attrs.get("mpa_partial_n_p", -1))
             if n_p_file != int(n_p):
                 raise ValueError(
@@ -2116,7 +2401,8 @@ def compute_mpa_sigma_c_omega_grid(
     laplace_ratio_max=DEFAULT_LAPLACE_RATIO_MAX, rel_tol=1.0e-8,
     allow_partial=False, pole_subset=None, group_subset=None,
     group_digests=None, census_out=None, census_sha="", plan_store=None,
-    plan_verify=False, binned_width_clause=None, print_fn=print,
+    plan_verify=False, binned_width_clause=None, windowing="pane",
+    print_fn=print,
 ):
     """``Sigma_c(omega, k, m, n)`` from a staged multipole fit store.
 
@@ -2175,8 +2461,10 @@ def compute_mpa_sigma_c_omega_grid(
 
     import jax
     import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
 
     from common import timing
+    from common.collectives import barrier, device_put_process_local
     from file_io import mpa_store
     from . import plan_store as PS
     from . import window_farm as WF
@@ -2190,10 +2478,25 @@ def compute_mpa_sigma_c_omega_grid(
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_grid_ry must be a 1D non-empty array.")
     omega_max_ry = float(np.max(np.abs(omega_req)))
+    windowing = str(windowing).strip().lower()
+    if windowing not in ("pane", "sector"):
+        raise ValueError(
+            f"MPA Sigma windowing={windowing!r}; expected 'pane' or 'sector'.")
+    if windowing == "sector" and binned_width_clause is not None:
+        raise ValueError(
+            "MPA Sigma: mpa_binned_width_clause cannot be combined with "
+            "windowing='sector'.  The sector plan has no sign-definite width "
+            "panes for that clause to bin.")
     edge_factor = float(ppm_cfg.window_edge_factor)
     xi_ry = narrow_pole_threshold_ry(
         float(ppm_cfg.regularization_ev) / RYD_TO_EV, omega_max_ry,
         edge_factor)
+    print_fn(
+        f"  MPA Sigma windowing: {windowing} -- "
+        + ("fixed GN branch geometry, pi/4 sector sinc on sign-definite "
+           "pieces, accepted Gamma<xi compatibility in the crossing core"
+           if windowing == "sector" else
+           "width-pane planner with the Gamma<xi two-point substitution"))
 
     ledger = mpa_store.fit_completion_ledger(fit_src)
     n_p = int(ledger["n_p"])
@@ -2231,6 +2534,11 @@ def compute_mpa_sigma_c_omega_grid(
     tau_kernels = (_get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid),
                    _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
                                          merged_x=True))
+    pole_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    print_fn(
+        "  MPA pole placement: B_p, Re Omega_p and complex Omega_p are "
+        "staged once per pole at P(None,'x','y') and reused by all four "
+        "branches.")
 
     idx_pos = np.where(omega_req >= 0.0)[0]
     idx_neg = np.where(omega_req < 0.0)[0]
@@ -2259,8 +2567,17 @@ def compute_mpa_sigma_c_omega_grid(
     fixed = {"read_s": 0.0, "plan_s": 0.0, "load_s": 0.0, "addr_s": 0.0,
              "verify_s": 0.0, "poles": 0, "branches": 0, "loaded": 0}
     plan_dir = str(plan_store or "") or None
+    if ((census_out is not None or plan_dir is not None)
+            and (not str(census_sha) or str(census_sha) == "unknown")):
+        raise ValueError(
+            "compute_mpa_sigma_c_omega_grid: a census or plan store "
+            "requires the exact clean-commit or dirty-tree source identity; "
+            "an empty/unknown identity would let distinct planners address "
+            "the same artifact.")
     if plan_dir is not None and census_out is not None:
-        os.makedirs(plan_dir, exist_ok=True)
+        if int(jax.process_index()) == 0:
+            os.makedirs(plan_dir, exist_ok=True)
+        barrier("mpa_plan_store_ready", print_fn=print_fn)
     plan_written = {}
     if census_out is not None:
         print_fn(
@@ -2288,21 +2605,32 @@ def compute_mpa_sigma_c_omega_grid(
         fixed["poles"] += 1
         print_fn(f"  MPA pass read: pole {int(p)} slab in "
                  f"{time.perf_counter() - t_read:.2f} s")
-        # The complex operand the MPA-routed groups take, built once per
-        # pole rather than once per branch, and only on the route that
-        # needs it: a loaded plan names which of the two slab operands
-        # each group takes and the loader rebuilds it from these arrays.
-        omega_complex_host = (a_host - 1j * g_host
-                              if (plan_dir is not None
-                                  and census_out is None) else None)
+        # The two pole-frequency operands are one physical field.  Keep one
+        # host identity for the four planners so the pole-level device cache
+        # can stage each representation at most once.
+        omega_complex_host = a_host - 1j * g_host
+        B_p_device = device_put_process_local(
+            np.asarray(B_p, dtype=np.complex128), pole_sharding)
+        a_device = device_put_process_local(a_host, pole_sharding)
         state = _prepare_sigma_state(
             jnp.asarray(wfns.enk[:, s.full]), jnp.asarray(wfns.occ[:, s.full]),
-            jnp.asarray(B_p, dtype=jnp.complex128),
-            jnp.asarray(a_host, dtype=jnp.float64),
-            jnp.ones(a_host.shape, dtype=bool),
+            B_p_device, a_device, jnp.ones_like(a_device, dtype=bool),
             jnp.asarray(str(ppm_cfg.fermi_reference) == "midgap", dtype=bool),
             jnp.asarray(True, dtype=bool))
         live = _host_at_source_shape(state.B_mask, bool, _to_host_np)
+        B_dev = state.B_corr
+        branches = tuple(_iter_branches(
+            omega_pos=np.asarray(omega_req[idx_pos], dtype=np.float64),
+            idx_pos=idx_pos,
+            omega_neg_abs=np.asarray(-omega_req[idx_neg], dtype=np.float64),
+            idx_neg=idx_neg,
+            E_cond=state.E_cond, H_val=state.H_val,
+            cond_mask=state.cond_mask, val_mask=state.val_mask))
+        # The branch objects retain precisely the A-side arrays they use and
+        # B_dev retains the corrected residue.  The rest of ``state`` is
+        # planner evidence already gathered to ``live``; keeping it through
+        # thousands of tau dispatches needlessly pins full pole fields.
+        del state, B_p_device
         # The pole-level half of the plan address, taken once for the four
         # branches that share these arrays -- and here rather than beside
         # the read, because ``live`` is the store's B mask and comes from
@@ -2327,15 +2655,11 @@ def compute_mpa_sigma_c_omega_grid(
             gamma_max_ev=float(np.max(g_host, where=live, initial=0.0))
             * RYD_TO_EV)
 
-        B_dev = jnp.asarray(state.B_corr)
-        for br in _iter_branches(
-                omega_pos=np.asarray(omega_req[idx_pos], dtype=np.float64),
-                idx_pos=idx_pos,
-                omega_neg_abs=np.asarray(-omega_req[idx_neg],
-                                         dtype=np.float64),
-                idx_neg=idx_neg,
-                E_cond=state.E_cond, H_val=state.H_val,
-                cond_mask=state.cond_mask, val_mask=state.val_mask):
+        pole_operands = _BranchOperandCache(mesh_xy)
+        pole_operands.seed(a_host, a_device)
+        groups = None
+        branch_tiles = None
+        for br in branches:
             bkey = WF.branch_key(br.space, br.neg_omega_half)
             # A BRANCH THIS LEG DOES NOT OWN IS NOT PLANNED, and that is
             # the difference between a sixteen-leg farm that pays the
@@ -2368,6 +2692,8 @@ def compute_mpa_sigma_c_omega_grid(
                         crossing_max_nodes=int(quad.crossing_max_nodes),
                         use_shipped_minimax_tables=bool(
                             quad.use_shipped_tables),
+                        windowing=windowing,
+                        omega_complex=omega_complex_host,
                         log_tag=f"p{p} {br.tag}", print_fn=print_fn)
 
             plan_addr, plan_file = None, None
@@ -2395,6 +2721,7 @@ def compute_mpa_sigma_c_omega_grid(
                             quad.use_shipped_tables),
                         "space": str(br.space),
                         "neg_omega_half": bool(br.neg_omega_half),
+                        "windowing": windowing,
                         # THE CLAUSE IS PART OF THE PLAN, SO IT IS PART OF
                         # THE ADDRESS.  The binned width clause changes
                         # pane membership when it is on; a cached plan
@@ -2498,12 +2825,16 @@ def compute_mpa_sigma_c_omega_grid(
                          f"{len(groups)} groups in "
                          f"{time.perf_counter() - t_plan:.2f} s")
                 if plan_dir is not None and census_out is not None:
-                    PS.write_branch_plan(
-                        plan_file, groups, address=plan_addr, pole=p,
-                        bkey=bkey, source_sha=census_sha, fit_store=fit_src,
-                        n_p=n_p, stats=stats, a_ry=a_host,
-                        omega_complex=a_host - 1j * g_host,
-                        print_fn=print_fn)
+                    if int(jax.process_index()) == 0:
+                        PS.write_branch_plan(
+                            plan_file, groups, address=plan_addr, pole=p,
+                            bkey=bkey, source_sha=census_sha,
+                            fit_store=fit_src, n_p=n_p, stats=stats,
+                            a_ry=a_host,
+                            omega_complex=omega_complex_host,
+                            print_fn=print_fn)
+                    barrier(f"mpa_plan_p{int(p)}_{bkey}",
+                            print_fn=print_fn)
                     plan_written[f"{int(p)}.{bkey}"] = {
                         "path": plan_file, "address": plan_addr}
             rec.n_legacy_modes = stats["n_narrow"]
@@ -2534,7 +2865,8 @@ def compute_mpa_sigma_c_omega_grid(
             branch_tiles = run_pass_branch(
                 groups=groups, omega_nonneg_ry=br.omega_abs, E_A=br.E_A,
                 B_p=B_dev, psi=psi, tau_kernels=tau_kernels,
-                mesh_xy=mesh_xy, log_tag=f"p{p} {br.tag}", print_fn=print_fn)
+                mesh_xy=mesh_xy, log_tag=f"p{p} {br.tag}",
+                print_fn=print_fn, operand_cache=pole_operands)
             if branch_tiles is None:
                 continue
             if tile_acc is None:
@@ -2546,7 +2878,12 @@ def compute_mpa_sigma_c_omega_grid(
                 for d, t in enumerate(branch_tiles.tiles):
                     tile_acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
         records.append(rec)
-        del omega_complex_host
+        # finalize_host_tiles has drained every tau/D2H use of this pole.
+        # Drop its device and host owners before the next slab is read so the
+        # advertised one-pole residency is also the actual HBM high-water.
+        del (B_dev, a_device, pole_operands, groups, branch_tiles, branches,
+             br, Omega_p, B_p, a_host, g_host, b_abs, live,
+             omega_complex_host)
 
     # THE LINE §10 IS WRITTEN FROM.  One greppable row per leg, so the
     # fixed term is a measurement in the log rather than a subtraction
@@ -2560,12 +2897,15 @@ def compute_mpa_sigma_c_omega_grid(
         f"{fixed['read_s'] + fixed['plan_s'] + fixed['load_s'] + fixed['addr_s']:.2f}s")
 
     if census_out is not None:
-        WF.write_census(
-            census_out, census_rows, fit_store=str(fit_src), n_p=n_p,
-            sha=str(census_sha), digests=census_digests,
-            extra={"poles": [int(x) for x in walk],
-                   "omega_grid_ry": [float(x) for x in omega_req],
-                   "plans": plan_written})
+        if int(jax.process_index()) == 0:
+            WF.write_census(
+                census_out, census_rows, fit_store=str(fit_src), n_p=n_p,
+                sha=str(census_sha), digests=census_digests,
+                extra={"poles": [int(x) for x in walk],
+                       "omega_grid_ry": [float(x) for x in omega_req],
+                       "windowing": windowing,
+                       "plans": plan_written})
+        barrier("mpa_pass_census_written", print_fn=print_fn)
         print_fn(
             f"  MPA pass census written: {census_out}\n"
             f"    {len(census_rows)} window groups over poles "
@@ -2594,5 +2934,6 @@ def compute_mpa_sigma_c_omega_grid(
                 jax.make_array_from_single_device_arrays(
                     padded, tile_meta.sharding, arrays), tiled=False))
     sigma_c = strip_sigma_window(full_pad, tile_meta.nb_real)
-    print_fn(format_pass_report(records, xi_ev=xi_ry * RYD_TO_EV))
+    print_fn(format_pass_report(
+        records, xi_ev=xi_ry * RYD_TO_EV, windowing=windowing))
     return jnp.asarray(sigma_c, dtype=jnp.complex128), records

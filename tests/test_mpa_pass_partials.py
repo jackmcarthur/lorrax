@@ -25,6 +25,14 @@ import pytest
 
 from gw.mpa import sigma_pass
 
+_FIT_ID = "fit-test-allocation"
+_SOURCE_IDENTITY = "test-source"
+
+
+def _combine(paths, **kwargs):
+    return sigma_pass.combine_pass_partials(
+        paths, fit_id=_FIT_ID, source_identity=_SOURCE_IDENTITY, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 #  resolve_pole_subset — which poles, never in which order
@@ -74,7 +82,8 @@ def _write(tmp_path, name, cube, poles, *, n_p=4, om=None, store="S.h5"):
     path = str(tmp_path / name)
     sigma_pass.write_pass_partial(
         path, cube, [_rec(p) for p in poles], n_p=n_p, poles=poles,
-        omega_grid_ry=om, fit_src=store, print_fn=lambda *_a, **_k: None)
+        omega_grid_ry=om, fit_src=store, fit_id=_FIT_ID,
+        source_identity=_SOURCE_IDENTITY, print_fn=lambda *_a, **_k: None)
     return path, om
 
 
@@ -95,7 +104,7 @@ def test_partials_recombine_to_the_ascending_sum_and_report_the_order_cost(
     paths = [_write(tmp_path, f"p{p}.h5", cubes[p], [p])[0] for p in range(4)]
     om = np.linspace(-1.0, 1.0, shape[0])
 
-    total, poles, audit = sigma_pass.combine_pass_partials(
+    total, poles, audit = _combine(
         paths, n_p=4, omega_grid_ry=om, fit_src="S.h5",
         print_fn=lambda *_a, **_k: None)
 
@@ -120,7 +129,7 @@ def test_one_file_may_carry_several_poles_and_is_added_exactly_once(tmp_path):
     a, b = _field(2, shape, seed=3)
     pa, om = _write(tmp_path, "a.h5", a, [0, 1])
     pb, _ = _write(tmp_path, "b.h5", b, [2, 3], om=om)
-    total, _poles, audit = sigma_pass.combine_pass_partials(
+    total, _poles, audit = _combine(
         [pa, pb], n_p=4, omega_grid_ry=om, fit_src="S.h5",
         print_fn=lambda *_a, **_k: None)
     assert audit["n_files"] == 2
@@ -139,7 +148,7 @@ def test_red_twin_a_missing_pole_is_refused_not_summed(tmp_path):
         path, om = _write(tmp_path, f"p{p}.h5", cubes[p], [p], om=om)
         paths.append(path)
     with pytest.raises(ValueError, match="missing \\[2\\]"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             paths, n_p=4, omega_grid_ry=om, fit_src="S.h5",
             print_fn=lambda *_a, **_k: None)
 
@@ -152,7 +161,7 @@ def test_red_twin_a_doubled_pole_is_refused_not_summed(tmp_path):
         path, om = _write(tmp_path, f"{name}.h5", cubes[p], [p], om=om)
         paths.append(path)
     with pytest.raises(ValueError, match="duplicated \\[1\\]"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             paths, n_p=4, omega_grid_ry=om, fit_src="S.h5",
             print_fn=lambda *_a, **_k: None)
 
@@ -164,7 +173,7 @@ def test_red_twin_partials_from_two_stores_are_refused(tmp_path):
     p1, _ = _write(tmp_path, "p1.h5", cubes[1], [1], n_p=2, store="B.h5",
                    om=om)
     with pytest.raises(ValueError, match="was integrated against fit store"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             [p0, p1], n_p=2, omega_grid_ry=om, fit_src="A.h5",
             print_fn=lambda *_a, **_k: None)
 
@@ -177,7 +186,7 @@ def test_red_twin_a_different_omega_grid_is_refused(tmp_path):
     p0, _ = _write(tmp_path, "p0.h5", cubes[0], [0], n_p=2, om=om_a)
     p1, _ = _write(tmp_path, "p1.h5", cubes[1], [1], n_p=2, om=om_b)
     with pytest.raises(ValueError, match="different Σ ω grid"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             [p0, p1], n_p=2, omega_grid_ry=om_a, fit_src="S.h5",
             print_fn=lambda *_a, **_k: None)
 
@@ -192,7 +201,7 @@ def test_red_twin_a_foreign_format_version_is_refused(tmp_path):
         f.attrs["mpa_partial_format_version"] = (
             sigma_pass.PARTIAL_FORMAT_VERSION + 1)
     with pytest.raises(ValueError, match="declares partial format version"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             [p0], n_p=1, omega_grid_ry=om, fit_src="S.h5",
             print_fn=lambda *_a, **_k: None)
 
@@ -202,7 +211,7 @@ def test_red_twin_a_store_with_a_different_n_p_is_refused(tmp_path):
     cubes = _field(1, shape, seed=19)
     p0, om = _write(tmp_path, "p0.h5", cubes[0], [0], n_p=1)
     with pytest.raises(ValueError, match="was written from a store"):
-        sigma_pass.combine_pass_partials(
+        _combine(
             [p0], n_p=4, omega_grid_ry=om, fit_src="S.h5",
             print_fn=lambda *_a, **_k: None)
 

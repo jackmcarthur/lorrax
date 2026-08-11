@@ -279,7 +279,10 @@ def main(argv=None):
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
-	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
+	centroids_frac, centroid_indices, n_rmu = load_centroids(
+		config.paths.centroids_file, wfn.fft_grid)
+	centroid_hash = symmetry_maps.centroid_set_hash(
+		centroids_frac, np.asarray(wfn.fft_grid, dtype=np.int64))
 	assert_centroid_selector(config.paths.centroids_file,
 	                         config.paths.centroid_selector, print_fn=print0)
 	tmp_dir = os.path.join(input_dir, "tmp")
@@ -512,6 +515,7 @@ def main(argv=None):
 				quad=quad, e_ref=e_ref,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, band_slices=band_slices,
+				centroid_hash=centroid_hash,
 				input_dir=input_dir,
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,

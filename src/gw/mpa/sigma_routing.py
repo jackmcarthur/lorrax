@@ -131,6 +131,7 @@ __all__ = [
     "exact_resolvent",
     "refuse_edge_factor_below_envelope",
     "route_pole",
+    "sector_sign_definite_rule",
     "sign_definite_rule",
 ]
 
@@ -570,6 +571,37 @@ def sign_definite_rule(x_min_ry, x_max_ry, gamma_ry, *, rel_tol=1e-8,
     t = (-1j) * tau.astype(np.complex128)
     alpha = np.asarray(rule["h"], dtype=np.float64).astype(np.complex128)
     return t, alpha, rule
+
+
+def sector_sign_definite_rule(radial_min_ry, radial_max_ry, *, rel_tol=1e-8,
+                              max_nodes=DEFAULT_MAX_CROSSING_NODES):
+    """One contour rule for a coupled set of sign-definite denominators.
+
+    For ``d = x - i*Gamma`` in the fourth quadrant, rotate by ``pi/4``:
+
+    ``1/d = exp(i*pi/4) int exp[-d*exp(i*pi/4)*s] ds``.
+
+    ``radial_min_ry`` and ``radial_max_ry`` bound the magnitude of the actual
+    coupled ``(x, Gamma)`` tuples.  They never pair one pole's largest width
+    with another pole's smallest real part, which is the rectangular-envelope
+    error responsible for the old width-pane tree.
+    """
+    import minimax as _mm
+
+    try:
+        rule = _mm.reciprocal_sector_rule(
+            radial_min_ry, radial_max_ry, rel_tol=rel_tol,
+            max_nodes=max_nodes)
+    except ValueError as exc:
+        raise RoutingRefusal(
+            f"sector_sign_definite_rule: {exc}",
+            code="sector_rule_refused",
+            a_dim=(float(radial_max_ry) / float(radial_min_ry)
+                   if float(radial_min_ry) > 0.0 else None)) from exc
+    contour = complex(rule["contour"])
+    t = (-1j * contour) * np.asarray(rule["s"], dtype=np.float64)
+    alpha = np.asarray(rule["weights"], dtype=np.complex128)
+    return t.astype(np.complex128), alpha, rule
 
 
 def route_pole(

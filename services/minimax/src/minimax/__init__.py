@@ -143,6 +143,7 @@ from minimax.refusals import (
     UncertifiedSolveRefused,
     UnknownTarget,
 )
+from minimax.sector import reciprocal_sector_rule
 from minimax.targets import (
     CHARACTERS,
     FAMILIES,
@@ -236,6 +237,8 @@ __all__ = [
     "MinimaxRefusal", "NoCertifiedTable", "AmplificationCap", "UnknownTarget",
     "CatalogUnavailable", "TableUnreadable", "CatalogCorrupt",
     "UncertifiedSolveRefused", "SamplingUnsupported",
+    # --- analytic, proof-bounded rules (no table or optimizer) -------------
+    "reciprocal_sector_rule",
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]

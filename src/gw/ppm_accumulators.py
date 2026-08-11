@@ -29,8 +29,8 @@ from .ppm_windows import _SigmaWindow
 
 def _project_tau_onto_omega_np(
     sigma_re: np.ndarray, sigma_im: np.ndarray | None, omega_vec: np.ndarray,
-    t_node: complex, alpha_eff: complex, omega_sign: float, pref: float,
-    project_code: int,
+    t_node: complex, alpha: complex, omega_sign: float, pref: float,
+    project_code: int, e_ref_sum: float = 0.0,
 ) -> np.ndarray:
     """Apply the ω-kernel exp(i·ω_sign·ω·t) and project onto σ channels (host).
 
@@ -86,7 +86,13 @@ def _project_tau_onto_omega_np(
     and a two-channel pair at code=0 (whose recombine branch died when the
     merge became the default).
     """
-    omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
+    # Keep the energy reference and output frequency in ONE exponential.
+    # They are one scalar phase in the denominator algebra.  On the rotated
+    # sector contour the reference term dominates and their product decays,
+    # while evaluating exp(-i*E_ref*t) and exp(+i*omega*t) separately can
+    # underflow/overflow before multiplication on a perfectly safe stripe.
+    omega_kernel = np.exp(
+        -1j * (float(e_ref_sum) - omega_sign * omega_vec) * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
     # the full (n_ω, nk, i, j) contrib afterwards — removes one full-size
     # array pass + temporary per τ.  Value-identical, NOT bitwise (the
@@ -96,7 +102,7 @@ def _project_tau_onto_omega_np(
     # likewise dropped: both branches already produce complex128
     # (``np.asarray`` with a matching dtype is a no-copy view) — that one
     # is bit-exact.
-    coeff = (pref * alpha_eff) * omega_kernel
+    coeff = (pref * alpha) * omega_kernel
     if sigma_im is None:
         # Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
         if project_code != 0:
@@ -276,7 +282,7 @@ class _SigmaAccumulator:
         for each window:
             acc.begin_window(window)                        # window carries its own metadata
             for each tau:
-                acc.add_tau(σ_re, σ_im, t_c, α_eff_c)       # only per-τ data
+                acc.add_tau(σ_re, σ_im, t_c, α_c, E_ref_sum)
             acc.end_window()
         acc.finalize()
 
@@ -286,16 +292,19 @@ class _SigmaAccumulator:
     ``window.project_code``) instead of being fed a parallel stream of
     scalars.  ``window.prefactor`` already carries every sign the branch's
     physics fixes (including the −1 that the −ω half contributes), so there is
-    no separate scale argument.  ``t_c`` / ``α_eff_c`` are Python/host complex
-    scalars computed once in :func:`minimax_tau_integrate_sigma`.
+    no separate scale argument.  ``t_c`` / ``alpha_c`` are Python/host
+    complex scalars; ``E_ref_sum`` stays separate until it is combined with
+    the output frequency in the projector's single stable exponential.
 
     For Laplace (project="full") windows ``add_tau`` receives
-    ``(X, None, t_c, α_eff_c)`` — the single complex X = ψ†σψ = S_R + i·S_I
+    ``(X, None, t_c, alpha_c, E_ref_sum)`` — the single complex
+    X = psi^dagger sigma psi = S_R + i*S_I
     in the ``sigma_re`` slot (the default and only Laplace channel plan);
     crossing windows always deliver the (σ_re, σ_im) pair.
     """
     def begin_window(self, window: '_SigmaWindow') -> None: ...
-    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None: ...
+    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_c: complex,
+                e_ref_sum: float = 0.0) -> None: ...
     def end_window(self) -> None: ...
     def finalize(self) -> jax.Array | None: ...
 
@@ -384,7 +393,8 @@ class _TauAccumulator(_SigmaAccumulator):
                 "_TauAccumulator.begin_window: previous window never closed")
         self._cur = _WindowAccum(window)
 
-    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
+    def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_c: complex,
+                e_ref_sum: float = 0.0) -> None:
         # Grab EVERY local shard handle and start the D2H copies now — do NOT
         # materialize to numpy yet.  ``copy_to_host_async`` returns the same
         # shard object with the transfer kicked off in the background.
@@ -410,13 +420,14 @@ class _TauAccumulator(_SigmaAccumulator):
                 handles.append((sr.data, si.data))
         assert self._cur is not None and not self._cur.closed
         self._cur.pending_count += 1
-        self._pending.append((handles, t_c, alpha_eff_c, self._cur))
+        self._pending.append(
+            (handles, t_c, alpha_c, float(e_ref_sum), self._cur))
         if len(self._pending) > self._lag:
             self._drain_one()
 
     def _drain_one(self) -> None:
         from common import timing
-        handles, t_c, alpha_eff_c, wctx = self._pending.popleft()
+        handles, t_c, alpha_c, e_ref_sum, wctx = self._pending.popleft()
         if wctx.win_shards is None:
             wctx.win_shards = [None] * len(handles)
         for d, (hr, hi) in enumerate(handles):
@@ -439,8 +450,8 @@ class _TauAccumulator(_SigmaAccumulator):
             with timing.section("sigma.tau.omega_project"):
                 proj = _project_tau_onto_omega_np(
                     sr, si, self._omega_vec_np,
-                    t_c, alpha_eff_c, wctx.omega_sign_f, wctx.pref_f,
-                    wctx.project_code,
+                    t_c, alpha_c, wctx.omega_sign_f, wctx.pref_f,
+                    wctx.project_code, e_ref_sum,
                 )
                 if wctx.win_shards[d] is None:
                     wctx.win_shards[d] = np.zeros_like(proj)

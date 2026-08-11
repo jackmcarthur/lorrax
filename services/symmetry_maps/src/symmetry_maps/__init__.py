@@ -95,6 +95,10 @@ The surface
     service where ``tnp = 2π·τ`` is divided**, and it has no positional
     slot for the translations precisely so that no caller can pass the
     wrong convention silently.
+``centroid_set_hash``
+    The closure-independent, order-sensitive identity of the ISDF basis:
+    exact integer FFT-grid indices when the grid is known, canonical wrapped
+    fractional coordinates otherwise.
 ``resolve_qgrid_symmetry`` / ``QgridSymmetryResolution``
     The DECISION, taken once: verdict → mode (``"ibz"`` | ``"full_bz"``)
     → tables → reason, in one object.  Consumers of the q-axis unfold
@@ -180,6 +184,7 @@ from symmetry_maps.orbit_syms import (
     QgridSymmetryResolution,
     real_space_action_tables,
     canonicalize_orbit,
+    centroid_set_hash,
     centroid_source_map_and_wrap,
     fft_grid_pullback_perm,
     orbit_images,
@@ -211,6 +216,7 @@ __all__ = [
     "fft_grid_pullback_perm", "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
+    "centroid_set_hash",
     "CLOSURE_TOL_DEFAULT",
     # orbit closure: the RESOLUTION the consumers branch on
     "resolve_qgrid_symmetry", "QgridSymmetryResolution",

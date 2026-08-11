@@ -371,6 +371,16 @@ def _config(path, *, nk_tot, head_label="as_shipped"):
         omega_grid_ry=np.linspace(-1.0, 1.0, 5),
         mpa_pole_energy_unit="Ry",
         mpa_head_label=head_label,
+        mpa_pole_subset="",
+        mpa_group_subset="",
+        mpa_pass_census_out="",
+        mpa_farm_manifest="",
+        mpa_plan_store="",
+        mpa_plan_verify=False,
+        mpa_pass_partial_out="",
+        mpa_pass_partial_in="",
+        mpa_binned_width_clause="off",
+        mpa_sigma_windowing="pane",
     ), types.SimpleNamespace(nk_tot=nk_tot)
 
 

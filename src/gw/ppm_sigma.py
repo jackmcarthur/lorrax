@@ -338,25 +338,24 @@ def minimax_tau_integrate_sigma(
         directly.  Crossing windows deliver the (σ_re, σ_im) pair.
     add_tau
         Callable invoked per τ with ``(σ_re, σ_im, t_c, α_eff_c)``.
-        ``t_c`` and ``α_eff_c`` are Python complex scalars (already on
+        ``t_c`` and ``α_c`` are Python complex scalars (already on
         host — they were the numpy values we used to build ``t_j``).
         Host-side accumulators can use them directly; GPU-side
         accumulators wrap them as jax scalars themselves.
     E_ref_sum
-        ``E_ref_A + E_ref_B`` for this window — absorbed into α per τ as
-        ``α_eff = α · exp(-i · E_ref_sum · t)`` so the Laplace kernel
-        sees non-negative (E_A, Ω_q) arguments.
+        ``E_ref_A + E_ref_B`` for this window.  The accumulator combines it
+        with the output frequency in one stable exponential, so the Laplace
+        kernel sees non-negative ``(E_A, Omega)`` arguments without forming
+        a growing and a decaying scalar separately.
     progress
         Optional ``LoopProgress``-like object whose ``.step()`` is called
         after each τ dispatch.
     """
     t_host = np.asarray(jax.device_get(nodes.t), dtype=np.complex128)
     alpha_host = np.asarray(jax.device_get(nodes.alpha), dtype=np.complex128)
-    alpha_eff_host = alpha_host * np.exp(-1j * float(E_ref_sum) * t_host)
-
     for i in range(int(nodes.t.shape[0])):
         t_c = complex(t_host[i])
-        alpha_eff_c = complex(alpha_eff_host[i])
+        alpha_c = complex(alpha_host[i])
         # Crossing windows return σ^τ as a (re, im) tuple: the crossing
         # window's HGL quadrature consumes Im[coeff·σ] = Re(c)·S_I +
         # Im(c)·S_R with independent real ω-weights, so both channels must
@@ -388,7 +387,7 @@ def minimax_tau_integrate_sigma(
         if progress is not None:
             progress.step()
         with timing.section("sigma.tau.host_accum"):
-            add_tau(sigma_re, sigma_im, t_c, alpha_eff_c)
+            add_tau(sigma_re, sigma_im, t_c, alpha_c, E_ref_sum)
 
 
 def _integrate_tau_windows_for_branch(
