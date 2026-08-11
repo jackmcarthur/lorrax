@@ -32,6 +32,22 @@ import numpy as np
 import pytest
 
 h5py = pytest.importorskip("h5py")
+
+# THE SERVICE ROOTS GO ON THE PATH BEFORE THE PROBE, and this is not
+# boilerplate.  MEASURED, 2026-08-10, ``lx test`` at P=4 on nid001156:
+# ``symmetry_maps`` is not importable at module scope inside the
+# container, so a bare ``importorskip`` collection-skips this whole
+# file and the run reports green having asserted nothing.  Three
+# existing suites — ``test_mpa_fit_driver``, ``test_mpa_store``,
+# ``test_mpa_pole_unfold`` — do exactly that today and have therefore
+# never run on the cluster harness (registered for their owner; not
+# fixed here, because the fix belongs in conftest and a peer lane is
+# already in that file).  ``ffi._services.ensure_on_path`` is the
+# tree's own answer, called by every ``src`` consumer, and it is
+# idempotent.
+from ffi import _services as _svc                                 # noqa: E402
+
+_svc.ensure_on_path()
 pytest.importorskip("symmetry_maps.qirr_store")
 jax = pytest.importorskip("jax")
 
