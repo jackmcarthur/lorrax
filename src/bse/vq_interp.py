@@ -2758,13 +2758,14 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
               "  ** SHORT — build_fH_R's orthonormality gate decides **"))
     if n_guard < 4:
         log_fn(f"  [warn] only {n_guard} guard band(s) above the ζ-fit "
-               f"window.  f(ε) ≡ 0 for ε ≥ max_k ε[nb_fh−1], and the "
-               f"shoulder measured four bands deep on both probed parents "
-               f"(2026-08-11-fifth-wall-is-the-f-transform-shoulder.md §2), "
-               f"so the top of the ζ window may come back from eigh as an "
-               f"arbitrary null-space direction.  The f-shoulder gate in "
-               f"compute_wfns_fi is what decides; this is the warning it "
-               f"makes cheap to act on.")
+               f"window.  f(ε) ≡ 0 for ε ≥ max_k ε[nb_fh−1], and the dead "
+               f"set measured FOUR bands deep on a 20-band window and TWO on "
+               f"a 52-band one (2026-08-11-fifth-wall-is-the-f-transform-"
+               f"shoulder.md §2), so the top of the ζ window may come back "
+               f"from eigh as an arbitrary null-space direction.  The "
+               f"f-shoulder gate in compute_wfns_fi is what decides — it "
+               f"prints the dead set's actual depth on THIS deck; this is "
+               f"the warning that makes it cheap to act on.")
     if n_guard > 16:
         log_fn(f"  [warn] {n_guard} guard bands is a LARGE interp window and "
                f"a large window does not improve — past a system-dependent "

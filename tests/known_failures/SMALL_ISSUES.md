@@ -651,6 +651,29 @@ silent overwrite.
     argues for every deck key) rather than fall back to defaults; the dedupe
     then follows from that ruling instead of preserving an accident.
     [xbands cleanup lane, 2026-08-11]
+44. **The f-shoulder gate RUNS on the refit path but does not LOG there.**
+    `bse.vq_interp.refit_vq` calls `compute_wfns_fi` without a `log_fn`, and
+    `refit_ongrid_null` calls `refit_vq` with a silenced one, so the
+    `[gate] f-shoulder over the RETURNED bands …` line — the dead-set census
+    and the `min_k |f|/max|f|` a lane needs to choose a guard count — appears
+    only for the driver's own BSE-window call and never for the refit's. The
+    gate itself is fine and fires there (measured: `twowin_0811/_logs/
+    nA_g0trip.log` refuses by name at band 50 with 16 zero slots), so this is
+    observability, not correctness. The fix is not "pass `log_fn`": that would
+    print the same three lines once per off-grid Q, which on a 129-point path
+    is 129 copies. It wants a print-once, at `refit_prepare` time, of the
+    census over the window the refit will return — which is computable there
+    from `enk_sigma` alone. [two-window lane, 2026-08-11]
+45. **`lx batch` co-placement: do not start a second batch against a pool that
+    already has 4-GPU legs in flight.** Three legs of this lane died in the
+    JAX coordination service (`ABORTED: … tried to connect with a different
+    incarnation`, rc 143/134) at the two moments a second `lx batch` was fired
+    against allocation 56644791 while the first still had 4-GPU legs running —
+    the same failure the zsolve lane recorded for `-P 4` on one node, reached
+    by a different route. `-P 2` inside ONE batch was fine for eleven legs;
+    two concurrent batches at `-P 2` and `-P 1` was not. The tell is rc
+    143/134 at ~30–45 s with `RegisterTask` errors in the log, and the legs
+    measure nothing. [two-window lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 
