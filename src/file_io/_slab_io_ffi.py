@@ -942,53 +942,15 @@ def _local_shard_and_global_offset(
     return local, offset
 
 
-def _shard_read_plan(
-    index: Sequence[slice],
-    out_shape: Sequence[int],
-    offset: Sequence[int],
-    valid_shape: Sequence[int],
-) -> tuple[tuple[int, ...],
-           tuple[slice, ...] | None,
-           tuple[slice, ...] | None]:
-    """Map one entry of ``Sharding.addressable_devices_indices_map`` to
-    a per-device hyperslab read plan.
-
-    Returns ``(local_shape, dst, disk)``:
-
-    * ``local_shape`` — the device-local block shape (replicated axes
-      come back from JAX as ``slice(None, None)`` and span the full
-      ``out_shape`` axis);
-    * ``dst`` — slices INTO the local block for the part overlapping
-      the valid (on-disk) region ``[0, valid_shape)`` of the slab, or
-      ``None`` when the block lies wholly in the padded tail (leave
-      the zero-filled block untouched);
-    * ``disk`` — the matching dataset slices, shifted by the caller's
-      global ``offset``.
-
-    Single source of truth for the index→(offset, shape) + valid-clip
-    arithmetic that was previously copy-pasted per backend
-    (``_slab_io_allgather`` sharded fast path and
-    ``_slab_io_mpi_host.read_slab`` — audit 2026-07-28,
-    QUALITY_PATTERNS #3).  ``common.collectives.
-    device_put_process_local`` keeps its own offsets-only two-liner.
-    """
-    ndim = len(out_shape)
-    los: list[int] = []
-    his: list[int] = []
-    for ax in range(ndim):
-        sl = index[ax]
-        los.append(0 if sl.start is None else int(sl.start))
-        his.append(int(out_shape[ax]) if sl.stop is None else int(sl.stop))
-    local_shape = tuple(h - l for l, h in zip(los, his))
-    r_lo = [min(l, int(v)) for l, v in zip(los, valid_shape)]
-    r_hi = [min(h, int(v)) for h, v in zip(his, valid_shape)]
-    if not all(b > a for a, b in zip(r_lo, r_hi)):
-        return local_shape, None, None
-    disk = tuple(slice(int(offset[ax]) + r_lo[ax],
-                       int(offset[ax]) + r_hi[ax]) for ax in range(ndim))
-    dst = tuple(slice(r_lo[ax] - los[ax], r_hi[ax] - los[ax])
-                for ax in range(ndim))
-    return local_shape, dst, disk
+# ``_shard_read_plan`` — the per-device (local_shape, dst, disk) hyperslab
+# arithmetic — was DELETED on 2026-08-11.  It was written in the 2026-07-28
+# audit as the single source of truth for a clip that TWO backends had
+# copy-pasted (``_slab_io_allgather``'s sharded fast path and
+# ``_slab_io_mpi_host.read_slab``), and both of those backends went away
+# with the tier deletion at 233a830d.  Nothing has called it since; the FFI
+# read path does its own clipping in ``_normalize_valid_shape`` plus the C
+# handler's rank arithmetic.  A de-duplication helper whose duplicates are
+# both gone is not a helper.
 
 
 # The ``lfs setstripe`` prestripe helper that used to live here was
@@ -1387,6 +1349,13 @@ class _DatasetGeometry:
     shape/dtype change on an existing dataset (decisions.md 2026-08-04);
     without that rule an ``H5Dopen`` of a differently-shaped dataset
     would leave this dict describing geometry the file does not have.
+
+    THAT REFUSAL IS THE C HANDLER'S, not this class's.  A Python
+    ``_refuse_geometry_change`` method used to live here and raise the
+    reuse-or-refuse ValueError; it was DELETED on 2026-08-11 with zero
+    callers.  ``lrx_phdf5_ensure_dataset`` performs the same check
+    collectively on every rank, which is where it has to be — a Python
+    twin can only see the ranks that reach it, and the two could disagree.
     """
 
     def _geom_init(self) -> None:
@@ -1399,35 +1368,6 @@ class _DatasetGeometry:
     def _known_shape(self, name: str) -> tuple[int, ...] | None:
         got = self._ds_geom.get(str(name))
         return None if got is None else got[0]
-
-    def _refuse_geometry_change(
-        self, *, op: str, name: str, want_shape, want_dtype,
-        have_shape, have_dtype,
-    ) -> bool:
-        """Return True if the existing dataset is reusable; else REFUSE.
-
-        decisions.md 2026-08-04: identical logical shape and dtype ⇒
-        reuse (idempotent); anything else ⇒ refuse, naming both shapes.
-        Never delete-and-recreate (silent data loss — the pre-2026-08-04
-        allgather behaviour) and never write into the previous geometry
-        (wrong physics with no symptom — the pre-2026-08-04 FFI and
-        phdf5_host behaviour, which clipped an ``mode='a'`` rerun at a
-        new μ against the OLD extent).
-        """
-        want_shape = tuple(int(s) for s in want_shape)
-        have_shape = tuple(int(s) for s in have_shape)
-        want_dtype = np.dtype(want_dtype)
-        have_dtype = np.dtype(have_dtype)
-        if want_shape == have_shape and want_dtype == have_dtype:
-            return True
-        raise ValueError(
-            f"{op} {name!r}: dataset already exists with shape "
-            f"{have_shape} dtype {have_dtype.name}, but was requested at "
-            f"shape {want_shape} dtype {want_dtype.name}.  SlabIO will "
-            f"neither delete-and-recreate it (data loss) nor write into "
-            f"the previous geometry (wrong extent, no symptom).  Open the "
-            f"file with mode='w', use a different dataset name, or delete "
-            f"the file.")
 
 
 def _shard_divisors(
