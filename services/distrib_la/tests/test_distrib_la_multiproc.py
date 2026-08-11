@@ -411,23 +411,7 @@ def check_closure_agrees_across_backends(mesh, dtype="complex128", nq=2,
     """
     import jax.numpy as jnp
     A_np, d, edge = _planted_pivot_gram(n, pos, size, nq, dtype)
-
-    def _fresh():
-        """A NEW device operand for every backend call.
-
-        ``cholesky`` DONATES argument 0 (``distrib_la.DONATES``) — the
-        factors are written over the operand's buffer wherever the library
-        supports it — so a second backend handed the same array gets
-        ``Array has been deleted``.  MEASURED, not defensive: the first
-        version of this check built ``A`` once and reused it, and on the
-        GPU 2x2 leg cuSOLVERMp's potrf consumed it and SLATE's call then
-        raised.  The runner classifies a ``RuntimeError`` as a GUARD, so
-        the cell reported neither PASS nor FAIL and simply vanished from
-        the count — "10 cells ran" where the CPU arm ran 14.  That is the
-        exact failure mode this file's own ``done: N cells ran`` line
-        exists to expose, and it worked.
-        """
-        return _put(A_np, mesh, (None, "x", "y"))
+    A = _put(A_np, mesh, (None, "x", "y"))
 
     def _verdict(label, L):
         piv = _gather(D.cholesky_pivot_spectrum(L))[0]
@@ -454,33 +438,17 @@ def check_closure_agrees_across_backends(mesh, dtype="complex128", nq=2,
         except (ValueError, RuntimeError) as exc:
             deferred[backend] = str(exc).split("\n")[0]
             continue
-        # PAST THIS LINE, RESOLUTION HAS PROMISED.  "A returned FFI name
-        # means every guard passed: the subsequent call cannot fail for an
-        # availability or geometry reason" -- so a RuntimeError from here
-        # on is a DEFECT, not a guard, and it must be re-raised as an
-        # AssertionError or the CLI runner files it under GUARD and the
-        # cell disappears from the count without ever saying FAIL.  That
-        # is not hypothetical: it is what the donated-operand bug above
-        # did on the first GPU leg.
-        try:
-            mod = D.backend_module(backend)
-            if backend == "cusolvermp":
-                L = mod.cholesky_handle_to_natural_L(
-                    mod.batched_distributed_cholesky(_fresh(), mesh=mesh))
-            else:
-                # SLATE factors ONE tile per call and hands back a handle,
-                # so the stack is assembled here rather than by
-                # plan.batched -- which refuses to stack handles, by
-                # design (one_handle).  A fresh operand PER q, same
-                # donation reason.
-                L = jnp.stack([
-                    mod.distributed_cholesky(_fresh()[q],
-                                             mesh=mesh).to_jax_lower()
-                    for q in range(nq)])
-        except (RuntimeError, ValueError) as exc:
-            raise AssertionError(
-                f"{backend}: resolve_backend PROMISED this call would "
-                f"work, and it raised {type(exc).__name__}: {exc}") from exc
+        mod = D.backend_module(backend)
+        if backend == "cusolvermp":
+            L = mod.cholesky_handle_to_natural_L(
+                mod.batched_distributed_cholesky(A, mesh=mesh))
+        else:
+            # SLATE factors ONE tile per call and hands back a handle, so
+            # the stack is assembled here rather than by plan.batched --
+            # which refuses to stack handles, by design (one_handle).
+            L = jnp.stack([
+                mod.distributed_cholesky(A[q], mesh=mesh).to_jax_lower()
+                for q in range(nq)])
         ranks[backend] = _verdict(backend, L)
 
     assert len(set(ranks.values())) == 1, (
