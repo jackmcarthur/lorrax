@@ -289,12 +289,20 @@ measurements above are all from the repaired wrapper.
 had started. The parent control's `lx batch` wrapper vanished, so no rc file
 and no summary ever appeared, while the step itself ran on to completion in
 976 s and wrote its full certification block. Reading "no rc file" as "the leg
-died", this lane relaunched it, and the duplicate then raced the original for
-the same `<logdir>/<id>.log`. **The banked log was checked rather than
-trusted**: it contains exactly one `refit-cert WORST` block, one Q#2 value and
-one step id (`lx-Xg1-010647`), so the numbers reported here come from a single
-clean 976 s run and not from two interleaved ones. Registered as SMALL_ISSUES
-row 41, with the rule that a relaunch must carry a distinct leg id.
+died", this lane relaunched it under the same leg id, and the duplicate
+**overwrote the original's `<logdir>/<id>.log`** — which survives only because
+it had been copied aside first, as `_logs/xb_ctl_parent3_ASREAD.log`.
+
+**The accident turned into the best control in this row.** The two runs are
+separate and each is internally clean — the copy holds step `lx-Xg1-010647`
+(976 s, one certification block) and the live log holds `lx-Xg1-012101`
+(973 s, one block) — so the parent control was measured **twice
+independently on the fixed tree**, and with `xbwin_0811`'s pre-fix control that
+makes **three runs agreeing to five decimals on all four Q**: 0.03899 /
+0.85783 / 0.37907 / 0.03410, worst always Q#2. Registered as SMALL_ISSUES
+row 41, with the rule that a relaunch must carry a distinct leg id — the
+overwrite is confirmed rather than near-missed, and it cost nothing here only
+because the deck is deterministic.
 
 Separately, two legs died on the JAX coordination service
 (`ALREADY_EXISTS: request from a newer incarnation`) because two of this lane's
