@@ -50,13 +50,23 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from common.shard_map import shard_map
 from jax.experimental import multihost_utils as _mh
 from functools import partial
+from typing import TYPE_CHECKING
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader                                    # noqa: E402
+# SMALL_ISSUES row 38.  ``WfnLoader`` is used at MODULE SCOPE for nothing but
+# two parameter annotations, and ``from __future__ import annotations`` above
+# means those are strings that are never evaluated — so this import bought a
+# hard dependency on ``wfn_loader`` (and, through it, h5py) for every consumer
+# of this module, including the ones that only want the select kernel.  That
+# edge is what let a clobbered PYTHONPATH on Perlmutter kill an h5py-less
+# import of a module that does not need h5py.  Under TYPE_CHECKING the
+# annotations still resolve for a type checker and cost nothing at run time.
+if TYPE_CHECKING:                                                   # pragma: no cover
+    from wfn_loader import WfnLoader
 from common import timing
 from common.collectives import device_put_process_local
 
@@ -613,7 +623,7 @@ def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
 
 
 def prune_candidates_by_pivoted_cholesky(
-    wfn: WfnLoader,
+    wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
     cand_idx: np.ndarray,
     n_keep: int,
@@ -630,6 +640,7 @@ def prune_candidates_by_pivoted_cholesky(
     orbit_id: np.ndarray | None = None,
     use_phdf5: bool = False,
     tol_rel: float | None = None,
+    n_point_budget: int | None = None,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -647,6 +658,19 @@ def prune_candidates_by_pivoted_cholesky(
 
     Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
     psd_info)``.
+
+    ``n_point_budget`` is THE FLOOR (owner ruling, 2026-08-10: "everything
+    the user has input on they should be specifying in units of points, and
+    we should be choosing the quantity of orbits that comes closest to that
+    number of points without exceeding it").  Orbit mode's ``n_keep`` is a
+    count of ORBITS, so the POINT total it lands on is whatever the picked
+    orbits happen to sum to and can overrun the number the user typed.  Give
+    this the user's point count and the delivered set is truncated to the
+    longest prefix of the pivot order whose point total does not exceed it —
+    a prefix and not a knapsack, because the pivot order is a quality ranking
+    produced by deflating in that order.  ``None`` (the default) is the
+    historical behaviour: ``n_keep`` orbits, whatever that costs in points.
+    Ignored outside orbit mode, where ``n_keep`` already IS the point count.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -852,11 +876,40 @@ def prune_candidates_by_pivoted_cholesky(
     else:
         # Unfold: kept = union of orbits of picked pivots.
         orbit_id_np = np.asarray(orbit_id)
-        picked_orbits = orbit_id_np[piv_np]
+        piv_used = piv_np
+        if n_point_budget is not None:
+            # THE FLOOR.  Truncate the pivot order to the longest prefix that
+            # fits the user's POINT budget.  Without this the delivered count
+            # is Σ orbit_size over whatever orbits the greedy picked, which
+            # overruns the number the user typed whenever the orbits it
+            # ranked highest are the large ones.
+            _labels, _inv = np.unique(orbit_id_np, return_inverse=True)
+            _sizes = np.bincount(_inv)
+            _sz_in_order = _sizes[np.searchsorted(_labels,
+                                                  orbit_id_np[piv_np])]
+            _cum = np.cumsum(_sz_in_order)
+            _k = int(np.searchsorted(_cum, int(n_point_budget), side="right"))
+            if _k < 1:
+                raise RuntimeError(
+                    f"pivoted-Cholesky REFUSES: the point budget "
+                    f"{int(n_point_budget)} is smaller than the first orbit "
+                    f"the pivot order ranked ({int(_sz_in_order[0])} "
+                    f"points), so the largest union of whole orbits that fits "
+                    f"is empty.  Orbit sizes present: "
+                    f"{np.array2string(np.unique(_sizes))}.  Raise N.")
+            piv_used = piv_np[:_k]
+            if verbose and _k < len(piv_np):
+                print(f"[pivoted_cholesky] ORBIT-FLOORED: "
+                      f"{int(n_point_budget)} points requested -> REALIZED "
+                      f"{int(_cum[_k - 1])} ({_k} of {len(piv_np)} picked "
+                      f"orbits kept; the next holds "
+                      f"{int(_sz_in_order[_k])} and would overrun).  The "
+                      f"floor SPENDS LESS and never rounds up.")
+        picked_orbits = orbit_id_np[piv_used]
         in_kept = np.isin(orbit_id_np, picked_orbits)
         keep_idx = np.asarray(cand_idx)[in_kept]
         if verbose:
-            print(f"[pivoted_cholesky] orbit-aware: {len(piv_np)} orbits picked "
+            print(f"[pivoted_cholesky] orbit-aware: {len(piv_used)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
         # R2 — certify at POINT granularity, which is the granularity of the
         # FILE being written.  Orbit mode only: in point mode ``rank`` is
@@ -1196,7 +1249,7 @@ def make_sharded_pivoted_cholesky_select(
 
 
 def build_gram_q0_via_loadwfns(
-    wfn: WfnLoader,
+    wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
     cand_idx: jnp.ndarray,
     n_val: int | None = None,
