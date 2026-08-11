@@ -68,6 +68,32 @@ KGRID = (NK, 1, 1)
 # helpers
 # ---------------------------------------------------------------------------
 
+def _mu_pad(n):
+    """The device-legal μ extent ``run_downfold`` itself pads to.
+
+    A CELL MUST BE ABLE TO EXPRESS ITSELF ON THE MESH IT FINDS.  Measured
+    2026-08-10 at four real GPUs (`owedlegs_0810/_logs/p4gates_gpu4.log`):
+    three cells in this initiative's two files were written at literal
+    extents — ``m = n = mu_S = 3``, an ``(nq, 4, 9)`` transfer — that do not
+    divide a 2×2 mesh, so ``contract_bands_block_reshard`` and ``pjit``
+    refused them BY NAME while the product they gate was healthy.  A 1×1
+    shape is not a small case of a P>1 shape; it is a different shape, and a
+    gate that only has one cannot certify the geometry production runs in.
+
+    The repair is the tree's own recipe rather than a rounder literal:
+    ``runtime.padding.padded_mu_extent`` is what ``downfold_run`` calls at
+    ``:348`` to size ``mu_S_pad``, and the zeta writer's own comment records
+    that "the transfer carries the device-legal μ pads on both axes ... and
+    the pad rows are exactly zero, so the slice is a restriction and not a
+    choice".  These cells now build that same padded operand, zero-filled,
+    and slice the logical block back off the answer.  At one device the
+    extent is unchanged, so the CPU numbers these cells have always reported
+    are untouched.
+    """
+    from runtime.padding import padded_mu_extent
+    return int(padded_mu_extent(int(n), int(jax.device_count())))
+
+
 def _psi(mesh, *, seed=0, nk=NK, nb=NB, ns=NS, mu=MU):
     """Random psi-at-centroids in the two layouts the Gram kernel wants."""
     rng = np.random.default_rng(seed)
@@ -375,31 +401,42 @@ def test_head_vector_transforms_with_the_conjugate_transfer():
     bar never sees it (the head is not in the bundle's V), every shape check
     passes, and on si_bse_debug the lowest exciton came out at 0.211 eV
     instead of 2.347 eV.
+
+    SHAPED ON THE MESH, not on 1×1 — see :func:`_mu_pad`.  ``m_s = 3`` is
+    the interesting case (μ_S generically does NOT divide the mesh: the real
+    deck selects 185 at 2×2), so it is kept and carried on the padded extent
+    the driver itself uses, with the pad rows exactly zero.  Zero rows of T
+    contribute zero rows to the congruence and zero entries to ``g0_S``, so
+    slicing the logical block off the answer restores the unpadded identity
+    exactly rather than approximately.
     """
     mesh = resolve_mesh()
     rng = np.random.default_rng(101)
     nq, m_s, m_l = 2, 3, 6
-    T = (rng.normal(size=(nq, m_s, m_l))
-         + 1j * rng.normal(size=(nq, m_s, m_l)))
-    g0 = rng.normal(size=m_l) + 1j * rng.normal(size=m_l)
+    m_s_pad, m_l_pad = _mu_pad(m_s), _mu_pad(m_l)
+    T = np.zeros((nq, m_s_pad, m_l_pad), dtype=np.complex128)
+    T[:, :m_s, :m_l] = (rng.normal(size=(nq, m_s, m_l))
+                        + 1j * rng.normal(size=(nq, m_s, m_l)))
+    g0 = np.zeros(m_l_pad, dtype=np.complex128)
+    g0[:m_l] = rng.normal(size=m_l) + 1j * rng.normal(size=m_l)
     head = np.conj(g0)[:, None] * g0[None, :]
     T_x = jax.lax.with_sharding_constraint(
         jnp.asarray(T), NamedSharding(mesh, P(None, None, "x")))
     T_y = jax.lax.with_sharding_constraint(
         jnp.asarray(T), NamedSharding(mesh, P(None, None, "y")))
     head_L = jax.lax.with_sharding_constraint(
-        jnp.asarray(np.broadcast_to(head, (nq, m_l, m_l)).copy()),
+        jnp.asarray(np.broadcast_to(head, (nq, m_l_pad, m_l_pad)).copy()),
         NamedSharding(mesh, P(None, "x", "y")))
     head_S = np.asarray(jax.device_get(
-        downfold.congruence(mesh, T_x, T_y)(head_L)))[0]
+        downfold.congruence(mesh, T_x, T_y)(head_L)))[0][:m_s, :m_s]
 
     g0_S = np.asarray(jax.device_get(downfold.transform_head_vector(
-        jnp.asarray(g0), T_x, 0, mesh)))
+        jnp.asarray(g0), T_x, 0, mesh)))[:m_s]
     rebuilt = np.conj(g0_S)[:, None] * g0_S[None, :]
     scale = np.max(np.abs(head_S))
     assert np.max(np.abs(rebuilt - head_S)) < 1e-12 * scale
 
-    wrong = np.einsum("mn,n->m", T[0], g0)
+    wrong = np.einsum("mn,n->m", T[0], g0)[:m_s]
     rebuilt_wrong = np.conj(wrong)[:, None] * wrong[None, :]
     assert np.max(np.abs(rebuilt_wrong - head_S)) > 0.1 * scale, (
         "T g0 also reproduced the congruenced head, so this gate is blind "
@@ -1032,7 +1069,12 @@ def test_qirr_the_cur_selection_is_not_star_stable_by_default():
         "decks the covariance condition is free and this section's repair is "
         "unnecessary; do not silently drop the check, measure it and say so")
     assert closed_at, "no mu_S was orbit-closed; the construction is wrong"
-    # the greedy-fill structure: closure lands on orbit boundaries
+    # On THIS synthetic, closure lands on orbit boundaries — q=0 gives every
+    # member of an orbit the same Schur diagonal and the tie-break is index
+    # order, so the pivot order fills orbits in turn.  That is a property of
+    # the construction and NOT of production Grams: on si_bse_debug the
+    # closed sizes would be the seven multiples of 24 and the real pivot
+    # order lands on none of them (0 of 185).
     assert all(m % QIRR_ORB == 0 for m in closed_at), closed_at
 
 
@@ -1050,9 +1092,21 @@ def test_qirr_orbit_completion_restores_closure_at_a_bounded_cost():
         closed = downfold.orbit_complete_keep(keep, sym_perm)
         assert set(keep.tolist()) <= set(closed.tolist()), "completion dropped"
         assert downfold.star_stability(closed, sym_perm).closed
+        # A PROPERTY OF THIS SYNTHETIC, NOT A GENERAL BOUND.  `keep` here is
+        # a prefix of index order against a synthetic whose orbits are index
+        # blocks, so completion cannot reach past the block mu_S stopped in.
+        # The generalisation this assert used to state in its message — "on a
+        # greedy pivot order the cost is the tail of one orbit" — is REFUTED
+        # on a production centroid set (si_bse_debug: 0 of 185 admissible
+        # mu_S closed, completion 185 -> 480, the whole parent basis;
+        # tests/known_failures/2026-08-10-downfold-qirr-star-stability.md).
+        # Kept as a cheap structural check on `orbit_complete_keep`, with the
+        # claim it is evidence for narrowed to what it actually covers.
         assert closed.size - keep.size < QIRR_ORB, (
-            "completion cost a whole group order; on a greedy pivot order it "
-            "should be the tail of the one orbit mu_S stopped inside")
+            "completion cost a whole group order on the SYNTHETIC, whose "
+            "orbits are contiguous index blocks — so an index-order prefix "
+            "cannot need more than the block it stopped inside.  This says "
+            "nothing about a real pivot order; see the amendment.")
         # and the tables it makes available are the parent's, restricted
         cperm, cL = downfold.child_unfold_tables(closed, sym_perm, L_table)
         assert cperm.shape == (QIRR_ORB, closed.size)

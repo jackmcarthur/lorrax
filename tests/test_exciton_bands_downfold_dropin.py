@@ -43,6 +43,26 @@ import jax.numpy as jnp                                       # noqa: E402
 from jax.sharding import NamedSharding, PartitionSpec as P    # noqa: E402
 
 
+def _mu_pad(n):
+    """The device-legal μ extent the drivers themselves pad to.
+
+    A CELL MUST BE ABLE TO EXPRESS ITSELF ON THE MESH IT FINDS.  Measured
+    2026-08-10 at four real GPUs (`owedlegs_0810/_logs/p4gates_gpu4.log`):
+    two cells in this file were written at literal μ extents — 3 kept rows,
+    an ``(nq, 4, 9)`` transfer — that do not divide a 2×2 mesh, so ``pjit``
+    refused their output shardings BY NAME while the driver policy they gate
+    was healthy.  μ_S generically does not divide the mesh (the real deck
+    selects 185 at 2×2), so the answer is not a rounder literal: it is the
+    pad the production path already carries.
+    ``runtime.padding.padded_mu_extent`` is the single source of truth for
+    it, and ``exciton_bands.build_conduction_stacks`` takes ``n_rmu_pad``
+    as an argument precisely so its caller can supply it.  At one device the
+    extent is unchanged, so these cells' 1×1 numbers are untouched.
+    """
+    from runtime.padding import padded_mu_extent
+    return int(padded_mu_extent(int(n), int(jax.device_count())))
+
+
 def _driver():
     """The real driver module, or a skip that says why it could not load.
 
@@ -201,6 +221,16 @@ class _Bundle:
 
 
 def _stacks_case(mu_src, mu_out, keep_idx, *, nQ=2, nk=2, nc=2, ns=1):
+    """The driver call, with ``n_rmu_pad`` resolved the way the driver does.
+
+    ``mu_out`` used to be passed as BOTH the logical μ and the padded μ,
+    which is only legal on a 1×1 mesh — the μ axis of the returned caches
+    carries an ``x`` (and a ``y``) sharding constraint, so its extent has to
+    divide the mesh.  ``main`` reads ``n_rmu_pad`` off the bundle's own
+    metadata for exactly this reason; here :func:`_mu_pad` recomputes it
+    from the same helper, and the pad columns are sliced back off so every
+    caller below keeps asserting against the logical width it asked for.
+    """
     mesh = __import__("common.collectives", fromlist=["resolve_mesh"]
                       ).resolve_mesh()
     rng = np.random.default_rng(5)
@@ -209,9 +239,15 @@ def _stacks_case(mu_src, mu_out, keep_idx, *, nQ=2, nk=2, nc=2, ns=1):
     eps = jnp.asarray(rng.normal(size=(nQ * nk, nc)))
     xb = _driver()
     out = xb.build_conduction_stacks(
-        _Bundle(psi, eps), nQ, nk, nc, nc, mu_out, mu_out, mesh,
+        _Bundle(psi, eps), nQ, nk, nc, nc, mu_out, _mu_pad(mu_out), mesh,
         keep_idx=keep_idx)
-    return np.asarray(psi), np.asarray(jax.device_get(out[0]))
+    got = np.asarray(jax.device_get(out[0]))
+    assert np.array_equal(got[..., mu_out:],
+                          np.zeros_like(got[..., mu_out:])), (
+        "the pad columns are not zero, so slicing them off is not a "
+        "restriction — a pad carrying data would make every identity below "
+        "depend on where the mesh happened to put the boundary")
+    return np.asarray(psi), got[..., :mu_out]
 
 
 def test_the_conduction_caches_are_the_parent_fit_sliced_to_the_kept_rows():
@@ -313,16 +349,29 @@ def test_transported_zeta_at_G0_is_the_transported_head_vector():
     at every G.  If the two ever drift apart the bundle's head and its
     off-grid exchange describe different bases — so the writer cross-checks
     them on every run, and this is that check with the deck taken out.
+
+    SHAPED ON THE MESH, not on 1×1 — see :func:`_mu_pad`.  ``_random_case``
+    hands back a ``(3, 4, 9)`` transfer, and 9 divides no square mesh; the
+    μ_L axis is the one ``transform_head_vector`` shards on ``x``, so the
+    literal shape refused at 2×2.  T and the ζ column are carried here on
+    the device-legal μ extents with exactly-zero pads — the same operand
+    ``run_downfold`` builds — and the logical block is sliced back off.
     """
     from common.collectives import resolve_mesh
     from gw import downfold
     T, zL, _v = _random_case()
     mesh = resolve_mesh()
+    nq, mu_s, mu_l = T.shape
+    mu_s_pad, mu_l_pad = _mu_pad(mu_s), _mu_pad(mu_l)
+    T_pad = np.zeros((nq, mu_s_pad, mu_l_pad), dtype=np.complex128)
+    T_pad[:, :mu_s, :mu_l] = T
+    g0_pad = np.zeros(mu_l_pad, dtype=np.complex128)
+    g0_pad[:mu_l] = zL[0][:, 0]
     T_x = jax.lax.with_sharding_constraint(
-        jnp.asarray(T), NamedSharding(mesh, P(None, None, "x")))
-    g0_L = jnp.asarray(zL[0][:, 0])
+        jnp.asarray(T_pad), NamedSharding(mesh, P(None, None, "x")))
+    g0_L = jnp.asarray(g0_pad)
     g0_S = np.asarray(jax.device_get(
-        downfold.transform_head_vector(g0_L, T_x, 0, mesh)))
+        downfold.transform_head_vector(g0_L, T_x, 0, mesh)))[:mu_s]
     from_zeta = (np.conj(T[0]) @ zL[0])[:, 0]
     assert np.max(np.abs(from_zeta - g0_S)) < 1e-12 * np.max(np.abs(g0_S))
 

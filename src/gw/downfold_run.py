@@ -796,6 +796,26 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
         # dimension this whole exercise makes small.
         from common.collectives import gather_to_host
         T_np = np.asarray(gather_to_host(T_x))[:, :int(mu_S), :mu_L_file]
+
+        # THE SAME SWAP FOR ``g0_S``, AND HOISTED OUT OF THE RANK-0 BRANCH —
+        # the two halves are one fix and neither works alone.  ``g0_S`` comes
+        # off ``transform_head_vector`` constrained to ``P('y')``, so at P>1
+        # it is exactly as non-addressable as ``T_x`` and the gate's bare
+        # ``jax.device_get`` refused it with "Fetching value for `jax.Array`
+        # that spans non-addressable (non process local) devices" — which is
+        # why ``lorrax-downfold`` could not run at P>1 AT ALL, on every rank,
+        # after the tensors had already reached disk
+        # (``tests/known_failures/2026-08-10-downfold-qirr-star-stability.md``
+        # defect 1).  Swapping in ``gather_to_host`` at the old site would
+        # have replaced a refusal with a HANG: its third arm is a
+        # ``process_allgather``, a collective, and the call sat inside
+        # ``if process_rank() == 0``, so ranks 1..P-1 would never enter it.
+        # The gather therefore happens HERE, beside ``T_np``, where every
+        # rank is; only the comparison and the print stay on the writer.
+        # Cost is one μ_S host vector.
+        g0_host = (None if g0_S is None
+                   else np.asarray(gather_to_host(g0_S)).ravel())
+
         perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, n_q=int(n_q),
                                     print_fn=print_fn)
 
@@ -827,7 +847,7 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
                     if perm[q] == 0:
                         g0_chk = z_S[:, 0].copy()
             mark_zeta_done(out_zeta)
-            _gate_g0_against_zeta(g0_chk, g0_S, print_fn)
+            _gate_g0_against_zeta(g0_chk, g0_host, print_fn)
             print_fn(
                 f"  [downfold/zeta] wrote {out_zeta}  (zeta_S = conj(T[q]) "
                 f"zeta_L over {nq_disk} q, mu {mu_L_file} -> {mu_S}, "
@@ -957,7 +977,7 @@ def _fft_grid_of(hdr):
     return grid
 
 
-def _gate_g0_against_zeta(g0_from_zeta, g0_S, print_fn) -> None:
+def _gate_g0_against_zeta(g0_from_zeta, g0_S_host, print_fn) -> None:
     """ζ_S(q=0, G=0) against the independently-transported ``g0_S``.
 
     Two routes to the same vector: this file's per-q ``conj(T) ζ_L`` and
@@ -968,10 +988,19 @@ def _gate_g0_against_zeta(g0_from_zeta, g0_S, print_fn) -> None:
     Reported, not asserted: ``G0_mu_nu`` is absent from bundles whose parent
     never wrote one, and the open 'g0_mu placement' owner row means its
     storage convention is not yet settled enough to hard-fail on.
+
+    ``g0_S_host`` IS ALREADY ON HOST, and that is a precondition rather than
+    a convenience.  This function runs on the writer rank only, so it must
+    not be the place a collective is issued; the caller gathers ``g0_S``
+    through ``common.collectives.gather_to_host`` on every rank before the
+    ``process_rank() == 0`` branch is taken.  Fetching here — which is what
+    this line used to do, with a bare ``jax.device_get`` — is a refusal at
+    P>1 on the sharded input and a deadlock if the fetch is made collective
+    in place.
     """
-    if g0_S is None or g0_from_zeta is None:
+    if g0_S_host is None or g0_from_zeta is None:
         return
-    g0 = np.asarray(jax.device_get(g0_S)).ravel()[:g0_from_zeta.shape[0]]
+    g0 = np.asarray(g0_S_host).ravel()[:g0_from_zeta.shape[0]]
     denom = max(float(np.max(np.abs(g0))), 1e-300)
     rel = float(np.max(np.abs(g0_from_zeta - g0))) / denom
     verdict = "AGREE" if rel < 1e-10 else "DISAGREE"
