@@ -146,7 +146,7 @@ Three variants, pick by what the process already holds:
 | the process holds | use | precedent |
 |---|---|---|
 | the whole global array (identical on every rank) | `jax.make_array_from_callback(shape, sharding, lambda idx: host[idx])` | `tests/multi_device/mtxel_sweep_bench.py:161` |
-| only its own local slice | `jax.make_array_from_process_local_data(sharding, local, global_shape)` | `src/bse/bse_io.py:489` |
+| only its own local slice | `jax.make_array_from_process_local_data(sharding, local, global_shape)` | `src/bse/bse_loading.py::_read_psi_mu_sharded` |
 | the whole global array, inside `src/` | `common.collectives.device_put_process_local(host, sharding)` | `src/common/collectives.py:462` |
 
 Inside `src/`, prefer the wrapper. It resolves the single-process and
@@ -202,10 +202,10 @@ of the array, per §1.
 | `src/bandstructure/htransform.py:728` | `(rank, nk·nb)` replicated, ≲ tens of MB | Benign. Eager `solve_triangular` on committed operands. |
 | `src/bandstructure/htransform.py:1358` | `(rank, rank)` ≈7 MB | Benign. Slice of a committed sharded array. |
 | `src/bandstructure/bse_setup.py:357` | `(rank, ns, n_μ)` replicated | Benign. See the comment at `bse_setup.py:350`: the `fH_R` version of this same line was **not** benign (11 GiB at nb=16 rising to 50 GiB) and was removed. |
-| `src/bse/exciton_bands.py:814` | `(n_μpad, n_μpad)` — μ² | Benign. `data["V_q0"]` is committed on both producer paths (`bse_io.py:811`, `bse_io.py:981`). |
-| `src/bse/exciton_bands.py:827` | μ² slice | Benign. Slice of `_read_wq_sharded`'s committed output (`bse_io.py:990`). |
+| `src/bse/exciton_bands.py:814` | `(n_μpad, n_μpad)` — μ² | Benign. `data["V_q0"]` is committed on both producer paths (`bse_loading::_read_bse_tensors`, `bse_densify::_interpolate_bse_data_to_grid`). |
+| `src/bse/exciton_bands.py:827` | μ² slice | Benign. Slice of `_read_wq_sharded`'s committed output (`bse_loading::_read_wq_sharded`). |
 | `src/bse/exciton_bands.py:866` | `(nQ, n_μpad, n_μpad)` — μ² | Benign. `V_rows` are all committed device arrays. |
-| `src/bse/bse_io.py:811` | `(n_μpad, n_μpad)` — μ² | Benign. `eval_vq` is `jax.jit(..., out_shardings=grid_out)` (`vq_interp.py:1175`), so its output is committed. |
+| `src/bse/bse_densify.py::_interpolate_bse_data_to_grid` | `(n_μpad, n_μpad)` — μ² | Benign. `eval_vq` is `jax.jit(..., out_shardings=grid_out)` (`vq_interp.py`), so its output is committed. |
 
 **Does not take the branch — guarded or structurally excluded:**
 
@@ -227,7 +227,7 @@ of the array, per §1.
 `collectives.py:539,620,693`; `_slab_io_allgather.py:385`;
 `_slab_io_mpi_host.py:624`; `wfn_loader.py:781,1325`;
 `ppm_accumulators.py:421,426`; `ppm_sigma.py:1078,1135`;
-`bse_io.py:488,593,644`; `w_omega_chain.py:325`.
+`bse_loading.py`'s three `jax.device_put(local_*)` staging calls in `_read_psi_mu_sharded` / `_read_vq0_sharded` / `_read_wq_sharded`; `w_omega_chain.py:325`.
 
 ### The one hazard worth naming
 

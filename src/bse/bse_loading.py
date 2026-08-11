@@ -2,39 +2,33 @@
 
 AUTHORITY RULE — a restart tensor is refused unless the FILE says its data was
 persisted, and the q-set it is stored on is asked once and answered once.
-``W0_qmunu`` has carried a ``W0_ready`` attr since the all-zero-screening
-incident and ``V_qmunu`` now carries ``V_ready``; absence means ready, so every
-file written before those attrs existed loads exactly as it always did, and
-only a file that positively claims "not persisted" is refused.  Whether a
-tensor is stored on the IBZ q wedge is ``is_q_wedge``'s question and
-``restart_munu_full_bz``'s answer, and every h5py-side reader here goes
-through them rather than subscripting a dataset — a wedge read under a full-BZ
-q index passes every shape check downstream.
+``W0_qmunu`` carries ``W0_ready`` and ``V_qmunu`` carries ``V_ready``; ABSENT
+MEANS READY, so a file written before those attrs existed loads exactly as it
+always did and only a file that positively claims "not persisted" is refused.
+Whether a tensor is stored on the IBZ q wedge is ``is_q_wedge``'s question and
+``restart_munu_full_bz``'s answer, and every h5py-side reader here goes through
+them rather than subscripting a dataset — a wedge read under a full-BZ q index
+passes every shape check downstream.
 
 Which bytes move is settled independently of how they move.  The SlabIO
 transport and the serial h5py tile readers return identical global shapes,
 identical PartitionSpecs and identical per-rank tiles, so the parity bar
-between them is bit equality; the choice is made ONCE per load, is a pure
+between them is BIT EQUALITY; the choice is made once per load, is a pure
 function of the platform probes, and is announced when it declines to the slow
 path.  Nothing here materialises more than one rank's (μ, ν) tile and there is
 no allgather on any arm.
 
-The two loaders are the module's public face.
 ``load_bse_data_from_restart_sharded`` is the production path at any process
 count; ``_load_ring_subset`` is the single-device full-file reader and refuses
-outright at P>1 rather than letting every rank read the whole file.  They
-publish the resolved window under the same four names, they take the band
-window from the same guard, and they inject the q=0 head through the same
+at P>1.  Both publish the resolved window under the same four names, take the
+band window from the same guard, and inject the q=0 head through the same
 helper, so a request cannot mean two different things depending on which one
 served it.
 
-ONE ORDERING HERE IS LOad-BEARING and is not an accident of layout: whether a
-coarse→fine densification is pending is resolved BEFORE the head injection,
-because the answer changes what the injection does (``bse_head``'s
-``defer_whead``, ``bse_densify``'s re-attachment).  With the feature off, or
-the fine grid equal to the coarse one, every line below runs exactly as it did
-before that existed — which is what makes the on-grid path bit-identical
-structurally rather than by measurement.
+ONE ORDERING IS LOAD-BEARING: whether a coarse→fine densification is pending is
+resolved BEFORE the head injection, because the answer changes what the
+injection does (``bse_head``'s ``defer_whead``, ``bse_densify``'s
+re-attachment).
 """
 from __future__ import annotations
 
@@ -75,24 +69,12 @@ _BARE_V_FALLBACK_WARNING = (
 def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
     """Refuse a restart tensor whose file says its data was never written.
 
-    THE ASYMMETRY THIS CLOSES.  ``W0_qmunu`` has carried a ``W0_ready``
-    attr since the April all-zero-screening incident — a full-size zero
-    placeholder that reached the solver and produced a plausible exciton
-    spectrum — and every W0 consumer in the tree gates on it.
-    ``V_qmunu`` carried no such flag, and the full-file reader read it
-    unconditionally on the line immediately above the one that gated W0.
-
-    That was safe by accident rather than by construction: V is never
-    allocated as a placeholder today, so present implied written.  The
-    writer now stamps ``V_ready`` (``file_io.tagged_arrays``) and this
-    refuses when the file says False.
-
-    ABSENT MEANS READY, and that is the whole backward-compatibility
-    story: every restart file written before the attr existed carries
-    nothing here and loads byte-for-byte as it always did.  Only a file
-    that positively claims "not persisted" is refused — which is the one
-    state that cannot be distinguished from good data by looking at the
-    numbers.
+    The ``V_ready`` counterpart of W0's ``W0_ready`` gate; the writer is
+    ``file_io.tagged_arrays``.  ABSENT MEANS READY — a file written before
+    the attr existed carries nothing here and loads byte-for-byte as it
+    always did, so only a file that positively claims "not persisted" is
+    refused.  That is the one state a full-size zero placeholder cannot be
+    distinguished from good data by looking at the numbers.
     """
     if dset.attrs.get("V_ready", True):
         return
@@ -108,15 +90,12 @@ def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
 def is_q_wedge(dset) -> bool:
     """Is this restart tensor stored on the IBZ q wedge?  ATTRS ONLY.
 
-    The cheap question, asked before a reader commits to a path.  It is a
-    one-line wrapper because the ANSWER must have one implementation —
-    ``symmetry_maps.qirr_store.dataset_q_storage``, which also owns the
-    refusal on a partially-stamped file — and because the service-path
-    bootstrap belongs in one place rather than at every probe site.
-
-    ``False`` for every restart file written before the q_irr format and
-    for every file a ``restart_q_storage = full`` run writes, which is what
-    keeps those readers on the byte path they have always had.
+    A one-line wrapper because the ANSWER must have exactly one
+    implementation — ``symmetry_maps.dataset_q_storage``, which also owns
+    the refusal on a partially-stamped file — and because the service-path
+    bootstrap belongs at one probe site, not at every one.  ``False`` for
+    every pre-q_irr file and every ``restart_q_storage = full`` file, which
+    is what keeps those readers on the byte path they have always had.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -132,39 +111,26 @@ def restart_munu_full_bz(dset, name: str, restart_file: str):
     ``bse.vq_interp`` asks this instead of subscripting the dataset, so the
     question "is this file a q wedge" is asked once and answered once.
 
-    THE LEGACY PATH IS THE SAME BYTES IT ALWAYS WAS.  A dataset with no
-    ``qirr_*`` attrs — which is every restart file written before the format
-    existed, and every file a ``restart_q_storage = full`` run writes today —
-    goes through ``dset[()]`` and nothing else happens.  That is not a
-    tolerance claim, it is the same expression the callers used before.
+    THE LEGACY PATH IS THE SAME BYTES IT ALWAYS WAS: a dataset with no
+    ``qirr_*`` attrs goes through ``dset[()]`` and nothing else happens.
+    A wedge unfolds once, all at once, through
+    ``symmetry_maps.unfold_isdf_operator`` driven by the tables stored IN
+    THE FILE, so what comes back is the same function of the same inputs
+    the producing run used rather than a re-derivation that could drift.
 
-    ON A WEDGE IT UNFOLDS ONCE, ALL AT ONCE, and that is the design rather
-    than a shortcut (followup_survey_symmetry_maps.md §5, carried into the
-    phase-3 brief: per-q reconstruction is unavailable and, per the owner,
-    memory was never the goal — disk size and write time were).  The unfold
-    is ``symmetry_maps.unfold_isdf_operator`` driven by the tables stored
-    IN THE FILE, so what comes back is the same function of the same inputs
-    the producing run itself used, not a re-derivation that could drift.
-
-    WHY THE MESH IS THIS MODULE'S BUSINESS AND NOT THE FORMAT'S.  The
-    unfold is a sharded double-gather and needs a mesh; the format layer
-    must not pick one, because "which devices" is a run-level decision.
-    Callers here are on the host single-device path, so
-    ``collectives.single_device_mesh()`` is what they get, named at the
-    site.  The genuinely sharded transport does not come through here — see
-    ``_MunuSlabPlan``, which refuses a wedge.  Note what that refusal is and
-    is not: the unfold CAN run sharded (it is an ``all_to_all`` kernel, and
-    ``file_io.tagged_arrays._unfold_wedge`` does exactly that on the GW read
-    side), so the BSE refusal is a held cost decision awaiting a measurement,
-    not an impossibility.  This host path meanwhile materialises the full BZ
-    once per caller per rank, which is why it is a stopgap.
+    THE MESH IS THIS MODULE'S CHOICE, NOT THE FORMAT'S: the unfold is a
+    sharded double-gather and needs one, but "which devices" is a run-level
+    decision the format layer must not take.  Callers here are on the host
+    single-device path, so ``collectives.single_device_mesh()`` is named at
+    the site.  That makes this a stopgap — it materialises the full BZ once
+    per caller per rank.  The sharded transport does not come through here;
+    ``_MunuSlabPlan`` refuses a wedge.
 
     THE μ PAD IS NOT RE-APPLIED HERE.  The file stores the LOGICAL extent
-    (652b731e / SHARDING_RULES §2) and every caller of this function pads on
-    its own axis afterwards — ``_read_psi_mu_sharded`` and friends take
-    ``n_rmu_pad`` and zero-fill.  Asking for the pad here would produce an
-    array padded to THIS process's device count, which is precisely the
-    device-count-dependent quantity the format exists to keep off disk.
+    (SHARDING_RULES §2) and every caller pads on its own axis afterwards
+    from its own ``n_rmu_pad``.  Padding here would bake THIS process's
+    device count into the array — the one device-count-dependent quantity
+    the on-disk format exists to keep out.
     """
     if not is_q_wedge(dset):
         return np.asarray(dset[()])
@@ -212,26 +178,20 @@ def _pad_first_two_axes(x: jax.Array, target: int) -> jax.Array:
 
 
 def _get_local_mesh_coords(
-    mesh_xy: Mesh, *, origin: str = "bse_io._get_local_mesh_coords",
+    mesh_xy: Mesh, *, origin: str = "bse_loading._get_local_mesh_coords",
 ) -> tuple[list[tuple[int, int]], int, int]:
     """This process's (x, y) coords in ``mesh_xy``, plus the grid shape.
 
     Refuses up front (``collectives._require_addressable``) a mesh on which
-    THIS process owns no device.  Every shard-aware reader below funnels
-    through here and then hands its process-local block to
-    ``jax.make_array_from_process_local_data``, which on a zero-addressable
-    mesh runs ``next(iter(addressable_shards.values()))``
-    (``jax/_src/array.py:1017``) over an empty map and raises a BARE
-    ``StopIteration('')`` — no message, no rank, no mention of a mesh.  At
-    P=2 that lands as "rank 0 succeeded, rank 1 died with an empty
-    exception", which is what makes it undiagnosable (job 7882420).
+    THIS process owns no device; without it
+    ``make_array_from_process_local_data`` raises a bare
+    ``StopIteration('')`` naming neither rank nor mesh.
 
-    The readers are called with the run's full 2-D mesh today, so every
-    rank IS addressable and this is hardening rather than a live bug.  It
-    is placed HERE, not at the three ``make_array_from_process_local_data``
-    call sites, because the very next line — ``np.argwhere(...)[0]`` over a
-    device this mesh does not contain — would raise an equally anonymous
-    ``IndexError`` first, before the guard could speak.
+    THE GUARD BELONGS HERE, not at the three
+    ``make_array_from_process_local_data`` call sites: the very next line —
+    ``np.argwhere(...)[0]`` over a device this mesh does not contain —
+    would raise an equally anonymous ``IndexError`` before a guard placed
+    lower down could speak.
     """
     from common.collectives import _require_addressable
 
@@ -271,7 +231,7 @@ def _read_psi_mu_sharded(
     trim: bool = True,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(
-        mesh_xy, origin="bse_io._read_psi_mu_sharded")
+        mesh_xy, origin="bse_loading._read_psi_mu_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
 
@@ -327,23 +287,16 @@ def _resolve_munu_reader(
     q=0 is the ``(0, 0, 0)`` k-slice.
 
     ``read_q_slab(q, mu0, mu1, nu0, nu1)`` returns the ``(μ, ν)`` tile at ONE
-    flat q index.  It exists because ``read_slab`` reads the FULL q axis: a
-    consumer that wants a single q (``_read_vq0_sharded`` wants only q=0) went
-    through ``read_slab(...)[:, :, 0, 0, 0]`` and paid ``nq``× the bytes it
-    used — 36× on the nq=36 MoS2 6×6 deck, 144× on a 12×12 grid, and the
-    discarded remainder is exactly as large as the whole ``W_q`` tile the same
-    loader reads next.  Element-for-element the two routes select the same
-    numbers; this one just does not read the other q's.
+    flat q index.  ``read_slab`` reads the FULL q axis, so a single-q consumer
+    (``_read_vq0_sharded``) that went through ``read_slab(...)[:, :, 0, 0, 0]``
+    paid ``nq``× the bytes it used.  Element-for-element the two routes select
+    the same numbers.
     """
-    # ---- THE q WEDGE, UNFOLDED ONCE, BEFORE ANY LAYOUT QUESTION --------
-    # A q_irr file's q axis is the IBZ, so every shape rule below — and
-    # every consumer's ``nkx*nky*nkz == nq`` arithmetic — is about a
-    # tensor that does not exist yet.  Unfold first, then the three
-    # layouts are the three layouts.  ``restart_munu_full_bz`` is the
-    # single seam and is a no-op on every legacy/full-BZ dataset, so the
-    # closures below still read the DATASET on those and nothing about
-    # the byte path changes.  The unfolded array is a host numpy array
-    # and slices identically, which is why the closures need no branch.
+    # THE q WEDGE, UNFOLDED BEFORE ANY LAYOUT QUESTION.  A q_irr file's q axis
+    # is the IBZ, so every shape rule below — and every consumer's
+    # ``nkx*nky*nkz == nq`` arithmetic — would be about a tensor that does not
+    # exist yet.  A no-op on every legacy/full-BZ dataset, and the unfolded
+    # host array slices identically, so the closures need no branch.
     if is_q_wedge(dset):
         dset = restart_munu_full_bz(dset, dset.name.lstrip("/"),
                                     dset.file.filename)
@@ -405,7 +358,7 @@ def _read_vq0_sharded(
     kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(
-        mesh_xy, origin="bse_io._read_vq0_sharded")
+        mesh_xy, origin="bse_loading._read_vq0_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
     (n_rmu, n_rnu, _nkx, _nky, _nkz,
@@ -425,9 +378,6 @@ def _read_vq0_sharded(
             nu_end = min(nu_start + nu_per_y, n_rnu)
             if nu_start >= n_rnu:
                 continue
-            # q=0 only.  ``read_q_slab`` hyperslabs the single q on DISK; the
-            # old ``read_slab(...)[:, :, 0, 0, 0]`` read all nq and threw
-            # nq-1 of them away (see _resolve_munu_reader).  Same elements.
             slab = read_q_slab(0, mu_start, mu_end, nu_start, nu_end)
             if slab.shape[0] < mu_per_x or slab.shape[1] < nu_per_y:
                 pad_mu = mu_per_x - slab.shape[0]
@@ -457,12 +407,9 @@ def _read_wq_sharded(
     kgrid: Optional[tuple[int, int, int]] = None,
 ) -> jax.Array:
     local_coords, grid_x, grid_y = _get_local_mesh_coords(
-        mesh_xy, origin="bse_io._read_wq_sharded")
+        mesh_xy, origin="bse_loading._read_wq_sharded")
     local_x, local_y = _get_local_axis_coords(local_coords)
     _assert_local_block(local_coords, local_x, local_y)
-    # Layout shim (8-D / 6-D / 3-D-flat-q) is single-sourced in
-    # ``_resolve_munu_reader``.  Internal BSE work below stays in the
-    # ``(μ, μ, nkx, nky, nkz)`` form the reader already produces.
     (n_rmu, n_rnu, nkx, nky, nkz,
      _read_munu_slab, _read_q_slab) = _resolve_munu_reader(dset, kgrid=kgrid)
 
@@ -501,57 +448,31 @@ def _read_wq_sharded(
 # ---------------------------------------------------------------------------
 # SlabIO transport for the sharded BSE loader
 # ---------------------------------------------------------------------------
-# The readers above are memory-correct — every one of them h5py-hyperslabs
-# only this rank's (μ, ν) tile and there is no allgather anywhere — and they
-# are also ~30x slower than the transport the rest of the tree certified.
-# MEASURED (CLAIMS 76, job 56389339): 1.25 GiB of restart tensors in 7.4 s at
-# P=4 is 0.17 GiB/s, against the 2.919 GiB/s CLAIMS 69 measured for the phdf5
-# tile path on a cold disjoint-node read at 16 ranks.  The gap is not the
-# hyperslab arithmetic, it is serial POSIX h5py: one rank's W_q tile is
-# nq × (μ/px) × (ν/py), i.e. nq × μ/px separate short row-runs of the file,
-# issued one at a time with no collective buffering and no aggregators.
+# The tile geometry below is DELIBERATELY the tile geometry the serial readers
+# compute.  The memory contract is unchanged and is the point: per-rank tiles,
+# nothing larger than one rank's tile materialised anywhere, no allgather (an
+# allgather is a refusal, not a fallback — owner ruling 2026-08-05).  Only who
+# moves the bytes changes.  The serial readers are memory-correct and ~17x
+# slower (0.17 GiB/s at P=4, CLAIMS 76, against 2.919 GiB/s for the phdf5 tile
+# path at 16 ranks, CLAIMS 69): serial POSIX h5py issues one rank's W_q tile as
+# nq × μ/px short row-runs, one at a time, with no collective buffering.
 #
-# So the tile geometry below is DELIBERATELY the same tile geometry the
-# serial readers compute.  The memory contract is unchanged and is the point:
-# per-rank tiles, nothing larger than one rank's tile materialised anywhere,
-# no allgather (an allgather is a refusal, not a fallback — owner ruling
-# 2026-08-05).  What changes is only who moves the bytes.
-#
-# The serial readers stay, and stay reachable: SlabIO's parallel tiers need
-# the phdf5 FFI; where it is unavailable SlabIO refuses outright (there is
-# no router and no allgather tier left to hand back).  Routing a
-# single-process BSE through a gather-to-rank-0 transport
-# would buy nothing (at P=1 "gather to rank 0" and "this rank's tile" are the
-# same bytes) and would put a second transport under the tests, so the
-# SlabIO path is taken for the PHDF5 tiers only.
+# SlabIO needs the phdf5 FFI and refuses outright where it is unavailable —
+# there is no router and no allgather tier left to hand back — so the serial
+# readers stay reachable as the only fallback.
 
 
 def _bse_slabio_usable(log_fn=print) -> bool:
     """Can this process move the restart tensors through SlabIO?
 
-    NOT a transport preference any more.  This used to read the deck's
-    ``slab_io`` key through ``gw_config.resolve_slab_io_backend`` and
-    return ``None`` for the allgather tier, because ``bse/`` declined to
-    use that tier.  There is one transport now and no deck key, so the
-    only remaining question is a capability one — and it is asked of the
-    stack, not of the input file.  ``input_file`` is no longer a
-    parameter: several BSE entry points and every unit test call the
-    loader with a bare restart path and no deck, and that never had
-    anything to do with which transport is correct.
+    A CAPABILITY QUESTION, asked of the stack and not of the input file —
+    there is no deck key and no ``input_file`` parameter, because several
+    BSE entry points and every unit test call the loader with a bare
+    restart path and no deck.
 
-    THE SERIAL READERS ARE NOT A TIER.  A False here does not select a
-    rank-0 gather — there is no such thing in this module.  It selects
-    the h5py tile readers above, which hyperslab exactly this rank's
-    (μ, ν) tile, allgather nothing, and are memory-correct at any
-    process count.  They are ~17x slower (0.17 GiB/s measured at P=4,
-    CLAIMS 76, against 2.919 GiB/s for the phdf5 tile path at 16 ranks,
-    CLAIMS 69) because they issue nq × μ/px short row-runs one at a time
-    with no collective buffering.  Slow and correct is a legitimate
-    fallback; the tier this file used to refuse was neither.
-
-    Announced when it declines, because "which transport ran" is the
-    single most consequential thing about a large run's I/O profile and
-    a silent 17x is indistinguishable from a hang.
+    A ``False`` selects the h5py tile readers above, not a rank-0 gather:
+    there is no such thing in this module.  Announced when it declines,
+    because a silent 17x is indistinguishable from a hang.
     """
     from file_io.slab_io import probe_availability
     ok, stage, reason = probe_availability()
@@ -566,12 +487,14 @@ def _bse_slabio_usable(log_fn=print) -> bool:
 class _MunuSlabPlan:
     """Where (μ, ν) and q live in a V/W dataset, for a SlabIO request.
 
-    The three on-disk layouts ``_resolve_munu_reader`` shims are the same
-    three here; this class states them as (offset, shape, spec) instead
-    of as a closure over ``dset``, because that is what
-    ``SlabIO.read_slab`` takes.  ``_resolve_munu_reader`` stays the
-    single source for the serial path and for the layout FACTS (which
-    axes, which order); this only re-expresses them.
+    The same three on-disk layouts ``_resolve_munu_reader`` shims, stated
+    as (offset, shape, spec) rather than as a closure over ``dset``,
+    because that is what ``SlabIO.read_slab`` takes.
+    ``_resolve_munu_reader`` stays the single source for the serial path
+    and for the layout FACTS (which axes, which order); this only
+    re-expresses them.  ``file_io.tagged_arrays._munu_slab_request`` is
+    the GW-side statement of the same three layouts, kept separate because
+    it never selects a single q and so never needs the kgrid.
 
     * 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)``
     * 6-D transitional ``(1, npol, npol, nq, μ, ν)``
@@ -605,45 +528,19 @@ class _MunuSlabPlan:
                 f"_MunuSlabPlan: unsupported V/W dataset rank {self.ndim} "
                 f"(shape {self.ds_shape}); expected 8-D, 6-D or 3-D flat-q.")
         if self.q_axes == 1 and int(self.q_extent[0]) != self.nq:
-            # THE q_irr WEDGE ARRIVES HERE, AND IS REFUSED — deliberately,
-            # and the message says so rather than leaving an operator to
-            # read "the q extent is wrong" and go looking for a truncated
-            # file.  This plan describes a per-rank (μ, ν) HYPERSLAB read
-            # through SlabIO, and the unfold is a double-gather ACROSS the
-            # μ and ν axes: a rank holding one (μ, ν) block does not hold
-            # the elements its own block's images come from, so there is
-            # nothing this plan could ask SlabIO FOR — no offset, no extent
-            # — that would reconstruct a full-BZ q.
-            #
-            # THAT IS A FACT ABOUT SlabIO AND NOT ABOUT THE UNFOLD, and
-            # this comment used to conclude otherwise ("structurally
-            # cannot").  ``unfold_isdf_operator`` is a ``shard_map`` over
-            # four ``lax.all_to_all`` collectives that redistribute exactly
-            # these axes volume-preservingly, never exceeding one tile per
-            # rank, and it takes and returns ``P(None,'x','y')`` — the spec
-            # ``request`` below already builds.  The producer runs it on the
-            # real distributed mesh twice per run, and the GW restart reader
-            # now does the same on the read side
-            # (``file_io.tagged_arrays._unfold_wedge``), measured
-            # bit-identical at 2x2, 4x1 and 1x4.  So the wedge does not need
-            # a different TRANSPORT: it needs the read to happen first and
-            # the collective to happen after, in jax, BEFORE the μ-major
-            # transpose in ``_slabio_read_munu`` (the unfold works q-major).
-            #
-            # WHY IT IS STILL REFUSED HERE.  Not correctness — cost.  Putting
-            # an all_to_all of an N_mu²-class object on the BSE load path is
-            # exactly what this module's comments otherwise forbid, and its
-            # price against the bytes the wedge saves has never been measured
-            # on a real interconnect (the only committed all_to_all baselines
-            # are WSL, and the 2x2 leg is emulated).  The design, including
-            # the single-q ``V_q0`` route, is
-            # DESIGN_restart_consolidation.md §4; it lands after one
-            # Perlmutter timing leg, with this refusal and the deck key.
-            # Until then a wedge file reads through the serial h5py readers
-            # — a stopgap, not an answer: they materialise the full-BZ
-            # tensor on the host, once per caller, per rank — or through the
-            # GW leg, which unfolds.  ``restart_q_storage = full`` writes a
-            # file this transport can take.
+            # THE q_irr WEDGE ARRIVES HERE AND IS REFUSED, deliberately, and
+            # the message says so rather than leaving an operator to read
+            # "the q extent is wrong" and go looking for a truncated file.
+            # THE REASON IS COST, NOT CORRECTNESS: a wedge needs the read
+            # first and ``unfold_isdf_operator``'s all_to_all after, in jax,
+            # BEFORE ``_slabio_read_munu``'s μ-major transpose (the unfold
+            # works q-major) — and the price of an all_to_all of an
+            # N_mu²-class object against the bytes the wedge saves has never
+            # been measured on a real interconnect.  Design incl. the
+            # single-q ``V_q0`` route: DESIGN_restart_consolidation.md §4;
+            # it lands after one Perlmutter timing leg.  Until then a wedge
+            # file reads through the serial h5py readers or the GW leg, and
+            # ``restart_q_storage = full`` writes a file this transport takes.
             _extra = ""
             if int(self.q_extent[0]) < self.nq:
                 _extra = (
@@ -695,14 +592,11 @@ def _slabio_read_munu(io, name, plan, mesh_xy, n_rmu_pad, *,
     ``trim=False``, with the same P('x','y',...) sharding.
 
     The on-disk order is q-major and the consumer wants μ-major, so the
-    result is transposed.  That transpose is LOCAL: μ and ν stay on
-    ('x', 'y') across it and every other axis is replicated, so GSPMD
-    has nothing to communicate.  It is pinned with an explicit
-    ``out_shardings`` rather than left to inference — an inferred
-    resharding here would be a silent all-to-all on an N_mu²-class
-    object, which is the one thing this loader must never do.  Its
-    transient is one more per-rank tile, exactly what the serial
-    readers' host ``local_w`` buffer already cost.
+    result is transposed.  That transpose is LOCAL — μ and ν stay on
+    ('x', 'y') across it and every other axis is replicated — and its
+    ``out_shardings`` is PINNED rather than inferred, because an inferred
+    resharding here would be a silent all-to-all on an N_mu²-class object,
+    the one thing this loader must never do.
     """
     offset, shape, spec = plan.request(n_rmu_pad, q_index=q_index)
     arr = io.read_slab(name, shape=shape, dtype=dtype, offset=offset,
@@ -730,12 +624,11 @@ def _slabio_read_psi(io, name, psi_shape, band_indices, axis, mesh_xy,
 
     ``band_indices`` must be a CONTIGUOUS ascending range; the caller's
     two windows (``arange(n_occ-n_val, n_occ)`` and
-    ``arange(n_occ, n_occ+n_cond)``) always are.  A hyperslab is an
-    offset and an extent, so a gap would silently read the wrong bands —
-    hence a refusal rather than an assumption.  Returning ``None``
-    instead would put the choice of transport inside a loop over band
-    windows; a caller that ever needs a ragged window should ask for the
-    serial reader for the whole load.
+    ``arange(n_occ, n_occ+n_cond)``) always are.  A hyperslab is an offset
+    and an extent, so a gap would silently read the wrong bands — hence a
+    refusal.  A caller that ever needs a ragged window must ask for the
+    serial reader for the whole load, so that the transport choice stays
+    one decision per load.
     """
     b = np.asarray(band_indices)
     if b.size == 0 or not np.array_equal(b, np.arange(int(b[0]),
@@ -774,21 +667,16 @@ def _read_bse_tensors(
     """``(psi_v_X, psi_c_X, V_q0, W_q, V_q_full)`` — one transport decision.
 
     THE seam between "which bytes" and "how they move".  Both branches
-    below return the identical arrays: identical global shapes,
-    identical PartitionSpecs, identical per-rank tiles, and the same
-    elements selected from the same datasets.  The parity bar for the
-    SlabIO branch is therefore BIT EQUALITY, not a tolerance — it is an
-    element-SELECTION change, not a reduction-order one, so neither
-    CLAIMS 71's padding gauge nor any eps floor applies (and the ~1.5-eps
-    "sharded/unsharded floor" quoted in earlier sessions does not
-    reproduce: sharding here is bit-exact).
+    below return identical global shapes, identical PartitionSpecs,
+    identical per-rank tiles and the same elements from the same datasets,
+    so the parity bar for the SlabIO branch is BIT EQUALITY, not a
+    tolerance: it is an element-SELECTION change, not a reduction-order
+    one, and no eps floor applies.
 
-    The transport choice is per-rank but is a pure function of the deck
-    file and the platform probes, so every rank reaches the same answer
-    and the collective SlabIO open is well-formed.  That is the same
-    contract ``LorraxConfig.from_input_file`` already relies on for the
-    GW driver; it is stated here because a divergence would present as a
-    hang inside ``H5Fopen`` rather than as an error.
+    The transport choice is per-rank but is a pure function of the
+    platform probes, so every rank reaches the same answer and the
+    collective SlabIO open is well-formed.  Stated because a divergence
+    would present as a hang inside ``H5Fopen`` rather than as an error.
     """
     if not _bse_slabio_usable(log_fn=log_fn):
         with h5py.File(restart_file, "r") as f:
@@ -803,10 +691,8 @@ def _read_bse_tensors(
                                      n_rmu_pad, trim=False, kgrid=kgrid)
             W_q = _read_wq_sharded(wq_dset, mu_per_x, nu_per_y, mesh_xy,
                                    n_rmu_pad, trim=False, kgrid=kgrid)
-            # Full-q exchange tensor for the finite-q W_q resolvent: read
-            # every V tile with the SAME (μ, ν, nkx, nky, nkz) reader as
-            # W_q (no head; head is a q=0-only rank-1 piece).
-            # V_q_full[:, :, 0, 0, 0] == V_q0 (the head-less q=0 read) — a
+            # V read with the SAME (μ, ν, nkx, nky, nkz) reader as W_q, so
+            # ``V_q_full[:, :, 0, 0, 0] == V_q0`` (both head-less) — a
             # self-check the finite-q harness asserts.
             V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
                                          n_rmu_pad, trim=False, kgrid=kgrid)
@@ -889,21 +775,16 @@ def load_bse_data_from_restart_sharded(
             wq_key = "W0_qmunu_nohead"
         elif "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             wq_key = "W0_qmunu"
-        # WHICH COULOMB CONVENTION THIS W WAS BUILT UNDER.  The BSE does not
-        # compute W — it reads it off the GW restart — so it has no Coulomb
-        # config of its own to check against and the honest disclosure is the
-        # stored policy itself.  Printed once per load, rank 0 only.
+        # The BSE reads W off the GW restart rather than computing it, so it
+        # has no Coulomb config of its own to check the stored policy against;
+        # disclosing the stamp is the honest substitute.
         if jax.process_index() == 0:
             from file_io import describe_coulomb_policy_stamp
             print(describe_coulomb_policy_stamp(restart_file))
-        # THE GATE, ASKED ONCE.  ``wq_key is not None`` here means a real
-        # screened W0 passed the ``W0_ready`` check above; below it is also
-        # the name of the bare-V dataset, because the fallback aliases the
-        # key.  Capture the answer before that aliasing destroys it — the
-        # head injection at the bottom of this function needs to know which
-        # tensor it is adding a SCREENED head to, and once the else branch
-        # below has run the key alone can no longer tell it.  Same question,
-        # same spelling as ``_load_ring_subset``'s
+        # CAPTURED BEFORE THE FALLBACK ALIASES ``wq_key``: after the else
+        # branch below, the key alone can no longer say whether the head
+        # injection is adding whead to a SCREENED W or to bare V.  Same
+        # question, same spelling, as ``_load_ring_subset``'s
         # ``w0_ready = W0_qmunu is not None``.
         w0_ready = wq_key is not None
         if wq_key is not None:
@@ -912,11 +793,9 @@ def load_bse_data_from_restart_sharded(
             if use_nohead:
                 print("Warning: requested --nohead but W0_qmunu_nohead not found/ready.")
             print(_BARE_V_FALLBACK_WARNING)
-            # NAME the fallback, don't just alias the handle: the tensor
-            # readers below are given dataset NAMES (SlabIO opens by name),
-            # so a ``None`` here would have become "no W dataset" instead of
-            # "W is bare V", which is the bare-Coulomb fallback this branch
-            # just warned about.
+            # NAME the fallback, don't only alias the handle: the readers
+            # below are given dataset NAMES (SlabIO opens by name), so a
+            # ``None`` key would mean "no W dataset" rather than "W is bare V".
             wq_key = vq_key
             wq_dset = vq_dset
         if "psi_full_y" not in f or "enk_full" not in f:
@@ -927,7 +806,9 @@ def load_bse_data_from_restart_sharded(
         psi_full_dset = f["psi_full_y"]
         enk_full = np.asarray(f["enk_full"][:])
 
-        # Same axis-shape compat shim as ``_load_per_axis_padded_w_block``.
+        # The same three on-disk layouts ``_resolve_munu_reader`` shims, asked
+        # here for the GEOMETRY only — this must not unfold a wedge, which is
+        # why it reads the dataset's own shape/attrs rather than calling that.
         if vq_dset.ndim == 8:
             nkx, nky, nkz = (int(s) for s in vq_dset.shape[3:6])
             n_rmu = int(vq_dset.shape[6])
@@ -974,11 +855,9 @@ def load_bse_data_from_restart_sharded(
                 f"No valence ({n_val_available}) or conduction ({n_cond_available}) bands "
                 f"resolved (n_occ={n_occ}, total={nb_total})."
             )
-        # THE degeneracy choke point.  Every BSE driver reaches its band
-        # window through this function, so the multiplet guard sits here —
-        # before the index arrays exist, and therefore before the ψ hyperslab
-        # read is sized.  A snap here resizes the read, which is what makes it
-        # free; a guard placed after the read could only complain.
+        # THE degeneracy choke point, placed before the index arrays exist and
+        # therefore before the ψ hyperslab read is sized: a snap here resizes
+        # the read, where a guard after it could only complain.
         n_val, n_cond = resolve_band_window(
             enk_full, n_occ, n_val, n_cond,
             tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
@@ -990,7 +869,7 @@ def load_bse_data_from_restart_sharded(
         eps_c = jnp.asarray(enk_full[:, cond_indices])
 
         _, grid_x, grid_y = _get_local_mesh_coords(
-            mesh_xy, origin="bse_io.load_bse_data_from_restart_sharded")
+            mesh_xy, origin="bse_loading.load_bse_data_from_restart_sharded")
         # Disk stores the LOGICAL μ extent; re-pad to the ONE in-memory
         # convention (mesh-product round-up, runtime.padding).
         n_rmu_pad = padded_mu_extent(n_rmu, grid_x * grid_y)
@@ -998,9 +877,8 @@ def load_bse_data_from_restart_sharded(
         nu_per_y = n_rmu_pad // grid_y
 
         # Shapes are all the tensor readers need from the open handle; the
-        # bytes are moved AFTER this block closes the file, because the
-        # SlabIO transport reopens the same path under collective MPI-IO
-        # and two live handles on one file is a hazard nobody needs.
+        # bytes move AFTER this block closes the file, because SlabIO reopens
+        # the same path under collective MPI-IO.
         vq_shape = tuple(int(s) for s in vq_dset.shape)
         wq_shape = tuple(int(s) for s in wq_dset.shape)
         psi_shape = tuple(int(s) for s in psi_full_dset.shape)
@@ -1016,10 +894,9 @@ def load_bse_data_from_restart_sharded(
                 G0_pad = np.zeros((n_rmu_pad,), dtype=np.complex128)
                 G0_pad[:G0_full.size] = G0_full
                 G0_full = G0_pad
-            # Process-local (AA.1): G0_full is host numpy read identically
-            # on every rank; plain device_put would fire the hidden
-            # assert_equal all-gather (twice).  LORRAX_CHECK_REPLICA=1
-            # re-arms it.
+            # G0_full is host numpy read identically on every rank; a plain
+            # device_put would fire the hidden assert_equal all-gather, twice
+            # (AA.1).  LORRAX_CHECK_REPLICA=1 re-arms it.
             from common.collectives import device_put_process_local
             g0_X = device_put_process_local(G0_full,
                                             NamedSharding(mesh_xy, P("x")))
@@ -1034,10 +911,9 @@ def load_bse_data_from_restart_sharded(
             vhead_restart = whead_restart = None
 
     # ── The big tensors, on whichever transport this stack has ──────────
-    # Outside the h5py handle on purpose (see the shape capture above).
-    # ONE decision for the whole load: mixing transports across the four
-    # tensors would make a throughput number unattributable and would
-    # open the SlabIO file twice for no gain.
+    # Outside the h5py handle on purpose (see the shape capture above), and
+    # ONE decision for all four: mixing transports would open the SlabIO file
+    # twice and make any throughput number unattributable.
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = _read_bse_tensors(
         restart_file, vq_key=vq_key, wq_key=wq_key, vq_shape=vq_shape,
         wq_shape=wq_shape, psi_shape=psi_shape, val_indices=val_indices,
@@ -1061,13 +937,9 @@ def load_bse_data_from_restart_sharded(
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
     # ── Is a coarse→fine densification pending?  Resolved HERE, before the
-    # head injection, because the answer changes what the injection does.
-    # C1 (the default) hands the densifier the head-EXCLUDED body and
-    # re-attaches the head per fine q afterwards, so on a densifying run the
-    # rank-1 whead must NOT go on now.  With the feature off, or the fine grid
-    # equal to the coarse one, ``densify_pending`` is False and every line
-    # below runs exactly as it did before this existed — that is the on-grid
-    # bit-identity, and it is structural rather than checked.
+    # head injection, because C1 (the default) hands the densifier the
+    # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
+    # a densifying run the rank-1 whead must NOT go on now.
     fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
     densify_pending = (fine_grid is not None
                        and fine_grid != (nkx, nky, nkz))
@@ -1081,9 +953,8 @@ def load_bse_data_from_restart_sharded(
             input_file, vhead_restart, whead_restart, cell_volume)
 
         if cell_volume is not None and (vhead is not None or whead is not None):
-            # ``w0_ready`` is the answer the dataset-selection block above
-            # recorded: whead goes on a SCREENED W or nowhere.  Same gate,
-            # same helper, as the single-device loader.
+            # whead goes on a SCREENED W or nowhere — same gate, same helper,
+            # as the single-device loader.
             V_q0, W_q, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
                 w0_ready=w0_ready, defer_whead=defer_whead)
@@ -1097,14 +968,10 @@ def load_bse_data_from_restart_sharded(
                     "gamma_cell": w_head_gamma_cell,
                 }
         else:
-            # §16.5 latent-bug guard: G0_mu_nu is present and inject_head is
-            # True, but the rank-1 head was NOT injected because vhead/whead
-            # both resolve to None (no cohsex.in override, no restart scalars)
-            # and/or cell_volume is unknown.  Previously silent → a head-LESS
-            # q=0 exchange tile with no trace.  Recompute is NON-TRIVIAL here
-            # (the loader has no wfn/meta/sym/S_cart to rebuild <v>_mBZ), so
-            # warn loudly and name the fix (add vhead/whead to the restart or
-            # a cohsex.in override).
+            # G0_mu_nu is present and inject_head is True, but the head cannot
+            # be built.  The loader has no wfn/meta/sym/S_cart with which to
+            # recompute <v>_mBZ, so the only honest move is to warn loudly and
+            # name the fix; silence here leaves a head-LESS q=0 tile no trace.
             import warnings
             reasons = []
             if cell_volume is None:
@@ -1123,11 +990,10 @@ def load_bse_data_from_restart_sharded(
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
             print(f"BSE-sharded: [WARN] {msg}")
 
-    # Hoisted exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v — the V-term
-    # decode (M_X, μ on x) and encode (M_Y, ν on y) vertices. Precomputed ONCE here
-    # (audit P3) so the per-iteration BSE matvec receives them as inputs instead of
-    # rebuilding them from ψ every call. Peak-neutral; the between-matvec floor rises
-    # by ~2·M/p (reports/bse_refactor_map_2026-07-15/archive/matvec_efficiency_audit).
+    # Exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v, hoisted so the
+    # per-iteration matvec receives them instead of rebuilding them from ψ:
+    # the V-term decode (M_X, μ on x) and encode (M_Y, ν on y) vertices.
+    # Peak-neutral; the between-matvec floor rises by ~2·M/p.
     M_X = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_X, psi_v_X),
         NamedSharding(mesh_xy, P(None, None, None, "x")))
@@ -1161,11 +1027,10 @@ def load_bse_data_from_restart_sharded(
         "fermi_energy": fermi_energy,
     }
 
-    # ── bse_k_grid coarse→fine densification (general BSE init) ───────────
-    # ``densify_pending`` was resolved BEFORE the head injection above, since
-    # it decides whether the head was deferred.  None/unset or == the coarse
-    # grid → return the coarse bundle above UNTOUCHED (fast path,
-    # byte-identical — the on-grid identity guarantee).
+    # ── bse_k_grid coarse→fine densification ─────────────────────────────
+    # Unset or == the coarse grid → the coarse bundle above is returned
+    # UNTOUCHED.  That is the on-grid byte-identity guarantee, and it is
+    # structural rather than measured.
     if densify_pending:
         if input_file is None:
             raise ValueError(
@@ -1190,16 +1055,14 @@ def _find_restart_file(input_file: str) -> str:
     """Locate ``isdf_tensors_<n_rmu>.h5`` — loudly when the choice is ambiguous.
 
     ``isdf_tensors_*.h5`` is namespaced by centroid count, so a run
-    directory that has been used for a μ-sweep holds several.  This
-    returned the first *lexicographically* sorted match, which is not the
-    newest and not necessarily the one the GW run that produced this
-    BSE's inputs wrote: ``isdf_tensors_1194.h5`` sorts before
-    ``isdf_tensors_276.h5``.  Picking the wrong one is silent — the BSE
+    directory used for a μ-sweep holds several, and lexicographic order is
+    meaningless across them (``isdf_tensors_1194.h5`` sorts before
+    ``isdf_tensors_276.h5``).  Picking the wrong one is SILENT: the BSE
     kernel is built from a different ISDF basis than Σ was, every stage
-    reports success, and the exciton spectrum is quietly wrong.  The
-    ambiguity is now named in the log, and the *newest* file wins (the
-    one the most recent GW run wrote), which is the intent everywhere
-    this is called from.
+    reports success, and the exciton spectrum is quietly wrong.  So the
+    NEWEST wins and the ambiguity is named in the log.
+    ``gw.downfold_run.resolve_restart_file`` refuses the same ambiguity
+    instead, deliberately — see its docstring for why the two differ.
     """
     input_dir = os.path.dirname(os.path.abspath(input_file))
     candidates = []
@@ -1209,7 +1072,6 @@ def _find_restart_file(input_file: str) -> str:
     if not candidates:
         raise FileNotFoundError(f"Could not find canonical restart file isdf_tensors_*.h5 in {input_dir}")
     if len(candidates) > 1:
-        # Newest wins; say so, and list what was passed over.
         chosen = max(candidates, key=os.path.getmtime)
         others = ", ".join(os.path.basename(p) for p in candidates
                            if p != chosen)
@@ -1240,17 +1102,15 @@ def _load_ring_subset(
 ) -> dict:
     """Load a single-device BSE subset from canonical gw_jax restart state.
 
-    FULL-FILE reader by construction: V_qmunu, W0_qmunu and psi_full_y
-    are materialised whole (that is what its two callers need — the
+    FULL-FILE reader by construction: V_qmunu, W0_qmunu and psi_full_y are
+    materialised whole, which is what its two callers need (the
     ``_preview_lanczos`` 1-device branch and the ring-matvec correctness
-    check's single-device reference).  A multi-process run must NEVER
-    come through here: every rank would h5py-read the full tensors
-    before any sharding (scorecard BD.4), and the single-device arrays
-    could not represent one logical object across processes anyway.
-    The production preview/ring/FEAST/KPM paths at P>1 already route
-    through :func:`load_bse_data_from_restart_sharded`, whose readers
-    hyperslab only each rank's (μ, ν) tile; this guard turns any future
-    misrouting into a refusal instead of a silent per-rank full read.
+    check's single-device reference).  A multi-process run must NEVER come
+    through here — every rank would h5py-read the full tensors before any
+    sharding, and single-device arrays cannot represent one logical object
+    across processes — so the P>1 guard below turns a future misrouting
+    into a refusal rather than a silent per-rank full read.
+    :func:`load_bse_data_from_restart_sharded` is the P>1 counterpart.
     """
     import jax as _jax
     if int(_jax.process_count()) > 1:
@@ -1262,11 +1122,6 @@ def _load_ring_subset(
             "as the P>1 preview/ring paths already do.")
     with h5py.File(restart_file, "r") as f:
         _refuse_unpersisted(f["V_qmunu"], "V_qmunu", restart_file)
-        # ``restart_munu_full_bz`` is ``dset[()]`` on every legacy and
-        # full-BZ file — the identical bytes this line read before — and
-        # unfolds the stored wedge on a q_irr file.  This reader is the
-        # FULL-FILE one by construction, so the all-at-once unfold is the
-        # shape it already had.
         V_qmunu = jnp.asarray(
             restart_munu_full_bz(f["V_qmunu"], "V_qmunu", restart_file))
         from file_io import describe_coulomb_policy_stamp
@@ -1276,10 +1131,8 @@ def _load_ring_subset(
                 restart_munu_full_bz(f["W0_qmunu"], "W0_qmunu", restart_file))
         else:
             W0_qmunu = None
-        # G0_mu_nu = ζ(q=0, μ, G=0) — rank-1 head projector. Persisted by the
-        # GW writer; consumed below by the q=0 head-injection step.
+        # G0_mu_nu = ζ(q=0, μ, G=0), the rank-1 head projector.
         G0_mu_nu = jnp.asarray(f["G0_mu_nu"][:]) if "G0_mu_nu" in f else None
-        # Restart-side scalar head fields (Phase B writer; may not exist yet).
         vhead_restart = complex(f["vhead"][()]) if "vhead" in f else None
         whead_restart = (jnp.asarray(f["whead"][:], dtype=jnp.complex128)
                          if "whead" in f else None)
@@ -1296,14 +1149,9 @@ def _load_ring_subset(
 
     enk_full = jnp.asarray(enk_full_np)
 
-    # V_qmunu axis-shape compatibility shim:
-    #   * legacy 8-D ``(1, npol, npol, nkx, nky, nkz, μ, μ)`` — read kgrid
-    #     directly from the shape;
-    #   * legacy 6-D ``(1, npol, npol, nq, μ, μ)`` — strip leading axes
-    #     and read kgrid from the WFN;
-    #   * new flat-q 3-D ``(nq, μ, μ)`` — read kgrid from the WFN.
-    # Internal BSE machinery still wants ``W_q`` shaped as
-    # ``(μ, μ, nkx, nky, nkz)``; we reshape after normalising V_qmunu.
+    # The same three on-disk layouts ``_resolve_munu_reader`` shims, restated
+    # for arrays that are already materialised: 8-D carries the kgrid in its
+    # own shape, 6-D and 3-D flat-q need it from the WFN.
     if V_qmunu.ndim == 8:
         nkx, nky, nkz = V_qmunu.shape[3:6]
         n_rmu = int(V_qmunu.shape[-1])
@@ -1349,10 +1197,8 @@ def _load_ring_subset(
         print(f"Warning: requested {n_cond} conduction bands but only {n_cond_available} available; using {n_cond_available}")
     n_val = min(n_val, n_val_available)
     n_cond = min(n_cond, n_cond_available)
-    # The 1-device escape from the sharded loader's choke point: same guard,
-    # same defaults, so the two routes cannot disagree about what window a
-    # given (n_val, n_cond) request means.  ``enk_full_np`` is the host copy
-    # that ``resolve_n_occ`` above already read (eqp-corrected when --eqp).
+    # Same guard and same defaults as the sharded loader, so the two routes
+    # cannot disagree about what window a given (n_val, n_cond) request means.
     n_val, n_cond = resolve_band_window(
         enk_full_np, n_occ, n_val, n_cond,
         tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
@@ -1373,29 +1219,24 @@ def _load_ring_subset(
                                      fill=-PAD_EPS_GUARD_RY)
     eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px,
                                      fill=PAD_EPS_GUARD_RY)
-    # V_qmunu is now flat-q (nq, μ, μ) post-shim; q=0 is V_qmunu[0].
-    V_q0 = V_qmunu[0]
+    V_q0 = V_qmunu[0]                       # flat-q (nq, μ, μ) post-shim
     V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)
     if W0_qmunu is not None:
         W_src = W0_qmunu
     else:
         print(_BARE_V_FALLBACK_WARNING)
         W_src = V_qmunu
-    # W_src: (nq, μ, μ).  Reshape flat-q → 3-D-k and transpose to the
-    # ``(μ, μ, nkx, nky, nkz)`` layout the downstream BSE machinery
-    # consumes.  This is the ONE place the 3-D-k form materialises
-    # inside BSE; elsewhere we keep flat-q.
+    # THE ONE PLACE the 3-D-k form materialises inside BSE — everything else
+    # keeps flat-q — because the downstream machinery consumes W_q as
+    # ``(μ, μ, nkx, nky, nkz)``.
     W_q = W_src.reshape(nkx, nky, nkz, n_rmu, n_rmu).transpose(3, 4, 0, 1, 2)
     W_q = _pad_first_two_axes(W_q, n_rmu_pad)
 
     # ── q=0 head injection (rank-1 in (μ,ν) ISDF basis) ──────────────────
-    # Runs AFTER the layout shim so it operates on the normalized q=0 slice:
-    # V_q0 (μ,μ) and the (0,0,0) k-slice of W_q.  compute_vcoul zeroes the
-    # G=G'=0 element of v(q=0); we reinstate the mini-BZ-averaged head as a
-    # rank-1 update from G0_mu_nu = ζ(0,μ,G=0).  Single device → feed G0 as
-    # both the μ- and ν-axis copy to the sharded rank-1 helper.  whead is
-    # injected into W_q only when a real screened W0 is present (not the
-    # bare-V fallback).  Source priority: cohsex.in overrides > restart-file.
+    # AFTER the layout shim, so it operates on the normalised q=0 slice.
+    # ``compute_vcoul`` zeroes the G=G'=0 element of v(q=0) and this
+    # reinstates the mini-BZ-averaged head from G0_mu_nu = ζ(0,μ,G=0).
+    # Single device, so G0 serves as both the μ- and the ν-axis copy.
     if G0_mu_nu is not None:
         vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart)
@@ -1416,13 +1257,11 @@ def _load_ring_subset(
         key, (1, n_cond_pad, n_val_pad, nk)
     )
 
-    # The RESOLVED window travels with the bundle, under the same four names
-    # ``load_bse_data_from_restart_sharded`` uses.  ``n_val``/``n_cond`` here
-    # are post-clamp AND post-snap (``resolve_band_window`` above rebound
-    # them); ``*_pad`` are the mesh-rounded extents the ψ/ε arrays are shaped
-    # by.  Callers had to re-derive these from ``psi_c.shape[1]`` — which is
-    # the padded number, and is why ``tests/bench/test_bse.py`` backfilled
-    # them by hand — or, worse, keep using their own pre-snap CLI request.
+    # The RESOLVED window travels with the bundle under the same four names
+    # ``load_bse_data_from_restart_sharded`` uses: ``n_val``/``n_cond`` are
+    # post-clamp AND post-snap, ``*_pad`` are the mesh-rounded extents the
+    # ψ/ε arrays actually carry.  A caller re-deriving either from
+    # ``psi_c.shape[1]`` gets the padded number.
     return {
         "psi_c": psi_c,
         "psi_v": psi_v,
