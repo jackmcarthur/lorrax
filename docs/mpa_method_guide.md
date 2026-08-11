@@ -373,6 +373,48 @@ Both switches are stamped: `prov_eig_mode` and `prov_fit_fused` sit beside
 are the old behaviour, so a store written before either existed reads back
 correctly as `lapack, unfused`.
 
+#### What the certification measured, and the three things to say about it
+
+The consolidation lane certified `jax_qr` against `lapack` as a fourth mode on
+its correctly-anchored ladder probe, 315,840 elements per rung. **Gate (d)
+passed**: `jax_qr` reproduces `lapack` to every printed digit on ⟨RSD⟩,
+condition number, backward error, prune counts and residue mass, at every
+rung. **Gate (a) passed**: W-rebuild `lapack` against `jax_qr` gives ⟨RSD⟩
+7.6e-14 with `dW_max` 2.6e-12 at rung 8, and 5.2e-14 with 3.1e-12 at rung 10;
+rung 1 is exact in all 17 accumulators. An independent pass on two q of each
+rung agrees — worst block norm 1.14e-12, worst single element 2.41e-11, with
+fidelity to the sampled `W_c` identical between arms to twelve digits.
+
+Three caveats travel with those numbers, and they should be read before
+anyone quotes them.
+
+**(i) `jax_qr` is not bit-identical to `lapack`, and must never be described
+as such.** Nine of the 17 accumulators differ at rung 8, at ≤1e-12 in the
+physics. The claim this module supports is numerical equivalence *at the
+certification norm*. It is not a claim of reproducing the other backend
+exactly, it was never intended to be one, and the store stamps
+`prov_eig_mode` precisely so that two fields differing in the last digits are
+attributable rather than mysterious.
+
+**(ii) Rung 2 looks alarming and is the conditioning floor, not a
+regression.** It is the full-rank case: `dW_sum` 5.3e-2 relative, with 42 % of
+elements counted "worse". That is §3.1b's floor arriving in production form —
+a full-rank pencil's eigenvalues carry `eps · cond` of intrinsic sensitivity,
+the two root-finders sit at opposite ends of it, and *neither is the correct
+one*. The test suite asserts it is a floor by doubling the sweep count and
+requiring the disagreement not to move. Pre-empting this here because a 42 %
+"worse" count is exactly the sort of number that gets waved in a review by
+someone who has not been told what it measures.
+
+**(iii) Six elements of 315,840 route differently through the guards at rung
+8.** They are the repair-guard sign-flip class: `reflection` and `time_order`
+are sign tests on `Re b` and `Im b`, and on a pruned null-space pole the sign
+is a coin flip between any two root-finders. This is the case
+`test_red_twin_the_repair_guards_cannot_be_gated_on_null_poles` exists to
+document, the count is consistent with its expectation, and the poles in
+question are dropped before a residue is fitted to them. Six in 315,840 is the
+measured size of it.
+
 ### 3.2 The five guards, and the quadrant algebra
 
 The linear algebra knows no physics and will return poles in the wrong half

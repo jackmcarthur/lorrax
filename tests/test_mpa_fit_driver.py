@@ -599,14 +599,26 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
                                * MS.COMPLEX128_BYTES)
     assert r["bytes_budget_total"] == r["blocks_walked"] * r["tile_bytes"]
 
-    # One vmapped dispatch per block for the fit, one for the
-    # diagnostics — and behind them two complete fits and three Pade
-    # solves per element, because the store requires a backward error
-    # the fit kernel does not return.
+    # ONE vmapped dispatch per block, ONE complete fit per element, ONE
+    # solve per element.  This cell used to assert a second dispatch per
+    # block and factors of two and three per element, because the store
+    # requires a backward error the fit kernel did not return and the
+    # only supplier refit the whole block to produce one.  The kernel
+    # returns it now (mode-aware), and the driver hands the conditioning
+    # door the fit's own diag instead of asking it to go and find out.
+    #
+    # THE ZERO IS THE LOAD-BEARING ONE.  The door is still called, once
+    # per block, with the block's solve mode — that is asserted by
+    # ``test_hardeners_leave_the_conditioning_call_path_alone`` and it is
+    # a seam another lane rebases onto.  What it no longer does is
+    # DISPATCH: it renames keys the fit already computed.  A reader who
+    # sees these two facts stated in two different cells is seeing the
+    # distinction the restructure turns on, which is why the counter is
+    # kept at zero in the report rather than deleted from it.
     assert r["fit_dispatches"] == r["blocks_walked"]
-    assert r["diagnostic_dispatches"] == r["blocks_walked"]
-    assert r["full_fits"] == 2 * r["elements_fitted"]
-    assert r["pade_solves"] == 3 * r["elements_fitted"]
+    assert r["diagnostic_dispatches"] == 0
+    assert r["full_fits"] == r["elements_fitted"]
+    assert r["pade_solves"] == r["elements_fitted"]
 
     sec = r["seconds"]
     parts = sec["read"] + sec["fit"] + sec["write"] + sec["finalize"]

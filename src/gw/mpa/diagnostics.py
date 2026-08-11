@@ -57,6 +57,7 @@ def solve_conditioning(
     rcond=1.0e-13,
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
+    eig=pade_fit.EIG_MODES[0],
     fit_diag=None,
 ):
     """Conditioning and backward error of the DENOMINATOR solve.
@@ -99,6 +100,33 @@ def solve_conditioning(
 
     Parameters
     ----------
+    eig
+        Which eigensolver the underlying fit uses; one of
+        ``pade_fit.EIG_MODES``.
+
+        PLUMBED, NOT ACCEPTED-AND-IGNORED, and the distinction is not
+        stylistic.  It is true that ``cond``, ``sigma_max`` and
+        ``sigma_min`` are properties of the MATRIX rather than of the
+        diagonalization -- they come from the SVD, which no eigensolver
+        choice touches -- and the same is true of ``backward_error``,
+        which measures the reduction ``L X = sL`` and not its spectrum.
+        On those four this argument genuinely makes no difference, and
+        the production ladders confirm it: the condition medians are
+        bit-identical between the two backends.
+
+        But this function returns EIGHT fields, and the other four --
+        ``forward_residual``, ``rel_rms_residual``, ``rsd_eq28`` and
+        ``n_valid`` -- are computed from the finished fit, downstream of
+        the root-finding, after the guards have run on the roots.  A
+        version that swallowed ``eig`` would report the LAPACK path's
+        residuals beside a jax_qr store's poles, which is the precise
+        shape of the defect this module was already reorganised once to
+        remove: a diagnostic that describes a fit nobody performed.
+
+        This argument was missing while both fit entry points had it, so
+        a caller forwarding one mode dict to the fit and to its
+        diagnostics raised TypeError on the second.  The fix is here
+        rather than at the call sites because the call sites were right.
     fit_diag
         The ``diag`` pytree ``pade_fit.fit_mpa_poles`` (or its batched
         form) ALREADY returned for these very samples.  When it is given
@@ -152,7 +180,7 @@ def solve_conditioning(
     # fit's BY CONSTRUCTION rather than by an argument about operand
     # order, because it IS the fit's.
     _, _, diag = pade_fit.fit_mpa_poles(
-        w, z, n, rcond=rcond, solve=solve, affine=affine)
+        w, z, n, rcond=rcond, solve=solve, affine=affine, eig=eig)
     return {k: diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
 
 
@@ -252,6 +280,7 @@ def default_holdout_indices(n_p):
 def holdout_residual(
     W_samples, z_samples, n_p, *, holdout=None, rcond=1.0e-13,
     solve=pade_fit.SOLVE_MODES[0], affine=True,
+    eig=pade_fit.EIG_MODES[0],
 ):
     """Fit on ``2*n_p - 2`` samples, evaluate on the 2 held out.
 
@@ -293,7 +322,7 @@ def holdout_residual(
 
     Omega, B, diag = pade_fit.fit_mpa_poles(
         w[keep_arr], z[keep_arr], n - 1, rcond=rcond, solve=solve,
-        affine=affine)
+        affine=affine, eig=eig)
     model = pade_fit.eval_mpa_model(
         Omega, B, z[held_arr], valid=diag["valid"])
     ref = w[held_arr]
@@ -337,6 +366,7 @@ def perturbation_refit(
     rcond=1.0e-13,
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
+    eig=pade_fit.EIG_MODES[0],
 ):
     """Refit under a certified sample-error vector; report the movement.
 
@@ -380,7 +410,7 @@ def perturbation_refit(
             "error_vector.shape == (2*n_p,) -- one certified complex error "
             "per sample, absolute and in the units of W_samples.")
 
-    kw = dict(rcond=rcond, solve=solve, affine=affine)
+    kw = dict(rcond=rcond, solve=solve, affine=affine, eig=eig)
     Om0, B0, d0 = pade_fit.fit_mpa_poles(w, z, n, **kw)
     Om1, B1, d1 = pade_fit.fit_mpa_poles(w + dw, z, n, **kw)
 

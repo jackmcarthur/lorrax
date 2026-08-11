@@ -33,7 +33,7 @@ import pytest
 jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
-from gw.mpa import pade_fit, sampling, small_eig  # noqa: E402
+from gw.mpa import diagnostics, pade_fit, sampling, small_eig  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +413,65 @@ def test_the_fused_path_reproduces_itself_run_to_run():
     assert np.array_equal(np.asarray(Om1), np.asarray(Om2))
     assert np.array_equal(np.asarray(B1), np.asarray(B2))
     assert np.array_equal(np.asarray(d1["valid"]), np.asarray(d2["valid"]))
+
+
+def test_every_fit_and_diagnostics_entry_point_takes_one_mode_dict():
+    """A caller holds ONE dict describing how the fit is to be done and
+    forwards it to the fit AND to the fit's diagnostics.
+
+    That is how every harness in this campaign is written, and it is why
+    a keyword present on ``fit_mpa_poles`` and absent from
+    ``solve_conditioning`` is not a cosmetic asymmetry: it raises
+    TypeError on the second call, and the workaround -- filtering the
+    dict at the call site -- is how a probe ends up measuring the
+    default while believing it measured the mode it asked for.
+
+    The cell walks every public entry point that performs a fit, so the
+    next keyword to be added has one place that fails if it is added in
+    only half of them.
+    """
+
+    mode = dict(rcond=1.0e-13, solve="loewner", affine=True, eig="jax_qr")
+    n_p = 8
+    W, z = _planted_tile(8, n_p, seed=29)
+    err = 1.0e-9 * np.ones(2 * n_p, dtype=np.complex128)
+
+    pade_fit.fit_mpa_poles(W[0], z, n_p, **mode)
+    pade_fit.fit_mpa_poles_batched(W, z, n_p, **mode)
+    diagnostics.solve_conditioning(W[0], z, n_p, **mode)
+    diagnostics.holdout_residual(W[0], z, n_p, **mode)
+    diagnostics.perturbation_refit(W[0], z, n_p, err, **mode)
+    diagnostics.diagnostics_batched(
+        diagnostics.solve_conditioning, W, z, n_p, **mode)
+
+
+def test_the_conditioning_door_reports_the_backend_it_was_asked_for():
+    """PLUMBED, not swallowed -- asserted rather than trusted.
+
+    Four of this door's eight fields are downstream of the root-finding,
+    so a version that accepted ``eig`` and ignored it would report one
+    backend's residuals beside the other's poles.  The check is exact
+    equality with the fit that WAS run in that mode, in both modes; the
+    second assertion confirms the first can actually detect a swallow,
+    by showing the two modes do not return the same number here.
+    """
+
+    n_p = 8
+    W, z = _planted_tile(8, n_p, seed=31)
+    seen = {}
+    for eig in pade_fit.EIG_MODES:
+        _, _, diag = pade_fit.fit_mpa_poles(W[0], z, n_p, eig=eig)
+        door = diagnostics.solve_conditioning(W[0], z, n_p, eig=eig)
+        for door_key, diag_key in diagnostics._CONDITIONING_FROM_DIAG.items():
+            assert np.array_equal(
+                np.asarray(door[door_key]), np.asarray(diag[diag_key])), (
+                f"eig={eig}: {door_key} is not the fit's {diag_key}")
+        seen[eig] = float(np.asarray(door["forward_residual"]))
+
+    assert seen["lapack"] != seen["jax_qr"], (
+        "the two backends returned an identical forward residual on this "
+        "element, so the equality above could not have caught a swallowed "
+        "eig= and this cell is not testing what it claims")
 
 
 def test_fused_and_unfused_are_bit_identical_for_a_fixed_backend():
