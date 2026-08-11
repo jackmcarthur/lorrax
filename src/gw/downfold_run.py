@@ -73,6 +73,7 @@ from gw.downfold import (
     BandWindow,
     R19_ANCHOR,
     build_transfer,
+    child_unfold_tables,
     congruence,
     epsilon_w,
     pair_density_gram,
@@ -239,6 +240,176 @@ def _read_geometry(filename: str) -> dict:
     return geom
 
 
+def _read_parent_unfold_tables(src: str, mu_L: int, print_fn):
+    """The parent's ``QirrTables``, or ``None`` when it stores the full BZ.
+
+    THE TABLE IS READ, NOT RE-DERIVED, and that is the whole point.  Building
+    ``(α, L)`` from geometry needs the parent's symmetry ops, which live on a
+    WFN this driver deliberately does not open — and even if it did, a
+    second derivation of the permutation would be a second answer to a
+    question the parent's own file already answers.  ``qirr_store`` persists
+    the tables beside the tensor they deconstructed, so the selection is
+    closed under exactly the permutation the parent's wedge storage rests on.
+
+    Returns ``None`` — an ABSENCE, announced as one — when the parent's
+    ``V_qmunu`` is stored on the full BZ.  Nothing is wrong in that case; the
+    selection is point-granular, closure is unmeasured, and the child cannot
+    be wedge-stored because there is no wedge in its lineage to store it on.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import dataset_q_storage, read_tables
+
+    try:
+        with h5py.File(src, "r") as f:
+            storage = dataset_q_storage(f["V_qmunu"])
+        if storage != "ibz":
+            print_fn(
+                "  [downfold/star] the parent stores V_qmunu on the FULL BZ, "
+                "so it carries no centroid source map and this run's "
+                "selection is POINT-GRANULAR: orbit closure is UNMEASURED, "
+                "which is an absence and not a pass, and the child cannot be "
+                "wedge-stored (there is no wedge in its lineage).  Set the "
+                "PARENT run's restart_q_storage = auto to get both.")
+            return None
+        tables = read_tables(src, "V_qmunu")
+    except (KeyError, ValueError, OSError) as exc:
+        print_fn(
+            f"  [downfold/star] the parent's q_irr tables could not be read "
+            f"({type(exc).__name__}: {exc}).  Falling back to a "
+            f"POINT-GRANULAR selection with closure UNMEASURED — an absence, "
+            f"not a pass.")
+        return None
+
+    perm = np.asarray(tables.sym_perm)
+    if int(perm.shape[1]) < int(mu_L):
+        raise ValueError(
+            f"downfold: the parent's stored sym_perm describes "
+            f"{int(perm.shape[1])} centroids but the bundle declares "
+            f"mu_L={mu_L}.  The table and the tensor are not about the same "
+            f"centroid set, and selecting orbits against the wrong table "
+            f"would produce a child whose 'orbits' are arbitrary index "
+            f"classes.")
+    print_fn(
+        f"  [downfold/star] parent centroid source map read from its own "
+        f"q_irr tables: {int(perm.shape[0])} op rows "
+        f"({int(tables.n_sym_spatial)} spatial + TRS) over "
+        f"{int(perm.shape[1])} centroids, {int(np.asarray(tables.q_irr_frac).shape[0])} "
+        f"of {int(np.asarray(tables.irr_idx_q).shape[0])} q on the wedge.")
+    return tables
+
+
+def _wedge_q_slots(tables) -> np.ndarray:
+    """Full-BZ index of each wedge slot: ``irr_idx == i`` and ``sym_idx == 0``.
+
+    REFUSES rather than guessing.  ``qirr_store``'s own module docstring
+    records that slicing an unfolded tensor back to the wedge is bit-exact
+    "only because ``sym_idx_q[q_irr_full_idx] == 0``, which is a consequence
+    of a policy nobody has agreed to freeze for this purpose".  A downfold has
+    no pre-unfold capture to fall back on — the reader unfolds the parent
+    before this driver sees it — so the policy is CHECKED here on every run
+    instead of relied upon, and the round trip below measures the result.
+    """
+    irr = np.asarray(tables.irr_idx_q).astype(np.int64).ravel()
+    sym = np.asarray(tables.sym_idx_q).astype(np.int64).ravel()
+    n_ibz = int(np.asarray(tables.q_irr_frac).shape[0])
+    slots = np.empty(n_ibz, dtype=np.int64)
+    for i in range(n_ibz):
+        hit = np.flatnonzero((irr == i) & (sym == 0))
+        if hit.size != 1:
+            raise ValueError(
+                f"downfold: wedge slot {i} is carried by {hit.size} full-BZ q "
+                f"with sym_idx == 0 (expected exactly one).  The child's "
+                f"wedge block would have to be chosen rather than restricted, "
+                f"and 'chosen' is the word for the failure this refusal "
+                f"exists to prevent.")
+        slots[i] = int(hit[0])
+    return slots
+
+
+def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
+                                  mu_S_pad, *, print_fn):
+    """THE COMPOSITION, MEASURED ON THE RUN'S OWN TENSORS.
+
+    An orbit-floored selection is orbit-closed by construction, so the child
+    HAS unfold tables — ``child_unfold_tables`` builds them as restrictions of
+    the parent's.  Whether the child is genuinely wedge-storable is a
+    different claim, and it is the one the q_irr amendment gated on a
+    synthetic: unfolding the child's wedge block with the child's own tables
+    must reproduce the child on the full BZ.
+
+    This takes that gate on the REAL tensors this run just produced, per run,
+    at whatever mesh it is on.  Cost is one unfold of an
+    ``(n_q_ibz, μ_S, μ_S)`` block, which is the smallest tensor in the
+    pipeline.  Returns ``(child_perm, child_L, slots, worst_rel)``.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_isdf_operator
+    from common.collectives import gather_to_host
+
+    child_perm, child_L = child_unfold_tables(
+        keep_idx, np.asarray(tables.sym_perm)[:, :],
+        np.asarray(tables.L_table))
+    slots = _wedge_q_slots(tables)
+
+    # The tables carry the CHILD's logical μ; the tensors carry its device
+    # pad.  Pad the tables with the identity tail / zero wrap the format
+    # itself uses, so the unfold runs at the tensor's own extent.
+    n_pad = int(mu_S_pad) - int(mu_S)
+    if n_pad:
+        tail = np.arange(mu_S, mu_S_pad, dtype=child_perm.dtype)
+        child_perm_p = np.concatenate(
+            [child_perm, np.broadcast_to(tail, (child_perm.shape[0], n_pad))],
+            axis=1)
+        child_L_p = np.concatenate(
+            [child_L, np.zeros((child_L.shape[0], n_pad, 3), child_L.dtype)],
+            axis=1)
+    else:
+        child_perm_p, child_L_p = child_perm, child_L
+
+    worst = {}
+    for name, arr in small.items():
+        full = np.asarray(gather_to_host(arr))
+        wedge = jnp.asarray(full[slots])
+        got = np.asarray(gather_to_host(unfold_isdf_operator(
+            wedge,
+            irr_idx=jnp.asarray(np.asarray(tables.irr_idx_q)),
+            sym_idx=jnp.asarray(np.asarray(tables.sym_idx_q)),
+            sym_perm=jnp.asarray(child_perm_p),
+            L_table=jnp.asarray(child_L_p),
+            q_irr_frac=jnp.asarray(np.asarray(tables.q_irr_frac)),
+            mesh_xy=mesh_xy,
+            n_sym_spatial=int(tables.n_sym_spatial))))
+        scale = float(np.max(np.abs(full))) or 1.0
+        worst[name] = float(np.max(np.abs(got - full))) / scale
+    worst_rel = max(worst.values()) if worst else float("nan")
+
+    print_fn("\n".join([
+        f"  [downfold/star] CHILD WEDGE-STORABILITY GATE, on this run's own "
+        f"tensors: the child's {len(slots)}-q wedge block unfolded with the "
+        f"child's own tables against the full-BZ child --",
+    ] + [f"  [downfold/star]   {n}: max rel {v:.3e}"
+         for n, v in sorted(worst.items())] + [
+        f"  [downfold/star] the child's unfold tables are the parent's "
+        f"restricted to the kept rows (keep[alpha_S(j)] = alpha(keep[j])), so "
+        f"the phase the child applies is the phase the parent would have "
+        f"applied to those centroids.  This number is the reassociation "
+        f"floor, not an agreement band: the two routes apply the same unitary "
+        f"at different points of one chain.  A DIFFERENT algebra misses by "
+        f"order one (the red twin in tests/test_downfold.py reads 8.6e-01).",
+        f"  [downfold/star] the tables are stored in the child's "
+        f"downfold_provenance group.  The child's TENSORS are still written "
+        f"on the FULL BZ, and the blocker is named rather than left to be "
+        f"rediscovered: symmetry_maps.qirr_store refuses to stamp a wedge "
+        f"without a CentroidClosureVerdict, which is a GEOMETRIC measurement "
+        f"over the parent's symmetry operations, and those live on a WFN this "
+        f"driver does not open.  The permutation-level statement above is a "
+        f"different object and must not be stamped as if it were that one.",
+    ]))
+    return child_perm, child_L, slots, worst_rel
+
+
 class _BandSlices:
     """The five-integer band-window stamp, carried through verbatim.
 
@@ -317,33 +488,21 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         # be flat in q, so the q = 0 Gram is the right selection Gram.
         S_q0 = jax.lax.with_sharding_constraint(
             S_LL[0], NamedSharding(mesh_xy, P("x", "y")))
-        # ORBIT CLOSURE OF THE SELECTION — passed when the driver can build
-        # the parent's centroid source map, and NOT BUILT HERE.
-        #
-        # ``select_cur_centroids`` completes the kept set to whole orbits when
-        # it is given ``sym_perm``, and re-takes the rank certificate and the
-        # auto ceiling on the completed set; that is the spectral-closure
-        # lane's row and it is done.  Producing the table is the OTHER half —
-        # it needs the parent's symmetry ops and centroid table together
-        # (``symmetry_maps.centroid_source_map_and_wrap``), which this driver
-        # does not load today, and it belongs with the q_irr wedge-writer
-        # plumbing rather than here.  Until it arrives, closure is UNMEASURED
-        # and this says so: an absence must not read like a pass.
-        print_fn(
-            "  [downfold/star] centroid orbit closure NOT CHECKED: this "
-            "driver does not build the parent's centroid source map, so "
-            "select_cur_centroids received no sym_perm.  THAT IS AN ABSENCE, "
-            "NOT A PASS — the CUR selection stops at exactly mu_S and "
-            "generically lands mid-orbit, and a child written on the q wedge "
-            "from a non-closed keep reads back as a permutation of the WRONG "
-            "centroids (tests/known_failures/"
-            "2026-08-10-downfold-qirr-star-stability.md).  Every child is "
-            "written on the FULL BZ today, which is correct and merely "
-            "larger, so nothing here is wrong — it is unverified.")
+        # THE PARENT'S CENTROID SOURCE MAP, when the parent carries one.
+        # It is not re-derived from geometry — the parent's own wedge tensors
+        # were stored against exactly this table and it travels in the file
+        # beside them, so reading it is the only way to be sure the selection
+        # is being closed under the SAME permutation the parent's storage
+        # rests on.  With it, the selection runs in whole orbits and floors to
+        # the user's point budget (owner ruling, 2026-08-10); without it, the
+        # selection is point-granular and closure is an ABSENCE.
+        parent_tables = _read_parent_unfold_tables(src, mu_L, print_fn)
         keep_idx, sel = select_cur_centroids(
             S_q0, cfg.mu_small, rcond=cfg.downfold_rcond,
             select_tol=cfg.downfold_select_tol, mesh_xy=mesh_xy,
-            mu_large_logical=mu_L, print_fn=print_fn, sym_perm=None)
+            mu_large_logical=mu_L, print_fn=print_fn,
+            sym_perm=(None if parent_tables is None
+                      else np.asarray(parent_tables.sym_perm)[:, :mu_L]))
         mu_S = int(sel.mu_small)
         mu_S_pad = int(padded_mu_extent(mu_S, int(jax.device_count())))
     print_fn(sel.describe())
@@ -432,13 +591,31 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             "answer to 'did the downfold work' that does not require a "
             "reference calculation.  It costs two GEMMs at mu_L per q.")
 
+    # ---- D5b: is the CHILD wedge-storable? --------------------------------
+    # Only askable now: it is a statement about the child's TENSORS, and they
+    # exist one statement ago.  Only ANSWERABLE at all because the selection
+    # ran in whole orbits — a point-granular keep has no child tables, which
+    # is what ``child_unfold_tables`` refuses by name.
+    child_tables = None
+    if parent_tables is not None and sel.star is not None and sel.star.closed:
+        with timing.section("downfold.star", announce=False):
+            child_tables = _gate_child_wedge_storability(
+                small, keep_idx, parent_tables, mesh_xy, mu_S, mu_S_pad,
+                print_fn=print_fn)
+    elif parent_tables is not None:
+        print_fn(
+            "  [downfold/star] the selection is NOT orbit-closed, so the "
+            "child has no unfold tables and the wedge-storability gate did "
+            "not run.  In orbit mode this cannot happen; reaching it means "
+            "the selection fell back to point granularity.")
+
     # ---- the write --------------------------------------------------------
     with timing.section("downfold.write", announce=True,
                         label="small restart bundle"):
         out_file = _write_small_bundle(
             cfg, geom, small, g0_S, rs.enk_full, psi_S_Y, keep_idx, mu_S,
             mesh_xy, sel=sel, rank_per_q=rank_per_q, eps=eps,
-            print_fn=print_fn)
+            child_tables=child_tables, print_fn=print_fn)
 
     parent_table, fft_grid = resolve_parent_centroids(
         cfg, src, mu_L, geom, os.path.dirname(out_file), print_fn=print_fn)
@@ -493,7 +670,8 @@ def _announce_residual(eps: dict, print_fn) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
-                        mu_S, mesh_xy, *, sel, rank_per_q, eps, print_fn):
+                        mu_S, mesh_xy, *, sel, rank_per_q, eps,
+                        child_tables=None, print_fn=print):
     out_dir = cfg.output_restart
     tmp_dir = os.path.join(out_dir, "tmp")
     if process_rank() == 0:
@@ -538,7 +716,8 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
             omega_grid=geom["omega_grid"], S_cart=geom["S_cart"])
 
     _stamp_downfold_provenance(out_file, cfg, geom, keep_idx, mu_S,
-                               sel=sel, rank_per_q=rank_per_q, eps=eps)
+                               sel=sel, rank_per_q=rank_per_q, eps=eps,
+                               child_tables=child_tables)
     barrier("downfold.bundle_written")
     print_fn(f"  [downfold] wrote {out_file}  "
              f"(mu {sel.mu_large} -> {mu_S}, "
@@ -557,7 +736,7 @@ def _append_munu(filename, name, arr, mu_S, mesh_xy):
 
 
 def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
-                               sel, rank_per_q, eps):
+                               sel, rank_per_q, eps, child_tables=None):
     """Rank-0 group recording what this bundle IS and how it was made.
 
     A downfolded bundle is indistinguishable from a natively-fitted one by
@@ -589,6 +768,18 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
         g.attrs["select_rank"] = np.int64(sel.select_rank)
         g.attrs["eigen_rank_kept"] = np.int64(sel.eigen_rank_kept)
         g.attrs["r19_anchor"] = R19_ANCHOR
+        # THE REQUEST AND THE REALIZATION, BOTH, and in POINTS.  A reader
+        # that finds mu_small = 168 in a deck that says 185 must be able to
+        # learn here that the difference is the orbit floor and not a typo.
+        g.attrs["mu_small_requested"] = np.int64(sel.mu_small_requested)
+        g.attrs["selection_granularity"] = (
+            "orbit" if sel.orbit_mode else "point")
+        if sel.orbit_mode:
+            g.attrs["n_orbits_kept"] = np.int64(sel.n_orbits_kept)
+            g.attrs["n_orbits_pool"] = np.int64(sel.n_orbits_pool)
+            g.attrs["orbit_select_rank"] = np.int64(sel.orbit_rank)
+            g.create_dataset("parent_orbit_sizes",
+                             data=np.asarray(sel.orbit_sizes, dtype=np.int64))
         if geom.get("centroids_charge_md5") is not None:
             g.attrs["parent_centroids_charge_md5"] = geom[
                 "centroids_charge_md5"]
@@ -598,6 +789,28 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
         for name, e in eps.items():
             g.create_dataset(f"eps_w_{name}",
                              data=np.asarray(e, dtype=np.float64))
+        # THE CHILD'S OWN UNFOLD TABLES, when the selection is orbit-closed.
+        # They are the parent's restricted to the kept rows, they were
+        # VERIFIED against this run's own tensors before they were written
+        # (``_gate_child_wedge_storability``), and they are stored so that a
+        # wedge writer for the child does not have to re-derive them — a
+        # second derivation of a permutation is a second answer to a question
+        # this run already answered.
+        if child_tables is not None:
+            child_perm, child_L, slots, worst_rel = child_tables
+            cg = g.create_group("child_unfold_tables")
+            cg.attrs["covariance_worst_rel"] = np.float64(worst_rel)
+            cg.attrs["note"] = (
+                "child sym_perm/L_table = the parent's restricted to keep_idx;"
+                " q-side tables are the parent's, unchanged (the downfold is"
+                " q-diagonal).  The child's TENSORS in this file are on the"
+                " FULL BZ.")
+            cg.create_dataset("sym_perm",
+                              data=np.asarray(child_perm, dtype=np.int32))
+            cg.create_dataset("L_table",
+                              data=np.asarray(child_L, dtype=np.int8))
+            cg.create_dataset("q_irr_full_idx",
+                              data=np.asarray(slots, dtype=np.int64))
     barrier("downfold.provenance")
 
 

@@ -617,10 +617,21 @@ def test_the_default_mode_and_tolerance_have_exactly_one_literal():
 # commutes with the whole point group, so every member of a centroid orbit
 # carries the IDENTICAL Schur diagonal: an orbit is a degenerate block, and
 # pivoted Cholesky's index-order tie-break between its members is exactly the
-# round-off-chosen slice this module's spectral guard refuses.  The repair is
-# the same repair — complete OUTWARD to whole orbits — and it forces the rank
-# certificate and the ``auto`` ceiling to be re-taken on the completed set,
-# which is this lane's row.
+# round-off-chosen slice this module's spectral guard refuses.
+#
+# THE TWO GUARDS POINT IN OPPOSITE DIRECTIONS, AND THAT IS THE POINT OF THIS
+# SECTION.  ``spectral_closure`` snaps the rank CEILING outward, because a cut
+# is a correctness threshold and taking less than it certified is the failure.
+# The selection floors ``mu_small`` inward, because ``mu_small`` is a BUDGET
+# the user stated in points and overrunning it is the failure — owner ruling,
+# 2026-08-10: "everything the user has input on they should be specifying in
+# units of points, and we should be choosing the quantity of orbits that comes
+# closest to that number of points without exceeding it."  These cells were
+# written against the previous design, in which the selection completed
+# OUTWARD to whole orbits; that design is retired because on ``si_bse_debug``
+# it took mu_S from 185 to 480 (the whole parent basis) and then refused.  The
+# cells are kept, pointed the other way, so the retirement is gated rather
+# than merely described.
 
 def _sel_setup(mu=12, orb=4, seed=5):
     """A parent Gram that genuinely commutes with a cyclic centroid group."""
@@ -646,8 +657,65 @@ def _sel_setup(mu=12, orb=4, seed=5):
     return G, perm
 
 
-def test_TRUE_a_mid_orbit_selection_is_completed_outward():
-    """The TRUE arm: a cut mid-orbit must be completed, never dropped."""
+def test_TRUE_a_mid_orbit_request_is_FLOORED_INWARD():
+    """The TRUE arm: a request between rungs lands on the rung BELOW it.
+
+    And the realized set is orbit-closed, so the child has unfold tables — the
+    composition the q_irr lane could not have because a point-granular
+    selection cuts orbits.
+    """
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw import downfold
+    from common.collectives import resolve_mesh
+
+    G, perm = _sel_setup()
+    mesh = resolve_mesh()
+    G_j = jax.lax.with_sharding_constraint(
+        jnp.asarray(G), NamedSharding(mesh, P("x", "y")))
+    sizes = np.bincount(downfold.centroid_orbit_id(perm))
+    fired = 0
+    for mu_S in range(4, 13):
+        got, rep = downfold.select_cur_centroids(
+            G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+            mu_large_logical=12, print_fn=lambda *a, **k: None,
+            sym_perm=perm)
+        assert downfold.star_stability(got, perm).closed, (
+            f"mu_S={mu_S}: the orbit-mode selection is not orbit-closed")
+        assert got.size <= mu_S, (
+            f"mu_S={mu_S}: the floor realized {got.size} points and OVERRAN "
+            f"the user's budget.  A budget that can be exceeded is not a "
+            f"budget; this is the direction the ruling fixed")
+        assert rep.mu_small == got.size, (
+            "the SelectionReport must carry the REALIZED count — the "
+            "delivered length is the authority")
+        assert rep.mu_small_requested == mu_S, (
+            "the report must also carry what was ASKED FOR, or a log reading "
+            "168 in a deck that says 185 is unexplainable")
+        # the realized count is the LARGEST legal rung at or below the request
+        rungs = [n for n in range(1, 13)
+                 if n % int(sizes[0]) == 0]          # equal orbits here
+        assert got.size == max(r for r in rungs if r <= mu_S), (
+            f"mu_S={mu_S}: floored to {got.size}, but "
+            f"{max(r for r in rungs if r <= mu_S)} also fits the budget — "
+            f"'closest without exceeding' means the LARGEST such value")
+        if got.size < mu_S:
+            fired += 1
+    assert fired >= 1, (
+        "every request landed exactly on a rung — the TRUE arm never ran and "
+        "this gate proves nothing")
+
+
+def test_RED_TWIN_a_selection_that_would_exceed_the_budget_floors_LOUDLY():
+    """The red twin the ruling names: overrun is impossible, and it is SAID.
+
+    A point-granular selection at the same mu_S takes a partial orbit — that
+    is the measured default (0 of 185 admissible mu_S closed on
+    ``si_bse_debug``).  Orbit mode cannot: it must come back smaller, closed,
+    and it must PRINT both numbers, because a quantisation nobody is told
+    about is a number that will be read as a typo.
+    """
     jax = pytest.importorskip("jax")
     jnp = jax.numpy
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -659,34 +727,29 @@ def test_TRUE_a_mid_orbit_selection_is_completed_outward():
     G_j = jax.lax.with_sharding_constraint(
         jnp.asarray(G), NamedSharding(mesh, P("x", "y")))
 
-    fired = 0
-    for mu_S in range(2, 12):
-        base, _ = downfold.select_cur_centroids(
-            G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
-            mu_large_logical=12, print_fn=lambda *a, **k: None)
-        if downfold.star_stability(base, perm).closed:
-            continue                       # nothing to complete at this mu_S
-        fired += 1
-        got, rep = downfold.select_cur_centroids(
-            G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
-            mu_large_logical=12, print_fn=lambda *a, **k: None,
-            sym_perm=perm)
-        assert downfold.star_stability(got, perm).closed, (
-            f"mu_S={mu_S}: completion did not close the orbit")
-        assert set(base.tolist()) <= set(got.tolist()), (
-            "completion DROPPED a selected centroid; the repair must be "
-            "keep-more, or the retained subspace falls below what the rank "
-            "refusal certified")
-        assert got.size > base.size, "outward means larger"
-        assert rep.mu_small == got.size, (
-            "the SelectionReport still carries the requested mu_S — the "
-            "delivered length is the authority and the report must say so")
-        assert rep.star is not None and rep.star.closed
-        # The re-taken certificate is on the COMPLETED set.
-        assert rep.eigen_rank_kept <= got.size
-    assert fired >= 1, (
-        "no mu_S needed completion on this construction — the TRUE arm never "
-        "ran and this gate proves nothing")
+    mu_S = 11                                  # between the rungs 8 and 12
+    point, _ = downfold.select_cur_centroids(
+        G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+        mu_large_logical=12, print_fn=lambda *a, **k: None)
+    assert point.size == mu_S
+    assert not downfold.star_stability(point, perm).closed, (
+        "the point-granular selection at mu_S=11 came back orbit-closed, so "
+        "this cell is not exercising the case the floor exists for")
+
+    lines = []
+    got, rep = downfold.select_cur_centroids(
+        G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+        mu_large_logical=12, print_fn=lines.append, sym_perm=perm)
+    assert got.size < mu_S and downfold.star_stability(got, perm).closed
+    blob = "\n".join(lines)
+    assert "ORBIT-FLOORED" in blob, "the floor fired silently"
+    assert f"requested {mu_S} points" in blob and f"REALIZED {got.size}" in blob, (
+        f"the loud line must name BOTH numbers; got:\n{blob}")
+    assert "were not spent" in blob, (
+        "the line must say how much of the budget went unspent")
+    # and the report says the same thing, for a consumer that reads objects
+    assert rep.floored_by == mu_S - got.size
+    assert rep.orbit_mode and rep.n_orbits_kept == got.size // 4
 
 
 def test_FALSE_an_already_closed_selection_is_untouched():
@@ -720,14 +783,17 @@ def test_FALSE_an_already_closed_selection_is_untouched():
     assert checked >= 1, "the FALSE arm never ran"
 
 
-def test_completion_that_would_exceed_the_rank_ceiling_REFUSES():
-    """The knob-trap, re-taken.  Completion is not allowed to buy fiction.
+def test_the_floor_can_NEVER_exceed_the_rank_ceiling():
+    """The knob-trap, re-taken — and now it is structural rather than checked.
 
-    Orbit completion moves mu_S outward, and outward can cross the eigenvalue
-    rank ceiling the window actually holds.  The refusal must fire on the
-    COMPLETED count — the whole discipline of this function is that mu_S is
-    validated against the eigenvalue rank, never against the selection
-    certificate, and completion does not get an exemption.
+    The previous design moved mu_S OUTWARD and could cross the eigenvalue
+    ceiling the window holds, so it had to re-certify and refuse; on
+    ``si_bse_debug`` that refusal was the production path.  Flooring cannot
+    reach that state: realized <= requested <= ceiling, in POINTS, so the
+    ceiling refusal only ever fires on the number the user typed.  This gate
+    is the measurement of that claim over a rank-deficient window, and it also
+    pins the OTHER half of the discipline — the selection certificate counts
+    ORBITS in orbit mode and must not be compared to a point count.
     """
     jax = pytest.importorskip("jax")
     jnp = jax.numpy
@@ -736,8 +802,8 @@ def test_completion_that_would_exceed_the_rank_ceiling_REFUSES():
     from common.collectives import resolve_mesh
 
     G, perm = _sel_setup()
-    # Squeeze the ceiling to just under an orbit boundary by rank-deficiency:
-    # project out the smallest directions so the window holds fewer than 12.
+    # Squeeze the ceiling by rank-deficiency: project out the smallest
+    # directions so the window holds fewer than 12 independent ones.
     w, V = np.linalg.eigh(G)
     w[:5] = w[5] * 1e-14                       # 7 directions above the cut
     G2 = (V * w) @ V.conj().T
@@ -745,23 +811,37 @@ def test_completion_that_would_exceed_the_rank_ceiling_REFUSES():
     mesh = resolve_mesh()
     G_j = jax.lax.with_sharding_constraint(
         jnp.asarray(G2), NamedSharding(mesh, P("x", "y")))
-    lines = []
-    raised = None
-    for mu_S in range(2, 12):
+
+    seen, over_ceiling = 0, []
+    for mu_S in range(4, 13):
+        lines = []
         try:
-            downfold.select_cur_centroids(
+            got, rep = downfold.select_cur_centroids(
                 G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
                 mu_large_logical=12, print_fn=lines.append, sym_perm=perm)
         except ValueError as exc:
-            if "Orbit completion needs" in str(exc):
-                raised = str(exc)
-                break
-    assert raised is not None, (
-        "no mu_S was refused: completion never crossed the ceiling on this "
-        "construction, so the re-certification is untested here")
-    assert "SYMMETRY-LEGAL" in raised and "lower mu_small" in raised, (
-        "the refusal must say WHICH number is over the ceiling and name the "
-        "fix; a bare refusal sends the user to loosen rcond")
+            # The only admissible refusal is on the REQUEST, never on a
+            # number the floor invented.
+            assert "REFUSING mu_small" in str(exc), str(exc)
+            continue
+        seen += 1
+        assert got.size <= rep.eigen_rank_pool, (
+            f"mu_S={mu_S}: realized {got.size} points against a ceiling of "
+            f"{rep.eigen_rank_pool} — the floor overran the rank criterion")
+        assert got.size <= mu_S
+        assert downfold.star_stability(got, perm).closed
+        if got.size > rep.eigen_rank_pool:
+            over_ceiling.append(mu_S)
+        # THE KNOB TRAP: select_rank counts ORBITS here and the report must
+        # say so rather than letting it be read as points.
+        assert rep.orbit_rank == rep.select_rank
+        assert "ORBITS" in rep.describe(), (
+            "the selection certificate is in orbits and the report does not "
+            "say so — this is the 42-of-42-directions-on-1908-points "
+            "confusion the point_granularity_rank instrument exists for")
+        assert rep.eigen_rank_kept <= got.size
+    assert seen >= 1, "no mu_S was admitted; the gate measured nothing"
+    assert not over_ceiling
 
 
 def test_the_absence_of_sym_perm_is_reported_as_an_absence():
@@ -769,8 +849,8 @@ def test_the_absence_of_sym_perm_is_reported_as_an_absence():
     import pathlib
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "src" / "gw" / "downfold_run.py").read_text()
-    assert "orbit closure NOT CHECKED" in src
-    assert "ABSENCE" in src and "NOT A PASS" in src
+    assert "closure is UNMEASURED" in src
+    assert "an absence and not a pass" in src
 
 
 def test_every_wired_site_imports_the_shared_guard():

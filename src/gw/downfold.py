@@ -154,6 +154,7 @@ __all__ = [
     "StarStability",
     "pair_density_gram",
     "select_cur_centroids",
+    "centroid_orbit_id",
     "star_stability",
     "orbit_complete_keep",
     "child_unfold_tables",
@@ -400,30 +401,74 @@ class SelectionReport:
     requested_auto: bool = False
     #: Orbit-closure verdict on the DELIVERED set, or ``None`` when no
     #: ``sym_perm`` was supplied — in which case closure is UNMEASURED, which
-    #: is an absence and not a pass.  When completion fired, ``mu_small``
-    #: above is the completed count.
+    #: is an absence and not a pass.
     star: "StarStability | None" = None
+    #: What the user asked for, IN POINTS, before the orbit floor.  Equal to
+    #: ``mu_small`` on the point-granularity path and ``>=`` it in orbit mode.
+    mu_small_requested: int = 0
+    #: Whole orbits realized, or ``None`` on the point-granularity path.
+    n_orbits_kept: int | None = None
+    #: Orbits the parent set holds in total.
+    n_orbits_pool: int | None = None
+    #: The parent's orbit census, ascending by label.
+    orbit_sizes: tuple[int, ...] | None = None
+    #: Orbits the select CERTIFIED before the residual hit the noise floor.
+    #: In orbit mode this is what ``select_rank`` counts, and it is NOT
+    #: comparable to any point count — see :meth:`describe`.
+    orbit_rank: int | None = None
+
+    @property
+    def orbit_mode(self) -> bool:
+        return self.n_orbits_kept is not None
+
+    @property
+    def floored_by(self) -> int:
+        """Points the user budgeted that the realized basis does not spend."""
+        return int(self.mu_small_requested) - int(self.mu_small)
 
     def describe(self, indent="  ") -> str:
+        if self.orbit_mode:
+            head = (
+                f"{indent}[downfold/select] CUR selection from the parent "
+                f"set, IN WHOLE SYMMETRY ORBITS: mu_L={self.mu_large} -> "
+                f"mu_S requested {self.mu_small_requested} points -> REALIZED "
+                f"{self.mu_small} ({self.n_orbits_kept} of "
+                f"{self.n_orbits_pool} orbits)")
+        else:
+            head = (f"{indent}[downfold/select] CUR selection from the parent "
+                    f"set: mu_L={self.mu_large} -> mu_S={self.mu_small}")
         lines = [
-            f"{indent}[downfold/select] CUR selection from the parent set: "
-            f"mu_L={self.mu_large} -> mu_S={self.mu_small}"
-            + ("  (mu_small = auto: sized by the certified eigenvalue RANK, "
-               "not by observable accuracy — see the warning above)"
-               if self.requested_auto else ""),
+            head + ("  (mu_small = auto: sized by the certified eigenvalue "
+                    "RANK, not by observable accuracy — see the warning "
+                    "above)" if self.requested_auto else ""),
             f"{indent}[downfold/select] TWO DIFFERENT RANKS, and they are "
             f"not the same knob:",
             f"{indent}[downfold/select]   EIGENVALUE rank of the pool Gram "
-            f"at rcond={self.rcond:g}: {self.eigen_rank_pool}   "
+            f"at rcond={self.rcond:g}: {self.eigen_rank_pool} POINTS   "
             f"<- this is what mu_S is validated against",
             f"{indent}[downfold/select]   pivoted-Cholesky SELECTION "
-            f"certificate at tol={self.select_tol:g}: {self.select_rank}   "
-            f"<- necessary, NOT sufficient (~3x the eigenvalue rank at the "
-            f"same nominal tolerance; RANK_PROBE §7)",
+            f"certificate at tol={self.select_tol:g}: {self.select_rank}"
+            + ((f" ORBITS   <- NOT a point count.  In orbit mode the greedy "
+                f"deflates the Schur complement by ONE direction per orbit "
+                f"while retiring all its members, so this counts orbits and "
+                f"is not comparable to mu_S={self.mu_small} points.  The "
+                f"comparable number is the line below "
+                f"(centroid.pivoted_cholesky.point_granularity_rank exists "
+                f"because this confusion already shipped once)")
+               if self.orbit_mode else
+               (f" POINTS   <- necessary, NOT sufficient (~3x the eigenvalue "
+                f"rank at the same nominal tolerance; RANK_PROBE §7)")),
             f"{indent}[downfold/select]   EIGENVALUE rank of the KEPT "
             f"block S_SS[keep,keep] at q=0: {self.eigen_rank_kept} of "
-            f"{self.mu_small}",
+            f"{self.mu_small} POINTS   <- the point-granularity certificate, "
+            f"taken on the REALIZED set",
         ]
+        if self.orbit_mode:
+            lines.append(
+                f"{indent}[downfold/select] the floor left "
+                f"{self.floored_by} of the {self.mu_small_requested} "
+                f"budgeted points unspent; the realized set is orbit-closed, "
+                f"so the child is wedge-storable.")
         if self.pool_report is not None:
             lines.append(f"{indent}[downfold/select] pool spectrum:")
             lines.append(self.pool_report.describe(indent=indent + "  "))
@@ -444,6 +489,241 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
     ev = np.linalg.eigvalsh(0.5 * (sub + sub.conj().T))
     return rank_criterion.rank_report(
         ev, rcond, label=label, quantity="eigenvalues", n_rows=n)
+
+
+# ---------------------------------------------------------------------------
+# THE TWO QUANTISATIONS ON THIS PATH POINT IN OPPOSITE DIRECTIONS, ON PURPOSE
+# ---------------------------------------------------------------------------
+#
+# ``select_cur_centroids`` rounds two different things, and a reader who has
+# just met one of them will assume the other rounds the same way.  It does not,
+# and the difference is not an inconsistency — it is the difference between a
+# CORRECTNESS constraint and a BUDGET.
+#
+#   ``common/spectral_closure`` — SNAP OUTWARD.  The rank ceiling is a cut
+#   through the pool Gram's eigenvalue spectrum, and a cut that lands inside a
+#   degenerate block picks a symmetry-arbitrary slice of an eigenspace.  The
+#   only stable choices are the whole block or none of it, and taking LESS than
+#   the criterion certified is the direction the rank refusal exists to
+#   prevent — so the guard MOVES THE CEILING UP, past the block.  It is allowed
+#   to overshoot the number it was handed because that number is a threshold on
+#   a physical quantity, not a resource the user is paying for.
+#
+#   ORBIT FLOORING — SNAP INWARD.  ``mu_small`` is the user's statement of how
+#   many centroids they are willing to carry, in POINTS.  Symmetry-legal sizes
+#   are the sizes of unions of whole orbits, so a request generically falls
+#   between two rungs of a ladder, and the ruling of 2026-08-10 is that the
+#   realized set is the largest one that DOES NOT EXCEED the request:
+#
+#       "everything the user has input on they should be specifying in units
+#        of points, and we should be choosing the quantity of orbits that
+#        comes closest to that number of points without exceeding it."
+#
+#   So this one UNDERSHOOTS, always, and says so loudly.  Overshooting a
+#   budget is the failure the previous design had: orbit COMPLETION rounded the
+#   selection outward to whole orbits, which on ``si_bse_debug`` took μ_S from
+#   185 to 480 — the entire parent basis, i.e. not downfolding at all — and
+#   then refused, correctly, because 480 is over the ceiling.  Flooring cannot
+#   reach that state by construction: the realized count is ≤ the request is ≤
+#   the ceiling, so the ceiling refusal can only ever fire on the number the
+#   user typed.
+#
+# Both are quantisations of a user-facing number onto a legal ladder; they
+# differ in whether the ladder is about what is TRUE or about what is BOUGHT.
+# ``AGENT_PREAMBLE``'s band-degeneracy ruling ("never set ``snap`` to make a
+# gate pass") is the same distinction from the other side: you may not loosen a
+# correctness criterion, and this floor loosens nothing — it spends less.
+
+
+def centroid_orbit_id(sym_perm) -> np.ndarray:
+    """Orbit labels for the parent's centroids: ``(n_rmu,)`` int32.
+
+    The orbits are the connected components of the action of ``sym_perm``'s
+    rows on the centroid index set — the same table :func:`star_stability`
+    takes, read as a graph instead of as a predicate.  Two centroids carry the
+    same label iff some op maps one to the other, so a set of centroids is
+    orbit-closed exactly when it is a union of label classes, which is the
+    property ``centroid.pivoted_cholesky``'s ``orbit_id`` mode delivers by
+    construction.
+
+    Labels are CONTIGUOUS from 0 and ordered by first appearance, so
+    ``np.bincount`` of the result is the orbit census.  Union-find with path
+    compression: O(n_sym · n_rmu) and no allocation past the parent array.
+    """
+    perm = np.asarray(sym_perm, dtype=np.int64)
+    if perm.ndim != 2:
+        raise ValueError(
+            f"downfold.centroid_orbit_id: sym_perm must be (n_sym, n_rmu); "
+            f"got shape {perm.shape}.")
+    n = int(perm.shape[1])
+    parent = np.arange(n, dtype=np.int64)
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for s in range(int(perm.shape[0])):
+        row = perm[s]
+        if int(row.min()) < 0 or int(row.max()) >= n:
+            raise ValueError(
+                f"downfold.centroid_orbit_id: sym_perm row {s} leaves the "
+                f"centroid index range [0, {n}) — it is not a permutation of "
+                f"the parent's centroid table.")
+        for mu in range(n):
+            ra, rb = find(mu), find(int(row[mu]))
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+    roots = np.array([find(i) for i in range(n)], dtype=np.int64)
+    _, label = np.unique(roots, return_inverse=True)
+    return label.astype(np.int32)
+
+
+def _orbit_census_line(sizes: np.ndarray) -> str:
+    """``2 x 24 + 9 x 48 = 480`` — the census, in the row's own spelling."""
+    vals, counts = np.unique(np.asarray(sizes), return_counts=True)
+    terms = " + ".join(f"{int(c)} x {int(v)}" for v, c in zip(vals, counts))
+    return f"{int(sizes.size)} orbits: {terms} = {int(np.sum(sizes))}"
+
+
+def _legal_point_counts(sizes: np.ndarray, ceiling: int,
+                        limit: int = 12) -> str:
+    """The rungs of the ladder at or below ``ceiling``, as a string.
+
+    Every size ``sum(subset of sizes)`` that is ≤ ``ceiling``.  Exact by
+    subset-sum over the DISTINCT orbit sizes with their multiplicities, which
+    on every deck in this project is a handful of values — the point of
+    printing it is that the owner row's complaint about the previous design
+    was that it asked the user to find this ladder by bisection without ever
+    being told a ladder is what they were searching for.
+    """
+    reach = {0}
+    for v in np.asarray(sizes, dtype=np.int64):
+        reach |= {r + int(v) for r in reach if r + int(v) <= int(ceiling)}
+    rungs = sorted(r for r in reach if r > 0)
+    if not rungs:
+        return "none — every orbit is larger than the ceiling"
+    if len(rungs) <= limit:
+        return ", ".join(str(r) for r in rungs)
+    head = ", ".join(str(r) for r in rungs[:limit // 2])
+    tail = ", ".join(str(r) for r in rungs[-(limit // 2):])
+    return f"{head}, ... , {tail}  ({len(rungs)} legal values)"
+
+
+def _floor_selection_to_orbits(
+    piv_np, rank, psd_host, *, mu_S, orbit_id, orbit_sizes, k_req, mu_L,
+    M_pad, ceiling, d0max, tol, print_fn,
+):
+    """THE FLOOR.  Take orbits in pivot order while the POINT total fits.
+
+    ``piv_np`` is the orbit-mode kernel's pivot list — one representative per
+    picked orbit, in the order the greedy chose them — and ``rank`` is how many
+    of those the residual actually certified.  The realized set is the union of
+    the orbits of the longest PREFIX whose point total is ``<= mu_S``.
+
+    A PREFIX AND NOT A KNAPSACK, and the reason is the certificate rather than
+    convenience.  The pivot order is a quality ranking produced by deflating
+    the Schur complement in that order; skipping orbit *k* to fit a smaller
+    orbit *k+1* would use a residual computed under the assumption that *k*
+    was taken.  The owner's ruling asks for "the quantity of orbits that comes
+    closest to that number of points without exceeding it" — a COUNT, taken in
+    the order the selection ranks them — and the prefix totals are strictly
+    increasing, so the largest admissible count is the answer to both readings.
+
+    Returns ``(keep_idx, realized, requested, n_orbits_kept, orbit_rank)``.
+    """
+    from centroid.pivoted_cholesky import refuse_unless_select_certified
+
+    rank_i = int(rank)
+    if rank_i < 1:
+        raise ValueError(
+            f"downfold: the orbit-mode selection certified NO orbit at "
+            f"select_tol={tol:g}: the residual Schur diagonal was at or below "
+            f"the noise floor {tol * float(d0max):.3e} before the first pivot. "
+            f"The q=0 pair-density Gram is numerically flat, which is a "
+            f"statement about the band window rather than about mu_small.")
+    n_usable = min(int(k_req), rank_i)
+    if rank_i < int(k_req):
+        print_fn(
+            f"  [downfold/select] NOTE: the orbit-mode select certified "
+            f"{rank_i} of the {int(k_req)} orbits the point budget could have "
+            f"held — past that the residual Schur diagonal is at the noise "
+            f"floor, so the remaining orbits add no independent direction.  "
+            f"The floor below runs over the {rank_i} certified ones.")
+
+    picked = np.asarray(piv_np[:n_usable], dtype=np.int64)
+    sizes_in_order = np.asarray(orbit_sizes)[np.asarray(orbit_id)[picked]]
+    cum = np.cumsum(sizes_in_order)
+    k_fit = int(np.searchsorted(cum, int(mu_S), side="right"))
+    if k_fit < 1:
+        raise ValueError(
+            f"downfold: REFUSING mu_small={mu_S}.  Selection runs in whole "
+            f"symmetry orbits, and the orbit the pivot order ranks FIRST "
+            f"holds {int(sizes_in_order[0])} centroids — more than the "
+            f"{mu_S} points budgeted, so the largest union of whole orbits "
+            f"that fits the budget is empty.  The parent set is "
+            f"{_orbit_census_line(np.asarray(orbit_sizes))}; the legal point "
+            f"counts at or below the ceiling {ceiling} are: "
+            f"{_legal_point_counts(np.asarray(orbit_sizes), ceiling)}.  Raise "
+            f"mu_small to at least {int(sizes_in_order[0])}.")
+
+    # THE CERTIFICATE, ON THE PREFIX ACTUALLY DELIVERED.  Same refusal the
+    # centroid generator raises on the same kernel output; ``n_keep`` here is
+    # in ORBITS because that is what the kernel counted, and the POINT-side
+    # validation is the ceiling check below it.
+    refuse_unless_select_certified(
+        picked[:k_fit], rank_i, psd_host, n_keep=k_fit, M=mu_L, M_pad=M_pad,
+        orbit_id=np.asarray(orbit_id), d0max=float(d0max), tol_rel=tol)
+
+    keep_orbits = np.asarray(orbit_id)[picked[:k_fit]]
+    keep_idx = np.sort(np.flatnonzero(
+        np.isin(np.asarray(orbit_id), keep_orbits)).astype(np.int64))
+    realized = int(keep_idx.size)
+    if realized != int(cum[k_fit - 1]):              # pragma: no cover
+        raise AssertionError(
+            f"downfold: the orbit floor planned {int(cum[k_fit - 1])} points "
+            f"and the union of those orbits holds {realized} — the orbit "
+            f"labels and the census disagree.")
+
+    # THE POINT-GRANULARITY VALIDATION, at the REALIZED count.  It cannot fail
+    # by construction (realized <= requested <= ceiling) and it is asserted
+    # anyway, because "cannot fail by construction" is what the previous
+    # design believed about completion's cost before it was measured.
+    if realized > int(ceiling):                      # pragma: no cover
+        raise AssertionError(
+            f"downfold: the orbit floor realized {realized} points against a "
+            f"rank ceiling of {ceiling}.  A floor cannot exceed its budget "
+            f"and the budget was already validated against the ceiling.")
+
+    sizes_kept = sizes_in_order[:k_fit]
+    nxt = ("" if k_fit >= n_usable else
+           (f"  The next orbit in the pivot order holds "
+            f"{int(sizes_in_order[k_fit])}, and {realized} + "
+            f"{int(sizes_in_order[k_fit])} = "
+            f"{realized + int(sizes_in_order[k_fit])} would exceed "
+            f"{mu_S}."))
+    print_fn("\n".join([
+        f"  *** [downfold/select] ORBIT-FLOORED: mu_S requested {mu_S} "
+        f"points -> REALIZED {realized} ({k_fit} orbits: "
+        + "+".join(str(int(v)) for v in sizes_kept) + ") ***",
+        f"  [downfold/select] mu_small is a request in POINTS and the "
+        f"realized basis is the largest union of WHOLE symmetry orbits that "
+        f"does not exceed it — {mu_S - realized} of the "
+        f"{mu_S} points you budgeted were not spent." + nxt,
+        f"  [downfold/select] parent census: "
+        f"{_orbit_census_line(np.asarray(orbit_sizes))}.  Legal point counts "
+        f"at or below the ceiling {ceiling}: "
+        f"{_legal_point_counts(np.asarray(orbit_sizes), ceiling)}.",
+        f"  [downfold/select] the floor SPENDS LESS; it never rounds up.  "
+        f"That is the opposite of common/spectral_closure's snap-OUTWARD on "
+        f"the rank cut two steps above, and the difference is deliberate: "
+        f"the ceiling is a correctness threshold and may be widened, "
+        f"mu_small is a budget and may not be overrun.  The previous design "
+        f"rounded the selection outward to whole orbits and took mu_S from "
+        f"185 to 480 on si_bse_debug — the whole parent basis.",
+    ]))
+    return keep_idx, realized, int(mu_S), int(k_fit), rank_i
 
 
 def select_cur_centroids(
@@ -476,19 +756,38 @@ def select_cur_centroids(
     purpose instead of by accident, and the accident cost 2.8 eV.
 
     ``sym_perm`` is the parent's ``(n_sym, n_rmu)`` centroid source map.  When
-    it is given, the selection is ORBIT-COMPLETED — μ_S moves OUTWARD to whole
-    orbits — and the rank certificate and the ``auto`` ceiling are re-taken on
-    the completed set.  That is not a nicety: at q = 0 the selection Gram
-    commutes with the whole group, so an orbit's members are exactly
-    degenerate and the pivot order's tie-break between them is arbitrary; a
+    it is given the selection runs in ORBIT MODE WITH A FLOOR, which is the
+    owner's ruling of 2026-08-10 and the reason this function no longer
+    completes outward:
+
+        "everything the user has input on they should be specifying in units
+         of points, and we should be choosing the quantity of orbits that
+         comes closest to that number of points without exceeding it."
+
+    So ``mu_small`` stays a request in POINTS — the interface does not change —
+    and what is delivered is the largest union of WHOLE ORBITS whose point
+    total does not exceed it.  The pivot loop picks one representative per
+    orbit and retires that orbit's whole membership
+    (``centroid.pivoted_cholesky``'s ``orbit_id`` mode), so the delivered set
+    is orbit-closed by construction, no completion is needed, no re-
+    certification is forced and the ceiling refusal can only fire on the number
+    the user typed.  Both numbers are printed, loudly, on every run.
+
+    Why closure is worth quantising for: at q = 0 the selection Gram commutes
+    with the whole group, so an orbit's members are exactly degenerate and a
+    point-granularity pivot order's tie-break between them is arbitrary.  A
     half-orbit makes the child unstorable on the q wedge and, if written
-    anyway, read back as a permutation of the WRONG centroids.  Leaving it
-    ``None`` keeps the historical behaviour and says nothing about closure,
-    which is an ABSENCE, not a pass.
+    anyway, read back as a permutation of the WRONG centroids.  Leaving
+    ``sym_perm`` ``None`` keeps the historical point-granularity behaviour and
+    says nothing about closure, which is an ABSENCE, not a pass.
+
+    THE DIRECTION IS OPPOSITE TO ``common/spectral_closure``'s, deliberately;
+    the block above this function is the whole argument.  This is a budget and
+    it undershoots; that is a correctness constraint and it overshoots.
 
     Returns ``(keep_idx, SelectionReport)`` with ``keep_idx`` a sorted
     ``int64`` array of parent centroid indices.  **``len(keep_idx)`` is the
-    authority on μ_S, not the number the caller passed** — orbit completion
+    authority on μ_S, not the number the caller passed** — the orbit floor
     moves it, the same way a band-window resolver moves the counts.
     """
     from centroid import distribution as dist
@@ -612,8 +911,40 @@ def select_cur_centroids(
 
     G_rows = jax.lax.with_sharding_constraint(
         S_q0, NamedSharding(mesh_xy, P(select_axis, None)))
+    d0max = float(np.real(np.diag(G_host)[:mu_L]).max())
+
+    # ---- 2a. ORBIT MODE, WHEN THE PARENT'S SOURCE MAP IS AVAILABLE ------
+    # The kernel has had this all along; the downfold used to pass ``None``
+    # here and repair the damage afterwards.  ``n_keep`` in orbit mode counts
+    # ORBITS, and the number of orbits that can possibly fit inside a POINT
+    # budget is bounded by taking them smallest-first — so that bound is what
+    # is requested from the kernel, and the delivered prefix is then truncated
+    # to the budget below.  Requesting more would make the kernel's own
+    # "asked for N, certified M" refusal fire on a number no user typed.
+    orbit_id = orbit_sizes = None
+    n_orbits_avail = None
+    if sym_perm is not None:
+        orbit_id = centroid_orbit_id(np.asarray(sym_perm)[:, :mu_L])
+        orbit_sizes = np.bincount(orbit_id).astype(np.int64)
+        n_orbits_avail = int(orbit_sizes.size)
+        k_cap = int(np.searchsorted(
+            np.cumsum(np.sort(orbit_sizes)), mu_S, side="right"))
+        if k_cap < 1:
+            raise ValueError(
+                f"downfold: REFUSING mu_small={mu_S}.  The parent's centroid "
+                f"set is {_orbit_census_line(orbit_sizes)}, and its SMALLEST "
+                f"symmetry orbit holds {int(orbit_sizes.min())} centroids — "
+                f"more than the {mu_S} points you asked for.  Selection runs "
+                f"in whole orbits so that the child is storable on the q "
+                f"wedge, so there is no legal set this small.  The legal "
+                f"point counts at or below the ceiling {ceiling} are: "
+                f"{_legal_point_counts(orbit_sizes, ceiling)}.")
+        k_req = min(k_cap, n_orbits_avail)
+    else:
+        k_req = mu_S
+
     select_step = make_sharded_pivoted_cholesky_select(
-        mesh_xy, M_pad, mu_S, mesh_axis=select_axis, tol_rel=tol)
+        mesh_xy, M_pad, k_req, mesh_axis=select_axis, tol_rel=tol)
     active_init = None
     if n_pad:
         from common.collectives import device_put_process_local
@@ -621,101 +952,72 @@ def select_cur_centroids(
         _act[mu_L:] = False
         active_init = device_put_process_local(
             _act, NamedSharding(mesh_xy, P(select_axis)))
+    orbit_id_jax = None
+    if orbit_id is not None:
+        from common.collectives import device_put_process_local
+        # Pads get an orbit id no real candidate holds, so the orbit-kill
+        # mask can never reach them — belt and braces on the active mask, and
+        # the same idiom ``prune_candidates_by_pivoted_cholesky`` uses.
+        _oid = np.asarray(orbit_id, dtype=np.int32)
+        if n_pad:
+            _oid = np.concatenate([_oid, np.full((n_pad,), -1, np.int32)])
+        orbit_id_jax = device_put_process_local(
+            _oid, NamedSharding(mesh_xy, P(select_axis)))
     piv, _L, rank, _d_final, _d_taken, _trR, psd_info = select_step(
-        G_rows, None, active_init)
+        G_rows, orbit_id_jax, active_init)
     piv_np = np.asarray(jax.device_get(piv))
     psd_host = (float(np.asarray(psd_info[0])), int(np.asarray(psd_info[1])),
                 int(np.asarray(psd_info[2])))
-    # The SAME refusal ``prune_candidates_by_pivoted_cholesky`` raises, on
-    # the same kernel output.  A jitted kernel cannot raise, so it reports
-    # and this refuses — LAPACK ``pstrf``'s division of labour.
-    refuse_unless_select_certified(
-        piv_np, int(rank), psd_host, n_keep=mu_S, M=mu_L, M_pad=M_pad,
-        orbit_id=None, d0max=float(np.real(np.diag(G_host)[:mu_L]).max()),
-        tol_rel=tol)
-    keep_idx = np.sort(piv_np.astype(np.int64))
 
-    # ---- 2b. ORBIT COMPLETION: snap-outward, one index over. ------------
-    # THIS IS THE SAME DISEASE THIS MODULE'S SPECTRAL GUARD TREATS, and the
-    # identification is exact rather than an analogy.  At q = 0 the selection
-    # Gram commutes with the whole point group, so every member of a centroid
-    # ORBIT carries the identical Schur diagonal — they are degenerate, and
-    # pivoted Cholesky's index-order tie-break picks between them.  Stopping
-    # at exactly ``mu_S`` therefore lands mid-orbit for a generic ``mu_S``
-    # (measured: 7 of 46 admissible values came back closed on the synthetic
-    # 8-orbit × 6 group), and a half-orbit is a subset chosen by index order
-    # out of a set the spectrum cannot distinguish — a symmetry-arbitrary
-    # slice of a degenerate block, which is exactly what
-    # ``common/spectral_closure`` refuses to let a rank cut be.
-    #
-    # So the repair is the same repair: complete OUTWARD to whole orbits.
-    # ``orbit_complete_keep`` is the walk; the reason it must ADD rather than
-    # drop is the reason the spectral guard widens rather than narrows —
-    # dropping would shrink the retained subspace below what the rank refusal
-    # above certified.
-    #
-    # Fence: the q_irr lane owns the plumbing this enables (child unfold
-    # tables, the wedge writer); this lane owns the completion and the
-    # re-certification it forces.
+    if orbit_id is None:
+        # POINT GRANULARITY — the historical path, taken when no source map
+        # reached this function.  Closure is UNMEASURED, which is an absence.
+        # The SAME refusal ``prune_candidates_by_pivoted_cholesky`` raises, on
+        # the same kernel output.  A jitted kernel cannot raise, so it reports
+        # and this refuses — LAPACK ``pstrf``'s division of labour.
+        refuse_unless_select_certified(
+            piv_np, int(rank), psd_host, n_keep=mu_S, M=mu_L, M_pad=M_pad,
+            orbit_id=None, d0max=d0max, tol_rel=tol)
+        keep_idx = np.sort(piv_np.astype(np.int64))
+        mu_S_requested = mu_S
+        n_orbits_kept = None
+        orbit_rank = None
+    else:
+        keep_idx, mu_S, mu_S_requested, n_orbits_kept, orbit_rank = (
+            _floor_selection_to_orbits(
+                piv_np, int(rank), psd_host, mu_S=mu_S, orbit_id=orbit_id,
+                orbit_sizes=orbit_sizes, k_req=k_req, mu_L=mu_L, M_pad=M_pad,
+                ceiling=ceiling, d0max=d0max, tol=tol, print_fn=print_fn))
+
+    # ---- 2b. THE CLOSURE VERDICT, MEASURED AND NOT ASSUMED. -------------
+    # Orbit mode delivers a union of orbits by construction, so this is a
+    # cheap re-derivation of a guaranteed property — which is exactly why it
+    # is taken: the guarantee lives in another module's loop, and "the kernel
+    # promises it" is the shape of claim this project measures instead of
+    # inheriting.  On the point-granularity path it stays ``None``, which is
+    # an ABSENCE and not a pass.
     star = None
     if sym_perm is not None:
         star = star_stability(keep_idx, sym_perm)
         print_fn(star.describe())
-        if not star.closed:
-            keep_idx = orbit_complete_keep(keep_idx, sym_perm)
-            mu_S_completed = int(keep_idx.size)
-            print_fn(
-                f"  *** [downfold/select] ORBIT-COMPLETED OUTWARD: mu_S "
-                f"{mu_S} -> {mu_S_completed} (+{mu_S_completed - mu_S} "
-                f"centroids).  A half-orbit is a symmetry-arbitrary slice of "
-                f"a set the q=0 Gram cannot distinguish; completing it is the "
-                f"same keep-more repair common/spectral_closure applies to a "
-                f"rank cut, and it is what makes the child wedge-storable. ***")
-            # RE-TAKE THE CERTIFICATE ON THE COMPLETED SET, against the
-            # EIGENVALUE rank and not the selection certificate — the
-            # knob-trap discipline this function is built around.  The
-            # completed set was never certified by the pivoted Cholesky
-            # (it stopped at mu_S), and the ceiling is the only number that
-            # was ever the right one to validate mu_S against.
-            if mu_S_completed > ceiling:
-                raise ValueError(
-                    f"downfold: REFUSING mu_small={mu_S}.  Orbit completion "
-                    f"needs {mu_S_completed} centroids to close the orbit the "
-                    f"selection stopped inside, but the retained band window "
-                    f"holds only {ceiling} numerically independent "
-                    f"pair-density directions at downfold_rcond={rcond:g}.  "
-                    f"The requested mu_S is not itself over the ceiling; the "
-                    f"SYMMETRY-LEGAL mu_S nearest it is, and a non-closed "
-                    f"selection is not an option — a child written on the q "
-                    f"wedge from one reads back as a permutation of the WRONG "
-                    f"centroids, silently, because every shape agrees.\n"
-                    f"  FIXES: (1) lower mu_small so that completion lands at "
-                    f"or under {ceiling} — the orbit boundaries below it are "
-                    f"the legal values, the same way degeneracy-closed nband "
-                    f"values are the legal band windows; (2) widen the "
-                    f"retained band window, which is what sets the ceiling "
-                    f"(~nb^0.8, RANK_PROBE §8).  Do NOT loosen "
-                    f"downfold_rcond to buy the difference: {R19_ANCHOR}.")
-            if mu_S_completed > mu_L:
-                raise ValueError(
-                    f"downfold: orbit completion of mu_small={mu_S} needs "
-                    f"{mu_S_completed} centroids, more than the parent basis "
-                    f"mu_L={mu_L} holds.  The parent's own centroid set is "
-                    f"not orbit-closed, which is a defect upstream of the "
-                    f"downfold — check the parent's centroid generation.")
-            mu_S = mu_S_completed
-            star = star_stability(keep_idx, sym_perm)
-            if not star.closed:                       # belt and braces
-                raise ValueError(
-                    "downfold: orbit completion did not produce an "
-                    "orbit-closed set — sym_perm is not a group action on "
-                    "the parent's centroid table.")
-            print_fn(star.describe())
+        if not star.closed:                           # belt and braces
+            raise ValueError(
+                "downfold: the orbit-mode selection came back NOT "
+                "orbit-closed.  Either sym_perm is not a group action on the "
+                "parent's centroid table, or the orbit labels and the kernel "
+                "disagree about which points share an orbit — the delivered "
+                "set is the union of the picked pivots' whole orbit classes, "
+                "so this cannot happen when both are about the same table.\n"
+                + star.describe(indent="  "))
 
     # ---- 3. What the SOLVE will actually retain, at q = 0. --------------
-    # On the COMPLETED set when completion fired: the number that matters is
-    # what the solve retains from the centroids actually carried, not from the
-    # ones the pivot order happened to stop at.
+    # AT POINT GRANULARITY, on the REALIZED set — the number that matters is
+    # what the solve retains from the centroids actually carried.  In orbit
+    # mode this is the only rank in this report that is comparable to μ_S:
+    # ``select_rank`` counts ORBITS there, and ``point_granularity_rank``
+    # exists in this tree because that confusion already shipped once (a gate
+    # passed at "42 of 42 directions certified" on a file holding 1908
+    # points, and the ζ back-solve then truncated ~450 modes per q).
     kept_rep = _eigen_rank(G_host[np.ix_(keep_idx, keep_idx)], rcond,
                            label="downfold S_SS (q=0)")
 
@@ -724,7 +1026,12 @@ def select_cur_centroids(
         eigen_rank_pool=ceiling, select_rank=int(rank),
         eigen_rank_kept=int(kept_rep.rank_criterion),
         pool_report=pool_rep, kept_report=kept_rep,
-        requested_auto=requested_auto, star=star)
+        requested_auto=requested_auto, star=star,
+        mu_small_requested=int(mu_S_requested),
+        n_orbits_kept=n_orbits_kept, n_orbits_pool=n_orbits_avail,
+        orbit_sizes=(None if orbit_sizes is None
+                     else tuple(int(v) for v in orbit_sizes)),
+        orbit_rank=orbit_rank)
     return keep_idx, rep
 
 
@@ -805,6 +1112,16 @@ def select_cur_centroids(
 # real Gram the tie-break interleaves the orbits instead, and by μ_S = 185 the
 # kept set already touches all eleven.  Numbers and evidence paths:
 # ``tests/known_failures/2026-08-10-downfold-qirr-star-stability.md``.
+#
+# AND THAT IS WHY COMPLETION IS NO LONGER ON THE SELECTION PATH.  The owner
+# ruled on 2026-08-10: the user states ``mu_small`` in POINTS and the selection
+# realizes the largest union of whole orbits that does not EXCEED it.  Picking
+# orbits instead of repairing points makes closure structural — the selection
+# does not go wrong, so there is nothing to complete — and it turns the 185 →
+# 480 blow-up above into 185 → 168, a set the ceiling admits by construction.
+# :func:`orbit_complete_keep` and :func:`star_stability` remain, the first as an
+# offline instrument for a set that came from somewhere else and the second as
+# the verdict :func:`select_cur_centroids` still takes on what it delivered.
 
 
 @dataclass(frozen=True)
@@ -917,6 +1234,13 @@ def orbit_complete_keep(keep_idx, sym_perm) -> np.ndarray:
     must re-take the rank certificate and the ``auto`` ceiling on the
     completed set rather than assuming the selection it started from is
     still the operative one.
+
+    **NOT ON THE SELECTION PATH ANY MORE.**  :func:`select_cur_centroids`
+    picks whole orbits and FLOORS to the user's point budget (owner ruling,
+    2026-08-10), so the set it delivers is closed and there is nothing to
+    complete.  This stays for the offline case — a keep set that arrived from
+    somewhere else, an archaeology question about an existing child — and for
+    the cells that measure what completion would have cost.
     """
     perm = np.asarray(sym_perm, dtype=np.int64)
     cur = set(int(v) for v in np.asarray(keep_idx, dtype=np.int64))

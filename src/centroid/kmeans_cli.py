@@ -369,7 +369,15 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
-    # Σ orbit_size over the picked orbits (≈ N_c by construction).
+    # Σ orbit_size over the picked orbits.  ``N_c`` is a POINT count the user
+    # typed, so the orbit target is an ESTIMATE and the delivered point total
+    # is FLOORED to N_c inside the kernel (``n_point_budget``) — owner ruling,
+    # 2026-08-10.  The orbit TARGET below is unchanged, deliberately: it is
+    # what ``refuse_unless_select_certified`` and the rank gate in ``main``
+    # are both stated against, so moving it would move a refusal threshold as
+    # a side effect of a budget change.  The floor can only ever TRUNCATE the
+    # delivered set, so the generator now delivers at most N_c points and
+    # never more, with every existing refusal reading exactly as before.
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
     n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
                     if orbit_id is not None else N_c)
@@ -381,6 +389,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     kwargs: dict = dict(
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
         orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+        n_point_budget=(int(N_c) if orbit_id is not None else None),
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = (0, n_val)

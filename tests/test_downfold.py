@@ -1078,6 +1078,111 @@ def test_qirr_the_cur_selection_is_not_star_stable_by_default():
     assert all(m % QIRR_ORB == 0 for m in closed_at), closed_at
 
 
+def _qirr_selection_gram(sym_perm, seed=19):
+    """A q=0 selection Gram that genuinely commutes with the whole group.
+
+    Which is what the real one IS — q = 0 is invariant under every op and the
+    unfold phases are unity there — and it is why every member of an orbit
+    presents pivoted Cholesky with the same residual diagonal.
+    """
+    rng = np.random.default_rng(seed)
+    A = (rng.normal(size=(QIRR_MU, 3 * QIRR_MU))
+         + 1j * rng.normal(size=(QIRR_MU, 3 * QIRR_MU)))
+    M = A @ A.conj().T
+    G = sum(M[np.ix_(p, p)] for p in sym_perm)
+    G = 0.5 * (G + G.conj().T)
+    for p in sym_perm:
+        assert np.max(np.abs(G[np.ix_(p, p)] - G)) < 1e-9
+    return G
+
+
+@pytest.mark.parametrize("mu_S_request", [7, 9, 11])
+def test_qirr_THE_COMPOSITION_an_orbit_floored_selection_gives_a_storable_child(
+        mu_S_request):
+    """(d) THE COMPOSITION.  The covariance gate, on the SHIPPING selection.
+
+    Every cell above this one hands the covariance route a keep set chosen by
+    hand (``QIRR_KEEP_CLOSED``).  That measured whether congruence and
+    unfolding commute; it could not measure whether the selection this driver
+    actually makes produces a keep set they commute ON, and the answer used to
+    be no — 0 of 185 admissible mu_S orbit-closed on ``si_bse_debug``.
+
+    This cell closes that gap: the keep set comes from
+    ``select_cur_centroids`` in orbit mode, at a REQUEST that falls between
+    rungs, and the wedge child unfolded with the child's own tables must
+    reproduce the full-BZ child.  A green here is the statement "wedge
+    children are storable at the selection the driver makes", which is the
+    composition the orbit floor buys.
+    """
+    mesh = resolve_mesh()
+    sym_perm, L_table = _qirr_tables()
+    G = _qirr_selection_gram(sym_perm)
+    G_j = jax.lax.with_sharding_constraint(
+        jnp.asarray(G), NamedSharding(mesh, P("x", "y")))
+
+    keep, rep = downfold.select_cur_centroids(
+        G_j, mu_S_request, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+        mu_large_logical=QIRR_MU, print_fn=lambda *a, **k: None,
+        sym_perm=sym_perm)
+    assert keep.size <= mu_S_request, "the floor overran the point budget"
+    assert keep.size < mu_S_request or mu_S_request % QIRR_ORB == 0
+    assert rep.star is not None and rep.star.closed, (
+        "the orbit-mode selection is not orbit-closed, so there is no "
+        "composition to test — the kernel's orbit_id mode is not doing what "
+        "its docstring promises")
+
+    child_perm, child_L = downfold.child_unfold_tables(keep, sym_perm, L_table)
+    S_ibz, W_ibz = _qirr_parent(mesh)
+    S_full = _qirr_unfold(S_ibz, mesh, sym_perm, L_table)
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    _T_i, W_S_ibz, _r = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
+    _T_f, W_S_full, _r2 = _qirr_downfold(S_full, W_full, keep, mesh)
+    got = np.asarray(jax.device_get(
+        _qirr_unfold(W_S_ibz, mesh, child_perm, child_L)))
+    want = np.asarray(jax.device_get(W_S_full))
+    assert got.shape == want.shape == (QIRR_NQ_FULL, keep.size, keep.size)
+    rel = np.max(np.abs(got - want)) / np.max(np.abs(want))
+    assert rel < 1e-12, (
+        f"the child of an ORBIT-FLOORED selection (request {mu_S_request} "
+        f"points -> realized {keep.size}) does not unfold to the full-BZ "
+        f"child (max rel {rel:.3e}).  The floor is supposed to make this "
+        f"structural; if it does not, the wedge child is not storable and "
+        f"the composition claim is false")
+
+
+def test_qirr_RED_TWIN_the_point_granular_selection_still_cuts_orbits():
+    """The floor is load-bearing: without it, the SAME mu_S is not closed.
+
+    A cell that only ever ran the orbit path would show the composition
+    working and say nothing about what the floor bought.  This is the control
+    arm: the same Gram, the same mu_S, ``sym_perm=None``, and the delivered
+    set must break closure — so ``child_unfold_tables`` refuses it and the
+    child of a point-granular selection has no tables at all.
+    """
+    mesh = resolve_mesh()
+    sym_perm, L_table = _qirr_tables()
+    G = _qirr_selection_gram(sym_perm)
+    G_j = jax.lax.with_sharding_constraint(
+        jnp.asarray(G), NamedSharding(mesh, P("x", "y")))
+    broken = []
+    for mu_S in (7, 9, 11):
+        keep, rep = downfold.select_cur_centroids(
+            G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+            mu_large_logical=QIRR_MU, print_fn=lambda *a, **k: None)
+        assert keep.size == mu_S
+        assert rep.star is None, (
+            "closure was reported without a sym_perm — an absence must not "
+            "be dressed as a measurement")
+        if not downfold.star_stability(keep, sym_perm).closed:
+            broken.append(mu_S)
+            with pytest.raises(ValueError, match="orbit-closed"):
+                downfold.child_unfold_tables(keep, sym_perm, L_table)
+    assert broken, (
+        "no point-granular selection broke closure on this construction, so "
+        "the orbit floor bought nothing here and this section's claim is "
+        "untested — measure it on a real deck before believing it")
+
+
 def test_qirr_orbit_completion_restores_closure_at_a_bounded_cost():
     """The repair, and its price.  Completion ADDS; it never drops.
 
