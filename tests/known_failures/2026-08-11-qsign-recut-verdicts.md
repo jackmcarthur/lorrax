@@ -279,11 +279,18 @@ port derives from `SLURM_JOB_ID` (`lx_pool.py:256`), so submissions must be
 serialised within an allocation; they were, and the legs were re-run. Nothing
 was banked from a collided leg.
 
-**Allocations: this lane created none and cancelled none.** `salloc` was
-refused `QOSMaxSubmitJobPerUserLimit` with two peer allocations already live —
-the trap `owedlegs_0810` hit and recorded — so it attached pools 56624724 and
-56612363 by explicit ID, as designed co-tenancy. One leg was lost to pool
-56612363 expiring under it and was re-run on the surviving pool.
+**Allocations, stated correctly after an earlier draft of this row got it
+wrong.** This lane's own `salloc` was refused `QOSMaxSubmitJobPerUserLimit`
+with two peer allocations already live — the trap `owedlegs_0810` hit and
+recorded — so it attached pools **56624724** and **56612363** by explicit ID as
+designed co-tenancy, and for most of its life it had created nothing. One leg
+was lost when 56612363 expired under it, and the **final relaunch of the parent
+control at 01:20 found 56624724 full and `lx` created allocation
+**56626252** (1 node, `lx-alloc-jackm`, 01:21:06) to place it.** That is this
+lane's own allocation, it is **released by explicit ID** at the end of the lane,
+and the peer pools are left alone. An earlier draft of this row and of
+`EVIDENCE.md` claimed "created none and cancelled none"; that was true when
+written and stopped being true, and it is corrected here rather than quietly.
 
 **Everything this lane wrote, named.** It is sole writer of
 `/pscratch/sd/j/jackm/qsign_recut_0811/`. Outside that directory it made four
