@@ -327,54 +327,6 @@ def write_sigma_freq_debug_table(
 	return abs_path
 
 
-def write_chunked_complex_dataset_h5(
-	filepath,
-	dataset_name,
-	values,
-	*,
-	mode: str = "a",
-	k_chunk_size: int = 16,
-):
-	"""Write a 3D/4D complex dataset to HDF5 in k-chunks."""
-	abs_path = os.path.abspath(filepath)
-	dirname = os.path.dirname(abs_path)
-	if dirname:
-		os.makedirs(dirname, exist_ok=True)
-
-	shape = tuple(values.shape)
-	k_chunk = max(1, int(k_chunk_size))
-
-	with h5py.File(abs_path, mode) as h5:
-		if dataset_name in h5:
-			del h5[dataset_name]
-		if len(shape) == 4:
-			n_omega, nk, nb, nb2 = shape
-			dset = h5.create_dataset(
-				dataset_name,
-				shape=shape,
-				dtype=np.complex128,
-				chunks=(n_omega, min(k_chunk, nk), nb, nb2),
-			)
-			for k0 in range(0, nk, k_chunk):
-				k1 = min(k0 + k_chunk, nk)
-				dset[:, k0:k1, :, :] = np.asarray(values[:, k0:k1, :, :], dtype=np.complex128)
-		elif len(shape) == 3:
-			nk, nb, nb2 = shape
-			dset = h5.create_dataset(
-				dataset_name,
-				shape=shape,
-				dtype=np.complex128,
-				chunks=(min(k_chunk, nk), nb, nb2),
-			)
-			for k0 in range(0, nk, k_chunk):
-				k1 = min(k0 + k_chunk, nk)
-				dset[k0:k1, :, :] = np.asarray(values[k0:k1, :, :], dtype=np.complex128)
-		else:
-			h5.create_dataset(dataset_name, data=np.asarray(values, dtype=np.complex128))
-
-	return abs_path
-
-
 # ===========================================================================
 # HOW sigma_mnk.h5 STORES ITS k AXIS — the SELECTION, and what it is not
 # ===========================================================================
