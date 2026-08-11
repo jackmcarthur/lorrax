@@ -2500,15 +2500,17 @@ def refit_window_view(zx, band_range, log_fn=print,
               f"({hi - lo} of psi_full_y's {zx['nb']}), so the Galerkin rank "
               f"bound is nk·nb = {zx['nk']}·{hi - lo} = "
               f"{zx['nk'] * (hi - lo)} instead of {zx['nk'] * zx['nb']}.")
-    log_fn("  [refit] BSE-WINDOW refit: " + _shape + "  ζ' is NOT the "
-           "producer's ζ and the stored V_qmunu tiles will NOT come back — "
-           "the certification is the contracted on-grid eigenvalue gate in "
-           "exciton_bands, not the tile null."
-           if window_mode == "bse" else
-           "  [refit] ζ-FIT-WINDOW refit on a DECOUPLED bundle: " + _shape
-           + "  That window IS the producer's own (zeta_nband < nband, read "
-             "from the ζ file's fit_provenance), so ζ' is the producer's ζ "
-             "and the tile null stays armed as the gate.")
+    if window_mode == "bse":
+        log_fn(f"  [refit] BSE-WINDOW refit: {_shape}  ζ' is NOT the "
+               f"producer's ζ and the stored V_qmunu tiles will NOT come "
+               f"back — the certification is the contracted on-grid "
+               f"eigenvalue gate in exciton_bands, not the tile null.")
+    else:
+        log_fn(f"  [refit] ζ-FIT-WINDOW refit on a DECOUPLED bundle: "
+               f"{_shape}  That window IS the producer's own "
+               f"(zeta_nband < nband, read from the ζ file's "
+               f"fit_provenance), so ζ' is the producer's ζ and the tile "
+               f"null stays armed as the gate.")
     return zw
 
 
