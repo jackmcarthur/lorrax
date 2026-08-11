@@ -754,6 +754,62 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
 	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
 
+	# ── ARE THESE TWO WINDOWS POINT-GROUP-INVARIANT SUBSPACES? ──────────
+	# The guard already exists — ``common.band_degeneracy`` — and the BSE
+	# has called it since 2026-08-10.  The ζ fit never did, and this is the
+	# seam where it matters most: ζ is what the IBZ cascade unfolds, so a
+	# window that is not invariant here breaks the k-star identity for
+	# EVERY object built on ζ, W included, and Σ_x first of all.
+	#
+	# Why a rotation is the reason: the cascade builds the full BZ by
+	# rotating the wedge, and a rotation sends ψ_n(k) into a combination of
+	# its DEGENERATE PARTNERS at Sk.  A window containing half a multiplet
+	# therefore has a rotation image that leaves it, and the pair space it
+	# represents is not invariant.  This is ``common/rank_criterion``'s
+	# story one index over — except that a band degeneracy is EXACT, so
+	# unlike a spectral cut there is no tolerance to tune.
+	#
+	# MEASURED, Si 6×6×6, the two ISDF windows above (nval 8 / ncond 52 /
+	# nband 60 → left [0,60), right [0,60)); the top edge cuts a 4-fold
+	# manifold (bands 59..62) at 4 of the 16 wedge k, keeping 2 and
+	# dropping 2:
+	#     nband=60 (open)     Σ_x star spread 0.0640 meV   Σ_c 38.785 meV
+	#     nband=68 (closed)   Σ_x star spread 0.0000 meV   Σ_c  0.083 meV
+	# and λ_max(C_q) — an exact star invariant — goes from star-constant
+	# only to 1e-4 to star-constant to 1e-10, which is the 4×4×4 anchor's
+	# own level.  The ζ rank truncation still fires on all 216 q in the
+	# closed arm, which is what rules the truncation out as the cause.
+	# tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md
+	#
+	# MODE.  ``snap`` here means "say so loudly and continue" — the
+	# report-only twin has nothing to widen, so it degrades to a warning by
+	# design.  ``strict`` is the RIGHT end state and is a one-word change,
+	# but flipping it would refuse every deck in the tree whose window
+	# happens to slice, and that census has not been run.  Owner row.
+	_en = getattr(wfn, "energies", None)
+	if _en is None:
+		print_fn("  [band window] closure NOT CHECKED: this loader exposes "
+		         "no `energies`.  That is an absence, not a pass.")
+	else:
+		from common import band_degeneracy as _bd
+		_enk = np.asarray(_en)[0]
+		_gaps = _bd.boundary_min_gaps(_enk)
+		for _lo, _hi, _what in (
+				(band_range_left[0], band_range_left[1], "ISDF left window"),
+				(band_range_right[0], band_range_right[1], "ISDF right window")):
+			_bd.check_band_window(
+				_enk, int(_lo), int(_hi), mode="snap", log=print_fn,
+				where=f"{_what} (the ζ fit's pair space)")
+		# Print the number even when it is fine: "no news" and "a good
+		# number" must not look alike (preamble measurement rule 10).
+		_edges = sorted({int(band_range_left[1]), int(band_range_right[0]),
+		                 int(band_range_right[1])})
+		print_fn("    ζ band-window closure: " + ", ".join(
+			f"edge {b} min gap {_gaps[b] * 13605.693122994:.3g} meV"
+			if b < len(_gaps) and np.isfinite(_gaps[b])
+			else f"edge {b} exempt (cuts nothing)"
+			for b in _edges))
+
 	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
 	# picked once by ``plan_gflat_chunks`` in the caller and live in
 	# ``chunks``; fit_zeta is a pure consumer.
