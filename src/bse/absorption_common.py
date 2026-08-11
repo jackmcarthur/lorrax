@@ -20,7 +20,12 @@ from typing import Optional
 import h5py
 import numpy as np
 
-RYD2EV = 13.6056980659
+from common.units import RYD_TO_EV
+
+#: Ry -> eV, from ``common.units`` — the one place the number lives.  Kept
+#: under this module's historical name because both absorption drivers import
+#: ``absorption_common.RYD2EV``.
+RYD2EV = RYD_TO_EV
 
 
 def exciton_dipole_projections(A, d_alpha):

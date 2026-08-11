@@ -19,8 +19,11 @@ import argparse
 import numpy as np
 import h5py
 
+from common.units import RYD_TO_EV
 
-RY_TO_EV = 13.6056980659
+
+#: Ry -> eV, from ``common.units``.
+RY_TO_EV = RYD_TO_EV
 
 
 def _detect_format(h5_path: str) -> str:

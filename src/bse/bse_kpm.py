@@ -36,10 +36,12 @@ from .bse_feast import (estimate_spectral_bounds_sharded, _create_mesh_xy,
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      pad_zone_mask_np)
 import common.timing as timing
+from common.units import RYD_TO_EV
 
 jax.config.update("jax_enable_x64", True)
 
-RY_TO_EV = 13.6056980659
+#: Ry -> eV, from ``common.units``.
+RY_TO_EV = RYD_TO_EV
 
 
 def make_bse_h_tilde(matvec, data, e_center, half_width):

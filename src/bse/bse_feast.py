@@ -34,13 +34,16 @@ from .bse_preconditioner import energy_diff_cv_k
 from .bse_serial import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
+from common.units import RYD_TO_EV
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      make_w_densifier, pad_zone_mask_np)
 
 jax.config.update("jax_enable_x64", True)
 
 
-RY_TO_EV_DEFAULT = 13.6056980659
+#: Ry -> eV, from ``common.units``.  Name kept: ``bse_pseudopoles`` and
+#: ``bse_w_exact`` import ``RY_TO_EV_DEFAULT`` from here.
+RY_TO_EV_DEFAULT = RYD_TO_EV
 ELLIPSE_GAMMA_FIXED = 0.2
 
 # Cache compiled GMRES solvers per (operator id, max_iter, tol, dtype), per-process.
