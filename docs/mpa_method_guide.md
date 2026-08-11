@@ -294,6 +294,85 @@ like `ρ^k` off it with `ρ ≈ 3` at that distance. Its advantage needs the
 samples to lie on the interval; the double-parallel protocol puts them beside
 it.
 
+### 3.1b Where the fit's time actually went, and the two things that fixed it
+
+The fit was running at about one per cent of the machine's double-precision
+peak — roughly 100–150 µs for an element whose arithmetic is a few
+microseconds — and the reason turned out to be two separate things, neither
+of which was the arithmetic.
+
+**The element was being fitted twice.** The staged store requires a condition
+number and a backward error beside every pole set, the fit kernel originally
+returned only the first, and the only supplier of the second was
+`diagnostics.solve_conditioning`, which re-solved the system and ran a
+complete second fit to report a forward residual beside it. The
+reconditioning lane closed half of that by making the fit report its own
+backward error — mode-aware, so the Loewner route reports the Loewner
+reduction's and not a Padé system nobody inverted. The other half was that
+the driver still called the conditioning door, and the door still refitted.
+It now hands the door the fit's own diagnostics, so the numbers the store
+stamps agree with the fit's by construction rather than by an argument about
+operand order. **Measured: exactly 2.00× on the whole block.** The call
+itself stays — the obligation the perf fleet pinned is that the driver keeps
+asking and the asking gets cheap, not that it stops asking.
+
+**The pole-finding was leaving XLA one element at a time.** `jnp.linalg.eigvals`
+does lower to the GPU — an older belief that it fell back to the host was
+refuted — but the lowering it reaches, `cusolver_geev_ffi`, does not batch.
+Measured at `n_p = 8` in complex128, it costs 1012 µs/element on a batch of
+1024 and 1045 µs/element on a batch of 4096: flat in the batch, which is what
+a per-matrix loop looks like. It also computes both eigenvector sets and
+discards them, and XLA cannot eliminate dead outputs inside a custom call.
+That one call was **91 %** of the jitted per-element cost.
+
+This is why jitting the fit had never paid. Wrapping the existing kernel in
+`jax.jit` is measurably *worse* than eager (1.77× against the fold's 2.00×):
+the compiler fuses everything it can reach and then waits on a serialised
+vendor call it cannot. **Fusion only becomes a lever once the eigensolver is
+inside XLA**, and the two changes are worth 21.4× together on the same
+device where either alone is worth about 2×.
+
+`gw.mpa.small_eig` is that eigensolver: Hessenberg reduction by a fixed
+number of Householder reflections, then Wilkinson-shifted QR sweeps with the
+active block shrinking on a fixed schedule rather than when a subdiagonal
+is judged small. Every count is fixed at trace time, which is the whole
+point — a textbook deflation test is data-dependent control flow, and paying
+for sweeps that were not needed is what a static shape costs. It runs at
+about 11 µs/element at `n_p = 8` against the vendor's 1155.
+
+**It does not reproduce the vendor bit for bit, and the gate is not asked to.**
+A different root-finder returns different roots; the campaign's equivalence
+norm is W rebuilt at the samples. Two measurements say why that is the right
+norm rather than a convenient one:
+
+* On **rank-deficient** solves — more poles fitted than the data supports,
+  which is the production situation the null guard exists for — the two paths
+  rebuild `W` to **1e-14**. The eigenvalues they disagree about are the null
+  space's, returned at numerical zero by the truncated pseudo-inverse, and
+  the null guard drops them before a residue is fitted to them.
+* On **full-rank** solves the Loewner matrix runs `cond` of 1e5–1e8, so its
+  eigenvalues carry `eps · cond ≈ 1e-9` of intrinsic sensitivity. The two
+  root-finders land at opposite ends of it and the rebuild separates by
+  ~1e-7. Doubling the sweep count does not lower it, which is how one tells a
+  conditioning floor from non-convergence. Neither arm fits the samples any
+  worse than the other: the fidelity numbers agree to four significant
+  figures.
+
+One consequence is worth stating because a gate was written against it and
+had to be revised. The **pruning** guards and the surviving-pole mask are
+bit-identical between the two paths in every configuration measured. The two
+**repair** guards, `reflection` and `time_order`, are not — they are sign
+tests on `Re b` and `Im b`, and on the null-space poles of a rank-deficient
+solve the sign is a coin flip between any two root-finders. Their fire counts
+disagree on such data and it does not matter, because those poles are pruned
+and the rebuilt screening agrees to 1e-14. A gate demanding they agree would
+have been a gate on rounding noise.
+
+Both switches are stamped: `prov_eig_mode` and `prov_fit_fused` sit beside
+`prov_solve_mode` in the store, and the cost report names them. The defaults
+are the old behaviour, so a store written before either existed reads back
+correctly as `lapack, unfused`.
+
 ### 3.2 The five guards, and the quadrant algebra
 
 The linear algebra knows no physics and will return poles in the wrong half
