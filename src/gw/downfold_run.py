@@ -658,14 +658,33 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
     a μ_S bundle — so copying it would be worse than leaving it out.
     Transporting it is the only answer that keeps the small bundle honest.
 
-    ONLY WHEN THE PARENT'S ζ IS ONE THIS CAN TRANSPORT.  ``T`` is indexed by
-    the restart's flat-q axis; a ζ written on the q-IBZ wedge is indexed by
-    the irreducible list, and mapping between them is the deferred IBZ-unfold
-    (one SymMaps sym-action).  When the parent's ζ is IBZ-only the small
-    bundle gets none and this says so, naming the parent's limitation rather
-    than presenting it as the downfold's — ``vq_interp`` refuses an IBZ ζ
-    outright, so ``--vq-mode interp`` was unavailable on the PARENT too and
-    the downfold has taken nothing away.
+    A q-IBZ ζ TRANSPORTS, AND NO UNFOLD IS NEEDED TO DO IT.  This function
+    used to refuse whenever the parent's ζ held fewer q than the bundle,
+    calling the gap "the deferred IBZ-zeta unfold".  That was over-broad, and
+    the reason is the owner's ruling of 2026-08-10: **the downfold is
+    q-DIAGONAL**, so it should be done on ``q_irr`` in the first place.  Every
+    stage after the selection acts on one q at a time — ``T[q]`` is built from
+    ``S_SS[q]`` and ``S_cross[q]`` alone, and the congruence is per-q — so the
+    transfer at a wedge q is the SAME MATRIX whether the surrounding run
+    enumerated the wedge or the whole star.  A wedge ζ therefore needs no
+    unfold: it needs the transfer AT ITS OWN q, which is one row of the
+    transfer this run already holds.  :func:`_zeta_q_to_restart_q` was already
+    the function that finds that row — an exact wrapped-integer match on the
+    q labels, refusing on anything it cannot place — and the count test in
+    front of it was rejecting inputs the matcher handles.  What the count
+    genuinely rules out is a ζ on a DIFFERENT grid, and that the matcher
+    refuses by name rather than by arithmetic.
+
+    WHAT THIS DOES AND DOES NOT BUY.  The child's ζ comes out on the parent's
+    own q set, so a wedge parent yields a wedge child and the child is exactly
+    as capable as its parent — which is the drop-in promise, held rather than
+    asserted.  It does NOT make ``--vq-mode interp`` work on a wedge lineage:
+    ``vq_interp`` still requires ``nq == nk`` and that refusal is untouched
+    here, because it is a statement about ITS reader and not about this
+    transport.  The difference from before is that the child no longer loses a
+    capability the parent had — previously a wedge parent produced a child
+    with NO ζ at all, which is strictly worse than the parent and was
+    described in the log as taking nothing away.
 
     Returns the written path, or ``""`` when no ζ was transported.
     """
@@ -712,17 +731,33 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
     zl = ZetaLoader(src_zeta, mesh=None)
     try:
         nq_disk = int(np.asarray(zl.ngk_per_q).shape[0])
-        if nq_disk != int(n_q):
+        if nq_disk > int(n_q):
+            # NOT the wedge case.  More ζ tiles than the bundle has q is a
+            # grid disagreement, and the one direction the per-q matcher
+            # below cannot resolve: every ζ q would still find a bundle q to
+            # match, but two of them would have to share one transfer row.
+            # Refused here rather than as a duplicate-permutation message
+            # three lines later, because the diagnosis is different.
             print_fn(
                 f"  [downfold/zeta] parent zeta_q.h5 stores {nq_disk} q "
-                f"against the bundle's {n_q} — the q-IBZ wedge.  The "
-                f"transfer T is indexed by the restart's flat-q axis and "
-                f"mapping the two is the deferred IBZ-zeta unfold, so no ζ "
-                f"is transported.  vq_interp refuses an IBZ ζ outright, so "
-                f"--vq-mode interp was already unavailable on the PARENT; "
-                f"this downfold has taken nothing away.  Re-fit the parent "
-                f"with LORRAX_FORCE_FULL_BZ=1 to get a ζ both can use.")
+                f"against the bundle's {n_q} — MORE ζ than there are q in "
+                f"the restart.  The two files do not describe the same "
+                f"q set, so no ζ is transported.")
             return ""
+        if nq_disk < int(n_q):
+            print_fn(
+                f"  [downfold/zeta] parent zeta_q.h5 stores {nq_disk} q "
+                f"against the bundle's {n_q} — the q-IBZ WEDGE, and it "
+                f"transports.  The downfold is q-diagonal: T[q] is built "
+                f"from S_SS[q] and S_cross[q] alone, so the transfer at a "
+                f"wedge q is the same matrix whichever q set the run "
+                f"enumerated.  Each stored ζ is matched to its own row of T "
+                f"by its q label (exact wrapped-integer match; a q that is "
+                f"not on the grid refuses).  The child's ζ lands on the "
+                f"PARENT's q set, so the child is exactly as capable as the "
+                f"parent — note that vq_interp still requires nq == nk, so "
+                f"--vq-mode interp remains unavailable on this lineage, as "
+                f"it was on the parent.")
 
         # T[q] at the LOGICAL extents.  The transfer carries the device-legal
         # μ pads on both axes; ζ on disk is logical on both, and the pad rows
@@ -738,7 +773,8 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
         # dimension this whole exercise makes small.
         from common.collectives import gather_to_host
         T_np = np.asarray(gather_to_host(T_x))[:, :int(mu_S), :mu_L_file]
-        perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, print_fn=print_fn)
+        perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, n_q=int(n_q),
+                                    print_fn=print_fn)
 
         ngkmax = int(zl.ngkmax_zeta)
         out_zeta = os.path.join(os.path.dirname(out_file), "zeta_q.h5")
@@ -781,7 +817,7 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
     return out_zeta
 
 
-def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, print_fn=print):
+def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, n_q=None, print_fn=print):
     """``perm[i]`` = the restart's flat-q index of ζ's q slot ``i``.
 
     THE TWO AXES ARE NOT THE SAME OBJECT AND ONE OF THEM IS RECONSTRUCTED.
@@ -800,6 +836,16 @@ def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, print_fn=print):
 
     Refusing beats guessing here: a permuted q axis writes each q's ζ against
     a different q's transfer, which is a bundle full of plausible numbers.
+
+    THE IDENTITY BRANCH IS FOR A FULL-BZ ζ ONLY, and ``n_q`` is what says so.
+    Its premise is that the writer's own order is the wrapped C-order grid,
+    which is true of the full-BZ writer and false of the wedge writer — the
+    wedge is ``q_irr_frac``'s order, an arbitrary subsequence of the grid, so
+    ``arange`` would hand slot ``i`` the transfer of grid point ``i`` and
+    write a bundle of plausible numbers.  When a wedge ζ reaches the short-
+    ``rk`` branch there is nothing left to match on and this REFUSES; a
+    wedge ζ is transportable exactly when its q are labelled, which on a
+    symmetry-reduced WFN they are, because ``rk`` IS the irreducible list.
     """
     kg = np.asarray(kgrid, dtype=np.int64)
     idx = np.stack(np.meshgrid(np.arange(kg[0]), np.arange(kg[1]),
@@ -808,6 +854,18 @@ def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, print_fn=print):
     keyed = {tuple(int(v) for v in row): i for i, row in enumerate(idx)}
     qraw = np.asarray(zl.kpoints, dtype=np.float64)
     if qraw.shape[0] < nq_disk:
+        if n_q is not None and int(nq_disk) < int(n_q):
+            raise ValueError(
+                f"downfold: the parent's zeta_q.h5 holds {nq_disk} q against "
+                f"the bundle's {n_q} — a q-IBZ WEDGE — and "
+                f"mf_header/kpoints/rk labels only {qraw.shape[0]} of them, "
+                f"so there is nothing to match its q on.  The identity "
+                f"fallback below is the FULL-BZ writer's wrapped C-order "
+                f"grid; a wedge is q_irr_frac's order, an arbitrary "
+                f"subsequence of that grid, so taking the identity would "
+                f"attach grid point i's transfer to wedge slot i and write a "
+                f"ζ of plausible, wrong numbers.  Re-fit the parent's ζ from "
+                f"a WFN whose rk labels every stored q.")
         print_fn(
             f"  [downfold/zeta] mf_header/kpoints/rk labels only "
             f"{qraw.shape[0]} of the {nq_disk} stored q (the WFN is "

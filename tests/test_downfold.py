@@ -753,7 +753,319 @@ def test_input_file_refuses_a_gw_deck(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 6.  Multi-device: the whole chain, P=1 against P>1
+# 6.  §q_irr — the downfold on the WEDGE, and whether its child unfolds
+# ---------------------------------------------------------------------------
+#
+# THE CLAIM UNDER TEST, stated so a reader knows what a green here buys.
+# ``gw.downfold``'s D2b block derives that the wedge downfold's child is
+# storable on the wedge iff the kept centroid set is orbit-closed.  These
+# cells test the two halves separately and then together:
+#
+#   (a) q-DIAGONALITY — the wedge transfer is the full-BZ transfer's own row,
+#       BIT-FOR-BIT.  No symmetry needed; it is why a wedge run is a
+#       restriction rather than an approximation, and it is what licenses
+#       downfold_run transporting a q-IBZ ζ against a full-BZ T.
+#   (b) COVARIANCE — congruence commutes with the tree's OWN unfold kernel
+#       when keep is orbit-closed, and the child's tables are the parent's
+#       restricted.  Run through ``symmetry_maps.unfold_isdf_operator``, not
+#       a reimplementation of it, so a green is about the shipping unfold.
+#   (c) THE RED TWIN the whole section exists for: a selection that is NOT
+#       orbit-closed must be CAUGHT, and — separately — must actually be
+#       WRONG if it were let through.  A refusal nobody has seen guard a real
+#       disagreement is decoration.
+#
+# The parent here is SYNTHETIC AND EXACTLY COVARIANT BY CONSTRUCTION: the
+# full-BZ operands are DEFINED as the unfold of a wedge block.  That is the
+# honest reference, because the property under test is the commutation of two
+# maps, not the physics that makes a pair-density Gram covariant in the first
+# place (which is the parent's own wedge-storage precondition, measured at
+# write time by ``verify_centroid_orbit_closure`` and not re-litigated here).
+
+QIRR_MU = 12
+QIRR_ORB = 4                       # 3 orbits of 4 under a cyclic group
+QIRR_NQ_FULL = 4
+QIRR_IRR_IDX = np.array([0, 1, 1, 1], dtype=np.int64)
+QIRR_SYM_IDX = np.array([0, 0, 1, 2], dtype=np.int64)
+QIRR_Q_IRR_FRAC = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]])
+#: keep two WHOLE orbits — the covariance condition, satisfied.
+QIRR_KEEP_CLOSED = np.array([0, 1, 2, 3, 8, 9, 10, 11], dtype=np.int64)
+#: the same size, but cutting through both orbits — the red twin.
+QIRR_KEEP_BROKEN = np.array([0, 1, 2, 4, 8, 9, 10, 11], dtype=np.int64)
+
+
+def _qirr_tables(seed=5):
+    """``(sym_perm, L_table)`` for a cyclic group with row 0 the IDENTITY.
+
+    Row 0 must be the identity op with zero wrap, because that is what makes
+    the ``sym_idx == 0`` full-BZ q's the wedge blocks themselves and turns
+    gate (a) into a bit-for-bit statement instead of a tolerance.
+    """
+    n_orb = QIRR_MU // QIRR_ORB
+    perm = np.empty((QIRR_ORB, QIRR_MU), dtype=np.int64)
+    for g in range(QIRR_ORB):
+        for o in range(n_orb):
+            base = o * QIRR_ORB
+            for j in range(QIRR_ORB):
+                perm[g, base + j] = base + (j + g) % QIRR_ORB
+    rng = np.random.default_rng(seed)
+    L = rng.integers(-1, 2, size=(QIRR_ORB, QIRR_MU, 3)).astype(np.int64)
+    L[0] = 0
+    assert np.array_equal(perm[0], np.arange(QIRR_MU))
+    return perm, L
+
+
+def _qirr_unfold(A_ibz, mesh, sym_perm, L_table):
+    """The tree's own unfold, on this section's tables."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_isdf_operator
+    return unfold_isdf_operator(
+        A_ibz, irr_idx=jnp.asarray(QIRR_IRR_IDX),
+        sym_idx=jnp.asarray(QIRR_SYM_IDX), sym_perm=jnp.asarray(sym_perm),
+        L_table=jnp.asarray(L_table),
+        q_irr_frac=jnp.asarray(QIRR_Q_IRR_FRAC), mesh_xy=mesh,
+        n_sym_spatial=QIRR_ORB)
+
+
+def _qirr_parent(mesh, seed=3):
+    """A wedge parent ``(S_ibz, W_ibz)`` and its unfold, both on device."""
+    rng = np.random.default_rng(seed)
+    n_ibz = QIRR_Q_IRR_FRAC.shape[0]
+    a = (rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU))
+         + 1j * rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU)))
+    # S: Hermitian POSITIVE DEFINITE (it is a Gram) with a well-separated
+    # spectrum, so the rank truncation retains the same count on both routes
+    # and the comparison is of numbers rather than of two different ranks.
+    S_ibz = np.einsum("qij,qkj->qik", a, a.conj()) + QIRR_MU * np.eye(QIRR_MU)
+    b = (rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU))
+         + 1j * rng.normal(size=(n_ibz, QIRR_MU, QIRR_MU)))
+    W_ibz = b + np.conj(np.swapaxes(b, 1, 2))
+    munu = NamedSharding(mesh, P(None, "x", "y"))
+    S_j = jax.lax.with_sharding_constraint(jnp.asarray(S_ibz), munu)
+    W_j = jax.lax.with_sharding_constraint(jnp.asarray(W_ibz), munu)
+    return S_j, W_j
+
+
+def _qirr_downfold(S_all, W_all, keep, mesh, rcond=1e-10):
+    """One downfold, on whatever q set its operands carry.
+
+    Deliberately the PRODUCTION primitives — ``build_transfer`` and
+    ``congruence`` — so that both routes below differ in their q set and in
+    nothing else.
+    """
+    munu = NamedSharding(mesh, P(None, "x", "y"))
+    S_host = np.asarray(jax.device_get(S_all))
+    S_SS = jax.lax.with_sharding_constraint(
+        jnp.asarray(S_host[:, keep, :][:, :, keep]), munu)
+    S_cross = jax.lax.with_sharding_constraint(
+        jnp.asarray(S_host[:, keep, :]), munu)
+    T_x, T_y, reports = downfold.build_transfer(
+        S_SS, S_cross, mesh, rcond=rcond, announce=False)
+    W_S = downfold.congruence(mesh, T_x, T_y)(W_all)
+    return T_x, W_S, [int(r.rank_criterion) for r in reports]
+
+
+def test_qirr_the_wedge_transfer_is_the_full_bz_transfer_bit_for_bit():
+    """(a) q-DIAGONALITY.  T[q] uses no q but its own.
+
+    At the full-BZ q whose ``sym_idx`` is 0 the unfold is the identity map
+    (identity permutation, zero wrap, unit phase), so the full-BZ route's
+    operands at that q ARE the wedge block.  Same inputs, same eigh, same
+    bits — asserted as equality and not as a tolerance, because anything
+    weaker would also pass if the transfer had picked up a dependence on the
+    surrounding q axis.
+
+    THIS is the licence for ``downfold_run.write_downfolded_zeta`` to
+    transport a q-IBZ ζ against a transfer built on the full BZ: the row it
+    reads is the matrix a wedge-native run would have computed.
+    """
+    mesh = resolve_mesh()
+    sym_perm, L_table = _qirr_tables()
+    S_ibz, W_ibz = _qirr_parent(mesh)
+    S_full = _qirr_unfold(S_ibz, mesh, sym_perm, L_table)
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    keep = QIRR_KEEP_CLOSED
+
+    T_ibz, _W_S_ibz, rank_ibz = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
+    T_full, _W_S_full, rank_full = _qirr_downfold(S_full, W_full, keep, mesh)
+
+    t_i = np.asarray(jax.device_get(T_ibz))
+    t_f = np.asarray(jax.device_get(T_full))
+    # the full-BZ q that carries each wedge block untouched
+    for i in range(QIRR_Q_IRR_FRAC.shape[0]):
+        q = int(np.flatnonzero((QIRR_IRR_IDX == i) & (QIRR_SYM_IDX == 0))[0])
+        assert np.array_equal(t_i[i], t_f[q]), (
+            f"wedge transfer i={i} differs from the full-BZ transfer at its "
+            f"own q={q}: the downfold has acquired a dependence on the q set "
+            f"it was handed, and a wedge run is then not a restriction of a "
+            f"full-BZ one")
+        assert rank_ibz[i] == rank_full[q]
+
+
+def test_qirr_covariance_the_wedge_child_unfolds_to_the_full_bz_child():
+    """(b) THE DEFINITIVE GATE.  Congruence commutes with the unfold.
+
+    Downfold the wedge, unfold the CHILD with the child's own tables, and
+    compare against downfolding the already-unfolded parent.  Both routes run
+    the shipping ``build_transfer`` / ``congruence`` / ``unfold_isdf_operator``.
+
+    NOT ASSERTED BIT-FOR-BIT, and the reason is stated rather than absorbed:
+    the two routes apply the same unitary at different points of the same
+    chain (before the eigh on one side, after the congruence on the other),
+    so they differ by floating-point REASSOCIATION — plus, at every q whose
+    op is not the identity, a multiply by a unit-modulus phase and later by
+    its conjugate, which is exact only in exact arithmetic.  The band below
+    is that floor, measured; a DIFFERENT ALGEBRA would miss it by order one,
+    which is what the red twin two cells down demonstrates.
+    """
+    mesh = resolve_mesh()
+    sym_perm, L_table = _qirr_tables()
+    S_ibz, W_ibz = _qirr_parent(mesh)
+    S_full = _qirr_unfold(S_ibz, mesh, sym_perm, L_table)
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    keep = QIRR_KEEP_CLOSED
+
+    stab = downfold.star_stability(keep, sym_perm)
+    assert stab.closed, stab.describe()
+    child_perm, child_L = downfold.child_unfold_tables(
+        keep, sym_perm, L_table)
+
+    _T_i, W_S_ibz, _r = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
+    _T_f, W_S_full, _r2 = _qirr_downfold(S_full, W_full, keep, mesh)
+    W_S_unfolded = _qirr_unfold(W_S_ibz, mesh, child_perm, child_L)
+
+    got = np.asarray(jax.device_get(W_S_unfolded))
+    want = np.asarray(jax.device_get(W_S_full))
+    assert got.shape == want.shape == (QIRR_NQ_FULL, keep.size, keep.size)
+    rel = np.max(np.abs(got - want)) / np.max(np.abs(want))
+    assert rel < 1e-12, (
+        f"the q_irr-downfolded child does not unfold to the full-BZ "
+        f"downfolded child (max rel {rel:.3e}).  Congruence and unfolding "
+        f"have stopped commuting — check the child tables before the algebra")
+
+
+def test_qirr_red_twin_a_symmetry_broken_selection_is_refused():
+    """(c1) RED TWIN.  A selection that cuts an orbit must be CAUGHT.
+
+    ``QIRR_KEEP_BROKEN`` is the same SIZE as the closed set and takes 3 of
+    orbit 0's 4 members plus one of orbit 1's, so nothing about a shape or a
+    count distinguishes it.  ``child_unfold_tables`` must refuse it by name.
+    """
+    sym_perm, L_table = _qirr_tables()
+    stab = downfold.star_stability(QIRR_KEEP_BROKEN, sym_perm)
+    assert not stab.closed
+    assert stab.violating_ops, "a broken selection with no violating op"
+    with pytest.raises(ValueError) as exc:
+        downfold.child_unfold_tables(QIRR_KEEP_BROKEN, sym_perm, L_table)
+    assert "orbit-closed" in str(exc.value)
+
+
+def test_qirr_red_twin_a_symmetry_broken_selection_really_is_wrong():
+    """(c2) THE REFUSAL IS LOAD-BEARING, not decoration.
+
+    Force the broken selection through with the closure check bypassed — by
+    handing the child unfold a table built the way an unguarded
+    implementation would build it, ``pos[]`` of the images that DO land
+    inside the kept set and an arbitrary slot for the ones that do not.  The
+    result must miss the full-BZ answer by order one.  A refusal that only
+    ever guarded agreeing numbers would be worth deleting.
+    """
+    mesh = resolve_mesh()
+    sym_perm, L_table = _qirr_tables()
+    S_ibz, W_ibz = _qirr_parent(mesh)
+    S_full = _qirr_unfold(S_ibz, mesh, sym_perm, L_table)
+    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
+    keep = QIRR_KEEP_BROKEN
+
+    pos = np.full(QIRR_MU, 0, dtype=np.int64)     # the arbitrary slot
+    pos[keep] = np.arange(keep.size, dtype=np.int64)
+    child_perm = pos[sym_perm[:, keep]]
+    child_L = L_table[:, keep]
+
+    _T_i, W_S_ibz, _r = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
+    _T_f, W_S_full, _r2 = _qirr_downfold(S_full, W_full, keep, mesh)
+    got = np.asarray(jax.device_get(
+        _qirr_unfold(W_S_ibz, mesh, child_perm, child_L)))
+    want = np.asarray(jax.device_get(W_S_full))
+    rel = np.max(np.abs(got - want)) / np.max(np.abs(want))
+    assert rel > 0.1, (
+        f"a selection that breaks star symmetry unfolded to within "
+        f"{rel:.3e} of the right answer — if that is real, the closure "
+        f"refusal is guarding nothing and should be reconsidered, not kept")
+
+
+def test_qirr_the_cur_selection_is_not_star_stable_by_default():
+    """THE MEASUREMENT the fix rests on: CUR breaks the star, generically.
+
+    On a Gram that commutes with the whole group — which is what the q = 0
+    selection Gram IS, since q = 0 is invariant under every op and the unfold
+    phases are unity there — the pivot order fills orbits GREEDILY but stops
+    at exactly ``mu_S``.  So closure holds only when ``mu_S`` lands on an
+    orbit boundary, and a user-chosen ``mu_S`` generally does not.
+
+    Pinned here because the whole q_irr storage decision turns on it, and
+    because "the selection is symmetry-stable" is exactly the kind of thing
+    that gets assumed once and inherited forever.
+    """
+    mesh = resolve_mesh()
+    sym_perm, _L = _qirr_tables()
+    rng = np.random.default_rng(19)
+    A = (rng.normal(size=(QIRR_MU, QIRR_MU))
+         + 1j * rng.normal(size=(QIRR_MU, QIRR_MU)))
+    M = A @ A.conj().T
+    G = sum(M[np.ix_(p, p)] for p in sym_perm)
+    G = 0.5 * (G + G.conj().T)
+    for p in sym_perm:                     # the symmetry we are selecting on
+        assert np.max(np.abs(G[np.ix_(p, p)] - G)) < 1e-10
+    G_j = jax.lax.with_sharding_constraint(
+        jnp.asarray(G), NamedSharding(mesh, P("x", "y")))
+
+    closed_at, broken_at = [], []
+    for mu_S in range(2, QIRR_MU):
+        keep, _rep = downfold.select_cur_centroids(
+            G_j, mu_S, rcond=1e-10, select_tol=1e-12, mesh_xy=mesh,
+            mu_large_logical=QIRR_MU, print_fn=lambda *a, **k: None)
+        (closed_at if downfold.star_stability(keep, sym_perm).closed
+         else broken_at).append(mu_S)
+    assert broken_at, (
+        "every mu_S came back orbit-closed — if that is reproducible on real "
+        "decks the covariance condition is free and this section's repair is "
+        "unnecessary; do not silently drop the check, measure it and say so")
+    assert closed_at, "no mu_S was orbit-closed; the construction is wrong"
+    # the greedy-fill structure: closure lands on orbit boundaries
+    assert all(m % QIRR_ORB == 0 for m in closed_at), closed_at
+
+
+def test_qirr_orbit_completion_restores_closure_at_a_bounded_cost():
+    """The repair, and its price.  Completion ADDS; it never drops.
+
+    Dropping the offending centroids instead would shrink the retained
+    subspace below what the selection certified, which is the failure the
+    rank refusal exists to prevent — so the repair rounds ``mu_S`` UP, and
+    the caller must treat the returned length as the authority.
+    """
+    sym_perm, L_table = _qirr_tables()
+    for mu_S in range(2, QIRR_MU):
+        keep = np.arange(mu_S, dtype=np.int64)          # a cutting selection
+        closed = downfold.orbit_complete_keep(keep, sym_perm)
+        assert set(keep.tolist()) <= set(closed.tolist()), "completion dropped"
+        assert downfold.star_stability(closed, sym_perm).closed
+        assert closed.size - keep.size < QIRR_ORB, (
+            "completion cost a whole group order; on a greedy pivot order it "
+            "should be the tail of the one orbit mu_S stopped inside")
+        # and the tables it makes available are the parent's, restricted
+        cperm, cL = downfold.child_unfold_tables(closed, sym_perm, L_table)
+        assert cperm.shape == (QIRR_ORB, closed.size)
+        assert np.array_equal(cL, L_table[:, closed])
+        for s in range(QIRR_ORB):
+            assert np.array_equal(closed[cperm[s]], sym_perm[s, closed]), (
+                "child permutation does not satisfy keep[alpha_S(j)] = "
+                "alpha(keep[j]) — the child's unfold would gather the wrong "
+                "rows")
+
+
+# ---------------------------------------------------------------------------
+# 7.  Multi-device: the whole chain, P=1 against P>1
 # ---------------------------------------------------------------------------
 
 def _mesh_invariance_payload():
