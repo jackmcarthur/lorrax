@@ -465,6 +465,92 @@ silent overwrite.
     stderr only, never an exit code, never a refusal.
     [AGENT_PREAMBLE.md efficiency doctrine rule 1]
 
+37. **Production Σ windows achieve 5–13× the quadrature tolerance they
+    ask for — and the tables are probably not the reason.** Measured, not
+    inferred: `dp12_p0.log` in
+    `/pscratch/sd/j/jackm/mpa_geom_0810/_reports/batchlogs` carries eight
+    `legacy-routed window` rows, and six of them miss:
+
+    | window | rule | nodes | achieved | asked |
+    |---|---|---|---|---|
+    | `core` ×2 | crossing | 25 | 4.43e-07 | <1e-06 ✓ |
+    | `b_slab` | Laplace | 9 | 4.93e-06 | <1e-06 |
+    | `a_stripe` | Laplace | 10 | 5.65e-06 | <1e-06 |
+    | `b_slab` | Laplace | 10 | 6.03e-06 | <1e-06 |
+    | `a_stripe` | Laplace | 9 | 6.29e-06 | <1e-06 |
+    | `single` | Laplace | 11 | **1.14e-05** | <1e-06 |
+    | `single` | Laplace | 10 | **1.26e-05** | <1e-06 |
+
+    The crossing rule meets the bar; every miss is a noncrossing/Laplace
+    window. The worst two name their tables:
+    `noncrossing_R_100p000000_eps_1p0em06.npz` (10 nodes,
+    `E_A=[0.0255, 0.9058]` Ry) and
+    `noncrossing_R_215p443469_eps_1p0em06.npz` (11 nodes,
+    `E_A=[0.0255, 4.1424]` Ry).
+
+    **THE DIAGNOSIS TO CHECK FIRST IS NOT A BAD TABLE.** Those same two
+    tables are *served* in the same log reporting `max_err 3.2e-07` and
+    `2.9e-07` — comfortably inside 1e-06 — because the shipped bound is on
+    the SCALED interval `[1, R]`, and
+    `minimax_assets/README.md` states the physical error then scales as
+    `error_bound / x_min`. Both worst rows fall out of that to three
+    digits: `3.2e-07 / 0.0255 = 1.25e-05` against the logged 1.26e-05, and
+    `2.9e-07 / 0.0255 = 1.14e-05` against the logged 1.14e-05. So the
+    likely mechanism is that the selection asks for 1e-06 in scaled units
+    and the window reports achieved error in physical units — two
+    different bars, compared. Stated as a HYPOTHESIS: the same arithmetic
+    does not close as cleanly on the `a_stripe`/`b_slab` rows (10 nodes at
+    6.03e-06 against 11 nodes at 1.14e-05 on the same interval is the wrong
+    way round for pure rescaling), so something else is also in play and
+    this is not solved here.
+
+    Consequence is sub-µeV at Σ scale and nothing in the campaign's
+    numbers is in question. What IS in question is the claim: production
+    is not running a 1e-06 quadrature, and three exits are open —
+    regenerate the catalog at the achieved-vs-asked bar, select against a
+    scaled target (`1e-06 * x_min`), or re-state what the deck's `1e-6`
+    means. That is an owner decision, not an agent's.
+
+    **Cost of the regenerate option, to the extent it is measured.** Two
+    anchors, both from the in-process-pole-loop lane's timing table at
+    `/pscratch/sd/j/jackm/mpa_inproc_0811/_reports/EVIDENCE.md`: a
+    single-pole `-G 4 -n 4` pass leg on the `n_p=2` / five-ω Si deck is
+    532 s wall / 496.3 s `sigma.exec`, of which 26.1 s is window planning;
+    and `dp12_p0.log` itself says `legacy-routed modes: 2554399 of
+    81432576 (3.14 %)` — only those windows read the noncrossing tables.
+    Node count drives τ dispatches roughly linearly, so more nodes costs
+    proportionally more on that 3.14 % slice. I did NOT measure the
+    node-count scaling itself, and that measurement is what a regenerate
+    decision actually needs.
+    [dp12_p0.log, mpa_geom_0810; minimax_assets/README.md; in-process
+    pole-loop lane, 2026-08-11]
+
+38. **Every shipped minimax table in production runs is stamped
+    "gen unrecorded / backend unrecorded / UNCERTIFIED", and the catalog
+    schema is why.** `minimax_assets/catalog.json` is `schema_version: 1`
+    with 31 table records whose keys are exactly `eps_q`, `error_bound`,
+    `error_metric`, `family`, `file`, `max_error`, `node_count`,
+    `range_max`, `range_param`, `target_kind` — no `certified`, no
+    generation record, no backend. The consuming door already expects
+    them: `services/minimax/src/minimax/door.py` reads
+    `entry.get("certified", False)` and carries a `NoCertifiedTable`
+    refusal path for the case, so the machinery exists and every shipped
+    entry defaults to False for want of a field. The result in the logs is
+    uniform — one production leg (`dp12_p0.log`) carries 17 `UNCERTIFIED`
+    stamps and zero certified ones.
+
+    Not a numerics defect and not urgent: the tables are the tables, and
+    row 37 is the question about whether they are the right ones. This row
+    is about being able to ANSWER that question later — a table with no
+    generation record cannot be reproduced, compared against a
+    regenerated one, or attributed to a host, and the survey's own warning
+    (three hosts, three answers, kappa0 varying by 900×) is precisely
+    about the axis this field would pin. Fix: catalog schema v2 carrying
+    generator commit, backend string and a certification flag, and a
+    re-stamp of the shipped bundle.
+    [dp12_p0.log, mpa_geom_0810; catalog.json schema_version 1;
+    door.py; in-process pole-loop lane, 2026-08-11]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - Rows 4, 5, 11, 25, 26, 27, 28, 31 (the `lx` harness trap inventory) —
