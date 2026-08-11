@@ -32,10 +32,8 @@ different sizing criterion from the retained window's pair-density rank that
 output is sliced to the kept rows afterwards, which is exact because the small
 basis's ψ-at-centroids is that same column slice by definition (see `mode`
 below). The downfold therefore writes the parent's table out beside the small
-bundle, taken from the parent's own `zeta_q.h5` header and content-verified
-against the bundle's `centroids_charge_md5`, and records its path in
-`downfold_provenance`. μ_S buys the (μ, μ) tensors and the BSE matvec; it does
-not and cannot buy the interpolation fit.
+bundle, by the route `parent_centroids_file` describes. μ_S buys the (μ, μ)
+tensors and the BSE matvec; it does not and cannot buy the interpolation fit.
 
 The second is ζ. Off-grid exchange interpolates a stored `zeta_q.h5`, and the
 parent's is the wrong basis, so the downfold transports it:
@@ -68,6 +66,20 @@ cross-checks its q = 0, G = 0 column against the independently transported
     longer takes away a capability its parent had. `--vq-mode ongrid` needs no
     ζ at all and is exact at every Q that lands on the BSE grid.
 
+!!! warning "Every child measurement quoted below predates the q-sign fix of 2026-08-11"
+    `downfold.pair_density_gram` built the transfer at −q and applied it at +q,
+    from the driver's birth commit until `0578bc89`, so every downfolded child
+    ever measured before that merge was the wrong object and every `eps_W`
+    recorded for one is void — `eps_W` was contracted against the same −q Gram,
+    so it is not the Pythagorean residual of anything. The numbers on this page
+    have not been re-taken. For the size of the correction, the one lineage that
+    was re-run on the fixed tree moved its exciton error from −348.6 meV to
+    −42.6 meV and its median `eps_W` from 1.056e-02 to 1.196e-02, so the error
+    bar barely moved while the observable moved by an order of magnitude
+    (`tests/known_failures/2026-08-11-qsign-recut-verdicts.md`). Read what
+    follows for the mechanism and the shape of the guidance, and re-measure
+    before quoting a figure.
+
 What the drop-in does **not** fix is how large μ_S has to be. Measured on the
 silicon deck below, the downfolded exciton bands at Q = 0 come out at 0.2579 eV
 for μ_S = 189 and 1.2605 eV for μ_S = 624 against the parent's 2.3451 eV — the
@@ -86,21 +98,17 @@ it destroys the spectrum rather than compressing it. The driver tells you which
 situation you are in — that is what the refusal and the error bar below are
 for — but it cannot create redundancy that the parent does not have.
 
-The measurement behind that paragraph is `DOWNFOLD_S1.md` §3(c), which is a
-**campaign report and is not in this repository** — it lives with the rest of the
-2026-08-08 BSE campaign artifacts. Nothing on this page depends on reading it, and
-where a number from it is quoted here it is quoted in full, but do not go looking
-for the file in a checkout.
+That measurement is `DOWNFOLD_S1.md` §3(c), a campaign report which lives with
+the 2026-08-08 BSE artifacts rather than in this repository; every number taken
+from it is quoted here in full, so do not go looking for the file in a checkout.
 
 Nowhere does this tree tell you how to *build* an over-complete parent, and that
-gap is worth naming because it is the first thing a reader of this page needs.
-The guidance in [drivers.md](drivers.md) is "run the GW stage at a generous μ_L",
-with no number and no invocation, and the one concrete figure anywhere — the
-960-centroid parent above — is reported as a measurement rather than as a recipe.
-For orientation, the parent used for the 2026-08-10 measurements on this page was
-built with `python3 -m centroid.kmeans_cli 900 --seed 42 --prune-n-val 8
---prune-n-cond 52` on the `si_bse_debug` WFN, which in orbit mode delivered 936
-points; that produced a window rank of 189, and, as the `mu_small` section below
+gap is the first thing a reader of this page needs. The only guidance anywhere is
+[drivers.md](drivers.md)'s "run the GW stage at a generous μ_L", with no number
+and no invocation. For orientation rather than as a recipe, the parent behind the
+2026-08-10 measurements here came from `python3 -m centroid.kmeans_cli 900 --seed
+42 --prune-n-val 8 --prune-n-cond 52` on the `si_bse_debug` WFN, which in orbit
+mode delivered 936 points and a window rank of 189 — and, as `mu_small` below
 records, was still not enough for a usable BSE spectrum after compression. Sizing
 a parent for a downfold is unsettled work, not a documented procedure.
 
@@ -112,13 +120,11 @@ end through an unmodified BSE driver. That is round-off through a pseudo-inverse
 and nothing else, so none of the Gram, the selection, the solve, the congruence
 or the writer is costing you anything measurable; the whole of that 37.4 meV is
 what a five-fold cut in μ_S bought. The second number is the bar it has to
-clear. Production BSE work wants better than 1 meV, and it is only
-full-frequency, MPA-class studies that have any business tolerating something
-like 10 meV. So read the aggressive demo as a demonstration of the mechanism
-rather than as a recommended setting: choose μ_S for the accuracy target and
-confirm the choice in the observable. That is the same rule `downfold_rcond`
-and `eps_W` are both held to further down this page, and for these three
-questions it is the only admissible evidence there is.
+clear, and this page states that bar once, under *How to validate a μ_S* below.
+So read the aggressive demo as a demonstration of the mechanism rather than as a
+recommended setting: choose μ_S for the accuracy target and confirm the choice
+in the observable, which is the same rule `downfold_rcond` and `eps_W` are both
+held to further down.
 
 ```
 python3 -m gw.downfold_cli -i downfold.in
@@ -235,6 +241,21 @@ There is no default. This is a physics choice and the driver cannot guess it.
 
 How many centroids the small basis should have, or the word `auto`.
 
+**It is a budget in points, and since 2026-08-10 the selection spends it in
+whole symmetry orbits.** Whenever a symmetry map reaches the selection, the
+driver takes orbits in pivot order for as long as the running point total stays
+at or below the number you wrote, so the basis you get is the largest union of
+whole orbits that does not exceed your budget — `mu_small = 185` on the
+`si_bse_debug` parent realizes 168, in four orbits. That is why the run prints
+requested and realized side by side, with a census of the parent's orbit sizes,
+and stamps both into the bundle's provenance. Choosing orbits rather than points
+is what makes the child's symmetry closure structural instead of something to be
+repaired afterwards, which the section on wedge storage below is about. If your
+budget is smaller than the first orbit the pivot order ranks, the driver refuses
+and lists the legal point counts under the ceiling rather than delivering an
+empty basis. Where no symmetry map reaches the selection the historical
+point-granularity path still runs, and there closure is simply not measured.
+
 **The recommendation is an explicit integer, validated against the parent by
 comparing the observable.** This page used to recommend `auto`, and that
 recommendation is withdrawn: it produced a 2.087 eV error in the lowest BSE
@@ -242,15 +263,10 @@ eigenvalue on the standard silicon walk, with nothing refusing anywhere. Write
 the number in the deck, and then check it — the check is *How to validate a
 μ_S* below, and it is one command.
 
-The recommendation carries a precondition, and it is the same one this page's
-opening section states: **the parent basis has to be over-complete for your
-retained window**, or there is no redundancy to compress and every μ_S you can
-legally ask for is too small. The driver cannot create redundancy the parent
-does not have, it does not measure whether the parent has any, and nothing in
-this tree tells you how to build a parent that does — that gap is named at the
-top of this page and it is still open. A downfold of a parent that was merely
-adequate for its window is not a compression; it is a truncation with a
-compression's reporting.
+The recommendation carries the precondition this page's opening section states —
+**the parent basis has to be over-complete for your retained window** — and a
+downfold of a parent that was merely adequate for its window is not a
+compression but a truncation with a compression's reporting.
 
 `auto` means "as many as the retained window has independent pair-density
 directions at `downfold_rcond`" — the eigenvalue-rank **ceiling**, and the
@@ -465,16 +481,12 @@ The residual is therefore orthogonal to the fit, Pythagoras holds exactly, and
 
 is not an estimate of the error — it *is* the error, computed from traces of
 μ × μ objects, without ever forming the exact observable (which has millions of
-rows). So every run carries its own accuracy statement, and a downfold that
-was too aggressive says so on the spot rather than three hours later in an
-exciton spectrum.
+rows). That exactness is also why the code applies no ridge anywhere on this
+path: a ridge would destroy the orthogonality the identity rests on, and
+`eps_W` would go on printing a plausible number that means nothing.
 
-One consequence worth stating out loud, because it is the reason the code
-applies no ridge anywhere on this path: a ridge would destroy the orthogonality
-that makes the identity exact, and `eps_W` would go on printing a plausible
-number that means nothing.
-
-And one caveat, measured: `eps_W` is a **tripwire, not a transferable gate**.
+What `eps_W` is exact *about* is narrower than it sounds, and that is the
+measured caveat: it is a **tripwire, not a transferable gate**.
 Within one parent bundle and one cut it ranks configurations monotonically, but
 the same `eps_W` of about one per cent produced a 37 meV exciton drift on one
 parent and a 1.7 eV drift on another (`DOWNFOLD_S1.md` §3(c), a campaign report
@@ -496,12 +508,11 @@ A restart bundle in the unchanged format, at the smaller μ: `V_qmunu`,
 carried through verbatim, the parent's Coulomb-kernel policy string re-stamped,
 and the parent's band-window stamp preserved.
 
-Three siblings land in the same `tmp/` directory: `zeta_q.h5` transported to the
-small basis, `centroids_frac_<μ_L>_parent.txt` (the basis the exciton driver's
-htransform leg fits in), and `centroids_frac_<μ_S>_downfold.txt` (the kept rows,
-for a fresh GW). They are not part of the bundle format — nothing in it holds a
-coordinate or a ζ — but they are what makes the output directory self-contained
-for every consumer rather than only for the ones that read tensors.
+Three siblings land in the same `tmp/` directory: the transported `zeta_q.h5`
+and the two centroid tables described under `parent_centroids_file` above. They
+are not part of the bundle format — nothing in it holds a coordinate or a ζ —
+but they are what makes the output directory self-contained for every consumer
+rather than only for the ones that read tensors.
 
 The band axis is **not** truncated. The retained window decides what the
 compression is faithful to; it is not a truncation of the stored bands. Cutting
@@ -513,7 +524,11 @@ is separate, later work with its own renumbering contract.
 Alongside the standard datasets the bundle carries a `downfold_provenance`
 group recording what it is: the parent file and its centroid count, the kept
 indices, the window, both tolerances, all three ranks, the retained rank at
-every q and the error bar at every q. A downfolded bundle is deliberately
+every q, the error bar at every q, the μ_S you requested beside the one the
+orbit floor realized, and — when the child has unfold tables — the
+wedge-storability residual with the conditioning and the tolerance it was judged
+against, because a residual with no tolerance beside it is what let a correct
+3.7e-08 read as a refutation for two days. A downfolded bundle is deliberately
 indistinguishable from a natively fitted one by shape — that is what makes it a
 drop-in — but it is not the same object, and a reader that wants to know can
 ask.
@@ -537,21 +552,30 @@ relate them. The child would then have no unfold tables at all, and a child
 written as though it did would read back as a permutation of the wrong
 centroids, silently, because every shape agrees.
 
-Whether the kept set is closed was measured rather than assumed, and it is not.
-Pivoted Cholesky selects against a q = 0 Gram that commutes with the whole
-group, so every member of an orbit looks identical to it and it fills orbits one
-at a time in index order — but it stops at exactly μ_S, which generally falls in
-the middle of an orbit. On the synthetic group the gates use, closure held only
-at the μ_S that land on orbit boundaries. The repair is small and is
-`gw.downfold.orbit_complete_keep`: round the selection up to whole orbits, which
-costs the tail of the single orbit μ_S stopped inside rather than anything
-proportional to the group order, and hand the resulting set to
-`child_unfold_tables` to get the child's α and wraps as restrictions of the
-parent's. That repair is implemented and gated; what has not yet been done is
-wiring it into the driver and writing the child through the q_irr writer, so
-today every child comes out on the full BZ. A downfold of a wedge parent is
-still correct — the reader unfolds the parent before the driver sees it — it is
-simply larger on disk than it could be.
+Closure was the obstacle until 2026-08-10, and it is not any more. A point-wise
+pivoted Cholesky stops at exactly μ_S, which on a real Gram falls in the middle
+of an orbit: not one of the 185 admissible μ_S on the `si_bse_debug` parent came
+back closed, and completing the production selection upward would have added 295
+centroids — the whole parent basis, which is the same thing as not downfolding.
+Picking orbits instead, as the `mu_small` section above describes, makes closure
+structural: `child_unfold_tables` then builds the child's α and wraps as
+restrictions of the parent's, and every run gates the result on its own tensors
+by unfolding the child's wedge block with those tables and comparing against the
+child on the full BZ. On the production deck that gate now reads 3.7e-08 against
+a tolerance scaled by the run's achieved conditioning, and passes with 5.4× of
+margin; it read 1.170 and REFUTED for two days because the Gram behind it was
+built at −q (`tests/known_failures/2026-08-11-downfold-gram-q-sign.md`).
+`gw.downfold.orbit_complete_keep` survives as an offline instrument for a kept
+set that came from somewhere else, and is no longer on the selection path.
+
+The child's tensors are nonetheless still written on the full BZ, and the
+remaining blocker is a different object from the one the gate above measures:
+`symmetry_maps.qirr_store` refuses to stamp a wedge without a
+`CentroidClosureVerdict`, which is a geometric measurement over the parent's
+symmetry operations, and those live on a WFN this driver does not open. A
+permutation-level statement must not be stamped as if it were that one. A
+downfold of a wedge parent is still correct — the reader unfolds the parent
+before the driver sees it — it is simply larger on disk than it could be.
 
 ## Where it does not apply
 
