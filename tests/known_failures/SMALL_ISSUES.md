@@ -323,6 +323,32 @@ silent overwrite.
     those two directions are symmetry-equivalent, so the spread is
     residual, not physics. [LT_LADDER_ACROSS_THE_CELL_2026-08-10.md]
 
+35. **`GATE wing_transition_axis` cannot see the error it names** —
+    `gw.mpa.head_dipole.wing_tensors` requires its `pair_amplitudes` and
+    its dipoles to be "the SAME vertical (k, c, v) set in the same
+    order" (its own words) and checks only
+    `M_flat.shape[0] != d_flat.shape[1]`, a COUNT. A (c, v)
+    transposition leaves that count invariant whenever the transition
+    manifold is a full product, which it always is: the Si
+    big-continuum deck has n_c = 92 and n_v = 8, and 64·92·8 = 64·8·92 =
+    47 104 either way. So the gate passes a transposed wing silently.
+    The failure it would let through is not loud: a mis-ordered wing
+    pairs each dipole with another transition's pair density, so the sum
+    is INCOHERENT and collapses toward zero by phase cancellation —
+    it looks like a correction that is merely too small, and the
+    tempting repair is a scale factor, which restores the magnitude and
+    not the frequency dependence. NOT the active cause of anything today:
+    the 2026-08-10 LF-head lane's caller was checked and is correct
+    (`_pair_amplitude(psi[:, sl.cond], psi[:, sl.val])`, logged as
+    `M (64, 92, 8, 1128)`), and the tree's three producers —
+    `transition_dipoles`, `_pair_amplitude` and the `delta` outer
+    difference — all agree on (k, c, v) in C order. Registered as a
+    latent hazard because the gate's own docstring states a requirement
+    it does not test, and the next caller may not be checked by hand.
+    Cheap fix: pass the (n_k, n_c, n_v) shape rather than the flattened
+    count, or have `wing_tensors` do its own reshape from a named
+    3-axis array instead of accepting a pre-flattened one.
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - Row 30 (`bandstructure.htransform` exit-hang shape) — fixed at
