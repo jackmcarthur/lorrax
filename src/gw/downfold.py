@@ -505,15 +505,30 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 #      points, and we should be choosing the quantity of orbits that comes
 #      closest to that number of points without exceeding it."
 #
-# So the selection UNDERSHOOTS, always, and says so loudly.  This is the same
-# direction the fleet's other quantisations of a KEPT quantity take, and it is
-# the direction ``common/spectral_closure`` is being aligned to as this is
-# written — a lane is flipping its straddled-block repair to DROP the block
-# rather than widen past it, on the same ruling.  Nothing here depends on which
-# way that lands: the floor is stated against the CEILING AS RESOLVED, whatever
-# resolves it, and ``realized <= requested <= ceiling`` holds either way.  Do
-# not re-introduce a "these two go opposite ways, on purpose" paragraph here;
-# there was one, and it was wrong within the hour.
+# So the selection UNDERSHOOTS, always, and says so loudly.
+#
+# THE TWO-RULE FAMILY, because this is the thing a reader will get wrong.  The
+# fleet quantises two different kinds of user-facing number and they are not
+# the same rule, though both are now floors in the sense that matters:
+#
+#   KEPT-SET quantities FLOOR.  ``mu_small`` here, ``N_c`` in the centroid
+#   generator, and the rank ceiling in ``common/spectral_closure`` — which
+#   DROPS a straddled degenerate block whole rather than widening past it
+#   (owner ruling, 2026-08-10).  You may not spend more than the user
+#   budgeted, and you may not keep a symmetry-arbitrary slice of a degenerate
+#   block, so both move DOWN to a legal boundary.  These compose: the orbit
+#   floor is stated against the ceiling AS RESOLVED, so
+#   ``realized <= requested <= ceiling`` regardless of how that cut settled.
+#
+#   BAND WINDOWS keep WHOLE MULTIPLETS.  ``common/band_degeneracy`` is not a
+#   budget at all — a window that slices a degenerate manifold makes the run
+#   wrong rather than expensive, so the rule there is closure, not thrift, and
+#   ``AGENT_PREAMBLE``'s standing ruling is that ``strict`` is the default and
+#   you never set ``snap`` to make a gate pass.
+#
+# Do not re-introduce a "these two go opposite ways, on purpose" paragraph
+# here.  There was one, contrasting this floor with a snap-OUTWARD ceiling, and
+# it was falsified within the hour by the ruling that flipped the ceiling.
 #
 # WHAT THE FLOOR REPLACED, because the contrast worth keeping is with the
 # retired design and not with a sibling guard.  ``select_cur_centroids`` used
