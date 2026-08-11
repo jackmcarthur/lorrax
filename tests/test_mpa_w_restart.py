@@ -334,6 +334,58 @@ def test_wfn_identity_follows_the_zeta_rule(tmp_path):
         f"absent (gw_init._zeta_fit_provenance)")
 
 
+def test_a_read_only_bundle_refuses_the_fit_instead_of_mutating_it(
+        tmp_path, wfn_a):
+    """The poles go INTO the bundle, so a read-only one is refused.
+
+    MEASURED ON THE REAL ARTIFACT, which is why this cell exists: the
+    campaign's production W(z) store
+    (``mpa_wcprod_0809/stores/W_omega_full_wc.h5``, 20.8 GB, 16 samples,
+    64 q, W_c, Ha) resolves to STAGE_FIT through this seam — correctly —
+    and the fleet treats that file as a read-only input.  Without this
+    refusal a deck pointing ``mpa_fit_file`` at it would rewrite 20 GB
+    of someone else's evidence, and would learn about it from an h5py
+    permission traceback partway through the walk.
+    """
+    path = tmp_path / "ro.h5"
+    _write_bundle(path, wfn_a)
+    d = w_restart.resolve_mpa_restart(
+        str(path), identity=w_restart.wfn_identity(wfn_a))
+    path.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError) as exc:
+            w_restart.fit_from_w_omega(d, print_fn=lambda *_: None)
+    finally:
+        path.chmod(0o644)
+    assert "not writable" in str(exc.value)
+    assert str(path) in str(exc.value)
+
+
+def test_a_fit_only_bundle_does_not_announce_a_W_it_does_not_hold(
+        tmp_path, wfn_a):
+    """A production fit store's samples are usually gone; say so.
+
+    ``mpa_fit_np8_wc.h5`` on the cluster is exactly this shape — a
+    finalized pole field with no W(omega) beside it — and a line of
+    ``?`` in every slot reads as a store that failed to describe
+    itself rather than one with nothing left to describe.
+    """
+    path = tmp_path / "fitonly.h5"
+    field = _write_bundle(path, wfn_a)
+    fit_driver.run_fit_driver(str(path), _W_NAME, str(path),
+                              field["z"], field["n_p"])
+    with h5py.File(str(path), "a") as f:
+        for key in (_W_NAME, _W_NAME + "__qirr", _W_NAME + "__mpa"):
+            if key in f:
+                del f[key]
+    d = w_restart.resolve_mpa_restart(
+        str(path), identity=w_restart.wfn_identity(wfn_a))
+    assert d.stage == w_restart.STAGE_SIGMA and d.w_header is None
+    line = w_restart.describe(d)
+    assert "not in this bundle" in line
+    assert "?" not in line, line
+
+
 # ---------------------------------------------------------------------------
 # (d) THE DRIVER SEAM IS ONE CALL, AND THE REFUSALS ARE NOT DUPLICATED
 # ---------------------------------------------------------------------------

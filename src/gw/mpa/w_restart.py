@@ -159,12 +159,20 @@ def describe(decision: MpaRestartDecision) -> str:
                 f"z) is SKIPPED and the pole fit runs here.  {grid} "
                 f"wfn={wfn}")
     led = decision.fit_ledger or {}
+    # THE W(omega) CLAUSE IS OMITTED WHEN THERE IS NO W(omega), rather
+    # than printed with '?' in every slot.  A production fit store is
+    # routinely a file of its own -- the samples it was fitted from are
+    # 20 GB and get deleted -- and a line of question marks reads as a
+    # store that failed to describe itself instead of one that has
+    # nothing left to describe.  The digests it was fitted AGAINST are
+    # stamped in the fit store itself and refused at the Sigma seam.
+    tail = f"; W(omega) {grid} wfn={wfn}" if decision.w_header else (
+        "; its W(omega) samples are not in this bundle")
     return (f"  [mpa_restart] {base}: RESUMING from its pole field — the "
             f"screening sweep AND the fit are SKIPPED.  n_p="
             f"{led.get('n_p', '?')} n_q={led.get('n_q', '?')} "
             f"{led.get('energy_unit', '?')} "
-            f"{led.get('screening_content', '?')}; W(omega) {grid} "
-            f"wfn={wfn}")
+            f"{led.get('screening_content', '?')}{tail}")
 
 
 def _has(path: str, name: str) -> bool:
@@ -325,11 +333,29 @@ def fit_from_w_omega(
             "fit_from_w_omega: this decision carries no W(omega) header, "
             "so there is nothing to fit.")
     n_p = int(hdr["sampling"]["n_p"])
+    # THE POLES GO INTO THE SAME FILE, AND THAT IS SAID OUT LOUD BEFORE
+    # A BYTE MOVES.  The bundle is one file by design, so fitting a
+    # resumed W(omega) MUTATES the file the deck named — and the
+    # campaign's own W(z) stores are 20 GB artifacts the fleet treats
+    # as read-only inputs (``mpa_wcprod_0809/stores/``).  An operator
+    # who points ``mpa_fit_file`` at one of those is asking for a fit
+    # they probably meant to write elsewhere, so a store this process
+    # cannot write is a REFUSAL naming the file rather than an
+    # h5py permission traceback three stages in, and a store it CAN
+    # write is announced as being written to.
+    if not os.access(decision.path, os.W_OK):
+        raise PermissionError(
+            f"fit_from_w_omega: {decision.path} holds the W(omega) "
+            f"samples but is not writable by this process, and the "
+            f"poles are written INTO the bundle beside them.  Copy the "
+            f"store to the run's own directory and point mpa_fit_file "
+            f"there, or fit it once and name the finished bundle.")
     print_fn(
         f"  [mpa_restart] fitting {n_p} poles per element from "
         f"{hdr['n_omega']} stored samples of "
         f"{os.path.basename(decision.path)} :: {decision.w_name} — the "
-        f"screening sweep does not run.")
+        f"screening sweep does not run.  The poles are written INTO "
+        f"this file, beside the samples they were fitted from.")
     return fit_driver.run_fit_driver(
         decision.path, decision.w_name, decision.path,
         np.asarray(hdr["omega"], dtype=np.complex128), n_p,
