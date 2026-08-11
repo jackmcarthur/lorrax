@@ -358,15 +358,18 @@ def make_sharded_fftn_3d(
 # native-JAX duplicate is not maintained).
 #
 # What the service is: the flat-k batched 3-D FFTs dispatched to the platform
-# FFI library — MKL FFT via the DFTI descriptor API on cpu meshes, cuFFT with
+# FFI library — the FFTW3 ABI on cpu meshes (NOT DFTI; those calls were deleted
+# 2026-08-05, see ffi/fft.py:138), cuFFT with
 # the advanced data layout (cufftPlanMany64) on CUDA meshes.  Both libraries
 # register the SAME target names, so the call sites are platform-agnostic.
 # WHY: XLA's fft custom-call wants the transformed axes minor-most, so every
 # dot(k-major) <-> fft(k-minor) boundary in the Σ τ kernel pays a full
 # transpose of the ~398 MB/rank μ² tile — 65% of the STAGED τ DISPATCH at
 # nb=128/P=64, BEFORE this service existed (the line said "of sigma.exec"
-# until 2026-08-11; see the denominator note in ffi/fft.py).  Today the FFT is
-# 7.6-16.5% of that dispatch and 32 ms of a 44.9 s GN-PPM driver wall at P=4.
+# until 2026-08-11; see the denominator note in ffi/fft.py).  Today the FFT's
+# share of that dispatch is 16.1% / 60.5% / 84.9% at 9 / 64 / 216 k-points
+# (P=4, BFC@0.85, 2026-08-11) — it is governed by nk, so there is no single
+# "today" number and the 9-k fixture's 0.07%-of-wall does not generalise.
 # Stride descriptors read the dot-layout tile where it lies, so the transposes
 # disappear instead of moving.  Contract: ``docs/dev/flat_k_fft_service.md``.
 #

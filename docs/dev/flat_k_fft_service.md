@@ -92,18 +92,29 @@ nb=128/P=64, and CLOSED as structural for any XLA-side arrangement
 (`wk_REL/sigma_perf_results.md`): the cost can be moved, not removed, as long
 as the FFT is XLA's.
 
-Two warnings about that sentence, because both have already misled someone.
-It said "60–65% of `sigma.exec`" until 2026-08-11, and 191.9 s is neither —
-it is 65% of the staged τ dispatch and 70.5% of `sigma.exec`
-(`wk_REL/FFI_EVIDENCE_AUDIT.md` F26). And it is the measurement from *before*
-this service existed. Afterwards the FFT is 15.1% of the staged τ dispatch
-decomposed and 7.6% fused at the same nb=128/P=64 on cpu (F25), and 26.4% /
-16.5% at four processes on A100s on the in-tree GN-PPM deck, where the entire
-FFT cost of the self-energy integration is **32 ms of a 44.9 s driver wall**
-(2026-08-11, `tests/known_failures/2026-08-11-gnppm-fft-is-already-on-the-ffi.md`).
-A lane quoting the pre-FFI figure as current will conclude the τ kernel is
-FFT-bound and propose wiring in a service that has been wired since
-2026-08-01.
+Three warnings about that sentence, because all three have already misled
+someone. It said "60–65% of `sigma.exec`" until 2026-08-11, and 191.9 s is
+neither — it is 65% of the staged τ dispatch and 70.5% of `sigma.exec`
+(`wk_REL/FFI_EVIDENCE_AUDIT.md` F26). It is the measurement from *before* this
+service existed, so a lane quoting it as current will conclude the τ kernel is
+FFT-bound and propose wiring in a service that has been wired since 2026-08-01.
+
+And — the third warning, added 2026-08-11 after the *correction* misled someone
+in turn — **no single number belongs in this slot at all, because the FFT's
+share is governed by k-point count and every measurement in the record was
+taken at small `nk`.** Measured across three decks at four processes on A100s,
+BFC@0.85, HEAD `dc766220`
+(`tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`):
+
+| deck | k (full BZ) | μ | FFT share of the staged τ dispatch | of the driver wall |
+|---|---|---|---|---|
+| `gnppm_debug` MoS2 3×3 | 9 | 399 | 16.1% | 0.1% |
+| Si 4×4×4 | 64 | 1128 | 60.5% | 7.8% |
+| Si 6×6×6 | 216 | 1104 | **84.9%** (85.7% decomposed) | **~28%** |
+
+plus 15.1% decomposed / 7.6% fused at nb=128/P=64 on cpu (F25), which is a
+64-k-class shape and sits where the ladder says it should. The cost goes as
+`n_tau · nk · μ_local · N_grid log N_grid`. Quote the rung, or quote none.
 
 Stride descriptors read the dot-layout tile where it lies.  MKL's DFTI
 descriptor API and `cufftPlanMany64`'s advanced data layout both express
@@ -276,7 +287,7 @@ aliases, honored with a one-time announcement (`mklpin::knob_value`).
 | the RELOCATED `ffi.mklfft` wrappers lower identically through cuFFT | **measured on real GPU**, job **7882123** (rtx-dev, `[CudaDevice(id=0)]`): `make_flat_k_fft_ffi` and `make_gw_conv_ffi` are **bit-exact** against the live `fft_helpers` path for both directions × three norms, and all 9 gate cells pass with their RED twins |
 | multi-PROCESS meshes (production: one process per GPU) | **measured 2026-08-11** — four processes, one A100 each, mesh 2×2, the GN-PPM and Si production decks, both green (`tests/known_failures/2026-08-11-gnppm-fft-is-already-on-the-ffi.md`) |
 | multi-DEVICE meshes inside ONE process | **measured, and it FAILS** — every in-process 2×2 dies `CUFFT_EXEC_FAILED` at every size, as an uncatchable SIGABRT. Production never has this shape; `tests/harness.mesh_subprocess_env` refuses the path by name in the mesh child rather than letting it abort |
-| the service inside the production Σ driver on GPU | **measured 2026-08-11** — `sigma.tau.GW_conv_ffi` 0.032 s over 155 τ dispatches (16.5% of `sigma.tau.dispatch`, 0.07% of the driver wall) at P=4, BFC@0.85; the decomposed chain costs 0.057 s (26.4%) |
+| the service inside the production Σ driver on GPU | **measured 2026-08-11 at three scales, and the share MOVES** — at P=4/BFC@0.85, `sigma.tau.GW_conv_ffi` is 0.031 s (16.1% of `sigma.tau.dispatch`) on the 9-k `gnppm_debug` deck, 4.007 s (60.5%) at Si 4×4×4 (64 k), and 31.189 s (**84.9%**, ~28% of the driver wall) at Si 6×6×6 (216 k). Do not quote one rung as the number (`2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`) |
 | the FFT FFI beside cuSOLVERMp in one process | **measured 2026-08-11** — `w_dyson_solver = distributed` on both decks: cuSOLVERMp (n=400, n=960) and the cuFFT flat-k/gw_conv handlers in the same four processes, rc 0, and the Si deck reproduces `eqp_si_ref.dat` at max \|Δ\| = 0.0000 meV over 3840 rows |
 | an `auto` mode for `LORRAX_FFT_FFI` | **CLOSED 2026-08-01** — the FFI-required ruling makes the backend mandatory (default ON, refusal on a missing library); `auto` capability-detection was deleted from the gate contract entirely |
 

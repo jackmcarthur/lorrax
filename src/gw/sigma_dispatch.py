@@ -456,8 +456,12 @@ def compute_sigma_xc(
     #   stored/gspace → replace it with the exact FFT-grid matrix
     #   folded        → zero it (V_H is inside kin_ion's values already)
     #   isdf          → keep it
-    # The ISDF quadrature runs regardless; it is cheap next to Σ, and
+    # The ISDF quadrature runs regardless; it is cheap next to Σ AT SCALE, and
     # running it unconditionally keeps the graph shape source-independent.
+    # Sized 2026-08-11 (P=4, BFC@0.85): gw_jax.isdf is 24.4% of the driver wall
+    # against Σ's 28.6% at Si 4x4x4, and 27.7% against 41.8% at Si 6x6x6 — so
+    # "cheap next to Σ" holds where it matters and INVERTS on the gnppm_debug
+    # fixture (23.7% against 5.2%), which is a bring-up-dominated gate deck.
     source, v_h_ext = resolve_external_hartree(
         config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
     if omit_v_h:

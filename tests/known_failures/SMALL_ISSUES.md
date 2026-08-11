@@ -808,3 +808,38 @@ predates `fix/band-window-degeneracy-closure-2026-08-11` and is not caused
 by it; it fires identically in both arms of that A/B, so it does not affect
 the comparison. Not investigated further — noted so the next lane does not
 spend a leg on a false positive, or trust a true negative.
+
+## 47. Every GN-PPM timing table on disk before 2026-08-11 was taken under the `platform` allocator, and `sigma.tau.dispatch` is not comparable across the two arms (2026-08-11)
+
+`symgate444_0810/arm{A,B}/gw_*.log`, `si666_ref_0810/gw_666.log`,
+`si666_ref_0810/symgate/gw_fullbz.log` and the `si_gnppm_0809` family all
+print `XLA allocator: platform  preallocate: off  mem_fraction: 0.85`. They
+are the only Si 4×4×4 and Si 6×6×6 GN-PPM decompositions in the record, and a
+lane reaching for "the last measured sigma numbers" will land on one of them.
+
+The row that moves is `sigma.tau.dispatch`, and it moves by two orders of
+magnitude. Under `platform` the dispatch call blocks on `cuMemAlloc`, so it
+absorbs the tau kernel's device wall; under BFC it is an async submit and the
+wait lands in `sigma.tau.d2h_wait` instead. Same deck (Si 6×6×6), same P=4,
+same mesh:
+
+| row | `platform` (`gw_666.log`) | BFC@0.85 (`gnppmdecomp_0811/U3`) |
+|---|---|---|
+| `sigma.tau.dispatch` | 41.277 s | **0.189 s** |
+| `sigma.tau.d2h_wait` | 0.004 s | **29.902 s** |
+| driver wall | 96.317 s | 95.919 s |
+
+**The wall does not move** — 0.4 %, inside this deck's own noise. So at this
+scale the allocator relocates 41 s of attribution and buys nothing, because
+the device is genuinely busy. That matters because `SIGMA_PPM_CAMPAIGN.md`
+reads the same collapse on its own deck (MoS2 6×6, μ=1496) as "allocator
+churn masquerading as device work" worth "40 % of the Sigma stage" — true
+there, and **not** a fleet-wide 40 %. Whether the collapse is a saving or a
+relabelling depends on whether the device was idle, which is a per-deck
+question.
+
+Practical rule: never compare a `sigma.tau.dispatch` or `d2h_wait` number
+across two logs without checking the `XLA allocator:` line in both, and read
+`host_accum`/`d2h_wait` as the device wall on the BFC arm
+(`src/gw/ppm_accumulators.py:425`). Full ladder and adjudication:
+`tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`.

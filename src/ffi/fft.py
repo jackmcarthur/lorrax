@@ -41,11 +41,19 @@ MIND THE DENOMINATOR, and mind the tense.  These lines said "60-65% of
 (``wk_REL/FFI_EVIDENCE_AUDIT.md`` F26).  More importantly it is the number
 from BEFORE this service existed, and reading it as current is how a lane
 concludes the τ kernel is still FFT-bound and proposes wiring in the FFI that
-is already wired.  AFTER: 15.1% (decomposed) / 7.6% (fused) of the staged τ
-dispatch at nb=128/P=64 on cpu (F25), and 16.5% / 26.4% at four processes on
-A100s on the in-tree GN-PPM deck — where the whole FFT cost is 32 ms of a
-44.9 s driver wall (2026-08-11,
-``tests/known_failures/2026-08-11-gnppm-fft-is-already-on-the-ffi.md``).
+is already wired.
+
+MIND THE DECK TOO.  There is no single "after" number, because the FFT's share
+is governed by K-POINT COUNT and every figure in the record was taken at small
+nk.  Measured 2026-08-11 at P=4 on A100s, BFC@0.85, HEAD dc766220, as a share
+of the staged τ dispatch: 16.1% on the 9-k gnppm_debug fixture, 60.5% at
+Si 4x4x4 (64 k), and 84.9% at Si 6x6x6 (216 k), where the FFT is about 28% of
+the whole driver wall.  The cpu nb=128/P=64 figures (15.1% decomposed / 7.6%
+fused, F25) are a 64-k-class shape.  Cost goes as
+n_tau * nk * mu_local * N_grid log N_grid.  Quote the rung or quote none —
+a lane that took the fixture's 0.07%-of-wall as general concluded there was no
+lever on the same day the correction landed
+(``tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md``).
 
 Two entry LAYERS, and the gate reaches only one — stated because it is
 structural, not a TODO.  ``make_flat_k_*`` wraps its own ``shard_map`` and

@@ -693,7 +693,7 @@ $$\sigma^\tau_{k,m,n} = \text{project\_ri}\!\left[ \text{FFT}\!\left[ G_k(\tau) 
 
 which reuses the same flat-k pipeline as static COHSEX but with the *frequency-integrated* projection variant: `_make_project_ri_reduce_scatter` lands the output `(m_X, n_Y)`-sharded and carries **real + imaginary** channels separately so the crossing window can keep only $\text{Im}[\text{coeff} \cdot \sigma^\tau]$ without materializing a complex σ^τ.
 
-All τ nodes of a single window run inside one `jax.lax.scan` (`_get_sigma_tau_scan_kernel`) so XLA can pipeline NCCL across iterations — this is what makes the GN-PPM path competitive with static COHSEX wall-time for small ω grids.
+The τ nodes of a window run as a **Python loop**, not a `lax.scan`: the per-τ body emits NCCL, and a monolithic scan was tried and regressed MoS2 3×3 by ~80% (`ppm_sigma.py:320`, `ppm_tau_kernel.py:185`). *(This paragraph previously described a `_get_sigma_tau_scan_kernel` that does not exist and credited the reverted scan with making GN-PPM "competitive with static COHSEX wall-time" — a comparative with no measurement behind it anywhere in the corpus. Deleted 2026-08-11.)*
 
 #### 6.9.4 Projecting τ onto ω
 

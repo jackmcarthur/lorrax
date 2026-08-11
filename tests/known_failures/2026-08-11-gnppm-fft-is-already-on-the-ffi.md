@@ -1,5 +1,28 @@
 # The GN-PPM kernel's FFTs are already on the FFI, and they cost 32 ms
 
+> **CORRECTED THE SAME DAY — read this first.** Everything measured on this page
+> is reproducible and stands *on the deck it was measured on*. The
+> generalisation does not. `tests/regression/gnppm_debug` is a fixture whose
+> driver wall is 56 % bring-up and whose sigma stage is 5 % of the run, and the
+> FFT share of the tau dispatch **rises steeply with k-point count**: 16 % at
+> this deck's 9 k-points, **60 % at Si 4x4x4 (64 k)** and **85 % at Si 6x6x6
+> (216 k)**, all at four processes on A100s under BFC@0.85 at HEAD `dc766220`.
+> At Si 6x6x6 the flat-k FFT convolution is about **28 % of the driver wall**,
+> not 0.07 %. In particular the section below headed "The share is not a
+> small-deck artifact" is wrong: it is a small-deck artifact. The two decks it
+> cites as agreeing agree by coincidence — one is this fixture, the other a
+> CPU run at nb=128 — and neither varied the k-point axis that turns out to
+> govern the share.
+> Measured and adjudicated in
+> `2026-08-11-gnppm-sigma-performance-claims-adjudicated.md`; evidence
+> `/pscratch/sd/j/jackm/gnppmdecomp_0811/`.
+>
+> What this page settles and what it does not: the wiring question is still
+> answered — the FFTs *are* already on the FFI, `LORRAX_FFT_FFI=0` still
+> refuses, and both of the owner's safety conditions still hold as measured
+> here. What it got wrong is the cost, and therefore the conclusion that there
+> is no lever.
+
 2026-08-11. A claim reached this lane from the MPA session: that the GN-PPM
 kernel the MPA path uses wastes substantial time in FFT calls, and that the
 in-tree FFT FFI would likely accelerate it. The owner attached two conditions
@@ -43,17 +66,36 @@ Four processes, one A100 each, mesh 2x2, allocator BFC@0.85, HEAD `0670fd34`,
 | `sigma.exec` | 2.295 s | 0.689 s (warm compile cache; not comparable across legs) |
 | driver wall | 44.908 s | 22.972 s |
 
-The number that answers the claim is the first column's third row against its
-last: the FFTs of the whole self-energy integration are **32 ms of a 44.9 s
-run**, which is 0.07 %. Removing their cost entirely — not accelerating it,
-removing it — would return seven parts in ten thousand.
+The number that answers the claim **on this deck** is the first column's third
+row against its last: the FFTs of the whole self-energy integration are **32 ms
+of a 44.9 s run**, which is 0.07 %. Removing their cost entirely — not
+accelerating it, removing it — would return seven parts in ten thousand **here**.
 
-The share is not a small-deck artifact. The Frontera CPU campaign measured the
-same ratio at nb=128 and P=64 after the FFI landed: 15.1 % of the staged tau
-dispatch decomposed, 7.6 % fused
-(`wk_REL/FFI_EVIDENCE_AUDIT.md`, F25). Two decks three orders of magnitude
-apart in size agree that the FFT is roughly a sixth of the tau dispatch, and
-the tau dispatch is a tenth of `sigma.exec`.
+That last sentence is where this page went wrong, and it is worth naming the
+mechanism rather than just the number. `gnppm_debug` is a 9-k-point fixture; its
+sigma stage is 5 % of the driver wall and its bring-up is 56 %. Dividing a sigma
+sub-row by *that* wall answers "how much of a fixture run is this", which is not
+what anybody asking about sigma means. On the Si 6x6x6 deck the same division
+gives ~28 %. See the correction banner at the top.
+
+~~The share is not a small-deck artifact.~~ **IT IS.** The Frontera CPU
+campaign measured 15.1 % of the staged tau dispatch decomposed and 7.6 % fused
+at nb=128/P=64 (`wk_REL/FFI_EVIDENCE_AUDIT.md`, F25), and this lane read 16.5 %
+here, and the agreement between those two numbers was taken as evidence that
+the ratio is scale-free. It is not. Both decks are small in the axis that
+matters — **k-points** — and neither varied it. Measured across a three-rung
+ladder at four processes on A100s, BFC@0.85, HEAD `dc766220`:
+
+| deck | k (full BZ) | centroids | FFT share of the staged tau dispatch |
+|---|---|---|---|
+| `gnppm_debug` (this page) | 9 | 399 | **16.1 %** |
+| Si 4x4x4 | 64 | 1128 | **60.5 %** |
+| Si 6x6x6 | 216 | 1104 | **84.9 %** (85.7 % decomposed) |
+
+and the tau dispatch is a tenth of `sigma.exec` **here only** — at Si 6x6x6 the
+tau kernel's device wall is 83 % of `sigma.exec`. The cost goes as
+`n_tau · nk · mu_local · N_grid log N_grid`, so the k-point count is the axis
+that governs it and the one every prior measurement held small.
 
 What the claim was probably remembering is the number from *before* the FFI:
 65 % of the staged tau dispatch went to FFT-adjacent layout churn on XLA:CPU
