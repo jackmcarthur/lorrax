@@ -733,6 +733,148 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	}
 
 
+def zeta_fit_band_ranges(band_slices, zeta_nband, *, log=print):
+	"""The two band ranges the ISDF ζ fit runs on: ``(left, right)``.
+
+	``left = (b0, b3)`` ("all val + sigma cond") and ``right = (b1, b4)``
+	("sigma val + all cond") — the pair density needs asymmetric ranges — for
+	every deck written before 2026-08-11, and for every deck since that does
+	not name ``zeta_nband``.  ``zeta_nband is None`` returns exactly those two
+	tuples and nothing else happens here, which is what makes the default
+	bit-identical: ``b4`` is the PADDED edge and is passed through untouched.
+
+	THE DECOUPLING.  ``b4`` is the top of the χ0/Σ band sum AND, until today,
+	the top of the window ζ was fitted on.  The two want opposite things.  The
+	fit wants a NARROW window: the per-Q ζ refit ``bse.exciton_bands`` runs for
+	a dense exciton band path reaches its target Q through an htransform
+	Galerkin representation whose rank bound is ``n_μ·n_s ≥ nk·nb``, and on the
+	Si 4×4×4 / 2628-centroid parent the measured capacity point is nb ≈ 52
+	(``build_fH_R``'s orthonormality gate reads 3.44e-07 at nb 52 against a
+	1.0e-06 cap, and 3.47e-06 at nb 60).  The band sum wants a WIDE one.  With
+	one key for both, narrowing ``nband`` to serve the fit also truncated the
+	sum — ``BandSlices`` requires b3 ≤ b4, so ``ncond`` had to come down with
+	it — and moved every quasiparticle level by ~222 meV median over the 4v8c
+	window (48 meV in the direct gap) for reasons that are not about the ζ
+	basis at all (``tests/known_failures/2026-08-11-narrowed-zeta-window-\
+clears-fh-and-the-tile-null-still-refuses.md`` §3).
+
+	``zeta_nband`` narrows ONLY the fit; the caller's ``band_slices`` — and so
+	χ0, Σ and the restart bundle's band axis — are untouched.
+
+	THE PAD IS DELIBERATELY NOT RE-APPLIED.  ``b4`` is
+	``round_up(nband, world_size)`` because the band axis has to divide the
+	device mesh for the sharded readers that FILL it.  This edge only SLICES an
+	array that already exists, and rounding it up would move a
+	degeneracy-checked edge to a different, unchecked one whenever the world
+	size changed — a physical band window that depends on the process count is
+	exactly what ``Meta``'s own pad note is careful to keep out of the physics.
+	A requested edge is honoured exactly or refused.
+	"""
+	left = (band_slices.b0, band_slices.b3)
+	right = (band_slices.b1, band_slices.b4)
+	if zeta_nband is None:
+		return left, right
+	b4_zeta = int(zeta_nband)
+	if not (band_slices.b1 < b4_zeta <= band_slices.b4):
+		raise ValueError(
+			f"zeta_nband={b4_zeta} is outside the band window this run holds: "
+			f"the ζ fit's right range starts at b1={band_slices.b1} and the "
+			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
+			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
+			f"window; it cannot move it outside the loaded bands.")
+	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
+	right = (band_slices.b1, b4_zeta)
+	log(f"    ζ-fit window DECOUPLED from the band sum: zeta_nband="
+	    f"{b4_zeta} (nband/b4={band_slices.b4}).  χ0/Σ still sum "
+	    f"[{band_slices.b0}, {band_slices.b4}); ζ is fitted on left {left} "
+	    f"x right {right}.")
+	if band_slices.b3 > b4_zeta:
+		log(f"    *** zeta_nband={b4_zeta} is BELOW the Σ evaluation window's "
+		    f"top b3={band_slices.b3}.  Quasiparticle energies for bands "
+		    f"[{b4_zeta}, {band_slices.b3}) are then built on pair densities "
+		    f"whose bra leg was never fitted — the ζ basis is EXTRAPOLATED "
+		    f"there.  Lower ncond to {b4_zeta - band_slices.b2} if those "
+		    f"bands are wanted. ***")
+	return left, right
+
+
+def check_zeta_fit_windows(energies, band_range_left, band_range_right,
+                           zeta_nband, *, log=print):
+	"""ARE THESE TWO WINDOWS POINT-GROUP-INVARIANT SUBSPACES?
+
+	The guard already exists — ``common.band_degeneracy`` — and the BSE has
+	called it since 2026-08-10.  The ζ fit never did, and this is the seam
+	where it matters most: ζ is what the IBZ cascade unfolds, so a window that
+	is not invariant here breaks the k-star identity for EVERY object built on
+	ζ, W included, and Σ_x first of all.
+
+	Why a rotation is the reason: the cascade builds the full BZ by rotating
+	the wedge, and a rotation sends ψ_n(k) into a combination of its
+	DEGENERATE PARTNERS at Sk.  A window containing half a multiplet therefore
+	has a rotation image that leaves it, and the pair space it represents is
+	not invariant.  This is ``common/rank_criterion``'s story one index over —
+	except that a band degeneracy is EXACT, so unlike a spectral cut there is
+	no tolerance to tune.
+
+	MEASURED, Si 6×6×6, on the stock windows (nval 8 / ncond 52 / nband 60 →
+	left [0,60), right [0,60)); the top edge cuts a 4-fold manifold (bands
+	59..62) at 4 of the 16 wedge k, keeping 2 and dropping 2:
+
+	    nband=60 (open)     Σ_x star spread 0.0640 meV   Σ_c 38.785 meV
+	    nband=68 (closed)   Σ_x star spread 0.0000 meV   Σ_c  0.083 meV
+
+	and λ_max(C_q) — an exact star invariant — goes from star-constant only to
+	1e-4 to star-constant to 1e-10, which is the 4×4×4 anchor's own level.  The
+	ζ rank truncation still fires on all 216 q in the closed arm, which is what
+	rules the truncation out as the cause.
+	``tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md``
+
+	MODE, AND WHY IT IS NOT UNIFORM.  ``snap`` means "say so loudly and
+	continue" — the report-only twin has nothing to widen, so it degrades to a
+	warning by design — and it is a GRANDFATHER CLAUSE for the edges the tree's
+	existing decks already sit on.  Those arrive through ``nband``/``ncond``,
+	were chosen before this check existed, and flipping them to ``strict``
+	would refuse every one that happens to slice; that census has not been run.
+	Owner row.
+
+	The ``zeta_nband`` edge has no such decks.  Naming the key is an explicit,
+	brand-new request for a specific edge, so it is checked the way the BSE has
+	checked its own windows since 2026-08-10 and it REFUSES
+	(``BandWindowDegeneracyError``, naming the band and the gap).  It matters
+	most exactly here: on a spin-orbit deck every band is a Kramers pair, so
+	every ODD edge splits one — Si 4×4×4 gives 53, 55 and 57 at exactly
+	0.000 meV — and several even edges split a 4- or 6-fold irrep at
+	high-symmetry k (50, 54 and 56, the last at 0.259 meV).  52 clears by
+	6.870 meV and is the only legal edge at or below 57 on that deck.
+	"""
+	if energies is None:
+		log("  [band window] closure NOT CHECKED: this loader exposes no "
+		    "`energies`.  That is an absence, not a pass.")
+		return
+	from common import band_degeneracy as _bd
+	enk = np.asarray(energies)[0]
+	gaps = _bd.boundary_min_gaps(enk)
+	for lo, hi, what in (
+			(band_range_left[0], band_range_left[1], "ISDF left window"),
+			(band_range_right[0], band_range_right[1], "ISDF right window")):
+		strict = (zeta_nband is not None and int(hi) == int(zeta_nband))
+		_bd.check_band_window(
+			enk, int(lo), int(hi), mode=("strict" if strict else "snap"),
+			log=log,
+			where=(f"{what} (the ζ fit's pair space)"
+			       + (f" — deck key zeta_nband={zeta_nband}"
+			          if strict else "")))
+	# Print the number even when it is fine: "no news" and "a good number"
+	# must not look alike (preamble measurement rule 10).
+	edges = sorted({int(band_range_left[1]), int(band_range_right[0]),
+	                int(band_range_right[1])})
+	log("    ζ band-window closure: " + ", ".join(
+		f"edge {b} min gap {gaps[b] * 13605.693122994:.3g} meV"
+		if b < len(gaps) and np.isfinite(gaps[b])
+		else f"edge {b} exempt (cuts nothing)"
+		for b in edges))
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
@@ -751,65 +893,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# through every call would be churn for no benefit).
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
 
-	# ISDF left/right band windows (pair density needs asymmetric ranges)
-	band_range_left = (band_slices.b0, band_slices.b3)   # all val + sigma cond
-	band_range_right = (band_slices.b1, band_slices.b4)   # sigma val + all cond
-
-	# ── ARE THESE TWO WINDOWS POINT-GROUP-INVARIANT SUBSPACES? ──────────
-	# The guard already exists — ``common.band_degeneracy`` — and the BSE
-	# has called it since 2026-08-10.  The ζ fit never did, and this is the
-	# seam where it matters most: ζ is what the IBZ cascade unfolds, so a
-	# window that is not invariant here breaks the k-star identity for
-	# EVERY object built on ζ, W included, and Σ_x first of all.
-	#
-	# Why a rotation is the reason: the cascade builds the full BZ by
-	# rotating the wedge, and a rotation sends ψ_n(k) into a combination of
-	# its DEGENERATE PARTNERS at Sk.  A window containing half a multiplet
-	# therefore has a rotation image that leaves it, and the pair space it
-	# represents is not invariant.  This is ``common/rank_criterion``'s
-	# story one index over — except that a band degeneracy is EXACT, so
-	# unlike a spectral cut there is no tolerance to tune.
-	#
-	# MEASURED, Si 6×6×6, the two ISDF windows above (nval 8 / ncond 52 /
-	# nband 60 → left [0,60), right [0,60)); the top edge cuts a 4-fold
-	# manifold (bands 59..62) at 4 of the 16 wedge k, keeping 2 and
-	# dropping 2:
-	#     nband=60 (open)     Σ_x star spread 0.0640 meV   Σ_c 38.785 meV
-	#     nband=68 (closed)   Σ_x star spread 0.0000 meV   Σ_c  0.083 meV
-	# and λ_max(C_q) — an exact star invariant — goes from star-constant
-	# only to 1e-4 to star-constant to 1e-10, which is the 4×4×4 anchor's
-	# own level.  The ζ rank truncation still fires on all 216 q in the
-	# closed arm, which is what rules the truncation out as the cause.
-	# tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md
-	#
-	# MODE.  ``snap`` here means "say so loudly and continue" — the
-	# report-only twin has nothing to widen, so it degrades to a warning by
-	# design.  ``strict`` is the RIGHT end state and is a one-word change,
-	# but flipping it would refuse every deck in the tree whose window
-	# happens to slice, and that census has not been run.  Owner row.
-	_en = getattr(wfn, "energies", None)
-	if _en is None:
-		print_fn("  [band window] closure NOT CHECKED: this loader exposes "
-		         "no `energies`.  That is an absence, not a pass.")
-	else:
-		from common import band_degeneracy as _bd
-		_enk = np.asarray(_en)[0]
-		_gaps = _bd.boundary_min_gaps(_enk)
-		for _lo, _hi, _what in (
-				(band_range_left[0], band_range_left[1], "ISDF left window"),
-				(band_range_right[0], band_range_right[1], "ISDF right window")):
-			_bd.check_band_window(
-				_enk, int(_lo), int(_hi), mode="snap", log=print_fn,
-				where=f"{_what} (the ζ fit's pair space)")
-		# Print the number even when it is fine: "no news" and "a good
-		# number" must not look alike (preamble measurement rule 10).
-		_edges = sorted({int(band_range_left[1]), int(band_range_right[0]),
-		                 int(band_range_right[1])})
-		print_fn("    ζ band-window closure: " + ", ".join(
-			f"edge {b} min gap {_gaps[b] * 13605.693122994:.3g} meV"
-			if b < len(_gaps) and np.isfinite(_gaps[b])
-			else f"edge {b} exempt (cuts nothing)"
-			for b in _edges))
+	# ISDF left/right band windows (pair density needs asymmetric ranges),
+	# and the ``zeta_nband`` decoupling if the deck asked for one.
+	band_range_left, band_range_right = zeta_fit_band_ranges(
+		band_slices, getattr(cfg, "zeta_nband", None), log=print_fn)
+	check_zeta_fit_windows(
+		getattr(wfn, "energies", None), band_range_left, band_range_right,
+		getattr(cfg, "zeta_nband", None), log=print_fn)
 
 	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
 	# picked once by ``plan_gflat_chunks`` in the caller and live in

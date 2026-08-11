@@ -778,6 +778,32 @@ _DEFAULTS = {
     "nval": 5,
     "ncond": 5,
     "nband": 100,
+    # ζ-FIT BAND-WINDOW TOP, decoupled from the χ0/Σ band-sum top
+    # (2026-08-11).  ``None`` (the default) means "follow ``nband``", which
+    # is what this axis did for its whole history and what keeps every
+    # existing deck bit-identical — the ζ fit's right band range is then
+    # ``(b1, b4)`` exactly as before, PADDED extent and all.
+    #
+    # WHY IT EXISTS.  ``nband`` served two unrelated jobs: the top of the
+    # χ0/Σ band sum (``b4``) and the top of the window ζ is fitted on.  The
+    # ζ fit wants a NARROW window on an over-complete centroid set — the
+    # htransform Galerkin leg the BSE's per-Q refit runs needs
+    # ``n_μ·n_s ≥ nk·nb``, and on the Si 4×4×4 / 2628-centroid lineage the
+    # measured capacity point is nb ≈ 52 — while the band sum wants a WIDE
+    # one.  With one key for both, narrowing the fit window truncated the
+    # band sum by the same eight bands and moved every quasiparticle level
+    # by ~222 meV (median over the 4v8c window; 48 meV in the direct gap),
+    # which is not a ζ-basis effect at all.  Set this instead and the band
+    # sum keeps its bands.
+    #
+    # It only ever NARROWS: ``zeta_nband > nband`` is refused, because the
+    # centroid ψ is loaded once over ``[b0, b4)`` and there is nothing above
+    # b4 to fit.  Its edge takes a STRICT ``band_degeneracy`` check (an
+    # explicit request is a new deck, so there is no census to grandfather):
+    # a ζ-fit window that splits a multiplet fits half of an irrep, and ζ is
+    # what the IBZ cascade unfolds.  See the ``nband`` entry in
+    # docs/input_reference.md and gw.gw_init.fit_zeta.
+    "zeta_nband": None,
     "sys_dim": 2,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
     # instead of rotating the fixed DFT one into the QP basis.  Off keeps
@@ -1437,6 +1463,14 @@ _NORMALIZE_STR = {
 # ``default is None`` otherwise means "nullable float".
 _NULLABLE_BOOL = frozenset()
 
+#: Keys whose default is ``None`` ("unset") but whose explicit value is an
+#: INTEGER.  Same role ``_NULLABLE_BOOL`` plays for tri-state booleans: the
+#: parse loop's ``default is None`` branch otherwise means "nullable float",
+#: and a band edge that parsed as ``52.0`` — or, worse, accepted ``52.5``
+#: and silently truncated it — is a band edge nobody can reason about.  A
+#: non-integral value raises out of ``configparser.getint`` by name.
+_NULLABLE_INT = frozenset({"zeta_nband"})
+
 #: Reserved slot in the params dict holding the set of deck keys the DECK
 #: named.  Leading underscore because it is not a deck key and must never
 #: match one: ``read_lorrax_input`` builds params from ``_DEFAULTS.items()``
@@ -1709,6 +1743,8 @@ def read_lorrax_input(filename: str) -> dict:
                 # value parses as bool.  Currently EMPTY — the last member
                 # (``use_ffi_io``) became a legacy key on 2026-08-06.
                 params[key] = section.getboolean(key)
+            elif key in _NULLABLE_INT:
+                params[key] = section.getint(key)
             elif isinstance(default, bool):
                 params[key] = section.getboolean(key)
             elif isinstance(default, int):
@@ -2127,6 +2163,10 @@ class LorraxConfig:
     nval: int
     ncond: int
     nband: int
+    #: ζ-fit band-window top.  ``None`` == follow ``nband`` (every deck
+    #: written before 2026-08-11); an int NARROWS the ζ fit's band ranges
+    #: without touching ``b4``, the χ0/Σ band-sum top.  See ``_DEFAULTS``.
+    zeta_nband: int | None
     sys_dim: int
     density_self_consistent: bool
     sc_on_ibz: bool
@@ -2724,11 +2764,33 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
+        # ζ-fit window top.  Empty / unset / equal-to-nband all collapse to
+        # None — "follow nband" — so the decoupled branch in
+        # ``gw.gw_init.fit_zeta`` is not entered at all and the fit is
+        # bit-identical (b4 is the PADDED edge; a redundant zeta_nband=nband
+        # must not silently un-pad it).
+        _zeta_nband_raw = _g("zeta_nband")
+        if _zeta_nband_raw in (None, ""):
+            _zeta_nband = None
+        else:
+            _zeta_nband = int(_zeta_nband_raw)
+            if _zeta_nband < 1 or _zeta_nband > int(_g("nband")):
+                raise ValueError(
+                    f"zeta_nband={_zeta_nband} must be in [1, nband="
+                    f"{int(_g('nband'))}].  It NARROWS the band window ζ is "
+                    f"fitted on; it cannot widen it, because the centroid ψ "
+                    f"this run loads spans [b0, b4) and there are no bands "
+                    f"above b4 to fit.  Raise nband if you want more bands in "
+                    f"the fit AND in the chi0/Sigma band sum.")
+            if _zeta_nband == int(_g("nband")):
+                _zeta_nband = None
+
         return cls(
             # Top-level: system + mode flags
             nval=int(_g("nval")),
             ncond=int(_g("ncond")),
             nband=int(_g("nband")),
+            zeta_nband=_zeta_nband,
             sys_dim=int(_g("sys_dim")),
             density_self_consistent=bool(_g("density_self_consistent")),
             sc_on_ibz=bool(_g("sc_on_ibz")),

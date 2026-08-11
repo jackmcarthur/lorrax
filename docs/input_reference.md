@@ -33,7 +33,8 @@ page has to read it from.
 |---|---|---|
 | `nval` | `5` | Interior valence edge of the sigma window: b1 = nelec - nval (gates the ISDF pair-density right window, not the QP window bottom). |
 | `ncond` | `5` | Conduction bands in the sigma/QP window; sigma diagonals are computed for [0, nelec+ncond). |
-| `nband` | `100` | chi0/Sigma band-sum top b4, rounded up to the world size (pads are zeroed). |
+| `nband` | `100` | chi0/Sigma band-sum top b4, rounded up to the world size (pads are zeroed). Sets the zeta-fit window top too unless `zeta_nband` narrows it. |
+| `zeta_nband` | None | Top of the band window the ISDF zeta fit runs on, DECOUPLED from the chi0/Sigma band-sum top. Unset (the default) = follow `nband`, which is bit-identical to every deck written before 2026-08-11. An integer ≤ `nband` narrows the fit's left/right band ranges only: chi0 and Sigma keep summing [b0, b4). It exists because the two want opposite windows — the per-Q zeta refit behind a dense exciton band path needs `n_mu*n_s >= nk*nb` for its htransform Galerkin leg (Si 4×4×4 / 2628 centroids: nb ≈ 52) while the band sum wants every band it can get, and narrowing `nband` to serve the fit cost 222 meV per quasiparticle level for reasons unrelated to the zeta basis. The edge takes a STRICT `band_degeneracy` check and REFUSES on a split multiplet — on a spin-orbit deck every odd edge splits a Kramers pair. |
 | `sys_dim` | `2` | System dimensionality (2 = slab): selects the Coulomb truncation. |
 | `ecutrho` | None | Density-grid cutoff (Ry) for the psp tools (kin_ion/dipole); None = the WFN's own ecutwfc. |
 | `bispinor` | false | Bispinor (4-spinor) run: 4-channel zeta-fit, Sigma^B transverse channels, two centroid files. |

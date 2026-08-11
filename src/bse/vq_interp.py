@@ -2298,8 +2298,10 @@ def exciton_evs(zx, D, Hdir, B, nstate=4):
 #          m-leg from htransform: u_m(r) = Σ_α c_{m,wrap(k−q)}[α] B_full[α](r))
 #     C_Q[μν] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r_ν)
 #     Z_Q[μr] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r)
-#     ζ̃_Q    = (C_Q + 1e-14·|tr C_Q|·I)⁻¹ Z_Q          (producer ridge,
-#               isdf.core._ridged_chol; Cholesky + two triangular solves)
+#     ζ̃_Q    = C_Q⁺ Z_Q                                (THE PRODUCER'S SOLVE:
+#               isdf.core.solve_zeta_charge_dense at the charge_zeta_solve
+#               and zeta_rcond THIS BUNDLE'S ζ was fitted with, read from
+#               its own isdf_header/fit_provenance — see _zeta_solve_of)
 #     ζ̃_Q(G) = FFT_r ζ̃_Q  gathered on the sphere |bᵀ(q+G)|² ≤ cutoff
 #     V_Q    = Σ_G conj(ζ̃(G)) v(q+G) ζ̃(G)
 #
@@ -2308,10 +2310,95 @@ def exciton_evs(zx, D, Hdir, B, nstate=4):
 # fit-scale GEMM chain per Q.  It is the EXPENSIVE mode by design; the
 # fixture-scale target is 1 GPU, minutes per Q.
 
+def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
+    """The producer's ζ-fit stamp off ``zeta_q.h5``; ``None`` if absent.
+
+    ``isdf_header/fit_provenance`` is a JSON string written by
+    ``gw.gw_init._zeta_fit_provenance`` AFTER ``mark_zeta_done``, so its
+    presence means the ζ on disk is both complete and described.  THE BUNDLE
+    IS THE TRUTH: it records the EFFECTIVE (post-``LORRAX_ZETA_RCOND``)
+    conditioning knobs and the EXACT band windows the fit ran on, which is
+    what a refit reproducing that fit needs — the deck beside it may have
+    moved, and on a decoupled ``zeta_nband`` run the deck's band window is
+    not the ζ-fit window at all.
+
+    Scalar metadata through serial h5py (:func:`file_io.read_isdf_header`),
+    safe on every rank before any tensor moves — same contract as
+    ``read_coulomb_policy_from_h5``.
+    """
+    import json
+
+    from file_io.isdf_header import read_isdf_header
+    try:
+        prov = read_isdf_header(zeta_file).fit_provenance
+    except (OSError, KeyError, ValueError):
+        return None
+    if not prov:
+        return None
+    try:
+        out = json.loads(prov)
+    except ValueError:
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float, float]:
+    """``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit on disk.
+
+    The three values ``isdf.core.solve_zeta_charge_dense`` needs to redo the
+    producer's ζ solve.  ``zeta_rcond``/``zeta_ridge`` are stored as the
+    provenance's own strings (``repr(value)``, or the raw env string when the
+    deprecated env twin won — ``isdf.core.deprecated_env_record``), so they
+    parse as floats either way and they are the EFFECTIVE values, which is
+    the whole point of reading them here instead of off the deck.
+    """
+    kind = str(prov.get("charge_zeta_solve", "")).strip().lower()
+    if kind not in ("rank_truncate", "cholesky"):
+        raise SystemExit(
+            f"exciton_bands --vq-mode=refit: {zeta_file} records "
+            f"charge_zeta_solve={prov.get('charge_zeta_solve')!r}, which is "
+            f"not a charge-channel ζ solve this refit can reproduce.  The "
+            f"refit must run the SAME solve the producer ran; it will not "
+            f"guess one.")
+    try:
+        rcond = float(prov["zeta_rcond"])
+        ridge = float(prov.get("zeta_ridge", 0.0))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"exciton_bands --vq-mode=refit: {zeta_file}'s fit_provenance "
+            f"does not carry a parseable zeta_rcond/zeta_ridge "
+            f"({prov.get('zeta_rcond')!r} / {prov.get('zeta_ridge')!r}).  "
+            f"Those are the conditioning knobs ζ was fitted under and the "
+            f"refit reproduces them exactly; it has no default for them."
+        ) from exc
+    return kind, rcond, ridge
+
+
+def _zeta_fit_window_of(prov: dict) -> tuple[int, int] | None:
+    """The ABSOLUTE band window ζ was fitted on, or ``None`` when the two
+    halves of the pair density do not share one.
+
+    The producer fits ``ρ_mn`` with m from ``band_range_left`` and n from
+    ``band_range_right`` — ``(b0, b3)`` and ``(b1, b4)`` on a stock deck.
+    The refit fits a SYMMETRIC window (one band axis, both legs), so it can
+    only reproduce ζ when those two ranges coincide; when they do not, this
+    returns ``None`` and the caller keeps the historical behaviour of fitting
+    the whole stored band axis.  On every deck the tile null has ever passed
+    on, ``nval == nelec`` and ``ncond == nband − nelec`` make them coincide.
+    """
+    try:
+        bl = [int(v) for v in prov["band_range_left"]]
+        br = [int(v) for v in prov["band_range_right"]]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (bl[0], bl[1]) if bl == br else None
+
+
 def refit_window_view(zx, band_range, log_fn=print,
                       degeneracy_mode: str = "strict",
-                      degeneracy_tol_ry: float | None = None):
-    """A band-axis VIEW of ``zx`` on a SUB-WINDOW of the ζ-fit window.
+                      degeneracy_tol_ry: float | None = None,
+                      window_mode: str = "bse"):
+    """A band-axis VIEW of ``zx`` on a SUB-WINDOW of the stored band axis.
 
     THE REFIT DOES NOT HAVE TO FIT THE WHOLE ζ-FIT WINDOW.  ``refit_vq``
     re-fits ζ at the target q from the pair densities of whatever band window
@@ -2352,14 +2439,28 @@ def refit_window_view(zx, band_range, log_fn=print,
     anything.  Edges that coincide with the ζ-fit window's own edges are
     boundaries of the calculation, not cuts, and are skipped by
     :func:`common.band_degeneracy.check_band_window` itself.
+
+    ``window_mode`` LABELS the slice, and only the label: the arithmetic is
+    the same either way.  ``"bse"`` is the narrowing above — ζ' ≠ ζ, tile null
+    off, contracted gate on.  ``"zeta"`` is the OTHER caller (2026-08-11): on a
+    bundle whose deck decoupled ``zeta_nband`` from ``nband``, the producer's ζ
+    was fitted on a STRICT SUB-WINDOW of the ``psi_full_y`` band axis, so
+    reaching the producer's own window is itself a slice — and there the tile
+    null is exactly the right gate and stays armed.  Passing the wrong label
+    would print the wrong certification story next to a correct number, which
+    is the failure mode this argument exists to prevent.
     """
     from common.band_degeneracy import DEGENERACY_TOL_RY, check_band_window
 
+    if window_mode not in ("zeta", "bse"):
+        raise SystemExit(
+            f"refit_window_view: window_mode={window_mode!r} is not 'zeta' "
+            f"or 'bse'.")
     b_lo, b_hi = int(band_range[0]), int(band_range[1])
     fr = zx.get("_h5_restart")
     if fr is None or "band_window" not in fr:
         raise SystemExit(
-            f"exciton_bands --refit-window=bse: {zx.get('restart_file')} "
+            f"exciton_bands --refit-window={window_mode}: {zx.get('restart_file')} "
             f"carries no ``band_window`` stamp, so the deck's absolute band "
             f"range ({b_lo}, {b_hi}) cannot be located inside the stored "
             f"psi_full_y's {zx['nb']}-band ζ-fit window.  Without that offset "
@@ -2372,14 +2473,14 @@ def refit_window_view(zx, band_range, log_fn=print,
     z_lo, z_hi = bw[0], bw[4]
     if (z_hi - z_lo) != int(zx["nb"]):
         raise SystemExit(
-            f"exciton_bands --refit-window=bse: the restart's band_window "
+            f"exciton_bands --refit-window={window_mode}: the restart's band_window "
             f"stamp {tuple(bw)} spans {z_hi - z_lo} bands but psi_full_y "
             f"carries nb={zx['nb']}.  The stamp and the tensor disagree about "
             f"the window they were written under, so no slice of the band "
             f"axis can be trusted.")
     if not (z_lo <= b_lo < b_hi <= z_hi):
         raise SystemExit(
-            f"exciton_bands --refit-window=bse: the deck's band window "
+            f"exciton_bands --refit-window={window_mode}: the deck's band window "
             f"[{b_lo}, {b_hi}) is not contained in the bundle's ζ-fit window "
             f"[{z_lo}, {z_hi}).  The refit fits ζ' from the STORED "
             f"psi_full_y, so it can only narrow that window, never reach "
@@ -2400,13 +2501,21 @@ def refit_window_view(zx, band_range, log_fn=print,
     zw["enk"] = np.asarray(zx["enk"])[:, lo:hi]
     zw["nb"] = hi - lo
     zw["_refit_window_abs"] = (b_lo, b_hi)
-    log_fn(f"  [refit] BSE-WINDOW refit: ζ' is re-fitted on absolute bands "
-           f"[{b_lo}, {b_hi}) ({hi - lo} of the ζ-fit window's {zx['nb']}), "
-           f"so the Galerkin rank bound is nk·nb = {zx['nk']}·{hi - lo} = "
-           f"{zx['nk'] * (hi - lo)} instead of {zx['nk'] * zx['nb']}.  ζ' is "
-           f"NOT the producer's ζ and the stored V_qmunu tiles will NOT come "
-           f"back — the certification is the contracted on-grid eigenvalue "
-           f"gate in exciton_bands, not the tile null.")
+    _shape = (f"ζ' is re-fitted on absolute bands [{b_lo}, {b_hi}) "
+              f"({hi - lo} of psi_full_y's {zx['nb']}), so the Galerkin rank "
+              f"bound is nk·nb = {zx['nk']}·{hi - lo} = "
+              f"{zx['nk'] * (hi - lo)} instead of {zx['nk'] * zx['nb']}.")
+    if window_mode == "bse":
+        log_fn(f"  [refit] BSE-WINDOW refit: {_shape}  ζ' is NOT the "
+               f"producer's ζ and the stored V_qmunu tiles will NOT come "
+               f"back — the certification is the contracted on-grid "
+               f"eigenvalue gate in exciton_bands, not the tile null.")
+    else:
+        log_fn(f"  [refit] ζ-FIT-WINDOW refit on a DECOUPLED bundle: "
+               f"{_shape}  That window IS the producer's own "
+               f"(zeta_nband < nband, read from the ζ file's "
+               f"fit_provenance), so ζ' is the producer's ζ and the tile "
+               f"null stays armed as the gate.")
     return zw
 
 
@@ -2428,11 +2537,37 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                                  zero-padded on r to a multiple of r_chunk
       B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r
       n_rtot, r_chunk, galerkin_rel — bookkeeping + printed residual
+      zeta_solve  ``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit
+          on disk — read from the ζ file's own ``isdf_header/fit_provenance``
+          and NOT from the deck.  ``refit_vq`` refuses without it.
     """
     from gw.gw_config import read_lorrax_input
     from bandstructure.htransform import initialize_wfns
     from common.wfn_transforms import iter_psi_rchunk_bandwise
 
+    # THE ζ SOLVE, BEFORE ANYTHING EXPENSIVE.  A refit whose solve does not
+    # match the producer's cannot reproduce the producer's tiles no matter how
+    # good its ψ representation is (five parents, §4 of
+    # tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-and-the-\
+    # tile-null-still-refuses.md), so the fit stamp is read first and the run
+    # refuses here rather than after the htransform.
+    _prov = read_zeta_fit_provenance(zx["zeta_file"])
+    if _prov is None:
+        raise SystemExit(
+            f"exciton_bands --vq-mode=refit: {zx['zeta_file']} carries no "
+            f"``isdf_header/fit_provenance``, so the ζ solve it was fitted "
+            f"with — charge_zeta_solve, zeta_rcond, zeta_ridge — is unknown. "
+            f"The refit re-solves the SAME system at the target Q and must "
+            f"use the SAME solve: a plain ridged Cholesky keeps the near-null "
+            f"directions the producer's rank truncation discarded and V_Q is "
+            f"quadratic in them.  The stamp is written by gw.gw_init after "
+            f"the fit completes; re-run the ζ fit to get a stamped file, or "
+            f"use --vq-mode=ongrid, which needs no refit.")
+    _zeta_solve = _zeta_solve_of(_prov, zx["zeta_file"])
+    log_fn(f"  [refit] ζ solve = THE PRODUCER'S: {_zeta_solve[0]} at "
+           f"zeta_rcond={_zeta_solve[1]:.3e}, zeta_ridge={_zeta_solve[2]:.3e} "
+           f"(read from {os.path.basename(zx['zeta_file'])} "
+           f"isdf_header/fit_provenance, not from the deck)")
     params = read_lorrax_input(input_file)
     (wfn, sym, meta, _, _S, ctilde, B_at_mu, enk_sigma,
      W_proj) = initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy,
@@ -2468,7 +2603,45 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         # the driver's contracted eigenvalue gate is the certification.
         zx = refit_window_view(zx, band_range, log_fn=log_fn,
                                degeneracy_mode=degeneracy_mode,
-                               degeneracy_tol_ry=degeneracy_tol_ry)
+                               degeneracy_tol_ry=degeneracy_tol_ry,
+                               window_mode="bse")
+    else:
+        # THE ζ-FIT WINDOW IS WHAT THE PRODUCER'S STAMP SAYS IT IS, not what
+        # psi_full_y's extent says.  Those were the same object until the
+        # 2026-08-11 ``zeta_nband`` decoupling: ``nband`` used to set BOTH the
+        # χ0/Σ band-sum top ``b4`` and the top of the ζ fit's own band ranges,
+        # so the stored band axis and the ζ-fit window could not differ.  With
+        # ``zeta_nband < nband`` the producer fits ζ on a strict SUB-window of
+        # the band axis it then stores, and a refit that fitted the whole axis
+        # would be fitting a DIFFERENT ζ — with every shape still matching,
+        # which is how this would go unnoticed.  The slice is the same one
+        # ``--refit-window=bse`` takes; the difference is that this window IS
+        # the producer's, so the tile null remains the gate.
+        _zw = _zeta_fit_window_of(_prov)
+        if _zw is not None and (_zw[1] - _zw[0]) != int(zx["nb"]):
+            zx = refit_window_view(zx, _zw, log_fn=log_fn,
+                                   degeneracy_mode=degeneracy_mode,
+                                   degeneracy_tol_ry=degeneracy_tol_ry,
+                                   window_mode="zeta")
+        if _zw is not None and (int(band_range[0]), int(band_range[1])) != _zw:
+            # LENGTH IS NOT IDENTITY.  The check below compares band COUNTS,
+            # so a deck whose window has the right width at the wrong origin
+            # would sail through it and fit ζ' on the wrong bands with no
+            # shape error anywhere.  The producer wrote down which bands;
+            # compare against those.
+            raise SystemExit(
+                f"exciton_bands --refit-window=zeta: the deck's band window "
+                f"[{band_range[0]}, {band_range[1]}) (nelec−nval, nelec+ncond) "
+                f"is not the window the producer fitted ζ on, which "
+                f"{os.path.basename(zx['zeta_file'])}'s fit_provenance records "
+                f"as [{_zw[0]}, {_zw[1]}).  The refit reproduces the "
+                f"producer's ζ from the pair densities of the producer's "
+                f"window, so it has to BE that window.  Set the deck's "
+                f"nval/ncond to reach exactly [{_zw[0]}, {_zw[1]}) — on a "
+                f"decoupled bundle (zeta_nband < nband) that is "
+                f"nval+ncond = {_zw[1] - _zw[0]}, NOT nband — or run "
+                f"--refit-window=bse, which fits ζ' on the deck's window and "
+                f"certifies on the contracted object instead.")
     if nb != zx["nb"]:
         raise SystemExit(
             f"exciton_bands --vq-mode=refit: the htransform band window is "
@@ -2534,6 +2707,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
            f"(refit-vs-stored on-grid floor is bounded by this)")
     return {"zx_fit": zx, "window_mode": window_mode,
             "window_abs": (int(band_range[0]), int(band_range[1])),
+            "zeta_solve": _zeta_solve,
             "ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
             "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
@@ -2652,13 +2826,26 @@ def _sphere_millers(zx, qw):
 _REFIT_KERNELS: dict = {}
 
 
-def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk):
+def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk, zeta_solve):
     """Jitted refit chunk kernels, cached on the (shape) signature so every
-    refit Q after the first is dispatch-only (per-q-recompile lesson)."""
-    key = (nk, nb, ns, n_mu, rank, r_chunk)
+    refit Q after the first is dispatch-only (per-q-recompile lesson).
+
+    ``zeta_solve`` is the producer's ``(charge_zeta_solve, zeta_rcond,
+    zeta_ridge)`` triple for the bundle being refitted (:func:`_zeta_solve_of`).
+    It is part of the CACHE KEY, not just of the closure: the ζ solve is a
+    different program per (kind, rcond), and a key that omitted it would hand
+    the second bundle of a process the first bundle's compiled solve.
+    """
+    key = (nk, nb, ns, n_mu, rank, r_chunk, tuple(zeta_solve))
     hit = _REFIT_KERNELS.get(key)
     if hit is not None:
         return hit
+    _solve_kind, _rcond, _ridge = zeta_solve
+    # LAZY, and for the same reason every other import in this module is:
+    # ``isdf.core``'s module body reaches ``distrib_la`` and the FFI plan
+    # resolver, and this module is imported by host-only diagnostics that
+    # never refit.  L1 → L1, so the layer map has nothing to say about it.
+    from isdf.core import solve_zeta_charge_dense
 
     @jax.jit
     def _cq_and_x(psi_m_mu, psi_mu):
@@ -2682,13 +2869,26 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk):
 
     @jax.jit
     def _solve_zeta(C, Z):
-        # producer convention (isdf.core._ridged_chol + solve_zeta charge
-        # path): Cholesky of C + 1e-14·|tr C|·I, two triangular solves.
-        ridge = 1e-14 * jnp.abs(jnp.trace(C))
-        L = jnp.linalg.cholesky(C + ridge * jnp.eye(C.shape[0], dtype=C.dtype))
-        y = jax.scipy.linalg.solve_triangular(L, Z, lower=True)
-        return jax.scipy.linalg.solve_triangular(
-            jnp.conj(L).T, y, lower=False)
+        # THE PRODUCER'S SOLVE, not a second implementation of it.  This
+        # used to be a plain Cholesky with a fixed 1e-14·|tr C| ridge, under
+        # a comment citing a private ridged-Cholesky helper of ``isdf.core``
+        # — a symbol that has never existed in this tree.  The production
+        # charge path is
+        # ``replicated_rank_truncate``: an eigh pseudo-inverse that DROPS
+        # every direction with λ < zeta_rcond·λ_max.  A ridged Cholesky
+        # KEEPS those directions and amplifies them by up to four orders
+        # more than the producer's κ cap allows, so ζ' differed from ζ in
+        # precisely the near-null subspace — and V_Q is quadratic in ζ.
+        # The tile identity ``refit_ongrid_null`` measured the consequence
+        # on five parents: worst-tile error monotone in the DISCARDED
+        # fraction (4.7 % → 3.289, 7.9 % → 16.0, 39.4 % → 50.9, 58.6 % →
+        # 139.9) against a 5.0e-02 bracket, while the htransform Galerkin
+        # residual moved eight orders and the tile null did not follow it
+        # (tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-\
+        # and-the-tile-null-still-refuses.md §4).
+        return solve_zeta_charge_dense(
+            C, Z, charge_zeta_solve=_solve_kind, zeta_rcond=_rcond,
+            zeta_ridge=_ridge)
 
     kernels = (_cq_and_x, _psi_m_chunk, _z_chunk, _solve_zeta)
     _REFIT_KERNELS[key] = kernels
@@ -2722,8 +2922,22 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     qw = np.asarray(q_tile_frac, dtype=np.float64)
     qw = qw - np.round(qw)
     n_rp = rst["n_rp"]
+    # THE PRODUCER'S SOLVE OR NOTHING.  ``rst["zeta_solve"]`` is set by
+    # ``refit_prepare`` from the ζ file's own fit_provenance; there is no
+    # default, because the default this call used to carry (ridged Cholesky)
+    # is the defect — a refit that cannot name the fit it is reproducing has
+    # no business producing a tile.
+    if "zeta_solve" not in rst:
+        raise SystemExit(
+            "refit_vq: this refit state carries no ``zeta_solve`` — the "
+            "(charge_zeta_solve, zeta_rcond, zeta_ridge) the bundle's ζ was "
+            "actually fitted with.  ζ' must be solved the way ζ was or it "
+            "differs from ζ in the near-null subspace the producer truncated, "
+            "and V_Q is quadratic in that difference.  Build the state with "
+            "vq_interp.refit_prepare, which reads the triple from the ζ "
+            "file's isdf_header/fit_provenance.")
     cq_and_x, psi_m_chunk, z_chunk, solve_zeta = _refit_kernels(
-        nk, nb, ns, n_mu, rank, r_chunk)
+        nk, nb, ns, n_mu, rank, r_chunk, rst["zeta_solve"])
     psi_r = rst["psi_r"].reshape(nk, nb, ns, n_rp)
     if m_leg == "stored":
         kqs = np.array([kq_index_of_frac(zx, k_frac - qw) for k_frac in

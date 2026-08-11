@@ -1916,6 +1916,75 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
     return jnp.linalg.cholesky(C_log + ridge)
 
 
+def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
+                            zeta_rcond: float, zeta_ridge: float = 0.0,
+                            rank_log: bool | None = None):
+    """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile.
+
+    ``ζ = C⁺Z`` (``charge_zeta_solve='rank_truncate'``, the production
+    default) or ``ζ = (C + ridge)⁻¹Z`` through two triangular solves
+    (``'cholesky'``).  The factor arithmetic is
+    :func:`_charge_factor_math` — the SAME traced kernel the sharded
+    producer route runs — and the back-solves are the same two bodies
+    ``solve_zeta`` applies (``_pinv_matmul_logical`` /
+    ``_tri_solve_logical``), written here without the identity pad because
+    a caller holding one whole tile has no pad to slice.
+
+    WHY THIS IS PUBLIC.  ``bse.vq_interp``'s per-Q refit has to solve the
+    same system the producer solved, or the ζ' it builds differs from ζ in
+    exactly the near-null subspace the producer discarded — and ``V_Q =
+    Σ_G conj(ζ(G)) v(q+G) ζ(G)`` is QUADRATIC in it.  Before 2026-08-11 the
+    refit ran a plain Cholesky with a fixed 1e-14·|tr C| ridge under a
+    comment claiming it followed a private ridged-Cholesky helper of THIS
+    module — a symbol that has never existed in this tree — and the tile
+    identity
+    ``vq_interp.refit_ongrid_null`` read 3.3, 16, 51 and 140 against a
+    5.0e-02 bracket, monotone in the fraction of directions the producer's
+    truncation had dropped (4.7 % → 3.289, 58.6 % → 139.9; five parents,
+    ``tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-and-\
+the-tile-null-still-refuses.md`` §4).  A second, private re-implementation
+    of a solve is how that happens; one exported entry point is the fix.
+
+    ``zeta_rcond`` / ``zeta_ridge`` are taken EXACTLY as given — this
+    function applies no ``LORRAX_ZETA_RCOND`` / ``LORRAX_ZETA_RIDGE``
+    override of its own.  Its caller is reproducing a fit that already
+    happened, and the EFFECTIVE (post-env) values of that fit are recorded
+    in the ζ file's ``isdf_header/fit_provenance``
+    (:func:`gw.gw_init._zeta_fit_provenance`); re-applying today's
+    environment on top would silently solve a different system than the one
+    on disk.  The producer-side entry points (:func:`_factor_c_q_replicated`
+    and friends) still apply the deprecated env twins, because there the
+    deck is what is being resolved.
+
+    ``rank_log`` defaults to the producer's rule (on for
+    ``rank_truncate`` unless ``LORRAX_ZETA_RANK_LOG`` says otherwise), so a
+    refit prints the same ``n_keep``/``kappa`` line the fit did and the two
+    can be read against each other.  jit-safe: everything below is jnp plus
+    ``jax.debug`` callbacks.
+    """
+    mode = str(charge_zeta_solve).strip().lower()
+    if mode not in ('rank_truncate', 'cholesky'):
+        raise ValueError(
+            f"solve_zeta_charge_dense: charge_zeta_solve={charge_zeta_solve!r} "
+            f"is not a charge-channel solve.  Expected 'rank_truncate' (the "
+            f"production default) or 'cholesky'.  The transverse families "
+            f"('ridge', 'transverse_rank_truncate') solve an INDEFINITE CCT "
+            f"and do not belong on this entry point.")
+    n_log = int(C.shape[-1])
+    if rank_log is None:
+        rank_log = (mode == 'rank_truncate'
+                    and env_bool("LORRAX_ZETA_RANK_LOG", True))
+    F = _charge_factor_math(
+        C[None, ...], mode=mode, n_log=n_log,
+        ridge_extra=float(zeta_ridge), rcond=float(zeta_rcond),
+        rank_log=bool(rank_log))[0]
+    if mode == 'rank_truncate':
+        # ζ = C⁺Z = B(BᴴZ) — B is the pseudo-inverse factor, B Bᴴ = C⁺.
+        return F @ (jnp.conj(F).T @ Z)
+    y = jax.scipy.linalg.solve_triangular(F, Z, lower=True)
+    return jax.scipy.linalg.solve_triangular(jnp.conj(F).T, y, lower=False)
+
+
 def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_ridge: float = 0.0,

@@ -593,6 +593,22 @@ silent overwrite.
     here.
     [qsign re-measurement lane, 2026-08-11; corrected by the refit-sharding
     lane, 2026-08-11]
+42. **`tools/gen_input_reference.py` has not been able to run for some
+    time, so `docs/input_reference.md` is hand-maintained by neglect.** It
+    refuses on key drift against `gw_config._DEFAULTS` and there are seven:
+    five keys with no one-liner (`mc_average_placement`,
+    `mc_average_placement_vcoul`, `restart_q_storage`, `sc_eigh`,
+    `write_restart_tensors`) and two one-liners for keys that no longer
+    exist (`slab_io`, `use_ffi_io`). Verified PRE-EXISTING on `origin/main`
+    `fa86c6b8` — the generator refuses identically on a clean base
+    worktree — so it is nobody's branch. The consequence is that the page
+    the register calls "generated from the parser, so it is complete" is
+    neither: `zeta_nband`'s row had to be hand-written in the generator's
+    own format, which is exactly the drift the generator exists to prevent.
+    Fixing it is seven one-line strings plus one regeneration, but the
+    regeneration rewrites the whole file and would collide with every lane
+    that has a docs edit in flight, so it wants its own bounded pass rather
+    than a ride-along. [ζ-solve + `zeta_nband` lane, 2026-08-11]
 
 42. **The 2-D slab Coulomb kernel exists twice, and unifying it is NOT
     free.** `bse.vq_interp.v_slab_on_set(kind="slab")` and

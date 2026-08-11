@@ -1804,8 +1804,14 @@ def main(argv=None):
                 f"function's own default sample (Γ and the three q furthest "
                 f"from it).  The path's small-|Q| tiles are the ones the "
                 f"default sample cannot reach and the ones 1/|Q|² amplifies.")
-            vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
-                                        log_fn=log, q_list=_qlist)
+            # ``zx_fit``, NOT ``zx``: identical on a stock bundle, and on a
+            # ``zeta_nband``-decoupled one it is the producer's own ζ-fit
+            # window sliced out of a wider stored band axis.  Handing the
+            # unsliced bundle to the gate would refit ζ' on bands the
+            # producer never fitted and then compare the result to the
+            # producer's tiles — a refusal with no defect behind it.
+            vq_interp.refit_ongrid_null(zx_fit, rst, V_ongrid, kgrid_vq,
+                                        mesh_xy, log_fn=log, q_list=_qlist)
         else:
             # THE GATE MOVES UP ONE LEVEL.  ζ' is fitted on the BSE window, so
             # it is not the producer's ζ and cannot return the producer's
