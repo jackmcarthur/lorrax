@@ -2794,7 +2794,20 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         # branch is also why the naive repair is wrong: ``process_allgather(
         # tiled=True)`` on the fully-addressable P=1 array would concatenate
         # this process's whole copy and multiply the k axis by P.
-        psi_r_host[:, lo:hi] = _to_host(psi_bc)
+        # SLICE TO THE CHUNK'S OWN WIDTH.  ``load_psi_gflat_padded`` pads the
+        # band axis up to a multiple of the device count, so a chunk narrower
+        # than that comes back WIDER than ``bc_range`` says — 9 requested
+        # bands arriving as 12 at four devices.  Every window this function
+        # ever saw before the two-window contract had a band count divisible
+        # by the device count (52, 24, 20 at P=4), so the last chunk was
+        # always already aligned and the pad never materialised; a guard count
+        # that makes ``nb_fh`` odd (53, 55, 57) is the first caller to see it,
+        # and it arrives as a numpy broadcast error naming two shapes and
+        # neither the loader nor the pad.  The pad rows are physically zero,
+        # so the slice discards nothing.
+        _bc = _to_host(psi_bc)
+        psi_r_host[:, lo:hi] = _bc[:, :hi - lo]
+        del _bc
     n_rp = ((n_rtot + r_chunk - 1) // r_chunk) * r_chunk
     if n_rp > n_rtot:
         psi_r_host = np.concatenate(

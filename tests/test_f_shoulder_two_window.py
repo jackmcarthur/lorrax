@@ -300,6 +300,23 @@ def test_refit_prepare_streams_psi_over_the_FH_window():
         "contract removes")
 
 
+def test_psi_chunks_are_sliced_to_their_own_width():
+    """The band-chunk assembly must slice to ``hi - lo``.
+
+    ``load_psi_gflat_padded`` pads the band axis to a multiple of the device
+    count, so a chunk narrower than that comes back WIDER than ``bc_range``
+    says.  Every window this function saw before the two-window contract had a
+    band count divisible by four (52, 24, 20), so the last chunk was always
+    aligned and the pad never materialised; the first ODD ``nb_fh`` (a guard
+    count of 5 on the ζ=52 parent, i.e. 57 bands) died with
+    ``could not broadcast input array from shape (64,12,2,13824) into shape
+    (64,9,2,13824)`` — a numpy message naming neither the loader nor the pad.
+    """
+    src = _refit_prepare_src()
+    assert "psi_r_host[:, lo:hi] = _bc[:, :hi - lo]" in src, (
+        "the chunk must be sliced to its own width, not broadcast whole")
+
+
 def test_refit_prepare_stores_the_ZETA_block_as_pair_density():
     """``rst["psi_r"]`` is the ζ sub-block: guards shape fH, never ρ.
 
