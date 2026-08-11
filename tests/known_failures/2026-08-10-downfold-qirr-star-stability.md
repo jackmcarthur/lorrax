@@ -52,6 +52,114 @@ The 10 skips are one reason on both sides — `liblorrax_ffi_host.so` is not bui
 on this box, which is the documented WSL condition for the dropin suite's
 driver-import cells.
 
+## THE OWED LEG WAS PAID — 2026-08-10, evidence `/pscratch/sd/j/jackm/owedlegs_0810/`
+
+Everything below this heading down to the horizontal rule is the settlement of
+the "OWED" section that follows it; that section is kept verbatim because it is
+the prediction this leg tested, and a prediction is worth more standing than
+edited.  Worktree `/pscratch/sd/j/jackm/owedlegs_0810/tree`, detached at
+`47657990`, `git dirty-count: 0` printed inside every leg.
+
+**The gates, on four real GPUs.**  `tests/test_downfold.py -k qirr` on one
+process holding four `CudaDevice`s, so `resolve_mesh()` builds a genuine 2×2
+over real cards rather than the emulated CPU mesh the amendment measured:
+**6 passed, 32 deselected in 27.59 s**, `jax device_count: 4`, HEAD
+`47657990` (`_logs/qirr_p4gpu.log`).  The covariance gate, the bit-for-bit
+q-diagonality gate and both red twins are therefore GPU evidence now, not CPU
+evidence.  The full two files at four GPUs come back **3 failed, 51 passed**
+against **54 passed** on one GPU, and all three failures are the test
+fixtures' own shapes rather than the product: `m = n = mu_S = 3` and a
+`(3, 4, 9)` output are not divisible by a 2×2 mesh, so
+`contract_bands_block_reshard` and `pjit` refuse them by name.  The cells are
+1×1-shaped and cannot express themselves on a square mesh; that is a
+gate-shape defect worth its own repair and it touches nothing this amendment
+claims.
+
+**The real deck, and it behaved.**  `si_bse_debug` on the shipped orbit-closed
+480-centroid set at `restart_q_storage = auto` resolved, in the writer's own
+words, to `auto -> ibz (centroid set is orbit-closed (worst residual 4.596e-16
+at tol 1.0e-05) and the q path reduced)` — a genuinely wedge-stored parent,
+`V_qmunu (8, 480, 480)` over 8 IBZ q of 64, plus a wedge `zeta_q.h5`.  The
+downfold on it selected `mu_S = 185` at `mu_small = auto` and transported the
+ζ, printing exactly the row this amendment fixed:
+
+```
+[downfold/zeta] parent zeta_q.h5 stores 8 q against the bundle's 64 — the
+    q-IBZ WEDGE, and it transports.
+[downfold/zeta] g0 cross-check: zeta_S(q=0, G=0) vs the transported g0_S
+    -> AGREE (max rel 1.065e-15).
+```
+
+**The covariance arm, on the deck, is exact.**  The same deck was run a second
+time at `restart_q_storage = full` and downfolded identically, and the two
+children were compared dataset by dataset: `V_qmunu (64, 185, 185)`,
+`W0_qmunu`, `G0_mu_nu`, both `eps_w` vectors and `zeta_q_G (8, 185, 588)` are
+**BIT-IDENTICAL, max |Δ| = 0.000000e+00** (`_logs/compare.log`).  Not the ~8
+ulp reassociation floor the synthetic gate reports — exactly zero, and the
+reason is the one the amendment already gives: the reader unfolds the parent
+before the driver sees it, so both routes hand the downfold the same operand.
+`LORRAX_FORCE_FULL_BZ=1` was not needed; flipping the deck key is the same
+experiment with less machinery.
+
+**THE NUMBER THIS AMENDMENT REFUSED TO INFER, TAKEN AT LAST — and it is worse
+than the synthetic.**  On `si_bse_debug` (μ_L = 480, 96 ops = 48 spatial + TRS,
+`downfold_rcond = 1.1e-6`, ceiling 185), every admissible μ_S from 1 to 185 was
+closure-tested against the parent's own stored `sym_perm`, using the shipping
+pivoted-Cholesky kernel's actual pivot order:
+
+> **real-deck orbit-closure rate = 0 of 185 = 0.0000.**
+
+Not one.  The synthetic 7-of-46 (≈15 %) was optimistic by exactly the amount
+that matters.  At the production selection `mu_small = auto → μ_S = 185`, **94
+of the 96 ops** send a kept centroid outside the kept set, and orbit completion
+would add **295 centroids, taking μ_S from 185 to 480 — the entire parent
+basis**, which is the same thing as not downfolding at all.  Over the open μ_S
+the inflation runs min 35, median 323, max 387 centroids.
+
+The orbit census says why, and it retires this amendment's own consolation.
+The 480-point set is **11 orbits: two of size 24 and nine of size 48**.  An
+orbit-closed subset must be a union of those, so the only closed sizes below
+the ceiling are the seven multiples of 24 — and the measured rate of zero means
+the real pivot order does not land on a union at any of them.  **The claim that
+"the CUR pivot order fills orbits greedily, so completion costs the tail of one
+orbit rather than the group order" is REFUTED on a production centroid set.**
+It held on the synthetic because q = 0 makes every member of an orbit share a
+Schur diagonal and the tie-break was index order; on the real Gram the
+tie-break interleaves orbits instead, and by μ_S = 185 the kept set already
+touches all eleven.  `star_stability`'s `describe()` still prints the greedy
+sentence, and that sentence should be corrected where it stands.
+
+**Two defects the four-GPU rule found on the way, both new.**
+
+1. **`lorrax-downfold` cannot run at P > 1 at all.**  At `-G 4 -n 4` it dies in
+   `downfold_run._gate_g0_against_zeta` (`src/gw/downfold_run.py:951`), which
+   does a bare `np.asarray(jax.device_get(g0_S))` on a globally sharded array:
+   *"Fetching value for `jax.Array` that spans non-addressable (non process
+   local) devices is not possible."*  The gate that the real-deck recipe below
+   tells you to read is precisely the line that cannot run in production
+   geometry.  It needs `process_allgather`, or the gather the selection path
+   already uses.  Both children above were therefore written at one GPU; the
+   tensors reached disk before the gate on the P=4 attempt, so the wedge child's
+   `zeta_q.h5` exists from that run too and is the same size as the full-BZ
+   child's.
+2. **A four-device single process is refused by the driver stack**, so "one
+   process, four cards" is not a way around (1): `resolve_mesh` raises
+   `mesh 2×2=4 != jax.process_count()=1`, and `SlabIO` refuses the same
+   mismatch from the MPI side.  The gates leg above works only because pytest
+   never opens a SlabIO file; anything touching the drivers must be
+   multi-process.  Note also that two P=4 JAX steps placed on ONE node collide
+   in the coordination service (`different incarnation`, rc=134) — batch such
+   legs at `-P 1` or place them on different nodes.
+
+**What is still owed after this leg.**  The BSE-eigenvalue leg of the
+covariance arm (step 3 below asks for `bse_jax --tda --bse` off both children)
+was not run: with the tensors bit-identical it can only agree, so it was
+dropped as a measurement of nothing, and that is a judgement rather than a
+result.  And the `g0` cross-check has never been read at P > 1, because
+defect (1) above is in front of it.
+
+---
+
 ## OWED, and unrunnable this lane
 
 The NERSC certificate expired at **2026-08-10T19:22:36 UTC** and the
