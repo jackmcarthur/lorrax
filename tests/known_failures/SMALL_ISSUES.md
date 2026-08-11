@@ -699,6 +699,25 @@ silent overwrite.
     file was syntactically valid before and after — `bash -n` passes on the
     patched copy. Patch wrappers between waves, never during one, and judge a
     leg that dies this way by its artefacts. [sixth-wall lane, 2026-08-11]
+48. **The `lorrax_*` modulefiles set `XLA_PYTHON_CLIENT_ALLOCATOR=platform`,
+    which is NOT the campaign default, and a long per-Q refit run dies of it.**
+    `modulefiles/lorrax_J070/*.lua:189` does `setenv(
+    "XLA_PYTHON_CLIENT_ALLOCATOR", "platform")` and repeats it as a
+    `--env=` on the shifter line; the startup banner already says so in as
+    many words — *"NOT LORRAX's canonical pair, which is preallocate=false
+    with the allocator left unset (BFC); a caller overrode it"* — and nothing
+    reads that line. `platform` is cudaMalloc/cudaFree per buffer with no
+    pooling, so a driver that allocates and frees a large tensor once per Q
+    fragments. Measured: `exciton_bands --vq-mode refit --q-per-segment 16`
+    on the μ=2988 parent ran **60 off-grid Q and then died**
+    `RESOURCE_EXHAUSTED: Failed to allocate request for 15.41GiB` inside
+    `refit_vq`'s `cq_and_x`, on a 40 GB card at `mem_fraction 0.85` — i.e.
+    with ~34 GB nominally available and the same allocation having succeeded
+    sixty times. Per-leg `env` `XLA_PYTHON_CLIENT_ALLOCATOR=default` reaches
+    it (lx applies the leg env inside the container, after the module).
+    Whether to change the modulefile is an owner call — it moves every
+    wall-time on the fleet, and every timing in the corpus was taken under
+    `platform`. [sixth-wall lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 
