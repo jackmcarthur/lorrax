@@ -492,47 +492,41 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 
 
 # ---------------------------------------------------------------------------
-# THE TWO QUANTISATIONS ON THIS PATH POINT IN OPPOSITE DIRECTIONS, ON PURPOSE
+# QUANTISING A USER-FACING COUNT: THE RULE IS FLOOR, AND IT IS THE ONLY RULE
 # ---------------------------------------------------------------------------
 #
-# ``select_cur_centroids`` rounds two different things, and a reader who has
-# just met one of them will assume the other rounds the same way.  It does not,
-# and the difference is not an inconsistency — it is the difference between a
-# CORRECTNESS constraint and a BUDGET.
+# ``mu_small`` is the user's statement of how many centroids they are willing
+# to carry, IN POINTS.  Symmetry-legal sizes are the sizes of unions of whole
+# orbits, so a request generically falls between two rungs of a ladder, and the
+# owner's ruling of 2026-08-10 is that the realized set is the largest rung
+# that DOES NOT EXCEED the request:
 #
-#   ``common/spectral_closure`` — SNAP OUTWARD.  The rank ceiling is a cut
-#   through the pool Gram's eigenvalue spectrum, and a cut that lands inside a
-#   degenerate block picks a symmetry-arbitrary slice of an eigenspace.  The
-#   only stable choices are the whole block or none of it, and taking LESS than
-#   the criterion certified is the direction the rank refusal exists to
-#   prevent — so the guard MOVES THE CEILING UP, past the block.  It is allowed
-#   to overshoot the number it was handed because that number is a threshold on
-#   a physical quantity, not a resource the user is paying for.
+#     "everything the user has input on they should be specifying in units of
+#      points, and we should be choosing the quantity of orbits that comes
+#      closest to that number of points without exceeding it."
 #
-#   ORBIT FLOORING — SNAP INWARD.  ``mu_small`` is the user's statement of how
-#   many centroids they are willing to carry, in POINTS.  Symmetry-legal sizes
-#   are the sizes of unions of whole orbits, so a request generically falls
-#   between two rungs of a ladder, and the ruling of 2026-08-10 is that the
-#   realized set is the largest one that DOES NOT EXCEED the request:
+# So the selection UNDERSHOOTS, always, and says so loudly.  This is the same
+# direction the fleet's other quantisations of a KEPT quantity take, and it is
+# the direction ``common/spectral_closure`` is being aligned to as this is
+# written — a lane is flipping its straddled-block repair to DROP the block
+# rather than widen past it, on the same ruling.  Nothing here depends on which
+# way that lands: the floor is stated against the CEILING AS RESOLVED, whatever
+# resolves it, and ``realized <= requested <= ceiling`` holds either way.  Do
+# not re-introduce a "these two go opposite ways, on purpose" paragraph here;
+# there was one, and it was wrong within the hour.
 #
-#       "everything the user has input on they should be specifying in units
-#        of points, and we should be choosing the quantity of orbits that
-#        comes closest to that number of points without exceeding it."
+# WHAT THE FLOOR REPLACED, because the contrast worth keeping is with the
+# retired design and not with a sibling guard.  ``select_cur_centroids`` used
+# to pick POINTS and then repair the result by orbit COMPLETION — rounding the
+# kept set OUTWARD to whole orbits.  On ``si_bse_debug`` that took μ_S from 185
+# to 480, the entire parent basis, i.e. not downfolding at all, and then
+# refused because 480 is over the ceiling.  Flooring cannot reach that state by
+# construction, so the ceiling refusal can only ever fire on the number the
+# user typed.
 #
-#   So this one UNDERSHOOTS, always, and says so loudly.  Overshooting a
-#   budget is the failure the previous design had: orbit COMPLETION rounded the
-#   selection outward to whole orbits, which on ``si_bse_debug`` took μ_S from
-#   185 to 480 — the entire parent basis, i.e. not downfolding at all — and
-#   then refused, correctly, because 480 is over the ceiling.  Flooring cannot
-#   reach that state by construction: the realized count is ≤ the request is ≤
-#   the ceiling, so the ceiling refusal can only ever fire on the number the
-#   user typed.
-#
-# Both are quantisations of a user-facing number onto a legal ladder; they
-# differ in whether the ladder is about what is TRUE or about what is BOUGHT.
 # ``AGENT_PREAMBLE``'s band-degeneracy ruling ("never set ``snap`` to make a
-# gate pass") is the same distinction from the other side: you may not loosen a
-# correctness criterion, and this floor loosens nothing — it spends less.
+# gate pass") is the constraint this must not violate, and it does not: the
+# floor loosens no criterion.  It spends less.
 
 
 def centroid_orbit_id(sym_perm) -> np.ndarray:
@@ -716,12 +710,12 @@ def _floor_selection_to_orbits(
         f"at or below the ceiling {ceiling}: "
         f"{_legal_point_counts(np.asarray(orbit_sizes), ceiling)}.",
         f"  [downfold/select] the floor SPENDS LESS; it never rounds up.  "
-        f"That is the opposite of common/spectral_closure's snap-OUTWARD on "
-        f"the rank cut two steps above, and the difference is deliberate: "
-        f"the ceiling is a correctness threshold and may be widened, "
-        f"mu_small is a budget and may not be overrun.  The previous design "
-        f"rounded the selection outward to whole orbits and took mu_S from "
-        f"185 to 480 on si_bse_debug — the whole parent basis.",
+        f"mu_small is a BUDGET and may not be overrun, and the floor is "
+        f"taken against the ceiling AS RESOLVED two steps above, so "
+        f"realized <= requested <= ceiling however that cut settles.  The "
+        f"design this replaced rounded the selection OUTWARD to whole orbits "
+        f"and took mu_S from 185 to 480 on si_bse_debug — the whole parent "
+        f"basis — and then refused.",
     ]))
     return keep_idx, realized, int(mu_S), int(k_fit), rank_i
 
@@ -781,9 +775,10 @@ def select_cur_centroids(
     ``sym_perm`` ``None`` keeps the historical point-granularity behaviour and
     says nothing about closure, which is an ABSENCE, not a pass.
 
-    THE DIRECTION IS OPPOSITE TO ``common/spectral_closure``'s, deliberately;
-    the block above this function is the whole argument.  This is a budget and
-    it undershoots; that is a correctness constraint and it overshoots.
+    THE DIRECTION IS ALWAYS INWARD — see the block above this function.  The
+    floor is stated against the ceiling AS RESOLVED, so it is independent of
+    how ``common/spectral_closure`` settles a cut that straddles a degenerate
+    block, and ``realized <= requested <= ceiling`` holds either way.
 
     Returns ``(keep_idx, SelectionReport)`` with ``keep_idx`` a sorted
     ``int64`` array of parent centroid indices.  **``len(keep_idx)`` is the
@@ -822,8 +817,11 @@ def select_cur_centroids(
     # centroids — is choosing between directions the spectrum cannot
     # distinguish.  ``common/spectral_closure`` moves the ceiling off the
     # block by DROPPING the block whole (owner ruling 2026-08-10), so the
-    # ceiling comes DOWN and every μ_S is validated against a rank the pool
-    # Gram can support without a symmetry-arbitrary direction in it.
+    # ceiling comes DOWN — the same FLOOR direction the orbit selection below
+    # takes, and the two compose without either restating the other's rule.
+    # Everything downstream here — the refusal, the orbit floor, the report —
+    # is stated against the RESOLVED ceiling rather than against the raw rank,
+    # so this call site does not need to know which boundary was chosen.
     #
     # This is the answer to the CUR-pivot symmetry-stability question the
     # q_irr-native lane runs into: pivot stability inside a degenerate block

@@ -619,19 +619,21 @@ def test_the_default_mode_and_tolerance_have_exactly_one_literal():
 # pivoted Cholesky's index-order tie-break between its members is exactly the
 # round-off-chosen slice this module's spectral guard refuses.
 #
-# THE TWO GUARDS POINT IN OPPOSITE DIRECTIONS, AND THAT IS THE POINT OF THIS
-# SECTION.  ``spectral_closure`` snaps the rank CEILING outward, because a cut
-# is a correctness threshold and taking less than it certified is the failure.
-# The selection floors ``mu_small`` inward, because ``mu_small`` is a BUDGET
-# the user stated in points and overrunning it is the failure — owner ruling,
-# 2026-08-10: "everything the user has input on they should be specifying in
-# units of points, and we should be choosing the quantity of orbits that comes
-# closest to that number of points without exceeding it."  These cells were
-# written against the previous design, in which the selection completed
-# OUTWARD to whole orbits; that design is retired because on ``si_bse_debug``
-# it took mu_S from 185 to 480 (the whole parent basis) and then refused.  The
-# cells are kept, pointed the other way, so the retirement is gated rather
-# than merely described.
+# THE SELECTION FLOORS, AND IT FLOORS AGAINST THE CEILING AS RESOLVED.  Owner
+# ruling, 2026-08-10: "everything the user has input on they should be
+# specifying in units of points, and we should be choosing the quantity of
+# orbits that comes closest to that number of points without exceeding it."
+# ``mu_small`` is a BUDGET the user stated in points and overrunning it is the
+# failure, so the realized set is the largest whole-orbit union at or below the
+# request.  These cells were written against the previous design, in which the
+# selection completed OUTWARD to whole orbits; that design is retired because
+# on ``si_bse_debug`` it took mu_S from 185 to 480 (the whole parent basis) and
+# then refused.  The cells are kept, pointed the other way, so the retirement
+# is gated rather than merely described.
+#
+# The assertions below are on ``rep.eigen_rank_pool`` — the ceiling THIS RUN
+# resolved — and never on how the straddled-block repair chose it, so they
+# stand whichever way ``spectral_closure``'s own quantisation settles.
 
 def _sel_setup(mu=12, orb=4, seed=5):
     """A parent Gram that genuinely commutes with a cyclic centroid group."""
