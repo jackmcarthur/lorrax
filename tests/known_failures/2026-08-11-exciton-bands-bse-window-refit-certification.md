@@ -134,29 +134,62 @@ carries the LARGEST truncation of the four and the second SMALLEST error. A
 1 %-truncated reference is present and is presumably contributing, but it is
 not what sets the scale or the q-dependence.
 
-## THE CONTROL THAT SEPARATES THEM
+## THE CONTROL THAT SEPARATES THEM, AND IT SPLITS THE ERROR 9:1
 
-`REPLACE_PARENT`
+Run the identical configuration — same deck, same window, same BSE window,
+same path, same gate — against the **un-downfolded parent** bundle
+(`xbdense_0810/parentfull/tmp/isdf_tensors_960.h5`, μ = 960, no
+`downfold_provenance`, no rank truncation). Its Galerkin bound at nb = 20 is
+the same 1280 ≤ 1920, so it is the one variable changed.
+
+| point | tile | child μ=191 | **parent μ=960** | ratio |
+|---|---|---|---|---|
+| X | (0,2,2) | 0.997 meV | **0.039 meV** | 26× |
+| W | (3,1,2) | 1.345 meV | **0.858 meV** | 1.6× |
+| L | (2,2,2) | 3.203 meV | **0.379 meV** | 8.5× |
+| Σ | (3,2,3) | 7.719 meV | **0.034 meV** | 227× |
+| **worst** | | **7.719 meV** | **0.858 meV** | **9.0×** |
+
+So the failure is **two mechanisms stacked**, and the control separates them:
+
+1. **The downfold is the larger one** — about 89 % of the child's worst-case
+   error. It is not the per-q ε_w magnitude (r = 0.30, above); it is the
+   downfold as a whole, and its signature is that the q-ORDERING rearranges
+   completely between the two columns. Σ is the *worst* point on the child
+   (7.719 meV) and the *best* on the parent (0.034 meV). A per-Q exchange
+   refit evaluated at a downfolded child's retained centroids is simply not
+   the operator the child's own stored tiles are.
+2. **The windowed ζ' has its own floor**, and the parent measures it clean at
+   **0.858 meV**, at W. That is still **86× over the 0.01 meV gate**, so
+   `--refit-window=bse` does not certify even on an un-downfolded parent, on
+   this centroid count.
+
+Both runs refused. Neither wrote a `.dat` or a `.png`.
 
 ## WHAT THIS COSTS THE OWNER, AND THE CHOICE THAT IS HIS
 
 The exciton band structure at 16 diagonalisations per segment is still owed,
-and the honest statement of why is now one line instead of three walls: **on
-this bundle, off-grid exchange is reachable but not yet trustworthy at the
-0.01 meV the delivered curve is certified to.** The routes, in the order they
-cost:
+and the honest statement of why is now one line instead of three walls: **the
+off-grid exchange is reachable, and it is not yet trustworthy at the 0.01 meV
+the delivered curve is certified to.** The routes, in the order they cost:
 
-* **A wider refit window on this same bundle.** Free of any re-run, bounded by
-  `nk·nb ≤ n_μ,parent·n_s` — at most nb = 28 here (bound 1792), against the
-  producer's 60. The ladder above says what that buys.
-* **The owner's preserved alternative: re-run the GW at ~2× centroids.**
-  A parent with n_μ ≳ 1920 makes `nk·nb_ζ = 3840` spannable and the refit runs
-  at the producer's own ζ-fit window — which is the configuration the TILE
-  null certifies, at the 3.3e-14 the kernel already measures. That is the
-  curve drawn from a higher-resolution parent rather than from a windowed
+* **Drop the downfold and refit on the parent.** Nearly free — the parent
+  bundle already exists and the driver runs on it unchanged. It buys the 9×
+  above and nothing more: 0.858 meV, still 86× over. Worth knowing, not a
+  solution.
+* **A wider refit window.** Bounded by `nk·nb ≤ n_μ,parent·n_s`, and in
+  practice by where the Gram-eigh stops spanning: nb ≤ 24 on this basis. The
+  ladder says it buys 12 %.
+* **The owner's preserved alternative, and now the only one the measurements
+  support: re-run the GW at ~2× centroids.** A parent with n_μ ≳ 1920 makes
+  `nk·nb_ζ = 3840` spannable, and the refit then runs at the producer's own
+  ζ-fit window — the configuration the TILE null certifies, at the 3.3e-14 the
+  kernel already measures, with no windowed ζ' anywhere in the path. That is
+  the curve drawn from a higher-resolution parent rather than from a windowed
   refit, and it is a different physical claim, not a cheaper route to the same
   one. Which of the two the delivered curve should be a curve OF remains an
-  owner call, exactly as the previous row said.
+  owner call, exactly as the previous row said — but this row removes the
+  cheap option from the menu rather than leaving it open.
 
 The `--q-per-segment` floor and the plotter are ready either way; nothing
 downstream of the exchange is waiting on anything.
@@ -189,7 +222,24 @@ the default backend segfaults inside HDF5 1.12.2 ("can't locate ID" /
 processes. The previous lane had this on its fine arm only; it is not a
 fine-grid fact, it is a multi-process-WFN-read fact.
 
+## GATES
+
+`956 passed / 9 failed / 68 skipped` on the rebased tree at a real P=4
+(`-G 4 -n 1`, `DEVICE_COUNT 4 PROCESS_COUNT 1`), over
+`tests/test_exciton_bands*`, `tests/test_bse_vq_interp*`,
+`tests/test_band_degeneracy.py` and all seven `services/*/tests`. This lane's
+own `tests/test_exciton_bands_refit_window.py` is **20 collected, 20 passed**.
+The 9 reds are byte-for-byte the same 9 before and after the rebase and none
+is in a file this branch touches: `test_bse_vq_interp::
+test_loo_accuracy_vs_reference_thresholds` is `KNOWN_FAILURES.md` row 1, and
+the other eight are distrib_la loader open-order, symmetry_maps emulated-mesh
+and vcoul import-isolation service cells.
+
 ## OWED
 
 The two PNGs. The blocker is the number in the table above, and it is a
-physics/representation number, not a scheduling one.
+physics/representation number, not a scheduling one. Everything downstream is
+ready and was checked rather than assumed: the `--q-per-segment` floor is
+landed and green, the staged plotter renders a `.dat` today, and the two
+header lines this branch adds (`# refit:`, `# refit-cert:`) fall through its
+comment skip untouched.
