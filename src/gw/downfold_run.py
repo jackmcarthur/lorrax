@@ -327,8 +327,51 @@ def _wedge_q_slots(tables) -> np.ndarray:
     return slots
 
 
+#: Above this relative disagreement the child's wedge block does NOT unfold to
+#: the child, and the gate says REFUTED rather than quoting the number and
+#: calling it a floor.  The two routes apply the same unitary at different
+#: points of one chain, so the honest floor is a few ulp (the synthetic gate in
+#: tests/test_downfold.py reads 1.7e-15); a DIFFERENT algebra misses by order
+#: one (its red twin reads 8.6e-01).  1e-9 sits in the empty decades between
+#: them, so no plausible reassociation reaches it and no real disagreement
+#: hides under it.
+CHILD_COVARIANCE_TOL = 1e-9
+
+
+def _star_rank_constancy(rank_per_q, tables):
+    """Is the transfer's retained rank CONSTANT on each symmetry star?
+
+    THE PRECONDITION UNDER THE PRECONDITION.  Orbit closure of ``keep`` is what
+    gives the child an unfold table; it is not what makes the child's tensors
+    unfold.  That needs ``T[q] = U^S T[i(q)] (U^L)†``, and ``T`` is built by a
+    RANK-TRUNCATED solve.  If ``S_SS[q]`` is covariant its spectrum is
+    identical across a star, so the retained rank must be constant on each
+    star; a star that spends different ranks at different members has been
+    handed non-covariant Grams, and no selection rule can repair that.
+
+    Cheap — a group-by over 64 integers — and it is the first thing to read
+    when the covariance gate fails, because it separates "the tables are wrong"
+    from "the operands were never covariant".
+
+    Returns ``(constant, worst_star, worst_spread, n_bad)``.
+    """
+    ranks = np.asarray(rank_per_q, dtype=np.int64).ravel()
+    irr = np.asarray(tables.irr_idx_q, dtype=np.int64).ravel()
+    if ranks.size != irr.size:
+        return None, -1, -1, -1
+    bad, worst, worst_star = 0, 0, -1
+    for i in np.unique(irr):
+        r = ranks[irr == i]
+        spread = int(r.max() - r.min())
+        if spread:
+            bad += 1
+            if spread > worst:
+                worst, worst_star = spread, int(i)
+    return bad == 0, worst_star, worst, bad
+
+
 def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
-                                  mu_S_pad, *, print_fn):
+                                  mu_S_pad, *, rank_per_q, print_fn):
     """THE COMPOSITION, MEASURED ON THE RUN'S OWN TENSORS.
 
     An orbit-floored selection is orbit-closed by construction, so the child
@@ -385,28 +428,75 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         worst[name] = float(np.max(np.abs(got - full))) / scale
     worst_rel = max(worst.values()) if worst else float("nan")
 
-    print_fn("\n".join([
+    passed = worst_rel < CHILD_COVARIANCE_TOL
+    lines = [
         f"  [downfold/star] CHILD WEDGE-STORABILITY GATE, on this run's own "
         f"tensors: the child's {len(slots)}-q wedge block unfolded with the "
         f"child's own tables against the full-BZ child --",
     ] + [f"  [downfold/star]   {n}: max rel {v:.3e}"
          for n, v in sorted(worst.items())] + [
-        f"  [downfold/star] the child's unfold tables are the parent's "
-        f"restricted to the kept rows (keep[alpha_S(j)] = alpha(keep[j])), so "
-        f"the phase the child applies is the phase the parent would have "
-        f"applied to those centroids.  This number is the reassociation "
-        f"floor, not an agreement band: the two routes apply the same unitary "
-        f"at different points of one chain.  A DIFFERENT algebra misses by "
-        f"order one (the red twin in tests/test_downfold.py reads 8.6e-01).",
-        f"  [downfold/star] the tables are stored in the child's "
-        f"downfold_provenance group.  The child's TENSORS are still written "
-        f"on the FULL BZ, and the blocker is named rather than left to be "
-        f"rediscovered: symmetry_maps.qirr_store refuses to stamp a wedge "
-        f"without a CentroidClosureVerdict, which is a GEOMETRIC measurement "
-        f"over the parent's symmetry operations, and those live on a WFN this "
-        f"driver does not open.  The permutation-level statement above is a "
-        f"different object and must not be stamped as if it were that one.",
-    ]))
+        f"  [downfold/star] VERDICT: {'PASS' if passed else 'REFUTED'} "
+        f"(worst {worst_rel:.3e} against tol {CHILD_COVARIANCE_TOL:.0e}).",
+    ]
+    if passed:
+        lines.append(
+            "  [downfold/star] the child's unfold tables are the parent's "
+            "restricted to the kept rows (keep[alpha_S(j)] = alpha(keep[j])), "
+            "so the phase the child applies is the phase the parent would "
+            "have applied to those centroids.  A number at this scale is the "
+            "reassociation floor and not an agreement band: the two routes "
+            "apply the same unitary at different points of one chain.")
+    else:
+        # DO NOT NARRATE AN ORDER-ONE NUMBER AS A FLOOR.  The mechanism is
+        # measured here rather than guessed at, because the two candidates
+        # want opposite fixes and the log is the only place the reader has.
+        const, worst_star, spread, n_bad = _star_rank_constancy(
+            rank_per_q, tables)
+        lines += [
+            "  [downfold/star] THE CHILD IS NOT WEDGE-STORABLE ON THIS DECK, "
+            "and orbit closure of the selection is not the missing piece — it "
+            "HOLDS (the verdict two blocks up).  Closure is what gives the "
+            "child an unfold TABLE; it is not what makes the child's TENSORS "
+            "unfold.  That needs T[q] = U^S T[i(q)] (U^L)+, and T is built by "
+            "a RANK-TRUNCATED solve.",
+        ]
+        if const is None:
+            lines.append(
+                "  [downfold/star] star-rank constancy: NOT MEASURED (the "
+                "per-q rank vector and the q tables have different lengths).")
+        elif const:
+            lines.append(
+                "  [downfold/star] star-rank constancy: the retained rank IS "
+                "constant on every star, so the truncation is not the "
+                "mechanism and the disagreement is upstream of it — suspect "
+                "the tables or the wedge-slot derivation, not the solve.")
+        else:
+            lines.append(
+                f"  [downfold/star] star-rank constancy: **REFUTED** — "
+                f"{n_bad} star(s) spend different retained ranks at different "
+                f"members, worst spread {spread} at wedge slot {worst_star}.  "
+                f"S_SS[q] is therefore NOT covariant across the star: a "
+                f"covariant Gram has an identical spectrum at every member, "
+                f"so the rank cut cannot move.  The pair-density Gram is "
+                f"built over the RETAINED BAND WINDOW, and a window that "
+                f"slices a degenerate manifold is exactly how a star-invariant "
+                f"quantity stops being one (see the band-degeneracy closure "
+                f"work of 2026-08-10).  NO selection rule can repair this; it "
+                f"is a statement about the window, not about mu_small.")
+        lines.append(
+            "  [downfold/star] the child's tables are stored anyway, WITH "
+            "this verdict beside them (covariance_worst_rel), because the "
+            "next lane needs the number and not a rebuild.  They must not be "
+            "used to write a wedge child until the verdict passes.")
+    lines.append(
+        "  [downfold/star] the child's TENSORS are written on the FULL BZ "
+        "either way, and the remaining blocker is named rather than left to "
+        "be rediscovered: symmetry_maps.qirr_store refuses to stamp a wedge "
+        "without a CentroidClosureVerdict, which is a GEOMETRIC measurement "
+        "over the parent's symmetry operations, and those live on a WFN this "
+        "driver does not open.  The permutation-level statement above is a "
+        "different object and must not be stamped as if it were that one.")
+    print_fn("\n".join(lines))
     return child_perm, child_L, slots, worst_rel
 
 
@@ -601,7 +691,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         with timing.section("downfold.star", announce=False):
             child_tables = _gate_child_wedge_storability(
                 small, keep_idx, parent_tables, mesh_xy, mu_S, mu_S_pad,
-                print_fn=print_fn)
+                rank_per_q=rank_per_q, print_fn=print_fn)
     elif parent_tables is not None:
         print_fn(
             "  [downfold/star] the selection is NOT orbit-closed, so the "
