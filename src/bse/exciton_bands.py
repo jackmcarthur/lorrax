@@ -121,6 +121,7 @@ from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
                                     check_band_window)
 from common.fft_helpers import make_sharded_ifftn_3d
+from common.provenance import lorrax_version, provenance_header
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
@@ -153,6 +154,73 @@ RY2EV = 13.6056980659
 #: the un-orthonormal Galerkin route would have printed.  If it fails, the
 #: window is wrong or the basis cannot span it; report, do not widen.
 REFIT_CERT_TOL_MEV = 0.01
+
+#: The SECOND certification grade, and it is a grade rather than a dial.
+#:
+#: 1.0 meV, for a deliverable whose features live at TENS of meV: an exciton
+#: band structure read as a picture — where the dispersion is, which valley is
+#: lowest, how the multiplets order along the path.  A curve certified here is
+#: NOT a reference number and must never be quoted as one.
+#:
+#: WHY IT EXISTS.  The windowed-ζ' route carries a representability error with
+#: no downfold in it at all, and on the Si 4×4×4 / μ=960 lineage it was 0.858
+#: meV — 86x over :data:`REFIT_CERT_TOL_MEV`, so at reference grade that route
+#: produces no picture, and the only path to 0.01 meV off-grid is a
+#: 2x-centroid GW re-run.  Refusing to draw a 10 meV feature because a 0.9 meV
+#: floor is not a 0.01 meV floor is the wrong trade for a picture and the right
+#: one for a number, so both are named and the default stays the number.
+#:
+#: **1.0 meV IS NOT A CLAIM THAT ANY PARTICULAR DECK CLEARS IT, and on that
+#: deck it does not.**  The 0.858 meV was measured at the four on-grid Q a
+#: ``--q-per-segment 1`` path reaches, all of them segment CORNERS.  Run the
+#: same parent on a real bandstructure path (``--q-per-segment 16``, which is
+#: the default) and the interior on-grid Q are a different population: 22.952
+#: meV at (0, ¼, ¼) and 6.110 meV at (¼, ¼, ¼), against 0.841 / 0.034 / 0.020
+#: at the corners the old control shared.  See
+#: ``tests/known_failures/2026-08-11-refit-vq-sharded-fetch-and-cert-grades.md``
+#: §4.  So this grade is a statement about what a PICTURE needs, never a
+#: prediction about a route, and a deck that misses it is telling you its
+#: exchange error is the size of the features — which is the one thing a
+#: figure must not be drawn through.
+#:
+#: WHAT IT IS NOT.  Not a free dial: there are exactly TWO grades, both module
+#: constants, and ``--cert-grade`` selects between them by name.  Nothing on
+#: the command line, in the environment or in a deck can produce a third
+#: tolerance.  The dual-solve certification RUNS unchanged at this grade and
+#: REFUSES above it — a visualization-grade run that fails is still a run that
+#: wrote no ``.dat`` and no ``.png``.  And on a pass the grade and the
+#: certified NUMBER are stamped into the run's provenance block, the ``.dat``
+#: header and the rendered plot, so a figure cannot be separated from the
+#: tolerance it was drawn under.
+CERT_TOL_VISUALIZATION_MEV = 1.0
+
+#: The whole tolerance surface, by name.  A grade is chosen from this table
+#: and nowhere else; ``--cert-grade``'s ``choices`` are its keys, so an
+#: unknown grade is an argparse refusal rather than a silent default.
+CERT_TOL_BY_GRADE = {
+    "reference": REFIT_CERT_TOL_MEV,
+    "visualization": CERT_TOL_VISUALIZATION_MEV,
+}
+
+#: What a stamped artefact says about itself.  One spelling, used by the
+#: provenance line, the ``.dat`` header and the plot, so the three cannot
+#: drift apart and a grep for the words finds all three.
+CERT_GRADE_LABEL = {
+    "reference": "reference grade",
+    "visualization": "visualization grade",
+}
+
+
+def cert_grade_stamp(grade: str, worst_mev: float) -> str:
+    """The one-line certification stamp: the GRADE and the NUMBER, together.
+
+    A grade without its number invites "certified" to be read as "exact", and
+    a number without its grade invites a 0.9 meV curve to be quoted as a
+    reference. They travel as one string or the claim is not made.
+    """
+    return (f"CERTIFIED {CERT_GRADE_LABEL[grade]}: worst max|dE_S| "
+            f"{worst_mev:.5f} meV against the "
+            f"{CERT_TOL_BY_GRADE[grade]:g} meV {grade} gate")
 
 
 def _gather_host(x):
@@ -516,7 +584,7 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
 
 def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
                                   evs_stored_route, kgrid_vq, log=print,
-                                  tol_mev: float = REFIT_CERT_TOL_MEV):
+                                  grade: str = "reference"):
     """THE gate for ``--refit-window=bse``: contracted, not tile-level.
 
     CERTIFY WHERE CONSUMED, one level up.  With ζ' fitted on the BSE window
@@ -532,16 +600,30 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
     and to nothing else, and it is measured in the units the curve is
     published in.
 
-    The tolerance is a MODULE CONSTANT and this function takes no route to
-    relaxing it; see :data:`REFIT_CERT_TOL_MEV`.  A failure here means the
-    windowed ζ' is not the same exchange operator on the BSE pair space — the
-    window is wrong, or the parent basis cannot span it — and the honest
-    response is to report the number, not to move the line.
+    THE TOLERANCE IS A NAMED GRADE, NOT A NUMBER THIS FUNCTION ACCEPTS.  It
+    takes ``grade``, a key of :data:`CERT_TOL_BY_GRADE`, and reads the
+    tolerance out of the module constant behind it — ``reference`` (default,
+    :data:`REFIT_CERT_TOL_MEV`, the published-number gate) or
+    ``visualization`` (:data:`CERT_TOL_VISUALIZATION_MEV`, the picture gate).
+    There are two and there is no third: a float parameter here would be a
+    route to making a failed certification pass, which is what the original
+    constant's docstring refused and what this signature keeps refusing.  A
+    failure at EITHER grade means the windowed ζ' is not the same exchange
+    operator on the BSE pair space — the window is wrong, or the basis cannot
+    span it — and the honest response is to report the number.
 
-    Returns the per-Q rows ``(iQ, tile_index, max|Δ| meV)`` so the caller can
-    put them in the ``.dat`` header: a certification whose numbers do not
-    travel with the data is a claim, not a record.
+    Returns ``(rows, worst)`` — the per-Q ``(iQ, tile_index, max|Δ| meV)`` and
+    the worst of them — so the caller can stamp both the numbers and the
+    certified worst into the ``.dat`` header, the provenance line and the
+    plot: a certification whose numbers do not travel with the data is a
+    claim, not a record.
     """
+    if grade not in CERT_TOL_BY_GRADE:
+        raise SystemExit(
+            f"exciton_bands: cert grade {grade!r} is not one of "
+            f"{sorted(CERT_TOL_BY_GRADE)}.  Grades are module constants; "
+            f"there is no third tolerance to reach.")
+    tol_mev = CERT_TOL_BY_GRADE[grade]
     kg = np.asarray(kgrid_vq, dtype=int)
     rows, worst, worst_iQ = [], 0.0, -1
     for j, iQ in enumerate(cert_idx):
@@ -559,18 +641,30 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"max|ΔE_S| refit-route vs stored-route = {dmax:.5f} meV "
             f"over {len(d_mev)} levels")
     log(f"  [refit-cert] WORST {worst:.5f} meV at Q#{worst_iQ} over "
-        f"{len(rows)} on-grid Q, gate {tol_mev:g} meV — this is the "
-        f"BSE-window ζ' certification, and it replaces (does not relax) the "
-        f"tile-level on-grid null, which a windowed ζ' cannot satisfy.")
+        f"{len(rows)} on-grid Q, gate {tol_mev:g} meV ({grade} grade) — this "
+        f"is the BSE-window ζ' certification, and it replaces (does not "
+        f"relax) the tile-level on-grid null, which a windowed ζ' cannot "
+        f"satisfy.")
     if not np.isfinite(worst) or worst > float(tol_mev):
         raise SystemExit(
             f"exciton_bands --refit-window=bse: the BSE-window ζ' refit does "
             f"NOT reproduce the stored-tile BSE eigenvalues on the coarse "
             f"grid — worst max|ΔE_S| = {worst:.5f} meV at Q#{worst_iQ} "
-            f"against the {tol_mev:g} meV gate.  Every OFF-grid exchange tile "
-            f"in this run comes from the same ζ', so nothing on this path is "
-            f"worth plotting.\n"
-            f"  This is not a tolerance to widen.  What it says is that the "
+            f"against the {tol_mev:g} meV {grade} gate.  Every OFF-grid "
+            f"exchange tile in this run comes from the same ζ', so nothing "
+            f"on this path is worth plotting.\n"
+            + ("  --cert-grade=visualization is the ONE other gate that "
+               f"exists ({CERT_TOL_VISUALIZATION_MEV:g} meV, for a picture "
+               f"and never for a quoted number); this run is already at it, "
+               f"so there is nothing further to select.\n"
+               if grade == "visualization" else
+               f"  --cert-grade=visualization is the ONE other gate that "
+               f"exists ({CERT_TOL_VISUALIZATION_MEV:g} meV).  It is for a "
+               f"FIGURE whose features live at tens of meV and never for a "
+               f"quoted number, and this run missed the reference gate by "
+               f"{worst / max(float(tol_mev), 1e-300):.0f}x — decide whether "
+               f"the deliverable is a picture before reaching for it.\n")
+            + f"  This is not a tolerance to widen.  What it says is that the "
             f"re-fitted ζ' is not the same exchange operator on the BSE pair "
             f"space as the producer's ζ, which is a statement about the "
             f"WINDOW and the BASIS:\n"
@@ -582,8 +676,15 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"Galerkin full-r residual from refit_prepare;\n"
             f"    * or the BSE window itself cuts a multiplet — check the "
             f"band-window lines above.\n"
-            f"  Report the number.  Do not raise REFIT_CERT_TOL_MEV.")
-    return rows
+            f"  Report the number.  Do not raise REFIT_CERT_TOL_MEV, and do "
+            f"not read --cert-grade as a way to: it selects between two "
+            f"NAMED grades that mean different things about the artefact, "
+            f"and neither of them is a number to edit.")
+    log(f"  [refit-cert] {cert_grade_stamp(grade, worst)} — stamped into the "
+        f"provenance line, the .dat header and the plot below, so no figure "
+        f"from this run can be separated from the tolerance it was drawn "
+        f"under.")
+    return rows, worst
 
 
 def apply_q_per_segment(params, q_per_segment, log=print) -> int:
@@ -1049,6 +1150,24 @@ def build_parser():
                          "against the same eigenvalues through the stored "
                          "tiles, at "
                          f"{REFIT_CERT_TOL_MEV:g} meV.")
+    ap.add_argument("--cert-grade", choices=tuple(CERT_TOL_BY_GRADE),
+                    default="reference",
+                    help="which NAMED tolerance the --refit-window=bse "
+                         "contracted certification is held to.  'reference' "
+                         f"(default, unchanged): {REFIT_CERT_TOL_MEV:g} meV, "
+                         "the gate a published NUMBER has to clear.  "
+                         "'visualization': "
+                         f"{CERT_TOL_VISUALIZATION_MEV:g} meV, for a "
+                         "deliverable that is a PICTURE — an exciton band "
+                         "structure whose features live at tens of meV — on "
+                         "a route whose own floor is ~0.9 meV.  The "
+                         "certification still RUNS and still REFUSES above "
+                         "the grade it was given; on a pass the grade and "
+                         "the certified number are stamped into the "
+                         "provenance line, the .dat header and the .png.  "
+                         "These two are the whole surface: both are module "
+                         "constants (CERT_TOL_BY_GRADE) and there is no flag, "
+                         "env var or deck key that produces a third number.")
     ap.add_argument("--refit-r-chunk", type=int, default=2048,
                     help="r-grid chunk of the refit Z build (vq_interp."
                          "refit_prepare); the per-chunk pair-density temp "
@@ -1720,7 +1839,12 @@ def main(argv=None):
                 f"{[int(i) for i in cert_idx]} — each solved twice, once "
                 f"through the refit exchange and once through the stored "
                 f"V_qmunu tile, in the same scan.  Gate: "
-                f"{REFIT_CERT_TOL_MEV:g} meV on every eigenvalue.")
+                f"{CERT_TOL_BY_GRADE[args.cert_grade]:g} meV on every "
+                f"eigenvalue ({CERT_GRADE_LABEL[args.cert_grade]}"
+                + ("" if args.cert_grade == "reference" else
+                   f", selected with --cert-grade={args.cert_grade}; the "
+                   f"curve this run writes is a PICTURE and its levels are "
+                   f"not reference numbers") + ").")
         tick("refit_prepare_and_null", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
@@ -2040,11 +2164,19 @@ def main(argv=None):
     # ── THE CERTIFICATION for --refit-window=bse, before a single number is
     #    written.  Refit route (already in ``evs_path``) against stored route
     #    (the twin rows) at the same Q, same caches, same solver. ──────────
-    cert_rows = []
+    cert_rows, cert_worst = [], None
     if cert_idx:
-        cert_rows = _certify_refit_against_stored(
+        cert_rows, cert_worst = _certify_refit_against_stored(
             cert_idx, Qpath, evs_path, evs_all[nQ:nQ + n_cert],
-            kgrid_vq, log=log)
+            kgrid_vq, log=log, grade=args.cert_grade)
+        # PROVENANCE.  The run's own rank-0 block is what outranks every page
+        # in the register (AGENT_PREAMBLE), so the grade and the certified
+        # number are stated there before the first byte of output is written,
+        # in the same words the .dat and the .png will carry.
+        log(f"  [provenance] LORRAX {lorrax_version()}: "
+            f"{cert_grade_stamp(args.cert_grade, cert_worst)}; "
+            f"refit window={args.refit_window}, {len(cert_rows)} on-grid "
+            f"certification Q, out-prefix {args.out_prefix}")
 
     # ── outputs (rank 0 ONLY — the .dat / .png writes and the plot must not
     #    race across the 16 processes; evs_all is fully addressable on every
@@ -2054,6 +2186,7 @@ def main(argv=None):
         dat = args.out_prefix + ".dat"
         with open(dat, "w", encoding="utf8") as fh:
             fh.write("# Exciton bandstructure E_S(Q), TDA, LORRAX\n")
+            fh.write(provenance_header())
             fh.write(f"# input: {os.path.abspath(args.input)}\n")
             fh.write(f"# window: n_val={n_val} n_cond={n_cond}; n_eig={args.n_eig}; "
                      f"kgrid {nkx}x{nky}x{nkz}; vq_mode={args.vq_mode}\n")
@@ -2069,10 +2202,22 @@ def main(argv=None):
                 # THE CERTIFICATION TRAVELS WITH THE DATA.  A gate whose
                 # numbers live only in a log is a claim about a file nobody
                 # has; these are the numbers that say this curve is trusted.
-                fh.write(f"# refit-cert: contracted on-grid gate, refit route "
-                         f"vs stored V_qmunu route, {REFIT_CERT_TOL_MEV:g} meV; "
-                         f"worst {max(r[2] for r in cert_rows):.5f} meV over "
-                         f"{len(cert_rows)} Q\n")
+                fh.write(f"# refit-cert: {cert_grade_stamp(args.cert_grade, cert_worst)}"
+                         f", contracted on-grid gate (refit route vs stored "
+                         f"V_qmunu route) over {len(cert_rows)} Q\n")
+                if args.cert_grade != "reference":
+                    # SAY IT IN WORDS, IN THE FILE.  A reader who meets this
+                    # .dat with no log has to be able to tell a picture from
+                    # a reference number without asking anyone.
+                    fh.write(f"# refit-cert-grade: VISUALIZATION GRADE — "
+                             f"certified only to "
+                             f"{CERT_TOL_VISUALIZATION_MEV:g} meV, which is "
+                             f"the tolerance for READING THIS AS A PICTURE "
+                             f"(features at tens of meV).  These levels are "
+                             f"NOT reference numbers; the "
+                             f"{REFIT_CERT_TOL_MEV:g} meV reference grade is "
+                             f"the default and is what a quoted eigenvalue "
+                             f"needs.\n")
                 for iQ, tile, dmax in cert_rows:
                     fh.write(f"#   Q#{iQ} tile {tile}: "
                              f"max|dE_S| = {dmax:.5f} meV\n")
@@ -2128,6 +2273,16 @@ def main(argv=None):
         ax.set_title("Exciton bandstructure (TDA)")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
+        if cert_worst is not None:
+            # ON THE PICTURE ITSELF.  A .dat header travels with the data and
+            # a log travels with nobody; the figure is the thing that ends up
+            # in a talk, and it is the one artefact that must not be able to
+            # arrive without its grade.  ``tight_layout`` first, then the
+            # reserved strip, so the stamp cannot be laid over the axes.
+            fig.subplots_adjust(bottom=0.18)
+            fig.text(0.01, 0.012,
+                     cert_grade_stamp(args.cert_grade, cert_worst),
+                     fontsize=6.5, color="#5A5A5A", ha="left", va="bottom")
         png = args.out_prefix + ".png"
         fig.savefig(png, dpi=180)
         print(f"Wrote {png}")

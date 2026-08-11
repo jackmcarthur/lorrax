@@ -2710,7 +2710,6 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     off-grid refit number is quoted.
     """
     import time as _time
-    from bandstructure.bse_setup import compute_wfns_fi
 
     t0 = _time.time()
     nk, nb, ns, n_mu = zx["nk"], zx["nb"], zx["ns"], zx["n_mu"]
@@ -2730,6 +2729,18 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         c_m = None
         psi_m_r = psi_r[jnp.asarray(kqs)]
     else:
+        # IMPORTED IN THE BRANCH THAT USES IT.  ``bandstructure.bse_setup``
+        # pulls in ``htransform``, whose module body runs
+        # ``initialize_communicator_stack()`` and with it the REQUIRED-FFI
+        # gate.  The ``"stored"`` leg never calls ``compute_wfns_fi``, so at
+        # function scope that import made a leg that needs no htransform
+        # refuse on a machine with no built ``liblorrax_ffi_host.so`` — which
+        # is every off-cluster bench, and it is what kept the P>1 twin below
+        # from being runnable anywhere but a compute node.  Production is
+        # unchanged: this branch IS the htransform leg, and ``refit_prepare``
+        # has already imported the same stack before any caller gets here.
+        from bandstructure.bse_setup import compute_wfns_fi
+
         # m-leg q list: wrap(k − q) for every coarse k, via htransform
         k_frac = zx["k_int"].astype(np.float64) / zx["kgrid"][None, :]
         qm_list = k_frac - qw[None, :]
@@ -2775,7 +2786,27 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         .reshape(n_mu, zx["n_rtot"])
     GS = _sphere_millers(zx, qw)
     fi = flat_idx(zx, GS)
-    zt = np.asarray(jax.device_get(ztG_box[:, jnp.asarray(fi)]))
+    # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get, and
+    # THE PARITY OF n_μ IS WHY THAT WAS NOT OBVIOUS.  ζ inherits its μ-axis
+    # sharding from ``psi_m_mu`` — ``bse_setup``'s ``psi_rmu_Y``, laid out
+    # ``P(None, None, None, 'y')`` — so ``ztG_box`` is μ-sharded across the
+    # mesh and, at P>1, across PROCESSES.  ``jax.device_get`` on that raises
+    # "Fetching value for a jax.Array that spans non-addressable (non process
+    # local) devices" (measured at 4 GPUs in 4 processes on the μ=960 parent,
+    # `qsign_recut_0811/_logs/xb_ctl_parent.log`).
+    #
+    # It hid for as long as it did because ``sharding_fit`` silently declines
+    # a spec the extent cannot satisfy: at the μ=191 child, 191 % 2 != 0, the
+    # μ axis is REPLICATED instead, and ``Array._value`` serves a fully
+    # replicated array out of the local shard before it ever reaches the
+    # addressability check — so the identical call works.  Every P=4 leg the
+    # refit path had ever had was the odd-μ child, and odd μ cannot see this
+    # by construction.  ``gather_to_host`` covers all three shapes in the one
+    # branch it already owns: device_get when fully addressable (P=1),
+    # addressable_data(0) when replicated (the odd-μ arm, still no
+    # collective), process_allgather(tiled=True) when genuinely sharded.
+    # Placement only — the tile below is arithmetic on the same values.
+    zt = _to_host(ztG_box[:, jnp.asarray(fi)])
     zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qw))[:, None] * zt
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
