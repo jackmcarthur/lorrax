@@ -52,6 +52,7 @@ from __future__ import annotations
 import contextlib
 import time
 
+import jax
 import numpy as np
 
 from file_io import mpa_store
@@ -73,6 +74,38 @@ __all__ = [
 #: some blocks and not others reads back as zero for the rest, and a
 #: zero condition number is a perfectly conditioned solve.
 _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
+
+
+#: Compiled fused-fit executables, keyed by everything that is static to
+#: the trace.  A module-level cache rather than a fresh ``jax.jit`` per
+#: block, for the reason ``sigma_pass`` keeps one: a jit object built
+#: inside the call is a new object every call, and a new object has an
+#: empty compilation cache, so the walk would pay a full compile per
+#: block and report it as run time.
+_FUSED_FITS = {}
+
+
+def _fused_fit_fn(n_p, guards, rcond, solve, affine, eig):
+    """The jitted batched fit for one static configuration.
+
+    Everything the kernel branches on -- ``n_p``, the solve mode, the
+    affine flag, the eigensolver, the guard dict -- is closed over rather
+    than passed, because all of it is resolved at trace time anyway and
+    closing over it is what lets the executable be cached on it.
+    """
+
+    key = (int(n_p), str(solve), bool(affine), str(eig), float(rcond),
+           tuple(sorted((str(k), guards[k]) for k in guards))
+           if guards else ())
+    fn = _FUSED_FITS.get(key)
+    if fn is None:
+        def _fit(tile, z):
+            return pade_fit.fit_mpa_poles_batched(
+                tile, z, int(n_p), guards=guards, rcond=rcond,
+                solve=solve, affine=affine, eig=eig)
+        fn = jax.jit(_fit)
+        _FUSED_FITS[key] = fn
+    return fn
 
 
 def _elements_from_block(block):
@@ -116,6 +149,9 @@ def fit_one_block(
     out_spec=None,
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
+    eig=pade_fit.EIG_MODES[0],
+    fused=False,
+    pad_elements=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -154,20 +190,29 @@ def fit_one_block(
 
     Notes
     -----
-    THE BACKWARD ERROR COSTS A SECOND DISPATCH, and it is not optional.
-    ``mpa_store.write_fit_block`` REQUIRES ``condition`` and
-    ``backward_error``: the Sigma stage's certification refuses poles
+    THE BACKWARD ERROR IS FREE NOW, AND THE DOOR IT COMES THROUGH IS
+    STILL THERE.  ``mpa_store.write_fit_block`` REQUIRES ``condition``
+    and ``backward_error``: the Sigma stage's certification refuses poles
     that fail its gates, and a pole whose conditioning nobody recorded
-    can only be trusted, never refused.  But ``pade_fit.fit_mpa_poles``
-    returns ``cond_pade`` and no backward error — the backward error
-    lives in ``diagnostics.solve_conditioning``, which re-solves the
-    system AND re-runs the whole fit internally to report its forward
-    residual.  So one logical block costs TWO complete fits per element
-    and THREE solves of the Pade-in-z^2 system: one in the fit, one
-    standalone in ``solve_conditioning``, and one more inside the fit
-    that function runs for itself.  The cost report states the
-    dispatches, the fits and the Pade solves separately rather than
-    quoting whichever is smallest; see :func:`format_cost_report`.
+    can only be trusted, never refused.  Those two numbers used to cost a
+    whole second fit of every element, because ``fit_mpa_poles`` returned
+    the condition number and not the backward error, and the only
+    supplier — ``diagnostics.solve_conditioning`` — re-solved the system
+    and refit the element to produce one.  Both halves of that are gone:
+    the reconditioning lane made the fit report its own backward error
+    (mode-aware, so the Loewner path reports the Loewner reduction's and
+    not a Pade system nobody inverted), and this driver now hands the
+    fit's own diagnostics to the conditioning door rather than asking it
+    to go and find out.  ONE fit, ONE solve, per element.
+
+    The door is still called, once per block, with the block's solve
+    mode.  That is deliberate and it is tested
+    (``test_hardeners_leave_the_conditioning_call_path_alone``): the
+    contract the perf fleet's §FIT-EFFICIENCY restructure pinned is that
+    the driver keeps asking and the asking gets cheap, not that the
+    driver stops asking.  A driver that quietly dropped the call would
+    leave the store's two required numbers with no named supplier, and
+    the next lane to need a third one with nowhere to put it.
     """
     n = int(n_p)
     t_read = time.perf_counter()
@@ -197,11 +242,46 @@ def fit_one_block(
     tile = _elements_from_block(block)
 
     t_fit = time.perf_counter()
-    Omega, B, diag = pade_fit.fit_mpa_poles_batched(
-        tile, z, n, guards=guards, rcond=rcond, solve=solve, affine=affine)
-    cond_diag = diagnostics.diagnostics_batched(
-        diagnostics.solve_conditioning, tile, z, n, rcond=rcond,
-        solve=solve, affine=affine)
+    if fused:
+        # ONE EXECUTABLE FOR EVERY BLOCK, WHICH IS WHAT THE PADDING BUYS.
+        # ``jax.jit`` keys its cache on input SHAPE, and the last column
+        # block of a q is narrower than the rest, so an unpadded walk
+        # compiles the kernel twice and pays the second compile in the
+        # middle of the run.  Padding every block up to the plan's widest
+        # gives one shape, one trace, one compile.  The padded rows are
+        # zero, which the fit reduces to zero poles that the range guard
+        # drops; they are sliced off before anything sees them, so they
+        # cannot reach the store or the cost counters.
+        n_el = int(tile.shape[0])
+        width = n_el if pad_elements is None else int(pad_elements)
+        if width < n_el:
+            raise ValueError(
+                f"fit_one_block: pad_elements={width} is narrower than the "
+                f"block's {n_el} elements.  FALSE case: pad_elements is the "
+                "widest block the walk will produce (n_mu * the column "
+                "budget), so every block fits inside it.")
+        tile_in = tile
+        if width != n_el:
+            tile_in = np.zeros((width, tile.shape[1]), dtype=tile.dtype)
+            tile_in[:n_el] = tile
+        Omega, B, diag = _fused_fit_fn(
+            n, guards, rcond, solve, affine, eig)(tile_in, z)
+        if width != n_el:
+            Omega = Omega[:n_el]
+            B = B[:n_el]
+            diag = jax.tree.map(lambda a: a[:n_el], diag)
+    else:
+        Omega, B, diag = pade_fit.fit_mpa_poles_batched(
+            tile, z, n, guards=guards, rcond=rcond, solve=solve,
+            affine=affine, eig=eig)
+    # THE CONDITIONING DOOR, ASKED WITH THE ANSWER IN HAND.  ``fit_diag``
+    # turns this from a second vmapped fit of the whole block into a
+    # rename of keys the fit already returned, which is why the numbers
+    # the store stamps agree with the fit's by construction instead of by
+    # an argument about operand order.  The call stays because the seam
+    # stays; see this function's Notes.
+    cond_diag = diagnostics.solve_conditioning(
+        tile, z, n, rcond=rcond, solve=solve, affine=affine, fit_diag=diag)
     Omega = np.asarray(Omega)
     B = np.asarray(B)
     t_fit = time.perf_counter() - t_fit
@@ -234,9 +314,13 @@ def fit_one_block(
         "n_elements": int(n_mu * n_cols),
         "bytes_read": int(block.size) * mpa_store.COMPLEX128_BYTES,
         "fit_dispatches": 1,
-        "diagnostic_dispatches": 1,
-        "full_fits": 2 * int(n_mu * n_cols),
-        "pade_solves": 3 * int(n_mu * n_cols),
+        # THE CONDITIONING DOOR NO LONGER DISPATCHES.  It is a projection
+        # of the fit's own diag, so there is no second launch to count;
+        # the key stays in the report because a counter that vanishes
+        # when it reaches zero is a counter nobody can prove reached it.
+        "diagnostic_dispatches": 0,
+        "full_fits": 1 * int(n_mu * n_cols),
+        "pade_solves": 1 * int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
         "seconds_write": t_write,
@@ -258,6 +342,8 @@ def run_fit_driver(
     report_stream=None,
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
+    eig=pade_fit.EIG_MODES[0],
+    fused=False,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
 
@@ -283,6 +369,11 @@ def run_fit_driver(
             "stamp below exists to close is a fit store that cannot say "
             "which algebra made it, and silently substituting the default "
             "for a typo is how that store gets written.")
+    # THE SAME REFUSAL FOR THE EIGENSOLVER, AND FOR THE SAME REASON.  The
+    # two backends do not agree bit for bit, so a store whose poles came
+    # from one of them and whose stamp says the other is a store nobody
+    # can re-derive.
+    pade_fit._check_eig_mode(eig)
     n = int(n_p)
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
@@ -359,14 +450,25 @@ def run_fit_driver(
         # documented as such in the format's prose.  Orthogonal to the
         # unfold tables above: one says where the poles live, the other
         # says how they were solved for.
+        # WHICH ROOT-FINDER, AND WHETHER IT RAN FUSED, stamped beside
+        # which algebra.  ``eig_mode`` changes the poles in the last
+        # digits and ``fused`` changes the order XLA does the arithmetic
+        # in, so neither is cosmetic: two stores that disagree at 1e-12
+        # are reconcilable if they say why and unattributable if they do
+        # not.  Absence of these keys reads as "lapack, unfused", which
+        # is what every store written before 2026-08-10 is.
         provenance=dict(provenance or {},
                         solve_mode=str(solve),
                         solve_affine=bool(affine),
-                        solve_rcond=float(rcond)))
+                        solve_rcond=float(rcond),
+                        eig_mode=str(eig),
+                        fit_fused=bool(fused)))
 
     report = {
         "solve": str(solve),
         "affine": bool(affine),
+        "eig": str(eig),
+        "fused": bool(fused),
         "rcond": float(rcond),
         "screening_content": content,
         "n_q": int(n_q),
@@ -391,12 +493,16 @@ def run_fit_driver(
     }
 
     spec = tiling.row_shard_spec()
+    # The widest block the walk can produce, which is what every block is
+    # padded up to under ``fused`` so the executable is compiled once.
+    pad_elements = int(n_mu) * int(plan["n_cols"])
     ledger = None
     for q, lo, hi in tiling.fit_schedule(n_q, n_mu, n_omega, tile_bytes):
         stats = fit_one_block(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
             tile_bytes=tile_bytes, guards=guards, rcond=rcond,
-            out_spec=spec, solve=solve, affine=affine)
+            out_spec=spec, solve=solve, affine=affine, eig=eig,
+            fused=fused, pad_elements=pad_elements)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1
         report["columns_read"] += stats["n_cols"]
@@ -441,21 +547,25 @@ def format_cost_report(report):
     beside each other so nobody has to infer the second from the first.
 
     SO THREE COUNTS ARE PRINTED, NOT ONE.  ``dispatches`` is what the
-    scheduler sees: two vmapped launches per block.  ``full fits`` is
-    what the elements see: TWO per element, because the store requires
-    a backward error, ``pade_fit.fit_mpa_poles`` does not return one,
-    and the only supplier — ``diagnostics.solve_conditioning`` — runs a
-    complete fit of its own to report a forward residual beside it.
-    ``Pade solves`` is what the linear algebra sees: THREE per element,
-    the two fits' plus the standalone equilibrated solve
-    ``solve_conditioning`` does before them.
+    scheduler sees, ``full fits`` is what the elements see, and ``Pade
+    solves`` is what the linear algebra sees.  They are printed side by
+    side because they are not the same number and a report that quotes
+    whichever of them is smallest is a report that has chosen its own
+    grade.
 
-    None of that factor is this driver's doing; it is a property of the
-    seam between the fit kernel and the staged store, and it is printed
-    rather than absorbed because the design review is where it can be
-    removed — a ``backward_error`` returned from ``fit_mpa_poles``
-    beside the ``cond_pade`` it already computes would collapse all
-    three counts to one dispatch, one fit and one solve.
+    THEY ARE ALL ONE NOW, AND THE PREVIOUS PARAGRAPH IS WHY THEY ARE
+    STILL PRINTED.  This report used to read two dispatches, two full
+    fits and three Pade solves per element, and it said in this docstring
+    that a ``backward_error`` returned from ``fit_mpa_poles`` beside the
+    ``cond_pade`` it already computes would collapse all three to one.
+    That is exactly what happened: the reconditioning lane made the fit
+    report its own (mode-aware) backward error, and the fit driver now
+    hands the fit's diag to ``diagnostics.solve_conditioning`` instead of
+    asking it to refit the block.  The counts stay in the report because
+    the way this factor came back last time was that nobody was counting
+    — a vmapped block is still not one solve merely because it is one
+    dispatch, and the day some lane needs a quantity the fit does not
+    return, these three numbers are where it will show up.
     """
     r = report
     sec = r["seconds"]
@@ -477,6 +587,12 @@ def format_cost_report(report):
         + f", rcond={r['rcond']:.1e}"
         + "  [stamped as prov_solve_mode / prov_solve_affine /"
         " prov_solve_rcond]",
+        # THE ROOT-FINDER AND THE FUSION, ON THE SAME FOOTING AS THE
+        # SOLVE, because production reaches both through a default too
+        # and an A/B arm's log has to be evidence of which arm it was.
+        f"  eig             {r['eig']}, "
+        f"fused={'yes' if r['fused'] else 'no'}"
+        + "  [stamped as prov_eig_mode / prov_fit_fused]",
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "
         f"{r['n_cols_budget']} columns per block",
@@ -488,11 +604,10 @@ def format_cost_report(report):
         f"  dispatches      {r['fit_dispatches']} fit + "
         f"{r['diagnostic_dispatches']} diagnostic, vmapped",
         f"  full fits       {r['full_fits']} "
-        f"(2 per element: the fit, and the one solve_conditioning "
-        f"runs to report a forward residual)",
+        f"(1 per element: the fit, whose own diag answers the "
+        f"conditioning door)",
         f"  Pade solves     {r['pade_solves']} "
-        f"(3 per element: the two fits', plus solve_conditioning's own "
-        f"equilibrated solve)",
+        f"(1 per element: the fit's; the door re-solves nothing)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "

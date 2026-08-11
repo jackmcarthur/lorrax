@@ -31,6 +31,24 @@ import jax.numpy as jnp
 from . import pade_fit
 
 
+#: The keys :func:`solve_conditioning` serves, and the ``fit_mpa_poles``
+#: diagnostic each one IS.  Written as a map rather than inline in the
+#: return statement because both of that function's arms return exactly
+#: this projection, and two hand-written copies of it are two things that
+#: can drift apart.  Every entry is a quantity the fit computed on its way
+#: to the poles; none of them is recoverable only by a second fit.
+_CONDITIONING_FROM_DIAG = {
+    "cond": "cond_pade",
+    "sigma_max": "sigma_max_pade",
+    "sigma_min": "sigma_min_pade",
+    "backward_error": "backward_error",
+    "forward_residual": "max_abs_residual",
+    "rel_rms_residual": "rel_rms_residual",
+    "rsd_eq28": "rsd_eq28",
+    "n_valid": "n_valid",
+}
+
+
 def solve_conditioning(
     W_samples,
     z_samples,
@@ -39,6 +57,7 @@ def solve_conditioning(
     rcond=1.0e-13,
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
+    fit_diag=None,
 ):
     """Conditioning and backward error of the DENOMINATOR solve.
 
@@ -77,7 +96,46 @@ def solve_conditioning(
         ``max_j |W_model(z_j) - W_c(z_j)|`` of the finished fit, i.e.
         after roots, guards and the residue refit.  Kept alongside the
         backward error because they fail independently.
+
+    Parameters
+    ----------
+    fit_diag
+        The ``diag`` pytree ``pade_fit.fit_mpa_poles`` (or its batched
+        form) ALREADY returned for these very samples.  When it is given
+        this function runs no solve and no fit; it projects the store's
+        numbers out of the fit's own diagnostics and returns them.
+
+        THIS IS THE CHEAP DOOR, AND IT IS STILL A DOOR.  The driver's
+        seam is that it asks this function for the two numbers
+        ``mpa_store.write_fit_block`` requires -- and the obligation the
+        perf fleet's §FIT-EFFICIENCY restructure pinned is that the
+        driver KEEPS ASKING while the asking stops costing a second fit,
+        not that the driver stops asking.  Passing the fit's own diag
+        honours both halves: the call site is unchanged, and the answer
+        is byte-identical to a recomputation because it is not a
+        recomputation.  Without it, the caller pays a whole second fit of
+        every element to be told what the first fit already knew.
+
+        ``None`` keeps the standalone behaviour, which is what the
+        diagnostics cells and any caller holding only samples want.
     """
+
+    if fit_diag is not None:
+        # NO SHAPE GATE ON THIS ARM, on purpose.  ``fit_diag`` may be a
+        # single element's diag or a whole vmapped tile's, and the
+        # projection is agnostic to which -- it renames keys and touches
+        # no axis.  The sample-support gate below is a statement about
+        # ONE element's grid and would refuse a tile for being a tile.
+        missing = sorted(set(_CONDITIONING_FROM_DIAG.values()) - set(fit_diag))
+        if missing:
+            raise ValueError(
+                f"GATE fit_diag_complete: fit_diag is missing {missing}. "
+                "FALSE case: fit_diag IS a diag pytree returned by "
+                "pade_fit.fit_mpa_poles (or fit_mpa_poles_batched) for "
+                "these samples -- a partial dict would serve a store some "
+                "keys it never measured, and an unmeasured condition "
+                "number reads back as a perfectly conditioned solve.")
+        return {k: fit_diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
 
     pade_fit._require_x64()
     pade_fit._check_sample_support(W_samples, z_samples, n_p)
@@ -95,16 +153,7 @@ def solve_conditioning(
     # order, because it IS the fit's.
     _, _, diag = pade_fit.fit_mpa_poles(
         w, z, n, rcond=rcond, solve=solve, affine=affine)
-    return {
-        "cond": diag["cond_pade"],
-        "sigma_max": diag["sigma_max_pade"],
-        "sigma_min": diag["sigma_min_pade"],
-        "backward_error": diag["backward_error"],
-        "forward_residual": diag["max_abs_residual"],
-        "rel_rms_residual": diag["rel_rms_residual"],
-        "rsd_eq28": diag["rsd_eq28"],
-        "n_valid": diag["n_valid"],
-    }
+    return {k: diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
 
 
 #: Hartree -> eV, for the width census only.  The fit itself never
