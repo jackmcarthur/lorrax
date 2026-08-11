@@ -527,6 +527,23 @@ silent overwrite.
     `/pscratch/sd/j/jackm/qsign_recut_0811/inleg.sh`.
     [qsign re-measurement lane, 2026-08-11]
 
+41. **`ssh -O exit perlmutter` KILLS every backgrounded launcher on the login
+    node, and `AGENT_PREAMBLE` recommends it without saying so.** The
+    certificate row says "a working `ssh` is not evidence — `ControlPersist`
+    answers past expiry; re-probe with `ssh -O exit perlmutter`". That advice
+    is correct about certificates and expensive about work: tearing down the
+    ControlMaster tears down every multiplexed session with it, and `nohup
+    ... &` does **not** survive it. Measured here — a 14-minute `bse.exciton_bands`
+    control leg died mid-Lanczos with no rc file, and the Slurm allocation
+    stayed up with only `.extern` running, so `squeue` looked healthy while the
+    step was gone. **Two cheap mitigations, both used after the fact:** launch
+    with `setsid nohup ... < /dev/null &` so the launcher leaves the ssh
+    session's process group, and never issue `ssh -O exit` while any leg is in
+    flight — re-probe the certificate with a fresh `ssh -o ControlPath=none`
+    instead, which tests the credential without evicting anyone. Worth a line
+    in `AGENT_PREAMBLE`'s certificate row next time that file is edited.
+    [qsign re-measurement lane, 2026-08-11]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module
