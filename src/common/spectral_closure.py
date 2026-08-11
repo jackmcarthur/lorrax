@@ -34,18 +34,60 @@ real and unguarded at every spectral cut in the tree.  This module is the
 enforcement the refutation left owing.  Read that file for the whole saga.
 
 WHAT THIS MODULE DOES.  Given a spectrum and a proposed cut, find the
-degenerate cluster straddling the cut, if any, and move the cut OUTWARD past
-it — the keep-more direction, the same principle ``band_degeneracy`` widens a
-window by.  Three modes, spelled the way its sibling spells them:
+degenerate cluster straddling the cut, if any, and move the cut so that the
+cluster is not split.  **The cut moves so that the whole straddled block is
+DROPPED** — the keep-fewer direction — on the owner's ruling of 2026-08-10:
 
-``"snap"`` (default here — see WHY SNAP, WHERE ITS SIBLING REFUSES)
-    Extend the retained set through the whole cluster and say so, loudly,
-    naming the cluster's values, its size, and the cut it moved.
+    "we just obtain singular values and truncate, and if we're truncating in
+     the middle of a block of degenerate singular values we should truncate
+     the whole block."
+
+Three modes, spelled the way its sibling spells them:
+
+``"snap"`` (default)
+    Close the cut in :data:`DEFAULT_DIRECTION` and say so, loudly, naming the
+    cluster's values, its size, and the cut it moved.
 ``"strict"``
     Refuse, naming the same things and the rank that would work.
 ``"off"``
     No check.  Kept for the same reason its sibling keeps one: a guard with
     no off switch gets deleted rather than configured.
+
+THE TWO-RULE FAMILY, BECAUSE THE SIBLINGS ROUND OPPOSITE WAYS ON PURPOSE
+------------------------------------------------------------------------
+Three guards in this tree quantise a user- or criterion-supplied number onto
+a symmetry-legal ladder, and a reader who has just met one will assume the
+others round the same way.  They do not, and the split is not an
+inconsistency — it is which side of the boundary is the safe one for the
+quantity being rounded.
+
+**KEPT-SET quantities FLOOR to a symmetric boundary — keep fewer.**  This
+module (drop the straddled block) and ``gw/downfold``'s orbit floor (realize
+the largest union of whole orbits that does not exceed the requested μ_S)
+both round DOWN.  What they round is a retained set, and the failure mode of
+rounding a retained set UP is that you admit directions nobody certified: at
+a rank cut the straddled block sits AT the rcond boundary, so it is
+noise-adjacent by construction and keeping it adds ill-conditioned
+directions to the very pseudo-inverse the cut exists to condition.  Flooring
+cannot do that.  It is also the strictly safe side of the amplification cap:
+dropping the smallest retained values RAISES ``λ_min(kept)``, so ``κ_eff``
+can only IMPROVE, and ``common/rank_criterion``'s cap is satisfied by
+construction rather than by a slack term (see WHAT THE FLIP DID TO κ_eff).
+
+**BAND WINDOWS include whole multiplets, or refuse.**  ``common/
+band_degeneracy`` guards a window boundary in a BAND spectrum, and there
+keep-more is the only correct repair, because the window is a statement
+about which physical states enter the calculation and half a multiplet is
+not a state of anything.  Its default is ``strict`` on the owner's ruling of
+2026-08-10 — a widened window is a DIFFERENT CALCULATION (4v4c became 4v8c,
+1024 dimensions became 2048, and a gate read 0.0906 eV of regression that no
+branch had caused), so it refuses rather than repairing, and
+``AGENT_PREAMBLE`` carries the standing rule: **never set ``snap`` to make a
+gate pass.**  That guard is untouched by this module and by the ruling above.
+
+The one-line discriminator: **a band window says WHICH STATES exist and
+rounds outward; a rank cut says HOW MANY DIRECTIONS are trustworthy and
+rounds inward.**
 
 THE TOLERANCE IS RELATIVE-TO-NEIGHBOUR, NOT RELATIVE-TO-σ_max
 --------------------------------------------------------------
@@ -85,31 +127,39 @@ measurements already in the tree.
   looking for agreement finer than the arithmetic can deliver finds nothing
   and reports a clean bill.
 
-WHY SNAP, WHERE ITS SIBLING REFUSES
------------------------------------
-``band_degeneracy`` defaults to ``strict`` on an owner ruling (2026-08-10),
-because widening a band window is *a different calculation*: 4v4c became
-4v8c, a 1024-dimension problem became 2048, and a gate read 0.0906 eV of
-regression that no branch had caused.  None of that transfers here, and the
-reason is arithmetic rather than taste.
+WHAT THE FLIP DID TO κ_eff, AND WHY THAT SETTLED THE DIRECTION
+--------------------------------------------------------------
+The guard landed (1e0d9e23) snapping the cut OUTWARD, and the argument for
+that default was a bound: the admitted directions are within ``rtol_deg`` of
+ones already retained, so ``κ_eff`` moves by at most ``(1 + rtol_deg)^m``
+across an m-member cluster — under one part in 10⁴, measured.  The bound was
+correct and it is not what was wrong with the default.  What was wrong is
+the SIGN.
 
-A snapped spectral cut admits directions whose spectral values are within
-``rtol_deg`` **of ones already retained**.  The achieved amplification the
-truncation exists to bound therefore moves by at most a factor
-``(1 + rtol_deg)^m`` across an m-member cluster — at 1e-6 and any physical
-multiplet, **under one part in 10⁴**.  Set against ``common/rank_criterion``'s
-R19 anchor, where retaining 41 % more rank moved a QP gap from 3.13 eV to
-−5049 eV, a spectral snap is not in the same universe of intervention as a
-window snap: it is a handful of directions that the criterion could not
-distinguish from ones it kept, admitted so that the retained span is a
-representation of the point group instead of a slice of one.  Refusing that
-by default would be refusing the repair, not protecting the calculation.
+Under the ruling the cut drops the block, and the two directions are not
+symmetric in their effect on the quantity the truncation exists to control:
 
-``strict`` is one word away for anyone who wants it, the achieved κ_eff
-after the snap is reported every time so the change is never invisible, and
-``rank_criterion``'s own ``violations()`` still guards the cap independently
-downstream.  Owner row: whether ``strict`` should become the default here
-too is the owner's call, not this lane's, and the flag is a single constant.
+* **drop** removes the smallest retained values, so ``λ_min(kept)`` rises and
+  ``κ_eff = λ_max/λ_min(kept)`` **falls**.  It is bounded BELOW by 1 and
+  above by the old ``κ_eff``: the amplification cap ``κ_eff ≤ 1/rcond`` that
+  ``common/rank_criterion`` derives cannot be violated by this move, in any
+  direction, at any block size.
+* **keep** admits values below the old ``λ_min(kept)``, so ``κ_eff`` **rises**
+  — by a bounded and small amount, but through the cap, which is why the
+  landed version needed a ``(1+rtol)^m`` slack term in every call site's cap
+  assertion in order not to trip its own guard.
+
+So the flip deletes a slack term rather than adding one, and the call sites
+assert the cap with **no slack at all** under the default direction.  A
+guard that has to widen the invariant it is protecting in order to fit is
+worth a second look; this one no longer does.
+
+``keep_block`` remains available per call site, for any site with a MEASURED
+reason to differ — see :data:`DIRECTIONS`.  No site in this tree uses it, and
+a site that turns out to NEED keep-more to stay correct is a finding to
+report rather than a flag to set: it would mean some downstream object
+requires the dropped directions, which is a statement about that object's
+conditioning and not about this guard.
 
 TWO EXECUTION SURFACES, ONE CRITERION
 -------------------------------------
@@ -121,10 +171,12 @@ criterion.
 :func:`resolve_spectral_cut` / :func:`cluster_at_cut` are host numpy: full
 report, full messages, ``strict`` raises where it is called.
 
-:func:`snap_keep_outward` is pure ``jnp``, batched, jit- and vmap-safe, and
+:func:`close_keep_mask` is pure ``jnp``, batched, jit- and vmap-safe, and
 returns the moved mask plus the numbers a caller needs to print.  It is a
-suffix-AND over adjacency links rather than a while-loop, so its trip count
-does not depend on the data.
+cumulative-AND over adjacency links rather than a while-loop, so its trip
+count does not depend on the data — a REVERSE one running up from the cut
+for ``drop_block``, a forward one running down from the top for
+``keep_block``, which is the only structural difference between the two.
 
 ``strict`` at a device site cannot raise where it fires — a jitted kernel
 cannot raise at all, which is the same division of labour
@@ -141,9 +193,21 @@ RELATION TO ``common/rank_criterion``
 That module decides HOW MANY directions to keep and why (a cap on how much
 the pseudo-inverse may amplify round-off); this one decides WHERE that many
 is allowed to land.  They are orthogonal and deliberately not merged: every
-call site here takes the rank ``rank_criterion`` chose and returns one that
-is at least as large, so the amplification cap is still the thing that sizes
-the retained set and this guard only refuses to let it stop mid-block.
+call site here takes the rank ``rank_criterion`` chose and, under the default
+direction, returns one that is **no larger**.  So the amplification cap is
+still the thing that sizes the retained set, this guard only refuses to let
+it stop mid-block, and the cap it was sized by holds afterwards without
+slack — ``rank_criterion.violations()`` downstream is measuring a κ_eff this
+guard can only have lowered.
+
+THE ONE FAILURE THE DROP DIRECTION HAS AND THE KEEP DIRECTION DOES NOT is
+that a block can swallow the entire retained set: if every value from
+``σ_max`` down to the cut is one degenerate block, dropping it leaves rank
+zero.  That is not a repair and it is never applied silently —
+:func:`resolve_spectral_cut` RAISES on it in every mode but ``off``, and the
+device face reports a zero count its caller must refuse on.  It means the
+spectrum is flat to ``rtol_deg`` across the whole retained range, which is a
+statement about the operator and not about the cut.
 """
 from __future__ import annotations
 
@@ -153,13 +217,17 @@ __all__ = [
     "DEFAULT_RTOL",
     "DEFAULT_MODE",
     "MODES",
+    "DEFAULT_DIRECTION",
+    "DIRECTIONS",
     "SpectralClusterError",
+    "SpectralBlockEmptiesCut",
     "degeneracy_noise_rtol",
     "cluster_at_cut",
     "resolve_spectral_cut",
     "describe_clean",
-    "snap_keep_outward",
+    "close_keep_mask",
     "resolve_mode",
+    "resolve_direction",
     "note_device_snap",
     "raise_if_pending",
     "pending",
@@ -185,8 +253,29 @@ MODES = ("snap", "strict", "off")
 #: THE ONE PLACE THE DEFAULT IS DECIDED.  Every function default and every
 #: call site reads this name — the way ``snap`` survived a day as an unwanted
 #: default in the band-window guard was that "the default" was spelled six
-#: times in three files.  See "WHY SNAP, WHERE ITS SIBLING REFUSES".
+#: times in three files.
 DEFAULT_MODE: str = "snap"
+
+#: WHICH WAY A STRADDLED BLOCK IS CLOSED.  Orthogonal to :data:`MODES`, which
+#: says only whether the guard repairs, refuses, or is absent.
+#:
+#: ``"drop_block"``
+#:     Drop the whole straddled block: the cut moves UP to the block's top
+#:     edge and the retained set gets SMALLER.  The owner's ruling of
+#:     2026-08-10 and the default — see the module docstring's THE TWO-RULE
+#:     FAMILY and WHAT THE FLIP DID TO κ_eff.
+#: ``"keep_block"``
+#:     Keep the whole straddled block: the cut moves DOWN past the block's
+#:     bottom edge and the retained set gets LARGER.  This was the default
+#:     that landed at 1e0d9e23 and it is retained as an option ONLY for a
+#:     call site with a measured reason to differ.  **No site in this tree
+#:     passes it.**  A site that needs it to stay correct is a finding to
+#:     report, not a flag to set.
+DIRECTIONS = ("drop_block", "keep_block")
+
+#: THE ONE PLACE THE DIRECTION IS DECIDED.  Same rule as :data:`DEFAULT_MODE`:
+#: spelled once, read by every function default and every call site.
+DEFAULT_DIRECTION: str = "drop_block"
 
 #: NAME of the environment dial the callers read — the seams this guard sits
 #: in have no deck key yet, so the mode arrives from the environment.
@@ -203,6 +292,17 @@ MODE_ENV = "LORRAX_SPECTRAL_CLOSURE"
 
 class SpectralClusterError(RuntimeError):
     """A rank cut falls inside a degenerate block, in ``strict`` mode."""
+
+
+class SpectralBlockEmptiesCut(SpectralClusterError):
+    """Dropping the straddled block would leave rank zero.
+
+    The failure that only the ``drop_block`` direction has: the block
+    straddling the cut reaches all the way to ``σ_max``, so there is no
+    non-empty closed retained set below the cut.  Raised in every mode but
+    ``off``, because a silent rank of zero is not a repair — see the module
+    docstring's closing paragraph.
+    """
 
 
 def resolve_mode(explicit=None) -> str:
@@ -222,6 +322,26 @@ def resolve_mode(explicit=None) -> str:
             f"{MODE_ENV}={mode!r} is not one of {MODES}.  A mis-spelled guard "
             f"mode is not silently 'off'.")
     return mode
+
+
+def resolve_direction(explicit=None) -> str:
+    """Validate a direction and supply :data:`DEFAULT_DIRECTION` when there is none.
+
+    Deliberately NOT readable from the environment.  The mode is a run-time
+    dial because a user may want to audit a deck under ``strict``; the
+    direction is a RULING, and a ruling that a stray environment variable can
+    reverse is not one.  A call site that must differ passes
+    ``direction="keep_block"`` in source, where it is reviewable.
+    """
+    if explicit is None:
+        return DEFAULT_DIRECTION
+    d = str(explicit).strip().lower()
+    if d not in DIRECTIONS:
+        raise ValueError(
+            f"spectral_closure direction {d!r} is not one of {DIRECTIONS}.  "
+            f"The default is {DEFAULT_DIRECTION!r} (drop the straddled "
+            f"block), on the owner's ruling of 2026-08-10.")
+    return d
 
 
 def degeneracy_noise_rtol(rcond) -> float:
@@ -256,7 +376,7 @@ def _desc_mag(values):
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
-def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL):
+def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL, direction=None):
     """The degenerate block straddling a cut, if there is one.
 
     Parameters
@@ -269,47 +389,74 @@ def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL):
     rtol : float
         Two neighbours are in the same block when they agree to this
         RELATIVE to the larger of them.
+    direction : str or None
+        :data:`DIRECTIONS` member, or ``None`` for :data:`DEFAULT_DIRECTION`.
+        BOTH resolutions are always reported; this only says which of them
+        ``n_keep_closed`` is.
 
     Returns
     -------
     dict
         ``n_keep``          the proposal, clamped to the spectrum
-        ``n_keep_snapped``  the outward-snapped count (== ``n_keep`` when the
-                            cut already falls in a gap)
+        ``n_keep_dropped``  cut moved UP to the block's top edge — the whole
+                            straddled block dropped (the ruling's direction)
+        ``n_keep_kept``     cut moved DOWN past the block's bottom edge — the
+                            whole straddled block retained
+        ``n_keep_closed``   whichever of the two ``direction`` selects; equal
+                            to ``n_keep`` when the cut already falls in a gap
+        ``direction``       the resolved direction, so a log line cannot
+                            claim one and report the other
+        ``empties``         ``True`` when ``n_keep_dropped == 0`` while the
+                            guard fired: the block reaches ``σ_max`` and the
+                            drop direction has no non-empty answer
         ``fired``           whether the cut fell inside a block
         ``gap_rel``         relative gap AT the proposed cut (``inf`` when the
                             cut is at an end and slices nothing)
+        ``gap_rel_closed``  relative gap at the MOVED cut — the guard's own
+                            proof that it landed in a gap
         ``members``         the block's magnitudes, descending, as a list —
                             the whole cluster, so a message can name it
-        ``span_rel``        ``(max − min)/max`` over the snapped extension:
-                            the bound on how much κ_eff can move
+        ``span_rel``        ``(max − min)/max`` over the block: the bound on
+                            how far κ_eff can move in either direction
         ``sigma_max``       largest magnitude in the spectrum
         ``last_kept``/``first_dropped`` magnitudes either side of the cut
+        ``kappa``/``kappa_closed`` achieved amplification before and after.
+                            Under ``drop_block`` the second is ``<=`` the
+                            first, always — see the module docstring.
 
     Nothing here looks for a knee, a plateau or an elbow.  It asks one
     question at one boundary, which is the only question a smooth spectrum
     can answer (``common/rank_criterion``, at length).
     """
+    d = resolve_direction(direction)
     mag, _ = _desc_mag(values)
     n = len(mag)
     k = max(0, min(int(n_keep), n))
 
     def _kappa(kk):
         """``σ_max/σ_min(kept)`` at retained count ``kk`` — the invariant
-        ``rank_criterion`` caps, reported here at the SNAPPED cut so the
-        change the snap makes to it is never invisible."""
+        ``rank_criterion`` caps, reported here at the MOVED cut so the change
+        the guard makes to it is never invisible."""
         if kk <= 0 or not mag or not (mag[0] > 0.0) or not (mag[kk - 1] > 0.0):
             return None
         return mag[0] / mag[kk - 1]
 
+    def _gap_at(c):
+        """Relative gap at a cut of ``c``; ``inf`` at either end."""
+        if c <= 0 or c >= n:
+            return float("inf")
+        s = max(mag[c - 1], mag[c])
+        return (mag[c - 1] - mag[c]) / s if s > 0.0 else float("inf")
+
     out = {
-        "n_keep": k, "n_keep_snapped": k, "fired": False,
-        "gap_rel": float("inf"), "gap_rel_snapped": float("inf"),
+        "n_keep": k, "n_keep_dropped": k, "n_keep_kept": k,
+        "n_keep_closed": k, "direction": d, "empties": False, "fired": False,
+        "gap_rel": float("inf"), "gap_rel_closed": float("inf"),
         "members": [], "span_rel": 0.0,
         "sigma_max": (mag[0] if mag else 0.0),
         "last_kept": (mag[k - 1] if k > 0 else None),
         "first_dropped": (mag[k] if k < n else None),
-        "kappa": _kappa(k), "kappa_snapped": _kappa(k),
+        "kappa": _kappa(k), "kappa_closed": _kappa(k),
         "n_total": n, "rtol": float(rtol),
     }
     # A cut at either end slices nothing — the same reason
@@ -321,19 +468,21 @@ def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL):
     if not (scale > 0.0):
         # An all-zero tail either side of the cut.  A RELATIVE test is
         # meaningless on it, and ``rank_criterion.violations()`` already
-        # refuses a zero/NaN spectrum, so say nothing rather than snap
-        # through an exactly-null block (which is the mesh pad, and is inert
-        # by construction).
+        # refuses a zero/NaN spectrum, so say nothing rather than move the
+        # cut through an exactly-null block (which is the mesh pad, and is
+        # inert by construction).
         out["gap_rel"] = float("inf")
         return out
     out["gap_rel"] = (hi - lo) / scale
     if out["gap_rel"] > float(rtol):
         return out
 
-    # The cut is inside a block.  Walk DOWNWARD to its bottom — outward, the
-    # keep-more direction, matching the owner's principle.  The walk is the
-    # same successive-difference rule ``band_degeneracy`` documents, with the
-    # relative test in place of the absolute one.
+    # The cut is inside a block.  Find BOTH its edges with the same
+    # successive-difference walk ``band_degeneracy`` documents, with the
+    # relative test in place of the absolute one.  Which edge the cut moves
+    # to is ``direction``'s business, not the walk's.
+    #
+    # DOWNWARD, to the block's bottom: the cut that keeps the block whole.
     j = k
     while j < n:
         a, b = mag[j - 1], mag[j]
@@ -341,9 +490,10 @@ def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL):
         if not (s > 0.0) or (a - b) / s > float(rtol):
             break
         j += 1
-    # And upward, so the message names the WHOLE block rather than the half
-    # of it below the cut.  The upward end never moves the cut (those are
-    # already kept); it is reported so the reader can see the block's size.
+    # UPWARD, to the block's top: the cut that DROPS the block whole, which
+    # is the default.  Note this walk must reach index 0 and stop there — a
+    # block that runs to the top of the spectrum has no closed non-empty cut
+    # below it, and that is the ``empties`` case rather than a rank of 0.
     i = k - 1
     while i > 0:
         a, b = mag[i - 1], mag[i]
@@ -352,17 +502,18 @@ def cluster_at_cut(values, n_keep, *, rtol=DEFAULT_RTOL):
             break
         i -= 1
     members = mag[i:j]
-    out["n_keep_snapped"] = j
     out["fired"] = True
     out["members"] = members
-    out["kappa_snapped"] = _kappa(j)
+    out["n_keep_dropped"] = i
+    out["n_keep_kept"] = j
+    out["empties"] = (i == 0)
+    closed = i if d == "drop_block" else j
+    out["n_keep_closed"] = closed
+    out["kappa_closed"] = _kappa(closed)
     # The gap at the NEW cut — the guard's own proof that it landed in one.
-    # ``inf`` when the snap ran off the bottom of the spectrum, which means
-    # the block is still open and the caller must be told so.
-    if j < n:
-        s2 = max(mag[j - 1], mag[j])
-        out["gap_rel_snapped"] = ((mag[j - 1] - mag[j]) / s2
-                                  if s2 > 0.0 else float("inf"))
+    # ``inf`` at either end: off the bottom means the block is still open and
+    # the caller must be told; off the top is the ``empties`` case.
+    out["gap_rel_closed"] = _gap_at(closed)
     if members and members[0] > 0.0:
         out["span_rel"] = (members[0] - members[-1]) / members[0]
     return out
@@ -378,10 +529,12 @@ def _fmt_block(members, head=4, tail=4):
 
 def _message(info, *, where, rcond=None):
     """The loud paragraph both modes print, built once so they cannot drift."""
-    k, k2, mem = info["n_keep"], info["n_keep_snapped"], info["members"]
-    # The block occupies sorted positions [k2 - len(mem), k2); the cut at k
+    k, mem = info["n_keep"], info["members"]
+    lo_edge, hi_edge = info["n_keep_dropped"], info["n_keep_kept"]
+    closed, d = info["n_keep_closed"], info["direction"]
+    # The block occupies sorted positions [lo_edge, hi_edge); the cut at k
     # keeps the ones above it and drops the ones below.
-    kept_in_block = k - (k2 - len(mem))
+    kept_in_block = k - lo_edge
     floor = ""
     if rcond is not None:
         nf = degeneracy_noise_rtol(rcond)
@@ -391,32 +544,45 @@ def _message(info, *, where, rcond=None):
                     "values are not resolvable at this rcond, so a CLEAN "
                     "verdict from this guard would mean little. **"
                     if float(info["rtol"]) < nf else ""))
-    if info["kappa"] and info["kappa_snapped"]:
-        kap = (f", so kappa_eff moves {info['kappa']:.4e} -> "
-               f"{info['kappa_snapped']:.4e} — NOT an R19-scale rank inflation "
-               f"(common/rank_criterion)")
+    if info["kappa"] and info["kappa_closed"]:
+        arrow = ("down" if info["kappa_closed"] <= info["kappa"] else "UP")
+        kap = (f", so kappa_eff moves {arrow} {info['kappa']:.4e} -> "
+               f"{info['kappa_closed']:.4e}"
+               + (" — dropping the block can only IMPROVE the amplification "
+                  "the cut exists to cap (common/rank_criterion)"
+                  if d == "drop_block" else
+                  " — keep_block RAISES it; this site opted out of the "
+                  "default direction and owes a measured reason"))
     else:
         kap = " (kappa_eff is undefined here — the retained block reaches zero)"
-    still_open = ("" if info["gap_rel_snapped"] != float("inf")
-                  or info["n_keep_snapped"] < info["n_total"] else
+    still_open = ("" if hi_edge < info["n_total"] else
                   "\n  - ** THE BLOCK IS STILL OPEN AT THE BOTTOM OF THE "
-                  "SPECTRUM: every remaining value is inside it, so there is "
-                  "no closed cut to snap to and the retained span is the whole "
-                  "spectrum. **")
+                  "SPECTRUM: every value below the cut is inside it, so "
+                  "keep_block would retain the whole spectrum. **")
+    empties = ("" if not info["empties"] else
+               "\n  - ** THE BLOCK REACHES sigma_max: every value ABOVE the "
+               "cut is inside it too, so dropping it leaves rank ZERO and "
+               "there is no non-empty closed cut.  The spectrum is flat to "
+               "rtol across the whole retained range — that is a statement "
+               "about the operator, not about the cut. **")
     return (
         f"[spectral-closure] {where}: the rank cut at {k} of {info['n_total']} "
         f"falls INSIDE a degenerate block.\n"
-        f"  - the block holds {len(mem)} values [{_fmt_block(mem)}]; the "
-        f"relative gap AT the cut is {info['gap_rel']:.3e} <= rtol "
-        f"{info['rtol']:.1e}, so the cut keeps {kept_in_block} of them and "
-        f"drops {k2 - k}.\n"
+        f"  - the block holds {len(mem)} values [{_fmt_block(mem)}] at sorted "
+        f"positions [{lo_edge}, {hi_edge}); the relative gap AT the cut is "
+        f"{info['gap_rel']:.3e} <= rtol {info['rtol']:.1e}, so the cut keeps "
+        f"{kept_in_block} of them and drops {hi_edge - k}.\n"
         f"  - keeping part of a degenerate block retains a symmetry-ARBITRARY "
         f"slice of an eigenspace: the retained span is a different subspace at "
         f"Sq than at q, chosen by round-off, and the k-star identity fails for "
         f"everything built on it.\n"
-        f"  - snapping OUTWARD to {k2} closes the block (relative gap at the "
-        f"new cut {info['gap_rel_snapped']:.3e}).  The block spans "
-        f"{info['span_rel']:.3e} relative{kap}." + still_open + floor)
+        f"  - direction={d}: the cut moves to {closed}, "
+        + (f"DROPPING the whole block" if d == "drop_block" else
+           f"KEEPING the whole block")
+        + f" (relative gap at the new cut {info['gap_rel_closed']:.3e}; the "
+        f"other legal cut is {hi_edge if d == 'drop_block' else lo_edge}).  "
+        f"The block spans {info['span_rel']:.3e} relative{kap}."
+        + still_open + empties + floor)
 
 
 def describe_clean(info, *, where):
@@ -438,7 +604,8 @@ def describe_clean(info, *, where):
 
 
 def resolve_spectral_cut(values, n_keep, *, rtol=DEFAULT_RTOL, mode=None,
-                         where="spectral cut", rcond=None, log=print):
+                         direction=None, where="spectral cut", rcond=None,
+                         log=print):
     """Return a retained count whose cut does not slice a degenerate block.
 
     The host face.  ``values`` is the spectrum, ``n_keep`` the rank
@@ -451,37 +618,54 @@ def resolve_spectral_cut(values, n_keep, *, rtol=DEFAULT_RTOL, mode=None,
     ``LORRAX_SPECTRAL_CLOSURE`` env).  ``strict`` raises
     :class:`SpectralClusterError`; ``off`` returns the proposal untouched
     and does not even look.
+
+    ``direction`` defaults to :data:`DEFAULT_DIRECTION` — drop the straddled
+    block.  It is a source-level argument with no environment dial; see
+    :func:`resolve_direction`.
+
+    RAISES :class:`SpectralBlockEmptiesCut` in ``snap`` as well as ``strict``
+    when dropping the block would leave rank zero.  A repair that returns an
+    empty basis is not a repair, and the caller cannot tell an empty result
+    from a working one by its type.
     """
     m = resolve_mode(mode)
+    d = resolve_direction(direction)
     if m == "off":
         # ``rtol = -1`` can never fire (a relative gap is >= 0), so ``off``
         # still returns the FULL dict — the numbers stay available to a log
         # line even when the guard is disarmed, and no caller has to special-
         # case a short dict.
-        return int(n_keep), cluster_at_cut(values, n_keep, rtol=-1.0)
-    info = cluster_at_cut(values, n_keep, rtol=rtol)
+        return int(n_keep), cluster_at_cut(values, n_keep, rtol=-1.0,
+                                           direction=d)
+    info = cluster_at_cut(values, n_keep, rtol=rtol, direction=d)
     if not info["fired"]:
         return int(info["n_keep"]), info
     msg = _message(info, where=where, rcond=rcond)
+    if d == "drop_block" and info["empties"]:
+        raise SpectralBlockEmptiesCut(
+            msg + f"\n  This is not a mode question: no mode but 'off' can "
+                  f"return rank 0 here.  Fix: raise rcond so the cut lands "
+                  f"above the flat range, or establish that this operator is "
+                  f"genuinely rank-{info['n_keep_kept']} and cut there.")
     if m == "strict":
         raise SpectralClusterError(
-            msg + f"\n  Fix: keep {info['n_keep_snapped']} instead of "
+            msg + f"\n  Fix: keep {info['n_keep_closed']} instead of "
                   f"{info['n_keep']}, or run with LORRAX_SPECTRAL_CLOSURE=snap "
                   f"to move the cut automatically, or =off to cut through the "
                   f"block deliberately.")
     for line in msg.splitlines():
         log(f"*** {line}")
-    log(f"*** SNAPPED OUTWARD: retained rank {info['n_keep']} -> "
-        f"{info['n_keep_snapped']}. ***")
-    return int(info["n_keep_snapped"]), info
+    log(f"*** {'DROPPED THE BLOCK' if d == 'drop_block' else 'KEPT THE BLOCK'}"
+        f": retained rank {info['n_keep']} -> {info['n_keep_closed']}. ***")
+    return int(info["n_keep_closed"]), info
 
 
 # ---------------------------------------------------------------------------
 # The device face — pure jnp, batched, jit- and vmap-safe
 # ---------------------------------------------------------------------------
 
-def snap_keep_outward(values, keep, *, rtol=DEFAULT_RTOL):
-    """Move a keep-mask outward past any degenerate block it cuts.  Pure ``jnp``.
+def close_keep_mask(values, keep, *, rtol=DEFAULT_RTOL, direction=None):
+    """Move a keep-mask off any degenerate block it cuts.  Pure ``jnp``.
 
     Parameters
     ----------
@@ -495,24 +679,43 @@ def snap_keep_outward(values, keep, *, rtol=DEFAULT_RTOL):
         NOT required to be contiguous in the input order.
     rtol : float
         Relative-to-neighbour block tolerance.
+    direction : str or None
+        :data:`DIRECTIONS` member; ``None`` is :data:`DEFAULT_DIRECTION`.
+        Static (a Python string), so the branch below is resolved at trace
+        time and neither kernel carries the other.
 
     Returns
     -------
     ``(keep_out, n_keep, n_keep_out)``
         ``keep_out`` in the INPUT order; the two counts are ``(...)``-shaped
-        int arrays so a caller can print or compare them per q.
+        int arrays so a caller can print or compare them per q.  Under
+        ``drop_block``, ``n_keep_out <= n_keep``, and **a caller must refuse
+        on ``n_keep_out == 0``** — a jitted kernel cannot raise, so the empty
+        case that :func:`resolve_spectral_cut` raises on arrives here as a
+        count.
 
-    NO DATA-DEPENDENT TRIP COUNT.  The walk that the host face writes as a
-    ``while`` is here a prefix-AND over adjacency links: sort descending by
-    magnitude, mark each adjacent pair "linked" when it passes the relative
-    test, force every link inside the kept prefix to linked (they are
-    already retained, so traversing them is vacuous), and take the running
-    AND.  Position ``i`` is retained exactly when every link from the top
-    down to it is unbroken — which for ``i`` past the cut means "the block
-    has not ended yet".  One sort, one cumprod, both static-shape.
+    NO DATA-DEPENDENT TRIP COUNT, in either direction.  The walk that the
+    host face writes as a ``while`` is here a cumulative AND over adjacency
+    links: sort descending by magnitude and mark each adjacent pair "linked"
+    when it passes the relative test.  Then force the links the walk does not
+    care about to linked (they are traversed vacuously) and take the running
+    AND from the end the walk starts at.  One sort, one cumprod, both
+    static-shape.
+
+    * ``drop_block`` walks UP from the cut, so the vacuous links are the ones
+      BELOW it (both their endpoints are already dropped) and the AND runs in
+      REVERSE.  ``revacc[p]`` is then "every link from p up to the cut is
+      unbroken" = "position p is in the block the cut straddles", and every
+      such retained position is removed.
+    * ``keep_block`` walks DOWN from the top, so the vacuous links are the
+      ones INSIDE the kept prefix and the AND runs forward.  ``reach[i]`` is
+      "position i is reachable from the top through unbroken links", which
+      past the cut means "the block has not ended yet", and every such
+      position is admitted.
     """
     import jax.numpy as jnp
 
+    d = resolve_direction(direction)
     v = jnp.asarray(values)
     mag = jnp.abs(v)
     n = mag.shape[-1]
@@ -530,21 +733,43 @@ def snap_keep_outward(values, keep, *, rtol=DEFAULT_RTOL):
     lo = mag_s[..., 1:]
     scale = jnp.maximum(hi, lo)
     # ``scale <= 0`` is an exactly-null pair (the mesh pad, inert by
-    # construction) — never "linked", so the walk stops rather than snapping
-    # the whole null tail in.
+    # construction) — never "linked", so the walk stops rather than sweeping
+    # the whole null tail.
     linked = (scale > 0.0) & ((hi - lo) <= float(rtol) * scale)
-    # Link m joins sorted positions m and m+1.  It is vacuous when m+1 is
-    # already inside the kept prefix.
+    # Link m joins sorted positions m and m+1.
     pos = jnp.arange(n - 1)
-    vacuous = (pos + 1) < n_keep[..., None]
-    chain = linked | vacuous
-    # ``reach[i]`` = AND of links 0..i-1 = "position i is reachable from the
-    # top through unbroken links".  cumprod in the value dtype keeps this in
-    # one kernel; the comparison back to bool is exact for 0/1.
-    acc = jnp.cumprod(chain.astype(jnp.int32), axis=-1)
-    reach = jnp.concatenate(
-        [jnp.ones(acc.shape[:-1] + (1,), dtype=jnp.int32), acc], axis=-1) > 0
-    keep_s_out = keep_s | reach
+    ones = jnp.ones(keep_s.shape[:-1] + (1,), dtype=jnp.int32)
+
+    if d == "keep_block":
+        # A link is vacuous when m+1 is already inside the kept prefix.
+        chain = linked | ((pos + 1) < n_keep[..., None])
+        acc = jnp.cumprod(chain.astype(jnp.int32), axis=-1)
+        reach = jnp.concatenate([ones, acc], axis=-1) > 0
+        # ``n_keep == 0`` retains nothing, so there is no block to be inside
+        # and nothing to admit.  Without this the leading ``ones`` above
+        # admits position 0 unconditionally and the device face disagrees
+        # with the host's "a cut at an end slices nothing" — a latent
+        # disagreement in the landed kernel, found by the two-face sweep when
+        # it was extended over both directions.
+        keep_s_out = keep_s | (reach & (n_keep > 0)[..., None])
+    else:
+        # DROP.  A link is vacuous when it lies at or below the cut: link m
+        # for m >= n_keep joins two positions the cut already dropped, so
+        # traversing it says nothing.  Forcing those to linked lets ONE
+        # reverse scan serve every ``n_keep`` without a data-dependent
+        # endpoint — the mirror of the ``keep_block`` trick above.
+        chain = linked | (pos >= n_keep[..., None])
+        racc = jnp.cumprod(chain[..., ::-1].astype(jnp.int32), axis=-1)[..., ::-1]
+        # ``in_block[p]`` = AND(chain[p:]) = AND(linked[p : n_keep]) = the cut
+        # and p are joined by an unbroken run of links.  Position n-1 is
+        # appended as True and never used: it can only be selected below when
+        # n_keep == n, which the ``n_keep < n`` factor excludes.
+        in_block = jnp.concatenate([racc, ones], axis=-1) > 0
+        straddled = (in_block
+                     & (jnp.arange(n) < n_keep[..., None])
+                     & (n_keep < n)[..., None])
+        keep_s_out = keep_s & ~straddled
+
     inv = jnp.argsort(order, axis=-1)
     keep_out = jnp.take_along_axis(keep_s_out, inv, axis=-1)
     return keep_out, n_keep, jnp.sum(keep_s_out, axis=-1)
@@ -567,7 +792,7 @@ def note_device_snap(where, n_keep, n_keep_out) -> None:
     _PENDING.append(
         f"{where}: the rank cut fell inside a degenerate block on at least "
         f"one q — retained rank {int(n_keep)} would have become "
-        f"{int(n_keep_out)} under snap.")
+        f"{int(n_keep_out)} under snap ({DEFAULT_DIRECTION}).")
 
 
 def pending() -> list[str]:
@@ -591,9 +816,9 @@ def raise_if_pending(where="spectral cut", *, mode=None, log=print) -> None:
         raise SpectralClusterError(
             f"[spectral-closure] {where}: {len(found)} spectral cut(s) fell "
             f"inside a degenerate block.\n{body}\n"
-            f"  Fix: LORRAX_SPECTRAL_CLOSURE=snap moves each cut outward past "
-            f"its block (the change to kappa_eff is bounded by the block's "
-            f"relative span, typically under 1e-4); =off cuts through "
-            f"deliberately.")
+            f"  Fix: LORRAX_SPECTRAL_CLOSURE=snap moves each cut off its "
+            f"block by DROPPING the block whole (the owner's ruling of "
+            f"2026-08-10), which lowers the retained rank and can only lower "
+            f"kappa_eff with it; =off cuts through deliberately.")
     for f in found:
         log(f"*** [spectral-closure] {f} ***")

@@ -207,6 +207,18 @@ class RankReport(object):
     ``n_dropped_alignment``  directions discarded by a device-grid round-DOWN.
                            MUST be 0 — a non-zero value means the numerics
                            depend on the device grid.
+    ``n_dropped_closure``  directions discarded by ``common/spectral_closure``
+                           because they were inside the degenerate block the
+                           cut straddled.  Supplied by the caller; NOT a
+                           violation.  It is a round-down like the one above
+                           and is deliberately counted apart from it, because
+                           the two have opposite standing: an alignment
+                           round-down makes the retained set a function of the
+                           DEVICE COUNT, while a closure drop makes it a
+                           function of the SPECTRUM — which is the point.  It
+                           can only raise ``sigma_min_kept``, so it can only
+                           improve ``kappa_eff``, and check 1 stays sharp
+                           across it.
     ``noise_rtol``         the discrepancy-principle reference line
     ``rank_at_noise``      rank a noise-floor cut would have retained
     ``overcomplete_margin``  see module docstring
@@ -216,8 +228,9 @@ class RankReport(object):
                  "rank_used", "sigma_max", "sigma_min_kept", "kappa_eff",
                  "kappa_cap", "dropped_hi", "dropped_lo",
                  "n_dropped_criterion", "n_padded_alignment",
-                 "n_dropped_alignment", "noise_rtol", "rank_at_noise",
-                 "overcomplete_margin", "rank_loose", "n_kept", "has_nan")
+                 "n_dropped_alignment", "n_dropped_closure", "noise_rtol",
+                 "rank_at_noise", "overcomplete_margin", "rank_loose",
+                 "n_kept", "has_nan")
 
     def violations(self):
         """List of strings; empty when the truncation is self-consistent.
@@ -227,7 +240,11 @@ class RankReport(object):
         1. ``κ_eff ≤ κ_cap`` — the invariant the criterion exists to enforce.
            Fires when something downstream RAISED the rank past the cut.
         2. ``n_dropped_alignment == 0`` — the retained set must not depend on
-           the device grid.
+           the device grid.  ``n_dropped_closure`` is EXCLUDED from this
+           count by construction: a spectral-closure drop is a round-down
+           chosen by the spectrum, not by the mesh, and folding the two
+           together would either blind this check or make it fire on the
+           repair.  See ``common/spectral_closure``.
         3. ``σ_max`` finite and non-zero — a relative threshold is meaningless
            on a zero/NaN operator.  This is the documented ``nband``-window
            trap where "the SVD of a zero matrix returns rank 0"
@@ -272,10 +289,10 @@ class RankReport(object):
                 if self.sigma_min_kept is not None else "n/a")
         lines.append(
             "%s[rank] %s: kept %d of %d %s  (criterion %d, +%d null pad, "
-            "-%d grid-dropped)"
+            "-%d closure-dropped, -%d grid-dropped)"
             % (indent, self.label, self.rank_used, self.n_total, q,
                self.rank_criterion, self.n_padded_alignment,
-               self.n_dropped_alignment))
+               self.n_dropped_closure, self.n_dropped_alignment))
         lines.append(
             "%s[rank]   retained %s range %.6e .. %s -> kappa_eff=%s "
             "(cap 1/rtol=%.3e at rtol=%.1e)"
@@ -285,9 +302,11 @@ class RankReport(object):
         if n_disc:
             lines.append(
                 "%s[rank]   discarded %d %s in %.6e .. %.6e  "
-                "= %d by the amplification cap + %d by GRID ALIGNMENT"
+                "= %d by the amplification cap + %d by DEGENERACY CLOSURE "
+                "+ %d by GRID ALIGNMENT"
                 % (indent, n_disc, q, self.dropped_lo, self.dropped_hi,
-                   self.n_dropped_criterion, self.n_dropped_alignment))
+                   self.n_dropped_criterion, self.n_dropped_closure,
+                   self.n_dropped_alignment))
         else:
             lines.append(
                 "%s[rank]   discarded 0 %s — the cap bound nothing on this "
@@ -308,7 +327,7 @@ class RankReport(object):
 
 def rank_report(spectrum, rtol, *, label="truncation",
                 quantity="singular values", rank_used=None,
-                n_rows=None, n_cols=None):
+                n_rows=None, n_cols=None, n_dropped_closure=0):
     """Build a :class:`RankReport` from a host-side spectrum.
 
     ``rank_used`` is the rank actually carried downstream.  Leave it ``None``
@@ -318,6 +337,16 @@ def rank_report(spectrum, rtol, *, label="truncation",
     for the round-down defect); when it is SMALLER the deficit is counted as
     ``n_dropped_alignment``, which :meth:`RankReport.violations` reports as a
     defect because it makes the numerics depend on the device grid.
+
+    ``n_dropped_closure`` is how many of any such deficit ``common/
+    spectral_closure`` accounts for — the members of a straddled degenerate
+    block that the cut dropped.  A caller that ran the closure guard MUST
+    pass it, and the amount is attributed to ``n_dropped_closure`` instead of
+    ``n_dropped_alignment`` so that check 2 keeps meaning "the mesh changed
+    the physics" rather than firing on the symmetry repair.  Anything left
+    over after this attribution is still an alignment round-down and still a
+    violation, which is what keeps the accounting honest rather than merely
+    quiet.
     """
     raw = [float(v) for v in spectrum]
     has_nan = any(math.isnan(v) or math.isinf(v) for v in raw)
@@ -343,7 +372,13 @@ def rank_report(spectrum, rtol, *, label="truncation",
 
     r.n_dropped_criterion = r.n_total - r.rank_criterion
     r.n_padded_alignment = max(0, r.rank_used - r.rank_criterion)
-    r.n_dropped_alignment = max(0, r.rank_criterion - r.rank_used)
+    # The closure drop is subtracted FIRST, so what remains in
+    # ``n_dropped_alignment`` is the mesh's doing and check 2 stays sharp.
+    # Clamped to the deficit actually present: a caller claiming more closure
+    # drops than there are missing directions cannot manufacture credit.
+    _deficit = max(0, r.rank_criterion - r.rank_used)
+    r.n_dropped_closure = min(int(n_dropped_closure), _deficit)
+    r.n_dropped_alignment = _deficit - r.n_dropped_closure
     # The discarded band is everything the criterion cut, PLUS anything a
     # round-down took off the bottom of the retained block.
     n_disc = r.n_total - n_kept_real

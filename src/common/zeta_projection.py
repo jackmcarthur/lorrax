@@ -691,9 +691,10 @@ def least_squares_transfer(
     # its eigenspaces onto itself and mixes a degenerate block's members
     # freely: retain the block whole and the retained span is invariant,
     # retain part of it and the span is a round-off-chosen slice that differs
-    # between q and Sq.  ``common/spectral_closure`` snaps the mask outward
-    # past any block it straddles — pure jnp, so it stays inside the same
-    # replicated computation and the verdict is identical on every process.
+    # between q and Sq.  ``common/spectral_closure`` moves the mask off any
+    # block it straddles by DROPPING that block whole (owner ruling
+    # 2026-08-10) — pure jnp, so it stays inside the same replicated
+    # computation and the verdict is identical on every process.
     #
     # ``off`` skips it entirely; ``strict`` computes the same verdict and
     # refuses on host below rather than snapping, so the flag means the same
@@ -702,10 +703,10 @@ def least_squares_transfer(
     # must be a function of its arguments (tests/test_layering.py).
     _sc_mode = spectral_closure.resolve_mode(
         os.environ.get(spectral_closure.MODE_ENV))
-    _keep_snapped, _n_pre, _n_post = spectral_closure.snap_keep_outward(
+    _keep_closed, _n_pre, _n_post = spectral_closure.close_keep_mask(
         w, keep, rtol=spectral_closure.DEFAULT_RTOL)
     if _sc_mode == "snap":
-        keep = _keep_snapped
+        keep = _keep_closed
     # THE CRITERION: ``keep`` is a CAP on how much G_S⁺ may amplify round-off
     # (κ_eff = λ_max/λ_min(kept) ≤ 1/rcond), NOT a search for a gap — these
     # ζ-overlap spectra are smooth and have none.  ``common/rank_criterion``
@@ -758,8 +759,10 @@ def least_squares_transfer(
     # ── The closure verdict, per q ────────────────────────────────────────
     # ``sc_pre`` is the rank the amplification cap chose, ``sc_post`` the rank
     # that closes whatever degenerate block that cut landed in.  They differ
-    # only on q whose cut sliced a block.
-    _n_fired = int(np.count_nonzero(sc_post > sc_pre))
+    # only on q whose cut sliced a block, and under the default direction the
+    # difference is NEGATIVE — the straddled block is dropped.  Counting with
+    # ``!=`` rather than ``>`` is what keeps that a firing instead of silence.
+    _n_fired = int(np.count_nonzero(sc_post != sc_pre))
     if _sc_mode != "off" and jax.process_index() == 0:
         if _n_fired:
             print_fn(
@@ -768,12 +771,13 @@ def least_squares_transfer(
                 f"{len(sc_pre)} q.  Retained rank per q would be "
                 f"{int(sc_pre.min())}..{int(sc_pre.max())}; closing the block "
                 f"takes it to {int(sc_post.min())}..{int(sc_post.max())} "
-                f"(max +{int(np.max(sc_post - sc_pre))} directions on one q).  "
+                f"(max -{int(np.max(sc_pre - sc_post))} directions on one q).  "
                 f"A cut through a degenerate block retains a symmetry-"
                 f"ARBITRARY slice of an eigenspace, so W_S would project onto "
                 f"a different subspace at q than at Sq. "
-                + (f"SNAPPED OUTWARD. ***" if _sc_mode == "snap"
-                   else f"NOT snapped (strict). ***"))
+                + (f"THE STRADDLED BLOCK WAS DROPPED "
+                   f"({spectral_closure.DEFAULT_DIRECTION}). ***"
+                   if _sc_mode == "snap" else f"NOT closed (strict). ***"))
         else:
             print_fn(
                 f"[zeta_projection]   spectral closure: the cut falls in a gap "
@@ -786,14 +790,18 @@ def least_squares_transfer(
             f"zeta_projection: the rcond={rcond:g} rank cut falls inside a "
             f"degenerate block of G_S on {_n_fired} of {len(sc_pre)} q, so the "
             f"retained span is not point-group invariant.  Fix: "
-            f"LORRAX_SPECTRAL_CLOSURE=snap closes each block (retained rank "
-            f"{int(sc_pre.max())} -> {int(sc_post.max())} at worst), or =off "
-            f"to cut through deliberately.")
-    # The cap check, with the ONE excess a closure snap can legitimately
-    # introduce allowed for and no more.  Snapping past m links each within
-    # ``rtol`` of the last can lower λ_min(kept) by at most (1+rtol)^m, so
-    # that — and nothing looser — is the slack.  With no snap, m = 0 and this
-    # is the historical ``1 + 1e-9``.
+            f"LORRAX_SPECTRAL_CLOSURE=snap drops each straddled block whole "
+            f"(retained rank {int(sc_pre.max())} -> {int(sc_post.min())} at "
+            f"worst), or =off to cut through deliberately.")
+    # The cap check.  Under the default direction the closure DROPS the
+    # straddled block, which raises λ_min(kept) and so can only LOWER
+    # κ_eff — the cap cannot be violated by the guard, and this expression
+    # is identically 1.0, i.e. the historical bare ``1 + 1e-9`` check.  It
+    # is written in the general form rather than deleted because it is what
+    # keeps the assertion honest if a site ever opts into ``keep_block``:
+    # admitting m links each within ``rtol`` of the last can lower
+    # λ_min(kept) by at most (1+rtol)^m, and that — nothing looser — is the
+    # slack such a site would be entitled to.
     _slack = float(np.max(
         (1.0 + spectral_closure.DEFAULT_RTOL) ** np.maximum(sc_post - sc_pre, 0)))
     if np.nanmax(kappa) > (1.0 / float(rcond)) * _slack * (1.0 + 1e-9):
@@ -806,7 +814,14 @@ def least_squares_transfer(
     if int(ranks.min()) == 0:
         raise ValueError(
             f"zeta_projection: rcond={rcond:g} retained ZERO directions at "
-            f"some q — the threshold is above λ_max.  Lower rcond.")
+            f"some q — either the threshold is above λ_max (lower rcond), or "
+            f"the spectral-closure guard dropped a degenerate block that "
+            f"reached λ_max, which leaves nothing above the cut.  The "
+            f"closure verdict above says which: it is the second when the "
+            f"guard fired on that q.  A block spanning the whole retained "
+            f"range means G_S is flat to "
+            f"{spectral_closure.DEFAULT_RTOL:.1e} there, which is a "
+            f"statement about the small basis and not about rcond.")
     w_inv = jnp.where(keep, 1.0 / jnp.where(keep, w, 1.0), 0.0)
 
     def _body(V_loc, wi_loc, O_loc):

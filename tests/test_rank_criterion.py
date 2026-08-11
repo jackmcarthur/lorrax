@@ -84,6 +84,79 @@ def test_a_grid_round_down_is_reported_as_a_violation():
 
 
 # ---------------------------------------------------------------------------
+# 2b. ``n_dropped_closure`` — the one deficit that is NOT a violation
+# ---------------------------------------------------------------------------
+#
+# ``common/spectral_closure`` drops the degenerate block a cut straddles
+# (owner ruling 2026-08-10), so ``rank_used`` legitimately lands BELOW the
+# criterion's rank.  That is a round-down, and check 2 refuses round-downs —
+# because a round-down to the DEVICE GRID makes the physics a function of the
+# machine.  A closure drop is a function of the SPECTRUM instead, so it is
+# attributed to its own column and excluded.
+#
+# This pair is here because the change makes a guard QUIETER in one case, and
+# a guard that got quieter without a gate is a guard nobody can trust again.
+
+
+def test_a_closure_drop_is_attributed_and_is_NOT_a_grid_violation():
+    """TRUE arm: the deficit the closure guard accounts for is not a defect."""
+    s = _smooth()
+    base = rc.rank_report(s, 1e-8)
+    closed = rc.rank_report(s, 1e-8, rank_used=base.rank_criterion - 3,
+                            n_dropped_closure=3)
+    assert closed.n_dropped_closure == 3
+    assert closed.n_dropped_alignment == 0
+    assert not [m for m in closed.violations() if "DEVICE-GRID" in m], (
+        "the closure drop was read as a device-grid round-down — with this "
+        "wrong, every run whose cut lands in a degenerate block refuses at "
+        "htransform, which is what the flip to drop_block would have caused")
+    # It is still REPORTED.  Excluded from the violation, never from the log.
+    assert "closure-dropped" in closed.describe()
+    assert "DEGENERACY CLOSURE" in closed.describe()
+
+
+def test_an_UNATTRIBUTED_deficit_still_violates():
+    """FALSE arm: the exemption is not a blanket one.
+
+    Same deficit, no claim made for it.  If this passed, the new field would
+    have disabled check 2 rather than refined it.
+    """
+    s = _smooth()
+    base = rc.rank_report(s, 1e-8)
+    bare = rc.rank_report(s, 1e-8, rank_used=base.rank_criterion - 3)
+    assert bare.n_dropped_closure == 0 and bare.n_dropped_alignment == 3
+    assert [m for m in bare.violations() if "DEVICE-GRID" in m]
+
+
+def test_a_partial_claim_leaves_the_remainder_a_violation():
+    """A closure drop and a grid round-down on the SAME run must not merge.
+
+    Three directions gone, only one of them the closure's: the other two are
+    still the mesh changing the physics, and the report must say so.
+    """
+    s = _smooth()
+    base = rc.rank_report(s, 1e-8)
+    mixed = rc.rank_report(s, 1e-8, rank_used=base.rank_criterion - 3,
+                           n_dropped_closure=1)
+    assert mixed.n_dropped_closure == 1 and mixed.n_dropped_alignment == 2
+    assert [m for m in mixed.violations() if "DEVICE-GRID" in m]
+
+
+def test_an_overclaim_cannot_manufacture_credit():
+    """Claiming more closure drops than there are missing directions is
+    clamped, so the field cannot be used to silence an unrelated round-down."""
+    s = _smooth()
+    base = rc.rank_report(s, 1e-8)
+    over = rc.rank_report(s, 1e-8, rank_used=base.rank_criterion - 2,
+                          n_dropped_closure=99)
+    assert over.n_dropped_closure == 2 and over.n_dropped_alignment == 0
+    # and a claim on a run with NO deficit stays zero rather than going negative
+    none = rc.rank_report(s, 1e-8, n_dropped_closure=5)
+    assert none.n_dropped_closure == 0 and none.n_dropped_alignment == 0
+    assert not none.violations()
+
+
+# ---------------------------------------------------------------------------
 # 3. The discrepancy principle is REFUTED here — show the arithmetic
 # ---------------------------------------------------------------------------
 

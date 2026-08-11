@@ -80,7 +80,7 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 
 | name | what it is |
 |---|---|
-| `plan(op, mesh, *, backend='auto', n=None, closure=None) -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. |
+| `plan(op, mesh, *, backend='auto', n=None) -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. |
 | `Plan(A)` / `Plan.batched(A_stack)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe** — no dlopen, no `device_put`, no process count inside. |
 | `Plan.is_native`, `.backend`, `.describe()` | The resolved fact, readable; never something a caller must branch on to be correct. |
 | `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, or the backend's own stacked entry where the library has one, with a batch-axis-reshard route reserved. **The one place that decides.** Introspection — a caller reads it, never branches on it. |
@@ -94,95 +94,10 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 | `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
 | `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
 | `dispatch_batched_eigh(A, mesh, backend)` | The one legacy entry point kept for `gw.qsgw_density`. |
-| `rank_cut(op, values, *, rcond \| n_keep, closure=None) -> RankCut` | **The rank-revealing surface.** Cut a spectrum with the degeneracy-closure guard. Also `Plan.rank_cut` / `FactorToken.rank_cut`, which bind the op and the mode. |
-| `cholesky_pivot_spectrum(L)`, `lu_rank_spectrum(LU)` | What a factorization's rank-revealing spectrum *is*: `\|diag L\|²` and `\|diag U\|`. Pure `jnp` on the last two axes, so one call serves a tile and a stack. |
-| `CLOSURE_MODES`, `CLOSURE_DEFAULT_MODE`, `CLOSURE_RTOL`, `CLOSURE_ENV`, `RANK_SPECTRA`, `SpectralClusterError` | The guard's vocabulary. Importable with **no jax and no `.so`**, like `BACKEND_CHOICES`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
 single-phase API would have to lie about when it checked.
-
-## The degeneracy-closure guard on rank cuts
-
-**A rank cut that stops inside a degenerate cluster keeps a
-symmetry-arbitrary slice of an eigenspace.** A symmetry that commutes with
-the factored operator maps each of its eigenspaces onto itself and mixes
-the members of a degenerate block freely, so cutting *between* whole blocks
-leaves the retained span invariant, and cutting *through* one leaves a span
-that differs between `q` and `Sq`, chosen by round-off. Everything built on
-it loses the k-star identity. The criterion, its tolerance and the whole
-saga are `common/spectral_closure` and
-`tests/known_failures/2026-08-10-spectral-cut-closure.md`; what this
-service adds is the wiring, on the two ops the owner named.
-
-**The surface is new, because there was no rank decision here to guard.**
-`eigh`, `cholesky` and `solve_lu` factor and solve; not one of them
-returned a rank before this. So `rank_cut` is where a rank cut is made,
-and `cholesky_pivot_spectrum` / `lu_rank_spectrum` say what a
-factorization's rank-revealing spectrum is:
-
-```python
-p  = distrib_la.plan("cholesky", mesh, backend="native2d", closure="snap")
-L  = p.batched(A)
-rc = p.rank_cut(distrib_la.cholesky_pivot_spectrum(L[q]), rcond=1e-8)
-keep = rc.n_keep        # >= the threshold's own answer, always
-```
-
-For Cholesky the spectrum is `|diag(L)|²` — with the pivot order fixed,
-that is exactly the Schur-complement diagonal a pivoted Cholesky compares
-against its tolerance. It is **squared**, and that is load-bearing: a
-relative-gap criterion is not invariant under a square root, so two pivots
-agreeing to 1e-6 have diagonals agreeing to ~5e-7, and reading the
-diagonal instead of the pivot invents degeneracies. For LU the spectrum is
-`|diag(U)|`, unsquared, because `A = P L U` already lives on the
-operator's scale.
-
-**Opt-in, and OFF by default this round.** `closure='snap'|'strict'|'off'`
-on `plan()` / `factor()`, or `LORRAX_DISTRIB_LA_CLOSURE` in the
-environment; the kwarg wins, and the mode resolves **once**, at plan time,
-so two calls through one plan cannot disagree. Nothing about resolution,
-routing, sharding, donation or the bytes a factorization returns depends
-on it — `test_arming_the_closure_changes_no_resolution_fact` compares all
-of those across the three modes, and `np.array_equal` on the factor itself
-is an L-b cell.
-
-Why off, when `common/spectral_closure` defaults to `snap`: the arithmetic
-argument for snapping transfers unchanged, but *who may change a route*
-does not. This service's route semantics are certified surface, and a
-guard that arrived switched on would change the rank a shipped operation
-returns without its caller asking — the shape of the silent route change
-this package's own Purpose section prices at a QP gap of −161 eV.
-**Owner row: flipping the default to `snap` is the owner's call; it is one
-constant, `distrib_la.closure.DEFAULT_MODE`.** The dial name is
-deliberately *not* `LORRAX_SPECTRAL_CLOSURE`, so that arming the ζ fit's
-guard cannot silently arm this one.
-
-**The kernel is a COPY of `common/spectral_closure`'s host face, not an
-import**, because services are import-isolated from `src/` by charter and
-by gate, and ~90 lines of stdlib arithmetic is cheaper than an import
-edge. The copy is held by a consistency cell in `tests/test_spectral_closure.py`
-— the only side that can see both — which runs thirteen hostile synthetic
-spectra through both `cluster_at_cut`s at every cut and asserts the dicts
-agree **field for field**, plus a cell that pins the one deliberate
-divergence (the default) and one that asserts the copy imports nothing
-from `common`.
-
-**Known limits, named rather than implied.**
-
-* `FactorToken` has **no `rank_spectrum()`**. A token's factor is opaque by
-  design — block-cyclic on a specific grid — and pulling `diag` out of one
-  is a distributed gather with a per-backend layout rule each. A caller
-  that wants a closed rank off an FFI factor materialises it through that
-  backend's own route (`cholesky_handle_to_natural_L`,
-  `SlateLowerL.to_jax_lower`) and hands the spectrum in. **Owed.**
-* There is **no device face**. `common/spectral_closure` has a pure-`jnp`
-  `snap_keep_outward` because the ζ cut lives inside a jitted kernel; no
-  rank decision in this service does, so there is one host face and
-  `strict` raises where it is called.
-* `|diag(U)|` is a **weaker rank revealer** than a rank-revealing QR or an
-  SVD and can miss a near-null space a column-pivoted factorization would
-  expose. The guard bounds where a cut may land, not whether the spectrum
-  is the right one to read.
 
 ## Contract
 
@@ -223,14 +138,6 @@ from `common`.
   `LORRAX_FFI_HOST_SO` pin which `.so` to open. `distrib_la.resolve` reads
   no environment at all. An explicit pin that cannot be honoured is a
   refusal, never a fall-through.
-  `LORRAX_DISTRIB_LA_CLOSURE` is the one other variable this package reads,
-  and it is not an exception to that rule: it selects no backend and
-  changes no route — it arms a rank-cut guard on a surface that returns no
-  matrix. `resolve.py` still reads nothing.
-* **A rank cut never shrinks.** Whatever `rank_cut` returns is at least
-  the proposal it was given; the closure guard only ever moves a cut
-  outward. Sizing the retained set stays the caller's `rcond`, and this
-  guard only refuses to let that size land mid-block.
 
 ## Backends
 
@@ -296,7 +203,6 @@ measures that the marks arrived).
 | tier | file | needs |
 |---|---|---|
 | L-a shape/contract algebra | `test_distrib_la_shape_algebra.py` | nothing — a laptop, milliseconds |
-| L-a rank-closure guard | `test_distrib_la_closure.py` | nothing — the criterion is stdlib arithmetic and the plan wiring resolves to `native` on a fake mesh |
 | L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
 | contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |

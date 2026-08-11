@@ -1083,10 +1083,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# be built on a basis whose span is not point-group invariant.
 	#
 	# Under the default (``snap``) this prints any firing and continues; the
-	# cut has already been moved outward inside the kernel.  On a deck whose
-	# cut falls in a gap it does nothing at all, which is what the Si 6×6×6
-	# ``armF`` (nband=68) arm is expected to show — its tightest cut has a
-	# relative gap of 0.315 against a tolerance of 1e-6.
+	# cut has already been moved inside the kernel, DROPPING the straddled
+	# block (owner ruling 2026-08-10).  On a deck whose cut falls in a gap it
+	# does nothing at all, which is what the Si 6×6×6 ``armF`` (nband=68) arm
+	# is expected to show — its tightest cut has a relative gap of 0.315
+	# against a tolerance of 1e-6, five decades clear of firing.  That deck is
+	# the control for the direction flip: a cut in a gap is unmoved by EITHER
+	# direction, so its retained ranks must be bit-unchanged across it.
 	_sc_mode = spectral_closure.resolve_mode(
 		os.environ.get(spectral_closure.MODE_ENV))
 	# Read the findings BEFORE the refusal clears them, so the "clean" line
@@ -1099,10 +1102,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
 		         "absence and not a pass.")
 	elif _sc_fired:
-		print_fn(f"    ζ rank-cut closure: guard fired above and the cut was "
-		         f"moved OUTWARD (mode={_sc_mode}).  ζ's retained span is "
-		         f"point-group invariant; the rank it carries is NOT the one "
-		         f"zeta_rcond alone would have chosen.")
+		print_fn(f"    ζ rank-cut closure: guard fired above and the "
+		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
+		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
+		         f"retained span is point-group invariant; the rank it "
+		         f"carries is LOWER than the one zeta_rcond alone would have "
+		         f"chosen, and its κ_eff is correspondingly better.")
 	else:
 		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
 		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "

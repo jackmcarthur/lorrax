@@ -597,13 +597,14 @@ def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
     info = spectral_closure.cluster_at_cut(ev, int(rank))
     if not info["fired"]:
         return ""
-    lo = info["n_keep_snapped"] - len(info["members"])
+    lo, hi = info["n_keep_dropped"], info["n_keep_kept"]
     return (f"the point rank {int(rank)} lands INSIDE a degenerate block of "
             f"{len(info['members'])} eigenvalues (relative gap at the cut "
             f"{info['gap_rel']:.2e}, rtol {info['rtol']:.1e}); the block runs "
-            f"from {lo} to {info['n_keep_snapped']}.  Any n_keep strictly "
-            f"between those selects PART of an eigenspace and is not "
-            f"point-group invariant — see common/spectral_closure.")
+            f"from {lo} to {hi}.  Any n_keep strictly between those selects "
+            f"PART of an eigenspace and is not point-group invariant; the two "
+            f"legal ranks are {lo} and {hi}, and the ruling of 2026-08-10 "
+            f"takes the LOWER — see common/spectral_closure.")
 
 
 # ═══════════════════════════════════════════════════════════════════════

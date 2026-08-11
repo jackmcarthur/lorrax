@@ -39,22 +39,6 @@ The surface
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
     ``SlateLowerL``), so "never reshard, feed it back verbatim" is the
     type rather than a comment.
-``rank_cut(op, values, *, rcond|n_keep, closure=...) -> RankCut``
-    The rank-revealing surface: cut a Cholesky's pivot spectrum
-    (:func:`cholesky_pivot_spectrum`), an LU's ``|diag(U)|``
-    (:func:`lu_rank_spectrum`) or an eigenvalue vector, with the
-    DEGENERACY-CLOSURE guard.  A cut that would stop inside a degenerate
-    cluster keeps a symmetry-arbitrary slice of an eigenspace; the guard
-    moves it OUTWARD past the cluster (``snap``), refuses (``strict``) or
-    is not there (``off``).  Also reachable as ``Plan.rank_cut`` /
-    ``FactorToken.rank_cut``, which bind the op and the mode.
-
-    **OPT-IN, and OFF by default this round.**  ``closure=`` on
-    :func:`plan` / :func:`factor`, or ``LORRAX_DISTRIB_LA_CLOSURE``.
-    Nothing about resolution, routing, sharding or the bytes a
-    factorization returns depends on it.  :mod:`distrib_la.closure` has
-    the criterion, the copy-not-import argument, and the owner row on
-    the default.
 ``resolve_backend(op, requested, mesh, *, n=None) -> str``
     The raising probe.  ``n`` is decoupled from the operands on purpose:
     a caller that will pad can ask before it has built anything.
@@ -88,18 +72,6 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
-from distrib_la.closure import (
-    DEFAULT_MODE as CLOSURE_DEFAULT_MODE,
-    DEFAULT_RTOL as CLOSURE_RTOL,
-    MODE_ENV as CLOSURE_ENV,
-    MODES as CLOSURE_MODES,
-    RANK_SPECTRA,
-    RankCut,
-    SpectralClusterError,
-    cholesky_pivot_spectrum,
-    lu_rank_spectrum,
-    rank_cut,
-)
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
@@ -137,10 +109,6 @@ __all__ = [
     "ROUTE_BATCH_RESHARD", "BATCHED_SCAN_UNROLL",
     # factor / solve
     "FactorToken", "factor", "solve",
-    # the rank-revealing surface and its degeneracy-closure guard
-    "rank_cut", "RankCut", "cholesky_pivot_spectrum", "lu_rank_spectrum",
-    "SpectralClusterError", "CLOSURE_MODES", "CLOSURE_DEFAULT_MODE",
-    "CLOSURE_RTOL", "CLOSURE_ENV", "RANK_SPECTRA",
     # resolution
     "resolve_backend", "list_backends", "backend_module",
     "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",

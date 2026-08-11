@@ -357,147 +357,6 @@ def check_factor_refuses_what_it_cannot_split(mesh, dtype="complex128"):
     return True
 
 
-def _planted_pivot_gram(n, pos, size, nq, dtype, rel=1e-9, decay=0.6):
-    """An HPD stack whose Cholesky pivot spectrum is KNOWN and has a block.
-
-    Diagonal, deliberately: for ``A = diag(d)`` the Cholesky factor is
-    exactly ``diag(sqrt(d))``, so the pivot spectrum every backend must
-    reproduce is ``d`` itself — analytically, to machine precision, on
-    every library.  A disagreement between two backends is then
-    attributable to the FACTORIZATION and not to a random matrix that two
-    reduction orders happened to see differently, which is the only way
-    "the backends agree" is worth asserting.
-
-    Returns ``(A, d, block_edge)``.
-    """
-    d = np.asarray([decay ** i for i in range(n)])
-    for j in range(size):
-        d[pos + j] = d[pos] * (1.0 - rel * j)
-    A = np.broadcast_to(np.diag(d).astype(dtype), (nq, n, n)).copy()
-    return A, d, pos + size
-
-
-def check_closure_agrees_across_backends(mesh, dtype="complex128", nq=2,
-                                         n=64, pos=32, size=4, k=34):
-    """**EVERY BACKEND MUST SNAP THE RANK CUT TO THE SAME PLACE.**
-
-    This is the claim that makes the degeneracy-closure guard a service
-    FEATURE rather than a utility function, and it is the one claim that
-    cannot be made anywhere but here.  L-a checks the criterion's
-    arithmetic and L-b checks that ``native`` and ``native2d`` agree; the
-    distributed libraries are refused on an emulated mesh by guard 4, so
-    cuSOLVERMp and SLATE have never been asked the question until this
-    leg.
-
-    Why it matters: the retained set of a rank cut is a SUBSPACE, and a
-    cut that stops inside a degenerate cluster keeps a symmetry-arbitrary
-    slice of an eigenspace.  If two backends snapped to different ranks,
-    the retained subspace would be a function of WHICH LIBRARY WAS
-    COMPILED — the same class of silent route divergence that produced a
-    QP gap of -161 eV with rc=0, wearing different clothes.
-
-    Three assertions per backend, and they fail differently:
-
-    1. the PIVOT SPECTRUM matches the analytic ``d`` (so a rank agreement
-       below is about the guard and not about two backends being wrong in
-       the same direction);
-    2. the guard FIRES (a pair that both failed to fire would also
-       "agree");
-    3. the snapped rank equals the block edge, and equals every other
-       backend's.
-
-    A backend this machine cannot resolve is DEFERRED BY NAME into the
-    returned report — an absence, never a pass.
-    """
-    import jax.numpy as jnp
-    A_np, d, edge = _planted_pivot_gram(n, pos, size, nq, dtype)
-
-    def _fresh():
-        """A NEW device operand for every backend call.
-
-        ``cholesky`` DONATES argument 0 (``distrib_la.DONATES``) — the
-        factors are written over the operand's buffer wherever the library
-        supports it — so a second backend handed the same array gets
-        ``Array has been deleted``.  MEASURED, not defensive: the first
-        version of this check built ``A`` once and reused it, and on the
-        GPU 2x2 leg cuSOLVERMp's potrf consumed it and SLATE's call then
-        raised.  The runner classifies a ``RuntimeError`` as a GUARD, so
-        the cell reported neither PASS nor FAIL and simply vanished from
-        the count — "10 cells ran" where the CPU arm ran 14.  That is the
-        exact failure mode this file's own ``done: N cells ran`` line
-        exists to expose, and it worked.
-        """
-        return _put(A_np, mesh, (None, "x", "y"))
-
-    def _verdict(label, L):
-        piv = _gather(D.cholesky_pivot_spectrum(L))[0]
-        err = _rel(np.sort(piv)[::-1], np.sort(d)[::-1])
-        assert err < RTOL, (
-            f"{label}: pivot spectrum vs the analytic diag(A) rel {err:.3e} "
-            f"> {RTOL:.0e}; a rank agreement built on this would mean "
-            f"nothing")
-        rc = D.rank_cut("cholesky", piv, n_keep=k, closure="snap",
-                        log=lambda *_: None)
-        assert rc.fired, (
-            f"{label}: the planted {size}-member block at {pos} was not "
-            f"detected — cut {k} came back unmoved, so this backend's arm "
-            f"of the agreement is vacuous")
-        assert rc.n_keep == edge, (
-            f"{label}: snapped to {rc.n_keep}, want the block edge {edge}")
-        return rc.n_keep
-
-    ranks = {"native": _verdict("native", np.linalg.cholesky(A_np))}
-    deferred = {}
-    for backend in ("cusolvermp", "slate"):
-        try:
-            D.resolve_backend("cholesky", backend, mesh, n=n)
-        except (ValueError, RuntimeError) as exc:
-            deferred[backend] = str(exc).split("\n")[0]
-            continue
-        # PAST THIS LINE, RESOLUTION HAS PROMISED.  "A returned FFI name
-        # means every guard passed: the subsequent call cannot fail for an
-        # availability or geometry reason" -- so a RuntimeError from here
-        # on is a DEFECT, not a guard, and it must be re-raised as an
-        # AssertionError or the CLI runner files it under GUARD and the
-        # cell disappears from the count without ever saying FAIL.  That
-        # is not hypothetical: it is what the donated-operand bug above
-        # did on the first GPU leg.
-        try:
-            mod = D.backend_module(backend)
-            if backend == "cusolvermp":
-                L = mod.cholesky_handle_to_natural_L(
-                    mod.batched_distributed_cholesky(_fresh(), mesh=mesh))
-            else:
-                # SLATE factors ONE tile per call and hands back a handle,
-                # so the stack is assembled here rather than by
-                # plan.batched -- which refuses to stack handles, by
-                # design (one_handle).  A fresh operand PER q, same
-                # donation reason.
-                L = jnp.stack([
-                    mod.distributed_cholesky(_fresh()[q],
-                                             mesh=mesh).to_jax_lower()
-                    for q in range(nq)])
-        except (RuntimeError, ValueError) as exc:
-            raise AssertionError(
-                f"{backend}: resolve_backend PROMISED this call would "
-                f"work, and it raised {type(exc).__name__}: {exc}") from exc
-        ranks[backend] = _verdict(backend, L)
-
-    assert len(set(ranks.values())) == 1, (
-        f"THE BACKENDS DISAGREE ON THE SNAPPED RANK CUT: {ranks}.  The "
-        f"retained subspace would be a function of which library was "
-        f"compiled.")
-    # FALSE arm, on the same mesh and the same backends: a spectrum with no
-    # degenerate cluster must be silent under ``strict`` everywhere.  Without
-    # it the cell above measures "the guard fires", not "it discriminates".
-    clean = np.asarray([0.6 ** i for i in range(n)])
-    for kk in (k, k + 1, n // 2):
-        assert not D.rank_cut("cholesky", clean, n_keep=kk,
-                              closure="strict").fired
-    return dict(ranks=ranks, deferred=deferred, edge=edge,
-                backends_run=sorted(ranks))
-
-
 def check_hostile_extents_through_the_ffi(mesh, dtype="complex128",
                                           backend="scalapack", op="solve_lu"):
     """Non-dividing extents through the block-cyclic DESCRIPTORS.
@@ -742,21 +601,6 @@ def test_factor_refuses_what_it_cannot_split():
     check_factor_refuses_what_it_cannot_split(_mesh_1x1("cpu"))
 
 
-def test_the_closure_agrees_across_every_reachable_backend():
-    """The backend-agreement gate, at 1x1.  Its 2x2 execution is leg L-c.
-
-    At 1x1 the FFI backends usually resolve (one process, one device), so
-    this cell is not merely the native arm — but whatever it reaches, the
-    check DEFERS BY NAME anything it cannot, and the report says which
-    backends actually ran.  A green cell that silently ran one backend is
-    the failure this whole file exists to avoid.
-    """
-    pytest.importorskip("jax")
-    out = check_closure_agrees_across_backends(_mesh_1x1(), n=16, pos=8,
-                                               size=4, k=10)
-    assert "native" in out["backends_run"]
-
-
 def test_batched_eigh_dispatch_gate_native_arm():
     """The adopted gate's check 1, which needs no library: backend ``off``
     stays bit-identical to ``jnp.linalg.eigh``.  The FFI arms need a host
@@ -822,12 +666,6 @@ _CLI_CELLS = [
          mesh, dt, backend="cusolvermp", op="solve_lu")),
     ("batched_eigh_dispatch", "cpu",
      lambda mesh, dt: check_batched_eigh_dispatch(mesh, dt)),
-    # The degeneracy-closure guard's backend-agreement gate.  Platform
-    # "" (both), because the claim is about every library this machine
-    # can reach and the check defers by name the ones it cannot: on a
-    # host mesh that is native + slate, on CUDA native + cusolvermp.
-    ("closure_backend_agreement", "",
-     lambda mesh, dt: check_closure_agrees_across_backends(mesh, dt)),
 ]
 
 

@@ -1,3 +1,153 @@
+> ## DIRECTION CORRECTED — THE CUT DROPS THE BLOCK, IT DOES NOT KEEP IT (2026-08-11)
+>
+> **The owner's ruling, verbatim:**
+>
+> > "we just obtain singular values and truncate, and if we're truncating in
+> > the middle of a block of degenerate singular values we should truncate the
+> > whole block."
+>
+> Everything below is correct about WHETHER a cut may split a degenerate block
+> (it may not) and WHERE the boundary is (the relative-to-neighbour criterion,
+> `DEFAULT_RTOL = 1e-6`, bracketed from both sides). It is wrong about WHICH
+> WAY the cut then moves. It landed snapping OUTWARD — keeping the straddled
+> block — and the ruling is the opposite: **the cut moves UP and the whole
+> straddled block is DROPPED.** `DEFAULT_DIRECTION = "drop_block"`.
+>
+> **Why the ruling is right, in the arithmetic rather than by authority.** The
+> section below headed "Default is `snap`, where its sibling defaults to
+> `strict`" argues from a BOUND: the admitted directions are within `rtol` of
+> ones already retained, so `κ_eff` moves by at most `(1+rtol)^m` — under one
+> part in 10⁴. That bound is correct and it was never the issue. The issue is
+> the SIGN. Dropping the block removes the smallest retained values, so
+> `λ_min(kept)` rises and **`κ_eff` falls**; keeping it admits values below the
+> old `λ_min(kept)`, so **`κ_eff` rises** — through the very cap
+> `common/rank_criterion` sized the cut by. The landed version needed a
+> `(1+rtol)^m` slack term in each call site's cap assertion in order not to
+> trip its own guard; **the correction deletes that slack rather than adding
+> one, and the call sites now assert the cap bare.** A block sitting at the
+> rcond boundary is noise-adjacent by construction, so keeping it is adding
+> ill-conditioned directions to the pseudo-inverse the cut exists to
+> condition. It is also the same floor semantics as the owner's points-budget
+> rule for `mu_small`.
+>
+> **The two-rule family, because these guards round opposite ways on purpose.**
+> KEPT-SET quantities floor to a symmetric boundary — this guard (drop the
+> straddled block) and `gw/downfold`'s orbit floor (largest union of whole
+> orbits not exceeding the requested μ_S) both round DOWN. BAND WINDOWS
+> include whole multiplets or refuse: `common/band_degeneracy` is **UNTOUCHED**
+> by this correction and keeps its `strict` default and its standing rule,
+> *never set `snap` to make a gate pass* — a widened window is a different
+> calculation (4v4c → 4v8c, the 0.0906 eV phantom regression). The
+> discriminator: **a band window says WHICH STATES exist and rounds outward; a
+> rank cut says HOW MANY DIRECTIONS are trustworthy and rounds inward.** That
+> paragraph now lives in `common/spectral_closure`'s docstring, where both
+> guards are visible from.
+>
+> **What changed, mechanically.** `DIRECTIONS`/`DEFAULT_DIRECTION` +
+> `resolve_direction()` (deliberately NOT environment-readable: the mode is a
+> dial, the direction is a ruling); `cluster_at_cut` reports BOTH legal cuts
+> (`n_keep_dropped`, `n_keep_kept`) and a direction-resolved `n_keep_closed`;
+> `snap_keep_outward` → `close_keep_mask`, which gains a REVERSE cumulative-AND
+> for the drop walk (still no data-dependent trip count) and keeps the forward
+> one for `keep_block`. The stale key `n_keep_snapped` was REMOVED rather than
+> aliased, so a stale reader gets a `KeyError` instead of a wrong number.
+>
+> **One new failure mode, which only the drop direction has:** a block that
+> reaches `σ_max` leaves rank zero when dropped. `SpectralBlockEmptiesCut`
+> refuses on it in `snap` as well as `strict` — a repair returning an empty
+> basis is not a repair — and the device face carries it out as a zero count
+> that `zeta_projection`'s existing zero-rank refusal catches, with that
+> refusal's message now naming closure as a possible cause.
+>
+> **One interaction found, and it was load-bearing:**
+> `rank_criterion.rank_report` computed `n_dropped_alignment = rank_criterion −
+> rank_used`, and `violations()` refuses on any non-zero value because a
+> round-down that depends on the DEVICE GRID makes the physics mesh-dependent.
+> A closure drop is also a round-down, so after the flip `htransform` would
+> have refused every run whose cut hit a block. `rank_report` now takes
+> `n_dropped_closure=` and attributes it to its own column, subtracted FIRST
+> and clamped to the deficit actually present — so check 2 keeps meaning "the
+> mesh changed the physics", and anything left over is still a violation.
+>
+> **`keep_block` survives** as a source-level per-call-site opt-out for a site
+> with a MEASURED reason to differ. **No site in the tree passes it**, and two
+> ratchets in `tests/test_spectral_closure.py` assert that plus "the default is
+> spelled exactly once". A site that turns out to NEED keep-more is a finding
+> about what consumes its retained span, to be reported rather than flagged
+> away.
+>
+> ### Evidence for the correction (2026-08-11)
+>
+> **The twins are re-asserted in the flipped direction, and they discriminate.**
+> With `DEFAULT_DIRECTION` set back to `keep_block`, **17 cells go red** across
+> both faces, all three modes and the κ argument — so these gates fail a
+> deliberately keep-more result rather than merely passing a drop one. The
+> criterion cell asserts `n_keep_closed == 20` AND `!= 24` by name.
+>
+> **CPU, WSL, worktree pin proven by `__file__` before measuring:**
+> `test_spectral_closure.py` **55 passed, 0 skipped**;
+> `test_rank_criterion.py` 17 (4 new). Eleven neighbouring suites:
+> **235 passed, 18 skipped**, against base `d8c7a24e` **244 passed, 18
+> skipped** on the same box — the −9 is the reverted `distrib_la` consistency
+> cells, and the 3 red in `test_htransform_kpath_gates.py` are **identical on
+> both sides** (the FFI `.so` is absent on this box, pre-existing).
+> `distrib_la`'s own suite at the reverted state: **108 passed, 62 skipped**
+> with the **same 6** pre-existing CUDA-library failures base has.
+>
+> **THE armF CONTROL, P=4 on a real 2×2 device mesh, and it is the point of
+> the whole leg.** armF's cut falls in a gap (relative gap 0.315 against rtol
+> 1e-6), so the flip must be **INERT** there:
+>
+>     ζ rank-cut closure: ARMED (mode=strict, rtol=1.0e-06) and SILENT
+>     — no cut fell inside a degenerate block of C_q on any q.
+>
+> **Exit 0 in 129 s under `strict`**, and the retained ranks over the 16 wedge
+> q come back **1 × 1095 and 15 × 1098 of 1104 — the set {1095, 1098},
+> bit-identical to what this file records for the same deck before the guard
+> existed and before the direction moved.** A live truncation firing on every
+> q, guard armed, silent, and unmoved: the flip changes nothing where no block
+> straddles. Run's own lines confirm the shape (`device mesh is 2x2 over axes
+> ('x','y')`, compile-cache ARMED at 4 processes), the deck (`nval = 8
+> ncond = 60 nband = 68`, `zeta_rcond = 1e-10`, deck md5 `d9f367a6…`) and the
+> tree (`HEAD 4ecbc7d2`, **dirty-count 0**, printed from inside the leg).
+>
+> **κ_eff, restated for the drop direction on the identical construction the
+> old note used** (planted block, `rel = rtol/4`, cut at 41 of 128):
+>
+> | block m | keep-snap κ ratio | drop-snap κ ratio | rank keep | rank drop |
+> |---|---|---|---|---|
+> | 2 | 1.000000250 | 0.804473828 | 41→42 | 41→40 |
+> | 4 | 1.000000750 | 0.804474230 | 41→44 | 41→40 |
+> | 8 | 1.000001750 | 0.804475034 | 41→48 | 41→40 |
+> | 48 | 1.000011750 | 0.804483079 | 41→88 | 41→40 |
+>
+> The old note's "<1e-4" is reproduced exactly in column 2. Column 3 is a
+> **different kind of number**: ~0.804 at every block size, i.e. a **19.6 %
+> IMPROVEMENT** in κ_eff, essentially independent of m — because the drop
+> moves `λ_min(kept)` across a real gap (one smooth spectral step) instead of
+> sliding it within an rtol-scale cluster. On the `rank_report` probe the same
+> effect reads κ 6.449e3 → 4.160e3 against a cap of 6.449e3.
+>
+> **A P=4 SHAPE TRAP, caught mid-leg and worth the row.** The first suites arm
+> ran `lx run -G 4 -n 4`, which places **four independent single-GPU pytest
+> sessions** — it printed four identical `229 passed, 8 skipped` lines and
+> would have been reported as a P=4 pass. The correct shape is `-G 4 -n 1`
+> (one process, four devices), and at it the same suites report **236 passed,
+> 1 skipped** — **seven cells that SKIPPED under the fake shape actually ran**,
+> which is exactly the mesh-dependent half. The leg now refuses outright
+> unless an in-leg probe prints `MESH_SHAPE devices=4 local=4` first.
+>
+> **Evidence:** `/pscratch/sd/j/jackm/spectral_drop_0811/` — `wt/` (worktree at
+> `4ecbc7d2`), `arm1.sh` / `arm2.sh`, `_logs/mesh_probe.log`,
+> `_logs/suites_p4_n1.log`, `_logs/armF_run2.log`, and `armF_run2/`.
+> Environment: `LX_BASE_MODULE=lorrax_J070`, the `merge_ckpt_2026-08-08` `.so`
+> pair, `JAX_ENABLE_X64=1`, BFC@0.85 — the same environment armF was
+> originally measured under. `bandwin666_0810/armF` was read READ-ONLY through
+> symlinks.
+>
+> Read the rest for the mechanism, the tolerance derivation, the site sweep and
+> the original armF evidence — all of which stand. Only the direction moved.
+
 # AMENDMENT — SPECTRAL CUTS NOW HAVE THE CLOSURE GUARD BAND WINDOWS HAVE HAD SINCE 53fd80ea (2026-08-10)
 
 **The owner's question was "did we finish enforcing symmetries (no degeneracy
