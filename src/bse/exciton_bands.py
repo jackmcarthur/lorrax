@@ -28,13 +28,24 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
     conduction slots holding the Q-shifted caches — no parallel kernel.
   * **Exchange V_Q** — from ``bse.vq_interp``:
       ``--vq-mode=interp``  F-scheme + b26p interpolation (fast; ONE jitted
-                            evaluator, per-Q dispatch-only), or
+                            evaluator, per-Q dispatch-only).  SLAB ONLY —
+                            the model's per-|G_z| channels exist only on a
+                            q_z=0 slab, and a bulk deck is refused by name.
       ``--vq-mode=refit``   per-Q ζ refit (compute-don't-interpolate — the
-                            off-grid GROUND TRUTH; expensive), or
+                            off-grid GROUND TRUTH; expensive).  Nothing in
+                            it is 2-D: on a ``sys_dim=3`` deck it contracts
+                            with the PRODUCER's own Coulomb door, so it is
+                            the arbitrary-Q exchange a bulk crystal runs,
+                            not merely a checking mode.
       ``--vq-mode=both``    interp on the full path + refit on
                             ``--refit-points`` spot checks, solved in the
                             SAME compiled scan (extra scan rows) so the
                             interp-vs-refit ΔE_S table is apples-to-apples.
+      ``--vq-mode=ongrid``  no model at all: the stored ``V_qmunu[wrap(−Q)]``
+                            tile, exact, but only at Q on the coarse
+                            exchange-tile grid — which ``--q-per-segment``
+                            (a FLOOR of 16 by default, because E_S(Q) on a
+                            path is a bandstructure) puts most Q off.
     Momentum labeling: the pair density conj(ψ_c[k+Q]) ψ_v[k] pairs with
     the tile at TILE momentum q = wrap(−Q) (reference-metric convention,
     ``vq_interp`` docstrings); on-grid this is exactly the stored
@@ -57,9 +68,12 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
     every path Q that lands on the coarse exchange-tile grid the BSE is solved
     twice in the same scan, once through the refit exchange and once through
     the producer's stored tile, and the eigenvalues must agree to
-    ``REFIT_CERT_TOL_MEV``.  The two modes are not a tolerance apart; they
-    certify different objects, and the windowed one certifies the object that
-    is published.
+    the tolerance ``--cert-grade`` names.  The two modes are not a tolerance
+    apart; they certify different objects, and the windowed one certifies the
+    object that is published.  ``--cert-grade`` selects between exactly two
+    NAMED module constants and never a number — :data:`CERT_TOL_BY_GRADE`,
+    whose two entries carry the whole argument; on a pass the grade and the
+    certified worst travel into the provenance line, the ``.dat`` and the plot.
   * **Γ endpoint** — at exactly Γ the production q=0 tile is used (stored
     head-body convention: compute_vcoul zeroes G=0, the mini-BZ-averaged
     head is the loader's rank-1 injection).  At every finite Q the G=0 term
@@ -120,6 +134,7 @@ from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
                                     check_band_window)
+from common.collectives import device_put_process_local
 from common.fft_helpers import make_sharded_ifftn_3d
 from common.provenance import lorrax_version, provenance_header
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
@@ -133,11 +148,9 @@ from .bse_w_exact import _create_mesh_xy
 from . import vq_interp
 
 RY2EV = 13.6056980659
-# PAD_EPS_GUARD_RY now lives in bse_io — the module that OWNS the band pad —
-# and is imported above.  It was defined here because this driver was the
-# only one that knew the loader's zero ε pad was a wrong number and repaired
-# it locally; the loader is correct now, so the constant belongs at the seam
-# and every BSE driver inherits the guard instead of one of nine.
+# PAD_EPS_GUARD_RY is imported, not defined: it belongs at the loader seam
+# (``bse_io``) so every BSE driver inherits the same guard, instead of this
+# one repairing a wrong ε pad locally as it used to.
 
 #: ``--refit-window=bse`` certification tolerance, in meV, on the CONTRACTED
 #: object: BSE eigenvalues at an on-grid Q through the refit exchange against
@@ -227,38 +240,24 @@ def _gather_host(x):
     """Gather a ``jax.Array`` to a full host numpy array, identical on every
     process, whether it is REPLICATED or PROCESS-SPANNING.
 
-    ONE line of delegation to :func:`common.collectives.gather_to_host`, and
-    the reasoning stays HERE because this driver is where it was learned:
+    ONE line of delegation to :func:`common.collectives.gather_to_host`, whose
+    docstring owns the three-arm branch and the incidents behind it.  The
+    wrapper is not free-standing: ``tests/test_bse_gather_and_mesh.py``
+    ratchets it, and its four siblings, to REACH that service — the gate
+    exists because five hand-rolled copies of this branch had drifted, three
+    of them onto ``tiled=False``, which raises on exactly the arrays their
+    callers feed them.
 
-    ``jax.device_get`` raises on an array whose shards live on OTHER processes
-    (the diagnostic gate's Q-shifted ψ_c is μ-sharded ``P(...,'x')``, so on a
-    16-process / 4-node run no single process holds it all) — those need
-    ``multihost_utils.process_allgather``, which stitches the full logical
-    array (gathering only the sharded axes) on every process.  But a
-    FULLY-ADDRESSABLE array (replicated, or single-process) must NOT go through
-    ``process_allgather(tiled=True)`` — that concatenates each process's full
-    copy and DUPLICATES the leading axis (e.g. eps_c (144,·) → (16·144,·)).  So
-    the service branches on ``is_fully_addressable``: ``device_get`` when the
-    whole array is local, ``process_allgather`` only when shards are remote.
-    The branch is a global property (identical on every process), so the
-    collective stays in lockstep.  On one process everything is fully
-    addressable ⇒ plain device_get.
-
-    WHAT THIS DRIVER ACTUALLY FEEDS IT, NOW.  Only ``evs_dev`` — the
-    block-Lanczos Ritz values, ``P()``-sharded.  The driver's own log line
-    records that such an array reports ``fully_addressable=False`` at P=64
-    (job 7882507), so it takes the service's ``is_fully_replicated`` arm: a
-    LOCAL buffer read, no collective.  The one caller that used to hand this
-    function a μ-sharded, genuinely process-spanning array — the on-grid
-    diagnostic gate — no longer does; it contracts μ on device instead (see
+    WHAT THIS DRIVER FEEDS IT, NOW.  Only ``evs_dev`` — the block-Lanczos
+    Ritz values, ``P()``-sharded.  The driver's own log line records that such
+    an array reports ``fully_addressable=False`` at P=64 (job 7882507), so it
+    takes the service's ``is_fully_replicated`` arm: a LOCAL buffer read, no
+    collective.  The one caller that used to hand this function a μ-sharded,
+    genuinely process-spanning array — the on-grid diagnostic gate — no longer
+    does; it contracts μ on device instead (see
     :func:`_gate_stats_on_device` for the three warm-up attempts that failed
     to make that gather work under impl=mpi).  So this driver now issues no
     cross-process host gather at all.
-
-    The branch still matters and is still gated in
-    ``tests/test_bse_gather_and_mesh.py``, because at 64 ranks the wrong arm
-    silently returns an array 64× too long on the leading axis, and because
-    the service is shared.
     """
     from common.collectives import gather_to_host
     return gather_to_host(x)
@@ -950,24 +949,13 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
     overlap loss / >0.1 Ry ε drift) — htransform accuracy is
     centroid-count-governed and reported, not silently trusted.
 
-    ψ IS NOT GATHERED.  This used to pull both the htransform and the stored
-    μ-sharded ψ to host on every process and do the contraction in numpy.
-    Two things were wrong with that.  (1) Scaling: it is an ``O(N_μ)``
-    all-gather per process inside a DIAGNOSTIC, on the one axis the whole BSE
-    is sharded over.  (2) It did not work: at P=16 under
-    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` the gather refuses with
-    "Communicator requested from a thread that is not the one MPI was
-    initialized from" — reproduced 6/6 and 4/4 cells in jobs 7882523 and
-    7882531, in this exact frame, and NOT cured by either of two
-    ``process_allgather`` warm-up attempts.  Contracting μ on device (where
-    the psum rides an already-warmed mesh-axis clique) removes the operand
-    that could not be gathered instead of trying harder to gather it, and
-    leaves a ``nk·nc²`` object that every process holds.
-
-    ε goes the same way: it is folded into the same jit and returned as a
-    replicated scalar, so the host side of this gate issues NO collective at
-    all — see ``_gate_stats_on_device`` for the three warm-up attempts that
-    did not make a host gather work here.
+    ψ IS NOT GATHERED, and ε is not either: both are contracted inside
+    :func:`_gate_stats_on_device`, which returns replicated results, so the
+    host side of this gate issues NO collective at all.  That function's
+    docstring carries the measurement — a μ-sharded host gather here is an
+    ``O(N_μ)`` all-gather per process inside a DIAGNOSTIC, and at P=16 under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` it does not work at any of
+    three warm-ups.
     """
     nc = int(data["n_cond"])
     d_dev, d_idx_dev, G_dev = _gate_stats_on_device(
@@ -1056,12 +1044,8 @@ def rerun_check_enabled(args) -> bool:
 
 
 def build_parser():
-    """The driver's argparse parser, built where a test can reach it.
-
-    This used to be inline in ``main``, which meant the only way to observe a
-    flag's default was to run a full solve.  It is a plain extraction: same
-    arguments, same order, same defaults.
-    """
+    """The driver's argparse parser, built where a test can reach it — so a
+    flag's default is observable without running a full solve."""
     import argparse
     # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE
     # resolver, and the CLI vocabulary is the resolver's own list rather
@@ -1440,10 +1424,6 @@ def main(argv=None):
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
     nv_pad, nc_pad = int(data["n_val_pad"]), int(data["n_cond_pad"])
     n_rmu, n_rmu_pad = int(data["n_rmu"]), int(data["n_rmu_pad"])
-    # pad-ε guard on the valence side (loader zero-pads; see module doc).
-    # Done ON DEVICE (jnp.where) to preserve the loader's sharding: a host
-    # device_get→jnp.asarray round-trip would fail on a process-spanning shard
-    # in a multi-node run AND drop the sharding.
     # ── QP energies (--eqp) ───────────────────────────────────────────────
     # BOTH legs of the pair basis have to move together or the diagonal
     # D_Q = eps_c(k+Q) - eps_v(k) mixes QP conduction with DFT valence.  The
@@ -1882,7 +1862,6 @@ def main(argv=None):
             V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
             V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
                                            + V_np[:n_rmu, :n_rmu].conj().T)
-            from common.collectives import device_put_process_local
             V_rows.append(device_put_process_local(V_pad, grid_xy))
             n_eval_calls += 1
             continue
@@ -1943,7 +1922,6 @@ def main(argv=None):
             # Process-local (AA.1): V_pad is host numpy, identical on every
             # rank; plain device_put would fire the hidden assert_equal
             # all-gather.  LORRAX_CHECK_REPLICA=1 re-arms it.
-            from common.collectives import device_put_process_local
             V_rows.append(device_put_process_local(V_pad, grid_xy))
     # Row order in the stack, and the ONE place it is written down:
     #   [0, nQ)                                   the path (+ --extra-q)
@@ -2101,10 +2079,10 @@ def main(argv=None):
     evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                 data["psi_v_X"], data["psi_v_Y"],
                                 data["eps_v"], W_R, *head_args)
-    # The block-Lanczos Ritz values come from a small replicated eigh(T) — the
-    # scan output is fully addressable on every process, so the rank-0
-    # ``device_get`` below reconstructs the whole (n_solve, n_eig) table
-    # (no cross-process gather needed).  Logged so the run proves it.
+    # THE ONLY HOST FETCH LEFT IN THIS DRIVER, and it issues no collective:
+    # ``evs_dev`` is the block-Lanczos Ritz table out of a small replicated
+    # eigh(T), ``P()``-sharded, so it takes the service's replicated arm (a
+    # local buffer read).  See ``_gather_host``.  Logged so the run proves it.
     log(f"[dist] evs sharding={evs_dev.sharding}, "
         f"fully_addressable={evs_dev.is_fully_addressable}")
     evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry

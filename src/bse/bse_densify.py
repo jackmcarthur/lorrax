@@ -623,12 +623,13 @@ def _interpolate_bse_data_to_grid(
     # averaging the WRONG MOMENT (a scalar <v> where the nonanalytic head needs
     # the 3×3 second moment <v q_a q_b>) — reached every coarse→fine user who
     # had not set the key; and (ii) the deck's exact disk body and its
-    # loader-injected ``vhead`` rank-1 head (:1689-1704 above) were discarded
-    # and substituted by an LR-only model reconstruction.
+    # loader-injected ``vhead`` rank-1 head (``bse_head._inject_q0_head``)
+    # were discarded and substituted by an LR-only model reconstruction.
     #
     # Both now follow the deck's ``head_minibz_average`` key, default off, like
-    # every other reader of that key in the tree (exciton_bands.py:971-973,
-    # head_correction.py:284,339, vq_interp.py:1498).  What the OFF arm gives
+    # every other reader of that key in the tree (``exciton_bands.main``'s
+    # ``head_mbz``, ``head_correction.HeadResolver``'s ``analytic_sphere``,
+    # ``vq_interp.build_vq_evaluator``).  What the OFF arm gives
     # up is only the head RESCALE, and at Q=0 the head is annihilated by
     # ⟨u_ck|u_vk⟩ = 0 up to the ISDF orthogonality residual
     # (LT_HEAD_PROBLEM.md §2.1) — so a stale head SCALE is inert to that
