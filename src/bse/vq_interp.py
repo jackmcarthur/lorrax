@@ -2955,6 +2955,57 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
     return out
 
 
+def zeta_r_to_sphere_q(zx, zeta, qw, fi):
+    """ζ(r) rows → ζ(q+G) rows at the flat FFT slots ``fi``, host.
+
+    THE PRODUCER'S FRAME, and the only place the refit states it::
+
+        ZG_μ(G) = Σ_r e^{−2πi (q+G)·r} ζ_μ(r)
+
+    — the Bloch factor multiplies ζ ON THE r GRID, before the FFT, which is
+    exactly what the ζ writer does (``gw.isdf_fitting`` hands ``qvec_frac``
+    to ``common.wfn_transforms.accumulate_rchunk_to_gflat``, whose per-q
+    phase site is pre-FFT).  This is the device twin of the host
+    :func:`to_sphere` four hundred lines up: same factor, same
+    ``norm="backward"``, same flat-index gather, differing only in that
+    ``to_sphere`` gathers the STORED sphere at a stored q index while this
+    takes an explicit slot list, so it also serves an off-grid q.
+
+    It is a named function rather than four lines inside :func:`refit_vq`
+    because ``tests/test_refit_frame_convention.py`` pins it against
+    :func:`to_sphere` on a random ζ at finite q, and that identity is the one
+    the sixth wall broke: the refit used to apply a per-μ centroid winding
+    phase ``e^{−2πi q·s_μ}`` to a phase-free FFT instead, which is exact only
+    for a ζ that is a delta at s_μ, is an exact no-op at q = 0, and is why Γ
+    was clean at 4.7e-06 while every finite q read 1.11–1.17.
+    """
+    n_mu = int(zeta.shape[0])
+    ph_r = np.exp(-2j * np.pi * (zx["rfrac"] @ np.asarray(qw)))
+    box = local_fftn3((jnp.asarray(zeta) * jnp.asarray(ph_r)[None, :]).reshape(
+        n_mu, zx["nx"], zx["ny"], zx["nz"]), axes=(1, 2, 3), norm="backward")
+    # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get, and
+    # THE PARITY OF n_μ IS WHY THAT WAS NOT OBVIOUS.  ζ inherits its μ-axis
+    # sharding from ``psi_m_mu`` — ``bse_setup``'s ``psi_rmu_Y``, laid out
+    # ``P(None, None, None, 'y')`` — so this box is μ-sharded across the
+    # mesh and, at P>1, across PROCESSES.  ``jax.device_get`` on that raises
+    # "Fetching value for a jax.Array that spans non-addressable (non process
+    # local) devices" (measured at 4 GPUs in 4 processes on the μ=960 parent,
+    # `qsign_recut_0811/_logs/xb_ctl_parent.log`).
+    #
+    # It hid for as long as it did because ``sharding_fit`` silently declines
+    # a spec the extent cannot satisfy: at the μ=191 child, 191 % 2 != 0, the
+    # μ axis is REPLICATED instead, and ``Array._value`` serves a fully
+    # replicated array out of the local shard before it ever reaches the
+    # addressability check — so the identical call works.  Every P=4 leg the
+    # refit path had ever had was the odd-μ child, and odd μ cannot see this
+    # by construction.  ``gather_to_host`` covers all three shapes in the one
+    # branch it already owns: device_get when fully addressable (P=1),
+    # addressable_data(0) when replicated (the odd-μ arm, still no
+    # collective), process_allgather(tiled=True) when genuinely sharded.
+    # Placement only — the tile is arithmetic on the same values.
+    return _to_host(box.reshape(n_mu, zx["n_rtot"])[:, jnp.asarray(fi)])
+
+
 def _sphere_millers(zx, qw):
     """All Miller G with |bᵀ(qw+G)|² ≤ zeta_cutoff (the fit sphere at qw)."""
     Kmax = np.sqrt(zx["zeta_cutoff"])
@@ -3135,42 +3186,53 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     # (pad columns are exact zeros — zero ψ ⇒ zero ρ ⇒ zero Z).
     Z = jnp.concatenate(Z_parts, axis=1)              # (n_μ, n_rp)
     zeta = solve_zeta(C, Z)[:, : rst["n_rtot"]]       # (n_μ, n_rtot)
-    # periodic-frame ζ̃ → sphere coefficients at qw → V tile.
-    # STORED-ζ PHASE CONVENTION (derived from the recon/to_sphere round
-    # trip; the on-grid null pins it): the producer stores
-    #     ZG_μ(G) = e^{−2πi q·s_μ} · FFT_r[ζ̃_μ](G)
-    # i.e. the u-frame fit vector with the centroid winding phase folded
-    # in (the same e^{+i(q+G)·s_μ} the F-scheme later factors OUT).  The
-    # tile contraction conj(zt_μ) v zt_ν then carries e^{+iq·(s_μ−s_ν)}
-    # relative to the phase-free FFT — omitting it decorates V by that
-    # (μ,ν) phase (measured: 54% tile / 11% B error on the on-grid null).
-    zeta_box = zeta.reshape(n_mu, zx["nx"], zx["ny"], zx["nz"])
-    ztG_box = local_fftn3(zeta_box, axes=(1, 2, 3), norm="backward") \
-        .reshape(n_mu, zx["n_rtot"])
+    # periodic-frame ζ̃ → sphere coefficients at qw → V tile, BY THE
+    # PRODUCER'S OWN TRANSFORM.  The ζ writer is
+    # ``common.wfn_transforms.accumulate_rchunk_to_gflat``, called from
+    # ``gw.isdf_fitting`` with ``qvec_frac=q``, and what it computes is
+    #
+    #     ZG_μ(G) = Σ_r e^{−2πi q·r} ζ_μ(r) e^{−2πi G·r}
+    #             = Σ_r e^{−2πi (q+G)·r} ζ_μ(r),
+    #
+    # i.e. the Bloch factor multiplies ζ ON THE r GRID, before the FFT, so
+    # that the transform is taken at q+G and not at G.  ``to_sphere`` and
+    # ``recon`` twenty lines up are the same statement in host numpy, which
+    # is what makes this the module's one spelling of the frame rather than
+    # a second opinion about it.  Both are exact no-ops at q = 0.
+    #
+    # THIS LINE USED TO CARRY A CENTROID WINDING PHASE INSTEAD —
+    # ``e^{−2πi q·s_μ} · FFT_r[ζ_μ](G)``, a per-μ DIAGONAL phase standing in
+    # for an r-dependent one.  The substitution is exact only if ζ_μ were a
+    # delta at s_μ, and it is not: ζ_μ is a cardinal interpolation function
+    # with support across the cell, so the two differ in the G-channel
+    # structure and not merely by a phase.  It is why Γ was clean and
+    # nothing else was
+    # (``tests/known_failures/2026-08-11-two-window-contract-lands-and-the-\
+    # sixth-wall-is-finite-q.md`` §5: 4.688e-06 at Γ, 1.11–1.17 at every
+    # finite q, with no stored tile reproduced at all).  Measured on
+    # ``dp2628n20`` with ``m_leg="stored"`` at four coarse q, ζ' against the
+    # STORED ζ on the matched sphere and the tile against the stored tile:
+    #
+    #   transform                         ζ' relF     tile relF
+    #   e^{−2πi q·s_μ}·FFT[ζ]  (was)      1.02–1.10   1.13–1.17
+    #   FFT[ζ]  (winding dropped)         1.42–1.76   0.23–0.57
+    #   THIS: FFT[e^{−2πi q·r} ζ]         1.4e-06–4.6e-06   2.0e-06–7.9e-06
+    #
+    # and the winding phase applied ON TOP of this one puts the tile back at
+    # 1.27–1.37, which is what says it is spurious rather than merely
+    # misplaced.  The magnitudes moved too — |ζ'| alone was 0.20–0.57 wrong —
+    # so this was never a phase convention that a sign flip could reach.  The
+    # G-sphere (``_sphere_millers`` vs the stored ``gvec``: identical sets,
+    # 0 missing either way at every q) and ``v_on_set`` (relF 0.0 against the
+    # producer's kernel on the stored sphere) were the other two suspects and
+    # are both exonerated by the same leg.  No centroid winding phase is
+    # applied anywhere below: ``zx["rmu_frac"]`` is still the right object in
+    # the F-scheme, where the same factor is taken OUT of the stored ζ to
+    # leave something smooth enough to interpolate — an approximation there
+    # ON PURPOSE, and never an identity here.
     GS = _sphere_millers(zx, qw)
     fi = flat_idx(zx, GS)
-    # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get, and
-    # THE PARITY OF n_μ IS WHY THAT WAS NOT OBVIOUS.  ζ inherits its μ-axis
-    # sharding from ``psi_m_mu`` — ``bse_setup``'s ``psi_rmu_Y``, laid out
-    # ``P(None, None, None, 'y')`` — so ``ztG_box`` is μ-sharded across the
-    # mesh and, at P>1, across PROCESSES.  ``jax.device_get`` on that raises
-    # "Fetching value for a jax.Array that spans non-addressable (non process
-    # local) devices" (measured at 4 GPUs in 4 processes on the μ=960 parent,
-    # `qsign_recut_0811/_logs/xb_ctl_parent.log`).
-    #
-    # It hid for as long as it did because ``sharding_fit`` silently declines
-    # a spec the extent cannot satisfy: at the μ=191 child, 191 % 2 != 0, the
-    # μ axis is REPLICATED instead, and ``Array._value`` serves a fully
-    # replicated array out of the local shard before it ever reaches the
-    # addressability check — so the identical call works.  Every P=4 leg the
-    # refit path had ever had was the odd-μ child, and odd μ cannot see this
-    # by construction.  ``gather_to_host`` covers all three shapes in the one
-    # branch it already owns: device_get when fully addressable (P=1),
-    # addressable_data(0) when replicated (the odd-μ arm, still no
-    # collective), process_allgather(tiled=True) when genuinely sharded.
-    # Placement only — the tile below is arithmetic on the same values.
-    zt = _to_host(ztG_box[:, jnp.asarray(fi)])
-    zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qw))[:, None] * zt
+    zt = zeta_r_to_sphere_q(zx, zeta, qw, fi)
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
     v = rst.get("v_on_set", None)

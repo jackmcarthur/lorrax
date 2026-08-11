@@ -100,12 +100,20 @@ def _synthetic(n_mu):
         return (rng.standard_normal(shape)
                 + 1j * rng.standard_normal(shape)).astype(np.complex128)
 
+    # Fractional r on the FFT grid, C order — ``load_zeta_coarse``'s own
+    # ``rfrac``, spelled the same way.  ``refit_vq`` needs it because the
+    # r→G transform carries the producer's Bloch factor e^{−2πi q·r} on the
+    # r grid; the twin's ``_Q_TILE`` is non-zero, so this is live here.
+    _rg = np.meshgrid(np.arange(nx) / nx, np.arange(ny) / ny,
+                      np.arange(nz) / nz, indexing="ij")
+    rfrac = np.stack([g.ravel() for g in _rg], 1)
     zx = {
         "nk": nk, "nb": _NB, "ns": _NS, "n_mu": n_mu, "nq": nk,
         "k_int": k_int, "kgrid": kg,
         "k_lookup": {tuple(v): i for i, v in enumerate(k_int)},
         "psi": cx(nk, _NB, _NS, n_mu),
         "nx": nx, "ny": ny, "nz": nz, "n_rtot": n_rtot,
+        "rfrac": rfrac,
         "rmu_frac": rng.random((n_mu, 3)),
         "zeta_cutoff": _ZETA_CUTOFF,
         "bvec": np.eye(3, dtype=np.float64),
