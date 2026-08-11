@@ -14,6 +14,47 @@ measurement is worth more standing than edited.  Implementation:
 
 ---
 
+> ## AMENDMENT 2026-08-11 — **THE ACCURACY COMPARISON IN THIS ROW IS VOID-BY-Q-SIGN-FIX. THE RULING AND THE ECONOMICS ARE NOT.**
+>
+> Both arms of the comparison below were downfolded through
+> `pair_density_gram` while it built its transfer at −q and applied it at +q,
+> so both were wrong at 56 of the 64 q
+> (`tests/known_failures/2026-08-11-downfold-gram-q-sign.md`).  Every `eps_W`,
+> the **−348.6 meV** exciton error, the orbit-floored arm's **FEAST
+> non-convergence** and its **+47 % Lanczos `E_max`** are measurements of that
+> defect and **must not be quoted**.
+>
+> **The comparison has been re-taken on the fixed tree.  The new numbers, and
+> the verdict, are in `tests/known_failures/2026-08-11-qsign-recut-verdicts.md`
+> §3; evidence `/pscratch/sd/j/jackm/qsign_recut_0811/`.**
+>
+> | quantity | recorded below (VOID) | re-measured 2026-08-11 |
+> |---|---|---|
+> | orbit-floored 168 `eps_W(W0)` median | 4.319e-02 | **1.273e-01** |
+> | point-picked 185 `eps_W(W0)` median | 1.056e-02 | **1.196e-02** |
+> | parent, lowest exciton 4v8c | 3.575096 eV | **3.575096 eV** (unchanged — not downfolded) |
+> | point-picked 185, lowest exciton | 3.226476 eV (**−348.6 meV**) | **3.532525 eV (−42.6 meV)** |
+> | orbit-floored 168, lowest exciton | *did not converge* | **3.492286 eV (−82.8 meV)** |
+> | independent directions | 122 of 168 vs 171 of 185 | **unchanged** — a q = 0 quantity, where −q ≡ q |
+>
+> **What survives:** the answer to §3's question is still NEITHER — the
+> symmetric-but-smaller basis is still *beaten*, now by 10.6x on the `eps_W`
+> median and 1.9x on the observable.  The direction counts, the orbit census,
+> the ladder of legal point counts and the economics finding (0.73 independent
+> directions per point against 0.92) are all q = 0 statements and are
+> untouched.  **The ruling itself was never a function of these numbers** and
+> stands as taken.
+>
+> **What does not survive:** the two claims this row leaned on hardest.  The
+> −348.6 meV was an eighth of its recorded size, and the FEAST non-convergence
+> was the defect, not the basis — the orbit-floored arm converges on the fixed
+> tree.  This row's own caution was well placed: it reported the
+> non-convergence as "a failure to produce an observable, not a measured
+> observable" and said it had not separated the causes.  It had not, and the
+> cause was the q-sign defect.
+
+---
+
 
 This is a decision to be made by whoever owns the downfold's centroid selection. It
 is not a defect report and it is not a change: the branch that carries this file

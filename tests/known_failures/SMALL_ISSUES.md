@@ -492,6 +492,41 @@ silent overwrite.
     the claim table it just read, so the next occurrence self-diagnoses.
     [batch lane report, 2026-08-10]
 
+39. **`vq_interp.refit_vq` cannot run at P>1 unless the basis size happens
+    to defeat sharding** — `src/bse/vq_interp.py:2778` does a bare
+    `jax.device_get(ztG_box[:, jnp.asarray(fi)])` on a globally sharded
+    array and dies with `RuntimeError: Fetching value for jax.Array that
+    spans non-addressable (non process local) devices`. It is the sibling
+    of the `refit_prepare` fix on `feat/xbands-bse-window-refit-2026-08-10`
+    (`_to_host`, not `device_get`) and was missed because **the failure
+    depends on n_μ parity**: the μ=191 child is odd, so `sharding_fit`
+    declines to shard it (`191 % 2 != 0` → replicated), the array is fully
+    addressable and the call accidentally works; the μ=960 parent is even,
+    shards for real, and the call fails. Every P=4 leg the refit path has
+    ever had was the odd-μ child arm, so the whole existing coverage is
+    blind to it by construction. Cost paid: this lane's parent control had
+    to be taken at P=1. Fix is one call site plus a cell that exercises
+    `refit_vq` at P>1 on an EVEN n_μ. Not physics — the P=1 arithmetic is
+    unaffected — but it blocks a four-GPU control, so it is not cosmetic.
+    [qsign re-measurement lane, 2026-08-11;
+    `/pscratch/sd/j/jackm/qsign_recut_0811/_logs/xb_ctl_parent.log`;
+    `tests/known_failures/2026-08-11-qsign-recut-verdicts.md` §4]
+
+40. **An in-leg mesh assert that knows only one driver's banner produces
+    FALSE REFUSALS** — the three drivers announce their shape in three
+    dialects (`exciton_bands`: `[dist] jax.device_count()=4 ...
+    mesh_xy.shape={...}`; `downfold_cli`: `mesh {'x': 2, 'y': 2} on 4
+    device(s), 4 process(es)`; `bse_jax`: `This is rank 0 of 4, and it
+    addresses 1 of the 4 devices`). A wrapper grepping for one of them
+    killed two `bse_jax` legs that had already **completed their physics**,
+    reporting exit 95 as if the shape were wrong. Two lessons worth
+    carrying, both cheap: parse all three dialects, and **never let a shape
+    assert overwrite a non-zero payload rc** — reporting 95 over a real
+    traceback hides the defect underneath, which is exactly how row 39
+    nearly went unnoticed. Reference implementation:
+    `/pscratch/sd/j/jackm/qsign_recut_0811/inleg.sh`.
+    [qsign re-measurement lane, 2026-08-11]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module
