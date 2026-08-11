@@ -1328,17 +1328,43 @@ def main(argv=None):
     # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
     ongrid = (args.vq_mode == "ongrid")
     kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
+    # WHICH GRID INDEXES THE EXCHANGE TILES.  Normally the bundle's own.  After
+    # a ``bse_k_grid`` coarse→fine densification the bundle's grid is the FINE
+    # one but the stored tiles are still the COARSE ones — exact where they
+    # exist (V_{μν}(q) is a ζ/G-sphere object and never sees the k-grid) and
+    # simply ABSENT at a fine q that is not a coarse q.  So the on-grid Q set
+    # is the coarse grid on a densified bundle, and the refusal below says so
+    # instead of letting a ``None`` subscript speak for it.
+    V_ongrid = data.get("V_q_full")
+    kgrid_vq = kgrid_bse
+    vq_src = "the bundle grid"
+    if V_ongrid is None and data.get("V_q_coarse") is not None:
+        V_ongrid = data["V_q_coarse"]
+        kgrid_vq = np.asarray(data["V_q_coarse_grid"], dtype=np.int64)
+        vq_src = "the COARSE restart grid (bse_k_grid densification)"
     if ongrid:
-        frac = Qpath * kgrid_bse[None, :]
+        if V_ongrid is None:
+            raise SystemExit(
+                "--vq-mode=ongrid needs the stored exchange tensor V_qmunu and "
+                "this bundle carries none.")
+        frac = Qpath * kgrid_vq[None, :]
         off = np.max(np.abs(frac - np.round(frac)))
         if off > 1e-6:
             raise SystemExit(
-                f"--vq-mode=ongrid needs every Q on the {nkx}x{nky}x{nkz} BSE "
-                f"grid; the path is off by {off:.3e} grid units.  Use a "
-                f"K_POINTS block whose segments land on the grid, or "
-                f"--vq-mode=interp (which needs FULL-BZ ζ storage).")
+                f"--vq-mode=ongrid needs every Q on the "
+                f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} EXCHANGE-TILE grid "
+                f"({vq_src}); the path is off by {off:.3e} grid units.  On a "
+                f"bse_k_grid-densified bundle that grid is the COARSE restart "
+                f"grid, not the fine BSE grid "
+                f"({nkx}x{nky}x{nkz}): densifying moves the k-SUM, it does not "
+                f"create exchange tiles at new q.  Use a K_POINTS block whose "
+                f"segments land on the coarse grid, or --vq-mode=interp (which "
+                f"needs FULL-BZ ζ storage and an exchange model valid for this "
+                f"cell).")
         log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
-            f"({nQ} Q, all on the {nkx}x{nky}x{nkz} grid) — no interpolation")
+            f"({nQ} Q, all on the "
+            f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} grid = {vq_src}) "
+            f"— no interpolation")
         head_mbz = False
         zx = prep = eval_vq = pinvF = coeffs_packed = None
     else:
@@ -1381,10 +1407,10 @@ def main(argv=None):
         q_tile = -Qpath[iQ]                          # tile momentum = wrap(−Q)
         q_tile_np = q_tile - np.round(q_tile)
         if ongrid:
-            ix, iy, iz = (np.round(q_tile_np * kgrid_bse).astype(int)
-                          % kgrid_bse)
+            ix, iy, iz = (np.round(q_tile_np * kgrid_vq).astype(int)
+                          % kgrid_vq)
             V_rows.append(_hermitize(
-                jax.device_put(data["V_q_full"][:, :, ix, iy, iz], grid_xy)))
+                jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
             n_eval_calls += 1
             continue
         q_tile = jnp.asarray(q_tile_np)

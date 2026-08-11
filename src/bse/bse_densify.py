@@ -523,6 +523,32 @@ def _interpolate_bse_data_to_grid(
 
     params = read_lorrax_input(input_file)
 
+    # ── WHICH ISDF BASIS THE htransform FITS IN ───────────────────────────
+    # On a NATIVE bundle: the deck's own table, and ``keep`` is None — this
+    # block is then a no-op and everything below is the program it always was.
+    #
+    # On a DOWNFOLDED bundle the two questions come apart, and the densifier
+    # has to answer them the same way ``exciton_bands`` already does (that
+    # driver's ``resolve_isdf_basis`` is the ONE owner of this contract and is
+    # called here rather than restated).  The Galerkin fit needs a basis
+    # spanning nk·nb, which is a completely different sizing criterion from
+    # the retained window's pair-density rank μ_S was chosen against — so the
+    # fit runs in the PARENT basis and its output is sliced to the kept rows,
+    # which is exact because the small basis's ψ-at-centroids IS that column
+    # slice (``mode = cur``).  Without this the pad below is asked for
+    # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
+    # with an index error that names neither the downfold nor the basis.
+    # Same defect class as PIPELINE_HEALTH row 4, which closed this for
+    # exciton_bands and never reached the ``bse_k_grid`` path.
+    from .exciton_bands import resolve_isdf_basis
+    centroids_path, keep_idx = resolve_isdf_basis(
+        restart_file, params, input_file, n_rmu_bundle=n_rmu, log=log_fn)
+    params["centroids_file"] = centroids_path
+    # HOST numpy closed over the trace, not a device_put: an eager device_put
+    # of a host array is the hidden-all-gather site; a numpy array becomes an
+    # HLO constant and is process-local by construction.
+    keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
+
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
      enk_sigma) = ht.initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy)
@@ -546,6 +572,11 @@ def _interpolate_bse_data_to_grid(
     @partial(jax.jit, out_shardings=(x4, y4, x4, y4, rep, rep))
     def _split_pad(psi, enk):
         # psi (nk_f, n_val+n_cond, ns, n_mu); enk (nk_f, n_val+n_cond).
+        # The parent→child column slice runs INSIDE this jit and BEFORE the
+        # pad, so the parent-width ψ never lands in a second buffer and the μ
+        # axis reaches its sharding constraint already at the small extent.
+        if keep is not None:
+            psi = psi[:, :, :, keep]
         psi_v = psi[:, :n_val]
         psi_c = psi[:, n_val:n_val + n_cond]
         psi_v = jnp.pad(psi_v, ((0, 0), (0, nv_pad - n_val), (0, 0),
@@ -685,6 +716,23 @@ def _interpolate_bse_data_to_grid(
         "eps_c": eps_c, "eps_v": eps_v,
         "W_q": W_q_fine, "V_q0": V_q0,
         "V_q_full": None,                       # finite-q resolvent not a fine use
+        # The finite-q EXCHANGE tiles survive the densification, on the COARSE
+        # q-grid they were stored on, and they are exact there.  V_{μν}(q) is
+        # built from ζ_q and the G-sphere; it never sees the BSE k-grid, so the
+        # coarse tile IS the fine solve's answer at any Q that lies on the
+        # coarse grid.  What the coarse restart cannot supply is a tile at a
+        # fine q that is not also a coarse q — that needs an exchange model at
+        # arbitrary q (``--vq-mode interp``), not an interpolation of this
+        # array, and no such tile is invented here.
+        #
+        # Kept under a SEPARATE key with its own grid stamp rather than left in
+        # ``V_q_full``: every other consumer of ``V_q_full`` (bse_w_exact's
+        # finite-q resolvent) indexes it with the bundle's own grid and would
+        # silently read the wrong tile on a densified bundle.  ``None`` there is
+        # the refusal those consumers already have; this key is opt-in and
+        # carries the grid that indexes it.
+        "V_q_coarse": data["V_q_full"],
+        "V_q_coarse_grid": coarse_grid,
         "nkx": fine_grid[0], "nky": fine_grid[1], "nkz": fine_grid[2],
     })
     return out
