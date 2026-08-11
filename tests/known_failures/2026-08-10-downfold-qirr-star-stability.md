@@ -158,6 +158,120 @@ dropped as a measurement of nothing, and that is a judgement rather than a
 result.  And the `g0` cross-check has never been read at P > 1, because
 defect (1) above is in front of it.
 
+## BOTH DEFECTS REPAIRED — 2026-08-10, `fix/owedlegs-p4-repairs-2026-08-10`
+
+Defect (1) above is fixed and defect (2)'s consequence for the gate suite — the
+three 1×1-shaped cells — is fixed with it.  Neither repair touches the physics
+this amendment is about; they are the two things standing between it and being
+verifiable in production geometry.
+
+**(1) `lorrax-downfold` runs at P>1.**  The bare
+`np.asarray(jax.device_get(g0_S))` is now
+`common.collectives.gather_to_host`, which is the recipe `FIX_womega`
+addendum 2 established for the nineteen sites of the same bug in
+`bse_w_exact`.  **The swap alone would not have been enough, and this is the
+part worth reading.**  The call sat inside `if process_rank() == 0:`, and
+`gather_to_host`'s third arm is a `process_allgather` — a collective.
+Swapping in place would have traded a refusal on every rank for a hang on
+P−1 of them, which is strictly worse because a refusal names itself and a
+hang does not.  The gather is therefore **hoisted above the rank-0 branch**,
+beside the `T_x` gather that was already there for exactly this reason, and
+only the comparison and the print stay on the writer.  `_gate_g0_against_zeta`
+now takes a host array and its docstring says that this is a precondition
+rather than a convenience, so the next person to reach for `device_get` there
+has been told twice.
+
+**(2) The three 1×1-shaped cells now express themselves on the mesh they
+find.**  `test_head_vector_transforms_with_the_conjugate_transfer`,
+`test_the_conduction_caches_are_the_parent_fit_sliced_to_the_kept_rows` and
+`test_transported_zeta_at_G0_is_the_transported_head_vector` built literal
+operands — `m = n = mu_S = 3`, an `(nq, 4, 9)` transfer — that divide no square
+mesh.  The repair is not a rounder literal: μ_S generically does not divide the
+mesh (this deck's own selection is 185 at 2×2), so the cells now carry the
+**device-legal μ pads the drivers themselves use**,
+`runtime.padding.padded_mu_extent` at `jax.device_count()`, zero-filled, and
+slice the logical block back off the answer.  That is the operand
+`run_downfold` builds at `downfold_run.py:348` and the one the ζ writer's own
+comment describes ("the pad rows are exactly zero, so the slice is a
+restriction and not a choice"), so the cells are now closer to the production
+path than they were, not further from it.  At one device every extent is
+unchanged, so the CPU numbers this amendment reports are untouched — and
+`_stacks_case` additionally asserts the pad columns really are zero, because
+otherwise slicing them off would be a choice rather than a restriction.
+
+**THE GATE, AT FOUR REAL GPUs — and the `g0` cross-check has now been read at
+P>1.**  Workspace `/pscratch/sd/j/jackm/owedfix_0810/`, tree detached at
+`1d0d4348`, `git dirty-count: 0` in every leg, on allocation 56612363
+(1 node × 4 A100, 4 ranks).  The deck is this amendment's own recipe: the
+owed-legs lane's wedge-stored `si_bse_debug` parent (`parent_auto`, read-only),
+`mu_small = auto`, `downfold_rcond = 1.1e-6`.
+
+| leg | shape | result | log |
+|---|---|---|---|
+| `df_p4` | `lorrax-downfold`, **4 ranks × 4 GPUs** | **rc=0 in 35.1 s** — it could not start at all before | `_logs/df_p4.log` |
+| `gates_gpu4` | both suites, 1 process holding 4 `CudaDevice`s, `resolve_mesh()` → 2×2 | **54 passed** (base at this shape: 3 failed, 51 passed) | `_logs/gates_gpu4.log` |
+| `compare_p4_vs_p1` | my P=4 child against the owed-legs lane's P=1 child | worst rel **3.539e-11**; `keep_idx`, `retained_rank_per_q`, `psi_full_y`, `enk_full` and every header **BIT-IDENTICAL** | `_logs/compare_p4_vs_p1.log` |
+
+> `[downfold/zeta] g0 cross-check: zeta_S(q=0, G=0) vs the transported g0_S
+> -> AGREE (max rel 9.467e-16).`
+
+**That line is the whole point of the repair**, and it is the first time it has
+existed at P>1; the P=1 reading it is compared against is 1.065e-15, taken by
+the owed-legs lane on the same parent.  Both are the reassociation floor and
+they differ from each other for the reason the mesh changes any reduction.
+The run also selected the same μ_S = 185, padded to 188, retained rank per q
+171/173/175, and the spectral-closure guard reported the cut in a gap on all
+64 q — the P=1 numbers, unchanged.
+
+**The two children are NOT bit-identical, and no claim says they should be.**
+Bit-identity was the wedge-versus-full-BZ result, where both routes hand the
+downfold the same operand; changing the MESH changes the reduction order of
+real collectives (`psum_scatter`, all-to-all), which is exactly why
+`test_downfold_is_mesh_invariant` asserts a relative band and says in its own
+docstring that "exact bit-identity is not claimed".  The measured 3.539e-11 on
+`V_qmunu` (2.443e-11 on `W0_qmunu`, 3.103e-11 on `zeta_q_G`) is *below* what
+this run's own conditioning licenses: the transfer solve reports
+`kappa_eff = 9.046e+05` against the `1/rcond` cap of 9.091e+05, so a 1e-16 seed
+is entitled to about 9e-11 here.  The invariants that must NOT move did not:
+**`keep_idx` is bit-identical**, so the retained subspace does not depend on
+the device count, and so is `retained_rank_per_q`.
+
+**Suite A/B, both sides run, WSL CPU, worktree pin proven by `__file__`
+before measuring.**  Base is `origin/main` `ad8d342f`.  On an **emulated 2×2**
+(`--xla_force_host_platform_device_count=4`, `LORRAX_MESH_CELL=1`, the
+whole-chain invariance cell deselected because it spawns its own workers):
+base **2 failed, 41 passed, 10 skipped**, branch **0 failed, 43 passed, 10
+skipped** — same 54 collected on both sides, and the two failures are the two
+of the three cells that are reachable on a box with no host `.so` (the
+conduction-cache cell is inside the 10 driver-import skips there and is
+covered by the GPU leg below).  At 1×1, the ordinary shape, branch is **44
+passed, 10 skipped**, identical to the numbers this amendment already records
+for its own branch — the repair changes no 1×1 result.
+
+**The `describe()` correction.**  The sentence this amendment asked to be
+corrected — "the CUR pivot order fills orbits greedily, so completion costs
+the tail of the one orbit `mu_S` stopped inside" — is gone from all three
+places it lived: `StarStability.describe()`, the section comment above it, and
+`orbit_complete_keep`'s docstring.  Each now carries the measured numbers
+instead, and the synthetic gate that asserts a bounded completion cost has had
+its message narrowed to the property it actually covers (its orbits are
+contiguous index blocks, so an index-order prefix cannot need more than the
+block it stopped in — which is a fact about the fixture, not about a pivot
+order).
+
+**The economics of the alternative are an OWNER ROW, not a change**:
+`tests/known_failures/2026-08-10-downfold-orbit-economics-owner-row.md` specs
+orbit-block-greedy selection against the numbers above, and notes that the
+kernel it would need already ships — `centroid/pivoted_cholesky.py`'s
+`orbit_id` mode, which `select_cur_centroids` currently calls with `None`.
+
+**Still owed after this leg.**  Defect (2) — a four-device single process is
+refused by `resolve_mesh` and by SlabIO — is untouched and is still true; it
+simply stopped mattering for this amendment, because the P=4 driver leg above
+is four PROCESSES, which is the production geometry and the one the four-GPU
+rule asks for.  Evidence for everything in this section:
+`/pscratch/sd/j/jackm/owedfix_0810/`.
+
 ---
 
 ## OWED, and unrunnable this lane
