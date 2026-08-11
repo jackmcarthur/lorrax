@@ -82,6 +82,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la import closure as _closure
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
@@ -327,6 +328,14 @@ class Plan:
         plan, which accepts any layout.
     donates
         Which positional operands this OP donates — see :data:`DONATES`.
+    closure
+        The degeneracy-closure mode :meth:`rank_cut` will run under —
+        ``'snap'`` / ``'strict'`` / ``'off'``, resolved ONCE at
+        :func:`plan` time from the kwarg, then the environment, then
+        :data:`distrib_la.closure.DEFAULT_MODE` (which is ``off``).
+        Resolution semantics — backend, route, sharding — do not depend
+        on it and it does not appear in any cache key, because it changes
+        nothing about what runs.
     """
 
     op: str
@@ -336,6 +345,7 @@ class Plan:
     n: int | None
     in_sharding: NamedSharding | None
     batch_in_sharding: NamedSharding | None
+    closure: str = _closure.DEFAULT_MODE
 
     # ---- introspection -------------------------------------------------
     @property
@@ -442,8 +452,51 @@ class Plan:
         where = ("in-tree JAX, any layout" if self.is_native else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
         n = "" if self.n is None else f", n={self.n}"
+        cl = ("" if self.closure == "off"
+              else f", rank-closure={self.closure}")
         return (f"{self.op}: {self.requested!r} -> {self.backend} "
-                f"({where}{n})")
+                f"({where}{n}{cl})")
+
+    # ---- the rank-revealing surface ------------------------------------
+    def rank_cut(self, values, **kwargs):
+        """Decide a rank in ``values`` under THIS plan's closure mode.
+
+        The plan already carries the op and the resolved guard mode, so a
+        call site that has a rank-revealing spectrum in hand —
+        :func:`distrib_la.cholesky_pivot_spectrum` of a Cholesky factor,
+        :func:`distrib_la.lu_rank_spectrum` of an LU one, an eigenvalue
+        vector — says only what it wants cut and where::
+
+            p  = distrib_la.plan("cholesky", mesh, backend="native2d",
+                                 closure="snap")
+            L  = p.batched(A)
+            rc = p.rank_cut(distrib_la.cholesky_pivot_spectrum(L[q]),
+                            rcond=1e-8)
+            keep = rc.n_keep          # >= the threshold's own answer
+
+        Every keyword of :func:`distrib_la.closure.rank_cut` is accepted
+        except ``op`` (this plan's) and ``closure`` (this plan's, resolved
+        at plan time so one run cannot have two answers).  Passing either
+        raises rather than silently overriding the plan, for the same
+        reason there is no ``backend=`` on a call and only on
+        :func:`plan`: a caller that overrides here has taken back the
+        decision the plan exists to make once.
+
+        THE GUARD IS OFF UNLESS SOMEBODY ARMED IT.  With ``closure='off'``
+        — the default this round — this returns the threshold's own answer
+        untouched and :meth:`RankCut.describe` says DISARMED rather than
+        clean, so an unarmed cut never reads as a checked one.
+        """
+        for banned in ("op", "closure"):
+            if banned in kwargs:
+                raise ValueError(
+                    f"Plan.rank_cut: {banned}= is the PLAN's "
+                    f"({getattr(self, banned)!r}) and cannot be overridden "
+                    f"per call — a plan resolves once so that every call "
+                    f"through it agrees.  Build a second plan if you want "
+                    f"a second {banned}.")
+        return _closure.rank_cut(self.op, values, closure=self.closure,
+                                 **kwargs)
 
     # ---- calling -------------------------------------------------------
     def _entry(self, key: str):
@@ -585,7 +638,7 @@ class Plan:
 
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
-         n: int | None = None) -> Plan:
+         n: int | None = None, closure: str | None = None) -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
     Every guard (vocabulary, platform, known-broken combinations,
@@ -611,6 +664,22 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     n
         Matrix extent, when known.  Passing it turns the divisibility rule
         into a resolve-time error instead of a call-time one.
+    closure
+        Degeneracy-closure mode for :meth:`Plan.rank_cut` — ``'snap'``,
+        ``'strict'``, ``'off'``, or ``None`` for the environment
+        (``LORRAX_DISTRIB_LA_CLOSURE``) and then ``off``.  **OPT-IN, and
+        OFF by default this round**: it is a new decision on a new
+        surface, not a change to what any existing route computes.
+        Resolution, routes, shardings and cache keys are all independent
+        of it — the resolved backend for a given ``(op, backend, mesh,
+        n)`` is byte-identical whatever this says, which is what makes it
+        safe to add to a certified surface. See
+        :mod:`distrib_la.closure` for why the default differs from the
+        monorepo guard's, and for the owner row that would change it.
+
+        The mode is resolved HERE, once, and stored — not read per call.
+        A guard whose mode can change between two calls of one plan is a
+        guard whose verdict nobody can reproduce.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -626,4 +695,6 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     stack = NamedSharding(mesh_xy, P(None, "x", "y")) if ffi else None
     return Plan(op=op, requested=str(backend), backend=resolved,
                 mesh=mesh_xy, n=None if n is None else int(n),
-                in_sharding=tile, batch_in_sharding=stack)
+                in_sharding=tile, batch_in_sharding=stack,
+                closure=_closure.resolve_mode(
+                    _closure.mode_from_env() if closure is None else closure))

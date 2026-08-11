@@ -622,3 +622,167 @@ def test_every_wired_site_imports_the_shared_guard():
             if needle not in text:
                 missing.append(f"{rel} lost its call to {needle}")
     assert not missing, "\n".join(missing)
+
+
+# ---------------------------------------------------------------------------
+# THE CONSISTENCY CELL — the service's COPY of this kernel may not drift
+# ---------------------------------------------------------------------------
+# ``services/distrib_la`` wires the same guard onto its rank-revealing
+# operations (pivoted-Cholesky pivot cuts, LU ``|diag(U)|`` cuts), and it
+# may NOT import this module: services are import-isolated from ``src/`` by
+# charter and by gate, and the worth of that isolation is that it has no
+# exceptions.  So ``distrib_la.closure`` carries a COPY of the criterion —
+# ~90 lines of stdlib arithmetic, cheaper than an import edge.
+#
+# A copy with nothing holding it is a fork waiting to happen, and this side
+# is the only one that can see both.  These cells are the hold.  They run
+# HERE rather than in the service suite for exactly that reason: the
+# service cannot import ``common`` even to test itself against it, so a
+# consistency check written over there would have to be written against a
+# transcription of this file, which is the drift it is supposed to catch.
+
+
+def _distrib_la_closure():
+    """The service's copy, or a skip that names why it is unreachable."""
+    try:
+        from ffi._services import ensure_on_path
+    except ImportError:                                    # pragma: no cover
+        pytest.skip("ffi._services is the documented service bootstrap and "
+                    "it is not importable here")
+    ensure_on_path()
+    return pytest.importorskip(
+        "distrib_la.closure",
+        reason="services/distrib_la is not on the path (standalone lorrax "
+               "checkout); the consistency claim is unmeasured, not passed")
+
+
+def _shared_spectra():
+    """The synthetic spectra BOTH implementations are run over.
+
+    Built here, once, and handed to both — a cell that built one spectrum
+    per side would compare two constructions as well as two kernels, and a
+    disagreement would not say which had moved.
+
+    Deliberately hostile, not representative: exact ties, a null tail, an
+    indefinite spectrum, a block open at the bottom, a single value, an
+    empty spectrum, and the armF gap the whole saga turns on.
+    """
+    out = {}
+    out["featureless"] = [0.5 ** i for i in range(24)]
+    for pos in (0, 4, 8, 20):
+        v = [0.5 ** i for i in range(24)]
+        for j in range(4):
+            v[pos + j] = v[pos] * (1.0 - 1e-9 * j)
+        out[f"block@{pos}"] = v
+    out["exact_ties"] = [1.0, 1.0, 1.0, 1e-3, 1e-3, 1e-9]
+    out["null_tail"] = [0.5 ** i for i in range(8)] + [0.0] * 6
+    out["indefinite"] = [3.0, -3.0 * (1 - 1e-9), 1e-2, -1e-5, 1e-8]
+    out["open_at_bottom"] = ([0.5 ** i for i in range(8)]
+                             + [1e-9 * (1 - 1e-9 * j) for j in range(6)])
+    out["armF"] = [1.0, 0.5, 1.46e-8, 1.0e-8, 1e-12]   # rel gap 0.315 at k=3
+    out["single"] = [7.0]
+    out["empty"] = []
+    out["descending_dupes"] = [1e-4] * 8
+    return out
+
+
+@pytest.mark.parametrize("name", sorted(_shared_spectra()))
+def test_the_service_copy_of_the_criterion_agrees_field_for_field(name):
+    """``cluster_at_cut`` must return the SAME DICT on both sides.
+
+    Every field, at every cut, on every shared spectrum — not just
+    ``n_keep_snapped``.  The messages, the reports and the owner-facing
+    numbers are all built out of ``gap_rel``, ``members``, ``span_rel`` and
+    the two ``kappa``s, so a copy that agreed only on the rank would still
+    print different evidence for the same event.
+    """
+    dl = _distrib_la_closure()
+    values = _shared_spectra()[name]
+    assert sc.DEFAULT_RTOL == dl.DEFAULT_RTOL, (
+        "the two copies disagree on the tolerance itself; nothing below "
+        "would be meaningful")
+    assert sc.MODES == dl.MODES
+    for k in range(len(values) + 2):
+        a = sc.cluster_at_cut(values, k)
+        b = dl.cluster_at_cut(values, k)
+        assert set(a) == set(b), (name, k, set(a) ^ set(b))
+        for field in sorted(a):
+            av, bv = a[field], b[field]
+            if isinstance(av, float) and math.isnan(av):
+                assert math.isnan(bv), (name, k, field)
+            else:
+                assert av == bv, (
+                    f"{name} at cut {k}: field {field!r} differs — "
+                    f"common={av!r} distrib_la={bv!r}")
+
+
+@pytest.mark.parametrize("mode", ["snap", "strict", "off"])
+def test_the_service_copy_resolves_an_explicit_mode_identically(mode):
+    """``resolve_spectral_cut`` under an EXPLICIT mode: same rank, same
+    raise-or-not, on every shared spectrum and every cut.
+
+    Explicit, because the DEFAULT is the one place the two deliberately
+    differ and it has its own cell below.
+    """
+    dl = _distrib_la_closure()
+    for name, values in sorted(_shared_spectra().items()):
+        for k in range(len(values) + 1):
+            def _run(mod):
+                try:
+                    n, _ = mod.resolve_spectral_cut(
+                        values, k, mode=mode, log=lambda *_: None)
+                    return ("ok", n)
+                except Exception as exc:                   # noqa: BLE001
+                    return ("raised", type(exc).__name__)
+            got_common, got_svc = _run(sc), _run(dl)
+            # The exception CLASSES are different types by construction —
+            # each package owns its own — so compare the class NAME, which
+            # is the same word on both sides on purpose.
+            assert got_common == got_svc, (name, k, mode, got_common, got_svc)
+
+
+def test_the_one_difference_is_the_default_and_it_is_deliberate():
+    """**The divergence, pinned so it stays a decision rather than drift.**
+
+    ``common.spectral_closure`` defaults to ``snap``: the arithmetic
+    argument (a snapped spectral cut admits directions within ``rtol`` of
+    ones already kept, so kappa_eff moves by under one part in 10^4) says
+    refusing by default would be refusing the repair.
+
+    ``distrib_la.closure`` defaults to ``off``, and the reason is not about
+    the criterion at all — it is that the service's route semantics are
+    CERTIFIED SURFACE, and a guard that arrived switched on would change
+    the rank a shipped operation returns without its caller asking.  That
+    is the same shape as the silent route change this tree measured at a
+    QP gap of -161 eV.
+
+    BOTH owner rows live in one place, here: flipping ``common``'s default
+    to ``strict``, and flipping ``distrib_la``'s to ``snap``.  Each is a
+    single constant, and this cell is what fails when one of them moves.
+    """
+    dl = _distrib_la_closure()
+    assert sc.DEFAULT_MODE == "snap"
+    assert dl.DEFAULT_MODE == "off"
+    assert sc.MODE_ENV == "LORRAX_SPECTRAL_CLOSURE"
+    assert dl.MODE_ENV == "LORRAX_DISTRIB_LA_CLOSURE"
+    assert sc.MODE_ENV != dl.MODE_ENV, (
+        "two guards with different defaults must not share one dial: a run "
+        "that armed one would silently arm the other")
+
+
+def test_the_service_copy_does_not_import_the_monorepo_one():
+    """The copy has to be a COPY.  If ``distrib_la.closure`` ever grew a
+    ``from common import ...`` the cells above would pass vacuously — and
+    the service's import-isolation gate would fail, but only in the leg
+    that runs it.  Cheap to assert here, next to the reason."""
+    import ast
+    import pathlib
+    dl = _distrib_la_closure()
+    tree = ast.parse(pathlib.Path(dl.__file__).read_text())
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            roots.add((node.module or "").split(".")[0])
+    assert "common" not in roots and "spectral_closure" not in roots, roots
