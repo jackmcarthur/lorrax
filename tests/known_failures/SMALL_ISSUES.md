@@ -734,6 +734,25 @@ silent overwrite.
     Whether to change the modulefile is an owner call — it moves every
     wall-time on the fleet, and every timing in the corpus was taken under
     `platform`. [sixth-wall lane, 2026-08-11]
+50. **A multi-rank leg SMALLER than a whole node is not device-placed, so it
+    collides with the one-GPU co-tenants it is sharing the node with.**
+    `lx` places one-GPU legs on a free device and says so; multi-rank legs it
+    leaves alone, which is correct when the leg owns the node and wrong when
+    it does not. Measured 2026-08-11: with the pool fragmented (four nodes,
+    8/16 GPUs free, no node with four free), the Si 4x4x4 production COHSEX
+    deck was launched at `-N 2 -G 2 -n 4` — a legitimate P=4 geometry that
+    fits the fragmentation — and every rank 0 logged
+    `[select_gpu] local rank 0 -> CUDA_VISIBLE_DEVICES=0 (from
+    CUDA_VISIBLE_DEVICES)` on BOTH nodes, i.e. onto the same physical device
+    a placed one-GPU co-tenant already held. It died
+    `RESOURCE_EXHAUSTED: Failed to allocate request for 19.42GiB` inside
+    `isdf.core.z_q_from_psi_sm` — a traceback that names the zeta fit and
+    says nothing about placement, which is the same tell the stale-`lx`
+    incident left. So `-N 1 -G 4` is not merely the convention for a
+    production-deck leg, it is the only geometry that is safe under
+    co-tenancy, and a fragmented pool means WAITING rather than reshaping.
+    Evidence `/pscratch/sd/j/jackm/ioaudit_0811/logs_cotenancy_oom_G2/`.
+    [io-dead-code-audit lane, 2026-08-11]
 
 ## Fixed (strike-in-place graveyard — newest first)
 

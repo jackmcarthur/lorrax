@@ -628,10 +628,12 @@ def _read_kchunk_union_sharded_cached(
 """Sharded-slab FFI writer — thin shard_map wrapper around PhdfWriteFfi.
 
 Preferred public entry point for gw_jax / isdf / etc. is
-:mod:`file_io.slab_io`, which has one transport (the phdf5 FFI) and
-allgather-and-rank-0-h5py backend (default) and this FFI backend.
-Call this module directly only for 2-D block-partitioned writes where
-you know you want the FFI path.
+:mod:`file_io.slab_io`, which has exactly one transport — this one.  The
+sentence that used to sit here still offered a choice between "the
+allgather-and-rank-0-h5py backend (default)" and the FFI backend; both
+the router and that backend were deleted at 233a830d, so the choice it
+described has not existed since.  Call this module directly only for 2-D
+block-partitioned writes where you know you want the raw FFI path.
 
 The underlying C++ handler is N-D and derives per-rank hyperslab
 offsets from ``ctx->rank`` + the mesh_shape / axis_for_dim attrs.

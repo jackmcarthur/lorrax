@@ -1139,11 +1139,12 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
     * Both h5 sinks (``gw.kin_ion_io.main``, ``psp.get_dipole_mtxels.main``)
       are RAW ``h5py.File`` writes on rank 0, not SlabIO.  ``SlabIO.
       write_slab`` does take a sharded ``jax.Array`` and write it as a
-      hyperslab, so converting them is the mechanism — but only its FFI
-      backend writes from the shards; the allgather backend gathers to
-      rank 0 first, so under ``slab_io=auto`` resolving to allgather the
-      conversion saves nothing and the claim would be false on exactly the
-      configurations that cannot afford it.
+      hyperslab, so converting them is the mechanism, and it would now
+      keep its promise: this paragraph used to withhold the conversion
+      because "the allgather backend gathers to rank 0 first", which was
+      true until 233a830d deleted that backend and the ``slab_io`` router
+      with it.  There is one transport left and it writes from the shards,
+      so the reason recorded here is spent — what is left is the work.
     * The third consumer cannot be converted at all by itself:
       ``gw.sigma_dispatch.resolve_external_hartree`` READS the table back
       as a replicated global operand and rotates it with
