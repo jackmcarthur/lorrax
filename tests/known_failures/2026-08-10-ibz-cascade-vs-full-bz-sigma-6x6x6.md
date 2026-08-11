@@ -1,4 +1,164 @@
-# THE IBZ CASCADE AND THE FORCED FULL-BZ PATH DISAGREE ON Σ AT Si 6×6×6 (2026-08-10) — **ADJUDICATED: NEITHER ARM IS CORRECT AT 6×6×6, AND THE CAUSE IS UPSTREAM OF BOTH**
+# THE IBZ CASCADE AND THE FORCED FULL-BZ PATH DISAGREE ON Σ AT Si 6×6×6 (2026-08-10) — **RESOLVED: THE ISDF BAND WINDOW CUT A DEGENERATE MULTIPLET**
+
+## RESOLUTION — written 2026-08-10 by the hypothesis-confirmation lane
+
+**The cause is the deck's band window, not its ζ basis. `nband = 60` falls
+strictly inside a 4-fold degenerate manifold (bands 59–62) at 4 of the 16
+wedge k, keeping 2 of the 4 members and dropping 2. A window holding half a
+multiplet is not a point-group-invariant subspace, so the pair space the ζ
+fit represents is not invariant, and the k-star identity cannot hold for
+anything built on ζ. Moving the window to the nearest degeneracy-closed
+value, `nband = 68`, takes the Σ_x star spread to EXACTLY ZERO. §6's prime
+suspect — the ζ rank truncation — is REFUTED.**
+
+### What was measured, both sides, on one tree
+
+Two arms of the same 6×6×6 deck, **two deck lines apart** (`ncond 52→60`,
+`nband 60→68`) and identical in everything else: same `WFN.h5`, same
+`centroids_frac_1104.txt`, same `zeta_rcond = 1e-10`, same `wcoul0_source`,
+same `.so` pair. Each arm regenerated its own `dipole.h5` and `kin_ion.h5`
+because both are `(…, nband, nband)`-shaped — 43.6→55.9 MB and 1.85→2.38 MB,
+the 68²/60² = 1.284 ratio, which is the arms' own proof that the window
+really changed. All six legs exit 0.
+
+| | armC `nband=60` (shipped) | armF `nband=68` (degeneracy-closed) |
+|---|---|---|
+| **max Σ_x k-star spread**, IBZ cascade | **0.0640 meV** | **0.0000 meV** |
+| **max Σ_x k-star spread**, forced full BZ | **0.1490 meV** | **0.0000 meV** |
+| max Re Σ_c k-star spread, IBZ cascade | 38.785 meV | **0.083 meV** |
+| max Re Σ_c k-star spread, forced full BZ | 139.407 meV | **1.912 meV** |
+| IBZ vs full-BZ, max ΔE_QP | 110.022 meV | **0.871 meV** |
+
+The armC column reproduces the body's numbers **exactly** — 0.064, 0.149,
+38.785, 139.407, 110.022 — on a different tree (`531bb2f5`), a different
+workspace and a fresh mean-field-derived `dipole.h5`/`kin_ion.h5`. That is
+the control this lane needed and it is bit-tight.
+
+### The upstream observable, which is what actually identifies the cause
+
+`λ_max(C_q)` is an **exact symmetry invariant**: for an orbit-closed centroid
+set, `C_{Sq} = P C_q P†`, so symmetry-equivalent q must carry the identical
+spectrum. Grouping the 216 logged per-q values by `λ_max` therefore assigns
+q-stars with no symmetry code at all, and the grouping's own validity check
+is that it recovers the wedge's 16 stars with the right sizes (it does:
+1, 3, 4, 6, 6, 8, 8, 12, 12, 12, 24×6 = 216).
+
+| deck | tightest rtol at which the 216 q close into 16 stars |
+|---|---|
+| 6×6×6 `nband=60` | **1e-4** — C_q is symmetry-broken before anything is truncated |
+| 6×6×6 `nband=68` | **1e-10** |
+| 4×4×4 anchor `nband=100` (64 q → 8 stars) | **1e-10** |
+
+Six orders of magnitude, and the fixed 6×6×6 deck lands exactly on the
+anchor deck's level. **The breakage is in `C_q` itself**, upstream of the ζ
+back-solve, which is consistent with Σ_x carrying it and with W merely
+amplifying it 500–1000×.
+
+### Why §6's prime suspect is refuted, stated as its own measurement
+
+§6 conjectured that the rank cut through the over-complete basis was not
+point-group covariant. Two independent measurements say otherwise:
+
+* **The retained rank is star-CONSTANT.** Grouped as above, **0 of 16
+  q-stars at 6×6×6 and 0 of 8 at 4×4×4** carry a non-constant `n_keep`, in
+  either arm and at either window. The 45 q that retain 1094 rather than
+  1095 modes are exactly the union of whole stars (24+12+6+3 = 45).
+* **The truncation still fires in the clean arm.** At `nband=68` the cut is
+  live on **all 216 q** (1104 → 1095/1098 modes, `λ_min_kept/λ_drop_hi` as
+  low as 1.46) and the Σ_x star identity is nonetheless satisfied to
+  0.0000 meV. A live rank truncation coexists with an exact star identity,
+  so the truncation cannot be what breaks it.
+
+Orbit closure was never the missing condition and neither was "rank
+closure" in the ζ spectrum. The missing condition is **degeneracy closure
+of the band window** — the same principle one index over, and the reason it
+is a *cleaner* condition is that a band degeneracy is exact by symmetry,
+where a ζ spectrum is smooth and has no gap to find (`common/rank_criterion`
+argues that at length).
+
+### Where the legal windows are
+
+Degeneracy-closed `nband` values in [40, 128) for this Si mean field, from
+the wedge eigenvalues alone — no GW, no W, no ζ:
+
+    4×4×4 anchor (8 wedge k) : [40, 68, 100]
+    6×6×6        (16 wedge k): [40, 68, 100]
+
+**The 4×4×4 anchor's `nband = 100` is one of only three legal values in that
+whole range, and the 6×6×6 deck's `nband = 60` is not one of them.** The
+anchor deck has been correct by luck, not by construction — which is exactly
+why the corpus never saw this and why the guard below is worth having.
+Edge-gap minima over the wedge: `E[100]−E[99] ≥ 0.32 eV` at 4×4×4;
+`E[60]−E[59] = 5e-14 eV` at four of the sixteen 6×6×6 wedge k.
+
+### The fix
+
+`common/band_degeneracy` has guarded precisely this since 2026-08-10 and the
+BSE calls it. **The ζ fit never did.** Branch
+`fix/band-window-degeneracy-closure-2026-08-11` adds the two calls, one per
+ISDF window (left `[b0,b3)`, right `[b1,b4)`), in `gw.gw_init.fit_zeta` —
+the seam that consumes them. Mode is `snap`, which for the report-only twin
+means *say so loudly and continue*; `strict` is the right end state and is a
+one-word change, but flipping it would refuse every deck in the tree whose
+window happens to slice and **that census has not been run — owner row.**
+Gates: `tests/test_isdf_band_window_closure.py`, 8 CPU cells, red twin on
+the 6×6×6 shape; 30 passed with the existing `test_band_degeneracy` and
+`test_sc_band_window` suites, 0 skipped.
+
+### Is there a valid 6×6×6 reference now?
+
+**Yes, with one stated limit.** `/pscratch/sd/j/jackm/bandwin666_0810/armF/`
+holds a complete GW/GN-PPM restart bundle at the degeneracy-closed window —
+`tmp/isdf_tensors_1104.h5`, 8.95 GB, shipped IBZ cascade, exit 0 in 198.7 s
+at P=4 (BFC@0.85). Its Σ_x satisfies the k-star identity exactly and its
+Σ_c star spread is **0.083 meV**, which clears gate (c) of
+`2026-08-10-w-densifier-head-interpolation.md` — that gate resolves
+differences at the tens-of-meV level and this bundle's symmetry noise is now
+two to three orders of magnitude below it. It is fit for that use.
+
+**The limit, stated rather than buried:** Σ_c is not yet clean at the level
+Σ_x is. The forced-full-BZ arm still carries 1.912 meV of Σ_c star spread
+against the cascade arm's 0.083 meV, and the two arms still disagree by
+0.871 meV — 126× better than the 110 meV this file opened with, and still
+not the 7.6 µeV the 4×4×4 anchor achieves. Since Σ_x is now exactly clean,
+whatever remains is **downstream of W**, is specific to the forced-full-BZ
+override, and is a different and much smaller question than the one this
+file was opened for. It does not block the bundle's use at the tens-of-meV
+gate; it does block calling the 6×6×6 deck µeV-clean.
+
+**Still owed, unchanged by this lane:** the 4v4c/FEAST BSE-table problems
+recorded in `FINE_GRID_REFERENCE.md` (strict degeneracy correctly refused
+the 4v4c window because spinor multiplets are 8-fold, so it ran 8v8c and
+FEAST returned 4 Ritz values at relres ≈ 8e-2 instead of 20 converged
+states). Note that this is the *same physics* as the finding above, at the
+BSE's window rather than the ζ fit's — the guard was right both times.
+
+### Provenance
+
+* Six GPU legs, all exit 0, all on **this lane's own allocations, released
+  by ID**: `56604339` (phase 1+2), `56605465` (the full-BZ pair). Phase 1's
+  four 1-GPU prerequisite legs ran concurrently, occupancy 3.27.
+* Tree `531bb2f5` (= `origin/main`), worktree `/pscratch/sd/j/jackm/bandwin666_0810/wt`,
+  HEAD and dirty-count printed **inside every leg**; deck md5 and the
+  resolved `nval/ncond/nband` printed in-leg too.
+* P=4 on every GW leg. Env identical across arms: `LX_BASE_MODULE=lorrax_J070`,
+  the `merge_ckpt_2026-08-08` `.so` pair, `JAX_ENABLE_X64=1`, BFC@0.85.
+* **Collected counts asserted:** 216 k-headers and 12960 Σ rows (216×60) in
+  each `nband=60` arm; 216 and 14688 (216×68) in each `nband=68` arm; 16
+  q-stars recovered from 216 k in all four.
+* **Instrument gate.** The k-star instrument was validated on the 4×4×4
+  clean case first, as required: it reports 0.006/0.009 meV Σ_c and
+  0.0000 meV Σ_x there, reproducing §4 exactly.
+* **Evidence:** `/pscratch/sd/j/jackm/bandwin666_0810/` — `armC/` `armF/`
+  `armCB/` `armFB/` (the 2×2 of window × q-path), `_logs/` (six leg logs),
+  `VERDICT.txt`, `driver.sh` `driver2.sh` `inleg.sh` and the JSONL manifests,
+  `rank_arm*.txt` (the per-q ζ spectra) and `qstar_sweep2.py` (the covariance
+  instrument). The band-window scan is `bandwindow.py`/`cleanwin.py` in
+  `/pscratch/sd/j/jackm/symgate444_0810/`.
+
+---
+
+# The adjudication that led here (2026-08-10) — **NEITHER ARM IS CORRECT AT 6×6×6, AND THE CAUSE IS UPSTREAM OF BOTH**
 
 **Status: the disagreement is real and reproduces, but it is a symptom rather
 than the disease. The decisive 4×4×4 leg has been run and the two arms agree
