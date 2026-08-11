@@ -132,15 +132,29 @@ def test_refit_transform_is_the_producers_at_finite_q():
 
 
 def test_gamma_is_where_the_two_spellings_coincide():
-    """WHY IT SURVIVED, and why the Γ null does not move under the fix."""
+    """WHY IT SURVIVED, and why the Γ null does not move under the fix.
+
+    The exactness claim is about the two PHASE FACTORS, and it is asserted
+    where it is exact: at q = 0 both ``e^{−2πi q·r}`` and ``e^{−2πi q·s_μ}``
+    evaluate to 1.0 + 0.0j in every slot, so neither transform is doing
+    anything and the tile cannot move.  The two SPELLINGS are then compared
+    at round-off rather than at zero, because ``zeta_r_to_sphere_q`` goes
+    through ``local_fftn3`` (jax, and on a GPU leg a GPU FFT) while the
+    pre-fix spelling here is ``np.fft`` — two implementations of the same
+    transform, measured 2.1e-16 apart on this fixture at four GPUs.  A
+    bit-equality assertion there would be a claim about FFT backends, which
+    is not what this file is for.
+    """
     vqi = pytest.importorskip("bse.vq_interp")
     q0 = np.zeros(3)
     zx, zeta = _synthetic_zx(q0)
     fi = vqi.flat_idx(zx, zx["gvec"][0])
+    assert np.all(np.exp(-2j * np.pi * (zx["rfrac"] @ q0)) == 1.0 + 0.0j)
+    assert np.all(np.exp(-2j * np.pi * (zx["rmu_frac"] @ q0)) == 1.0 + 0.0j)
     new = np.asarray(vqi.zeta_r_to_sphere_q(zx, zeta, q0, fi))
     old = _old_spelling(vqi, zx, zeta, q0, fi)
     ref = vqi.to_sphere(zx, zeta, 0)[:, :_NGK]
-    assert _relF(old, new) == 0.0, "at q = 0 both phases are exactly 1"
+    assert _relF(old, new) < 1e-12, "at q = 0 the two spellings coincide"
     assert _relF(new, ref) < 1e-12
 
 
