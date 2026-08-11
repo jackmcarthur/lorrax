@@ -310,6 +310,31 @@ deleted — the retirement is gated, not merely described:
 | `test_qirr_RED_TWIN_the_point_granular_selection_still_cuts_orbits` | the control arm: same Gram, same μ_S, `sym_perm=None` — the delivered set breaks closure and `child_unfold_tables` refuses it, so the floor is shown to have bought something |
 | `tests/test_layering.py` | 80 passed — the new import edges cross no layer |
 
+**FOUR REAL GPUs, and the shape asserted rather than assumed.**  Workspace
+`/pscratch/sd/j/jackm/orbitfloor_0810/`, own allocation 56616165.
+
+| leg | shape | result |
+|---|---|---|
+| `gates_gpu4` | the three suites, ONE process holding four `CudaDevice`s | **105 passed, 0 skipped, 0 failed** at `752a3d43`; `MESH_SHAPE probe: local_devices=4 global_devices=4 processes=1`, `resolve_mesh(): {'x': 2, 'y': 2}` |
+| `gates_merged` | the same, on the tree REBASED onto `origin/main` 01d462e4 | **114 passed, 0 skipped, 0 failed** — +9 are main's own new drop-block cells |
+| `df_floor` / `df_point` | `lorrax-downfold`, **4 ranks x 4 GPUs** | rc=0; `mesh {'x': 2, 'y': 2} on 4 device(s), 4 process(es)` |
+| `df_floor_merged` | the same deck on the rebased tree | rc=0 in 30.2 s, **every number identical** — the floor, the census, the ladder, the verdict |
+
+The GPU run has **zero skips** against WSL's ten: those ten are the
+`liblorrax_ffi_host.so` driver-import cells, which run here.  Collected is
+105 on both, so the green is over the same set and not a smaller one.
+
+**A P=4 SHAPE CORRECTION THAT COST THIS LANE A ROUND, and it cuts both ways.**
+`lx run -G 4 -n 4` on a PYTEST file places four independent single-GPU
+sessions, each a 1x1 mesh, and reports a green that is four copies of P=1 — the
+gates leg above is `-G 4 -n 1` for exactly that reason, with an in-leg probe
+that exits 95 if it sees fewer than four global devices.  But the opposite is
+true of these DRIVERS: `lorrax-downfold` and `bse.bse_jax` both REFUSE a
+four-device single process (`resolve_mesh: mesh 2x2=4 != process_count()=1`;
+`bse_loading._get_local_mesh_coords` raises `IndexError: index 0 is out of
+bounds for axis 0 with size 0`), so their real P=4 shape is four PROCESSES at
+`-G 4 -n 4`.  One rule does not cover both; assert the mesh in-leg either way.
+
 The count is verified against the expected set rather than read off a green
 bar: 100 collected on base, 105 on branch, +5 = three parametrised composition
 cells, one composition red twin, and a net +1 in `test_spectral_closure.py`
