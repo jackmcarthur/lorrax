@@ -132,6 +132,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import small_eig
+
 # Default guard configuration.  Values, not behaviour: every entry is
 # read through ``_resolve_guards`` and may be overridden per call.
 DEFAULT_GUARDS = {
@@ -223,6 +225,56 @@ SOLVE_MODES = ("loewner", "pade")
 #: with ``rho ~ 3`` here.  Chebyshev's advantage needs the samples to
 #: lie on the interval, and the double-parallel protocol puts them
 #: beside it.
+
+
+#: WHO FINDS THE ROOTS, once the denominator algebra has said which
+#: matrix they are the eigenvalues of.  Orthogonal to
+#: :data:`SOLVE_MODES`: that names which matrix, this names the
+#: eigensolver, and both modes above feed both backends here.
+#:
+#: ``"lapack"``
+#:     ``jnp.linalg.eigvals``.  DEFAULT, because it is what every store
+#:     on disk was made with.  On GPU it reaches ``cusolver_geev_ffi``,
+#:     which does not batch: measured on this tree at ``n_p = 8``, the
+#:     per-element cost is 1012 us at 1024 elements and 1045 us at 4096,
+#:     i.e. flat in the batch, which is the signature of a per-matrix
+#:     loop.  It is 91 % of the jitted fit.
+#: ``"jax_qr"``
+#:     :func:`gw.mpa.small_eig.eigvals` -- Hessenberg reduction plus
+#:     fixed-count shifted QR, entirely inside XLA, so it batches and
+#:     fuses with the rest of the kernel.
+#:
+#: THE TWO DO NOT AGREE BIT FOR BIT and are not meant to.  A different
+#: root-finder returns different roots in the last digits; the campaign's
+#: equivalence norm for that is W-rebuild-at-samples, not pole identity.
+#: The default stays ``"lapack"`` so that selecting the fast path is a
+#: decision someone made and stamped, never a silent change of answer
+#: under a store that was written before it existed.
+EIG_MODES = ("lapack", "jax_qr")
+
+
+def _eigvals(M, eig):
+    """Eigenvalues of one small matrix, through the chosen backend.
+
+    The branch is on a Python string resolved at trace time, so both arms
+    are static-shape and this stays one ``jit``/``vmap`` kernel either
+    way -- the same discipline :data:`SOLVE_MODES` follows.
+    """
+
+    if eig == "jax_qr":
+        return small_eig.eigvals(M)
+    return jnp.linalg.eigvals(M)
+
+
+def _check_eig_mode(eig):
+    if eig not in EIG_MODES:
+        raise ValueError(
+            f"GATE eig_mode_known: eig={eig!r} is not one of {EIG_MODES}. "
+            "FALSE case: eig names an eigensolver this kernel implements. "
+            "A REFUSAL and not a fallback, for the reason the solve mode "
+            "is one: the two backends do not agree bit for bit, so a typo "
+            "that silently read as the default would put poles in a store "
+            "that cannot say which root-finder made them.")
 
 
 def _resolve_guards(guards):
@@ -495,7 +547,7 @@ def _loewner_pencil(w, x_hat, n):
     return L, sL
 
 
-def _loewner_roots(w, x_hat, n, rcond):
+def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """Poles of the Loewner interpolant, in the ``b_hat = x/x_max`` plane.
 
     Returns ``(b_hat, cond, s_max, s_min)`` in the same shape contract as
@@ -520,11 +572,11 @@ def _loewner_roots(w, x_hat, n, rcond):
     L_pinv = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * u.conj().T)
     cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
     X = L_pinv @ sL
-    return (jnp.linalg.eigvals(X), cond, s_max, s_min,
+    return (_eigvals(X, eig), cond, s_max, s_min,
             _matrix_backward_error(L, sL, X))
 
 
-def _companion_roots(c_coeffs):
+def _companion_roots(c_coeffs, eig="lapack"):
     """Roots of the monic ``Q(t) = t**n + sum_k c_k t**k``.
 
     Companion matrix exactly as sigma-paper Eq. (S8): ones on the
@@ -544,7 +596,7 @@ def _companion_roots(c_coeffs):
     if n > 1:
         comp = comp.at[1:, :-1].set(jnp.eye(n - 1, dtype=jnp.complex128))
     comp = comp.at[:, -1].set(-c_coeffs)
-    return jnp.linalg.eigvals(comp)
+    return _eigvals(comp, eig)
 
 
 def _guard_reflection(b_hat):
@@ -697,6 +749,7 @@ def fit_mpa_poles(
     rcond=1.0e-13,
     solve=SOLVE_MODES[0],
     affine=True,
+    eig=EIG_MODES[0],
 ):
     """Fit ``n_p`` MPA poles to one element's ``2*n_p`` samples of W_c.
 
@@ -731,6 +784,13 @@ def fit_mpa_poles(
         :func:`_affine_domain`.  ``solve="pade", affine=False`` is the
         shipped 2026-08-09 solve exactly, and is how the conditioning
         pathology is exhibited.
+    eig
+        Which eigensolver finds the roots of whichever matrix ``solve``
+        chose; one of :data:`EIG_MODES`.  ``"lapack"`` is the default and
+        is what every store on disk was made with.  ``"jax_qr"`` stays
+        inside XLA and is the only one of the two that batches, but it
+        does NOT reproduce the other bit for bit -- see
+        :data:`EIG_MODES`.
 
     Returns
     -------
@@ -750,6 +810,7 @@ def fit_mpa_poles(
             f"GATE solve_mode_known: solve={solve!r} is not one of "
             f"{SOLVE_MODES}. FALSE case: solve names a denominator "
             "algebra this kernel implements.")
+    _check_eig_mode(eig)
     n = int(n_p)
 
     w = jnp.asarray(W_samples, dtype=jnp.complex128)
@@ -764,7 +825,8 @@ def fit_mpa_poles(
     # Python string, so it is resolved at trace time and both arms are
     # static-shape -- this stays one jit/vmap kernel either way.
     if solve == "loewner":
-        b_hat, cond, s_max, s_min, bwd = _loewner_roots(w, x_hat, n, rcond)
+        b_hat, cond, s_max, s_min, bwd = _loewner_roots(
+            w, x_hat, n, rcond, eig)
     else:
         A, rhs, _t, x_centre, x_scale = build_pade_system(
             w, z, n, affine=affine)
@@ -776,7 +838,7 @@ def fit_mpa_poles(
         # where the composition is exactly ``1.0`` and ``0.0``.
         rescale = (x_scale / x_max).astype(jnp.complex128)
         offset = (x_centre / x_max).astype(jnp.complex128)
-        b_hat = _companion_roots(coef[n:]) * rescale + offset
+        b_hat = _companion_roots(coef[n:], eig) * rescale + offset
 
     # --- Stage 3: residues BEFORE any guard fires.  These are the
     # all-sample complex LS residues of the raw fit; they are what
@@ -892,6 +954,7 @@ def fit_mpa_poles_batched(
     rcond=1.0e-13,
     solve=SOLVE_MODES[0],
     affine=True,
+    eig=EIG_MODES[0],
 ):
     """``fit_mpa_poles`` vmapped over the leading (element) axis.
 
@@ -916,7 +979,7 @@ def fit_mpa_poles_batched(
         return fit_mpa_poles(
             w_row, z_samples, n_p, guards=guards,
             refit_after_guards=refit_after_guards, rcond=rcond,
-            solve=solve, affine=affine)
+            solve=solve, affine=affine, eig=eig)
 
     return jax.vmap(_one)(tile)
 
