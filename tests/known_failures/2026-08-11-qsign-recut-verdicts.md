@@ -82,11 +82,18 @@ a factor of two of the gate. **The agreement between the two shapes is the
 point: a mesh artefact would not reproduce a 100-fold predictor separation
 twice.**
 
-**So the attribution is settled: the q-sign defect was the whole of the
-anomaly, and what remains at 2.593 meV is the windowed-ζ' representability
-error of the route, which is a separate and already-registered question**
-(`2026-08-10-exciton-bands-offgrid-Q-is-slab-only.md`). The remaining error now
-lives where no downfold can be blamed for it.
+**So the attribution loop closes, and it closes on the ANOMALY rather than on
+the whole error.** What the q-sign defect explains is exactly what was
+anomalous about the old pattern: Σ's dominance, and the rearrangement of the
+per-Q ordering between child and parent that no smooth basis-truncation story
+could account for. Both are gone. What it does **not** explain — and this row
+does not claim it does — is the 2.593 meV that remains, which splits into the
+route's own windowed-ζ' representability error (visible on the un-downfolded
+parent at 0.858 meV, a separate and already-registered question,
+`2026-08-10-exciton-bands-offgrid-Q-is-slab-only.md`) plus a genuine downfold
+truncation residual concentrated at L, quantified in the next section. **The
+useful change is that every remaining term now sits somewhere it can be
+honestly attributed**, which was not true of the 7.719 meV.
 
 ### The decomposition, restated — and the statistic the old one used was wrong
 
