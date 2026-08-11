@@ -1,7 +1,10 @@
 # The two-window contract is in, the fifth wall is down at Γ by four orders — and the tile null still refuses, on a SIXTH wall that is FINITE q and is not the m-leg (2026-08-11)
 
 **STATUS: THE NAMED FIX IS IMPLEMENTED, GATED AND MEASURED. THE TILE NULL
-STILL REFUSES, SO THERE IS NO `.dat`, NO `.png` AND NO CERT. NO TOLERANCE
+STILL REFUSES, SO THERE IS NO CURVE: NO REFIT `.dat`, NO `.png`, NO CERT.
+(The only two `.dat` this lane wrote anywhere are the `--vq-mode ongrid`
+byte-identity A/B artefacts in its own workspace, §7 — 346 data bytes each,
+written to BE compared, and not a curve.) NO TOLERANCE
 MOVED: the tile bracket is 5.0e-02, the fH ortho cap 1.0e-06, the reference
 cert grade 0.01 meV, `DEGENERACY_TOL_RY` 1.000 meV — all untouched, and all
 still refusing where they refused. `LORRAX_FH_ORTHO_TOL` was NEVER set;
