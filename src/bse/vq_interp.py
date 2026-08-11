@@ -64,19 +64,26 @@ coordinate, K = q+G Cartesian in bohr⁻¹, v = slab-truncated Coulomb):
         V(Q)   = Σ_j w_j V_SRc(q_j)
                + conj(A) A^T,  A = e^{−2πi(Q+G)·s_μ} M_μ(Q+G) √v_LR(Q+G)
 
-SCOPE: slab systems with q_z = 0 coarse grids (per-G_z channels exact
-there); FULL-BZ stored ζ (nq == nk).  IBZ-only ζ storage (the IBZ cascade)
-is rejected with a clear error — unfolding ζ through the one canonical
-SymMaps sym-action is deferred work, not a parallel helper here.  The slab
-half of that scope is ENFORCED, not merely stated, by
-:func:`slab_scope_violations` (see its docstring for the three conditions
-and what each one costs when it is violated); a 3-D bulk deck is refused at
-load with the reason named, instead of surfacing three functions later as
-an unexplained ``run_gates`` residual.
+SCOPE — THE MODEL'S, NOT THE MODULE'S.  The b26p INTERPOLATION above is
+slab-only (q_z = 0 coarse grids and slab-separable axes; the per-G_z channels
+are exact nowhere else), and that half is ENFORCED by
+:func:`slab_scope_violations`, from :func:`build_vq_evaluator` — the MODEL
+build — before anything expensive.  It used to fire at load, and moved when
+the refit below stopped being slab-bound; ``load_zeta_coarse`` still defaults
+to ``require_slab=True`` and only the refit caller passes ``False``.  Both
+paths need FULL-BZ stored ζ (nq == nk); IBZ-only storage (the IBZ cascade) is
+rejected with a clear error — unfolding ζ through the one canonical SymMaps
+sym-action is deferred work, not a parallel helper here.
 
 The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
 — a per-Q ζ refit from htransform full-r wavefunctions — lives in this
 module too (``refit_vq``): both are V_Q sources with one calling contract.
+NOTHING IN THE REFIT IS 2-D: it contracts with whatever kernel
+:func:`make_v_on_set` hands it, which on a ``sys_dim=3`` deck is the
+PRODUCER's own Coulomb door, so it is the arbitrary-Q exchange a bulk crystal
+runs and not merely a checking mode.  Which band window it fits ζ' on is the
+caller's ``--refit-window`` choice, and that choice picks the gate —
+:func:`refit_window_view` is where both are written down.
 
 Do NOT "improve" the model with: literal/pinned real-space moments (refuted
 twice, §12.2/§13.3), SVD learned multipoles (no low rank, §13.2), hard-cut
@@ -238,14 +245,10 @@ class _ZetaGTiles:
         self.shape = (int(loader.n_q_on_disk), int(loader.n_rmu_disk),
                       int(loader.n_G_sph_disk))
         self.dtype = np.complex128
-        # The header-vs-dataset ngkmax agreement check that used to stand
-        # here is GONE, not dropped: ``ZetaLoader.__init__`` has enforced
-        # it at OPEN since the door absorbed the local plan, and it has to
-        # live there — the two plans that could disagree (the collective
-        # one sizes ngkmax from the header, the local one from the dataset
-        # G axis) are both the loader's now, so only the loader can be
-        # sure neither is reachable without the check.  Here it protected
-        # exactly the consumers that happened to build tiles.
+        # The header-vs-dataset ngkmax agreement check is GONE from here, not
+        # dropped: ``ZetaLoader.__init__`` enforces it at OPEN, which is the
+        # only place that can, since BOTH plans that could disagree about
+        # ngkmax (header-sized collective, dataset-sized local) are its.
 
     # -- local plan (host numpy, h5py hyperslab; unchanged semantics) ---
     def __getitem__(self, key):
@@ -272,10 +275,6 @@ class _ZetaGTiles:
         """
         q_offset, q_count = int(q_offset), int(q_count)
         if self._distributed:
-            # No ``layout=`` since 2026-08-07: ZetaLoader.load reads G-flat
-            # and nothing else, so the kwarg had one legal value and the
-            # signature stopped carrying it (zeta_loader design D3).  This
-            # bundle already refuses a non-G-flat file in __init__.
             return self._loader.load(
                 q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
                 sharding=sharding.spec)
@@ -391,9 +390,11 @@ def slab_scope_violations(bvec, qfr=None, policy=None) -> list[str]:
 def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
     """Refuse an out-of-scope deck by name.  See :func:`slab_scope_violations`.
 
-    THE ONE SITE.  ``load_zeta_coarse`` calls this before anything expensive
-    runs, so the refusal arrives instead of ``build_cq`` + a gate battery
-    whose numbers are consequences rather than causes.
+    THE ONE SITE, and it is :func:`build_vq_evaluator` that calls it — the
+    b26p MODEL build, which is the thing that is slab-only — still before
+    anything expensive, so the refusal arrives instead of ``build_cq`` + a
+    gate battery whose numbers are consequences rather than causes.  The
+    refit caller loads ζ with ``require_slab=False`` and never reaches here.
     """
     why = slab_scope_violations(bvec, qfr=qfr, policy=policy)
     if not why:
@@ -405,14 +406,11 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
         + "  None of these is a tuning problem and no change to the long-range "
           "fit reaches them.  On a bulk deck use `--vq-mode ongrid` (exact, "
           "but only at Q on the BSE grid) or `--vq-mode refit` (the per-Q "
-          "zeta refit, exact at ANY Q).  Note that until 2026-08-10 this "
-          "sentence named `refit` while `refit` contracted with the SAME slab "
-          "kernel and the driver refused it as `not wired` -- so the advice "
-          "was a dead end.  It is not any more: the refit takes the "
-          "producer's own Coulomb door on a sys_dim=3 deck (make_v_on_set) "
-          "and the driver refits every path Q behind an on-grid null. "
-          "See the module docstring's SCOPE note and PIPELINE_HEALTH.md punch "
-          "row 23, which is this refusal's measured history.")
+          "zeta refit, exact at ANY Q: it takes the producer's own Coulomb "
+          "door on a sys_dim=3 deck -- make_v_on_set -- and the driver refits "
+          "every path Q behind an on-grid null).  See the module docstring's "
+          "SCOPE note and PIPELINE_HEALTH.md punch row 23, which is this "
+          "refusal's measured history.")
 
 
 # ===========================================================================
@@ -646,13 +644,11 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
 def close_zeta_coarse(zx: dict) -> None:
     """Release every handle :func:`load_zeta_coarse` opened.
 
-    EXPLICIT ownership.  The three lazy q-stacks are read-only handles,
-    not arrays, so the objects that hold them have to outlive the loader
-    call; before this they were kept alive purely by living in ``zx``
-    and being dropped when ``zx`` was — i.e. by CPython refcounting,
-    with nothing that could be called to end them.  ``zx`` remains
-    usable for everything already materialised (ψ, ε, the q labels, the
-    kernels); only the lazy reads (``ZG``, ``Vqmunu``, ``W0``) stop.
+    EXPLICIT ownership, because the three lazy q-stacks are read-only HANDLES
+    and have to outlive the loader call — so ending them cannot be left to
+    CPython refcounting on ``zx``.  ``zx`` remains usable for everything
+    already materialised (ψ, ε, the q labels, the kernels); only the lazy
+    reads (``ZG``, ``Vqmunu``, ``W0``) stop.
 
     Idempotent, and safe on a partially-built bundle.
     """
@@ -745,6 +741,14 @@ def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
     moves makeVq-vs-disk from ~1e-9 to 0.33).  Split (stable expm1;
     vSR+vLR == v to 1e-13, gated):
         slab_lr: v · e^{−K²/4α²}      slab_sr: v · (−expm1(−K²/4α²))
+
+    NOT DEDUPED INTO ``vcoul.Slab2D``, deliberately.  Same FORMULA, different
+    ARITHMETIC: the service spells it ``v_reg * fact`` and is bit-compared
+    against BGW's pre-port table, this spells it ``8π/K² · f2d / celvol``, and
+    the two differ in the last ulp — not a free swap under a 5e-6
+    ``makeVq_vs_disk`` gate.  The ``slab_sr``/``slab_lr`` split has no service
+    equivalent on an explicit Miller set at all.  The refit's BULK kernel does
+    go through the door (:func:`make_v_on_set`).
     """
     K = zx["bvec"].T @ (np.asarray(qfrac)[:, None] + GS.astype(np.float64))
     K2 = np.sum(K * K, axis=0)
@@ -1065,16 +1069,14 @@ def run_gates(zx, C_q):
             float(np.max(np.abs(vs[:n] + vl[:n] - v[:n]))
                   / max(np.max(np.abs(v[:n])), 1e-300)), 1e-13)
     # Slab-axis separability (per-G_z channels need b3 ∥ z, b1/b2 in-plane).
-    # BELT AND BRACES SINCE 2026-08-10, not the guard: ``load_zeta_coarse``
-    # refuses a non-slab cell outright (:func:`assert_slab_scope`), naming
-    # this ratio and the two other conditions, so on any deck that reaches
-    # here the line below reads 0.000e+00.  It stays because a battery that
-    # prints every quantity it depends on is how the row-23 attribution was
-    # possible at all — and because deleting a gate is how the next one goes
-    # unwatched.  Do NOT read a FAIL here as an interpolation defect: it is
-    # cell geometry, and so is the ``makeVq_vs_disk`` residual that
-    # accompanies it on a bulk deck (both measured in
-    # :func:`slab_scope_violations`).
+    # BELT AND BRACES, not the guard: ``build_vq_evaluator`` has already
+    # refused a non-slab cell by name (:func:`assert_slab_scope`) before this
+    # battery runs, so on any deck that reaches here the line reads 0.000e+00.
+    # It stays because a battery that prints every quantity it depends on is
+    # how the row-23 attribution was possible at all.  Do NOT read a FAIL here
+    # as an interpolation defect: it is cell geometry, and so is the
+    # ``makeVq_vs_disk`` residual that accompanies it on a bulk deck (both
+    # measured in :func:`slab_scope_violations`).
     bv = zx["bvec"]
     log("slab_axes_offdiag", float(max(np.max(np.abs(bv[2, :2])),
                                        np.max(np.abs(bv[:2, 2])))
@@ -1263,21 +1265,19 @@ def _to_host(x):
     """Gather a device array to a full host numpy array on EVERY process,
     whether it is PROCESS-SPANNING or fully addressable.
 
-    The per-q ζ-clean tiles are q-sharded ``P(('x','y'),...)`` across the whole
-    (multi-node) mesh, so on a 16-process run no single process holds the full
-    stack and ``jax.device_get`` raises; ``multihost_utils.process_allgather``
-    stitches the global array (gathering only the sharded q-axis).  It is
-    COLLECTIVE — every process must reach it in lockstep; the
-    ``prepare_coarse`` chunk loop is deterministic (same nq / q_chunk on all
-    processes), so they do.  A FULLY-ADDRESSABLE input (single-GPU run, or a
-    replicated array) must instead use ``device_get`` — ``process_allgather(
-    tiled=True)`` would DUPLICATE its leading axis by the process count.  Branch
-    on ``is_fully_addressable`` (a global property, so the collective stays in
-    lockstep); this keeps the 1-GPU path a plain device_get.
+    ONE line of delegation to :func:`common.collectives.gather_to_host`, which
+    owns the three-arm branch (``device_get`` when fully addressable, a local
+    shard read when merely replicated, ``process_allgather(tiled=True)`` when
+    the shards are genuinely remote) and the incidents behind it.  The wrapper
+    is not free-standing: ``tests/test_bse_gather_and_mesh.py`` ratchets it,
+    and its four siblings, to REACH that service rather than re-derive it.
 
-    That branch now lives ONCE, in :func:`common.collectives.gather_to_host`;
-    this is delegation, and the reasoning above is kept here because the
-    ζ-clean chunk loop is where it is load-bearing."""
+    WHAT MAKES IT LOAD-BEARING HERE: the collective arm is reached in a LOOP.
+    ``prepare_coarse``'s ζ-clean tiles are q-sharded ``P(('x','y'),...)``
+    across the whole mesh, so on a 16-process run every chunk takes it, and
+    the ranks stay in lockstep only because that loop is deterministic (same
+    nq / q_chunk on every process).
+    """
     from common.collectives import gather_to_host
     return gather_to_host(x)
 
@@ -1482,9 +1482,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             device_put_process_local(v_lr_all[sl], qb2),
             device_put_process_local(idx_all[sl], qb2),
             device_put_process_local(zx["qfr"][sl], qb2))
-        # process_allgather (not device_get): S_b/V_b/F_b are q-sharded qb3
-        # across the whole mesh, so on a multi-node run their shards span other
-        # processes and device_get would raise (non-addressable).
+        # ``_to_host``, not device_get: S_b/V_b/F_b are q-sharded qb3 across
+        # the whole mesh, so at P>1 their shards span other processes.  This
+        # is the deterministic loop ``_to_host``'s docstring relies on.
         if keep_host_mirrors:
             S_np[sl] = _to_host(S_b)
             V_SRc_np[sl] = _to_host(V_b)
@@ -1498,7 +1498,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     stencil_sh = _ns(mesh_xy, P(None, "x", "y"), (nq, n_mu, n_mu),
                      "prepare_coarse.V_SRc")
     # Host-mirror branch: process-local placement (AA.1; the mirror was
-    # assembled identically on every rank from _to_host'd chunks).
+    # assembled identically on every rank from gathered chunks).
     V_SRc_dev = (device_put_process_local(V_SRc_np, stencil_sh)
                  if keep_host_mirrors
                  else jax.jit(lambda *c: jnp.concatenate(c, axis=0),
@@ -1706,7 +1706,8 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, chunk):
     every Q whose ``|Q+G*|`` is small enough (all 8 probed Q on the reference
     slab deck), so a Q path normally lives in a single entry.
     """
-    from vcoul import wrap_points_to_voronoi
+    from vcoul import (minibz_cell_affine, minibz_frac_to_cart,
+                       wrap_points_to_voronoi)
     key = (bvec.tobytes(), tuple(int(s) for s in kgrid), int(n_q),
            int(nsamples), int(qmc_reps), int(seed_offset), int(chunk))
     hit = _MBZ_DQ_CACHE.get(key)
@@ -1721,14 +1722,19 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, chunk):
     loc = slots % np.uint32(n_q)                        # in-batch draw
     gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
     U = np.asarray(_mbz_draw_u(gidx, base_key), dtype=np.float64)
-    # δq mapping — VERBATIM minibz_voronoi_batches geometry (single source
-    # for the wrap + mini-BZ affine map), nmax=3 = BGW ncell.
-    randcart = (bvec.T @ U.T).T
+    # δq mapping THROUGH THE DOOR, not a local re-spelling of it: all three
+    # steps are ``vcoul.minibz``'s, which is what makes the convention
+    # decidable in one place.  It is a convention with a history — the
+    # transposed frac→cart spelling ``U @ bvec.T`` is NOT a fundamental domain
+    # of the reciprocal lattice and shipped as a three-month bias in the 3D
+    # body head (358bb0b), which is precisely why the service refuses to let
+    # each caller write its own.  nmax=3 = BGW ncell.  Bit-identical to the
+    # local spellings this replaces (measured over 200 random cells, both
+    # helpers exactly equal in float64).
+    randcart = minibz_frac_to_cart(U, bvec)
     wrapped = np.asarray(wrap_points_to_voronoi(
         jnp.asarray(randcart), jnp.asarray(bvec), nmax=3), dtype=np.float64)
-    randlims = bvec.T @ (np.diag(1.0 / np.asarray(kgrid, np.float64))
-                         @ np.linalg.inv(bvec.T))
-    dq = (randlims @ wrapped.T).T
+    dq = (minibz_cell_affine(bvec, kgrid) @ wrapped.T).T
     dq[:, 2] = 0.0                                       # 2D slab: qz = 0
     if len(_MBZ_DQ_CACHE) >= _MBZ_DQ_CACHE_MAX:
         _MBZ_DQ_CACHE.pop(next(iter(_MBZ_DQ_CACHE)))
@@ -1809,10 +1815,9 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     never calls here (bse_io._interpolate_bse_data_to_grid).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
-    # Replumbed 2026-08-07: these are pure service symbols; the door is
-    # the true dependency (the gw.coulomb.base / gw.vcoul spellings are
-    # compat shims kept for sibling branches this phase).  The Voronoi wrap
-    # moved into :func:`_mbz_dq` with the rest of the Q-independent geometry.
+    # The DOOR is the true dependency; the ``gw.coulomb`` / ``gw.vcoul``
+    # spellings of these are compat shims.  Everything Q-INDEPENDENT (the
+    # draws, the Voronoi wrap, the mini-BZ affine) lives in :func:`_mbz_dq`.
     from vcoul import _minibz_kernel_bare, minibz_inscribed_sphere_r2
     if alpha is None:
         alpha = float(prep["alpha"])
@@ -2499,9 +2504,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             bool(params.get("bispinor", False)), band_chunk_size=16):
         lo = bc_range[0] - band_range[0]
         hi = bc_range[1] - band_range[0]
-        # _to_host (= common.collectives.gather_to_host), NOT device_get.  ``iter_psi_rchunk_bandwise`` yields
-        # a mesh-sharded global array, so on a MULTI-PROCESS run its shards
-        # live on other processes and ``jax.device_get`` raises
+        # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get.
+        # ``iter_psi_rchunk_bandwise`` yields a mesh-sharded global array, so on a MULTI-PROCESS run its
+        # shards live on other processes and ``jax.device_get`` raises
         # ("Fetching value for a jax.Array that spans non-addressable
         # devices") — measured at P=4/4-process, job 56612363 step .59, the
         # first time this function ever ran under the driver.  Its three-arm
@@ -2588,7 +2593,6 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
                                  axis=1))
         for j in far[:3]:
             q_list.append(tuple(int(v) for v in idx[j]))
-    from common.collectives import device_put_process_local
     sh = NamedSharding(mesh_xy, P("x", "y"))
     out = []
     worst = 0.0
