@@ -245,3 +245,124 @@ def test_band_degeneracy_snap_is_still_reachable_and_still_named():
     assert "default" in help_text and "strict" in help_text, (
         f"--band-degeneracy's help does not name strict as the default, so "
         f"the flip is invisible from --help; got: {action.help!r}")
+
+
+# ---------------------------------------------------------------------------
+# (4) the THIRD flip: --q-per-segment defaults to 16 (owner, 2026-08-10)
+# ---------------------------------------------------------------------------
+# "the exciton band fine grid plot looks like shit. i wanted like 16
+# diagonalizations on each line segment. i thought that was obvious. it's a
+# bandstructure."  The decks in tree carried K_POINTS counts of 1 and 2, so
+# Γ–X–W–L–Γ–Σ was drawn with EIGHT diagonalisations and straight lines between
+# the corners.  The driver now applies a FLOOR of 16 per segment by default.
+#
+# Same failure mode as the two flips above — a default that quietly flips
+# back — plus one this file has not had to pin before: a floor that silently
+# becomes an OVERRIDE would coarsen a hand-tuned dense deck, and a floor that
+# stops being reachable at 1 would make the old sparse path unreproducible.
+# All three are pinned.
+
+def _floor(counts, n):
+    """Run the driver's own floor over a parser-shaped segment list."""
+    exciton_bands = _driver()
+    segs = [{"k": [0.0, 0.0, 0.0], "n": 1, "label": "G"}]
+    for i, c in enumerate(counts):
+        segs.append({"k": [0.5, 0.0, 0.0], "n": int(c), "label": f"P{i}"})
+    params = {"kpoints_crystal_b": {"segments": segs}}
+    n_pts = exciton_bands.apply_q_per_segment(params, n, log=lambda *_: None)
+    return [s["n"] for s in params["kpoints_crystal_b"]["segments"][1:]], n_pts
+
+
+def test_q_per_segment_defaults_to_sixteen():
+    """A bare command line draws a bandstructure, not a line drawing."""
+    exciton_bands = _driver()
+    args = exciton_bands.build_parser().parse_args(BASE_ARGV)
+    assert args.q_per_segment == 16, (
+        f"a bare exciton_bands command line asks for "
+        f"{args.q_per_segment} Q per segment; the owner's ruling on "
+        f"2026-08-10 is that 16 is the floor and that it is the default")
+
+
+def test_the_floor_raises_the_deck_that_produced_the_eight_point_plot():
+    """G X W L G Σ at deck counts 2,1,1,2,1 → 8 Q.  Under the floor, 81."""
+    got, n_pts = _floor([2, 1, 1, 2, 1], 16)
+    assert got == [16, 16, 16, 16, 16]
+    assert n_pts == 81, f"the floored G-X-W-L-G-S path carries {n_pts} Q, not 81"
+
+
+def test_the_floor_is_a_floor_and_not_an_override():
+    """A deck asking for MORE than the floor keeps its own counts.
+
+    An override here would silently coarsen every hand-tuned dense deck in
+    the fleet the day this default landed, and the coarsening would look
+    exactly like a converged calculation.
+    """
+    got, n_pts = _floor([40, 2, 100], 16)
+    assert got == [40, 16, 100], (
+        f"--q-per-segment overrode the deck's own denser counts: {got}")
+    assert n_pts == 1 + 40 + 16 + 100
+
+
+def test_q_per_segment_one_is_the_identity():
+    """The sparse behaviour stays reachable, and only by asking for it.
+
+    ``1`` is below every deck count that can be parsed (the parser floors at
+    1 itself), so this is the exact pre-flip path — which is what makes every
+    archived sparse run reproducible from its own recipe plus one flag.
+    """
+    counts = [2, 1, 1, 2, 1]
+    got, n_pts = _floor(counts, 1)
+    assert got == counts
+    assert n_pts == 1 + sum(counts) == 8
+
+
+def test_a_zero_or_negative_floor_refuses():
+    """Not a point count.  Refuse rather than emit an empty or reversed path."""
+    for bad in (0, -3):
+        with pytest.raises(SystemExit):
+            _floor([2, 1], bad)
+
+
+def test_help_text_states_the_floor_semantics():
+    """A floor that ``--help`` describes as an override is a trap."""
+    exciton_bands = _driver()
+    action = {a.dest: a
+              for a in exciton_bands.build_parser()._actions}["q_per_segment"]
+    assert action.default == 16
+    help_text = (action.help or "").lower()
+    assert "floor" in help_text, (
+        f"--q-per-segment's help does not say it is a floor; got: "
+        f"{action.help!r}")
+    assert "16" in help_text, (
+        "--q-per-segment's help does not name its default")
+
+
+def test_the_driver_applies_the_floor_before_it_builds_the_path():
+    """The wiring: ``apply_q_per_segment`` is called, and BEFORE
+    ``initialize_kpath``.
+
+    Everything above is theatre if the driver never consults the floor, or
+    consults it after the path is already generated from the deck's counts —
+    which would be green, well-tested and entirely unread.  Read the real
+    call order out of the real source.
+    """
+    tree = _source_tree()
+    lines_apply, lines_kpath = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = (fn.id if isinstance(fn, ast.Name) else
+                fn.attr if isinstance(fn, ast.Attribute) else None)
+        if name == "apply_q_per_segment":
+            lines_apply.append(node.lineno)
+        elif name == "initialize_kpath":
+            lines_kpath.append(node.lineno)
+    assert lines_apply, (
+        "exciton_bands.py never calls apply_q_per_segment — the floor is a "
+        "well-tested function the driver does not use")
+    assert lines_kpath, "exciton_bands.py no longer calls initialize_kpath"
+    assert min(lines_apply) < min(lines_kpath), (
+        f"apply_q_per_segment is called at line {min(lines_apply)}, AFTER "
+        f"initialize_kpath at {min(lines_kpath)}; the path is then built "
+        f"from the deck's own counts and the floor changes nothing")

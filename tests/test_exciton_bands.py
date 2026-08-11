@@ -54,9 +54,16 @@ def test_exciton_bands_3pt_smoke(tmp_path):
     cwd = os.getcwd()
     try:
         os.chdir(run)
+        # --q-per-segment 1 is the IDENTITY on the deck's own counts, and it
+        # is what keeps this a 3-point smoke: the driver's default is a floor
+        # of 16 per segment (it is a bandstructure), which would make this
+        # cell a 17-point run for no extra coverage.  The floor's own
+        # semantics are asserted in test_q_per_segment_floor below, on the
+        # parsed dict, with no GPU.
         rc = main(["-i", str(run / "exb.in"), "--n-val", "2", "--n-cond", "2",
                    "--n-eig", "4", "--block-size", "4", "--max-iter", "30",
-                   "--vq-mode", "interp", "--out-prefix", "smoke"])
+                   "--vq-mode", "interp", "--q-per-segment", "1",
+                   "--out-prefix", "smoke"])
     finally:
         os.chdir(cwd)
     assert rc == 0

@@ -477,6 +477,64 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
         f"centroids_file at that table directly.")
 
 
+def apply_q_per_segment(params, q_per_segment, log=print) -> int:
+    """Raise every ``K_POINTS crystal_b`` segment to at least N points.
+
+    IT IS A BANDSTRUCTURE, SO SAMPLE IT LIKE ONE.  The deck format carries a
+    per-segment point count, and the decks in this campaign carried counts of
+    one and two — which draws Γ–X–W–L–Γ–Σ with eight diagonalisations in
+    total and produces a plot of straight lines between corners.  The owner's
+    reading of that plot ("it looks like shit ... i thought that was
+    obvious") is the reason this floor exists and is on by default.
+
+    A FLOOR, not an override, and the distinction is the whole gate:
+
+      * a segment the deck leaves sparser than ``q_per_segment`` is raised to
+        it, so the DEFAULT (16) draws at least 16 diagonalisations per
+        segment on every deck that ever ran, without editing any deck;
+      * a segment the deck already asks for MORE points on keeps its own
+        count, so a hand-tuned dense deck is not silently coarsened;
+      * ``--q-per-segment 1`` is the identity — every deck count is already
+        >= 1 — so the sparse behaviour is still reachable, by asking for it
+        explicitly and only that way.
+
+    Only ``bse.exciton_bands`` calls this.  The mutation is on the parsed
+    ``params`` dict this driver owns for the length of one run, so the
+    single-particle bandstructure driver reading the same deck is untouched.
+
+    Returns the number of path points the raised path will carry.
+    """
+    seginfo = params.get("kpoints_crystal_b") or {}
+    segs = seginfo.get("segments", [])
+    if len(segs) < 2:
+        return 0
+    floor = int(q_per_segment)
+    if floor < 1:
+        raise SystemExit(
+            f"exciton_bands: --q-per-segment={floor} is not a point count.  "
+            f"1 is the identity (every deck count is already >= 1) and 16 is "
+            f"the default.")
+    # segs[0] is the path's first corner; segs[i>0] carries the count for the
+    # segment that ENDS at it (generate_kpath_from_qe_segments).
+    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[1:]]
+    for seg, n_deck in zip(segs[1:], deck_counts):
+        seg["n"] = max(n_deck, floor)
+    raised = [(i, a, max(a, floor))
+              for i, a in enumerate(deck_counts, start=1) if a < floor]
+    n_pts = 1 + sum(max(a, floor) for a in deck_counts)
+    if raised:
+        log(f"  [q-per-segment] floor {floor}: raised {len(raised)} of "
+            f"{len(deck_counts)} segment(s) "
+            f"({', '.join(f'#{i}: {a}->{b}' for i, a, b in raised)}); "
+            f"the path now carries {n_pts} Q "
+            f"(deck alone: {1 + sum(deck_counts)}).  It is a bandstructure — "
+            f"pass --q-per-segment 1 for the deck's own counts.")
+    else:
+        log(f"  [q-per-segment] floor {floor}: every deck segment already "
+            f"asks for at least that many; path unchanged at {n_pts} Q.")
+    return n_pts
+
+
 def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
     """The ζ file the off-grid exchange needs — or a refusal that explains it.
 
@@ -828,6 +886,24 @@ def build_parser():
                          f"{DEGENERACY_TOL_RY:.4e} = 1 meV; the smallest "
                          f"between-pair boundary gap measured on the Si "
                          f"12x12 SOC deck was 5.9 meV)")
+    ap.add_argument("--q-per-segment", type=int, default=16,
+                    dest="q_per_segment",
+                    help="MINIMUM number of Q the driver puts on each "
+                         "K_POINTS crystal_b segment (default 16).  It is a "
+                         "FLOOR on the deck's own per-segment counts, not an "
+                         "override: a segment the deck asks for MORE points "
+                         "on keeps its own count, and '--q-per-segment 1' is "
+                         "the identity, which is the only way to get the "
+                         "deck's counts verbatim.  The default exists "
+                         "because E_S(Q) along a high-symmetry path is a "
+                         "BANDSTRUCTURE: the decks in tree carried counts of "
+                         "1 and 2, which drew Γ-X-W-L-Γ-Σ with eight "
+                         "diagonalisations and straight lines between them.  "
+                         "Each extra Q is one more row of the SAME compiled "
+                         "solve scan (no extra compile), so density is "
+                         "cheap; it is the htransform ψ_c(k+Q) cache that "
+                         "grows linearly, and that is what to watch on a "
+                         "densified (bse_k_grid) bundle.")
     ap.add_argument("--n-eig", type=int, default=6)
     ap.add_argument("--block-size", type=int, default=8)
     ap.add_argument("--max-iter", type=int, default=40,
@@ -1081,6 +1157,11 @@ def main(argv=None):
         raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "
                          "the exciton Q path comes from it (same format as "
                          "the htransform bandstructure driver)")
+    # Sampling density BEFORE the path is generated: a floor on the deck's
+    # per-segment counts, default 16, so the default output is a
+    # bandstructure rather than a line drawing between corners.  See
+    # apply_q_per_segment for why this is a floor and not an override.
+    apply_q_per_segment(params, args.q_per_segment, log=log)
 
     # Everything above — the startup call, jax.distributed, mesh creation and its
     # MPI clique warm-up, the input parse — is the driver prologue.  Named
@@ -1327,6 +1408,11 @@ def main(argv=None):
     # D3h-orbit-closure cascade), which ``vq_interp`` refuses.  Cost: the full
     # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
     ongrid = (args.vq_mode == "ongrid")
+    # ``refit`` used to refuse ("not wired") and to be unusable anyway: its
+    # kernel was the slab one.  Since 2026-08-10 it is the exact arbitrary-Q
+    # exchange on a bulk deck — the ONLY one, because the interpolation model
+    # is slab-only — and it is what a dense Q path on a 3-D crystal runs.
+    pure_refit = (args.vq_mode == "refit")
     kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
     # WHICH GRID INDEXES THE EXCHANGE TILES.  Normally the bundle's own.  After
     # a ``bse_k_grid`` coarse→fine densification the bundle's grid is the FINE
@@ -1360,7 +1446,13 @@ def main(argv=None):
                 f"create exchange tiles at new q.  Use a K_POINTS block whose "
                 f"segments land on the coarse grid, or --vq-mode=interp (which "
                 f"needs FULL-BZ ζ storage and an exchange model valid for this "
-                f"cell).")
+                f"cell).\n"
+                f"  CHECK --q-per-segment FIRST if this deck used to run: it "
+                f"floors every segment at {args.q_per_segment} points by "
+                f"default (2026-08-10 — E_S(Q) on a path is a bandstructure), "
+                f"and a floor above ~2 puts most Q off any coarse grid.  "
+                f"--q-per-segment 1 restores the deck's own counts exactly; "
+                f"the dense path is what needs the full-BZ ζ.")
         log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
             f"({nQ} Q, all on the "
             f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} grid = {vq_src}) "
@@ -1375,14 +1467,51 @@ def main(argv=None):
                     else bool(params.get("head_minibz_average", False)))
         log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
             f"(head_minibz_average={head_mbz})")
-        require_zeta_for_interp(restart_file, args.vq_mode, (nkx, nky, nkz))
-        vqm = vq_interp.build_vq_evaluator(
-            restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
-            eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
-            head_minibz_average=head_mbz, log_fn=log)
-        zx, prep = vqm.zx, vqm.prep
-        eval_vq, pinvF, coeffs_packed = vqm.eval_vq, vqm.pinvF, vqm.coeffs_packed
+        zeta_path = require_zeta_for_interp(restart_file, args.vq_mode,
+                                            (nkx, nky, nkz))
+        if pure_refit:
+            # NO interpolation model is built at all.  The b26p long-range fit
+            # is the slab-only half of vq_interp; the refit path fits ζ at the
+            # target Q from the htransform ψ and contracts it with the
+            # producer's own Coulomb door.  So this branch loads ζ and stops.
+            zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
+                                            mesh=mesh_xy, log_fn=log,
+                                            require_slab=False)
+            prep = eval_vq = pinvF = coeffs_packed = None
+            if head_mbz:
+                raise SystemExit(
+                    "exciton_bands: --head-minibz-average needs the "
+                    "interpolation model's long-range pieces (minibz_head_vlr "
+                    "reads prep), which --vq-mode=refit does not build.  The "
+                    "refit keeps the full v(Q+G) including G=0 at every Q, "
+                    "which is the pointwise head this flag would replace.")
+        else:
+            vqm = vq_interp.build_vq_evaluator(
+                restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
+                eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
+                head_minibz_average=head_mbz, log_fn=log)
+            zx, prep = vqm.zx, vqm.prep
+            eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
+                                             vqm.coeffs_packed)
     tick("vq_prepare", t0)
+
+    # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
+    rst = None
+    if pure_refit:
+        t0 = time.time()
+        rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
+                                      r_chunk=args.refit_r_chunk, log_fn=log,
+                                      policy=zx.get("policy"),
+                                      keep_idx=keep_idx)
+        if V_ongrid is None:
+            raise SystemExit(
+                "exciton_bands: --vq-mode=refit certifies itself against the "
+                "stored V_qmunu at on-grid q and this bundle carries none, so "
+                "there is nothing to check the off-grid tiles against.  Load a "
+                "bundle with the exchange tensor, or use --vq-mode=ongrid.")
+        vq_interp.refit_ongrid_null(zx, rst, V_ongrid, kgrid_vq, mesh_xy,
+                                    log_fn=log)
+        tick("refit_prepare_and_null", t0)
 
     grid_xy = NamedSharding(mesh_xy, P("x", "y"))
 
@@ -1413,6 +1542,15 @@ def main(argv=None):
                 jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
             n_eval_calls += 1
             continue
+        if pure_refit:
+            V_np = vq_interp.refit_vq(zx, rst, q_tile_np, mesh_xy, log_fn=log)
+            V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
+            V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
+                                           + V_np[:n_rmu, :n_rmu].conj().T)
+            from common.collectives import device_put_process_local
+            V_rows.append(device_put_process_local(V_pad, grid_xy))
+            n_eval_calls += 1
+            continue
         q_tile = jnp.asarray(q_tile_np)
         if head_mbz:
             gstar, head_val, M_ab = vq_interp.minibz_head_vlr(
@@ -1431,9 +1569,10 @@ def main(argv=None):
             V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
                                              coeffs_packed)))
         n_eval_calls += 1
-    if args.vq_mode == "refit":
-        raise SystemExit("--vq-mode=refit alone is not wired; use "
-                         "--vq-mode=both (interp path + refit spot checks)")
+    if pure_refit:
+        log(f"  exchange: per-Q ζ REFIT at all {n_eval_calls} finite Q "
+            f"(compute-don't-interpolate; Γ keeps the production q=0 tile), "
+            f"certified against the stored V_qmunu by the on-grid null above")
     refit_idx = []
     if args.vq_mode == "both":
         if args.refit_points:
@@ -1443,7 +1582,9 @@ def main(argv=None):
             refit_idx = sorted({int(i) for i in
                                 np.linspace(1, nQ - 2, 5).round()})
         rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
-                                      r_chunk=args.refit_r_chunk)
+                                      r_chunk=args.refit_r_chunk,
+                                      policy=zx.get("policy"),
+                                      keep_idx=keep_idx)
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)

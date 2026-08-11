@@ -403,9 +403,14 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
         "vq_interp is a SLAB model and this deck is not a slab" + where
         + ".  " + "  ".join(f"({i + 1}) {w}." for i, w in enumerate(why))
         + "  None of these is a tuning problem and no change to the long-range "
-          "fit reaches them; use `--vq-mode ongrid` (exact at every Q on the "
-          "BSE grid) or `--vq-mode refit` (the per-Q zeta refit) on this deck. "
-          " "
+          "fit reaches them.  On a bulk deck use `--vq-mode ongrid` (exact, "
+          "but only at Q on the BSE grid) or `--vq-mode refit` (the per-Q "
+          "zeta refit, exact at ANY Q).  Note that until 2026-08-10 this "
+          "sentence named `refit` while `refit` contracted with the SAME slab "
+          "kernel and the driver refused it as `not wired` -- so the advice "
+          "was a dead end.  It is not any more: the refit takes the "
+          "producer's own Coulomb door on a sys_dim=3 deck (make_v_on_set) "
+          "and the driver refits every path Q behind an on-grid null. "
           "See the module docstring's SCOPE note and PIPELINE_HEALTH.md punch "
           "row 23, which is this refusal's measured history.")
 
@@ -414,7 +419,8 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
 # coarse-data loading (reference load_fixture, with paths as arguments)
 # ===========================================================================
 def load_zeta_coarse(restart_file: str, zeta_file: str, *,
-                     mesh: Mesh | None = None, log_fn=print) -> dict:
+                     mesh: Mesh | None = None, log_fn=print,
+                     require_slab: bool = True) -> dict:
     """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
 
     q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
@@ -620,9 +626,20 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     # the gate failures it explained.  The stamp was never missing; nothing
     # READ it.  So the fix is a refusal that quotes it, not a second copy.
     from file_io import read_coulomb_policy_from_h5
-    assert_slab_scope(zx["bvec"], qfr=zx["qfr"],
-                      policy=read_coulomb_policy_from_h5(restart_file),
-                      source=restart_file)
+    zx["policy"] = read_coulomb_policy_from_h5(restart_file)
+    # ``require_slab=False`` is the REFIT caller, and it is not a bypass of
+    # the scope check — it is the observation that the scope check is about a
+    # part of this module the refit never touches.  Both slab-only facts
+    # (:func:`slab_scope_violations`) are properties of the b26p long-range
+    # MODEL and of ``v_slab_on_set``; the refit fits ζ at the target Q and
+    # contracts it with the kernel :func:`make_v_on_set` hands it, which on a
+    # bulk deck is the producer's own.  The check therefore moved to
+    # ``build_vq_evaluator`` — the model build — rather than being weakened,
+    # so an interp/both run on a bulk deck refuses exactly as loudly as
+    # before, one call later and before anything expensive still.
+    if require_slab:
+        assert_slab_scope(zx["bvec"], qfr=zx["qfr"], policy=zx["policy"],
+                          source=restart_file)
     return zx
 
 
@@ -742,6 +759,81 @@ def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
     elif kind == "slab_sr":
         v = v * (-np.expm1(-K2 / (4.0 * alpha ** 2)))
     return np.where(zero, 0.0, v)
+
+
+def make_v_on_set(zx, policy, log_fn=print):
+    """The kernel the REFIT contracts with — the PRODUCER's, not this module's.
+
+    ``v_slab_on_set`` above is the 2-D Ismail-Beigi truncation, and it is the
+    only kernel the b26p long-range model can have, because that model's
+    ``|G_z|`` channels only exist on a slab (see
+    :func:`slab_scope_violations`).  The **refit** is a different animal: it
+    fits ζ at the target Q from the htransform ψ and contracts it with
+    ``v`` directly, with no fitted model anywhere in the path.  Nothing in it
+    is 2-D except this one call — so on a bulk deck the refit is exact the
+    moment the kernel is the one that built the stored tiles.
+
+    That is not an argument, it is a measurement.  Rebuilding the
+    ``si_bse_debug`` 4×4×4 960→191 bundle's own ``V_qmunu`` from its own
+    stored ζ, at all 64 coarse q (2026-08-10,
+    ``/pscratch/sd/j/jackm/xbdense_0810/probe_v3d2.py``):
+
+    | kernel | makeVq-vs-disk relative (min / med / max) | under the 5e-6 gate |
+    |---|---|---|
+    | ``v_slab_on_set`` (this module's) | 5.8e-3 / 3.8e-2 / 5.1e-1 | 0 of 64 |
+    | bulk 8π/K²/Ω, **no** mini-BZ head | 1.4e-14 / 9.2e-3 / 4.8e-2 | 1 of 64 |
+    | the door below (bulk + mini-BZ head) | 3.7e-15 / 9.2e-15 / **3.3e-14** | **64 of 64** |
+
+    The middle row is the one the module docstring already predicted and left
+    open ("the remainder attributable to the deck's own
+    ``mc_average_vcoul_body = true`` mini-BZ head-slot injection, which this
+    module does not model either").  It is closed here by not modelling it at
+    all: ``gw.compute_vcoul.compute_v_q_per_G`` IS the function the V_q
+    writer called, and ``build_v_head_miniBZ_fn_3d`` IS the head it injected,
+    so the refit and the producer cannot disagree about a convention — there
+    is only one implementation of it.  Note which row is load-bearing: the
+    mini-BZ head moves this by six orders of magnitude and the deck's 25 Ry
+    ``bare_coulomb_cutoff`` moves it by nothing (the ζ sphere is already
+    inside it), so a lane that ported the cutoff and skipped the head would
+    have got 9.2e-3 and no idea why.
+
+    ``policy`` is ``file_io.read_coulomb_policy_from_h5``'s dict.  ONLY
+    ``sys_dim = 3`` takes the new route; 2-D and unstamped decks keep
+    ``v_slab_on_set`` byte for byte, so no slab result anywhere can move.
+    """
+    sys_dim = str((policy or {}).get("sys_dim", "")).strip()
+    if sys_dim != "3":
+        return lambda qfrac, GS, kind="slab", alpha=None: v_slab_on_set(
+            zx, qfrac, GS, kind, alpha)
+
+    from gw.compute_vcoul import compute_v_q_per_G
+    from vcoul import build_v_head_miniBZ_fn_3d
+
+    cutoff = (policy or {}).get("bare_coulomb_cutoff", None)
+    cutoff = float(cutoff) if cutoff not in (None, "") else None
+    mc = str((policy or {}).get("mc_average_vcoul_body", "")).strip().lower()
+    head_fn = (build_v_head_miniBZ_fn_3d(
+        np.asarray(zx["kgrid"], dtype=int), zx["bvec"], zx["celvol"])
+        if mc in ("true", "1", "yes") else None)
+    log_fn(f"  [refit] bulk kernel via the producer's own door: sys_dim=3, "
+           f"bare_coulomb_cutoff={cutoff}, mini-BZ head slot="
+           f"{head_fn is not None} (mc_average_vcoul_body={mc!r}).  The "
+           f"on-grid null below is what certifies this pairing.")
+
+    def _v(qfrac, GS, kind="slab", alpha=None):
+        if kind != "slab":
+            raise NotImplementedError(
+                "the bulk refit kernel has no SR/LR Gaussian split — that "
+                "split exists for the b26p long-range model, which is "
+                "slab-only and is not on the refit path")
+        v = compute_v_q_per_G(
+            np.asarray(qfrac, dtype=np.float64)[None, :],
+            np.asarray(GS, dtype=np.int32)[None, :, :],
+            bvec=zx["bvec"], cell_volume=zx["celvol"], sys_dim=3,
+            vcoul_cutoff_ry=cutoff, v_head_fn=head_fn)
+        return np.real(np.asarray(v)[0])
+
+    return _v
 
 
 def v_sphere(zx, q, kind="slab", alpha=None):
@@ -1987,7 +2079,12 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # read on every rank.  The reader announces and falls back to the
     # local h5py plan when the deployment cannot serve SlabIO.
     zx = load_zeta_coarse(restart_file, zeta_file, mesh=mesh_xy,
-                          log_fn=log_fn)
+                          log_fn=log_fn, require_slab=False)
+    # THE ONE SITE, moved here from the loader: this function is the b26p
+    # model build, and the model is what is slab-only.  Still before anything
+    # expensive — ``build_cq`` is the next line.
+    assert_slab_scope(zx["bvec"], qfr=zx["qfr"], policy=zx.get("policy"),
+                      source=restart_file)
     C_q = build_cq(zx, mesh_xy)
     if run_diagnostics:
         run_gates(zx, C_q)
@@ -2207,7 +2304,7 @@ def exciton_evs(zx, D, Hdir, B, nstate=4):
 # fixture-scale target is 1 GPU, minutes per Q.
 
 def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
-                  r_chunk: int = 2048):
+                  r_chunk: int = 2048, policy=None, keep_idx=None):
     """One-time refit state: htransform handles + full-r α-basis.
 
     Returns ``rst`` dict:
@@ -2228,9 +2325,33 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                                return_full_proj=True)
     nk, nb, rank = int(ctilde.shape[0]), int(ctilde.shape[1]), int(ctilde.shape[2])
     ns = int(B_at_mu.shape[1])
-    assert nk == zx["nk"] and nb == zx["nb"] and ns == zx["ns"], \
-        (f"htransform window (nk={nk}, nb={nb}, ns={ns}) != zeta-fit window "
-         f"(nk={zx['nk']}, nb={zx['nb']}, ns={zx['ns']})")
+    # DOWNFOLDED BUNDLE: the htransform leg fits in the PARENT ISDF basis (it
+    # is sized by nk·nb, not by mu_S — resolve_isdf_basis), so B_at_mu comes
+    # back at the parent's mu while every ζ object here is at the child's.
+    # Slice the mu axis to the kept rows, which is the same column slice that
+    # defines the bundle's own psi_full_y, and do it HERE so psi_rmu_Y is born
+    # at the child's width instead of being trimmed after the contraction.
+    if keep_idx is not None:
+        ki = np.asarray(keep_idx, dtype=int)
+        if int(B_at_mu.shape[2]) != int(zx["n_mu"]):
+            B_at_mu = B_at_mu[:, :, jnp.asarray(ki)]
+            log_fn(f"  [refit] downfold: B_at_mu mu axis sliced "
+                   f"{int(B_at_mu.shape[2])} <- parent basis, to the "
+                   f"{len(ki)} kept centroid rows")
+    assert nk == zx["nk"] and ns == zx["ns"], \
+        (f"htransform window (nk={nk}, ns={ns}) != zeta-fit window "
+         f"(nk={zx['nk']}, ns={zx['ns']})")
+    if nb != zx["nb"]:
+        raise SystemExit(
+            f"exciton_bands --vq-mode=refit: the htransform band window is "
+            f"nb={nb} (deck nval+ncond) but the bundle's stored psi_full_y "
+            f"carries nb={zx['nb']}.  The refit RE-FITS zeta at the target Q "
+            f"from the pair densities of that window, so it has to be the "
+            f"window the producer fitted in, not a narrower BSE one — a "
+            f"narrower window gives a different zeta and the on-grid null "
+            f"would (correctly) refuse it.  Set the deck's nval/ncond to the "
+            f"GW run's ({zx['nb']} bands total); --n-val/--n-cond still choose "
+            f"the BSE window inside it.")
     fg = tuple(int(x) for x in meta.fft_grid)
     assert fg == (zx["nx"], zx["ny"], zx["nz"]), \
         f"WFN FFT grid {fg} != zeta_q.h5 grid {(zx['nx'], zx['ny'], zx['nz'])}"
@@ -2270,7 +2391,86 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
             "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
             "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
-            "rank": rank}
+            "rank": rank,
+            "v_on_set": make_v_on_set(zx, policy, log_fn=log_fn)}
+
+
+def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
+                      q_list=None, tol=5e-2):
+    """THE gate: refit at a COARSE q must give back the STORED tile.
+
+    CERTIFY WHERE CONSUMED.  Every off-grid exchange tile this driver writes
+    comes out of :func:`refit_vq`, and the only place its answer can be
+    checked against something independent is a q where the producer already
+    wrote one down.  So before a single off-grid number is used, the same
+    call is made at on-grid q and compared to ``V_qmunu[q]``.
+
+    The floor is NOT machine precision and must not be set there: the refit
+    reaches the target q through the htransform Galerkin representation of ψ,
+    whose full-r residual ``refit_prepare`` prints, and the tile error is
+    bounded below by it.  ``tol`` is therefore a REGRESSION bracket on the
+    refit-vs-stored ratio, not an accuracy claim — the number that matters is
+    printed next to it, and a lane reading this should compare it against the
+    Galerkin residual, not against zero.  (The kernel itself is separately
+    exact: rebuilding the stored tiles from the STORED ζ with the same door
+    lands at 3.3e-14, so anything above that is the ψ representation, not the
+    Coulomb.)
+
+    Returns the list of (q_index, relative error).
+    """
+    kg = np.asarray(kgrid_vq, dtype=int)
+    if q_list is None:
+        # Γ plus the three coarse q furthest from it — the head-dominated
+        # slot and the zone-boundary ones, which fail differently.
+        idx = np.stack(np.meshgrid(*[np.arange(k) for k in kg],
+                                   indexing="ij"), axis=-1).reshape(-1, 3)
+        q_list = [tuple(int(v) for v in idx[0])]
+        far = np.argsort(-np.sum(np.minimum(idx, kg[None, :] - idx) ** 2,
+                                 axis=1))
+        for j in far[:3]:
+            q_list.append(tuple(int(v) for v in idx[j]))
+    from common.collectives import device_put_process_local
+    sh = NamedSharding(mesh_xy, P("x", "y"))
+    out = []
+    worst = 0.0
+    for (ix, iy, iz) in q_list:
+        qfr = np.array([ix, iy, iz], dtype=np.float64)
+        qfr = np.where(qfr > kg / 2.0, qfr - kg, qfr) / kg
+        # NORMS ON DEVICE.  ``V_stored`` is the loader's sharded (mu, nu, ...)
+        # tensor and on a multi-process run it is not fully addressable, so a
+        # host gather here would die on exactly the geometry this driver runs
+        # at.  jnp reductions over the (x, y) face give the same number and
+        # need no gather.
+        V_ref = jax.device_put(
+            V_stored[:, :, ix % kg[0], iy % kg[1], iz % kg[2]], sh)
+        n_mu = min(int(V_ref.shape[0]), int(zx["n_mu"]))
+        V_new = refit_vq(zx, rst, qfr, mesh_xy, log_fn=lambda *_: None)
+        pad = np.zeros(tuple(int(v) for v in V_ref.shape), dtype=np.complex128)
+        pad[:n_mu, :n_mu] = V_new[:n_mu, :n_mu]
+        V_new_d = device_put_process_local(pad, sh)
+        rel = float(jnp.linalg.norm(V_new_d - V_ref)
+                    / jnp.maximum(jnp.linalg.norm(V_ref), 1e-300))
+        out.append(((ix, iy, iz), rel))
+        worst = max(worst, rel)
+        log_fn(f"  [refit-null] q=({ix},{iy},{iz}) frac="
+               f"{np.array2string(qfr, precision=4)}: refit vs stored "
+               f"V_qmunu rel = {rel:.3e}")
+    log_fn(f"  [refit-null] worst {worst:.3e} over {len(out)} coarse q "
+           f"(bracket {tol:.1e}; the Galerkin full-r residual printed above "
+           f"is the physical floor, and the kernel's own on-grid null is "
+           f"3.3e-14 — so this number is the htransform representation)")
+    if not np.isfinite(worst) or worst > tol:
+        raise SystemExit(
+            f"exciton_bands: the per-Q exchange REFIT does not reproduce the "
+            f"stored V_qmunu at on-grid q (worst relative {worst:.3e} against "
+            f"the {tol:.1e} bracket).  Every off-grid tile this run would "
+            f"write comes from the same call, so nothing downstream of here "
+            f"is worth plotting.  Check the Coulomb-policy stamp "
+            f"(sys_dim / mc_average_vcoul_body / bare_coulomb_cutoff) against "
+            f"the run that wrote the bundle, and the Galerkin residual "
+            f"refit_prepare printed — a large residual there is an htransform "
+            f"window problem, not a kernel one.")
+    return out
 
 
 def _sphere_millers(zx, qw):
@@ -2418,7 +2618,10 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     fi = flat_idx(zx, GS)
     zt = np.asarray(jax.device_get(ztG_box[:, jnp.asarray(fi)]))
     zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qw))[:, None] * zt
-    v = v_slab_on_set(zx, qw, GS)
+    # The producer's kernel on a bulk deck, this module's slab one otherwise;
+    # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
+    v = rst.get("v_on_set", None)
+    v = v(qw, GS) if v is not None else v_slab_on_set(zx, qw, GS)
     A = zt * np.sqrt(v)[None, :]
     V = np.conj(A) @ A.T
     log_fn(f"  [refit] q_tile={np.array2string(qw, precision=4)}: "
