@@ -149,8 +149,12 @@ from common.zeta_projection import (
 __all__ = [
     "BandWindow",
     "SelectionReport",
+    "StarStability",
     "pair_density_gram",
     "select_cur_centroids",
+    "star_stability",
+    "orbit_complete_keep",
+    "child_unfold_tables",
     "slice_psi_to_centroids",
     "build_transfer",
     "congruence",
@@ -589,6 +593,205 @@ def select_cur_centroids(
         pool_report=pool_rep, kept_report=kept_rep,
         requested_auto=requested_auto)
     return keep_idx, rep
+
+
+# ---------------------------------------------------------------------------
+# D2b — THE COVARIANCE CONDITION: can the CHILD be stored on the q wedge?
+# ---------------------------------------------------------------------------
+#
+# THE ARGUMENT, ONCE, BECAUSE EVERYTHING BELOW IS ITS EXECUTABLE FORM.
+#
+# ``symmetry_maps.unfold_isdf_operator`` expands a wedge tensor as
+#
+#     A_full[q, μ', ν'] = exp(2πi q_irr · (L_{s,μ'} − L_{s,ν'}))
+#                         · A_ibz[i(q), α_s(μ'), α_s(ν')]
+#
+# with ``i = irr_idx[q]``, ``s = sym_idx[q]``.  Write that as a congruence by
+# the MONOMIAL matrix
+#
+#     U_s[μ', μ] = exp(2πi q_irr · L_{s,μ'}) · δ(μ, α_s(μ'))
+#
+# so that ``A_full[q] = U_s A_ibz[i] U_s†`` — a permutation with a unit-modulus
+# diagonal, hence unitary, and the unfold is exactly a change of basis.
+#
+# THE DOWNFOLD IS q-DIAGONAL.  ``T[q] = S_SS[q]⁻¹ S_cross[q]`` uses no other q,
+# and the congruence ``A_S[q] = T[q] A_L[q] T[q]†`` is per-q.  So a downfold
+# restricted to the wedge produces, at every wedge q, THE SAME MATRIX the
+# full-BZ downfold produces at that q.  Nothing about symmetry is needed for
+# that; it is the reason the wedge run is a restriction and not an
+# approximation, and it is what makes ζ-on-the-wedge transport (downfold_run)
+# a slice rather than an unfold.
+#
+# WHERE SYMMETRY *IS* NEEDED is the CHILD's own storage.  Reading the child
+# back applies the child's tables, ``A_S,full[q] = U^S_s A_S,ibz[i] U^S_s†``,
+# and that reproduces the full-BZ downfold iff
+#
+#     T[q] = U^S_s · T[i(q)] · (U^L_s)†                    (COVARIANCE)
+#
+# Both Grams inherit the parent's covariance (``S_LL,full[q] = U^L_s
+# S_LL,ibz[i] U^L_s†`` — it is a two-point object in the centroid basis at q,
+# the same class as V and W), and ``S_cross = S_LL[keep, :]``,
+# ``S_SS = S_LL[keep, keep]``.  Restricting rows to ``keep`` commutes with
+# ``U^L_s`` — which is the ONLY step that is not automatic — precisely when
+#
+#     α_s(keep) = keep  for every op s                     (ORBIT CLOSURE)
+#
+# because ``U^L_s`` sources row μ' from row α_s(μ'): if some α_s(μ') for
+# μ' ∈ keep lands outside keep, the small basis at q is a DIFFERENT subset of
+# the parent than the small basis at i(q), there is no ``U^S_s``, and the
+# child has no unfold tables to be read with.
+#
+# SO IT IS ONE CONDITION, ON ONE OBJECT: the kept centroid set must be
+# orbit-closed under the SAME permutation the parent's wedge storage already
+# rests on.  :func:`star_stability` measures it, :func:`orbit_complete_keep`
+# repairs it, :func:`child_unfold_tables` builds the ``U^S`` the repair makes
+# available.  MEASURED, 2026-08-10, and it does NOT hold as it stands: the
+# pivoted-Cholesky pivot order fills orbits greedily but stops at exactly
+# ``mu_S``, so a generic ``mu_S`` cuts through the orbit it is in the middle
+# of — on a synthetic 8-orbit × 6 group only 7 of 46 admissible ``mu_S``
+# came back closed.  A downfold is therefore NOT wedge-storable by default,
+# and this is the seam that says so instead of the child being written and
+# read back as a permutation of the wrong centroids.
+
+
+@dataclass(frozen=True)
+class StarStability:
+    """Is ``keep_idx`` orbit-closed — i.e. is the child wedge-storable?
+
+    ``closed`` is the verdict.  The rest is what a refusal or a report wants
+    and would otherwise recompute: which ops break it, how far outside the
+    kept set their images land, and how many centroids orbit completion
+    would have to add.  A bool cannot distinguish "one op, one stray
+    centroid" from "no orbit is complete", and those want different fixes.
+    """
+
+    closed: bool
+    n_sym: int
+    n_keep: int
+    #: op indices s with ``α_s(keep) ⊄ keep``, ascending.
+    violating_ops: tuple[int, ...]
+    #: parent centroid indices that orbit completion would add.
+    missing: np.ndarray
+    #: ``len(keep) + len(missing)`` — μ_S after completion.
+    n_keep_closed: int
+
+    def describe(self, indent="  ") -> str:
+        head = (f"{indent}[downfold/star] kept centroid set is "
+                f"{'ORBIT-CLOSED' if self.closed else 'NOT orbit-closed'} "
+                f"under {self.n_sym} ops ({self.n_keep} centroids)")
+        if self.closed:
+            return head + " — the child is wedge-storable."
+        return "\n".join([
+            head + f" — {len(self.violating_ops)}/{self.n_sym} ops send a "
+            f"kept centroid outside the kept set.",
+            f"{indent}[downfold/star] the child therefore has NO unfold "
+            f"tables: at a full-BZ q the small basis would be a different "
+            f"subset of the parent than at its wedge parent q, so a wedge "
+            f"child would read back as a permutation of the WRONG "
+            f"centroids — silently, because the shapes agree.",
+            f"{indent}[downfold/star] orbit completion would add "
+            f"{int(self.missing.size)} centroids (mu_S "
+            f"{self.n_keep} -> {self.n_keep_closed}); the CUR pivot order "
+            f"fills orbits greedily, so the cost is the tail of the one "
+            f"orbit mu_S stopped inside, not a factor of the group order.",
+        ])
+
+
+def star_stability(keep_idx, sym_perm) -> StarStability:
+    """MEASURE the covariance condition.  Never assume it.
+
+    ``sym_perm`` is the parent's ``(n_sym, n_rmu)`` centroid source map —
+    the same table its wedge tensors were stored against.  Rows beyond the
+    spatial half (the TRS-augmented ones) duplicate the first half and are
+    included as given, because the condition is about the SET of images and
+    a duplicate row cannot change it.
+
+    Cheap: a gather and a set comparison per op, on μ-sized integers.
+    """
+    keep = np.unique(np.asarray(keep_idx, dtype=np.int64))
+    perm = np.asarray(sym_perm, dtype=np.int64)
+    if perm.ndim != 2:
+        raise ValueError(
+            f"downfold.star_stability: sym_perm must be (n_sym, n_rmu); got "
+            f"shape {perm.shape}.")
+    if keep.size and int(keep.max()) >= int(perm.shape[1]):
+        raise ValueError(
+            f"downfold.star_stability: keep_idx reaches "
+            f"{int(keep.max())} but sym_perm describes only "
+            f"{int(perm.shape[1])} centroids.  The selection and the "
+            f"permutation are not about the same centroid table.")
+    kset = set(int(v) for v in keep)
+    bad, missing = [], set()
+    for s in range(int(perm.shape[0])):
+        img = set(int(v) for v in perm[s, keep])
+        if img != kset:
+            bad.append(s)
+            missing |= (img - kset)
+    miss = np.array(sorted(missing), dtype=np.int64)
+    return StarStability(
+        closed=not bad, n_sym=int(perm.shape[0]), n_keep=int(keep.size),
+        violating_ops=tuple(bad), missing=miss,
+        n_keep_closed=int(keep.size + miss.size))
+
+
+def orbit_complete_keep(keep_idx, sym_perm) -> np.ndarray:
+    """The smallest orbit-CLOSED superset of ``keep_idx``.
+
+    Repeated image-taking to a fixed point — the orbit closure of the kept
+    set under the group the rows of ``sym_perm`` generate.  Adding centroids
+    is the only admissible repair: DROPPING the offenders instead would
+    shrink the retained subspace below what the selection certified, which
+    is the one thing the rank refusal exists to prevent.
+
+    THIS CHANGES μ_S, and the caller must treat the returned length as the
+    authority rather than the number the user typed — the same
+    window-authority pattern as ``build_conduction_stacks``.  The increase
+    is bounded by the group order but is in practice the tail of a single
+    orbit, because the pivot order fills orbits greedily (measured; see the
+    block above).
+    """
+    perm = np.asarray(sym_perm, dtype=np.int64)
+    cur = set(int(v) for v in np.asarray(keep_idx, dtype=np.int64))
+    while True:
+        idx = np.fromiter(cur, dtype=np.int64, count=len(cur))
+        nxt = set(cur)
+        for s in range(int(perm.shape[0])):
+            nxt |= set(int(v) for v in perm[s, idx])
+        if nxt == cur:
+            return np.array(sorted(cur), dtype=np.int64)
+        cur = nxt
+
+
+def child_unfold_tables(keep_idx, sym_perm, L_table):
+    """The CHILD's ``(sym_perm, L_table)`` — ``U^S`` from ``U^L``.
+
+    ``child_perm[s, j] = position in keep of α_s(keep[j])`` and
+    ``child_L[s, j] = L_table[s, keep[j]]``, which is the statement
+    ``keep[α^S_s(j)] = α_s(keep[j])`` — the child's monomial is the parent's
+    restricted to the kept rows, with the SAME lattice wraps, so the phase
+    the child's unfold applies is the phase the parent's would have applied
+    to those centroids.  Deriving the wraps any other way would be a second
+    answer to a question the parent already answered.
+
+    REFUSES on a set that is not orbit-closed, by name, because that is the
+    condition under which ``position in keep`` has no value to return.
+    """
+    keep = np.unique(np.asarray(keep_idx, dtype=np.int64))
+    perm = np.asarray(sym_perm, dtype=np.int64)
+    L = np.asarray(L_table)
+    stab = star_stability(keep, perm)
+    if not stab.closed:
+        raise ValueError(
+            "downfold.child_unfold_tables: REFUSING — " + stab.describe(
+                indent="").replace("\n", "\n  "))
+    pos = np.full(int(perm.shape[1]), -1, dtype=np.int64)
+    pos[keep] = np.arange(keep.size, dtype=np.int64)
+    child_perm = pos[perm[:, keep]]
+    if int(child_perm.min()) < 0:                       # pragma: no cover
+        raise AssertionError(
+            "downfold.child_unfold_tables: an image escaped the kept set "
+            "after star_stability certified closure.")
+    return child_perm, L[:, keep]
 
 
 def slice_psi_to_centroids(psi_X, psi_Y, keep_idx, mu_small_pad, mesh_xy):

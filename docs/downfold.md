@@ -46,15 +46,27 @@ two descriptions of one interaction cannot drift apart, and the writer
 cross-checks its q = 0, G = 0 column against the independently transported
 `g0_S` on every run.
 
-!!! note "One case where ζ is not transported"
-    A parent whose ζ was written on the q-IBZ wedge cannot be transported: `T`
-    is indexed by the restart's flat-q axis and mapping the two is the deferred
-    IBZ-ζ unfold. The run says so and the small bundle carries no ζ. Nothing is
-    lost relative to the parent — `vq_interp` refuses an IBZ ζ outright, so
-    `--vq-mode interp` was never available on that lineage — and
-    `--vq-mode ongrid` needs no ζ at all and is exact at every Q on the BSE
-    grid. Re-fit the parent under `LORRAX_FORCE_FULL_BZ=1` if you want the
-    off-grid path.
+!!! note "A ζ stored on the q-IBZ wedge transports too"
+    Until 2026-08-10 the downfold refused to transport a ζ that its parent had
+    written on the q-IBZ wedge, on the grounds that the transfer `T` is indexed
+    by the restart's flat-q axis while a wedge ζ is indexed by the irreducible
+    list. That refusal was wider than the problem. The downfold is q-diagonal:
+    `T[q]` is built from `S_SS[q]` and `S_cross[q]` and from nothing else, so
+    the transfer at a wedge q is the same matrix whether the run around it
+    enumerated the wedge or the whole star. A wedge ζ therefore does not need
+    unfolding — it needs the row of `T` that belongs to its own q, and the
+    downfold already had a function that finds that row by matching q labels
+    exactly. The child's ζ comes out on the parent's own q set, so a wedge
+    parent now yields a wedge child that is exactly as capable as its parent,
+    where before it yielded a child with no ζ at all.
+
+    This does not make `--vq-mode interp` work on a wedge lineage. `vq_interp`
+    still requires `nq == nk` and reads a wedge ζ as the IBZ cascade being
+    active, which is a statement about that reader and not about the
+    transport; unfolding a ζ remains deferred work that has to route through
+    the one SymMaps sym-action. What has changed is only that the downfold no
+    longer takes away a capability its parent had. `--vq-mode ongrid` needs no
+    ζ at all and is exact at every Q that lands on the BSE grid.
 
 What the drop-in does **not** fix is how large μ_S has to be. Measured on the
 silicon deck below, the downfolded exciton bands at Q = 0 come out at 0.2579 eV
@@ -505,6 +517,41 @@ every q and the error bar at every q. A downfolded bundle is deliberately
 indistinguishable from a natively fitted one by shape — that is what makes it a
 drop-in — but it is not the same object, and a reader that wants to know can
 ask.
+
+## The child bundle is written on the full BZ, and why that is not laziness
+
+A restart bundle can be stored on the irreducible wedge and unfolded when it is
+read, and it would be natural to expect a downfold of such a bundle to produce
+another one. The obstacle is not the downfold, which is q-diagonal and happy to
+run on whatever q set it is handed. It is the centroid selection.
+
+Unfolding a tensor from the wedge is a congruence by a monomial matrix: a
+permutation of the centroid index, α, carrying one unit-modulus phase per
+centroid from the real-space lattice wrap. The downfold is also a congruence,
+by the transfer `T`. The two commute — so that downfolding the wedge and
+unfolding the child gives back what downfolding the whole star would have given
+— exactly when the kept centroid set is closed under α, because otherwise the
+small basis at a full-BZ q is a *different* subset of the parent than the small
+basis at its wedge parent, and no permutation of the child's own centroids can
+relate them. The child would then have no unfold tables at all, and a child
+written as though it did would read back as a permutation of the wrong
+centroids, silently, because every shape agrees.
+
+Whether the kept set is closed was measured rather than assumed, and it is not.
+Pivoted Cholesky selects against a q = 0 Gram that commutes with the whole
+group, so every member of an orbit looks identical to it and it fills orbits one
+at a time in index order — but it stops at exactly μ_S, which generally falls in
+the middle of an orbit. On the synthetic group the gates use, closure held only
+at the μ_S that land on orbit boundaries. The repair is small and is
+`gw.downfold.orbit_complete_keep`: round the selection up to whole orbits, which
+costs the tail of the single orbit μ_S stopped inside rather than anything
+proportional to the group order, and hand the resulting set to
+`child_unfold_tables` to get the child's α and wraps as restrictions of the
+parent's. That repair is implemented and gated; what has not yet been done is
+wiring it into the driver and writing the child through the q_irr writer, so
+today every child comes out on the full BZ. A downfold of a wedge parent is
+still correct — the reader unfolds the parent before the driver sees it — it is
+simply larger on disk than it could be.
 
 ## Where it does not apply
 
