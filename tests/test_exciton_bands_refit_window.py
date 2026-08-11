@@ -304,6 +304,98 @@ def test_the_gate_tolerance_has_no_cli_route():
         "an environment override for the certification tolerance appeared")
 
 
+def test_there_are_exactly_two_grades_and_both_are_module_constants():
+    """THE SHAPE OF THE CONCESSION, and the reason it is not a dial.
+
+    ``--cert-grade`` was added so a deliverable that is a PICTURE can be drawn
+    on a route whose own floor is ~0.9 meV.  What makes that a grade rather
+    than a relaxation is that the tolerance surface is closed: two names, two
+    module constants, and argparse ``choices`` refusing everything else.  A
+    third number reachable from anywhere — a float flag, an env var, a deck
+    key — turns the whole thing back into the knob the reference constant's
+    docstring refuses, so this cell checks the closure and not merely the
+    values.
+    """
+    eb = _driver()
+    assert eb.CERT_TOL_BY_GRADE == {"reference": 0.01, "visualization": 1.0}
+    assert eb.CERT_TOL_BY_GRADE["reference"] is eb.REFIT_CERT_TOL_MEV
+    assert (eb.CERT_TOL_BY_GRADE["visualization"]
+            is eb.CERT_TOL_VISUALIZATION_MEV)
+    act = {a.dest: a for a in eb.build_parser()._actions}["cert_grade"]
+    assert act.default == "reference", (
+        "the default grade moved off 'reference' — every existing invocation "
+        "would silently start certifying to 1 meV")
+    assert set(act.choices) == set(eb.CERT_TOL_BY_GRADE), (
+        "--cert-grade's choices and CERT_TOL_BY_GRADE disagree, so a grade "
+        "exists that has no constant or a constant that cannot be selected")
+    assert act.type is None, "--cert-grade takes a NAME, never a number"
+    src = open(SRC_DRIVER, encoding="utf8").read()
+    for bad in ("LORRAX_CERT_TOL", "LORRAX_CERT_GRADE", "cert_tol_mev="):
+        assert bad not in src, f"a third route to the tolerance appeared: {bad}"
+
+
+def _cert_args(dmax_mev, n_q=2):
+    """Synthetic dual-solve rows whose worst |ΔE_S| is ``dmax_mev``."""
+    Qpath = np.array([[0.0, 0.5, 0.5], [0.5, 0.5, 0.5]] * n_q)[:n_q]
+    ry = dmax_mev / (RY2EV * 1e3)
+    refit = [np.array([1.0, 2.0]) for _ in range(n_q)]
+    stored = [np.array([1.0, 2.0 - ry]) for _ in range(n_q)]
+    return list(range(n_q)), Qpath, refit, stored, np.array([4, 4, 4])
+
+
+@pytest.mark.parametrize("grade,tol", [("reference", 0.01),
+                                       ("visualization", 1.0)])
+def test_every_grade_still_refuses_above_its_own_line(grade, tol):
+    """A GRADE IS STILL A GATE.  The concession is the number, never the
+    refusal: the dual solve runs at both grades and raises at both.  Checked
+    on either side of each line so a grade cannot become a pass-through.
+    """
+    eb = _driver()
+    idx, Qp, refit, stored, kg = _cert_args(tol * 0.5)
+    rows, worst = eb._certify_refit_against_stored(
+        idx, Qp, refit, stored, kg, log=lambda *_: None, grade=grade)
+    assert len(rows) == len(idx)
+    assert worst == pytest.approx(tol * 0.5, rel=1e-6)
+
+    idx, Qp, refit, stored, kg = _cert_args(tol * 2.0)
+    with pytest.raises(SystemExit) as exc:
+        eb._certify_refit_against_stored(
+            idx, Qp, refit, stored, kg, log=lambda *_: None, grade=grade)
+    assert f"{tol:g} meV {grade} gate" in str(exc.value)
+
+
+def test_an_unknown_grade_is_refused_rather_than_defaulted():
+    """The one failure mode a dict lookup invites."""
+    eb = _driver()
+    idx, Qp, refit, stored, kg = _cert_args(0.0)
+    with pytest.raises(SystemExit, match="is not one of"):
+        eb._certify_refit_against_stored(
+            idx, Qp, refit, stored, kg, log=lambda *_: None, grade="loose")
+
+
+def test_a_visualization_pass_stamps_the_grade_and_the_number_together():
+    """WHAT KEEPS A PICTURE FROM BEING QUOTED AS A NUMBER.
+
+    The stamp is one string used by the provenance line, the ``.dat`` header
+    and the ``.png``; it must carry BOTH the words and the certified value,
+    and the driver must write it into all three.  Checked at the source level
+    for the three sinks, because a run that only logs it has stamped nothing
+    a reader of the figure can see.
+    """
+    eb = _driver()
+    stamp = eb.cert_grade_stamp("visualization", 0.85783)
+    assert "visualization grade" in stamp
+    assert "0.85783" in stamp and "1 meV" in stamp
+    assert "reference grade" in eb.cert_grade_stamp("reference", 0.001)
+
+    src = open(SRC_DRIVER, encoding="utf8").read()
+    assert src.count("cert_grade_stamp(args.cert_grade") >= 3, (
+        "the certification stamp does not reach all three sinks — it must be "
+        "written into the provenance line, the .dat header AND the plot, and "
+        "the plot is the one that ends up in a talk")
+    assert "fig.text(" in src, "the .png carries no stamp"
+
+
 def test_the_driver_refits_against_the_sliced_zeta_view():
     """THE SILENT ONE.  ``refit_vq`` contracts the band axes away, so handing
     it the unsliced bundle while ``rst`` carries the narrow window fits ζ' on

@@ -84,6 +84,12 @@ def twin(tmp_path_factory):
             f"'Fetching value for `jax.Array` that spans non-addressable "
             f"(non process local) devices'.  {len(dumps)} of "
             f"{mesh_launch.NPROC} rank dumps were written."))
+    # A GREEN RUN LEAVES THE SAME EVIDENCE A RED ONE DOES.  What this twin
+    # measured — the launch mode and the layout each parity actually got — is
+    # the part a report has to quote, and it is not recoverable from "6
+    # passed".  Printed once, from the fixture, so it survives -q.
+    print(f"\n[refit-shard twin] mode={res.mode} ({why}), wall {res.wall_s:.1f}s"
+          f"\n[refit-shard twin] rank0 = {json.dumps(dumps[0]) if dumps else '<none>'}")
     return res, dumps
 
 
