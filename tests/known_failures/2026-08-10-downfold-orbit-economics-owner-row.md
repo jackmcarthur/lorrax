@@ -426,8 +426,31 @@ is now in the gate and its result is reported below: the PARENT's own tensor was
 stored on this wedge with these tables and unfolded by the reader before the
 driver saw it, so slicing it back and unfolding it MUST return it, and both arms
 run the same `_unfold_roundtrip_rel` so they cannot differ by a line of
-plumbing.  **Until that control is read, no claim about the child's covariance
-is made here.**
+plumbing.  **The control has now been read and it is the strongest possible pass:**
+
+```
+  [downfold/star]   CONTROL, the PARENT's own tensor through the SAME route
+      (it was stored on this wedge with these tables, so it MUST return): max rel 0.000e+00
+  [downfold/star] VERDICT: REFUTED (worst 1.241e+00 against tol 1e-09).
+```
+
+Bit-exact zero, not the reassociation floor — because on the control arm the two
+routes really are the same arithmetic on the same bytes.  So the wedge-slot
+derivation, the table restriction and the unfold call are all exonerated, and
+**the child's order-one disagreement is a real covariance failure of the child,
+not a defect in the instrument that found it.**
+
+**The mechanism remains unidentified, and this lane says so rather than
+choosing a story.**  What is excluded: the harness (control, 0.000e+00) and any
+truncation that moves within a star (`star_rank_constancy`, constant on every
+star).  What is NOT excluded, and is the strongest remaining candidate: the
+covariance of the pair-density Gram itself.  Equal ranks across a star are
+NECESSARY for a covariant `S_SS` and nowhere near sufficient — `S_SS[q]` and
+`U S_SS[i] U†` can share a spectrum without being equal — so the constancy
+result clears the rank SHADOW of covariance and leaves covariance open.  The
+decisive next measurement is one gather and one unfold, and it is named in the
+driver's own log: compare `S_LL[q]` against `U S_LL[i(q)] U†` directly.  **This
+lane did not run it.**
 
 Two consequences for whoever picks this up:
 
