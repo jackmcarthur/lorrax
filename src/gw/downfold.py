@@ -770,13 +770,33 @@ def select_cur_centroids(
 # orbit-closed under the SAME permutation the parent's wedge storage already
 # rests on.  :func:`star_stability` measures it, :func:`orbit_complete_keep`
 # repairs it, :func:`child_unfold_tables` builds the ``U^S`` the repair makes
-# available.  MEASURED, 2026-08-10, and it does NOT hold as it stands: the
-# pivoted-Cholesky pivot order fills orbits greedily but stops at exactly
-# ``mu_S``, so a generic ``mu_S`` cuts through the orbit it is in the middle
-# of — on a synthetic 8-orbit × 6 group only 7 of 46 admissible ``mu_S``
-# came back closed.  A downfold is therefore NOT wedge-storable by default,
-# and this is the seam that says so instead of the child being written and
-# read back as a permutation of the wrong centroids.
+# available.  MEASURED, 2026-08-10, and it does NOT hold as it stands: a
+# generic ``mu_S`` cuts through an orbit, so a downfold is NOT wedge-storable
+# by default, and this is the seam that says so instead of the child being
+# written and read back as a permutation of the wrong centroids.
+#
+# HOW BADLY IT FAILS WAS ALSO MEASURED, AND THE FIRST ANSWER WAS WRONG.  This
+# block used to add that "the pivoted-Cholesky pivot order fills orbits
+# greedily but stops at exactly ``mu_S``", inferred from a synthetic 8-orbit ×
+# 6 group where 7 of 46 admissible ``mu_S`` came back closed (≈15 %).  That
+# consolation is REFUTED on a production centroid set — ``si_bse_debug``,
+# μ_L = 480, 96 ops (48 spatial + TRS), ``downfold_rcond = 1.1e-6``, ceiling
+# 185, every admissible ``mu_S`` closure-tested against the parent's own
+# stored ``sym_perm`` with the shipping pivot order:
+#
+#     real-deck orbit-closure rate = 0 of 185 = 0.0000
+#
+# Not one.  At the production selection ``mu_small = auto → μ_S = 185``, 94 of
+# the 96 ops violate and completion adds 295 centroids — μ_S 185 → 480, THE
+# ENTIRE PARENT BASIS, which is the same thing as not downfolding at all.
+# Over the open ``mu_S`` the inflation runs min 35, median 323, max 387.  The
+# 480-point set is 11 orbits (two of 24, nine of 48), so the only closed sizes
+# under the ceiling are the seven multiples of 24 and the pivot order lands on
+# none of them.  The synthetic held only because q = 0 gives every member of
+# an orbit the same Schur diagonal and the tie-break was index order; on a
+# real Gram the tie-break interleaves the orbits instead, and by μ_S = 185 the
+# kept set already touches all eleven.  Numbers and evidence paths:
+# ``tests/known_failures/2026-08-10-downfold-qirr-star-stability.md``.
 
 
 @dataclass(frozen=True)
@@ -816,9 +836,19 @@ class StarStability:
             f"centroids — silently, because the shapes agree.",
             f"{indent}[downfold/star] orbit completion would add "
             f"{int(self.missing.size)} centroids (mu_S "
-            f"{self.n_keep} -> {self.n_keep_closed}); the CUR pivot order "
-            f"fills orbits greedily, so the cost is the tail of the one "
-            f"orbit mu_S stopped inside, not a factor of the group order.",
+            f"{self.n_keep} -> {self.n_keep_closed}).  READ THAT NUMBER; do "
+            f"not assume it is small.  This line used to promise the cost "
+            f"was 'the tail of the one orbit mu_S stopped inside, not a "
+            f"factor of the group order' — that was inferred from a "
+            f"synthetic (7 of 46 mu_S closed) and is REFUTED on a "
+            f"production centroid set: si_bse_debug, mu_L=480, 96 ops, "
+            f"ceiling 185, 2026-08-10 — 0 of 185 admissible mu_S closed, "
+            f"94/96 ops violating at mu_S=185, and completion there took "
+            f"mu_S 185 -> 480, the ENTIRE parent basis.  The synthetic held "
+            f"only because q=0 gives an orbit one Schur diagonal and the "
+            f"tie-break was index order; on a real Gram the pivot order "
+            f"interleaves the orbits.  See tests/known_failures/"
+            f"2026-08-10-downfold-qirr-star-stability.md.",
         ])
 
 
@@ -870,10 +900,15 @@ def orbit_complete_keep(keep_idx, sym_perm) -> np.ndarray:
 
     THIS CHANGES μ_S, and the caller must treat the returned length as the
     authority rather than the number the user typed — the same
-    window-authority pattern as ``build_conduction_stacks``.  The increase
-    is bounded by the group order but is in practice the tail of a single
-    orbit, because the pivot order fills orbits greedily (measured; see the
-    block above).
+    window-authority pattern as ``build_conduction_stacks``.  THE INCREASE IS
+    NOT IN PRACTICE SMALL: this docstring used to say it was "the tail of a
+    single orbit, because the pivot order fills orbits greedily", and that
+    was measured false on ``si_bse_debug`` — completion there takes μ_S from
+    185 to 480, the whole parent basis (see the block above).  The only bound
+    that survives is the trivial one, μ_L, so a caller that wires this in
+    must re-take the rank certificate and the ``auto`` ceiling on the
+    completed set rather than assuming the selection it started from is
+    still the operative one.
     """
     perm = np.asarray(sym_perm, dtype=np.int64)
     cur = set(int(v) for v in np.asarray(keep_idx, dtype=np.int64))
