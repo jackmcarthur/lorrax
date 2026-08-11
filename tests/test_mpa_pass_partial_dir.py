@@ -250,6 +250,68 @@ def test_a_half_resumed_walk_is_the_same_number_as_a_whole_one(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+#  The resume decision at more than one rank.  The symptom of getting this
+#  wrong is a HANG, so it is the one branch that gets a red twin standing
+#  in for four processes.
+# ---------------------------------------------------------------------------
+
+def test_at_one_process_the_resume_is_just_the_file_being_there(tmp_path):
+    p = sigma_pass.pole_partial_path(tmp_path, 0)
+    assert sigma_pass.agree_on_resume(p, pole=0) is False
+    _write(p, _cube(31), 0)
+    assert sigma_pass.agree_on_resume(p, pole=0) is True
+
+
+def _four_ranks(monkeypatch, votes):
+    """``process_count() == 4`` with a chosen allgather outcome.
+
+    Verbatim ``process_allgather(tiled=False)`` semantics on a fully
+    addressable operand: the per-rank value comes back stacked on a new
+    leading axis of length four.  pytest is ONE process, so the axis has
+    to be installed rather than allocated -- the same technique
+    ``tests/test_mpa_pass_p4.py`` uses for C1's red twin, and for the same
+    reason: no in-suite cell can produce a process axis natively.
+    """
+    import jax
+    from gw import ppm_windows as PW
+
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        PW, "_to_host_np",
+        lambda a, dtype=np.complex128, *, tiled=False:
+            np.asarray(votes, dtype=dtype).reshape(4, 1))
+
+
+def test_four_ranks_that_all_see_the_checkpoint_all_skip(monkeypatch,
+                                                         tmp_path):
+    _four_ranks(monkeypatch, [1, 1, 1, 1])
+    assert sigma_pass.agree_on_resume(
+        sigma_pass.pole_partial_path(tmp_path, 2), pole=2) is True
+
+
+def test_four_ranks_that_all_miss_the_checkpoint_all_integrate(monkeypatch,
+                                                               tmp_path):
+    _four_ranks(monkeypatch, [0, 0, 0, 0])
+    assert sigma_pass.agree_on_resume(
+        sigma_pass.pole_partial_path(tmp_path, 2), pole=2) is False
+
+
+def test_red_twin_ranks_that_disagree_refuse_instead_of_deadlocking(
+        monkeypatch, tmp_path):
+    """THE ONE THAT HAS NO ERROR MESSAGE IF IT IS NOT CAUGHT HERE.
+
+    Two ranks folding pole 2 from disk and two integrating it do not
+    return different numbers -- they meet in the next tau dispatch's
+    collective and stop, with no traceback, which on a batch queue is
+    indistinguishable from a slow leg.
+    """
+    _four_ranks(monkeypatch, [1, 1, 0, 1])
+    with pytest.raises(RuntimeError, match="do not agree"):
+        sigma_pass.agree_on_resume(
+            sigma_pass.pole_partial_path(tmp_path, 2), pole=2)
+
+
+# ---------------------------------------------------------------------------
 #  The refusals, asked before the store is opened.
 # ---------------------------------------------------------------------------
 

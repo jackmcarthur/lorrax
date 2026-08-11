@@ -179,6 +179,7 @@ __all__ = [
     "combine_pass_partials",
     "compute_mpa_sigma_c_omega_grid",
     "flat_index_dtype",
+    "agree_on_resume",
     "format_pass_report",
     "gather_pass_tiles",
     "narrow_pole_threshold_ry",
@@ -1940,6 +1941,47 @@ def read_pole_partial(path, *, pole, n_p, omega_grid_ry, fit_src):
     return cube, rec
 
 
+def agree_on_resume(part_path, *, pole, print_fn=print):
+    """Does THIS POLE already have a checkpoint — asked of every rank at once.
+
+    THE FAILURE THIS PREVENTS IS A HANG, NOT A WRONG NUMBER.  The body of
+    the pass loop is full of collectives: every τ dispatch, every gather.
+    A run in which rank 0 folds pole 3 from disk and rank 2 integrates it
+    does not disagree about an answer — it deadlocks in the first
+    dispatch after the split, with no traceback, and on a batch queue
+    that is indistinguishable from a slow leg.  So the branch is decided
+    ONCE, by asking every rank and requiring unanimity.
+
+    In ordinary operation they always agree: the partials live on the
+    shared filesystem and the file a rank is looking for was written
+    minutes ago by a previous run, or by rank 0 of this one at a pole
+    this loop never revisits.  The check is here for the cases that are
+    not ordinary — a stale metadata cache, a directory that turns out to
+    be node-local — because those are exactly the ones whose symptom is
+    the hang.
+    """
+    import jax
+
+    here = bool(os.path.exists(str(part_path)))
+    if int(jax.process_count()) == 1:
+        return here
+
+    from ..ppm_windows import _to_host_np
+
+    votes = np.asarray(_to_host_np(
+        np.asarray([1 if here else 0], dtype=np.int32),
+        dtype=np.int32, tiled=False)).reshape(-1)
+    if votes.size and 0 < int(votes.sum()) < int(votes.size):
+        raise RuntimeError(
+            f"MPA Σ resume: the ranks do not agree on whether pole "
+            f"{int(pole)} is already checkpointed at {part_path} — votes "
+            f"{votes.tolist()}.  Half of them would fold it from disk and "
+            f"half would integrate it, and the two halves then meet in a "
+            f"collective that never completes.  The partial directory must "
+            f"be on a filesystem every rank sees.")
+    return bool(votes.size and int(votes.sum()) == int(votes.size))
+
+
 def gather_pass_tiles(tile_acc, tile_meta, n_omega):
     """The per-device Σ tiles placed back into ONE padded host cube.
 
@@ -2312,6 +2354,13 @@ def compute_mpa_sigma_c_omega_grid(
     whose partial is already on disk is not read, not planned and not
     integrated: it is folded from the file, which is the resume.
 
+    AT MORE THAN ONE RANK the checkpoint is written by rank 0 alone --
+    the gather leaves the identical cube on every rank, so four writers
+    would interleave four copies of the same payload through one file's
+    format metadata -- and the resume decision is taken COLLECTIVELY
+    (:func:`agree_on_resume`), because ranks that disagree about
+    skipping a pole meet in a collective that never returns.
+
     THE MEMORY MODEL CHANGES, AND NOT IN THE DIRECTION "UNCHANGED".  The
     pole axis stays streamed — ``read_pole_slice`` still brings in one
     pole's ``(B_p, Omega_p)`` and the full ``(n_p, n_mu, n_mu)`` B tensor
@@ -2327,6 +2376,7 @@ def compute_mpa_sigma_c_omega_grid(
     """
     import time
 
+    import jax
     import jax.numpy as jnp
 
     from common import timing
@@ -2471,7 +2521,7 @@ def compute_mpa_sigma_c_omega_grid(
         pole_acc = None
         if part_dir is not None:
             part_path = pole_partial_path(part_dir, p)
-            if os.path.exists(part_path):
+            if agree_on_resume(part_path, pole=p, print_fn=print_fn):
                 # THE RESUME, AND IT IS A SKIP RATHER THAN A SHORTCUT.
                 # Nothing about this pole is read, planned or integrated:
                 # its whole contribution to the sum is the cube on disk,
@@ -2796,11 +2846,21 @@ def compute_mpa_sigma_c_omega_grid(
                     gather_pass_tiles(pole_acc, tile_meta, n_omega),
                     tile_meta.nb_real)
             pole_acc = None
-            write_pass_partial(
-                pole_partial_path(part_dir, p), pole_cube, [rec],
-                n_p=n_p, poles=[int(p)], omega_grid_ry=omega_req,
-                fit_src=fit_src, leg_id=(str(leg_id) if leg_id else None),
-                print_fn=print_fn)
+            # ONE WRITER.  ``gather_pass_tiles`` leaves the SAME cube on
+            # every rank -- ``process_allgather`` is a gather, not a
+            # scatter -- so at four ranks all four hold identical bytes
+            # and all four would open one path for writing.  Four h5py
+            # writers on one file is undefined at the library level even
+            # when the payload is identical, because it is the FORMAT
+            # metadata that interleaves; rank 0 writes and the others
+            # carry on, since what they need from the checkpoint (the
+            # cube) they already have in hand.
+            if int(jax.process_index()) == 0:
+                write_pass_partial(
+                    pole_partial_path(part_dir, p), pole_cube, [rec],
+                    n_p=n_p, poles=[int(p)], omega_grid_ry=omega_req,
+                    fit_src=fit_src, leg_id=(str(leg_id) if leg_id else None),
+                    print_fn=print_fn)
             if sigma_total is None:
                 sigma_total = np.zeros_like(pole_cube)
             sigma_total = sigma_total + pole_cube      # THE PINNED ORDER
