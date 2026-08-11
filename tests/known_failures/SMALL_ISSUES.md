@@ -568,3 +568,28 @@ silent overwrite.
   the log-and-proceed hazard in
   `tests/known_failures/2026-08-10-unknown-deck-key-refusal-spec.md`: the
   warning was printed and the run proceeded on the wrong branch.
+
+## `dipole.h5` provenance sanity check reads the RUN's band window as 5/5/128 (2026-08-10)
+
+Every Si 6×6×6 GW run prints, twice:
+
+    *** LORRAX SANITY FAILURE: .../dipole.h5 was generated from a DIFFERENT
+    DFT solution or band window than this run (prov_nval: file=8 run=5;
+    prov_ncond: file=52 run=5; prov_nband: file=60 run=128). ***
+
+The **file** side is right — 8/52/60 is exactly the deck the `dipole.h5` was
+generated from, minutes earlier, by `psp.get_dipole_mtxels -i <that same
+deck>`. The **run** side is wrong: 5/5/128 are the `nval`/`ncond`/`nband`
+defaults, so the comparison is against unresolved defaults rather than
+against the run's actual window. The check therefore fires on a *correctly
+matched* dipole file and would presumably stay silent on some genuinely
+mismatched ones, which is the worse half.
+
+Reproduced on three separate runs and on both windows: the original
+reference (`si666_ref_0810/gw_666.log`), and both arms of the band-window
+A/B (`bandwin666_0810/_logs/gw_{C,F}_*.log`, `nband` 60 and 68 — the file
+side tracks the deck, the run side stays 5/5/128 in all of them). It
+predates `fix/band-window-degeneracy-closure-2026-08-11` and is not caused
+by it; it fires identically in both arms of that A/B, so it does not affect
+the comparison. Not investigated further — noted so the next lane does not
+spend a leg on a false positive, or trust a true negative.
