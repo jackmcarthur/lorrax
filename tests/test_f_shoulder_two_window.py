@@ -427,6 +427,27 @@ def test_bse_densify_warns_when_b_max_equals_the_window():
 #  7. the driver's knob and its stamp
 # ---------------------------------------------------------------------------
 
+def test_contracted_cert_runs_under_the_zeta_window_too():
+    """The tile null bounds a TILE at 5.0e-02 RELATIVE; the curve is published
+    in meV.  Those are different claims, so under ``--refit-window=zeta`` the
+    contracted eigenvalue certification now runs ALONGSIDE the tile null
+    rather than only under ``bse``.
+
+    Strictly additive: it relaxes nothing, it reuses the path's own caches and
+    scan, and the empty-population case stays a REFUSAL only for ``bse``,
+    where it is the sole gate — under ``zeta`` the tile null has already run
+    and a missing stamp is announced instead of raised.
+    """
+    src = (REPO_ROOT / "src" / "bse" / "exciton_bands.py").read_text("utf8")
+    assert 'if not cert_idx and args.refit_window == "bse":' in src, (
+        "the empty-population refusal must be bse-only")
+    assert "window_mode=args.refit_window" in src, (
+        "the cert must know which gate it is on this run")
+    # and the twin rows are built off cert_idx regardless of window, which is
+    # the line that actually makes it run.
+    assert "for iQ in cert_idx:" in src
+
+
 def test_exciton_bands_exposes_and_threads_the_guard_count():
     src = (REPO_ROOT / "src" / "bse" / "exciton_bands.py").read_text("utf8")
     assert '"--refit-guard-bands"' in src
