@@ -73,8 +73,8 @@ def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
     ``file_io.tagged_arrays``.  ABSENT MEANS READY — a file written before
     the attr existed carries nothing here and loads byte-for-byte as it
     always did, so only a file that positively claims "not persisted" is
-    refused.  That is the one state a full-size zero placeholder cannot be
-    distinguished from good data by looking at the numbers.
+    refused.  That claim is the only way to catch the one state the numbers
+    cannot betray: a full-size zero placeholder passes every shape check.
     """
     if dset.attrs.get("V_ready", True):
         return
