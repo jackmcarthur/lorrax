@@ -76,8 +76,77 @@
 > about what consumes its retained span, to be reported rather than flagged
 > away.
 >
+> ### Evidence for the correction (2026-08-11)
+>
+> **The twins are re-asserted in the flipped direction, and they discriminate.**
+> With `DEFAULT_DIRECTION` set back to `keep_block`, **17 cells go red** across
+> both faces, all three modes and the κ argument — so these gates fail a
+> deliberately keep-more result rather than merely passing a drop one. The
+> criterion cell asserts `n_keep_closed == 20` AND `!= 24` by name.
+>
+> **CPU, WSL, worktree pin proven by `__file__` before measuring:**
+> `test_spectral_closure.py` **55 passed, 0 skipped**;
+> `test_rank_criterion.py` 17 (4 new). Eleven neighbouring suites:
+> **235 passed, 18 skipped**, against base `d8c7a24e` **244 passed, 18
+> skipped** on the same box — the −9 is the reverted `distrib_la` consistency
+> cells, and the 3 red in `test_htransform_kpath_gates.py` are **identical on
+> both sides** (the FFI `.so` is absent on this box, pre-existing).
+> `distrib_la`'s own suite at the reverted state: **108 passed, 62 skipped**
+> with the **same 6** pre-existing CUDA-library failures base has.
+>
+> **THE armF CONTROL, P=4 on a real 2×2 device mesh, and it is the point of
+> the whole leg.** armF's cut falls in a gap (relative gap 0.315 against rtol
+> 1e-6), so the flip must be **INERT** there:
+>
+>     ζ rank-cut closure: ARMED (mode=strict, rtol=1.0e-06) and SILENT
+>     — no cut fell inside a degenerate block of C_q on any q.
+>
+> **Exit 0 in 129 s under `strict`**, and the retained ranks over the 16 wedge
+> q come back **1 × 1095 and 15 × 1098 of 1104 — the set {1095, 1098},
+> bit-identical to what this file records for the same deck before the guard
+> existed and before the direction moved.** A live truncation firing on every
+> q, guard armed, silent, and unmoved: the flip changes nothing where no block
+> straddles. Run's own lines confirm the shape (`device mesh is 2x2 over axes
+> ('x','y')`, compile-cache ARMED at 4 processes), the deck (`nval = 8
+> ncond = 60 nband = 68`, `zeta_rcond = 1e-10`, deck md5 `d9f367a6…`) and the
+> tree (`HEAD 4ecbc7d2`, **dirty-count 0**, printed from inside the leg).
+>
+> **κ_eff, restated for the drop direction on the identical construction the
+> old note used** (planted block, `rel = rtol/4`, cut at 41 of 128):
+>
+> | block m | keep-snap κ ratio | drop-snap κ ratio | rank keep | rank drop |
+> |---|---|---|---|---|
+> | 2 | 1.000000250 | 0.804473828 | 41→42 | 41→40 |
+> | 4 | 1.000000750 | 0.804474230 | 41→44 | 41→40 |
+> | 8 | 1.000001750 | 0.804475034 | 41→48 | 41→40 |
+> | 48 | 1.000011750 | 0.804483079 | 41→88 | 41→40 |
+>
+> The old note's "<1e-4" is reproduced exactly in column 2. Column 3 is a
+> **different kind of number**: ~0.804 at every block size, i.e. a **19.6 %
+> IMPROVEMENT** in κ_eff, essentially independent of m — because the drop
+> moves `λ_min(kept)` across a real gap (one smooth spectral step) instead of
+> sliding it within an rtol-scale cluster. On the `rank_report` probe the same
+> effect reads κ 6.449e3 → 4.160e3 against a cap of 6.449e3.
+>
+> **A P=4 SHAPE TRAP, caught mid-leg and worth the row.** The first suites arm
+> ran `lx run -G 4 -n 4`, which places **four independent single-GPU pytest
+> sessions** — it printed four identical `229 passed, 8 skipped` lines and
+> would have been reported as a P=4 pass. The correct shape is `-G 4 -n 1`
+> (one process, four devices), and at it the same suites report **236 passed,
+> 1 skipped** — **seven cells that SKIPPED under the fake shape actually ran**,
+> which is exactly the mesh-dependent half. The leg now refuses outright
+> unless an in-leg probe prints `MESH_SHAPE devices=4 local=4` first.
+>
+> **Evidence:** `/pscratch/sd/j/jackm/spectral_drop_0811/` — `wt/` (worktree at
+> `4ecbc7d2`), `arm1.sh` / `arm2.sh`, `_logs/mesh_probe.log`,
+> `_logs/suites_p4_n1.log`, `_logs/armF_run2.log`, and `armF_run2/`.
+> Environment: `LX_BASE_MODULE=lorrax_J070`, the `merge_ckpt_2026-08-08` `.so`
+> pair, `JAX_ENABLE_X64=1`, BFC@0.85 — the same environment armF was
+> originally measured under. `bandwin666_0810/armF` was read READ-ONLY through
+> symlinks.
+>
 > Read the rest for the mechanism, the tolerance derivation, the site sweep and
-> the armF evidence — all of which stand. Only the direction moved.
+> the original armF evidence — all of which stand. Only the direction moved.
 
 # AMENDMENT — SPECTRAL CUTS NOW HAVE THE CLOSURE GUARD BAND WINDOWS HAVE HAD SINCE 53fd80ea (2026-08-10)
 
