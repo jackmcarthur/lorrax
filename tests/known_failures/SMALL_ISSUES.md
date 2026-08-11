@@ -594,6 +594,48 @@ silent overwrite.
     [qsign re-measurement lane, 2026-08-11; corrected by the refit-sharding
     lane, 2026-08-11]
 
+42. **The 2-D slab Coulomb kernel exists twice, and unifying it is NOT
+    free.** `bse.vq_interp.v_slab_on_set(kind="slab")` and
+    `vcoul.Slab2D._v_bare_per_q` compute the same Ismail-Beigi truncation
+    from the same inputs, but in different arithmetic order — the service
+    spells it `(8π/K²)·f2d * fact` with `fact = 1/Ω` and is bit-compared
+    against BerkeleyGW's pre-port table, while `vq_interp` spells it
+    `8π/K² · f2d / celvol`. Those differ in the last ulp, and the caller's
+    own on-grid gate (`makeVq_vs_disk`, 5e-6) sits above a path whose bulk
+    sibling lands at 3.3e-14, so swapping one for the other is a numerics
+    change, not a refactor. `vq_interp` additionally needs `slab_sr` /
+    `slab_lr` (the Gaussian SR/LR split the b26p long-range model is built
+    on), which the service has no equivalent for **on an explicit Miller
+    set** — `vcoul.minibz._minibz_kernel_bare` carries those kinds but takes
+    a Cartesian shift plus δq draws, not a `(3, nG)` Miller table. So the
+    honest unification is a new service entry point (`v` on an explicit
+    Miller set, all four kinds, one arithmetic order) plus a re-pin of both
+    callers' references — an owner-scoped change to a bit-pinned surface,
+    not a cleanup lane's. Noted here so the next lane does not either
+    re-derive the finding or make the swap silently. The verdict is also
+    written into `v_slab_on_set`'s own docstring, where a lane reaching for
+    it will meet it. The refit's BULK kernel already goes through the door
+    (`vq_interp.make_v_on_set` -> `gw.compute_vcoul.compute_v_q_per_G`), so
+    this is the only Coulomb arithmetic left local to `src/bse/`.
+    [xbands cleanup lane, 2026-08-11]
+
+43. **`bse_densify` reads the deck twice, two ways, and only one of them
+    can be reused.** `_read_lorrax_input_quietly` and `_resolve_bse_k_grid`
+    both wrap `gw.gw_config.read_lorrax_input` in the same
+    "a config read must never crash a load" try/except, and the second's
+    docstring even says so ("Same tolerance as `_resolve_bse_k_grid`'s own
+    read"). They are NOT interchangeable: `_resolve_bse_k_grid` keeps
+    `_parse_grid_spec` INSIDE its `try`, so a malformed three-integer
+    `bse_k_grid` value returns `None` (feature off) rather than raising,
+    and the two print different messages. Collapsing them is therefore a
+    behaviour change on a deck-error path — small, but a real one — and it
+    was left alone by a lane whose mandate was behaviour-preserving. Whoever
+    takes it should decide first whether a malformed `bse_k_grid` ought to
+    REFUSE (which is what `2026-08-10-unknown-deck-key-refusal-spec.md`
+    argues for every deck key) rather than fall back to defaults; the dedupe
+    then follows from that ruling instead of preserving an accident.
+    [xbands cleanup lane, 2026-08-11]
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module
