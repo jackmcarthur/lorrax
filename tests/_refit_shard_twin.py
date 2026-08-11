@@ -112,6 +112,15 @@ def _synthetic(n_mu):
     }
     rst = {
         "rank": _RANK, "r_chunk": _R_CHUNK, "n_rp": n_rp, "n_rtot": n_rtot,
+        # The producer's ζ solve, which ``refit_prepare`` reads off the ζ
+        # file's fit_provenance and ``refit_vq`` refuses without.  There is no
+        # ζ file here (the inputs are synthetic), so the production DEFAULTS
+        # are stated: rank_truncate at ZETA_RCOND_DEFAULT, no ridge.  The
+        # twin is about the cross-process transport of ζ'(G), and the solve
+        # is upstream of it — but it has to be A solve, and it has to be the
+        # one production takes, or the transport is measured on a program
+        # nothing runs.
+        "zeta_solve": ("rank_truncate", 1e-8, 0.0),
         "psi_r": cx(nk * _NB, _NS * n_rp),
         "B_full": cx(_RANK, _NS * n_rp),
         # v(q+G) on the fit sphere: positive, q-dependent, and NOT the
