@@ -548,3 +548,23 @@ silent overwrite.
 
 - Row 15 (exciton_bands un-persistable host callback) — fixed at
   `824032b7`, 2026-08-09, persistent-cache gate green.
+
+- **`w_head_densify` is documented as a deck key and is not one** (found
+  2026-08-10, measurement lane, densified-downfold experiment). Three places
+  say it is a deck key — `bse_densify`'s module docstring,
+  `resolve_w_head_densify`'s own docstring ("*else the deck's
+  `w_head_densify` key*"), and
+  `tests/known_failures/2026-08-10-w-densifier-head-interpolation.md`
+  ("`w_head_densify = legacy` (deck key, or `--w-head-densify` on
+  `exciton_bands`)"). It is absent from `gw_config`'s recognized-key set, so
+  `read_lorrax_input` prints *"unrecognized deck key … ignored"* and drops
+  it, and `resolve_w_head_densify(None, params)` then resolves to `c1`.
+  Measured: a deck containing `w_head_densify = legacy` resolves to `c1`.
+  **Consequence: the C1 branch's own A/B control arm cannot be selected from
+  a deck at all** — only from the `exciton_bands` CLI flag, which does not
+  reach `bse.bse_jax`'s `bse_k_grid` path. A lane that sets the key in a deck
+  and reports a "legacy arm" has measured the C1 arm twice. Fix is one schema
+  row (plus `w_head_gamma_cell`, same gap). This is also a live instance of
+  the log-and-proceed hazard in
+  `tests/known_failures/2026-08-10-unknown-deck-key-refusal-spec.md`: the
+  warning was printed and the run proceeded on the wrong branch.
