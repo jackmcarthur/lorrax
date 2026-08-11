@@ -1,10 +1,7 @@
 """Compatibility facade for the BSE restart I/O, split 2026-08-10.
 
-This module used to be all of it — loading, band-window authority, q=0 head
-injection, coarse-to-fine densification and restart policy in one file that had
-reached 2917 lines — and five separate lanes collided in it inside two days.
-The code now lives in four modules, each with one responsibility and one
-authority rule stated in its own docstring:
+The code lives in four modules, each with one responsibility and one authority
+rule stated in its own docstring:
 
 ``bse_window``
     Which bands are in the window, and how its axes are padded.  The
@@ -24,17 +21,14 @@ authority rule stated in its own docstring:
 
 NOTHING MOVED THAT CONSUMERS CAN SEE.  Every name this module exported before
 the split is re-exported here and resolves to the same function object, so
-every consumer's import is byte-identical to what it was.  The only import
-lines that changed anywhere are two test GUARDS that reach in to patch or to
-read the source of code that moved; a guard has to follow the code or it stops
-measuring anything.
+every consumer's import is unchanged.  Only two test GUARDS that reach in to
+patch or to read the source of moved code had to follow it.
 
-Retiring the facade — pointing the twenty-odd import sites at the real modules
-and deleting this file — is a separate decision that has not been taken.  One
-in-package consumer, ``bse/vq_interp.py``'s lazy ``from . import bse_io``, is
-still on it deliberately: the lazy form is what keeps the two modules out of an
-import cycle, and repointing it belongs with the retirement rather than ahead
-of it.
+Retiring the facade — repointing the import sites and deleting this file — is a
+separate decision that has NOT been taken.  ``bse/vq_interp.py``'s lazy
+``from . import bse_io`` is still on it deliberately: the lazy form is what
+keeps the two modules out of an import cycle, so repointing it belongs with the
+retirement rather than ahead of it.
 
 Write new code against the module that owns the behaviour, not against this
 file.
