@@ -583,8 +583,16 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
 
 def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
                                   evs_stored_route, kgrid_vq, log=print,
-                                  grade: str = "reference"):
-    """THE gate for ``--refit-window=bse``: contracted, not tile-level.
+                                  grade: str = "reference",
+                                  window_mode: str = "bse"):
+    """The CONTRACTED gate: eigenvalues, not tiles.
+
+    ``window_mode`` says what this gate IS on this run, and it changes the
+    wording and nothing else — the comparison, the grade and the tolerance are
+    the same object either way.  Under ``bse`` it REPLACES the tile null (ζ'
+    ≠ ζ, so the tile identity does not exist).  Under ``zeta`` it rides
+    ALONGSIDE it and adds what a relative tile bracket cannot say: how many
+    meV the published eigenvalues move.
 
     CERTIFY WHERE CONSUMED, one level up.  With ζ' fitted on the BSE window
     the refit no longer computes the producer's ``V_qmunu``, so the tile
@@ -640,18 +648,25 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"max|ΔE_S| refit-route vs stored-route = {dmax:.5f} meV "
             f"over {len(d_mev)} levels")
     log(f"  [refit-cert] WORST {worst:.5f} meV at Q#{worst_iQ} over "
-        f"{len(rows)} on-grid Q, gate {tol_mev:g} meV ({grade} grade) — this "
-        f"is the BSE-window ζ' certification, and it replaces (does not "
-        f"relax) the tile-level on-grid null, which a windowed ζ' cannot "
-        f"satisfy.")
+        f"{len(rows)} on-grid Q, gate {tol_mev:g} meV ({grade} grade) — "
+        + ("this is the BSE-window ζ' certification, and it replaces (does "
+           "not relax) the tile-level on-grid null, which a windowed ζ' "
+           "cannot satisfy." if window_mode == "bse" else
+           "this run's ζ' is the producer's ζ, so the tile null certified "
+           "the TILES and this certifies the EIGENVALUES; both are gates and "
+           "neither relaxes the other."))
     if not np.isfinite(worst) or worst > float(tol_mev):
         raise SystemExit(
-            f"exciton_bands --refit-window=bse: the BSE-window ζ' refit does "
+            f"exciton_bands --refit-window={window_mode}: the refit does "
             f"NOT reproduce the stored-tile BSE eigenvalues on the coarse "
             f"grid — worst max|ΔE_S| = {worst:.5f} meV at Q#{worst_iQ} "
             f"against the {tol_mev:g} meV {grade} gate.  Every OFF-grid "
             f"exchange tile in this run comes from the same ζ', so nothing "
             f"on this path is worth plotting.\n"
+            + ("  THE TILE NULL PASSED AND THIS DID NOT, which is exactly "
+               "what this gate exists to catch: a 5.0e-02 RELATIVE bracket "
+               "on a tile is not a meV statement about an eigenvalue.  Report "
+               "both numbers.\n" if window_mode == "zeta" else "")
             + ("  --cert-grade=visualization is the ONE other gate that "
                f"exists ({CERT_TOL_VISUALIZATION_MEV:g} meV, for a picture "
                f"and never for a quoted number); this run is already at it, "
@@ -1134,6 +1149,26 @@ def build_parser():
                          "against the same eigenvalues through the stored "
                          "tiles, at "
                          f"{REFIT_CERT_TOL_MEV:g} meV.")
+    ap.add_argument("--refit-guard-bands", type=int, default=None,
+                    metavar="N",
+                    help="guard bands the refit's htransform (fH) window "
+                         "carries ABOVE the window zeta' is fitted on "
+                         f"(default {vq_interp.REFIT_N_GUARD_DEFAULT}).  THE "
+                         "TWO-WINDOW CONTRACT: f(eps) is identically zero for "
+                         "eps >= max_k eps of fH's OWN top band, so pinning "
+                         "the two windows together asks compute_wfns_fi for "
+                         "exactly the bands fH cannot represent -- the top "
+                         "band vanishes at the k that defines the shift and a "
+                         "whole shoulder below it carries ~1%% of fH's "
+                         "weight, so eigh returns arbitrary null-space "
+                         "directions there (measured: on-grid tile null 1.267 "
+                         "with zero guards, against a 5.0e-02 bracket).  The "
+                         "guards move that shoulder onto bands nobody reads; "
+                         "zeta' is still fitted on the producer's window "
+                         "exactly.  Costs Galerkin capacity "
+                         "(n_mu*n_s >= nk*(nb_zeta+N)) and needs the WFN to "
+                         "carry the bands.  0 is the RED TWIN and must fail "
+                         "the tile null.")
     ap.add_argument("--cert-grade", choices=tuple(CERT_TOL_BY_GRADE),
                     default="reference",
                     help="which NAMED tolerance the --refit-window=bse "
@@ -1751,7 +1786,8 @@ def main(argv=None):
                                       keep_idx=keep_idx,
                                       window_mode=args.refit_window,
                                       degeneracy_mode=args.band_degeneracy,
-                                      degeneracy_tol_ry=args.degeneracy_tol_ry)
+                                      degeneracy_tol_ry=args.degeneracy_tol_ry,
+                                      n_guard=args.refit_guard_bands)
         # THE ζ THE REFIT ACTUALLY FITS IN.  Identical to ``zx`` under
         # ``--refit-window=zeta``; a band-axis sub-window VIEW of it under
         # ``bse``.  Every refit_vq call below takes this, not ``zx`` — handing
@@ -1812,55 +1848,80 @@ def main(argv=None):
             # producer's tiles — a refusal with no defect behind it.
             vq_interp.refit_ongrid_null(zx_fit, rst, V_ongrid, kgrid_vq,
                                         mesh_xy, log_fn=log, q_list=_qlist)
+        # THE CONTRACTED CERTIFICATION — for BOTH windows, and for different
+        # reasons.  Under ``bse`` it is the ONLY gate: ζ' is fitted on the BSE
+        # window, so it is not the producer's ζ and cannot return the
+        # producer's TILES; that identity is gone and re-tuning its bracket
+        # would be widening a comparison with no reason to hold.  Under
+        # ``zeta`` the tile null above already certifies the TILES, and this
+        # certifies, in the units the curve is published in, the object the
+        # driver actually delivers — a 5.0e-02 RELATIVE bracket on a tile is
+        # not a meV statement about an eigenvalue, and the eigenvalue is the
+        # deliverable.  It is strictly ADDITIVE there: it relaxes nothing, and
+        # a run that passes the tile null and fails this one was never
+        # certified by the tile null.
+        #
+        # Every path Q that lands on the coarse exchange-tile grid gets a TWIN
+        # solve row carrying the producer's own stored tile, and the two
+        # eigenvalue sets are compared after the scan
+        # (``_certify_refit_against_stored``).  CERTIFY WHERE CONSUMED: the
+        # refit's only consumer is that contraction, the twins ride the same
+        # single-compile scan, and they reuse the path's own conduction
+        # caches, so the gate costs no cache and no compile — only |cert|
+        # extra Lanczos solves.
+        frac = Qpath[:nQ_path] * kgrid_vq[None, :]
+        on_grid = (np.max(np.abs(frac - np.round(frac)), axis=1) < 1e-6)
+        finite = (np.linalg.norm(Qpath[:nQ_path]
+                                 - np.round(Qpath[:nQ_path]), axis=1)
+                  >= 1e-9)
+        cert_idx = [int(i) for i in np.nonzero(on_grid & finite)[0]]
+        # De-duplicate by TILE momentum: a path that passes through the
+        # same coarse q twice (Γ appears twice on Γ–X–W–L–Γ–Σ, and its
+        # neighbours can repeat) would otherwise pay for the same
+        # comparison more than once.
+        seen, uniq = set(), []
+        for i in cert_idx:
+            key = tuple(np.round((-Qpath[i]) * kgrid_vq).astype(int)
+                        % kgrid_vq)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(i)
+        cert_idx = uniq
+        if not cert_idx and args.refit_window == "bse":
+            raise SystemExit(
+                f"exciton_bands --refit-window=bse: not one of the "
+                f"{nQ_path} path Q is a FINITE point of the "
+                f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} exchange-tile "
+                f"grid, so there is nowhere the refit route and the "
+                f"producer's stored tiles can be compared and nothing "
+                f"certifies this run.  A windowed ζ' cannot be checked "
+                f"tile-by-tile (it is a different ζ), so the contracted "
+                f"gate is the only one, and it needs at least one shared "
+                f"Q.  Use a K_POINTS path whose corners are on the coarse "
+                f"grid — the standard Γ–X–W–L–Γ–Σ corners all are — or "
+                f"run --refit-window=zeta on a bundle whose parent basis "
+                f"spans nk·nb_ζ.")
+        if not cert_idx:
+            # ζ-window run with no shared Q.  NOT a refusal: the tile null
+            # above is this mode's certification and it has already run.  Said
+            # out loud so nobody reads a missing ``# refit-cert:`` stamp as a
+            # gate that was skipped.
+            log(f"  [refit-cert] none of the {nQ_path} path Q is a finite "
+                f"point of the "
+                f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} exchange-tile "
+                f"grid, so the CONTRACTED certification has nowhere to stand "
+                f"on this path.  The tile null above is this run's "
+                f"certification; the .dat will carry no ``# refit-cert:`` "
+                f"line and the figure no meV stamp.")
         else:
-            # THE GATE MOVES UP ONE LEVEL.  ζ' is fitted on the BSE window, so
-            # it is not the producer's ζ and cannot return the producer's
-            # TILES — that identity is gone and re-tuning its bracket would be
-            # widening a comparison with no reason to hold.  What CAN be
-            # certified is the object this driver actually delivers: the BSE
-            # eigenvalues.  Every path Q that happens to land on the coarse
-            # exchange-tile grid gets a TWIN solve row carrying the producer's
-            # own stored tile, and the two eigenvalue sets are compared after
-            # the scan (``_certify_refit_against_stored``).  CERTIFY WHERE
-            # CONSUMED: the refit's only consumer is that contraction, the
-            # twins ride the same single-compile scan, and they reuse the
-            # path's own conduction caches, so the gate costs no cache and no
-            # compile — only |cert| extra Lanczos solves.
-            frac = Qpath[:nQ_path] * kgrid_vq[None, :]
-            on_grid = (np.max(np.abs(frac - np.round(frac)), axis=1) < 1e-6)
-            finite = (np.linalg.norm(Qpath[:nQ_path]
-                                     - np.round(Qpath[:nQ_path]), axis=1)
-                      >= 1e-9)
-            cert_idx = [int(i) for i in np.nonzero(on_grid & finite)[0]]
-            # De-duplicate by TILE momentum: a path that passes through the
-            # same coarse q twice (Γ appears twice on Γ–X–W–L–Γ–Σ, and its
-            # neighbours can repeat) would otherwise pay for the same
-            # comparison more than once.
-            seen, uniq = set(), []
-            for i in cert_idx:
-                key = tuple(np.round((-Qpath[i]) * kgrid_vq).astype(int)
-                            % kgrid_vq)
-                if key not in seen:
-                    seen.add(key)
-                    uniq.append(i)
-            cert_idx = uniq
-            if not cert_idx:
-                raise SystemExit(
-                    f"exciton_bands --refit-window=bse: not one of the "
-                    f"{nQ_path} path Q is a FINITE point of the "
-                    f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} exchange-tile "
-                    f"grid, so there is nowhere the refit route and the "
-                    f"producer's stored tiles can be compared and nothing "
-                    f"certifies this run.  A windowed ζ' cannot be checked "
-                    f"tile-by-tile (it is a different ζ), so the contracted "
-                    f"gate is the only one, and it needs at least one shared "
-                    f"Q.  Use a K_POINTS path whose corners are on the coarse "
-                    f"grid — the standard Γ–X–W–L–Γ–Σ corners all are — or "
-                    f"run --refit-window=zeta on a bundle whose parent basis "
-                    f"spans nk·nb_ζ.")
-            log(f"  [refit-cert] BSE-window ζ': the tile null does NOT apply "
-                f"(ζ' ≠ ζ).  Certifying the CONTRACTED object instead at "
-                f"{len(cert_idx)} on-grid path Q "
+            log(f"  [refit-cert] "
+                + ("BSE-window ζ': the tile null does NOT apply (ζ' ≠ ζ).  "
+                   "Certifying the CONTRACTED object instead"
+                   if args.refit_window == "bse" else
+                   "ζ-fit-window ζ': the tile null above certifies the TILES; "
+                   "this ADDITIONALLY certifies the CONTRACTED object, in the "
+                   "meV the curve is published in")
+                + f" at {len(cert_idx)} on-grid path Q "
                 f"{[int(i) for i in cert_idx]} — each solved twice, once "
                 f"through the refit exchange and once through the stored "
                 f"V_qmunu tile, in the same scan.  Gate: "
@@ -1958,7 +2019,8 @@ def main(argv=None):
         rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
                                       r_chunk=args.refit_r_chunk,
                                       policy=zx.get("policy"),
-                                      keep_idx=keep_idx)
+                                      keep_idx=keep_idx,
+                                      n_guard=args.refit_guard_bands)
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
@@ -2184,14 +2246,16 @@ def main(argv=None):
     evs_refit = {iQ: evs_all[nQ + n_cert + j]
                  for j, iQ in enumerate(refit_idx)}
 
-    # ── THE CERTIFICATION for --refit-window=bse, before a single number is
-    #    written.  Refit route (already in ``evs_path``) against stored route
-    #    (the twin rows) at the same Q, same caches, same solver. ──────────
+    # ── THE CONTRACTED CERTIFICATION, before a single number is written.
+    #    Refit route (already in ``evs_path``) against stored route (the twin
+    #    rows) at the same Q, same caches, same solver.  Under ``bse`` it is
+    #    the only gate; under ``zeta`` it rides alongside the tile null. ────
     cert_rows, cert_worst = [], None
     if cert_idx:
         cert_rows, cert_worst = _certify_refit_against_stored(
             cert_idx, Qpath, evs_path, evs_all[nQ:nQ + n_cert],
-            kgrid_vq, log=log, grade=args.cert_grade)
+            kgrid_vq, log=log, grade=args.cert_grade,
+            window_mode=args.refit_window)
         # PROVENANCE.  The run's own rank-0 block is what outranks every page
         # in the register (AGENT_PREAMBLE), so the grade and the certified
         # number are stated there before the first byte of output is written,
@@ -2221,6 +2285,17 @@ def main(argv=None):
                             f"{zx_fit['nk'] * zx_fit['nb']})"
                             if args.refit_window == "bse" else
                             " (producer's zeta-fit window)") + "\n")
+                # THE TWO-WINDOW CONTRACT TRAVELS WITH THE DATA.  A curve
+                # drawn through a zero-guard refit is a curve through
+                # arbitrary null-space directions at the top of its own
+                # window, and the only way a reader tells the two apart after
+                # the fact is this line.
+                fh.write(f"# refit-fh-window: absolute bands "
+                         f"[{rst['window_abs_fh'][0]}, "
+                         f"{rst['window_abs_fh'][1]}) = zeta window + "
+                         f"{rst['n_guard']} guard band(s); Galerkin residual "
+                         f"{rst['galerkin_rel']:.3e} (fH) / "
+                         f"{rst['galerkin_rel_zeta']:.3e} (zeta window)\n")
             if cert_rows:
                 # THE CERTIFICATION TRAVELS WITH THE DATA.  A gate whose
                 # numbers live only in a log is a claim about a file nobody

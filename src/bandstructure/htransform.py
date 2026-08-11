@@ -1220,7 +1220,33 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
-                    mesh_xy: Mesh | None = None, return_full_proj: bool = False):
+                    mesh_xy: Mesh | None = None, return_full_proj: bool = False,
+                    n_guard_bands: int = 0):
+    """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
+
+    ``n_guard_bands`` widens the htransform window ABOVE the deck's
+    ``(nelec − nval, nelec + ncond)`` by that many bands, and only that.  It
+    is the two-window contract's one lever: ``f(ε)`` is identically zero for
+    ε ≥ ``shift`` := ``max_k ε[nb−1]``, so the top of the htransform's OWN
+    window contributes nothing to ``fH`` and ``jnp.linalg.eigh`` fills those
+    slots out of fH's null space.  A caller that needs the top of its window
+    BACK — ``bse.vq_interp.refit_prepare``, whose ζ' must be fitted on exactly
+    the producer's window — buys guard bands above it so every band it asks
+    for is interior.  Default ``0`` is the historical behaviour, byte for
+    byte: no caller that omits it loads a band it did not load before.
+
+    The widening moves ``ncond`` (and, with it, ``nband``, which is what
+    ``Meta`` zero-pads ψ above — a guard band past ``nband`` would arrive as
+    exact zeros and the Galerkin solve would never say so).  It does NOT move
+    ``nval``: the shoulder is at the TOP of the window, and the bottom edge is
+    the deck's own.
+
+    Measured, on the two parents of
+    ``tests/known_failures/2026-08-11-fifth-wall-is-the-f-transform-shoulder.md``:
+    with zero guards the top four bands of a 20-band window collapse to
+    ``min_k ‖O[m,:]‖`` = 0.23…0.27 in the α-space overlap, and the on-grid
+    tile null reads 1.267 against a 5.0e-02 bracket.
+    """
     from file_io.centroids import load_centroids as _shared_load_centroids
 
     input_dir = os.path.dirname(os.path.abspath(input_path))
@@ -1239,6 +1265,36 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     nval = int(params["nval"])
     ncond = int(params["ncond"])
     nband = int(params["nband"])
+    n_guard_bands = int(n_guard_bands)
+    if n_guard_bands < 0:
+        raise ValueError(
+            f"initialize_wfns: n_guard_bands={n_guard_bands} is negative; the "
+            f"guard bands sit ABOVE the deck's window and there is no such "
+            f"thing as a negative one.  Pass 0 for the historical window.")
+    if n_guard_bands:
+        _ncond_deck, _nband_deck = ncond, nband
+        ncond = _ncond_deck + n_guard_bands
+        nband = max(_nband_deck, int(wfn.nelec) + ncond)
+        _b_hi = int(wfn.nelec) + ncond
+        if _b_hi > int(wfn.nbands):
+            raise SystemExit(
+                f"initialize_wfns: {n_guard_bands} guard band(s) above the "
+                f"deck's window would need bands up to {_b_hi}, and "
+                f"{os.path.basename(wfn_file)} carries {int(wfn.nbands)}.  "
+                f"A guard band the file cannot supply arrives as EXACT ZEROS "
+                f"(``Meta``'s past-mnband pad), which the Galerkin solve "
+                f"absorbs without complaint and the f-transform then reports "
+                f"as a perfectly representable band.  Re-run the WFN with "
+                f"more bands, or drop the guard count to "
+                f"{max(0, int(wfn.nbands) - int(wfn.nelec) - _ncond_deck)}.")
+        log_fn(f"  [two-window] htransform window WIDENED by "
+               f"{n_guard_bands} guard band(s) above the deck's: ncond "
+               f"{_ncond_deck} → {ncond} (bands "
+               f"[{int(wfn.nelec) - nval}, {_b_hi}) of {int(wfn.nbands)}); "
+               f"nband {_nband_deck} → {nband} so the guards are READ rather "
+               f"than zero-padded.  f(ε) ≡ 0 for ε ≥ max_k ε[nb−1], so the "
+               f"guards absorb the shoulder and every band the caller asks "
+               f"for is interior to fH.")
     bispinor = bool(params.get("bispinor", False))
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
@@ -1882,6 +1938,26 @@ def main(argv=None):
         from .bse_setup import compute_wfns_fi
         b_min = int(params["wfn_fi_min"])
         b_max = int(params["wfn_fi_max"]) or int(ctilde.shape[1])
+        # SPLASH RADIUS OF THE f-SHOULDER, named by
+        # ``2026-08-11-fifth-wall-is-the-f-transform-shoulder.md`` §7 and
+        # audited here.  ``wfn_fi_max`` unset DEFAULTS to the full band count
+        # — zero guard bands, i.e. exactly the configuration that row
+        # convicts.  ``compute_wfns_fi``'s f-shoulder gate is what refuses;
+        # this warns first, in the vocabulary of the deck key the user would
+        # have to change, so the refusal is not the first news of it.
+        _n_guard = int(ctilde.shape[1]) - b_max
+        if _n_guard < 4:
+            log(f"  [warn] wfn_fi_max={b_max} leaves only {_n_guard} guard "
+                f"band(s) below the top of the htransform window "
+                f"({int(ctilde.shape[1])} bands)"
+                + (" — this is the ZERO-GUARD default (wfn_fi_max unset "
+                   "means 'the whole window')" if not
+                   int(params["wfn_fi_max"]) else "")
+                + f".  f(eps) is identically zero at and above "
+                f"max_k eps of the window's own top band, so the top of what "
+                f"you are asking BACK may be an arbitrary direction out of "
+                f"fH's null space.  Raise nband/ncond so the window extends "
+                f"above wfn_fi_max; the f-shoulder gate decides.")
         with mesh_xy, timing.section("wfns_fi"):
             wfns_fi = compute_wfns_fi(
                 ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,

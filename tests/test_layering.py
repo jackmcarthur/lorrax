@@ -757,8 +757,15 @@ _L1_LIBRARY_ENV_READS = {
     # resolve_reshard_route — explicit kwarg wins, env is the A/B path the
     # production exciton_bands driver cannot plumb an argument to (file
     # ownership); unknown tokens announce, never silently.
+    # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
+    # refuse-on-garbage, same shape as ``resolve_fh_ortho_tol`` in the sibling
+    # module four lines up.  It is deliberately NOT a driver flag: the gate
+    # catches a returned band that is ABSENT from fH, which is not a
+    # tolerance question, and the only value that changes its verdict is a
+    # negative one, whose whole purpose is reproducing a known-bad run.
     "bandstructure.bse_setup": {
         "LORRAX_FACE_TO_BATCH_ROUTE",
+        "LORRAX_FI_FSHOULDER_TOL",
     },
 }
 

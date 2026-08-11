@@ -2519,28 +2519,92 @@ def refit_window_view(zx, band_range, log_fn=print,
     return zw
 
 
+#: Guard bands the refit's fH window carries ABOVE the ζ-fit window, by
+#: default.  Four, from measurement rather than taste: on both probed parents
+#: of ``tests/known_failures/2026-08-11-fifth-wall-is-the-f-transform-\
+#: shoulder.md`` §2 the bands whose ``min_k |f|/max|f|`` reaches exactly zero
+#: are the top FOUR (dp2628n20, nb 20) and the top TWO (p2628n52, nb 52), and
+#: the first band that never gets closer to zero than ~4e-4 of max|f| is four
+#: below the edge on the wider one.  Same number the ``exciton_bands``
+#: guard-band warning has used since the Si degeneracy root-cause, and for a
+#: related reason.
+REFIT_N_GUARD_DEFAULT = 4
+
+
 def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                   r_chunk: int = 2048, policy=None, keep_idx=None,
                   window_mode: str = "zeta",
                   degeneracy_mode: str = "strict",
-                  degeneracy_tol_ry: float | None = None):
+                  degeneracy_tol_ry: float | None = None,
+                  n_guard: int | None = None):
     """One-time refit state: htransform handles + full-r α-basis.
+
+    THE TWO-WINDOW CONTRACT.  There are two windows here and they are not the
+    same window:
+
+      * the **ζ-fit window** — the producer's, exactly.  ζ' is re-fitted at
+        the target Q from the pair densities of THIS window and no other, or
+        it is not the producer's ζ and ``refit_ongrid_null`` (correctly)
+        refuses it.  ``zx_fit`` carries it; ``refit_vq`` fits in it.
+      * the **fH window** — the ζ window PLUS ``n_guard`` bands above it.
+        ``ctilde``, ``B_at_mu``, ``enk_sigma``, ``B_full`` and ``rank`` all
+        live here.
+
+    WHY THEY MUST DIFFER.  ``f(ε)`` is identically zero for ε ≥ ``shift`` and
+    the htransform sets ``shift = max_k ε[nb−1]`` — the top band of its OWN
+    window.  Pinning the fH window to the ζ window therefore asks
+    ``compute_wfns_fi`` for precisely the bands ``fH`` cannot represent: the
+    top band vanishes at the k that defines the shift, and ``f`` vanishes to
+    second order approaching it, so a whole SHOULDER of bands below the top
+    carries a per-cent or less of fH's weight and ``eigh`` fills those slots
+    out of fH's null space.  Measured (``2026-08-11-fifth-wall-is-the-f-\
+    transform-shoulder.md``): four bands exactly zeroed at three k each on
+    ``dp2628n20``, α-space overlap ‖O[m,:]‖ collapsing to 0.23…0.27, and an
+    on-grid tile null of 1.267/1.409 against a 5.0e-02 bracket — while the
+    representation itself measured 8.9e-15 orthonormality and a 4.3e-15
+    Galerkin residual.  The representation was never the defect; the REQUEST
+    was.
+
+    WHAT IT COSTS.  The Galerkin capacity bound tightens from ``nk·nb_ζ`` to
+    ``nk·(nb_ζ + n_guard) ≤ n_μ·n_s``, and the deck has to be able to LOAD the
+    guards (``initialize_wfns`` raises ``nband`` for them and refuses when the
+    WFN has no such bands — a guard band past the file arrives as exact zeros
+    and nothing downstream would say so).  ``n_guard=0`` restores the
+    zero-guard configuration exactly, and is the red twin: it must fail the
+    tile null loudly.
 
     Returns ``rst`` dict:
       zx_fit   the band-axis view of ``zx`` the refit actually fits in — the
           bundle itself under ``window_mode="zeta"``, a sub-window view under
           ``"bse"`` (:func:`refit_window_view`).  EVERY later ``refit_vq``
           call must be handed this, not the caller's ``zx``.
-      ctilde, B_at_mu, enk_sigma, kgrid_co — htransform setup (window ==
-          the refit window; asserted against ``zx_fit``)
-      psi_r    (nk·nb, ns·n_rp)  stored-window u on the full r-grid, device,
-                                 zero-padded on r to a multiple of r_chunk
-      B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r
+      ctilde, B_at_mu, enk_sigma, kgrid_co — htransform setup on the WIDE
+          (fH) window: ``nb_wide = zx_fit["nb"] + n_guard``
+      psi_r    (nk·nb_ζ, ns·n_rp)  stored ζ-WINDOW u on the full r-grid,
+                                 device, zero-padded on r to a multiple of
+                                 r_chunk.  The guard bands are deliberately
+                                 NOT here: they shape fH, they are not pair
+                                 density.
+      B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r,
+                                 built from the WIDE ψ because ``W_proj`` and
+                                 ``ctilde`` are the wide window's
+      n_guard, nb_wide, window_abs (ζ), window_abs_fh (wide) — the contract,
+          recorded so a reader of ``rst`` never has to infer which is which
       n_rtot, r_chunk, galerkin_rel — bookkeeping + printed residual
       zeta_solve  ``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit
           on disk — read from the ζ file's own ``isdf_header/fit_provenance``
           and NOT from the deck.  ``refit_vq`` refuses without it.
     """
+    # ARGUMENT VALIDATION FIRST — it costs nothing, it needs no file to be
+    # readable, and it runs BEFORE the htransform import below, whose module
+    # body brings up the communicator stack and the REQUIRED-FFI gate.
+    n_guard = REFIT_N_GUARD_DEFAULT if n_guard is None else int(n_guard)
+    if n_guard < 0:
+        raise SystemExit(
+            f"refit_prepare: n_guard={n_guard} is negative.  Guard bands sit "
+            f"ABOVE the ζ-fit window; 0 is the zero-guard configuration the "
+            f"f-shoulder row convicts, and there is nothing below it.")
+
     from gw.gw_config import read_lorrax_input
     from bandstructure.htransform import initialize_wfns
     from common.wfn_transforms import iter_psi_rchunk_bandwise
@@ -2571,8 +2635,15 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     params = read_lorrax_input(input_file)
     (wfn, sym, meta, _, _S, ctilde, B_at_mu, enk_sigma,
      W_proj) = initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy,
-                               return_full_proj=True)
-    nk, nb, rank = int(ctilde.shape[0]), int(ctilde.shape[1]), int(ctilde.shape[2])
+                               return_full_proj=True,
+                               n_guard_bands=n_guard)
+    nk, nb_wide, rank = (int(ctilde.shape[0]), int(ctilde.shape[1]),
+                         int(ctilde.shape[2]))
+    # ``nb`` is, everywhere below and in every ``refit_vq`` call, the ζ-FIT
+    # window's band count — the window ζ' is fitted on and the window the
+    # pair densities live in.  ``nb_wide`` is fH's.  They differ by exactly
+    # the guards, and conflating them is the defect this contract fixes.
+    nb = nb_wide - n_guard
     ns = int(B_at_mu.shape[1])
     # DOWNFOLDED BUNDLE: the htransform leg fits in the PARENT ISDF basis (it
     # is sized by nk·nb, not by mu_S — resolve_isdf_basis), so B_at_mu comes
@@ -2590,10 +2661,12 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     assert nk == zx["nk"] and ns == zx["ns"], \
         (f"htransform window (nk={nk}, ns={ns}) != zeta-fit window "
          f"(nk={zx['nk']}, ns={zx['ns']})")
-    # The deck's ABSOLUTE band range — the window ``initialize_wfns`` just
-    # built ``ctilde`` over, and the window the ψ stream below reads.
+    # The deck's ABSOLUTE band range — the ζ-FIT window, which is what the
+    # deck's nval/ncond name and what ``zx`` carries.  ``initialize_wfns``
+    # built ``ctilde`` over ``band_range_fh``, which is this plus the guards.
     nelec = int(wfn.nelec)
     band_range = (nelec - int(params["nval"]), nelec + int(params["ncond"]))
+    band_range_fh = (band_range[0], band_range[1] + n_guard)
     if window_mode not in ("zeta", "bse"):
         raise SystemExit(
             f"refit_prepare: window_mode={window_mode!r} is not 'zeta' or "
@@ -2644,8 +2717,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                 f"certifies on the contracted object instead.")
     if nb != zx["nb"]:
         raise SystemExit(
-            f"exciton_bands --vq-mode=refit: the htransform band window is "
-            f"nb={nb} (deck nval+ncond) but the ζ the refit fits against "
+            f"exciton_bands --vq-mode=refit: the ζ-FIT window is nb={nb} "
+            f"(deck nval+ncond; fH spans {nb_wide} = that plus {n_guard} "
+            f"guard band(s)) but the ζ the refit fits against "
             f"carries nb={zx['nb']}.  Under the default "
             f"``--refit-window=zeta`` the refit RE-FITS zeta at the target Q "
             f"from the pair densities of the PRODUCER's window, so it has to "
@@ -2654,8 +2728,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             f"forward:\n"
             f"  * set the deck's nval/ncond to the GW run's "
             f"({zx['nb']} bands total); --n-val/--n-cond still choose the BSE "
-            f"window inside it.  Needs n_mu,parent*n_s >= nk*nb = "
-            f"{zx['nk'] * zx['nb']} for the htransform Galerkin leg;\n"
+            f"window inside it.  Needs n_mu,parent*n_s >= nk*(nb + n_guard) = "
+            f"{zx['nk'] * (zx['nb'] + n_guard)} for the htransform Galerkin "
+            f"leg (the guards are inside the bound too);\n"
             f"  * or ``--refit-window=bse``, which fits ζ' on the DECK's "
             f"window instead (the BSE window plus its guard bands) and "
             f"certifies on the CONTRACTED object — on-grid BSE eigenvalues, "
@@ -2666,17 +2741,51 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         f"WFN FFT grid {fg} != zeta_q.h5 grid {(zx['nx'], zx['ny'], zx['nz'])}"
     n_rtot = zx["n_rtot"]
 
-    # Stream the ψ of the REFIT window onto the full r-grid (host assembly,
-    # one band chunk at a time), then push once to device.  ``band_range`` is
-    # the deck's (nelec − nval, nelec + ncond), i.e. exactly the window
-    # ``initialize_wfns`` built ``ctilde`` over and — after the check above —
-    # exactly the window ``zx`` now carries on its band axis.
-    psi_r_host = np.empty((nk, nb, ns, n_rtot), dtype=np.complex128)
+    # ── THE TWO-WINDOW CONTRACT, announced ───────────────────────────────
+    # Same shape of report and the same thresholds as ``exciton_bands``'s own
+    # guard-band block, because it is the same quantity: bands above what the
+    # caller reads, kept so the f-shoulder lands on nobody.  Below four is the
+    # measured shoulder depth on the probed parents; above sixteen is the
+    # documented on-grid cliff, which is not hypothetical (MoS2/640c on-grid
+    # |Δε_c| ~1 meV at nband ≤ 48 against ~955 meV at nband 80).
+    log_fn(f"  [refit] two-window contract: ζ' is fitted on bands "
+           f"[{band_range[0]}, {band_range[1]}) ({nb} bands, the producer's); "
+           f"fH spans [{band_range_fh[0]}, {band_range_fh[1]}) ({nb_wide} "
+           f"bands) = that plus {n_guard} guard band(s).  Galerkin capacity "
+           f"needs n_mu*n_s = {int(zx['n_mu']) * ns} >= nk*nb_fh = "
+           f"{nk * nb_wide}"
+           + ("" if int(zx["n_mu"]) * ns >= nk * nb_wide else
+              "  ** SHORT — build_fH_R's orthonormality gate decides **"))
+    if n_guard < 4:
+        log_fn(f"  [warn] only {n_guard} guard band(s) above the ζ-fit "
+               f"window.  f(ε) ≡ 0 for ε ≥ max_k ε[nb_fh−1], and the dead "
+               f"set measured FOUR bands deep on a 20-band window and TWO on "
+               f"a 52-band one (2026-08-11-fifth-wall-is-the-f-transform-"
+               f"shoulder.md §2), so the top of the ζ window may come back "
+               f"from eigh as an arbitrary null-space direction.  The "
+               f"f-shoulder gate in compute_wfns_fi is what decides — it "
+               f"prints the dead set's actual depth on THIS deck; this is "
+               f"the warning that makes it cheap to act on.")
+    if n_guard > 16:
+        log_fn(f"  [warn] {n_guard} guard bands is a LARGE interp window and "
+               f"a large window does not improve — past a system-dependent "
+               f"cliff it WRECKS — the recovered on-grid energies (MoS2/640c: "
+               f"~1 meV at nband<=48, ~955 meV at nband 80).  Keep the guards "
+               f"just deep enough to clear the f-shoulder.")
+
+    # Stream the ψ of the fH (WIDE) window onto the full r-grid (host
+    # assembly, one band chunk at a time), then push once to device.
+    # ``band_range_fh`` is the window ``initialize_wfns`` built ``ctilde``
+    # over, so it is the window ``W_proj`` projects and the ONLY window
+    # ``B_full = W_proj @ ψ`` is defined on.  The ζ-window sub-block is sliced
+    # back out below and is what ``refit_vq`` contracts; the guard bands exist
+    # to shape fH and are deliberately absent from every pair density.
+    psi_r_host = np.empty((nk, nb_wide, ns, n_rtot), dtype=np.complex128)
     for bc_range, psi_bc in iter_psi_rchunk_bandwise(
-            wfn, sym, meta, mesh_xy, band_range, 0, n_rtot,
+            wfn, sym, meta, mesh_xy, band_range_fh, 0, n_rtot,
             bool(params.get("bispinor", False)), band_chunk_size=16):
-        lo = bc_range[0] - band_range[0]
-        hi = bc_range[1] - band_range[0]
+        lo = bc_range[0] - band_range_fh[0]
+        hi = bc_range[1] - band_range_fh[0]
         # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get.
         # ``iter_psi_rchunk_bandwise`` yields a mesh-sharded global array, so on a MULTI-PROCESS run its
         # shards live on other processes and ``jax.device_get`` raises
@@ -2686,32 +2795,68 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         # branch is also why the naive repair is wrong: ``process_allgather(
         # tiled=True)`` on the fully-addressable P=1 array would concatenate
         # this process's whole copy and multiply the k axis by P.
-        psi_r_host[:, lo:hi] = _to_host(psi_bc)
+        # SLICE TO THE CHUNK'S OWN WIDTH.  ``load_psi_gflat_padded`` pads the
+        # band axis up to a multiple of the device count, so a chunk narrower
+        # than that comes back WIDER than ``bc_range`` says — 9 requested
+        # bands arriving as 12 at four devices.  Every window this function
+        # ever saw before the two-window contract had a band count divisible
+        # by the device count (52, 24, 20 at P=4), so the last chunk was
+        # always already aligned and the pad never materialised; a guard count
+        # that makes ``nb_fh`` odd (53, 55, 57) is the first caller to see it,
+        # and it arrives as a numpy broadcast error naming two shapes and
+        # neither the loader nor the pad.  The pad rows are physically zero,
+        # so the slice discards nothing.
+        _bc = _to_host(psi_bc)
+        psi_r_host[:, lo:hi] = _bc[:, :hi - lo]
+        del _bc
     n_rp = ((n_rtot + r_chunk - 1) // r_chunk) * r_chunk
     if n_rp > n_rtot:
         psi_r_host = np.concatenate(
-            [psi_r_host, np.zeros((nk, nb, ns, n_rp - n_rtot),
+            [psi_r_host, np.zeros((nk, nb_wide, ns, n_rp - n_rtot),
                                   dtype=np.complex128)], axis=3)
-    psi_r = jnp.asarray(psi_r_host.reshape(nk * nb, ns * n_rp))
-    del psi_r_host
+    psi_r_fh = jnp.asarray(psi_r_host.reshape(nk * nb_wide, ns * n_rp))
     # α-basis on full r; Galerkin fidelity printed (the refit floor at
     # on-grid q is bounded below by this residual)
     W_proj = jnp.asarray(W_proj)
-    # ns folds with r: W_proj columns are (nk·nb); psi_r rows likewise —
-    # but the SVD's column space folded (ns, n_mu); on full r the fold is
+    # ns folds with r: W_proj columns are (nk·nb_wide); psi_r_fh rows likewise
+    # — but the SVD's column space folded (ns, n_mu); on full r the fold is
     # (ns, n_rp), consistent because ψ rows carry (s, r) in C order.
-    B_full = W_proj @ psi_r                      # (rank, ns·n_rp)
-    rec = jnp.asarray(ctilde.reshape(nk * nb, rank)) @ B_full
-    gal = float(jnp.linalg.norm(rec - psi_r) / jnp.linalg.norm(psi_r))
-    log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} "
-           f"(refit-vs-stored on-grid floor is bounded by this)")
+    B_full = W_proj @ psi_r_fh                   # (rank, ns·n_rp)
+    rec = jnp.asarray(ctilde.reshape(nk * nb_wide, rank)) @ B_full
+    gal = float(jnp.linalg.norm(rec - psi_r_fh) / jnp.linalg.norm(psi_r_fh))
+    # TWO RESIDUALS, because the two windows are two objects.  The fH one is
+    # what ``B_full`` and ``ctilde`` actually represent; the ζ one is the
+    # floor that bounds the tile, because the pair densities the tile
+    # contracts live in the ζ window and nowhere else.  Printing only the
+    # first would attribute the guards' own (larger, harmless) representation
+    # error to the tile; printing only the second would hide a wide window
+    # that has stopped spanning.
+    _r3 = rec.reshape(nk, nb_wide, ns * n_rp)[:, :nb]
+    _p3 = psi_r_fh.reshape(nk, nb_wide, ns * n_rp)[:, :nb]
+    gal_zeta = float(jnp.linalg.norm(_r3 - _p3) / jnp.linalg.norm(_p3))
+    del rec, _r3, _p3
+    log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} over "
+           f"the fH window ({nb_wide} bands), {gal_zeta:.3e} over the ζ-fit "
+           f"window ({nb} bands) — the ζ one is the refit-vs-stored on-grid "
+           f"floor, since only ζ-window pair densities enter the tile")
+    # The ζ-WINDOW ψ is what ``refit_vq`` contracts, on BOTH legs: the n leg
+    # directly, the stored-m-leg twin by k-index.  Slice it out of the wide
+    # host buffer and drop the wide device copy — the guards' job is done the
+    # moment ``B_full`` exists.
+    del psi_r_fh
+    psi_r = jnp.asarray(
+        np.ascontiguousarray(psi_r_host[:, :nb]).reshape(nk * nb, ns * n_rp))
+    del psi_r_host
     return {"zx_fit": zx, "window_mode": window_mode,
             "window_abs": (int(band_range[0]), int(band_range[1])),
+            "window_abs_fh": (int(band_range_fh[0]), int(band_range_fh[1])),
+            "n_guard": int(n_guard), "nb_wide": int(nb_wide),
             "zeta_solve": _zeta_solve,
             "ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
             "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
             "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
+            "galerkin_rel_zeta": gal_zeta,
             "rank": rank,
             "v_on_set": make_v_on_set(zx, policy, log_fn=log_fn)}
 
