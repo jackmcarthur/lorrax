@@ -397,18 +397,37 @@ driver now measures that per run instead of assuming it.
 ```
 
 Order one — the red twin's magnitude, not the 1.7e-15 the synthetic covariance
-gate reads.  **Orbit closure is not the missing piece: it HOLDS.**  Closure is
-what gives the child an unfold TABLE; it is not what makes the child's TENSORS
-unfold.  That needs `T[q] = U^S T[i(q)] (U^L)†`, and `T` is built by a
-RANK-TRUNCATED solve — and the truncation is not star-constant here: the
-retained rank runs **120 to 124 across 64 q**.  A covariant `S_SS` has an
-identical spectrum at every member of a star, so a rank cut cannot move within
-one; the measured spread says the pair-density Gram over this retained window is
-not star-covariant, and no selection rule can repair that.  The suspect is the
-window itself — a band range that slices a degenerate manifold is exactly how a
-star-invariant quantity stops being one — which is the same mechanism the
-band-degeneracy closure work of 2026-08-10 found at 6x6x6.  **Named as a
-suspect, not a finding: this lane did not test it.**
+gate reads.  **Orbit closure is not the missing piece: it HOLDS** (the run says
+so two lines above, under all 96 ops).  Closure is what gives the child an
+unfold TABLE; it is not what makes the child's TENSORS unfold.  That needs
+`T[q] = U^S T[i(q)] (U^L)†`, and `T` is built by a RANK-TRUNCATED solve.
+
+**THE FIRST HYPOTHESIS WAS REFUTED BY THE INSTRUMENT WRITTEN TO TEST IT, and
+that is recorded rather than quietly replaced.**  The retained rank runs 120 to
+124 across the 64 q, which looks exactly like a truncation that moves within a
+star — and a covariant `S_SS` has an identical spectrum at every star member, so
+that would have made the pair-density Gram non-covariant and the retained band
+window the culprit (the mechanism the band-degeneracy work of 2026-08-10 found
+at 6x6x6).  `_star_rank_constancy` groups the per-q rank BY STAR and says:
+
+> `[downfold/star] star-rank constancy: the retained rank IS constant on every
+> star, so the truncation is not the mechanism and the disagreement is upstream
+> of it`
+
+The 120..124 spread is ACROSS stars, not within one.  So the band window is not
+implicated and the solve is not implicated, and the honest state of this lane is
+that **the mechanism is not identified.**
+
+**Nor is it yet established that there is a mechanism to find.**  The route has
+three parts that could each be wrong alone — the wedge-slot derivation, the
+table restriction, and the unfold call — and an order-one number cannot tell
+"the child is not covariant" from "this harness is wrong".  A CONTROL that can
+is now in the gate and its result is reported below: the PARENT's own tensor was
+stored on this wedge with these tables and unfolded by the reader before the
+driver saw it, so slicing it back and unfolding it MUST return it, and both arms
+run the same `_unfold_roundtrip_rel` so they cannot differ by a line of
+plumbing.  **Until that control is read, no claim about the child's covariance
+is made here.**
 
 Two consequences for whoever picks this up:
 

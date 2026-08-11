@@ -529,9 +529,21 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         elif const:
             lines.append(
                 "  [downfold/star] star-rank constancy: the retained rank IS "
-                "constant on every star, so the truncation is not the "
-                "mechanism and the disagreement is upstream of it — suspect "
-                "the tables or the wedge-slot derivation, not the solve.")
+                "constant on every star, so a truncation that moves WITHIN a "
+                "star is not the mechanism.  Note what that does and does not "
+                "exclude: equal ranks across a star are NECESSARY for a "
+                "covariant S_SS and nowhere near sufficient, so this clears "
+                "the rank-motion signature and leaves the covariance of the "
+                "pair-density Gram itself open."
+                + ("  With the control at the reassociation floor the "
+                   "wedge-slot derivation, the table restriction and the "
+                   "unfold call are all exonerated too, so the disagreement "
+                   "is in the CHILD's covariance and not in this route.  THE "
+                   "MECHANISM IS NOT IDENTIFIED BY THIS RUN.  The decisive "
+                   "next measurement is one gather and one unfold: compare "
+                   "S_LL[q] against U S_LL[i(q)] U-dagger directly, which "
+                   "tests covariance rather than its rank shadow."
+                   if control_ok else ""))
         else:
             lines.append(
                 f"  [downfold/star] star-rank constancy: **REFUTED** — "
