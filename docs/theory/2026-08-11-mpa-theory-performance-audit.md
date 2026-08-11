@@ -1,866 +1,1004 @@
-# MPA accuracy and performance audit
+# A legible fast-full-frequency design for LORRAX
 
-Date: 2026-08-11  
-Scope: the LORRAX multipole approximation (MPA), its residual difference from
-the matched BerkeleyGW contour-deformation calculation for Si, and changes that
-could make the method more robust and less expensive. Pole-axis batching is
-deliberately out of scope.
+Date: 2026-08-11
 
-## Executive conclusions
+Status: design audit, not yet an implementation
 
-1. The remaining error for bands 7--10 is mostly a nearly rigid correlation
-   self-energy offset, not a gap or dispersion error. Before alignment, the 32
-   states have an Eqp0 mean/MAE of $+7.661/+7.661$ meV and a maximum error of
-   $10.199$ meV. After subtracting the mean, the MAE is $1.682$ meV and the
-   maximum is $2.577$ meV. Thus LORRAX already reproduces these bands across
-   all eight irreducible $k$ points to better than 5 meV up to one common
-   energy zero.
+Scope: MPA construction of $W(z)$ and evaluation of $\Sigma_c$ in the
+low-memory ISDF path. Simultaneous storage of multiple pole slabs is explicitly
+out of scope.
 
-2. The residual is not explained by the final self-energy interpolation,
-   BerkeleyGW's static remainder, or exchange. Replacing linear interpolation
-   by PCHIP or cubic interpolation changes the mean by only about $0.03$ meV.
-   BerkeleyGW's static-remainder correction is about $-297$ meV for these
-   states, and the compared primed columns deliberately omit it. The exchange
-   error is only $0.143$ meV MAE.
+## Correction to the first version of this report
 
-3. The finite-field/local-field head is not the source of the common
-   $+7.66$ meV shift. The accepted 1394-centroid Schur-complement head
-   reproduces BerkeleyGW's two head samples at $0$ and $2i$ Ry at the
-   $10^{-4}$ level using independently estimated Coulomb heads, or at the
-   $10^{-5}$ level when the same bare head is used. More decisively, an MPA
-   scalar head changes occupied and empty on-shell states with opposite signs.
-   The observed error decomposes into a $+7.661$ meV common component and only
-   a $+1.333$ meV particle--hole-antisymmetric component. The head can affect
-   the latter, but cannot generate the former.
+The first version did not answer the central performance question. It proposed
+transition-amplitude reuse even though materializing transition amplitudes is
+incompatible with the intended scaling, and it discussed many secondary
+changes before deriving why one MPA pole was causing about ten thousand tau
+dispatches. That recommendation is withdrawn.
 
-4. The residual must therefore be separated between the body rational fit and
-   LORRAX's subsequent complex-time evaluation. The latter is not the analytic
-   pole convolution used in the original MPA/Yambo method: 6--15% of the pole
-   elements in each Si pass are classified as narrower than
-   $\xi=0.6667$ eV and sent through a two-point regularized route. That route
-   is a serious, inexpensive-to-test candidate for a few-meV bias. If it is
-   innocent, a body continuation or high-frequency-moment bias is the leading
-   hypothesis. Existing pole-count data are oscillatory and confounded by an
-   older 1128-centroid geometry.
+This replacement takes the four-branch GN-PPM construction as the reference:
+use a small, intelligible number of windows; accept a bounded constant-factor
+loss rather than multiplying windows to chase a local optimum; and never create
+an object proportional to the transition space.
 
-5. The present MPA Sigma path is much more expensive than it needs to be. The
-   eight Si pole passes made 52,252 tau dispatches, versus 167 for GN-PPM: a
-   factor of 313 in node evaluations and about 47 in critical-path wall time
-   when pole passes run concurrently. The optimization target should be
+The main conclusion is simple:
 
-   \[
-   C_\Sigma \simeq
-   \sum_{p,b,g,w} N_\tau(p,b,g,w)\,C_\tau,
-   \]
+> Eight poles do not intrinsically require 52,252 tau evaluations. The current
+> planner destroys the elementwise correlation between pole energy and pole
+> width, replaces the resulting cloud by hundreds of rectangular envelopes,
+> and reruns the full $G$/FFT/projection kernel for every rectangle.
 
-   not the number of output frequencies and not merely the number of routing
-   groups.
+The preferred repair is also simple in outline:
 
-6. The first structural priorities are: build a direct analytic-resolvent
-   oracle for a small state/q sample; remove or certify the $\Gamma<\xi$
-   substitution; enforce line-batched construction of $W(z)$; reuse transition
-   amplitudes across every $z$ sample; constrain the fit's high-frequency
-   moment; introduce held-out continuation validation; and jointly
-   optimize/merge CTSP windows by total tau-node cost. Per-element quadrature
-   grids should not be introduced naively: they can save nodes for one element
-   while destroying the much more valuable reuse of $G(\tau)$.
+1. preserve the GN four-branch decomposition;
+2. use a complex-sector Laplace rule for every sign-definite branch, without
+   width panes;
+3. remove the discontinuous narrow-pole substitution: retain every fitted
+   $\Gamma_p>0$ in the quasiparticle limit, and add an explicit
+   $\eta_\Sigma$ continuously only when a broadened self-energy is requested;
+4. construct the two sampling lines of $W(z)$ with line-shared, non-materializing
+   $G_cG_v$ sweeps;
+5. choose the smallest pole count that passes held-out $W$ and quasiparticle
+   checks.
 
-## 1. What the Si result actually says
+No production physics code or tests were changed as part of this audit.
 
-The reference is the matched BerkeleyGW contour-deformation run with 100 bands,
-25 Ry screened and bare cutoffs, `frequency_dependence 2`, and
-`exact_static_ch 1`. LORRAX is compared with the **primed** BerkeleyGW columns,
-which are the finite-band result without the static-remainder addition.
+## 1. The measured problem
 
-For the deterministic eight-pole, 1394-centroid, $[-7,+7]$ eV run, the safe
-protocol region is
+The accepted GN-PPM calculation uses four conceptual branches. In the code,
+the two crossing branches each contain a core, an A-stripe, and a B-slab, while
+the two noncrossing branches each contain one window. The result is eight code
+windows and 167 tau nodes:
 
-\[
-|\epsilon^{\rm DFT}_{n\mathbf{k}}-E_F|\leq 5\ {\rm eV},
-\]
+| Half/space | Code windows | Tau nodes |
+|---|---|---:|
+| positive, conduction | core + A-stripe + B-slab | 70 |
+| positive, valence | one noncrossing window | 14 |
+| negative, conduction | one noncrossing window | 14 |
+| negative, valence | core + A-stripe + B-slab | 69 |
+| total | four branch plans, eight pieces | 167 |
 
-leaving a 2 eV interpolation margin. It contains 84 states over all eight
-irreducible $k$ points. The main metrics are:
+The deterministic eight-pole MPA calculation executed the following plans:
 
-| Quantity | MAE (meV) | Mean LORRAX-BGW (meV) | Max abs. (meV) |
+| Pole | $+\omega$, cond. | $+\omega$, val. | $-\omega$, cond. | $-\omega$, val. | Total groups / nodes |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 5 / 841 | 47 / 3,075 | 47 / 6,212 | 5 / 635 | 104 / 10,763 |
+| 1 | 6 / 832 | 63 / 2,488 | 63 / 4,232 | 6 / 647 | 138 / 8,199 |
+| 2 | 6 / 674 | 58 / 1,878 | 58 / 2,877 | 6 / 515 | 128 / 5,944 |
+| 3 | 5 / 348 | 59 / 1,740 | 59 / 2,390 | 5 / 267 | 128 / 4,745 |
+| 4 | 6 / 378 | 61 / 1,737 | 61 / 2,271 | 6 / 303 | 134 / 4,689 |
+| 5 | 5 / 219 | 58 / 1,569 | 58 / 1,955 | 5 / 189 | 126 / 3,932 |
+| 6 | 6 / 243 | 57 / 1,507 | 57 / 1,811 | 6 / 221 | 126 / 3,782 |
+| 7 | 9 / 501 | 123 / 4,417 | 123 / 4,803 | 9 / 477 | 264 / 10,198 |
+| total | 48 / 4,036 | 526 / 18,411 | 526 / 26,551 | 48 / 3,254 | 1,148 / 52,252 |
+
+The important split is:
+
+| Route | Groups | Tau nodes | Fraction of nodes |
 |---|---:|---:|---:|
-| Eqp0, all 84 safe states | 7.726 | +6.594 | 14.561 |
-| Correlation, all 84 states | 7.752 | +6.600 | 14.612 |
-| Exchange, all 84 states | 0.111 | +0.003 | 0.352 |
-| Eqp0, bands 7--10/all $k$ | 7.661 | +7.661 | 10.199 |
-| Bands 7--10 after mean alignment | 1.682 | 0 | 2.577 |
+| two sign-definite branches | 1,036 | 44,842 | 85.8% |
+| two complex crossing branches | 80 | 6,941 | 13.3% |
+| legacy narrow-pole branches | 32 | 469 | 0.9% |
 
-The indirect- and direct-Gamma-gap errors are $-3.594$ and $-4.517$ meV.
-Those gap errors and the aligned band errors are already at the requested
-5 meV level. What remains is chiefly an absolute correlation-energy zero.
+The ten-thousand-node passes are therefore not caused primarily by the
+crossing core. They are caused by the two branches that never cross.
 
-For the selected bands, the raw means are
+One tau node performs the expensive work: build $G(t)$, build the selected
+piece of $W(t)$, transform, multiply, transform back, and project to the target
+bands. Selecting a tiny pole mask costs only about 4.6--11 ms of a measured
+139--175 ms node. Consequently, a pane containing 0.1% of the pole elements
+does not cost 0.1% of a node. It costs essentially one full node.
 
-\[
-\overline{\delta E}_{v}=+8.993\ {\rm meV},\qquad
-\overline{\delta E}_{c}=+6.328\ {\rm meV}.
-\]
+This makes the correct objective
 
-It is useful to resolve them into common and particle--hole-antisymmetric parts:
+$$
+C_\Sigma = \sum_{p,b,g,w} N_\tau(p,b,g,w)\,C_\tau,
+$$
 
-\[
-\delta E_{\rm even}=\frac{\overline{\delta E}_{v}+
-\overline{\delta E}_{c}}{2}=+7.661\ {\rm meV},
-\]
+not the number of pole elements in a group and not the accuracy of each
+quadrature considered in isolation.
 
-\[
-\delta E_{\rm odd}=\frac{\overline{\delta E}_{v}-
-\overline{\delta E}_{c}}{2}=+1.333\ {\rm meV}.
-\]
+## 2. Why the noncrossing planner explodes
 
-This decomposition is the most informative diagnostic in the current data.
+Write one fitted pole as
 
-## 2. Attribution of the 7.6 meV component
+$$
+\Omega_i = a_i-i\Gamma_i,
+\qquad a_i>0,
+\qquad \Gamma_i\ge 0.
+$$
 
-### 2.1 Final frequency interpolation: excluded
+On a sign-definite branch, the scalar denominator has the form
 
-The stored Sigma cube has a 0.5 eV mesh over $[-7,+7]$ eV. Re-evaluating the
-same cube at the DFT energies gives, for bands 7--10:
+$$
+d_i=x_i-i\Gamma_i,
+\qquad x_i>0.
+$$
 
-| Interpolant | MAE (meV) | Mean (meV) | Max abs. (meV) |
-|---|---:|---:|---:|
-| Current linear | 7.661 | +7.661 | 10.199 |
-| PCHIP | 7.635 | +7.635 | 9.883 |
-| Cubic | 7.633 | +7.633 | 9.889 |
+The fitter's guard gives $\Gamma_i\le a_i$, and on the two globally
+noncrossing branches $x_i\ge a_i$. Therefore every individual denominator
+satisfies
 
-The nonlinear interpolants move individual states by at most about 1.2 meV and
-the mean by only 0.03 meV. They cannot account for the common offset.
+$$
+0\le \frac{\Gamma_i}{x_i}\le 1.
+$$
 
-### 2.2 Static remainder: excluded
+The current planner does not certify that coupled set. Within a pole slab it
+first buckets $a_i$, then forms the rectangular bound
 
-The comparison uses BerkeleyGW's primed Eqp0 and correlation columns, so both
-codes contain the same explicit 100-band sum and neither side includes the
-static remainder. In the same BerkeleyGW output, the unprimed-minus-primed
-static-remainder shift for bands 7--10 has mean magnitude $296.8$ meV and
-ranges from about $-375$ to $-211$ meV. It is roughly forty times too large,
-strongly state dependent, and has the wrong interpretation to explain the
-observed residual.
+$$
+\beta_{\mathrm{pane}}
+=
+\frac{\max_{i\in\mathrm{pane}}\Gamma_i}
+     {E_{A,\min}+\min_{i\in\mathrm{pane}}a_i}.
+$$
 
-### 2.3 Exchange and DFT state matching: excluded
+The numerator and denominator can come from different matrix elements. Thus
+every point may obey $\Gamma_i/x_i\le1$ while the enclosing rectangle has
+$\beta_{\mathrm{pane}}>1$. The planner recursively bisects the width axis until
+the false rectangle satisfies the clause. For the accepted Si pole field this
+creates 46--122 `single` panes per sign-definite branch and pole.
 
-The safe-set exchange MAE is $0.111$ meV, with maximum $0.352$ meV. The DFT
-energy mapping differs by at most $0.007$ meV. The offset enters through the
-correlation path.
+For each pane, the current positive composite rule is sized using
 
-### 2.4 Finite-field/local-field head: bounded, not the common offset
+$$
+A_{\mathrm{rect}}
+=
+\frac{\Gamma_{\max}+(x_{\max}-x_{\min})}{x_{\min}},
+$$
 
-The accepted head is built from the long-wavelength Schur complement. In block
-form, with the reciprocal-space dielectric matrix separated into head and body,
+and at $10^{-8}$ its node count is approximately $7A_{\mathrm{rect}}$. The
+full kernel is then rerun for that pane. This is a conservative certification
+strategy for a rectangle that the physical pole cloud never occupied.
 
-\[
-\epsilon =
-\begin{pmatrix}
-\epsilon_{00} & \epsilon_{0G}\\
-\epsilon_{G0} & \epsilon_{GG'}
-\end{pmatrix},
+The width range is real, but the need for hundreds of full-kernel panes is not.
+
+There is an intermediate option already present in the source. A read-only
+reconstruction of the disabled ratio-four binned-width clause gives 11,631
+nodes instead of 52,252, a 4.49-fold reduction, without changing the crossing
+branches. That is a useful fallback while sector rules are being certified,
+but it is not the desired endpoint: it remains about seventy GN node counts
+and retains width panes that have no physical meaning.
+
+## 3. The sign-definite replacement: one complex sector
+
+The exact identity is
+
+$$
+\frac{1}{d}=\int_0^\infty e^{-d\tau}\,d\tau,
+\qquad \Re d>0.
+$$
+
+Suppose the served denominators occupy a sector
+
+$$
+-\phi_{\max}\le\arg d\le0,
+\qquad 0<\phi_{\max}\le\frac{\pi}{2}.
+$$
+
+Rotate the contour once, with $\theta=\phi_{\max}/2$:
+
+$$
+\frac{1}{d}
+=
+e^{i\theta}\int_0^\infty
+\exp\!\left[-d e^{i\theta}s\right]ds.
+$$
+
+Now the exponent lies in the symmetric sector
+
+$$
+-\frac{\phi_{\max}}{2}
+\le
+\arg\!\left(d e^{i\theta}\right)
+\le
++\frac{\phi_{\max}}{2},
+$$
+
+so its decay is bounded by the magnitude of the *same* denominator. No
+unrelated $\Gamma_{\max}$ is paired with an unrelated $x_{\min}$.
+
+With $\eta_\Sigma=0$ in the quasiparticle limit, or
+$\delta_i=\Gamma_i+\eta_\Sigma$ when finite broadening is requested, the clean
+universal choice is
+$\phi_{\max}=\pi/2$ and $\theta=\pi/4$, covering the whole fourth quadrant. In
+that case
+
+$$
+\Re\!\left[(x-i\delta)e^{i\pi/4}\right]
+=
+\frac{x+\delta}{\sqrt{2}},
+$$
+
+and
+
+$$
+\frac{
+\left|\Im\!\left[(x-i\delta)e^{i\pi/4}\right]\right|
+}{
+\Re\!\left[(x-i\delta)e^{i\pi/4}\right]
+}
+=
+\frac{|x-\delta|}{x+\delta}
+\le1.
+$$
+
+This covers the globally noncrossing branches and the stripe/slab pieces with
+one convention; no special case is needed when a pole is far from the real
+axis.
+
+This contour remains separable. The existing tau kernel receives
+
+$$
+t=-i e^{i\theta}s,
+$$
+
+and evaluates the exact $G$ and pole phases at that complex time. With energy
+references chosen at the lower edges of their windows, both the $G$ factor and
+the $W$ factor decay separately. There is no transition tensor and no need to
+hold more than one pole slab.
+
+On a stripe/slab with the $+\omega$ phase, the scalar energy-reference factor
+and the scalar output-frequency factor must be formed as one exponential. The
+former dominates by construction, so their product decays, but evaluating a
+growing $e^{+\omega e^{i\theta}s}$ and a decaying reference factor separately
+could overflow before multiplication. This is an implementation detail that
+the scalar oracle must exercise explicitly.
+
+A sector exponential rule can be constructed by sinc quadrature after
+$s=e^y$, or by a sector minimax solve. Its rank should grow logarithmically
+with the radial range, rather than linearly with the false rectangle's phase
+bandwidth. That scaling is a mathematical design target, not yet a measured
+production result. It must be certified on the actual denominator domain
+before it replaces the current rule.
+
+The default policy should be one rule per sign-definite branch. If the radial
+range exceeds a certified table, use a very small number of logarithmic radial
+windows. A split is accepted only when the *sum* of their node counts beats the
+one-rule plan by a material factor. Hundreds of width panes are not an
+acceptable fallback.
+
+## 4. Crossing: separate the quasiparticle limit from finite broadening
+
+The original MPA self-energy contains the Green-function time-ordering
+parameter separately from the fitted complex screening pole. For an empty-state
+denominator,
+
+$$
+\frac{1}
+{\omega-E_m-\Omega_p+i\eta_\Sigma}
+=
+\frac{1}
+{u+i(\Gamma_p+\eta_\Sigma)}.
+$$
+
+The fitted plasmon width is $\Gamma_p=-\Im\Omega_p$. The formal quasiparticle
+target takes $\eta_\Sigma\to0^+$; a finite $\eta_\Sigma$ is a separately
+requested broadened self-energy, not an intrinsic part of MPA and not a
+quadrature-conditioning knob.
+
+### 4.1 What is wrong now
+
+For $\Gamma_p\ge\xi$, LORRAX retains the fitted complex pole. That is the
+correct $\eta_\Sigma=0$ limit. For $\Gamma_p<\xi$, it discards $\Gamma_p$,
+makes the pole real, and sends it through the legacy HGL-smoothed real-pole
+target at $\xi$. Here $\xi=0.6667$ eV is derived from the requested output
+window. The two sides are different analytic targets and do not meet
+continuously at $\Gamma_p=\xi$.
+
+This replacement changes the dispersive part coherently on either side of a
+pole. It is therefore a credible candidate for part of the observed
+$+6.594$ meV common Si correlation offset, but the residue-weighted sign and
+magnitude are unknown. The decisive diagnostic is current HGL versus the full
+complex fitted $\Gamma_p$ at the same $\eta_\Sigma=0$, followed by an
+independent $\xi$-sensitivity sweep. A finite-$\eta_\Sigma$ run changes the
+observable and is not, by itself, an attribution test.
+
+### 4.2 What the rigid Si offset is, and is not
+
+For bands 7--10—two valence and two conduction bands at all eight irreducible
+$k$ points—the MPA--BGW-CD difference has mean $+7.661$ meV, while its
+mean-aligned MAE is only 1.682 meV. It is therefore usefully described as a
+near-gap common correlation shift, although the complete 84-state safe window
+is less perfectly rigid.
+
+Several explanations are already excluded or strongly constrained:
+
+- bare $\Sigma_x$ has mean error $+0.0025$ meV and MAE 0.111 meV, so the
+  residual is not ordinary exchange or upstream bare-Coulomb machinery;
+- the comparison uses BGW's primed columns, which omit the 'achcor' static
+  remainder, and LORRAX also has no static remainder. 'exact_static_ch=1'
+  makes BGW's primed and corrected results available; it does not insert the
+  remainder into the primed result;
+- BGW's 'gpp_sexcutoff' and 'gpp_broadening' are GPP controls, not part of the
+  contour-deformation reference used here, so a PPM SEX cutoff cannot explain
+  this MPA--CD statistic;
+- output-grid interpolation has about 0.69 meV RMS effect and $-0.027$ meV
+  signed mean, too small and too non-rigid to supply the offset.
+
+The remaining ranked candidates are the narrow-pole HGL substitution, general
+body continuation error from an exactly determined but not held-out-certified
+MPA fit, and a smaller residual dynamic-head continuation error. The Schur/LF
+head's agreement with the matched BGW head rules out a gross head
+normalization or static-screening error, but does not prove its complete
+real-axis continuation at the meV level.
+
+The shortest attribution sequence is:
+
+1. legacy HGL versus full-complex fitted $\Gamma_p$ at
+   $\eta_\Sigma=0$, followed by a $\xi$ sweep;
+2. head-exact/head-off/body-only decompositions of $\Sigma_c$;
+3. additional body $W(z)$ oracle points scored with a
+   self-energy-weighted norm.
+
+Until those tests are made, the rigid term is localized to the
+correlation-frequency treatment but should not be assigned specifically to
+the head or the narrow-pole route.
+
+### 4.3 The common four-window geometry
+
+Let $T=\omega_{\max}$. Each crossing branch is partitioned only by real
+energies:
+
+- core: $E_A\le T$ and $a_p\le T$;
+- A-stripe: $E_A>T$ and $a_p\le T$;
+- B-slab: all $E_A$ and $a_p>T$.
+
+These inequalities partition the branch exactly. The stripe and slab are
+strictly sign-definite and use the sector rule. Only the core needs real time,
+with
+
+$$
+-2T\le u=\omega-E_A-a_p\le T.
+$$
+
+This topology is independent of $\Gamma_p$, $\eta_\Sigma$, and an
+`edge_factor`. Widths choose a scalar rule inside the core; they do not create
+a new energy-window tree.
+
+### 4.4 Explicitly broadened self-energy
+
+If a finite $\eta_\Sigma>0$ is requested, define
+
+$$
+\delta_p=\Gamma_p+\eta_\Sigma
+$$
+
+continuously for every pole. The core identity is
+
+$$
+\frac{1}{u+i\delta_p}
+=
+-i\int_0^\infty e^{iut}e^{-\delta_p t}\,dt.
+$$
+
+One rule can be certified on the full right-half-plane rectangle
+
+$$
+-2T\le u\le T,
 \qquad
-\epsilon_M^{-1}=
-\left(
-\epsilon_{00}-\epsilon_{0G}\epsilon_{GG'}^{-1}\epsilon_{G'0}
-\right)^{-1}.
-\]
+\eta_\Sigma\le\delta_p\le T+\eta_\Sigma,
+$$
 
-The 1394-centroid artifact gives
+with logarithmic grading near $t=0$ for the short-time scale at large
+$\delta_p$. The stored pole is not changed. On real time the integrator
+multiplies by $e^{-\eta_\Sigma t}$; on a sector contour it may equivalently use
+the temporary Sigma-only operand
 
-| Sample | LORRAX $W_h$ (Ry) | BerkeleyGW $W_h$ (Ry) | Relative difference |
-|---|---:|---:|---:|
-| $z=0$ | 150.0791 | 150.0650 | $9.4\times10^{-5}$ |
-| $z=2i$ Ry | 2343.3675 | 2343.1341 | $1.0\times10^{-4}$ |
+$$
+\Omega_p^{\mathrm{eff}}
+=
+a_p-i(\Gamma_p+\eta_\Sigma).
+$$
 
-Most of that displayed difference is the independently integrated bare head.
-Using the same $v_h$, the screened inverse-dielectric differences are
-$6.9\times10^{-6}$ and $1.0\times10^{-6}$, respectively. The fitted head
-poles are causal and the sample interpolation residual is
-$5.5\times10^{-10}$.
+The causal sign must be checked separately on occupied and empty branches.
+$\eta_\Sigma$ must match a reference calculation or be part of an explicit
+convergence sequence; it must never increase when the output window widens.
 
-That last number must not be overinterpreted. The accepted head's held-out
-near-real-strip residual is about 0.3195 even though it interpolates the 16
-training samples essentially exactly and satisfies its transition-manifold
-moment at $10^{-5}$. This is a direct demonstration that training residual,
-pole quadrant, and one asymptotic moment do not certify continuation where
-Sigma evaluates it. The occupied/empty sign test still excludes the head as
-the source of the *common* 7.66 meV component, but real-axis head validation
-remains important for the smaller odd component and for other materials.
+### 4.5 Strict quasiparticle limit
 
-BerkeleyGW's finite-field calculation does not simply omit the dynamic head.
-Its `eps0mat` contains the dynamic $G=G'=0$ slot, while its small-cell
-Coulomb treatment defines the corresponding bare head. The two programs use
-different machinery to obtain the same limiting object; the direct sample
-comparison above is a stronger test than trying to infer equivalence from code
-names.
+At $\eta_\Sigma=0$, every fitted $\Gamma_p>0$ stays in the exact complex
+resolvent:
 
-There is also a structural sign test. For the scalar MPA head, exactly on shell,
+$$
+\frac{1}{u+i\Gamma_p}
+=
+-i\int_0^\infty e^{iut}e^{-\Gamma_p t}\,dt.
+$$
 
-\[
-\Sigma^{h}_{c,v}\propto
-+\sum_p \frac{B^h_p}{\Omega_p-i\Gamma_p},\qquad
-\Sigma^{h}_{c,c}\propto
--\sum_p \frac{B^h_p}{\Omega_p-i\Gamma_p}.
-\]
+There is no positive global floor when fitted widths approach zero. The clean
+options are therefore:
 
-Changing the head therefore shifts occupied and empty states in opposite
-directions to leading order. Directly substituting older and accepted head fits
-changes the selected states by approximately $+5.3$ meV for valence and
-$-5.3$ meV for conduction, with essentially zero common mean. The observed
-common $+7.661$ meV component cannot be caused by a missing BerkeleyGW head
-correction. Only the $1.333$ meV odd component remains plausibly head-like.
+1. one certified multiscale core rule over the actual
+   $(u,\Gamma_p)$ domain, if its total node count is acceptable;
+2. a few geometric $\Gamma$ rule bands that retain each element's exact
+   $e^{-\Gamma_p t}$ physics;
+3. an analytic shifted-resolvent or principal-value treatment for exactly
+   real poles.
 
-### 2.5 f-sum rule: no evidence of a unit bug; moment accuracy remains relevant
+The limit $\Gamma_p=0$ is a principal-value plus delta-function problem and
+must be named as such. A small positive fitted width must not be turned into a
+real pole merely because it is expensive. In an idealized time-bandwidth
+model, the oscillatory part of dyadic width-band costs forms a geometric sum,
+but near-zero resolution, tolerance terms, and per-band overhead prevent that
+from being a certified bound. The scalar campaign must decide whether one
+multiscale rule or a small number of bands is cheaper.
 
-For
+## 5. The target Sigma plan
 
-\[
-W_c(z)=\sum_{p=1}^{n_p} B_p
-\left[\frac{1}{z-\Omega_p}-\frac{1}{z+\Omega_p}\right],
-\]
+For each pole pass, the conceptual plan should again be:
 
-the high-frequency expansion is
+| Half/space | Plan |
+|---|---|
+| $+\omega$, conduction | crossing core + sector A-stripe + sector B-slab |
+| $+\omega$, valence | one sector noncrossing rule |
+| $-\omega$, conduction | one sector noncrossing rule |
+| $-\omega$, valence | crossing core + sector A-stripe + sector B-slab |
 
-\[
-W_c(z)=\frac{C_2}{z^2}+\frac{C_4}{z^4}+O(z^{-6}),
+This is the same four-branch story as GN-PPM. Complex poles change the scalar
+quadrature served by a branch; they do not require a new combinatorial
+hierarchy.
+
+Without simultaneous pole storage, aggregate Sigma work cannot honestly equal
+GN work. Each of $n_p$ pole slabs must pass through the contraction at least
+once. The useful best-case architectural reference is therefore
+
+$$
+n_p N_\tau^{\mathrm{GN}}
+=
+8\times167
+=
+1{,}336,
+$$
+
+not $N_\tau^{\mathrm{GN}}$ itself. This is not a mathematical lower bound:
+finite $\Gamma_p$ can make some MPA poles easier, while a small explicit
+$\eta_\Sigma$ can make the crossing core harder than GN.
+
+For an explicitly broadened calculation, a useful cost model is
+
+$$
+N_{\mathrm{total}}(\eta_\Sigma)
+=
+N_{\mathrm{sector}}+\frac{K}{\eta_\Sigma},
+$$
+
+where the second term represents the crossing-core time scale. Neither
+$N_{\mathrm{sector}}$ nor $K$ is known yet; Step A must determine both from
+certified scalar rules. In the strict quasiparticle limit the relevant model
+is instead the measured cost of the multiscale or few-band $\Gamma_p$ plan.
+The defensible commitment at this stage is narrower: eliminate the 44,842
+sign-definite pane nodes and let the scalar campaign determine the remaining
+core cost.
+
+Independent pole jobs can reduce wall latency when enough GPUs are available,
+while aggregate node work remains proportional to $n_p$. The achieved latency
+also includes compilation, I/O, fit, and scheduler overhead and must be
+measured. Reusing one $G(t)$ build across several pole slabs could remove the
+aggregate factor, but it is the separate multi-pole-memory project and is not
+assumed here.
+
+## 6. Constructing $W(z)$ without transitions
+
+### 6.1 What produced the accepted store
+
+The accepted file
+
+`/pscratch/sd/j/jackm/mpa_geom_0810/det6/stores/Wc_det_np8.h5`
+
+is stamped `prov_route='exact-resolvent'` and
+`prov_producer='geom_samples.stage_geom'`. For each irreducible $q$, that
+producer calls `chi0_resolvent` for all 16 samples and then performs 16 Dyson
+solves. The implementation forms, one $k$ block at a time,
+
+$$
+M^q_{cvk}(\mu)
+=
+\sum_s
+\psi^*_{c,k-q}(s,\mu)\psi_{v,k}(s,\mu).
+$$
+
+It also allocates the complete 16-frequency $W_c$ array. This was a useful
+correctness route for the Si campaign, but it is not the scalable production
+architecture. It must not become the FF path for large band counts, dense
+$k$ meshes, phonon displacements, or high-throughput work.
+
+For this small Si case the memory-heavy route is fast: the recorded body build
+costs about 0.74--1.30 s for all 16 samples at one irreducible $q$, followed by
+about 0.29 s for the 16 Dyson solves. The objection is its transition-space
+memory and scaling, not that this particular artifact was slow.
+
+### 6.2 The non-materializing line sweep
+
+For a transition energy $\Delta>0$ and sample $z=\omega+i\varpi$,
+
+$$
+K_z(\Delta)
+=
+\frac{1}{z-\Delta}-\frac{1}{z+\Delta}
+=
+-2\int_0^\infty
+e^{-\varpi t}e^{i\omega t}\sin(\Delta t)\,dt.
+$$
+
+At one real-time node, the transition sine sum can be formed from the
+anti-Hermitian combination of conduction and valence propagator products. In
+schematic form,
+
+$$
+S_q(t)
+=
+\sum_{kvc}M^q_{cvk}M^{q*}_{cvk}\sin(\Delta_{cvk}t),
+$$
+
+but $M^q_{cvk}$ is never constructed. The existing ISDF pattern builds the
+conduction and valence Green functions, multiplies them in real space, and
+FFTs the product to all $q$.
+
+Every sample on one horizontal line then differs only in scalar weights:
+
+$$
+\chi_0(q;\omega_j+i\varpi)
+\approx
+-2\sum_{\ell}h_\ell
+e^{-\varpi t_\ell}e^{i\omega_jt_\ell}S_q(t_\ell).
+$$
+
+Thus one expensive $G_cG_v$/FFT sweep serves the complete line. The near and
+far lines have different $\varpi$ and should have different rules.
+
+$S_q(t_\ell)$ must be produced, accumulated into the requested frequency
+outputs, and discarded one time node at a time. Storing it for every
+$t_\ell$ would merely replace the forbidden transition tensor by an
+$N_\tau n_qN_\mu^2$ time-history tensor.
+
+This requires a real-time sibling of `w_isdf.compute_chi0_multi`; the current
+`evaluator.evaluate_samples` expresses the scalar line algebra but is not wired
+to a production Green-function sweep.
+
+### 6.3 Why a separate grid for every $W(z)$ is usually worse
+
+For the monolithic line representation, let
+
+$$
+F=\Delta_{\max}+\max_j|\omega_j|,
 \qquad
-C_2=2\sum_pB_p\Omega_p,
-\quad C_4=2\sum_pB_p\Omega_p^3.
-\]
-
-The transition-manifold f-sum residual stored with the accepted fit is
-$1.0\times10^{-5}$. A separate log value near 0.19 compares against a
-classical plasma-frequency target and is not evidence of a Hartree/Rydberg
-conversion error: converting both $B_p$ and $\Omega_p$ changes
-$B_p\Omega_p$ by the required factor of four.
-
-Nevertheless, sample interpolation and a global f-sum check do not prove that
-every body element has the right high-frequency moments. A small systematic
-error in
-
-\[
-M_1(\mathbf q;\mu\nu)=2\sum_p
-B_{p,\mathbf q}^{\mu\nu}\Omega_{p,\mathbf q}^{\mu\nu}
-\]
-
-is a credible mechanism for a common Coulomb-hole-like shift. This is the most
-important untested theoretical diagnostic.
-
-### 2.6 Unresolved body ambiguity: rational fit versus Sigma evaluation
-
-The evidence does not yet identify one unique line of code. It does narrow the
-search to the dynamic body correlation construction, but that construction has
-two separate approximations.
-
-First, the rational fit may have a continuation or moment bias. Existing
-body-only pole ladders are oscillatory: on an older 1128-centroid geometry, the
-indirect gap moved by $-48.8$ meV from $n_p=8$ to 10 and $+42.7$ meV from 10
-to 12. A diagnostic projection of the 12-pole-minus-8-pole body correction
-onto the current near-gap states reduces a 7.07 meV MAE to 4.39 meV, but that
-projection mixes centroid geometries and is not a result that should be banked.
-
-Second, LORRAX does not insert every fitted body pole into the analytic MPA
-self-energy formula. For the $\pm7$ eV output window the conditioning floor
-sets $\xi=0.6667$ eV. Every fitted element with $\Gamma_p<\xi$ is treated as a
-real pole by the legacy two-point crossing machinery and broadened at $\xi$.
-Per pole pass, 6.09--15.29% of all elements take this route; their fractions of
-total $|B|$ are 1.62--6.15%. Across all eight passes the corresponding totals
-are 10.50% by count and 4.03% by residue mass. This replacement is absent from
-the published MPA/Yambo convolution and is large on the scale of fitted widths.
-It may be numerically benign after integration, but that has not been shown by
-a direct-resolvent comparison. It is presently the cheapest serious candidate
-for a few-meV bias.
-
-The appropriate conclusion is therefore:
-
-- compare the current complex-time answer to the exact fitted-pole denominator
-  before changing the fit;
-- the body fit is not demonstrated to be converged monotonically;
-- its error has the correct common-sign character;
-- a same-geometry nested ladder is required before choosing between sample
-  placement, insufficient pole order, a moment constraint, and a Sigma
-  quadrature bias.
-
-## 3. Relation to the MPA and CTSP formulations
-
-### 3.1 The rational ansatz agrees with the published MPA
-
-The original multipole method represents each response element as
-
-\[
-X^{\rm MPA}(z)=\sum_{p=1}^{n_p}
-\frac{2\Omega_pR_p}{z^2-\Omega_p^2},
-\]
-
-using $2n_p$ complex-frequency samples. LORRAX instead fits $W_c$ directly,
-
-\[
-W_c^{\rm MPA}(z)=\sum_{p=1}^{n_p}
-\frac{2\Omega_pB_p}{z^2-\Omega_p^2},
-\]
-
-which is the same scalar rational structure. In a diagonal plane-wave Coulomb
-basis, the two residues differ by frequency-independent multiplication by bare
-Coulomb factors. In the ISDF basis, however, an elementwise pole is an
-effective basis-dependent representation, not necessarily a literal physical
-oscillator. Pole-by-pole interpretations should therefore be made cautiously;
-the reconstructed matrix response and its spectral constraints are the
-physical tests.
-
-The published self-energy convolution is analytic once the pole model is
-known:
-
-\[
-\Sigma_c(\omega)=\sum_{m,p}\mathcal V_{mp}
-\left[
-\frac{f_m}{\omega-\epsilon_m+\Omega_p-i\eta}
-+\frac{1-f_m}{\omega-\epsilon_m-\Omega_p+i\eta}
-\right],
-\]
-
-where $\mathcal V_{mp}$ contains the state vertices and pole residues. Yambo
-follows this pole-denominator route. LORRAX's scalar head uses the same algebra,
-but its body uses CTSP quadratures to retain low scaling in the ISDF
-representation. That is a valid algorithmic hybrid, but it is not numerically
-equivalent to Yambo until its quadrature and narrow-pole substitutions are
-checked against the analytic expression.
-
-### 3.2 Sampling and fitting: common design, different algorithms
-
-| Feature | Original papers / Yambo | LORRAX |
-|---|---|---|
-| Fitted object | Polarizability/dielectric response | $W_c$ directly in ISDF |
-| Samples | One shared complex grid | One shared near/far two-line grid |
-| Fit | Padé or Padé--Thiele | Scaled fixed-support Loewner by default |
-| Pole guards | Filter/coalesce/map, then residue refit | Local reflection/pruning/coalescence/range guards, then residue refit |
-| Sigma | Analytic pole convolution | Analytic head; CTSP body with a narrow-pole fallback |
-| Precision | Double recommended | x64 |
-
-The papers and Yambo use one shared two-line grid for all response elements,
-with near/far heights of roughly 0.1/1 Ha and $2n_p$ total points. This shared
-grid is essential: element-specific frequency grids would require the union of
-all requested frequencies in the expensive response/Dyson stage.
-
-LORRAX follows this design, and its published real-axis partition agrees with
-the original table through $n_p=7$. Its greedy continuation at larger orders
-is LORRAX-specific and differs from current Yambo's dyadic `lP` construction.
-This is not inherently wrong, but it means high-order behavior must be
-validated rather than inferred from Yambo.
-
-The difference is already numerically material: on the older 1128-centroid
-body data, a current-Yambo-style ten-pole grid changed the result by about
-$-49.7$ meV relative to LORRAX's ten-pole grid. This does not establish which
-grid is better; it establishes that the high-order point set, not just
-$n_p$, is a convergence parameter.
-
-The fitting algorithm is also intentionally different. LORRAX defaults to a
-scaled, fixed-support Loewner pencil with `rcond=1e-13`; the papers and Yambo
-use linear-algebra Padé or Padé--Thiele, with Padé--Thiele the current Yambo
-default. Yambo explicitly warns that accuracy need not improve monotonically
-with pole count, recommends double precision, and advises no more than about 20
-poles. LORRAX's Loewner formulation is defensible and often better conditioned,
-but it needs model-order sensitivity, held-out continuation, and physical
-matrix checks rather than a claim of numerical equivalence to Yambo.
-
-LORRAX's guard sequence broadly follows the published practice: map poles into
-an underdamped fourth-quadrant sector, remove or coalesce unsupported poles, and
-refit residues over all samples. The precise thresholds and survivor rules are
-local choices. Reflecting a pole is a model-changing repair, not by itself a
-causality proof; fourth-quadrant scalar poles with complex elementwise residues
-also do not guarantee matrix Hermiticity, passivity, or positive spectral
-weight.
-
-One convention statement should be corrected before extending the code to new
-contours. With $\Omega=a-i\Gamma$, the time-ordered even response has poles at
-$+\Omega$ in the fourth quadrant and $-\Omega$ in the second quadrant. It is
-therefore not analytic throughout the entire upper half-plane. Sampling in the
-first quadrant remains appropriate, but `sample_plan.py` currently describes
-this using a global-upper-half-plane analyticity statement that conflates the
-time-ordered and retarded sheets.
-
-### 3.3 CTSP is an additional approximation layer
-
-LORRAX separates two approximations that should be diagnosed independently:
-
-1. a rational approximation of each screened-interaction element $W(z)$;
-2. a complex-time separated evaluation of the resulting Sigma denominators.
-
-For a fitted pole $\Omega_p=\omega_p-i\gamma_p$, the correlation denominator
-has the generic form
-
-\[
-D=\omega-\epsilon_{m,\mathbf{k-q}}\mp\Omega_p.
-\]
-
-Within a sign-definite energy window, a Laplace representation separates its
-state and pole dependence,
-
-\[
-\frac{1}{D}=s\int_0^\infty d\tau\,
-e^{-sD\tau},
-\qquad \operatorname{Re}(sD)>0,
-\]
-
-and crossing windows use a regularized/shifted representation. The minimax
-rules approximate the exponential family over a bounded spectral interval.
-Consequently, cost and accuracy depend on the **window envelope**, damping, and
-node reuse, not only on how accurately the rational fit matches its training
-samples.
-
-The current crossing/noncrossing distinction is physically and numerically
-well motivated and should be retained. The weak point is that routing creates
-many conservative pole/group/window panes and evaluates a separate tau rule for
-each. A rule optimal for an individual Lorentzian is not automatically optimal
-for the full calculation: if it prevents reuse of $G(\tau)$, it can increase
-total work even with fewer nodes per element.
-
-The $\Gamma<\xi$ branch is more than a routing optimization. It replaces
-$1/(u+i\Gamma_p)$ by a real-pole target regularized over a width $\xi$. The
-current argument is that poles much narrower than the calculation's crossing
-resolution are indistinguishable after smearing. That may be a useful numerical
-model, but $\xi$ depends on the requested output window and the HGL conditioning
-floor, while $\Gamma_p$ came from the fitted response. Results can therefore
-acquire an output-window-dependent approximation not present in the MPA ansatz.
-A direct analytic-denominator oracle and a controlled $\xi$ sweep are mandatory
-before this route is considered generally robust.
-
-### 3.4 Robustness beyond insulating Si
-
-One insulating Si calculation cannot validate the method for metals, small-gap
-systems, localized excitations, strongly anisotropic screening, or semicore
-states. Published metallic MPA work introduces a tiny imaginary displacement
-at the origin, low-energy quadratic sampling for Al/Cu, and a separate
-$q\rightarrow0$ intraband correction. These are different analytic
-requirements, not tuning details.
-
-A general production protocol should select among at least insulating,
-small-gap, and metallic sample plans; include the appropriate intraband and
-long-wavelength limits; and certify each q/block by held-out matrix errors,
-moment errors, causality, and passivity. The same global candidate pool can
-still be shared, but its low-energy density and origin treatment must depend on
-the system class.
-
-## 4. Measured cost structure
-
-### 4.1 W sampling and fitting
-
-The double-parallel grid uses exactly
-
-\[
-n_z=2n_p
-\]
-
-screened-interaction samples. The dominant response work scales approximately
-as
-
-\[
-C_W=O\!\left(2n_p n_q n_k n_v n_c n_\mu^2\right),
-\]
-
-while storage scales as $2n_p n_qn_\mu^2$. Pair amplitudes and transition
-energies should be constructed once per $(q,k\hbox{-block})$ and scanned over
-all $z$; the resolvent implementation supports this sharing pattern.
-
-The strip has $2(n_p-1)$ points on two horizontal lines. The evaluator's
-correctness default is currently `batching="per-point"`; `per-line` reduces the
-number of strip sweeps from 14 to 2 for $n_p=8$, and from 18 to 2 for
-$n_p=10$. It does not remove the Dyson solve for each sample, but can remove
-repeated quadrature/transition sweeps.
-
-The fit performs $n_qn_\mu^2$ small rational problems, with work growing
-roughly as $n_p^3$. The old diagnostic path redundantly refit each element.
-The current path removed the full refit, but can still avoid a second Padé solve
-by returning the already-computed solve vector with the conditioning result.
-
-Priority depends on the W producer. In the recorded Si exact-resolvent build,
-the inner work for all 16 samples and eight q points was only about 9.2 s,
-while fitting took about 411 s and each Sigma pole pass took roughly $10^3$ s.
-Reducing 16 samples to 12 would therefore save only about 2.3 s in that run.
-Line batching and adaptive sample counts can matter much more for the damped-
-time W producer or larger systems, but the present Si bottleneck is Sigma first
-and fitting second.
-
-### 4.2 Sigma
-
-The production pole-pass logs contain:
-
-| Pole | Tau dispatches | Dispatch wall (s) | Pass wall (s) |
-|---:|---:|---:|---:|
-| 0 | 10,763 | 2,522 | 2,954 |
-| 1 | 8,199 | 1,928 | 2,269 |
-| 2 | 5,944 | 1,393 | 1,663 |
-| 3 | 4,745 | 1,113 | 1,337 |
-| 4 | 4,689 | 1,099 | 1,329 |
-| 5 | 3,932 | 923 | 1,122 |
-| 6 | 3,782 | 887 | 1,077 |
-| 7 | 10,198 | 2,534 | 2,941 |
-| **Total** | **52,252** | **12,399** | **14,692** |
-
-The matched GN-PPM run made 167 tau dispatches, taking 12.8 s of a 63.1 s
-total. Although the eight MPA poles can be fanned out, the longest pass is about
-49 minutes, versus about one minute for GN. Pole 0 alone used panes containing
-roughly 50--342 nodes. This is the main wall-time problem.
-
-Reducing the number of requested output $\omega$ points will not reduce this
-cost proportionally: one tau evaluation accumulates the whole output-frequency
-vector. Likewise, narrower pole storage is not the primary issue here.
-
-## 5. Recommended theoretical and algorithmic program
-
-The priorities below distinguish changes that preserve the mathematical
-approximation from research changes that alter it.
-
-### Priority 0: add measurements, not a large test suite
-
-For every production MPA run, record:
-
-- $n_p,n_z,n_q,n_\mu,n_k,n_v,n_c,n_\omega$;
-- W route counts, line sweeps, quadrature-node totals, and Dyson solves;
-- fit dispatch count, solve count, backward error, training residual, held-out
-  residual, and moment residual;
-- for every Sigma pole/branch/group/window: placement, spectral bounds,
-  damping, $N_\tau$, tau-kernel time, and accumulated residue norm.
-
-The scalar objective for routing changes should be measured total tau-kernel
-time or $\sum N_\tau C_\tau$, with QP error as a constraint. This can be added
-as production diagnostics and output parsing; it does not require a broad new
-unit-test campaign.
-
-### Priority 1: isolate the body error with an analytic oracle
-
-Before changing the W fit, evaluate a small stratified set of body
-contributions from the existing pole store using the published analytic
-denominators. Include near-gap valence and conduction targets; crossing and
-noncrossing branches; narrow and broad poles; and several q/intermediate-state
-tiles. Compare three numbers from identical $B_p,\Omega_p$ data:
-
-1. the direct analytic denominator;
-2. the exact-complex CTSP route with the fitted $\Gamma_p$;
-3. the current route, including the $\Gamma_p<\xi$ substitution.
-
-This distinguishes fit error, complex-time quadrature error, and width-floor
-error without another W calculation. Sweep $\xi$ downward in the oracle and
-report both count fraction, residue-mass fraction, and the actual contribution
-to Sigma. The result should decide whether the 7.66 meV common shift is already
-present in the rational model or is introduced downstream.
-
-### Priority 2: make current operations share work
-
-1. **Make per-line W evaluation the production default.** This changes 14 strip
-   sweeps to 2 at $n_p=8$. Confirm from production provenance that the external
-   W producer actually reaches this seam. Expected W-stage speedup is roughly
-   2--8x depending on the fraction spent in the unavoidable sample-wise Dyson
-   solves.
-
-2. **Build transition amplitudes once and scan all $z$.** Keep the
-   `chi0_resolvent` sharing structure in the production path. Stream q or column
-   tiles to avoid materializing an unnecessarily large
-   $(2n_p,n_\mu,n_\mu)$ tensor.
-
-3. **Cache and merge compatible Sigma rules.** Key a rule by its placement,
-   envelope, damping range, and requested tolerance. Merge adjacent routing
-   groups only when the merged rule lowers total $\sum N_\tau$, not merely the
-   group count. This preserves the existing crossing/noncrossing logic and
-   should reduce repeated launches without changing pole physics. The existing
-   experimental width-binning clause has already reduced documented node totals
-   from 5541 to 885 and from 1393 to 245, about sixfold. It is the first
-   low-risk Sigma timing A/B, provided the catalog certificate and final-output
-   equivalence gates remain active.
-
-4. **Use the shipped damped-line minimax catalog.** The selector exists but has
-   no production consumer. Catalog lookup avoids cold runtime rule solves and
-   should replace composite fallback where its certified envelope covers the
-   requested near/far lines.
-
-5. **Return conditioning data from the first fit solve.** Avoid the remaining
-   second Padé solve. This is likely a 15--35% fit-stage improvement, not an
-   end-to-end breakthrough.
-
-### Priority 3: constrain and validate continuation, not just interpolation
-
-The current fit can interpolate its training samples to nearly machine
-precision while still giving a biased continuation between or beyond them.
-For each representative q/block, split a nested sample pool into fitting and
-held-out points and report both
-
-\[
-r_{\rm train}=\max_{z\in Z_{\rm fit}}
-\frac{|W_{\rm MPA}(z)-W(z)|}{\max(|W(z)|,W_{\rm floor})},
-\]
-
-\[
-r_{\rm hold}=\max_{z\in Z_{\rm hold}}
-\frac{|W_{\rm MPA}(z)-W(z)|}{\max(|W(z)|,W_{\rm floor})}.
-\]
-
-Add a moment constraint or penalty,
-
-\[
-\min_{B,\Omega}
-\left\|D\bigl(W_{\rm MPA}(Z)-W(Z)\bigr)\right\|_2^2
-+\lambda_M\left\|2\sum_pB_p\Omega_p-M_1^{\rm target}\right\|_F^2,
-\]
-
-with scaling $D$ chosen by a physically meaningful absolute/relative floor.
-The target should come directly from the transition manifold or an independently
-computed high-frequency response, not the classical homogeneous-electron
-plasma frequency. Causality/passivity checks should remain hard gates.
-
-The current Loewner/scaled fit is preferable to an unscaled raw Padé solve.
-Potential research alternatives are constrained vector fitting, a symmetry-
-preserving AAA/Loewner selection, or shared-pole block fits. They should be
-judged by held-out $W$, moment error, and final QP energies rather than by
-training residual alone.
-
-A practical conditioning audit should fit a deterministic ensemble of balanced
-Loewner support partitions, sweep rank thresholds over roughly
-$10^{-10}$--$10^{-14}$, and choose the smallest rank stable in held-out
-Sigma-weighted errors and trusted moments. After pole selection, refit residues
-with a weighted constrained problem,
-
-\[
-\min_B\|D(AB-W)\|_2^2+\lambda\|LB\|_2^2,
-\qquad CB=m,
-\]
-
-where $D$ reflects sample uncertainty and Sigma influence, $L$ penalizes large
-cancellation-dominated residues, and $CB=m$ imposes only trustworthy static or
-transition-manifold moments. Do not hard-enforce a classical all-electron
-f-sum when the transition space is truncated or a nonlocal pseudopotential
-changes the velocity commutator.
-
-### Priority 4: adapt a shared sample pool, not every element independently
-
-The near/far double-parallel construction is valuable because it is nested and
-lets many matrix elements share expensive $W(z)$ evaluations. Blindly choosing
-a different complex grid for every $W_{\mu\nu}(z)$ would normally require the
-union of all requested frequencies and can cost more than it saves.
-
-A better adaptive design is:
-
-1. build a small, nested global candidate pool on the near/far lines plus a few
-   far-real or arc anchors;
-2. evaluate the candidate samples in line batches;
-3. choose a subset and/or pole order per q-block or spectral cluster using a
-   matrix norm, held-out error, and moment residual;
-4. retain a shared-pole representation inside each block when it is accurate,
-   allowing element-dependent residues without element-dependent sample calls;
-5. enrich the common pool only where a block fails certification.
-
-This keeps the favorable $W$-construction sharing while allowing easy blocks
-to use fewer effective samples. Far-real anchors are particularly useful for
-the high-frequency moment; near-line points resolve low-energy structure. Arc
-points can improve the real-axis strip but tend to demand more expensive
-damped-line quadrature, so their end-to-end cost must be measured rather than
-assumed.
-
-### Priority 5: optimize CTSP windows jointly
-
-The original complex-time method chooses energy windows to balance the number
-of states/poles against quadrature order. LORRAX should solve the analogous
-discrete optimization using the actual fitted-pole distribution:
-
-\[
-\min_{\mathcal P}
-\sum_{w\in\mathcal P}
-N_\tau(A_w,R_w,\gamma_w,\varepsilon)
-\,C_\tau(N_{{\rm state},w})
-\]
-
-subject to certified approximation error and with an explicit reward for node
-reuse. Here $\mathcal P$ partitions state/pole pairs, $A_w,R_w$ are the
-window's spectral bounds, and $\gamma_w$ is its damping envelope.
-
-Practical steps are:
-
-- preserve separate crossing and noncrossing families;
-- use actual state density and residue-weighted pole density when proposing
-  splits;
-- merge bins if the wider rule costs less than the sum of the narrow rules;
-- construct a shared union of tau nodes at branch/window scope and reuse
-  $G(\tau)$ across poles where interpolation of the scalar pole factor is
-  certified;
-- treat per-Lorentzian minimax rules as candidates inside this global cost
-  problem, not automatically as the execution grid.
-
-The last item is a research change. A logarithmic master tau grid with
-barycentric or generalized-Gaussian weights may enable much more reuse, but it
-must be tested against direct denominators because interpolation in tau can
-amplify cancellation in crossing windows.
-
-### Priority 6: prototype common-pole matrix or channel models
-
-The exact matrix response has common excitation energies and matrix residues.
-Independent elementwise fits discard that structure and make each denominator
-depend on $(\mu,\nu)$, which is why the analytic MPA sum is difficult to retain
-inside the low-scaling ISDF contraction. A reduced model
-
-\[
-W_c^q(z)\approx\sum_{p=1}^{K}
-\frac{2\Omega_{pq}B_{pq}}{z^2-\Omega_{pq}^2}
-\]
-
-with matrix residues $B_{pq}$ would make the pole energy common within a q
-block or channel cluster. It offers several advantages:
-
-- pole locations become basis covariant within the modeled block;
-- reciprocity, Hermiticity, and retarded spectral positivity can be imposed on
-  matrix residues;
-- the denominator no longer varies across every ISDF matrix element;
-- shifted-G/resolvent builds can evaluate the body convolution analytically,
-  as the scalar head already does, eliminating tau quadrature for accepted
-  blocks.
-
-A single global eight-pole matrix model will probably be too rigid. Prototype
-block/tangential Loewner fits of dominant dielectric eigenchannels, clusters of
-channels that share poles, or PSD factorizations of retarded spectral residues.
-If there are $C$ pole clusters and one shifted build remains batched over q, a
-rough shifted-build count is $2CKN_\omega$. It can beat the present time-domain
-route when
-
-\[
-2CKN_\omega < N_{\tau,\mathrm{current}}.
-\]
-
-For $K=8$ and nine target energies this is 144 q-batched builds per cluster,
-versus several thousand tau dispatches per current pole pass. If q cannot be
-batched, the count acquires an additional $N_q$ and may lose outright.
-Communication, transform cost, and attainable q batching therefore determine
-the real break-even point; begin with a small q/channel prototype and the
-direct-denominator oracle rather than a wholesale rewrite.
-
-The newer MPA-Sigma idea--fitting Sigma itself from first- and third-quadrant
-samples--is complementary. It is attractive for dense spectra or many output
-energies, but it does not remove the cost of producing the initial Sigma
-samples and is not the first optimization for a small near-gap QP set.
-
-### Priority 7: reduce pole count only after continuation is certified
-
-Because the current $n_p=8,10,12$ ladder is not converged on a common
-geometry, lowering $n_p$ now would trade an unknown bias for speed. Once the
-moment/held-out checks are in place, a material- or q-block-specific reduction
-from eight to six poles would save 25% of W samples and roughly 40--60% of the
-small fit linear algebra, but perhaps only 15--35% end to end when Sigma
-dominates.
-
-Do not improve timing by artificially broadening fitted poles. Their imaginary
-parts enter the physical Sigma denominator and routing envelopes; changing them
-changes the answer.
-
-## 6. Minimal decisive calculation sequence
-
-No large test expansion is needed. The following production comparisons answer
-the open questions in order.
-
-1. **Direct-denominator and width-floor audit.** On stratified q/state/mode
-   tiles, compare the analytic fitted-pole denominator, the exact-complex CTSP
-   result, and the current $\Gamma<\xi$ route. Sweep $\xi$ toward zero. This
-   requires no new $W(z)$ calculation and is the fastest attribution test.
-
-2. **Same-geometry nested fit audit.** If the first test leaves a rational-fit
-   residual, extend the accepted 1394-centroid nested sample pool from
-   $n_p=8$ to 10 and 12, evaluating only new $W(z)$ points. Record training,
-   held-out, elementwise moment, causality, and backward-error metrics.
-
-3. **Near-gap Sigma target.** Initially evaluate only bands 7--10 at all eight
-   irreducible k points, with the same $[-7,+7]$ eV safe window. Compare raw,
-   mean-aligned, and valence/conduction-even/odd components to BerkeleyGW's
-   primed finite-band result.
-
-4. **Moment-constrained A/B.** At the smallest pole order that still exhibits
-   the common offset, refit the identical $W(z)$ samples with and without the
-   transition-manifold $M_1$ constraint. Do not change Sigma routing in this
-   comparison.
-
-5. **Routing optimization benchmark.** Only after accuracy attribution, compare
-   current panes, safely merged panes, and shared-node candidates. Bank total
-   tau dispatches, total nodes, tau-kernel wall, and final Eqp differences.
-
-6. **Optional BerkeleyGW head upper bound.** If a final head check is desired,
-   vary only BerkeleyGW's small-cell/head averaging or replace only the scalar
-   head contribution. Given the parity and sign decomposition above, this is a
-   lower priority than the body ladder.
-
-Success criteria for the first cycle are:
-
-- raw bands 7--10 MAE ≤5 meV across all eight k points, without an empirical
-  energy shift;
-- gaps and mean-aligned dispersions ≤5 meV;
-- a monotone or at least certified held-out convergence trend with pole order;
-- a substantial reduction from 52,252 tau dispatches, with unchanged direct-
-  denominator answers at the requested tolerance.
-
-## 7. Concrete code touchpoints
-
-- `src/gw/mpa/sampling.py`: nested double-parallel candidate grids and possible
-  anchor enrichment.
-- `src/gw/mpa/evaluator.py`: production `per-line` batching and W-route
-  counters.
-- `src/gw/mpa/chi0_resolvent.py`: transition-amplitude reuse across $z$.
-- `src/gw/mpa/pade_fit.py` and `fit_driver.py`: moment-constrained fit,
-  held-out certification, and removal of the second solve.
-- `src/gw/mpa/sigma_pass.py` and `sigma_routing.py`: joint pane/window cost
-  model, direct-denominator oracle, $\Gamma<\xi$ attribution, compatible-rule
-  merging, and node reuse.
-- `src/gw/mpa/sample_plan.py`: correct the time-ordered versus retarded
-  analyticity wording before introducing any new contour.
-- `services/minimax/src/minimax/damped_line_selector.py`: connect the existing
-  catalog to production.
-- `src/gw/mpa/head_dipole.py` and `sigma_head.py`: retain the accepted
-  Schur-complement head and its independent diagnostics; do not tune it to
-  absorb a body offset.
-
-## 8. Guardrails
-
-- Keep the bare and screened head averages on the same estimator.
-- Keep causality, conjugation, and passivity checks as hard gates.
-- Never select a model using only its training-point interpolation residual.
-- Do not infer general convergence from the current mixed-geometry pole ladder.
-- Do not attribute a common correlation offset to the scalar head without
-  defeating the occupied/empty sign test.
-- Do not optimize group count while increasing total tau nodes.
-- Do not create independent per-element frequency or tau grids unless their
-  global union and lost reuse are included in the cost model.
-- Keep the user's requested test budget: production parsers/diagnostics may be
-  expanded, but this investigation should not grow a broad unit-test suite.
-
-## 9. Local evidence used in this audit
-
-- MPA production output:
-  `/pscratch/sd/j/jackm/mpa_geom_0810/combine_det_wide`
-- Pole-pass logs:
-  `/pscratch/sd/j/jackm/mpa_geom_0810/_reports`
-- Accepted head artifact:
-  `/pscratch/sd/j/jackm/mpa_headprobe_0810/graft/head_lf_1394.h5`
-- Matched BerkeleyGW contour-deformation run:
-  `/pscratch/sd/j/jackm/bgw_repro_0811/bgw_cd_esch`
-- Matched BerkeleyGW GN run:
-  `/pscratch/sd/j/jackm/bgw_repro_0811/bgw_gn`
-- LORRAX method guide: `docs/mpa_method_guide.md`
-- Archived CTSP derivation/reference: 
-  `docs/dev/archive/misc/references/Kim-2020-MARKDOWN.md`
-
-## References
-
-1. D. A. Leon *et al.*, "Frequency dependence in GW made simple using a
-   multipole approximation," *Phys. Rev. B* **104**, 115157 (2021):
-   [DOI](https://doi.org/10.1103/PhysRevB.104.115157),
-   [arXiv](https://arxiv.org/abs/2109.01532).
-2. M. Kim, G. J. Martyna, and S. Ismail-Beigi, "Complex-time shredded
-   propagator method for large-scale GW calculations," *Phys. Rev. B* **101**,
-   035139 (2020):
-   [DOI](https://doi.org/10.1103/PhysRevB.101.035139).
-3. D. A. Leon *et al.*, metallic-system extension of the MPA, *Phys. Rev. B*
-   **107**, 155130 (2023):
-   [DOI](https://doi.org/10.1103/PhysRevB.107.155130),
-   [arXiv](https://arxiv.org/abs/2301.02282).
-4. The official Yambo
-   [MPA tutorial](https://wiki.yambo-code.eu/wiki/index.php/Quasi-particles_and_Self-energy_within_the_Multipole_Approximation_%28MPA%29),
-   with source snapshots for the
-   [sampling grid](https://github.com/yambo-code/yambo/blob/19c12410fd9f70aee9bcab61221567433566510d/src/common/FREQUENCIES_mpa_sampling.F),
-   [fit and pole guards](https://github.com/yambo-code/yambo/blob/19c12410fd9f70aee9bcab61221567433566510d/src/modules/mod_MPA.F),
-   and
-   [frequency defaults](https://github.com/yambo-code/yambo/blob/19c12410fd9f70aee9bcab61221567433566510d/src/modules/mod_frequency.F).
-5. The 2025 MPA-Sigma proposal, a separate fit of the self-energy useful for
-   dense output-energy or spectral-function workloads:
-   [arXiv:2501.09121](https://arxiv.org/abs/2501.09121).
+A=F/\varpi.
+$$
+
+A positive composite rule at relative tolerance $10^{-8}$ uses about $7A$
+nodes. The damping tail extends to
+
+$$
+T\simeq\frac{\log(2/\epsilon)}{\varpi},
+$$
+
+so a direct real-time discretization naturally encounters the time-bandwidth
+scale $FT$. The measured $7A$ behavior describes the current positive
+composite rule; it is not a lower bound on sector minimax rules, nonuniform
+representations, or a formulation with smaller active transition windows.
+
+If the line is split into point groups $G$, the expensive-node count is
+approximately
+
+$$
+N_{\mathrm{split}}
+\propto
+\sum_G
+\frac{\Delta_{\max}+\max_{j\in G}|\omega_j|}{\varpi}.
+$$
+
+Every group repays the $\Delta_{\max}$ term. Per-point grids are consequently
+the wrong default. They can win only if they permit materially smaller
+transition windows or if output accumulation, rather than the Green-function
+build, dominates wall time.
+
+The planner should compare the measured model
+
+$$
+C_W
+=
+\sum_G N_G
+\left[C_G(G)+C_{\mathrm{FFT}}+|G|C_{\mathrm{acc}}\right]
+$$
+
+and choose the simplest plan within a factor of two of its minimum. It should
+never customize the time grid by $q$, because one real-space transform
+produces all $q$ together.
+
+### 6.4 The same crossing/noncrossing idea applies to $W$
+
+The two terms in $K_z$ should not be forced through one monolithic sine rule.
+Their signs and quadrants must be explicit. If $x=\Delta+\omega>0$, then
+
+$$
+\frac{1}{z+\Delta}=\frac{1}{x+i\varpi}
+$$
+
+lies in the first quadrant and uses the conjugate rotation
+$\theta=-\pi/4$. For the high-energy resonant tail,
+$\Delta>\omega_{\max}$,
+
+$$
+\frac{1}{z-\Delta}
+=
+-\frac{1}{(\Delta-\omega)-i\varpi},
+$$
+
+so the fourth-quadrant rule carries the displayed minus sign. Consequently:
+
+- $1/(z+\Delta)$ is always sign-definite and belongs on a sector-Laplace
+  contour;
+- $1/(z-\Delta)$ needs real time only where the sampled $\omega$ range overlaps
+  the transition range;
+- the high-energy resonant tail is sign-definite again.
+
+The analogous occupied/empty signs must be derived, rather than inferred,
+when applying sector rules to the Sigma stripe and slab.
+
+The transition energy is a sum of positive conduction and hole energies, so
+the same core/A-stripe/B-slab partition used by GN can separate the crossing
+piece without ever naming a transition. Splitting a whole sampling line into
+many real-frequency subranges can at best reduce the linear crossing bandwidth
+by a modest factor while multiplying the number of crossing partitions. The
+default should therefore be one near-line plan and one far-line plan, each with
+a few GN-like pieces, not one plan per $W(z)$.
+
+### 6.5 Memory is controlled by output batching
+
+Accumulating $B$ frequencies at once costs, before sharding,
+
+$$
+M_{\mathrm{acc}}
+=
+16B\,n_qN_\mu^2\ \text{bytes}.
+$$
+
+This is accumulator memory, not peak memory. A production estimate must use
+
+$$
+M_{\mathrm{peak}}
+=
+M_{\mathrm{base}}+M_{\mathrm{acc}}+M_{\mathrm{Dyson}}+M_{\mathrm{output}},
+$$
+
+including resident Green-function/FFT arrays, Coulomb and Dyson workspace,
+and at least one completed output matrix. The displayed $n_q$ is the full-$q$
+case; selecting only an irreducible wedge during accumulation is a separate,
+not-yet-implemented optimization.
+
+If all points on a line fit, it is one sweep. Otherwise, repeat the same line
+rule for output batches of size $B$. This is an explicit and measurable
+memory--compute tradeoff; it never creates a transition tensor or a stored
+time history. The batch is chosen from an announced peak-memory budget, not
+hard-coded from the Si geometry.
+
+## 7. Fitting: what to retain and what to change
+
+The direct fit of $W_c(z)$ has the correct even rational form,
+
+$$
+W_c(z)
+=
+\sum_{p=1}^{n_p}
+\frac{2\Omega_pB_p}{z^2-\Omega_p^2}.
+$$
+
+The Loewner denominator solve was better conditioned than the old
+Vandermonde-like Padé solve for this Si campaign: the latter crossed
+double-precision conditioning at $n_p=8$--10, while the Loewner form represents
+the same rational type without powers of $z^2$. That result does not establish
+Loewner as uniformly preferable across materials.
+
+LORRAX is not using Yambo's fitting algorithm. It shares the even multipole
+ansatz and the double-parallel sampling concept, but its fixed-support Loewner
+solver, rank threshold, and repair operations differ from Yambo's
+analytic/linear Padé and Padé--Thiele paths.
+
+The following distinctions matter:
+
+- Refitting residues after a pole has been reassigned, conjugated, or removed
+  is necessary.
+  Keeping residues belonging to the old poles would be wrong.
+- A small training residual on exactly $2n_p$ samples is not a continuation
+  certificate. It mainly says the interpolation problem was solved.
+- The original MPA work publishes a fulfillment/time-ordering repair that
+  enforces the required sign of $\Im\Omega_p$. Any particular conjugation or
+  reassignment used by LORRAX is model-changing and must be identified; its
+  post-repair residue refit and held-out behavior must be reported.
+- Reducing the active pole count for a rank-deficient or unfulfilled element is
+  consistent with the Yambo MPA strategy. Forcing every element to carry the
+  nominal order is not required.
+
+The robust workflow is:
+
+1. keep one shared two-line sampling geometry;
+2. evaluate additional unused points within the line envelopes;
+3. use rank-revealing Loewner fits and select the smallest $n_p$ whose held-out
+   $W$ error and quasiparticle error pass;
+4. keep zero-residue slots for elements of lower numerical order, so storage
+   stays regular;
+5. report singular-value gaps, effective rank, residue norms, distance of each
+   pole from the sampled domain, and sensitivity to the support partition and
+   SVD cutoff;
+6. report both raw and self-energy-weighted held-out errors, every pole repair,
+   and the response-level analytic checks below.
+
+Extra points require extra accumulation and Dyson solves. They require no new
+$G_cG_v$ time nodes only when they remain inside the certified frequency
+envelope and fit in the same output batch; otherwise the rule grows or a sweep
+is repeated. The accepted 16-point store uses all 16 points for the $n_p=8$
+fit, so it contains no true held-out data for that model. It needs additional
+oracle points; reduced-order cross-validation is available only for
+$n_p<8$.
+
+Two exact model moments should be checked elementwise for every fit:
+
+$$
+W_c(0)=-2\sum_p\frac{B_p}{\Omega_p},
+\qquad
+\lim_{|z|\to\infty}z^2W_c(z)=2\sum_p\Omega_pB_p.
+$$
+
+Once the finite-band and pseudopotential conventions behind the
+high-frequency moment are pinned, these can enter a scaled, regularized
+residue refit. Until then they are diagnostics, not hard constraints. Complex
+elementwise residues are fit coefficients, not individually positive
+oscillator strengths. At matrix level the appropriate checks are the Schwarz
+relation, schematically $W(q,z)^\dagger=W(q,z^*)$ with the repository's
+$q$/time-reversal convention, and positive-semidefinite retarded loss on
+$\omega>0$ under the repository's sign convention. $W$ at a generic complex
+frequency is not simply Hermitian.
+
+For geometry relaxation and phonons, hard model-order changes and pole repairs
+can create non-smooth quasiparticle Hamiltonians. Topology, nominal zero-padded
+order, and correction policy should be frozen across a displacement family.
+Absolute sampling frequencies may remain fixed only when one family-wide
+envelope covers every displacement; otherwise update them by a smooth,
+deterministic rule. A rank change can be continuous when a zero-padded residue
+vanishes smoothly, so it is a continuity diagnostic rather than an automatic
+failure. Discontinuous changes must be flagged.
+
+## 8. A structural research track: common matrix poles
+
+Elementwise poles are flexible, but pole positions then depend on the chosen
+matrix basis and vary over every $(\mu,\nu)$ element. That variation is exactly
+what makes analytic convolution incompatible with the current low-scaling
+separation.
+
+A matrix-valued model with a shared pole dictionary would be
+
+$$
+W_c(q,z)
+=
+\sum_{p=1}^{r}
+\frac{2\Omega_{p,q}B_{p,q}}{z^2-\Omega_{p,q}^2},
+$$
+
+where $\Omega_{p,q}$ is scalar over matrix elements at a fixed $q$ and
+$B_{p,q}$ is a residue matrix. This has two possible consequences:
+
+1. at a fixed $q$, every matrix element shares a pole frequency, so its local
+   Sigma frequency geometry is GN-like;
+2. the analytic MPA convolution can be written with shifted one-particle Green
+   functions, avoiding both tau quadrature and transition amplitudes.
+
+The direct analytic route is then based on objects such as
+
+$$
+G(z)=\Psi\,\mathrm{diag}\!\left(\frac{1}{z-E_m}\right)\Psi^\dagger,
+$$
+
+which are band contractions, not valence--conduction transition tensors.
+
+A $q$-dependent pole dictionary is not genuinely global: its shifted-$G$
+contraction may reintroduce a $q$ loop and lose the all-$q$ FFT separation. A
+stronger GN-like claim would require poles shared across $q$ as well. Either
+choice therefore needs an end-to-end scaling benchmark.
+
+The shifted-$G$ cost is schematically
+
+$$
+C_{\mathrm{shifted}\,G}
+\sim
+r\,n_\omega\left(C_G+C_{\mathrm{convolution}}\right),
+$$
+
+with separate occupied and unoccupied terms. Common poles remove tau
+quadrature but do not automatically remove the pole multiplier. They win only
+if $n_\omega$ is sufficiently smaller than the time-rule rank, or if
+$\Sigma(\omega)$ can be interpolated safely from fewer shifted evaluations.
+
+This is not the first implementation step because a common denominator may
+require many more poles to describe all matrix elements. The decisive
+experiment is a read-only fit of the existing $W(z)$ store using MIMO Loewner
+or vector fitting, with common poles chosen from small random sketches of $W$
+itself. No transition data are involved. Continue only if roughly 8--16
+common poles pass additional held-out $W$ and quasiparticle checks and the
+$q$-dependent contraction is competitive; abandon it if the required rank
+grows with $N_\mu$.
+
+High-frequency moment constraints and matrix passivity constraints are useful
+in this track, but they should be soft constraints or validation metrics until
+their finite-band and pseudopotential conventions are pinned. They are not the
+explanation for the present 52,252-node cost.
+
+## 9. Performance expectations and honest lower bounds
+
+There are three distinct multiplicative costs:
+
+| Stage | GN-PPM | Elementwise $n_p$-pole MPA | What can remove the factor? |
+|---|---:|---:|---|
+| screening samples | 2 $W$ values | $2n_p$ $W$ values | line-shared $G_cG_v$ sweep removes repeated tau builds, not Dyson solves |
+| Dyson solves | 2 | $2n_p$ | smaller adaptive order or a different matrix model |
+| Sigma pole contractions | one pole model | at least $n_p$ pole passes without batching | multi-pole batching or shared-pole shifted-$G$ convolution |
+
+The immediate sector/window repair removes the mechanism responsible for
+44,842 of 52,252 nodes. Its resulting speedup is conditional on the certified
+crossing-core rank; no single reduction factor should be quoted before Step A.
+It does not repeal the honest $n_p$ aggregate-work factor imposed by
+one-pole-at-a-time memory.
+
+For the line-sampled screening stage, direct real-time quadrature encounters a
+time-bandwidth scale proportional to
+$(\Delta_{\mathrm{active}}+\omega_{\max})/\varpi_{\mathrm{near}}$. This is a
+planning heuristic, not a universal lower bound. The first way to control it
+is a few crossing/noncrossing energy windows and a well-chosen sampling range,
+not per-frequency transition amplitudes.
+
+For QSGW, quadrature families, compiled kernels, and allocations can be reused
+when shapes remain unchanged. Energy bounds and sample geometry must be
+revalidated at every iteration and configuration. For forces, use one
+enclosing family-wide envelope or a smooth deterministic update rule. The
+physics arrays themselves must be recomputed. A fast but discontinuous pole
+selection is unsuitable for forces; reproducible smoothness is part of the
+performance specification.
+
+## 10. Minimal implementation sequence
+
+### Step A: scalar certification, no production run
+
+Using stored pole and energy extrema:
+
+1. construct a sector exponential rule for the exact coupled denominator
+   domain;
+2. compare it with $1/d$ on random, boundary, and worst production tuples;
+3. for an explicitly broadened target, construct the full-$\delta$ crossing
+   rule and compare it with $1/[u+i(\Gamma+\eta_\Sigma)]$;
+4. for the strict quasiparticle target, compare one multiscale rule and a few
+   exact-$\Gamma$ geometric bands with $1/(u+i\Gamma)$, including the declared
+   exact-real-pole limit;
+5. print the resulting four-branch plan and node count for all eight stored
+   poles.
+
+Acceptance target: uniform scalar error at the requested tolerance, no width
+pane dimension, and measured values for $N_{\mathrm{sector}}$, the broadened
+core coefficient $K$, and the strict-limit core cost. This is a small analysis
+tool, not a large unit-test campaign.
+
+### Step B: one-pole Sigma A/B
+
+Implement the new planner behind one explicit experimental switch:
+
+- no `Gamma < xi` path;
+- a declared strict-QP or finite-broadening target;
+- fixed GN branch geometry;
+- sector rules for every sign-definite piece;
+- full plan and node census in the log.
+
+The correctness gate is the direct analytic MPA Eq. 13 denominator on a small
+state/q/element sample. Comparison with the current production pole partial
+then measures the intended physics change from retaining narrow fitted widths;
+it is not an equality gate because the current path substitutes a different
+denominator.
+
+### Step C: eight-pole production comparison
+
+Only after Step B passes, run the existing four-GPU production protocol and
+compare against the same BerkeleyGW primed contour-deformation columns. Retain
+the existing $[-7,+7]$ eV grid and score only the safe $\pm5$ eV region.
+
+Required outputs:
+
+- raw and mean-aligned errors for several valence and conduction bands at all
+  irreducible $k$ points;
+- direct and indirect gaps;
+- $\eta_\Sigma$ sweep;
+- total and per-pole tau nodes and wall time;
+- maximum memory.
+
+For bands 7--10 at all eight irreducible $k$ points, the current result has a
+rigid $+7.661$ meV mean offset. After subtracting that mean, its MAE is
+1.682 meV and its maximum error is 2.577 meV; aligned to the VBM, its MAE is
+2.120 meV and maximum error is 4.517 meV. The indirect and direct gap errors
+are $-3.594$ and $-4.517$ meV. The target is at most 5 meV for the band
+dispersion and gaps, while the absolute common offset is diagnosed separately
+against matched head, static-remainder, and reference conventions. The new
+route must preserve this accuracy before speed is credited.
+
+### Step D: non-materializing $W(z)$ producer
+
+Build the real-time multi-output sibling of `compute_chi0_multi`, initially for
+one horizontal line and a small output batch, consuming $S_q(t)$ immediately
+at each time node. Validate it against the accepted exact-resolvent $W(z)$
+artifact. Then add the resonant/antiresonant GN-like window split and optimize
+the explicit wall model, with one near-line and one far-line plan as the
+default.
+
+### Step E: reduce the pole count before making poles cheaper
+
+Add unused oracle points within the line envelopes, because the existing 16
+samples are all consumed by the $n_p=8$ fit. Use them to test $n_p=4,6,8$;
+reduced-order cross-validation on the existing store is informative only for
+$n_p<8$. The smallest order meeting the 5 meV quasiparticle target wins. Only
+after the elementwise path is efficient should the
+common-matrix-pole/shifted-$G$ track be judged.
+
+## 11. Things this design explicitly does not do
+
+- It does not materialize or cache $M_{cvk}(\mu)$.
+- It does not precompute a transition tensor under another name.
+- It does not assume multiple pole slabs fit in memory.
+- It does not create a quadrature grid for each matrix element or each $q$.
+- It does not treat hundreds of tiny masks as cheap because they contain few
+  pole elements.
+- It does not replace a fitted width below a window-dependent threshold.
+- It does not claim that sample interpolation error certifies real-axis
+  continuation.
+- It does not add a large unit-test suite before the scalar plan has proved
+  that the method is worth implementing.
+
+## 12. Evidence and references
+
+Local implementation evidence:
+
+- `src/gw/mpa/sigma_pass.py`: recursive noncrossing width split and one full
+  integration per resulting `WindowGroup`.
+- `src/gw/mpa/sigma_routing.py`: current complex crossing and sign-definite
+  integral identities.
+- `src/gw/ppm_windows.py`: the GN four-branch/eight-piece reference geometry.
+- `src/gw/ppm_sigma.py` and `src/gw/ppm_tau_kernel.py`: one full
+  $G$/FFT/projection dispatch per tau node.
+- `src/gw/mpa/chi0_resolvent.py`: the current blockwise transition-amplitude
+  correctness producer.
+- `src/gw/mpa/evaluator.py`: the unwired line-shared scalar damped-time
+  algebra.
+- `src/gw/w_isdf.py`: the existing non-materializing static multi-output
+  Green-function kernel pattern.
+- `/pscratch/sd/j/jackm/mpa_geom_0810/_reports/batchlogs/det_wide_p*.log`:
+  accepted per-pole group and node census.
+
+Primary method references:
+
+- M. Kim, G. J. Martyna, and S. Ismail-Beigi,
+  [Complex-time shredded propagator method for large-scale GW
+  calculations](https://doi.org/10.1103/PhysRevB.101.035139), the CTSP
+  framework underlying the GN-style decomposition used here.
+- D. A. Leon et al., [Frequency dependence in GW made simple using a
+  multi-pole approximation](https://arxiv.org/abs/2109.01532), especially
+  Eqs. 11--13 for the pole model and analytic self-energy.
+- [Yambo's MPA self-energy implementation](https://github.com/yambo-code/yambo/blob/3a0d457a24da514d673d18981ae316e467600e0d/src/qp/QP_mpa.F#L333-L388),
+  which adds `QP_G_damp` to the external Green-function frequency before
+  combining it with the complex MPA poles for finite-broadening evaluations;
+  current Yambo also sets this damping to zero on non-real-axis evaluation
+  grids, so this is evidence for an available broadening, not an intrinsic MPA
+  width.
+- D. A. Leon et al., [Efficient full frequency GW for metals using a
+  multipole approach for the dielectric screening](https://arxiv.org/abs/2301.02282),
+  for the metal sampling and intraband extension.
+- [Yambo MPA tutorial](https://wiki.yambo-code.eu/wiki/index.php/Quasi-particles_and_Self-energy_within_the_Multipole_Approximation_%28MPA%29),
+  for the production double-parallel sampling, Padé--Thiele option, reduced
+  pole count for unfulfilled modes, and explicit Green-function damping used
+  for self-energy/spectral calculations.
+- D. A. Leon et al., [Multipole approximation for the self-energy in GW
+  calculations](https://arxiv.org/abs/2501.09121), whose analytic expression
+  omits a finite $G_0$ damping when fitted complex screening poles already
+  supply the time ordering.
+
+The papers evaluate the pole convolution analytically. LORRAX's complex-time
+route is justified only if it preserves the low-scaling separability at a
+small, measured constant over that analytic reference. The present
+$52{,}252/167$ ratio is 313 times one GN evaluation, but
+$52{,}252/(8\times167)=39.1$ times the honest eight-pole,
+one-pole-at-a-time architectural reference. Neither meets that standard; the
+four-branch sector design is the direct attempt to do so.
