@@ -29,6 +29,7 @@ _services.ensure_on_path()
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
 from common import rank_criterion
+from common import spectral_closure
 from common import timing
 from runtime.padding import round_up
 from common.wfn_transforms import (
@@ -351,6 +352,24 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # 41 % MORE rank moved a QP gap from 3.13 eV to −5049 eV.
     rank_phys = rank_criterion.select_rank(s_host, rtol)
 
+    # ── …and the criterion is not allowed to stop mid-multiplet ───────────
+    # ``common/spectral_closure``, the sibling of the band-window guard.  A
+    # cut through a degenerate σ block keeps a symmetry-ARBITRARY slice of an
+    # eigenspace, and this function's own NUMERICS note (a) says so from the
+    # other side: "eigenvectors of A Aᴴ match the SVD's U only up to per-σ
+    # phases (rotations inside degenerate σ groups)".  That rotation freedom
+    # is harmless while a degenerate group is retained WHOLE — every physical
+    # output is invariant under it — and is exactly what breaks covariance
+    # when the group is split.  Snapping outward costs at most the block's
+    # relative span in κ_eff (1e-6-scale), which is why the default repairs
+    # rather than refuses; see that module on why its sibling refuses instead.
+    rank_phys, _sc = spectral_closure.resolve_spectral_cut(
+        s_host, rank_phys, where="htransform psi@centroids Gram-eigh sigma",
+        rcond=rtol, log=log_fn)
+    if not _sc["fired"]:
+        log_fn(spectral_closure.describe_clean(
+            _sc, where="htransform psi@centroids sigma"))
+
     # ── Mesh alignment: PAD, never round the rank down ────────────────────
     # G, its Cholesky factor, ctilde, B and fH all live on a (rank, rank)
     # face sharded P('x','y'), so the carried extent has to divide BOTH mesh
@@ -450,6 +469,17 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
               f"mesh-aligned to {align})" if n_pad else "")
            + f" ({time.time()-t1:.2f}s)")
     log_fn(_trunc.describe())
+    if _sc["fired"]:
+        # ``rank_report`` measures the AMPLIFICATION CAP and knows nothing
+        # about the closure snap, so it counts the snapped directions in its
+        # "null pad" column (``rank_used > rank_criterion`` reads as padding,
+        # which it never raises on).  Split the number here rather than teach
+        # it a second criterion: the two guards stay orthogonal, and a reader
+        # is not left believing real retained directions are null.
+        log_fn(f"  [rank]   of the +{_trunc.n_padded_alignment} shown as null "
+               f"pad above, {_sc['n_keep_snapped'] - _sc['n_keep']} are "
+               f"spectral-closure snaps (REAL retained directions, sigma > 0) "
+               f"and {n_pad} are the mesh-alignment nulls.")
     _bad = _trunc.violations()
     if _bad:
         raise ValueError(

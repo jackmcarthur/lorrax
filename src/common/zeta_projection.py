@@ -134,6 +134,7 @@ Refusals (all raise BEFORE any collective, with the fix named)
 """
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import numpy as np
@@ -142,6 +143,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import spectral_closure
 from common.collectives import warm_mesh_cliques
 from common.contract_bands import contract_bands_block_reshard
 
@@ -683,6 +685,27 @@ def least_squares_transfer(
     w, V = jnp.linalg.eigh(gram_S)              # ascending, replicated
     lam_max = jnp.max(w, axis=-1, keepdims=True)
     keep = w > (float(rcond) * lam_max)
+    # CLOSURE.  The cut above is a cap on amplification; it is not allowed to
+    # stop halfway through a degenerate block.  ``G_S`` commutes with every
+    # symmetry the centroid set is closed under, so a symmetry maps each of
+    # its eigenspaces onto itself and mixes a degenerate block's members
+    # freely: retain the block whole and the retained span is invariant,
+    # retain part of it and the span is a round-off-chosen slice that differs
+    # between q and Sq.  ``common/spectral_closure`` snaps the mask outward
+    # past any block it straddles — pure jnp, so it stays inside the same
+    # replicated computation and the verdict is identical on every process.
+    #
+    # ``off`` skips it entirely; ``strict`` computes the same verdict and
+    # refuses on host below rather than snapping, so the flag means the same
+    # thing here as at every other seam.
+    # The caller reads the dial and passes it — ``spectral_closure`` is L2 and
+    # must be a function of its arguments (tests/test_layering.py).
+    _sc_mode = spectral_closure.resolve_mode(
+        os.environ.get(spectral_closure.MODE_ENV))
+    _keep_snapped, _n_pre, _n_post = spectral_closure.snap_keep_outward(
+        w, keep, rtol=spectral_closure.DEFAULT_RTOL)
+    if _sc_mode == "snap":
+        keep = _keep_snapped
     # THE CRITERION: ``keep`` is a CAP on how much G_S⁺ may amplify round-off
     # (κ_eff = λ_max/λ_min(kept) ≤ 1/rcond), NOT a search for a gap — these
     # ζ-overlap spectra are smooth and have none.  ``common/rank_criterion``
@@ -701,10 +724,13 @@ def least_squares_transfer(
         jnp.max(jnp.where(keep, -jnp.inf, w), axis=-1),          # λ top dropped
         jnp.min(w, axis=-1),                                     # λ_min
         jnp.sum(w > (float(rcond) * 1e-4 * lam_max), axis=-1),   # loose rank
+        _n_pre,                                                  # rank at the
+        _n_post,                                                 # cap / closed
     ))
     ranks = np.asarray(_stats[0])
     lmax_h, lminkeep_h, ldrop_h, lmin_h, ranks_loose = (
-        np.asarray(x) for x in _stats[1:])
+        np.asarray(x) for x in _stats[1:6])
+    sc_pre, sc_post = np.asarray(_stats[6]), np.asarray(_stats[7])
     n_mu_s = int(gram_S.shape[-1])
     # Computed on EVERY process (gram_S is replicated, so the verdict is the
     # same everywhere) — a refusal raised only on rank 0 would hang the rest.
@@ -729,13 +755,54 @@ def least_squares_transfer(
             f"discarded 0 (this route never rounds the rank to the mesh); "
             f"margin (rcond x 1e-4) max +{100.0*np.max(margin):.1f}% "
             f"— R19 anchor: +41% cost 5000 eV.")
-    if np.nanmax(kappa) > (1.0 / float(rcond)) * (1.0 + 1e-9):
+    # ── The closure verdict, per q ────────────────────────────────────────
+    # ``sc_pre`` is the rank the amplification cap chose, ``sc_post`` the rank
+    # that closes whatever degenerate block that cut landed in.  They differ
+    # only on q whose cut sliced a block.
+    _n_fired = int(np.count_nonzero(sc_post > sc_pre))
+    if _sc_mode != "off" and jax.process_index() == 0:
+        if _n_fired:
+            print_fn(
+                f"*** [spectral-closure] zeta_projection transfer: the rank "
+                f"cut lands INSIDE a degenerate block of G_S on {_n_fired} of "
+                f"{len(sc_pre)} q.  Retained rank per q would be "
+                f"{int(sc_pre.min())}..{int(sc_pre.max())}; closing the block "
+                f"takes it to {int(sc_post.min())}..{int(sc_post.max())} "
+                f"(max +{int(np.max(sc_post - sc_pre))} directions on one q).  "
+                f"A cut through a degenerate block retains a symmetry-"
+                f"ARBITRARY slice of an eigenspace, so W_S would project onto "
+                f"a different subspace at q than at Sq. "
+                + (f"SNAPPED OUTWARD. ***" if _sc_mode == "snap"
+                   else f"NOT snapped (strict). ***"))
+        else:
+            print_fn(
+                f"[zeta_projection]   spectral closure: the cut falls in a gap "
+                f"on all {len(sc_pre)} q at rtol "
+                f"{spectral_closure.DEFAULT_RTOL:.1e} (noise floor eps/rcond = "
+                f"{spectral_closure.degeneracy_noise_rtol(rcond):.2e}) — no "
+                f"degenerate block is cut.")
+    if _sc_mode == "strict" and _n_fired:
+        raise spectral_closure.SpectralClusterError(
+            f"zeta_projection: the rcond={rcond:g} rank cut falls inside a "
+            f"degenerate block of G_S on {_n_fired} of {len(sc_pre)} q, so the "
+            f"retained span is not point-group invariant.  Fix: "
+            f"LORRAX_SPECTRAL_CLOSURE=snap closes each block (retained rank "
+            f"{int(sc_pre.max())} -> {int(sc_post.max())} at worst), or =off "
+            f"to cut through deliberately.")
+    # The cap check, with the ONE excess a closure snap can legitimately
+    # introduce allowed for and no more.  Snapping past m links each within
+    # ``rtol`` of the last can lower λ_min(kept) by at most (1+rtol)^m, so
+    # that — and nothing looser — is the slack.  With no snap, m = 0 and this
+    # is the historical ``1 + 1e-9``.
+    _slack = float(np.max(
+        (1.0 + spectral_closure.DEFAULT_RTOL) ** np.maximum(sc_post - sc_pre, 0)))
+    if np.nanmax(kappa) > (1.0 / float(rcond)) * _slack * (1.0 + 1e-9):
         raise ValueError(
             f"zeta_projection: achieved amplification "
             f"{np.nanmax(kappa):.3e} exceeds the cap "
             f"{1.0/float(rcond):.3e} the rcond={rcond:g} truncation was "
-            f"supposed to enforce — the retained set is not the one the "
-            f"criterion selected.")
+            f"supposed to enforce (closure slack {_slack:.6f}) — the retained "
+            f"set is not the one the criterion selected.")
     if int(ranks.min()) == 0:
         raise ValueError(
             f"zeta_projection: rcond={rcond:g} retained ZERO directions at "

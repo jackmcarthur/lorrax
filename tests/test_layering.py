@@ -166,6 +166,7 @@ _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 #: L2 by module.  Whole packages are in ``_L2_PACKAGES``.
 _L2_MODULES = frozenset({
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
+    "common.spectral_closure",  # where that truncation is allowed to land
     "centroid.kmeans_isdf",    # density-weighted Lloyd loop under a metric
 })
 # ``common.minimax`` was here ("minimax quadrature: a Remez problem").  It is

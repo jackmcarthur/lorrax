@@ -571,6 +571,41 @@ def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
     return int((ev > tol * d0max).sum()), n_pts, ""
 
 
+def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
+    """Whether that rank lands inside a degenerate block.  REPORT ONLY.
+
+    :func:`point_granularity_rank` selects nothing — it hands an operator a
+    number to size ``n_keep`` by — so this neither snaps nor refuses.  But
+    the number is a rank cut like any other, and when it lands inside a
+    degenerate block every ``n_keep`` in that block buys a symmetry-arbitrary
+    slice of an eigenspace: the pivoted-Cholesky select is then choosing
+    between directions the spectrum cannot distinguish, and no amount of care
+    in the pivot order can make that choice covariant.  Saying so here is the
+    difference between an operator picking 1908 points and understanding why
+    the ζ back-solve truncated to 1450.
+
+    Returns ``""`` when the cut falls in a gap.  Kept OUT of
+    :func:`point_granularity_rank`'s ``reason`` field on purpose: that field
+    is contracted to mean "the measurement was skipped and ``rank`` is
+    ``None``", and its caller only prints it in that case, so a closure note
+    smuggled into it would be silently dropped.
+    """
+    from common import spectral_closure
+    sub = np.asarray(jax.device_get(G))[np.ix_(np.asarray(keep_mask, dtype=bool),
+                                               np.asarray(keep_mask, dtype=bool))]
+    ev = np.linalg.eigvalsh(0.5 * (sub + sub.conj().T))
+    info = spectral_closure.cluster_at_cut(ev, int(rank))
+    if not info["fired"]:
+        return ""
+    lo = info["n_keep_snapped"] - len(info["members"])
+    return (f"the point rank {int(rank)} lands INSIDE a degenerate block of "
+            f"{len(info['members'])} eigenvalues (relative gap at the cut "
+            f"{info['gap_rel']:.2e}, rtol {info['rtol']:.1e}); the block runs "
+            f"from {lo} to {info['n_keep_snapped']}.  Any n_keep strictly "
+            f"between those selects PART of an eigenspace and is not "
+            f"point-group invariant — see common/spectral_closure.")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Step 4 — end-to-end wrapper
 # ═══════════════════════════════════════════════════════════════════════
@@ -843,6 +878,12 @@ def prune_candidates_by_pivoted_cholesky(
                           f"back-solve will truncate about that many modes "
                           f"per q; D3 shipped a 7 GiB restart file to learn "
                           f"the same thing downstream.")
+                _note = point_rank_closure_note(G, in_kept, pt_rank,
+                                                tol_rel=tol_rel)
+                print(f"  [point rank] closure: " + (
+                    _note if _note else
+                    "the rank cut falls in a gap — no degenerate block is "
+                    "sliced at this tolerance."))
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
