@@ -314,3 +314,112 @@ The count is verified against the expected set rather than read off a green
 bar: 100 collected on base, 105 on branch, +5 = three parametrised composition
 cells, one composition red twin, and a net +1 in `test_spectral_closure.py`
 (two cells replaced by three).
+
+## THE DECIDING LEG — question 3, answered, and the answer is expensive
+
+This is the measurement this row asked for and refused to predict: "two
+downfolds of the same parent — one at the point-picked μ_S = 185 the driver
+chooses today, one orbit-blocked at μ_S = 168 — compared on `eps_w`".  It has
+now been run, at **four GPUs in four processes**, and the row's own alternative
+outcome is the one that happened: *it moves a lot.*
+
+Workspace `/pscratch/sd/j/jackm/orbitfloor_0810/`, logs `_logs3/`, tree
+detached at `e8fe346a` with `git dirty-count: 0` printed by every rank.  Both
+arms are `si_bse_debug`, μ_L = 480, window 0:20 symmetric, `mu_small = auto`,
+`downfold_rcond = 1.1e-6`, mesh `{'x': 2, 'y': 2} on 4 device(s), 4
+process(es)` — the production geometry, and the shape asserted in-log rather
+than assumed.
+
+**The two arms differ in one thing only: whether the parent carries a centroid
+source map.**  Arm A reads the owed-legs lane's wedge-stored `parent_auto`,
+which carries its own `sym_perm`, so the selection runs in orbits and floors.
+Arm B reads `parent_full`, the same deck stored on the full BZ, which carries
+no table, so the selection is point-granular — the historical behaviour, on the
+same code, at the same commit.  Those two parents were measured BIT-IDENTICAL
+through the downfold by the owed-legs lane, so the parent choice is a switch
+for the selection rule and not a second variable.
+
+| | arm A — ORBIT-FLOORED | arm B — point-picked (control) |
+|---|---|---|
+| μ_S requested (points) | 185 | 185 |
+| μ_S realized (points) | **168** — 4 orbits, 48+48+48+24 | **185** |
+| orbit closure of the delivered set | **CLOSED under all 96 ops** | UNMEASURED (no table) — an absence |
+| eigenvalue rank of `S_SS[keep,keep]` at q=0 | **122 of 168** | **171 of 185** |
+| retained rank of the transfer per q, min/med/max over 64 q | **120 / 123 / 124** | **171 / 173 / 175** |
+| `eps_W(W0_qmunu)` min/median/max | 3.205e-02 / **4.319e-02** / 1.328e-01 | 7.232e-03 / **1.056e-02** / 1.341e-02 |
+| `eps_W(V_qmunu)` min/median/max | 3.024e-02 / **5.179e-02** / 1.527e-01 | 7.533e-03 / **1.096e-02** / 1.691e-02 |
+| leg wall | 409.6 s | 237.1 s |
+
+**The symmetric-but-smaller basis is beaten, not matched: about 4x worse at the
+median q and about 10x worse at the worst q.**  Both numbers are the printed
+Pythagorean error bar, which the driver itself labels a tripwire rather than an
+accuracy gate — the observable arm is reported separately below — but a
+tripwire that moves by a decade is not a subtle effect.
+
+**And the mechanism is measured rather than inferred, which is the part worth
+carrying forward.**  It is not that 168 < 185; a 9 % cut in points does not buy
+a 4x error bar.  It is that **an orbit-closed basis is inefficient in
+directions per point on this deck**:
+
+* 168 orbit-closed points carry **122** independent directions — 0.73 per point.
+* 185 point-picked points carry **171** — 0.92 per point.
+
+The reason is the same q = 0 group invariance that makes orbit mode possible in
+the first place.  The selection Gram commutes with the whole group, so it block-
+diagonalises by irrep, and a single orbit of 48 centroids contributes only as
+many independent directions as that orbit's permutation representation contains
+irreps of the Gram's support — nowhere near 48.  Taking whole orbits therefore
+buys mostly REDUNDANCY.  The row's arithmetic said the ladder is coarse; the
+measurement says the rungs are also *cheap in points and expensive in
+directions*, and that second fact is the one that costs the error bar.
+
+This retires, on numbers, the hope in this row's §3 that "if the error bar
+barely moves, the quantisation is free and this is an easy ruling".  It does not
+retire the ruling: the owner ruled on the INTERFACE — what a user-facing count
+means and which way it rounds — and that ruling is right independently of what
+any one deck's error bar does with it.  What the measurement settles is the
+DECK question the row put beside it: *"the small-orbit-count decks are telling
+us they cannot be both compressed and wedge-stored, and that is worth knowing
+before any code is written."*  On `si_bse_debug`, with 11 orbits over 480
+centroids, that is now the measured answer.
+
+## AND THE WEDGE CHILD DOES NOT MATERIALISE ON THIS DECK EITHER
+
+The composition this row's alternative was FOR — an orbit-closed selection makes
+the child wedge-storable — holds in the algebra and fails on this deck, and the
+driver now measures that per run instead of assuming it.
+
+```
+  [downfold/star] kept centroid set is ORBIT-CLOSED under 96 ops (168 centroids) — the child is wedge-storable.
+  [downfold/star] CHILD WEDGE-STORABILITY GATE, on this run's own tensors: ...
+  [downfold/star]   V_qmunu:  max rel 1.170e+00
+  [downfold/star]   W0_qmunu: max rel 1.241e+00
+```
+
+Order one — the red twin's magnitude, not the 1.7e-15 the synthetic covariance
+gate reads.  **Orbit closure is not the missing piece: it HOLDS.**  Closure is
+what gives the child an unfold TABLE; it is not what makes the child's TENSORS
+unfold.  That needs `T[q] = U^S T[i(q)] (U^L)†`, and `T` is built by a
+RANK-TRUNCATED solve — and the truncation is not star-constant here: the
+retained rank runs **120 to 124 across 64 q**.  A covariant `S_SS` has an
+identical spectrum at every member of a star, so a rank cut cannot move within
+one; the measured spread says the pair-density Gram over this retained window is
+not star-covariant, and no selection rule can repair that.  The suspect is the
+window itself — a band range that slices a degenerate manifold is exactly how a
+star-invariant quantity stops being one — which is the same mechanism the
+band-degeneracy closure work of 2026-08-10 found at 6x6x6.  **Named as a
+suspect, not a finding: this lane did not test it.**
+
+Two consequences for whoever picks this up:
+
+1. The gate is now a VERDICT (`CHILD_COVARIANCE_TOL = 1e-9`, chosen in the empty
+   decades between the synthetic floor 1.7e-15 and the red twin 8.6e-01) and it
+   prints the star-rank constancy measurement on a failure, so the next lane
+   starts from a mechanism rather than from a number.  The first version of this
+   gate narrated whatever it measured as "the reassociation floor"; it would
+   have called 1.170e+00 a floor, and that is exactly the class of green this
+   project's measurement discipline exists to refuse.
+2. The child's tables are still stored beside the child with the verdict next to
+   them (`downfold_provenance/child_unfold_tables/covariance_worst_rel`), and the
+   log says in as many words that they must not be used to write a wedge child
+   until the verdict passes.

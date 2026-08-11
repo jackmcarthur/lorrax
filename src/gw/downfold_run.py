@@ -370,8 +370,44 @@ def _star_rank_constancy(rank_per_q, tables):
     return bad == 0, worst_star, worst, bad
 
 
+def _unfold_roundtrip_rel(arr_full, tables, sym_perm, L_table, slots,
+                          mesh_xy, n_mu_logical):
+    """max rel |unfold(arr_full[slots]) - arr_full| — one number, host-side.
+
+    The common half of the storability gate and its control, written once so
+    that the two are the SAME route by construction: a control that differed
+    from the thing it controls by a line of plumbing would not be a control.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_isdf_operator
+    from common.collectives import gather_to_host
+
+    full = np.asarray(gather_to_host(arr_full))
+    n_pad = int(full.shape[-1]) - int(n_mu_logical)
+    perm, L = np.asarray(sym_perm), np.asarray(L_table)
+    if n_pad:
+        tail = np.arange(n_mu_logical, n_mu_logical + n_pad, dtype=perm.dtype)
+        perm = np.concatenate(
+            [perm[:, :n_mu_logical],
+             np.broadcast_to(tail, (perm.shape[0], n_pad))], axis=1)
+        L = np.concatenate(
+            [L[:, :n_mu_logical],
+             np.zeros((L.shape[0], n_pad, 3), L.dtype)], axis=1)
+    got = np.asarray(gather_to_host(unfold_isdf_operator(
+        jnp.asarray(full[slots]),
+        irr_idx=jnp.asarray(np.asarray(tables.irr_idx_q)),
+        sym_idx=jnp.asarray(np.asarray(tables.sym_idx_q)),
+        sym_perm=jnp.asarray(perm), L_table=jnp.asarray(L),
+        q_irr_frac=jnp.asarray(np.asarray(tables.q_irr_frac)),
+        mesh_xy=mesh_xy, n_sym_spatial=int(tables.n_sym_spatial))))
+    scale = float(np.max(np.abs(full))) or 1.0
+    return float(np.max(np.abs(got - full))) / scale
+
+
 def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
-                                  mu_S_pad, *, rank_per_q, print_fn):
+                                  mu_S_pad, *, rank_per_q, parent_tensor=None,
+                                  mu_L=None, print_fn=print):
     """THE COMPOSITION, MEASURED ON THE RUN'S OWN TENSORS.
 
     An orbit-floored selection is orbit-closed by construction, so the child
@@ -411,33 +447,54 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
     else:
         child_perm_p, child_L_p = child_perm, child_L
 
-    worst = {}
-    for name, arr in small.items():
-        full = np.asarray(gather_to_host(arr))
-        wedge = jnp.asarray(full[slots])
-        got = np.asarray(gather_to_host(unfold_isdf_operator(
-            wedge,
-            irr_idx=jnp.asarray(np.asarray(tables.irr_idx_q)),
-            sym_idx=jnp.asarray(np.asarray(tables.sym_idx_q)),
-            sym_perm=jnp.asarray(child_perm_p),
-            L_table=jnp.asarray(child_L_p),
-            q_irr_frac=jnp.asarray(np.asarray(tables.q_irr_frac)),
-            mesh_xy=mesh_xy,
-            n_sym_spatial=int(tables.n_sym_spatial))))
-        scale = float(np.max(np.abs(full))) or 1.0
-        worst[name] = float(np.max(np.abs(got - full))) / scale
+    worst = {name: _unfold_roundtrip_rel(
+                 arr, tables, child_perm, child_L, slots, mesh_xy, mu_S)
+             for name, arr in small.items()}
     worst_rel = max(worst.values()) if worst else float("nan")
 
+    # THE CONTROL, AND IT IS NOT OPTIONAL.  The route above has three parts
+    # that could each be wrong on their own — the wedge-slot derivation, the
+    # table restriction, and the unfold call — and a failure tells them apart
+    # only against a case whose answer is known.  The PARENT's own tensor is
+    # that case: it was STORED on this wedge, with these tables, and the
+    # reader unfolded it before this driver saw it, so slicing it back and
+    # unfolding it must return it.  If the control fails, the finding is in
+    # this harness and not in the physics, and no claim about covariance may
+    # be made from the number above.
+    control_rel = None
+    if parent_tensor is not None and mu_L is not None:
+        control_rel = _unfold_roundtrip_rel(
+            parent_tensor, tables, np.asarray(tables.sym_perm),
+            np.asarray(tables.L_table), slots, mesh_xy, int(mu_L))
+
     passed = worst_rel < CHILD_COVARIANCE_TOL
+    control_ok = (control_rel is not None
+                  and control_rel < CHILD_COVARIANCE_TOL)
     lines = [
         f"  [downfold/star] CHILD WEDGE-STORABILITY GATE, on this run's own "
         f"tensors: the child's {len(slots)}-q wedge block unfolded with the "
         f"child's own tables against the full-BZ child --",
     ] + [f"  [downfold/star]   {n}: max rel {v:.3e}"
          for n, v in sorted(worst.items())] + [
+        (f"  [downfold/star]   CONTROL, the PARENT's own tensor through the "
+         f"SAME route (it was stored on this wedge with these tables, so it "
+         f"MUST return): max rel "
+         + ("NOT TAKEN" if control_rel is None else f"{control_rel:.3e}")),
         f"  [downfold/star] VERDICT: {'PASS' if passed else 'REFUTED'} "
         f"(worst {worst_rel:.3e} against tol {CHILD_COVARIANCE_TOL:.0e}).",
     ]
+    if control_rel is not None and not control_ok:
+        lines += [
+            f"  [downfold/star] *** THE CONTROL FAILED ({control_rel:.3e}). "
+            f"The parent's own tensor does not survive slice-then-unfold "
+            f"through this route, and the parent's storage is KNOWN GOOD — so "
+            f"the disagreement above is in THIS HARNESS (the wedge-slot "
+            f"derivation, the table restriction, or the unfold call), NOT in "
+            f"the child's covariance.  NO CLAIM ABOUT WEDGE STORABILITY MAY "
+            f"BE MADE FROM THE NUMBER ABOVE. ***",
+        ]
+        print_fn("\n".join(lines))
+        return child_perm, child_L, slots, worst_rel
     if passed:
         lines.append(
             "  [downfold/star] the child's unfold tables are the parent's "
@@ -460,6 +517,11 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
             "unfold.  That needs T[q] = U^S T[i(q)] (U^L)+, and T is built by "
             "a RANK-TRUNCATED solve.",
         ]
+        if control_rel is None:
+            lines.append(
+                "  [downfold/star] the control was NOT TAKEN, so 'the child "
+                "is not covariant' and 'this harness is wrong' are not yet "
+                "distinguished.  Read the mechanism below as a candidate.")
         if const is None:
             lines.append(
                 "  [downfold/star] star-rank constancy: NOT MEASURED (the "
@@ -691,7 +753,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         with timing.section("downfold.star", announce=False):
             child_tables = _gate_child_wedge_storability(
                 small, keep_idx, parent_tables, mesh_xy, mu_S, mu_S_pad,
-                rank_per_q=rank_per_q, print_fn=print_fn)
+                rank_per_q=rank_per_q, parent_tensor=tensors.get("V_qmunu"),
+                mu_L=mu_L, print_fn=print_fn)
     elif parent_tables is not None:
         print_fn(
             "  [downfold/star] the selection is NOT orbit-closed, so the "
