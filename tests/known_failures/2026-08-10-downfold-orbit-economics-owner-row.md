@@ -465,3 +465,64 @@ Two consequences for whoever picks this up:
    them (`downfold_provenance/child_unfold_tables/covariance_worst_rel`), and the
    log says in as many words that they must not be used to write a wedge child
    until the verdict passes.
+
+## THE OBSERVABLE, which is the honest accuracy instrument and not eps_W
+
+The driver says on every run that `eps_W` is a tripwire and that "the honest
+accuracy instrument is the observable comparison against the parent".  So it was
+taken, three arms, same deck, same flags, `_logs6/`.
+
+**The band-degeneracy guard refused the first attempt on all three arms
+identically** — `--n-val 4 --n-cond 4` cuts a multiplet on this deck — and named
+its own fix.  The window was widened to the degeneracy-closed `4v8c` the guard
+asked for, on all three arms together.  `--band-degeneracy snap` and `off` were
+both available and neither was used: `AGENT_PREAMBLE`'s standing ruling is that
+you never loosen that criterion to make a leg run, and a window chosen to make
+a comparison possible is a window that is choosing the comparison's answer.
+
+| arm | μ_S | lowest exciton (eV) | vs parent |
+|---|---|---|---|
+| parent | 480 | **3.575096** | — |
+| point-picked | 185 | **3.226476** | **−348.6 meV** |
+| orbit-floored | **168** | **none — the eigensolver did not converge** | no answer at all |
+
+The 168 arm dies in FEAST's Ritz step with `numpy.linalg.LinAlgError:
+Eigenvalues did not converge` (`bse_feast.py:1483`), on the same deck, the same
+flags and the same four-process mesh on which both other arms return.  That is
+reported as what it is — **a failure to produce an observable, not a measured
+observable** — and it is not converted into a number.  It is consistent with the
+error bar (that arm's `eps_W` is 4-10x the other's) and with the direction count
+(122 independent directions against 171), and consistency is not proof: a FEAST
+non-convergence has other possible causes and this lane did not separate them.
+
+One more number that IS available on all three arms, because it comes from the
+Lanczos bound rather than from the solve, and it says the same thing about
+spectral distortion:
+
+| arm | E_max (Lanczos) | vs parent |
+|---|---|---|
+| parent | 13.001 eV | — |
+| point-picked 185 | 14.471 eV | +11 % |
+| orbit-floored 168 | 19.139 eV | **+47 %** |
+
+`E_min` is 0.677 eV on all three and discriminates nothing.
+
+**The answer to the question the owner row asked in its §3 — "does the
+symmetric-but-smaller basis beat or match the asymmetric-larger one?" — is
+NEITHER.  It is beaten, on every instrument that returned a number, and on the
+observable it did not return one.**
+
+## What this lane is NOT claiming
+
+* Not that orbit flooring is wrong.  The ruling is about what a user-facing
+  count MEANS and which way it rounds, and that is right independently of what
+  any deck's error bar does with it.  A user who asks for 185 points and is
+  silently given 480 has been failed; a user given 168 with both numbers printed
+  has been told the truth about a deck that cannot do better.
+* Not that this generalises past `si_bse_debug`.  The economics are driven by
+  the orbit census — 11 orbits over 480 centroids — and a deck with many small
+  orbits has a finer ladder and a better directions-per-point ratio.  The
+  measurement to make on a new deck is the one above and it is cheap.
+* Not that the wedge child is unreachable.  The composition is exact in the
+  algebra and is gated green on the synthetic; what failed is this deck, with
+  the harness exonerated at 0.000e+00 and the mechanism open.
