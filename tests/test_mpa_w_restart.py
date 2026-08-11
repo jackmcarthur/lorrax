@@ -361,6 +361,31 @@ def test_a_read_only_bundle_refuses_the_fit_instead_of_mutating_it(
     assert str(path) in str(exc.value)
 
 
+def test_an_undeclared_pole_field_is_refused_at_the_driver(tmp_path,
+                                                           wfn_a):
+    """A finalized fit store that cannot say its unit or its object.
+
+    MEASURED ON THE REAL ARTIFACTS: eight of the 48 stores on Perlmutter
+    (``si_mpa_0808/_reports/big/mpa_fit*.h5``, ``mpa_closer_0809``'s)
+    are finalized, complete, and declare ``energy_unit = None`` with
+    ``screening_content = None`` — they predate both declarations.  The
+    Sigma pass refuses them, but only after the head read and the pass
+    loop have been reached.  Asking at the driver costs nothing and
+    names the file.
+    """
+    path = tmp_path / "legacy_poles.h5"
+    field = _write_bundle(path, wfn_a)
+    fit_driver.run_fit_driver(str(path), _W_NAME, str(path),
+                              field["z"], field["n_p"])
+    with h5py.File(str(path), "a") as f:
+        del f.attrs[MS.FIT_SCREENING_CONTENT_ATTR]
+    with pytest.raises(ValueError) as exc:
+        w_restart.resolve_mpa_restart(
+            str(path), identity=w_restart.wfn_identity(wfn_a))
+    assert "resuming the pole field" in str(exc.value)
+    assert "does not declare WHICH screening object" in str(exc.value)
+
+
 def test_a_fit_only_bundle_does_not_announce_a_W_it_does_not_hold(
         tmp_path, wfn_a):
     """A production fit store's samples are usually gone; say so.

@@ -234,6 +234,27 @@ def resolve_mpa_restart(
     if _has(path, mpa_store.MPA_FIT_SUFFIX):
         led = mpa_store.fit_completion_ledger(path)
         if bool(led.get("complete", False)):
+            # THE POLE FIELD'S OWN DECLARATIONS, ASKED AT THE DRIVER.
+            # The Sigma pass runs both of these itself and would refuse
+            # such a store anyway -- but only after ``read_head_poles``
+            # and the pass loop have been reached, and only if this
+            # bundle's poles get that far.  MEASURED, 2026-08-10: eight
+            # of the 48 fit stores on this machine
+            # (``si_mpa_0808/_reports/big/mpa_fit*.h5`` and
+            # ``mpa_closer_0809``'s) predate the declarations and carry
+            # energy_unit=None with screening_content=None, which is a
+            # pole axis nobody can say the unit of and a fit nobody can
+            # say the object of.  Refusing them here costs a driver
+            # nothing and names the file.
+            mpa_store.require_correlation_part(
+                led.get("screening_content"),
+                where=f"{context}: resuming the pole field in "
+                      f"{os.path.basename(path)}",
+                source=path)
+            mpa_store.canonical_energy_unit(
+                led.get("energy_unit"),
+                where=f"{context}: the pole axis of "
+                      f"{os.path.basename(path)}")
             return MpaRestartDecision(path=path, stage=STAGE_SIGMA,
                                       w_name=w_name, w_header=w_header,
                                       fit_ledger=led)
