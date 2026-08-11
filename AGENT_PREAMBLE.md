@@ -44,6 +44,7 @@ incident is the reason; it is not decoration.
 | 7 | **PROVENANCE TRAVELS OR THE CLAIM DOESN'T**: env/infra claims leave a lane with exact config + log path, else labelled hypothesis | "BFC is unusable": one datum under the wrong config, three cross-fleet rounds to retract (`ALLOCATOR_ARCHAEOLOGY.md`) |
 | 8 | **STOP AT THE FUNDED LINE**: price before launching; over cap → stop and report the plan. Stage boundaries are resume points. Kill by PID, never `pkill` pattern. No artifact deletion under a running comparison | — |
 | 9 | **CACHE SYMMETRY IS NOT A COUNT**: a P>1 leg that reports `xla_compiles=0 vetoed=0` has shown nothing until the cache-KEY SET is compared across ranks — four ranks each holding a private program report the same numbers as four sharing one | `tests/test_jax_cache_contract.py`; `LORRAX_JAX_CACHE_KEYDUMP`; the five siblings of `FIX_multislice_cachekey.md` §6.1 |
+| 10 | **VERIFY WHAT WAS COLLECTED, not just what failed** — a green run whose collection you did not check is not a green run; print/assert the collected count against the expected set (three variants in one day: worktree venv importing the wrong tree, direct_cells not expanding parametrize so green read FAIL, importorskip collapsing a whole module to one silent SKIP) | collected==expected, skips itemized by name, before believing any green |
 
 Claim/check rubric: `docs/dev/QUALITY_PATTERNS.md` (ten classes, cited by number).
 Worked gate-by-gate example: **§6 of `docs/mpa_method_guide.md`**, on the MPA
