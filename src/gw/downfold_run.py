@@ -82,7 +82,8 @@ from gw.downfold import (
     transform_head_vector,
 )
 
-__all__ = ["DownfoldResult", "resolve_restart_file", "run_downfold"]
+__all__ = ["DownfoldResult", "resolve_restart_file", "run_downfold",
+           "child_covariance_tol"]
 
 #: Bumped when the provenance group's contents change meaning.
 #: 2 (2026-08-10) adds the ISDF-basis paths — ``parent_centroids_file``,
@@ -91,7 +92,13 @@ __all__ = ["DownfoldResult", "resolve_restart_file", "run_downfold"]
 #: only read the tensors already in it.  Purely additive: every version-1
 #: field keeps its meaning, so a reader that only wants ``keep_idx`` need not
 #: look at the version at all.
-DOWNFOLD_PROVENANCE_VERSION = 2
+#: 3 (2026-08-11) adds ``kappa_eff_per_q`` and, beside the child's tables,
+#: ``covariance_kappa_eff`` / ``covariance_tol`` / ``covariance_verdict``.
+#: These are what make ``covariance_worst_rel`` READABLE: the gate's
+#: tolerance is now a function of the run's own conditioning
+#: (``child_covariance_tol``), so a residual stored without the κ it was
+#: taken at cannot be turned back into a verdict.  Also purely additive.
+DOWNFOLD_PROVENANCE_VERSION = 3
 
 #: The two-point tensors a downfold transports.  Each is a LINEAR object in
 #: the centroid basis and therefore transforms by congruence.  A plasmon-pole
@@ -327,15 +334,99 @@ def _wedge_q_slots(tables) -> np.ndarray:
     return slots
 
 
-#: Above this relative disagreement the child's wedge block does NOT unfold to
-#: the child, and the gate says REFUTED rather than quoting the number and
-#: calling it a floor.  The two routes apply the same unitary at different
-#: points of one chain, so the honest floor is a few ulp (the synthetic gate in
-#: tests/test_downfold.py reads 1.7e-15); a DIFFERENT algebra misses by order
-#: one (its red twin reads 8.6e-01).  1e-9 sits in the empty decades between
-#: them, so no plausible reassociation reaches it and no real disagreement
-#: hides under it.
+#: The FLOOR of the child-covariance gate, and the value the gate used as an
+#: absolute constant until 2026-08-11.  It was chosen "in the empty decades
+#: between the synthetic floor 1.7e-15 and the red twin 8.6e-01" — on a
+#: synthetic whose transfer solve runs at a condition number of order 20.  It
+#: stays here as a floor so that a well-conditioned synthetic does not get a
+#: gate tighter than the one it was calibrated against.
 CHILD_COVARIANCE_TOL = 1e-9
+
+#: Exponent of the κ-scaling, FITTED to the filed measurements and not taken
+#: from theory.  ``tests/known_failures/2026-08-11-downfold-gram-q-sign.md``
+#: records a three-point rcond sweep of the achieved covariance residual on
+#: ``si_bse_debug`` against the transfer solve's own ``kappa_eff``:
+#:
+#:     kappa_eff  2.0e+01 -> 3.9e-10
+#:     kappa_eff  9.9e+01 -> 1.2e-09
+#:     kappa_eff  8.9e+05 -> 3.7e-08
+#:
+#: A least-squares line through those three points in log-log has slope
+#: **0.4087**, which is rounded to 0.41 here.  Note what that REFUTES: the
+#: same row's prose reasons that "the pinv's perturbation is second order in
+#: the condition number", and the measurement says the observed exponent is
+#: about 0.41, not 2.  The design constraint on this ruling is that the
+#: exponent comes from the measurements, so 0.41 is what ships and the theory
+#: sentence is a hypothesis the data does not support.  The measured local
+#: slope also FALLS with κ (0.70 across the first decade, 0.38 across the
+#: last four), so a single global 0.41 extrapolates upward — conservative in
+#: the direction the owner asked about, which is more atoms and centroids.
+CHILD_COVARIANCE_KAPPA_EXPONENT = 0.41
+
+#: Enveloping coefficient, in units of ``eps_mach``: the SMALLEST constant for
+#: which ``C * kappa**p * eps`` covers all three filed points (the three
+#: implied constants are 5.14e5, 8.21e5 and 6.06e5 eps; this is the largest,
+#: rounded up).  It is a fit residual, not a margin — the margin is the
+#: separate factor below.
+CHILD_COVARIANCE_KAPPA_COEFF = 8.3e5
+
+#: The safety factor, STATED rather than folded into the coefficient so a
+#: reader can audit the two apart.  4x.  It is modest on purpose: the three
+#: filed points come from ONE deck at three rcond values, so deck-to-deck
+#: spread is unmeasured, and 4x covers the 1.6x spread of the fit itself with
+#: room over.  What it costs is checked rather than assumed — at the
+#: production deck's κ = 8.945e+05 the gate opens to 2.0e-07, which is 5.4x
+#: above the 3.729e-08 that deck achieves and still **5.8e+06 times tighter**
+#: than the 1.170e+00 the same deck produced when its transfer was genuinely
+#: built at the wrong q.  The gate keeps essentially all of its
+#: discrimination; see the high-κ red twin in ``tests/test_downfold.py``.
+CHILD_COVARIANCE_KAPPA_SAFETY = 4.0
+
+#: Machine epsilon, named once so the formula below reads as what it is.
+_EPS_MACH = float(np.finfo(np.float64).eps)
+
+
+def child_covariance_tol(kappa_eff) -> float:
+    """The child-covariance gate's tolerance at THIS run's conditioning.
+
+    ``tol(κ) = max(CHILD_COVARIANCE_TOL, safety * C * κ**p * eps_mach)``
+
+    WHY THIS IS A FUNCTION AND NOT A CONSTANT (owner ruling, 2026-08-11:
+    *"make it scale if you think that is the most likely thing to be more
+    robust to say 100x more atoms and centroids"*).  The quantity the gate
+    measures is a pseudo-inverse perturbation: the transfer is
+    ``T = S_SS^+ S_cross``, and whatever covariance residual the Gram carries
+    is amplified through that pinv.  The amplification is a property of the
+    SOLVE's conditioning, so a gate written as an absolute number is
+    calibrated to whatever deck it was first read on.  It was, and the
+    consequence is filed: the 1e-9 constant was set against a synthetic at
+    κ ~ 20, the production deck runs at κ_eff = 8.9e5 and achieves 3.7e-08,
+    and the gate therefore printed **REFUTED on a correct result** — the
+    verdict was reporting the deck's conditioning, not its correctness.
+
+    ``kappa_eff`` IS A MEASUREMENT, NEVER A KNOB.  It is the achieved
+    amplification ``sigma_max / sigma_min_kept`` that
+    ``common.rank_criterion`` computes for this run's own transfer solve,
+    the number ``[downfold/solve]`` prints and that the bundle records under
+    ``downfold_provenance/kappa_eff_per_q``.  It is not estimated here, it
+    is not a deck key, and there is no CLI or environment route to it — the
+    same discipline the refit-window certification tolerance keeps.  Pass
+    the MAX over q, because ``worst_rel`` is itself a max over q.
+
+    If ``kappa_eff`` is missing or not finite the tolerance falls back to the
+    floor and the caller says so: an absence is not a measurement, and a gate
+    that guessed a κ in order to open itself would be the loosening this
+    whole row exists to refuse.
+    """
+    try:
+        kap = float(kappa_eff)
+    except (TypeError, ValueError):
+        kap = float("nan")
+    if not np.isfinite(kap) or kap <= 0.0:
+        return float(CHILD_COVARIANCE_TOL)
+    scaled = (CHILD_COVARIANCE_KAPPA_SAFETY * CHILD_COVARIANCE_KAPPA_COEFF
+              * kap ** CHILD_COVARIANCE_KAPPA_EXPONENT * _EPS_MACH)
+    return float(max(CHILD_COVARIANCE_TOL, scaled))
 
 
 def _star_rank_constancy(rank_per_q, tables):
@@ -406,7 +497,8 @@ def _unfold_roundtrip_rel(arr_full, tables, sym_perm, L_table, slots,
 
 
 def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
-                                  mu_S_pad, *, rank_per_q, parent_tensor=None,
+                                  mu_S_pad, *, rank_per_q, kappa_per_q=None,
+                                  parent_tensor=None,
                                   mu_L=None, print_fn=print):
     """THE COMPOSITION, MEASURED ON THE RUN'S OWN TENSORS.
 
@@ -420,7 +512,14 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
     This takes that gate on the REAL tensors this run just produced, per run,
     at whatever mesh it is on.  Cost is one unfold of an
     ``(n_q_ibz, μ_S, μ_S)`` block, which is the smallest tensor in the
-    pipeline.  Returns ``(child_perm, child_L, slots, worst_rel)``.
+    pipeline.
+
+    ``kappa_per_q`` is this run's own achieved amplification from the transfer
+    solve; its max sets the tolerance through :func:`child_covariance_tol`.
+    Omitting it is legal and pins the gate at the 1e-9 floor, which the
+    verdict line then says out loud.
+
+    Returns ``(child_perm, child_L, slots, worst_rel)``.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -467,9 +566,43 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
             parent_tensor, tables, np.asarray(tables.sym_perm),
             np.asarray(tables.L_table), slots, mesh_xy, int(mu_L))
 
-    passed = worst_rel < CHILD_COVARIANCE_TOL
+    # THE TOLERANCE IS THIS RUN'S OWN, and it is derived from this run's own
+    # measured conditioning rather than carried in from whatever deck the
+    # gate was first read on.  ``worst_rel`` is a max over q, so the κ that
+    # pairs with it is the max over q too.
+    kap = np.asarray(kappa_per_q, dtype=np.float64).ravel() \
+        if kappa_per_q is not None else np.asarray([], dtype=np.float64)
+    kap_max = float(np.nanmax(kap)) if kap.size and np.any(np.isfinite(kap)) \
+        else float("nan")
+    tol = child_covariance_tol(kap_max)
+    passed = worst_rel < tol
+    # The CONTROL keeps the ABSOLUTE floor, deliberately.  It is a slice and
+    # an unfold of a tensor the reader already unfolded — a permutation and a
+    # unit-modulus phase, with no pseudo-inverse anywhere in it — so its
+    # honest floor is a few ulp at any conditioning, and scaling it with a κ
+    # it does not depend on would blunt the one check that separates "this
+    # harness is wrong" from "the child is not covariant".
     control_ok = (control_rel is not None
                   and control_rel < CHILD_COVARIANCE_TOL)
+    if np.isfinite(kap_max):
+        tol_note = (
+            f"  [downfold/star]   TOLERANCE, from THIS run's conditioning: "
+            f"kappa_eff max over q = {kap_max:.3e} -> tol = max(1e-9, "
+            f"{CHILD_COVARIANCE_KAPPA_SAFETY:g} x "
+            f"{CHILD_COVARIANCE_KAPPA_COEFF:.1e} x kappa^"
+            f"{CHILD_COVARIANCE_KAPPA_EXPONENT:g} x eps) = {tol:.3e}.  The "
+            f"exponent is FITTED to the filed rcond sweep (2.0e1 -> 3.9e-10, "
+            f"9.9e1 -> 1.2e-09, 8.9e5 -> 3.7e-08) and the 4x is a stated "
+            f"safety factor; the gate is a pinv perturbation and does not "
+            f"have a conditioning-independent floor.")
+    else:
+        tol_note = (
+            f"  [downfold/star]   TOLERANCE: kappa_eff was NOT SUPPLIED to "
+            f"this gate, so the tolerance falls back to the absolute floor "
+            f"{CHILD_COVARIANCE_TOL:.0e} and is NOT scaled.  An absence is "
+            f"not a measurement; a REFUTED here may be the deck's "
+            f"conditioning and not its correctness, and the fix is to hand "
+            f"the gate the solve's kappa_eff, never to widen this number.")
     lines = [
         f"  [downfold/star] CHILD WEDGE-STORABILITY GATE, on this run's own "
         f"tensors: the child's {len(slots)}-q wedge block unfolded with the "
@@ -479,9 +612,12 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         (f"  [downfold/star]   CONTROL, the PARENT's own tensor through the "
          f"SAME route (it was stored on this wedge with these tables, so it "
          f"MUST return): max rel "
-         + ("NOT TAKEN" if control_rel is None else f"{control_rel:.3e}")),
+         + ("NOT TAKEN" if control_rel is None else f"{control_rel:.3e}")
+         + f" against the UNSCALED floor {CHILD_COVARIANCE_TOL:.0e} (no "
+           f"pseudo-inverse on this route, so it does not scale with kappa)"),
+        tol_note,
         f"  [downfold/star] VERDICT: {'PASS' if passed else 'REFUTED'} "
-        f"(worst {worst_rel:.3e} against tol {CHILD_COVARIANCE_TOL:.0e}).",
+        f"(worst {worst_rel:.3e} against tol {tol:.3e}).",
     ]
     if control_rel is not None and not control_ok:
         lines += [
@@ -494,15 +630,17 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
             f"BE MADE FROM THE NUMBER ABOVE. ***",
         ]
         print_fn("\n".join(lines))
-        return child_perm, child_L, slots, worst_rel
+        return child_perm, child_L, slots, worst_rel, kap_max, tol
     if passed:
         lines.append(
             "  [downfold/star] the child's unfold tables are the parent's "
             "restricted to the kept rows (keep[alpha_S(j)] = alpha(keep[j])), "
             "so the phase the child applies is the phase the parent would "
             "have applied to those centroids.  A number at this scale is the "
-            "reassociation floor and not an agreement band: the two routes "
-            "apply the same unitary at different points of one chain.")
+            "reassociation floor CARRIED THROUGH THE PSEUDO-INVERSE and not "
+            "an agreement band: the two routes apply the same unitary at "
+            "different points of one chain, and the transfer between those "
+            "points amplifies by kappa_eff.")
     else:
         # DO NOT NARRATE AN ORDER-ONE NUMBER AS A FLOOR.  The mechanism is
         # measured here rather than guessed at, because the two candidates
@@ -510,6 +648,10 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         const, worst_star, spread, n_bad = _star_rank_constancy(
             rank_per_q, tables)
         lines += [
+            f"  [downfold/star] and it misses by {worst_rel / tol:.2e}x the "
+            f"tolerance THIS run's own conditioning allows, so the verdict is "
+            f"not reporting kappa_eff: a gate at a fixed 1e-9 could be "
+            f"refuting arithmetic, this one cannot.",
             "  [downfold/star] THE CHILD IS NOT WEDGE-STORABLE ON THIS DECK, "
             "and orbit closure of the selection is not the missing piece — it "
             "HOLDS (the verdict two blocks up).  Closure is what gives the "
@@ -571,7 +713,7 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         "driver does not open.  The permutation-level statement above is a "
         "different object and must not be stamped as if it were that one.")
     print_fn("\n".join(lines))
-    return child_perm, child_L, slots, worst_rel
+    return child_perm, child_L, slots, worst_rel, kap_max, tol
 
 
 class _BandSlices:
@@ -706,6 +848,14 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             print_fn=print_fn)
         T_x.block_until_ready()
     rank_per_q = np.array([r.rank_criterion for r in reports], dtype=np.int64)
+    # THE RUN'S OWN CONDITIONING, kept beside its rank because the two are
+    # the same measurement read two ways and because the child-covariance
+    # gate's tolerance is a function of it (``child_covariance_tol``).  Taken
+    # from the SAME reports ``[downfold/solve]`` prints, so the number in the
+    # gate's verdict line is the number in the solve's banner.
+    kappa_per_q = np.array(
+        [r.kappa_eff if r.kappa_eff is not None else np.nan for r in reports],
+        dtype=np.float64)
 
     # ---- D4: the congruence ----------------------------------------------
     with timing.section("downfold.congruence", announce=True,
@@ -765,7 +915,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         with timing.section("downfold.star", announce=False):
             child_tables = _gate_child_wedge_storability(
                 small, keep_idx, parent_tables, mesh_xy, mu_S, mu_S_pad,
-                rank_per_q=rank_per_q, parent_tensor=tensors.get("V_qmunu"),
+                rank_per_q=rank_per_q, kappa_per_q=kappa_per_q,
+                parent_tensor=tensors.get("V_qmunu"),
                 mu_L=mu_L, print_fn=print_fn)
     elif parent_tables is not None:
         print_fn(
@@ -779,7 +930,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
                         label="small restart bundle"):
         out_file = _write_small_bundle(
             cfg, geom, small, g0_S, rs.enk_full, psi_S_Y, keep_idx, mu_S,
-            mesh_xy, sel=sel, rank_per_q=rank_per_q, eps=eps,
+            mesh_xy, sel=sel, rank_per_q=rank_per_q,
+            kappa_per_q=kappa_per_q, eps=eps,
             child_tables=child_tables, print_fn=print_fn)
 
     parent_table, fft_grid = resolve_parent_centroids(
@@ -835,8 +987,9 @@ def _announce_residual(eps: dict, print_fn) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
-                        mu_S, mesh_xy, *, sel, rank_per_q, eps,
-                        child_tables=None, print_fn=print):
+                        mu_S, mesh_xy, *, sel, rank_per_q,
+                        kappa_per_q=None, eps, child_tables=None,
+                        print_fn=print):
     out_dir = cfg.output_restart
     tmp_dir = os.path.join(out_dir, "tmp")
     if process_rank() == 0:
@@ -881,7 +1034,8 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
             omega_grid=geom["omega_grid"], S_cart=geom["S_cart"])
 
     _stamp_downfold_provenance(out_file, cfg, geom, keep_idx, mu_S,
-                               sel=sel, rank_per_q=rank_per_q, eps=eps,
+                               sel=sel, rank_per_q=rank_per_q,
+                               kappa_per_q=kappa_per_q, eps=eps,
                                child_tables=child_tables)
     barrier("downfold.bundle_written")
     print_fn(f"  [downfold] wrote {out_file}  "
@@ -901,7 +1055,8 @@ def _append_munu(filename, name, arr, mu_S, mesh_xy):
 
 
 def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
-                               sel, rank_per_q, eps, child_tables=None):
+                               sel, rank_per_q, eps, kappa_per_q=None,
+                               child_tables=None):
     """Rank-0 group recording what this bundle IS and how it was made.
 
     A downfolded bundle is indistinguishable from a natively-fitted one by
@@ -951,6 +1106,14 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
         g.create_dataset("keep_idx", data=np.asarray(keep_idx, dtype=np.int64))
         g.create_dataset("retained_rank_per_q",
                          data=np.asarray(rank_per_q, dtype=np.int64))
+        # THE CONDITIONING, RECORDED.  ``child_covariance_tol`` is a function
+        # of this number, so a reader who wants to know why this bundle's
+        # covariance verdict said what it said must be able to find the κ it
+        # was taken at — without re-running the solve, and without estimating
+        # anything.  Per q, because that is how it is measured.
+        if kappa_per_q is not None:
+            g.create_dataset("kappa_eff_per_q",
+                             data=np.asarray(kappa_per_q, dtype=np.float64))
         for name, e in eps.items():
             g.create_dataset(f"eps_w_{name}",
                              data=np.asarray(e, dtype=np.float64))
@@ -962,9 +1125,17 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
         # second derivation of a permutation is a second answer to a question
         # this run already answered.
         if child_tables is not None:
-            child_perm, child_L, slots, worst_rel = child_tables
+            child_perm, child_L, slots, worst_rel, kap_max, cov_tol = \
+                child_tables
             cg = g.create_group("child_unfold_tables")
             cg.attrs["covariance_worst_rel"] = np.float64(worst_rel)
+            # The verdict is worst_rel against THIS pair, so both travel.  A
+            # bare residual with no tolerance beside it is the shape that let
+            # a correct 3.7e-08 read as REFUTED for two days.
+            cg.attrs["covariance_kappa_eff"] = np.float64(kap_max)
+            cg.attrs["covariance_tol"] = np.float64(cov_tol)
+            cg.attrs["covariance_verdict"] = (
+                "PASS" if worst_rel < cov_tol else "REFUTED")
             cg.attrs["note"] = (
                 "child sym_perm/L_table = the parent's restricted to keep_idx;"
                 " q-side tables are the parent's, unchanged (the downfold is"
