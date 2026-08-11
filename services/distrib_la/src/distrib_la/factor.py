@@ -58,6 +58,7 @@ from typing import Any
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la import closure as _closure
 from distrib_la.plan import (BATCHED_SCAN_UNROLL, cached_scan, ensure_sharding,
                              scan_signature)
 from distrib_la.resolve import NATIVE, backend_module, resolve_backend
@@ -83,6 +84,11 @@ class FactorToken:
         checks the RHS against them, so a mismatched B refuses here
         instead of corrupting a solve or hanging in a collective.
 
+    closure
+        The degeneracy-closure mode :meth:`rank_cut` runs under, resolved
+        once at :func:`factor` time.  ``'off'`` by default — see
+        :mod:`distrib_la.closure`.
+
     The factor itself is deliberately NOT a public attribute: its layout
     is block-cyclic on ``mesh``'s specific grid, and "feed it back
     verbatim" is only enforceable while nothing can take it out.
@@ -94,15 +100,52 @@ class FactorToken:
     n: int
     nbatch: int
     _factor: Any = field(repr=False)
+    closure: str = _closure.DEFAULT_MODE
 
     def __repr__(self) -> str:                      # no factor bytes in logs
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        cl = "" if self.closure == "off" else f", closure={self.closure}"
         return (f"FactorToken({self.op}/{self.backend}, n={self.n}, "
-                f"nbatch={self.nbatch}, mesh={px}x{py})")
+                f"nbatch={self.nbatch}, mesh={px}x{py}{cl})")
+
+    def rank_cut(self, values, **kwargs):
+        """Decide a rank in ``values`` under THIS token's closure mode.
+
+        The factor/solve split is where a rank decision most obviously
+        belongs — you have factored, and the next question is how much of
+        the factor to trust — so the token carries the guard the same way
+        :class:`distrib_la.Plan` does, with the same refusal on ``op=`` /
+        ``closure=``.
+
+        **THE SPECTRUM IS THE CALLER'S TO SUPPLY, AND THIS ROUND IT HAS
+        TO BE.** A token's factor is opaque by design: ScaLAPACK's
+        ``ipiv`` and LU, cuSOLVERMp's raw buffer and SLATE's
+        ``SlateLowerL`` are block-cyclic on a specific grid, and there is
+        deliberately no accessor to reach one. Pulling ``diag`` out of a
+        block-cyclic handle is a distributed gather with a per-backend
+        layout rule each — real work, and none of it measured. So a
+        caller that wants a closed rank off an FFI factor materialises the
+        factor through that backend's own documented route
+        (``cholesky_handle_to_natural_L``, ``SlateLowerL.to_jax_lower``)
+        and hands the spectrum here. **OWED, named rather than implied:
+        a ``FactorToken.rank_spectrum()`` that reads the diagonal in
+        place.**
+        """
+        for banned in ("op", "closure"):
+            if banned in kwargs:
+                raise ValueError(
+                    f"FactorToken.rank_cut: {banned}= is the TOKEN's "
+                    f"({getattr(self, banned)!r}) and cannot be overridden "
+                    f"per call — a token is valid only for the system it "
+                    f"factored, and that includes the guard it was "
+                    f"factored under.")
+        return _closure.rank_cut(self.op, values, closure=self.closure,
+                                 **kwargs)
 
 
 def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
-           n: int | None = None) -> FactorToken:
+           n: int | None = None,
+           closure: str | None = None) -> FactorToken:
     """Factor a STACK ``A`` ``(nbatch, n, n)`` once; return an opaque token.
 
     ``op`` is ``'cholesky'`` (``potrf``) or ``'solve_lu'`` (``getrf``).
@@ -119,6 +162,13 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
     ``jnp.linalg.solve``, neither of which produces a reusable
     distributed factor.  Both refuse here rather than pretending, and name
     what to call instead.
+
+    ``closure`` is the degeneracy-closure mode the returned token's
+    :meth:`FactorToken.rank_cut` runs under — ``'snap'`` / ``'strict'`` /
+    ``'off'``, or ``None`` for ``LORRAX_DISTRIB_LA_CLOSURE`` and then
+    ``off``.  It is OPT-IN and changes NOTHING about the factorization:
+    the same backend resolves, the same library runs, the same bytes come
+    back.  It decides only what a rank cut taken OFF that factor may do.
     """
     if op not in FACTOR_OPS:
         raise ValueError(
@@ -166,7 +216,10 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
         held = _slate_potrf_stack(mod, A, mesh_xy)
 
     return FactorToken(op=op, backend=resolved, mesh=mesh_xy,
-                       n=extent, nbatch=nb, _factor=held)
+                       n=extent, nbatch=nb, _factor=held,
+                       closure=_closure.resolve_mode(
+                           _closure.mode_from_env() if closure is None
+                           else closure))
 
 
 def _slate_potrf_stack(mod, A, mesh_xy: Mesh) -> tuple:
