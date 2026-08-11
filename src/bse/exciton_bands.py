@@ -1134,6 +1134,26 @@ def build_parser():
                          "against the same eigenvalues through the stored "
                          "tiles, at "
                          f"{REFIT_CERT_TOL_MEV:g} meV.")
+    ap.add_argument("--refit-guard-bands", type=int, default=None,
+                    metavar="N",
+                    help="guard bands the refit's htransform (fH) window "
+                         "carries ABOVE the window zeta' is fitted on "
+                         f"(default {vq_interp.REFIT_N_GUARD_DEFAULT}).  THE "
+                         "TWO-WINDOW CONTRACT: f(eps) is identically zero for "
+                         "eps >= max_k eps of fH's OWN top band, so pinning "
+                         "the two windows together asks compute_wfns_fi for "
+                         "exactly the bands fH cannot represent -- the top "
+                         "band vanishes at the k that defines the shift and a "
+                         "whole shoulder below it carries ~1%% of fH's "
+                         "weight, so eigh returns arbitrary null-space "
+                         "directions there (measured: on-grid tile null 1.267 "
+                         "with zero guards, against a 5.0e-02 bracket).  The "
+                         "guards move that shoulder onto bands nobody reads; "
+                         "zeta' is still fitted on the producer's window "
+                         "exactly.  Costs Galerkin capacity "
+                         "(n_mu*n_s >= nk*(nb_zeta+N)) and needs the WFN to "
+                         "carry the bands.  0 is the RED TWIN and must fail "
+                         "the tile null.")
     ap.add_argument("--cert-grade", choices=tuple(CERT_TOL_BY_GRADE),
                     default="reference",
                     help="which NAMED tolerance the --refit-window=bse "
@@ -1751,7 +1771,8 @@ def main(argv=None):
                                       keep_idx=keep_idx,
                                       window_mode=args.refit_window,
                                       degeneracy_mode=args.band_degeneracy,
-                                      degeneracy_tol_ry=args.degeneracy_tol_ry)
+                                      degeneracy_tol_ry=args.degeneracy_tol_ry,
+                                      n_guard=args.refit_guard_bands)
         # THE ζ THE REFIT ACTUALLY FITS IN.  Identical to ``zx`` under
         # ``--refit-window=zeta``; a band-axis sub-window VIEW of it under
         # ``bse``.  Every refit_vq call below takes this, not ``zx`` — handing
@@ -1958,7 +1979,8 @@ def main(argv=None):
         rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
                                       r_chunk=args.refit_r_chunk,
                                       policy=zx.get("policy"),
-                                      keep_idx=keep_idx)
+                                      keep_idx=keep_idx,
+                                      n_guard=args.refit_guard_bands)
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
@@ -2221,6 +2243,17 @@ def main(argv=None):
                             f"{zx_fit['nk'] * zx_fit['nb']})"
                             if args.refit_window == "bse" else
                             " (producer's zeta-fit window)") + "\n")
+                # THE TWO-WINDOW CONTRACT TRAVELS WITH THE DATA.  A curve
+                # drawn through a zero-guard refit is a curve through
+                # arbitrary null-space directions at the top of its own
+                # window, and the only way a reader tells the two apart after
+                # the fact is this line.
+                fh.write(f"# refit-fh-window: absolute bands "
+                         f"[{rst['window_abs_fh'][0]}, "
+                         f"{rst['window_abs_fh'][1]}) = zeta window + "
+                         f"{rst['n_guard']} guard band(s); Galerkin residual "
+                         f"{rst['galerkin_rel']:.3e} (fH) / "
+                         f"{rst['galerkin_rel_zeta']:.3e} (zeta window)\n")
             if cert_rows:
                 # THE CERTIFICATION TRAVELS WITH THE DATA.  A gate whose
                 # numbers live only in a log is a claim about a file nobody

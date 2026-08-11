@@ -560,6 +560,23 @@ def _interpolate_bse_data_to_grid(
             f"bse_k_grid BSE window [{b_min},{b_max}) escapes the htransform fH "
             f"window [0,{nb_window}); the input's nval/nband must load "
             f">= {n_val} valence and >= {n_cond} conduction guard bands.")
+    # SPLASH RADIUS OF THE f-SHOULDER (``2026-08-11-fifth-wall-is-the-f-\
+    # transform-shoulder.md`` §7, audited here).  The check above refuses
+    # ``b_max > nb_window`` and so PERMITS ``b_max == nb_window`` — a deck
+    # whose ``nband`` equals ``nval + ncond`` has no conduction guard at all
+    # and lands exactly where the refit did: f(eps) is identically zero at and
+    # above ``max_k eps`` of the window's own top band, so the top of the BSE
+    # conduction selection comes back from eigh as a null-space direction.
+    # ``compute_wfns_fi``'s f-shoulder gate refuses; this says it first, in
+    # the deck's own vocabulary.
+    _n_guard = nb_window - b_max
+    if _n_guard < 4:
+        log_fn(f"  [warn] bse_k_grid: only {_n_guard} conduction guard "
+               f"band(s) above the BSE window [{b_min},{b_max}) inside the "
+               f"{nb_window}-band htransform window.  The f-transform's shift "
+               f"is max_k eps of THAT window's top band, so f == 0 there and "
+               f"the shoulder below it carries ~1% of fH's weight; the top of "
+               f"the returned window may be arbitrary.  Raise nband/ncond.")
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=coarse_grid, kgrid_fi=fine_grid,

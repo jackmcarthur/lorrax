@@ -169,6 +169,131 @@ def _uniform_kgrid_frac(kgrid: tuple[int, int, int]) -> jax.Array:
     return jnp.asarray((grid + 0.5) % 1.0 - 0.5)
 
 
+#: The f-shoulder tripwire's floor on ``min_k |f(ε_b)| / max|f|``, over the
+#: bands ``compute_wfns_fi`` RETURNS.  Default 0.0 — refuse only when a
+#: returned band's f is EXACTLY zero somewhere in the zone, which is the
+#: measured failure and not a tolerance judgement.  A NEGATIVE override
+#: disables the gate (announced); a positive one tightens it.
+FI_FSHOULDER_TOL_DEFAULT = 0.0
+
+
+def resolve_fi_fshoulder_tol(log_fn=None) -> float:
+    """``LORRAX_FI_FSHOULDER_TOL`` (default 0.0) — the f-shoulder gate floor.
+
+    Same announce-or-refuse grammar as ``LORRAX_FH_ORTHO_TOL``
+    (``gw_config.env_float`` in refuse mode), with ONE deliberate difference
+    that is worth stating because the two gates sit four lines apart: here
+    ``0`` is the DEFAULT, not the off switch.  A band whose ``f`` is exactly
+    zero at some k is not a tolerance question — it is absent from ``fH``
+    — so the floor that catches it is zero, and turning the gate OFF needs a
+    value no threshold could ever be (negative).
+    """
+    from gw.gw_config import env_float
+    tol = env_float("LORRAX_FI_FSHOULDER_TOL", FI_FSHOULDER_TOL_DEFAULT,
+                    refuse=True)
+    if tol != FI_FSHOULDER_TOL_DEFAULT and log_fn is not None:
+        log_fn(f"  [gate] LORRAX_FI_FSHOULDER_TOL={tol:.3e} overrides the "
+               f"default {FI_FSHOULDER_TOL_DEFAULT:.1e}"
+               + ("  ** THE f-SHOULDER GATE IS DISABLED — only ever to "
+                  "reproduce a known-bad run **" if tol < 0.0 else ""))
+    return tol
+
+
+def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
+                     rank: int | None = None):
+    """REFUSE when a RETURNED band is invisible to ``fH`` at some k.
+
+    THE MECHANISM, in one sentence: ``f`` is identically zero for ε ≥
+    ``shift`` and ``htransform._f_params_from_energies`` sets ``shift =
+    max_k ε[nb−1]``, so the top band of the htransform's own window
+    contributes EXACTLY NOTHING to ``fH = Σ_n f(ε_n) c_n c_nᴴ`` at the k that
+    attains that maximum, and ``f`` vanishes to second order approaching it
+    — which puts a whole SHOULDER of bands below the top at a per-cent or
+    less of fH's weight.  Those eigenvector slots are degenerate with fH's
+    own ``(rank − nb)``-dimensional null space and ``eigh`` fills them with
+    arbitrary directions out of it.  The returned ψ for such a band is not
+    slightly wrong; it is a different vector.
+
+    WHY A GATE AND NOT A DOC LINE.  This cost five lanes.  The representation
+    was fine every time — ``ctilde`` orthonormality 8.9e-15 and the Galerkin
+    residual 4.3e-15 on the parent where the tile null read 140 — so every
+    instrument the tree already had exonerated the htransform, correctly, and
+    the defect was in the REQUEST.  Measured signature
+    (``tests/known_failures/2026-08-11-fifth-wall-is-the-f-transform-shoulder.md``
+    §2), from the runs' own ``enk_sigma``:
+
+        dp2628n20  nb 20, ZERO guards:  bands 16..19 read min_k |f|/max|f| =
+                   0.000000, exactly zero at 3 k each; α-space overlap
+                   ‖O[m,:]‖ collapses to 0.23…0.27; tile null 1.267.
+        p2628n52   nb 52, ZERO guards:  bands 50, 51 zero at 8 k each.
+        The bands that SURVIVE never get closer to zero than ~4e-4 of
+        max|f| and come back at ‖O[m,:]‖ = 1.000000 at every k.
+
+    So the good and the bad are separated by four decades with nothing in
+    between, and a floor at exactly zero is the whole discrimination.
+
+    THE FIX IS GUARD BANDS, not a wider tolerance: widen the htransform
+    window ABOVE what you ask back (``initialize_wfns(n_guard_bands=…)``,
+    ``bse.vq_interp.refit_prepare``), so the shoulder lands on bands nobody
+    reads.  ``b_min``/``b_max`` index ``ctilde``'s band axis, which is the
+    same axis ``f_eps`` carries and — ``f`` being monotone in ε — the same
+    ascending-eigenvalue slice the caller takes out of ``fH_q``.
+    """
+    tol = resolve_fi_fshoulder_tol(log_fn)
+    fa = np.abs(np.asarray(f_eps, dtype=np.float64))     # (nb_co, nk_co)
+    fmax = float(fa.max()) if fa.size else 0.0
+    if fmax <= 0.0:
+        raise ValueError(
+            "compute_wfns_fi: max|f(ε)| over the whole htransform window is "
+            "zero — every band is at or above the f-transform's shift, so fH "
+            "is identically zero and its eigenvectors are pure noise.  This "
+            "is an energy-array problem (a zeroed or sentinel enk_sigma), "
+            "not a window one.")
+    ratio = fa[b_min:b_max, :].min(axis=1) / fmax        # per RETURNED band
+    n_zero_k = int((fa[b_min:b_max, :] == 0.0).sum())
+    worst_b = int(np.argmin(ratio)) + b_min
+    worst = float(ratio.min())
+    n_guard = int(fa.shape[0]) - int(b_max)
+    if log_fn is not None:
+        log_fn(f"  [gate] f-shoulder over the RETURNED bands "
+               f"[{b_min}, {b_max}) of {int(fa.shape[0])} "
+               f"({n_guard} guard band(s) above): "
+               f"min_b min_k |f(ε_b)|/max|f| = {worst:.6e} at band {worst_b} "
+               f"(shift = {shift:.8f} Ry; {n_zero_k} exactly-zero (band, k) "
+               f"slot(s) in the returned window)")
+    if tol < 0.0:
+        return worst
+    if worst <= tol:
+        raise ValueError(
+            f"compute_wfns_fi: band {worst_b} of the RETURNED window "
+            f"[{b_min}, {b_max}) is invisible to fH — "
+            f"min_k |f(ε_{worst_b})|/max|f| = {worst:.6e} at or below the "
+            f"{tol:.1e} floor, with {n_zero_k} exactly-zero (band, k) slot(s) "
+            f"in the window.  f(ε) ≡ 0 for ε ≥ shift = {shift:.8f} Ry "
+            f"(= max_k ε of the TOP band of ctilde's own window), so this "
+            f"band contributes nothing to fH = Σ_n f(ε_n) c_n c_nᴴ at those "
+            f"k; its eigenvector slot is degenerate with fH's "
+            + (f"{int(rank) - int(fa.shape[0])}-dimensional "
+               if rank is not None else "")
+            + f"null space and eigh fills it with an arbitrary direction out "
+            f"of that space. "
+            f"The returned ψ for that band is a DIFFERENT VECTOR, not an "
+            f"approximate one, and every pair density built from it is wrong "
+            f"— measured at 1.267 on a 5.0e-02 tile-null bracket.\n"
+            f"  THE FIX IS GUARD BANDS, and it is the ONLY fix: widen the "
+            f"htransform window above what you ask back, so the shoulder "
+            f"lands on bands nobody reads.  There are currently {n_guard}; "
+            f"the two probed parents needed 4.  In a deck: raise "
+            f"``nband``/``ncond`` above the window you return "
+            f"(``wfn_fi_max``, the BSE window, the ζ-fit window).  In code: "
+            f"``htransform.initialize_wfns(n_guard_bands=…)``, which "
+            f"``bse.vq_interp.refit_prepare`` drives from "
+            f"``--refit-guard-bands``.  Do NOT reach for "
+            f"LORRAX_FI_FSHOULDER_TOL: a negative value reproduces the "
+            f"known-bad run and nothing else.")
+    return worst
+
+
 def compute_wfns_fi(
     *,
     ctilde: jax.Array,
@@ -407,6 +532,7 @@ def compute_wfns_fi(
         ctilde, enk_sigma, kgrid_co, mesh_xy,
         a_band_index=a_band_index, log_fn=log)
     del fH_k  # diagnostic-only here; not needed downstream
+    _f_shoulder_gate(_f_eps, b_min, b_max, shift, log, rank=rank)
 
     # fH_R stays SHARDED P(None, 'x', 'y') — the (rank, rank) face is split
     # across the mesh, the lattice-R axis is not.  The q-Fourier sum contracts
