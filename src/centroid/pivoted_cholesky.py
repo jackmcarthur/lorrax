@@ -50,13 +50,23 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from common.shard_map import shard_map
 from jax.experimental import multihost_utils as _mh
 from functools import partial
+from typing import TYPE_CHECKING
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader                                    # noqa: E402
+# SMALL_ISSUES row 38.  ``WfnLoader`` is used at MODULE SCOPE for nothing but
+# two parameter annotations, and ``from __future__ import annotations`` above
+# means those are strings that are never evaluated — so this import bought a
+# hard dependency on ``wfn_loader`` (and, through it, h5py) for every consumer
+# of this module, including the ones that only want the select kernel.  That
+# edge is what let a clobbered PYTHONPATH on Perlmutter kill an h5py-less
+# import of a module that does not need h5py.  Under TYPE_CHECKING the
+# annotations still resolve for a type checker and cost nothing at run time.
+if TYPE_CHECKING:                                                   # pragma: no cover
+    from wfn_loader import WfnLoader
 from common import timing
 from common.collectives import device_put_process_local
 
@@ -613,7 +623,7 @@ def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
 
 
 def prune_candidates_by_pivoted_cholesky(
-    wfn: WfnLoader,
+    wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
     cand_idx: np.ndarray,
     n_keep: int,
@@ -1239,7 +1249,7 @@ def make_sharded_pivoted_cholesky_select(
 
 
 def build_gram_q0_via_loadwfns(
-    wfn: WfnLoader,
+    wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
     cand_idx: jnp.ndarray,
     n_val: int | None = None,

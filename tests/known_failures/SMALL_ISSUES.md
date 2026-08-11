@@ -494,6 +494,22 @@ silent overwrite.
 
 ## Fixed (strike-in-place graveyard — newest first)
 
+- **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module
+  scope for annotations that are never evaluated) — **TAKEN AND FIXED** on
+  `feat/downfold-orbit-floor-2026-08-10`, 2026-08-10, branch pushed and NOT
+  merged. Folded into that lane because it was already editing this file
+  (batch-small-items policy); it rides that lane's P=4 gate and cost no extra
+  leg. The import is now under `if TYPE_CHECKING:` and the two `wfn:
+  WfnLoader` annotations are quoted, so a type checker still resolves them and
+  the run-time import edge is gone — which is the edge a clobbered
+  `PYTHONPATH` on Perlmutter used to kill an h5py-less import of a module that
+  does not need h5py. **Its sibling is deliberately UNTOUCHED and is not
+  fixed**: `import symmetry_maps` two lines further down is also used only for
+  the `sym: symmetry_maps.SymMaps` annotations, but it sits behind an
+  `_services.ensure_on_path()` bootstrap whose removal is a different question
+  from this one, and quietly widening a named row is how a small fix becomes
+  an unreviewed one. Register it separately if it is wanted.
+
 - Rows 4, 5, 11, 25, 26, 27, 28, 31 (the `lx` harness trap inventory) —
   fixed together at `0835d2b` on sandbox_v2
   `fix/lx-harness-traps-2026-08-10`, 2026-08-10, branch pushed and
