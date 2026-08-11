@@ -73,7 +73,14 @@ def _make_run(tmp_path):
     return run
 
 
-pytestmark = pytest.mark.skipif(
+# PER-CELL, not module-level.  This was a ``pytestmark``, and a module-level
+# skipif keyed on a fixture path collapses the FIXTURE-FREE cells too — the
+# parser gate and the two AST red twins have no fixture and no GPU, and they
+# were silently not running anywhere the MoS2 deck is absent (which is every
+# box but one).  A whole module reading SKIPPED is the collection failure
+# AGENT_PREAMBLE measurement rule 10 names; the marker belongs on the cells
+# that actually read the deck.
+needs_mos2_fixture = pytest.mark.skipif(
     not os.path.exists(f"{FXDIR}/tmp/zeta_q.h5"),
     reason="MoS2 3x3 640-centroid fixture not present")
 
@@ -85,6 +92,7 @@ def _load(restart, inp, mesh_xy, bse_k_grid):
         inject_head=True, bse_k_grid=bse_k_grid)
 
 
+@needs_mos2_fixture
 @pytest.mark.gpu
 def test_on_grid_identity_byte_equal(tmp_path):
     """bse_k_grid == coarse → the bundle is byte-identical to the no-flag path."""
@@ -102,6 +110,7 @@ def test_on_grid_identity_byte_equal(tmp_path):
         assert np.array_equal(a, b), f"{k} not byte-identical on the fast path"
 
 
+@needs_mos2_fixture
 @pytest.mark.gpu
 def test_densify_3to6_shapes_and_solvable(tmp_path):
     """3×3→6×6 densification: fine-grid bundle shapes + a solvable spectrum."""
@@ -211,6 +220,7 @@ def test_kgrid_head_key_is_read_not_forced():
         "the deck key is being ignored")
 
 
+@needs_mos2_fixture
 @pytest.mark.gpu
 def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
     """RED TWIN (a): with ``head_minibz_average`` unset (the default), a
@@ -241,6 +251,7 @@ def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
     assert tuple(df["W_q"].shape[-3:]) == (6, 6, 1)
 
 
+@needs_mos2_fixture
 @pytest.mark.gpu
 def test_densify_optin_matches_prefix_construction(tmp_path):
     """GATE (b): with ``head_minibz_average = true`` explicitly set, the
@@ -283,3 +294,88 @@ def test_densify_optin_matches_prefix_construction(tmp_path):
 
     # the opt-in arm really does move the tile off the deck's
     assert not np.array_equal(got, np.asarray(jax.device_get(d0["V_q0"])))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The finite-q EXCHANGE tiles across a densification (2026-08-10).
+#
+# ``_interpolate_bse_data_to_grid`` nulls ``V_q_full`` because the fine-grid
+# resolvent is not a use of it — but ``exciton_bands --vq-mode ongrid`` reads
+# exactly that array for every Q != Gamma, so a densified bundle met it as a
+# ``None`` subscript with no explanation.  The tiles ARE still available and
+# still exact: V_{mu nu}(q) is a zeta/G-sphere object that never sees the BSE
+# k-grid, so the coarse tile IS the fine solve's answer at any Q on the coarse
+# grid.  What the coarse restart cannot supply is a tile at a fine q that is
+# not a coarse q, and that is a REFUSAL rather than an interpolation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_densifier_keeps_the_coarse_exchange_tiles_with_their_grid():
+    """The densifier must hand the coarse V_qmunu forward under its OWN grid
+    stamp, and must NOT leave it in ``V_q_full`` (whose consumers index it with
+    the bundle's — now fine — grid, so they would read the wrong tile)."""
+    import ast
+    import inspect
+    from bse import bse_io
+
+    fn = ast.parse(inspect.getsource(bse_io._interpolate_bse_data_to_grid)).body[0]
+    keys = {n.value for n in ast.walk(fn)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert "V_q_coarse" in keys and "V_q_coarse_grid" in keys, (
+        "the densified bundle carries no coarse-exchange-tile key: "
+        "exciton_bands --vq-mode ongrid has nothing to read")
+
+    # ``V_q_full`` must still be set to None on this path — the red twin is
+    # leaving the coarse array there, which every other consumer would index
+    # with the fine grid.
+    src = inspect.getsource(bse_io._interpolate_bse_data_to_grid)
+    assert '"V_q_full": None' in src, (
+        "V_q_full is no longer None on the densified bundle — bse_w_exact "
+        "would index a coarse array with fine (nkx,nky,nkz) and silently read "
+        "the wrong exchange tile")
+
+
+def test_ongrid_exchange_is_indexed_by_the_tile_grid_not_the_bse_grid():
+    """RED TWIN (fixture-free): the ongrid exchange lookup in ``exciton_bands``
+    must use the EXCHANGE-TILE grid.  Pre-fix it used ``kgrid_bse`` — the
+    bundle's own grid — which on a densified bundle is the FINE one, so the
+    lookup both indexed a nulled array and asked for Q the tiles do not have.
+
+    Read as TEXT rather than imported: ``bse.exciton_bands`` pulls in the FFI
+    gate at import, which is unavailable on a login node or a laptop, and this
+    cell has no business needing a built ``.so`` to read a subscript."""
+    import ast
+    import os as _os
+    from bse import bse_io
+
+    src_path = _os.path.join(_os.path.dirname(_os.path.abspath(bse_io.__file__)),
+                             "exciton_bands.py")
+    src = open(src_path).read()
+    mod = ast.parse(src)
+    fns = [n for n in ast.walk(mod)
+           if isinstance(n, ast.FunctionDef) and n.name == "main"]
+    assert fns, "exciton_bands has no main() to gate"
+    fn = fns[0]
+
+    # the tile grid is resolved from the bundle, with the densifier's coarse
+    # stamp winning when there is one
+    assert "V_q_coarse_grid" in src, (
+        "exciton_bands never reads the densifier's coarse-tile grid stamp, so "
+        "--vq-mode ongrid on a bse_k_grid-densified bundle meets a None "
+        "subscript instead of an explanation")
+
+    subs = [n for n in ast.walk(fn)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name) and n.value.id == "V_ongrid"]
+    assert subs, "the ongrid exchange lookup no longer reads V_ongrid"
+
+    # and kgrid_bse must not be what rounds Q onto the tile lattice
+    bad = [n for n in ast.walk(fn)
+           if isinstance(n, ast.Call)
+           and isinstance(n.func, ast.Attribute) and n.func.attr == "round"
+           and n.args and isinstance(n.args[0], ast.BinOp)
+           and isinstance(n.args[0].right, ast.Name)
+           and n.args[0].right.id == "kgrid_bse"]
+    assert not bad, (
+        "a Q is still being rounded onto ``kgrid_bse`` for the exchange-tile "
+        "lookup; on a densified bundle that is the FINE grid and the tiles are "
+        "COARSE")
