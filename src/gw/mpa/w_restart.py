@@ -23,9 +23,43 @@ existing ``mpa_fit_file`` names that file.  A deck therefore says where
 its multipole screening lives exactly once, and what it finds there
 decides what this run has to do:
 
-    poles, finalized      -> STAGE_SIGMA:  skip the fit AND the sweep
-    W(omega) only         -> STAGE_FIT:    fit here, skip the sweep
-    neither               -> STAGE_BUILD:  nothing on disk to resume from
+    poles, finalized      -> STAGE_SIGMA:   skip the fit AND the sweep
+    W(omega) only         -> STAGE_FIT:     fit here, skip the sweep
+    zeta only             -> STAGE_BUILD_W: sweep and fit, skip the ISDF fit
+    neither               -> STAGE_BUILD:   nothing on disk to resume from
+
+TWO KINDS OF FAILURE, AND THEY DO NOT GET THE SAME ANSWER.  This is the
+distinction the ladder is built around, so it is stated before the
+mechanics:
+
+* an IDENTITY failure REFUSES.  The declared artifact is not of the
+  object this run is about -- a different wavefunction, a pole axis
+  nobody can name the unit of, a half-written sweep.  That is "you
+  pointed at the wrong bundle", which is an error and not a stage
+  decision, and no amount of rebuilding makes it right.  These raise.
+* a STALENESS failure DROPS one rung, with the mismatched key named on
+  one line.  The declared artifact is of the right object but of an
+  older version of it -- a different centroid table, a different rank,
+  a different frequency grid.  That is the ordinary developer flow ("I
+  changed something"), and the correct response is to rebuild exactly
+  the stages downstream of what changed.
+
+The failure shape this must be STRUCTURALLY unable to produce is the
+one that nearly shipped on 2026-08-10: a store carrying a head derived
+from a different basis, reused because nothing compared the basis.
+Hence: never silent reuse, and never silent rebuild.  Every rung that
+is skipped says so, and every rung that is dropped says which key
+dropped it.
+
+WHO OWNS WHICH CHECK.  This module owns the LADDER -- which rung a run
+may start on -- and not the identity of the artifacts on it.  The zeta
+stage's identity is ``gw_init._zeta_reuse_ok``'s, which already
+compares the source WFN, the centroid table's md5, the band windows,
+the cutoffs and the solver knobs; it is CALLED and its verdict handed
+here as :class:`ZetaState` rather than restated, because a second
+implementation of a provenance rule is a second thing to keep in sync.
+That split is also what makes the ladder testable without a filesystem:
+the decision is a pure function of the states it is handed.
 
 WHAT IT REFUSES, AND WHOSE REFUSAL EACH ONE IS.  Nothing in this module
 re-implements a check the store already makes; it CALLS them, so a
@@ -76,12 +110,19 @@ STAGE_SIGMA = "sigma"
 #: A complete W(omega) tensor is present and the poles are not: the fit
 #: runs here, off disk, and the screening sweep is skipped.
 STAGE_FIT = "fit"
+#: A valid zeta/ISDF fit is present and no W(omega) is: the sweep and
+#: the fit both run, but the ISDF fit itself is skipped.  This is the
+#: rung the "I only changed the solver" iteration lands on.
+STAGE_BUILD_W = "build_w"
 #: Neither is present.  Nothing to resume from.
 STAGE_BUILD = "build"
 
 __all__ = [
     "MpaRestartDecision",
+    "SamplingExpectation",
     "STAGE_BUILD",
+    "STAGE_BUILD_W",
+    "ZetaState",
     "STAGE_FIT",
     "STAGE_SIGMA",
     "W_OMEGA_DATASET",
@@ -115,6 +156,83 @@ def wfn_identity(wfn) -> dict:
 
 
 @dataclass(frozen=True)
+class ZetaState:
+    """What the caller found at the declared zeta/ISDF artifact.
+
+    A VERDICT, NOT A PATH, and that is the point.  The zeta reuse rule
+    lives in ``gw_init._zeta_reuse_ok`` and already compares the source
+    WFN, the centroid table's md5, the band windows, the cutoffs and the
+    solver knobs against this run's inputs.  Handing this module the
+    ANSWER rather than the file keeps that rule in one place and keeps
+    the ladder a pure function of its inputs, which is what lets the
+    drop branches be tested without a filesystem.
+
+    ``reason`` names the key that failed when ``valid`` is False -- it is
+    printed verbatim, so it should read like ``centroids_md5`` or
+    ``n_rmu``, not like a sentence.
+    """
+
+    present: bool = False
+    valid: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SamplingExpectation:
+    """This run's frequency grid and the deck keys that feed sampling.
+
+    Compared against the stored W(omega)'s own header.  ``omega`` is
+    matched EXACTLY -- ``np.array_equal`` and not a tolerance -- because
+    a grid that is nearly the same is a different grid: the poles are
+    fitted at these abscissae and a shifted sample is a different
+    constraint, not a rounding of the same one.
+
+    ``keys`` is whatever the driver declares feeds the sweep (the q set,
+    the line heights, the basis rank).  It is a plain dict so a deck can
+    grow a sampling key without this module learning its name; anything
+    present on both sides and unequal drops the rung and is named.  A key
+    the store never stamped is NOT a mismatch -- silence on either side
+    means "this store predates the key", which is a reason to be careful
+    and not a reason to rebuild, and the same rule the restart lane
+    already settled on for its own stamps.
+    """
+
+    omega: object = None
+    keys: dict | None = None
+
+
+def _sampling_mismatch(expect, w_header):
+    """The first key on which this run and the stored sweep disagree."""
+    if expect is None or w_header is None:
+        return None
+    want = expect.omega
+    if want is not None:
+        got = w_header.get("omega")
+        if got is None:
+            return None
+        a = np.asarray(want, dtype=np.complex128).reshape(-1)
+        b = np.asarray(got, dtype=np.complex128).reshape(-1)
+        if a.shape != b.shape:
+            return (f"omega (grid has {b.size} points, this run asks for "
+                    f"{a.size})")
+        if not np.array_equal(a, b):
+            i = int(np.argmax(np.abs(a - b)))
+            return (f"omega (first difference at index {i}: stored "
+                    f"{b[i]!r}, this run {a[i]!r})")
+    prov = dict(w_header.get("provenance", {}) or {})
+    for key, mine in sorted((expect.keys or {}).items()):
+        if mine is None or key not in prov or prov[key] is None:
+            continue
+        theirs = prov[key]
+        same = (np.array_equal(np.asarray(mine), np.asarray(theirs))
+                if isinstance(mine, (list, tuple, np.ndarray))
+                else str(mine) == str(theirs))
+        if not same:
+            return f"{key} (stored {theirs!r}, this run {mine!r})"
+    return None
+
+
+@dataclass(frozen=True)
 class MpaRestartDecision:
     """What this run found in the bundle, and therefore what it must do."""
 
@@ -125,6 +243,23 @@ class MpaRestartDecision:
     w_header: dict | None = None
     #: ``mpa_store.fit_completion_ledger`` for the poles, or ``None``.
     fit_ledger: dict | None = None
+    #: One line per rung this run was NOT allowed to start on, each
+    #: naming the key that dropped it.  Empty when nothing was stale.
+    #: Carried rather than only printed so a test can assert on the
+    #: reason instead of scraping a log.
+    drops: tuple = ()
+
+    def announce_drops(self, print_fn=print) -> tuple:
+        """Say which rungs were refused and why, before the skip line.
+
+        A drop is the half of this decision that is invisible in the
+        result: the run simply rebuilds, which looks exactly like a run
+        that had nothing to resume.  So each one is stated, with its
+        key, in the order the ladder considered them.
+        """
+        for reason in self.drops:
+            print_fn(f"  [mpa restart] NOT resuming: {reason}")
+        return self.drops
 
     def announce(self, print_fn=print) -> str:
         """One rank-0 line naming the skip and the store's provenance.
@@ -145,6 +280,10 @@ def describe(decision: MpaRestartDecision) -> str:
     if decision.stage == STAGE_BUILD:
         return (f"  [mpa_restart] {base}: no W(omega) tensor and no pole "
                 f"field — nothing to resume from.")
+    if decision.stage == STAGE_BUILD_W:
+        return (f"  [mpa_restart] {base}: RESUMING from the zeta/ISDF fit "
+                f"— the ISDF fit is SKIPPED and the screening sweep (chi0 "
+                f"+ Dyson at every z) and the pole fit both run here.")
     hdr = decision.w_header or {}
     prov = hdr.get("provenance", {}) or {}
     wfn = prov.get("wfn_file", "?")
@@ -191,6 +330,8 @@ def resolve_mpa_restart(
     w_name: str = W_OMEGA_DATASET,
     identity: dict | None = None,
     context: str = "compute_mode = mpa",
+    zeta: "ZetaState | None" = None,
+    sampling: "SamplingExpectation | None" = None,
 ) -> MpaRestartDecision:
     """Which stage this bundle lets the run skip.  Refuses a stale one.
 
@@ -198,10 +339,38 @@ def resolve_mpa_restart(
     "the caller cannot say", which is not the same as "it matches": the
     check is then skipped and the store's own stamp is still announced,
     so an operator reading the log can see what was resumed.
+
+    ``zeta`` is :class:`ZetaState` -- the verdict of the zeta reuse rule
+    the caller already ran.  ``sampling`` is this run's
+    :class:`SamplingExpectation`.  Both default to ``None``, meaning
+    "the caller cannot say", and both then leave the ladder exactly as
+    it was before they existed: this function is a strict extension, so
+    a driver that has not been taught the new rungs keeps its old
+    behaviour rather than silently gaining a skip.
+
+    The rungs are considered from the DEEPEST down, and the first one
+    whose staleness check fails drops to the next with its key recorded
+    in :attr:`MpaRestartDecision.drops`.  Identity failures do not drop
+    -- they raise, from inside the calls this delegates to.
     """
+    drops: list = []
+    stale_sampling = False
+    def _floor(reasons):
+        """The rung to land on when no W(omega) may be resumed."""
+        if zeta is None or not zeta.present:
+            return MpaRestartDecision(path=path, stage=STAGE_BUILD,
+                                      w_name=w_name, drops=tuple(reasons))
+        if not zeta.valid:
+            return MpaRestartDecision(
+                path=path, stage=STAGE_BUILD, w_name=w_name,
+                drops=tuple(reasons) + (
+                    f"the zeta/ISDF fit, because {zeta.reason} changed; "
+                    f"refitting it",))
+        return MpaRestartDecision(path=path, stage=STAGE_BUILD_W,
+                                  w_name=w_name, drops=tuple(reasons))
+
     if not os.path.exists(path):
-        return MpaRestartDecision(path=path, stage=STAGE_BUILD,
-                                  w_name=w_name)
+        return _floor(drops)
     w_header = None
     if _has(path, w_name):
         # EVERY FORMAT REFUSAL RUNS HERE, before any stage is skipped:
@@ -228,10 +397,33 @@ def resolve_mpa_restart(
                 f"fit poles to zero screening at those z and report a "
                 f"backward error of 0 for doing it.  Finish the sweep, "
                 f"or re-produce the store.")
+        # IDENTITY FIRST, AND IT RAISES.  A foreign WFN is not a stale
+        # sweep to be redone, it is the wrong bundle: a different WFN
+        # with the same centroid count yields a numerically different W
+        # that no hash inside the file can distinguish, so there is no
+        # safe rung below this one to fall back to.
         _refuse_a_foreign_wfn(w_header.get("provenance", {}) or {},
                               identity, path=path, name=w_name,
                               context=context)
-    if _has(path, mpa_store.MPA_FIT_SUFFIX):
+        # STALENESS SECOND, AND IT DROPS.  The sweep is of the right
+        # object but of a different sampling of it.
+        stale = _sampling_mismatch(sampling, w_header)
+        if stale is not None:
+            drops.append(f"the W(omega) sweep in {os.path.basename(path)}, "
+                         f"because {stale}; re-sweeping")
+            w_header = None
+            stale_sampling = True
+    # A POLE FIELD FITTED FROM A SWEEP THIS RUN CALLS STALE IS STALE
+    # TOO, and it is worth saying why this is not obvious from the
+    # ladder's shape.  The rungs are otherwise independent -- a bundle
+    # may legitimately carry poles and no samples, because the samples
+    # are tens of gigabytes and get deleted -- so "poles present" does
+    # not normally have to ask anything about W(omega).  It does have to
+    # when the W(omega) is BOTH present AND of a different sampling than
+    # this run wants: those poles were fitted at abscissae the run is
+    # not asking for, and resuming them would answer a question nobody
+    # asked while looking exactly like a successful skip.
+    if _has(path, mpa_store.MPA_FIT_SUFFIX) and not stale_sampling:
         led = mpa_store.fit_completion_ledger(path)
         if bool(led.get("complete", False)):
             # THE POLE FIELD'S OWN DECLARATIONS, ASKED AT THE DRIVER.
@@ -260,8 +452,9 @@ def resolve_mpa_restart(
                                       fit_ledger=led)
     if w_header is not None:
         return MpaRestartDecision(path=path, stage=STAGE_FIT,
-                                  w_name=w_name, w_header=w_header)
-    return MpaRestartDecision(path=path, stage=STAGE_BUILD, w_name=w_name)
+                                  w_name=w_name, w_header=w_header,
+                                  drops=tuple(drops))
+    return _floor(drops)
 
 
 def write_w_omega(

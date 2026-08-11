@@ -84,6 +84,16 @@ integration branches, not main — `git show feat/mpa-wedge-pole-unfold-2026-08-
 
 - **Your own worktree.** Never `/home/jackm/projects/lorrax` (shared clone; a lane's
   commit already landed on another's ref there); never `/pscratch/sd/j/jackm/wt_int0808_bgw`.
+- **Never read another lane's checked-out worktree as if it were HEAD — branch from the
+  COMMIT.** The `wt_int0808_bgw` line above is an INSTANCE of this, not the rule: any
+  worktree a peer holds may carry uncommitted work, and a branch is checked out in at
+  most one worktree, so `git worktree add <dir> <branch>` refuses and the tempting repair
+  is to go work in theirs. Do this instead: verify read-only that the file you need is
+  unmodified (`git show <commit>:<path> | md5sum` against the working copy), then
+  `git worktree add <dir> -b <yours> <commit>`. Measured 2026-08-10: a lane commissioned
+  to extend `w_restart.py` found `feat/wz-restart-wiring-2026-08-11` already held by a
+  live peer; the md5 matched the commit, so branching off the commit was provably the
+  same code and cost nothing.
 - **`RUNS_INFLIGHT.md` row before any cluster submit** (canonical: `/pscratch/sd/j/jackm/sandbox_v2_rescue_2026-08-06/RUNS_INFLIGHT.md`) — struck when the claim
   how a peer discovers its legs can ride along with yours (rule 1).
 - **Push feature branches freely; `main` needs owner approval.** Conflating those into
