@@ -2625,7 +2625,12 @@ def read_pole_slice(src, p, *, unfold=False, mesh_xy=None,
         # HOST NUMPY, as the wedge read already returned.  The pass loop's
         # next move is host-side window planning off Re/Im Ω, so handing
         # back a device array would only move the gather, not remove it.
-        return np.asarray(Om_f), np.asarray(B_f)
+        # At P>1 these are GLOBAL arrays sharded over processes, so bare
+        # ``np.asarray`` cannot fetch their non-addressable shards; use the
+        # one collective wrapper that distinguishes global sharding from a
+        # replicated array and reconstructs the full source shape exactly.
+        from common.collectives import gather_to_host
+        return gather_to_host(Om_f), gather_to_host(B_f)
 
 
 def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
@@ -2755,7 +2760,9 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
 
     Returns
     -------
-    ``(Omega_full, B_full)``, each ``(n_q_full, N_mu, N_mu)``.
+    ``(Omega_full, B_full)``, each at the reader mesh's
+    ``(n_q_full, N_mu_padded, N_mu_padded)`` in-memory extent.  The logical
+    block is unchanged and every pad row/column is exactly zero.
     """
     import jax.numpy as jnp
     # THROUGH THE SERVICE'S DOOR, never a submodule -- the same import
@@ -2763,6 +2770,32 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
     from symmetry_maps import unfold_isdf_operator
 
     can = tables.canonical()
+    Omega_arr = np.asarray(Omega_p)
+    B_arr = np.asarray(B_p)
+    if (Omega_arr.ndim != 3 or B_arr.shape != Omega_arr.shape
+            or Omega_arr.shape[-2] != Omega_arr.shape[-1]):
+        raise ValueError(
+            "unfold_pole_field: Omega_p and B_p must share one square "
+            f"(n_q_ibz, n_mu, n_mu) slab; got {Omega_arr.shape} and "
+            f"{B_arr.shape}.")
+    n_log = int(Omega_arr.shape[-1])
+    if int(can.n_mu) != n_log:
+        raise ValueError(
+            f"unfold_pole_field: pole slabs have logical n_mu={n_log}, but "
+            f"their unfold tables address {int(can.n_mu)} centroids.")
+
+    # Disk owns the LOGICAL extent; the reader owns today's mesh pad.  This
+    # is the same inverse-of-storage operation as qirr_store.read_tensor:
+    # zero tensor tails, identity permutation tail, zero lattice-wrap tail.
+    # The unfold's two all_to_all axes require divisibility by the whole
+    # mesh, while a fit written on another device count must remain usable.
+    from runtime.padding import padded_mu_extent
+    n_pad = int(padded_mu_extent(n_log, mesh_xy))
+    if n_pad != n_log:
+        pad = n_pad - n_log
+        Omega_arr = np.pad(Omega_arr, ((0, 0), (0, pad), (0, pad)))
+        B_arr = np.pad(B_arr, ((0, 0), (0, pad), (0, pad)))
+        can = can.padded(n_pad)
     kw = dict(irr_idx=can.irr_idx_q, sym_idx=can.sym_idx_q,
               sym_perm=can.sym_perm, q_irr_frac=can.q_irr_frac,
               mesh_xy=mesh_xy, n_sym_spatial=int(can.n_sym_spatial),
@@ -2773,9 +2806,9 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
               trs_rule="pair_transpose")
     L_zero = np.zeros_like(np.asarray(can.L_table))
     Omega_full = unfold_isdf_operator(
-        jnp.asarray(Omega_p), L_table=L_zero, **kw)
+        jnp.asarray(Omega_arr), L_table=L_zero, **kw)
     B_full = unfold_isdf_operator(
-        jnp.asarray(B_p), L_table=can.L_table, **kw)
+        jnp.asarray(B_arr), L_table=can.L_table, **kw)
     return Omega_full, B_full
 
 
