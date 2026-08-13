@@ -57,7 +57,6 @@ __all__ = [
     "fit_one_block",
     "format_cost_report",
     "pole_pass_order",
-    "read_pole_slice",
     "run_fit_driver",
 ]
 
@@ -455,9 +454,6 @@ def pole_pass_order(n_p):
     return tuple(range(n))
 
 
-read_pole_slice = mpa_store.read_pole_slice
-
-
 def accumulate_over_pole_passes(
     fit_src, per_pole_fn, *, order=None, allow_partial=False
 ):
@@ -526,7 +522,7 @@ def accumulate_over_pole_passes(
     total = None
     passes = []
     for p in walk:
-        Omega_p, B_p = read_pole_slice(
+        Omega_p, B_p = mpa_store.read_pole_slice(
             fit_src, p, allow_partial=allow_partial)
         contrib = per_pole_fn(p, Omega_p, B_p)
         total = contrib if total is None else total + contrib

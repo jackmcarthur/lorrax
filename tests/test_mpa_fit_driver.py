@@ -790,8 +790,8 @@ def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
         np.arange(lo, hi), planted["z"], n_p)
 
     with pytest.raises(ValueError, match="NOT FINALIZED"):
-        fit_driver.read_pole_slice(str(fit_path), 0)
-    Omega_p, B_p = fit_driver.read_pole_slice(
+        MS.read_pole_slice(str(fit_path), 0)
+    Omega_p, B_p = MS.read_pole_slice(
         str(fit_path), 0, allow_partial=True)
     assert Omega_p.shape == (n_q, n_mu, n_mu)
     assert B_p.shape == (n_q, n_mu, n_mu)
@@ -801,7 +801,7 @@ def test_pole_slices_are_the_store_tensor_sliced(fitted):
     """The stopgap reader returns exactly what the whole read returns."""
     Om, Bp, _, ledger = MS.read_fit_tensors(str(fitted["path"]))
     for p in fit_driver.pole_pass_order(ledger["n_p"]):
-        Omega_p, B_p = fit_driver.read_pole_slice(str(fitted["path"]), p)
+        Omega_p, B_p = MS.read_pole_slice(str(fitted["path"]), p)
         np.testing.assert_array_equal(Omega_p, Om[p])
         np.testing.assert_array_equal(B_p, Bp[p])
 
