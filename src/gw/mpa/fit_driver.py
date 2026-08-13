@@ -53,10 +53,8 @@ from file_io import mpa_store
 from gw.mpa import pade_fit, tiling
 
 __all__ = [
-    "accumulate_over_pole_passes",
     "fit_one_block",
     "format_cost_report",
-    "pole_pass_order",
     "run_fit_driver",
 ]
 
@@ -472,116 +470,3 @@ def format_cost_report(report):
         "",
     ]
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# The one-pole-per-pass read, and the accumulation it exists to license
-# ---------------------------------------------------------------------------
-
-def pole_pass_order(n_p):
-    """THE PINNED PASS ORDER: ascending pole index, 0 .. n_p - 1.
-
-    Pinned, and stated as its own function, because the accumulation
-    below is a re-associated floating-point sum and re-association is
-    only reproducible if the order is.  Ascending index is not an
-    arbitrary choice: ``pade_fit.fit_mpa_poles`` returns its poles
-    sorted ascending in ``Re Omega`` (then ``Im Omega``), and the staged
-    store keeps that axis leading, so pass ``p`` is the ``p``-th
-    lowest-energy pole of every element at once.  Summing the small
-    contributions before the large ones is also the better-conditioned
-    direction for the accumulation, which is a happy consequence of an
-    ordering chosen for reproducibility rather than an argument for it.
-    """
-    n = int(n_p)
-    if n < 1:
-        raise ValueError(
-            f"pole_pass_order: n_p={n_p!r} is not a positive integer. "
-            "FALSE case: int(n_p) >= 1.")
-    return tuple(range(n))
-
-
-def accumulate_over_pole_passes(
-    fit_src, per_pole_fn, *, order=None, allow_partial=False
-):
-    """Run ``per_pole_fn`` once per pole and accumulate; return the sum.
-
-    THIS IS THE CORRECTNESS LEMMA OF THE MEMORY-SAFE DESIGN, NOT A
-    SIGMA IMPLEMENTATION.  It computes nothing physical and knows
-    nothing about self-energies, Green's functions, quadratures or
-    windows.  What it does is exhibit the pass STRUCTURE that the
-    owner's Sigma design rests on — S section 5.5: *"run the existing
-    sigma integration ~14 times, one B_q/Omega_q pair at a time, in its
-    standard sharded form; wasteful of Green's-function construction,
-    memory-safe by choice"* — in a form where its one mathematical
-    claim can be checked without a Sigma stage existing.
-
-    THE CLAIM.  A quantity that is a SUM OVER POLES of a per-pole term
-    is unchanged when the sum is re-associated into one pass per pole,
-    with only one ``(B_q, Omega_q)`` pair resident at a time.  That is
-    the whole of it, and it is why the memory-shaped plan costs
-    fourteen sets of spatial FFTs and no accuracy.  The real Sigma is
-    such a sum: ``W(tau) = sum_p B_p exp(-i Omega_p tau)`` enters
-    linearly, so every downstream contraction distributes over ``p``.
-
-    THE ONE CAVEAT, AND IT IS FLOATING-POINT AND NOT ALGEBRAIC.  The
-    re-association is exact in exact arithmetic and NOT bit-exact in
-    floating point: ``sum_p`` evaluated as a vectorised reduction over
-    a pole axis and ``sum_p`` evaluated as a sequential accumulation
-    associate differently and differ at the last ulp or two.  So the
-    pass order is PINNED (:func:`pole_pass_order`) and the accumulation
-    is sequential in that order, which makes the result reproducible
-    run to run even though it is not identical to the vectorised one.
-    ``tests/test_mpa_fit_driver.py`` asserts both halves: agreement
-    with the vectorised reference at machine precision, and BIT-EXACT
-    agreement with an association-matched reference, which is what
-    isolates the difference to association and nothing else.
-
-    Parameters
-    ----------
-    fit_src
-        The finalized staged store, as a path or an open h5py group.
-    per_pole_fn
-        ``f(p, Omega_p, B_p) -> array`` — the per-pass quantity.
-        ``Omega_p`` and ``B_p`` are ``(n_q, N_mu, N_mu)``, this pole's
-        slab and no other.  A real driver's ``f`` is the existing sigma
-        integration; here it is whatever the caller passes.
-    order
-        Pass order.  ``None`` takes :func:`pole_pass_order`.  Passing
-        one explicitly is how a test shows the association caveat is
-        real.
-
-    Returns
-    -------
-    ``(total, info)``
-        ``total`` is the accumulated sum; ``info`` records the order
-        actually walked, the number of passes, and the per-pass
-        provenance the design asks the driver to own (S section 5.5:
-        *"the 14 partial Sigmas only add coherently if each pass
-        records the (pole index, E_ref_B, quadrature provenance) triple
-        it used"* — the pole index is this module's half).
-    """
-    ledger = mpa_store.fit_completion_ledger(fit_src)
-    n_p = ledger["n_p"]
-    walk = (pole_pass_order(n_p) if order is None
-            else tuple(int(p) for p in order))
-
-    total = None
-    passes = []
-    for p in walk:
-        Omega_p, B_p = mpa_store.read_pole_slice(
-            fit_src, p, allow_partial=allow_partial)
-        contrib = per_pole_fn(p, Omega_p, B_p)
-        total = contrib if total is None else total + contrib
-        passes.append({
-            "pole_index": int(p),
-            "re_omega_min": float(np.min(np.real(Omega_p))),
-            "re_omega_max": float(np.max(np.real(Omega_p))),
-            "gamma_max": float(np.max(np.abs(np.imag(Omega_p)))),
-        })
-
-    return total, {
-        "order": walk,
-        "n_passes": len(walk),
-        "n_p": n_p,
-        "passes": passes,
-    }

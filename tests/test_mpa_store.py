@@ -1015,7 +1015,8 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     assert ledger["q_storage"] == "ibz"
     assert ledger["n_q_full"] == tables.n_q_full
     assert ledger["table_hash"] == tables.canonical().digest()
-    Om, Bp = MS.read_pole_slice(tmpdir_path, 0, to_unit="Ry")
+    Om, Bp = MS.read_poles(tmpdir_path, pole_slice=0, to_unit="Ry")
+    Om, Bp = Om[0], Bp[0]
     np.testing.assert_array_equal(Om, 2.0 * (0.7 - 0.1j))
     np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
 
@@ -1050,15 +1051,6 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
     with pytest.raises(ValueError, match="NOT READY"):
         MS.read_head_fit(tmpdir_path)
-
-
-def test_complete_pole_axis_uses_the_same_read_policy(tmpdir_path):
-    _staged_fit(tmpdir_path, n_p=3)
-    MS.finalize_fit_store(tmpdir_path)
-    Omega, Bp, _diag, _ledger = MS.read_fit_tensors(tmpdir_path)
-    got_Omega, got_Bp = MS.read_pole_slices(tmpdir_path)
-    np.testing.assert_array_equal(got_Omega, Omega)
-    np.testing.assert_array_equal(got_Bp, Bp)
 
 
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(

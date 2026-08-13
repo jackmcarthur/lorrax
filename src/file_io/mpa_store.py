@@ -2642,20 +2642,3 @@ def read_poles(
     return _finish_pole_read(
         src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
         return_sharded=return_sharded, to_unit=to_unit)
-
-
-def read_pole_slices(src, **kwargs):
-    """Compatibility name for :func:`read_poles` with the full axis."""
-    return read_poles(src, **kwargs)
-
-
-def read_pole_slice(src, p, **kwargs):
-    """Read one leading pole slab; production reads stay sharded via SlabIO.
-
-    ``to_unit='Ry'`` performs the fit-axis conversion once at this I/O seam.
-    A wedge unfold uses the stored ``symmetry_maps`` tables and the general
-    pair-transpose TRS rule, required because complex-frequency W is not
-    Hermitian.
-    """
-    Omega, Bp = read_poles(src, pole_slice=int(p), **kwargs)
-    return Omega[0], Bp[0]
