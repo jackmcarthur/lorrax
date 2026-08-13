@@ -14,6 +14,7 @@ process owns a full band matrix.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import jax
@@ -25,6 +26,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 __all__ = [
     "build_forward_neighbor_table",
     "build_g_wrap_lookup",
+    "band_storage_extent",
     "fourth_order_connection",
     "g_wrap_for_forward_step",
     "inverse_neighbor_table",
@@ -36,12 +38,31 @@ __all__ = [
 _BAND_MATMUL_CACHE = {}
 
 
-def wfn_fingerprint(wfn) -> str:
-    """SHA-256 over the small DFT solution tables used by PT and dipole.
+def band_storage_extent(mesh, nbands: int) -> int:
+    """Return the one physical band extent shared by all PT layouts.
 
-    This intentionally excludes wavefunction coefficients: hashing them would
-    touch hundreds of GiB and defeat rapid startup. Energies, stored k rows
-    and electron/spinor/band counts provide the existing provenance contract.
+    Wavefunctions shard bands over the composite mesh while matrices shard
+    their two band axes separately. Rounding to the full mesh product is
+    accepted by both layouts, including rectangular meshes.
+    """
+    from runtime.padding import round_up
+
+    names = tuple(str(a) for a in mesh.axis_names)
+    if names != ("x", "y"):
+        raise ValueError(
+            "parallel transport requires mesh axes ('x','y'); "
+            f"got {names!r}")
+    divisor = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    return round_up(int(nbands), divisor)
+
+
+def wfn_fingerprint(wfn) -> str:
+    """Cheap SHA-256 identity for the fixed-gauge WFN used by PT.
+
+    Coefficients are too large to hash at startup. For a real loader the
+    resolved path and full stat identity conservatively stamp its gauge
+    generation; modifying, replacing, copying or moving it requires a new
+    artifact.
     """
     import hashlib
 
@@ -54,6 +75,15 @@ def wfn_fingerprint(wfn) -> str:
         digest.update(value.tobytes())
     digest.update(
         str((int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands))).encode())
+    path = getattr(wfn, "path", None)
+    if path is not None:
+        resolved = os.path.realpath(os.fspath(path))
+        stat = os.stat(resolved)
+        digest.update(resolved.encode("utf-8"))
+        digest.update(str((
+            int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+            int(stat.st_mtime_ns), int(stat.st_ctime_ns),
+        )).encode())
     return digest.hexdigest()
 
 

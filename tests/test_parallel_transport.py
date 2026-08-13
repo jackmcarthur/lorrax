@@ -13,11 +13,13 @@ import numpy as np
 from jax.sharding import Mesh
 
 from common.parallel_transport import (
+    band_storage_extent,
     build_forward_neighbor_table,
     build_g_wrap_lookup,
     fourth_order_connection,
     g_wrap_for_forward_step,
     make_distributed_band_matmul,
+    wfn_fingerprint,
 )
 import file_io.parallel_transport as pt_io
 from file_io.parallel_transport import (
@@ -27,8 +29,44 @@ from file_io.parallel_transport import (
     OCCUPATIONS_DATASET,
     VELOCITY_DFT_DATASET,
     complete_velocity_validation,
+    initialize_parallel_transport_artifact,
     validate_covariant_velocity,
 )
+
+
+
+def test_common_storage_extent_handles_rectangular_meshes():
+    mesh = types.SimpleNamespace(
+        axis_names=("x", "y"), shape={"x": 2, "y": 4})
+    assert band_storage_extent(mesh, 5) == 8
+    assert band_storage_extent(mesh, 8) == 8
+
+
+def test_wfn_fingerprint_changes_with_fixed_gauge_file_identity(tmp_path):
+    path = tmp_path / "WFN.h5"
+    path.write_bytes(b"one fixed-gauge generation")
+    wfn = types.SimpleNamespace(
+        energies=np.asarray([[0.1, 0.2]]),
+        kpoints=np.asarray([[0.0, 0.0, 0.0]]),
+        nelec=1, nspinor=1, nbands=2, path=str(path))
+    first = wfn_fingerprint(wfn)
+    path.write_bytes(b"another fixed-gauge generation")
+    second = wfn_fingerprint(wfn)
+    assert first != second
+
+
+def test_artifact_refuses_an_aliased_fourth_order_mesh_before_io():
+    wfn = types.SimpleNamespace(kgrid=np.asarray([4, 6, 6]))
+    try:
+        initialize_parallel_transport_artifact(
+            "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
+            effective_nspinor=1, bispinor=False,
+            velocity_dft_kmajor=None, wfn_path="WFN.h5",
+            wfn_fingerprint="0" * 64)
+    except ValueError as exc:
+        assert "at least five" in str(exc) and "kgrid=(4, 6, 6)" in str(exc)
+    else:
+        raise AssertionError("undersampled fourth-order mesh was accepted")
 
 
 def test_forward_neighbors_do_not_assume_flattening_order():
@@ -309,3 +347,45 @@ def test_artifact_schema_is_slabio_only_and_names_the_head_manifold():
     assert VELOCITY_DFT_DATASET == "velocity_dft_cart"
     assert ENERGIES_DATASET == "dft_energies_ry_full"
     assert OCCUPATIONS_DATASET == "dft_occupations_full"
+
+
+
+def test_fourth_order_negative_hop_keeps_noncommuting_product_order():
+    rng = np.random.default_rng(921)
+    nk, nb = 8, 2
+    kints = np.stack((np.arange(nk), np.zeros(nk), np.zeros(nk)), axis=1)
+    plus = build_forward_neighbor_table(kints, (nk, 1, 1))
+    links = np.broadcast_to(
+        np.eye(nb, dtype=np.complex128), (3, nk, nb, nb)).copy()
+    for k in range(nk):
+        raw = (rng.normal(size=(nb, nb))
+               + 1j * rng.normal(size=(nb, nb)))
+        q, r = np.linalg.qr(raw)
+        phase = np.diag(r)
+        links[0, k] = q * (phase / np.abs(phase))[None, :]
+
+    def multiply(left, right):
+        return jnp.einsum("...ij,...jk->...ik", left, right)
+
+    got = np.asarray(fourth_order_connection(
+        jnp.asarray(links), plus, (1.0 / nk, 1.0, 1.0),
+        band_matmul=multiply))[0]
+    minus = np.empty(nk, dtype=np.int32)
+    minus[plus[:, 0]] = np.arange(nk)
+    ref = np.empty_like(got)
+    wrong = np.empty_like(got)
+    for k in range(nk):
+        km1 = minus[k]
+        km2 = minus[km1]
+        lp1 = links[0, k]
+        lp2 = lp1 @ links[0, plus[k, 0]]
+        lm1 = links[0, km1].conj().T
+        second = links[0, km2].conj().T
+        raw_ref = 1j * (-lp2 + 8 * lp1 - 8 * lm1 + lm1 @ second) \
+            / (12.0 / nk)
+        raw_wrong = 1j * (-lp2 + 8 * lp1 - 8 * lm1 + second @ lm1) \
+            / (12.0 / nk)
+        ref[k] = 0.5 * (raw_ref + raw_ref.conj().T)
+        wrong[k] = 0.5 * (raw_wrong + raw_wrong.conj().T)
+    np.testing.assert_allclose(got, ref, rtol=2e-14, atol=2e-14)
+    assert np.max(np.abs(got - wrong)) > 1.0e-3

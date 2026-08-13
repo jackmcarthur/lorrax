@@ -77,6 +77,7 @@ baselines); ``services/wfn_loader/docs/DESIGN.md`` (why).
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 import types
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
@@ -91,10 +92,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ._collectives import device_put_process_local
 
 
-__all__ = ["WfnLoader"]
+__all__ = ["IBZRows", "WfnLoader"]
 
 
-KSpec = Sequence[int] | Literal["ibz", "full_bz"]
+@dataclass(frozen=True)
+class IBZRows:
+    """Explicit raw WFN-file IBZ rows, without symmetry unfolding."""
+
+    rows: tuple[int, ...]
+
+
+KSpec = Sequence[int] | IBZRows | Literal["ibz", "full_bz"]
 
 
 class WfnLoader:
@@ -531,6 +539,8 @@ class WfnLoader:
           unfold=True.
         - explicit list: interpreted as **full-BZ indices**, unfold=True.
         """
+        if isinstance(k, IBZRows):
+            return np.asarray(k.rows, dtype=np.int32), False
         if isinstance(k, str):
             if k == "ibz":
                 return np.arange(self.nkpts, dtype=np.int32), False
@@ -541,6 +551,8 @@ class WfnLoader:
         return np.asarray(k, dtype=np.int32), True
 
     def _k_cache_key(self, k: KSpec) -> tuple:
+        if isinstance(k, IBZRows):
+            return ("ibz_rows", tuple(int(v) for v in k.rows))
         if isinstance(k, str):
             return (k,)
         return ("list", tuple(int(v) for v in k))

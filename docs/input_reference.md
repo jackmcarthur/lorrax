@@ -140,6 +140,8 @@ page has to read it from.
 |---|---|---|
 | `density_self_consistent` | false | Rebuild V_H from the current orbitals every SC iteration instead of rotating the fixed DFT V_H into the QP basis; off keeps QSGW fixed-density. |
 | `sc_on_ibz` | false | Run the SC loop's H/E/U and carried state on the IBZ, broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton. |
+| `sc_head_update` | `"off"` | `off` preserves the fixed DFT head; `parallel_transport` rebuilds the head every QSGW iteration from the saved Berry connection and current fixed-basis Hamiltonian, without reading wavefunctions. At iteration zero DeltaH=0 and U=I, so the same stationary map reconstructs the DFT head. |
+| `parallel_transport_file` | `"parallel_transport.h5"` | SlabIO artifact written by `get_dipole_mtxels --parallel-transport`; required when `sc_head_update = parallel_transport`. Its WFN fingerprint, k grid, band manifold, and velocity-identity validation must match the run. |
 | `qp_solver` | `"auto"` | QP extraction: one_shot_dft (G0W0 at E_DFT; auto default) | fixed_point (on-shell) | self_consistent (QSGW loop). |
 | `do_G0` | true | Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run. |
 | `self_consistent` | false | DEPRECATED alias for qp_solver = self_consistent. |

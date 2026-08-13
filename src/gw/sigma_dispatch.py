@@ -444,6 +444,7 @@ def compute_sigma_xc(
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
     omit_v_h: bool = False,
+    iteration_head=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -670,6 +671,7 @@ def compute_sigma_xc(
         config=config, meta=meta, mesh_xy=mesh_xy,
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
+        iteration_head=iteration_head,
         print_fn=print_fn,
     )
 

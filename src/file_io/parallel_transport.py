@@ -17,6 +17,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.mtxel_sweep import band_sphere_spec
 from common.parallel_transport import (
+    band_storage_extent,
     build_forward_neighbor_table,
     build_g_wrap_lookup,
     fourth_order_connection,
@@ -27,7 +28,7 @@ from common.parallel_transport import (
 from file_io.slab_io import SlabIO
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -104,6 +105,8 @@ def initialize_parallel_transport_artifact(
     sym,
     mesh,
     nbands: int,
+    effective_nspinor: int,
+    bispinor: bool,
     velocity_dft_kmajor,
     wfn_path: str,
     wfn_fingerprint: str,
@@ -118,6 +121,15 @@ def initialize_parallel_transport_artifact(
     distributed band tile.
     """
     nb = int(nbands)
+    kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+    undersampled = [axis for axis, n in zip("xyz", kgrid) if n < 5]
+    if undersampled:
+        raise ValueError(
+            "parallel-transport preprocessing requires at least five "
+            "distinct mesh points along every Cartesian mesh direction for "
+            "the advertised fourth-order +/-2 stencil; got "
+            f"kgrid={kgrid} (undersampled axes "
+            f"{','.join(undersampled)}).")
     nrk = int(np.asarray(sym.kirr_fullids).size)
     nk = int(sym.nk_tot)
     energies, occupations = _full_band_tables(wfn, sym, nb)
@@ -182,6 +194,8 @@ def initialize_parallel_transport_artifact(
         io.write_attr("band_start", np.int32(0))
         io.write_attr("band_stop", np.int32(nb))
         io.write_attr("spin_channel", np.int32(0))
+        io.write_attr("effective_nspinor", np.int32(effective_nspinor))
+        io.write_attr("bispinor", np.int32(bool(bispinor)))
         io.write_attr("kgrid", np.asarray(wfn.kgrid, dtype=np.int32))
         io.write_attr("kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
         io.write_attr("reduced_spacing",
@@ -221,6 +235,8 @@ def _write_link_stage(
     polar_plan,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Stream IBZ wavefunctions and write links plus fixed-reference data."""
+    from wfn_loader import IBZRows
+
     nb = int(nbands)
     source_full = np.asarray(sym.kirr_fullids, dtype=np.int32)
     nrk = int(source_full.size)
@@ -233,7 +249,7 @@ def _write_link_stage(
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         for ik_irr, center_full in enumerate(source_full):
-            center_ids = [int(center_full)]
+            center_ids = IBZRows((int(ik_irr),))
             center_xy = wfn.load(
                 bands=(0, nb), k=center_ids, sharding=band_sphere_spec(),
                 bispinor=bool(bispinor))
@@ -299,6 +315,7 @@ def _write_connection_stage(
 ) -> None:
     """Read compact links, unfold through SymMaps, and write A once."""
     nb = int(nbands)
+    nb_storage = band_storage_extent(mesh, nb)
     table = directed_edge_orbit_table(
         kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
         kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
@@ -316,7 +333,9 @@ def _write_connection_stage(
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         source_links = io.read_slab(
-            LINKS_DATASET, partition_spec=block_spec)
+            LINKS_DATASET,
+            shape=(int(source_full.size), 3, nb_storage, nb_storage),
+            partition_spec=block_spec)
         selected = source_links[
             table["source_row"], table["source_direction"]]
         full_target_major = apply_band_matrix_symmetry(
@@ -380,9 +399,7 @@ def write_parallel_transport_artifact(
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file."""
     plan_polar, edge_table, apply_symmetry = _require_service_apis()
-    from runtime.padding import round_up, spec_divisor
-    nb_padded = round_up(
-        int(nbands), spec_divisor(mesh, band_sphere_spec(), 1))
+    nb_padded = band_storage_extent(mesh, int(nbands))
     polar_plan = plan_polar(
         mesh, n=nb_padded, backend="distributed", rcond=float(rcond))
     full_plus, source_full, source_steps = _write_link_stage(
@@ -436,10 +453,11 @@ def complete_velocity_validation(
             f"{energies.shape}")
     h_sharding = NamedSharding(mesh, P(None, "x", "y"))
 
-    @jax.jit(out_shardings=h_sharding)
     def _diagonal_hamiltonian(e):
         return jax.vmap(jnp.diag)(e).astype(A.dtype)
 
+    _diagonal_hamiltonian = jax.jit(
+        _diagonal_hamiltonian, out_shardings=h_sharding)
     H = _diagonal_hamiltonian(energies.astype(A.real.dtype))
     reconstructed = covariant_cartesian_derivative(
         H, A, mesh=mesh, kgrid=tuple(int(x) for x in kgrid),
@@ -467,17 +485,22 @@ def validate_parallel_transport_artifact(
     rtol: float,
 ) -> dict[str, object]:
     """Read the artifact through SlabIO and execute its mandatory gate."""
+    nb = int(nbands)
+    nb_storage = band_storage_extent(mesh, nb)
+    nk = int(np.prod(tuple(int(x) for x in kgrid)))
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
         connection = io.read_slab(
             CONNECTION_CART_DATASET,
+            shape=(3, nk, nb_storage, nb_storage),
             partition_spec=P(None, None, "x", "y"))
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET,
+            shape=(3, nk, nb_storage, nb_storage),
             partition_spec=P(None, None, "x", "y"))
         energies = io.read_slab(
             ENERGIES_DATASET,
+            shape=(nk, nb_storage),
             partition_spec=P(None, ("x", "y")))
-    nb = int(nbands)
     if nb <= 0 or nb > int(np.shape(energies)[1]):
         raise ValueError(
             f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")

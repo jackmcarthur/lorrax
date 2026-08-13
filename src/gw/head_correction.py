@@ -884,6 +884,8 @@ def format_static_head_diagnostics(head: StaticHeadTerms) -> str:
 def _expand_band_diagonal_to_kij_jit(diag, *, nk_tot: int, nb: int):
     """JIT'd body of :func:`expand_band_diagonal_to_kij`."""
     eye = jnp.eye(nb, dtype=jnp.complex128)
+    if diag.ndim == 2:
+        return eye[None, :, :] * diag[:, :, None]
     one_k = eye[None, :, :] * diag[None, :, None]
     return jnp.broadcast_to(one_k, (nk_tot, nb, nb))
 
@@ -896,7 +898,16 @@ def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
     ~6 eager-pjit cache misses per call into one cached XLA module.
     """
     diag_arr = jnp.asarray(diag, dtype=jnp.complex128)
-    nb = int(diag_arr.shape[0])
+    if diag_arr.ndim == 1:
+        nb = int(diag_arr.shape[0])
+    elif diag_arr.ndim == 2:
+        if int(diag_arr.shape[0]) != int(nk_tot):
+            raise ValueError(
+                f"k-dependent diagonal has {diag_arr.shape[0]} rows, "
+                f"expected nk_tot={nk_tot}")
+        nb = int(diag_arr.shape[1])
+    else:
+        raise ValueError("band diagonal must be (nb,) or (nk,nb)")
     return _expand_band_diagonal_to_kij_jit(diag_arr, nk_tot=int(nk_tot), nb=nb)
 
 
@@ -1009,6 +1020,7 @@ def compute_ppm_head_sigma_diag(
     enk_ry: np.ndarray,
     efermi_ry: float,
     n_occ: int,
+    occupations: np.ndarray | None = None,
     cell_volume: float,
     nk_tot: int,
     eta: float = 1.0e-6,
@@ -1032,8 +1044,11 @@ def compute_ppm_head_sigma_diag(
     if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
         return np.zeros((n_omega, nk, nb), dtype=np.complex128)
 
-    f = np.zeros((nb,), dtype=np.float64)
-    f[: max(0, min(int(n_occ), nb))] = 1.0
+    if occupations is None:
+        f = np.zeros((nb,), dtype=np.float64)
+        f[: max(0, min(int(n_occ), nb))] = 1.0
+    else:
+        f = np.asarray(occupations, dtype=np.float64)
     return compute_complex_pole_head_sigma_diag(
         omega_grid_ry=omega,
         enk_ry=enk,

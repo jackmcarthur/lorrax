@@ -133,6 +133,9 @@ class SCInputs:
     #: built on the full BZ — Σ comes from an FFT over the k-grid, which
     #: needs the whole grid (decisions.md, TRS veto scope).
     kstar: object | None = None
+    #: Validated, device-resident Berry connection + exact DFT velocity.
+    #: None preserves the historical fixed-DFT head path exactly.
+    parallel_transport: object | None = None
     print_fn: Callable = print
 
 
@@ -1099,7 +1102,76 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
             f"orbitals (E_F = {e_f_ry:.6f} Ry)")
 
-    # Per-mode screening: solve W at every frequency the Σ scheme needs.
+    # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
+    # accelerators that evaluate one carry repeatedly: at iteration zero
+    # DeltaH=0 and U=I, so this reconstructs the DFT head through the same
+    # prevalidated path used thereafter. Only saved A/v and the carried H
+    # are touched; no wavefunction coefficients enter this route.
+    iteration_head = None
+    iteration_static_head_terms = inputs.static_head_terms
+    pt = getattr(inputs, "parallel_transport", None)
+    if pt is not None:
+        from .head_correction import compute_static_head_terms_from_sample
+        from .qsgw_head import (
+            assemble_delta_head_manifold,
+            build_iteration_head_samples,
+        )
+
+        H_active_full = (
+            state.H_qp_dft if ks.is_identity
+            else ks.broadcast(state.H_qp_dft))
+        e_dft_active = inputs.e_dft_active_kn_ry
+        nb_active = int(H_active_full.shape[-1])
+        h_dft_active = (
+            e_dft_active[:, :, None]
+            * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
+        delta_active = H_active_full - h_dft_active
+        nb_storage = int(pt.connection_cart.shape[-1])
+        if int(wfns_qp.enk.shape[1]) < nb_storage:
+            raise ValueError(
+                "parallel-transport head storage has "
+                f"{nb_storage} padded bands, but the SC wavefunction bundle "
+                f"has only {wfns_qp.enk.shape[1]}.")
+        tail_diagonal = (wfns_qp.enk[:, :nb_storage]
+                         - inputs.wfns_dft.enk[:, :nb_storage])
+        delta_head = assemble_delta_head_manifold(
+            delta_active, tail_diagonal, nb_storage=nb_storage,
+            mesh=inputs.mesh_xy)
+
+        omegas = [0.0 + 0.0j]
+        if inputs.config.compute_mode.ppm_model == "gn":
+            omegas.append(1j * float(inputs.config.ppm.omega_p))
+        iteration_head = build_iteration_head_samples(
+            delta_head,
+            pt.connection_cart,
+            pt.velocity_dft_cart,
+            U_full,
+            wfns_qp.enk[:, :nb_storage],
+            wfns_qp.occ[:, :nb_storage],
+            np.asarray(omegas, dtype=np.complex128),
+            mesh=inputs.mesh_xy,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            nocc=int(inputs.meta.nelec),
+            nb_logical=int(pt.nb_logical),
+            sigma_energies_ry=np.asarray(E_full, dtype=np.float64),
+            efermi_ry=float(efermi_ry),
+            wfn=inputs.wfn,
+            meta=inputs.meta,
+            config=inputs.config,
+        )
+        if bool(inputs.config.do_G0):
+            iteration_static_head_terms = compute_static_head_terms_from_sample(
+                iteration_head.at(0.0 + 0.0j),
+                occ=np.asarray(wfns_qp.occ[:, :inputs.meta.nb_sigma]),
+                cell_volume=float(inputs.meta.cell_volume),
+                nk_tot=int(inputs.meta.nk_tot),
+            )
+        inputs.print_fn(
+            "    SC head: QSGW covariant velocity from saved parallel "
+            f"transport (nb={pt.nb_logical}, samples={len(omegas)})")
+
+    # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     requests = screening_requests_for(
         inputs.config.compute_mode, inputs.config)
@@ -1122,7 +1194,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
         e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
-        static_head_terms=inputs.static_head_terms,
+        static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad, e_ref=inputs.e_ref,
         config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
@@ -1138,6 +1210,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # once, below, after this returns.
         hartree_basis_rotation=U_full,
         omit_v_h=v_h_dft_new is not None,
+        iteration_head=iteration_head,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -1849,6 +1922,26 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
+    parallel_transport = None
+    if str(config.sc.head_update) == "parallel_transport":
+        if not bool(config.do_G0):
+            raise ValueError(
+                "sc_head_update=parallel_transport requires do_G0=true; "
+                "otherwise the rebuilt head has no consumer.")
+        from file_io.paths import resolve_input_path
+        from .qsgw_head import load_parallel_transport_head
+
+        pt_path = resolve_input_path(
+            input_dir, config.paths.parallel_transport_file)
+        parallel_transport = load_parallel_transport_head(
+            pt_path, mesh=mesh_xy, wfn=wfn, meta=meta)
+        vgate = parallel_transport.validation
+        print_fn(
+            "  SC head: loaded validated parallel transport from "
+            f"{pt_path} (nb={parallel_transport.nb_logical}, "
+            f"velocity max_abs={vgate['max_abs']:.3e}, "
+            f"max_rel={vgate['max_rel']:.3e})")
+
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         head_channel=head_channel,
@@ -1862,6 +1955,7 @@ def run_sc_driver(
         e_dft_active_kn_ry=e_dft_active_kn_ry,
         valence_mask_active_kn=val_mask_active,
         kstar=kstar,
+        parallel_transport=parallel_transport,
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)

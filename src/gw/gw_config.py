@@ -814,6 +814,11 @@ _DEFAULTS = {
     # boundary.  Sigma stays on the full BZ -- it is an FFT over the
     # k-grid.  Off keeps the loop entirely full-BZ.
     "sc_on_ibz": False,
+    # Update the q->0 head from the current QSGW Hamiltonian through the
+    # precomputed parallel-transport connection.  Explicit opt-in preserves
+    # every historical deck and makes a missing/stale artifact a refusal.
+    "sc_head_update": "off",       # off | parallel_transport
+    "parallel_transport_file": "parallel_transport.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1443,6 +1448,7 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
+    "sc_head_update",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
@@ -1821,6 +1827,7 @@ class FilePaths:
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
     kin_ion_file: str
+    parallel_transport_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -2012,6 +2019,7 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     eigh: str = "auto"    # "auto" | "native" | "distributed"
+    head_update: str = "off"  # "off" | "parallel_transport"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -2030,6 +2038,10 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
+        if self.head_update not in ("off", "parallel_transport"):
+            raise ValueError(
+                "sc_head_update must be 'off' or 'parallel_transport'; "
+                f"got {self.head_update!r}.")
 
 
 @dataclass(frozen=True)
@@ -2446,6 +2458,7 @@ class LorraxConfig:
             centroids_file=str(_g("centroids_file")),
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
+            parallel_transport_file=str(_g("parallel_transport_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
@@ -2537,6 +2550,7 @@ class LorraxConfig:
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),
+            head_update=str(_g("sc_head_update")).strip().lower(),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,

@@ -815,6 +815,10 @@ def main(argv=None):
 	args = parser.parse_args(argv)
 
 	if args.parallel_transport_out is not None:
+		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
+			parser.error(
+				"--parallel-transport-out and --out must name different files; "
+				"the dipole writer opens --out with truncation")
 		if args.vnl_mode != "analytic":
 			parser.error(
 				"--parallel-transport-out requires --vnl-mode=analytic: "
@@ -1267,6 +1271,8 @@ def main(argv=None):
 					initialize_parallel_transport_artifact(
 						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
 						nbands=nb,
+						effective_nspinor=int(meta.nspinor),
+						bispinor=bispinor,
 						velocity_dft_kmajor=H_v,
 						wfn_path=str(wfn_path),
 						wfn_fingerprint=wfn_fingerprint(wfn),
