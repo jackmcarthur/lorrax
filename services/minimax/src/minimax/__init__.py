@@ -204,9 +204,10 @@ _SOLVER_NAMES = (
 # same lazy door as the historical solvers: a production table lookup must
 # not import an optimiser.
 _FREQUENCY_FIT_NAMES = (
-    "PositiveChebyshevFit", "SharedSineFit",
+    "PositiveChebyshevFit", "SharedSineFit", "DampedReciprocalFit",
     "positive_complex_chebyshev", "shared_sine_system",
-    "resolvent_system", "fit_shared_sine_rule", "select_smallest_rank",
+    "resolvent_system", "fit_shared_sine_rule", "fit_damped_reciprocal",
+    "select_smallest_rank",
 )
 
 
