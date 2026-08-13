@@ -12,7 +12,7 @@ is that case today.
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
 total exchange-correlation contribution to ``H_QP = kin_ion + V_H +
-Σ_xc``.  PPM-mode-only diagnostics (full ω-grid Σ_c, on-shell diagonals,
+Σ_xc``.  Dynamic-mode-only diagnostics (full ω-grid Σ_c, on-shell diagonals,
 head decomposition) live as optional fields and are populated only when
 the mode produces them.
 
@@ -60,15 +60,15 @@ class SigmaResult:
     sigma_xc_kij_ry      : (nk, nb, nb)   Exchange-correlation total going
                                           into ``H_QP = kin_ion + V_H + Σ_xc``.
                                           Static modes: Σ_SX + Σ_COH (with
-                                          head).  PPM modes: Σ_x + Σ_c^QSGW.
+                                          head).  Dynamic modes: Σ_x + Σ_c^QSGW.
 
     Static-mode-only (None in PPM)
     ------------------------------
     sigma_sx_kij_ry      : (nk, nb, nb)   Σ_SX with head
     sigma_coh_kij_ry     : (nk, nb, nb)   Σ_COH with head
 
-    PPM-only (None in static)
-    -------------------------
+    Dynamic-mode-only (None in static)
+    ----------------------------------
     sigma_c_omega_kij_ry      : (nω, nk, nb, nb), sharded P(None,None,'x','y')
                                 Full ω-grid Σ_c (post-head); drives eqp1
                                 Z-factor central difference.
@@ -76,7 +76,7 @@ class SigmaResult:
     omega_dft_rel_ev          : (nk, nb)  E_DFT − E_F (eV).
     omega_grid_ev             : (nω,)     ω-grid in eV.
     omega_grid_ry             : (nω,)     ω-grid in Ry.
-    head_sigma_diag_w_kn_ry   : (nω, nk, nb)  PPM analytic head diagonal.
+    head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal.
     sigma_omega_h5_path       : str       on-disk Σ_c(ω) HDF5 path.
 
     Basis
@@ -316,6 +316,107 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
 
 
 # ---------------------------------------------------------------------------
+# Dynamic-Sigma finalization (shared by every frequency ansatz)
+# ---------------------------------------------------------------------------
+
+def finalize_dynamic_sigma(
+    sigma_c_body_omega: jax.Array,
+    head_sigma_diag_w_kn_ry: np.ndarray | None,
+    *,
+    sig_x: jax.Array,
+    sig_h: jax.Array,
+    e_qp_ev: np.ndarray,
+    config,
+    meta,
+    mesh_xy: Mesh,
+    sym,
+    wfn,
+    band_slices,
+    input_dir: str,
+    write_sigma_omega_h5: bool = True,
+    print_fn: Callable = print,
+) -> SigmaResult:
+    """Finalize one dynamic Sigma ansatz without knowing its pole model.
+
+    The ansatz supplies only its body cube and band-diagonal q->0 head.
+    This seam performs the common head injection, interpolation at DFT
+    energies, canonical file write and QSGW build, then returns the uniform
+    :class:`SigmaResult`.  The fixed-point solve and optional scissor remain
+    in :func:`gw.qsgw_utils.solve_qp`, which consumes the retained omega cube;
+    there is still one owner of that energy-update policy.
+    """
+    import common.timing as timing
+    from .dynamic_sigma import (
+        add_head_sigma_diag,
+        eval_sigma_c_at_dft_energies,
+        sigma_omega_output_path,
+        write_sigma_omega,
+    )
+    from .qsgw_utils import build_qsgw_sigma_xc
+
+    with timing.section("gw_jax.dynamic_sigma_finalize"):
+        sigma_c_omega = add_head_sigma_diag(
+            sigma_c_body_omega, head_sigma_diag_w_kn_ry)
+
+        (sigma_c_at_dft_ev,
+         omega_dft_rel_ev,
+         efermi_dft_ev) = eval_sigma_c_at_dft_energies(
+            sigma_c_omega,
+            config=config,
+            band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+            mesh_xy=mesh_xy, print_fn=print_fn,
+        )
+
+        if write_sigma_omega_h5:
+            sigma_omega_h5_path = write_sigma_omega(
+                sigma_c_omega,
+                sig_x=sig_x, sig_h=sig_h,
+                config=config, input_dir=input_dir,
+                meta=meta, mesh_xy=mesh_xy,
+                sym=sym, print_fn=print_fn,
+            )
+        else:
+            sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
+
+        # Static Sigma_x is added in the QSGW kernel.  E_F is the same WFN
+        # reference used above for the DFT-frequency interpolation.
+        omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        e_qp_rel_ev = (
+            np.asarray(e_qp_ev, dtype=np.float64)
+            - float(wfn.efermi) * RYD_TO_EV)
+        sig_x_rep = device_put_process_local(
+            sig_x, NamedSharding(mesh_xy, P(None, None, None)))
+        sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
+            sigma_c_omega, sig_x_rep,
+            omega_grid_ev, e_qp_rel_ev, mesh_xy,
+        )
+        print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
+                 f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+
+        # Only append when this call created the base file.  SC iterations
+        # pass False and append once, in the cube's own basis, at convergence.
+        if write_sigma_omega_h5:
+            from .qsgw_utils import write_qsgw_sigma_cube
+            write_qsgw_sigma_cube(
+                sigma_omega_h5_path, sigma_xc_qsgw,
+                config=config, print_fn=print_fn)
+
+    return SigmaResult(
+        v_h_kij_ry=sig_h,
+        sigma_x_kij_ry=sig_x,
+        sigma_xc_kij_ry=sigma_xc_qsgw,
+        sigma_c_omega_kij_ry=sigma_c_omega,
+        sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
+        omega_dft_rel_ev=omega_dft_rel_ev,
+        omega_grid_ev=config.omega_grid_ev,
+        omega_grid_ry=config.omega_grid_ry,
+        head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
+        sigma_omega_h5_path=sigma_omega_h5_path,
+        efermi_dft_ev=efermi_dft_ev,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -401,7 +502,6 @@ def compute_sigma_xc(
     """
     from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
-    from .qsgw_utils import build_qsgw_sigma_xc
 
     # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
     # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
@@ -566,69 +666,28 @@ def compute_sigma_xc(
         wfns=wfns,
         V_q=V_q,
         W_static_q=W_static, W_probe_q=W_by_role["probe"],
-        sig_x=sig_x, sig_h=sig_h,
-        quad=quad, e_ref=e_ref,
+        quad=quad,
         config=config, meta=meta, mesh_xy=mesh_xy,
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
+        print_fn=print_fn,
+    )
+
+    return finalize_dynamic_sigma(
+        ppm_outputs.sigma_c_body_omega,
+        ppm_outputs.head_sigma_diag_w_kn_ry,
+        sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
+        config=config, meta=meta, mesh_xy=mesh_xy,
+        sym=sym, wfn=wfn, band_slices=band_slices,
         input_dir=input_dir,
         write_sigma_omega_h5=write_sigma_omega_h5,
         print_fn=print_fn,
     )
 
-    # QSGW Σ_xc^QSGW evaluated at e_qp_ev.  Static Σ_x is added inside
-    # the kernel, so the result already includes Σ_x.  The E_F reference
-    # is the LORRAX-canonical midgap (``wfn.efermi`` — the same value
-    # the PPM pipeline used for ``omega_dft_rel_ev``), so calling this
-    # with ``e_qp_ev = E_DFT`` evaluates at exactly the pipeline's
-    # at-DFT frequencies (textbook G0W0 / SC-iteration-1 equivalence).
-    omega_grid_ev = np.asarray(
-        config.omega_grid_ev, dtype=np.float64)
-    efermi_ry = float(wfn.efermi)
-    e_qp_rel_ev = np.asarray(e_qp_ev, dtype=np.float64) - efermi_ry * RYD_TO_EV
-    # Process-local replication (plain ``device_put`` of a host/uncommitted
-    # array onto a multi-process sharding fires JAX's hidden ``assert_equal``
-    # all-gather — scorecard AA.1).  ``sig_x`` is replicated post-Σ output,
-    # identical on every rank; ``LORRAX_CHECK_REPLICA=1`` re-arms the check.
-    sig_x_rep = device_put_process_local(
-        sig_x, NamedSharding(mesh_xy, P(None, None, None)))
-    sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
-        ppm_outputs.sigma_c_omega, sig_x_rep,
-        omega_grid_ev, e_qp_rel_ev, mesh_xy,
-    )
-    print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
-             f"({100*qsgw_diag['frac_clipped']:.1f}%)")
-
-    # THE OPT-IN QSGW CUBE, on the path that just wrote the file.  Gated
-    # on ``write_sigma_omega_h5`` and not only on the deck key, because
-    # that flag is exactly "did THIS call create sigma_mnk.h5": the SC
-    # iteration map passes False and the converged single write happens
-    # later, in ``sc_iteration.dump_sigma_omega_h5_final``, which appends
-    # there instead.  Without the flag this would append the iteration-i
-    # cube to whatever file the previous run left behind.
-    if write_sigma_omega_h5:
-        from .qsgw_utils import write_qsgw_sigma_cube
-        write_qsgw_sigma_cube(
-            ppm_outputs.sigma_omega_h5_path, sigma_xc_qsgw,
-            config=config, print_fn=print_fn)
-
-    return SigmaResult(
-        v_h_kij_ry=sig_h,
-        sigma_x_kij_ry=sig_x,
-        sigma_xc_kij_ry=sigma_xc_qsgw,
-        sigma_c_omega_kij_ry=ppm_outputs.sigma_c_omega,
-        sigma_c_at_dft_diag_ev=ppm_outputs.sigma_c_at_dft_ev,
-        omega_dft_rel_ev=ppm_outputs.omega_dft_rel_ev,
-        omega_grid_ev=config.omega_grid_ev,
-        omega_grid_ry=config.omega_grid_ry,
-        head_sigma_diag_w_kn_ry=ppm_outputs.head_sigma_diag_w_kn_ry,
-        sigma_omega_h5_path=ppm_outputs.sigma_omega_h5_path,
-        efermi_dft_ev=ppm_outputs.efermi_dft_ev,
-    )
-
 
 __all__ = [
     "SigmaResult",
+    "finalize_dynamic_sigma",
     "compute_sigma_xc",
     "ROTATED_TO_DFT_FIELDS",
     "SIGMA_BASIS_FIELDS",

@@ -1148,7 +1148,7 @@ def write_results(
     # E_DFT relative to mid-gap E_F (matches gw_jax convention).  Only
     # needed when there is a finite ω-grid to interpolate against.
     # ``results.efermi_ev`` is the canonical value computed once upstream
-    # in ``ppm_pipeline._eval_sigma_c_at_dft_energies`` from the actual
+    # in ``dynamic_sigma.eval_sigma_c_at_dft_energies`` from the actual
     # number of occupied bands (``meta.nelec``); the writer used to
     # recompute it from ``band_stop - band_start`` which silently treats
     # every sigma-window band as occupied → efermi = top-of-window-band.

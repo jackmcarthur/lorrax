@@ -301,7 +301,7 @@ def test_the_derived_total_is_c_plus_sx_plus_h_bit_identically(tmp_path):
 
     Both write paths already spell this association — the replicated
     derivation in ``write_sigma_omega_h5`` and the sharded one in
-    ``gw.ppm_pipeline._write_sigma_omega_h5`` — and the point of the gate
+    ``gw.dynamic_sigma.write_sigma_omega`` — and the point of the gate
     is that they keep spelling the SAME one.  Bit-identical, in float64,
     because a reassociation of a 3-term float64 sum shows up at 1e-16
     relative and any gate loose enough to miss that is not pinning
@@ -456,7 +456,7 @@ def test_both_write_paths_call_the_one_association():
     exactly what this gate exists to stop coming back.
     """
     import re
-    for rel in ("src/file_io/sigma_output.py", "src/gw/ppm_pipeline.py"):
+    for rel in ("src/file_io/sigma_output.py", "src/gw/dynamic_sigma.py"):
         body = open(os.path.join(_REPO, rel)).read()
         # the derivation site must go through the named function
         assert "derive_sigma_total(" in body, (

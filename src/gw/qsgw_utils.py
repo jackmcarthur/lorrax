@@ -532,7 +532,7 @@ def write_qsgw_sigma_cube(
     file's other cubes are in:
 
     * ``gw.sigma_dispatch.compute_sigma_xc``, immediately after the QSGW
-      build, on the one-shot path where ``compute_ppm_sigma_pipeline``
+      build, on the one-shot path where ``finalize_dynamic_sigma``
       created the file a few statements earlier.  Gated there on the same
       ``write_sigma_omega_h5`` flag that decided whether the file was
       written at all, so it cannot fire during an SC iteration (which

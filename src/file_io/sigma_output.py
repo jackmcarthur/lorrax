@@ -716,7 +716,7 @@ def derive_sigma_total(sigma_c, sigma_sx, hartree):
 	bytes, so they call one function rather than each spelling their own
 	parenthesisation: the replicated derivation in
 	:func:`write_sigma_omega_h5` and the sharded one inside
-	``gw.ppm_pipeline._write_sigma_omega_h5``'s jitted ``_ev_tensors``.
+	``gw.dynamic_sigma.write_sigma_omega``'s jitted ``_ev_tensors``.
 	Works on host and device arrays alike — it is three adds.
 
 	WHY THIS IS A NAMED FUNCTION AND NOT AN EXPRESSION.  A float64

@@ -5,9 +5,7 @@ inlined as ~200 lines of bookkeeping:
 
     χ₀(probe ω) → W(probe ω) → 2-point PPM fit (B_q, Ω_q)
         → precompile + run Σ^c(ω, k, m, n)
-        → analytic q→0 head injection
-        → diag-Σ_c interpolation at DFT energies
-        → write sigma_mnk.h5
+        → analytic q→0 head construction
 
 The math kernels live in ``gw.ppm_sigma`` (per-τ kernel + accumulators)
 and ``gw.head_correction`` (head fits + analytic head Σ).  This module
@@ -19,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from common.units import RYD_TO_EV
@@ -37,17 +34,11 @@ from .ppm_tau_kernel import precompile_sigma
 
 @dataclass(frozen=True)
 class PPMOutputs:
-    """Frequency-dependent PPM Σ^c results returned to the GW driver."""
+    """Ansatz-specific PPM outputs handed to the dynamic finalizer."""
 
-    sigma_c_omega: jax.Array | None        # (n_omega, nk, nb, nb)  Ry
-    sigma_c_at_dft_ev: np.ndarray | None   # (nk, nb)  diag(Σ_c) at E_DFT
-    sigma_xc_at_dft_ev: np.ndarray | None  # (nk, nb)  diag(Σ_x) + diag(Σ_c) at E_DFT
-    omega_dft_rel_ev: np.ndarray | None    # (nk, nb)  E_DFT - E_F  (eV)
-    efermi_dft_ev: float | None
-    sigma_omega_h5_path: str
-    # Diagonal of the analytic q→0 head added to ``sigma_c_omega`` — kept
-    # separately for diagnostic printing (the head is band-diagonal so the
-    # decomposition is lossless).  ``None`` when no head was injected.
+    sigma_c_body_omega: jax.Array          # (n_omega, nk, nb, nb)  Ry
+    # Kept separate: injection is shared by every dynamic ansatz in
+    # ``dynamic_sigma.add_head_sigma_diag``.
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
 
 
@@ -105,27 +96,18 @@ def _fit_head_correction(
     return head_gn
 
 
-def _inject_analytic_head(
-    sigma_c_omega: jax.Array, head_gn, *,
+def _compute_analytic_head_diag(
+    head_gn, *,
     config: LorraxConfig,
     band_slices,
     wfn, sym, meta,
     print_fn,
-) -> tuple[jax.Array, np.ndarray | None]:
-    """Add the analytic q→0, G=G'=0 head to Σ^c(ω).
+) -> np.ndarray:
+    """Compute the analytic q→0, G=G'=0 PPM head diagonal.
 
-    One head, added to the in-memory tensor (replicated add, or a
-    rank-local band-diagonal add on the sharded layout).  A head-less
-    Σ_c is a silent wrong answer (Bug B,
-    reports/sigma_ppm_tighten_2026-07-04); the streamed (kij_stream)
-    h5-RMW arm of this function was REMOVED 2026-07-31 with the mode.
-
-    Returns
-    -------
-    sigma_c_omega_with_head, head_sigma_diag_w_kn_ry
-        Post-head Σ_c (same shape as input) and the band-diagonal of the
-        head-only contribution ``(nω, nk, nb)`` in Ry (head is diagonal
-        in band so this is a lossless decomposition).
+    A head-less Σ_c is a silent wrong answer (Bug B,
+    reports/sigma_ppm_tighten_2026-07-04).  Injection is deliberately left
+    to the ansatz-neutral dynamic-Sigma finalizer.
     """
     from .head_correction import compute_ppm_head_sigma_diag
 
@@ -138,14 +120,9 @@ def _inject_analytic_head(
     efermi_ry = float(wfn.efermi)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
-    # The head is band-DIAGONAL; compute that (nω, nk, nb) representation
-    # once.  The dense (nω, nk, nb, nb) tensor — n_ω·nk·nb²·16 B per rank,
-    # a full-cube-sized transient — is embedded from it ONLY on the path
-    # that adds densely (the in-memory replicated add); the
-    # sharded layout injects the diagonal rank-locally and never
-    # materializes the dense head anywhere.  The dense embed below is
-    # bit-identical to the historical compute_ppm_head_sigma_kij output
-    # (that function now embeds this same array — single source of truth).
+    # The head is band-diagonal; compute that lossless (nω, nk, nb)
+    # representation once.  The neutral injection seam avoids a dense head
+    # entirely for the sharded layout.
     head_sigma_diag_ry = compute_ppm_head_sigma_diag(
         head_gn,
         omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
@@ -155,13 +132,6 @@ def _inject_analytic_head(
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
     )
-
-    def _embed_dense(diag_w_kn: np.ndarray) -> np.ndarray:
-        n_w, nk_h, nb_h = diag_w_kn.shape
-        dense = np.zeros((n_w, nk_h, nb_h, nb_h), dtype=np.complex128)
-        idx = np.arange(nb_h)
-        dense[:, :, idx, idx] = diag_w_kn
-        return dense
 
     # max|dense| == max|diag| (off-diagonals are exact zeros; |diag| >= 0),
     # so the diagnostic is unchanged on every path.
@@ -175,165 +145,7 @@ def _inject_analytic_head(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
-    head_diag_w_kn_ry = np.asarray(head_sigma_diag_ry)
-
-
-    from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
-    if is_band_sharded_sigma_omega(sigma_c_omega):
-        # Sharded layout (sigma_omega_layout=sharded): rank-local add of the
-        # band-diagonal head onto each rank's (m_X, n_Y) tile — zero
-        # communication, no dense head anywhere.  Element-for-element the
-        # same IEEE add as the dense path performs on the diagonal (its
-        # off-diagonal adds are exact +0.0).
-        return (
-            add_band_diag_sharded(sigma_c_omega, head_diag_w_kn_ry),
-            head_diag_w_kn_ry,
-        )
-
-    return (
-        sigma_c_omega + jnp.asarray(_embed_dense(head_diag_w_kn_ry),
-                                    dtype=jnp.complex128),
-        head_diag_w_kn_ry,
-    )
-
-
-def _eval_sigma_c_at_dft_energies(
-    sigma_c_omega: jax.Array, *,
-    config: LorraxConfig,
-    sig_x: jax.Array,
-    band_slices, wfn, sym, meta, mesh_xy,
-    print_fn,
-):
-    """Interpolate diag(Σ_c)(ω) at each DFT energy on all ranks.
-
-    Pulls the replicated diagonal of Σ_c(ω, k, m, n) via
-    :func:`qsgw_utils.extract_sigma_diag_replicated` (cheap allgather of
-    the diagonal only, ~MB) so the result is consistent across ranks —
-    required by the post-Σ flow in ``gw_jax`` which now runs on all
-    ranks.
-
-    Returns ``(sigma_c_at_dft_ev, sigma_xc_at_dft_ev, omega_dft_rel_ev,
-    efermi_dft_ev)``, all replicated.
-    """
-    enk_dft, _ = get_enk_bandrange(
-        wfn, sym, band_slices.sigma_range,
-        band_slices.sigma_range, nspinor=meta.nspinor)
-    enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
-    # Single source of truth for the mid-gap E_F: WFNReader computes it
-    # once at WFN load (``wfn.efermi`` in Ry).  Don't recompute here.
-    vbm_ev = float(wfn.vbm) * RYD_TO_EV
-    cbm_ev = float(wfn.cbm) * RYD_TO_EV
-    efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
-    omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
-    print_fn(
-        f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  "
-        f"(VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
-    )
-
-    omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    from .qsgw_utils import extract_sigma_diag_replicated
-    sig_c_diag = (
-        np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
-        * RYD_TO_EV)
-
-    from .qsgw_utils import interp_along_omega
-    sigma_c_at_dft_ev = interp_along_omega(
-        sig_c_diag, omega_ev, omega_dft_rel_ev)
-
-    sig_x_diag_ev = np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
-    sigma_xc_at_dft_ev = sig_x_diag_ev + sigma_c_at_dft_ev
-    return (
-        sigma_c_at_dft_ev,
-        sigma_xc_at_dft_ev,
-        omega_dft_rel_ev,
-        efermi_dft_ev,
-    )
-
-
-def _write_sigma_omega_h5(
-    sigma_c_omega: jax.Array, *,
-    sig_x: jax.Array,
-    sig_h: jax.Array,
-    config: LorraxConfig,
-    input_dir: str,
-    meta,
-    mesh_xy,
-    sym=None,
-    print_fn=None,
-) -> str:
-    """Write the canonical sigma_mnk.h5 file (one writer, two backends).
-
-    ``sym`` THREADS THE STAR TABLES IN, and with them the k_irr
-    extraction: given it, the writer measures the star spread on the
-    complete full-BZ cube and then keeps one row per star.  Passing it is
-    the ONLY thing that turns the extraction on, so a caller that has no
-    symmetry object still writes the full BZ and still writes a file with
-    no ``k_storage`` attr, which every existing reader treats as full.
-    """
-    import os
-    from file_io import write_sigma_omega_h5
-
-    out_path = config.paths.sigma_omega_h5_file
-    if not os.path.isabs(out_path):
-        out_path = os.path.join(input_dir, out_path)
-
-    # ``gw.kin_ion_io.star_tables`` is the ONE derivation of this triple
-    # in the tree (it takes n_sym_spatial from ``sym.sym_mats_k`` rather
-    # than the WFN header, so producer and consumer of the conjugation
-    # convention cannot drift); reuse it rather than re-deriving here.
-    star = None
-    if sym is not None:
-        from .kin_ion_io import star_tables
-        star = star_tables(sym)
-
-    from .qsgw_utils import is_band_sharded_sigma_omega
-    if is_band_sharded_sigma_omega(sigma_c_omega):
-        # Sharded layout: derive the eV tensors with the OUTPUT sharding
-        # pinned to the cube's own (m_X, n_Y) tiling, so the partitioner
-        # cannot resolve the sharded+replicated elementwise mix by
-        # gathering the cube (pattern #4: make the constraint
-        # structural).  Same expression, same operand order as the
-        # writer's own derivation on the replicated path:
-        # total = (Ry→eV Σ_c + Ry→eV Σ_x[None]) + Ry→eV V_H[None] —
-        # bit-identical elementwise.  SlabIO's per-rank hyperslab
-        # writers (PHDF5_FFI / PHDF5_HOST) then write each rank's tile
-        # directly; the h5py_allgather backend is refused at P>1 for
-        # this layout at driver start.
-        shd = sigma_c_omega.sharding
-
-        def _ev_tensors(c_ry, x_ry, h_ry):
-            # THE ASSOCIATION COMES FROM ``file_io.sigma_output``, not from
-            # a second copy of the expression here.  The two write paths
-            # must produce bit-identical bytes and a float64
-            # reassociation moves them at 1e-16, which no physics gate
-            # would catch -- so there is one function and one gate on it.
-            from file_io.sigma_output import derive_sigma_total
-            c_ev = RYD_TO_EV * c_ry
-            total = derive_sigma_total(
-                c_ev, RYD_TO_EV * x_ry, RYD_TO_EV * h_ry)
-            return total, c_ev
-
-        total_ev, sigma_c_ev = jax.jit(
-            _ev_tensors, out_shardings=(shd, shd))(
-                sigma_c_omega, sig_x, sig_h)
-        write_sigma_omega_h5(
-            out_path, config.omega_grid_ev, total_ev,
-            sigma_c_kij_ev=sigma_c_ev,
-            sigma_sx_kij_ev=RYD_TO_EV * sig_x,
-            hartree_kij_ev=RYD_TO_EV * sig_h,
-            mesh=mesh_xy, star=star, print_fn=print_fn,
-        )
-        return out_path
-    # SlabIO handles rank-0 dispatch internally; both backends need
-    # all ranks to enter, so no ``if rank == 0`` guard.
-    write_sigma_omega_h5(
-        out_path, config.omega_grid_ev, None,
-        sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
-        sigma_sx_kij_ev=RYD_TO_EV * sig_x,
-        hartree_kij_ev=RYD_TO_EV * sig_h,
-        mesh=mesh_xy, star=star, print_fn=print_fn,
-    )
-    return out_path
+    return np.asarray(head_sigma_diag_ry)
 
 
 def compute_ppm_sigma_pipeline(
@@ -342,10 +154,7 @@ def compute_ppm_sigma_pipeline(
     V_q: jax.Array,
     W_static_q: jax.Array,
     W_probe_q: jax.Array,
-    sig_x: jax.Array,
-    sig_h: jax.Array,
     quad,
-    e_ref,
     config: LorraxConfig,
     meta,
     mesh_xy,
@@ -353,8 +162,6 @@ def compute_ppm_sigma_pipeline(
     band_slices,
     wfn,
     sym,
-    input_dir: str,
-    write_sigma_omega_h5: bool = True,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -371,12 +178,11 @@ def compute_ppm_sigma_pipeline(
 
         1. Two-point PPM pole fit (B_q, Ω_q) from (W_static, W_probe).
         2. Precompile + run Σ^c(ω, k, m, n) over the windowed minimax grid.
-        3. Inject the analytic q→0 head correction.
-        4. Interpolate diag(Σ_c) at DFT energies (rank-0 only).
-        5. Write sigma_mnk.h5 (eV units).
-    """
-    from . import w_isdf  # for ensure_compilation_cache + cache hit timings
+        3. Construct the analytic q→0 head correction.
 
+    The ansatz-neutral finalizer injects that head, interpolates, writes and
+    builds the QSGW matrix.
+    """
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
 
@@ -433,56 +239,21 @@ def compute_ppm_sigma_pipeline(
                 omega_grid_ry=config.omega_grid_ry,
                 print_fn=print_fn,
             )
-        sigma_c_omega = sigma_omega.sigma_c_kij
+        sigma_c_body_omega = sigma_omega.sigma_c_kij
 
-        # Step 3: q→0 head injection (analytic, mini-BZ-averaged)
+        # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
         )
-        sigma_c_omega, head_sigma_diag_w_kn_ry = _inject_analytic_head(
-            sigma_c_omega, head_gn,
+        head_sigma_diag_w_kn_ry = _compute_analytic_head_diag(
+            head_gn,
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
             print_fn=print_fn,
         )
 
-        # Step 4: diag(Σ_c) at DFT energies (replicated across ranks)
-        (sigma_c_at_dft_ev,
-         sigma_xc_at_dft_ev,
-         omega_dft_rel_ev,
-         efermi_dft_ev) = _eval_sigma_c_at_dft_energies(
-            sigma_c_omega,
-            config=config, sig_x=sig_x,
-            band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
-            mesh_xy=mesh_xy,
-            print_fn=print_fn,
-        )
-
-        # Step 5: write sigma_mnk.h5 (skipped on intermediate SC iters
-        # — the SC driver writes once at convergence using the captured
-        # sigma_c_omega from the final SigmaResult).
-        if write_sigma_omega_h5:
-            sigma_omega_h5_path = _write_sigma_omega_h5(
-                sigma_c_omega,
-                sig_x=sig_x, sig_h=sig_h,
-                config=config, input_dir=input_dir,
-                meta=meta, mesh_xy=mesh_xy,
-                sym=sym, print_fn=print_fn,
-            )
-        else:
-            import os
-            sigma_omega_h5_path = config.paths.sigma_omega_h5_file
-            if not os.path.isabs(sigma_omega_h5_path):
-                sigma_omega_h5_path = os.path.join(
-                    input_dir, sigma_omega_h5_path)
-
     return PPMOutputs(
-        sigma_c_omega=sigma_c_omega,
-        sigma_c_at_dft_ev=sigma_c_at_dft_ev,
-        sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
-        omega_dft_rel_ev=omega_dft_rel_ev,
-        efermi_dft_ev=efermi_dft_ev,
-        sigma_omega_h5_path=sigma_omega_h5_path,
+        sigma_c_body_omega=sigma_c_body_omega,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
     )

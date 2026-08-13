@@ -1980,7 +1980,7 @@ def dump_sigma_omega_h5_final(
     sigma_result = state.last_sigma_result
     if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
         return None
-    from .ppm_pipeline import _write_sigma_omega_h5
+    from .dynamic_sigma import write_sigma_omega
     from .qsgw_utils import write_qsgw_sigma_cube
 
     # ``sym`` TURNS THE k_irr EXTRACTION ON, and the ordering it needs is
@@ -1989,7 +1989,7 @@ def dump_sigma_omega_h5_final(
     # complete and the kernel has exited by the time the SC loop reaches
     # convergence, and only then is this called.  The writer measures the
     # star spread on those complete rows before dropping any.
-    path = _write_sigma_omega_h5(
+    path = write_sigma_omega(
         sigma_result.sigma_c_omega_kij_ry,
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,

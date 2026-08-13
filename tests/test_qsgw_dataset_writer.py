@@ -886,7 +886,7 @@ def test_the_cube_is_written_at_both_seams_and_only_there():
                      "write_qsgw_sigma_cube")
     util = _calls_of(_SRC / "gw" / "qsgw_utils.py", "write_qsgw_sigma_cube")
     assert sc == ["dump_sigma_omega_h5_final"], sc
-    assert disp == ["compute_sigma_xc"], disp
+    assert disp == ["finalize_dynamic_sigma"], disp
     # ``solve_qp``'s fixed_point branch rebuilds at the solved energies
     # and must overwrite the at-DFT cube the dispatch wrote, or the file
     # disagrees with eqp0.dat by the whole on-shell correction.
