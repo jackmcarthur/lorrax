@@ -1032,13 +1032,81 @@ def compute_ppm_head_sigma_diag(
     if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
         return np.zeros((n_omega, nk, nb), dtype=np.complex128)
 
-    eps_rel = enk - float(efermi_ry)                                # (nk, nb)
     f = np.zeros((nb,), dtype=np.float64)
     f[: max(0, min(int(n_occ), nb))] = 1.0
+    return compute_complex_pole_head_sigma_diag(
+        omega_grid_ry=omega,
+        enk_ry=enk,
+        efermi_ry=efermi_ry,
+        occupations=f,
+        poles_ry=np.asarray([head.omega_h - 1j * eta]),
+        residues_ry=np.asarray([head.R_h]),
+        cell_volume=cell_volume,
+        nk_tot=nk_tot,
+    )
+
+
+def compute_complex_pole_head_sigma_diag(
+    *,
+    omega_grid_ry: np.ndarray,
+    enk_ry: np.ndarray,
+    efermi_ry: float,
+    occupations: np.ndarray,
+    poles_ry: np.ndarray,
+    residues_ry: np.ndarray,
+    cell_volume: float,
+    nk_tot: int,
+) -> np.ndarray:
+    r"""Band-diagonal head self-energy for generic retarded complex poles.
+
+    For poles ``Omega_p = a_p - i Gamma_p`` and head residues ``R_p``,
+
+    .. math::
+
+        \Sigma_n^{\mathrm{head}}(\omega) =
+        \frac{1}{V_{\mathrm{cell}}N_k}\sum_p R_p
+        \left[\frac{f_{nk}}{\delta_{nk}+\Omega_p}
+        + \frac{1-f_{nk}}{\delta_{nk}-\Omega_p}\right],
+
+    where ``delta_nk = omega - (epsilon_nk - E_F)``.  Occupations are
+    accepted per band or per ``(k,band)``; this keeps the denominator valid
+    when an energy window straddles the Fermi level without deciding how the
+    occupations themselves are produced.
+
+    All energy-like inputs and residues are in Ry.  The result is complex Ry
+    with shape ``(n_omega, n_k, n_band)``.
+    """
+    omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
+    enk = np.asarray(enk_ry, dtype=np.float64)
+    if enk.ndim != 2:
+        raise ValueError("enk_ry must be 2D (nk, nb)")
+    nk, nb = enk.shape
+    occ = np.asarray(occupations, dtype=np.float64)
+    if occ.shape == (nb,):
+        occ = np.broadcast_to(occ[None, :], (nk, nb))
+    elif occ.shape != (nk, nb):
+        raise ValueError(
+            f"occupations must have shape {(nb,)} or {(nk, nb)}, got "
+            f"{occ.shape}")
+    poles = np.asarray(poles_ry, dtype=np.complex128).reshape(-1)
+    # Preserve a real residue dtype.  Besides avoiding a needless complex
+    # multiply for real fits, this keeps the one-real-pole PPM wrapper
+    # bit-identical to its historical arithmetic.
+    residues = np.asarray(residues_ry).reshape(-1)
+    if residues.shape != poles.shape:
+        raise ValueError("poles_ry and residues_ry must have the same length")
+    if poles.size == 0:
+        return np.zeros((omega.size, nk, nb), dtype=np.complex128)
+
+    eps_rel = enk - float(efermi_ry)
     delta = omega[:, None, None] - eps_rel[None, :, :]              # (nω, nk, nb)
-    occ_term = f[None, None, :] / (delta + head.omega_h - 1j * eta)
-    emp_term = (1.0 - f[None, None, :]) / (delta - head.omega_h + 1j * eta)
-    sigma_diag = (head.R_h / (float(cell_volume) * float(nk_tot))) * (occ_term + emp_term)
+    pole = poles[:, None, None, None]
+    f = occ[None, None, :, :]
+    occ_term = f / (delta[None, :, :, :] + pole)
+    emp_term = (1.0 - f) / (delta[None, :, :, :] - pole)
+    pref = residues / (float(cell_volume) * float(nk_tot))
+    sigma_diag = np.sum(
+        pref[:, None, None, None] * (occ_term + emp_term), axis=0)
     return np.asarray(sigma_diag, dtype=np.complex128)
 
 

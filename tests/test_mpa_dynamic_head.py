@@ -15,7 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from gw.head_correction import fold_cartesian_head_wings_sharded
+from gw.head_correction import (
+    HeadGNParams,
+    compute_complex_pole_head_sigma_diag,
+    compute_ppm_head_sigma_diag,
+    fold_cartesian_head_wings_sharded,
+)
 
 
 def _complex(rng, shape, scale=1.0):
@@ -74,3 +79,47 @@ def test_cartesian_ywz_fold_matches_dense_bordered_dyson():
             1.0 - vbare * lam**2 * (qhat @ got_S[iz] @ qhat))
         np.testing.assert_allclose(reduced_head, dense_head, rtol=2e-13,
                                    atol=2e-11)
+
+
+def test_complex_pole_head_sum_matches_ppm_and_direct_denominators():
+    """One real PPM pole preserves bytes; two damped poles pin width signs."""
+    omega = np.asarray([-0.7, 0.0, 0.4, 1.1])
+    enk = np.asarray([[-0.8, -0.1, 0.25], [-0.65, 0.05, 0.6]])
+    efermi = -0.03
+    cell_volume, nk_tot, eta = 83.0, 8, 2.0e-5
+    head = HeadGNParams(
+        omega_h_sq=1.44, omega_h=1.2, B_h=3.6, R_h=1.5,
+        wc_head_0=-2.5, wc_head_iwp=-1.0, vc0=30.0, omega_p=0.5)
+
+    got_ppm = compute_ppm_head_sigma_diag(
+        head, omega_grid_ry=omega, enk_ry=enk, efermi_ry=efermi,
+        n_occ=1, cell_volume=cell_volume, nk_tot=nk_tot, eta=eta)
+    eps_rel = enk - float(efermi)
+    f = np.asarray([1.0, 0.0, 0.0])
+    delta = omega[:, None, None] - eps_rel[None, :, :]
+    occ_term = f[None, None, :] / (delta + head.omega_h - 1j * eta)
+    emp_term = ((1.0 - f[None, None, :])
+                / (delta - head.omega_h + 1j * eta))
+    legacy = ((head.R_h / (float(cell_volume) * float(nk_tot)))
+              * (occ_term + emp_term))
+    assert np.array_equal(got_ppm, np.asarray(legacy, dtype=np.complex128))
+
+    occupations = np.asarray([[1.0, 0.7, 0.0], [1.0, 0.2, 0.0]])
+    poles = np.asarray([0.65 - 0.04j, 1.7 - 0.22j])
+    residues = np.asarray([0.8 + 0.15j, -0.25 + 0.4j])
+    got = compute_complex_pole_head_sigma_diag(
+        omega_grid_ry=omega, enk_ry=enk, efermi_ry=efermi,
+        occupations=occupations, poles_ry=poles, residues_ry=residues,
+        cell_volume=cell_volume, nk_tot=nk_tot)
+    direct = np.zeros_like(got)
+    for pole, residue in zip(poles, residues):
+        direct += residue / (cell_volume * nk_tot) * (
+            occupations[None, :, :] / (delta + pole)
+            + (1.0 - occupations[None, :, :]) / (delta - pole))
+    np.testing.assert_allclose(got, direct, rtol=2e-15, atol=2e-17)
+
+    wrong_width_sign = compute_complex_pole_head_sigma_diag(
+        omega_grid_ry=omega, enk_ry=enk, efermi_ry=efermi,
+        occupations=occupations, poles_ry=poles.conj(),
+        residues_ry=residues, cell_volume=cell_volume, nk_tot=nk_tot)
+    assert np.max(np.abs(got - wrong_width_sign)) > 1.0e-5
