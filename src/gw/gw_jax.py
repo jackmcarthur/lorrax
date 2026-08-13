@@ -68,7 +68,7 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
+	ComputeMode, LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature

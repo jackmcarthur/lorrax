@@ -172,6 +172,18 @@ def test_the_driver_refuses_at_entry_before_it_spends_anything():
     assert guard < source.index("isdf = prepare_isdf_and_wavefunctions(")
 
 
+def test_the_driver_imports_the_mode_axis_it_dispatches_on():
+    """The post-screening MPA branch must not depend on an unbound name."""
+    tree = ast.parse((_GW / "gw_jax.py").read_text())
+    imported = {
+        alias.asname or alias.name
+        for node in tree.body if isinstance(node, ast.ImportFrom)
+        and node.module == "gw_config"
+        for alias in node.names
+    }
+    assert "ComputeMode" in imported
+
+
 # ---------------------------------------------------------------------------
 # 3. Exhaustive dispatch — no site inherits an else-branch
 # ---------------------------------------------------------------------------
