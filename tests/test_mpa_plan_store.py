@@ -316,6 +316,64 @@ def test_four_pole_noncross_extraction_and_topology():
         SP._shared_noncross_classes(bad, 8)
 
 
+def test_wide_side_union_coalesces_only_identical_single_or_slab_physics():
+    provenance = (
+        "NON-PRODUCTION sampled wide+Gamma_eff=0 union; test")
+    nodes = MinimaxNodes(
+        t=np.asarray([0.1 - 0.2j, 0.3 - 0.4j]),
+        alpha=np.asarray([0.5 + 0.1j, 0.2 + 0.3j]))
+
+    def _class(name, poles, *, mask):
+        window = _SigmaWindow(
+            name=name, nodes=nodes, mask_A=np.asarray(mask, dtype=bool),
+            E_ref_A=0.25, E_ref_B=0.0,
+            omega_sign=(-1 if name == "single" else 1),
+            project="full", prefactor=1.0, provenance=provenance)
+        poles = np.asarray(tuple(poles), dtype=np.int32)
+        side = np.tile(np.asarray([
+            0.0, np.inf, -np.inf, -np.inf, 0.05, np.inf]),
+            (poles.size, 1))
+        wide = np.tile(np.asarray([
+            0.0, np.inf, 0.05, -np.inf, np.inf, np.inf]),
+            (poles.size, 1))
+        return (("neg_cond", name, window, poles, side),
+                ("neg_cond", name, window, poles, wide))
+
+    side_single, wide_single = _class(
+        "single", range(8), mask=[[True, False], [False, True]])
+    # Stripes remain separate even if a synthetic fixture gives them equal
+    # masks.  Production has 8/26 finite-only A states, so crediting this
+    # contraction would be unsound.
+    side_stripe, wide_stripe = _class(
+        "a_stripe", (0, 1), mask=[[True, False], [True, False]])
+    sides, wide, mixed = SP._coalesce_shared_noncross_sides(
+        [side_single, side_stripe], [wide_single, wide_stripe])
+    assert [(row[0], row[1]) for row in mixed] == [
+        ("neg_cond", "single")]
+    assert [(row[0], row[1]) for row in sides] == [
+        ("neg_cond", "a_stripe")]
+    assert [(row[0], row[1]) for row in wide] == [
+        ("neg_cond", "a_stripe")]
+
+    first = SP._mixed_batch_sweeps(mixed, (0, 1, 2, 3))
+    assert len(first) == 1
+    (_bkey, _name, _window, global_poles, local_poles,
+     bounds, real_flags) = first[0]
+    assert tuple(global_poles) == tuple(range(4)) * 2
+    assert tuple(local_poles) == tuple(range(4)) * 2
+    assert bounds.shape == (8, 6)
+    assert tuple(real_flags) == (True,) * 4 + (False,) * 4
+
+    bad_wide = (
+        wide_single[:2]
+        + (replace(wide_single[2],
+                   mask_A=np.logical_not(wide_single[2].mask_A)),)
+        + wide_single[3:])
+    with pytest.raises(ValueError, match="contraction physics"):
+        SP._coalesce_shared_noncross_sides(
+            [side_single], [bad_wide])
+
+
 def test_a_leg_can_load_only_the_groups_it_owns(planned, tmp_path):
     """A slice off disk equals the same slice of the computed plan.
 

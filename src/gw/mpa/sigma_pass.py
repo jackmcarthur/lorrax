@@ -2172,11 +2172,15 @@ def _extract_shared_sides(groups, a_real, omega_complex):
 def _extract_shared_noncross(groups, omega_complex):
     """Remove the six ordinary finite-width classes eligible for pole sharing."""
     names = {"sector:single", "sector:a_stripe", "sector:b_slab"}
+    provenances = (
+        "NON-PRODUCTION shared noncross frontier;",
+        "NON-PRODUCTION sampled wide+Gamma_eff=0 union;",
+    )
     kept, shared = [], []
     for group in groups:
         if (str(group.name) not in names or len(group.windows) != 1
                 or not str(group.windows[0].provenance or "").startswith(
-                    "NON-PRODUCTION shared noncross frontier;")):
+                    provenances)):
             kept.append(group)
             continue
         if (group.selector_bounds_B is None
@@ -2311,6 +2315,95 @@ def _shared_noncross_classes(collected, n_p):
     return out
 
 
+_NONCROSS_SIDE_UNION_PROVENANCE = (
+    "NON-PRODUCTION sampled wide+Gamma_eff=0 union;")
+
+
+def _coalesce_shared_noncross_sides(side_classes, noncross_classes):
+    """Pair only union-fitted wide/side classes with identical A physics.
+
+    A mixed class carries two selector rows per pole: the compatibility row
+    uses ``Re Omega`` in its scalar phase and the finite-width row uses the
+    full complex pole.  The rows may share the existing spatial contraction
+    only when their quadrature, A mask, A gauge, sign, projector, and
+    prefactor are byte/bit identical.  ``a_stripe`` is intentionally not a
+    candidate: the accepted production plans give its side and wide pieces
+    different A masks, so combining their W fields before one G contraction
+    would add transitions that the side window does not own.
+    """
+    side_classes = list(side_classes)
+    noncross_classes = list(noncross_classes)
+    mixed = []
+    compatible = {
+        ("neg_cond", "single"), ("pos_val", "single"),
+        ("neg_val", "b_slab"), ("pos_cond", "b_slab"),
+    }
+
+    def _tagged(row):
+        return str(row[2].provenance or "").startswith(
+            _NONCROSS_SIDE_UNION_PROVENANCE)
+
+    consumed_side, consumed_wide = set(), set()
+    for key in sorted(compatible):
+        side_found = [
+            (index, row) for index, row in enumerate(side_classes)
+            if row[:2] == key]
+        wide_found = [
+            (index, row) for index, row in enumerate(noncross_classes)
+            if row[:2] == key]
+        union_requested = any(
+            _tagged(row) for _index, row in side_found + wide_found)
+        if not union_requested:
+            continue
+        if (len(side_found) != 1 or len(wide_found) != 1
+                or not _tagged(side_found[0][1])
+                or not _tagged(wide_found[0][1])):
+            raise ValueError(
+                f"wide+compatibility union {key[0]}.{key[1]} requires one "
+                "identically tagged side class and one wide class")
+        side_index, side = side_found[0]
+        wide_index, wide = wide_found[0]
+        side_window, wide_window = side[2], wide[2]
+        if not _same_side_rule(side_window, wide_window):
+            raise ValueError(
+                f"wide+compatibility union {key[0]}.{key[1]} differs in "
+                "quadrature or A-space contraction physics")
+        side_poles = np.asarray(side[3], dtype=np.int32)
+        wide_poles = np.asarray(wide[3], dtype=np.int32)
+        if not np.array_equal(side_poles, wide_poles):
+            raise ValueError(
+                f"wide+compatibility union {key[0]}.{key[1]} has "
+                "different pole coverage")
+        side_bounds = np.asarray(side[4], dtype=np.float64)
+        wide_bounds = np.asarray(wide[4], dtype=np.float64)
+        if (side_bounds.shape != wide_bounds.shape
+                or side_bounds.shape != (side_poles.size, 6)):
+            raise ValueError(
+                f"wide+compatibility union {key[0]}.{key[1]} has an "
+                "invalid selector topology")
+        for pole, side_bound, wide_bound in zip(
+                side_poles, side_bounds, wide_bounds, strict=True):
+            if _selector_bounds_overlap(side_bound, wide_bound):
+                raise ValueError(
+                    f"wide+compatibility union {key[0]}.{key[1]} "
+                    f"overlaps at pole {int(pole)}")
+        mixed.append((
+            key[0], key[1], replace(wide_window, E_ref_B=0.0),
+            np.concatenate((side_poles, wide_poles)),
+            np.concatenate((side_bounds, wide_bounds), axis=0),
+            np.concatenate((np.ones(side_poles.size, dtype=bool),
+                            np.zeros(wide_poles.size, dtype=bool)))))
+        consumed_side.add(side_index)
+        consumed_wide.add(wide_index)
+    return (
+        [row for index, row in enumerate(side_classes)
+         if index not in consumed_side],
+        [row for index, row in enumerate(noncross_classes)
+         if index not in consumed_wide],
+        mixed,
+    )
+
+
 def _side_batch_sweeps(classes, batch_poles):
     """Map global side-class poles onto one staged pole batch."""
     batch_poles = tuple(map(int, batch_poles))
@@ -2332,6 +2425,32 @@ def _side_batch_sweeps(classes, batch_poles):
     return sweeps
 
 
+def _mixed_batch_sweeps(classes, batch_poles):
+    """Map duplicated side/wide selector rows onto one resident pole batch."""
+    batch_poles = tuple(map(int, batch_poles))
+    if len(batch_poles) != len(set(batch_poles)):
+        raise ValueError("staged mixed batch repeats a resident pole")
+    local = {pole: index for index, pole in enumerate(batch_poles)}
+    sweeps = []
+    for bkey, name, window, poles, bounds, real_flags in classes:
+        poles = np.asarray(poles, dtype=np.int32)
+        bounds = np.asarray(bounds, dtype=np.float64)
+        real_flags = np.asarray(real_flags, dtype=bool)
+        if bounds.shape != (poles.size, 6) or real_flags.shape != poles.shape:
+            raise ValueError(
+                f"mixed class {bkey}.{name} has an invalid selector stack")
+        take = [index for index, pole in enumerate(map(int, poles))
+                if pole in local]
+        if not take:
+            continue
+        global_poles = poles[take]
+        local_poles = np.asarray(
+            [local[int(pole)] for pole in global_poles], dtype=np.int32)
+        sweeps.append((bkey, name, window, global_poles, local_poles,
+                       bounds[take], real_flags[take]))
+    return sweeps
+
+
 def _stack_shared_pole_batch(shared_poles, poles, *, consume):
     """Stack one host pole batch, optionally releasing its slab owners."""
     poles = tuple(map(int, poles))
@@ -2350,6 +2469,7 @@ def _stack_shared_pole_batch(shared_poles, poles, *, consume):
 def run_shared_crossing_branch(
     *, window, pole_indices, selector_bounds, omega_nonneg_ry, E_A, B_poles,
     Omega_poles, psi, tau_kernel, mesh_xy, log_tag, print_fn,
+    phase_real_flags=None,
 ):
     """Integrate one common crossing rule after summing its poles in W(tau)."""
     import jax.numpy as jnp
@@ -2373,12 +2493,19 @@ def run_shared_crossing_branch(
     mask_A = jnp.asarray(window.mask_A)
 
     def build_sigma_tau(t_node):
-        out = tau_kernel(
+        common = (
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, B_poles, Omega_poles,
             jnp.asarray(pole_indices, dtype=jnp.int32),
-            jnp.asarray(selector_bounds, dtype=jnp.float64),
-            jnp.asarray(window.E_ref_A), jnp.asarray(0.0), t_node)
+            jnp.asarray(selector_bounds, dtype=jnp.float64))
+        if phase_real_flags is None:
+            out = tau_kernel(
+                *common, jnp.asarray(window.E_ref_A), jnp.asarray(0.0),
+                t_node)
+        else:
+            out = tau_kernel(
+                *common, jnp.asarray(phase_real_flags, dtype=jnp.bool_),
+                jnp.asarray(window.E_ref_A), jnp.asarray(0.0), t_node)
         return (out, None) if window.project_code == 0 else out
 
     progress = LoopProgress(window.n_tau, print_fn, title=f"sigma[{log_tag}]",
@@ -3466,7 +3593,10 @@ def compute_mpa_sigma_c_omega_grid(
              omega_complex_host)
 
     if share_crossing:
-        from ..ppm_tau_kernel import _get_sigma_shared_tau_kernel
+        from ..ppm_tau_kernel import (
+            _get_sigma_shared_mixed_tau_kernel,
+            _get_sigma_shared_tau_kernel,
+        )
 
         expected = {"pos_cond", "neg_val"}
         if (set(shared_exact) != expected or set(shared_hgl) != expected
@@ -3477,6 +3607,9 @@ def compute_mpa_sigma_c_omega_grid(
         side_classes = _shared_side_classes(shared_sides, n_p)
         noncross_classes = (_shared_noncross_classes(shared_noncross, n_p)
                             if shared_noncross else [])
+        side_classes, noncross_classes, union_classes = (
+            _coalesce_shared_noncross_sides(
+                side_classes, noncross_classes))
         stacked_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
         crossing_poles = (0, 1)
         B_host, Omega_host = _stack_shared_pole_batch(
@@ -3511,6 +3644,8 @@ def compute_mpa_sigma_c_omega_grid(
             mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, real_pole=True)
         noncross_kernel = _get_sigma_shared_tau_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, real_pole=False)
+        union_kernel = _get_sigma_shared_mixed_tau_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True)
         for batch_poles in ((0, 1, 2, 3), (4, 5, 6, 7)):
             B_host, Omega_host = _stack_shared_pole_batch(
                 shared_poles, batch_poles, consume=False)
@@ -3518,6 +3653,25 @@ def compute_mpa_sigma_c_omega_grid(
             Omega_batch = device_put_process_local(
                 Omega_host, stacked_sharding)
             del B_host, Omega_host
+            for (bkey, name, window, global_poles, local_poles,
+                 bounds, real_flags) in _mixed_batch_sweeps(
+                     union_classes, batch_poles):
+                branch = shared_branches[bkey]
+                _fold_branch(branch, run_shared_crossing_branch(
+                    window=window, pole_indices=local_poles,
+                    selector_bounds=bounds,
+                    phase_real_flags=real_flags,
+                    omega_nonneg_ry=branch.omega_abs, E_A=branch.E_A,
+                    B_poles=B_batch, Omega_poles=Omega_batch, psi=psi,
+                    tau_kernel=union_kernel, mesh_xy=mesh_xy,
+                    log_tag=(f"shared wide+side {bkey}.{name} "
+                             f"rank{window.n_tau} selectors"
+                             f"{list(map(int, global_poles))}"),
+                    print_fn=print_fn))
+                records[0].n_tau_nodes += int(window.n_tau)
+                records[0].groups.append(
+                    f"shared-wide-side:{bkey}.{name}:"
+                    f"rank{int(window.n_tau)}")
             for (bkey, name, window, global_poles, local_poles,
                  bounds) in _side_batch_sweeps(side_classes, batch_poles):
                 branch = shared_branches[bkey]

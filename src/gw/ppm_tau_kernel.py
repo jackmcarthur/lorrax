@@ -589,6 +589,95 @@ def _get_sigma_shared_tau_kernel(
     return _tau_kernel_staged
 
 
+def _get_sigma_shared_mixed_tau_kernel(
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool,
+) -> Callable[..., jax.Array]:
+    """Sum real-phase side and complex-phase wide selectors into one W.
+
+    This is the frequency-only companion of
+    :func:`_get_sigma_shared_tau_kernel`.  Each selector row carries a flag:
+    true uses the accepted compatibility functional ``Re Omega`` and false
+    uses the finite-width pole ``Omega``.  Their W fields are added before
+    the unchanged Sigma convolution/projection kernel.  No spatial layout or
+    sharding changes.
+    """
+    kgrid = tuple(int(x) for x in kgrid)
+    from ffi import ffi_dial_key
+
+    key = ("mixed-real-complex", id(mesh_xy), kgrid,
+           _stage_timing_enabled(), ffi_dial_key(), bool(merged_x))
+    if key in _sigma_shared_tau_kernel_cache:
+        return _sigma_shared_tau_kernel_cache[key]
+
+    ensure_jax_compile_cache()
+    q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    sigma_kij_kernel = _get_sigma_kij_kernel(
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=bool(merged_x))
+
+    @jax.jit
+    def _build_W(B_poles, Omega_poles, pole_indices, bounds,
+                 phase_real_flags, E_ref_B, t_node):
+        def _add(index, W_t):
+            pole = jax.lax.dynamic_index_in_dim(
+                pole_indices, index, axis=0, keepdims=False)
+            omega = jax.lax.dynamic_index_in_dim(
+                Omega_poles, pole, axis=0, keepdims=False)
+            residue = jax.lax.dynamic_index_in_dim(
+                B_poles, pole, axis=0, keepdims=False)
+            b = jax.lax.dynamic_index_in_dim(
+                bounds, index, axis=0, keepdims=False)
+            real_phase = jax.lax.dynamic_index_in_dim(
+                phase_real_flags, index, axis=0, keepdims=False)
+            a = jnp.real(omega)
+            gamma = -jnp.imag(omega)
+            selected = ((a > b[0]) & (a <= b[1])
+                        & (gamma >= b[2]) & (gamma > b[3])
+                        & (gamma < b[4]) & (gamma <= b[5]))
+            phase = jnp.where(real_phase, a + 0.0j, omega)
+            return W_t + jnp.where(
+                selected,
+                residue * jnp.exp(-1j * (phase - E_ref_B) * t_node),
+                jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+
+        W_t = jax.lax.fori_loop(
+            0, pole_indices.shape[0], _add, jnp.zeros_like(B_poles[0]))
+        return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
+
+    if not _stage_timing_enabled():
+        @jax.jit
+        def _tau_kernel(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
+            phase_real_flags, E_ref_A, E_ref_B, t_node,
+        ):
+            W_t = _build_W(
+                B_poles, Omega_poles, pole_indices, bounds,
+                phase_real_flags, E_ref_B, t_node)
+            return sigma_kij_kernel(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, E_ref_A, t_node, W_t)
+
+        _sigma_shared_tau_kernel_cache[key] = _tau_kernel
+        return _tau_kernel
+
+    def _tau_kernel_staged(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
+        phase_real_flags, E_ref_A, E_ref_B, t_node,
+    ):
+        with timing.section("sigma.tau.w_phase") as sec:
+            W_t = _build_W(
+                B_poles, Omega_poles, pole_indices, bounds,
+                phase_real_flags, E_ref_B, t_node)
+            sec.watch(W_t)
+        return sigma_kij_kernel(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_ref_A, t_node, W_t)
+
+    _sigma_shared_tau_kernel_cache[key] = _tau_kernel_staged
+    return _tau_kernel_staged
+
+
 def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
     """AOT lower + compile the per-τ sigma kernel.
 
