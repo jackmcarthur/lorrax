@@ -142,6 +142,9 @@ MPA_GROUP_SUFFIX = "__mpa"
 #: Sibling group holding the staged-fit completion ledger.
 MPA_FIT_SUFFIX = "__mpafit"
 
+#: Tiny scalar q->0 fit beside, but independent of, the body pole tensors.
+MPA_HEAD_SUFFIX = "__mpahead"
+
 # The fit keeps the W wedge's q map beside its poles.  The tables belong to
 # ``symmetry_maps``; this is only the dataset name under which that service
 # files them.
@@ -1559,7 +1562,7 @@ def allocate_fit_store(
         # behind would leave a full-size array of ITS numbers indexed by
         # THIS run's ledger, and the Σ stage would certify the new poles
         # against the old evidence.
-        for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX] + [
+        for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX] + [
                 k for k in grp if str(k).startswith("fit_")]:
             if key in grp:
                 del grp[key]
@@ -1631,6 +1634,119 @@ def _append(dset, values):
     arr = np.asarray(values)
     dset.resize(n + arr.shape[0], axis=0)
     dset[n:] = arr
+
+
+def write_head_fit(
+    dest,
+    sample_z,
+    sample_Wc,
+    Omega_p,
+    B_p,
+    *,
+    energy_unit,
+    fit_condition,
+    fit_backward_error,
+    fit_max_abs_residual,
+    mode="a",
+):
+    """Write the complete scalar q->0 MPA fit and stamp readiness last.
+
+    The head is intentionally not expanded to ``(q,mu,mu)``: its samples and
+    poles are one tiny frequency axis, owned by the same file as the body fit.
+    ``sample_Wc`` stays in Coulomb-head atomic units; ``sample_z``, ``Omega_p``
+    and ``B_p`` use ``energy_unit`` (the pole residue has one energy factor).
+    """
+    if str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"write_head_fit: energy_unit must be one of "
+            f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
+    z = np.ascontiguousarray(sample_z, dtype=np.complex128).reshape(-1)
+    wc = np.ascontiguousarray(sample_Wc, dtype=np.complex128).reshape(-1)
+    poles = np.ascontiguousarray(Omega_p, dtype=np.complex128).reshape(-1)
+    residues = np.ascontiguousarray(B_p, dtype=np.complex128).reshape(-1)
+    if z.size < 1 or poles.size < 1:
+        raise ValueError("write_head_fit: sample and pole axes must be nonempty")
+    if z.shape != wc.shape:
+        raise ValueError("write_head_fit: sample_z and sample_Wc shapes differ")
+    if poles.shape != residues.shape:
+        raise ValueError("write_head_fit: Omega_p and B_p shapes differ")
+    for name, arr in (("sample_z", z), ("sample_Wc", wc),
+                      ("Omega_p", poles), ("B_p", residues)):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"write_head_fit: {name} contains non-finite values")
+    diag = {
+        "fit_condition": float(fit_condition),
+        "fit_backward_error": float(fit_backward_error),
+        "fit_max_abs_residual": float(fit_max_abs_residual),
+    }
+    if any(not np.isfinite(v) or v < 0.0 for v in diag.values()):
+        raise ValueError("write_head_fit: diagnostics must be finite and nonnegative")
+
+    qs = _qs()
+    with qs.QirrDest(dest, mode) as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX in grp:
+            del grp[MPA_HEAD_SUFFIX]
+        head = grp.create_group(MPA_HEAD_SUFFIX)
+        head.attrs["ready"] = False
+        head.create_dataset("sample_z", data=z)
+        head.create_dataset("sample_Wc", data=wc)
+        head.create_dataset("Omega_p", data=poles)
+        head.create_dataset("B_p", data=residues)
+        head.attrs["format_version"] = np.int64(1)
+        head.attrs["frequency_unit"] = str(energy_unit)
+        head.attrs["Wc_unit"] = "a.u."
+        head.attrs["residue_unit"] = f"{energy_unit}*a.u."
+        for key, value in diag.items():
+            head.attrs[key] = value
+        head.attrs["ready"] = True
+
+
+def read_head_fit(src, *, to_unit=None, mode="r"):
+    """Read the complete scalar q->0 MPA fit; refuse absent/partial data."""
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError("read_head_fit: fit store carries no scalar head")
+        head = grp[MPA_HEAD_SUFFIX]
+        if int(head.attrs.get("format_version", -1)) != 1:
+            raise ValueError("read_head_fit: unsupported scalar-head format")
+        if not bool(head.attrs.get("ready", False)):
+            raise ValueError("read_head_fit: scalar head is NOT READY")
+        source_unit = qs.qirr_attr_str(head, "frequency_unit")
+        z = np.asarray(head["sample_z"][()])
+        wc = np.asarray(head["sample_Wc"][()])
+        poles = np.asarray(head["Omega_p"][()])
+        residues = np.asarray(head["B_p"][()])
+        diagnostics = {
+            key: float(head.attrs[key])
+            for key in ("fit_condition", "fit_backward_error",
+                        "fit_max_abs_residual")
+        }
+        units = {
+            "frequency": source_unit,
+            "Wc": qs.qirr_attr_str(head, "Wc_unit"),
+            "residue": qs.qirr_attr_str(head, "residue_unit"),
+        }
+    if to_unit is not None:
+        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+            raise ValueError(
+                "head read: both stored and requested energy units must be "
+                f"declared; stored={source_unit!r}, requested={to_unit!r}")
+        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        z, poles, residues = z * scale, poles * scale, residues * scale
+        units["frequency"] = str(to_unit)
+        units["residue"] = f"{to_unit}*a.u."
+    return {
+        "sample_z": z,
+        "sample_Wc": wc,
+        "Omega_p": poles,
+        "B_p": residues,
+        "units": units,
+        "diagnostics": diagnostics,
+        "ready": True,
+    }
 
 
 def write_fit_block(

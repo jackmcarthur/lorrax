@@ -983,6 +983,38 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
 
 
+def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
+    """The tiny head axis converts only its energy-like quantities."""
+    MS.allocate_fit_store(
+        tmpdir_path, n_q=1, n_mu=2, n_p=1, energy_unit="Ha")
+    z = np.asarray([0.0 + 0.1j, 0.7 + 0.1j])
+    wc = np.asarray([-14.0 + 0.0j, -3.0 + 0.2j])
+    poles = np.asarray([0.8 - 0.06j, 1.4 - 0.2j])
+    residues = np.asarray([0.3 + 0.1j, -0.2 + 0.05j])
+    MS.write_head_fit(
+        tmpdir_path, z, wc, poles, residues, energy_unit="Ha",
+        fit_condition=17.0, fit_backward_error=2.0e-12,
+        fit_max_abs_residual=4.0e-8)
+
+    got = MS.read_head_fit(tmpdir_path, to_unit="Ry")
+    np.testing.assert_array_equal(got["sample_z"], 2.0 * z)
+    np.testing.assert_array_equal(got["sample_Wc"], wc)
+    np.testing.assert_array_equal(got["Omega_p"], 2.0 * poles)
+    np.testing.assert_array_equal(got["B_p"], 2.0 * residues)
+    assert got["units"] == {
+        "frequency": "Ry", "Wc": "a.u.", "residue": "Ry*a.u."}
+    assert got["diagnostics"] == {
+        "fit_condition": 17.0,
+        "fit_backward_error": 2.0e-12,
+        "fit_max_abs_residual": 4.0e-8,
+    }
+
+    with h5py.File(tmpdir_path, "a") as f:
+        f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
+    with pytest.raises(ValueError, match="NOT READY"):
+        MS.read_head_fit(tmpdir_path)
+
+
 def test_complete_pole_axis_uses_the_same_read_policy(tmpdir_path):
     _staged_fit(tmpdir_path, n_p=3)
     MS.finalize_fit_store(tmpdir_path)
