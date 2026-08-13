@@ -6,11 +6,12 @@ The stored forward link has the orientation
 
 and therefore transports a band-space operator from ``k+b_i`` back to
 ``k``. Wavefunctions use the WfnLoader sphere layout
-``(1, nb_pad, nspinor, ngkmax)``. The overlap kernel gathers the neighbour
+``(1, nb_pad, nspinor, ngkmax)``. The link kernel gathers the neighbour
 onto the central G sphere, shards central bands over ``x`` and neighbour
-bands over ``y``, and returns ``(1, nb_pad, nb_pad)`` with
-``P(None, "x", "y")``. G and spin are replicated contraction axes, so no
-process owns a full band matrix.
+bands over ``y``, and forms the raw overlap at ``P("x", "y")``. G and
+spin are replicated contraction axes, so no process owns a full band matrix.
+The planned distributed polar factor is called inside that same compiled
+graph: the raw overlap never crosses a Python dispatch boundary.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ __all__ = [
     "g_wrap_for_forward_step",
     "inverse_neighbor_table",
     "make_distributed_band_matmul",
-    "make_cross_k_overlap",
+    "make_cross_k_link",
     "wfn_fingerprint",
 ]
 
@@ -222,18 +223,34 @@ def build_g_wrap_lookup(
     return index, valid
 
 
-def make_cross_k_overlap(mesh):
-    """Build the two fixed-shape JITs used by the streamed link sweep."""
+def make_cross_k_link(mesh, polar_plan):
+    """Build the fixed-shape JITs used by the streamed link sweep.
+
+    ``polar_plan`` is the eagerly resolved, trace-safe operation returned by
+    ``distrib_la.plan_polar_factor``. Planning remains outside the streamed
+    IBZ loop, while overlap formation and the polar factor share one outer
+    JIT so the distributed raw overlap stays on device and has no standalone
+    dispatch or lifetime.
+
+    Returns
+    -------
+    center_on_x, link
+        ``center_on_x`` reshards the central wavefunctions once per IBZ
+        point. ``link`` accepts that resident centre, one neighbour and the
+        G-wrap lookup and returns ``(L, s)``. ``L`` has ``P('x','y')`` and
+        the length-band singular spectrum ``s`` is replicated according to
+        the distributed-linear-algebra service contract.
+    """
     sphere_x = NamedSharding(mesh, P(None, "x", None, None))
     sphere_y = NamedSharding(mesh, P(None, "y", None, None))
-    block_xy = NamedSharding(mesh, P(None, "x", "y"))
+    block_xy = NamedSharding(mesh, P("x", "y"))
 
     @jax.jit
     def center_on_x(center_xy):
         return jax.lax.with_sharding_constraint(center_xy, sphere_x)
 
     @jax.jit
-    def overlap(center_x, neighbor_xy, g_index, g_valid):
+    def link(center_x, neighbor_xy, g_index, g_valid):
         neighbor = jnp.take(neighbor_xy, g_index, axis=-1)
         neighbor = jnp.where(
             g_valid[None, None, None, :], neighbor,
@@ -242,9 +259,10 @@ def make_cross_k_overlap(mesh):
         raw = jnp.einsum(
             "kbsg,knsg->kbn", jnp.conj(center_x), neighbor_y,
             optimize=True)
-        return jax.lax.with_sharding_constraint(raw, block_xy)
+        raw = jax.lax.with_sharding_constraint(raw[0], block_xy)
+        return polar_plan(raw)
 
-    return center_on_x, overlap
+    return center_on_x, link
 
 
 def make_distributed_band_matmul(mesh, *, n_batch_axes: int):

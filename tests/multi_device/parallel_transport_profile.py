@@ -30,6 +30,7 @@ from common.collectives import (  # noqa: E402
     resolve_mesh,
 )
 from distrib_la import plan_polar_factor  # noqa: E402
+from common.parallel_transport import make_cross_k_link  # noqa: E402
 from gw.qsgw_head import (  # noqa: E402
     _active_rotation_kernel,
     _cartesian_fft_multipliers,
@@ -93,6 +94,41 @@ def main() -> int:
             f"distributed polar mismatch: L={link_error}, s={singular_error}"
         )
 
+    # Make the cross-k contraction equal matrix_host exactly, then time the
+    # production composition in which the raw overlap feeds the planned polar
+    # factor without returning to Python.
+    center_host = np.zeros((1, n, 1, n), dtype=np.complex128)
+    center_host[0, :, 0, :] = np.eye(n)
+    neighbor_host = np.zeros_like(center_host)
+    neighbor_host[0, :, 0, :] = matrix_host.T
+    sphere = NamedSharding(mesh, P(None, ("x", "y"), None, None))
+    center = device_put_process_local(center_host, sphere)
+    neighbor = device_put_process_local(neighbor_host, sphere)
+    center_on_x, make_link = make_cross_k_link(mesh, polar)
+    center_x = _ready(center_on_x(center))
+    g_index = np.arange(n, dtype=np.int32)
+    g_valid = np.ones(n, dtype=bool)
+    start = time.perf_counter()
+    fused_link, fused_singular = _ready(
+        make_link(center_x, neighbor, g_index, g_valid))
+    fused_cold_s = time.perf_counter() - start
+    fused_warm_s = []
+    for _ in range(5):
+        start = time.perf_counter()
+        fused_link, fused_singular = _ready(
+            make_link(center_x, neighbor, g_index, g_valid))
+        fused_warm_s.append(time.perf_counter() - start)
+    fused_link_error = np.max(
+        np.abs(_host(fused_link) - ref_u @ ref_vh)) / np.max(
+            np.abs(ref_u @ ref_vh))
+    fused_singular_error = np.max(
+        np.abs(_host(fused_singular) - ref_s)) / ref_s[0]
+    if fused_link_error > 3.0e-11 or fused_singular_error > 3.0e-11:
+        raise AssertionError(
+            "fused overlap/polar mismatch: "
+            f"L={fused_link_error}, s={fused_singular_error}"
+        )
+
     slab_shapes = None
     if os.environ.get("PT_PROFILE_SKIP_SLAB", "0") != "1":
         # Lazy so a factorization-only service image need not install h5py;
@@ -109,17 +145,26 @@ def main() -> int:
         )
         energy_pad = np.zeros((2, 8), dtype=np.float64)
         energy_pad[:, :5] = rng.normal(size=(2, 5))
+        singular_pad = np.zeros((2, 3, 8), dtype=np.float64)
+        singular_pad[:, :, :5] = np.sort(
+            rng.random(size=(2, 3, 5)), axis=-1)[:, :, ::-1]
         matrix_dev = device_put_process_local(
             matrix_pad, NamedSharding(mesh, P(None, "x", "y"))
         )
         energy_dev = device_put_process_local(
             energy_pad, NamedSharding(mesh, P(None, ("x", "y")))
         )
+        singular_dev = device_put_process_local(
+            singular_pad, NamedSharding(mesh, P())
+        )
         with SlabIO(path, mode="w", mesh=mesh) as io:
             io.create_dataset("matrix", shape=(3, 5, 5), dtype=np.complex128)
             io.create_dataset("energy", shape=(2, 5), dtype=np.float64)
+            io.create_dataset(
+                "singular", shape=(2, 3, 5), dtype=np.float64)
             io.write_slab("matrix", matrix_dev)
             io.write_slab("energy", energy_dev)
+            io.write_slab("singular", singular_dev)
         with SlabIO(path, mode="r", mesh=mesh) as io:
             matrix_read = io.read_slab(
                 "matrix", shape=(3, 8, 8), partition_spec=P(None, "x", "y")
@@ -127,17 +172,27 @@ def main() -> int:
             energy_read = io.read_slab(
                 "energy", shape=(2, 8), partition_spec=P(None, ("x", "y"))
             )
+            singular_read = io.read_slab(
+                "singular",
+                shape=(2, 3, 8),
+                partition_spec=P(None, None, ("x", "y")),
+            )
         got_matrix = _host(matrix_read)
         got_energy = _host(energy_read)
+        got_singular = _host(singular_read)
         if not (
             np.array_equal(got_matrix[:, :5, :5], matrix_pad[:, :5, :5])
             and not np.any(got_matrix[:, 5:, :])
             and not np.any(got_matrix[:, :, 5:])
             and np.array_equal(got_energy[:, :5], energy_pad[:, :5])
             and not np.any(got_energy[:, 5:])
+            and np.array_equal(
+                got_singular[:, :, :5], singular_pad[:, :, :5])
+            and not np.any(got_singular[:, :, 5:])
         ):
             raise AssertionError("SlabIO common physical-extent round trip failed")
-        slab_shapes = (got_matrix.shape, got_energy.shape)
+        slab_shapes = (
+            got_matrix.shape, got_energy.shape, got_singular.shape)
         barrier("pt-profile-after-slab")
         if rank == 0:
             path.unlink(missing_ok=True)
@@ -240,6 +295,10 @@ def main() -> int:
                 "backend": polar.backend,
                 "link_rel": link_error,
                 "singular_rel": singular_error,
+                "fused_cold_s": fused_cold_s,
+                "fused_warm_s": fused_warm_s,
+                "fused_link_rel": fused_link_error,
+                "fused_singular_rel": fused_singular_error,
             },
         )
         print("PT_PROFILE slabio", slab_shapes if slab_shapes else "SKIPPED")

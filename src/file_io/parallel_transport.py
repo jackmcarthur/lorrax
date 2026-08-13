@@ -22,7 +22,7 @@ from common.parallel_transport import (
     build_g_wrap_lookup,
     fourth_order_connection,
     g_wrap_for_forward_step,
-    make_cross_k_overlap,
+    make_cross_k_link,
     make_distributed_band_matmul,
 )
 from file_io.slab_io import SlabIO
@@ -154,6 +154,14 @@ def initialize_parallel_transport_artifact(
                 "gauge": "WfnLoader generated full-BZ gauge",
             })
         io.create_dataset(
+            SINGULAR_VALUES_DATASET, shape=(nrk, 3, nb), dtype=np.float64,
+            attrs={
+                "k_storage": "ibz_source_edges",
+                "source_steps": "positive reduced-grid unit steps",
+                "ordering": "descending",
+                "distribution": "replicated O(nband) diagnostic",
+            })
+        io.create_dataset(
             VELOCITY_DFT_DATASET, shape=(3, nk, nb, nb),
             dtype=np.complex128,
             attrs={
@@ -243,8 +251,8 @@ def _write_link_stage(
     full_plus = build_forward_neighbor_table(sym.kvecs_asints, wfn.kgrid)
     source_plus = full_plus[source_full]
     wraps = np.empty((nrk, 3, 3), dtype=np.int32)
-    singular_values = np.empty((nrk, 3, nb), dtype=np.float64)
-    center_on_x, overlap_kernel = make_cross_k_overlap(mesh)
+    singular_values = []
+    center_on_x, link_kernel = make_cross_k_link(mesh, polar_plan)
     source_steps = np.eye(3, dtype=np.int32)
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
@@ -273,25 +281,27 @@ def _write_link_stage(
                 neighbor_xy = wfn.load(
                     bands=(0, nb), k=neighbor_ids,
                     sharding=band_sphere_spec(), bispinor=bool(bispinor))
-                raw_overlap = overlap_kernel(
-                    center_x, neighbor_xy, g_index, g_valid)
                 # WfnLoader owns the exact zero band pad.  distrib_la's
                 # polar contract returns the canonical partial isometry for
                 # those null directions; slicing the physical leading block
                 # is therefore well-defined and does not perturb the link.
-                link, values = polar_plan(raw_overlap[0])
+                link, values = link_kernel(
+                    center_x, neighbor_xy, g_index, g_valid)
                 io.write_slab(
                     LINKS_DATASET, link[None, None, :, :],
                     offset=(ik_irr, idir, 0, 0))
-                # Singular values are O(nb), bounded by the selected head
-                # manifold: 8*nb bytes per link, 24*nrk*nb bytes for this
-                # host diagnostic table. It never scales as nb^2.
-                singular_values[ik_irr, idir] = np.asarray(
-                    jax.device_get(values[:nb]), dtype=np.float64)
-                del neighbor_xy, raw_overlap, link, values
+                # Retain only the replicated O(nb) diagnostic. Stacking and
+                # writing once after the stream avoids both a per-link host
+                # synchronization and a second HDF5 transaction per link.
+                singular_values.append(values[:nb])
+                del neighbor_xy, link, values
             del center_xy, center_x
 
-        io.write_attr(SINGULAR_VALUES_DATASET, singular_values)
+        singular_values_device = jnp.stack(singular_values).reshape(
+            nrk, 3, nb)
+        singular_values_device = jax.lax.with_sharding_constraint(
+            singular_values_device, NamedSharding(mesh, P()))
+        io.write_slab(SINGULAR_VALUES_DATASET, singular_values_device)
         io.write_attr("source_steps", source_steps)
         io.write_attr("source_full_ids", source_full)
         io.write_attr("source_neighbor_full_ids", source_plus)

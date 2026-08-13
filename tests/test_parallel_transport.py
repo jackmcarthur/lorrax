@@ -18,7 +18,6 @@ from common.parallel_transport import (
     build_g_wrap_lookup,
     fourth_order_connection,
     g_wrap_for_forward_step,
-    make_distributed_band_matmul,
     wfn_fingerprint,
 )
 import file_io.parallel_transport as pt_io
@@ -27,6 +26,7 @@ from file_io.parallel_transport import (
     ENERGIES_DATASET,
     LINKS_DATASET,
     OCCUPATIONS_DATASET,
+    SINGULAR_VALUES_DATASET,
     VELOCITY_DFT_DATASET,
     complete_velocity_validation,
     initialize_parallel_transport_artifact,
@@ -138,13 +138,14 @@ def test_g_wrap_lookup_boundary_and_wrong_sign_red_twin():
     assert int(np.count_nonzero(wrong_valid)) == 1
 
 
-def test_cross_k_overlap_hostile_2x2_mesh_subprocess():
-    """nb=5 is padded to 8 on a 2x2 mesh and no shard owns the full matrix."""
+def test_cross_k_link_fuses_overlap_and_polar_on_hostile_2x2_mesh_subprocess():
+    """The nb=5/8 overlap stays tiled through its planned polar factor."""
     code = r"""
 import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from common.parallel_transport import make_cross_k_overlap
+from common.parallel_transport import make_cross_k_link
+from distrib_la import plan_polar_factor
 
 assert len(jax.devices()) == 4, len(jax.devices())
 mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
@@ -153,21 +154,32 @@ center = rng.normal(size=(1, 8, 1, 6)) + 1j*rng.normal(size=(1, 8, 1, 6))
 neighbor = rng.normal(size=(1, 8, 1, 6)) + 1j*rng.normal(size=(1, 8, 1, 6))
 center[:, 5:] = 0
 neighbor[:, 5:] = 0
-index = np.array([2, 0, 4, 1, 3, 0], dtype=np.int32)
-valid = np.array([1, 1, 0, 1, 1, 0], dtype=bool)
+index = np.array([2, 0, 4, 1, 3, 5], dtype=np.int32)
+valid = np.ones(6, dtype=bool)
 xy = NamedSharding(mesh, P(None, ("x", "y"), None, None))
 center_xy = jax.device_put(center, xy)
 neighbor_xy = jax.device_put(neighbor, xy)
-to_x, overlap = make_cross_k_overlap(mesh)
-got = overlap(to_x(center_xy), neighbor_xy, index, valid)
+polar = plan_polar_factor(mesh, n=8, backend="off", rcond=1.0e-12)
+to_x, make_link = make_cross_k_link(mesh, polar)
+got, singular = make_link(to_x(center_xy), neighbor_xy, index, valid)
 aligned = neighbor[..., index]
-aligned = np.where(valid[None, None, None, :], aligned, 0)
-want = np.einsum("kbsg,knsg->kbn", np.conj(center), aligned)
-np.testing.assert_allclose(np.asarray(got), want, rtol=2e-13, atol=2e-13)
-assert tuple(got.sharding.spec) == (None, "x", "y")
-assert {s.data.shape for s in got.addressable_shards} == {(1, 4, 4)}
-assert np.count_nonzero(np.asarray(got)[:, 5:, :]) == 0
-assert np.count_nonzero(np.asarray(got)[:, :, 5:]) == 0
+raw = np.einsum("kbsg,knsg->kbn", np.conj(center), aligned)[0]
+u, s, vh = np.linalg.svd(raw[:5, :5], full_matrices=False)
+got_host = np.asarray(got)
+singular_host = np.asarray(singular)
+np.testing.assert_allclose(
+    got_host[:5, :5], u @ vh, rtol=2e-12, atol=2e-12)
+np.testing.assert_allclose(
+    singular_host[:5], s, rtol=2e-12, atol=2e-12)
+np.testing.assert_allclose(
+    singular_host[5:], 0.0, rtol=0.0, atol=2e-12)
+assert tuple(got.sharding.spec) == ("x", "y")
+assert tuple(singular.sharding.spec) == ()
+assert {part.data.shape for part in got.addressable_shards} == {(4, 4)}
+np.testing.assert_allclose(
+    got_host[5:, :], 0.0, rtol=0.0, atol=2e-12)
+np.testing.assert_allclose(
+    got_host[:, 5:], 0.0, rtol=0.0, atol=2e-12)
 """
     env = os.environ.copy()
     flags = env.get("XLA_FLAGS", "")
@@ -175,6 +187,13 @@ assert np.count_nonzero(np.asarray(got)[:, :, 5:]) == 0
         flags + " --xla_force_host_platform_device_count=4").strip()
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
+    repo = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (
+        str(repo / "src"),
+        str(repo / "services" / "distrib_la" / "src"),
+        str(repo / "services" / "lxkit" / "src"),
+        env.get("PYTHONPATH", ""),
+    )))
     run = subprocess.run(
         [sys.executable, "-c", code], env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
@@ -343,6 +362,7 @@ def test_artifact_schema_is_slabio_only_and_names_the_head_manifold():
     assert "h5py.File" not in source
     assert "SlabIO(" in source
     assert LINKS_DATASET == "links_ibz"
+    assert SINGULAR_VALUES_DATASET == "singular_values_ibz"
     assert CONNECTION_CART_DATASET == "berry_connection_cart"
     assert VELOCITY_DFT_DATASET == "velocity_dft_cart"
     assert ENERGIES_DATASET == "dft_energies_ry_full"
