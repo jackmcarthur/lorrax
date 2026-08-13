@@ -27,8 +27,8 @@ band slices. Those slices, not a quadrature tolerance, decide which bands
 enter screening. For an ISDF centroid $\mu$, define
 
 $$
-M^\mathbf q_{cv\mathbf k}(\mu)
-=\sum_s\psi^*_{c,\mathbf{k-q},s}(\mu)\psi_{v,\mathbf k,s}(\mu),
+M^{\mathbf q}_{cv\mathbf k}(\mu)
+=\sum_s\psi^{\ast}_{c,\mathbf{k-q},s}(\mu)\psi_{v,\mathbf k,s}(\mu),
 \qquad
 \Delta^\mathbf q_{cv\mathbf k}
 =\epsilon_{c,\mathbf{k-q}}-\epsilon_{v,\mathbf k}>0 .
@@ -40,8 +40,8 @@ particle polarizability is
 $$
 \chi^0_{\mu\nu}(\mathbf q,z)
 \sim \sum_{\mathbf kvc}
-M^\mathbf q_{cv\mathbf k}(\mu)
-M^{\mathbf q*}_{cv\mathbf k}(\nu)
+M^{\mathbf q}_{cv\mathbf k}(\mu)
+M^{\mathbf q\ast}_{cv\mathbf k}(\nu)
 K_z(\Delta^\mathbf q_{cv\mathbf k}),
 $$
 
@@ -61,16 +61,14 @@ analytic continuation occurs anywhere in this path.
 For stable factorization, let
 
 $$
-v_{\max}=\max_v\epsilon_v,\quad
-c_{\min}=\min_c\epsilon_c,\quad
-E_g=c_{\min}-v_{\max},
-$$
-$$
-A_{c\mathbf k}=\epsilon_{c\mathbf k}-c_{\min}\ge0,
-\qquad
-B_{v\mathbf k}=v_{\max}-\epsilon_{v\mathbf k}\ge0,
-\qquad
-\Delta=E_g+A+B.
+\begin{aligned}
+v_{\max}&=\max_v\epsilon_v,
+&c_{\min}&=\min_c\epsilon_c,
+&E_g&=c_{\min}-v_{\max},\\
+A_{c\mathbf k}&=\epsilon_{c\mathbf k}-c_{\min}\ge0,
+&B_{v\mathbf k}&=v_{\max}-\epsilon_{v\mathbf k}\ge0,\\
+\Delta&=E_g+A+B.
+\end{aligned}
 \tag{2}
 $$
 
@@ -90,19 +88,19 @@ by a positive-interval Laplace rule.
 At a complex time $\tau$, the two spectral factors are schematically
 
 $$
+\begin{aligned}
 G^c_{\mathbf k}(\tau)
-\sim\sum_c\psi_{c\mathbf k}\psi^*_{c\mathbf k}
-e^{-\tau(\epsilon_{c\mathbf k}-c_{\min})},
-$$
-$$
+&\sim\sum_c\psi_{c\mathbf k}\psi^{\ast}_{c\mathbf k}
+e^{-\tau(\epsilon_{c\mathbf k}-c_{\min})},\\
 G^v_{\mathbf k}(-\tau)
-\sim\sum_v\psi_{v\mathbf k}\psi^*_{v\mathbf k}
+&\sim\sum_v\psi_{v\mathbf k}\psi^{\ast}_{v\mathbf k}
 e^{-\tau(v_{\max}-\epsilon_{v\mathbf k})}.
+\end{aligned}
 \tag{4}
 $$
 
 Two forward $\mathbf k$ FFTs, the local product
-$G^c_R\,G^v_R{}^*$, and a final forward FFT produce the $\mathbf{k-q}$
+$G^c_R G^{v\ast}_R$, and a final forward FFT produce the $\mathbf{k-q}$
 convolution and exactly the residue orientation in (1). The current array
 layout conjugates the returned conduction matrix, so the raw complex-time
 builder is called at $\bar\tau$ on the conduction side and at $-\tau$ on the
@@ -695,7 +693,7 @@ the pole walk; they are not frequency-dependent calculation intermediates.
 For each window and node, the runtime forms schematically
 
 $$
-G_A(t_\ell)\sim\sum_{n\in A}\psi_n\psi_n^*
+G_A(t_\ell)\sim\sum_{n\in A}\psi_n\psi_n^{\ast}
 e^{-i(E_{A,n}-E_A^{\rm ref})t_\ell},
 $$
 $$
