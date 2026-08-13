@@ -102,15 +102,14 @@ def screening_requests_for(
     Returns an empty list for unscreened schemes (``X_ONLY``); a single
     static request for COHSEX; static + probe for the PPM schemes.
 
-    EVERY MODE IS NAMED HERE, INCLUDING THE ONES THAT REFUSE.  This
+    EVERY MODE IS NAMED HERE.  This
     function is the first place a compute mode turns into work, so a mode
     reaching it without a branch of its own would get its screening plan
     from whichever ``if`` happened to sit last — which is how a new ansatz
-    silently becomes a run of an old one.  The MPA branch below therefore
-    refuses by name rather than being absent: ``mpa``'s W is sampled on
-    the double-parallel grid (``gw.mpa.sample_plan.mpa_plan``), not at
-    {0, probe}, and returning the PPM pair for it would be wrong in a way
-    no downstream stage could detect.
+    silently becomes a run of an old one.  MPA returns no independent
+    requests here because its named model stage owns the shared
+    double-parallel frequency walk.  Returning the PPM pair would be wrong
+    in a way no downstream stage could detect.
 
     To add a new scheme, extend the dispatch here AND add a
     corresponding case to ``compute_sigma_xc`` that reads the W's by

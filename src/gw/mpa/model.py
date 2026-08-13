@@ -94,9 +94,10 @@ def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
         del chi, Wc
 
 
-def _fit_body(sample_path, fit_path, z, n_p, tile_bytes):
+def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
     return fit_driver.run_fit_driver(
-        sample_path, _WC, fit_path, z, n_p, tile_bytes=tile_bytes)
+        sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
+        tile_bytes=tile_bytes)
 
 
 def build_mpa_fit(
@@ -180,7 +181,7 @@ def build_mpa_fit(
         sample_path, V, z_all.size, q_idx, meta, mesh_xy,
         config.backend.w_dyson_solver)
     _, report = _fit_body(
-        sample_path, fit_path, z_all, n_p, tile_bytes)
+        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
     _fit_fixed_head(
         fit_path, head_resolver, 1j * float(config.ppm.omega_p))
     print_fn(fit_driver.format_cost_report(report))

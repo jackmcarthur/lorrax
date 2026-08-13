@@ -138,8 +138,8 @@ def test_selecting_it_refuses_and_names_the_mode_and_the_next_step():
     msg = str(exc.value)
     assert "mpa" in msg
     assert "the LORRAX GW driver" in msg
-    assert "dynamic q->0 head" in msg
-    assert "shared output/QSGW finalizer" in msg
+    assert "row-sharded Padé fit" in msg
+    assert "adjoint-free near-axis Sigma" in msg
     assert "THEORY_mpa_implementation.md" in msg
 
 
@@ -176,7 +176,7 @@ def test_the_driver_refuses_at_entry_before_it_spends_anything():
 # 3. Exhaustive dispatch — no site inherits an else-branch
 # ---------------------------------------------------------------------------
 
-def test_the_screening_planner_refuses_it_rather_than_planning_two_points():
+def test_the_screening_planner_defers_to_the_named_mpa_model_stage():
     """MPA's W is sampled on the double-parallel grid, not at {0, probe}.
 
     Returning the PPM pair here would be a wrong answer no downstream
@@ -184,9 +184,7 @@ def test_the_screening_planner_refuses_it_rather_than_planning_two_points():
     """
     from gw.screening import screening_requests_for
 
-    with pytest.raises(NotImplementedError) as exc:
-        screening_requests_for(ComputeMode.MPA, config=None)
-    assert "mpa" in str(exc.value)
+    assert screening_requests_for(ComputeMode.MPA, config=None) == []
 
 
 def test_the_screening_planner_is_unmoved_for_the_modes_that_work():

@@ -59,10 +59,12 @@ def test_fit_walk_consumes_wc_not_chi(monkeypatch):
 
     monkeypatch.setattr(model.fit_driver, "run_fit_driver", run)
     got = model._fit_body(
-        "samples.h5", "poles.h5", np.array([0.0j, 1.0j]), 1, None)
+        "samples.h5", "poles.h5", np.array([0.0j, 1.0j]), 1, None,
+        _mesh())
     assert got == ("ledger", "report")
     assert seen["args"][:3] == (
         "samples.h5", model._WC, "poles.h5")
+    assert seen["kwargs"]["mesh_xy"] == _mesh()
 
 
 def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
