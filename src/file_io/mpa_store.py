@@ -2153,13 +2153,17 @@ def write_fit_block_collective(
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
         valid_diag = (1, ledger["n_mu"], int(cols.size))
+        global_pole = (n_p, ledger["n_q"], ledger["n_mu"],
+                       ledger["n_mu"])
+        global_diag = (ledger["n_q"], ledger["n_mu"], ledger["n_mu"])
         io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
-                      valid_shape=valid_pole)
+                      global_shape=global_pole, valid_shape=valid_pole)
         io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
-                      valid_shape=valid_pole)
+                      global_shape=global_pole, valid_shape=valid_pole)
         for key in keys:
             io.write_slab("fit_" + key, diag_block[key],
-                          offset=(iq, 0, lo), valid_shape=valid_diag)
+                          offset=(iq, 0, lo), global_shape=global_diag,
+                          valid_shape=valid_diag)
 
     if process_rank() == 0:
         with _qs().QirrDest(dest, "a") as grp:
