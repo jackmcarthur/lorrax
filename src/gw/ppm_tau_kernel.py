@@ -14,8 +14,9 @@ shared primitive ``common.contract_bands.contract_bands_block_reshard``
 (owner directive 2026-07-28) — this module keeps only the Σ-specific
 channel algebra and the kernel plumbing around it.
 
-The module-level kernel caches (`_sigma_tau_kernel_cache`,
-`_sigma_kij_kernel_cache`) are co-located with the factories that read them.
+The module-level kernel caches are co-located with the factories that read
+them.  In particular, :func:`get_sigma_spatial_kernel` is the one reusable
+``G_k x W_q -> Sigma`` owner; ansatz adapters cache only their G/W synthesis.
 This is load-bearing: ``precompile_sigma`` (the AOT prewarm called from
 ``ppm_pipeline``) must hit the *same* cache dicts as the runtime path, or the
 first per-τ dispatch pays a full compile inside execution.
@@ -38,6 +39,9 @@ from common.jax_compile_cache import ensure_jax_compile_cache
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+_sigma_spatial_kernel_cache: dict[
+    tuple[object, ...], Callable[..., jax.Array]
+] = {}
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
@@ -212,44 +216,32 @@ def _make_project_ri_reduce_scatter(
     )
 
 
-def _get_sigma_kij_kernel(
+def get_sigma_spatial_kernel(
     *,
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
     merged_x: bool = False,
 ) -> Callable[..., jax.Array]:
-    """Return a jit-compatible sigma-kij kernel with device-local FFTs.
+    """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
-    The tail project (ψ* σ ψ → Σ_mn) uses the reduce-scatter variant
-    (_make_project_ri_reduce_scatter) so the emitted σ^τ is sharded
-    (m_X, n_Y) without any downstream reshuffle.  ``merged_x`` selects the
-    projection plan (owner ruling 2026-07-28, default semantics since the
-    same-day owner order): False = two-channel (S_R, S_I) output — the
-    crossing-window path; True = the Laplace plan emitting the single
-    complex X = ψ†σψ (channel-plan doc: _make_project_ri_reduce_scatter).
-    Both are built in every Σ run.
+    This is the extension seam for alternate propagators and screened
+    interactions.  GN-PPM and MPA construct their own ``G_k`` and ``W_q``;
+    this owner performs only the flat-k FFT convolution and band projection.
+    A two-point vertex-corrected W can therefore enter without forking the
+    spatial kernel.  A genuine three-point vertex remains a different
+    contraction and should not be hidden behind this interface.
     """
-
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
     from common.fft_helpers import (
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
-    # The stage-timing flag is part of the cache key: the two variants are
-    # different callables (fused jit vs staged dispatcher) and must not
-    # shadow each other across a flag flip inside one process (tests).
-    # Likewise every factory-time FFI dial (FFT, fused FFT, contract_bands
-    # GEMM — one owner: ffi.ffi_dial_key()): a flip mid-process must rebuild
-    # the kernel.  ``merged_x`` keys the projection plan: BOTH kernels live
-    # in the cache simultaneously in every Σ run (Laplace windows dispatch
-    # the merged one, crossing windows the two-channel one).
     from ffi import ffi_dial_key
-    pipeline_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                    ffi_dial_key(), bool(merged_x))
-    if pipeline_key in _sigma_kij_kernel_cache:
-        return _sigma_kij_kernel_cache[pipeline_key]
-
-    from .wavefunction_bundle import G_FFT7D_SPEC as _G_spec, V_FFT5D_SPEC as _V_spec
-
+    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
+           bool(merged_x))
+    if key in _sigma_spatial_kernel_cache:
+        return _sigma_spatial_kernel_cache[key]
+    from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
+                                      V_FFT5D_SPEC as _V_spec)
     ensure_jax_compile_cache()
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
     use_fused_ffi = _fft_ffi_fused_enabled()
@@ -267,93 +259,20 @@ def _get_sigma_kij_kernel(
         _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
-    from .greens_function_kernel import build_G_tau
+    project = _make_project_ri_reduce_scatter(mesh_xy, merged_x=merged_x)
 
-    _project_ri_rs = _make_project_ri_reduce_scatter(mesh_xy, merged_x=merged_x)
-
-    @partial(jax.jit, donate_argnums=(8,))
-    def _sigma_kij_kernel(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_ref_A, t_node, W_q,
-    ):
-        """Σ_kij = project_rs[ FFT[ G(R) · W(R) / √Nk ] ].  All flat-k.
-
-        Output: the (S_R, S_I) tuple (two-channel plan) or the single
-        complex X = ψ†σψ (merged Laplace plan, ``merged_x=True``).
-
-        W_q is (nq, μ, μ) flat-q — same layout as all other flat-k arrays.
-        ``W_q`` is **donated**: it's built fresh each τ by ``_build_W_t_q``
-        and only consumed here, so XLA can reuse its buffer for the
-        ``V_R = _V_ifftn(W_q)`` output instead of allocating a separate
-        intermediate.  DONATION-AUDIT NOTE (2026-07-28): in PRODUCTION this
-        jit is traced INTO the outer ``_tau_kernel`` jit, where inner-jit
-        donation is inert (donation acts only at top-level dispatch — same
-        house fact as the ζ r-chunk jits, SPEEDUP_SCORECARD.md audit row
-        (d)); there W_t_q is a module-internal temp and buffer reuse is
-        XLA's liveness analysis + the FFI in-place aliases.  The annotation
-        is kept for any future top-level dispatch of this kernel.
-
-        G(t) = build_G_tau(psi, E_A, 1j·t_node, e_ref=E_ref_A, mask=mask_A),
-        i.e. the unified ISDF-basis G builder with pure-imaginary t
-        (real-time evolution).  Output (Σ_ri) emerges (m_X, n_Y)-sharded
-        from the final shard_map.
-        """
-        G_k = build_G_tau(
-            psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
-            e_ref=E_ref_A, mask=mask_A,
-        )
+    @partial(jax.jit, donate_argnums=(2, 3))
+    def spatial(psi_proj_xr, psi_proj_yn, G_k, W_q):
         if use_fused_ffi:
             sigma_k = _gw_conv(G_k, W_q)
         else:
             G_R = _G_ifftn(G_k)
-            V_R = _V_ifftn(W_q)[:, None, :, None, :]  # (nk,1,μ,1,μ) broadcast to G shape
+            V_R = _V_ifftn(W_q)[:, None, :, None, :]
             sigma_k = _G_fftn(G_R * V_R * inv_sqrt_nk)
-        return _project_ri_rs(psi_proj_xr, sigma_k, psi_proj_yn)
-
+        return project(psi_proj_xr, sigma_k, psi_proj_yn)
     if not _stage_timing_enabled():
-        _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel
-        return _sigma_kij_kernel
-
-    # ------------------------------------------------------------------
-    # Stage-split instrumented variant (LORRAX_SIGMA_TAU_TIMING=1 only).
-    #
-    # Same op sequence as ``_sigma_kij_kernel`` above, dispatched as five
-    # cached stage jits so blocking ``timing.section`` sub-rows attribute
-    # the per-τ wall (evidence: AQ 4962c/P=64 HLO module_0912, 2026-07-28
-    # — the 1.51 s/τ was indivisible).  Notes:
-    #   * ``sigma.tau.project_rs`` covers the ψ-projection dots AND their
-    #     psum_scatters together — they live inside one shard_map (the
-    #     two-channel body, or the merged single-chain body when
-    #     ``merged_x``; the crossing family keeps two channels per the
-    #     owner ruling 2026-07-28); a per-op split of dot vs collective
-    #     wait comes from a profiler trace (jax_profile.trace_section
-    #     wraps the first window per branch in ppm_sigma), not from
-    #     restructuring the kernel.
-    #   * DONATION AUDIT (2026-07-28, owner directive with the FFT-FFI
-    #     prototype): each stage jit now donates every operand that is DEAD
-    #     after its call — G_k → G_ifft, W_q → V_ifft, (G_R, V_R) →
-    #     mult_fft, sigma_k → project.  Verified against this dispatcher:
-    #     none of those is referenced again after its consuming stage (the
-    #     ``sec.watch`` block-until-ready runs in the PRODUCING stage's
-    #     section, before the donation), and the ψ/E/mask operands are
-    #     loop-invariant across τ so they are never donated.  This closes
-    #     the staged path's previously-documented "W_q NOT donated here"
-    #     gap and drops the big dead tiles (399 MB G_k / G_R, 100 MB W_q /
-    #     V_R at nb=128/P=64) from the staged peak.  Donation is data
-    #     movement only — stage rows measure the same ops.
-    #   * Stage boundaries force materialization of G_k / G_R / V_R that
-    #     the fused module may keep in fft-native layout, so staged wall
-    #     ≠ fused wall; the rows are for RATIO attribution.
-    #   * LORRAX_FFT_FFI_FUSED=1: the three FFT-adjacent rows collapse into
-    #     ONE row ``sigma.tau.GW_conv_ffi`` (the fused FFT-FFI
-    #     handler does IFFT·multiply·FFT in one call) — A/B against the
-    #     sum G_ifft + V_ifft + GW_mult_fft of the reference table.
-    # Scale-neutral: per-τ host overhead is O(#stages), independent of
-    # n_atoms / N_μ / nk / P and identical on CPU and GPU backends.
-    # ------------------------------------------------------------------
-    _G_build_j = jax.jit(
-        lambda xn, yr, E_A, mask_A, E_ref_A, t_node: build_G_tau(
-            xn, yr, E_A, 1j * t_node, e_ref=E_ref_A, mask=mask_A))
+        _sigma_spatial_kernel_cache[key] = spatial
+        return spatial
     if use_fused_ffi:
         _conv_j = jax.jit(_gw_conv, donate_argnums=(0, 1))
     else:
@@ -362,16 +281,12 @@ def _get_sigma_kij_kernel(
                             donate_argnums=(0,))
         _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),
                               donate_argnums=(0, 1))
-    _project_j = jax.jit(_project_ri_rs, donate_argnums=(1,))
+    _project_j = jax.jit(project, donate_argnums=(1,))
 
-    def _sigma_kij_kernel_staged(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_ref_A, t_node, W_q,
+    def spatial_staged(
+        psi_proj_xr, psi_proj_yn, G_k, W_q,
     ):
-        with timing.section("sigma.tau.G_build") as sec:
-            G_k = _G_build_j(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                             E_ref_A, t_node)
-            sec.watch(G_k)
+        """Diagnostic split of the same spatial operation sequence."""
         if use_fused_ffi:
             with timing.section("sigma.tau.GW_conv_ffi") as sec:
                 sigma_k = _conv_j(G_k, W_q)
@@ -391,8 +306,51 @@ def _get_sigma_kij_kernel(
             sec.watch(out)
         return out
 
-    _sigma_kij_kernel_cache[pipeline_key] = _sigma_kij_kernel_staged
-    return _sigma_kij_kernel_staged
+    _sigma_spatial_kernel_cache[key] = spatial_staged
+    return spatial_staged
+
+
+def _get_sigma_kij_kernel(
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
+) -> Callable[..., jax.Array]:
+    """GN/MPA adapter that builds G and calls the shared spatial kernel."""
+    from ffi import ffi_dial_key
+    key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
+           ffi_dial_key(), bool(merged_x))
+    if key in _sigma_kij_kernel_cache:
+        return _sigma_kij_kernel_cache[key]
+    from .greens_function_kernel import build_G_tau
+    spatial = get_sigma_spatial_kernel(
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x)
+
+    @partial(jax.jit, donate_argnums=(8,))
+    def kernel(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, E_ref_A, t_node, W_q,
+    ):
+        G_k = build_G_tau(
+            psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
+            e_ref=E_ref_A, mask=mask_A)
+        return spatial(psi_proj_xr, psi_proj_yn, G_k, W_q)
+    if not _stage_timing_enabled():
+        _sigma_kij_kernel_cache[key] = kernel
+        return kernel
+    build_g = jax.jit(
+        lambda xn, yr, E, mask, ref, t: build_G_tau(
+            xn, yr, E, 1j * t, e_ref=ref, mask=mask))
+
+    def staged(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, E_ref_A, t_node, W_q,
+    ):
+        with timing.section("sigma.tau.G_build") as sec:
+            G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_A,
+                          E_ref_A, t_node)
+            sec.watch(G_k)
+        return spatial(psi_proj_xr, psi_proj_yn, G_k, W_q)
+
+    _sigma_kij_kernel_cache[key] = staged
+    return staged
 
 
 def _get_sigma_tau_kernel(
