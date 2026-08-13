@@ -84,7 +84,7 @@ nav:
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
-      - MPA method guide (start here for multipole W): mpa_method_guide.md
+      - MPA frequency pipeline: theory/mpa-frequency-pipeline.md
       - MPA compute mode (how the mode was declared): theory/THEORY_mpa_implementation.md
   - Architecture:
       - Design decisions: architecture/decisions.md
