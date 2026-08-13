@@ -149,8 +149,12 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     summaries = []
     for p, pole in enumerate(_poles()):
         summaries.extend(SW.summarize_sigma_poles(
-            (pole,), _branches(), regularization_width_ry=0.2,
+            pole[None, ...], _branches(), regularization_width_ry=0.2,
             edge_factor=1.5, pole_offset=p))
+    batched = SW.summarize_sigma_poles(
+        jnp.stack(_poles()), _branches(), regularization_width_ry=0.2,
+        edge_factor=1.5)
+    assert batched == tuple(summaries)
     streamed, streamed_report = SW.build_shared_sigma_windows(
         None, _branches(), regularization_width_ry=0.2,
         edge_factor=1.5, pole_summaries=summaries)

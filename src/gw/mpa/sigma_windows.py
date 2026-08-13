@@ -66,6 +66,43 @@ def _stats(Omega, bounds):
     return tuple(map(float, (lo_a, hi_a, lo_g, hi_g)))
 
 
+@jax.jit
+def _stats_all_poles(Omega, bounds):
+    """Per-pole selector bounds without iterating a distributed array."""
+    a, gamma = jnp.real(Omega), -jnp.imag(Omega)
+    b = jnp.asarray(bounds)
+    mask = ((a > b[0]) & (a <= b[1])
+            & (gamma >= b[2]) & (gamma > b[3])
+            & (gamma < b[4]) & (gamma <= b[5]))
+    axes = tuple(range(1, Omega.ndim))
+    return (
+        jnp.sum(mask, axis=axes, dtype=jnp.int64),
+        jnp.min(jnp.where(mask, a, jnp.inf), axis=axes),
+        jnp.max(jnp.where(mask, a, -jnp.inf), axis=axes),
+        jnp.min(jnp.where(mask, gamma, jnp.inf), axis=axes),
+        jnp.max(jnp.where(mask, gamma, -jnp.inf), axis=axes),
+    )
+
+
+@jax.jit
+def _unsupported_pole_count(Omega):
+    a, gamma = jnp.real(Omega), -jnp.imag(Omega)
+    live = jnp.abs(Omega) > np.finfo(np.float64).tiny
+    return jnp.sum(live & ((a <= 0.0) | (gamma < 0.0)), dtype=jnp.int64)
+
+
+def _stats_by_pole(Omega, bounds):
+    arrays = tuple(np.asarray(x) for x in jax.device_get(
+        _stats_all_poles(Omega, bounds)))
+    out = []
+    for i in range(int(Omega.shape[0])):
+        if not int(arrays[0][i]):
+            out.append(None)
+        else:
+            out.append(tuple(float(x[i]) for x in arrays[1:]))
+    return tuple(out)
+
+
 def _rows(Omega_poles, bounds, phase_real):
     indices, selectors, phases, stats = [], [], [], []
     for pole, Omega in enumerate(Omega_poles):
@@ -110,12 +147,19 @@ def summarize_sigma_poles(
     """Reduce one resident pole batch to the scalar planning evidence."""
     _omega_max, _xi, _hgl_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
-    out = []
-    for local, Omega in enumerate(Omega_poles):
-        out.append((int(pole_offset) + local,
-                    {name: _stats(Omega, bounds)
-                     for name, bounds in selectors.items()}))
-    return tuple(out)
+    bad = int(jax.device_get(_unsupported_pole_count(Omega_poles)))
+    if bad:
+        raise ValueError(
+            f"MPA fit contains {bad} unsupported live poles with "
+            "Re Omega <= 0 or Im Omega > 0")
+    evidence = {
+        name: _stats_by_pole(Omega_poles, bounds)
+        for name, bounds in selectors.items()
+    }
+    return tuple(
+        (int(pole_offset) + local,
+         {name: values[local] for name, values in evidence.items()})
+        for local in range(int(Omega_poles.shape[0])))
 
 
 def _rows_from_summaries(summaries, name, bounds, phase_real):
