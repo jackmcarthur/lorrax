@@ -66,10 +66,19 @@ __all__ = [
 #: zero condition number is a perfectly conditioned solve.
 _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
 
+# One production pole fit.  These are the settings that made the accepted
+# Si store: the fixed-support Loewner pencil and the fully JAX-resident QR
+# root finder.  The Padé algebra remains reachable directly through
+# ``pade_fit`` as a diagnostic red twin; the disk driver must not silently
+# choose between two numerical methods.
+_FIT_SOLVE = "loewner"
+_FIT_AFFINE = True
+_FIT_EIG = "jax_qr"
+
 
 @functools.lru_cache(maxsize=None)
 def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
-    """One compiled local-row Padé fit; columns remain replicated."""
+    """One compiled local-row Loewner fit; columns remain replicated."""
     import jax
     import jax.numpy as jnp
     from jax import lax
@@ -89,7 +98,8 @@ def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
         n_rows, n_cols, n_omega = samples.shape
         tile = samples.reshape(n_rows * n_cols, n_omega)
         Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
-            tile, z, n, guards=guards, rcond=rcond)
+            tile, z, n, guards=guards, rcond=rcond,
+            solve=_FIT_SOLVE, affine=_FIT_AFFINE, eig=_FIT_EIG)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
@@ -177,7 +187,7 @@ def fit_one_block(
         and the per-stage seconds.  :func:`run_fit_driver` sums these
         into the run's cost report.
 
-    The Padé kernel returns its condition number, backward error and sample
+    The Loewner kernel returns its condition number, backward error and sample
     residual from the same solve; diagnostics therefore add no second fit.
 
     """
@@ -334,6 +344,14 @@ def run_fit_driver(
             "the failure that stamp exists to catch.")
 
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
+    fit_provenance = dict(provenance or {})
+    fit_provenance.update({
+        "solve_mode": _FIT_SOLVE,
+        "solve_affine": _FIT_AFFINE,
+        "solve_rcond": rcond,
+        "eig_mode": _FIT_EIG,
+        "fit_fused": True,
+    })
     mpa_store.allocate_fit_store_collective(
         fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
         diagnostic_keys=_DIAGNOSTIC_KEYS,
@@ -342,13 +360,17 @@ def run_fit_driver(
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
         unfold_tables=mpa_store.read_w_tables(w_src, w_name),
-        provenance=provenance)
+        provenance=fit_provenance)
 
     report = {
         "n_q": int(n_q),
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
+        "solve": _FIT_SOLVE,
+        "affine": _FIT_AFFINE,
+        "eig": _FIT_EIG,
+        "rcond": rcond,
         "n_cols_budget": int(plan["n_cols"]),
         "n_blocks_per_q": int(plan["n_blocks"]),
         "tile_bytes": int(plan["tile_bytes"]),
@@ -439,6 +461,8 @@ def format_cost_report(report):
         "-" * 60,
         f"  geometry        n_q={r['n_q']} N_mu={r['n_mu']} "
         f"n_omega={r['n_omega']} n_p={r['n_p']}",
+        f"  solve           {r['solve']}, rcond={r['rcond']:.1e}",
+        f"  eig             {r['eig']}, fused=yes",
         f"  walk            {r['blocks_walked']} blocks "
         f"({r['n_blocks_per_q']} per q x {r['n_q']} q), "
         f"{r['n_cols_budget']} columns per block",
@@ -451,7 +475,7 @@ def format_cost_report(report):
         f"{r['diagnostic_dispatches']} diagnostic, vmapped",
         f"  full fits       {r['full_fits']} "
         f"(1 per element; diagnostics reuse the same solve)",
-        f"  Pade solves     {r['pade_solves']} "
+        f"  pole solves     {r['pade_solves']} "
         f"(1 per element)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "

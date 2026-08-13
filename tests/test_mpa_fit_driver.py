@@ -716,7 +716,7 @@ def test_cost_report_text_states_what_the_plan_demands(fitted, capsys):
     """Printed once at finalize, and it says the load-bearing numbers."""
     text = fitted["text"]
     for token in ("logical outputs", "dispatches", "full fits",
-                  "Pade solves", "bytes read", "peak block", "seconds",
+                  "pole solves", "bytes read", "peak block", "seconds",
                   "columns read", "elements fitted"):
         assert token in text, f"cost report omits {token!r}"
     assert str(fitted["report"]["logical_outputs"]) in text

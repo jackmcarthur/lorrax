@@ -391,15 +391,17 @@ def test_noise_robustness_bounded_pole_movement(capsys):
 
 
 def test_diagnostics_conditioning_and_backward_error():
-    """A correct solve of an ill-conditioned system reports BOTH facts."""
+    """The discarded Padé solve reports its own conditioning cliff."""
 
     n_p = 8
     z = _grid(n_p, omega_m=4.0)
     Omega_t, B_t = _si_like_poles(n_p)
     W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
 
-    cnd = diagnostics.solve_conditioning(W, z, n_p)
-    fit_diag = pade_fit.fit_mpa_poles(W, z, n_p)[2]
+    cnd = diagnostics.solve_conditioning(
+        W, z, n_p, solve="pade", affine=False)
+    fit_diag = pade_fit.fit_mpa_poles(
+        W, z, n_p, solve="pade", affine=False)[2]
     # Tiny backward error: the linear algebra was done right.
     assert float(cnd["backward_error"]) < 1.0e-12
     np.testing.assert_allclose(
