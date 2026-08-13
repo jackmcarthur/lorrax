@@ -51,7 +51,7 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
                                 jnp.asarray([0.5 + 0j]))
 
     monkeypatch.setattr(SW.minimax, "fit_damped_reciprocal", fake_fit)
-    monkeypatch.setattr(SW, "damped_line_rule", fake_damped)
+    monkeypatch.setattr(SW, "damped_rectangle_rule", fake_damped)
     monkeypatch.setattr(SW, "solve_phase_minimax_bandwidth",
                         lambda *_a, **_k: FakeHGL())
 
@@ -69,7 +69,7 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
 
     single = next(row for row in plan if row.window.name == "single")
     assert single.pole_indices.tolist() == [0, 1, 0, 1]
-    assert single.phase_real.tolist() == [True, True, False, False]
+    assert single.phase_real.tolist() == [False, False, False, False]
     exact = [row for row in plan if row.window.name == "core"]
     assert all(not np.any(row.phase_real) for row in exact)
     hgl = [row for row in plan if row.window.name == "core_hgl"]
@@ -104,3 +104,15 @@ def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
         assert "crosses zero" in str(exc)
     else:
         raise AssertionError("a non-sign-definite rectangle was accepted")
+
+
+def test_live_negative_real_pole_refuses():
+    poles = (jnp.asarray([[[-0.2 - 0.1j]]]),)
+    try:
+        SW.build_shared_sigma_windows(
+            poles, _branches(), regularization_width_ry=0.2,
+            edge_factor=1.5)
+    except ValueError as exc:
+        assert "Re Omega <= 0" in str(exc)
+    else:
+        raise AssertionError("an unsupported negative-real pole was omitted")

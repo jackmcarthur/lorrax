@@ -716,7 +716,6 @@ def write_w_slab_collective(
     zero updates the small readiness ledger.  A failed data write therefore
     leaves the slab explicitly unready.
     """
-    import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from common.collectives import barrier, process_rank
@@ -727,9 +726,13 @@ def write_w_slab_collective(
         raise ValueError(
             "write_w_slab_collective: global_shape must be "
             "(n_omega,n_q,n_mu,n_mu)")
-    W4 = jax.device_put(
-        W_q_munu[None, ...],
-        NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    expected = NamedSharding(mesh_xy, P(None, "x", "y"))
+    if getattr(W_q_munu, "sharding", None) != expected:
+        raise ValueError(
+            "write_w_slab_collective requires W on P(None,'x','y'); "
+            "the producer must return the native SlabIO layout rather "
+            "than resharding a bulk tensor at the writer seam")
+    W4 = W_q_munu[None, ...]
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         io.write_slab(
             name, W4, offset=(int(i_omega), 0, 0, 0),
@@ -1827,6 +1830,14 @@ def fit_completion_ledger(src, *, mode="r"):
         cond = np.asarray(led["block_condition_max"][()], dtype=np.float64)
         berr = np.asarray(led["block_backward_error_max"][()],
                           dtype=np.float64)
+        certification = {
+            str(key)[len("mpa_cert_"):]: grp.attrs[key]
+            for key in grp.attrs if str(key).startswith("mpa_cert_")
+        }
+        provenance = {
+            str(key)[len("prov_"):]: grp.attrs[key]
+            for key in grp.attrs if str(key).startswith("prov_")
+        }
         return {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
@@ -1836,6 +1847,10 @@ def fit_completion_ledger(src, *, mode="r"):
             "q_storage": qs.qirr_attr_str(
                 grp, "mpa_fit_q_storage") or "full",
             "table_hash": qs.qirr_attr_str(grp, "mpa_fit_table_hash"),
+            "w_grid_hash": qs.qirr_attr_str(grp, "mpa_fit_w_grid_hash"),
+            "w_table_hash": qs.qirr_attr_str(grp, "mpa_fit_w_table_hash"),
+            "w_centroid_hash": qs.qirr_attr_str(
+                grp, "mpa_fit_w_centroid_hash"),
             "energy_unit": qs.qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
@@ -1848,7 +1863,48 @@ def fit_completion_ledger(src, *, mode="r"):
             "condition_max": float(cond.max()) if cond.size else None,
             "backward_error_max": float(berr.max()) if berr.size else None,
             "finalized_utc": qs.qirr_attr_str(grp, "mpa_fit_finalized_utc"),
+            "certification": certification,
+            "provenance": provenance,
         }
+
+
+def validate_fit_store(src, *, expected_identity=None, mode="r"):
+    """Validate the finalized fit contract before Sigma reads pole bytes.
+
+    ``expected_identity`` may name ``w_grid_hash``, ``w_table_hash`` and
+    ``w_centroid_hash`` from the screening object currently in use.  The
+    fit's own declared ``*_max_allowed`` certification thresholds are always
+    enforced against its observed maxima.
+    """
+    ledger = fit_completion_ledger(src, mode=mode)
+    if not ledger["complete"]:
+        raise ValueError("MPA Sigma requires a finalized pole fit store")
+    if ledger["energy_unit"] not in FIT_ENERGY_UNITS:
+        raise ValueError("MPA fit store does not declare a supported unit")
+    for key, want in (expected_identity or {}).items():
+        if key not in ("w_grid_hash", "w_table_hash", "w_centroid_hash"):
+            raise KeyError(f"unknown MPA fit identity field {key!r}")
+        got = ledger[key]
+        if got is None or str(got) != str(want):
+            raise ValueError(
+                f"MPA fit identity mismatch for {key}: got {got!r}, "
+                f"expected {want!r}")
+    observed = {
+        "condition_max": ledger["condition_max"],
+        "backward_error_max": ledger["backward_error_max"],
+    }
+    for key, allowed in ledger["certification"].items():
+        if not str(key).endswith("_allowed"):
+            continue
+        metric = str(key)[:-len("_allowed")]
+        if metric not in observed:
+            continue
+        got = observed[metric]
+        if got is None or float(got) > float(allowed):
+            raise ValueError(
+                f"MPA fit failed its stored certification: {metric}="
+                f"{got!r} exceeds {allowed!r}")
+    return ledger
 
 
 def finalize_fit_store(dest, *, certification=None, mode="a"):
@@ -2106,9 +2162,10 @@ def _finish_pole_read(
     return Omega, Bp
 
 
-def read_pole_slices(
+def read_poles(
     src,
     *,
+    pole_slice=None,
     mesh_xy=None,
     unfold=False,
     return_sharded=False,
@@ -2116,14 +2173,32 @@ def read_pole_slices(
     allow_partial=False,
     mode="r",
 ):
-    """Read the complete pole axis with two collective SlabIO reads."""
+    """Read one contiguous pole range with two collective SlabIO reads.
+
+    The leading pole axis is always retained.  ``pole_slice=None`` reads it
+    completely; an integer reads a length-one range.  This is the sole pole
+    tensor reader—the singular/plural compatibility wrappers below add no
+    I/O policy of their own.
+    """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
-        _refuse_unfinalized(grp, ledger, allow_partial, "read_pole_slices")
+        _refuse_unfinalized(grp, ledger, allow_partial, "read_poles")
+        if pole_slice is None:
+            lo, hi = 0, ledger["n_p"]
+        elif isinstance(pole_slice, (int, np.integer)):
+            lo, hi = int(pole_slice), int(pole_slice) + 1
+        else:
+            lo, hi, step = pole_slice.indices(ledger["n_p"])
+            if step != 1:
+                raise ValueError("read_poles requires a contiguous pole slice")
+        if not (0 <= lo < hi <= ledger["n_p"]):
+            raise IndexError(
+                f"read_poles: pole range [{lo},{hi}) is outside "
+                f"[0,{ledger['n_p']})")
         if mesh_xy is None:
-            Omega = np.asarray(grp["Omega_p"])
-            Bp = np.asarray(grp["B_p"])
+            Omega = np.asarray(grp["Omega_p"][lo:hi])
+            Bp = np.asarray(grp["B_p"][lo:hi])
 
     if mesh_xy is not None:
         from jax.sharding import PartitionSpec as P
@@ -2131,30 +2206,25 @@ def read_pole_slices(
         from file_io.slab_io import SlabIO
 
         n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
-        shape = (ledger["n_p"], ledger["n_q"], n_pad, n_pad)
+        shape = (hi - lo, ledger["n_q"], n_pad, n_pad)
         with SlabIO(src, mode="r", mesh=mesh_xy) as io:
             Omega = io.read_slab(
-                "Omega_p", shape=shape, offset=(0, 0, 0, 0),
+                "Omega_p", shape=shape, offset=(lo, 0, 0, 0),
                 partition_spec=P(None, None, "x", "y"))
             Bp = io.read_slab(
-                "B_p", shape=shape, offset=(0, 0, 0, 0),
+                "B_p", shape=shape, offset=(lo, 0, 0, 0),
                 partition_spec=P(None, None, "x", "y"))
     return _finish_pole_read(
         src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
         return_sharded=return_sharded, to_unit=to_unit)
 
 
-def read_pole_slice(
-    src,
-    p,
-    *,
-    mesh_xy=None,
-    unfold=False,
-    return_sharded=False,
-    to_unit=None,
-    allow_partial=False,
-    mode="r",
-):
+def read_pole_slices(src, **kwargs):
+    """Compatibility name for :func:`read_poles` with the full axis."""
+    return read_poles(src, **kwargs)
+
+
+def read_pole_slice(src, p, **kwargs):
     """Read one leading pole slab; production reads stay sharded via SlabIO.
 
     ``to_unit='Ry'`` performs the fit-axis conversion once at this I/O seam.
@@ -2162,34 +2232,5 @@ def read_pole_slice(
     pair-transpose TRS rule, required because complex-frequency W is not
     Hermitian.
     """
-    qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
-        ledger = fit_completion_ledger(grp)
-        _refuse_unfinalized(grp, ledger, allow_partial,
-                            f"read_pole_slice(p={p})")
-        ip = int(p)
-        if not 0 <= ip < ledger["n_p"]:
-            raise IndexError(
-                f"read_pole_slice: p={ip} is outside [0,{ledger['n_p']})")
-        if mesh_xy is None:
-            Omega = np.asarray(grp["Omega_p"][ip])
-            Bp = np.asarray(grp["B_p"][ip])
-
-    if mesh_xy is not None:
-        from jax.sharding import PartitionSpec as P
-        from runtime.padding import padded_mu_extent
-        from file_io.slab_io import SlabIO
-
-        n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
-        shape = (1, ledger["n_q"], n_pad, n_pad)
-        with SlabIO(src, mode="r", mesh=mesh_xy) as io:
-            Omega = io.read_slab(
-                "Omega_p", shape=shape, offset=(ip, 0, 0, 0),
-                partition_spec=P(None, None, "x", "y"))[0]
-            Bp = io.read_slab(
-                "B_p", shape=shape, offset=(ip, 0, 0, 0),
-                partition_spec=P(None, None, "x", "y"))[0]
-
-    return _finish_pole_read(
-        src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
-        return_sharded=return_sharded, to_unit=to_unit)
+    Omega, Bp = read_poles(src, pole_slice=int(p), **kwargs)
+    return Omega[0], Bp[0]

@@ -399,6 +399,74 @@ def damped_line_rule(
     }
 
 
+def damped_rectangle_rule(
+    gamma_min,
+    gamma_max,
+    freq_max,
+    *,
+    rel_tol=DEFAULT_REL_TOL,
+    wavelengths_per_panel=DEFAULT_WAVELENGTHS_PER_PANEL,
+    max_order=256,
+):
+    r"""Positive real-time rule for a lower-half-plane rectangle.
+
+    The rule approximates the causal Laplace identity uniformly for
+    ``|Re d| <= freq_max`` and
+    ``gamma_min <= -Im d <= gamma_max``.  Truncation is controlled by the
+    weakest damping, while each Bernstein-ellipse panel bound uses the
+    largest imaginary excursion.  This is the width-aware counterpart of
+    :func:`damped_line_rule`; using a one-line rule at ``gamma_min`` for
+    wider poles has no such panel-error guarantee.
+    """
+    g0, g1 = map(float, (gamma_min, gamma_max))
+    f = float(freq_max)
+    tol = float(rel_tol)
+    if not (0.0 < g0 <= g1 < np.inf):
+        raise ValueError(
+            "gamma bounds must satisfy 0 < gamma_min <= gamma_max")
+    if not (0.0 < f < np.inf) or not (0.0 < tol < 1.0):
+        raise ValueError("freq_max must be positive and rel_tol in (0,1)")
+
+    t_max = np.log(2.0 / tol) / g0
+    panel_target = float(wavelengths_per_panel) * 2.0 * np.pi / f
+    n_panels = max(1, int(np.ceil(t_max / panel_target)))
+    width = t_max / n_panels
+    half_bandwidth = (f + g1) * width / 4.0
+    eps_panel = 0.5 * (tol / g0) / n_panels
+    nodes, weights, orders = [], [], []
+    for panel in range(n_panels):
+        left = panel * width
+        envelope = np.exp(-g0 * left)
+        order = int(np.ceil(half_bandwidth)) + 1
+        while order <= int(max_order) and _gauss_legendre_panel_bound(
+                order, half_bandwidth, width, envelope) > eps_panel:
+            order += 1
+        if order > int(max_order):
+            raise ValueError(
+                f"damped rectangle panel {panel} needs order above "
+                f"max_order={max_order}")
+        x, w = np.polynomial.legendre.leggauss(order)
+        nodes.append(left + 0.5 * width * (x + 1.0))
+        weights.append(0.5 * width * w)
+        orders.append(order)
+    t = np.concatenate(nodes).astype(np.float64)
+    h = np.concatenate(weights).astype(np.float64)
+    return {
+        "t": t,
+        "h": h,
+        "n_nodes": int(t.size),
+        "n_panels": int(n_panels),
+        "orders": tuple(orders),
+        "t_max": float(t_max),
+        "panel_width": float(width),
+        "gamma_min": g0,
+        "gamma_max": g1,
+        "freq_max": f,
+        "rel_tol": tol,
+        "kappa0": float(g0 * np.sum(h * np.exp(-g0 * t))),
+    }
+
+
 def damped_line_projection(rule, z):
     """The per-point scalar weights ``w_l(z) = -2 h_l e^{i z t_l}``.
 

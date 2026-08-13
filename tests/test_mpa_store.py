@@ -280,13 +280,16 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         tmpdir_path, "W", mesh_xy=mesh, n_omega=1,
         n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables, omega=omega,
         sampling=sampling, closure_verdict=verdict)
-    W = _w_omega(1, _N_Q_IBZ, n_mu)[0]
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    W_host = _w_omega(1, _N_Q_IBZ, n_mu)[0]
+    W = jax.device_put(W_host, NamedSharding(mesh, P(None, "x", "y")))
     assert MS.write_w_slab_collective(
         tmpdir_path, "W", 0, W, mesh_xy=mesh,
         global_shape=shape) == 1
 
     got, header = MS.read_w_slab(tmpdir_path, "W", 0)
-    np.testing.assert_array_equal(got, W)
+    np.testing.assert_array_equal(got, W_host)
     assert header["data_ready"].tolist() == [True]
     assert [call[0] for call in calls] == [
         "open", "create", "close", "open", "write", "close"]
@@ -987,6 +990,34 @@ def test_complete_pole_axis_uses_the_same_read_policy(tmpdir_path):
     got_Omega, got_Bp = MS.read_pole_slices(tmpdir_path)
     np.testing.assert_array_equal(got_Omega, Omega)
     np.testing.assert_array_equal(got_Bp, Bp)
+
+
+def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
+        tmpdir_path):
+    MS.allocate_fit_store(
+        tmpdir_path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
+        grid_hash="grid", table_hash="table", centroid_hash="centroids",
+        provenance={"solver": "unit-test"})
+    Om = np.full((1, 2, 2), 0.7 - 0.1j)
+    Bp = np.ones_like(Om)
+    diag = {"condition": np.full((2, 2), 3.0),
+            "backward_error": np.full((2, 2), 2.0e-8)}
+    MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
+    ledger = MS.finalize_fit_store(
+        tmpdir_path, certification={
+            "condition_max_allowed": 4.0,
+            "backward_error_max_allowed": 1.0e-7,
+        })
+    assert ledger["w_grid_hash"] == "grid"
+    assert ledger["w_table_hash"] == "table"
+    assert ledger["w_centroid_hash"] == "centroids"
+    assert ledger["provenance"]["solver"] == "unit-test"
+    MS.validate_fit_store(tmpdir_path, expected_identity={
+        "w_grid_hash": "grid", "w_table_hash": "table",
+        "w_centroid_hash": "centroids"})
+    with pytest.raises(ValueError, match="identity mismatch"):
+        MS.validate_fit_store(
+            tmpdir_path, expected_identity={"w_grid_hash": "wrong"})
 
 
 def test_an_unfinalized_store_is_readable_only_through_the_announced_door(

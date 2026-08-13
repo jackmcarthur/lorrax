@@ -8,7 +8,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
-from file_io.mpa_store import read_pole_slices
+from file_io.mpa_store import read_poles, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -56,10 +56,12 @@ def integrate_sigma_windows(
 ):
     """Compute ``Sigma_c(omega)`` from sharded ``(Omega_p, B_p)`` fields.
 
-    Four poles are stacked at a time by default to bound HBM.  The grouping is
-    purely a memory schedule: every window selects poles from their actual
-    complex frequency, and a rule spanning two batches is evaluated twice.
-    Only one ``W(t)``, ``G(t)``, and ``Sigma(t)`` tile exists per dispatch.
+    Four resident poles are consumed at a time by default.  This bounds the
+    transient contraction operand, not the fitted-pole residency: the public
+    MPA mode remains refused until its driver streams these ranges from
+    :func:`file_io.mpa_store.read_poles`.  The grouping is purely a memory
+    schedule; every window selects poles by actual complex frequency.  Only
+    one ``W(t)``, ``G(t)``, and ``Sigma(t)`` tile exists per dispatch.
     """
     if not plan:
         raise ValueError("MPA Sigma needs pole fields and a nonempty plan")
@@ -137,8 +139,9 @@ def _branches(wfns, omega, efermi_ry):
     occupied = wfns.occ[:, wfns.slices.full] > 0.5
     # Do not clip these distances at zero.  In a small-gap or inverted
     # system an unoccupied state may sit below E_F (or an occupied state
-    # above it); the occupation chooses the branch and the window planner
-    # decides from the actual denominator whether it is crossing.
+    # above it); occupation still chooses the band sum.  The current internal
+    # planner refuses a nominally sign-definite cell that then crosses zero.
+    # Public MPA remains disabled until that cell is split and rerouted.
     return _iter_branches(
         omega_pos=omega[idx_pos], idx_pos=idx_pos,
         omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
@@ -161,14 +164,19 @@ def compute_sigma_c_mpa_omega_grid(
     hgl_target_error=1.0e-6,
     hgl_max_nodes=200,
     pole_batch_size=4,
+    fit_identity=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
     Pole tensors are read collectively in their native sharding through
-    :mod:`file_io.mpa_store`; no full ``(p,q,mu,mu)`` host copy exists.
+    :mod:`file_io.mpa_store`; no full ``(p,q,mu,mu)`` host copy exists.  This
+    internal entry point still keeps the complete pole axis device-resident;
+    production dispatch is intentionally refused until it drives the range
+    reader batch by batch.
     """
-    Omega, B = read_pole_slices(
+    validate_fit_store(fit_src, expected_identity=fit_identity)
+    Omega, B = read_poles(
         fit_src, mesh_xy=mesh_xy, unfold=True, return_sharded=True,
         to_unit="Ry")
     branches = _branches(wfns, omega_grid_ry, efermi_ry)

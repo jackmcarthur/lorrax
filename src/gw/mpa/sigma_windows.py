@@ -17,7 +17,7 @@ import numpy as np
 
 import minimax
 
-from gw.mpa.evaluator import damped_line_rule
+from gw.mpa.evaluator import damped_rectangle_rule
 from gw.minimax_screening import MinimaxNodes, solve_phase_minimax_bandwidth
 from gw.ppm_windows import (_SigmaBranch, _SigmaWindow,
                             crossing_regularization_floor)
@@ -48,17 +48,19 @@ def _stats(Omega, bounds):
     mask = ((a > b[0]) & (a <= b[1])
             & (gamma >= b[2]) & (gamma > b[3])
             & (gamma < b[4]) & (gamma <= b[5]))
+    live = jnp.abs(Omega) > np.finfo(np.float64).tiny
     count, lo_a, hi_a, lo_g, hi_g, bad = jax.device_get((
         jnp.sum(mask, dtype=jnp.int64),
         jnp.min(jnp.where(mask, a, jnp.inf)),
         jnp.max(jnp.where(mask, a, -jnp.inf)),
         jnp.min(jnp.where(mask, gamma, jnp.inf)),
         jnp.max(jnp.where(mask, gamma, -jnp.inf)),
-        jnp.sum((a > 0.0) & (gamma < 0.0), dtype=jnp.int64),
+        jnp.sum(live & ((a <= 0.0) | (gamma < 0.0)), dtype=jnp.int64),
     ))
     if int(bad):
         raise ValueError(
-            f"MPA fit contains {int(bad)} live upper-half-plane poles")
+            f"MPA fit contains {int(bad)} unsupported live poles with "
+            "Re Omega <= 0 or Im Omega > 0")
     if not int(count):
         return None
     return tuple(map(float, (lo_a, hi_a, lo_g, hi_g)))
@@ -139,11 +141,12 @@ def build_shared_sigma_windows(
 ):
     """Build the complete MPA frequency plan from actual pole bounds.
 
-    ``Gamma < xi`` uses the accepted real-pole HGL functional in the core
-    and ``Re Omega`` on its sign-definite sides.  ``Gamma >= xi`` retains the
-    fitted complex pole: a damped real-time core and rotated-Laplace sides.
-    One fitted sign-definite dictionary is shared by all widths and poles in
-    a physical class; memory batching is left to the executor.
+    ``Gamma < xi`` uses the accepted real-pole HGL functional only in its
+    crossing core.  Every sign-definite side retains exact fitted ``Gamma``.
+    ``Gamma >= xi`` also retains the complex pole, using a width-certified
+    damped real-time core and rotated-Laplace sides.  One sign-definite
+    dictionary is shared by all widths and poles in a physical class; memory
+    batching is left to the executor.
     """
     poles = tuple(Omega_poles)
     if not poles:
@@ -165,8 +168,11 @@ def build_shared_sigma_windows(
     # Deep selectors are open at their lower a edge.
     selectors["wide_deep"][0] = omega_max
     selectors["narrow_deep"][0] = hgl_edge
+    # Every sign-definite route retains the fitted complex pole.  Replacing
+    # Gamma by zero is the HGL core's explicit approximation, not a property
+    # of every pole below xi.
     selected = {
-        name: _rows(poles, bounds, name.startswith("narrow"))
+        name: _rows(poles, bounds, False)
         for name, bounds in selectors.items()
     }
 
@@ -251,8 +257,9 @@ def build_shared_sigma_windows(
                 if eb is not None:
                     f_max = max(f_max, omega_max + max(omega_max - eb[0], 0.0)
                                 + a_span)
-            rule = damped_line_rule(gamma_min, f_max,
-                                    rel_tol=target_error)
+            gamma_max = max(row[3] for row in stats)
+            rule = damped_rectangle_rule(
+                gamma_min, gamma_max, f_max, rel_tol=target_error)
             exact_nodes = MinimaxNodes(
                 t=jnp.asarray(rule["t"], dtype=jnp.complex128),
                 alpha=jnp.asarray(-1j * rule["h"], dtype=jnp.complex128))
@@ -267,7 +274,8 @@ def build_shared_sigma_windows(
                         _branch.omega_idx, idx, bounds, phase))
 
         # The near-axis core is the existing HGL service, not an imitation.
-        idx, bounds, phase, _stats_rows = selected["narrow_shallow"]
+        idx, bounds, _phase, _stats_rows = selected["narrow_shallow"]
+        phase = np.ones(idx.size, dtype=bool)
         if idx.size:
             q = solve_phase_minimax_bandwidth(
                 max(2.0 * hgl_edge / xi, 1e-8),

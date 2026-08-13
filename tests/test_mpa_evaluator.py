@@ -79,6 +79,19 @@ def _rule_error(rule, z_values, delta):
     return worst
 
 
+def test_damped_rectangle_rule_covers_every_declared_width():
+    rule = evaluator.damped_rectangle_rule(
+        0.2, 1.1, 4.0, rel_tol=1.0e-5)
+    u = np.linspace(-4.0, 4.0, 129)
+    gamma = np.linspace(0.2, 1.1, 11)
+    d = u[None, :] - 1j * gamma[:, None]
+    got = 1j * np.sum(
+        rule["h"][None, None, :]
+        * np.exp(-1j * d[:, :, None] * rule["t"][None, None, :]),
+        axis=-1)
+    assert np.max(np.abs(1.0 - d * got)) < 1.0e-5
+
+
 # ---------------------------------------------------------------------------
 # 1. The kernel
 # ---------------------------------------------------------------------------
