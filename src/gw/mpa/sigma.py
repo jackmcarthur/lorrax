@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+from file_io.mpa_store import read_pole_slices
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+from gw.ppm_windows import _iter_branches
+
+from .sigma_windows import build_shared_sigma_windows
 
 
 def _batch_rows(row, batch):
@@ -40,15 +42,10 @@ def execution_census(plan, n_poles, pole_batch_size=4):
     return {"n_sweeps": sweeps, "n_tau": nodes}
 
 
-@lru_cache(maxsize=8)
-def _stack_on_device(sharding):
-    out = NamedSharding(sharding.mesh, P(None, None, "x", "y"))
-    return jax.jit(lambda *xs: jnp.stack(xs), out_shardings=out)
-
-
 def integrate_sigma_windows(
     wfns,
-    pole_fields,
+    Omega_poles,
+    B_poles,
     plan,
     omega_grid_ry,
     meta,
@@ -64,11 +61,11 @@ def integrate_sigma_windows(
     complex frequency, and a rule spanning two batches is evaluated twice.
     Only one ``W(t)``, ``G(t)``, and ``Sigma(t)`` tile exists per dispatch.
     """
-    fields = tuple(pole_fields)
-    if not fields or not plan:
+    if not plan:
         raise ValueError("MPA Sigma needs pole fields and a nonempty plan")
-    if any(len(pair) != 2 for pair in fields):
-        raise ValueError("pole_fields entries must be (Omega_p, B_p) pairs")
+    if (Omega_poles.ndim != 4 or B_poles.shape != Omega_poles.shape
+            or not int(Omega_poles.shape[0])):
+        raise ValueError("Omega_poles and B_poles must share (p,q,mu,mu)")
     batch_size = int(pole_batch_size)
     if batch_size < 1:
         raise ValueError("pole_batch_size must be positive")
@@ -93,12 +90,10 @@ def integrate_sigma_windows(
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
-    for lo in range(0, len(fields), batch_size):
-        batch = tuple(range(lo, min(lo + batch_size, len(fields))))
-        Omega = _stack_on_device(fields[0][0].sharding)(
-            *(fields[p][0] for p in batch))
-        B = _stack_on_device(fields[0][1].sharding)(
-            *(fields[p][1] for p in batch))
+    n_poles = int(Omega_poles.shape[0])
+    for lo in range(0, n_poles, batch_size):
+        batch = tuple(range(lo, min(lo + batch_size, n_poles)))
+        Omega, B = Omega_poles[lo:lo + batch_size], B_poles[lo:lo + batch_size]
         for row in plan:
             selected = _batch_rows(row, batch)
             if selected is None:
@@ -127,11 +122,74 @@ def integrate_sigma_windows(
 
     sigma = strip_sigma_window(accumulator.finalize(), nb_real)
     print_fn(f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
-             f"({len(fields)} poles, batches of {batch_size})")
+             f"({n_poles} poles, batches of {batch_size})")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
         sigma_c_kij=sigma)
 
 
-__all__ = ["execution_census", "integrate_sigma_windows"]
+def _branches(wfns, omega, efermi_ry):
+    """The four causal branches, with occupation and energy kept separate."""
+    omega = np.asarray(omega, np.float64)
+    idx_pos, idx_neg = np.where(omega >= 0.0)[0], np.where(omega < 0.0)[0]
+    energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
+    occupied = wfns.occ[:, wfns.slices.full] > 0.5
+    # Do not clip these distances at zero.  In a small-gap or inverted
+    # system an unoccupied state may sit below E_F (or an occupied state
+    # above it); the occupation chooses the branch and the window planner
+    # decides from the actual denominator whether it is crossing.
+    return _iter_branches(
+        omega_pos=omega[idx_pos], idx_pos=idx_pos,
+        omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
+        E_cond=energy, H_val=-energy,
+        cond_mask=~occupied, val_mask=occupied)
+
+
+def compute_sigma_c_mpa_omega_grid(
+    wfns,
+    fit_src,
+    meta,
+    mesh_xy,
+    *,
+    omega_grid_ry,
+    efermi_ry,
+    regularization_width_ry,
+    edge_factor=1.5,
+    target_error=1.0e-4,
+    max_rank=96,
+    hgl_target_error=1.0e-6,
+    hgl_max_nodes=200,
+    pole_batch_size=4,
+    print_fn=print,
+):
+    """Read a fitted MPA store, derive its windows, and compute Sigma_c.
+
+    Pole tensors are read collectively in their native sharding through
+    :mod:`file_io.mpa_store`; no full ``(p,q,mu,mu)`` host copy exists.
+    """
+    Omega, B = read_pole_slices(
+        fit_src, mesh_xy=mesh_xy, unfold=True, return_sharded=True,
+        to_unit="Ry")
+    branches = _branches(wfns, omega_grid_ry, efermi_ry)
+    plan, geometry = build_shared_sigma_windows(
+        Omega, branches,
+        regularization_width_ry=regularization_width_ry,
+        edge_factor=edge_factor, target_error=target_error,
+        max_rank=max_rank, hgl_target_error=hgl_target_error,
+        hgl_max_nodes=hgl_max_nodes)
+    physical = execution_census(plan, int(Omega.shape[0]), pole_batch_size)
+    print_fn(
+        f"  MPA windows: xi={geometry['xi_ry'] * RYD_TO_EV:.4f} eV, "
+        f"{geometry['n_windows']} logical windows, "
+        f"{physical['n_tau']} physical tau dispatches")
+    return integrate_sigma_windows(
+        wfns, Omega, B, plan, omega_grid_ry, meta, mesh_xy,
+        pole_batch_size=pole_batch_size, print_fn=print_fn)
+
+
+__all__ = [
+    "compute_sigma_c_mpa_omega_grid",
+    "execution_census",
+    "integrate_sigma_windows",
+]

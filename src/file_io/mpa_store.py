@@ -2067,6 +2067,83 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
     return Omega_full, B_full
 
 
+def _finish_pole_read(
+    src, Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
+):
+    """Apply the one unit/unfold/gather policy shared by pole readers."""
+    if to_unit is not None:
+        source_unit = ledger["energy_unit"]
+        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+            raise ValueError(
+                "pole read: both stored and requested energy units must be "
+                f"declared; stored={source_unit!r}, requested={to_unit!r}")
+        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        Omega, Bp = Omega * scale, Bp * scale
+
+    if unfold and ledger["q_storage"] == "ibz":
+        import jax.numpy as jnp
+
+        if mesh_xy is None:
+            raise ValueError("a wedge pole unfold requires mesh_xy")
+        tables = read_fit_unfold_tables(src)
+        if tables is None:
+            raise ValueError("wedge fit has no unfold tables")
+        if Omega.ndim == 3:
+            Omega, Bp = unfold_pole_field(Omega, Bp, tables, mesh_xy=mesh_xy)
+        else:
+            Omega, Bp = map(
+                jnp.stack,
+                zip(*(unfold_pole_field(Omega[p], Bp[p], tables,
+                                        mesh_xy=mesh_xy)
+                      for p in range(int(Omega.shape[0])))))
+    if return_sharded:
+        if mesh_xy is None:
+            raise ValueError("return_sharded requires mesh_xy")
+        return Omega, Bp
+    if mesh_xy is not None:
+        from common.collectives import gather_to_host
+        return gather_to_host(Omega), gather_to_host(Bp)
+    return Omega, Bp
+
+
+def read_pole_slices(
+    src,
+    *,
+    mesh_xy=None,
+    unfold=False,
+    return_sharded=False,
+    to_unit=None,
+    allow_partial=False,
+    mode="r",
+):
+    """Read the complete pole axis with two collective SlabIO reads."""
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial, "read_pole_slices")
+        if mesh_xy is None:
+            Omega = np.asarray(grp["Omega_p"])
+            Bp = np.asarray(grp["B_p"])
+
+    if mesh_xy is not None:
+        from jax.sharding import PartitionSpec as P
+        from runtime.padding import padded_mu_extent
+        from file_io.slab_io import SlabIO
+
+        n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
+        shape = (ledger["n_p"], ledger["n_q"], n_pad, n_pad)
+        with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+            Omega = io.read_slab(
+                "Omega_p", shape=shape, offset=(0, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))
+            Bp = io.read_slab(
+                "B_p", shape=shape, offset=(0, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))
+    return _finish_pole_read(
+        src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
+        return_sharded=return_sharded, to_unit=to_unit)
+
+
 def read_pole_slice(
     src,
     p,
@@ -2113,27 +2190,6 @@ def read_pole_slice(
                 "B_p", shape=shape, offset=(ip, 0, 0, 0),
                 partition_spec=P(None, None, "x", "y"))[0]
 
-    if to_unit is not None:
-        source_unit = ledger["energy_unit"]
-        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
-            raise ValueError(
-                "read_pole_slice: both stored and requested energy units "
-                f"must be declared; stored={source_unit!r}, requested={to_unit!r}")
-        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
-        Omega, Bp = Omega * scale, Bp * scale
-
-    if unfold and ledger["q_storage"] == "ibz":
-        if mesh_xy is None:
-            raise ValueError("read_pole_slice: a wedge unfold requires mesh_xy")
-        tables = read_fit_unfold_tables(src)
-        if tables is None:
-            raise ValueError("read_pole_slice: wedge fit has no unfold tables")
-        Omega, Bp = unfold_pole_field(Omega, Bp, tables, mesh_xy=mesh_xy)
-    if return_sharded:
-        if mesh_xy is None:
-            raise ValueError("read_pole_slice: return_sharded requires mesh_xy")
-        return Omega, Bp
-    if mesh_xy is not None:
-        from common.collectives import gather_to_host
-        return gather_to_host(Omega), gather_to_host(Bp)
-    return Omega, Bp
+    return _finish_pole_read(
+        src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
+        return_sharded=return_sharded, to_unit=to_unit)

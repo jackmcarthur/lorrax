@@ -980,6 +980,15 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
 
 
+def test_complete_pole_axis_uses_the_same_read_policy(tmpdir_path):
+    _staged_fit(tmpdir_path, n_p=3)
+    MS.finalize_fit_store(tmpdir_path)
+    Omega, Bp, _diag, _ledger = MS.read_fit_tensors(tmpdir_path)
+    got_Omega, got_Bp = MS.read_pole_slices(tmpdir_path)
+    np.testing.assert_array_equal(got_Omega, Omega)
+    np.testing.assert_array_equal(got_Bp, Bp)
+
+
 def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
         tmpdir_path):
     """RED TWIN: partial reads must be ASKED for, never inferred.
