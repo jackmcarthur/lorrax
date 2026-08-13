@@ -233,6 +233,65 @@ def test_every_frequency_slab_round_trips_bit_identically(tmpdir_path):
         assert bool(hdr["data_ready"][i])
 
 
+def test_collective_writer_keeps_large_bytes_behind_slabio(
+        tmpdir_path, monkeypatch):
+    """The production helper uses SlabIO; h5py only stamps metadata."""
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+
+    calls = []
+
+    class FakeSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            calls.append(("open", mode, mesh))
+            self.file = h5py.File(path, mode)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.file.close()
+            calls.append(("close",))
+
+        def create_dataset(self, name, *, shape, dtype):
+            calls.append(("create", name, tuple(shape)))
+            self.file.create_dataset(name, shape=shape, dtype=dtype)
+
+        def write_slab(self, name, value, *, offset, global_shape):
+            host = np.asarray(value)
+            valid = tuple(min(host.shape[d], global_shape[d] - offset[d])
+                          for d in range(host.ndim))
+            target = tuple(slice(offset[d], offset[d] + valid[d])
+                           for d in range(host.ndim))
+            source = tuple(slice(0, n) for n in valid)
+            self.file[name][target] = host[source]
+            calls.append(("write", name, tuple(offset), valid))
+
+    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(collectives, "process_rank", lambda: 0)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+
+    tables, verdict, n_mu = _geometry()
+    omega = np.asarray([0.2 + 0.1j])
+    sampling = dict(_SAMPLING, n_p=1)
+    mesh = _mesh()
+    shape = (1, _N_Q_IBZ, n_mu, n_mu)
+    MS.allocate_w_omega_collective(
+        tmpdir_path, "W", mesh_xy=mesh, n_omega=1,
+        n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables, omega=omega,
+        sampling=sampling, closure_verdict=verdict)
+    W = _w_omega(1, _N_Q_IBZ, n_mu)[0]
+    assert MS.write_w_slab_collective(
+        tmpdir_path, "W", 0, W, mesh_xy=mesh,
+        global_shape=shape) == 1
+
+    got, header = MS.read_w_slab(tmpdir_path, "W", 0)
+    np.testing.assert_array_equal(got, W)
+    assert header["data_ready"].tolist() == [True]
+    assert [call[0] for call in calls] == [
+        "open", "create", "close", "open", "write", "close"]
+
+
 def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for iq in range(_N_Q_IBZ):

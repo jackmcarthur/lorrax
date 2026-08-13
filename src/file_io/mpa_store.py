@@ -411,30 +411,10 @@ def allocate_w_omega(
         permutation α is silently unrecoverable, per frequency.
     """
     qs = _qs()
-    n_omega = int(n_omega)
-    n_q_on_disk = int(n_q_on_disk)
-    n_mu = int(n_mu)
-    if min(n_omega, n_q_on_disk, n_mu) < 1:
-        raise ValueError(
-            f"mpa_store: extents must be positive; got n_omega="
-            f"{n_omega}, n_q_on_disk={n_q_on_disk}, n_mu={n_mu}")
-    dtype = np.complex128 if dtype is None else dtype
-    shape = (n_omega, n_q_on_disk, n_mu, n_mu)
-    # THE CLOSURE REFUSAL RUNS BEFORE ANY BYTE IS ALLOCATED.  The stamp
-    # below refuses too — it is the same call — but by then a full-size
-    # dataset exists, and a refused allocation that leaves a
-    # correctly-shaped file behind is precisely the shape of the
-    # all-zero-screening hazard this format spends a ledger to avoid.
-    if closure_verdict is None:
-        raise ValueError(
-            "allocate_w_omega: closure_verdict= is required.  A wedge "
-            "stored against a centroid set that is not orbit-closed has "
-            "no permutation α and is unrecoverable — at EVERY "
-            "frequency, so the ω axis multiplies the damage rather than "
-            "diluting it.  Take one from "
-            "symmetry_maps.verify_centroid_orbit_closure.")
-    closure_verdict.raise_if_not_closed(
-        f"allocate_w_omega({name!r}) refuses q_irr storage")
+    shape, dtype = _w_storage_geometry(
+        n_omega, n_q_on_disk, n_mu, dtype, closure_verdict,
+        where=f"allocate_w_omega({name!r})")
+    n_omega, n_q_on_disk, n_mu = shape[:3]
     with qs.QirrDest(dest, mode) as grp:
         if name in grp:
             del grp[name]
@@ -444,6 +424,79 @@ def allocate_w_omega(
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(n_omega, dtype=bool),
             provenance=provenance)
+
+
+def _w_storage_geometry(n_omega, n_q_on_disk, n_mu, dtype,
+                        closure_verdict, *, where):
+    """Validate one W-frequency allocation before any bytes are created."""
+    n_omega = int(n_omega)
+    n_q_on_disk = int(n_q_on_disk)
+    n_mu = int(n_mu)
+    if min(n_omega, n_q_on_disk, n_mu) < 1:
+        raise ValueError(
+            f"mpa_store: extents must be positive; got n_omega="
+            f"{n_omega}, n_q_on_disk={n_q_on_disk}, n_mu={n_mu}")
+    dtype = np.dtype(np.complex128 if dtype is None else dtype)
+    shape = (n_omega, n_q_on_disk, n_mu, n_mu)
+    # THE CLOSURE REFUSAL RUNS BEFORE ANY BYTE IS ALLOCATED.  The stamp
+    # below refuses too — it is the same call — but by then a full-size
+    # dataset exists, and a refused allocation that leaves a
+    # correctly-shaped file behind is precisely the shape of the
+    # all-zero-screening hazard this format spends a ledger to avoid.
+    if closure_verdict is None:
+        raise ValueError(
+            f"{where}: closure_verdict= is required.  A wedge "
+            "stored against a centroid set that is not orbit-closed has "
+            "no permutation α and is unrecoverable — at EVERY "
+            "frequency, so the ω axis multiplies the damage rather than "
+            "diluting it.  Take one from "
+            "symmetry_maps.verify_centroid_orbit_closure.")
+    closure_verdict.raise_if_not_closed(f"{where} refuses q_irr storage")
+    return shape, dtype
+
+
+def allocate_w_omega_collective(
+    dest,
+    name,
+    *,
+    mesh_xy,
+    n_omega,
+    n_q_on_disk,
+    n_mu,
+    tables,
+    omega,
+    sampling,
+    omega_line=None,
+    closure_verdict=None,
+    dtype=None,
+    provenance=None,
+    mode="a",
+):
+    """Collectively allocate W(z); serial HDF5 writes metadata only.
+
+    The large rank-4 dataset is created through :class:`SlabIO` on every
+    process.  After that collective handle closes, rank zero stamps the small
+    q-wedge tables, frequency grid, and readiness ledger, then all processes
+    synchronize before any slab write begins.
+    """
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    shape, dtype = _w_storage_geometry(
+        n_omega, n_q_on_disk, n_mu, dtype, closure_verdict,
+        where=f"allocate_w_omega_collective({name!r})")
+    with SlabIO(dest, mode=mode, mesh=mesh_xy) as io:
+        io.create_dataset(name, shape=shape, dtype=dtype)
+
+    header = None
+    if process_rank() == 0:
+        header = stamp_w_omega(
+            dest, name, tables=tables, omega=omega, sampling=sampling,
+            omega_line=omega_line, closure_verdict=closure_verdict,
+            data_ready=np.zeros(shape[0], dtype=bool),
+            provenance=provenance)
+    barrier("mpa_w_omega_allocated")
+    return header
 
 
 def stamp_w_omega(
@@ -620,11 +673,69 @@ def write_w_slab(dest, name, i_omega, W_q_munu, *, ready=True, mode="a"):
                 f"touch ω — so a slab of a different shape is not this "
                 f"tensor's slab.")
         ds[i] = X
-        led = mgrp["data_ready"][()]
-        led[i] = bool(ready)
-        mgrp["data_ready"][...] = led
-        ds.attrs["qirr_data_ready"] = bool(led.all())
-        return int(led.sum())
+        return _mark_w_slab_ready(ds, mgrp, i, ready)
+
+
+def _mark_w_slab_ready(ds, mgrp, i_omega, ready):
+    """Commit one slab only after its data writer has closed."""
+    i = int(i_omega)
+    n_omega = int(ds.shape[0])
+    if not 0 <= i < n_omega:
+        raise IndexError(
+            f"mpa_store: frequency index {i} is outside [0, {n_omega}) "
+            f"for {ds.name!r}.")
+    led = mgrp["data_ready"][()]
+    led[i] = bool(ready)
+    mgrp["data_ready"][...] = led
+    ds.attrs["qirr_data_ready"] = bool(led.all())
+    return int(led.sum())
+
+
+def write_w_slab_collective(
+    dest,
+    name,
+    i_omega,
+    W_q_munu,
+    *,
+    mesh_xy,
+    global_shape,
+    ready=True,
+):
+    """Write one native sharded W(z) slab and then commit readiness.
+
+    ``W_q_munu`` remains on its ``P(None, 'x', 'y')`` layout.  SlabIO
+    inserts the singleton frequency axis, clips only the device-dependent
+    mu padding against ``global_shape``, and closes collectively before rank
+    zero updates the small readiness ledger.  A failed data write therefore
+    leaves the slab explicitly unready.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    shape = tuple(int(n) for n in global_shape)
+    if len(shape) != 4:
+        raise ValueError(
+            "write_w_slab_collective: global_shape must be "
+            "(n_omega,n_q,n_mu,n_mu)")
+    W4 = jax.device_put(
+        W_q_munu[None, ...],
+        NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.write_slab(
+            name, W4, offset=(int(i_omega), 0, 0, 0),
+            global_shape=shape)
+    del W4
+
+    n_ready = None
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, "a") as grp:
+            ds, mgrp = _open_w(grp, name)
+            n_ready = _mark_w_slab_ready(ds, mgrp, i_omega, ready)
+    barrier("mpa_w_slab_ready")
+    return n_ready
 
 
 # ---------------------------------------------------------------------------
