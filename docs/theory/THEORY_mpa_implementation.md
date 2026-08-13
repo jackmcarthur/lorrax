@@ -89,10 +89,27 @@ There are two scalar quadrature families.
 statements.  The many-body kernels receive only nodes and weights.  No
 wavefunction, q mesh or ISDF concept is present in the minimax service.
 
-At each node LORRAX builds the occupied and empty Green functions once, forms
-the response tile, and projects all requested `z_j` through scalar weights.
-The expensive node count is therefore the union of the two arms, not the
-number of samples times a per-sample rank.
+For the shared sine rule, each positive atom `(t_j,w_j)` is expanded exactly
+into two contour nodes,
+
+$$
+(\tau,c,s)=(-it_j,-iw_j,-1),\qquad(+it_j,+iw_j,+1),
+$$
+
+whose executable sum is
+
+$$
+-\sum_{\pm}c_\pm e^{-\tau_\pm(\Delta-s_\pm z)}
+=-2w_j e^{izt_j}\sin(\Delta t_j).
+$$
+
+`services/minimax.shared_sine_contour` owns this scalar identity.
+`gw.w_isdf.compute_chi0_contour` carries the complex times through the same
+Green-function/FFT contraction used by static chi0.  At each node LORRAX
+builds the occupied and empty Green functions once, forms the response tile,
+and projects every requested `z_j` through scalar weights.  The expensive
+node count is therefore twice the shared sine rank, not the number of samples
+times a per-sample rank.
 
 ## 3. Dyson solve, W samples and pole fit
 
@@ -104,10 +121,11 @@ W(z)=\left[1-V\chi_0(z)\right]^{-1}V,
 $$
 
 The matrix solve remains distributed.  One native sharded
-`P(None,'x','y')` W slab is live at a time.  `file_io.mpa_store` inserts its
-singleton frequency axis and writes it collectively through SlabIO; the
-small readiness bit is committed only after collective close.  A failed
-write is therefore an explicitly incomplete sample, not a plausible zero.
+`P(None,'x','y')` W slab is live at a time.  An offline/restart workflow may
+write it through `file_io.mpa_store`, whose singleton frequency axis and
+large arrays are owned by SlabIO; the small readiness bit is committed only
+after collective close.  A failed write is therefore incomplete, not a
+plausible zero.
 
 The elementwise multipole model is
 
@@ -117,13 +135,13 @@ W_c(z)\approx\sum_{p=1}^{N_p}
 \qquad \Omega_p=a_p-i\Gamma_p.
 $$
 
-`gw.mpa.pade_fit` owns the normalized Loewner/Padé solve; `gw.mpa.fit_driver`
-owns the column-block walk; `file_io.mpa_store` owns all pole bytes, units,
-unfold tables, completion, fit diagnostics and identity stamps.  The fit is
-written by `(q,nu-column)` blocks because retaining all output poles in
-memory is larger than retaining the input sample block.  A consumer refuses
-an incomplete store and enforces its stored condition/backward-error limits
-before reading pole tensors.
+`gw.mpa.pade_fit` owns the normalized Loewner/Padé solve.  For an
+offline/restart fit, `gw.mpa.fit_driver` owns the column walk and
+`file_io.mpa_store` owns pole bytes, units, completion and diagnostics.  For
+self-consistency, `gw.mpa.model.produce_model` receives one
+`(z,mu,nu-column)` Wc tile, fits it, releases it, and retains only the fitted
+pole arrays and tiny scalar head.  It performs no file I/O.  Thus neither
+path requires a full frequency-resolved W tensor in memory.
 
 The pole fit may place every pole at any positive `a_p` and nonnegative
 `Gamma_p`; pole index is not a frequency band.  The executor groups poles by
@@ -270,10 +288,20 @@ noncrossing ranks logarithmically and finite-width crossing ranks roughly as
 
 ## 7. Dynamic head, output and QSGW boundary
 
-The missing production component is the matrix-valued dynamic q→0
-head/wings evaluated on the same frequency grid and with an explicitly
-selected velocity-commutator sign.  It must be added to the body before
-interpolation or output.  Until this exists, `compute_mode = mpa` refuses.
+The core local-field algebra is
+
+$$
+S_{\mathrm{eff}}(z)=S_0(z)
++\frac{Y(z)W_{\mathrm{body},\Gamma}(z)Z(z)}{V_{\mathrm{cell}}}.
+$$
+
+`gw.head_correction.fold_cartesian_head_wings_sharded` owns this contraction
+without gathering the body tile, and the scalar MPA head has the same generic
+complex-pole sum as the body.  The missing production component is the
+per-map producer that rebuilds `S_0`, `Y`, `Z` from the current orbitals and
+energies, applies the canonical anisotropic q→0 average, and hands its head
+samples to the bounded fit.  Until that producer is connected,
+`compute_mode = mpa` refuses.
 
 After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
 
