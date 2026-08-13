@@ -155,15 +155,19 @@ whose nominally sign-definite rectangle reaches zero; public small/inverted-
 gap support requires splitting that rectangle at the denominator boundary
 and routing the straddling part through a crossing rule.
 
-Let
+Let $W=\max(|\omega_{\min}|,|\omega_{\max}|)$ and let
+$A_{\max}=24$ be the conditioning ceiling of the accepted HGL rule.  The
+routing scale is
 
 $$
-\xi=\max\left(\eta,
- f_{\mathrm{edge}}\max|\omega|\,\epsilon_{\mathrm{mach}}^{1/3}\right),
+\xi=\max\left(\eta,\frac{2W}{A_{\max}-2f_{\mathrm{edge}}}
+\right).
 $$
 
-where `eta` is the requested regularization and `f_edge` is the window-edge
-factor.  `xi` separates the absolutely convergent finite-width core from the
+Here `eta` is the requested regularization and `f_edge` is the window-edge
+factor.  The floor keeps the HGL dimensionless core bandwidth
+$A_{\mathrm{core}}=2W/\xi+2f_{\mathrm{edge}}$ at or below $A_{\max}$.
+Thus `xi` separates the absolutely convergent finite-width core from the
 near-axis regularized core.  It is a numerical routing boundary, not a pole
 fit or broadening applied to every pole.
 
