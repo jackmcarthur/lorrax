@@ -428,6 +428,7 @@ def compute_ppm_sigma_pipeline(
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
                 ppm_cfg=config.ppm,
+                sigma_cfg=config.sigma,
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
                 print_fn=print_fn,

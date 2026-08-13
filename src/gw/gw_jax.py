@@ -291,7 +291,7 @@ def main(argv=None):
 	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check
 	# must test what will execute).  The Σ driver re-checks divisibility at
 	# its own seam as the last-line guard.
-	if mode.is_dynamic and config.ppm.omega_layout == "sharded":
+	if mode.is_dynamic and config.sigma.omega_layout == "sharded":
 		_p_x = int(mesh_xy.devices.shape[0])
 		_p_y = int(mesh_xy.devices.shape[1])
 		_nbs = int(meta.nb_sigma)

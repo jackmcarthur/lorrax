@@ -560,7 +560,7 @@ class QPSolver(str, enum.Enum):
     - ``FIXED_POINT`` — one-shot Σ + diagonal on-shell solve
       E = h0 + ReΣ(E) for the QSGW-build evaluation energies
       (eigenvalue-only; Σ is never rebuilt).  Dynamic modes only — static
-      Σ has no ω-grid to solve on.  ``ppm.sigma_at_dft_extrapolate`` is a
+      Σ has no ω-grid to solve on.  ``sigma.sigma_at_dft_extrapolate`` is a
       sub-knob of this state (scissor for out-of-grid bands).
     - ``SELF_CONSISTENT`` — full QSGW loop (:mod:`gw.sc_iteration`):
       Σ rebuilt each iteration from rotated ψ + the previous iteration's
@@ -1910,14 +1910,43 @@ class ScreeningConfig:
 
 
 @dataclass(frozen=True)
-class PPMConfig:
-    """Plasmon-pole model + Σ_c(ω) output grid + on-shell options.
+class DynamicSigmaConfig:
+    """Ansatz-neutral real-frequency Sigma grid and output policy."""
+    omega_min_ev: float
+    omega_max_ev: float
+    omega_step_ev: float
+    regularization_ev: float
+    window_edge_factor: float
+    omega_batch_size: int
+    omega_accumulation: str
+    omega_layout: str
+    fermi_reference: str
+    sigma_at_dft_extrapolate: bool
+    sigma_at_dft_energies: bool
 
-    Single grouped home for everything PPM/Σ_c-related: the pole-fit
-    ansatz, the probe-ω choice, the analytic head-pole override, the
-    σ-quadrature minimax tolerances, the ω-grid for the output, and
-    the post-hoc on-shell evaluation knobs.
-    """
+    def __post_init__(self):
+        if self.omega_step_ev <= 0.0:
+            raise ValueError("sigma_omega_step_ev must be > 0.")
+        if self.omega_max_ev < self.omega_min_ev:
+            raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
+        if self.fermi_reference not in ("vbm", "midgap"):
+            raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
+        if self.omega_accumulation == "kij_stream":
+            raise ValueError(
+                "sigma_omega_accumulation = kij_stream was REMOVED; use "
+                "'kij' or 'auto' with sigma_omega_layout = sharded")
+        if self.omega_accumulation not in ("auto", "kij"):
+            raise ValueError("sigma_omega_accumulation must be auto/kij.")
+        if self.omega_layout not in ("replicated", "sharded"):
+            raise ValueError(
+                "sigma_omega_layout must be 'replicated' or 'sharded'.")
+        if self.omega_batch_size < 1:
+            raise ValueError("sigma_omega_batch_size must be >= 1.")
+
+
+@dataclass(frozen=True)
+class PPMConfig:
+    """Parameters specific to the two-point plasmon-pole ansatz."""
     # --- Model selection ---
     model: str                    # "gn" | "hl" — picked by ComputeMode usually
     omega_p: float                # probe ω (Ry); imag for GN, real for HL
@@ -1933,25 +1962,7 @@ class PPMConfig:
     sigma_target_error: float
     sigma_max_nodes: int
 
-    # --- ω-grid for Σ_c(ω) output (eV) ---
-    omega_min_ev: float
-    omega_max_ev: float
-    omega_step_ev: float
-    regularization_ev: float
-    window_edge_factor: float
-    omega_batch_size: int
-    omega_accumulation: str       # "auto" | "kij"
-    #: Σ_c(ω) end-of-stage layout: "replicated" gathers the full cube onto
-    #: every rank (historical path); "sharded" keeps it (m_X, n_Y)-tiled on
-    #: the existing mesh and consumers read the tiles directly (movement-only,
-    #: bit-identical outputs; see _DEFAULTS["sigma_omega_layout"]).
-    omega_layout: str             # "replicated" | "sharded"
-
-    # --- on-shell evaluation knobs ---
     invalid_mode: str             # "zero" | "2ry" | "static_limit" | "infinity"(alias)
-    fermi_reference: str          # "midgap" | "vbm"
-    sigma_at_dft_extrapolate: bool
-    sigma_at_dft_energies: bool
 
     def __post_init__(self):
         # Validate scalar knobs once, at the parse site (values are already
@@ -1959,36 +1970,11 @@ class PPMConfig:
         # invalid_mode ('imaginary' → NotImplementedError, needs a
         # complex-Ω path) stays in the Σ^c kernel — this checks only
         # that the *value* is recognized.
-        if self.omega_step_ev <= 0.0:
-            raise ValueError("ppm.omega_step_ev must be > 0.")
-        if self.omega_max_ev < self.omega_min_ev:
-            raise ValueError("ppm.omega_max_ev must be >= ppm.omega_min_ev.")
-        if self.fermi_reference not in ("vbm", "midgap"):
-            raise ValueError("ppm.fermi_reference must be 'vbm' or 'midgap'.")
-        if self.omega_accumulation == "kij_stream":
-            # REMOVED mode (2026-07-31): the single-process streamed-h5
-            # accumulator is gone.  Refuse the removed VALUE of a known
-            # key rather than silently rerouting an old deck.
-            raise ValueError(
-                "sigma_omega_accumulation = kij_stream was REMOVED: the "
-                "single-process streamed-h5 accumulator is gone "
-                "(superseded by host-tile accumulation and "
-                "sigma_omega_layout=sharded for cubes that do not fit).  "
-                "Use 'kij' or 'auto'.")
-        if self.omega_accumulation not in ("auto", "kij"):
-            raise ValueError(
-                "ppm.omega_accumulation must be auto/kij.")
-        if self.omega_layout not in ("replicated", "sharded"):
-            raise ValueError(
-                "sigma_omega_layout must be 'replicated' or 'sharded'; "
-                f"got {self.omega_layout!r}.")
         if self.invalid_mode not in (
             "zero", "skip", "2ry", "static_limit", "infinity", "imaginary"
         ):
             raise ValueError(
                 f"ppm.invalid_mode: unknown value {self.invalid_mode!r}")
-        if self.omega_batch_size < 1:
-            raise ValueError("ppm.omega_batch_size must be >= 1.")
         if self.probe_chi_reuse not in ("off", "auto"):
             raise ValueError(
                 "ppm_probe_chi_reuse must be 'off' or 'auto'; "
@@ -2153,6 +2139,7 @@ class LorraxConfig:
         config.compute_mode           # -> ComputeMode enum
         config.head.wcoul0_source     # head plumbing
         config.ppm.omega_p            # PPM probe ω
+        config.sigma.omega_layout     # shared dynamic-Sigma output policy
         config.debug.sigma_freq_debug_output
 
     See module docstring for the full grouping.  ``cohsex.in`` keys
@@ -2214,6 +2201,7 @@ class LorraxConfig:
     paths: FilePaths
     head: HeadConfig
     screening: ScreeningConfig
+    sigma: DynamicSigmaConfig
     ppm: PPMConfig
     sc: SCConfig
     memory: MemoryConfig
@@ -2362,7 +2350,7 @@ class LorraxConfig:
         from this one by division so the two can never disagree in length
         or accumulate independent float-step rounding.
         """
-        p = self.ppm
+        p = self.sigma
         n = int(np.floor(
             (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev + 0.5)) + 1
         return p.omega_min_ev + p.omega_step_ev * np.arange(n, dtype=np.float64)
@@ -2498,15 +2486,18 @@ class LorraxConfig:
             probe_chi_reuse=str(_g("ppm_probe_chi_reuse")).strip().lower(),
             sigma_target_error=float(_g("ppm_sigma_target_error")),
             sigma_max_nodes=int(_g("ppm_sigma_max_nodes")),
+            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
+        )
+        sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
-            omega_accumulation=str(_g("sigma_omega_accumulation")).strip().lower(),
+            omega_accumulation=str(
+                _g("sigma_omega_accumulation")).strip().lower(),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
-            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
@@ -2814,6 +2805,7 @@ class LorraxConfig:
             paths=paths,
             head=head,
             screening=screening,
+            sigma=sigma,
             ppm=ppm,
             sc=sc,
             memory=memory,

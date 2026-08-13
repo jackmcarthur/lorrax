@@ -667,7 +667,7 @@ def solve_qp(
         f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
         f"{n_iter} iterations")
     if (
-        config.ppm.sigma_at_dft_extrapolate
+        config.sigma.sigma_at_dft_extrapolate
         and 0 < n_bands_in < n_bands_total
     ):
         occ_mask_kn = np.broadcast_to(

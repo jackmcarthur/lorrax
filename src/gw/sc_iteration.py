@@ -1746,8 +1746,8 @@ def run_sc_driver(
     # scissor (otherwise their Σ_c is clamped at the grid edge → the
     # QSGW H-build feeds garbage diagonals that explode the iteration).
     efermi_ev = float(wfn.efermi) * RYD_TO_EV
-    omega_min_ev = float(config.ppm.omega_min_ev) + efermi_ev
-    omega_max_ev = float(config.ppm.omega_max_ev) + efermi_ev
+    omega_min_ev = float(config.sigma.omega_min_ev) + efermi_ev
+    omega_max_ev = float(config.sigma.omega_max_ev) + efermi_ev
     e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
     band_in_grid, _ = classify_bands_in_grid(
         e_dft_ev, omega_min_ev, omega_max_ev)

@@ -57,7 +57,7 @@ import numpy as np
 
 from common import jax_profile, timing
 from common.units import RYD_TO_EV
-from .gw_config import PPMConfig
+from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
     MinimaxNodes,
@@ -792,6 +792,7 @@ def compute_sigma_c_ppm_omega_grid(
     mesh_xy: Mesh,
     *,
     ppm_cfg: PPMConfig,
+    sigma_cfg: DynamicSigmaConfig,
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
     print_fn=print,
@@ -826,9 +827,10 @@ def compute_sigma_c_ppm_omega_grid(
     crossing_eps_q = float(quad.crossing_eps_q)
     use_shipped_minimax_tables = bool(quad.use_shipped_tables)
 
-    # Scalar knobs — direct reads off the validated frozen PPMConfig.
-    regularization_width_ry = float(ppm_cfg.regularization_ev) / RYD_TO_EV
-    edge_factor = float(ppm_cfg.window_edge_factor)
+    # Ansatz-neutral grid/window knobs come from DynamicSigmaConfig; the PPM
+    # object contributes only its invalid-pole policy.
+    regularization_width_ry = float(sigma_cfg.regularization_ev) / RYD_TO_EV
+    edge_factor = float(sigma_cfg.window_edge_factor)
 
     # Crossing-quadrature conditioning floor: raise ξ if the Σ_c ω-grid is wide
     # enough that the HGL core window would be ill-conditioned (Σ|α| ~ 1e5,
@@ -843,8 +845,8 @@ def compute_sigma_c_ppm_omega_grid(
             f"(A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ would make the "
             f"HGL crossing quadrature ill-conditioned)")
         regularization_width_ry = xi_floor
-    omega_batch_size = int(ppm_cfg.omega_batch_size)
-    fermi_reference = ppm_cfg.fermi_reference
+    omega_batch_size = int(sigma_cfg.omega_batch_size)
+    fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
     if nk != int(enk_full.shape[0]):
@@ -956,7 +958,7 @@ def compute_sigma_c_ppm_omega_grid(
     # 2751 MB/rank at nb=512) is elided, and every consumer reads the tiles
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
-    sharded_layout = (str(ppm_cfg.omega_layout) == "sharded")
+    sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
     if sharded_layout:
         p_x = int(mesh_xy.shape['x'])
         p_y = int(mesh_xy.shape['y'])
