@@ -26,8 +26,10 @@ The carry ``H_qp_dft`` is sized ``(nk, nb_active, nb_active)`` where
 the **active subspace** is ``band_slices.sigma = [b0, b3)`` — the bands
 ``kin_ion.h5`` was generated for and the bands :mod:`cohsex_sigma` /
 :mod:`ppm_pipeline` compute Σ for.  Bands above ``b3`` keep their DFT
-ψ + DFT energies throughout SC iteration; their QP corrections come
-from the scissor extrapolation downstream (see :mod:`gw.scissor`).
+ψ throughout SC iteration.  Iteration 1 also keeps their DFT energies
+exactly; later iterations apply the current conduction scissor to the
+logical sum-band tail ``[b3, b4_user)`` before rebuilding χ₀ and Σ.
+Mesh-padding slots ``[b4_user, b4)`` remain untouched.
 
 Robustness assumptions for the active-space partition:
 
@@ -73,7 +75,7 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
-from .scissor import fit_scissor
+from .scissor import apply_conduction_scissor_to_tail, fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
@@ -1008,8 +1010,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             efermi_ry = _midgap_efermi(E_qp_ry, n_occ)
 
     # Rotate the active subspace of the DFT bundle to this iteration's QP
-    # basis.  Bands outside ``slices.sigma`` keep their DFT ψ + DFT energy
-    # (their QP corrections come from the scissor extrapolation downstream).
+    # basis.  Bands outside ``slices.sigma`` always keep their DFT ψ.  From
+    # iteration 2 onward, logical conduction-sum bands above b3 receive the
+    # current active-space conduction scissor in ENERGY only; iteration 1
+    # keeps the historical DFT ladder exactly, preserving the one-shot gate.
     # THE ONE PLACE THE TWO k-SETS MEET.  H, E and U live on the IBZ; the
     # bundle, W and Σ live on the full BZ because Σ is an FFT over the
     # k-grid and needs the whole grid.  ``broadcast`` is an index gather
@@ -1025,9 +1029,56 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
 
+    # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
+    # the fit is derived from the current carry's eigenspectrum and the
+    # immutable active DFT ladder.  The logical stop is b4_user, not padded
+    # b4; apply_conduction_scissor_to_tail copies padding bit-for-bit.  The
+    # optional ladder is consumed by rotate_wavefunctions, which remains the
+    # single owner of occupation rebuilding after an energy change.
+    enk_base = None
+    tail_start = int(inputs.band_slices.sigma.stop)
+    logical_stop = (
+        int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
+    if state.iteration > 0 and logical_stop > tail_start:
+        from .scissor import k_star_weights
+
+        e_dft_fit = inputs.e_dft_active_kn_ry
+        valence_fit = inputs.valence_mask_active_kn
+        if not ks.is_identity:
+            e_dft_fit = ks.select(e_dft_fit)
+            valence_fit = ks.select(valence_fit)
+        e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
+        fit_mask_kn = np.broadcast_to(
+            np.asarray(inputs.partition.in_range_mask, dtype=bool)[None, :],
+            e_dft_fit_ev.shape)
+        tail_fit = fit_scissor(
+            E_dft_kn_ev=e_dft_fit_ev,
+            E_qp_kn_ev=(
+                np.asarray(E_qp_ry, dtype=np.float64) * RYD_TO_EV),
+            valence_mask_kn=np.asarray(valence_fit, dtype=bool),
+            fit_mask_kn=fit_mask_kn,
+            k_weights=k_star_weights(ks),
+        )
+        enk_base_ev = apply_conduction_scissor_to_tail(
+            np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
+            tail_fit,
+            tail_start=tail_start,
+            logical_stop=logical_stop,
+        )
+        enk_base = device_put_process_local(
+            enk_base_ev / RYD_TO_EV,
+            NamedSharding(inputs.mesh_xy, P(None, None)))
+        inputs.print_fn(
+            f"    SC sum-band tail: scissored [{tail_start}, "
+            f"{logical_stop}) with conduction "
+            f"alpha={tail_fit.alpha_c:+.4f}, "
+            f"beta={tail_fit.beta_c_ev:+.4f} eV "
+            f"(n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f})")
+
     wfns_qp = rotate_wavefunctions(
         inputs.wfns_dft, U_full,
-        enk_active_new=E_full, efermi=float(efermi_ry),
+        enk_active_new=E_full, enk_base=enk_base,
+        efermi=float(efermi_ry),
         mesh_xy=inputs.mesh_xy,
         active_slice=inputs.band_slices.sigma,
     )
@@ -1718,12 +1769,13 @@ def run_sc_driver(
     # ``E[:, :n_occ]`` midgap in ``_diagonalize_and_get_efermi``, and the
     # ``fermi_level_step`` target in ``rebuild_hartree_dft_basis``.  All
     # four are ``meta.nelec``, which counts from band 0, while the window
-    # starts at ``b0``.  They coincide only at ``b0 == 0``.  On a deck
-    # with ``nval < nelec`` the masks would silently mark the wrong bands
-    # occupied and the density-SC rebuild would omit the ``b0`` bands
-    # below the window from ρ — an O(400 Ry) V_H error with no local
-    # symptom, since ``rho_from_wfns`` checks only the electron count it
-    # was handed.  Refuse instead of computing it.
+    # starts at ``b0``.  They coincide only at ``b0 == 0``.  ``Meta`` fixes
+    # b0=0 today; importantly, ``nval`` moves b1 and does NOT move b0.  If a
+    # future caller supplies a truncated active window, these masks would
+    # silently mark the wrong bands occupied and the density-SC rebuild
+    # would omit the bands below b0 from ρ — an O(400 Ry) V_H error with no
+    # local symptom, since ``rho_from_wfns`` checks only the electron count
+    # it was handed.  Refuse instead of computing it.
     b0_sigma, b3_sigma = band_slices.sigma_range
     if int(b0_sigma) != 0:
         raise NotImplementedError(
@@ -1733,7 +1785,9 @@ def run_sc_driver(
             f"window, i.e. counted from band 0.  Self-consistency on a deck "
             f"with b0 != 0 needs the occupancies re-expressed relative to b0 "
             f"and the density rebuild extended to the bands below b0; neither "
-            f"is implemented.  Use nval = nelec, or qp_solver = one_shot_dft.")
+            f"is implemented.  Restore an active window beginning at band 0, "
+            f"or use qp_solver = one_shot_dft.  Changing nval cannot fix "
+            f"this: nval moves b1, not b0.")
 
     e_dft_active_kn_ry = jnp.asarray(np.asarray(enk_dft, dtype=np.float64))
     nb_active = e_dft_active_kn_ry.shape[1]

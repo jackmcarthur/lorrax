@@ -150,6 +150,62 @@ class ScissorFit:
         )
 
 
+def apply_conduction_scissor_to_tail(
+    E_dft_kn_ev: np.ndarray,
+    fit: ScissorFit,
+    *,
+    tail_start: int,
+    logical_stop: int,
+) -> np.ndarray:
+    """Apply ``fit`` only to a logical conduction-sum tail.
+
+    The active QP matrix ends at ``tail_start`` (local ``b3``) while the
+    physical band sum ends at ``logical_stop`` (local ``b4_user``).  Return
+    a copy of the full DFT energy ladder with
+
+    ``E_QP = fit.alpha_c * E_DFT + fit.beta_c_ev``
+
+    on exactly ``[:, tail_start:logical_stop]``.  Active energies before
+    ``tail_start`` and mesh-padding slots at/after ``logical_stop`` are
+    copied bit-for-bit.  This function owns energies only: wavefunctions
+    remain DFT outside the active block, and the bundle constructor that
+    consumes the returned ladder owns rebuilding occupations.
+
+    Parameters
+    ----------
+    E_dft_kn_ev : np.ndarray, (nk, nb_full)
+        Full DFT energy ladder in eV, including any padded band slots.
+    fit : ScissorFit
+        Current active-space fit.  Its conduction law is used regardless
+        of energy ordering because this interval is the declared
+        conduction-sum tail.
+    tail_start, logical_stop : int
+        Local half-open interval ``[b3, b4_user)``.
+    """
+    E = np.asarray(E_dft_kn_ev, dtype=np.float64)
+    if E.ndim != 2:
+        raise ValueError(
+            "apply_conduction_scissor_to_tail: E_dft_kn_ev must have shape "
+            f"(nk, nb_full); got {E.shape}.")
+    lo = int(tail_start)
+    hi = int(logical_stop)
+    if not (0 <= lo <= hi <= E.shape[1]):
+        raise ValueError(
+            "apply_conduction_scissor_to_tail: expected "
+            f"0 <= tail_start <= logical_stop <= {E.shape[1]}, got "
+            f"tail_start={lo}, logical_stop={hi}.")
+    if hi > lo and int(fit.n_fit_c) == 0:
+        raise ValueError(
+            "apply_conduction_scissor_to_tail: the logical conduction tail "
+            f"[{lo}, {hi}) is nonempty but ScissorFit has no trusted "
+            "conduction samples.")
+
+    out = E.copy()
+    out[:, lo:hi] = (
+        float(fit.alpha_c) * E[:, lo:hi] + float(fit.beta_c_ev))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-band in-grid classification
 # ---------------------------------------------------------------------------
@@ -387,6 +443,7 @@ def fit_scissor(
 
 __all__ = [
     "ScissorFit",
+    "apply_conduction_scissor_to_tail",
     "classify_bands_in_grid",
     "fit_scissor",
     "full_bz_k_weights",

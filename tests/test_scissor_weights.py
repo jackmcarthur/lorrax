@@ -20,6 +20,10 @@ A fifth property is asserted but not yet held: the two energy arrays must
 not be passable positionally, because they are the same shape and dtype
 and a swap is silent.  See the xfail below.
 
+The energy-only sum-band seam is also pinned here: an identity conduction
+fit is bit-exact, an affine fit touches only ``[b3,b4_user)``, and padded
+band slots beyond ``b4_user`` never enter the fit or update.
+
 ``src/gw/scissor.py`` is loaded FROM ITS PATH, not as ``gw.scissor``:
 ``gw/__init__.py`` imports ``common.meta``, which imports jax, and jax is
 not importable on a login node.  The module itself needs only numpy, so
@@ -43,9 +47,63 @@ sys.modules[_spec.name] = scissor
 _spec.loader.exec_module(scissor)
 
 ScissorFit = scissor.ScissorFit
+apply_conduction_scissor_to_tail = scissor.apply_conduction_scissor_to_tail
 fit_scissor = scissor.fit_scissor
 full_bz_k_weights = scissor.full_bz_k_weights
 k_star_weights = scissor.k_star_weights
+
+
+def _tail_fit(*, alpha_c=1.0, beta_c_ev=0.0, n_fit_c=4):
+    """Small explicit ScissorFit; valence values are hostile on purpose."""
+    return ScissorFit(
+        alpha_v=-9.0, beta_v_ev=123.0,
+        alpha_c=float(alpha_c), beta_c_ev=float(beta_c_ev),
+        n_fit_v=4, n_fit_c=int(n_fit_c),
+        rmse_v_ev=0.0, rmse_c_ev=0.0,
+        w_fit_v=4.0, w_fit_c=float(n_fit_c),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Energy-only logical tail application
+# ---------------------------------------------------------------------------
+
+def test_identity_conduction_scissor_preserves_every_energy_bit_exactly():
+    energies = np.array([
+        [-8.0, -2.0, 1.0, 3.0, 7.0, 11.0, 999.0],
+        [-7.5, -1.5, 1.5, 4.0, 8.0, 12.0, 999.0],
+    ], dtype=np.float64)
+    got = apply_conduction_scissor_to_tail(
+        energies, _tail_fit(), tail_start=4, logical_stop=6)
+    assert np.array_equal(got, energies)
+    assert got is not energies
+
+
+def test_affine_conduction_scissor_changes_only_b3_to_b4_user():
+    energies = np.arange(16, dtype=np.float64).reshape(2, 8) - 4.0
+    got = apply_conduction_scissor_to_tail(
+        energies, _tail_fit(alpha_c=1.25, beta_c_ev=0.75),
+        tail_start=4, logical_stop=7)
+
+    want = energies.copy()
+    want[:, 4:7] = 1.25 * energies[:, 4:7] + 0.75
+    np.testing.assert_array_equal(got, want)
+    np.testing.assert_array_equal(got[:, :4], energies[:, :4])
+
+
+def test_conduction_tail_scissor_does_not_touch_mesh_padding():
+    energies = np.array([
+        [-3.0, -1.0, 1.0, 2.0, 5.0, 8.0, 1.0e30, 1.0e30],
+        [-2.5, -0.5, 1.5, 2.5, 6.0, 9.0, 1.0e30, 1.0e30],
+    ], dtype=np.float64)
+    got = apply_conduction_scissor_to_tail(
+        energies, _tail_fit(alpha_c=0.8, beta_c_ev=1.0),
+        tail_start=3, logical_stop=6)
+
+    np.testing.assert_array_equal(got[:, 6:], energies[:, 6:])
+    np.testing.assert_array_equal(got[:, :3], energies[:, :3])
+    np.testing.assert_array_equal(
+        got[:, 3:6], 0.8 * energies[:, 3:6] + 1.0)
 
 
 # ---------------------------------------------------------------------------

@@ -476,6 +476,7 @@ def rotate_wavefunctions(
     U_dft_to_qp_active: jax.Array,
     *,
     enk_active_new: jax.Array,
+    enk_base: jax.Array | None = None,
     efermi: float | None,
     mesh_xy: Mesh,
     active_slice: slice | None = None,
@@ -531,11 +532,12 @@ def rotate_wavefunctions(
     The ``active_slice`` (default: ``wfns_dft.slices.sigma`` — the QP
     evaluation window) selects a contiguous band block ``[start, stop)``
     where the QP Hamiltonian has full off-diagonal Σ and we apply the
-    band-mixing unitary.  Bands **outside** that window keep their DFT
-    wavefunctions and DFT energies untouched; their QP corrections come
-    from the scissor extrapolation downstream.  This avoids rotating ψ
-    for bands the QP calculation never touched (which is both wasteful
-    and physically wrong since we have no Σ for them).
+    band-mixing unitary.  Bands **outside** that window always keep their
+    DFT wavefunctions.  Their energies come from ``enk_base`` when one is
+    supplied, otherwise from the DFT bundle unchanged.  This lets the SC
+    driver apply an energy-only scissor to conduction-sum bands without
+    inventing a QP wavefunction rotation for bands the QP matrix never
+    touched.
 
     Validation
     ----------
@@ -551,8 +553,16 @@ def rotate_wavefunctions(
         Per-k unitary on the active block, shape ``(nk, nb_active, nb_active)``.
     enk_active_new
         New eigenvalues on the active block, shape ``(nk, nb_active)``.
+    enk_base
+        Optional full-band energy ladder, shape ``(nk, nb_full)``.  Only
+        entries outside ``active_slice`` survive; active entries are always
+        replaced by ``enk_active_new``.  The caller owns preserving logical
+        padding in this ladder.  ``None`` takes the exact historical path
+        from ``wfns_dft.enk``.
     efermi
-        Fermi level; used to rebuild ``occ``.
+        Fermi level; used here to rebuild ``occ`` after both the active and
+        optional inactive energy updates.  No energy-only helper owns
+        occupations.
     mesh_xy
         2-D device mesh; sharding of the four ψ copies is preserved.
     active_slice
@@ -600,9 +610,22 @@ def rotate_wavefunctions(
             wfns_dft.psi_xn, wfns_dft.psi_xr, wfns_dft.psi_yr,
             wfns_dft.psi_yn, U)
 
-        # enk: copy DFT, replace the active block with the new eigenvalues.
-        enk_full = wfns_dft.enk.at[:, active_slice].set(
-            jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        # enk: the default branch is the exact historical expression.  The
+        # optional base changes inactive ENERGIES only; the active block is
+        # overwritten below and the four ψ arrays above always started from
+        # wfns_dft.
+        if enk_base is None:
+            enk_full = wfns_dft.enk.at[:, active_slice].set(
+                jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        else:
+            if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
+                raise ValueError(
+                    f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
+                    f"does not match full DFT energies "
+                    f"{wfns_dft.enk.shape}.")
+            enk_full = jnp.asarray(
+                enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
+                    jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
         rep2 = NamedSharding(mesh_xy, P(None, None))
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
         occ_full = jax.lax.with_sharding_constraint(
