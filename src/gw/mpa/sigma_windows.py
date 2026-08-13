@@ -26,6 +26,8 @@ from gw.ppm_windows import (_SigmaBranch, _SigmaWindow,
 class SharedSigmaWindow(NamedTuple):
     window: _SigmaWindow
     E_A: jax.Array
+    omega_abs: np.ndarray
+    omega_idx: np.ndarray
     pole_indices: np.ndarray
     bounds: np.ndarray
     phase_real: np.ndarray
@@ -232,7 +234,8 @@ def build_shared_sigma_windows(
                 f"positive complex-sector fit; sampled error "
                 f"{fit.sampled_max_error:.3e}; rank {nodes.t.size}")
             output.append(SharedSigmaWindow(
-                win, branch.E_A, np.asarray(pole_i, np.int32), np.asarray(bounds),
+                win, branch.E_A, branch.omega_abs, branch.omega_idx,
+                np.asarray(pole_i, np.int32), np.asarray(bounds),
                 np.asarray(phases, bool)))
 
     if crossing_branches:
@@ -260,7 +263,8 @@ def build_shared_sigma_windows(
                         target_error, f"positive damped crossing rule; "
                         f"rank {exact_nodes.t.size}")
                     output.append(SharedSigmaWindow(
-                        win, _branch.E_A, idx, bounds, phase))
+                        win, _branch.E_A, _branch.omega_abs,
+                        _branch.omega_idx, idx, bounds, phase))
 
         # The near-axis core is the existing HGL service, not an imitation.
         idx, bounds, phase, _stats_rows = selected["narrow_shallow"]
@@ -279,7 +283,8 @@ def build_shared_sigma_windows(
                         "core_hgl", hgl_nodes, mask, eb[0], +1, "imag", -neg,
                         q.max_error, q.provenance, crossing_kind="hgl")
                     output.append(SharedSigmaWindow(
-                        win, branch.E_A, idx, bounds, phase))
+                        win, branch.E_A, branch.omega_abs,
+                        branch.omega_idx, idx, bounds, phase))
 
     return output, {"xi_ry": xi, "omega_max_ry": omega_max,
                     "n_windows": len(output),

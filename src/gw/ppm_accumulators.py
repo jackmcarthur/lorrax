@@ -550,17 +550,35 @@ class DeviceOmegaAccumulator:
         self._index = 0
 
     def begin_window(self, t, alpha, *, omega_sign, prefactor,
-                     e_ref_sum=0.0, antihermitian=False):
+                     e_ref_sum=0.0, antihermitian=False,
+                     omega_indices=None, omega_values=None):
         if self._coeff is not None:
             raise RuntimeError("previous frequency window is still open")
         t = np.asarray(jax.device_get(t), np.complex128)
         alpha = np.asarray(jax.device_get(alpha), np.complex128)
         if t.ndim != 1 or alpha.shape != t.shape or t.size == 0:
             raise ValueError("t and alpha must be nonempty equal vectors")
-        self._coeff = np.asarray(_omega_coefficient(
-            np, self._omega[None, :], t[:, None], alpha[:, None],
+        if omega_indices is None:
+            if omega_values is not None:
+                raise ValueError("omega_values requires omega_indices")
+            omega = self._omega
+            indices = None
+        else:
+            indices = np.asarray(omega_indices, dtype=np.int64)
+            omega = np.asarray(omega_values, dtype=np.complex128)
+            if (indices.ndim != 1 or omega.shape != indices.shape
+                    or np.any(indices < 0) or np.any(indices >= self._omega.size)):
+                raise ValueError("invalid active frequency indices/values")
+        active = np.asarray(_omega_coefficient(
+            np, omega[None, :], t[:, None], alpha[:, None],
             float(omega_sign), float(prefactor), float(e_ref_sum)),
             np.complex128)
+        if indices is None:
+            self._coeff = active
+        else:
+            self._coeff = np.zeros(
+                (t.size, self._omega.size), dtype=np.complex128)
+            self._coeff[:, indices] = active
         self._index = 0
         self._window = (_device_output_zeros(
             self._shape, self._sharding)() if antihermitian else None)

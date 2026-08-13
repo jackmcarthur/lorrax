@@ -92,3 +92,24 @@ def test_device_frequency_fold_and_one_sided_completion():
     broken.add_tau(sigma)
     with pytest.raises(RuntimeError, match="before all tau nodes"):
         broken.end_window()
+
+
+def test_device_frequency_fold_can_target_one_causal_half():
+    mesh = _mesh()
+    sigma_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    output_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    omega = np.asarray([-0.6, -0.2, 0.0, 0.4])
+    sigma = jax.device_put(
+        np.asarray([[[2.0 + 0.5j]]]), sigma_sharding)
+    acc = DeviceOmegaAccumulator(
+        omega, shape=(4, 1, 1, 1), sharding=output_sharding)
+    acc.begin_window(
+        np.asarray([0.3]), np.asarray([0.7]), omega_sign=1.0,
+        prefactor=-1.0, omega_indices=np.asarray([2, 3]),
+        omega_values=np.asarray([0.0, 0.4]))
+    acc.add_tau(sigma)
+    acc.end_window()
+    got = np.asarray(acc.finalize())[:, 0, 0, 0]
+    assert np.array_equal(got[:2], np.zeros(2, np.complex128))
+    want = -0.7 * np.exp(1j * np.asarray([0.0, 0.4]) * 0.3) * (2 + 0.5j)
+    np.testing.assert_allclose(got[2:], want, rtol=2e-14, atol=2e-14)
