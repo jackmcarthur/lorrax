@@ -204,10 +204,9 @@ def branch_address(*, source_sha, fit_store, n_p, pole, bkey, slab,
     planning time it replaces rather than assumed to be small.
     """
     h = hashlib.blake2b(digest_size=16)
-    address_format = (PLAN_FORMAT
-                      if str(scalars.get("windowing", "pane")) == "sector"
-                      else _V1_FORMAT)
-    h.update(f"{address_format}\n".encode())
+    # Preserve the established address space.  Compact production plans use
+    # plain filenames and never enter the addressed-plan route.
+    h.update(f"{_V1_FORMAT}\n".encode())
     _feed(h, "slab", str(slab))
     _feed(h, "source_sha", str(source_sha))
     _feed(h, "fit_store", str(fit_store))
@@ -369,7 +368,12 @@ def write_branch_plan(path, groups, *, address, pole, bkey, source_sha,
         f.attrs["n_p"] = int(n_p)
         f.attrs["n_groups"] = int(len(groups))
         f.attrs["group_plan_digest"] = WF.group_plan_digest(groups)
-        f.attrs["full_plan_digest"] = WF.full_plan_digest(groups)
+        # ``full_plan_digest`` belongs to the legacy index-backed farm path.
+        # Compact scalar selectors are consumed by the plain plan interface
+        # and deliberately add no new identity scheme.
+        f.attrs["full_plan_digest"] = (
+            WF.full_plan_digest(groups)
+            if all(g.selector_bounds_B is None for g in groups) else "")
         f.attrs["window_fields"] = ",".join(win_fields)
         f.attrs["written_utc"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
