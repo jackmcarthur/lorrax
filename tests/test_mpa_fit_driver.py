@@ -91,6 +91,72 @@ _SAMPLING = {"varpi": [0.1, 1.0], "n_p": _N_P, "alpha": 1,
              "omega_max": _OMEGA_M, "protocol": "double_parallel"}
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _host_slabio_for_driver_tests():
+    """Exercise the collective API on CPU; PHDF5 itself has cluster tests."""
+    import file_io.slab_io as slab_io
+    from jax.sharding import NamedSharding
+
+    original = slab_io.SlabIO
+
+    class HostSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            self.file = h5py.File(path, mode)
+            self.mesh = mesh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.file.close()
+
+        def create_dataset(self, name, *, shape, dtype, **_):
+            if name not in self.file:
+                self.file.create_dataset(name, shape=shape, dtype=dtype)
+
+        def read_slab(self, name, *, shape, offset, valid_shape,
+                      partition_spec, **_):
+            out = np.zeros(shape, dtype=self.file[name].dtype)
+            extent = tuple(min(valid_shape[d], shape[d],
+                               self.file[name].shape[d] - offset[d])
+                           for d in range(len(shape)))
+            dst = tuple(slice(0, n) for n in extent)
+            src = tuple(slice(offset[d], offset[d] + extent[d])
+                        for d in range(len(shape)))
+            out[dst] = self.file[name][src]
+            return jax.device_put(
+                out, NamedSharding(self.mesh, partition_spec))
+
+        def write_slab(self, name, value, *, offset, valid_shape, **_):
+            host = np.asarray(jax.device_get(value))
+            extent = tuple(min(valid_shape[d], host.shape[d],
+                               self.file[name].shape[d] - offset[d])
+                           for d in range(host.ndim))
+            dst = tuple(slice(offset[d], offset[d] + extent[d])
+                        for d in range(host.ndim))
+            src = tuple(slice(0, n) for n in extent)
+            self.file[name][dst] = host[src]
+
+    slab_io.SlabIO = HostSlabIO
+    yield
+    slab_io.SlabIO = original
+
+
+@pytest.fixture(scope="module")
+def mesh_xy():
+    from jax.sharding import Mesh
+    devices = np.asarray(jax.devices())
+    shape = (2, 2) if devices.size == 4 else (1, 1)
+    return Mesh(devices[:np.prod(shape)].reshape(shape), ("x", "y"))
+
+
+def _allocate_collective_fit(path, n_q, n_mu, n_p, mesh_xy):
+    return MS.allocate_fit_store_collective(
+        str(path), mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,
+        diagnostic_keys=("condition", "backward_error", "residual",
+                         "n_valid"))
+
+
 # ---------------------------------------------------------------------------
 # Geometry, the planted field, and the W(omega) file
 # ---------------------------------------------------------------------------
@@ -234,13 +300,14 @@ def planted(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def fitted(planted):
+def fitted(planted, mesh_xy):
     """One full driver run: the finalized store, ledger and report."""
     fit_path = planted["root"] / "mpa_fit.h5"
     stream = io.StringIO()
     ledger, report = fit_driver.run_fit_driver(
         str(planted["w_path"]), _W_NAME, str(fit_path),
-        planted["z"], planted["n_p"], report_stream=stream)
+        planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+        report_stream=stream)
     return {"path": fit_path, "ledger": ledger, "report": report,
             "text": stream.getvalue()}
 
@@ -281,6 +348,49 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     assert d_b < 1.0e-6
 
 
+def test_p4_nondivisible_rows_are_padded_not_gathered(mesh_xy):
+    """At P=4, N_mu=5 is row-sharded as 8 and padding stays zero."""
+    if int(np.prod(tuple(mesh_xy.shape.values()))) != 4:
+        pytest.skip("requires a four-device 2x2 mesh")
+    import jax.numpy as jnp
+    from file_io.slab_io import mesh_divisible_shape
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    n_p, n_mu, n_cols = 2, 5, 2
+    z = _protocol_grid(n_p)
+    Omega_ref = np.array([0.8 - 0.08j, 2.0 - 0.2j])
+    B_ref = np.array([1.0 + 0.1j, 0.5 - 0.2j])
+    w = pade_fit.synthesize_w_samples(Omega_ref, B_ref, z)
+    spec = P(None, None, ("x", "y"), None)
+    shape = mesh_divisible_shape((2 * n_p, 1, n_mu, n_cols),
+                                 mesh_xy, spec)
+    host = np.zeros(shape, dtype=np.complex128)
+    host[:, 0, :n_mu, :] = np.asarray(w)[:, None, None]
+    block = jax.device_put(host, NamedSharding(mesh_xy, spec))
+    z_dev = jax.device_put(jnp.asarray(z), NamedSharding(mesh_xy, P(None)))
+    row_ids = jax.device_put(
+        jnp.arange(shape[2], dtype=jnp.int32),
+        NamedSharding(mesh_xy, P(("x", "y"))))
+    kernel = fit_driver._sharded_fit_kernel(
+        mesh_xy, n_p, tuple(sorted(pade_fit.DEFAULT_GUARDS.items())),
+        1.0e-13)
+    Om, Bp, *_, finite = kernel(
+        block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
+    got_om = np.asarray(jax.device_get(Om))
+    got_b = np.asarray(jax.device_get(Bp))
+    np.testing.assert_allclose(
+        got_om[:, 0, :n_mu],
+        np.broadcast_to(Omega_ref[:, None, None], (n_p, n_mu, n_cols)),
+        atol=1.0e-10)
+    np.testing.assert_allclose(
+        got_b[:, 0, :n_mu],
+        np.broadcast_to(B_ref[:, None, None], (n_p, n_mu, n_cols)),
+        atol=1.0e-10)
+    assert np.all(got_om[:, 0, n_mu:] == 0.0)
+    assert np.all(got_b[:, 0, n_mu:] == 0.0)
+    assert bool(np.asarray(jax.device_get(finite)))
+
+
 #: How far above the ``cond * eps_mach`` conditioning floor each quantity
 #: may land.  Sized from a two-device measurement recorded in the cell
 #: below: Omega reaches 5.7x the floor on this host's GPU and 0.036x on its
@@ -291,7 +401,7 @@ _COND_EPS_MARGIN_OMEGA = 30.0
 _COND_EPS_MARGIN_B = 300.0
 
 
-def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys):
+def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
     """The gate again at n_p = 8 — the Si schedule, and the regime
     where the conditioning the theory plan ranks as risk 6 actually
     bites.
@@ -362,7 +472,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys):
     stream = io.StringIO()
     ledger, report = fit_driver.run_fit_driver(
         str(tmp_path / "W_si.h5"), _W_NAME, str(fit_path),
-        field["z"], n_p, report_stream=stream)
+        field["z"], n_p, mesh_xy=mesh_xy, report_stream=stream)
     assert ledger["complete"]
     assert report["n_cols_budget"] == 1
     assert report["blocks_walked"] == field["n_q"] * field["n_mu"]
@@ -447,7 +557,7 @@ def test_the_journal_spans_the_column_axis_exactly_once(planted, fitted):
 # ---------------------------------------------------------------------------
 
 def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
-        planted, tmp_path):
+        planted, tmp_path, mesh_xy):
     """Walk every block but one; finalize must refuse and say which.
 
     The point is not that finalize refuses — the store's own suite has
@@ -457,7 +567,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
     """
     fit_path = tmp_path / "gappy.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    _allocate_collective_fit(fit_path, n_q, n_mu, n_p, mesh_xy)
 
     schedule = tiling.fit_schedule(n_q, n_mu, 2 * n_p)
     skipped = schedule[len(schedule) // 2]
@@ -466,7 +576,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
             continue
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q,
-            np.arange(lo, hi), planted["z"], n_p)
+            np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
 
     with pytest.raises(ValueError) as exc:
         MS.finalize_fit_store(str(fit_path))
@@ -483,7 +593,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
 # ---------------------------------------------------------------------------
 
 def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
-        planted, tmp_path, capsys):
+        planted, tmp_path, capsys, mesh_xy):
     """A block too wide is refused, changes nothing, and the walk goes on.
 
     THE RESUMABILITY CLAIM, AS A TEST.  ``fit_one_block`` reads before
@@ -497,7 +607,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     fit_path = tmp_path / "resumed.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
     n_omega = 2 * n_p
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    _allocate_collective_fit(fit_path, n_q, n_mu, n_p, mesh_xy)
 
     budget = MS.choose_column_budget(n_mu, n_omega)
     assert budget < n_mu, "the walk must take more than one block"
@@ -508,7 +618,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     for q, lo, hi in schedule[:2]:
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q,
-            np.arange(lo, hi), planted["z"], n_p)
+            np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
     before = MS.fit_completion_ledger(str(fit_path))
 
     q, lo, _ = schedule[2]
@@ -516,7 +626,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     with pytest.raises(ValueError) as exc:
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q, greedy,
-            planted["z"], n_p)
+            planted["z"], n_p, mesh_xy=mesh_xy)
     msg = str(exc.value)
     assert f"refusing {budget + 1} columns" in msg
     assert f"allows {budget}" in msg
@@ -535,7 +645,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     for q, lo, hi in schedule[2:]:
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q,
-            np.arange(lo, hi), planted["z"], n_p)
+            np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
     ledger = MS.finalize_fit_store(str(fit_path))
     assert ledger["complete"]
 
@@ -552,14 +662,14 @@ def test_the_walk_never_reads_more_than_one_tile(fitted):
 
 
 def test_driver_refuses_a_grid_that_is_not_the_files_stamped_grid(
-        planted, tmp_path):
+        planted, tmp_path, mesh_xy):
     """A fit against the wrong abscissae is what the stamp prevents."""
     wrong = np.asarray(planted["z"], dtype=np.complex128).copy()
     wrong[2] += 1.0e-6
     with pytest.raises(ValueError, match="stamped omega"):
         fit_driver.run_fit_driver(
             str(planted["w_path"]), _W_NAME, str(tmp_path / "no.h5"),
-            wrong, planted["n_p"])
+            wrong, planted["n_p"], mesh_xy=mesh_xy)
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +882,8 @@ def test_each_pass_records_its_pole_provenance(fitted):
     assert all(row["gamma_max"] > 0.0 for row in info["passes"])
 
 
-def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
+def test_read_pole_slice_refuses_an_unfinalized_store(
+        planted, tmp_path, mesh_xy):
     """The stopgap reader keeps the store's refusal, not just its bytes.
 
     Reading the pole slab straight out of HDF5 would bypass "an
@@ -783,11 +894,11 @@ def test_read_pole_slice_refuses_an_unfinalized_store(planted, tmp_path):
     """
     fit_path = tmp_path / "partial.h5"
     n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
-    MS.allocate_fit_store(str(fit_path), n_q=n_q, n_mu=n_mu, n_p=n_p)
+    _allocate_collective_fit(fit_path, n_q, n_mu, n_p, mesh_xy)
     q, lo, hi = tiling.fit_schedule(n_q, n_mu, 2 * n_p)[0]
     fit_driver.fit_one_block(
         str(planted["w_path"]), _W_NAME, str(fit_path), q,
-        np.arange(lo, hi), planted["z"], n_p)
+        np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
 
     with pytest.raises(ValueError, match="NOT FINALIZED"):
         MS.read_pole_slice(str(fit_path), 0)

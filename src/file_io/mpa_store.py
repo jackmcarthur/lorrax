@@ -1547,9 +1547,115 @@ def read_w_columns(
     return block
 
 
+def read_w_columns_collective(
+    src,
+    name,
+    q,
+    mu_cols,
+    *,
+    mesh_xy,
+    n_cols_buffer,
+    tile_bytes=None,
+    header=None,
+):
+    """Collectively read one all-frequency column tile, sharded on rows.
+
+    The returned array is ``(n_omega, 1, n_mu_padded, n_cols_buffer)``
+    with ``P(None, None, ('x', 'y'), None)``.  The singleton is the stored
+    q axis; retaining it makes the SlabIO offset and the fit-store write
+    geometry identical.  A short final column block is zero-filled to the
+    fixed buffer width and ``valid_shape`` prevents those zeros from reading
+    bytes belonging to the next block.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from file_io.slab_io import SlabIO, mesh_divisible_shape
+
+    hdr = read_w_header(src, name) if header is None else header
+    n_mu = int(hdr["n_mu"])
+    n_omega = int(hdr["n_omega"])
+    cols = normalise_columns(mu_cols, n_mu)
+    lo, hi = int(cols[0]), int(cols[-1]) + 1
+    if hi - lo != int(cols.size):
+        raise ValueError(
+            "read_w_columns_collective requires one contiguous column "
+            "range; the production fit schedule emits contiguous blocks")
+    width = int(n_cols_buffer)
+    budget = choose_column_budget(n_mu, n_omega, tile_bytes)
+    if int(cols.size) > budget:
+        raise ValueError(
+            f"read_w_columns_collective({name!r}): refusing "
+            f"{int(cols.size)} columns.  "
+            + describe_column_cost(n_mu, n_omega, int(cols.size), tile_bytes)
+            + f"  The column budget allows {budget}.")
+    if width < int(cols.size) or width > budget:
+        raise ValueError(
+            f"read_w_columns_collective: n_cols_buffer={width}, actual "
+            f"width={int(cols.size)}, budget={budget}; require "
+            "actual <= buffer <= budget")
+    if int(hdr["n_ready"]) != n_omega:
+        missing = np.flatnonzero(~np.asarray(hdr["data_ready"], dtype=bool))
+        raise ValueError(
+            f"read_w_columns_collective({name!r}): {len(missing)} of "
+            f"{n_omega} frequency slabs are not ready")
+    iq = int(q)
+    if not 0 <= iq < int(hdr["n_q_on_disk"]):
+        raise IndexError(
+            f"read_w_columns_collective: q={iq} is outside [0, "
+            f"{int(hdr['n_q_on_disk'])})")
+
+    spec = P(None, None, ("x", "y"), None)
+    shape = mesh_divisible_shape(
+        (n_omega, 1, n_mu, width), mesh_xy, spec)
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        return io.read_slab(
+            name, shape=shape, offset=(0, iq, 0, lo),
+            valid_shape=(n_omega, 1, n_mu, int(cols.size)),
+            partition_spec=spec)
+
+
 # ---------------------------------------------------------------------------
 # The staged B/Ω fit store
 # ---------------------------------------------------------------------------
+
+def _initialise_fit_metadata(
+    grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
+    centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
+):
+    """Rank-zero-only small metadata half of fit-store allocation."""
+    qs = _qs()
+    for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX] + [
+            k for k in grp if str(k).startswith("fit_")]:
+        if key in grp:
+            del grp[key]
+    led = grp.create_group(MPA_FIT_SUFFIX)
+    led.create_dataset("blocks_done", data=np.zeros((n_q, n_mu), dtype=bool))
+    led.create_dataset("block_journal", shape=(0, 3), maxshape=(None, 3),
+                       dtype=np.int64)
+    for key in ("block_condition_max", "block_backward_error_max"):
+        led.create_dataset(key, shape=(0,), maxshape=(None,),
+                           dtype=np.float64)
+    if diagnostic_keys is not None:
+        led.attrs["diagnostic_keys"] = ",".join(sorted(diagnostic_keys))
+
+    grp.attrs["mpa_fit_format_version"] = np.int64(MPA_FIT_FORMAT_VERSION)
+    if energy_unit is not None:
+        grp.attrs[FIT_ENERGY_UNIT_ATTR] = str(energy_unit)
+    grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
+    grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
+    grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
+    grp.attrs["mpa_fit_complete"] = False
+    grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
+    grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
+    grp.attrs["mpa_fit_allocated_utc"] = _utc_now()
+    for label, val in (("grid_hash", grid_hash), ("table_hash", table_hash),
+                       ("centroid_hash", centroid_hash)):
+        if val is not None:
+            grp.attrs["mpa_fit_w_" + label] = str(val)
+    for key, val in (provenance or {}).items():
+        grp.attrs["prov_" + str(key)] = val
+    if unfold_tables is not None:
+        stamp_fit_unfold_tables(grp, unfold_tables)
 
 def allocate_fit_store(
     dest,
@@ -1594,7 +1700,6 @@ def allocate_fit_store(
         that these poles came from that screening on that centroid set.
         Optional only because a synthetic fit has no such file.
     """
-    qs = _qs()
     n_q = int(n_q)
     n_mu = int(n_mu)
     n_p = int(n_p)
@@ -1607,16 +1712,12 @@ def allocate_fit_store(
         raise ValueError(
             f"allocate_fit_store: energy_unit must be one of "
             f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
-    with qs.QirrDest(dest, mode) as grp:
-        # EVERY ``fit_*`` GOES, not just the two required ones.  A
-        # re-allocation that left an earlier run's extra diagnostic
-        # behind would leave a full-size array of ITS numbers indexed by
-        # THIS run's ledger, and the Σ stage would certify the new poles
-        # against the old evidence.
-        for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX] + [
-                k for k in grp if str(k).startswith("fit_")]:
-            if key in grp:
-                del grp[key]
+    with _qs().QirrDest(dest, mode) as grp:
+        _initialise_fit_metadata(
+            grp, n_q=n_q, n_mu=n_mu, n_p=n_p, energy_unit=energy_unit,
+            grid_hash=grid_hash, table_hash=table_hash,
+            centroid_hash=centroid_hash, unfold_tables=unfold_tables,
+            provenance=provenance)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -1626,37 +1727,55 @@ def allocate_fit_store(
         grp.create_dataset("fit_backward_error", shape=(n_q, n_mu, n_mu),
                            dtype=np.float64)
 
-        led = grp.create_group(MPA_FIT_SUFFIX)
-        led.create_dataset("blocks_done", data=np.zeros((n_q, n_mu),
-                                                        dtype=bool))
-        led.create_dataset("block_journal",
-                           shape=(0, 3), maxshape=(None, 3),
-                           dtype=np.int64)
-        for key in ("block_condition_max", "block_backward_error_max"):
-            led.create_dataset(key, shape=(0,), maxshape=(None,),
-                               dtype=np.float64)
-
-        grp.attrs["mpa_fit_format_version"] = np.int64(
-            MPA_FIT_FORMAT_VERSION)
-        if energy_unit is not None:
-            grp.attrs[FIT_ENERGY_UNIT_ATTR] = str(energy_unit)
-        grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
-        grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
-        grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
-        grp.attrs["mpa_fit_complete"] = False
-        grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
-        grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
-        grp.attrs["mpa_fit_allocated_utc"] = _utc_now()
-        for label, val in (("grid_hash", grid_hash),
-                           ("table_hash", table_hash),
-                           ("centroid_hash", centroid_hash)):
-            if val is not None:
-                grp.attrs["mpa_fit_w_" + label] = str(val)
-        for key, val in (provenance or {}).items():
-            grp.attrs["prov_" + str(key)] = val
-        if unfold_tables is not None:
-            stamp_fit_unfold_tables(grp, unfold_tables)
         return fit_completion_ledger(grp)
+
+
+def allocate_fit_store_collective(
+    dest, *, mesh_xy, n_q, n_mu, n_p, diagnostic_keys,
+    energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
+    unfold_tables=None, dtype=None, provenance=None, mode="w",
+):
+    """Allocate a fit store without any rank owning a pole tensor.
+
+    Rank zero replaces and stamps only the small ledger/tables.  After a
+    barrier every rank collectively creates the pole and diagnostic datasets
+    through SlabIO, followed by a second barrier before any block is written.
+    """
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    n_q, n_mu, n_p = int(n_q), int(n_mu), int(n_p)
+    if min(n_q, n_mu, n_p) < 1:
+        raise ValueError("allocate_fit_store_collective: extents must be positive")
+    if energy_unit is not None and str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"allocate_fit_store_collective: unsupported energy unit "
+            f"{energy_unit!r}")
+    keys = tuple(sorted(str(k) for k in diagnostic_keys))
+    required = {"condition", "backward_error"}
+    if not required.issubset(keys):
+        raise ValueError(
+            "allocate_fit_store_collective requires condition and "
+            "backward_error diagnostics")
+    dtype = np.complex128 if dtype is None else dtype
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, mode) as grp:
+            _initialise_fit_metadata(
+                grp, n_q=n_q, n_mu=n_mu, n_p=n_p,
+                energy_unit=energy_unit, grid_hash=grid_hash,
+                table_hash=table_hash, centroid_hash=centroid_hash,
+                unfold_tables=unfold_tables, provenance=provenance,
+                diagnostic_keys=keys)
+    barrier("mpa_fit_metadata_allocated")
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
+                          dtype=dtype)
+        io.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
+        for key in keys:
+            io.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
+                              dtype=np.float64)
+    barrier("mpa_fit_payload_allocated")
+    return fit_completion_ledger(dest)
 
 
 def _utc_now():
@@ -1936,6 +2055,125 @@ def write_fit_block(
         _append(led["block_backward_error_max"],
                 np.array([float(np.max(diag["backward_error"]))]))
         return fit_completion_ledger(grp)
+
+
+def write_fit_block_collective(
+    dest,
+    q,
+    mu_cols,
+    Omega_p_block,
+    B_p_block,
+    diag_block,
+    *,
+    mesh_xy,
+    block_condition_max,
+    block_backward_error_max,
+    diagnostics_finite,
+):
+    """Collectively write one native row-sharded fit block.
+
+    Pole and diagnostic bytes never leave their owning devices.  Only after
+    all collective writes have closed does rank zero advance the small
+    completion ledger; a barrier publishes that commit to every rank.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    ledger = fit_completion_ledger(dest)
+    if ledger["complete"]:
+        raise ValueError("write_fit_block_collective: store is finalized")
+    iq = int(q)
+    if not 0 <= iq < ledger["n_q"]:
+        raise IndexError(
+            f"write_fit_block_collective: q={iq} outside [0,{ledger['n_q']})")
+    cols = normalise_columns(mu_cols, ledger["n_mu"])
+    lo, hi = int(cols[0]), int(cols[-1]) + 1
+    if hi - lo != int(cols.size):
+        raise ValueError("write_fit_block_collective requires contiguous columns")
+    already = cols[np.asarray(ledger["blocks_done"][iq, cols], dtype=bool)]
+    if already.size:
+        raise ValueError(
+            f"write_fit_block_collective: q={iq} columns "
+            f"{already[:8].tolist()} are already fitted")
+    if not bool(diagnostics_finite):
+        raise ValueError(
+            "write_fit_block_collective: fit diagnostics contain non-finite "
+            "values; refusing to certify this block")
+
+    pole_spec = P(None, None, ("x", "y"), None)
+    # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
+    diag_spec = P(None, ("x", "y"))
+    expected_pole = NamedSharding(mesh_xy, pole_spec)
+    expected_diag = NamedSharding(mesh_xy, diag_spec)
+    mesh_size = int(np.prod(tuple(int(v) for v in mesh_xy.shape.values())))
+
+    def _on(arr, expected):
+        sharding = getattr(arr, "sharding", None)
+        return (isinstance(sharding, NamedSharding)
+                and sharding.mesh == mesh_xy
+                and (sharding == expected or mesh_size == 1))
+
+    Om, Bp = Omega_p_block, B_p_block
+    if not _on(Om, expected_pole) or not _on(Bp, expected_pole):
+        raise ValueError(
+            "write_fit_block_collective requires Omega_p and B_p on "
+            "P(None,None,('x','y'),None)")
+    n_p, one, n_rows, width = map(int, Om.shape)
+    if tuple(Bp.shape) != tuple(Om.shape) or one != 1:
+        raise ValueError(
+            "write_fit_block_collective: pole blocks must agree and have "
+            "shape (n_p,1,n_mu_padded,n_cols_buffer)")
+    if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
+            or width < int(cols.size):
+        raise ValueError(
+            f"write_fit_block_collective: pole block {tuple(Om.shape)} is "
+            f"incompatible with n_p={ledger['n_p']}, n_mu={ledger['n_mu']}, "
+            f"columns={int(cols.size)}")
+    keys = tuple(sorted(diag_block))
+    stamped = None
+    with _qs().QirrDest(dest, "r") as grp:
+        stamped = _qs().qirr_attr_str(_open_fit(grp), "diagnostic_keys")
+    if stamped != ",".join(keys):
+        raise ValueError(
+            f"write_fit_block_collective: diagnostics {keys} do not match "
+            f"allocated keys {stamped!r}")
+    for key, arr in diag_block.items():
+        if tuple(arr.shape) != (1, n_rows, width):
+            raise ValueError(
+                f"write_fit_block_collective: diagnostic {key!r} has "
+                f"shape {tuple(arr.shape)}, expected {(1, n_rows, width)}")
+        if not _on(arr, expected_diag):
+            raise ValueError(
+                f"write_fit_block_collective: diagnostic {key!r} must be "
+                "on P(None,('x','y'),None)")
+
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
+        valid_diag = (1, ledger["n_mu"], int(cols.size))
+        io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
+                      valid_shape=valid_pole)
+        io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
+                      valid_shape=valid_pole)
+        for key in keys:
+            io.write_slab("fit_" + key, diag_block[key],
+                          offset=(iq, 0, lo), valid_shape=valid_diag)
+
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, "a") as grp:
+            led = _open_fit(grp)
+            done = np.asarray(led["blocks_done"][()], dtype=bool)
+            done[iq, cols] = True
+            led["blocks_done"][...] = done
+            _append(led["block_journal"],
+                    np.array([[iq, lo, hi]], dtype=np.int64))
+            _append(led["block_condition_max"],
+                    np.array([float(block_condition_max)]))
+            _append(led["block_backward_error_max"],
+                    np.array([float(block_backward_error_max)]))
+    barrier(f"mpa_fit_block_{iq}_{lo}_{hi}_committed")
+    return fit_completion_ledger(dest)
 
 
 def _canonical_diagnostics(diag_block, n_rows, n_cols):

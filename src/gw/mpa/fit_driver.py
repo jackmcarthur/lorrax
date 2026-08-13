@@ -13,10 +13,9 @@ that was planted.  That claim spans both, so it is tested here.
 
 THE LOOP, WHICH IS THE WHOLE MODULE
 -----------------------------------
-``plan_column_walk`` -> for each ``(q, column block)``: ``read_w_columns``
-(budgeted) -> ``fit_mpa_poles_batched`` (vmapped over the block's
-elements) -> ``write_fit_block`` (staged, as the block completes) ->
-``finalize_fit_store``.  Nothing accumulates across blocks except the
+``plan_column_walk`` -> for each ``(q, column block)``: collective SlabIO
+read -> row-local ``fit_mpa_poles_batched`` -> collective SlabIO write ->
+rank-zero ledger commit.  Nothing accumulates across blocks except the
 cost counters: the fit's OUTPUT is larger than its input at the
 scheduled ``n_p`` (``tiling`` derives the factor), so holding the poles
 until the last block would hold more than the samples that were already
@@ -45,6 +44,7 @@ protocol grid they were evaluated on is stamped beside them.
 
 from __future__ import annotations
 
+import functools
 import time
 
 import numpy as np
@@ -69,30 +69,64 @@ __all__ = [
 _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
 
 
-def _elements_from_block(block):
-    """``(n_omega, N_mu, n_cols)`` -> ``(N_mu * n_cols, n_omega)``.
+@functools.lru_cache(maxsize=None)
+def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
+    """One compiled local-row Padé fit; columns remain replicated."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
 
-    The fit kernel takes one element's sample vector per row and is
-    vmapped over the leading axis, so the frequency axis — outermost on
-    disk, because the fit reads all of omega for a few columns — becomes
-    the innermost one in the solve.  The element index is
-    ``mu * n_cols + col``, which is what :func:`_block_from_elements`
-    inverts; the two are written next to each other so the ordering has
-    one definition and not two.
-    """
-    n_omega, n_mu, n_cols = block.shape
-    return np.transpose(block, (1, 2, 0)).reshape(n_mu * n_cols, n_omega)
+    from common.shard_map import shard_map
 
+    row_axes = ("x", "y")
+    block_spec = P(None, None, row_axes, None)
+    pole_spec = P(None, None, row_axes, None)
+    diag_spec = P(None, row_axes, None)
+    guards = dict(guard_items)
+    n = int(n_p)
 
-def _block_from_elements(arr, n_mu, n_cols):
-    """``(n_elements, n_p)`` -> ``(n_p, N_mu, n_cols)``, the write shape.
+    def _local(block, z, row_ids, n_mu_logical, n_cols_logical):
+        samples = jnp.transpose(block[:, 0], (1, 2, 0))
+        n_rows, n_cols, n_omega = samples.shape
+        tile = samples.reshape(n_rows * n_cols, n_omega)
+        Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
+            tile, z, n, guards=guards, rcond=rcond)
+        Omega = jnp.transpose(
+            Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
+        Bp = jnp.transpose(
+            Bp.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
+        valid = ((row_ids[:, None] < n_mu_logical)
+                 & (jnp.arange(n_cols)[None, :] < n_cols_logical))
 
-    The pole axis leads on disk because the Sigma stage consumes
-    ``W(tau) = sum_p B_p exp(-i Omega_p tau)`` with ``p`` outermost —
-    one pass per pole, one contiguous slab per pass.
-    """
-    a = np.asarray(arr)
-    return np.transpose(a, (1, 0)).reshape(a.shape[1], n_mu, n_cols)
+        def _diag(x):
+            return jnp.where(valid, x.reshape(n_rows, n_cols), 0.0)[None]
+
+        condition = _diag(diag["cond_pade"])
+        backward = _diag(diag["backward_error"])
+        residual = _diag(diag["max_abs_residual"])
+        n_valid = _diag(diag["n_valid"])
+        Omega = jnp.where(valid[None, None], Omega, 0.0 + 0.0j)
+        Bp = jnp.where(valid[None, None], Bp, 0.0 + 0.0j)
+        maxima = lax.pmax(
+            jnp.stack((jnp.max(condition), jnp.max(backward))), row_axes)
+        finite = (
+            jnp.all(jnp.isfinite(Omega)) & jnp.all(jnp.isfinite(Bp))
+            & jnp.all(jnp.isfinite(condition))
+            & jnp.all(jnp.isfinite(backward))
+            & jnp.all(jnp.isfinite(residual))
+            & jnp.all(jnp.isfinite(n_valid)))
+        finite = lax.pmin(finite.astype(jnp.int32), row_axes)
+        return (Omega, Bp, condition, backward, residual, n_valid,
+                maxima, finite)
+
+    mapped = shard_map(
+        _local, mesh=mesh_xy,
+        in_specs=(block_spec, P(None), P(row_axes), P(), P()),
+        out_specs=(pole_spec, pole_spec, diag_spec, diag_spec, diag_spec,
+                   diag_spec, P(None), P()),
+        check_vma=True)
+    return jax.jit(mapped)
 
 
 def fit_one_block(
@@ -104,10 +138,12 @@ def fit_one_block(
     z_samples,
     n_p,
     *,
+    mesh_xy,
+    n_cols_buffer=None,
     tile_bytes=None,
     guards=None,
     rcond=1.0e-13,
-    out_spec=None,
+    header=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -131,10 +167,9 @@ def fit_one_block(
         function requires them to agree, because a fit against the
         wrong abscissae is the one failure the stamped grid exists to
         prevent.
-    out_spec
-        Optional row-axis sharding spec for the read block, checked (not
-        applied) by the reader.  ``tiling.row_shard_spec()`` is the only
-        shape it accepts.
+    mesh_xy
+        The run mesh.  The full ``('x', 'y')`` mesh shards the row axis;
+        frequency and the scheduled column buffer remain replicated.
 
     Returns
     -------
@@ -146,15 +181,27 @@ def fit_one_block(
 
     The Padé kernel returns its condition number, backward error and sample
     residual from the same solve; diagnostics therefore add no second fit.
+
     """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import device_put_process_local
+
     n = int(n_p)
+    hdr = mpa_store.read_w_header(w_src, w_name) if header is None else header
+    n_mu = int(hdr["n_mu"])
+    cols = mpa_store.normalise_columns(mu_cols, n_mu)
+    if n_cols_buffer is None:
+        n_cols_buffer = mpa_store.choose_column_budget(
+            n_mu, int(hdr["n_omega"]), tile_bytes)
     t_read = time.perf_counter()
-    block = mpa_store.read_w_columns(
-        w_src, w_name, q, mu_cols, tile_bytes=tile_bytes,
-        out_spec=out_spec)
+    block = mpa_store.read_w_columns_collective(
+        w_src, w_name, q, cols, mesh_xy=mesh_xy,
+        n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes, header=hdr)
     t_read = time.perf_counter() - t_read
 
-    n_omega, n_mu, n_cols = block.shape
+    n_omega, _, n_mu_padded, _ = map(int, block.shape)
+    n_cols = int(cols.size)
     z = np.asarray(z_samples, dtype=np.complex128)
     if z.shape != (2 * n,):
         raise ValueError(
@@ -172,34 +219,37 @@ def fit_one_block(
             f"either the fit is being run at an n_p the file was not "
             f"sampled for, or the file is not a double-parallel grid.")
 
-    tile = _elements_from_block(block)
-
     t_fit = time.perf_counter()
-    Omega, B, diag = pade_fit.fit_mpa_poles_batched(
-        tile, z, n, guards=guards, rcond=rcond)
-    Omega = np.asarray(Omega)
-    B = np.asarray(B)
+    resolved = pade_fit._resolve_guards(guards)
+    guard_items = tuple(sorted(resolved.items()))
+    kernel = _sharded_fit_kernel(mesh_xy, n, guard_items, float(rcond))
+    z_dev = device_put_process_local(
+        z, NamedSharding(mesh_xy, P(None)))
+    row_ids = device_put_process_local(
+        np.arange(n_mu_padded, dtype=np.int32),
+        NamedSharding(mesh_xy, P(("x", "y"))))
+    (Omega, B, condition, backward, residual, n_valid,
+     maxima, finite) = kernel(
+        block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
+    Omega.block_until_ready()
     t_fit = time.perf_counter() - t_fit
 
     diag_block = {
-        "condition": np.asarray(diag["cond_pade"],
-                                dtype=np.float64).reshape(n_mu, n_cols),
-        "backward_error": np.asarray(
-            diag["backward_error"],
-            dtype=np.float64).reshape(n_mu, n_cols),
-        "residual": np.asarray(
-            diag["max_abs_residual"],
-            dtype=np.float64).reshape(n_mu, n_cols),
-        "n_valid": np.asarray(
-            diag["n_valid"], dtype=np.float64).reshape(n_mu, n_cols),
+        "condition": condition,
+        "backward_error": backward,
+        "residual": residual,
+        "n_valid": n_valid,
+
     }
+    maxima_host = np.asarray(maxima.addressable_data(0), dtype=np.float64)
+    finite_host = bool(np.asarray(finite.addressable_data(0)))
 
     t_write = time.perf_counter()
-    ledger = mpa_store.write_fit_block(
-        fit_dest, q, mu_cols,
-        _block_from_elements(Omega, n_mu, n_cols),
-        _block_from_elements(B, n_mu, n_cols),
-        diag_block)
+    ledger = mpa_store.write_fit_block_collective(
+        fit_dest, q, cols, Omega, B, diag_block, mesh_xy=mesh_xy,
+        block_condition_max=maxima_host[0],
+        block_backward_error_max=maxima_host[1],
+        diagnostics_finite=finite_host)
     t_write = time.perf_counter() - t_write
 
     return {
@@ -207,7 +257,8 @@ def fit_one_block(
         "q": int(q),
         "n_cols": int(n_cols),
         "n_elements": int(n_mu * n_cols),
-        "bytes_read": int(block.size) * mpa_store.COMPLEX128_BYTES,
+        "bytes_read": (n_omega * n_mu * n_cols
+                       * mpa_store.COMPLEX128_BYTES),
         "fit_dispatches": 1,
         "diagnostic_dispatches": 0,
         "full_fits": int(n_mu * n_cols),
@@ -225,6 +276,7 @@ def run_fit_driver(
     z_samples,
     n_p,
     *,
+    mesh_xy,
     tile_bytes=None,
     guards=None,
     rcond=1.0e-13,
@@ -270,8 +322,9 @@ def run_fit_driver(
             "the failure that stamp exists to catch.")
 
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
-    mpa_store.allocate_fit_store(
-        fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
+    mpa_store.allocate_fit_store_collective(
+        fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
+        diagnostic_keys=_DIAGNOSTIC_KEYS,
         energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
@@ -301,13 +354,13 @@ def run_fit_driver(
                     "finalize": 0.0, "total": 0.0},
     }
 
-    spec = tiling.row_shard_spec()
     ledger = None
     for q, lo, hi in tiling.fit_schedule(n_q, n_mu, n_omega, tile_bytes):
         stats = fit_one_block(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
+            mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
             tile_bytes=tile_bytes, guards=guards, rcond=rcond,
-            out_spec=spec)
+            header=header)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1
         report["columns_read"] += stats["n_cols"]
@@ -324,8 +377,17 @@ def run_fit_driver(
         report["seconds"]["write"] += stats["seconds_write"]
 
     t_fin = time.perf_counter()
-    ledger = mpa_store.finalize_fit_store(
-        fit_dest, certification=certification)
+    from common.collectives import barrier, process_rank
+    before = mpa_store.fit_completion_ledger(fit_dest)
+    if not bool(np.asarray(before["blocks_done"]).all()):
+        raise ValueError(
+            "run_fit_driver: refusing collective finalize because the fit "
+            "ledger still has unfinished columns")
+    if process_rank() == 0:
+        mpa_store.finalize_fit_store(
+            fit_dest, certification=certification)
+    barrier("mpa_fit_finalized")
+    ledger = mpa_store.fit_completion_ledger(fit_dest)
     report["seconds"]["finalize"] = time.perf_counter() - t_fin
 
     report["logical_outputs"] = 2 * n * report["elements_fitted"]
@@ -335,7 +397,7 @@ def run_fit_driver(
     report["backward_error_max"] = ledger["backward_error_max"]
     report["seconds"]["total"] = time.perf_counter() - t_total
 
-    if report_stream is not None:
+    if report_stream is not None and process_rank() == 0:
         report_stream.write(format_cost_report(report))
     return ledger, report
 
