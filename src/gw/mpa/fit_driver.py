@@ -45,7 +45,6 @@ protocol grid they were evaluated on is stamped beside them.
 
 from __future__ import annotations
 
-import contextlib
 import time
 
 import numpy as np
@@ -290,9 +289,11 @@ def run_fit_driver(
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     mpa_store.allocate_fit_store(
         fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
+        energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
+        unfold_tables=mpa_store.read_w_tables(w_src, w_name),
         provenance=provenance)
 
     report = {
@@ -454,66 +455,7 @@ def pole_pass_order(n_p):
     return tuple(range(n))
 
 
-@contextlib.contextmanager
-def _as_group(src, mode="r"):
-    """An open h5py group, from either a path or an already-open one.
-
-    A three-line mirror of ``symmetry_maps.QirrDest``, and it should not
-    survive.  It exists only because :func:`read_pole_slice` is a read
-    ``mpa_store`` does not expose (see that function), so this module
-    has one file open the store cannot do for it.  When the pole-sliced
-    reader moves into ``mpa_store`` this goes with it.
-    """
-    if hasattr(src, "attrs"):
-        yield src
-        return
-    import h5py
-    with h5py.File(str(src), mode) as handle:
-        yield handle
-
-
-def read_pole_slice(fit_src, p, *, allow_partial=False):
-    """``(Omega_p, B_p)`` for ONE pole — ``(n_q, N_mu, N_mu)`` each.
-
-    STOPGAP, AND NAMED AS ONE.  The staged store's readers are
-    ``read_fit_block`` (all n_p poles, a few columns) and
-    ``read_fit_tensors`` (all poles, all columns).  Neither is the read
-    the Sigma accumulation actually performs: one pole, every q, every
-    element — which is exactly one contiguous slab of the ``(n_p, n_q,
-    N_mu, N_mu)`` dataset, because the pole axis was made leading on
-    disk FOR this access pattern.  The reader is one line and it is
-    missing, so it is written here rather than added to a branch this
-    one must not modify.  It belongs in ``mpa_store`` beside the other
-    two, and the design review is where that lands.
-
-    THE LEDGER REFUSAL IS NOT SKIPPED WITH IT.  Reading the slab
-    directly would bypass the store's "an unfitted column reads back as
-    zeros, and a zero pole is not an absent pole" refusal, so that
-    refusal is re-stated here against the public
-    ``fit_completion_ledger``.  ``allow_partial=True`` is the same
-    announced escape the store offers.
-    """
-    with _as_group(fit_src) as grp:
-        ledger = mpa_store.fit_completion_ledger(grp)
-        if not ledger["complete"] and not allow_partial:
-            raise ValueError(
-                f"read_pole_slice(p={p}): this fit store is NOT "
-                f"FINALIZED — {ledger['n_done']} of "
-                f"{ledger['n_total']} (q, column) pairs are fitted.  An "
-                f"unfitted column reads back as zeros, and a zero pole "
-                f"is not an absent pole: B_p = 0 at Omega_p = 0 "
-                f"contributes nothing to W(tau) = sum_p B_p "
-                f"exp(-i Omega_p tau) and therefore looks exactly like "
-                f"a converged fit of a genuinely dark screening "
-                f"channel.  Pass allow_partial=True to read the staged "
-                f"state deliberately.")
-        ip = int(p)
-        n_p = ledger["n_p"]
-        if not 0 <= ip < n_p:
-            raise IndexError(
-                f"read_pole_slice: p={ip} is outside [0, {n_p})")
-        return (np.asarray(grp["Omega_p"][ip]),
-                np.asarray(grp["B_p"][ip]))
+read_pole_slice = mpa_store.read_pole_slice
 
 
 def accumulate_over_pole_passes(
@@ -576,25 +518,24 @@ def accumulate_over_pole_passes(
         records the (pole index, E_ref_B, quadrature provenance) triple
         it used"* — the pole index is this module's half).
     """
-    with _as_group(fit_src) as grp:
-        ledger = mpa_store.fit_completion_ledger(grp)
-        n_p = ledger["n_p"]
-        walk = (pole_pass_order(n_p) if order is None
-                else tuple(int(p) for p in order))
+    ledger = mpa_store.fit_completion_ledger(fit_src)
+    n_p = ledger["n_p"]
+    walk = (pole_pass_order(n_p) if order is None
+            else tuple(int(p) for p in order))
 
-        total = None
-        passes = []
-        for p in walk:
-            Omega_p, B_p = read_pole_slice(
-                grp, p, allow_partial=allow_partial)
-            contrib = per_pole_fn(p, Omega_p, B_p)
-            total = contrib if total is None else total + contrib
-            passes.append({
-                "pole_index": int(p),
-                "re_omega_min": float(np.min(np.real(Omega_p))),
-                "re_omega_max": float(np.max(np.real(Omega_p))),
-                "gamma_max": float(np.max(np.abs(np.imag(Omega_p)))),
-            })
+    total = None
+    passes = []
+    for p in walk:
+        Omega_p, B_p = read_pole_slice(
+            fit_src, p, allow_partial=allow_partial)
+        contrib = per_pole_fn(p, Omega_p, B_p)
+        total = contrib if total is None else total + contrib
+        passes.append({
+            "pole_index": int(p),
+            "re_omega_min": float(np.min(np.real(Omega_p))),
+            "re_omega_max": float(np.max(np.real(Omega_p))),
+            "gamma_max": float(np.max(np.abs(np.imag(Omega_p)))),
+        })
 
     return total, {
         "order": walk,

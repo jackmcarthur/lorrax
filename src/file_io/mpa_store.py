@@ -142,6 +142,13 @@ MPA_GROUP_SUFFIX = "__mpa"
 #: Sibling group holding the staged-fit completion ledger.
 MPA_FIT_SUFFIX = "__mpafit"
 
+# The fit keeps the W wedge's q map beside its poles.  The tables belong to
+# ``symmetry_maps``; this is only the dataset name under which that service
+# files them.
+FIT_TABLE_OWNER = "Omega_p"
+FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
+FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
+
 #: Bump when the fit store's layout changes.  Independent of the W
 #: format's version: the two files have separate lifetimes and a reader
 #: of one is not a reader of the other.
@@ -1493,9 +1500,11 @@ def allocate_fit_store(
     n_q,
     n_mu,
     n_p,
+    energy_unit=None,
     grid_hash=None,
     table_hash=None,
     centroid_hash=None,
+    unfold_tables=None,
     dtype=None,
     provenance=None,
     mode="a",
@@ -1537,6 +1546,10 @@ def allocate_fit_store(
             f"allocate_fit_store: extents must be positive; got n_q="
             f"{n_q}, n_mu={n_mu}, n_p={n_p}")
     dtype = np.complex128 if dtype is None else dtype
+    if energy_unit is not None and str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"allocate_fit_store: energy_unit must be one of "
+            f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
     with qs.QirrDest(dest, mode) as grp:
         # EVERY ``fit_*`` GOES, not just the two required ones.  A
         # re-allocation that left an earlier run's extra diagnostic
@@ -1568,6 +1581,8 @@ def allocate_fit_store(
 
         grp.attrs["mpa_fit_format_version"] = np.int64(
             MPA_FIT_FORMAT_VERSION)
+        if energy_unit is not None:
+            grp.attrs[FIT_ENERGY_UNIT_ATTR] = str(energy_unit)
         grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
         grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
         grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
@@ -1582,6 +1597,8 @@ def allocate_fit_store(
                 grp.attrs["mpa_fit_w_" + label] = str(val)
         for key, val in (provenance or {}).items():
             grp.attrs["prov_" + str(key)] = val
+        if unfold_tables is not None:
+            stamp_fit_unfold_tables(grp, unfold_tables)
         return fit_completion_ledger(grp)
 
 
@@ -1814,6 +1831,12 @@ def fit_completion_ledger(src, *, mode="r"):
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
+            "n_q_full": int(grp.attrs.get(
+                "mpa_fit_n_q_full", grp.attrs["mpa_fit_n_q"])),
+            "q_storage": qs.qirr_attr_str(
+                grp, "mpa_fit_q_storage") or "full",
+            "table_hash": qs.qirr_attr_str(grp, "mpa_fit_table_hash"),
+            "energy_unit": qs.qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
             "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
             "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
             "blocks_done": done,
@@ -1977,3 +2000,140 @@ def read_fit_tensors(src, *, allow_partial=False, mode="r"):
         diag = {str(k)[len("fit_"):]: np.asarray(grp[k][()])
                 for k in grp if str(k).startswith("fit_")}
         return Om, Bp, diag, ledger
+
+
+def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
+    """Store the W wedge's existing q-unfold tables beside its fitted poles."""
+    qs = _qs()
+    can = tables.canonical()
+    with qs.QirrDest(dest, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        storage = qs.validate_qirr_tables(
+            can, int(ledger["n_q"]), int(ledger["n_mu"]))
+        digest = can.digest()
+        stamped = qs.qirr_attr_str(grp, "mpa_fit_table_hash")
+        if stamped is not None and stamped != digest:
+            raise ValueError(
+                "stamp_fit_unfold_tables: the store already carries a "
+                "different q-unfold table")
+        name = FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX
+        if name in grp:
+            del grp[name]
+        tgrp = grp.create_group(name)
+        for key in ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm",
+                    "L_table"):
+            tgrp.create_dataset(key, data=getattr(can, key))
+        tgrp.attrs["n_sym_spatial"] = np.int64(can.n_sym_spatial)
+        tgrp.attrs["table_hash"] = digest
+        grp.attrs["mpa_fit_table_hash"] = digest
+        grp.attrs["mpa_fit_q_storage"] = storage
+        grp.attrs["mpa_fit_n_q_full"] = np.int64(can.n_q_full)
+    return can
+
+
+def read_fit_unfold_tables(src, *, mode="r"):
+    """Return the fit store's q-unfold tables, or ``None`` for full BZ."""
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        if FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX not in grp:
+            return None
+        return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
+
+
+def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
+    """Unfold one pole wedge without conjugating its frequency dependence."""
+    import jax.numpy as jnp
+
+    from symmetry_maps import unfold_isdf_operator
+
+    can = tables.canonical()
+    if (Omega_p.ndim != 3 or tuple(B_p.shape) != tuple(Omega_p.shape)
+            or Omega_p.shape[-1] != Omega_p.shape[-2]):
+        raise ValueError("pole slabs must share one square (q,mu,mu) shape")
+    if int(can.n_mu) > int(Omega_p.shape[-1]):
+        raise ValueError("pole slab is smaller than its centroid tables")
+    if int(can.n_mu) != int(Omega_p.shape[-1]):
+        can = can.padded(int(Omega_p.shape[-1]))
+    kwargs = dict(
+        irr_idx=can.irr_idx_q, sym_idx=can.sym_idx_q,
+        sym_perm=can.sym_perm, q_irr_frac=can.q_irr_frac,
+        mesh_xy=mesh_xy, n_sym_spatial=int(can.n_sym_spatial),
+        trs_rule="pair_transpose")
+    zeros = np.zeros_like(np.asarray(can.L_table))
+    Omega_full = unfold_isdf_operator(
+        jnp.asarray(Omega_p), L_table=zeros, **kwargs)
+    B_full = unfold_isdf_operator(
+        jnp.asarray(B_p), L_table=can.L_table, **kwargs)
+    return Omega_full, B_full
+
+
+def read_pole_slice(
+    src,
+    p,
+    *,
+    mesh_xy=None,
+    unfold=False,
+    return_sharded=False,
+    to_unit=None,
+    allow_partial=False,
+    mode="r",
+):
+    """Read one leading pole slab; production reads stay sharded via SlabIO.
+
+    ``to_unit='Ry'`` performs the fit-axis conversion once at this I/O seam.
+    A wedge unfold uses the stored ``symmetry_maps`` tables and the general
+    pair-transpose TRS rule, required because complex-frequency W is not
+    Hermitian.
+    """
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial,
+                            f"read_pole_slice(p={p})")
+        ip = int(p)
+        if not 0 <= ip < ledger["n_p"]:
+            raise IndexError(
+                f"read_pole_slice: p={ip} is outside [0,{ledger['n_p']})")
+        if mesh_xy is None:
+            Omega = np.asarray(grp["Omega_p"][ip])
+            Bp = np.asarray(grp["B_p"][ip])
+
+    if mesh_xy is not None:
+        from jax.sharding import PartitionSpec as P
+        from runtime.padding import padded_mu_extent
+        from file_io.slab_io import SlabIO
+
+        n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
+        shape = (1, ledger["n_q"], n_pad, n_pad)
+        with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+            Omega = io.read_slab(
+                "Omega_p", shape=shape, offset=(ip, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))[0]
+            Bp = io.read_slab(
+                "B_p", shape=shape, offset=(ip, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))[0]
+
+    if to_unit is not None:
+        source_unit = ledger["energy_unit"]
+        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+            raise ValueError(
+                "read_pole_slice: both stored and requested energy units "
+                f"must be declared; stored={source_unit!r}, requested={to_unit!r}")
+        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        Omega, Bp = Omega * scale, Bp * scale
+
+    if unfold and ledger["q_storage"] == "ibz":
+        if mesh_xy is None:
+            raise ValueError("read_pole_slice: a wedge unfold requires mesh_xy")
+        tables = read_fit_unfold_tables(src)
+        if tables is None:
+            raise ValueError("read_pole_slice: wedge fit has no unfold tables")
+        Omega, Bp = unfold_pole_field(Omega, Bp, tables, mesh_xy=mesh_xy)
+    if return_sharded:
+        if mesh_xy is None:
+            raise ValueError("read_pole_slice: return_sharded requires mesh_xy")
+        return Omega, Bp
+    if mesh_xy is not None:
+        from common.collectives import gather_to_host
+        return gather_to_host(Omega), gather_to_host(Bp)
+    return Omega, Bp

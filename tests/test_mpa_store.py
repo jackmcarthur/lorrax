@@ -957,6 +957,29 @@ def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
         assert int(f.attrs["mpa_fit_n_blocks"]) == 2 * 3
 
 
+def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
+    tables, _verdict, n_mu = _geometry()
+    MS.allocate_fit_store(
+        tmpdir_path, n_q=_N_Q_IBZ, n_mu=n_mu, n_p=1,
+        energy_unit="Ha", unfold_tables=tables)
+    for q in range(_N_Q_IBZ):
+        Om = np.full((1, n_mu, n_mu), 0.7 - 0.1j)
+        Bp = np.full((1, n_mu, n_mu), 0.2 + 0.3j)
+        diag = {"condition": np.ones((n_mu, n_mu)),
+                "backward_error": np.zeros((n_mu, n_mu))}
+        MS.write_fit_block(tmpdir_path, q, np.arange(n_mu), Om, Bp, diag)
+    MS.finalize_fit_store(tmpdir_path)
+
+    ledger = MS.fit_completion_ledger(tmpdir_path)
+    assert ledger["energy_unit"] == "Ha"
+    assert ledger["q_storage"] == "ibz"
+    assert ledger["n_q_full"] == tables.n_q_full
+    assert ledger["table_hash"] == tables.canonical().digest()
+    Om, Bp = MS.read_pole_slice(tmpdir_path, 0, to_unit="Ry")
+    np.testing.assert_array_equal(Om, 2.0 * (0.7 - 0.1j))
+    np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
+
+
 def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
         tmpdir_path):
     """RED TWIN: partial reads must be ASKED for, never inferred.
