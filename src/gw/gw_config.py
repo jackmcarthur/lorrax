@@ -520,8 +520,8 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # loudly until it is rewritten to pin the new behaviour.
 UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
     ComputeMode.MPA: (
-        "the row-sharded Padé fit and adjoint-free near-axis Sigma gate "
-        "must pass at P=4; see THEORY_mpa_implementation.md"
+        "the real-material chi/W/fixed-head/Sigma/QSGW disk pipeline "
+        "must pass end to end; see THEORY_mpa_implementation.md"
     ),
 }
 

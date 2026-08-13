@@ -3,9 +3,10 @@
 This page is the authoritative frequency-domain description of the MPA
 pipeline.  It describes the mathematics, ownership, validity domains and I/O
 boundaries in the order they are encountered.  `compute_mode = mpa` remains
-disabled until the dynamic q→0 head and the driver finalizer described below
-land; the scalar fit, pole store, window planner and shared Sigma kernel are
-available for internal tests without weakening that refusal.
+disabled until one real-material chi/W/fixed-head/Sigma/QSGW calculation
+passes end to end through the disk-bounded driver.  The scalar fit, pole
+store, window planner and shared Sigma kernel are available for internal
+tests without weakening that refusal.
 The refusal is owned by `gw_config.UNIMPLEMENTED_MODES`; deleting its MPA row
 is the final enablement gesture, not a preparatory step.
 
@@ -292,7 +293,7 @@ frequency interval changes the denominator rectangles and can increase
 noncrossing ranks logarithmically and finite-width crossing ranks roughly as
 `F/Gamma_min`, with discrete jumps when a pole moves between windows.
 
-## 7. Dynamic head, output and QSGW boundary
+## 7. Head, output and QSGW boundary
 
 The core local-field algebra is
 
@@ -307,8 +308,10 @@ without gathering the body tile.  The production component that rebuilds
 staged driver therefore labels and reuses the established two-point DFT
 scalar head while rebuilding the MPA body.  This fixed-head approximation
 omits local-field head/wing dynamics; it is not an arbitrary-frequency MPA
-head.  Public `compute_mode = mpa` remains disabled until the row-sharded
-fit and this approximation pass the four-rank integration gate.
+head.  The row-sharded fit and temporal pole consumer have passed their
+four-rank integration gate; public `compute_mode = mpa` remains disabled
+until one real-material run also traverses chi, W, this fixed head, the full
+Sigma contraction, and the common QSGW finalizer.
 
 After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
 
