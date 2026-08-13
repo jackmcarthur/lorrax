@@ -12,6 +12,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from ._compat import deprecated_alias
+from .directed_edges import apply_band_matrix_symmetry
 from ._shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -2140,10 +2141,7 @@ def _broadcast_rows(A_irr, take, trs):
     """``A_irr[take]`` with ``conj`` on the rows ``trs`` marks."""
     if not isinstance(A_irr, jax.Array):
         out = np.asarray(A_irr)[take]
-        if np.any(trs):
-            out = np.where(trs.reshape((-1,) + (1,) * (out.ndim - 1)),
-                           np.conj(out), out)
-        return out
+        return apply_band_matrix_symmetry(out, antiunitary=trs)
     out_sh = _row_out_sharding(A_irr)
     ndim = int(A_irr.ndim)
     any_trs = bool(np.any(trs))
@@ -2157,7 +2155,7 @@ def _broadcast_rows(A_irr, take, trs):
         def _f(x):
             out = x[take_j]
             if any_trs:
-                out = jnp.where(trs_j, jnp.conj(out), out)
+                out = apply_band_matrix_symmetry(out, antiunitary=trs_j)
             return out
         return _jit_with(_f, out_sh)
 
@@ -2224,7 +2222,8 @@ def _star_stats(A_full, members, refs, conj):
             return 0.0, scale
         bshape = (-1,) + (1,) * (A.ndim - 1)
         gathered = A[refs]
-        ref_v = np.where(conj.reshape(bshape), np.conj(gathered), gathered)
+        ref_v = apply_band_matrix_symmetry(
+            gathered, antiunitary=conj.reshape(bshape))
         return float(np.abs(A[members] - ref_v).max()), scale
 
     out_sh = _scalar_out_sharding(A_full)
@@ -2244,7 +2243,8 @@ def _star_stats(A_full, members, refs, conj):
             if n_mem == 0:
                 return jnp.stack([jnp.zeros_like(scale), scale])
             gathered = x[ref_j]
-            ref_v = jnp.where(conj_j, jnp.conj(gathered), gathered)
+            ref_v = apply_band_matrix_symmetry(
+                gathered, antiunitary=conj_j)
             return jnp.stack([jnp.max(jnp.abs(x[mem_j] - ref_v)), scale])
         return _jit_with(_f, out_sh)
 

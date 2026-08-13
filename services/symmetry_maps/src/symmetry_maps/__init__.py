@@ -61,6 +61,11 @@ The surface
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
+``directed_edge_orbit_table`` / ``apply_band_matrix_symmetry``
+    Pure-array signed directed-edge metadata, and the one endpoint-sewn
+    unitary/antiunitary band-matrix action.  Nonsymmorphic phases enter through
+    the endpoint sewing matrices; vector/covector mixing is an explicit
+    caller-supplied component representation.
 ``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
 ``slice_q_full_to_ibz``
     The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
@@ -133,6 +138,10 @@ from symmetry_maps.density_symmetry_check import (
     check_density_symmetries,
     trs_check_mode,
 )
+from symmetry_maps.directed_edges import (
+    apply_band_matrix_symmetry,
+    directed_edge_orbit_table,
+)
 from symmetry_maps.maps import (
     KStarMap,
     SymMaps,
@@ -200,6 +209,8 @@ __all__ = [
     "SymMaps", "kgrid_shift_map", "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
+    # directed band-matrix edges: pure table + the one symmetry action
+    "directed_edge_orbit_table", "apply_band_matrix_symmetry",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "mix_channels_by_proper_rotation",

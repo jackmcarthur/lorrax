@@ -44,6 +44,8 @@ so reaching *past* the door is the thing that still flags.
 | `star_select(A_full, irr_idx_k)` | Keep one row per star — the FIRST occurrence, in full-BZ order, never `np.unique`'s ascending label order. |
 | `star_broadcast(A_irr, irr, sidx, nss, *, trs_reference='star_row')` | IBZ → full BZ with the conjugation predicate. Two legal values, one per operand flavour; an unknown value RAISES rather than defaulting. The default is `'star_row'` — see Contract for why the one `'ibz_slab'` caller passes it as a literal anyway. |
 | `star_spread(A_full, irr, sidx, nss)` | The one diagnostic that sees a gauge or conjugation mismatch. Hermiticity, norms and electron counts all survive one. |
+| `directed_edge_orbit_table(...)` | Pure-array compact-directed-edge → full-grid table. Handles signed elementary steps on shifted/anisotropic grids, records source/target endpoints, direction, adjoint and antiunitary flags, and REFUSES non-permutations, incomplete or conflicting images. |
+| `apply_band_matrix_symmetry(...)` | The one band-matrix action: optional adjoint, antiunitary conjugation, endpoint sewing, and optional component mixing. `star_broadcast` uses its identity-sewing antiunitary path rather than maintaining a second algebra. |
 | `unfold_v_q(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial)` | Sharded centroid double-gather + umklapp L-phase + TRS conj. `shard_map` + paired `all_to_all`, 1× single-tile peak memory per rank. |
 | `unfold_v_q_bispinor_lorentz(...)` | The 3-vector Lorentz mixing on the bispinor TT block. Its `R_proper_table` operand is in a convention the §A5 formula compensates for — see Antipatterns. |
 | `unfold_psi(cnk_kbar, *, sym_idx, g_kbar, sym_mats_k, translations, U_spinor_spatial)` | The (★) ψ derivation: spinor rotation, τ phase, G-list negation, TRS conjugation. Hard-raises unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
@@ -105,6 +107,44 @@ kept rather than deleted, with the case where it returns FALSE constructed
   `LORRAX_TRS_SPATIAL_TOL`, `LORRAX_TRS_MAX_K` — all in
   `docs/dev/env_vars.md`. Env grants and tunes the measurement; it never
   selects a symmetry convention.
+
+### Directed band-matrix edges
+
+`directed_edge_orbit_table` takes only arrays from the canonical point map:
+`kgrid`, the WFN `shift` in mesh-index units, `sym_mats_k`,
+`irr_idx_k`/`sym_idx_k`, and the exact raw-source rows `kirr_fullids`.  A
+stored link has layout
+`(n_source_k, n_source_step, ..., n_band_x, n_band_y)`.  The returned dense
+fields have layout `(n_k_full, n_target_step)` and index that array with
+`source_row`/`source_direction`; `reverse`, `antiunitary`, `sym_idx`, and both
+stored/oriented endpoint pairs make every non-index action explicit.
+
+For a source link `M(k0,k1)`, `apply_band_matrix_symmetry` implements
+
+```
+M(gk0,gk1) = B_g(k0) M(k0,k1) B_g(k1)† .
+```
+
+An antiunitary row conjugates `M`; it does not transpose a non-Hermitian
+link.  A reverse edge first adjoints `M` and swaps the endpoint sewings.
+`component_mix[..., out, in]` optionally mixes a Cartesian/vector/covector
+component axis after the band action; the caller supplies the already chosen
+forward rotation or covector representation, so this helper never guesses
+whether a component is Cartesian, reduced-coordinate, polar, or axial.
+Translations and nonsymmorphic phases belong in the endpoint sewing matrices,
+not in the edge table.  Identity sewings preserve the existing
+`star_broadcast` convention exactly.
+
+The builder validates every symmetry row as an affine permutation of
+`(n + shift)/kgrid` and every stored direction as a signed elementary-step
+permutation.  A C3 operation that maps an elementary step to a multi-step
+combination therefore REFUSES and names the fix.  This elementary-step
+service requires a direction basis closed under the
+point group; a multi-hop orbit must be precomputed before using this table.
+No nearest-direction, clipped-index, or last-write-wins fallback exists.
+The host table costs `O(n_k*n_sym + n_k*n_target*n_source_step)` small integer
+work.  Endpoint sewing adds only the two distributed band-space products;
+there is no full-band gather or wavefunction dependency.
 
 ## Backends
 
