@@ -200,6 +200,15 @@ _SOLVER_NAMES = (
     "_imag_target",
 )
 
+# Pure offline fitting routines.  They use SciPy, so keep them behind the
+# same lazy door as the historical solvers: a production table lookup must
+# not import an optimiser.
+_FREQUENCY_FIT_NAMES = (
+    "PositiveChebyshevFit", "SharedSineFit",
+    "positive_complex_chebyshev", "shared_sine_system",
+    "resolvent_system", "fit_shared_sine_rule", "select_smallest_rank",
+)
+
 
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
@@ -210,11 +219,15 @@ def __getattr__(name: str):
     if name in _SOLVER_NAMES:
         from minimax import solver as _solver          # noqa: PLC0415
         return getattr(_solver, name)
+    if name in _FREQUENCY_FIT_NAMES:
+        from minimax import frequency_fit as _fit      # noqa: PLC0415
+        return getattr(_fit, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | set(_SOLVER_NAMES))
+    return sorted(set(globals()) | set(_SOLVER_NAMES)
+                  | set(_FREQUENCY_FIT_NAMES))
 
 
 __all__ = [
@@ -236,6 +249,8 @@ __all__ = [
     "MinimaxRefusal", "NoCertifiedTable", "AmplificationCap", "UnknownTarget",
     "CatalogUnavailable", "TableUnreadable", "CatalogCorrupt",
     "UncertifiedSolveRefused", "SamplingUnsupported",
+    # --- generic complex-frequency fitting (lazy; scipy) -------------------
+    *_FREQUENCY_FIT_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]

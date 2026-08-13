@@ -137,12 +137,12 @@ def test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
             # is what catches an __all__ that quietly emptied, and a
             # deliberate door change is exactly the kind of edit that
             # should have to touch a test.
-            "assert len(M.__all__) == 63, (len(M.__all__), M.__all__)\n"
+            "assert len(M.__all__) == 70, (len(M.__all__), M.__all__)\n"
             # Only the NON-lazy half is touched by name here: hasattr on a
             # solver name would fire the PEP-562 __getattr__ and import
             # scipy, which is the very thing the next assertion denies.
             "for _n in M.__all__:\n"
-            "    if _n in M._SOLVER_NAMES:\n"
+            "    if _n in M._SOLVER_NAMES or _n in M._FREQUENCY_FIT_NAMES:\n"
             "        continue\n"
             "    assert hasattr(M, _n), _n\n"
             "v = M.catalog()\n"
