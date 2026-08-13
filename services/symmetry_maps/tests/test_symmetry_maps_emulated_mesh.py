@@ -134,7 +134,13 @@ def _hermitian_ibz(n_rmu, n_q=3, seed=17):
     return 0.5 * (a + np.swapaxes(a.conj(), -1, -2))
 
 
-def _hand_unfold(V_ibz, *, perm, L, n_rmu):
+def _nonhermitian_ibz(n_rmu, n_q=3, seed=23):
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal((n_q, n_rmu, n_rmu))
+            + 1j * rng.standard_normal((n_q, n_rmu, n_rmu)))
+
+
+def _hand_unfold(V_ibz, *, perm, L, n_rmu, trs_rule="conj"):
     """The per-element reference, in plain numpy.
 
     Same expression as ``tests/test_symmetry_unfold.py``'s
@@ -155,7 +161,9 @@ def _hand_unfold(V_ibz, *, perm, L, n_rmu):
         ph = np.exp(2j * np.pi * qL)
         blk = V_ibz[parent][np.ix_(p, p)]
         blk = ph[:, None] * blk * np.conj(ph)[None, :]
-        out[iq] = np.conj(blk) if s >= _NTRAN else blk
+        if s >= _NTRAN:
+            blk = np.conj(blk) if trs_rule == "conj" else blk.T
+        out[iq] = blk
     return out
 
 
@@ -248,6 +256,32 @@ def test_the_conj_wrap_on_trs_rows_is_live():
     assert rel > 1e-3, (
         f"removing the conjugation on the TRS rows changed nothing "
         f"({rel:.3e}); the antiunitary branch is not live")
+
+
+@pytest.mark.parametrize("px,py", [(1, 1), (2, 2), (4, 1)])
+def test_pair_transpose_unfolds_a_nonhermitian_operator(px, py):
+    import jax.numpy as jnp
+    mesh = _mesh(px, py)
+    perm, L, n_rmu = _divisible_geometry()
+    V = _nonhermitian_ibz(n_rmu)
+    ref = _hand_unfold(V, perm=perm, L=L, n_rmu=n_rmu,
+                       trs_rule="pair_transpose")
+    got = np.asarray(unfold_isdf_operator(
+        jnp.asarray(V), irr_idx=_IRR, sym_idx=_SYM, sym_perm=perm, L_table=L,
+        q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN,
+        trs_rule="pair_transpose"))
+    np.testing.assert_allclose(got, ref, rtol=1.0e-13, atol=1.0e-13)
+
+
+def test_unknown_trs_rule_refuses():
+    import jax.numpy as jnp
+    mesh = _mesh(1, 1)
+    perm, L, n_rmu = _divisible_geometry()
+    with pytest.raises(ValueError, match="trs_rule"):
+        unfold_isdf_operator(
+            jnp.asarray(_hermitian_ibz(n_rmu)), irr_idx=_IRR, sym_idx=_SYM,
+            sym_perm=perm, L_table=L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+            n_sym_spatial=_NTRAN, trs_rule="conj_transpose")
 
 
 def test_the_trivial_map_short_circuits_to_its_input():

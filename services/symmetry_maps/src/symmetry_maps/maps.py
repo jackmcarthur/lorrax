@@ -218,6 +218,7 @@ def unfold_isdf_operator(
     q_irr_frac,
     mesh_xy,
     n_sym_spatial,
+    trs_rule="conj",
 ):
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
@@ -285,6 +286,11 @@ def unfold_isdf_operator(
         ``ntran`` — count of spatial-only sym ops in ``sym_perm``'s
         first half.  Used to identify TRS-augmented rows
         (``sym_idx >= n_sym_spatial``) and apply the required ``conj``.
+    trs_rule
+        ``"conj"`` for Hermitian inputs (the historical default), or
+        ``"pair_transpose"`` for a general complex-frequency operator.
+        Time reversal transposes its centroid pair without conjugating its
+        frequency dependence.
 
     Returns
     -------
@@ -312,7 +318,14 @@ def unfold_isdf_operator(
             f"but sym_perm has only {n_sym_perm} rows.  Build it via "
             f"``centroid_source_map_and_wrap(..., extend_trs=True)`` so it "
             f"covers the TRS-augmented half of ``sym_mats_k``.")
+    if trs_rule not in ("conj", "pair_transpose"):
+        raise ValueError(
+            "unfold_isdf_operator: trs_rule must be 'conj' for a Hermitian "
+            "operator or 'pair_transpose' for a general operator")
     trs_used = max_sym >= int(n_sym_spatial)
+    if not trs_used:
+        # Keep centrosymmetric inputs on the historical compiled module.
+        trs_rule = "conj"
     if trs_used and int(n_sym_spatial) * 2 != n_sym_perm:
         raise ValueError(
             f"unfold_isdf_operator: sym_idx uses TRS-augmented rows "
@@ -378,6 +391,7 @@ def unfold_isdf_operator(
         q_irr_arr=q_irr_arr,
         trs_mask_arr=trs_mask_arr,
         n_sym_spatial=int(n_sym_spatial),
+        trs_rule=trs_rule,
         mesh_xy=mesh_xy)
     return fn(V_q_ibz)
 
@@ -387,7 +401,7 @@ _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 
 def _get_unfold_isdf_operator_jit(
     *, V_q_shape, fwd_perm_arr, idx_arr, sym_arr, L_arr, q_irr_arr,
-    trs_mask_arr, n_sym_spatial, mesh_xy,
+    trs_mask_arr, n_sym_spatial, mesh_xy, trs_rule="conj",
 ):
     """Cache the inner ``_do_unfold`` jit by (shape, sym table content).
 
@@ -406,6 +420,7 @@ def _get_unfold_isdf_operator_jit(
         q_irr_arr.tobytes(),
         trs_mask_arr.tobytes(),
         int(n_sym_spatial),
+        str(trs_rule),
         id(mesh_xy),
     )
     hit = _UNFOLD_ISDF_OPERATOR_JIT_CACHE.get(key)
@@ -438,18 +453,27 @@ def _get_unfold_isdf_operator_jit(
             f"μ-padding in Meta should already enforce this — check "
             f"that meta.n_rmu_padded is mesh-divisible.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    pair_transpose = (trs_rule == "pair_transpose")
+    in_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
+                else P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=V_sh)
     def _do_unfold(V_ibz):
         @partial(shard_map, mesh=mesh_xy,
-                 in_specs=P(None, 'x', 'y'),
+                 in_specs=in_specs,
                  out_specs=P(None, 'x', 'y'),
                  check_vma=False)
-        def _kernel(V_ibz_local):
+        def _kernel(*operands):
             # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
+            V_ibz_local = operands[0]
             perm_q = fwd_perm_j[sym_j]                      # (n_q_full, n_rmu)
             # Gather q axis (replicated → local concat via idx_j).
-            V_at_irr = V_ibz_local[idx_j]                   # (n_q_full, μ/Px, ν/Py)
+            if pair_transpose:
+                source = jnp.concatenate((V_ibz_local, operands[1]), axis=0)
+                pick = idx_j + trs_mask_j.astype(idx_j.dtype) * V_q_shape[0]
+                V_at_irr = source[pick]
+            else:
+                V_at_irr = V_ibz_local[idx_j]
 
             # μ permute on 'x'.  all_to_all redistributes:
             #   split  ν (local, /Py)  → ν / (Py·Px)
@@ -506,17 +530,25 @@ def _get_unfold_isdf_operator_jit(
                 phase, x_idx * mu_local, mu_local, axis=1)  # (n_q, μ/Px)
             phase_nu = jax.lax.dynamic_slice_in_dim(
                 phase, y_idx * nu_local, nu_local, axis=1)  # (n_q, ν/Py)
-            V_full_local = (phase_mu[:, :, None] * V_full_local
-                            * jnp.conj(phase_nu)[:, None, :])
-
-            # TRS rows: per-element rule
-            # V_full[TRS-q, μ, ν] = conj(V_ibz[parent, μ, ν])
-            # = V_ibz[parent, ν, μ] (by Hermiticity).
-            V_full_local = jnp.where(
-                trs_mask_j[:, None, None],
-                jnp.conj(V_full_local), V_full_local)
+            if pair_transpose:
+                mu_phase = jnp.where(trs_mask_j[:, None],
+                                     jnp.conj(phase_mu), phase_mu)
+                nu_phase = jnp.where(trs_mask_j[:, None],
+                                     phase_nu, jnp.conj(phase_nu))
+                V_full_local = (mu_phase[:, :, None] * V_full_local
+                                * nu_phase[:, None, :])
+            else:
+                V_full_local = (phase_mu[:, :, None] * V_full_local
+                                * jnp.conj(phase_nu)[:, None, :])
+                V_full_local = jnp.where(
+                    trs_mask_j[:, None, None],
+                    jnp.conj(V_full_local), V_full_local)
             return V_full_local
 
+        if pair_transpose:
+            transposed = jax.lax.with_sharding_constraint(
+                jnp.swapaxes(V_ibz, -2, -1), V_sh)
+            return _kernel(V_ibz, transposed)
         return _kernel(V_ibz)
 
     _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
