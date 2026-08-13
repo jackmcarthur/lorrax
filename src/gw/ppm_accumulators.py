@@ -27,6 +27,12 @@ import numpy as np
 from .ppm_windows import _SigmaWindow
 
 
+def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
+    """Frequency coefficient shared by the host and device folds."""
+    return ((prefactor * alpha)
+            * xp.exp(-1j * (e_ref - sign * omega) * t))
+
+
 def _project_tau_onto_omega_np(
     sigma_re: np.ndarray, sigma_im: np.ndarray | None, omega_vec: np.ndarray,
     t_node: complex, alpha_eff: complex, omega_sign: float, pref: float,
@@ -86,7 +92,6 @@ def _project_tau_onto_omega_np(
     and a two-channel pair at code=0 (whose recombine branch died when the
     merge became the default).
     """
-    omega_kernel = np.exp(1j * omega_sign * omega_vec * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
     # the full (n_ω, nk, i, j) contrib afterwards — removes one full-size
     # array pass + temporary per τ.  Value-identical, NOT bitwise (the
@@ -96,7 +101,8 @@ def _project_tau_onto_omega_np(
     # likewise dropped: both branches already produce complex128
     # (``np.asarray`` with a matching dtype is a no-copy view) — that one
     # is bit-exact.
-    coeff = (pref * alpha_eff) * omega_kernel
+    coeff = _omega_coefficient(
+        np, omega_vec, t_node, alpha_eff, omega_sign, pref)
     if sigma_im is None:
         # Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
         if project_code != 0:
@@ -495,6 +501,101 @@ class _TauAccumulator(_SigmaAccumulator):
         :meth:`_MemoryTileSink.host_tiles`."""
         self._drain_all()
         return self._sink.host_tiles()
+
+
+@lru_cache(maxsize=8)
+def _device_output_zeros(shape, sharding):
+    return jax.jit(
+        lambda: jnp.zeros(shape, dtype=jnp.complex128),
+        out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _device_omega_add(sharding):
+    return jax.jit(
+        lambda acc, sigma, coeff: (
+            acc + coeff.reshape((-1, 1, 1, 1)) * sigma[None, ...]),
+        donate_argnums=(0,), out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _device_output_add(sharding):
+    return jax.jit(
+        lambda total, window: total + window,
+        donate_argnums=(0,), out_shardings=sharding)
+
+
+class DeviceOmegaAccumulator:
+    """Fold one transient sigma(tau) tile into a sharded omega cube.
+
+    No tau history is retained.  A full/Laplace window accumulates directly
+    into the result.  A one-sided sine window uses one temporary omega cube,
+    applies ``(Z-Z†)/(2i)`` once after its last tau, then adds it to the same
+    result.  ``alpha`` is the quadrature weight before reference rephasing;
+    combining ``E_ref_sum`` and omega in one exponential avoids separately
+    overflowing two factors whose product is well conditioned.
+    """
+
+    def __init__(self, omega_vec, *, shape, sharding):
+        self._shape = tuple(int(n) for n in shape)
+        self._sharding = sharding
+        self._replicated = NamedSharding(sharding.mesh, P())
+        self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
+        if self._shape[0] != self._omega.size:
+            raise ValueError(
+                "DeviceOmegaAccumulator: shape[0] must equal n_omega")
+        self._total = _device_output_zeros(self._shape, sharding)()
+        self._window = None
+        self._coeff = None
+        self._index = 0
+
+    def begin_window(self, t, alpha, *, omega_sign, prefactor,
+                     e_ref_sum=0.0, antihermitian=False):
+        if self._coeff is not None:
+            raise RuntimeError("previous frequency window is still open")
+        t = np.asarray(jax.device_get(t), np.complex128)
+        alpha = np.asarray(jax.device_get(alpha), np.complex128)
+        if t.ndim != 1 or alpha.shape != t.shape or t.size == 0:
+            raise ValueError("t and alpha must be nonempty equal vectors")
+        self._coeff = np.asarray(_omega_coefficient(
+            np, self._omega[None, :], t[:, None], alpha[:, None],
+            float(omega_sign), float(prefactor), float(e_ref_sum)),
+            np.complex128)
+        self._index = 0
+        self._window = (_device_output_zeros(
+            self._shape, self._sharding)() if antihermitian else None)
+
+    def add_tau(self, sigma_tau):
+        if self._coeff is None:
+            raise RuntimeError("no open frequency window")
+        if self._index >= self._coeff.shape[0]:
+            raise RuntimeError("more sigma(tau) tiles than quadrature nodes")
+        coeff = jax.device_put(self._coeff[self._index], self._replicated)
+        self._index += 1
+        if self._window is None:
+            self._total = _device_omega_add(self._sharding)(
+                self._total, sigma_tau, coeff)
+        else:
+            self._window = _device_omega_add(self._sharding)(
+                self._window, sigma_tau, coeff)
+
+    def end_window(self):
+        if self._coeff is None:
+            raise RuntimeError("no open frequency window")
+        if self._index != self._coeff.shape[0]:
+            raise RuntimeError("frequency window ended before all tau nodes")
+        if self._window is not None:
+            completed = _antiherm_band_fn(self._sharding)(self._window)
+            self._total = _device_output_add(self._sharding)(
+                self._total, completed)
+        self._window = None
+        self._coeff = None
+        self._index = 0
+
+    def finalize(self):
+        if self._coeff is not None:
+            raise RuntimeError("cannot finalize an open frequency window")
+        return self._total
 
 
 class _WindowSink:

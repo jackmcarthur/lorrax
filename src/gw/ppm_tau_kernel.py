@@ -38,6 +38,9 @@ from common.jax_compile_cache import ensure_jax_compile_cache
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
+_sigma_shared_tau_kernel_cache: dict[
+    tuple[object, ...], Callable[..., jax.Array]
+] = {}
 
 
 def _stage_timing_enabled() -> bool:
@@ -500,6 +503,107 @@ def _get_sigma_tau_kernel(
 
     _sigma_tau_kernel_cache[cache_key] = _tau_kernel
     return _tau_kernel
+
+
+def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
+                       phase_real, E_ref_B, t_node):
+    """Build one W(tau) tile from selected multipole fields.
+
+    ``bounds`` rows are ``(a_gt, a_le, gamma_ge, gamma_gt, gamma_lt,
+    gamma_le)``.  Each row selects one pole field; ``phase_real`` chooses
+    the accepted near-axis functional ``Re(Omega)`` for that row, otherwise
+    the fitted complex pole is used.  The pole axis is never materialized in
+    W: the loop carries one ``(q, mu, nu)`` tile.
+    """
+    def _add(index, W_t):
+        pole = jax.lax.dynamic_index_in_dim(
+            pole_indices, index, axis=0, keepdims=False)
+        omega = jax.lax.dynamic_index_in_dim(
+            Omega_poles, pole, axis=0, keepdims=False)
+        residue = jax.lax.dynamic_index_in_dim(
+            B_poles, pole, axis=0, keepdims=False)
+        b = jax.lax.dynamic_index_in_dim(
+            bounds, index, axis=0, keepdims=False)
+        use_real = jax.lax.dynamic_index_in_dim(
+            phase_real, index, axis=0, keepdims=False)
+        a = jnp.real(omega)
+        gamma = -jnp.imag(omega)
+        selected = ((a > b[0]) & (a <= b[1])
+                    & (gamma >= b[2]) & (gamma > b[3])
+                    & (gamma < b[4]) & (gamma <= b[5]))
+        phase = jnp.where(use_real, a + 0.0j, omega)
+        return W_t + jnp.where(
+            selected,
+            residue * jnp.exp(-1j * (phase - E_ref_B) * t_node),
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+
+    return jax.lax.fori_loop(
+        0, pole_indices.shape[0], _add, jnp.zeros_like(B_poles[0]))
+
+
+def get_shared_sigma_tau_kernel(
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
+) -> Callable[..., jax.Array]:
+    """Return the GN tau kernel with a selected multipole W(tau) builder.
+
+    All spatial work is the established ``build_G_tau -> fused GW FFT ->
+    contract_bands`` path.  This wrapper changes only the scalar frequency
+    synthesis: several poles and compatible windows are summed into one W
+    tile before that unchanged convolution.  It always uses the single
+    complex projection carrier; HGL's missing sine arm is completed once by
+    :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
+    """
+    kgrid = tuple(int(x) for x in kgrid)
+    from ffi import ffi_dial_key
+
+    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key())
+    if key in _sigma_shared_tau_kernel_cache:
+        return _sigma_shared_tau_kernel_cache[key]
+
+    ensure_jax_compile_cache()
+    q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    sigma_kij = _get_sigma_kij_kernel(
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True)
+
+    @jax.jit
+    def _build(B_poles, Omega_poles, pole_indices, bounds,
+               phase_real, E_ref_B, t_node):
+        W_t = build_shared_w_tau(
+            B_poles, Omega_poles, pole_indices, bounds,
+            phase_real, E_ref_B, t_node)
+        return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
+
+    if not _stage_timing_enabled():
+        @jax.jit
+        def _tau(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
+            phase_real, E_ref_A, E_ref_B, t_node,
+        ):
+            W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                         phase_real, E_ref_B, t_node)
+            return sigma_kij(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, E_ref_A, t_node, W_t)
+
+        _sigma_shared_tau_kernel_cache[key] = _tau
+        return _tau
+
+    def _tau_staged(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
+        phase_real, E_ref_A, E_ref_B, t_node,
+    ):
+        with timing.section("sigma.tau.w_phase") as sec:
+            W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                         phase_real, E_ref_B, t_node)
+            sec.watch(W_t)
+        return sigma_kij(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_ref_A, t_node, W_t)
+
+    _sigma_shared_tau_kernel_cache[key] = _tau_staged
+    return _tau_staged
 
 
 def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh) -> None:
