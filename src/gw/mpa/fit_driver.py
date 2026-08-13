@@ -3,7 +3,7 @@
 STAGING LOCATION: see ``gw/mpa/__init__.py``.  This is the module that
 touches every other half of the multipole-W infrastructure — the
 schedule (``tiling``), the bytes (``file_io.mpa_store``), the sample
-grid (``sampling``) and the fit itself (``pade_fit``, ``diagnostics``)
+grid (``sampling``) and the fit itself (``pade_fit``)
 — and it exists because none of them can demonstrate the pipeline
 alone.  The fit kernel proves it recovers planted poles from samples in
 memory; the store proves it refuses a half-written file.  Neither
@@ -50,7 +50,7 @@ import time
 import numpy as np
 
 from file_io import mpa_store
-from gw.mpa import diagnostics, pade_fit, tiling
+from gw.mpa import pade_fit, tiling
 
 __all__ = [
     "accumulate_over_pole_passes",
@@ -144,22 +144,8 @@ def fit_one_block(
         and the per-stage seconds.  :func:`run_fit_driver` sums these
         into the run's cost report.
 
-    Notes
-    -----
-    THE BACKWARD ERROR COSTS A SECOND DISPATCH, and it is not optional.
-    ``mpa_store.write_fit_block`` REQUIRES ``condition`` and
-    ``backward_error``: the Sigma stage's certification refuses poles
-    that fail its gates, and a pole whose conditioning nobody recorded
-    can only be trusted, never refused.  But ``pade_fit.fit_mpa_poles``
-    returns ``cond_pade`` and no backward error — the backward error
-    lives in ``diagnostics.solve_conditioning``, which re-solves the
-    system AND re-runs the whole fit internally to report its forward
-    residual.  So one logical block costs TWO complete fits per element
-    and THREE solves of the Pade-in-z^2 system: one in the fit, one
-    standalone in ``solve_conditioning``, and one more inside the fit
-    that function runs for itself.  The cost report states the
-    dispatches, the fits and the Pade solves separately rather than
-    quoting whichever is smallest; see :func:`format_cost_report`.
+    The Padé kernel returns its condition number, backward error and sample
+    residual from the same solve; diagnostics therefore add no second fit.
     """
     n = int(n_p)
     t_read = time.perf_counter()
@@ -191,17 +177,15 @@ def fit_one_block(
     t_fit = time.perf_counter()
     Omega, B, diag = pade_fit.fit_mpa_poles_batched(
         tile, z, n, guards=guards, rcond=rcond)
-    cond_diag = diagnostics.diagnostics_batched(
-        diagnostics.solve_conditioning, tile, z, n, rcond=rcond)
     Omega = np.asarray(Omega)
     B = np.asarray(B)
     t_fit = time.perf_counter() - t_fit
 
     diag_block = {
-        "condition": np.asarray(cond_diag["cond"],
+        "condition": np.asarray(diag["cond_pade"],
                                 dtype=np.float64).reshape(n_mu, n_cols),
         "backward_error": np.asarray(
-            cond_diag["backward_error"],
+            diag["backward_error"],
             dtype=np.float64).reshape(n_mu, n_cols),
         "residual": np.asarray(
             diag["max_abs_residual"],
@@ -225,9 +209,9 @@ def fit_one_block(
         "n_elements": int(n_mu * n_cols),
         "bytes_read": int(block.size) * mpa_store.COMPLEX128_BYTES,
         "fit_dispatches": 1,
-        "diagnostic_dispatches": 1,
-        "full_fits": 2 * int(n_mu * n_cols),
-        "pade_solves": 3 * int(n_mu * n_cols),
+        "diagnostic_dispatches": 0,
+        "full_fits": int(n_mu * n_cols),
+        "pade_solves": int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
         "seconds_write": t_write,
@@ -367,22 +351,10 @@ def format_cost_report(report):
     merely because it is one dispatch, and the two numbers are printed
     beside each other so nobody has to infer the second from the first.
 
-    SO THREE COUNTS ARE PRINTED, NOT ONE.  ``dispatches`` is what the
-    scheduler sees: two vmapped launches per block.  ``full fits`` is
-    what the elements see: TWO per element, because the store requires
-    a backward error, ``pade_fit.fit_mpa_poles`` does not return one,
-    and the only supplier — ``diagnostics.solve_conditioning`` — runs a
-    complete fit of its own to report a forward residual beside it.
-    ``Pade solves`` is what the linear algebra sees: THREE per element,
-    the two fits' plus the standalone equilibrated solve
-    ``solve_conditioning`` does before them.
-
-    None of that factor is this driver's doing; it is a property of the
-    seam between the fit kernel and the staged store, and it is printed
-    rather than absorbed because the design review is where it can be
-    removed — a ``backward_error`` returned from ``fit_mpa_poles``
-    beside the ``cond_pade`` it already computes would collapse all
-    three counts to one dispatch, one fit and one solve.
+    The three counts distinguish scheduler launches, elementwise fits and
+    Padé solves.  They are equal up to the number of elements per block:
+    conditioning, backward error and the finished-model residual are all
+    produced by the same fit.
     """
     r = report
     sec = r["seconds"]
@@ -404,11 +376,9 @@ def format_cost_report(report):
         f"  dispatches      {r['fit_dispatches']} fit + "
         f"{r['diagnostic_dispatches']} diagnostic, vmapped",
         f"  full fits       {r['full_fits']} "
-        f"(2 per element: the fit, and the one solve_conditioning "
-        f"runs to report a forward residual)",
+        f"(1 per element; diagnostics reuse the same solve)",
         f"  Pade solves     {r['pade_solves']} "
-        f"(3 per element: the two fits', plus solve_conditioning's own "
-        f"equilibrated solve)",
+        f"(1 per element)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "

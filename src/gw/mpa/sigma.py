@@ -14,7 +14,8 @@ from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import _iter_branches
 
-from .sigma_windows import build_shared_sigma_windows
+from .sigma_windows import (build_shared_sigma_windows,
+                            summarize_sigma_poles)
 
 
 def _batch_rows(row, batch):
@@ -54,15 +55,7 @@ def integrate_sigma_windows(
     pole_batch_size=4,
     print_fn=print,
 ):
-    """Compute ``Sigma_c(omega)`` from sharded ``(Omega_p, B_p)`` fields.
-
-    Four resident poles are consumed at a time by default.  This bounds the
-    transient contraction operand, not the fitted-pole residency: the public
-    MPA mode remains refused until its driver streams these ranges from
-    :func:`file_io.mpa_store.read_poles`.  The grouping is purely a memory
-    schedule; every window selects poles by actual complex frequency.  Only
-    one ``W(t)``, ``G(t)``, and ``Sigma(t)`` tile exists per dispatch.
-    """
+    """Compute ``Sigma_c(omega)`` from resident pole fields (test adapter)."""
     if not plan:
         raise ValueError("MPA Sigma needs pole fields and a nonempty plan")
     if (Omega_poles.ndim != 4 or B_poles.shape != Omega_poles.shape
@@ -72,6 +65,28 @@ def integrate_sigma_windows(
     if batch_size < 1:
         raise ValueError("pole_batch_size must be positive")
 
+    n_poles = int(Omega_poles.shape[0])
+    batches = ((lo, Omega_poles[lo:lo + batch_size],
+                B_poles[lo:lo + batch_size])
+               for lo in range(0, n_poles, batch_size))
+    return _integrate_sigma_batches(
+        wfns, batches, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+        pole_batch_size=batch_size, print_fn=print_fn)
+
+
+def _integrate_sigma_batches(
+    wfns,
+    batches,
+    n_poles,
+    plan,
+    omega_grid_ry,
+    meta,
+    mesh_xy,
+    *,
+    pole_batch_size,
+    print_fn,
+):
+    """One spatial executor for resident arrays and streamed fit slabs."""
     omega = np.asarray(omega_grid_ry, np.float64)
     if omega.ndim != 1 or not omega.size:
         raise ValueError("omega_grid_ry must be a nonempty vector")
@@ -92,10 +107,10 @@ def integrate_sigma_windows(
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
-    n_poles = int(Omega_poles.shape[0])
-    for lo in range(0, n_poles, batch_size):
-        batch = tuple(range(lo, min(lo + batch_size, n_poles)))
-        Omega, B = Omega_poles[lo:lo + batch_size], B_poles[lo:lo + batch_size]
+    batch_size = int(pole_batch_size)
+    for lo, Omega, B in batches:
+        width = int(Omega.shape[0])
+        batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
             selected = _batch_rows(row, batch)
             if selected is None:
@@ -129,6 +144,36 @@ def integrate_sigma_windows(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
         sigma_c_kij=sigma)
+
+
+def integrate_sigma_store(
+    wfns,
+    fit_src,
+    n_poles,
+    plan,
+    omega_grid_ry,
+    meta,
+    mesh_xy,
+    *,
+    pole_batch_size=4,
+    print_fn=print,
+):
+    """Read, unfold, consume, and release one pole range at a time."""
+    batch_size = int(pole_batch_size)
+    if batch_size < 1:
+        raise ValueError("pole_batch_size must be positive")
+
+    def batches():
+        for lo in range(0, int(n_poles), batch_size):
+            hi = min(lo + batch_size, int(n_poles))
+            Omega, B = read_poles(
+                fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
+                unfold=True, return_sharded=True, to_unit="Ry")
+            yield lo, Omega, B
+
+    return _integrate_sigma_batches(
+        wfns, batches(), int(n_poles), plan, omega_grid_ry, meta, mesh_xy,
+        pole_batch_size=batch_size, print_fn=print_fn)
 
 
 def _branches(wfns, omega, efermi_ry):
@@ -169,35 +214,44 @@ def compute_sigma_c_mpa_omega_grid(
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
-    Pole tensors are read collectively in their native sharding through
-    :mod:`file_io.mpa_store`; no full ``(p,q,mu,mu)`` host copy exists.  This
-    internal entry point still keeps the complete pole axis device-resident;
-    production dispatch is intentionally refused until it drives the range
-    reader batch by batch.
+    Pole tensors are read collectively in their native sharding.  A first
+    four-pole walk retains only scalar geometry for planning; the spatial
+    executor rereads and releases the same four-pole ranges.  No complete
+    pole axis exists on host or device.
     """
-    validate_fit_store(fit_src, expected_identity=fit_identity)
-    Omega, B = read_poles(
-        fit_src, mesh_xy=mesh_xy, unfold=True, return_sharded=True,
-        to_unit="Ry")
+    ledger = validate_fit_store(fit_src, expected_identity=fit_identity)
+    n_poles = int(ledger["n_p"])
     branches = _branches(wfns, omega_grid_ry, efermi_ry)
+    summaries = []
+    for lo in range(0, n_poles, int(pole_batch_size)):
+        hi = min(lo + int(pole_batch_size), n_poles)
+        Omega, B = read_poles(
+            fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
+            unfold=True, return_sharded=True, to_unit="Ry")
+        summaries.extend(summarize_sigma_poles(
+            Omega, branches,
+            regularization_width_ry=regularization_width_ry,
+            edge_factor=edge_factor, pole_offset=lo))
+        del Omega, B
     plan, geometry = build_shared_sigma_windows(
-        Omega, branches,
+        None, branches, pole_summaries=summaries,
         regularization_width_ry=regularization_width_ry,
         edge_factor=edge_factor, target_error=target_error,
         max_rank=max_rank, hgl_target_error=hgl_target_error,
         hgl_max_nodes=hgl_max_nodes)
-    physical = execution_census(plan, int(Omega.shape[0]), pole_batch_size)
+    physical = execution_census(plan, n_poles, pole_batch_size)
     print_fn(
         f"  MPA windows: xi={geometry['xi_ry'] * RYD_TO_EV:.4f} eV, "
         f"{geometry['n_windows']} logical windows, "
         f"{physical['n_tau']} physical tau dispatches")
-    return integrate_sigma_windows(
-        wfns, Omega, B, plan, omega_grid_ry, meta, mesh_xy,
+    return integrate_sigma_store(
+        wfns, fit_src, n_poles, plan, omega_grid_ry, meta, mesh_xy,
         pole_batch_size=pole_batch_size, print_fn=print_fn)
 
 
 __all__ = [
     "compute_sigma_c_mpa_omega_grid",
     "execution_census",
+    "integrate_sigma_store",
     "integrate_sigma_windows",
 ]

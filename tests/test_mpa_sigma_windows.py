@@ -58,6 +58,19 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     plan, report = SW.build_shared_sigma_windows(
         _poles(), _branches(), regularization_width_ry=0.2,
         edge_factor=1.5)
+    summaries = []
+    for p, pole in enumerate(_poles()):
+        summaries.extend(SW.summarize_sigma_poles(
+            (pole,), _branches(), regularization_width_ry=0.2,
+            edge_factor=1.5, pole_offset=p))
+    streamed, streamed_report = SW.build_shared_sigma_windows(
+        None, _branches(), regularization_width_ry=0.2,
+        edge_factor=1.5, pole_summaries=summaries)
+    assert streamed_report == report
+    assert [(r.window.name, r.pole_indices.tolist(), r.bounds.tolist())
+            for r in streamed] == [
+                (r.window.name, r.pole_indices.tolist(), r.bounds.tolist())
+                for r in plan]
     names = [row.window.name for row in plan]
     assert names.count("single") == 2
     assert names.count("b_slab") == 2
@@ -74,6 +87,14 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     assert all(not np.any(row.phase_real) for row in exact)
     hgl = [row for row in plan if row.window.name == "core_hgl"]
     assert all(np.all(row.phase_real) for row in hgl)
+    assert all(row.window.project == "full" for row in hgl)
+    np.testing.assert_array_equal(
+        np.asarray(hgl[0].window.nodes.t),
+        np.asarray([0.2 / report["xi_ry"], -0.2 / report["xi_ry"]]))
+    np.testing.assert_array_equal(
+        np.asarray(hgl[0].window.nodes.alpha),
+        np.asarray([0.5 / report["xi_ry"] / (2j),
+                    -0.5 / report["xi_ry"] / (2j)]))
 
     # The narrow and finite-width stripe have different A masks, but share
     # one fitted node dictionary within each causal branch.
@@ -116,3 +137,18 @@ def test_live_negative_real_pole_refuses():
         assert "Re Omega <= 0" in str(exc)
     else:
         raise AssertionError("an unsupported negative-real pole was omitted")
+
+
+def test_explicit_hgl_arms_do_not_assume_residue_adjoint():
+    t = np.asarray([0.3, 0.8])
+    alpha = np.asarray([0.4, -0.2])
+    signed_t = np.stack((t, -t), axis=-1).reshape(-1)
+    signed_alpha = np.stack(
+        (alpha / (2j), -alpha / (2j)), axis=-1).reshape(-1)
+    residue = np.asarray([[1.0 + 0.2j, 2.0 - 0.7j],
+                          [-0.3 + 1.1j, 0.4 - 0.9j]])
+    u = 0.61
+    got = residue * np.sum(signed_alpha * np.exp(1j * u * signed_t))
+    want = residue * np.sum(alpha * np.sin(t * u))
+    np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)
+    assert not np.allclose(residue, residue.conj().T)

@@ -378,6 +378,7 @@ def allocate_w_omega(
     closure_verdict=None,
     dtype=None,
     provenance=None,
+    energy_unit="Ha",
     mode="a",
 ):
     """Create the (n_omega, n_q, N_μ, N_μ) dataset with NO slab ready.
@@ -433,7 +434,7 @@ def allocate_w_omega(
             grp, name, tables=tables, omega=omega, sampling=sampling,
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(n_omega, dtype=bool),
-            provenance=provenance)
+            provenance=provenance, energy_unit=energy_unit)
 
 
 def _w_storage_geometry(n_omega, n_q_on_disk, n_mu, dtype,
@@ -480,6 +481,8 @@ def allocate_w_omega_collective(
     closure_verdict=None,
     dtype=None,
     provenance=None,
+    n_rmu_logical=None,
+    energy_unit="Ha",
     mode="a",
 ):
     """Collectively allocate W(z); serial HDF5 writes metadata only.
@@ -504,7 +507,8 @@ def allocate_w_omega_collective(
             dest, name, tables=tables, omega=omega, sampling=sampling,
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(shape[0], dtype=bool),
-            provenance=provenance)
+            n_rmu_logical=n_rmu_logical, provenance=provenance,
+            energy_unit=energy_unit)
     barrier("mpa_w_omega_allocated")
     return header
 
@@ -521,6 +525,7 @@ def stamp_w_omega(
     data_ready=None,
     n_rmu_logical=None,
     provenance=None,
+    energy_unit="Ha",
     mode="a",
 ):
     """Make an ALREADY-WRITTEN 4-D dataset a version-2 W(ω) tensor.
@@ -625,7 +630,12 @@ def stamp_w_omega(
         ds.attrs[qs.QIRR_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION_FREQ)
         ds.attrs[_FREQ_ATTR] = _FREQ_ATTR_VALUE
         ds.attrs["mpa_n_omega"] = np.int64(n_omega)
-        ds.attrs["mpa_omega_units"] = "Ha"
+        unit = str(energy_unit)
+        if unit not in FIT_ENERGY_UNITS:
+            raise ValueError(
+                f"mpa_store: energy_unit must be one of "
+                f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
+        ds.attrs["mpa_omega_units"] = unit
         ds.attrs["mpa_protocol"] = san["protocol"]
         ds.attrs["mpa_varpi"] = san["varpi"]
         ds.attrs["mpa_n_p"] = np.int64(san["n_p"])
@@ -749,6 +759,47 @@ def write_w_slab_collective(
             n_ready = _mark_w_slab_ready(ds, mgrp, i_omega, ready)
     barrier("mpa_w_slab_ready")
     return n_ready
+
+
+def read_w_slab_collective(
+    src,
+    name,
+    i_omega,
+    *,
+    mesh_xy,
+    require_ready=True,
+):
+    """Read one frequency slab directly into ``P(None,'x','y')``.
+
+    This is the inverse of :func:`write_w_slab_collective`: the file keeps
+    the logical centroid extent, SlabIO pads only the two distributed axes,
+    and no rank materializes the complete ``(q,mu,nu)`` slab.  The routine
+    is valid for any MPA frequency tensor with this layout (in particular
+    both ``chi(z)`` and ``Wc(z)``); the historical ``W`` in its name denotes
+    the on-disk format, not an extra transport.
+    """
+    from jax.sharding import PartitionSpec as P
+    from file_io.slab_io import SlabIO, mesh_divisible_shape
+
+    header = read_w_header(src, name)
+    i = int(i_omega)
+    if not 0 <= i < header["n_omega"]:
+        raise IndexError(
+            f"read_w_slab_collective: frequency index {i} is outside "
+            f"[0,{header['n_omega']}) for {name!r}")
+    if require_ready and not bool(header["data_ready"][i]):
+        raise ValueError(
+            f"read_w_slab_collective: {name!r} slab {i} is allocated but "
+            "not ready")
+
+    logical = (1, header["n_q_on_disk"], header["n_mu"], header["n_mu"])
+    spec = P(None, None, "x", "y")
+    shape = mesh_divisible_shape(logical, mesh_xy, spec)
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        slab = io.read_slab(
+            name, shape=shape, offset=(i, 0, 0, 0),
+            valid_shape=logical, partition_spec=spec)
+    return slab[0], header
 
 
 # ---------------------------------------------------------------------------
@@ -1647,6 +1698,7 @@ def write_head_fit(
     fit_condition,
     fit_backward_error,
     fit_max_abs_residual,
+    model="multipole",
     mode="a",
 ):
     """Write the complete scalar q->0 MPA fit and stamp readiness last.
@@ -1694,6 +1746,7 @@ def write_head_fit(
         head.create_dataset("Omega_p", data=poles)
         head.create_dataset("B_p", data=residues)
         head.attrs["format_version"] = np.int64(1)
+        head.attrs["model"] = str(model)
         head.attrs["frequency_unit"] = str(energy_unit)
         head.attrs["Wc_unit"] = "a.u."
         head.attrs["residue_unit"] = f"{energy_unit}*a.u."
@@ -1729,6 +1782,7 @@ def read_head_fit(src, *, to_unit=None, mode="r"):
             "Wc": qs.qirr_attr_str(head, "Wc_unit"),
             "residue": qs.qirr_attr_str(head, "residue_unit"),
         }
+        model = qs.qirr_attr_str(head, "model")
     if to_unit is not None:
         if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
             raise ValueError(
@@ -1745,6 +1799,7 @@ def read_head_fit(src, *, to_unit=None, mode="r"):
         "B_p": residues,
         "units": units,
         "diagnostics": diagnostics,
+        "model": model,
         "ready": True,
     }
 

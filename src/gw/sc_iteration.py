@@ -1101,16 +1101,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening: solve W at every frequency the Σ scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
-    requests = screening_requests_for(
-        inputs.config.compute_mode, inputs.config)
-    W_by_role = compute_screening(
-        wfns_qp, inputs.V_q, requests,
-        quad=inputs.quad, e_ref=inputs.e_ref,
-        sym=inputs.sym, centroid_indices=inputs.centroid_indices,
-        config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
-        print_fn=inputs.print_fn,
+    from .screening import compute_screening_model
+    W_by_role = compute_screening_model(
+        inputs.config.compute_mode, wfns_qp, inputs.V_q,
+        quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
+        centroid_indices=inputs.centroid_indices, config=inputs.config,
+        meta=inputs.meta, mesh_xy=inputs.mesh_xy,
+        run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
+        label=f"sc_{state.iteration:04d}",
+        head_resolver=inputs.head_resolver,
         head_channel=getattr(inputs, 'head_channel', None),
-    )
+        print_fn=inputs.print_fn)
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
     # so intermediate SC iterations don't thrash sigma_mnk.h5; the

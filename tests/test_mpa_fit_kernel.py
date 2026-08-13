@@ -399,8 +399,11 @@ def test_diagnostics_conditioning_and_backward_error():
     W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
 
     cnd = diagnostics.solve_conditioning(W, z, n_p)
+    fit_diag = pade_fit.fit_mpa_poles(W, z, n_p)[2]
     # Tiny backward error: the linear algebra was done right.
     assert float(cnd["backward_error"]) < 1.0e-12
+    np.testing.assert_allclose(
+        fit_diag["backward_error"], cnd["backward_error"], rtol=1e-13)
     # Large condition number: the ANSWER is still only good to cond*eps.
     # This pairing is the whole point of reporting both -- a small
     # backward error alone would look like a clean bill of health.

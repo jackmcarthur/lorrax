@@ -80,6 +80,59 @@ def _rows(Omega_poles, bounds, phase_real):
             np.asarray(phases, dtype=bool), stats)
 
 
+def _geometry(branches, regularization_width_ry, edge_factor):
+    omega_max = max((float(np.max(b.omega_abs)) for b in branches
+                     if b.omega_abs.size), default=0.0)
+    xi = max(float(regularization_width_ry),
+             crossing_regularization_floor(omega_max, edge_factor), 1e-12)
+    hgl_edge = omega_max + float(edge_factor) * xi
+    selectors = {
+        "narrow": _selector(gamma_hi=xi),
+        "wide": _selector(gamma_lo=xi),
+        "wide_shallow": _selector(a_hi=omega_max, gamma_lo=xi),
+        "wide_deep": _selector(a_hi=_INF, gamma_lo=xi),
+        "narrow_shallow": _selector(a_hi=hgl_edge, gamma_hi=xi),
+        "narrow_deep": _selector(a_hi=_INF, gamma_hi=xi),
+    }
+    selectors["wide_deep"][0] = omega_max
+    selectors["narrow_deep"][0] = hgl_edge
+    return omega_max, xi, hgl_edge, selectors
+
+
+def summarize_sigma_poles(
+    Omega_poles,
+    branches,
+    *,
+    regularization_width_ry,
+    edge_factor,
+    pole_offset=0,
+):
+    """Reduce one resident pole batch to the scalar planning evidence."""
+    _omega_max, _xi, _hgl_edge, selectors = _geometry(
+        branches, regularization_width_ry, edge_factor)
+    out = []
+    for local, Omega in enumerate(Omega_poles):
+        out.append((int(pole_offset) + local,
+                    {name: _stats(Omega, bounds)
+                     for name, bounds in selectors.items()}))
+    return tuple(out)
+
+
+def _rows_from_summaries(summaries, name, bounds, phase_real):
+    indices, selectors, phases, stats = [], [], [], []
+    for pole, evidence in summaries:
+        got = evidence[name]
+        if got is None:
+            continue
+        indices.append(int(pole))
+        selectors.append(bounds)
+        phases.append(phase_real)
+        stats.append(got)
+    return (np.asarray(indices, dtype=np.int32),
+            np.asarray(selectors, dtype=np.float64).reshape(-1, 6),
+            np.asarray(phases, dtype=bool), stats)
+
+
 def _a_space(branch, predicate):
     E = np.asarray(jax.device_get(branch.E_A), dtype=np.float64)
     base = np.asarray(jax.device_get(branch.base_mask_A), dtype=bool)
@@ -138,6 +191,7 @@ def build_shared_sigma_windows(
     hgl_eps_q: float = 1.0e-3,
     hgl_max_nodes: int = 200,
     use_shipped_hgl: bool = True,
+    pole_summaries=None,
 ):
     """Build the complete MPA frequency plan from actual pole bounds.
 
@@ -148,33 +202,25 @@ def build_shared_sigma_windows(
     dictionary is shared by all widths and poles in a physical class; memory
     batching is left to the executor.
     """
-    poles = tuple(Omega_poles)
-    if not poles:
+    poles = () if Omega_poles is None else tuple(Omega_poles)
+    summaries = None if pole_summaries is None else tuple(pole_summaries)
+    if not poles and not summaries:
         raise ValueError("MPA Sigma needs at least one pole field")
-    omega_max = max((float(np.max(b.omega_abs)) for b in branches
-                     if b.omega_abs.size), default=0.0)
-    xi = max(float(regularization_width_ry),
-             crossing_regularization_floor(omega_max, edge_factor), 1e-12)
-    hgl_edge = omega_max + float(edge_factor) * xi
-
-    selectors = {
-        "narrow": _selector(gamma_hi=xi),
-        "wide": _selector(gamma_lo=xi),
-        "wide_shallow": _selector(a_hi=omega_max, gamma_lo=xi),
-        "wide_deep": _selector(a_hi=_INF, gamma_lo=xi),
-        "narrow_shallow": _selector(a_hi=hgl_edge, gamma_hi=xi),
-        "narrow_deep": _selector(a_hi=_INF, gamma_hi=xi),
-    }
-    # Deep selectors are open at their lower a edge.
-    selectors["wide_deep"][0] = omega_max
-    selectors["narrow_deep"][0] = hgl_edge
+    omega_max, xi, hgl_edge, selectors = _geometry(
+        branches, regularization_width_ry, edge_factor)
     # Every sign-definite route retains the fitted complex pole.  Replacing
     # Gamma by zero is the HGL core's explicit approximation, not a property
     # of every pole below xi.
-    selected = {
-        name: _rows(poles, bounds, False)
-        for name, bounds in selectors.items()
-    }
+    if summaries is None:
+        selected = {
+            name: _rows(poles, bounds, False)
+            for name, bounds in selectors.items()
+        }
+    else:
+        selected = {
+            name: _rows_from_summaries(summaries, name, bounds, False)
+            for name, bounds in selectors.items()
+        }
 
     output = []
     crossing_branches = []
@@ -283,12 +329,21 @@ def build_shared_sigma_windows(
                 eps_q=hgl_eps_q, target_kind="hgl",
                 use_shipped_tables=use_shipped_hgl)
             raw = q.to_minimax_nodes(time_axis="crossing_hgl")
-            hgl_nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
+            t = raw.t / xi
+            alpha = raw.alpha / xi
+            # Do not infer the -t arm from a band-space adjoint.  MPA fits
+            # each complex residue element independently, so pole p need not
+            # be adjoint-closed element by element.  Both explicit arms use
+            # the same B_p and form alpha*sin(t*u) algebraically.
+            hgl_nodes = MinimaxNodes(
+                t=jnp.stack((t, -t), axis=-1).reshape(-1),
+                alpha=jnp.stack(
+                    (alpha / (2j), -alpha / (2j)), axis=-1).reshape(-1))
             for branch, neg in crossing_branches:
                 mask, eb = _a_space(branch, lambda E: E <= hgl_edge)
                 if eb is not None:
                     win = _window(
-                        "core_hgl", hgl_nodes, mask, eb[0], +1, "imag", -neg,
+                        "core_hgl", hgl_nodes, mask, eb[0], +1, "full", -neg,
                         q.max_error, q.provenance, crossing_kind="hgl")
                     output.append(SharedSigmaWindow(
                         win, branch.E_A, branch.omega_abs,
@@ -299,4 +354,7 @@ def build_shared_sigma_windows(
                     "n_tau": int(sum(row.window.n_tau for row in output))}
 
 
-__all__ = ["SharedSigmaWindow", "build_shared_sigma_windows"]
+__all__ = [
+    "SharedSigmaWindow", "build_shared_sigma_windows",
+    "summarize_sigma_poles",
+]

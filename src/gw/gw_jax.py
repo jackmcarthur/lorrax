@@ -72,7 +72,7 @@ from .gw_config import (
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
-from .screening import compute_screening, screening_requests_for
+from .screening import compute_screening_model
 from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
 from .degen_average import (
@@ -404,16 +404,16 @@ def main(argv=None):
 				wfns, config.minimax_config, print_fn=print0)
 	# SC solves its own W's inside the iteration map; the static W is
 	# still solved once here to seed the W0 restart flush.
-	requests = screening_requests_for(mode, config)
-	if qp_solver is QPSolver.SELF_CONSISTENT:
-		requests = [r for r in requests if r.role == "static"]
 	with timing.section("gw_jax.screening", announce=True,
 	                    label="screening (chi0 -> W)"):
-		W_by_role = compute_screening(
-			wfns, V_q, requests, quad=quad, e_ref=e_ref,
-			sym=sym, centroid_indices=centroid_indices,
-			config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0,
-			head_channel=getattr(isdf, 'head_channel', None))
+		W_by_role = compute_screening_model(
+			mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+			centroid_indices=centroid_indices, config=config, meta=meta,
+			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"),
+			label="oneshot", head_resolver=head_resolver,
+			head_channel=getattr(isdf, 'head_channel', None),
+			static_only=qp_solver is QPSolver.SELF_CONSISTENT,
+			print_fn=print0)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
@@ -433,12 +433,13 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	with timing.section("gw_jax.persist_w0"):
-		persist_w0_and_head(
-			W_by_role.get("static", V_q),
-			tensors_filename=tensors_filename, head_resolver=head_resolver,
-			config=config, meta=meta, mesh_xy=mesh_xy,
-			sym=sym, centroid_indices=centroid_indices, print_fn=print0)
+	if mode is not ComputeMode.MPA:
+		with timing.section("gw_jax.persist_w0"):
+			persist_w0_and_head(
+				W_by_role.get("static", V_q),
+				tensors_filename=tensors_filename, head_resolver=head_resolver,
+				config=config, meta=meta, mesh_xy=mesh_xy,
+				sym=sym, centroid_indices=centroid_indices, print_fn=print0)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was

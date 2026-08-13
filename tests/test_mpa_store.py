@@ -295,6 +295,41 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         "open", "create", "close", "open", "write", "close"]
 
 
+def test_collective_reader_keeps_one_frequency_slab_sharded(
+        tmpdir_path, monkeypatch):
+    W, _, _, _, _, _ = _write_w(tmpdir_path)
+    calls = []
+
+    class FakeSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            self.path = path
+
+        def __enter__(self):
+            calls.append("open")
+            return self
+
+        def __exit__(self, *_):
+            calls.append("close")
+
+        def read_slab(self, name, *, shape, offset, valid_shape,
+                      partition_spec):
+            with h5py.File(self.path, "r") as f:
+                raw = np.asarray(f[name][offset[0]:offset[0] + 1])
+            out = np.zeros(shape, dtype=raw.dtype)
+            out[tuple(slice(0, n) for n in raw.shape)] = raw
+            import jax
+            from jax.sharding import NamedSharding
+            return jax.device_put(out, NamedSharding(_mesh(), partition_spec))
+
+    import file_io.slab_io as slab_io
+    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    got, header = MS.read_w_slab_collective(
+        tmpdir_path, "W_qmunu_omega", 1, mesh_xy=_mesh())
+    np.testing.assert_array_equal(np.asarray(got), W[1])
+    assert header["data_ready"][1]
+    assert calls == ["open", "close"]
+
+
 def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for iq in range(_N_Q_IBZ):

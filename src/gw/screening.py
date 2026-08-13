@@ -128,14 +128,9 @@ def screening_requests_for(
         return [static, ScreeningRequest(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     if mode is ComputeMode.MPA:
-        # The sample plan exists (``gw.mpa.sample_plan.mpa_plan``); the
-        # fit stage that consumes it does not, so there is no honest
-        # ScreeningRequest list to return yet.
-        refuse_unimplemented_compute_mode(
-            mode, context="screening_requests_for")
-        raise NotImplementedError(              # pragma: no cover
-            "screening_requests_for: compute_mode = mpa has no screening "
-            "plan until the MPA fit stage lands.")
+        # MPA owns a shared multi-frequency disk walk, not independent W
+        # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver.
+        return []
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")
 
@@ -674,6 +669,56 @@ def compute_screening(
     return W_by_role
 
 
+def compute_screening_model(
+    mode,
+    wfns,
+    V_q,
+    *,
+    quad,
+    e_ref,
+    sym,
+    centroid_indices,
+    config,
+    meta,
+    mesh_xy,
+    run_dir,
+    label,
+    head_resolver=None,
+    head_channel=None,
+    static_only=False,
+    print_fn=print,
+):
+    """Build the screening representation consumed by one Sigma ansatz.
+
+    Ordinary modes return their in-memory ``{role: W_q}`` mapping.  MPA
+    returns one disk-backed fit path under ``"mpa_fit"``; its shared
+    frequency walk cannot be represented as independent screening requests.
+    ``static_only`` is the pre-SC restart seed used by ordinary modes; MPA
+    rebuilds its model inside each iteration and therefore returns nothing.
+    """
+    if mode is ComputeMode.MPA:
+        if static_only:
+            return {}
+        if head_resolver is None:
+            raise ValueError("MPA screening requires a fixed head resolver")
+        from .mpa.model import build_mpa_fit
+        fit_path = build_mpa_fit(
+            run_dir, label, wfns=wfns, V_q=V_q, quad=quad, sym=sym,
+            centroid_indices=centroid_indices, head_resolver=head_resolver,
+            config=config, meta=meta, mesh_xy=mesh_xy,
+            energy_reference=e_ref, print_fn=print_fn)
+        return {"mpa_fit": fit_path}
+
+    requests = screening_requests_for(mode, config)
+    if static_only:
+        requests = [request for request in requests
+                    if request.role == "static"]
+    return compute_screening(
+        wfns, V_q, requests, quad=quad, e_ref=e_ref, sym=sym,
+        centroid_indices=centroid_indices, config=config, meta=meta,
+        mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel)
+
+
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
             kgrid=None) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
@@ -745,4 +790,5 @@ __all__ = [
     "screening_requests_for",
     "compute_static_w",
     "compute_screening",
+    "compute_screening_model",
 ]

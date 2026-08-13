@@ -630,6 +630,47 @@ def compute_sigma_xc(
             sigma_coh_kij_ry=sig_coh,
         )
 
+    if mode is ComputeMode.MPA:
+        from file_io import mpa_store
+        from .head_correction import compute_complex_pole_head_sigma_diag
+        from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+
+        if e_qp_ev is None:
+            raise ValueError("MPA Sigma requires QP evaluation energies")
+        try:
+            fit_path = W_by_role["mpa_fit"]
+        except KeyError as exc:
+            raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+        quadrature = config.sigma_quadrature_config
+        body = compute_sigma_c_mpa_omega_grid(
+            wfns, fit_path, meta, mesh_xy,
+            omega_grid_ry=config.omega_grid_ry,
+            efermi_ry=float(wfn.efermi),
+            regularization_width_ry=(
+                float(config.sigma.regularization_ev) / RYD_TO_EV),
+            edge_factor=float(config.sigma.window_edge_factor),
+            target_error=float(quadrature.target_error),
+            max_rank=int(quadrature.max_nodes),
+            pole_batch_size=int(config.mpa.pole_batch_size),
+            print_fn=print_fn)
+        head = mpa_store.read_head_fit(fit_path, to_unit="Ry")
+        sigma_bands = wfns.slices.sigma
+        head_diag = compute_complex_pole_head_sigma_diag(
+            omega_grid_ry=np.asarray(config.omega_grid_ry),
+            enk_ry=np.asarray(wfns.enk[:, sigma_bands]),
+            efermi_ry=float(wfn.efermi),
+            occupations=np.asarray(wfns.occ[:, sigma_bands]),
+            poles_ry=head["Omega_p"], residues_ry=head["B_p"],
+            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+        return finalize_dynamic_sigma(
+            body.sigma_c_kij, head_diag,
+            sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
+            config=config, meta=meta, mesh_xy=mesh_xy,
+            sym=sym, wfn=wfn, band_slices=band_slices,
+            input_dir=input_dir,
+            write_sigma_omega_h5=write_sigma_omega_h5,
+            print_fn=print_fn)
+
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
     # guard it was reached by ELSE: anything that was not X_ONLY and not

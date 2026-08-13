@@ -586,9 +586,9 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
     # solves per element, because the store requires a backward error
     # the fit kernel does not return.
     assert r["fit_dispatches"] == r["blocks_walked"]
-    assert r["diagnostic_dispatches"] == r["blocks_walked"]
-    assert r["full_fits"] == 2 * r["elements_fitted"]
-    assert r["pade_solves"] == 3 * r["elements_fitted"]
+    assert r["diagnostic_dispatches"] == 0
+    assert r["full_fits"] == r["elements_fitted"]
+    assert r["pade_solves"] == r["elements_fitted"]
 
     sec = r["seconds"]
     parts = sec["read"] + sec["fit"] + sec["write"] + sec["finalize"]

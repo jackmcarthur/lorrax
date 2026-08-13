@@ -448,6 +448,15 @@ def fit_mpa_poles(
     # --- Stage 1: the normalised Pade-in-z^2 linear solve.
     A, rhs, x_hat, x_max = build_pade_system(w, z, n)
     coef, cond, s_max, s_min = _solve_normalised(A, rhs, rcond)
+    row_norm = jnp.linalg.norm(A, axis=1)
+    row_norm = jnp.where(row_norm > 0, row_norm, 1.0)
+    A_n, rhs_n = A / row_norm[:, None], rhs / row_norm
+    backward_num = jnp.linalg.norm(A_n @ coef - rhs_n)
+    backward_den = (
+        jnp.linalg.norm(A_n) * jnp.linalg.norm(coef)
+        + jnp.linalg.norm(rhs_n))
+    backward_error = backward_num / jnp.where(
+        backward_den > 0, backward_den, 1.0)
     c_coeffs = coef[n:]
 
     # --- Stage 2: companion-matrix roots.  b = Omega**2, scaled.
@@ -521,6 +530,7 @@ def fit_mpa_poles(
         "cond_pade": cond,
         "sigma_max_pade": s_max,
         "sigma_min_pade": s_min,
+        "backward_error": backward_error,
         "x_max": x_max,
         "n_reflected": jnp.sum(fired_reflection.astype(jnp.int32)),
         "n_time_order_flipped": jnp.sum(fired_time_order.astype(jnp.int32)),

@@ -520,8 +520,8 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # loudly until it is rewritten to pin the new behaviour.
 UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
     ComputeMode.MPA: (
-        "the dynamic q->0 head and shared output/QSGW finalizer must land; "
-        "see THEORY_mpa_implementation.md"
+        "the row-sharded Padé fit and adjoint-free near-axis Sigma gate "
+        "must pass at P=4; see THEORY_mpa_implementation.md"
     ),
 }
 
@@ -1337,6 +1337,14 @@ _DEFAULTS = {
     "ppm_probe_chi_reuse": "off",
     "ppm_sigma_target_error": 1.0e-6,
     "ppm_sigma_max_nodes": 64,
+    # Multipole W sampling / bounded Sigma consumption.
+    "mpa_n_poles": 8,
+    "mpa_material_class": "insulator",
+    "mpa_sampling_alpha": 1,
+    "mpa_varpi_near_ry": 0.2,
+    "mpa_varpi_far_ry": 2.0,
+    "mpa_head_model": "fixed_dft",
+    "mpa_pole_batch_size": 4,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
@@ -1982,6 +1990,37 @@ class PPMConfig:
 
 
 @dataclass(frozen=True)
+class MPAConfig:
+    """Multipole sample geometry and bounded pole-consumption policy."""
+
+    n_poles: int
+    material_class: str
+    sampling_alpha: int
+    varpi_near_ry: float
+    varpi_far_ry: float
+    head_model: str
+    pole_batch_size: int
+
+    def __post_init__(self):
+        if not 1 <= self.n_poles <= 16:
+            raise ValueError("mpa_n_poles must be in [1, 16]")
+        if self.material_class != "insulator":
+            raise NotImplementedError(
+                "mpa_material_class currently supports only 'insulator'; "
+                "fractional-occupation/intraband physics has not landed")
+        if self.sampling_alpha not in (1, 2):
+            raise ValueError("mpa_sampling_alpha must be 1 or 2")
+        if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
+            raise ValueError(
+                "MPA line heights must satisfy 0 < near < far")
+        if self.head_model != "fixed_dft":
+            raise NotImplementedError(
+                "mpa_head_model currently supports only 'fixed_dft'")
+        if not 1 <= self.pole_batch_size <= 4:
+            raise ValueError("mpa_pole_batch_size must be in [1, 4]")
+
+
+@dataclass(frozen=True)
 class SCConfig:
     """Self-consistency loop knobs (read only when qp_solver=self_consistent).
 
@@ -2203,6 +2242,7 @@ class LorraxConfig:
     screening: ScreeningConfig
     sigma: DynamicSigmaConfig
     ppm: PPMConfig
+    mpa: MPAConfig
     sc: SCConfig
     memory: MemoryConfig
     backend: BackendConfig
@@ -2487,6 +2527,15 @@ class LorraxConfig:
             sigma_target_error=float(_g("ppm_sigma_target_error")),
             sigma_max_nodes=int(_g("ppm_sigma_max_nodes")),
             invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
+        )
+        mpa = MPAConfig(
+            n_poles=int(_g("mpa_n_poles")),
+            material_class=str(_g("mpa_material_class")).strip().lower(),
+            sampling_alpha=int(_g("mpa_sampling_alpha")),
+            varpi_near_ry=float(_g("mpa_varpi_near_ry")),
+            varpi_far_ry=float(_g("mpa_varpi_far_ry")),
+            head_model=str(_g("mpa_head_model")).strip().lower(),
+            pole_batch_size=int(_g("mpa_pole_batch_size")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
@@ -2807,6 +2856,7 @@ class LorraxConfig:
             screening=screening,
             sigma=sigma,
             ppm=ppm,
+            mpa=mpa,
             sc=sc,
             memory=memory,
             backend=backend,

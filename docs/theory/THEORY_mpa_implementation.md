@@ -135,13 +135,14 @@ W_c(z)\approx\sum_{p=1}^{N_p}
 \qquad \Omega_p=a_p-i\Gamma_p.
 $$
 
-`gw.mpa.pade_fit` owns the normalized Loewner/Padé solve.  For an
-offline/restart fit, `gw.mpa.fit_driver` owns the column walk and
-`file_io.mpa_store` owns pole bytes, units, completion and diagnostics.  For
-self-consistency, `gw.mpa.model.produce_model` receives one
-`(z,mu,nu-column)` Wc tile, fits it, releases it, and retains only the fitted
-pole arrays and tiny scalar head.  It performs no file I/O.  Thus neither
-path requires a full frequency-resolved W tensor in memory.
+`gw.mpa.pade_fit` owns the normalized Loewner/Padé solve,
+`gw.mpa.fit_driver` owns the column walk, and `file_io.mpa_store` owns sample
+and pole bytes, units, completion, and diagnostics.  Each irreducible-q
+`chi(z_j)` slab is committed first.  Dyson then reads one complete chi slab,
+writes one `Wc(z_j)` slab, and releases both.  The fit reads all `z_j` only
+for a bounded `nu`-column block (about `N_mu/N_z` columns by default), writes
+its poles, and releases the block.  No full frequency tensor exists in
+memory.
 
 The pole fit may place every pole at any positive `a_p` and nonnegative
 `Gamma_p`; pole index is not a frequency band.  The executor groups poles by
@@ -296,12 +297,13 @@ S_{\mathrm{eff}}(z)=S_0(z)
 $$
 
 `gw.head_correction.fold_cartesian_head_wings_sharded` owns this contraction
-without gathering the body tile, and the scalar MPA head has the same generic
-complex-pole sum as the body.  The missing production component is the
-per-map producer that rebuilds `S_0`, `Y`, `Z` from the current orbitals and
-energies, applies the canonical anisotropic q→0 average, and hands its head
-samples to the bounded fit.  Until that producer is connected,
-`compute_mode = mpa` refuses.
+without gathering the body tile.  The production component that rebuilds
+`S_0`, `Y`, and `Z` from the current orbitals is not connected yet.  The
+staged driver therefore labels and reuses the established two-point DFT
+scalar head while rebuilding the MPA body.  This fixed-head approximation
+omits local-field head/wing dynamics; it is not an arbitrary-frequency MPA
+head.  Public `compute_mode = mpa` remains disabled until the row-sharded
+fit and this approximation pass the four-rank integration gate.
 
 After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
 
@@ -312,11 +314,12 @@ After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
 5. apply the existing outside-band scissor extension.
 
 One-shot and diagonal fixed-point QP solvers can consume a finalized external
-pole store.  Fully self-consistent QSGW cannot: each iteration changes the
-orbitals and transition energies, so chi0 samples, Dyson solves, MPA poles,
-window bounds and the dynamic head must be rebuilt in-loop and handed to
-Sigma in memory.  Writing and rereading W or poles each iteration is not part
-of the intended algorithm.
+pole store.  Fully self-consistent QSGW rebuilds the body model because each
+iteration changes the orbitals and transition energies.  Its bounded path is
+`chi(z)` q-wedge store -> one-slab Dyson -> `Wc(z)` q-wedge store -> bounded
+column fit -> q-wedge pole store.  Sigma subsequently reads and unfolds four
+pole/residue slabs at a time.  The fixed-head approximation may reuse one
+head fit while the body is rebuilt each iteration.
 
 ## 8. Current validation and public controls
 
@@ -329,11 +332,11 @@ validate that particular frozen schedule, not every runtime-generated plan.
 
 Common real-frequency controls already live in the Sigma section of
 `docs/input_reference.md`: grid minimum, maximum and step; regularization;
-window-edge factor; omega layout and accumulation.  MPA-specific production
-keys are deliberately not parsed while the mode refuses—parsed-but-ignored
-keys are defects.  When the head/driver lands, the intended small public
-surface is pole count, material-class/sample-plan choice, near/far sampling
-line heights, head label, Sigma target/rank and pole batch size.  HGL
+window-edge factor; omega layout and accumulation.  The staged MPA keys are
+pole count, insulating sample-plan choice, near/far sampling line heights,
+the explicitly fixed-DFT head model, and pole batch size (hard-capped at
+four).  The mode still refuses at entry while its P=4 gate is incomplete, so
+none of these keys can silently select unverified work.  HGL
 certification constants, panel construction details, provenance hashes and
 campaign controls remain implementation data rather than deck knobs.
 
