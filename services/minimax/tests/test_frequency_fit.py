@@ -6,6 +6,7 @@ from minimax import (
     fit_shared_sine_rule,
     positive_complex_chebyshev,
     resolvent_system,
+    shared_sine_contour,
     shared_sine_system,
 )
 
@@ -75,3 +76,23 @@ def test_shared_sine_fit_reduces_dense_error_and_reports_executed_rank():
     assert result.executed_contour_nodes == 2 * result.sine_rank
     assert result.sampled_max_error < 2.0e-2
     assert np.all(result.weights >= 0.0)
+
+
+def test_shared_sine_contour_is_the_same_kernel_atom_by_atom():
+    from minimax import SharedSineFit
+
+    fit = SharedSineFit(
+        times=np.asarray([0.2, 0.7]),
+        weights=np.asarray([0.3, 0.1]),
+        sampled_max_error=0.0,
+        sampled_error_by_frequency=np.zeros(1),
+        worst_delta_by_frequency=np.zeros(1),
+        history=(),
+    )
+    tau, weights, signs = shared_sine_contour(fit)
+    delta = 1.4
+    z = 0.6 + 0.2j
+    got = np.sum(-weights * np.exp(-tau * (delta - signs * z)))
+    want = np.sum(-2.0 * fit.weights * np.exp(1j * z * fit.times)
+                  * np.sin(delta * fit.times))
+    np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)

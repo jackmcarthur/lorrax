@@ -61,6 +61,34 @@ class SharedSineFit:
         return 2 * self.sine_rank
 
 
+def shared_sine_contour(fit: SharedSineFit) -> tuple[Array, Array, Array]:
+    r"""Expand a shared sine rule into its two complex-time arms.
+
+    For every positive ``(t,w)`` this returns
+
+    .. math::
+
+       (\tau,c,s)=(-it,-iw,-1),\quad(+it,+iw,+1),
+
+    where a consumer evaluates ``-c exp[-tau (Delta-s z)]``.  Their sum is
+    exactly ``-2 w exp(i z t) sin(Delta t)``.  No fitting or resampling occurs.
+    """
+    times = np.asarray(fit.times, dtype=np.float64)
+    weights = np.asarray(fit.weights, dtype=np.float64)
+    if (times.ndim != 1 or weights.shape != times.shape or times.size == 0
+            or np.any(times <= 0.0) or np.any(weights < 0.0)
+            or not np.all(np.isfinite(times))
+            or not np.all(np.isfinite(weights))):
+        raise ValueError("shared sine fit must contain finite positive nodes and weights")
+    tau = np.concatenate((-1.0j * times, 1.0j * times))
+    contour_weights = np.concatenate((-1.0j * weights, 1.0j * weights))
+    frequency_sign = np.concatenate((
+        -np.ones(times.size, dtype=np.int8),
+        np.ones(times.size, dtype=np.int8),
+    ))
+    return tau, contour_weights, frequency_sign
+
+
 @dataclass(frozen=True)
 class DampedReciprocalFit:
     """Positive rotated-Laplace rule fitted to complex rectangles."""

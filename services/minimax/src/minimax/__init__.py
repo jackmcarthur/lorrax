@@ -205,7 +205,7 @@ _SOLVER_NAMES = (
 # not import an optimiser.
 _FREQUENCY_FIT_NAMES = (
     "PositiveChebyshevFit", "SharedSineFit", "DampedReciprocalFit",
-    "positive_complex_chebyshev", "shared_sine_system",
+    "positive_complex_chebyshev", "shared_sine_system", "shared_sine_contour",
     "resolvent_system", "fit_shared_sine_rule", "fit_damped_reciprocal",
     "select_smallest_rank",
 )
