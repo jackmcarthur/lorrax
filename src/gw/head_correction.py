@@ -26,6 +26,7 @@ import os
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
 
@@ -400,6 +401,66 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
             int(wfn.nspin), int(wfn.nspinor), omega_grid, eta=float(eta),
         )[0]
     return np.asarray(S_cart_omega, dtype=np.complex128)
+
+
+@functools.partial(jax.jit, static_argnames=("mesh_xy",))
+def fold_cartesian_head_wings_sharded(
+    S_direct: jax.Array,
+    Y_x: jax.Array,
+    W_body_xy: jax.Array,
+    Z_y: jax.Array,
+    cell_volume: float,
+    *,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    r"""Fold dynamic body screening into the Cartesian q² head tensor.
+
+    This is the Cartesian-leading-axis generalization of the production-tested
+    sharded ``Y W Z`` reduction in ``gw.experimental.head_wing_schur``:
+
+    .. math::
+
+        S_{ab}^{\mathrm{eff}}(z) = S_{ab}^{0}(z)
+          + \frac{1}{V_{\mathrm{cell}}}
+            \sum_{\mu\nu}Y_{a\mu}(z)W_{\mu\nu}(z)Z_{\nu b}(z).
+
+    Any replicated batch/frequency axes may precede the displayed axes.  The
+    centroid axes remain tiled exactly like the screening body: ``Y`` on
+    ``x``, ``W`` on ``(x,y)``, and ``Z`` on ``y``.  Therefore the only
+    communication is the reduction of the tiny Cartesian output.  The caller
+    must supply those shardings; this kernel deliberately does not defensively
+    reshard the large inputs.
+
+    Parameters
+    ----------
+    S_direct
+        Direct dipole tensor, ``(..., 3, 3)``, replicated.
+    Y_x
+        Left wing, ``(..., 3, n_mu)``, centroid axis sharded on ``x``.
+    W_body_xy
+        Already screened body, ``(..., n_mu, n_mu)``, sharded on ``(x,y)``.
+    Z_y
+        Right wing, ``(..., n_mu, 3)``, centroid axis sharded on ``y``.
+    cell_volume
+        Primitive-cell volume in bohr³.  It appears exactly once.
+    mesh_xy
+        Production two-dimensional device mesh.
+
+    Returns
+    -------
+    jax.Array
+        Effective tensor ``(..., 3, 3)``, replicated on ``mesh_xy``.
+    """
+    n_lead = W_body_xy.ndim - 2
+    if n_lead < 0 or Y_x.ndim != n_lead + 2 or Z_y.ndim != n_lead + 2:
+        raise ValueError("Y, W_body, and Z must share their leading axes")
+    correction = jnp.einsum(
+        "...am,...mn,...nb->...ab", Y_x, W_body_xy, Z_y, optimize=True)
+    S_effective = S_direct + correction / jnp.asarray(cell_volume)
+    return jax.lax.with_sharding_constraint(
+        S_effective,
+        NamedSharding(mesh_xy, P(*([None] * n_lead), None, None)),
+    )
 
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
