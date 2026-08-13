@@ -2113,7 +2113,8 @@ def write_fit_block_collective(
         sharding = getattr(arr, "sharding", None)
         return (isinstance(sharding, NamedSharding)
                 and sharding.mesh == mesh_xy
-                and (sharding == expected or mesh_size == 1))
+                and (sharding.is_equivalent_to(expected, arr.ndim)
+                     or mesh_size == 1))
 
     Om, Bp = Omega_p_block, B_p_block
     if not _on(Om, expected_pole) or not _on(Bp, expected_pole):
