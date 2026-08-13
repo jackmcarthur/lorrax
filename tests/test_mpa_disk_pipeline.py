@@ -13,6 +13,25 @@ def _mesh():
     return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
 
+def test_q_wedge_returns_the_resolution_verdict(monkeypatch):
+    verdict = object()
+    resolution = SimpleNamespace(verdict=verdict)
+    monkeypatch.setattr(
+        "gw.v_q_g_flat._resolve_ibz_q_list",
+        lambda **kwargs: (
+            None, np.zeros((1, 3)), np.zeros(1, np.int32),
+            np.zeros(1, np.int32), np.zeros((1, 1), np.int32),
+            np.zeros((1, 1, 3), np.int32), True, resolution))
+    sym = SimpleNamespace(
+        q_irr_full_idx=np.array([0], np.int32),
+        sym_matrices=np.eye(3, dtype=np.int32)[None, ...])
+    q_idx, _tables, got = model._q_wedge(
+        sym, np.zeros((1, 3), np.int32),
+        SimpleNamespace(kgrid=(1, 1, 1), fft_grid=(1, 1, 1)))
+    np.testing.assert_array_equal(q_idx, [0])
+    assert got is verdict
+
+
 def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
     V = jnp.asarray(np.stack([np.eye(2), 2 * np.eye(2)]),
                     dtype=jnp.complex128)

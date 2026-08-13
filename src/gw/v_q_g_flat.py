@@ -219,11 +219,14 @@ def _make_per_q_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 # ---------------------------------------------------------------------------
 
 def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
-                        context="V_q / W q-grid reduction"):
+                        context="V_q / W q-grid reduction",
+                        return_resolution=False):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
-    q_full_to_irr_sym, sym_perm, L_table, use_ibz)``.  When
+    q_full_to_irr_sym, sym_perm, L_table, use_ibz)``.  With
+    ``return_resolution=True``, the resolution carrying the closure verdict
+    is appended.  When
     ``use_ibz`` is False the *_idx / *_sym / sym_perm / L_table fields
     are None; caller skips the post-loop unfold.
 
@@ -251,6 +254,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
     q_full_to_irr_sym = None
     sym_perm = None
     L_table = None
+    res = None
     # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
     # compute V_q at all full-BZ q's directly.  Useful for isolating
     # whether residuals come from unfold_isdf_operator vs the rest of the
@@ -316,8 +320,10 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
         q_irr_kgrid_int - kg_arr,
         q_irr_kgrid_int).astype(np.float64)
     q_irr_frac = q_irr_wrapped / kg_arr
-    return (q_irr_kgrid_int, q_irr_frac,
-            q_full_to_irr_idx, q_full_to_irr_sym, sym_perm, L_table, use_ibz)
+    result = (q_irr_kgrid_int, q_irr_frac,
+              q_full_to_irr_idx, q_full_to_irr_sym,
+              sym_perm, L_table, use_ibz)
+    return (*result, res) if return_resolution else result
 
 
 def _pick_g_chunk(ngkmax: int, target: int = 4096) -> int:

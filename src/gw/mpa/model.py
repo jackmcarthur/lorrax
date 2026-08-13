@@ -20,17 +20,18 @@ def _q_wedge(sym, centroid_indices, meta):
     from gw.v_q_g_flat import _resolve_ibz_q_list
     from symmetry_maps import QirrTables
 
-    _, q_frac, irr, sym_idx, perm, wraps, use_ibz = _resolve_ibz_q_list(
+    (_, q_frac, irr, sym_idx, perm, wraps, use_ibz,
+     resolution) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=tuple(meta.kgrid), fft_grid=tuple(meta.fft_grid),
-        context="MPA chi/Wc q-wedge storage")
+        context="MPA chi/Wc q-wedge storage", return_resolution=True)
     if not use_ibz:
         raise ValueError("MPA disk sampling requires an orbit-closed q wedge")
     tables = QirrTables(
         irr_idx_q=irr, sym_idx_q=sym_idx, q_irr_frac=q_frac,
         sym_perm=perm, L_table=wraps,
         n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]))
-    return np.asarray(sym.q_irr_full_idx, np.int32), tables
+    return np.asarray(sym.q_irr_full_idx, np.int32), tables, resolution.verdict
 
 
 def _to_wedge(value, q_idx, mesh_xy):
@@ -125,7 +126,7 @@ def build_mpa_fit(
         varpi_far=config.mpa.varpi_far_ry, energy_unit="Ry")
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
-    q_idx, tables = _q_wedge(sym, centroid_indices, meta)
+    q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)
     sample_path = os.path.join(root, f"mpa_samples_{label}.h5")
     fit_path = os.path.join(root, f"mpa_fit_{label}.h5")
     varpi = np.unique(z_all.imag)
@@ -133,6 +134,7 @@ def build_mpa_fit(
     common = dict(
         mesh_xy=mesh_xy, n_omega=z_all.size, n_q_on_disk=q_idx.size,
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
+        closure_verdict=closure_verdict,
         omega=z_all, omega_line=line, energy_unit="Ry",
         sampling={"protocol": "double_parallel", "varpi": varpi,
                   "n_p": n_p, "alpha": config.mpa.sampling_alpha,
