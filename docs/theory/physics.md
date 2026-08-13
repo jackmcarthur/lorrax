@@ -717,6 +717,15 @@ The $(n_\omega, n_k, m_X, n_Y)$ accumulator (`omega_accumulation = auto | kij`, 
 
 Implementation: `compute_sigma_c_ppm_omega_grid` in `gw/ppm_sigma.py`. Output written to `sigma_mnk.h5` (`omega_ev`, `sigma_c_kij_ev`, `sigma_sx_kij_ev`, `hartree_kij_ev`) via `file_io.sigma_output.write_sigma_omega_h5`.
 
+### 6.10 Multipole frequency integration
+
+MPA replaces the two-point pole fit by complex-frequency chi0 samples, an
+elementwise multipole fit of W, and geometry-dependent shared Sigma windows.
+Its equations, exact validity domains, SlabIO boundaries and current dynamic-
+head/QSGW refusal are owned by
+[Multipole frequency integration](THEORY_mpa_implementation.md); they are not
+restated here.
+
 ---
 
 ## 7. JAX Sharding Summary

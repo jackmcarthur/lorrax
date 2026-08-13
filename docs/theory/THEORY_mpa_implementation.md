@@ -1,125 +1,309 @@
-# The MPA compute mode: what exists, what refuses, what lands next
+# Multipole frequency integration in LORRAX
 
-This is the page the driver points at when you set `compute_mode = mpa` and
-it stops. It exists so that the refusal is a pointer to an explanation
-rather than a dead end.
+This page is the authoritative frequency-domain description of the MPA
+pipeline.  It describes the mathematics, ownership, validity domains and I/O
+boundaries in the order they are encountered.  `compute_mode = mpa` remains
+disabled until the dynamic q→0 head and the driver finalizer described below
+land; the scalar fit, pole store, window planner and shared Sigma kernel are
+available for internal tests without weakening that refusal.
+The refusal is owned by `gw_config.UNIMPLEMENTED_MODES`; deleting its MPA row
+is the final enablement gesture, not a preparatory step.
 
-## What `compute_mode = mpa` means
+## 1. Energies and the transition spectrum
 
-`mpa` is the multipole approximation to the screened interaction: instead of
-representing W's frequency dependence with a single plasmon pole fitted to
-two samples — which is what `gn_ppm` and `hl_ppm` do — it fits n complex
-poles (Ω_p, B_p) to W sampled on a double-parallel grid in the complex
-frequency plane, and evaluates Σ_c(ω) from those poles. The owner's
-shorthand for this work is "FF", for full frequency, because the point of
-it is to stop approximating the frequency integral with one pole; the deck
-key is spelled `mpa` because every other value on this axis names an
-ansatz, and "full frequency" names a family of ansätze rather than one of
-them. That reasoning is written out in full in the `ComputeMode` docstring
-in `src/gw/gw_config.py`, together with the alternative that was rejected.
+All frequency algorithms use one Fermi reference and convert stored pole
+energies to Ry at the pole-store read boundary.  Occupation chooses the band
+sum; it does not replace the signed energy.  Thus an empty state just below
+the Fermi level or an occupied state just above it remains signed, which is
+essential for future small-gap and inverted-gap support.
 
-## Why the mode exists before the kernels do
+For an insulating reference, define
 
-The mode is declared on the axis, parses from a deck, has a row in the
-channel-availability table, and is named explicitly at every site in the
-tree that dispatches on `compute_mode` — and it refuses to run.
+$$
+E_g = E_{c,\min}-E_{v,\max},\qquad
+A_{c\mathbf{k}}=E_{c\mathbf{k}}-E_{c,\min},\qquad
+B_{v\mathbf{k}}=E_{v,\max}-E_{v\mathbf{k}},
+$$
 
-That ordering is deliberate. A compute mode is dangerous in exactly the
-window between "someone can select it" and "everything that branches on it
-knows about it", because during that window a dispatch site with an `else`
-branch will quietly serve the new mode whatever the old modes got. The Σ
-dispatch had precisely that shape: anything that was neither bare exchange
-nor COHSEX fell into the two-point plasmon-pole pipeline. An MPA run
-landing there would have fitted a GN pole to two W samples and reported the
-result as its Σ_c(ω), and no stage downstream could have told. Closing that
-window before any kernel exists is cheaper than closing it afterwards, and
-it is testable today.
+so a transition has
 
-So what landed with the mode is the safety skeleton: the value, the parser,
-the refusal, the exhaustive dispatch, and the channel table. What did not
-land is any physics.
+$$
+\Delta_{cv\mathbf{k}}=E_g+A_{c\mathbf{k}}+B_{v\mathbf{k}}>0.
+$$
 
-## What refuses, and where
+The factorization is never implemented as a loop over `(v,c,mu)`.  LORRAX
+forms one occupied Green function and one empty Green function at each shared
+time node and contracts them in the ISDF basis.
 
-Selecting `mpa` stops the run at driver entry — before the wavefunction
-read, before ISDF, before any allocation is spent — with a message naming
-the mode. The refusal is `NotImplementedError`, which is a different
-exception from the `ValueError` a misspelled mode value gets from the
-parser, because those are different operator mistakes: `compute_mode = mpaa`
-means "no such mode", `compute_mode = mpa` means "that mode, not yet".
+## 2. Complex samples of chi0
 
-The entry refusal is a courtesy, not the safety mechanism. Every downstream
-site refuses independently, so a caller that bypasses the driver — the
-self-consistency loop, a test, a future entry point — cannot reach a kernel
-that would misinterpret the mode:
+The independent-particle response is sampled at a finite set of complex
+frequencies `z_j`.  Schematically,
 
-- `gw.screening.screening_requests_for` has an `mpa` branch that refuses
-  rather than returning the PPM's `{0, probe}` pair. MPA's W is sampled on
-  the double-parallel grid, and that grid is not two points.
-- `gw.sigma_dispatch.compute_sigma_xc` refuses any mode with no plasmon-pole
-  model before it reaches the PPM pipeline, so the `else` that used to
-  absorb new modes is gone.
-- `gw.ppm_pipeline.compute_ppm_sigma_pipeline` refuses a non-pole-model mode
-  at its own entry, which is where the "HL, or else GN" reading of the mode
-  lives.
-- `gw.gw_output.persist_w0_and_head` refuses to stamp a `{0, probe}`
-  head grid onto a restart file for a mode whose W was never evaluated
-  there.
+$$
+G_c(\mathbf r,\mathbf r',t)
+ \sim \sum_{c\mathbf k}\psi_{c\mathbf k}(\mathbf r)
+ \psi^*_{c\mathbf k}(\mathbf r')e^{-iE_{c\mathbf k}t},
+$$
 
-Deleting the mode's row from `UNIMPLEMENTED_MODES` in `gw_config.py` is the
-gesture that turns the mode on. The suite that pins these refusals fails
-loudly the moment that row goes, which is the intended forcing function:
-whoever lands the fit stage has to replace each refusal with the real
-behaviour rather than discover later that one of them was still standing.
+$$
+G_v(\mathbf r,\mathbf r',-t)
+ \sim \sum_{v\mathbf k}\psi_{v\mathbf k}(\mathbf r)
+ \psi^*_{v\mathbf k}(\mathbf r')e^{+iE_{v\mathbf k}t},
+$$
 
-## What the fit stage will build
+and their product has spectral kernel
 
-The theory is settled and written up in `~/MPA_THEORY_PLAN.md`; the parts
-that bear on this mode's shape are summarised here so the skeleton's names
-can be read against them.
+$$
+K_z(\Delta)=-\frac{2\Delta}{\Delta^2-z^2}
+            =-2\int_0^\infty e^{izt}\sin(\Delta t)\,dt.
+$$
 
-The fit stage produces, per (q, μν) column, a set of complex poles Ω_p with
-residues B_p, fitted from W evaluated on the double-parallel sample grid —
-two horizontal lines in the complex-ω plane, with a semi-homogeneous
-powers-of-two real partition nested in the pole count. The infrastructure
-for this is already in the tree under `src/gw/mpa/`: the sample grid
-(`sampling`), the sampling object and its plans including `mpa_plan`
-(`sample_plan`), the normalised Padé-in-z² solve with its ordered guards
-(`pade_fit`), the conditioning and held-out harness (`diagnostics`), the
-complex-frequency W evaluator (`evaluator`), the walk over the (q, ν-column)
-grid (`tiling`), the driver that composes them (`fit_driver`), and the
-staged B/Ω store (`file_io.mpa_store`). None of it is wired to a compute
-mode yet, which is the gap this mode's refusal marks.
+The sample plan is the double-parallel grid: a near-real line resolves sharp
+structure, a farther line anchors the continuation, and their real parts use
+a nested powers-of-two partition.  The lower transition bound is the actual
+smallest included positive transition; the upper bound is the largest
+transition formed by the requested occupied and empty band sums.  A metallic
+or fractional-occupation plan needs a separate intraband treatment and is
+currently refused rather than assigned an artificial gap.
 
-The Σ stage then consumes those complex poles. The four-branch
-decomposition survives the move from real to complex poles under a single
-time-ordered continuation; the crossing core targets the full complex
-resolvent rather than a sine-only kernel, because the split Im-channel
-projection was an economy specific to the Hybertsen-Louie plasmon pole and
-computes the wrong analytic object here. Poles are summed before the
-spatial FFT — a design that dispatches a separate spatial kernel per pole
-is rejected outright — and the accumulation runs as a 14-pass structure.
-Pole widths select quadrature rules by octave bucket, but the exact Γ_p is
-never rounded and no pole is dropped or evaluated outside a certified
-envelope.
+There are two scalar quadrature families.
 
-The channel table already records the consequence for the outputs: `mpa`
-builds the same two Σ channels the PPM modes build — bare exchange Σ_x and
-dynamic correlation Σ_c(ω) — by a different producer. That is exactly why
-the table alone could not be the safety net, and why the mode also refuses:
-two modes can be indistinguishable in what they produce and completely
-different in how, and only the second difference is the dangerous one.
+1. **Damped line.**  For `Im z = varpi > 0`, truncate at
 
-## Where the rest is written down
+   $$t_{\max}=\frac{\log(2/\epsilon)}{\varpi}$$
 
-- `src/gw/gw_config.py` — the `ComputeMode` docstring (the naming decision
-  and the rejected alternative), `MODE_SIGMA_CHANNELS` (the
-  channel-availability table and the rule for adding a mode),
-  `UNIMPLEMENTED_MODES` and `refuse_unimplemented_compute_mode`.
-- `src/gw/mpa/__init__.py` — what each module of the staged MPA
-  infrastructure owns, and the note that its location is a parking spot
-  rather than a ruling.
-- `tests/test_ff_compute_mode.py` — the refusals, the exhaustiveness of
-  every mode-dispatch site, and the table's completeness ratchet.
-- `~/MPA_THEORY_PLAN.md` — the theory plan itself: the fit stage, the Σ
-  stage, the tabulation campaign, the error budget and the ranked risks.
+   and integrate positive real times with composite Gauss–Legendre or a
+   certified sparse positive rule.  The bandwidth is
+   `max |Re z| + Delta_max`; there is no `Delta_min` requirement.  This route
+   remains well-defined as the band gap closes, but its node count grows with
+   the time-bandwidth product.
+
+2. **Interval exponential rules.**  Where the denominator has fixed sign,
+   rotate the Laplace contour and approximate `1/x` on a bounded positive
+   interval.  The cost grows approximately as
+   `log(Delta_max/Delta_min) log(1/epsilon)`.  It is therefore economical for
+   sign-definite cells and unsuitable when the interval crosses zero.
+
+`services/minimax` owns these scalar rules and their sampled/certified error
+statements.  The many-body kernels receive only nodes and weights.  No
+wavefunction, q mesh or ISDF concept is present in the minimax service.
+
+At each node LORRAX builds the occupied and empty Green functions once, forms
+the response tile, and projects all requested `z_j` through scalar weights.
+The expensive node count is therefore the union of the two arms, not the
+number of samples times a per-sample rank.
+
+## 3. Dyson solve, W samples and pole fit
+
+For each sampled frequency,
+
+$$
+W(z)=\left[1-V\chi_0(z)\right]^{-1}V,
+\qquad W_c(z)=W(z)-V.
+$$
+
+The matrix solve remains distributed.  One native sharded
+`P(None,'x','y')` W slab is live at a time.  `file_io.mpa_store` inserts its
+singleton frequency axis and writes it collectively through SlabIO; the
+small readiness bit is committed only after collective close.  A failed
+write is therefore an explicitly incomplete sample, not a plausible zero.
+
+The elementwise multipole model is
+
+$$
+W_c(z)\approx\sum_{p=1}^{N_p}
+  \frac{2\Omega_p B_p}{z^2-\Omega_p^2},
+\qquad \Omega_p=a_p-i\Gamma_p.
+$$
+
+`gw.mpa.pade_fit` owns the normalized Loewner/Padé solve; `gw.mpa.fit_driver`
+owns the column-block walk; `file_io.mpa_store` owns all pole bytes, units,
+unfold tables, completion, fit diagnostics and identity stamps.  The fit is
+written by `(q,nu-column)` blocks because retaining all output poles in
+memory is larger than retaining the input sample block.  A consumer refuses
+an incomplete store and enforces its stored condition/backward-error limits
+before reading pole tensors.
+
+The pole fit may place every pole at any positive `a_p` and nonnegative
+`Gamma_p`; pole index is not a frequency band.  The executor groups poles by
+their actual geometry for each window, then uses batches of four only as an
+HBM schedule.  A batch boundary has no physics meaning.
+
+## 4. Sigma denominators and causal branches
+
+For a requested real-frequency grid `omega`, a pole contribution contains a
+denominator of the schematic form
+
+$$
+d(\omega)=E_A+a_p-s\,|\omega|-i\Gamma_p,
+$$
+
+where `A` is the occupied or empty Green-function space and `s` is fixed by
+the causal half.  The four branches are
+
+| frequency half | Green-function bands | usual geometry |
+|---|---|---|
+| `omega >= 0` | empty | crossing |
+| `omega >= 0` | occupied | sign-definite |
+| `omega < 0` | empty | sign-definite |
+| `omega < 0` | occupied | crossing |
+
+This table is only the usual insulating topology.  The actual signed band
+energies are authoritative.  The internal planner currently refuses a cell
+whose nominally sign-definite rectangle reaches zero; public small/inverted-
+gap support requires splitting that rectangle at the denominator boundary
+and routing the straddling part through a crossing rule.
+
+Let
+
+$$
+\xi=\max\left(\eta,
+ f_{\mathrm{edge}}\max|\omega|\,\epsilon_{\mathrm{mach}}^{1/3}\right),
+$$
+
+where `eta` is the requested regularization and `f_edge` is the window-edge
+factor.  `xi` separates the absolutely convergent finite-width core from the
+near-axis regularized core.  It is a numerical routing boundary, not a pole
+fit or broadening applied to every pole.
+
+## 5. The three Sigma quadrature methods
+
+Every selected pole keeps its exact residue.  Except for the explicit HGL
+core below, it also keeps exact `Gamma_p`.
+
+### 5.1 Sign-definite sectors
+
+If `Re d` has one sign over a cell, rotate the Laplace contour by an angle
+that keeps `Re(c d)>0` and fit
+
+$$
+\frac1d= c\int_0^\infty e^{-c d s}\,ds
+       \approx\sum_\ell w_\ell e^{-d\tau_\ell},
+\qquad \tau_\ell=c s_\ell.
+$$
+
+One positive rule is fitted over the union of all actual `(Re d,Gamma)`
+rectangles in a physical class.  The fit uses endpoint/log-radial training
+and an independent midpoint grid; the reported bound is sampled unless the
+selected minimax asset carries a continuum certificate.  The rule is valid
+only over its recorded rectangles and output-frequency half.
+
+The historical names `single`, `a_stripe` and `b_slab` describe how a
+crossing rectangle is partitioned into sign-definite leftovers.  They are
+not different kernels.  Compatible pole residues are summed into one W(t)
+tile before the spatial convolution.
+
+### 5.2 Finite-width crossing core
+
+For `Gamma_p >= xi`, use the causal real-time identity
+
+$$
+\frac1d=i\int_0^\infty e^{-idt}\,dt.
+$$
+
+The common positive composite rule covers
+`|Re d| <= F` and `Gamma_min <= Gamma <= Gamma_max`.  Its tail uses the
+weakest damping,
+
+$$t_{\max}=\log(2/\epsilon)/\Gamma_{\min},$$
+
+while each Bernstein-ellipse panel bound uses `F+Gamma_max`.  This detail is
+what permits one rule to cover poles at several widths; a rule certified on
+one horizontal line alone does not establish that claim.  The cost is set
+mainly by `F/Gamma_min`; adding more strongly damped poles is usually cheap.
+
+### 5.3 Near-axis HGL core
+
+For `Gamma_p < xi` in the crossing core, absolute real-time convergence
+would require an impractically long interval.  LORRAX instead uses the
+accepted regularized real-pole HGL sine functional on a bounded dimensionless
+bandwidth.  Its pole phase is `Re Omega_p`, and the missing negative-time arm
+is restored once after the tau sum by the global anti-Hermitian completion
+
+$$
+\Sigma_{\mathrm{HGL}}=\frac{Z-Z^\dagger}{2i}.
+$$
+
+This is the only place where fitted `Gamma_p` is intentionally discarded.
+Its accepted rank/error pair is part of the implementation contract, rather
+than a routine input dial: reducing rank 48 to 21 moved the tested QP levels
+by about 1.56 meV, while the accepted rule was below the 0.2 meV gate.
+
+## 6. Shared spatial execution
+
+For each scalar node the ansatz-specific code constructs
+
+$$
+G_A(t),\qquad
+W(t)=\sum_{p\in\mathcal W}B_p e^{-i(\Omega_p-E_{B,\mathrm{ref}})t},
+$$
+
+then calls the one public spatial seam
+
+$$
+G_k(t)\times W_q(t)
+\longrightarrow
+\operatorname{project}\!\left[
+\mathcal F\{\mathcal F^{-1}G_k\,\mathcal F^{-1}W_q\}
+\right]_{mn\mathbf k}.
+$$
+
+`gw.ppm_tau_kernel.get_sigma_spatial_kernel` owns the fused FFT convolution
+and band projection.  GN-PPM and MPA own only their G/W synthesis.  A
+different one-particle propagator, such as `dG/dQ_ph`, can therefore provide
+another G tile; a two-point vertex-corrected W can provide another W tile.
+A genuine three-point vertex has different tensor rank and belongs to a
+separate contraction, not a flag in this kernel.
+
+Only one G(t), W(t) and Sigma(t) tile exists per node.  The result is folded
+directly into the sharded real-frequency cube; no tau history is retained.
+The number of omega grid points changes fold/storage work linearly but does
+not by itself multiply the expensive tau-node count.  Widening the requested
+frequency interval changes the denominator rectangles and can increase
+noncrossing ranks logarithmically and finite-width crossing ranks roughly as
+`F/Gamma_min`, with discrete jumps when a pole moves between windows.
+
+## 7. Dynamic head, output and QSGW boundary
+
+The missing production component is the matrix-valued dynamic q→0
+head/wings evaluated on the same frequency grid and with an explicitly
+selected velocity-commutator sign.  It must be added to the body before
+interpolation or output.  Until this exists, `compute_mode = mpa` refuses.
+
+After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
+
+1. add body and q→0 head;
+2. interpolate the matrix-valued cube at the DFT or current QP energies;
+3. write `sigma_mnk.h5` through the existing sharded output path;
+4. construct the static Hermitian QSGW operator;
+5. apply the existing outside-band scissor extension.
+
+One-shot and diagonal fixed-point QP solvers can consume a finalized external
+pole store.  Fully self-consistent QSGW cannot: each iteration changes the
+orbitals and transition energies, so chi0 samples, Dyson solves, MPA poles,
+window bounds and the dynamic head must be rebuilt in-loop and handed to
+Sigma in memory.  Writing and rereading W or poles each iteration is not part
+of the intended algorithm.
+
+## 8. Current validation and public controls
+
+The research reference used eight fitted poles and four-pole HBM batches.
+The accepted 572-node schedule had 16 shared sweeps.  After staging and HGL
+carrier cleanup it took 91.731 s wall / 72.821 s Sigma on four A100 GPUs and
+agreed with its pre-optimization cube to roundoff; its maximum registered QP
+difference from the 1229-node reference was 0.025891 meV.  These measurements
+validate that particular frozen schedule, not every runtime-generated plan.
+
+Common real-frequency controls already live in the Sigma section of
+`docs/input_reference.md`: grid minimum, maximum and step; regularization;
+window-edge factor; omega layout and accumulation.  MPA-specific production
+keys are deliberately not parsed while the mode refuses—parsed-but-ignored
+keys are defects.  When the head/driver lands, the intended small public
+surface is pole count, material-class/sample-plan choice, near/far sampling
+line heights, head label, Sigma target/rank and pole batch size.  HGL
+certification constants, panel construction details, provenance hashes and
+campaign controls remain implementation data rather than deck knobs.
+
+Module ownership is summarized in `src/gw/mpa/__init__.py`; exact input
+defaults belong only in `docs/input_reference.md`, not in this theory page.

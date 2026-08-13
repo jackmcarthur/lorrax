@@ -520,7 +520,8 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # loudly until it is rewritten to pin the new behaviour.
 UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
     ComputeMode.MPA: (
-        "the MPA fit stage lands first; see THEORY_mpa_implementation.md"
+        "the dynamic q->0 head and shared output/QSGW finalizer must land; "
+        "see THEORY_mpa_implementation.md"
     ),
 }
 
