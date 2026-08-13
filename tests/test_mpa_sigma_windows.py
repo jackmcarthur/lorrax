@@ -1,0 +1,106 @@
+from types import SimpleNamespace
+
+import jax.numpy as jnp
+import numpy as np
+
+from gw.minimax_screening import MinimaxNodes
+from gw.mpa import sigma_windows as SW
+from gw.ppm_windows import _SigmaBranch
+
+
+def _branches():
+    omega = np.asarray([0.0, 0.5, 1.0])
+    idx = np.arange(omega.size)
+    cond = jnp.asarray([[0.2, 1.15, 1.5]])
+    # A slightly negative occupied/empty edge is allowed when the actual
+    # denominator remains sign-definite; occupation policy is separate.
+    val = jnp.asarray([[-0.02, 1.1, 1.45]])
+    mask = jnp.ones_like(cond, dtype=bool)
+    return [
+        _SigmaBranch("pos_cond", cond, mask, "cond", False, omega, idx),
+        _SigmaBranch("pos_val", val, mask, "val", False, omega, idx),
+        _SigmaBranch("neg_cond", cond, mask, "cond", True, omega, idx),
+        _SigmaBranch("neg_val", val, mask, "val", True, omega, idx),
+    ]
+
+
+def _poles():
+    one = np.asarray([[[0.45 - 0.10j, 0.55 - 0.30j],
+                       [1.45 - 0.10j, 1.55 - 0.30j]]])
+    return (jnp.asarray(one), jnp.asarray(one + 0.02))
+
+
+def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
+    def fake_fit(rectangles, **_kwargs):
+        assert np.all(np.asarray(rectangles)[:, 0] > 0.0)
+        return SimpleNamespace(
+            nodes=np.asarray([0.2 + 0.1j, 0.7 + 0.2j]),
+            weights=np.asarray([0.4 + 0.1j, 0.3 + 0.2j]),
+            sampled_max_error=8e-5)
+
+    def fake_damped(*_args, **_kwargs):
+        return {"t": np.asarray([0.3, 0.8]),
+                "h": np.asarray([0.4, 0.6])}
+
+    class FakeHGL:
+        max_error = 1e-7
+        provenance = "accepted HGL"
+
+        def to_minimax_nodes(self, **_kwargs):
+            return MinimaxNodes(jnp.asarray([0.2 + 0j]),
+                                jnp.asarray([0.5 + 0j]))
+
+    monkeypatch.setattr(SW.minimax, "fit_damped_reciprocal", fake_fit)
+    monkeypatch.setattr(SW, "damped_line_rule", fake_damped)
+    monkeypatch.setattr(SW, "solve_phase_minimax_bandwidth",
+                        lambda *_a, **_k: FakeHGL())
+
+    plan, report = SW.build_shared_sigma_windows(
+        _poles(), _branches(), regularization_width_ry=0.2,
+        edge_factor=1.5)
+    names = [row.window.name for row in plan]
+    assert names.count("single") == 2
+    assert names.count("b_slab") == 2
+    assert names.count("a_stripe") == 2
+    assert names.count("a_stripe_hgl") == 2
+    assert names.count("core") == 2
+    assert names.count("core_hgl") == 2
+    assert report["n_windows"] == 12
+
+    single = next(row for row in plan if row.window.name == "single")
+    assert single.pole_indices.tolist() == [0, 1, 0, 1]
+    assert single.phase_real.tolist() == [True, True, False, False]
+    exact = [row for row in plan if row.window.name == "core"]
+    assert all(not np.any(row.phase_real) for row in exact)
+    hgl = [row for row in plan if row.window.name == "core_hgl"]
+    assert all(np.all(row.phase_real) for row in hgl)
+
+    # The narrow and finite-width stripe have different A masks, but share
+    # one fitted node dictionary within each causal branch.
+    for prefactor in (-1.0, 1.0):
+        pair = [row for row in plan
+                if row.window.name.startswith("a_stripe")
+                and row.window.prefactor == prefactor]
+        assert len(pair) == 2
+        np.testing.assert_array_equal(pair[0].window.nodes.t,
+                                      pair[1].window.nodes.t)
+
+
+def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
+    monkeypatch.setattr(
+        SW.minimax, "fit_damped_reciprocal",
+        lambda *_a, **_k: SimpleNamespace(
+            nodes=np.asarray([0.2 + 0.1j]),
+            weights=np.asarray([0.4 + 0.1j]),
+            sampled_max_error=1e-4))
+    branches = _branches()
+    # On pos_val, E_A=-0.02 and a=0.01 make E_A+a negative.  The method must
+    # not hide that by flooring the lower bound to a small positive number.
+    bad = (jnp.asarray([[[0.01 - 0.1j]]]),)
+    try:
+        SW.build_shared_sigma_windows(
+            bad, branches, regularization_width_ry=0.2, edge_factor=1.5)
+    except ValueError as exc:
+        assert "crosses zero" in str(exc)
+    else:
+        raise AssertionError("a non-sign-definite rectangle was accepted")
