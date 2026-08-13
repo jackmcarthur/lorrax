@@ -263,6 +263,23 @@ the unchanged complex-time kernel. This is not analytic continuation and it
 does not create accuracy between the fitted $z_j$ values. It is a direct
 quadrature optimized for a finite request set.
 
+![Actual MoS2 transition window, MPA sample points, and frozen sine nodes](figures/mpa_chi_geometry.png)
+
+*The left panel uses the actual logical valence and conduction energies of the
+MoS2 calculation; its diagonal lines are the resonant ridges
+$E_g+A+B=\operatorname{Re}z$ for two requested points. The middle panel shows
+all 15 fitted $z$ values and the exact transition interval. The right panel
+shows every time in the frozen rank-154 positive dictionary and its executed
+$\tau=\pm it$ expansion. Only marker area encodes the fitted weight.*
+
+![Bernstein ellipses and line damping for the actual near-line composite](figures/mpa_chi_bernstein.png)
+
+*For comparison with the fitted dictionary, this is the analytic positive
+composite at the same $10^{-4}$ scalar tier. Dots are its actual
+Gauss--Legendre nodes. Each colored ellipse is the Bernstein contour used to
+select that panel's order; the lower panel shows why the near line fixes the
+tail while the far line is already exponentially negligible.*
+
 ### 3.5 General contour representation and batching
 
 All of the complex exponential arms use
@@ -605,6 +622,15 @@ Thus every narrow pole still belongs to exactly one of the two physical
 classes: one Laplace window if noncrossing, or HGL core plus sign-definite
 sides if crossing.
 
+![Rotated Sigma window plane and complex denominator plane](figures/mpa_sigma_windows.png)
+
+*The window thresholds, frequency lines, $\xi$, color field, and contraction
+counts are numerical values from the converged 609-node plan. Representative
+band and plasmon centers are used only to populate the geometry. Rotation to
+$S=E_A+a_p$ makes the two displayed real frequencies vertical cuts; the
+right panel maps those same pairs to $u=\omega-S$ and their illustrative pole
+widths. The dashed horizontal line is the actual HGL/wide boundary.*
+
 ## 9. Optional width-pane planner
 
 The `pane` planner implements the same crossing/noncrossing physics with a
@@ -687,6 +713,15 @@ the A mask, six scalar bounds selecting $(a_p,\Gamma_p)$, references, signs,
 projector, nodes, and achieved error for each window. It does not store a
 dense pole mask. Such plans are baked offline and read as small inputs before
 the pole walk; they are not frequency-dependent calculation intermediates.
+
+![Actual complex-time nodes in the 609-node Sigma plan](figures/mpa_sigma_nodes.png)
+
+*These are the frozen time coordinates, not representative points.
+Noncrossing nodes follow rotated contours, exact crossing and HGL nodes lie on
+real time, and sign-definite crossing-side nodes lie on negative imaginary
+time. The right panel separates dictionary size from executed spatial
+contractions: branch and four-pole batching multiplicities explain the
+difference.*
 
 ## 11. The $\Sigma$ time sweep and its I/O
 
