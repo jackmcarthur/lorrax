@@ -144,6 +144,11 @@ from minimax.refusals import (
     UnknownTarget,
 )
 from minimax.sector import reciprocal_sector_rule
+from minimax.finite_z_contour import (
+    ContourArm,
+    FiniteZContourRule,
+    build_finite_z_contour,
+)
 from minimax.targets import (
     CHARACTERS,
     FAMILIES,
