@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "distrib_la"
 version = "0.1.0"
-description = "Distributed dense linear algebra over a JAX device mesh: eigh, cholesky, LU solve, factor/solve — one door over ScaLAPACK, SLATE, cuSOLVERMp and the in-tree JAX paths"
+description = "Distributed dense linear algebra over a JAX device mesh: polar/SVD, eigh, cholesky, LU solve, factor/solve"
 requires-python = ">=3.12"
 
 # THE QUARANTINE, DECLARED.  ScaLAPACK / SLATE / cuSOLVERMp appear nowhere
