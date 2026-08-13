@@ -49,10 +49,13 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.ppm_accumulators import (
+    _DeviceTauAccumulator,
     _TauAccumulator,
     _complete_one_sided_tau,
     _project_tau_onto_omega_np,
 )
+from gw.minimax_screening import MinimaxNodes
+from gw.ppm_windows import _SigmaWindow
 
 
 RNG = np.random.default_rng(20260809)
@@ -400,6 +403,26 @@ def _reference(S_R_g, S_I_g, n_tau=3):
     Z = n_tau * (_coeff().reshape(-1, 1, 1, 1)
                  * (S_R_g + 1j * S_I_g)[None, ...])
     return (Z - _adj(Z)) / 2j
+
+
+def test_device_fold_matches_the_host_frequency_algebra():
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    shape = (OMEGA.size, 2, 2, 3)
+    sigma = jax.device_put(
+        np.arange(12, dtype=np.float64).reshape(2, 2, 3) * (1.0 + 0.2j),
+        NamedSharding(mesh, P(None, "x", "y")))
+    nodes = MinimaxNodes(np.asarray([T_NODE]), np.asarray([ALPHA_EFF]))
+    window = _SigmaWindow(
+        "full", nodes, np.ones((1, 1), bool), 0.2, 0.3, 1, "full", PREF)
+    acc = _DeviceTauAccumulator(OMEGA, shape=shape, sharding=sharding)
+    acc.begin_window(window)
+    acc.add_tau(sigma, None, T_NODE, ALPHA_EFF, 0.5)
+    acc.end_window()
+    got = np.asarray(acc.finalize())
+    want = _project_tau_onto_omega_np(
+        np.asarray(sigma), None, OMEGA, T_NODE, ALPHA_EFF, 1, PREF, 0, 0.5)
+    np.testing.assert_allclose(got, want, rtol=1.0e-14, atol=1.0e-14)
 
 
 @pytest_sharded

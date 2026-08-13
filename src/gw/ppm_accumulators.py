@@ -27,6 +27,11 @@ import numpy as np
 from .ppm_windows import _SigmaWindow
 
 
+def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref):
+    """Scalar frequency coefficient shared by host and device folds."""
+    return (prefactor * alpha) * xp.exp(-1j * (e_ref - sign * omega) * t)
+
+
 def _project_tau_onto_omega_np(
     sigma_re: np.ndarray, sigma_im: np.ndarray | None, omega_vec: np.ndarray,
     t_node: complex, alpha: complex, omega_sign: float, pref: float,
@@ -91,8 +96,6 @@ def _project_tau_onto_omega_np(
     # sector contour the reference term dominates and their product decays,
     # while evaluating exp(-i*E_ref*t) and exp(+i*omega*t) separately can
     # underflow/overflow before multiplication on a perfectly safe stripe.
-    omega_kernel = np.exp(
-        -1j * (float(e_ref_sum) - omega_sign * omega_vec) * t_node)
     # ``pref`` is folded into the (n_ω,)-sized coeff instead of multiplying
     # the full (n_ω, nk, i, j) contrib afterwards — removes one full-size
     # array pass + temporary per τ.  Value-identical, NOT bitwise (the
@@ -102,7 +105,8 @@ def _project_tau_onto_omega_np(
     # likewise dropped: both branches already produce complex128
     # (``np.asarray`` with a matching dtype is a no-copy view) — that one
     # is bit-exact.
-    coeff = (pref * alpha) * omega_kernel
+    coeff = _omega_coefficient(
+        np, omega_vec, t_node, alpha, omega_sign, pref, float(e_ref_sum))
     if sigma_im is None:
         # Laplace plan: sigma_re IS the complex X = S_R + i·S_I.
         if project_code != 0:
@@ -506,6 +510,114 @@ class _TauAccumulator(_SigmaAccumulator):
         :meth:`_MemoryTileSink.host_tiles`."""
         self._drain_all()
         return self._sink.host_tiles()
+
+
+@lru_cache(maxsize=8)
+def _device_output_zeros(shape, sharding):
+    return jax.jit(lambda: jnp.zeros(shape, dtype=jnp.complex128),
+                   out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _device_omega_add_merged(sharding):
+    return jax.jit(
+        lambda acc, sigma, coeff: (
+            acc + coeff.reshape((-1, 1, 1, 1)) * sigma[None, ...]),
+        donate_argnums=(0,), out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _device_omega_add_split(sharding):
+    return jax.jit(
+        lambda acc, sigma_re, sigma_im, coeff: (
+            acc + coeff.reshape((-1, 1, 1, 1))
+            * (sigma_re + 1j * sigma_im)[None, ...]),
+        donate_argnums=(0,), out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _device_output_add(sharding):
+    return jax.jit(lambda total, window: total + window,
+                   donate_argnums=(0,), out_shardings=sharding)
+
+
+class _DeviceTauAccumulator(_SigmaAccumulator):
+    """Fold sigma(tau) into a sharded omega cube without retaining tau."""
+
+    def __init__(self, omega_vec, *, shape, sharding):
+        self._shape = tuple(int(x) for x in shape)
+        self._sharding = sharding
+        self._replicated = NamedSharding(sharding.mesh, P())
+        self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
+        self._total = _device_output_zeros(self._shape, sharding)()
+        self._window = None
+        self._project_code = None
+        self._coeff = None
+        self._e_ref_sum = None
+        self._tau_index = 0
+
+    def begin_window(self, window: _SigmaWindow) -> None:
+        if self._project_code is not None:
+            raise RuntimeError("previous frequency window is still open")
+        self._project_code = int(window.project_code)
+        t = np.asarray(jax.device_get(window.nodes.t), np.complex128)
+        alpha = np.asarray(jax.device_get(window.nodes.alpha), np.complex128)
+        self._e_ref_sum = float(window.E_ref_A + window.E_ref_B)
+        self._coeff = np.asarray(_omega_coefficient(
+            np, self._omega[None, :], t[:, None], alpha[:, None],
+            float(window.omega_sign), float(window.prefactor),
+            self._e_ref_sum), np.complex128)
+        self._tau_index = 0
+        self._window = (_device_output_zeros(self._shape, self._sharding)()
+                        if self._project_code == 1 else None)
+
+    def add_tau(self, sigma_re, sigma_im, t_c, alpha_c,
+                e_ref_sum=0.0) -> None:
+        del t_c, alpha_c
+        if self._project_code is None:
+            raise RuntimeError("no open frequency window")
+        if float(e_ref_sum) != self._e_ref_sum:
+            raise ValueError("frequency window reference changed during fold")
+        coeff = jax.device_put(self._coeff[self._tau_index], self._replicated)
+        self._tau_index += 1
+        if self._project_code == 0:
+            if sigma_im is not None:
+                raise ValueError("split sigma(tau) reached a full projection")
+            self._total = _device_omega_add_merged(self._sharding)(
+                self._total, sigma_re, coeff)
+        else:
+            if sigma_im is None:
+                raise ValueError("merged sigma(tau) reached an imag projection")
+            self._window = _device_omega_add_split(self._sharding)(
+                self._window, sigma_re, sigma_im, coeff)
+
+    def end_window(self) -> None:
+        if self._project_code is None:
+            raise RuntimeError("no open frequency window")
+        if self._tau_index != int(self._coeff.shape[0]):
+            raise RuntimeError("frequency window ended before all tau nodes")
+        if self._project_code == 1:
+            self._window = _antiherm_band_fn(self._sharding)(self._window)
+            self._total = _device_output_add(self._sharding)(
+                self._total, self._window)
+        self._window = None
+        self._project_code = None
+        self._coeff = None
+        self._e_ref_sum = None
+        self._tau_index = 0
+
+    def finalize(self):
+        if self._project_code is not None:
+            raise RuntimeError("cannot finalize an open frequency window")
+        return self._total
+
+    def finalize_host_tiles(self):
+        shards = list(self.finalize().addressable_shards)
+        for shard in shards:
+            shard.data.copy_to_host_async()
+        return ([np.asarray(shard.data) for shard in shards],
+                [tuple(shard.index) for shard in shards],
+                [shard.device for shard in shards])
 
 
 class _WindowSink:

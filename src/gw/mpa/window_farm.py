@@ -207,11 +207,16 @@ def full_plan_digest(groups):
 
     h = hashlib.sha256()
     for i, g in enumerate(groups):
-        idx = np.ascontiguousarray(g.idx_B)
+        selector = getattr(g, "selector_bounds_B", None)
+        membership = np.ascontiguousarray(
+            selector if selector is not None else g.idx_B)
+        suffix = (f"bounds|{membership.dtype.str}|{membership.size}"
+                  if selector is not None else
+                  f"{membership.dtype.str}|{membership.size}")
         h.update(f"G{i}|{g.name}|{int(g.n_modes)}|{float(g.b_mass)!r}|"
                  f"{tuple(int(x) for x in g.field_shape)}|{g.provenance}|"
-                 f"{idx.dtype.str}|{idx.size}\n".encode())
-        h.update(memoryview(idx).cast("B"))
+                 f"{suffix}\n".encode())
+        h.update(memoryview(membership).cast("B"))
         op = np.asarray(g.omega_operand)
         h.update(f"|operand:{op.dtype.str}{op.shape}\n".encode())
         for j, w in enumerate(g.windows):

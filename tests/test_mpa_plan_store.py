@@ -16,12 +16,16 @@ slab) and several MPA-routed groups whose operand is the complex pole field.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from gw.mpa import plan_store as PS
 from gw.mpa import sigma_pass as SP
 from gw.mpa import window_farm as WF
+from gw.minimax_screening import MinimaxNodes
+from gw.ppm_windows import _SigmaWindow
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +166,154 @@ def test_a_loaded_plan_is_bit_identical_to_the_computed_one(planned, tmp_path):
             assert wg.crossing_kind == ww.crossing_kind
             assert wg.max_error == ww.max_error
             assert wg.provenance == ww.provenance
+
+
+def test_compact_selector_round_trip_and_crossing_coalescence(
+        planned, tmp_path):
+    a, g, _live, _E_A, _omega_abs, groups, stats = planned
+    window = groups[-1].windows[0]
+    bounds = ([1.0e-14, np.inf, 0.02, -np.inf, np.inf, 0.1],
+              [1.0e-14, np.inf, 0.02, 0.1, np.inf, np.inf])
+    compact = [
+        replace(groups[-1], name=f"sector:core:g{i}", windows=[window],
+                idx_B=None, selector_bounds_B=np.asarray(selector))
+        for i, selector in enumerate(bounds)
+    ]
+    omega_complex = a - 1j * g
+    path = tmp_path / "plan_p0.pos_cond.h5"
+    PS.write_branch_plan(
+        path, compact, address="production", pole=0, bkey="pos_cond",
+        source_sha="", fit_store="", n_p=8, stats=stats, a_ry=a,
+        omega_complex=omega_complex, print_fn=lambda *x, **k: None)
+    loaded = PS.read_branch_plan(
+        path, lo=0, hi=2, a_ry=a, omega_complex=omega_complex)
+    kept, exact, hgl = SP._extract_shared_crossing(
+        loaded, a, omega_complex)
+    assert not kept and not hgl and len(exact) == 1
+    assert np.array_equal(
+        SP._sector_selector_host(a - 1j * g, exact[0][1]),
+        np.logical_or.reduce([group.dense_mask_B(a - 1j * g)
+                              for group in loaded]))
+
+    bad = (
+        [loaded[0], replace(loaded[1], windows=[replace(
+            loaded[1].windows[0],
+            prefactor=-loaded[1].windows[0].prefactor)])],
+        [replace(loaded[0], omega_operand=np.asarray(a)), loaded[1]],
+    )
+    for changed in bad:
+        with pytest.raises(ValueError, match="non-gauge physics"):
+            SP._extract_shared_crossing(changed, a, omega_complex)
+
+
+def test_compact_selector_interval_seams_are_analytic():
+    below = np.asarray([0.0, 4.0, -np.inf, -np.inf, 0.5, np.inf])
+    above = np.asarray([1.0, 5.0, 0.5, -np.inf, np.inf, np.inf])
+    assert not SP._selector_bounds_overlap(below, above)
+    below[4], below[5] = np.inf, 0.5
+    assert SP._selector_bounds_overlap(below, above)
+
+
+def test_four_pole_side_partitions_local_indices_and_lifetime():
+    expected = (
+        ("neg_cond", "single", ((range(4), 9), (range(4, 8), 6)), -1, 1.0),
+        ("pos_val", "single", ((range(4), 9), (range(4, 8), 6)), -1, -1.0),
+        ("neg_val", "a_stripe", (((0, 1), 6),), 1, -1.0),
+        ("pos_cond", "a_stripe", (((0, 1), 7),), 1, 1.0),
+        ("neg_val", "b_slab", ((range(4), 8), (range(4, 8), 6)), 1, -1.0),
+        ("pos_cond", "b_slab", ((range(4), 9), (range(4, 8), 6)), 1, 1.0),
+    )
+    collected = {}
+    for class_index, (bkey, name, batches, sign, prefactor) in enumerate(
+            expected):
+        for batch_index, (poles, rank) in enumerate(batches):
+            t = -1j * np.linspace(0.1 + batch_index, 1.0 + batch_index, rank)
+            alpha = np.linspace(0.2, 1.1, rank).astype(np.complex128)
+            for pole in poles:
+                window = _SigmaWindow(
+                    name=name, nodes=MinimaxNodes(t=t, alpha=alpha),
+                    mask_A=np.full((2, 2), class_index % 2 == 0,
+                                   dtype=bool),
+                    E_ref_A=0.25 + class_index,
+                    E_ref_B=0.03 * (pole + 1), omega_sign=sign,
+                    project="full", prefactor=prefactor)
+                bounds = np.asarray([
+                    1.0e-14, np.inf, -np.inf, -np.inf, 0.05, np.inf])
+                collected.setdefault(bkey, []).append((pole, window, bounds))
+    classes = SP._shared_side_classes(collected, 8)
+    assert len(classes) == 10
+    assert sum(window.n_tau for _b, _n, window, _p, _s in classes) == 72
+    first = SP._side_batch_sweeps(classes, (0, 1, 2, 3))
+    second = SP._side_batch_sweeps(classes, (4, 5, 6, 7))
+    assert len(first) == 6 and len(second) == 4
+    assert all(tuple(local) == tuple(range(len(global_)))
+               for _b, _n, _w, global_, local, _bounds in first + second)
+
+    repeated = dict(collected)
+    repeated["neg_cond"] = list(repeated["neg_cond"])
+    pole, window, bounds = repeated["neg_cond"][0]
+    repeated["neg_cond"].append((pole, replace(
+        window, nodes=MinimaxNodes(
+            t=np.asarray(window.nodes.t) + 1.0e-12j,
+            alpha=window.nodes.alpha)), bounds))
+    with pytest.raises(ValueError, match="does not partition"):
+        SP._shared_side_classes(repeated, 8)
+
+    slabs = {pole: (np.full((2,), pole), np.full((2,), -pole))
+             for pole in range(8)}
+    SP._stack_shared_pole_batch(slabs, (0, 1), consume=False)
+    assert set(slabs) == set(range(8))
+    B_stack, Omega_stack = SP._stack_shared_pole_batch(
+        slabs, (0, 1, 2, 3), consume=True)
+    assert B_stack.shape == Omega_stack.shape == (4, 2)
+    assert set(slabs) == {4, 5, 6, 7}
+
+
+def test_four_pole_noncross_extraction_and_topology():
+    expected = (
+        ("neg_cond", "single", range(8)),
+        ("pos_val", "single", range(8)),
+        ("neg_val", "a_stripe", (0, 1)),
+        ("pos_cond", "a_stripe", (0, 1)),
+        ("neg_val", "b_slab", range(8)),
+        ("pos_cond", "b_slab", range(8)),
+    )
+    omega = np.asarray([1.0 - 0.1j])
+    collected = {}
+    for class_index, (bkey, name, poles) in enumerate(expected):
+        nodes = MinimaxNodes(
+            t=np.asarray([0.1 - 0.2j, 0.3 - 0.4j]),
+            alpha=np.asarray([0.5 + 0.1j, 0.2 + 0.3j]))
+        for pole in poles:
+            window = _SigmaWindow(
+                name=name, nodes=nodes,
+                mask_A=np.full((2, 2), class_index % 2 == 0),
+                E_ref_A=float(class_index), E_ref_B=float(pole),
+                omega_sign=(-1 if name == "single" else 1),
+                project="full", prefactor=1.0,
+                provenance="NON-PRODUCTION shared noncross frontier; test")
+            group = SP.WindowGroup(
+                name=f"sector:{name}", windows=[window], idx_B=None,
+                field_shape=omega.shape, omega_operand=omega, n_modes=1,
+                b_mass=1.0, provenance="test",
+                selector_bounds_B=np.asarray([
+                    0.0, np.inf, 0.0, -np.inf, np.inf, np.inf]))
+            kept, extracted = SP._extract_shared_noncross([group], omega)
+            assert not kept and len(extracted) == 1
+            collected.setdefault(bkey, []).append(
+                (pole, extracted[0][0], extracted[0][1]))
+    classes = SP._shared_noncross_classes(collected, 8)
+    assert len(classes) == 6
+    assert len(SP._side_batch_sweeps(classes, (0, 1, 2, 3))) == 6
+    assert len(SP._side_batch_sweeps(classes, (4, 5, 6, 7))) == 4
+
+    bkey, name, pieces = "neg_cond", "single", collected["neg_cond"]
+    pole, window, bounds = pieces[-1]
+    bad = dict(collected)
+    bad[bkey] = pieces[:-1] + [(pole, replace(
+        window, prefactor=-window.prefactor), bounds)]
+    with pytest.raises(ValueError, match="differ across poles"):
+        SP._shared_noncross_classes(bad, 8)
 
 
 def test_a_leg_can_load_only_the_groups_it_owns(planned, tmp_path):

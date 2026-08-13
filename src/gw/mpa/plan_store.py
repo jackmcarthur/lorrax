@@ -92,7 +92,9 @@ __all__ = [
     "write_branch_plan",
 ]
 
-PLAN_FORMAT = "lorrax-mpa-branch-plan/1"
+PLAN_FORMAT = "lorrax-mpa-branch-plan/2"
+_V1_FORMAT = "lorrax-mpa-branch-plan/1"
+_READABLE_PLAN_FORMATS = {_V1_FORMAT, PLAN_FORMAT}
 
 #: Every field of ``ppm_windows._SigmaWindow``, as this module knows it.
 #: Checked against the dataclass at write time -- see :func:`_window_fields`.
@@ -105,7 +107,7 @@ _WINDOW_FIELDS = (
 #: Every field of ``sigma_pass.WindowGroup``.  Same check, same reason.
 _GROUP_FIELDS = (
     "name", "windows", "idx_B", "field_shape", "omega_operand", "n_modes",
-    "b_mass", "provenance",
+    "b_mass", "provenance", "selector_bounds_B",
 )
 
 #: How a group's ``omega_operand`` is rebuilt from the leg's own pole slab.
@@ -170,7 +172,7 @@ def slab_digest(**arrays):
     weaker guarantee.
     """
     h = hashlib.blake2b(digest_size=32)
-    h.update(f"{PLAN_FORMAT}/slab\n".encode())
+    h.update(f"{_V1_FORMAT}/slab\n".encode())
     for key in sorted(arrays):
         _feed(h, f"array.{key}", np.asarray(arrays[key]))
     return h.hexdigest()
@@ -202,7 +204,10 @@ def branch_address(*, source_sha, fit_store, n_p, pole, bkey, slab,
     planning time it replaces rather than assumed to be small.
     """
     h = hashlib.blake2b(digest_size=16)
-    h.update(f"{PLAN_FORMAT}\n".encode())
+    address_format = (PLAN_FORMAT
+                      if str(scalars.get("windowing", "pane")) == "sector"
+                      else _V1_FORMAT)
+    h.update(f"{address_format}\n".encode())
     _feed(h, "slab", str(slab))
     _feed(h, "source_sha", str(source_sha))
     _feed(h, "fit_store", str(fit_store))
@@ -397,7 +402,22 @@ def write_branch_plan(path, groups, *, address, pole, bkey, source_sha,
             node.attrs["operand"] = _operand_tag(
                 g, a_ry=a_ry, omega_complex=omega_complex)
             node.attrs["n_windows"] = int(len(g.windows))
-            node.create_dataset("idx_B", data=np.asarray(g.idx_B))
+            if g.selector_bounds_B is None:
+                if g.idx_B is None:
+                    raise ValueError(
+                        f"plan_store: group {g.name!r} has no membership")
+                node.attrs["selection"] = "index"
+                node.create_dataset("idx_B", data=np.asarray(g.idx_B))
+            else:
+                from .sigma_pass import _validate_sector_selector_bounds
+                if g.idx_B is not None:
+                    raise ValueError(
+                        f"plan_store: group {g.name!r} has two memberships")
+                node.attrs["selection"] = "sector-bounds-v1"
+                node.create_dataset(
+                    "selector_bounds_B",
+                    data=_validate_sector_selector_bounds(
+                        g.selector_bounds_B))
             wg = node.create_group("windows")
             for j, w in enumerate(g.windows):
                 wn = wg.create_group(str(j))
@@ -450,10 +470,10 @@ def read_plan_header(path):
     import h5py
 
     with h5py.File(str(path), "r") as f:
-        if str(f.attrs.get("format")) != PLAN_FORMAT:
+        if str(f.attrs.get("format")) not in _READABLE_PLAN_FORMATS:
             raise ValueError(
                 f"read_plan_header: {path} declares format "
-                f"{f.attrs.get('format')!r}, not {PLAN_FORMAT!r}.")
+                f"{f.attrs.get('format')!r}, not a readable branch plan.")
         n_groups = int(f.attrs["n_groups"])
         gg = f["groups"]
         rows = [(str(gg[str(i)].attrs["name"]),
@@ -509,10 +529,10 @@ def read_branch_plan(path, *, lo, hi, a_ry, omega_complex):
 
     groups = []
     with h5py.File(str(path), "r") as f:
-        if str(f.attrs.get("format")) != PLAN_FORMAT:
+        if str(f.attrs.get("format")) not in _READABLE_PLAN_FORMATS:
             raise ValueError(
                 f"read_branch_plan: {path} declares format "
-                f"{f.attrs.get('format')!r}, not {PLAN_FORMAT!r}.")
+                f"{f.attrs.get('format')!r}, not a readable branch plan.")
         gg = f["groups"]
         for i in range(int(lo), int(hi)):
             node = gg[str(i)]
@@ -554,16 +574,29 @@ def read_branch_plan(path, *, lo, hi, a_ry, omega_complex):
                     provenance=(str(wn.attrs["provenance"])
                                 if bool(wn.attrs["has_provenance"]) else None),
                 ))
+            selection = str(node.attrs.get("selection", "index"))
+            if selection == "index":
+                idx_B = np.asarray(node["idx_B"][()])
+                selector_bounds_B = None
+            elif selection == "sector-bounds-v1":
+                from .sigma_pass import _validate_sector_selector_bounds
+                idx_B = None
+                selector_bounds_B = _validate_sector_selector_bounds(
+                    node["selector_bounds_B"][()])
+            else:
+                raise ValueError(
+                    f"read_branch_plan: unknown membership {selection!r}")
             groups.append(WindowGroup(
                 name=str(node.attrs["name"]),
                 windows=wins,
-                idx_B=np.asarray(node["idx_B"][()]),
+                idx_B=idx_B,
                 field_shape=tuple(int(x) for x in
                                   np.asarray(node.attrs["field_shape"])),
                 omega_operand=operand,
                 n_modes=int(node.attrs["n_modes"]),
                 b_mass=float(node.attrs["b_mass"]),
                 provenance=str(node.attrs["provenance"]),
+                selector_bounds_B=selector_bounds_B,
             ))
     return groups
 

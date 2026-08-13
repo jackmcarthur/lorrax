@@ -164,7 +164,7 @@ own an opinion about the symmetry.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -238,14 +238,15 @@ class WindowGroup:
 
     name: str
     windows: list
-    idx_B: np.ndarray
+    idx_B: np.ndarray | None
     field_shape: tuple
     omega_operand: np.ndarray
     n_modes: int
     b_mass: float
     provenance: str
+    selector_bounds_B: np.ndarray | None = None
 
-    def dense_mask_B(self):
+    def dense_mask_B(self, omega_complex=None):
         """The identical boolean this group used to carry, rebuilt on call.
 
         Kept because two consumers still want a dense selector and both
@@ -255,6 +256,13 @@ class WindowGroup:
         It is a method and not an attribute so that materializing 81.4 MB
         is something a caller does on purpose.
         """
+        if self.selector_bounds_B is not None:
+            if omega_complex is None:
+                omega_complex = self.omega_operand
+            return _sector_selector_host(omega_complex,
+                                         self.selector_bounds_B)
+        if self.idx_B is None:
+            raise ValueError(f"window group {self.name!r} has no selector")
         return _dense_from_index(self.idx_B, self.field_shape)
 
 
@@ -895,6 +903,64 @@ def _dense_from_index(idx, shape):
     m = np.zeros(int(np.prod(shape)) if shape else 0, dtype=bool)
     m[np.asarray(idx, dtype=np.int64)] = True
     return m.reshape(shape)
+
+
+_SECTOR_SELECTOR_SIZE = 6
+
+
+def _validate_sector_selector_bounds(bounds):
+    """Validate ``(a_gt,a_le,g_ge,g_gt,g_lt,g_le)`` scalar membership."""
+    out = np.asarray(bounds, dtype=np.float64)
+    if out.shape != (_SECTOR_SELECTOR_SIZE,) or np.isnan(out).any():
+        raise ValueError(
+            "MPA compact selector must be six binary64 bounds without NaN")
+    if not out[0] < out[1] or not max(out[2], out[3], 0.0) < min(
+            out[4], out[5]):
+        raise ValueError("MPA compact selector describes an empty domain")
+    return out
+
+
+def _sector_selector_from_ag(a, gamma, bounds):
+    b = bounds
+    return ((a > b[0]) & (a <= b[1])
+            & (gamma >= b[2]) & (gamma > b[3])
+            & (gamma < b[4]) & (gamma <= b[5]))
+
+
+def _sector_selector_host(omega_complex, bounds):
+    omega = np.asarray(omega_complex)
+    if omega.dtype.kind != "c":
+        raise ValueError("MPA compact selector requires complex Omega")
+    gamma = -np.imag(omega)
+    live = np.real(omega) > 1.0e-14
+    if np.any(gamma[live] < 0.0):
+        raise ValueError("MPA pole field contains upper-half-plane poles")
+    return _sector_selector_from_ag(
+        np.real(omega), gamma, _validate_sector_selector_bounds(bounds))
+
+
+_SECTOR_SELECTOR_FNS = {}
+
+
+def _sector_selector_device(omega_complex, bounds, mesh_xy):
+    """Evaluate one scalar pole selector at the pole field's sharding."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    pole_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    scalar_sharding = NamedSharding(mesh_xy, P())
+    key = (pole_sharding, scalar_sharding)
+    fn = _SECTOR_SELECTOR_FNS.get(key)
+    if fn is None:
+        fn = jax.jit(
+            lambda omega, b: _sector_selector_from_ag(
+                jnp.real(omega), -jnp.imag(omega), b),
+            in_shardings=(pole_sharding, scalar_sharding),
+            out_shardings=pole_sharding)
+        _SECTOR_SELECTOR_FNS[key] = fn
+    return fn(omega_complex, jax.device_put(
+        _validate_sector_selector_bounds(bounds), scalar_sharding))
 
 
 # ---------------------------------------------------------------------------
@@ -1833,6 +1899,7 @@ def run_pass_branch(
     log_tag,
     print_fn,
     operand_cache=None,
+    selector_omega=None,
 ):
     """Integrate one pass's window groups on one branch; return host tiles.
 
@@ -1859,7 +1926,7 @@ def run_pass_branch(
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from common import timing
-    from ..ppm_accumulators import _MemoryTileSink, _TauAccumulator
+    from ..ppm_accumulators import _DeviceTauAccumulator
     from ..ppm_sigma import _SigmaBranchTiles, _integrate_tau_windows_for_branch
 
     n_omega = int(np.asarray(omega_nonneg_ry).shape[0])
@@ -1869,11 +1936,10 @@ def run_pass_branch(
     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, nk_proj, nb_proj = psi
     m_pad = int(psi_proj_xr.shape[1])
     n_pad = int(psi_proj_yn.shape[3])
-    sink = _MemoryTileSink(
-        shape=(n_omega, nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')))
-    accumulator = _TauAccumulator(
-        omega_vec=jnp.asarray(omega_nonneg_ry, dtype=jnp.float64), sink=sink)
+    output_sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+    accumulator = _DeviceTauAccumulator(
+        omega_vec=jnp.asarray(omega_nonneg_ry, dtype=jnp.float64),
+        shape=(n_omega, nk_proj, m_pad, n_pad), sharding=output_sharding)
 
     tau_kernel, tau_kernel_x = tau_kernels
     operands = (_BranchOperandCache(mesh_xy) if operand_cache is None
@@ -1885,7 +1951,12 @@ def run_pass_branch(
         # from the index -- and dropped when the loop returns.
         with timing.section("mpa.group_operands"):
             omega_q_dev = operands.device(grp.omega_operand)
-            mask_b_dev = group_selector_device(grp.idx_B, grp.field_shape)
+            mask_b_dev = (
+                _sector_selector_device(
+                    operands.device(selector_omega),
+                    grp.selector_bounds_B, mesh_xy)
+                if grp.selector_bounds_B is not None else
+                group_selector_device(grp.idx_B, grp.field_shape))
         _integrate_tau_windows_for_branch(
             windows=grp.windows, accumulator=accumulator, E_A=E_A,
             B_q=B_p, Omega_q=omega_q_dev,
@@ -1901,8 +1972,428 @@ def run_pass_branch(
     return _SigmaBranchTiles(
         tiles=tiles, tile_index=tile_index, devices=tile_devices,
         spatial_padded=(nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        sharding=output_sharding,
         nb_real=nb_proj)
+
+
+def _extract_shared_crossing(groups, a_real, omega_complex):
+    """Remove coalescible exact/HGL cores from one loaded branch plan."""
+    exact, hgl, kept = [], [], []
+    for group in groups:
+        if (group.selector_bounds_B is not None
+                and str(group.name).startswith("sector:core:")
+                and len(group.windows) == 1
+                and group.windows[0].project == "full"):
+            exact.append(group)
+            continue
+        core = [window for window in group.windows
+                if window.crossing_kind == "hgl"]
+        if core:
+            if len(core) != 1 or group.selector_bounds_B is None:
+                raise ValueError("shared HGL requires one compact core window")
+            window = core[0]
+            bounds = _validate_sector_selector_bounds(
+                group.selector_bounds_B).copy()
+            if (window.project != "imag" or window.mask_B_mode != "le_t"
+                    or window.mask_B_threshold is None
+                    or not np.isfinite(float(window.mask_B_threshold))
+                    or group.omega_operand is not a_real):
+                raise ValueError(
+                    "shared HGL core does not carry its real-pole a<=T "
+                    "physics")
+            bounds[1] = min(bounds[1], float(window.mask_B_threshold))
+            hgl.append((window, bounds))
+            side = [item for item in group.windows if item is not window]
+            if side:
+                kept.append(replace(group, windows=side))
+            continue
+        kept.append(group)
+
+    if exact:
+        if len(exact) != 2:
+            raise ValueError("shared exact crossing requires two Gamma bands")
+        first = exact[0].windows[0]
+        bounds = [_validate_sector_selector_bounds(g.selector_bounds_B)
+                  for g in exact]
+        candidate = bounds[0].copy()
+        if (not np.array_equal(bounds[1][:3], candidate[:3])
+                or not np.isneginf(bounds[0][3])
+                or not np.isposinf(bounds[0][4])
+                or not np.isposinf(bounds[1][4])
+                or not np.isposinf(bounds[1][5])
+                or bounds[0][5] != bounds[1][3]):
+            raise ValueError("exact crossing Gamma bands are not contiguous")
+        candidate[3] = -np.inf
+        candidate[4] = np.inf
+        candidate[5] = max(float(b[5]) for b in bounds)
+        for group in exact:
+            window = group.windows[0]
+            same = (
+                np.array_equal(window.nodes.t, first.nodes.t)
+                and np.array_equal(window.nodes.alpha, first.nodes.alpha)
+                and np.array_equal(window.mask_A, first.mask_A)
+                and float(window.E_ref_A) == float(first.E_ref_A)
+                and int(window.omega_sign) == int(first.omega_sign)
+                and window.project == first.project == "full"
+                and float(window.prefactor) == float(first.prefactor)
+                and window.mask_B_mode == first.mask_B_mode == "all"
+                and window.mask_B_threshold is None
+                and first.mask_B_threshold is None
+                and window.crossing_kind == first.crossing_kind is None
+                and group.omega_operand is omega_complex)
+            if not same:
+                raise ValueError(
+                    "exact crossing bands differ in non-gauge physics")
+        exact = [(first, candidate)]
+
+    if exact and hgl:
+        if len(hgl) != 1:
+            raise ValueError("shared crossing requires one HGL core")
+        exact_bounds = exact[0][1]
+        hgl_bounds = hgl[0][1]
+        xi = float(exact_bounds[2])
+        if (not np.isfinite(xi) or xi <= 0.0
+                or not np.isneginf(exact_bounds[3])
+                or not np.isposinf(exact_bounds[4])
+                or not np.isposinf(exact_bounds[5])
+                or not np.isneginf(hgl_bounds[2])
+                or not np.isneginf(hgl_bounds[3])
+                or float(hgl_bounds[4]) != xi
+                or not np.isposinf(hgl_bounds[5])):
+            raise ValueError(
+                "exact and HGL crossing selectors do not meet at xi")
+    return kept, exact, hgl
+
+
+def _common_shared_window(pieces, kind):
+    """Validate p0/p1 common-rule physics and return its pole selectors."""
+    if len(pieces) != 2 or [piece[0] for piece in pieces] != [0, 1]:
+        raise ValueError(f"shared {kind} requires poles 0 and 1")
+    first = pieces[0][1]
+    for _pole, window, _bounds in pieces[1:]:
+        same = (
+            np.array_equal(window.nodes.t, first.nodes.t)
+            and np.array_equal(window.nodes.alpha, first.nodes.alpha)
+            and np.array_equal(window.mask_A, first.mask_A)
+            and float(window.E_ref_A) == float(first.E_ref_A)
+            and int(window.omega_sign) == int(first.omega_sign)
+            and str(window.project) == str(first.project)
+            and float(window.prefactor) == float(first.prefactor))
+        if not same:
+            raise ValueError(f"shared {kind} windows differ across poles")
+    return replace(first, E_ref_B=0.0), np.stack(
+        [piece[2] for piece in pieces])
+
+
+def _selector_bounds_overlap(left, right):
+    """Whether two validated compact selector rectangles intersect."""
+    left = _validate_sector_selector_bounds(left)
+    right = _validate_sector_selector_bounds(right)
+    if max(left[0], right[0]) >= min(left[1], right[1]):
+        return False
+    gamma_lo = max(0.0, left[2], left[3], right[2], right[3])
+    gamma_hi = min(left[4], left[5], right[4], right[5])
+    if gamma_lo != gamma_hi:
+        return gamma_lo < gamma_hi
+    return all(
+        gamma_lo >= bounds[2] and gamma_lo > bounds[3]
+        and gamma_lo < bounds[4] and gamma_lo <= bounds[5]
+        for bounds in (left, right))
+
+
+def _extract_shared_sides(groups, a_real, omega_complex):
+    """Remove real-pole compatibility windows and refine their selectors."""
+    del omega_complex
+    kept, sides, side_bounds = [], [], []
+    for group in groups:
+        candidates = [
+            window for window in group.windows
+            if window.project == "full" and window.crossing_kind is None
+        ]
+        if not candidates or group.selector_bounds_B is None:
+            kept.append(group)
+            continue
+        if group.omega_operand is not a_real:
+            if np.asarray(group.omega_operand).dtype.kind != "f":
+                kept.append(group)
+                continue
+            raise ValueError(
+                "shared compatibility side does not carry its real pole")
+        base = _validate_sector_selector_bounds(
+            group.selector_bounds_B).copy()
+        remaining = [
+            window for window in group.windows
+            if not (window.project == "full"
+                    and window.crossing_kind is None)
+        ]
+        group_bounds = []
+        for window in candidates:
+            bounds = base.copy()
+            if window.mask_B_mode == "le_t":
+                if (window.mask_B_threshold is None
+                        or not np.isfinite(float(window.mask_B_threshold))):
+                    raise ValueError(
+                        "shared compatibility stripe needs a finite threshold")
+                bounds[1] = min(bounds[1],
+                                float(window.mask_B_threshold))
+            elif window.mask_B_mode == "gt_t":
+                if (window.mask_B_threshold is None
+                        or not np.isfinite(float(window.mask_B_threshold))):
+                    raise ValueError(
+                        "shared compatibility slab needs a finite threshold")
+                bounds[0] = max(bounds[0],
+                                float(window.mask_B_threshold))
+            elif (window.mask_B_mode != "all"
+                  or window.mask_B_threshold is not None):
+                raise ValueError(
+                    "shared compatibility side has an unsupported selector")
+            bounds = _validate_sector_selector_bounds(bounds)
+            if any(_selector_bounds_overlap(bounds, previous)
+                   for previous in side_bounds):
+                raise ValueError("compatibility side selectors overlap")
+            side_bounds.append(bounds)
+            group_bounds.append(bounds)
+            sides.append((window, bounds))
+        ordered = sorted(group_bounds, key=lambda item: float(item[0]))
+        covers = (
+            len(ordered) == 1
+            or (float(ordered[0][0]) == float(base[0])
+                and float(ordered[-1][1]) == float(base[1])
+                and all(float(left[1]) == float(right[0])
+                        for left, right in zip(ordered, ordered[1:]))))
+        if not covers:
+            raise ValueError(
+                "compatibility side selectors do not cover their group")
+        if remaining:
+            kept.append(replace(group, windows=remaining))
+    return kept, sides
+
+
+def _extract_shared_noncross(groups, omega_complex):
+    """Remove the six ordinary finite-width classes eligible for pole sharing."""
+    names = {"sector:single", "sector:a_stripe", "sector:b_slab"}
+    kept, shared = [], []
+    for group in groups:
+        if (str(group.name) not in names or len(group.windows) != 1
+                or not str(group.windows[0].provenance or "").startswith(
+                    "NON-PRODUCTION shared noncross frontier;")):
+            kept.append(group)
+            continue
+        if (group.selector_bounds_B is None
+                or group.omega_operand is not omega_complex):
+            raise ValueError(
+                f"shared noncross group {group.name!r} does not carry its "
+                "compact finite-width pole physics")
+        window = group.windows[0]
+        piece = str(group.name).partition(":")[2]
+        if (str(window.name) != piece or window.project != "full"
+                or window.crossing_kind is not None
+                or window.mask_B_mode != "all"
+                or window.mask_B_threshold is not None):
+            raise ValueError(
+                f"shared noncross group {group.name!r} has incompatible "
+                "window physics")
+        shared.append((window, _validate_sector_selector_bounds(
+            group.selector_bounds_B).copy()))
+    return kept, shared
+
+
+def _array_bytes_equal(left, right):
+    """Direct byte equality for one quadrature vector; no plan identity."""
+    left, right = np.asarray(left), np.asarray(right)
+    return (left.shape == right.shape and left.dtype == right.dtype
+            and left.tobytes(order="C") == right.tobytes(order="C"))
+
+
+def _same_side_rule(left, right):
+    return (
+        _array_bytes_equal(left.nodes.t, right.nodes.t)
+        and _array_bytes_equal(left.nodes.alpha, right.nodes.alpha)
+        and np.array_equal(left.mask_A, right.mask_A)
+        and float(left.E_ref_A) == float(right.E_ref_A)
+        and int(left.omega_sign) == int(right.omega_sign)
+        and str(left.project) == str(right.project)
+        and float(left.prefactor) == float(right.prefactor)
+    )
+
+
+def _shared_side_classes(collected, n_p):
+    """Infer direct-rule batches and validate the six side partitions."""
+    if int(n_p) != 8:
+        raise ValueError("shared compatibility schedule requires eight poles")
+    classes = []
+    for bkey in ("pos_cond", "pos_val", "neg_cond", "neg_val"):
+        for pole, window, bounds in collected.get(bkey, []):
+            if window.project != "full" or window.crossing_kind is not None:
+                raise ValueError("compatibility side has non-Laplace physics")
+            match = next((item for item in classes
+                          if item[0] == bkey
+                          and item[1] == window.name
+                          and _same_side_rule(item[2][0][1], window)), None)
+            if match is None:
+                match = (bkey, str(window.name), [])
+                classes.append(match)
+            if any(old_pole == pole
+                   for old_pole, _window, _bounds in match[2]):
+                raise ValueError(
+                    f"compatibility side repeats pole {pole} on "
+                    f"{bkey}.{window.name}")
+            match[2].append((int(pole), window, bounds))
+
+    all_poles = tuple(range(8))
+    expected = (
+        ("neg_cond", "single", all_poles),
+        ("pos_val", "single", all_poles),
+        ("neg_val", "a_stripe", (0, 1)),
+        ("pos_cond", "a_stripe", (0, 1)),
+        ("neg_val", "b_slab", all_poles),
+        ("pos_cond", "b_slab", all_poles),
+    )
+    found = {}
+    for bkey, name, pieces in classes:
+        pieces.sort(key=lambda item: item[0])
+        found.setdefault((bkey, name), []).append(pieces)
+    if set(found) != {(bkey, name) for bkey, name, _poles in expected}:
+        raise ValueError(
+            "loaded sector plans do not contain the six frozen "
+            f"compatibility-side classes; found {sorted(found)}")
+
+    out = []
+    for bkey, name, expected_poles in expected:
+        batches = found[(bkey, name)]
+        actual = [piece[0] for batch in batches for piece in batch]
+        if (len(actual) != len(set(actual))
+                or tuple(sorted(actual)) != expected_poles):
+            raise ValueError(
+                f"compatibility side {bkey}.{name} does not partition "
+                f"poles {list(expected_poles)}; found {sorted(actual)}")
+        batches.sort(key=lambda batch: batch[0][0])
+        for batch in batches:
+            out.append((
+                bkey, name, replace(batch[0][1], E_ref_B=0.0),
+                np.asarray([piece[0] for piece in batch], dtype=np.int32),
+                np.stack([piece[2] for piece in batch])))
+    return out
+
+
+def _shared_noncross_classes(collected, n_p):
+    """Infer the six finite-width pole classes from their direct rules."""
+    if int(n_p) != 8:
+        raise ValueError("shared noncross schedule requires eight poles")
+    expected = (
+        ("neg_cond", "single", tuple(range(8))),
+        ("pos_val", "single", tuple(range(8))),
+        ("neg_val", "a_stripe", (0, 1)),
+        ("pos_cond", "a_stripe", (0, 1)),
+        ("neg_val", "b_slab", tuple(range(8))),
+        ("pos_cond", "b_slab", tuple(range(8))),
+    )
+    out = []
+    for bkey, name, poles in expected:
+        pieces = sorted(
+            (piece for piece in collected.get(bkey, [])
+             if str(piece[1].name) == name), key=lambda item: item[0])
+        if tuple(piece[0] for piece in pieces) != poles:
+            raise ValueError(
+                f"shared noncross {bkey}.{name} requires poles "
+                f"{list(poles)}")
+        first = pieces[0][1]
+        if any(not _same_side_rule(first, piece[1]) for piece in pieces[1:]):
+            raise ValueError(
+                f"shared noncross {bkey}.{name} rules differ across poles")
+        out.append((
+            bkey, name, replace(first, E_ref_B=0.0),
+            np.asarray(poles, dtype=np.int32),
+            np.stack([piece[2] for piece in pieces])))
+    if sum(len(pieces) for pieces in collected.values()) != sum(
+            len(row[2]) for row in expected):
+        raise ValueError("loaded plans contain unexpected shared noncross work")
+    return out
+
+
+def _side_batch_sweeps(classes, batch_poles):
+    """Map global side-class poles onto one staged pole batch."""
+    batch_poles = tuple(map(int, batch_poles))
+    if len(batch_poles) != len(set(batch_poles)):
+        raise ValueError("staged side batch repeats a pole")
+    local = {pole: index for index, pole in enumerate(batch_poles)}
+    sweeps = []
+    for bkey, name, window, poles, bounds in classes:
+        take = [index for index, pole in enumerate(map(int, poles))
+                if pole in local]
+        if not take:
+            continue
+        global_poles = np.asarray(
+            [int(poles[index]) for index in take], dtype=np.int32)
+        local_poles = np.asarray(
+            [local[int(pole)] for pole in global_poles], dtype=np.int32)
+        sweeps.append((bkey, name, window, global_poles, local_poles,
+                       np.asarray(bounds)[take]))
+    return sweeps
+
+
+def _stack_shared_pole_batch(shared_poles, poles, *, consume):
+    """Stack one host pole batch, optionally releasing its slab owners."""
+    poles = tuple(map(int, poles))
+    try:
+        values = [shared_poles[pole] for pole in poles]
+    except KeyError as exc:
+        raise ValueError(f"shared pole {int(exc.args[0])} is missing") from exc
+    B_stack = np.stack([value[0] for value in values])
+    Omega_stack = np.stack([value[1] for value in values])
+    if consume:
+        for pole in poles:
+            del shared_poles[pole]
+    return B_stack, Omega_stack
+
+
+def run_shared_crossing_branch(
+    *, window, pole_indices, selector_bounds, omega_nonneg_ry, E_A, B_poles,
+    Omega_poles, psi, tau_kernel, mesh_xy, log_tag, print_fn,
+):
+    """Integrate one common crossing rule after summing its poles in W(tau)."""
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common import timing
+    from common.progress import LoopProgress
+    from ..ppm_accumulators import _DeviceTauAccumulator
+    from ..ppm_sigma import _SigmaBranchTiles, minimax_tau_integrate_sigma
+
+    n_omega = int(np.asarray(omega_nonneg_ry).size)
+    if n_omega == 0:
+        return None
+    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, nk_proj, nb_proj = psi
+    shape = (n_omega, nk_proj, int(psi_proj_xr.shape[1]),
+             int(psi_proj_yn.shape[3]))
+    sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    accumulator = _DeviceTauAccumulator(
+        jnp.asarray(omega_nonneg_ry, dtype=jnp.float64),
+        shape=shape, sharding=sharding)
+    mask_A = jnp.asarray(window.mask_A)
+
+    def build_sigma_tau(t_node):
+        out = tau_kernel(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, B_poles, Omega_poles,
+            jnp.asarray(pole_indices, dtype=jnp.int32),
+            jnp.asarray(selector_bounds, dtype=jnp.float64),
+            jnp.asarray(window.E_ref_A), jnp.asarray(0.0), t_node)
+        return (out, None) if window.project_code == 0 else out
+
+    progress = LoopProgress(window.n_tau, print_fn, title=f"sigma[{log_tag}]",
+                            item_name="shared tau node", max_updates=10)
+    accumulator.begin_window(window)
+    minimax_tau_integrate_sigma(
+        window.nodes, build_sigma_tau=build_sigma_tau,
+        add_tau=accumulator.add_tau, E_ref_sum=window.E_ref_A,
+        progress=progress)
+    accumulator.end_window()
+    progress.finish()
+    with timing.section("sigma.finalize"):
+        tiles, indices, devices = accumulator.finalize_host_tiles()
+    return _SigmaBranchTiles(
+        tiles, indices, devices, shape[1:], sharding, nb_proj)
 
 
 #: Format version of a per-pass partial Σ_c file.  Stamped by
@@ -2547,6 +3038,20 @@ def compute_mpa_sigma_c_omega_grid(
     tile_meta = None
     records = []
 
+    def _fold_branch(branch, branch_tiles):
+        nonlocal tile_acc, tile_meta
+        if branch_tiles is None:
+            return
+        if tile_acc is None:
+            tile_meta = branch_tiles
+            tile_acc = [np.zeros((n_omega,) + tile.shape[1:],
+                                 dtype=np.complex128)
+                        for tile in branch_tiles.tiles]
+        with timing.section("mpa.branch_fold"):
+            for device, tile in enumerate(branch_tiles.tiles):
+                tile_acc[device][np.asarray(
+                    branch.omega_idx, dtype=np.int64)] += tile
+
     # THE PINNED ORDER.  Ascending pole index: the store's leading axis,
     # the fitter's own sort, and the better-conditioned accumulation
     # direction.  The re-association this loop performs is exact in exact
@@ -2557,6 +3062,9 @@ def compute_mpa_sigma_c_omega_grid(
     # subsequence of the pinned order, so a split run and a whole run
     # associate the same way within each process.
     walk = resolve_pass_poles(n_p, pole_subset, group_subset)
+    share_crossing = False
+    shared_exact, shared_hgl, shared_sides, shared_noncross = {}, {}, {}, {}
+    shared_poles, shared_branches = {}, {}
     census_rows, census_digests = [], {}
     # THE PER-LEG FIXED TERM, ACCOUNTED RATHER THAN INFERRED.  §9.5 of the
     # 16-GPU plan had to back it out of a census leg's total (106-115 s
@@ -2567,7 +3075,30 @@ def compute_mpa_sigma_c_omega_grid(
     fixed = {"read_s": 0.0, "plan_s": 0.0, "load_s": 0.0, "addr_s": 0.0,
              "verify_s": 0.0, "poles": 0, "branches": 0, "loaded": 0}
     plan_dir = str(plan_store or "") or None
-    if ((census_out is not None or plan_dir is not None)
+    plain_sector_plans = bool(
+        plan_dir is not None and windowing == "sector"
+        and census_out is None
+        and os.path.isfile(os.path.join(
+            plan_dir, "plan_p0.pos_cond.h5")))
+    if plain_sector_plans:
+        required = [os.path.join(
+            plan_dir, f"plan_p{pole}.{branch}.h5")
+            for pole in range(n_p) for branch in WF.BRANCH_KEYS]
+        missing = [path for path in required if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                "plain production sector plan is incomplete; missing: "
+                + ", ".join(missing))
+        if (group_subset is not None
+                or tuple(walk) != tuple(resolve_pole_subset(n_p, None))):
+            raise ValueError(
+                "plain production sector plans share crossing work across "
+                "poles 0 and 1 and require one complete in-process walk")
+        share_crossing = True
+    if plain_sector_plans and plan_verify:
+        raise ValueError("production sector plans do not support re-planning")
+    if ((census_out is not None
+         or (plan_dir is not None and not plain_sector_plans))
             and (not str(census_sha) or str(census_sha) == "unknown")):
         raise ValueError(
             "compute_mpa_sigma_c_omega_grid: a census or plan store "
@@ -2599,7 +3130,10 @@ def compute_mpa_sigma_c_omega_grid(
                 fit_src, p, unfold=unfold_q, mesh_xy=mesh_xy,
                 allow_partial=allow_partial)
         a_host = np.asarray(np.real(Omega_p), dtype=np.float64)
-        g_host = np.abs(np.asarray(np.imag(Omega_p), dtype=np.float64))
+        g_host = -np.asarray(np.imag(Omega_p), dtype=np.float64)
+        if np.any(g_host[a_host > 1.0e-14] < 0.0):
+            raise ValueError(
+                f"MPA pole {p} contains live upper-half-plane frequencies")
         b_abs = np.abs(np.asarray(B_p))
         fixed["read_s"] += time.perf_counter() - t_read
         fixed["poles"] += 1
@@ -2639,7 +3173,7 @@ def compute_mpa_sigma_c_omega_grid(
         # the four branches genuinely read the same Re Omega, Gamma, live
         # mask and |B|, and only E_A, its mask and the ω half-grid differ.
         slab_dig = None
-        if plan_dir is not None:
+        if plan_dir is not None and not plain_sector_plans:
             t_slab = time.perf_counter()
             slab_dig = PS.slab_digest(
                 a_ry=a_host, gamma_ry=g_host, live_mask=live, b_abs=b_abs)
@@ -2697,7 +3231,11 @@ def compute_mpa_sigma_c_omega_grid(
                         log_tag=f"p{p} {br.tag}", print_fn=print_fn)
 
             plan_addr, plan_file = None, None
-            if plan_dir is not None:
+            if plain_sector_plans:
+                plan_addr = "production"
+                plan_file = os.path.join(
+                    plan_dir, f"plan_p{int(p)}.{bkey}.h5")
+            elif plan_dir is not None:
                 t_addr = time.perf_counter()
                 plan_addr = PS.branch_address(
                     source_sha=census_sha, fit_store=fit_src, n_p=n_p,
@@ -2745,21 +3283,36 @@ def compute_mpa_sigma_c_omega_grid(
                 # the artifact stores each group's index set as its own
                 # dataset rather than one array per branch.
                 if not os.path.exists(plan_file):
-                    PS.refuse_missing_plan(plan_dir, pole=p, bkey=bkey,
-                                           address=plan_addr)
+                    if plain_sector_plans:
+                        raise FileNotFoundError(
+                            f"missing production frequency plan {plan_file}")
+                    PS.refuse_missing_plan(
+                        plan_dir, pole=p, bkey=bkey, address=plan_addr)
                 t_load = time.perf_counter()
                 header = PS.read_plan_header(plan_file)
-                rng = WF.group_range(group_subset, pole=p, bkey=bkey,
-                                     n_groups=header["n_groups"])
-                if rng is None:                  # pragma: no cover - guarded
-                    continue                     # above by the branch skip
-                lo_i, hi_i, total_i = rng
-                WF.check_partition(
-                    n_groups=header["n_groups"],
-                    digest_got=WF.group_plan_digest_from_rows(header["rows"]),
-                    pole=p, bkey=bkey, total=total_i, lo=lo_i, hi=hi_i,
-                    digest=(group_digests or {}).get(f"{int(p)}.{bkey}"),
-                    source="the stored plan")
+                if plain_sector_plans:
+                    if (header["pole"] != int(p)
+                            or header["branch"] != bkey
+                            or header["n_p"] != n_p):
+                        raise ValueError(
+                            f"production plan {plan_file} describes a "
+                            "different pole, branch, or pole count")
+                    lo_i, hi_i = 0, int(header["n_groups"])
+                    total_i = hi_i
+                else:
+                    rng = WF.group_range(
+                        group_subset, pole=p, bkey=bkey,
+                        n_groups=header["n_groups"])
+                    if rng is None:              # pragma: no cover - guarded
+                        continue
+                    lo_i, hi_i, total_i = rng
+                    WF.check_partition(
+                        n_groups=header["n_groups"],
+                        digest_got=WF.group_plan_digest_from_rows(
+                            header["rows"]),
+                        pole=p, bkey=bkey, total=total_i, lo=lo_i, hi=hi_i,
+                        digest=(group_digests or {}).get(
+                            f"{int(p)}.{bkey}"), source="the stored plan")
                 groups = PS.read_branch_plan(
                     plan_file, lo=lo_i, hi=hi_i, a_ry=a_host,
                     omega_complex=omega_complex_host)
@@ -2770,9 +3323,10 @@ def compute_mpa_sigma_c_omega_grid(
                 fixed["loaded"] += 1
                 print_fn(
                     f"  MPA plan p{p} {br.tag} ({bkey}): LOADED groups "
-                    f"[{lo_i}, {hi_i}) of {total_i} in {dt_load:.2f} s "
-                    f"(address {plan_addr[:12]}, digest "
-                    f"{header['group_plan_digest']})")
+                    f"[{lo_i}, {hi_i}) of {total_i} in {dt_load:.2f} s"
+                    + (" (plain production plan)" if plain_sector_plans else
+                       f" (address {plan_addr[:12]}, digest "
+                       f"{header['group_plan_digest']})"))
                 if plan_verify:
                     # THE GATE, RUN WHERE THE REAL INPUTS ARE.  Plan the
                     # branch the old way and fingerprint both to the last
@@ -2858,6 +3412,38 @@ def compute_mpa_sigma_c_omega_grid(
                 group_lo = loaded_lo
             if not groups:
                 continue
+            if share_crossing:
+                exact, hgl = [], []
+                if int(p) in (0, 1) and bkey in ("pos_cond", "neg_val"):
+                    groups, exact, hgl = _extract_shared_crossing(
+                        groups, a_host, omega_complex_host)
+                    if exact:
+                        shared_exact.setdefault(bkey, []).append(
+                            (int(p), exact[0][0], exact[0][1]))
+                    if hgl:
+                        if len(hgl) != 1:
+                            raise ValueError(
+                                "one HGL core is required per branch")
+                        shared_hgl.setdefault(bkey, []).append(
+                            (int(p), hgl[0][0], hgl[0][1]))
+                groups, noncross = _extract_shared_noncross(
+                    groups, omega_complex_host)
+                if noncross:
+                    shared_noncross.setdefault(bkey, []).extend(
+                        (int(p), window, bounds)
+                        for window, bounds in noncross)
+                groups, sides = _extract_shared_sides(
+                    groups, a_host, omega_complex_host)
+                if sides:
+                    shared_sides.setdefault(bkey, []).extend(
+                        (int(p), window, bounds)
+                        for window, bounds in sides)
+                if exact or hgl or sides or noncross:
+                    shared_poles.setdefault(int(p), (
+                        np.asarray(B_p, dtype=np.complex128),
+                        np.asarray(omega_complex_host,
+                                   dtype=np.complex128)))
+                    shared_branches.setdefault(bkey, br)
             rec.n_tau_nodes += int(sum(int(w.n_tau) for g in groups
                                        for w in g.windows))
             rec.groups += [g.name for g in groups]
@@ -2866,17 +3452,11 @@ def compute_mpa_sigma_c_omega_grid(
                 groups=groups, omega_nonneg_ry=br.omega_abs, E_A=br.E_A,
                 B_p=B_dev, psi=psi, tau_kernels=tau_kernels,
                 mesh_xy=mesh_xy, log_tag=f"p{p} {br.tag}",
-                print_fn=print_fn, operand_cache=pole_operands)
+                print_fn=print_fn, operand_cache=pole_operands,
+                selector_omega=omega_complex_host)
             if branch_tiles is None:
                 continue
-            if tile_acc is None:
-                tile_meta = branch_tiles
-                tile_acc = [np.zeros((n_omega,) + t.shape[1:],
-                                     dtype=np.complex128)
-                            for t in branch_tiles.tiles]
-            with timing.section("mpa.branch_fold"):
-                for d, t in enumerate(branch_tiles.tiles):
-                    tile_acc[d][np.asarray(br.omega_idx, dtype=np.int64)] += t
+            _fold_branch(br, branch_tiles)
         records.append(rec)
         # finalize_host_tiles has drained every tau/D2H use of this pole.
         # Drop its device and host owners before the next slab is read so the
@@ -2884,6 +3464,101 @@ def compute_mpa_sigma_c_omega_grid(
         del (B_dev, a_device, pole_operands, groups, branch_tiles, branches,
              br, Omega_p, B_p, a_host, g_host, b_abs, live,
              omega_complex_host)
+
+    if share_crossing:
+        from ..ppm_tau_kernel import _get_sigma_shared_tau_kernel
+
+        expected = {"pos_cond", "neg_val"}
+        if (set(shared_exact) != expected or set(shared_hgl) != expected
+                or set(shared_poles) != set(range(n_p))):
+            raise ValueError(
+                "loaded sector plans do not contain complete shared "
+                "exact/HGL/side work for the full pole stack")
+        side_classes = _shared_side_classes(shared_sides, n_p)
+        noncross_classes = (_shared_noncross_classes(shared_noncross, n_p)
+                            if shared_noncross else [])
+        stacked_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        crossing_poles = (0, 1)
+        B_host, Omega_host = _stack_shared_pole_batch(
+            shared_poles, crossing_poles, consume=False)
+        B_crossing = device_put_process_local(B_host, stacked_sharding)
+        Omega_crossing = device_put_process_local(Omega_host,
+                                                  stacked_sharding)
+        del B_host, Omega_host
+        for kind, collected, merged_x, real_pole in (
+                ("exact", shared_exact, True, False),
+                ("HGL", shared_hgl, False, True)):
+            kernel = _get_sigma_shared_tau_kernel(
+                mesh_xy=mesh_xy, kgrid=kgrid,
+                merged_x=merged_x, real_pole=real_pole)
+            for bkey in ("pos_cond", "neg_val"):
+                window, bounds = _common_shared_window(
+                    collected[bkey], kind)
+                branch = shared_branches[bkey]
+                _fold_branch(branch, run_shared_crossing_branch(
+                    window=window, pole_indices=np.asarray((0, 1)),
+                    selector_bounds=bounds,
+                    omega_nonneg_ry=branch.omega_abs, E_A=branch.E_A,
+                    B_poles=B_crossing, Omega_poles=Omega_crossing, psi=psi,
+                    tau_kernel=kernel, mesh_xy=mesh_xy,
+                    log_tag=f"shared {kind} p0+p1 {branch.tag}",
+                    print_fn=print_fn))
+                records[0].n_tau_nodes += int(window.n_tau)
+                records[0].groups.append(f"shared-{kind.lower()}:{bkey}")
+        del B_crossing, Omega_crossing
+
+        side_kernel = _get_sigma_shared_tau_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, real_pole=True)
+        noncross_kernel = _get_sigma_shared_tau_kernel(
+            mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, real_pole=False)
+        for batch_poles in ((0, 1, 2, 3), (4, 5, 6, 7)):
+            B_host, Omega_host = _stack_shared_pole_batch(
+                shared_poles, batch_poles, consume=False)
+            B_batch = device_put_process_local(B_host, stacked_sharding)
+            Omega_batch = device_put_process_local(
+                Omega_host, stacked_sharding)
+            del B_host, Omega_host
+            for (bkey, name, window, global_poles, local_poles,
+                 bounds) in _side_batch_sweeps(side_classes, batch_poles):
+                branch = shared_branches[bkey]
+                _fold_branch(branch, run_shared_crossing_branch(
+                    window=window, pole_indices=local_poles,
+                    selector_bounds=bounds,
+                    omega_nonneg_ry=branch.omega_abs, E_A=branch.E_A,
+                    B_poles=B_batch, Omega_poles=Omega_batch, psi=psi,
+                    tau_kernel=side_kernel, mesh_xy=mesh_xy,
+                    log_tag=(f"shared side {bkey}.{name} "
+                             f"rank{window.n_tau} "
+                             f"poles{list(map(int, global_poles))}"),
+                    print_fn=print_fn))
+                records[0].n_tau_nodes += int(window.n_tau)
+                records[0].groups.append(
+                    f"shared-side:{bkey}.{name}:rank{int(window.n_tau)}")
+            for (bkey, name, window, global_poles, local_poles,
+                 bounds) in _side_batch_sweeps(noncross_classes,
+                                               batch_poles):
+                branch = shared_branches[bkey]
+                _fold_branch(branch, run_shared_crossing_branch(
+                    window=window, pole_indices=local_poles,
+                    selector_bounds=bounds,
+                    omega_nonneg_ry=branch.omega_abs, E_A=branch.E_A,
+                    B_poles=B_batch, Omega_poles=Omega_batch, psi=psi,
+                    tau_kernel=noncross_kernel, mesh_xy=mesh_xy,
+                    log_tag=(f"shared noncross {bkey}.{name} "
+                             f"rank{window.n_tau} "
+                             f"poles{list(map(int, global_poles))}"),
+                    print_fn=print_fn))
+                records[0].n_tau_nodes += int(window.n_tau)
+                records[0].groups.append(
+                    f"shared-noncross:{bkey}.{name}:"
+                    f"rank{int(window.n_tau)}")
+            del B_batch, Omega_batch
+            for pole in batch_poles:
+                del shared_poles[int(pole)]
+        if shared_poles:
+            raise ValueError(
+                f"unconsumed shared pole slabs: {sorted(shared_poles)}")
+        del shared_poles
 
     # THE LINE §10 IS WRITTEN FROM.  One greppable row per leg, so the
     # fixed term is a measurement in the log rather than a subtraction

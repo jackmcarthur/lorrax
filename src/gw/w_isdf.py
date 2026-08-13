@@ -51,7 +51,8 @@ _w_solve_cache: dict = {}
 # ============================================================================
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
-                            n_out: int = 1):
+                            n_out: int = 1, *,
+                            complex_contour: bool = False):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
     ``n_out`` (static): number of χ outputs accumulated over the SAME τ
@@ -60,6 +61,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     ``nodes.alpha`` of shape ``(n_out, L)`` and returns an ``n_out``-tuple
     of χ's — the per-τ G-build/FFT/contraction tensors are computed once
     and each output is its own weighted accumulation.
+
+    ``complex_contour`` is a separate, cache-keyed frequency convention.
+    False retains the locked static path, including its explicit real-τ cast.
+    True carries the contour time without changing the spatial contraction:
+    the raw valence builder receives ``-τ`` and the raw conduction builder
+    receives ``conj(τ)``.  With the returned conjugates below this gives the
+    same ``exp(-τ (E_c-E_v-E_gap))`` transition factor for complex τ.
     """
     from common.fft_helpers import make_flat_k_fftn
 
@@ -71,7 +79,9 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # cache key or a mid-process flag flip serves the stale backend
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
-    cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out)
+    complex_contour = bool(complex_contour)
+    cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
+                 complex_contour)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -131,14 +141,17 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             NamedSharding(mesh_xy, _rep0)),
              out_shardings=(_G_k_shard, _G_k_shard))
     def _build_Gv_Gc(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                    enk_v, enk_c, tau_scalar, vmax, cmin):
+                     enk_v, enk_c, tau_scalar, vmax, cmin):
         # phases_v = exp(-τ (vmax - e_v)) = exp(-(-τ)(e_v - vmax))  → t=-τ, e_ref=vmax
-        # phases_c = exp(-τ (e_c - cmin))                            → t=+τ, e_ref=cmin
+        # The returned conjugate changes a raw builder time t into conj(t).
+        # Thus complex contour nodes require raw t_c=conj(τ), whereas the
+        # locked real path continues to receive t_c=τ exactly as before.
+        t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_v_xn, psi_v_yr, enk_v, -tau_scalar, e_ref=vmax),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
-            build_G_tau(psi_c_xn, psi_c_yr, enk_c,  tau_scalar, e_ref=cmin),
+            build_G_tau(psi_c_xn, psi_c_yr, enk_c, t_c, e_ref=cmin),
             _G_k_shard)
         # Hermitian-swap conj (see FFT-convention block comment above) —
         # belongs at the call site, NOT inside build_G_tau.
@@ -184,10 +197,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
             def _body(accs, xs):
                 t_scalar, alpha_col = xs        # alpha_col: (n_out,)
-                tau_real = jnp.real(t_scalar).astype(jnp.float64)
+                if complex_contour:
+                    tau_kernel = t_scalar
+                else:
+                    tau_kernel = jnp.real(t_scalar).astype(jnp.float64)
                 Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
                                           psi_c_yr, psi_c_xn,
-                                          enk_v, enk_c, tau_real, vmax, cmin)
+                                          enk_v, enk_c, tau_kernel, vmax, cmin)
                 Gv_R = _Gv_fftn(Gv_k)
                 Gc_R = _Gc_fftn(Gc_k)
                 chi_tau = jax.lax.with_sharding_constraint(
@@ -240,15 +256,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
         def _body(chi_R_acc, xs):
             t_scalar, alpha_scalar = xs
-            # ``t`` arrives complex (pytree dtype); chi0's Laplace quad
-            # places it with Im=0.  Cast to float64 so _build_Gv_Gc's
-            # float64 tau signature — and build_G_tau's downstream exp —
-            # stay on the exact numerical path that produced the locked
-            # MoS2 3×3 regression hash.
-            tau_real = jnp.real(t_scalar).astype(jnp.float64)
+            if complex_contour:
+                tau_kernel = t_scalar
+            else:
+                # ``t`` arrives complex (pytree dtype); chi0's Laplace quad
+                # places it with Im=0.  Cast to float64 so _build_Gv_Gc's
+                # float64 tau signature — and build_G_tau's downstream exp —
+                # stay on the exact numerical path that produced the locked
+                # MoS2 3×3 regression hash.
+                tau_kernel = jnp.real(t_scalar).astype(jnp.float64)
             Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
                                       psi_c_yr, psi_c_xn,
-                                      enk_v, enk_c, tau_real, vmax, cmin)
+                                      enk_v, enk_c, tau_kernel, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
             # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
@@ -840,6 +859,134 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
     kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out)
+    kernel.lower(*args).compile()
+
+
+def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
+                             E_gap):
+    """Fold the two complex-frequency resolvents into executable χ rows.
+
+    Each node belongs to one of
+
+    ``frequency_sign = +1``
+        ``-1 / (Delta - z)``;
+    ``frequency_sign = -1``
+        ``-1 / (Delta + z)``.
+
+    ``tau = c*t`` and ``weight_rows = c*h`` describe the positive contour
+    rule for ``1/d``.  Since the device kernel evolves only
+    ``Delta-E_gap``, its complete coefficient is
+
+    ``-c*h*exp(-tau*E_gap + frequency_sign*tau*z)``.
+
+    Rows may contain zeros where an output does not consume a node; this is
+    the frequency-only union that lets several requested ``z`` values share
+    one τ sweep.  ``E_gap`` is folded here exactly once and nowhere in the
+    complex device path.
+    """
+    tau = np.asarray(tau, dtype=np.complex128)
+    weight_rows = np.asarray(weight_rows, dtype=np.complex128)
+    frequency_sign = np.asarray(frequency_sign)
+    z_values = np.asarray(z_values, dtype=np.complex128)
+    if (tau.ndim != 1 or z_values.ndim != 1 or z_values.size == 0 or
+            frequency_sign.shape != tau.shape or
+            weight_rows.shape != (z_values.size, tau.size)):
+        raise ValueError(
+            "chi0 contour: require tau/sign (L,), z (n_out,), and "
+            f"weight_rows (n_out,L); got {tau.shape}, "
+            f"{frequency_sign.shape}, {z_values.shape}, "
+            f"{weight_rows.shape}")
+    if not np.all(np.isin(frequency_sign, (-1, 1))):
+        raise ValueError(
+            "chi0 contour: frequency_sign must be +1 for Delta-z or "
+            "-1 for Delta+z")
+    frequency_sign = frequency_sign.astype(np.int8, copy=False)
+    exponent = -tau[None, :] * (
+        float(E_gap) - frequency_sign[None, :] * z_values[:, None])
+    return -weight_rows * np.exp(exponent)
+
+
+def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
+                              z_values, energy_reference):
+    """Prepare the frequency rows and the unchanged sharded χ operands."""
+    s = wfns.slices
+    enk_v = wfns.enk[:, s.val]
+    enk_c = wfns.enk[:, s.cond]
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
+    vmax = float(np.max(enk_v_host))
+    cmin = float(np.min(enk_c_host))
+    tau = np.asarray(tau, dtype=np.complex128)
+    alpha_rows = _chi0_contour_alpha_rows(
+        tau, weight_rows, frequency_sign, z_values, cmin - vmax)
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_rows[0] if alpha_rows.shape[0] == 1
+                          else alpha_rows, dtype=jnp.complex128),
+    )
+    args = (
+        nodes,
+        wfns.xn(s.val), wfns.yr(s.val),
+        wfns.yr(s.cond), wfns.xn(s.cond),
+        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
+        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64),
+    )
+    return args, alpha_rows.shape[0]
+
+
+def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
+                         meta, mesh_xy, *, energy_reference=0.0):
+    """Evaluate near-real complex-frequency χ on one contour-node union.
+
+    Parameters
+    ----------
+    wfns : Wavefunctions
+        Existing wavefunction bundle; its k, spinor, band and sharded μ axes
+        are consumed exactly as in :func:`compute_chi0`.
+    tau : (L,) complex128 array
+        Complex times ``c_j t_j`` in inverse-energy units.
+    weight_rows : (n_out, L) complex128 array
+        Contour weights ``c_j h_j``.  A zero excludes a union node from an
+        output without changing the common τ scan.
+    frequency_sign : (L,) array of {+1, -1}
+        ``+1`` selects ``Delta-z`` and ``-1`` selects ``Delta+z``.
+    z_values : (n_out,) complex128 array
+        Direct near-real sample frequencies, in the band-energy units.
+
+    Returns
+    -------
+    jax.Array or tuple[jax.Array, ...]
+        One ``(nq, mu, mu)`` array for one output, otherwise an ``n_out``
+        tuple, always sharded ``P(None, 'x', 'y')``.
+
+    The large kernel is the existing two-forward-G-FFT, elementwise-product,
+    final-forward-FFT construction; only its scalar time convention and
+    frequency weights differ from static screening.
+    """
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args, n_out = _chi0_contour_kernel_args(
+        wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out, complex_contour=True)
+    return kernel(*args)
+
+
+def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
+                            z_values, meta, mesh_xy, *,
+                            energy_reference=None):
+    """AOT sibling of :func:`compute_chi0_contour` for the same node union."""
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    if len(np.asarray(tau)) == 0:
+        return
+    args, n_out = _chi0_contour_kernel_args(
+        wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out, complex_contour=True)
     kernel.lower(*args).compile()
 
 
