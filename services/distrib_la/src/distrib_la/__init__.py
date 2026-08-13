@@ -1,7 +1,7 @@
 """``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
 
-One door for ``eigh``, ``cholesky`` and ``solve_lu`` on an ``('x','y')``
-device mesh, over four backend families: **scalapack** (CPU preferred),
+One door for ``polar_factor``, ``eigh``, ``cholesky`` and ``solve_lu`` on an
+``('x','y')`` device mesh, over four backend families: **scalapack** (CPU preferred),
 **slate** (CPU fallback where it is not broken; ROCm always,
 declared-untested), **cusolvermp** (CUDA preferred) and **native** (pure
 JAX, everywhere).  A caller says what it wants computed and on which mesh;
@@ -19,6 +19,10 @@ zero of its declared dependencies.
 
 The surface
 -----------
+polar_factor(A, mesh, ...) -> (L, s)
+    Square distributed polar/SVD through a Hermitian dilation and one planned
+    Hermitian eigensolve.  The planned form separates eager resolution from
+    the trace-safe operation used in streamed k-point loops.
 ``plan(op, mesh, *, backend='auto', n=None) -> Plan``
     Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
     ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
@@ -86,6 +90,7 @@ from distrib_la.plan import (
     ensure_sharding,
     plan,
 )
+from distrib_la.polar import PolarPlan, plan_polar_factor, polar_factor
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -104,6 +109,8 @@ from distrib_la.resolve import (
 __all__ = [
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
+    # polar / SVD
+    "PolarPlan", "plan_polar_factor", "polar_factor",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_SCAN_UNROLL",
