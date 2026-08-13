@@ -1,5 +1,15 @@
 # Multi-device gates (not in the default pytest suite)
 
+MPA disk-stream gate: `mpa_fit_stream_gate.py`, exactly P=4.  It writes ten
+q-irreducible W samples through real SlabIO, fits a deliberately
+nondivisible `N_mu=P+1` five-pole field with the production row-sharded Padé
+walk, then reads and consumes pole ranges `[0:4]` and `[4:5]`.  It compares
+the resulting temporal W tile with the planted analytic pole sum on every
+addressable shard and requires exact-zero padding.
+
+    MPA_STREAM_GATE_DIR=/path/to/evidence \
+      <launcher> -n 4 python3 tests/multi_device/mpa_fit_stream_gate.py
+
 Tier-2 device-count-invariance gate: runs the gnppm + bispinor e2e fixtures at
 P=1 (1 GPU) and P=4 (4 GPUs, one process per device) and compares ζ / Σ_X /
 minimax node counts / invalid census / off-pole eqp against the tolerances

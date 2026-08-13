@@ -91,3 +91,15 @@ def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
     assert [(lo, hi) for lo, hi, _ in reads] == [(0, 4), (4, 8), (8, 10)]
     assert all(row[2]["unfold"] and row[2]["return_sharded"]
                for row in reads)
+
+
+def test_sigma_store_refuses_more_than_four_resident_poles():
+    for size in (0, 5):
+        try:
+            mpa_sigma.integrate_sigma_store(
+                None, "poles.h5", 8, (), np.array([0.0]), None, _mesh(),
+                pole_batch_size=size)
+        except ValueError as exc:
+            assert "[1, 4]" in str(exc)
+        else:
+            raise AssertionError(f"pole_batch_size={size} was accepted")

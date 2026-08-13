@@ -18,6 +18,13 @@ from .sigma_windows import (build_shared_sigma_windows,
                             summarize_sigma_poles)
 
 
+def _bounded_pole_batch_size(value):
+    size = int(value)
+    if not 1 <= size <= 4:
+        raise ValueError("MPA pole_batch_size must be in [1, 4]")
+    return size
+
+
 def _batch_rows(row, batch):
     local = {int(p): i for i, p in enumerate(batch)}
     keep = [i for i, p in enumerate(row.pole_indices) if int(p) in local]
@@ -32,6 +39,7 @@ def _batch_rows(row, batch):
 
 def execution_census(plan, n_poles, pole_batch_size=4):
     """Return physical tau dispatches after memory batching."""
+    pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     batches = [range(lo, min(lo + pole_batch_size, n_poles))
                for lo in range(0, n_poles, pole_batch_size)]
     sweeps = nodes = 0
@@ -61,9 +69,7 @@ def integrate_sigma_windows(
     if (Omega_poles.ndim != 4 or B_poles.shape != Omega_poles.shape
             or not int(Omega_poles.shape[0])):
         raise ValueError("Omega_poles and B_poles must share (p,q,mu,mu)")
-    batch_size = int(pole_batch_size)
-    if batch_size < 1:
-        raise ValueError("pole_batch_size must be positive")
+    batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     n_poles = int(Omega_poles.shape[0])
     batches = ((lo, Omega_poles[lo:lo + batch_size],
@@ -159,9 +165,7 @@ def integrate_sigma_store(
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time."""
-    batch_size = int(pole_batch_size)
-    if batch_size < 1:
-        raise ValueError("pole_batch_size must be positive")
+    batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     def batches():
         for lo in range(0, int(n_poles), batch_size):
@@ -221,6 +225,7 @@ def compute_sigma_c_mpa_omega_grid(
     """
     ledger = validate_fit_store(fit_src, expected_identity=fit_identity)
     n_poles = int(ledger["n_p"])
+    pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = _branches(wfns, omega_grid_ry, efermi_ry)
     summaries = []
     for lo in range(0, n_poles, int(pole_batch_size)):
