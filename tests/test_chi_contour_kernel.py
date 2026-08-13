@@ -146,3 +146,26 @@ def test_contour_rows_encode_both_resolvent_signs():
         got[0, 1], -weights[0, 1] * np.exp(-tau0 * (1.20 + z[0])))
     np.testing.assert_allclose(
         np.sum(got[1]), -2.0 * weights[1, 0] * np.exp(-tau0 * 1.20))
+
+
+def test_mpa_line_adapter_matches_the_two_resolvents():
+    """The exact arrays assembled by the MPA line route pin both signs."""
+    from gw.mpa.evaluator import damped_line_rule
+
+    delta = 1.2
+    gap_reference = 0.7
+    z = np.asarray([0.4 + 0.3j])
+    rule = damped_line_rule(
+        0.3, 1.6, rel_tol=1.0e-8, max_order=96)
+    t, h = rule["t"], rule["h"]
+    tau = np.concatenate((1j * t, -1j * t))
+    signs = np.concatenate((np.ones(t.size, np.int8),
+                            -np.ones(t.size, np.int8)))
+    weights = np.broadcast_to(
+        np.concatenate((1j * h, -1j * h)), (z.size, 2 * t.size))
+    alpha = w_isdf._chi0_contour_alpha_rows(
+        tau, weights, signs, z, gap_reference)
+    got = np.sum(
+        alpha[0] * np.exp(-tau * (delta - gap_reference)))
+    want = 1.0 / (z[0] - delta) - 1.0 / (z[0] + delta)
+    np.testing.assert_allclose(got, want, rtol=1.0e-8, atol=1.0e-8)

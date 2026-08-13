@@ -241,12 +241,17 @@ mainly by `F/Gamma_min`; adding more strongly damped poles is usually cheap.
 For `Gamma_p < xi` in the crossing core, absolute real-time convergence
 would require an impractically long interval.  LORRAX instead uses the
 accepted regularized real-pole HGL sine functional on a bounded dimensionless
-bandwidth.  Its pole phase is `Re Omega_p`, and the missing negative-time arm
-is restored once after the tau sum by the global anti-Hermitian completion
+bandwidth.  Its pole phase is `Re Omega_p`.  Each sine atom is evaluated with
+both signed times and the same stored residue,
 
 $$
-\Sigma_{\mathrm{HGL}}=\frac{Z-Z^\dagger}{2i}.
+B_p\sin(ut)=B_p\frac{e^{iut}-e^{-iut}}{2i}.
 $$
+
+The negative-time arm is explicit: it is not inferred from a band-space
+adjoint, because independently fitted matrix elements need not make an
+individual pole residue Hermitian.  This preserves arbitrary complex
+off-diagonal residues without pole matching.
 
 This is the only place where fitted `Gamma_p` is intentionally discarded.
 Its accepted rank/error pair is part of the implementation contract, rather

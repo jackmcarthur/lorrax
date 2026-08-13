@@ -527,6 +527,11 @@ def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
     assert bool(ledger["blocks_done"].all())
     assert ledger["journal"].shape == (n_q * plan["n_blocks"], 3)
     assert ledger["block_condition_max"].size == n_q * plan["n_blocks"]
+    assert ledger["certification"] == {
+        "condition_max_allowed": pytest.approx(1.0e13),
+        "backward_error_max_allowed": pytest.approx(
+            np.sqrt(np.finfo(np.float64).eps)),
+    }
 
     _, _, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
     for key in ("condition", "backward_error", "residual", "n_valid"):

@@ -2303,16 +2303,27 @@ def validate_fit_store(src, *, expected_identity=None, mode="r"):
             raise ValueError(
                 f"MPA fit identity mismatch for {key}: got {got!r}, "
                 f"expected {want!r}")
+    required = (
+        "condition_max_allowed",
+        "backward_error_max_allowed",
+    )
+    missing = [key for key in required
+               if key not in ledger["certification"]]
+    if missing:
+        raise ValueError(
+            "MPA Sigma requires certified pole fits; the store is missing "
+            + ", ".join(missing))
     observed = {
         "condition_max": ledger["condition_max"],
         "backward_error_max": ledger["backward_error_max"],
     }
-    for key, allowed in ledger["certification"].items():
-        if not str(key).endswith("_allowed"):
-            continue
+    for key in required:
+        allowed = ledger["certification"][key]
+        if not np.isfinite(float(allowed)) or float(allowed) <= 0.0:
+            raise ValueError(
+                f"MPA fit has invalid stored certification {key}="
+                f"{allowed!r}")
         metric = str(key)[:-len("_allowed")]
-        if metric not in observed:
-            continue
         got = observed[metric]
         if got is None or float(got) > float(allowed):
             raise ValueError(

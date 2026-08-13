@@ -300,6 +300,20 @@ def run_fit_driver(
     decision nobody reads.
     """
     n = int(n_p)
+    rcond = float(rcond)
+    if not 0.0 < rcond < 1.0:
+        raise ValueError("run_fit_driver requires 0 < rcond < 1")
+    if certification is None:
+        # These are solver-consistency guards, not material tolerances.
+        # A solve beyond 1/rcond is numerically rank deficient by its own
+        # truncation policy; sqrt(eps) is the ordinary backward-stability
+        # ceiling for complex128 arithmetic.  Observable accuracy remains a
+        # separate held-out/direct-denominator gate.
+        certification = {
+            "condition_max_allowed": 1.0 / rcond,
+            "backward_error_max_allowed": float(
+                np.sqrt(np.finfo(np.float64).eps)),
+        }
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
     n_mu = header["n_mu"]

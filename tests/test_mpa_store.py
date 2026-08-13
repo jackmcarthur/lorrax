@@ -941,10 +941,12 @@ def _fit_block(n_p, n_rows, n_cols, seed):
     return Om, Bp, diag
 
 
-def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None):
+def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None,
+                energy_unit=None):
     """Walk the schedule, writing blocks; optionally stop early."""
-    MS.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          grid_hash="sha256:deadbeef")
+    MS.allocate_fit_store(
+        path, n_q=n_q, n_mu=n_mu, n_p=n_p,
+        grid_hash="sha256:deadbeef", energy_unit=energy_unit)
     truth = {}
     steps = [(q, lo, hi) for q in range(n_q)
              for lo, hi in tiling.column_blocks(n_mu, n_cols)]
@@ -1085,6 +1087,15 @@ def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
     with pytest.raises(ValueError, match="identity mismatch"):
         MS.validate_fit_store(
             tmpdir_path, expected_identity={"w_grid_hash": "wrong"})
+
+
+def test_sigma_refuses_an_uncertified_fit_store(tmpdir_path):
+    """A COMPLETE ledger is not an accuracy certificate."""
+    _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
+                energy_unit="Ry")
+    MS.finalize_fit_store(tmpdir_path)
+    with pytest.raises(ValueError, match="requires certified pole fits"):
+        MS.validate_fit_store(tmpdir_path)
 
 
 def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
