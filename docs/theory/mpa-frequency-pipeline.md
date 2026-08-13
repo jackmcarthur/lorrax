@@ -280,7 +280,45 @@ Gauss--Legendre nodes. Each colored ellipse is the Bernstein contour used to
 select that panel's order; the lower panel shows why the near line fixes the
 tail while the far line is already exponentially negligible.*
 
-### 3.5 General contour representation and batching
+### 3.5 One-sided finite-set construction
+
+For a finite set of upper-half-plane samples, the two resolvents in (1) can
+also be oriented independently:
+
+$$
+-\frac{1}{\Delta-z}
+=-i\int_0^\infty e^{-i(\Delta-z)t}\,dt,
+\qquad
+-\frac{1}{\Delta+z}
+=-c\int_0^\infty e^{-c(\Delta+z)t}\,dt,
+\tag{12a}
+$$
+
+where the second contour is chosen so that
+$\operatorname{Re}[c(\Delta+z)]>0$ on the complete requested
+$(\Delta,z)$ domain.  The first arm is a damped real-time integral; the
+second can usually be rotated toward imaginary time and is much shorter.
+Each arm is partitioned into positive Gauss--Legendre panels.  Panel lengths
+resolve the largest phase frequency, panel orders are increased until a
+Bernstein-ellipse remainder bound is below the allocated tolerance, and the
+tail is stopped only after its analytic exponential bound is small enough.
+The union of both arms is then executed once for all requested $z_j$, with a
+different scalar coefficient row for every $z_j$.
+
+For the documented MoS2 interval
+$\Delta\in[0.12495270135383862,5.333158679936671]$ Ry and its 15 finite
+MPA samples, this construction used 202 resonant and 40 antiresonant nodes,
+242 expensive transition contractions in total.  Direct comparison of all
+$15\times9$ finite-$q$ matrices with the explicit transition resolvent gave
+a maximum scaled error $2.02\times10^{-9}$ and Frobenius relative error
+$1.49\times10^{-9}$.  The finite-$z$ execution took 0.418 s on four A100s,
+compared with 1.135 s for the earlier rank-327 sine dictionary expanded to
+654 $\tau=\pm it$ contractions.  These timings cover construction of the
+finite-$z$ $\chi^0$ matrices from the already prepared wavefunction/ISDF
+tensors; they do not include wavefunction preparation, static $\chi^0$,
+Dyson solves, or the MPA fit.
+
+### 3.6 General contour representation and batching
 
 All of the complex exponential arms use
 
@@ -714,6 +752,33 @@ projector, nodes, and achieved error for each window. It does not store a
 dense pole mask. Such plans are baked offline and read as small inputs before
 the pole walk; they are not frequency-dependent calculation intermediates.
 
+### 10.1 Validated sharing boundary
+
+The first observable-qualified compact plan executed 609 contractions:
+315 noncrossing, 138 finite-width exact crossing, 96 accepted HGL, and 60
+compatibility-side contractions. A later union fit combined only those
+wide-pole and narrow-side contributions having identical A masks, causal
+branches, projectors, and reference conventions. The two stripe classes
+remain separate because their A masks differ. This reduced the sign-definite
+work from 375 to 338 contractions and the total from 609 to 572, in 16
+frequency sweeps, without changing the spatial convolution.
+
+Against the 1229-node reference, the 572-node plan changed the largest
+registered quasiparticle energy by 0.0259 meV and the indirect and direct
+Gamma gaps by -0.0313 and -0.0307 meV. Its measured four-A100 wall time was
+110.3 s, versus 117.9 s for the 609-node plan. The Sigma phase itself was
+91.5 s versus 86.1 s, however, so this establishes the smaller sound
+frequency census and observable accuracy, not a clean kernel-speedup claim.
+The remaining scheduling overhead should be profiled before fewer nodes are
+assumed to give proportionally less wall time.
+
+Two attractive-looking merges are invalid. Equal scalar nodes do not allow
+windows with different G or W masks to share one bilinear contraction,
+because that introduces cross terms. Likewise, widening the HGL core to
+absorb every compatibility side is not a small extension: the side domains
+reach dimensionless bandwidths of order 300, rather than the core value of
+order 24, and would require hundreds of sine nodes per branch.
+
 ![Actual complex-time nodes in the 609-node Sigma plan](figures/mpa_sigma_nodes.png)
 
 *These are the frozen time coordinates, not representative points.
@@ -774,7 +839,39 @@ quasiparticle quantities. A wider quasiparticle energy range requires a wider
 $\omega$ grid and therefore new window bounds; neither the MPA fit nor a
 quadrature licenses extrapolation beyond its declared frequency domain.
 
-## 12. Minimal convergence hierarchy
+## 12. Closing-gap domain rules
+
+Window selection is determined by the actual denominator domain, not by a
+nominal ``conduction'' or ``valence'' label. This matters when a selected
+$E_c$ range extends below the Fermi level or an $E_v$ range extends above it.
+For finite-$z$ $\chi^0$, the resonant real-time arm of (12a) remains damped
+for signed transition energies whenever $\operatorname{Im}z>0$. The second
+arm is admitted only if one contour orientation satisfies
+
+$$
+\min_{\Delta,z}\operatorname{Re}[c(\Delta+z)]>0.
+$$
+
+If this quantity changes sign, the domain is split and oppositely oriented,
+or the paired-sine representation (8) is used. Near $\Delta=0$ the two
+resolvents can cancel much more strongly than either arm separately, so the
+implementation must compare against the combined kernel and fall back to the
+paired representation when that cancellation is poorly conditioned. The
+static $z=0$ rule requires $\min|\Delta|>0$; a true zero transition needs an
+occupation-aware intraband term and an explicit principal-value or broadening
+prescription, and must otherwise be refused.
+
+The same rule governs Sigma. A noncrossing contour is legal only when its
+complete selected denominator set satisfies
+$\min_d\operatorname{Re}(cd)>0$. If the real part changes sign, the window
+is crossing regardless of band labels. Finite $\Gamma_p$ supplies damping
+to the exact crossing route, while its cost diverges as $\Gamma_p\to0$;
+the HGL/sine route supplies the declared near-axis regularization. A domain
+containing both $u=0$ and $\Gamma_p=0$ is genuinely singular and requires a
+declared $\xi$, principal value, or physical occupation treatment rather
+than automatic window reassignment.
+
+## 13. Minimal convergence hierarchy
 
 Frequency errors should be tightened in this order:
 
