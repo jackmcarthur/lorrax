@@ -209,6 +209,7 @@ def compute_sigma_c_mpa_omega_grid(
     regularization_width_ry,
     edge_factor=1.5,
     target_error=1.0e-4,
+    crossing_target_error=None,
     max_rank=96,
     crossing_max_nodes=500,
     pole_batch_size=4,
@@ -241,6 +242,7 @@ def compute_sigma_c_mpa_omega_grid(
         None, branches, pole_summaries=summaries,
         regularization_width_ry=regularization_width_ry,
         edge_factor=edge_factor, target_error=target_error,
+        crossing_target_error=crossing_target_error,
         max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
     physical = execution_census(plan, n_poles, pole_batch_size)
     print_fn(

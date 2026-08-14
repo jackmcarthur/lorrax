@@ -226,16 +226,25 @@ $$
 \frac1d=i\int_0^\infty e^{-idt}\,dt.
 $$
 
-The common positive composite rule covers
+The common positive global-Gauss rule covers
 `|Re d| <= F` and `Gamma_min <= Gamma <= Gamma_max`.  Its tail uses the
-weakest damping,
+weakest damping.  Several deterministic tail-error allocations are tried,
+and the smallest rule passing a disjoint dense boundary check is retained.
+The natural scale remains
 
 $$t_{\max}=\log(2/\epsilon)/\Gamma_{\min},$$
 
-while each Bernstein-ellipse panel bound uses `F+Gamma_max`.  This detail is
-what permits one rule to cover poles at several widths; a rule certified on
-one horizontal line alone does not establish that claim.  The cost is set
-mainly by `F/Gamma_min`; adding more strongly damped poles is usually cheap.
+up to the selected tail allocation.  This is what permits one rule to cover
+poles at several widths; a rule certified on one horizontal line alone does
+not establish that claim.  The cost is set mainly by `F/Gamma_min`; adding
+more strongly damped poles is usually cheap.
+
+Both the crossing and sign-definite inputs bound the same dimensionless
+relative residual, `|1-d Q(d)|`.  They nevertheless have separate error
+budgets: the positive crossing error was observably much less sensitive in
+the validated eight-pole calculation.  The defaults `2e-3` (crossing) and
+`6.5e-4` (sector) reduced the physical census from 478 to 446 while changing
+registered QP energies by at most `5e-5` meV relative to the 478-node plan.
 
 ### 5.3 Near-axis HGL core
 

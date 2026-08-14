@@ -245,6 +245,7 @@ def build_shared_sigma_windows(
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float = 1.0e-4,
+    crossing_target_error: float | None = None,
     max_rank: int = 96,
     crossing_max_nodes: int = 500,
     pole_summaries=None,
@@ -259,7 +260,20 @@ def build_shared_sigma_windows(
     The electronic stripe, plasmon slab, and the two inherently sign-definite
     causal branches use the existing rotated-Laplace minimax service.  Pole
     batching is solely an executor memory policy and never a spectral split.
+
+    ``target_error`` and ``crossing_target_error`` both bound the same
+    dimensionless relative residual ``|1-d Q(d)|``.  The latter defaults to
+    the former for direct callers; production MPA supplies independently
+    validated budgets because the two rule families have different
+    observable sensitivity.
     """
+    sector_error = float(target_error)
+    crossing_error = (sector_error if crossing_target_error is None
+                      else float(crossing_target_error))
+    if not (0.0 < sector_error < 1.0
+            and 0.0 < crossing_error < 1.0):
+        raise ValueError("MPA Sigma target errors must lie in (0, 1)")
+
     poles = () if Omega_poles is None else tuple(Omega_poles)
     residues = (() if B_poles is None else tuple(B_poles))
     summaries = None if pole_summaries is None else tuple(pole_summaries)
@@ -326,7 +340,7 @@ def build_shared_sigma_windows(
                 [(stat, real)], eb, omega_max, eta,
                 crossing=(sign > 0)))
         nodes, fit = _laplace_nodes(
-            rectangles, target_error, max_rank)
+            rectangles, sector_error, max_rank)
         nodes = _apply_external_damping(nodes, eta)
         for name, mask_A, eb, components in outputs:
             pole_i, bounds, phases = [], [], []
@@ -370,7 +384,7 @@ def build_shared_sigma_windows(
                           for e in eb
                           for a in (a_lo, a_hi)))
             rule = damped_rectangle_positive_rule(
-                gamma_min, gamma_max, f_max, rel_tol=target_error,
+                gamma_min, gamma_max, f_max, rel_tol=crossing_error,
                 max_nodes=crossing_max_nodes)
             raw_nodes = MinimaxNodes(
                 t=jnp.asarray(rule["t"], dtype=jnp.complex128),
@@ -384,7 +398,7 @@ def build_shared_sigma_windows(
                         f"positive {rule['rule_type']} damped crossing rule; "
                         f"eta {eta:.6e}; gamma "
                         f"[{gamma_min:.6e},{gamma_max:.6e}]; "
-                        f"f_max {f_max:.6e}; target {target_error:.3e}; "
+                        f"f_max {f_max:.6e}; target {crossing_error:.3e}; "
                         f"sampled error {rule['sampled_max_error']:.3e}; "
                         f"continuum cover "
                         f"{rule['continuum_error_bound']:.3e}; "
@@ -398,6 +412,8 @@ def build_shared_sigma_windows(
 
     return output, {"eta_ry": eta, "omega_max_ry": omega_max,
                     "crossing_edge_ry": crossing_edge,
+                    "sector_target_error": sector_error,
+                    "crossing_target_error": crossing_error,
                     "n_windows": len(output),
                     "n_tau": int(sum(row.window.n_tau for row in output))}
 

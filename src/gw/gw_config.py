@@ -1345,6 +1345,13 @@ _DEFAULTS = {
     "mpa_varpi_far_ry": 2.0,
     "mpa_head_model": "fixed_dft",
     "mpa_pole_batch_size": 4,
+    # Both targets bound the same dimensionless relative residual
+    # |1-d Q(d)|.  They are separate because the positive crossing rule is
+    # demonstrably less observable-sensitive than the support-selected
+    # sign-definite rules on the validated MPA Sigma gate.
+    "mpa_sigma_sector_target_error": 6.5e-4,
+    "mpa_sigma_crossing_target_error": 2.0e-3,
+    "mpa_sigma_max_nodes": 96,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
@@ -2000,6 +2007,9 @@ class MPAConfig:
     varpi_far_ry: float
     head_model: str
     pole_batch_size: int
+    sigma_sector_target_error: float
+    sigma_crossing_target_error: float
+    sigma_max_nodes: int
 
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
@@ -2018,6 +2028,11 @@ class MPAConfig:
                 "mpa_head_model currently supports only 'fixed_dft'")
         if not 1 <= self.pole_batch_size <= 4:
             raise ValueError("mpa_pole_batch_size must be in [1, 4]")
+        if not (0.0 < self.sigma_sector_target_error < 1.0
+                and 0.0 < self.sigma_crossing_target_error < 1.0):
+            raise ValueError("MPA Sigma target errors must lie in (0, 1)")
+        if self.sigma_max_nodes < 2:
+            raise ValueError("mpa_sigma_max_nodes must be at least two")
 
 
 @dataclass(frozen=True)
@@ -2536,6 +2551,11 @@ class LorraxConfig:
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
             head_model=str(_g("mpa_head_model")).strip().lower(),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
+            sigma_sector_target_error=float(
+                _g("mpa_sigma_sector_target_error")),
+            sigma_crossing_target_error=float(
+                _g("mpa_sigma_crossing_target_error")),
+            sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),

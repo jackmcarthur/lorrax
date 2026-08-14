@@ -164,14 +164,18 @@ def test_actual_stripe_and_slab_match_direct_complex_denominators():
 
 
 def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
+    seen = {}
+
     def fake_fit(rectangles, **_kwargs):
         assert np.all(np.asarray(rectangles)[:, 0] > 0.0)
+        seen.setdefault("sector", []).append(_kwargs["target_error"])
         return SimpleNamespace(
             nodes=np.asarray([0.2 + 0.1j, 0.7 + 0.2j]),
             weights=np.asarray([0.4 + 0.1j, 0.3 + 0.2j]),
             sampled_max_error=8e-5)
 
     def fake_damped(*_args, **_kwargs):
+        seen["crossing"] = _kwargs["rel_tol"]
         return {"t": np.asarray([0.3, 0.8]),
                 "h": np.asarray([0.4, 0.6]),
                 "sampled_max_error": 7e-5,
@@ -187,7 +191,8 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
         _poles(), _branches(),
         B_poles=tuple(jnp.ones_like(pole) for pole in _poles()),
         regularization_width_ry=0.2,
-        edge_factor=1.5)
+        edge_factor=1.5, target_error=6.5e-4,
+        crossing_target_error=2.0e-3)
     summaries = []
     for p, pole in enumerate(_poles()):
         summaries.extend(SW.summarize_sigma_poles(
@@ -201,7 +206,8 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     assert batched == tuple(summaries)
     streamed, streamed_report = SW.build_shared_sigma_windows(
         None, _branches(), regularization_width_ry=0.2,
-        edge_factor=1.5, pole_summaries=summaries)
+        edge_factor=1.5, pole_summaries=summaries,
+        target_error=6.5e-4, crossing_target_error=2.0e-3)
     assert streamed_report == report
     assert [(r.window.name, r.pole_indices.tolist(), r.bounds.tolist())
             for r in streamed] == [
@@ -213,6 +219,10 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     assert names.count("a_stripe") == 2
     assert names.count("core") == 2
     assert report["n_windows"] == 8
+    assert report["sector_target_error"] == 6.5e-4
+    assert report["crossing_target_error"] == 2.0e-3
+    assert set(seen["sector"]) == {6.5e-4}
+    assert seen["crossing"] == 2.0e-3
 
     single = next(row for row in plan if row.window.name == "single")
     assert single.pole_indices.tolist() == [0, 1]

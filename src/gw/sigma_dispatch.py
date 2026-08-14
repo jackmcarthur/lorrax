@@ -641,7 +641,6 @@ def compute_sigma_xc(
             fit_path = W_by_role["mpa_fit"]
         except KeyError as exc:
             raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
-        quadrature = config.sigma_quadrature_config
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
@@ -649,9 +648,11 @@ def compute_sigma_xc(
             regularization_width_ry=(
                 float(config.sigma.regularization_ev) / RYD_TO_EV),
             edge_factor=float(config.sigma.window_edge_factor),
-            target_error=float(quadrature.target_error),
-            max_rank=int(quadrature.max_nodes),
-            crossing_max_nodes=int(quadrature.crossing_max_nodes),
+            target_error=float(config.mpa.sigma_sector_target_error),
+            crossing_target_error=float(
+                config.mpa.sigma_crossing_target_error),
+            max_rank=int(config.mpa.sigma_max_nodes),
+            crossing_max_nodes=max(500, int(config.mpa.sigma_max_nodes)),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
         head = mpa_store.read_head_fit(fit_path, to_unit="Ry")

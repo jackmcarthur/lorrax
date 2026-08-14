@@ -102,6 +102,9 @@ page has to read it from.
 | `degen_avg_tol_ry` | `1e-06` | Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry). |
 | `ppm_sigma_target_error` | `1e-06` | Target error of the PPM Sigma^c tau-quadrature. |
 | `ppm_sigma_max_nodes` | `64` | Node-count cap for the PPM Sigma^c quadrature. |
+| `mpa_sigma_sector_target_error` | `6.5e-4` | Relative-residual bound `|1-d Q(d)|` for sign-definite MPA Sigma windows. |
+| `mpa_sigma_crossing_target_error` | `2e-3` | Relative-residual bound `|1-d Q(d)|` for the positive damped MPA crossing rule. |
+| `mpa_sigma_max_nodes` | `96` | Maximum rank of one sign-definite MPA Sigma rule; the positive crossing fallback retains its 500-node safety ceiling. |
 | `sigma_omega_min_ev` | `-5.0` | Sigma(omega) grid lower edge (eV, relative to E_DFT). |
 | `sigma_omega_max_ev` | `5.0` | Sigma(omega) grid upper edge (eV). |
 | `sigma_omega_step_ev` | `0.25` | Sigma(omega) grid step (eV). |
