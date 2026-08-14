@@ -391,6 +391,8 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
             nelec=nelec, print_fn=print_fn)
         _check_dipole_provenance(dipole_path, params=params or {}, wfn=wfn,
                                  print_fn=print_fn)
+    # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
+    # step occupation; metallic QSGW uses the explicit weighted PT head.
     occ = np.zeros((nk_tot, nb), dtype=float)
     occ[:, :max(0, min(nelec, nb))] = 1.0
     f_nk = jnp.asarray(occ, dtype=jnp.float64)

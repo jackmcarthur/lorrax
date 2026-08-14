@@ -261,10 +261,11 @@ def _solve_head_occupations(
     nk = int(energies.shape[0])
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
     capacity = float(spin_degeneracy_factor(inputs.wfn))
+    target_electrons = float(inputs.wfn.num_electrons)
     mu_ry, occ_logical = solve_mp1_occupations(
         energies[:, :nb_logical],
         kweights,
-        capacity * float(inputs.meta.nelec),
+        target_electrons,
         width_ev / RYD_TO_EV,
         state_capacity=capacity,
     )
@@ -1228,7 +1229,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             mesh=inputs.mesh_xy,
             kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
             bvec_cart=pt.reciprocal_lattice_cart,
-            nocc=int(inputs.meta.nelec),
             nb_logical=int(pt.nb_logical),
             sigma_energies_ry=np.asarray(E_full, dtype=np.float64),
             efermi_ry=head_efermi_ry,

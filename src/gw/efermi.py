@@ -44,10 +44,12 @@ calculation, 1 for a spinor one — ``psp.get_DFT_mtxels.
 spin_degeneracy_factor``) multiplies BOTH the electron count and the
 occupancy, so it cancels out of E_F exactly.  Carrying it here would be an
 invitation to apply it twice; it belongs in ρ's normalisation, where it
-does not cancel.  ``WfnLoader.nelec`` is already a band count
-(``max(ifmax)``), so it is the right argument to pass unmodified.
+does not cancel.
 
-MP1 APIs below count physical electrons.  Pass the canonical
+MP1 APIs below count physical electrons.  ``WfnLoader.num_electrons`` is
+the weighted WFN occupation count; do not substitute
+``WfnLoader.nelec=max(ifmax)``, which is only a band boundary in a metal.
+Pass the canonical
 ``spin_degeneracy_factor(wfn)`` as ``state_capacity``: 1 for a fully
 relativistic spinor WFN and 2 for a spin-restricted scalar WFN.  Their
 ``broadening_ry`` follows BerkeleyGW ``occ_broadening``: the MP1

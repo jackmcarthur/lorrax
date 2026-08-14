@@ -79,6 +79,10 @@ class Meta:
         n_proc = jax.process_count()
         b_id_0 = 0
         b_id_1 = int(wfn.nelec - nval)
+        # TODO(metal-band-windows): ``wfn.nelec=max(ifmax)`` is only the
+        # highest partially occupied band boundary.  Replace this single b2
+        # valence/conduction split when finite-q metallic screening and Sigma
+        # consume occupation weights rather than integer band manifolds.
         b_id_2 = int(wfn.nelec)
         b_id_3 = int(wfn.nelec + ncond)
         # b_id_4 is the padded upper bound: rounded up so the band axis

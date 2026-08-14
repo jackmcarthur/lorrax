@@ -248,7 +248,6 @@ def main() -> int:
             occupation,
             [0.0j, 0.5j],
             mesh=mesh,
-            nocc=8,
             nb_logical=nb,
             cell_volume=100.0,
             nk_tot=nk,

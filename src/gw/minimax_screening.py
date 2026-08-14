@@ -747,6 +747,8 @@ def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
     on the band-energy interval, and e_ref is the global energy zero.
     """
     s = wfns.slices
+    # TODO(metal-screening): derive this transition window from all pairs
+    # with nonzero f_nk-f_mk, not the ifmax-based b2 cut.
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]
     e_ref = resolve_minimax_energy_reference(
@@ -995,5 +997,4 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
             f"(R'={(Omega-quad.x_min)/(Omega-quad.x_max):.3f}), "
             f"err~{err_combined:.1e}  [{fused.provenance}]")
     return fused
-
 

@@ -164,11 +164,37 @@ class WfnLoader:
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
 
         # Derived band-fill metadata — same names WFNReader exposed.
-        # ``ifmax`` is the 1-based index of the highest occupied band.
+        # ``ifmax`` is the 1-based index of the highest band with nonzero
+        # occupation.  It is a BAND BOUNDARY, not an electron count: in a
+        # metal the last band can be only partially occupied.
         if np.size(self.ifmax) > 0:
             self.nelec = int(np.max(self.ifmax))
         else:
             self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
+        weights = np.asarray(self.kweights, dtype=np.float64)
+        weight_sum = float(weights.sum())
+        if (weights.shape != (int(self.nkpts),)
+                or not np.all(np.isfinite(weights))
+                or np.any(weights < 0.0)
+                or not np.isfinite(weight_sum)
+                or weight_sum <= 0.0):
+            raise ValueError(
+                "WFN k-point weights must be finite, nonnegative, and have "
+                f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
+        occs = np.asarray(self.occs, dtype=np.float64)
+        if occs.shape != (int(self.nspin), int(self.nkpts), int(self.nbands)):
+            raise ValueError(
+                "WFN occupations have shape "
+                f"{occs.shape}, expected "
+                f"({int(self.nspin)},{int(self.nkpts)},{int(self.nbands)}).")
+        # BerkeleyGW's WFN convention counts 2/(nspin*nspinor) electrons per
+        # unit occupation.  Unlike ``nelec=max(ifmax)``, this remains the
+        # physical fixed-N target for fractional occupations.
+        state_capacity = 2.0 / (
+            float(max(int(self.nspin), 1))
+            * float(max(int(self.nspinor), 1)))
+        self.num_electrons = state_capacity * float(np.einsum(
+            "k,skb->", weights / weight_sum, occs, optimize=True))
         _nb = int(self.energies.shape[-1])
         _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
         self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
@@ -250,6 +276,9 @@ class WfnLoader:
         # that can turn a time-reversal row into a conjugated ψ, so
         # gating there covers every backend (eager / phdf5).
         #
+        # TODO(metal-symmetry): form this diagnostic density with the WFN
+        # occupation weights; ``nelec=max(ifmax)`` overfills its current
+        # occupied-band-only window for a metal.
         # Runs last in ``__init__`` because it needs ``nelec``,
         # ``kweights``, ``box_index`` and the open file handle.  Cost is
         # occupied-bands-only on a ±-closed k-subsample — order a second

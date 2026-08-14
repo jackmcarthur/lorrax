@@ -680,7 +680,6 @@ def head_s_tensor_sharded(
     omegas_ry,
     *,
     mesh: Mesh,
-    nocc: int,
     nb_logical: int,
     cell_volume: float,
     nk_tot: int,
@@ -691,8 +690,8 @@ def head_s_tensor_sharded(
     """Build S(omega) from a 2-D band-tiled current QSGW velocity.
 
     The contraction runs over every pair in ``[0, nb_logical)`` and uses
-    the signed factor ``f_nk - f_mk``.  ``nocc`` is only an electron-count
-    sanity bound; it never partitions the band sum.
+    the signed factor ``f_nk - f_mk``.  There is deliberately no integer
+    occupied-band boundary in this API.
 
     Energies and occupations are passed twice with complementary one-axis
     shardings.  Each rank forms only its local conduction-by-valence tile;
@@ -711,10 +710,10 @@ def head_s_tensor_sharded(
         )
     if v.shape[2] != v.shape[3]:
         raise ValueError("velocity band matrices must be square.")
-    if not (0 <= int(nocc) <= int(nb_logical) <= int(v.shape[2])):
+    if not (0 < int(nb_logical) <= int(v.shape[2])):
         raise ValueError(
-            f"need 0 <= nocc <= nb_logical <= stored nb, got "
-            f"{nocc}, {nb_logical}, {v.shape[2]}."
+            f"need 0 < nb_logical <= stored nb, got "
+            f"{nb_logical}, {v.shape[2]}."
         )
     pref = 4.0 / (
         float(cell_volume)
@@ -819,7 +818,6 @@ def build_iteration_head_samples(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
     bvec_cart,
-    nocc: int,
     nb_logical: int,
     sigma_energies_ry,
     efermi_ry: float,
@@ -844,7 +842,6 @@ def build_iteration_head_samples(
         occupations_qp_kn,
         omegas_ry,
         mesh=mesh,
-        nocc=nocc,
         nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),

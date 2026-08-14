@@ -97,7 +97,6 @@ def test_sharded_s_tensor_matches_legacy_dft_formula():
             jnp.asarray(occ),
             jnp.asarray(omegas),
             mesh=_mesh(),
-            nocc=nocc,
             nb_logical=nb,
             cell_volume=volume,
             nk_tot=nk,
@@ -156,7 +155,6 @@ def test_s_tensor_ignores_mesh_padding_bands():
     v[:, :, :, nb:] *= 1e9
     kw = dict(
         mesh=_mesh(),
-        nocc=nocc,
         nb_logical=nb,
         cell_volume=31.0,
         nk_tot=nk,
@@ -244,7 +242,6 @@ def test_s_tensor_uses_k_dependent_occupations_not_band_cut():
             jnp.asarray(occupations),
             [omega],
             mesh=_mesh(),
-            nocc=2,
             nb_logical=logical,
             cell_volume=volume,
             nk_tot=nk,

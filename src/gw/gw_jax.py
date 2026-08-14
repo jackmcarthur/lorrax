@@ -161,6 +161,8 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 	"""
 	head = head_resolver.at(0.0 + 0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
+	# TODO(metal-sigma): this one-shot static Sigma head still uses the
+	# ifmax band boundary.  Port it with the rest of metallic Sigma.
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
 		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=meta.nk_tot)

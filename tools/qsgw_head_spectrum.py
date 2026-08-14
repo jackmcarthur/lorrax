@@ -85,6 +85,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--nbands",
+        type=int,
+        default=None,
+        help=(
+            "logical bands included in the head sum; default is the complete "
+            "parallel-transport manifold"
+        ),
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default="qsgw_head_spectrum.dat",
@@ -93,6 +102,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.omega_points < 1:
         parser.error("--omega-points must be >= 1")
+    if args.nbands is not None and args.nbands < 1:
+        parser.error("--nbands must be >= 1")
     if not np.isfinite(args.omega_min_ev) or not np.isfinite(args.omega_max_ev):
         parser.error("frequency endpoints must be finite")
     if args.omega_max_ev < args.omega_min_ev:
@@ -286,7 +297,15 @@ def _run(args: argparse.Namespace) -> int:
         pt = load_parallel_transport_head(
             pt_file, mesh=mesh, wfn=wfn, meta=meta
         )
-    nb_logical = int(pt.nb_logical)
+    nb_available = int(pt.nb_logical)
+    nb_logical = (
+        nb_available if args.nbands is None else int(args.nbands)
+    )
+    if nb_logical > nb_available:
+        raise ValueError(
+            f"--nbands={nb_logical} exceeds the {nb_available}-band "
+            "parallel-transport manifold."
+        )
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
     energies_kn, _ = get_enk_bandrange(
         wfn,
@@ -307,7 +326,7 @@ def _run(args: argparse.Namespace) -> int:
     mu_ry_device, occupations_logical = solve_mp1_occupations(
         energies_kn[:, :nb_logical],
         kweights,
-        capacity * float(meta.nelec),
+        float(wfn.num_electrons),
         width_ev / float(RYD_TO_EV),
         state_capacity=capacity,
     )
@@ -336,7 +355,6 @@ def _run(args: argparse.Namespace) -> int:
         occupations_kn,
         omegas_ry,
         mesh=mesh,
-        nocc=int(meta.nelec),
         nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
