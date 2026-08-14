@@ -107,6 +107,15 @@ def build_mpa_fit(
     tile_bytes=None, print_fn=print,
 ):
     """Write chi/Wc samples and fitted q-wedge poles; return the fit path."""
+    if config.mpa.material_class != "insulator":
+        raise NotImplementedError(
+            "GATE mpa_metal_evaluator_unavailable: the configured metallic "
+            "double-parallel sample plan is available through "
+            "config.mpa.sample_plan(omega_m_ry), but build_mpa_fit cannot "
+            "evaluate it until occupation-weighted interband/intraband chi "
+            "and Sigma branches land. FALSE case: "
+            "config.mpa.material_class == 'insulator'.")
+
     from common.collectives import barrier, process_rank
     from gw.minimax_config import MinimaxConfig
     from gw.minimax_screening import build_imag_quadrature
@@ -119,11 +128,7 @@ def build_mpa_fit(
 
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
-    plan = sample_plan.mpa_plan(
-        n_p, omega_m, material_class=config.mpa.material_class,
-        alpha=config.mpa.sampling_alpha,
-        varpi_near=config.mpa.varpi_near_ry,
-        varpi_far=config.mpa.varpi_far_ry, energy_unit="Ry")
+    plan = config.mpa.sample_plan(omega_m)
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)

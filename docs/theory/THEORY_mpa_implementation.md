@@ -62,11 +62,15 @@ $$
 
 The sample plan is the double-parallel grid: a near-real line resolves sharp
 structure, a farther line anchors the continuation, and their real parts use
-a nested powers-of-two partition.  The lower transition bound is the actual
-smallest included positive transition; the upper bound is the largest
-transition formed by the requested occupied and empty band sums.  A metallic
-or fractional-occupation plan needs a separate intraband treatment and is
-currently refused rather than assigned an artificial gap.
+a nested powers-of-two partition.  `mpa_material_class = metal` selects the
+published displaced origin, while `mpa_sampling_alpha` and the two `varpi`
+keys control the real partition and line heights.  This pure sampling plan is
+available through `config.mpa.sample_plan(omega_m_ry)`.  The lower transition
+bound is the actual smallest included positive transition; the upper bound is
+the largest transition formed by the requested occupied and empty band sums.
+The current evaluator still refuses a metallic or fractional-occupation plan
+until its occupation-weighted interband and intraband terms land; it never
+manufactures an artificial gap.
 
 There are two scalar quadrature families.
 

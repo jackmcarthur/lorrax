@@ -86,6 +86,11 @@ page has to read it from.
 | `minimax_max_nodes` | `64` | Node-count cap for the minimax quadrature solver. |
 | `regenerate_minimax_tables` | false | Force re-solving the minimax tables instead of reusing cached ones. |
 | `minimax_energy_reference` | `"midgap"` | Energy reference for the minimax transition range (midgap default). |
+| `mpa_n_poles` | `8` | Number of MPA poles and therefore the number of points on each double-parallel sampling line (`2*mpa_n_poles` samples total). |
+| `mpa_material_class` | `"insulator"` | Sampling geometry: `insulator` puts the first near-line point at zero; `metal` puts it at `i*2e-5 Ry`. Metallic sample plans can be constructed, but the production χ/Σ evaluator still refuses until occupation-weighted interband/intraband terms land. |
+| `mpa_sampling_alpha` | `1` | Real-coordinate exponent for the nested partition, `omega_n = omega_m*s_n^alpha`; supported values are 1 and 2. |
+| `mpa_varpi_near_ry` | `0.2` | Height in Ry of the near complex-frequency sampling line. |
+| `mpa_varpi_far_ry` | `2.0` | Height in Ry of the far complex-frequency sampling line; must exceed `mpa_varpi_near_ry`. |
 | `ppm_model` | `"gn"` | Plasmon-pole ansatz: gn (Godby-Needs, imaginary probe) | hl (Hybertsen-Louie, real probe). |
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |

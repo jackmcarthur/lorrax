@@ -2014,10 +2014,10 @@ class MPAConfig:
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
-        if self.material_class != "insulator":
-            raise NotImplementedError(
-                "mpa_material_class currently supports only 'insulator'; "
-                "fractional-occupation/intraband physics has not landed")
+        if self.material_class not in ("insulator", "metal"):
+            raise ValueError(
+                "mpa_material_class must be 'insulator' or 'metal'; "
+                f"got {self.material_class!r}")
         if self.sampling_alpha not in (1, 2):
             raise ValueError("mpa_sampling_alpha must be 1 or 2")
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
@@ -2033,6 +2033,24 @@ class MPAConfig:
             raise ValueError("MPA Sigma target errors must lie in (0, 1)")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
+
+    def sample_plan(self, omega_m_ry):
+        """Return the configured double-parallel frequency plan in Ry.
+
+        This is sampling geometry only.  In particular, constructing a
+        metallic plan does not claim that the occupation-weighted χ/Σ
+        evaluators needed to consume it have landed.
+        """
+        from .mpa.sample_plan import mpa_plan
+
+        return mpa_plan(
+            self.n_poles, omega_m_ry,
+            material_class=self.material_class,
+            alpha=self.sampling_alpha,
+            varpi_near=self.varpi_near_ry,
+            varpi_far=self.varpi_far_ry,
+            energy_unit="Ry",
+        )
 
 
 @dataclass(frozen=True)
