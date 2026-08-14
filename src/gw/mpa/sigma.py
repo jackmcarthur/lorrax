@@ -210,8 +210,7 @@ def compute_sigma_c_mpa_omega_grid(
     edge_factor=1.5,
     target_error=1.0e-4,
     max_rank=96,
-    hgl_target_error=1.0e-6,
-    hgl_max_nodes=200,
+    crossing_max_nodes=500,
     pole_batch_size=4,
     fit_identity=None,
     print_fn=print,
@@ -242,11 +241,10 @@ def compute_sigma_c_mpa_omega_grid(
         None, branches, pole_summaries=summaries,
         regularization_width_ry=regularization_width_ry,
         edge_factor=edge_factor, target_error=target_error,
-        max_rank=max_rank, hgl_target_error=hgl_target_error,
-        hgl_max_nodes=hgl_max_nodes)
+        max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
     physical = execution_census(plan, n_poles, pole_batch_size)
     print_fn(
-        f"  MPA windows: xi={geometry['xi_ry'] * RYD_TO_EV:.4f} eV, "
+        f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
         f"{geometry['n_windows']} logical windows, "
         f"{physical['n_tau']} physical tau dispatches")
     return integrate_sigma_store(

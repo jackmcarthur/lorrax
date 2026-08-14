@@ -17,10 +17,9 @@ import numpy as np
 
 import minimax
 
-from gw.mpa.evaluator import damped_rectangle_rule
-from gw.minimax_screening import MinimaxNodes, solve_phase_minimax_bandwidth
-from gw.ppm_windows import (_SigmaBranch, _SigmaWindow,
-                            crossing_regularization_floor)
+from gw.mpa.evaluator import damped_rectangle_gauss_rule
+from gw.minimax_screening import MinimaxNodes
+from gw.ppm_windows import _SigmaBranch, _SigmaWindow
 
 
 class SharedSigmaWindow(NamedTuple):
@@ -120,20 +119,15 @@ def _rows(Omega_poles, bounds, phase_real):
 def _geometry(branches, regularization_width_ry, edge_factor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
-    xi = max(float(regularization_width_ry),
-             crossing_regularization_floor(omega_max, edge_factor), 1e-12)
-    hgl_edge = omega_max + float(edge_factor) * xi
+    eta = max(float(regularization_width_ry), 1e-12)
+    crossing_edge = omega_max + float(edge_factor) * eta
     selectors = {
-        "narrow": _selector(gamma_hi=xi),
-        "wide": _selector(gamma_lo=xi),
-        "wide_shallow": _selector(a_hi=omega_max, gamma_lo=xi),
-        "wide_deep": _selector(a_hi=_INF, gamma_lo=xi),
-        "narrow_shallow": _selector(a_hi=hgl_edge, gamma_hi=xi),
-        "narrow_deep": _selector(a_hi=_INF, gamma_hi=xi),
+        "all": _selector(),
+        "shallow": _selector(a_hi=crossing_edge),
+        "deep": _selector(),
     }
-    selectors["wide_deep"][0] = omega_max
-    selectors["narrow_deep"][0] = hgl_edge
-    return omega_max, xi, hgl_edge, selectors
+    selectors["deep"][0] = crossing_edge
+    return omega_max, eta, crossing_edge, selectors
 
 
 def summarize_sigma_poles(
@@ -145,7 +139,7 @@ def summarize_sigma_poles(
     pole_offset=0,
 ):
     """Reduce one resident pole batch to the scalar planning evidence."""
-    _omega_max, _xi, _hgl_edge, selectors = _geometry(
+    _omega_max, _eta, _crossing_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
     bad = int(jax.device_get(_unsupported_pole_count(Omega_poles)))
     if bad:
@@ -196,6 +190,14 @@ def _laplace_nodes(rectangles, target_error, max_rank):
             fit)
 
 
+def _apply_external_damping(nodes, eta):
+    """Insert the requested retarded broadening exactly once."""
+    t = jnp.asarray(nodes.t, dtype=jnp.complex128)
+    alpha = (jnp.asarray(nodes.alpha, dtype=jnp.complex128)
+             * jnp.exp(-float(eta) * t))
+    return MinimaxNodes(t=t, alpha=alpha)
+
+
 def _window(name, nodes, mask_A, E_ref_A, omega_sign, project, prefactor,
             max_error, provenance, *, crossing_kind=None):
     return _SigmaWindow(
@@ -205,7 +207,7 @@ def _window(name, nodes, mask_A, E_ref_A, omega_sign, project, prefactor,
         max_error=max_error, provenance=provenance)
 
 
-def _rectangles(rows, E_bounds, omega_max, *, crossing):
+def _rectangles(rows, E_bounds, omega_max, eta, *, crossing):
     rectangles = []
     e_lo, e_hi = E_bounds
     for (_a_lo, _a_hi, g_lo, g_hi), real_phase in rows:
@@ -218,8 +220,8 @@ def _rectangles(rows, E_bounds, omega_max, *, crossing):
                 f"(lower denominator {x_lo:.6g} Ry); route this cell "
                 "through the crossing family instead")
         rectangles.append((x_lo, x_hi,
-                           0.0 if real_phase else g_lo,
-                           0.0 if real_phase else g_hi))
+                           0.0 if real_phase else g_lo + eta,
+                           0.0 if real_phase else g_hi + eta))
     return rectangles
 
 
@@ -231,30 +233,26 @@ def build_shared_sigma_windows(
     edge_factor: float,
     target_error: float = 1.0e-4,
     max_rank: int = 96,
-    hgl_target_error: float = 1.0e-6,
-    hgl_eps_q: float = 1.0e-3,
-    hgl_max_nodes: int = 200,
-    use_shipped_hgl: bool = True,
+    crossing_max_nodes: int = 500,
     pole_summaries=None,
 ):
     """Build the complete MPA frequency plan from actual pole bounds.
 
-    ``Gamma < xi`` uses the accepted real-pole HGL functional only in its
-    crossing core.  Every sign-definite side retains exact fitted ``Gamma``.
-    ``Gamma >= xi`` also retains the complex pole, using a width-certified
-    damped real-time core and rotated-Laplace sides.  One sign-definite
-    dictionary is shared by all widths and poles in a physical class; memory
-    batching is left to the executor.
+    The requested ``regularization_width_ry`` is a literal retarded ``eta``.
+    It is inserted once into every denominator by multiplying each time-node
+    weight by ``exp(-eta*t)``.  Fitted pole widths remain in ``W(t)``.
+
+    One positive real-time rule serves every pole width in the crossing core.
+    The electronic stripe, plasmon slab, and the two inherently sign-definite
+    causal branches use the existing rotated-Laplace minimax service.  Pole
+    batching is solely an executor memory policy and never a spectral split.
     """
     poles = () if Omega_poles is None else tuple(Omega_poles)
     summaries = None if pole_summaries is None else tuple(pole_summaries)
     if not poles and not summaries:
         raise ValueError("MPA Sigma needs at least one pole field")
-    omega_max, xi, hgl_edge, selectors = _geometry(
+    omega_max, eta, crossing_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
-    # Every sign-definite route retains the fitted complex pole.  Replacing
-    # Gamma by zero is the HGL core's explicit approximation, not a property
-    # of every pole below xi.
     if summaries is None:
         selected = {
             name: _rows(poles, bounds, False)
@@ -276,8 +274,7 @@ def build_shared_sigma_windows(
             mask, eb = _a_space(branch, lambda E: np.ones(E.shape, bool))
             if eb is not None:
                 sign_specs.append((branch, [("single", mask, eb, [
-                    ("narrow", selected["narrow"]),
-                    ("wide", selected["wide"]),
+                    ("all", selected["all"]),
                 ])], -1, -neg))
             continue
 
@@ -286,19 +283,13 @@ def build_shared_sigma_windows(
             branch, lambda E: np.ones(E.shape, bool))
         if eb_slab is not None:
             sign_specs.append((branch, [("b_slab", mask_slab, eb_slab, [
-                ("narrow_deep", selected["narrow_deep"]),
-                ("wide_deep", selected["wide_deep"]),
+                ("deep", selected["deep"]),
             ])], +1, +neg))
-        stripe_outputs = []
-        for label, edge, key in (("a_stripe_hgl", hgl_edge,
-                                  "narrow_shallow"),
-                                 ("a_stripe", omega_max, "wide_shallow")):
-            mask, eb = _a_space(branch, lambda E, edge=edge: E > edge)
-            if eb is not None:
-                stripe_outputs.append((label, mask, eb,
-                                       [(key, selected[key])]))
-        if stripe_outputs:
-            sign_specs.append((branch, stripe_outputs, +1, +neg))
+        mask, eb = _a_space(branch, lambda E: E > crossing_edge)
+        if eb is not None:
+            sign_specs.append((branch, [("a_stripe", mask, eb, [
+                ("shallow", selected["shallow"]),
+            ])], +1, +neg))
 
     # Fit each physical sign-definite class once, including both its real-pole
     # and finite-width cells when their A mask is identical.
@@ -313,9 +304,11 @@ def build_shared_sigma_windows(
         rectangles = []
         for stat, real, eb in rows:
             rectangles.extend(_rectangles(
-                [(stat, real)], eb, omega_max, crossing=(sign > 0)))
+                [(stat, real)], eb, omega_max, eta,
+                crossing=(sign > 0)))
         nodes, fit = _laplace_nodes(
             rectangles, target_error, max_rank)
+        nodes = _apply_external_damping(nodes, eta)
         for name, mask_A, eb, components in outputs:
             pole_i, bounds, phases = [], [], []
             for _key, (idx, sel, phase, _stats_rows) in components:
@@ -335,65 +328,50 @@ def build_shared_sigma_windows(
                 np.asarray(phases, bool)))
 
     if crossing_branches:
-        # One finite-width rule serves both causal crossing branches.
-        idx, bounds, phase, stats = selected["wide_shallow"]
-        exact_masks, f_max = [], 0.0
+        # One positive causal rule serves the complete fitted-width interval
+        # and both causal crossing branches.  Each branch remains a distinct
+        # physical G*W contraction because its band space differs.
+        idx, bounds, phase, stats = selected["shallow"]
+        core_masks, f_max = [], 0.0
         if idx.size:
-            gamma_min = min(row[2] for row in stats)
-            a_span = max(row[1] for row in stats) - min(row[0] for row in stats)
+            gamma_min = eta + min(row[2] for row in stats)
+            gamma_max = eta + max(row[3] for row in stats)
+            a_lo = min(row[0] for row in stats)
+            a_hi = max(row[1] for row in stats)
             for branch, neg in crossing_branches:
-                mask, eb = _a_space(branch, lambda E: E <= omega_max)
-                exact_masks.append((branch, neg, mask, eb))
+                mask, eb = _a_space(branch, lambda E: E <= crossing_edge)
+                core_masks.append((branch, neg, mask, eb))
                 if eb is not None:
-                    f_max = max(f_max, omega_max + max(omega_max - eb[0], 0.0)
-                                + a_span)
-            gamma_max = max(row[3] for row in stats)
-            rule = damped_rectangle_rule(
-                gamma_min, gamma_max, f_max, rel_tol=target_error)
-            exact_nodes = MinimaxNodes(
+                    w_lo = float(np.min(branch.omega_abs))
+                    w_hi = float(np.max(branch.omega_abs))
+                    f_max = max(
+                        f_max,
+                        *(abs(w - e - a)
+                          for w in (w_lo, w_hi)
+                          for e in eb
+                          for a in (a_lo, a_hi)))
+            rule = damped_rectangle_gauss_rule(
+                gamma_min, gamma_max, f_max, rel_tol=target_error,
+                max_nodes=crossing_max_nodes)
+            raw_nodes = MinimaxNodes(
                 t=jnp.asarray(rule["t"], dtype=jnp.complex128),
                 alpha=jnp.asarray(-1j * rule["h"], dtype=jnp.complex128))
-            for _branch, neg, mask, eb in exact_masks:
+            exact_nodes = _apply_external_damping(raw_nodes, eta)
+            for _branch, neg, mask, eb in core_masks:
                 if eb is not None:
                     win = _window(
                         "core", exact_nodes, mask, eb[0], +1, "full", -neg,
-                        target_error, f"positive damped crossing rule; "
+                        rule["sampled_max_error"],
+                        "positive global Gauss damped crossing rule; "
+                        f"sampled error {rule['sampled_max_error']:.3e}; "
+                        f"kappa {rule['kappa0']:.6f}; "
                         f"rank {exact_nodes.t.size}")
                     output.append(SharedSigmaWindow(
                         win, _branch.E_A, _branch.omega_abs,
                         _branch.omega_idx, idx, bounds, phase))
 
-        # The near-axis core is the existing HGL service, not an imitation.
-        idx, bounds, _phase, _stats_rows = selected["narrow_shallow"]
-        phase = np.ones(idx.size, dtype=bool)
-        if idx.size:
-            q = solve_phase_minimax_bandwidth(
-                max(2.0 * hgl_edge / xi, 1e-8),
-                target_error=hgl_target_error, max_nodes=hgl_max_nodes,
-                eps_q=hgl_eps_q, target_kind="hgl",
-                use_shipped_tables=use_shipped_hgl)
-            raw = q.to_minimax_nodes(time_axis="crossing_hgl")
-            t = raw.t / xi
-            alpha = raw.alpha / xi
-            # Do not infer the -t arm from a band-space adjoint.  MPA fits
-            # each complex residue element independently, so pole p need not
-            # be adjoint-closed element by element.  Both explicit arms use
-            # the same B_p and form alpha*sin(t*u) algebraically.
-            hgl_nodes = MinimaxNodes(
-                t=jnp.stack((t, -t), axis=-1).reshape(-1),
-                alpha=jnp.stack(
-                    (alpha / (2j), -alpha / (2j)), axis=-1).reshape(-1))
-            for branch, neg in crossing_branches:
-                mask, eb = _a_space(branch, lambda E: E <= hgl_edge)
-                if eb is not None:
-                    win = _window(
-                        "core_hgl", hgl_nodes, mask, eb[0], +1, "full", -neg,
-                        q.max_error, q.provenance, crossing_kind="hgl")
-                    output.append(SharedSigmaWindow(
-                        win, branch.E_A, branch.omega_abs,
-                        branch.omega_idx, idx, bounds, phase))
-
-    return output, {"xi_ry": xi, "omega_max_ry": omega_max,
+    return output, {"eta_ry": eta, "omega_max_ry": omega_max,
+                    "crossing_edge_ry": crossing_edge,
                     "n_windows": len(output),
                     "n_tau": int(sum(row.window.n_tau for row in output))}
 

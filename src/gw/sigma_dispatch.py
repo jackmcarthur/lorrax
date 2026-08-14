@@ -651,6 +651,7 @@ def compute_sigma_xc(
             edge_factor=float(config.sigma.window_edge_factor),
             target_error=float(quadrature.target_error),
             max_rank=int(quadrature.max_nodes),
+            crossing_max_nodes=int(quadrature.crossing_max_nodes),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
         head = mpa_store.read_head_fit(fit_path, to_unit="Ry")

@@ -467,6 +467,115 @@ def damped_rectangle_rule(
     }
 
 
+def damped_rectangle_gauss_rule(
+    gamma_min,
+    gamma_max,
+    freq_max,
+    *,
+    rel_tol=DEFAULT_REL_TOL,
+    max_nodes=500,
+):
+    r"""Smallest sampled-positive global Gauss rule for a damping rectangle.
+
+    This has the same causal integral and positivity certificate as
+    :func:`damped_rectangle_rule`, but selects the order of one global
+    Gauss--Legendre rule by the relative residual
+
+    ``1 - z * sum(h * exp(-z*t))``, ``z = gamma - 1j*x``.
+
+    The residual is analytic inside the rectangle, so its continuum maximum
+    lies on the boundary.  The returned error is nevertheless described as
+    sampled evidence: the four edges are checked densely, not with interval
+    arithmetic.  The panelled rule remains the conservative fallback.
+    """
+    g0, g1 = map(float, (gamma_min, gamma_max))
+    f = float(freq_max)
+    tol = float(rel_tol)
+    cap = int(max_nodes)
+    if not (0.0 < g0 <= g1 < np.inf):
+        raise ValueError(
+            "gamma bounds must satisfy 0 < gamma_min <= gamma_max")
+    if not (0.0 < f < np.inf) or not (0.0 < tol < 1.0):
+        raise ValueError("freq_max must be positive and rel_tol in (0,1)")
+    if cap < 2:
+        raise ValueError("max_nodes must be at least two")
+
+    t_max = np.log(2.0 / tol) / g0
+
+    def _boundary(n_x, n_gamma):
+        x = np.linspace(-f, f, int(n_x))
+        if g1 == g0:
+            gamma = np.asarray([g0])
+        else:
+            gamma = np.geomspace(g0, g1, int(n_gamma))
+        return np.unique(np.r_[
+            g0 - 1j * x, g1 - 1j * x,
+            gamma + 1j * f, gamma - 1j * f,
+        ])
+
+    fit_boundary = _boundary(2049, 513)
+    check_boundary = _boundary(8193, 2049)
+
+    def _rule(order):
+        x, h = np.polynomial.legendre.leggauss(int(order))
+        return 0.5 * t_max * (x + 1.0), 0.5 * t_max * h
+
+    def _score(order, boundary):
+        t, h = _rule(order)
+        worst = 0.0
+        for left in range(0, boundary.size, 2048):
+            z = boundary[left:left + 2048]
+            residual = 1.0 - (
+                z[:, None] * np.exp(-z[:, None] * t[None, :])) @ h
+            worst = max(worst, float(np.max(np.abs(residual))))
+        return worst
+
+    # A global Gauss rule resolves exp(+-i*f*t) once its order is of the
+    # time-bandwidth scale f*t_max/4.  Bracket from that physical floor, then
+    # use a binary search rather than constructing every lower order.
+    lo = max(2, int(np.floor(max(f, g1) * t_max / 4.0)))
+    lo = min(lo, cap)
+    hi = min(cap, max(lo + 1, int(np.ceil(max(f, g1) * t_max / 3.0))))
+    while _score(hi, fit_boundary) > tol and hi < cap:
+        lo = hi
+        hi = min(cap, max(hi + 1, 2 * hi))
+    if _score(hi, fit_boundary) > tol:
+        raise RuntimeError(
+            f"global damped rectangle rule did not reach {tol:g} through "
+            f"max_nodes={cap}")
+    while hi - lo > 1:
+        middle = (lo + hi) // 2
+        if _score(middle, fit_boundary) <= tol:
+            hi = middle
+        else:
+            lo = middle
+
+    order = hi
+    sampled_error = _score(order, check_boundary)
+    while sampled_error > tol and order < cap:
+        order += 1
+        sampled_error = _score(order, check_boundary)
+    if sampled_error > tol:
+        raise RuntimeError(
+            f"global damped rectangle held-out residual {sampled_error:.6g} "
+            f"exceeds {tol:g} through max_nodes={cap}")
+    t, h = _rule(order)
+    return {
+        "t": t.astype(np.float64),
+        "h": h.astype(np.float64),
+        "n_nodes": int(order),
+        "n_panels": 1,
+        "orders": (int(order),),
+        "t_max": float(t_max),
+        "gamma_min": g0,
+        "gamma_max": g1,
+        "freq_max": f,
+        "rel_tol": tol,
+        "sampled_max_error": float(sampled_error),
+        "kappa0": float(g0 * np.sum(h * np.exp(-g0 * t))),
+    }
+
+
 def damped_line_projection(rule, z):
     """The per-point scalar weights ``w_l(z) = -2 h_l e^{i z t_l}``.
 

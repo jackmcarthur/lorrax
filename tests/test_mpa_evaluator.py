@@ -92,6 +92,26 @@ def test_damped_rectangle_rule_covers_every_declared_width():
     assert np.max(np.abs(1.0 - d * got)) < 1.0e-5
 
 
+def test_global_gauss_rectangle_rule_is_smaller_and_stable():
+    panelled = evaluator.damped_rectangle_rule(
+        0.2, 1.1, 4.0, rel_tol=1.0e-4)
+    rule = evaluator.damped_rectangle_gauss_rule(
+        0.2, 1.1, 4.0, rel_tol=1.0e-4)
+    u = np.linspace(-4.0, 4.0, 2049)
+    gamma = np.geomspace(0.2, 1.1, 257)
+    boundary = np.unique(np.r_[
+        0.2 - 1j * u, 1.1 - 1j * u,
+        gamma - 4.0j, gamma + 4.0j,
+    ])
+    residual = 1.0 - (
+        boundary[:, None]
+        * np.exp(-boundary[:, None] * rule["t"][None, :])) @ rule["h"]
+    assert np.max(np.abs(residual)) <= 1.0e-4
+    assert rule["n_nodes"] < panelled["n_nodes"]
+    assert np.all(rule["h"] > 0.0)
+    assert 0.99 < rule["kappa0"] <= 1.0
+
+
 # ---------------------------------------------------------------------------
 # 1. The kernel
 # ---------------------------------------------------------------------------
