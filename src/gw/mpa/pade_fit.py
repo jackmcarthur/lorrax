@@ -1,9 +1,7 @@
 """The MPA-W fit kernel: 2*n_p complex samples of W_c -> n_p complex poles.
 
-STAGING LOCATION; the minimax-service design decides the final home.
-Landed ahead of that design review because the method is settled by
-``~/MPA_THEORY_PLAN.md`` section B ("The fit stage").  Placement under
-``src/gw/mpa`` is a parking spot, not a ruling.
+The model, Loewner default, certification boundary, and downstream use are
+owned by ``docs/theory/THEORY_mpa_implementation.md``.
 
 The model
 ---------
@@ -24,7 +22,7 @@ the time-domain consumer reads ``W(tau) = sum_p B_p exp(-i Omega_p tau)``
 
 Sources
 -------
-* ``~/MPA_THEORY_PLAN.md`` section B -- the binding LORRAX spec: fit
+* ``docs/theory/THEORY_mpa_implementation.md`` -- the binding LORRAX spec: fit
   ``W_c`` directly, normalised Pade-in-z^2 linear solve with z_max
   scaling, companion-matrix roots, all-2*n_p-point complex least-squares
   residues, the published guards, mandatory residue refit after any

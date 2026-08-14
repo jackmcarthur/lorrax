@@ -1,139 +1,36 @@
-"""The complex-frequency W evaluator: the MPA fallback correctness path.
+"""Complex-frequency chi kernels and positive causal quadrature rules.
 
-STAGING LOCATION; the minimax-service design decides the final home.
-Landed ahead of that review because the method is settled by
-``~/MPA_THEORY_PLAN.md`` section B ("Evaluation") and because the fit
-kernel that consumes it is already here.
+The current mathematical contract and the distinction between the chi line
+rule and the MPA Sigma crossing rule are owned by
+``docs/theory/THEORY_mpa_implementation.md``.
 
-THE KERNEL, AND WHY IT IS ONE KERNEL
-------------------------------------
-Theory-plan section B fixes the exact kernel of the damped-tau sweep::
+For ``z = omega + i*varpi`` in the upper half-plane, the chi transition
+kernel is
 
-    K_z(Delta) = -2 * integral_0^inf dt e^{-varpi t} e^{i omega t}
-                                        sin(Delta t)
+``K_z(Delta) = -2 integral_0^inf exp(i*z*t) sin(Delta*t) dt``
 
-Write ``z = omega + i*varpi`` and the damping and the phase are one
-factor, ``e^{-varpi t} e^{i omega t} = e^{i z t}``, which is the form
-this module uses everywhere::
+and its exact scalar oracle is
 
-    K_z(Delta) = -2 * integral_0^inf dt e^{i z t} sin(Delta t)
+``K_z(Delta) = -2*Delta/(Delta**2-z**2)``.
 
-CLOSED FORM.  For ``Im z > 0`` the integral converges absolutely and
-is elementary.  Using ``sin(Delta t) = (e^{i Delta t} - e^{-i Delta
-t}) / 2i`` and ``integral_0^inf e^{i s t} dt = i/s`` for ``Im s > 0``::
+Production cannot use the divide because one time node stands for the
+separable occupied- and empty-band Green-function contractions.  The closed
+form is retained only to test that the quadrature evaluates the right kernel.
 
-    integral_0^inf e^{i z t} sin(Delta t) dt
-        = (1/2i) [ i/(z+Delta) - i/(z-Delta) ]
-        = (1/2) [ 1/(z+Delta) - 1/(z-Delta) ]
-        = Delta / (Delta**2 - z**2)
+``damped_line_rule`` serves a horizontal chi sampling line.  It truncates the
+positive real-time integral, partitions it into wavelength-sized panels, and
+grades a positive Gauss-Legendre order by the local exponential envelope.
+Every sample on the line shares the nodes and positive weights; only its
+scalar phase differs.  Positivity bounds the amplification independently of
+the number of panels.
 
-so::
-
-    K_z(Delta) = -2 * Delta / (Delta**2 - z**2)
-               = 1/(z - Delta) - 1/(z + Delta)
-
-which is the resonant-plus-antiresonant spectral kernel of chi0 at
-complex ``z``, i.e. exactly the object the whole pipeline has always
-been evaluating -- at ``z = 0``, at ``z = i*varpi``, at ``z = omega``.
-``gw.mpa.sample_plan`` records that identity as the 2x2 table; this
-module is the machine for the one cell nothing else evaluates.
-
-BOTH PATHS ARE KEPT, ON PURPOSE
--------------------------------
-``damped_kernel`` is the closed form and ``damped_line_rule`` +
-``evaluate_damped_points`` are the quadrature.  They are not
-alternatives:
-
-* the closed form is the UNIT-TEST ORACLE.  It is exact to rounding
-  and it costs one divide, so every claim about the quadrature is
-  checked against it rather than against a converged version of
-  itself;
-* the quadrature is what GENERALISES.  In production the per-node
-  quantity is not ``sum_j g_j sin(Delta_j t_l)`` computed from a
-  materialised spectrum -- it is a chi0 build at time node ``t_l``, and
-  no closed form exists for it.  The quadrature path is the one whose
-  internals become that build (see ``evaluate_samples``' ``sweep_fn``
-  seam); the closed form can only ever be a test.
-
-THE RULE: POSITIVE COMPOSITE GAUSS-LEGENDRE
--------------------------------------------
-Theory-plan section B, "The rule formulation campaign", is explicit
-that the certified bounded-amplification global rule is OFFLINE
-campaign work, and that "positive composite quadrature is the
-stability oracle and fallback -- a pilot measured it at roughly 4-5*A
-nodes (about 400/500/800 at A = 80/120/200), stable but not cheap".
-This module builds that fallback and nothing beyond it: it is
-admissible today, without the certificate, because positivity is what
-bounds the amplification.
-
-WHY POSITIVITY IS THE WHOLE POINT.  The projection weights are
-``w_l(z) = -2 h_l e^{i z t_l}`` with ``h_l > 0``, so
-
-    sum_l |w_l(z)| = 2 sum_l h_l e^{-varpi t_l}
-                   <= 2 integral_0^inf e^{-varpi t} dt = 2/varpi
-
-for every ``omega`` on the line, with the bound INDEPENDENT of the node
-count.  ``2/varpi`` is the exact ``L1`` mass of the continuous kernel
-weight, so the amplification ratio ``kappa0`` reported by
-``damped_line_rule`` is at most 1 and approaches it from below.  A
-signed rule buys nodes with cancellation and gives that up; this is
-why the campaign's target is *bounded-total-variation* minimax and why
-the oracle is *positive* composite quadrature.
-
-PANELS, NOT A GLOBAL RULE -- the documented choice.  The integrand
-``e^{i z t} sin(Delta t)`` is an analytic oscillation under an
-exponential envelope: the oscillation does not slow down as ``t``
-grows but the envelope kills it.  So the rule is built as
-
-* a TRUNCATION at ``t_max`` set by the envelope, and
-* uniform PANELS across ``[0, t_max]`` whose width is a fixed number
-  of wavelengths of the fastest component, each carrying its own
-  Gauss-Legendre rule whose ORDER IS GRADED by the local envelope --
-  early panels are resolved to the full tolerance, late panels only to
-  the tolerance their amplitude can still violate.
-
-A single global Gauss-Legendre rule was rejected because its order
-would have to resolve the fastest oscillation over the whole
-``[0, t_max]`` at the accuracy the FIRST panel needs, which is the
-grading this rule spends its cheapness on; a double-exponential rule
-was rejected because it is a rule for endpoint singularities, which
-this integrand does not have.  Both rejections are node-count
-arguments, and the node-count table in ``tests/test_mpa_evaluator.py``
-is what backs them.
-
-THE NODE COUNT, MEASURED (``tests/test_mpa_evaluator.py``, the
-convergence table).  With ``A = freq_max / varpi`` the dimensionless
-bandwidth and ``rel_tol`` the requested error relative to the kernel's
-own ``1/varpi`` scale::
-
-    rel_tol     A=20        A=80        A=200
-    1e-6        110 (5.5A)  414 (5.2A)  1017 (5.1A)
-    1e-8        150 (7.5A)  569 (7.1A)  1401 (7.0A)
-    1e-10       193 (9.7A)  724 (9.1A)  1797 (9.0A)
-    1e-12       238 (11.9A) 895 (11.2A) 2213 (11.1A)
-
-and the measured worst error comes out at 0.51 to 0.69 of the
-requested budget ``rel_tol/varpi`` at every one of the twelve entries
--- the rule delivers what it asks for, slightly better, uniformly in
-``A``.  Two things to read off it.  The ``1e-6`` row IS the plan's
-pilot -- 414 nodes at A=80 against its "about 400" -- so the "4-5*A"
-figure is the rule at a 1e-6 tolerance, not the rule as such.  And
-``N/A`` grows like ``ln(1/rel_tol)/4``, which is the Gauss-Legendre
-resolution floor ``t_max * freq_max / 4`` with ``t_max`` set by the
-envelope: the tolerance buys time range, and the time range buys
-oscillations that have to be resolved.  ``DEFAULT_REL_TOL`` is 1e-8,
-the middle of the table -- two decades tighter than the pilot's tier
-for 1.4x its nodes.
-
-WHAT THIS MODULE IS NOT.  It is not line-batched in the physical
-sense.  ``evaluate_samples`` will share ONE rule and ONE sweep across a
-line when asked (``batching='per-line'``), which is the arithmetic of
-theory-plan section B's "common damping and common nodes per line,
-scalar per-point projections"; but the sweep it shares is a spectrum
-sum, not a chi0 build. The default is ``'per-point'``, which is the
-plan's named correctness fallback -- "independent per-point sweeps are
-the correctness fallback" -- and the two agree to the rule's tolerance,
-which is a test.
+``damped_rectangle_positive_rule`` serves the MPA Sigma crossing core.  It
+searches positive global Gauss-Legendre rules over the complete damping
+rectangle, validates on a disjoint boundary grid, records a derivative-based
+continuum cover, and compares against an independently panelled fallback.
+Large ``gamma_max`` is treated as a short-time boundary layer, not an
+oscillation frequency.  The two rules share a causal integral and positivity
+argument, but they solve different domains and are not interchangeable.
 """
 
 import numpy as np
@@ -194,7 +91,7 @@ def _require_x64():
 def damped_kernel(z, delta):
     """``K_z(Delta) = -2 Delta / (Delta**2 - z**2)``.  Host-side numpy.
 
-    The exact value of theory-plan section B's damped-tau integral; see
+    The exact value of the authoritative MPA chapter's damped-tau integral; see
     the module docstring for the derivation.  Broadcasts ``z`` against
     ``delta``: pass ``z`` with a trailing axis of ones to get the full
     ``(n_z, n_delta)`` table.

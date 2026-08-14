@@ -1,10 +1,8 @@
 """Diagnostics for the MPA-W fit.
 
-STAGING LOCATION; the minimax-service design decides the final home.
-
-Why this module exists at all: the theory plan (``~/MPA_THEORY_PLAN.md``
-section B, "Fit algebra") is explicit that the papers' fit statistics do
-NOT transfer to LORRAX.  Their representability numbers -- the mean count
+The authoritative fit contract is
+``docs/theory/THEORY_mpa_implementation.md``.  The papers' fit statistics do
+not transfer directly to LORRAX.  Their representability numbers -- the mean count
 of corrected matrix elements and the relative standard deviation of the
 extrapolated response, defined in the metals paper's supplemental section
 III -- are plane-wave statistics collected in an orthonormal basis.  The

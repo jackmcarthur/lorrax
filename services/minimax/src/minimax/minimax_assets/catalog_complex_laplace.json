@@ -15,7 +15,7 @@
     "beta": "|requested - entry beta| <= entry beta_tolerance, a MEASURED two-sided band and not a rounding rule. The target is a different function at every beta, so no direction is conservative; but d/dbeta of the target has modulus 1/(1 + beta^2) at the hard end of the interval, so an entry absorbs a mismatch of about error_bound*(1 + beta^2) -- 2.6e-4 at beta = 16 and the 1e-6 tier. Entries whose beta_axis is 'exact_phase_on_fixed_nodes' additionally serve the whole band [beta_min, beta] exactly, because there beta enters only as a unit-modulus phase on nodes chosen without reference to it."
   },
   "shipping_rule": {
-    "source": "MPA_THEORY_PLAN.md section E",
+    "source": "docs/theory/THEORY_mpa_implementation.md",
     "kappa0_definition": "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
     "kappa0_reference": "the pure-damping envelope integral 1/u, which is the same normalisation gw.mpa.evaluator.damped_line_rule uses for the strip; every certified shipped noncrossing table measures between 1.0000 and 1.0215 under it.",
     "normal": 2.0,

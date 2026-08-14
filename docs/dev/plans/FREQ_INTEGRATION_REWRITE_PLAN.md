@@ -1,5 +1,13 @@
 # Frequency Integration Engine: Design & Implementation Guide
 
+> **Historical design plan, not current architecture.** This document records
+> the original real-pole GL/HGL rewrite. It does not describe the MPA planner
+> added in August 2026. For current MPA equations, window selectors, node
+> construction, scaling, I/O, and controls, use
+> `docs/theory/THEORY_mpa_implementation.md`. For the still-live GN-PPM
+> real-pole quadratures, use `docs/theory/minimax-quadrature.md` and the GN-PPM
+> section of `docs/theory/physics.md`.
+
 Status: Implementation blueprint
 Audience: developers and agents working on the GW/CTSP codebase
 

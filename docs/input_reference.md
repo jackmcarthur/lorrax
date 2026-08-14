@@ -82,8 +82,8 @@ page has to read it from.
 | `whead_0freq` | None | Override the static W head; None = computed. |
 | `whead_imfreq` | None | Override the imaginary-frequency W head (GN probe); None = computed. |
 | `screening_method` | `"minimax"` | chi0 frequency treatment. `minimax` is the ONLY supported value and any other REFUSES at config construction. The legacy spelling `ctsp` was accepted until 2026-08-06 and silently ran minimax, so replacing it with `minimax` (or deleting the key) changes no result. |
-| `minimax_target_error` | `1e-06` | Target uniform error of the minimax time/frequency quadrature. |
-| `minimax_max_nodes` | `64` | Node-count cap for the minimax quadrature solver. |
+| `minimax_target_error` | `1e-06` | Target scalar error of the chi0 time/frequency quadrature. MPA applies it to the static, imaginary-axis, and damped-line sample evaluators; keep this tighter than the Sigma budgets because the pole fit can amplify sample noise. |
+| `minimax_max_nodes` | `64` | Node cap for interval minimax solves and per-panel Gauss-order cap for an MPA damped line. It is not a cap on the total nodes across all damped-line panels. |
 | `regenerate_minimax_tables` | false | Force re-solving the minimax tables instead of reusing cached ones. |
 | `minimax_energy_reference` | `"midgap"` | Energy reference for the minimax transition range (midgap default). |
 | `mpa_n_poles` | `8` | Number of MPA poles and therefore the number of points on each double-parallel sampling line (`2*mpa_n_poles` samples total). |
@@ -91,6 +91,8 @@ page has to read it from.
 | `mpa_sampling_alpha` | `1` | Real-coordinate exponent for the nested partition, `omega_n = omega_m*s_n^alpha`; supported values are 1 and 2. |
 | `mpa_varpi_near_ry` | `0.2` | Height in Ry of the near complex-frequency sampling line. |
 | `mpa_varpi_far_ry` | `2.0` | Height in Ry of the far complex-frequency sampling line; must exceed `mpa_varpi_near_ry`. |
+| `mpa_head_model` | `"fixed_dft"` | MPA q→0 head policy. Only `fixed_dft` is accepted: fit and reuse the established two-point DFT scalar head while the body is rebuilt. This omits dynamic local-field head/wing feedback. |
+| `mpa_pole_batch_size` | `4` | Maximum fitted-pole slabs resident during MPA Sigma. Values 1–4 are accepted. This is an HBM schedule, not a spectral grouping. |
 | `ppm_model` | `"gn"` | Plasmon-pole ansatz: gn (Godby-Needs, imaginary probe) | hl (Hybertsen-Louie, real probe). |
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |
@@ -102,22 +104,22 @@ page has to read it from.
 
 | key | default | meaning |
 |---|---|---|
-| `compute_mode` | `"auto"` | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto never infers mpa. mpa parses and REFUSES TO RUN until its dynamic q→0 head and common output/QSGW finalizer land; scalar fit/window/kernel internals do not weaken that refusal. See [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
+| `compute_mode` | `"auto"` | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto never infers mpa. mpa parses and REFUSES TO RUN until one real-material chi/W/fixed-head/Sigma/QSGW disk calculation passes end to end. Its internal components do not weaken that refusal. See [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
 | `no_degen_averaging` | false | Disable BGW-style averaging of diagonal Sigma within degenerate sets. |
 | `degen_avg_tol_ry` | `1e-06` | Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry). |
 | `ppm_sigma_target_error` | `1e-06` | Target error of the PPM Sigma^c tau-quadrature. |
 | `ppm_sigma_max_nodes` | `64` | Node-count cap for the PPM Sigma^c quadrature. |
-| `mpa_sigma_sector_target_error` | `6.5e-4` | Relative-residual bound `|1-d Q(d)|` for sign-definite MPA Sigma windows. |
-| `mpa_sigma_crossing_target_error` | `2e-3` | Relative-residual bound `|1-d Q(d)|` for the positive damped MPA crossing rule. |
+| `mpa_sigma_sector_target_error` | `6.5e-4` | Sampled relative-residual target `|1-d Q(d)|` for sign-definite complex-sector MPA windows. Nearby values need not give nested supports, so converge the emitted plan at the QP level. |
+| `mpa_sigma_crossing_target_error` | `2e-3` | Relative-residual target `|1-d Q(d)|` for the positive causal Gauss rule on the MPA crossing rectangle. It is the same metric as the sector target but has a separately validated observable budget. |
 | `mpa_sigma_max_nodes` | `96` | Maximum rank of one sign-definite MPA Sigma rule; the positive crossing fallback retains its 500-node safety ceiling. |
 | `sigma_omega_min_ev` | `-5.0` | Sigma(omega) grid lower edge (eV, relative to E_DFT). |
 | `sigma_omega_max_ev` | `5.0` | Sigma(omega) grid upper edge (eV). |
 | `sigma_omega_step_ev` | `0.25` | Sigma(omega) grid step (eV). |
-| `sigma_regularization_ev` | `0.25` | Lorentzian regularization of the Sigma(omega) evaluation (eV). |
-| `sigma_window_edge_factor` | `1.5` | Widens the minimax window past the sigma omega-grid edges (T = omega_max + factor*xi). |
+| `sigma_regularization_ev` | `0.25` | Retarded broadening of Sigma(omega) in eV. In MPA this is a literal external `eta`, applied once in addition to each fitted pole width; it is not a pole-fit width or an HGL scale. Must be finite and positive. |
+| `sigma_window_edge_factor` | `1.5` | MPA core/sector partition margin in `T = max(abs(omega_min),abs(omega_max)) + factor*eta`. It moves work between exact quadrature families and does not add a second broadening. |
 | `sigma_omega_batch_size` | `4` | Omega points evaluated per batch in the Sigma^c(omega) loop. |
 | `sigma_omega_accumulation` | `"auto"` | How per-branch Sigma(omega) contributions are accumulated (auto = pick by size). |
-| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). |
+| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
 | `sigma_at_dft_energies` | false | DEPRECATED alias for qp_solver = one_shot_dft (now the default). |
 | `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |

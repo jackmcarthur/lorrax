@@ -128,7 +128,7 @@ TARGETS: Mapping[str, TargetSpec] = MappingProxyType({
     "damped_line": TargetSpec(
         name="damped_line",
         definition=("K_z(Delta) = -2 int_0^inf dt e^{-varpi t} e^{i omega t} "
-                    "sin(Delta t)  (MPA_THEORY_PLAN section B)"),
+                    "sin(Delta t)  (THEORY_mpa_implementation.md)"),
         version=1,
         domain="strip"),
 })

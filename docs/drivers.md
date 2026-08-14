@@ -157,7 +157,7 @@ P-scaling at P=16 (b300 deck, 2979c/300b): the ζ charge factor executes q-paral
 | key (deck unless noted) | default | meaning |
 |---|---|---|
 | `nband` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ band-sum top / interior valence edge / σ conduction count; σ diagonals for [0, nelec+ncond) |
-| `compute_mode` | auto | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`; auto never infers `mpa`. `mpa` is declared but REFUSES AT DRIVER ENTRY until its dynamic head and common output/QSGW finalizer land — see [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
+| `compute_mode` | auto | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`; auto never infers `mpa`. `mpa` is declared but REFUSES AT DRIVER ENTRY until one real-material chi/W/fixed-head/Sigma/QSGW disk calculation passes end to end — see [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
 | `qp_solver` | auto→one_shot_dft | `one_shot_dft` (G0W0 at E_DFT) \| `fixed_point` (on-shell solve) \| `self_consistent` (QSGW loop) |
 | `restart` | true | reuse `tmp/isdf_tensors_{n_rmu}.h5` (skip ζ-fit/V_q); stamp contract below |
 | `ppm_probe_chi_reuse` | off | opt-in `auto`: probe χ₀ folds into ONE fused τ sweep on static+k augmented nodes; pays only where per-node χ cost dominates (nets +1.2 s at b300 — planner cost; job 7885109) |

@@ -1,8 +1,16 @@
 # Frequency Integration Rewrite Progress
 
+> **Superseded implementation record.** This file describes the original
+> real-pole GL/HGL rewrite and is not a specification for MPA. Current MPA
+> sampling, complex-pole fitting, literal-eta core/stripe/slab partition, and
+> positive causal crossing rule are owned by
+> `docs/theory/THEORY_mpa_implementation.md`. Current GN-PPM HGL theory is
+> owned by `docs/theory/minimax-quadrature.md`. Do not implement from the
+> checklist below.
+
 Status: Stages 1-3 completed for chi path
 Owner: Codex
-Related plan: `docs/FREQ_INTEGRATION_REWRITE_PLAN.md`
+Related historical plan: `docs/dev/plans/FREQ_INTEGRATION_REWRITE_PLAN.md`
 
 ## Scope
 Track implementation progress for the separate frequency-integration pipeline under `src/gw/freqint/` while keeping legacy dynamic integration available for parity checks.

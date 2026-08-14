@@ -36,8 +36,9 @@ def test_actual_windows_match_all_four_causal_denominators():
 
     The spatial contraction is deliberately factored out: its scalar input
     is the real production ``build_shared_w_tau`` result.  The residues are
-    non-Hermitian so the near-axis result can only pass through the explicit
-    +t/-t construction; an inferred band adjoint gives a different answer.
+    non-Hermitian so a residue-adjoint shortcut would give a different answer.
+    The causal core must retain the same stored residue in its scalar time
+    representation.
     """
     energy = 0.1
     omega = 0.45

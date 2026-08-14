@@ -1,16 +1,16 @@
 """Double-parallel sample grid for the MPA-W fit stage.
 
-STAGING LOCATION; the minimax-service design decides the final home.
-This module is infrastructure landed ahead of that design review because
-the method itself is settled by ``~/MPA_THEORY_PLAN.md`` section B.
+This module owns sampling geometry only.  The executable quadratures, fit,
+and Sigma windows are described in
+``docs/theory/THEORY_mpa_implementation.md``.
 
 Sources
 -------
 The protocol implemented here is the published double-parallel sampling
-of the multipole-W papers, as adopted verbatim by the theory plan:
+of the multipole-W papers:
 
-* ``~/MPA_THEORY_PLAN.md`` section B, "Sampling geometry" and
-  "Pole schedules" -- the binding LORRAX spec.
+* ``docs/theory/THEORY_mpa_implementation.md`` -- the binding LORRAX
+  interpretation and its production validity boundary.
 * Leon, Ferretti, Varsano, Molinari, Cardoso, *Efficient full frequency
   GW for metals using a multipole approach for the dielectric
   screening*, Phys. Rev. B **107**, 155130 (2023).  Markdown copy in
@@ -76,7 +76,7 @@ PUBLISHED_PARTITION_FRACTIONS = {
         Fraction(1, 2), Fraction(3, 4), Fraction(1)),
 }
 
-# Pole schedules from the theory plan section B, kept as documentation
+# Published/reported pole schedules, kept as documentation
 # for callers; nothing in this module reads them.
 POLE_SCHEDULE = {
     "Si": 8, "hBN": 10, "TiO2": 10, "Al": 8, "Na": 8, "Cu": 12,

@@ -59,4 +59,8 @@ For implementation details, see `src/gw/gw_jax.py` and `src/gw/w_isdf.py`.
 
 Self-consistent updates iterate the V_Hartree and Sigma_GW contributions until the quasiparticle Hamiltonian is stationary. The DFT Hamiltonian is K (kinetic) + I (ionic local + nonlocal) + H (Hartree) + Vxc; `gw.kin_ion_io` writes the K+I elements (and, by default, the exact V_H) to file so the run can rebuild V_Hartree + Sigma_GW itself, and `psp.get_dipole_mtxels` supplies the dipole matrix elements for the q→0 head correction to W.
 
-QSGW (`qp_solver = self_consistent`, `gw_config.QPSolver`) is wired for all compute modes via the mode-agnostic sigma dispatch and verified end-to-end; the loop knobs (`sc_max_iter`, `sc_tol_ev`, rCROP/linear acceleration) are deck keys. See manual §4.5 for the solver family.
+QSGW (`qp_solver = self_consistent`, `gw_config.QPSolver`) uses the
+mode-agnostic Sigma dispatch for enabled dynamic modes. MPA remains declared
+but refused until its real-material disk pipeline passes end to end; see
+[Multipole frequency integration](THEORY_mpa_implementation.md). The loop
+knobs (`sc_max_iter`, `sc_tol_ev`, rCROP/linear acceleration) are deck keys.

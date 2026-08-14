@@ -8,6 +8,17 @@ Runtime reuse layer: `src/gw/minimax_screening.py`
 
 ---
 
+!!! note "Scope: real-pole GN-PPM and CTSP families"
+
+    The GL, HGL, and learned real-axis crossing rules on this page describe
+    the real-pole GN-PPM/CTSP lineage and the reusable scalar minimax service.
+    They are not the current MPA Sigma algorithm. MPA poles have fitted complex
+    widths and use a literal external eta, a positive causal Gauss rule for the
+    crossing core, and complex-sector minimax rules elsewhere. See
+    [Multipole frequency integration](THEORY_mpa_implementation.md). HGL remains
+    documented here because GN-PPM still consumes it; its absence from MPA is
+    intentional.
+
 ## Quick Reference
 
 | Quantity | Formula |

@@ -721,8 +721,11 @@ Implementation: `compute_sigma_c_ppm_omega_grid` in `gw/ppm_sigma.py`. Output wr
 
 MPA replaces the two-point pole fit by complex-frequency chi0 samples, an
 elementwise multipole fit of W, and geometry-dependent shared Sigma windows.
-Its equations, exact validity domains, SlabIO boundaries and current dynamic-
-head/QSGW refusal are owned by
+Unlike the GN-PPM method in §6.9, current MPA does not use an HGL near-axis
+window: fitted pole widths plus one literal retarded eta make the crossing
+core an absolutely convergent positive causal integral.
+Its equations, exact validity domains, SlabIO boundaries, fixed-head
+approximation, and public enablement boundary are owned by
 [Multipole frequency integration](THEORY_mpa_implementation.md); they are not
 restated here.
 

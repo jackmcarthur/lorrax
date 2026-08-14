@@ -1,18 +1,13 @@
-"""Frequency-resolved W restart tensors, and the staged B/Ω fit store.
+"""Frequency-resolved W restart tensors and the B/Omega fit store.
 
-STAGING LOCATION.  This module is deliberately dependency-light and
-MOVABLE.  It lives in ``src/file_io/`` because that is where the restart
-format layer lives today, but the multipole-W work is a staging area:
-when the MPA stage settles, both this module and ``gw/mpa/tiling.py``
-are expected to move as a pair (most likely into a ``mpa`` service
-alongside ``symmetry_maps``).  Nothing here imports from ``gw``, and the
-``symmetry_maps`` DOOR — not its submodules — is imported LAZILY through
-:func:`_qs`, so the move costs an import line rather than a redesign and
-importing ``file_io`` still costs no jax.
+This module owns MPA sample and pole bytes.  It remains dependency-light:
+nothing here imports from ``gw``, and the ``symmetry_maps`` door is imported
+lazily through :func:`_qs`, so importing ``file_io`` still costs no jax.
 
 WHAT THIS FORMAT IS.  The multipole-W fit needs W_c evaluated on the
-double-parallel sampling grid — ~2·n_p complex frequencies on two lines
-ϖ₁ and ϖ₂ (MPA_THEORY_PLAN §B) — before it can fit anything, and the
+double-parallel sampling grid — 2·n_p complex frequencies on two lines
+ϖ₁ and ϖ₂ (``docs/theory/THEORY_mpa_implementation.md``) — before it can
+fit anything, and the
 owner's memory constraint is exact: a SMALL NUMBER of W_q(μ,ν) copies
 fit in memory at once, but NOT all ω_i.  So every frequency goes to the
 restart file, with the frequency axis LEADING::
@@ -1694,7 +1689,7 @@ def allocate_fit_store(
     ----------
     n_p
         Poles per element.  Si is 8 (scan 6–12), hBN and TiO₂ 10–11, Al
-        and Na 8, Cu 12 (MPA_THEORY_PLAN §B).
+        and Na 8, Cu 12 (see the authoritative MPA theory chapter).
     grid_hash, table_hash, centroid_hash
         The W(ω) file's stamps, carried here so the Σ stage can assert
         that these poles came from that screening on that centroid set.
@@ -2185,7 +2180,7 @@ def _canonical_diagnostics(diag_block, n_rows, n_cols):
     """The per-block fit diagnostics, validated and float64.
 
     Condition number and backward error are the two the Σ stage's
-    certification is stated in (MPA_THEORY_PLAN §B: "condition numbers
+    certification is stated in the MPA theory chapter: "condition numbers
     and backward error, diagonal/off-diagonal and norm-resolved
     distributions"), so they are REQUIRED and everything else is extra.
     """
