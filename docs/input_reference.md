@@ -82,6 +82,7 @@ page has to read it from.
 | `whead_0freq` | None | Override the static W head; None = computed. |
 | `whead_imfreq` | None | Override the imaginary-frequency W head (GN probe); None = computed. |
 | `screening_method` | `"minimax"` | chi0 frequency treatment. `minimax` is the ONLY supported value and any other REFUSES at config construction. The legacy spelling `ctsp` was accepted until 2026-08-06 and silently ran minimax, so replacing it with `minimax` (or deleting the key) changes no result. |
+| `occ_broadening` | `0.0` | First-order Methfessel-Paxton occupation broadening in eV, using BerkeleyGW's convention `z=(E-E_F)/(2*occ_broadening)`. Zero preserves step occupations. Initially consumed only by the per-iteration parallel-transport QSGW head; Green's functions and the finite-q screening body remain unchanged until their metallic formulations land. |
 | `minimax_target_error` | `1e-06` | Target uniform error of the minimax time/frequency quadrature. |
 | `minimax_max_nodes` | `64` | Node-count cap for the minimax quadrature solver. |
 | `regenerate_minimax_tables` | false | Force re-solving the minimax tables instead of reusing cached ones. |

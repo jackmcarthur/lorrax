@@ -1302,6 +1302,12 @@ _DEFAULTS = {
     "whead_imfreq": None,
     # Screening / minimax
     "screening_method": "minimax",
+    # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
+    # Zero preserves the historical step-occupation path.  The first
+    # consumer is the per-iteration QSGW parallel-transport head; the same
+    # key is intentionally reserved for later Green-function/screening
+    # consumers so there is one occupation convention for the whole code.
+    "occ_broadening": 0.0,
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
     "regenerate_minimax_tables": False,
@@ -1888,12 +1894,15 @@ class ScreeningConfig:
     normalised, and ran minimax without a word.
     """
     method: str                   # "minimax" -- the only supported value
+    occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
 
     def __post_init__(self):
+        if self.occ_broadening_ev < 0.0:
+            raise ValueError("occ_broadening must be >= 0 eV.")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from
         # the pre-minimax era) was accepted here for months and always ran
@@ -2484,6 +2493,7 @@ class LorraxConfig:
         )
         screening = ScreeningConfig(
             method=str(_g("screening_method")).strip().lower(),
+            occ_broadening_ev=float(_g("occ_broadening")),
             minimax_target_error=float(_g("minimax_target_error")),
             minimax_max_nodes=int(_g("minimax_max_nodes")),
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),

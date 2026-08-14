@@ -616,8 +616,8 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _s_tensor_kernel(mesh: Mesh, *, nocc: int, nb_logical: int) -> Callable:
-    key = ("head_s", id(mesh), int(nocc), int(nb_logical))
+def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    key = ("head_s", id(mesh), int(nb_logical))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -630,7 +630,12 @@ def _s_tensor_kernel(mesh: Mesh, *, nocc: int, nb_logical: int) -> Callable:
         dE = e_bra[:, :, None] - e_ket[:, None, :]
         f_diff = f_ket[:, None, :] - f_bra[:, :, None]
         logical = ((ix[:, None] < nb_logical) & (iy[None, :] < nb_logical))[None, :, :]
-        transition = logical & (f_diff > 0.0) & (dE > 0.0)
+        # Sum every energy-ordered band pair.  f_diff is SIGNED: MP1 is
+        # not globally monotone and may overshoot slightly outside [0, 1],
+        # so filtering on f_v-f_c>0 would not implement the Adler-Wiser
+        # occupation difference.  The historical 0/1 path is unchanged
+        # because its energy-ordered nonzero differences are positive.
+        transition = logical & (dE > 0.0)
 
         def _one(omega):
             z = omega + 1j * eta
@@ -685,6 +690,10 @@ def head_s_tensor_sharded(
 ):
     """Build S(omega) from a 2-D band-tiled current QSGW velocity.
 
+    The contraction runs over every pair in ``[0, nb_logical)`` and uses
+    the signed factor ``f_nk - f_mk``.  ``nocc`` is only an electron-count
+    sanity bound; it never partitions the band sum.
+
     Energies and occupations are passed twice with complementary one-axis
     shardings.  Each rank forms only its local conduction-by-valence tile;
     a two-axis psum reduces the final 3x3 tensor.
@@ -713,7 +722,7 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    return _s_tensor_kernel(mesh, nocc=int(nocc), nb_logical=int(nb_logical))(
+    return _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
         v,
         e,
         e,

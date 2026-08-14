@@ -259,7 +259,7 @@ def test_s_tensor_uses_k_dependent_occupations_not_band_cut():
             for v in range(logical):
                 de = energies[k, c] - energies[k, v]
                 fd = occupations[k, v] - occupations[k, c]
-                if fd <= 0.0 or de <= 0.0:
+                if de <= 0.0:
                     continue
                 weight = prefactor * fd / (de * (omega * omega - de * de))
                 ref += weight * np.outer(
