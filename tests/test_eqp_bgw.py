@@ -93,3 +93,20 @@ def test_writer_rejects_shape_mismatch(tmp_path, reference_block):
 		write_bgw_eqp(str(out), np.zeros((2, 3)), e_dft, e_qp, band_offset=0)
 	with pytest.raises(ValueError, match="e_qp shape"):
 		write_bgw_eqp(str(out), kpts, e_dft, e_qp[:, :4], band_offset=0)
+
+
+def test_writer_adds_single_line_diagnostic_comments(tmp_path, reference_block):
+	kpts, e_dft, e_qp = reference_block
+	out = tmp_path / "eqp0_iter0000.dat"
+	write_bgw_eqp(
+		str(out), kpts, e_dft, e_qp, band_offset=18,
+		comments=("SC map=0000 role=initial", "tail_scissor=none"),
+	)
+	lines = out.read_text().splitlines()
+	assert lines[1:3] == [
+		"# SC map=0000 role=initial", "# tail_scissor=none"]
+	with pytest.raises(ValueError, match="one line"):
+		write_bgw_eqp(
+			str(out), kpts, e_dft, e_qp, band_offset=18,
+			comments=("not\none line",),
+		)

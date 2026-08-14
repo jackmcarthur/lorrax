@@ -109,3 +109,43 @@ def test_the_omega_cube_is_in_the_residency_census():
     body = _block("gw_iteration_map")
     census = body[body.index("_residency_census("):]
     assert '"sigma_c_omega_kij_ry"' in census
+
+
+def test_sc_output_lifecycle_has_one_owner_per_large_artifact():
+    body = _block("gw_iteration_map")
+    assert "retain_iteration_artifacts(" in body
+    assert body.index("_check_sigma_stage(") < body.index(
+        "retain_iteration_artifacts(")
+
+    dump = _block("dump_qp_wfn_artifacts")
+    assert "enk_full_base_ry=enk_full_base_ry" in dump
+
+
+def test_rcrop_preserves_output_metadata_from_the_last_map():
+    body = _block("_run_rcrop")
+    for field in ("_last_scissor_fit", "_last_tail_scissor_fit"):
+        assert f"{field}[0] = None" in body
+        assert f"{field}[0] = state_out." in body
+        assert f"{field[1:]}={field}[0]" in body
+
+
+def test_per_map_files_are_output_diagnostics_not_final_eqp_math():
+    body = _block("_write_sc_eqp_snapshot")
+    assert "write_bgw_eqp(" in body
+    assert "assemble_eqp" not in body
+    assert "output_candidate_active_scissor" in body
+    assert "input_tail_scissor" in body
+    assert "kirr_fullids" in body
+
+
+def test_history_and_fixed_head_serial_writes_are_rank_gated():
+    history = _block("_maybe_dump_e_history")
+    assert "process_rank() == 0" in history
+    assert history.index("process_rank() == 0") < history.index("np.save(")
+    assert "barrier(" in history
+
+    model_src = (_PATH.parents[2] / "src" / "gw" / "mpa" / "model.py")
+    text = model_src.read_text()
+    call = text.rindex("_fit_fixed_head(")
+    assert text.rfind("if process_rank() == 0:", 0, call) < call
+    assert text.index('barrier("mpa.model.head_fit"', call) > call

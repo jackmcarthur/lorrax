@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import jax
@@ -11,6 +12,32 @@ from gw.mpa import sigma as mpa_sigma
 
 def _mesh():
     return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+
+def test_iteration_artifacts_retain_only_the_completed_map(
+        tmp_path, monkeypatch):
+    root = tmp_path / "mpa"
+    root.mkdir()
+    keep = model.iteration_artifact_paths(root, "sc_0002")
+    for path in (*keep,
+                 *model.iteration_artifact_paths(root, "sc_0000"),
+                 *model.iteration_artifact_paths(root, "sc_0007")):
+        open(path, "wb").close()
+    unrelated = root / "mpa_fit_external.h5"
+    unrelated.touch()
+    barriers = []
+    monkeypatch.setattr("common.collectives.process_rank", lambda: 0)
+    monkeypatch.setattr(
+        "common.collectives.barrier",
+        lambda label, print_fn=print: barriers.append(label))
+
+    model.retain_iteration_artifacts(root, "sc_0002", print_fn=lambda *_: None)
+
+    assert all(os.path.exists(path) for path in keep)
+    assert unrelated.exists()
+    assert sorted(path.name for path in root.iterdir()) == sorted(
+        [os.path.basename(path) for path in keep] + [unrelated.name])
+    assert barriers == ["mpa.model.retain.sc_0002"]
 
 
 def test_q_wedge_returns_the_resolution_verdict(monkeypatch):

@@ -999,6 +999,7 @@ def write_results(
     print_fn=print,
     *,
     eqp_dE_ev: float = 0.5,
+    write_qp_rotations: bool = True,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1008,7 +1009,10 @@ def write_results(
     2. ``eqp0.dat``        — BGW-format zeroth-order QP energies.
     3. ``eqp1.dat``        — BGW-format Z-linearized QP energies (Z=1 in
        static COHSEX, BGW central-difference Z in PPM modes).
-    4. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp.
+    Conditional:
+
+    4. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
+       skipped when the SC artifact owner already wrote the converged file.
 
     Conditional (PPM, non-SC):
 
@@ -1038,6 +1042,10 @@ def write_results(
         Reduced-zone k-point mapping for restart metadata.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
+    write_qp_rotations : bool
+        Write ``qp_wfn_rotations.h5`` here.  Self-consistent runs that
+        already wrote the converged SC rotation pass ``False`` so this
+        post-Sigma eigensolve cannot overwrite the authoritative file.
     """
     from file_io import (
         write_sigma_to_file,
@@ -1206,18 +1214,19 @@ def write_results(
         print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
-    nkx, nky, nkz = kgrid
-    write_qp_rotations_h5(
-        os.path.join(input_dir, "qp_wfn_rotations.h5"),
-        U_mnk=results.U_qp,
-        E_qp_nk=results.E_qp_ry / 2.0,  # Ry → Hartree
-        band_start=results.band_start,
-        band_stop=results.band_stop,
-        kpoints_crys=kpoints_crys,
-        nkx=nkx, nky=nky, nkz=nkz,
-        kpoints_reduced=kpoints_reduced,
-        kirr_to_kfull=kirr_to_kfull,
-    )
+    if write_qp_rotations:
+        nkx, nky, nkz = kgrid
+        write_qp_rotations_h5(
+            os.path.join(input_dir, "qp_wfn_rotations.h5"),
+            U_mnk=results.U_qp,
+            E_qp_nk=results.E_qp_ry / 2.0,  # Ry → Hartree
+            band_start=results.band_start,
+            band_stop=results.band_stop,
+            kpoints_crys=kpoints_crys,
+            nkx=nkx, nky=nky, nkz=nkz,
+            kpoints_reduced=kpoints_reduced,
+            kirr_to_kfull=kirr_to_kfull,
+        )
 
     # ── Status summary ────────────────────────────────────────────────────
     print_fn(f"\n  Sigma diag:   {sigma_diag_file}")

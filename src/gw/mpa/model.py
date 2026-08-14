@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
 
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -14,6 +14,43 @@ from gw.mpa import evaluator, fit_driver, sample_plan
 
 _CHI = "chi_qmunu_z"
 _WC = "Wc_qmunu_z"
+
+
+def iteration_artifact_paths(run_dir, label):
+    """Return the two disk artifacts owned by one MPA screening map."""
+    root = os.path.abspath(os.fspath(run_dir))
+    return (
+        os.path.join(root, f"mpa_samples_{label}.h5"),
+        os.path.join(root, f"mpa_fit_{label}.h5"),
+    )
+
+
+def retain_iteration_artifacts(run_dir, label, *, print_fn=print):
+    """Collectively retain only one completed SC map's sample/fit stores.
+
+    Only exact managed names ``mpa_{samples,fit}_sc_NNNN.h5`` are eligible;
+    an external input fit is never touched.  The caller invokes this only
+    after the current map has built and consumed its replacement, so a
+    failure preserves the last usable generation.  Scanning rather than
+    deleting only ``N-1`` also removes stale later maps from a shorter rerun.
+    """
+    from common.collectives import barrier, process_rank
+
+    root = os.path.abspath(os.fspath(run_dir))
+    keep = set(iteration_artifact_paths(root, label))
+    managed = re.compile(r"mpa_(?:samples|fit)_sc_[0-9]{4}\.h5\Z")
+    removed = []
+    is_root = process_rank() == 0
+    if is_root and os.path.isdir(root):
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if managed.fullmatch(name) and path not in keep:
+                os.remove(path)
+                removed.append(name)
+    barrier(f"mpa.model.retain.{label}", print_fn=print_fn)
+    if is_root and removed:
+        print_fn(f"  MPA scratch: retained {label}; discarded: "
+                 + ", ".join(removed))
 
 
 def _q_wedge(sym, centroid_indices, meta):
@@ -132,8 +169,7 @@ def build_mpa_fit(
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)
-    sample_path = os.path.join(root, f"mpa_samples_{label}.h5")
-    fit_path = os.path.join(root, f"mpa_fit_{label}.h5")
+    sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
     common = dict(
@@ -189,10 +225,19 @@ def build_mpa_fit(
         config.backend.w_dyson_solver)
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
-    _fit_fixed_head(
-        fit_path, head_resolver, 1j * float(config.ppm.omega_p))
+    # ``write_head_fit`` is an intentionally small serial-h5py metadata
+    # writer.  The body fit above is collective SlabIO; letting every rank
+    # enter this final delete/create/write sequence races one HDF5 group.
+    if process_rank() == 0:
+        _fit_fixed_head(
+            fit_path, head_resolver, 1j * float(config.ppm.omega_p))
+    barrier("mpa.model.head_fit", print_fn=print_fn)
     print_fn(fit_driver.format_cost_report(report))
     return fit_path
 
 
-__all__ = ["build_mpa_fit"]
+__all__ = [
+    "build_mpa_fit",
+    "retain_iteration_artifacts",
+    "iteration_artifact_paths",
+]

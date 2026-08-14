@@ -775,6 +775,9 @@ def main(argv=None):
 			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
+			write_qp_rotations=not (
+				qp_solver is QPSolver.SELF_CONSISTENT
+				and config.debug.write_wfn_h5),
 			print_fn=print0,
 		)
 	timing.record("gw_jax.output", time.perf_counter() - _t_out)

@@ -93,6 +93,8 @@ def write_qp_wfn_h5(
     enk_active_qp_ry: np.ndarray,           # (nk, nb_active)             E_QP for active block, Ry
     band_start: int,
     band_stop: int,
+    *,
+    enk_full_base_ry: np.ndarray | None = None,
 ) -> None:
     """Write a BGW-compatible WFN.h5 with QP-rotated ψ and replaced energies.
 
@@ -100,8 +102,9 @@ def write_qp_wfn_h5(
       * Bands ``[band_start, band_stop)`` (the "active" block):
           ``c_qp[n, s, G] = Σ_m U[k, m, n] · c_dft[m, s, G]``
           ``E[n] ← enk_active_qp_ry[k, n - band_start]``
-      * All other bands keep their DFT coefficients and DFT energies
-        unchanged — the SC iteration only touched the active subspace.
+      * All other coefficients remain DFT.  Their energies default to DFT,
+        or may be supplied through ``enk_full_base_ry`` when a caller owns
+        an explicit energy-only extrapolation such as the SC sum-band tail.
 
     The ``wfn`` argument is a :class:`~wfn_loader.WfnLoader` and
     is reused as the ``crystal`` source for :class:`WFNWriter` (it
@@ -146,7 +149,17 @@ def write_qp_wfn_h5(
     # All-band IBZ coefficients + per-k G-vectors via the unified loader.
     # qp_wfn is a one-shot host-mutate-write path; everything stays on
     # the host (sharding=None forces replicated → host numpy view).
-    enk_full_ry = np.array(wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
+    if enk_full_base_ry is None:
+        enk_full_ry = np.array(
+            wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
+    else:
+        base = np.asarray(enk_full_base_ry, dtype=np.float64)
+        expected = (int(wfn.nkpts), int(wfn.nbands))
+        if base.shape != expected:
+            raise ValueError(
+                "write_qp_wfn_h5: enk_full_base_ry shape "
+                f"{base.shape} inconsistent with {expected}.")
+        enk_full_ry = base.copy()
     enk_full_ry[:, band_start:band_stop] = np.asarray(
         enk_active_qp_ry, dtype=np.float64)
 
@@ -185,5 +198,4 @@ def write_qp_wfn_h5(
             c_all_dft[band_start:band_stop] = np.einsum(
                 "mn,msg->nsg", U_kmn[ik], c_active_dft, optimize=True)
             w.write_k(ik, enk_full_ry[ik], c_all_dft)
-
 

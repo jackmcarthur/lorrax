@@ -111,6 +111,7 @@ def write_bgw_eqp(
 	*,
 	band_offset: int,
 	nspin: int = 1,
+	comments: tuple[str, ...] = (),
 ) -> str:
 	"""Write a BerkeleyGW ``eqp{0,1}.dat`` file.
 
@@ -128,6 +129,11 @@ def write_bgw_eqp(
 	    BGW file uses 1-based labels ``band_offset + 1 .. band_offset + nb``.
 	nspin
 	    Number of spin channels (LORRAX runs at nspin=1).
+	comments
+	    Optional diagnostic lines written after the provenance header.  The
+	    formatter supplies the leading ``# `` so the file remains readable by
+	    BerkeleyGW-compatible parsers.  The ordinary ``eqp0.dat`` / ``eqp1.dat``
+	    path passes none and remains byte-identical to the historical format.
 	"""
 	kpts = np.asarray(kpoints_irr_frac, dtype=np.float64)
 	e_dft = np.asarray(e_dft_ev, dtype=np.float64)
@@ -157,6 +163,13 @@ def write_bgw_eqp(
 
 	with open(abs_path, "w") as fh:
 		fh.write(provenance_header())
+		for comment in comments:
+			line = str(comment)
+			if "\n" in line or "\r" in line:
+				raise ValueError(
+					"write_bgw_eqp comments must each be one line; got "
+					f"{line!r}")
+			fh.write(f"# {line}\n")
 		for ik in range(nk):
 			kx, ky, kz = (float(kpts[ik, j]) for j in range(3))
 			# Fortran (3f13.9, i8)

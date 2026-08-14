@@ -170,6 +170,11 @@ class SCState:
     iteration: int
     last_sigma_result: SigmaResult | None = None
     last_sigma_basis_U: jax.Array | None = None   # (nk, nb, nb) ⟨DFT_m|QP_n⟩
+    # Small output-only records from this map.  They never feed the next
+    # fixed-point evaluation; the SC diagnostics and final WFN writer own
+    # their only consumers.
+    last_scissor_fit: object | None = None
+    last_tail_scissor_fit: object | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1041,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # optional ladder is consumed by rotate_wavefunctions, which remains the
     # single owner of occupation rebuilding after an energy change.
     enk_base = None
+    tail_fit = None
     tail_start = int(inputs.band_slices.sigma.stop)
     logical_stop = (
         int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
@@ -1205,7 +1211,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # that rule is incomplete).  Handing the callee the SAME map that did
     # the ``select`` three lines up is what makes the weights impossible
     # to get out of step with the rows.
-    scissor_E_qp_kn_ry = _scissor_E_qp_for_outofrange(
+    scissor_E_qp_kn_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_act, val_mask,
         inputs.partition.in_range_mask, ks,
         print_fn=inputs.print_fn,
@@ -1217,6 +1223,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
 
+    # Keep at most one complete MPA screening model on disk.  The current
+    # map has now built its replacement, consumed it through Sigma, passed
+    # the Sigma gates and assembled H.  Only at this point is the preceding
+    # map's pair safe to unlink.  The newest pair survives convergence for
+    # restart/debugging; ordinary screening modes never enter this branch.
+    from .gw_config import ComputeMode
+    if inputs.config.compute_mode is ComputeMode.MPA:
+        from .mpa.model import retain_iteration_artifacts
+        retain_iteration_artifacts(
+            os.path.join(inputs.input_dir, "tmp", "mpa"),
+            f"sc_{state.iteration:04d}",
+            print_fn=inputs.print_fn,
+        )
+
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
@@ -1227,6 +1247,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # compute_sigma_xc runs there.  Storing the IBZ U_qp here is the
         # mismatch that raised 'k' 10 vs 16.
         last_sigma_basis_U=U_full,
+        last_scissor_fit=scissor_fit,
+        last_tail_scissor_fit=tail_fit,
     )
 
 
@@ -1241,7 +1263,7 @@ def _scissor_E_qp_for_outofrange(
     in_range_mask: jax.Array,
     kstar,
     print_fn=None,
-) -> jax.Array:
+) -> tuple[jax.Array, object | None]:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
     that are out of the ω-grid range.
 
@@ -1274,7 +1296,7 @@ def _scissor_E_qp_for_outofrange(
     in_range = np.asarray(in_range_mask, dtype=bool)
     # Fast path: nothing to extrapolate.
     if bool(in_range.all()):
-        return e_dft_kn_ry
+        return e_dft_kn_ry, None
 
     H_diag_np = np.real(np.asarray(jnp.diagonal(
         H_qp_dft_full, axis1=1, axis2=2)))
@@ -1294,7 +1316,100 @@ def _scissor_E_qp_for_outofrange(
     # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.
     delta_ev = fit.predict(
         e_dft_np * RYD_TO_EV, np.asarray(valence_mask_kn, dtype=bool))
-    return jnp.asarray((e_dft_np + delta_ev / RYD_TO_EV))
+    return jnp.asarray((e_dft_np + delta_ev / RYD_TO_EV)), fit
+
+
+def _write_sc_eqp_snapshot(
+    inputs: SCInputs,
+    state_out: SCState,
+    e_output_kn_ev: np.ndarray,
+    *,
+    call_index: int,
+    role: str,
+    rms_ev: float,
+    rms2_ev: float,
+) -> str | None:
+    """Write one small BGW-shaped record of a completed SC map call.
+
+    The QP column is ``eigvalsh(F(H_in))``.  The active-band scissor is fit
+    to that same output candidate; the sum-band tail scissor is explicitly
+    labelled as the input law that was used to build this map's chi/W/Sigma.
+    rCROP trial outputs are useful diagnostics but are not accepted iterates.
+    This is not a second implementation of BGW's final ``eqp0`` / ``eqp1``
+    equations; those remain solely in :mod:`gw.eqp_bgw`.
+    """
+    from common.collectives import process_rank
+    from .eqp_bgw import write_bgw_eqp
+
+    if process_rank() != 0:
+        return None
+
+    irr = np.asarray(inputs.sym.kirr_fullids, dtype=np.int64)
+    kpoints = np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64)[irr]
+    e_dft_full = np.asarray(
+        inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV
+    e_dft = e_dft_full[irr]
+    e_output = np.asarray(e_output_kn_ev, dtype=np.float64)
+    # The loop is either full-BZ or already in the KStarMap's irreducible
+    # row order.  ``kirr_fullids`` selects only in the former case.
+    if getattr(inputs, "kstar", None) is None:
+        e_output = e_output[irr]
+
+    active_scissored = np.flatnonzero(
+        ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
+    band_offset = int(inputs.band_slices.sigma.start)
+    active_labels = ",".join(
+        str(band_offset + int(i) + 1) for i in active_scissored)
+    active_labels = active_labels or "none"
+    tail_start = int(inputs.band_slices.sigma.stop)
+    tail_stop = int(inputs.meta.b_id_4_user) - band_offset
+
+    active_fit = state_out.last_scissor_fit
+    tail_fit = state_out.last_tail_scissor_fit
+    comments = (
+        f"SC map={int(call_index):04d} role={role}; columns are "
+        "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
+        "outputs are not accepted iterates",
+        f"map_output_RMS_dE_prev_output={float(rms_ev):.9e} eV; "
+        f"map_output_RMS_dE_two_calls={float(rms2_ev):.9e} eV; "
+        "these are map-call diagnostics, not accepted-iterate residuals",
+        f"active_scissored_bands_1based={active_labels}",
+        ("active_scissor=none (all active bands lie on the Sigma grid)"
+         if active_fit is None else
+         "output_candidate_active_scissor: " + active_fit.summary()),
+        (f"sum_band_tail=[{tail_start + band_offset + 1},"
+         f"{tail_stop + band_offset}] 1-based; input_tail_scissor="
+         + ("none (DFT energies)" if tail_fit is None else
+            f"E_QP={tail_fit.alpha_c:+.10e}*E_DFT"
+            f"{tail_fit.beta_c_ev:+.10e} eV; "
+            f"n={tail_fit.n_fit_c}, w={tail_fit.w_fit_c:.0f}, "
+            f"rmse={tail_fit.rmse_c_ev:.10e} eV")),
+    )
+    path = os.path.join(
+        inputs.input_dir, f"eqp0_iter{int(call_index):04d}.dat")
+    write_bgw_eqp(
+        path, kpoints, e_dft, e_output,
+        band_offset=band_offset, nspin=1, comments=comments,
+    )
+    inputs.print_fn(f"  SC map energies: {path}")
+    return path
+
+
+def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
+    """Remove only managed per-map text snapshots from an earlier run."""
+    import re
+    from common.collectives import process_rank
+
+    removed = 0
+    managed = re.compile(r"eqp0_iter[0-9]{4}\.dat\Z")
+    if process_rank() == 0 and os.path.isdir(input_dir):
+        for name in os.listdir(input_dir):
+            if managed.fullmatch(name):
+                os.remove(os.path.join(input_dir, name))
+                removed += 1
+        if removed:
+            print_fn(f"  SC map energies: cleared {removed} stale snapshots")
+    barrier("sc.eqp_snapshots.clear", print_fn=print_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1461,7 @@ def run_self_consistency(
         ``max_iter == 1`` (one-shot G0W0).
     """
     print_fn = inputs.print_fn
+    _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
@@ -1354,6 +1470,16 @@ def run_self_consistency(
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
         state_new = gw_iteration_map(state_init, inputs)
+        e_initial_ev = (
+            np.asarray(eigvalsh_kshard(state_init.H_qp_dft)) * RYD_TO_EV)
+        e_new_ev = (
+            np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
+        rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
+        _write_sc_eqp_snapshot(
+            inputs, state_new, e_new_ev,
+            call_index=0, role="one_shot", rms_ev=rms,
+            rms2_ev=float("nan"),
+        )
         return state_new, []
 
     if accelerator == "rcrop":
@@ -1400,6 +1526,8 @@ def _run_linear_mixing(
         # LAST iteration's is kept: it leaves the loop in ``state_new``.
         state = SCState(H_qp_dft=state.H_qp_dft, iteration=state.iteration)
         state_new = gw_iteration_map(state, inputs)
+        E_candidate_ev = (
+            np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
         if mixing != 1.0:
             H_mixed = (
                 mixing * state_new.H_qp_dft
@@ -1410,6 +1538,8 @@ def _run_linear_mixing(
                 iteration=state_new.iteration,
                 last_sigma_result=state_new.last_sigma_result,
                 last_sigma_basis_U=state_new.last_sigma_basis_U,
+                last_scissor_fit=state_new.last_scissor_fit,
+                last_tail_scissor_fit=state_new.last_tail_scissor_fit,
             )
         E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -1422,6 +1552,10 @@ def _run_linear_mixing(
             f"  SC iter {state_new.iteration}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
+        )
+        _write_sc_eqp_snapshot(
+            inputs, state_new, E_candidate_ev,
+            call_index=it, role="linear", rms_ev=rms, rms2_ev=rms2,
         )
         state = state_new
         E_prev_ev = E_new_ev
@@ -1590,6 +1724,8 @@ def _run_rcrop(
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_sigma: list = [None]
     _last_basis_U: list = [None]
+    _last_scissor_fit: list = [None]
+    _last_tail_scissor_fit: list = [None]
     _iter_idx = [0]
     rms_history: list[float] = []
 
@@ -1616,10 +1752,14 @@ def _run_rcrop(
         # this cell is refilled below and the loop exits with it.
         _last_sigma[0] = None
         _last_basis_U[0] = None
+        _last_scissor_fit[0] = None
+        _last_tail_scissor_fit[0] = None
         state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
         state_out = gw_iteration_map(state_in, inputs)
         _last_sigma[0] = state_out.last_sigma_result
         _last_basis_U[0] = state_out.last_sigma_basis_U
+        _last_scissor_fit[0] = state_out.last_scissor_fit
+        _last_tail_scissor_fit[0] = state_out.last_tail_scissor_fit
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
@@ -1633,6 +1773,13 @@ def _run_rcrop(
             f"  SC rCROP call {len(rms_history)}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
+        )
+        call_index = _iter_idx[0]
+        role = ("initial" if call_index == 0 else
+                "trial" if call_index % 2 else "accepted_input_map")
+        _write_sc_eqp_snapshot(
+            inputs, state_out, E_new,
+            call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
         )
         _iter_idx[0] += 1
         return _to_entry(state_out.H_qp_dft - H)
@@ -1690,6 +1837,8 @@ def _run_rcrop(
         iteration=_iter_idx[0],
         last_sigma_result=_last_sigma[0],
         last_sigma_basis_U=_last_basis_U[0],
+        last_scissor_fit=_last_scissor_fit[0],
+        last_tail_scissor_fit=_last_tail_scissor_fit[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
@@ -1702,13 +1851,16 @@ def _maybe_dump_e_history(
 ) -> None:
     if not dump_dir:
         return
-    os.makedirs(dump_dir, exist_ok=True)
-    np.save(os.path.join(dump_dir, "e_history_kn_ev.npy"),
-            np.stack(e_history, axis=0))
-    print_fn(
-        f"  SC dump: saved {len(e_history)} eigenvalue snapshots to "
-        f"{dump_dir}/e_history_kn_ev.npy (shape (iter, k, n))"
-    )
+    from common.collectives import process_rank
+    if process_rank() == 0:
+        os.makedirs(dump_dir, exist_ok=True)
+        np.save(os.path.join(dump_dir, "e_history_kn_ev.npy"),
+                np.stack(e_history, axis=0))
+        print_fn(
+            f"  SC dump: saved {len(e_history)} eigenvalue snapshots to "
+            f"{dump_dir}/e_history_kn_ev.npy (shape (map, k, n))"
+        )
+    barrier("sc.e_history.write", print_fn=print_fn)
 
 
 def run_sc_driver(
@@ -1882,7 +2034,7 @@ def run_sc_driver(
     )
     sigma_result = state_final.last_sigma_result
     print_fn(
-        f"  SC done: {len(rms_history)} iterations"
+        f"  SC done: {len(rms_history)} GW map calls"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
             if rms_history else " (one-shot)"))
 
@@ -1899,6 +2051,7 @@ def run_sc_driver(
             state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
             kstar=kstar_io, state_on_ibz=kstar is not None,
             wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
+            logical_band_stop=int(meta.b_id_4_user),
             output_dir=input_dir, print_fn=print_fn,
         )
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -2079,6 +2232,7 @@ def dump_qp_wfn_artifacts(
     wfn,                                 # WFNReader (source of base coeffs + crystal)
     sym,                                 # SymMaps (full-BZ k-list + kirr_fullids)
     band_slices,
+    logical_band_stop: int | None = None,
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
     print_fn: Callable = print,
@@ -2089,7 +2243,8 @@ def dump_qp_wfn_artifacts(
 
     * ``WFN_qp.h5`` — full BGW-format wavefunction file with active-block
       ψ rotated by ``U`` and active-block energies replaced by ``E_qp``;
-      bands outside the active block keep their DFT values.
+      the logical conduction-sum tail keeps DFT orbitals and receives the
+      last map's energy-only scissor; other bands keep their DFT values.
       Drop-in replacement for downstream BSE / restart paths that read
       a WFN.h5.
     * ``qp_wfn_rotations.h5`` — small companion file containing just
@@ -2130,14 +2285,16 @@ def dump_qp_wfn_artifacts(
       labels the rows of ``U_mnk``; the canonical writer of this same
       file passes ``sym.unfolded_kpts`` there (gw_output.py:865-875) and
       the consumer indexes ``U_mnk`` by full-BZ index
-      (postprocess/rotate_wfn_to_qp.py:159).  ``write_results`` rewrites
-      this file later in the same run from the driver's own full-BZ
-      eigh, so writing it on any other k-set would also make the two
-      writes of one path disagree in shape.
+      (postprocess/rotate_wfn_to_qp.py:159).  In an SC run this is the sole
+      owner: the later generic result writer is told not to overwrite it
+      from its slightly different post-Sigma eigensolve.
 
     ``state_on_ibz`` says which k-set the loop ran on (``config.sc_on_ibz``)
     and ``kstar`` is the map; both writers are then reached by
     :func:`_on_kset` from wherever the state is.
+
+    ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
+    is required only when the final map used an energy-only tail scissor.
 
     Both files are rank-0-only writes (h5py is single-writer); a
     multihost barrier follows so the caller can rely on both files
@@ -2181,10 +2338,25 @@ def dump_qp_wfn_artifacts(
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:
+        enk_full_base_ry = None
+        tail_fit = state.last_tail_scissor_fit
+        if tail_fit is not None:
+            if logical_band_stop is None:
+                raise ValueError(
+                    "dump_qp_wfn_artifacts: logical_band_stop is required "
+                    "when the final SC map used a tail scissor.")
+            base_ev = np.asarray(
+                wfn.energies[0], dtype=np.float64) * RYD_TO_EV
+            enk_full_base_ry = apply_conduction_scissor_to_tail(
+                base_ev, tail_fit,
+                tail_start=int(band_slices.b3),
+                logical_stop=int(logical_band_stop),
+            ) / RYD_TO_EV
         write_qp_wfn_h5(
             qp_wfn_path, wfn=wfn,
             U_kmn=U_wfn, enk_active_qp_ry=enk_wfn_ry,
             band_start=band_slices.b0, band_stop=band_slices.b3,
+            enk_full_base_ry=enk_full_base_ry,
         )
         write_qp_rotations_h5(
             qp_rot_path,
