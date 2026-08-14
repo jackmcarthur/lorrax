@@ -151,12 +151,12 @@ class SCState:
         k-set is not negotiable; the U stored beside it follows.
 
     The primary iteration carry is ``H_qp_dft``.  When metallic head
-    occupations are enabled, the small ``(nk, nb_head)`` occupation table
-    and its chemical potential are auxiliary carried state: iteration i's
-    first-half head consumes the values produced only at the END of
-    iteration i-1.  They are deliberately not installed in the wavefunction
-    bundle, so Green's functions and finite-q screening keep their historical
-    occupations until their metallic formulations land.
+    occupations are enabled, the small ``(nk, nb_head)`` occupation and
+    tetrahedron-surface tables plus their chemical potential are auxiliary
+    carried state: iteration i's first-half head consumes the values produced
+    only at the END of iteration i-1.  They are deliberately not installed in
+    the wavefunction bundle, so Green's functions and finite-q screening keep
+    their historical occupations until their metallic formulations land.
 
     ``last_sigma_result`` is purely for the final output writer (eqp.dat,
     sigma_diag.dat, freq_debug.dat); it does not feed the next iteration.
@@ -173,6 +173,7 @@ class SCState:
     iteration: int
     head_efermi_ry: float | None = None
     head_occ_kn: jax.Array | None = None  # full-BZ, padded PT head manifold
+    head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     last_sigma_result: SigmaResult | None = None
     last_sigma_basis_U: jax.Array | None = None   # (nk, nb, nb) ⟨DFT_m|QP_n⟩
 
@@ -213,7 +214,9 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     # all-gather, P × nk × nb² × 16 B — scorecard AA.1).  ``H0`` is a
     # pure function of the DFT energies, identical on every rank;
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
-    head_efermi_ry, head_occ_kn = _solve_head_occupations(
+    (head_efermi_ry,
+     head_occ_kn,
+     head_surface_weight_kn) = _solve_head_occupations(
         inputs, inputs.wfns_dft.enk)
     if head_efermi_ry is not None:
         inputs.print_fn(
@@ -224,24 +227,28 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         iteration=0,
         head_efermi_ry=head_efermi_ry,
         head_occ_kn=head_occ_kn,
+        head_surface_weight_kn=head_surface_weight_kn,
     )
 
 
 def _solve_head_occupations(
     inputs: SCInputs,
     energies_kn_ry,
-) -> tuple[float | None, jax.Array | None]:
+) -> tuple[float | None, jax.Array | None, jax.Array | None]:
     """Solve the fixed-N MP1 state used only by the next QSGW head.
 
     The table is full-BZ because the parallel-transport velocity and head
     contraction are full-BZ.  Padding is explicit and inert; the solver sees
-    exactly ``nb_logical`` physical bands.  A zero width returns ``(None,
-    None)`` so the historical step-occupation path is bit-for-bit untouched.
+    exactly ``nb_logical`` physical bands.  The same end-of-iteration
+    energies and chemical potential also define periodic tetrahedron
+    Fermi-surface weights for the next iteration's Drude head.  A zero width
+    returns three ``None`` values so the historical step-occupation path is
+    bit-for-bit untouched.
     """
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
     if width_ev == 0.0 or pt is None:
-        return None, None
+        return None, None, None
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if energies.ndim != 2:
@@ -275,7 +282,28 @@ def _solve_head_occupations(
         mode="constant",
         constant_values=0.0,
     )
-    return float(mu_ry), occ_kn
+    # The Drude weight is a Fermi-surface integral, not a coarse-grid
+    # sampling of the MP1 derivative.  On sodium 8^3 the latter moves the
+    # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
+    # determine the fixed-N chemical potential; no fitted plasma frequency
+    # enters the response.
+    from .fermi_surface import tetrahedron_delta_weights
+
+    surface_logical = tetrahedron_delta_weights(
+        np.asarray(energies[:, :nb_logical], dtype=np.float64),
+        np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64),
+        tuple(int(x) for x in inputs.wfn.kgrid),
+        float(mu_ry),
+    )
+    # The distributed contraction owns an explicit uniform 1/Nk.  Convert
+    # normalized-BZ tetrahedron weights to its per-grid-point interface.
+    surface_kn = jnp.pad(
+        jnp.asarray(surface_logical * float(nk), dtype=jnp.float64),
+        ((0, 0), (0, nb_storage - nb_logical)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    return float(mu_ry), occ_kn, surface_kn
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1232,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             omegas.append(1j * float(inputs.config.ppm.omega_p))
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
+        head_surface_weight_kn = None
         if state.head_occ_kn is not None:
             if state.head_efermi_ry is None:
                 raise ValueError(
@@ -1217,6 +1246,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
             head_occ_kn = state.head_occ_kn
             head_efermi_ry = float(state.head_efermi_ry)
+            if state.head_surface_weight_kn is None:
+                raise ValueError(
+                    "QSGW head occupations were carried without their "
+                    "tetrahedron Fermi-surface weights.")
+            if tuple(state.head_surface_weight_kn.shape) != (
+                    int(wfns_qp.enk.shape[0]), nb_storage):
+                raise ValueError(
+                    "carried QSGW head Fermi-surface weights have shape "
+                    f"{state.head_surface_weight_kn.shape}, expected "
+                    f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
+            head_surface_weight_kn = state.head_surface_weight_kn
 
         iteration_head = build_iteration_head_samples(
             delta_head,
@@ -1226,6 +1266,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfns_qp.enk[:, :nb_storage],
             head_occ_kn,
             np.asarray(omegas, dtype=np.complex128),
+            surface_weight_qp_kn=head_surface_weight_kn,
             mesh=inputs.mesh_xy,
             kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
             bvec_cart=pt.reciprocal_lattice_cart,
@@ -1370,8 +1411,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # rotated above.  The head in THIS call used state.head_occ_kn; this solve
     # produces the table consumed by the NEXT call.  Nothing installs it in
     # wfns_qp, so finite-q screening and Green's functions are unchanged.
-    next_head_efermi_ry, next_head_occ_kn = _solve_head_occupations(
-        inputs, wfns_qp.enk)
+    (next_head_efermi_ry,
+     next_head_occ_kn,
+     next_head_surface_weight_kn) = _solve_head_occupations(inputs, wfns_qp.enk)
     if next_head_efermi_ry is not None:
         inputs.print_fn(
             "    SC head occupations: end-of-iteration BGW-MP1 update, "
@@ -1383,6 +1425,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         iteration=state.iteration + 1,
         head_efermi_ry=next_head_efermi_ry,
         head_occ_kn=next_head_occ_kn,
+        head_surface_weight_kn=next_head_surface_weight_kn,
         last_sigma_result=sigma_result,
         # FULL-BZ U.  These two fields are consumed TOGETHER by
         # run_sc_driver's final rotate-back, so they must share a k-set,
@@ -1566,6 +1609,7 @@ def _run_linear_mixing(
             iteration=state.iteration,
             head_efermi_ry=state.head_efermi_ry,
             head_occ_kn=state.head_occ_kn,
+            head_surface_weight_kn=state.head_surface_weight_kn,
         )
         state_new = gw_iteration_map(state, inputs)
         if mixing != 1.0:
@@ -1578,6 +1622,7 @@ def _run_linear_mixing(
                 iteration=state_new.iteration,
                 head_efermi_ry=state_new.head_efermi_ry,
                 head_occ_kn=state_new.head_occ_kn,
+                head_surface_weight_kn=state_new.head_surface_weight_kn,
                 last_sigma_result=state_new.last_sigma_result,
                 last_sigma_basis_U=state_new.last_sigma_basis_U,
             )
@@ -1760,6 +1805,9 @@ def _run_rcrop(
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_sigma: list = [None]
     _last_basis_U: list = [None]
+    _head_efermi: list = [state_init.head_efermi_ry]
+    _head_occ: list = [state_init.head_occ_kn]
+    _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
 
@@ -1786,10 +1834,19 @@ def _run_rcrop(
         # this cell is refilled below and the loop exits with it.
         _last_sigma[0] = None
         _last_basis_U[0] = None
-        state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
+        state_in = SCState(
+            H_qp_dft=H,
+            iteration=_iter_idx[0],
+            head_efermi_ry=_head_efermi[0],
+            head_occ_kn=_head_occ[0],
+            head_surface_weight_kn=_head_surface_weight[0],
+        )
         state_out = gw_iteration_map(state_in, inputs)
         _last_sigma[0] = state_out.last_sigma_result
         _last_basis_U[0] = state_out.last_sigma_basis_U
+        _head_efermi[0] = state_out.head_efermi_ry
+        _head_occ[0] = state_out.head_occ_kn
+        _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
@@ -1858,6 +1915,9 @@ def _run_rcrop(
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
+        head_efermi_ry=_head_efermi[0],
+        head_occ_kn=_head_occ[0],
+        head_surface_weight_kn=_head_surface_weight[0],
         last_sigma_result=_last_sigma[0],
         last_sigma_basis_U=_last_basis_U[0],
     )

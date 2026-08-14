@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the current occupation-weighted QSGW interband head spectrum.
+"""Evaluate the DFT or current-QSGW interband plus Drude head spectrum.
 
 This is a small end-to-end diagnostic, not a second head implementation.  It
 loads the WFN and exact DFT velocity stage named by a LORRAX input file,
@@ -10,10 +10,10 @@ writes
     chi00(q0,w) = q0.T @ S(w) @ q0
     epsinv00(q0,w) = 1 / (1 - 8*pi/|q0|^2 * chi00(q0,w))
 
-The result is deliberately labelled *interband only*: the current S kernel
-has the all-band occupation difference f_nk-f_mk, but no metallic
-intraband/Drude term yet.  It is therefore useful for inspecting the present
-head implementation, not for claiming full BerkeleyGW metal parity.
+The diagonal velocity and an explicit Fermi-surface quadrature supply the
+ab-initio Drude tensor; no fitted plasma frequency is used.  With
+``--dft-velocity-only`` this is strictly a DFT diagnostic.  Head/wing/body
+local-field coupling and finite-q dispersion remain outside it.
 
 Run on compute nodes through the normal LORRAX launcher, for example::
 
@@ -46,7 +46,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
         allow_abbrev=False,
         description=(
             "Load a WFN + parallel_transport.h5, solve fixed-N MP1 "
-            "occupations, and evaluate Lorrax's current interband S(omega)."
+            "occupations, and evaluate Lorrax's interband plus Drude "
+            "S(omega)."
         ),
     )
     parser.add_argument("-i", "--input", required=True, help="LORRAX input file")
@@ -94,6 +95,25 @@ def _parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--drude-integration",
+        choices=("none", "tetrahedron", "mp1"),
+        default="none",
+        help=(
+            "Fermi-surface quadrature for the Drude tensor; tetrahedron "
+            "integrates the linearly interpolated periodic grid without "
+            "smearing, while mp1 samples -df/dE on the input k points"
+        ),
+    )
+    parser.add_argument(
+        "--electron-count",
+        type=float,
+        default=None,
+        help=(
+            "diagnostic fixed-N override; default is the physical weighted "
+            "occupation count stored by the WFN"
+        ),
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default="qsgw_head_spectrum.dat",
@@ -112,6 +132,10 @@ def _parse_args(argv=None) -> argparse.Namespace:
         not np.isfinite(args.eta_ev) or args.eta_ev < 0.0
     ):
         parser.error("--eta-ev must be finite and >= 0")
+    if args.electron_count is not None and (
+        not np.isfinite(args.electron_count) or args.electron_count <= 0.0
+    ):
+        parser.error("--electron-count must be finite and positive")
     q0 = np.asarray(args.q0_crystal, dtype=np.float64)
     if not np.all(np.isfinite(q0)) or np.linalg.norm(q0) == 0.0:
         parser.error("--q0-crystal must be finite and nonzero")
@@ -133,13 +157,15 @@ def _write_spectrum(
     eta_ry: float,
     nbands: int,
     nk: int,
+    plasma_ev: float,
+    drude_integration: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     header = "\n".join(
         (
-            "lorrax_qsgw_head_spectrum schema=1",
-            "physics=current occupation-weighted interband S(omega); "
-            "intraband/Drude term absent",
+            "lorrax_qsgw_head_spectrum schema=2",
+            "physics=occupation-weighted interband plus ab-initio "
+            "Fermi-surface Drude tensor",
             f"input={input_file}",
             f"wfn={wfn_file}",
             f"parallel_transport={pt_file}",
@@ -151,6 +177,8 @@ def _write_spectrum(
             f"retarded_eta_ry={eta_ry:.17g}",
             f"electron_count_audit={electron_count:.17g}",
             f"nk_full={nk} nbands={nbands}",
+            f"directional_plasma_frequency_ev={plasma_ev:.17g}",
+            f"drude_integration={drude_integration}",
             "columns: omega_ev Re_chi00 Im_chi00 Re_epsinv00 Im_epsinv00",
         )
     )
@@ -239,12 +267,18 @@ def _run(args: argparse.Namespace) -> int:
     jax.config.update("jax_enable_x64", True)
 
     from common import Meta, RYD_TO_EV
+    from gw.fermi_surface import tetrahedron_delta_weights
     from common.wfn_transforms import get_enk_bandrange
     from ffi.common.ffi_loader import phdf5_init_mpi
     from file_io.paths import resolve_input_path
-    from gw.efermi import solve_mp1_occupations
+    from gw.efermi import mp1_negative_derivative, solve_mp1_occupations
     from gw.gw_config import LorraxConfig
-    from gw.qsgw_head import head_s_tensor_sharded, load_parallel_transport_head
+    from gw.qsgw_head import (
+        head_drude_tensor_sharded,
+        head_samples_from_s,
+        head_s_tensor_sharded,
+        load_parallel_transport_head,
+    )
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from wfn_loader import WfnLoader
     import symmetry_maps
@@ -326,16 +360,46 @@ def _run(args: argparse.Namespace) -> int:
     mu_ry_device, occupations_logical = solve_mp1_occupations(
         energies_kn[:, :nb_logical],
         kweights,
-        float(wfn.num_electrons),
+        (float(wfn.num_electrons)
+         if args.electron_count is None else float(args.electron_count)),
         width_ev / float(RYD_TO_EV),
         state_capacity=capacity,
     )
+    mu_ry = float(np.asarray(jax.block_until_ready(mu_ry_device)))
     occupations_kn = jnp.pad(
         occupations_logical,
         ((0, 0), (0, nb_storage - nb_logical)),
         mode="constant",
         constant_values=0.0,
     )
+    if args.drude_integration == "none":
+        surface_weight_logical = None
+    elif args.drude_integration == "mp1":
+        surface_weight_logical = mp1_negative_derivative(
+            energies_kn[:, :nb_logical],
+            mu_ry_device,
+            width_ev / float(RYD_TO_EV),
+        )
+    else:
+        # ``head_drude_tensor_sharded`` carries the uniform 1/Nk factor.
+        # Tetrahedron weights already integrate over the normalized BZ, so
+        # multiply by Nk here to present the same contraction interface.
+        tetra_weights = tetrahedron_delta_weights(
+            np.asarray(energies_kn[:, :nb_logical], dtype=np.float64),
+            np.asarray(sym.unfolded_kpts, dtype=np.float64),
+            tuple(int(x) for x in wfn.kgrid),
+            mu_ry,
+        )
+        surface_weight_logical = jnp.asarray(
+            tetra_weights * float(meta.nk_tot), dtype=jnp.float64)
+    surface_weight_kn = None
+    if surface_weight_logical is not None:
+        surface_weight_kn = jnp.pad(
+            surface_weight_logical,
+            ((0, 0), (0, nb_storage - nb_logical)),
+            mode="constant",
+            constant_values=0.0,
+        )
 
     omega_ev = np.linspace(
         float(args.omega_min_ev),
@@ -361,9 +425,43 @@ def _run(args: argparse.Namespace) -> int:
         nspin=int(wfn.nspin),
         nspinor=int(meta.nspinor),
         eta_ry=eta_ry,
+        surface_weight_kn=surface_weight_kn,
     )
+    drude_tensor = None
+    if surface_weight_kn is not None:
+        drude_tensor = head_drude_tensor_sharded(
+            pt.velocity_dft_cart,
+            surface_weight_kn,
+            mesh=mesh,
+            nb_logical=nb_logical,
+            cell_volume=float(meta.cell_volume),
+            nk_tot=int(meta.nk_tot),
+            nspin=int(wfn.nspin),
+            nspinor=int(meta.nspinor),
+        )
     s_host = np.asarray(jax.block_until_ready(s_cart), dtype=np.complex128)
-    mu_ry = float(np.asarray(jax.block_until_ready(mu_ry_device)))
+    drude_host = (
+        np.zeros((3, 3), dtype=np.complex128)
+        if drude_tensor is None
+        else np.asarray(jax.block_until_ready(drude_tensor), dtype=np.complex128)
+    )
+    static_sample = None
+    static_kappa2 = None
+    if surface_weight_kn is not None:
+        surface_host = np.asarray(
+            jax.block_until_ready(surface_weight_kn), dtype=np.float64)
+        dos_ry_per_cell = (
+            capacity * float(np.sum(surface_host)) / float(meta.nk_tot))
+        static_kappa2 = (
+            8.0 * np.pi * dos_ry_per_cell / float(meta.cell_volume))
+        static_sample = head_samples_from_s(
+            np.zeros((1, 3, 3), dtype=np.complex128),
+            np.asarray([0.0 + 0.0j]),
+            wfn=wfn,
+            meta=meta,
+            config=config,
+            static_kappa2_bohr2=static_kappa2,
+        )[0]
     occupations_host = np.asarray(
         jax.block_until_ready(occupations_logical), dtype=np.float64
     )
@@ -378,6 +476,10 @@ def _run(args: argparse.Namespace) -> int:
             "--q0-crystal maps to a numerically zero Cartesian vector."
         )
     chi00 = np.einsum("i,wij,j->w", q0_cart, s_host, q0_cart, optimize=True)
+    qhat = q0_cart / np.sqrt(q2)
+    plasma_ry2 = 8.0 * np.pi * float(
+        np.real(np.einsum("i,ij,j->", qhat, drude_host, qhat)))
+    plasma_ev = np.sqrt(max(plasma_ry2, 0.0)) * float(RYD_TO_EV)
     vcoul = 8.0 * np.pi / q2
     epsinv00 = 1.0 / (1.0 - vcoul * chi00)
     rows = np.column_stack(
@@ -403,6 +505,8 @@ def _run(args: argparse.Namespace) -> int:
             eta_ry=eta_ry,
             nbands=nb_logical,
             nk=int(meta.nk_tot),
+            plasma_ev=plasma_ev,
+            drude_integration=args.drude_integration,
         )
         print0(
             f"Wrote {output}: {len(omega_ev)} frequencies, "
@@ -410,9 +514,16 @@ def _run(args: argparse.Namespace) -> int:
             f"N={electron_count:.12f}."
         )
         print0(
-            "Interpretation: occupation-weighted interband head only; "
-            "the metallic intraband/Drude contribution is not included."
+            "Ab-initio Fermi-surface Drude tensor: directional "
+            f"omega_p={plasma_ev:.9f} eV."
         )
+        if static_sample is not None:
+            print0(
+                "Static tetrahedron DOS head: "
+                f"kappa_TF^2={static_kappa2:.9g} bohr^-2, "
+                f"vc0={static_sample.vc0:.9g}, "
+                f"wcoul0={static_sample.wcoul0:.9g}."
+            )
     return 0
 
 

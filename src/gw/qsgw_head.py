@@ -673,6 +673,88 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     return kernel
 
 
+def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    """Compile the Fermi-surface velocity contraction once per band shape."""
+    key = ("head_drude", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(v_local, surface_weight_x, prefactor):
+        nx, ny = v_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        diagonal = (
+            (ix[:, None] == iy[None, :])
+            & (ix[:, None] < nb_logical)
+            & (iy[None, :] < nb_logical)
+        )[None, :, :]
+        weight = jnp.where(diagonal, surface_weight_x[:, :, None], 0.0)
+        local = prefactor * jnp.einsum(
+            "akij,kij,bkij->ab",
+            jnp.conj(v_local), weight, v_local, optimize=True,
+        )
+        return jax.lax.psum(local, (ax_x, ax_y))
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(P(None, None, "x", "y"), P(None, "x"), P()),
+        out_specs=P(None, None),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def head_drude_tensor_sharded(
+    velocity_cart,
+    surface_weight_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+):
+    """Return the ab-initio Drude tensor ``D_ab`` in Rydberg units.
+
+    ``D_ab = C/(Omega Nk) sum_kn (-df/dE) v_a,nn* v_b,nn`` with state
+    capacity ``C=2/(nspin*nspinor)``.  Consequently the directional plasma
+    frequency in this tree's Rydberg convention is
+    ``omega_p(qhat)^2 = 8*pi*qhat.D.qhat``.  The diagonal QSGW velocities
+    include the nonlocal-pseudopotential and covariant-rotation terms.  At
+    the initial iteration they are exactly the saved DFT ``dH/dk``; only a
+    subsequent self-consistent Hamiltonian update makes them QSGW.  No fitted
+    or experimental plasma frequency enters.
+    """
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+        raise ValueError(
+            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if tuple(surface.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            f"surface_weight_kn shape {surface.shape} does not match "
+            f"velocity (nk,nb)={v.shape[1:3]}.")
+    if not (0 < int(nb_logical) <= int(v.shape[2])):
+        raise ValueError(
+            f"need 0 < nb_logical <= stored nb, got "
+            f"{nb_logical}, {v.shape[2]}.")
+    pref = 2.0 / (
+        float(cell_volume)
+        * float(nk_tot)
+        * float(max(int(nspin), 1))
+        * float(max(int(nspinor), 1))
+    )
+    tensor = _drude_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+        v, surface, jnp.asarray(pref, dtype=jnp.complex128))
+    return 0.5 * (tensor + jnp.conj(tensor.T))
+
+
 def head_s_tensor_sharded(
     velocity_cart,
     energies_kn_ry,
@@ -686,12 +768,19 @@ def head_s_tensor_sharded(
     nspin: int,
     nspinor: int,
     eta_ry: float = 0.0,
+    surface_weight_kn=None,
 ):
-    """Build S(omega) from a 2-D band-tiled current QSGW velocity.
+    """Build interband plus optional Drude ``S(omega)`` from current velocity.
+
+    The initial call uses the saved DFT operator.  Later self-consistent calls
+    use its covariantly updated and rotated counterpart.
 
     The contraction runs over every pair in ``[0, nb_logical)`` and uses
     the signed factor ``f_nk - f_mk``.  There is deliberately no integer
-    occupied-band boundary in this API.
+    occupied-band boundary in this API.  If ``surface_weight_kn`` is supplied,
+    the diagonal-velocity Fermi-surface tensor is added as
+    ``D/(omega+i*eta)^2``.  This is the dynamic q->0 intraband limit; the
+    strictly static metallic limit has a different order of limits.
 
     Energies and occupations are passed twice with complementary one-axis
     shardings.  Each rank forms only its local conduction-by-valence tile;
@@ -721,7 +810,7 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    return _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
         v,
         e,
         e,
@@ -731,6 +820,29 @@ def head_s_tensor_sharded(
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
     )
+    if surface_weight_kn is None:
+        return interband
+    drude = head_drude_tensor_sharded(
+        v,
+        surface_weight_kn,
+        mesh=mesh,
+        nb_logical=int(nb_logical),
+        cell_volume=float(cell_volume),
+        nk_tot=int(nk_tot),
+        nspin=int(nspin),
+        nspinor=int(nspinor),
+    )
+    z = omega + 1j * jnp.asarray(float(eta_ry), dtype=jnp.float64)
+    # The exact static metallic limit is Thomas-Fermi, not the omega->0
+    # value of the dynamic Drude expression.  Leave an exact zero-frequency
+    # slot untouched here; ``head_samples_from_s`` replaces that slot with
+    # the separately averaged TF model when surface weights are present.
+    inv_z2 = jnp.where(
+        jnp.abs(z) > 1.0e-15,
+        1.0 / jnp.square(z),
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
+    return interband + drude[None, :, :] * inv_z2[:, None, None]
 
 
 @dataclass(frozen=True)
@@ -761,6 +873,7 @@ def head_samples_from_s(
     wfn,
     meta,
     config,
+    static_kappa2_bohr2: float | None = None,
 ) -> tuple[object, ...]:
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
     from gw.head_correction import HeadSample, resolve_head_override
@@ -783,11 +896,16 @@ def head_samples_from_s(
         if override is not None:
             out.append(override)
             continue
+        is_static_metal = (
+            static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
         vc0, wc0 = compute_q0_averages(
             wfn,
             jnp.asarray(0.0, dtype=jnp.float64),
             meta,
-            S_cart=S,
+            S_cart=None if is_static_metal else S,
+            static_kappa2=(
+                jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
+                if is_static_metal else None),
             analytic_sphere=bool(config.head.head_minibz_average),
         )
         out.append(
@@ -795,12 +913,13 @@ def head_samples_from_s(
                 vc0=complex(vc0),
                 wcoul0=complex(wc0),
                 source=(
-                    "qsgw_parallel_transport"
+                    ("qsgw_parallel_transport_tf"
+                     if is_static_metal else "qsgw_parallel_transport")
                     if abs(z) <= 1.0e-14
                     else f"qsgw_parallel_transport(omega={z} Ry)"
                 ),
                 omega=z,
-                S_cart=S,
+                S_cart=None if is_static_metal else S,
             )
         )
     return tuple(out)
@@ -815,6 +934,7 @@ def build_iteration_head_samples(
     occupations_qp_kn,
     omegas_ry,
     *,
+    surface_weight_qp_kn=None,
     mesh: Mesh,
     kgrid: tuple[int, int, int],
     bvec_cart,
@@ -848,9 +968,25 @@ def build_iteration_head_samples(
         nspin=int(wfn.nspin),
         nspinor=int(meta.nspinor),
         eta_ry=float(config.head.wcoul0_eta),
+        surface_weight_kn=surface_weight_qp_kn,
     )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
-    samples = head_samples_from_s(S, omegas, wfn=wfn, meta=meta, config=config)
+    static_kappa2 = None
+    if surface_weight_qp_kn is not None:
+        capacity = 2.0 / (
+            float(max(int(wfn.nspin), 1))
+            * float(max(int(meta.nspinor), 1)))
+        # Tetrahedron weights arrive multiplied by Nk to share the distributed
+        # Drude contraction's interface.  Undo that factor for the normalized
+        # BZ density of states, then use kappa_TF^2=8*pi*DOS_Ry/Omega.
+        dos_ry_per_cell = capacity * float(
+            np.sum(np.asarray(surface_weight_qp_kn, dtype=np.float64))) / float(
+                meta.nk_tot)
+        static_kappa2 = (
+            8.0 * np.pi * dos_ry_per_cell / float(meta.cell_volume))
+    samples = head_samples_from_s(
+        S, omegas, wfn=wfn, meta=meta, config=config,
+        static_kappa2_bohr2=static_kappa2)
     return IterationHeadSamples(
         omegas=omegas,
         samples=samples,

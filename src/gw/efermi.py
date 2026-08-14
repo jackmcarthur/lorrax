@@ -66,8 +66,8 @@ import jax.numpy as jnp
 
 
 __all__ = [
-    "fermi_level_step", "mp1_occupations", "occupied_band_count",
-    "solve_mp1_occupations", "step_occupations",
+    "fermi_level_step", "mp1_negative_derivative", "mp1_occupations",
+    "occupied_band_count", "solve_mp1_occupations", "step_occupations",
 ]
 
 # Tolerance for "the cumulative occupancy lands exactly on the target",
@@ -91,6 +91,14 @@ def _mp1_values(E, chemical_potential, broadening):
             - correction / (2.0 * jnp.sqrt(jnp.pi)))
 
 
+def _mp1_negative_derivative_values(E, chemical_potential, broadening):
+    """``-df/dE`` for BerkeleyGW's first-order MP occupation."""
+    x = (E - chemical_potential) / (2.0 * broadening)
+    gaussian = jnp.exp(-jnp.square(x))
+    return ((1.5 - jnp.square(x)) * gaussian
+            / (2.0 * broadening * jnp.sqrt(jnp.pi)))
+
+
 @jax.jit
 def mp1_occupations(E_kn, chemical_potential, broadening_ry) -> jax.Array:
     """First-order MP occupations with BerkeleyGW width semantics.
@@ -100,6 +108,22 @@ def mp1_occupations(E_kn, chemical_potential, broadening_ry) -> jax.Array:
     [0, 1] is deliberately retained.
     """
     return _mp1_values(
+        jnp.asarray(E_kn, dtype=jnp.float64),
+        jnp.asarray(chemical_potential, dtype=jnp.float64),
+        jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+@jax.jit
+def mp1_negative_derivative(
+    E_kn, chemical_potential, broadening_ry,
+) -> jax.Array:
+    """Return the exact MP1 Fermi-surface weight ``-df/dE`` in Ry^-1.
+
+    First-order Methfessel-Paxton is not a positive distribution: its small
+    negative side lobes are part of the configured quadrature and are kept.
+    The width convention is identical to :func:`mp1_occupations`.
+    """
+    return _mp1_negative_derivative_values(
         jnp.asarray(E_kn, dtype=jnp.float64),
         jnp.asarray(chemical_potential, dtype=jnp.float64),
         jnp.asarray(broadening_ry, dtype=jnp.float64))
