@@ -9,7 +9,9 @@ implements
     v_Q   = v_DFT + D_k (H_Q - H_DFT)
 
 and rebuilds the tiny Cartesian S tensor from the resulting band-tiled
-velocity.  The only replicated result is ``(n_omega, 3, 3)``.
+velocity.  When the current centroid wavefunctions are supplied it also
+builds the two q-linear head/body wings.  The wings stay centroid-sharded;
+only the final ``(n_omega, 3, 3)`` Schur-reduced tensor is replicated.
 
 Units and coordinates
 ---------------------
@@ -34,15 +36,19 @@ from common.shard_map import shard_map
 
 
 __all__ = [
+    "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
     "build_iteration_head_samples",
+    "build_iteration_head_response",
     "covariant_cartesian_derivative",
     "covariant_structured_delta",
     "head_s_tensor_sharded",
+    "head_wings_sharded",
     "head_samples_from_s",
+    "finalize_iteration_head_samples",
     "load_parallel_transport_head",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
@@ -673,6 +679,287 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     return kernel
 
 
+def _head_wing_kernel(
+    mesh: Mesh,
+    *,
+    nb_logical: int,
+    include_surface: bool,
+) -> Callable:
+    r"""Return the cached all-band q-linear wing contraction.
+
+    The velocity is already tiled on both band axes.  A naive wing einsum
+    would have to gather one complete band axis because the output centroid
+    axis and one velocity-band axis share the same mesh axis.  Instead each
+    rank circulates its small velocity tile around that mesh axis.  After one
+    ring every local centroid slice has seen every band tile, while no rank
+    ever materialises a full ``nb x nb`` velocity matrix.
+    """
+    key = ("head_wings", id(mesh), int(nb_logical), bool(include_surface))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+    px = int(mesh.shape[ax_x])
+    py = int(mesh.shape[ax_y])
+    perm_x = tuple((i, (i + 1) % px) for i in range(px))
+    perm_y = tuple((i, (i + 1) % py) for i in range(py))
+
+    def _local(
+        v_local,
+        psi_xn_local,
+        psi_yn_local,
+        energies,
+        occupations,
+        surface_weight,
+        omegas,
+        pref_inter,
+        pref_surface,
+        eta,
+    ):
+        nk = v_local.shape[1]
+        nx, ny = v_local.shape[-2:]
+        ns = psi_xn_local.shape[1]
+        nmu_x = psi_xn_local.shape[2]
+        nmu_y = psi_yn_local.shape[2]
+        x_coord = jax.lax.axis_index(ax_x)
+        y_coord = jax.lax.axis_index(ax_y)
+        x_start = x_coord * nx
+        y_start = y_coord * ny
+        z = omegas + 1j * eta
+        dynamic_inv_z = jnp.where(
+            jnp.abs(omegas) > 1.0e-15,
+            1.0 / z,
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+        )
+
+        e_low_y = jax.lax.dynamic_slice(
+            energies, (0, y_start), (nk, ny))
+        f_low_y = jax.lax.dynamic_slice(
+            occupations, (0, y_start), (nk, ny))
+        psi_low_x = jax.lax.dynamic_slice(
+            psi_xn_local, (0, 0, 0, y_start), (nk, ns, nmu_x, ny))
+
+        y0 = jnp.zeros(
+            (omegas.shape[0], 3, nmu_x), dtype=jnp.complex128)
+
+        def _left_step(step, carry):
+            v_tile, acc = carry
+            source_x = jnp.mod(x_coord - step, px)
+            high_start = source_x * nx
+            e_high = jax.lax.dynamic_slice(
+                energies, (0, high_start), (nk, nx))
+            f_high = jax.lax.dynamic_slice(
+                occupations, (0, high_start), (nk, nx))
+            psi_high = jax.lax.dynamic_slice(
+                psi_xn_local, (0, 0, 0, high_start),
+                (nk, ns, nmu_x, nx))
+            dE = e_high[:, :, None] - e_low_y[:, None, :]
+            f_diff = f_low_y[:, None, :] - f_high[:, :, None]
+            global_high = high_start + jnp.arange(nx)
+            global_low = y_start + jnp.arange(ny)
+            logical = (
+                (global_high[:, None] < nb_logical)
+                & (global_low[None, :] < nb_logical)
+            )[None, :, :]
+            transition = logical & (dE > 0.0)
+            denom = z[:, None, None, None] ** 2 - dE[None, :, :, :] ** 2
+            weight = jnp.where(
+                transition[None, :, :, :]
+                & (jnp.abs(denom) > 1.0e-16),
+                pref_inter * f_diff[None, :, :, :] / denom,
+                jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+            )
+            if include_surface:
+                diagonal = logical & (
+                    global_high[:, None] == global_low[None, :]
+                )[None, :, :]
+                surface_high = jax.lax.dynamic_slice(
+                    surface_weight, (0, high_start), (nk, nx))
+                weight = weight + jnp.where(
+                    diagonal[None, :, :, :],
+                    (pref_surface
+                     * dynamic_inv_z[:, None, None, None]
+                     * surface_high[None, :, :, None]),
+                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                )
+            # b_ij(mu)=sum_s conj(psi_i(mu))*psi_j(mu).  This expression
+            # fuses b with the transition sum and never stores nk*nb^2*nmu.
+            acc = acc + jnp.einsum(
+                "akij,wkij,ksmi,ksmj->wam",
+                jnp.conj(v_tile), weight,
+                jnp.conj(psi_high), psi_low_x,
+                optimize=True,
+            )
+            v_next = (
+                jax.lax.ppermute(v_tile, ax_x, perm_x)
+                if px > 1 else v_tile)
+            return v_next, acc
+
+        _, Y_x = jax.lax.fori_loop(0, px, _left_step, (v_local, y0))
+        Y_x = jax.lax.psum(Y_x, ax_y)
+
+        e_high_x = jax.lax.dynamic_slice(
+            energies, (0, x_start), (nk, nx))
+        f_high_x = jax.lax.dynamic_slice(
+            occupations, (0, x_start), (nk, nx))
+        psi_high_y = jax.lax.dynamic_slice(
+            psi_yn_local, (0, 0, 0, x_start), (nk, ns, nmu_y, nx))
+        z0 = jnp.zeros(
+            (omegas.shape[0], nmu_y, 3), dtype=jnp.complex128)
+
+        def _right_step(step, carry):
+            v_tile, acc = carry
+            source_y = jnp.mod(y_coord - step, py)
+            low_start = source_y * ny
+            e_low = jax.lax.dynamic_slice(
+                energies, (0, low_start), (nk, ny))
+            f_low = jax.lax.dynamic_slice(
+                occupations, (0, low_start), (nk, ny))
+            psi_low = jax.lax.dynamic_slice(
+                psi_yn_local, (0, 0, 0, low_start),
+                (nk, ns, nmu_y, ny))
+            dE = e_high_x[:, :, None] - e_low[:, None, :]
+            f_diff = f_low[:, None, :] - f_high_x[:, :, None]
+            global_high = x_start + jnp.arange(nx)
+            global_low = low_start + jnp.arange(ny)
+            logical = (
+                (global_high[:, None] < nb_logical)
+                & (global_low[None, :] < nb_logical)
+            )[None, :, :]
+            transition = logical & (dE > 0.0)
+            denom = z[:, None, None, None] ** 2 - dE[None, :, :, :] ** 2
+            weight = jnp.where(
+                transition[None, :, :, :]
+                & (jnp.abs(denom) > 1.0e-16),
+                pref_inter * f_diff[None, :, :, :] / denom,
+                jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+            )
+            if include_surface:
+                diagonal = logical & (
+                    global_high[:, None] == global_low[None, :]
+                )[None, :, :]
+                surface_low = jax.lax.dynamic_slice(
+                    surface_weight, (0, low_start), (nk, ny))
+                weight = weight + jnp.where(
+                    diagonal[None, :, :, :],
+                    (pref_surface
+                     * dynamic_inv_z[:, None, None, None]
+                     * surface_low[None, :, None, :]),
+                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                )
+            acc = acc + jnp.einsum(
+                "ksmi,ksmj,wkij,bkij->wmb",
+                psi_high_y, jnp.conj(psi_low), weight, v_tile,
+                optimize=True,
+            )
+            v_next = (
+                jax.lax.ppermute(v_tile, ax_y, perm_y)
+                if py > 1 else v_tile)
+            return v_next, acc
+
+        _, Z_y = jax.lax.fori_loop(0, py, _right_step, (v_local, z0))
+        Z_y = jax.lax.psum(Z_y, ax_x)
+        return Y_x, Z_y
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),
+            P(None, None, "x", None),
+            P(None, None, "y", None),
+            P(None, None),
+            P(None, None),
+            P(None, None),
+            P(None),
+            P(),
+            P(),
+            P(),
+        ),
+        out_specs=(P(None, None, "x"), P(None, "y", None)),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def head_wings_sharded(
+    velocity_cart,
+    wfns,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+):
+    r"""Build q-linear head/body wings in the current band basis.
+
+    For every energy-ordered interband pair, with
+    ``b_ij(mu)=sum_s psi_i(mu)^* psi_j(mu)``, this evaluates
+
+    ``Y[a,mu] = sum conj(v[a,ij]) F_ij b_ij(mu)`` and
+    ``Z[mu,b] = sum conj(b_ij(mu)) F_ij v[b,ij]``,
+
+    where ``F_ij = 4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  This is
+    exactly the normalization paired with ``head_s_tensor_sharded``:
+    ``S_direct`` owns ``1/cell_volume`` and the later Schur fold introduces
+    the sole additional ``1/cell_volume`` multiplying ``Y W Z``.
+
+    With tetrahedron surface weights, the finite-frequency intraband wings
+    ``sum delta(E-mu) v_a b_nn / z`` are included as well.  The strictly
+    static metal limit is not obtained by setting ``z=0`` in that expression;
+    its head remains on the separate Thomas-Fermi path.
+    """
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
+    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+        raise ValueError(
+            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            f"velocity (nk,nb)={v.shape[1:3]}.")
+    if (
+        int(wfns.psi_xn.shape[0]) != int(v.shape[1])
+        or int(wfns.psi_yn.shape[0]) != int(v.shape[1])
+        or int(wfns.psi_xn.shape[1]) != int(wfns.psi_yn.shape[1])
+    ):
+        raise ValueError(
+            "centroid wavefunction k/spinor axes do not match the velocity")
+    if int(wfns.psi_xn.shape[-1]) < int(v.shape[-1]):
+        raise ValueError("centroid wavefunctions do not cover the head manifold")
+    psi_xn = wfns.psi_xn[..., : int(v.shape[-1])]
+    psi_yn = wfns.psi_yn[..., : int(v.shape[-1])]
+    include_surface = surface_weight_kn is not None
+    surface = (
+        jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+        if include_surface else jnp.zeros_like(e))
+    if surface.shape != e.shape:
+        raise ValueError(
+            f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
+    spin_denominator = (
+        float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
+    pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
+    return _head_wing_kernel(
+        mesh, nb_logical=int(nb_logical),
+        include_surface=bool(include_surface))(
+            v, psi_xn, psi_yn, e, f, surface, omega,
+            jnp.asarray(pref_inter, dtype=jnp.complex128),
+            jnp.asarray(pref_surface, dtype=jnp.complex128),
+            jnp.asarray(float(eta_ry), dtype=jnp.float64),
+        )
+
+
 def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     """Compile the Fermi-surface velocity contraction once per band shape."""
     key = ("head_drude", id(mesh), int(nb_logical))
@@ -846,6 +1133,20 @@ def head_s_tensor_sharded(
 
 
 @dataclass(frozen=True)
+class IterationHeadResponse:
+    """Direct head and centroid-sharded wings before the body Schur fold."""
+
+    omegas: tuple[complex, ...]
+    S_direct: jax.Array
+    Y_x: jax.Array | None
+    Z_y: jax.Array | None
+    static_kappa2_bohr2: float | None
+    sigma_energies_ry: np.ndarray
+    sigma_occupations: np.ndarray
+    efermi_ry: float
+
+
+@dataclass(frozen=True)
 class IterationHeadSamples:
     """Per-iteration q=0 samples plus the matching active QP spectrum."""
 
@@ -864,6 +1165,87 @@ class IterationHeadSamples:
             f"QSGW iteration head has no sample at omega={z} Ry; "
             f"available={self.omegas}."
         )
+
+
+def finalize_iteration_head_samples(
+    response: IterationHeadResponse,
+    *,
+    wfn,
+    meta,
+    config,
+    mesh: Mesh,
+    requests=None,
+    W_by_role=None,
+) -> IterationHeadSamples:
+    """Apply the optional body Schur fold and mini-BZ-average the head.
+
+    ``W_by_role`` is the already-screened finite-G/centroid body returned by
+    :func:`gw.screening.compute_screening`.  Flat q index zero is Gamma in
+    the production C-order convention, and its singular head channel is
+    absent, so ``W_by_role[role][0]`` is precisely the body operand required
+    by the bordered-Dyson reduction.
+
+    Passing no ``W_by_role`` intentionally produces the direct-head result.
+    This keeps the one-shot diagnostic API and X-only path unchanged.
+    """
+    S_effective = response.S_direct
+    if W_by_role:
+        if response.Y_x is None or response.Z_y is None:
+            raise ValueError(
+                "body-screened QSGW head requested without head/body wings")
+        if requests is None:
+            raise ValueError("screening requests are required to match W roles")
+        reqs = tuple(requests)
+        if len(reqs) != len(response.omegas):
+            raise ValueError(
+                f"head has {len(response.omegas)} frequencies but screening "
+                f"has {len(reqs)} requests")
+        W_gamma = []
+        for omega, req in zip(response.omegas, reqs):
+            if abs(complex(req.omega_ry) - omega) > 1.0e-12:
+                raise ValueError(
+                    f"head/screening frequency mismatch: {omega} vs "
+                    f"{req.omega_ry} ({req.role})")
+            try:
+                W_role = W_by_role[req.role]
+            except KeyError as exc:
+                raise KeyError(
+                    f"screening did not return required head role {req.role!r}") \
+                    from exc
+            W_gamma.append(W_role[0])
+        W_gamma = jnp.stack(W_gamma, axis=0)
+        if (
+            int(W_gamma.shape[-2]) != int(response.Y_x.shape[-1])
+            or int(W_gamma.shape[-1]) != int(response.Z_y.shape[-2])
+        ):
+            raise ValueError(
+                "QSGW head-wing centroid extents do not match W(Gamma): "
+                f"Y={response.Y_x.shape}, W={W_gamma.shape}, "
+                f"Z={response.Z_y.shape}")
+        from gw.head_correction import fold_cartesian_head_wings_sharded
+        S_effective = fold_cartesian_head_wings_sharded(
+            response.S_direct,
+            response.Y_x,
+            W_gamma,
+            response.Z_y,
+            float(meta.cell_volume),
+            mesh_xy=mesh,
+        )
+    samples = head_samples_from_s(
+        S_effective,
+        response.omegas,
+        wfn=wfn,
+        meta=meta,
+        config=config,
+        static_kappa2_bohr2=response.static_kappa2_bohr2,
+    )
+    return IterationHeadSamples(
+        omegas=response.omegas,
+        samples=samples,
+        sigma_energies_ry=response.sigma_energies_ry,
+        sigma_occupations=response.sigma_occupations,
+        efermi_ry=response.efermi_ry,
+    )
 
 
 def head_samples_from_s(
@@ -925,7 +1307,7 @@ def head_samples_from_s(
     return tuple(out)
 
 
-def build_iteration_head_samples(
+def build_iteration_head_response(
     delta_h_dft,
     connection_cart,
     velocity_dft_cart,
@@ -944,8 +1326,9 @@ def build_iteration_head_samples(
     wfn,
     meta,
     config,
-) -> IterationHeadSamples:
-    """Build the complete no-wavefunction head state for one SC iteration."""
+    wfns_qp=None,
+) -> IterationHeadResponse:
+    """Build current-basis direct head and, when requested, its wings."""
     correction = covariant_structured_delta(
         delta_h_dft,
         connection_cart,
@@ -970,6 +1353,22 @@ def build_iteration_head_samples(
         eta_ry=float(config.head.wcoul0_eta),
         surface_weight_kn=surface_weight_qp_kn,
     )
+    Y_x = Z_y = None
+    if wfns_qp is not None:
+        Y_x, Z_y = head_wings_sharded(
+            v_qp,
+            wfns_qp,
+            energies_qp_kn_ry,
+            occupations_qp_kn,
+            omegas_ry,
+            mesh=mesh,
+            nb_logical=nb_logical,
+            nk_tot=int(meta.nk_tot),
+            nspin=int(wfn.nspin),
+            nspinor=int(meta.nspinor),
+            eta_ry=float(config.head.wcoul0_eta),
+            surface_weight_kn=surface_weight_qp_kn,
+        )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     static_kappa2 = None
     if surface_weight_qp_kn is not None:
@@ -984,18 +1383,62 @@ def build_iteration_head_samples(
                 meta.nk_tot)
         static_kappa2 = (
             8.0 * np.pi * dos_ry_per_cell / float(meta.cell_volume))
-    samples = head_samples_from_s(
-        S, omegas, wfn=wfn, meta=meta, config=config,
-        static_kappa2_bohr2=static_kappa2)
-    return IterationHeadSamples(
+    return IterationHeadResponse(
         omegas=omegas,
-        samples=samples,
+        S_direct=S,
+        Y_x=Y_x,
+        Z_y=Z_y,
+        static_kappa2_bohr2=static_kappa2,
         sigma_energies_ry=np.asarray(sigma_energies_ry, dtype=np.float64),
         sigma_occupations=np.asarray(occupations_qp_kn, dtype=np.float64)[
             :, : np.shape(sigma_energies_ry)[1]
         ],
         efermi_ry=float(efermi_ry),
     )
+
+
+def build_iteration_head_samples(
+    delta_h_dft,
+    connection_cart,
+    velocity_dft_cart,
+    U_dft_to_qp,
+    energies_qp_kn_ry,
+    occupations_qp_kn,
+    omegas_ry,
+    *,
+    surface_weight_qp_kn=None,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    sigma_energies_ry,
+    efermi_ry: float,
+    wfn,
+    meta,
+    config,
+) -> IterationHeadSamples:
+    """Backward-compatible direct-head builder used by small diagnostics."""
+    response = build_iteration_head_response(
+        delta_h_dft,
+        connection_cart,
+        velocity_dft_cart,
+        U_dft_to_qp,
+        energies_qp_kn_ry,
+        occupations_qp_kn,
+        omegas_ry,
+        surface_weight_qp_kn=surface_weight_qp_kn,
+        mesh=mesh,
+        kgrid=kgrid,
+        bvec_cart=bvec_cart,
+        nb_logical=nb_logical,
+        sigma_energies_ry=sigma_energies_ry,
+        efermi_ry=efermi_ry,
+        wfn=wfn,
+        meta=meta,
+        config=config,
+    )
+    return finalize_iteration_head_samples(
+        response, wfn=wfn, meta=meta, config=config, mesh=mesh)
 
 
 def validate_dft_velocity_identity(

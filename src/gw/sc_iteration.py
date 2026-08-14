@@ -1191,19 +1191,27 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
             f"orbitals (E_F = {e_f_ry:.6f} Ry)")
 
+    # Per-mode screening plan.  The q->0 head uses this exact frequency/role
+    # table so a Schur-folded probe can never drift from the body W it folds.
+    requests = screening_requests_for(
+        inputs.config.compute_mode, inputs.config)
+
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
     # DeltaH=0 and U=I, so this reconstructs the DFT head through the same
-    # prevalidated path used thereafter. Only saved A/v and the carried H
-    # are touched; no wavefunction coefficients enter this route.
+    # prevalidated path used thereafter.  Saved A/v and the carried H build
+    # the direct tensor.  The already-resident, already-rotated centroid
+    # wavefunctions build q-linear wings; they are not reloaded here.
     iteration_head = None
+    iteration_head_response = None
     iteration_static_head_terms = inputs.static_head_terms
     pt = getattr(inputs, "parallel_transport", None)
     if pt is not None:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import (
             assemble_delta_head_manifold,
-            build_iteration_head_samples,
+            build_iteration_head_response,
+            finalize_iteration_head_samples,
         )
 
         H_active_full = (
@@ -1227,9 +1235,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             delta_active, tail_diagonal, nb_storage=nb_storage,
             mesh=inputs.mesh_xy)
 
-        omegas = [0.0 + 0.0j]
-        if inputs.config.compute_mode.ppm_model == "gn":
-            omegas.append(1j * float(inputs.config.ppm.omega_p))
+        omegas = (
+            [complex(req.omega_ry) for req in requests]
+            if requests else [0.0 + 0.0j])
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
         head_surface_weight_kn = None
@@ -1258,7 +1266,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
             head_surface_weight_kn = state.head_surface_weight_kn
 
-        iteration_head = build_iteration_head_samples(
+        iteration_head_response = build_iteration_head_response(
             delta_head,
             pt.connection_cart,
             pt.velocity_dft_cart,
@@ -1276,22 +1284,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfn=inputs.wfn,
             meta=inputs.meta,
             config=inputs.config,
+            wfns_qp=wfns_qp,
         )
-        if bool(inputs.config.do_G0):
-            iteration_static_head_terms = compute_static_head_terms_from_sample(
-                iteration_head.at(0.0 + 0.0j),
-                occ=np.asarray(head_occ_kn[:, :inputs.meta.nb_sigma]),
-                cell_volume=float(inputs.meta.cell_volume),
-                nk_tot=int(inputs.meta.nk_tot),
-            )
         inputs.print_fn(
-            "    SC head: QSGW covariant velocity from saved parallel "
-            f"transport (nb={pt.nb_logical}, samples={len(omegas)})")
+            "    SC head: QSGW covariant velocity + current-basis wings "
+            "from saved parallel transport/current centroid bundle "
+            f"(nb={pt.nb_logical}, samples={len(omegas)})")
 
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
-    requests = screening_requests_for(
-        inputs.config.compute_mode, inputs.config)
     W_by_role = compute_screening(
         wfns_qp, inputs.V_q, requests,
         quad=inputs.quad, e_ref=inputs.e_ref,
@@ -1300,6 +1301,32 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         print_fn=inputs.print_fn,
         head_channel=getattr(inputs, 'head_channel', None),
     )
+
+    if iteration_head_response is not None:
+        iteration_head = finalize_iteration_head_samples(
+            iteration_head_response,
+            wfn=inputs.wfn,
+            meta=inputs.meta,
+            config=inputs.config,
+            mesh=inputs.mesh_xy,
+            requests=requests,
+            W_by_role=W_by_role,
+        )
+        if W_by_role:
+            inputs.print_fn(
+                "    SC head: folded q-linear wings through screened "
+                "W_body(Gamma) before the mini-BZ average")
+        if bool(inputs.config.do_G0):
+            iteration_static_head_terms = compute_static_head_terms_from_sample(
+                iteration_head.at(0.0 + 0.0j),
+                occ=np.asarray(head_occ_kn[:, :inputs.meta.nb_sigma]),
+                cell_volume=float(inputs.meta.cell_volume),
+                nk_tot=int(inputs.meta.nk_tot),
+            )
+
+    # TODO(metal-screening): W_body above still uses the historical minimax
+    # valence/conduction band cut.  Only the q->0 head and wings use the
+    # carried MP1 occupations in this change; finite-q chi0 stays untouched.
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
     # so intermediate SC iterations don't thrash sigma_mnk.h5; the
