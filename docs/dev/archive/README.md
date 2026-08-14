@@ -6,12 +6,12 @@ This folder contains older documentation that has been **superseded** by the com
 
 | Old File | Superseded By | Notes |
 |----------|---------------|-------|
-| `formalism.md` | `../PHYSICS_COMPREHENSIVE.md` §1-3 | Terse, missing spin details |
-| `isdf_context.md` | `../PHYSICS_COMPREHENSIVE.md` §2-3 | Incomplete (cuts off mid-sentence) |
-| `cohsex_jax_physics.md` | `../PHYSICS_COMPREHENSIVE.md` §6-7 | Verbose, streamlined in comprehensive doc |
-| `ZETA_FITTING_ALGORITHM.md` | `../PHYSICS_COMPREHENSIVE.md` §4-5 | Redundant with comprehensive doc |
-| `isdf_spin_galerkin_derivation.md` | `../PHYSICS_COMPREHENSIVE.md` §3 | CCT/ZCT derivation already included |
-| `ctsp_revised.md` | `../MINIMAX_QUADRATURE.md` | Overlaps with minimax quadrature reference |
+| `formalism.md` | [`physics.md`](../../theory/physics.md) | Terse predecessor of the current shared-theory chapter |
+| `isdf_context.md` | [`physics.md`](../../theory/physics.md) | Incomplete predecessor |
+| `cohsex_jax_physics.md` | [`physics.md`](../../theory/physics.md) | Verbose predecessor of the current shared-theory chapter |
+| `ZETA_FITTING_ALGORITHM.md` | [`isdf-zeta-vq.md`](../../theory/isdf-zeta-vq.md) | Superseded real-space algorithm |
+| `isdf_spin_galerkin_derivation.md` | [`isdf-zeta-vq.md`](../../theory/isdf-zeta-vq.md) | CCT/ZCT derivation retained in concise form |
+| `ctsp_revised.md` | [`minimax-quadrature.md`](../../theory/minimax-quadrature.md) | Overlaps with the current quadrature reference |
 | `cold_start_2026-07.md` | `../../environment/machines/frontera.md` §3 | Point-in-time measurement record (jobs 7882055/7882076/7882070/7882139) — preserved verbatim; the operative recipe moved |
 | `HANDOFF_2026-07-28.md`, `HANDOFF_2026-07-29.md`, `HANDOFF_cpu_frontera_2026-07.md` | current docs + `SPEEDUP_SCORECARD.md` | Point-in-time campaign handoffs |
 

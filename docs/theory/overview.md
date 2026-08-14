@@ -1,66 +1,43 @@
-## ISDF + GW Formalism (COHSEX focus)
+# Theory map
 
-This page summarizes the working equations used in this codebase. It is a condensed, renderable version of the notes in docs/dev/archive/isdf_context.md.
+LORRAX evaluates GW and related response functions in an interpolative
+separable density-fitting (ISDF) basis. The common calculation is
 
-### Wavefunctions and notation
+$$
+\{\psi_{n\mathbf k},\epsilon_{n\mathbf k}\}
+\longrightarrow \zeta_{q\mu}
+\longrightarrow (V_q,\chi^0_q)
+\longrightarrow W_q
+\longrightarrow \Sigma_{\mathbf k}(\omega)
+\longrightarrow H_{\mathrm{QP}}.
+$$
 
-We work with spinor wavefunctions on a real-space grid r and k-points k:
+Each arrow has one detailed owner:
 
-- psi_nk(r): band n, k-point k, and spinor index s (suppressed when clear)
-- cnk(G): plane-wave coefficients on FFT grid G
-- FFTs connect cnk(G) ↔ psi_nk(r)
+| question | read |
+|---|---|
+| How do ISDF, screening, self-energy, and QSGW fit together? | [Core ISDF and GW theory](physics.md) |
+| How are interpolation vectors and Coulomb matrices formed? | [G-flat zeta and V](isdf-zeta-vq.md) |
+| Which symmetry convention controls irreducible-zone work and unfolding? | [Symmetry](symmetry.md) |
+| How are static and GN/HL-PPM frequency integrals separated? | [Minimax quadrature](minimax-quadrature.md) |
+| What fixes the HL plasmon pole? | [HL-GPP derivation](hl-gpp-derivation.md) |
+| How are MPA samples, poles, and Sigma windows constructed? | [Multipole frequency integration](THEORY_mpa_implementation.md) |
+| What is the long-wavelength response convention? | [S-tensor convention](s-tensor-convention.md) |
+| Why is the exchange head direction dependent? | [LT splitting and the exchange head](lt-exchange-head.md) |
 
-### ISDF basis selection
+The theory pages state equations, conventions, validity domains, and the few
+data layouts forced by those equations. Exact input defaults belong to the
+[input reference](../input_reference.md). Module ownership and dependency
+rules belong to [architecture](../architecture/codebase.md). Historical
+measurements and implementation campaigns belong under `docs/reports` or
+`docs/dev`, not here.
 
-1. Build charge density from a chosen band window (valence + some conduction)
-2. Select interpolation points r_mu via k-means/CVT over the density
+Three principles recur throughout:
 
-### Density-product approximation
-
-For each crystal momentum transfer q, approximate the density product:
-
-rho_q(mnk, r) = psi*_{m,k−q}(r) psi_{n,k}(r) ≈ sum_mu zeta_{q,mu}(r) psi*_{m,k−q}(r_mu) psi_{n,k}(r_mu)
-
-We solve a least-squares system for zeta_{q,mu}(r):
-
-Z_q(r_mu, r) = sum_k P*_{k−q}(r_mu, r) P_k(r_mu, r)
-C_q(r_mu, r_nu) = sum_k P*_{k−q}(r_mu, r_nu) P_k(r_mu, r_nu)
-C_q zeta_q = Z_q
-
-where P_k(r, r_mu) = sum_n psi_{n,k}(r) psi_{n,k}(r_mu). Spinor structure is carried in psi but zeta_q is spin-independent.
-
-### Coulomb matrix elements in the ISDF basis
-
-Define z_q,mu(r) = e^{−i q·r} zeta_{q,mu}(r). In reciprocal space:
-
-V_{q,mu,nu} = sum_G z*_{q,mu}(G) v_q(G) z_{q,nu}(G)
-
-with v_q(G) the Coulomb kernel (truncated in 2D; q=G=0 handled analytically/MC per BerkeleyGW conventions).
-
-### Green’s function and COHSEX
-
-At t=0 (static limit), we build G from occupied and unoccupied subspaces. In practice we use psi evaluated on r_mu and zeta-derived V_mu,nu on the k-grid, transform to mixed R-space as needed, and form
-
-sigma_X ∝ G ∘ V  (element-wise in the mixed representation),
-
-then project back to band space Sigma_kij by contracting with psi. Screened exchange (SX) and Coulomb-hole (COH) can be obtained if W replaces V (via chi0).
-
-### Practical notes
-
-- All large arrays are sharded over devices using JAX NamedSharding and PartitionSpec
-- Wavefunction FFTs are performed once per window, then reduced to psi(r_mu)
-- q-loops materialize only the minimal data needed (zeta for one q at a time)
-
-For implementation details, see `src/gw/gw_jax.py` and `src/gw/w_isdf.py`.
-
-
-
-### Self consistency (updated 2026-07-31)
-
-Self-consistent updates iterate the V_Hartree and Sigma_GW contributions until the quasiparticle Hamiltonian is stationary. The DFT Hamiltonian is K (kinetic) + I (ionic local + nonlocal) + H (Hartree) + Vxc; `gw.kin_ion_io` writes the K+I elements (and, by default, the exact V_H) to file so the run can rebuild V_Hartree + Sigma_GW itself, and `psp.get_dipole_mtxels` supplies the dipole matrix elements for the q→0 head correction to W.
-
-QSGW (`qp_solver = self_consistent`, `gw_config.QPSolver`) uses the
-mode-agnostic Sigma dispatch for enabled dynamic modes. MPA remains declared
-but refused until its real-material disk pipeline passes end to end; see
-[Multipole frequency integration](THEORY_mpa_implementation.md). The loop
-knobs (`sc_max_iter`, `sc_tol_ev`, rCROP/linear acceleration) are deck keys.
+1. Occupation selects a spectral branch; it does not redefine a signed band
+   energy.
+2. Expensive pair sums are replaced by separable Green-function contractions,
+   and symmetry is used only where the operation commutes with unfolding.
+3. Scalar quadrature, distributed storage, and spatial physics have distinct
+   owners. A numerical rule never knows about bands or HDF5; SlabIO never
+   decides physics.
