@@ -2236,6 +2236,25 @@ class LorraxConfig:
     # --- Input directory (for resolving relative paths at runtime) ---
     input_dir: str = ""
 
+    def __post_init__(self):
+        """Refuse fractional-occupation settings outside their landed scope."""
+        if self.screening.occ_broadening_ev == 0.0:
+            return
+        if self.qp_solver is not QPSolver.SELF_CONSISTENT:
+            raise ValueError(
+                "occ_broadening > 0 is currently implemented only for "
+                "qp_solver=self_consistent.")
+        if self.sc.head_update != "parallel_transport":
+            raise ValueError(
+                "occ_broadening > 0 currently updates only the QSGW head; "
+                "set sc_head_update=parallel_transport.")
+        if self.sc.accelerator != "linear":
+            raise ValueError(
+                "occ_broadening > 0 carries an exact end-of-iteration MP1 "
+                "occupation state and therefore currently requires "
+                "sc_accelerator=linear.  rCROP mixes only the Hamiltonian "
+                "and cannot preserve that sequential state exactly.")
+
     # ------------------------------------------------------------------
     #  Derived config objects
     # ------------------------------------------------------------------

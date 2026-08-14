@@ -16,10 +16,8 @@ iteration"); the only consumers are ``dump_sigma_omega_h5_final`` and
 survives.
 
 That "nothing reads it" is the load-bearing claim, so it is the
-assertion: ``gw_iteration_map`` may touch ``state.iteration`` and
-``state.H_qp_dft`` and nothing else.  A later change that made the map
-depend on the previous Σ would silently make the drop wrong, and would
-fail here first.
+assertion: ``gw_iteration_map`` may touch the Hamiltonian/counter and the
+small lagged QSGW-head occupation state, but never the previous Sigma.
 
 AST plus source text, no jax, so it runs anywhere.
 """
@@ -55,14 +53,14 @@ def _state_attrs(fn, var="state"):
             and isinstance(n.value, ast.Name) and n.value.id == var}
 
 
-def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
+def test_gw_iteration_map_reads_only_the_iteration_carry():
     assert _state_attrs(_func("gw_iteration_map")) == {
-        "iteration", "H_qp_dft"}
+        "iteration", "H_qp_dft", "head_efermi_ry", "head_occ_kn"}
 
 
 @pytest.mark.parametrize("driver", ["_run_rcrop", "_run_linear_mixing"])
 def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
-    """Every ``SCState(...)`` built as a map ARGUMENT carries H and i only.
+    """No ``SCState(...)`` built as a map argument carries stale Sigma.
 
     The finalize state at the end of ``_run_rcrop`` legitimately carries
     the last Σ, so the check is on the constructions whose keywords are
@@ -75,9 +73,13 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "SCState":
             keys = {kw.arg for kw in node.keywords}
-            (inputs if keys == {"H_qp_dft", "iteration"} else finals).append(
-                keys)
-    assert inputs, f"{driver} builds no bare input SCState"
+            if "last_sigma_result" in keys:
+                finals.append(keys)
+            else:
+                inputs.append(keys)
+    assert inputs, f"{driver} builds no input SCState"
+    for keys in inputs:
+        assert "last_sigma_result" not in keys
     for keys in finals:
         assert "last_sigma_result" in keys, (
             f"{driver} builds an SCState with {sorted(keys)} — an argument "
@@ -99,7 +101,7 @@ def test_rcrop_clears_the_capture_cells_before_the_map_call():
 
 def test_linear_mixing_rebuilds_the_carry_before_the_map_call():
     body = _block("_run_linear_mixing")
-    rebuild = body.index("state = SCState(H_qp_dft=state.H_qp_dft")
+    rebuild = body.index("state = SCState(")
     call = body.index("gw_iteration_map(")
     assert rebuild < call
 
