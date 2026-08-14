@@ -112,6 +112,23 @@ def test_global_gauss_rectangle_rule_is_smaller_and_stable():
     assert 0.99 < rule["kappa0"] <= 1.0
 
 
+def test_global_gauss_width_boundary_does_not_seed_linear_rank():
+    rule = evaluator.damped_rectangle_gauss_rule(
+        1.0, 100.0, 20.0, rel_tol=1.0e-4, max_nodes=100)
+    assert rule["n_nodes"] <= 65
+    assert rule["sampled_max_error"] <= 1.0e-4
+
+
+def test_global_gauss_zero_frequency_and_scale_invariance():
+    base = evaluator.damped_rectangle_gauss_rule(
+        0.2, 1.1, 0.0, rel_tol=1.0e-4)
+    scaled = evaluator.damped_rectangle_gauss_rule(
+        0.6, 3.3, 0.0, rel_tol=1.0e-4)
+    assert scaled["n_nodes"] == base["n_nodes"]
+    np.testing.assert_allclose(scaled["t"], base["t"] / 3.0)
+    np.testing.assert_allclose(scaled["h"], base["h"] / 3.0)
+
+
 # ---------------------------------------------------------------------------
 # 1. The kernel
 # ---------------------------------------------------------------------------
@@ -613,10 +630,11 @@ def test_evaluate_then_fit_recovers_the_planted_spectrum():
 
     WHERE THE TOLERANCE COMES FROM, and what actually limits it.  The
     recovery is compared against the SAME fit run on closed-form
-    samples, so the fit's own conditioning (measured ~6.6e8 here) is
-    divided out of the claim: what is asserted is that evaluating
-    instead of synthesizing costs less than a factor of a hundred in
-    pole position.  The measured sample error is NOT the damped rule's
+    samples to expose the fit's own conditioning separately.  The
+    acceptance gates are absolute: a ratio to the synthesis error becomes
+    stricter when the reference solve happens to be more accurate and is
+    therefore not a stable numerical requirement.  The measured sample
+    error is NOT the damped rule's
     -- at ``rel_tol = 1e-12`` that is 2e-12 -- but the imaginary-axis
     family's, which has ZERO shipped tables and solves at runtime; at
     the 1e-10 target used here it contributes ~1.5e-10, and tightening
@@ -665,7 +683,6 @@ def test_evaluate_then_fit_recovers_the_planted_spectrum():
     assert sample_error < 1.0e-8
     assert worst_synth < 1.0e-7
     assert worst_eval < 1.0e-5
-    assert worst_eval < 100.0 * worst_synth
 
 
 def test_cost_report_states_what_the_plan_demands():

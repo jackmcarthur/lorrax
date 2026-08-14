@@ -17,7 +17,7 @@ import numpy as np
 
 import minimax
 
-from gw.mpa.evaluator import damped_rectangle_gauss_rule
+from gw.mpa.evaluator import damped_rectangle_positive_rule
 from gw.minimax_screening import MinimaxNodes
 from gw.ppm_windows import _SigmaBranch, _SigmaWindow
 
@@ -41,13 +41,13 @@ def _selector(a_hi=_INF, gamma_lo=-_INF, gamma_hi=_INF):
                       dtype=np.float64)
 
 
-def _stats(Omega, bounds):
+def _stats(Omega, B, bounds):
     a, gamma = jnp.real(Omega), -jnp.imag(Omega)
     b = jnp.asarray(bounds)
-    mask = ((a > b[0]) & (a <= b[1])
+    live = jnp.abs(B) > 0.0
+    mask = (live & (a > b[0]) & (a <= b[1])
             & (gamma >= b[2]) & (gamma > b[3])
             & (gamma < b[4]) & (gamma <= b[5]))
-    live = jnp.abs(Omega) > np.finfo(np.float64).tiny
     count, lo_a, hi_a, lo_g, hi_g, bad = jax.device_get((
         jnp.sum(mask, dtype=jnp.int64),
         jnp.min(jnp.where(mask, a, jnp.inf)),
@@ -66,11 +66,11 @@ def _stats(Omega, bounds):
 
 
 @jax.jit
-def _stats_all_poles(Omega, bounds):
+def _stats_all_poles(Omega, B, bounds):
     """Per-pole selector bounds without iterating a distributed array."""
     a, gamma = jnp.real(Omega), -jnp.imag(Omega)
     b = jnp.asarray(bounds)
-    mask = ((a > b[0]) & (a <= b[1])
+    mask = ((jnp.abs(B) > 0.0) & (a > b[0]) & (a <= b[1])
             & (gamma >= b[2]) & (gamma > b[3])
             & (gamma < b[4]) & (gamma <= b[5]))
     axes = tuple(range(1, Omega.ndim))
@@ -84,15 +84,19 @@ def _stats_all_poles(Omega, bounds):
 
 
 @jax.jit
-def _unsupported_pole_count(Omega):
+def _pole_refusal_counts(Omega, B):
     a, gamma = jnp.real(Omega), -jnp.imag(Omega)
-    live = jnp.abs(Omega) > np.finfo(np.float64).tiny
-    return jnp.sum(live & ((a <= 0.0) | (gamma < 0.0)), dtype=jnp.int64)
+    finite_B = jnp.isfinite(jnp.real(B)) & jnp.isfinite(jnp.imag(B))
+    live = finite_B & (jnp.abs(B) > 0.0)
+    return (
+        jnp.sum(~finite_B, dtype=jnp.int64),
+        jnp.sum(live & ((a <= 0.0) | (gamma < 0.0)), dtype=jnp.int64),
+    )
 
 
-def _stats_by_pole(Omega, bounds):
+def _stats_by_pole(Omega, B, bounds):
     arrays = tuple(np.asarray(x) for x in jax.device_get(
-        _stats_all_poles(Omega, bounds)))
+        _stats_all_poles(Omega, B, bounds)))
     out = []
     for i in range(int(Omega.shape[0])):
         if not int(arrays[0][i]):
@@ -102,10 +106,10 @@ def _stats_by_pole(Omega, bounds):
     return tuple(out)
 
 
-def _rows(Omega_poles, bounds, phase_real):
+def _rows(Omega_poles, B_poles, bounds, phase_real):
     indices, selectors, phases, stats = [], [], [], []
-    for pole, Omega in enumerate(Omega_poles):
-        got = _stats(Omega, bounds)
+    for pole, (Omega, B) in enumerate(zip(Omega_poles, B_poles)):
+        got = _stats(Omega, B, bounds)
         if got is not None:
             indices.append(pole)
             selectors.append(bounds)
@@ -119,7 +123,9 @@ def _rows(Omega_poles, bounds, phase_real):
 def _geometry(branches, regularization_width_ry, edge_factor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
-    eta = max(float(regularization_width_ry), 1e-12)
+    eta = float(regularization_width_ry)
+    if not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("MPA sigma eta must be finite and positive")
     crossing_edge = omega_max + float(edge_factor) * eta
     selectors = {
         "all": _selector(),
@@ -132,6 +138,7 @@ def _geometry(branches, regularization_width_ry, edge_factor):
 
 def summarize_sigma_poles(
     Omega_poles,
+    B_poles,
     branches,
     *,
     regularization_width_ry,
@@ -141,13 +148,18 @@ def summarize_sigma_poles(
     """Reduce one resident pole batch to the scalar planning evidence."""
     _omega_max, _eta, _crossing_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
-    bad = int(jax.device_get(_unsupported_pole_count(Omega_poles)))
+    if B_poles.shape != Omega_poles.shape:
+        raise ValueError("Omega_poles and B_poles must have identical shapes")
+    nonfinite, bad = map(int, jax.device_get(
+        _pole_refusal_counts(Omega_poles, B_poles)))
+    if nonfinite:
+        raise ValueError(f"MPA fit contains {nonfinite} nonfinite residues")
     if bad:
         raise ValueError(
             f"MPA fit contains {bad} unsupported live poles with "
             "Re Omega <= 0 or Im Omega > 0")
     evidence = {
-        name: _stats_by_pole(Omega_poles, bounds)
+        name: _stats_by_pole(Omega_poles, B_poles, bounds)
         for name, bounds in selectors.items()
     }
     return tuple(
@@ -229,6 +241,7 @@ def build_shared_sigma_windows(
     Omega_poles,
     branches: list[_SigmaBranch],
     *,
+    B_poles=None,
     regularization_width_ry: float,
     edge_factor: float,
     target_error: float = 1.0e-4,
@@ -248,14 +261,20 @@ def build_shared_sigma_windows(
     batching is solely an executor memory policy and never a spectral split.
     """
     poles = () if Omega_poles is None else tuple(Omega_poles)
+    residues = (() if B_poles is None else tuple(B_poles))
     summaries = None if pole_summaries is None else tuple(pole_summaries)
     if not poles and not summaries:
         raise ValueError("MPA Sigma needs at least one pole field")
     omega_max, eta, crossing_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
     if summaries is None:
+        if not residues:
+            raise ValueError(
+                "B_poles are required when pole_summaries are absent")
+        if len(residues) != len(poles):
+            raise ValueError("Omega_poles and B_poles must have equal length")
         selected = {
-            name: _rows(poles, bounds, False)
+            name: _rows(poles, residues, bounds, False)
             for name, bounds in selectors.items()
         }
     else:
@@ -350,7 +369,7 @@ def build_shared_sigma_windows(
                           for w in (w_lo, w_hi)
                           for e in eb
                           for a in (a_lo, a_hi)))
-            rule = damped_rectangle_gauss_rule(
+            rule = damped_rectangle_positive_rule(
                 gamma_min, gamma_max, f_max, rel_tol=target_error,
                 max_nodes=crossing_max_nodes)
             raw_nodes = MinimaxNodes(
@@ -362,8 +381,15 @@ def build_shared_sigma_windows(
                     win = _window(
                         "core", exact_nodes, mask, eb[0], +1, "full", -neg,
                         rule["sampled_max_error"],
-                        "positive global Gauss damped crossing rule; "
+                        f"positive {rule['rule_type']} damped crossing rule; "
+                        f"eta {eta:.6e}; gamma "
+                        f"[{gamma_min:.6e},{gamma_max:.6e}]; "
+                        f"f_max {f_max:.6e}; target {target_error:.3e}; "
                         f"sampled error {rule['sampled_max_error']:.3e}; "
+                        f"continuum cover "
+                        f"{rule['continuum_error_bound']:.3e}; "
+                        f"tail fraction "
+                        f"{rule['tail_budget_fraction']:.3f}; "
                         f"kappa {rule['kappa0']:.6f}; "
                         f"rank {exact_nodes.t.size}")
                     output.append(SharedSigmaWindow(

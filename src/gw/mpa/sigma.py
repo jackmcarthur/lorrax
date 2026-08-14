@@ -233,7 +233,7 @@ def compute_sigma_c_mpa_omega_grid(
             fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
             unfold=True, return_sharded=True, to_unit="Ry")
         summaries.extend(summarize_sigma_poles(
-            Omega, branches,
+            Omega, B, branches,
             regularization_width_ry=regularization_width_ry,
             edge_factor=edge_factor, pole_offset=lo))
         del Omega, B

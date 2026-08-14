@@ -467,6 +467,29 @@ def damped_rectangle_rule(
     }
 
 
+def _damped_rectangle_boundary(g0, g1, f, n_x, n_gamma, *, midpoint):
+    if midpoint:
+        x = -f + (np.arange(int(n_x)) + 0.5) * 2.0 * f / int(n_x)
+        fraction = (np.arange(int(n_gamma)) + 0.5) / int(n_gamma)
+    else:
+        x = np.linspace(-f, f, int(n_x))
+        fraction = np.linspace(0.0, 1.0, int(n_gamma))
+    gamma = (np.asarray([g0]) if g1 == g0 else
+             np.exp(np.log(g0) + fraction * np.log(g1 / g0)))
+    return np.unique(np.r_[g0 - 1j * x, g1 - 1j * x,
+                           gamma + 1j * f, gamma - 1j * f])
+
+
+def _damped_rectangle_score(t, h, boundary):
+    worst = 0.0
+    for left in range(0, boundary.size, 2048):
+        z = boundary[left:left + 2048]
+        residual = 1.0 - (
+            z[:, None] * np.exp(-z[:, None] * t[None, :])) @ h
+        worst = max(worst, float(np.max(np.abs(residual))))
+    return worst
+
+
 def damped_rectangle_gauss_rule(
     gamma_min,
     gamma_max,
@@ -475,7 +498,7 @@ def damped_rectangle_gauss_rule(
     rel_tol=DEFAULT_REL_TOL,
     max_nodes=500,
 ):
-    r"""Smallest sampled-positive global Gauss rule for a damping rectangle.
+    r"""Positive global Gauss rule for a damping rectangle.
 
     This has the same causal integral and positivity certificate as
     :func:`damped_rectangle_rule`, but selects the order of one global
@@ -484,9 +507,11 @@ def damped_rectangle_gauss_rule(
     ``1 - z * sum(h * exp(-z*t))``, ``z = gamma - 1j*x``.
 
     The residual is analytic inside the rectangle, so its continuum maximum
-    lies on the boundary.  The returned error is nevertheless described as
-    sampled evidence: the four edges are checked densely, not with interval
-    arithmetic.  The panelled rule remains the conservative fallback.
+    lies on the boundary.  The returned error remains sampled evidence: the
+    four edges are checked on a dense half-cell-shifted grid disjoint from the
+    fit grid.  ``continuum_error_bound`` adds the conservative derivative
+    cover bound; it is reported, not silently substituted for the requested
+    sampled metric.
     """
     g0, g1 = map(float, (gamma_min, gamma_max))
     f = float(freq_max)
@@ -495,71 +520,74 @@ def damped_rectangle_gauss_rule(
     if not (0.0 < g0 <= g1 < np.inf):
         raise ValueError(
             "gamma bounds must satisfy 0 < gamma_min <= gamma_max")
-    if not (0.0 < f < np.inf) or not (0.0 < tol < 1.0):
-        raise ValueError("freq_max must be positive and rel_tol in (0,1)")
+    if not (0.0 <= f < np.inf) or not (0.0 < tol < 1.0):
+        raise ValueError("freq_max must be nonnegative and rel_tol in (0,1)")
     if cap < 2:
         raise ValueError("max_nodes must be at least two")
 
-    t_max = np.log(2.0 / tol) / g0
+    fit_boundary = _damped_rectangle_boundary(
+        g0, g1, f, 2049, 513, midpoint=False)
+    check_boundary = _damped_rectangle_boundary(
+        g0, g1, f, 8192, 2048, midpoint=True)
 
-    def _boundary(n_x, n_gamma):
-        x = np.linspace(-f, f, int(n_x))
-        if g1 == g0:
-            gamma = np.asarray([g0])
-        else:
-            gamma = np.geomspace(g0, g1, int(n_gamma))
-        return np.unique(np.r_[
-            g0 - 1j * x, g1 - 1j * x,
-            gamma + 1j * f, gamma - 1j * f,
-        ])
+    legendre = {}
 
-    fit_boundary = _boundary(2049, 513)
-    check_boundary = _boundary(8193, 2049)
-
-    def _rule(order):
-        x, h = np.polynomial.legendre.leggauss(int(order))
+    def _rule(order, t_max):
+        if int(order) not in legendre:
+            legendre[int(order)] = np.polynomial.legendre.leggauss(int(order))
+        x, h = legendre[int(order)]
         return 0.5 * t_max * (x + 1.0), 0.5 * t_max * h
 
-    def _score(order, boundary):
-        t, h = _rule(order)
-        worst = 0.0
-        for left in range(0, boundary.size, 2048):
-            z = boundary[left:left + 2048]
-            residual = 1.0 - (
-                z[:, None] * np.exp(-z[:, None] * t[None, :])) @ h
-            worst = max(worst, float(np.max(np.abs(residual))))
-        return worst
+    def _score(order, t_max, boundary):
+        return _damped_rectangle_score(*_rule(order, t_max), boundary)
 
-    # A global Gauss rule resolves exp(+-i*f*t) once its order is of the
-    # time-bandwidth scale f*t_max/4.  Bracket from that physical floor, then
-    # use a binary search rather than constructing every lower order.
-    lo = max(2, int(np.floor(max(f, g1) * t_max / 4.0)))
-    lo = min(lo, cap)
-    hi = min(cap, max(lo + 1, int(np.ceil(max(f, g1) * t_max / 3.0))))
-    while _score(hi, fit_boundary) > tol and hi < cap:
-        lo = hi
-        hi = min(cap, max(hi + 1, 2 * hi))
-    if _score(hi, fit_boundary) > tol:
+    # Only f is oscillatory.  gamma_max creates a short-time boundary layer,
+    # so using it in the time-bandwidth seed can over-rank a rule by orders of
+    # magnitude.  Gauss error is not monotone in the order; scan the final
+    # bracket rather than binary-searching an assumption the family lacks.
+    # The usual t_max=log(2/tol)/g0 reserves half of the error for the
+    # omitted tail.  That split is convenient, not optimal.  Search a small
+    # deterministic family of tail allocations and score the complete
+    # resolvent residual, which includes truncation and quadrature together.
+    # Positivity and the literal physical eta are unchanged.
+    best = None
+    starts = []
+    for tail_fraction in (0.50, 0.70, 0.80, 0.85, 0.90, 0.925, 0.95):
+        t_max = np.log(1.0 / (tail_fraction * tol)) / g0
+        start = min(cap, max(2, int(np.floor(f * t_max / 4.0))))
+        starts.append(start)
+        stop = cap if best is None else min(cap, best[0])
+        for candidate in range(start, stop + 1):
+            if _score(candidate, t_max, fit_boundary) > tol:
+                continue
+            heldout = _score(candidate, t_max, check_boundary)
+            if heldout <= tol:
+                row = (candidate, heldout, t_max, tail_fraction)
+                if best is None or row[:2] < best[:2]:
+                    best = row
+                break
+    if best is None:
         raise RuntimeError(
-            f"global damped rectangle rule did not reach {tol:g} through "
+            f"global damped rectangle rule did not reach {tol:g} from "
+            f"oscillatory seeds {min(starts)}-{max(starts)} through "
             f"max_nodes={cap}")
-    while hi - lo > 1:
-        middle = (lo + hi) // 2
-        if _score(middle, fit_boundary) <= tol:
-            hi = middle
-        else:
-            lo = middle
-
-    order = hi
-    sampled_error = _score(order, check_boundary)
-    while sampled_error > tol and order < cap:
-        order += 1
-        sampled_error = _score(order, check_boundary)
-    if sampled_error > tol:
-        raise RuntimeError(
-            f"global damped rectangle held-out residual {sampled_error:.6g} "
-            f"exceeds {tol:g} through max_nodes={cap}")
-    t, h = _rule(order)
+    order, sampled_error, t_max, tail_fraction = best
+    t, h = _rule(order, t_max)
+    z_max = float(np.hypot(g1, f))
+    derivative_bound = float(np.sum(
+        h * np.exp(-g0 * t) * (1.0 + z_max * t)))
+    x_cover = f / 8192.0
+    if g1 == g0:
+        gamma_cover = 0.0
+    else:
+        gamma_mid = np.exp(
+            np.log(g0)
+            + (np.arange(2048) + 0.5) * np.log(g1 / g0) / 2048.0)
+        gamma_cover = max(
+            float(gamma_mid[0] - g0), float(g1 - gamma_mid[-1]),
+            0.5 * float(np.max(np.diff(gamma_mid))))
+    continuum_bound = sampled_error + derivative_bound * max(
+        x_cover, gamma_cover)
     return {
         "t": t.astype(np.float64),
         "h": h.astype(np.float64),
@@ -567,13 +595,72 @@ def damped_rectangle_gauss_rule(
         "n_panels": 1,
         "orders": (int(order),),
         "t_max": float(t_max),
+        "tail_budget_fraction": float(tail_fraction),
         "gamma_min": g0,
         "gamma_max": g1,
         "freq_max": f,
         "rel_tol": tol,
         "sampled_max_error": float(sampled_error),
+        "continuum_error_bound": float(continuum_bound),
         "kappa0": float(g0 * np.sum(h * np.exp(-g0 * t))),
+        "rule_type": "global_gauss",
     }
+
+
+def damped_rectangle_positive_rule(
+    gamma_min,
+    gamma_max,
+    freq_max,
+    *,
+    rel_tol=DEFAULT_REL_TOL,
+    max_nodes=500,
+):
+    """Choose the smaller passing positive rectangle rule.
+
+    The global rule is normally smaller.  The panelled rule is an independent
+    conservative fallback while the global family is certified numerically.
+    Both candidates are scored on the same disjoint dense boundary grid.
+    """
+    g0, g1 = map(float, (gamma_min, gamma_max))
+    f, tol = float(freq_max), float(rel_tol)
+    candidates = []
+    try:
+        candidates.append(damped_rectangle_gauss_rule(
+            g0, g1, f, rel_tol=tol, max_nodes=max_nodes))
+    except RuntimeError:
+        pass
+
+    if f == 0.0:
+        if not candidates:
+            raise RuntimeError(
+                f"global zero-frequency rectangle rule did not reach "
+                f"{tol:g} through max_nodes={int(max_nodes)}")
+        return min(candidates, key=lambda rule: (
+            rule["n_nodes"], rule["sampled_max_error"]))
+
+    try:
+        panelled = damped_rectangle_rule(g0, g1, f, rel_tol=tol)
+    except (RuntimeError, ValueError):
+        panelled = None
+    boundary = _damped_rectangle_boundary(
+        g0, g1, f, 8192, 2048, midpoint=True)
+    worst = np.inf
+    if panelled is not None and panelled["n_nodes"] <= int(max_nodes):
+        worst = _damped_rectangle_score(
+            panelled["t"], panelled["h"], boundary)
+    if panelled is not None and worst <= tol:
+        panelled = dict(panelled)
+        panelled.update(sampled_max_error=worst,
+                        continuum_error_bound=np.nan,
+                        tail_budget_fraction=0.5,
+                        rule_type="panelled_gauss")
+        candidates.append(panelled)
+    if not candidates:
+        raise RuntimeError(
+            f"no positive damped rectangle rule reached {tol:g} through "
+            f"max_nodes={int(max_nodes)}")
+    return min(candidates, key=lambda rule: (rule["n_nodes"],
+                                             rule["sampled_max_error"]))
 
 
 def damped_line_projection(rule, z):
