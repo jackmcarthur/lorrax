@@ -289,7 +289,11 @@ def _write_link_stage(
                     center_x, neighbor_xy, g_index, g_valid)
                 io.write_slab(
                     LINKS_DATASET, link[None, None, :, :],
-                    offset=(ik_irr, idir, 0, 0))
+                    offset=(ik_irr, idir, 0, 0),
+                    global_shape=(nrk, 3, nb, nb))
+                # WfnLoader owns a second collective HDF5 handle.  Finish
+                # this asynchronous append before its next streamed read.
+                io.sync_writes()
                 # Retain only the replicated O(nb) diagnostic. Stacking and
                 # writing once after the stream avoids both a per-link host
                 # synchronization and a second HDF5 transaction per link.
@@ -301,7 +305,9 @@ def _write_link_stage(
             nrk, 3, nb)
         singular_values_device = jax.lax.with_sharding_constraint(
             singular_values_device, NamedSharding(mesh, P()))
-        io.write_slab(SINGULAR_VALUES_DATASET, singular_values_device)
+        io.write_slab(
+            SINGULAR_VALUES_DATASET, singular_values_device,
+            global_shape=(nrk, 3, nb))
         io.write_attr("source_steps", source_steps)
         io.write_attr("source_full_ids", source_full)
         io.write_attr("source_neighbor_full_ids", source_plus)
@@ -386,8 +392,13 @@ def _write_connection_stage(
             return jax.lax.with_sharding_constraint(out, block_sharding)
 
         connection_cart = _to_cart(connection_reduced)
-        io.write_slab(CONNECTION_REDUCED_DATASET, connection_reduced)
-        io.write_slab(CONNECTION_CART_DATASET, connection_cart)
+        connection_shape = (3, int(sym.nk_tot), nb, nb)
+        io.write_slab(
+            CONNECTION_REDUCED_DATASET, connection_reduced,
+            global_shape=connection_shape)
+        io.write_slab(
+            CONNECTION_CART_DATASET, connection_cart,
+            global_shape=connection_shape)
         io.write_attr("directed_edge_source_row", table["source_row"])
         io.write_attr(
             "directed_edge_source_direction", table["source_direction"])
