@@ -46,6 +46,13 @@ occupancy, so it cancels out of E_F exactly.  Carrying it here would be an
 invitation to apply it twice; it belongs in ρ's normalisation, where it
 does not cancel.  ``WfnLoader.nelec`` is already a band count
 (``max(ifmax)``), so it is the right argument to pass unmodified.
+
+MP1 APIs below count physical electrons.  Pass the canonical
+``spin_degeneracy_factor(wfn)`` as ``state_capacity``: 1 for a fully
+relativistic spinor WFN and 2 for a spin-restricted scalar WFN.  Their
+``broadening_ry`` follows BerkeleyGW ``occ_broadening``: the MP1
+argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
+``broadening_ry=degauss/2``.
 """
 
 from __future__ import annotations
@@ -56,11 +63,118 @@ import jax
 import jax.numpy as jnp
 
 
-__all__ = ["fermi_level_step", "step_occupations", "occupied_band_count"]
+__all__ = [
+    "fermi_level_step", "mp1_occupations", "occupied_band_count",
+    "solve_mp1_occupations", "step_occupations",
+]
 
 # Tolerance for "the cumulative occupancy lands exactly on the target",
 # i.e. the gapped case.  Scaled by the target so it is relative.
 _EXACT_FILL_RTOL = 1e-9
+
+# Fixed bracket/iteration counts keep one lowering for all per-iteration
+# broadening values at fixed (nk, nb).  At either endpoint |x| >= 8, so the
+# MP1 tail is below 1e-27 in float64.
+_MP1_BRACKET_WIDTHS = 16.0
+_MP1_BISECTION_STEPS = 64
+
+
+def _mp1_values(E, chemical_potential, broadening):
+    """BerkeleyGW v4 MP1 formula on float64 JAX operands."""
+    x = (E - chemical_potential) / (2.0 * broadening)
+    gaussian = jnp.exp(-jnp.square(x))
+    # For an absurdly small width, avoid leaking the limiting inf*0 as NaN.
+    correction = jnp.where(jnp.isfinite(x), x * gaussian, 0.0)
+    return (0.5 * (1.0 - jax.lax.erf(x))
+            - correction / (2.0 * jnp.sqrt(jnp.pi)))
+
+
+@jax.jit
+def mp1_occupations(E_kn, chemical_potential, broadening_ry) -> jax.Array:
+    """First-order MP occupations with BerkeleyGW width semantics.
+
+    ``broadening_ry`` is ``occ_broadening`` converted to Ry; the
+    argument is ``(E-mu)/(2*broadening_ry)``.  MP1's small overshoot beyond
+    [0, 1] is deliberately retained.
+    """
+    return _mp1_values(
+        jnp.asarray(E_kn, dtype=jnp.float64),
+        jnp.asarray(chemical_potential, dtype=jnp.float64),
+        jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+@jax.jit
+def _solve_mp1_kernel(E, w, target, broadening, capacity):
+    """Pure fixed-shape device root plus final occupations."""
+    E = jnp.asarray(E, dtype=jnp.float64)
+    w = jnp.asarray(w, dtype=jnp.float64)
+    target = jnp.asarray(target, dtype=jnp.float64)
+    broadening = jnp.asarray(broadening, dtype=jnp.float64)
+    capacity = jnp.asarray(capacity, dtype=jnp.float64)
+    tail = _MP1_BRACKET_WIDTHS * broadening
+    bracket0 = (jnp.min(E) - tail, jnp.max(E) + tail)
+
+    def count(mu):
+        return capacity * jnp.einsum(
+            "k,kn->", w, _mp1_values(E, mu, broadening))
+
+    def bisect(_iteration, bracket):
+        lo, hi = bracket
+        mid = 0.5 * (lo + hi)
+        below = count(mid) < target
+        return (jnp.where(below, mid, lo), jnp.where(below, hi, mid))
+
+    # MP1 is locally non-monotone near a level.  Opposite-sign bisection is
+    # safeguarded against that derivative; a bare Newton step is not.
+    lo, hi = jax.lax.fori_loop(
+        0, _MP1_BISECTION_STEPS, bisect, bracket0)
+    mu = 0.5 * (lo + hi)
+    return mu, _mp1_values(E, mu, broadening)
+
+
+def solve_mp1_occupations(
+    E_kn, kweights, n_electrons: float, broadening_ry: float, *,
+    state_capacity: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
+
+    Solves ``state_capacity * sum_k w_k sum_n f_kn = n_electrons``.
+    ``kweights`` are normalized weights for the supplied k-set (normalized
+    star multiplicities on an IBZ).  A fully relativistic state has
+    ``state_capacity=1``; a restricted scalar state has 2.  Use the
+    canonical ``spin_degeneracy_factor(wfn)``.
+
+    Validation is host-only and reads no eigenvalues.  Root and occupations
+    are one fixed-iteration JAX kernel with no Python loop or scalar readback.
+    """
+    shape = tuple(int(s) for s in np.shape(E_kn))
+    w = np.asarray(kweights, dtype=np.float64)
+    if len(shape) != 2 or min(shape, default=0) < 1:
+        raise ValueError(
+            f"solve_mp1_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+    if w.shape != (shape[0],):
+        raise ValueError(
+            f"solve_mp1_occupations: kweights must be ({shape[0]},); got {w.shape}")
+    if not np.all(np.isfinite(w)) or np.any(w < 0.0):
+        raise ValueError("solve_mp1_occupations: kweights must be finite/nonnegative")
+    weight_sum = float(w.sum())
+    if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1e-10):
+        raise ValueError(
+            f"solve_mp1_occupations: kweights must sum to 1; got {weight_sum:.17g}")
+
+    target = float(n_electrons)
+    broadening = float(broadening_ry)
+    capacity = float(state_capacity)
+    if not np.isfinite(broadening) or broadening <= 0.0:
+        raise ValueError("solve_mp1_occupations: broadening_ry must be finite and > 0")
+    if not np.isfinite(capacity) or capacity <= 0.0:
+        raise ValueError("solve_mp1_occupations: state_capacity must be finite and > 0")
+    maximum = capacity * weight_sum * shape[1]
+    if not np.isfinite(target) or not (0.0 < target < maximum):
+        raise ValueError(
+            f"solve_mp1_occupations: n_electrons={target!r} outside (0, {maximum})")
+
+    return _solve_mp1_kernel(E_kn, w, target, broadening, capacity)
 
 
 @jax.jit
