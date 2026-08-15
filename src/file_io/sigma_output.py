@@ -93,6 +93,7 @@ def write_sigma_to_file(
 	hartree_kij_eV=None,
 	energies_dft_ev=None,
 	*,
+	kpoints_crys,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
@@ -102,6 +103,10 @@ def write_sigma_to_file(
 	Args:
 		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
+		kpoints_crys: (nk, 3) crystal coordinates, ONE ROW PER Sigma ROW.
+			REQUIRED, and checked against ``nk``.  See the k-BASIS note
+			below: this file's rows are whatever basis the caller's Sigma
+			is on, and this argument is how the file says which.
 		sigma_coh_kij_eV: Correlation-like self-energy in eV, shape (nk, nb, nb)
 		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
 		energies_dft_ev: DFT (mean-field) band energies in eV, shape (nk, nb).
@@ -112,8 +117,51 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+
+	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
+	------------------------------------------------
+	The block label ``k-point N`` is a POSITION in whatever array the
+	caller handed in, and nothing in the file used to say which k that
+	was.  Three separate downstream comparisons then paired this file's
+	rows against BerkeleyGW's IBZ blocks by position, because positions
+	0,1,2 coincide on Si 4x4x4 and only diverge from row 3 on (the true
+	map is ``[0,1,2,5,6,7,10,27]``).  The worst of them reported a
+	291 meV disagreement where the real figure was 28 meV; an earlier
+	one manufactured a 600 meV "non-symmorphic phase bug".
+
+	So the coordinate is written on every block, and ``kpoints_crys`` is
+	REQUIRED and length-checked against the Sigma rows.  A consumer can
+	now join on the coordinate instead of the position, and a reader can
+	see at a glance which basis the file is on -- an IBZ file and a
+	full-BZ file no longer look identical.
+
+	This writer does NOT decide the basis; ``gw_output.write_results``
+	does, and it deliberately keeps this file on the FULL BZ because
+	``bandstructure.htransform.read_eqp_energies`` refuses anything else
+	(``htransform.py:1200-1206`` requires ``nk == sym.nk_tot`` and takes
+	the ``sigX=`` column of this very file as its ``--eqp-file`` input).
+	The eqp{0,1}.dat pair, which no full-BZ consumer reads, is on the
+	wedge -- see ``gw_output.py`` and ``gw/eqp_bgw.py``.
+
+	The coordinate goes on its OWN line, never appended to the
+	``k-point N:`` header and never onto a data row.  Both of those
+	placements break parsers in tree: htransform anchors its header
+	regex with ``$`` (``htransform.py:1153``), and six parsers
+	discriminate header-from-body by "exactly four whitespace tokens".
+	A separate ``#`` line is invisible to every one of them, exactly as
+	the existing ruler line already is.
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		# The structural guard: handing 64 rows of full-BZ Sigma an
+		# 8-row IBZ k-list (or vice versa) is the mistake this file
+		# exists to make impossible, so it is refused rather than
+		# written out and discovered downstream.
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} "
+			f"Sigma k-rows of {os.path.basename(str(filename))} — the "
+			f"k-list and the self-energy are on different k-bases.")
 
 	# ------------------------------------------------------------------
 	# REAL-VS-COMPLEX IS ONE DECISION PER COLUMN, TAKEN OVER THE WHOLE ARRAY
@@ -185,6 +233,8 @@ def write_sigma_to_file(
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
 			f.write("-" * 100 + "\n")
 			for n in range(nbands):
 				sx_re = float(np.real(sx_diag[k, n]))
@@ -223,6 +273,8 @@ def write_eqp_g0w0(
 	eqp_path,
 	energies_dft_ev,
 	g0w0_diag_ev,
+	*,
+	kpoints_crys,
 ):
 	"""Write E_DFT next to diagonal (H0 + Sigma_xc(E_DFT)) for G0W0 comparisons.
 
@@ -234,6 +286,15 @@ def write_eqp_g0w0(
 		DFT eigenvalues in eV.
 	g0w0_diag_ev : array (nk, nb)
 		Diagonal matrix elements of (kin_ion + V_H + Sigma_xc(E_DFT)) in eV.
+	kpoints_crys : array (nk, 3)
+		Crystal coordinates, one row per energy row.  REQUIRED and
+		length-checked, for the reason spelled out in the k-BASIS note
+		of :func:`write_sigma_to_file` — this file has the same
+		``k-point N:`` block layout and was paired by position by the
+		same downstream scripts.  It stays on the FULL BZ because the
+		out-of-tree ``make_eqp_htformat.py`` joins it against the
+		IBZ ``eqp1.dat`` to build htransform's full-BZ input
+		(``docs/drivers.md:226``).
 	"""
 	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
 	g0w0_diag_ev = np.asarray(g0w0_diag_ev, dtype=np.complex128)
@@ -241,6 +302,12 @@ def write_eqp_g0w0(
 		raise ValueError(
 			f"Shape mismatch for eqp_g0w0: DFT {energies_dft_ev.shape} vs G0W0 {g0w0_diag_ev.shape}"
 		)
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (energies_dft_ev.shape[0], 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the "
+			f"{energies_dft_ev.shape[0]} energy k-rows of eqp_g0w0 — the "
+			f"k-list and the energies are on different k-bases.")
 
 	abs_path = os.path.abspath(eqp_path)
 	dirname = os.path.dirname(abs_path)
@@ -253,6 +320,8 @@ def write_eqp_g0w0(
 		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
 		for k in range(energies_dft_ev.shape[0]):
 			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
 			f.write("-" * 80 + "\n")
 			for n in range(energies_dft_ev.shape[1]):
 				e_dft = float(energies_dft_ev[k, n])
