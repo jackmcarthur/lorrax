@@ -2654,9 +2654,12 @@ def run_sc_driver(
     if getattr(config, "occ_smearing_family", None):
         from psp.get_DFT_mtxels import spin_degeneracy_factor
         from .efermi import solve_mp1_occupations
+        _e_part = np.asarray(enk_dft, dtype=np.float64)
+        # enk_dft here is the unfolded full-BZ table: uniform weights,
+        # the same convention as _solve_head_occupations.
         _mu_ry, _ = solve_mp1_occupations(
-            np.asarray(enk_dft, dtype=np.float64),
-            np.asarray(wfn.kweights, dtype=np.float64),
+            _e_part,
+            np.full(_e_part.shape[0], 1.0 / _e_part.shape[0]),
             float(wfn.num_electrons),
             float(config.occ_broadening_ry),
             state_capacity=float(spin_degeneracy_factor(wfn)))
