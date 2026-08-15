@@ -1305,6 +1305,56 @@ inverse so the PROJECTOR is transpose-invariant; that argument covers the
 sum at `:189` but not obviously the per-op `keep` test at `:176`, which
 tests individual ops.
 
+### `sc_on_ibz = true` HAS ROTTED — it crashes, and the crash is the two-wedge conflation
+
+MEASURED 2026-08-15 on `gnppm_debug` with `qp_solver = self_consistent`,
+`sc_max_iter = 3`.  The flag defaults False (`gw_config.py:816`), **no deck in
+the tree sets it, and no regression deck runs the SC path at all** — every
+committed deck is `qp_solver = one_shot_dft`.  So nothing has exercised this
+since it was written.
+
+    sc_iteration.py:1397  _write_sc_eqp_snapshot
+      -> eqp_bgw.py:145   write_bgw_eqp
+    ValueError: e_qp shape (5, 46) does not match e_dft (9, 46)
+
+**5 and 9 are the two different IBZs.**  With `sc_on_ibz` on, the loop reduces
+H/E/U to the STAR wedge — 5 orbits on this deck — while
+`_write_sc_eqp_snapshot` hands the result to a writer expecting the FILE wedge,
+`wfn.kpoints`, which is 9 here.  This is the distinction recorded in
+`docs/architecture/symmetry_register.md` ("THERE ARE TWO DIFFERENT IBZs"), and
+it is not academic: it is the live mechanism of this crash.  Note it would NOT
+crash on `si_cohsex_debug`, where the two wedges coincide at 8 — the same
+"right where you test, wrong where you don't" shape.
+
+NOT REPAIRED, deliberately: the owner asked for the failure rather than a fix
+forward, on the grounds that a flag off this long may have rotted and knowing
+that is worth more than a quick repair.  The default stays False.
+
+### MEASURED: independent per-k `eigh` is NOT a source of star-inequivalent E_qp
+
+Same run, `sc_on_ibz` OFF, so `H_qp_dft` is assembled and diagonalised
+independently at every one of the 9 full-BZ k:
+
+| quantity | star spread over 5 orbits |
+|---|---|
+| `E_DFT` | **0.0000 meV** |
+| `E_QP`  | **0.0000 meV** |
+
+(`eqp1.dat` prints `%15.9f` eV, so this bounds the spread below ~1e-6 meV, not
+merely below a meV.)
+
+So per-k diagonalisation reproduces star-equal eigenvalues **exactly**.  The
+8x redundant `eigh` is wasted work, but it is not a source of symmetry
+breaking, and **none** of the 2.6 -> 41 meV Sigma star spread can be
+attributed to it.
+
+CAVEAT ON SCOPE, and it matters: `gnppm_debug`'s centroid set
+(`centroids_frac_399.txt`) IS orbit-closed, so its Sigma star spread is
+already ~0 and this deck cannot discriminate the two causes.  The deck that
+shows 41 meV is `si_cohsex_debug`, which is `one_shot_dft`; testing it would
+need an SC variant, which `sc_on_ibz`'s rot currently blocks.  This result is
+CONSISTENT with the conditioning attribution and does not prove it.
+
 ### MEASURED, AND IT OVERTURNS THE RECEIVED EXPLANATION: centroid non-closure is NOT what drives the Si production deck's star spread
 
 2026-08-15.  The tree has stated in several places — `si_cohsex_debug/README.md`,
