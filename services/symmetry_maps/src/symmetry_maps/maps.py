@@ -2276,7 +2276,7 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None, *, trs_reference="star_row"):
+                   irr_labels=None, *, trs_reference):
     """Spread an IBZ band-index quantity over the full BZ.
 
     ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
@@ -2317,6 +2317,20 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     equality default: a caller that omitted them would get silently wrong
     matrices on every TRS pair (measured 3.6e-01 relative, job 7889235),
     and nothing downstream would notice.
+
+    ``trs_reference`` IS REQUIRED TOO, AND HAS NO DEFAULT.  It used to
+    default to ``"star_row"``, which is right for a ``star_select``
+    operand and wrong for a file slab — and the failure it produces is
+    the one nothing sees: 183.61 eV on the off-diagonals with the REAL
+    DIAGONAL EXACTLY INTACT, so the electron count, hermiticity, the
+    spectrum, the eqp.dat V_H column and the diagonal star-spread metric
+    all survive it.  A default is exactly the wrong shape for a choice
+    whose wrong branch is invisible to every cheap check, so there is
+    none: a caller that has not thought about which flavour its operand
+    is gets a ``TypeError`` at the call site instead of a plausible wrong
+    matrix.  ``KStarMap.broadcast`` does not take the argument because
+    its operand can only have come from :meth:`KStarMap.select`, which
+    fixes the answer to ``"star_row"`` by construction.
     """
     irr = np.asarray(irr_idx_k)
     sidx = np.asarray(sym_idx_k)

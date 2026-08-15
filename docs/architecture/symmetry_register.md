@@ -94,22 +94,59 @@ Not to be confused with the **structure factor** `exp(-2πi G·τ_atom)` in
 `psp/` — that τ is an atomic position, a different operation needing no shared
 backend.
 
-## 5. Time reversal — the most fragmented operation
+## 5. Time reversal — consolidated 2026-08-15
 
-Five predicates, of which **two are genuinely different and the difference is
-priced at 183.61 eV**:
+Two genuinely different predicates, and the difference is priced at
+**183.61 eV**:
 
 - `trs_reference="star_row"` → XOR of two flags (`_star_conj_flags`) — for
-  operands that came from `star_select`.
+  operands that came from `star_select`, i.e. rows of a full-BZ array, each
+  carrying a `sym_idx` of its own.
 - `trs_reference="ibz_slab"` → the member's own flag — for a wedge slab read
-  verbatim off disk.
+  verbatim off disk with no symmetry applied.
 
-They disagree on 6 of 9 k-points on `cohsex_debug`, with the **real diagonal
-left exactly intact** — which is why nothing caught it for a month. The other
-three spellings (`sym_idx >= n_sym_spatial` at ψ level, in three places) are
-consistent.
+The other three spellings (`sym_idx >= n_sym_spatial` at ψ level) are one
+predicate in three places and are consistent.
 
-`tests/multi_device/star_invariance_gate.py` uses the **wrong one** — registered.
+**`trs_reference` now has NO DEFAULT.** It used to default to `"star_row"`,
+which is right for a `star_select` operand and wrong for a file slab. A default
+is the wrong shape for a choice whose wrong branch is invisible, so a caller who
+has not thought about it gets a `TypeError` rather than a plausible wrong
+matrix. All 13 call sites in the tree — production, tests, tools and
+multi-device gates — now state their flavour, and
+`tests/test_unfold_through_the_service.py` sweeps the AST to keep it that way
+(opt-out only via a greppable `trs-reference-exempt` comment; its one user is
+the refusal cell itself).
+
+`tests/multi_device/star_invariance_gate.py` used the **wrong** predicate —
+comparing against the star's first FULL-BZ row while deciding conjugation with
+the member's own flag. FIXED. It would have reported a false failure on any deck
+whose star begins on a time-reversed row.
+
+### What can and cannot see a wrong predicate — MEASURED, and the surprise
+
+| check | sees it? |
+|---|---|
+| electron count, hermiticity, spectrum, eqp.dat V_H | **no** |
+| the diagonal star-spread metric (`compare_to_bgw`) | **no** |
+| `symmetry_maps.star_spread` (full matrices, self-consistency) | **no** ← |
+| comparison against independently computed full-BZ values | **yes** |
+
+The third row is the one to know. The natural assumption is that the full-matrix
+spread catches what the diagonal one misses. **It does not**: the wrong
+predicate conjugates an ENTIRE STAR uniformly, and a uniformly conjugated star
+is still perfectly self-consistent under the star relation. `star_spread`
+measures self-consistency, so it reports ~0 on both.
+
+What the mix-up changes is the star's relation to the data it came from, not its
+internal consistency. So the only thing that can catch it is a comparison
+against independently computed full-BZ values — which is how 27cc885 was caught
+(183.61 eV "against an independently computed V_H") and what
+`tests/test_star_offdiag_gate.py` does on the committed full matrices in
+`cohsex_debug/sigma_mnk.h5`. Do not add `star_spread` as the guard for this
+class and believe you are covered; a cell in
+`test_unfold_through_the_service.py` asserts the blindness so that belief fails
+loudly.
 
 ## 6. Real-space / FFT-grid symmetry
 
@@ -142,7 +179,7 @@ registered.
 | Proper-rotation channel mix | **yes** | the CrI₃ fixture is transposed + TRS-sign-flipped |
 | G rotation + umklapp | **4** | `vcoul/bgw_parity.py` |
 | τ phase (G-space) | **yes** | but the 2π convention splits across 4 dividers |
-| TRS conjugation predicate | 5 spellings, **2 semantics** | `star_invariance_gate.py` uses the wrong one |
+| TRS conjugation predicate | 2 semantics, **no default, all 13 call sites explicit** | nothing — AST-swept |
 | r-grid image / source map | **~6 expressions** | forward/pull-back must be upgraded together |
 | Density symmetrisation | 2 (**one broken**) | the bench copy |
 | Cartesian-index rotation | `R_cart_forward` named but **unused**; the one live site uses `R_cart` untransposed | — |
@@ -174,6 +211,48 @@ compressible would move physics.
 | `v_q_bispinor.h5` | **full BZ always** | unfolds before writing |
 
 ---
+
+## Non-closed centroid sets in the tree: KEEP, and why
+
+Four non-closed sets remain, deliberately. **Do not re-open the sweep.**
+
+| set | worst | why it stays |
+|---|---|---|
+| `si_cohsex_debug/centroids_frac_960.txt` | 1.318e-01 | `test_qgrid_symmetry_resolution.py`'s `_OPEN_SET`, paired against the 144 set as `_CLOSED_SET` — the pair *is* the thing under test |
+| `si_bse_debug/centroids_frac_480.txt` | 1.718e-01 | measured specimen pinned by `test_symmetry_maps_closure.py` and `..._qgrid_resolution.py` (47/48 ops); the deck itself already uses the closed twin |
+| `cohsex_debug/centroids_frac_60.txt` | 2.762e-01 | `test_star_offdiag_gate.py` asserts its consequence as a fact; also the deck behind ~12 test files incl. `conftest.py` |
+| `bispinor_debug/centroids_frac_256.txt` | 1.436e-01 | the documented full-BZ fallback the bispinor fixture exercises; regenerating changes a frozen reference — **open owner question** |
+
+These are what the closure machinery is *tested against*: deleting them deletes
+the tests that establish closure behaviour.
+
+**And closure is not what people think it is on these decks.** Measured
+2026-08-15: an orbit-closed 960-point set for the Si production deck
+(`centroids_frac_960_orbitclosed.txt`, `closed=True` at 1.000e-06 on 48 ops,
+same count, same deck) moved the within-star Σ spread only 2.611 → 1.964 meV at
+the compared bands and 41.34 → 39.88 meV over the full window — while making
+BerkeleyGW agreement ~35× worse (sigTOT MAE 0.4329 → 14.9426 meV). Forcing
+closure did not fix the symptom it was believed to cause.
+
+### The conditioning synthesis — hand this to whoever picks up the count question
+
+Three independent measurements in this tree point at ONE mechanism, and it is
+**conditioning, not geometry**:
+
+1. The Si deck carries ~537–588 G per k, so **960 centroids is ~1.7×
+   over-complete** and 144 is ~0.25×. The 144 set measures a star spread of
+   exactly 0.000; both 960 sets measure ~40 meV, closed or not.
+2. A ledger row records **1776 centroids on a 588-G deck (3.0× over-complete)
+   dropping 300+ modes per q at κ ≈ 1e10 and producing a 100 eV Σ_c with no
+   refusal.**
+3. The `zeta_rcond` ladder drifts sigTOT **0.054 → 1.021 → 37.218 meV** as rcond
+   loosens 1e-8 → 1e-6 → 1e-4.
+
+Over-complete centroid sets make the ζ fit ill-conditioned; the fit noise breaks
+the symmetry the quadrature should respect. That explains why forcing closure
+did not help, and it implies a **real tension**: low count buys symmetry and
+loses accuracy, high count does the reverse. The count sweep that would test it
+is an open owner question, not authorised.
 
 ## The question to ask before any further wedge move
 

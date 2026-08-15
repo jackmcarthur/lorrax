@@ -707,10 +707,17 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 		M = np.moveaxis(M, k_axis - (1 if ndim == 4 else 0), 0)
 
 	sel = M[np.asarray(rows_to_keep)]
+	# ``star_row``: ``sel`` is rows taken out of the FULL-BZ array ``M``,
+	# so each row carries a ``sym_idx`` of its own and the predicate is the
+	# XOR — the same flavour ``star_select`` produces.  This used to ride
+	# the argument's default; the default is gone, because the other branch
+	# is wrong here by 183.61 eV on the off-diagonals with the real
+	# diagonal exactly intact, which nothing downstream would have seen.
 	unfolded = np.asarray(symmetry_maps.star_broadcast(
 		sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
 		int(n_sym_spatial),
-		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32)))
+		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
+		trs_reference="star_row"))
 	raw = float(np.abs(M - unfolded).max()) if M.size else 0.0
 
 	diag = frob = trace = 0.0
