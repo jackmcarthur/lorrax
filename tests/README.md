@@ -98,7 +98,7 @@ fixtures) so the ζ-fit/V_q are not redone per gate: restart≡fresh, μ-pad
 flips (gnppm + bispinor), kij↔kij_stream, SC-iter-1≡one-shot, fixed-point
 frozen rotations, IBZ≡full-BZ.  Every major 2026 bug class lives here.
 
-**Tier 3 — unit tests** (17 files): only what the gates cannot see —
+**Tier 3 — unit tests** (18 files): only what the gates cannot see —
 config parsing (`test_qp_solver_config`), quadrature math vs analytic
 values (`test_minimax_quadrature`), TRS/symmetry-unfold invariants on
 synthetic data (`test_symmetry_unfold`), loader/IO contracts
@@ -110,7 +110,10 @@ kernel identities vs independent references (`test_wfn_transforms`,
 sign regressions (`test_head_correction`), PPM window freeze
 (`test_sigma_ppm_gates` G2), planner floors (`test_band_chunk_size_floor`),
 QSGW band partition (`test_band_partition`), restart pad roundtrip
-(`test_restart_pad_roundtrip`), BGW eqp format (`test_eqp_bgw`), plus ONE
+(`test_restart_pad_roundtrip`), BGW eqp format (`test_eqp_bgw`), the
+k-basis of the energy files (`test_eqp_kpoint_basis` — eqp{0,1}.dat on the
+IBZ wedge, sigma_diag/eqp_g0w0 on the full BZ, every block naming its own
+k so nothing downstream has to pair by position), plus ONE
 kmeans smoke test (`test_kmeans_smoke` — kmeans is a fixture-generation
 tool; deeper breakage fails visibly at regen).
 

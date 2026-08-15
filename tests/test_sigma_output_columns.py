@@ -22,6 +22,12 @@ from file_io.sigma_output import write_sigma_to_file
 
 NK, NB = 2, 4
 
+#: Crystal coordinates for the NK rows.  Required by the writer (it
+#: length-checks them against the Sigma rows) so every block can say
+#: which k it is; these cells are about column layout, not the k-basis,
+#: so any distinct pair does.
+KPTS = np.array([[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]], dtype=np.float64)
+
 
 def _diag_array(values):
     """``(NK, NB, NB)`` with ``values`` on the diagonal."""
@@ -52,7 +58,8 @@ def _one_hot_complex():
 def test_one_complex_element_makes_every_row_of_that_column_complex(tmp_path):
     """The property: a column complex ANYWHERE is written complex EVERYWHERE."""
     out = tmp_path / "sigma.dat"
-    write_sigma_to_file(_diag_array(_one_hot_complex()), filename=str(out))
+    write_sigma_to_file(_diag_array(_one_hot_complex()), filename=str(out),
+                        kpoints_crys=KPTS)
     rows = _rows(out)
     assert len(rows) == NK * NB
     n_with_i = sum(1 for r in rows if "i" in r.split("sigSX=")[1])
@@ -70,7 +77,8 @@ def test_a_fully_real_component_carries_no_imaginary_field_anywhere(tmp_path):
     """
     out = tmp_path / "sigma_real.dat"
     vals = np.arange(NK * NB).reshape(NK, NB) * 0.25 + 0j
-    write_sigma_to_file(_diag_array(vals), filename=str(out))
+    write_sigma_to_file(_diag_array(vals), filename=str(out),
+                        kpoints_crys=KPTS)
     for r in _rows(out):
         assert "i" not in r.split("sigSX=")[1], (
             f"a fully real sigSX column emitted an imaginary field: {r!r}")
@@ -92,7 +100,7 @@ def test_every_row_has_the_same_width_with_every_column_present(
         hv[0, 1] += 1.0e-2j
     out = tmp_path / "full.dat"
     write_sigma_to_file(
-        _diag_array(vals), filename=str(out),
+        _diag_array(vals), filename=str(out), kpoints_crys=KPTS,
         sigma_coh_kij_eV=_diag_array(vals * 0.5),
         hartree_kij_eV=_diag_array(hv),
         energies_dft_ev=np.arange(NK * NB).reshape(NK, NB) * 1.0)
@@ -121,6 +129,7 @@ def test_the_totals_column_decides_on_its_own_sum(tmp_path):
     coh = vals - 2.0e-3j
     out = tmp_path / "cancel.dat"
     write_sigma_to_file(_diag_array(sx), filename=str(out),
+                        kpoints_crys=KPTS,
                         sigma_coh_kij_eV=_diag_array(coh))
     rows = _rows(out)
     assert rows, "no rows written"

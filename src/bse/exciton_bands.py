@@ -1482,10 +1482,21 @@ def main(argv=None):
     # energies, so a QP-driven gap change cannot mis-slice); the interpolated
     # leg is corrected below, right after ``initialize_wfns``.
     #
-    # ``input_file=None`` on purpose: with it, apply_eqp_corrections asserts the
-    # eqp file is IBZ-sized (nk_ibz == sym.nk_red).  LORRAX's own GW writes
-    # eqp1.dat on the FULL BZ (one block per k of the WFN, same order), so the
-    # energy-matching branch is the correct one and it maps 1:1 here.
+    # ``input_file=None`` on purpose: with it, apply_eqp_corrections asserts
+    # the eqp file is IBZ-sized (nk_ibz == sym.nk_red) AND that this driver's
+    # k-axis is the matching full BZ, which the densified Q-path is not.
+    #
+    # NOT because the file is full-BZ.  It is NOT: ``gw_output.py:1113``
+    # subsets through ``kirr_to_kfull`` and ``gw_jax.py:779`` passes
+    # ``wfn.kpoints``, so eqp{0,1}.dat are the IBZ wedge — 8 blocks against
+    # 64 k on Si 4x4x4, not the 1:1 this comment used to claim.  The
+    # energy-matching branch is correct anyway, but for a different reason:
+    # E_DFT is constant over a symmetry star, so matching each full-BZ k to
+    # the wedge block that reproduces its mean-field energies performs the
+    # IBZ->full unfold.  It is a heuristic (tol 0.01 eV) standing in for a
+    # coordinate join — see tests/KNOWN_FAILURES.md, "The BSE Q-path takes
+    # its QP energies through an E_DFT heuristic justified by a false
+    # premise", which is registered and NOT fixed here.
     enk_qp_full = None
     if args.eqp:
         from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
@@ -1544,10 +1555,13 @@ def main(argv=None):
                                      mesh_xy=mesh_xy)
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
-        # its ``htransform.read_eqp_energies`` expects the "n=… EQP=…" text
-        # form, not the columnar eqp1.dat LORRAX's GW writes, and it swallows
-        # the parse failure with a log line — i.e. it would silently leave DFT
-        # energies in place.  One parser (``bse_io.read_bgw_eqp``) for both legs.
+        # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
+        # "n=… EQP=…" text form on the FULL BZ, not the columnar IBZ eqp1.dat
+        # LORRAX's GW writes, so it would refuse this file on both counts.
+        # (It refuses loudly — ``htransform.py:1313-1320`` raises SystemExit;
+        # this comment used to say it "swallows the parse failure with a log
+        # line", which has not been true since that FATAL was added.)
+        # One parser (``bse_io.read_bgw_eqp``) for both legs.
         _b0 = int(wfn.nelec) - int(params["nval"])
         _b1 = int(wfn.nelec) + int(params["ncond"])
         enk_sigma = jnp.asarray(enk_qp_full[:, _b0:_b1].T)      # (nb, nk) Ry
