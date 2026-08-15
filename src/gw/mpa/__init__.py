@@ -40,8 +40,7 @@ Contents
     ``K_z(Δ) = −2∫₀^∞ dt e^{izt} sin(Δt)`` in closed form (the
     oracle) and as a positive composite Gauss-Legendre rule (the
     fallback correctness path that generalises to the damped-τ
-    sweep), plus the adapters onto the three shipped families and the
-    stage's cost report.
+    sweep).
 ``pade_fit``
     The fit kernel itself: normalised Padé-in-z² linear solve with
     z_max scaling, companion-matrix roots, all-2·n_p-point complex

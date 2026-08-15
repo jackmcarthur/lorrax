@@ -23,18 +23,14 @@ same shape contract as ``pade_fit.fit_mpa_poles``, so the same ``vmap``
 applies.
 """
 
-import jax
 import jax.numpy as jnp
 
 from . import pade_fit
 
 
 #: The keys :func:`solve_conditioning` serves, and the ``fit_mpa_poles``
-#: diagnostic each one IS.  Written as a map rather than inline in the
-#: return statement because both of that function's arms return exactly
-#: this projection, and two hand-written copies of it are two things that
-#: can drift apart.  Every entry is a quantity the fit computed on its way
-#: to the poles; none of them is recoverable only by a second fit.
+#: diagnostic each one IS.  Every entry is a quantity the fit computed on
+#: its way to the poles; none needs a second fit.
 _CONDITIONING_FROM_DIAG = {
     "cond": "cond_pade",
     "sigma_max": "sigma_max_pade",
@@ -56,7 +52,6 @@ def solve_conditioning(
     solve=pade_fit.SOLVE_MODES[0],
     affine=True,
     eig=pade_fit.EIG_MODES[0],
-    fit_diag=None,
 ):
     """Conditioning and backward error of the DENOMINATOR solve.
 
@@ -125,43 +120,7 @@ def solve_conditioning(
         a caller forwarding one mode dict to the fit and to its
         diagnostics raised TypeError on the second.  The fix is here
         rather than at the call sites because the call sites were right.
-    fit_diag
-        The ``diag`` pytree ``pade_fit.fit_mpa_poles`` (or its batched
-        form) ALREADY returned for these very samples.  When it is given
-        this function runs no solve and no fit; it projects the store's
-        numbers out of the fit's own diagnostics and returns them.
-
-        THIS IS THE CHEAP DOOR, AND IT IS STILL A DOOR.  The driver's
-        seam is that it asks this function for the two numbers
-        ``mpa_store.write_fit_block`` requires -- and the obligation the
-        perf fleet's §FIT-EFFICIENCY restructure pinned is that the
-        driver KEEPS ASKING while the asking stops costing a second fit,
-        not that the driver stops asking.  Passing the fit's own diag
-        honours both halves: the call site is unchanged, and the answer
-        is byte-identical to a recomputation because it is not a
-        recomputation.  Without it, the caller pays a whole second fit of
-        every element to be told what the first fit already knew.
-
-        ``None`` keeps the standalone behaviour, which is what the
-        diagnostics cells and any caller holding only samples want.
     """
-
-    if fit_diag is not None:
-        # NO SHAPE GATE ON THIS ARM, on purpose.  ``fit_diag`` may be a
-        # single element's diag or a whole vmapped tile's, and the
-        # projection is agnostic to which -- it renames keys and touches
-        # no axis.  The sample-support gate below is a statement about
-        # ONE element's grid and would refuse a tile for being a tile.
-        missing = sorted(set(_CONDITIONING_FROM_DIAG.values()) - set(fit_diag))
-        if missing:
-            raise ValueError(
-                f"GATE fit_diag_complete: fit_diag is missing {missing}. "
-                "FALSE case: fit_diag IS a diag pytree returned by "
-                "pade_fit.fit_mpa_poles (or fit_mpa_poles_batched) for "
-                "these samples -- a partial dict would serve a store some "
-                "keys it never measured, and an unmeasured condition "
-                "number reads back as a perfectly conditioned solve.")
-        return {k: fit_diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
 
     pade_fit._require_x64()
     pade_fit._check_sample_support(W_samples, z_samples, n_p)
@@ -169,90 +128,11 @@ def solve_conditioning(
     w = jnp.asarray(W_samples, dtype=jnp.complex128)
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
 
-    # ONE FIT, ONE SOLVE.  Every field below is now something
-    # ``fit_mpa_poles`` already computed on its way to the poles, so this
-    # function no longer re-solves the system and no longer refits the
-    # element -- which is what the driver's cost report called out as the
-    # seam the design review could remove, and what the perf lane's
-    # §FIT-EFFICIENCY diff removes.  The backward error agrees with the
-    # fit's BY CONSTRUCTION rather than by an argument about operand
-    # order, because it IS the fit's.
+    # Every field is something ``fit_mpa_poles`` already computed on its
+    # way to the poles; one fit, no second solve.
     _, _, diag = pade_fit.fit_mpa_poles(
         w, z, n, rcond=rcond, solve=solve, affine=affine, eig=eig)
     return {k: diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
-
-
-#: Hartree -> eV, for the width census only.  The fit itself never
-#: converts units; ``Omega_p`` is in whatever unit ``z_samples`` was.
-_HA_EV = 27.211386245988
-
-
-def residue_width_census(
-    Omega, B, valid=None, *, edges_ev=(4.0, 16.0), energy_unit="Ha"
-):
-    """WHERE THE RESIDUE MASS SITS, resolved by fitted width.
-
-    An AGGREGATION over elements, unlike everything else in this module,
-    and it is here rather than in a reporting script because it is the
-    instrument that saw the 2026-08-10 rung-10 failure in its physical
-    form: at ``n_p = 8`` the shipped fit put 1.5 % of ``sum_p |B_p|`` on
-    poles wider than 16 eV, and at ``n_p = 10`` it put **49 %** there.
-    Two extra poles bought no structure; the fit spent them on modes
-    broader than the plasmon itself, which is what an ill-conditioned
-    rational fit does with freedom the data cannot determine.  A
-    conditioning number alone would not have said that, and a residual
-    alone would not have said it either.
-
-    Parameters
-    ----------
-    Omega, B
-        ``(..., n_p)`` -- a batch of fitted pole sets and residues, e.g.
-        straight off ``fit_mpa_poles_batched``.
-    valid
-        ``(..., n_p)`` bool; pruned poles carry ``B_p = 0`` already, so
-        this only makes the intent explicit.
-    edges_ev
-        Width thresholds in eV.  ``Gamma = |Im Omega|``, the fitted
-        half-width, on the same convention as the campaign's tables.
-    energy_unit
-        Unit of ``Omega``; ``"Ha"`` or ``"eV"``.
-
-    Returns
-    -------
-    dict
-        ``mass_fraction_above`` -- one entry per edge, the fraction of
-        total ``|B|`` on poles wider than that edge; plus the live-mode
-        count and the ``|B|``-weighted width percentiles the campaign's
-        census tables quote.
-    """
-
-    if energy_unit not in ("Ha", "eV"):
-        raise ValueError(
-            f"GATE census_energy_unit: energy_unit={energy_unit!r} is not "
-            "one of ('Ha', 'eV'). FALSE case: the caller names the unit "
-            "Omega is in -- the census thresholds are in eV and the fit "
-            "never converted anything.")
-    to_ev = _HA_EV if energy_unit == "Ha" else 1.0
-
-    om = jnp.asarray(Omega, dtype=jnp.complex128)
-    b = jnp.asarray(B, dtype=jnp.complex128)
-    live = jnp.ones(om.shape, dtype=bool) if valid is None else jnp.asarray(
-        valid)
-    mag = jnp.where(live, jnp.abs(b), 0.0)
-    gamma_ev = jnp.abs(jnp.imag(om)) * to_ev
-    total = jnp.sum(mag)
-    total = jnp.where(total > 0, total, 1.0)
-
-    return {
-        "n_live": jnp.sum(live.astype(jnp.int32)),
-        "mass_total": jnp.sum(mag),
-        "mass_fraction_above": {
-            float(e): jnp.sum(jnp.where(gamma_ev > e, mag, 0.0)) / total
-            for e in edges_ev
-        },
-        "gamma_ev_p50": jnp.median(jnp.where(live, gamma_ev, jnp.nan)),
-        "gamma_ev_weighted_mean": jnp.sum(mag * gamma_ev) / total,
-    }
 
 
 def default_holdout_indices(n_p):
@@ -437,22 +317,3 @@ def perturbation_refit(
         "valid_count_change": d1["n_valid"] - d0["n_valid"],
         "perturbation_norm": jnp.linalg.norm(dw),
     }
-
-
-def diagnostics_batched(fn, W_tile, z_samples, n_p, **kwargs):
-    """``vmap`` any of the above over an ``(n_elements, 2*n_p)`` tile.
-
-    ``fn`` is one of ``solve_conditioning``, ``holdout_residual`` or
-    ``perturbation_refit``.  Extra keyword arguments are passed through
-    unmapped, so a single certified error vector applies to every element
-    -- which is the physically meaningful case, the error being a
-    property of the quadrature that produced the samples, not of the
-    element.
-    """
-
-    tile = jnp.asarray(W_tile, dtype=jnp.complex128)
-    if tile.ndim != 2:
-        raise ValueError(
-            f"GATE W_tile_rank: W_tile has shape {tuple(tile.shape)}. FALSE "
-            "case: W_tile.ndim == 2, i.e. (n_elements, 2*n_p).")
-    return jax.vmap(lambda row: fn(row, z_samples, n_p, **kwargs))(tile)

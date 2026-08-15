@@ -25,8 +25,7 @@ WHAT IS DIFFERENT FROM ``complex_laplace``, and it is three things.
    ``complex_laplace`` into its own selector has no analogue.
 2. **The domain is a BANDWIDTH, not an interval.**  ``Delta`` runs over
    ``[0, Delta_max]`` with no ``Delta_min`` and no gap assumption, which
-   is ``gw.mpa.sample_plan.FAMILIES['damped_line']['domain']`` verbatim
-   and is what makes this the occupations-ready route: the gapless case
+   is what makes this the occupations-ready route: the gapless case
    that is an ``R -> infinity`` catastrophe on the interval families is
    not a special case here at all.
 3. **One entry serves BOTH sampling lines and every n_p.**  The nodes

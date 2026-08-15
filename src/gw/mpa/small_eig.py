@@ -208,6 +208,8 @@ def _qr_sweep(H, m, n):
     # naming mesh axes in this otherwise generic eigensolver.
     cs0 = (jnp.zeros((2, max(n - 1, 1)), dtype=H.dtype)
            + jnp.asarray(H[0, 0] * 0, dtype=H.dtype))
+    # TASTE rule-2 carve-out: per-device scratch carry seeded from the
+    # varying matrix; scan conversion not required.
     H, cs = lax.fori_loop(0, max(n - 1, 0), left, (H, cs0))
 
     # --- R Q, the same rotations from the right in the SAME order.

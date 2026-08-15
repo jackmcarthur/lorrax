@@ -77,7 +77,7 @@ _FIT_EIG = "jax_qr"
 
 
 @functools.lru_cache(maxsize=None)
-def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
+def _sharded_fit_kernel(mesh_xy, n_p, rcond):
     """One compiled local-row Loewner fit; columns remain replicated."""
     import jax
     import jax.numpy as jnp
@@ -90,7 +90,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
     block_spec = P(None, None, row_axes, None)
     pole_spec = P(None, None, row_axes, None)
     diag_spec = P(None, row_axes, None)
-    guards = dict(guard_items)
+    guards = pade_fit._resolve_guards(None)
     n = int(n_p)
 
     def _local(block, z, row_ids, n_mu_logical, n_cols_logical):
@@ -149,7 +149,6 @@ def fit_one_block(
     mesh_xy,
     n_cols_buffer=None,
     tile_bytes=None,
-    guards=None,
     rcond=1.0e-13,
     header=None,
 ):
@@ -228,9 +227,7 @@ def fit_one_block(
             f"sampled for, or the file is not a double-parallel grid.")
 
     t_fit = time.perf_counter()
-    resolved = pade_fit._resolve_guards(guards)
-    guard_items = tuple(sorted(resolved.items()))
-    kernel = _sharded_fit_kernel(mesh_xy, n, guard_items, float(rcond))
+    kernel = _sharded_fit_kernel(mesh_xy, n, float(rcond))
     z_dev = device_put_process_local(
         z, NamedSharding(mesh_xy, P(None)))
     row_ids = device_put_process_local(
@@ -268,8 +265,6 @@ def fit_one_block(
         "bytes_read": (n_omega * n_mu * n_cols
                        * mpa_store.COMPLEX128_BYTES),
         "fit_dispatches": 1,
-        "diagnostic_dispatches": 0,
-        "full_fits": int(n_mu * n_cols),
         "pade_solves": int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
@@ -286,9 +281,7 @@ def run_fit_driver(
     *,
     mesh_xy,
     tile_bytes=None,
-    guards=None,
     rcond=1.0e-13,
-    certification=None,
     provenance=None,
     report_stream=None,
 ):
@@ -311,17 +304,15 @@ def run_fit_driver(
     rcond = float(rcond)
     if not 0.0 < rcond < 1.0:
         raise ValueError("run_fit_driver requires 0 < rcond < 1")
-    if certification is None:
-        # These are solver-consistency guards, not material tolerances.
-        # A solve beyond 1/rcond is numerically rank deficient by its own
-        # truncation policy; sqrt(eps) is the ordinary backward-stability
-        # ceiling for complex128 arithmetic.  Observable accuracy remains a
-        # separate held-out/direct-denominator gate.
-        certification = {
-            "condition_max_allowed": 1.0 / rcond,
-            "backward_error_max_allowed": float(
-                np.sqrt(np.finfo(np.float64).eps)),
-        }
+    # Solver-consistency guards, not material tolerances.  A solve beyond
+    # 1/rcond is numerically rank deficient by its own truncation policy;
+    # sqrt(eps) is the ordinary backward-stability ceiling for complex128.
+    # Observable accuracy remains a separate held-out gate.
+    certification = {
+        "condition_max_allowed": 1.0 / rcond,
+        "backward_error_max_allowed": float(
+            np.sqrt(np.finfo(np.float64).eps)),
+    }
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
     n_mu = header["n_mu"]
@@ -381,8 +372,6 @@ def run_fit_driver(
         "bytes_read": 0,
         "peak_block_bytes": 0,
         "fit_dispatches": 0,
-        "diagnostic_dispatches": 0,
-        "full_fits": 0,
         "pade_solves": 0,
         "seconds": {"read": 0.0, "fit": 0.0, "write": 0.0,
                     "finalize": 0.0, "total": 0.0},
@@ -393,7 +382,7 @@ def run_fit_driver(
         stats = fit_one_block(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
             mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
-            tile_bytes=tile_bytes, guards=guards, rcond=rcond,
+            tile_bytes=tile_bytes, rcond=rcond,
             header=header)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1
@@ -403,8 +392,6 @@ def run_fit_driver(
         report["peak_block_bytes"] = max(report["peak_block_bytes"],
                                          stats["bytes_read"])
         report["fit_dispatches"] += stats["fit_dispatches"]
-        report["diagnostic_dispatches"] += stats["diagnostic_dispatches"]
-        report["full_fits"] += stats["full_fits"]
         report["pade_solves"] += stats["pade_solves"]
         report["seconds"]["read"] += stats["seconds_read"]
         report["seconds"]["fit"] += stats["seconds_fit"]
@@ -447,10 +434,9 @@ def format_cost_report(report):
     merely because it is one dispatch, and the two numbers are printed
     beside each other so nobody has to infer the second from the first.
 
-    The three counts distinguish scheduler launches, elementwise fits and
-    Padé solves.  They are equal up to the number of elements per block:
-    conditioning, backward error and the finished-model residual are all
-    produced by the same fit.
+    The two counts distinguish scheduler launches from per-element pole
+    solves; conditioning, backward error and the finished-model residual
+    are all produced by the same solve.
     """
     r = report
     sec = r["seconds"]
@@ -471,12 +457,9 @@ def format_cost_report(report):
         f"  elements fitted {r['elements_fitted']}",
         f"  logical outputs {r['logical_outputs']} "
         f"(= 2*n_p per element: n_p Omega + n_p B)",
-        f"  dispatches      {r['fit_dispatches']} fit + "
-        f"{r['diagnostic_dispatches']} diagnostic, vmapped",
-        f"  full fits       {r['full_fits']} "
-        f"(1 per element; diagnostics reuse the same solve)",
+        f"  dispatches      {r['fit_dispatches']} fit, vmapped",
         f"  pole solves     {r['pade_solves']} "
-        f"(1 per element)",
+        f"(1 per element; diagnostics reuse the same solve)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "
