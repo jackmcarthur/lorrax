@@ -1225,6 +1225,45 @@ the two codes do not order k the same way" — the same fingerprint class as
 `eqp.dat` carries coordinates in its headers, so a coordinate join is
 available on both sides.
 
+### Two rotation-math defects found by the 2026-08-15 symmetry inventory
+
+REGISTERED, not fixed — both are behaviour changes in gate/bench code and
+belong to the consolidation pass, not to the audit that found them.
+
+1. **`tests/multi_device/star_invariance_gate.py:128-139` uses the WRONG
+   TRS predicate.**  It compares each star member against `T[mem[0]]` —
+   the star's first FULL-BZ row, i.e. `star_broadcast`'s `"star_row"`
+   operand — but decides conjugation with `if int(sidx[j]) >= n_spatial`,
+   which is the `"ibz_slab"` predicate.  That is exactly the mix-up
+   `star_broadcast`'s own docstring prices at **183.61 eV**
+   (`maps.py:2294-2303`: the two predicates disagree on 6 of 9 k-points on
+   `cohsex_debug`, with the real diagonal left exactly intact).  The right
+   predicate for `star_row` operands is the XOR, `_star_conj_flags`
+   (`maps.py:2167`, XOR at `:2194`).  Consequence: this gate will report a
+   FALSE FAILURE on any deck whose star begins on a time-reversed row.
+   It is a gate, not production, so nothing physical is wrong today.
+
+2. **`tests/bench/charge_density.py:135` `_symmetrise_density` is a broken
+   duplicate** of `src/gw/qsgw_density.py:270` `symmetrise_density`.
+   Three defects against the canonical: (a) NO τ phase at all, so it is
+   silently wrong on every non-symmorphic deck; (b) it rotates G with
+   `sym.R_grid` (= `mtrx`) where the live convention is `sym_mats_k`
+   (= `mtrx.T`) — the transposed convention, which is the one the stale
+   `maps.py` comment corrected in this commit used to state; (c) it works
+   in G-space with an FFT round trip instead of the r-grid permutation.
+   Called unconditionally at `tests/bench/charge_density.py:130`.
+   `src/psp/scf_potential.py:19-20` already records it as known broken.
+   Fix is deletion in favour of the canonical, not repair.
+
+Also noted, no action: `SymMaps.R_cart_forward` (`maps.py:1727`) exists
+solely to NAME the transpose a rank>=1 Cartesian index needs, and has
+**zero production consumers** — while the one live Cartesian-index
+rotation (`src/psp/orbital_magnetization.py:172-177`) uses `R_cart`
+untransposed.  Its defence (`:185-187`) is that the group is closed under
+inverse so the PROJECTOR is transpose-invariant; that argument covers the
+sum at `:189` but not obviously the per-op `keep` test at `:176`, which
+tests individual ops.
+
 ### MEASURED: how non-orbit-closed the Si production centroid set actually is
 
 2026-08-15, `refactor/eqp-ibz-2026-08-15`, Si production deck

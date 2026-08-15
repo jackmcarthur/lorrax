@@ -91,10 +91,26 @@ The surface
 ``verify_centroid_orbit_closure`` / ``CentroidClosureVerdict``
     Orbit closure as a MEASUREMENT rather than an exception:
     ``centroid_source_map_and_wrap`` refuses on a non-closed set, this says
-    by how much and on which ops.  It is also **the one place in the
-    service where ``tnp = 2π·τ`` is divided**, and it has no positional
-    slot for the translations precisely so that no caller can pass the
-    wrong convention silently.
+    by how much and on which ops.  It has no positional slot for the
+    translations, and enforces a mutually-exclusive ``tnp=``/``tau=``
+    keyword pair, precisely so that no caller can pass the wrong
+    convention silently.
+
+    IT IS NOT "the one place the 2π is divided" — this doc used to say
+    that, and it is false: ``orbit_syms`` divides at :192, :478, :887 and
+    :1308, and multiplies back at :1224.  THE REAL RULE, which is what a
+    caller needs:
+
+      ``SymMaps.translations`` is RAW BGW ``tnp`` (= 2π·τ).
+      G-space consumes it UNDIVIDED — :func:`tau_phase_row` wants ``tnp``.
+      Real space DIVIDES by 2π — every ``orbit_syms`` entry point does.
+
+    So ``tau_phase_row(S, sym.translations[s], G)`` and
+    ``centroid_source_map_and_wrap(..., sym.translations)`` take the SAME
+    array and mean DIFFERENT things by it.  Both are right today only
+    because each happens to want the convention it gets; nothing checks
+    it.  Passing one's argument to the other is a 2π error that no shape
+    or dtype catches.
 ``resolve_qgrid_symmetry`` / ``QgridSymmetryResolution``
     The DECISION, taken once: verdict → mode (``"ibz"`` | ``"full_bz"``)
     → tables → reason, in one object.  Consumers of the q-axis unfold
