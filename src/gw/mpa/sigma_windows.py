@@ -96,19 +96,23 @@ def _geometry(branches, regularization_width_ry, edge_factor):
     eta = float(regularization_width_ry)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("MPA sigma eta must be finite and positive")
-    # Fractional occupations give the crossing branches a negative-E_A shell
-    # (width ~ few×degauss).  Deepening the shallow/deep pole edge by that
-    # excursion keeps every deep-pole slab rectangle sign-definite
-    # (x_lo = e_lo + a_lo − ω_max > edge·η) and routes the straddle through
-    # the crossing core, whose f_max bound below already covers it.  A
-    # non-negative support (every normal insulator) contributes zero, so the
-    # insulating geometry is unchanged bit-for-bit.
+    # Fractional occupations give EVERY branch a possible negative-E_A shell
+    # (width ~ few×degauss): the crossing branches through their own support,
+    # and the statically-sign-definite branches through wrong-side states (an
+    # MP1-fractional state above μ still carries weight f in a "val" branch).
+    # Deepening the shallow/deep pole edge by the worst excursion across ALL
+    # branches keeps every deep-pole rectangle sign-definite — the crossing
+    # slab at x_lo = e_lo + a_lo − ω_max > edge·η, and the sd_slab (the
+    # wrong-side sliver × deep poles, whose x has the +ω orientation) at
+    # x_lo = e_lo + a_lo ≥ edge·η + ω_max — and routes every straddle
+    # through a core rule whose f_max bound covers it.  A non-negative
+    # support (every normal insulator) contributes zero, so the insulating
+    # geometry is unchanged bit-for-bit.
     excursion = 0.0
     for b in branches:
-        if (b.space == "cond") != b.neg_omega_half:
-            _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
-            if eb is not None:
-                excursion = max(excursion, -min(eb[0], 0.0))
+        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
+        if eb is not None:
+            excursion = max(excursion, -min(eb[0], 0.0))
     crossing_edge = omega_max + float(edge_factor) * eta + excursion
     selectors = {
         "all": _selector(),
@@ -169,6 +173,14 @@ def _rows_from_summaries(summaries, name, bounds, phase_real):
 def _a_space(branch, predicate):
     E = np.asarray(jax.device_get(branch.E_A), dtype=np.float64)
     base = np.asarray(jax.device_get(branch.base_mask_A), dtype=bool)
+    if branch.band_weight is not None:
+        # Metallic branches select multiplicatively (mask x weight in the
+        # executor), so base_mask_A spans the whole window and exactly-zero
+        # weights would widen the geometry with bands that contribute
+        # nothing — the -0.53 Ry phantom excursion of the first metallic
+        # arm. Geometry sees the exact nonzero support only.
+        w = np.asarray(jax.device_get(branch.band_weight), dtype=np.float64)
+        base = base & (w != 0.0)
     mask = base & predicate(E)
     values = E[mask]
     if not values.size:
@@ -270,16 +282,44 @@ def build_shared_sigma_windows(
 
     output = []
     crossing_branches = []
+    sliver_branches = []
     sign_specs = []
+    # A statically-sign-definite branch keeps the Laplace family only for
+    # states whose denominator x = ω + E_A + Ω stays positive with margin.
+    # Wrong-side fractional states (signed E_A ≤ sd_edge) genuinely cross:
+    # x passes through zero for shallow poles.  They keep THIS family's
+    # algebra — omega_sign = −1 (the +ω orientation) and prefactor = −neg —
+    # and only change quadrature technology: deep poles through a Laplace
+    # slab (sd_slab, sign-definite by the deepened crossing_edge), shallow
+    # poles through the damped positive rule (sd_core below), which is the
+    # rule built for denominators through zero.  Reclassifying the whole
+    # branch into the crossing family is WRONG (measured −8x disagreement
+    # with the exact fractional reference): that flips both the ω
+    # orientation and the prefactor for every state.
+    sd_edge = float(edge_factor) * eta
     for branch in branches:
         crossing = (branch.space == "cond") != branch.neg_omega_half
         neg = -1.0 if branch.neg_omega_half else 1.0
         if not crossing:
             mask, eb = _a_space(branch, lambda E: np.ones(E.shape, bool))
-            if eb is not None:
+            if eb is None:
+                continue
+            if branch.band_weight is None or eb[0] > sd_edge:
                 sign_specs.append((branch, [("single", mask, eb, [
                     ("all", selected["all"]),
                 ])], -1, -neg))
+                continue
+            mask_hi, eb_hi = _a_space(branch, lambda E: E > sd_edge)
+            if eb_hi is not None:
+                sign_specs.append((branch, [("single", mask_hi, eb_hi, [
+                    ("all", selected["all"]),
+                ])], -1, -neg))
+            mask_lo, eb_lo = _a_space(branch, lambda E: E <= sd_edge)
+            if eb_lo is not None:
+                sign_specs.append((branch, [("sd_slab", mask_lo, eb_lo, [
+                    ("deep", selected["deep"]),
+                ])], -1, -neg))
+                sliver_branches.append((branch, neg, mask_lo, eb_lo))
             continue
 
         crossing_branches.append((branch, neg))
@@ -382,6 +422,53 @@ def build_shared_sigma_windows(
                         win, _branch.E_A, _branch.omega_abs,
                         _branch.omega_idx, idx, bounds, phase,
                         band_weight=_branch.band_weight))
+
+    if sliver_branches:
+        # Wrong-side slivers of the sign-definite branches × shallow poles:
+        # the same damped positive rule as the crossing core (it covers
+        # |Re x| ≤ f_max through zero; the retarded decay comes from the
+        # pole widths + eta, not the sign of Re x), but evaluated in THIS
+        # family's orientation: x = ω + E_A + Ω, i.e. omega_sign = −1 and
+        # prefactor = −neg.  f_max therefore bounds |ω + e + a|, not
+        # |ω − e − a|.
+        idx, bounds, phase, stats = selected["shallow"]
+        if idx.size:
+            gamma_min = eta + min(row[2] for row in stats)
+            gamma_max = eta + max(row[3] for row in stats)
+            a_lo = min(row[0] for row in stats)
+            a_hi = max(row[1] for row in stats)
+            for branch, neg, mask_lo, eb_lo in sliver_branches:
+                w_lo = float(np.min(branch.omega_abs))
+                w_hi = float(np.max(branch.omega_abs))
+                f_max = max(abs(w + e + a)
+                            for w in (w_lo, w_hi)
+                            for e in eb_lo
+                            for a in (a_lo, a_hi))
+                rule = damped_rectangle_positive_rule(
+                    gamma_min, gamma_max, f_max, rel_tol=crossing_error,
+                    max_nodes=crossing_max_nodes)
+                raw_nodes = MinimaxNodes(
+                    t=jnp.asarray(rule["t"], dtype=jnp.complex128),
+                    alpha=jnp.asarray(-1j * rule["h"], dtype=jnp.complex128))
+                exact_nodes = _apply_external_damping(raw_nodes, eta)
+                # Prefactor +neg, NOT −neg: the Laplace service represents
+                # +1/x while this damped rule represents −1/x (alpha = −i·h
+                # against ∫e^{−ixt}dt = −i/x), which is also why the
+                # crossing core flips sign relative to its slab.  The
+                # family value −neg/x' therefore needs pref = +neg here.
+                win = _window(
+                    "sd_core", exact_nodes, mask_lo, eb_lo[0], -1, "full",
+                    +neg, rule["sampled_max_error"],
+                    f"positive {rule['rule_type']} damped rule in the "
+                    f"sign-definite (+ω) orientation; eta {eta:.6e}; gamma "
+                    f"[{gamma_min:.6e},{gamma_max:.6e}]; "
+                    f"f_max {f_max:.6e}; target {crossing_error:.3e}; "
+                    f"sampled error {rule['sampled_max_error']:.3e}; "
+                    f"rank {exact_nodes.t.size}")
+                output.append(SharedSigmaWindow(
+                    win, branch.E_A, branch.omega_abs, branch.omega_idx,
+                    idx, bounds, phase,
+                    band_weight=branch.band_weight))
 
     return output, {"eta_ry": eta, "omega_max_ry": omega_max,
                     "crossing_edge_ry": crossing_edge,

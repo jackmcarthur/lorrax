@@ -181,6 +181,115 @@ def test_weighted_split_plan_matches_fractional_reference():
             f"weighted plan disagrees at omega={omega}: {got} vs {want}")
 
 
+def test_wrong_side_sliver_in_sign_definite_branch_matches_reference():
+    """Wrong-side fractional states in a STATICALLY-SIGN-DEFINITE branch.
+
+    The gate above cannot see this cell: its shallowest pole (Re 0.30)
+    sits above the sliver depth (|E_A| = 0.08), so x = omega + E_A + a
+    never crosses zero and the plain Laplace window stays valid.  The
+    first real metallic arm (sodium 48b, claim 0194 chain) had poles
+    down to Re 0.0149 against a shell of ~0.05 Ry — x through zero in
+    the +omega orientation, which the crossing family cannot represent
+    (its x = E_A + a − omega has the opposite omega sign; wholesale
+    reclassification was measured wrong by a factor ~−8).  This cell
+    pins the fix: the sliver keeps the sign-definite family's own
+    (omega_sign=−1, prefactor=−neg) and takes the damped positive rule
+    (sd_core) for shallow poles plus a Laplace slab (sd_slab) for deep
+    ones.
+
+    Failing-first certificate: pre-fix this exact construction refuses
+    with "MPA sign-definite window reaches or crosses zero (lower
+    denominator −0.03 Ry)" — the np6 arm's refusal in miniature.  The
+    unweighted negative control below keeps that refusal reachable.
+    """
+    shallow_poles = np.asarray([0.05 - 0.02j, 0.59 - 0.03j, 1.80 - 0.05j])
+    Omega = jnp.asarray(shallow_poles.reshape(-1, 1, 1, 1))
+    B = jnp.asarray(_B_P.reshape(-1, 1, 1, 1))
+    branches = _pos_branches(weighted=True)
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, branches,
+        regularization_width_ry=_ETA, edge_factor=_EDGE)
+    plan, geometry = SW.build_shared_sigma_windows(
+        summaries, branches,
+        regularization_width_ry=_ETA, edge_factor=_EDGE, **_TOL)
+
+    # Plan shape: the wrong-side val state (E_A = −0.08) owns an sd_core
+    # window in the +omega orientation, and the sd_slab serves the deep pole.
+    sd_core = [r for r in plan if r.window.name == "sd_core"]
+    assert sd_core, "no sd_core window for the wrong-side sliver"
+    for r in sd_core:
+        assert r.window.omega_sign == -1, r.window
+        assert bool(np.asarray(r.window.mask_A).reshape(-1)[2])
+        assert not np.asarray(r.window.mask_A).reshape(-1)[[0, 1, 3]].any()
+    assert [r for r in plan if r.window.name == "sd_slab"], (
+        "no sd_slab window for sliver x deep poles")
+
+    # Values against the exact fractional reference, same pole set.
+    def exact(omega):
+        poles = shallow_poles - 1j * _ETA
+        E = _E_MINUS_MU.reshape(-1)
+        f = _F.reshape(-1)
+        val = -sum(f[n] * np.sum(B_P / (omega + (-E[n]) + poles))
+                   for n in range(E.size) if f[n] != 0.0
+                   for B_P in [_B_P])
+        cond = -sum((1.0 - f[n]) * np.sum(B_P / (omega - E[n] - poles))
+                    for n in range(E.size) if f[n] != 1.0
+                    for B_P in [_B_P])
+        return val + cond
+
+    def evaluate(plan_rows, omega):
+        total = 0.0 + 0.0j
+        for row in plan_rows:
+            win = row.window
+            w_idx = np.where(np.isclose(row.omega_abs, abs(omega)))[0]
+            if not w_idx.size:
+                continue
+            t = np.asarray(jax.device_get(win.nodes.t))
+            alpha = np.asarray(jax.device_get(win.nodes.alpha))
+            build_all = jax.jit(jax.vmap(
+                lambda tt: build_shared_w_tau(
+                    B, Omega, jnp.asarray(row.pole_indices),
+                    jnp.asarray(row.bounds), jnp.asarray(row.phase_real),
+                    win.E_ref_B, tt)))
+            W_t = np.asarray(jax.device_get(
+                build_all(win.nodes.t))).reshape(t.size, -1)[:, 0]
+            E_A = np.asarray(jax.device_get(row.E_A)).reshape(-1)
+            mask = np.asarray(win.mask_A).reshape(-1)
+            weight = getattr(row, "band_weight", None)
+            w = (np.ones_like(E_A) if weight is None
+                 else np.asarray(jax.device_get(weight)).reshape(-1))
+            G_t = np.array([
+                np.sum(w[mask] * np.exp(-1j * (E_A[mask] - win.E_ref_A) * tt))
+                for tt in t])
+            coeff = (win.prefactor * alpha
+                     * np.exp(-1j * (win.E_ref_A + win.E_ref_B
+                                     - win.omega_sign * abs(omega)) * t))
+            total += np.sum(coeff * G_t * W_t)
+        return total
+
+    for omega in _OMEGA_GRID:
+        got = evaluate(plan, omega)
+        want = exact(omega)
+        assert abs(got - want) / abs(want) < 5.0e-4, (
+            f"sliver plan disagrees at omega={omega}: {got} vs {want}")
+
+    # Negative control aimed at the real refusal: an UNWEIGHTED branch whose
+    # mask includes the wrong-side state must still refuse by name — the
+    # sd split is licensed by the weight semantics only.
+    import pytest
+    E = jnp.asarray(_E_MINUS_MU)
+    idx = np.arange(_OMEGA_GRID.size)
+    bad_val_mask = jnp.asarray(_F != 0.0)
+    bad = [_SigmaBranch("pos_val", -E, bad_val_mask, "val", False,
+                        _OMEGA_GRID, idx)]
+    bad_sum = SW.summarize_sigma_poles(
+        Omega, B, bad, regularization_width_ry=_ETA, edge_factor=_EDGE)
+    with pytest.raises(ValueError, match="reaches or crosses zero"):
+        SW.build_shared_sigma_windows(
+            bad_sum, bad,
+            regularization_width_ry=_ETA, edge_factor=_EDGE, **_TOL)
+
+
 def test_straddle_routes_through_crossing_core():
     """Plan shape: the negative-E_A shell lands in a core (crossing) window,
     the barely-deep pole is served shallow, and every sign-definite slab
