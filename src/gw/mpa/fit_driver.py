@@ -88,7 +88,7 @@ def _scalar_fit_kernel(n_p, guard_items, rcond):
     def _kernel(samples, z):
         return pade_fit.fit_mpa_poles(
             samples, z, n, guards=guards, rcond=float(rcond),
-            solve=_FIT_SOLVE, affine=_FIT_AFFINE, eig=_FIT_EIG)
+            eig=_FIT_EIG)
 
     return _kernel
 
@@ -122,8 +122,10 @@ def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
         "max_abs_residual": float(
             np.asarray(diagnostics["max_abs_residual"])),
         "n_valid": int(np.asarray(diagnostics["n_valid"])),
-        "solve": _FIT_SOLVE,
-        "affine": bool(_FIT_AFFINE),
+        # Loewner is the only solve (chore 8e2f7f76); the pair is kept in
+        # the report so stores keep stamping their provenance explicitly.
+        "solve": "loewner",
+        "affine": True,
         "eig": _FIT_EIG,
         "rcond": float(rcond),
     }
