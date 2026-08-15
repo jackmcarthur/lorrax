@@ -218,6 +218,12 @@ Reads BerkeleyGW `WFN.h5`. `backend='auto'` (default) picks `eager` (h5py + nump
 
 ### 2.5 `SymMaps` — `services/symmetry_maps/` (the door)
 
+> **Read [`symmetry_register.md`](symmetry_register.md) first** if your question
+> is "where does this kind of symmetry live". It maps every symmetry operation
+> in the tree to its backend and call sites, grouped by OPERATION rather than by
+> file, and names the two conventions (`mtrx` vs `mtrx.T`; raw `tnp` vs τ) that
+> cause the most damage when confused.
+
 IBZ → full BZ unfolding. Builds the full mesh, k→q maps, spinor SU(2) rotations (Markley quaternion), and fractional-translation phases for non-symmorphic operators. Key methods:
 
 - `get_gvecs_kfull(wfn, nk)` — rotated G-vectors at full-BZ k-point

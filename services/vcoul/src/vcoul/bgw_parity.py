@@ -180,9 +180,19 @@ def fill_v_grid_for_q(
     G_miller = table.G_miller_per_q[iq]
     vcoul = table.vcoul_per_q[iq]
 
-    # Map G-vectors using the same integer formula as
-    # common/symmetry_maps.py:get_gvecs_kfull (lines 689-690):
+    # Map G-vectors using the same integer formula as the loader's
+    # ``gvecs`` (``services/wfn_loader/src/wfn_loader/loader.py:604``,
+    # ``einsum('ij,kj->ki', sym_mats_k[sym_idx], k_gvecs) - Gkk``):
     #     G_full = sym_krep @ G_irr - kg0
+    #
+    # THIS IS AN INDEPENDENT COPY, not a call.  It is registered as such
+    # in tests/KNOWN_FAILURES.md ("Bespoke IBZ->full-BZ unfolding outside
+    # the symmetry service"), together with why it was not rewritten: the
+    # service returns no ``kg0``, and recomputing one here is the very
+    # hand-rolled matching the register exists to remove.  The old
+    # citation above pointed at "common/symmetry_maps.py:689-690", a file
+    # and line range that no longer exist — that body was inlined into
+    # the loader when the service was split out.
     # Here q_frac plays the role of k_full, q_table plays k_bar, and kg0
     # satisfies q_frac = S_k @ q_table + kg0.  Both S_k and kg0 are
     # integer-valued so the transform preserves the FFT grid.
