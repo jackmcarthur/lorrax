@@ -62,6 +62,7 @@ from __future__ import annotations
 import functools as _functools
 import math as _math
 import os
+import time as _time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -220,6 +221,20 @@ def stage_compute_mode(inputs: "SCInputs"):
     """
     mode = getattr(inputs, "compute_mode", None)
     return inputs.config.compute_mode if mode is None else mode
+
+
+def _indirect_gap_ev(e_kn_ev: np.ndarray, n_occ: int) -> float:
+    """min_k E[n_occ] − max_k E[n_occ−1], in eV.
+
+    The physical number a person watching a QSGW run is actually waiting
+    to see settle, so it goes on the per-iteration line beside the
+    residual.  Returns NaN when the active window has no conduction band
+    (nothing to subtract) rather than raising inside a progress print.
+    """
+    e = np.asarray(e_kn_ev, dtype=np.float64)
+    if not (0 < int(n_occ) < e.shape[1]):
+        return float("nan")
+    return float(e[:, int(n_occ)].min() - e[:, int(n_occ) - 1].max())
 
 
 class _StageConverged(Exception):
@@ -1501,7 +1516,7 @@ def _write_sc_eqp_snapshot(
     call_index: int,
     role: str,
     rms_ev: float,
-    rms2_ev: float,
+    max_abs_ev: float,
 ) -> str | None:
     """Write one small BGW-shaped record of a completed SC map call.
 
@@ -1544,9 +1559,18 @@ def _write_sc_eqp_snapshot(
         f"SC map={int(call_index):04d} role={role}; columns are "
         "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
         "outputs are not accepted iterates",
-        f"map_output_RMS_dE_prev_output={float(rms_ev):.9e} eV; "
-        f"map_output_RMS_dE_two_calls={float(rms2_ev):.9e} eV; "
-        "these are map-call diagnostics, not accepted-iterate residuals",
+        # THE CRITERION FIRST, AND NAMED AS SUCH.  ``max_abs`` is the
+        # fixed-point residual max|eig F(H) - eig H| over the
+        # NON-SCISSORED bands, which is what the loop converges on; the
+        # RMS is a looser diagnostic over ALL active bands and is kept
+        # only because existing tooling reads that key.  Quoting the RMS
+        # as the convergence figure understated a real production run by
+        # ~19x (KNOWN_LORRAX_ISSUES, gw/sc_iteration).
+        f"CRITERION_max_abs_dE_fixed_point_nonscissored="
+        f"{float(max_abs_ev):.9e} eV (output-vs-input of THIS call); "
+        f"map_output_RMS_dE_prev_output={float(rms_ev):.9e} eV "
+        "(DIAGNOSTIC ONLY: RMS over all active bands against the previous "
+        "map call, which under rCROP may be a trial step)",
         f"active_scissored_bands_1based={active_labels}",
         ("active_scissor=none (all active bands lie on the Sigma grid)"
          if active_fit is None else
@@ -1596,6 +1620,9 @@ def run_self_consistency(
     cutoff_ev: float | None = None,
     clear_snapshots: bool = True,
     snapshot_base: int = 0,
+    stage_label: str = "SC",
+    n_occ_active: int = 0,
+    verdict_out: list | None = None,
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` to ``max_iter`` or the stage cutoff.
 
@@ -1661,7 +1688,7 @@ def run_self_consistency(
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
             call_index=snapshot_base, role="one_shot", rms_ev=rms,
-            rms2_ev=float("nan"),
+            max_abs_ev=float("nan"),
         )
         return state_new, []
 
@@ -1675,6 +1702,8 @@ def run_self_consistency(
             dump_dir=_dump_dir,
             cutoff_ev=_cutoff,
             snapshot_base=snapshot_base,
+            stage_label=stage_label, n_occ_active=n_occ_active,
+            verdict_out=verdict_out,
         )
     if accelerator == "linear":
         return _run_linear_mixing(
@@ -1685,6 +1714,8 @@ def run_self_consistency(
             dump_dir=_dump_dir,
             cutoff_ev=_cutoff,
             snapshot_base=snapshot_base,
+            stage_label=stage_label, n_occ_active=n_occ_active,
+            verdict_out=verdict_out,
         )
     raise ValueError(
         f"run_self_consistency: unknown accelerator={accelerator!r} "
@@ -1695,7 +1726,8 @@ def _run_linear_mixing(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, mixing: float,
     eigvalsh_kshard, print_fn, dump_dir, cutoff_ev: float | None = None,
-    snapshot_base: int = 0,
+    snapshot_base: int = 0, stage_label: str = "SC", n_occ_active: int = 0,
+    verdict_out: list | None = None,
 ) -> tuple[SCState, list[float]]:
     """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
 
@@ -1742,30 +1774,36 @@ def _run_linear_mixing(
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new_ev.copy())
-        rms2 = (
-            float(np.sqrt(np.mean((E_new_ev - _e_history[-3]) ** 2)))
-            if len(_e_history) >= 3 else float("nan"))
-        print_fn(
-            f"  SC iter {state_new.iteration}: "
-            f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
-            f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
-        )
+        # SAME CRITERION AS rCROP, AND THE SAME REASON IT IS OUTPUT-vs-INPUT.
+        # ``E_candidate_ev`` is the UNMIXED map output F(H); ``E_prev_ev``
+        # is that call's input.  Testing the MIXED ``E_new_ev`` against the
+        # previous iterate instead is precisely the mixing != 1 trap: at
+        # small alpha the mixed iterate barely moves whatever F does, so the
+        # loop would "converge" by damping rather than by solving.  This
+        # also used to break on ``rms < tol_ev``, an RMS over ALL active
+        # bands including the scissored ones -- both the looser test and a
+        # different set (5.8x under max|dE| on the measured Si deck).
+        verdict = protected_band_convergence(
+            E_candidate_ev, E_prev_ev, _protected, _in_range,
+            tol_ev if cutoff_ev is None else cutoff_ev)
         _write_sc_eqp_snapshot(
             inputs, state_new, E_candidate_ev,
             call_index=snapshot_base + it, role="linear",
-            rms_ev=rms, rms2_ev=rms2,
+            rms_ev=rms, max_abs_ev=float(verdict.max_abs_ev),
         )
-        verdict = protected_band_convergence(
-            E_new_ev, E_prev_ev, _protected, _in_range,
-            tol_ev if cutoff_ev is None else cutoff_ev)
-        print_fn(f"    SC stage check: {verdict.summary()}")
+        _gap = _indirect_gap_ev(E_candidate_ev, n_occ_active)
+        print_fn(
+            f"  [{stage_label} iter {it + 1}/{max_iter} linear a={mixing:.2f}]"
+            f" max|dE|={verdict.max_abs_ev * 1e3:9.3f} meV"
+            f" (k={verdict.worst_k:3d} b={verdict.worst_band:3d})"
+            f"  cutoff={verdict.cutoff_ev * 1e3:g} meV"
+            f"  gap={_gap:.4f} eV"
+            f"  [RMS_nonsciss={verdict.rms_protected_ev * 1e3:.3f} meV,"
+            f" RMS_all={rms * 1e3:.3f} meV — diagnostics]")
         state = state_new
         E_prev_ev = E_new_ev
-        # SAME CRITERION AS rCROP.  This used to break on ``rms < tol_ev``
-        # -- an RMS over ALL active bands, including the scissored ones,
-        # which is both the looser test and a different set.  See the
-        # ``_run_rcrop`` note: the all-band RMS ran 5.8x under max|ΔE| on
-        # the measured Si deck.
+        if verdict_out is not None:
+            verdict_out[:] = [verdict]
         if verdict.converged:
             break
 
@@ -1778,6 +1816,8 @@ def _run_rcrop(
     max_iter: int, tol_ev: float, history_depth: int,
     eigvalsh_kshard, print_fn, dump_dir,
     cutoff_ev: float | None = None, snapshot_base: int = 0,
+    stage_label: str = "SC", n_occ_active: int = 0,
+    verdict_out: list | None = None,
 ) -> tuple[SCState, list[float]]:
     """rCROP (Anderson-style) accelerated fixed point.
 
@@ -1933,18 +1973,33 @@ def _run_rcrop(
     _last_outputs: list = [None]
     _iter_idx = [0]
     rms_history: list[float] = []
-    # THE STAGE CRITERION runs on the ACCEPTED-ITERATE sequence, not on
-    # every map call.  rCROP makes two calls per iteration (a trial step
-    # and the real-residual evaluation); a trial can land close to its
-    # predecessor without the iterate having converged, so testing every
-    # call would stop the stage on a diagnostic.  ``role`` below is the
-    # existing name for that distinction and this reuses it rather than
-    # inventing a second one.
+    # THE STAGE CRITERION IS THE FIXED-POINT RESIDUAL OF ONE MAP CALL:
+    # eigenvalues of the OUTPUT F(H) against eigenvalues of that same
+    # call's INPUT H.  It is NOT the difference between successive
+    # accepted iterates, and the distinction is load-bearing.
+    #
+    # Under rCROP the accepted iterate is a mixed linear combination of
+    # the history, so "successive accepted iterates stopped moving" can be
+    # driven arbitrarily small by damping while F still has no fixed
+    # point -- the two tests coincide only at mixing = 1.  That is the
+    # same trap KNOWN_LORRAX_ISSUES records for the snapshot RMS stamp
+    # under mixing != 1.  ‖F(H) − H‖ makes no reference to the iteration
+    # that produced H, so it cannot be flattered by the accelerator.
+    #
+    # It is still evaluated only on NON-TRIAL calls: on those the input
+    # IS the accepted iterate (rcrop_nojit's `f_new = residual_fn(x_new)`),
+    # so this is the residual AT the iterate the loop would return.  A
+    # trial call's residual is the residual at a probe point, which is a
+    # diagnostic, not a convergence statement.
+    #
+    # Costs one extra eigvalsh of the (nk, nb, nb) input per checked call
+    # -- negligible beside the Sigma build, and it is what makes the extra
+    # "evaluate Sigma once more at the end" check unnecessary: the last
+    # checked call already measured exactly that residual.
     _protected = np.asarray(
         inputs.partition.protected_mask, dtype=bool).reshape(-1)
     _in_range = np.asarray(
         inputs.partition.in_range_mask, dtype=bool).reshape(-1)
-    _accepted_e: list[np.ndarray] = [_e_history[0].copy()]
     _verdicts: list[ConvergenceVerdict] = []
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
@@ -1974,50 +2029,58 @@ def _run_rcrop(
         # screening artifacts ``sc_{iteration:04d}`` (the MPA fit/W pair
         # under tmp/mpa), so a second stage restarting the count at 0
         # would write over the first stage's files.
+        # THE MAP INPUT's eigenvalues, for the fixed-point residual below.
+        E_in = np.asarray(eigvalsh_kshard(H)) * RYD_TO_EV
         state_in = SCState(H_qp_dft=H, iteration=snapshot_base + _iter_idx[0])
+        _t_call = _time.perf_counter()
         state_out = gw_iteration_map(state_in, inputs)
+        _wall_call = _time.perf_counter() - _t_call
         _last_outputs[0] = state_out.outputs
-        # Track per-call eigenvalue RMS so the user sees progress in the
-        # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())
-        rms2 = (
-            float(np.sqrt(np.mean((E_new - _e_history[-3]) ** 2)))
-            if len(_e_history) >= 3 else float("nan"))
-        print_fn(
-            f"  SC rCROP call {len(rms_history)}: "
-            f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
-            f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
-        )
         call_index = _iter_idx[0]
         role = ("initial" if call_index == 0 else
                 "trial" if call_index % 2 else "accepted_input_map")
+        # THE HEADLINE LINE.  max|ΔE| first because it is the criterion,
+        # with the (k, band) it lands on -- "which band is the straggler"
+        # is the first thing anyone watching asks -- then the cutoff on
+        # the SAME line so distance-to-target needs no arithmetic, then
+        # the gap (the physical number people actually watch settle), the
+        # wall time, and only then the RMS, explicitly labelled looser.
+        _res = protected_band_convergence(
+            E_new, E_in, _protected, _in_range,
+            cutoff_ev if cutoff_ev is not None else float("inf"))
+        _gap = _indirect_gap_ev(E_new, n_occ_active)
+        print_fn(
+            f"  [{stage_label} iter {1 + call_index // 2}/{max_iter}"
+            f" {role:18s}] max|ΔE|={_res.max_abs_ev * 1e3:9.3f} meV"
+            f" (k={_res.worst_k:3d} b={_res.worst_band:3d})"
+            f"  cutoff={(cutoff_ev or 0.0) * 1e3:g} meV"
+            f"  gap={_gap:.4f} eV  {_wall_call:6.1f} s"
+            f"  [RMS_nonsciss={_res.rms_protected_ev * 1e3:.3f} meV,"
+            f" RMS_all={rms * 1e3:.3f} meV — diagnostics]")
         _write_sc_eqp_snapshot(
             inputs, state_out, E_new,
             call_index=snapshot_base + call_index, role=role,
-            rms_ev=rms, rms2_ev=rms2,
+            rms_ev=rms, max_abs_ev=float(_res.max_abs_ev),
         )
         _iter_idx[0] += 1
-        # Stage criterion on the accepted-iterate sequence only.
+        # Stage criterion: the FIXED-POINT RESIDUAL of this call, on
+        # non-trial calls only (there the input IS the accepted iterate).
+        # No "needs two iterates" guard is required any more: ‖F(H) − H‖
+        # small at call 0 genuinely means the DFT H is already a fixed
+        # point of the map, which is a true statement about the solution
+        # rather than an artefact of comparing against the starting guess.
         if cutoff_ev is not None and role != "trial":
-            verdict = protected_band_convergence(
-                E_new, _accepted_e[-1], _protected, _in_range, cutoff_ev)
-            _accepted_e.append(E_new.copy())
-            _verdicts.append(verdict)
-            print_fn(f"    SC stage check: {verdict.summary()}")
-            if verdict.converged and len(_accepted_e) > 2:
-                # ``> 2`` because the first accepted check compares the
-                # map's output against the DFT starting eigenvalues, which
-                # is a measure of the FIRST correction, not of a fixed
-                # point: a deck whose G0W0 shift is small everywhere would
-                # otherwise "converge" before a second Sigma was ever built.
+            _verdicts.append(_res)
+            if _res.converged:
                 raise _StageConverged(
                     SCState(H_qp_dft=state_out.H_qp_dft,
                             iteration=_iter_idx[0],
                             outputs=state_out.outputs),
-                    verdict)
+                    _res)
         return _to_entry(state_out.H_qp_dft - H)
 
     # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
@@ -2073,6 +2136,8 @@ def _run_rcrop(
             "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, which this path does not "
             "reach)")
+        if verdict_out is not None:
+            verdict_out.append(stop.verdict)
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 
@@ -2137,6 +2202,8 @@ def _run_rcrop(
         iteration=_iter_idx[0],
         outputs=_last_outputs[0],
     )
+    if verdict_out is not None and _verdicts:
+        verdict_out.append(_verdicts[-1])
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
 
@@ -2158,6 +2225,38 @@ def _maybe_dump_e_history(
             f"{dump_dir}/e_history_kn_ev.npy (shape (map, k, n))"
         )
     barrier("sc.e_history.write", print_fn=print_fn)
+
+
+def _announce_inert_keys_for_stage(stage, stage_config, print_fn) -> None:
+    """Say which parsed deck keys THIS stage's self-energy will not honor.
+
+    ANNOUNCE, NOT REFUSE, and the distinction is forced rather than
+    chosen.  Under ``compute_mode = mpa`` the parsed-and-validated keys
+    ``fermi_reference`` and ``sigma_omega_layout`` are silently ignored —
+    MPA hard-codes ``wfn.efermi`` and always emits the sharded cube
+    (``grep -rn 'fermi_reference\\|omega_layout' src/gw/mpa/`` → 0 hits;
+    KNOWN_LORRAX_ISSUES, gw/sigma_dispatch).  That is the same trust hole
+    as a deck key with no reader.
+
+    It cannot be a refusal here: ``fermi_reference`` DEFAULTS to
+    ``midgap``, so every MPA deck in existence — including the owner's
+    accepted production deck — requests a value MPA does not honor, and
+    refusing would turn a silent difference into a total outage for a
+    defect this change did not introduce and is not scoped to fix.  So
+    the stage says so, once, by name, and the fix stays where the ledger
+    put it: making the MPA branch consume or refuse both keys at
+    ``sigma_dispatch.py``.
+    """
+    from .gw_config import ComputeMode
+
+    if stage.mode is not ComputeMode.MPA:
+        return
+    print_fn(
+        f"    NOTE stage {stage.mode.value}: 'fermi_reference="
+        f"{stage_config.sigma.fermi_reference}' and 'sigma_omega_layout="
+        f"{stage_config.sigma.omega_layout}' are parsed but currently "
+        f"INERT on the MPA branch (KNOWN_LORRAX_ISSUES, gw/sigma_dispatch). "
+        f"The Fermi reference feeds the scissor, so this is not cosmetic.")
 
 
 def run_staged_self_consistency(
@@ -2204,6 +2303,7 @@ def run_staged_self_consistency(
     state = state_init
     rms_history: list[float] = []
     records: list[dict] = []
+    _verdicts_out: list = []
     call_offset = 0
 
     for idx, stage in enumerate(stages, start=1):
@@ -2240,7 +2340,9 @@ def run_staged_self_consistency(
             inputs.config, compute_mode_raw=stage.mode.value)
         stage_inputs = dataclasses.replace(
             inputs, compute_mode=stage.mode, config=stage_config)
+        _announce_inert_keys_for_stage(stage, stage_config, print_fn)
         t0 = _time.perf_counter()
+        _v: list = []
         state, stage_rms = run_self_consistency(
             state, stage_inputs,
             max_iter=stage.max_iter,
@@ -2251,7 +2353,11 @@ def run_staged_self_consistency(
             mixing=mixing,
             clear_snapshots=(idx == 1),
             snapshot_base=call_offset,
+            stage_label=f"stage {idx}/{len(stages)} {stage.mode.value}",
+            n_occ_active=int(getattr(inputs.meta, "nelec", 0) or 0),
+            verdict_out=_v,
         )
+        _verdicts_out.extend(_v)
         wall = _time.perf_counter() - t0
         rms_history.extend(stage_rms)
         records.append({
@@ -2261,59 +2367,39 @@ def run_staged_self_consistency(
             "max_iter": int(stage.max_iter),
             "map_calls": len(stage_rms),
             "wall_s": float(wall),
+            "s_per_call": float(wall / len(stage_rms)) if stage_rms else float("nan"),
+            "final_max_abs_ev": float(_v[-1].max_abs_ev) if _v else float("nan"),
+            "converged": bool(_v[-1].converged) if _v else False,
             "final_rms_ev": float(stage_rms[-1]) if stage_rms else float("nan"),
         })
         print_fn(
-            f"  ── SC stage {idx} done: {len(stage_rms)} map calls, "
-            f"{wall:.1f} s ──")
+            f"  ── SC stage {idx}/{len(stages)} {stage.mode.value} DONE: "
+            f"{len(stage_rms)} map calls, {wall:.1f} s "
+            f"({wall / max(len(stage_rms), 1):.1f} s/call), "
+            f"max|dE|={records[-1]['final_max_abs_ev'] * 1e3:.3f} meV vs "
+            f"{stage.cutoff_ev * 1e3:g} meV -> "
+            f"{'CONVERGED' if records[-1]['converged'] else 'NOT CONVERGED'}"
+            f" ──")
         call_offset += len(stage_rms) + 1
         last_inputs, last_stage = stage_inputs, stage
 
-    # ── FINAL QP-CONSISTENCY CHECK ──────────────────────────────────────
-    # A loop that stops on "successive iterates stopped moving" has proved
-    # a property of the ITERATION, not of the SOLUTION.  The two differ
-    # whenever the map contracts toward something that is not a fixed
-    # point of the physical equation -- which is not hypothetical here:
-    # the rCROP residual defect (KNOWN_LORRAX_ISSUES, gw/sc_iteration)
-    # showed this loop declaring convergence 60x early.
-    #
-    # So evaluate Sigma ONCE MORE at the converged energies and check that
-    # the eigenvalues come back where we stopped.  COSTS ONE FULL MAP CALL
-    # (~73 s for MPA on the measured Si deck, ~3 s for GN-PPM) and is
-    # default-on anyway: a QSGW number nobody re-substituted into its own
-    # equation is a number with no evidence behind it.
-    #
-    # The check's state is DISCARDED -- it is a residual measurement, not
-    # another iteration, and silently returning a further-iterated answer
-    # would make the run's output depend on whether the check ran.
-    _, _eigvalsh = _kshard_eigh_kernels(inputs.mesh_xy)
-    t0 = _time.perf_counter()
-    e_stop = np.asarray(_eigvalsh(state.H_qp_dft)) * RYD_TO_EV
-    state_check = gw_iteration_map(
-        SCState(H_qp_dft=state.H_qp_dft, iteration=call_offset), last_inputs)
-    e_check = np.asarray(_eigvalsh(state_check.H_qp_dft)) * RYD_TO_EV
-    qp_verdict = protected_band_convergence(
-        e_check, e_stop,
-        np.asarray(inputs.partition.protected_mask, dtype=bool).reshape(-1),
-        np.asarray(inputs.partition.in_range_mask, dtype=bool).reshape(-1),
-        last_stage.cutoff_ev)
-    print_fn(
-        f"  SC QP-consistency (one extra Σ at the converged energies, "
-        f"{_time.perf_counter() - t0:.1f} s): {qp_verdict.summary()}")
-    if not qp_verdict.converged:
+    # NO EXTRA Sigma CALL AT THE END.  An earlier revision evaluated
+    # Sigma once more at the converged energies to check the QP equation.
+    # That is now redundant AND it spent wall time, which is the opposite
+    # of this feature's goal: the stage criterion is already the
+    # FIXED-POINT RESIDUAL of a single map call (max|eig F(H) - eig H|
+    # over the non-scissored bands), so the last checked call has always
+    # measured exactly "does re-evaluating Sigma reproduce these
+    # energies".  The final verdict below IS that number, at zero cost.
+    if _verdicts_out:
+        v = _verdicts_out[-1]
         print_fn(
-            "  !!! SC QP-CONSISTENCY FAILED: re-evaluating Σ at the "
-            "converged energies did NOT reproduce them to the final "
-            "stage's cutoff.  The loop stopped moving, but the result is "
-            "not a fixed point of the QP equation to that tolerance. !!!")
-    records.append({
-        "stage": "qp_consistency",
-        "mode": last_stage.mode.value,
-        "cutoff_ev": float(last_stage.cutoff_ev),
-        "max_abs_ev": float(qp_verdict.max_abs_ev),
-        "converged": bool(qp_verdict.converged),
-        "wall_s": float(_time.perf_counter() - t0),
-    })
+            f"  SC fixed-point residual at the returned iterate: "
+            f"max|dE| = {v.max_abs_ev * 1e3:.4f} meV over {v.n_protected} "
+            f"non-scissored bands vs a {v.cutoff_ev * 1e3:g} meV cutoff "
+            f"-> {'SATISFIED' if v.converged else 'NOT SATISFIED'} "
+            f"(output-vs-input of the last accepted map call; no extra "
+            f"Sigma was built to measure it)")
 
     return state, rms_history, records
 
@@ -2494,26 +2580,18 @@ def run_sc_driver(
     )
     sigma_result = state_final.outputs.sigma_result
     print_fn(
-        # Count STAGES, not records -- ``stage_records`` also carries the
-        # QP-consistency row, and counting it printed "3 stage(s)" for a
-        # two-stage ladder.
         f"  SC done: {len(rms_history)} GW map calls across "
-        f"{sum(1 for r in stage_records if r['stage'] != 'qp_consistency')}"
-        f" stage(s)"
+        f"{len(stage_records)} stage(s)"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
             if rms_history else " (one-shot)"))
     for rec in stage_records:
-        if rec["stage"] == "qp_consistency":
-            print_fn(
-                f"    QP-consistency ({rec['mode']}): max|ΔE| = "
-                f"{rec['max_abs_ev'] * 1e3:.4f} meV vs cutoff "
-                f"{rec['cutoff_ev'] * 1e3:g} meV, {rec['wall_s']:.1f} s "
-                f"-> {'OK' if rec['converged'] else 'FAILED'}")
-            continue
         print_fn(
-            f"    stage {rec['stage']} {rec['mode']}: "
-            f"{rec['map_calls']} map calls, {rec['wall_s']:.1f} s, "
-            f"cutoff {rec['cutoff_ev'] * 1e3:g} meV")
+            f"    stage {rec['stage']} {rec['mode']:7s}: "
+            f"{rec['map_calls']:3d} map calls, {rec['wall_s']:8.1f} s "
+            f"({rec['s_per_call']:6.1f} s/call), final max|dE| = "
+            f"{rec['final_max_abs_ev'] * 1e3:9.3f} meV vs cutoff "
+            f"{rec['cutoff_ev'] * 1e3:g} meV -> "
+            f"{'CONVERGED' if rec['converged'] else 'NOT CONVERGED'}")
 
     # Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
     # qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged

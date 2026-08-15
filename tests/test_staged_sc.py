@@ -388,21 +388,9 @@ def test_stage_overrides_the_mode_on_inputs_AND_on_config(tmp_path, monkeypatch)
         seen.append((inputs.compute_mode, inputs.config.compute_mode))
         return state, []
 
+
     monkeypatch.setattr(
         sc_iteration, "run_self_consistency", _fake_run_self_consistency)
-    # The always-on QP-consistency check does one real map call + eigh;
-    # stub both, and record the mode IT runs under too -- the check must
-    # use the LAST stage's self-energy, not the deck's.
-    monkeypatch.setattr(
-        sc_iteration, "_kshard_eigh_kernels",
-        lambda mesh, *a, **k: (None, lambda H: np.zeros((2, 4))))
-
-    def _fake_map(state, inputs):
-        seen.append(("qp_check", inputs.config.compute_mode))
-        return state
-
-    monkeypatch.setattr(sc_iteration, "gw_iteration_map", _fake_map)
-
     from gw.band_partition import BandPartition
     ones = np.ones(4, dtype=bool)
     inputs = sc_iteration.SCInputs(
@@ -421,11 +409,9 @@ def test_stage_overrides_the_mode_on_inputs_AND_on_config(tmp_path, monkeypatch)
     assert seen == [
         (ComputeMode.GN_PPM, ComputeMode.GN_PPM),
         (ComputeMode.MPA, ComputeMode.MPA),
-        ("qp_check", ComputeMode.MPA),
     ], (
         "each stage must present ITS mode on both SCInputs.compute_mode "
-        "and config.compute_mode, and the QP-consistency check must run "
-        f"under the LAST stage's mode; got {seen}")
+        f"and config.compute_mode; got {seen}")
 
 
 def test_empty_stage_ladder_refuses():
