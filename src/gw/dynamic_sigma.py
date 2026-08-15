@@ -58,19 +58,30 @@ def eval_sigma_c_at_dft_energies(
     config,
     band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
+    efermi_ry=None,
 ):
-    """Interpolate diag(Sigma_c)(omega) at every DFT band energy."""
+    """Interpolate diag(Sigma_c)(omega) at every DFT band energy.
+
+    ``efermi_ry`` is the reference the Sigma(omega) GRID was built with.
+    None keeps the loader's midgap/VBM ``wfn.efermi`` (the insulating PPM
+    convention). A metallic caller MUST pass the same fixed-N mu its grid
+    used: mixing references samples Sigma at energies shifted by
+    (mu - efermi_midgap) — measured +2.79 eV on the sodium deck, showing
+    up as a spurious ~+2.4 eV near-E_F QP correction.
+    """
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
         band_slices.sigma_range, nspinor=meta.nspinor)
     enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
     vbm_ev = float(wfn.vbm) * RYD_TO_EV
     cbm_ev = float(wfn.cbm) * RYD_TO_EV
-    efermi_dft_ev = float(wfn.efermi) * RYD_TO_EV
+    ref_ry = float(wfn.efermi) if efermi_ry is None else float(efermi_ry)
+    efermi_dft_ev = ref_ry * RYD_TO_EV
     omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
     print_fn(
-        f"  E_F(midgap) = {efermi_dft_ev:.6f} eV  "
-        f"(VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
+        f"  omega reference = {efermi_dft_ev:.6f} eV "
+        f"({'wfn.efermi midgap/VBM' if efermi_ry is None else 'fixed-N mu'};"
+        f" VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
     from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega

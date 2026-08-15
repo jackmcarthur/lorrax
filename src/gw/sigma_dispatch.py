@@ -339,6 +339,7 @@ def finalize_dynamic_sigma(
     input_dir: str,
     write_sigma_omega_h5: bool = True,
     print_fn: Callable = print,
+    efermi_ry=None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -369,6 +370,7 @@ def finalize_dynamic_sigma(
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
+            efermi_ry=efermi_ry,
         )
 
         if write_sigma_omega_h5:
@@ -382,12 +384,12 @@ def finalize_dynamic_sigma(
         else:
             sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
 
-        # Static Sigma_x is added in the QSGW kernel.  E_F is the same WFN
-        # reference used above for the DFT-frequency interpolation.
+        # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
+        # reference the interpolation above used — one omega reference per
+        # finalize, or the two reads sample different grid positions.
         omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         e_qp_rel_ev = (
-            np.asarray(e_qp_ev, dtype=np.float64)
-            - float(wfn.efermi) * RYD_TO_EV)
+            np.asarray(e_qp_ev, dtype=np.float64) - efermi_dft_ev)
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
@@ -735,7 +737,11 @@ def compute_sigma_xc(
             sym=sym, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
-            print_fn=print_fn)
+            print_fn=print_fn,
+            # The MPA grid was built against this mu (one chemical
+            # potential per iteration); the finalizer must read it back
+            # against the same reference.
+            efermi_ry=sigma_efermi_ry)
 
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
