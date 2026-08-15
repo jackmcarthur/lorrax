@@ -333,6 +333,10 @@ class SCState:
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
+    # DIAGNOSTIC continuity only (mu-drift log): the map ENTRY-solves its
+    # own occupation state from the spectrum of the H it is handed, so
+    # correctness never depends on these two fields — F(H) is a self-map
+    # of H alone, which is what rCROP's trial/accept trajectory assumes.
     occupation_state: OccupationState | None = None  # full-BZ, padded PT head manifold
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
@@ -1412,6 +1416,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
+    # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
+    # the spectrum of the H actually being mapped (wfns_qp.enk is the
+    # eigensystem of state.H_qp_dft rotated above).  This makes the
+    # iteration a genuine self-map F(H) = Sigma[H, occ(H)] — the contract
+    # _run_rcrop's own header states ("gw_iteration_map reads
+    # state.iteration and state.H_qp_dft and nothing else") and the one
+    # rCROP's trial/accept trajectory requires: every F(H) evaluation,
+    # trial or accepted, gets occupations consistent with ITS H by
+    # construction.  The previous flow solved this same quantity at
+    # END-of-iteration and carried it into the NEXT call — a
+    # one-generation lag (audit A5) that was exact only on the
+    # mixing=1 linear trajectory, which is why rCROP was refused on
+    # metallic decks.  At a fixed point H* = F(H*) the two rules
+    # coincide, so the converged answer is unchanged.  Insulating decks
+    # (occ_broadening = 0) return (None, None): bit-identical path.
+    entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
+        inputs, wfns_qp.enk)
+
     # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
     # orbitals, alongside Sigma_i and from the same U_qp, both feeding
     # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
@@ -1501,27 +1523,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
         head_surface_weight_kn = None
-        if state.occupation_state is not None:
-            carried = state.occupation_state
-            if tuple(np.shape(carried.f_kn)) != (
-                    int(wfns_qp.enk.shape[0]), nb_storage):
-                raise ValueError(
-                    "carried QSGW occupation state has shape "
-                    f"{np.shape(carried.f_kn)}, expected "
-                    f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
-            head_occ_kn = carried.f_kn
-            head_efermi_ry = float(carried.mu_ry)
-            if state.head_surface_weight_kn is None:
-                raise ValueError(
-                    "QSGW occupation state was carried without its "
-                    "tetrahedron Fermi-surface weights.")
-            if tuple(state.head_surface_weight_kn.shape) != (
-                    int(wfns_qp.enk.shape[0]), nb_storage):
-                raise ValueError(
-                    "carried QSGW head Fermi-surface weights have shape "
-                    f"{state.head_surface_weight_kn.shape}, expected "
-                    f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
-            head_surface_weight_kn = state.head_surface_weight_kn
+        if entry_occ_state is not None:
+            # Entry-solved THIS call from wfns_qp.enk, so the shapes are
+            # right by construction; the invariant worth pinning is that
+            # the head consumes the SAME mu the entry solve produced —
+            # exact equality, not a tolerance (the rewiring regression
+            # this guards is a consumer drifting back to a carried or
+            # midgap reference).
+            head_occ_kn = entry_occ_state.f_kn
+            head_efermi_ry = float(entry_occ_state.mu_ry)
+            assert head_efermi_ry == float(entry_occ_state.mu_ry)
+            head_surface_weight_kn = entry_surface_weight_kn
 
         iteration_head_response = build_iteration_head_response(
             delta_head,
@@ -1565,9 +1577,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     # Metal-only threading: the insulating routes stay on the None branch
-    # (bit-exact bool selectors) even though a step OccupationState is
-    # carried for the head — dormant-behind-material_class by design.
-    metal_occ_state = (state.occupation_state
+    # (bit-exact bool selectors).  The ENTRY-solved state feeds chi, the
+    # head and Sigma — one mu per map call, from this call's spectrum.
+    metal_occ_state = (entry_occ_state
                        if _material_class(inputs) == "metal" else None)
     W_by_role = compute_screening_model(
         inputs.config.compute_mode, wfns_qp, inputs.V_q,
@@ -1735,25 +1747,22 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
 
-    # END-OF-ITERATION metallic occupation update.  This is intentionally
-    # after Sigma/H assembly and after the current energies and orbitals were
-    # rotated above.  The head in THIS call used state.head_occ_kn; this solve
-    # produces the table consumed by the NEXT call.  Nothing installs it in
-    # wfns_qp, so finite-q screening and Green's functions are unchanged.
-    next_occ_state, next_head_surface_weight_kn = _solve_head_occupations(
-        inputs, wfns_qp.enk)
-    if next_occ_state is not None:
-        # μ drift against the carried previous-iteration state is the R6
-        # convergence invariant; log it every iteration.
-        drift = (abs(next_occ_state.mu_ry - state.occupation_state.mu_ry)
+    # The occupation state was ENTRY-solved from this call's own spectrum
+    # and consumed by this call's chi/head/Sigma; no second solve happens
+    # here.  The carry below is DIAGNOSTIC continuity only (mu drift
+    # between consecutive map inputs) — the next call re-solves at its
+    # own entry, whatever trajectory (linear, rCROP trial/accept) handed
+    # it its H.
+    if entry_occ_state is not None:
+        drift = (abs(entry_occ_state.mu_ry - state.occupation_state.mu_ry)
                  if state.occupation_state is not None else float("nan"))
         inputs.print_fn(
-            "    SC occupations: end-of-iteration BGW-MP1 update, "
-            f"mu={next_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
-            f"|dmu|={drift * RYD_TO_EV:.3e} eV, "
+            "    SC occupations: entry-solved BGW-MP1 state, "
+            f"mu={entry_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
+            f"|dmu|={drift * RYD_TO_EV:.3e} eV vs previous map input, "
             f"width={inputs.config.occ_broadening_ry:.10f} Ry "
             f"(degauss {2.0 * inputs.config.occ_broadening_ry:.10f} Ry), "
-            f"occ_hash {next_occ_state.occ_hash}")
+            f"occ_hash {entry_occ_state.occ_hash}")
 
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
@@ -1780,8 +1789,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
-        occupation_state=next_occ_state,
-        head_surface_weight_kn=next_head_surface_weight_kn,
+        occupation_state=entry_occ_state,
+        head_surface_weight_kn=entry_surface_weight_kn,
         outputs=SCOutputs(
             sigma_result=sigma_result,
             # FULL-BZ U.  These two fields are consumed TOGETHER by

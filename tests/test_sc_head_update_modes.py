@@ -125,19 +125,25 @@ def test_a_fractional_deck_defaulting_the_head_key_is_still_refused(tmp_path):
 
 @pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
 def test_the_other_two_fractional_preconditions_are_unchanged(tmp_path, mode):
-    # A legal head mode does not excuse the solver or the accelerator.
+    # A legal head mode does not excuse the solver.
     with pytest.raises(ValueError, match="self_consistent"):
         _config(
             tmp_path,
             "occ_broadening = 0.13605693122994\n"
             f"sc_head_update = {mode}\n")
-    with pytest.raises(ValueError, match="sc_accelerator=linear"):
-        _config(
-            tmp_path,
-            "qp_solver = self_consistent\n"
-            "sc_accelerator = rcrop\n"
-            "occ_broadening = 0.13605693122994\n"
-            f"sc_head_update = {mode}\n")
+
+
+@pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
+def test_rcrop_is_legal_on_a_metallic_deck(tmp_path, mode):
+    """The entry-solve rule (2026-08-15) makes F(H) a self-map of H alone,
+    so the accelerator refusal is gone: a metallic rCROP deck parses."""
+    cfg = _config(
+        tmp_path,
+        "qp_solver = self_consistent\n"
+        "sc_accelerator = rcrop\n"
+        "occ_broadening = 0.13605693122994\n"
+        f"sc_head_update = {mode}\n")
+    assert cfg.sc.accelerator == "rcrop"
 
 
 def test_an_unknown_head_update_value_refuses_and_names_both_modes(tmp_path):
@@ -392,3 +398,41 @@ def test_the_loader_the_driver_takes_is_the_one_the_tool_takes():
     ).read_text()
     assert "load_dft_velocity_head" in source
     assert "_load_dft_velocity_stage" not in source
+
+
+def test_the_map_entry_solves_its_own_occupations():
+    """The rCROP-enabling invariant, pinned at the source level.
+
+    F(H) must be a self-map of H alone: gw_iteration_map solves its MP1
+    occupation state at ENTRY from the spectrum of the H it was handed
+    (wfns_qp.enk), and the carried state is diagnostic only.  The
+    discriminating failure this guards: a consumer rewired back to
+    state.occupation_state would make trial/accepted rCROP iterates
+    consume occupations from a different trajectory point.
+    """
+    import ast
+    import inspect
+    import re
+    from gw import sc_iteration
+
+    src = inspect.getsource(sc_iteration.gw_iteration_map)
+    # (a) the entry solve exists and feeds from this call's spectrum
+    assert re.search(
+        r"entry_occ_state, entry_surface_weight_kn = "
+        r"_solve_head_occupations\(\s*inputs, wfns_qp\.enk\)", src), \
+        "gw_iteration_map lost its entry occupation solve"
+    # (b) the metal chi/head/Sigma threading consumes the ENTRY state
+    assert "metal_occ_state = (entry_occ_state" in src
+    assert "head_occ_kn = entry_occ_state.f_kn" in src
+    # (c) the carried state is read ONLY by the mu-drift diagnostic:
+    # count attribute reads of state.occupation_state in the function.
+    tree = ast.parse(src)
+    reads = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and n.attr == "occupation_state"
+        and isinstance(n.value, ast.Name) and n.value.id == "state"
+    ]
+    assert len(reads) == 2, (
+        f"state.occupation_state is read {len(reads)} times in "
+        "gw_iteration_map; the entry-solve rule allows exactly the two "
+        "reads of the mu-drift diagnostic (guard + subtraction)")

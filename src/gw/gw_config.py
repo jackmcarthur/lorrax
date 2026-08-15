@@ -2502,12 +2502,14 @@ class LorraxConfig:
                 "set sc_head_update to one of "
                 + ", ".join(METAL_HEAD_UPDATES)
                 + ".")
-        if self.sc.accelerator != "linear":
-            raise ValueError(
-                "occ_broadening > 0 carries an exact end-of-iteration MP1 "
-                "occupation state and therefore currently requires "
-                "sc_accelerator=linear.  rCROP mixes only the Hamiltonian "
-                "and cannot preserve that sequential state exactly.")
+        # rCROP is legal on metallic decks since the ENTRY-solve rule
+        # (2026-08-15): gw_iteration_map solves its MP1 occupation state
+        # from the spectrum of the H it is handed, every call, so F(H) is
+        # a self-map of H alone and any accelerator trajectory (trial or
+        # accepted iterates) gets occupations consistent with its own H
+        # by construction.  The refusal this replaces guarded the old
+        # END-of-iteration carry, which was exact only on the mixing=1
+        # linear trajectory.
 
     # ------------------------------------------------------------------
     #  Derived config objects

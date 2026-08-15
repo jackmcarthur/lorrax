@@ -55,13 +55,20 @@ def _state_attrs(fn, var="state"):
             and isinstance(n.value, ast.Name) and n.value.id == var}
 
 
-# The full carried state of one QSGW step: the QP Hamiltonian, the counter,
-# the per-iteration OccupationState, and the derived tetrahedron surface
-# weights produced at the END of the previous iteration.
+# The carried state one QSGW map call READS: the QP Hamiltonian, the
+# counter, and the previous call's OccupationState — the last of these for
+# the mu-drift diagnostic ONLY.  Since the entry-solve rule (2026-08-15)
+# the map solves its own occupations from the spectrum of the H it is
+# handed, so neither correctness nor the head consumes the carry;
+# head_surface_weight_kn is carried for continuity but never read here.
 _CARRY_KEYS = {
-    "iteration", "H_qp_dft",
-    "occupation_state", "head_surface_weight_kn",
+    "iteration", "H_qp_dft", "occupation_state",
 }
+
+# What a bare INPUT SCState is constructed with in the drivers: the read
+# set above plus head_surface_weight_kn, which rides along for carry
+# continuity (the map re-derives it at entry and never reads the carry).
+_STATE_INPUT_KEYS = _CARRY_KEYS | {"head_surface_weight_kn"}
 
 
 def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
@@ -83,7 +90,7 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "SCState":
             keys = {kw.arg for kw in node.keywords}
-            (inputs if keys == _CARRY_KEYS else finals).append(keys)
+            (inputs if keys == _STATE_INPUT_KEYS else finals).append(keys)
     assert inputs, f"{driver} builds no bare input SCState"
     for keys in finals:
         assert "outputs" in keys, (
