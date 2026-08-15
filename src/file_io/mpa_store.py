@@ -94,8 +94,11 @@ through the ``*_collective`` forms.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
+import os
+import sys
 
 import numpy as np
 
@@ -240,7 +243,7 @@ def stamp_occupation_provenance(obj, occupation_state):
 def read_occupation_stamps(src, *, mode="r"):
     """Return the fit store's occupation stamps, or None if unstamped."""
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         if ("mpa_" + _OCC_STAMP_ORDER[0]) not in grp.attrs:
             return None
         return {
@@ -283,6 +286,10 @@ def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
 #: arithmetic, and a budget whose constants are anonymous is a budget
 #: nobody can check against a message.
 COMPLEX128_BYTES = 16
+
+#: "the caller did not read this yet", distinct from a legitimate
+#: ``None`` (a full-BZ store genuinely has no unfold tables).
+_UNREAD = object()
 
 _QS_CACHE: list = []
 
@@ -333,6 +340,61 @@ def _qs():
         ) from exc
     _QS_CACHE.append(symmetry_maps)
     return symmetry_maps
+
+
+@contextlib.contextmanager
+def _h5(target, mode, *, where=None):
+    """THE serial-h5py door onto a store the FFI transport also drives.
+
+    Every h5py open in this module goes through here, because every file
+    this module writes is ALSO written by ``SlabIO`` through a different
+    HDF5 library instance (audit A1; sandbox claims/0110).  What the door
+    adds over a bare ``QirrDest``:
+
+    * it DECLARES the open to :mod:`file_io.hdf5_owner`, which refuses by
+      name if the FFI currently holds a live handle on the same path and
+      either side can write — the undefined case, and the one whose
+      symptom is a native rank-0 segfault rather than an exception;
+    * it FLUSHES before close on a write mode, so the bytes are durable
+      before the next collective open reads the superblock;
+    * it closes in a ``finally`` — the registry must not be left believing
+      a handle is live after an exception, or it would refuse every later
+      legitimate open on the path.
+
+    ``target`` is a path (this door owns the handle) or an already-open
+    h5py File/Group (the caller owns it; the door still declares it, since
+    a live foreign handle is exactly what the registry needs to know
+    about).  ``where`` defaults to the calling function's name.
+    """
+    from .hdf5_owner import STACK_H5PY, is_write_mode, note_close, note_open
+
+    if where is None:
+        try:
+            where = "mpa_store." + sys._getframe(2).f_code.co_name
+        except Exception:                                   # pragma: no cover
+            where = "mpa_store"
+    owned = isinstance(target, (str, bytes, os.PathLike))
+    if owned:
+        path, reg_mode = os.fspath(target), mode
+    else:
+        handle = getattr(target, "file", None)
+        path = getattr(handle, "filename", None)
+        # The caller's real mode, not ours: ``QirrDest`` ignores ``mode``
+        # on an open group, so claiming "a" for a handle the caller opened
+        # "r" would invent a writer.
+        reg_mode = getattr(handle, "mode", "r") or "r"
+    token = (None if path is None
+             else note_open(path, STACK_H5PY, reg_mode, where=where))
+    try:
+        with _qs().QirrDest(target, mode) as grp:
+            try:
+                yield grp
+            finally:
+                if owned and is_write_mode(mode):
+                    grp.file.flush()
+    finally:
+        if token is not None:
+            note_close(path, token)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +581,7 @@ def allocate_w_omega(
         n_omega, n_q_on_disk, n_mu, dtype, closure_verdict,
         where=f"allocate_w_omega({name!r})")
     n_omega, n_q_on_disk, n_mu = shape[:3]
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         if name in grp:
             del grp[name]
         grp.create_dataset(name, shape=shape, dtype=dtype)
@@ -646,7 +708,7 @@ def stamp_w_omega(
     if n_rmu_logical is not None:
         can = can.logical(int(n_rmu_logical)).canonical()
 
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         if name not in grp:
             raise KeyError(
                 f"mpa_store: {name!r} is not in this file.  "
@@ -775,7 +837,7 @@ def write_w_slab(dest, name, i_omega, W_q_munu, *, ready=True, mode="a"):
     """
     qs = _qs()
     X = np.asarray(W_q_munu)
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         ds, mgrp = _open_w(grp, name)
         i = int(i_omega)
         n_omega = int(ds.shape[0])
@@ -874,7 +936,7 @@ def write_w_slab_collective(
 
     n_ready = None
     if process_rank() == 0:
-        with _qs().QirrDest(dest, "a") as grp:
+        with _h5(dest, "a") as grp:
             ds, mgrp = _open_w(grp, name)
             n_ready = _mark_w_slab_ready(ds, mgrp, i_omega, ready)
     barrier("mpa_w_slab_ready")
@@ -953,7 +1015,7 @@ def read_w_header(src, name, *, mode="r"):
     the format about what it is holding.
     """
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         ds, mgrp = _open_w(grp, name)
         version = _refuse_unless_rank_matches_version(ds, name)
         if version != QIRR_FORMAT_VERSION_FREQ:
@@ -1239,7 +1301,7 @@ def read_w_slab(
             f"require_ready=False to inspect the placeholder "
             f"deliberately.")
 
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         ds = grp[name]
         raw = ds[i] if q is None else ds[i, int(q)]
     raw = np.asarray(raw)
@@ -1601,7 +1663,7 @@ def read_w_columns(
     # point selection on the LAST axis only, which h5py supports and
     # which keeps the row axis whole — the axis the caller shards.
     lo, hi, sel = _column_span(cols)
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         block = grp[name][:, iq, :, slice(lo, hi) if sel is None else sel]
     block = np.asarray(block)
 
@@ -1777,7 +1839,7 @@ def allocate_fit_store(
         raise ValueError(
             f"allocate_fit_store: energy_unit must be one of "
             f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
-    with _qs().QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         _initialise_fit_metadata(
             grp, n_q=n_q, n_mu=n_mu, n_p=n_p, energy_unit=energy_unit,
             grid_hash=grid_hash, table_hash=table_hash,
@@ -1839,7 +1901,7 @@ def allocate_fit_store_collective(
                               dtype=np.float64)
     barrier("mpa_fit_payload_allocated")
     if process_rank() == 0:
-        with _qs().QirrDest(dest, "a") as grp:
+        with _h5(dest, "a") as grp:
             _initialise_fit_metadata(
                 grp, n_q=n_q, n_mu=n_mu, n_p=n_p,
                 energy_unit=energy_unit, grid_hash=grid_hash,
@@ -1961,7 +2023,7 @@ def write_head_fit(
         raise ValueError("write_head_fit: diagnostics must be finite and nonnegative")
 
     qs = _qs()
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         _open_fit(grp)
         if MPA_HEAD_SUFFIX in grp:
             del grp[MPA_HEAD_SUFFIX]
@@ -1986,7 +2048,7 @@ def write_head_fit(
 def read_head_fit(src, *, to_unit=None, mode="r"):
     """Read the complete scalar q->0 MPA fit; refuse absent/partial data."""
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         _open_fit(grp)
         if MPA_HEAD_SUFFIX not in grp:
             raise ValueError("read_head_fit: fit store carries no scalar head")
@@ -2088,7 +2150,7 @@ def write_head_fit_collective(
             "scalar-head grid hash does not match the fitted body grid")
 
     if process_rank() == 0:
-        with _qs().QirrDest(dest, "a") as grp:
+        with _h5(dest, "a") as grp:
             _open_fit(grp)
             if MPA_HEAD_SUFFIX in grp:
                 del grp[MPA_HEAD_SUFFIX]
@@ -2115,7 +2177,7 @@ def write_head_fit_collective(
         io.write_attr(prefix + "B_p", residues)
     barrier("mpa_head_payload_written")
     if process_rank() == 0:
-        with _qs().QirrDest(dest, "a") as grp:
+        with _h5(dest, "a") as grp:
             grp[MPA_HEAD_SUFFIX].attrs["ready"] = True
     barrier("mpa_head_committed")
 
@@ -2127,7 +2189,7 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
     from file_io.slab_io import SlabIO
 
     ledger = validate_fit_store(src)
-    with _qs().QirrDest(src, "r") as grp:
+    with _h5(src, "r") as grp:
         _open_fit(grp)
         if MPA_HEAD_SUFFIX not in grp:
             raise ValueError("MPA fit store carries no scalar head")
@@ -2254,7 +2316,7 @@ def write_fit_block(
     qs = _qs()
     Om = np.asarray(Omega_p_block)
     Bp = np.asarray(B_p_block)
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         led = _open_fit(grp)
         n_p = int(grp.attrs["mpa_fit_n_p"])
         n_q = int(grp.attrs["mpa_fit_n_q"])
@@ -2402,7 +2464,7 @@ def write_fit_block_collective(
             f"columns={int(cols.size)}")
     keys = tuple(sorted(diag_block))
     stamped = None
-    with _qs().QirrDest(dest, "r") as grp:
+    with _h5(dest, "r") as grp:
         stamped = _qs().qirr_attr_str(_open_fit(grp), "diagnostic_keys")
     if stamped != ",".join(keys):
         raise ValueError(
@@ -2434,7 +2496,7 @@ def write_fit_block_collective(
                           valid_shape=valid_diag)
 
     if process_rank() == 0:
-        with _qs().QirrDest(dest, "a") as grp:
+        with _h5(dest, "a") as grp:
             _commit_fit_block(_open_fit(grp), iq, cols, lo, hi,
                               block_condition_max,
                               block_backward_error_max)
@@ -2497,7 +2559,7 @@ def fit_completion_ledger(src, *, mode="r"):
     the Σ stage's certification needs the second.
     """
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         led = _open_fit(grp)
         done = np.asarray(led["blocks_done"][()], dtype=bool)
         journal = np.asarray(led["block_journal"][()], dtype=np.int64)
@@ -2603,7 +2665,7 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     when nobody declared a threshold.
     """
     qs = _qs()
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         led = _open_fit(grp)
         if bool(grp.attrs.get("mpa_fit_complete", False)):
             raise ValueError(
@@ -2682,7 +2744,7 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
     needs the second one.
     """
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
         _refuse_unfinalized(grp, ledger, allow_partial,
                             f"read_fit_block(q={q})")
@@ -2723,7 +2785,7 @@ def read_fit_tensors(src, *, allow_partial=False, mode="r"):
     :func:`read_fit_block`.
     """
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
         _refuse_unfinalized(grp, ledger, allow_partial,
                             "read_fit_tensors")
@@ -2738,7 +2800,7 @@ def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
     """Store the W wedge's existing q-unfold tables beside its fitted poles."""
     qs = _qs()
     can = tables.canonical()
-    with qs.QirrDest(dest, mode) as grp:
+    with _h5(dest, mode) as grp:
         ledger = fit_completion_ledger(grp)
         storage = qs.validate_qirr_tables(
             can, int(ledger["n_q"]), int(ledger["n_mu"]))
@@ -2766,7 +2828,7 @@ def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
 def read_fit_unfold_tables(src, *, mode="r"):
     """Return the fit store's q-unfold tables, or ``None`` for full BZ."""
     qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    with _h5(src, mode) as grp:
         if FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX not in grp:
             return None
         return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
@@ -2801,8 +2863,15 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
 
 def _finish_pole_read(
     src, Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
+    tables=_UNREAD,
 ):
-    """Apply the one unit/unfold policy shared by pole readers."""
+    """Apply the one unit/unfold policy shared by pole readers.
+
+    ``tables`` is the unfold table set when the caller already read it
+    (:class:`PoleReader` does, once per iteration, BEFORE it opens its
+    collective handle); the sentinel means "read it from ``src`` now",
+    which is the one-shot :func:`read_poles` path.
+    """
     if to_unit is not None:
         scale = _unit_scale(ledger["energy_unit"], to_unit, "pole read")
         Omega, Bp = Omega * scale, Bp * scale
@@ -2812,7 +2881,8 @@ def _finish_pole_read(
 
         if mesh_xy is None:
             raise ValueError("a wedge pole unfold requires mesh_xy")
-        tables = read_fit_unfold_tables(src)
+        if tables is _UNREAD:
+            tables = read_fit_unfold_tables(src)
         if tables is None:
             raise ValueError("wedge fit has no unfold tables")
         if Omega.ndim == 3:
@@ -2842,6 +2912,117 @@ def _pole_read_shape(ledger, mesh_xy):
     return ledger["n_q"], n_pad, n_pad
 
 
+def _pole_range(ledger, pole_slice, where):
+    """Normalise ``pole_slice`` against the ledger's pole count."""
+    if pole_slice is None:
+        lo, hi = 0, ledger["n_p"]
+    elif isinstance(pole_slice, (int, np.integer)):
+        lo, hi = int(pole_slice), int(pole_slice) + 1
+    else:
+        lo, hi, step = pole_slice.indices(ledger["n_p"])
+        if step != 1:
+            raise ValueError(f"{where} requires a contiguous pole slice")
+    if not (0 <= lo < hi <= ledger["n_p"]):
+        raise IndexError(
+            f"{where}: pole range [{lo},{hi}) is outside "
+            f"[0,{ledger['n_p']})")
+    return int(lo), int(hi)
+
+
+class PoleReader:
+    """ONE collective handle serving every pole batch of one iteration.
+
+    WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
+    batches so no complete pole tensor ever exists on host or device, and
+    it walks it TWICE per iteration — once for the census that plans the
+    windows, once for the spatial executor.  Called through
+    :func:`read_poles`, each batch opened and closed its own h5py handle
+    (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
+    the unfold tables — and the third one landed *between* the two, so the
+    per-batch sequence alternated h5py → FFI → h5py on one file, through
+    two independent HDF5 library instances, once per batch.
+
+    This reader collapses that to: read the ledger and the unfold tables
+    with h5py ONCE, CLOSE h5py, then hold ONE ``SlabIO`` open for every
+    batch of the iteration.  Two properties, and the second is the one
+    that matters more than the arithmetic:
+
+    * the churn drops from ``3·n_batches`` opens per walk to ``2 + 1``;
+    * **no h5py open happens while the collective handle is live**, so
+      the alternation the two libraries cannot survive does not occur at
+      all inside a Σ stage.  ``file_io.hdf5_owner`` enforces that rather
+      than trusting this docstring: a stray h5py open on this path while
+      this reader is alive refuses by name.
+
+    The handle is released in a ``finally`` — use it as a context manager,
+    or call :meth:`close` from one.  A refusal raised mid-walk (an
+    uncertified fit, a bad pole range) must still release the collective
+    handle on every rank, because the next collective call on this mesh
+    would otherwise rendezvous against a file this rank never closed.
+    """
+
+    def __init__(self, src, *, mesh_xy, allow_partial=False, mode="r"):
+        if mesh_xy is None:
+            raise ValueError(
+                "PoleReader requires mesh_xy: it exists to hold ONE "
+                "collective handle open across an iteration's pole "
+                "batches, and a mesh-less read has no such handle.  Use "
+                "read_poles(src, pole_slice=...) for the host path.")
+        self.src = src
+        self.mesh_xy = mesh_xy
+        # h5py FIRST, and completely, and closed — before any collective
+        # handle exists.  Both reads are small and neither is repeated.
+        with _h5(src, mode) as grp:
+            self.ledger = fit_completion_ledger(grp)
+            _refuse_unfinalized(grp, self.ledger, allow_partial, "PoleReader")
+        self.tables = (read_fit_unfold_tables(src)
+                       if self.ledger["q_storage"] == "ibz" else None)
+        self.n_poles = int(self.ledger["n_p"])
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(src, mode="r", mesh=mesh_xy)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        io, self._io = getattr(self, "_io", None), None
+        if io is not None:
+            io.close()
+
+    def read(self, pole_slice=None, *, unfold=False, return_sharded=False,
+             to_unit=None):
+        """One contiguous pole range, through the handle already open."""
+        if self._io is None:
+            raise ValueError(
+                "PoleReader.read after close(): the collective handle this "
+                "reader owns is gone.  Open a new reader rather than "
+                "reopening this one — a reader whose handle can be revived "
+                "is a reader whose lifetime nobody can read off the code.")
+        from jax.sharding import PartitionSpec as P
+
+        lo, hi = _pole_range(self.ledger, pole_slice, "PoleReader.read")
+        shape = (hi - lo, *_pole_read_shape(self.ledger, self.mesh_xy))
+        Omega = self._io.read_slab(
+            "Omega_p", shape=shape, offset=(lo, 0, 0, 0),
+            partition_spec=P(None, None, "x", "y"))
+        Bp = self._io.read_slab(
+            "B_p", shape=shape, offset=(lo, 0, 0, 0),
+            partition_spec=P(None, None, "x", "y"))
+        return _finish_pole_read(
+            self.src, Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
+            unfold=unfold, return_sharded=return_sharded, to_unit=to_unit,
+            tables=self.tables)
+
+
+def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
+    """A :class:`PoleReader` for one iteration's pole walk."""
+    return PoleReader(src, mesh_xy=mesh_xy, allow_partial=allow_partial,
+                      mode=mode)
+
+
 def read_poles(
     src,
     *,
@@ -2859,6 +3040,13 @@ def read_poles(
     completely; an integer reads a length-one range.  This is the sole
     pole tensor reader.  A mesh read is always sharded — pass
     ``return_sharded=True`` with ``mesh_xy``; there is no gather path.
+
+    ONE range per call, so a caller reading SEVERAL ranges of one file —
+    every Σ stage does — opens and closes the store once per range.  Use
+    :func:`open_pole_reader` there instead: it holds one collective handle
+    across the whole walk and does its h5py reads before that handle
+    exists (audit A1).  This function is the single-range door, and is
+    that reader with a lifetime of one call.
     """
     if mesh_xy is not None and not return_sharded:
         raise ValueError(
@@ -2867,38 +3055,18 @@ def read_poles(
             "read lands sharded and every mesh caller consumes that "
             "layout, so no gather path exists.  Fix: pass "
             "return_sharded=True, or drop mesh_xy for a host-side read.")
-    qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
+    if mesh_xy is not None:
+        with open_pole_reader(src, mesh_xy=mesh_xy,
+                              allow_partial=allow_partial, mode=mode) as rd:
+            return rd.read(pole_slice, unfold=unfold,
+                           return_sharded=return_sharded, to_unit=to_unit)
+
+    with _h5(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
         _refuse_unfinalized(grp, ledger, allow_partial, "read_poles")
-        if pole_slice is None:
-            lo, hi = 0, ledger["n_p"]
-        elif isinstance(pole_slice, (int, np.integer)):
-            lo, hi = int(pole_slice), int(pole_slice) + 1
-        else:
-            lo, hi, step = pole_slice.indices(ledger["n_p"])
-            if step != 1:
-                raise ValueError("read_poles requires a contiguous pole slice")
-        if not (0 <= lo < hi <= ledger["n_p"]):
-            raise IndexError(
-                f"read_poles: pole range [{lo},{hi}) is outside "
-                f"[0,{ledger['n_p']})")
-        if mesh_xy is None:
-            Omega = np.asarray(grp["Omega_p"][lo:hi])
-            Bp = np.asarray(grp["B_p"][lo:hi])
-
-    if mesh_xy is not None:
-        from jax.sharding import PartitionSpec as P
-        from file_io.slab_io import SlabIO
-
-        shape = (hi - lo, *_pole_read_shape(ledger, mesh_xy))
-        with SlabIO(src, mode="r", mesh=mesh_xy) as io:
-            Omega = io.read_slab(
-                "Omega_p", shape=shape, offset=(lo, 0, 0, 0),
-                partition_spec=P(None, None, "x", "y"))
-            Bp = io.read_slab(
-                "B_p", shape=shape, offset=(lo, 0, 0, 0),
-                partition_spec=P(None, None, "x", "y"))
+        lo, hi = _pole_range(ledger, pole_slice, "read_poles")
+        Omega = np.asarray(grp["Omega_p"][lo:hi])
+        Bp = np.asarray(grp["B_p"][lo:hi])
     return _finish_pole_read(
-        src, Omega, Bp, ledger, mesh_xy=mesh_xy, unfold=unfold,
+        src, Omega, Bp, ledger, mesh_xy=None, unfold=unfold,
         return_sharded=return_sharded, to_unit=to_unit)

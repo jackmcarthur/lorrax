@@ -163,6 +163,21 @@ class SlabIO:
         """
         self._backend.write_attr(name, value)
 
+    def stamp_dataset_attrs(self, name: str, attrs: dict) -> None:
+        """Stamp H5 attributes onto a dataset this handle did not create.
+
+        Rides the SAME deferral as ``create_dataset(attrs=...)`` — the one
+        rank-0 h5py reopen after ``H5Fclose`` — so a stamp costs no extra
+        open of the file and, in particular, no serial-h5py open while the
+        collective handle is live (``file_io.hdf5_owner``, audit A1).
+
+        For metadata ABOUT a dataset that ``write_attr`` wrote: those land
+        in the same reopen, before this, so ``omega_ev`` exists by the
+        time its attrs are applied.  A name absent at that moment raises,
+        exactly as it does for ``create_dataset``.
+        """
+        self._backend._deferred_ds_attrs.append((str(name), dict(attrs)))
+
     def sync_writes(self) -> None:
         """Wait for queued writes without closing the collective handle.
 

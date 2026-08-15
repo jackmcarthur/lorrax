@@ -132,8 +132,14 @@ _L3_MODULES = frozenset({
     "common.progress", "common.gpu_utils", "common.async_io", "common.sanity",
     # FFT kernels
     "common.fft_helpers",
-    # the sharded-HDF5 transport (NOT the format readers above it)
+    # the sharded-HDF5 transport (NOT the format readers above it).
+    # ``file_io.hdf5_owner`` is at the transport's level and not above it:
+    # its whole subject is which NATIVE LIBRARY INSTANCE, in this PROCESS,
+    # holds a file open — the same class of fact ``_slab_io_ffi`` is made
+    # of, and one no format reader is allowed to reason about.  It imports
+    # nothing from ``src/``.
     "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
+    "file_io.hdf5_owner",
 })
 #: Whole packages at L3.  Two of the three services are here for the same
 #: reason ``ffi`` is: their entire subject is devices, meshes, processes,

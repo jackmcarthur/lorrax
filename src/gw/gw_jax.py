@@ -266,6 +266,19 @@ def main(argv=None):
 		print_fn=print0,
 	)
 
+	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
+	# from /proc/self/maps, printed, not asserted (audit A1 fix 3).  Two
+	# instances — h5py's bundled libhdf5 and the FFI's cray
+	# libhdf5_parallel — alternately touching one file is the standing
+	# explanation for the metallic driver's iteration-3 rank-0 segfault,
+	# and until now the condition was INFERRED from the deployed
+	# artifacts' NEEDED entries rather than observed in the running
+	# process.  ``file_io.hdf5_owner`` prints again after each SC
+	# iteration's store cycle, with the paths that were touched through
+	# both.
+	from file_io.hdf5_owner import probe as _hdf5_probe
+	_hdf5_probe("startup", print_fn=print0)
+
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)

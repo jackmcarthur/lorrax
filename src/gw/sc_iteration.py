@@ -1767,6 +1767,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"sc_{state.iteration:04d}",
             print_fn=inputs.print_fn,
         )
+        # AFTER this iteration's complete store cycle (allocate → fit →
+        # finalize → head → Σ → retain), which is the point at which the
+        # per-iteration churn audit A1 measures has actually happened.
+        # Cheap: one /proc/self/maps read and a dict walk.  It reports the
+        # mapped-libhdf5 count and, per file, how many times each HDF5
+        # library instance opened it — the number that grows with
+        # iteration count and that A1 predicts is the segfault's driver.
+        from file_io.hdf5_owner import probe as _hdf5_probe
+        _hdf5_probe(f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
 
     return SCState(
         H_qp_dft=H_qp_dft_new,
@@ -2928,6 +2937,12 @@ def dump_sigma_omega_h5_final(
         sig_h=sigma_result.v_h_kij_ry,
         config=config, input_dir=input_dir,
         meta=meta, mesh_xy=mesh_xy,
+        # THE CONVERGED CUBE'S OWN ω REFERENCE, carried on the result the
+        # cube came from.  Recomputing it here would be a second opinion
+        # about the axis this file writes, and on the metal path the two
+        # conventions differ by a measured 2.79 eV (audit A2).
+        omega_reference_ev=sigma_result.efermi_dft_ev,
+        omega_reference_provenance=sigma_result.omega_reference_provenance,
         sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")

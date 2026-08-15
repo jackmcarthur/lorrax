@@ -9,7 +9,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
-from file_io.mpa_store import read_poles, validate_fit_store
+from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -133,20 +133,35 @@ def integrate_sigma_store(
     pole_batch_size=4,
     print_fn=print,
 ):
-    """Read, unfold, consume, and release one pole range at a time."""
+    """Read, unfold, consume, and release one pole range at a time.
+
+    ``fit_src`` is a store path, or a live
+    :class:`~file_io.mpa_store.PoleReader` whose collective handle the
+    caller owns — which is what
+    :func:`compute_sigma_c_mpa_omega_grid` passes, so the census walk and
+    this executor walk share ONE open handle for the whole iteration
+    instead of opening the store once per pole batch (audit A1).  Given a
+    path, this function owns a reader for the length of its own walk.
+    """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
-    def batches():
+    def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            Omega, B = read_poles(
-                fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
-                unfold=True, return_sharded=True, to_unit="Ry")
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
             yield lo, Omega, B
 
-    return _integrate_sigma_batches(
-        wfns, batches(), int(n_poles), plan, omega_grid_ry, meta, mesh_xy,
-        pole_batch_size=batch_size, print_fn=print_fn)
+    def run(reader):
+        return _integrate_sigma_batches(
+            wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
+            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+
+    if isinstance(fit_src, PoleReader):
+        return run(fit_src)
+    with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+        return run(reader)
 
 
 def _branches(wfns, omega, efermi_ry, occupation_state=None):
@@ -228,28 +243,37 @@ def compute_sigma_c_mpa_omega_grid(
     branches = _branches(wfns, omega_grid_ry, efermi_ry,
                          occupation_state=occupation_state)
     summaries = []
-    for lo in range(0, n_poles, int(pole_batch_size)):
-        hi = min(lo + int(pole_batch_size), n_poles)
-        Omega, B = read_poles(
-            fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
-            unfold=True, return_sharded=True, to_unit="Ry")
-        summaries.extend(summarize_sigma_poles(
-            Omega, B, branches,
+    # ONE collective handle for the census walk, the planner, and the
+    # executor walk — the whole Σ stage of this iteration.  The reader
+    # does its h5py reads (ledger, unfold tables) before that handle
+    # exists and none after, so no serial-h5py open on this store
+    # overlaps or interleaves with the FFI one anywhere inside a Σ stage
+    # (audit A1; hdf5_owner enforces it).  The context manager is the
+    # release path: a refusal from the planner or the executor must still
+    # close the handle on every rank.
+    with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+        for lo in range(0, n_poles, int(pole_batch_size)):
+            hi = min(lo + int(pole_batch_size), n_poles)
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            summaries.extend(summarize_sigma_poles(
+                Omega, B, branches,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor, pole_offset=lo))
+            del Omega, B
+        plan, geometry = build_shared_sigma_windows(
+            summaries, branches,
             regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor, pole_offset=lo))
-        del Omega, B
-    plan, geometry = build_shared_sigma_windows(
-        summaries, branches,
-        regularization_width_ry=regularization_width_ry,
-        edge_factor=edge_factor, target_error=target_error,
-        crossing_target_error=crossing_target_error,
-        max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
-    print_fn(
-        f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-        f"{geometry['n_windows']} logical windows")
-    return integrate_sigma_store(
-        wfns, fit_src, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-        pole_batch_size=pole_batch_size, print_fn=print_fn)
+            edge_factor=edge_factor, target_error=target_error,
+            crossing_target_error=crossing_target_error,
+            max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
+        print_fn(
+            f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+            f"{geometry['n_windows']} logical windows")
+        return integrate_sigma_store(
+            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            pole_batch_size=pole_batch_size, print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
