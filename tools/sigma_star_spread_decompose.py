@@ -251,11 +251,13 @@ def unfold_residual(A, irr, sidx, nss):
     if A.ndim == 4:
         U = np.stack([
             np.asarray(symmetry_maps.star_broadcast(
-                A[w][rep], lab_of, np.asarray(sidx), nss, irr_labels=ids))
+                A[w][rep], lab_of, np.asarray(sidx), nss, irr_labels=ids,
+                trs_reference="star_row"))
             for w in range(A.shape[0])])
     else:
         U = np.asarray(symmetry_maps.star_broadcast(
-            A[rep], lab_of, np.asarray(sidx), nss, irr_labels=ids))
+            A[rep], lab_of, np.asarray(sidx), nss, irr_labels=ids,
+            trs_reference="star_row"))
     rel = float(np.linalg.norm((A - U).ravel()) / np.linalg.norm(A.ravel()))
     return rel, float(np.abs(A - U).max()), U, rep
 

@@ -535,6 +535,6 @@ def test_the_round_trip_is_exact_on_the_production_tables(deck):
     km = KStarMap.from_sym(sym, nss)
     sel, labels = star_select(A, irr)
     assert np.array_equal(np.asarray(km.select(A)), np.asarray(sel))
-    back = star_broadcast(sel, irr, sidx, nss, irr_labels=labels)
+    back = star_broadcast(sel, irr, sidx, nss, irr_labels=labels, trs_reference="star_row")
     assert np.array_equal(np.asarray(back), A)
     assert km.spread(A) == 0.0

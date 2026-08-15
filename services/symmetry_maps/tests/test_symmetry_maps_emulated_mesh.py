@@ -580,13 +580,13 @@ def test_the_star_helpers_keep_a_sharded_operand_sharded():
     sh = NamedSharding(mesh, P(None, "x", "y"))
     dev = jax.device_put(jnp.asarray(A), sh)
     sel_d, labels = star_select(dev, irr)
-    back_d = star_broadcast(sel_d, irr, sidx, 2, irr_labels=labels)
+    back_d = star_broadcast(sel_d, irr, sidx, 2, irr_labels=labels, trs_reference="star_row")
     assert isinstance(sel_d, jax.Array) and isinstance(back_d, jax.Array)
     assert sel_d.sharding.spec == sh.spec
     assert back_d.sharding.spec == sh.spec
 
     sel_h, _ = star_select(A, irr)
-    back_h = star_broadcast(sel_h, irr, sidx, 2, irr_labels=labels)
+    back_h = star_broadcast(sel_h, irr, sidx, 2, irr_labels=labels, trs_reference="star_row")
     assert float(np.abs(np.asarray(sel_d) - sel_h).max()) == 0.0
     assert float(np.abs(np.asarray(back_d) - back_h).max()) == 0.0
     assert star_spread(dev, irr, sidx, 2) == star_spread(A, irr, sidx, 2)

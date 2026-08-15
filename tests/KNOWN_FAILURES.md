@@ -1230,8 +1230,8 @@ available on both sides.
 REGISTERED, not fixed — both are behaviour changes in gate/bench code and
 belong to the consolidation pass, not to the audit that found them.
 
-1. **`tests/multi_device/star_invariance_gate.py:128-139` uses the WRONG
-   TRS predicate.**  It compares each star member against `T[mem[0]]` —
+1. **FIXED 2026-08-15.** `tests/multi_device/star_invariance_gate.py` used
+   the WRONG TRS predicate.  It compares each star member against `T[mem[0]]` —
    the star's first FULL-BZ row, i.e. `star_broadcast`'s `"star_row"`
    operand — but decides conjugation with `if int(sidx[j]) >= n_spatial`,
    which is the `"ibz_slab"` predicate.  That is exactly the mix-up
