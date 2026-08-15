@@ -1230,8 +1230,49 @@ available on both sides.
 REGISTERED, not fixed — both are behaviour changes in gate/bench code and
 belong to the consolidation pass, not to the audit that found them.
 
-1. **FIXED 2026-08-15.** `tests/multi_device/star_invariance_gate.py` used
-   the WRONG TRS predicate.  It compares each star member against `T[mem[0]]` —
+1. **FIXED 2026-08-15, and VERIFIED BY EXECUTION at P=4.**
+   `tests/multi_device/star_invariance_gate.py` used the WRONG TRS
+   predicate.
+
+   A/B on `cohsex_debug` (9 k, 3 stars, ntran=12, 3 TRS rows, and star
+   label 2's FIRST member is a TRS row — the only configuration in which
+   the two predicates differ), `srun -n 4`:
+
+   | predicate | check 0 classification | residual |
+   |---|---|---|
+   | fixed (XOR) | 3 spatial + 3 TRS pairs | **5.599e-10** |
+   | old (member's own flag) | 4 spatial + 2 TRS pairs | **1.400e-02** |
+
+   The old predicate puts ONE PAIR IN THE WRONG BUCKET and the residual
+   rises seven orders of magnitude — the false failure this row predicted,
+   now measured rather than reasoned.
+
+   **TWO THINGS THE EXECUTION ALSO ESTABLISHED, both worth knowing:**
+
+   (a) **The gate passes on a deck that does not exercise the branch.** On
+   `si_cohsex_debug` (64 k, 8 stars, ntran=48) it reports `TRS pairs=0`
+   and VERDICT PASS at 1.169e-15. There are no time-reversed rows in that
+   deck's selection, so a wrong TRS predicate is invisible there. Anyone
+   running this gate for TRS coverage must use a deck with TRS rows;
+   `cohsex_debug` is the one in tree.
+
+   (b) **...and it cannot pass on the deck that does.** `RTOL = 1e-10`
+   (`star_invariance_gate.py:77`) is tighter than `cohsex_debug`'s own
+   noise floor of 5.599e-10, so checks 1 and 3 report FAIL there **on
+   both legs**, before and after the fix, and the overall VERDICT is FAIL
+   either way. Those two checks route through the service's
+   `star_spread`/`star_broadcast`, which already used the correct XOR, so
+   they are unaffected by the predicate — it is purely a tolerance
+   calibrated for Si (1.169e-15) being applied to a deck three orders
+   noisier. NOT changed here: the gate is superseded (its four checks were
+   ported to `services/symmetry_maps/tests` on 2026-08-07) and retiring it
+   is on the owner's cleanup checklist. Recorded so the next person to run
+   it is not misled by a red that predates them.
+
+   Note the file's own docstring is stale on one point: it says it imports
+   `from common.symmetry_maps import ...` at :48, and it does not — it
+   imports `from symmetry_maps import ...` through the service door, which
+   is why it still runs at all.  It compares each star member against `T[mem[0]]` —
    the star's first FULL-BZ row, i.e. `star_broadcast`'s `"star_row"`
    operand — but decides conjugation with `if int(sidx[j]) >= n_spatial`,
    which is the `"ibz_slab"` predicate.  That is exactly the mix-up
