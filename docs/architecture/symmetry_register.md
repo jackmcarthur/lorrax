@@ -376,6 +376,49 @@ did not help, and it implies a **real tension**: low count buys symmetry and
 loses accuracy, high count does the reverse. The count sweep that would test it
 is an open owner question, not authorised.
 
+## `qp_wfn_rotations.h5` → wedge: three preconditions, all measured, all negative
+
+Investigated 2026-08-15, **not implemented**. Recorded because each answer
+contradicts what the I/O survey asserted, and because the same three questions
+apply to every remaining wedge candidate.
+
+**1. Are the non-wedge `U_mnk` rows computed, or broadcast?  COMPUTED.**
+Both producers do `E_qp_ry, U_qp = eigh(state.H_qp_dft)`
+(`sc_iteration.py:998-1003`) over the **full-BZ** k axis — `gw_output.py:468`
+says so outright: "when Σ is unfolded to the full BZ the eigh runs on
+nk_full > wfn.nkpts". So every full-BZ row is an independent diagonalisation
+of that k's own H, not a gather from the wedge. **Storing only the wedge is
+therefore LOSSY, not redundancy removal** — and the discarded rows are not
+reconstructible by any gather, because an eigenvector is defined up to a phase
+and, inside a degenerate multiplet, up to a unitary mixing. Defensible while
+nothing reads them (verified: nothing does), but it is a different change and
+must be described as one.
+
+**2. Does a stale reader of a newly-written file fail loudly?  NO.**
+Measured with h5py on the real Si map `kirr_to_kfull = [0,1,2,5,6,7,10,27]`
+against an 8-row dataset: indices 10 and 27 raise `IndexError`, but
+**0, 1, 2, 5, 6, 7 — six of eight — silently return the wrong row.** On the
+full BZ every index `< nk_red` (8 of 64) is silently wrong. "It will
+IndexError" is false for the majority of lookups. The only mitigation that is
+loud in *all* cases is renaming the datasets when wedge-stored, which gives a
+stale reader `KeyError` immediately; the `k_storage` stamp does not help an
+out-of-tree consumer, which by definition does not read it.
+
+**3. How big is the saving, measured?  3.58 MB → ~0.47 MB.**
+On the Si production fixture: `U_mnk {64, 60, 60}` complex128 = 3.52 MB, whole
+file 3,757,812 bytes. The wedge form is `{8, 60, 60}` = 0.44 MB, whole file
+≈ 0.47 MB — a **7.6× reduction saving ~3.1 MB**. The survey's "184 MB → 24 MB"
+is ~50× larger than anything measurable here and was not reproduced.
+
+### Calibration on the ranked I/O list
+
+The survey was wrong about `E_qp_nk_hartree` having "no reader at all" — it has
+a **gated** one (`sigma_omega_layout_ab.py:154`, consumed at `:461` with
+`required=sc`; `U_mnk` is the report-only one). It was wrong about the file
+size by ~50×. Treat its other unverified assertions — the 26.7 GB restart
+figure, the 13 GB transient, any "no reader" claim — as **leads to check, not
+facts to act on**.
+
 ## The question to ask before any further wedge move
 
 *Is there a diagnostic that exists only while the redundant copies are alive?*
