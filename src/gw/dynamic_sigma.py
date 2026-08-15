@@ -68,6 +68,12 @@ def eval_sigma_c_at_dft_energies(
     used: mixing references samples Sigma at energies shifted by
     (mu - efermi_midgap) — measured +2.79 eV on the sodium deck, showing
     up as a spurious ~+2.4 eV near-E_F QP correction.
+
+    Returns ``(sigma_c_at_dft_ev, omega_dft_rel_ev, efermi_dft_ev,
+    provenance)``.  THE PROVENANCE IS RETURNED, not re-derived by the
+    caller: this function owns the ``efermi_ry is None`` decision, and the
+    writer that stamps the answer into ``sigma_mnk.h5`` must record the
+    same one it interpolated with, not a second opinion about it.
     """
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
@@ -78,6 +84,10 @@ def eval_sigma_c_at_dft_energies(
     ref_ry = float(wfn.efermi) if efermi_ry is None else float(efermi_ry)
     efermi_dft_ev = ref_ry * RYD_TO_EV
     omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
+    from file_io.sigma_output import (OMEGA_REFERENCE_FIXED_N_MU,
+                                      OMEGA_REFERENCE_MIDGAP)
+    provenance = (OMEGA_REFERENCE_MIDGAP if efermi_ry is None
+                  else OMEGA_REFERENCE_FIXED_N_MU)
     print_fn(
         f"  omega reference = {efermi_dft_ev:.6f} eV "
         f"({'wfn.efermi midgap/VBM' if efermi_ry is None else 'fixed-N mu'};"
@@ -96,6 +106,7 @@ def eval_sigma_c_at_dft_energies(
         sigma_c_at_dft_ev,
         omega_dft_rel_ev,
         efermi_dft_ev,
+        provenance,
     )
 
 
@@ -115,10 +126,20 @@ def write_sigma_omega(
     input_dir: str,
     meta,
     mesh_xy,
+    omega_reference_ev,
+    omega_reference_provenance,
     sym=None,
     print_fn=None,
 ) -> str:
-    """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz."""
+    """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz.
+
+    ``omega_reference_ev`` / ``omega_reference_provenance`` are REQUIRED
+    keyword arguments, not defaulted ones: the ω axis this function
+    writes is relative, and a caller that does not say what it is
+    relative to produces the unstamped file audit A2 is about.  Both come
+    straight from :func:`eval_sigma_c_at_dft_energies`, which owns the
+    choice.
+    """
     from file_io import write_sigma_omega_h5
 
     out_path = sigma_omega_output_path(config, input_dir)
@@ -149,7 +170,10 @@ def write_sigma_omega(
             sigma_c_kij_ev=sigma_c_ev,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
-            mesh=mesh_xy, star=star, print_fn=print_fn,
+            mesh=mesh_xy, star=star,
+            omega_reference_ev=omega_reference_ev,
+            omega_reference_provenance=omega_reference_provenance,
+            print_fn=print_fn,
         )
         return out_path
 
@@ -158,7 +182,10 @@ def write_sigma_omega(
         sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
         sigma_sx_kij_ev=RYD_TO_EV * sig_x,
         hartree_kij_ev=RYD_TO_EV * sig_h,
-        mesh=mesh_xy, star=star, print_fn=print_fn,
+        mesh=mesh_xy, star=star,
+        omega_reference_ev=omega_reference_ev,
+        omega_reference_provenance=omega_reference_provenance,
+        print_fn=print_fn,
     )
     return out_path
 

@@ -738,6 +738,47 @@ def write_eqp_bgw_in_memory(
 	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 
+#: Occupations this far from an integer are FRACTIONAL, i.e. a smeared
+#: Fermi surface.  Loose on purpose: the question here is "is there a
+#: mid-gap to fall back on", and one partially filled state anywhere in
+#: the BZ answers it, whatever the smearing width.
+_OCC_INTEGER_TOL = 1.0e-6
+
+
+def _metallic_occupations(ifmax, occupations):
+	"""``(metallic, why)`` from a WFN's own occupation record.
+
+	TWO INDEPENDENT SIGNATURES, either of which means "no mid-gap exists":
+
+	* ``ifmax`` — the highest occupied band, per k — is not the same at
+	  every k.  That is a band crossing E_F, which is what a Fermi surface
+	  IS; ``max(ifmax)`` then names a band that is empty at some k, and
+	  ½(VBM+CBM) computed across that split is not a gap centre.
+	* any occupation is strictly fractional.  A smeared metal's states at
+	  E_F are partially filled by construction.
+
+	Reported separately because they answer different questions when a
+	reader comes back to a refusal: the first is geometry, the second is
+	smearing.  ``occupations=None`` (a WFN without the dataset) simply
+	does not contribute its half.
+	"""
+	reasons = []
+	ifmax = np.asarray(ifmax)
+	if ifmax.size and int(np.min(ifmax)) != int(np.max(ifmax)):
+		reasons.append(
+			f"ifmax varies across k ({int(np.min(ifmax))}..{int(np.max(ifmax))}"
+			") — a band crosses E_F")
+	if occupations is not None:
+		occ = np.asarray(occupations, dtype=np.float64)
+		frac = np.abs(occ - np.rint(occ)) > _OCC_INTEGER_TOL
+		if bool(np.any(frac)):
+			reasons.append(
+				f"{int(np.count_nonzero(frac))} of {occ.size} occupations "
+				f"are fractional (max deviation "
+				f"{float(np.max(np.abs(occ - np.rint(occ)))):.3e})")
+	return bool(reasons), "; ".join(reasons) or "insulating"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator: read the run directory and emit eqp{0,1}.dat
 # ---------------------------------------------------------------------------
@@ -776,6 +817,8 @@ def make_eqp_bgw(
 		# energies: (nspin, nk, nbands_total) in Ry
 		energies_ry = np.asarray(wfn["mf_header/kpoints/el"])
 		ifmax = np.asarray(wfn["mf_header/kpoints/ifmax"])  # (nspin, nk) 1-based
+		occupations = (np.asarray(wfn["mf_header/kpoints/occ"])
+		               if "mf_header/kpoints/occ" in wfn else None)
 	if nspin != 1:
 		raise NotImplementedError("LORRAX runs at nspin=1; got nspin={}".format(nspin))
 
@@ -801,17 +844,60 @@ def make_eqp_bgw(
 			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
 		)
 
-	# Mid-gap Fermi level from the IBZ DFT energies (matches gw_jax convention)
-	n_occ = int(np.max(ifmax[0]))                       # 1-based highest occ
-	occ_idx_local = n_occ - 1 - band_start              # within the window
-	if occ_idx_local < 0 or occ_idx_local + 1 >= nb_window:
+	# ── THE ω REFERENCE: the file's stamp first, midgap only as a legacy
+	#    fallback on a file that is demonstrably insulating (audit A2) ──
+	#
+	# ``sigma_mnk.h5``'s ω axis is RELATIVE, and which zero it is relative
+	# to is a property of the RUN that wrote it, not of the WFN this
+	# function can see.  The in-run consumers take the finalizer's
+	# ``efermi_dft_ev``; this CLI used to recompute ½(VBM+CBM) instead,
+	# which on the metal path samples Σ_c(ω) at energies shifted by
+	# (mu − midgap) — a measured 2.79 eV on the sodium deck, showing up as
+	# a spurious ~+2.4 eV near-E_F QP correction.  So: prefer the stamp;
+	# where there is none, fall back to midgap ONLY if the occupations say
+	# insulating, and REFUSE otherwise rather than guess wrong by default.
+	from file_io.sigma_output import read_omega_reference
+	stamped_ev, stamped_provenance = read_omega_reference(sigma_mnk_path)
+	metallic, why = _metallic_occupations(ifmax, occupations)
+
+	if stamped_ev is not None:
+		efermi_ev = float(stamped_ev)
+	elif metallic:
 		raise ValueError(
-			"sigma window does not bracket VBM/CBM: band_range="
-			f"[{band_start},{band_stop}), VBM index={n_occ - 1}"
-		)
-	vbm_ev = float(np.max(e_dft_ev[:, : occ_idx_local + 1]))
-	cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
-	efermi_ev = 0.5 * (vbm_ev + cbm_ev)
+			f"make_eqp_bgw: {os.path.basename(sigma_mnk_path)} carries no "
+			f"omega_reference_ev stamp, and {os.path.basename(wfn_path)} "
+			f"has METALLIC occupations ({why}).\n"
+			f"  got  : an unstamped Sigma_c(omega) cube whose axis zero is "
+			f"unknown, and a run whose zero is the fixed-N chemical "
+			f"potential mu, not mid-gap.\n"
+			f"  want : the reference the run interpolated with.  Assuming "
+			f"mid-gap here samples Sigma_c at energies shifted by "
+			f"(mu - midgap) — 2.79 eV on the sodium deck — and produces "
+			f"eqp files that look plausible and are wrong.  There is no "
+			f"mid-gap on a metal: the band that would define it crosses "
+			f"E_F.\n"
+			f"  fix  : regenerate sigma_mnk.h5 with a driver that stamps "
+			f"omega_reference_ev (every write since audit A2 does), or "
+			f"take eqp0/eqp1 from the run's own output rather than "
+			f"reassembling them from disk.  Any comparison already made "
+			f"from an unstamped metallic cube through this path is "
+			f"invalid.")
+	else:
+		# Mid-gap Fermi level from the IBZ DFT energies — the pre-stamp
+		# insulating convention, kept so every file written before the
+		# stamp existed still assembles bit-identically.
+		n_occ = int(np.max(ifmax[0]))                   # 1-based highest occ
+		occ_idx_local = n_occ - 1 - band_start          # within the window
+		if occ_idx_local < 0 or occ_idx_local + 1 >= nb_window:
+			raise ValueError(
+				"sigma window does not bracket VBM/CBM: band_range="
+				f"[{band_start},{band_stop}), VBM index={n_occ - 1}"
+			)
+		vbm_ev = float(np.max(e_dft_ev[:, : occ_idx_local + 1]))
+		cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
+		efermi_ev = 0.5 * (vbm_ev + cbm_ev)
+		stamped_provenance = "midgap (unstamped file, insulating occupations)"
+	print(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
 	e_dft_rel_ev = e_dft_ev - efermi_ev
 
 	# kin_ion (Ry → eV), pulled on the IBZ wedge directly.

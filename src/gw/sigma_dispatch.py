@@ -105,6 +105,11 @@ class SigmaResult:
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
     efermi_dft_ev: float | None = None
+    #: Which convention ``efermi_dft_ev`` IS — "fixed-N mu" or "midgap".
+    #: Carried beside the number so the end-of-SC writer stamps the same
+    #: answer the finalize interpolated with (audit A2), instead of
+    #: re-deriving it from a config key one layer further from the choice.
+    omega_reference_provenance: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +171,7 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ry",
     "sigma_omega_h5_path",
     "efermi_dft_ev",
+    "omega_reference_provenance",
 )
 
 
@@ -367,7 +373,8 @@ def finalize_dynamic_sigma(
 
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
-         efermi_dft_ev) = eval_sigma_c_at_dft_energies(
+         efermi_dft_ev,
+         omega_reference_provenance) = eval_sigma_c_at_dft_energies(
             sigma_c_omega,
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
@@ -381,6 +388,8 @@ def finalize_dynamic_sigma(
                 sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
+                omega_reference_ev=efermi_dft_ev,
+                omega_reference_provenance=omega_reference_provenance,
                 sym=sym, print_fn=print_fn,
             )
         else:
@@ -421,6 +430,7 @@ def finalize_dynamic_sigma(
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         sigma_omega_h5_path=sigma_omega_h5_path,
         efermi_dft_ev=efermi_dft_ev,
+        omega_reference_provenance=omega_reference_provenance,
     )
 
 

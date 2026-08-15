@@ -55,11 +55,17 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     def evaluate(got_sigma, **kwargs):
         calls.append("interp")
         assert got_sigma is post_head
-        return (np.full((1, 2), 4.0), np.full((1, 2), 6.0), 7.0)
+        return (np.full((1, 2), 4.0), np.full((1, 2), 6.0), 7.0,
+                "fixed-N mu")
 
     def write(got_sigma, **kwargs):
         calls.append("write")
         assert got_sigma is post_head
+        # THE FINALIZE'S OWN ANSWER REACHES THE WRITER (audit A2): the
+        # stamp is not re-derived at the write site, so the file records
+        # the reference the interpolation above actually used.
+        assert kwargs["omega_reference_ev"] == 7.0
+        assert kwargs["omega_reference_provenance"] == "fixed-N mu"
         return "/tmp/sigma_mnk.h5"
 
     def build(got_sigma, got_x, omega, energy, got_mesh):
@@ -99,3 +105,4 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     np.testing.assert_array_equal(result.sigma_c_at_dft_diag_ev, 4.0)
     np.testing.assert_array_equal(result.omega_dft_rel_ev, 6.0)
     assert result.efermi_dft_ev == 7.0
+    assert result.omega_reference_provenance == "fixed-N mu"
