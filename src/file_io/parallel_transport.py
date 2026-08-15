@@ -94,8 +94,10 @@ __all__ = [
     "WAvStencilMetadata",
     "WAvStencilReader",
     "covariant_velocity",
+    "line_index_table",
     "link_symmetry_reduction_applies",
     "initialize_parallel_transport_artifact",
+    "transported_frame",
     "validate_covariant_velocity",
     "validate_parallel_transport_artifact",
     "write_parallel_transport_artifact",
@@ -1062,6 +1064,145 @@ def write_parallel_transport_artifact(
             q_stencil_orbit_table=q_stencil_table)
 
 
+def _dagger(matrices):
+    return jnp.swapaxes(jnp.conj(matrices), -1, -2)
+
+
+def line_index_table(
+    forward_neighbors: np.ndarray,
+    direction: int,
+    extent: int,
+) -> np.ndarray:
+    """Return ``(n_lines, extent)`` full-BZ ids of every ``+b_i`` cycle.
+
+    The mesh is a torus, so repeatedly following one elementary step
+    partitions the full BZ into ``nk/extent`` disjoint cycles of exactly
+    ``extent`` points.  This is a host-side O(nk) integer walk over the
+    stored neighbour table, so it makes no assumption about how the full-BZ
+    rows happen to be flattened.  It REFUSES on anything that is not that
+    partition, because a short or overlapping cycle would silently make the
+    transported frame multi-valued.
+    """
+    plus = np.asarray(forward_neighbors, dtype=np.int64)
+    idir = int(direction)
+    n = int(extent)
+    if plus.ndim != 2 or plus.shape[1] != 3:
+        raise ValueError(
+            f"forward_neighbors must be (nk, 3); got {plus.shape}")
+    if not 0 <= idir < 3:
+        raise ValueError(f"direction must be 0, 1 or 2; got {direction}")
+    nk = int(plus.shape[0])
+    if n <= 0 or nk % n:
+        raise ValueError(
+            f"direction {idir} extent {n} does not divide nk={nk}")
+    seen = np.zeros(nk, dtype=bool)
+    lines = []
+    for start in range(nk):
+        if seen[start]:
+            continue
+        line = [start]
+        seen[start] = True
+        node = start
+        for _ in range(n - 1):
+            node = int(plus[node, idir])
+            if seen[node]:
+                raise ValueError(
+                    f"direction {idir} cycle through k={start} closes after "
+                    f"{len(line)} of {n} steps; the neighbour table is not a "
+                    "uniform torus")
+            line.append(node)
+            seen[node] = True
+        if int(plus[node, idir]) != start:
+            raise ValueError(
+                f"direction {idir} cycle through k={start} does not close "
+                f"after {n} steps")
+        lines.append(line)
+    return np.asarray(lines, dtype=np.int64)
+
+
+def transported_frame(
+    links_direction,
+    forward_neighbors: np.ndarray,
+    direction: int,
+    extent: int,
+    *,
+    mesh,
+    band_matmul,
+) -> tuple[jax.Array, float]:
+    """Return the frame parallel-transported along one reduced direction.
+
+    ``U(k)`` is built by walking every ``+b_i`` line of the mesh from its own
+    base point, ``U(k+b_i) = L_i(k)^H U(k)``, and is then TWISTED so the line
+    closes on the torus: with ``S`` the line's holonomy the frame carries an
+    extra ``S^(-t/N)``.  Both properties are needed and neither is optional:
+
+    * transported, so ``H_t = U^H diag(E) U`` is the DFT Hamiltonian in a
+      frame that follows the manifold smoothly THROUGH band crossings — the
+      sorted spectrum's kinks are a property of the labelling, not of the
+      operator (claims 0183, 0187);
+    * closed, so ``H_t`` is PERIODIC along that direction.  Untwisted, the
+      frame jumps by the Wilson loop at the zone boundary and the FFT
+      derivative rings on that discontinuity.
+
+    The spectral derivative along ``b_i`` is a per-line 1-D operation, so
+    nothing is required of this frame in the other two directions; that is
+    why one frame per direction is built rather than one global sweep, whose
+    big-loop holonomies measured 13-18x worse on the crossing fixture.
+
+    In the twisted frame the transported link is the per-line CONSTANT
+    ``S^(-1/N)``, so the fourth-order connection of it carries no
+    finite-difference truncation error of its own.
+
+    Returns ``(U, max|S - 1|)``; the second value is the transport holonomy
+    diagnostic, stamped on the artifact.
+    """
+    links = jnp.asarray(links_direction)
+    order = line_index_table(forward_neighbors, direction, extent)
+    n_lines, n = order.shape
+    nk, nb = int(links.shape[0]), int(links.shape[-1])
+    line_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    stack_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+
+    frames = [jax.lax.with_sharding_constraint(
+        jnp.broadcast_to(jnp.eye(nb, dtype=links.dtype), (n_lines, nb, nb)),
+        line_sharding)]
+    for step in range(1, n):
+        frames.append(band_matmul(
+            _dagger(links[order[:, step - 1]]), frames[-1]))
+    holonomy = band_matmul(_dagger(links[order[:, n - 1]]), frames[-1])
+
+    # The line holonomies are the ONE object this service replicates: there
+    # are nk/extent of them, i.e. one full-BZ band matrix divided by the
+    # mesh extent, and a batched eigh needs them whole.
+    S = jax.lax.with_sharding_constraint(holonomy, NamedSharding(mesh, P()))
+    eye = jnp.eye(nb, dtype=S.dtype)
+    hermitian = 0.5 * (S + _dagger(S))
+    antihermitian = (S - _dagger(S)) / 2.0j
+    # S is unitary, so its Hermitian and anti-Hermitian parts commute with it
+    # and with each other; a generic real combination of them therefore has
+    # the same eigenvectors and a batched Hermitian eigh diagonalizes S
+    # exactly, with no matrix-logarithm branch beyond the principal one.
+    _values, V = jnp.linalg.eigh(hermitian + 0.7548 * antihermitian)
+    theta = jnp.angle(jnp.diagonal(
+        _dagger(V) @ S @ V, axis1=-2, axis2=-1))
+    exponents = -jnp.arange(n, dtype=jnp.float64) / float(n)
+    phase = jnp.exp(1.0j * exponents[:, None, None] * theta[None])
+    twist = jnp.einsum("lij,tlj,lkj->tlik", V, phase, jnp.conj(V),
+                       optimize=True)
+    twist = jax.lax.with_sharding_constraint(twist, stack_sharding)
+
+    stacked = jax.lax.with_sharding_constraint(
+        jnp.stack(frames, axis=0), stack_sharding)
+    twisted = make_distributed_band_matmul(mesh, n_batch_axes=2)(
+        stacked, twist)
+    U = jnp.zeros((nk, nb, nb), dtype=links.dtype)
+    U = U.at[jnp.asarray(order.T.reshape(-1))].set(
+        twisted.reshape(n * n_lines, nb, nb))
+    U = jax.lax.with_sharding_constraint(U, line_sharding)
+    defect = float(jax.device_get(jnp.max(jnp.abs(S - eye[None]))))
+    return U, defect
+
+
 def complete_velocity_validation(
     path: str | Path,
     *,
@@ -1071,10 +1212,37 @@ def complete_velocity_validation(
     energies_full,
     connection_cart,
     velocity_exact_cart,
+    links_full,
+    forward_neighbors,
     atol: float,
     rtol: float,
+    scope_blocks=(),
 ) -> dict[str, object]:
     """Run and stamp the mandatory DFT covariant-velocity reconstruction.
+
+    The gate compares, per reduced direction ``i``,
+
+        spectral_derivative_i(H_t) - i [A_t, H_t]   vs   U^H v_exact U
+
+    with ``H_t = U^H diag(E) U``, ``U`` the frame parallel-transported along
+    ``b_i`` (:func:`transported_frame`) and ``A_t`` the connection built by
+    the one shared fourth-order service from the TRANSPORTED links.  Each
+    direction's reconstruction is rotated back with ``U ... U^H`` before the
+    comparison, so the residual is reported in the DFT band basis and the
+    per-band-block diagnostics below mean what their band labels say.
+
+    Why not ``H = diag(E)`` directly (claims 0183, 0187): with ``H``
+    diagonal the commutator's diagonal is ``A_nn (E_n - E_n) = 0``, so that
+    check never touches the connection at all and degenerates into an FFT
+    derivative of band-index-SORTED ``E_n(k)``, which is kinked wherever
+    bands cross.  Measured on the 48-band sodium artifact, 2026-08-15:
+    3.859e-2 on the never-crossing semicore and 1.4285 the moment the 3s
+    manifold enters at band 9.
+
+    The sorted-frame reconstruction is still computed, as a DIAGNOSTIC only,
+    so one run carries its own before/after evidence.  ``scope_blocks``
+    reports both restricted to leading band blocks — the scoping that
+    discriminated the crossing signature in the first place.
 
     The spectral derivative import is lazy because ``gw.qsgw_head`` is
     owned by the self-consistent-head lane. Both preprocessing and QSGW call
@@ -1082,25 +1250,42 @@ def complete_velocity_validation(
     the signed ``i 2*pi R`` multiplier and reduced-to-Cartesian conversion.
     """
     try:
-        from gw.qsgw_head import covariant_cartesian_derivative
+        from gw.qsgw_head import (covariant_cartesian_derivative,
+                                  reduced_covector_to_cartesian)
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "parallel-transport validation requires "
-            "gw.qsgw_head.covariant_cartesian_derivative; merge the QSGW "
-            "head service lane") from exc
+            "gw.qsgw_head.covariant_cartesian_derivative and "
+            "reduced_covector_to_cartesian; merge the QSGW head service "
+            "lane") from exc
 
     energies = jnp.asarray(energies_full)
     A = jnp.asarray(connection_cart)
     exact = jnp.asarray(velocity_exact_cart)
+    links = jnp.asarray(links_full)
+    grid = tuple(int(x) for x in kgrid)
+    reciprocal = np.asarray(bvec_cart, dtype=np.float64)
     if energies.ndim != 2:
         raise ValueError(
             f"energies_full must be (nk, nb); got {energies.shape}")
-    if A.shape[:2] != (3, energies.shape[0]) \
-            or A.shape[-2:] != (energies.shape[1], energies.shape[1]):
+    nk, nb = int(energies.shape[0]), int(energies.shape[1])
+    if A.shape[:2] != (3, nk) or A.shape[-2:] != (nb, nb):
         raise ValueError(
             f"connection shape {A.shape} does not match energies "
             f"{energies.shape}")
+    if tuple(links.shape) != (3, nk, nb, nb):
+        raise ValueError(
+            f"links_full must be (3, {nk}, {nb}, {nb}); got "
+            f"{tuple(links.shape)}")
+    plus = np.asarray(forward_neighbors, dtype=np.int64)
+    if plus.shape != (nk, 3):
+        raise ValueError(
+            f"forward_neighbors must be ({nk}, 3); got {plus.shape}")
     h_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    stack_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+    band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
+    identity_reciprocal = np.eye(3, dtype=np.float64)
 
     def _diagonal_hamiltonian(e):
         return jax.vmap(jnp.diag)(e).astype(A.dtype)
@@ -1108,19 +1293,133 @@ def complete_velocity_validation(
     _diagonal_hamiltonian = jax.jit(
         _diagonal_hamiltonian, out_shardings=h_sharding)
     H = _diagonal_hamiltonian(energies.astype(A.real.dtype))
-    reconstructed = covariant_cartesian_derivative(
-        H, A, mesh=mesh, kgrid=tuple(int(x) for x in kgrid),
-        bvec_cart=np.asarray(bvec_cart, dtype=np.float64))
+
+    # Diagnostic arm: the pre-0187 sorted-diagonal reconstruction, kept so a
+    # single run reports its own before/after without a second job.
+    sorted_frame = covariant_cartesian_derivative(
+        H, A, mesh=mesh, kgrid=grid, bvec_cart=reciprocal)
+
+    reduced_rows = []
+    holonomy = 0.0
+    for idir in range(3):
+        U, defect = transported_frame(
+            links[idir], plus, idir, grid[idir],
+            mesh=mesh, band_matmul=band_matmul)
+        holonomy = max(holonomy, defect)
+        U_h = _dagger(U)
+        transported_link = band_matmul(
+            band_matmul(U_h, links[idir]), U[plus[:, idir]])
+        # Only this direction's connection enters this direction's covariant
+        # derivative; the other two rows are the identity link, whose
+        # fourth-order connection is exactly zero.
+        link_stack = jnp.broadcast_to(
+            jnp.eye(nb, dtype=links.dtype), (3, nk, nb, nb))
+        link_stack = jax.lax.with_sharding_constraint(
+            link_stack.at[idir].set(transported_link), stack_sharding)
+        connection = fourth_order_connection(
+            link_stack, plus, spacing, band_matmul=band_matmul)
+        connection = jax.lax.with_sharding_constraint(
+            jnp.zeros_like(connection).at[idir].set(connection[idir]),
+            stack_sharding)
+        H_t = jax.lax.with_sharding_constraint(
+            band_matmul(band_matmul(U_h, H), U), h_sharding)
+        # bvec = 1 makes the shared service return d/d(kappa_i) directly; the
+        # three reduced rows are converted together once, below.
+        row = covariant_cartesian_derivative(
+            H_t, connection, mesh=mesh, kgrid=grid,
+            bvec_cart=identity_reciprocal)[idir]
+        reduced_rows.append(band_matmul(band_matmul(U, row), U_h))
+    transported = reduced_covector_to_cartesian(
+        jax.lax.with_sharding_constraint(
+            jnp.stack(reduced_rows, axis=0), stack_sharding),
+        reciprocal)
+
     metrics = _velocity_error_metrics(
-        reconstructed, exact, atol=float(atol), rtol=float(rtol))
+        transported, exact, atol=float(atol), rtol=float(rtol))
+    diagnostic = _velocity_error_metrics(
+        sorted_frame, exact, atol=float(atol), rtol=float(rtol))
+    metrics["transport_holonomy"] = float(holonomy)
+    for name in ("max_abs", "max_rel", "max_abs_diagonal",
+                 "max_abs_offdiagonal"):
+        metrics[f"{name}_sorted_frame"] = diagnostic[name]
+    metrics["passed_sorted_frame"] = diagnostic["passed"]
+    blocks = tuple(int(m) for m in scope_blocks if 0 < int(m) <= nb)
+    if blocks:
+        metrics["blocks"] = _block_scoped_metrics(
+            transported, exact, blocks, atol=float(atol), rtol=float(rtol))
+        metrics["blocks_sorted_frame"] = _block_scoped_metrics(
+            sorted_frame, exact, blocks, atol=float(atol), rtol=float(rtol))
+        if jax.process_index() == 0:
+            print(f"  velocity validation, leading band blocks (nb={nb}, "
+                  f"nk={nk}); transport holonomy max|S-1|={holonomy:.6e}")
+            print("   bands  transported max_abs  diag        offdiag     "
+                  "| sorted-frame max_abs  diag        offdiag")
+            for new, old in zip(metrics["blocks"],
+                                metrics["blocks_sorted_frame"]):
+                print(f"   1..{new['bands']:<4d} {new['max_abs']:.6e}"
+                      f"        {new['max_abs_diagonal']:.4e}  "
+                      f"{new['max_abs_offdiagonal']:.4e}  | "
+                      f"{old['max_abs']:.6e}        "
+                      f"{old['max_abs_diagonal']:.4e}  "
+                      f"{old['max_abs_offdiagonal']:.4e}")
     write_velocity_validation(path, mesh=mesh, metrics=metrics)
     if not metrics["passed"]:
-        raise RuntimeError(
-            "parallel-transport DFT velocity validation failed: "
+        refusal = RuntimeError(
+            "parallel-transport DFT velocity validation failed in the "
+            "transported frame: "
             f"max_abs={metrics['max_abs']:.6e}, "
             f"max_rel={metrics['max_rel']:.6e}, "
-            f"atol={metrics['atol']:.6e}, rtol={metrics['rtol']:.6e}")
+            f"atol={metrics['atol']:.6e}, rtol={metrics['rtol']:.6e} "
+            f"(sorted-frame diagnostic max_abs="
+            f"{metrics['max_abs_sorted_frame']:.6e}, transport holonomy "
+            f"max|S-1|={holonomy:.6e})")
+        # A refusal that carries its own numbers: a caller scanning band
+        # windows or tolerances should never have to re-run to read them.
+        refusal.metrics = metrics
+        raise refusal
     return metrics
+
+
+def _full_bz_links(io, *, mesh, nk: int, nb_storage: int):
+    """Read the stored links and return them as ``(3, nk, nb, nb)``.
+
+    The link stage stores either one row per full-BZ point (bcc/fcc, where
+    ``link_symmetry_reduction_applies`` is false) or one row per IBZ point
+    plus the directed-edge orbit table that unfolds it.  Both layouts are
+    stamped on the artifact, so the gate reads whichever is there rather
+    than rebuilding the table from a SymMaps it does not own.
+    """
+    block_spec = P(None, None, "x", "y")
+    source_full = np.asarray(io.read_slab(
+        "source_full_ids", partition_spec=P(None), as_numpy=True))
+    n_source = int(source_full.size)
+    stored = io.read_slab(
+        LINKS_DATASET, shape=(n_source, 3, nb_storage, nb_storage),
+        partition_spec=block_spec)
+    if n_source == nk:
+        return jnp.moveaxis(stored, 1, 0)
+    try:
+        from symmetry_maps import apply_band_matrix_symmetry
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "unfolding symmetry-reduced parallel-transport links requires "
+            "symmetry_maps.apply_band_matrix_symmetry; merge the symmetry "
+            "service lane") from exc
+
+    def _table(name):
+        return np.asarray(io.read_slab(
+            f"directed_edge_{name}", shape=(nk, 3),
+            partition_spec=P(None, None), as_numpy=True))
+
+    selected = stored[_table("source_row"), _table("source_direction")]
+    unfolded = apply_band_matrix_symmetry(
+        selected,
+        antiunitary=_table("antiunitary"),
+        reverse=_table("reverse"),
+        sewing_start=None,
+        sewing_end=None,
+    )
+    return jnp.moveaxis(unfolded, 1, 0)
 
 
 def validate_parallel_transport_artifact(
@@ -1132,11 +1431,13 @@ def validate_parallel_transport_artifact(
     nbands: int,
     atol: float,
     rtol: float,
+    scope_blocks=None,
 ) -> dict[str, object]:
     """Read the artifact through SlabIO and execute its mandatory gate."""
     nb = int(nbands)
     nb_storage = band_storage_extent(mesh, nb)
-    nk = int(np.prod(tuple(int(x) for x in kgrid)))
+    grid = tuple(int(x) for x in kgrid)
+    nk = int(np.prod(grid))
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
         connection = io.read_slab(
             CONNECTION_CART_DATASET,
@@ -1150,15 +1451,33 @@ def validate_parallel_transport_artifact(
             ENERGIES_DATASET,
             shape=(nk, nb_storage),
             partition_spec=P(None, ("x", "y")))
+        forward_neighbors = np.asarray(io.read_slab(
+            "full_forward_neighbors", shape=(nk, 3),
+            partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
+        links = _full_bz_links(
+            io, mesh=mesh, nk=nk, nb_storage=nb_storage)
     if nb <= 0 or nb > int(np.shape(energies)[1]):
         raise ValueError(
             f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")
+    if nb_storage > nb:
+        # The stored links are zero outside the logical manifold. Put the
+        # identity on the pad diagonal so the transported frame stays
+        # unitary there; energies, velocity and connection are all zero on
+        # those rows, so they contribute exactly zero error either way.
+        pad = np.zeros((nb_storage, nb_storage), dtype=np.complex128)
+        rows = np.arange(nb, nb_storage)
+        pad[rows, rows] = 1.0
+        links = links + jnp.asarray(pad)[None, None]
+    if scope_blocks is None:
+        scope_blocks = tuple(range(8, nb, 8)) + (nb,)
     return complete_velocity_validation(
-        path, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart,
+        path, mesh=mesh, kgrid=grid, bvec_cart=bvec_cart,
         energies_full=energies,
         connection_cart=connection,
         velocity_exact_cart=velocity,
-        atol=float(atol), rtol=float(rtol))
+        links_full=links,
+        forward_neighbors=forward_neighbors,
+        atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks)
 
 
 def covariant_velocity(
@@ -1244,6 +1563,56 @@ def _velocity_error_metrics(
     }
 
 
+def _block_scoped_metrics(
+    reconstructed,
+    exact,
+    blocks,
+    *,
+    atol: float,
+    rtol: float,
+) -> list[dict[str, object]]:
+    """Repeat the gate metrics on leading band sub-blocks.
+
+    This is the scoping that separated "the connection is wrong" from "the
+    band window is truncated" on the sodium artifact (claim 0183): the
+    semicore rows never cross, so a block that is clean up to band 8 and
+    jumps at band 9 names a band-crossing defect and nothing else.  It is a
+    DIAGNOSTIC — the stamped verdict stays the full-window one.
+    """
+    error = jnp.abs(jnp.asarray(reconstructed) - jnp.asarray(exact))
+    magnitude = jnp.abs(jnp.asarray(exact))
+    rows = []
+    for extent in blocks:
+        m = int(extent)
+        block_error = error[:, :, :m, :m]
+        block_exact = magnitude[:, :, :m, :m]
+        diagonal = jnp.eye(m, dtype=bool)[None, None, :, :]
+        rows.append({
+            "bands": m,
+            "max_abs": float(jax.device_get(jnp.max(block_error))),
+            "max_abs_diagonal": float(jax.device_get(jnp.max(
+                jnp.where(diagonal, block_error, 0.0)))),
+            "max_abs_offdiagonal": float(jax.device_get(jnp.max(
+                jnp.where(~diagonal, block_error, 0.0)))),
+            "max_rel": float(jax.device_get(jnp.max(
+                block_error / jnp.maximum(block_exact, float(atol))))),
+            "passed": bool(jax.device_get(jnp.all(
+                block_error <= float(atol) + float(rtol) * block_exact))),
+        })
+    return rows
+
+
+_VELOCITY_GATE_KEYS = (
+    "atol", "rtol", "max_abs", "max_rel",
+    "max_abs_diagonal", "max_abs_offdiagonal",
+)
+_VELOCITY_DIAGNOSTIC_KEYS = (
+    "transport_holonomy",
+    "max_abs_sorted_frame", "max_rel_sorted_frame",
+    "max_abs_diagonal_sorted_frame", "max_abs_offdiagonal_sorted_frame",
+)
+
+
 def write_velocity_validation(
     path: str | Path,
     *,
@@ -1251,10 +1620,7 @@ def write_velocity_validation(
     metrics: dict[str, object],
 ) -> None:
     """Stamp mandatory DFT reconstruction gate metrics through SlabIO."""
-    required = {
-        "passed", "atol", "rtol", "max_abs", "max_rel",
-        "max_abs_diagonal", "max_abs_offdiagonal",
-    }
+    required = set(_VELOCITY_GATE_KEYS) | {"passed"}
     missing = required.difference(metrics)
     if missing:
         raise ValueError(f"velocity validation metrics missing {sorted(missing)}")
@@ -1262,6 +1628,10 @@ def write_velocity_validation(
         io.write_attr("velocity_validation_complete", np.int32(1))
         io.write_attr(
             "velocity_validation_passed", np.int32(bool(metrics["passed"])))
-        for name in sorted(required - {"passed"}):
+        for name in _VELOCITY_GATE_KEYS:
             io.write_attr(
                 f"velocity_validation_{name}", np.float64(metrics[name]))
+        for name in _VELOCITY_DIAGNOSTIC_KEYS:
+            if name in metrics:
+                io.write_attr(
+                    f"velocity_validation_{name}", np.float64(metrics[name]))
