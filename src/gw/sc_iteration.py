@@ -84,6 +84,141 @@ from .wavefunction_bundle import (
 
 
 # ---------------------------------------------------------------------------
+# Convergence: max|dE| over the NON-SCISSORED bands
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConvergenceVerdict:
+    """One convergence decision, with the numbers it was made from.
+
+    ``max_abs_ev`` IS THE TEST; the two RMS figures are reported only.
+    They travel together, and print together, because they are different
+    tests and the looser one has historically been the one on screen: an
+    RMS can sit comfortably under a cutoff that a single band is far
+    above.
+    """
+
+    converged: bool
+    max_abs_ev: float        # L-inf over the non-scissored bands -- THE test
+    rms_protected_ev: float  # RMS over the same set   -- reported only
+    rms_all_ev: float        # RMS over ALL active bands -- the legacy number
+    n_protected: int
+    n_total: int
+    worst_k: int
+    worst_band: int
+    cutoff_ev: float
+
+    def summary(self) -> str:
+        """The log line.  Says which number is the test and which is not."""
+        return (
+            f"max|dE| = {self.max_abs_ev:.6f} eV over {self.n_protected} "
+            f"non-scissored bands (CRITERION, cutoff {self.cutoff_ev:.6f} eV; "
+            f"worst k={self.worst_k} band={self.worst_band}) | "
+            f"RMS_nonscissored = {self.rms_protected_ev:.6f} eV, "
+            f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
+            f"(diagnostics, NOT the criterion) | "
+            f"{'CONVERGED' if self.converged else 'not converged'}")
+
+
+def protected_band_convergence(
+    e_new_ev: np.ndarray,
+    e_prev_ev: np.ndarray,
+    protected_mask: np.ndarray,
+    in_range_mask: np.ndarray,
+    cutoff_ev: float,
+) -> ConvergenceVerdict:
+    """Has every NON-SCISSORED band moved by less than ``cutoff_ev``?
+
+    ``e_*_ev`` are ``(nk, nb_active)`` eV.  The test set is
+    ``protected_mask | in_range_mask``, both from the ITERATION-LOCAL
+    :class:`~gw.band_partition.BandPartition` -- never a band-index
+    window written down somewhere else.  A frozen window keeps testing
+    the bands that WERE in range; the set that matters is the one this
+    iteration actually treated as physical.
+
+    WHY THE UNION AND NOT ``protected_mask`` ALONE.  The partition is
+    THREE-way and only the third category is scissored:
+    ``apply_band_partition`` substitutes alpha*E_DFT + beta exactly where
+    ``in_range_mask`` is False.  A band in range but NOT protected keeps
+    its own Sigma-derived diagonal and merely loses off-diagonal mixing --
+    a genuine degree of freedom.  Today ``run_sc_driver`` builds both
+    masks from the same ``in_range``, so the two spellings agree; that is
+    a property of that ONE line, not of this predicate.
+
+    WHY SCISSORED BANDS ARE EXCLUDED.  Their energies are alpha*E_DFT +
+    beta with the coefficients refitted each iteration FROM the in-range
+    corrections, so including them re-counts in-range drift through the
+    fit rather than measuring anything new.
+
+    THE TEST IS L-INFINITY, NOT RMS.  "All these bands change by less than
+    the cutoff" is a statement about the WORST band.  The RMS figures come
+    back in the verdict for reporting and are never compared to the cutoff.
+    """
+    e_new = np.asarray(e_new_ev, dtype=np.float64)
+    e_prev = np.asarray(e_prev_ev, dtype=np.float64)
+    if e_new.shape != e_prev.shape:
+        raise ValueError(
+            f"protected_band_convergence: energy shapes disagree, "
+            f"{e_new.shape} vs {e_prev.shape}.")
+    prot = np.asarray(protected_mask, dtype=bool).reshape(-1)
+    inr = np.asarray(in_range_mask, dtype=bool).reshape(-1)
+    for name, m in (("protected_mask", prot), ("in_range_mask", inr)):
+        if m.shape[0] != e_new.shape[1]:
+            raise ValueError(
+                f"protected_band_convergence: {name} has {m.shape[0]} "
+                f"bands but the energies have {e_new.shape[1]}.  The masks "
+                f"must be the iteration's own band partition over the SAME "
+                f"active window.")
+    mask = prot | inr
+
+    delta = np.abs(e_new - e_prev)
+    rms_all = float(np.sqrt(np.mean(delta ** 2)))
+    n_protected = int(mask.sum())
+    if n_protected == 0:
+        # Refuse rather than declare victory over the empty set: "max over
+        # {} < cutoff" is vacuously true.
+        raise ValueError(
+            "protected_band_convergence: the band partition leaves ZERO "
+            "non-scissored bands (protected | in_range is empty), so there "
+            "is no set to converge on -- every active band's diagonal would "
+            "be a scissor value.  Widen sigma_omega_min_ev / "
+            "sigma_omega_max_ev so some active band lies on the Sigma grid.")
+
+    d_prot = delta[:, mask]
+    max_abs = float(d_prot.max())
+    rms_prot = float(np.sqrt(np.mean(d_prot ** 2)))
+    flat = int(np.argmax(d_prot))
+    worst_k, worst_col = divmod(flat, d_prot.shape[1])
+    worst_band = int(np.flatnonzero(mask)[worst_col])
+    return ConvergenceVerdict(
+        converged=bool(max_abs < float(cutoff_ev)),
+        max_abs_ev=max_abs,
+        rms_protected_ev=rms_prot,
+        rms_all_ev=rms_all,
+        n_protected=n_protected,
+        n_total=int(e_new.shape[1]),
+        worst_k=int(worst_k),
+        worst_band=worst_band,
+        cutoff_ev=float(cutoff_ev),
+    )
+
+
+class _Converged(Exception):
+    """Internal: stop the rCROP solve because the criterion was met.
+
+    rCROP's loop has no convergence callback, and the criterion is an
+    L-infinity norm on EIGENVALUES (eV) rather than anything the solver
+    can express, so it is signalled out of ``residual_fn``.  Carries the
+    state so the caller need not reconstruct it.
+    """
+
+    def __init__(self, state: "SCState", verdict: ConvergenceVerdict):
+        super().__init__(verdict.summary())
+        self.state = state
+        self.verdict = verdict
+
+
+# ---------------------------------------------------------------------------
 # State + inputs
 # ---------------------------------------------------------------------------
 
@@ -1900,11 +2035,22 @@ def _run_linear_mixing(
     max_iter: int, tol_ev: float, mixing: float,
     eigvalsh_kshard, print_fn, dump_dir,
 ) -> tuple[SCState, list[float]]:
-    """Plain α-mixing fixed point.  Diagnostic / fallback path."""
+    """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
+
+    Converges on the SAME criterion as the rCROP path, and for the same
+    reason it is output-vs-input: testing the MIXED iterate against its
+    predecessor is exactly the mixing != 1 trap -- at small alpha the
+    mixed iterate barely moves whatever F does, so the loop would
+    "converge" by damping rather than by solving.
+    """
     state = state_init
     rms_history: list[float] = []
     E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
     _e_history: list[np.ndarray] = [E_prev_ev.copy()]
+    _protected = np.asarray(
+        inputs.partition.protected_mask, dtype=bool).reshape(-1)
+    _in_range = np.asarray(
+        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -1952,9 +2098,17 @@ def _run_linear_mixing(
             inputs, state_new, E_candidate_ev,
             call_index=it, role="linear", rms_ev=rms, rms2_ev=rms2,
         )
+        # SAME CRITERION AS rCROP.  ``E_candidate_ev`` is the UNMIXED map
+        # output F(H); ``E_prev_ev`` is that call's input.  This used to
+        # break on ``rms < tol_ev`` -- an RMS over ALL active bands
+        # including the scissored ones, both the looser test and a
+        # different set.
+        verdict = protected_band_convergence(
+            E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
+        print_fn(f"    SC convergence: {verdict.summary()}")
         state = state_new
         E_prev_ev = E_new_ev
-        if rms < tol_ev:
+        if verdict.converged:
             break
 
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
@@ -2122,6 +2276,10 @@ def _run_rcrop(
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
+    _protected = np.asarray(
+        inputs.partition.protected_mask, dtype=bool).reshape(-1)
+    _in_range = np.asarray(
+        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -2133,6 +2291,7 @@ def _run_rcrop(
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
+        E_in = np.asarray(eigvalsh_kshard(H)) * RYD_TO_EV
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
         # ``gw_iteration_map`` reads ``state.iteration`` and
         # ``state.H_qp_dft`` and nothing else, so the previous result was
@@ -2158,6 +2317,15 @@ def _run_rcrop(
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+        # THE CRITERION: the fixed-point residual of THIS call, output
+        # against that same call's input.  Not the difference between
+        # successive accepted iterates -- under rCROP the accepted
+        # iterate is a mixed combination of the history, so that
+        # difference can be driven small by damping while F still has no
+        # fixed point.  ||F(H) - H|| makes no reference to the iteration
+        # that produced H, so the accelerator cannot flatter it.
+        _verdict = protected_band_convergence(
+            E_new, E_in, _protected, _in_range, tol_ev)
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())
@@ -2176,31 +2344,88 @@ def _run_rcrop(
             inputs, state_out, E_new,
             call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
         )
+        print_fn(f"    SC convergence: {_verdict.summary()}")
         _iter_idx[0] += 1
+        # Non-trial calls only: there the INPUT is the accepted iterate
+        # (rcrop_nojit's ``f_new = residual_fn(x_new)``), so this is the
+        # residual AT the iterate the loop would return.  A trial call's
+        # residual is the residual at a probe point -- a diagnostic.
+        if role != "trial" and _verdict.converged:
+            raise _Converged(
+                SCState(H_qp_dft=state_out.H_qp_dft,
+                        iteration=_iter_idx[0],
+                        outputs=state_out.outputs),
+                _verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
-    # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
-    # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.  ``n_elem`` is the
-    # LOGICAL element count on purpose: the pad modes contribute exactly
-    # zero to ‖f‖₂, so counting them would loosen the tolerance by
-    # nb_pad/nb per band axis for no physical reason.
-    tol_ry = tol_ev / RYD_TO_EV
-    tol_resid = float(np.sqrt(n_elem)) * tol_ry
+    # rCROP HAS NO STOPPING AUTHORITY.  ``tol=0.0`` below is not a
+    # disarmed threshold; it is the statement that this solver's job is
+    # to ACCELERATE and the caller's is to decide convergence, using the
+    # exact L-infinity eigenvalue test.  That test is free: the map
+    # already diagonalises H to get QP energies.
+    #
+    # What used to be here was
+    # ``tol_resid = sqrt(n_elem) * tol_ev / RYD_TO_EV``, DELETED rather
+    # than repaired.  The ``sqrt(n_elem)`` was the whole defect: the
+    # comment above it said it converted a per-band ENERGY tolerance into
+    # a per-element RMS on the MATRIX, but for Hermitian H, Weyl gives
+    #
+    #     |dlambda_i| <= ||dH||_2 <= ||dH||_F = ||f||_2
+    #
+    # so the only sound conversion is ``tol_resid = tol_ry``, with no
+    # sqrt at all -- conservative, possibly stopping later than strictly
+    # necessary, never early.  Multiplying by sqrt(n_elem) loosens the
+    # bound by exactly the factor that destroys it.
+    #
+    # THE ARITHMETIC CLOSES EXACTLY.  MEASURED on Si 4x4x4 SYM/SOC at
+    # P=4: the carry is (64, 24, 24) -- the loop runs full-BZ under
+    # ``sc_on_ibz = false`` -- so n_elem = 36864 and sqrt(n_elem) = 192.
+    # At a 2 meV request the threshold became 2.8223e-02 Ry; rCROP
+    # stopped at ||f||_2 = 2.3618e-02 Ry reporting converged=True; and
+    # max|dE| over the non-scissored bands at that call was 0.120477 eV,
+    # 60.2x the cutoff.  The sound threshold, 1.4700e-04 Ry, sits 161x
+    # BELOW the residual it stopped at, so it would not have stopped.
+    # Weyl slack ||dH||_F / max|dlambda| measured 2.67, and
+    # 192 / 2.67 = 72.0x is the predicted looseness at threshold against
+    # 60.2x observed at the actual stop.  Nothing is unaccounted for.
+    #
+    # The deleted comment's care about LOGICAL vs PADDED ``n_elem`` was
+    # correct about padding and beside the point: it fine-tuned a factor
+    # that should not have existed.  Local precision can disguise a
+    # global error, so the factor is gone rather than corrected.
 
-    result = rcrop_nojit(
-        residual_fn,
-        # THE CARRY ITSELF, not a flattened copy of it.
-        x0,
-        m=history_depth,
-        maxit=max_iter,
-        tol=tol_resid,
-        print_fn=None,  # we print our own RMS-ΔE history above
-        entry_sharding=entry_sh,
-    )
+    try:
+        result = rcrop_nojit(
+            residual_fn,
+            # THE CARRY ITSELF, not a flattened copy of it.
+            x0,
+            m=history_depth,
+            maxit=max_iter,
+            tol=0.0,   # see above: rCROP does not decide convergence
+            print_fn=None,  # we print our own RMS-ΔE history above
+            entry_sharding=entry_sh,
+        )
+    except _Converged as stop:
+        # The criterion fired inside the map.  Return the accepted
+        # iterate that met it, NOT rCROP's internal x: the two differ by
+        # one trial step and only this one carries an SCOutputs for the
+        # writers.  The pad-inertness check below reads the solver's
+        # final x, which this path never reaches -- say so rather than
+        # skip it silently.
+        print_fn(
+            f"  SC rCROP stopped by the convergence criterion after "
+            f"{_iter_idx[0]} map calls: {stop.verdict.summary()}")
+        print_fn(
+            "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
+            "check reads the solver's final x, not reached on this path)")
+        _maybe_dump_e_history(dump_dir, _e_history, print_fn)
+        return stop.state, rms_history
+
     print_fn(
-        f"  SC rCROP done: {result.iterations} iterations, "
-        f"converged={bool(result.converged)}, "
-        f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry")
+        f"  SC rCROP done: {result.iterations} iterations WITHOUT meeting "
+        f"the {tol_ev:.3e} eV criterion (budget exhausted), final "
+        f"‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry -- a "
+        f"DIAGNOSTIC: rCROP has no stopping rule of its own")
 
     # INERTNESS, CHECKED — a DIFFERENT claim from the parity one at the top
     # of this function, and this pair has been measured to come apart: the
