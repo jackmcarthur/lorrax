@@ -127,8 +127,9 @@ def screening_requests_for(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     if mode is ComputeMode.MPA:
         # MPA owns a shared multi-frequency disk walk, not independent W
-        # requests.  ``gw.mpa.model.build_mpa_fit`` will be called by the
-        # driver once the gw_config.UNIMPLEMENTED_MODES row is deleted.
+        # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver
+        # directly; the gw_config.UNIMPLEMENTED_MODES row that used to gate
+        # that path has been deleted.
         return []
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")

@@ -23,10 +23,11 @@ $$
 
 Verification banner: every named symbol in this page was read at commit
 `a5b1002b` on `integ/metal-mpa-qsgw-2026-08-15` (2026-08-15); measured
-numbers carry their claim row or probe record. `compute_mode = mpa` still
-refuses at driver entry for every material class
-(`gw_config.UNIMPLEMENTED_MODES` — the whole mode, not a metal row); section
-7 states what that gate waits on.
+numbers carry their claim row or probe record. `compute_mode = mpa` **no
+longer refuses at driver entry**: `gw_config.UNIMPLEMENTED_MODES` was
+emptied at `9c9b23dc` (2026-08-15) once the metal pipeline ran end to end.
+Section 6.4 states exactly what that lift does and does not assert — it is
+parseability, not convergence.
 
 ## 1. The finite-occupation response and its cancellation structure
 
@@ -677,18 +678,35 @@ need no restatement.
 
 ### 6.4 Gate status
 
-`gw_config.UNIMPLEMENTED_MODES[ComputeMode.MPA]` still refuses the compute
-mode at driver entry and at the `Sigma` seam — for metals and insulators
-alike (it has no metal-only row; do not describe it as a metal gate).
-Removing the row is the landing gesture and waits on one real metallic run
-traversing chi/W/head/`Sigma`/QSGW end to end. As of 2026-08-15 that run is
-blocked upstream of the MPA code entirely: the mandatory parallel-transport
-velocity gate fails on the Na deck for a reason independent of the transport
-itself (claim 183 — the gate's diagonal compares an FFT derivative of
-band-sorted `E_n(k)` against the exact velocity and is not smooth at band
-crossings; measured `max_abs = 3.169` against `atol = 5e-4`, already
-`3.9e-2` on the never-crossing semicore bands). Rungs R2 (claim 180) and R3
-(claims 181/182) stand; R4/R5/R6 are unrun; the gate stays down.
+**The gate is LIFTED as of 2026-08-15** (commit `9c9b23dc` on
+`integ/metal-mpa-qsgw-2026-08-15`, pushed; *not* an ancestor of
+`origin/main`). `gw_config.UNIMPLEMENTED_MODES` is now empty:
+`ComputeMode.MPA` passes the driver-entry check and the `Sigma` seam. The
+row it used to hold was never a metal row — it refused metals and insulators
+alike — so do not describe what was removed as a metal gate.
+
+**What the lift asserts, and what it does not.** Removing the row was the
+declared landing gesture for *one real metallic run traversing
+chi/W/head/`Sigma`/QSGW end to end*, and that is what it was taken on: R6
+ran three self-consistent iterations to `rc = 0` on the Na deck. **It is a
+statement about parseability, not convergence.** That run did not converge —
+`max|dE|` 5.433 eV against a 1e-4 eV criterion, `mu` moving 1.849 eV between
+iterations — and the convergence physics continues under R5/R6. The
+site-level refusals are the safety now and are untouched:
+`mpa_metal_needs_occupations`, the deck-key cross-validation, and the
+occupation-stamp assert.
+
+The route it ran on is `sc_head_update = dft_velocity`, not parallel
+transport. The PT velocity gate still fails on the Na deck for a reason
+independent of the transport itself (claim 183 — the gate's diagonal
+compares an FFT derivative of band-sorted `E_n(k)` against the exact
+velocity and is not smooth at band crossings; measured `max_abs = 3.169`
+against `atol = 5e-4`, already `3.9e-2` on the never-crossing semicore
+bands, improved to 1.796 by the transported frame of claim 195 but still
+refusing). Rungs R2 (claim 180) and R3 (claims 181/182) stand; R4's fit half
+is claim 196 and its eqp half awaits a rerun; velocities everywhere on this
+route are DFT p-matrix elements, with the covariant-derivative upgrade
+parked on claim 183.
 
 ## 7. Claims ledger for this page
 

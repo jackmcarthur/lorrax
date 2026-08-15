@@ -7,8 +7,10 @@ sees one signature and one result type.
 
 The dispatch is EXHAUSTIVE over ``gw_config.ComputeMode``: a mode with
 no kernel here is refused by name, not absorbed by the last branch.
-MPA has a branch below but is gated at entry by
-``gw_config.UNIMPLEMENTED_MODES`` until its pipeline passes end to end.
+MPA has a branch below and is no longer gated at entry: its
+``gw_config.UNIMPLEMENTED_MODES`` row was deleted once the metal pipeline
+ran end to end.  The site-level refusals are the safety now — a metal plan
+without an ``OccupationState`` is still refused by name.
 
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the

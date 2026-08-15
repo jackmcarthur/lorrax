@@ -7,12 +7,16 @@ by an object defined earlier. Exact deck defaults belong to the
 [input reference](../input_reference.md); equations and validity domains belong
 here.
 
-`compute_mode = mpa` is declared but still refuses at driver entry. The
-disk-bounded chi-to-W-to-fit pipeline, the shared Sigma planner, and the common
-dynamic-Sigma finalizer exist on this feature branch. Public enablement waits
-for one real-material calculation to traverse that complete path with the
-fixed-head approximation and pass its numerical gate. The refusal is owned by
-`gw_config.UNIMPLEMENTED_MODES`; internal component tests do not weaken it.
+`compute_mode = mpa` **runs**: the entry refusal owned by
+`gw_config.UNIMPLEMENTED_MODES` was removed at `9c9b23dc` (2026-08-15) on
+`integ/metal-mpa-qsgw-2026-08-15`, which is pushed but **not** an ancestor of
+`origin/main`. The condition it waited on — one real-material calculation
+traversing the disk-bounded chi-to-W-to-fit pipeline, the shared Sigma planner
+and the common dynamic-Sigma finalizer end to end — was met by a three-iteration
+metallic QSGW run on the Na deck. Read that narrowly: it means the mode parses
+and executes, **not** that the result converged (it did not) and not that the
+numbers are validated. Convergence and the BGW comparison continue under rungs
+R5/R6; the per-site refusals that guard physics preconditions are untouched.
 
 ## 1. One pipeline, three approximations
 

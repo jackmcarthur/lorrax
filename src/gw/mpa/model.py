@@ -356,9 +356,9 @@ def build_mpa_fit(
     # discharged: occupation-weighted chi (fractional contour + finite-q
     # divided difference) and the weighted Sigma branches landed in Wave 1.
     # A metal plan still refuses without an OccupationState — here, before
-    # any inode exists, and again at the _evaluate_samples seam.  The
-    # driver-level UNIMPLEMENTED_MODES row gates the deck path until the
-    # E2E claim.
+    # any inode exists, and again at the _evaluate_samples seam — and that
+    # refusal is now the only gate on the deck path: the driver-level
+    # UNIMPLEMENTED_MODES row was deleted when the metal pipeline ran E2E.
     _require_metal_occupations(config, occupation_state)
     from common.collectives import barrier, process_rank
 
