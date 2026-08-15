@@ -199,10 +199,146 @@ def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
         tile_bytes=tile_bytes)
 
 
+def _metal_kminq_rows(sym, q_idx):
+    """Per-wedge-row flat ``k → k−q`` maps for the static origin sample.
+
+    Row order follows the stored wedge (``sym.q_irr_full_idx`` order); the
+    Gamma row's map must be the identity, which is asserted because it is
+    the one cheap invariant that discriminates a wedge-row/kq-column
+    ordering mismatch.
+    """
+    from common.kq_mapping import kminq_idx_for_iq
+
+    q_idx = np.asarray(q_idx, dtype=np.int64)
+    rows = np.stack([
+        kminq_idx_for_iq(sym, j) for j in range(int(q_idx.size))
+    ])
+    for j in np.flatnonzero(q_idx == 0):
+        if not np.array_equal(
+                rows[j], np.arange(rows.shape[1], dtype=rows.dtype)):
+            raise ValueError(
+                "MPA metal q wedge: the Gamma row's k-q map is not the "
+                "identity, so the stored wedge ordering does not match "
+                "SymMaps.kq_map columns")
+    return rows
+
+
+def _evaluate_samples(
+    wfns, routes, quad, config, meta, mesh_xy, *,
+    energy_reference, occupation_state, write_full, write_wedge,
+    static_gamma_override, gamma_row, kminq_rows,
+):
+    """Evaluate every plan point through its route's kernel.
+
+    Insulating plans keep the historical kernels on a byte-identical code
+    path.  Metal plans (shifted-origin double-parallel protocol) route the
+    near line's first sample through the exact static divided-difference
+    kernel — the damped contour rule at varpi = 2e-5 Ry needs ~1.0e6 nodes
+    (probe record runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md)
+    — and every other point through the fractional contour kernel with the
+    rule bandwidth derived from the occupation supports, not ``quad.x_max``.
+    ``write_full`` takes a full-grid chi (the writer wedges it);
+    ``write_wedge`` takes already-wedge-shaped rows.
+    """
+    from gw.minimax_config import MinimaxConfig
+    from gw.minimax_screening import build_imag_quadrature
+    from gw.w_isdf import (
+        compute_chi0,
+        compute_chi0_contour,
+        compute_chi0_contour_fractional,
+        compute_chi0_static_fractional,
+        occupation_support_bandwidth,
+    )
+
+    metal = config.mpa.material_class != "insulator"
+    if metal and occupation_state is None:
+        raise ValueError(
+            "GATE mpa_metal_needs_occupations: a metal MPA plan requires "
+            "occupation_state (gw.efermi.OccupationState); got None. "
+            "FALSE case: material_class == 'insulator', or an "
+            "OccupationState was passed.")
+    omega_m = float(quad.x_max)
+    if metal:
+        delta_max = occupation_support_bandwidth(
+            wfns.enk, occupation_state.f_kn)
+
+    for point in routes["existing"]:
+        if not metal:
+            used = quad if point["character"] == "static" else \
+                build_imag_quadrature(
+                    quad, point["varpi"],
+                    MinimaxConfig(
+                        target_error=config.minimax_config.target_error,
+                        max_nodes=config.minimax_config.max_nodes))
+            chi = compute_chi0(
+                wfns, used, meta, mesh_xy, energy_reference=energy_reference)
+            if (
+                point["character"] == "static"
+                and static_gamma_override is not None
+            ):
+                chi = chi.at[0].set(static_gamma_override[0])
+            write_full(point, chi)
+        elif point["role"].startswith("near"):
+            # The shifted-origin slot stores the exact static value; the
+            # fit reads sample_z = i*varpi_1, and the inconsistency is
+            # bounded by (varpi_1/(q*v_F))^2 at finite q (W1.a-2).
+            chi_w = compute_chi0_static_fractional(
+                wfns, meta, mesh_xy, occupation_state=occupation_state,
+                kminq_rows=kminq_rows)
+            if static_gamma_override is not None and gamma_row is not None:
+                chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
+            write_wedge(point, chi_w)
+        else:
+            # Far pure-imaginary point: the fractional contour is cheap at
+            # O(1) Ry line heights (31 nodes at varpi=1, tol 1e-6).
+            rule = evaluator.damped_line_rule(
+                point["varpi"], delta_max + abs(point["omega"]),
+                rel_tol=config.minimax_config.target_error,
+                max_order=config.minimax_config.max_nodes)
+            chi = compute_chi0_contour_fractional(
+                wfns, rule["t"], rule["h"],
+                np.asarray([point["z"]], dtype=np.complex128),
+                meta, mesh_xy,
+                occupations=occupation_state.f_kn,
+                energy_reference=float(occupation_state.mu_ry))
+            write_full(point, chi)
+
+    for varpi_i, points in routes["lines"]:
+        z = np.asarray([point["z"] for point in points])
+        bandwidth = (
+            (delta_max if metal else omega_m)
+            + float(np.max(np.abs(z.real))))
+        rule = evaluator.damped_line_rule(
+            varpi_i, bandwidth,
+            rel_tol=config.minimax_config.target_error,
+            max_order=config.minimax_config.max_nodes)
+        t, h = rule["t"], rule["h"]
+        if metal:
+            # Positive nodes only: the fractional kernel supplies both
+            # Keldysh terms itself (never the symmetric ±tau doubling).
+            values = compute_chi0_contour_fractional(
+                wfns, t, h, z, meta, mesh_xy,
+                occupations=occupation_state.f_kn,
+                energy_reference=float(occupation_state.mu_ry))
+        else:
+            tau = np.concatenate((1j * t, -1j * t))
+            signs = np.concatenate((np.ones(t.size, np.int8),
+                                    -np.ones(t.size, np.int8)))
+            weights = np.broadcast_to(
+                np.concatenate((1j * h, -1j * h)), (z.size, 2 * t.size))
+            values = compute_chi0_contour(
+                wfns, tau, weights, signs, z, meta, mesh_xy,
+                energy_reference=energy_reference)
+        values = (values,) if z.size == 1 else values
+        for point, chi in zip(points, values):
+            write_full(point, chi)
+
+
 def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
-    tile_bytes=None, plan=None, iteration_head_response=None, print_fn=print,
+    tile_bytes=None, plan=None, iteration_head_response=None,
+    occupation_state=None, print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head."""
     if config.mpa.material_class != "insulator":
@@ -214,9 +350,6 @@ def build_mpa_fit(
             "and Sigma branches land. FALSE case: "
             "config.mpa.material_class == 'insulator'.")
     from common.collectives import barrier, process_rank
-    from gw.minimax_config import MinimaxConfig
-    from gw.minimax_screening import build_imag_quadrature
-    from gw.w_isdf import compute_chi0, compute_chi0_contour
 
     root = os.path.abspath(os.fspath(run_dir))
     if process_rank() == 0:
@@ -264,45 +397,32 @@ def build_mpa_fit(
         sample_path, _WC, mode="a", **common)
 
     routes = sample_plan.plan_routes(plan)
-    for point in routes["existing"]:
-        used = quad if point["character"] == "static" else \
-            build_imag_quadrature(
-                quad, point["varpi"],
-                MinimaxConfig(
-                    target_error=config.minimax_config.target_error,
-                    max_nodes=config.minimax_config.max_nodes))
-        chi = compute_chi0(
-            wfns, used, meta, mesh_xy, energy_reference=energy_reference)
-        if (
-            point["character"] == "static"
-            and iteration_head_response is not None
-            and iteration_head_response.static_chi_body_gamma is not None
-        ):
-            chi = chi.at[0].set(
-                iteration_head_response.static_chi_body_gamma[0])
+    metal = config.mpa.material_class != "insulator"
+    kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
+    static_gamma_override = (
+        iteration_head_response.static_chi_body_gamma
+        if iteration_head_response is not None else None)
+    gamma_matches = np.flatnonzero(np.asarray(q_idx, np.int64) == 0)
+    gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
+
+    def _write_full(point, chi):
         _write_sample(
             sample_path, point["index"], chi, q_idx, meta, mesh_xy,
             z_all.size)
-    for varpi_i, points in routes["lines"]:
-        z = np.asarray([point["z"] for point in points])
-        rule = evaluator.damped_line_rule(
-            varpi_i, omega_m + float(np.max(np.abs(z.real))),
-            rel_tol=config.minimax_config.target_error,
-            max_order=config.minimax_config.max_nodes)
-        t, h = rule["t"], rule["h"]
-        tau = np.concatenate((1j * t, -1j * t))
-        signs = np.concatenate((np.ones(t.size, np.int8),
-                                -np.ones(t.size, np.int8)))
-        weights = np.broadcast_to(
-            np.concatenate((1j * h, -1j * h)), (z.size, 2 * t.size))
-        values = compute_chi0_contour(
-            wfns, tau, weights, signs, z, meta, mesh_xy,
-            energy_reference=energy_reference)
-        values = (values,) if z.size == 1 else values
-        for point, chi in zip(points, values):
-            _write_sample(
-                sample_path, point["index"], chi, q_idx, meta, mesh_xy,
-                z_all.size)
+
+    def _write_wedge(point, chi_wedge):
+        chi_wedge.block_until_ready()
+        mpa_store.write_w_slab_collective(
+            sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
+            global_shape=(z_all.size, q_idx.size, meta.n_rmu, meta.n_rmu))
+
+    _evaluate_samples(
+        wfns, routes, quad, config, meta, mesh_xy,
+        energy_reference=energy_reference,
+        occupation_state=occupation_state,
+        write_full=_write_full, write_wedge=_write_wedge,
+        static_gamma_override=static_gamma_override,
+        gamma_row=gamma_row, kminq_rows=kminq_rows)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
     iteration_head = _solve_wc(

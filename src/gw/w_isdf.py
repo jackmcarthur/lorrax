@@ -1213,6 +1213,102 @@ def compute_chi0_contour_fractional(
     return values[0] if n_out == 1 else values
 
 
+def _static_fractional_pair_scan(
+    psi_x_a, psi_y_a, psi_x_b, psi_y_b, energy_a, energy_b,
+    occ_a, occ_b, surface_a, surface_b, *, nb_logical, tile,
+):
+    """Ordered-pair divided-difference scan shared by the static kernels.
+
+    The ``a`` operands ride at k; the ``b`` operands ride at whatever k row
+    the caller supplied — the same arrays for the Gamma kernel, the k−q
+    rolled arrays for the finite-q kernel.  TASTE 6 judgment (the same
+    ruling the Gamma kernel carries): the ordered band-pair index exists
+    only inside one tile step beside the centroid axes; the per-rank
+    transient is the two density tiles,
+    ``nk·(nmu_x/P_x + nmu_y/P_y)·tile²·16 B`` per step (Na 48b, 8³ k,
+    tile 8: tens of MB), and ONE static sample per fit rides this kernel —
+    never a dynamic route.  The certified separable rational-f service
+    (docs/theory/finite-occupation-screening.md §static) is the staged
+    scaling path behind the same public API.
+    """
+    nk, nspinor, nmu_x, nb = psi_x_a.shape
+    nmu_y = psi_y_a.shape[2]
+    nb_pad = ((int(nb) + tile - 1) // tile) * tile
+    pad = nb_pad - int(nb)
+    pad4 = ((0, 0), (0, 0), (0, 0), (0, pad))
+    pad2 = ((0, 0), (0, pad))
+    pa_x_full = jnp.pad(psi_x_a, pad4)
+    pb_x_full = jnp.pad(psi_x_b, pad4)
+    pa_y_full = jnp.pad(psi_y_a, pad4)
+    pb_y_full = jnp.pad(psi_y_b, pad4)
+    ea_full = jnp.pad(energy_a, pad2)
+    eb_full = jnp.pad(energy_b, pad2)
+    fa_full = jnp.pad(occ_a, pad2)
+    fb_full = jnp.pad(occ_b, pad2)
+    sa_full = jnp.pad(surface_a, pad2)
+    sb_full = jnp.pad(surface_b, pad2)
+    ntiles = nb_pad // tile
+
+    def _pair_tile(accumulator, flat_index):
+        ia = (flat_index // ntiles) * tile
+        ib = (flat_index % ntiles) * tile
+        pa_x = jax.lax.dynamic_slice(
+            pa_x_full, (0, 0, 0, ia), (nk, nspinor, nmu_x, tile))
+        pb_x = jax.lax.dynamic_slice(
+            pb_x_full, (0, 0, 0, ib), (nk, nspinor, nmu_x, tile))
+        pa_y = jax.lax.dynamic_slice(
+            pa_y_full, (0, 0, 0, ia), (nk, nspinor, nmu_y, tile))
+        pb_y = jax.lax.dynamic_slice(
+            pb_y_full, (0, 0, 0, ib), (nk, nspinor, nmu_y, tile))
+        ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
+        eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
+        fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
+        fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
+        sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
+        sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
+
+        de = ea[:, :, None] - eb[:, None, :]
+        df = fa[:, :, None] - fb[:, None, :]
+        scale = jnp.maximum(
+            1.0,
+            jnp.maximum(jnp.abs(ea[:, :, None]),
+                        jnp.abs(eb[:, None, :])),
+        )
+        separated = (
+            jnp.abs(de) > 64.0 * jnp.finfo(jnp.float64).eps * scale)
+        # surface_weight is -df/dE.  The average is exact for a truly
+        # degenerate pair and is the stable midpoint limit for a pair
+        # closer than floating-point energy resolution.
+        diagonal_limit = -0.5 * (sa[:, :, None] + sb[:, None, :])
+        divided = jnp.where(
+            separated, df / jnp.where(separated, de, 1.0),
+            diagonal_limit)
+        ga = ia + jnp.arange(tile)
+        gb = ib + jnp.arange(tile)
+        logical = (
+            (ga[:, None] < int(nb_logical))
+            & (gb[None, :] < int(nb_logical))
+        )[None, :, :]
+        divided = jnp.where(logical, divided, 0.0)
+
+        # d_ab(mu) = sum_s psi_a(mu) conj(psi_b(mu)).  The spinor
+        # component is summed here, so scalar, two-component and future
+        # four-component wavefunctions share this exact kernel.
+        density_x = jnp.einsum(
+            "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
+        density_y = jnp.einsum(
+            "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+        contribution = jnp.einsum(
+            "kab,kmab,knab->mn", divided, density_x,
+            jnp.conj(density_y), optimize=True)
+        return accumulator + contribution, None
+
+    zero = jnp.zeros((nmu_x, nmu_y), dtype=jnp.complex128)
+    chi, _ = jax.lax.scan(
+        _pair_tile, zero, jnp.arange(ntiles * ntiles), unroll=1)
+    return chi[None, :, :] / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+
+
 def _get_chi_static_fractional_gamma_kernel(
     mesh_xy: Mesh, *, nb_logical: int, pair_tile: int,
 ):
@@ -1233,81 +1329,60 @@ def _get_chi_static_fractional_gamma_kernel(
         return hit
 
     def _local(psi_xn, psi_yn, energies, occupations, surface_weight):
-        nk, nspinor, nmu_x, nb = psi_xn.shape
-        nmu_y = psi_yn.shape[2]
-        nb_pad = ((int(nb) + tile - 1) // tile) * tile
-        pad = nb_pad - int(nb)
-        psi_x = jnp.pad(psi_xn, ((0, 0), (0, 0), (0, 0), (0, pad)))
-        psi_y = jnp.pad(psi_yn, ((0, 0), (0, 0), (0, 0), (0, pad)))
-        energy = jnp.pad(energies, ((0, 0), (0, pad)))
-        occ = jnp.pad(occupations, ((0, 0), (0, pad)))
-        surface = jnp.pad(surface_weight, ((0, 0), (0, pad)))
-        ntiles = nb_pad // tile
-
-        def _pair_tile(accumulator, flat_index):
-            ia = (flat_index // ntiles) * tile
-            ib = (flat_index % ntiles) * tile
-            pa_x = jax.lax.dynamic_slice(
-                psi_x, (0, 0, 0, ia), (nk, nspinor, nmu_x, tile))
-            pb_x = jax.lax.dynamic_slice(
-                psi_x, (0, 0, 0, ib), (nk, nspinor, nmu_x, tile))
-            pa_y = jax.lax.dynamic_slice(
-                psi_y, (0, 0, 0, ia), (nk, nspinor, nmu_y, tile))
-            pb_y = jax.lax.dynamic_slice(
-                psi_y, (0, 0, 0, ib), (nk, nspinor, nmu_y, tile))
-            ea = jax.lax.dynamic_slice(energy, (0, ia), (nk, tile))
-            eb = jax.lax.dynamic_slice(energy, (0, ib), (nk, tile))
-            fa = jax.lax.dynamic_slice(occ, (0, ia), (nk, tile))
-            fb = jax.lax.dynamic_slice(occ, (0, ib), (nk, tile))
-            sa = jax.lax.dynamic_slice(surface, (0, ia), (nk, tile))
-            sb = jax.lax.dynamic_slice(surface, (0, ib), (nk, tile))
-
-            de = ea[:, :, None] - eb[:, None, :]
-            df = fa[:, :, None] - fb[:, None, :]
-            scale = jnp.maximum(
-                1.0,
-                jnp.maximum(jnp.abs(ea[:, :, None]),
-                            jnp.abs(eb[:, None, :])),
-            )
-            separated = (
-                jnp.abs(de) > 64.0 * jnp.finfo(jnp.float64).eps * scale)
-            # surface_weight is -df/dE.  The average is exact for a truly
-            # degenerate pair and is the stable midpoint limit for a pair
-            # closer than floating-point energy resolution.
-            diagonal_limit = -0.5 * (sa[:, :, None] + sb[:, None, :])
-            divided = jnp.where(
-                separated, df / jnp.where(separated, de, 1.0),
-                diagonal_limit)
-            ga = ia + jnp.arange(tile)
-            gb = ib + jnp.arange(tile)
-            logical = (
-                (ga[:, None] < int(nb_logical))
-                & (gb[None, :] < int(nb_logical))
-            )[None, :, :]
-            divided = jnp.where(logical, divided, 0.0)
-
-            # d_ab(mu) = sum_s psi_a(mu) conj(psi_b(mu)).  The spinor
-            # component is summed here, so scalar, two-component and future
-            # four-component wavefunctions share this exact kernel.
-            density_x = jnp.einsum(
-                "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
-            density_y = jnp.einsum(
-                "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
-            contribution = jnp.einsum(
-                "kab,kmab,knab->mn", divided, density_x,
-                jnp.conj(density_y), optimize=True)
-            return accumulator + contribution, None
-
-        zero = jnp.zeros((nmu_x, nmu_y), dtype=jnp.complex128)
-        chi, _ = jax.lax.scan(
-            _pair_tile, zero, jnp.arange(ntiles * ntiles), unroll=1)
-        return chi[None, :, :] / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+        return _static_fractional_pair_scan(
+            psi_xn, psi_yn, psi_xn, psi_yn, energies, energies,
+            occupations, occupations, surface_weight, surface_weight,
+            nb_logical=nb_logical, tile=tile)
 
     kernel = jax.jit(shard_map(
         _local,
         mesh=mesh_xy,
         in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, None), P(None, None),
                   P(None, None)),
+        out_specs=P(None, "x", "y"),
+        check_vma=False,
+    ))
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
+def _get_chi_static_fractional_q_kernel(
+    mesh_xy: Mesh, *, nb_logical: int, pair_tile: int,
+):
+    """Finite-q sibling of the Gamma static kernel: b rides at k−q.
+
+    The caller supplies the flat ``k → k−q`` map for one stored q row;
+    every b-side operand (both densities, energies, occupations, surface
+    weights) is rolled by it before the shared ordered-pair scan.  The
+    map is replicated and the ψ k axis is replicated on this mesh, so the
+    gather is rank-local — no collectives are added over the Gamma kernel.
+    """
+    from common.shard_map import shard_map
+    from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
+
+    tile = int(pair_tile)
+    key = ("static_fractional_q", id(mesh_xy), int(nb_logical), tile)
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    def _local(psi_xn, psi_yn, kminq_idx, energies, occupations,
+               surface_weight):
+        pb_x = jnp.take(psi_xn, kminq_idx, axis=0)
+        pb_y = jnp.take(psi_yn, kminq_idx, axis=0)
+        eb = jnp.take(energies, kminq_idx, axis=0)
+        fb = jnp.take(occupations, kminq_idx, axis=0)
+        sb = jnp.take(surface_weight, kminq_idx, axis=0)
+        return _static_fractional_pair_scan(
+            psi_xn, psi_yn, pb_x, pb_y, energies, eb,
+            occupations, fb, surface_weight, sb,
+            nb_logical=nb_logical, tile=tile)
+
+    kernel = jax.jit(shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None), P(None, None),
+                  P(None, None), P(None, None)),
         out_specs=P(None, "x", "y"),
         check_vma=False,
     ))
@@ -1366,6 +1441,94 @@ def compute_chi0_static_fractional_gamma(
         nb_logical=int(nb_logical),
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
     )(psi_x, psi_y, e, f, surface)
+
+
+def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
+    """Largest transition energy over the exact occupation supports, Ry.
+
+    ``max(E over the (1-f) support) − min(E over the f support)`` with the
+    no-slop support rule of :func:`_exact_occupation_support_slices`: only
+    weights stored as exactly 0 or exactly 1 are dropped, so an MP1
+    overshoot band at a support edge is included.  This — not
+    ``quad.x_max`` — sizes the damped-line rule bandwidth on metal plans,
+    where the occupied and empty supports overlap.
+    """
+    e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
+    f_slice, u_slice = _exact_occupation_support_slices(occupations_kn)
+    return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
+
+
+def compute_chi0_static_fractional(
+    wfns,
+    meta,
+    mesh_xy,
+    *,
+    occupation_state,
+    kminq_rows,
+    nb_logical=None,
+):
+    """Exact static finite-occupation chi0 for every stored q row.
+
+    The finite-q generalization of
+    :func:`compute_chi0_static_fractional_gamma`: for wedge row j the b
+    side of every ordered pair rides at ``k − q_j`` through the caller's
+    precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
+    the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
+    the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
+    pairs.  One divided-difference sample per fit rides this route — the
+    shifted-origin slot of the metal double-parallel plan, whose damped
+    contour rule is unaffordable (probe record
+    ``runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md``:
+    ~1.0e6 nodes at varpi = 2e-5 Ry).  Returns ``(n_q, n_mu, n_mu)``
+    wedge rows in the raw-chi normalization expected by :func:`solve_w`,
+    sharded ``P(None, 'x', 'y')``.
+    """
+    from gw.efermi import mp1_negative_derivative
+
+    family = getattr(occupation_state, "smearing_family", None)
+    if family != "mp1":
+        raise ValueError(
+            "GATE static_fractional_needs_mp1: compute_chi0_static_"
+            "fractional requires OccupationState.smearing_family == 'mp1' "
+            f"(analytic -df/dE diagonal); got {family!r}. A step-function "
+            "static body is the insulating compute_chi0 kernel's job. "
+            "FALSE case: smearing_family == 'mp1'.")
+    e = jnp.asarray(wfns.enk, dtype=jnp.float64)
+    f = jnp.asarray(occupation_state.f_kn, dtype=jnp.float64)
+    if f.shape != e.shape:
+        raise ValueError(
+            f"static fractional chi occupations {f.shape} do not match "
+            f"energies {e.shape}")
+    if int(e.shape[0]) != int(meta.nk_tot):
+        raise ValueError(
+            f"static fractional chi has nk={e.shape[0]}, expected "
+            f"meta.nk_tot={meta.nk_tot}")
+    nb = int(e.shape[1])
+    nb_log = nb if nb_logical is None else int(nb_logical)
+    if not (0 < nb_log <= nb):
+        raise ValueError(
+            f"static fractional chi needs 0 < nb_logical <= {nb}; got "
+            f"{nb_logical}")
+    kmq = np.asarray(kminq_rows, dtype=np.int32)
+    if kmq.ndim != 2 or kmq.shape[1] != int(e.shape[0]):
+        raise ValueError(
+            "static fractional chi kminq_rows must have shape (n_q, nk="
+            f"{e.shape[0]}); got {kmq.shape}")
+    if int(wfns.psi_xn.shape[-1]) < nb:
+        raise ValueError(
+            "centroid wavefunctions do not cover the static bands")
+    surface = mp1_negative_derivative(
+        e, float(occupation_state.mu_ry),
+        float(occupation_state.smearing_width_ry))
+    psi_x = wfns.psi_xn[..., :nb]
+    psi_y = wfns.psi_yn[..., :nb]
+    kernel = _get_chi_static_fractional_q_kernel(
+        mesh_xy, nb_logical=nb_log, pair_tile=_STATIC_FRACTIONAL_PAIR_TILE)
+    rows = [
+        kernel(psi_x, psi_y, jnp.asarray(row), e, f, surface)
+        for row in kmq
+    ]
+    return rows[0] if len(rows) == 1 else jnp.concatenate(rows, axis=0)
 
 
 def precompile_chi0_contour_fractional(

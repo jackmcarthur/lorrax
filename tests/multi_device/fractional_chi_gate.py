@@ -119,6 +119,81 @@ def main():
         )
     if relative > 5.0e-12:
         raise AssertionError("fractional chi dense Kubo mismatch")
+
+    # --- W1: the finite-q static divided-difference row -------------------
+    from gw import efermi
+    from gw.w_isdf import compute_chi0_static_fractional
+
+    mu, width = 0.15, 0.08
+    occ_mp1 = np.asarray(jax.device_get(
+        efermi.mp1_occupations(enk, mu, width)))
+    surface = np.asarray(jax.device_get(
+        efermi.mp1_negative_derivative(enk, mu, width)))
+    wfns_mp1 = Wavefunctions(
+        psi_xn=wfns.psi_xn, psi_xr=wfns.psi_xr, psi_yr=wfns.psi_yr,
+        psi_yn=wfns.psi_yn, enk=wfns.enk,
+        occ=_put(occ_mp1, mesh, P(None, None)), slices=slices)
+    state = SimpleNamespace(
+        f_kn=occ_mp1, mu_ry=mu, smearing_family="mp1",
+        smearing_width_ry=width)
+    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
+    got_static = np.asarray(multihost_utils.process_allgather(
+        compute_chi0_static_fractional(
+            wfns_mp1, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+            occupation_state=state, kminq_rows=kminq),
+        tiled=True))
+
+    want_static = np.zeros((nk, nmu, nmu), np.complex128)
+    for q in range(nk):
+        for k in range(nk):
+            kmq = (k - q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    de = enk[k, a] - enk[kmq, b]
+                    scale = max(1.0, abs(enk[k, a]), abs(enk[kmq, b]))
+                    if abs(de) > 64.0 * np.finfo(np.float64).eps * scale:
+                        divided = (occ_mp1[k, a] - occ_mp1[kmq, b]) / de
+                    else:
+                        divided = -0.5 * (surface[k, a] + surface[kmq, b])
+                    M = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    want_static[q] += divided * np.outer(M, np.conj(M))
+    want_static /= np.sqrt(float(nk))
+    err_s = float(np.max(np.abs(got_static - want_static)))
+    rel_s = err_s / max(float(np.max(np.abs(want_static))), 1.0e-300)
+
+    # W1.a-2 consistency: the exact-static value stored in the shifted
+    # origin slot differs from chi(i*varpi_1) by O((varpi_1/gap)^2) at
+    # finite q.  Resolvent oracle, finite-q row q=1.
+    varpi1 = 2.0e-5
+
+    def _resolvent(z, q):
+        out = np.zeros((nmu, nmu), np.complex128)
+        for k in range(nk):
+            kmq = (k - q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    delta = enk[kmq, b] - enk[k, a]
+                    fdiff = occ_mp1[k, a] - occ_mp1[kmq, b]
+                    if fdiff == 0.0 and delta == 0.0:
+                        continue
+                    M = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    out += (fdiff / (z - delta)) * np.outer(M, np.conj(M))
+        return out / np.sqrt(float(nk))
+
+    shift_rel = (
+        np.max(np.abs(_resolvent(1j * varpi1, 1) - _resolvent(0.0, 1)))
+        / np.max(np.abs(_resolvent(0.0, 1))))
+    if rank == 0:
+        print(
+            "[fractional-chi] static finite-q max_rel={:.3e}; "
+            "origin-shift consistency (q=1) rel={:.3e}".format(
+                rel_s, shift_rel),
+            flush=True,
+        )
+    if rel_s > 5.0e-12:
+        raise AssertionError("finite-q static divided-difference mismatch")
     multihost_utils.sync_global_devices("fractional_chi_gate_pass")
 
 

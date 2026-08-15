@@ -301,3 +301,262 @@ def test_static_fractional_gamma_matches_divided_difference():
                 want += divided * np.outer(density, np.conj(density))
     want /= np.sqrt(float(enk.shape[0]))
     np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
+
+
+def _mp1_tables(enk, mu, width):
+    """Consistent (f, -df/dE) tables from the production MP1 helpers."""
+    from gw import efermi
+
+    f = np.asarray(jax.device_get(efermi.mp1_occupations(enk, mu, width)))
+    s = np.asarray(jax.device_get(
+        efermi.mp1_negative_derivative(enk, mu, width)))
+    return f, s
+
+
+def _dense_static_finite_q(psi, enk, occ, surface, kminq_rows):
+    """Divided-difference oracle: a at k, b at k-q, MP1 midpoint diagonal."""
+    n_q = kminq_rows.shape[0]
+    nk, nb = enk.shape
+    nmu = psi.shape[-1]
+    out = np.zeros((n_q, nmu, nmu), np.complex128)
+    for j in range(n_q):
+        for k in range(nk):
+            kmq = int(kminq_rows[j, k])
+            for a in range(nb):
+                for b in range(nb):
+                    de = enk[k, a] - enk[kmq, b]
+                    scale = max(1.0, abs(enk[k, a]), abs(enk[kmq, b]))
+                    if abs(de) > 64.0 * np.finfo(np.float64).eps * scale:
+                        divided = (occ[k, a] - occ[kmq, b]) / de
+                    else:
+                        divided = -0.5 * (surface[k, a] + surface[kmq, b])
+                    density = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    out[j] += divided * np.outer(density, np.conj(density))
+    return out / np.sqrt(float(nk))
+
+
+def test_static_fractional_finite_q_matches_divided_difference():
+    """The finite-q static kernel: b rides at k-q; Gamma row = Gamma kernel.
+
+    Scope: CPU emulated mesh, 3-point 1-D k grid.  The production wedge-row
+    to kq_map-column alignment is asserted separately by the Gamma-identity
+    refusal in gw.mpa.model._metal_kminq_rows and lands numerically at the
+    R2 BGW comparison.
+    """
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260815)
+    nk, nb, ns, nmu = 3, 4, 2, 4
+    psi = (rng.normal(size=(nk, nb, ns, nmu))
+           + 1j * rng.normal(size=(nk, nb, ns, nmu)))
+    enk = np.array([
+        [-1.3, -0.4, 0.20, 1.1],
+        [-1.1, -0.2, 0.20, 1.4],
+        [-1.4, -0.1, 0.70, 1.2],
+    ])  # E[0,2] == E[1,2]: a degenerate (k, k-q) pair at q=2 exercises
+    # the -df/dE midpoint limit at finite q.
+    mu, width = 0.15, 0.08
+    occ, surface = _mp1_tables(enk, mu, width)
+    slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
+    wfns = Wavefunctions(
+        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
+        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
+        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
+        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        enk=_put(enk, mesh, P(None, None)),
+        occ=_put(occ, mesh, P(None, None)),
+        slices=slices,
+    )
+    state = SimpleNamespace(
+        f_kn=occ, mu_ry=mu, smearing_family="mp1", smearing_width_ry=width)
+    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
+
+    got = w_isdf.compute_chi0_static_fractional(
+        wfns, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+        occupation_state=state, kminq_rows=kminq)
+    got = np.asarray(jax.device_get(got))
+    want = _dense_static_finite_q(psi, enk, occ, surface, kminq)
+    np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
+
+    # The refactored Gamma kernel and the finite-q kernel with an identity
+    # map are the same computation (value-level parity of the shared body).
+    gamma = w_isdf.compute_chi0_static_fractional_gamma(
+        wfns, enk, occ, surface,
+        SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh, nb_logical=nb)
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(gamma))[0], got[0], rtol=1e-13, atol=1e-13)
+
+    with pytest.raises(ValueError, match="static_fractional_needs_mp1"):
+        w_isdf.compute_chi0_static_fractional(
+            wfns, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+            occupation_state=SimpleNamespace(
+                f_kn=occ, mu_ry=mu, smearing_family="fixed",
+                smearing_width_ry=0.0),
+            kminq_rows=kminq)
+
+
+def test_origin_row_static_value_bounds_the_shifted_sample():
+    """W1.a-2: |chi(i*varpi1) - chi(0)| at finite q obeys the resolvent bound.
+
+    Pure-numpy resolvent oracles; the deck-level 4e-8 Na number is rung R2's.
+    """
+    rng = np.random.default_rng(20260815)
+    nk, nb, ns, nmu = 3, 4, 1, 3
+    psi = (rng.normal(size=(nk, nb, ns, nmu))
+           + 1j * rng.normal(size=(nk, nb, ns, nmu)))
+    enk = np.array([
+        [-1.3, -0.4, 0.2, 1.1],
+        [-1.1, -0.2, 0.5, 1.4],
+        [-1.4, -0.1, 0.7, 1.2],
+    ])
+    occ = np.array([
+        [1.0, 0.82, 0.10, 0.0],
+        [1.0, 0.61, 0.25, 0.0],
+        [1.0, 0.74, -0.01, 0.0],
+    ])
+    varpi1 = 2.0e-5
+    q = 1
+
+    def resolvent(z):
+        out = np.zeros((nmu, nmu), np.complex128)
+        for k in range(nk):
+            kmq = (k - q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    delta = enk[kmq, b] - enk[k, a]
+                    fdiff = occ[k, a] - occ[kmq, b]
+                    if fdiff == 0.0 and delta == 0.0:
+                        continue
+                    density = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    out += (fdiff / (z - delta)) * np.outer(
+                        density, np.conj(density))
+        return out / np.sqrt(float(nk))
+
+    static = resolvent(0.0)
+    shifted = resolvent(1j * varpi1)
+    rel = np.max(np.abs(shifted - static)) / np.max(np.abs(static))
+    gaps = []
+    for k in range(nk):
+        kmq = (k - q) % nk
+        for a in range(nb):
+            for b in range(nb):
+                if occ[k, a] != occ[kmq, b]:
+                    gaps.append(abs(enk[kmq, b] - enk[k, a]))
+    # On a random (non-TRS) fixture the O(varpi) term survives, so the
+    # honest bound here is linear; the quadratic (varpi/(q*v_F))**2 claim
+    # holds for TRS-even physical spectra and is rung R2's deck-level
+    # measurement.
+    bound = varpi1 / min(gaps)
+    assert rel <= 10.0 * bound, (rel, bound)
+    assert rel > 0.0  # the bound is measuring something
+
+
+def test_occupation_support_bandwidth_keeps_the_overshoot_edge():
+    """An MP1 overshoot band at the f-support edge widens the bandwidth.
+
+    The overshoot (f = -0.01, exactly nonzero) sits at the LOWEST band, so
+    dropping it is what a tolerance-based support would do -- and would
+    shrink the bandwidth by 1 Ry.  The no-slop rule keeps it.
+    """
+    enk = np.array([[-3.0, -2.0, 0.0, 1.0, 2.0]])
+    occ = np.array([[-0.01, 1.0, 0.5, 0.0, 0.0]])
+    got = w_isdf.occupation_support_bandwidth(enk, occ)
+    assert got == 2.0 - (-3.0)
+    trimmed = occ.copy()
+    trimmed[0, 0] = 0.0  # what clipping would have produced
+    assert w_isdf.occupation_support_bandwidth(enk, trimmed) == 2.0 - (-2.0)
+
+
+def test_metal_plan_dispatch_census(monkeypatch):
+    """Every metal point reaches its metal kernel; insulators are untouched.
+
+    Fails if any metal line point reaches compute_chi0_contour or any metal
+    existing point reaches compute_chi0 -- the exact bug W1 closes.
+    """
+    from gw.mpa import model, sample_plan
+
+    calls = []
+
+    def _fake(name, wedge=False):
+        def _f(*args, **kwargs):
+            calls.append(name)
+            class _Chi:
+                def at(self, *a):  # pragma: no cover - override path unused
+                    raise AssertionError("no override in census")
+                block_until_ready = staticmethod(lambda: None)
+            return np.zeros((3, 2, 2), np.complex128) if wedge else \
+                np.zeros((3, 2, 2), np.complex128)
+        return _f
+
+    monkeypatch.setattr(w_isdf, "compute_chi0", _fake("insulating_static"))
+    monkeypatch.setattr(
+        w_isdf, "compute_chi0_contour", _fake("insulating_contour"))
+    monkeypatch.setattr(
+        w_isdf, "compute_chi0_contour_fractional",
+        _fake("fractional_contour"))
+    monkeypatch.setattr(
+        w_isdf, "compute_chi0_static_fractional", _fake("static_dd", True))
+    monkeypatch.setattr(
+        w_isdf, "occupation_support_bandwidth", lambda *a, **k: 3.0)
+
+    written = []
+    quad = SimpleNamespace(x_max=1.5)
+    config = SimpleNamespace(
+        mpa=SimpleNamespace(material_class="metal"),
+        minimax_config=SimpleNamespace(target_error=1e-6, max_nodes=64))
+    state = SimpleNamespace(
+        f_kn=np.array([[1.0, 0.5, 0.0]]), mu_ry=0.1,
+        smearing_family="mp1", smearing_width_ry=0.04)
+    plan = sample_plan.mpa_plan(
+        3, 1.5, material_class="metal", energy_unit="Ry")
+    routes = sample_plan.plan_routes(plan)
+
+    model._evaluate_samples(
+        SimpleNamespace(enk=np.array([[0.0]]), occ=None), routes, quad,
+        config, meta=None, mesh_xy=None, energy_reference=0.0,
+        occupation_state=state,
+        write_full=lambda p, chi: written.append(("full", p["role"])),
+        write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
+        static_gamma_override=None, gamma_row=None,
+        kminq_rows=np.zeros((3, 1), np.int32))
+
+    assert "insulating_static" not in calls
+    assert "insulating_contour" not in calls
+    assert calls.count("static_dd") == 1
+    roles = {role: kind for kind, role in written}
+    assert roles.get("near_00") == "wedge"
+    assert all(kind == "full" for kind, role in written if role != "near_00")
+    # 2*n_p points total, every one written exactly once
+    assert len(written) == 6
+
+    # Insulating census: only the historical kernels fire.
+    calls.clear()
+    written.clear()
+    config_i = SimpleNamespace(
+        mpa=SimpleNamespace(material_class="insulator"),
+        minimax_config=SimpleNamespace(target_error=1e-6, max_nodes=64))
+    monkeypatch.setattr(
+        "gw.minimax_screening.build_imag_quadrature",
+        lambda *a, **k: quad)
+    plan_i = sample_plan.mpa_plan(
+        3, 1.5, material_class="insulator", energy_unit="Ry")
+    model._evaluate_samples(
+        SimpleNamespace(enk=np.array([[0.0]]), occ=None),
+        sample_plan.plan_routes(plan_i), quad, config_i, meta=None,
+        mesh_xy=None, energy_reference=0.0, occupation_state=None,
+        write_full=lambda p, chi: written.append(("full", p["role"])),
+        write_wedge=lambda p, chi: written.append(("wedge", p["role"])),
+        static_gamma_override=None, gamma_row=None, kminq_rows=None)
+    assert "fractional_contour" not in calls
+    assert "static_dd" not in calls
+    assert len(written) == 6
+
+    # A metal plan with no occupations refuses by name.
+    with pytest.raises(ValueError, match="mpa_metal_needs_occupations"):
+        model._evaluate_samples(
+            SimpleNamespace(enk=None, occ=None), routes, quad, config,
+            meta=None, mesh_xy=None, energy_reference=0.0,
+            occupation_state=None,
+            write_full=lambda p, chi: None, write_wedge=lambda p, chi: None,
+            static_gamma_override=None, gamma_row=None, kminq_rows=None)
