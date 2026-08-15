@@ -1225,6 +1225,43 @@ the two codes do not order k the same way" — the same fingerprint class as
 `eqp.dat` carries coordinates in its headers, so a coordinate join is
 available on both sides.
 
+### MEASURED: how non-orbit-closed the Si production centroid set actually is
+
+2026-08-15, `refactor/eqp-ibz-2026-08-15`, Si production deck
+(`cohsex_si_test.in`, 960 literal centroids, 4x4x4, 64 k / 8 wedge).
+Star spread — the worst per-band max-min of Re diag Sigma_tot between
+members of one star — as a function of how many leading bands are
+included:
+
+| bands | star spread |
+|-------|-------------|
+| `[:8]`  |  0.9796 meV |
+| `[:16]` |  **2.6111 meV** |
+| `[:24]` |  7.2668 meV |
+| `[:32]` |  7.5926 meV |
+| `[:40]` | 10.0203 meV |
+| `[:60]` | **41.3376 meV** |
+
+`bands[:16] = 2.6111` reproduces the historical figure exactly — that is
+the whole scope the BerkeleyGW anchor fixture covers, and therefore the
+only part anyone had ever measured.  **The violation keeps growing with
+band index, to 41.3 meV over the deck's full 60-band sigma window**, i.e.
+sixteen times what the old scope could see.
+
+This is NOT a defect entry: the deck is documented as using a literal,
+non-orbit-closed 960-point centroid set, so the ISDF quadrature genuinely
+breaks the 48-op point group and a nonzero spread is expected
+(`tests/regression/si_cohsex_debug/README.md`, "Known defects"; the
+orbit-closed 144-point fast deck measures exactly 0.000).  What is new is
+the SIZE and the band dependence, which nobody had, because the metric
+was scoped to the fixture's 16 bands.  Anyone reopening the
+orbit-closure question wants this table: the cost of the non-closed set
+is concentrated in the conduction bands, not spread evenly.
+
+Reproduce: the writer now emits `# star_spread_ev_per_band` into
+`sigma_diag.dat`, so the ladder is readable off any run's output without
+instrumenting anything.
+
 ### Aside: `_assert_matches_reference`'s "BYTE-IDENTICAL" branch is unreachable
 
 Noticed while re-freezing.  `tests/test_gw_jax_regression.py:140` reports

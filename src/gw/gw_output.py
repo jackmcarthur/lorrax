@@ -1083,29 +1083,43 @@ def _warn_on_unphysical_h0(
 # ---------------------------------------------------------------------------
 
 def _star_spread_of_sigma_diag(sigma_tot_kij_ev, k_star_labels):
-    """(worst per-band max−min of Re diag Σ_tot within a star, n members).
+    """Per-band star spread of Re diag Σ_tot, plus its max and n members.
+
+    Returns ``(per_band (nb,), worst, n_members)``, all in eV, or
+    ``(None, None, None)`` when no labels are supplied — "not measured"
+    and "measured zero" are the two things this diagnostic must never
+    confuse, so the caller then writes no header line rather than a zero.
 
     ``k_star_labels`` is ``sym.irr_idx_k`` — the SERVICE's table, one
     star label per full-BZ k.  Grouping by it is reading that table, not
     reconstructing a star: no coordinates are compared, no symmetry
     operation is applied, and no tolerance appears anywhere below.
 
-    Definition kept bit-for-bit from ``tests/harness.py``'s
-    ``_star_spread`` so the recorded number stays comparable with every
-    figure already in the record (2.611 meV on the production anchor,
-    0.000 on the orbit-closed 144-point set): max−min across a star's
-    members, per band, worst over bands and stars, of the REAL DIAGONAL.
+    PER BAND, AND THAT IS THE POINT.  The quantity is max−min across a
+    star's members, per band, of the REAL DIAGONAL.  Reducing it to a
+    single max HERE was wrong: the band SCOPE belongs to the consumer,
+    not the producer.  ``tests/harness.py``'s metric has always been
+    scoped to the bands its BerkeleyGW fixture covers (16 on the Si
+    anchor), while this driver's sigma window is whatever the deck asks
+    for (60 on the same deck) — so a producer-side max silently answered
+    a wider question than the gate was asking.  Measured on that deck:
 
-    Returns ``(None, None)`` when no labels are supplied — the caller
-    then writes no header line rather than a zero, because "not measured"
-    and "measured zero" are the two things this diagnostic must never
-    confuse.  Its documented blindness is unchanged and stated at the
-    header line: conjugating a Hermitian block leaves the real diagonal
-    exactly intact, so the TRS class is asked in
-    ``tests/test_star_offdiag_gate.py`` instead.
+        bands[:8]  0.9796   bands[:16]  2.6111   bands[:24]  7.2668
+        bands[:32] 7.5926   bands[:40] 10.0203   bands[:60] 41.3376   (meV)
+
+    ``bands[:16] = 2.6111`` reproduces the historical figure exactly, so
+    the physics was never in question; only the scope was.  Emitting the
+    vector lets each consumer take the max over the bands it actually
+    compares, and would have made that diagnosable by reading the file
+    instead of by bisecting a band ladder.
+
+    The max is emitted beside it because that is what a human reads at a
+    glance.  Its documented blindness is unchanged: conjugating a
+    Hermitian block leaves the real diagonal exactly intact, so the TRS
+    class is asked in ``tests/test_star_offdiag_gate.py`` instead.
     """
     if k_star_labels is None:
-        return None, None
+        return None, None, None
     labels = np.asarray(k_star_labels)
     diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
     if labels.shape[0] != diag.shape[0]:
@@ -1113,13 +1127,14 @@ def _star_spread_of_sigma_diag(sigma_tot_kij_ev, k_star_labels):
             f"k_star_labels has {labels.shape[0]} entries but Sigma has "
             f"{diag.shape[0]} k-rows — the star table and the self-energy "
             f"are on different k-sets.")
-    worst, n_members = 0.0, 0
+    per_band = np.zeros(diag.shape[1], dtype=np.float64)
+    n_members = 0
     for lab in np.unique(labels):
         rows = diag[labels == lab]
         n_members += int(rows.shape[0])
         if rows.shape[0] > 1:
-            worst = max(worst, float((rows.max(0) - rows.min(0)).max()))
-    return worst, n_members
+            per_band = np.maximum(per_band, rows.max(0) - rows.min(0))
+    return per_band, float(per_band.max(initial=0.0)), n_members
 
 
 def write_results(
@@ -1280,17 +1295,26 @@ def write_results(
     # arrays, against the service's OWN star labels (``sym.irr_idx_k``),
     # and recorded in the file's header for the consumer to read.
     #
+    # PER BAND, not as one number: the band SCOPE is the consumer's
+    # knowledge, not the producer's.  ``compare_to_bgw`` compares only the
+    # bands its BerkeleyGW fixture covers; this driver's sigma window is
+    # whatever the deck asked for.  Emitting the vector lets the consumer
+    # take its own max; emitting only a producer-side max answered a wider
+    # question than the gate asked and read 41.34 meV where the gate's own
+    # scope reads 2.61.
+    #
     # That is strictly better than what it replaced: the harness grouped
     # k into stars by matching mean-field ENERGY vectors to 2e-3 eV — a
     # fingerprint that aliases whenever two stars are degenerate, and one
     # of the sites this branch is removing.
-    _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
+    _spread_per_band, _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
         sx_out + corr_out, k_star_labels)
 
     write_sigma_to_file(
         sx_out[irr_idx],
         sigma_diag_file,
         star_spread_ev=_star_spread_ev,
+        star_spread_per_band_ev=_spread_per_band,
         n_star_members=_nstar,
         sigma_coh_kij_eV=corr_out[irr_idx],
         hartree_kij_eV=sig_h_out[irr_idx],

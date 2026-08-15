@@ -95,6 +95,7 @@ def write_sigma_to_file(
 	*,
 	kpoints_crys,
 	star_spread_ev=None,
+	star_spread_per_band_ev=None,
 	n_star_members=None,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
@@ -246,13 +247,24 @@ def write_sigma_to_file(
 		# check survives the file's move to the wedge.
 		if star_spread_ev is not None:
 			f.write(f"# star_spread_ev {float(star_spread_ev):.9e}   "
-			        f"# worst per-band max-min of Re diag {total_label} "
-			        f"within one star, over the {int(n_star_members)} "
-			        f"full-BZ k this wedge unfolds to.  BLIND TO THE TRS "
-			        f"CONJUGATION CLASS by construction (conjugating a "
-			        f"Hermitian block leaves its real diagonal intact) — "
-			        f"that question is gated in "
+			        f"# max over ALL {nbands} bands of the per-band max-min "
+			        f"of Re diag {total_label} within one star, over the "
+			        f"{int(n_star_members)} full-BZ k this wedge unfolds "
+			        f"to.  READ THE PER-BAND ROW BELOW, NOT THIS, IF YOU "
+			        f"COMPARE A BAND SUBSET: the band scope belongs to the "
+			        f"consumer, and this max answers the widest possible "
+			        f"question.  BLIND TO THE TRS CONJUGATION CLASS by "
+			        f"construction (conjugating a Hermitian block leaves "
+			        f"its real diagonal intact) — that question is gated in "
 			        f"tests/test_star_offdiag_gate.py\n")
+		if star_spread_per_band_ev is not None:
+			_pb = np.asarray(star_spread_per_band_ev, dtype=np.float64)
+			if _pb.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_per_band_ev has shape {_pb.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			f.write("# star_spread_ev_per_band "
+			        + " ".join(f"{float(v):.9e}" for v in _pb) + "\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
