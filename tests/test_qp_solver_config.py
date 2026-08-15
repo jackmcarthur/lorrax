@@ -117,24 +117,27 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_sc_defaults(tmp_path):
+    # ``accelerator`` left this record when ``sc_accelerator`` was retired
+    # (2026-08-14); rCROP is the only accelerator.  See test_staged_sc.py
+    # for the retirement's own cells.
     sc = _config(tmp_path).sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (20, 1.0e-4, "rcrop", 5, 1.0, None)
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (20, 1.0e-4, 5, 1.0, None)
+    assert not hasattr(sc, "accelerator")
 
 
 def test_sc_input_keys(tmp_path):
     sc = _config(
         tmp_path,
-        "sc_max_iter = 7\nsc_tol_ev = 1e-6\nsc_accelerator = linear\n"
+        "sc_max_iter = 7\nsc_tol_ev = 1e-6\n"
         "sc_history_depth = 3\nsc_mixing = 0.5\nsc_dump_dir = sc_hist\n").sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (7, 1.0e-6, "linear", 3, 0.5, "sc_hist")
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (7, 1.0e-6, 3, 0.5, "sc_hist")
 
 
 def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     monkeypatch.setenv("LORRAX_SC_MAX_ITER", "3")
     monkeypatch.setenv("LORRAX_SC_TOL_EV", "1e-10")
-    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
     monkeypatch.setenv("LORRAX_SC_DEPTH", "2")
     monkeypatch.setenv("LORRAX_SC_MIXING", "0.25")
     monkeypatch.setenv("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")
@@ -144,15 +147,25 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     sc = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
     ).sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (3, 1.0e-10, "linear", 2, 0.25,
-                                        "/tmp/sc_dump")
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (3, 1.0e-10, 2, 0.25, "/tmp/sc_dump")
     assert any("deprecated env override" in l for l in lines)
 
 
-def test_sc_bad_accelerator_rejected(tmp_path):
-    with pytest.raises(ValueError, match="sc_accelerator"):
-        _config(tmp_path, "sc_accelerator = bogus\n")
+def test_sc_accel_env_is_retired_and_announced(tmp_path, monkeypatch):
+    """``LORRAX_SC_ACCEL`` lost its reader with the deck key.
+
+    An env var that is read by nothing and silently changes nothing is
+    the same defect as a deck key with no reader, so the retirement is
+    ANNOUNCED rather than left to be discovered.
+    """
+    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
+    lines: list[str] = []
+    path = tmp_path / "cohsex_accel_env.in"
+    path.write_text(BASE_INPUT)
+    LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert any("LORRAX_SC_ACCEL" in l for l in lines)
 
 
 # ---------------------------------------------------------------------------
