@@ -315,6 +315,8 @@ if(LORRAX_FFI_HAVE_CUFFT)
     find_library(CUFFT_LIBRARY cufft
         PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
               "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+              "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64"
+              "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/lib"
         NO_DEFAULT_PATH)
     find_library(NVRTC_LIBRARY nvrtc
         PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
@@ -323,6 +325,8 @@ if(LORRAX_FFI_HAVE_CUFFT)
     find_path(CUFFT_INCLUDE_DIR cufft.h
         PATHS "${CUDA_TOOLKIT_ROOT}/include"
               "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+              "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/include"
+              "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include"
         NO_DEFAULT_PATH)
     find_path(NVRTC_INCLUDE_DIR nvrtc.h
         PATHS "${CUDA_TOOLKIT_ROOT}/include"

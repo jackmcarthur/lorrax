@@ -23,6 +23,12 @@ has not been exercised recently.*
   would need their own bring-up. Treat
   [transports](../transports.md) claims as Frontera-measured unless a
   jobid says otherwise.
+* An experimental **bare-host CUDA 13.2 lane** was brought up on 2026-08-14
+  (JID 56981024): JAX/JAXlib 0.9.1, cuSOLVERMp 0.9.1, cuBLASMp 0.10 and
+  cuFFT passed on a real four-process 2x2 A100 mesh.  This is a usable
+  module lane, not yet a replacement for the full Shifter lane: it contains
+  no device SLATE or parallel-HDF5 handlers.  Recipe and exact pins:
+  [`config/perlmutter/cuda13_module/`](../../../config/perlmutter/cuda13_module/).
 
 ## 1. Entry point: `lx` {#1-entry-point-lx}
 
@@ -189,6 +195,52 @@ MPI stack override: `LORRAX_MPI_TYPE=cray_shasta` (default) | `none` |
 GPU-aware Cray MPICH: the module sets `MPICH_GPU_SUPPORT_ENABLED=1` and
 preloads `libmpi_gtl_cuda.so.0` — Cray-specific; no OpenMPI/UCX
 equivalent exists for these two knobs.
+
+### Experimental bare-host CUDA 13.2 lane
+
+This lane keeps the toolchain in NERSC modules, which is the interface most
+Perlmutter users already know, and supplies only the pieces the module stack
+does not currently have at compatible versions:
+
+| component | source |
+|---|---|
+| CUDA compiler/runtime | NERSC `cudatoolkit/13.2` |
+| cuBLAS, cuSOLVER, cuFFT | NVHPC 26.5 `math_libs/13.2` |
+| NCCL 2.29.3 | NVHPC 26.5 `comm_libs/13.2` |
+| JAX/JAXlib/plugin 0.9.1 | `jax[cuda13-local]` in a private venv |
+| cuDNN 9.12 | one no-deps NVIDIA DSO wheel |
+| cuSOLVERMp 0.9.1 + cuBLASMp 0.10 | newest pinned no-deps NVIDIA wheels |
+
+`--no-deps` on the NVIDIA native wheels is part of the contract.  Without
+it, pip installs another CUDA runtime beside the module toolkit and the run
+is no longer a module-based CUDA stack.  NERSC's current cuDNN modules are
+CUDA-12 builds, so cuDNN is the one runtime DSO supplied privately.
+
+From a fresh scratch clone:
+
+```bash
+bash config/perlmutter/cuda13_module/setup_env.sh
+bash config/perlmutter/cuda13_module/build_ffi.sh
+bash config/perlmutter/cuda13_module/install_module.sh
+
+module load lorrax_C13
+LX_BASE_MODULE=lorrax_C13 lx doctor
+LX_BASE_MODULE=lorrax_C13 lx run -G 4 -n 4 \
+  python -u config/perlmutter/cuda13_module/verify_runtime.py
+```
+
+The FFI build uses direct GNU `gcc`/`g++`, not Cray's `cc` wrapper.  With
+`craype-accel-nvidia80` loaded, that wrapper injects the current CUDA-12
+`libmpi_gtl_cuda` into even CMake's compiler probe.  This lane is deliberately
+MPI-free—cuSOLVERMp communicates through NCCL—and sets
+`LORRAX_MPICH_GPU_SUPPORT=0`.  The build verifier asserts both properties.
+
+The installed personal module currently points at its scratch clone, so it
+is a development deployment and inherits scratch-purge lifetime.  A durable
+group deployment should set `LORRAX_CUDA13_ENV`, `LORRAX_CUDA13_NATIVE`, and
+`LORRAX_CUDA13_BUILD` to persistent prefixes before running all three scripts.
+It should not be called the full production lane until CUDA-13 SLATE and
+parallel-HDF5 handlers have their own four-GPU certification.
 
 ## 3. Multi-host topology
 
