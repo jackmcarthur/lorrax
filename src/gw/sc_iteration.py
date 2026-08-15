@@ -82,6 +82,164 @@ from .wavefunction_bundle import (
 
 
 # ---------------------------------------------------------------------------
+# Stage convergence: max-abs over the PROTECTED bands
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConvergenceVerdict:
+    """One stage-convergence decision, with the numbers it was made from.
+
+    ``max_abs_ev`` IS THE TEST; the two RMS figures are reported only.
+    They are carried together, and printed together, because they are
+    different tests and the looser one has historically been the one on
+    screen: "every band changes by less than the cutoff" is an
+    L-infinity statement over the protected set, and an RMS can sit
+    comfortably under a cutoff that a single band is far above.  On the
+    accepted Si run the reported band RMS was 2.6571 meV against a
+    5 meV cutoff, which says nothing at all about the worst band.
+    """
+
+    converged: bool
+    max_abs_ev: float        # L-inf over PROTECTED bands -- THE criterion
+    rms_protected_ev: float  # RMS over PROTECTED bands  -- reported only
+    rms_all_ev: float        # RMS over ALL active bands -- the legacy number
+    n_protected: int
+    n_total: int
+    worst_k: int
+    worst_band: int
+    cutoff_ev: float
+
+    def summary(self) -> str:
+        """The log line.  Says which number is the test and which is not."""
+        return (
+            f"max|ΔE| = {self.max_abs_ev:.6f} eV over {self.n_protected} "
+            f"non-scissored bands (CRITERION, cutoff {self.cutoff_ev:.6f} eV; "
+            f"worst k={self.worst_k} band={self.worst_band}) | "
+            f"RMS_protected = {self.rms_protected_ev:.6f} eV, "
+            f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
+            f"(diagnostics, NOT the criterion) | "
+            f"{'CONVERGED' if self.converged else 'not converged'}")
+
+
+def protected_band_convergence(
+    e_new_ev: np.ndarray,
+    e_prev_ev: np.ndarray,
+    protected_mask: np.ndarray,
+    in_range_mask: np.ndarray,
+    cutoff_ev: float,
+) -> ConvergenceVerdict:
+    """Has every NON-SCISSORED band moved by less than ``cutoff_ev``?
+
+    ``e_*_ev`` are ``(nk, nb_active)`` eV.  The test set is
+    ``protected_mask | in_range_mask`` — both taken from the
+    ITERATION-LOCAL :class:`~gw.band_partition.BandPartition`, never a
+    band-index window written down somewhere else.  A frozen window keeps
+    testing the bands that WERE in range; the set that matters is the one
+    this iteration actually treated as physical.
+
+    WHY THE UNION AND NOT ``protected_mask`` ALONE.  The partition is
+    THREE-way, and only the third category is scissored:
+    ``apply_band_partition`` replaces a diagonal with α·E_DFT + β exactly
+    where ``in_range_mask`` is False.  A band that is in range but NOT
+    protected keeps its own Σ-derived diagonal and merely loses its
+    off-diagonal mixing — it is a genuine independent degree of freedom
+    and belongs in the convergence test.  Today the two spellings agree,
+    because ``run_sc_driver`` builds the production partition as
+    ``BandPartition(protected_mask=in_range, in_range_mask=in_range)``,
+    but that agreement is a property of that ONE line rather than of this
+    predicate, and ``BandPartition`` permits a narrower protected set.
+
+    WHY SCISSORED BANDS ARE EXCLUDED.  Their energies are α·E_DFT + β
+    with α, β refitted each iteration FROM the in-range corrections, so a
+    scissored band moves only when the fit coefficients move.  Including
+    it would re-count the in-range drift through the fit rather than
+    measure anything new.
+
+    THE TEST IS L-INFINITY, NOT RMS.  "All these bands change by less
+    than the cutoff" is a statement about the worst band.  The RMS
+    figures come back in the verdict for reporting and are never compared
+    against the cutoff here.
+    """
+    e_new = np.asarray(e_new_ev, dtype=np.float64)
+    e_prev = np.asarray(e_prev_ev, dtype=np.float64)
+    if e_new.shape != e_prev.shape:
+        raise ValueError(
+            f"protected_band_convergence: energy shapes disagree, "
+            f"{e_new.shape} vs {e_prev.shape}.")
+    prot = np.asarray(protected_mask, dtype=bool).reshape(-1)
+    inr = np.asarray(in_range_mask, dtype=bool).reshape(-1)
+    for name, m in (("protected_mask", prot), ("in_range_mask", inr)):
+        if m.shape[0] != e_new.shape[1]:
+            raise ValueError(
+                f"protected_band_convergence: {name} has {m.shape[0]} "
+                f"bands but the energies have {e_new.shape[1]}.  The masks "
+                f"must be the iteration's own band partition over the SAME "
+                f"active window.")
+    mask = prot | inr
+
+    delta = np.abs(e_new - e_prev)
+    rms_all = float(np.sqrt(np.mean(delta ** 2)))
+    n_protected = int(mask.sum())
+    if n_protected == 0:
+        # Refuse rather than declare victory over the empty set: a
+        # partition with nothing protected AND nothing in range means the
+        # omega grid excluded every active band and every diagonal is a
+        # scissor value, so "max over {} < cutoff" is vacuously true.
+        raise ValueError(
+            "protected_band_convergence: the band partition leaves ZERO "
+            "non-scissored bands (protected | in_range is empty), so there "
+            "is no set to converge on -- every active band's diagonal would "
+            "be a scissor value.  Widen sigma_omega_min_ev / "
+            "sigma_omega_max_ev so some active band lies on the Sigma grid.")
+
+    d_prot = delta[:, mask]
+    max_abs = float(d_prot.max())
+    rms_prot = float(np.sqrt(np.mean(d_prot ** 2)))
+    flat = int(np.argmax(d_prot))
+    worst_k, worst_col = divmod(flat, d_prot.shape[1])
+    worst_band = int(np.flatnonzero(mask)[worst_col])
+    return ConvergenceVerdict(
+        converged=bool(max_abs < float(cutoff_ev)),
+        max_abs_ev=max_abs,
+        rms_protected_ev=rms_prot,
+        rms_all_ev=rms_all,
+        n_protected=n_protected,
+        n_total=int(e_new.shape[1]),
+        worst_k=int(worst_k),
+        worst_band=worst_band,
+        cutoff_ev=float(cutoff_ev),
+    )
+
+
+def stage_compute_mode(inputs: "SCInputs"):
+    """The Σ ansatz the CURRENT stage runs.
+
+    One reader for a fact with two possible sources, so a stage cannot
+    half-apply: ``inputs.compute_mode`` when the staged driver set it,
+    the deck's ``config.compute_mode`` otherwise.
+    """
+    mode = getattr(inputs, "compute_mode", None)
+    return inputs.config.compute_mode if mode is None else mode
+
+
+class _StageConverged(Exception):
+    """Internal: stop the rCROP solve because the STAGE cutoff was met.
+
+    rCROP's own ``tol`` is an L2 norm on the H residual (Ry); the stage
+    criterion is an L-infinity norm on protected EIGENVALUES (eV).  They
+    are not the same test and neither bounds the other, so the stage
+    criterion cannot be expressed as an ``rcrop_nojit`` tolerance and is
+    signalled out of ``residual_fn`` instead.  Carries the last state so
+    the caller does not have to reconstruct it.
+    """
+
+    def __init__(self, state: "SCState", verdict: ConvergenceVerdict):
+        super().__init__(verdict.summary())
+        self.state = state
+        self.verdict = verdict
+
+
+# ---------------------------------------------------------------------------
 # State + inputs
 # ---------------------------------------------------------------------------
 
@@ -134,6 +292,14 @@ class SCInputs:
     #: needs the whole grid (decisions.md, TRS veto scope).
     kstar: object | None = None
     print_fn: Callable = print
+    #: The Σ ansatz THIS STAGE runs.  ``None`` means "whatever the deck's
+    #: ``compute_mode`` says", which is what every pre-staging caller
+    #: wants and keeps the one-shot equivalence gate unchanged.  The
+    #: staged driver sets it per stage via ``dataclasses.replace``, which
+    #: is why the map reads :func:`stage_compute_mode` and not
+    #: ``config.compute_mode`` directly — those two disagree by design
+    #: from the moment a ladder has more than one rung.
+    compute_mode: object | None = None
 
 
 @dataclass(frozen=True)
@@ -1113,8 +1279,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Per-mode screening: solve W at every frequency the Σ scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     from .screening import compute_screening_model
+    _stage_mode = stage_compute_mode(inputs)
     W_by_role = compute_screening_model(
-        inputs.config.compute_mode, wfns_qp, inputs.V_q,
+        _stage_mode, wfns_qp, inputs.V_q,
         quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
         centroid_indices=inputs.centroid_indices, config=inputs.config,
         meta=inputs.meta, mesh_xy=inputs.mesh_xy,
@@ -1129,7 +1296,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # converged tensor is written once after run_self_consistency
     # returns (see ``dump_sigma_omega_h5_final``).
     sigma_result = compute_sigma_xc(
-        inputs.config.compute_mode,
+        _stage_mode,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
@@ -1234,7 +1401,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # map's pair safe to unlink.  The newest pair survives convergence for
     # restart/debugging; ordinary screening modes never enter this branch.
     from .gw_config import ComputeMode
-    if inputs.config.compute_mode is ComputeMode.MPA:
+    if _stage_mode is ComputeMode.MPA:
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
             os.path.join(inputs.input_dir, "tmp", "mpa"),
@@ -1426,8 +1593,11 @@ def run_self_consistency(
     accelerator: str = "rcrop",
     history_depth: int = 5,
     mixing: float = 1.0,
+    cutoff_ev: float | None = None,
+    clear_snapshots: bool = True,
+    snapshot_base: int = 0,
 ) -> tuple[SCState, list[float]]:
-    """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
+    """Iterate ``gw_iteration_map`` to ``max_iter`` or the stage cutoff.
 
     The iteration carry holds only ``H_qp_dft``; convergence is judged
     on the **eigenvalues** of consecutive H matrices (recomputed each
@@ -1436,6 +1606,12 @@ def run_self_consistency(
 
     Parameters
     ----------
+    cutoff_ev
+        The STAGE criterion: max |ΔE| over the NON-SCISSORED bands (eV),
+        i.e. over ``partition.protected_mask | partition.in_range_mask``.
+        ``None`` falls back to ``tol_ev``, which is what the one-shot
+        path passes.  See :func:`protected_band_convergence` — this is an
+        L-infinity test, NOT the band RMS that the progress lines report.
     accelerator
         ``"rcrop"`` (default) — Anderson-style restart-CROP acceleration
         from :mod:`mixing.acceleration`.  Order ``history_depth``.
@@ -1444,14 +1620,18 @@ def run_self_consistency(
         many bands near the gap (PPM ω-grid stiffness), which means a
         plain fixed-point hits a 2-cycle and even α=0.5 linear damping
         only shrinks the cycle amplitude rather than killing it.
-        ``"linear"`` — plain α-mixing with damping ``mixing``.  Useful
-        for diagnosis (very small α reaches the fixed point monotonically
-        but is slow).
+        ``"linear"`` — plain α-mixing with damping ``mixing``.  Reachable
+        only from a direct call now that ``sc_accelerator`` is retired;
+        kept as a diagnostic entry point.
     history_depth
         rCROP history depth (only used when ``accelerator="rcrop"``).
         ``m=5`` is BGW's QSGW default.
     mixing
         Linear damping coefficient when ``accelerator="linear"``.
+    clear_snapshots, snapshot_base
+        Stage bookkeeping: only stage 1 clears the previous run's
+        ``eqp0_iterNNNN.dat``, and each stage offsets its snapshot
+        indices so a later stage does not overwrite an earlier one's.
 
     Returns
     -------
@@ -1462,11 +1642,13 @@ def run_self_consistency(
         ``max_iter == 1`` (one-shot G0W0).
     """
     print_fn = inputs.print_fn
-    _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
+    if clear_snapshots:
+        _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
     _dump_dir = inputs.config.sc.dump_dir
+    _cutoff = float(tol_ev if cutoff_ev is None else cutoff_ev)
 
     # One-shot fast path: no acceleration needed.
     if max_iter == 1:
@@ -1478,7 +1660,7 @@ def run_self_consistency(
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
-            call_index=0, role="one_shot", rms_ev=rms,
+            call_index=snapshot_base, role="one_shot", rms_ev=rms,
             rms2_ev=float("nan"),
         )
         return state_new, []
@@ -1491,6 +1673,8 @@ def run_self_consistency(
             eigvalsh_kshard=eigvalsh_kshard,
             print_fn=print_fn,
             dump_dir=_dump_dir,
+            cutoff_ev=_cutoff,
+            snapshot_base=snapshot_base,
         )
     if accelerator == "linear":
         return _run_linear_mixing(
@@ -1499,6 +1683,8 @@ def run_self_consistency(
             eigvalsh_kshard=eigvalsh_kshard,
             print_fn=print_fn,
             dump_dir=_dump_dir,
+            cutoff_ev=_cutoff,
+            snapshot_base=snapshot_base,
         )
     raise ValueError(
         f"run_self_consistency: unknown accelerator={accelerator!r} "
@@ -1508,13 +1694,26 @@ def run_self_consistency(
 def _run_linear_mixing(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, mixing: float,
-    eigvalsh_kshard, print_fn, dump_dir,
+    eigvalsh_kshard, print_fn, dump_dir, cutoff_ev: float | None = None,
+    snapshot_base: int = 0,
 ) -> tuple[SCState, list[float]]:
-    """Plain α-mixing fixed point.  Diagnostic / fallback path."""
+    """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
+
+    Converges on the SAME criterion as the rCROP path — max|ΔE| over the
+    non-scissored bands.  It has to: this path exists to be compared
+    AGAINST rCROP (does the accelerator invent the answer?), and a
+    control that stops on a different test measures the two criteria
+    rather than the two accelerators.  Every iterate here is an accepted
+    iterate, so there is no trial/accepted distinction to make.
+    """
     state = state_init
     rms_history: list[float] = []
     E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
     _e_history: list[np.ndarray] = [E_prev_ev.copy()]
+    _protected = np.asarray(
+        inputs.partition.protected_mask, dtype=bool).reshape(-1)
+    _in_range = np.asarray(
+        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -1553,11 +1752,21 @@ def _run_linear_mixing(
         )
         _write_sc_eqp_snapshot(
             inputs, state_new, E_candidate_ev,
-            call_index=it, role="linear", rms_ev=rms, rms2_ev=rms2,
+            call_index=snapshot_base + it, role="linear",
+            rms_ev=rms, rms2_ev=rms2,
         )
+        verdict = protected_band_convergence(
+            E_new_ev, E_prev_ev, _protected, _in_range,
+            tol_ev if cutoff_ev is None else cutoff_ev)
+        print_fn(f"    SC stage check: {verdict.summary()}")
         state = state_new
         E_prev_ev = E_new_ev
-        if rms < tol_ev:
+        # SAME CRITERION AS rCROP.  This used to break on ``rms < tol_ev``
+        # -- an RMS over ALL active bands, including the scissored ones,
+        # which is both the looser test and a different set.  See the
+        # ``_run_rcrop`` note: the all-band RMS ran 5.8x under max|ΔE| on
+        # the measured Si deck.
+        if verdict.converged:
             break
 
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
@@ -1568,6 +1777,7 @@ def _run_rcrop(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
     eigvalsh_kshard, print_fn, dump_dir,
+    cutoff_ev: float | None = None, snapshot_base: int = 0,
 ) -> tuple[SCState, list[float]]:
     """rCROP (Anderson-style) accelerated fixed point.
 
@@ -1723,6 +1933,19 @@ def _run_rcrop(
     _last_outputs: list = [None]
     _iter_idx = [0]
     rms_history: list[float] = []
+    # THE STAGE CRITERION runs on the ACCEPTED-ITERATE sequence, not on
+    # every map call.  rCROP makes two calls per iteration (a trial step
+    # and the real-residual evaluation); a trial can land close to its
+    # predecessor without the iterate having converged, so testing every
+    # call would stop the stage on a diagnostic.  ``role`` below is the
+    # existing name for that distinction and this reuses it rather than
+    # inventing a second one.
+    _protected = np.asarray(
+        inputs.partition.protected_mask, dtype=bool).reshape(-1)
+    _in_range = np.asarray(
+        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
+    _accepted_e: list[np.ndarray] = [_e_history[0].copy()]
+    _verdicts: list[ConvergenceVerdict] = []
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -1746,7 +1969,12 @@ def _run_rcrop(
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
         # this cell is refilled below and the loop exits with it.
         _last_outputs[0] = None
-        state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
+        # ``snapshot_base`` offsets the iteration too, not just the text
+        # snapshot index.  ``gw_iteration_map`` labels its on-disk
+        # screening artifacts ``sc_{iteration:04d}`` (the MPA fit/W pair
+        # under tmp/mpa), so a second stage restarting the count at 0
+        # would write over the first stage's files.
+        state_in = SCState(H_qp_dft=H, iteration=snapshot_base + _iter_idx[0])
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
         # Track per-call eigenvalue RMS so the user sees progress in the
@@ -1768,9 +1996,28 @@ def _run_rcrop(
                 "trial" if call_index % 2 else "accepted_input_map")
         _write_sc_eqp_snapshot(
             inputs, state_out, E_new,
-            call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
+            call_index=snapshot_base + call_index, role=role,
+            rms_ev=rms, rms2_ev=rms2,
         )
         _iter_idx[0] += 1
+        # Stage criterion on the accepted-iterate sequence only.
+        if cutoff_ev is not None and role != "trial":
+            verdict = protected_band_convergence(
+                E_new, _accepted_e[-1], _protected, _in_range, cutoff_ev)
+            _accepted_e.append(E_new.copy())
+            _verdicts.append(verdict)
+            print_fn(f"    SC stage check: {verdict.summary()}")
+            if verdict.converged and len(_accepted_e) > 2:
+                # ``> 2`` because the first accepted check compares the
+                # map's output against the DFT starting eigenvalues, which
+                # is a measure of the FIRST correction, not of a fixed
+                # point: a deck whose G0W0 shift is small everywhere would
+                # otherwise "converge" before a second Sigma was ever built.
+                raise _StageConverged(
+                    SCState(H_qp_dft=state_out.H_qp_dft,
+                            iteration=_iter_idx[0],
+                            outputs=state_out.outputs),
+                    verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
     # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
@@ -1781,20 +2028,84 @@ def _run_rcrop(
     tol_ry = tol_ev / RYD_TO_EV
     tol_resid = float(np.sqrt(n_elem)) * tol_ry
 
-    result = rcrop_nojit(
-        residual_fn,
-        # THE CARRY ITSELF, not a flattened copy of it.
-        x0,
-        m=history_depth,
-        maxit=max_iter,
-        tol=tol_resid,
-        print_fn=None,  # we print our own RMS-ΔE history above
-        entry_sharding=entry_sh,
-    )
+    # WHO OWNS CONVERGENCE.  When a stage cutoff governs, the L-infinity
+    # eigenvalue test is the SOLE authority and rCROP's own L2-on-H
+    # tolerance is disarmed (tol = 0), leaving the iteration budget as the
+    # only other stop.
+    #
+    # This is not tidiness.  MEASURED on the Si 4x4x4 SOC deck at P=4
+    # (runs/Si/01_staged_sc_2026-08-14/logs/probe_p4_newso.log): with the
+    # residual tolerance armed, rCROP returned `converged=True` after 2
+    # iterations at ‖f‖₂ = 2.3618e-02 Ry (its threshold being
+    # √36864 · 2 meV/RYD_TO_EV = 2.82e-02) at the very call where the
+    # stage check read max|ΔE| = 0.120477 eV over the protected bands --
+    # SIXTY TIMES the 2 meV cutoff.  The docstring above converts between
+    # the two with "≈", and that ≈ is doing far more work than it looks:
+    # a per-element RMS over an (nk, nb, nb) OPERATOR is not a bound on
+    # the largest eigenvalue shift, so a stage that trusted it would stop
+    # early and report a converged label.  Leaving both armed would also
+    # make the stop reason ambiguous, which is how "converged" comes to
+    # mean "one of two different things, and the log does not say which".
+    if cutoff_ev is not None:
+        tol_resid = 0.0
+
+    try:
+        result = rcrop_nojit(
+            residual_fn,
+            # THE CARRY ITSELF, not a flattened copy of it.
+            x0,
+            m=history_depth,
+            maxit=max_iter,
+            tol=tol_resid,
+            print_fn=None,  # we print our own RMS-ΔE history above
+            entry_sharding=entry_sh,
+        )
+    except _StageConverged as stop:
+        # The STAGE criterion fired inside the map.  Return the accepted
+        # iterate that met it, NOT rCROP's internal x: the two differ by
+        # one trial step and only this one has an SCOutputs to hand the
+        # writers.  The pad-inertness check below is skipped with the
+        # solver's x, and said so rather than silently.
+        print_fn(
+            f"  SC rCROP stopped by the stage criterion after "
+            f"{_iter_idx[0]} map calls: {stop.verdict.summary()}")
+        print_fn(
+            "  SC rCROP pad inertness: NOT CHECKED (early stop -- the "
+            "check reads the solver's final x, which this path does not "
+            "reach)")
+        _maybe_dump_e_history(dump_dir, _e_history, print_fn)
+        return stop.state, rms_history
+
     print_fn(
         f"  SC rCROP done: {result.iterations} iterations, "
         f"converged={bool(result.converged)}, "
         f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry")
+    if cutoff_ev is not None:
+        # NAME THE STOP REASON.  Reaching here at all means the stage
+        # criterion did NOT fire (that path raises), so the only honest
+        # readings are "budget exhausted" or "the solver stopped itself" --
+        # and with tol_resid disarmed above the second should be
+        # unreachable.  Say which, rather than assuming the budget: an
+        # earlier revision printed "exhausted its 5-iteration budget" over
+        # a solve that had run 2 iterations and stopped on its own
+        # residual, which is a false account of why the run ended.
+        _stopped_early = (bool(result.converged)
+                          or int(result.iterations) < int(max_iter))
+        _why = (f"the rCROP solver stopped itself after "
+                f"{int(result.iterations)} of {max_iter} iterations "
+                f"(converged={bool(result.converged)}, "
+                f"‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry)"
+                if _stopped_early else
+                f"it exhausted its {max_iter}-iteration budget")
+        if _verdicts:
+            print_fn(
+                f"  SC stage did NOT meet its cutoff -- {_why}: "
+                f"{_verdicts[-1].summary()}")
+        else:
+            print_fn(
+                f"  SC stage: no accepted-iterate check was reached "
+                f"({_why}); too few map calls to compare two accepted "
+                f"iterates")
 
     # INERTNESS, CHECKED — a DIFFERENT claim from the parity one at the top
     # of this function, and this pair has been measured to come apart: the
@@ -1847,6 +2158,164 @@ def _maybe_dump_e_history(
             f"{dump_dir}/e_history_kn_ev.npy (shape (map, k, n))"
         )
     barrier("sc.e_history.write", print_fn=print_fn)
+
+
+def run_staged_self_consistency(
+    state_init: SCState,
+    inputs: SCInputs,
+    *,
+    stages,
+    history_depth: int = 5,
+    mixing: float = 1.0,
+) -> tuple[SCState, list[float], list[dict]]:
+    """Run the self-consistency LADDER: each stage to its own cutoff.
+
+    Every stage iterates its own Σ ansatz to its own max-abs-over-
+    protected-bands cutoff, and the next stage starts from the previous
+    one's converged carry — which is the whole point of the ladder.  A
+    cheap scheme (GN-PPM) reaches the fixed point first, so the
+    expensive one (MPA) starts near it and pays for fewer of its own
+    iterations.
+
+    The carry that crosses a stage boundary is ``H_qp_dft`` and nothing
+    else, exactly as it is WITHIN a stage: everything derived (E, U,
+    E_F) is recomputed by the next stage's first eigh, so no stale
+    eigenvector can be carried across a change of self-energy.
+
+    Returns ``(state_final, rms_history, stage_records)``, where each
+    record is a dict of that stage's mode, cutoff, map-call count and
+    wall time — the numbers the staged-vs-unstaged comparison is made
+    from, captured here rather than re-derived from a log.
+    """
+    import dataclasses
+    import time as _time
+
+    if not stages:
+        # Refuse here rather than let the loop run zero times: the caller
+        # would then read ``state.outputs.sigma_result`` off the UNTOUCHED
+        # initial state, whose ``outputs`` is None, and get an
+        # AttributeError several frames away from the actual cause.
+        raise ValueError(
+            "run_staged_self_consistency: the stage ladder is empty, so no "
+            "self-energy would ever be built.  ``SCConfig.stages`` is "
+            "populated by ``gw_config.resolve_sc_stages``; a directly "
+            "constructed SCConfig must pass it explicitly.")
+    print_fn = inputs.print_fn
+    state = state_init
+    rms_history: list[float] = []
+    records: list[dict] = []
+    call_offset = 0
+
+    for idx, stage in enumerate(stages, start=1):
+        print_fn(
+            f"  ── SC stage {idx}/{len(stages)}: {stage.mode.value}, "
+            f"cutoff {stage.cutoff_ev * 1e3:g} meV (max|ΔE| over protected "
+            f"bands), <= {stage.max_iter} iterations ──")
+        # THE ONLY THING THAT CHANGES PER STAGE -- but it has to change in
+        # BOTH places the mode is read from, which is the whole lesson of
+        # this function.
+        #
+        #   (a) ``SCInputs.compute_mode`` is what ``stage_compute_mode``
+        #       hands to ``compute_screening_model`` / ``compute_sigma_xc``
+        #       / the MPA retention branch.
+        #   (b) ``config.compute_mode`` is what the KERNELS BELOW those
+        #       entry points read for themselves.
+        #
+        # Setting only (a) half-applies the stage, and it fails in exactly
+        # the configuration this feature exists for: MEASURED on the
+        # gn_ppm -> mpa ladder, stage 1 dispatched correctly to the PPM
+        # pipeline and then died inside it --
+        # ``ppm_pipeline.py:197-204``, "compute_mode = mpa is not a
+        # plasmon-pole model", because ``compute_ppm_sigma_pipeline``
+        # re-reads ``config.compute_mode`` rather than trusting the mode
+        # its caller resolved.  A single-scheme ladder cannot show this:
+        # there the deck's mode and the stage's mode agree, so both arms
+        # of the run are silently consistent and the bug is invisible.
+        #
+        # So the stage replaces the mode ON THE CONFIG too.  ``compute_mode``
+        # is a property over ``compute_mode_raw``, so writing the raw field
+        # makes every downstream reader -- including ones this module has
+        # never heard of -- see the stage's mode.
+        stage_config = dataclasses.replace(
+            inputs.config, compute_mode_raw=stage.mode.value)
+        stage_inputs = dataclasses.replace(
+            inputs, compute_mode=stage.mode, config=stage_config)
+        t0 = _time.perf_counter()
+        state, stage_rms = run_self_consistency(
+            state, stage_inputs,
+            max_iter=stage.max_iter,
+            tol_ev=stage.cutoff_ev,
+            cutoff_ev=stage.cutoff_ev,
+            accelerator="rcrop",
+            history_depth=history_depth,
+            mixing=mixing,
+            clear_snapshots=(idx == 1),
+            snapshot_base=call_offset,
+        )
+        wall = _time.perf_counter() - t0
+        rms_history.extend(stage_rms)
+        records.append({
+            "stage": idx,
+            "mode": stage.mode.value,
+            "cutoff_ev": float(stage.cutoff_ev),
+            "max_iter": int(stage.max_iter),
+            "map_calls": len(stage_rms),
+            "wall_s": float(wall),
+            "final_rms_ev": float(stage_rms[-1]) if stage_rms else float("nan"),
+        })
+        print_fn(
+            f"  ── SC stage {idx} done: {len(stage_rms)} map calls, "
+            f"{wall:.1f} s ──")
+        call_offset += len(stage_rms) + 1
+        last_inputs, last_stage = stage_inputs, stage
+
+    # ── FINAL QP-CONSISTENCY CHECK ──────────────────────────────────────
+    # A loop that stops on "successive iterates stopped moving" has proved
+    # a property of the ITERATION, not of the SOLUTION.  The two differ
+    # whenever the map contracts toward something that is not a fixed
+    # point of the physical equation -- which is not hypothetical here:
+    # the rCROP residual defect (KNOWN_LORRAX_ISSUES, gw/sc_iteration)
+    # showed this loop declaring convergence 60x early.
+    #
+    # So evaluate Sigma ONCE MORE at the converged energies and check that
+    # the eigenvalues come back where we stopped.  COSTS ONE FULL MAP CALL
+    # (~73 s for MPA on the measured Si deck, ~3 s for GN-PPM) and is
+    # default-on anyway: a QSGW number nobody re-substituted into its own
+    # equation is a number with no evidence behind it.
+    #
+    # The check's state is DISCARDED -- it is a residual measurement, not
+    # another iteration, and silently returning a further-iterated answer
+    # would make the run's output depend on whether the check ran.
+    _, _eigvalsh = _kshard_eigh_kernels(inputs.mesh_xy)
+    t0 = _time.perf_counter()
+    e_stop = np.asarray(_eigvalsh(state.H_qp_dft)) * RYD_TO_EV
+    state_check = gw_iteration_map(
+        SCState(H_qp_dft=state.H_qp_dft, iteration=call_offset), last_inputs)
+    e_check = np.asarray(_eigvalsh(state_check.H_qp_dft)) * RYD_TO_EV
+    qp_verdict = protected_band_convergence(
+        e_check, e_stop,
+        np.asarray(inputs.partition.protected_mask, dtype=bool).reshape(-1),
+        np.asarray(inputs.partition.in_range_mask, dtype=bool).reshape(-1),
+        last_stage.cutoff_ev)
+    print_fn(
+        f"  SC QP-consistency (one extra Σ at the converged energies, "
+        f"{_time.perf_counter() - t0:.1f} s): {qp_verdict.summary()}")
+    if not qp_verdict.converged:
+        print_fn(
+            "  !!! SC QP-CONSISTENCY FAILED: re-evaluating Σ at the "
+            "converged energies did NOT reproduce them to the final "
+            "stage's cutoff.  The loop stopped moving, but the result is "
+            "not a fixed point of the QP equation to that tolerance. !!!")
+    records.append({
+        "stage": "qp_consistency",
+        "mode": last_stage.mode.value,
+        "cutoff_ev": float(last_stage.cutoff_ev),
+        "max_abs_ev": float(qp_verdict.max_abs_ev),
+        "converged": bool(qp_verdict.converged),
+        "wall_s": float(_time.perf_counter() - t0),
+    })
+
+    return state, rms_history, records
 
 
 def run_sc_driver(
@@ -2012,22 +2481,39 @@ def run_sc_driver(
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
-    print_fn(f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
-             f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}"
-             + (f", depth={sc.history_depth}" if sc.accelerator == "rcrop"
-                else f", α={sc.mixing:.2f}"))
-    state_final, rms_history = run_self_consistency(
+    print_fn(
+        f"  SC: deck mode={config.compute_mode.value}, "
+        f"eval={sc.eval_type.value}, rCROP depth={sc.history_depth}, "
+        f"per-stage ceiling={sc.max_iter}")
+    print_fn(f"  SC ladder: {sc.describe_stages()}")
+    state_final, rms_history, stage_records = run_staged_self_consistency(
         state_init, inputs,
-        max_iter=sc.max_iter, tol_ev=sc.tol_ev,
-        accelerator=sc.accelerator,
+        stages=sc.stages,
         history_depth=sc.history_depth,
         mixing=sc.mixing,
     )
     sigma_result = state_final.outputs.sigma_result
     print_fn(
-        f"  SC done: {len(rms_history)} GW map calls"
+        # Count STAGES, not records -- ``stage_records`` also carries the
+        # QP-consistency row, and counting it printed "3 stage(s)" for a
+        # two-stage ladder.
+        f"  SC done: {len(rms_history)} GW map calls across "
+        f"{sum(1 for r in stage_records if r['stage'] != 'qp_consistency')}"
+        f" stage(s)"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
             if rms_history else " (one-shot)"))
+    for rec in stage_records:
+        if rec["stage"] == "qp_consistency":
+            print_fn(
+                f"    QP-consistency ({rec['mode']}): max|ΔE| = "
+                f"{rec['max_abs_ev'] * 1e3:.4f} meV vs cutoff "
+                f"{rec['cutoff_ev'] * 1e3:g} meV, {rec['wall_s']:.1f} s "
+                f"-> {'OK' if rec['converged'] else 'FAILED'}")
+            continue
+        print_fn(
+            f"    stage {rec['stage']} {rec['mode']}: "
+            f"{rec['map_calls']} map calls, {rec['wall_s']:.1f} s, "
+            f"cutoff {rec['cutoff_ev'] * 1e3:g} meV")
 
     # Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
     # qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
