@@ -1092,7 +1092,7 @@ branch; the other nine are recorded here and NOT touched.**
 
 Ordered by "could silently produce a wrong pairing".
 
-### FIXED on this branch
+### FIXED on this branch (five of eleven)
 
 1. `src/bse/bse_window.py` `apply_eqp_corrections` — matched each full-BZ
    k to a wedge block of `eqp1.dat` by comparing MEAN-FIELD ENERGIES with
@@ -1111,6 +1111,65 @@ Ordered by "could silently produce a wrong pairing".
    directly, verifies the block coordinates against the deck's own wedge,
    and unfolds through the service.
 
+4. `src/postprocess/rotate_wfn_to_qp.py` `find_kpoint_mapping` — a
+   coordinate `argmin` at `tol=1e-6` with no uniqueness check, rebuilding
+   the table `sym.kirr_fullids` already is.  **The highest-value fix in
+   the list**: its output selected `U_mnk[ik_full]` and the QP energies
+   for each reduced k, and `gw.eqp_bgw` reads the SAME `kirr_to_kfull`
+   dataset out of `qp_wfn_rotations.h5` — so the two disagreeing about a
+   k meant the rotated WFN and `eqp{0,1}.dat` disagreed too.  The fix
+   turned out to be a deletion: the rotation file ALREADY carries
+   `kirr_to_kfull`, written from `sym.kirr_fullids` by both producers
+   (`gw_jax`/`write_results` and `sc_iteration.py:2365`), so the module
+   now READS it and checks the service's own contract
+   (`kpoints_crys[kirr_to_kfull] == wfn.kpoints`) rather than
+   re-deriving it.  `--add-mapping` and
+   `add_kpoint_mapping_to_rotation_file` are DELETED: that path
+   recomputed the map by nearest-coordinate search and *overwrote* the
+   service's dataset with an approximation of itself.  No jax import was
+   needed, so the module stays jax-free.
+5. `src/file_io/qe_save_reader.py` `_reduce_mp_to_ibz` — a 70-line
+   hand-rolled orbit reduction (`_EPS = 1e-5` grid snap, `equiv` parent
+   array, accumulated `wkk` weights), duplicating
+   `symmetry_maps.find_irreducible_bz_points`, which does it in INTEGER
+   kgrid coordinates with no tolerance at all and returns the orbit map
+   this one discarded.  Now delegates; weights come from
+   `np.bincount(irr_idx)`.
+   **THE TRANSPOSE CONVENTION WAS MEASURED, NOT ASSUMED.**  The old code
+   applied `S @ k` on the raw QE matrices while `SymMaps` builds its
+   k-table as `sym_matrices.transpose(0,2,1)` — different operations, and
+   no docstring settles which this grid wants.  Checked against the old
+   implementation on the committed fixtures: on `si_cohsex_debug`
+   (4x4x4, 48 ops, 8 IBZ points) the AS-STORED matrices reproduce it
+   exactly and the transposed ones move k by 2.5e-01; on the 2-op
+   `gnppm_debug` deck BOTH agree, which is why only a high-symmetry deck
+   decides it.  There is no test coverage of this function in tree and no
+   QE reference fixture, so that measurement is the only evidence — it is
+   pinned in `tests/test_unfold_through_the_service.py`.
+
+### STOPPED, and why — `vcoul/bgw_parity.py`
+
+Item 3 below is NOT fixed, deliberately, on two independent grounds.
+
+**The service does not expose what the rewrite needs.**  The call site
+needs `(iq, S_k, kg0)`: an index, the symmetry row, AND the integer
+umklapp vector, because `kg0` then shifts the whole G-list at
+`bgw_parity.py:189` (`G_input = S_k @ G_miller - kg0`).
+`find_irreducible_bz_points` returns `(irr_idx, sym_idx, irr_out)` and no
+`kg0`; recovering it means recomputing `q - S_k @ q_table` locally, i.e.
+putting back a piece of the hand-rolled matching the rule exists to
+remove.  It also wants a q-GRID to integerise against, which
+`bgw_parity` never receives — it holds fractions only.  Per the standing
+instruction, "the service can't do this yet" is the answer rather than a
+local workaround.
+
+**And the surface is already under an owner ruling.**  `use_bgw_vcoul`
+defaults False (`gw_config.py:1286`), no in-tree deck or fixture sets it
+true, and `file_io/read_bgw_vcoul.py:23` states outright that the
+surface is "data-dead in-tree" and under a repair-or-delete owner
+question.  Rewriting a data-dead path that may be deleted is work
+against a decision that has not been taken.
+
 ### REGISTERED, not fixed
 
 3. `services/vcoul/src/vcoul/bgw_parity.py:44-92` `find_q_index` —
@@ -1124,22 +1183,8 @@ Ordered by "could silently produce a wrong pairing".
    `sym_mats_k` from a *different* WFN.  The module already carries this
    as "a registered owner question (repair-or-delete on the whole
    `use_bgw_vcoul` surface)".
-4. `src/postprocess/rotate_wfn_to_qp.py:24-72` `find_kpoint_mapping` —
-   coordinate `argmin` with `tol=1e-6` and no uniqueness/permutation
-   check, rebuilding the table `sym.kirr_fullids` already is (and that
-   `src/gw/gw_jax.py` passes for the very same dataset).  **Its output is
-   written into `qp_wfn_rotations.h5` and trusted downstream by
-   `src/gw/eqp_bgw.py:787`**, so a wrong pairing here reaches
-   `eqp{0,1}.dat`.  Dead scaffolding at `:42-47` (`full_kpoints_gen`
-   generated, never used).
-5. `src/file_io/qe_save_reader.py:340-410` `_reduce_mp_to_ibz` — a
-   complete hand-rolled orbit reconstruction (apply every symmetry to
-   every k, dedupe at `_EPS = 1e-5`, build an `equiv` parent map),
-   duplicating `symmetry_maps.find_irreducible_bz_points`, which does the
-   same job in INTEGER kgrid coordinates with no tolerance.  The `equiv`
-   map is discarded — only `kpoints, weights` escape — so nothing
-   downstream can check the mapping.  Reached from `src/psp/run_nscf.py`
-   and `src/psp/kpm_dos.py`.
+4. *(FIXED — see item 4 under "FIXED" above.)*
+5. *(FIXED — see item 5 under "FIXED" above.)*
 6. `src/gw/downfold_run.py:1445-1490` — integer-keyed dict map, well
    guarded (membership refusal at `:1474`, bijectivity at `:1483`), EXCEPT
    the `np.arange` identity fallback at `:1470`, which the code's own
