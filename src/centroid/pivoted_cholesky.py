@@ -965,47 +965,88 @@ def prune_candidates_by_pivoted_cholesky(
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
                   f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
 
-    # ── ORBIT-BLOCK SELECT (the repair; see orbit_block_select_host) ────────
-    # Opt-in while it is host-only.  Default OFF, so every existing caller
-    # takes the byte-identical old path.
+    # ── ORBIT-BLOCK SELECT — THE DEFAULT FOR ORBIT MODE ────────────────────
+    # The old orbit branch of the point-mode kernel deflated ONE direction
+    # per admitted orbit while spending up to n_sym points; it is wrong, not
+    # merely slower, so it is not kept behind a flag.  Set
+    # LORRAX_ORBIT_BLOCK_SELECT=host to run the numpy oracle instead (it is
+    # the reference the sharded kernel is gated against); =legacy re-enables
+    # the old behaviour for bisection ONLY and prints that it is doing so.
     _ob = os.environ.get("LORRAX_ORBIT_BLOCK_SELECT", "").strip().lower()
-    if orbit_id is not None and _ob in ("1", "trace", "maxdiag"):
-        _score = "trace" if _ob in ("1", "trace") else "maxdiag"
-        _cap = int(os.environ.get("LORRAX_ORBIT_BLOCK_HOST_MAX_M",
-                                  ORBIT_BLOCK_HOST_MAX_M_DEFAULT))
-        if M > _cap:
-            raise NotImplementedError(
-                f"LORRAX_ORBIT_BLOCK_SELECT is host-only for now and M={M} "
-                f"exceeds LORRAX_ORBIT_BLOCK_HOST_MAX_M={_cap}.  The dense "
-                f"host path would gather an ({M},{M}) Gram onto one rank.  "
-                f"Port the block loop into the sharded kernel before using "
-                f"it at this size; do NOT raise the cap to get past this.")
-        with timing.section("prune.select"):
-            _Gh = np.asarray(_mh.process_allgather(
-                G, tiled=True))[:M, :M]
-            _order, _piv_pts, _trR = orbit_block_select_host(
-                _Gh, np.asarray(orbit_id), n_orbit_keep=n_keep,
-                n_point_budget=n_point_budget, tol_rel=tol_rel, score=_score)
+    if orbit_id is not None and _ob != "legacy":
         _oid_np = np.asarray(orbit_id)
-        _sel = np.isin(_oid_np, _order)
+        _labels, _dense = np.unique(_oid_np, return_inverse=True)
+        _n_orb = int(_labels.shape[0])
+        _budget = int(n_point_budget) if n_point_budget is not None else int(M)
+        _kpts = min(int(M), _budget)
+        if _ob == "host":
+            _cap = int(os.environ.get("LORRAX_ORBIT_BLOCK_HOST_MAX_M",
+                                      ORBIT_BLOCK_HOST_MAX_M_DEFAULT))
+            if M > _cap:
+                raise NotImplementedError(
+                    f"LORRAX_ORBIT_BLOCK_SELECT=host is the numpy ORACLE and "
+                    f"M={M} exceeds LORRAX_ORBIT_BLOCK_HOST_MAX_M={_cap}.  "
+                    f"Drop the override to use the sharded kernel.")
+            with timing.section("prune.select"):
+                _Gh = np.asarray(_mh.process_allgather(G, tiled=True))[:M, :M]
+                _order, _piv_pts, _trR = orbit_block_select_host(
+                    _Gh, _dense, n_orbit_keep=_n_orb,
+                    n_point_budget=_budget, tol_rel=tol_rel, score="trace")
+            _piv_np = np.asarray(_piv_pts)
+        else:
+            with timing.section("prune.select"):
+                _dense_pad = _dense.astype(np.int32)
+                if n_pad:
+                    _dense_pad = np.concatenate(
+                        [_dense_pad, np.full((n_pad,), _n_orb, dtype=np.int32)])
+                _oid_jax = device_put_process_local(
+                    _dense_pad, NamedSharding(mesh, PartitionSpec(select_axis)))
+                _active_init = None
+                if n_pad:
+                    _act = np.ones((M_pad,), dtype=bool)
+                    _act[M:] = False
+                    _active_init = device_put_process_local(
+                        _act, NamedSharding(mesh, PartitionSpec(select_axis)))
+                _sel_step = make_sharded_orbit_block_select(
+                    mesh, M_pad, _kpts, _n_orb,
+                    mesh_axis=select_axis, tol_rel=tol_rel)
+                (_piv, _L, _rank_j, _d_final, _d_taken, _trR_vec,
+                 _psd) = _sel_step(G, _oid_jax, _active_init)
+                _piv.block_until_ready()
+            del _L
+            _piv_np = np.asarray(_piv)
+            _piv_np = _piv_np[_piv_np >= 0]
+            _trR = float(np.asarray(_trR_vec)[int(_rank_j)])
+            _order = _dense[_piv_np][
+                np.sort(np.unique(_dense[_piv_np], return_index=True)[1])]
+
+        # Whole-orbit point budget, on the orbit order the pivots induce.
+        _sizes = np.bincount(_dense, minlength=_n_orb)
+        _cum = np.cumsum(_sizes[_order])
+        _k = int(np.searchsorted(_cum, _budget, side="right"))
+        if _k < 1:
+            raise RuntimeError(
+                f"pivoted-Cholesky REFUSES: the point budget {_budget} is "
+                f"smaller than the first orbit the block order ranked "
+                f"({int(_sizes[_order[0]])} points).  Raise N.")
+        _order = _order[:_k]
+        _sel = np.isin(_dense, _order)
         keep_idx = np.asarray(cand_idx)[_sel]
-        _rank = int(_piv_pts.shape[0])
+        _n_del = int(_sel.sum())
+        _rank = int(np.isin(_dense[_piv_np], _order).sum())
         if verbose:
-            print(f"[pivoted_cholesky] ORBIT-BLOCK select (score={_score}): "
-                  f"{_order.shape[0]} orbits -> {int(_sel.sum())} points, "
+            _path = "host oracle" if _ob == "host" else "sharded"
+            print(f"[pivoted_cholesky] ORBIT-BLOCK select ({_path}): "
+                  f"{_order.shape[0]} orbits -> {_n_del} points, "
                   f"{_rank} rank-1 deflations "
-                  f"({_rank}/{int(_sel.sum())} = "
-                  f"{_rank / max(int(_sel.sum()), 1):.4f} certified "
+                  f"({_rank}/{_n_del} = {_rank / max(_n_del, 1):.4f} certified "
                   f"directions per delivered point), tr(R)/tr(G)={_trR:.3e}")
             print(f"[pivoted_cholesky] orbit-aware: {_order.shape[0]} orbits "
-                  f"→ {int(_sel.sum())} unfolded centroids (orbit-closed)")
+                  f"→ {_n_del} unfolded centroids (orbit-closed)")
         # THE GATE THIS PATH CAN ACTUALLY STATE.  The old orbit gate compared
         # a rank counted in ORBITS against an orbit target, which is why it
         # printed "18/18 certified -- PASS" over a set that spanned the wrong
-        # directions.  Here the deflation count IS at point granularity, so
-        # the property "the delivered set spans as many independent
-        # directions as it claims points" is checkable, and is checked.
-        _n_del = int(_sel.sum())
+        # directions.  Here the deflation count IS at point granularity.
         _tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
         if _rank < int(np.ceil((1.0 - _tol) * _n_del)):
             raise RuntimeError(
@@ -1017,6 +1058,11 @@ def prune_candidates_by_pivoted_cholesky(
                 f"Lower N, or widen the prune window so the Gram sees the "
                 f"pair densities the orbits actually carry.")
         return keep_idx, _rank, _n_del, None, None
+    if orbit_id is not None and _ob == "legacy":
+        print("[pivoted_cholesky] WARNING: LORRAX_ORBIT_BLOCK_SELECT=legacy — "
+              "running the OLD orbit branch, which deflates one direction per "
+              "orbit and is known to cost 56x of BerkeleyGW agreement on the "
+              "Si anchor.  For bisection only.")
 
     # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
     # row-sharded the same way as G; the body marks the whole orbit
@@ -1424,6 +1470,224 @@ def make_sharded_pivoted_cholesky_select(
     return step
 
 
+
+def make_sharded_orbit_block_select(
+    mesh: Mesh,
+    M: int,
+    k_points: int,
+    n_orb: int,
+    *,
+    mesh_axis: str | tuple[str, ...] = 'x',
+    tol_rel: float | None = None,
+):
+    """Sharded ORBIT-BLOCK pivoted-Cholesky select.
+
+    Same row-sharded Gram, same collectives idioms and same stopping rule as
+    ``make_sharded_pivoted_cholesky_select``; two things differ, and they are
+    the whole repair:
+
+      1. **The pivot search is restricted to the OPEN orbit.**  When the open
+         orbit has no residual left, the next orbit is opened by maximum
+         residual TRACE over the orbits not yet admitted (a ``segment_sum``
+         plus one ``psum`` on an ``(n_orb+1,)`` vector -- orbit counts are
+         tens to hundreds, so this is cheap next to the O(M) work already in
+         the body).  On a sym-invariant Gram the trace is ``orbit_size x
+         d_rep``, so ranking by it weights an orbit by the number of points
+         it will actually cost -- the multiplicity weighting the old rule
+         did not have.
+
+      2. **The Schur update kills the PIVOT, not the orbit.**  The old body
+         did one rank-1 update and then dropped all ``n_sym`` members
+         (``kill_mask = orbit_id == orbit_id_p``), so admitting a 48-point
+         orbit deflated ONE direction while spending 48 points and every
+         later orbit was ranked on a residual stale by 47 of them.
+
+    ``k_points`` is therefore a POINT budget and the trip count is one
+    rank-1 update per delivered point -- the same loop shape and the same
+    cost as point mode, and independent of the FFT grid size.  **The k-means
+    candidate pool is untouched:** this changes only which pool members are
+    kept, so the owner's constraint that pruning must not run over the full
+    grid is preserved by construction.
+
+    ``orbit_id`` must be DENSE in ``[0, n_orb)``; zero-pad rows must carry
+    ``n_orb`` as a sentinel (they land in a bucket nothing can open).
+
+    Returns ``(piv, L, rank, d_final, d_taken, trR_over_trG, psd_info)`` with
+    the same shardings as the point-mode factory.  ``piv`` is in pivot order
+    and groups by orbit, so the host can read the admitted-orbit order off it
+    and apply the whole-orbit point budget exactly as before.
+    """
+    dist.require_axes(mesh, mesh_axis, "make_sharded_orbit_block_select")
+    n_dev = dist.n_shards(mesh, mesh_axis)
+    if M % n_dev != 0:
+        raise ValueError(f"M={M} must be divisible by product of mesh axes "
+                         f"{mesh_axis} (= {n_dev})")
+    M_slab = M // n_dev
+
+    row_shard = PartitionSpec(mesh_axis, None)
+    row_shard_1d = PartitionSpec(mesh_axis)
+    rep = PartitionSpec()
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
+                 (rep, rep, rep))
+
+    @jax.jit
+    def step(G, orbit_id, active_init=None):
+        def body_local(G_slab, orbit_id_slab, active_slab=None):
+            real_dtype = G_slab.real.dtype
+            eps = jnp.finfo(real_dtype).eps
+            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+            my_idx = lax.axis_index(mesh_axis)
+
+            col_ids_local = my_idx * M_slab + jnp.arange(M_slab)
+            local_diag_raw = jnp.real(G_slab[jnp.arange(M_slab), col_ids_local])
+            local_diag = jnp.maximum(local_diag_raw, 0.0)
+            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
+            col_ids_k = jnp.arange(k_points)
+            d0max_global = lax.pmax(jnp.max(local_diag_raw), axis_name=mesh_axis)
+            tol = (jnp.sqrt(eps) if tol_rel is None
+                   else jnp.asarray(tol_rel, real_dtype))
+            floor = tol * d0max_global
+
+            at0_loc = jnp.argmin(local_diag_raw).astype(jnp.int32)
+            at0_glob = (my_idx * M_slab + at0_loc).astype(jnp.int32)
+            neg0 = local_diag_raw[at0_loc] < 0.0
+
+            avail0 = (jnp.ones((M_slab,), dtype=bool) if active_slab is None
+                      else active_slab.astype(bool))
+            oid = orbit_id_slab.astype(jnp.int32)
+
+            init = (
+                local_diag,                                          # d
+                jnp.zeros((M_slab, k_points), dtype=G_slab.dtype),   # L
+                -jnp.ones((k_points,), dtype=jnp.int32),             # piv
+                avail0,                                              # unadmitted
+                avail0,                                              # unpivoted
+                jnp.int32(-1),                                       # cur orbit
+                jnp.zeros((k_points,), dtype=real_dtype),            # d_taken
+                jnp.zeros((k_points + 1,), dtype=real_dtype).at[0].set(
+                    jnp.sum(local_diag)),
+                jnp.minimum(local_diag_raw[at0_loc],
+                            jnp.zeros((), dtype=real_dtype)),
+                jnp.where(neg0, at0_glob, jnp.int32(-1)),
+                jnp.int32(-1),
+            )
+
+            def body(j, carry):
+                (d, L, piv, unadm, unpiv, cur, d_taken, trR,
+                 d_min_raw, d_min_at, d_min_j) = carry
+
+                # ---- is the OPEN orbit still worth pivoting? --------------
+                in_cur = (oid == cur) & unpiv
+                pv_cur = lax.pmax(jnp.max(jnp.where(in_cur, d, minus_inf)),
+                                  axis_name=mesh_axis)
+                need_new = pv_cur <= floor
+
+                # ---- open the next orbit by residual TRACE ----------------
+                # Computed unconditionally (jit has no cheap branch here) and
+                # selected below; both terms are O(M) like the argmax already
+                # in this body.
+                seg = jax.ops.segment_sum(
+                    jnp.where(unadm, d, 0.0), oid,
+                    num_segments=n_orb + 1, indices_are_sorted=False)
+                seg = lax.psum(seg, axis_name=mesh_axis)
+                seg = seg.at[n_orb].set(-jnp.inf)      # the pad sentinel bucket
+                cand = jnp.argmax(seg).astype(jnp.int32)
+                cur_new = jnp.where(need_new, cand, cur)
+
+                in_cur = (oid == cur_new) & unpiv
+                masked_d = jnp.where(in_cur, d, minus_inf)
+                local_p_idx = jnp.argmax(masked_d)
+                local_pv = masked_d[local_p_idx]
+                global_pv = lax.pmax(local_pv, mesh_axis)
+                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
+                winner_p = jnp.where(local_pv >= global_pv, local_global_p,
+                                     jnp.int32(2 ** 30))
+                global_p = -lax.pmax(-winner_p, mesh_axis)
+                take = global_pv > floor
+                pivot_val = jnp.maximum(global_pv, floor)
+
+                # Mark the newly-opened orbit as admitted (whole).
+                opened = need_new & take
+                unadm = unadm & ~(opened & (oid == cur_new))
+
+                gcol_slab = G_slab[:, global_p]
+                my_has_p = (global_p // M_slab == my_idx)
+                local_p_rel = global_p - my_idx * M_slab
+                safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
+                local_Lp = jnp.where(my_has_p, L[safe_idx, :],
+                                     jnp.zeros_like(L[safe_idx, :]))
+                L_p = lax.psum(local_Lp, mesh_axis)
+
+                prev_mask = (col_ids_k < j).astype(G_slab.dtype)
+                corr = L @ (jnp.conj(L_p) * prev_mask)
+                denom = jnp.sqrt(pivot_val)
+                newcol = (gcol_slab - corr) / denom
+                fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype),
+                                   newcol)
+                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+
+                L = L.at[:, j].set(newcol)
+                piv = piv.at[j].set(jnp.where(take, global_p, jnp.int32(-1)))
+                d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
+
+                d_raw = d - jnp.abs(newcol) ** 2
+                masked_raw = jnp.where(unpiv, d_raw, jnp.inf)
+                step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+                step_min = masked_raw[step_at]
+                beats = take & (step_min < d_min_raw)
+                d_min_at = jnp.where(
+                    beats, (my_idx * M_slab + step_at).astype(jnp.int32),
+                    d_min_at)
+                d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+                d_min_raw = jnp.where(beats, step_min, d_min_raw)
+                d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
+                trR = trR.at[j + 1].set(jnp.sum(d_new))
+
+                # THE KEY DIFFERENCE: kill the PIVOT only.  Its orbit siblings
+                # stay pivotable, so the orbit is deflated by as many
+                # directions as it delivers points.
+                kill = my_has_p & (jnp.arange(M_slab) == local_p_rel) & take
+                unpiv = unpiv & ~kill
+                d = jnp.where(kill, 0.0, jnp.where(take, d_new, d))
+
+                return (d, L, piv, unadm, unpiv, cur_new, d_taken, trR,
+                        d_min_raw, d_min_at, d_min_j)
+
+            (d_final, L_out, piv_out, _unadm, _unpiv, _cur, d_taken, trR,
+             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
+                0, k_points, body, init)
+            d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
+            trR = lax.psum(trR, axis_name=mesh_axis) / trG
+            rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
+            mine = d_min_raw == g_min
+            far = jnp.int32(2 ** 30)
+            g_at = -lax.pmax(-jnp.where(mine, d_min_at, far),
+                             axis_name=mesh_axis)
+            g_j = -lax.pmax(-jnp.where(mine, d_min_j, far),
+                            axis_name=mesh_axis)
+            return (piv_out, L_out, rank, d_final, d_taken, trR,
+                    (g_min, g_at, g_j))
+
+        specs = [row_shard, row_shard_1d]
+        args = [G, orbit_id]
+        has_active = active_init is not None
+        if has_active:
+            specs.append(row_shard_1d); args.append(active_init)
+
+        def _entry(*a):
+            return body_local(a[0], a[1], a[2] if has_active else None)
+
+        return shard_map(
+            _entry, mesh=mesh,
+            in_specs=tuple(specs), out_specs=out_specs,
+            check_vma=False,
+        )(*args)
+
+    return step
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Full 2-D Gram pipeline: load_wfns → pair density → q=0 Gram
 # ═══════════════════════════════════════════════════════════════════════
@@ -1650,7 +1914,31 @@ def build_gram_q0_via_loadwfns(
     # column axis must not be sliced locally).
     n_dev_total = mesh_xy.devices.size
     col_block = 0
-    if n_dev_total == 1:
+    # ── MULTI-DEVICE BLOCKING (2026-08-15) ──────────────────────────────────
+    # This used to be `if n_dev_total == 1`, i.e. the blocking that exists to
+    # stop the pair density from being materialised whole was disabled on
+    # exactly the meshes that hit the wall.  MEASURED: the orbit-mode
+    # candidate pool at oversample 6 on Si 4x4x4 (M = 3724, nk = 8, nspinor
+    # = 2) asks for a single 13.44 GiB allocation ON EACH DEVICE of a 2x2
+    # mesh and dies -- 2*nk*ns^2*M*16 B/column x M columns = 14.2 GB, which
+    # is the request to the byte, so the (nk,ns,ns,M,M) intermediate is NOT
+    # being spread by the mesh.  That ceiling was then mistaken for a
+    # property of the algorithm and used to bound a design decision.
+    #
+    # Blocking the OUTPUT columns does not change the contraction order, so G
+    # is the same map either way; only materialisation moves.  The one thing
+    # a sharded mesh needs on top of the single-device path is that each
+    # block's column extent divide the 'y' shard count, so the slice reshards
+    # cleanly instead of splitting a shard.  Single-device behaviour is
+    # untouched and byte-identical: same branch, same auto-budget, same
+    # env override.
+    _n_y = 1
+    try:
+        if 'y' in mesh_xy.axis_names:
+            _n_y = int(mesh_xy.shape['y'])
+    except Exception:
+        _n_y = 1
+    if True:
         # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
         # means "no override", i.e. the auto budget below.  This USED to be a bare
         # presence test — ``=0`` and ``=off`` are the two spellings a user
@@ -1677,6 +1965,10 @@ def build_gram_q0_via_loadwfns(
             bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
             budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
             col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
+        if n_dev_total > 1 and col_block:
+            # Round UP to a whole number of 'y' shards: a block that splits a
+            # shard would force a partial-shard slice on every block.
+            col_block = ((col_block + _n_y - 1) // _n_y) * _n_y
         if col_block >= psi_l_rmu_Y.shape[3]:
             col_block = 0  # one full block == the original computation
 
@@ -1685,7 +1977,8 @@ def build_gram_q0_via_loadwfns(
         if verbose:
             print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
                   f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; single-device path)")
+                  f"({-(-M_cols // col_block)} blocks; "
+                  f"{'single-device' if n_dev_total == 1 else f'{n_dev_total}-device'} path)")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
@@ -1699,15 +1992,21 @@ def build_gram_q0_via_loadwfns(
             g_blocks = []
             for c0 in range(0, M_cols, col_block):
                 c1 = min(c0 + col_block, M_cols)
-                P_l_b = pair_density(
-                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
-                P_r_b = pair_density(
-                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
+                # Slicing a 'y'-sharded axis yields an array whose sharding
+                # pjit will not accept against pair_density's declared
+                # in_shardings, so each block is re-placed explicitly.  The
+                # block width is a whole number of 'y' shards (rounded above),
+                # so this is a local relabel, not a reshuffle.
+                _yspec = NamedSharding(mesh_xy, PartitionSpec(None, None, None, 'y'))
+                _l_blk = jax.device_put(psi_l_rmu_Y[..., c0:c1], _yspec)
+                _r_blk = jax.device_put(psi_r_rmu_Y[..., c0:c1], _yspec)
+                P_l_b = pair_density(psi_l_rmuT_X, _l_blk, mesh_xy)
+                P_r_b = pair_density(psi_r_rmuT_X, _r_blk, mesh_xy)
                 G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
                                         symmetrize=False)
                 G_b.block_until_ready()
                 g_blocks.append(G_b)
-                del P_l_b, P_r_b
+                del P_l_b, P_r_b, _l_blk, _r_blk
             G = jnp.concatenate(g_blocks, axis=1)
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.

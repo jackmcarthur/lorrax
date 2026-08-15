@@ -341,6 +341,41 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
               f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
         indices, snapped, _ = snap_centroids_to_grid(
             unfolded, fft_grid, deduplicate=False)
+        # ── REP-COLLAPSE COUNTER ───────────────────────────────────────────
+        # The delivered pool routinely comes in BELOW n_sym * M_rep, and that
+        # shortfall has two causes with opposite meanings:
+        #   * reps that drifted into an orbit another rep already claimed --
+        #     a LOST degree of freedom, and in orbit mode reps are the scarce
+        #     resource (the point branch redistributes its collisions via
+        #     ``ensure_unique_centroids``; this branch has no such step);
+        #   * reps on SPECIAL POSITIONS, whose orbits are legitimately
+        #     smaller than n_sym -- not a loss at all.
+        # Reporting only the shortfall conflates them, so count the first
+        # directly: how many reps produced an orbit id an earlier rep already
+        # produced.
+        try:
+            _g = np.asarray(fft_grid)
+            _key = lambda a: (np.round(np.asarray(a) * _g).astype(np.int64)
+                              % _g) @ np.array([_g[1] * _g[2], _g[2], 1])
+            _lut = dict(zip(_key(snapped).tolist(),
+                            np.asarray(orbit_id).tolist()))
+            _rep_orbits = [_lut.get(k) for k in _key(reps_snapped).tolist()]
+            _rep_orbits = [o for o in _rep_orbits if o is not None]
+            _n_rep = len(_rep_orbits)
+            _n_dist = len(set(_rep_orbits))
+            _sizes = np.bincount(np.asarray(orbit_id))
+            _sizes = _sizes[_sizes > 0]
+            print(f"  [orbit pool] {_n_rep} reps -> {_n_dist} distinct orbits "
+                  f"({_n_rep - _n_dist} COLLAPSED onto an orbit another rep "
+                  f"already claimed = "
+                  f"{100.0 * (_n_rep - _n_dist) / max(_n_rep, 1):.1f}% of the "
+                  f"k-means degrees of freedom lost)")
+            print(f"  [orbit pool] delivered {indices.shape[0]} points vs "
+                  f"{n_sym * _n_rep} = n_sym x reps; orbit sizes "
+                  f"{np.array2string(np.unique(_sizes))} "
+                  f"(sizes below n_sym = special positions, NOT a loss)")
+        except Exception as _e:                      # diagnostic only
+            print(f"  [orbit pool] counter unavailable: {_e}")
         return indices, snapped, indices.shape[0], orbit_id
 
     print(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
