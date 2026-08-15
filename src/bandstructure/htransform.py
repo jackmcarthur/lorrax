@@ -1,5 +1,4 @@
 import os
-import re
 import math
 import argparse
 import numpy as np
@@ -31,6 +30,7 @@ from common import Meta
 from common import rank_criterion
 from common import spectral_closure
 from common import timing
+from common.units import RYD_TO_EV
 from runtime.padding import round_up
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
@@ -1141,87 +1141,99 @@ def _make_logger(verbose: bool):
 
 
 def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.Array:
-    """Parse EQP (or sigX) energies from a BerkeleyGW-style file.
+    """Full-BZ QP energies from the IRREDUCIBLE-WEDGE ``eqp{0,1}.dat``.
 
-    Supports lines like either:
-      - "n=10  EDFT=  ...  EQP= -12.3456 + 0.0000i"
-      - "n=10  sigX=  -12.3456 + 0.000000i  VH= ..." (x-only files)
+    Reads the BerkeleyGW-columnar eqp file LORRAX's GW writes — one block
+    per ``wfn.kpoints`` entry, the crystal coordinate in the block header,
+    energies in eV — and returns ``(nb, nk_full)`` in RYDBERG over
+    ``band_window``, which is what this module's DFT path returns.
 
-    Returns energies shaped as (nb, nk_full) matching the requested window.
+    THE UNFOLD IS THE SERVICE'S, NOT THIS MODULE'S.  Every IBZ→full-BZ
+    map in the tree goes through ``symmetry_maps.star_broadcast``, reached
+    here by its single adapter ``file_io.kin_ion.broadcast_ibz_to_full_bz``
+    — the same call the kin_ion read path takes, with the same
+    ``ibz_slab`` predicate, because this is the same situation: a wedge
+    slab read verbatim off disk with no symmetry operation applied to it.
+
+    WHAT THIS REPLACED, AND WHY.  It used to require a PRE-UNFOLDED
+    full-BZ text file (``nk == sym.nk_tot``, refused otherwise) whose
+    ``k-point N:`` blocks it paired to full-BZ k BY POSITION, with no
+    coordinate ever read.  Nothing in the tree wrote that file: it came
+    from an out-of-tree ``make_eqp_htformat.py`` that joined
+    ``eqp_g0w0.dat`` against ``eqp1.dat`` to do the unfold by hand.  That
+    is bespoke unfolding one hop upstream, plus a positional pairing that
+    a re-ordered file passes silently.  Now the wedge file is read
+    directly and the service does the unfold, so the converter has no job
+    left and the position never enters.
+
+    The block coordinates are CHECKED against the deck's own wedge
+    (``sym.unfolded_kpts[sym.kirr_fullids]``) rather than trusted — a
+    file from another deck, or in another order, is refused here instead
+    of producing a quasiparticle bandstructure with the energies on the
+    wrong k.
     """
     start, end = int(band_window[0]), int(band_window[1])
     nb = int(max(0, end - start))
     if nb == 0:
         raise ValueError("Empty band window requested for EQP override")
 
-    # Precompile regexes
-    k_header = re.compile(r"^\s*k-point\s+(\d+)\s*:\s*$")
-    n_line = re.compile(r"n\s*=\s*(\d+)")
-    eqp_val = re.compile(r"EQP\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
-    sigx_val = re.compile(r"sigX\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+    from file_io.kin_ion import broadcast_ibz_to_full_bz
+    from gw.eqp_bgw import read_bgw_eqp
+    from gw.kin_ion_io import star_tables
 
-    # Accumulate per-k maps from absolute band index -> energy
-    energies_by_k: list[dict[int, float]] = []
-    current_k: int | None = None
+    kpts_file, _e_dft_ev, e_qp_ev, band_offset = read_bgw_eqp(eqp_file)
+    nk_file, nb_file = e_qp_ev.shape
 
-    with open(eqp_file, "r", encoding="utf8") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            m_k = k_header.match(line)
-            if m_k is not None:
-                # Start new k-point block
-                current_k = int(m_k.group(1))
-                # Ensure list is long enough
-                while len(energies_by_k) <= current_k:
-                    energies_by_k.append({})
-                continue
+    # ---- the file must be THIS deck's wedge, in the wedge's order -------
+    kirr = np.asarray(sym.unfolded_kpts, dtype=np.float64)[
+        np.asarray(sym.kirr_fullids, dtype=np.int64)]
+    if nk_file != kirr.shape[0]:
+        raise ValueError(
+            f"{os.path.basename(eqp_file)} holds {nk_file} k-blocks but this "
+            f"deck's irreducible wedge has {kirr.shape[0]} (full BZ "
+            f"{int(sym.nk_tot)}).  This reader takes the wedge file LORRAX's "
+            f"GW writes; the pre-unfolded full-BZ form is no longer read.")
+    # Written by ``%13.9f``, so equality is to that many places; the
+    # comparison is modulo a lattice vector because either side may carry
+    # a k in a different periodic image.
+    dk = np.asarray(kpts_file, dtype=np.float64) - kirr
+    dk -= np.rint(dk)
+    worst = float(np.max(np.abs(dk))) if dk.size else 0.0
+    if worst > 1e-6:
+        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
+        raise ValueError(
+            f"{os.path.basename(eqp_file)} block {bad} is at "
+            f"{np.asarray(kpts_file)[bad].tolist()} but this deck's wedge "
+            f"point {bad} is {kirr[bad].tolist()} (worst |Δk| = {worst:.2e} "
+            f"over {nk_file} blocks).  The eqp file does not belong to this "
+            f"wavefunction, or its k-order differs — either way its energies "
+            f"would land on the wrong k.")
 
-            if current_k is None:
-                continue
+    # ---- absolute band window -> the file's columns ---------------------
+    lo, hi = start - band_offset, end - band_offset
+    if lo < 0 or hi > nb_file:
+        raise ValueError(
+            f"{os.path.basename(eqp_file)} covers absolute bands "
+            f"[{band_offset}, {band_offset + nb_file}) but the requested "
+            f"window is [{start}, {end}) — the eqp file does not span the "
+            f"htransform sigma window.")
+    window_ev = np.asarray(e_qp_ev)[:, lo:hi]
+    if np.isnan(window_ev).any():
+        n_missing = int(np.isnan(window_ev).sum())
+        raise ValueError(
+            f"{os.path.basename(eqp_file)} is missing {n_missing} of "
+            f"{window_ev.size} (k, band) entries inside the requested window "
+            f"[{start}, {end}) — a short block cannot be silently padded.")
 
-            # Parse band index and energy value
-            m_n = n_line.search(line)
-            if m_n is None:
-                continue
-            band_idx = int(m_n.group(1))
+    # ---- THE unfold: wedge -> full BZ, through the service --------------
+    full_ev = np.asarray(broadcast_ibz_to_full_bz(window_ev, *star_tables(sym)))
+    if full_ev.shape[0] != int(sym.nk_tot):
+        raise ValueError(
+            f"star_broadcast returned {full_ev.shape[0]} k-points, expected "
+            f"{int(sym.nk_tot)}")
 
-            m_eqp = eqp_val.search(line)
-            val = None
-            if m_eqp is not None:
-                val = float(m_eqp.group(1))
-            else:
-                m_sigx = sigx_val.search(line)
-                if m_sigx is not None:
-                    val = float(m_sigx.group(1))
-
-            if val is not None:
-                energies_by_k[current_k][band_idx] = val
-
-    if not energies_by_k:
-        raise ValueError(f"No k-point blocks found in {os.path.basename(eqp_file)}")
-
-    nk = len(energies_by_k)
-    if hasattr(sym, "nk_tot"):
-        expected_nk = int(sym.nk_tot)
-        if nk != expected_nk:
-            raise ValueError(
-                f"EQP file has nk={nk}, but symmetry maps expect nk={expected_nk}"
-            )
-    # Build (nk, nb) by slicing the absolute band indices [start:end]
-    energies_window = np.zeros((nk, nb), dtype=np.float64)
-    for ik in range(nk):
-        kmap = energies_by_k[ik]
-        for j, b_abs in enumerate(range(start, end)):
-            if b_abs not in kmap:
-                raise ValueError(
-                    f"Missing EQP for band {b_abs} at k-point {ik} in {os.path.basename(eqp_file)}"
-                )
-            energies_window[ik, j] = kmap[b_abs]
-
-    # Return (nb, nk) to match internal conventions
-    return jnp.asarray(energies_window.T, dtype=jnp.float64)
+    # eV on disk (BGW convention); Ry is this module's internal unit.
+    return jnp.asarray(full_ev.T / RYD_TO_EV, dtype=jnp.float64)
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
@@ -1318,10 +1330,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         except Exception as exc:
             raise SystemExit(
                 f"FATAL: --eqp-file {os.path.basename(eqp_path)} could not be "
-                f"consumed: {exc}\nExpected format: 'k-point <K>:' blocks "
-                f"covering all {getattr(sym, 'nk_tot', '?')} k-points with "
-                f"EQP=/sigX= tokens, energies in Ry. Use "
-                f"make_eqp_htformat.py to convert BGW-column eqp files."
+                f"consumed: {exc}\nExpected LORRAX's GW ``eqp1.dat`` as "
+                f"written: BerkeleyGW columns on the IRREDUCIBLE WEDGE — "
+                f"{getattr(sym, 'nk_red', '?')} k-blocks for this deck, each "
+                f"a '(3f13.9,i8)' crystal-coordinate header followed by that "
+                f"many '(2i8,2f15.9)' band rows in eV.  Pass it directly; the "
+                f"unfold to this deck's {getattr(sym, 'nk_tot', '?')} full-BZ "
+                f"k-points happens here, through the symmetry service.  No "
+                f"pre-conversion step is needed or accepted."
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))

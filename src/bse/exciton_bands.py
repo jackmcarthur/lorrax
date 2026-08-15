@@ -1482,21 +1482,16 @@ def main(argv=None):
     # energies, so a QP-driven gap change cannot mis-slice); the interpolated
     # leg is corrected below, right after ``initialize_wfns``.
     #
-    # ``input_file=None`` on purpose: with it, apply_eqp_corrections asserts
-    # the eqp file is IBZ-sized (nk_ibz == sym.nk_red) AND that this driver's
-    # k-axis is the matching full BZ, which the densified Q-path is not.
-    #
-    # NOT because the file is full-BZ.  It is NOT: ``gw_output.py:1113``
-    # subsets through ``kirr_to_kfull`` and ``gw_jax.py:779`` passes
-    # ``wfn.kpoints``, so eqp{0,1}.dat are the IBZ wedge — 8 blocks against
-    # 64 k on Si 4x4x4, not the 1:1 this comment used to claim.  The
-    # energy-matching branch is correct anyway, but for a different reason:
-    # E_DFT is constant over a symmetry star, so matching each full-BZ k to
-    # the wedge block that reproduces its mean-field energies performs the
-    # IBZ->full unfold.  It is a heuristic (tol 0.01 eV) standing in for a
-    # coordinate join — see tests/KNOWN_FAILURES.md, "The BSE Q-path takes
-    # its QP energies through an E_DFT heuristic justified by a false
-    # premise", which is registered and NOT fixed here.
+    # ``args.input`` is passed, and the eqp file is the IRREDUCIBLE WEDGE.
+    # This used to pass ``input_file=None`` to reach a second code path that
+    # matched full-BZ k to wedge blocks by mean-field energy to 0.01 eV, on
+    # the stated grounds that "LORRAX's own GW writes eqp1.dat on the FULL
+    # BZ".  It does not — ``gw_output.py`` subsets through ``kirr_to_kfull``
+    # and ``gw_jax.py`` passes ``wfn.kpoints`` — so the assertion that
+    # branch was avoiding is the one that PASSES, and the heuristic was
+    # bespoke unfolding standing in for the symmetry service.  Both are
+    # gone; ``apply_eqp_corrections`` now unfolds through the service's
+    # single ``star_broadcast`` adapter and ``input_file`` is required.
     enk_qp_full = None
     if args.eqp:
         from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
@@ -1504,17 +1499,13 @@ def main(argv=None):
         import h5py as _h5py
         with _h5py.File(restart_file, "r") as _f:
             _enk_dft_full = np.asarray(_f["enk_full"][:])
-        # n_occ has to come from the WFN's ``ifmax`` (via ``input_file``), but
-        # ``input_file`` cannot be handed to apply_eqp_and_reslice_bands — it
-        # would reach apply_eqp_corrections' IBZ branch and assert.  Resolve it
-        # here and pass it explicitly instead.
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
         data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
-            restart_file, args.eqp, None, n_val, n_cond, n_occ_in,
+            restart_file, args.eqp, args.input, n_val, n_cond, n_occ_in,
             mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry)
-        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp)
+        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp, args.input)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
             f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "

@@ -195,6 +195,82 @@ def write_bgw_eqp(
 	return abs_path
 
 
+def read_bgw_eqp(eqp_file: str):
+	"""Read a BerkeleyGW ``eqp{0,1}.dat`` — the inverse of :func:`write_bgw_eqp`.
+
+	Returns ``(kpts_irr (nk, 3), e_dft (nk, nb), e_qp (nk, nb),
+	band_offset)``; the energies are eV and the k-points are the CRYSTAL
+	COORDINATES the block headers carry, on the irreducible wedge the
+	writer emitted.
+
+	``band_offset`` is the 0-BASED ABSOLUTE index of column 0, recovered
+	from the file's own 1-based ``iband`` labels — the inverse of
+	:func:`write_bgw_eqp`'s ``band_offset``.  It is returned rather than
+	dropped because a consumer slicing an absolute band window
+	(``bandstructure.htransform``) cannot place these columns without it,
+	and the previous reader discarded it, which is why that consumer grew
+	a second eqp parser instead of using this one.
+
+	**Lives beside the writer on purpose.**  It used to sit in
+	``bse.bse_window``, which made it reachable only from BSE — so
+	``bandstructure.htransform`` grew a second, incompatible eqp parser of
+	its own rather than take a ``bandstructure → bse`` edge that exists
+	nowhere else in the tree.  One format, one reader, one writer, in one
+	module: a change to the layout cannot now update only half of them.
+
+	Ragged band counts are tolerated (short blocks are NaN-padded to the
+	widest), because a caller slicing a band window must be able to see
+	which states are absent rather than read a zero.
+	"""
+	kpts: list[list[float]] = []
+	e_dft_blocks: list[list[float]] = []
+	e_qp_blocks: list[list[float]] = []
+	first_band: int | None = None
+
+	with open(eqp_file) as f:
+		while True:
+			header = f.readline()
+			if not header:
+				break
+			stripped = header.strip()
+			if not stripped:
+				break
+			if stripped.startswith("#"):
+				continue
+			parts = header.split()
+			if len(parts) < 4:
+				break
+			kpts.append([float(parts[0]), float(parts[1]), float(parts[2])])
+			n_bands = int(parts[3])
+
+			e_dft_k, e_qp_k = [], []
+			for _ in range(n_bands):
+				cols = f.readline().split()
+				# (ispin, iband, E_DFT, E_QP); iband is 1-based ABSOLUTE.
+				if first_band is None:
+					first_band = int(cols[1])
+				e_dft_k.append(float(cols[2]))
+				e_qp_k.append(float(cols[3]))
+			e_dft_blocks.append(e_dft_k)
+			e_qp_blocks.append(e_qp_k)
+
+	if not kpts:
+		raise ValueError(
+			f"no k-point blocks parsed from {os.path.basename(eqp_file)} — "
+			f"expected the BerkeleyGW eqp layout this module writes "
+			f"(a '(3f13.9,i8)' k header, then that many '(2i8,2f15.9)' rows)")
+
+	max_band = max(len(b) for b in e_dft_blocks)
+	n_kpts = len(kpts)
+	e_dft = np.full((n_kpts, max_band), np.nan)
+	e_qp = np.full((n_kpts, max_band), np.nan)
+	for i in range(n_kpts):
+		nb = len(e_dft_blocks[i])
+		e_dft[i, :nb] = e_dft_blocks[i]
+		e_qp[i, :nb] = e_qp_blocks[i]
+	return np.array(kpts), e_dft, e_qp, int(first_band) - 1
+
+
 def verify_eqp_file(
 	path: str, *, nk: int, nb: int, nspin: int = 1,
 	print_fn=print,
