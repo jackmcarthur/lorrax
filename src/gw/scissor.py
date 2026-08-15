@@ -423,6 +423,28 @@ def fit_scissor(
         E_dft_sorted[mask_v], E_qp_sorted[mask_v], w_v)
     alpha_c, beta_c, _ = _wls_line(
         E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
+    # No-information laws.  _wls_line returns (0, 0) on an empty class and
+    # (0, y0) on a single sample; as an E_QP = α·E + β scissor those
+    # extrapolate every band to ZERO / to a constant — on the metallic
+    # sodium deck the Fermi-crossing pair gave the classes no clean
+    # samples, every scissored diagonal became exactly 0.0, and eigvalsh's
+    # ascending sort interleaved 46 zeros with the two real eigenvalues
+    # (the migrating-band snapshots, max|dE| = VBM to six decimals).
+    # Zero samples ⇒ identity (keep E_DFT); one sample ⇒ rigid shift.
+    for _cls in ("v", "c"):
+        _m, _w = (mask_v, w_v) if _cls == "v" else (mask_c, w_c)
+        _n = int(_m.sum())
+        if _n == 0:
+            _a, _b = 1.0, 0.0
+        elif _n == 1:
+            _a = 1.0
+            _b = float((E_qp_sorted - E_dft_sorted)[_m][0])
+        else:
+            continue
+        if _cls == "v":
+            alpha_v, beta_v = _a, _b
+        else:
+            alpha_c, beta_c = _a, _b
     resid_v = (E_qp_sorted - E_dft_sorted)[mask_v] - (
         (alpha_v - 1.0) * E_dft_sorted[mask_v] + beta_v)
     resid_c = (E_qp_sorted - E_dft_sorted)[mask_c] - (
