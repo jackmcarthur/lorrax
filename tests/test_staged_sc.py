@@ -437,3 +437,81 @@ def test_sc_accelerator_rcrop_is_retired_and_ignored(tmp_path):
     with pytest.deprecated_call(match="sc_accelerator"):
         cfg = _config(tmp_path, "sc_accelerator = rcrop\n")
     assert not hasattr(cfg.sc, "accelerator")
+
+
+# ---------------------------------------------------------------------------
+# 7. the convergence POSTCONDITION on the real run path
+# ---------------------------------------------------------------------------
+
+def _stub_inputs(cfg, tmp_path, nb=4):
+    from gw import sc_iteration
+    from gw.band_partition import BandPartition
+    ones = np.ones(nb, dtype=bool)
+    return sc_iteration.SCInputs(
+        wfns_dft=None, V_q=None, kin_ion_dft=None, head_channel=None,
+        quad=None, e_ref=0.0, static_head_terms=None, head_resolver=None,
+        config=cfg, meta=None, mesh_xy=None, sym=None, wfn=None,
+        centroid_indices=None, band_slices=None, input_dir=str(tmp_path),
+        partition=BandPartition(protected_mask=ones, in_range_mask=ones),
+        e_dft_active_kn_ry=None, valence_mask_active_kn=None,
+        print_fn=lambda *a, **k: None,
+    )
+
+
+def test_reporting_converged_without_a_verdict_is_refused(tmp_path, monkeypatch):
+    """THE CELL FOR THE DEFECT THAT ACTUALLY HAPPENED.
+
+    The rCROP bug was not a wrong predicate -- the predicate was never
+    consulted.  rcrop_nojit declared convergence on its own L2 residual,
+    the driver relayed it, and nothing connected the word "converged" to
+    a measured max|dE|.  A unit test on the predicate cannot catch that.
+    This asserts the DRIVER refuses to report convergence it cannot
+    substantiate.
+    """
+    from gw import sc_iteration
+
+    cfg = _config(tmp_path, SC + "compute_mode = gn_ppm\n")
+
+    # A stage that "succeeds" but never fills verdict_out -- i.e. some
+    # other stopping rule decided, exactly as rCROP used to.
+    def _silent_success(state, inputs, **kw):
+        return state, [1.0]
+
+    monkeypatch.setattr(
+        sc_iteration, "run_self_consistency", _silent_success)
+    monkeypatch.setattr(
+        sc_iteration, "_kshard_eigh_kernels",
+        lambda mesh, *a, **k: (None, lambda H: np.zeros((2, 4))))
+
+    with pytest.raises(AssertionError, match="NO verdict"):
+        sc_iteration.run_staged_self_consistency(
+            sc_iteration.SCState(H_qp_dft=None, iteration=0),
+            _stub_inputs(cfg, tmp_path), stages=cfg.sc.stages)
+
+
+def test_converged_flag_must_agree_with_its_own_verdict(tmp_path, monkeypatch):
+    """A verdict that does not clear the cutoff cannot be reported converged."""
+    from gw import sc_iteration
+
+    cfg = _config(tmp_path, SC + "compute_mode = gn_ppm\n")
+    cutoff = cfg.sc.stages[0].cutoff_ev
+
+    def _lying_success(state, inputs, **kw):
+        v = kw.get("verdict_out")
+        if v is not None:
+            # max_abs 10x the cutoff, but the record claims converged.
+            v.append(sc_iteration.ConvergenceVerdict(
+                converged=True, max_abs_ev=10.0 * cutoff,
+                rms_protected_ev=0.0, rms_all_ev=0.0, n_protected=4,
+                n_total=4, worst_k=0, worst_band=0, cutoff_ev=cutoff))
+        return state, [1.0]
+
+    monkeypatch.setattr(sc_iteration, "run_self_consistency", _lying_success)
+    monkeypatch.setattr(
+        sc_iteration, "_kshard_eigh_kernels",
+        lambda mesh, *a, **k: (None, lambda H: np.zeros((2, 4))))
+
+    with pytest.raises(AssertionError, match="does not support it"):
+        sc_iteration.run_staged_self_consistency(
+            sc_iteration.SCState(H_qp_dft=None, iteration=0),
+            _stub_inputs(cfg, tmp_path), stages=cfg.sc.stages)

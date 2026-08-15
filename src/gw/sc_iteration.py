@@ -1695,7 +1695,7 @@ def run_self_consistency(
     if accelerator == "rcrop":
         return _run_rcrop(
             state_init, inputs,
-            max_iter=max_iter, tol_ev=tol_ev,
+            max_iter=max_iter,
             history_depth=history_depth,
             eigvalsh_kshard=eigvalsh_kshard,
             print_fn=print_fn,
@@ -1813,7 +1813,7 @@ def _run_linear_mixing(
 
 def _run_rcrop(
     state_init: SCState, inputs: SCInputs, *,
-    max_iter: int, tol_ev: float, history_depth: int,
+    max_iter: int, history_depth: int,
     eigvalsh_kshard, print_fn, dump_dir,
     cutoff_ev: float | None = None, snapshot_base: int = 0,
     stage_label: str = "SC", n_occ_active: int = 0,
@@ -1864,7 +1864,9 @@ def _run_rcrop(
     mesh = inputs.mesh_xy
     print_fn(
         f"  SC rCROP: history_depth={history_depth}, "
-        f"max_iter={max_iter}, tol={tol_ev:.1e} eV/band-RMS")
+        f"max_iter={max_iter}, criterion=max|ΔE| over the non-scissored "
+        f"bands < {(cutoff_ev or float('nan')) * 1e3:g} meV "
+        f"(rCROP itself has no stopping rule)")
     # PAD, DO NOT DEGRADE.  ``band_rotation_spec`` puts the two band axes
     # on the two mesh axes, so it needs px | nb and py | nb — the same
     # condition every other user of that spec is under.  What used to be
@@ -2083,35 +2085,37 @@ def _run_rcrop(
                     _res)
         return _to_entry(state_out.H_qp_dft - H)
 
-    # rCROP residual tolerance: ‖f‖₂ ≤ tol_ry · √(n_elem) ⇔ per-element
-    # RMS ≤ tol_ry.  Convert RMS ΔE in eV → Ry first.  ``n_elem`` is the
-    # LOGICAL element count on purpose: the pad modes contribute exactly
-    # zero to ‖f‖₂, so counting them would loosen the tolerance by
-    # nb_pad/nb per band axis for no physical reason.
-    tol_ry = tol_ev / RYD_TO_EV
-    tol_resid = float(np.sqrt(n_elem)) * tol_ry
-
-    # WHO OWNS CONVERGENCE.  When a stage cutoff governs, the L-infinity
-    # eigenvalue test is the SOLE authority and rCROP's own L2-on-H
-    # tolerance is disarmed (tol = 0), leaving the iteration budget as the
-    # only other stop.
+    # rCROP HAS NO STOPPING AUTHORITY.  ``tol=0.0`` is not a disarmed
+    # threshold; it is the statement that this solver's job is to
+    # ACCELERATE and the driver's job is to decide convergence, using the
+    # exact L-infinity eigenvalue test above.  That test is free: the map
+    # already diagonalises H to get QP energies.
     #
-    # This is not tidiness.  MEASURED on the Si 4x4x4 SOC deck at P=4
-    # (runs/Si/01_staged_sc_2026-08-14/logs/probe_p4_newso.log): with the
-    # residual tolerance armed, rCROP returned `converged=True` after 2
-    # iterations at ‖f‖₂ = 2.3618e-02 Ry (its threshold being
-    # √36864 · 2 meV/RYD_TO_EV = 2.82e-02) at the very call where the
-    # stage check read max|ΔE| = 0.120477 eV over the protected bands --
-    # SIXTY TIMES the 2 meV cutoff.  The docstring above converts between
-    # the two with "≈", and that ≈ is doing far more work than it looks:
-    # a per-element RMS over an (nk, nb, nb) OPERATOR is not a bound on
-    # the largest eigenvalue shift, so a stage that trusted it would stop
-    # early and report a converged label.  Leaving both armed would also
-    # make the stop reason ambiguous, which is how "converged" comes to
-    # mean "one of two different things, and the log does not say which".
-    if cutoff_ev is not None:
-        tol_resid = 0.0
-
+    # What used to be here was a residual threshold
+    # ``tol_resid = sqrt(n_elem) * tol_ev / RYD_TO_EV``, deleted rather
+    # than repaired.  The ``sqrt(n_elem)`` was the whole defect: the
+    # comment above it said it converted a per-band ENERGY tolerance into
+    # a per-element RMS on the MATRIX, but for Hermitian H, Weyl gives
+    #
+    #     |Δλ_i| ≤ ‖ΔH‖₂ ≤ ‖ΔH‖_F = ‖f‖₂
+    #
+    # so the only sound conversion is ``tol_resid = tol_ry``, with no
+    # sqrt at all.  Multiplying by sqrt(n_elem) loosens the bound by
+    # exactly the factor that destroys it.  MEASURED on the Si 4x4x4 SOC
+    # deck (carry (64, 24, 24), n_elem = 36864, sqrt = 192): at a 2 meV
+    # request the threshold became 2.8223e-02 Ry, rCROP stopped at
+    # ‖f‖₂ = 2.3618e-02 Ry reporting converged=True, and max|ΔE| over the
+    # non-scissored bands at that call was 0.120477 eV -- 60x the cutoff.
+    # The sound threshold, 1.4700e-04 Ry, is 161x BELOW the residual it
+    # stopped at, so it would not have stopped.  The arithmetic closes
+    # exactly: 192 (loosening) / 2.67 (Weyl slack, ‖ΔH‖_F/max|Δλ| here)
+    # = 72x projected overshoot at threshold, against 60x observed at the
+    # actual stop.  Nothing is unaccounted for.
+    #
+    # Note the deleted comment's care about LOGICAL vs PADDED n_elem: it
+    # was correct about padding and beside the point, fine-tuning a factor
+    # that should not have existed.  Local precision can disguise a global
+    # error, so the factor is gone rather than corrected.
     try:
         result = rcrop_nojit(
             residual_fn,
@@ -2119,7 +2123,7 @@ def _run_rcrop(
             x0,
             m=history_depth,
             maxit=max_iter,
-            tol=tol_resid,
+            tol=0.0,   # see above: rCROP does not decide convergence
             print_fn=None,  # we print our own RMS-ΔE history above
             entry_sharding=entry_sh,
         )
@@ -2143,17 +2147,19 @@ def _run_rcrop(
 
     print_fn(
         f"  SC rCROP done: {result.iterations} iterations, "
-        f"converged={bool(result.converged)}, "
-        f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry")
+        f"final ‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry "
+        f"(a DIAGNOSTIC: rCROP has no stopping rule, so it never reports "
+        f"convergence of its own)")
     if cutoff_ev is not None:
-        # NAME THE STOP REASON.  Reaching here at all means the stage
-        # criterion did NOT fire (that path raises), so the only honest
-        # readings are "budget exhausted" or "the solver stopped itself" --
-        # and with tol_resid disarmed above the second should be
-        # unreachable.  Say which, rather than assuming the budget: an
-        # earlier revision printed "exhausted its 5-iteration budget" over
-        # a solve that had run 2 iterations and stopped on its own
-        # residual, which is a false account of why the run ended.
+        # NAME THE STOP REASON.  Reaching here means the stage criterion
+        # did NOT fire (that path raises), and rCROP owns no stopping rule
+        # (tol=0.0), so "budget exhausted" is now the only reachable
+        # reading.  The other branch is kept as a refusal-shaped guard: if
+        # it ever prints, some caller reintroduced a residual threshold.
+        # Say which, rather than assuming: an earlier revision printed
+        # "exhausted its 5-iteration budget" over a solve that had run 2
+        # iterations and stopped on its own residual -- a false account of
+        # why the run ended.
         _stopped_early = (bool(result.converged)
                           or int(result.iterations) < int(max_iter))
         _why = (f"the rCROP solver stopped itself after "
@@ -2372,6 +2378,48 @@ def run_staged_self_consistency(
             "converged": bool(_v[-1].converged) if _v else False,
             "final_rms_ev": float(stage_rms[-1]) if stage_rms else float("nan"),
         })
+        # ── POSTCONDITION: "CONVERGED" MUST MEAN THE PREDICATE SAID SO ──
+        # The rCROP defect was NOT a bad predicate -- the predicate was
+        # never consulted.  A solver reported convergence on its own
+        # internal residual, the driver relayed it, and no assertion
+        # anywhere connected the word "converged" to a measured max|ΔE|.
+        # A unit test on the predicate could not have caught that; only a
+        # postcondition on the real run path can, so this lives here and
+        # not in tests/.
+        #
+        # It REFUSES rather than warns: a run that reports a converged
+        # QSGW result it cannot substantiate is worse than one that dies.
+        _rec = records[-1]
+        # (a) THE PREDICATE MUST HAVE BEEN CONSULTED AT ALL.  A stage that
+        #     ran map calls under a governing cutoff produces a verdict on
+        #     every non-trial call.  Zero verdicts means the loop ended for
+        #     a reason the convergence criterion never saw -- which is
+        #     precisely how rCROP used to end it.  Note this fires whether
+        #     or not the stage claims success: "stopped for an unexamined
+        #     reason" is the defect, and reporting it as merely
+        #     not-converged would hide it again.
+        if stage_rms and not _v:
+            raise AssertionError(
+                f"SC stage {idx} ({stage.mode.value}) ran "
+                f"{len(stage_rms)} map call(s) under a "
+                f"{stage.cutoff_ev * 1e3:g} meV cutoff but the convergence "
+                f"predicate produced NO verdict, so nothing ever measured "
+                f"max|ΔE| against that cutoff.  This is the exact shape of "
+                f"the rCROP defect (KNOWN_LORRAX_ISSUES, gw/sc_iteration): "
+                f"a stopping rule other than protected_band_convergence "
+                f"decided when the loop ended.")
+        # (b) AND IT MUST SUPPORT WHAT IS REPORTED.
+        if _rec["converged"]:
+            _final = _v[-1]
+            if not (_final.converged
+                    and _final.max_abs_ev < float(stage.cutoff_ev)):
+                raise AssertionError(
+                    f"SC stage {idx} ({stage.mode.value}) reports CONVERGED "
+                    f"but its own final verdict does not support it: "
+                    f"max|ΔE| = {_final.max_abs_ev * 1e3:.6f} meV against a "
+                    f"{stage.cutoff_ev * 1e3:g} meV cutoff "
+                    f"(verdict.converged={_final.converged}).")
+
         print_fn(
             f"  ── SC stage {idx}/{len(stages)} {stage.mode.value} DONE: "
             f"{len(stage_rms)} map calls, {wall:.1f} s "
