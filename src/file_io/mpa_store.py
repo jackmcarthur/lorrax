@@ -41,9 +41,10 @@ and BOTH ARE THE RIGHT SHAPE — the tables validate, the shape-vs-attr
 cross-check agrees, nothing refuses — whenever ``n_omega`` happens to
 equal the wedge extent.  Si 4³ reduces 64 q to 8 and an n_p = 4 fit
 samples 8 frequencies; that coincidence is one deck away, not one in a
-million.  So: the writer stamps 2, and :func:`read_qirr_tensor` is the
-WIDENED reader that accepts {1, 2} and discriminates on the RANK before
-it looks at anything else.  See that function for the full argument.
+million.  So: the writer stamps 2, ``qirr_store.read_tensor`` refuses
+any rank but 3 under its own stamp, and
+:func:`_refuse_unless_rank_matches_version` discriminates on the RANK
+before any reader here believes an extent.
 
 PRESENCE IS NEVER READINESS, PER FREQUENCY.  ``gw_init`` allocates a
 full-size zero ``W0`` before the screening that fills it exists, and the
@@ -81,10 +82,14 @@ Testing note: everything below is exercised host-side with plain h5py
 at LOGICAL extents.  The phdf5 FFI is not built on WSL, so the format
 is tested at its seams the way the symmetry lane tested the q_irr
 format; the ``SlabIO`` write path (where each rank contributes its own
-(μ, ν) hyperslab and no rank holds the whole array) gets its Perlmutter
-leg when this is integrated, and :func:`stamp_w_omega` exists for
-exactly that split — the producer writes the bytes with the machinery
-it already has and this stamps them.
+(μ, ν) hyperslab and no rank holds the whole array) has its Perlmutter
+leg in ``tests/multi_device/mpa_fit_stream_gate.py``, and
+:func:`stamp_w_omega` exists for exactly that split — the producer
+writes the bytes with the machinery it already has and this stamps
+them.  The serial :func:`allocate_w_omega` / :func:`write_w_slab` /
+:func:`allocate_fit_store` / :func:`write_fit_block` family is the HOST
+TEST SEAM those suites run on — zero ``src`` callers; production writes
+through the ``*_collective`` forms.
 """
 
 from __future__ import annotations
@@ -102,7 +107,8 @@ import numpy as np
 #: it moves next to ``QIRR_FORMAT_VERSION``.
 QIRR_FORMAT_VERSION_FREQ = 2
 
-#: Every version :func:`read_qirr_tensor` will read.  A reader that
+#: Every version :func:`_refuse_unless_rank_matches_version` accepts.
+#: A reader that
 #: reads an unknown version best-effort returns wrong numbers on the day
 #: the layout changes; a reader that accepts a KNOWN version without
 #: checking the rank returns wrong numbers on the day the layout gains
@@ -111,7 +117,7 @@ QIRR_FORMAT_VERSIONS_READABLE = (1, 2)
 
 #: Rank of the stored dataset THIS format adds — version 2 is
 #: ``(n_omega, n_q, N_μ, N_μ)``.  The rank is the discriminant, not a
-#: consistency nicety; see :func:`read_qirr_tensor`.
+#: consistency nicety; see :func:`_refuse_unless_rank_matches_version`.
 #:
 #: Version 1's rank is NOT restated here.  It is
 #: ``symmetry_maps.QIRR_RANK_BY_VERSION``'s to state and
@@ -147,6 +153,19 @@ FIT_TABLE_OWNER = "Omega_p"
 FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
 FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
 
+#: The two per-element fit diagnostics the format REQUIRES; everything
+#: else a fit measures is extra.  Single source for the names derived
+#: from them on disk — the ``fit_<k>`` datasets, the ``block_<k>_max``
+#: journal columns and the ``<k>_max_allowed`` certification attrs — so
+#: a third required diagnostic cannot be added at one site and missed at
+#: another.
+REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
+
+#: Every scalar-head fit model :func:`read_head_fit` knows how to
+#: interpret.  The reader refuses an unknown model rather than serving
+#: poles whose fitting protocol nobody can name.
+_HEAD_FIT_MODELS = ("fixed_dft_gn",)
+
 #: Bump when the fit store's layout changes.  Independent of the W
 #: format's version: the two files have separate lifetimes and a reader
 #: of one is not a reader of the other.
@@ -170,15 +189,18 @@ _SAMPLING_ORDER = ("protocol", "varpi", "n_p", "alpha", "omega_max")
 #: The attrs version 2 adds on top of the version-1 q_irr set — the
 #: EXACT difference between the two stamps, which is what makes the
 #: removability claim checkable: set these aside and the version number,
-#: and a v2 file's attrs must equal a v1 file's attr for attr.  Written
-#: out as a list rather than matched by an ``mpa_`` prefix so that an
+#: and a v2 file's attrs must equal a v1 file's attr for attr.  An
+#: explicit closed set rather than an ``mpa_`` prefix match, so that an
 #: attr added later to one format and not the other fails the comparison
-#: instead of being swallowed by a ``startswith``.  (``mpa_writer`` is
-#: deliberately absent: it says BY WHAT, not WHAT, and belongs with the
-#: timestamps the comparison already exempts.)
+#: instead of being swallowed by a ``startswith``; the sampling portion
+#: is derived from :data:`_SAMPLING_ORDER`, the one list of sampling
+#: keys.  (``mpa_writer`` is deliberately absent: it says BY WHAT, not
+#: WHAT, and belongs with the timestamps the comparison already
+#: exempts.)
 _MPA_OWNED_ATTRS = (
-    _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units", "mpa_protocol",
-    "mpa_varpi", "mpa_n_p", "mpa_alpha", "mpa_omega_max", "mpa_grid_hash",
+    _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units",
+    *("mpa_" + key for key in _SAMPLING_ORDER),
+    "mpa_grid_hash",
 )
 
 #: Bytes per complex128 element.  Named because it appears in the budget
@@ -631,11 +653,17 @@ def stamp_w_omega(
                 f"mpa_store: energy_unit must be one of "
                 f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
         ds.attrs["mpa_omega_units"] = unit
-        ds.attrs["mpa_protocol"] = san["protocol"]
-        ds.attrs["mpa_varpi"] = san["varpi"]
-        ds.attrs["mpa_n_p"] = np.int64(san["n_p"])
-        ds.attrs["mpa_alpha"] = np.int64(san["alpha"])
-        ds.attrs["mpa_omega_max"] = np.float64(san["omega_max"])
+        # THE SAMPLING ATTRS, in :data:`_SAMPLING_ORDER` — the one list
+        # of sampling keys.  ``_canonical_sampling`` already fixed the
+        # types (str, float64 array, int, int, float); ints and floats
+        # are stamped as fixed-width scalars.
+        for key in _SAMPLING_ORDER:
+            val = san[key]
+            if isinstance(val, int):
+                val = np.int64(val)
+            elif isinstance(val, float):
+                val = np.float64(val)
+            ds.attrs["mpa_" + key] = val
         ds.attrs["mpa_grid_hash"] = grid_hash
         ds.attrs["mpa_writer"] = "file_io.mpa_store"
         for key, val in extra.items():
@@ -706,6 +734,28 @@ def _mark_w_slab_ready(ds, mgrp, i_omega, ready):
     return int(led.sum())
 
 
+def _require_layout(arr, mesh_xy, spec, where):
+    """Refuse unless ``arr`` lies on ``NamedSharding(mesh_xy, spec)``.
+
+    Layout EQUIVALENCE, never spec equality: JAX canonicalizes specs (a
+    rank-3 array's trailing replicated entries are dropped, for one), so
+    two unequal specs can name ONE placement — and on a one-device mesh
+    every placement is the same bytes.  ``where`` is the complete
+    refusal message; the caller writes it because only the caller knows
+    what the array is and what its producer should have done.
+    """
+    from jax.sharding import NamedSharding
+
+    expected = NamedSharding(mesh_xy, spec)
+    mesh_size = int(np.prod(tuple(int(v) for v in mesh_xy.shape.values())))
+    sharding = getattr(arr, "sharding", None)
+    if not (isinstance(sharding, NamedSharding)
+            and sharding.mesh == mesh_xy
+            and (sharding.is_equivalent_to(expected, np.ndim(arr))
+                 or mesh_size == 1)):
+        raise ValueError(where)
+
+
 def write_w_slab_collective(
     dest,
     name,
@@ -724,7 +774,7 @@ def write_w_slab_collective(
     zero updates the small readiness ledger.  A failed data write therefore
     leaves the slab explicitly unready.
     """
-    from jax.sharding import NamedSharding, PartitionSpec as P
+    from jax.sharding import PartitionSpec as P
 
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -734,12 +784,11 @@ def write_w_slab_collective(
         raise ValueError(
             "write_w_slab_collective: global_shape must be "
             "(n_omega,n_q,n_mu,n_mu)")
-    expected = NamedSharding(mesh_xy, P(None, "x", "y"))
-    if getattr(W_q_munu, "sharding", None) != expected:
-        raise ValueError(
-            "write_w_slab_collective requires W on P(None,'x','y'); "
-            "the producer must return the native SlabIO layout rather "
-            "than resharding a bulk tensor at the writer seam")
+    _require_layout(
+        W_q_munu, mesh_xy, P(None, "x", "y"),
+        "write_w_slab_collective requires W on P(None,'x','y'); "
+        "the producer must return the native SlabIO layout rather "
+        "than resharding a bulk tensor at the writer seam")
     W4 = W_q_munu[None, ...]
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         io.write_slab(
@@ -836,8 +885,7 @@ def read_w_header(src, name, *, mode="r"):
                 f"mpa_store: {name!r} is format version {version}; the "
                 f"frequency-resolved readers are version "
                 f"{QIRR_FORMAT_VERSION_FREQ}.  Use "
-                f"qirr_store.read_tensor for a version-1 tensor, or "
-                f"read_qirr_tensor to dispatch on the version.")
+                f"qirr_store.read_tensor for a version-1 tensor.")
 
         # THE PARTIAL-STAMP REFUSAL, version 2's half.  The rank check
         # above settles which format this is; this settles whether the
@@ -879,13 +927,15 @@ def read_w_header(src, name, *, mode="r"):
                     f"every slab and a long one addresses slabs that do "
                     f"not exist.")
 
-        sampling = {
-            "protocol": qs.qirr_attr_str(ds, "mpa_protocol"),
-            "varpi": np.asarray(ds.attrs["mpa_varpi"], dtype=np.float64),
-            "n_p": int(ds.attrs["mpa_n_p"]),
-            "alpha": int(ds.attrs["mpa_alpha"]),
-            "omega_max": float(ds.attrs["mpa_omega_max"]),
-        }
+        # THE SAMPLING ATTRS, through :data:`_SAMPLING_ORDER` and back
+        # through ``_canonical_sampling`` — the same coercions the stamp
+        # used, run by the one function that owns them.  (The digest
+        # check below already re-canonicalises, so this adds no check
+        # that did not run before; it only runs one call earlier.)
+        sampling, _ = _canonical_sampling({
+            key: (qs.qirr_attr_str(ds, "mpa_" + key) if key == "protocol"
+                  else ds.attrs["mpa_" + key])
+            for key in _SAMPLING_ORDER})
         recomputed = omega_grid_digest(omega, line, sampling)
         stamped_hash = qs.qirr_attr_str(ds, "mpa_grid_hash")
         if stamped_hash != recomputed:
@@ -978,8 +1028,8 @@ def _refuse_unless_rank_matches_version(ds, name):
 
     THE VERSION-1 HALF OF THAT CHECK IS NO LONGER HERE, and its removal
     is the point rather than a simplification.  This function used to
-    enforce rank 3 under a version-1 stamp, and the docstring of
-    :func:`read_qirr_tensor` registered the reason as a follow-up in as
+    enforce rank 3 under a version-1 stamp, and the since-deleted
+    dispatcher registered the reason as a follow-up in as
     many words: a wrapper protects the callers who use it and nobody
     else, and the hazard is worst precisely for a caller who does not
     know the new layout exists.  ``qirr_store.read_tensor`` now runs that
@@ -1046,77 +1096,6 @@ def _refuse_unless_rank_matches_version(ds, name):
             f"axis is {_FREQ_ATTR_VALUE!r} — axis 0 — and nothing else "
             f"has been defined.")
     return version
-
-
-def read_qirr_tensor(src, name, *, mode="r", **kw):
-    """THE WIDENED READER: version 1 or 2, dispatched on the RANK.
-
-    ``qirr_store.read_tensor`` is the version-1 reader, and it refuses
-    any other version AND any rank but 3 under its own stamp — the hole
-    the frequency axis opened is closed there, at the reader every
-    unsuspecting consumer already calls, rather than here.  See
-    :func:`_refuse_unless_rank_matches_version` for the mechanism and for
-    why a version stamp alone does not close it.
-
-    So this is the reader a caller who may be handed EITHER layout should
-    ask, and what it adds is the dispatch plus version 2's own checks,
-    run before the tables are opened:
-
-    * version 1, rank 3 -> ``qirr_store.read_tensor``, untouched.  Every
-      keyword goes straight through, that reader makes its own rank
-      refusal, and the bytes that come back are the bytes that came back
-      before this module existed.
-    * version 2, rank 4 -> :func:`read_w_omega`, which returns the whole
-      frequency-resolved tensor.  Callers that want one slab or a few
-      columns should ask for those directly; this path exists so a
-      generic consumer is never SILENTLY wrong, not because reading all
-      of ω at once is a good idea.
-    * anything else -> refuse, naming the rank and the version.
-
-    A file with no version attr at all is legacy full-BZ and is
-    delegated to ``qirr_store.read_tensor`` unchanged, which is where
-    the no-attr-means-full rule lives.
-
-    THAT FOLLOW-UP IS DISCHARGED.  This docstring used to register one:
-    the version-1 rank check belonged INSIDE ``qirr_store.read_tensor``
-    rather than in a wrapper, because a wrapper protects the callers who
-    use it and nobody else, and it sat here only because the symmetry
-    checkpoint carrying that reader was still landing.  The checkpoint
-    landed with the refusal in ``read_tensor``, and this function is now
-    what the note asked it to become: the DISPATCHER, plus the two
-    checks that are genuinely this format's own — version 2's rank, and
-    the ``mpa_freq_axis`` cross-check in both directions.  See
-    :func:`_refuse_unless_rank_matches_version`.
-    """
-    qs = _qs()
-    with qs.QirrDest(src, mode) as grp:
-        if name not in grp:
-            raise KeyError(f"mpa_store: {name!r} is not in this file")
-        ds = grp[name]
-        if qs.QIRR_VERSION_ATTR not in ds.attrs:
-            return qs.read_tensor(grp, name, **kw)
-        version = _refuse_unless_rank_matches_version(ds, name)
-        if version == QIRR_FORMAT_VERSION_FREQ:
-            return read_w_omega(grp, name, **kw)
-        return qs.read_tensor(grp, name, **kw)
-
-
-def read_w_omega(src, name, *, require_ready=True, mode="r", **kw):
-    """The WHOLE (n_omega, n_q, N_μ, N_μ) tensor, slab by slab.
-
-    Present for the widened dispatcher and for tests, and it says so:
-    the owner's constraint is that all of ω does NOT fit in memory, so a
-    production consumer wants :func:`read_w_slab` or
-    :func:`read_w_columns`.  Reading everything is the thing the format
-    exists to make unnecessary.
-    """
-    header = read_w_header(src, name, mode=mode)
-    slabs = []
-    for i in range(header["n_omega"]):
-        arr, _ = read_w_slab(src, name, i, require_ready=require_ready,
-                             mode=mode, **kw)
-        slabs.append(np.asarray(arr))
-    return np.stack(slabs, axis=0), header
 
 
 def read_w_slab(
@@ -1233,6 +1212,8 @@ def read_w_slab(
     # never ``symmetry_maps.maps``.  Reaching a submodule is what stops
     # a service being replaceable, and ``test_layering`` enforces it.
     from symmetry_maps import unfold_isdf_operator
+    # Test seam only — the bulk to-device transfer below has zero
+    # production callers; production unfolds sharded in _finish_pole_read.
     full = unfold_isdf_operator(
         jnp.asarray(raw),
         irr_idx=can.irr_idx_q,
@@ -1433,6 +1414,62 @@ def _refuse_two_dim_sharding(spec, where):
         f"is computed against.  Shard the rows, loop the columns.")
 
 
+def _column_span(cols):
+    """``(lo, hi, sel)`` for a normalised column set.
+
+    ``[lo, hi)`` is the covering span; ``sel`` is ``None`` when the set
+    is contiguous (one HDF5 hyperslab) and the explicit point-selection
+    list when it is not.
+    """
+    lo, hi = int(cols[0]), int(cols[-1]) + 1
+    if (hi - lo) == int(cols.size):
+        return lo, hi, None
+    return lo, hi, cols.tolist()
+
+
+def _validate_column_request(header, q, mu_cols, tile_bytes, where,
+                             *, require_ready=True):
+    """The refusal set both all-frequency column readers share.
+
+    Returns ``(iq, cols, budget)`` — the checked q index, the
+    normalised columns and the tile-budget column count — or refuses:
+    over budget, frequency slabs missing, or q out of range, in that
+    order, each naming its arithmetic.
+    """
+    n_mu = int(header["n_mu"])
+    n_omega = int(header["n_omega"])
+    cols = normalise_columns(mu_cols, n_mu)
+    budget = choose_column_budget(n_mu, n_omega, tile_bytes)
+    if int(cols.size) > budget:
+        raise ValueError(
+            f"{where}: refusing {int(cols.size)} columns.  " +
+            describe_column_cost(n_mu, n_omega, int(cols.size),
+                                 tile_bytes) +
+            f"  A block spanning all {n_omega} frequencies is priced to "
+            f"be ONE of the small number of W_q(μ,ν) copies that fit at "
+            f"once; pass tile_bytes= to raise the budget deliberately, "
+            f"or loop the columns in blocks of {budget}.")
+    if require_ready and int(header["n_ready"]) != n_omega:
+        missing = np.flatnonzero(
+            ~np.asarray(header["data_ready"], dtype=bool))
+        raise ValueError(
+            f"{where}: {len(missing)} of {n_omega} "
+            f"frequency slabs are not ready (indices "
+            f"{missing[:8].tolist()}{'...' if len(missing) > 8 else ''})."
+            f"  A column block spans the WHOLE frequency axis, so a fit "
+            f"run on the ready half of the grid returns poles that are "
+            f"wrong rather than absent — the unwritten slabs read as "
+            f"zeros and the Padé solve happily fits them.  Fill the "
+            f"grid, or pass require_ready=False to inspect it.")
+    iq = int(q)
+    if not 0 <= iq < int(header["n_q_on_disk"]):
+        raise IndexError(
+            f"{where}: q={iq} is outside [0, "
+            f"{int(header['n_q_on_disk'])}); the tensor is stored on "
+            f"the {header['q_storage']} q axis.")
+    return iq, cols, budget
+
+
 def read_w_columns(
     src,
     name,
@@ -1478,53 +1515,18 @@ def read_w_columns(
     qs = _qs()
     header = read_w_header(src, name, mode=mode)
     _refuse_two_dim_sharding(out_spec, f"read_w_columns({name!r})")
-
     n_mu = header["n_mu"]
-    n_omega = header["n_omega"]
-    cols = normalise_columns(mu_cols, n_mu)
-    budget = choose_column_budget(n_mu, n_omega, tile_bytes)
-    if int(cols.size) > budget:
-        raise ValueError(
-            f"read_w_columns({name!r}): refusing "
-            f"{int(cols.size)} columns.  " +
-            describe_column_cost(n_mu, n_omega, int(cols.size),
-                                 tile_bytes) +
-            f"  A block spanning all {n_omega} frequencies is priced to "
-            f"be ONE of the small number of W_q(μ,ν) copies that fit at "
-            f"once; pass tile_bytes= to raise the budget deliberately, "
-            f"or loop the columns in blocks of {budget}.")
-
-    if require_ready and header["n_ready"] != n_omega:
-        missing = np.flatnonzero(~header["data_ready"])
-        raise ValueError(
-            f"read_w_columns({name!r}): {len(missing)} of {n_omega} "
-            f"frequency slabs are not ready (indices "
-            f"{missing[:8].tolist()}{'...' if len(missing) > 8 else ''})."
-            f"  A column block spans the WHOLE frequency axis, so a fit "
-            f"run on the ready half of the grid returns poles that are "
-            f"wrong rather than absent — the unwritten slabs read as "
-            f"zeros and the Padé solve happily fits them.  Fill the "
-            f"grid, or pass require_ready=False to inspect it.")
-
-    iq = int(q)
-    if not 0 <= iq < header["n_q_on_disk"]:
-        raise IndexError(
-            f"read_w_columns({name!r}): q={iq} is outside [0, "
-            f"{header['n_q_on_disk']}); the tensor is stored on the "
-            f"{header['q_storage']} q axis.")
+    iq, cols, _ = _validate_column_request(
+        header, q, mu_cols, tile_bytes, f"read_w_columns({name!r})",
+        require_ready=require_ready)
 
     # ONE HYPERSLAB, NOT ONE PER FREQUENCY.  A contiguous run becomes a
     # slice (HDF5 reads it as a single hyperslab); anything else is a
     # point selection on the LAST axis only, which h5py supports and
     # which keeps the row axis whole — the axis the caller shards.
-    lo, hi = int(cols[0]), int(cols[-1]) + 1
-    contiguous = (hi - lo) == int(cols.size)
+    lo, hi, sel = _column_span(cols)
     with qs.QirrDest(src, mode) as grp:
-        ds = grp[name]
-        if contiguous:
-            block = ds[:, iq, :, lo:hi]
-        else:
-            block = ds[:, iq, :, cols.tolist()]
+        block = grp[name][:, iq, :, slice(lo, hi) if sel is None else sel]
     block = np.asarray(block)
 
     if n_mu_padded is not None and int(n_mu_padded) != n_mu:
@@ -1569,35 +1571,20 @@ def read_w_columns_collective(
     hdr = read_w_header(src, name) if header is None else header
     n_mu = int(hdr["n_mu"])
     n_omega = int(hdr["n_omega"])
-    cols = normalise_columns(mu_cols, n_mu)
-    lo, hi = int(cols[0]), int(cols[-1]) + 1
-    if hi - lo != int(cols.size):
+    iq, cols, budget = _validate_column_request(
+        hdr, q, mu_cols, tile_bytes,
+        f"read_w_columns_collective({name!r})")
+    lo, hi, sel = _column_span(cols)
+    if sel is not None:
         raise ValueError(
             "read_w_columns_collective requires one contiguous column "
             "range; the production fit schedule emits contiguous blocks")
     width = int(n_cols_buffer)
-    budget = choose_column_budget(n_mu, n_omega, tile_bytes)
-    if int(cols.size) > budget:
-        raise ValueError(
-            f"read_w_columns_collective({name!r}): refusing "
-            f"{int(cols.size)} columns.  "
-            + describe_column_cost(n_mu, n_omega, int(cols.size), tile_bytes)
-            + f"  The column budget allows {budget}.")
     if width < int(cols.size) or width > budget:
         raise ValueError(
             f"read_w_columns_collective: n_cols_buffer={width}, actual "
             f"width={int(cols.size)}, budget={budget}; require "
             "actual <= buffer <= budget")
-    if int(hdr["n_ready"]) != n_omega:
-        missing = np.flatnonzero(~np.asarray(hdr["data_ready"], dtype=bool))
-        raise ValueError(
-            f"read_w_columns_collective({name!r}): {len(missing)} of "
-            f"{n_omega} frequency slabs are not ready")
-    iq = int(q)
-    if not 0 <= iq < int(hdr["n_q_on_disk"]):
-        raise IndexError(
-            f"read_w_columns_collective: q={iq} is outside [0, "
-            f"{int(hdr['n_q_on_disk'])})")
 
     spec = P(None, None, ("x", "y"), None)
     shape = mesh_divisible_shape(
@@ -1631,9 +1618,9 @@ def _initialise_fit_metadata(
     led.create_dataset("blocks_done", data=np.zeros((n_q, n_mu), dtype=bool))
     led.create_dataset("block_journal", shape=(0, 3), maxshape=(None, 3),
                        dtype=np.int64)
-    for key in ("block_condition_max", "block_backward_error_max"):
-        led.create_dataset(key, shape=(0,), maxshape=(None,),
-                           dtype=np.float64)
+    for key in REQUIRED_DIAGNOSTICS:
+        led.create_dataset("block_" + key + "_max", shape=(0,),
+                           maxshape=(None,), dtype=np.float64)
     if diagnostic_keys is not None:
         led.attrs["diagnostic_keys"] = ",".join(sorted(diagnostic_keys))
 
@@ -1721,10 +1708,9 @@ def allocate_fit_store(
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
-        grp.create_dataset("fit_condition", shape=(n_q, n_mu, n_mu),
-                           dtype=np.float64)
-        grp.create_dataset("fit_backward_error", shape=(n_q, n_mu, n_mu),
-                           dtype=np.float64)
+        for key in REQUIRED_DIAGNOSTICS:
+            grp.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
+                               dtype=np.float64)
 
         return fit_completion_ledger(grp)
 
@@ -1759,11 +1745,10 @@ def allocate_fit_store_collective(
             "must replace the inode so SlabIO can apply its rank-aware "
             "Lustre stripe policy")
     keys = tuple(sorted(str(k) for k in diagnostic_keys))
-    required = {"condition", "backward_error"}
-    if not required.issubset(keys):
+    if not set(REQUIRED_DIAGNOSTICS).issubset(keys):
         raise ValueError(
-            "allocate_fit_store_collective requires condition and "
-            "backward_error diagnostics")
+            "allocate_fit_store_collective requires "
+            + " and ".join(REQUIRED_DIAGNOSTICS) + " diagnostics")
     dtype = np.complex128 if dtype is None else dtype
     with SlabIO(dest, mode="w", mesh=mesh_xy) as io:
         io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -1813,6 +1798,39 @@ def _append(dset, values):
     dset[n:] = arr
 
 
+def _commit_fit_block(led, iq, cols, lo, hi, cond_max, berr_max):
+    """Advance the completion ledger for one block whose bytes landed.
+
+    THE JOURNAL RECORDS THE SPAN, ``blocks_done`` RECORDS THE TRUTH.
+    ``fit_schedule`` only ever emits contiguous blocks, so for a normal
+    walk the two agree exactly; a caller that hands a scattered
+    selection gets a span WIDER than its column count, which is why the
+    ledger and not the journal is what :func:`finalize_fit_store` and
+    :func:`read_fit_block` refuse on.  A sentinel in the journal would
+    have made "which columns" a question with two answers.
+    """
+    done = np.asarray(led["blocks_done"][()], dtype=bool)
+    done[iq, cols] = True
+    led["blocks_done"][...] = done
+    _append(led["block_journal"],
+            np.array([[iq, lo, hi]], dtype=np.int64))
+    for key, val in zip(REQUIRED_DIAGNOSTICS, (cond_max, berr_max)):
+        _append(led["block_" + key + "_max"], np.array([float(val)]))
+
+
+def _unit_scale(source_unit, to_unit, where):
+    """The multiplier taking energies from ``source_unit`` to ``to_unit``.
+
+    Both units must be declared in :data:`FIT_ENERGY_UNITS`; an
+    undeclared unit is refused rather than passed through at 1.0.
+    """
+    if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"{where}: both stored and requested energy units must be "
+            f"declared; stored={source_unit!r}, requested={to_unit!r}")
+    return FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+
+
 def write_head_fit(
     dest,
     sample_z,
@@ -1824,7 +1842,7 @@ def write_head_fit(
     fit_condition,
     fit_backward_error,
     fit_max_abs_residual,
-    model="multipole",
+    model,
     mode="a",
 ):
     """Write the complete scalar q->0 MPA fit and stamp readiness last.
@@ -1909,12 +1927,17 @@ def read_head_fit(src, *, to_unit=None, mode="r"):
             "residue": qs.qirr_attr_str(head, "residue_unit"),
         }
         model = qs.qirr_attr_str(head, "model")
-    if to_unit is not None:
-        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+        if model not in _HEAD_FIT_MODELS:
             raise ValueError(
-                "head read: both stored and requested energy units must be "
-                f"declared; stored={source_unit!r}, requested={to_unit!r}")
-        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+                f"read_head_fit: got scalar-head model {model!r}; want "
+                f"one of {_HEAD_FIT_MODELS} — the only fitting protocols "
+                f"this reader knows how to interpret, and a pole set "
+                f"whose protocol nobody can name cannot be consumed "
+                f"correctly.  Fix: refit the head with a known model, or "
+                f"teach _HEAD_FIT_MODELS the new one alongside its "
+                f"consumer.")
+    if to_unit is not None:
+        scale = _unit_scale(source_unit, to_unit, "head read")
         z, poles, residues = z * scale, poles * scale, residues * scale
         units["frequency"] = str(to_unit)
         units["residue"] = f"{to_unit}*a.u."
@@ -2029,15 +2052,14 @@ def write_fit_block(
                 f"journal would carry two entries for one column with "
                 f"no rule for which one the diagnostics belong to.")
 
-        lo, hi = int(cols[0]), int(cols[-1]) + 1
-        contiguous = (hi - lo) == int(cols.size)
-        sel = slice(lo, hi) if contiguous else cols.tolist()
+        lo, hi, sel = _column_span(cols)
+        sel = slice(lo, hi) if sel is None else sel
         grp["Omega_p"][:, iq, :, sel] = Om
         grp["B_p"][:, iq, :, sel] = Bp
-        grp["fit_condition"][iq, :, sel] = diag["condition"]
-        grp["fit_backward_error"][iq, :, sel] = diag["backward_error"]
+        for key in REQUIRED_DIAGNOSTICS:
+            grp["fit_" + key][iq, :, sel] = diag[key]
         for key, arr in diag.items():
-            if key in ("condition", "backward_error"):
+            if key in REQUIRED_DIAGNOSTICS:
                 continue
             name = "fit_" + key
             if name not in grp:
@@ -2045,22 +2067,9 @@ def write_fit_block(
                                    dtype=np.float64)
             grp[name][iq, :, sel] = arr
 
-        done[iq, cols] = True
-        led["blocks_done"][...] = done
-        # THE JOURNAL RECORDS THE SPAN, ``blocks_done`` RECORDS THE
-        # TRUTH.  ``fit_schedule`` only ever emits contiguous blocks, so
-        # for a normal walk the two agree exactly; a caller that hands a
-        # scattered selection gets a span WIDER than its column count,
-        # which is why the ledger and not the journal is what
-        # :func:`finalize_fit_store` and :func:`read_fit_block` refuse
-        # on.  A sentinel in the journal would have made "which columns"
-        # a question with two answers.
-        _append(led["block_journal"],
-                np.array([[iq, lo, hi]], dtype=np.int64))
-        _append(led["block_condition_max"],
-                np.array([float(np.max(diag["condition"]))]))
-        _append(led["block_backward_error_max"],
-                np.array([float(np.max(diag["backward_error"]))]))
+        _commit_fit_block(led, iq, cols, lo, hi,
+                          np.max(diag["condition"]),
+                          np.max(diag["backward_error"]))
         return fit_completion_ledger(grp)
 
 
@@ -2083,7 +2092,7 @@ def write_fit_block_collective(
     all collective writes have closed does rank zero advance the small
     completion ledger; a barrier publishes that commit to every rank.
     """
-    from jax.sharding import NamedSharding, PartitionSpec as P
+    from jax.sharding import PartitionSpec as P
 
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -2096,8 +2105,8 @@ def write_fit_block_collective(
         raise IndexError(
             f"write_fit_block_collective: q={iq} outside [0,{ledger['n_q']})")
     cols = normalise_columns(mu_cols, ledger["n_mu"])
-    lo, hi = int(cols[0]), int(cols[-1]) + 1
-    if hi - lo != int(cols.size):
+    lo, hi, sel = _column_span(cols)
+    if sel is not None:
         raise ValueError("write_fit_block_collective requires contiguous columns")
     already = cols[np.asarray(ledger["blocks_done"][iq, cols], dtype=bool)]
     if already.size:
@@ -2112,20 +2121,11 @@ def write_fit_block_collective(
     pole_spec = P(None, None, ("x", "y"), None)
     # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
     diag_spec = P(None, ("x", "y"))
-    expected_pole = NamedSharding(mesh_xy, pole_spec)
-    expected_diag = NamedSharding(mesh_xy, diag_spec)
-    mesh_size = int(np.prod(tuple(int(v) for v in mesh_xy.shape.values())))
-
-    def _on(arr, expected):
-        sharding = getattr(arr, "sharding", None)
-        return (isinstance(sharding, NamedSharding)
-                and sharding.mesh == mesh_xy
-                and (sharding.is_equivalent_to(expected, arr.ndim)
-                     or mesh_size == 1))
 
     Om, Bp = Omega_p_block, B_p_block
-    if not _on(Om, expected_pole) or not _on(Bp, expected_pole):
-        raise ValueError(
+    for arr in (Om, Bp):
+        _require_layout(
+            arr, mesh_xy, pole_spec,
             "write_fit_block_collective requires Omega_p and B_p on "
             "P(None,None,('x','y'),None)")
     n_p, one, n_rows, width = map(int, Om.shape)
@@ -2152,10 +2152,10 @@ def write_fit_block_collective(
             raise ValueError(
                 f"write_fit_block_collective: diagnostic {key!r} has "
                 f"shape {tuple(arr.shape)}, expected {(1, n_rows, width)}")
-        if not _on(arr, expected_diag):
-            raise ValueError(
-                f"write_fit_block_collective: diagnostic {key!r} must be "
-                "on P(None,('x','y'),None)")
+        _require_layout(
+            arr, mesh_xy, diag_spec,
+            f"write_fit_block_collective: diagnostic {key!r} must be "
+            "on P(None,('x','y'),None)")
 
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
@@ -2174,16 +2174,9 @@ def write_fit_block_collective(
 
     if process_rank() == 0:
         with _qs().QirrDest(dest, "a") as grp:
-            led = _open_fit(grp)
-            done = np.asarray(led["blocks_done"][()], dtype=bool)
-            done[iq, cols] = True
-            led["blocks_done"][...] = done
-            _append(led["block_journal"],
-                    np.array([[iq, lo, hi]], dtype=np.int64))
-            _append(led["block_condition_max"],
-                    np.array([float(block_condition_max)]))
-            _append(led["block_backward_error_max"],
-                    np.array([float(block_backward_error_max)]))
+            _commit_fit_block(_open_fit(grp), iq, cols, lo, hi,
+                              block_condition_max,
+                              block_backward_error_max)
     barrier(f"mpa_fit_block_{iq}_{lo}_{hi}_committed")
     return fit_completion_ledger(dest)
 
@@ -2201,8 +2194,7 @@ def _canonical_diagnostics(diag_block, n_rows, n_cols):
             f"write_fit_block: diag_block must be a dict with "
             f"'condition' and 'backward_error'; got "
             f"{type(diag_block).__name__}")
-    missing = [k for k in ("condition", "backward_error")
-               if k not in diag_block]
+    missing = [k for k in REQUIRED_DIAGNOSTICS if k not in diag_block]
     if missing:
         raise ValueError(
             f"write_fit_block: diag_block is missing {missing}.  The Σ "
@@ -2248,9 +2240,11 @@ def fit_completion_ledger(src, *, mode="r"):
         led = _open_fit(grp)
         done = np.asarray(led["blocks_done"][()], dtype=bool)
         journal = np.asarray(led["block_journal"][()], dtype=np.int64)
-        cond = np.asarray(led["block_condition_max"][()], dtype=np.float64)
-        berr = np.asarray(led["block_backward_error_max"][()],
-                          dtype=np.float64)
+        maxima = {
+            key: np.asarray(led["block_" + key + "_max"][()],
+                            dtype=np.float64)
+            for key in REQUIRED_DIAGNOSTICS
+        }
         certification = {
             str(key)[len("mpa_cert_"):]: grp.attrs[key]
             for key in grp.attrs if str(key).startswith("mpa_cert_")
@@ -2259,7 +2253,7 @@ def fit_completion_ledger(src, *, mode="r"):
             str(key)[len("prov_"):]: grp.attrs[key]
             for key in grp.attrs if str(key).startswith("prov_")
         }
-        return {
+        out = {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
@@ -2279,14 +2273,14 @@ def fit_completion_ledger(src, *, mode="r"):
             "n_done": int(done.sum()),
             "n_total": int(done.size),
             "journal": journal,
-            "block_condition_max": cond,
-            "block_backward_error_max": berr,
-            "condition_max": float(cond.max()) if cond.size else None,
-            "backward_error_max": float(berr.max()) if berr.size else None,
             "finalized_utc": qs.qirr_attr_str(grp, "mpa_fit_finalized_utc"),
             "certification": certification,
             "provenance": provenance,
         }
+        for key, vals in maxima.items():
+            out["block_" + key + "_max"] = vals
+            out[key + "_max"] = float(vals.max()) if vals.size else None
+        return out
 
 
 def validate_fit_store(src, *, expected_identity=None, mode="r"):
@@ -2310,28 +2304,21 @@ def validate_fit_store(src, *, expected_identity=None, mode="r"):
             raise ValueError(
                 f"MPA fit identity mismatch for {key}: got {got!r}, "
                 f"expected {want!r}")
-    required = (
-        "condition_max_allowed",
-        "backward_error_max_allowed",
-    )
-    missing = [key for key in required
-               if key not in ledger["certification"]]
+    missing = [key + "_max_allowed" for key in REQUIRED_DIAGNOSTICS
+               if key + "_max_allowed" not in ledger["certification"]]
     if missing:
         raise ValueError(
             "MPA Sigma requires certified pole fits; the store is missing "
             + ", ".join(missing))
-    observed = {
-        "condition_max": ledger["condition_max"],
-        "backward_error_max": ledger["backward_error_max"],
-    }
-    for key in required:
+    for metric_key in REQUIRED_DIAGNOSTICS:
+        key = metric_key + "_max_allowed"
         allowed = ledger["certification"][key]
         if not np.isfinite(float(allowed)) or float(allowed) <= 0.0:
             raise ValueError(
                 f"MPA fit has invalid stored certification {key}="
                 f"{allowed!r}")
-        metric = str(key)[:-len("_allowed")]
-        got = observed[metric]
+        metric = metric_key + "_max"
+        got = ledger[metric]
         if got is None or float(got) > float(allowed):
             raise ValueError(
                 f"MPA fit failed its stored certification: {metric}="
@@ -2382,14 +2369,12 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
                 (" ..." if len(gaps) > 6 else "") +
                 "  Stamping it complete would tell the Σ stage that "
                 "zeros are poles.")
-        cond = np.asarray(led["block_condition_max"][()])
-        berr = np.asarray(led["block_backward_error_max"][()])
         grp.attrs["mpa_fit_complete"] = True
         grp.attrs["mpa_fit_finalized_utc"] = _utc_now()
-        grp.attrs["mpa_fit_condition_max"] = np.float64(
-            cond.max() if cond.size else 0.0)
-        grp.attrs["mpa_fit_backward_error_max"] = np.float64(
-            berr.max() if berr.size else 0.0)
+        for key in REQUIRED_DIAGNOSTICS:
+            vals = np.asarray(led["block_" + key + "_max"][()])
+            grp.attrs["mpa_fit_" + key + "_max"] = np.float64(
+                vals.max() if vals.size else 0.0)
         grp.attrs["mpa_fit_n_blocks"] = np.int64(
             int(led["block_journal"].shape[0]))
         for key, val in (certification or {}).items():
@@ -2454,19 +2439,15 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
                 f"zeros, which is a converged-looking dark channel and "
                 f"not an absent one, so the refusal is on the LEDGER "
                 f"and never on the data.")
-        lo, hi = int(cols[0]), int(cols[-1]) + 1
-        contiguous = (hi - lo) == int(cols.size)
-        sel = slice(lo, hi) if contiguous else cols.tolist()
+        lo, hi, sel = _column_span(cols)
+        sel = slice(lo, hi) if sel is None else sel
         Om = np.asarray(grp["Omega_p"][:, iq, :, sel])
         Bp = np.asarray(grp["B_p"][:, iq, :, sel])
-        diag = {
-            "condition": np.asarray(grp["fit_condition"][iq, :, sel]),
-            "backward_error": np.asarray(
-                grp["fit_backward_error"][iq, :, sel]),
-        }
+        required_ds = tuple("fit_" + k for k in REQUIRED_DIAGNOSTICS)
+        diag = {k: np.asarray(grp["fit_" + k][iq, :, sel])
+                for k in REQUIRED_DIAGNOSTICS}
         for key in grp:
-            if str(key).startswith("fit_") and key not in (
-                    "fit_condition", "fit_backward_error"):
+            if str(key).startswith("fit_") and key not in required_ds:
                 diag[str(key)[len("fit_"):]] = np.asarray(
                     grp[key][iq, :, sel])
         return Om, Bp, diag, ledger
@@ -2475,8 +2456,10 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
 def read_fit_tensors(src, *, allow_partial=False, mode="r"):
     """The whole ``(Omega_p, B_p, diagnostics, ledger)``.
 
-    For the Σ stage, which consumes every pole of every element at a q,
-    and for tests.  Same finalize refusal as :func:`read_fit_block`.
+    For tests and offline inspection.  The Σ stage does NOT read this —
+    it streams contiguous pole ranges through :func:`read_poles` and
+    never holds the whole tensor.  Same finalize refusal as
+    :func:`read_fit_block`.
     """
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
@@ -2558,14 +2541,9 @@ def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy):
 def _finish_pole_read(
     src, Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
 ):
-    """Apply the one unit/unfold/gather policy shared by pole readers."""
+    """Apply the one unit/unfold policy shared by pole readers."""
     if to_unit is not None:
-        source_unit = ledger["energy_unit"]
-        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
-            raise ValueError(
-                "pole read: both stored and requested energy units must be "
-                f"declared; stored={source_unit!r}, requested={to_unit!r}")
-        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        scale = _unit_scale(ledger["energy_unit"], to_unit, "pole read")
         Omega, Bp = Omega * scale, Bp * scale
 
     if unfold and ledger["q_storage"] == "ibz":
@@ -2584,14 +2562,23 @@ def _finish_pole_read(
                 zip(*(unfold_pole_field(Omega[p], Bp[p], tables,
                                         mesh_xy=mesh_xy)
                       for p in range(int(Omega.shape[0])))))
-    if return_sharded:
-        if mesh_xy is None:
-            raise ValueError("return_sharded requires mesh_xy")
-        return Omega, Bp
-    if mesh_xy is not None:
-        from common.collectives import gather_to_host
-        return gather_to_host(Omega), gather_to_host(Bp)
+    if return_sharded and mesh_xy is None:
+        raise ValueError("return_sharded requires mesh_xy")
     return Omega, Bp
+
+
+def _pole_read_shape(ledger, mesh_xy):
+    """Global read shape for one pole range's trailing (q, μ, ν) axes.
+
+    Deliberately ``runtime.padding.padded_mu_extent`` and NOT
+    ``slab_io.mesh_divisible_shape``: the unfold's all_to_all needs the
+    μ extent divisible by the device PRODUCT, not merely by each mesh
+    axis.
+    """
+    from runtime.padding import padded_mu_extent
+
+    n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
+    return ledger["n_q"], n_pad, n_pad
 
 
 def read_poles(
@@ -2608,10 +2595,17 @@ def read_poles(
     """Read one contiguous pole range with two collective SlabIO reads.
 
     The leading pole axis is always retained.  ``pole_slice=None`` reads it
-    completely; an integer reads a length-one range.  This is the sole pole
-    tensor reader—the singular/plural compatibility wrappers below add no
-    I/O policy of their own.
+    completely; an integer reads a length-one range.  This is the sole
+    pole tensor reader.  A mesh read is always sharded — pass
+    ``return_sharded=True`` with ``mesh_xy``; there is no gather path.
     """
+    if mesh_xy is not None and not return_sharded:
+        raise ValueError(
+            "read_poles: got mesh_xy with return_sharded=False; want "
+            "return_sharded=True on every mesh read — the collective "
+            "read lands sharded and every mesh caller consumes that "
+            "layout, so no gather path exists.  Fix: pass "
+            "return_sharded=True, or drop mesh_xy for a host-side read.")
     qs = _qs()
     with qs.QirrDest(src, mode) as grp:
         ledger = fit_completion_ledger(grp)
@@ -2634,11 +2628,9 @@ def read_poles(
 
     if mesh_xy is not None:
         from jax.sharding import PartitionSpec as P
-        from runtime.padding import padded_mu_extent
         from file_io.slab_io import SlabIO
 
-        n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
-        shape = (hi - lo, ledger["n_q"], n_pad, n_pad)
+        shape = (hi - lo, *_pole_read_shape(ledger, mesh_xy))
         with SlabIO(src, mode="r", mesh=mesh_xy) as io:
             Omega = io.read_slab(
                 "Omega_p", shape=shape, offset=(lo, 0, 0, 0),

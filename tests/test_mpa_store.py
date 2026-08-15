@@ -6,8 +6,9 @@ built on WSL, so the format is tested where its claims actually live —
 the attrs, the ranks, the ledgers and the refusals — exactly the way the
 symmetry lane tested the q_irr format it extends.  The ``SlabIO`` write
 path, where every rank contributes its own (μ, ν) hyperslab and no rank
-holds the whole array, is what ``mpa_store.stamp_w_omega`` exists for and
-it gets its PERLMUTTER LEG WHEN THIS IS INTEGRATED.  Nothing here claims
+holds the whole array, is what ``mpa_store.stamp_w_omega`` exists for;
+its Perlmutter leg is ``tests/multi_device/mpa_fit_stream_gate.py``.
+Nothing here claims
 multi-rank coverage; ``test_the_column_block_is_sharded_on_rows_only``
 tests the REFUSAL that keeps the sharding 1-D, not the sharding itself.
 
@@ -38,41 +39,17 @@ import pytest
 h5py = pytest.importorskip("h5py")
 pytest.importorskip("symmetry_maps.qirr_store")
 
-from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
-                           verify_centroid_orbit_closure)
+from symmetry_maps import verify_centroid_orbit_closure           # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import tiling                                         # noqa: E402
+from tests._mpa_test_geometry import (                            # noqa: E402
+    FFT as _FFT, SYMS as _SYMS, TNP as _TNP, N_Q_FULL as _N_Q_FULL,
+    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, closed_centroid_set, geometry)
 
-#: The synthetic FFT grid the centroid set lives on.
-_FFT = np.array([12, 12, 12], dtype=np.int64)
-
-#: A GLIDE: {σ_z | τ = (1/2, 0, 0)}.  Order two — applying it twice gives
-#: {I | (1, 0, 0)} ≡ the identity mod the lattice — so {I, g} is a group
-#: and the orbits really close.  τ×grid = (6, 0, 0) is integer on the
-#: 12-grid, so images land on grid points.  Copied in spirit from the
-#: symmetry lane's umklapp arm because it is the one in-memory geometry
-#: in the tree whose L rows are non-trivial.
-_SYMS = np.stack([np.eye(3, dtype=np.int64),
-                  np.diag([1, 1, -1]).astype(np.int64)])
-_TNP = np.array([[0.0, 0.0, 0.0], [np.pi, 0.0, 0.0]])
-
-#: 5 full-BZ q folding onto 3 IBZ parents, two of them through the
-#: TIME-REVERSED rows (index >= n_sym_spatial = 2), so the antiunitary
-#: branch of the unfold is live at every frequency.
-_IRR = np.array([0, 1, 1, 2, 2], dtype=np.int32)
-_SYM = np.array([0, 1, 0, 3, 0], dtype=np.int32)
-_N_SYM_SPATIAL = 2
-_N_Q_IBZ = 3
-_N_Q_FULL = 5
-
-#: IBZ q's with non-zero components on every axis, so exp(2πi q·L) is
-#: not accidentally 1.
-_Q_IRR = np.array([[0.0, 0.0, 0.0],
-                   [1 / 3, 0.0, 1 / 4],
-                   [0.0, 1 / 3, 1 / 3]])
-
+#: Eight seeds whose glide orbits union to this suite's centroid set;
+#: the builder itself lives in tests/_mpa_test_geometry.py.
 _SEEDS = ((0, 0, 0), (4, 5, 0), (2, 2, 6), (9, 7, 6),
           (1, 2, 3), (7, 3, 4), (1, 1, 1), (5, 8, 9))
 
@@ -84,33 +61,15 @@ _SAMPLING = {"varpi": [0.1, 1.0], "n_p": 3, "alpha": 1,
 
 
 # ---------------------------------------------------------------------------
-# Geometry
+# Geometry — one shared builder, this suite's seeds
 # ---------------------------------------------------------------------------
 
 def _closed_centroid_set():
-    """The union of the seeds' orbits — closed under the group by
-    definition, so the closure verdict is a property of this function."""
-    S = np.asarray(_SYMS, dtype=np.float64)
-    rinv = np.rint(np.linalg.inv(S)).astype(np.int64)
-    tint = np.rint(np.asarray(_TNP, dtype=np.float64) / (2.0 * np.pi)
-                   * _FFT).astype(np.int64)
-    imgs = set()
-    for r in np.asarray(_SEEDS, dtype=np.int64):
-        for s in range(S.shape[0]):
-            imgs.add(tuple(((rinv[s] @ r + tint[s]) % _FFT).tolist()))
-    return np.array(sorted(imgs), dtype=np.int32)
+    return closed_centroid_set(_SEEDS)
 
 
 def _geometry():
-    """``(tables, verdict, n_mu)`` for the synthetic closed set."""
-    cent = _closed_centroid_set()
-    verdict = verify_centroid_orbit_closure(
-        cent.astype(np.float64) / _FFT, _SYMS, tnp=_TNP, fft_grid=_FFT)
-    assert verdict.closed, verdict.describe()
-    perm, L = centroid_source_map_and_wrap(
-        cent, _SYMS, _TNP, _FFT, validate=True, extend_trs=True)
-    tables = QS.QirrTables(_IRR, _SYM, _Q_IRR, perm, L, _N_SYM_SPATIAL)
-    return tables, verdict, int(cent.shape[0])
+    return geometry(_SEEDS)
 
 
 def _w_omega(n_omega, n_q, n_mu, seed=17):
@@ -241,33 +200,26 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
 
     calls = []
 
-    class FakeSlabIO:
+    class RecordingSlabIO(HostSlabIO):
+        """The shared host shim, plus the call census this test needs."""
+
         def __init__(self, path, *, mode, mesh):
             calls.append(("open", mode, mesh))
-            self.file = h5py.File(path, mode)
+            super().__init__(path, mode=mode, mesh=mesh)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            self.file.close()
+        def __exit__(self, *exc):
+            super().__exit__(*exc)
             calls.append(("close",))
 
-        def create_dataset(self, name, *, shape, dtype):
-            calls.append(("create", name, tuple(shape)))
-            self.file.create_dataset(name, shape=shape, dtype=dtype)
+        def create_dataset(self, name, **kw):
+            calls.append(("create", name))
+            super().create_dataset(name, **kw)
 
-        def write_slab(self, name, value, *, offset, global_shape):
-            host = np.asarray(value)
-            valid = tuple(min(host.shape[d], global_shape[d] - offset[d])
-                          for d in range(host.ndim))
-            target = tuple(slice(offset[d], offset[d] + valid[d])
-                           for d in range(host.ndim))
-            source = tuple(slice(0, n) for n in valid)
-            self.file[name][target] = host[source]
-            calls.append(("write", name, tuple(offset), valid))
+        def write_slab(self, name, value, **kw):
+            super().write_slab(name, value, **kw)
+            calls.append(("write", name))
 
-    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     monkeypatch.setattr(collectives, "process_rank", lambda: 0)
     monkeypatch.setattr(collectives, "barrier", lambda _name: False)
 
@@ -300,29 +252,19 @@ def test_collective_reader_keeps_one_frequency_slab_sharded(
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     calls = []
 
-    class FakeSlabIO:
-        def __init__(self, path, *, mode, mesh):
-            self.path = path
+    class RecordingSlabIO(HostSlabIO):
+        """The shared host shim, plus the open/close census."""
 
         def __enter__(self):
             calls.append("open")
-            return self
+            return super().__enter__()
 
-        def __exit__(self, *_):
+        def __exit__(self, *exc):
             calls.append("close")
-
-        def read_slab(self, name, *, shape, offset, valid_shape,
-                      partition_spec):
-            with h5py.File(self.path, "r") as f:
-                raw = np.asarray(f[name][offset[0]:offset[0] + 1])
-            out = np.zeros(shape, dtype=raw.dtype)
-            out[tuple(slice(0, n) for n in raw.shape)] = raw
-            import jax
-            from jax.sharding import NamedSharding
-            return jax.device_put(out, NamedSharding(_mesh(), partition_spec))
+            super().__exit__(*exc)
 
     import file_io.slab_io as slab_io
-    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     got, header = MS.read_w_slab_collective(
         tmpdir_path, "W_qmunu_omega", 1, mesh_xy=_mesh())
     np.testing.assert_array_equal(np.asarray(got), W[1])
@@ -653,9 +595,9 @@ def test_the_walk_covers_every_column_exactly_once():
 # Arm 6 — the version-2 discriminant.  THE RED TWIN THAT MOTIVATES IT.
 # ---------------------------------------------------------------------------
 
-def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
+def test_a_rank_4_tensor_stamped_version_1_is_refused_by_the_v1_reader(
         tmpdir_path):
-    """THE HAZARD, CONSTRUCTED — and now refused by BOTH readers.
+    """THE HAZARD, CONSTRUCTED — and refused where every consumer reads.
 
     The malicious case is built to be maximally quiet: ``n_omega`` is
     chosen EQUAL to the wedge extent, so a version-1 reader's
@@ -676,15 +618,13 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
     which put the check inside ``read_tensor`` above ``read_tables`` and
     before any extent is believed.  So the assertion is inverted here
     rather than deleted: the line that used to pin the corruption now
-    pins its absence, and the test keeps its job of being the red twin
-    that says which reader is protecting whom.
+    pins its absence.
 
-    Both refusals are asserted because they protect different people.
-    ``qirr_store.read_tensor`` protects the consumer who has never heard
-    of a frequency axis and is simply reading a restart file — that is
-    the one that matters, and it is the one that did not exist before.
-    ``mpa_store.read_qirr_tensor`` protects the consumer who knows both
-    layouts and asked the dispatcher.
+    ``qirr_store.read_tensor`` is where the refusal matters: it protects
+    the consumer who has never heard of a frequency axis and is simply
+    reading a restart file.  (``mpa_store``'s dispatcher wrapper, which
+    reached the same refusal by delegation, is deleted — a wrapper
+    protects only the callers who use it.)
     """
     tables, verdict, n_mu = _geometry()
     n_omega = _N_Q_IBZ            # THE COINCIDENCE, on purpose
@@ -710,55 +650,6 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
     assert "qirr_format_version=1" in msg and "rank 3" in msg, msg
     assert "rank 4" in msg or str(tuple(W.shape)) in msg, msg
     assert "RANK IS THE DISCRIMINANT" in msg, msg
-
-    # AND THROUGH THE DISPATCHER, which reaches the same refusal by
-    # delegating rather than by keeping a second copy of it.
-    with pytest.raises(ValueError) as exc2:
-        MS.read_qirr_tensor(tmpdir_path, name, unfold=False)
-    msg2 = str(exc2.value)
-    assert "rank 3" in msg2 and "RANK IS THE DISCRIMINANT" in msg2, msg2
-
-
-def test_the_widened_reader_dispatches_both_versions(tmpdir_path):
-    """{1, 2} through one door, and the v1 bytes are untouched.
-
-    The dispatcher exists so a generic consumer is never SILENTLY
-    wrong.  It must therefore be a no-op for the case that already
-    worked: a version-1 file read through it is the same array and the
-    same header the version-1 reader returns, ``array_equal`` and
-    field for field.
-    """
-    W, tables, verdict, _, _, _ = _write_w(tmpdir_path, n_omega=4)
-    v1 = tmpdir_path.replace("w.h5", "v1.h5")
-    QS.write_qirr_tensor(v1, "W0_qmunu", W[0], tables=tables,
-                         closure_verdict=verdict)
-
-    a, ha = QS.read_tensor(v1, "W0_qmunu", unfold=False)
-    b, hb = MS.read_qirr_tensor(v1, "W0_qmunu", unfold=False)
-    assert np.array_equal(a, b)
-    assert ha == hb
-
-    full, hdr = MS.read_qirr_tensor(tmpdir_path, "W_qmunu_omega")
-    assert full.shape == W.shape
-    assert np.array_equal(full, W)
-    assert hdr["format_version"] == 2
-
-
-def test_a_rank_3_dataset_stamped_version_2_refuses(tmpdir_path):
-    """RED, the mirror: version 2 without the axis is not version 2.
-
-    The discriminant runs both directions.  A rank-3 dataset stamped 2
-    is a file claiming a frequency axis it does not have, which would
-    make ``ds[i]`` a q row read as a whole slab.
-    """
-    W, tables, verdict, _, _, _ = _write_w(tmpdir_path, n_omega=4)
-    v1 = tmpdir_path.replace("w.h5", "v1.h5")
-    QS.write_qirr_tensor(v1, "W0_qmunu", W[0], tables=tables,
-                         closure_verdict=verdict)
-    with h5py.File(v1, "a") as f:
-        f["W0_qmunu"].attrs[QS.QIRR_VERSION_ATTR] = np.int64(2)
-    with pytest.raises(ValueError, match="rank 4"):
-        MS.read_qirr_tensor(v1, "W0_qmunu", unfold=False)
 
 
 def test_the_frequency_attr_and_the_version_must_agree(tmpdir_path):
@@ -1032,7 +923,7 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
     MS.write_head_fit(
         tmpdir_path, z, wc, poles, residues, energy_unit="Ha",
         fit_condition=17.0, fit_backward_error=2.0e-12,
-        fit_max_abs_residual=4.0e-8)
+        fit_max_abs_residual=4.0e-8, model="fixed_dft_gn")
 
     got = MS.read_head_fit(tmpdir_path, to_unit="Ry")
     np.testing.assert_array_equal(got["sample_z"], 2.0 * z)
