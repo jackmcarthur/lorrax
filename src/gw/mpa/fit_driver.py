@@ -53,6 +53,7 @@ from file_io import mpa_store
 from gw.mpa import pade_fit, tiling
 
 __all__ = [
+    "fit_scalar_samples",
     "fit_one_block",
     "format_cost_report",
     "run_fit_driver",
@@ -74,6 +75,60 @@ _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
 _FIT_SOLVE = "loewner"
 _FIT_AFFINE = True
 _FIT_EIG = "jax_qr"
+
+
+@functools.lru_cache(maxsize=None)
+def _scalar_fit_kernel(n_p, guard_items, rcond):
+    """One replicated scalar fit using the production Loewner policy."""
+    import jax
+    import jax.numpy as jnp
+
+    guards = dict(guard_items)
+    n = int(n_p)
+
+    @jax.jit
+    def _kernel(samples, z):
+        return pade_fit.fit_mpa_poles(
+            samples, z, n, guards=guards, rcond=float(rcond),
+            solve=_FIT_SOLVE, affine=_FIT_AFFINE, eig=_FIT_EIG)
+
+    return _kernel
+
+
+def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
+    """Fit one scalar Wc sample vector with the body driver's exact policy."""
+    import jax
+    import jax.numpy as jnp
+
+    n = int(n_p)
+    z = np.asarray(z_samples, dtype=np.complex128)
+    wc = np.asarray(Wc, dtype=np.complex128)
+    if z.shape != (2 * n,) or wc.shape != z.shape:
+        raise ValueError(
+            "scalar MPA head requires Wc and z with shape (2*n_p,); "
+            f"got Wc={wc.shape}, z={z.shape}, n_p={n}")
+    resolved = pade_fit._resolve_guards(guards)
+    kernel = _scalar_fit_kernel(
+        n, tuple(sorted(resolved.items())), float(rcond))
+    Omega, B, diagnostics = kernel(
+        jnp.asarray(wc), jnp.asarray(z))
+    Omega, B, diagnostics = jax.device_get((Omega, B, diagnostics))
+    valid = np.asarray(diagnostics["valid"], dtype=bool)
+    if not np.any(valid):
+        raise ValueError("scalar MPA head fit rejected every pole")
+    return {
+        "Omega_p": np.asarray(Omega, dtype=np.complex128)[valid],
+        "B_p": np.asarray(B, dtype=np.complex128)[valid],
+        "condition": float(np.asarray(diagnostics["cond_pade"])),
+        "backward_error": float(np.asarray(diagnostics["backward_error"])),
+        "max_abs_residual": float(
+            np.asarray(diagnostics["max_abs_residual"])),
+        "n_valid": int(np.asarray(diagnostics["n_valid"])),
+        "solve": _FIT_SOLVE,
+        "affine": bool(_FIT_AFFINE),
+        "eig": _FIT_EIG,
+        "rcond": float(rcond),
+    }
 
 
 @functools.lru_cache(maxsize=None)

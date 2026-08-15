@@ -37,6 +37,7 @@ class Box0D(vcoul.Box0D):
         self, wfn, meta: Meta, *,
         S_cart=None,        # ignored (box truncation: head is finite already)
         epshead=None,       # ignored (no screening correction at the head)
+        static_kappa2=None, # ignored (no metallic long-wave limit in 0D)
         nsamples=None,
         method=None,
         qmc_reps=None,
@@ -51,7 +52,8 @@ class Box0D(vcoul.Box0D):
         del meta        # a box is Gamma-only; the service takes no kgrid here
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
-            S_cart=S_cart, epshead=epshead, nsamples=nsamples,
+            S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
+            nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,
         )

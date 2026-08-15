@@ -164,7 +164,12 @@ REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
 #: Every scalar-head fit model :func:`read_head_fit` knows how to
 #: interpret.  The reader refuses an unknown model rather than serving
 #: poles whose fitting protocol nobody can name.
-_HEAD_FIT_MODELS = ("fixed_dft_gn",)
+_HEAD_FIT_MODELS = (
+    "fixed_dft_gn",
+    "dft_direct_loewner",
+    "qsgw_direct_loewner",
+    "qsgw_schur_loewner",
+)
 
 #: Bump when the fit store's layout changes.  Independent of the W
 #: format's version: the two files have separate lifetimes and a reader
@@ -1948,6 +1953,173 @@ def read_head_fit(src, *, to_unit=None, mode="r"):
         "B_p": residues,
         "units": units,
         "diagnostics": diagnostics,
+        "model": model,
+        "ready": True,
+    }
+
+
+def write_head_fit_collective(
+    dest,
+    sample_z,
+    sample_Wc,
+    Omega_p,
+    B_p,
+    *,
+    mesh_xy,
+    energy_unit,
+    fit_condition,
+    fit_backward_error,
+    fit_max_abs_residual,
+    grid_hash,
+    fit_provenance,
+    model="multipole",
+):
+    """Collectively publish one tiny scalar head fit through SlabIO."""
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    z = np.ascontiguousarray(sample_z, dtype=np.complex128).reshape(-1)
+    wc = np.ascontiguousarray(sample_Wc, dtype=np.complex128).reshape(-1)
+    poles = np.ascontiguousarray(Omega_p, dtype=np.complex128).reshape(-1)
+    residues = np.ascontiguousarray(B_p, dtype=np.complex128).reshape(-1)
+    if str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError("collective scalar head has an unsupported energy unit")
+    if (z.size < 1 or poles.size < 1 or z.shape != wc.shape
+            or poles.shape != residues.shape):
+        raise ValueError("collective scalar head has inconsistent vector extents")
+    for name, arr in (
+        ("sample_z", z), ("sample_Wc", wc),
+        ("Omega_p", poles), ("B_p", residues),
+    ):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"collective scalar head {name} is not finite")
+    diagnostics = {
+        "fit_condition": float(fit_condition),
+        "fit_backward_error": float(fit_backward_error),
+        "fit_max_abs_residual": float(fit_max_abs_residual),
+    }
+    if any(not np.isfinite(v) or v < 0.0 for v in diagnostics.values()):
+        raise ValueError("collective scalar-head diagnostics are invalid")
+    ledger = fit_completion_ledger(dest)
+    if not ledger["complete"]:
+        raise ValueError("scalar head may only be attached to a finalized body fit")
+    if str(ledger["w_grid_hash"]) != str(grid_hash):
+        raise ValueError(
+            "scalar-head grid hash does not match the fitted body grid")
+
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, "a") as grp:
+            _open_fit(grp)
+            if MPA_HEAD_SUFFIX in grp:
+                del grp[MPA_HEAD_SUFFIX]
+            head = grp.create_group(MPA_HEAD_SUFFIX)
+            head.attrs["ready"] = False
+            head.attrs["format_version"] = np.int64(2)
+            head.attrs["model"] = str(model)
+            head.attrs["frequency_unit"] = str(energy_unit)
+            head.attrs["Wc_unit"] = "a.u."
+            head.attrs["residue_unit"] = f"{energy_unit}*a.u."
+            head.attrs["mpa_grid_hash"] = str(grid_hash)
+            for key, value in diagnostics.items():
+                head.attrs[key] = value
+            for key, value in sorted(dict(fit_provenance).items()):
+                head.attrs["fit_" + str(key)] = value
+    barrier("mpa_head_metadata_allocated")
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        prefix = MPA_HEAD_SUFFIX + "/"
+        io.write_attr(prefix + "sample_z", z)
+        io.write_attr(prefix + "sample_Wc", wc)
+        io.write_attr(prefix + "Omega_p", poles)
+        io.write_attr(prefix + "B_p", residues)
+    barrier("mpa_head_payload_written")
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, "a") as grp:
+            grp[MPA_HEAD_SUFFIX].attrs["ready"] = True
+    barrier("mpa_head_committed")
+
+
+def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
+    """Collectively read and certify the scalar head fit through SlabIO."""
+    from jax.sharding import PartitionSpec as P
+
+    from file_io.slab_io import SlabIO
+
+    ledger = validate_fit_store(src)
+    with _qs().QirrDest(src, "r") as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError("MPA fit store carries no scalar head")
+        head = grp[MPA_HEAD_SUFFIX]
+        if int(head.attrs.get("format_version", -1)) != 2:
+            raise ValueError("collective scalar-head reader requires format version 2")
+        if not bool(head.attrs.get("ready", False)):
+            raise ValueError("scalar MPA head is NOT READY")
+        source_unit = _qs().qirr_attr_str(head, "frequency_unit")
+        model = _qs().qirr_attr_str(head, "model")
+        grid_hash = _qs().qirr_attr_str(head, "mpa_grid_hash")
+        diagnostics = {
+            key: float(head.attrs[key])
+            for key in (
+                "fit_condition", "fit_backward_error",
+                "fit_max_abs_residual")
+        }
+        provenance = {
+            str(key)[len("fit_"):]: head.attrs[key]
+            for key in head.attrs if str(key).startswith("fit_")
+            and str(key) not in diagnostics
+        }
+    if str(grid_hash) != str(ledger["w_grid_hash"]):
+        raise ValueError("scalar-head/body MPA grid hashes differ")
+    if str(model) not in _HEAD_FIT_MODELS:
+        raise ValueError(
+            f"read_head_fit_collective: stored head model {model!r} is not "
+            f"one of {_HEAD_FIT_MODELS}; a consumer must not silently "
+            "interpret an unknown fitting protocol")
+    condition_limit = float(provenance.get(
+        "condition_max_allowed", np.inf))
+    backward_limit = float(provenance.get(
+        "backward_error_max_allowed", np.inf))
+    if diagnostics["fit_condition"] > condition_limit:
+        raise ValueError("scalar-head Loewner fit exceeds its condition gate")
+    if diagnostics["fit_backward_error"] > backward_limit:
+        raise ValueError("scalar-head Loewner fit exceeds its backward-error gate")
+
+    prefix = MPA_HEAD_SUFFIX + "/"
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        z = io.read_slab(
+            prefix + "sample_z", partition_spec=P(None), as_numpy=True)
+        wc = io.read_slab(
+            prefix + "sample_Wc", partition_spec=P(None), as_numpy=True)
+        poles = io.read_slab(
+            prefix + "Omega_p", partition_spec=P(None), as_numpy=True)
+        residues = io.read_slab(
+            prefix + "B_p", partition_spec=P(None), as_numpy=True)
+    z = np.asarray(z, dtype=np.complex128)
+    wc = np.asarray(wc, dtype=np.complex128)
+    poles = np.asarray(poles, dtype=np.complex128)
+    residues = np.asarray(residues, dtype=np.complex128)
+    if z.shape != wc.shape or poles.shape != residues.shape:
+        raise ValueError("collective scalar-head payload has inconsistent shapes")
+    if not all(np.all(np.isfinite(x)) for x in (z, wc, poles, residues)):
+        raise ValueError("collective scalar-head payload is not finite")
+    if to_unit is not None:
+        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+            raise ValueError("scalar-head unit conversion is unsupported")
+        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        z, poles, residues = z * scale, poles * scale, residues * scale
+        source_unit = str(to_unit)
+    return {
+        "sample_z": z,
+        "sample_Wc": wc,
+        "Omega_p": poles,
+        "B_p": residues,
+        "units": {
+            "frequency": source_unit,
+            "Wc": "a.u.",
+            "residue": f"{source_unit}*a.u.",
+        },
+        "diagnostics": diagnostics,
+        "provenance": provenance,
         "model": model,
         "ready": True,
     }

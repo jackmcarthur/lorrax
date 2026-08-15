@@ -52,6 +52,7 @@ class Slab2D(vcoul.Slab2D):
         self, wfn, meta: Meta, *,
         S_cart=None,
         epshead=None,
+        static_kappa2=None,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
@@ -60,7 +61,8 @@ class Slab2D(vcoul.Slab2D):
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
             (meta.nkx, meta.nky, meta.nkz),
-            S_cart=S_cart, epshead=epshead, nsamples=nsamples,
+            S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
+            nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,
         )

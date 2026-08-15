@@ -169,3 +169,135 @@ def test_mpa_line_adapter_matches_the_two_resolvents():
         alpha[0] * np.exp(-tau * (delta - gap_reference)))
     want = 1.0 / (z[0] - delta) - 1.0 / (z[0] + delta)
     np.testing.assert_allclose(got, want, rtol=1.0e-8, atol=1.0e-8)
+
+
+def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
+    monkeypatch,
+):
+    """Finite occupations preserve the explicit q and -q orientations."""
+    import common.fft_helpers as fft_helpers
+
+    monkeypatch.setattr(
+        fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260814)
+    nk, nb, ns, nmu = 3, 4, 2, 4
+    psi = (
+        rng.normal(size=(nk, nb, ns, nmu))
+        + 1j * rng.normal(size=(nk, nb, ns, nmu))
+    )
+    enk = np.array([
+        [-1.3, -0.4, 0.2, 1.1],
+        [-1.1, -0.2, 0.5, 1.4],
+        [-1.4, -0.1, 0.7, 1.2],
+    ])
+    occ = np.array([
+        [1.0, 0.82, 0.10, 0.0],
+        [1.0, 0.61, 0.25, 0.0],
+        [1.0, 0.74, -0.01, 0.0],
+    ])
+    slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
+    wfns = Wavefunctions(
+        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
+        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
+        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
+        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        enk=_put(enk, mesh, P(None, None)),
+        occ=_put(occ, mesh, P(None, None)),
+        slices=slices,
+    )
+    time = np.array([0.13, 0.41, 0.79])
+    z = np.array([0.32 + 0.18j, 0.77 + 0.24j])
+    weights = np.array([
+        [0.19, 0.31, 0.17],
+        [0.23, 0.27, 0.11],
+    ])
+    got = w_isdf.compute_chi0_contour_fractional(
+        wfns,
+        time,
+        weights,
+        z,
+        SimpleNamespace(nkx=3, nky=1, nkz=1),
+        mesh,
+    )
+    got = np.stack([np.asarray(jax.device_get(value)) for value in got])
+
+    want = np.zeros((z.size, nk, nmu, nmu), np.complex128)
+    projection = weights * np.exp(1j * z[:, None] * time[None, :])
+    for q in range(nk):
+        for k in range(nk):
+            kmq = (k - q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    delta = enk[kmq, b] - enk[k, a]
+                    fdiff = occ[k, a] - occ[kmq, b]
+                    M = np.einsum(
+                        "sm,sm->m",
+                        np.conj(psi[kmq, b]),
+                        psi[k, a],
+                    )
+                    time_sum = np.sum(
+                        -1j * projection
+                        * np.exp(-1j * delta * time)[None, :],
+                        axis=1,
+                    )
+                    want[:, q] += (
+                        time_sum[:, None, None]
+                        * fdiff
+                        * np.outer(M, np.conj(M))[None, :, :]
+                    )
+    want /= np.sqrt(float(nk))
+    np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
+
+    f_slice, u_slice = w_isdf._exact_occupation_support_slices(wfns.occ)
+    assert f_slice == slice(0, 3)
+    assert u_slice == slice(1, 4)
+
+
+def test_static_fractional_gamma_matches_divided_difference():
+    """The z=0 metal body includes ordered pairs and the FS diagonal."""
+    mesh = _mesh_xy()
+    psi, enk, slices, base = _toy(mesh)
+    occ = np.array([
+        [1.0, 0.83, 0.14, -0.01],
+        [1.0, 0.69, 0.22, 0.00],
+    ])
+    surface = np.array([
+        [0.01, 0.42, 0.31, -0.02],
+        [0.02, 0.37, 0.28, -0.01],
+    ])
+    wfns = Wavefunctions(
+        psi_xn=base.psi_xn,
+        psi_xr=base.psi_xr,
+        psi_yr=base.psi_yr,
+        psi_yn=base.psi_yn,
+        enk=base.enk,
+        occ=_put(occ, mesh, P(None, None)),
+        slices=slices,
+    )
+    got = w_isdf.compute_chi0_static_fractional_gamma(
+        wfns,
+        enk,
+        occ,
+        surface,
+        SimpleNamespace(nk_tot=enk.shape[0], n_rmu=psi.shape[-1]),
+        mesh,
+        nb_logical=enk.shape[1],
+    )
+    got = np.asarray(jax.device_get(got))[0]
+
+    want = np.zeros_like(got)
+    for k in range(enk.shape[0]):
+        for a in range(enk.shape[1]):
+            for b in range(enk.shape[1]):
+                divided = (
+                    -surface[k, a]
+                    if a == b
+                    else (occ[k, a] - occ[k, b])
+                    / (enk[k, a] - enk[k, b])
+                )
+                density = np.einsum(
+                    "sm,sm->m", psi[k, a], np.conj(psi[k, b]))
+                want += divided * np.outer(density, np.conj(density))
+    want /= np.sqrt(float(enk.shape[0]))
+    np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)

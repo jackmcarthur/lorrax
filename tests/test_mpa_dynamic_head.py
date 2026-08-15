@@ -21,6 +21,7 @@ from gw.head_correction import (
     compute_ppm_head_sigma_diag,
     fold_cartesian_head_wings_sharded,
 )
+from gw.qsgw_head import _fold_static_kappa2
 
 
 def _complex(rng, shape, scale=1.0):
@@ -79,6 +80,32 @@ def test_cartesian_ywz_fold_matches_dense_bordered_dyson():
             1.0 - vbare * lam**2 * (qhat @ got_S[iz] @ qhat))
         np.testing.assert_allclose(reduced_head, dense_head, rtol=2e-13,
                                    atol=2e-11)
+
+
+def test_static_schur_fold_updates_thomas_fermi_kappa():
+    """The scalar static wing fold feeds the screened mini-BZ parameter."""
+    from types import SimpleNamespace
+
+    kappa2 = 0.72
+    volume = 91.0
+    left = jnp.asarray([-0.08, 0.03, -0.04])
+    right = jnp.asarray([-0.07, 0.02, -0.05])
+    body = jnp.asarray([
+        [1.4, 0.1, 0.0],
+        [0.1, 1.1, 0.2],
+        [0.0, 0.2, 0.9],
+    ], dtype=jnp.complex128)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    response = SimpleNamespace(
+        static_kappa2_bohr2=kappa2,
+        static_Y_x=left,
+        static_Z_y=right,
+    )
+    got = _fold_static_kappa2(response, body, volume, mesh)
+    f_direct = -kappa2 / (8.0 * np.pi)
+    f_effective = f_direct + np.asarray(left @ body @ right) / volume
+    want = -8.0 * np.pi * f_effective.real
+    np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)
 
 
 def test_complex_pole_head_sum_matches_ppm_and_direct_denominators():

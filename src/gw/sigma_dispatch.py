@@ -447,6 +447,7 @@ def compute_sigma_xc(
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
     omit_v_h: bool = False,
+    iteration_head=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -669,13 +670,22 @@ def compute_sigma_xc(
                 CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
-        head = mpa_store.read_head_fit(fit_path, to_unit="Ry")
-        sigma_bands = wfns.slices.sigma
+        head = mpa_store.read_head_fit_collective(
+            fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+        if iteration_head is None:
+            sigma_bands = wfns.slices.sigma
+            head_enk = np.asarray(wfns.enk[:, sigma_bands])
+            head_occ = np.asarray(wfns.occ[:, sigma_bands])
+            head_efermi = float(wfn.efermi)
+        else:
+            head_enk = np.asarray(iteration_head.sigma_energies_ry)
+            head_occ = np.asarray(iteration_head.sigma_occupations)
+            head_efermi = float(iteration_head.efermi_ry)
         head_diag = compute_complex_pole_head_sigma_diag(
             omega_grid_ry=np.asarray(config.omega_grid_ry),
-            enk_ry=np.asarray(wfns.enk[:, sigma_bands]),
-            efermi_ry=float(wfn.efermi),
-            occupations=np.asarray(wfns.occ[:, sigma_bands]),
+            enk_ry=head_enk,
+            efermi_ry=head_efermi,
+            occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
@@ -723,6 +733,7 @@ def compute_sigma_xc(
         config=config, meta=meta, mesh_xy=mesh_xy,
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
+        iteration_head=iteration_head,
         print_fn=print_fn,
     )
 

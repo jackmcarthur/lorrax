@@ -75,6 +75,7 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
+from .gw_config import ComputeMode
 from .scissor import ScissorFit, apply_conduction_scissor_to_tail, fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
@@ -133,6 +134,9 @@ class SCInputs:
     #: built on the full BZ — Σ comes from an FFT over the k-grid, which
     #: needs the whole grid (decisions.md, TRS veto scope).
     kstar: object | None = None
+    #: Validated, device-resident Berry connection + exact DFT velocity.
+    #: None preserves the historical fixed-DFT head path exactly.
+    parallel_transport: object | None = None
     print_fn: Callable = print
 
 
@@ -170,18 +174,29 @@ class SCState:
     LOOP's k-set — the IBZ when a map is given — while ``outputs``
     carries full-BZ objects (see :class:`SCOutputs`).
 
-    The iteration "carry" is **just** ``H_qp_dft`` — the QP Hamiltonian
-    on the active subspace (``slices.sigma`` of the wfn bundle), in
-    the original DFT basis.  Everything else (``E_qp``, ``U_dft_to_qp``,
-    ``efermi``) is derivable by the next iteration's first step
-    (``vmap(eigh)``), so we don't carry redundant state — that would
-    let convergence checks read inconsistent (E, H) pairs if anyone
-    forgot to keep them in sync.  ``outputs`` is purely for the final
-    output writers; it does not feed the next iteration.
+    The primary iteration carry is ``H_qp_dft``.  When metallic head
+    occupations are enabled, the small ``(nk, nb_head)`` occupation and
+    tetrahedron-surface tables plus their chemical potential are auxiliary
+    carried state: iteration i's first-half head consumes the values produced
+    only at the END of iteration i-1.  They are deliberately not installed in
+    the wavefunction bundle, so Green's functions and finite-q screening keep
+    their historical occupations until their metallic formulations land.
+
+    ``outputs`` (an ``SCOutputs`` record) is purely for the final output
+    writers; it does not feed the next iteration.  Its ``sigma_basis_U``
+    is the DFT→QP unitary that DEFINED the basis ``sigma_result`` was
+    computed in (the eigh of the *previous* carry) — the writer must
+    rotate Σ back to DFT with THIS U, not the converged U of the final
+    carry: the two agree only at convergence, and using the converged U
+    mis-rotates Σ_x/V_H whenever the loop stops before the fixed point
+    (maximally so at max_iter=1, where the correct U is the identity).
     """
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
+    head_efermi_ry: float | None = None
+    head_occ_kn: jax.Array | None = None  # full-BZ, padded PT head manifold
+    head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
 
 
@@ -221,10 +236,96 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     # all-gather, P × nk × nb² × 16 B — scorecard AA.1).  ``H0`` is a
     # pure function of the DFT energies, identical on every rank;
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+    (head_efermi_ry,
+     head_occ_kn,
+     head_surface_weight_kn) = _solve_head_occupations(
+        inputs, inputs.wfns_dft.enk)
+    if head_efermi_ry is not None:
+        inputs.print_fn(
+            "  SC head occupations: initialized BGW-MP1 state at "
+            f"mu={head_efermi_ry * RYD_TO_EV:.8f} eV")
     return SCState(
         H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
+        head_efermi_ry=head_efermi_ry,
+        head_occ_kn=head_occ_kn,
+        head_surface_weight_kn=head_surface_weight_kn,
     )
+
+
+def _solve_head_occupations(
+    inputs: SCInputs,
+    energies_kn_ry,
+) -> tuple[float | None, jax.Array | None, jax.Array | None]:
+    """Solve the fixed-N MP1 state used only by the next QSGW head.
+
+    The table is full-BZ because the parallel-transport velocity and head
+    contraction are full-BZ.  Padding is explicit and inert; the solver sees
+    exactly ``nb_logical`` physical bands.  The same end-of-iteration
+    energies and chemical potential also define periodic tetrahedron
+    Fermi-surface weights for the next iteration's Drude head.  A zero width
+    returns three ``None`` values so the historical step-occupation path is
+    bit-for-bit untouched.
+    """
+    width_ev = float(inputs.config.screening.occ_broadening_ev)
+    pt = getattr(inputs, "parallel_transport", None)
+    if width_ev == 0.0 or pt is None:
+        return None, None, None
+
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    if energies.ndim != 2:
+        raise ValueError(
+            f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
+    nb_logical = int(pt.nb_logical)
+    nb_storage = int(pt.connection_cart.shape[-1])
+    if not (0 < nb_logical <= nb_storage <= int(energies.shape[1])):
+        raise ValueError(
+            "QSGW head occupation manifold must satisfy 0 < logical <= "
+            f"storage <= energy bands; got {nb_logical}, {nb_storage}, "
+            f"{energies.shape[1]}.")
+
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
+    from .efermi import solve_mp1_occupations
+
+    nk = int(energies.shape[0])
+    kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
+    capacity = float(spin_degeneracy_factor(inputs.wfn))
+    target_electrons = float(inputs.wfn.num_electrons)
+    mu_ry, occ_logical = solve_mp1_occupations(
+        energies[:, :nb_logical],
+        kweights,
+        target_electrons,
+        width_ev / RYD_TO_EV,
+        state_capacity=capacity,
+    )
+    occ_kn = jnp.pad(
+        occ_logical,
+        ((0, 0), (0, nb_storage - nb_logical)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    # The Drude weight is a Fermi-surface integral, not a coarse-grid
+    # sampling of the MP1 derivative.  On sodium 8^3 the latter moves the
+    # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
+    # determine the fixed-N chemical potential; no fitted plasma frequency
+    # enters the response.
+    from .fermi_surface import tetrahedron_delta_weights
+
+    surface_logical = tetrahedron_delta_weights(
+        np.asarray(energies[:, :nb_logical], dtype=np.float64),
+        np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64),
+        tuple(int(x) for x in inputs.wfn.kgrid),
+        float(mu_ry),
+    )
+    # The distributed contraction owns an explicit uniform 1/Nk.  Convert
+    # normalized-BZ tetrahedron weights to its per-grid-point interface.
+    surface_kn = jnp.pad(
+        jnp.asarray(surface_logical * float(nk), dtype=jnp.float64),
+        ((0, 0), (0, nb_storage - nb_logical)),
+        mode="constant",
+        constant_values=0.0,
+    )
+    return float(mu_ry), occ_kn, surface_kn
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +979,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     call lives here directly — adding a new Σ scheme that wants extra
     W frequencies is purely a screening + compute_sigma_xc change.
     """
+    from .screening import compute_screening_model, screening_requests_for
+
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
     if state.iteration == 0:
@@ -1110,9 +1213,136 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"    density-SC: rebuilt V_H from iteration {state.iteration} "
             f"orbitals (E_F = {e_f_ry:.6f} Ry)")
 
-    # Per-mode screening: solve W at every frequency the Σ scheme needs.
+    # Per-mode screening plan.  The q->0 head uses this exact frequency/role
+    # table so a Schur-folded probe can never drift from the body W it folds.
+    requests = screening_requests_for(
+        inputs.config.compute_mode, inputs.config)
+
+    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+    mpa_plan = None
+    if mpa_mode:
+        from .mpa import sample_plan
+        from .mpa.model import make_mpa_plan
+
+        mpa_plan = make_mpa_plan(inputs.config, inputs.quad)
+        mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
+        head_omegas = [complex(value) for value in mpa_z]
+        # The metallic MPA grid starts just above the origin.  Preserve a
+        # separate exact-static sample for do_G0; it is nonanalytic and must
+        # never enter the Loewner sample vector.
+        if bool(inputs.config.do_G0) and not np.any(mpa_z == 0.0 + 0.0j):
+            head_omegas.append(0.0 + 0.0j)
+    else:
+        head_omegas = (
+            [complex(req.omega_ry) for req in requests]
+            if requests else [0.0 + 0.0j])
+
+    # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
+    # accelerators that evaluate one carry repeatedly: at iteration zero
+    # DeltaH=0 and U=I, so this reconstructs the DFT head through the same
+    # prevalidated path used thereafter.  Saved A/v and the carried H build
+    # the direct tensor.  The already-resident, already-rotated centroid
+    # wavefunctions build q-linear wings; they are not reloaded here.
+    iteration_head = None
+    iteration_head_response = None
+    iteration_static_head_terms = inputs.static_head_terms
+    pt = getattr(inputs, "parallel_transport", None)
+    if pt is not None:
+        from .head_correction import compute_static_head_terms_from_sample
+        from .qsgw_head import (
+            assemble_delta_head_manifold,
+            build_iteration_head_response,
+            finalize_iteration_head_samples,
+        )
+
+        H_active_full = (
+            state.H_qp_dft if ks.is_identity
+            else ks.broadcast(state.H_qp_dft))
+        e_dft_active = inputs.e_dft_active_kn_ry
+        nb_active = int(H_active_full.shape[-1])
+        h_dft_active = (
+            e_dft_active[:, :, None]
+            * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
+        delta_active = H_active_full - h_dft_active
+        nb_storage = int(pt.connection_cart.shape[-1])
+        if int(wfns_qp.enk.shape[1]) < nb_storage:
+            raise ValueError(
+                "parallel-transport head storage has "
+                f"{nb_storage} padded bands, but the SC wavefunction bundle "
+                f"has only {wfns_qp.enk.shape[1]}.")
+        tail_diagonal = (wfns_qp.enk[:, :nb_storage]
+                         - inputs.wfns_dft.enk[:, :nb_storage])
+        delta_head = assemble_delta_head_manifold(
+            delta_active, tail_diagonal, nb_storage=nb_storage,
+            mesh=inputs.mesh_xy)
+
+        head_occ_kn = wfns_qp.occ[:, :nb_storage]
+        head_efermi_ry = float(efermi_ry)
+        head_surface_weight_kn = None
+        if state.head_occ_kn is not None:
+            if state.head_efermi_ry is None:
+                raise ValueError(
+                    "QSGW head occupations were carried without their "
+                    "chemical potential.")
+            if tuple(state.head_occ_kn.shape) != (
+                    int(wfns_qp.enk.shape[0]), nb_storage):
+                raise ValueError(
+                    "carried QSGW head occupations have shape "
+                    f"{state.head_occ_kn.shape}, expected "
+                    f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
+            head_occ_kn = state.head_occ_kn
+            head_efermi_ry = float(state.head_efermi_ry)
+            if state.head_surface_weight_kn is None:
+                raise ValueError(
+                    "QSGW head occupations were carried without their "
+                    "tetrahedron Fermi-surface weights.")
+            if tuple(state.head_surface_weight_kn.shape) != (
+                    int(wfns_qp.enk.shape[0]), nb_storage):
+                raise ValueError(
+                    "carried QSGW head Fermi-surface weights have shape "
+                    f"{state.head_surface_weight_kn.shape}, expected "
+                    f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
+            head_surface_weight_kn = state.head_surface_weight_kn
+
+        iteration_head_response = build_iteration_head_response(
+            delta_head,
+            pt.connection_cart,
+            pt.velocity_dft_cart,
+            U_full,
+            wfns_qp.enk[:, :nb_storage],
+            head_occ_kn,
+            np.asarray(head_omegas, dtype=np.complex128),
+            surface_weight_qp_kn=head_surface_weight_kn,
+            mesh=inputs.mesh_xy,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            nb_logical=int(pt.nb_logical),
+            sigma_energies_ry=np.asarray(E_full, dtype=np.float64),
+            efermi_ry=head_efermi_ry,
+            wfn=inputs.wfn,
+            meta=inputs.meta,
+            config=inputs.config,
+            # Y and Z are built directly from the two centroid-sharded
+            # wavefunction copies.  Their band-pair tiles are distributed
+            # over the full Px*Py mesh and frequency-blocked in each ring.
+            wfns_qp=wfns_qp,
+            eta_ry=(0.0 if mpa_mode else None),
+        )
+        if mpa_mode:
+            inputs.print_fn(
+                "    SC head: occupation-aware QSGW response plus sharded "
+                "ISDF wings on the "
+                f"exact MPA z grid (nb={pt.nb_logical}, "
+                f"fit samples={mpa_z.size})")
+        else:
+            inputs.print_fn(
+                "    SC head: QSGW covariant velocity + current-basis wings "
+                "from saved parallel transport/current centroid bundle "
+                f"(nb={pt.nb_logical}, samples={len(head_omegas)})")
+
+
+    # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
-    from .screening import compute_screening_model
     W_by_role = compute_screening_model(
         inputs.config.compute_mode, wfns_qp, inputs.V_q,
         quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
@@ -1122,7 +1352,52 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         label=f"sc_{state.iteration:04d}",
         head_resolver=inputs.head_resolver,
         head_channel=getattr(inputs, 'head_channel', None),
+        wfn=inputs.wfn,
+        mpa_plan=mpa_plan,
+        iteration_head_response=iteration_head_response,
         print_fn=inputs.print_fn)
+
+    # MPA owns a shared complex-frequency model rather than the finite role
+    # table above.  Its fit mapping is not a body-W role mapping; without
+    # ordinary requests finalize the direct head only.
+    if iteration_head_response is not None and mpa_mode:
+        iteration_head = W_by_role.get("iteration_head")
+        if iteration_head is None:
+            raise RuntimeError(
+                "MPA screening did not return its sampled QSGW head")
+        if bool(inputs.config.do_G0):
+            iteration_static_head_terms = compute_static_head_terms_from_sample(
+                iteration_head.at(0.0 + 0.0j),
+                occ=np.asarray(head_occ_kn[:, :inputs.meta.nb_sigma]),
+                cell_volume=float(inputs.meta.cell_volume),
+                nk_tot=int(inputs.meta.nk_tot),
+            )
+    elif iteration_head_response is not None:
+        head_body_by_role = W_by_role if requests else None
+        iteration_head = finalize_iteration_head_samples(
+            iteration_head_response,
+            wfn=inputs.wfn,
+            meta=inputs.meta,
+            config=inputs.config,
+            mesh=inputs.mesh_xy,
+            requests=requests,
+            W_by_role=head_body_by_role,
+        )
+        if head_body_by_role:
+            inputs.print_fn(
+                "    SC head: folded q-linear wings through screened "
+                "W_body(Gamma) before the mini-BZ average")
+        if bool(inputs.config.do_G0):
+            iteration_static_head_terms = compute_static_head_terms_from_sample(
+                iteration_head.at(0.0 + 0.0j),
+                occ=np.asarray(head_occ_kn[:, :inputs.meta.nb_sigma]),
+                cell_volume=float(inputs.meta.cell_volume),
+                nk_tot=int(inputs.meta.nk_tot),
+            )
+
+    # TODO(metal-screening): W_body above still uses the historical minimax
+    # valence/conduction band cut.  Only the q->0 response uses the
+    # carried MP1 occupations in this change; finite-q chi0 stays untouched.
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
     # so intermediate SC iterations don't thrash sigma_mnk.h5; the
@@ -1134,7 +1409,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
         e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
-        static_head_terms=inputs.static_head_terms,
+        static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad,
         config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
@@ -1150,6 +1425,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # once, below, after this returns.
         hartree_basis_rotation=U_full,
         omit_v_h=v_h_dft_new is not None,
+        iteration_head=iteration_head,
         write_sigma_omega_h5=False,
         print_fn=inputs.print_fn,
     )
@@ -1228,12 +1504,25 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
 
+    # END-OF-ITERATION metallic occupation update.  This is intentionally
+    # after Sigma/H assembly and after the current energies and orbitals were
+    # rotated above.  The head in THIS call used state.head_occ_kn; this solve
+    # produces the table consumed by the NEXT call.  Nothing installs it in
+    # wfns_qp, so finite-q screening and Green's functions are unchanged.
+    (next_head_efermi_ry,
+     next_head_occ_kn,
+     next_head_surface_weight_kn) = _solve_head_occupations(inputs, wfns_qp.enk)
+    if next_head_efermi_ry is not None:
+        inputs.print_fn(
+            "    SC head occupations: end-of-iteration BGW-MP1 update, "
+            f"mu={next_head_efermi_ry * RYD_TO_EV:.8f} eV, "
+            f"width={inputs.config.screening.occ_broadening_ev:.8f} eV")
+
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
     # the Sigma gates and assembled H.  Only at this point is the preceding
     # map's pair safe to unlink.  The newest pair survives convergence for
     # restart/debugging; ordinary screening modes never enter this branch.
-    from .gw_config import ComputeMode
     if inputs.config.compute_mode is ComputeMode.MPA:
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
@@ -1245,6 +1534,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
+        head_efermi_ry=next_head_efermi_ry,
+        head_occ_kn=next_head_occ_kn,
+        head_surface_weight_kn=next_head_surface_weight_kn,
         outputs=SCOutputs(
             sigma_result=sigma_result,
             # FULL-BZ U.  These two fields are consumed TOGETHER by
@@ -1525,7 +1817,13 @@ def _run_linear_mixing(
         # to the map, so without this rebind both generations of the
         # ω-cube are live for the whole of ``gw_iteration_map``.  The
         # LAST iteration's is kept: it leaves the loop in ``state_new``.
-        state = SCState(H_qp_dft=state.H_qp_dft, iteration=state.iteration)
+        state = SCState(
+            H_qp_dft=state.H_qp_dft,
+            iteration=state.iteration,
+            head_efermi_ry=state.head_efermi_ry,
+            head_occ_kn=state.head_occ_kn,
+            head_surface_weight_kn=state.head_surface_weight_kn,
+        )
         state_new = gw_iteration_map(state, inputs)
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
@@ -1537,6 +1835,9 @@ def _run_linear_mixing(
             state_new = SCState(
                 H_qp_dft=H_mixed,
                 iteration=state_new.iteration,
+                head_efermi_ry=state_new.head_efermi_ry,
+                head_occ_kn=state_new.head_occ_kn,
+                head_surface_weight_kn=state_new.head_surface_weight_kn,
                 outputs=state_new.outputs,
             )
         E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
@@ -1721,6 +2022,9 @@ def _run_rcrop(
     _e_history: list[np.ndarray] = [
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_outputs: list = [None]
+    _head_efermi: list = [state_init.head_efermi_ry]
+    _head_occ: list = [state_init.head_occ_kn]
+    _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
 
@@ -1746,9 +2050,18 @@ def _run_rcrop(
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
         # this cell is refilled below and the loop exits with it.
         _last_outputs[0] = None
-        state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
+        state_in = SCState(
+            H_qp_dft=H,
+            iteration=_iter_idx[0],
+            head_efermi_ry=_head_efermi[0],
+            head_occ_kn=_head_occ[0],
+            head_surface_weight_kn=_head_surface_weight[0],
+        )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
+        _head_efermi[0] = state_out.head_efermi_ry
+        _head_occ[0] = state_out.head_occ_kn
+        _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
@@ -1824,6 +2137,9 @@ def _run_rcrop(
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
+        head_efermi_ry=_head_efermi[0],
+        head_occ_kn=_head_occ[0],
+        head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
@@ -1993,6 +2309,26 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
+    parallel_transport = None
+    if str(config.sc.head_update) == "parallel_transport":
+        if not bool(config.do_G0):
+            raise ValueError(
+                "sc_head_update=parallel_transport requires do_G0=true; "
+                "otherwise the rebuilt head has no consumer.")
+        from file_io.paths import resolve_input_path
+        from .qsgw_head import load_parallel_transport_head
+
+        pt_path = resolve_input_path(
+            input_dir, config.paths.parallel_transport_file)
+        parallel_transport = load_parallel_transport_head(
+            pt_path, mesh=mesh_xy, wfn=wfn, meta=meta)
+        vgate = parallel_transport.validation
+        print_fn(
+            "  SC head: loaded validated parallel transport from "
+            f"{pt_path} (nb={parallel_transport.nb_logical}, "
+            f"velocity max_abs={vgate['max_abs']:.3e}, "
+            f"max_rel={vgate['max_rel']:.3e})")
+
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
         head_channel=head_channel,
@@ -2006,6 +2342,7 @@ def run_sc_driver(
         e_dft_active_kn_ry=e_dft_active_kn_ry,
         valence_mask_active_kn=val_mask_active,
         kstar=kstar,
+        parallel_transport=parallel_transport,
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)

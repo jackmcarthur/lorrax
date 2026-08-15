@@ -163,6 +163,15 @@ class SlabIO:
         """
         self._backend.write_attr(name, value)
 
+    def sync_writes(self) -> None:
+        """Wait for queued writes without closing the collective handle.
+
+        Use this only when the next operation enters another HDF5 handle on
+        the same ranks.  The FFI writer is asynchronous, so program order at
+        the Python call site alone does not serialize those two HDF5 calls.
+        """
+        self._backend._drain_pending()
+
     # ------------------------------------------------------------------
     def write_slab(
         self,

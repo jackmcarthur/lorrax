@@ -55,9 +55,17 @@ def _state_attrs(fn, var="state"):
             and isinstance(n.value, ast.Name) and n.value.id == var}
 
 
+# The full carried state of one QSGW step: the QP Hamiltonian, the counter,
+# and the metallic head-occupation trio produced at the END of the previous
+# iteration (head_* feed only the q->0 head; see the SCState docstring).
+_CARRY_KEYS = {
+    "iteration", "H_qp_dft",
+    "head_efermi_ry", "head_occ_kn", "head_surface_weight_kn",
+}
+
+
 def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
-    assert _state_attrs(_func("gw_iteration_map")) == {
-        "iteration", "H_qp_dft"}
+    assert _state_attrs(_func("gw_iteration_map")) == _CARRY_KEYS
 
 
 @pytest.mark.parametrize("driver", ["_run_rcrop", "_run_linear_mixing"])
@@ -75,13 +83,12 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "SCState":
             keys = {kw.arg for kw in node.keywords}
-            (inputs if keys == {"H_qp_dft", "iteration"} else finals).append(
-                keys)
+            (inputs if keys == _CARRY_KEYS else finals).append(keys)
     assert inputs, f"{driver} builds no bare input SCState"
     for keys in finals:
         assert "outputs" in keys, (
             f"{driver} builds an SCState with {sorted(keys)} — an argument "
-            f"to gw_iteration_map must carry H_qp_dft and iteration only")
+            f"to gw_iteration_map must carry exactly the carry fields")
 
 
 def test_rcrop_clears_the_capture_cells_before_the_map_call():
@@ -99,7 +106,8 @@ def test_rcrop_clears_the_capture_cells_before_the_map_call():
 
 def test_linear_mixing_rebuilds_the_carry_before_the_map_call():
     body = _block("_run_linear_mixing")
-    rebuild = body.index("state = SCState(H_qp_dft=state.H_qp_dft")
+    rebuild = body.index("state = SCState(")
+    assert "H_qp_dft=state.H_qp_dft" in body[rebuild:rebuild + 400]
     call = body.index("gw_iteration_map(")
     assert rebuild < call
 
@@ -143,8 +151,12 @@ def test_history_and_fixed_head_serial_writes_are_rank_gated():
     assert history.index("process_rank() == 0") < history.index("np.save(")
     assert "barrier(" in history
 
+    # The head fit is COLLECTIVE now (every rank enters SlabIO), so the
+    # rank gate moved from the model to the writer: model.py must route
+    # the head only through write_head_fit_collective, never through the
+    # serial h5py test seam write_head_fit.
     model_src = (_PATH.parents[2] / "src" / "gw" / "mpa" / "model.py")
     text = model_src.read_text()
-    call = text.rindex("_fit_fixed_head(")
-    assert text.rfind("if process_rank() == 0:", 0, call) < call
-    assert text.index('barrier("mpa.model.head_fit"', call) > call
+    assert "write_head_fit_collective(" in text
+    assert "write_head_fit(" not in text.replace(
+        "write_head_fit_collective(", "")

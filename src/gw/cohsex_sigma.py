@@ -56,6 +56,8 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     numpy; the ``device_put`` at the end places it on the mesh.
     DO NOT "fix" back to ``jnp``.
     """
+    # TODO(metal-sigma): replace this integer occupied projector with the
+    # fractional weights in ``wfns.occ`` when metallic SX/Hartree land.
     # The coverage claim above, enforced rather than merely asserted in
     # prose: if the Σ window were ever narrower than the occupied
     # manifold, ``min`` would silently drop occupied bands out of ρ and
@@ -402,5 +404,4 @@ def compute_v_h_sigma_x(
         "sig_h":   sig_h,
         "sig_x":   sig_x,
     }
-
 

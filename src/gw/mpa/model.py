@@ -15,6 +15,19 @@ _CHI = "chi_qmunu_z"
 _WC = "Wc_qmunu_z"
 
 
+def make_mpa_plan(config, quad):
+    """Build and validate the one frequency plan shared by body and head."""
+    n_p = int(config.mpa.n_poles)
+    omega_m = float(quad.x_max)
+    plan = sample_plan.mpa_plan(
+        n_p, omega_m, material_class=config.mpa.material_class,
+        alpha=config.mpa.sampling_alpha,
+        varpi_near=config.mpa.varpi_near_ry,
+        varpi_far=config.mpa.varpi_far_ry, energy_unit="Ry")
+    sample_plan.refuse_unsupported(plan, delta_max=omega_m)
+    return plan
+
+
 def iteration_artifact_paths(run_dir, label):
     """Return the two disk artifacts owned by one MPA screening map."""
     root = os.path.abspath(os.fspath(run_dir))
@@ -78,49 +91,106 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z):
     del value
 
 
-def _fit_fixed_head(fit_path, head_resolver, probe_omega):
-    """Store the established two-point DFT head beside each body fit.
-
-    This is deliberately not an arbitrary-frequency MPA head: it reuses the
-    DFT-basis scalar PPM head while the body is rebuilt.  Local-field head/wing
-    dynamics are omitted until their production producer lands.
-    """
-    from gw.head_correction import fit_head_ppm_from_samples
-
-    z = np.asarray([0.0j, complex(probe_omega)], np.complex128)
-    static, probe = (head_resolver.at(complex(point)) for point in z)
+def _fit_head_samples(
+    fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model,
+):
+    """Fit scalar Wc_head on the body's exact complex-frequency grid."""
     wc = np.asarray([
-        complex(static.wcoul0) - complex(static.vc0),
-        complex(probe.wcoul0) - complex(probe.vc0),
-    ])
-    head = fit_head_ppm_from_samples(
-        static, probe, probe_omega=complex(probe_omega))
-    Omega = np.asarray([complex(head.omega_h, -1.0e-6)], np.complex128)
-    B = np.asarray([complex(head.R_h)], np.complex128)
-    reconstructed = B[0] / (z - Omega[0]) - B[0] / (z + Omega[0])
-    residual = np.max(np.abs(reconstructed - wc))
-    backward = residual / max(float(np.max(np.abs(wc))), 1.0)
-    mpa_store.write_head_fit(
-        fit_path, z, wc, Omega, B,
-        energy_unit="Ry",
-        fit_condition=1.0, fit_backward_error=backward,
-        fit_max_abs_residual=residual, model="fixed_dft_gn")
+        complex(sample.wcoul0) - complex(sample.vc0)
+        for sample in head_samples
+    ], dtype=np.complex128)
+    fitted = fit_driver.fit_scalar_samples(wc, z, n_p)
+    provenance = {
+        "solve_mode": fitted["solve"],
+        "solve_affine": fitted["affine"],
+        "solve_rcond": fitted["rcond"],
+        "eig_mode": fitted["eig"],
+        "n_valid": fitted["n_valid"],
+        "condition_max_allowed": 1.0 / fitted["rcond"],
+        "backward_error_max_allowed": float(
+            np.sqrt(np.finfo(np.float64).eps)),
+    }
+    mpa_store.write_head_fit_collective(
+        fit_path, z, wc, fitted["Omega_p"], fitted["B_p"],
+        mesh_xy=mesh_xy, energy_unit="Ry",
+        fit_condition=fitted["condition"],
+        fit_backward_error=fitted["backward_error"],
+        fit_max_abs_residual=fitted["max_abs_residual"],
+        grid_hash=grid_hash, fit_provenance=provenance, model=model)
 
 
-def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
+def _solve_wc(
+    sample_path,
+    V,
+    n_z,
+    q_idx,
+    meta,
+    mesh_xy,
+    dyson_solver=None,
+    *,
+    head_response=None,
+    wfn=None,
+    config=None,
+):
+    from gw.qsgw_head import (
+        IterationHeadSamples,
+        finalize_iteration_head_sample,
+    )
     from gw.w_isdf import solve_w
 
+    if head_response is not None and len(head_response.omegas) < int(n_z):
+        raise ValueError("MPA head response does not cover the body sample grid")
+    gamma = None
+    if head_response is not None and head_response.Y_x is not None:
+        matches = np.flatnonzero(np.asarray(q_idx, dtype=np.int64) == 0)
+        if matches.size != 1:
+            raise ValueError(
+                "MPA Schur head requires exactly one Gamma row in the q wedge")
+        gamma = int(matches[0])
+
+    head_samples = []
     shape = (n_z, q_idx.size, meta.n_rmu, meta.n_rmu)
     for index in range(n_z):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
-        Wc = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver) - V
+        W = solve_w(V, chi, meta, mesh_xy, dyson_solver=dyson_solver)
+        W.block_until_ready()
+        if head_response is not None:
+            head_samples.append(finalize_iteration_head_sample(
+                head_response,
+                index,
+                None if gamma is None else W[gamma],
+                wfn=wfn,
+                meta=meta,
+                config=config,
+                mesh=mesh_xy,
+            ))
+        Wc = W - V
         Wc.block_until_ready()
         mpa_store.write_w_slab_collective(
             sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
             global_shape=shape)
-        del chi, Wc
+        del chi, W, Wc
+
+    if head_response is None:
+        return None
+    for index in range(int(n_z), len(head_response.omegas)):
+        head_samples.append(finalize_iteration_head_sample(
+            head_response,
+            index,
+            None,
+            wfn=wfn,
+            meta=meta,
+            config=config,
+            mesh=mesh_xy,
+        ))
+    return IterationHeadSamples(
+        omegas=head_response.omegas,
+        samples=tuple(head_samples),
+        sigma_energies_ry=head_response.sigma_energies_ry,
+        sigma_occupations=head_response.sigma_occupations,
+        efermi_ry=head_response.efermi_ry,
+    )
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
@@ -130,11 +200,11 @@ def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
 
 
 def build_mpa_fit(
-    run_dir, label, *, wfns, V_q, quad, sym, centroid_indices,
+    run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
-    tile_bytes=None, print_fn=print,
+    tile_bytes=None, plan=None, iteration_head_response=None, print_fn=print,
 ):
-    """Write chi/Wc samples and fitted q-wedge poles; return the fit path."""
+    """Write body/head samples and fits; return path plus iteration head."""
     if config.mpa.material_class != "insulator":
         raise NotImplementedError(
             "GATE mpa_metal_evaluator_unavailable: the configured metallic "
@@ -143,7 +213,6 @@ def build_mpa_fit(
             "evaluate it until occupation-weighted interband/intraband chi "
             "and Sigma branches land. FALSE case: "
             "config.mpa.material_class == 'insulator'.")
-
     from common.collectives import barrier, process_rank
     from gw.minimax_config import MinimaxConfig
     from gw.minimax_screening import build_imag_quadrature
@@ -156,9 +225,27 @@ def build_mpa_fit(
 
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
-    plan = config.mpa.sample_plan(omega_m)
+    plan = make_mpa_plan(config, quad) if plan is None else plan
     z_all = sample_plan.plan_z(plan)
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
+    if iteration_head_response is not None:
+        response_z = np.asarray(
+            iteration_head_response.omegas[:z_all.size],
+            dtype=np.complex128)
+        if response_z.shape != z_all.shape or not np.array_equal(
+                response_z, z_all):
+            raise ValueError(
+                "QSGW head and MPA body must use the identical stamped z grid")
+        overrides = (
+            config.head.vhead,
+            config.head.whead_0freq,
+            config.head.whead_imfreq,
+        )
+        if any(value is not None for value in overrides):
+            raise ValueError(
+                "multipoint QSGW-MPA head samples cannot be combined with "
+                "single-frequency vhead/whead overrides")
+
     q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
@@ -186,6 +273,13 @@ def build_mpa_fit(
                     max_nodes=config.minimax_config.max_nodes))
         chi = compute_chi0(
             wfns, used, meta, mesh_xy, energy_reference=energy_reference)
+        if (
+            point["character"] == "static"
+            and iteration_head_response is not None
+            and iteration_head_response.static_chi_body_gamma is not None
+        ):
+            chi = chi.at[0].set(
+                iteration_head_response.static_chi_body_gamma[0])
         _write_sample(
             sample_path, point["index"], chi, q_idx, meta, mesh_xy,
             z_all.size)
@@ -211,24 +305,43 @@ def build_mpa_fit(
                 z_all.size)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
-    _solve_wc(
+    iteration_head = _solve_wc(
         sample_path, V, z_all.size, q_idx, meta, mesh_xy,
-        config.backend.w_dyson_solver)
+        config.backend.w_dyson_solver,
+        head_response=iteration_head_response,
+        wfn=wfn if iteration_head_response is not None else None,
+        config=config if iteration_head_response is not None else None,
+    )
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
-    # ``write_head_fit`` is an intentionally small serial-h5py metadata
-    # writer.  The body fit above is collective SlabIO; letting every rank
-    # enter this final delete/create/write sequence races one HDF5 group.
-    if process_rank() == 0:
-        _fit_fixed_head(
-            fit_path, head_resolver, 1j * float(config.ppm.omega_p))
-    barrier("mpa.model.head_fit", print_fn=print_fn)
+    if iteration_head is None:
+        head_fit_samples = tuple(
+            head_resolver.at(complex(z)) for z in z_all)
+        head_model = "dft_direct_loewner"
+    else:
+        head_fit_samples = iteration_head.samples[:z_all.size]
+        head_model = (
+            "qsgw_schur_loewner"
+            if iteration_head_response.Y_x is not None
+            else "qsgw_direct_loewner"
+        )
+    fit_ledger = mpa_store.fit_completion_ledger(fit_path)
+    _fit_head_samples(
+        fit_path,
+        head_fit_samples,
+        z_all,
+        n_p,
+        fit_ledger["w_grid_hash"],
+        mesh_xy,
+        model=head_model,
+    )
     print_fn(fit_driver.format_cost_report(report))
-    return fit_path
+    return fit_path, iteration_head
 
 
 __all__ = [
     "build_mpa_fit",
+    "make_mpa_plan",
     "retain_iteration_artifacts",
     "iteration_artifact_paths",
 ]

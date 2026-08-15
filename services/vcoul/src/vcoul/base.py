@@ -99,6 +99,7 @@ class CoulombKernel(Protocol):
         self, geometry: CoulombGeometry, kgrid, *,
         S_cart: jnp.ndarray | None = None,
         epshead: jnp.ndarray | None = None,
+        static_kappa2: jnp.ndarray | None = None,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
@@ -110,6 +111,9 @@ class CoulombKernel(Protocol):
           using the same sample points as ``vc0_mean`` (anisotropic).
         - ``epshead`` (fallback): historical Ismail-Beigi gamma model.
           Less accurate; kept for back-compat with older runs.
+        - ``static_kappa2`` (3D metal): Thomas-Fermi
+          ``wcoul0 = <8*pi/(q^2+kappa^2)>``.  This is a distinct order of
+          limits from the finite-frequency ``S_cart`` model.
 
         ``Box0D`` ignores everything except ``geometry`` (and the
         ``epshead`` slot, unused) — V(q=G=0) is finite from the cell-box

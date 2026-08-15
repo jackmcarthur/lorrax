@@ -46,6 +46,7 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 band_sphere_spec, blocks_to_host,
                                 dipole_operator, sweep_matrix_elements)
+from common.parallel_transport import wfn_fingerprint
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -59,7 +60,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
 # --------------------------
 # K+G helpers
 # --------------------------
@@ -582,24 +582,6 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     return val
 
 
-def wfn_fingerprint(wfn) -> str:
-    """SHA-256 over the DFT solution ``dipole.h5`` is a function of.
-
-    Covers the eigenvalues, the k-list and the electron/spinor counts.
-    Deliberately NOT the coefficients: they are hundreds of GB, and any
-    change to them that matters also moves an eigenvalue.
-    """
-    import hashlib
-
-    h = hashlib.sha256()
-    for arr in (np.ascontiguousarray(np.asarray(wfn.energies, dtype=np.float64)),
-                np.ascontiguousarray(np.asarray(wfn.kpoints, dtype=np.float64))):
-        h.update(str(arr.shape).encode())
-        h.update(arr.tobytes())
-    h.update(str((int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands))).encode())
-    return h.hexdigest()
-
-
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, vnl_mode,
                              vnl_velocity_sign=None) -> None:
@@ -781,6 +763,41 @@ def main(argv=None):
 		help="Output filename (default: dipole.h5)",
 	)
 	parser.add_argument(
+		"--parallel-transport-out",
+		type=str,
+		default=None,
+		help="SlabIO parallel-transport output, or the standalone W-av output "
+		     "when --w-av-only is selected. The default dipole path and "
+		     "dipole.h5 schema are unchanged.",
+	)
+	parser.add_argument(
+		"--w-av-only",
+		action="store_true",
+		help="Write only the finite-q W-av stencil selected by the two "
+		     "W_av_*_neighbors input flags; skip dipole and PT preprocessing.",
+	)
+	parser.add_argument(
+		"--parallel-transport-rcond",
+		type=float,
+		default=1.0e-10,
+		help="Relative singular-value cutoff passed to distributed "
+		     "polar_factor (default: 1e-10).",
+	)
+	parser.add_argument(
+		"--parallel-transport-validation-atol",
+		type=float,
+		default=5.0e-4,
+		help="Absolute tolerance for the mandatory reconstructed-vs-exact "
+		     "DFT velocity gate (default: 5e-4).",
+	)
+	parser.add_argument(
+		"--parallel-transport-validation-rtol",
+		type=float,
+		default=5.0e-3,
+		help="Relative tolerance for the mandatory reconstructed-vs-exact "
+		     "DFT velocity gate (default: 5e-3).",
+	)
+	parser.add_argument(
 		"--debug-kindex",
 		type=int,
 		default=1,
@@ -803,9 +820,47 @@ def main(argv=None):
 	)
 	args = parser.parse_args(argv)
 
+	if args.parallel_transport_out is not None:
+		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
+			parser.error(
+				"--parallel-transport-out and --out must name different files; "
+				"the dipole writer opens --out with truncation")
+		if args.vnl_mode != "analytic":
+			parser.error(
+				"--parallel-transport-out requires --vnl-mode=analytic: "
+				"the artifact stores the exact sharded DFT velocity from "
+				"the production sweep, not the gathered numeric debug arm")
+		if args.skip_vnl:
+			parser.error(
+				"--parallel-transport-out cannot be combined with --skip-vnl: "
+				"velocity_dft_cart must contain p + i[r,V_NL]")
+		if not np.isfinite(args.parallel_transport_rcond) \
+				or float(args.parallel_transport_rcond) <= 0.0:
+			parser.error("--parallel-transport-rcond must be finite and positive")
+		for name, value in (
+				("--parallel-transport-validation-atol",
+				 args.parallel_transport_validation_atol),
+				("--parallel-transport-validation-rtol",
+				 args.parallel_transport_validation_rtol),
+		):
+			if not np.isfinite(value) or float(value) < 0.0:
+				parser.error(f"{name} must be finite and non-negative")
 
 	input_path = Path(args.input).resolve()
 	params = read_cohsex_input(str(input_path))
+	w_av_first_neighbors = bool(params.get("w_av_first_neighbors", False))
+	w_av_second_neighbors = bool(params.get("w_av_second_neighbors", False))
+	if (w_av_first_neighbors or w_av_second_neighbors) \
+			and args.parallel_transport_out is None:
+		parser.error(
+			"W_av_first_neighbors / W_av_second_neighbors require "
+			"--parallel-transport-out: it names the SlabIO stencil "
+			"artifact")
+	if args.w_av_only and not (
+			w_av_first_neighbors or w_av_second_neighbors):
+		parser.error(
+			"--w-av-only requires an enabled W_av_*_neighbors input flag")
+
 	# The relative sign of i[r, V_NL] in the assembled velocity, resolved
 	# ONCE here so that the two producer routes below -- the analytic
 	# ``dipole_operator`` sweep and the numeric finite-difference block --
@@ -822,7 +877,7 @@ def main(argv=None):
 	# can be read against the table without doing the flip in one's head.
 	_arm = ("p + i[r, V_NL]  (LEGACY -1 arm)" if vnl_velocity_sign < 0.0
 	        else "p - i[r, V_NL]  (default since 2026-08-09)")
-	if not args.skip_vnl:
+	if not args.skip_vnl and not args.w_av_only:
 		print(f"  velocity assembly: {_arm}, "
 		      f"vnl_velocity_sign = {vnl_velocity_sign:+.1f}")
 	# Resolve WFN relative to input file directory as preferred
@@ -831,15 +886,15 @@ def main(argv=None):
 		wfn_path = (input_path.parent / wfn_path).resolve()
 
 	# Open WFN and symmetry.  The mesh comes from the module-top
-	# ``initialize_communicator_stack()``; with it, ``backend=auto`` can
-	# pick the collective phdf5 read at P>1 instead of the per-rank eager
-	# h5py read (scorecard BD.2).  The per-k sweep below stays on the
-	# process-local read path either way.
-	wfn = WfnLoader(str(wfn_path))
-	wfn.adopt_mesh(RUNTIME.mesh)
-	sym = symmetry_maps.SymMaps(wfn)
+	# ``initialize_communicator_stack()``; pass it at construction so
+	# ``backend=auto`` selects collective phdf5 immediately rather than first
+	# opening an unused eager backend and switching it afterwards.
+	wfn = WfnLoader(str(wfn_path), mesh=RUNTIME.mesh)
+	# WfnLoader owns the one cached symmetry service used by its collective
+	# unfold path.  Reuse it here instead of constructing an identical second
+	# table that the first ``wfn.load(...)`` would immediately build again.
+	sym = wfn.symmetry()
 
-	nval = int(params.get("nval", 5))
 	ncond = int(params.get("ncond", 5))
 	# Choose target band count: at least nelec+ncond, clipped to file bands; honor user nband if larger
 	try:
@@ -852,9 +907,6 @@ def main(argv=None):
 		nband = max(int(wfn.nbands), int(wfn.nelec) + int(ncond))
 	bispinor = bool(params.get("bispinor", False))
 
-	print("\nCreating system metadata...")
-	meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
-
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``
 	# (mandatory under impl=mpi, from the main thread).  ``RUNTIME.mesh``
@@ -864,6 +916,28 @@ def main(argv=None):
 	# Ensure we load enough conduction bands for debug/output comparisons.
 	# ψ is NOT loaded here — see the k sweep below.
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
+
+	if args.w_av_only:
+		from file_io.parallel_transport import write_w_av_stencil_artifact
+		with timing.section("w_av_stencil"):
+			write_w_av_stencil_artifact(
+				Path(args.parallel_transport_out).resolve(),
+				wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
+				nbands=nband_eff, bispinor=bispinor,
+				first_neighbors=w_av_first_neighbors,
+				second_neighbors=w_av_second_neighbors,
+				wfn_path=str(wfn_path),
+				wfn_fingerprint=wfn_fingerprint(wfn))
+		if jax.process_index() == 0:
+			print(
+				"\nWrote standalone W-av stencil to "
+				f"{Path(args.parallel_transport_out).resolve()}")
+		return 0
+
+	nval = int(params.get("nval", 5))
+	if jax.process_index() == 0:
+		print("\nCreating system metadata...")
+	meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 
 	print("\nScanning for pseudopotential files...")
 	searched = [str(args.pseudo_dir)] if args.pseudo_dir else [str(input_path.parent)]
@@ -1195,6 +1269,8 @@ def main(argv=None):
 	# The three Cartesian components ride ONE sweep, so the hoisted
 	# m-side reshard is paid once rather than three times; only the
 	# per-k reshard payload is 3x.
+	pt_path = None
+	write_pt_remainder = None
 	if args.vnl_mode == "numeric":
 		with timing.section("dipole_sweep"):
 			dip_k_major = gather_k_blocks(nk, _dipole_block,
@@ -1219,6 +1295,28 @@ def main(argv=None):
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
 				kvecs=np.asarray(sym.unfolded_kpts))
+			if args.parallel_transport_out is not None:
+				# The feature is deliberately opt-in: the default dipole
+				# artifact and its bitwise production path remain untouched.
+				# Keep H_v sharded and direction-major it only inside the
+				# SlabIO writer; no host gather or second velocity evaluation.
+				from file_io.parallel_transport import (
+					initialize_parallel_transport_artifact,
+					validate_parallel_transport_artifact,
+					write_parallel_transport_artifact)
+				pt_path = Path(args.parallel_transport_out).resolve()
+				with timing.section("parallel_transport_velocity"):
+					initialize_parallel_transport_artifact(
+						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
+						nbands=nb,
+						effective_nspinor=int(meta.nspinor),
+						bispinor=bispinor,
+						velocity_dft_kmajor=H_v,
+						wfn_path=str(wfn_path),
+						wfn_fingerprint=wfn_fingerprint(wfn),
+						rcond=float(args.parallel_transport_rcond))
+				write_pt_remainder = write_parallel_transport_artifact
+				validate_pt_artifact = validate_parallel_transport_artifact
 			# THE BOUNDARY, named rather than implied: the only consumer
 			# of the (nk, 3, nb, nb) table is the serial h5py write on
 			# rank 0 below, which cannot take a sharded operand.
@@ -1226,6 +1324,31 @@ def main(argv=None):
 			# runs in chunks so a peer's transient is one chunk.
 			dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
 		del H_v, psi_G
+		if pt_path is not None:
+			# The SlabIO velocity transaction above is closed and durable,
+			# and the all-k psi/H_v device arrays are now dead.  The link
+			# stream therefore holds only one central and one neighbour WFN
+			# plus one distributed band matrix, never both preprocessing
+			# representations at once.
+			with timing.section("parallel_transport_links"):
+				write_pt_remainder(
+					pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
+					nbands=nb, bispinor=bispinor,
+					rcond=float(args.parallel_transport_rcond),
+					w_av_first_neighbors=w_av_first_neighbors,
+					w_av_second_neighbors=w_av_second_neighbors)
+			with timing.section("parallel_transport_validation"):
+				metrics = validate_pt_artifact(
+					pt_path, mesh=RUNTIME.mesh, kgrid=wfn.kgrid,
+					nbands=nb,
+					bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
+					atol=float(args.parallel_transport_validation_atol),
+					rtol=float(args.parallel_transport_validation_rtol))
+			print(
+				"  DFT covariant-velocity validation: PASS "
+				f"max_abs={metrics['max_abs']:.6e}, "
+				f"max_rel={metrics['max_rel']:.6e}")
+			print(f"\nWrote parallel-transport data to {pt_path}")
 	if dip_k_major is not None:
 		dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
 	else:

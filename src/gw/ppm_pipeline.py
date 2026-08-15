@@ -48,6 +48,7 @@ def _fit_head_correction(
     meta,
     probe_omega: complex,
     print_fn,
+    iteration_head=None,
 ):
     """Fit the GN-PPM scalar head from the user-selected source."""
     from .head_correction import (
@@ -57,7 +58,8 @@ def _fit_head_correction(
         format_head_diagnostics,
     )
 
-    head_static = head_resolver.at(0.0 + 0.0j)
+    head_source = iteration_head if iteration_head is not None else head_resolver
+    head_static = head_source.at(0.0 + 0.0j)
     omega_h_override = config.ppm.head_omega_h_ry
     # ``ppm_model``, not ``is HL_PPM``: the final arm of this chain is the
     # GN two-point head fit, so reading the mode as a boolean "is it HL"
@@ -88,7 +90,7 @@ def _fit_head_correction(
             f"({(omega_p_sq_ry**0.5) * RYD_TO_EV:.4f} eV)"
         )
     else:
-        head_probe = head_resolver.at(probe_omega)
+        head_probe = head_source.at(probe_omega)
         head_gn = fit_head_ppm_from_samples(
             head_static, head_probe, probe_omega=probe_omega)
 
@@ -102,6 +104,7 @@ def _compute_analytic_head_diag(
     band_slices,
     wfn, sym, meta,
     print_fn,
+    iteration_head=None,
 ) -> np.ndarray:
     """Compute the analytic q→0, G=G'=0 PPM head diagonal.
 
@@ -111,13 +114,28 @@ def _compute_analytic_head_diag(
     """
     from .head_correction import compute_ppm_head_sigma_diag
 
-    enk_full, _ = get_enk_bandrange(
-        wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-        nspinor=meta.nspinor)
-    enk_full_np = np.asarray(enk_full, dtype=np.float64)
-    # Canonical mid-gap E_F from WFNReader (computed once at WFN load
-    # over the full set of bands stored in WFN.h5; band-window-independent).
-    efermi_ry = float(wfn.efermi)
+    occupations = None
+    if iteration_head is None:
+        enk_full, _ = get_enk_bandrange(
+            wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+            nspinor=meta.nspinor)
+        enk_full_np = np.asarray(enk_full, dtype=np.float64)
+        # Canonical DFT mid-gap E_F for the one-shot path.
+        efermi_ry = float(wfn.efermi)
+    else:
+        # The velocity, transition denominators, occupations, and analytic
+        # head Sigma must describe ONE iteration.  Re-loading DFT energies
+        # here would quietly mix bases after the S tensor was updated.
+        enk_full_np = np.asarray(
+            iteration_head.sigma_energies_ry, dtype=np.float64)
+        efermi_ry = float(iteration_head.efermi_ry)
+        expected = (int(meta.nk_tot), int(meta.nb_sigma))
+        if enk_full_np.shape != expected:
+            raise ValueError(
+                "iteration head active energies must have shape "
+                f"{expected}, got {enk_full_np.shape}.")
+        occupations = np.asarray(
+            iteration_head.sigma_occupations, dtype=np.float64)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
     # The head is band-diagonal; compute that lossless (nω, nk, nb)
@@ -129,6 +147,7 @@ def _compute_analytic_head_diag(
         enk_ry=enk_full_np,
         efermi_ry=efermi_ry,
         n_occ=n_occ,
+        occupations=occupations,
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
     )
@@ -162,6 +181,7 @@ def compute_ppm_sigma_pipeline(
     band_slices,
     wfn,
     sym,
+    iteration_head=None,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -245,11 +265,13 @@ def compute_ppm_sigma_pipeline(
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
+            iteration_head=iteration_head,
         )
         head_sigma_diag_w_kn_ry = _compute_analytic_head_diag(
             head_gn,
             config=config, band_slices=band_slices,
             wfn=wfn, sym=sym, meta=meta,
+            iteration_head=iteration_head,
             print_fn=print_fn,
         )
 

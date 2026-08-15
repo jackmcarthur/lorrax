@@ -520,7 +520,7 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # loudly until it is rewritten to pin the new behaviour.
 UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
     ComputeMode.MPA: (
-        "the real-material chi/W/fixed-head/Sigma/QSGW disk pipeline "
+        "the real-material chi/W/dynamic-head/Sigma/QSGW disk pipeline "
         "must pass end to end; see THEORY_mpa_implementation.md"
     ),
 }
@@ -814,6 +814,11 @@ _DEFAULTS = {
     # boundary.  Sigma stays on the full BZ -- it is an FFT over the
     # k-grid.  Off keeps the loop entirely full-BZ.
     "sc_on_ibz": False,
+    # Update the q->0 head from the current QSGW Hamiltonian through the
+    # precomputed parallel-transport connection.  Explicit opt-in preserves
+    # every historical deck and makes a missing/stale artifact a refusal.
+    "sc_head_update": "off",       # off | parallel_transport
+    "parallel_transport_file": "parallel_transport.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1263,6 +1268,12 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # Opt-in finite-q W-av preprocessing.  The flags select the first and
+    # second reciprocal-grid stencil shells written beside the PT data; they
+    # do not activate the not-yet-complete metallic finite-q screening path.
+    "w_av_first_neighbors": False,
+    "w_av_second_neighbors": False,
+
     # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
     # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
     # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
@@ -1297,6 +1308,12 @@ _DEFAULTS = {
     "whead_imfreq": None,
     # Screening / minimax
     "screening_method": "minimax",
+    # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
+    # Zero preserves the historical step-occupation path.  The first
+    # consumer is the per-iteration QSGW parallel-transport head; the same
+    # key is intentionally reserved for later Green-function/screening
+    # consumers so there is one occupation convention for the whole code.
+    "occ_broadening": 0.0,
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
     "regenerate_minimax_tables": False,
@@ -1459,6 +1476,7 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
+    "sc_head_update",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
@@ -1857,6 +1875,7 @@ class FilePaths:
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
     kin_ion_file: str
+    parallel_transport_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -1897,6 +1916,8 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
+    w_av_first_neighbors: bool
+    w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
     use_bgw_vcoul: bool
@@ -1917,12 +1938,15 @@ class ScreeningConfig:
     normalised, and ran minimax without a word.
     """
     method: str                   # "minimax" -- the only supported value
+    occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
 
     def __post_init__(self):
+        if self.occ_broadening_ev < 0.0:
+            raise ValueError("occ_broadening must be >= 0 eV.")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from
         # the pre-minimax era) was accepted here for months and always ran
@@ -2088,6 +2112,7 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     eigh: str = "auto"    # "auto" | "native" | "distributed"
+    head_update: str = "off"  # "off" | "parallel_transport"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -2106,6 +2131,10 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
+        if self.head_update not in ("off", "parallel_transport"):
+            raise ValueError(
+                "sc_head_update must be 'off' or 'parallel_transport'; "
+                f"got {self.head_update!r}.")
 
 
 @dataclass(frozen=True)
@@ -2291,6 +2320,25 @@ class LorraxConfig:
 
     # --- Input directory (for resolving relative paths at runtime) ---
     input_dir: str = ""
+
+    def __post_init__(self):
+        """Refuse fractional-occupation settings outside their landed scope."""
+        if self.screening.occ_broadening_ev == 0.0:
+            return
+        if self.qp_solver is not QPSolver.SELF_CONSISTENT:
+            raise ValueError(
+                "occ_broadening > 0 is currently implemented only for "
+                "qp_solver=self_consistent.")
+        if self.sc.head_update != "parallel_transport":
+            raise ValueError(
+                "occ_broadening > 0 currently updates only the QSGW head; "
+                "set sc_head_update=parallel_transport.")
+        if self.sc.accelerator != "linear":
+            raise ValueError(
+                "occ_broadening > 0 carries an exact end-of-iteration MP1 "
+                "occupation state and therefore currently requires "
+                "sc_accelerator=linear.  rCROP mixes only the Hamiltonian "
+                "and cannot preserve that sequential state exactly.")
 
     # ------------------------------------------------------------------
     #  Derived config objects
@@ -2523,6 +2571,7 @@ class LorraxConfig:
             centroids_file=str(_g("centroids_file")),
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
+            parallel_transport_file=str(_g("parallel_transport_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
@@ -2540,6 +2589,8 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
+            w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
+            w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
             zeta_cutoff=_g("zeta_cutoff"),
             use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
@@ -2548,6 +2599,7 @@ class LorraxConfig:
         )
         screening = ScreeningConfig(
             method=str(_g("screening_method")).strip().lower(),
+            occ_broadening_ev=float(_g("occ_broadening")),
             minimax_target_error=float(_g("minimax_target_error")),
             minimax_max_nodes=int(_g("minimax_max_nodes")),
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
@@ -2624,6 +2676,7 @@ class LorraxConfig:
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),
+            head_update=str(_g("sc_head_update")).strip().lower(),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,

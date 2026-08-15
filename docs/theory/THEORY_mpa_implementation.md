@@ -566,12 +566,42 @@ S_{\mathrm{eff}}(z)=S_0(z)
 +\frac{Y(z)W_{\mathrm{body},\Gamma}(z)Z(z)}{V_{\mathrm{cell}}}.
 $$
 
-The sharded $YWZ$ contraction exists, but the producer that rebuilds $S_0$,
-$Y$, and $Z$ from the current orbitals is not connected. The staged MPA driver
-therefore fits the established two-point DFT scalar head once and labels it
-`fixed_dft_gn`. This approximation omits dynamic local-field head/wing
-feedback. It is especially suspect near gap closure and under orbital
-self-consistency.
+`gw.head_correction.fold_cartesian_head_wings_sharded` owns this contraction
+without gathering the body tile.  MPA now builds one frequency plan and gives
+the exact same complex `z` array to the body and to the QSGW direct-head
+response.  Each Dyson slab may finalize one head sample while total
+`W_body,Gamma(z)` is resident; only the 3x3 result survives.  The scalar
+`Wc_head(z) = W_head(z) - v_head` is fit with the same Loewner policy, guards,
+and complex sample grid as the body and is published collectively through
+SlabIO beside the body poles.
+
+The MPA path supplies independent complex left/right centroid wings at every
+sample.  The direct all-band contraction keeps the two stored centroid-
+sharded wavefunction copies, distributes equal band-pair tiles over all
+`Px*Py` ranks, and circulates a tile only around the mesh axis matching its
+output wing.  Frequencies are blocked inside each ring, so the transition
+weight temporary is bounded and no band-pair-by-centroid tensor is stored.
+Each sample is folded through total W while that body slab is resident.
+
+The QSGW order is sequential.  The first half of iteration `i` evaluates the
+direct head on the full MPA grid using the chemical potential and occupations
+carried from iteration `i-1`.  Only after Sigma/H assembly and the current
+orbital rotation does the fixed-electron MP1 solve produce the state consumed
+by iteration `i+1`.  Those occupations are used only by the head correction;
+the finite-q body, Green functions, and general Sigma occupation semantics are
+still the insulating implementations and remain capability-gated.
+
+One-shot and diagonal fixed-point QP solvers can consume a finalized external
+pole store.  Fully self-consistent QSGW rebuilds the body and head models
+because each iteration changes the orbitals and transition energies.  The
+bounded path is `chi(z)` q-wedge store -> one-slab Dyson and head finalization
+-> `Wc(z)` q-wedge store -> bounded body-column and scalar-head Loewner fits.
+Sigma subsequently reads and unfolds four body pole/residue slabs at a time
+and reads the small head fit collectively.  Public `compute_mode = mpa`
+remains disabled until one real-material run traverses the complete
+chi/W/head/Sigma/QSGW chain; this section describes landed internal plumbing,
+not a metallic-screening capability claim.
+
 
 The MPA body applies the configured $\eta$ to every pole. The current generic
 complex-pole head consumer uses the stored head pole without adding the same
@@ -586,7 +616,7 @@ Hermitian QSGW operator, and apply the existing outside-band scissor. A
 self-consistent MPA calculation must rebuild chi, W, and the body pole fit
 after each orbital update. Writing q-wedge chi, W, and pole stores on every
 iteration is supported by the bounded dataflow above; no model tensor belongs
-in `SCState`.
+in `SCState`. When `sc_head_update = parallel_transport`, the fixed-DFT fallback head is replaced per iteration by the direct QP-basis head described above.
 
 ## 13. Validated starting profile
 
@@ -604,7 +634,6 @@ mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
-mpa_head_model = fixed_dft
 mpa_pole_batch_size = 4
 
 mpa_sigma_sector_target_error = 6.5e-4

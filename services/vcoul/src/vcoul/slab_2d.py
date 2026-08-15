@@ -93,11 +93,16 @@ class Slab2D:
         self, geometry: CoulombGeometry, kgrid, *,
         S_cart=None,
         epshead=None,
+        static_kappa2=None,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
     ):
+        if static_kappa2 is not None:
+            raise NotImplementedError(
+                "static_kappa2 is the 3D Thomas-Fermi model; the 2D metallic "
+                "q->0 form requires its separate |q| kernel")
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = jnp.asarray(geometry.bvec, dtype=jnp.float64)
         zc = jnp.pi / bvec[2, 2]

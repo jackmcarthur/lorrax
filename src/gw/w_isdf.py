@@ -45,6 +45,12 @@ from .minimax_screening import MinimaxNodes
 _chi_minimax_kernel_cache: dict = {}
 _w_solve_cache: dict = {}
 
+# The static metal fallback streams one small ordered band-pair tile at a
+# time.  This is deliberately a compile-time constant: changing it is a
+# memory/performance choice, not physics or an input-file option.
+_STATIC_FRACTIONAL_PAIR_TILE = 8
+
+
 
 # ============================================================================
 # χ₀ kernel — minimax quadrature
@@ -281,6 +287,147 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi
     return minimax_tau_integrate_chi
 
+
+
+
+def _get_chi_fractional_contour_kernel(
+    mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
+):
+    """Retarded finite-occupation chi0 on one positive-time sweep.
+
+    At each node this builds only
+
+        A_q(t) = sum_ab f_a (1-f_b) exp[-i(E_b-E_a)t] X_ab(q)
+
+    from two single-band Green sums.  The other Keldysh product is not a
+    second pair build: Hermiticity of the density vertex gives
+
+        B_q(t) = A_{-q}(-t)^T.
+
+    With the FFT convention used here, FFT_R[conj(A_R(t))](q) is exactly
+    conj(A_{-q}(t)) = A_{-q}(-t)^T.  This is an explicit full-grid
+    q-orientation identity, not time-reversal symmetry, and is therefore
+    valid for broken-TRS spinor calculations.  The two products meet only
+    after both band sums have disappeared.
+    """
+    from common.fft_helpers import make_flat_k_fftn
+    from .greens_function_kernel import build_G_tau
+    from .wavefunction_bundle import (
+        G_FFT7D_SPEC,
+        G_FLATK_SPEC,
+        CHI_Q_SPEC,
+        CHI_R_SPEC,
+        PSI_XN_SPEC,
+        PSI_YR_SPEC,
+    )
+    from ffi import ffi_dial_key
+
+    grid = tuple(int(n) for n in kgrid)
+    nk = int(np.prod(grid))
+    n_out = int(n_out)
+    if n_out < 1:
+        raise ValueError("fractional contour chi0 requires at least one output")
+    cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(), n_out)
+    if cache_key in _chi_minimax_kernel_cache:
+        return _chi_minimax_kernel_cache[cache_key]
+
+    G_fftn = make_flat_k_fftn(
+        mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
+    chi_fftn = make_flat_k_fftn(
+        mesh_xy, grid, CHI_Q_SPEC, norm="ortho")
+    G_shard = NamedSharding(mesh_xy, G_FLATK_SPEC)
+    chi_R_shard = NamedSharding(mesh_xy, CHI_R_SPEC)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    rep1 = NamedSharding(mesh_xy, P(None))
+    rep0 = NamedSharding(mesh_xy, P())
+
+    @partial(
+        jax.jit,
+        in_shardings=(
+            rep1, rep0,
+            NamedSharding(mesh_xy, PSI_XN_SPEC),
+            NamedSharding(mesh_xy, PSI_YR_SPEC),
+            NamedSharding(mesh_xy, PSI_YR_SPEC),
+            NamedSharding(mesh_xy, PSI_XN_SPEC),
+            rep2, rep2, rep2, rep2, rep0,
+        ),
+        out_shardings=tuple(chi_R_shard for _ in range(n_out)),
+    )
+    def integrate(
+        time_nodes,
+        projection_rows,
+        psi_f_xn,
+        psi_f_yr,
+        psi_u_yr,
+        psi_u_xn,
+        enk_f,
+        enk_u,
+        occ_f,
+        occ_u,
+        energy_reference,
+    ):
+        n_mu = psi_f_xn.shape[2]
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
+            chi_R_shard,
+        )
+        initial = tuple(zero for _ in range(n_out))
+
+        def body(accumulators, node):
+            time, projection = node
+            tau = jnp.asarray(1j, dtype=jnp.complex128) * time
+            Gf_k = jax.lax.with_sharding_constraint(
+                jnp.conj(build_G_tau(
+                    psi_f_xn,
+                    psi_f_yr,
+                    enk_f,
+                    -tau,
+                    e_ref=energy_reference,
+                    band_weight=occ_f,
+                )),
+                G_shard,
+            )
+            Gu_k = jax.lax.with_sharding_constraint(
+                jnp.conj(build_G_tau(
+                    psi_u_xn,
+                    psi_u_yr,
+                    enk_u,
+                    -tau,
+                    e_ref=energy_reference,
+                    band_weight=1.0 - occ_u,
+                )),
+                G_shard,
+            )
+            Gf_R = G_fftn(Gf_k)
+            Gu_R = G_fftn(Gu_k)
+            A_R = jax.lax.with_sharding_constraint(
+                jnp.einsum(
+                    "Rambn,Rambn->Rmn",
+                    Gu_R,
+                    jnp.conj(Gf_R),
+                    optimize=True,
+                ),
+                chi_R_shard,
+            )
+            reverse_R = jnp.conj(A_R)
+            updated = tuple(
+                accumulators[i]
+                - 1j * projection[i] * A_R
+                + 1j * projection[i] * reverse_R
+                for i in range(n_out)
+            )
+            return updated, None
+
+        final_R, _ = jax.lax.scan(
+            body,
+            initial,
+            (time_nodes, jnp.transpose(projection_rows)),
+            unroll=1,
+        )
+        return tuple(chi_fftn(value) for value in final_R)
+
+    _chi_minimax_kernel_cache[cache_key] = integrate
+    return integrate
 
 
 
@@ -941,6 +1088,310 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=True)
     kernel.lower(*args).compile()
+
+
+
+
+def _exact_occupation_support_slices(occupations):
+    """Smallest contiguous f and (1-f) band supports without truncation.
+
+    Equality is intentional.  MP1 occupations may overshoot [0, 1], so this
+    helper neither clips nor applies a tolerance.  It only drops bands whose
+    stored weight is exactly zero on every k, or exactly one on every k.
+    Partially occupied bands consequently belong to both slices.
+    """
+    occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
+    if occ.ndim != 2:
+        raise ValueError(
+            "fractional contour occupations must have shape (nk, nb), got "
+            + str(occ.shape))
+    f_support = np.any(occ != 0.0, axis=0)
+    u_support = np.any(occ != 1.0, axis=0)
+    if not np.any(f_support) or not np.any(u_support):
+        raise ValueError(
+            "fractional contour chi0 needs at least one nonzero f band and "
+            "one nonzero (1-f) band")
+    f_idx = np.flatnonzero(f_support)
+    u_idx = np.flatnonzero(u_support)
+    return (
+        slice(int(f_idx[0]), int(f_idx[-1]) + 1),
+        slice(int(u_idx[0]), int(u_idx[-1]) + 1),
+    )
+
+
+def _chi0_fractional_contour_args(
+    wfns,
+    time_nodes,
+    weight_rows,
+    z_values,
+    occupations,
+    energy_reference,
+):
+    """Prepare the exact finite-occupation positive-time response."""
+    time_nodes = np.asarray(time_nodes, dtype=np.float64)
+    z_values = np.asarray(z_values, dtype=np.complex128)
+    if time_nodes.ndim != 1 or time_nodes.size == 0:
+        raise ValueError(
+            "fractional contour time_nodes must be a nonempty 1-D array")
+    if not np.all(np.isfinite(time_nodes)) or np.any(time_nodes < 0.0):
+        raise ValueError(
+            "fractional contour time_nodes must be finite and nonnegative")
+    if z_values.ndim != 1 or z_values.size == 0:
+        raise ValueError(
+            "fractional contour z_values must be a nonempty 1-D array")
+    if np.any(z_values.imag <= 0.0):
+        raise ValueError(
+            "fractional retarded contour requires Im(z) > 0; the exact static "
+            "divided-difference limit is a separate quadrature target")
+
+    weights = np.asarray(weight_rows, dtype=np.complex128)
+    if weights.ndim == 1:
+        if weights.shape != time_nodes.shape:
+            raise ValueError(
+                "fractional contour 1-D weights must match time_nodes")
+        weights = np.broadcast_to(
+            weights[None, :], (z_values.size, time_nodes.size))
+    if weights.shape != (z_values.size, time_nodes.size):
+        raise ValueError(
+            "fractional contour weights must have shape (n_z, n_time)")
+    projection_rows = weights * np.exp(
+        1j * z_values[:, None] * time_nodes[None, :])
+
+    occ_full = wfns.occ if occupations is None else occupations
+    if tuple(occ_full.shape) != tuple(wfns.enk.shape):
+        raise ValueError(
+            "fractional contour occupation shape {} does not match energies "
+            "{}".format(occ_full.shape, wfns.enk.shape))
+    f_slice, u_slice = _exact_occupation_support_slices(occ_full)
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    args = (
+        jnp.asarray(time_nodes, dtype=jnp.float64),
+        jnp.asarray(projection_rows, dtype=jnp.complex128),
+        wfns.xn(f_slice),
+        wfns.yr(f_slice),
+        wfns.yr(u_slice),
+        wfns.xn(u_slice),
+        wfns.enk[:, f_slice],
+        wfns.enk[:, u_slice],
+        occ_full[:, f_slice],
+        occ_full[:, u_slice],
+        jnp.asarray(eref, dtype=jnp.float64),
+    )
+    return args, z_values.size
+
+
+def compute_chi0_contour_fractional(
+    wfns,
+    time_nodes,
+    weight_rows,
+    z_values,
+    meta,
+    mesh_xy,
+    *,
+    occupations=None,
+    energy_reference=0.0,
+):
+    """Evaluate retarded finite-occupation chi0 at complex frequencies.
+
+    weight_rows contains the positive real-time quadrature weights; this
+    routine supplies exp(i*z*t) and both exact Keldysh terms.  It does not
+    implement z=0: the gapless static limit contains the finite divided
+    difference -df/dE and requires its own certified integration rule.
+    """
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args, n_out = _chi0_fractional_contour_args(
+        wfns,
+        time_nodes,
+        weight_rows,
+        z_values,
+        occupations,
+        energy_reference,
+    )
+    kernel = _get_chi_fractional_contour_kernel(mesh_xy, kgrid, n_out)
+    values = kernel(*args)
+    return values[0] if n_out == 1 else values
+
+
+def _get_chi_static_fractional_gamma_kernel(
+    mesh_xy: Mesh, *, nb_logical: int, pair_tile: int,
+):
+    """Exact q=0 divided-difference body, streamed by band-pair tiles.
+
+    The output centroid axes are the process mesh axes.  Bands and k points
+    remain replicated, so every rank performs the same number of pair-tile
+    steps for its unique ``(mu_x, nu_y)`` output tile.  No rank forms an
+    ``(nk, nb, nb, n_mu)`` transition-density array.
+    """
+    from common.shard_map import shard_map
+    from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
+
+    tile = int(pair_tile)
+    key = ("static_fractional_gamma", id(mesh_xy), int(nb_logical), tile)
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    def _local(psi_xn, psi_yn, energies, occupations, surface_weight):
+        nk, nspinor, nmu_x, nb = psi_xn.shape
+        nmu_y = psi_yn.shape[2]
+        nb_pad = ((int(nb) + tile - 1) // tile) * tile
+        pad = nb_pad - int(nb)
+        psi_x = jnp.pad(psi_xn, ((0, 0), (0, 0), (0, 0), (0, pad)))
+        psi_y = jnp.pad(psi_yn, ((0, 0), (0, 0), (0, 0), (0, pad)))
+        energy = jnp.pad(energies, ((0, 0), (0, pad)))
+        occ = jnp.pad(occupations, ((0, 0), (0, pad)))
+        surface = jnp.pad(surface_weight, ((0, 0), (0, pad)))
+        ntiles = nb_pad // tile
+
+        def _pair_tile(accumulator, flat_index):
+            ia = (flat_index // ntiles) * tile
+            ib = (flat_index % ntiles) * tile
+            pa_x = jax.lax.dynamic_slice(
+                psi_x, (0, 0, 0, ia), (nk, nspinor, nmu_x, tile))
+            pb_x = jax.lax.dynamic_slice(
+                psi_x, (0, 0, 0, ib), (nk, nspinor, nmu_x, tile))
+            pa_y = jax.lax.dynamic_slice(
+                psi_y, (0, 0, 0, ia), (nk, nspinor, nmu_y, tile))
+            pb_y = jax.lax.dynamic_slice(
+                psi_y, (0, 0, 0, ib), (nk, nspinor, nmu_y, tile))
+            ea = jax.lax.dynamic_slice(energy, (0, ia), (nk, tile))
+            eb = jax.lax.dynamic_slice(energy, (0, ib), (nk, tile))
+            fa = jax.lax.dynamic_slice(occ, (0, ia), (nk, tile))
+            fb = jax.lax.dynamic_slice(occ, (0, ib), (nk, tile))
+            sa = jax.lax.dynamic_slice(surface, (0, ia), (nk, tile))
+            sb = jax.lax.dynamic_slice(surface, (0, ib), (nk, tile))
+
+            de = ea[:, :, None] - eb[:, None, :]
+            df = fa[:, :, None] - fb[:, None, :]
+            scale = jnp.maximum(
+                1.0,
+                jnp.maximum(jnp.abs(ea[:, :, None]),
+                            jnp.abs(eb[:, None, :])),
+            )
+            separated = (
+                jnp.abs(de) > 64.0 * jnp.finfo(jnp.float64).eps * scale)
+            # surface_weight is -df/dE.  The average is exact for a truly
+            # degenerate pair and is the stable midpoint limit for a pair
+            # closer than floating-point energy resolution.
+            diagonal_limit = -0.5 * (sa[:, :, None] + sb[:, None, :])
+            divided = jnp.where(
+                separated, df / jnp.where(separated, de, 1.0),
+                diagonal_limit)
+            ga = ia + jnp.arange(tile)
+            gb = ib + jnp.arange(tile)
+            logical = (
+                (ga[:, None] < int(nb_logical))
+                & (gb[None, :] < int(nb_logical))
+            )[None, :, :]
+            divided = jnp.where(logical, divided, 0.0)
+
+            # d_ab(mu) = sum_s psi_a(mu) conj(psi_b(mu)).  The spinor
+            # component is summed here, so scalar, two-component and future
+            # four-component wavefunctions share this exact kernel.
+            density_x = jnp.einsum(
+                "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
+            density_y = jnp.einsum(
+                "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+            contribution = jnp.einsum(
+                "kab,kmab,knab->mn", divided, density_x,
+                jnp.conj(density_y), optimize=True)
+            return accumulator + contribution, None
+
+        zero = jnp.zeros((nmu_x, nmu_y), dtype=jnp.complex128)
+        chi, _ = jax.lax.scan(
+            _pair_tile, zero, jnp.arange(ntiles * ntiles), unroll=1)
+        return chi[None, :, :] / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+
+    kernel = jax.jit(shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, None), P(None, None),
+                  P(None, None)),
+        out_specs=P(None, "x", "y"),
+        check_vma=False,
+    ))
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
+def compute_chi0_static_fractional_gamma(
+    wfns,
+    energies_kn_ry,
+    occupations_kn,
+    surface_weight_kn,
+    meta,
+    mesh_xy,
+    *,
+    nb_logical: int,
+):
+    r"""Return the exact static fractional-occupation chi0 at Gamma.
+
+    The ordered-pair kernel evaluates
+
+    ``(f_ka-f_kb)/(E_ka-E_kb)``
+
+    and uses ``df/dE`` on the degenerate diagonal.  The supplied surface
+    table owns that diagonal limit; the QSGW metal path supplies periodic
+    tetrahedron weights, while off-diagonal pairs retain the carried MP1
+    occupations.  The returned ``(1,n_mu,n_mu)`` array has the historical
+    raw-chi normalization expected by :func:`solve_w`.
+
+    This direct tiled implementation is the exact finite-band fallback.  A
+    future certified separable divided-difference minimax target can replace
+    its internals without changing this API or the Dyson/head callers.
+    """
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    if e.ndim != 2 or f.shape != e.shape or surface.shape != e.shape:
+        raise ValueError(
+            "static fractional chi requires matching (nk,nb) energies, "
+            f"occupations, and surface weights; got {e.shape}, {f.shape}, "
+            f"{surface.shape}")
+    if int(e.shape[0]) != int(meta.nk_tot):
+        raise ValueError(
+            f"static fractional chi has nk={e.shape[0]}, expected "
+            f"meta.nk_tot={meta.nk_tot}")
+    if not (0 < int(nb_logical) <= int(e.shape[1])):
+        raise ValueError(
+            f"static fractional chi needs 0 < nb_logical <= {e.shape[1]}; "
+            f"got {nb_logical}")
+    if int(wfns.psi_xn.shape[-1]) < int(e.shape[1]):
+        raise ValueError("centroid wavefunctions do not cover the static bands")
+    psi_x = wfns.psi_xn[..., : int(e.shape[1])]
+    psi_y = wfns.psi_yn[..., : int(e.shape[1])]
+    return _get_chi_static_fractional_gamma_kernel(
+        mesh_xy,
+        nb_logical=int(nb_logical),
+        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
+    )(psi_x, psi_y, e, f, surface)
+
+
+def precompile_chi0_contour_fractional(
+    wfns,
+    time_nodes,
+    weight_rows,
+    z_values,
+    meta,
+    mesh_xy,
+    *,
+    occupations=None,
+    energy_reference=0.0,
+):
+    """AOT sibling of compute_chi0_contour_fractional."""
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    args, n_out = _chi0_fractional_contour_args(
+        wfns,
+        time_nodes,
+        weight_rows,
+        z_values,
+        occupations,
+        energy_reference,
+    )
+    _get_chi_fractional_contour_kernel(
+        mesh_xy, kgrid, n_out).lower(*args).compile()
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
