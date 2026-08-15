@@ -343,6 +343,14 @@ def test_write_results_puts_every_text_file_on_the_wedge(tmp_path):
     # ...and the star-spread diagnostic, which CANNOT be recomputed from a
     # wedge file, is recorded in the header instead of being lost.
     hdr = (tmp_path / "sigma_diag.dat").read_text()
+    # Per band, not just the max: the band scope is the consumer's, and a
+    # producer-side max answered a wider question than the gate asked
+    # (41.34 meV over 60 bands vs 2.61 over the 16 compared).
+    pb = [ln for ln in hdr.splitlines()
+          if ln.startswith("# star_spread_ev_per_band")]
+    assert len(pb) == 1, "no per-band star-spread row"
+    assert len(pb[0].split()) - 2 == NB, (
+        f"per-band row has {len(pb[0].split()) - 2} entries for {NB} bands")
     assert "# star_spread_ev" in hdr, (
         "sigma_diag.dat carries no star-spread header line.  That number is "
         "measured upstream on the full BZ; without it the diagnostic dies "
