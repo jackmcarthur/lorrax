@@ -48,6 +48,23 @@ _UNFOLDERS = [
 ]
 
 
+def _code_of(relpath: str, name: str) -> str:
+    """A function's CODE, with its docstring removed.
+
+    The docstrings on these functions deliberately NAME the constructs
+    that were deleted, so a substring search over the raw source finds
+    them and reports the explanation as the defect.  Stripping the
+    docstring node and unparsing leaves only what actually runs.
+    """
+    fn = _function(relpath, name)
+    body = fn.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return "\n".join(ast.unparse(node) for node in body)
+
+
 def _function(relpath: str, name: str) -> ast.FunctionDef:
     tree = ast.parse((_SRC / relpath).read_text())
     for node in ast.walk(tree):
@@ -109,9 +126,7 @@ def test_no_energy_fingerprint_matching_survives_in_the_bse_path():
     rediscover.  Pinned on the source: no tolerance constant and no
     'match by energy' machinery in the function.
     """
-    src = (_SRC / "bse/bse_window.py").read_text()
-    fn = _function("bse/bse_window.py", "apply_eqp_corrections")
-    seg = ast.get_source_segment(src, fn) or ""
+    seg = _code_of("bse/bse_window.py", "apply_eqp_corrections")
     for token in ("tol_ev", "best_ibz", "best_err"):
         assert token not in seg, (
             f"apply_eqp_corrections still contains {token!r} — the "
@@ -343,3 +358,81 @@ def test_the_adapter_is_a_plain_gather_when_no_row_is_time_reversed():
     wedge = rng.standard_normal((int(irr.max()) + 1, 5))
     full = np.asarray(_adapter()(wedge, irr, sidx, nss))
     np.testing.assert_allclose(full, wedge[irr], atol=0.0, rtol=0.0)
+
+
+# ===========================================================================
+#  The other two sites fixed on this branch — the patterns must not return
+# ===========================================================================
+
+#: (file, function, substrings that MUST NOT reappear).  Each token is the
+#: literal name of a construct this branch deleted, so the cell names the
+#: defect rather than a shape that might legitimately recur.
+_BANNED = [
+    ("postprocess/rotate_wfn_to_qp.py", "read_kirr_to_kfull",
+     ("argmin", "np.argmin", "tol=1e-6")),
+    ("file_io/qe_save_reader.py", "_reduce_mp_to_ibz",
+     ("_EPS", "equiv", "wkk")),
+    ("bse/bse_window.py", "apply_eqp_corrections",
+     ("tol_ev", "best_ibz", "best_err")),
+]
+
+
+@pytest.mark.parametrize("relpath,name,banned", _BANNED)
+def test_the_deleted_k_matching_constructs_do_not_come_back(
+        relpath, name, banned):
+    """No argmin over k, no tolerance snapping, no hand-built orbit map.
+
+    Source-level and named, because each of these was a DIFFERENT wrong
+    way to answer "which k is this": a nearest-coordinate search
+    (rotate_wfn_to_qp), a 1e-5 grid snap with a hand-rolled equivalence
+    array (qe_save_reader), and a mean-field-energy fingerprint
+    (bse_window).  A shape-based check would miss at least one of them.
+    """
+    body = _code_of(relpath, name)
+    for token in banned:
+        assert token not in body, (
+            f"{relpath}::{name} contains {token!r} again — one of the "
+            f"hand-rolled k-matching constructs this branch removed")
+
+
+def test_rotate_wfn_reads_the_services_table_instead_of_rebuilding_it():
+    """``kirr_to_kfull`` is READ from the rotation file, not re-derived.
+
+    The file already carries it, written from ``sym.kirr_fullids`` by
+    both producers.  Rebuilding it here by nearest-coordinate search is
+    what let the rotated WFN and ``eqp{0,1}.dat`` — which reads the same
+    dataset in ``gw.eqp_bgw`` — disagree about a k.
+    """
+    src = (_SRC / "postprocess/rotate_wfn_to_qp.py").read_text()
+    assert "f_rot['kirr_to_kfull']" in src or 'f_rot["kirr_to_kfull"]' in src, (
+        "rotate_wfn_to_qp no longer reads kirr_to_kfull from the rotation "
+        "file — if it derives the map again, it is a second answer to a "
+        "question the symmetry service already answered")
+    assert "def add_kpoint_mapping_to_rotation_file" not in src, (
+        "the --add-mapping path is back; it OVERWROTE the service's "
+        "kirr_to_kfull with a nearest-coordinate approximation of itself")
+
+
+def test_qe_kgrid_reduction_delegates_and_keeps_qe_s_transpose_convention():
+    """``_reduce_mp_to_ibz`` calls the service, on the AS-STORED matrices.
+
+    The convention is the load-bearing part and was MEASURED, not
+    assumed: on ``si_cohsex_debug`` (4x4x4, 48 ops) the as-stored
+    matrices reproduce the previous implementation exactly while the
+    transposed ones move k by 2.5e-01; on a 2-op deck both agree, so
+    only a high-symmetry deck can tell them apart.  A silent transpose
+    here changes every QE-derived k-grid in the tree.
+    """
+    fn = _function("file_io/qe_save_reader.py", "_reduce_mp_to_ibz")
+    called = {
+        (c.func.id if isinstance(c.func, ast.Name) else
+         getattr(c.func, "attr", None))
+        for c in ast.walk(fn) if isinstance(c, ast.Call)
+    }
+    assert "find_irreducible_bz_points" in called, (
+        "_reduce_mp_to_ibz no longer delegates to the symmetry service")
+    assert ".transpose(" not in _code_of(
+            "file_io/qe_save_reader.py", "_reduce_mp_to_ibz"), (
+        "a transpose appeared in _reduce_mp_to_ibz.  The measurement says "
+        "this grid reduces with the AS-STORED QE matrices; transposing "
+        "them silently changes every QE-derived k-grid")

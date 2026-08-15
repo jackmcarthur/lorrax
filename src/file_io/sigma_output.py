@@ -78,6 +78,8 @@ def write_sigma_to_file(
 	energies_dft_ev=None,
 	*,
 	kpoints_crys,
+	star_spread_ev=None,
+	n_star_members=None,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
@@ -120,12 +122,16 @@ def write_sigma_to_file(
 	full-BZ file no longer look identical.
 
 	This writer does NOT decide the basis; ``gw_output.write_results``
-	does, and it deliberately keeps this file on the FULL BZ because
-	``bandstructure.htransform.read_eqp_energies`` refuses anything else
-	(``htransform.py:1200-1206`` requires ``nk == sym.nk_tot`` and takes
-	the ``sigX=`` column of this very file as its ``--eqp-file`` input).
-	The eqp{0,1}.dat pair, which no full-BZ consumer reads, is on the
-	wedge -- see ``gw_output.py`` and ``gw/eqp_bgw.py``.
+	does, and since 2026-08-15 it writes EVERY text file on the
+	irreducible wedge — the k-set Sigma is actually extracted on.  The
+	full-BZ arrays are that wedge's symmetry image and carry no
+	independent information, so writing them was writing the same numbers
+	several times under indices nothing in the file explained.
+	A consumer that genuinely needs the full BZ unfolds through the
+	symmetry service (``symmetry_maps.star_broadcast``, via
+	``file_io.kin_ion.broadcast_ibz_to_full_bz``), which is what
+	``htransform.read_eqp_energies`` and ``bse_io.apply_eqp_corrections``
+	do.  Nothing reconstructs a star by hand.
 
 	The coordinate goes on its OWN line, never appended to the
 	``k-point N:`` header and never onto a data row.  Both of those
@@ -215,6 +221,22 @@ def write_sigma_to_file(
 		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
+		        f"states its crystal coordinate on a '# kcrys' line\n")
+		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
+		# ``gw_output._star_spread_of_sigma_diag``) because a wedge file
+		# cannot carry it: unfolding the wedge back is a gather, so the
+		# spread would read 0.000 by construction.  Recorded here so the
+		# check survives the file's move to the wedge.
+		if star_spread_ev is not None:
+			f.write(f"# star_spread_ev {float(star_spread_ev):.9e}   "
+			        f"# worst per-band max-min of Re diag {total_label} "
+			        f"within one star, over the {int(n_star_members)} "
+			        f"full-BZ k this wedge unfolds to.  BLIND TO THE TRS "
+			        f"CONJUGATION CLASS by construction (conjugating a "
+			        f"Hermitian block leaves its real diagonal intact) — "
+			        f"that question is gated in "
+			        f"tests/test_star_offdiag_gate.py\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
@@ -275,10 +297,12 @@ def write_eqp_g0w0(
 		length-checked, for the reason spelled out in the k-BASIS note
 		of :func:`write_sigma_to_file` — this file has the same
 		``k-point N:`` block layout and was paired by position by the
-		same downstream scripts.  It stays on the FULL BZ because the
-		out-of-tree ``make_eqp_htformat.py`` joins it against the
-		IBZ ``eqp1.dat`` to build htransform's full-BZ input
-		(``docs/drivers.md:226``).
+		same downstream scripts.  On the irreducible wedge, like every
+		other text file ``gw_output.write_results`` emits; its one
+		former full-BZ consumer was the out-of-tree
+		``make_eqp_htformat.py``, whose whole job was pre-unfolding this
+		file for htransform — which now reads the wedge and unfolds
+		through the symmetry service itself.
 	"""
 	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
 	g0w0_diag_ev = np.asarray(g0w0_diag_ev, dtype=np.complex128)
@@ -319,8 +343,21 @@ def write_eqp_g0w0(
 def write_sigma_freq_debug_table(
 	filepath: str,
 	columns: list[tuple[str, np.ndarray]],
+	*,
+	kpoints_crys,
 ) -> str:
 	"""Write a per-(k, n) decomposition table.
+
+	``kpoints_crys`` is (nk, 3) crystal coordinates, REQUIRED and
+	length-checked against the columns, and written as a ``# kcrys`` line
+	under each ``k-point N:`` header — the same rule the other two text
+	writers in this module follow, for the same reason.  This file carries
+	``k`` as a DATA COLUMN, which makes it look self-describing and is
+	exactly the trap: that integer is a position in whatever array the
+	caller passed, and pairing it against another code's k-order by value
+	is the mistake that produced 291 meV and 600 meV phantom
+	disagreements elsewhere in this tree.  The coordinate is the join key;
+	the integer is not.
 
 	Each entry in ``columns`` is a ``(name, array)`` pair, where ``array``
 	has shape ``(nk, nb)`` and is real or complex.  Real arrays produce one
@@ -346,6 +383,12 @@ def write_sigma_freq_debug_table(
 		if arr.shape != (nk, nb):
 			raise ValueError(
 				f"column {name!r}: shape {arr.shape} != ({nk}, {nb})")
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} k-rows "
+			f"of {os.path.basename(str(filepath))} — the k-list and the "
+			f"columns are on different k-bases.")
 
 	# Column header — Re/Im split for complex arrays.
 	header = ["k", "n"]
@@ -383,6 +426,8 @@ def write_sigma_freq_debug_table(
 		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
+			f.write(f"# kcrys {kpts[ik, 0]:15.9f}{kpts[ik, 1]:15.9f}"
+			        f"{kpts[ik, 2]:15.9f}\n")
 			for ib in range(nb):
 				row = [f"{ik:>{col_w}d}", f"{ib:>{col_w}d}"]
 				for name, arr in arrays:

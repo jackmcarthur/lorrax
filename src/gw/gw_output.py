@@ -507,6 +507,8 @@ def write_freq_debug(
     omega_dft_rel_ev,
     head_sigma_diag_w_kn_ry,
     omega_grid_ry,
+    kirr_to_kfull,
+    kpoints_irr_frac,
     print_fn=print,
 ):
     """Optional Σ-decomposition debug table (rank-0 caller, all in eV).
@@ -639,8 +641,15 @@ def write_freq_debug(
     )
     _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
     _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
+    # THE WEDGE, like every other text file this module writes.  Each
+    # column above was built on the full BZ because that is the shape the
+    # Sigma arrays arrive in; the rows kept are the ones Sigma was
+    # actually extracted on, and ``kpoints_irr_frac`` names them.
+    _irr = np.asarray(kirr_to_kfull, dtype=np.int64)
+    _cols = [(name, np.asarray(arr)[_irr]) for name, arr in _cols]
     write_sigma_freq_debug_table(
-        config.debug.sigma_freq_debug_file, _cols)
+        config.debug.sigma_freq_debug_file, _cols,
+        kpoints_crys=np.asarray(kpoints_irr_frac, dtype=np.float64))
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
@@ -985,6 +994,46 @@ def _warn_on_unphysical_h0(
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 
+def _star_spread_of_sigma_diag(sigma_tot_kij_ev, k_star_labels):
+    """(worst per-band max−min of Re diag Σ_tot within a star, n members).
+
+    ``k_star_labels`` is ``sym.irr_idx_k`` — the SERVICE's table, one
+    star label per full-BZ k.  Grouping by it is reading that table, not
+    reconstructing a star: no coordinates are compared, no symmetry
+    operation is applied, and no tolerance appears anywhere below.
+
+    Definition kept bit-for-bit from ``tests/harness.py``'s
+    ``_star_spread`` so the recorded number stays comparable with every
+    figure already in the record (2.611 meV on the production anchor,
+    0.000 on the orbit-closed 144-point set): max−min across a star's
+    members, per band, worst over bands and stars, of the REAL DIAGONAL.
+
+    Returns ``(None, None)`` when no labels are supplied — the caller
+    then writes no header line rather than a zero, because "not measured"
+    and "measured zero" are the two things this diagnostic must never
+    confuse.  Its documented blindness is unchanged and stated at the
+    header line: conjugating a Hermitian block leaves the real diagonal
+    exactly intact, so the TRS class is asked in
+    ``tests/test_star_offdiag_gate.py`` instead.
+    """
+    if k_star_labels is None:
+        return None, None
+    labels = np.asarray(k_star_labels)
+    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    if labels.shape[0] != diag.shape[0]:
+        raise ValueError(
+            f"k_star_labels has {labels.shape[0]} entries but Sigma has "
+            f"{diag.shape[0]} k-rows — the star table and the self-energy "
+            f"are on different k-sets.")
+    worst, n_members = 0.0, 0
+    for lab in np.unique(labels):
+        rows = diag[labels == lab]
+        n_members += int(rows.shape[0])
+        if rows.shape[0] > 1:
+            worst = max(worst, float((rows.max(0) - rows.min(0)).max()))
+    return worst, n_members
+
+
 def write_results(
     results: GWResults,
     sigma_diag_file: str,
@@ -996,6 +1045,7 @@ def write_results(
     kpoints_irr_frac: np.ndarray,
     kpoints_reduced: np.ndarray | None = None,
     kirr_to_kfull: np.ndarray | None = None,
+    k_star_labels: np.ndarray | None = None,
     print_fn=print,
     *,
     eqp_dE_ev: float = 0.5,
@@ -1096,26 +1146,66 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
-    # k-BASIS: FULL BZ, and deliberately so.  Every array above is
-    # (nk_full, nb, nb), and ``kpoints_crys`` is ``sym.unfolded_kpts`` —
-    # the two match row for row, which is what the writer now checks.
+    # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
+    # Sigma is EXTRACTED on the irreducible wedge; the full-BZ arrays this
+    # function receives are its symmetry image and carry no independent
+    # information.  So every text file below is written on the wedge, one
+    # block per ``wfn.kpoints`` entry, each block stating its crystal
+    # coordinate.  ``kirr_to_kfull[i]`` is the full-BZ row of wedge point
+    # ``i``; it is the ONLY way rows are selected here, and
+    # ``kpoints_irr_frac`` labels exactly those rows.
     #
-    # This file is NOT moved to the wedge with eqp{0,1}.dat, because it
-    # has a full-BZ consumer that eqp{0,1}.dat does not:
-    # ``bandstructure.htransform.read_eqp_energies`` takes the ``sigX=``
-    # column of this file as ``--eqp-file`` and refuses any row count
-    # other than ``sym.nk_tot`` (htransform.py:1200-1206), indexing the
-    # blocks positionally as full-BZ k (htransform.py:1170-1173).
-    # Truncating here would break that hop; what kills the position-
-    # pairing bug class instead is the per-block coordinate the writer
-    # now emits, which lets a consumer join on k rather than on N.
+    # ``kpoints_crys`` (the full-BZ list) is deliberately NOT used for any
+    # of them — it survives only for ``qp_wfn_rotations.h5``, which stores
+    # the full zone on purpose.  A consumer that needs the full BZ unfolds
+    # through the symmetry service, as ``htransform.read_eqp_energies``
+    # and ``bse_io.apply_eqp_corrections`` now do.
+    if kirr_to_kfull is None:
+        raise ValueError(
+            "write_results requires kirr_to_kfull — every text file it "
+            "writes is on the irreducible wedge and this is the map that "
+            "selects those rows.  Pass sym.kirr_fullids.")
+    irr_idx = np.asarray(kirr_to_kfull, dtype=np.int64)
+    kpts_irr = np.asarray(kpoints_irr_frac, dtype=np.float64)
+    if kpts_irr.shape[0] != irr_idx.shape[0]:
+        raise ValueError(
+            f"write_results: kpoints_irr_frac has {kpts_irr.shape[0]} rows "
+            f"but kirr_to_kfull selects {irr_idx.shape[0]} — the k-list and "
+            f"the row selector disagree about the size of the wedge.")
+
+    # ── THE STAR SPREAD IS MEASURED HERE, BECAUSE HERE IS WHERE IT EXISTS ─
+    # ``_star_spread`` (tests/harness.py) is the worst per-band
+    # disagreement between members of ONE star of the real diagonal
+    # Sigma_tot.  It is a real diagnostic — 2.611 meV on the production
+    # anchor against 0.000 on the orbit-closed 144-point centroid set is
+    # how a non-orbit-closed set was caught — and it is the reason the
+    # full-BZ file existed at all.
+    #
+    # It CANNOT be recovered downstream from a wedge file: unfolding the
+    # wedge back through the service is a gather, so every member would
+    # equal its parent and the spread would read 0.000 by construction —
+    # a fake green, which is worse than no check.  The information is
+    # here and nowhere else, so it is measured here, on the full-BZ
+    # arrays, against the service's OWN star labels (``sym.irr_idx_k``),
+    # and recorded in the file's header for the consumer to read.
+    #
+    # That is strictly better than what it replaced: the harness grouped
+    # k into stars by matching mean-field ENERGY vectors to 2e-3 eV — a
+    # fingerprint that aliases whenever two stars are degenerate, and one
+    # of the sites this branch is removing.
+    _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
+        sx_out + corr_out, k_star_labels)
+
     write_sigma_to_file(
-        sx_out,
+        sx_out[irr_idx],
         sigma_diag_file,
-        sigma_coh_kij_eV=corr_out,
-        hartree_kij_eV=sig_h_out,
-        energies_dft_ev=r2e * np.asarray(results.E_dft_ry, dtype=np.float64),
-        kpoints_crys=kpoints_crys,
+        star_spread_ev=_star_spread_ev,
+        n_star_members=_nstar,
+        sigma_coh_kij_eV=corr_out[irr_idx],
+        hartree_kij_eV=sig_h_out[irr_idx],
+        energies_dft_ev=(
+            r2e * np.asarray(results.E_dft_ry, dtype=np.float64)[irr_idx]),
+        kpoints_crys=kpts_irr,
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
@@ -1127,16 +1217,8 @@ def write_results(
     # Static modes (COHSEX) hand in ``sigma_c_omega_diag_ev=None`` ⇒ Z=1
     # ⇒ eqp1 == eqp0, matching BGW's behavior for static runs.
     #
-    # All gw_jax internal arrays live on the unfolded full BZ (nk_full);
-    # BGW's eqp{0,1}.dat lists only the IBZ wedge.  ``kirr_to_kfull[i]``
-    # is the full-BZ index of IBZ point ``i``; index with it to subset.
-    if kirr_to_kfull is None:
-        raise ValueError(
-            "write_results requires kirr_to_kfull for the BGW eqp{0,1}.dat "
-            "writer — pass sym.kirr_fullids."
-        )
-    irr_idx = np.asarray(kirr_to_kfull, dtype=np.int64)
-
+    # ``irr_idx`` and ``kpts_irr`` are the ones resolved above, for every
+    # file this function writes; the eqp pair is no longer the exception.
     e_dft_ev_full = np.asarray(results.E_dft_ry, dtype=np.float64) * r2e
     e_dft_ev_irr = e_dft_ev_full[irr_idx]
     kin_ion_diag_ev = (
@@ -1231,17 +1313,16 @@ def write_results(
             * r2e
         )
         g0w0_path = os.path.join(input_dir, "eqp_g0w0.dat")
-        # FULL BZ, like sigma_diag.dat above and for the same reason:
-        # the out-of-tree ``make_eqp_htformat.py`` joins this file
-        # against the IBZ ``eqp1.dat`` to build htransform's full-BZ
-        # ``--eqp-file`` (docs/drivers.md:226), so the row set is load-
-        # bearing.  ``kpoints_crys`` is ``sym.unfolded_kpts``, matching
-        # the (nk_full, nb) energy arrays row for row.
+        # The wedge, like every other text file here.  Its one former
+        # full-BZ consumer was the out-of-tree ``make_eqp_htformat.py``,
+        # which existed to PRE-UNFOLD this file for htransform; htransform
+        # now reads the wedge ``eqp1.dat`` and unfolds through the
+        # symmetry service, so that converter has no job left.
         write_eqp_g0w0(
             g0w0_path,
-            results.E_dft_ry * r2e,
-            h0_diag + results.sigma_xc_at_dft_ev,
-            kpoints_crys=kpoints_crys,
+            (results.E_dft_ry * r2e)[irr_idx],
+            (h0_diag + results.sigma_xc_at_dft_ev)[irr_idx],
+            kpoints_crys=kpts_irr,
         )
         print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
