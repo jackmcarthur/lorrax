@@ -120,8 +120,17 @@ the refusal cell itself).
 
 `tests/multi_device/star_invariance_gate.py` used the **wrong** predicate —
 comparing against the star's first FULL-BZ row while deciding conjugation with
-the member's own flag. FIXED. It would have reported a false failure on any deck
-whose star begins on a time-reversed row.
+the member's own flag. **FIXED and verified by execution at P=4**: on
+`cohsex_debug` the old predicate classifies 4 spatial + 2 TRS pairs at a
+residual of 1.400e-02, the fixed one 3 + 3 at 5.599e-10 — one pair in the wrong
+bucket, seven orders of magnitude.
+
+Two facts that execution surfaced and inference would not have: the gate
+**passes on `si_cohsex_debug` with `TRS pairs=0`**, so that deck cannot exercise
+the branch at all; and it **cannot pass on `cohsex_debug`**, whose noise floor
+(5.6e-10) exceeds the gate's `RTOL = 1e-10` — a tolerance calibrated for Si's
+1.2e-15. Both legs fail those two checks identically, before and after the fix.
+Use a TRS-bearing deck for TRS coverage, and do not read that red as new.
 
 ### What can and cannot see a wrong predicate — MEASURED, and the surprise
 
@@ -147,6 +156,48 @@ against independently computed full-BZ values — which is how 27cc885 was caugh
 class and believe you are covered; a cell in
 `test_unfold_through_the_service.py` asserts the blindness so that belief fails
 loudly.
+
+## PRINCIPLE: a self-consistency check cannot detect a uniform error
+
+**No check that asks "is this array consistent with itself under the symmetry
+relation" can detect an error applied uniformly across a whole orbit.** Only a
+comparison against independently computed values can.
+
+This is not a remark about one function. It is a property of the *shape* of the
+check, and it applies to any invariance residual — star spread, orbit closure
+residuals, "does W(Sq) match the permutation of W(q)".
+
+The worked instance, measured:
+
+- The two TRS predicates differ by conjugating an **entire star** uniformly.
+- A uniformly conjugated star still satisfies the star relation exactly.
+- So `symmetry_maps.star_spread` — which compares each member to its star's
+  reference by the correct XOR rule — reports **~0 on both the right and the
+  wrong array**.
+- The diagonal metric is blind for a second, independent reason: conjugating a
+  Hermitian block leaves its real diagonal exactly intact.
+- Historical consequence: 27cc885's wrong `trs_reference` measured **183.61 eV**
+  and was caught only "against an independently computed V_H". The electron
+  count, hermiticity, the spectrum and the eqp.dat V_H column were all
+  unchanged, and nothing in the suite turned red for a month.
+
+| check shape | detects a uniform per-orbit error? |
+|---|---|
+| self-consistency residual (`star_spread`, closure residuals) | **no** |
+| any diagonal-only observable | no (and blind to conjugation twice over) |
+| comparison against independently computed values | **yes** |
+
+**Do not reach for `star_spread` as the guard for a conjugation or convention
+error.** The guard is `tests/test_star_offdiag_gate.py`, which compares against
+the committed full matrices in `cohsex_debug/sigma_mnk.h5` — independent data,
+not self-consistency.
+
+*How this was established, because the reasoning matters as much as the result:*
+a cell was written asserting that `star_spread` **would** catch the mix-up —
+the natural assumption being that the full-matrix check sees what the diagonal
+one misses. The cell failed. The conclusion drawn was that the cell was wrong,
+not the code, and the property above is what replaced it. The assumption had
+been stated in a docstring for months without anyone running it.
 
 ## 6. Real-space / FFT-grid symmetry
 
