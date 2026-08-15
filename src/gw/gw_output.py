@@ -1073,13 +1073,24 @@ def write_results(
         Base directory for ancillary output files (eqp_g0w0.dat,
         qp_wfn_rotations.h5).
     kpoints_crys : np.ndarray, (nk_full, 3)
-        Full-zone k-points in crystal coordinates (for qp_wfn_rotations).
+        Full-zone k-points in crystal coordinates (``sym.unfolded_kpts``).
+        Labels the blocks of the two FULL-BZ text files, ``sigma_diag.dat``
+        and ``eqp_g0w0.dat`` — each row of Sigma gets its k printed, so
+        nothing downstream has to pair by block position — and is stored
+        in ``qp_wfn_rotations.h5``.  NOT what eqp{0,1}.dat use; those take
+        ``kpoints_irr_frac`` below.
     kgrid : (nkx, nky, nkz)
         k-mesh dimensions.
     kpoints_irr_frac : np.ndarray, (nk_irr, 3)
         IBZ-wedge k-points in fractional coords (used for BGW eqp{0,1}.dat).
-    kpoints_reduced, kirr_to_kfull : optional
-        Reduced-zone k-point mapping for restart metadata.
+    kpoints_reduced : optional
+        Reduced-zone k-point list, for restart metadata.
+    kirr_to_kfull : np.ndarray, (nk_irr,)
+        ``sym.kirr_fullids`` — the full-BZ index of each wedge point.
+        Typed optional but REQUIRED in practice (raises below): it is what
+        subsets the full-BZ Sigma down to the wedge for eqp{0,1}.dat, and
+        it must stay in step with ``kpoints_irr_frac``, which labels the
+        rows it selects.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1125,12 +1136,26 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
+    # k-BASIS: FULL BZ, and deliberately so.  Every array above is
+    # (nk_full, nb, nb), and ``kpoints_crys`` is ``sym.unfolded_kpts`` —
+    # the two match row for row, which is what the writer now checks.
+    #
+    # This file is NOT moved to the wedge with eqp{0,1}.dat, because it
+    # has a full-BZ consumer that eqp{0,1}.dat does not:
+    # ``bandstructure.htransform.read_eqp_energies`` takes the ``sigX=``
+    # column of this file as ``--eqp-file`` and refuses any row count
+    # other than ``sym.nk_tot`` (htransform.py:1200-1206), indexing the
+    # blocks positionally as full-BZ k (htransform.py:1170-1173).
+    # Truncating here would break that hop; what kills the position-
+    # pairing bug class instead is the per-block coordinate the writer
+    # now emits, which lets a consumer join on k rather than on N.
     write_sigma_to_file(
         sx_out,
         sigma_diag_file,
         sigma_coh_kij_eV=corr_out,
         hartree_kij_eV=sig_h_out,
         energies_dft_ev=r2e * np.asarray(results.E_dft_ry, dtype=np.float64),
+        kpoints_crys=kpoints_crys,
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
@@ -1265,10 +1290,17 @@ def write_results(
             * r2e
         )
         g0w0_path = os.path.join(input_dir, "eqp_g0w0.dat")
+        # FULL BZ, like sigma_diag.dat above and for the same reason:
+        # the out-of-tree ``make_eqp_htformat.py`` joins this file
+        # against the IBZ ``eqp1.dat`` to build htransform's full-BZ
+        # ``--eqp-file`` (docs/drivers.md:226), so the row set is load-
+        # bearing.  ``kpoints_crys`` is ``sym.unfolded_kpts``, matching
+        # the (nk_full, nb) energy arrays row for row.
         write_eqp_g0w0(
             g0w0_path,
             results.E_dft_ry * r2e,
             h0_diag + results.sigma_xc_at_dft_ev,
+            kpoints_crys=kpoints_crys,
         )
         print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
