@@ -1362,6 +1362,15 @@ _DEFAULTS = {
     "mpa_sampling_alpha": 1,
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
+    # Height (Ry) of the metal near line's FIRST sample, z_1^1 = i*shift --
+    # the published stability dodge around zero-energy intraband
+    # transitions, NOT a broadening.  Unset (the default) = the published
+    # 1e-5 Ha = 2e-5 Ry constant in ``gw.mpa.sampling._METAL_ORIGIN_SHIFT``,
+    # which is bit-for-bit every grid built before this key existed.  A
+    # METAL-ONLY key: an insulating deck's first sample is z = 0 exactly, so
+    # setting it there is refused rather than ignored.  Ry like every deck
+    # key, and therefore TWICE the Ha value the papers quote.
+    "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
     # Both targets bound the same dimensionless relative residual
     # |1-d Q(d)|.  They are separate because the positive crossing rule is
@@ -2057,6 +2066,9 @@ class MPAConfig:
     sampling_alpha: int
     varpi_near_ry: float
     varpi_far_ry: float
+    #: Metal near-line origin shift in Ry; ``None`` = the published
+    #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
+    metal_origin_shift_ry: float | None
     pole_batch_size: int
     sigma_sector_target_error: float
     sigma_crossing_target_error: float
@@ -2076,6 +2088,28 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
+        # The origin shift is metal-only geometry: an insulating plan puts
+        # its first near-line sample at z = 0 exactly, so a shift there is
+        # an off-dial that must refuse rather than be ignored.
+        if self.metal_origin_shift_ry is not None:
+            if self.material_class != "metal":
+                raise ValueError(
+                    "mpa_metal_origin_shift_ry is a metal-only key "
+                    f"(mpa_material_class = {self.material_class} here): it "
+                    "moves the METAL near line's first sample off zero, and "
+                    "an insulating plan samples z = 0 exactly. Remove it, or "
+                    "set mpa_material_class = metal.")
+            if not (0.0 < self.metal_origin_shift_ry < self.varpi_near_ry):
+                raise ValueError(
+                    "mpa_metal_origin_shift_ry must satisfy 0 < shift < "
+                    f"mpa_varpi_near_ry; got shift = "
+                    f"{self.metal_origin_shift_ry!r} Ry against "
+                    f"mpa_varpi_near_ry = {self.varpi_near_ry!r} Ry. The "
+                    "shift dodges the zero-energy intraband pile-up without "
+                    "climbing off the near line it sits on. NOTE the unit: "
+                    "this key is Ry like every deck key, so it is TWICE the "
+                    "Hartree value the multipole papers quote (published "
+                    "default 1e-5 Ha = 2e-5 Ry).")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
 
@@ -2094,6 +2128,7 @@ class MPAConfig:
             alpha=self.sampling_alpha,
             varpi_near=self.varpi_near_ry,
             varpi_far=self.varpi_far_ry,
+            origin_shift=self.metal_origin_shift_ry,
             energy_unit="Ry",
         )
 
@@ -2801,6 +2836,9 @@ class LorraxConfig:
             sampling_alpha=int(_g("mpa_sampling_alpha")),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
+            metal_origin_shift_ry=(
+                float(_g("mpa_metal_origin_shift_ry"))
+                if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             sigma_sector_target_error=float(
                 _g("mpa_sigma_sector_target_error")),

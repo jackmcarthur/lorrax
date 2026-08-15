@@ -23,7 +23,8 @@ def make_mpa_plan(config, quad):
         n_p, omega_m, material_class=config.mpa.material_class,
         alpha=config.mpa.sampling_alpha,
         varpi_near=config.mpa.varpi_near_ry,
-        varpi_far=config.mpa.varpi_far_ry, energy_unit="Ry")
+        varpi_far=config.mpa.varpi_far_ry,
+        origin_shift=config.mpa.metal_origin_shift_ry, energy_unit="Ry")
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     return plan
 
@@ -392,14 +393,24 @@ def build_mpa_fit(
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
+    # The origin shift is stamped ONLY when the deck declared it: it enters
+    # mpa_store's `extra` channel as the additive attr
+    # ``mpa_prov_metal_origin_shift_ry``, outside _SAMPLING_ORDER and so
+    # outside the ω-grid digest.  A deck that leaves the key unset writes
+    # the byte-identical store it wrote before the key existed, which is
+    # the whole reason this is `extra` and not a sixth sampling field.
+    sampling_record = {"protocol": "double_parallel", "varpi": varpi,
+                       "n_p": n_p, "alpha": config.mpa.sampling_alpha,
+                       "omega_max": omega_m}
+    if config.mpa.metal_origin_shift_ry is not None:
+        sampling_record["metal_origin_shift_ry"] = float(
+            config.mpa.metal_origin_shift_ry)
     common = dict(
         mesh_xy=mesh_xy, n_omega=z_all.size, n_q_on_disk=q_idx.size,
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
         closure_verdict=closure_verdict,
         omega=z_all, omega_line=line, energy_unit="Ry",
-        sampling={"protocol": "double_parallel", "varpi": varpi,
-                  "n_p": n_p, "alpha": config.mpa.sampling_alpha,
-                  "omega_max": omega_m})
+        sampling=sampling_record)
     mpa_store.allocate_w_omega_collective(
         sample_path, _CHI, mode="w", **common)
     mpa_store.allocate_w_omega_collective(

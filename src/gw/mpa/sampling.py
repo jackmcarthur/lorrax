@@ -52,8 +52,12 @@ import numpy as np
 _VARPI_NEAR = {"Ha": 0.1, "Ry": 0.2}
 _VARPI_FAR = {"Ha": 1.0, "Ry": 2.0}
 
-# The metal origin shift: z_1^1 = i * 1e-5 Ha, a stability dodge around
-# zero-energy intraband transitions -- NOT a physical broadening.
+# The metal origin shift DEFAULT: z_1^1 = i * 1e-5 Ha, a stability dodge
+# around zero-energy intraband transitions -- NOT a physical broadening.
+# The Ry column is the same physical height in LORRAX-native Rydberg, so
+# every Ry entry is TWICE its Ha partner.  Overridable per call through
+# ``double_parallel_grid(origin_shift=...)`` and, from a deck, through
+# ``mpa_metal_origin_shift_ry`` (always Ry, because deck keys are).
 _METAL_ORIGIN_SHIFT = {"Ha": 1.0e-5, "Ry": 2.0e-5}
 
 _MATERIAL_CLASSES = ("insulator", "metal")
@@ -201,6 +205,7 @@ def double_parallel_grid(
     alpha=1,
     varpi_near=None,
     varpi_far=None,
+    origin_shift=None,
     energy_unit="Ha",
 ):
     """Return the ``2*n_p`` complex sample points of the DP protocol.
@@ -223,6 +228,15 @@ def double_parallel_grid(
         Line heights.  ``None`` takes the published defaults for
         ``energy_unit``: 0.1 and 1 Ha (equivalently 0.2 and 2 Ry).
         Passing them explicitly means the caller owns their units.
+    origin_shift
+        Height of the METAL near line's first sample, ``z_1^1 = i*shift``.
+        Exactly ``varpi_near``'s shape: ``None`` takes the published
+        default for ``energy_unit`` (1e-5 Ha, equivalently 2e-5 Ry), and
+        passing it explicitly means the caller owns its units.  Refused
+        under ``material_class="insulator"``, whose first sample is
+        ``z = 0`` exactly and would silently ignore it, and refused
+        unless ``0 < origin_shift < varpi_near``.  From a deck this is
+        ``mpa_metal_origin_shift_ry``.
     energy_unit
         ``"Ha"`` or ``"Ry"``; selects defaults only.
 
@@ -268,6 +282,23 @@ def double_parallel_grid(
             "FALSE case: 0 < varpi_near < varpi_far -- the near line "
             "resolves structure, the far line carries the envelope.")
 
+    shift = (_METAL_ORIGIN_SHIFT[energy_unit] if origin_shift is None
+             else float(origin_shift))
+    if origin_shift is not None and material_class == "insulator":
+        raise ValueError(
+            f"GATE origin_shift_metal_only: origin_shift={origin_shift!r} "
+            "was passed with material_class='insulator', whose near line's "
+            "first sample is z = 0 exactly -- the shift would be silently "
+            "ignored. FALSE case: material_class == 'metal', or "
+            "origin_shift is None.")
+    if material_class == "metal" and not (0.0 < shift < vn):
+        raise ValueError(
+            f"GATE origin_shift_ordering: origin_shift={shift!r} is not "
+            f"strictly inside (0, varpi_near={vn!r}) in {energy_unit}. "
+            "FALSE case: 0 < origin_shift < varpi_near -- the shift dodges "
+            "the zero-energy intraband pile-up (a stability dodge, not a "
+            "broadening) without climbing off the near line it sits on.")
+
     omegas = partition_omegas(n, omega_m, alpha=alpha)
 
     near = omegas + 1j * vn
@@ -278,7 +309,7 @@ def double_parallel_grid(
     if material_class == "insulator":
         near[0] = 0.0 + 0.0j
     else:
-        near[0] = 1j * _METAL_ORIGIN_SHIFT[energy_unit]
+        near[0] = 1j * shift
 
     grid = np.concatenate([near, far]).astype(np.complex128)
 

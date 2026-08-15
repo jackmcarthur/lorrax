@@ -696,8 +696,23 @@ def test_gate_sampling_refusals():
         sampling.double_parallel_grid(4, 4.0, energy_unit="eV")
     with pytest.raises(ValueError, match="GATE varpi_ordering"):
         sampling.double_parallel_grid(4, 4.0, varpi_near=1.0, varpi_far=0.1)
+    with pytest.raises(ValueError, match="GATE origin_shift_metal_only"):
+        sampling.double_parallel_grid(4, 4.0, origin_shift=1.0e-4)
+    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+        sampling.double_parallel_grid(
+            4, 4.0, material_class="metal", origin_shift=0.0)
+    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+        sampling.double_parallel_grid(
+            4, 4.0, material_class="metal", origin_shift=0.1)
     # FALSE case for each: the scheduled Si call is accepted.
     assert sampling.double_parallel_grid(8, 4.0).shape == (16,)
+    # FALSE case for the two shift gates: a legal metal shift is taken, and
+    # it is the ONLY sample that moves (the ladder's whole requirement).
+    shifted = sampling.double_parallel_grid(
+        8, 4.0, material_class="metal", origin_shift=1.0e-4)
+    default = sampling.double_parallel_grid(8, 4.0, material_class="metal")
+    assert shifted[0] == 1e-4j and default[0] == 1e-5j
+    np.testing.assert_array_equal(shifted[1:], default[1:])
 
 
 def test_gate_error_vector_shape():
