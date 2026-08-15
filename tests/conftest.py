@@ -837,6 +837,34 @@ def gnppm_restart_baseline(gnppm_session, tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def gnppm_sc_session(gnppm_session, tmp_path_factory):
+    """THE self-consistent run.  There is exactly one, and this is it.
+
+    Every other committed deck is ``qp_solver = one_shot_dft``, which is
+    how ``sc_on_ibz`` rotted into a crash without turning anything red.
+    See ``tests/regression/gnppm_debug/gnppm_sc.in`` for why this fixture
+    and not a smaller one — the short version is that the deck must have
+    a file wedge and a star wedge of DIFFERENT sizes (9 vs 5 here) and an
+    orbit-closed centroid set, and gnppm_debug is the only one with both.
+
+    Restarts from the ``gnppm_session`` state, so it costs one Σ chain
+    rather than an ISDF rebuild: ~25 s at P=4 against ~31 s fresh.
+    """
+    run_dir = harness.copy_fixture(
+        harness.REG / "gnppm_debug",
+        tmp_path_factory.mktemp("gnppm_sc") / "gnppm_debug",
+        tmp_from=gnppm_session.run_dir)
+    res = harness.run_gw_jax(run_dir, "gnppm_sc.in")
+    if res.returncode != 0:
+        pytest.fail(
+            f"gnppm SC session run failed.\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+    return _NS(run_dir=run_dir, input_name="gnppm_sc.in",
+               output_name="sigma_diag_gnppm_sc.dat", stdout=res.stdout,
+               session=gnppm_session)
+
+
+@pytest.fixture(scope="session")
 def bispinor_session(tmp_path_factory):
     """Fresh run of the bispinor GN-PPM fixture; Tier-1 state."""
     return _run_session_case(
