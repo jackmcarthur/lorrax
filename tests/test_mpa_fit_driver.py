@@ -157,6 +157,51 @@ def _allocate_collective_fit(path, n_q, n_mu, n_p, mesh_xy):
                          "n_valid"))
 
 
+def test_collective_fit_inode_is_slabio_owned_before_metadata(
+        tmp_path, mesh_xy, monkeypatch):
+    """Serial metadata must append to, never create, the fit-store inode.
+
+    Lustre fixes striping at inode creation.  If rank-zero h5py opens the
+    destination first, the multi-gigabyte pole payload inherits the directory
+    default (one stripe in the Si gate) and SlabIO's rank-aware MPI-IO hints
+    arrive too late.  This assertion deliberately pins creation order rather
+    than merely checking that the finished HDF5 contents look right.
+    """
+    path = tmp_path / "fit_inode_owner.h5"
+    door = MS._qs()
+    original = door.QirrDest
+    metadata_opens = []
+
+    class MetadataMustAppend(original):
+        def __enter__(self):
+            metadata_opens.append(self._mode)
+            assert self._mode in ("a", "r")
+            if self._mode == "a":
+                assert path.exists()
+            group = super().__enter__()
+            if self._mode == "a":
+                assert "Omega_p" in group and "B_p" in group
+                assert "fit_condition" in group
+            return group
+
+    monkeypatch.setattr(door, "QirrDest", MetadataMustAppend)
+    _allocate_collective_fit(path, n_q=1, n_mu=3, n_p=2, mesh_xy=mesh_xy)
+    assert metadata_opens == ["a", "r"]
+
+    with h5py.File(path, "r") as f:
+        assert f["Omega_p"].shape == (2, 1, 3, 3)
+        assert f[MS.MPA_FIT_SUFFIX]["blocks_done"].shape == (1, 3)
+
+
+def test_collective_fit_allocation_refuses_inode_preserving_mode(
+        tmp_path, mesh_xy):
+    with pytest.raises(ValueError, match="requires mode='w'.*stripe policy"):
+        MS.allocate_fit_store_collective(
+            str(tmp_path / "bad_append.h5"), mesh_xy=mesh_xy,
+            n_q=1, n_mu=3, n_p=2,
+            diagnostic_keys=("condition", "backward_error"), mode="a")
+
+
 # ---------------------------------------------------------------------------
 # Geometry, the planted field, and the W(omega) file
 # ---------------------------------------------------------------------------

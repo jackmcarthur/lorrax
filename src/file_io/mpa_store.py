@@ -1616,11 +1616,15 @@ def read_w_columns_collective(
 def _initialise_fit_metadata(
     grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
     centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
+    preserve_payload=False,
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
-    for key in ["Omega_p", "B_p", MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX] + [
-            k for k in grp if str(k).startswith("fit_")]:
+    reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX]
+    if not preserve_payload:
+        reset = ["Omega_p", "B_p"] + [
+            k for k in grp if str(k).startswith("fit_")] + reset
+    for key in reset:
         if key in grp:
             del grp[key]
     led = grp.create_group(MPA_FIT_SUFFIX)
@@ -1732,9 +1736,12 @@ def allocate_fit_store_collective(
 ):
     """Allocate a fit store without any rank owning a pole tensor.
 
-    Rank zero replaces and stamps only the small ledger/tables.  After a
-    barrier every rank collectively creates the pole and diagnostic datasets
-    through SlabIO, followed by a second barrier before any block is written.
+    SlabIO first replaces the inode and collectively creates the pole and
+    diagnostic datasets.  This ordering is required on Lustre: the stripe
+    layout is fixed when the inode is created, so a preliminary serial-h5py
+    metadata file would pin the multi-gigabyte fit store to one OST.  After
+    SlabIO closes, rank zero stamps only the small ledger/tables and a barrier
+    makes the complete store visible before any block is written.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -1746,6 +1753,11 @@ def allocate_fit_store_collective(
         raise ValueError(
             f"allocate_fit_store_collective: unsupported energy unit "
             f"{energy_unit!r}")
+    if mode != "w":
+        raise ValueError(
+            "allocate_fit_store_collective requires mode='w': allocation "
+            "must replace the inode so SlabIO can apply its rank-aware "
+            "Lustre stripe policy")
     keys = tuple(sorted(str(k) for k in diagnostic_keys))
     required = {"condition", "backward_error"}
     if not required.issubset(keys):
@@ -1753,16 +1765,7 @@ def allocate_fit_store_collective(
             "allocate_fit_store_collective requires condition and "
             "backward_error diagnostics")
     dtype = np.complex128 if dtype is None else dtype
-    if process_rank() == 0:
-        with _qs().QirrDest(dest, mode) as grp:
-            _initialise_fit_metadata(
-                grp, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                energy_unit=energy_unit, grid_hash=grid_hash,
-                table_hash=table_hash, centroid_hash=centroid_hash,
-                unfold_tables=unfold_tables, provenance=provenance,
-                diagnostic_keys=keys)
-    barrier("mpa_fit_metadata_allocated")
-    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+    with SlabIO(dest, mode="w", mesh=mesh_xy) as io:
         io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                           dtype=dtype)
         io.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
@@ -1770,6 +1773,15 @@ def allocate_fit_store_collective(
             io.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                               dtype=np.float64)
     barrier("mpa_fit_payload_allocated")
+    if process_rank() == 0:
+        with _qs().QirrDest(dest, "a") as grp:
+            _initialise_fit_metadata(
+                grp, n_q=n_q, n_mu=n_mu, n_p=n_p,
+                energy_unit=energy_unit, grid_hash=grid_hash,
+                table_hash=table_hash, centroid_hash=centroid_hash,
+                unfold_tables=unfold_tables, provenance=provenance,
+                diagnostic_keys=keys, preserve_payload=True)
+    barrier("mpa_fit_metadata_allocated")
     return fit_completion_ledger(dest)
 
 
