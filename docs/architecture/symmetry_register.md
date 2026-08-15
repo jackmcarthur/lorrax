@@ -376,9 +376,33 @@ did not help, and it implies a **real tension**: low count buys symmetry and
 loses accuracy, high count does the reverse. The count sweep that would test it
 is an open owner question, not authorised.
 
-## `qp_wfn_rotations.h5` → wedge: three preconditions, all measured, all negative
+## GENERAL PROPERTY: a wedge-stored array indexed by a full-BZ index
 
-Investigated 2026-08-15, **not implemented**. Recorded because each answer
+**It is silently wrong wherever the index is below `nk_red`, and only raises
+above it.** Measured with h5py against an 8-row dataset on the real Si map
+`kirr_to_kfull = [0, 1, 2, 5, 6, 7, 10, 27]`: indices 10 and 27 raise
+`IndexError`; **0, 1, 2, 5, 6, 7 — six of eight — return the wrong row with no
+error**. On the full BZ, every index `< nk_red` (8 of 64 on Si) is silently
+wrong.
+
+This governs the DESIGN of every wedge move, not just one file:
+
+- "A stale consumer will `IndexError`" is **false** for the majority of
+  lookups. Do not rely on it.
+- A `k_storage` stamp protects in-tree readers and does nothing for
+  out-of-tree ones, which by definition do not read it.
+- The only mitigation loud in *all* cases is **renaming the datasets** when the
+  storage basis changes: a stale reader then gets `KeyError` immediately.
+
+The text writers moved earlier in this branch are not exposed to this, because
+they are parsed by block rather than indexed by k — the hazard is specific to
+array-indexed formats.
+
+## `qp_wfn_rotations.h5` → wedge: DROPPED
+
+Investigated 2026-08-15, **not implemented, and not to be re-opened off the
+survey's ranking**.  Lossy, silently corrupting for six of eight in-range
+indices, and worth ~3 MB. Recorded because each answer
 contradicts what the I/O survey asserted, and because the same three questions
 apply to every remaining wedge candidate.
 
@@ -410,14 +434,51 @@ file 3,757,812 bytes. The wedge form is `{8, 60, 60}` = 0.44 MB, whole file
 ≈ 0.47 MB — a **7.6× reduction saving ~3.1 MB**. The survey's "184 MB → 24 MB"
 is ~50× larger than anything measurable here and was not reproduced.
 
+### `restart_q_storage`: VERIFIED, unlike the two above
+
+Checked 2026-08-15 because the survey had by then been wrong twice on one
+entry. **This claim holds.**
+
+The c2406 anchor run (`lorrax_mos2_12x12/run_A_c2406_b400_AF`) no longer exists
+on disk, so this is DERIVED rather than disk-measured — but the derivation rests
+on a convention verified empirically on a real file, and on the service's own
+symmetry algebra:
+
+- **Convention, measured**: `V_qmunu {64, 960, 960}` and `W0_qmunu {64, 960,
+  960}`, complex128, shape `(nq, μ, μ)`, on the Si production fixture. Predicted
+  file size from those shapes reproduces the measured 2,013,798,432 bytes to
+  99.6% (the residual is HDF5 metadata and the smaller datasets).
+- **Anchor size, arithmetic**: at `nq = 144`, `μ = 2406`, complex128 —
+  `V_qmunu` = 13,337,478,144 B = **13.34 GB**, and `V + W0` =
+  **26.67 GB**. The survey's "26.7 GB" is exact, not rounded up.
+- **Reduction, computed by the service**: `find_irreducible_bz_points` on a
+  12×12×1 mesh under a closed 6mm point group (order 12, closure verified)
+  gives **19 irreducible q of 144 — 7.6×**, with and without TRS. So the
+  wedge form is **3.51 GB**, matching the claimed "~3.5 GB".
+
+**The 13 GB transient** behind "V's unfold after the Dyson solve" is the same
+arithmetic: one full-BZ `V_qmunu` at this anchor is 13.34 GB.
+
+So the I/O section's headline number is sound and the `_MunuSlabPlan` blocker
+is worth measuring. Note what was NOT established: that the on-disk file at
+that anchor actually was 26.7 GB (the run is gone), and that a production deck
+still uses μ = 2406.
+
 ### Calibration on the ranked I/O list
 
 The survey was wrong about `E_qp_nk_hartree` having "no reader at all" — it has
 a **gated** one (`sigma_omega_layout_ab.py:154`, consumed at `:461` with
 `required=sc`; `U_mnk` is the report-only one). It was wrong about the file
-size by ~50×. Treat its other unverified assertions — the 26.7 GB restart
-figure, the 13 GB transient, any "no reader" claim — as **leads to check, not
-facts to act on**.
+size by ~50× **on the fixture available** — though `U_mnk` scales as `nb²`, so
+184 MB is not impossible on a production deck with far more bands; record it as
+unreproducible here rather than as simply false.
+
+The 26.7 GB restart figure and the 13 GB transient have since been CHECKED and
+hold (above). So the survey's record is: two claims wrong on the
+`qp_wfn_rotations` entry, two claims right on the `restart_q_storage` entry.
+Treat every remaining unverified assertion — any "no reader" claim especially —
+as a **lead to check, not a fact to act on**, and check it on the deck the
+claim names rather than a convenient small one.
 
 ## The question to ask before any further wedge move
 
