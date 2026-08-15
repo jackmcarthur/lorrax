@@ -138,7 +138,7 @@ def test_selecting_it_refuses_and_names_the_mode_and_the_next_step():
     msg = str(exc.value)
     assert "mpa" in msg
     assert "the LORRAX GW driver" in msg
-    assert "real-material chi/W/fixed-head/Sigma/QSGW" in msg
+    assert "real-material chi/W/dynamic-head/Sigma/QSGW" in msg
     assert "end to end" in msg
     assert "THEORY_mpa_implementation.md" in msg
 

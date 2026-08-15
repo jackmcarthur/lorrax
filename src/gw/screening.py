@@ -159,6 +159,7 @@ def compute_static_w(
     section: str = "chi0_W",
     fused_probe_chi=None,
     chi0_override: jax.Array | None = None,
+    gamma_chi_override: jax.Array | None = None,
     head_channel=None,
 ):
     """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
@@ -351,6 +352,18 @@ def compute_static_w(
                     chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
                                           energy_reference=e_ref)
                     chi0_q.block_until_ready()
+            if gamma_chi_override is not None:
+                gamma = jnp.asarray(gamma_chi_override)
+                expected = (1, int(meta.n_rmu), int(meta.n_rmu))
+                if tuple(gamma.shape) != expected:
+                    raise ValueError(
+                        "Gamma chi override must have shape "
+                        f"{expected}, got {gamma.shape}")
+                with timing.section(
+                        "chi.gamma_static", announce=True,
+                        label=f"{_w} exact static fractional Gamma body"):
+                    chi0_q = chi0_q.at[0].set(gamma[0])
+                    chi0_q.block_until_ready()
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
             if use_ibz_w:
@@ -490,6 +503,7 @@ def compute_screening(
     mesh_xy,
     print_fn: Callable = print,
     head_channel=None,
+    iteration_head_response=None,
 ) -> dict[str, jax.Array]:
     """Evaluate W at each requested frequency.
 
@@ -590,13 +604,19 @@ def compute_screening(
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
                     role=req.role, fused_probe_chi=fused_plan,
-                    head_channel=head_channel)
+                    head_channel=head_channel,
+                    gamma_chi_override=(
+                        iteration_head_response.static_chi_body_gamma
+                        if iteration_head_response is not None else None))
             else:
                 W_static = compute_static_w(
                     wfns, V_q, quad, e_ref=e_ref,
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
-                    role=req.role, head_channel=head_channel)
+                    role=req.role, head_channel=head_channel,
+                    gamma_chi_override=(
+                        iteration_head_response.static_chi_body_gamma
+                        if iteration_head_response is not None else None))
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
@@ -682,8 +702,11 @@ def compute_screening_model(
     mesh_xy,
     run_dir,
     label,
+    wfn=None,
     head_resolver=None,
     head_channel=None,
+    mpa_plan=None,
+    iteration_head_response=None,
     static_only=False,
     print_fn=print,
 ):
@@ -699,14 +722,19 @@ def compute_screening_model(
         if static_only:
             return {}
         if head_resolver is None:
-            raise ValueError("MPA screening requires a fixed head resolver")
+            raise ValueError("MPA screening requires a head resolver")
         from .mpa.model import build_mpa_fit
-        fit_path = build_mpa_fit(
-            run_dir, label, wfns=wfns, V_q=V_q, quad=quad, sym=sym,
+        fit_path, iteration_head = build_mpa_fit(
+            run_dir, label, wfns=wfns, wfn=wfn, V_q=V_q, quad=quad, sym=sym,
             centroid_indices=centroid_indices, head_resolver=head_resolver,
             config=config, meta=meta, mesh_xy=mesh_xy,
-            energy_reference=e_ref, print_fn=print_fn)
-        return {"mpa_fit": fit_path}
+            energy_reference=e_ref, plan=mpa_plan,
+            iteration_head_response=iteration_head_response,
+            print_fn=print_fn)
+        result = {"mpa_fit": fit_path}
+        if iteration_head is not None:
+            result["iteration_head"] = iteration_head
+        return result
 
     requests = screening_requests_for(mode, config)
     if static_only:
@@ -715,7 +743,8 @@ def compute_screening_model(
     return compute_screening(
         wfns, V_q, requests, quad=quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
-        mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel)
+        mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel,
+        iteration_head_response=iteration_head_response)
 
 
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,

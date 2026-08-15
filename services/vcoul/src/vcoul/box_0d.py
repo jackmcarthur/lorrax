@@ -80,6 +80,7 @@ class Box0D:
         self, geometry: CoulombGeometry, kgrid=None, *,
         S_cart=None,        # ignored (box truncation: head is finite already)
         epshead=None,       # ignored (no screening correction at the head)
+        static_kappa2=None, # ignored (no metallic long-wave limit in 0D)
         nsamples=None,
         method=None,
         qmc_reps=None,
@@ -94,7 +95,7 @@ class Box0D:
         ``kgrid`` is accepted and ignored so the three kernels share one
         call shape; a box has one k-point by construction.
         """
-        del S_cart, epshead, nsamples, method, qmc_reps, kgrid
+        del S_cart, epshead, static_kappa2, nsamples, method, qmc_reps, kgrid
         if geometry.bdot is None or geometry.fft_grid is None:
             raise ValueError(
                 "Box0D.q0_average needs a CoulombGeometry carrying bdot and "

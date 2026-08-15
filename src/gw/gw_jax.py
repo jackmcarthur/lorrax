@@ -161,6 +161,8 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 	"""
 	head = head_resolver.at(0.0 + 0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
+	# TODO(metal-sigma): this one-shot static Sigma head still uses the
+	# ifmax band boundary.  Port it with the rest of metallic Sigma.
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
 		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=meta.nk_tot)
@@ -409,7 +411,7 @@ def main(argv=None):
 		W_by_role = compute_screening_model(
 			mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
 			centroid_indices=centroid_indices, config=config, meta=meta,
-			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"),
+			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
 			label="oneshot", head_resolver=head_resolver,
 			head_channel=getattr(isdf, 'head_channel', None),
 			static_only=qp_solver is QPSolver.SELF_CONSISTENT,

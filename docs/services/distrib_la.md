@@ -62,9 +62,14 @@ hangs at a 3×3 mesh for every n ≥ 3072"). The run artifacts are under
 
 ## Purpose
 
-One door for `eigh`, `cholesky` and `solve_lu` on an `('x','y')` device
-mesh, so a driver says *what* to compute and *where*, never *which
-library*. Before this service the same three ops were dispatched from ten
+The same top-level door also owns the square-matrix polar/SVD operation used
+for parallel-transport links.  It composes the planned distributed Hermitian
+eigensolver rather than introducing a fifth vendor dependency or allowing a
+caller-side dense SVD.
+
+One door for `polar_factor`, `eigh`, `cholesky` and `solve_lu` on an
+`('x','y')` device mesh, so a driver says *what* to compute and *where*,
+never *which library*. Before this service the three primitive ops were dispatched from ten
 `src/` modules through four packages (`ffi.linalg`, `ffi.slate`,
 `ffi.scalapack`, `common.cholesky_2d`), with per-call-site guard ladders
 that disagreed; the worst measured consequence of that drift was a silent
@@ -77,6 +82,63 @@ The service is the door. `import distrib_la` and use top-level names;
 failure that `tests/test_layering.py` fails on (with a red twin).
 
 ## API
+
+The polar additions are:
+
+| name | what it is |
+|---|---|
+| polar_factor(A, mesh, backend='distributed', rcond=None) -> (L, s) | Cached one-shot square polar factor. A and L are P('x','y'); descending s is replicated. |
+| plan_polar_factor(mesh, n=..., backend='distributed', rcond=None) -> PolarPlan | Eagerly resolve once for a streamed k-point loop. The returned operation is trace-safe. |
+| PolarPlan(A) | One physical square matrix only. No batch axis: the preprocessing design streams one neighbour at a time. |
+
+### Polar factor / SVD contract
+
+The operation diagonalizes the Hermitian dilation
+
+    H = [[0, A], [A.H, 0]]
+
+with one planned eigh call and forms L = U V.H from its positive-eigenvalue
+subspace.  It never diagonalizes A.H A: that Gram construction squares the
+condition number and loses precisely the small overlap singular values needed
+as the manifold-quality diagnostic.  Singular values are non-negative and
+descending, matching NumPy SVD order.
+
+The physical input is exactly one rank-2 square float64 or complex128 array at
+P('x','y') on the supplied mesh.  The service refuses rank, shape, dtype,
+mesh-axis, divisibility, and concrete-layout mismatches before numerical work.
+There is no implicit device_put or full-matrix reshard.  L has the same shape,
+dtype and sharding.  Only s, a length-n real vector, is replicated.
+
+rcond is relative to max(s).  None means n times machine epsilon for the real
+component dtype.  Directions at or below the cutoff do not contribute to L.
+Consequently a rank-deficient matrix returns the unique polar partial
+isometry.  The service does not invent a backend-dependent unitary pairing of
+independent left and right null spaces.  Full-rank overlap matrices return the
+usual unitary polar factor.
+
+P('x','y') requires the physical extent to divide both mesh axes.  For a
+non-divisible logical band count, zero-pad rows and columns to the next common
+multiple, factor that physical matrix, and slice the leading logical block of
+L and leading logical singular values.  The zero pad is safe because its null
+directions are thresholded out.  plan_polar_factor refuses a non-divisible
+physical extent and reports the minimum pad extent rather than rounding
+silently.
+
+Planning and execution remain separate.  Hoist plan_polar_factor out of the
+IBZ loop; it resolves and probes the backend once.  PolarPlan is trace-safe and
+the dilation, planned eigh, masking, and final sharded GEMM are cached as one
+fused operation per mesh/shape/backend/dtype/cutoff signature.  The convenient
+polar_factor call caches that plan for eager streamed calls, but deliberately
+refuses entry from an outer trace and points to the planned form.
+
+Expected array scaling over the design envelope is O(n^2/P) per process for
+every matrix-shaped value.  The dilation and its eigenvectors each have 4n^2
+global elements; A and L each have n^2; no n^2 object is replicated.  The only
+replicated result is n real singular values.  Runtime is the cost of one 2n
+Hermitian eigensolve plus one n-cubic distributed GEMM.  The 3x3 large-eigh
+hang documented at the top applies to the dilation extent 2n as well.
+
+### Planned factorization API
 
 | name | what it is |
 |---|---|
@@ -100,6 +162,13 @@ resolve time — operand dtype, rank and extent are trace-time facts — so a
 single-phase API would have to lie about when it checked.
 
 ## Contract
+
+* Polar/SVD is a composite, not a resolver operation: its backend argument is
+  passed once to plan('eigh', ..., n=2*n), so there is no second backend
+  vocabulary or demotion ladder to drift.
+* Rank-deficient polar output is value-level comparable through the partial
+  isometry and singular spectrum.  Individual dilation eigenvectors remain
+  gauge-dependent and must never be compared across meshes.
 
 * **Promise semantics.** A returned backend name means every guard passed:
   platform, **known-broken combinations**, compiled handler,
@@ -195,6 +264,13 @@ including the declared-untested tier.
   (`_open_cuda_before_host`). See Antipatterns.
 
 ## Tests
+
+test_distrib_la_polar.py is the synthetic complex/real polar tier.  It covers
+NumPy-SVD parity, unitary and repeated-singular-value degeneracies,
+ill-conditioning below the Gram-eigh resolution floor, numerical rank
+deficiency, an all-zero matrix, non-divisible logical padding, output
+shardings, planned tracing, and refusal/red-control cases.  It runs on the
+four-device emulated CPU mesh and does not require a vendor library.
 
 Four tiers, markers `services` + `distrib_la`, applied by a collection hook
 (a `pytestmark` in a conftest is silent — `tests/test_service_selection.py`
@@ -514,6 +590,13 @@ evidence — the SLATE trsm back-solve had never run before step 2:
 | batched-vs-serial eigh | **bit-identical** (0.0 in W and Z) | — |
 
 ## Antipatterns
+
+* Calling jnp.linalg.svd at a consumer, or using eigh(A.H @ A), bypasses the
+  service and is numerically weaker.  Use polar_factor, or hoist one
+  plan_polar_factor for a streamed loop.
+* Passing a replicated/host overlap matrix and relying on an implicit reshard
+  is refused.  Build the overlap directly at P('x','y'); pad before placement
+  when the logical band count does not tile the mesh.
 
 * **Editing `src/ffi/<name>/`.** `src/ffi/linalg/`, `src/ffi/slate/`,
   `src/ffi/scalapack/` and `src/common/cholesky_2d.py` are **deleted**

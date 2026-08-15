@@ -14,7 +14,8 @@ found.
 import numpy as np
 import pytest
 
-from gw.efermi import (fermi_level_step, occupied_band_count,
+from gw.efermi import (fermi_level_step, mp1_occupations,
+                       occupied_band_count, solve_mp1_occupations,
                        step_occupations)
 
 
@@ -124,3 +125,59 @@ def test_occupations_are_float64_for_the_fractional_successor():
     occ_dev = step_occupations(jnp.asarray(E), 1.5)
     assert occ_dev.dtype == np.float64
     assert occ_dev.tolist() == [[1.0, 1.0, 0.0]]
+
+
+def test_mp1_matches_the_berkeleygw_fe_reference_state():
+    """Pin the formula and the factor-of-two width to the BGW 4.0 artifact."""
+    ryd_to_ev = 13.605693122994
+    occ = mp1_occupations(
+        np.array([[18.547842 / ryd_to_ev]]),
+        18.526851685673 / ryd_to_ev,
+        0.27211385 / ryd_to_ev,
+    )
+    # sigma.out prints this occupation to six decimals.
+    assert float(occ[0, 0]) == pytest.approx(0.467387, abs=5.0e-7)
+
+    # Red twin: treating BGW occ_broadening as QE's denominator is a
+    # different convention and must not accidentally reproduce the fixture.
+    wrong = mp1_occupations(
+        np.array([[18.547842 / ryd_to_ev]]),
+        18.526851685673 / ryd_to_ev,
+        0.5 * 0.27211385 / ryd_to_ev,
+    )
+    assert abs(float(wrong[0, 0]) - 0.467387) > 1.0e-2
+
+
+def test_mp1_fixed_electron_spinor_and_nonuniform_ibz_weights():
+    """One electron per spinor state, with the IBZ star weights in the root."""
+    E = np.array([
+        [-1.0, -0.20, 0.45, 1.7],
+        [-0.8,  0.05, 0.60, 1.9],
+        [-0.7,  0.25, 0.85, 2.1],
+    ])
+    w = np.array([0.125, 0.375, 0.500])
+    target = 2.25
+    mu, occ = solve_mp1_occupations(
+        E, w, target, 0.08, state_capacity=1.0)
+    got = float(np.einsum("k,kn->", w, np.asarray(occ)))
+    assert got == pytest.approx(target, abs=2.0e-13)
+    assert np.isfinite(float(mu))
+
+    # A restricted scalar state has twice the capacity.  The same physical
+    # electron target therefore has a lower chemical potential; silently
+    # applying this factor to the spinor arm would be observable here.
+    mu_scalar, occ_scalar = solve_mp1_occupations(
+        E, w, target, 0.08, state_capacity=2.0)
+    got_scalar = 2.0 * float(np.einsum("k,kn->", w, np.asarray(occ_scalar)))
+    assert got_scalar == pytest.approx(target, abs=2.0e-13)
+    assert float(mu_scalar) < float(mu)
+
+
+def test_mp1_solver_refuses_ambiguous_weights_and_width():
+    E = np.zeros((2, 4))
+    with pytest.raises(ValueError, match="sum to 1"):
+        solve_mp1_occupations(
+            E, np.array([0.25, 0.25]), 2.0, 0.1, state_capacity=1.0)
+    with pytest.raises(ValueError, match="broadening_ry"):
+        solve_mp1_occupations(
+            E, np.array([0.5, 0.5]), 2.0, 0.0, state_capacity=1.0)

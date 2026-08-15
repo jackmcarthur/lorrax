@@ -3,7 +3,7 @@
 This page is the authoritative frequency-domain description of the MPA
 pipeline.  It describes the mathematics, ownership, validity domains and I/O
 boundaries in the order they are encountered.  `compute_mode = mpa` remains
-disabled until one real-material chi/W/fixed-head/Sigma/QSGW calculation
+disabled until one real-material chi/W/dynamic-head/Sigma/QSGW calculation
 passes end to end through the disk-bounded driver.  The scalar fit, pole
 store, window planner and shared Sigma kernel are available for internal
 tests without weakening that refusal.
@@ -303,31 +303,41 @@ S_{\mathrm{eff}}(z)=S_0(z)
 $$
 
 `gw.head_correction.fold_cartesian_head_wings_sharded` owns this contraction
-without gathering the body tile.  The production component that rebuilds
-`S_0`, `Y`, and `Z` from the current orbitals is not connected yet.  The
-staged driver therefore labels and reuses the established two-point DFT
-scalar head while rebuilding the MPA body.  This fixed-head approximation
-omits local-field head/wing dynamics; it is not an arbitrary-frequency MPA
-head.  The row-sharded fit and temporal pole consumer have passed their
-four-rank integration gate; public `compute_mode = mpa` remains disabled
-until one real-material run also traverses chi, W, this fixed head, the full
-Sigma contraction, and the common QSGW finalizer.
+without gathering the body tile.  MPA now builds one frequency plan and gives
+the exact same complex `z` array to the body and to the QSGW direct-head
+response.  Each Dyson slab may finalize one head sample while total
+`W_body,Gamma(z)` is resident; only the 3x3 result survives.  The scalar
+`Wc_head(z) = W_head(z) - v_head` is fit with the same Loewner policy, guards,
+and complex sample grid as the body and is published collectively through
+SlabIO beside the body poles.
 
-After that addition, MPA must reuse the existing dynamic-Sigma finalizer:
+The MPA path supplies independent complex left/right centroid wings at every
+sample.  The direct all-band contraction keeps the two stored centroid-
+sharded wavefunction copies, distributes equal band-pair tiles over all
+`Px*Py` ranks, and circulates a tile only around the mesh axis matching its
+output wing.  Frequencies are blocked inside each ring, so the transition
+weight temporary is bounded and no band-pair-by-centroid tensor is stored.
+Each sample is folded through total W while that body slab is resident.
 
-1. add body and q→0 head;
-2. interpolate the matrix-valued cube at the DFT or current QP energies;
-3. write `sigma_mnk.h5` through the existing sharded output path;
-4. construct the static Hermitian QSGW operator;
-5. apply the existing outside-band scissor extension.
+The QSGW order is sequential.  The first half of iteration `i` evaluates the
+direct head on the full MPA grid using the chemical potential and occupations
+carried from iteration `i-1`.  Only after Sigma/H assembly and the current
+orbital rotation does the fixed-electron MP1 solve produce the state consumed
+by iteration `i+1`.  Those occupations are used only by the head correction;
+the finite-q body, Green functions, and general Sigma occupation semantics are
+still the insulating implementations and remain capability-gated.
 
 One-shot and diagonal fixed-point QP solvers can consume a finalized external
-pole store.  Fully self-consistent QSGW rebuilds the body model because each
-iteration changes the orbitals and transition energies.  Its bounded path is
-`chi(z)` q-wedge store -> one-slab Dyson -> `Wc(z)` q-wedge store -> bounded
-column fit -> q-wedge pole store.  Sigma subsequently reads and unfolds four
-pole/residue slabs at a time.  The fixed-head approximation may reuse one
-head fit while the body is rebuilt each iteration.
+pole store.  Fully self-consistent QSGW rebuilds the body and head models
+because each iteration changes the orbitals and transition energies.  The
+bounded path is `chi(z)` q-wedge store -> one-slab Dyson and head finalization
+-> `Wc(z)` q-wedge store -> bounded body-column and scalar-head Loewner fits.
+Sigma subsequently reads and unfolds four body pole/residue slabs at a time
+and reads the small head fit collectively.  Public `compute_mode = mpa`
+remains disabled until one real-material run traverses the complete
+chi/W/head/Sigma/QSGW chain; this section describes landed internal plumbing,
+not a metallic-screening capability claim.
+
 
 ## 8. Current validation and public controls
 
@@ -342,7 +352,8 @@ Common real-frequency controls already live in the Sigma section of
 `docs/input_reference.md`: grid minimum, maximum and step; regularization;
 window-edge factor; omega layout and accumulation.  The staged MPA keys are
 pole count, insulating sample-plan choice, near/far sampling line heights,
-the explicitly fixed-DFT head model, and pole batch size (hard-capped at
+the fixed-DFT fallback head model (replaced per iteration when
+`sc_head_update = parallel_transport`), and pole batch size (hard-capped at
 four).  The mode still refuses at entry while its P=4 gate is incomplete, so
 none of these keys can silently select unverified work.  HGL
 certification constants, panel construction details, provenance hashes and

@@ -178,6 +178,8 @@ def _prepare_sigma_state(
     excludes them here — and in every other Ω/B consumer — with no mask
     argument (ROOT_CAUSE.md 2026-07-08; PADDING_AUDIT item 3).
     """
+    # TODO(metal-greens): the finite-occupation Green's-function/Sigma
+    # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
 
