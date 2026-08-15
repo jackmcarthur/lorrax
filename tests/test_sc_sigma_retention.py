@@ -56,11 +56,11 @@ def _state_attrs(fn, var="state"):
 
 
 # The full carried state of one QSGW step: the QP Hamiltonian, the counter,
-# and the metallic head-occupation trio produced at the END of the previous
-# iteration (head_* feed only the q->0 head; see the SCState docstring).
+# the per-iteration OccupationState, and the derived tetrahedron surface
+# weights produced at the END of the previous iteration.
 _CARRY_KEYS = {
     "iteration", "H_qp_dft",
-    "head_efermi_ry", "head_occ_kn", "head_surface_weight_kn",
+    "occupation_state", "head_surface_weight_kn",
 }
 
 

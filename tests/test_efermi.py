@@ -181,3 +181,116 @@ def test_mp1_solver_refuses_ambiguous_weights_and_width():
     with pytest.raises(ValueError, match="broadening_ry"):
         solve_mp1_occupations(
             E, np.array([0.5, 0.5]), 2.0, 0.0, state_capacity=1.0)
+
+
+# ---------------------------------------------------------------------------
+# OccupationState — the frozen cross-agent contract (metal_mpa_plan W3)
+# ---------------------------------------------------------------------------
+
+from gw.efermi import (OccupationState, assert_fixed_n,
+                       assert_wfn_occupation_consistency)
+
+
+def _metal_grid():
+    """A dense symmetric one-k 'metal': mu lands at 0 by MP1 symmetry."""
+    E = np.linspace(-0.1, 0.1, 201)[None, :]
+    w = np.array([1.0])
+    return E, w
+
+
+def test_occupation_state_mp1_owns_the_fixed_n_invariant():
+    E, w = _metal_grid()
+    target = 100.5
+    st = OccupationState.solve_mp1(E, w, target, 0.02, state_capacity=1.0)
+    assert st.smearing_family == "mp1"
+    assert st.smearing_width_ry == pytest.approx(0.02)
+    assert st.n_electrons == pytest.approx(target)
+    # The invariant the constructor asserted, re-checked here explicitly.
+    realized = assert_fixed_n(st, w, state_capacity=1.0)
+    assert realized == pytest.approx(target, abs=1e-10)
+    # A mismatched target refuses by name (direct construction + assert).
+    bad = OccupationState(
+        f_kn=st.f_kn, mu_ry=st.mu_ry, smearing_family="mp1",
+        smearing_width_ry=0.02, n_electrons=target + 1.0)
+    with pytest.raises(ValueError, match="fixed-N invariant"):
+        assert_fixed_n(bad, w, state_capacity=1.0)
+
+
+def test_occupation_state_keeps_mp1_overshoot_unclipped():
+    """MP1 exceeds 1 just below mu (max ~1.025 at x=-1); it must survive.
+
+    Clipping would silently change every ρ/Σ contraction on a metal; the
+    contract says NEVER clipped, so the overshoot is the discriminating
+    observable.
+    """
+    E, w = _metal_grid()
+    st = OccupationState.solve_mp1(E, w, 100.5, 0.02, state_capacity=1.0)
+    f = np.asarray(st.f_kn)
+    assert float(f.max()) > 1.0
+    assert float(f.min()) < 0.0  # the mirrored negative lobe above mu
+
+
+def test_occupation_state_hash_binds_to_the_table():
+    E, w = _metal_grid()
+    a = OccupationState.solve_mp1(E, w, 100.5, 0.02, state_capacity=1.0)
+    b = OccupationState.solve_mp1(E, w, 100.5, 0.02, state_capacity=1.0)
+    c = OccupationState.solve_mp1(E, w, 101.5, 0.02, state_capacity=1.0)
+    assert a.occ_hash == b.occ_hash
+    assert a.occ_hash != c.occ_hash
+    assert len(a.occ_hash) == 16
+    with pytest.raises(ValueError, match="occ_hash"):
+        OccupationState(
+            f_kn=a.f_kn, mu_ry=a.mu_ry, smearing_family="mp1",
+            smearing_width_ry=0.02, n_electrons=100.5,
+            occ_hash="0" * 16)
+
+
+def test_occupation_state_step_is_insulating_only():
+    # Gapped: works, family "fixed", zero width, capacity-weighted target.
+    E = np.array([[0.0, 1.0, 2.0, 3.0]] * 4)
+    w = np.full(4, 0.25)
+    st = OccupationState.step(E, w, 2.0, state_capacity=2.0)
+    assert st.smearing_family == "fixed"
+    assert st.smearing_width_ry == 0.0
+    assert st.n_electrons == pytest.approx(4.0)
+    assert st.mu_ry == pytest.approx(1.5)
+    # Metallic partial fill: refused by name, pointing at solve_mp1.
+    rng = np.random.default_rng(1)
+    Em = np.sort(rng.standard_normal((10, 60)), axis=1)
+    wm = rng.random(10)
+    wm = wm / wm.sum()
+    with pytest.raises(ValueError, match="solve_mp1"):
+        OccupationState.step(Em, wm, 20.8)
+
+
+def test_occupation_state_family_and_width_are_coupled():
+    E, w = _metal_grid()
+    st = OccupationState.solve_mp1(E, w, 100.5, 0.02, state_capacity=1.0)
+    with pytest.raises(ValueError, match="width"):
+        OccupationState(
+            f_kn=st.f_kn, mu_ry=st.mu_ry, smearing_family="fixed",
+            smearing_width_ry=0.02, n_electrons=100.5)
+    with pytest.raises(ValueError, match="width"):
+        OccupationState(
+            f_kn=st.f_kn, mu_ry=st.mu_ry, smearing_family="mp1",
+            smearing_width_ry=0.0, n_electrons=100.5)
+
+
+def test_wfn_occupation_consistency_discriminates_width():
+    """The degauss-vs-degauss/2 trap must fire, and the matched case pass.
+
+    A WFN whose stored occupations were made at width w agrees with our
+    solve at w to round-off; the same WFN checked at 2w deviates at the
+    Fermi surface by ~1e-1 — far above the 1e-6 gate.
+    """
+    E, w = _metal_grid()
+    width = 0.02
+    st = OccupationState.solve_mp1(E, w, 100.5, width, state_capacity=1.0)
+    stored = np.asarray(mp1_occupations(E, st.mu_ry, width))
+    dev = assert_wfn_occupation_consistency(
+        st, stored, w, state_capacity=1.0, num_electrons=100.5)
+    assert dev <= 1e-12
+    stored_wrong = np.asarray(mp1_occupations(E, st.mu_ry, 2.0 * width))
+    with pytest.raises(ValueError, match="degauss/2"):
+        assert_wfn_occupation_consistency(
+            st, stored_wrong, w, state_capacity=1.0, num_electrons=100.5)

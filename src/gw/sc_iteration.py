@@ -75,6 +75,7 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
+from .efermi import OccupationState
 from .gw_config import ComputeMode
 from .scissor import ScissorFit, apply_conduction_scissor_to_tail, fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
@@ -174,13 +175,15 @@ class SCState:
     LOOP's k-set — the IBZ when a map is given — while ``outputs``
     carries full-BZ objects (see :class:`SCOutputs`).
 
-    The primary iteration carry is ``H_qp_dft``.  When metallic head
-    occupations are enabled, the small ``(nk, nb_head)`` occupation and
-    tetrahedron-surface tables plus their chemical potential are auxiliary
-    carried state: iteration i's first-half head consumes the values produced
-    only at the END of iteration i-1.  They are deliberately not installed in
-    the wavefunction bundle, so Green's functions and finite-q screening keep
-    their historical occupations until their metallic formulations land.
+    The primary iteration carry is ``H_qp_dft``.  When metallic occupations
+    are enabled, ``occupation_state`` is the ONE per-iteration
+    ``gw.efermi.OccupationState`` (padded parallel-transport head window,
+    fixed-N μ, family, width, hash) plus its derived tetrahedron
+    Fermi-surface table: iteration i's first-half consumers read the values
+    produced only at the END of iteration i-1.  They are deliberately not
+    installed in the wavefunction bundle, so Green's functions and finite-q
+    screening keep their historical occupations until their metallic
+    formulations land (WAVE2 wiring points below name the hand-off sites).
 
     ``outputs`` (an ``SCOutputs`` record) is purely for the final output
     writers; it does not feed the next iteration.  Its ``sigma_basis_U``
@@ -194,8 +197,7 @@ class SCState:
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
-    head_efermi_ry: float | None = None
-    head_occ_kn: jax.Array | None = None  # full-BZ, padded PT head manifold
+    occupation_state: OccupationState | None = None  # full-BZ, padded PT head manifold
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
     outputs: SCOutputs | None = None
 
@@ -236,41 +238,74 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     # all-gather, P × nk × nb² × 16 B — scorecard AA.1).  ``H0`` is a
     # pure function of the DFT energies, identical on every rank;
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
-    (head_efermi_ry,
-     head_occ_kn,
-     head_surface_weight_kn) = _solve_head_occupations(
+    occ_state, head_surface_weight_kn = _solve_head_occupations(
         inputs, inputs.wfns_dft.enk)
-    if head_efermi_ry is not None:
+    if occ_state is not None:
         inputs.print_fn(
             "  SC head occupations: initialized BGW-MP1 state at "
-            f"mu={head_efermi_ry * RYD_TO_EV:.8f} eV")
+            f"mu={occ_state.mu_ry * RYD_TO_EV:.8f} eV "
+            f"[occ_hash {occ_state.occ_hash}]")
+        if _material_class(inputs) == "metal":
+            # Metal-run startup gate: re-solving on the WFN's OWN stored
+            # eigenvalue/weight table must reproduce its stored occupations,
+            # or the smearing family/width does not match the deck that made
+            # the WFN (QE 'mp' matches at broadening_ry = degauss/2).
+            from .efermi import (OccupationState as _OS,
+                                 assert_wfn_occupation_consistency)
+            from psp.get_DFT_mtxels import spin_degeneracy_factor
+            w_ibz = np.asarray(inputs.wfn.kweights, dtype=np.float64)
+            w_ibz = w_ibz / w_ibz.sum()
+            capacity = float(spin_degeneracy_factor(inputs.wfn))
+            check_state = _OS.solve_mp1(
+                np.asarray(inputs.wfn.energies[0], dtype=np.float64),
+                w_ibz,
+                float(inputs.wfn.num_electrons),
+                float(inputs.config.screening.occ_broadening_ev) / RYD_TO_EV,
+                state_capacity=capacity)
+            deviation = assert_wfn_occupation_consistency(
+                check_state, np.asarray(inputs.wfn.occs[0]), w_ibz,
+                state_capacity=capacity,
+                num_electrons=float(inputs.wfn.num_electrons))
+            inputs.print_fn(
+                "  SC head occupations: WFN consistency max|Δf| = "
+                f"{deviation:.3e}, mu_check = "
+                f"{check_state.mu_ry * RYD_TO_EV:.8f} eV (wfn.efermi "
+                f"{inputs.wfn.efermi * RYD_TO_EV:.6f} eV is the midgap/VBM "
+                "convention, reported not asserted)")
     return SCState(
         H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
-        head_efermi_ry=head_efermi_ry,
-        head_occ_kn=head_occ_kn,
+        occupation_state=occ_state,
         head_surface_weight_kn=head_surface_weight_kn,
     )
+
+
+def _material_class(inputs) -> str:
+    """The deck's declared MPA material class; 'insulator' when absent."""
+    mpa = getattr(inputs.config, "mpa", None)
+    return str(getattr(mpa, "material_class", "insulator"))
 
 
 def _solve_head_occupations(
     inputs: SCInputs,
     energies_kn_ry,
-) -> tuple[float | None, jax.Array | None, jax.Array | None]:
-    """Solve the fixed-N MP1 state used only by the next QSGW head.
+) -> tuple[OccupationState | None, jax.Array | None]:
+    """Solve the per-iteration fixed-N MP1 occupation state.
 
-    The table is full-BZ because the parallel-transport velocity and head
-    contraction are full-BZ.  Padding is explicit and inert; the solver sees
-    exactly ``nb_logical`` physical bands.  The same end-of-iteration
-    energies and chemical potential also define periodic tetrahedron
-    Fermi-surface weights for the next iteration's Drude head.  A zero width
-    returns three ``None`` values so the historical step-occupation path is
-    bit-for-bit untouched.
+    Returns ``(OccupationState, surface_weight_kn)`` — the one occupation
+    record the head consumes today and chi/Σ consume at Wave-2 wiring, plus
+    its derived tetrahedron Fermi-surface table.  The state's ``f_kn`` is
+    full-BZ because the parallel-transport velocity and head contraction are
+    full-BZ, padded to the PT storage width; padding is explicit and inert
+    (exact zeros move neither the count nor the hash's meaning) and the
+    solver sees exactly ``nb_logical`` physical bands.  A zero width returns
+    ``(None, None)`` so the historical step-occupation path is bit-for-bit
+    untouched.
     """
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
     if width_ev == 0.0 or pt is None:
-        return None, None, None
+        return None, None
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if energies.ndim != 2:
@@ -285,17 +320,18 @@ def _solve_head_occupations(
             f"{energies.shape[1]}.")
 
     from psp.get_DFT_mtxels import spin_degeneracy_factor
-    from .efermi import solve_mp1_occupations
+    from .efermi import assert_fixed_n, solve_mp1_occupations
 
     nk = int(energies.shape[0])
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
     capacity = float(spin_degeneracy_factor(inputs.wfn))
     target_electrons = float(inputs.wfn.num_electrons)
+    width_ry = width_ev / RYD_TO_EV
     mu_ry, occ_logical = solve_mp1_occupations(
         energies[:, :nb_logical],
         kweights,
         target_electrons,
-        width_ev / RYD_TO_EV,
+        width_ry,
         state_capacity=capacity,
     )
     occ_kn = jnp.pad(
@@ -304,6 +340,16 @@ def _solve_head_occupations(
         mode="constant",
         constant_values=0.0,
     )
+    occ_state = OccupationState(
+        f_kn=occ_kn,
+        mu_ry=float(mu_ry),
+        smearing_family="mp1",
+        smearing_width_ry=float(width_ry),
+        n_electrons=target_electrons,
+    )
+    # The pad bands are exact zeros, so the padded table satisfies the same
+    # fixed-N invariant the logical solve does.
+    assert_fixed_n(occ_state, kweights, state_capacity=capacity)
     # The Drude weight is a Fermi-surface integral, not a coarse-grid
     # sampling of the MP1 derivative.  On sodium 8^3 the latter moves the
     # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
@@ -325,7 +371,7 @@ def _solve_head_occupations(
         mode="constant",
         constant_values=0.0,
     )
-    return float(mu_ry), occ_kn, surface_kn
+    return occ_state, surface_kn
 
 
 # ---------------------------------------------------------------------------
@@ -802,8 +848,29 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
 
     # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
     # header) and only E_F and the degeneracy flag cross.
-    e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
-    occ = step_occupations(E_qp_ry, e_f)
+    if _material_class(inputs) == "metal":
+        # Metal ρ: fixed-N MP1 occupations solved on THIS iteration's QP
+        # spectrum (W3 update point).  The step path below cannot represent
+        # a metal (partial fill / degenerate-manifold refusal), and the
+        # constructor owns the fixed-N invariant.
+        width_ev = float(inputs.config.screening.occ_broadening_ev)
+        if width_ev <= 0.0:
+            raise ValueError(
+                "mpa_material_class = metal requires screening occ_broadening "
+                "> 0 to solve fixed-N MP1 occupations for the density; got "
+                f"{width_ev!r} eV.")
+        occ_state = OccupationState.solve_mp1(
+            E_qp_ry, kweights, float(inputs.wfn.num_electrons),
+            width_ev / RYD_TO_EV,
+            state_capacity=float(spin_degeneracy_factor(inputs.wfn)))
+        e_f = occ_state.mu_ry
+        occ = occ_state.f_kn
+        inputs.print_fn(
+            "    V_H rebuild: metal MP1 occupations, "
+            f"mu={e_f * RYD_TO_EV:.8f} eV [occ_hash {occ_state.occ_hash}]")
+    else:
+        e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
+        occ = step_occupations(E_qp_ry, e_f)
 
     # Rotated orbitals: needed for rho, NOT for the contraction below.
     psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
@@ -1279,22 +1346,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
         head_surface_weight_kn = None
-        if state.head_occ_kn is not None:
-            if state.head_efermi_ry is None:
-                raise ValueError(
-                    "QSGW head occupations were carried without their "
-                    "chemical potential.")
-            if tuple(state.head_occ_kn.shape) != (
+        if state.occupation_state is not None:
+            carried = state.occupation_state
+            if tuple(np.shape(carried.f_kn)) != (
                     int(wfns_qp.enk.shape[0]), nb_storage):
                 raise ValueError(
-                    "carried QSGW head occupations have shape "
-                    f"{state.head_occ_kn.shape}, expected "
+                    "carried QSGW occupation state has shape "
+                    f"{np.shape(carried.f_kn)}, expected "
                     f"({wfns_qp.enk.shape[0]}, {nb_storage}).")
-            head_occ_kn = state.head_occ_kn
-            head_efermi_ry = float(state.head_efermi_ry)
+            head_occ_kn = carried.f_kn
+            head_efermi_ry = float(carried.mu_ry)
             if state.head_surface_weight_kn is None:
                 raise ValueError(
-                    "QSGW head occupations were carried without their "
+                    "QSGW occupation state was carried without its "
                     "tetrahedron Fermi-surface weights.")
             if tuple(state.head_surface_weight_kn.shape) != (
                     int(wfns_qp.enk.shape[0]), nb_storage):
@@ -1343,6 +1407,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
+    # WAVE2: pass occupation_state here (state.occupation_state → chi body
+    # via compute_screening_model → build_mpa_fit; signature lands with I1).
     W_by_role = compute_screening_model(
         inputs.config.compute_mode, wfns_qp, inputs.V_q,
         quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
@@ -1403,6 +1469,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # so intermediate SC iterations don't thrash sigma_mnk.h5; the
     # converged tensor is written once after run_self_consistency
     # returns (see ``dump_sigma_omega_h5_final``).
+    # WAVE2: pass occupation_state here (state.occupation_state → Σ_x/SX
+    # diag(f), Σ_c branch weights, and the metal E_F reference; signatures
+    # land with I3/I4).
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
@@ -1509,14 +1578,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # rotated above.  The head in THIS call used state.head_occ_kn; this solve
     # produces the table consumed by the NEXT call.  Nothing installs it in
     # wfns_qp, so finite-q screening and Green's functions are unchanged.
-    (next_head_efermi_ry,
-     next_head_occ_kn,
-     next_head_surface_weight_kn) = _solve_head_occupations(inputs, wfns_qp.enk)
-    if next_head_efermi_ry is not None:
+    next_occ_state, next_head_surface_weight_kn = _solve_head_occupations(
+        inputs, wfns_qp.enk)
+    if next_occ_state is not None:
+        # μ drift against the carried previous-iteration state is the R6
+        # convergence invariant; log it every iteration.
+        drift = (abs(next_occ_state.mu_ry - state.occupation_state.mu_ry)
+                 if state.occupation_state is not None else float("nan"))
         inputs.print_fn(
-            "    SC head occupations: end-of-iteration BGW-MP1 update, "
-            f"mu={next_head_efermi_ry * RYD_TO_EV:.8f} eV, "
-            f"width={inputs.config.screening.occ_broadening_ev:.8f} eV")
+            "    SC occupations: end-of-iteration BGW-MP1 update, "
+            f"mu={next_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
+            f"|dmu|={drift * RYD_TO_EV:.3e} eV, "
+            f"width={inputs.config.screening.occ_broadening_ev:.8f} eV, "
+            f"occ_hash {next_occ_state.occ_hash}")
 
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
@@ -1534,8 +1608,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
-        head_efermi_ry=next_head_efermi_ry,
-        head_occ_kn=next_head_occ_kn,
+        occupation_state=next_occ_state,
         head_surface_weight_kn=next_head_surface_weight_kn,
         outputs=SCOutputs(
             sigma_result=sigma_result,
@@ -1820,8 +1893,7 @@ def _run_linear_mixing(
         state = SCState(
             H_qp_dft=state.H_qp_dft,
             iteration=state.iteration,
-            head_efermi_ry=state.head_efermi_ry,
-            head_occ_kn=state.head_occ_kn,
+            occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
         )
         state_new = gw_iteration_map(state, inputs)
@@ -1835,8 +1907,7 @@ def _run_linear_mixing(
             state_new = SCState(
                 H_qp_dft=H_mixed,
                 iteration=state_new.iteration,
-                head_efermi_ry=state_new.head_efermi_ry,
-                head_occ_kn=state_new.head_occ_kn,
+                occupation_state=state_new.occupation_state,
                 head_surface_weight_kn=state_new.head_surface_weight_kn,
                 outputs=state_new.outputs,
             )
@@ -2022,8 +2093,7 @@ def _run_rcrop(
     _e_history: list[np.ndarray] = [
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
     _last_outputs: list = [None]
-    _head_efermi: list = [state_init.head_efermi_ry]
-    _head_occ: list = [state_init.head_occ_kn]
+    _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
@@ -2053,14 +2123,12 @@ def _run_rcrop(
         state_in = SCState(
             H_qp_dft=H,
             iteration=_iter_idx[0],
-            head_efermi_ry=_head_efermi[0],
-            head_occ_kn=_head_occ[0],
+            occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
-        _head_efermi[0] = state_out.head_efermi_ry
-        _head_occ[0] = state_out.head_occ_kn
+        _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
@@ -2137,8 +2205,7 @@ def _run_rcrop(
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
-        head_efermi_ry=_head_efermi[0],
-        head_occ_kn=_head_occ[0],
+        occupation_state=_occ_state[0],
         head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],
     )
