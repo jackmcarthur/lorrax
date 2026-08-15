@@ -45,10 +45,14 @@ def _project_tau_onto_omega_np(
     """Apply the ω-kernel exp(i·ω_sign·ω·t) and project onto σ channels (host).
 
     This is the **single** ω-projector in LORRAX (both sinks call it — there is
-    no jax mirror to keep in sync).  Returns the single-τ contribution at every
-    ω in ``omega_vec``:
+    no jax mirror to keep in sync).  σ^τ arrives as ``(n_brk, nk, i, j)`` — the
+    band-bracket axis LEADS (``gw.band_extrapolation``; length 1 in the
+    ordinary case) — and the ω axis is inserted BEHIND it, so the result is
+    ``(n_brk, n_ω, nk, i, j)``.  The ω kernel is elementwise in every other
+    index, so a bracket is carried through untouched; that is exactly why the
+    axis can lead here without the projector knowing what a bracket is:
 
-        contrib[ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)
+        contrib[b, ω, k, i, j] = pref · α_eff · exp(i·sign·ω·t) · P(σ_re, σ_im)[b]
 
     The window's ``project_code`` names the consumer:
 
@@ -115,7 +119,7 @@ def _project_tau_onto_omega_np(
                 "consumer (project_code=1) — the crossing window needs the "
                 "(S_R, S_I) pair and must dispatch the two-channel kernel "
                 "(ppm_sigma window dispatch bug).")
-        contrib = coeff.reshape(-1, 1, 1, 1) * sigma_re[None, ...]
+        contrib = coeff.reshape(1, -1, 1, 1, 1) * sigma_re[:, None, ...]
         return np.asarray(contrib, dtype=np.complex128)
     # Two-channel (S_R, S_I) pair: crossing windows only.  The Laplace
     # recombine branch (pair at code=0) died when the merge became the
@@ -140,7 +144,7 @@ def _project_tau_onto_omega_np(
     # operator: it couples element (i, j) to element (j, i), which the
     # (m_X, n_Y)-sharded per-shard tiles here cannot see.
     X = sigma_re + 1j * sigma_im
-    contrib = coeff.reshape(-1, 1, 1, 1) * X[None, ...]
+    contrib = coeff.reshape(1, -1, 1, 1, 1) * X[:, None, ...]
     return np.asarray(contrib, dtype=np.complex128)
 
 
@@ -151,11 +155,15 @@ def _project_tau_onto_omega_np(
 def _band_axis_partition_counts(sigma_sharding) -> tuple[int, int]:
     """How many mesh slices σ^τ's two band axes ``(m, n)`` are cut into.
 
-    ``sigma_sharding`` is whatever sharding the (nk, m_X, n_Y) σ^τ tiles
-    arrived with — ``P(None, 'x', 'y')`` on the production mesh.  A sharding
-    we cannot read (``None``, or anything that is not a ``NamedSharding``)
-    is reported as UNSPLIT, which is correct for the single-device and
-    plain-numpy callers and is why the caller must never manufacture one.
+    ``sigma_sharding`` is whatever sharding the ``(..., m_X, n_Y)`` σ^τ tiles
+    arrived with — ``P(None, None, 'x', 'y')`` on the production mesh, whose
+    leading axes are the band bracket and k.  The two band axes are read as
+    the LAST two entries of the spec rather than by absolute position, so a
+    leading axis added in front of k cannot silently shift which axis is
+    tested for splitting.  A sharding we cannot read (``None``, or anything
+    that is not a ``NamedSharding``) is reported as UNSPLIT, which is correct
+    for the single-device and plain-numpy callers and is why the caller must
+    never manufacture one.
     """
     mesh = getattr(sigma_sharding, 'mesh', None)
     spec = getattr(sigma_sharding, 'spec', None)
@@ -171,7 +179,7 @@ def _band_axis_partition_counts(sigma_sharding) -> tuple[int, int]:
             n *= int(mesh.shape[a])
         return n
 
-    return _count(spec[1]), _count(spec[2])
+    return _count(spec[-2]), _count(spec[-1])
 
 
 @lru_cache(maxsize=8)
@@ -254,14 +262,15 @@ def _complete_one_sided_tau(win_shards, shard_devices, sigma_sharding):
         return [(t - np.conj(np.swapaxes(t, -1, -2))) / 2j for t in win_shards]
     mesh = sigma_sharding.mesh
     spec = tuple(sigma_sharding.spec)
-    # σ^τ is (nk, m, n); the window tiles carry the leading ω axis.
-    sharding4 = NamedSharding(mesh, P(None, *spec))
+    # σ^τ is (n_brk, nk, m, n); the window tiles carry the ω axis INSERTED
+    # behind the leading bracket axis, i.e. (n_brk, n_ω, nk, m, n).
+    sharding_w = NamedSharding(mesh, P(spec[0], None, *spec[1:]))
     t0 = win_shards[0]
-    gshape = (int(t0.shape[0]), int(t0.shape[1]),
-              int(t0.shape[2]) * p_m, int(t0.shape[3]) * p_n)
+    gshape = tuple(int(v) for v in t0.shape[:-2]) + (
+        int(t0.shape[-2]) * p_m, int(t0.shape[-1]) * p_n)
     arrays = [jax.device_put(t, d) for t, d in zip(win_shards, shard_devices)]
-    completed = _antiherm_band_fn(sharding4)(
-        jax.make_array_from_single_device_arrays(gshape, sharding4, arrays))
+    completed = _antiherm_band_fn(sharding_w)(
+        jax.make_array_from_single_device_arrays(gshape, sharding_w, arrays))
     by_device = {s.device: np.asarray(s.data)
                  for s in completed.addressable_shards}
     return [by_device[d] for d in shard_devices]
@@ -648,13 +657,14 @@ class _MemoryTileSink(_WindowSink):
     (``sigma_kij_host`` add, ``_to_host_np``) sees the same (m_X, n_Y) sharding.
     """
 
-    def __init__(self, shape: tuple[int, int, int, int], sharding: NamedSharding):
+    def __init__(self, shape: tuple[int, ...], sharding: NamedSharding):
         self._shape = shape
         self._sharding = sharding
         self._total_shards: list[np.ndarray] | None = None
         self._devices: list | None = None
-        # 3-D σ^τ shard indices (nk, m, n) captured with the first window —
-        # needed by host_tiles() to place each tile in the 4-D global Σ.
+        # 4-D σ^τ shard indices (n_brk, nk, m, n) captured with the first
+        # window — needed by host_tiles() to place each tile in the 5-D
+        # global Σ.
         self._index: list[tuple] | None = None
 
     def consume_window(self, win_shards, shard_index, shard_devices) -> None:
@@ -712,10 +722,11 @@ class _MemoryTileSink(_WindowSink):
                      for _ in devices]
             index4 = [tuple(dmap[d]) for d in devices]
             return tiles, index4, devices
-        # _index holds the 3-D σ^τ indices (nk, m, n); the sink's global
-        # shape carries the leading ω axis → prepend the full slice.
-        index4 = [(slice(None),) + tuple(ix) for ix in self._index]
-        return self._total_shards, index4, self._devices
+        # _index holds the 4-D σ^τ indices (n_brk, nk, m, n); the sink's
+        # global shape inserts the ω axis BEHIND the leading bracket axis →
+        # splice a full slice in at position 1.
+        index5 = [(ix[0], slice(None)) + tuple(ix[1:]) for ix in self._index]
+        return self._total_shards, index5, self._devices
 
     def result(self) -> jax.Array:
         if self._total_shards is None:
