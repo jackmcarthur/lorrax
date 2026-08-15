@@ -1080,59 +1080,127 @@ the non-SC branch (`gw_jax.py:543`), where the whole object is DFT basis.
 a new Σ channel cannot join the wrong group silently.  It does not and
 cannot catch this: the mixing is in the consumer, not the declaration.
 
-## The BSE Q-path takes its QP energies through an E_DFT heuristic justified by a false premise
+## Bespoke IBZ→full-BZ unfolding outside the symmetry service — census
 
-OPEN, UNMEASURED, 2026-08-15.  Found while making the energy files
-self-describing (`refactor/eqp-ibz-2026-08-15`); registered rather than
-fixed, because fixing it means changing what the Q-path is handed, not
-what the writers emit.
+REGISTER, 2026-08-15, `refactor/eqp-ibz-2026-08-15`.  The rule being
+enforced: `services/symmetry_maps` owns symmetry unfolding, and a driver
+that needs a full-BZ quantity from a wedge one calls it rather than
+open-coding a star expansion, an index map or a k-matching loop.  A
+by-shape sweep of `src/`, `tools/`, `scripts/` and the non-symmetry
+services found eleven sites.  **Two were in scope and are FIXED on that
+branch; the other nine are recorded here and NOT touched.**
 
-`src/bse/exciton_bands.py:1469-1472` says, as the stated reason for
-passing `input_file=None`:
+Ordered by "could silently produce a wrong pairing".
 
-> LORRAX's own GW writes eqp1.dat on the FULL BZ (one block per k of the
-> WFN, same order), so the energy-matching branch is the correct one and
-> it maps 1:1 here.
+### FIXED on this branch
 
-**That is false.**  `gw_output.py:1113` subsets every eqp array through
-`kirr_to_kfull`, and `gw_jax.py:779` passes `kpoints_irr_frac=wfn.kpoints`
-— `eqp{0,1}.dat` are on the IBZ wedge, and the map is 8→64 on Si 4x4x4,
-not 1:1.  It is the same false belief that produced the 291 meV and
-600 meV phantom disagreements downstream, here load-bearing in a comment.
+1. `src/bse/bse_window.py` `apply_eqp_corrections` — matched each full-BZ
+   k to a wedge block of `eqp1.dat` by comparing MEAN-FIELD ENERGIES with
+   `tol_ev = 0.01`, reachable through `input_file=None`, live in
+   `src/bse/exciton_bands.py`'s `--eqp` path.  Right by accident (E_DFT is
+   constant over a star) and silently wrong once two stars agree to 10 meV
+   across the compared window — `best_ibz` then takes the QP shift from
+   the wrong star, and the `matched.all()` gate catches only NO match,
+   never a WRONG one.  Now one path, unfolding through the service
+   adapter; `input_file` is required.
+2. `src/bandstructure/htransform.py` `read_eqp_energies` — required a
+   PRE-UNFOLDED full-BZ text file (`nk == sym.nk_tot`) and paired its
+   `k-point N:` blocks to full-BZ k BY POSITION, checking only the count,
+   never a coordinate.  The unfold itself happened one hop upstream in an
+   out-of-tree `make_eqp_htformat.py`.  Now reads the wedge `eqp1.dat`
+   directly, verifies the block coordinates against the deck's own wedge,
+   and unfolds through the service.
 
-The NUMBERS are currently right, which is why this is a register entry and
-not a bug fix: `input_file=None` routes to the E_DFT fingerprint branch
-(`bse_window.py:585-616`), and because E_DFT is constant over a symmetry
-star, matching each full-BZ k to the wedge block reproducing its
-mean-field energies performs the IBZ→full unfold correctly.  The exposure
-is that the branch which would CHECK the basis
-(`bse_window.py:578`, `assert nk_ibz == sym.nk_red`) is deliberately
-disabled on this path, and the heuristic aliases whenever two distinct
-stars agree to within `tol_ev = 0.01` across the whole compared window —
-`best_ibz` then silently takes the QP shift from the wrong star.
+### REGISTERED, not fixed
 
-To fix: `read_bgw_eqp` already parses and returns the crystal coordinates
-(`bse_window.py:445-447, 467`) and `apply_eqp_corrections` discards them on
-its first line (`bse_window.py:563`).  Give the Q-path a full-BZ k list and
-join on those coordinates instead of on energies; the file has carried them
-all along.
+3. `services/vcoul/src/vcoul/bgw_parity.py:44-92` `find_q_index` —
+   reconstructs the star `q = S_k·q̄ + G` in a double Python loop with
+   `tol = 1e-4` on fractional coordinates, FIRST MATCH WINS.  Two hazards:
+   the tolerance is loose enough to alias on a fine grid, and when the
+   little group is non-trivial the arbitrary `S_k` chosen is then used at
+   `bgw_parity.py:180` to rotate the whole G-list, so an equally-valid
+   different `S_k` gives a different G permutation.  Consumer:
+   `src/gw/compute_vcoul.py:245-261`, which can additionally source
+   `sym_mats_k` from a *different* WFN.  The module already carries this
+   as "a registered owner question (repair-or-delete on the whole
+   `use_bgw_vcoul` surface)".
+4. `src/postprocess/rotate_wfn_to_qp.py:24-72` `find_kpoint_mapping` —
+   coordinate `argmin` with `tol=1e-6` and no uniqueness/permutation
+   check, rebuilding the table `sym.kirr_fullids` already is (and that
+   `src/gw/gw_jax.py` passes for the very same dataset).  **Its output is
+   written into `qp_wfn_rotations.h5` and trusted downstream by
+   `src/gw/eqp_bgw.py:787`**, so a wrong pairing here reaches
+   `eqp{0,1}.dat`.  Dead scaffolding at `:42-47` (`full_kpoints_gen`
+   generated, never used).
+5. `src/file_io/qe_save_reader.py:340-410` `_reduce_mp_to_ibz` — a
+   complete hand-rolled orbit reconstruction (apply every symmetry to
+   every k, dedupe at `_EPS = 1e-5`, build an `equiv` parent map),
+   duplicating `symmetry_maps.find_irreducible_bz_points`, which does the
+   same job in INTEGER kgrid coordinates with no tolerance.  The `equiv`
+   map is discarded — only `kpoints, weights` escape — so nothing
+   downstream can check the mapping.  Reached from `src/psp/run_nscf.py`
+   and `src/psp/kpm_dos.py`.
+6. `src/gw/downfold_run.py:1445-1490` — integer-keyed dict map, well
+   guarded (membership refusal at `:1474`, bijectivity at `:1483`), EXCEPT
+   the `np.arange` identity fallback at `:1470`, which the code's own
+   comment says would "attach grid point i's transfer to wedge slot i and
+   write a ζ of plausible, wrong numbers".
+7. `src/bse/vq_interp.py:565-605` — rebuilds the full-BZ q list from a
+   `meshgrid` when `rk` is short, re-deriving the service's own wrap/C-order
+   convention.  Numerically gated and it refuses a genuine IBZ ζ, so the
+   risk is ORDERING drift if the writer's convention ever changes.
+8. `src/file_io/sigma_output.py:498-527` `compact_star_tables` — a Python
+   re-implementation of `star_select`'s first-occurrence row order, whose
+   own docstring says it must match that convention; it then feeds
+   `symmetry_maps.star_broadcast` at `:637-640`, so a drift produces a
+   silently wrong star assignment.
+9. `tools/sigma_star_spread_decompose.py:245-260` (and `:417`) — a THIRD
+   answer to the same compaction, using SORTED labels where the other two
+   use first occurrence.  Diagnostic tool.
+10. `tools/bgw_sigma_hp_to_fixture.py:265-272` and `:367-372` — maps BGW
+    IBZ k onto LORRAX k by comparing `Eo`/`E_dft` vectors at `2e-3`.
+    Self-referential: the fabricated star then feeds the `star_spread`
+    statistic at `:288`, i.e. the metric meant to DETECT a broken unfold is
+    computed over a star the tolerance invented.  Offline tool.
+11. `src/psp/orbital_magnetization.py:384-401` — a hand-built
+    "which k is this" dict for finite-difference neighbours.  Full-BZ →
+    full-BZ, exact integer keys, so no aliasing; listed only because it
+    duplicates the grid lookup the service owns.  Diagnostic path.
 
-Sibling stale claims found in the same sweep, both corrected on that
-branch (no behaviour change): `docs/drivers.md:276` called `--eqp FILE` a
-"full-BZ `eqp1.dat`", contradicting `docs/drivers.md:226`; and
-`exciton_bands.py:1533` said htransform "swallows the parse failure with a
-log line", where `htransform.py:1313-1320` raises `SystemExit`.
+Test-side hand-rolls, lower priority and noted for completeness:
+`tests/test_scissor_weights.py:169-175, 296-302, 333-338` (a `_FakeKStar`
+oracle that re-implements the thing under test),
+`tests/test_restart_qirr_consumers.py:78-83`, and
+`tests/harness.py:803-830` `compare_to_bgw`, which assigns each LORRAX k
+to a BGW IBZ k "on the whole `Eo` vector, not on k coordinates, because
+the two codes do not order k the same way" — the same fingerprint class as
+(10), and with the same self-reference, since the star it builds is what
+`_star_spread` is then computed over.  The stated reason no longer holds:
+`sigma_diag.dat` now carries `# kcrys` on every block and BerkeleyGW's own
+`eqp.dat` carries coordinates in its headers, so a coordinate join is
+available on both sides.
 
-**Constraint discovered, do not "clean this up" later:** `sigma_diag.dat`
-and `eqp_g0w0.dat` must stay on the FULL BZ.
-`bandstructure.htransform.read_eqp_energies` takes the `sigX=` column of
-`sigma_diag.dat` as its `--eqp-file`, indexes blocks positionally as
-full-BZ k (`htransform.py:1170-1173`) and refuses any count other than
-`sym.nk_tot` (`htransform.py:1200-1206`); `eqp_g0w0.dat` is joined against
-the IBZ `eqp1.dat` by the out-of-tree `make_eqp_htformat.py` to build that
-input (`docs/drivers.md:226`).  The tree therefore holds both bases on
-purpose; what stops them being confused is the per-block coordinate, not a
-common row count.
+### Aside: `_assert_matches_reference`'s "BYTE-IDENTICAL" branch is unreachable
+
+Noticed while re-freezing.  `tests/test_gw_jax_regression.py:140` reports
+`BYTE-IDENTICAL to the reference (atol not exercised)` when
+`output_file.read_text() == reference_file.read_text()`.  That comparison
+can never be true: `common.provenance.provenance_header` (`provenance.py:27`)
+stamps `datetime.now(UTC)` into the first line of every `.dat` LORRAX
+writes, so the output and any committed reference differ in byte 30 of
+line 1 no matter what the physics did.  Every frozen-gate pass has
+therefore gone through the tolerance path, and the headroom warning is the
+only report anyone has ever seen.  Harmless — the atol path IS the gate,
+and it prints the margin — but the branch is dead and its message implies
+a stronger check than exists.  The fix is one line (compare through
+`harness.normalize_dat`, which already strips exactly that line); not taken
+here because it changes what a green gate prints on every deck.
+
+The gate for the two fixed sites is
+`tests/test_unfold_through_the_service.py`: an AST layer that fails if
+either function stops calling the adapter or grows a nested k-loop back,
+plus a behavioural layer that fails if an unfold drops, duplicates or
+mis-parents a k.  Verified red against the pre-change source of both.
 
 ## `KStarMap.spread_rel` loses NaN on an emulated partitioned reduction
 
