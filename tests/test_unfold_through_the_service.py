@@ -711,3 +711,47 @@ def test_at_least_one_fixture_has_the_two_wedges_coinciding_and_one_not():
     diverge = [d for d, _, a, b in _DECK_WEDGES if a != b]
     assert coincide and diverge, (
         f"fixtures cover only one case: coincide={coincide} diverge={diverge}")
+
+
+def test_the_reduce_and_the_file_wedge_unfold_are_not_inverses():
+    """They are not, and the asymmetry is real rather than an oversight.
+
+    ``reduce_full_bz_to_file_wedge`` keeps one row per STORED k.
+    ``unfold_file_wedge_to_full_bz`` rebuilds every full-BZ k from its
+    ORBIT PARENT.  Where the WFN carries two k in the same orbit — which
+    it does on ``cohsex_debug``, where file wedge row 1 is the
+    time-reverse of row 2 — the round trip replaces row 1's own stored
+    values with ``conj`` of row 2's.
+
+    Pinned so nobody writes ``unfold(reduce(x)) == x`` into a gate and is
+    surprised on the two decks where it is false.  On ``si_cohsex_debug``
+    it happens to hold, which is exactly why it needs pinning.
+    """
+    _sm = _symmetry_maps()
+    reg = _SRC.parent / "tests" / "regression" / "cohsex_debug" / "WFNsmall.h5"
+    if not reg.exists():
+        pytest.skip("cohsex_debug not in this tree")
+    try:
+        from wfn_loader import WfnLoader
+    except Exception as exc:                                    # noqa: BLE001
+        pytest.skip(f"loader unavailable ({type(exc).__name__})")
+
+    sym = _sm.SymMaps(WfnLoader(str(reg)))
+    rng = np.random.default_rng(7)
+    nk_full = int(sym.nk_tot)
+    full = (rng.standard_normal((nk_full, 2, 2))
+            + 1j * rng.standard_normal((nk_full, 2, 2)))
+
+    wedge = np.asarray(_sm.reduce_full_bz_to_file_wedge(sym, full))
+    assert wedge.shape[0] == int(sym.nk_red)
+    back = np.asarray(_sm.unfold_file_wedge_to_full_bz(sym, wedge))
+    assert back.shape[0] == nk_full
+
+    # On THIS deck the round trip is not the identity, because one stored
+    # k is the time-reverse of another and the unfold rebuilds it from the
+    # orbit parent rather than from its own row.
+    assert not np.allclose(back, full), (
+        "reduce->unfold round-tripped exactly on cohsex_debug — if that is "
+        "now true, the orbit structure of this fixture changed and the "
+        "asymmetry documented on reduce_full_bz_to_file_wedge needs "
+        "re-measuring")

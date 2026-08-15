@@ -27,6 +27,7 @@ import re
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from file_io.sigma_output import write_eqp_g0w0, write_sigma_to_file
 from gw.eqp_bgw import write_bgw_eqp
@@ -309,11 +310,13 @@ def test_write_results_puts_every_text_file_on_the_wedge(tmp_path):
         eqp0_file=str(tmp_path / "eqp0.dat"),
         eqp1_file=str(tmp_path / "eqp1.dat"),
         input_dir=str(tmp_path),
-        kpoints_crys=full,
         kgrid=(4, 4, 4),
-        kpoints_irr_frac=wedge,
-        kirr_to_kfull=SI444_IRR_TO_FULL,
-        k_star_labels=star_labels,
+        # THE symmetry object.  write_results reduces through the service
+        # itself; the wedge coordinates are the full-BZ list put through
+        # the SAME reduction, so they cannot disagree about which k.
+        sym=SimpleNamespace(unfolded_kpts=full,
+                            kirr_fullids=SI444_IRR_TO_FULL,
+                            irr_idx_k=star_labels),
         write_qp_rotations=False,
         print_fn=lambda *a, **k: None,
     )
