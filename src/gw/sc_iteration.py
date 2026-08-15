@@ -2646,7 +2646,23 @@ def run_sc_driver(
     # at *every* k.  Bands outside the ω-grid get the per-iteration
     # scissor (otherwise their Σ_c is clamped at the grid edge → the
     # QSGW H-build feeds garbage diagonals that explode the iteration).
-    efermi_ev = float(wfn.efermi) * RYD_TO_EV
+    # ONE ω reference: the window must be anchored where the Σ grid is.
+    # Metallic decks build the grid against the fixed-N μ; judging the
+    # window against wfn.efermi (midgap, +2.79 eV on sodium) emptied the
+    # partition — 0/48 in range — so every band was scissored by a fit
+    # with zero samples and H_qp came back all-zero.
+    if getattr(config, "occ_smearing_family", None):
+        from psp.get_DFT_mtxels import spin_degeneracy_factor
+        from .efermi import solve_mp1_occupations
+        _mu_ry, _ = solve_mp1_occupations(
+            np.asarray(enk_dft, dtype=np.float64),
+            np.asarray(wfn.kweights, dtype=np.float64),
+            float(wfn.num_electrons),
+            float(config.occ_broadening_ry),
+            state_capacity=float(spin_degeneracy_factor(wfn)))
+        efermi_ev = float(_mu_ry) * RYD_TO_EV
+    else:
+        efermi_ev = float(wfn.efermi) * RYD_TO_EV
     omega_min_ev = float(config.sigma.omega_min_ev) + efermi_ev
     omega_max_ev = float(config.sigma.omega_max_ev) + efermi_ev
     e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
