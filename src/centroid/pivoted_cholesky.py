@@ -518,6 +518,162 @@ def refuse_unless_select_certified(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Orbit-BLOCK select — the repair for the stale-residual defect
+# ═══════════════════════════════════════════════════════════════════════
+#
+# THE DEFECT THIS REPLACES.  ``pivoted_cholesky_select`` in orbit mode does
+# ONE rank-1 Schur update per admitted orbit and then marks every member of
+# that orbit inactive (``kill_mask = (orbit_id == orbit_id[p])``, :352).  So
+# admitting a 48-point orbit deflates the residual by ONE direction while
+# spending 48 points.  Its own docstring justifies this with
+#
+#     "all orbit members of the picked pivot have the same residual diagonal
+#      and the column update on any one of them is, by symmetry, the optimal
+#      full-orbit removal"
+#
+# and the first clause is true (the diagonal of a sym-invariant Gram is a
+# class function) while the second does not follow: equal DIAGONALS do not
+# make the members linearly DEPENDENT.  An orbit spans up to ``n_sym``
+# directions; a rank-1 update removes one.  MEASURED contradiction on the Si
+# 4x4x4 anchor: an orbit-mode 768-point set is reported by the select as 18
+# certified directions, and the zeta back-solve on that very set keeps
+# 768/768 modes per q.  If the docstring's claim held, zeta would keep 18.
+#
+# CONSEQUENCE.  After the first admitted orbit the residual ``d`` that ranks
+# every later orbit is stale by (orbit_size - 1) directions, and it goes on
+# being stale, so the greedy ranks candidates on a residual that still counts
+# directions already paid for.  The delivered set is full rank but spans the
+# WRONG directions -- which is exactly the failure shape the rank gate cannot
+# see, because in orbit mode it is stated on the orbit count.
+#
+# THE REPAIR.  Block-pivoted Cholesky with the orbits as blocks:
+#   * score each ACTIVE orbit by its residual TRACE (= sum of member
+#     diagonals).  For a sym-invariant Gram that is orbit_size x d_rep, so
+#     multiplicity weighting is automatic -- an orbit that costs 48 points is
+#     ranked on the 48 points' worth of trace it removes, not on one point's.
+#   * admit the argmax orbit and deflate by EVERY member of it, one rank-1
+#     update each, largest residual first.
+# The number of rank-1 deflations then EQUALS the number of points delivered,
+# which is the property the orbit path violated.
+#
+# COST.  One rank-1 update per delivered point -- identical to point mode,
+# and independent of the FFT grid size.  The k-means candidate pool is
+# untouched: this changes only which pool members are kept.
+
+#: Guard for the host-side implementation below.  The dense host path holds
+#: one (M, M) complex128 Gram; at the Si/MoS2-fixture scale (M ~ 1e3) that is
+#: tens of MB.  Above this the sharded-kernel port is required -- the host
+#: path REFUSES rather than silently gathering a multi-GB Gram to one rank.
+ORBIT_BLOCK_HOST_MAX_M_DEFAULT = 4096
+
+
+def orbit_block_select_host(G, orbit_id, *, n_orbit_keep, n_point_budget=None,
+                            tol_rel=None, score="trace"):
+    """Block-pivoted Cholesky with orbits as blocks.  Host/numpy.
+
+    Parameters
+    ----------
+    G : (M, M) complex/real ndarray -- the candidate Gram (logical part only,
+        no zero pad).
+    orbit_id : (M,) int ndarray.
+    n_orbit_keep : int -- maximum number of orbits to admit.
+    n_point_budget : int or None -- stop before the delivered point count
+        would exceed this.  Whole orbits only; never a partial orbit.
+    tol_rel : float or None -- stopping tolerance relative to max initial
+        diagonal.  ``None`` -> sqrt(eps), matching the jitted kernel.
+    score : {"trace", "maxdiag"} -- how an orbit is ranked.  ``"trace"`` is
+        the block generalisation and carries the multiplicity weighting;
+        ``"maxdiag"`` reproduces the OLD ranking rule while keeping the NEW
+        (correct) deflation, so the two effects can be attributed separately.
+
+    Returns
+    -------
+    order : (n_orbits_taken,) int ndarray -- admitted orbit LABELS, in the
+        order they were admitted.
+    piv_points : (n_points_taken,) int ndarray -- every pivoted point index,
+        in pivot order.  ``len(piv_points)`` IS the point-granularity rank:
+        one certified direction per delivered point.
+    trR_over_trG : float -- residual trace fraction after the last block.
+    """
+    G = np.asarray(G)
+    M = G.shape[0]
+    oid = np.asarray(orbit_id, dtype=np.int64)
+    if oid.shape[0] != M:
+        raise ValueError(f"orbit_id has {oid.shape[0]} entries for M={M}")
+    real_dtype = np.real(G).dtype
+    eps = np.finfo(real_dtype).eps
+    tol = np.sqrt(eps) if tol_rel is None else float(tol_rel)
+
+    d = np.real(np.diag(G)).astype(np.float64).copy()
+    trG = float(np.maximum(d, 0.0).sum())
+    floor = tol * float(d.max())
+    d = np.maximum(d, 0.0)
+
+    labels, inv = np.unique(oid, return_inverse=True)
+    n_orb = labels.shape[0]
+    members = [np.where(inv == a)[0] for a in range(n_orb)]
+    orb_alive = np.ones(n_orb, dtype=bool)
+
+    L = np.zeros((M, M), dtype=G.dtype)     # columns filled as we pivot
+    piv_points: list[int] = []
+    order: list[int] = []
+    n_pts = 0
+    j = 0
+
+    for _ in range(int(n_orbit_keep)):
+        if not orb_alive.any():
+            break
+        if score == "trace":
+            sc = np.array([d[members[a]].sum() if orb_alive[a] else -np.inf
+                           for a in range(n_orb)])
+        elif score == "maxdiag":
+            sc = np.array([d[members[a]].max() if orb_alive[a] else -np.inf
+                           for a in range(n_orb)])
+        else:
+            raise ValueError(f"score must be 'trace' or 'maxdiag'; got {score!r}")
+        a = int(np.argmax(sc))
+        if not np.isfinite(sc[a]):
+            break
+        mem = members[a]
+        # Stop BEFORE overrunning the budget; whole orbits only.
+        if n_point_budget is not None and n_pts + mem.shape[0] > int(n_point_budget):
+            orb_alive[a] = False
+            continue
+        if float(d[mem].max()) <= floor:
+            break
+
+        # --- deflate by the WHOLE orbit: one rank-1 update per member ------
+        remaining = list(mem)
+        while remaining:
+            loc = int(np.argmax(d[remaining]))
+            p = int(remaining.pop(loc))
+            dp = float(d[p])
+            if dp <= floor:
+                # This member adds no certified direction.  Keep it in the
+                # delivered set (the orbit is admitted whole) but do not
+                # count it as a certified direction.
+                continue
+            corr = L[:, :j] @ np.conj(L[p, :j])
+            newcol = (G[:, p] - corr) / np.sqrt(dp)
+            newcol[p] = np.sqrt(dp)
+            L[:, j] = newcol
+            d = np.maximum(d - np.abs(newcol) ** 2, 0.0)
+            d[p] = 0.0
+            piv_points.append(p)
+            j += 1
+        orb_alive[a] = False
+        d[mem] = 0.0                       # admitted; never re-rank them
+        order.append(int(labels[a]))
+        n_pts += mem.shape[0]
+        if n_point_budget is not None and n_pts >= int(n_point_budget):
+            break
+
+    trR = float(d.sum()) / trG if trG > 0 else 0.0
+    return (np.asarray(order, dtype=np.int64),
+            np.asarray(piv_points, dtype=np.int64), trR)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # R2 — rank at POINT granularity
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -808,6 +964,59 @@ def prune_candidates_by_pivoted_cholesky(
             print(f"[pivoted_cholesky] zero-pad for the sharded select: "
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
                   f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
+
+    # ── ORBIT-BLOCK SELECT (the repair; see orbit_block_select_host) ────────
+    # Opt-in while it is host-only.  Default OFF, so every existing caller
+    # takes the byte-identical old path.
+    _ob = os.environ.get("LORRAX_ORBIT_BLOCK_SELECT", "").strip().lower()
+    if orbit_id is not None and _ob in ("1", "trace", "maxdiag"):
+        _score = "trace" if _ob in ("1", "trace") else "maxdiag"
+        _cap = int(os.environ.get("LORRAX_ORBIT_BLOCK_HOST_MAX_M",
+                                  ORBIT_BLOCK_HOST_MAX_M_DEFAULT))
+        if M > _cap:
+            raise NotImplementedError(
+                f"LORRAX_ORBIT_BLOCK_SELECT is host-only for now and M={M} "
+                f"exceeds LORRAX_ORBIT_BLOCK_HOST_MAX_M={_cap}.  The dense "
+                f"host path would gather an ({M},{M}) Gram onto one rank.  "
+                f"Port the block loop into the sharded kernel before using "
+                f"it at this size; do NOT raise the cap to get past this.")
+        with timing.section("prune.select"):
+            _Gh = np.asarray(_mh.process_allgather(
+                G, tiled=True))[:M, :M]
+            _order, _piv_pts, _trR = orbit_block_select_host(
+                _Gh, np.asarray(orbit_id), n_orbit_keep=n_keep,
+                n_point_budget=n_point_budget, tol_rel=tol_rel, score=_score)
+        _oid_np = np.asarray(orbit_id)
+        _sel = np.isin(_oid_np, _order)
+        keep_idx = np.asarray(cand_idx)[_sel]
+        _rank = int(_piv_pts.shape[0])
+        if verbose:
+            print(f"[pivoted_cholesky] ORBIT-BLOCK select (score={_score}): "
+                  f"{_order.shape[0]} orbits -> {int(_sel.sum())} points, "
+                  f"{_rank} rank-1 deflations "
+                  f"({_rank}/{int(_sel.sum())} = "
+                  f"{_rank / max(int(_sel.sum()), 1):.4f} certified "
+                  f"directions per delivered point), tr(R)/tr(G)={_trR:.3e}")
+            print(f"[pivoted_cholesky] orbit-aware: {_order.shape[0]} orbits "
+                  f"→ {int(_sel.sum())} unfolded centroids (orbit-closed)")
+        # THE GATE THIS PATH CAN ACTUALLY STATE.  The old orbit gate compared
+        # a rank counted in ORBITS against an orbit target, which is why it
+        # printed "18/18 certified -- PASS" over a set that spanned the wrong
+        # directions.  Here the deflation count IS at point granularity, so
+        # the property "the delivered set spans as many independent
+        # directions as it claims points" is checkable, and is checked.
+        _n_del = int(_sel.sum())
+        _tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
+        if _rank < int(np.ceil((1.0 - _tol) * _n_del)):
+            raise RuntimeError(
+                f"pivoted-Cholesky REFUSES (orbit-block): delivered "
+                f"{_n_del} points but only {_rank} of them added an "
+                f"independent direction at tol*max(diag G).  The admitted "
+                f"orbits are numerically rank-deficient as POINT sets; the "
+                f"file would claim {_n_del} centroids and span {_rank}.  "
+                f"Lower N, or widen the prune window so the Gram sees the "
+                f"pair densities the orbits actually carry.")
+        return keep_idx, _rank, _n_del, None, None
 
     # Run select on the row-sharded Gram. Orbit-aware mode passes orbit_id
     # row-sharded the same way as G; the body marks the whole orbit
