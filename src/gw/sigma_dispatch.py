@@ -573,6 +573,23 @@ def compute_sigma_xc(
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
+    # ── A DECK KEY THAT NO KERNEL READS IS REFUSED, NOT IGNORED ─────────
+    # ``sigma_band_extrapolation`` is wired into the GN/HL two-point PPM Σ
+    # kernel and nothing else (owner scope).  Reaching MPA / COHSEX /
+    # X_ONLY with it set would produce a perfectly ordinary run whose log
+    # simply lacks the extrapolation block — the exact failure mode
+    # measurement-discipline rule 1 names, where a green A/B measured
+    # nothing because one arm silently dropped the knob.
+    if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
+        raise NotImplementedError(
+            f"sigma_band_extrapolation = true with compute_mode = "
+            f"{getattr(mode, 'value', mode)}.  The band-convergence "
+            f"extrapolation is wired into the two-point plasmon-pole Σ_c "
+            f"kernel only (gn_ppm / hl_ppm); this mode's Σ kernel does not "
+            f"build band-bracket Green's functions, so the key would steer "
+            f"nothing.  Use compute_mode = gn_ppm, or unset "
+            f"sigma_band_extrapolation.")
+
     # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
     # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
     # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
