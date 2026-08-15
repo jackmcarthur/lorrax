@@ -116,7 +116,8 @@ def _fit_fixed_head(fit_path, head_resolver, probe_omega):
         fit_max_abs_residual=residual, model="fixed_dft_gn")
 
 
-def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
+def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None,
+              distrib_la_batched_route: str = "auto"):
     from gw.w_isdf import solve_w
 
     shape = (n_z, q_idx.size, meta.n_rmu, meta.n_rmu)
@@ -124,7 +125,8 @@ def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
         Wc = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver) - V
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route) - V
         Wc.block_until_ready()
         mpa_store.write_w_slab_collective(
             sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
@@ -222,7 +224,8 @@ def build_mpa_fit(
     V = _to_wedge(V_q, q_idx, mesh_xy)
     _solve_wc(
         sample_path, V, z_all.size, q_idx, meta, mesh_xy,
-        config.backend.w_dyson_solver)
+        config.backend.w_dyson_solver,
+        getattr(config.backend, "distrib_la_batched_route", "auto"))
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
     # ``write_head_fit`` is an intentionally small serial-h5py metadata

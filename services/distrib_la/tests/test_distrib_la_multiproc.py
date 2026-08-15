@@ -524,6 +524,68 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
     return out
 
 
+def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
+                                  nrhs=32):
+    """Route (c), all array-returning ops, including a ragged batch.
+
+    This body is shared by pytest's 1x1 smoke and the real P=4 CLI matrix.
+    On the latter ``nq=5`` is deliberately not divisible by four, so the
+    op-safe pad/drop path is load-bearing.  Every result is checked at the
+    ordinary Plan.batched output layout before the test-only host readback.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    ndev = int(mesh.devices.size)
+    if ndev > 1:
+        assert nq % ndev != 0, (
+            f"route-c gate batch nq={nq} divides P={ndev}; the ragged "
+            f"padding this gate claims to cover is vacuous")
+    rng = np.random.default_rng(20260815)
+    out = {}
+
+    A_eigh = _herm(rng, nq, n, dtype)
+    W, Z = D.plan(
+        "eigh", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_eigh, mesh, (None, "x", "y")))
+    assert W.sharding.is_fully_replicated
+    assert Z.sharding.spec == P(None, "x", "y")
+    W_np, Z_np = _gather(W), _gather(Z)
+    out["eigh_values"] = _rel(W_np, np.linalg.eigvalsh(A_eigh))
+    out["eigh_residual"] = _rel(
+        A_eigh @ Z_np, Z_np * W_np[:, None, :])
+    assert out["eigh_values"] < 1e-10
+    assert out["eigh_residual"] < RTOL
+
+    A_chol = _hpd(rng, nq, n, dtype)
+    L = D.plan(
+        "cholesky", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_chol, mesh, (None, "x", "y")), block_size=17)
+    assert L.sharding.spec == P(None, "x", "y")
+    L_np = _gather(L)
+    out["cholesky"] = _rel(L_np, np.linalg.cholesky(A_chol))
+    out["cholesky_residual"] = _rel(
+        L_np @ np.conj(np.swapaxes(L_np, -1, -2)), A_chol)
+    assert out["cholesky"] < RTOL
+    assert out["cholesky_residual"] < RTOL
+
+    A_lu = _hpd(rng, nq, n, dtype)
+    B_lu = _rng_mat(rng, (nq, n, nrhs), dtype)
+    X = D.plan(
+        "solve_lu", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_lu, mesh, (None, "x", "y")),
+              _put(B_lu, mesh, (None, "x", "y")))
+    assert X.sharding.spec == P(None, "x", "y")
+    X_np = _gather(X)
+    out["solve"] = _rel(X_np, np.linalg.solve(A_lu, B_lu))
+    out["solve_residual"] = _resid(A_lu, X_np, B_lu)
+    assert out["solve"] < RTOL
+    assert out["solve_residual"] < 1e-10
+    return out
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -615,6 +677,11 @@ def test_batched_eigh_dispatch_gate_native_arm():
     assert float(jnp.max(jnp.abs(Z_off - Z_nat))) == 0.0
 
 
+def test_batch_reshard_local_ops_smoke():
+    """The real staged movement is the P=4 CLI cell of the same body."""
+    check_batch_reshard_local_ops(_mesh_1x1("cpu"), nq=5, n=16, nrhs=8)
+
+
 def test_the_cli_cells_are_all_reachable():
     """Every ``_CLI_CELLS`` row names a function that exists and every
     check body is in the table.
@@ -666,6 +733,8 @@ _CLI_CELLS = [
          mesh, dt, backend="cusolvermp", op="solve_lu")),
     ("batched_eigh_dispatch", "cpu",
      lambda mesh, dt: check_batched_eigh_dispatch(mesh, dt)),
+    ("batch_reshard_local_ops", "",
+     lambda mesh, dt: check_batch_reshard_local_ops(mesh, dt)),
 ]
 
 

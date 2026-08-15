@@ -1069,7 +1069,10 @@ def build_parser():
     # and ``scalapack``, so the CPU distributed eigh was unreachable from
     # here).  Function-local because gw_config parses decks and this
     # module is imported by things that do not.
-    from gw.gw_config import eigh_backend_choices
+    from gw.gw_config import (
+        distrib_la_batched_route_choices,
+        eigh_backend_choices,
+    )
 
     ap = argparse.ArgumentParser(allow_abbrev=False,
         description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
@@ -1231,6 +1234,13 @@ def build_parser():
                          "(a WIDE fH band window), at the cost of nq "
                          "sequential solves.  Needs a square mesh and one JAX "
                          "process per device.")
+    ap.add_argument(
+        "--distrib-la-batched-route", default=None,
+        choices=distrib_la_batched_route_choices(),
+        help="OVERRIDES the input-file distrib_la_batched_route key for "
+             "both htransform and coarse-V batched linalg. auto preserves "
+             "the backend's distributed route; batch_reshard moves q onto "
+             "the mesh and runs local whole-matrix JAX linalg.")
     ap.add_argument("--px", type=int, default=1)
     ap.add_argument("--py", type=int, default=1)
     ap.add_argument("--rerun-check", action="store_true",
@@ -1341,7 +1351,10 @@ def main(argv=None):
     # ``resolve_eigh_backend`` stays a function-local import for the reason
     # given in ``build_parser``: gw_config parses decks, and this module is
     # imported by things that do not.
-    from gw.gw_config import resolve_eigh_backend
+    from gw.gw_config import (
+        resolve_distrib_la_batched_route,
+        resolve_eigh_backend,
+    )
 
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -1415,6 +1428,8 @@ def main(argv=None):
     # build_vq_evaluator — read this resolved value.)
     args.eigh_backend = resolve_eigh_backend(
         params, override=args.eigh_backend)
+    args.distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=args.distrib_la_batched_route)
     # The INTENT travels to compute_wfns_fi as well: its refusal contract
     # (refuse at resolve time, never fall back to the whole-matrix native
     # path) is armed by this flag, not by the resolved library name.
@@ -1453,7 +1468,8 @@ def main(argv=None):
         # .60, the first time the refit ever got that far.
         load_v_full=(args.vq_mode in ("ongrid", "refit")),
         degeneracy_mode=args.band_degeneracy,
-        degeneracy_tol_ry=args.degeneracy_tol_ry)
+        degeneracy_tol_ry=args.degeneracy_tol_ry,
+        distrib_la_batched_route=args.distrib_la_batched_route)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -1637,7 +1653,8 @@ def main(argv=None):
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
         eigh_backend=args.eigh_backend,
-        use_low_mem_eigh=_use_low_mem_eigh, log_fn=log)
+        use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
+        distrib_la_batched_route=args.distrib_la_batched_route)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
         keep_idx=keep_idx)
@@ -1768,6 +1785,7 @@ def main(argv=None):
             vqm = vq_interp.build_vq_evaluator(
                 restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
                 eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
+                distrib_la_batched_route=args.distrib_la_batched_route,
                 head_minibz_average=head_mbz, log_fn=log)
             zx, prep = vqm.zx, vqm.prep
             eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
@@ -1787,7 +1805,9 @@ def main(argv=None):
                                       window_mode=args.refit_window,
                                       degeneracy_mode=args.band_degeneracy,
                                       degeneracy_tol_ry=args.degeneracy_tol_ry,
-                                      n_guard=args.refit_guard_bands)
+                                      n_guard=args.refit_guard_bands,
+                                      distrib_la_batched_route=(
+                                          args.distrib_la_batched_route))
         # THE ζ THE REFIT ACTUALLY FITS IN.  Identical to ``zx`` under
         # ``--refit-window=zeta``; a band-axis sub-window VIEW of it under
         # ``bse``.  Every refit_vq call below takes this, not ``zx`` — handing
@@ -2020,7 +2040,9 @@ def main(argv=None):
                                       r_chunk=args.refit_r_chunk,
                                       policy=zx.get("policy"),
                                       keep_idx=keep_idx,
-                                      n_guard=args.refit_guard_bands)
+                                      n_guard=args.refit_guard_bands,
+                                      distrib_la_batched_route=(
+                                          args.distrib_la_batched_route))
         for iQ in refit_idx:
             q_tile = -Qpath[iQ]
             V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)

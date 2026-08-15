@@ -991,7 +991,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if eigh_kind == "distributed":
             from gw.qsgw_density import distributed_eigh_bands
             E_qp_ry, U_qp = distributed_eigh_bands(
-                state.H_qp_dft, mesh=inputs.mesh_xy)
+                state.H_qp_dft, mesh=inputs.mesh_xy,
+                distrib_la_batched_route=(
+                    getattr(inputs.config.backend,
+                            "distrib_la_batched_route", "auto")))
         else:
             eigh_kshard, _ = _kshard_eigh_kernels(
                 inputs.mesh_xy, _band_rotation_spec())

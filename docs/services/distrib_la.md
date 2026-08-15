@@ -80,10 +80,10 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 
 | name | what it is |
 |---|---|
-| `plan(op, mesh, *, backend='auto', n=None) -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. |
+| `plan(op, mesh, *, backend='auto', n=None, batched_route='auto') -> Plan` | Resolve once, then call. **Eager** — dlopens, probes, reads `jax.process_count()`. `batched_route='batch_reshard'` opts into the staged local route. |
 | `Plan(A)` / `Plan.batched(A_stack)` | One tile at `P('x','y')` / a stack at `P(None,'x','y')`. **Trace-safe** — no dlopen, no `device_put`, no process count inside. |
 | `Plan.is_native`, `.backend`, `.describe()` | The resolved fact, readable; never something a caller must branch on to be correct. |
-| `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, or the backend's own stacked entry where the library has one, with a batch-axis-reshard route reserved. **The one place that decides.** Introspection — a caller reads it, never branches on it. |
+| `Plan.batched_route`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_SCAN_UNROLL` | HOW a stack runs: a `lax.scan` over the single-matrix op, the backend's stacked entry, or staged batch-axis movement around a local native kernel. **The one place that decides.** Public selection is `auto|batch_reshard`; `scan`/`backend_batched` remain internal resolutions. |
 | `Plan.native_fn` | A pure closure for a fusion-critical site that needs the math inside its own `jit`. Native backends only. |
 | `factor(op, A, mesh, *, backend, ...) -> FactorToken` | Factor once. |
 | `solve(token, B) -> jax.Array` | Back-solve many. The token carries the handle (ScaLAPACK `ipiv`, cuSOLVERMp raw buffer, SLATE `SlateLowerL`). |
@@ -93,7 +93,7 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | Stable hashable mesh identity (axes, extents, platform, device ids) and its two predicates. `mesh_key` is for any cache whose stored value does **not** retain the mesh; `id(mesh)` there is the documented drift. |
 | `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
 | `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
-| `dispatch_batched_eigh(A, mesh, backend)` | The one legacy entry point kept for `gw.qsgw_density`. |
+| `dispatch_batched_eigh(A, mesh, backend, *, batched_route='auto')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
@@ -204,6 +204,7 @@ measures that the marks arrived).
 |---|---|---|
 | L-a shape/contract algebra | `test_distrib_la_shape_algebra.py` | nothing — a laptop, milliseconds |
 | L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
+| route-c staged movement | `test_distrib_la_batch_reshard.py` | four emulated CPU devices; all three local kernels, ragged batches, inverse round trip + wrong-order red twin |
 | L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
 | contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |
 | C++ / ELF acceptance | `test_so_acceptance.py` | binutils + a pinned `.so`; reads the ELF, never dlopens |
@@ -387,9 +388,10 @@ choice collapses to **`Plan.batched_route`, the one place that decides**:
 * **(b)** `ROUTE_BACKEND_BATCHED` — the backend's stacked entry where the
   library has one. Its saving is in C++, around ONE descriptor and ONE
   workspace, and no scan can recover it.
-* **(c)** `ROUTE_BATCH_RESHARD` — **RESERVED. Not built; asking for it
-  raises and says so.** Reshard `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op
-  locally with the native jax kernel per matrix, reshard back. This serves
+* **(c)** `ROUTE_BATCH_RESHARD` — reshard
+  `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op locally with the native
+  JAX kernel per matrix, and reshard matrix outputs back through the literal
+  inverse exchange. This serves
   the very-large-`N_μ` doctrine right up to single-matrix capacity
   **without paying any distributed-library fixed cost** — which the tables
   above show is the entire cost below n ≈ 10⁴.
@@ -397,14 +399,36 @@ choice collapses to **`Plan.batched_route`, the one place that decides**:
 (a)/(b)/(c) behind one toggle point is how small-system, non-distributed
 linalg happens **without a parallel API**.
 
-**Route (c) needs no new movement primitive.**
-`common.staged_reshard.face_to_batch_reshard` already implements exactly
-that exchange: `P(None,'x','y') → P(('x','y'),None,None)` as two
-single-mesh-axis `all_to_all`s, because the one-step move is not a tile
-permutation and GSPMD silently degrades it to replicate-then-partition
-(measured 64× per-rank residency blow-up, job 7882974). Divisibility
-rules and both schedules are documented in that module. The remaining work
-is **wiring distrib_la's batched ops to it, not inventing movement.**
+**Route (c) is built without an upward package dependency.**
+`common.staged_reshard.face_to_batch_reshard` established the exchange:
+`P(None,'x','y') → P(('x','y'),None,None)` as two single-mesh-axis
+`all_to_all`s, because the one-step move is not a tile permutation and
+GSPMD silently degrades it to replicate-then-partition (measured 64×
+per-rank residency blow-up, job 7882974). `distrib_la` is independently
+installable and therefore cannot import `common`; its private
+`_batch_reshard` module carries the same `split_b_first` schedule and its
+literal inverse inside one `shard_map`:
+
+```
+face→batch: x(split q, join μ), then y(split q, join ν)
+batch→face: y(split ν, join q), then x(split μ, join q)
+```
+
+The local kernels are `jnp.linalg.eigh`, `jnp.linalg.cholesky`, and
+`jnp.linalg.solve`, covering every array-returning `Plan.batched` op.
+Eigh eigenvalues take a device `all_gather` back to the service's replicated
+vector contract; eigenvectors, factors, and solve outputs take the inverse
+`all_to_all` pair. Nothing gathers through the host. A leading batch that
+does not divide `Px·Py` is padded and dropped inside the route: zero-Hermitian
+for eigh, identity A for Cholesky/LU, and zero RHS for LU. Matrix faces keep
+the existing exact-tiling contract (`N % Px == N % Py == 0`, and
+`NRHS % Py == 0` for LU); violations refuse before placement or collective
+entry. Backend-only `block_size` is consumed at the route boundary and never
+leaks into `jnp.linalg.*`.
+
+The public opt-in is construction-time:
+`plan(..., batched_route='batch_reshard')`; `Plan.batched(...)` remains the
+single call surface. `auto` is byte-for-byte the historical selection.
 
 #### What the restructure cost and bought
 
@@ -492,8 +516,10 @@ gate green** (`tests/multi_device/batched_eigh_dispatch_gate.py`, and its
 adopted twin `check_batched_eigh_dispatch` in the L-c suite: the two
 routes agree to **0 ulp** in both W and Z — job 7889132 at nq=6/n=32, and
 again at nq=8/n=64 with the scan on both sides of the comparison). That
-gate is the guard on this whole design, and it is why route (c) is safe
-to add later: it can prove a new route did not change an answer. Its
+gate is the guard on this whole design. Route (c) additionally has direct
+native-reference, inverse-round-trip, and wrong-inverse red-twin coverage;
+the real P=4 shared check is `check_batch_reshard_local_ops`. The older gate
+continues to prove scan and backend-stacked execution did not drift. Its
 `_force_serial` argument is `Plan.batched`'s private `_route` override —
 the toggle is what makes the gate able to run two routes over one set of
 operands at all.

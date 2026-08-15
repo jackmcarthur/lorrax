@@ -435,7 +435,8 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 # ============================================================================
 
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
-                                n_rmu_logical: int):
+                                n_rmu_logical: int,
+                                distrib_la_batched_route: str = "auto"):
     """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
 
     The DISTRIBUTED plan — the scale-out route for thousands of
@@ -494,7 +495,8 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
             f"_get_w_solve_fn_distributed: n_rmu_logical={n_log} exceeds "
             f"extent {n_ext}")
 
-    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log)
+    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log,
+                 str(distrib_la_batched_route))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -522,7 +524,9 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # raises at resolve time (the former silent 1-D-mesh degenerate-to-
     # native was removed; audit fix/zq 2026-07-28), so a returned plan is
     # always the distributed backend it names.
-    p = linalg_plan("solve_lu", mesh_xy, backend="distributed", n=n_ext)
+    p = linalg_plan(
+        "solve_lu", mesh_xy, backend="distributed", n=n_ext,
+        batched_route=distrib_la_batched_route)
 
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -661,7 +665,8 @@ def _w_solve_pref_scalar(meta) -> float:
     return 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
 
 
-def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None):
+def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
+                        distrib_la_batched_route: str = "auto"):
     """Return ``(solve_fn, pref)`` for the requested W plan.
 
     Single source of truth for the two-plan dispatch.  Both ``solve_w``
@@ -694,14 +699,16 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None):
     n_log = int(meta.n_rmu)
 
     if dyson == "distributed":
-        solve_fn = _get_w_solve_fn_distributed(mesh_xy, nq, n_rmu, n_log)
+        solve_fn = _get_w_solve_fn_distributed(
+            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route)
     else:
         solve_fn = _get_w_solve_fn_local(
             mesh_xy, nq, n_rmu, n_rmu_logical=n_log)
     return solve_fn, jnp.asarray(pref_scalar, dtype=jnp.complex128)
 
 
-def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
+def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+            distrib_la_batched_route: str = "auto"):
     """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
 
     All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
@@ -727,7 +734,8 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
     caller must drop its reference after this call.
     """
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver)
+        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        distrib_la_batched_route=distrib_la_batched_route)
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
@@ -982,7 +990,8 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     ).compile()
 
 
-def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
+def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
+                       distrib_la_batched_route: str = "auto"):
     """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
     Goes through the same ``_resolve_w_solve_fn`` dispatch as
@@ -990,7 +999,8 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None):
     """
     ensure_jax_compile_cache()
     solve_fn, pref = _resolve_w_solve_fn(
-        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver)
+        meta, mesh_xy, n_rmu=chi0_q.shape[1], dyson_solver=dyson_solver,
+        distrib_la_batched_route=distrib_la_batched_route)
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —
     # the first real call builds the BLACS descriptor and compiles its

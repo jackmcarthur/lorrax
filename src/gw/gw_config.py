@@ -698,6 +698,57 @@ def eigh_backend_choices() -> tuple:
     return tuple(BACKEND_CHOICES["eigh"])
 
 
+def distrib_la_batched_route_choices() -> tuple[str, ...]:
+    """User-facing batch-route vocabulary from the ``distrib_la`` door.
+
+    ``auto`` preserves the resolved backend's established scan/stacked-FFI
+    route.  ``batch_reshard`` moves the batch axis onto the device mesh and
+    runs the service's local JAX kernel on whole per-device matrices.  Keep
+    this resolver beside :func:`eigh_backend_choices`: deck and CLI parsers
+    must not grow frozen copies of a service-owned vocabulary.
+    """
+    try:
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import BATCHED_ROUTE_CHOICES
+    except ImportError:
+        # A source-only install can parse decks before services/ is installed.
+        # The service contract test pins this fallback equal to the live list.
+        return ("auto", "batch_reshard")
+    return tuple(BATCHED_ROUTE_CHOICES)
+
+
+def resolve_distrib_la_batched_route(
+        params, *, override: str | None = None) -> str:
+    """Resolve the universal distrib_la batch schedule from deck/CLI input.
+
+    ``use_low_mem_eigh`` says that one complete eigensolver tile cannot fit
+    on a device; ``batch_reshard`` requires exactly that residency.  Refuse
+    the contradictory pair here, before either the GW or standalone BSE
+    drivers allocate a matrix.
+    """
+    raw = (override if override is not None else
+           (params.get("distrib_la_batched_route", "auto")
+            if hasattr(params, "get") else "auto"))
+    route = str("auto" if raw is None else raw).strip().lower()
+    choices = distrib_la_batched_route_choices()
+    if route not in choices:
+        raise ValueError(
+            f"distrib_la_batched_route={route!r} invalid; expected "
+            f"{' / '.join(choices)}.")
+    if (route == "batch_reshard" and hasattr(params, "get")
+            and bool(params.get("use_low_mem_eigh", False))):
+        raise ValueError(
+            "distrib_la_batched_route='batch_reshard' contradicts "
+            "use_low_mem_eigh=true: batch_reshard places one complete "
+            "matrix (and its result/workspace) on each participating "
+            "device, while use_low_mem_eigh asserts that whole-tile "
+            "residency is not safe.  Keep distrib_la_batched_route=auto "
+            "for the robust face-sharded eigensolver route, or disable "
+            "use_low_mem_eigh only when a full tile fits.")
+    return route
+
+
 def resolve_eigh_backend(params, *, override: str | None = None) -> str:
     """``(eigh_backend, use_low_mem_eigh)`` → ONE backend string.
 
@@ -1069,6 +1120,14 @@ _DEFAULTS = {
     #       explicit, never auto-picked.  (SLATE getrf not yet written.)
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    # Universal schedule for every array-returning ``distrib_la.Plan.batched``
+    # call.  ``auto`` preserves the robust distributed/backend-batched route
+    # selected by each plan.  ``batch_reshard`` is the small-matrix/high-HBM
+    # opt-in: P(None,'x','y') -> P(('x','y'),None,None), local JAX linalg on
+    # each device's whole matrices, then the inverse reshard.  Backend
+    # resolution and the Plan I/O contract stay unchanged; this explicit
+    # route runs the local JAX kernel in place of that backend for the call.
+    "distrib_la_batched_route": "auto",
     #   eigh_backend = auto | off | distributed | cusolvermp | slate
     #                | scalapack
     #       Hermitian eigensolver for the BSE/htransform distributed-eigh
@@ -1472,6 +1531,7 @@ _NORMALIZE_STR = {
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
+    "distrib_la_batched_route",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -2137,6 +2197,7 @@ class BackendConfig:
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
+    distrib_la_batched_route: str  # "auto" | "batch_reshard"
     eigh_backend: str          # resolved: auto|off|distributed|cusolvermp|
                                #           slate|scalapack (use_low_mem_eigh
                                #           already folded in)
@@ -2157,6 +2218,8 @@ class BackendConfig:
                if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
+            + (f"distrib_la_batched_route={self.distrib_la_batched_route}, "
+               if self.distrib_la_batched_route != "auto" else "")
             + (f"eigh_backend={self.eigh_backend}"
                + (" (use_low_mem_eigh)" if self.use_low_mem_eigh else "")
                + ", " if self.eigh_backend != "auto" else "")
@@ -2656,6 +2719,7 @@ class LorraxConfig:
         # Distributed-linalg axes.
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
+        _distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
             raise ValueError(
                 f"distributed_cholesky={_dist_chol!r} invalid; expected "
@@ -2784,6 +2848,7 @@ class LorraxConfig:
             w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
+            distrib_la_batched_route=_distrib_la_batched_route,
             eigh_backend=_eigh_backend,
             use_low_mem_eigh=_use_low_mem_eigh,
             zeta_ridge=float(_g("zeta_ridge")),

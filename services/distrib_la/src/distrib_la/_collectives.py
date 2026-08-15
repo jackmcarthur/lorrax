@@ -1,4 +1,4 @@
-"""The two cross-process primitives distrib_la needs, and nothing else.
+"""The cross-process primitives distrib_la needs, and nothing else.
 
 Ported from LORRAX ``src/ffi/common/broadcast.py`` and the
 ``device_put_process_local`` half of ``src/common/collectives.py``, both at
@@ -15,7 +15,8 @@ import os
 
 import numpy as np
 
-__all__ = ["broadcast_bytes", "device_put_process_local"]
+__all__ = ["broadcast_bytes", "device_put_process_local",
+           "warm_mesh_cliques"]
 
 
 def broadcast_bytes(buf: np.ndarray, *, key: str,
@@ -107,3 +108,57 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
     shards = [jax.device_put(np.ascontiguousarray(arr[idx]), dev)
               for dev, idx in idx_map.items()]
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+
+# CPU/MPI creates collective communicators on first use.  jaxlib refuses to
+# create them from an intra-op worker because that worker is not MPI's main
+# thread.  This is the service-local sibling of
+# ``common.collectives.warm_mesh_cliques``: distrib_la is independently
+# installable and must not reach upward into LORRAX's common package.
+_WARMED_MESHES: set = set()
+
+
+def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
+    """Create each mesh-axis MPI communicator on the calling main thread.
+
+    A no-op off JAX's CPU ``impl=mpi`` transport, in single-process runs,
+    and for an already-warmed mesh.  Call synchronously on every rank before
+    compiling a route containing explicit ``all_to_all`` collectives.
+    """
+    if os.environ.get(
+            "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip().lower() != "mpi":
+        return 0.0
+
+    import time
+
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from distrib_la._shard_map import shard_map
+
+    if jax.process_count() <= 1:
+        return 0.0
+    key = (tuple(int(d.id) for d in mesh.devices.ravel()),
+           tuple(mesh.axis_names))
+    if key in _WARMED_MESHES:
+        return 0.0
+
+    t0 = time.perf_counter()
+    tiny = jnp.zeros(1)
+    axes = list(mesh.axis_names)
+    groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
+    for ax in groups:
+        f = jax.jit(shard_map(
+            lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
+            in_specs=(P(None),), out_specs=P(None), check_vma=False))
+        jax.block_until_ready(f(tiny))
+
+    dt = time.perf_counter() - t0
+    _WARMED_MESHES.add(key)
+    if jax.process_index() == 0:
+        print_fn(
+            f"[distrib_la] warmed {len(groups)} MPI cliques for mesh "
+            f"{tuple(mesh.devices.shape)} axes={axes} in {dt * 1e3:.0f} ms")
+    return dt

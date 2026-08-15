@@ -374,7 +374,11 @@ def compute_static_w(
             with timing.section("W.compile", announce=True,
                                 label=f"{_w} Dyson compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-                                   dyson_solver=config.backend.w_dyson_solver)
+                                   dyson_solver=config.backend.w_dyson_solver,
+                                   distrib_la_batched_route=(
+                                       getattr(config.backend,
+                                               "distrib_la_batched_route",
+                                               "auto")))
             if head_channel is None:
                 with timing.section(
                         "W.exec", announce=True,
@@ -382,7 +386,10 @@ def compute_static_w(
                               f"{'IBZ wedge' if use_ibz_w else 'full BZ'})"):
                     W_q_solve = solve_w(
                         V_q_solve, chi0_q_solve, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     # χ₀ is donated inside solve_w — the reference is
                     # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                     del chi0_q_solve
@@ -418,11 +425,17 @@ def compute_static_w(
                     # (nq, μ, μ) transient, live only across the first LU.
                     W_body0 = solve_w(
                         V_body_solve, chi0_q_solve.copy(), meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     del V_body_solve
                     W_bare = solve_w(
                         V_bare_solve, chi0_q_solve, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     del chi0_q_solve, V_bare_solve
                     W_q_solve = _hc.combine_head_channel(
                         W_body0, W_bare, head_channel, q_index=q_idx)
