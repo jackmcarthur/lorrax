@@ -518,12 +518,7 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # REMOVING A ROW IS THE LANDING GESTURE.  When the MPA fit stage lands,
 # its author deletes this entry and the suite that pins the refusal fails
 # loudly until it is rewritten to pin the new behaviour.
-UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
-    ComputeMode.MPA: (
-        "the real-material chi/W/dynamic-head/Sigma/QSGW disk pipeline "
-        "must pass end to end; see THEORY_mpa_implementation.md"
-    ),
-}
+UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {}
 
 
 def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):

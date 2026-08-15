@@ -172,10 +172,9 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 
 def main(argv=None):
 	_description = (
-		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM self-energy, "
-		"one-shot or self-consistent (see gw_config.ComputeMode / "
-		"QPSolver).  compute_mode = mpa is declared but refuses to run "
-		"until its Σ stage lands.")
+		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
+		"self-energy, one-shot or self-consistent (see "
+		"gw_config.ComputeMode / QPSolver).")
 	argp = argparse.ArgumentParser(
 		allow_abbrev=False, description=_description)
 	argp.add_argument(
