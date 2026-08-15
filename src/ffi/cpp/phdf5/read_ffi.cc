@@ -335,6 +335,14 @@ static ffi::Error ReadDispatch(
         return fail(ffi::ErrorCode::kInvalidArgument,
                     "phdf5 read: ctx_handle is null");
     }
+    // Audit B2: validated against the live-ctx registry BEFORE ``fail``
+    // (which reads ctx->rank) or anything else touches this pointer.
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read", &live_err)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
+    }
 
     const auto dims = A_out->dimensions();
     const size_t N = dims.size();
@@ -682,6 +690,14 @@ static ffi::Error ReadKchunkDispatch(
     if (!ctx) {
         return fail(ffi::ErrorCode::kInvalidArgument,
                     "phdf5 read_kchunk: ctx_handle is null");
+    }
+    // Audit B2 — see the note in ReadDispatch.
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read_kchunk",
+                            &live_err)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
     }
 
     const auto dims = A_out->dimensions();
@@ -1153,6 +1169,16 @@ static ffi::Future ReadKchunkUnionDispatch(
     if (!ctx) {
         return fail(ffi::ErrorCode::kInvalidArgument,
                     "phdf5 read_kchunk_union: ctx_handle is null");
+    }
+    // Audit B2 — see the note in ReadDispatch.  This dispatch returns a
+    // Future, so the refusal goes back through ``fail_early`` (which does not
+    // touch ctx), not through ``fail``.
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read_kchunk_union",
+                            &live_err)) {
+            return fail_early(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
     }
 
     const auto dims = A_out->dimensions();

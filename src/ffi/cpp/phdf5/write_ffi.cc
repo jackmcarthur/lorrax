@@ -471,6 +471,19 @@ static ffi::Future WriteDispatch(
         return fail(ffi::ErrorCode::kInvalidArgument,
                     "phdf5 write: ctx_handle is null");
     }
+    // Audit B2: the handle is validated against the live-ctx registry BEFORE
+    // ``fail`` (which reads ctx->rank) or the task closure captures it.  On
+    // THIS path a stale ctx is not merely a bad read — it is an H5Dwrite into
+    // a file the process no longer owns.
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, handle_host[0], "phdf5 write", &live_err)) {
+            ffi::Promise p;
+            ffi::Future f(p);
+            p.SetError(ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err));
+            return f;
+        }
+    }
 
     const auto dims = A.dimensions();
     const size_t N = dims.size();
