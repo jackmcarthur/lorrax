@@ -436,3 +436,203 @@ def test_qe_kgrid_reduction_delegates_and_keeps_qe_s_transpose_convention():
         "a transpose appeared in _reduce_mp_to_ibz.  The measurement says "
         "this grid reduces with the AS-STORED QE matrices; transposing "
         "them silently changes every QE-derived k-grid")
+
+
+# ===========================================================================
+#  TRS: the two predicates, and the blindness that let them diverge
+# ===========================================================================
+
+def _symmetry_maps():
+    """``symmetry_maps``, with the service path bootstrapped first.
+
+    ``from symmetry_maps import ...`` at cell scope only works if some
+    EARLIER test already called ``ffi._services.ensure_on_path()`` — so a
+    cell that does it bare passes in a full run and fails when selected
+    alone.  One accessor removes the ordering dependence.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    import symmetry_maps
+    return symmetry_maps
+
+
+def _star_with_a_time_reversed_first_member():
+    """A 4-k BZ over 2 stars where star 1's FIRST member is a TRS row.
+
+    That is the only configuration in which the two conjugation
+    predicates disagree, and it is a property of the op-selection policy
+    rather than of the physics — which is why it can lie dormant on
+    every deck in a tree and then appear.
+
+    ``irr_idx_k`` labels the star; ``sym_idx_k >= n_sym_spatial`` marks a
+    time-reversal row.  Rows 2 and 3 form star 1, and row 2 — the one
+    ``star_select`` keeps — is time-reversed.
+    """
+    irr = np.array([0, 0, 1, 1], dtype=np.int32)
+    sym = np.array([0, 2, 2, 0], dtype=np.int32)      # n_sym_spatial = 2
+    return irr, sym, 2
+
+
+def _hermitian_stack(rng, nk, nb):
+    a = rng.standard_normal((nk, nb, nb)) + 1j * rng.standard_normal((nk, nb, nb))
+    return a + np.conj(np.swapaxes(a, 1, 2))
+
+
+def test_the_two_trs_predicates_really_do_disagree():
+    """Both branches run; on this star they give DIFFERENT matrices.
+
+    If they ever agree here the fixture has stopped modelling the case,
+    and every cell below would pass without testing anything.
+    """
+    star_broadcast = _symmetry_maps().star_broadcast
+    irr, sym, nss = _star_with_a_time_reversed_first_member()
+    rng = np.random.default_rng(0)
+    wedge = _hermitian_stack(rng, 2, 3)
+
+    a = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                  trs_reference="star_row"))
+    b = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                  trs_reference="ibz_slab"))
+    assert not np.allclose(a, b), (
+        "the two trs_reference branches agree on a star whose first member "
+        "is time-reversed — that is the ONLY case they differ on, so this "
+        "fixture no longer exercises the 183.61 eV mix-up")
+
+
+def test_a_diagonal_check_is_structurally_blind_to_the_mix_up():
+    """THE POINT.  The wrong predicate is invisible to the cheap checks.
+
+    Conjugating a Hermitian block leaves its REAL DIAGONAL exactly
+    intact, so every diagonal observable — the electron count,
+    hermiticity, the spectrum, the eqp.dat V_H column, and the
+    diagonal star-spread metric ``compare_to_bgw`` reports — survives a
+    wrong ``trs_reference`` unchanged.  That is why 27cc885's 183.61 eV
+    error sat undetected for a month.
+
+    This cell asserts the blindness as a PROPERTY rather than leaving it
+    as a warning in a docstring: a future reader who adds a diagonal
+    assertion and believes it covers the conjugation class has this cell
+    telling them, in numbers, that it does not.
+    """
+    star_broadcast = _symmetry_maps().star_broadcast
+    irr, sym, nss = _star_with_a_time_reversed_first_member()
+    rng = np.random.default_rng(1)
+    wedge = _hermitian_stack(rng, 2, 3)
+
+    a = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                  trs_reference="star_row"))
+    b = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                  trs_reference="ibz_slab"))
+
+    # The real diagonals are EXACTLY equal — not close, equal.
+    da = np.real(np.diagonal(a, axis1=1, axis2=2))
+    db = np.real(np.diagonal(b, axis1=1, axis2=2))
+    np.testing.assert_array_equal(
+        da, db,
+        err_msg="the real diagonals differ, so a diagonal check WOULD see "
+                "the mix-up and this cell's premise is wrong")
+    # ...while the off-diagonals differ by O(the matrix itself).
+    off = np.abs(a - b).max() / max(np.abs(a).max(), 1e-300)
+    assert off > 0.1, (
+        f"the two predicates differ by only {off:.2e} relative off-diagonal; "
+        f"the recorded disagreement is O(1) (183.61 eV on a real deck)")
+
+
+def test_even_the_self_consistency_spread_is_blind_to_it():
+    """AND SO IS ``star_spread`` — which is the part that makes this bite.
+
+    The natural assumption is that the diagonal metric is blind but the
+    full-matrix one catches it.  IT DOES NOT, and the reason is worth
+    stating: the wrong predicate conjugates an ENTIRE STAR uniformly, and
+    a uniformly conjugated star is still perfectly self-consistent under
+    the star relation.  ``star_spread`` measures self-consistency, so it
+    reports ~0 on both.
+
+    What the mix-up changes is the star's relation to the DATA IT CAME
+    FROM, not its internal consistency.  So the only thing that can see
+    it is a comparison against independently computed full-BZ values —
+    which is exactly how 27cc885 was caught (183.61 eV "against an
+    independently computed V_H") and exactly what
+    ``tests/test_star_offdiag_gate.py`` does on the committed full
+    matrices in ``cohsex_debug/sigma_mnk.h5``.
+
+    This cell exists so nobody adds ``star_spread`` as the guard against
+    this class and believes they are covered.
+    """
+    _sm = _symmetry_maps()
+    star_broadcast, star_spread = _sm.star_broadcast, _sm.star_spread
+    irr, sym, nss = _star_with_a_time_reversed_first_member()
+    rng = np.random.default_rng(2)
+    wedge = _hermitian_stack(rng, 2, 3)
+
+    right = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                      trs_reference="star_row"))
+    wrong = np.asarray(star_broadcast(wedge, irr, sym, nss,
+                                      trs_reference="ibz_slab"))
+    scale = max(float(np.abs(right).max()), 1e-300)
+
+    # BOTH are self-consistent.  This is the claim.
+    assert float(star_spread(right, irr, sym, nss)) / scale < 1e-12
+    assert float(star_spread(wrong, irr, sym, nss)) / scale < 1e-12, (
+        "star_spread DID see the mix-up — if that is now true the comment "
+        "above is wrong and this class has a cheaper guard than believed")
+
+    # ...and only comparison against the known-correct full-BZ array does.
+    assert float(np.abs(right - wrong).max()) / scale > 0.1, (
+        "the two broadcasts agree, so nothing can distinguish them here")
+
+
+def test_star_broadcast_refuses_to_guess_the_predicate():
+    """No default: the wrong branch is invisible, so it cannot be implicit.
+
+    ``trs_reference`` used to default to ``"star_row"``, which is right
+    for a ``star_select`` operand and wrong for a file slab.  A caller who
+    had not thought about it got a plausible wrong matrix; now they get a
+    TypeError.
+    """
+    star_broadcast = _symmetry_maps().star_broadcast
+    irr, sym, nss = _star_with_a_time_reversed_first_member()
+    wedge = _hermitian_stack(np.random.default_rng(3), 2, 3)
+    with pytest.raises(TypeError):
+        star_broadcast(wedge, irr, sym, nss)  # trs-reference-exempt: the point
+
+
+def test_every_call_site_in_the_tree_states_its_flavour():
+    """AST sweep: no ``star_broadcast`` call may omit ``trs_reference``.
+
+    The signature enforces this at run time; this enforces it at read
+    time, across the whole tree including tools and multi-device gates,
+    so the answer is visible at every call site rather than only when one
+    executes.
+    """
+    root = _SRC.parent
+    missing = []
+    for path in root.rglob("*.py"):
+        if ".git" in str(path) or "jax_cache" in str(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (getattr(node.func, "attr", None)
+                    or getattr(node.func, "id", None))
+            if name != "star_broadcast":
+                continue
+            kw = {k.arg for k in node.keywords}
+            if "trs_reference" in kw:
+                continue
+            # A call may opt out ONLY by saying so on its own line, which
+            # is greppable and shows up in review.  The one user is the
+            # refusal cell above, whose whole point is the omission.
+            line = path.read_text().splitlines()[node.lineno - 1]
+            if "trs-reference-exempt" in line:
+                continue
+            missing.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not missing, (
+        "star_broadcast called without an explicit trs_reference at: "
+        + ", ".join(missing)
+        + ".  Which predicate applies depends on where the operand came "
+          "from, and the wrong one is invisible to every diagonal check.")
