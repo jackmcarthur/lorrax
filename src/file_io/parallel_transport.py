@@ -43,6 +43,43 @@ W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
 OCCUPATIONS_DATASET = "dft_occupations_full"
 
+def link_symmetry_reduction_applies(sym, kgrid) -> bool:
+    """Whether the IBZ link stream + directed-edge unfold is DEFINED here.
+
+    The reduction stores one link per (IBZ k, elementary +b_i/N_i step) and
+    recovers every full-BZ link by mapping those edges through the point
+    group.  That is only possible when the symmetry image of an elementary
+    mesh step is again an elementary mesh step up to sign — i.e. when the
+    point group acts on the PRIMITIVE reciprocal basis as signed
+    permutations.  True for simple-cubic/tetragonal/orthorhombic primitive
+    cells; FALSE for bcc and fcc primitive cells, where the cubic group
+    sends [1,0,0] to [0,1,1] (measured on the sodium 8x8x8 bcc deck,
+    2026-08-15).  ``directed_edge_orbit_table`` refuses in that case and
+    names this escape hatch; when it does not apply the links are streamed
+    on the FULL BZ and the unfold degenerates to the identity.
+
+    Uses the same step map as
+    ``symmetry_maps.directed_edges._mapped_step``: round(S @ (b/N) * N).
+    """
+    mats = np.asarray(sym.sym_mats_k, dtype=np.float64)
+    if mats.ndim != 3 or mats.shape[-2:] != (3, 3):
+        raise ValueError(
+            f"sym_mats_k must be (n_sym, 3, 3); got {mats.shape}")
+    grid = np.asarray(kgrid, dtype=np.float64).reshape(3)
+    steps = np.eye(3, dtype=np.int64)
+    allowed = {tuple(int(x) for x in row)
+               for row in np.concatenate([steps, -steps], axis=0)}
+    for mat in mats:
+        for step in steps:
+            raw = (mat @ (step / grid)) * grid
+            rounded = np.rint(raw)
+            if float(np.max(np.abs(raw - rounded))) > 1.0e-10:
+                return False
+            if tuple(int(x) for x in rounded) not in allowed:
+                return False
+    return True
+
+
 __all__ = [
     "CONNECTION_CART_DATASET",
     "CONNECTION_REDUCED_DATASET",
@@ -57,6 +94,7 @@ __all__ = [
     "WAvStencilMetadata",
     "WAvStencilReader",
     "covariant_velocity",
+    "link_symmetry_reduction_applies",
     "initialize_parallel_transport_artifact",
     "validate_covariant_velocity",
     "validate_parallel_transport_artifact",
@@ -373,8 +411,9 @@ def initialize_parallel_transport_artifact(
             "the advertised fourth-order +/-2 stencil; got "
             f"kgrid={kgrid} (undersampled axes "
             f"{','.join(undersampled)}).")
-    nrk = int(np.asarray(sym.kirr_fullids).size)
+    reduced = link_symmetry_reduction_applies(sym, kgrid)
     nk = int(sym.nk_tot)
+    nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
     energies, occupations = _full_band_tables(wfn, sym, nb)
     velocity = jnp.asarray(velocity_dft_kmajor)
     if velocity.ndim != 4 or velocity.shape[:2] != (nk, 3):
@@ -390,7 +429,8 @@ def initialize_parallel_transport_artifact(
         io.create_dataset(
             LINKS_DATASET, shape=(nrk, 3, nb, nb), dtype=np.complex128,
             attrs={
-                "k_storage": "ibz_source_edges",
+                "k_storage": ("ibz_source_edges" if reduced
+                              else "full_bz_source_edges"),
                 "orientation": "L_i(k) X(k+b_i) L_i(k)^H",
                 "source_steps": "positive reduced-grid unit steps",
                 "band_layout": "P(None,None,x,y)",
@@ -399,7 +439,8 @@ def initialize_parallel_transport_artifact(
         io.create_dataset(
             SINGULAR_VALUES_DATASET, shape=(nrk, 3, nb), dtype=np.float64,
             attrs={
-                "k_storage": "ibz_source_edges",
+                "k_storage": ("ibz_source_edges" if reduced
+                              else "full_bz_source_edges"),
                 "source_steps": "positive reduced-grid unit steps",
                 "ordering": "descending",
                 "distribution": "replicated O(nband) diagnostic",
@@ -470,6 +511,7 @@ def initialize_parallel_transport_artifact(
         io.write_attr("velocity_units_ry_bohr", np.int32(1))
         io.write_attr("velocity_frame_cartesian", np.int32(1))
         io.write_attr("reciprocal_units_bohr_inverse", np.int32(1))
+        io.write_attr("links_symmetry_reduced", np.int32(bool(reduced)))
         io.write_attr("connection_complete", np.int32(0))
         io.write_attr("velocity_validation_complete", np.int32(0))
         io.write_attr("velocity_validation_passed", np.int32(0))
@@ -489,7 +531,15 @@ def _write_link_stage(
     from wfn_loader import IBZRows
 
     nb = int(nbands)
-    source_full = np.asarray(sym.kirr_fullids, dtype=np.int32)
+    # bcc/fcc primitive cells are NOT closed under their own point group in
+    # the elementary-step basis, so the IBZ edge stream cannot be unfolded
+    # (see ``link_symmetry_reduction_applies``).  There the source set is the
+    # full BZ and every center is addressed by its full-BZ id, exactly the
+    # way the neighbor already is.
+    reduced = link_symmetry_reduction_applies(
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)))
+    source_full = (np.asarray(sym.kirr_fullids, dtype=np.int32) if reduced
+                   else np.arange(int(sym.nk_tot), dtype=np.int32))
     nrk = int(source_full.size)
     full_plus = build_forward_neighbor_table(sym.kvecs_asints, wfn.kgrid)
     source_plus = full_plus[source_full]
@@ -500,7 +550,8 @@ def _write_link_stage(
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         for ik_irr, center_full in enumerate(source_full):
-            center_ids = IBZRows((int(ik_irr),))
+            center_ids = (IBZRows((int(ik_irr),)) if reduced
+                          else [int(center_full)])
             center_xy = wfn.load(
                 bands=(0, nb), k=center_ids, sharding=band_sphere_spec(),
                 bispinor=bool(bispinor))
@@ -575,17 +626,25 @@ def _write_connection_stage(
     """Read compact links, unfold through SymMaps, and write A once."""
     nb = int(nbands)
     nb_storage = band_storage_extent(mesh, nb)
-    table = directed_edge_orbit_table(
-        kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
-        kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
-        sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
-        irr_idx_k=np.asarray(sym.irr_idx_k, dtype=np.int32),
-        sym_idx_k=np.asarray(sym.sym_idx_k, dtype=np.int32),
-        source_full_ids=source_full,
-        source_steps=source_steps,
-        n_sym_spatial=int(wfn.ntran),
-        target_steps=np.eye(3, dtype=np.int32),
-    )
+    reduced = link_symmetry_reduction_applies(
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)))
+    table = None
+    if reduced:
+        table = directed_edge_orbit_table(
+            kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
+            kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
+            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+            irr_idx_k=np.asarray(sym.irr_idx_k, dtype=np.int32),
+            sym_idx_k=np.asarray(sym.sym_idx_k, dtype=np.int32),
+            source_full_ids=source_full,
+            source_steps=source_steps,
+            n_sym_spatial=int(wfn.ntran),
+            target_steps=np.eye(3, dtype=np.int32),
+        )
+    elif int(source_full.size) != int(sym.nk_tot):
+        raise ValueError(
+            "unreduced link storage must cover the full BZ; got "
+            f"{int(source_full.size)} source rows for nk_tot={int(sym.nk_tot)}")
     block_spec = P(None, None, "x", "y")
     block_sharding = NamedSharding(mesh, block_spec)
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
@@ -595,15 +654,21 @@ def _write_connection_stage(
             LINKS_DATASET,
             shape=(int(source_full.size), 3, nb_storage, nb_storage),
             partition_spec=block_spec)
-        selected = source_links[
-            table["source_row"], table["source_direction"]]
-        full_target_major = apply_band_matrix_symmetry(
-            selected,
-            antiunitary=table["antiunitary"],
-            reverse=table["reverse"],
-            sewing_start=None,
-            sewing_end=None,
-        )
+        if table is None:
+            # The source rows ARE the targets, in full-BZ id order, and each
+            # already carries its own elementary step: the unfold is the
+            # identity and no gauge/sewing operation applies.
+            full_target_major = source_links
+        else:
+            selected = source_links[
+                table["source_row"], table["source_direction"]]
+            full_target_major = apply_band_matrix_symmetry(
+                selected,
+                antiunitary=table["antiunitary"],
+                reverse=table["reverse"],
+                sewing_start=None,
+                sewing_end=None,
+            )
         full_links = jnp.moveaxis(full_target_major, 1, 0)
         full_links = jax.lax.with_sharding_constraint(
             full_links, block_sharding)
@@ -642,12 +707,13 @@ def _write_connection_stage(
         io.write_slab(
             CONNECTION_CART_DATASET, connection_cart,
             global_shape=connection_shape)
-        io.write_attr("directed_edge_source_row", table["source_row"])
-        io.write_attr(
-            "directed_edge_source_direction", table["source_direction"])
-        io.write_attr("directed_edge_sym_idx", table["sym_idx"])
-        io.write_attr("directed_edge_reverse", table["reverse"])
-        io.write_attr("directed_edge_antiunitary", table["antiunitary"])
+        if table is not None:
+            io.write_attr("directed_edge_source_row", table["source_row"])
+            io.write_attr(
+                "directed_edge_source_direction", table["source_direction"])
+            io.write_attr("directed_edge_sym_idx", table["sym_idx"])
+            io.write_attr("directed_edge_reverse", table["reverse"])
+            io.write_attr("directed_edge_antiunitary", table["antiunitary"])
         io.write_attr("connection_complete", np.int32(1))
 
 
