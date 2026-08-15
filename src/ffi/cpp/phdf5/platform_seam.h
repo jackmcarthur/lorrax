@@ -20,8 +20,9 @@
 //      stays platform-agnostic (the split jaxlib uses for cpu-lapack vs
 //      cuda-cusolver).
 //   2. INDEX COPY-IN — the small (ndim × int64) offset / valid_shape / count
-//      control buffers are device-resident on CUDA (cudaMemcpy D2H) and
-//      already host-resident on cpu (a plain read).
+//      control buffers are device-resident on CUDA (an ``xla_stream``-ordered
+//      cudaMemcpyAsync D2H followed by a cudaStreamSynchronize) and already
+//      host-resident on cpu (a plain read).
 //   3. DEVICE STAGING — the bulk payload.  CUDA stages through the ctx's
 //      page-locked ``pinned_buf`` with an async copy on ``ctx->stream``
 //      signalled by a pooled event; on cpu the XLA buffer IS host memory, so
@@ -63,19 +64,62 @@
 namespace lorrax_ffi::phdf5 {
 
 // ---- Seam 2: copy a small (N × int64) index buffer out of an FFI input into
-// host ``dst``.  Host: the buffer is already host-resident.  CUDA: D2H copy.
-// Returns false on failure and fills ``err`` (CUDA path only).
+// host ``dst``.  Host: the buffer is already host-resident.  CUDA: a D2H copy
+// ORDERED ON THE XLA STREAM, then a synchronize, because the caller reads
+// ``dst`` the instant this returns.  Returns false on failure and fills
+// ``err`` (CUDA path only).
+//
+// WHY THE STREAM ARGUMENT EXISTS — SLAB_IO_ROOT_CAUSE_AUDIT.md §A/S3.
+//
+// This was a plain ``cudaMemcpy`` on the LEGACY DEFAULT STREAM.  XLA creates
+// its compute streams and the ctx stream with ``cudaStreamNonBlocking``, and
+// the legacy default stream does NOT order against a non-blocking stream —
+// so the copy could, and did, read the operand allocation BEFORE the XLA
+// stream had written it, harvesting whatever the allocator had left there.
+// The observed harvest was
+//
+//     offset_base=4462667732332943029
+//
+// on a call site that passes offset 0 (measured 2026-08-15, iteration 5 of
+// the damped R6 arm; identical on every rank, because every rank ran the same
+// schedule over the same stale layout, and the read_ffi.cc bounds test then
+// refused collectively, by design).  The handle operand travels this same
+// seam, so a raced read there yields a garbage or freed ``PhdfCtx*`` — the
+// suspected route to the segfault-at-close (S1) and the phantom
+// open-for-write (S2).
+//
+// The OUTPUT side was already stream-correct (``stage_host_to_output`` in
+// read_ffi.cc: cudaMemcpyAsync on ctx->stream + event + cudaStreamWaitEvent
+// on xla_stream).  This is the same discipline applied to the small copies
+// that missed it: enqueuing on ``xla_stream`` orders the copy AFTER the ops
+// that produced the operands — XLA's FFI contract is that a handler's
+// operands are ready on the stream the handler executes on — and the
+// synchronize is what makes the bytes visible to the host code below.
+// Cost: one stream sync per control copy, microseconds, phdf5 handlers only.
 static inline bool copy_index_to_host(
-    void* dst, const void* src, size_t nbytes, std::string* err)
+    LRX_STREAM_PARAM void* dst, const void* src, size_t nbytes,
+    std::string* err)
 {
 #ifdef LORRAX_FFI_NO_CUDA
     std::memcpy(dst, src, nbytes);
     (void)err;
     return true;
 #else
-    cudaError_t ce = cudaMemcpy(dst, src, nbytes, cudaMemcpyDeviceToHost);
+    cudaError_t ce = cudaMemcpyAsync(dst, src, nbytes,
+                                     cudaMemcpyDeviceToHost, xla_stream);
     if (ce != cudaSuccess) {
-        if (err) *err = cudaGetErrorString(ce);
+        if (err) *err = std::string("cudaMemcpyAsync(D2H,xla_stream): ")
+                      + cudaGetErrorString(ce);
+        return false;
+    }
+    // The host reads ``dst`` immediately after this returns, so the copy must
+    // have LANDED, not merely been enqueued.  Synchronizing the XLA stream
+    // (rather than the whole device) waits for exactly the ops this copy was
+    // ordered behind.
+    ce = cudaStreamSynchronize(xla_stream);
+    if (ce != cudaSuccess) {
+        if (err) *err = std::string("cudaStreamSynchronize(xla_stream): ")
+                      + cudaGetErrorString(ce);
         return false;
     }
     return true;

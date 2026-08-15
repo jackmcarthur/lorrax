@@ -312,7 +312,8 @@ static ffi::Error ReadDispatch(
         // plainly.  A failure here is a broken D2H copy, not a collective
         // divergence — it hits every rank identically.
         std::string herr;
-        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
+                                handle_buf.untyped_data(),
                                 2 * sizeof(int64_t), &herr)) {
             return ffi::Error(ffi::ErrorCode::kInternal,
                               "phdf5 read: copy(handle) failed: " + herr);
@@ -366,13 +367,14 @@ static ffi::Error ReadDispatch(
     // host memory (D2H on CUDA; already host-resident on the host build).
     std::vector<int64_t> offset_host(N);
     std::string cperr;
-    if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+    if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
+                            offset_buf.untyped_data(),
                             N * sizeof(int64_t), &cperr)) {
         return fail(ffi::ErrorCode::kInternal,
                     "phdf5 read: copy(offset) failed: " + cperr);
     }
     std::vector<int64_t> valid_shape_host(N);
-    if (!copy_index_to_host(valid_shape_host.data(),
+    if (!copy_index_to_host(LRX_STREAM_ARG valid_shape_host.data(),
                             valid_shape_buf.untyped_data(),
                             N * sizeof(int64_t), &cperr)) {
         return fail(ffi::ErrorCode::kInternal,
@@ -661,7 +663,8 @@ static ffi::Error ReadKchunkDispatch(
         // No ctx yet, so there is nothing to announce through: return
         // plainly.  A failure here hits every rank identically.
         std::string herr;
-        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
+                                handle_buf.untyped_data(),
                                 2 * sizeof(int64_t), &herr)) {
             return ffi::Error(
                 ffi::ErrorCode::kInternal,
@@ -725,7 +728,8 @@ static ffi::Error ReadKchunkDispatch(
     std::vector<int64_t> offset_host((size_t)n_kchunk * N_file);
     {
         std::string cperr;
-        if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
+                                offset_buf.untyped_data(),
                                 offset_host.size() * sizeof(int64_t), &cperr)) {
             return fail(ffi::ErrorCode::kInternal,
                         "phdf5 read_kchunk: copy(offset) failed: " + cperr);
@@ -1127,7 +1131,8 @@ static ffi::Future ReadKchunkUnionDispatch(
     int64_t handle_host[2] = {0, 0};
     {
         std::string herr;
-        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
+                                handle_buf.untyped_data(),
                                 2 * sizeof(int64_t), &herr)) {
             return fail_early(
                 ffi::ErrorCode::kInternal,
@@ -1193,12 +1198,14 @@ static ffi::Future ReadKchunkUnionDispatch(
     std::vector<int64_t> cnt_host((size_t)n_kchunk * N_file);
     {
         std::string cperr;
-        if (!copy_index_to_host(off_host.data(), offset_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG off_host.data(),
+                                offset_buf.untyped_data(),
                                 off_host.size() * sizeof(int64_t), &cperr)) {
             return fail(ffi::ErrorCode::kInternal,
                 "phdf5 read_kchunk_union: copy(offset): " + cperr);
         }
-        if (!copy_index_to_host(cnt_host.data(), count_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG cnt_host.data(),
+                                count_buf.untyped_data(),
                                 cnt_host.size() * sizeof(int64_t), &cperr)) {
             return fail(ffi::ErrorCode::kInternal,
                 "phdf5 read_kchunk_union: copy(count): " + cperr);
@@ -1309,9 +1316,9 @@ static ffi::Future ReadKchunkUnionDispatch(
             std::move(per_rank_max), kax,
             std::move(promise));
     };
-#ifndef LORRAX_FFI_NO_CUDA
-    (void)xla_stream;  // unused: task owns its own synchronization via h2d_event
-#endif
+    // ``xla_stream`` is used ABOVE, by the three control-operand copies (seam
+    // 2 is stream-ordered — SLAB_IO_ROOT_CAUSE_AUDIT.md B1).  The QUEUED TASK
+    // below does not need it: it owns its own synchronization via h2d_event.
     {
         std::lock_guard<std::mutex> lk(ctx->queue_mu);
         ctx->task_queue.emplace_back(std::move(task));
