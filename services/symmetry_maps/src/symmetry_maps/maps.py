@@ -2406,14 +2406,7 @@ def _star_tables_of(sym):
             int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
 
 
-def _moveaxis_like(a, src, dst):
-    """``moveaxis`` that keeps a device array on its device."""
-    if isinstance(a, np.ndarray):
-        return np.moveaxis(a, src, dst)
-    return jnp.moveaxis(a, src, dst)
-
-
-def unfold_file_wedge_to_full_bz(sym, data, *, axis=0):
+def unfold_file_wedge_to_full_bz(sym, data):
     """FILE wedge → full BZ.  ``(sym.nk_red, …)`` → ``(sym.nk_tot, …)``.
 
     The wedge as the WFN stores it — ``wfn.kpoints``, the k-set every
@@ -2426,13 +2419,35 @@ def unfold_file_wedge_to_full_bz(sym, data, *, axis=0):
     abstraction.
     """
     irr, sidx, nss = _star_tables_of(sym)
-    if axis:
-        data = _moveaxis_like(data, axis, 0)
-    out = star_broadcast(data, irr, sidx, nss, trs_reference="ibz_slab")
-    return _moveaxis_like(out, 0, axis) if axis else out
+    return star_broadcast(data, irr, sidx, nss, trs_reference="ibz_slab")
 
 
-def unfold_star_wedge_to_full_bz(sym, data, *, axis=0):
+def reduce_full_bz_to_file_wedge(sym, data):
+    """full BZ → FILE wedge.  ``(sym.nk_tot, …)`` → ``(sym.nk_red, …)``.
+
+    Selects the rows that ARE ``wfn.kpoints`` — the k-set every ``.dat``
+    output is indexed by — so a writer can reduce without ever holding
+    ``kirr_fullids``.  Pure row selection: no conjugation, no symmetry
+    operation, nothing to get the wrong way round.
+
+    NOT THE EXACT INVERSE of :func:`unfold_file_wedge_to_full_bz`, and the
+    asymmetry is real rather than an oversight.  This keeps one row per
+    STORED k; the unfold rebuilds every full-BZ k from its ORBIT PARENT.
+    Where the WFN carries two k in the same orbit — ``cohsex_debug``, where
+    file wedge row 1 is the time-reverse of row 2 — the round trip
+    reduce→unfold replaces row 1's own stored values with ``conj`` of row
+    2's.  Self-consistent, and correct if the two really are TRS partners,
+    but it is not the identity and must not be assumed to be.
+
+    There is deliberately no ``reduce_full_bz_to_star_wedge``: that is
+    :func:`star_select`, which already exists and returns the labels the
+    star round trip needs.
+    """
+    rows = np.asarray(sym.kirr_fullids, dtype=np.int32)
+    return _take_rows(data, rows)
+
+
+def unfold_star_wedge_to_full_bz(sym, data):
     """STAR wedge → full BZ.  ``(n_orbits, …)`` → ``(sym.nk_tot, …)``.
 
     The wedge :func:`star_select` produces — one row per symmetry orbit,
@@ -2445,10 +2460,7 @@ def unfold_star_wedge_to_full_bz(sym, data, *, axis=0):
     coincide on the third.
     """
     irr, sidx, nss = _star_tables_of(sym)
-    if axis:
-        data = _moveaxis_like(data, axis, 0)
-    out = star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
-    return _moveaxis_like(out, 0, axis) if axis else out
+    return star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
 
 
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):

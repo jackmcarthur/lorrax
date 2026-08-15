@@ -72,6 +72,11 @@ The surface
     would have been right on the deck most gates run and silently wrong
     elsewhere.  Both are thin wrappers over ONE backend
     (``star_broadcast``); a THIRD means the parameterisation is wrong.
+``reduce_full_bz_to_file_wedge``
+    The one reduction: full BZ → the rows that ARE ``wfn.kpoints``, so a
+    writer never holds ``kirr_fullids``.  Pure selection.  NOT the exact
+    inverse of the file-wedge unfold — see its docstring.  There is no
+    star-wedge twin because that is ``star_select``.
 ``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
 ``slice_q_full_to_ibz``
     The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
@@ -167,6 +172,7 @@ from symmetry_maps.maps import (
     kgrid_shift_map,
     slice_q_full_to_ibz,
     star_broadcast,
+    reduce_full_bz_to_file_wedge,
     unfold_file_wedge_to_full_bz,
     unfold_star_wedge_to_full_bz,
     star_select,
@@ -230,6 +236,7 @@ __all__ = [
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
+    "reduce_full_bz_to_file_wedge",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "mix_channels_by_proper_rotation",
