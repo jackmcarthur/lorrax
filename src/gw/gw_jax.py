@@ -766,8 +766,7 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
-			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
-			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
+			sym=sym,
 			e_eval_ev=e_eval_ev,
 			print_fn=print0,
 		)
@@ -796,17 +795,11 @@ def main(argv=None):
 			eqp0_file=config.paths.eqp0_file,
 			eqp1_file=config.paths.eqp1_file,
 			input_dir=input_dir,
-			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
 			kgrid=meta.kgrid,
-			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
-			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
-			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
-			# The service's star table (full-BZ k -> its wedge parent).
-			# Only the star-spread diagnostic uses it, and only because
-			# that number has to be measured on the full BZ before the
-			# writers reduce to the wedge — see
-			# ``gw_output._star_spread_of_sigma_diag``.
-			k_star_labels=np.array(sym.irr_idx_k, dtype=np.int32),
+			# THE symmetry object, not tables off it.  Every k-basis
+			# decision is made where the data is written, through
+			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
+			sym=sym,
 			write_qp_rotations=not rotations_written,
 			print_fn=print0,
 		)

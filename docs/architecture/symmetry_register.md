@@ -210,6 +210,24 @@ gives `[0, 2, 0, 2, 2, 2, 0, 0, 0]`. The companion property
 stated reason wrong — but nothing should be built on the identity claim until
 someone establishes which.
 
+### A test that pins the FIXTURE CORPUS, not the code
+
+`test_at_least_one_fixture_has_the_two_wedges_coinciding_and_one_not` asserts
+that the tree contains **both** a deck where the two wedges coincide
+(`si_cohsex_debug`, 8 = 8) and one where they diverge (`cohsex_debug` 4 vs 3,
+`gnppm_debug` 9 vs 5). It is unusual: it constrains the test corpus rather than
+any behaviour.
+
+It has to. If every deck diverged, conflating the two wedges would always raise
+and nobody would need two names. If every deck coincided, it would never raise
+and the bug would be permanently silent. The distinction is only testable
+because the tree happens to contain both cases.
+
+**Anyone pruning fixtures: removing `cohsex_debug` or `gnppm_debug` silently
+disarms every check of the two-wedge distinction** — including the
+reduce/unfold asymmetry cell, which needs a deck where a stored k is the
+time-reverse of another. That is what this cell exists to say out loud.
+
 ## PRINCIPLE: a self-consistency check cannot detect a uniform error
 
 **No check that asks "is this array consistent with itself under the symmetry
