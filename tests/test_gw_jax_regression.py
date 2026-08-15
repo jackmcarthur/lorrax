@@ -232,11 +232,20 @@ _BGW_TOL = {
 }
 
 # Symmetry-equivalent k MUST carry identical Σ.  MEASURED 2.611 meV on the
-# production deck — NOT zero, because centroids_frac_960.txt is a literal
-# (non-orbit-closed) point set, so the ISDF quadrature itself breaks the
-# 48-op point group.  The fast deck's orbit-closed 144-point set measures
-# exactly 0.000.  Gated loosely here to pin the known value without
-# pretending it is clean; see README.md "Known defects".
+# production deck over the 16 bands this fixture compares — NOT zero.
+#
+# THE CAUSE IS NOT KNOWN, and specifically it is NOT the centroid set's
+# non-closure, which is what this comment used to assert.  MEASURED
+# 2026-08-15: an orbit-closed 960-point set for the same deck
+# (centroids_frac_960_orbitclosed.txt, closed=True at 1.000e-06 on 48 ops)
+# moves this number only 2.611 -> 1.964 meV, while making agreement with
+# BerkeleyGW ~35x WORSE (sigTOT MAE 0.4329 -> 14.9426 meV).  The fast
+# deck's 144-point set measures exactly 0.000, so the spread tracks
+# centroid COUNT rather than closure; rank truncation in the zeta fit at
+# 960 is the untested suspect.  Full table in tests/KNOWN_FAILURES.md.
+#
+# Gated loosely here to pin the known value without pretending it is
+# clean; see README.md "Known defects".
 _BGW_STAR_SPREAD_MAX_MEV = 5.0
 
 
