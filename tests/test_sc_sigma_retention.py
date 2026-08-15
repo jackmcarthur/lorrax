@@ -149,7 +149,14 @@ def test_per_map_files_are_output_diagnostics_not_final_eqp_math():
     assert "assemble_eqp" not in body
     assert "output_candidate_active_scissor" in body
     assert "input_tail_scissor" in body
-    assert "kirr_fullids" in body
+    # The rows are the FILE wedge (wfn.kpoints), like every other .dat.
+    # This used to assert ``"kirr_fullids" in body`` — the same fact
+    # spelled as the index table the writer gathered by.  It now goes
+    # through the service instead (2026-08-15): the table itself is the
+    # service's business, and under ``sc_on_ibz`` the loop's own rows are
+    # the STAR wedge, which is a different length (5 vs 9 on gnppm_debug).
+    # See tests/test_sc_on_ibz_wedges.py.
+    assert "reduce_full_bz_to_file_wedge" in body
 
 
 def test_history_and_fixed_head_serial_writes_are_rank_gated():
