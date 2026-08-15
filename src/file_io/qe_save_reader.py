@@ -342,71 +342,70 @@ def _reduce_mp_to_ibz(
     sym_matrices: np.ndarray,
     time_reversal: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Gamma-centred MP grid reduced to IBZ (reproduces QE kpoint_grid.f90).
+    """Gamma-centred MP grid reduced to the IBZ, THROUGH THE SYMMETRY SERVICE.
 
-    Algorithm:
-      1. Enumerate grid with direction 3 cycling fastest (QE loop order)
-      2. For each k, apply all symmetries S (and optionally -S for TR)
-      3. Forward-only equivalence: mark n_equiv > nk as equivalent
-      4. Extract IBZ in discovery order with accumulated weights
+    Returns ``(kpoints (n_ibz, 3) in [-0.5, 0.5), weights summing to 1)``,
+    the pair QE's ``kpoint_grid.f90`` produces and this module's two
+    consumers (``psp.run_nscf``, ``psp.kpm_dos``) want.
+
+    WHAT THIS REPLACED.  A 70-line reimplementation of the orbit
+    reduction: enumerate the grid, apply every symmetry (and ``-S`` for
+    time reversal) to every k, snap to the grid with ``_EPS = 1e-5``,
+    mark forward-only equivalence, accumulate weights.  That is exactly
+    :func:`symmetry_maps.find_irreducible_bz_points`, which does the same
+    job in INTEGER kgrid coordinates — so with no tolerance at all — and
+    additionally returns the orbit map this one built and threw away.
+
+    THE TRANSPOSE CONVENTION WAS MEASURED, NOT ASSUMED.  The old code
+    applied ``S @ k`` on the raw QE/BGW rotation matrices, while
+    ``SymMaps`` builds its k-space table as ``sym_matrices.transpose(0,2,1)``
+    — different operations, and the docstrings alone do not settle which
+    this grid wants.  Checked against the old implementation on the
+    committed fixtures: on ``si_cohsex_debug`` (4x4x4, 48 ops, 8 IBZ
+    points) the AS-STORED matrices reproduce it exactly and the
+    transposed ones do not (k differ by 2.5e-01); on the 2-op
+    ``gnppm_debug`` deck both agree, which is why the high-symmetry deck
+    is the one that decides.  ``tests/test_unfold_through_the_service.py``
+    carries that comparison so the convention cannot drift back.
+
+    ``sym_matrices`` arrives already filtered by :meth:`build_kgrid` for
+    ``nosym`` / ``no_t_rev`` / ``force_symmorphic``; the service function
+    has no such flags and must not grow any — the filtering is a QE
+    input-semantics question, not a symmetry-algebra one.
     """
-    nk1, nk2, nk3 = int(nk[0]), int(nk[1]), int(nk[2])
-    nkr = nk1 * nk2 * nk3
-    nsym = sym_matrices.shape[0]
-    _EPS = 1e-5
+    # Lazily imported: ``symmetry_maps`` pulls jax, and this module is
+    # otherwise a plain QE-XML/HDF5 reader that a caller may import
+    # without a device stack.
+    from symmetry_maps import find_irreducible_bz_points
 
-    # Phase 1: full grid in crystal coords (QE loop order)
-    xkg = np.empty((nkr, 3))
-    for i in range(nk1):
-        for j in range(nk2):
-            for k in range(nk3):
-                n = k + j * nk3 + i * nk2 * nk3
-                xkg[n] = [i / nk1, j / nk2, k / nk3]
+    kg = np.asarray(nk, dtype=int).reshape(3)
+    S = np.asarray(sym_matrices, dtype=np.int32)
+    # TRS enters as the augmented ``[S, -S]`` table the service documents,
+    # which is what the old per-symmetry ``-S`` variant amounted to.
+    sym_k = np.concatenate([S, -S]) if time_reversal else S
 
-    # Phase 2: forward-only equivalence marking
-    equiv = np.arange(nkr, dtype=int)
-    wkk = np.ones(nkr)
+    # Full grid in integer kgrid coords, C-order (k3 fastest) — the same
+    # enumeration QE uses and the same one the service infers its grid
+    # from (it takes ``full.max(axis=0) + 1``, so every axis maximum must
+    # appear, which a complete enumeration guarantees).
+    full_int = np.array(
+        [[i, j, k]
+         for i in range(kg[0]) for j in range(kg[1]) for k in range(kg[2])],
+        dtype=np.int32)
 
-    for nk_idx in range(nkr):
-        if equiv[nk_idx] != nk_idx:
-            continue
-        for ns in range(nsym):
-            xkr = sym_matrices[ns] @ xkg[nk_idx]
-            xkr -= np.round(xkr)
+    irr_idx, _sym_idx, irr_int = find_irreducible_bz_points(
+        full_int, sym_k, irr_kgrid_int=None)
 
-            variants = [xkr.copy()]
-            if time_reversal:
-                neg = -xkr.copy()
-                neg -= np.round(neg)
-                variants.append(neg)
+    # Integer kgrid coords -> crystal fractions in [-0.5, 0.5), the range
+    # QE returns and both consumers assume.
+    kpoints = irr_int.astype(np.float64) / kg[None, :]
+    kpoints -= np.rint(kpoints)
 
-            for xk_test in variants:
-                xx = xk_test[0] * nk1
-                yy = xk_test[1] * nk2
-                zz = xk_test[2] * nk3
-                if (abs(xx - round(xx)) > _EPS or
-                    abs(yy - round(yy)) > _EPS or
-                    abs(zz - round(zz)) > _EPS):
-                    continue
-                i = round(xx) % nk1
-                j = round(yy) % nk2
-                k = round(zz) % nk3
-                n_eq = k + j * nk3 + i * nk2 * nk3
-                if n_eq > nk_idx and equiv[n_eq] == n_eq:
-                    equiv[n_eq] = nk_idx
-                    wkk[nk_idx] += 1.0
-
-    # Phase 3: extract IBZ in discovery order
-    ibz_k, ibz_w = [], []
-    for nk_idx in range(nkr):
-        if equiv[nk_idx] == nk_idx:
-            kpt = xkg[nk_idx] - np.round(xkg[nk_idx])
-            ibz_k.append(kpt)
-            ibz_w.append(wkk[nk_idx])
-
-    kpoints = np.array(ibz_k)
-    weights = np.array(ibz_w)
-    weights /= weights.sum()
-    return kpoints, weights
-
-
+    # The weights ARE the orbit sizes — the quantity the old code
+    # accumulated by hand and the service hands back for free.
+    counts = np.bincount(irr_idx, minlength=irr_int.shape[0]).astype(np.float64)
+    if int(counts.sum()) != full_int.shape[0]:
+        raise RuntimeError(
+            f"IBZ orbits cover {int(counts.sum())} of {full_int.shape[0]} "
+            f"grid points — the reduction dropped or double-counted k.")
+    return kpoints, counts / counts.sum()

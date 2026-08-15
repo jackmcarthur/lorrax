@@ -258,17 +258,21 @@ def test_sigma_diag_refuses_a_k_list_from_the_other_basis(
 #  write_results — the seam where the two bases are actually chosen
 # ===========================================================================
 
-def test_write_results_puts_eqp_on_the_wedge_and_the_rest_on_the_full_bz(
-        tmp_path):
+def test_write_results_puts_every_text_file_on_the_wedge(tmp_path):
     """THE cell: the driver's own writer, on a deck where 8 != 64.
 
     Everything above tests a writer in isolation, which cannot see the
     mistake that actually happened — the CALLER handing a full-BZ k-list
-    and full-BZ Sigma to the eqp writer.  This drives
+    and full-BZ Sigma to a writer.  This drives
     ``gw_output.write_results`` end to end with ``nk_full=64`` and
     ``nk_irr=8`` and checks all three files at once, by coordinate AND
     by value: ``E_DFT`` is k-tagged, so "it took the first 8 rows" and
     "it took the right 8 rows" are distinguishable.
+
+    Since 2026-08-15 that is ALL of them: ``sigma_diag.dat`` and
+    ``eqp_g0w0.dat`` moved to the wedge with the eqp pair, once
+    ``htransform`` learned to read the wedge and unfold through the
+    symmetry service instead of demanding a pre-unfolded file.
     """
     from common.units import RYD_TO_EV
     from gw.gw_output import GWResults, write_results
@@ -283,6 +287,14 @@ def test_write_results_puts_eqp_on_the_wedge_and_the_rest_on_the_full_bz(
                 + np.arange(nb)[None, :] / 100.0).astype(np.float64)
     zeros = np.zeros((nk_full, nb, nb), dtype=np.complex128)
     eye = np.broadcast_to(np.eye(nb), (nk_full, nb, nb)).copy()
+
+    # Full-BZ k -> its wedge parent.  In a real run this is
+    # ``sym.irr_idx_k``; here every full row is assigned to the last wedge
+    # point at or before it, which is a valid star partition covering all
+    # 64 rows and is all the star-spread statistic needs.
+    star_labels = np.zeros(nk_full, dtype=np.int32)
+    for _i, _kf in enumerate(SI444_IRR_TO_FULL):
+        star_labels[_kf:] = _i
 
     results = GWResults(
         sig_sx=zeros.copy(), sig_coh=zeros.copy(), sig_h=zeros.copy(),
@@ -301,6 +313,7 @@ def test_write_results_puts_eqp_on_the_wedge_and_the_rest_on_the_full_bz(
         kgrid=(4, 4, 4),
         kpoints_irr_frac=wedge,
         kirr_to_kfull=SI444_IRR_TO_FULL,
+        k_star_labels=star_labels,
         write_qp_rotations=False,
         print_fn=lambda *a, **k: None,
     )
@@ -318,13 +331,23 @@ def test_write_results_puts_eqp_on_the_wedge_and_the_rest_on_the_full_bz(
                      f"subset by position, not through kirr_to_kfull "
                      f"({SI444_IRR_TO_FULL.tolist()})"))
 
-    # --- sigma_diag / eqp_g0w0: the full BZ, each block naming its k ---
+    # --- sigma_diag / eqp_g0w0: the WEDGE too, each block naming its k ---
     for name in ("sigma_diag.dat", "eqp_g0w0.dat"):
         kpts, labels = _read_kcrys_blocks(tmp_path / name)
-        assert labels == list(range(nk_full)), (
-            f"{name} has {len(labels)} k-blocks; htransform requires all "
-            f"{nk_full} (htransform.py:1200-1206)")
-        np.testing.assert_allclose(kpts, full, atol=1e-9)
+        assert labels == list(range(8)), (
+            f"{name} has {len(labels)} k-blocks on a deck whose wedge is 8 "
+            f"of {nk_full} — every text file write_results emits is on the "
+            f"wedge now, and a full-BZ file means the unfold came back")
+        np.testing.assert_allclose(kpts, wedge, atol=1e-9)
+
+    # ...and the star-spread diagnostic, which CANNOT be recomputed from a
+    # wedge file, is recorded in the header instead of being lost.
+    hdr = (tmp_path / "sigma_diag.dat").read_text()
+    assert "# star_spread_ev" in hdr, (
+        "sigma_diag.dat carries no star-spread header line.  That number is "
+        "measured upstream on the full BZ; without it the diagnostic dies "
+        "with the wedge move, and recomputing it downstream would report a "
+        "fake 0.000 because unfolding a wedge is a gather.")
 
 
 def test_the_coordinate_line_is_invisible_to_the_block_parsers(tmp_path):
@@ -360,10 +383,19 @@ def test_the_coordinate_line_is_invisible_to_the_block_parsers(tmp_path):
             f"the coordinate line {ln!r} has exactly four tokens, the shape "
             f"six parsers use to mean 'k header' or 'band row'")
 
-    # ...and every k-point header still matches htransform's ANCHORED
-    # regex, i.e. the coordinate did not get appended to it.
+    # ...and every k-BLOCK HEADER still matches the anchored regex, i.e.
+    # the coordinate did not get appended to it.  Comment lines are
+    # excluded: they are invisible to every parser by construction, and
+    # the file's own '# k-basis: ... N k-points' banner contains the
+    # substring without being a header.
+    #
+    # htransform no longer parses this layout at all (it reads the BGW
+    # columnar eqp file now), but the regex is kept as the STRICTEST
+    # header matcher known to have been pointed at these files, so the
+    # format stays compatible with any out-of-tree parser written
+    # against it.
     headers = [ln for ln in out.read_text().splitlines()
-               if "k-point" in ln]
+               if "k-point" in ln and not ln.startswith("#")]
     assert headers
     for ln in headers:
         assert ht_header.match(ln) is not None, (
