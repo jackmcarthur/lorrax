@@ -35,12 +35,22 @@ import pytest
 
 _SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 
-#: The service's single adapter over ``symmetry_maps.star_broadcast``.
-#: ``tests/test_kin_ion_star_broadcast.py`` pins that the adapter itself
-#: holds exactly one ``star_broadcast`` call with the ``ibz_slab``
-#: predicate; these cells pin that the drivers reach the unfold THROUGH
-#: it rather than around it.
-_ADAPTER = "broadcast_ibz_to_full_bz"
+#: The names a driver may reach the unfold through.  All route to ONE
+#: backend (``symmetry_maps.star_broadcast``);
+#: ``tests/test_kin_ion_star_broadcast.py`` pins that the file-table
+#: adapter holds exactly one ``star_broadcast`` call with the ``ibz_slab``
+#: predicate.  These cells pin that the drivers reach the unfold THROUGH
+#: one of them rather than around it.
+#:
+#: The two ``unfold_*_wedge_to_full_bz`` names exist because there are two
+#: different IBZs and they are NOT the same size — file wedge
+#: (``wfn.kpoints``) vs star wedge (``star_select``): 8 = 8 on
+#: si_cohsex_debug but 4 vs 3 on cohsex_debug and 9 vs 5 on gnppm_debug.
+_ADAPTERS = {
+    "broadcast_ibz_to_full_bz",          # file-table path (kin_ion read)
+    "unfold_file_wedge_to_full_bz",      # live SymMaps, file wedge
+    "unfold_star_wedge_to_full_bz",      # live SymMaps, star wedge
+}
 
 _UNFOLDERS = [
     ("bandstructure/htransform.py", "read_eqp_energies"),
@@ -86,11 +96,11 @@ def test_the_unfold_is_delegated_to_the_service_adapter(relpath, name):
          getattr(c.func, "attr", None))
         for c in ast.walk(fn) if isinstance(c, ast.Call)
     }
-    assert _ADAPTER in called, (
-        f"{relpath}::{name} no longer calls {_ADAPTER}.  If it now reaches "
-        f"the full BZ some other way, that way is a second unfold: the "
-        f"time-reversal rule and the star row order live in the service, "
-        f"and a driver-local copy is what this cell exists to prevent.")
+    assert called & _ADAPTERS, (
+        f"{relpath}::{name} reaches the full BZ without any of {_ADAPTERS}. "
+        f"If it now does so some other way, that way is a second unfold: "
+        f"the time-reversal rule and the star row order live in the "
+        f"service, and a driver-local copy is what this cell prevents.")
 
 
 @pytest.mark.parametrize("relpath,name", _UNFOLDERS)
@@ -636,3 +646,68 @@ def test_every_call_site_in_the_tree_states_its_flavour():
         + ", ".join(missing)
         + ".  Which predicate applies depends on where the operand came "
           "from, and the wrong one is invisible to every diagonal check.")
+
+
+# ===========================================================================
+#  The two wedges — why there are two named unfolds and not one
+# ===========================================================================
+
+_DECK_WEDGES = [
+    # (deck, WFN name, file wedge nk_red, star wedge n_orbits)
+    ("si_cohsex_debug", "WFN.h5", 8, 8),      # COINCIDE — the deck most gates run
+    ("cohsex_debug", "WFNsmall.h5", 4, 3),    # diverge
+    ("gnppm_debug", "WFN.h5", 9, 5),          # diverge
+]
+
+
+@pytest.mark.parametrize("deck,wfn_name,nk_red,n_orbits", _DECK_WEDGES)
+def test_the_file_wedge_and_the_star_wedge_are_different_objects(
+        deck, wfn_name, nk_red, n_orbits):
+    """MEASURED sizes, pinned per deck — the reason for two named unfolds.
+
+    The FILE wedge is ``wfn.kpoints`` (``sym.nk_red``), what every ``.dat``
+    is indexed by and what BerkeleyGW means by the IBZ.  The STAR wedge is
+    what ``star_select`` keeps, one row per orbit.
+
+    They COINCIDE on ``si_cohsex_debug`` and diverge on the other two.  A
+    single ``unfold_ibz_to_full_bz`` would therefore have been correct on
+    the deck most gates run and silently wrong elsewhere — where the
+    lengths differ a mistake raises, where they coincide it does not.
+    This cell fails if that stops being true, i.e. if the fixtures stop
+    covering both cases.
+    """
+    import os
+    reg = _SRC.parent / "tests" / "regression" / deck
+    wfn_path = reg / wfn_name
+    if not wfn_path.exists():
+        pytest.skip(f"{deck}/{wfn_name} not in this tree")
+    try:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import SymMaps
+        from wfn_loader import WfnLoader
+    except Exception as exc:                                    # noqa: BLE001
+        pytest.skip(f"loader/service unavailable here ({type(exc).__name__})")
+
+    sym = SymMaps(WfnLoader(str(wfn_path)))
+    got_file = int(sym.nk_red)
+    got_star = len(set(np.asarray(sym.irr_idx_k).tolist()))
+    assert (got_file, got_star) == (nk_red, n_orbits), (
+        f"{deck}: file wedge {got_file} (expected {nk_red}), star wedge "
+        f"{got_star} (expected {n_orbits}).  These two sizes are what make "
+        f"two named unfolds necessary; if they moved, re-read the register "
+        f"before collapsing them.")
+
+
+def test_at_least_one_fixture_has_the_two_wedges_coinciding_and_one_not():
+    """The fixture set must cover BOTH cases or the distinction is untested.
+
+    If every deck diverged, a conflating bug would always raise and nobody
+    would need two names.  If every deck coincided, it would never raise
+    and the bug would be permanently silent.  The tree has both, and that
+    is what makes this testable at all.
+    """
+    coincide = [d for d, _, a, b in _DECK_WEDGES if a == b]
+    diverge = [d for d, _, a, b in _DECK_WEDGES if a != b]
+    assert coincide and diverge, (
+        f"fixtures cover only one case: coincide={coincide} diverge={diverge}")

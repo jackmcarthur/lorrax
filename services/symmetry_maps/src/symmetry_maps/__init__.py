@@ -61,6 +61,17 @@ The surface
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
+``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz``
+    THE TWO NAMED UNFOLDS, taking a ``SymMaps`` rather than index tables
+    so a driver never holds one.  TWO, because there are two different
+    IBZs and they are NOT the same size: the FILE wedge (``wfn.kpoints``,
+    ``nk_red``, what every .dat is indexed by and what BerkeleyGW means)
+    and the STAR wedge (``star_select``'s, one row per orbit).  Measured,
+    they coincide on ``si_cohsex_debug`` (8 = 8) and diverge on
+    ``cohsex_debug`` (4 vs 3) and ``gnppm_debug`` (9 vs 5) — so ONE name
+    would have been right on the deck most gates run and silently wrong
+    elsewhere.  Both are thin wrappers over ONE backend
+    (``star_broadcast``); a THIRD means the parameterisation is wrong.
 ``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
 ``slice_q_full_to_ibz``
     The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
@@ -156,6 +167,8 @@ from symmetry_maps.maps import (
     kgrid_shift_map,
     slice_q_full_to_ibz,
     star_broadcast,
+    unfold_file_wedge_to_full_bz,
+    unfold_star_wedge_to_full_bz,
     star_select,
     star_spread,
     tau_phase_row,
@@ -216,6 +229,7 @@ __all__ = [
     "SymMaps", "kgrid_shift_map", "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
+    "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "mix_channels_by_proper_rotation",

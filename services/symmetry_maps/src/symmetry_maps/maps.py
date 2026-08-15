@@ -2369,6 +2369,88 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     return _broadcast_rows(A_irr, take, conj)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# THE TWO NAMED UNFOLDS.  Two operations, ONE backend.
+# ─────────────────────────────────────────────────────────────────────────
+# There are two different IBZs in this tree and they are not the same size
+# (docs/architecture/symmetry_register.md, "THERE ARE TWO DIFFERENT IBZs"):
+#
+#   file wedge  — ``wfn.kpoints``, length ``sym.nk_red``, addressed by
+#                 ``kirr_fullids``.  What every .dat output is indexed by
+#                 and what BerkeleyGW means by the IBZ.
+#   star wedge  — what :func:`star_select` keeps, one row per orbit.
+#
+# MEASURED: they coincide on ``si_cohsex_debug`` (8 = 8) and diverge on
+# ``cohsex_debug`` (4 vs 3) and ``gnppm_debug`` (9 vs 5).  A single
+# ``unfold_ibz_to_full_bz`` would therefore be correct on the deck most
+# gates run and silently wrong on the others — so there are two names, and
+# the call site says which without the reader needing to know what
+# ``trs_reference`` means.
+#
+# They are thin wrappers over ONE backend (:func:`star_broadcast`), which
+# is what keeps a future spinor-rotation or bispinor upgrade a one-place
+# change.  Resist making this four: a THIRD unfold means the
+# parameterisation is wrong, not that another name is needed.
+
+def _star_tables_of(sym):
+    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` off a live ``SymMaps``.
+
+    ``n_sym_spatial`` is derived from ``sym_mats_k`` (always ``2·ntran``
+    in both SymMaps branches) rather than read from the WFN header,
+    because that is the derivation :func:`unfold_psi` uses to decide which
+    rows get conjugated when it BUILDS ψ(Sk).  Reading it from the header
+    instead lets the producer and the consumer of that convention drift.
+    """
+    return (np.asarray(sym.irr_idx_k, dtype=np.int32),
+            np.asarray(sym.sym_idx_k, dtype=np.int32),
+            int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
+
+
+def _moveaxis_like(a, src, dst):
+    """``moveaxis`` that keeps a device array on its device."""
+    if isinstance(a, np.ndarray):
+        return np.moveaxis(a, src, dst)
+    return jnp.moveaxis(a, src, dst)
+
+
+def unfold_file_wedge_to_full_bz(sym, data, *, axis=0):
+    """FILE wedge → full BZ.  ``(sym.nk_red, …)`` → ``(sym.nk_tot, …)``.
+
+    The wedge as the WFN stores it — ``wfn.kpoints``, the k-set every
+    ``.dat`` output is indexed by and what BerkeleyGW calls the IBZ.  Use
+    this for anything read off disk in that indexing: ``eqp{0,1}.dat``,
+    ``sigma_diag.dat``, a ``kin_ion.h5`` slab.
+
+    Takes the ``SymMaps`` itself, not index tables: the tables are the
+    service's business and a driver that holds one has already lost the
+    abstraction.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    if axis:
+        data = _moveaxis_like(data, axis, 0)
+    out = star_broadcast(data, irr, sidx, nss, trs_reference="ibz_slab")
+    return _moveaxis_like(out, 0, axis) if axis else out
+
+
+def unfold_star_wedge_to_full_bz(sym, data, *, axis=0):
+    """STAR wedge → full BZ.  ``(n_orbits, …)`` → ``(sym.nk_tot, …)``.
+
+    The wedge :func:`star_select` produces — one row per symmetry orbit,
+    each row a FULL-BZ row carrying a ``sym_idx`` of its own.  Use this
+    for the round trip ``unfold_star_wedge_to_full_bz(sym,
+    star_select(A_full, sym.irr_idx_k)[0])``, which is the identity.
+
+    NOT interchangeable with :func:`unfold_file_wedge_to_full_bz`: the two
+    wedges differ in LENGTH on two of the three committed decks, and
+    coincide on the third.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    if axis:
+        data = _moveaxis_like(data, axis, 0)
+    out = star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
+    return _moveaxis_like(out, 0, axis) if axis else out
+
+
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
     """max residual of ``A_full`` against its own star, by the right rule.
 
