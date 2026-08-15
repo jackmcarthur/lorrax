@@ -60,10 +60,11 @@ def test_unknown_material_class_is_a_parse_error(tmp_path):
 
 
 def test_metal_evaluator_refuses_before_creating_output(tmp_path):
+    # The blanket capability gate is discharged; the entry now refuses a
+    # metal plan without an OccupationState, still before any inode exists.
     config = _config(tmp_path, _METAL_KEYS)
     run_dir = tmp_path / "must_not_exist"
-    with pytest.raises(
-            NotImplementedError, match="mpa_metal_evaluator_unavailable"):
+    with pytest.raises(ValueError, match="mpa_metal_needs_occupations"):
         model.build_mpa_fit(
             run_dir, "metal", wfns=None, V_q=None, quad=None, sym=None,
             centroid_indices=None, head_resolver=None, config=config,

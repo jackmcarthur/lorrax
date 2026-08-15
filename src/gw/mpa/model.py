@@ -93,6 +93,7 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z):
 
 def _fit_head_samples(
     fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model,
+    occupation_state=None,
 ):
     """Fit scalar Wc_head on the body's exact complex-frequency grid."""
     wc = np.asarray([
@@ -116,7 +117,8 @@ def _fit_head_samples(
         fit_condition=fitted["condition"],
         fit_backward_error=fitted["backward_error"],
         fit_max_abs_residual=fitted["max_abs_residual"],
-        grid_hash=grid_hash, fit_provenance=provenance, model=model)
+        grid_hash=grid_hash, fit_provenance=provenance, model=model,
+        occupation_state=occupation_state)
 
 
 def _solve_wc(
@@ -223,6 +225,18 @@ def _metal_kminq_rows(sym, q_idx):
     return rows
 
 
+def _require_metal_occupations(config, occupation_state):
+    """One owner of the metal-needs-occupations refusal (two gates pin it:
+    the build_mpa_fit entry, before any inode exists, and the
+    _evaluate_samples seam for direct callers)."""
+    if config.mpa.material_class != "insulator" and occupation_state is None:
+        raise ValueError(
+            "GATE mpa_metal_needs_occupations: a metal MPA plan requires "
+            "occupation_state (gw.efermi.OccupationState); got None. "
+            "FALSE case: material_class == 'insulator', or an "
+            "OccupationState was passed.")
+
+
 def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
     energy_reference, occupation_state, write_full, write_wedge,
@@ -251,12 +265,7 @@ def _evaluate_samples(
     )
 
     metal = config.mpa.material_class != "insulator"
-    if metal and occupation_state is None:
-        raise ValueError(
-            "GATE mpa_metal_needs_occupations: a metal MPA plan requires "
-            "occupation_state (gw.efermi.OccupationState); got None. "
-            "FALSE case: material_class == 'insulator', or an "
-            "OccupationState was passed.")
+    _require_metal_occupations(config, occupation_state)
     omega_m = float(quad.x_max)
     if metal:
         delta_max = occupation_support_bandwidth(
@@ -341,14 +350,14 @@ def build_mpa_fit(
     occupation_state=None, print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head."""
-    if config.mpa.material_class != "insulator":
-        raise NotImplementedError(
-            "GATE mpa_metal_evaluator_unavailable: the configured metallic "
-            "double-parallel sample plan is available through "
-            "config.mpa.sample_plan(omega_m_ry), but build_mpa_fit cannot "
-            "evaluate it until occupation-weighted interband/intraband chi "
-            "and Sigma branches land. FALSE case: "
-            "config.mpa.material_class == 'insulator'.")
+    # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
+    # discharged: occupation-weighted chi (fractional contour + finite-q
+    # divided difference) and the weighted Sigma branches landed in Wave 1.
+    # A metal plan still refuses without an OccupationState — here, before
+    # any inode exists, and again at the _evaluate_samples seam.  The
+    # driver-level UNIMPLEMENTED_MODES row gates the deck path until the
+    # E2E claim.
+    _require_metal_occupations(config, occupation_state)
     from common.collectives import barrier, process_rank
 
     root = os.path.abspath(os.fspath(run_dir))
@@ -454,6 +463,7 @@ def build_mpa_fit(
         fit_ledger["w_grid_hash"],
         mesh_xy,
         model=head_model,
+        occupation_state=occupation_state,
     )
     print_fn(fit_driver.format_cost_report(report))
     return fit_path, iteration_head

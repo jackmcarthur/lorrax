@@ -671,10 +671,16 @@ def compute_sigma_xc(
             # one iteration, which is exactly what this refuses.
             mpa_store.assert_occupation_stamps(
                 fit_path, occupation_state, where="MPA Sigma head/body fit")
+        # One chemical potential per iteration: the metal reference is the
+        # state's fixed-N mu, never the loader's midgap/VBM efermi.
+        sigma_efermi_ry = (float(occupation_state.mu_ry)
+                           if occupation_state is not None
+                           else float(wfn.efermi))
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
-            efermi_ry=float(wfn.efermi),
+            efermi_ry=sigma_efermi_ry,
+            occupation_state=occupation_state,
             regularization_width_ry=(
                 float(config.sigma.regularization_ev) / RYD_TO_EV),
             edge_factor=float(config.sigma.window_edge_factor),
@@ -688,11 +694,16 @@ def compute_sigma_xc(
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+        # One occupation state per iteration: head fit vs body (skips when
+        # occupation_state is None; refuses an unstamped head under metal).
+        from .mpa.sigma import assert_head_body_occupation_match
+        assert_head_body_occupation_match(
+            head.get("occupation_stamps") or {}, occupation_state)
         if iteration_head is None:
             sigma_bands = wfns.slices.sigma
             head_enk = np.asarray(wfns.enk[:, sigma_bands])
             head_occ = np.asarray(wfns.occ[:, sigma_bands])
-            head_efermi = float(wfn.efermi)
+            head_efermi = sigma_efermi_ry
         else:
             head_enk = np.asarray(iteration_head.sigma_energies_ry)
             head_occ = np.asarray(iteration_head.sigma_occupations)

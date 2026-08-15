@@ -707,6 +707,7 @@ def compute_screening_model(
     head_channel=None,
     mpa_plan=None,
     iteration_head_response=None,
+    occupation_state=None,
     static_only=False,
     print_fn=print,
 ):
@@ -730,6 +731,7 @@ def compute_screening_model(
             config=config, meta=meta, mesh_xy=mesh_xy,
             energy_reference=e_ref, plan=mpa_plan,
             iteration_head_response=iteration_head_response,
+            occupation_state=occupation_state,
             print_fn=print_fn)
         result = {"mpa_fit": fit_path}
         if iteration_head is not None:

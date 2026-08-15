@@ -2052,6 +2052,7 @@ def write_head_fit_collective(
     grid_hash,
     fit_provenance,
     model="multipole",
+    occupation_state=None,
 ):
     """Collectively publish one tiny scalar head fit through SlabIO."""
     from common.collectives import barrier, process_rank
@@ -2103,6 +2104,8 @@ def write_head_fit_collective(
                 head.attrs[key] = value
             for key, value in sorted(dict(fit_provenance).items()):
                 head.attrs["fit_" + str(key)] = value
+            if occupation_state is not None:
+                stamp_occupation_provenance(head, occupation_state)
     barrier("mpa_head_metadata_allocated")
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         prefix = MPA_HEAD_SUFFIX + "/"
@@ -2136,6 +2139,12 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
         source_unit = _qs().qirr_attr_str(head, "frequency_unit")
         model = _qs().qirr_attr_str(head, "model")
         grid_hash = _qs().qirr_attr_str(head, "mpa_grid_hash")
+        occupation_stamps = None
+        if ("mpa_" + _OCC_STAMP_ORDER[0]) in head.attrs:
+            occupation_stamps = {
+                "occ_hash": _qs().qirr_attr_str(head, "mpa_occ_hash"),
+                "mu_ry": float(head.attrs["mpa_mu_ry"]),
+            }
         diagnostics = {
             key: float(head.attrs[key])
             for key in (
@@ -2200,6 +2209,7 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
         "diagnostics": diagnostics,
         "provenance": provenance,
         "model": model,
+        "occupation_stamps": occupation_stamps,
         "ready": True,
     }
 

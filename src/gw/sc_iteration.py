@@ -181,9 +181,10 @@ class SCState:
     fixed-N μ, family, width, hash) plus its derived tetrahedron
     Fermi-surface table: iteration i's first-half consumers read the values
     produced only at the END of iteration i-1.  They are deliberately not
-    installed in the wavefunction bundle, so Green's functions and finite-q
-    screening keep their historical occupations until their metallic
-    formulations land (WAVE2 wiring points below name the hand-off sites).
+    installed in the wavefunction bundle: under mpa_material_class = metal
+    the state is threaded explicitly into screening (build_mpa_fit) and
+    Sigma (compute_sigma_xc); insulating decks pass None and keep the
+    historical occupations bit-exactly.
 
     ``outputs`` (an ``SCOutputs`` record) is purely for the final output
     writers; it does not feed the next iteration.  Its ``sigma_basis_U``
@@ -1407,8 +1408,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
-    # WAVE2: pass occupation_state here (state.occupation_state → chi body
-    # via compute_screening_model → build_mpa_fit; signature lands with I1).
+    # Metal-only threading: the insulating routes stay on the None branch
+    # (bit-exact bool selectors) even though a step OccupationState is
+    # carried for the head — dormant-behind-material_class by design.
+    metal_occ_state = (state.occupation_state
+                       if _material_class(inputs) == "metal" else None)
     W_by_role = compute_screening_model(
         inputs.config.compute_mode, wfns_qp, inputs.V_q,
         quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
@@ -1421,6 +1425,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         wfn=inputs.wfn,
         mpa_plan=mpa_plan,
         iteration_head_response=iteration_head_response,
+        occupation_state=metal_occ_state,
         print_fn=inputs.print_fn)
 
     # MPA owns a shared complex-frequency model rather than the finite role
@@ -1461,19 +1466,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 nk_tot=int(inputs.meta.nk_tot),
             )
 
-    # TODO(metal-screening): W_body above still uses the historical minimax
-    # valence/conduction band cut.  Only the q->0 response uses the
-    # carried MP1 occupations in this change; finite-q chi0 stays untouched.
+    # Under mpa_material_class = metal the finite-q body above went through
+    # build_mpa_fit(occupation_state=...) — fractional contour lines and the
+    # divided-difference origin rows.  Insulating decks keep the historical
+    # valence/conduction cut (occupation_state=None).
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``
     # so intermediate SC iterations don't thrash sigma_mnk.h5; the
     # converged tensor is written once after run_self_consistency
     # returns (see ``dump_sigma_omega_h5_final``).
-    # WAVE2: pass occupation_state here (state.occupation_state → Σ_x/SX
-    # diag(f), Σ_c branch weights, and the metal E_F reference; signatures
-    # land with I3/I4).
+    # Same metal-only threading as the screening step above: Σ_x/SX
+    # diag(f), Σ_c branch weights, and the metal E_F reference.
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
+        occupation_state=metal_occ_state,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
