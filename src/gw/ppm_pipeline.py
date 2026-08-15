@@ -17,12 +17,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
+from .band_extrapolation import (
+    fit_band_extrapolation,
+    format_extrapolation_report,
+    plan_band_brackets,
+)
 from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
@@ -167,6 +173,89 @@ def _compute_analytic_head_diag(
     return np.asarray(head_sigma_diag_ry)
 
 
+def _band_count_point(cube, i: int):
+    """``cube[i]`` with the TRAILING (ω, k, m, n) sharding preserved.
+
+    The Σ cube's leading axis is the band count and is replicated, so
+    dropping it is shard-local — but ``sigma_omega_layout=sharded``'s whole
+    contract is that consumers read the layout off the array itself
+    (``qsgw_utils.is_band_sharded_sigma_omega``), and a bare ``cube[i]``
+    leaves that to XLA's propagation through a slice+reshape.  Restate it.
+    """
+    sharding = getattr(cube, "sharding", None)
+    if not isinstance(sharding, NamedSharding):
+        return cube[i]
+    spec = tuple(sharding.spec)
+    if len(spec) != int(getattr(cube, "ndim", 0)):
+        return cube[i]
+    out = NamedSharding(sharding.mesh, P(*spec[1:]))
+    return jax.jit(lambda a: a[i], out_shardings=out)(cube)
+
+
+def _report_band_extrapolation(
+    sigma_omega, head_sigma_diag_w_kn_ry, *,
+    plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+) -> None:
+    """Log the three band-count Σ_c's, the fit and its diagnostics.
+
+    Reads the band DIAGONAL of each cumulative point at the SAME external
+    evaluation energy — E_DFT − E_F, on the SAME ω grid — so nothing but the
+    band count differs between the three.  The analytic q→0 head is added to
+    every point identically (it is a band-diagonal ω-dependent term with no
+    unoccupied-state sum, hence bracket-independent), so the reported values
+    are the physical Σ_c rather than the body alone; being a common offset it
+    shifts S_∞ and S₃ together and leaves ``Δ_tail`` unchanged.
+
+    Σ_c only.  Σ_x is a sum over OCCUPIED states and has no slow unoccupied
+    tail; extrapolating Σ_total would fit a constant as if it converged.
+    """
+    from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
+
+    cube = sigma_omega.sigma_c_kij
+    enk_dft, _ = get_enk_bandrange(
+        wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+        nspinor=meta.nspinor)
+    enk_ev = np.asarray(enk_dft) * RYD_TO_EV
+    omega_eval_ev = enk_ev - float(wfn.efermi) * RYD_TO_EV
+    omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    head = (None if head_sigma_diag_w_kn_ry is None
+            else np.asarray(head_sigma_diag_w_kn_ry))
+
+    points = []
+    for i in range(cube.shape[0]):
+        diag_w_kn = np.asarray(
+            extract_sigma_diag_replicated(_band_count_point(cube, i), mesh_xy))
+        if head is not None:
+            diag_w_kn = diag_w_kn + head
+        # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
+        # it, so the reported numbers are in the same unit as every other Σ
+        # line in the log and the formatter needs no scale of its own.
+        points.append(interp_along_omega(
+            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
+    fit = fit_band_extrapolation(sigma_omega.band_counts, np.stack(points))
+
+    # THE STATES A GW RUN IS FOR.  The band edges, located from the actual
+    # eigenvalues over the QP window rather than assumed to sit at index
+    # n_occ-1 / n_occ (spin-orbit doubling and the k-star ordering both move
+    # them).  An aggregate over the whole QP window is reported too, labelled
+    # as the envelope it is: Σ_c at the top of the window is the largest and
+    # least converged quantity in the run, and a max is its number, not the
+    # calculation's.
+    n_occ = int(band_slices.b2 - band_slices.b0)
+    occ, unocc = enk_ev[:, :n_occ], enk_ev[:, n_occ:]
+    states = []
+    if occ.size:
+        kv, nv = np.unravel_index(int(np.argmax(occ)), occ.shape)
+        states.append((f"VBM  k={kv} n={nv}  E={occ[kv, nv]:.4f} eV",
+                       (int(kv), int(nv))))
+    if unocc.size:
+        kc, nc = np.unravel_index(int(np.argmin(unocc)), unocc.shape)
+        states.append((f"CBM  k={kc} n={nc + n_occ}  "
+                       f"E={unocc[kc, nc]:.4f} eV",
+                       (int(kc), int(nc + n_occ))))
+    print_fn(format_extrapolation_report(plan, fit, states=states))
+
+
 def compute_ppm_sigma_pipeline(
     *,
     wfns,
@@ -255,8 +344,28 @@ def compute_ppm_sigma_pipeline(
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
+        #
+        # The band-bracket plan is resolved HERE, once, before anything is
+        # compiled: it fixes the kernel's G-build count, the AOT signature
+        # and the Σ cube's leading extent, so it must be the same object all
+        # three see.  ``sigma_band_extrapolation = false`` (the default)
+        # gives the trivial one-bracket plan and the whole path below is
+        # bit-identical to the un-bracketed code.
+        s = wfns.slices
+        plan = plan_band_brackets(
+            enabled=bool(config.sigma.band_extrapolation),
+            enk_ry=np.asarray(wfns.enk[:, s.full]),
+            n_occ=int(s.b2 - s.b0),
+            nb_logical=int(meta.b_id_4_user or s.b4) - int(s.b0),
+            nb_padded=int(s.nb_full),
+        )
+        if plan.enabled:
+            print_fn(
+                f"  Σc band extrapolation: ON — {plan.n_brackets} disjoint "
+                f"band brackets {plan.bounds} against ONE W(τ) per τ; "
+                f"band counts {plan.counts} (requested {plan.requested}).")
         with timing.section("sigma.compile"):
-            precompile_sigma(wfns, ppm, meta, mesh_xy)
+            precompile_sigma(wfns, ppm, meta, mesh_xy, brackets=plan.bounds)
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -265,9 +374,18 @@ def compute_ppm_sigma_pipeline(
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
                 occupation_state=occupation_state,
+                plan=plan,
                 print_fn=print_fn,
             )
-        sigma_c_body_omega = sigma_omega.sigma_c_kij
+        # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
+        # the leading band-count axis; everything downstream of this line —
+        # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
+        # build — is shared with MPA and COHSEX and is deliberately left at
+        # the shape it has always had.  The last element IS the ordinary
+        # full-band Σ_c (the cumulative sum's final term), so at
+        # n_bracket = 1 this index is the identity.
+        sigma_c_body_omega = _band_count_point(
+            sigma_omega.sigma_c_kij, sigma_omega.sigma_c_kij.shape[0] - 1)
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
@@ -282,6 +400,17 @@ def compute_ppm_sigma_pipeline(
             iteration_head=iteration_head,
             print_fn=print_fn,
         )
+
+        # Step 4: the band-convergence extrapolation report.  After the head,
+        # because the head is part of the Σ_c being reported; before the
+        # return, because the cube's leading axis does not survive it.
+        if plan.enabled:
+            _report_band_extrapolation(
+                sigma_omega, head_sigma_diag_w_kn_ry,
+                plan=plan, config=config, band_slices=band_slices,
+                wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
+                print_fn=print_fn,
+            )
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
