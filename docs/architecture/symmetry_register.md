@@ -183,8 +183,10 @@ For V, W0, ψ and `enk_full` the answer is **no** — their closure is measured 
 generation time and stamped as `qirr_closure_verdict`.
 
 For Σ the answer was **yes**: the star spread is the worst per-band max−min of
-Re diag Σ between members of one star, and it caught a non-orbit-closed centroid
-set. Unfolding a wedge back through the service is a *gather*, so every member
+Re diag Σ between members of one star. (It was long believed to *measure*
+centroid non-closure; measured 2026-08-15, it does not — an orbit-closed 960-set
+for the Si deck moves it only 2.611 → 1.964 meV. It is a real symmetry
+diagnostic whose driver on that deck is still unidentified.) Unfolding a wedge back through the service is a *gather*, so every member
 would equal its parent and the spread would read 0.000 **by construction** — a
 fake green, worse than no check. It is therefore measured upstream on the
 full-BZ arrays and recorded into the wedge file's header, **per band**, because
