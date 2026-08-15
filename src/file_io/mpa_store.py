@@ -208,6 +208,77 @@ _MPA_OWNED_ATTRS = (
     "mpa_grid_hash",
 )
 
+#: Occupation-provenance stamps, in a fixed order; attr name = "mpa_" +
+#: key.  Written only when an occupation state is supplied, so insulating
+#: stores stay byte-identical.  Asserted at REUSE sites only: a same-run
+#: assert would compare the store to the state that just wrote it (the
+#: same circularity that retired fit_identity), so the consumers are the
+#: cross-run reader and the QSGW per-iteration log.
+_OCC_STAMP_ORDER = (
+    "occ_hash", "mu_ry", "smearing_family", "smearing_width_ry",
+    "occ_nelec")
+
+
+def _occ_stamp_values(occupation_state):
+    """The five stamp values from a duck-typed occupation state."""
+    st = occupation_state
+    return {
+        "occ_hash": str(st.occ_hash),
+        "mu_ry": float(st.mu_ry),
+        "smearing_family": str(st.smearing_family),
+        "smearing_width_ry": float(st.smearing_width_ry),
+        "occ_nelec": float(st.n_electrons),
+    }
+
+
+def stamp_occupation_provenance(obj, occupation_state):
+    """Stamp the ``mpa_<key>`` occupation attrs on an h5 object."""
+    for key, val in _occ_stamp_values(occupation_state).items():
+        obj.attrs["mpa_" + key] = val
+
+
+def read_occupation_stamps(src, *, mode="r"):
+    """Return the fit store's occupation stamps, or None if unstamped."""
+    qs = _qs()
+    with qs.QirrDest(src, mode) as grp:
+        if ("mpa_" + _OCC_STAMP_ORDER[0]) not in grp.attrs:
+            return None
+        return {
+            "occ_hash": qs.qirr_attr_str(grp, "mpa_occ_hash"),
+            "mu_ry": float(grp.attrs["mpa_mu_ry"]),
+            "smearing_family": qs.qirr_attr_str(grp, "mpa_smearing_family"),
+            "smearing_width_ry": float(grp.attrs["mpa_smearing_width_ry"]),
+            "occ_nelec": float(grp.attrs["mpa_occ_nelec"]),
+        }
+
+
+def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
+    """REUSE-site gate: the store's occupations are the run's occupations.
+
+    Refuses an unstamped store outright — a metallic reuse of a store
+    that predates the stamps cannot certify compatibility and must be
+    regenerated.  Never called on the same-run write path.
+    """
+    stamps = read_occupation_stamps(src)
+    if stamps is None:
+        raise ValueError(
+            f"{where}: no occupation stamps present. A metallic reuse "
+            "needs a store written with its occupation state "
+            "(mpa_occ_hash ...); regenerate the fit store with the "
+            "current build.")
+    want = _occ_stamp_values(occupation_state)
+    hard = ("occ_hash", "smearing_family", "smearing_width_ry", "occ_nelec")
+    bad = [k for k in hard if stamps[k] != want[k]]
+    if bad:
+        detail = ", ".join(
+            f"{k}: store {stamps[k]!r} != run {want[k]!r}" for k in bad)
+        raise ValueError(
+            f"{where}: occupation stamps disagree with the run's "
+            f"occupation state ({detail}; store mu_ry={stamps['mu_ry']!r}, "
+            f"run mu_ry={want['mu_ry']!r}). The fit was made from "
+            "different occupations — regenerate it.")
+
+
 #: Bytes per complex128 element.  Named because it appears in the budget
 #: arithmetic, and a budget whose constants are anonymous is a budget
 #: nobody can check against a message.
@@ -1608,7 +1679,7 @@ def read_w_columns_collective(
 def _initialise_fit_metadata(
     grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
     centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
-    preserve_payload=False,
+    preserve_payload=False, occupation_state=None,
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
@@ -1645,6 +1716,8 @@ def _initialise_fit_metadata(
             grp.attrs["mpa_fit_w_" + label] = str(val)
     for key, val in (provenance or {}).items():
         grp.attrs["prov_" + str(key)] = val
+    if occupation_state is not None:
+        stamp_occupation_provenance(grp, occupation_state)
     if unfold_tables is not None:
         stamp_fit_unfold_tables(grp, unfold_tables)
 
@@ -1661,6 +1734,7 @@ def allocate_fit_store(
     unfold_tables=None,
     dtype=None,
     provenance=None,
+    occupation_state=None,
     mode="a",
 ):
     """Create the staged B_q / Ω_q store with an EMPTY completion ledger.
@@ -1708,7 +1782,7 @@ def allocate_fit_store(
             grp, n_q=n_q, n_mu=n_mu, n_p=n_p, energy_unit=energy_unit,
             grid_hash=grid_hash, table_hash=table_hash,
             centroid_hash=centroid_hash, unfold_tables=unfold_tables,
-            provenance=provenance)
+            provenance=provenance, occupation_state=occupation_state)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -1723,7 +1797,8 @@ def allocate_fit_store(
 def allocate_fit_store_collective(
     dest, *, mesh_xy, n_q, n_mu, n_p, diagnostic_keys,
     energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
-    unfold_tables=None, dtype=None, provenance=None, mode="w",
+    unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
+    mode="w",
 ):
     """Allocate a fit store without any rank owning a pole tensor.
 
@@ -1770,7 +1845,8 @@ def allocate_fit_store_collective(
                 energy_unit=energy_unit, grid_hash=grid_hash,
                 table_hash=table_hash, centroid_hash=centroid_hash,
                 unfold_tables=unfold_tables, provenance=provenance,
-                diagnostic_keys=keys, preserve_payload=True)
+                diagnostic_keys=keys, preserve_payload=True,
+                occupation_state=occupation_state)
     barrier("mpa_fit_metadata_allocated")
     return fit_completion_ledger(dest)
 
@@ -1848,6 +1924,7 @@ def write_head_fit(
     fit_backward_error,
     fit_max_abs_residual,
     model,
+    occupation_state=None,
     mode="a",
 ):
     """Write the complete scalar q->0 MPA fit and stamp readiness last.
@@ -1901,6 +1978,8 @@ def write_head_fit(
         head.attrs["residue_unit"] = f"{energy_unit}*a.u."
         for key, value in diag.items():
             head.attrs[key] = value
+        if occupation_state is not None:
+            stamp_occupation_provenance(head, occupation_state)
         head.attrs["ready"] = True
 
 

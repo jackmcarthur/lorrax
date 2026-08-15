@@ -39,7 +39,9 @@ page has to read it from.
 | `ecutrho` | None | Density-grid cutoff (Ry) for the psp tools (kin_ion/dipole); None = the WFN's own ecutwfc. |
 | `bispinor` | false | Bispinor (4-spinor) run: 4-channel zeta-fit, Sigma^B transverse channels, two centroid files. |
 | `vnl_velocity_sign` | `""` | Relative sign of the `i[r, V_NL]` commutator in the assembled velocity, read by `psp.get_dipole_mtxels` and passed to `common.mtxel_sweep.dipole_operator`; the CLI `--vnl-velocity-sign` overrides it. `-1` (equivalently `shipped`) is the shipped assembly; `+1` (`flipped`) is the arm that reproduces BerkeleyGW's q→0 head. Empty means NOT DECLARED and resolves to the shipped sign, which is why the default is a string and not a float: a float default would make "unset" and an explicit `-1` indistinguishable, and the point of the stamp this feeds is to record which arm a given `dipole.h5` was built with. This key was absent from this page until 2026-08-10 while being present in `_DEFAULTS`. |
-| `fermi_reference` | `"midgap"` | Where E_F sits inside the gap for the G/W time kernels (midgap default). |
+| `fermi_reference` | `"midgap"` | Where E_F sits for the G/W time kernels: `vbm`/`midgap` inside a gap; `mp1_fixed_n` is the fixed-N MP1 chemical potential and is REQUIRED (and only legal) when `mpa_material_class = metal`. |
+| `occ_smearing_family` | absent | Metal-only, required with `occ_smearing_width_ry` when `mpa_material_class = metal`; refused under insulator. Only `mp1` (Methfessel-Paxton order 1) is certified. Deck keys because WFN.h5 carries no smearing metadata. |
+| `occ_smearing_width_ry` | absent | The QE `degauss` in Ry. Metal-only; see `occ_smearing_family`. |
 
 ## ISDF / zeta
 

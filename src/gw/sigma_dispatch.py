@@ -448,6 +448,7 @@ def compute_sigma_xc(
     hartree_basis_rotation: jax.Array | None = None,
     omit_v_h: bool = False,
     iteration_head=None,
+    occupation_state=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -655,6 +656,21 @@ def compute_sigma_xc(
             fit_path = W_by_role["mpa_fit"]
         except KeyError as exc:
             raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+        if config.mpa.material_class == "metal":
+            # Metal deck-key consistency is refused at config parse
+            # (_validate_occupation_smearing); here the run-level facts:
+            # the one-occupation-state rule, and head/body provenance.
+            if occupation_state is None:
+                raise ValueError(
+                    "MPA Sigma under mpa_material_class = metal requires "
+                    "the iteration's occupation_state (fixed-N MP1 solve); "
+                    "got None. The QSGW driver passes it; a direct caller "
+                    "must construct one from the current spectrum.")
+            # The head fit was written by this run's screening step; a
+            # cross-ITERATION mismatch here means two states leaked into
+            # one iteration, which is exactly what this refuses.
+            mpa_store.assert_occupation_stamps(
+                fit_path, occupation_state, where="MPA Sigma head/body fit")
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,

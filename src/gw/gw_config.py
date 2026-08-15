@@ -1402,6 +1402,13 @@ _DEFAULTS = {
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
+    # DFT occupation smearing of the starting point.  REQUIRED as a pair
+    # when ``mpa_material_class = metal``; refused under insulator.  These
+    # are deck keys because WFN.h5 does NOT carry them: mf_header stores
+    # el/occ/w but no smearing family and no degauss (verified 2026-08-15
+    # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
+    "occ_smearing_family": None,
+    "occ_smearing_width_ry": None,
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
     # as an alias for ``qp_solver = one_shot_dft`` — which is now the
@@ -1479,6 +1486,7 @@ _NORMALIZE_STR = {
     "sc_head_update",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
+    "occ_smearing_family",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
@@ -1505,6 +1513,10 @@ _NULLABLE_BOOL = frozenset()
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({"zeta_nband"})
+
+#: Keys whose default is None but whose explicit value is a STRING — the
+#: bare ``default is None`` parser branch is the nullable-float one.
+_NULLABLE_STR = frozenset({"occ_smearing_family"})
 
 #: Reserved slot in the params dict holding the set of deck keys the DECK
 #: named.  Leading underscore because it is not a deck key and must never
@@ -1800,6 +1812,8 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = section.getboolean(key)
             elif key in _NULLABLE_INT:
                 params[key] = section.getint(key)
+            elif key in _NULLABLE_STR:
+                params[key] = str(raw)
             elif isinstance(default, bool):
                 params[key] = section.getboolean(key)
             elif isinstance(default, int):
@@ -1987,8 +2001,9 @@ class DynamicSigmaConfig:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-        if self.fermi_reference not in ("vbm", "midgap"):
-            raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
+        if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
+            raise ValueError(
+                "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
@@ -2229,6 +2244,56 @@ class BSEConfig:
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 
+def _validate_occupation_smearing(mpa, sigma, family, width_ry):
+    """Cross-key deck validation for the metallic occupation model.
+
+    Metal decks must declare the smearing pair and the two Sigma keys the
+    metallic MPA path actually honors; insulating decks must not carry the
+    smearing pair at all (an off-dial refusal, never a silent ignore).
+    Module-level so tests exercise it without a full parse.
+    """
+    if mpa.material_class == "metal":
+        if family is None or width_ry is None:
+            raise ValueError(
+                "mpa_material_class = metal requires the occupation "
+                "smearing pair: set occ_smearing_family = mp1 and "
+                "occ_smearing_width_ry = <the QE degauss, in Ry>. "
+                "They cannot be derived from WFN.h5 (mf_header carries "
+                "no smearing metadata).")
+        if family != "mp1":
+            raise ValueError(
+                "occ_smearing_family supports only 'mp1' "
+                f"(Methfessel-Paxton order 1); got {family!r}. Other "
+                "families need their own occupation solve and error "
+                "certificates before they can be honored.")
+        if not width_ry > 0.0:
+            raise ValueError(
+                "occ_smearing_width_ry must be > 0 for a metal; got "
+                f"{width_ry!r}")
+        if sigma.fermi_reference != "mp1_fixed_n":
+            raise ValueError(
+                "mpa_material_class = metal requires fermi_reference = "
+                f"mp1_fixed_n (got {sigma.fermi_reference!r}): the metallic "
+                "Sigma measures energies against the fixed-N MP1 chemical "
+                "potential, not a gap-derived reference.")
+        if sigma.omega_layout != "sharded":
+            raise ValueError(
+                "mpa_material_class = metal requires sigma_omega_layout = "
+                f"sharded (got {sigma.omega_layout!r}): the MPA Sigma "
+                "emits the mesh-sharded omega cube only.")
+    else:
+        if family is not None or width_ry is not None:
+            raise ValueError(
+                "occ_smearing_family / occ_smearing_width_ry are metal-only "
+                "keys (mpa_material_class = insulator here). Remove them, "
+                "or set mpa_material_class = metal.")
+        if sigma.fermi_reference == "mp1_fixed_n":
+            raise ValueError(
+                "fermi_reference = mp1_fixed_n requires "
+                "mpa_material_class = metal (it names the fixed-N MP1 "
+                "chemical potential, which insulating decks do not solve).")
+
+
 @dataclass(frozen=True)
 class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation.
@@ -2265,6 +2330,14 @@ class LorraxConfig:
     sc_on_ibz: bool
     #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
     hartree_source: str
+    #: DFT occupation smearing of the starting point ("mp1" = Methfessel-
+    #: Paxton order 1, the only certified family).  REQUIRED as a pair when
+    #: ``mpa_material_class = metal``; refused under insulator.  Deck keys,
+    #: not derived: WFN.h5's mf_header carries el/occ/w but no smearing
+    #: metadata (see ``_DEFAULTS``).  Validated by
+    #: ``_validate_occupation_smearing``.
+    occ_smearing_family: str | None
+    occ_smearing_width_ry: float | None
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
@@ -2641,6 +2714,13 @@ class LorraxConfig:
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
         )
+        _occ_family = _g("occ_smearing_family")
+        _occ_family = (
+            str(_occ_family).strip().lower()
+            if _occ_family is not None else None)
+        _occ_width = _g("occ_smearing_width_ry")
+        _occ_width = float(_occ_width) if _occ_width is not None else None
+        _validate_occupation_smearing(mpa, sigma, _occ_family, _occ_width)
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run
         # unchanged); a note is printed whenever one is active.
@@ -2927,6 +3007,8 @@ class LorraxConfig:
             density_self_consistent=bool(_g("density_self_consistent")),
             sc_on_ibz=bool(_g("sc_on_ibz")),
             hartree_source=_hartree_source,
+            occ_smearing_family=_occ_family,
+            occ_smearing_width_ry=_occ_width,
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
