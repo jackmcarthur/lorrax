@@ -115,6 +115,25 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
         Gij, NamedSharding(mesh_xy, P(None, None, None)))
 
 
+def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
+    """The ONE place the static Σ entries decide their occupation projector.
+
+    ``Gij`` supplied by the caller still wins — the SC-COHSEX loop iterates
+    on its own projector.  But a caller handing in BOTH a projector and an
+    occupation state is asking for two occupation models in one Σ, and the
+    state is the one that would be silently dropped (the exact class of
+    defect this threading exists to close).  Refuse instead; TASTE 13.
+    """
+    if Gij is None:
+        return build_Gij(meta, mesh_xy, occupation_state)
+    if occupation_state is not None:
+        raise ValueError(
+            "static Sigma: both an explicit Gij and an occupation_state "
+            "were supplied.  The explicit projector would silently ignore "
+            "the state's diag(f) weights; pass one or the other.")
+    return Gij
+
+
 # ---------------------------------------------------------------------------
 # Kernel factory — one cached build produces all three static kernels
 # (sigma_sx, sigma_coh, hartree) for a given (mesh, kgrid).  Chi0 and
@@ -261,6 +280,7 @@ def compute_cohsex_sigma(
     compute_bare_x: bool = True,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    occupation_state=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -280,6 +300,12 @@ def compute_cohsex_sigma(
         separately to the bare-X pass.
     compute_bare_x
         Whether to also compute Σ_X (bare exchange) using V_q.
+    occupation_state
+        The iteration's :class:`gw.efermi.OccupationState`, or ``None``.
+        ``None`` is the insulating default and keeps the integer ``occ >
+        0.5`` projector bit-for-bit; a state makes Σ_X / Σ_SX / V_H read
+        the same ``diag(f)`` weights Σ_c already uses.  Mutually
+        exclusive with an explicit ``Gij`` (see :func:`_resolve_Gij`).
 
     Returns
     -------
@@ -297,8 +323,7 @@ def compute_cohsex_sigma(
     upstream in ``ppm_sigma`` and is only collapsed into a replicated
     Σ_xc^QSGW after the energy-domain contraction.
     """
-    if Gij is None:
-        Gij = build_Gij(meta, mesh_xy)
+    Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
 
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
@@ -370,6 +395,7 @@ def compute_v_h_sigma_x(
     static_head_terms=None,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    occupation_state=None,
 ) -> dict:
     """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
 
@@ -390,9 +416,12 @@ def compute_v_h_sigma_x(
     Bispinor: identical to ``compute_cohsex_sigma``'s ``compute_bare_x``
     branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
     and ``bispinor_v_q_path`` are supplied.
+
+    ``occupation_state`` carries the same contract as in
+    :func:`compute_cohsex_sigma`: ``None`` is insulating and bit-exact,
+    a state puts ``diag(f)`` into Σ_X and V_H.
     """
-    if Gij is None:
-        Gij = build_Gij(meta, mesh_xy)
+    Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot))
     rep = NamedSharding(mesh_xy, P(None, None, None))

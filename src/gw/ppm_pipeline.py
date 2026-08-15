@@ -182,6 +182,7 @@ def compute_ppm_sigma_pipeline(
     wfn,
     sym,
     iteration_head=None,
+    occupation_state=None,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -202,6 +203,12 @@ def compute_ppm_sigma_pipeline(
 
     The ansatz-neutral finalizer injects that head, interpolates, writes and
     builds the QSGW matrix.
+
+    ``occupation_state`` is the iteration's
+    :class:`gw.efermi.OccupationState`, carried through to the one
+    occupation projector this pipeline builds (the invalid-pole
+    static-COHSEX term in ``ppm_sigma``).  ``None`` — every insulating
+    deck — keeps the integer projector bit-for-bit.
     """
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
@@ -257,6 +264,7 @@ def compute_ppm_sigma_pipeline(
                 sigma_cfg=config.sigma,
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
+                occupation_state=occupation_state,
                 print_fn=print_fn,
             )
         sigma_c_body_omega = sigma_omega.sigma_c_kij

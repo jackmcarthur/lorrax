@@ -2244,20 +2244,39 @@ class BSEConfig:
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 
-def _validate_occupation_smearing(mpa, sigma, family, width_ry):
+#: Relative tolerance on the ``occ_smearing_width_ry`` / ``occ_broadening``
+#: agreement.  Loose enough that the eV<->Ry round trip cannot trip it (a
+#: deck written with CODATA 13.605693122994 eV/Ry and read back through
+#: ``common.units.RYD_TO_EV`` = 13.6056980659 differs by 3.6e-7 relative),
+#: tight enough that a CONVENTION error — the factor of two between the QE
+#: degauss and BerkeleyGW's half-width — is three orders of magnitude clear
+#: of it.
+_OCC_WIDTH_RTOL = 1.0e-4
+
+
+def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
     """Cross-key deck validation for the metallic occupation model.
 
     Metal decks must declare the smearing pair and the two Sigma keys the
     metallic MPA path actually honors; insulating decks must not carry the
     smearing pair at all (an off-dial refusal, never a silent ignore).
     Module-level so tests exercise it without a full parse.
+
+    THE WIDTH CONVENTION, stated once, here, because two keys carry it.
+    ``occ_smearing_width_ry`` and ``occ_broadening`` are the SAME width in
+    different units: BerkeleyGW's ``occ_broadening``, whose MP1 argument is
+    ``(E - mu) / (2 * width)``.  The QE ``degauss`` is TWICE it.  A deck
+    that sets both and disagrees is refused below rather than silently
+    resolved, because the two ways of being wrong (halving or doubling the
+    smearing) are indistinguishable in the output.
     """
     if mpa.material_class == "metal":
         if family is None or width_ry is None:
             raise ValueError(
                 "mpa_material_class = metal requires the occupation "
                 "smearing pair: set occ_smearing_family = mp1 and "
-                "occ_smearing_width_ry = <the QE degauss, in Ry>. "
+                "occ_smearing_width_ry = <BerkeleyGW occ_broadening, in "
+                "Ry> = <the QE degauss, in Ry> / 2. "
                 "They cannot be derived from WFN.h5 (mf_header carries "
                 "no smearing metadata).")
         if family != "mp1":
@@ -2292,6 +2311,29 @@ def _validate_occupation_smearing(mpa, sigma, family, width_ry):
                 "fermi_reference = mp1_fixed_n requires "
                 "mpa_material_class = metal (it names the fixed-N MP1 "
                 "chemical potential, which insulating decks do not solve).")
+
+    # Cross-key width agreement, checked last so the class-level off-dial
+    # refusals above own their own messages.  ``occ_broadening = 0`` is the
+    # documented "step occupations" dial, not a width, so it is never a
+    # disagreement — the b24/b40 step-occupation control arms deliberately
+    # set exactly that beside a live smearing pair.
+    broadening_ev = float(screening.occ_broadening_ev)
+    if width_ry is not None and broadening_ev > 0.0:
+        broadening_ry = broadening_ev / RYD_TO_EV
+        if abs(width_ry - broadening_ry) > _OCC_WIDTH_RTOL * abs(broadening_ry):
+            raise ValueError(
+                "occ_smearing_width_ry and occ_broadening are the SAME "
+                "width in different units, and this deck's two values "
+                f"disagree: occ_smearing_width_ry = {width_ry!r} Ry vs "
+                f"occ_broadening = {broadening_ev!r} eV = "
+                f"{broadening_ry:.12g} Ry (RYD_TO_EV = {RYD_TO_EV}). "
+                "Both are BerkeleyGW's occ_broadening, whose MP1 argument "
+                "is (E-mu)/(2*width); the QE degauss is TWICE either of "
+                f"them, so this deck implies degauss = {2.0 * width_ry:.12g}"
+                f" Ry from the first key and {2.0 * broadening_ry:.12g} Ry "
+                "from the second. Set occ_smearing_width_ry = degauss/2 "
+                "and occ_broadening = occ_smearing_width_ry * "
+                f"{RYD_TO_EV} eV/Ry, or remove one of them.")
 
 
 @dataclass(frozen=True)
@@ -2336,6 +2378,11 @@ class LorraxConfig:
     #: not derived: WFN.h5's mf_header carries el/occ/w but no smearing
     #: metadata (see ``_DEFAULTS``).  Validated by
     #: ``_validate_occupation_smearing``.
+    #:
+    #: ``occ_smearing_width_ry`` IS ``occ_broadening`` in Ry — BerkeleyGW's
+    #: convention, MP1 argument ``(E-mu)/(2*width)`` — and therefore HALF
+    #: the QE ``degauss``.  It is the metal path's single width source; see
+    #: :attr:`occ_broadening_ry`.
     occ_smearing_family: str | None
     occ_smearing_width_ry: float | None
 
@@ -2416,6 +2463,45 @@ class LorraxConfig:
     # ------------------------------------------------------------------
     #  Derived config objects
     # ------------------------------------------------------------------
+
+    @property
+    def occ_broadening_ry(self) -> float:
+        """THE occupation-smearing width consumed at runtime, in Ry.
+
+        One width, one owner.  Every MP1 solve in the driver reads this
+        and nothing else, so the two deck keys that carry the width can
+        no longer feed different numbers into different stages.
+
+        CONVENTION — BerkeleyGW's, not QE's.  ``gw.efermi``'s MP1
+        argument is ``(E - mu) / (2 * width)`` (``_mp1_values``), the same
+        form BerkeleyGW uses (``Common/input_utils.f90:380``), so this
+        width is HALF the QE ``degauss``.  Measured, not asserted: at
+        ``degauss = 0.02 Ry`` the sodium SOC deck's BGW arm reproduces
+        QE's own stored occupations to 7.1e-12 with ``occ_broadening =
+        0.13605693122994 eV = 0.01 Ry`` (CLAIMS 185), and LORRAX's mu
+        lands 6.2e-7 eV from QE's E_F at the same width (CLAIMS 180).
+        ``OccupationState.smearing_width_ry`` — the field this feeds and
+        the one stamped into the MPA fit store — is the same quantity
+        under the same name.
+
+        SOURCE.  ``occ_smearing_width_ry`` when the deck declares it (the
+        metal path); otherwise ``occ_broadening`` converted from eV, which
+        is every insulating and pre-metal deck and is bit-for-bit what
+        those decks used before this key existed.  When both are set
+        ``_validate_occupation_smearing`` has already refused any
+        disagreement beyond ``_OCC_WIDTH_RTOL``, so the branch cannot
+        change the physics of a deck that carries both — it only decides
+        which of two agreeing numbers is the exact one, and the deck's own
+        Ry value is the one that did not make a round trip through eV.
+
+        NOT A DIAL.  ``occ_broadening == 0`` remains the switch that
+        selects step occupations (``sc_iteration._solve_head_occupations``
+        and the metal V_H rebuild both read it as such); this property
+        answers "how wide", never "whether".
+        """
+        if self.occ_smearing_width_ry is not None:
+            return float(self.occ_smearing_width_ry)
+        return float(self.screening.occ_broadening_ev) / RYD_TO_EV
 
     @property
     def compute_mode(self) -> ComputeMode:
@@ -2720,7 +2806,8 @@ class LorraxConfig:
             if _occ_family is not None else None)
         _occ_width = _g("occ_smearing_width_ry")
         _occ_width = float(_occ_width) if _occ_width is not None else None
-        _validate_occupation_smearing(mpa, sigma, _occ_family, _occ_width)
+        _validate_occupation_smearing(
+            mpa, sigma, screening, _occ_family, _occ_width)
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run
         # unchanged); a note is printed whenever one is active.

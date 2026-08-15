@@ -496,8 +496,17 @@ def compute_sigma_xc(
     config, meta, mesh_xy, sym, wfn, band_slices, input_dir
         Standard driver scaffolding.
     Gij
-        Optional band-space occupation projector; ``None`` builds the
-        default DFT-occ projector inside the static kernels.
+        Optional band-space occupation projector; ``None`` builds it
+        inside the static kernels from ``occupation_state``.  Supplying
+        both is refused (``cohsex_sigma._resolve_Gij``).
+    occupation_state
+        The iteration's :class:`gw.efermi.OccupationState`.  It reaches
+        BOTH halves of Σ here: the MPA branch below (µ, stamps, the
+        fractional contour) and — since this commit — the static
+        channels, so Σ_X / Σ_SX / V_H and the PPM invalid-pole static
+        term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
+        the insulating default and every static channel is then
+        bit-for-bit the integer ``occ > 0.5`` projector.
     wfns_transverse, bispinor_v_q_path
         Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
         tile file).  Both-or-neither; Σ^B is folded into ``sig_x`` by
@@ -543,6 +552,7 @@ def compute_sigma_xc(
             compute_bare_x=True,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
+            occupation_state=occupation_state,
         )
     else:
         cohsex = compute_v_h_sigma_x(
@@ -551,6 +561,7 @@ def compute_sigma_xc(
             static_head_terms=static_head_terms,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
+            occupation_state=occupation_state,
         )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
@@ -761,6 +772,7 @@ def compute_sigma_xc(
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
         iteration_head=iteration_head,
+        occupation_state=occupation_state,
         print_fn=print_fn,
     )
 

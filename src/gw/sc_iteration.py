@@ -250,7 +250,10 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
             # Metal-run startup gate: re-solving on the WFN's OWN stored
             # eigenvalue/weight table must reproduce its stored occupations,
             # or the smearing family/width does not match the deck that made
-            # the WFN (QE 'mp' matches at broadening_ry = degauss/2).
+            # the WFN.  ``config.occ_broadening_ry`` is the deck's ONE width
+            # and already carries BGW's convention, so QE's 'mp' matches it
+            # at occ_smearing_width_ry = degauss/2 — this gate is what
+            # catches a deck that got that factor wrong.
             from .efermi import (OccupationState as _OS,
                                  assert_wfn_occupation_consistency)
             from psp.get_DFT_mtxels import spin_degeneracy_factor
@@ -261,7 +264,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 np.asarray(inputs.wfn.energies[0], dtype=np.float64),
                 w_ibz,
                 float(inputs.wfn.num_electrons),
-                float(inputs.config.screening.occ_broadening_ev) / RYD_TO_EV,
+                inputs.config.occ_broadening_ry,
                 state_capacity=capacity)
             deviation = assert_wfn_occupation_consistency(
                 check_state, np.asarray(inputs.wfn.occs[0]), w_ibz,
@@ -303,6 +306,9 @@ def _solve_head_occupations(
     ``(None, None)`` so the historical step-occupation path is bit-for-bit
     untouched.
     """
+    # ``occ_broadening`` is the DIAL (0 ⇒ step occupations, historical path
+    # untouched); ``config.occ_broadening_ry`` is the WIDTH.  They are the
+    # same key on an insulating deck and cross-checked on a metal one.
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
     if width_ev == 0.0 or pt is None:
@@ -327,7 +333,7 @@ def _solve_head_occupations(
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
     capacity = float(spin_degeneracy_factor(inputs.wfn))
     target_electrons = float(inputs.wfn.num_electrons)
-    width_ry = width_ev / RYD_TO_EV
+    width_ry = inputs.config.occ_broadening_ry
     mu_ry, occ_logical = solve_mp1_occupations(
         energies[:, :nb_logical],
         kweights,
@@ -862,7 +868,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
                 f"{width_ev!r} eV.")
         occ_state = OccupationState.solve_mp1(
             E_qp_ry, kweights, float(inputs.wfn.num_electrons),
-            width_ev / RYD_TO_EV,
+            inputs.config.occ_broadening_ry,
             state_capacity=float(spin_degeneracy_factor(inputs.wfn)))
         e_f = occ_state.mu_ry
         occ = occ_state.f_kn
@@ -1595,7 +1601,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "    SC occupations: end-of-iteration BGW-MP1 update, "
             f"mu={next_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
             f"|dmu|={drift * RYD_TO_EV:.3e} eV, "
-            f"width={inputs.config.screening.occ_broadening_ev:.8f} eV, "
+            f"width={inputs.config.occ_broadening_ry:.10f} Ry "
+            f"(degauss {2.0 * inputs.config.occ_broadening_ry:.10f} Ry), "
             f"occ_hash {next_occ_state.occ_hash}")
 
     # Keep at most one complete MPA screening model on disk.  The current

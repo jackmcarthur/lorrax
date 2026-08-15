@@ -149,13 +149,15 @@ class Wavefunctions:
     #: (nk, nb_full) float64 replicated.  Storage is a WEIGHT, but only ρ
     #: (``qsgw_density.rho_from_wfns``) consumes it as one today.  χ₀ takes
     #: its val/cond split from a BAND-INDEX CUT (``minimax_screening.py``
-    #: :943-944, ``s.val``/``s.cond``), static Σ_x/Σ_SX from the
-    #: ``nocc = min(nelec, nb_sigma)`` band projector
-    #: (``cohsex_sigma.py``:72-74), and the one Σ site that does read this
-    #: array thresholds it (``ppm_sigma.py``:181, ``occ_full > 0.5``).  So
-    #: a fractional-occupation port must change those three as well:
-    #: filling ``occ`` alone leaves χ₀ and Σ on a step function while ρ
-    #: alone is smeared, and nothing would flag the disagreement.
+    #: :943-944, ``s.val``/``s.cond``) and the one Σ site that does read
+    #: this array thresholds it (``ppm_sigma.py``:181, ``occ_full > 0.5``).
+    #: So a fractional-occupation port must change those as well: filling
+    #: ``occ`` alone leaves χ₀ and Σ on a step function while ρ alone is
+    #: smeared, and nothing would flag the disagreement.  **Static Σ_x/Σ_SX
+    #: and V_H are DONE (2026-08-15):** they read the carried
+    #: ``OccupationState`` through ``cohsex_sigma.build_Gij``'s ``diag(f)``
+    #: branch, not this array, and fall back to the integer projector
+    #: bit-for-bit when no state is carried.
     occ: jax.Array
     slices: BandSlices
 
