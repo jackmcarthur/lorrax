@@ -30,6 +30,10 @@ class SharedSigmaWindow(NamedTuple):
     pole_indices: np.ndarray
     bounds: np.ndarray
     phase_real: np.ndarray
+    #: The owning branch's fractional weight (f or 1−f), or None for the
+    #: incumbent bool-mask semantics.  The executor folds it into the A-side
+    #: selector operand; planning here uses only the SUPPORT mask.
+    band_weight: jax.Array | None = None
 
 
 _INF = np.inf
@@ -92,7 +96,20 @@ def _geometry(branches, regularization_width_ry, edge_factor):
     eta = float(regularization_width_ry)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("MPA sigma eta must be finite and positive")
-    crossing_edge = omega_max + float(edge_factor) * eta
+    # Fractional occupations give the crossing branches a negative-E_A shell
+    # (width ~ few×degauss).  Deepening the shallow/deep pole edge by that
+    # excursion keeps every deep-pole slab rectangle sign-definite
+    # (x_lo = e_lo + a_lo − ω_max > edge·η) and routes the straddle through
+    # the crossing core, whose f_max bound below already covers it.  A
+    # non-negative support (every normal insulator) contributes zero, so the
+    # insulating geometry is unchanged bit-for-bit.
+    excursion = 0.0
+    for b in branches:
+        if (b.space == "cond") != b.neg_omega_half:
+            _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
+            if eb is not None:
+                excursion = max(excursion, -min(eb[0], 0.0))
+    crossing_edge = omega_max + float(edge_factor) * eta + excursion
     selectors = {
         "all": _selector(),
         "shallow": _selector(a_hi=crossing_edge),
@@ -312,7 +329,8 @@ def build_shared_sigma_windows(
             output.append(SharedSigmaWindow(
                 win, branch.E_A, branch.omega_abs, branch.omega_idx,
                 np.asarray(pole_i, np.int32), np.asarray(bounds),
-                np.asarray(phases, bool)))
+                np.asarray(phases, bool),
+                band_weight=branch.band_weight))
 
     if crossing_branches:
         # One positive causal rule serves the complete fitted-width interval
@@ -362,7 +380,8 @@ def build_shared_sigma_windows(
                         f"rank {exact_nodes.t.size}")
                     output.append(SharedSigmaWindow(
                         win, _branch.E_A, _branch.omega_abs,
-                        _branch.omega_idx, idx, bounds, phase))
+                        _branch.omega_idx, idx, bounds, phase,
+                        band_weight=_branch.band_weight))
 
     return output, {"eta_ry": eta, "omega_max_ry": omega_max,
                     "crossing_edge_ry": crossing_edge,

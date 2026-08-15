@@ -142,6 +142,12 @@ class _SigmaBranch(NamedTuple):
     neg_omega_half: bool        # True on the −ω half — Σ_c evaluated at |ω|
     omega_abs: np.ndarray       # non-negative ω values to evaluate at (|ω_rel|)
     omega_idx: np.ndarray       # global ω indices these map into
+    band_weight: jax.Array | None = None
+    # (nk, nb) real, or None.  Fractional-occupation weight (f on the val
+    # branch, 1−f on cond) applied in the τ kernel's G synthesis through the
+    # build_G_tau(band_weight=...) seam.  None ⇒ the incumbent bool-mask
+    # semantics, bit-exact.  Never clipped — MP smearing can overshoot [0,1]
+    # (docs/theory/finite-occupation-screening.md).
 
 
 def _iter_branches(
@@ -150,6 +156,8 @@ def _iter_branches(
     omega_neg_abs: np.ndarray, idx_neg: np.ndarray,
     E_cond: jax.Array, H_val: jax.Array,
     cond_mask: jax.Array, val_mask: jax.Array,
+    cond_weight: jax.Array | None = None,
+    val_weight: jax.Array | None = None,
 ) -> list[_SigmaBranch]:
     """Enumerate the 4 branches (A-space × ω-half), skipping empty ω halves.
 
@@ -170,19 +178,23 @@ def _iter_branches(
         branches += [
             _SigmaBranch(tag="ω≥E_F cond", E_A=E_cond, base_mask_A=cond_mask,
                          space="cond", neg_omega_half=False,
-                         omega_abs=omega_pos, omega_idx=idx_pos),
+                         omega_abs=omega_pos, omega_idx=idx_pos,
+                         band_weight=cond_weight),
             _SigmaBranch(tag="ω≥E_F val",  E_A=H_val,  base_mask_A=val_mask,
                          space="val",  neg_omega_half=False,
-                         omega_abs=omega_pos, omega_idx=idx_pos),
+                         omega_abs=omega_pos, omega_idx=idx_pos,
+                         band_weight=val_weight),
         ]
     if omega_neg_abs.size:
         branches += [
             _SigmaBranch(tag="ω<E_F cond", E_A=E_cond, base_mask_A=cond_mask,
                          space="cond", neg_omega_half=True,
-                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
+                         omega_abs=omega_neg_abs, omega_idx=idx_neg,
+                         band_weight=cond_weight),
             _SigmaBranch(tag="ω<E_F val",  E_A=H_val,  base_mask_A=val_mask,
                          space="val",  neg_omega_half=True,
-                         omega_abs=omega_neg_abs, omega_idx=idx_neg),
+                         omega_abs=omega_neg_abs, omega_idx=idx_neg,
+                         band_weight=val_weight),
         ]
     return branches
 
@@ -192,6 +204,8 @@ def branches_for_omega_grid(
     *,
     E_cond: jax.Array, H_val: jax.Array,
     cond_mask: jax.Array, val_mask: jax.Array,
+    cond_weight: jax.Array | None = None,
+    val_weight: jax.Array | None = None,
 ) -> list[_SigmaBranch]:
     """Split a signed ω grid at zero and enumerate the four causal branches.
 
@@ -206,7 +220,8 @@ def branches_for_omega_grid(
         omega_pos=omega[idx_pos], idx_pos=idx_pos,
         omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
         E_cond=E_cond, H_val=H_val,
-        cond_mask=cond_mask, val_mask=val_mask)
+        cond_mask=cond_mask, val_mask=val_mask,
+        cond_weight=cond_weight, val_weight=val_weight)
 
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):

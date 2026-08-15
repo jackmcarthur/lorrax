@@ -323,21 +323,28 @@ def _get_sigma_kij_kernel(
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x)
 
+    def _g_from_selector(xn, yr, E, sel, ref, t):
+        # The A-side selector operand is dtype-dispatched (static at trace
+        # time): bool = the incumbent band-identity mask, bit-exact; float =
+        # the metallic mask×weight product (f or 1−f folded by the executor),
+        # applied through build_G_tau's band_weight seam — one G builder,
+        # weights never clipped (finite-occupation-screening.md).
+        if sel.dtype == jnp.bool_:
+            return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel)
+        return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel)
+
     @partial(jax.jit, donate_argnums=(8,))
     def kernel(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_ref_A, t_node, W_q,
     ):
-        G_k = build_G_tau(
-            psi_coh_xn, psi_coh_yr, E_A, 1j * t_node,
-            e_ref=E_ref_A, mask=mask_A)
+        G_k = _g_from_selector(
+            psi_coh_xn, psi_coh_yr, E_A, mask_A, E_ref_A, t_node)
         return spatial(psi_proj_xr, psi_proj_yn, G_k, W_q)
     if not _stage_timing_enabled():
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
-    build_g = jax.jit(
-        lambda xn, yr, E, mask, ref, t: build_G_tau(
-            xn, yr, E, 1j * t, e_ref=ref, mask=mask))
+    build_g = jax.jit(_g_from_selector)
 
     def staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,

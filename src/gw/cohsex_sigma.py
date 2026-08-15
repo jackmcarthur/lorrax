@@ -34,7 +34,7 @@ from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 # kept alongside the COHSEX kernels because it's only consumed here.
 # ---------------------------------------------------------------------------
 
-def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
+def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
     """Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
 
     **Band coverage — the Hartree density is complete regardless of
@@ -56,8 +56,38 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     numpy; the ``device_put`` at the end places it on the mesh.
     DO NOT "fix" back to ``jnp``.
     """
-    # TODO(metal-sigma): replace this integer occupied projector with the
-    # fractional weights in ``wfns.occ`` when metallic SX/Hartree land.
+    # With an occupation state (duck-typed gw.efermi.OccupationState) the
+    # projector is diag(f) — exact for insulators too: step occupations are
+    # exactly {0.0, 1.0}, so diag(f) == the eye(nocc) block bit-for-bit
+    # (asserted in tests/test_sigma_fermi_split.py).  Weights are never
+    # clipped: an MP-overshoot band (f<0 or f>1) contributes with its sign.
+    if occupation_state is not None:
+        f = np.asarray(occupation_state.f_kn, dtype=np.float64)
+        f = f.reshape(int(meta.nk_tot), -1)
+        if f.shape[1] < int(meta.nb_sigma):
+            raise ValueError(
+                f"build_Gij: occupation state carries {f.shape[1]} bands but "
+                f"the sigma window needs {int(meta.nb_sigma)}.")
+        f_win = f[:, : int(meta.nb_sigma)]
+        # The metallic form of the same V_H-silently-small hazard the
+        # integer guard below prevents: electrons carried by bands outside
+        # the Σ window would silently leave the Hartree density.
+        n_win = float(np.sum(f_win)) / float(meta.nk_tot)
+        n_target = float(occupation_state.n_electrons)
+        if abs(n_win - n_target) > 1.0e-8:
+            raise ValueError(
+                f"build_Gij: the sigma window holds {n_win:.10f} electrons "
+                f"but the occupation state solved for {n_target:.10f}.  The "
+                "Hartree density would be missing weight carried by bands "
+                "outside the window; widen nb_sigma or re-solve.")
+        Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma),
+                       dtype=np.complex128)
+        idx = np.arange(int(meta.nb_sigma))
+        Gij[:, idx, idx] = f_win.astype(np.complex128)
+        from common.collectives import device_put_process_local
+        return device_put_process_local(
+            Gij, NamedSharding(mesh_xy, P(None, None, None)))
+    # Integer path (occupation_state None) — unchanged, bit-exact.
     # The coverage claim above, enforced rather than merely asserted in
     # prose: if the Σ window were ever narrower than the occupied
     # manifold, ``min`` would silently drop occupied bands out of ρ and

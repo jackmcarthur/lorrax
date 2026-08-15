@@ -34,3 +34,45 @@ def test_small_gap_branching_follows_occupation_not_energy_sign():
     assert neg_val.base_mask_A.tolist() == [[True, False, True, False]]
     assert float(pos_cond.E_A[0, 1]) < 0.0
     assert float(neg_val.E_A[0, 2]) < 0.0
+
+
+def test_branches_metallize_only_with_an_occupation_state():
+    """None ⇒ incumbent occ>0.5 masks (no weights); a state ⇒ exact supports
+    with unclipped (f, 1−f) weights signed against the state's mu."""
+    from types import SimpleNamespace
+    import jax.numpy as jnp
+    from gw.mpa.sigma import _branches
+
+    enk = np.asarray([[0.1, 0.2, 0.3]])
+    occ = np.asarray([[1.0, 0.6, 0.0]])
+    wfns = SimpleNamespace(
+        enk=jnp.asarray(enk), occ=jnp.asarray(occ),
+        slices=SimpleNamespace(full=slice(0, 3)))
+    omega = np.asarray([0.0, 0.4])
+
+    legacy = _branches(wfns, omega, 0.25)
+    assert all(b.band_weight is None for b in legacy)
+    np.testing.assert_array_equal(
+        np.asarray(legacy[0].base_mask_A), occ <= 0.5)
+
+    state = SimpleNamespace(
+        f_kn=np.asarray([[1.0, 0.7, -0.02]]), mu_ry=0.25,
+        n_electrons=1.68, occ_hash="h")
+    metal = _branches(wfns, omega, 0.25, occupation_state=state)
+    cond, val = metal[0], metal[1]
+    np.testing.assert_array_equal(np.asarray(cond.base_mask_A),
+                                  [[False, True, True]])
+    np.testing.assert_array_equal(np.asarray(val.base_mask_A),
+                                  [[True, True, True]])
+    np.testing.assert_allclose(np.asarray(cond.band_weight),
+                               [[0.0, 0.3, 1.02]])
+    np.testing.assert_allclose(np.asarray(val.band_weight),
+                               [[1.0, 0.7, -0.02]])
+    np.testing.assert_allclose(np.asarray(cond.E_A), enk - 0.25)
+
+    try:
+        _branches(wfns, omega, 0.30, occupation_state=state)
+    except ValueError as err:
+        assert "inconsistent" in str(err)
+    else:
+        raise AssertionError("mu mismatch was not refused")

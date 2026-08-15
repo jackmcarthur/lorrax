@@ -82,6 +82,17 @@ def _integrate_sigma_batches(
             pole_indices, bounds, phase_real = (
                 device_put_process_local(x, small) for x in selected)
             win = row.window
+            weight = getattr(row, "band_weight", None)
+            if weight is None:
+                # Incumbent bool selector — the kernel's mask path, bit-exact.
+                selector = jnp.asarray(win.mask_A)
+            else:
+                # Metallic: fold support × fractional weight into one float
+                # operand; the kernel dtype-dispatches it onto build_G_tau's
+                # band_weight seam.  Never clipped.
+                selector = (jnp.asarray(win.mask_A, jnp.float64)
+                            * jnp.reshape(jnp.asarray(weight, jnp.float64),
+                                          np.asarray(win.mask_A).shape))
             accumulator.begin_window(
                 win.nodes.t, win.nodes.alpha,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
@@ -91,7 +102,7 @@ def _integrate_sigma_batches(
             for t in np.asarray(jax.device_get(win.nodes.t), np.complex128):
                 sigma_tau = tau_kernel(
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    row.E_A, jnp.asarray(win.mask_A), B, Omega,
+                    row.E_A, selector, B, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),
                     jnp.asarray(t, dtype=jnp.complex128))
@@ -138,18 +149,43 @@ def integrate_sigma_store(
         pole_batch_size=batch_size, print_fn=print_fn)
 
 
-def _branches(wfns, omega, efermi_ry):
-    """The four causal branches, with occupation and energy kept separate."""
-    energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
-    occupied = wfns.occ[:, wfns.slices.full] > 0.5
-    # Do not clip these distances at zero.  In a small-gap or inverted
-    # system an unoccupied state may sit below E_F (or an occupied state
-    # above it); occupation still chooses the band sum.  The current internal
-    # planner refuses a nominally sign-definite cell that then crosses zero.
-    # Public MPA remains disabled until that cell is split and rerouted.
+def _branches(wfns, omega, efermi_ry, occupation_state=None):
+    """The four causal branches, with occupation and energy kept separate.
+
+    ``occupation_state=None`` is the incumbent insulating semantics,
+    bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
+    With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
+    exact fractional supports and weights: the val branch sums EVERY band
+    with f≠0 at weight f, the cond branch every band with f≠1 at weight
+    1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
+    overshoot (f<0 or f>1) rides through unchanged
+    (docs/theory/finite-occupation-screening.md).
+    """
+    if occupation_state is None:
+        energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
+        occupied = wfns.occ[:, wfns.slices.full] > 0.5
+        # Do not clip these distances at zero.  In a small-gap or inverted
+        # system an unoccupied state may sit below E_F (or an occupied state
+        # above it); occupation still chooses the band sum.  A cell whose
+        # rectangle then crosses zero is rerouted through the crossing core
+        # by the planner's excursion-deepened edge (sigma_windows._geometry).
+        return branches_for_omega_grid(
+            omega, E_cond=energy, H_val=-energy,
+            cond_mask=~occupied, val_mask=occupied)
+    mu = float(occupation_state.mu_ry)
+    if abs(float(efermi_ry) - mu) > 1.0e-12:
+        raise ValueError(
+            "MPA Sigma got efermi_ry inconsistent with its occupation "
+            f"state: efermi_ry={float(efermi_ry):.12g} Ry vs "
+            f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
+            "per iteration — pass the state's own mu.")
+    f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
+                    wfns.enk.shape)[:, wfns.slices.full]
+    energy = wfns.enk[:, wfns.slices.full] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
-        cond_mask=~occupied, val_mask=occupied)
+        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_weight=1.0 - f, val_weight=f)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -167,9 +203,15 @@ def compute_sigma_c_mpa_omega_grid(
     max_rank,
     crossing_max_nodes,
     pole_batch_size=4,
+    occupation_state=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
+
+    ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
+    the incumbent insulating semantics, bit-exact.  With a state, the causal
+    branches carry exact fractional supports and (f, 1−f) weights, and
+    ``efermi_ry`` must equal ``occupation_state.mu_ry``.
 
     Pole tensors are read collectively in their native sharding.  A first
     four-pole walk retains only scalar geometry for planning; the spatial
@@ -183,7 +225,8 @@ def compute_sigma_c_mpa_omega_grid(
     ledger = validate_fit_store(fit_src)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(wfns, omega_grid_ry, efermi_ry)
+    branches = _branches(wfns, omega_grid_ry, efermi_ry,
+                         occupation_state=occupation_state)
     summaries = []
     for lo in range(0, n_poles, int(pole_batch_size)):
         hi = min(lo + int(pole_batch_size), n_poles)
@@ -209,7 +252,38 @@ def compute_sigma_c_mpa_omega_grid(
         pole_batch_size=pole_batch_size, print_fn=print_fn)
 
 
+def assert_head_body_occupation_match(head_attrs, occupation_state):
+    """Refuse when the head fit and the body Sigma disagree about occupations.
+
+    ``head_attrs`` is the stamp dict a head-fit reader returns.  One
+    occupation state per iteration is the rule (ARCHITECTURE W2.d/W3); the
+    head's stamped ``occ_hash``/``mu_ry`` must equal the body's.  A metal
+    run with an UNSTAMPED head fit refuses too — an unverifiable stamp is
+    not a pass.  Insulating runs (state None) skip the check.
+    """
+    if occupation_state is None:
+        return
+    stamped_hash = head_attrs.get("occ_hash")
+    stamped_mu = head_attrs.get("mu_ry")
+    if stamped_hash is None or stamped_mu is None:
+        raise ValueError(
+            "metallic MPA Sigma requires an occupation-stamped head fit "
+            "(occ_hash + mu_ry attrs); this store has "
+            f"occ_hash={stamped_hash!r}, mu_ry={stamped_mu!r}.  Refit the "
+            "head with the current iteration's occupation state.")
+    if (str(stamped_hash) != str(occupation_state.occ_hash)
+            or abs(float(stamped_mu) - float(occupation_state.mu_ry))
+            > 1.0e-12):
+        raise ValueError(
+            "head fit and Sigma body carry different occupation states: "
+            f"head (occ_hash={stamped_hash}, mu={float(stamped_mu):.12g}) "
+            f"vs body (occ_hash={occupation_state.occ_hash}, "
+            f"mu={float(occupation_state.mu_ry):.12g}).  One state per "
+            "iteration; rebuild the stale artifact.")
+
+
 __all__ = [
+    "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
     "integrate_sigma_store",
 ]
