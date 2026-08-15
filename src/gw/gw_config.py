@@ -1343,7 +1343,6 @@ _DEFAULTS = {
     "mpa_sampling_alpha": 1,
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
-    "mpa_head_model": "fixed_dft",
     "mpa_pole_batch_size": 4,
     # Both targets bound the same dimensionless relative residual
     # |1-d Q(d)|.  They are separate because the positive crossing rule is
@@ -1358,8 +1357,6 @@ _DEFAULTS = {
     "sigma_omega_step_ev": 0.25,
     "sigma_regularization_ev": 0.25,
     "sigma_window_edge_factor": 1.5,
-    "sigma_omega_batch_size": 4,
-    "sigma_omega_accumulation": "auto",
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
     #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
     #       tiles are gathered into the FULL cube on EVERY rank
@@ -1450,6 +1447,10 @@ _LEGACY_DECK_KEYS = frozenset({
     # running and say what it lost.  See file_io/slab_io.py.
     "slab_io",                      # warn-and-ignore (one transport now)
     "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
+    # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
+    # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
+    # keeps its dedicated parse refusal; other values warn-and-ignore.
+    "sigma_omega_accumulation",
 })
 
 # Keys whose string values should be lowercased and stripped
@@ -1459,7 +1460,7 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "sc_eigh",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
-    "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
+    "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
@@ -1659,6 +1660,26 @@ def read_lorrax_input(filename: str) -> dict:
                     "IGNORED — one sharded-slab transport, not deck-selectable "
                     "(it never changed a number, only which library moved "
                     "the bytes)"))
+        # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
+        # accumulation is the only mode, so the key steered nothing.  The
+        # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
+        _acc = section.get("sigma_omega_accumulation", fallback=None)
+        if _acc is not None:
+            if _acc.strip().strip('"\'').lower() == "kij_stream":
+                raise ValueError(
+                    "sigma_omega_accumulation = kij_stream was REMOVED; "
+                    "host-tile accumulation is the only mode "
+                    "(sigma_omega_layout selects the end-of-stage layout)")
+            import warnings
+            warnings.warn(
+                "Input key 'sigma_omega_accumulation' is no longer "
+                "supported and will be ignored (host-tile accumulation is "
+                "the only mode).  Remove it from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sigma_omega_accumulation",
+                "IGNORED — host-tile accumulation is the only mode"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
         for legacy_key, replacement in (
@@ -1932,8 +1953,6 @@ class DynamicSigmaConfig:
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
-    omega_batch_size: int
-    omega_accumulation: str
     omega_layout: str
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
@@ -1946,17 +1965,9 @@ class DynamicSigmaConfig:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
         if self.fermi_reference not in ("vbm", "midgap"):
             raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-        if self.omega_accumulation == "kij_stream":
-            raise ValueError(
-                "sigma_omega_accumulation = kij_stream was REMOVED; use "
-                "'kij' or 'auto' with sigma_omega_layout = sharded")
-        if self.omega_accumulation not in ("auto", "kij"):
-            raise ValueError("sigma_omega_accumulation must be auto/kij.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
-        if self.omega_batch_size < 1:
-            raise ValueError("sigma_omega_batch_size must be >= 1.")
 
 
 @dataclass(frozen=True)
@@ -2005,12 +2016,13 @@ class MPAConfig:
     sampling_alpha: int
     varpi_near_ry: float
     varpi_far_ry: float
-    head_model: str
     pole_batch_size: int
     sigma_sector_target_error: float
     sigma_crossing_target_error: float
     sigma_max_nodes: int
 
+    # pole_batch_size and the two Sigma target errors are validated at their
+    # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
@@ -2023,14 +2035,6 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        if self.head_model != "fixed_dft":
-            raise NotImplementedError(
-                "mpa_head_model currently supports only 'fixed_dft'")
-        if not 1 <= self.pole_batch_size <= 4:
-            raise ValueError("mpa_pole_batch_size must be in [1, 4]")
-        if not (0.0 < self.sigma_sector_target_error < 1.0
-                and 0.0 < self.sigma_crossing_target_error < 1.0):
-            raise ValueError("MPA Sigma target errors must lie in (0, 1)")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
 
@@ -2567,7 +2571,6 @@ class LorraxConfig:
             sampling_alpha=int(_g("mpa_sampling_alpha")),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
-            head_model=str(_g("mpa_head_model")).strip().lower(),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             sigma_sector_target_error=float(
                 _g("mpa_sigma_sector_target_error")),
@@ -2581,9 +2584,6 @@ class LorraxConfig:
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
-            omega_batch_size=int(_g("sigma_omega_batch_size")),
-            omega_accumulation=str(
-                _g("sigma_omega_accumulation")).strip().lower(),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),

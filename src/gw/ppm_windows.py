@@ -187,6 +187,28 @@ def _iter_branches(
     return branches
 
 
+def branches_for_omega_grid(
+    omega_grid_ry,
+    *,
+    E_cond: jax.Array, H_val: jax.Array,
+    cond_mask: jax.Array, val_mask: jax.Array,
+) -> list[_SigmaBranch]:
+    """Split a signed ω grid at zero and enumerate the four causal branches.
+
+    Only the ω-sign split is shared; the A-space energies/masks stay with
+    the caller because the two drivers derive them differently (PPM clips
+    E_cond/H_val at zero around an internally derived E_F; MPA keeps signed
+    occupation-chosen distances for small-gap/inverted systems).
+    """
+    omega = np.asarray(omega_grid_ry, np.float64)
+    idx_pos, idx_neg = np.where(omega >= 0.0)[0], np.where(omega < 0.0)[0]
+    return _iter_branches(
+        omega_pos=omega[idx_pos], idx_pos=idx_pos,
+        omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
+        E_cond=E_cond, H_val=H_val,
+        cond_mask=cond_mask, val_mask=val_mask)
+
+
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
     """Gather a possibly sharded array to host."""
     # A globally-sharded (non-fully-addressable) jax.Array can only be gathered

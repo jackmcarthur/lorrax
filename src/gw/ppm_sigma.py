@@ -65,7 +65,7 @@ from .minimax_screening import (
 )
 from .ppm_windows import (
     _SigmaWindow,
-    _iter_branches,
+    branches_for_omega_grid,
     _build_windows_for_branch,
     window_mask_B_bounds,
     _to_host_np,
@@ -606,7 +606,6 @@ def _run_sigma_branch(
     meta,
     log_tag: str = "",
     print_fn=print,
-    omega_batch_size: int = 4,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
@@ -845,7 +844,6 @@ def compute_sigma_c_ppm_omega_grid(
             f"(A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ would make the "
             f"HGL crossing quadrature ill-conditioned)")
         regularization_width_ry = xi_floor
-    omega_batch_size = int(sigma_cfg.omega_batch_size)
     fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -855,16 +853,9 @@ def compute_sigma_c_ppm_omega_grid(
     omega_req = np.asarray(omega_values_ry, dtype=np.float64)
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_values_ry must be a 1D non-empty array.")
-    omega_batch_size = int(max(1, omega_batch_size))
 
-    # Split omega grid into positive and negative relative to Fermi level
-    idx_pos = np.where(omega_req >= 0.0)[0]
-    idx_neg = np.where(omega_req < 0.0)[0]
-    omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
-    omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
-
-    # fermi_reference / omega_accumulation are validated + normalized at
-    # PPMConfig construction; used directly here (fermi → traced bool below).
+    # fermi_reference is validated + normalized at config construction;
+    # used directly here (fermi → traced bool below).
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
@@ -944,7 +935,7 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
-    # 2026-07-31; ``omega_accumulation`` is auto|kij, both host tiles).
+    # 2026-07-31).
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
     n_omega = int(omega_req.size)
@@ -998,16 +989,14 @@ def compute_sigma_c_ppm_omega_grid(
         mesh_xy=mesh_xy,
         meta=meta,
         print_fn=print_fn,
-        omega_batch_size=omega_batch_size,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
     # See _iter_branches for how each branch's physical identity fixes its
     # denominator/prefactor signs (no ±1 sign fields are carried).
-    branches = _iter_branches(
-        omega_pos=omega_pos, idx_pos=idx_pos,
-        omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
+    branches = branches_for_omega_grid(
+        omega_req,
         E_cond=E_cond, H_val=H_val,
         cond_mask=cond_mask, val_mask=val_mask,
     )

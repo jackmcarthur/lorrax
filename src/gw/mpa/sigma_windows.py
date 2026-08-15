@@ -34,35 +34,15 @@ class SharedSigmaWindow(NamedTuple):
 
 _INF = np.inf
 
+#: Node ceiling for the positive causal crossing rule: keeps the validated
+#: 500-node safety margin even when mpa_sigma_max_nodes is set lower.
+CROSSING_NODE_FLOOR = 500
+
 
 def _selector(a_hi=_INF, gamma_lo=-_INF, gamma_hi=_INF):
     # (a_gt, a_le, gamma_ge, gamma_gt, gamma_lt, gamma_le)
     return np.asarray((0.0, a_hi, gamma_lo, -_INF, gamma_hi, _INF),
                       dtype=np.float64)
-
-
-def _stats(Omega, B, bounds):
-    a, gamma = jnp.real(Omega), -jnp.imag(Omega)
-    b = jnp.asarray(bounds)
-    live = jnp.abs(B) > 0.0
-    mask = (live & (a > b[0]) & (a <= b[1])
-            & (gamma >= b[2]) & (gamma > b[3])
-            & (gamma < b[4]) & (gamma <= b[5]))
-    count, lo_a, hi_a, lo_g, hi_g, bad = jax.device_get((
-        jnp.sum(mask, dtype=jnp.int64),
-        jnp.min(jnp.where(mask, a, jnp.inf)),
-        jnp.max(jnp.where(mask, a, -jnp.inf)),
-        jnp.min(jnp.where(mask, gamma, jnp.inf)),
-        jnp.max(jnp.where(mask, gamma, -jnp.inf)),
-        jnp.sum(live & ((a <= 0.0) | (gamma < 0.0)), dtype=jnp.int64),
-    ))
-    if int(bad):
-        raise ValueError(
-            f"MPA fit contains {int(bad)} unsupported live poles with "
-            "Re Omega <= 0 or Im Omega > 0")
-    if not int(count):
-        return None
-    return tuple(map(float, (lo_a, hi_a, lo_g, hi_g)))
 
 
 @jax.jit
@@ -104,20 +84,6 @@ def _stats_by_pole(Omega, B, bounds):
         else:
             out.append(tuple(float(x[i]) for x in arrays[1:]))
     return tuple(out)
-
-
-def _rows(Omega_poles, B_poles, bounds, phase_real):
-    indices, selectors, phases, stats = [], [], [], []
-    for pole, (Omega, B) in enumerate(zip(Omega_poles, B_poles)):
-        got = _stats(Omega, B, bounds)
-        if got is not None:
-            indices.append(pole)
-            selectors.append(bounds)
-            phases.append(phase_real)
-            stats.append(got)
-    return (np.asarray(indices, dtype=np.int32),
-            np.asarray(selectors, dtype=np.float64).reshape(-1, 6),
-            np.asarray(phases, dtype=bool), stats)
 
 
 def _geometry(branches, regularization_width_ry, edge_factor):
@@ -238,19 +204,20 @@ def _rectangles(rows, E_bounds, omega_max, eta, *, crossing):
 
 
 def build_shared_sigma_windows(
-    Omega_poles,
+    pole_summaries,
     branches: list[_SigmaBranch],
     *,
-    B_poles=None,
     regularization_width_ry: float,
     edge_factor: float,
-    target_error: float = 1.0e-4,
+    target_error: float,
     crossing_target_error: float | None = None,
-    max_rank: int = 96,
-    crossing_max_nodes: int = 500,
-    pole_summaries=None,
+    max_rank: int,
+    crossing_max_nodes: int,
 ):
-    """Build the complete MPA frequency plan from actual pole bounds.
+    """Build the complete MPA frequency plan from summarized pole bounds.
+
+    ``pole_summaries`` is the ``summarize_sigma_poles`` output (any batch
+    partition, concatenated in pole order).
 
     The requested ``regularization_width_ry`` is a literal retarded ``eta``.
     It is inserted once into every denominator by multiplying each time-node
@@ -274,28 +241,15 @@ def build_shared_sigma_windows(
             and 0.0 < crossing_error < 1.0):
         raise ValueError("MPA Sigma target errors must lie in (0, 1)")
 
-    poles = () if Omega_poles is None else tuple(Omega_poles)
-    residues = (() if B_poles is None else tuple(B_poles))
-    summaries = None if pole_summaries is None else tuple(pole_summaries)
-    if not poles and not summaries:
-        raise ValueError("MPA Sigma needs at least one pole field")
+    summaries = tuple(pole_summaries)
+    if not summaries:
+        raise ValueError("MPA Sigma needs at least one pole summary")
     omega_max, eta, crossing_edge, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
-    if summaries is None:
-        if not residues:
-            raise ValueError(
-                "B_poles are required when pole_summaries are absent")
-        if len(residues) != len(poles):
-            raise ValueError("Omega_poles and B_poles must have equal length")
-        selected = {
-            name: _rows(poles, residues, bounds, False)
-            for name, bounds in selectors.items()
-        }
-    else:
-        selected = {
-            name: _rows_from_summaries(summaries, name, bounds, False)
-            for name, bounds in selectors.items()
-        }
+    selected = {
+        name: _rows_from_summaries(summaries, name, bounds, False)
+        for name, bounds in selectors.items()
+    }
 
     output = []
     crossing_branches = []
@@ -419,6 +373,6 @@ def build_shared_sigma_windows(
 
 
 __all__ = [
-    "SharedSigmaWindow", "build_shared_sigma_windows",
-    "summarize_sigma_poles",
+    "CROSSING_NODE_FLOOR", "SharedSigmaWindow",
+    "build_shared_sigma_windows", "summarize_sigma_poles",
 ]
