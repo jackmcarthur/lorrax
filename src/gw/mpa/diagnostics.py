@@ -49,8 +49,6 @@ def solve_conditioning(
     n_p,
     *,
     rcond=1.0e-13,
-    solve=pade_fit.SOLVE_MODES[0],
-    affine=True,
     eig=pade_fit.EIG_MODES[0],
 ):
     """Conditioning and backward error of the DENOMINATOR solve.
@@ -65,8 +63,8 @@ def solve_conditioning(
     ``cond``
         2-norm condition number of the matrix the chosen mode inverts:
         the row-equilibrated ``2n x 2n`` cross-multiplied system for
-        ``solve="pade"``, the ``n x n`` Loewner matrix ``L`` for
-        ``solve="loewner"``.  This is the number that decides whether the
+        the ``n x n`` Loewner matrix ``L``.  This is the number that
+        decides whether the
         recovered poles mean anything: the theory plan's ranked risk 6 is
         precisely "Vandermonde/companion conditioning fails at any
         scheduled n_p", and the papers' ``n_p <= 15`` range is not
@@ -131,7 +129,7 @@ def solve_conditioning(
     # Every field is something ``fit_mpa_poles`` already computed on its
     # way to the poles; one fit, no second solve.
     _, _, diag = pade_fit.fit_mpa_poles(
-        w, z, n, rcond=rcond, solve=solve, affine=affine, eig=eig)
+        w, z, n, rcond=rcond, eig=eig)
     return {k: diag[v] for k, v in _CONDITIONING_FROM_DIAG.items()}
 
 
@@ -157,7 +155,6 @@ def default_holdout_indices(n_p):
 
 def holdout_residual(
     W_samples, z_samples, n_p, *, holdout=None, rcond=1.0e-13,
-    solve=pade_fit.SOLVE_MODES[0], affine=True,
     eig=pade_fit.EIG_MODES[0],
 ):
     """Fit on ``2*n_p - 2`` samples, evaluate on the 2 held out.
@@ -199,8 +196,7 @@ def holdout_residual(
     z = jnp.asarray(z_samples, dtype=jnp.complex128)
 
     Omega, B, diag = pade_fit.fit_mpa_poles(
-        w[keep_arr], z[keep_arr], n - 1, rcond=rcond, solve=solve,
-        affine=affine, eig=eig)
+        w[keep_arr], z[keep_arr], n - 1, rcond=rcond, eig=eig)
     model = pade_fit.eval_mpa_model(
         Omega, B, z[held_arr], valid=diag["valid"])
     ref = w[held_arr]
@@ -242,8 +238,6 @@ def perturbation_refit(
     error_vector,
     *,
     rcond=1.0e-13,
-    solve=pade_fit.SOLVE_MODES[0],
-    affine=True,
     eig=pade_fit.EIG_MODES[0],
 ):
     """Refit under a certified sample-error vector; report the movement.
@@ -288,7 +282,7 @@ def perturbation_refit(
             "error_vector.shape == (2*n_p,) -- one certified complex error "
             "per sample, absolute and in the units of W_samples.")
 
-    kw = dict(rcond=rcond, solve=solve, affine=affine, eig=eig)
+    kw = dict(rcond=rcond, eig=eig)
     Om0, B0, d0 = pade_fit.fit_mpa_poles(w, z, n, **kw)
     Om1, B1, d1 = pade_fit.fit_mpa_poles(w + dw, z, n, **kw)
 
