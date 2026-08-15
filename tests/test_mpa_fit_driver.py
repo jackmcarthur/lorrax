@@ -712,3 +712,53 @@ def test_the_planted_field_is_symmetric_in_mu_nu(planted):
     W = planted["W"]
     np.testing.assert_allclose(W, np.swapaxes(W, -1, -2),
                                rtol=1e-13, atol=1e-13)
+
+
+# ---------------------------------------------------------------------------
+# Occupation provenance through the DRIVER path (claim 0194 regression)
+# ---------------------------------------------------------------------------
+
+def test_driver_writes_occupation_stamps_when_given_a_state(planted,
+                                                            mesh_xy):
+    """The body fit store carries the five occ stamps end-to-end.
+
+    Claim 0194: the metallic np6 arm refused on 'no occupation stamps
+    present' because run_fit_driver dropped the state two frames above
+    the stamper — the writer existed, its caller never passed the state.
+    This drives the DRIVER path (not stamp_occupation_provenance
+    directly) with a duck-typed state and reads the stamps back through
+    the production reader, so the regression cannot silently return.
+    """
+    import types
+    state = types.SimpleNamespace(
+        occ_hash="deadbeefdeadbeef", mu_ry=0.121, smearing_family="mp1",
+        smearing_width_ry=0.01, n_electrons=10.0)
+    fit_path = planted["root"] / "mpa_fit_stamped.h5"
+    fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path),
+        planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+        occupation_state=state)
+    got = MS.read_occupation_stamps(str(fit_path))
+    assert got["occ_hash"] == "deadbeefdeadbeef"
+    assert got["smearing_family"] == "mp1"
+    np.testing.assert_allclose(
+        [got["mu_ry"], got["smearing_width_ry"], got["occ_nelec"]],
+        [0.121, 0.01, 10.0], rtol=0, atol=0)
+    MS.assert_occupation_stamps(str(fit_path), state, where="regression")
+
+
+def test_insulating_driver_store_carries_no_occupation_stamps(fitted):
+    """Default path unchanged: no state, no stamps, byte-compat."""
+    import h5py
+    with h5py.File(str(fitted["path"]), "r") as f:
+        # walk every object: the five mpa_ occ attrs must appear nowhere
+        bad = []
+        def _check(name, obj):
+            for k in obj.attrs:
+                if str(k).startswith("mpa_occ") or str(k) == "mpa_mu_ry":
+                    bad.append((name, str(k)))
+        f.visititems(_check)
+        for k in f.attrs:
+            if str(k).startswith("mpa_occ") or str(k) == "mpa_mu_ry":
+                bad.append(("/", str(k)))
+    assert bad == [], f"insulating store carries occ stamps: {bad}"

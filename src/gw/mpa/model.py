@@ -196,10 +196,11 @@ def _solve_wc(
     )
 
 
-def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
+def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
+              occupation_state=None):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
-        tile_bytes=tile_bytes)
+        tile_bytes=tile_bytes, occupation_state=occupation_state)
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -453,7 +454,8 @@ def build_mpa_fit(
         config=config if iteration_head_response is not None else None,
     )
     _, report = _fit_body(
-        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
+        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
+        occupation_state=occupation_state)
     if iteration_head is None:
         head_fit_samples = tuple(
             head_resolver.at(complex(z)) for z in z_all)

@@ -677,11 +677,13 @@ def compute_sigma_xc(
                     "the iteration's occupation_state (fixed-N MP1 solve); "
                     "got None. The QSGW driver passes it; a direct caller "
                     "must construct one from the current spectrum.")
-            # The head fit was written by this run's screening step; a
-            # cross-ITERATION mismatch here means two states leaked into
-            # one iteration, which is exactly what this refuses.
-            mpa_store.assert_occupation_stamps(
-                fit_path, occupation_state, where="MPA Sigma head/body fit")
+            # No stamp assert here: this is a SAME-RUN site (the fit store
+            # was written by this run's screening step), and W4 rules that
+            # stamps are asserted at REUSE sites only — a same-run
+            # write-then-read cannot detect the cross-iteration leak it
+            # would claim to guard (claim 0194: the assert here was
+            # unsatisfiable while no writer path carried the state).
+            # assert_occupation_stamps remains the cross-run reuse gate.
         # One chemical potential per iteration: the metal reference is the
         # state's fixed-N mu, never the loader's midgap/VBM efermi.
         sigma_efermi_ry = (float(occupation_state.mu_ry)

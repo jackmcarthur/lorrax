@@ -338,6 +338,7 @@ def run_fit_driver(
     tile_bytes=None,
     rcond=1.0e-13,
     provenance=None,
+    occupation_state=None,
     report_stream=None,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
@@ -406,7 +407,8 @@ def run_fit_driver(
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
         unfold_tables=mpa_store.read_w_tables(w_src, w_name),
-        provenance=fit_provenance)
+        provenance=fit_provenance,
+        occupation_state=occupation_state)
 
     report = {
         "n_q": int(n_q),
