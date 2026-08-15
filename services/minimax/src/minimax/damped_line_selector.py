@@ -123,7 +123,7 @@ class DampedLineSelection:
     @property
     def compression(self) -> float:
         """Nodes saved against ONE COMPOSITE RULE PER LINE, which is what
-        ``evaluate_samples(batching='per-line')`` spends today."""
+        a per-line ``damped_line_rule`` sweep spends today."""
 
         return float(self.composite_node_count) / max(self.node_count, 1)
 
