@@ -817,7 +817,9 @@ _DEFAULTS = {
     # Update the q->0 head from the current QSGW Hamiltonian through the
     # precomputed parallel-transport connection.  Explicit opt-in preserves
     # every historical deck and makes a missing/stale artifact a refusal.
-    "sc_head_update": "off",       # off | parallel_transport
+    # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
+    # p-matrix velocity stage only, without the connection.
+    "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
@@ -2096,6 +2098,13 @@ class MPAConfig:
         )
 
 
+#: The ``sc_head_update`` values that rebuild the q->0 head every QSGW
+#: iteration, i.e. the ones a fractionally occupied deck may choose.  One
+#: tuple, so the vocabulary, the mandatory-metal rule and the driver's
+#: dispatch cannot disagree about what "a metal head mode" is.
+METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
+
+
 @dataclass(frozen=True)
 class SCConfig:
     """Self-consistency loop knobs (read only when qp_solver=self_consistent).
@@ -2127,7 +2136,14 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     eigh: str = "auto"    # "auto" | "native" | "distributed"
-    head_update: str = "off"  # "off" | "parallel_transport"
+    #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
+    #: values are the METAL head modes: both run the per-iteration head
+    #: chain, and they differ only in the velocity operator they feed it —
+    #: ``parallel_transport`` adds the covariant DΔH correction from the
+    #: saved Berry connection, ``dft_velocity`` uses the exact DFT p-matrix
+    #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
+    #: test against; do not spell the pair out a second time.
+    head_update: str = "off"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -2146,10 +2162,11 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
-        if self.head_update not in ("off", "parallel_transport"):
+        if self.head_update not in ("off",) + METAL_HEAD_UPDATES:
             raise ValueError(
-                "sc_head_update must be 'off' or 'parallel_transport'; "
-                f"got {self.head_update!r}.")
+                "sc_head_update must be 'off', "
+                + " or ".join(repr(v) for v in METAL_HEAD_UPDATES)
+                + f"; got {self.head_update!r}.")
 
 
 @dataclass(frozen=True)
@@ -2449,10 +2466,12 @@ class LorraxConfig:
             raise ValueError(
                 "occ_broadening > 0 is currently implemented only for "
                 "qp_solver=self_consistent.")
-        if self.sc.head_update != "parallel_transport":
+        if self.sc.head_update not in METAL_HEAD_UPDATES:
             raise ValueError(
                 "occ_broadening > 0 currently updates only the QSGW head; "
-                "set sc_head_update=parallel_transport.")
+                "set sc_head_update to one of "
+                + ", ".join(METAL_HEAD_UPDATES)
+                + ".")
         if self.sc.accelerator != "linear":
             raise ValueError(
                 "occ_broadening > 0 carries an exact end-of-iteration MP1 "

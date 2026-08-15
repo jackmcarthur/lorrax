@@ -82,7 +82,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help=(
             "read the completed exact-DFT velocity stage without requiring "
-            "the Berry-connection/QSGW-rotation stage"
+            "the Berry-connection/QSGW-rotation stage; the driver spelling "
+            "of the same route is sc_head_update = dft_velocity"
         ),
     )
     parser.add_argument(
@@ -190,71 +191,6 @@ def _write_spectrum(
 _RYD_TO_EV = 13.605693122994
 
 
-def _load_dft_velocity_stage(path, *, mesh, wfn, meta):
-    """Load the exact DFT velocity stage needed by this diagnostic only."""
-    from types import SimpleNamespace
-
-    import h5py
-    import numpy as np
-    from jax.sharding import PartitionSpec as P
-
-    from common.parallel_transport import band_storage_extent, wfn_fingerprint
-    from file_io.parallel_transport import (
-        SCHEMA_VERSION,
-        VELOCITY_DFT_DATASET,
-    )
-    from file_io.slab_io import SlabIO
-
-    nb = int(meta.b_id_4_user)
-    with h5py.File(path, "r") as raw:
-        schema = int(raw["schema_version"][()])
-        band_start = int(raw["band_start"][()])
-        band_stop = int(raw["band_stop"][()])
-        kgrid = np.asarray(raw["kgrid"][()], dtype=np.int32)
-        reciprocal = np.asarray(
-            raw["reciprocal_lattice_cart"][()], dtype=np.float64
-        )
-        fingerprint_raw = np.asarray(
-            raw["wfn_fingerprint_utf8"][()], dtype=np.uint8
-        )
-    fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
-    expected_reciprocal = (
-        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
-    )
-    refusals = []
-    if schema != int(SCHEMA_VERSION):
-        refusals.append(f"schema_version={schema}, expected {SCHEMA_VERSION}")
-    if (band_start, band_stop) != (0, nb):
-        refusals.append(
-            f"band manifold [{band_start},{band_stop}) != [0,{nb})"
-        )
-    if not np.array_equal(kgrid, np.asarray(wfn.kgrid, dtype=np.int32)):
-        refusals.append("k grid differs from the current WFN")
-    if not np.allclose(
-        reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13
-    ):
-        refusals.append("reciprocal lattice differs from the current WFN")
-    if fingerprint != wfn_fingerprint(wfn):
-        refusals.append("WFN fingerprint differs from the velocity artifact")
-    if refusals:
-        raise ValueError(
-            f"{path}: refusing DFT velocity stage:\n  - "
-            + "\n  - ".join(refusals)
-        )
-    nb_storage = band_storage_extent(mesh, nb)
-    with SlabIO(path, mode="r", mesh=mesh) as io:
-        velocity = io.read_slab(
-            VELOCITY_DFT_DATASET,
-            shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
-            partition_spec=P(None, None, "x", "y"),
-        )
-    return SimpleNamespace(
-        velocity_dft_cart=velocity,
-        nb_logical=nb,
-        reciprocal_lattice_cart=reciprocal,
-    )
-
-
 def _run(args: argparse.Namespace) -> int:
     # One bring-up, before any import that can initialize JAX.
     from runtime import initialize_communicator_stack
@@ -277,6 +213,7 @@ def _run(args: argparse.Namespace) -> int:
         head_drude_tensor_sharded,
         head_samples_from_s,
         head_s_tensor_sharded,
+        load_dft_velocity_head,
         load_parallel_transport_head,
     )
     from psp.get_DFT_mtxels import spin_degeneracy_factor
@@ -324,7 +261,9 @@ def _run(args: argparse.Namespace) -> int:
         config.input_dir, config.paths.parallel_transport_file
     )
     if args.dft_velocity_only:
-        pt = _load_dft_velocity_stage(
+        # Same loader the driver's ``sc_head_update = dft_velocity`` mode
+        # takes; it lives in gw.qsgw_head so the two cannot drift.
+        pt = load_dft_velocity_head(
             pt_file, mesh=mesh, wfn=wfn, meta=meta
         )
     else:

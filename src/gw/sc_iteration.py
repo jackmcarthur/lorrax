@@ -319,7 +319,10 @@ def _solve_head_occupations(
         raise ValueError(
             f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
     nb_logical = int(pt.nb_logical)
-    nb_storage = int(pt.connection_cart.shape[-1])
+    # The velocity is the one large dataset BOTH head modes carry; the
+    # connection is absent under sc_head_update = dft_velocity.  They are
+    # written with identical shape, so the storage width is unchanged.
+    nb_storage = int(pt.velocity_dft_cart.shape[-1])
     if not (0 < nb_logical <= nb_storage <= int(energies.shape[1])):
         raise ValueError(
             "QSGW head occupation manifold must satisfy 0 < logical <= "
@@ -1329,26 +1332,33 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             finalize_iteration_head_samples,
         )
 
-        H_active_full = (
-            state.H_qp_dft if ks.is_identity
-            else ks.broadcast(state.H_qp_dft))
-        e_dft_active = inputs.e_dft_active_kn_ry
-        nb_active = int(H_active_full.shape[-1])
-        h_dft_active = (
-            e_dft_active[:, :, None]
-            * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
-        delta_active = H_active_full - h_dft_active
-        nb_storage = int(pt.connection_cart.shape[-1])
+        nb_storage = int(pt.velocity_dft_cart.shape[-1])
         if int(wfns_qp.enk.shape[1]) < nb_storage:
             raise ValueError(
                 "parallel-transport head storage has "
                 f"{nb_storage} padded bands, but the SC wavefunction bundle "
                 f"has only {wfns_qp.enk.shape[1]}.")
-        tail_diagonal = (wfns_qp.enk[:, :nb_storage]
-                         - inputs.wfns_dft.enk[:, :nb_storage])
-        delta_head = assemble_delta_head_manifold(
-            delta_active, tail_diagonal, nb_storage=nb_storage,
-            mesh=inputs.mesh_xy)
+        # ``sc_head_update = dft_velocity`` carries no connection, so DeltaH
+        # has no consumer: skip its assembly rather than building an
+        # O(nk*nb_storage^2) manifold and a spectral derivative for a term
+        # that is then dropped.  Everything below this point is shared.
+        connection_cart = pt.connection_cart
+        delta_head = None
+        if connection_cart is not None:
+            H_active_full = (
+                state.H_qp_dft if ks.is_identity
+                else ks.broadcast(state.H_qp_dft))
+            e_dft_active = inputs.e_dft_active_kn_ry
+            nb_active = int(H_active_full.shape[-1])
+            h_dft_active = (
+                e_dft_active[:, :, None]
+                * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
+            delta_active = H_active_full - h_dft_active
+            tail_diagonal = (wfns_qp.enk[:, :nb_storage]
+                             - inputs.wfns_dft.enk[:, :nb_storage])
+            delta_head = assemble_delta_head_manifold(
+                delta_active, tail_diagonal, nb_storage=nb_storage,
+                mesh=inputs.mesh_xy)
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -1377,7 +1387,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
         iteration_head_response = build_iteration_head_response(
             delta_head,
-            pt.connection_cart,
+            connection_cart,
             pt.velocity_dft_cart,
             U_full,
             wfns_qp.enk[:, :nb_storage],
@@ -1399,15 +1409,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfns_qp=wfns_qp,
             eta_ry=(0.0 if mpa_mode else None),
         )
+        velocity_kind = (
+            "QSGW covariant velocity" if connection_cart is not None
+            else "QP-rotated DFT p-matrix velocity")
         if mpa_mode:
             inputs.print_fn(
                 "    SC head: occupation-aware QSGW response plus sharded "
-                "ISDF wings on the "
-                f"exact MPA z grid (nb={pt.nb_logical}, "
-                f"fit samples={mpa_z.size})")
+                f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
+                f"nb={pt.nb_logical}, fit samples={mpa_z.size})")
         else:
             inputs.print_fn(
-                "    SC head: QSGW covariant velocity + current-basis wings "
+                f"    SC head: {velocity_kind} + current-basis wings "
                 "from saved parallel transport/current centroid bundle "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)})")
 
@@ -2245,6 +2257,76 @@ def _maybe_dump_e_history(
     barrier("sc.e_history.write", print_fn=print_fn)
 
 
+def load_head_velocity_source(
+    config,
+    input_dir: str,
+    *,
+    mesh,
+    wfn,
+    meta,
+    print_fn=print,
+):
+    """Resolve ``sc_head_update`` to the head's velocity source, or None.
+
+    The ONE place the mode string turns into an object.  Both metal modes
+    read the artifact ``get_dipole_mtxels --parallel-transport`` writes;
+    they differ in how much of it they need:
+
+    ``parallel_transport``
+        the whole thing — Berry connection, the exact DFT velocity, and the
+        completed velocity-identity validation, all through
+        ``load_parallel_transport_head``.
+
+    ``dft_velocity``
+        the exact DFT p-matrix velocity stage ONLY, through
+        ``load_dft_velocity_head``.  ``load_parallel_transport_head`` is
+        not called, not imported, and not reachable on this path — which is
+        the point: it currently dies on its first rank-0 scalar read
+        (claim 0188 blocker 1) and repairing that belongs to the
+        parallel-transport route, not to this one.
+
+    Returns None for ``off``, which preserves the fixed-DFT head exactly.
+    """
+    from gw.gw_config import METAL_HEAD_UPDATES
+
+    mode = str(config.sc.head_update)
+    if mode not in METAL_HEAD_UPDATES:
+        return None
+    if not bool(config.do_G0):
+        raise ValueError(
+            f"sc_head_update={mode} requires do_G0=true; "
+            "otherwise the rebuilt head has no consumer.")
+
+    from file_io.paths import resolve_input_path
+
+    pt_path = resolve_input_path(
+        input_dir, config.paths.parallel_transport_file)
+    if mode == "dft_velocity":
+        from .qsgw_head import load_dft_velocity_head
+
+        source = load_dft_velocity_head(
+            pt_path, mesh=mesh, wfn=wfn, meta=meta)
+        print_fn(
+            "  SC head: loaded the exact DFT p-matrix velocity stage from "
+            f"{pt_path} (nb={source.nb_logical}); no Berry connection, so "
+            "the ΔH covariant velocity correction is OFF and the head runs "
+            "on DFT velocities rotated into each iteration's QP basis "
+            "(claim 0183 parks the covariant upgrade)")
+        return source
+
+    from .qsgw_head import load_parallel_transport_head
+
+    source = load_parallel_transport_head(
+        pt_path, mesh=mesh, wfn=wfn, meta=meta)
+    vgate = source.validation
+    print_fn(
+        "  SC head: loaded validated parallel transport from "
+        f"{pt_path} (nb={source.nb_logical}, "
+        f"velocity max_abs={vgate['max_abs']:.3e}, "
+        f"max_rel={vgate['max_rel']:.3e})")
+    return source
+
+
 def run_sc_driver(
     wfns,
     V_q: jax.Array,
@@ -2389,25 +2471,9 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
-    parallel_transport = None
-    if str(config.sc.head_update) == "parallel_transport":
-        if not bool(config.do_G0):
-            raise ValueError(
-                "sc_head_update=parallel_transport requires do_G0=true; "
-                "otherwise the rebuilt head has no consumer.")
-        from file_io.paths import resolve_input_path
-        from .qsgw_head import load_parallel_transport_head
-
-        pt_path = resolve_input_path(
-            input_dir, config.paths.parallel_transport_file)
-        parallel_transport = load_parallel_transport_head(
-            pt_path, mesh=mesh_xy, wfn=wfn, meta=meta)
-        vgate = parallel_transport.validation
-        print_fn(
-            "  SC head: loaded validated parallel transport from "
-            f"{pt_path} (nb={parallel_transport.nb_logical}, "
-            f"velocity max_abs={vgate['max_abs']:.3e}, "
-            f"max_rel={vgate['max_rel']:.3e})")
+    parallel_transport = load_head_velocity_source(
+        config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
+        print_fn=print_fn)
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
@@ -2793,6 +2859,7 @@ __all__ = [
     "SCOutputs",
     "SCState",
     "gw_iteration_map",
+    "load_head_velocity_source",
     "make_initial_state_from_dft",
     "run_self_consistency",
     "run_sc_driver",

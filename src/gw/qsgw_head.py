@@ -36,6 +36,7 @@ from common.shard_map import shard_map
 
 
 __all__ = [
+    "DftVelocityHeadData",
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
@@ -51,6 +52,7 @@ __all__ = [
     "head_samples_from_s",
     "finalize_iteration_head_sample",
     "finalize_iteration_head_samples",
+    "load_dft_velocity_head",
     "load_parallel_transport_head",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
@@ -81,6 +83,36 @@ class ParallelTransportHeadData:
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
     validation: dict[str, float]
+
+
+@dataclass(frozen=True)
+class DftVelocityHeadData:
+    """The same head inputs MINUS the Berry connection.
+
+    ``sc_head_update = dft_velocity`` runs the metallic head chain on the
+    exact DFT p-matrix velocity written by
+    ``get_dipole_mtxels --parallel-transport`` and NOTHING else from that
+    artifact: no connection, so no covariant ``DΔH`` correction to the
+    velocity, so no dependence on the link/rotation stage.  The velocity is
+    still rotated into the current QP basis every iteration by the same
+    ``U`` the head carry threads — the approximation is confined to the
+    ΔH-induced *change* of the velocity operator, which this mode drops.
+
+    ``connection_cart`` is a field, pinned at ``None``, so that every
+    consumer can ask one object the same question and branch on the answer
+    instead of on the mode string.
+
+    This is the configuration every accepted sodium head number was
+    produced in (claims 0180/0181/0189, through
+    ``tools/qsgw_head_spectrum.py --dft-velocity-only``).  The covariant
+    upgrade is parked on claim 0183.
+    """
+
+    velocity_dft_cart: jax.Array
+    nb_logical: int
+    reciprocal_lattice_cart: np.ndarray
+    connection_cart: None = None
+    validation: None = None
 
 
 def _read_small(io, name: str, shape: tuple[int, ...], dtype):
@@ -222,6 +254,97 @@ def load_parallel_transport_head(
         nb_logical=expected_nb,
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
+    )
+
+
+def load_dft_velocity_head(
+    path: str,
+    *,
+    mesh: Mesh,
+    wfn,
+    meta,
+) -> DftVelocityHeadData:
+    """Load the completed exact-DFT velocity stage, and only that stage.
+
+    This is the loader ``tools/qsgw_head_spectrum.py --dft-velocity-only``
+    has always used — it lived in that tool until ``sc_head_update =
+    dft_velocity`` gave the driver the same route, and it moved here rather
+    than being copied so the two cannot drift.
+
+    Two differences from :func:`load_parallel_transport_head`, both
+    deliberate:
+
+    * ``connection_complete`` / ``velocity_validation_*`` are NOT required.
+      The velocity is written and checked by the dipole job on its own; the
+      link, connection and velocity-identity stages exist to serve the
+      covariant correction this mode does not take.
+    * the handful of small provenance values are read with plain h5py.
+      ``SlabIO.write_attr`` stores them as rank-0 datasets and the FFI
+      ``read_slab`` refuses an empty shape (claim 0188 blocker 1,
+      ``_slab_io_ffi.py:1050``), so this path must not go through
+      ``_read_small``.  Repairing that read is the parallel-transport
+      loader's own business (claim 0187 fixer); this mode is not blocked
+      behind it and does not touch it.
+
+    Every other provenance refusal the PT loader emits is kept verbatim:
+    schema, band manifold, k grid, reciprocal lattice, WFN fingerprint.
+    """
+    import h5py
+
+    from common.parallel_transport import band_storage_extent, wfn_fingerprint
+    from file_io.parallel_transport import (
+        SCHEMA_VERSION,
+        VELOCITY_DFT_DATASET,
+    )
+    from file_io.slab_io import SlabIO
+
+    nb = int(meta.b_id_4_user)
+    with h5py.File(path, "r") as raw:
+        schema = int(raw["schema_version"][()])
+        band_start = int(raw["band_start"][()])
+        band_stop = int(raw["band_stop"][()])
+        kgrid = np.asarray(raw["kgrid"][()], dtype=np.int32)
+        reciprocal = np.asarray(
+            raw["reciprocal_lattice_cart"][()], dtype=np.float64
+        )
+        fingerprint_raw = np.asarray(
+            raw["wfn_fingerprint_utf8"][()], dtype=np.uint8
+        )
+    fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
+    expected_reciprocal = (
+        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    )
+    refusals = []
+    if schema != int(SCHEMA_VERSION):
+        refusals.append(f"schema_version={schema}, expected {SCHEMA_VERSION}")
+    if (band_start, band_stop) != (0, nb):
+        refusals.append(
+            f"band manifold [{band_start},{band_stop}) != [0,{nb})"
+        )
+    if not np.array_equal(kgrid, np.asarray(wfn.kgrid, dtype=np.int32)):
+        refusals.append("k grid differs from the current WFN")
+    if not np.allclose(
+        reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13
+    ):
+        refusals.append("reciprocal lattice differs from the current WFN")
+    if fingerprint != wfn_fingerprint(wfn):
+        refusals.append("WFN fingerprint differs from the velocity artifact")
+    if refusals:
+        raise ValueError(
+            f"{path}: refusing DFT velocity stage:\n  - "
+            + "\n  - ".join(refusals)
+        )
+    nb_storage = band_storage_extent(mesh, nb)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        velocity = io.read_slab(
+            VELOCITY_DFT_DATASET,
+            shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
+            partition_spec=P(None, None, "x", "y"),
+        )
+    return DftVelocityHeadData(
+        velocity_dft_cart=velocity,
+        nb_logical=nb,
+        reciprocal_lattice_cart=reciprocal,
     )
 
 
@@ -1557,16 +1680,25 @@ def build_iteration_head_response(
     wfns_qp=None,
     eta_ry: float | None = None,
 ) -> IterationHeadResponse:
-    """Build current-basis direct head and, when requested, its wings."""
-    correction = covariant_structured_delta(
-        delta_h_dft,
-        connection_cart,
-        U_active=U_dft_to_qp,
-        mesh=mesh,
-        kgrid=kgrid,
-        bvec_cart=bvec_cart,
-    )
-    v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128) + correction
+    """Build current-basis direct head and, when requested, its wings.
+
+    ``connection_cart=None`` is ``sc_head_update = dft_velocity``: no Berry
+    connection is resident, so the covariant ``DΔH`` correction is dropped
+    and the bare DFT p-matrix velocity enters.  ``delta_h_dft`` is then
+    unused and may be None.  Everything downstream of the velocity —
+    the per-iteration rotation into the QP basis, S(z), the Drude term, the
+    ISDF wings, the static κ² — is the SAME code on both routes.
+    """
+    v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    if connection_cart is not None:
+        v_dft_basis = v_dft_basis + covariant_structured_delta(
+            delta_h_dft,
+            connection_cart,
+            U_active=U_dft_to_qp,
+            mesh=mesh,
+            kgrid=kgrid,
+            bvec_cart=bvec_cart,
+        )
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)

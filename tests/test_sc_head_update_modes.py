@@ -1,0 +1,394 @@
+"""``sc_head_update = dft_velocity``: vocabulary, dispatch, and head chain.
+
+Three questions, one per section:
+
+1. **Config** — is ``dft_velocity`` a legal value, does the mandatory rule
+   for a fractionally occupied deck accept EITHER metal head mode, and is
+   the refusal that catches a metal deck with no head mode intact?
+2. **Dispatch** — does the ``dft_velocity`` route reach the
+   parallel-transport loader?  It must not: that loader currently dies on
+   its first rank-0 scalar read (claim 0188 blocker 1) and this mode is
+   deliberately not blocked behind that repair.  Pinned by monkeypatching
+   the loader to raise, with the ``parallel_transport`` arm as the control
+   that proves the trap is armed.
+3. **Head chain** — does the mode run the same S(z)/Drude/wing chain on
+   the DFT p-matrix velocity, and does it still rotate that velocity into
+   the current QP basis every iteration?  The velocity rotation is the
+   whole reason a QSGW iteration differs from the one-shot tool route, so
+   it is pinned directly, both as an equality against the rotated velocity
+   and as a difference from the unrotated one.
+
+Everything here is at the fixture scale of
+``test_qsgw_parallel_transport_head.py`` (a handful of k points and bands),
+with no WFN and no artifact on disk.  The backend is NOT pinned to cpu the
+way that file's is: the transport arm of the equivalence cell takes
+``spectral_cartesian_derivative``, which needs the FFT FFI, and the host
+library on this site cannot load (``libsci_gnu.so.6`` is absent from the
+container) — so this suite runs where the driver runs.
+"""
+
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+
+import pytest
+
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
+
+from gw import qsgw_head
+from gw.gw_config import METAL_HEAD_UPDATES, LorraxConfig
+from gw.qsgw_head import (
+    build_iteration_head_response,
+    head_s_tensor_sharded,
+    rotate_velocity_active_to_qp,
+)
+from gw.sc_iteration import load_head_velocity_source
+
+jax.config.update("jax_enable_x64", True)
+
+
+def _mesh():
+    devices = np.asarray(jax.devices())
+    if devices.size >= 4:
+        devices = devices[:4].reshape(2, 2)
+    else:
+        devices = devices[:1].reshape(1, 1)
+    return Mesh(devices, ("x", "y"))
+
+
+# ---------------------------------------------------------------------------
+# 1. Config: the vocabulary and the widened mandatory rule
+# ---------------------------------------------------------------------------
+
+_BASE = """\
+[cohsex]
+nval = 2
+ncond = 2
+nband = 10
+memory_per_device_gb = 4.0
+"""
+
+# The three keys the fractional-occupation rule already required before
+# this mode existed; only the head-mode value is under test below.
+_FRACTIONAL = (
+    "qp_solver = self_consistent\n"
+    "sc_accelerator = linear\n"
+    "occ_broadening = 0.13605693122994\n"
+)
+
+
+def _config(tmp_path, extra: str = "", name: str = "head_mode.in"):
+    path = tmp_path / name
+    path.write_text(_BASE + extra)
+    return LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: None)
+
+
+def test_the_metal_head_vocabulary_is_exactly_the_two_modes():
+    # One tuple owns the pair; a consumer that spells it out again is the
+    # drift this constant exists to prevent.
+    assert METAL_HEAD_UPDATES == ("parallel_transport", "dft_velocity")
+
+
+@pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
+def test_a_fractional_deck_accepts_either_metal_head_mode(tmp_path, mode):
+    cfg = _config(tmp_path, _FRACTIONAL + f"sc_head_update = {mode}\n")
+    assert cfg.sc.head_update == mode
+    assert cfg.screening.occ_broadening_ev > 0.0
+
+
+def test_dft_velocity_parses_on_an_insulating_deck_too(tmp_path):
+    # The head mode is not itself the metal switch; occ_broadening is.
+    cfg = _config(tmp_path, "sc_head_update = dft_velocity\n")
+    assert cfg.sc.head_update == "dft_velocity"
+    assert cfg.screening.occ_broadening_ev == 0.0
+
+
+def test_a_fractional_deck_with_the_head_off_is_still_refused(tmp_path):
+    # UNCHANGED behaviour: widening the rule to two values must not turn it
+    # into no rule at all.
+    with pytest.raises(ValueError, match="sc_head_update"):
+        _config(tmp_path, _FRACTIONAL + "sc_head_update = off\n")
+
+
+def test_a_fractional_deck_defaulting_the_head_key_is_still_refused(tmp_path):
+    # ...including when the deck simply omits the key (default "off").
+    with pytest.raises(ValueError, match="occ_broadening"):
+        _config(tmp_path, _FRACTIONAL)
+
+
+@pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
+def test_the_other_two_fractional_preconditions_are_unchanged(tmp_path, mode):
+    # A legal head mode does not excuse the solver or the accelerator.
+    with pytest.raises(ValueError, match="self_consistent"):
+        _config(
+            tmp_path,
+            "occ_broadening = 0.13605693122994\n"
+            f"sc_head_update = {mode}\n")
+    with pytest.raises(ValueError, match="sc_accelerator=linear"):
+        _config(
+            tmp_path,
+            "qp_solver = self_consistent\n"
+            "sc_accelerator = rcrop\n"
+            "occ_broadening = 0.13605693122994\n"
+            f"sc_head_update = {mode}\n")
+
+
+def test_an_unknown_head_update_value_refuses_and_names_both_modes(tmp_path):
+    with pytest.raises(ValueError, match="sc_head_update") as exc:
+        _config(tmp_path, "sc_head_update = dft_velocities\n")
+    message = str(exc.value)
+    for mode in METAL_HEAD_UPDATES:
+        assert mode in message
+
+
+# ---------------------------------------------------------------------------
+# 2. Dispatch: dft_velocity never touches the parallel-transport loader
+# ---------------------------------------------------------------------------
+
+_SENTINEL = SimpleNamespace(
+    nb_logical=7, velocity_dft_cart=None, connection_cart=None,
+    reciprocal_lattice_cart=None, validation=None)
+
+
+def _stub_config(mode: str, *, do_G0: bool = True):
+    return SimpleNamespace(
+        sc=SimpleNamespace(head_update=mode),
+        do_G0=do_G0,
+        paths=SimpleNamespace(parallel_transport_file="parallel_transport.h5"),
+    )
+
+
+@pytest.fixture
+def armed_loaders(monkeypatch):
+    """Both loaders replaced: PT raises, DFT-velocity records its path."""
+    calls: dict[str, object] = {}
+
+    def _pt_boom(path, **kwargs):
+        calls["parallel_transport"] = path
+        raise AssertionError(
+            "load_parallel_transport_head must not be reached on the "
+            "dft_velocity path")
+
+    def _dft(path, **kwargs):
+        calls["dft_velocity"] = path
+        return _SENTINEL
+
+    monkeypatch.setattr(
+        qsgw_head, "load_parallel_transport_head", _pt_boom)
+    monkeypatch.setattr(qsgw_head, "load_dft_velocity_head", _dft)
+    return calls
+
+
+def test_dft_velocity_never_calls_the_parallel_transport_loader(
+        armed_loaders, tmp_path):
+    got = load_head_velocity_source(
+        _stub_config("dft_velocity"), str(tmp_path),
+        mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+    assert got is _SENTINEL
+    assert "parallel_transport" not in armed_loaders
+    assert armed_loaders["dft_velocity"] == str(
+        tmp_path / "parallel_transport.h5")
+
+
+def test_the_transport_arm_does_call_it(armed_loaders, tmp_path):
+    # Control: without this cell the one above would also pass if the
+    # dispatch loaded nothing at all, or if the monkeypatch missed.
+    with pytest.raises(AssertionError, match="must not be reached"):
+        load_head_velocity_source(
+            _stub_config("parallel_transport"), str(tmp_path),
+            mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+    assert "parallel_transport" in armed_loaders
+
+
+def test_head_update_off_loads_neither(armed_loaders, tmp_path):
+    got = load_head_velocity_source(
+        _stub_config("off"), str(tmp_path),
+        mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+    assert got is None
+    assert armed_loaders == {}
+
+
+@pytest.mark.parametrize("mode", METAL_HEAD_UPDATES)
+def test_both_modes_refuse_without_do_G0(armed_loaders, tmp_path, mode):
+    # The rebuilt head has no consumer without do_G0, on either route.
+    with pytest.raises(ValueError, match=mode):
+        load_head_velocity_source(
+            _stub_config(mode, do_G0=False), str(tmp_path),
+            mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+    assert armed_loaders == {}
+
+
+def test_the_dispatch_announces_the_dropped_correction(
+        armed_loaders, tmp_path):
+    lines: list[str] = []
+    load_head_velocity_source(
+        _stub_config("dft_velocity"), str(tmp_path),
+        mesh=None, wfn=None, meta=None,
+        print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    said = "\n".join(lines)
+    assert "DFT p-matrix velocity" in said
+    assert "0183" in said
+
+
+# ---------------------------------------------------------------------------
+# 3. The head chain on DFT velocities
+# ---------------------------------------------------------------------------
+
+_KGRID = (2, 2, 2)
+
+
+def _head_fixture(seed: int):
+    """A whole small head problem: velocity, bands, occupations, wings."""
+    rng = np.random.default_rng(seed)
+    nk, nb, na, nmu, ns = int(np.prod(_KGRID)), 6, 3, 4, 2
+    raw = rng.normal(size=(3, nk, nb, nb)) + 1j * rng.normal(
+        size=(3, nk, nb, nb))
+    velocity = raw + np.swapaxes(raw.conj(), -1, -2)
+    energies = np.sort(rng.uniform(-0.7, 1.1, (nk, nb)), axis=1)
+    occupations = np.clip(
+        rng.uniform(-0.02, 1.02, (nk, nb))[:, ::-1].copy(), -0.02, 1.0)
+    surface = rng.uniform(0.0, 0.4, (nk, nb))
+    psi = rng.normal(size=(nk, ns, nmu, nb)) + 1j * rng.normal(
+        size=(nk, ns, nmu, nb))
+    U = np.stack([
+        np.linalg.qr(
+            rng.normal(size=(na, na)) + 1j * rng.normal(size=(na, na)))[0]
+        for _ in range(nk)])
+    bvec = np.asarray([[1.7, 0.0, 0.0], [0.0, 1.7, 0.0], [0.0, 0.0, 1.7]])
+    return SimpleNamespace(
+        nk=nk, nb=nb, na=na, velocity=velocity, energies=energies,
+        occupations=occupations, surface=surface,
+        wfns_qp=SimpleNamespace(
+            psi_xn=jnp.asarray(psi), psi_yn=jnp.asarray(psi)),
+        U=U, bvec=bvec,
+        omegas=np.asarray([0.31 + 0.05j, 0.77 + 0.05j, 1.4 + 0.05j]),
+        wfn=SimpleNamespace(nspin=1),
+        meta=SimpleNamespace(cell_volume=97.3, nk_tot=nk, nspinor=2),
+        config=SimpleNamespace(head=SimpleNamespace(wcoul0_eta=0.0)),
+    )
+
+
+def _response(fx, *, connection, delta, U, wings=True):
+    return build_iteration_head_response(
+        delta,
+        connection,
+        jnp.asarray(fx.velocity),
+        jnp.asarray(U),
+        jnp.asarray(fx.energies),
+        jnp.asarray(fx.occupations),
+        fx.omegas,
+        surface_weight_qp_kn=jnp.asarray(fx.surface),
+        mesh=_mesh(),
+        kgrid=_KGRID,
+        bvec_cart=fx.bvec,
+        nb_logical=fx.nb,
+        sigma_energies_ry=fx.energies,
+        efermi_ry=0.21,
+        wfn=fx.wfn,
+        meta=fx.meta,
+        config=fx.config,
+        wfns_qp=(fx.wfns_qp if wings else None),
+        eta_ry=0.05,
+    )
+
+
+def test_the_dft_velocity_chain_reproduces_the_transport_chain_at_zero_dh():
+    """The whole chain, both routes, where they must agree exactly.
+
+    With DeltaH = 0 and A = 0 the covariant correction vanishes, so the
+    transport route reduces to the DFT-velocity route.  Agreement across
+    S(z), the Drude term (surface weights are supplied), both ISDF wings
+    and the static kappa^2 is the smoke test that the new branch skips only
+    the correction and nothing else.
+    """
+    fx = _head_fixture(2026)
+    zeros_A = jnp.zeros((3, fx.nk, fx.nb, fx.nb), dtype=jnp.complex128)
+    zeros_dh = jnp.zeros((fx.nk, fx.nb, fx.nb), dtype=jnp.complex128)
+
+    transport = _response(fx, connection=zeros_A, delta=zeros_dh, U=fx.U)
+    dft = _response(fx, connection=None, delta=None, U=fx.U)
+
+    np.testing.assert_allclose(
+        np.asarray(dft.S_direct), np.asarray(transport.S_direct),
+        rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(
+        np.asarray(dft.Y_x), np.asarray(transport.Y_x),
+        rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(
+        np.asarray(dft.Z_y), np.asarray(transport.Z_y),
+        rtol=1e-13, atol=1e-13)
+    assert dft.static_kappa2_bohr2 == pytest.approx(
+        transport.static_kappa2_bohr2, rel=1e-14)
+    assert dft.omegas == transport.omegas
+    assert dft.efermi_ry == transport.efermi_ry
+
+
+def test_a_real_delta_h_is_what_the_dft_velocity_mode_drops():
+    """Negative control for the cell above: with a genuine connection and
+    DeltaH the two routes MUST differ, or the equality proved nothing."""
+    fx = _head_fixture(3031)
+    rng = np.random.default_rng(77)
+    raw_a = rng.normal(size=(3, fx.nk, fx.nb, fx.nb)) + 1j * rng.normal(
+        size=(3, fx.nk, fx.nb, fx.nb))
+    A = jnp.asarray(raw_a + np.swapaxes(raw_a.conj(), -1, -2))
+    dh = np.zeros((fx.nk, fx.nb, fx.nb), dtype=np.complex128)
+    block = rng.normal(size=(fx.nk, fx.na, fx.na)) + 1j * rng.normal(
+        size=(fx.nk, fx.na, fx.na))
+    dh[:, :fx.na, :fx.na] = block + np.swapaxes(block.conj(), -1, -2)
+    dh[:, np.arange(fx.na, fx.nb), np.arange(fx.na, fx.nb)] = rng.normal(
+        size=(fx.nk, fx.nb - fx.na))
+
+    transport = _response(
+        fx, connection=A, delta=jnp.asarray(dh), U=fx.U, wings=False)
+    dft = _response(fx, connection=None, delta=None, U=fx.U, wings=False)
+    assert np.max(np.abs(
+        np.asarray(dft.S_direct) - np.asarray(transport.S_direct))) > 1e-3
+
+
+def test_dft_velocity_rotates_into_the_qp_basis_every_iteration():
+    """The per-iteration U rotation is NOT dropped with the connection.
+
+    The R2/R3 tool route was one-shot, so its velocity was never rotated.
+    A QSGW iteration's is: the mode feeds ``U^dag v U`` on the active block
+    to the same S tensor, using the U the head carry already threads.
+    """
+    fx = _head_fixture(4102)
+    got = np.asarray(_response(
+        fx, connection=None, delta=None, U=fx.U, wings=False).S_direct)
+
+    rotated = rotate_velocity_active_to_qp(
+        jnp.asarray(fx.velocity), jnp.asarray(fx.U), mesh=_mesh())
+    common = dict(
+        mesh=_mesh(), nb_logical=fx.nb,
+        cell_volume=float(fx.meta.cell_volume), nk_tot=fx.nk,
+        nspin=int(fx.wfn.nspin), nspinor=int(fx.meta.nspinor),
+        eta_ry=0.05, surface_weight_kn=jnp.asarray(fx.surface))
+    ref = np.asarray(head_s_tensor_sharded(
+        rotated, jnp.asarray(fx.energies), jnp.asarray(fx.occupations),
+        fx.omegas, **common))
+    np.testing.assert_allclose(got, ref, rtol=1e-13, atol=1e-13)
+
+    # ...and the rotation is load-bearing: the unrotated velocity gives a
+    # different head on this fixture.
+    unrotated = np.asarray(head_s_tensor_sharded(
+        jnp.asarray(fx.velocity), jnp.asarray(fx.energies),
+        jnp.asarray(fx.occupations), fx.omegas, **common))
+    assert np.max(np.abs(got - unrotated)) > 1e-3
+
+
+def test_the_loader_the_driver_takes_is_the_one_the_tool_takes():
+    """No second implementation: the tool's --dft-velocity-only stage
+    loader moved into gw.qsgw_head and the tool imports it from there."""
+    source = (
+        __import__("pathlib").Path(qsgw_head.__file__).resolve().parents[2]
+        / "tools" / "qsgw_head_spectrum.py"
+    ).read_text()
+    assert "load_dft_velocity_head" in source
+    assert "_load_dft_velocity_stage" not in source
