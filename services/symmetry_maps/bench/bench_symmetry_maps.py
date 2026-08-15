@@ -330,7 +330,7 @@ def run_star(rows, *, warmup, reps):
              lambda A=A: star_select(A, irr)),
             ("star_broadcast", ishape, shape,
              lambda A_irr=A_irr: star_broadcast(
-                 A_irr, irr, sidx, nss, kmap.labels)),
+                 A_irr, irr, sidx, nss, kmap.labels, trs_reference="star_row")),
             ("star_spread", shape, (),
              lambda A=A: star_spread(A, irr, sidx, nss)),
             ("KStarMap.spread_rel", shape, (),

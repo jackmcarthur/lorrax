@@ -377,7 +377,8 @@ def test_the_gauge_blind_arms_vanish_on_an_exact_star_relation():
              + 1j * rng.standard_normal((len(rows), 4, 4)))
     full = np.asarray(symmetry_maps.star_broadcast(
         wedge, compact, _SIDX, _NSS,
-        irr_labels=np.arange(len(rows), dtype=np.int32)))
+        irr_labels=np.arange(len(rows), dtype=np.int32),
+        trs_reference="star_row"))
 
     stats = sigma_star_spread_stats(full, rows, compact, _SIDX, _NSS)
     for arm in ("raw_ev", "frobenius_ev", "trace_ev"):

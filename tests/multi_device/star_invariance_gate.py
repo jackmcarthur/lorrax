@@ -127,6 +127,22 @@ def main():
     # per sym row, rather than assuming.
     sidx = np.asarray(sym.sym_idx_k)
     n_spatial = int(wfn.ntran)
+    # THE PREDICATE IS THE XOR, BECAUSE THE REFERENCE IS A FULL-BZ ROW.
+    # ``base`` below is ``T[mem[0]]`` — the star's first full-BZ member,
+    # which carries a ``sym_idx`` of its own and can itself be a
+    # time-reversal row.  So whether member ``j`` equals ``base`` or
+    # conj(``base``) is whether the two DIFFER in TRS-ness, not whether
+    # ``j`` alone is time-reversed.
+    #
+    # This used to test ``sidx[j] >= n_spatial`` — the ``ibz_slab``
+    # predicate — against a ``star_row`` reference.  That is exactly the
+    # mix-up ``star_broadcast``'s docstring prices at 183.61 eV, and here
+    # it made the gate REPORT A FALSE FAILURE on any deck whose star
+    # begins on a time-reversed row: it would demand equality where the
+    # conjugate holds and vice versa.  Correct on decks whose stars all
+    # begin spatial, which is a property of the op-selection policy and
+    # not of the physics.
+    trs = sidx >= n_spatial
     d_eq = d_cj = 0.0
     n_sp = n_tr = 0
     for v in np.unique(irr):
@@ -137,7 +153,7 @@ def main():
         for j in mem[1:]:
             e = float(np.abs(T[j] - base).max())
             c = float(np.abs(T[j] - np.conj(base)).max())
-            if int(sidx[j]) >= n_spatial:
+            if bool(trs[j] ^ trs[mem[0]]):
                 d_cj = max(d_cj, c); n_tr += 1
             else:
                 d_eq = max(d_eq, e); n_sp += 1
@@ -166,7 +182,8 @@ def main():
 
     # ---- 3. select -> broadcast is the identity -------------------------
     T_irr, labels = star_select(T, irr)
-    T_back = star_broadcast(T_irr, irr, sidx, n_spatial, labels)
+    T_back = star_broadcast(T_irr, irr, sidx, n_spatial, labels,
+                            trs_reference="star_row")
     d = float(np.abs(T_back - T).max()) / scale
     ok3 = d <= RTOL
     p0(f"[star] 3. select->broadcast round trip  {d:.3e}   "
@@ -190,7 +207,8 @@ def main():
         return np.asarray(jax.device_put(a, rep))
 
     T_irr_d, _ = star_select(T_dev, irr)
-    T_back_d = star_broadcast(T_irr_d, irr, sidx, n_spatial, labels)
+    T_back_d = star_broadcast(T_irr_d, irr, sidx, n_spatial, labels,
+                              trs_reference="star_row")
     spread_d = star_spread(T_dev, irr, sidx, n_spatial)
     d_sel = float(np.abs(_host(T_irr_d) - T_irr).max())
     d_bck = float(np.abs(_host(T_back_d) - T_back).max())

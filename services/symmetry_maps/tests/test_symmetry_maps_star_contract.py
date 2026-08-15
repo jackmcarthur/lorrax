@@ -121,7 +121,7 @@ def _hermitian_star_consistent(irr, sidx, nss, nb=4, seed=0):
     star, conjugated where the member's TRS-ness differs from the star's
     kept row.  The loop is a plain python ``for`` over rows using
     ``_star_conj_flags`` only for the PREDICATE — it never calls
-    ``star_broadcast``, so ``star_broadcast(star_select(A)) == A`` is a
+    ``star_broadcast``, so ``star_broadcast(star_select(A), trs_reference="star_row") == A`` is a
     claim about the helpers and not a restatement of how ``A`` was made.
     """
     rng = np.random.default_rng(seed)
@@ -237,7 +237,7 @@ def test_the_disagreement_count_can_fail():
 
 @pytest.mark.parametrize("name,irr,sidx,nss,expect", _CASES)
 def test_select_broadcast_round_trip_is_exact(name, irr, sidx, nss, expect):
-    """I1 + I3.  ``star_broadcast(star_select(A)) == A``, BIT-exact.
+    """I1 + I3.  ``star_broadcast(star_select(A), trs_reference="star_row") == A``, BIT-exact.
 
     Measured before 3e002f2's fix: 1.796e-01 relative on gnppm_debug and
     1.087e-14 after (the fix's own numbers).  Here the operand is built to
@@ -253,7 +253,7 @@ def test_select_broadcast_round_trip_is_exact(name, irr, sidx, nss, expect):
     _require_discriminating(irr, sidx, nss, expect)
     A = _hermitian_star_consistent(irr, sidx, nss)
     sel, labels = star_select(A, irr)
-    back = star_broadcast(sel, irr, sidx, nss, irr_labels=labels)
+    back = star_broadcast(sel, irr, sidx, nss, irr_labels=labels, trs_reference="star_row")
     assert np.array_equal(np.asarray(back), A), (
         f"{name}: round trip is not exact; "
         f"max|Δ| = {np.abs(np.asarray(back) - A).max():.3e}")
@@ -280,7 +280,7 @@ def test_the_round_trip_survives_non_monotone_first_occurrence():
     sel, got_labels = star_select(A, GNPPM_IRR)
     np.testing.assert_array_equal(got_labels, labels)
     back = star_broadcast(sel, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS,
-                          irr_labels=labels)
+                          irr_labels=labels, trs_reference="star_row")
     assert np.array_equal(np.asarray(back), A)
 
 
@@ -297,7 +297,7 @@ def test_sorted_label_order_breaks_the_round_trip():
     sel, labels = star_select(A, GNPPM_IRR)
     order = np.argsort(labels)
     wrong = star_broadcast(sel[order], GNPPM_IRR, GNPPM_SYM, GNPPM_NSS,
-                           irr_labels=labels)
+                           irr_labels=labels, trs_reference="star_row")
     err = np.abs(np.asarray(wrong) - A).max() / np.abs(A).max()
     assert err > 0.1, (
         f"sorted-order addressing must be visibly wrong; got {err:.3e}")
@@ -470,7 +470,7 @@ def test_the_class_and_the_free_functions_are_bit_equal(name, irr, sidx, nss,
     np.testing.assert_array_equal(km.labels, labels)
     np.testing.assert_array_equal(
         km.broadcast(sel), star_broadcast(sel, irr, sidx, nss,
-                                          irr_labels=labels))
+                                          irr_labels=labels, trs_reference="star_row"))
     assert km.spread(A) == star_spread(A, irr, sidx, nss)
     assert km.spread_rel(A) == km.spread(A) / np.abs(A).max()
     assert km.nk_full == len(irr)
@@ -613,9 +613,9 @@ def test_the_helpers_keep_a_device_operand_on_the_device():
     np.testing.assert_array_equal(labels_d, labels)
     assert float(np.abs(np.asarray(sel_d) - sel_h).max()) == 0.0
     back_h = star_broadcast(sel_h, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS,
-                            irr_labels=labels)
+                            irr_labels=labels, trs_reference="star_row")
     back_d = star_broadcast(sel_d, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS,
-                            irr_labels=labels)
+                            irr_labels=labels, trs_reference="star_row")
     assert isinstance(back_d, jax.Array)
     assert float(np.abs(np.asarray(back_d) - back_h).max()) == 0.0
     assert star_spread(dev, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS) == star_spread(
