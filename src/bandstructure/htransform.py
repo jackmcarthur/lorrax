@@ -1150,10 +1150,10 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
     THE UNFOLD IS THE SERVICE'S, NOT THIS MODULE'S.  Every IBZ→full-BZ
     map in the tree goes through ``symmetry_maps.star_broadcast``, reached
-    here by its single adapter ``file_io.kin_ion.broadcast_ibz_to_full_bz``
-    — the same call the kin_ion read path takes, with the same
-    ``ibz_slab`` predicate, because this is the same situation: a wedge
-    slab read verbatim off disk with no symmetry operation applied to it.
+    here by :func:`symmetry_maps.unfold_file_wedge_to_full_bz` — the FILE
+    wedge, ``wfn.kpoints``, which is what ``eqp1.dat`` is indexed by and
+    what BerkeleyGW means by the IBZ.  It shares its backend with the
+    kin_ion read path; no index table crosses into this module.
 
     WHAT THIS REPLACED, AND WHY.  It used to require a PRE-UNFOLDED
     full-BZ text file (``nk == sym.nk_tot``, refused otherwise) whose
@@ -1177,9 +1177,8 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
     if nb == 0:
         raise ValueError("Empty band window requested for EQP override")
 
-    from file_io.kin_ion import broadcast_ibz_to_full_bz
     from gw.eqp_bgw import read_bgw_eqp
-    from gw.kin_ion_io import star_tables
+    from symmetry_maps import unfold_file_wedge_to_full_bz
 
     kpts_file, _e_dft_ev, e_qp_ev, band_offset = read_bgw_eqp(eqp_file)
     nk_file, nb_file = e_qp_ev.shape
@@ -1226,7 +1225,11 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
             f"[{start}, {end}) — a short block cannot be silently padded.")
 
     # ---- THE unfold: wedge -> full BZ, through the service --------------
-    full_ev = np.asarray(broadcast_ibz_to_full_bz(window_ev, *star_tables(sym)))
+    # The FILE wedge: ``eqp1.dat`` is indexed by ``wfn.kpoints``, which is a
+    # different (and on two of three committed decks a different-LENGTH)
+    # k-set from the star wedge — see the register.  The call site says
+    # which without the reader needing to know what ``trs_reference`` is.
+    full_ev = np.asarray(unfold_file_wedge_to_full_bz(sym, window_ev))
     if full_ev.shape[0] != int(sym.nk_tot):
         raise ValueError(
             f"star_broadcast returned {full_ev.shape[0]} k-points, expected "
