@@ -1264,6 +1264,57 @@ inverse so the PROJECTOR is transpose-invariant; that argument covers the
 sum at `:189` but not obviously the per-op `keep` test at `:176`, which
 tests individual ops.
 
+### MEASURED, AND IT OVERTURNS THE RECEIVED EXPLANATION: centroid non-closure is NOT what drives the Si production deck's star spread
+
+2026-08-15.  The tree has stated in several places — `si_cohsex_debug/README.md`,
+`test_gw_jax_regression.py`'s tolerance comment, and (until this entry)
+`docs/architecture/symmetry_register.md` — that the production deck's within-star
+Sigma spread is caused by `centroids_frac_960.txt` being a literal,
+non-orbit-closed point set.  **That was never measured against the alternative.
+It has now been, and it is wrong.**
+
+An orbit-closed 960-point set was generated for the same deck by the same
+procedure the orbit-closed 144 set follows (`kmeans_cli 960 --orbit --seed 42
+--prune-n-val 8 --prune-n-cond 52`), and verified `closed=True`, worst residual
+**1.000e-06 on 48 ops** — identical to the 144 set, both in pure fractional
+coordinates and on the deck's (24,24,24) FFT grid.  It is shipped beside the
+original as `centroids_frac_960_orbitclosed.txt`.  The deck was pointed at it and
+the anchor re-run.
+
+| quantity | non-closed 960 (shipping) | orbit-closed 960 |
+|---|---|---|
+| closure, on-grid | `False`, worst 1.318e-01, 47/48 ops | `True`, worst 1.000e-06 |
+| star spread `[:16]` | 2.6111 meV | **1.9642 meV** |
+| star spread `[:60]` | 41.3376 meV | **39.8758 meV** |
+| sigSX MAE / max vs BGW | 0.1509 / 0.3030 | **3.3336 / 11.8904** |
+| sigCOH MAE / max vs BGW | 0.3513 / 1.2141 | **11.9480 / 39.0121** |
+| sigTOT MAE / max vs BGW | 0.4329 / 1.2525 | **14.9426 / 41.1405** |
+
+**Closure removed essentially none of the spread** — 4% at the full 60-band
+window, 25% at the 16 bands the anchor compares.  If non-closure were the
+mechanism, a closed set would have gone to ~0.000, which is what the 144-point
+set measures.  It did not.
+
+**And it cost a factor of ~35 in agreement with BerkeleyGW**, taking every
+column far outside the gate (limits 1.5 MAE / 5.0 max).  So the orbit-closed
+anchor is worse on the axis the anchor exists to measure and no better on the
+axis it was supposed to fix.  The deck is therefore left on the shipping set and
+the gate is green; this is recorded rather than acted on.
+
+HYPOTHESIS, NOT ESTABLISHED, for what actually drives it: the spread tracks
+centroid COUNT, not geometry.  The 144-point set measures exactly 0.000; both
+960-point sets measure ~40 meV over the full window whether closed or not.  The
+zeta fit at 960 runs with condition numbers around 1e7-1e8 and an rcond of
+1e-10 (`[zeta rank_truncate]` on any run of this deck), so numerical rank
+truncation breaking the symmetry is the natural suspect.  Testing that means a
+count sweep at fixed closure, which has not been done.
+
+CONSEQUENCE FOR THE ORBIT-CLOSURE WORK GENERALLY: orbit closure remains correct
+and worth having — `centroid_source_map_and_wrap` REFUSES without it, and a
+non-closed set forces the q-axis to the full BZ.  What is now measured is that
+on this deck it is not the source of the star spread, so "regenerate on a closed
+set" is not a fix for that symptom.
+
 ### MEASURED: how non-orbit-closed the Si production centroid set actually is
 
 2026-08-15, `refactor/eqp-ibz-2026-08-15`, Si production deck

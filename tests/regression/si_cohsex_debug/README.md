@@ -201,8 +201,12 @@ Known defects, measured and unfixed
    production run.**  Worst per-band spread within a star: **2.611 meV**
    (sigTOT).  It should be exactly 0.  The fast deck, whose 144-point centroid
    set *is* orbit-closed, measures exactly **0.000**.  The production 960-point
-   set is a literal (non-orbit-closed) point set, so the ISDF quadrature itself
-   breaks the 48-op point group.  This is why the IBZ-representative and
+   set is a literal (non-orbit-closed) point set — but **that is NOT the cause**,
+   which this README asserted until it was measured on 2026-08-15: an
+   orbit-closed 960-point set for this deck (`centroids_frac_960_orbitclosed.txt`,
+   `closed=True` at 1.000e-06 on 48 ops) moves the spread only 2.611 -> 1.964 meV
+   while making BerkeleyGW agreement ~35x worse.  The spread tracks centroid
+   COUNT, not closure; see `tests/KNOWN_FAILURES.md`.  This is why the IBZ-representative and
    full-BZ numbers in the table above differ, and why the gate uses the full BZ
    — an IBZ-only comparison hides it and depends on which representative you
    pick.  Not fixed here: fixing it means regenerating the production centroid
