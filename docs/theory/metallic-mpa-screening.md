@@ -564,6 +564,27 @@ fit's stamped occupations equal the body's live state
 (`gw.mpa.sigma.assert_head_body_occupation_match`) — two occupation states
 cannot leak into one iteration.
 
+### 5.3b Broadening: MPA passes eta through, GN-PPM floors it
+
+The two dynamic ansatzes do NOT share an effective broadening, and any
+cross-ansatz comparison that ignores this is confounded (registered in the
+sandbox KNOWN_LORRAX_ISSUES, 2026-08-15):
+
+- **MPA** passes the deck's `regularization_ev` straight into the `Sigma`
+  denominators — on the sodium campaign decks, eta = 0.25 eV, and every
+  R5/R6 claim quotes it explicitly.
+- **GN-PPM** silently floors its xi at
+
+      xi_floor = 2*omega_max / (24 - 2*edge)
+
+  which on this window class evaluates to 1.4286 eV — 5.7x the MPA value on
+  the same deck. The floor is printed at runtime but was documented nowhere
+  before this paragraph.
+
+Consequence: an MPA-vs-GN-PPM energy difference mixes physics with a 5.7x
+broadening mismatch. No such comparison may be claimed without either
+equalizing xi/eta or carrying this caveat verbatim.
+
 ### 5.4 Exchange, SX, Hartree: `diag(f)` end to end
 
 `gw.cohsex_sigma.build_Gij(occupation_state=...)` builds `G_ij = diag(f)`
