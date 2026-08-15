@@ -1051,10 +1051,36 @@ _DEFAULTS = {
     # instead of rotating the fixed DFT one into the QP basis.  Off keeps
     # QSGW fixed-density, which is what every result before 2026-08-04 was.
     "density_self_consistent": False,
-    # Run the SC loop's H / E / U on the IBZ, broadcasting back at the
-    # boundary.  Sigma stays on the full BZ -- it is an FFT over the
+    # Run the SC loop's H / E / U on the STAR wedge, broadcasting back at
+    # the boundary.  Sigma stays on the full BZ -- it is an FFT over the
     # k-grid.  Off keeps the loop entirely full-BZ.
-    "sc_on_ibz": False,
+    #
+    # DEFAULT FLIPPED False -> True, 2026-08-15, on the owner's standing
+    # directive that H^QP be built and eigh'd only on symmetry-reduced
+    # k-points.  Two measurements paid for the flip, both on
+    # ``gnppm_debug`` (file wedge 9, star wedge 5, so the two differ):
+    #
+    #   1. EQUIVALENCE, with ``sc_accelerator = linear``, ``sc_mixing = 1``:
+    #      the on and off arms agree to **1e-6 meV** -- the ``%15.9f``
+    #      print floor -- on E_QP at EVERY iterate and in the final
+    #      eqp0/eqp1, with identical k coordinates.  The map is exactly
+    #      k-set invariant, so the two arms have the same fixed point.
+    #
+    #   2. THE TRAJECTORY IS NOT, under the DEFAULT accelerator.  With
+    #      rCROP the same pair diverges to 24.45 meV by map call 5 and
+    #      113.3 meV in the final eqp0.  That is not a defect: rCROP's
+    #      least-squares mixing minimises a residual norm summed over the
+    #      loop's OWN k-set, so on the star wedge each orbit is counted
+    #      once and on the full BZ with its multiplicity.  Different
+    #      weights, different coefficients, same fixed point.  It does mean
+    #      an UNCONVERGED rCROP run's iterates move when this flag moves --
+    #      relevant given that the accepted Si QSGW run is on record as not
+    #      converged.
+    #
+    # This had rotted invisibly (crash at the eqp writer, the two wedges
+    # conflated) because no committed deck ran the SC path at all.  One now
+    # does: tests/regression/gnppm_debug/gnppm_sc.in.
+    "sc_on_ibz": True,
     # Update the q->0 head from the current QSGW Hamiltonian through the
     # precomputed parallel-transport connection.  Explicit opt-in preserves
     # every historical deck and makes a missing/stale artifact a refusal.
