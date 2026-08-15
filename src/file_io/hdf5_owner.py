@@ -292,28 +292,53 @@ def open_scope(path, stack, mode, *, where: str):
 # The measurement (GATE-7 style)
 # ---------------------------------------------------------------------------
 
-def mapped_hdf5_libraries() -> list[str]:
-    """Distinct libhdf5 shared objects mapped into THIS process, sorted.
+#: HDF5 ships companion libraries beside the core one, and they are NOT
+#: separate library instances: they are thin wrappers that call into the
+#: core object they were built against.  Counting them would make a
+#: perfectly safe single-stack process (h5py's wheel alone maps both
+#: ``libhdf5-<hash>.so`` and ``libhdf5_hl-<hash>.so``) report TWO, and the
+#: escalation in :func:`probe` keys on that count — so the distinction is
+#: load-bearing, not cosmetic.  Anything else beginning ``libhdf5`` is a
+#: core build, including cray's ``libhdf5_parallel_gnu_123.so``.
+_HDF5_COMPANION_PREFIXES = (
+    "libhdf5_hl", "libhdf5_cpp", "libhdf5_hl_cpp", "libhdf5hl_fortran",
+    "libhdf5_fortran", "libhdf5_java", "libhdf5_tools",
+)
 
-    Reads ``/proc/self/maps``.  Returns ``[]`` where that file does not
-    exist (non-Linux); an empty list means "not measurable here", not
-    "safe", and the caller's printed line says so.
-    """
+
+def _mapped_hdf5_objects():
+    """``(core, companion)`` libhdf5 basenames mapped into this process."""
     try:
         with open("/proc/self/maps", "r") as fh:
             lines = fh.readlines()
     except OSError:
-        return []
-    found = set()
+        return [], []
+    core, companion = set(), set()
     for line in lines:
         cut = line.rfind(" /")
         if cut < 0:
             continue
         base = os.path.basename(line[cut + 1:].strip())
         low = base.lower()
-        if low.startswith("libhdf5") and ".so" in low:
-            found.add(base)
-    return sorted(found)
+        if not (low.startswith("libhdf5") and ".so" in low):
+            continue
+        if low.startswith(_HDF5_COMPANION_PREFIXES):
+            companion.add(base)
+        else:
+            core.add(base)
+    return sorted(core), sorted(companion)
+
+
+def mapped_hdf5_libraries() -> list[str]:
+    """Distinct CORE libhdf5 objects mapped into THIS process, sorted.
+
+    Reads ``/proc/self/maps``.  Companions (``libhdf5_hl`` and friends)
+    are excluded — see :data:`_HDF5_COMPANION_PREFIXES`; they are
+    reported separately by :func:`probe`.  Returns ``[]`` where
+    ``/proc/self/maps`` does not exist (non-Linux); an empty list means
+    "not measurable here", not "safe", and the printed line says so.
+    """
+    return _mapped_hdf5_objects()[0]
 
 
 def shared_paths() -> list[str]:
@@ -351,7 +376,7 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
     same refusal :func:`note_open` raises.  Under the default ``measure``
     policy nothing is raised; the line is the deliverable.
     """
-    libs = mapped_hdf5_libraries()
+    libs, companions = _mapped_hdf5_objects()
     rows = alternation_rows()
     both = [r for r in rows if r[1] and r[2]]
     unsafe = [r for r in both if r[4]]
@@ -360,7 +385,10 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
     if not libs:
         shown = "unmeasurable (no /proc/self/maps)"
     else:
-        shown = f"{len(libs)} mapped: " + ", ".join(libs)
+        shown = f"{len(libs)} core mapped: " + ", ".join(libs)
+        if companions:
+            shown += (f" (+{len(companions)} companion: "
+                      + ", ".join(companions) + ")")
     print_fn(f"  [hdf5-probe {where}] libhdf5 {shown}; "
              f"HDF5_USE_FILE_LOCKING={locking}; policy={policy()}")
     if both:
@@ -396,7 +424,8 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
                 f"  fix  : split the metadata onto a sibling file, or set "
                 f"{POLICY_ENV}=measure to record the condition instead of "
                 f"refusing on it.")
-    return {"libraries": libs, "shared": [r[0] for r in both],
+    return {"libraries": libs, "companions": companions,
+            "shared": [r[0] for r in both],
             "unsafe": [r[0] for r in unsafe], "rows": rows}
 
 

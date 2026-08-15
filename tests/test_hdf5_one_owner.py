@@ -245,8 +245,33 @@ def test_the_probe_counts_mapped_libhdf5_objects_and_prints_them():
     assert out["libraries"] == libs
     joined = "\n".join(lines)
     assert "[hdf5-probe unit-test]" in joined
-    assert f"{len(libs)} mapped" in joined
+    assert f"{len(libs)} core mapped" in joined
     assert "HDF5_USE_FILE_LOCKING=" in joined
+
+
+def test_the_probe_does_not_count_hl_as_a_second_library():
+    """``libhdf5_hl`` is a WRAPPER, not a second HDF5 instance.
+
+    h5py's wheel maps both ``libhdf5-<hash>.so`` and
+    ``libhdf5_hl-<hash>.so``; the second calls into the first and shares
+    its cache.  Counting it would make a perfectly safe single-stack
+    process report TWO libraries — and :func:`probe`'s escalation keys on
+    that count, so it would report A1's unsafe condition on a machine
+    where the condition does not hold.  Measured on the deployed stack:
+    the true count is 2 cores (h5py's + the FFI's cray build) and 1
+    companion.
+    """
+    core, companion = HO._mapped_hdf5_objects()
+    if not os.path.exists("/proc/self/maps"):
+        pytest.skip("/proc/self/maps is not available here")
+    assert not any(n.lower().startswith("libhdf5_hl") for n in core), (
+        f"libhdf5_hl counted as a core library: {core}")
+    assert all(n.lower().startswith("libhdf5") for n in core + companion)
+    # The cray parallel build IS a core library despite its long name.
+    assert HO._HDF5_COMPANION_PREFIXES and not (
+        "libhdf5_parallel_gnu_123.so.200".startswith(
+            HO._HDF5_COMPANION_PREFIXES)), (
+        "the cray parallel build must classify as core, not companion")
 
 
 def test_the_probe_names_the_unsafe_condition_when_it_holds(fit_store,
@@ -258,10 +283,14 @@ def test_the_probe_names_the_unsafe_condition_when_it_holds(fit_store,
     that is what the pipeline does today.  ``strict`` turns the same
     measurement into the refusal.
     """
+    # The deployed pair, faked: this suite's own process maps only h5py's
+    # core object (the FFI .so is not loaded under JAX_PLATFORMS=cpu), so
+    # the condition has to be constructed to be tested.
     monkeypatch.setattr(
-        HO, "mapped_hdf5_libraries",
-        lambda: ["libhdf5-9e18f0c6.so.320.0.0",
-                 "libhdf5_parallel_gnu_123.so.200"])
+        HO, "_mapped_hdf5_objects",
+        lambda: (["libhdf5-9e18f0c6.so.320.0.0",
+                  "libhdf5_parallel_gnu_123.so.200"],
+                 ["libhdf5_hl-69da89c9.so.320.0.0"]))
     HO.note_close(fit_store,
                   HO.note_open(fit_store, HO.STACK_FFI, "a",
                                where="test: SlabIO write"))
