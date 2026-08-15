@@ -1195,10 +1195,25 @@ class SymMaps:
             self.q_irr_kgrid_int = self.kvecs_asints.copy()
             return
 
-        # BGW convention: `mtrx` (= `sym_matrices` here) acts on G-vectors
-        # in column form: `G' = mtrx @ G`. For real-space coords the
-        # corresponding action uses `Rinv = inv(mtrx)`: `r' = Rinv @ r + τ`
-        # (see orbit_syms.centroid_source_map_and_wrap,
+        # THE G-SPACE ACTION USES ``mtrx.T``, NOT ``mtrx``.  This comment
+        # used to say `G' = mtrx @ G`, which contradicts both the line
+        # directly below it (``sym_mats_k = mtrx.transpose(0,2,1)``) and
+        # the only place G is actually rotated
+        # (``wfn_loader/loader.py:604``, ``einsum('ij,kj->ki',
+        # sym_mats_k[sym_idx], k_gvecs)``).  It also contradicted the
+        # correct statement in ``syms_crystal_to_cartesian`` below
+        # (``G_full = mtrx.T @ G_irr = sym_mats_k @ G_irr``).
+        #
+        # It is corrected rather than deleted because a reader of
+        # ``SymMaps.__init__`` hits this before either of those, and the
+        # transposed convention it stated is the one the known-broken
+        # ``tests/bench/charge_density.py:159-174`` adopted — it rotates
+        # G with ``R_grid`` (= ``mtrx``) and is wrong on every
+        # non-symmorphic deck.
+        #
+        # So: k and G both transform with ``sym_mats_k = mtrx.T``
+        # (column form).  Real space uses `Rinv = inv(mtrx)`:
+        # `r' = Rinv @ r + τ` (see orbit_syms.centroid_source_map_and_wrap,
         # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
         # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
