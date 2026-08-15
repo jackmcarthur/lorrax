@@ -72,8 +72,6 @@ _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
 # root finder.  The Padé algebra remains reachable directly through
 # ``pade_fit`` as a diagnostic red twin; the disk driver must not silently
 # choose between two numerical methods.
-_FIT_SOLVE = "loewner"
-_FIT_AFFINE = True
 _FIT_EIG = "jax_qr"
 
 
@@ -154,7 +152,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
         tile = samples.reshape(n_rows * n_cols, n_omega)
         Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
             tile, z, n, guards=guards, rcond=rcond,
-            solve=_FIT_SOLVE, affine=_FIT_AFFINE, eig=_FIT_EIG)
+            eig=_FIT_EIG)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
@@ -393,8 +391,7 @@ def run_fit_driver(
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     fit_provenance = dict(provenance or {})
     fit_provenance.update({
-        "solve_mode": _FIT_SOLVE,
-        "solve_affine": _FIT_AFFINE,
+        "solve_mode": "loewner",   # the only solve since 2026-08-15
         "solve_rcond": rcond,
         "eig_mode": _FIT_EIG,
         "fit_fused": True,
@@ -415,8 +412,7 @@ def run_fit_driver(
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
-        "solve": _FIT_SOLVE,
-        "affine": _FIT_AFFINE,
+        "solve": "loewner",
         "eig": _FIT_EIG,
         "rcond": rcond,
         "n_cols_budget": int(plan["n_cols"]),
