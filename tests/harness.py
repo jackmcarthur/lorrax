@@ -814,22 +814,36 @@ def _parse_kcrys_blocks(path: Path) -> dict:
 
 
 def _parse_star_spread_header(path: Path):
-    """``(star_spread_ev, n_star_members)`` from the writer's header, or None.
+    """``(per_band (nb,), n_star_members)`` from the writer's header, or None.
 
     The diagnostic is MEASURED UPSTREAM, on the full-BZ Sigma, against the
     symmetry service's own star labels
     (``gw_output._star_spread_of_sigma_diag``) — it cannot be recomputed
     from this file, because the file is the wedge and unfolding a wedge is
     a gather, which would report 0.000 by construction.
+
+    THE PER-BAND VECTOR IS WHAT THIS RETURNS, deliberately.  The scalar
+    ``star_spread_ev`` beside it is the max over the driver's WHOLE sigma
+    window, which is a wider question than any given comparison asks: on
+    the Si anchor that window is 60 bands and reads 41.34 meV, while the
+    16 bands the BerkeleyGW fixture covers read 2.61.  The band scope is
+    the consumer's knowledge, so the consumer takes its own max.
     """
+    per_band, n_members = None, None
     for ln in Path(path).read_text().splitlines():
+        if not ln.startswith("#") and ln.strip():
+            break
+        m = re.match(r"#\s*star_spread_ev_per_band\s+(.*)$", ln)
+        if m:
+            per_band = np.asarray([float(x) for x in m.group(1).split()])
+            continue
         m = re.match(r"#\s*star_spread_ev\s+(\S+)", ln)
         if m:
             n = re.search(r"over the (\d+)\s+full-BZ k", ln)
-            return float(m.group(1)), (int(n.group(1)) if n else None)
-        if not ln.startswith("#") and ln.strip():
-            break
-    return None
+            n_members = int(n.group(1)) if n else None
+    if per_band is None:
+        return None
+    return per_band, n_members
 
 
 def compare_to_bgw(output_file: Path, fixture: Path, labels=(
@@ -935,13 +949,21 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
     hdr = _parse_star_spread_header(output_file)
     if hdr is None:
         raise AssertionError(
-            f"{output_file} carries no '# star_spread_ev' header line.  That "
-            f"diagnostic is measured on the full BZ inside gw_output before "
-            f"the writer reduces to the wedge; without it there is nothing "
-            f"here to report, and recomputing it from a wedge file would "
-            f"return a fake 0.000.")
-    out["_star_spread"] = hdr[0] * 1e3
-    out["_nstar"] = hdr[1]
+            f"{output_file} carries no '# star_spread_ev_per_band' header "
+            f"row.  That diagnostic is measured on the full BZ inside "
+            f"gw_output before the writer reduces to the wedge; without it "
+            f"there is nothing here to report, and recomputing it from a "
+            f"wedge file would return a fake 0.000.")
+    per_band, n_members = hdr
+    if per_band.shape[0] < nb:
+        raise AssertionError(
+            f"star-spread row covers {per_band.shape[0]} bands but this "
+            f"comparison spans {nb}; the file's sigma window is narrower "
+            f"than the BerkeleyGW fixture.")
+    # THE CONSUMER'S OWN SCOPE: the max over exactly the bands compared
+    # above, not the driver's whole sigma window.
+    out["_star_spread"] = float(per_band[:nb].max()) * 1e3
+    out["_nstar"] = n_members
     return out
 
 
