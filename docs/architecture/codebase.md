@@ -478,9 +478,11 @@ Written by `isdf_fitting.fit_zeta_chunked_to_h5` via `SlabIO`.
 
 `file_io.tagged_arrays.read_restart_state_from_h5` / `write_restart_state_to_h5`. Lets you skip the zeta-fit stage on a rerun. Contains V_q, ψ bundle arrays, kin_ion submatrix pointers, and related metadata.
 
-### 6.6 Output — `eqp.dat` / `eqp1.dat`
+### 6.6 Output — `eqp0.dat` / `eqp1.dat`
 
-BGW-compatible text. Written by `file_io.sigma_output.write_eqp_g0w0` / `write_eqp1`. Columns depend on path (G₀W₀ one-shot vs. self-consistent) — see `write_eqp_table`.
+BGW-compatible text, on the **IBZ wedge** (one block per `wfn.kpoints` entry, k-coordinates in the BGW `(3f13.9,i8)` block header). Written by `gw.eqp_bgw.write_bgw_eqp`, via `assemble_eqp` — one assembly shared by the live driver (`gw_output.write_results`) and the post-hoc CLI (`gw.eqp_bgw.make_eqp_bgw`), so the V_H seam, the mean-field gate, the Z-factor and the formatter each exist once. `eqp1` differs from `eqp0` only in the `E_QP` column (Z-linearized vs zeroth-order; Z=1 in static modes ⇒ identical).
+
+Not to be confused with the **full-BZ** `sigma_diag.dat` / `eqp_g0w0.dat` (`file_io.sigma_output.write_sigma_to_file` / `write_eqp_g0w0`), which use `k-point N:` blocks plus a `# kcrys` line. The two bases are deliberate — see `docs/drivers.md` and `tests/test_eqp_kpoint_basis.py`.
 
 ### 6.7 Output — `sigma_mnk.h5` (new format)
 
@@ -664,7 +666,8 @@ main                                       [gw/gw_jax.py]
 | **QSGW Σ^xc** | `gw/qsgw_utils.py : build_qsgw_sigma_xc_from_h5` |
 | **Anderson mixing (SC)** | `mixing/acceleration.py : rcrop_nojit`, `hermitian_to_upper_flat` |
 | **Write sigma_mnk.h5** | `file_io/sigma_output.py : write_sigma_omega_h5` |
-| **Write eqp.dat / eqp1.dat** | `file_io/sigma_output.py : write_eqp_g0w0`, `write_eqp1` |
+| **Write eqp0.dat / eqp1.dat** (IBZ wedge) | `gw/eqp_bgw.py : assemble_eqp`, `write_bgw_eqp` |
+| **Write sigma_diag.dat / eqp_g0w0.dat** (full BZ) | `file_io/sigma_output.py : write_sigma_to_file`, `write_eqp_g0w0` |
 | **SlabIO (phdf5 writer)** | `file_io/slab_io.py : SlabIO` (backends in `_slab_io_ffi.py` / `_slab_io_allgather.py`) |
 | **Centroid selection** | `centroid/kmeans_cli.py : main` (algorithm: `centroid/kmeans_isdf.py`) |
 | **Dipole generation** | `psp/get_dipole_mtxels.py : main` |

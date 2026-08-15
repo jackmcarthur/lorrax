@@ -1080,6 +1080,60 @@ the non-SC branch (`gw_jax.py:543`), where the whole object is DFT basis.
 a new Σ channel cannot join the wrong group silently.  It does not and
 cannot catch this: the mixing is in the consumer, not the declaration.
 
+## The BSE Q-path takes its QP energies through an E_DFT heuristic justified by a false premise
+
+OPEN, UNMEASURED, 2026-08-15.  Found while making the energy files
+self-describing (`refactor/eqp-ibz-2026-08-15`); registered rather than
+fixed, because fixing it means changing what the Q-path is handed, not
+what the writers emit.
+
+`src/bse/exciton_bands.py:1469-1472` says, as the stated reason for
+passing `input_file=None`:
+
+> LORRAX's own GW writes eqp1.dat on the FULL BZ (one block per k of the
+> WFN, same order), so the energy-matching branch is the correct one and
+> it maps 1:1 here.
+
+**That is false.**  `gw_output.py:1113` subsets every eqp array through
+`kirr_to_kfull`, and `gw_jax.py:779` passes `kpoints_irr_frac=wfn.kpoints`
+— `eqp{0,1}.dat` are on the IBZ wedge, and the map is 8→64 on Si 4x4x4,
+not 1:1.  It is the same false belief that produced the 291 meV and
+600 meV phantom disagreements downstream, here load-bearing in a comment.
+
+The NUMBERS are currently right, which is why this is a register entry and
+not a bug fix: `input_file=None` routes to the E_DFT fingerprint branch
+(`bse_window.py:585-616`), and because E_DFT is constant over a symmetry
+star, matching each full-BZ k to the wedge block reproducing its
+mean-field energies performs the IBZ→full unfold correctly.  The exposure
+is that the branch which would CHECK the basis
+(`bse_window.py:578`, `assert nk_ibz == sym.nk_red`) is deliberately
+disabled on this path, and the heuristic aliases whenever two distinct
+stars agree to within `tol_ev = 0.01` across the whole compared window —
+`best_ibz` then silently takes the QP shift from the wrong star.
+
+To fix: `read_bgw_eqp` already parses and returns the crystal coordinates
+(`bse_window.py:445-447, 467`) and `apply_eqp_corrections` discards them on
+its first line (`bse_window.py:563`).  Give the Q-path a full-BZ k list and
+join on those coordinates instead of on energies; the file has carried them
+all along.
+
+Sibling stale claims found in the same sweep, both corrected on that
+branch (no behaviour change): `docs/drivers.md:276` called `--eqp FILE` a
+"full-BZ `eqp1.dat`", contradicting `docs/drivers.md:226`; and
+`exciton_bands.py:1533` said htransform "swallows the parse failure with a
+log line", where `htransform.py:1313-1320` raises `SystemExit`.
+
+**Constraint discovered, do not "clean this up" later:** `sigma_diag.dat`
+and `eqp_g0w0.dat` must stay on the FULL BZ.
+`bandstructure.htransform.read_eqp_energies` takes the `sigX=` column of
+`sigma_diag.dat` as its `--eqp-file`, indexes blocks positionally as
+full-BZ k (`htransform.py:1170-1173`) and refuses any count other than
+`sym.nk_tot` (`htransform.py:1200-1206`); `eqp_g0w0.dat` is joined against
+the IBZ `eqp1.dat` by the out-of-tree `make_eqp_htformat.py` to build that
+input (`docs/drivers.md:226`).  The tree therefore holds both bases on
+purpose; what stops them being confused is the per-block coordinate, not a
+common row count.
+
 ## `KStarMap.spread_rel` loses NaN on an emulated partitioned reduction
 
 OPEN, MEASURED, 2026-08-07, owner decision pending.  Carried in the suite
