@@ -10,7 +10,7 @@ linear mixing passed the loop carry itself — so the peak was two of
 them, a P-independent doubling of the largest object on the surface.
 
 Nothing in the loop reads it.  ``SCState``'s own docstring says so
-("purely for the final output writer … it does not feed the next
+("purely for the final output writers; it does not feed the next
 iteration"); the only consumers are ``dump_sigma_omega_h5_final`` and
 ``run_sc_driver``'s finalize, and both want the LAST one, which still
 survives.
@@ -65,9 +65,9 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
     """Every ``SCState(...)`` built as a map ARGUMENT carries H and i only.
 
     The finalize state at the end of ``_run_rcrop`` legitimately carries
-    the last Σ, so the check is on the constructions whose keywords are
-    exactly the two fields the map reads — there must be at least one —
-    and on every other construction still naming ``last_sigma_result``.
+    the last ``SCOutputs``, so the check is on the constructions whose
+    keywords are exactly the two fields the map reads — there must be at
+    least one — and on every other construction still naming ``outputs``.
     """
     fn = _func(driver)
     inputs, finals = [], []
@@ -79,7 +79,7 @@ def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
                 keys)
     assert inputs, f"{driver} builds no bare input SCState"
     for keys in finals:
-        assert "last_sigma_result" in keys, (
+        assert "outputs" in keys, (
             f"{driver} builds an SCState with {sorted(keys)} — an argument "
             f"to gw_iteration_map must carry H_qp_dft and iteration only")
 
@@ -92,7 +92,7 @@ def test_rcrop_clears_the_capture_cells_before_the_map_call():
     the next Σ.
     """
     body = _block("_run_rcrop")
-    clear = body.index("_last_sigma[0] = None")
+    clear = body.index("_last_outputs[0] = None")
     call = body.index("gw_iteration_map(")
     assert clear < call
 
@@ -123,10 +123,9 @@ def test_sc_output_lifecycle_has_one_owner_per_large_artifact():
 
 def test_rcrop_preserves_output_metadata_from_the_last_map():
     body = _block("_run_rcrop")
-    for field in ("_last_scissor_fit", "_last_tail_scissor_fit"):
-        assert f"{field}[0] = None" in body
-        assert f"{field}[0] = state_out." in body
-        assert f"{field[1:]}={field}[0]" in body
+    assert "_last_outputs[0] = None" in body
+    assert "_last_outputs[0] = state_out.outputs" in body
+    assert "outputs=_last_outputs[0]" in body
 
 
 def test_per_map_files_are_output_diagnostics_not_final_eqp_math():

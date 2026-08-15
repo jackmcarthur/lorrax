@@ -39,8 +39,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import jax_profile
 import common.timing as timing
-from .gw_config import (
-    ComputeMode, env_bool, refuse_unimplemented_compute_mode)
+from .gw_config import ComputeMode, env_bool
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +127,8 @@ def screening_requests_for(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     if mode is ComputeMode.MPA:
         # MPA owns a shared multi-frequency disk walk, not independent W
-        # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver.
+        # requests.  ``gw.mpa.model.build_mpa_fit`` will be called by the
+        # driver once the gw_config.UNIMPLEMENTED_MODES row is deleted.
         return []
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")

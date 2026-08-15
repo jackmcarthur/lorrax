@@ -75,7 +75,7 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
-from .scissor import apply_conduction_scissor_to_tail, fit_scissor
+from .scissor import ScissorFit, apply_conduction_scissor_to_tail, fit_scissor
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
@@ -137,15 +137,38 @@ class SCInputs:
 
 
 @dataclass(frozen=True)
+class SCOutputs:
+    """Output-only records captured from one map call.
+
+    Purely for the final output writers (``run_sc_driver``'s finalize,
+    ``dump_sigma_omega_h5_final``, ``dump_qp_wfn_artifacts``, the per-map
+    snapshot); nothing here feeds the next fixed-point evaluation.
+
+    ``sigma_result`` and ``sigma_basis_U`` are on the FULL BZ and must
+    AGREE, because they are consumed together by ``run_sc_driver``'s
+    final rotate-back — Σ is a k-grid FFT, so its k-set is not
+    negotiable, and the U stored beside it follows.  ``sigma_basis_U``
+    is the DFT→QP unitary that DEFINED the basis ``sigma_result`` was
+    computed in (the eigh of the *previous* carry) — the writer must
+    rotate Σ back to DFT with THIS U, not the converged U of the final
+    carry: the two agree only at convergence, and using the converged U
+    mis-rotates Σ_x/V_H whenever the loop stops before the fixed point
+    (maximally so at max_iter=1, where the correct U is the identity).
+    """
+
+    sigma_result: SigmaResult
+    sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
+    scissor_fit: ScissorFit | None
+    tail_scissor_fit: ScissorFit | None
+
+
+@dataclass(frozen=True)
 class SCState:
     """State carried across self-consistent iterations.
 
-    K-SET INVARIANT (with ``SCInputs.kstar``):
-      * ``H_qp_dft`` is on the LOOP's k-set — the IBZ when a map is given.
-      * ``last_sigma_result`` and ``last_sigma_basis_U`` are on the FULL
-        BZ and must AGREE, because they are consumed together by
-        ``run_sc_driver``'s final rotate-back.  Σ is a k-grid FFT, so its
-        k-set is not negotiable; the U stored beside it follows.
+    K-SET INVARIANT (with ``SCInputs.kstar``): ``H_qp_dft`` is on the
+    LOOP's k-set — the IBZ when a map is given — while ``outputs``
+    carries full-BZ objects (see :class:`SCOutputs`).
 
     The iteration "carry" is **just** ``H_qp_dft`` — the QP Hamiltonian
     on the active subspace (``slices.sigma`` of the wfn bundle), in
@@ -153,28 +176,13 @@ class SCState:
     ``efermi``) is derivable by the next iteration's first step
     (``vmap(eigh)``), so we don't carry redundant state — that would
     let convergence checks read inconsistent (E, H) pairs if anyone
-    forgot to keep them in sync.
-
-    ``last_sigma_result`` is purely for the final output writer (eqp.dat,
-    sigma_diag.dat, freq_debug.dat); it does not feed the next iteration.
-    ``last_sigma_basis_U`` is the DFT→QP unitary that DEFINED the basis
-    ``last_sigma_result`` was computed in (the eigh of the *previous*
-    carry) — the writer must rotate Σ back to DFT with THIS U, not the
-    converged U of the final carry: the two agree only at convergence,
-    and using the converged U mis-rotates Σ_x/V_H whenever the loop
-    stops before the fixed point (maximally so at max_iter=1, where the
-    correct U is the identity).
+    forgot to keep them in sync.  ``outputs`` is purely for the final
+    output writers; it does not feed the next iteration.
     """
 
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
-    last_sigma_result: SigmaResult | None = None
-    last_sigma_basis_U: jax.Array | None = None   # (nk, nb, nb) ⟨DFT_m|QP_n⟩
-    # Small output-only records from this map.  They never feed the next
-    # fixed-point evaluation; the SC diagnostics and final WFN writer own
-    # their only consumers.
-    last_scissor_fit: object | None = None
-    last_tail_scissor_fit: object | None = None
+    outputs: SCOutputs | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -862,17 +870,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     derived quantities (E_qp, U_qp, efermi) are recomputed each call;
     the only carried state is ``H_qp_dft`` on the active subspace.
 
-    Screening is mode-orthogonal: each iteration asks the configured Σ
-    scheme which W's it needs (via :func:`gw.screening.screening_requests_for`),
-    evaluates them in one pass (:func:`gw.screening.compute_screening`),
-    and hands the resulting ``{role → W_q}`` dict to
+    Screening is mode-orthogonal: each iteration asks
+    :func:`gw.screening.compute_screening_model` for the configured Σ
+    scheme's screening representation and hands the resulting
+    ``{role → W_q}`` dict to
     :func:`gw.sigma_dispatch.compute_sigma_xc`.  No ``compute_chi0``
     call lives here directly — adding a new Σ scheme that wants extra
-    W frequencies is purely a screening_requests_for + compute_sigma_xc
-    change.
+    W frequencies is purely a screening + compute_sigma_xc change.
     """
-    from .screening import compute_screening, screening_requests_for
-
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
     if state.iteration == 0:
@@ -1131,7 +1136,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
         static_head_terms=inputs.static_head_terms,
         head_resolver=inputs.head_resolver,
-        quad=inputs.quad, e_ref=inputs.e_ref,
+        quad=inputs.quad,
         config=inputs.config, meta=inputs.meta, mesh_xy=inputs.mesh_xy,
         sym=inputs.sym, wfn=inputs.wfn,
         band_slices=inputs.band_slices,
@@ -1240,15 +1245,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     return SCState(
         H_qp_dft=H_qp_dft_new,
         iteration=state.iteration + 1,
-        last_sigma_result=sigma_result,
-        # FULL-BZ U.  These two fields are consumed TOGETHER by
-        # run_sc_driver's final rotate-back, so they must share a k-set,
-        # and ``sigma_result``'s is the full BZ by construction --
-        # compute_sigma_xc runs there.  Storing the IBZ U_qp here is the
-        # mismatch that raised 'k' 10 vs 16.
-        last_sigma_basis_U=U_full,
-        last_scissor_fit=scissor_fit,
-        last_tail_scissor_fit=tail_fit,
+        outputs=SCOutputs(
+            sigma_result=sigma_result,
+            # FULL-BZ U.  These two fields are consumed TOGETHER by
+            # run_sc_driver's final rotate-back, so they must share a
+            # k-set, and ``sigma_result``'s is the full BZ by
+            # construction -- compute_sigma_xc runs there.  Storing the
+            # IBZ U_qp here is the mismatch that raised 'k' 10 vs 16.
+            sigma_basis_U=U_full,
+            scissor_fit=scissor_fit,
+            tail_scissor_fit=tail_fit,
+        ),
     )
 
 
@@ -1364,8 +1371,8 @@ def _write_sc_eqp_snapshot(
     tail_start = int(inputs.band_slices.sigma.stop)
     tail_stop = int(inputs.meta.b_id_4_user) - band_offset
 
-    active_fit = state_out.last_scissor_fit
-    tail_fit = state_out.last_tail_scissor_fit
+    active_fit = state_out.outputs.scissor_fit
+    tail_fit = state_out.outputs.tail_scissor_fit
     comments = (
         f"SC map={int(call_index):04d} role={role}; columns are "
         "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
@@ -1397,19 +1404,13 @@ def _write_sc_eqp_snapshot(
 
 def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
     """Remove only managed per-map text snapshots from an earlier run."""
-    import re
-    from common.collectives import process_rank
+    from .qsgw_utils import remove_managed
 
-    removed = 0
-    managed = re.compile(r"eqp0_iter[0-9]{4}\.dat\Z")
-    if process_rank() == 0 and os.path.isdir(input_dir):
-        for name in os.listdir(input_dir):
-            if managed.fullmatch(name):
-                os.remove(os.path.join(input_dir, name))
-                removed += 1
-        if removed:
-            print_fn(f"  SC map energies: cleared {removed} stale snapshots")
-    barrier("sc.eqp_snapshots.clear", print_fn=print_fn)
+    removed = remove_managed(
+        input_dir, r"eqp0_iter[0-9]{4}\.dat\Z",
+        barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
+    if removed:
+        print_fn(f"  SC map energies: cleared {len(removed)} stale snapshots")
 
 
 # ---------------------------------------------------------------------------
@@ -1536,10 +1537,7 @@ def _run_linear_mixing(
             state_new = SCState(
                 H_qp_dft=H_mixed,
                 iteration=state_new.iteration,
-                last_sigma_result=state_new.last_sigma_result,
-                last_sigma_basis_U=state_new.last_sigma_basis_U,
-                last_scissor_fit=state_new.last_scissor_fit,
-                last_tail_scissor_fit=state_new.last_tail_scissor_fit,
+                outputs=state_new.outputs,
             )
         E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -1719,13 +1717,10 @@ def _run_rcrop(
     def _to_entry(A):
         return jax.device_put(_pad_bands(A), entry_sh)
 
-    # Bookkeeping for per-iteration printing + final SigmaResult capture.
+    # Bookkeeping for per-iteration printing + final SCOutputs capture.
     _e_history: list[np.ndarray] = [
         np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
-    _last_sigma: list = [None]
-    _last_basis_U: list = [None]
-    _last_scissor_fit: list = [None]
-    _last_tail_scissor_fit: list = [None]
+    _last_outputs: list = [None]
     _iter_idx = [0]
     rms_history: list[float] = []
 
@@ -1750,16 +1745,10 @@ def _run_rcrop(
         # P-independent doubling of the peak.  Only the LAST one has a
         # consumer -- ``dump_sigma_omega_h5_final`` -- and it survives:
         # this cell is refilled below and the loop exits with it.
-        _last_sigma[0] = None
-        _last_basis_U[0] = None
-        _last_scissor_fit[0] = None
-        _last_tail_scissor_fit[0] = None
+        _last_outputs[0] = None
         state_in = SCState(H_qp_dft=H, iteration=_iter_idx[0])
         state_out = gw_iteration_map(state_in, inputs)
-        _last_sigma[0] = state_out.last_sigma_result
-        _last_basis_U[0] = state_out.last_sigma_basis_U
-        _last_scissor_fit[0] = state_out.last_scissor_fit
-        _last_tail_scissor_fit[0] = state_out.last_tail_scissor_fit
+        _last_outputs[0] = state_out.outputs
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
         E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
@@ -1825,7 +1814,7 @@ def _run_rcrop(
             f"(exactly 0.0: {pad_max == 0.0})")
 
     # Final state: use the last x from rCROP (Hermitised) and the last
-    # captured SigmaResult so the writer downstream has the full
+    # captured SCOutputs so the writer downstream has the full
     # frequency-grid Σ_c, head pieces, etc.
     # Back to the REPLICATED carry layout: every consumer of the returned
     # state (``_scissor_E_qp_for_outofrange``, ``final_qp_eigenstates``,
@@ -1835,10 +1824,7 @@ def _run_rcrop(
     state_final = SCState(
         H_qp_dft=H_final,
         iteration=_iter_idx[0],
-        last_sigma_result=_last_sigma[0],
-        last_sigma_basis_U=_last_basis_U[0],
-        last_scissor_fit=_last_scissor_fit[0],
-        last_tail_scissor_fit=_last_tail_scissor_fit[0],
+        outputs=_last_outputs[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
@@ -1883,7 +1869,7 @@ def run_sc_driver(
     input_dir: str,
     enk_dft,
     print_fn: Callable = print,
-) -> tuple[SigmaResult, jax.Array, list[float]]:
+) -> tuple[SigmaResult, jax.Array, list[float], bool]:
     """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
 
     Wraps the whole SC machinery — band partition (protected / in-range /
@@ -1896,7 +1882,7 @@ def run_sc_driver(
     -------
     sigma_result : SigmaResult
         The LAST iteration's Σ, **rotated back to the DFT basis** with
-        the basis-of-record U (``state.last_sigma_basis_U`` — the
+        the basis-of-record U (``state.outputs.sigma_basis_U`` — the
         unitary that defined the basis the last ``compute_sigma_xc``
         call ran in; the converged U is one iteration ahead and agrees
         only at the fixed point — worst case ``max_iter=1``, where the
@@ -1910,6 +1896,11 @@ def run_sc_driver(
         ``H_QP = kin_ion + sigma_total``.
     rms_history : list[float]
         RMS ΔE (eV) per iteration.
+    rotations_written : bool
+        True when this call wrote ``qp_wfn_rotations.h5`` (the
+        ``config.debug.write_wfn_h5`` artifact dump ran).  The driver's
+        generic writer reads this fact instead of re-deriving the
+        predicate, so it cannot overwrite the authoritative SC file.
     """
     import dataclasses
 
@@ -2032,7 +2023,7 @@ def run_sc_driver(
         history_depth=sc.history_depth,
         mixing=sc.mixing,
     )
-    sigma_result = state_final.last_sigma_result
+    sigma_result = state_final.outputs.sigma_result
     print_fn(
         f"  SC done: {len(rms_history)} GW map calls"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
@@ -2046,6 +2037,7 @@ def run_sc_driver(
     # eigenvalues + U are the *true* QP eigenstates of the SC fixed
     # point (the driver's post-Σ-seam eigh differs slightly because the
     # SC carry applies the band partition).
+    rotations_written = False
     if config.debug.write_wfn_h5:
         dump_qp_wfn_artifacts(
             state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
@@ -2054,6 +2046,7 @@ def run_sc_driver(
             logical_band_stop=int(meta.b_id_4_user),
             output_dir=input_dir, print_fn=print_fn,
         )
+        rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym, print_fn=print_fn,
@@ -2062,7 +2055,7 @@ def run_sc_driver(
     # Rotate every QP-basis SigmaResult field back to the DFT basis.
     # The Σ matrices live in the basis of the wfn bundle the last
     # ``compute_sigma_xc`` call ran in — the basis DEFINED by
-    # ``state.last_sigma_basis_U``.  Downstream driver code (H build +
+    # ``state.outputs.sigma_basis_U``.  Downstream driver code (H build +
     # eigh, writer, freq_debug) is written for DFT-basis matrices
     # (kin_ion is DFT basis throughout).
     # PLACED ONCE, FOR ALL FIVE ROTATIONS, at ``band_rotation_spec`` —
@@ -2075,7 +2068,8 @@ def run_sc_driver(
     # than a slow success — and plain ``jax.device_put`` of a host array
     # fires the hidden replica ``assert_equal`` all-gather.  ``_place``
     # routes each kind correctly; only the spec changed.
-    U = _place(state_final.last_sigma_basis_U, mesh_xy, _band_rotation_spec())
+    U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
+               _band_rotation_spec())
     sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
@@ -2095,7 +2089,7 @@ def run_sc_driver(
         sigma_omega_h5_path=sigma_omega_h5_path,
         efermi_dft_ev=float(wfn.efermi) * RYD_TO_EV,
     )
-    return sigma_result_dft, sigma_total, rms_history
+    return sigma_result_dft, sigma_total, rms_history, rotations_written
 
 
 def final_qp_eigenstates(
@@ -2175,7 +2169,7 @@ def dump_sigma_omega_h5_final(
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
 
-    Pulls the full ω-grid Σ_c tensor from ``state.last_sigma_result``
+    Pulls the full ω-grid Σ_c tensor from ``state.outputs.sigma_result``
     (which the iteration map captures from each
     :func:`compute_sigma_xc` call but does NOT write to disk during SC
     iterations — see the ``write_sigma_omega_h5=False`` flag in
@@ -2185,7 +2179,8 @@ def dump_sigma_omega_h5_final(
     Returns the on-disk path (or ``None`` for static modes that didn't
     populate a Σ_c(ω) tensor).
     """
-    sigma_result = state.last_sigma_result
+    sigma_result = (
+        state.outputs.sigma_result if state.outputs is not None else None)
     if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
         return None
     from .dynamic_sigma import write_sigma_omega
@@ -2339,7 +2334,8 @@ def dump_qp_wfn_artifacts(
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:
         enk_full_base_ry = None
-        tail_fit = state.last_tail_scissor_fit
+        tail_fit = (state.outputs.tail_scissor_fit
+                    if state.outputs is not None else None)
         if tail_fit is not None:
             if logical_band_stop is None:
                 raise ValueError(
@@ -2377,6 +2373,7 @@ def dump_qp_wfn_artifacts(
 
 __all__ = [
     "SCInputs",
+    "SCOutputs",
     "SCState",
     "gw_iteration_map",
     "make_initial_state_from_dft",

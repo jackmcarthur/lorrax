@@ -6,8 +6,9 @@ The dispatch decides which Σ kernel runs internally; the iteration map
 sees one signature and one result type.
 
 The dispatch is EXHAUSTIVE over ``gw_config.ComputeMode``: a mode with
-no kernel here is refused by name, not absorbed by the last branch.  MPA
-is that case today.
+no kernel here is refused by name, not absorbed by the last branch.
+MPA has a branch below but is gated at entry by
+``gw_config.UNIMPLEMENTED_MODES`` until its pipeline passes end to end.
 
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
@@ -20,9 +21,12 @@ Every band-indexed field comes back in the basis of the ``wfns`` bundle
 this module was handed; the four field tuples beside the dataclass say
 which of them a consumer sees in which basis.
 
-This module owns *no compute* of its own — every kernel lives under
-``cohsex_sigma`` (static channels), ``ppm_pipeline`` (dynamic Σ_c) or
-``qsgw_utils`` (the QSGW Hermitisation).  It only orchestrates.
+The Σ kernels live under ``cohsex_sigma`` (static channels),
+``ppm_pipeline`` (two-point PPM Σ_c), ``gw.mpa`` (multipole Σ_c) and
+``qsgw_utils`` (the QSGW Hermitisation); this module orchestrates them
+and owns the shared dynamic-Σ finalization seam
+(:func:`finalize_dynamic_sigma`: head injection, at-DFT interpolation,
+file write, QSGW build).
 """
 
 from __future__ import annotations
@@ -145,11 +149,11 @@ SIGMA_BASIS_FIELDS = (
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
-#: path: ``omega_dft_rel_ev`` is E_DFT − E_F (``ppm_pipeline.py``:219-223,
-#: from ``get_enk_bandrange``).  TRAP: under self-consistency it labels
-#: bands by the DFT index while ``sigma_c_at_dft_diag_ev`` — the
-#: interpolation it drives, ``ppm_pipeline.py``:236 — labels them by the
-#: QP index.
+#: path: ``omega_dft_rel_ev`` is E_DFT − E_F, built from
+#: ``get_enk_bandrange`` in ``dynamic_sigma.eval_sigma_c_at_dft_energies``.
+#: TRAP: under self-consistency it labels bands by the DFT index while
+#: ``sigma_c_at_dft_diag_ev`` — the interpolation it drives, in that same
+#: function — labels them by the QP index.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
 )
@@ -430,7 +434,6 @@ def compute_sigma_xc(
     static_head_terms,
     head_resolver,
     quad,
-    e_ref: float,
     config,
     meta,
     mesh_xy: Mesh,
@@ -468,6 +471,10 @@ def compute_sigma_xc(
           the ω-zero anchor for the PPM two-point fit.
         * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
           for the second fit point.
+        * ``"mpa_fit"`` — on-disk path of the MPA screening-model fit
+          store (``gw.screening.compute_screening_model`` for
+          ``ComputeMode.MPA``); the MPA branch reads it instead of an
+          in-memory W.
 
         ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
         means picking the role labels it needs in
@@ -476,12 +483,12 @@ def compute_sigma_xc(
         no plumbing changes elsewhere.  Until it has a branch here it is
         refused by name; it is never served by the PPM one.
     e_qp_ev
-        Per-(k, n) QP energies (eV) used by the PPM QSGW build to evaluate
-        Σ_c(E_m, E_n).  Required for PPM modes; ignored for static.
+        Per-(k, n) QP energies (eV) used by the QSGW build to evaluate
+        Σ_c(E_m, E_n).  Required for dynamic modes; ignored for static.
     static_head_terms, head_resolver
         q→0 head plumbing; ``static_head_terms`` is None when ``do_G0`` is
         false in the config.
-    quad, e_ref
+    quad
         Static minimax quadrature for χ₀; produced by
         ``minimax_screening.build_static_quadrature`` once per W solve.
     config, meta, mesh_xy, sym, wfn, band_slices, input_dir
@@ -630,13 +637,19 @@ def compute_sigma_xc(
             sigma_coh_kij_ry=sig_coh,
         )
 
+    # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
+    # energies — one check above both branches, one message.
+    if e_qp_ev is None:
+        raise ValueError(
+            f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
+            "(QP energies for the QSGW Σ_c evaluation).")
+
     if mode is ComputeMode.MPA:
         from file_io import mpa_store
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+        from .mpa.sigma_windows import CROSSING_NODE_FLOOR
 
-        if e_qp_ev is None:
-            raise ValueError("MPA Sigma requires QP evaluation energies")
         try:
             fit_path = W_by_role["mpa_fit"]
         except KeyError as exc:
@@ -652,7 +665,8 @@ def compute_sigma_xc(
             crossing_target_error=float(
                 config.mpa.sigma_crossing_target_error),
             max_rank=int(config.mpa.sigma_max_nodes),
-            crossing_max_nodes=max(500, int(config.mpa.sigma_max_nodes)),
+            crossing_max_nodes=max(
+                CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
         head = mpa_store.read_head_fit(fit_path, to_unit="Ry")
@@ -696,10 +710,6 @@ def compute_sigma_xc(
             f"gw.screening.screening_requests_for.")
 
     # Dynamic PPM modes: need W_static + W_probe.
-    if e_qp_ev is None:
-        raise ValueError(
-            f"compute_sigma_xc: PPM mode {mode!r} requires e_qp_ev "
-            "(QP energies for the QSGW Σ_c evaluation).")
     if "probe" not in W_by_role:
         raise KeyError(
             f"compute_sigma_xc: PPM mode {mode!r} requires "

@@ -480,7 +480,7 @@ def main(argv=None):
 				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,
-				quad=quad, e_ref=e_ref,
+				quad=quad,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, band_slices=band_slices,
 				input_dir=input_dir,
@@ -575,6 +575,10 @@ def main(argv=None):
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
 	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
+	# ``rotations_written`` is run_sc_driver's own report of whether it
+	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
+	# than re-deriving the predicate.
+	rotations_written = False
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
 		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
@@ -586,7 +590,7 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
-			sigma_result, sigma_total, _ = run_sc_driver(
+			sigma_result, sigma_total, _, rotations_written = run_sc_driver(
 				wfns, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
@@ -775,9 +779,7 @@ def main(argv=None):
 			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
-			write_qp_rotations=not (
-				qp_solver is QPSolver.SELF_CONSISTENT
-				and config.debug.write_wfn_h5),
+			write_qp_rotations=not rotations_written,
 			print_fn=print0,
 		)
 	timing.record("gw_jax.output", time.perf_counter() - _t_out)
