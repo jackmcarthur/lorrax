@@ -138,9 +138,9 @@ sample and pole stores; the readers compare these identities rather than
 assuming that equal shapes mean equal physics.
 
 `gw.mpa.sampling` owns only this geometry. `gw.mpa.sample_plan` classifies the
-points and chooses an evaluator. Constructing a metallic plan is supported;
-evaluating it is not yet supported because occupation-weighted interband and
-intraband chi and Sigma terms have not landed.
+points and chooses an evaluator. Metallic plans are evaluated as well as
+constructed; which kernel serves each metal point, and the measured reasoning,
+belong to [Metallic MPA screening](metallic-mpa-screening.md).
 
 ## 4. How each chi sample is evaluated
 
@@ -329,10 +329,11 @@ energy, the four insulating branches are
 The table determines the usual topology, not the answer by decree. The
 planner computes bounds from actual signed energies and live fitted poles. A
 nominally sign-definite rectangle whose lower bound reaches zero refuses
-instead of silently applying a divergent Laplace representation. Supporting
-small, inverted, or fractional-occupation systems requires splitting such a
-cell at the actual denominator boundary and supplying the missing occupation
-physics.
+instead of silently applying a divergent Laplace representation. Small,
+inverted, and fractional-occupation systems are where that happens for a
+physical reason rather than a planning mistake; the occupation weights and
+the split that keeps the rectangles sign definite are owned by
+[Metallic MPA screening](metallic-mpa-screening.md).
 
 ## 8. The core, electronic stripe, and plasmon slab
 
@@ -587,9 +588,11 @@ The QSGW order is sequential.  The first half of iteration `i` evaluates the
 direct head on the full MPA grid using the chemical potential and occupations
 carried from iteration `i-1`.  Only after Sigma/H assembly and the current
 orbital rotation does the fixed-electron MP1 solve produce the state consumed
-by iteration `i+1`.  Those occupations are used only by the head correction;
-the finite-q body, Green functions, and general Sigma occupation semantics are
-still the insulating implementations and remain capability-gated.
+by iteration `i+1`.  That carried state is one `gw.efermi.OccupationState`
+and reaches the finite-q body and Sigma as well as the head correction;
+[Metallic MPA screening](metallic-mpa-screening.md) owns what each consumer
+does with it, which pieces are threaded end to end and which are not, and the
+capability-gate status.
 
 One-shot and diagonal fixed-point QP solvers can consume a finalized external
 pole store.  Fully self-consistent QSGW rebuilds the body and head models
@@ -696,11 +699,13 @@ Use these dependencies when moving beyond the validated profile.
   sweeps, not the approximation. The production interface refuses values above
   four until a larger resident batch is memory-certified.
 
-- **Small-gap or metallic occupations.** The sample-grid functions exist, but
-  the evaluator still refuses. Occupied and empty selection must come from
-  actual occupations, fractional weights must enter both chi and Sigma, and any
-  sign-straddling energy cell must be split before the mode can be called
-  metallic.
+- **Small-gap or metallic occupations.** Owned by
+  [Metallic MPA screening](metallic-mpa-screening.md). The cost model changes
+  in two places: the origin row leaves the sampled-quadrature family for an
+  exact divided-difference tile scan, and the damped-line bandwidth is set by
+  the occupation supports rather than by $\omega_m$, so it grows with the
+  smearing width as well as the band window. Sigma rank grows because the
+  crossing core absorbs the Fermi-surface straddle.
 
 ## 15. Ownership map
 
