@@ -147,6 +147,75 @@ def _tightest_k(enk_ry: np.ndarray, b: int) -> tuple[int, float]:
     return k, float(d[k])
 
 
+def snap_cut_to_clean_boundary(
+    enk_ry: np.ndarray,
+    cut: int,
+    *,
+    tol_ry: float = DEGENERACY_TOL_RY,
+    lo: int = 0,
+    hi: int | None = None,
+) -> int:
+    """Nearest band count ``<= hi`` whose boundary splits no multiplet.
+
+    THE SAME CONSTRAINT :func:`resolve_band_window` ENFORCES, asked as a
+    one-sided question.  ``resolve_band_window`` is given a *window* the user
+    asked for and may only widen it outward; this is given a single INTERNAL
+    sampling point — a band count at which a converging sum is to be
+    evaluated — where neither direction loses anything the user requested, so
+    the nearest clean boundary is the right answer and staying near the
+    requested fraction is what matters.  Both read the same one number per
+    boundary, :func:`boundary_min_gaps`; there is no second notion of "clean"
+    in the tree.
+
+    Parameters
+    ----------
+    enk_ry : (nk, nb) float array
+        Band energies in **Rydberg**, ascending in the band axis at each k.
+        Pass the array the sum will actually be truncated against.
+    cut : int
+        Requested band count (= boundary index: bands ``< cut`` are kept).
+    tol_ry : float
+        Two bands are "the same multiplet" within this, in Ry.
+    lo, hi : int
+        Inclusive search bounds on the returned count.  ``hi`` defaults to
+        ``nb``.  ``lo``/``hi`` are themselves returned unchecked when the
+        walk reaches them — the caller owns what a degenerate endpoint means.
+
+    Returns
+    -------
+    int
+        The clean boundary nearest ``cut``, ties broken DOWNWARD (fewer
+        bands), which keeps a set of ascending cuts from crossing.
+
+    Notes
+    -----
+    The outer boundaries (0 and ``nb``) are ``+inf`` in
+    :func:`boundary_min_gaps` and are therefore always clean — the walk
+    terminates.
+    """
+    e = np.asarray(enk_ry, dtype=np.float64)
+    nb = int(e.shape[1])
+    hi = nb if hi is None else int(hi)
+    lo = int(lo)
+    if not (0 <= lo <= hi <= nb):
+        raise ValueError(
+            f"snap_cut_to_clean_boundary: bad bounds lo={lo} hi={hi} nb={nb}")
+    gaps = boundary_min_gaps(e)
+    tol = float(tol_ry)
+    cut = int(min(max(int(cut), lo), hi))
+    for delta in range(0, max(cut - lo, hi - cut) + 1):
+        for cand in ((cut - delta), (cut + delta)):     # downward tie-break
+            if lo <= cand <= hi and gaps[cand] > tol:
+                return int(cand)
+    # Unreachable while either endpoint is clean, which boundary_min_gaps
+    # guarantees for 0 and nb; a caller-restricted [lo, hi] can in principle
+    # contain no clean boundary at all, and that is a refusal, not a guess.
+    raise BandWindowDegeneracyError(
+        f"snap_cut_to_clean_boundary: no band count in [{lo}, {hi}] has a "
+        f"multiplet-clean boundary at tol "
+        f"{tol * 1e3 * _EV_PER_RY:.3f} meV (requested {cut}).")
+
+
 def resolve_band_window(
     enk_ry: np.ndarray,
     n_occ: int,

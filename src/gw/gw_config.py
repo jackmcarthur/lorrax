@@ -1384,6 +1384,17 @@ _DEFAULTS = {
     # dynamical pole and adds the analytic static-COHSEX term for those
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
+    # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
+    # OFF by default.  ON evaluates the Sigma_c band sum at THREE band
+    # counts in one pass -- nband*{~50%, ~75%, 100%} of the conduction
+    # range, snapped so no cut splits a degenerate multiplet -- by building
+    # three DISJOINT band-bracket Green's functions per tau against one
+    # W(tau), and fits S(N) = S_inf + A/N to extrapolate to infinite bands.
+    # GN-PPM only.  REFUSES BY NAME (never silently disables) when the band
+    # sum has n_cond <= n_occ.  Costs ~3x the Sigma tau-loop wall: G(tau)
+    # lives in the centroid basis, so the FFT chain and the psi projection
+    # are paid once per bracket regardless of how the bands are split.
+    "sigma_band_extrapolation": False,
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
@@ -1957,6 +1968,10 @@ class DynamicSigmaConfig:
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
+    #: Band-convergence extrapolation of Sigma_c.  Read ONLY by the GN-PPM
+    #: pipeline (``gw.ppm_pipeline``); MPA and COHSEX do not consult it and
+    #: are not wired for it.
+    band_extrapolation: bool = False
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -2588,6 +2603,7 @@ class LorraxConfig:
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
+            band_extrapolation=bool(_g("sigma_band_extrapolation")),
         )
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run

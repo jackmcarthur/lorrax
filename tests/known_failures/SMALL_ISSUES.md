@@ -754,6 +754,27 @@ silent overwrite.
     Evidence `/pscratch/sd/j/jackm/ioaudit_0811/logs_cotenancy_oom_G2/`.
     [io-dead-code-audit lane, 2026-08-11]
 
+51. **The fused `gw_conv` FFI takes W in k-SPACE, so `ifftn(W(tau))` cannot
+    be hoisted out of a loop that contracts several G(tau) against one
+    W(tau).** Found wiring `sigma_band_extrapolation`
+    (`gw.band_extrapolation`), which builds three disjoint band-bracket
+    Green's functions per tau against ONE W(tau). The W-only half of the
+    spatial chain is now an explicit, hoistable stage —
+    `ppm_tau_kernel.SpatialKernel.prep_w`, `src/gw/ppm_tau_kernel.py:219,304` —
+    and on the DECOMPOSED chain (`LORRAX_FFT_FFI_FUSED=0`) it does hoist:
+    n brackets cost `2n + 1` transforms instead of `3n`. On the certified
+    production default (fused) `prep_w` is the IDENTITY, because
+    `ffi.fft.make_gw_conv_ffi`'s handler signature is
+    `(G_flat, W_flat) -> sigma_flat` with W in k-space and all three
+    transforms inside the one call (`src/ffi/fft.py:377`, `:402-417`), so
+    the W transform is recomputed once per bracket: `3n` transforms, i.e.
+    one third of the FFT chain wasted at n = 3. Fixing it needs a second
+    handler entry that accepts W already in R-space — a C++/ABI change to
+    `liblorrax_ffi.so`, deliberately out of scope for the extrapolation
+    lane. Not a correctness defect; a named, quantified, ABI-shaped
+    optimisation. [band-extrapolation lane, 2026-08-15]
+
+
 ## Fixed (strike-in-place graveyard — newest first)
 
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module

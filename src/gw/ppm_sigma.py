@@ -98,12 +98,23 @@ class PPMBuildResult:
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    # (n_omega, nk, nb, nb).  Layout is carried BY THE ARRAY'S OWN
+    # (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS THE BAND-COUNT
+    # AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
+    # ``[0, band_counts[i])``, so ``sigma_c_kij[-1]`` is the ordinary
+    # full-band Σ_c and is what every downstream consumer takes.  Length 1
+    # in the ordinary case (``band_counts == (nband,)``), 3 under
+    # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
+    #
+    # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
     # SHARDING (single source of truth): replicated/uncommitted under
     # sigma_omega_layout=replicated (historical), or
-    # P(None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
+    # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: The LOGICAL band count each leading-axis element sums to.  Aligned
+    #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
+    #: and nothing else needs either.
+    band_counts: tuple[int, ...] = ()
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -119,10 +130,12 @@ class _SigmaBranchTiles(NamedTuple):
     still attached (stripped once, after the gather).
     """
     tiles: list                      # list[np.ndarray], one per addressable shard
-    tile_index: list                 # list[tuple[slice, ...]] 4-D global indices
+    tile_index: list                 # list[tuple[slice, ...]] 5-D global indices
     devices: list                    # owning jax devices, aligned with tiles
-    spatial_padded: tuple            # (nk_proj, m_pad, n_pad) global padded extents
-    sharding: NamedSharding          # P(None, None, 'x', 'y') over the 4-D global
+    spatial_padded: tuple            # (n_brk, nk_proj, m_pad, n_pad) padded extents
+                                     # (the ω axis sits BETWEEN n_brk and nk_proj
+                                     # in the assembled cube, so it is not here)
+    sharding: NamedSharding          # P(None, None, None, 'x', 'y'), 5-D global
     nb_real: int                     # real QP window extent (pre-pad), for strip
 
 
@@ -604,6 +617,7 @@ def _run_sigma_branch(
     wfns,
     mesh_xy: Mesh,
     meta,
+    brackets: tuple[tuple[int, int], ...],
     log_tag: str = "",
     print_fn=print,
     use_shipped_minimax_tables: bool = True,
@@ -661,6 +675,7 @@ def _run_sigma_branch(
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        brackets=brackets,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
     # project="full" windows — owner order 2026-07-28); crossing windows
@@ -669,6 +684,7 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         merged_x=True,
+        brackets=brackets,
     )
 
     # One async-D2H accumulator over the memory-tile sink: Σ_c(ω,k,m,n)
@@ -676,9 +692,10 @@ def _run_sigma_branch(
     # the full (n_ω,n_k,n_b,n_b) buffer never exists on any GPU until the
     # final device assembly at finalize().  (copy_to_host_async + a short
     # deque overlap GPU-τ_{k+lag} with the numpy-τ_k accumulate.)
+    n_brk = len(brackets)
     sink = _MemoryTileSink(
-        shape=(n_omega, nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        shape=(n_brk, n_omega, nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
     )
     accumulator: _SigmaAccumulator = _TauAccumulator(
         omega_vec=omega_vec, sink=sink)
@@ -709,8 +726,8 @@ def _run_sigma_branch(
         tiles=tiles,
         tile_index=tile_index,
         devices=tile_devices,
-        spatial_padded=(nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        spatial_padded=(n_brk, nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
         nb_real=nb_proj,
     ), windows
 
@@ -794,6 +811,7 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_cfg: DynamicSigmaConfig,
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
+    plan: 'BandBracketPlan | None' = None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
@@ -803,9 +821,27 @@ def compute_sigma_c_ppm_omega_grid(
     a stale/typo'd name must raise, not silently default); the derived
     ω-grid arrives as an explicit data argument.  ``ppm_cfg``/``quad``
     never travel below this driver.
+
+    ``plan`` is the band-bracket plan (:mod:`gw.band_extrapolation`).
+    ``None`` means the trivial one — a single bracket over every band —
+    which is the ordinary Σ_c and is bit-identical to the un-bracketed
+    code this replaced.  A three-bracket plan makes the τ kernel build
+    three DISJOINT Green's functions per τ against one W(τ), and the
+    returned cube's leading axis carries their CUMULATIVE sums.
+
+    The quadrature, the ω grid, E_ref_A/E_ref_B, W(τ) and the ISDF
+    representation are all built from the FULL band range BEFORE the
+    bracket loop and shared verbatim by every bracket — which is what
+    makes the three points differ by band count and nothing else.
     """
+    from .band_extrapolation import trivial_plan
 
     s = wfns.slices
+    if plan is None:
+        plan = trivial_plan(int(s.nb_full), int(s.b2 - s.b0),
+                            int(meta.b_id_4_user or s.b4) - int(s.b0))
+    brackets = plan.bounds
+    n_brk = plan.n_brackets
     psi_proj_xr = wfns.xr(s.sigma)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
@@ -972,7 +1008,8 @@ def compute_sigma_c_ppm_omega_grid(
 
     sigma_kij_host = (
         None if sharded_layout
-        else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
+        else np.zeros((n_brk, n_omega, nk_proj, nb_proj, nb_proj),
+                      dtype=np.complex128)
     )
 
     common_branch_kwargs = dict(
@@ -990,6 +1027,7 @@ def compute_sigma_c_ppm_omega_grid(
         meta=meta,
         print_fn=print_fn,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+        brackets=brackets,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
@@ -1041,8 +1079,12 @@ def compute_sigma_c_ppm_omega_grid(
         idx = np.asarray(br.omega_idx, dtype=np.int64)
         if tile_acc is None:
             tile_meta = branch_tiles
+            # The bracket axis leads and the branch's ω axis sits BEHIND it
+            # (a branch owns a subset of ω but every bracket), so the full-ω
+            # accumulator keeps t's axis 0 and widens axis 1.
             tile_acc = [
-                np.zeros((n_omega,) + t.shape[1:], dtype=np.complex128)
+                np.zeros((t.shape[0], n_omega) + t.shape[2:],
+                         dtype=np.complex128)
                 for t in branch_tiles.tiles]
         else:
             # All branches run the same ψ window on the same mesh, so
@@ -1054,7 +1096,7 @@ def compute_sigma_c_ppm_omega_grid(
                 f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
         with timing.section("sigma.branch_fold"):
             for d, t in enumerate(branch_tiles.tiles):
-                tile_acc[d][idx] += t
+                tile_acc[d][:, idx] += t
 
     # Single end-of-stage gather: assemble the global padded Σ_c from the
     # per-rank host tiles and reconstruct it on every rank's host — ONCE,
@@ -1067,8 +1109,10 @@ def compute_sigma_c_ppm_omega_grid(
     if not sharded_layout and tile_acc is not None:
         assert tile_meta.nb_real == nb_proj
         with timing.section("sigma.host_gather"):
-            padded_shape = (n_omega,) + tuple(
-                int(s) for s in tile_meta.spatial_padded)
+            # spatial_padded is (n_brk, nk, m_pad, n_pad); the ω axis is
+            # INSERTED at position 1, behind the leading bracket axis.
+            _sp = tuple(int(v) for v in tile_meta.spatial_padded)
+            padded_shape = (_sp[0], n_omega) + _sp[1:]
             if int(jax.process_count()) == 1:
                 # Every shard is addressable (single process, any device
                 # count — no shard-0 assumption, Bug C): pure host
@@ -1101,13 +1145,14 @@ def compute_sigma_c_ppm_omega_grid(
     # (it replaces 'sigma.host_gather', which does not run here).
     if sharded_layout:
         with timing.section("sigma.tile_finalize"):
-            gshape = (n_omega, nk_proj, nb_proj, nb_proj)
+            gshape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
             if tile_acc is None:
                 # No branch produced tiles (all-empty branches): a zero
                 # Σ_c, mirroring the replicated path's untouched zeros
                 # buffer.  Same metadata idiom as
                 # _MemoryTileSink.host_tiles()'s empty path.
-                sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+                sharding = NamedSharding(
+                    mesh_xy, P(None, None, None, 'x', 'y'))
                 devices = list(sharding.addressable_devices)
                 dmap = sharding.devices_indices_map(gshape)
                 local_shape = sharding.shard_shape(gshape)
@@ -1120,7 +1165,7 @@ def compute_sigma_c_ppm_omega_grid(
                 # resolved to identity — padded extents ARE the real
                 # extents (pattern #7: assert it, don't assume it).
                 assert tuple(int(s) for s in tile_meta.spatial_padded) \
-                    == (nk_proj, nb_proj, nb_proj), (
+                    == (n_brk, nk_proj, nb_proj, nb_proj), (
                     f"sharded Σ layout saw a padded window "
                     f"{tile_meta.spatial_padded} despite the "
                     f"divisibility guard (nb={nb_proj})")
@@ -1129,11 +1174,20 @@ def compute_sigma_c_ppm_omega_grid(
                 tile_index = tile_meta.tile_index
             # static_limit fold, rank-local — same per-element order as
             # the replicated path (branch sum first, then the static
-            # term); tile_index[d] is (ω-slice, k-slice, m-slice,
-            # n-slice) into the global cube.
+            # term); tile_index[d] is (bracket-slice, ω-slice, k-slice,
+            # m-slice, n-slice) into the global cube.
+            #
+            # THE TERM GOES INTO BRACKET 0 ONLY, not into every bracket.
+            # It is ω- AND band-count-independent (a static-COHSEX term
+            # over the occupied states and the RI window, with no
+            # unoccupied tail), so it is a CONSTANT offset on the band-sum
+            # series: adding it to the first bracket puts it into all three
+            # cumulative sums exactly once, which is what a constant offset
+            # must do.  Adding it to every bracket would multiply it by the
+            # bracket index under the cumulative sum.
             if sigma_static_host is not None:
-                for d, ix4 in enumerate(tile_index):
-                    tile_acc[d] += sigma_static_host[tuple(ix4[1:])][None, ...]
+                for d, ix5 in enumerate(tile_index):
+                    tile_acc[d][0] += sigma_static_host[tuple(ix5[2:])][None, ...]
             arrays = [jax.device_put(t, dev)
                       for t, dev in zip(tile_acc, devices)]
             sigma_kij_sharded = jax.make_array_from_single_device_arrays(
@@ -1142,15 +1196,30 @@ def compute_sigma_c_ppm_omega_grid(
     # static_limit: fold the ω-independent invalid-pole static-COHSEX
     # term into Σ_c at every ω (host add; the sharded layout folded it
     # tile-locally above — identical values).
+    # (Bracket 0 only — see the sharded twin above for why.)
     if sigma_static_host is not None and not sharded_layout:
-        sigma_kij_host += sigma_static_host[None, ...]
+        sigma_kij_host[0] += sigma_static_host[None, ...]
 
+    # ── THE BRACKETS BECOME BAND COUNTS ─────────────────────────────────
+    # Up to here the leading axis holds DISJOINT band brackets; a
+    # cumulative sum along it turns them into Σ_c at each of the plan's
+    # band counts, with the last element the ordinary full-band Σ_c.  At
+    # n_brk = 1 the cumulative sum is the identity on the values, which is
+    # what keeps the default path bit-identical.  Done in place on the
+    # replicated path so the default run pays no second copy of the cube.
     if sharded_layout:
-        sigma_kij_req = sigma_kij_sharded
+        # Axis 0 is replicated in the Σ sharding, so the scan is entirely
+        # shard-local; pin the output sharding so it cannot drift off the
+        # layout every consumer downstream reads.
+        sigma_kij_req = jax.jit(
+            lambda a: jnp.cumsum(a, axis=0),
+            out_shardings=sigma_kij_sharded.sharding)(sigma_kij_sharded)
     else:
+        np.cumsum(sigma_kij_host, axis=0, out=sigma_kij_host)
         sigma_kij_req = jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
+        band_counts=tuple(int(c) for c in plan.counts),
     )
