@@ -551,22 +551,25 @@ def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
                           P(None, None, None) if u_spec is None else u_spec)
     k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
 
+    # Replication is an ENFORCED output contract (out_shardings), not a
+    # body hint: at P=4 the trailing with_sharding_constraint was dropped
+    # by the partitioner and the host read local-shard-plus-zeros — 22 of
+    # 29 IBZ rows exactly 0.0 in every eqp snapshot, max|dE| = VBM to six
+    # decimals, and the MP1 mu solved on a three-quarters-zero table
+    # (QUALITY_PATTERNS §4: the optimized HLO is the only ground truth).
     if eigvalsh_only:
-        @jax.jit
+        @_functools.partial(jax.jit, out_shardings=rep_E)
         def _f(H):
             H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
             H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
-            E = jax.vmap(jnp.linalg.eigvalsh)(H_h)
-            return jax.lax.with_sharding_constraint(E, rep_E)
+            return jax.vmap(jnp.linalg.eigvalsh)(H_h)
         return _f
     else:
-        @jax.jit
+        @_functools.partial(jax.jit, out_shardings=(rep_E, rep_U))
         def _f(H):
             H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
             H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
             E, U = jax.vmap(jnp.linalg.eigh)(H_h)
-            E = jax.lax.with_sharding_constraint(E, rep_E)
-            U = jax.lax.with_sharding_constraint(U, rep_U)
             return E, U
         return _f
 
