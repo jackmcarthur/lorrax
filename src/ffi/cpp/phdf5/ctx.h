@@ -240,4 +240,36 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes);
 // callers are the synchronous read handlers by construction.
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes);
 
+// ─── THE LIVE-CTX REGISTRY (SLAB_IO_ROOT_CAUSE_AUDIT.md B2) ──────────────
+//
+// A handler's ctx handle arrives as an int64 in a DEVICE buffer and is turned
+// back into a pointer by ``reinterpret_cast<PhdfCtx*>``.  Before B1 that
+// buffer was read without stream ordering, so the int64 could be stale
+// allocator content: either a garbage address (immediate segfault on the
+// first field access) or — worse, because it corrupts quietly — a pointer to
+// a PREVIOUS iteration's already-closed ctx, i.e. a use-after-free whose
+// damage surfaces somewhere else entirely, e.g. at the next close's
+// writer-thread join.  That is the suspected route to S1.
+//
+// B1 removes the race.  This is the second line: every value that comes off
+// that seam is CHECKED against the set of contexts this library currently has
+// open before anything dereferences it, so a residual race — from a path we
+// have not audited, from a double close, from a handle minted by the other
+// platform leg — becomes a named refusal with got/want/fix instead of a
+// dereference.  Insert at open (after the ctx is fully built), erase at the
+// top of close (before teardown starts).
+//
+// ``n_live`` is an out-param rather than a second no-argument function on
+// purpose: a ``size_t live_ctx_count()`` would mangle IDENTICALLY in the CUDA
+// and host legs, and this header's whole ABI-identity argument above is that
+// no phdf5 symbol may do that.  Taking a ``PhdfCtx*`` puts the leg tag in the
+// mangled name.  (The version script hides both anyway — belt and braces, in
+// that order.)
+void register_live_ctx(PhdfCtx* ctx);
+// Returns whether this pointer WAS live — the erase and the test are one
+// locked operation so ``close_ctx`` can use it as the double-close guard
+// without a check-then-erase window.
+bool unregister_live_ctx(PhdfCtx* ctx);
+bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
+
 }  // namespace lorrax_ffi::phdf5
