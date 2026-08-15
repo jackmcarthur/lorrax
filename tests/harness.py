@@ -800,6 +800,38 @@ def parse_bgw_hp_fixture(path: Path):
     return kfrac, np.asarray(bands), data
 
 
+def _parse_kcrys_blocks(path: Path) -> dict:
+    """{kpt index: (kx, ky, kz)} from a sigma_diag .dat's ``# kcrys`` lines."""
+    out, ik = {}, -1
+    for ln in Path(path).read_text().splitlines():
+        m = re.search(r"k-point\s+(\d+)\s*:", ln)
+        if m:
+            ik = int(m.group(1))
+            continue
+        if ln.startswith("# kcrys") and ik >= 0:
+            out[ik] = tuple(float(x) for x in ln.split()[2:5])
+    return out
+
+
+def _parse_star_spread_header(path: Path):
+    """``(star_spread_ev, n_star_members)`` from the writer's header, or None.
+
+    The diagnostic is MEASURED UPSTREAM, on the full-BZ Sigma, against the
+    symmetry service's own star labels
+    (``gw_output._star_spread_of_sigma_diag``) — it cannot be recomputed
+    from this file, because the file is the wedge and unfolding a wedge is
+    a gather, which would report 0.000 by construction.
+    """
+    for ln in Path(path).read_text().splitlines():
+        m = re.match(r"#\s*star_spread_ev\s+(\S+)", ln)
+        if m:
+            n = re.search(r"over the (\d+)\s+full-BZ k", ln)
+            return float(m.group(1)), (int(n.group(1)) if n else None)
+        if not ln.startswith("#") and ln.strip():
+            break
+    return None
+
+
 def compare_to_bgw(output_file: Path, fixture: Path, labels=(
         "sigSX", "sigCOH", "sigTOT")):
     """Deviation of a LORRAX sigma_diag .dat from the BGW anchor, in meV.
@@ -807,15 +839,30 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
     Returns ``{column: (mae, max_abs)}`` plus ``"_star_spread"`` and
     ``"_nstar"``.
 
-    Every LORRAX k-point is used, not one representative per IBZ k.  The
-    fixture holds BGW's 8 IBZ k-points; LORRAX writes the full 64-point BZ.
-    Each LORRAX k is assigned to the IBZ k whose mean-field energies it
-    reproduces (matching on the whole ``Eo`` vector, not on k coordinates,
-    because the two codes do not order k the same way).  Symmetry-equivalent
-    k MUST carry identical Sigma, so comparing all of them is both the honest
-    average and a symmetry check — ``_star_spread`` is the worst per-band
-    disagreement between members of one star, which an IBZ-representative
-    comparison cannot see.
+    BOTH SIDES ARE THE IRREDUCIBLE WEDGE, JOINED ON THE CRYSTAL
+    COORDINATE.  The fixture holds BerkeleyGW's 8 IBZ k with their
+    fractional coordinates; since 2026-08-15 LORRAX writes its own wedge
+    with a ``# kcrys`` line per block, so the two are matched on the k
+    itself — exactly, modulo a lattice vector, with an ambiguous match
+    REFUSED rather than resolved.
+
+    This replaced a nearest-match over MEAN-FIELD ENERGY vectors at
+    2e-3 eV, whose stated justification was that "the two codes do not
+    order k the same way".  True, and irrelevant now that both files name
+    their k: an energy fingerprint aliases whenever two stars are
+    degenerate across the compared window, and it was one of the
+    hand-rolled k-matching sites this branch removes.
+
+    ``_star_spread`` and ``_nstar`` ARE READ FROM THE FILE HEADER, not
+    recomputed here.  They are measured in ``gw_output`` on the full-BZ
+    Sigma against ``sym.irr_idx_k``, because that is the only place the
+    information exists: symmetry-equivalent k carry independently
+    computed Sigma before the writer reduces to the wedge, and no
+    downstream unfold can bring that back (``star_broadcast`` is a
+    gather, so every member would equal its parent and the spread would
+    read a fake 0.000).  ``_nstar`` therefore still counts the full-BZ
+    k the diagnostic covered — 64 on the Si production deck — and still
+    fails the same way if the k assignment collapses.
 
     ``_star_spread`` IS NOT A SYMMETRY GATE, and must not be read as one.
     It is a max-minus-min over the REAL DIAGONAL ``sigTOT`` values of a
@@ -846,40 +893,55 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
     for r in rows:
         lx.setdefault(int(r[0]), []).append(r)
     lx = {k: np.asarray(v) for k, v in lx.items()}
-    # parse_eqp_rows gives [kpt, band, A, B, C, VH_re, VH_im]; the driver also
-    # writes an Eo column, which parse_eqp_rows drops — re-read it here since
-    # the k-matching needs it.
-    eo = _parse_eo_column(output_file)
+
+    kcrys = _parse_kcrys_blocks(output_file)
+    if not kcrys:
+        raise AssertionError(
+            f"{output_file} carries no '# kcrys' lines, so its blocks cannot "
+            f"be joined to BerkeleyGW's by k.  A file written before "
+            f"2026-08-15 is on the full BZ and anonymous; regenerate it.")
 
     ref = {labels[0]: bgw["X"] + bgw["SXmX"],
            labels[1]: bgw["CHp"],
            labels[2]: bgw["Sigp"]}
     acc = {c: [] for c in labels}
-    star_spread, nstar_total = 0.0, 0
     for ik in range(kfrac.shape[0]):
-        emf = bgw["Emf"][ik, :nb]
-        hits = [k for k, v in lx.items()
-                if v.shape[0] >= nb and k in eo
-                and np.max(np.abs(np.asarray(eo[k][:nb]) - emf)) < 2e-3]
-        if not hits:
+        # Exact join on k, modulo a lattice vector.  Not a nearest match:
+        # every candidate within the round-trip epsilon of '%13.9f' is
+        # collected, and anything other than exactly one is an error.
+        hits = []
+        for k, kv in kcrys.items():
+            d = np.asarray(kv) - kfrac[ik]
+            if np.max(np.abs(d - np.rint(d))) < 1e-6:
+                hits.append(k)
+        if len(hits) != 1:
             raise AssertionError(
-                f"BGW anchor: no LORRAX k-point reproduces the mean-field "
-                f"energies of BGW IBZ k{ik+1} = {kfrac[ik]}.  Either the run "
-                f"used a different WFN or the band ordering changed.")
-        nstar_total += len(hits)
+                f"BGW anchor: BGW IBZ k{ik + 1} = {kfrac[ik]} matched "
+                f"{len(hits)} LORRAX blocks {hits}.  Expected exactly one — "
+                f"the two wedges must be the same k-set.  LORRAX blocks: "
+                f"{sorted(kcrys.values())}")
+        k = hits[0]
+        if lx[k].shape[0] < nb:
+            raise AssertionError(
+                f"LORRAX block {k} has {lx[k].shape[0]} bands, BGW has {nb}")
         for j, c in enumerate(labels):
-            for k in hits:
-                acc[c].append(lx[k][:nb, 2 + j] - ref[c][ik])
-        if len(hits) > 1:
-            block = np.stack([lx[k][:nb, 4] for k in hits])   # sigTOT
-            star_spread = max(star_spread,
-                              float((block.max(0) - block.min(0)).max()))
+            acc[c].append(lx[k][:nb, 2 + j] - ref[c][ik])
+
     out = {}
     for c in labels:
         d = np.concatenate(acc[c]) * 1e3
         out[c] = (float(np.abs(d).mean()), float(np.abs(d).max()))
-    out["_star_spread"] = star_spread * 1e3
-    out["_nstar"] = nstar_total
+
+    hdr = _parse_star_spread_header(output_file)
+    if hdr is None:
+        raise AssertionError(
+            f"{output_file} carries no '# star_spread_ev' header line.  That "
+            f"diagnostic is measured on the full BZ inside gw_output before "
+            f"the writer reduces to the wedge; without it there is nothing "
+            f"here to report, and recomputing it from a wedge file would "
+            f"return a fake 0.000.")
+    out["_star_spread"] = hdr[0] * 1e3
+    out["_nstar"] = hdr[1]
     return out
 
 

@@ -11,8 +11,7 @@ Usage:
 
 __all__ = [
     'rotate_wfn_coefficients',
-    'find_kpoint_mapping',
-    'add_kpoint_mapping_to_rotation_file',
+    'read_kirr_to_kfull',
 ]
 
 
