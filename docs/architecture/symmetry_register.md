@@ -157,6 +157,53 @@ class and believe you are covered; a cell in
 `test_unfold_through_the_service.py` asserts the blindness so that belief fails
 loudly.
 
+## THERE ARE TWO DIFFERENT "IBZ"s, AND THEY ARE NOT THE SAME SIZE
+
+Measured 2026-08-15 on the three committed decks. **This is the single most
+important thing on this page for anyone writing a wedge API.**
+
+| deck | `nk_tot` | **file wedge** `nk_red` | **star wedge** (`star_select`) | coincide? |
+|---|---|---|---|---|
+| `si_cohsex_debug` | 64 | 8 | 8 | **yes** |
+| `cohsex_debug` | 9 | 4 | **3** | no |
+| `gnppm_debug` | 9 | 9 | **5** | no |
+
+- **The file wedge** is `wfn.kpoints` — the k the WFN file stores, length
+  `sym.nk_red`, addressed by `kirr_fullids`. This is what `eqp{0,1}.dat`,
+  `sigma_diag.dat` and every text output are indexed by, and what BerkeleyGW
+  means by the IBZ.
+- **The star wedge** is what `star_select` keeps — one row per symmetry star,
+  length = number of distinct `irr_idx_k` labels.
+
+They differ whenever the WFN's k-set is finer than the symmetry strictly
+requires. On `cohsex_debug`, WFN k #1 is the **time-reverse** of WFN k #2
+(`sym_idx_k[kirr_fullids] = [0, 12, 0, 0]`, and 12 = ntran = pure time
+reversal), so the file carries 4 k where symmetry has only 3 orbits.
+
+**They coincide on `si_cohsex_debug`** — the deck most gates run on. So an API
+that conflates them is *correct on the deck you test with* and wrong on two
+others, which is the same trap shape as the TRS predicate. Where the lengths
+differ a mistake raises; where they coincide it is silent.
+
+`irr_idx_k` indexes the FILE wedge (`maps.py`: "`sym_idx_k[ik_full]` maps
+`wfn.kpoints[irr_idx_k[ik_full]]` → `unfolded_kpts[ik_full]`"), with values in
+`[0, nk_red)`. On `cohsex_debug` its distinct values are `{0, 2, 3}` — **file
+wedge row 1 is never a parent**, and `broadcast_ibz_to_full_bz` therefore
+reconstructs that k as `conj` of row 2 and discards row 1's own stored data.
+That is self-consistent, but it is not what "one row per stored k" suggests.
+
+### A documented contract that does not hold
+
+`maps.py` states, as the justification for the `ibz_slab` predicate, that
+"`sym_idx_k[kirr_fullids]` is the identity, so a row taken here is the STORED
+wavefunction rather than a rotated one". **Measured, it is the identity only on
+`si_cohsex_debug`**: `cohsex_debug` gives `[0, 12, 0, 0]` and `gnppm_debug`
+gives `[0, 2, 0, 2, 2, 2, 0, 0, 0]`. The companion property
+(`unfolded_kpts[kirr_fullids] == wfn.kpoints`) DOES hold on all three
+(≤ 3.3e-10). Not repaired here — the code may well be right and only the
+stated reason wrong — but nothing should be built on the identity claim until
+someone establishes which.
+
 ## PRINCIPLE: a self-consistency check cannot detect a uniform error
 
 **No check that asks "is this array consistent with itself under the symmetry
