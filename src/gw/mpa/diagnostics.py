@@ -317,3 +317,81 @@ def perturbation_refit(
         "valid_count_change": d1["n_valid"] - d0["n_valid"],
         "perturbation_norm": jnp.linalg.norm(dw),
     }
+
+# Restored 2026-08-15 after deletion on a zero-caller grep (cleanup commit
+# 3cc20a93): this is an INSTRUMENT, not plumbing. It is the diagnostic that
+# saw the 2026-08-10 rung-10 failure in its physical form (49% of |B| mass
+# fleeing to >16 eV poles at n_p=10), and it distinguishes "the fit is
+# worse" from "the fit is wrong". Instruments are exempt from zero-caller
+# deletion; owner-relayed ruling, session 2026-08-15.
+#: Hartree -> eV, for the width census only.  The fit itself never
+#: converts units; ``Omega_p`` is in whatever unit ``z_samples`` was.
+_HA_EV = 27.211386245988
+
+
+def residue_width_census(
+    Omega, B, valid=None, *, edges_ev=(4.0, 16.0), energy_unit="Ha"
+):
+    """WHERE THE RESIDUE MASS SITS, resolved by fitted width.
+
+    An AGGREGATION over elements, unlike everything else in this module,
+    and it is here rather than in a reporting script because it is the
+    instrument that saw the 2026-08-10 rung-10 failure in its physical
+    form: at ``n_p = 8`` the shipped fit put 1.5 % of ``sum_p |B_p|`` on
+    poles wider than 16 eV, and at ``n_p = 10`` it put **49 %** there.
+    Two extra poles bought no structure; the fit spent them on modes
+    broader than the plasmon itself, which is what an ill-conditioned
+    rational fit does with freedom the data cannot determine.  A
+    conditioning number alone would not have said that, and a residual
+    alone would not have said it either.
+
+    Parameters
+    ----------
+    Omega, B
+        ``(..., n_p)`` -- a batch of fitted pole sets and residues, e.g.
+        straight off ``fit_mpa_poles_batched``.
+    valid
+        ``(..., n_p)`` bool; pruned poles carry ``B_p = 0`` already, so
+        this only makes the intent explicit.
+    edges_ev
+        Width thresholds in eV.  ``Gamma = |Im Omega|``, the fitted
+        half-width, on the same convention as the campaign's tables.
+    energy_unit
+        Unit of ``Omega``; ``"Ha"`` or ``"eV"``.
+
+    Returns
+    -------
+    dict
+        ``mass_fraction_above`` -- one entry per edge, the fraction of
+        total ``|B|`` on poles wider than that edge; plus the live-mode
+        count and the ``|B|``-weighted width percentiles the campaign's
+        census tables quote.
+    """
+
+    if energy_unit not in ("Ha", "eV"):
+        raise ValueError(
+            f"GATE census_energy_unit: energy_unit={energy_unit!r} is not "
+            "one of ('Ha', 'eV'). FALSE case: the caller names the unit "
+            "Omega is in -- the census thresholds are in eV and the fit "
+            "never converted anything.")
+    to_ev = _HA_EV if energy_unit == "Ha" else 1.0
+
+    om = jnp.asarray(Omega, dtype=jnp.complex128)
+    b = jnp.asarray(B, dtype=jnp.complex128)
+    live = jnp.ones(om.shape, dtype=bool) if valid is None else jnp.asarray(
+        valid)
+    mag = jnp.where(live, jnp.abs(b), 0.0)
+    gamma_ev = jnp.abs(jnp.imag(om)) * to_ev
+    total = jnp.sum(mag)
+    total = jnp.where(total > 0, total, 1.0)
+
+    return {
+        "n_live": jnp.sum(live.astype(jnp.int32)),
+        "mass_total": jnp.sum(mag),
+        "mass_fraction_above": {
+            float(e): jnp.sum(jnp.where(gamma_ev > e, mag, 0.0)) / total
+            for e in edges_ev
+        },
+        "gamma_ev_p50": jnp.median(jnp.where(live, gamma_ev, jnp.nan)),
+        "gamma_ev_weighted_mean": jnp.sum(mag * gamma_ev) / total,
+    }
