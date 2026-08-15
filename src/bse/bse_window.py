@@ -559,9 +559,7 @@ def apply_eqp_corrections(
 
     from ffi import _services
     _services.ensure_on_path()
-    from file_io.kin_ion import broadcast_ibz_to_full_bz
-    from gw.kin_ion_io import star_tables
-    from symmetry_maps import SymMaps
+    from symmetry_maps import SymMaps, unfold_file_wedge_to_full_bz
     from wfn_loader import WfnLoader
 
     # 3-tuple: this consumer's band axis is already LOCAL to the deck's
@@ -588,11 +586,12 @@ def apply_eqp_corrections(
             f"writes; a full-BZ file ({sym.nk_tot} blocks) is the pre-unfolded "
             f"form that no longer exists.")
 
-    # THE UNFOLD, through the service's single adapter.  ``e_qp_ibz`` is the
-    # file's own wedge slab, read verbatim with no symmetry operation
-    # applied, which is exactly the ``ibz_slab`` predicate the adapter
-    # carries; there is no second star_broadcast call in the tree.
-    e_qp_full_ev = broadcast_ibz_to_full_bz(e_qp_ibz, *star_tables(sym))
+    # THE UNFOLD, named for the wedge it is on.  ``eqp1.dat`` is indexed by
+    # ``wfn.kpoints`` — the FILE wedge — which on two of the three committed
+    # decks is a different LENGTH from the star wedge, so the distinction is
+    # not cosmetic.  One backend under both named ops; no index table
+    # crosses into this module.
+    e_qp_full_ev = unfold_file_wedge_to_full_bz(sym, e_qp_ibz)
 
     enk_qp = enk_full.copy()
     n_take = min(nb_eqp, nb_full)

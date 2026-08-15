@@ -51,8 +51,14 @@ single-backend: `maps.py` `spinor_rotation_for_sym_row` (alias
 docstring promises 4×4 for four-component states; the code unconditionally
 allocates 2×2. **This is the upgrade path the register exists to protect**: the
 SU(2) construction and the TRS augmentation each have exactly one
-implementation, so adding a 4-component branch is a change in two named
-functions, not a search.
+implementation, and both named unfolds share one backend, so adding a
+4-component branch is a change in a few named functions rather than a search.
+
+**Bispinor is explicitly OUT OF SCOPE** (owner ruling, 2026-08-15). This entry
+is a note for whoever does that work, not a task. In particular
+`tests/regression/bispinor_debug/centroids_frac_256.txt` is **not** to be
+regenerated — it stays exactly as it is, keep-with-justification, recorded
+under the non-closed-set dispositions below.
 
 ## 2. Proper-rotation channel mixing (the bispinor-adjacent one)
 
