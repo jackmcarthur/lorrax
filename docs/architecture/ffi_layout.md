@@ -16,7 +16,7 @@ the failure modes apart.
 > can find the code, not so you can quote them. **Read the file.**
 >
 > This page owns the *native boundary*. It does not own owner rulings
-> ([`decisions.md`](decisions.md)), the SlabIO tiers and their measurements
+> ([`decisions.md`](decisions.md)), the SlabIO contract and its measurements
 > ([`slab_io.md`](slab_io.md)), or knob spellings and defaults
 > ([`../dev/env_vars.md`](../dev/env_vars.md)). See the
 > [register](../index.md#register).
@@ -137,7 +137,7 @@ is a routine we are trusting without evidence.
 | **Cholesky** (`potrf`) | **cuSOLVERMp** batched `potrf`/`potrs`; **SLATE** `potrf`/`trsm` | **SLATE** host `potrf` against MKL (opt-in; unset stage ⇒ phdf5-only lib) | **there is no ScaLAPACK `potrf` handler anywhere in the tree** | **(none at build time)** — `test_distrib_la_contract.py` only | contract tests only |
 | **LU** (`getrf`/`getrs`) | **cuSOLVERMp** batched `solve_lu` (GPU); **ScaLAPACK** `pXgetrf`/`pXgetrs` from LibSci (CPU) | **ScaLAPACK** from MKL | fused `solve_lu` **and** the split `getrf`+`getrs` pair; resolve refuses if any of the three targets is missing | **(none at build time)** — contract tests only. `LORRAX_LU_NO_PIVOT` can disable pivoting at run time with no gate | contract tests only |
 | **Distributed transport** | **NCCL** (cuSOLVERMp ≥0.7.2) or **CAL** (≤0.6.x); **NVSHMEM** transitively via cuBLASMp; `MPI_COMM_WORLD` dup for SLATE/ScaLAPACK | Intel MPI; NCCL for the pip cuSOLVERMp on the rtx leg | the stage choice *is* the transport choice — one string, `LORRAX_NVHPC_SUBPATH`; build refuses if unstated | build-time refusal on an unstated stage (`build.sh`) | — |
-| **Parallel HDF5** | **`cray-hdf5-parallel/1.14.3.7`** (`libhdf5_parallel_gnu.so.310`) over **Cray MPICH** `libmpi_gnu_123.so.12` | **phdf5 1.14.6** (`libhdf5.so.310`) over **Intel MPI 2020.4** | h5py-parallel host tier (`_MpiHostBackend`); rank-0 serial h5py **only at one process** — above that it refuses | **GATE 1** (`gate_one_mpi.sh`, one cray-mpich object) and **GATE 7** (`gate_one_hdf5.sh`, one HDF5 SOVERSION + the stage provides it) | **both PASS**, Perlmutter, measured 2026-08-06 |
+| **Parallel HDF5** | **`cray-hdf5-parallel/1.14.3.7`** (`libhdf5_parallel_gnu.so.310`) over **Cray MPICH** `libmpi_gnu_123.so.12` | **phdf5 1.14.6** (`libhdf5.so.310`) over **Intel MPI 2020.4** | **none — the alternatives were deleted 2026-08-06.** There is one transport; a deployment that cannot serve it refuses at open naming the probe that declined. `bse_loading`'s serial-h5py tile readers are a loud, memory-correct fallback at ANY process count (~17x slower, CLAIMS 76 vs 69) and are deliberately not a tier | **GATE 1** (`gate_one_mpi.sh`, one cray-mpich object) and **GATE 7** (`gate_one_hdf5.sh`, one HDF5 SOVERSION + the stage provides it) | **both PASS**, Perlmutter, measured 2026-08-06 |
 | **OpenMP runtime** | `libgomp.so.1` | `libiomp5` (Intel) | `libgomp` \| `libiomp5` \| `libomp` | **GATE 6** — the OpenMP runtime really is OpenMP | **PASS**, Perlmutter — but see §3b, it passes on an empty set too |
 
 **Scope of every "PASS" above:** Perlmutter, login node, bare metal, against
@@ -435,39 +435,45 @@ inferred from the CMake option.
 
 ## 5. Parallel HDF5 — what the FFI side of it is
 
-**[`slab_io.md`](slab_io.md) owns this subsystem**: the three tiers, the
-`slab_io` deck key that routes between them, the striping campaign, the
-launcher requirements and the multi-node certification. Only the two
-FFI-side facts belong here.
+**[`slab_io.md`](slab_io.md) owns this subsystem**: the tile contract and
+what a call site may assume of it, the striping campaign, the launcher
+requirements, the multi-node certification, the one-owner-per-file rule,
+and the measured failure signatures. Only the FFI-side facts belong here.
+
+**There is ONE transport, and no router.** The three tiers (`PHDF5_FFI`,
+`PHDF5_HOST`, `H5PY_ALLGATHER`), the `SlabIOBackend` enum, the `slab_io`
+deck key, the `use_ffi_io` boolean and the `auto` router were **deleted
+2026-08-06**, along with the seven separate refusals that had been guarding
+the allgather tier. `file_io/slab_io.py` today takes a path, a mode and a
+mesh, and a deployment that cannot serve the tile path refuses at open
+naming the probe that declined. Anything on any page that describes
+choosing between tiers, or a gap in a refusal that guards one, describes a
+tree that no longer exists —
+[history](slab_io.md#tiers-history) records why, because the shape of the
+mistake recurs.
 
 **The C++ handler is one source serving both legs.** The same `phdf5/`
 sources compile into `liblorrax_ffi.so` and into the CUDA-free
 `liblorrax_ffi_host.so`, where the D2H staging into a pinned buffer degrades
-to an in-place read of the XLA host buffer. Tier 1 (`PHDF5_FFI`) is that
-handler; tier 2 (`phdf5_host`) drives the same MPI-IO from Python and needs
-no `.so` at all.
+to an in-place read of the XLA host buffer. That degradation is why the
+control-operand stream race ([`slab_io.md`](slab_io.md#stream-race)) is a
+CUDA-leg-only defect: on the host leg `copy_index_to_host` is a `memcpy`
+and there is no stream to race.
 
-**One boolean grammar spans both writers**, so
-`LORRAX_PHDF5_COLLECTIVE_WRITES=0` means "independent" in each of them — §6.
+**Since `fix/ffi-odr-2026-08-08` the two legs' C entry points are NOT
+interchangeable.** The host leg's carry a `_host` suffix
+(`cpp/common/c_abi.h`) and each leg's internal definitions are localised by
+`exports_{cuda,host}.map`, precisely so that one `PhdfCtx` type name with
+two struct layouts can no longer alias across the two `.so`s under
+`RTLD_GLOBAL`. A library built before that fix still exports the plain
+names and still collides —
+[`slab_io.md#odr-host-so`](slab_io.md#odr-host-so) has the current
+measurement and the acceptance test, and `tests/KNOWN_FAILURES.md` L1 owns
+the defect.
 
-One thing is worth repeating from `slab_io.md`, because getting it wrong
-sends you hunting for a demotion that no longer exists: **`H5PY_ALLGATHER`
-is a refusal above one process, not a fallback** (owner ruling 2026-08-05,
-implemented `0d8e50c`). It is not a tier the system may choose; it is a tier
-the system refuses to choose.
-
-> **A gap in that refusal, found 2026-08-06.** The rule is enforced in
-> `gw/gw_config.py` — `_refuse_explicit_h5py_allgather` and
-> `_refuse_slab_io_no_parallel_writer`, both of which always raise, and both
-> placed after the whole precedence chain so no deck branch escapes them.
-> **But it is deck-level only.** The library entry point
-> `file_io/slab_io.py:88-90` still returns `SlabIOBackend.H5PY_ALLGATHER`
-> when `use_ffi_io is None`, at any process count, and `:97-98` maps
-> `use_ffi_io=False` the same way. A caller who constructs `SlabIO` directly
-> instead of going through a parsed deck still reaches the tier at P>1.
-> Anywhere you read "both routes raise at parse time" — including on this
-> page before today — that is a statement about the deck router, which is
-> the only place it is true.
+**One boolean grammar spans every reader of these knobs**, so
+`LORRAX_PHDF5_COLLECTIVE_WRITES=0` means "independent" wherever it is
+read — §6.
 
 ---
 
@@ -497,8 +503,9 @@ at 4 rather than becoming a knob that must be kept in sync with a value it
 does not depend on.
 
 **Boolean grammar.** All the flags parse through `env_flag`
-(`context.cc`), which mirrors Python's
-`file_io/_slab_io_mpi_host._env_flag` exactly: unset or exactly-empty →
+(`context.cc`), which mirrors Python's `file_io/_slab_io_ffi._env_flag`
+exactly (it mirrored `_slab_io_mpi_host._env_flag` until that module was
+deleted with the host tier on 2026-08-06): unset or exactly-empty →
 the default; otherwise trimmed, lowercased, and **true only for
 `1` / `true` / `yes` / `on`**. Everything else is false — including `off`,
 `no`, and any typo. There is no "unrecognised value" diagnostic, so
