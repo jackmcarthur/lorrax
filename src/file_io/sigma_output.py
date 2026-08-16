@@ -266,8 +266,15 @@ def write_sigma_to_file(
 				raise ValueError(
 					f"star_spread_multiplet_ev has shape {_mp.shape}, "
 					f"expected ({nbands},) — one entry per written band.")
-			f.write(f"# star_spread_ev_multiplet_max {float(_mp.max()):.9e}\n")
-			f.write("# star_spread_ev_per_band_multiplet "
+			# NAMED "star_spread_multiplet_ev*", NOT "star_spread_ev_*_multiplet".
+			# "# star_spread_ev" is already a PREFIX of
+			# "# star_spread_ev_per_band", and any reader that counts rows by
+			# prefix -- tests/test_eqp_kpoint_basis.py does -- breaks the
+			# moment a third key extends that stem.  Measured: the first
+			# spelling of this row did exactly that.  A new header key must
+			# not extend an existing one.
+			f.write(f"# star_spread_multiplet_ev {float(_mp.max()):.9e}\n")
+			f.write("# star_spread_multiplet_ev_per_band "
 			        + " ".join(f"{float(v):.9e}" for v in _mp) + "\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
