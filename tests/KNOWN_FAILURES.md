@@ -1211,6 +1211,32 @@ against a decision that has not been taken.
     "which k is this" dict for finite-difference neighbours.  Full-BZ →
     full-BZ, exact integer keys, so no aliasing; listed only because it
     duplicates the grid lookup the service owns.  Diagnostic path.
+12. **`src/file_io/epsreader.py:136` `unfold_eps_comps` — ADDED
+    2026-08-15, previously registered NOWHERE.**  A fifth independent
+    `G' = S·G − G_umklapp` in `src/`, found by re-counting the register's
+    "four implementations" claim by reading.  Two things make it worth a
+    row rather than a fix:
+    (a) it is **dead but shipped** — `EPSReader` is re-exported from
+    `src/file_io/__init__.py:41`, and its three in-tree instantiators
+    (`gw/head_correction.py:286-289` and two `scripts/checks/`) never call
+    this method; the only callers are under `misc/archived_tests/`;
+    (b) its own comment at `:126` says **"NO SUPPORT FOR TAU (FRAC
+    TRANS) CURRENTLY"**, i.e. it is known-wrong on every non-symmorphic
+    deck and nothing outside the file said so.
+    NOT FIXED HERE: repairing a method with no caller is speculative, and
+    deleting a re-exported public method is a surface change.  The
+    decision owed is delete-or-fix, not repair-in-place.
+
+**Correction to (3)'s recorded reason.**  It says "the service returns no
+`kg0`".  A reader who greps finds `SymMaps.get_umklapp_vector`
+(`maps.py:1944`) immediately and concludes this row is stale.  The method
+exists; the real blocker is that it is **index-keyed to a
+`(SymMaps, WFNReader)` pair**, and `bgw_parity.fill_v_grid_for_q`
+(`:147-153`) receives raw fractions and a bare matrix stack, never those
+objects.  Separately, `find_irreducible_bz_points` computes the rotation
+and discards the umklapp at `maps.py:102` — the `% kg` **is** the thrown-
+away `kg0`, and a `return_umklapp=True` there is about two lines.  The
+row stands; only its justification needed correcting.
 
 Test-side hand-rolls, lower priority and noted for completeness:
 `tests/test_scissor_weights.py:169-175, 296-302, 333-338` (a `_FakeKStar`
@@ -1305,13 +1331,14 @@ inverse so the PROJECTOR is transpose-invariant; that argument covers the
 sum at `:189` but not obviously the per-op `keep` test at `:176`, which
 tests individual ops.
 
-### `sc_on_ibz = true` HAS ROTTED — it crashes, and the crash is the two-wedge conflation
+### ~~`sc_on_ibz = true` HAS ROTTED~~ — FIXED 2026-08-15, and the default is now True
 
-MEASURED 2026-08-15 on `gnppm_debug` with `qp_solver = self_consistent`,
-`sc_max_iter = 3`.  The flag defaults False (`gw_config.py:816`), **no deck in
-the tree sets it, and no regression deck runs the SC path at all** — every
-committed deck is `qp_solver = one_shot_dft`.  So nothing has exercised this
-since it was written.
+**CLOSED.**  Kept because the shape of the failure is the reusable part.
+
+MEASURED 2026-08-15 on `gnppm_debug` with `qp_solver = self_consistent`.  The
+flag defaulted False, **no deck in the tree set it, and no regression deck ran
+the SC path at all** — every committed deck was `qp_solver = one_shot_dft`.  So
+nothing had exercised this since it was written.
 
     sc_iteration.py:1397  _write_sc_eqp_snapshot
       -> eqp_bgw.py:145   write_bgw_eqp
@@ -1319,16 +1346,114 @@ since it was written.
 
 **5 and 9 are the two different IBZs.**  With `sc_on_ibz` on, the loop reduces
 H/E/U to the STAR wedge — 5 orbits on this deck — while
-`_write_sc_eqp_snapshot` hands the result to a writer expecting the FILE wedge,
-`wfn.kpoints`, which is 9 here.  This is the distinction recorded in
-`docs/architecture/symmetry_register.md` ("THERE ARE TWO DIFFERENT IBZs"), and
-it is not academic: it is the live mechanism of this crash.  Note it would NOT
-crash on `si_cohsex_debug`, where the two wedges coincide at 8 — the same
-"right where you test, wrong where you don't" shape.
+`_write_sc_eqp_snapshot` handed the result to a writer expecting the FILE
+wedge, `wfn.kpoints`, which is 9 here.  It would NOT have crashed on
+`si_cohsex_debug`, where the two wedges coincide at 8 — the same "right where
+you test, wrong where you don't" shape.
 
-NOT REPAIRED, deliberately: the owner asked for the failure rather than a fix
-forward, on the grounds that a flag off this long may have rotted and knowing
-that is worth more than a quick repair.  The default stays False.
+FIXED at both boundaries by routing star wedge → full BZ → file wedge through
+the service (`reduce_full_bz_to_file_wedge ∘ unfold_star_wedge_to_full_bz`);
+`dump_qp_wfn_artifacts`'s length-matching `placements` dict went with it.
+Default flipped to True on a measured A/B: **1e-6 meV per iterate under linear
+mixing**, with the rCROP trajectory k-set dependent by construction (24.45 meV
+by map call 5).  See `docs/architecture/symmetry_register.md`, "The SC loop
+crosses both wedges".
+
+**The lesson that outlives the bug**: a flag whose default is off, that no deck
+sets, on a path no deck runs, is not covered by any number of green cells.
+`tests/regression/gnppm_debug/gnppm_sc.in` now runs the SC path, and
+`tests/test_sc_on_ibz_wedges.py` pins the boundary.
+
+### `tools/gen_input_reference.py` REFUSES to run, so `docs/input_reference.md` is hand-maintained
+
+MEASURED 2026-08-15, incidental to the `sc_on_ibz` default flip. The generator
+raises `SystemExit` on any key drift against `gw_config._DEFAULTS` and writes
+nothing, so the doc it owns cannot be regenerated:
+
+    gen_input_reference: key drift vs gw_config._DEFAULTS
+      missing one-liners for: ['mc_average_placement',
+        'mc_average_placement_vcoul', 'mpa_material_class', 'mpa_n_poles',
+        'mpa_pole_batch_size', 'mpa_sampling_alpha',
+        'mpa_sigma_crossing_target_error', 'mpa_sigma_max_nodes',
+        'mpa_sigma_sector_target_error', 'mpa_varpi_far_ry',
+        'mpa_varpi_near_ry', 'restart_q_storage', 'sc_eigh',
+        'write_restart_tensors']
+      stale entries for removed keys: ['slab_io', 'use_ffi_io']
+
+Pre-existing — none of those 16 keys is touched by this branch. The refusal is
+the right design (a doc that silently drops a key is worse than one that
+refuses), but the consequence is that **`docs/input_reference.md` has been
+edited by hand for as long as the drift has existed**, and nothing says so.
+The `sc_on_ibz` row was updated in BOTH places (`KEYS` in the generator and
+the rendered table) so the two agree whenever someone clears the drift.
+
+### THREE frozen references were stale from the moment the writers moved to the wedge
+
+MEASURED 2026-08-15, and this is the row the pre-merge anchor run existed to
+produce. When the text writers moved from the full BZ to the file wedge
+(commit `954ba9c8`, "writers take sym and reduce through the service"), **no
+frozen reference was migrated and no regression gate was run.** Three gates
+had been red ever since:
+
+| gate | output | reference | verdict |
+|---|---|---|---|
+| `test_si_production_matches_frozen_reference` | 480 rows (8 k) | 3840 (64 k) | RED |
+| `test_si_fast_matches_frozen_reference` | 160 (8 k) | 1280 (64 k) | RED |
+| `test_gw_jax_matches_reference[cohsex]` | 120 (4 k) | 270 (9 k) | RED |
+
+`gnppm_debug` (9 = 9), `bispinor_debug` (9 = 9) and `hbn_cohsex_debug`
+(18 = 18) stayed green **for the wrong reason** — on those decks the file
+wedge IS the full BZ, so the writers' k-set change was invisible. The three
+that broke are exactly the three where `nk_red < nk_tot`.
+
+**CONFIRMED PRE-EXISTING, not caused by the `sc_on_ibz` work**: the same
+`Row-count mismatch: output (480, 7), reference (3840, 7)` reproduces at
+`0241118f`, the parent commit, in a clean worktree.
+
+**Migrated, not regenerated — and the migration was proved before it was
+applied.** Each deck was re-run and the new wedge output compared, block by
+block, against the frozen full-BZ reference at the full-BZ indices
+`kirr_fullids`:
+
+| deck | `kirr_fullids` | max abs difference |
+|---|---|---|
+| `si_cohsex_debug` production | `[0,1,2,5,6,7,10,27]` | **0.000000e+00 eV** |
+| `si_cohsex_debug` fast | `[0,1,2,5,6,7,10,27]` | **0.000000e+00 eV** |
+| `cohsex_debug` | `[0,1,2,4]` | **1e-6 eV** (one VH digit, twice) |
+
+and every new block's `# kcrys` line was checked to equal `wfn.kpoints` in
+order. So the references still carry the frozen numbers; what changed is
+which k are present and the block framing. The two Si decks are bit-exact.
+`cohsex_debug`'s one deviation is a last-printed-digit VH move
+(`189.059483 → 189.059482`) at its 1e-6 gate; the other textual diffs on that
+deck are format-only — the OLD file printed VH real on some rows and complex
+on others, which was already internally inconsistent.
+
+**Re-freezing is normally the owner's call** (the `si_fast` gate's own skip
+message says so). It is done here because leaving three red regression gates
+across a merge is worse, and because the values were *proved* unchanged rather
+than re-blessed. It is a SEPARATE COMMIT so it can be reverted on its own.
+
+### `cohsex_debug` CANNOT run `sc_on_ibz`, and the reason couples two open questions
+
+MEASURED 2026-08-15.  `cohsex_debug` is the deck with the sharpest two-wedge
+divergence (file wedge 4, star wedge 3) and would be the ideal SC regression
+deck.  It refuses:
+
+    ValueError: k-star spread of Σ+V_H is 2.763726e-01 relative, above the
+    refusal threshold 1.0e-06.
+
+That is **not** a wedge bug — it is `_check_kstar_spread` working correctly on
+a genuinely non-star-invariant Σ.  `centroids_frac_60.txt` is one of the four
+deliberately non-orbit-closed sets, and its recorded closure residual is
+**2.762e-01** — the same number.  So the deck's Σ really does differ between
+members of a star, and selecting a representative would keep an arbitrary one.
+
+Consequence worth stating: **the centroid-closure question and the SC wedge
+question are coupled through this fixture.**  Anyone who regenerates
+`centroids_frac_60.txt` as orbit-closed changes which decks can exercise the SC
+path — and per the register, that set is KEEP-with-justification because
+`test_star_offdiag_gate.py` asserts its consequence as a fact.
 
 ### MEASURED: independent per-k `eigh` is NOT a source of star-inequivalent E_qp
 

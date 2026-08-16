@@ -80,10 +80,44 @@ Two implementations of that *sequencing* — host `maps.py unfold_psi`, device
 This is the one genuine duplication in rotation math and it is minimal: two
 lines of ordering, no math.
 
-**G rotation + umklapp** (`G' = sym_mats_k @ G − kg0`): **four implementations.**
-Canonical `wfn_loader/loader.py`; umklapp `maps.py get_umklapp_vector`.
-Independent copy in `services/vcoul/src/vcoul/bgw_parity.py` (registered, not
-fixed — the service returns no `kg0`); two more in `misc/archived_tests/`.
+**G rotation + umklapp** (`G' = sym_mats_k @ G − kg0`). **Re-counted by
+reading, 2026-08-15: the "four implementations" this page used to claim is
+TOO LOW.** Split by what each thing actually is:
+
+- **Rotation carrying an umklapp subtraction — 3 live, not 2.** Canonical
+  `wfn_loader/loader.py:604`; `services/vcoul/src/vcoul/bgw_parity.py:199`
+  (registered, blocked); and **`src/file_io/epsreader.py:136`
+  (`unfold_eps_comps`), which was registered NOWHERE.** It has no in-tree
+  caller — only `misc/archived_tests/` — and self-documents at `:126` that it
+  has "NO SUPPORT FOR TAU (FRAC TRANS)", i.e. it is known-wrong on every
+  non-symmorphic deck and nothing outside the file said so. Now in
+  `tests/KNOWN_FAILURES.md`.
+- **Umklapp-vector *solvers* — 4 independent.** `maps.py:1960`, a second
+  differently-rounded branch in the *same function* (`maps.py:1953-1956`),
+  `bgw_parity.py:71-75`, and `src/common/kq_mapping.py:71-73` (the `k−q`
+  translation flavour).
+- **Bare `S·G`, no umklapp — 3 more live spellings.** `maps.py:843`
+  (`(S @ G.T).T`, inside `tau_phase_row`), `maps.py:102/122/143`
+  (`einsum('sij,qj->sqi') % kg`, which *discards* the umklapp — see below),
+  `tests/bench/charge_density.py:167` (`@ R.T`, and with the wrong matrix).
+- **Archived: 7, not 2.** `misc/archived_tests/cohsex_noisdf.py:291,456`;
+  `symtest.ipynb:232,407`; `get_interp_vectors.py:46,270,271`. All genuinely
+  dead — the package has an empty `__init__` and those modules import a
+  `wfnreader` that does not exist anywhere in the tree.
+
+`loader.py:604` and `get_umklapp_vector` are **one composed path, not two
+answers**: the loader calls the service for `Gkk` rather than restating it.
+Counting them as two of four was a category slip.
+
+**The vcoul blocker HOLDS, but its recorded reason is greppably wrong.**
+`KNOWN_FAILURES.md` says "the service returns no `kg0`" — a reader who greps
+finds `SymMaps.get_umklapp_vector` immediately and concludes the register is
+out of date. The true blocker: that method is *index-keyed* to a
+`(SymMaps, WFNReader)` pair, and `bgw_parity.fill_v_grid_for_q` receives raw
+fractions and a bare matrix stack, never those objects. Separately,
+`find_irreducible_bz_points` computes the rotation and throws the umklapp away
+at `maps.py:102` (`% kg` **is** the discarded `kg0`), which is where a
+`return_umklapp=True` would go in about two lines.
 
 **Band-index unfold** (`star_broadcast`) is *not* a rotation — pure gather plus
 conjugation on TRS rows. One adapter, `file_io/kin_ion.py
@@ -165,14 +199,29 @@ loudly.
 
 ## THERE ARE TWO DIFFERENT "IBZ"s, AND THEY ARE NOT THE SAME SIZE
 
-Measured 2026-08-15 on the three committed decks. **This is the single most
-important thing on this page for anyone writing a wedge API.**
+Measured 2026-08-15 over **every** committed deck, not three. **This is the
+single most important thing on this page for anyone writing a wedge API.**
 
-| deck | `nk_tot` | **file wedge** `nk_red` | **star wedge** (`star_select`) | coincide? |
-|---|---|---|---|---|
-| `si_cohsex_debug` | 64 | 8 | 8 | **yes** |
-| `cohsex_debug` | 9 | 4 | **3** | no |
-| `gnppm_debug` | 9 | 9 | **5** | no |
+| deck | `nk_tot` | **file wedge** `nk_red` | **star wedge** (`star_select`) | coincide? | same ROW ORDER? |
+|---|---|---|---|---|---|
+| `si_cohsex_debug` | 64 | 8 | 8 | **yes** | yes |
+| `si_bse_debug` | 64 | 8 | 8 | **yes** | yes |
+| `hbn_cohsex_debug` | 18 | 18 | 18 | **yes** | yes |
+| `cohsex_debug` | 9 | 4 | **3** | no | no |
+| `gnppm_debug` | 9 | 9 | **5** | no | no |
+| `bispinor_debug` | 9 | 9 | **5** | no | no |
+
+`bispinor_debug` is a **fourth** diverging deck; earlier revisions of this
+page listed three decks and missed it and `si_bse_debug`/`hbn_cohsex_debug`.
+
+**The row ORDER is a second fact and it is the one that bites quietly.** Two
+wedges of the same LENGTH can still be different row orders, so a length
+match is not a k-set match. Measured `kirr_fullids` against `star_select`'s
+row order: identical on the three that coincide; on `gnppm_debug` and
+`bispinor_debug` `kirr_fullids` is the identity `[0..8]` while the star rows
+are `[0, 1, 3, 4, 5]`; on `cohsex_debug`, `[0, 1, 2, 4]` against `[0, 1, 4]`.
+Anything that picks a k-set by matching a count — as `dump_qp_wfn_artifacts`
+did until 2026-08-15 — is asserting the order too, without checking it.
 
 - **The file wedge** is `wfn.kpoints` — the k the WFN file stores, length
   `sym.nk_red`, addressed by `kirr_fullids`. This is what `eqp{0,1}.dat`,
@@ -228,6 +277,60 @@ disarms every check of the two-wedge distinction** — including the
 reduce/unfold asymmetry cell, which needs a deck where a stored k is the
 time-reverse of another. That is what this cell exists to say out loud.
 
+## The SC loop crosses both wedges, and that is where it broke
+
+`config.sc_on_ibz` runs H/E/U on the **star wedge** while Σ stays on the full
+BZ. Every `.dat` writer wants the **file wedge**. Until 2026-08-15 the loop's
+rows went straight to the writer:
+
+    sc_iteration.py:1397 _write_sc_eqp_snapshot -> eqp_bgw.py:145
+    ValueError: e_qp shape (5, 46) does not match e_dft (9, 46)
+
+**There is no star-wedge → file-wedge operation and none should be added.**
+The route that is right on every deck is *star wedge → full BZ → file wedge*:
+
+```python
+reduce_full_bz_to_file_wedge(sym, unfold_star_wedge_to_full_bz(sym, x))
+```
+
+Two boundaries take it — `_write_sc_eqp_snapshot` and
+`dump_qp_wfn_artifacts` — and neither holds an index table. The second
+replaced a `placements` dict that chose between `KStarMap.select` and the
+full BZ **by matching lengths** against `wfn.nkpts`; per the order row above,
+a length match is not a k-set match.
+
+**`sc_on_ibz` now defaults True** (owner directive: `H^QP` is built and
+`eigh`'d only on symmetry-reduced k). What paid for the flip, on
+`gnppm_debug`:
+
+| accelerator | on vs off, E_QP |
+|---|---|
+| `linear`, `mixing = 1` | **1e-6 meV** — the `%15.9f` print floor — at every iterate |
+| `rcrop` (the default) | 24.45 meV by map call 5; 113.3 meV in the final `eqp0` |
+
+The map is exactly k-set invariant; **rCROP is not**, because its
+least-squares mixing minimises a residual summed over the loop's own k-set —
+each orbit once on the star wedge, with its multiplicity on the full BZ. Same
+fixed point, different path. So an *unconverged* rCROP run's iterates move
+when this flag moves. NOT established: agreement at a converged fixed point
+(both arms stop at 2–3 map calls, RMS ΔE ≈ 3 eV).
+
+### The one deck that runs it, and the one that cannot
+
+`tests/regression/gnppm_debug/gnppm_sc.in` is the **only** committed deck with
+`qp_solver = self_consistent`. Before it, every deck was `one_shot_dft`, which
+is why this rotted invisibly: flipping the default would have changed no suite
+result.
+
+`cohsex_debug` (4 vs 3, the sharpest divergence) **cannot run `sc_on_ibz` at
+all**: `centroids_frac_60.txt` is not orbit-closed, so the k-star spread of
+Σ+V_H measures **2.763726e-01** against the 1e-6 refusal and the run stops.
+That is the gate working on a genuinely non-star-invariant Σ — 2.762e-01 is
+exactly that set's recorded closure residual, listed under the non-closed sets
+below. **The centroid-closure question and the SC wedge question are coupled
+through this deck**, and anyone who "fixes" that set changes which decks can
+exercise the SC path.
+
 ## PRINCIPLE: a self-consistency check cannot detect a uniform error
 
 **No check that asks "is this array consistent with itself under the symmetry
@@ -281,8 +384,75 @@ These are the same algebra computed two ways with two rounding strategies and
 two failure modes. The package docstring warns they are *not* variants of each
 other (direction), and cites a silent 4 eV gap on hex systems from confusing
 them; what it does not say is that the wrap/snap logic must be **upgraded
-twice**. Three more copies of `Rinv·r + τ mod 1` live in the same file, plus a
-byte-identical FFT-grid gather in `centroid/charge_density.py`.
+twice**.
+
+### Re-counted 2026-08-15: it is TWELVE live expressions, not "~6"
+
+Every one is live production. This page previously said "~6" and named the
+wrong byte-identical pair.
+
+| where | direction | wrap |
+|---|---|---|
+| `orbit_syms.py:493` `centroid_source_map_and_wrap` | source | `rint`×grid → `floor_divide` → `rint` |
+| `orbit_syms.py:956` `verify_centroid_orbit_closure` | **source** | `% 1.0`, min-image scoring |
+| `orbit_syms.py:1321` `fft_grid_pullback_perm` | forward | `− np.floor` on UNSNAPPED floats |
+| `orbit_syms.py:243` `orbit_images` | forward | `% 1.0` (jax, vmapped) |
+| `orbit_syms.py:334`, `:342` | forward | `% 1.0` then `round(·×inv) % inv` |
+| `orbit_syms.py:145` | forward, integer | `% N` |
+| `centroid/charge_density.py:199` | forward, integer | `% N` |
+| **`centroid/kmeans_isdf.py:270, 288, 378`** | forward | **no wrap at all** (min-image downstream) |
+| **`centroid/kmeans_isdf.py:569`** | forward | `% 1.0` |
+
+**The four in `src/centroid/kmeans_isdf.py` are the ones that matter**, and
+this page did not name that module at all. It is the *generator* of the
+centroid sets whose orbit closure the rest of this section is about, so an
+upgrade to the r-space action convention would silently not reach the thing
+that produces the data.
+
+**The byte-identical pair was misidentified.** `charge_density.py:199` twins
+**`orbit_syms.py:145`** — same expression *and* the same radix flatten on the
+following line — not `fft_grid_pullback_perm`.
+
+### Consolidation is 12 → ~5, not a tidy-up. RE-SCOPED, NOT DONE.
+
+Three axes are irreducible and one of them is load-bearing:
+
+1. **Direction.** Source (`S·(r − τ)`) vs forward (`Rinv·r + τ`). The package
+   docstring already records that giving these one name shape is the mechanism
+   of the 4 eV hex-system gap. A shared helper with a direction flag re-creates
+   exactly that API.
+2. **Rounding, and the two strategies are NOT interchangeable.**
+   `centroid_source_map_and_wrap` snaps to FFT-grid integers *before* `floor`,
+   and its own comment (`orbit_syms.py:494-503`) says why: naive `np.floor`
+   flips an `L` component 0 → −1 on tiny negative noise, "which produces a
+   spurious `exp(±iπ/2)` phase in `unfold_isdf_operator`" — measured on Si
+   Fd-3m as 14 of 64 q at rel err ~0.8. `fft_grid_pullback_perm` does the
+   forbidden thing (`− np.floor` on unsnapped floats) and is safe **only
+   because it discards the integer part**. One keeps `L` and feeds it to an
+   umklapp phase; one throws it away. Any shared helper must return `L` and
+   pay the expensive path unconditionally.
+3. **Backend.** `orbit_syms.py:243` and the four `kmeans_isdf.py` sites are
+   inside `@jax.jit` / `lax.fori_loop`; three of those deliberately omit the
+   wrap because the Lloyd metric handles periodicity through an explicit
+   min-image table, so wrapping there would be **wrong**, not redundant.
+
+What *is* mechanically free, and is the honest first step: `orbit_syms.py:145`
+≡ `charge_density.py:199` (pure deletion), `:334` ≡ `:342` (one local, eight
+lines apart), and one local `_image()` for the four `kmeans_isdf.py` spellings.
+
+**Not attempted here.** The item was scoped as "~6 copies, upgrade twice"; it
+is twelve across three packages with a measured rounding hazard between two of
+them. That is a different piece of work and it should be re-scoped by the owner
+rather than absorbed into a symmetry-consolidation diff.
+
+### One documentation defect found while counting
+
+`orbit_syms.py:18-20` names `charge_density._symmetrise_density` and
+`symmetry_maps.py:339-345` as the canonical real-space convention. The former
+is the **known-broken bench copy** (`KNOWN_FAILURES.md`: wrong matrix, no τ
+phase, "fix is deletion… not repair"); the latter is a flat module that no
+longer exists since the service split. So the canonical convention doc points
+a reader at a broken G-space routine using the transposed matrix.
 
 **Density symmetrisation**: canonical `gw/qsgw_density.py symmetrise_density`
 (pure gather over the pull-back table). A known-broken duplicate in
@@ -299,10 +469,10 @@ registered.
 | TRS spinor augmentation | **yes** | nothing live |
 | ψ unfold sequencing | 2 (agree) | order-of-ops must be edited twice; factors are shared |
 | Proper-rotation channel mix | **yes** | the CrI₃ fixture is transposed + TRS-sign-flipped |
-| G rotation + umklapp | **4** | `vcoul/bgw_parity.py` |
+| G rotation + umklapp | **3 live** (was miscounted as 4) | `vcoul/bgw_parity.py` (blocked) and **`file_io/epsreader.py:136`**, which was unregistered and is τ-blind by its own admission |
 | τ phase (G-space) | **yes** | but the 2π convention splits across 4 dividers |
 | TRS conjugation predicate | 2 semantics, **no default, all 13 call sites explicit** | nothing — AST-swept |
-| r-grid image / source map | **~6 expressions** | forward/pull-back must be upgraded together |
+| r-grid image / source map | **12 expressions** (was miscounted as ~6) | forward/pull-back must be upgraded together — AND the four in `centroid/kmeans_isdf.py`, the module that GENERATES the centroid sets |
 | Density symmetrisation | 2 (**one broken**) | the bench copy |
 | Cartesian-index rotation | `R_cart_forward` named but **unused**; the one live site uses `R_cart` untransposed | — |
 
@@ -463,6 +633,74 @@ So the I/O section's headline number is sound and the `_MunuSlabPlan` blocker
 is worth measuring. Note what was NOT established: that the on-disk file at
 that anchor actually was 26.7 GB (the run is gone), and that a production deck
 still uses μ = 2406.
+
+### The `_MunuSlabPlan` blocker: what it says, and what would settle it
+
+Audited by reading, 2026-08-15. **The refusal is at
+`src/bse/bse_loading.py:530-556`, and its own comment says in capitals
+`THE REASON IS COST, NOT CORRECTNESS`** and that the price "has never been
+measured on a real interconnect". Corroborated independently at
+`tests/known_failures/2026-08-11-munu-layout-fact-stated-twice.md:49`.
+
+**Everything the wedge path needs already exists.** The writer, the pre-unfold
+capture, the per-dataset `q_storage` / `qirr_closure_verdict` stamp, the
+sharded `unfold_isdf_operator` — which takes and returns *exactly* the
+`P(None,'x','y')` spec `_MunuSlabPlan.request` already builds — and a public
+wedge-unfolding sharded reader (`tagged_arrays.read_munu_tensor_from_h5:1153`)
+that the GW leg uses in production. `tagged_arrays.py:935-948` states the
+premise directly: the double-gather argument "is true of SlabIO and the
+conclusion does not follow", because the collective happens *after* the read,
+in jax.
+
+**Four things block it, and only one is the cost:**
+
+1. The ~3-line insertion of the unfold between the read and the μ-major
+   transpose in `_slabio_read_munu`.
+2. A decision on the single-q `V_q0` route — `plan.request(q_index=0)` selects
+   one flat q by hyperslab offset, and on a wedge that q lives at
+   `irr_idx_q[0]` under `sym_idx_q[0]`, i.e. a per-q reconstruction, which the
+   tree has ruled unavailable.
+3. **`DESIGN_restart_consolidation.md`, the design every one of these sites
+   defers to, IS NOT IN THE REPOSITORY.** Cited at `bse_loading.py:540`,
+   `gw/restart_q_storage.py:527`, `file_io/tagged_arrays.py:945` and twice in
+   the known-failures note; `find . -iname '*restart_consolidation*'` is empty.
+4. The timing leg — for which **no in-tree deck drives a wedge through
+   `_MunuSlabPlan` on real bytes at all.** The three cells that touch the
+   refusal (`test_restart_qirr_consumers.py:400,419,433`) build the plan from
+   a bare shape tuple: no HDF5, no SlabIO, no mesh. `restart_q_storage_ab.sh`
+   greps for the refusal rather than timing it. The only committed
+   `unfold_isdf_operator` numbers are correctness (bit-identity at 1×1/2×2/4×1
+   emulated, plus four real CPU processes) — never wall time.
+
+**DERIVED, not measured — and it says the deck size does not matter.** The
+unfold moves `C · nq_full · μ² · 16` bytes over the interconnect; the wedge
+saves reading `(nq_full − nq_ibz) · μ² · 16` bytes off disk. **μ² cancels.**
+The wedge wins iff
+
+    B_net  >  C · [ nq_full / (nq_full − nq_ibz) ] · B_disk
+
+and at the 7.6× reduction of the μ = 2406 anchor the bracket is **1.152**. So
+the verdict is a bandwidth ratio, not a size question, and a modest deck
+answers it provided the object is large enough to be bandwidth- rather than
+latency-bound. The one committed disk number is SlabIO phdf5 at
+**2.919 GiB/s (16 ranks)** against serial h5py **0.17 GiB/s (P=4)**
+(`bse_loading.py:455-458`). **Not run here** — stated so the next person
+measures the right thing rather than sizing a deck to μ = 2406.
+
+**Two defects found while auditing the refusal:**
+
+- The refusal's *message* contradicts its own comment. The comment says "cost,
+  not correctness"; the string handed to the operator (`:548-552`) says the
+  transport **"cannot unfold it"** — an inability claim the tree elsewhere
+  states is false. The test that pins the message
+  (`test_restart_qirr_consumers.py:400-417`) only checks for `"wedge"` and
+  `"restart_q_storage=full"`, so it does not hold the reason honest.
+- `gw_config.py:943-948` still tells deck authors "the GW restart reader
+  refuses it too". That stopped being true at `536cbac9`; the GW reader has
+  unfolded since. Three more places repeat the refuted double-gather premise
+  as fact: `tests/multi_device/README.md:132-136`,
+  `tests/multi_device/restart_q_storage_ab.py:39-45`, and
+  `tests/regression/si_bse_debug/README.md:229-236`.
 
 ### Calibration on the ranked I/O list
 
