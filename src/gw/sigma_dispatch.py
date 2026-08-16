@@ -358,6 +358,7 @@ def finalize_dynamic_sigma(
     band_slices,
     input_dir: str,
     write_sigma_omega_h5: bool = True,
+    band_extrapolation: dict | None = None,
     print_fn: Callable = print,
     efermi_ry=None,
 ) -> SigmaResult:
@@ -411,7 +412,8 @@ def finalize_dynamic_sigma(
                 meta=meta, mesh_xy=mesh_xy,
                 omega_reference_ev=efermi_dft_ev,
                 omega_reference_provenance=omega_reference_provenance,
-                sym=sym, print_fn=print_fn,
+                sym=sym, band_extrapolation=band_extrapolation,
+                print_fn=print_fn,
             )
         else:
             sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
@@ -877,6 +879,7 @@ def compute_sigma_xc(
         sym=sym, wfn=wfn, band_slices=band_slices,
         input_dir=input_dir,
         write_sigma_omega_h5=write_sigma_omega_h5,
+        band_extrapolation=ppm_outputs.band_extrapolation,
         print_fn=print_fn,
     )
 
