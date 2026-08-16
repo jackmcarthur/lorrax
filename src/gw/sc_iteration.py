@@ -504,7 +504,10 @@ def _solve_head_occupations(
     # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
     # determine the fixed-N chemical potential; no fitted plasma frequency
     # enters the response.
-    from .fermi_surface import tetrahedron_delta_weights
+    from .fermi_surface import (
+        star_symmetrize_weights,
+        tetrahedron_delta_weights,
+    )
 
     surface_logical = tetrahedron_delta_weights(
         np.asarray(energies[:, :nb_logical], dtype=np.float64),
@@ -512,6 +515,18 @@ def _solve_head_occupations(
         tuple(int(x) for x in inputs.wfn.kgrid),
         float(mu_ry),
     )
+    # POST-INTEGRATION STAR SYMMETRIZATION.  The six tetrahedra all share one
+    # hardcoded (1,1,1) body diagonal, so the weight table is NOT star
+    # covariant: measured on this deck's converged state, 4 of 48 crystal ops
+    # leave it invariant, N(E_F) varies by 0.0425 states/Ry/cell inside a
+    # single star, and the Drude tensor comes out 2.68 percent anisotropic on
+    # cubic sodium.  Averaging over each star restores the crystal point
+    # group exactly and moves neither sum_kn w_kn nor the Drude trace.  It
+    # belongs HERE rather than inside the quadrature because this is where
+    # the star labels live -- `sym.irr_idx_k` is already in hand, and the
+    # quadrature is deliberately symmetry-free.  O(nk*nb).
+    surface_logical = star_symmetrize_weights(
+        surface_logical, np.asarray(inputs.sym.irr_idx_k))
     # The distributed contraction owns an explicit uniform 1/Nk.  Convert
     # normalized-BZ tetrahedron weights to its per-grid-point interface.
     surface_kn = jnp.pad(
