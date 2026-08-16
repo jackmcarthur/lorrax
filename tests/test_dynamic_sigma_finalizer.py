@@ -113,3 +113,43 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     # absolute eV, because that is where eqp1 has to be linearized and the
     # writer cannot re-derive them (``eqp_bgw.compute_eqp_diag``).
     np.testing.assert_array_equal(result.e_eval_ev, [[2.0, 3.0]])
+
+
+def test_the_sc_driver_does_not_overwrite_the_finalize_omega_reference():
+    """The reference that reaches the eqp writer is the finalize's own.
+
+    ``run_sc_driver`` hands the driver's post-Σ seam a rebased copy of the
+    last iteration's ``SigmaResult``, and ``gw_jax`` puts its
+    ``efermi_dft_ev`` straight into ``GWResults.efermi_ev``, which is the
+    single number ``gw_output.write_results`` forms ``e_dft_rel_ev`` (and
+    the eqp1 centre) from.  That field used to be re-filled here with the
+    loader's ``wfn.efermi`` — mid-gap ½(VBM+CBM) of the DFT spectrum —
+    unconditionally, so a metallic run's eqp0/eqp1.dat sampled Σ_c(ω)
+    2.932 eV away from the reference its own grid was built with on the
+    sodium 8×8×8 deck (measured: those files reassemble from disk to
+    3.6e-4 eV at wfn.efermi and to 3.7 eV at the loop's fixed-N μ).
+
+    AST, not a run: the defect is one keyword in one call, it is invisible
+    to every shape/finiteness gate, and reproducing it end to end costs a
+    self-consistent QSGW.  Static modes never fill the field, which is
+    what the unconditional re-fill was for — so the ``else`` arm may
+    still be ``wfn.efermi``; what may not come back is dropping the test.
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "sc_iteration.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_sc_driver")
+    kw = [k for call in ast.walk(fn)
+          if isinstance(call, ast.Call) for k in call.keywords
+          if k.arg == "efermi_dft_ev"]
+    assert len(kw) == 1, f"expected exactly one efermi_dft_ev=, got {len(kw)}"
+    value = kw[0].value
+    assert isinstance(value, ast.IfExp), (
+        "run_sc_driver must keep the dynamic finalize's own omega "
+        "reference and fall back to wfn.efermi only where there is none; "
+        f"got an unconditional {ast.dump(value)[:90]}")
+    assert (isinstance(value.body, ast.Attribute)
+            and value.body.attr == "efermi_dft_ev"), ast.dump(value.body)[:90]

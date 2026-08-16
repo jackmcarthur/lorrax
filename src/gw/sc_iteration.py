@@ -2614,7 +2614,11 @@ def run_sc_driver(
         ``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``
         runs).
         ``sigma_omega_h5_path`` points at the converged single-write
-        sigma_mnk.h5; ``efermi_dft_ev`` is filled for every mode.
+        sigma_mnk.h5; ``efermi_dft_ev`` is filled for every mode — the
+        dynamic finalize's OWN omega reference (the one its grid and its
+        interpolation used, and the one stamped into that file) wherever
+        there is one, ``wfn.efermi`` only for the static modes that never
+        set it.
     sigma_total : (nk, nb, nb) Ry
         Σ_xc + V_H in the DFT basis — the eigh operand
         ``H_QP = kin_ion + sigma_total``.
@@ -2835,7 +2839,29 @@ def run_sc_driver(
             _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_coh_kij_ry is not None else None),
         sigma_omega_h5_path=sigma_omega_h5_path,
-        efermi_dft_ev=float(wfn.efermi) * RYD_TO_EV,
+        # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
+        # This line used to read ``float(wfn.efermi) * RYD_TO_EV``
+        # unconditionally, which OVERWROTE the reference the finalize
+        # interpolated and built its grid with — the fixed-N mu on a metal —
+        # with the loader's mid-gap ½(VBM+CBM) of the DFT spectrum.  That
+        # value is what ``gw_jax`` puts in ``GWResults.efermi_ev`` and what
+        # ``gw_output.write_results`` forms ``e_dft_rel_ev`` from, so the
+        # run's eqp0/eqp1.dat sampled Sigma_c(omega) 2.932 eV away from the
+        # loop's own zero on the sodium deck and clipped at the grid edge —
+        # non-rigidly, hence the jagged final band (claim 0202 §2; the
+        # mechanism there is attributed to ``final_qp_eigenstates``' printed
+        # midgap 4.166867 eV, and the measurement says otherwise: the files
+        # reassemble to 3.6e-4 eV at wfn.efermi = 4.440137 eV and to 3.7 eV
+        # at the loop's mu = 1.507789 eV, so THIS line is the mechanism and
+        # 32564eb7's fix never reached the writer — ``run_sc_driver``
+        # discards the efermi ``dump_qp_wfn_artifacts`` returns).
+        # Static modes never fill it (only the dynamic finalize does), which
+        # is what the unconditional fill was for; keep that and nothing more.
+        # Insulating dynamic decks are byte-identical either way — there the
+        # finalize's own reference IS ``wfn.efermi``.
+        efermi_dft_ev=(sigma_result.efermi_dft_ev
+                       if sigma_result.efermi_dft_ev is not None
+                       else float(wfn.efermi) * RYD_TO_EV),
     )
     return sigma_result_dft, sigma_total, rms_history, rotations_written
 
