@@ -804,14 +804,13 @@ and one structural:
 - **Numerical.** Chi, head and `Sigma` at call `n+1` paired current
   energies with the occupations of the previous spectrum. Measured on the
   same undamped linear deck, the first three map calls give
-  `0.871369 / 0.514006 / 0.315953 eV` under the entry solve against
-  `0.871369 / 0.549794 / 0.404293 eV` under the end solve (claim 198) —
-  identical at call 1, where both rules see the same starting state, and
-  22% better by call 3, with a *stable* contraction ratio (0.590, 0.615)
-  where the end-solve arm's was already climbing (0.631, 0.735). The
-  entry-solve numbers are from the arm at
-  `runs/Na/02_soc48b_qsgw_mpa/05_rcrop_ab/linear/ab_linear_0815_161250.log`
-  (jobid 57038615); **their claim row has not landed** — see 7.6.
+  `0.871 / 0.514 / 0.316 eV` under the entry solve against
+  `0.871 / 0.550 / 0.404 eV` under the end solve — identical at call 1,
+  where both rules see the same starting state, and steadier thereafter:
+  the entry-solve contraction ratio holds (0.59, 0.61) where the
+  end-solve arm's was already climbing (0.63, 0.73). Claim 201 records
+  this A/B as the enabling evidence for the rule; the end-solve
+  trajectory is claim 198's.
 - **Structural, and this is the load-bearing one.** With an end-solve
   carry, `F` depends on the *trajectory* that produced `H`, not on `H`:
   it is exact only along the `sc_mixing = 1` linear path, where the
@@ -881,15 +880,25 @@ Weyl slack `||dH||_F / max|dlambda| = 2.67`, the predicted looseness is
 The same deck under plain linear mixing landed within `0.313 meV` of the
 rCROP answer, so this was a stopping-rule defect and not a physics one.
 
-**The floor is real and it is close.** On the sodium deck the criterion is
-an `L-infinity` over **two** bands — the Fermi-crossing Kramers pair, the
-only non-scissored bands the frozen window leaves (7.5) — and the 1 meV
-cutoff used for the converged run sits *at* the banked `omega`-grid
-half-step floor of `1.42 meV` on band energies (claims 198, 200). A
-tighter cutoff on this deck would be measuring the grid, not the map.
-The companion analysis script defaults to the same set, parsed from the
-snapshot's own `active_scissored_bands_1based` comment rather than from a
-band window written down somewhere else (claim 198, audit finding A3).
+**The floors are close, and where exactly they sit is not settled.** On
+the sodium deck the criterion is an `L-infinity` over **two** bands — the
+Fermi-crossing Kramers pair, the only non-scissored bands the frozen
+window leaves (7.5) — so the tolerance is doing very little averaging, and
+two banked numbers bracket what it can mean. Claims 198 and 200 read the
+1 meV cutoff as sitting *at* the `omega`-grid half-step floor of
+`1.42 meV` on band energies, i.e. at the edge of what the grid resolves.
+Claim 201 reads the same pair differently and says why: that `1.42 meV`
+was measured on a `0.5 eV` `omega` step, while this deck runs `0.25 eV`
+(41 points over `[-5,+5] eV`), so the deck's own floor is *smaller and
+unmeasured* — the rerun on the fixed tip is owed. Above the tolerance
+there is a second, coarser floor: the Si-lineage `N_p` sensitivity of
+`15 meV` between 8 and 10 poles, whose sodium rerun is also owed (claim
+201). Do not average the two readings; state which floor a per-band claim
+is being made against, and note that neither has been measured on this
+deck at its own settings. The companion analysis script defaults to the
+same band set, parsed from the snapshot's own
+`active_scissored_bands_1based` comment rather than from a band window
+written down somewhere else (claim 198, audit finding A3).
 
 ### 7.4 The measured characterization: damping is the whole difference
 
@@ -929,8 +938,10 @@ The audit's A5 (occupation lag) met its own deferral condition verbatim,
 but A4 — band-index pairing across iterates under the `eigvalsh` sort, of
 which the `k=292 -> 355` argmax relocation is a candidate symptom —
 remains unseparated from it (claim 200). Damping fixing the amplitude is
-not a diagnosis, and these two arms ran under the *end*-solve rule that
-7.2 replaced; the entry-solve arms are 7.6.
+not a diagnosis, and both arms in the table ran under the *end*-solve rule
+that 7.2 replaced. Damped linear is therefore how metallic sodium was
+*first* converged, not the recommended way to converge one: the production
+ruling is entry-solve rCROP, and 7.6 is where that is argued and measured.
 
 ### 7.5 Two anchors that decide which bands are even being converged
 
@@ -978,7 +989,7 @@ sodium's converged protected pair is `+1.88 eV` (7.4). A deck whose QP
 spectrum carries a band across the frozen window edge is the untested case
 (audit A4).
 
-### 7.6 rCROP on metals: refused, then legalized, and not yet measured
+### 7.6 rCROP on metals: refused, legalized, and now the production route
 
 **Why it was refused, and it was a state-consistency argument, not a
 tuning preference.** Under the end-solve rule the occupation state was a
@@ -998,14 +1009,34 @@ Separately, `4a6ef831` removed rCROP's own early-stop defect (7.3), so a
 metallic rCROP arm now stops on the same `L-infinity` criterion as the
 linear arm rather than on an `L2` proxy.
 
-**Status: measured runs exist, claims do not.** A 3-iteration
-linear-vs-rCROP A/B and an 8-iteration rCROP horizon run were launched on
-jobid 57038615 into `runs/Na/02_soc48b_qsgw_mpa/05_rcrop_ab/`
-(`RUNS_INFLIGHT.md` rows owned by `claude-rcrop-metals`). **As of
-2026-08-15 the sandbox ledger ends at claim 200 and carries no row for
-them**, so this chapter quotes no rCROP-on-metal trajectory; the one
-entry-solve number it does quote (7.2) is cited to that arm's log, marked
-as claim-pending, and must be replaced by its claim row when one lands.
+**Measured, and it converges without a variant (claim 201).** The
+entry-solve rCROP horizon run on the same sodium deck
+(`runs/Na/02_soc48b_qsgw_mpa/05_rcrop_ab/`) reaches
+`max|dE| = 0.389 meV` in **9 map calls** against the same 1 meV
+tolerance, on the trajectory
+
+```
+0.871369  0.514006  0.154386  0.106831  0.040433
+0.029043  0.002650  0.001527  0.000389   eV
+```
+
+which is **not monotone in its ratios** and should not be read as one: the
+`0.107 -> 0.040 -> 0.029` plateau is rCROP spending early calls building
+its secant space, and the quasi-Newton tail then contracts by up to 11x
+per call. Against the damped-linear arm of 7.4 (7 calls to 0.833 meV) the
+cost at the 1 meV tolerance is comparable, but there is no hand-chosen
+damping parameter — `sc_mixing = 1.0` diverges and `0.5` was picked by
+hand — and the accelerating tail is what wins at any tighter tolerance,
+which a fixed `~0.3-0.4`-per-call linear contraction cannot follow. Claim
+201's ruling, adopted here: **`sc_accelerator = rcrop` with the entry
+solve is the production route for metallic QSGW.**
+
+Its iterates differ from 7.4's by design — those arms ran the carried
+occupation rule at `bf57701b`, this one the entry solve at `178f62b8` —
+so the two are not an accelerator A/B on a fixed map, and nothing here
+separates "rCROP beats damping" from "the entry solve improved the map".
+The claim's own floor caveats (7.3) bound what may be read off the
+converged energies.
 
 ### 7.7 What metallic self-consistency does not yet establish
 
@@ -1020,19 +1051,24 @@ Open, with the reason each is still open:
   write"*, and an A/B at `bf57701b` fails identically (claim 198). Every
   number in 7.4 is 4 ranks on one node.
 - **A4 vs A5 unseparated** (7.4).
-- **The A1 hazard is reduced, not eliminated.** Two core libhdf5
-  instances are mapped in one process (cross-major), and the per-file churn
-  was **measured** at 1027 cross-library alternations on one file in one
-  iteration against the audit's ~25 estimate (claim 198). The landed
-  mitigation is a per-process one-owner registry (`file_io/hdf5_owner.py`,
-  `LORRAX_HDF5_ONE_OWNER`), a single h5py door in `mpa_store`, and one
-  `SlabIO` held across an iteration's pole batches; the sibling-file split
-  that would remove the class is specified but not scheduled. Two attempts
-  at the damped arm produced one intermittent garbage-offset head-fit read
-  (registered in the sandbox `KNOWN_LORRAX_ISSUES`). The stream-ordering
-  fix for the raced control-operand reads (`ef98d47f`, `15eef55f`) and its
-  acceptance run (`07_damped_streamfix/`) are in flight with **no claim as
-  of this writing**.
+- **The A1 hazard is reduced, not eliminated — and it owns less than it
+  was charged with.** Two core libhdf5 instances are mapped in one process
+  (cross-major), and the per-file churn was **measured** at 1027
+  cross-library alternations on one file in one iteration against the
+  audit's ~25 estimate (claim 198). The landed mitigation is a per-process
+  one-owner registry (`file_io/hdf5_owner.py`, `LORRAX_HDF5_ONE_OWNER`), a
+  single h5py door in `mpa_store`, and one `SlabIO` held across an
+  iteration's pole batches; the sibling-file split that would remove the
+  class is specified but not scheduled. The intermittent garbage-offset
+  head-fit read that killed one attempt at the damped arm has since been
+  root-caused **elsewhere**: an unordered control-operand copy on the
+  legacy default CUDA stream, which the XLA stream does not order against,
+  fixed at `ef98d47f` (stream-ordered copy) and `15eef55f` (live-context
+  handle validation). That write-up's gates are measured but its ledger row
+  and its acceptance arm (`07_damped_streamfix/`) were not landed when this
+  section was written, so treat the reattribution as pending confirmation
+  and the defect itself as still registered in the sandbox
+  `KNOWN_LORRAX_ISSUES`.
 - **The static-wing Schur fold is unblocked but unmeasured.** 4.1's
   `2.827e-7` fold correction is dynamic-wing tool scope; a completed
   metallic QSGW iteration now exists (claim 200), so the static-wing
@@ -1063,7 +1099,7 @@ Open, with the reason each is still open:
 | scissor identity law; the all-zero-diagonal wreckage it fixed | commit `bf57701b` |
 | `max\|dE\|` criterion; the `sqrt(n_elem)` autopsy (60.2x vs 72x predicted) | commit `4a6ef831` |
 | entry-solved occupations; the metallic rCROP refusal deleted | commit `178f62b8` |
-| entry-solve vs end-solve first three calls, 0.315953 vs 0.404293 eV | `05_rcrop_ab/linear/ab_linear_0815_161250.log`, jobid 57038615 — **claim pending** |
+| entry-solve vs end-solve first three calls (0.316 vs 0.404 eV); rCROP 0.389 meV in 9 calls; the production ruling; the two tolerance floors | claim 201 |
 | undamped divergence trajectory; bit-identical pre-change A/B; multi-node break; 1027 alternations | claim 198 |
 | damped convergence 0.833 meV in 7 calls; `mu` and `\|dmu\|`; converged QP pair; 1.42 meV grid floor | claim 200 |
 | uniform shift a null direction of `F`; the frozen window and mask caveat | claim 197(k) |
