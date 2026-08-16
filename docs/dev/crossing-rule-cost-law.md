@@ -158,14 +158,29 @@ that information demand is genuine):
 
 ## 6. What this does NOT fix: the fit-side sibling (design only)
 
-Fe F3's failure chain is a FIT pathology, upstream of everything here:
-the 209 eV transition span pushed the noncrossing minimax family to
-R = 1.5e13 (uncertified), the Loewner fit put poles at 1255 eV — six
-times beyond the sampling line's span — and 33.2% of residue mass sat
-above 16 eV (the census discriminator; healthy Si ≈ 1.5%, pathological
-≈ 49%), ending in an all-NaN σ_c behind rc = 0.  The quadrature
-decomposition makes the *evaluation* of whatever poles exist cheap at
-any depth; it does not make a bad pole fit good.
+Fe F3's failure chain is a FIT pathology, upstream of everything here.
+Measured directly from the F3 store
+(`runs/Fe/01_metal_mpa_qsgw/tmp/mpa/mpa_fit_sc_0000.h5`, offline census
+walk over all 78 q × 600² blocks × 8 poles, 2026-08-16):
+
+* the sampling line was stretched over the full transition span —
+  Re z up to 15.346 Ry = **208.8 eV** with only 16 samples (heights
+  0.2 / 2.0 Ry), and the static minimax window hit R = 1.53e13
+  (UNCERTIFIED runtime solve, the F3 log);
+* the width census: **33.16%** of total residue mass |B| sits on poles
+  wider than 16 eV (healthy Si ≈ 1.5%, the rung-10 pathology 49%);
+  90.9% is wider than 4 eV; the |B|-weighted mean width is 15.2 eV;
+* the position census: the |B|-weighted mean pole position is
+  **57.6 eV** — far above the ~10–25 eV plasmon region — with 10.5% of
+  mass above 100 eV and significant-residue poles (>1e-3 of block max)
+  out to **421 eV**, i.e. twice beyond the sampling span; the head fit
+  itself spent 2 of 8 poles at ~185 eV with 19–24 eV widths.
+
+The fit finalized (condition_max 4.5e8, backward error 5.7e-14 — both
+certificates pass), which is exactly the census's point: conditioning
+and residual cannot see a pole budget spent outside the physics.  The
+quadrature decomposition makes the *evaluation* of whatever poles exist
+cheap at any depth; it does not make a bad pole fit good.
 
 The design that remains (the directive's candidate 4): the
 Loewner/MPA sample-line span should NOT be stretched to cover deep
