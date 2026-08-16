@@ -115,28 +115,30 @@ class EPSReader:
         mat.flat[::nmtx_q+1] -= 1.0  # Subtracts 1 from diagonal elements in-place
         return mat
     
-    def unfold_eps_comps(self, iqbar, S, Gq):
-        # get the components Gtilde in order to do sum_GG' M*_q1(Gtilde) epsinv_GG'(q_1) M_q1(Gtilde)
-
-        #assert isinstance(S, np.ndarray) and S.shape == (3, 3), f"S must be a 3x3 numpy array, got shape {S.shape}"
-        #assert isinstance(Gq, np.ndarray) and Gq.shape == (3,), f"Gq must be a 3-element numpy array, got shape {Gq.shape}"
-
-        # consider q_1 = qbar{S|tau} + Gq, then (see Deslippe 2012 section 7.2)
-        # epsinv_GG'(q_1) = exp(-i(G-G')tau) epsinv_[(G+Gq)Sinv,(G'+Gq)Sinv](qbar)
-        # therefore, sum_GG' M*_q1(G) epsinv_GG'(q_1) M_q1(G') = sum_GG' M*_q1(GS-Gq) epsinv_GG'(qbar) M_q1(GS-Gq)
-        # NO SUPPORT FOR TAU (FRAC TRANS) CURRENTLY
-
-        # iqbar must be the index of the q-point *in the epsilon file*
-
-        #Sinv = np.linalg.inv(S)
-        # note gind_eps2rho is much longer than actual mtx size.
-        G_comps_qbar = np.zeros((self.nmtx[iqbar],3),dtype=np.int32)
-        G_comps_qbar = self.comps[self.gind_eps2rho[iqbar,:self.nmtx[iqbar]],:]
-        #G_comps_q1 = np.matmul(G_comps_qbar+Gq[:,np.newaxis],Sinv)
-        G_comps_q1 = np.einsum('ij,kj->ki',S.astype(np.int32),G_comps_qbar) - Gq[np.newaxis,:]
-
-        return G_comps_q1
-
+    # ``unfold_eps_comps`` WAS HERE AND IS DELETED (2026-08-16).
+    #
+    # It was a fifth independent ``G' = S·G − G_umklapp`` in this tree, found
+    # by re-counting the symmetry register's "four implementations" claim, and
+    # registered nowhere until 2026-08-15.  Two facts decided it:
+    #
+    #   * its own comment said "NO SUPPORT FOR TAU (FRAC TRANS) CURRENTLY",
+    #     i.e. it was known-wrong on every non-symmorphic deck, and nothing
+    #     outside this file said so;
+    #   * it had NO live caller.  The only references were in
+    #     ``misc/archived_tests/cohsex_noisdf.py``, which cannot be imported
+    #     at all — it does ``from wfnreader import WFNReader`` and
+    #     ``from gpu_utils import cp``, and neither module exists anywhere in
+    #     the tree.
+    #
+    # DELETED RATHER THAN FIXED because adding τ support to a method with no
+    # caller is speculative and untestable, while leaving a τ-blind G-rotation
+    # in a re-exported class is an invitation to use it.  Same disposition the
+    # register records for the other known-broken rotation copy: "fix is
+    # deletion in favour of the canonical, not repair."
+    #
+    # If you need this, the canonical G rotation + umklapp is
+    # ``wfn_loader/loader.py`` with ``symmetry_maps.SymMaps.get_umklapp_vector``
+    # — and it handles τ.
 
     def get_eps_diagonal(self, iq):
         """Get the static diagonal elements for a specific q-point.
