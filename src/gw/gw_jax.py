@@ -696,8 +696,25 @@ def main(argv=None):
 		# evaluation, so there is no census of existing decks sitting on a
 		# sliced edge to grandfather, and the honest move is to refuse rather
 		# than to whisper.
+		# THE INDEX BASE, which is the whole difficulty here.  ``enk_dft``
+		# spans the ACTIVE WINDOW ONLY — it is fetched over
+		# ``band_slices.sigma_range``, so its columns are 0..b3-b0 — while
+		# b0/b3 are GLOBAL band indices.  Checking global edges against
+		# that array makes both edges fall outside ``0 < b < nb`` whenever
+		# b0 == 0 (the normal case, and the only case the SC driver
+		# allows), so the guard would pass EVERY window without ever
+		# looking at one: a silent no-op guard, which is the same class of
+		# defect as the no-op key this commit exists to fix.
+		#
+		# ``wfn.energies[0]`` is (nk_irr, nbands_total) in Ry over the FULL
+		# band set, so the gap AT b3 is the gap between bands b3-1 and b3 —
+		# the quantity that decides whether the window's upper edge splits
+		# a multiplet.  Same array and same convention as
+		# ``gw_init.check_zeta_fit_windows``.  The IBZ k-set is the right
+		# one: degeneracies live at the high-symmetry points, all of which
+		# the wedge contains.
 		from common.band_degeneracy import boundary_min_gaps, check_band_window
-		_enk_ry = np.asarray(enk_dft, dtype=np.float64)
+		_enk_ry = np.asarray(wfn.energies[0], dtype=np.float64)
 		try:
 			check_band_window(
 				_enk_ry, int(band_slices.b0), int(band_slices.b3),

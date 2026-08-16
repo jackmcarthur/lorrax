@@ -265,7 +265,85 @@ def test_sigma_diag_is_identical_across_both_arms(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. THE REFUSAL SURVIVES THE WIRING
+# 3. THE BAND-WINDOW GUARD MUST BE ABLE TO FIRE
+# ---------------------------------------------------------------------------
+#
+# A guard that cannot fire is the same defect as a key that selects
+# nothing, one level down -- and the first draft of this wiring had
+# exactly that bug.  It handed ``check_band_window`` the ACTIVE-WINDOW
+# energies (``enk_dft``, whose columns are 0..b3-b0) together with GLOBAL
+# edges b0/b3.  With b0 == 0 -- the normal case, and the only one the SC
+# driver permits -- b_min lands on 0 and b_max lands on nb, both outside
+# the guard's own ``0 < b < nb`` test, so EVERY window passed without
+# being looked at.  The fix is the array, not the guard: full-band
+# energies (``wfn.energies[0]``), against which a global edge means what
+# it says.  These two cells pin both halves.
+
+def _degenerate_deck_energies() -> np.ndarray:
+    """(nk, nbands) Ry with an EXACTLY degenerate pair straddling band 4."""
+    e = np.array([
+        [0.00, 0.10, 0.20, 0.30, 0.40, 0.40, 0.70, 0.90],
+        [0.02, 0.12, 0.22, 0.32, 0.45, 0.45, 0.72, 0.92],
+    ], dtype=np.float64)
+    return e                      # bands 4 and 5 are degenerate at every k
+
+
+def test_the_window_guard_fires_on_a_sliced_multiplet():
+    """Global edges against FULL-BAND energies: the edge at 5 must refuse."""
+    from common.band_degeneracy import (BandWindowDegeneracyError,
+                                        check_band_window)
+    e = _degenerate_deck_energies()
+    with pytest.raises(BandWindowDegeneracyError):
+        # Window [0, 5) cuts the 4/5 pair in half.
+        check_band_window(e, 0, 5, mode="strict", log=lambda *a, **k: None)
+
+
+def test_the_window_guard_is_a_noop_on_the_active_window_array():
+    """THE BUG, pinned so it cannot come back.
+
+    Same physical window, but described against the ACTIVE-WINDOW array
+    the way the first draft did it: the array is only as wide as the
+    window, so the upper edge coincides with its width and the guard
+    treats it as cutting nothing.  It passes -- which is precisely why
+    the driver must hand it the FULL-band energies instead.
+    """
+    from common.band_degeneracy import check_band_window
+    e = _degenerate_deck_energies()
+    sliced = e[:, 0:5]            # what `enk_dft` looks like for [0, 5)
+    # No exception: b_max == nb is exempt, so the sliced multiplet at the
+    # boundary is invisible.  Documenting the no-op IS the regression test.
+    check_band_window(sliced, 0, 5, mode="strict", log=lambda *a, **k: None)
+
+
+def test_the_driver_hands_the_guard_full_band_energies():
+    """Structural: the driver's guard must read ``wfn.energies``.
+
+    Pinned by source inspection rather than by a full run, because
+    reaching this seam otherwise costs a WFN, a mean field and four GPUs.
+    If the array ever reverts to ``enk_dft`` the guard silently stops
+    guarding, and no numerical test would notice.
+
+    READ AS TEXT, not imported: importing ``gw.gw_jax`` brings up the
+    runtime stack and the FFI gate refuses on a CPU cell, which would
+    turn this into an environment test instead of a source contract.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "gw_jax.py").read_text()
+    assert "check_band_window(" in src, "the guard is gone entirely"
+    guard = src.split("check_band_window(")[-1].split(",")[0]
+    assert "_enk_ry" in guard, f"guard reads {guard.strip()!r}"
+    assign = [ln for ln in src.splitlines() if "_enk_ry =" in ln]
+    assert assign, "no _enk_ry assignment in gw_jax"
+    assert "wfn.energies" in assign[0], (
+        f"the hermitianized band-window guard is reading {assign[0].strip()!r}; "
+        f"it must read the FULL-band table (wfn.energies), or a global "
+        f"upper edge equal to the active window's width makes it a no-op.")
+
+
+# ---------------------------------------------------------------------------
+# 4. THE REFUSAL SURVIVES THE WIRING
 # ---------------------------------------------------------------------------
 
 BASE_INPUT = """\
