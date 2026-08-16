@@ -55,7 +55,7 @@ page has to read it from.
 | `transverse_zeta_rcond` | `1e-10` | Transverse rank-truncation cutoff tau relative to |lambda|_max (rank_truncate family only; no env twin). |
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
-| `band_chunk_size` | `16` | Bands per chunk in the band-chunked FFT/pair-density loops. |
+| `band_chunk_size` | `0` | Bands per chunk in the band-chunked FFT/pair-density loops. `0` (the default) = the gflat memory planner picks it against the device budget; a positive value PINS it, rounded up to a multiple of the mesh size (a correctness floor: `band_chunk // p_xy` must be >= 1). The default was `16` until 0.1.0, which pinned the chunk on every deck in the tree and made the planner's Stage-A search dead code. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
 ## Screening

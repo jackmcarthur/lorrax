@@ -14,6 +14,14 @@ The planner is the single source of truth for chunk sizes; the user-set
 adjust for correctness on the active mesh.  These tests pin the
 mesh-floor + round-up-to-multiple-of-``p_xy`` contract.
 
+THE DEFAULT IS ``0`` SINCE 0.1.0, i.e. "the planner decides".  It was
+``16``, and ``gw_init`` passes ``band_chunk_override = band_chunk_size if
+> 0 else None`` — so a non-zero default meant every deck in the tree
+pinned the band chunk and the auto-pick branch below (the largest
+power-of-2 whose FFT box fits half the headroom) never ran on a real
+run.  The last cell here pins that the shipped default reaches the
+planner.
+
 Tickled by CrI3 6x6 30Ry bispinor full-BZ 16-GPU (commit ``2de70eb``+
 ``4b927dc`` cascade) where user set ``band_chunk_size=2``.
 """
@@ -171,3 +179,47 @@ def test_band_chunk_capped_at_nb_total_or_world_size():
     # built downstream will still be only nb_total wide, but the static
     # _bpd_max shape uses band_chunk // p_xy = 1 per device.
     assert plan.band_chunk >= 16
+
+
+# ---------------------------------------------------------------------------
+# The shipped default must REACH the auto-pick above.
+# ---------------------------------------------------------------------------
+
+
+def test_the_shipped_default_hands_the_choice_to_the_planner():
+    """``band_chunk_size = 0`` is the deck's spelling of "planner decides".
+
+    Checked at both ends, because the two halves fail differently: the
+    DEFAULT (a non-zero one un-deadens nothing) and the SEAM in
+    ``gw_init`` that turns it into ``band_chunk_override = None`` (a seam
+    that passed ``0`` through would ask the planner to floor zero).
+    """
+    import ast
+    import pathlib as _pl
+
+    from gw.gw_config import _DEFAULTS
+
+    assert _DEFAULTS["band_chunk_size"] == 0
+
+    src = (_pl.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "gw_init.py").read_text()
+    assert ("band_chunk_override=(int(mem.band_chunk_size)" in src
+            and "if mem.band_chunk_size > 0 else None)" in src), (
+        "the gw_init seam no longer turns 0 into None; the planner would "
+        "be handed a zero-width band chunk")
+    ast.parse(src)
+
+
+def test_a_pinned_value_still_wins_over_the_planner():
+    """RED TWIN of the default change: > 0 still PINS."""
+    mesh = _cpu_mesh(2, 2)
+    pinned = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=mesh,
+        nb_total=168, ngkmax=5000, n_q_disk=36, budget_gb=28.0,
+        band_chunk_override=8, r_chunk_override=4096)
+    planned = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=mesh,
+        nb_total=168, ngkmax=5000, n_q_disk=36, budget_gb=28.0,
+        band_chunk_override=None, r_chunk_override=4096)
+    assert pinned.band_chunk == 8
+    assert planned.band_chunk >= 4 and planned.band_chunk % 4 == 0

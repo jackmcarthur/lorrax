@@ -1193,7 +1193,19 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    "band_chunk_size": 16,
+    # Bands per chunk in the band-chunked FFT / pair-density loops.
+    # 0 (DEFAULT) = the gflat memory planner picks it against the device
+    # budget; a positive value PINS it (rounded up to a multiple of the
+    # mesh size, which is a correctness floor, not a preference).
+    #
+    # THE DEFAULT WAS 16, AND 16 IS NOT "UNSET".  ``gw_init`` passes
+    # ``band_chunk_override = band_chunk_size if > 0 else None``, so a
+    # non-zero default meant EVERY deck in the tree pinned the band chunk
+    # and the planner's Stage-A search (gflat_memory_model: the largest
+    # power-of-2 band chunk whose FFT box fits half the headroom) was dead
+    # code on every run.  0 is the same "unset" spelling the other chunk
+    # dials already use.
+    "band_chunk_size": 0,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
