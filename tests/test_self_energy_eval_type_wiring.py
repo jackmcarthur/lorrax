@@ -144,17 +144,25 @@ def _body(path: str) -> str:
 
 
 def _parse_eqp(path: str) -> np.ndarray:
-    """Read the E_QP column back out of a BGW eqp{0,1}.dat."""
-    rows: list[list[float]] = []
+    """Read the E_QP column back out of a BGW eqp{0,1}.dat.
+
+    BOTH line kinds carry four fields -- the per-k header is
+    ``(kx, ky, kz, nspin*nb)`` and the band row is
+    ``(ispin, iband, E_DFT, E_QP)`` -- so the field COUNT cannot tell them
+    apart.  The band row is the one whose first two fields are integers.
+    """
+    rows: list[float] = []
     with open(path) as fh:
         for line in fh:
             if line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) == 4:                       # ispin iband E_DFT E_QP
-                rows.append([float(parts[3])])
-    vals = np.array(rows, dtype=np.float64).reshape(_NK, _NB)
-    return vals
+            if len(parts) != 4:
+                continue
+            if "." in parts[0] or "." in parts[1]:    # k-point header
+                continue
+            rows.append(float(parts[3]))              # ispin iband E_DFT E_QP
+    return np.array(rows, dtype=np.float64).reshape(_NK, _NB)
 
 
 # ---------------------------------------------------------------------------
