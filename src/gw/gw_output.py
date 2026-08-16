@@ -1218,6 +1218,19 @@ def write_results(
     # columns above use (a REDUCTION to the wedge, not a symmetry
     # unfolding — nothing is reconstructed).
     #
+    # ON SYMMETRY-REDUCED k, AND WHY THE SUBSET IS ENOUGH.  The driver's
+    # eigh is ``jax.vmap(jnp.linalg.eigh, in_axes=0)`` — nk INDEPENDENT
+    # (nb, nb) eigensolves with no coupling across k.  The eigenvalues at
+    # the wedge k are therefore bit-for-bit what a wedge-only
+    # diagonalisation would produce, so what is REPORTED here is the
+    # symmetry-reduced H_qp spectrum even though the batch that computed
+    # it was full-BZ.  That batch is not this feature's: it already ran on
+    # every path (it feeds ``qp_wfn_rotations.h5`` and the one-shot
+    # WFN_qp.h5), so reporting from it adds no diagonalisation at all.
+    # Narrowing the batch ITSELF to the wedge is a separate change — it
+    # would move the H-build seam for every path, including the default
+    # one — and belongs with the IBZ eqp work, not here.
+    #
     # eqp1 == eqp0 by construction, and that is the physics, not a
     # placeholder: off-diagonal Σ has already moved the bands, so there is
     # no Newton step left to Z-linearize.  The static-COHSEX path reports
