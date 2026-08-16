@@ -18,12 +18,12 @@ are tied to one implementation.
 
 | Family | API the LORRAX handler calls | Implementations of that API | Swappable? |
 |---|---|---|---|
-| `scalapack` | ScaLAPACK + C-BLACS Fortran ABI — **exactly eleven symbols**, hand-declared in [`cpp/scalapack/blacs_grid.h`](cpp/scalapack/blacs_grid.h): `pzheevd_`, `pdsyevd_`, `pzgetrf_`, `pdgetrf_`, `pzgetrs_`, `pdgetrs_`, `numroc_`, `descinit_`, `Csys2blacs_handle`, `Cblacs_gridinit`, `Cblacs_gridinfo`.  That list is not a summary: it is the complete non-libc undefined-symbol set of `solve_lu_ffi.cc` + `eigh_ffi.cc`, measured. | Intel MKL (`libmkl_scalapack_lp64` **+** `libmkl_blacs_<mpi>_lp64` — measured 8 + 3 = 11), Cray LibSci (`libsci_*_mpi_*`), netlib ScaLAPACK, AMD AOCL.  **Not SLATE** — see §0b. | **Yes.** Pass `-DLORRAX_SCALAPACK_LIBRARIES="<whole link line>"` and the MKL probe is skipped entirely. No source change. |
+| `scalapack` | ScaLAPACK + C-BLACS Fortran ABI — **exactly thirteen symbols**, hand-declared in [`cpp/scalapack/blacs_grid.h`](cpp/scalapack/blacs_grid.h): `pzheevd_`, `pdsyevd_`, `pzgetrf_`, `pdgetrf_`, `pzgetrs_`, `pdgetrs_`, `pzgemm_`, `pdgemm_`, `numroc_`, `descinit_`, `Csys2blacs_handle`, `Cblacs_gridinit`, `Cblacs_gridinfo`. That list is not a summary: it is the complete numerical/grid symbol surface of `gemm_ffi.cc`, `solve_lu_ffi.cc`, and `eigh_ffi.cc`. | Intel MKL (`libmkl_scalapack_lp64` **+** `libmkl_blacs_<mpi>_lp64` — measured 10 + 3 = 13), Cray LibSci (`libsci_*_mpi_*`), netlib ScaLAPACK, AMD AOCL. **Not SLATE** — see §0b. | **Yes.** Pass `-DLORRAX_SCALAPACK_LIBRARIES="<whole link line>"` and the MKL probe is skipped entirely. No source change. |
 | `mklblas` | CBLAS — `cblas_dgemm` / `cblas_sgemm` / `cblas_zgemm` / `cblas_cgemm`, plus the OPTIONAL `cblas_?gemm_batch` extension | Intel MKL, Cray LibSci, OpenBLAS, BLIS, ATLAS | **Yes.** Point `LORRAX_CBLAS_DIR` (or `CRAY_LIBSCI_PREFIX_DIR`) at a prefix with `cblas.h`. The batched extension is looked up at run time, per precision; a BLAS without it silently takes the portable plain-GEMM loop and says so once. |
 | `phdf5` | HDF5 C API + MPI-IO (`H5Pset_fapl_mpio`, `H5Dwrite`, …) | any parallel HDF5, over any MPI | **Yes.** `-DHDF5_ROOT=<prefix>`; see §"phdf5 stack choice". |
 | `mklfft` | Intel **DFTI** descriptor API (`DftiCreateDescriptor`/`SetValue`/`Compute*`) | **Intel MKL only.** | **No.** DFTI is Intel's. A LibSci-only site simply gets no host FFT handler: `LORRAX_FFT_FFI` refuses at run time and the default XLA lowering stands — a lost optimisation, never a wrong answer. The portable target if this ever needs fixing is the FFTW3 *guru* interface (`fftw_plan_guru_dft`), which takes the arbitrary input/output strides this handler depends on and is implemented by FFTW, cray-fftw, AOCL — and by MKL itself, which exports `fftw_plan_many_dft`/`fftw_execute` from the same library as the `Dfti*` entry points. That is a rewrite of the descriptor construction, not a link-line change, and it is unmeasured. |
 | `slate` | `slate::` C++ templates (`slate::potrf`, `slate::trsm`, `slate::heev` over `slate::HermitianMatrix`) | **ICL SLATE only.** | **No** — a C++ template library has no ABI a second vendor could implement. |
-| `cusolvermp` | `cusolverMp*` — opaque handle + grid + descriptor objects, `int64_t` dimensions, caller-supplied device *and* host workspace, an NCCL communicator | **NVIDIA only.** | **No.** Despite solving the same problems, it shares no symbol with ScaLAPACK (`nm -D libcusolverMp.so.0` finds none of the eleven names above). It is a different API for the same operation, not a second ScaLAPACK. |
+| `cusolvermp` | `cusolverMp*` — opaque handle + grid + descriptor objects, `int64_t` dimensions, caller-supplied device *and* host workspace, an NCCL communicator | **NVIDIA only.** | **No.** Despite solving the same problems, it shares no symbol with ScaLAPACK (`nm -D libcusolverMp.so.0` finds none of the thirteen names above). It is a different API for the same operation, not a second ScaLAPACK. |
 | `cublasmp` | `cublasMp*` — same shape of API as cuSOLVERMp | **NVIDIA only.** | **No.** Likewise exports no PBLAS symbol (`pzgemm_`, `pztrsm_`). |
 | `cufft` | cuFFT plan API | **NVIDIA only.** | **No.** |
 
@@ -51,11 +51,11 @@ interception.
 
 Build it with [`cpp/stage/slate_build_scalapack_api.sh`](cpp/stage/slate_build_scalapack_api.sh)
 and `nm -D` the result (SLATE v2025.05.28, measured 2026-07-31 against the
-eleven names above):
+thirteen names above):
 
-| | LORRAX's eleven |
+| | LORRAX's thirteen |
 |---|---|
-| **DEFINED (6)** | `pzheevd_` `pdsyevd_` `pzgetrf_` `pdgetrf_` `pzgetrs_` `pdgetrs_` |
+| **DEFINED (8)** | `pzheevd_` `pdsyevd_` `pzgetrf_` `pdgetrf_` `pzgetrs_` `pdgetrs_` `pzgemm_` `pdgemm_` |
 | **UNDEF (2)** — it *calls* them | `numroc_` `Cblacs_gridinfo` |
 | **absent (3)** | `descinit_` `Csys2blacs_handle` `Cblacs_gridinit` |
 
@@ -70,7 +70,7 @@ provider you can name in `LORRAX_SCALAPACK_LIBRARIES` by itself.
 five names it does not define are grid/descriptor bookkeeping
 (`descinit_`, `numroc_`, `Cblacs_gridinit`, `Cblacs_gridinfo`,
 `Csys2blacs_handle`), and every ScaLAPACK-bearing platform ships them: Intel
-MKL (measured here — `libmkl_scalapack_lp64` defines 8 of LORRAX's 11 and
+MKL (measured here — `libmkl_scalapack_lp64` defines 10 of LORRAX's 13 and
 `libmkl_blacs_<mpi>_lp64` the other 3), Cray LibSci, AMD AOCL, netlib.  Any
 machine that can host LORRAX at all already has that layer.  The overlay
 just goes in front of it.
@@ -216,7 +216,7 @@ CUDA/HIP/cuBLAS/rocBLAS symbols), so `devices` had nothing to dispatch to.
   `cudaLaunchKernel`, `cudaMemcpyAsync`, …).  The backend really is a build
   switch.
 * The `scalapack_api` overlay built against the **CUDA** SLATE exports the
-  **identical** 11-name classification (6 DEFINED / 2 UNDEF / 3 absent) and
+  **identical** 13-name classification (8 DEFINED / 2 UNDEF / 3 absent) and
   a full exported ABI differing from the CPU build's by only `_init` and
   `_fini` — linker artifacts, not API.  **One ABI, two backends.**
 * A caller that mentions only ScaLAPACK names (`Cblacs_*`, `descinit_`,

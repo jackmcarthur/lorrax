@@ -17,10 +17,11 @@
 #
 # It is ALSO the measurement behind PORTING.md §0's "SLATE's own optional
 # libslate_scalapack_api" row.  Run `nm -D` on the artifact and you get, for
-# LORRAX's eleven ScaLAPACK/BLACS names (SLATE v2025.05.28, measured
+# LORRAX's thirteen ScaLAPACK/BLACS names (SLATE v2025.05.28, measured
 # 2026-07-31):
 #
-#     DEFINED (6)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+#     DEFINED (8)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+#                  pzgemm_ pdgemm_
 #     UNDEF   (2)  numroc_ Cblacs_gridinfo          <- the overlay CALLS these
 #     absent  (3)  descinit_ Csys2blacs_handle Cblacs_gridinit
 #
@@ -142,14 +143,15 @@ SO="$OUT/libslate_scalapack_api.so"
     -L"$LIB" -lslate -Wl,-rpath,"$LIB"
 echo "[sapi] --- artifact ---"; ls -lh "$SO"
 
-# The gate this artifact exists for: it must DEFINE the six compute routines
+# The gate this artifact exists for: it must DEFINE the eight compute routines
 # and must NOT define the five grid/descriptor names.  Read the dynamic
 # symbol table ONCE (a `nm -D | grep -q` loop under pipefail reports MISSING
 # for every symbol grep matches early — recorded in build_ffi_host.sh).
 DYN="$(nm -D "$SO")"
-echo "[sapi] --- LORRAX's eleven ScaLAPACK/BLACS names in this artifact ---"
+echo "[sapi] --- LORRAX's thirteen ScaLAPACK/BLACS names in this artifact ---"
 bad=0
-for s in pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_; do
+for s in pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_ \
+         pzgemm_ pdgemm_; do
     if grep -qE "^[0-9a-f]+ [TWBDVi] $s\$" <<< "$DYN"; then echo "  DEFINED  $s"
     else echo "  MISSING  $s  <- expected DEFINED"; bad=1; fi
 done
@@ -160,5 +162,5 @@ for s in numroc_ descinit_ Csys2blacs_handle Cblacs_gridinit Cblacs_gridinfo; do
     else echo "  absent   $s"; fi
 done
 [ "$bad" -eq 0 ] || { echo "[sapi] FAILED: symbol table is not the documented shape." >&2; exit 1; }
-echo "[sapi] done — 6 DEFINED / 5 not.  This is an OVERLAY, not a ScaLAPACK."
+echo "[sapi] done — 8 DEFINED / 5 not.  This is an OVERLAY, not a ScaLAPACK."
 echo "[sapi] LORRAX REFUSES it as a provider; see src/ffi/cpp/scalapack/blacs_grid.h."

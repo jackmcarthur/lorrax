@@ -117,6 +117,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":              "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
+    "lorrax_slate_batched_gemm":      "SlateBatchedGemmFfi",
 }
 
 # Host variants of the slate targets (src/ffi/cpp/slate/host_ffi.cc) —
@@ -147,10 +148,12 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":              "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
+    "lorrax_slate_batched_gemm":      "SlateBatchedGemmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_batched_getrf": "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs": "ScalapackBatchedGetrsHostFfi",
     "lorrax_scalapack_eigh":          "ScalapackEighHostFfi",
+    "lorrax_scalapack_batched_gemm":  "ScalapackBatchedGemmHostFfi",
     # MKL FFT (DFTI API) flat-k batched-FFT handlers (cpp/mklfft) — the
     # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",

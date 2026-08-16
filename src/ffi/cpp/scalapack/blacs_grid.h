@@ -72,6 +72,25 @@ void pzgetrs_(const char* trans, const int* n, const int* nrhs,
               const int* desca, const int* ipiv, std::complex<double>* b,
               const int* ib, const int* jb, const int* descb, int* info);
 
+// General matrix multiply (gemm_ffi.cc).
+void pdgemm_(const char* transa, const char* transb,
+             const int* m, const int* n, const int* k,
+             const double* alpha,
+             const double* a, const int* ia, const int* ja, const int* desca,
+             const double* b, const int* ib, const int* jb, const int* descb,
+             const double* beta,
+             double* c, const int* ic, const int* jc, const int* descc);
+void pzgemm_(const char* transa, const char* transb,
+             const int* m, const int* n, const int* k,
+             const std::complex<double>* alpha,
+             const std::complex<double>* a, const int* ia, const int* ja,
+             const int* desca,
+             const std::complex<double>* b, const int* ib, const int* jb,
+             const int* descb,
+             const std::complex<double>* beta,
+             std::complex<double>* c, const int* ic, const int* jc,
+             const int* descc);
+
 // Hermitian/symmetric eigensolver, divide & conquer (eigh_ffi.cc).
 // NOTE the ABI asymmetry: the real routine has no RWORK.
 void pdsyevd_(const char* jobz, const char* uplo, const int* n,
@@ -112,7 +131,7 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 }
 
 // ---------------------------------------------------------------------------
-//  WHICH LIBRARY IS ACTUALLY BEHIND THESE ELEVEN NAMES  (2026-07-31)
+//  WHICH LIBRARY IS ACTUALLY BEHIND THESE THIRTEEN NAMES  (2026-08-16)
 //
 //  ScaLAPACK is an API with several implementations, and this file's whole
 //  premise is that LORRAX does not care which one answers — MKL on Frontera,
@@ -124,15 +143,16 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 //  (`scalapack_api/`, built as `libslate_scalapack_api.so`) whose documented
 //  use is `LD_PRELOAD` interception: it re-DEFINES the ScaLAPACK entry
 //  points and forwards them to `slate::`.  MEASURED against this repo's own
-//  eleven names (SLATE v2025.05.28, built 2026-07-31, `nm -D`):
+//  thirteen names (SLATE v2025.05.28, built 2026-07-31, `nm -D`):
 //
-//      DEFINED (6)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+//      DEFINED (8)  pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
+//                   pzgemm_ pdgemm_
 //      UNDEF   (2)  numroc_ Cblacs_gridinfo      <- it CALLS these
 //      absent  (3)  descinit_ Csys2blacs_handle Cblacs_gridinit
 //
 //  So it is an OVERLAY, never a provider: it must sit on top of a real
 //  ScaLAPACK+BLACS (it also consumes Cblacs_get / Cblacs_pcoord /
-//  Cblacs_pinfo / indxl2g_).  The six it does define are exactly the six
+//  Cblacs_pinfo / indxl2g_).  The eight it does define are exactly the eight
 //  compute routines LORRAX calls, i.e. an `LD_PRELOAD` — or an
 //  `-lslate_scalapack_api` ahead of MKL in LORRAX_SCALAPACK_LIBRARIES —
 //  silently replaces EVERY solve these two handlers make, with nothing on
@@ -355,7 +375,7 @@ inline void scalapack_announce_slate_api(const char* op, const char* name) {
 //  a vendor named in a docstring or a directory name is decoration.
 //
 //  This makes the answer visible on demand rather than guessable.  It prints
-//  the defining object for each of the ELEVEN names, once per process, on
+//  the defining object for each of the THIRTEEN names, once per process, on
 //  rank 0 (or every rank with `=all`), reusing the log grammar in
 //  mkl_thread_pin.h.  Opt-in, because in a healthy build it is noise; the
 //  moment a port misbehaves it is the first question worth asking.
@@ -373,10 +393,10 @@ inline void scalapack_log_providers_once() {
     std::call_once(once, [] {
         static const char* kNames[] = {
             "pzheevd_", "pdsyevd_", "pzgetrf_", "pdgetrf_", "pzgetrs_",
-            "pdgetrs_", "numroc_", "descinit_", "Csys2blacs_handle",
-            "Cblacs_gridinit", "Cblacs_gridinfo"};
+            "pdgetrs_", "pzgemm_", "pdgemm_", "numroc_", "descinit_",
+            "Csys2blacs_handle", "Cblacs_gridinit", "Cblacs_gridinfo"};
         std::fprintf(stderr,
-                     "[scalapack] provider map (the 11 names this library "
+                     "[scalapack] provider map (the 13 names this library "
                      "calls; anything implementing them can back it):\n");
         for (const char* n : kNames) {
             const std::string& lib = scalapack_symbol_provider(n);

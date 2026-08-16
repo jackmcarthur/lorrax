@@ -22,7 +22,7 @@ ships five targets, all validated on NERSC Perlmutter (1–4 nodes × 4×A100):
 >
 > **SLATE can answer to ScaLAPACK names — that is the portability route,
 > and it is one permutation away from working.** SLATE's optional
-> `libslate_scalapack_api` re-defines 6 of LORRAX's 11 ScaLAPACK names
+> `libslate_scalapack_api` re-defines 8 of LORRAX's 13 ScaLAPACK names
 > (measured: every compute routine, none of the grid/descriptor tools,
 > which every platform's own ScaLAPACK supplies anyway) and forwards them
 > to `slate::`, whose CPU/CUDA/ROCm backend is fixed by the *build*. So

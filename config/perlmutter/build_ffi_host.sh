@@ -25,7 +25,7 @@
 #   family     API LORRAX calls          Perlmutter provider
 #   ---------  ------------------------  ---------------------------------
 #   scalapack  ScaLAPACK + C-BLACS       Cray LibSci  libsci_gnu_mpi_mp
-#              (the 11 Fortran-ABI       VERIFIED 2026-08-05: all ELEVEN
+#              (the 13 Fortran-ABI       VERIFIED 2026-08-16: all THIRTEEN
 #              names in blacs_grid.h)    symbols present (pzheevd_ pdsyevd_
 #                                        pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_
 #                                        numroc_ descinit_ Csys2blacs_handle
@@ -258,7 +258,7 @@ if [[ ! -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# PRE-FLIGHT: the eleven ScaLAPACK/BLACS names must actually be in LibSci.
+# PRE-FLIGHT: the thirteen ScaLAPACK/BLACS names must actually be in LibSci.
 # A capability check, not a version check — this is what makes the script
 # survive a LibSci upgrade or a move to netlib/AOCL.
 # ---------------------------------------------------------------------------
@@ -274,7 +274,8 @@ if [[ -z "$_symtab" ]]; then
 fi
 missing=""
 for sym in pzheevd_ pdsyevd_ pzgetrf_ pdgetrf_ pzgetrs_ pdgetrs_ \
-           numroc_ descinit_ Csys2blacs_handle Cblacs_gridinit Cblacs_gridinfo; do
+           pzgemm_ pdgemm_ numroc_ descinit_ Csys2blacs_handle \
+           Cblacs_gridinit Cblacs_gridinfo; do
     grep -qE "[[:space:]]${sym}\$" <<<"$_symtab" || missing="$missing $sym"
 done
 unset _symtab
@@ -283,7 +284,7 @@ if [[ -n "$missing" ]]; then
     echo "[build_ffi_host] Pass an explicit -DLORRAX_SCALAPACK_LIBRARIES instead." >&2
     exit 2
 fi
-echo "[build_ffi_host] pre-flight: all 11 ScaLAPACK/BLACS symbols present in $(basename "$SCALAPACK_SO")"
+echo "[build_ffi_host] pre-flight: all 13 ScaLAPACK/BLACS symbols present in $(basename "$SCALAPACK_SO")"
 
 # ---------------------------------------------------------------------------
 # Configure + build.

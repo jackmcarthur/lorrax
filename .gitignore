@@ -69,6 +69,7 @@ jit_*
 # restate explicitly for the FFI subtree and cover IDE / clangd artifacts
 # that commonly appear next to the CMakeLists.txt.
 src/ffi/**/cpp/build/
+src/ffi/**/cpp/build_*/
 src/ffi/**/*.so
 src/ffi/**/*.o
 src/ffi/**/compile_commands.json

@@ -605,7 +605,7 @@ _UNIVERSAL_SKIPS = (
 
 #: Perlmutter's declared expected-backend profile.  The four MUST rows are
 #: the charter's, and they are measurable today: survey 2 verified all
-#: eleven ScaLAPACK symbols in LibSci 25.09.0, the SLATE host and device
+#: thirteen ScaLAPACK symbols in LibSci 25.09.0, the SLATE host and device
 #: builds, cuSOLVERMp 0.7.2 and the phdf5 handlers at the ARTIFACT level
 #: (nm/readelf), and BUILD_NOTES.md pins the host .so those symbols live
 #: in.  ``cusolvermp`` is CUDA-only by construction, so its row is

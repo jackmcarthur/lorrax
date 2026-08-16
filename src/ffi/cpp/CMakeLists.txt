@@ -515,6 +515,7 @@ if(LORRAX_HAVE_SLATE)
         slate/eigh_ffi.cc
         slate/potrf_ffi.cc
         slate/trsm_ffi.cc
+        slate/gemm_ffi.cc
         slate/batched_potrf_ffi.cc
         slate/batched_trsm_ffi.cc
     )
@@ -843,11 +844,11 @@ endif()
 #  family    API it calls              implementations that provide it
 #  --------  ------------------------  -------------------------------------
 #  scalapack ScaLAPACK + C-BLACS       Intel MKL (libmkl_scalapack_lp64
-#            (Fortran ABI; the ELEVEN  defines 8 + libmkl_blacs_<mpi>_lp64
-#            symbols listed below,     defines 3 = all eleven, measured),
+#            (Fortran ABI; THIRTEEN     defines 10 + libmkl_blacs_<mpi>_lp64
+#            symbols listed below,     defines 3 = all thirteen, measured),
 #            declared in scalapack/    Cray LibSci (libsci_*_mpi_*), netlib
 #            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
-#                                      libslate_scalapack_api: 6/11, and
+#                                      libslate_scalapack_api: 8/13, and
 #                                      refused -- see RESOLVE 1/4 below.
 #  mklblas   CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
 #            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
@@ -888,12 +889,13 @@ endif()
 #
 #  unresolved at load: any of
 #         pzheevd_  pdsyevd_  pzgetrf_  pdgetrf_  pzgetrs_  pdgetrs_
+#         pzgemm_   pdgemm_
 #         numroc_   descinit_ Csys2blacs_handle  Cblacs_gridinit
 #         Cblacs_gridinfo
 #      -> no ScaLAPACK+BLACS on the link line.  Set -DLORRAX_MKL_ROOT (or
 #         $MKLROOT), or pass a whole -DLORRAX_SCALAPACK_LIBRARIES link line.
-#         Those ELEVEN names are the entire ScaLAPACK surface LORRAX uses —
-#         the complete undefined-symbol set of solve_lu_ffi.cc + eigh_ffi.cc
+#         Those THIRTEEN names are the entire ScaLAPACK surface LORRAX uses —
+#         the complete undefined-symbol set of GEMM, solve_lu, and eigh
 #         outside libc, measured, not estimated.  Anything implementing them
 #         can back these handlers.
 #  unresolved at load: cblas_dgemm / cblas_zgemm
@@ -937,7 +939,7 @@ set(_mklblas_on       0)
 
 # ----------------------------------------------------------------------------
 #  RESOLVE 1/4 — ScaLAPACK + C-BLACS.  Required by cpp/scalapack/*_ffi.cc
-#  (pXgetrf / pXgetrs / pXheevd / Cblacs_gridinit / descinit / numroc;
+#  (pXgetrf / pXgetrs / pXheevd / pXgemm / Cblacs_gridinit / descinit / numroc;
 #  prototypes hand-declared in cpp/scalapack/blacs_grid.h because ScaLAPACK
 #  ships no vendor-neutral C header).
 #
@@ -949,8 +951,8 @@ set(_mklblas_on       0)
 #      block COMMENTED OUT ("# todo: requires ScaLAPACK"), so a CMake install
 #      never contains libslate_scalapack_api regardless of that setting.
 #    * Even when built from the GNUmakefile (or
-#      cpp/stage/slate_build_scalapack_api.sh), that library DEFINES only 6 of
-#      the eleven names below — every compute routine, none of the
+#      cpp/stage/slate_build_scalapack_api.sh), that library DEFINES only 8 of
+#      the thirteen names below — every compute routine, none of the
 #      grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo itself.
 #      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
 #      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
@@ -1318,7 +1320,7 @@ if(slate_FOUND OR _scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES slate/context.cc)
 endif()
 if(slate_FOUND)
-    list(APPEND LORRAX_FFI_HOST_SOURCES slate/host_ffi.cc)
+    list(APPEND LORRAX_FFI_HOST_SOURCES slate/host_ffi.cc slate/gemm_host_ffi.cc)
     list(APPEND _host_link_libs slate)
     list(APPEND _host_rpaths "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64" "/lorrax_slate/lib")
 endif()
@@ -1326,7 +1328,8 @@ if(_scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES
         scalapack/solve_lu_ffi.cc
         scalapack/getrf_getrs_ffi.cc
-        scalapack/eigh_ffi.cc)
+        scalapack/eigh_ffi.cc
+        scalapack/gemm_ffi.cc)
 endif()
 if(_mklfft_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES mklfft/fft_flat_k_ffi.cc)

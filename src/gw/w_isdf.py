@@ -444,28 +444,24 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     ζ-fit's distributed rank-truncate tier
     (:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
 
-    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
-       GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
-       along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
-       block along 'x' (full k for its j columns, μ·μ/Py per rank),
-       multiplies locally, and subtracts from its identity tile.  The
-       gathers are STRUCTURAL — inside shard_map the partitioner cannot
-       hoist them into a full-stack gather (the per_q-tier lesson,
-       quality pattern #4).  The q loop is chunked HOST-side so one
-       collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
-       (the AF transport bound; separate XLA executions cannot be
-       re-combined by a compiler pass).
+    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` through top-level
+       :func:`distrib_la.matmul`.  The default calls the platform's actual
+       2-D GEMM provider and retains face shards throughout.  The explicit
+       ``batch_reshard`` route performs x-then-y all-to-alls, local GEMM,
+       and the literal y-then-x inverse; it never forms a μ²/sqrt(P) panel.
+       The q loop is chunked host-side so one collective/provider call stays
+       below ``LORRAX_COLLECTIVE_CHUNK_MB``.
     2. **Factor + backsolve** — ONE resolved
        :class:`distrib_la.Plan` for ``solve_lu`` with
        ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
        CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
        consuming the block-cyclic tiles where they already live.
 
-    **No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
-    factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
-    μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
-    gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
-    no relayout, unlike the local plan.
+    On the default route, **no rank materialises a full (μ, μ) tile or a
+    JAX-level μ²/sqrt(P) panel**: the contraction calls the selected
+    distrib_la provider's 2-D GEMM (cuBLASMp or PBLAS), and inputs, A, the LU
+    factors and W stay ``P(None,'x','y')``.  The opt-in ``batch_reshard``
+    route deliberately makes complete matrices local for both GEMM and LU.
 
     Padding contract, and why it is exact: V and χ pad rows/cols are
     exact zeros (the bilinear-in-zero-padded-ψ contract), so at the
@@ -503,6 +499,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     from common.shard_map import shard_map
     from ffi import _services
     _services.ensure_on_path()
+    from distrib_la import matmul as linalg_matmul
     from distrib_la import plan as linalg_plan
     # House chunking pattern — single source (scorecard AF): one emitted
     # collective's payload is bounded by LORRAX_COLLECTIVE_CHUNK_MB.
@@ -536,33 +533,27 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         print(f"  [W solve] w_dyson_solver=distributed -> {p.describe()}",
               flush=True)
 
-    # The two collectives ``_a_local`` emits, per q (2-D block GEMM):
-    #   all_gather('y')  V   (μ/Px, μ/Py) -> (μ/Px, μ)  = μ²/Px · 16 B
-    #   all_gather('x')  χ   (μ/Px, μ/Py) -> (μ, μ/Py)  = μ²/Py · 16 B
-    # The BIGGER of the two sets the q-block (see ``_chunk_q``).
-    per_q_coll = max(n_ext * (n_ext // px), n_ext * (n_ext // py)) * 16
+    # No JAX all_gather remains.  Bound each provider call / staged exchange
+    # by one input face per q; provider-private workspaces are backend-owned.
+    per_q_coll = (n_ext // px) * (n_ext // py) * 16
 
     @partial(shard_map, mesh=mesh_xy,
-             in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
+             in_specs=P(None, 'x', 'y'),
              out_specs=P(None, 'x', 'y'), check_vma=False)
-    def _a_local(V_loc, chi_loc):
-        # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
-        # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
-        # of communication as ``isdf.core._distributed_pinv_apply``.
-        V_row = jax.lax.all_gather(V_loc, 'y', axis=2, tiled=True)
-        chi_col = jax.lax.all_gather(chi_loc, 'x', axis=1, tiled=True)
-        prod = jnp.einsum('qik,qkj->qij', V_row, chi_col)
+    def _identity_minus_local(prod):
+        # A[q,i,j] = δ_ij − (Vχs)[q,i,j] on my output face.  The
+        # contraction itself belongs to distrib_la and arrives already tiled.
         i0 = jax.lax.axis_index('x') * (n_ext // px)
         j0 = jax.lax.axis_index('y') * (n_ext // py)
         eye_tile = jnp.equal(
             i0 + jnp.arange(n_ext // px)[:, None],
-            j0 + jnp.arange(n_ext // py)[None, :]).astype(V_loc.dtype)
+            j0 + jnp.arange(n_ext // py)[None, :]).astype(prod.dtype)
         return eye_tile[None, :, :] - prod
 
-    @partial(jax.jit, donate_argnums=(2,), out_shardings=nat)
-    def _a_chunk(V_blk, chi_blk, A_acc, q0):
+    @partial(jax.jit, donate_argnums=(1,), out_shardings=nat)
+    def _a_chunk(prod, A_acc, q0):
         return jax.lax.dynamic_update_slice(
-            A_acc, _a_local(V_blk, chi_blk), (q0, 0, 0))
+            A_acc, _identity_minus_local(prod), (q0, 0, 0))
 
     # χ is donated here (module contract: the caller releases χ₀ after
     # solve_w — see screening.py's ``del chi0_q_solve``).
@@ -598,16 +589,26 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         (nq, μ, μ) at P(None,'x','y').  chi_flat's buffer is consumed."""
         nq_local = int(V_flat.shape[0])
         qb = _chunk_q(nq_local, per_q_coll)
-        _chunk_log('W Dyson A-build (GEMM)', nq_local, qb, per_q_coll)
+        if (str(distrib_la_batched_route).strip().lower() == "batch_reshard"
+                and qb >= px * py):
+            # Keep all full blocks divisible by P so face→batch movement
+            # preserves exactly qb*μ²/P elements per rank.  At most the
+            # final block is ragged and padded; otherwise every host-loop
+            # block would pay the same synthetic-matrix padding overhead.
+            qb = max(px * py, (qb // (px * py)) * (px * py))
+        _chunk_log('W Dyson A-build (distrib_la GEMM)',
+                   nq_local, qb, per_q_coll)
         chi_scaled = _scale(chi_flat, pref)
         A = _zeros_like(V_flat)
-        # Host-level q-block loop: ONE XLA execution per block, so the
-        # emitted all_gather payloads are bounded by construction and
-        # cannot be re-combined by a compiler pass (AF note in
-        # isdf/core).  At most two compiled shapes (full + remainder).
+        # Host-level q-block loop: ONE distrib_la execution per block.  At
+        # most two compiled shapes (full + remainder).
         for q0 in range(0, nq_local, qb):
             q1 = min(q0 + qb, nq_local)
-            A = _a_chunk(V_flat[q0:q1], chi_scaled[q0:q1], A, q0)
+            prod = linalg_matmul(
+                V_flat[q0:q1], chi_scaled[q0:q1], mesh=mesh_xy,
+                backend=p.backend,
+                batched_route=distrib_la_batched_route)
+            A = _a_chunk(prod, A, q0)
         B = _copy(V_flat)
         # ONE plan call for the whole stack: one descriptor, one
         # workspace; A and B are donated into the FFI.
