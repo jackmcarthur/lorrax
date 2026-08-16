@@ -61,7 +61,7 @@ def test_boundary_min_gaps_is_a_min_over_k_p1():
     e = np.array([[0.0, 1.0],            # k=0: gap 1.0
                   [0.0, 0.5],            # k=1: gap 0.5  <- the min
                   [0.0, 2.0]])           # k=2: gap 2.0
-    gaps = boundary_min_gaps(e)
+    gaps = boundary_min_gaps(e, is_full_spectrum=True)
     assert gaps.shape == (3,)
     assert np.isinf(gaps[0]) and np.isinf(gaps[2]), (
         "the outer boundaries cut nothing and must be +inf, else the snap "
@@ -296,7 +296,7 @@ def test_tolerance_separates_a_5p9_meV_boundary_p1():
     # gap.  Deliberately NOT the midline, which is reported and never snapped.
     e[:, 4:] += -0.1 + 5.9 * MEV
 
-    assert boundary_min_gaps(e)[4] == pytest.approx(5.9 * MEV, rel=1e-9)
+    assert boundary_min_gaps(e, is_full_spectrum=True)[4] == pytest.approx(5.9 * MEV, rel=1e-9)
 
     # default 1 meV: 5.9 meV is a genuine gap, leave it alone.
     assert resolve_band_window(e, 2, 2, 2, where="test") == (2, 2)
