@@ -1525,9 +1525,33 @@ Two things make it invisible today:
   **before** the partition is applied at `:1222`, so the star-spread
   enforcement does not cover the partition boundary at all.
 
-Whoever picks this up: the question is whether the mask should be promoted to
-whole multiplets (which widens the protected set and changes H_qp), or whether
-the partition boundary should merely be reported.  That is an owner call.
+**IS IT CHEAP?  The diagnostic is; the fix is not, and they are different
+changes.**
+
+- **Reporting it is cheap — ~20 lines, no behaviour change.**  Everything
+  needed is already in scope at `sc_iteration.py:1978`: `e_dft_ev` is the
+  array the mask was derived from, and `boundary_min_gaps` is one import.
+  The mask's INTERIOR transitions (`np.diff(mask)`) are exactly the boundaries
+  to test; its outer edges are the active window's own and come back `nan`
+  from `boundary_min_gaps(..., is_full_spectrum=False)`, which is the correct
+  answer — they cannot be judged from the window.  This is the honest minimum
+  and nothing about the calculation moves.
+- **Fixing it is NOT cheap.**  Promoting the mask to whole multiplets widens
+  the protected set, so more bands carry full off-diagonal Σ, so `H_qp`
+  changes and every QSGW number moves.  That is a physics decision with a
+  convergence story attached, not a guard.
+
+**The related one-line reorder is also not free.**  Moving
+`_check_kstar_spread` from `:1180` (before the partition) to after `:1222`
+would make it check the object that actually ships, and it is one line — but
+the partition is exactly the operation that could make that residual non-zero,
+so the reorder can turn the gate red on decks that pass today.  It is a
+strengthening, not a cleanup, and it wants its own measurement first: run it
+both ways on `gnppm_debug` and see whether the post-partition residual is
+still at the 1e-10 floor.
+
+Whoever picks this up: the ordering is (1) land the report, (2) measure the
+post-partition spread, (3) then decide about promoting the mask.
 
 ### `tools/gen_input_reference.py` REFUSES to run, so `docs/input_reference.md` is hand-maintained
 
