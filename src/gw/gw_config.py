@@ -142,10 +142,9 @@ def env_float(name: str, default: float, *, print_fn=print,
 
     The same defect class as :func:`env_bool`, one type along.  A
     ``try: float(...) except: default`` leaves the user believing a knob is
-    in force when it is not — the exact failure this file's
-    ``ISDF_ZCT_STAGE_CAP_GB`` handler already carries a comment about
-    ("an OOM later, with no clue"), and which its sibling
-    ``ISDF_CHUNK_TARGET_UTILIZATION`` was still committing.
+    in force when it is not — "an OOM later, with no clue", as the
+    (since-deleted) ``ISDF_ZCT_STAGE_CAP_GB`` handler put it, and which
+    its sibling ``ISDF_CHUNK_TARGET_UTILIZATION`` was still committing.
 
     ``refuse=True`` is for knobs that GATE correctness rather than tune
     performance (``LORRAX_FH_ORTHO_TOL``): running with the default while
@@ -172,52 +171,6 @@ def env_float(name: str, default: float, *, print_fn=print,
                      f"falling back to {default}.  The knob is NOT in "
                      f"force. ***")
         return default
-
-
-def resolve_zct_stage_cap(cap_raw, frac_raw, *, per_device_gb: float,
-                          total_gb: float, print_fn=print):
-    """Resolve the ζCᵀ stage cap in GB, or ``None`` when no cap applies.
-
-    Pure — the caller supplies ``total_gb`` (the physical card, ``0.0``
-    when there is no device to take a fraction of, i.e. the CPU backend).
-
-    Every path that ends in "no cap" says why.  The CPU path used to be
-    silent: the fraction branch sat behind
-    ``jax.default_backend() in ("gpu", "cuda")``, so a user who exported
-    ``ISDF_ZCT_STAGE_CAP_FRAC`` on a CPU run got no cap, no clamp and no
-    message — indistinguishable from the knob working.
-    """
-    if cap_raw and str(cap_raw).strip():
-        try:
-            return min(float(per_device_gb),
-                       max(0.0, float(cap_raw)))
-        except ValueError:
-            # Deliberately does NOT fall through to the _FRAC branch: an
-            # explicit absolute cap that cannot be parsed is a user error,
-            # and quietly substituting a different knob's answer for it
-            # would hide the typo behind a plausible number.
-            print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_GB="
-                     f"{cap_raw!r} is not a number; NO stage cap is in "
-                     f"force (ISDF_ZCT_STAGE_CAP_FRAC is not consulted as "
-                     f"a fallback for a malformed explicit cap). ***")
-            return None
-    if not (frac_raw and str(frac_raw).strip()):
-        return None
-    if float(total_gb) <= 0:
-        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
-                 f"{frac_raw!r} is a fraction of the DEVICE's physical "
-                 f"memory, and this backend reports none (total_gb=0) — "
-                 f"so NO stage cap is in force.  Use "
-                 f"ISDF_ZCT_STAGE_CAP_GB for an absolute cap. ***")
-        return None
-    try:
-        frac = max(0.10, min(0.95, float(frac_raw)))
-    except ValueError:
-        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
-                 f"{frac_raw!r} is not a number; the stage cap is "
-                 f"NOT set. ***")
-        return None
-    return min(float(per_device_gb), frac * float(total_gb))
 
 
 # ---------------------------------------------------------------------------
@@ -2375,14 +2328,17 @@ class MemoryConfig:
     ``memory_per_device_gb=0`` triggers GPU auto-detection at config
     construction time.  ``chunk_target_utilization`` is sourced from the
     ``ISDF_CHUNK_TARGET_UTILIZATION`` env var (default 0.97).
-    ``zct_stage_cap_gb`` similarly from
-    ``ISDF_ZCT_STAGE_CAP_GB`` / ``ISDF_ZCT_STAGE_CAP_FRAC``.
+
+    ``zct_stage_cap_gb`` was a fourth field here — computed from
+    ``ISDF_ZCT_STAGE_CAP_GB`` / ``_FRAC``, stored, and read by NOBODY.
+    Field, computation and both env reads were deleted in 0.1.0 rather
+    than frozen into the release's memory surface; the two knobs never
+    capped anything.
     """
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
-    zct_stage_cap_gb: float | None
     gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
@@ -2729,25 +2685,6 @@ class LorraxConfig:
         if chunk_utilization > 0:
             chunk_utilization = max(0.85, min(1.0, chunk_utilization))
 
-        # --- ZCT stage cap from env ---
-        # ``total_gb`` is the PHYSICAL card; 0.0 when the backend has no
-        # device memory (CPU).  Passing it in keeps the decision — and
-        # every "no cap, and here is why" announcement — in one pure,
-        # testable place instead of behind a backend guard that used to
-        # skip the fraction branch in silence.
-        import jax
-        _zct_total_gb = 0.0
-        if jax.default_backend() in ("gpu", "cuda"):
-            from common.gpu_utils import get_device_memory_info
-            _zct_total_gb = float(
-                get_device_memory_info().get("total_gb", 0.0))
-        zct_stage_cap_gb = resolve_zct_stage_cap(
-            os.environ.get("ISDF_ZCT_STAGE_CAP_GB"),
-            os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC"),
-            per_device_gb=memory_per_device_gb,
-            total_gb=_zct_total_gb,
-            print_fn=print_fn)
-
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
 
@@ -2863,7 +2800,6 @@ class LorraxConfig:
             chunk_target_utilization=chunk_utilization,
             band_chunk_size=int(_g("band_chunk_size")),
             r_chunk_override=int(_g("r_chunk_size")),
-            zct_stage_cap_gb=zct_stage_cap_gb,
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )

@@ -33,7 +33,7 @@ Conventions throughout this doc:
 | Mesh axes | `'x'` = μ/centroid, `'y'` = r-chunk; `P = p_x · p_y` |
 | Budget detection | `common.gpu_utils.get_device_memory_gb = 0.9 · bytes_available`; `bytes_available` from `jax.memory_stats().bytes_limit − bytes_in_use`, falls back to `nvidia-smi memory.free` |
 | Target utilization | heuristic `0.97` (`cohsex.in :: chunk_target_utilization`); G-flat planner `0.80` (lower margin reflects bc-loop transient unpredictability) |
-| Safety cap (opt-in) | `ISDF_ZCT_STAGE_CAP_GB` / `ISDF_ZCT_STAGE_CAP_FRAC` env vars for the ZCT stage only |
+| Safety cap (opt-in) | none. `ISDF_ZCT_STAGE_CAP_GB` / `ISDF_ZCT_STAGE_CAP_FRAC` claimed to cap the ZCT stage; the field they filled had no reader and all three were deleted in 0.1.0 |
 
 Typical ranges (from production datasets):
 
