@@ -422,9 +422,11 @@ which also **overrides the `Gamma` row of the body's origin sample**
 (`model._evaluate_samples`, `static_gamma_override`) — the one row where the
 `q`-first order of limits of section 2.3 would be wrong. Measured (claim
 181, Na 48b): `kappa_TF^2 = 0.708586826 bohr^-2`; the fold correction on
-this deck is relative `2.827e-7` (dynamic-wing tool scope; the static-wing
-fold itself awaits a completed metallic QSGW iteration), so
+this deck is relative `2.827e-7` (dynamic-wing tool scope), so
 `kappa_eff^2 = kappa_TF^2` to well inside the value discrepancy of 4.4.
+The **static-wing** fold has still not been measured: it was blocked on a
+completed metallic QSGW iteration, one now exists (claim 200), and the
+measurement is owed — see `§7.7`.
 
 ### 4.2 Dynamic head: Kubo + Drude + wings, on the body's grid
 
@@ -667,9 +669,16 @@ the map still moves. The ladder's analysis script
 (`runs/Na/02_soc48b_qsgw_mpa/01_lorrax_metal_mpa/r6_residual.py`) refuses to
 run unless the caller confirms `mixing = 1` for exactly this reason, and
 deliberately does not reuse the run's printed RMS (a different norm over a
-different band set). Alongside it, R6 asserts per iteration: electron count
-conserved by the fixed-N solve (`<= 1e-8`), `mu` drift decreasing, fit
-certifications green, head poles stable.
+different band set). It no longer defaults to *all* bands either: it parses
+the protected set from the snapshot's own `active_scissored_bands_1based`
+comment — `{9,10}` on this deck — and reproduces the driver's criterion to
+every printed digit (claim 198; the audit's finding A3 was that an
+all-bands default re-counts the refit scissor diagonals). The driver now
+applies this same output-vs-input rule itself, on both the linear and the
+rCROP path; §7.3 owns the implemented predicate and the band set it runs
+over. Alongside it, R6 asserts per iteration: electron count conserved by
+the fixed-N solve (`<= 1e-8`), `mu` drift decreasing, fit certifications
+green, head poles stable.
 
 ### 6.3 The smearing width: one owner, BGW semantics
 
@@ -697,11 +706,16 @@ alike — so do not describe what was removed as a metal gate.
 **What the lift asserts, and what it does not.** Removing the row was the
 declared landing gesture for *one real metallic run traversing
 chi/W/head/`Sigma`/QSGW end to end*, and that is what it was taken on: R6
-ran three self-consistent iterations to `rc = 0` on the Na deck. **It is a
-statement about parseability, not convergence.** That run did not converge —
-`max|dE|` 5.433 eV against a 1e-4 eV criterion, `mu` moving 1.849 eV between
-iterations — and the convergence physics continues under R5/R6. The
-site-level refusals are the safety now and are untouched:
+ran three self-consistent iterations to `rc = 0` on the Na deck. **It was a
+statement about parseability, not convergence** — that run did not converge
+(`max|dE|` 5.433 eV against a 1e-4 eV criterion, `mu` moving 1.849 eV
+between iterations), and it predates the three defects §7 records: the
+zero-sample scissor (`bf57701b`), the midgap-anchored partition window
+(`90b8275d`) and the mixed omega reference in the finalizer (`59d7ea20`).
+**Convergence is now separately measured** — claims 198 and 200, `§7.4`:
+undamped diverges, damped reaches 0.833 meV in 7 map calls. Read the two
+statements as what they are, a parse gate and a physics result, not as one
+another. The site-level refusals are the safety now and are untouched:
 `mpa_metal_needs_occupations`, the deck-key cross-validation, and the
 occupation-stamp assert.
 
@@ -713,9 +727,11 @@ velocity and is not smooth at band crossings; measured `max_abs = 3.169`
 against `atol = 5e-4`, already `3.9e-2` on the never-crossing semicore
 bands, improved to 1.796 by the transported frame of claim 195 but still
 refusing). Rungs R2 (claim 180) and R3 (claims 181/182) stand; R4's fit half
-is claim 196 and its eqp half awaits a rerun; velocities everywhere on this
-route are DFT p-matrix elements, with the covariant-derivative upgrade
-parked on claim 183.
+is claim 196 and its `eqp` half still awaits its rerun on the
+omega-reference-fixed tip; R6 landed as claims 198/200 (`§7.4`), and R5 —
+the one-shot metallic `Sigma` against the BerkeleyGW full-frequency
+reference — has not. Velocities everywhere on this route are DFT p-matrix
+elements, with the covariant-derivative upgrade parked on claim 183.
 
 ## 7. Self-consistency: the metallic QSGW map and its convergence
 
