@@ -676,6 +676,36 @@ Use these dependencies when moving beyond the validated profile.
   linearly with the new transition bandwidth. Keep the old pole count only if
   held-out W and QP values remain converged.
 
+- **More bands in the Sigma sum — and how to extrapolate them.** Measured on
+  a one-shot GN-PPM Si ladder at $n_b = 28/40/68$ with a band-matched
+  BerkeleyGW arm at every rung (claim 197; the MPA arm of this ladder was not
+  run, and §5.3b's broadening caveat forbids reading the GN-PPM numbers as
+  MPA ones). **94.6%** of the mean-square 28-vs-68-band error is a *rigid
+  shift* of the whole spectrum (BGW 92.7%): aligning each run on its own
+  $\mu$ cuts RMS $|\Delta E_{QP}|$ from **787 meV to 186 meV**, within 1.6%
+  of the best possible uniform shift, so there is no cleverer reference than
+  per-run $\mu$. The residual is not noise but a clean linear stretch,
+  $\Delta E = s + \alpha (E - \bar E)$ with $\alpha \approx +0.031$, which
+  with the shift explains 99.2% of the variance; the two codes agree on $s$
+  to 2% and on $\alpha$ to 4%, which is why the mechanism is read as
+  truncating the $\Sigma_c$ intermediate-state sum rather than as an
+  implementation difference. The tail is textbook $1/n_b$: a per-$(k,n)$ fit
+  $E(n_b) = E_\infty + A/n_b$ over three widely spread rungs reproduces them
+  to 15 meV RMS — a 52x lever on the 787 meV error it corrects — and beats
+  $1/n_b^2$ by 4-5x in both codes. Practice, therefore: align on per-run
+  $\mu$, drop the outermost band pair at each window edge (they are
+  non-monotone in $n_b$ and inflate the fit residual 8x), fit $E_\infty +
+  A/n_b$ on three rungs, and report the extrapolated correction beside the
+  number — that deck still owes $-528$ meV mean at 68 bands. Two limits of
+  this result, both measured: energy-*local* differences already cancel it
+  (the direct gap at $\Gamma$ moves 5.5 meV while the levels move 787 meV)
+  while wide-window differences do not (valence bandwidth $+268$ meV), and
+  it does **not** carry to the screening channel at all — on the Na head
+  ladder a best rigid $\omega$-shift removes only ~24% of RMS
+  $|\Delta \chi^{00}|$ and a best amplitude rescale 39%, so the head's
+  finite-band error is a change of spectral *shape* and a shift-and-stretch
+  ansatz is wrong for $W$.
+
 - **A wider Sigma interval.** Both $T$ and the crossing beat bandwidth $F$
   grow. Crossing rank is approximately linear in the added bandwidth; sector
   ranks grow logarithmically until a window boundary changes. A finer output
