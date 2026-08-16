@@ -523,9 +523,11 @@ def write_freq_debug(
     and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
     (static, screened mode).
 
-    No-op unless ``config.debug.sigma_freq_debug_output`` is set.
+    No-op unless ``config.debug.sigma_freq_debug_file`` names a file
+    (empty = off; the bool that used to gate this was folded into the
+    filename in 0.1.0).
     """
-    if not config.debug.sigma_freq_debug_output:
+    if not config.debug.sigma_freq_debug_file:
         return
     from file_io import write_sigma_freq_debug_table
     from .eqp_bgw import (

@@ -116,8 +116,7 @@ page has to read it from.
 | `sigma_omega_batch_size` | `4` | Omega points evaluated per batch in the Sigma^c(omega) loop. |
 | `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
-| `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |
-| `sigma_freq_debug_file` | `"sigma_freq_debug.dat"` | Path of the Sigma(omega) debug dump. |
+| `sigma_freq_debug_file` | `""` | Path of the per-branch Sigma(omega) debug dump; EMPTY (the default) = off. The `sigma_freq_debug_output` bool was folded into this key for 0.1.0 and now REFUSES, naming the line to write. |
 
 ## IO / restart
 

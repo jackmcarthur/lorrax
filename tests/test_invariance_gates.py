@@ -55,7 +55,7 @@ _OUT = "sigma_diag_gnppm_test.dat"
 # conftest.gnppm_restart_baseline so variants diff against it cleanly).
 _RESTART_MUTATIONS = {
     "restart = false": "restart = true",
-    "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
+    "sigma_freq_debug_file = sigma_freq_debug.dat": "sigma_freq_debug_file =",
 }
 
 

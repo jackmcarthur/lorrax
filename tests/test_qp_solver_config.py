@@ -76,6 +76,29 @@ def test_the_self_consistent_boolean_refuses_naming_qp_solver(tmp_path):
     assert "qp_solver = self_consistent" in msg
 
 
+def test_sigma_freq_debug_output_refuses_naming_the_file_key(tmp_path):
+    """Folded into the filename (empty = off) in 0.1.0.
+
+    REFUSED rather than translated: ``true`` has to become a FILENAME, and
+    picking one for the deck would be the parser inventing an output path.
+    """
+    from gw.gw_config import read_lorrax_input
+
+    p = tmp_path / "deck_freqdbg.in"
+    p.write_text(_with_compute_mode(BASE_INPUT)
+                 + "sigma_freq_debug_output = true\n")
+    with pytest.raises(ValueError) as exc:
+        read_lorrax_input(str(p))
+    assert "sigma_freq_debug_file = sigma_freq_debug.dat" in str(exc.value)
+
+
+def test_the_debug_table_is_off_by_default_and_on_by_naming_a_file(tmp_path):
+    assert _config(tmp_path).debug.sigma_freq_debug_file == ""
+    cfg = _config(tmp_path, "sigma_freq_debug_file = sfd.dat\n")
+    assert cfg.debug.sigma_freq_debug_file.endswith("sfd.dat")
+    assert not hasattr(cfg.debug, "sigma_freq_debug_output")
+
+
 def test_sigma_at_dft_energies_is_ignored_and_says_so(tmp_path):
     """Deleted 0.1.0.  It was parsed and never read for its whole life.
 

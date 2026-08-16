@@ -785,7 +785,7 @@ def main(argv=None):
 	)
 	if meta.rank == 0:
 		# Optional Σ-decomposition debug table (no-op unless
-		# ``debug.sigma_freq_debug_output``; see ``gw_output.write_freq_debug``).
+		# ``debug.sigma_freq_debug_file``; see ``gw_output.write_freq_debug``).
 		write_freq_debug(
 			results, config=config,
 			static_head_terms=static_head_terms,

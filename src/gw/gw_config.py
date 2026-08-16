@@ -1403,8 +1403,13 @@ _DEFAULTS = {
     "ppm_invalid_mode": "static_limit",
     "sigma_at_dft_extrapolate": False,
     # Debug
-    "sigma_freq_debug_output": False,
-    "sigma_freq_debug_file": "sigma_freq_debug.dat",
+    # The per-branch Sigma(omega) debug table.  EMPTY (default) = off —
+    # the deck's own idiom for an optional file (``centroids_file_current``,
+    # ``kgrid_fi``, ``bse_k_grid``).  A bool plus a filename for one
+    # artifact was one key too many, and the two could disagree: a deck
+    # naming a file and forgetting the bool wrote nothing, silently.
+    # ``sigma_freq_debug_output`` was that bool; see ``_LEGACY_DECK_KEYS``.
+    "sigma_freq_debug_file": "",
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
     # replaced by E_QP).  Fires for both one-shot and SC; set False to
@@ -1521,6 +1526,11 @@ _LEGACY_DECK_KEYS = frozenset({
     # wrong, and warns.  The wedge-unfold READER in file_io.tagged_arrays
     # stays -- files written on the wedge must still load.
     "restart_q_storage",            # refuse on auto/ibz, else ignore
+    # 0.1.0: folded into ``sigma_freq_debug_file`` (empty = off).  REFUSED
+    # rather than translated: ``true`` has to become a FILENAME, and
+    # picking one for the deck would be this parser inventing an output
+    # path.  The refusal names the line to write.
+    "sigma_freq_debug_output",      # refuse -> sigma_freq_debug_file
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1785,6 +1795,18 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        if section.get("sigma_freq_debug_output", fallback=None) is not None:
+            raise ValueError(
+                f"Input key 'sigma_freq_debug_output' "
+                f"({_deck_key_line(lines, start, end, 'sigma_freq_debug_output')}"
+                f") was folded into 'sigma_freq_debug_file' in 0.1.0: an "
+                f"empty filename (the default) is off, a non-empty one is "
+                f"on.  A bool beside a filename for one artifact was one "
+                f"key too many, and a deck that named the file and forgot "
+                f"the bool wrote nothing.  Write "
+                f"'sigma_freq_debug_file = sigma_freq_debug.dat' to turn it "
+                f"on, or delete both lines to leave it off.")
+
         _rqs = section.get("restart_q_storage", fallback=None)
         if _rqs is not None:
             _rqs_val = str(_rqs).strip().lower()
@@ -2403,7 +2425,7 @@ class BackendConfig:
 @dataclass(frozen=True)
 class DebugConfig:
     """Debug-only flags + auxiliary output filenames."""
-    sigma_freq_debug_output: bool
+    #: Empty = OFF.  See ``_DEFAULTS["sigma_freq_debug_file"]``.
     sigma_freq_debug_file: str
     write_wfn_h5: bool
 
@@ -2438,7 +2460,7 @@ class LorraxConfig:
         config.head.wcoul0_source     # head plumbing
         config.ppm.omega_p            # PPM probe ω
         config.sigma.omega_layout     # shared dynamic-Sigma output policy
-        config.debug.sigma_freq_debug_output
+        config.debug.sigma_freq_debug_file
 
     See module docstring for the full grouping.  ``cohsex.in`` keys
     are unchanged — input files written for prior versions still parse
@@ -3000,8 +3022,7 @@ class LorraxConfig:
                 f"{HARTREE_SOURCES}.  H0 = kin_ion + V_H is a ~500 eV "
                 "cancellation; this key is not guessed.")
         debug = DebugConfig(
-            sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
-            sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
+            sigma_freq_debug_file=str(_g("sigma_freq_debug_file") or ""),
             write_wfn_h5=bool(_g("write_wfn_h5")),
         )
         bse = BSEConfig(

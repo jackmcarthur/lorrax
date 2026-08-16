@@ -76,8 +76,7 @@ whead_0freq = 150.395600
 
 memory_per_device_gb = 28
 
-sigma_freq_debug_output = true
-
+sigma_freq_debug_file = sigma_freq_debug.dat
 wfn_file = WFN.h5
 output_file = eqp_si_fast.dat
 sigma_diag_file = eqp_si_fast.dat
