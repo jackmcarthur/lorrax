@@ -528,6 +528,22 @@ def test_the_column_budget_is_the_tile_arithmetic():
     # Never zero, and never more columns than there are.
     assert MS.choose_column_budget(8, 4096) == 1
     assert MS.choose_column_budget(16, 1) == 16
+    # BOTH CLAMPS ARE PUBLISHED NOW (audit §E.3 item 5): the upper one is
+    # what a generous budget meets, and the docstring's own worked case.
+    assert MS.choose_column_budget(480, 16, 100 * 2 ** 20) == 480
+
+    # And the sentence prints the arithmetic that RAN (item 4): the tile
+    # product only when the budget IS one tile, and a call a reader can
+    # type to get the number beside it.
+    one_tile = MS.describe_column_cost(480, 16, 30)
+    assert "one (N_mu, N_mu) tile, 480*480*16 B = 3686400 B" in one_tile
+    assert ("choose_column_budget(480, 16, tile_bytes=3686400, "
+            "itemsize=16) allows 30") in one_tile
+    big = MS.describe_column_cost(480, 16, 100, tile_bytes=100 * 2 ** 20)
+    assert "480*480*16" not in big, big      # the false equation is gone
+    assert f"budget of {100 * 2 ** 20} B" in big
+    assert (f"choose_column_budget(480, 16, tile_bytes={100 * 2 ** 20}, "
+            "itemsize=16) allows 480") in big
 
 
 def test_a_column_request_that_busts_the_budget_refuses(tmpdir_path):
@@ -1333,8 +1349,12 @@ def test_a_tensor_without_its_omega_group_refuses(tmpdir_path):
 def test_the_column_helpers_refuse_a_malformed_request(tmpdir_path):
     """RED cluster on the column argument itself."""
     _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    with pytest.raises(ValueError, match="repeats a column"):
-        MS.normalise_columns([1, 1, 2], n_mu)
+    with pytest.raises(ValueError, match="repeats a column") as exc:
+        MS.normalise_columns([1, 1, 2, 5, 5], n_mu)
+    # THE COLUMNS THAT REPEAT, under the label "repeats a column".  It
+    # used to name the first four DISTINCT columns, which sends a reader
+    # debugging a duplicate to three innocent indices (audit §E.3 item 11).
+    assert "[1, 5]" in str(exc.value), str(exc.value)
     with pytest.raises(IndexError, match="logical columns"):
         MS.normalise_columns([0, n_mu], n_mu)
     with pytest.raises(TypeError, match="boolean mask"):

@@ -1545,7 +1545,8 @@ def choose_column_budget(n_mu, n_omega, tile_bytes=None,
 
     so
 
-        n_cols = floor(tile_bytes / (n_omega * N_mu * itemsize))
+        n_cols = min(N_mu,
+                     max(1, floor(tile_bytes / (n_omega * N_mu * itemsize))))
 
     which for the default budget collapses to ``n_cols = N_mu //
     n_omega`` — the frequency axis is paid for out of the column count,
@@ -1555,18 +1556,19 @@ def choose_column_budget(n_mu, n_omega, tile_bytes=None,
     122 880 B, and the budget is exactly **30 columns** — 16·480·30·16 =
     3 686 400 B, the tile to the byte.
 
-    Clamped BOTH WAYS: to at least 1, and to at most ``n_mu``.  The lower
-    clamp is the interesting one — a budget of zero columns is not a
-    budget, it is a refusal to make progress, and the honest failure for a
-    grid so long that one column busts a tile is to hand back 1 and let the
-    caller see the cost in :func:`describe_column_cost`.  The UPPER clamp
-    is not in the closed form above and it bites whenever ``tile_bytes``
-    is generous: measured 2026-08-15, ``choose_column_budget(480, 16)`` is
-    30 as the worked example says, but ``choose_column_budget(480, 16,
-    100*2**20)`` returns **480**, not the 853 the formula gives.  A caller
-    that sizes an ``n_cols_buffer`` off the published formula and passes a
-    large budget is refused by :func:`read_w_columns_collective`.
-    Reconciling the two is a code change and is on the follow-up list.
+    BOTH CLAMPS ARE IN THE FORMULA ABOVE, and both bite in practice.  The
+    LOWER one — a budget of zero columns is not a budget, it is a refusal
+    to make progress, and the honest failure for a grid so long that one
+    column busts a tile is to hand back 1 and let the caller see the cost
+    in :func:`describe_column_cost`.  The UPPER one bites whenever
+    ``tile_bytes`` is generous: measured 2026-08-15,
+    ``choose_column_budget(480, 16)`` is 30 as the worked example says,
+    but ``choose_column_budget(480, 16, 100*2**20)`` returns **480** — the
+    whole row extent — where the unclamped ratio would give 853.  There
+    are only ``n_mu`` columns to read.  The clamp used to be absent from
+    the published form, so a caller that sized an ``n_cols_buffer`` off it
+    and passed a large budget was refused by
+    :func:`read_w_columns_collective` (audit §E.3 item 5).
 
     Parameters
     ----------
@@ -1605,30 +1607,34 @@ def describe_column_cost(n_mu, n_omega, n_cols, tile_bytes=None,
     driver that is deciding rather than failing — a message a caller can
     only see by triggering an exception is a message that gets read once.
 
-    KNOWN DEFECT, measured 2026-08-15, prose cannot fix it: when
-    ``tile_bytes`` is passed the sentence prints ``n_mu*n_mu*itemsize B =
-    <tile_bytes>``, an equation that is false for any budget that is not
-    one tile, and it ends with a ``choose_column_budget(n_mu, n_omega)``
-    call that omits the very arguments the number was computed with — so a
-    reader who types the printed call gets a different answer.  Trust the
-    numbers, not the arithmetic, until the follow-up lands.
+    THE ARITHMETIC IS THE ONE THAT RAN.  The budget half prints the tile
+    product only when the budget IS one tile; a caller-supplied
+    ``tile_bytes`` prints as the number it is, because
+    ``n_mu*n_mu*itemsize = <a different number>`` is a false equation and
+    a false equation in a refusal costs more than the refusal saves.  The
+    ``choose_column_budget(...)`` call it ends with is ECHOED IN FULL, so
+    a reader who types it gets the number that was just printed rather
+    than the default-budget one (audit §E.3 item 4).
     """
     n_mu = int(n_mu)
     n_omega = int(n_omega)
     n_cols = int(n_cols)
+    itemsize = int(itemsize)
     budget = one_tile_bytes(n_mu, itemsize) if tile_bytes is None \
         else int(tile_bytes)
-    cost = n_omega * n_mu * n_cols * int(itemsize)
+    cost = n_omega * n_mu * n_cols * itemsize
     allowed = choose_column_budget(n_mu, n_omega, tile_bytes, itemsize)
+    budget_terms = (f"one (N_mu, N_mu) tile, {n_mu}*{n_mu}*{itemsize} B = "
+                    if tile_bytes is None else "")
     return (
         f"{n_cols} columns at n_omega={n_omega}, N_mu={n_mu} costs "
-        f"{n_omega}*{n_mu}*{n_cols}*{int(itemsize)} B = {cost} B "
+        f"{n_omega}*{n_mu}*{n_cols}*{itemsize} B = {cost} B "
         f"({cost / 2 ** 20:.2f} MiB) against a budget of "
-        f"{'one (N_mu, N_mu) tile, ' if tile_bytes is None else ''}"
-        f"{n_mu}*{n_mu}*{int(itemsize)} B = {budget} B "
+        f"{budget_terms}{budget} B "
         f"({budget / 2 ** 20:.2f} MiB) — a ratio of "
         f"{cost / budget:.3f}x.  choose_column_budget({n_mu}, "
-        f"{n_omega}) allows {allowed}.")
+        f"{n_omega}, tile_bytes={budget}, itemsize={itemsize}) allows "
+        f"{allowed}.")
 
 
 def normalise_columns(mu_cols, n_mu):
@@ -1651,9 +1657,13 @@ def normalise_columns(mu_cols, n_mu):
             f"mpa_store: mu_cols must be 1-D; got shape {cols.shape}")
     if cols.size == 0:
         raise ValueError("mpa_store: mu_cols is empty")
-    uniq = np.unique(cols)
+    uniq, counts = np.unique(cols, return_counts=True)
     if uniq.size != cols.size:
-        dup = sorted(set(cols.tolist()))
+        # The REPEATED ones, not the first four distinct ones: the label
+        # says "repeats a column", so the numbers beside it have to be the
+        # columns that repeat or the message sends the reader to innocent
+        # indices (audit §E.3 item 11).
+        dup = uniq[counts > 1].tolist()
         raise ValueError(
             f"mpa_store: mu_cols repeats a column "
             f"({cols.size} given, {uniq.size} distinct, e.g. "
@@ -2478,9 +2488,11 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
     if not all(np.all(np.isfinite(x)) for x in (z, wc, poles, residues)):
         raise ValueError("collective scalar-head payload is not finite")
     if to_unit is not None:
-        if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
-            raise ValueError("scalar-head unit conversion is unsupported")
-        scale = FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+        # THE SHARED HELPER, not a second copy of the same policy: it
+        # refuses an undeclared unit by NAME and prints both spellings,
+        # where the inline version said only that the conversion was
+        # "unsupported" (audit §E.3 item 12).
+        scale = _unit_scale(source_unit, to_unit, "read_head_fit_collective")
         z, poles, residues = z * scale, poles * scale, residues * scale
         source_unit = str(to_unit)
     return {
