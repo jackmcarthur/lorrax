@@ -129,6 +129,7 @@ def write_sigma_omega(
     omega_reference_ev,
     omega_reference_provenance,
     sym=None,
+    band_extrapolation=None,
     print_fn=None,
 ) -> str:
     """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz.
@@ -139,6 +140,11 @@ def write_sigma_omega(
     relative to produces the unstamped file audit A2 is about.  Both come
     straight from :func:`eval_sigma_c_at_dft_energies`, which owns the
     choice.
+    ``band_extrapolation`` is the optional
+    ``{"arrays": {...}, "attrs": {...}}`` the Σ_c band-convergence fit
+    produces (``gw.band_extrapolation.extrapolation_h5_payload``).  None —
+    the default and every non-extrapolating run — writes exactly the file
+    that was written before the feature existed.
     """
     from file_io import write_sigma_omega_h5
 
@@ -173,6 +179,7 @@ def write_sigma_omega(
             mesh=mesh_xy, star=star,
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
+            band_extrapolation=band_extrapolation,
             print_fn=print_fn,
         )
         return out_path
@@ -185,6 +192,7 @@ def write_sigma_omega(
         mesh=mesh_xy, star=star,
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,
+        band_extrapolation=band_extrapolation,
         print_fn=print_fn,
     )
     return out_path

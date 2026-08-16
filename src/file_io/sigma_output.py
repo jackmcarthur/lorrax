@@ -42,6 +42,15 @@ SIGMA_K_AXIS = {
 	"qp_diag_self_consistent_ev": 0,
 	"qp_omega0_ev": 0,
 	"qp_static_cohsex_ev": 0,
+	# The Σ_c band-convergence fit, band-DIAGONAL (nk, nb), so k is axis 0.
+	# Registered here and not only written, because that is what puts them
+	# through the same star extraction and the same star-spread instrument
+	# as the cubes: the invariant that matters for S_inf is exact star
+	# covariance, and it is only checkable on a persisted, stamped array.
+	"sigma_c_extrap_inf_kn_ev": 0,
+	"sigma_c_extrap_last_kn_ev": 0,
+	"sigma_c_extrap_ampl_kn_ev": 0,
+	"sigma_c_extrap_sigma_kn_ev": 0,
 }
 
 #: The ω axis, and the two attrs on it that say what it is measured FROM.
@@ -974,6 +983,7 @@ def write_sigma_omega_h5(
 	star=None,
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
+	band_extrapolation=None,
 	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
@@ -984,6 +994,21 @@ def write_sigma_omega_h5(
 	  - sigma_c_kij_ev  (optional): (n_omega, nk, nb, nb)
 	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
 	  - hartree_kij_ev  (optional): (nk, nb, nb)
+	  - sigma_c_extrap_*_kn_ev (optional): (nk, nb) — the Σ_c
+	    band-convergence fit, present only when the run extrapolated
+
+	``band_extrapolation``
+	    ``{"arrays": {name: (nk, nb)}, "attrs": {...}}`` from
+	    ``gw.band_extrapolation.extrapolation_h5_payload``.  Until
+	    2026-08-15 the fitted ``S_inf`` reached NO artifact: a run with the
+	    feature on and one with it off were identical to 8e-15 in every
+	    dataset here while the log reported an 848 meV correction, so the
+	    feature could not be gated, diffed or consumed, and a star-spread
+	    test on this file passed vacuously by measuring the
+	    un-extrapolated cube.  The arrays ride the SAME extraction and
+	    stamp as the cubes rather than being appended raw, so ``S_inf``
+	    and ``sigma_c_kij_ev`` cannot disagree about which k the file
+	    holds.  ``None`` writes exactly the pre-feature file.
 
 	All large writes go through :mod:`file_io.slab_io`, which has one
 	transport (per-rank collective MPI-IO) and no selector.
@@ -1052,6 +1077,11 @@ def write_sigma_omega_h5(
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
 	}
+	extrap_arrays = dict((band_extrapolation or {}).get("arrays", {}))
+	extrap_attrs = dict((band_extrapolation or {}).get("attrs", {}))
+	# Into the SAME payload, so the extraction, the stamp and the spread
+	# measurement are one code path for the cubes and the fit alike.
+	payload.update(extrap_arrays)
 
 	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
 	# QSGW appender rather than spelled twice.
@@ -1110,6 +1140,22 @@ def write_sigma_omega_h5(
 				dtype=np.complex128, chunks=kij_chunks,
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		for name in extrap_arrays:
+			arr = payload[name]
+			if arr is None:
+				continue
+			arr = np.asarray(arr)
+			# The run-level facts (band counts, fractions, verdict, any
+			# planner fallback) ride on EVERY one of these datasets, so a
+			# reader that opens one of them alone still learns whether the
+			# number it is holding was trusted.
+			at = dict(_attrs(name) or {})
+			at.update(extrap_attrs)
+			io.create_dataset(name, shape=tuple(arr.shape),
+				dtype=np.complex128,
+				chunks=(min(k_chunk, arr.shape[0]),) + tuple(arr.shape[1:]),
+				attrs=at)
+			io.write_slab(name, arr)
 	return abs_path
 
 
