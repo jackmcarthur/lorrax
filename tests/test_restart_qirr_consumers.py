@@ -394,17 +394,43 @@ def test_the_tile_shim_still_reads_a_legacy_file_from_disk_lazily(
 
 
 # ---------------------------------------------------------------------------
-# 3. The sharded transport refuses, and says why
+# 3. The sharded transport READS a wedge (since 2026-08-15), and still
+#    refuses a file it genuinely cannot reconstruct
 # ---------------------------------------------------------------------------
 
-def test_the_slabio_plan_refuses_a_wedge_and_names_it(trs_arm, tmp_path):
-    """The refusal an operator has to be able to act on.
+def test_the_slabio_plan_READS_a_wedge_when_the_file_carries_its_tables(
+        trs_arm):
+    """MIGRATED.  This cell used to assert the opposite.
 
-    ``_MunuSlabPlan`` describes a per-rank (μ, ν) hyperslab; the unfold
-    gathers ACROSS μ and ν, so there is no offset it could ask for that
-    would reconstruct a full-BZ q.  It refuses — and the message must name
-    the q wedge and the deck key that avoids it, because the bare extent
-    disagreement reads as a truncated file.
+    It pinned a refusal whose stated reason was COST — "the price of an
+    all_to_all of an N_mu²-class object … has never been measured on a real
+    interconnect" — and whose message claimed the transport *cannot* unfold,
+    which ``file_io.tagged_arrays._unfold_wedge`` had already recorded as
+    false.  MEASURED 2026-08-15 on 4×A100 NVLink at complex128: the unfold
+    runs at 57.4 GiB/s against a 2.919 GiB/s disk path, and μ² cancels
+    between the two sides, so the wedge wins by 6–17× at every size.  The
+    refusal is lifted; the plan now takes the file's own tables and reads it.
+    """
+    from bse.bse_io import _MunuSlabPlan
+
+    plan = _MunuSlabPlan((trs_arm.tables.n_q_ibz, trs_arm.n_mu, trs_arm.n_mu),
+                         (trs_arm.n_q_full, 1, 1),
+                         wedge_tables=trs_arm.tables)
+    assert plan.is_wedge is True
+    assert plan.n_rmu == trs_arm.n_mu and plan.nq == trs_arm.n_q_full
+    # The read is sized to the WEDGE; the unfold to the full BZ happens after
+    # it, in jax, which is the whole design.
+    _off, shape, _spec = plan.request(trs_arm.n_mu)
+    assert shape[0] == trs_arm.tables.n_q_ibz
+
+
+def test_a_wedge_with_NO_tables_is_still_refused_and_named(trs_arm):
+    """The refusal that survives, and it is now about reconstructibility.
+
+    A q extent below the k-grid with no unfold tables is not a wedge this
+    reader can take — it is a truncated or mis-stamped file, and re-deriving
+    the tables from this run's ``sym`` is not offered, because a table that
+    reconstructs the tensor must be the table that deconstructed it.
     """
     from bse.bse_io import _MunuSlabPlan
 
@@ -412,8 +438,36 @@ def test_the_slabio_plan_refuses_a_wedge_and_names_it(trs_arm, tmp_path):
         _MunuSlabPlan((5, trs_arm.n_mu, trs_arm.n_mu),
                       (trs_arm.n_q_full, 1, 1))
     msg = str(exc.value)
-    assert "wedge" in msg.lower()
-    assert "restart_q_storage=full" in msg
+    assert "no q_irr unfold tables" in msg
+    assert "truncated or mis-stamped" in msg
+    # ...and this arm DOES name the key, because here it applies.
+    assert "restart_q_storage=auto|ibz" in msg
+
+
+def test_gamma_is_one_hyperslab_on_a_wedge_not_an_unfold(trs_arm):
+    """The single-q ``V_q0`` route, which needs no collective at all.
+
+    Γ is its own orbit parent under every point group, so on a wedge the
+    single-q read is still ONE hyperslab — the same bytes at a different
+    row.  That is asserted against the FILE'S OWN tables (identity
+    permutation, zero wrap, not time-reversed), never assumed, so a wedge
+    that reached Γ by a rotation would refuse rather than hand back a
+    rotated block labelled q=0.
+    """
+    from bse.bse_io import _MunuSlabPlan
+
+    plan = _MunuSlabPlan((trs_arm.tables.n_q_ibz, trs_arm.n_mu, trs_arm.n_mu),
+                         (trs_arm.n_q_full, 1, 1),
+                         wedge_tables=trs_arm.tables)
+    row = plan.gamma_wedge_row()
+    assert row is not None, (
+        "Γ should be reachable by the identity on any orbit decomposition")
+    off, shape, _spec = plan.request(trs_arm.n_mu, q_index=0)
+    assert shape[0] == 1 and off[0] == row
+
+    # Any OTHER single q on a wedge is a rotated image and must refuse.
+    with pytest.raises(ValueError, match="only q=0|Only q=0"):
+        plan.request(trs_arm.n_mu, q_index=1)
 
 
 def test_the_slabio_plan_accepts_a_full_bz_dataset(trs_arm):

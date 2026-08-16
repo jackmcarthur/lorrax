@@ -501,8 +501,9 @@ class _MunuSlabPlan:
     * 3-D flat-q ``(nq, μ, ν)``
     """
 
-    def __init__(self, ds_shape, kgrid):
+    def __init__(self, ds_shape, kgrid, *, wedge_tables=None):
         self.ds_shape = tuple(int(s) for s in ds_shape)
+        self.tables = wedge_tables
         self.ndim = len(self.ds_shape)
         nkx, nky, nkz = (int(v) for v in kgrid)
         self.kgrid = (nkx, nky, nkz)
@@ -527,35 +528,103 @@ class _MunuSlabPlan:
             raise ValueError(
                 f"_MunuSlabPlan: unsupported V/W dataset rank {self.ndim} "
                 f"(shape {self.ds_shape}); expected 8-D, 6-D or 3-D flat-q.")
+        # THE q_irr WEDGE IS READ, NOT REFUSED, since 2026-08-15.
+        #
+        # This used to raise on any q extent != nq, saying the SlabIO
+        # transport "cannot unfold" a wedge.  THE STATED REASON WAS COST AND
+        # THE COST WAS NEVER MEASURED; the inability claim was wrong in the
+        # first place, and ``file_io.tagged_arrays._unfold_wedge`` says so at
+        # length: the unfold is a ``shard_map`` over four ``lax.all_to_all``
+        # collectives that take and return exactly the ``P(None,'x','y')``
+        # this plan already produces, the collective happens AFTER the read
+        # in jax, and nothing asks SlabIO to unfold as a hyperslab offset.
+        # The GW leg has read wedges this way in production since 536cbac9.
+        #
+        # MEASURED 2026-08-15, 4xA100 NVLink, complex128 (JAX_ENABLE_X64=1 --
+        # without it JAX silently truncates to complex64 and halves the bytes,
+        # which would make the wedge look 2x better than it is):
+        #
+        #     mu     full-BZ tensor   unfold     B_net        vs 2.919 GiB/s disk
+        #     2048   9.000 GiB        0.157 s    57.4 GiB/s   19.7x
+        #     1024   2.250 GiB        0.041 s    54.3 GiB/s   18.6x
+        #      512   0.562 GiB        0.015 s    38.5 GiB/s   13.2x
+        #      256   0.141 GiB        0.007 s    20.7 GiB/s    7.1x
+        #
+        # The unfold moves C.nq_full.mu^2.16 bytes and the wedge saves reading
+        # (nq_full - nq_ibz).mu^2.16, so MU-SQUARED CANCELS and the verdict is
+        # a bandwidth ratio: the wedge wins iff B_net > [nq_full /
+        # (nq_full - nq_ibz)] . B_disk, a bracket of 1.152 at the 7.6x
+        # reduction of the mu=2406 anchor.  It wins by 6-17x at every size.
+        # Worth ~23 GB at that anchor (26.7 GB -> ~3.5 GB).
+        #
+        # SCOPE: single node, NVLink -- which IS this transport's P=4 geometry,
+        # but a multi-node BSE crosses Slingshot and was not measured.
+        self.is_wedge = False
         if self.q_axes == 1 and int(self.q_extent[0]) != self.nq:
-            # THE q_irr WEDGE ARRIVES HERE AND IS REFUSED, deliberately, and
-            # the message says so rather than leaving an operator to read
-            # "the q extent is wrong" and go looking for a truncated file.
-            # THE REASON IS COST, NOT CORRECTNESS: a wedge needs the read
-            # first and ``unfold_isdf_operator``'s all_to_all after, in jax,
-            # BEFORE ``_slabio_read_munu``'s μ-major transpose (the unfold
-            # works q-major) — and the price of an all_to_all of an
-            # N_mu²-class object against the bytes the wedge saves has never
-            # been measured on a real interconnect.  Design incl. the
-            # single-q ``V_q0`` route: DESIGN_restart_consolidation.md §4;
-            # it lands after one Perlmutter timing leg.  Until then a wedge
-            # file reads through the serial h5py readers or the GW leg, and
-            # ``restart_q_storage = full`` writes a file this transport takes.
-            _extra = ""
-            if int(self.q_extent[0]) < self.nq:
-                _extra = (
-                    "  If this file was written with restart_q_storage=auto "
-                    "or =ibz it is stored on the IBZ q WEDGE, and the SlabIO "
-                    "hyperslab transport cannot unfold it (the unfold gathers "
-                    "across the μ/ν axes this plan shards on).  Re-run the GW "
-                    "leg with restart_q_storage=full, or read through the "
-                    "serial h5py path.")
-            raise ValueError(
-                f"_MunuSlabPlan: kgrid {self.kgrid} (nq={self.nq}) "
-                f"disagrees with the dataset q extent "
-                f"{self.q_extent[0]}.{_extra}")
+            t = self.tables
+            n_ibz = int(self.q_extent[0])
+            if (t is not None and int(t.n_q_ibz) == n_ibz
+                    and int(t.n_q_full) == self.nq):
+                self.is_wedge = True
+            else:
+                # Still a refusal, but now only for a file that genuinely
+                # cannot be reconstructed: a truncated dataset, or a wedge
+                # whose own unfold tables are missing or disagree.  A table
+                # that reconstructs the tensor must be the table that
+                # deconstructed it, so re-deriving it from this run's ``sym``
+                # is not offered.
+                _why = ("carries no q_irr unfold tables"
+                        if t is None else
+                        f"carries tables for {int(t.n_q_ibz)} -> "
+                        f"{int(t.n_q_full)} q, which do not match")
+                # THE ADVICE STAYS ATTACHED TO THE ARM IT APPLIES TO.  A
+                # dataset with MORE q rows than the k-grid is not a wedge and
+                # no restart_q_storage setting produces or fixes it; naming
+                # the key there sends an operator to re-run a GW leg that was
+                # never the problem.  Pinned by
+                # test_an_oversized_q_extent_does_not_claim_to_be_a_wedge.
+                _fix = ""
+                if n_ibz < self.nq:
+                    _fix = (
+                        "  A q-WEDGE file IS readable here when its unfold "
+                        "tables are present (restart_q_storage=auto|ibz "
+                        "writes them); this one is not reconstructible, so it "
+                        "is a truncated or mis-stamped file rather than a "
+                        "wedge.")
+                raise ValueError(
+                    f"_MunuSlabPlan: kgrid {self.kgrid} (nq={self.nq}) "
+                    f"disagrees with the dataset q extent {n_ibz}, and the "
+                    f"file {_why}.{_fix}")
         self.n_rmu = int(self.ds_shape[-2])
         self.n_rnu = int(self.ds_shape[-1])
+
+    def gamma_wedge_row(self):
+        """The wedge row holding flat q=0, or ``None`` if it needs an unfold.
+
+        Γ is its own orbit parent under every point group, so on a wedge the
+        single-q ``V_q0`` read is still ONE hyperslab — the same bytes, at a
+        different row — and needs no collective at all.  That is asserted
+        against the file's OWN tables rather than assumed: the operation
+        taking the wedge row to flat q=0 must be a spatial op (not TRS) whose
+        centroid permutation is the identity and whose lattice wrap is zero.
+        Anything else would need the real unfold, and this returns ``None`` so
+        the caller refuses by name instead of reading a rotated block as if it
+        were Γ.
+        """
+        t = self.tables
+        if t is None or not self.is_wedge:
+            return None
+        s_idx = int(np.asarray(t.sym_idx_q)[0])
+        row = int(np.asarray(t.irr_idx_q)[0])
+        if s_idx >= int(t.n_sym_spatial):
+            return None                              # time-reversed: conj
+        perm = np.asarray(t.sym_perm)[s_idx]
+        wrap = np.asarray(t.L_table)[s_idx]
+        if not np.array_equal(perm, np.arange(perm.shape[0])):
+            return None
+        if np.any(wrap != 0):
+            return None
+        return row
 
     def request(self, n_rmu_pad, q_index=None):
         """``(offset, shape, partition_spec)`` for one read_slab call.
@@ -564,6 +633,10 @@ class _MunuSlabPlan:
         ``None`` asks for every q, which is what the ``W_q`` consumer
         needs.  Leading layout axes are always taken at index 0 with
         extent 1 — the serial readers' ``[0, 0, 0]``.
+
+        ON A WEDGE the full-q request reads ``n_q_ibz`` rows and
+        :func:`_slabio_read_munu` unfolds them; the single-q request is
+        remapped to Γ's wedge row by :meth:`gamma_wedge_row`.
         """
         offset = [0] * self.ndim
         shape = [1] * self.lead
@@ -575,7 +648,25 @@ class _MunuSlabPlan:
             offset[3], offset[4], offset[5] = qx, qy, qz
             shape.extend((1, 1, 1))
         else:
-            offset[self.lead] = int(q_index)
+            row = int(q_index)
+            if self.is_wedge:
+                if int(q_index) != 0:
+                    raise ValueError(
+                        f"_MunuSlabPlan: single-q read of flat q={q_index} on "
+                        f"a q-WEDGE dataset.  Only q=0 (Γ) is a hyperslab on "
+                        f"a wedge, because Γ is its own orbit parent; any "
+                        f"other q is a rotated image and must come from the "
+                        f"full-q read, which unfolds.")
+                g = self.gamma_wedge_row()
+                if g is None:
+                    raise ValueError(
+                        "_MunuSlabPlan: this wedge reaches flat q=0 by a "
+                        "non-identity operation (a rotation, a non-zero "
+                        "lattice wrap, or time reversal), so V_q0 is not one "
+                        "hyperslab here.  Read the full q axis, which "
+                        "unfolds, or re-run with restart_q_storage=full.")
+                row = g
+            offset[self.lead] = row
             shape.append(1)
         shape.extend((int(n_rmu_pad), int(n_rmu_pad)))
         spec = P(*([None] * (len(shape) - 2) + ["x", "y"]))
@@ -601,12 +692,31 @@ def _slabio_read_munu(io, name, plan, mesh_xy, n_rmu_pad, *,
     offset, shape, spec = plan.request(n_rmu_pad, q_index=q_index)
     arr = io.read_slab(name, shape=shape, dtype=dtype, offset=offset,
                        mesh=mesh_xy, partition_spec=spec)
+    # THE WEDGE UNFOLD, HERE AND NOWHERE ELSE: after the read, before the
+    # μ-major transpose, because ``unfold_isdf_operator`` works q-major and
+    # takes/returns the P(None,'x','y') spec the read already produced.  It
+    # is the SAME helper the GW leg uses (file_io.tagged_arrays._unfold_wedge)
+    # on the SAME tables the file carries, so producer and consumer evaluate
+    # one function on one set of inputs rather than agreeing by a property.
+    # A full-BZ file has ``plan.tables is None`` and this is a no-op.
+    #
+    # The single-q route never reaches this: on a wedge it is remapped to Γ's
+    # own wedge row by ``plan.request``, which is one hyperslab and no
+    # collective.  Applying an unfold to a single-q slab would be wrong —
+    # ``unfold_isdf_operator`` wants the whole IBZ axis.
+    if q_index is None and getattr(plan, "is_wedge", False):
+        from file_io.tagged_arrays import _unfold_wedge
+        arr = _unfold_wedge(jnp.reshape(arr, (int(plan.tables.n_q_ibz),
+                                              int(n_rmu_pad), int(n_rmu_pad))),
+                            plan.tables, n_rmu_pad, mesh_xy)
     nkx, nky, nkz = plan.kgrid
     if q_index is not None:
         out_spec = P("x", "y")
         target = (int(n_rmu_pad), int(n_rmu_pad))
         fn = lambda a: jnp.reshape(a, target)
     else:
+        # (nkx, nky, nkz) is the FULL BZ either way: a full-BZ file read it
+        # directly, a wedge file was just unfolded to it above.
         out_spec = P("x", "y", None, None, None)
         mid = (nkx, nky, nkz, int(n_rmu_pad), int(n_rmu_pad))
         fn = lambda a: jnp.transpose(jnp.reshape(a, mid), (3, 4, 0, 1, 2))
@@ -700,8 +810,20 @@ def _read_bse_tensors(
         return psi_v_X, psi_c_X, V_q0, W_q, V_q_full
 
     from file_io.slab_io import SlabIO
-    vq_plan = _MunuSlabPlan(vq_shape, kgrid)
-    wq_plan = _MunuSlabPlan(wq_shape, kgrid)
+    from file_io.tagged_arrays import _qirr_wedge_tables
+    # Kilobytes, read on the serial handle BEFORE the collective SlabIO open,
+    # which is the same ordering rule tagged_arrays follows: the two handles
+    # must not overlap.  Empty for every full-BZ file, so those files take the
+    # byte path they always had.
+    with h5py.File(restart_file, "r") as _f:
+        _wedge = _qirr_wedge_tables(_f)
+    vq_plan = _MunuSlabPlan(vq_shape, kgrid, wedge_tables=_wedge.get(vq_key))
+    wq_plan = _MunuSlabPlan(wq_shape, kgrid, wedge_tables=_wedge.get(wq_key))
+    if vq_plan.is_wedge or wq_plan.is_wedge:
+        log_fn(f"BSE-sharded: q-WEDGE restart, unfolding "
+               f"{int((vq_plan.tables or wq_plan.tables).n_q_ibz)} -> "
+               f"{int((vq_plan.tables or wq_plan.tables).n_q_full)} q "
+               f"through the symmetry service")
     log_fn(f"BSE-sharded: restart tensors via SlabIO "
            f"({os.path.basename(restart_file)})")
     with SlabIO(restart_file, mode="r", mesh=mesh_xy) as io:
