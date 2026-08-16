@@ -14,9 +14,10 @@ and `use_ffi_io`, so today it refuses before writing — which is the only reaso
 this page survived. Use it as a **drift checker** (it prints exactly which keys
 have appeared in or vanished from `_DEFAULTS`) and edit this page by hand.
 `gw_config._DEFAULTS` remains the single source of truth for deck keys.
-Unknown keys warn: a key not in `_DEFAULTS` and not covered by a legacy branch
-is reported in one aggregated rank-0 warning and ignored; `strict_keys = true`
-upgrades this to a refusal naming every unknown key.
+Unknown keys refuse: a key not in `_DEFAULTS`, not covered by a legacy branch
+and not an `_ALIASES` row raises a `ValueError` naming every unknown key with
+its line number. `strict_keys = false` downgrades that to one aggregated rank-0
+warning — for archived decks read for their history rather than run.
 Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 
 The last section of this page is a **different input file**. The downfold
@@ -142,7 +143,7 @@ page has to read it from.
 | `gspace_mode` | `"host_cache"` | psi(G) host lifecycle: host_cache (resident, default) | file_reread (rebuild per r-chunk; zero persistent residency). |
 | `write_wfn_h5` | true | End-of-run WFN_qp.h5 write (BGW format, psi rotated by the final U, E_QP energies). |
 | `write_qsgw_datasets` | false | Add the QSGW plotting appendix to sigma_mnk.h5: `sigma_xc_qsgw_kij_ev` (the static Hermitian Sigma_xc the QSGW ansatz builds) plus the QP energy ladders `qp_omega0_ev` (H0 + Sigma_x + Sigma_c(omega=0)), `qp_diag_self_consistent_ev` (the diagonal on-shell fixed point E = h0 + ReSigma(E)) and `qp_static_cohsex_ev` (H0 + Sigma_SX + Sigma_COH, written only by a run that BUILT those two channels, i.e. `compute_mode = cohsex`; a PPM run says so in one rank-0 line rather than putting a different operator under that name). Default false is byte-for-byte today's file: these four datasets had no producer between 2026-04-11, when the QP/output rewrite deleted the block that wrote them, and 2026-08-08, and survived only in the committed `cohsex_debug` fixture. They are written on the file's OWN k-set, carrying the same `k_storage` stamp and the same four star-spread numbers as every other cube in it, so a plotting script reads them through the reader path it already uses for Sigma_c. The cost is a write plus one (nk, nb, nb) eigh and one host-side (nk, nb) fixed point — never a Sigma or screening kernel. A quantity the run's compute mode did not build is omitted and named, not manufactured. |
-| `strict_keys` | false | Unknown deck keys refuse (ValueError naming every one) instead of the default aggregated warning. |
+| `strict_keys` | true | Unknown deck keys refuse (ValueError naming every one, with line numbers). `false` downgrades to one aggregated rank-0 warning. |
 
 ## Solver
 

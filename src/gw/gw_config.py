@@ -1423,12 +1423,21 @@ _DEFAULTS = {
     # construction.  See bandstructure.bse_setup.compute_wfns_fi.
     "wfn_fi_q_chunk": 0,
 
-    # Deck hygiene.  False (DEFAULT): a key that is not in _DEFAULTS and
-    # not covered by a legacy/deprecation branch is reported in one
-    # aggregated rank-0 warning and ignored.  True: the same condition
-    # raises ValueError naming every unknown key — for CI decks and fresh
-    # runs where a typo must not silently drop a knob.
-    "strict_keys": False,
+    # Deck hygiene.  True (DEFAULT since 0.1.0): a key that is not in
+    # _DEFAULTS, not covered by a legacy/deprecation branch and not an
+    # _ALIASES row raises ValueError naming every unknown key at once,
+    # with line numbers.  False downgrades that to one aggregated rank-0
+    # warning and ignores the keys — for archived decks that carry dead
+    # keys and are being read for their history, not run.
+    #
+    # WHY THE DEFAULT FLIPPED.  An unrecognized deck key already produced
+    # a wrong-physics-arm-rc=0 incident: the first flipped-arm dipole.h5
+    # came back stamped with the SHIPPED sign and "1 unrecognized deck
+    # key(s)" in a log nobody read (see ``vnl_velocity_sign`` above).  A
+    # typo that silently drops a knob is indistinguishable from the knob
+    # working, and the retired/renamed branches above exist precisely so
+    # that old decks do not need the lenient default to keep running.
+    "strict_keys": True,
 }
 
 # Deck keys REMOVED from _DEFAULTS but still handled by an explicit

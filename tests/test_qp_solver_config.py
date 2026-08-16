@@ -199,8 +199,12 @@ def test_removed_legacy_aliases_are_inert(tmp_path, monkeypatch):
     # the portable keys (the pre-removal alias honored 'on' → cusolvermp
     # here).  They DO appear in the aggregated unknown-key stdout report
     # like any other unknown key — that is the point of the removal.
+    # ``strict_keys = false`` because the default flipped to true for
+    # 0.1.0: what is under test here is that the removed aliases do not
+    # STEER, which needs the deck to parse at all.
     _pin_backend(monkeypatch, "gpu")
-    cfg = _config(tmp_path, "cusolvermp_charge = on\ncusolvermp_lu = off\n")
+    cfg = _config(tmp_path, "strict_keys = false\n"
+                  "cusolvermp_charge = on\ncusolvermp_lu = off\n")
     assert cfg.backend.distributed_cholesky == "auto"
     assert cfg.backend.distributed_lu == "auto"
 
@@ -230,15 +234,18 @@ def test_explicit_cusolvermp_on_cpu_refuses(tmp_path, monkeypatch, key):
 # ---------------------------------------------------------------------------
 
 def test_unknown_key_warns_on_stdout_and_still_parses(tmp_path, capsys):
+    # ``strict_keys = false`` is now the OPT-IN (the default flipped to
+    # true for 0.1.0), so the lenient arm has to ask for itself.
     from gw.gw_config import read_lorrax_input
     p = tmp_path / "deck_unknown.in"
-    p.write_text(BASE_INPUT + "x_only = true\nuse_chunked_isdf = false\n")
+    p.write_text(BASE_INPUT + "strict_keys = false\n"
+                 "x_only = true\nuse_chunked_isdf = false\n")
     params = read_lorrax_input(str(p))
     out = capsys.readouterr().out
     # One aggregated report naming each key with its line number.
     assert "unrecognized deck key" in out
-    assert "x_only (line 6)" in out
-    assert "use_chunked_isdf (line 7)" in out
+    assert "x_only (line 7)" in out
+    assert "use_chunked_isdf (line 8)" in out
     assert "ignored" in out
     # ...and the deck still parses: known keys land, unknown ones don't.
     assert params["nval"] == 2
