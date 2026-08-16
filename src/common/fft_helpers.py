@@ -388,6 +388,31 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 )
 
 
+# ============================================================================
+# THE FUSED-CONV FAMILY at the factory seam
+# ============================================================================
+# Two entries, ONE contract:
+#
+#     U = scale · FFT_k( IFFT_k(X) · K )
+#
+# — both transforms, the broadcast multiply against a STORED kernel, and every
+# norm factor as a single constant, in ONE FFI call per rank, so the R-space
+# intermediate never materialises.  The members differ ONLY in where the
+# caller's tile already keeps its k axis, because that is what decides which
+# memory layout the one kernel has to read:
+#
+#     make_flat_k_gw_conv     k LEADING     lorrax_mklfft_gw_conv     cpu+CUDA
+#     make_fused_conv_kminor  k MINOR-most  lorrax_cufft_conv_kminor  CUDA
+#
+# Pick by your resident layout, and do NOT transpose to reach the other one:
+# transposing to reach a fused kernel spends exactly what the fusion saves.
+# The family contract, the measurement behind the split, and the reason the
+# k-minor member takes its kernel already in R space all live in ONE place —
+# ``ffi/fft.py``'s module docstring.  This block is the seam, not a second
+# copy of it.
+# ============================================================================
+
+
 def make_flat_k_gw_conv(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
@@ -397,17 +422,51 @@ def make_flat_k_gw_conv(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution ``fn(G_flat, W_flat) -> sigma_flat``:
+    """Fused conv, **k-LEADING** ``fn(G_flat, W_flat) -> sigma_flat``:
 
         sigma = fftn( ifftn(G) * ifftn(W)[:, None, :, None, :] * mult )
 
     with all three transforms + the broadcast multiply in ONE FFI call per
     rank, so the R-space G tile never materializes.  Sigma-family layout
     contract only; the plain helpers remain the entry point for everything
-    else.  Implementation: :func:`ffi.mklfft.make_gw_conv_ffi`.
+    else.  Sibling: :func:`make_fused_conv_kminor`, same expression for a
+    caller whose k axis is already minor-most.  Implementation:
+    :func:`ffi.fft.make_gw_conv_ffi`.
     """
     return _make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec,
                              norm=norm, mult=mult)
+
+
+def make_fused_conv_kminor(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    x_spec: P,
+    k_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+    out_layout: int = 0,
+) -> Callable:
+    """Fused conv, **k-MINOR** ``fn(X, K) -> U``:
+
+        U = scale · fftn_k( ifftn_k(X) · K[None, :, :, None, None, :] )
+
+    ``X`` ``(d0,d1,d2,d3,d4,nk)``, ``K`` ``(d1,d2,nk)`` ALREADY in R space
+    (this member multiplies its stored kernel, it does not transform it — the
+    caller builds that once and reuses it; see ``ffi/fft.py``).  ONE FFI call:
+    both transforms, the broadcast multiply, both norm factors as a single
+    constant, and — at ``out_layout=1`` — a consumer's
+    ``(d0,nk,d3,d1,d4,d2)`` permutation emitted from the STORE, so a
+    downstream layout costs nothing extra.
+
+    CUDA only, and **default OFF** (``LORRAX_CONV_KMINOR_FFI``): a new
+    hand-written kernel, exercised at P=1 only.  Sibling:
+    :func:`make_flat_k_gw_conv`.  Implementation:
+    :func:`ffi.fft.make_conv_kminor_ffi`.
+    """
+    from ffi.fft import make_conv_kminor_ffi as _impl
+    return _impl(mesh, kgrid, x_spec, k_spec,
+                 norm=norm, mult=mult, out_layout=out_layout)
 
 
 

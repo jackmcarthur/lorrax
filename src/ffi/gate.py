@@ -120,12 +120,25 @@ __all__ = [
 MODE_SPELLINGS: dict[str, tuple[str, ...]] = {
     "off":  ("0", "off", "false", "no"),
     "on":   ("1", "on", "true", "yes"),
+    # ``auto`` — CAPABILITY DETECTION, and it is back for exactly one shape of
+    # dial.  The 2026-08-01 ruling deleted it because the gates it applied to
+    # were REQUIRED layers whose ``auto`` demoted onto a duplicate compute path
+    # ("a refusal at startup ... not a silent demotion to a slower path").  A
+    # dial whose OFF state is the CERTIFIED production path is the opposite
+    # case: there is no duplicate to demote onto, because the fallthrough IS
+    # the reference implementation, and refusing at startup would make an
+    # OPTIONAL accelerator mandatory.  ``ffi_gate_contract.md`` §3.2 already
+    # states the price of declaring it — "No auto unless you can name the
+    # capability test AND the measured reason" — so a gate that declares this
+    # mode must also fill :attr:`auto_capability`, which is that name.
+    "auto": ("auto",),
 }
 
 #: How each mode is spelled in a grammar-error message.
 MODE_HELP: dict[str, str] = {
     "off":  "0/off/false/no",
     "on":   "1/on/true/yes",
+    "auto": "auto",
 }
 
 #: A grammar error resolves to the gate's DEFAULT (announced).  An
@@ -257,6 +270,14 @@ class Gate:
     off_policy: str = "fallback"
     off_announce_msg: str = ""             #: fallback announce (no fields)
     off_refuse_msg: str = ""               #: refuse prose (no fields)
+    #: REQUIRED of any gate declaring ``auto``: the capability test, named, in
+    #: one clause.  It appears verbatim in the startup line, so a reader can
+    #: see WHAT was detected rather than only which way it went.  A gate that
+    #: declares ``auto`` without it is refused at construction — an
+    #: undocumented auto is the silent demotion the ruling forbade.
+    auto_capability: str = ""
+    auto_on_msg: str = ""                  #: {target} — capability present
+    auto_off_msg: str = ""                 #: {reason} — capability absent
     # -- prose: announce -----------------------------------------------
     resolved_msg: Mapping[str, str] = field(default_factory=dict)  #: {target}
     #: Non-empty ⇒ an out-of-scope platform is skipped SILENTLY by
@@ -295,6 +316,13 @@ class Gate:
             raise ValueError(
                 f"Gate({self.env}): default={self.default!r} is not one of "
                 f"{tuple(MODE_SPELLINGS)}.")
+        if "auto" in self.modes and not self.auto_capability:
+            raise ValueError(
+                f"Gate({self.env}) declares mode 'auto' but names no "
+                f"auto_capability.  ffi_gate_contract.md §3.2: an auto tier "
+                f"must state the capability test it performs, because an "
+                f"auto nobody can read is the silent demotion the 2026-08-01 "
+                f"ruling deleted the old auto tier for.")
 
     # -- tier 0: grammar ------------------------------------------------
 
@@ -316,8 +344,12 @@ class Gate:
             (self.env, "grammar"),
             f"*** {self.env}={v!r} is not a recognized value "
             f"(accepted: {', '.join(MODE_HELP[m] for m in self.modes)}).  "
-            f"Treating as the default ({self.default.upper()} — the FFI "
-            f"layer is required, decisions.md 2026-08-01). ***",
+            f"Treating as the default ({self.default.upper()} — "
+            + ("the capability is detected per mesh, so this cannot break a "
+               "run"
+               if self.default == "auto" else
+               "the FFI layer is required, decisions.md 2026-08-01")
+            + "). ***",
             scope="local")
         return self.default
 
@@ -406,6 +438,18 @@ class Gate:
         """
         if self.mode() == "off":
             return None
+        if self.mode() == "auto":
+            # SILENTLY-CORRECT fallthrough, and the silence is DECLARED: the
+            # caller's own path is the certified reference, so an absent
+            # capability is a routing fact, not a demotion to something worse.
+            # The one line naming which arm is live is enforce()'s, printed
+            # once into the startup report — never per call.
+            if not self.platform_ok(mesh):
+                return None
+            try:
+                return self.require(mesh, target=target)
+            except Exception:                          # noqa: BLE001
+                return None
         if not self.platform_ok(mesh):
             if not self.silent_platform_demote:
                 announce_once(
@@ -452,6 +496,32 @@ class Gate:
                 f"decisions.md 2026-08-01).",
                 scope="local")
             return None
+        if self.mode() == "auto":
+            # ONE line, at startup, saying which arm this run actually took.
+            # It never raises: `auto` promises a working run on any backend.
+            plat = mesh_ffi_platform(mesh)
+            reason = ""
+            got = None
+            if plat not in self.platforms:
+                reason = (f"the backend is {mesh.devices.flat[0].platform!r} "
+                          f"and this dial exists on "
+                          f"{'/'.join(self.platforms)} only")
+            else:
+                from ffi.common import ffi_loader
+                ok, why = ffi_loader.probe_target(self.target, plat)
+                if ok:
+                    got = plat
+                else:
+                    reason = why
+            msg = ((self.auto_on_msg or
+                    f"[{self.env}] auto -> ON ({{target}}).")
+                   .format(target=self.target)
+                   if got else
+                   (self.auto_off_msg or
+                    f"[{self.env}] auto -> OFF ({self.off_label}): {{reason}}")
+                   .format(reason=reason))
+            announce_once((self.env, "auto", str(got)), msg, scope="rank0")
+            return got
         if not self.platform_ok(mesh):
             if not self.silent_platform_demote:
                 announce_once(

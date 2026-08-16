@@ -499,6 +499,12 @@ endif()
 if(LORRAX_CUFFT_ON)
     list(APPEND LORRAX_FFI_SOURCES
         cufft/fft_flat_k_cuda_ffi.cc
+        # k-MINOR fused conv (BSE ladder-W rung, 2026-08-16).  Rides the same
+        # switch because it shares the leg's requirement — NVRTC + the driver
+        # API — but it links NO cuFFT: its transform is a direct per-axis DFT
+        # written in the kernel, sized by the call's attributes.  If the cuFFT
+        # probe is ever split from the nvrtc probe, this file follows nvrtc.
+        cufft/conv_kminor_cuda_ffi.cc
     )
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
