@@ -1200,7 +1200,11 @@ def _star_spread_over_multiplets(sigma_tot_kij_ev, sym, e_dft_ry,
         return None
     # THE SAME boundary rule the band-window safeguards use, so "clean" means
     # one thing in this tree: min over k of the gap across each boundary.
-    gaps = boundary_min_gaps(e)
+    # The sigma WINDOW, not the mean field: the outer entries come back
+    # nan, and the loop below never reads them (it only ever asks about
+    # interior boundaries).  Declaring it honestly is what stops this
+    # grouping from silently certifying the deck's own band edge.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
     bounds, start = [], 0
     nb = diag.shape[1]
     for b in range(1, nb + 1):
