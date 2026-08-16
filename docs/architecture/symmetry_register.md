@@ -436,6 +436,50 @@ Three axes are irreducible and one of them is load-bearing:
    wrap because the Lloyd metric handles periodicity through an explicit
    min-image table, so wrapping there would be **wrong**, not redundant.
 
+### DONE 2026-08-16 — 12 → 5, seven restatements deleted, all bit-identical
+
+The plan below was executed. What shipped, and the two things that changed
+during it:
+
+**The shared kernel is `snap_to_grid_and_split_wrap(images_frac, fft_grid)
+-> (idx, L)`**, and it is what makes this a consolidation rather than a
+tidy-up: the snap-before-floor rule used to be written inside the SOURCE map
+and *not* inside the forward one, so it had to be upgraded twice and only one
+copy ever implemented it. It now exists once and serves **both directions** —
+it takes the images already computed, and the two maps differ in how those
+were built, not in how they must be split. The 14/64 q evidence is written at
+that function, and a test cell replays the exact negative-noise input and
+asserts both that the snap gets it right and that a naive `floor` still gets
+it wrong.
+
+**S2's discards-`L` exemption is in the code**, with an AST test asserting the
+pullback still throws `L` away — a pullback that started consuming it would
+silently inherit S1's correctness requirement. **S1 and S2 are still two
+functions** and a cell asserts that too.
+
+**The seven deletions**, verified bit-identical on three decks
+(si_cohsex_debug 48 ops/24³, gnppm_debug, cohsex_debug):
+`orbit_syms.py:145` + `centroid/charge_density.py:199` → S4;
+`orbit_syms.py:334, :342` → S3 stack form;
+`centroid/kmeans_isdf.py:270, :288, :378, :569` → S3 single-op form.
+
+**A numerical finding that shaped the design**: `einsum` and `@` differ by
+**one ulp** (measured: 2 of 276 entries at 2.220e-16), because BLAS picks a
+different summation order for a three-term dot. So **each call site kept the
+contraction it already had** — the orbit sites were `einsum` and took the
+stack form, the kmeans sites were `@` and took the single-op form. Crossing
+them over would have been a one-ulp change to centroid selection dressed as a
+refactor, and a pivoted-Cholesky pivot order is exactly what one ulp flips.
+
+**`wrap` is required with no default** on both S3 forms, because three of the
+four `kmeans_isdf` sites deliberately do NOT wrap — they feed a minimum-image
+metric with its own offset table, so folding into `[0,1)` first would put the
+image on the wrong replica. That is the most dangerous line in the diff.
+
+`epsreader.py:136` was **deleted** in its own commit, with a tombstone.
+
+### The plan as written, kept for the record
+
 ### THE PLAN — what the five survivors are, for the owner to scope
 
 Written 2026-08-15 on request. **Not started.** Ordered by blast radius, and
