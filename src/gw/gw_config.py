@@ -2911,6 +2911,38 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
+        # Band-window and dimensionality ranges, checked HERE because
+        # ``zeta_nband`` below is the only one of the five that has ever
+        # been.  Each of these otherwise dies far downstream and in the
+        # vocabulary of the site that tripped over it: nval > nelec gives
+        # b1 < 0 and surfaces inside ``BandSlices.from_band_edges``,
+        # nband <= 0 surfaces as a chunk-arithmetic error, and a bad
+        # sys_dim reaches ``gw.coulomb.base.get_kernel``.  The band
+        # counts' UPPER bounds need the WFN and are checked at its open
+        # (``gw_jax``); these are the ones knowable from the deck alone.
+        _nval, _ncond, _nband = int(_g("nval")), int(_g("ncond")), int(_g("nband"))
+        if _nval < 0:
+            raise ValueError(
+                f"nval={_nval} must be >= 0.  It is an offset BELOW the "
+                f"occupied edge (b1 = n_occ - nval), so a negative value "
+                f"asks for a ζ-fit window that starts above n_occ.")
+        if _ncond < 0:
+            raise ValueError(
+                f"ncond={_ncond} must be >= 0.  It is the number of "
+                f"conduction bands above n_occ in the Σ/QP window "
+                f"(b3 = n_occ + ncond).")
+        if _nband <= 0:
+            raise ValueError(
+                f"nband={_nband} must be > 0.  It is the χ0/Σ band-sum top "
+                f"b4; a run summing no bands is not a smaller calculation, "
+                f"it is a different one.")
+        _sys_dim = int(_g("sys_dim"))
+        if _sys_dim not in (0, 2, 3):
+            raise ValueError(
+                f"sys_dim={_sys_dim} invalid; expected 0 (molecule/box), "
+                f"2 (slab) or 3 (bulk).  There is no 1-D (wire) Coulomb "
+                f"truncation in the tree — see gw/coulomb/base.py.")
+
         # ζ-fit window top.  Empty / unset / equal-to-nband all collapse to
         # None — "follow nband" — so the decoupled branch in
         # ``gw.gw_init.fit_zeta`` is not entered at all and the fit is

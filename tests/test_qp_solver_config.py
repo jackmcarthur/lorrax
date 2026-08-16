@@ -19,6 +19,8 @@ All tests run on a throwaway input file — no WFN, no GPU, no jit.
 from __future__ import annotations
 
 import pathlib
+import re
+
 import pytest
 
 from gw.gw_config import LorraxConfig, QPSolver
@@ -294,6 +296,45 @@ def test_mixed_case_key_survives_strict_keys(tmp_path):
     p.write_text(BASE_INPUT + "strict_keys = true\ndo_G0 = false\n")
     params = read_lorrax_input(str(p))     # must not raise
     assert params["do_G0"] is False
+
+
+# ---------------------------------------------------------------------------
+# Parse-time band-window / dimensionality ranges.  ``zeta_nband`` was the
+# only one of the five ever checked here; the other four each died far
+# downstream, in the vocabulary of whatever site tripped over them.
+# ---------------------------------------------------------------------------
+
+def _geom_config(tmp_path, *, nval=2, ncond=2, nband=10, sys_dim=2):
+    path = tmp_path / "cohsex_geom.in"
+    path.write_text(
+        f"[cohsex]\nnval = {nval}\nncond = {ncond}\nnband = {nband}\n"
+        f"sys_dim = {sys_dim}\nmemory_per_device_gb = 4.0\n")
+    return LorraxConfig.from_input_file(str(path),
+                                        print_fn=lambda *a, **k: None)
+
+
+@pytest.mark.parametrize("kwargs, needle", [
+    ({"nval": -1}, "nval=-1"),
+    ({"ncond": -3}, "ncond=-3"),
+    ({"nband": 0}, "nband=0"),
+    ({"nband": -10}, "nband=-10"),
+    ({"sys_dim": 1}, "sys_dim=1"),
+    ({"sys_dim": 4}, "sys_dim=4"),
+])
+def test_geometry_ranges_refuse_at_parse_time(tmp_path, kwargs, needle):
+    with pytest.raises(ValueError, match=re.escape(needle)):
+        _geom_config(tmp_path, **kwargs)
+
+
+@pytest.mark.parametrize("sys_dim", [0, 2, 3])
+def test_legal_sys_dim_values_still_parse(tmp_path, sys_dim):
+    assert _geom_config(tmp_path, sys_dim=sys_dim).sys_dim == sys_dim
+
+
+def test_zero_is_a_legal_nval_and_ncond(tmp_path):
+    """The boundary is >= 0, not > 0: nval = 0 puts b1 at n_occ."""
+    cfg = _geom_config(tmp_path, nval=0, ncond=0)
+    assert (cfg.nval, cfg.ncond) == (0, 0)
 
 
 def test_screening_method_ctsp_refuses_and_names_minimax(tmp_path):
