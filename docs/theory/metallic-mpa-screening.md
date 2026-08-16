@@ -22,8 +22,9 @@ W_c(z)=\sum_p\frac{2\Omega_pB_p}{z^2-\Omega_p^2},
 $$
 
 Verification banner: every named symbol in this page was read at commit
-`a5b1002b` on `integ/metal-mpa-qsgw-2026-08-15` (2026-08-15); measured
-numbers carry their claim row or probe record. `compute_mode = mpa` **no
+`941db3a7` on `integ/metal-mpa-qsgw-2026-08-15` (2026-08-15; sections 1–5
+unchanged since the `a5b1002b` reading); measured numbers carry their claim
+row or probe record. `compute_mode = mpa` **no
 longer refuses at driver entry**: `gw_config.UNIMPLEMENTED_MODES` was
 emptied at `9c9b23dc` (2026-08-15) once the metal pipeline ran end to end.
 Section 6.4 states exactly what that lift does and does not assert — it is
@@ -619,13 +620,19 @@ computed from.
 
 ## 6. The QSGW occupation cycle
 
-### 6.1 One state per iteration
+### 6.1 One state per map call, solved at entry
 
-The QSGW order is sequential: the first half of iteration `i` evaluates the
-head and body on the `(f, mu)` carried from `i-1`; only after `Sigma`/`H`
-assembly and the orbital rotation does the end-of-iteration solve produce
-the state for `i+1` (`gw.sc_iteration`, end-of-iteration update). That
-carried state is one frozen `gw.efermi.OccupationState`
+Every call of the QSGW map solves its own occupation state, **at entry**,
+from the spectrum of the `H` it was handed: `gw.sc_iteration.gw_iteration_map`
+rotates into the QP basis and immediately calls
+`_solve_head_occupations(inputs, wfns_qp.enk)`, and that one state is what
+this call's chi, `q->0` head and `Sigma` consume (commit `178f62b8`). There
+is exactly one MP1 solve per map call and no carry: `SCState.occupation_state`
+still holds the previous call's state, but only as the `|d mu|` drift
+diagnostic, and nothing physical reads it. Section 7.2 owns why the rule
+changed from the earlier end-of-iteration solve, and what it bought.
+
+The solved state is one frozen `gw.efermi.OccupationState`
 (`f_kn` unclipped, `mu_ry`, `smearing_family`, `smearing_width_ry`,
 `n_electrons`, derived `occ_hash`), built from the **QP eigenvalues** by
 `OccupationState.solve_mp1` — a safeguarded fixed-N bisection
