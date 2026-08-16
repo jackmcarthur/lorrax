@@ -3,11 +3,12 @@
 WHAT IS MEASURED HERE.  Three things, and they are separated on purpose
 because they fail for different reasons and get fixed by different people:
 
-1. THE KEY.  Parsed, normalised, validated at PARSE time (the shape
-   ``hartree_source`` uses), reaching the frozen dataclass the driver reads
-   as a ``_raw`` field — raw because ``auto`` cannot be resolved at parse
-   time: its answer depends on the run's centroid set, which does not exist
-   until the ISDF stage.
+1. THE RETIRED KEY.  ``restart_q_storage`` was DELETED in 0.1.0 (owner
+   ruling 2026-08-08: symmetry never needed a mode switch, the WFN file
+   already answers the question) and storage is pinned to ``full``, which
+   is what its default already was.  ``auto``/``ibz`` REFUSE — they asked
+   for a q wedge that is no longer written; ``full`` is redundant and
+   warns.  Files ALREADY on the wedge must still load.
 
 2. THE SEAM.  ``closure_for_restart`` is the ONE function the restart writer
    asks the closure question through, so the owner's stamp ruling
@@ -101,131 +102,72 @@ def _closed_but_unreduced():
                            reason="the q-grid admits no reduction")
 
 
-# ---------------------------------------------------------------------------
-# 1. The key
-# ---------------------------------------------------------------------------
-
-def test_the_key_defaults_to_full():
-    """FULL IS THE DESIGNED DEFAULT AND THE WEDGE IS OPT-IN PER DECK.
-
-    ``DESIGN_symmetry_restart_followup.md`` rules it in as many words —
-    "the deck key keeps full-BZ storage as the default until the owner rules
-    on centroid regeneration, and the q_irr path is opt-in per deck" — and
-    ``SPEC_qirr_restart_tensors.md`` agrees ("defaulting to whatever
-    preserves today's" bytes).
-
-    THIS CELL USED TO ASSERT ``auto``, citing a design-doc line that does not
-    exist in the design doc.  The 2026-08-08 landing census priced the
-    difference: with ``auto`` in ``_DEFAULTS``, both in-tree decks whose
-    centroid sets are orbit-closed silently began writing the q wedge, and
-    nine cells went red across the GW and BSE restart paths because neither
-    reader unfolds.  A default that changes the on-disk restart FORMAT is
-    exactly the kind that has to be asked for, which is what this cell now
-    holds.
-    """
+def test_the_key_is_gone_from_the_defaults_table():
+    """Deleted, not re-defaulted.  ``_DEFAULTS`` is the deck's surface."""
     from gw.gw_config import _DEFAULTS
 
-    assert _DEFAULTS["restart_q_storage"] == "full"
+    assert "restart_q_storage" not in _DEFAULTS
 
 
-def test_a_deck_that_never_heard_of_the_key_gets_full(tmp_path):
+def test_a_deck_that_never_heard_of_the_key_still_parses(tmp_path):
     """Every archived deck keeps parsing AND keeps its bytes.
 
     The second half is the point: a deck written before this key existed
-    must not change on-disk format by standing still.
+    must not change on-disk format by standing still — and ``full``, the
+    format it got, is now the only one written.
     """
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
-    assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\n"
+                    "ncond = 4\nnband = 8\n")
+    assert "restart_q_storage" not in read_lorrax_input(str(deck))
 
 
-def test_the_hand_built_params_fallback_agrees_with_the_registered_default(
-        tmp_path, monkeypatch):
-    """The ``or`` in the parse site is a SECOND spelling of the default.
+@pytest.mark.parametrize("spelling", ["auto", "AUTO", "ibz", "  Ibz  "])
+def test_the_two_wedge_values_refuse_naming_what_still_loads(tmp_path,
+                                                             spelling):
+    """They asked for a q wedge that is no longer WRITTEN.
 
-    ``LorraxConfig`` resolves ``_g("restart_q_storage") or <fallback>``, and
-    that fallback is reached by any caller that assembles the params dict
-    itself and omits the key.  Two spellings of one default is how they
-    drift, and a drift here is a caller silently storing a different q-set,
-    so the two are asserted equal rather than eyeballed.
-    """
-    monkeypatch.chdir(tmp_path)
-    from gw.gw_config import LorraxConfig, _DEFAULTS
-
-    deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
-    cfg = LorraxConfig.from_input_file(str(deck),
-                                       print_fn=lambda *a, **k: None)
-    assert cfg.restart_q_storage_raw == _DEFAULTS["restart_q_storage"]
-
-
-@pytest.mark.parametrize("spelling", ["ibz", "IBZ", "  Ibz  ", "FULL",
-                                      "Auto"])
-def test_the_key_normalises_case_and_whitespace(tmp_path, spelling):
-    """``_NORMALIZE_STR`` membership, measured rather than asserted by eye.
-
-    Every other enumerated string key in the deck is case-insensitive, and
-    a key that is the one exception is a key an operator types in the
-    obvious way and then cannot explain the behaviour of.
+    Silently handing such a deck the full BZ would change its on-disk
+    format without a word — the failure this key's own default was chosen
+    to avoid.  The refusal must also say that files already on the wedge
+    still load, or an operator reads it as "my restart file is lost".
     """
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text(f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text(f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\n"
+                    f"ncond = 4\nnband = 8\n"
                     f"restart_q_storage = {spelling}\n")
-    got = read_lorrax_input(str(deck))["restart_q_storage"]
-    assert got == spelling.strip().lower()
+    with pytest.raises(ValueError) as exc:
+        read_lorrax_input(str(deck))
+    msg = str(exc.value)
+    assert "restart_q_storage" in msg
+    assert "still load" in msg
 
 
-def test_the_key_is_not_an_unknown_deck_key(tmp_path):
-    """``strict_keys = true`` must ACCEPT it — the ``_DEFAULTS`` membership."""
+@pytest.mark.parametrize("spelling", ["full", "FULL", "  Full  "])
+def test_the_pinned_value_is_redundant_not_wrong(tmp_path, spelling):
+    """``full`` named the behaviour that is now unconditional."""
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
-                    "strict_keys = true\nrestart_q_storage = full\n")
-    assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
+    deck.write_text(f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\n"
+                    f"ncond = 4\nnband = 8\n"
+                    f"restart_q_storage = {spelling}\n")
+    with pytest.warns(DeprecationWarning, match="restart_q_storage"):
+        read_lorrax_input(str(deck))
 
 
-def test_the_key_reaches_the_dataclass_as_a_RAW_field(tmp_path, monkeypatch):
-    """Through ``LorraxConfig.from_input_file``, and UNRESOLVED.
+def test_the_wedge_unfold_reader_is_still_there():
+    """Deleting the WRITER's key must not delete the READER.
 
-    The ``_raw`` suffix is the contract: ``auto`` is still ``auto`` on the
-    frozen config, because resolving it needs the closure answer and the
-    centroid set does not exist at parse time.  A field that arrived here
-    already resolved would have had to guess.
+    Restart files already written on the q wedge have to keep loading;
+    that is the whole reason the refusal above can afford to be a refusal.
     """
-    monkeypatch.chdir(tmp_path)
-    from gw.gw_config import LorraxConfig
-
-    deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
-                    "restart_q_storage = auto\n")
-    cfg = LorraxConfig.from_input_file(str(deck),
-                                       print_fn=lambda *a, **k: None)
-    assert cfg.restart_q_storage_raw == "auto"
-    assert cfg.write_restart_tensors is True, "independent axes"
-
-
-def test_a_typo_dies_at_parse_time_not_after_the_compute(tmp_path,
-                                                         monkeypatch):
-    """RED TWIN of the parse-time validation.
-
-    ``hartree_source``'s comment says why this shape exists: the alternative
-    is a refusal 20 minutes into a 40-node run, after the ISDF stage that
-    the restart write is the tail of.  The refusal names the legal set.
-    """
-    monkeypatch.chdir(tmp_path)
-    from gw.gw_config import LorraxConfig
-
-    deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
-                    "restart_q_storage = wedge\n")
-    with pytest.raises(ValueError, match=r"restart_q_storage='wedge'"):
-        LorraxConfig.from_input_file(str(deck),
-                                     print_fn=lambda *a, **k: None)
+    reader = (_SRC / "file_io" / "tagged_arrays.py").read_text()
+    assert "unfold" in reader and "q_storage" in reader
 
 
 # ---------------------------------------------------------------------------
@@ -443,16 +385,17 @@ def test_the_ibz_decision_carries_the_tables_forward():
         "auto", _open_set(), context="gate").resolution is None
 
 
-def test_the_legal_set_is_the_one_the_parser_validates_against():
-    """ONE tuple, two consumers.  A second list is a second answer."""
-    from gw.gw_config import _DEFAULTS
+def test_the_legal_set_survives_the_keys_deletion():
+    """The RESOLUTION keeps its vocabulary; only the deck key went.
+
+    ``auto`` and ``ibz`` are still resolvable arms — the wedge writer and
+    every refusal it carries are intact — so that storage-follows-the-WFN
+    lands at ``resolve_restart_q_storage_for_run`` rather than having to
+    rebuild what the deletion threw away.
+    """
     from gw.restart_q_storage import RESTART_Q_STORAGE
 
     assert RESTART_Q_STORAGE == ("auto", "full", "ibz")
-    assert _DEFAULTS["restart_q_storage"] in RESTART_Q_STORAGE
-    src = (_SRC / "gw" / "gw_config.py").read_text()
-    assert "RESTART_Q_STORAGE" in src, (
-        "gw_config must validate against the module's tuple, not a copy")
     assert np.all(np.array([m == m.strip().lower()
                             for m in RESTART_Q_STORAGE])), (
         "the legal values must already be in normalised form")
@@ -588,78 +531,58 @@ def test_a_nosym_wfn_really_does_produce_an_unreduced_q_axis():
 
 
 # ---------------------------------------------------------------------------
-# 6. THE KEY IS DEPRECATED, AND SAYS SO TO THE DECKS THAT PIN IT
+# 6. THE RESOLUTION IS PINNED, AND STILL GOES THROUGH THE ONE SEAM
 # ---------------------------------------------------------------------------
 
-def test_the_parser_records_which_keys_the_deck_itself_named(tmp_path):
-    """A pinned key and an inherited default must be distinguishable.
+def test_the_driver_call_pins_full_rather_than_reading_a_key():
+    """``resolve_restart_q_storage_for_run`` asks for ``full``, literally.
 
-    They are not distinguishable from the resolved value: a deck pinning
-    ``full`` and a deck that never mentions the key both arrive as
-    ``"full"``.  The parser knows the difference — it reads ``None`` from the
-    section for an absent key — and now records it, because a deprecation
-    that cannot tell those apart must either shout at every deck in the tree
-    or at none of them.
+    The end state the owner ruled for is storage that FOLLOWS the WFN's own
+    symmetry, and that lands at THIS call — so the resolution still routes
+    through ``resolve_restart_q_storage`` (one resolution point, one
+    announcement) rather than short-circuiting past it now that there is
+    nothing for the deck to say.
     """
-    from gw.gw_config import read_lorrax_input
-
-    bare = tmp_path / "bare.in"
-    bare.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\n")
-    pinned = tmp_path / "pinned.in"
-    pinned.write_text(
-        "[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nrestart_q_storage = full\n")
-
-    bare_keys = read_lorrax_input(str(bare))["_deck_named_keys"]
-    pin_keys = read_lorrax_input(str(pinned))["_deck_named_keys"]
-
-    assert "restart_q_storage" not in bare_keys
-    assert "restart_q_storage" in pin_keys
-    assert "nval" in bare_keys and "nval" in pin_keys, (
-        "the record must cover every named key, not only the deprecated one")
-    # It is not a deck key and must never be mistaken for one.
-    from gw.gw_config import _DEFAULTS
-    assert "_deck_named_keys" not in _DEFAULTS
+    tree = ast.parse(_STORAGE_MOD.read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "resolve_restart_q_storage_for_run")
+    body = ast.unparse(fn)
+    assert "resolve_restart_q_storage('full'" in body
+    assert "restart_q_storage_raw" not in body
 
 
-def test_the_deprecation_speaks_only_to_a_deck_that_named_the_key():
-    """OWNER RULING 2026-08-08 ~13:20: this key is deleted, not defaulted.
+def test_the_deck_named_keys_mechanism_is_gone():
+    """Its sole consumer was the deleted key's deprecation notice."""
+    from gw import gw_config, restart_q_storage
 
-    So a deck that pins it is building on something with an end date and is
-    told once; a deck that never mentions it hears nothing.  Warning on the
-    default path would print for every deck in the tree, which is how a
-    deprecation notice becomes noise nobody reads — and the DEFAULT is not
-    what is deprecated, the KEY is.
+    assert not hasattr(restart_q_storage, "_deck_named_the_key")
+    assert not hasattr(gw_config, "_DECK_NAMED_KEYS")
+
+
+def test_the_config_no_longer_carries_the_raw_request(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from gw.gw_config import LorraxConfig
+
+    deck = tmp_path / "cohsex.in"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\n"
+                    "ncond = 4\nnband = 8\n")
+    cfg = LorraxConfig.from_input_file(str(deck),
+                                       print_fn=lambda *a, **k: None)
+    assert not hasattr(cfg, "restart_q_storage_raw")
+    assert not hasattr(cfg, "raw_input_keys")
+    assert cfg.write_restart_tensors is True, "independent axes"
+
+
+def test_the_pinned_arm_is_the_one_every_deck_was_already_running():
+    """RED TWIN of the pin: ``full`` was the default and the wedge was not.
+
+    ``si_bse_debug`` pinned ``full`` explicitly and every other deck
+    inherited it, so pinning the resolver to ``full`` changes no run — the
+    ``auto`` arm that would have differed is the one nothing selected.
     """
-    import types
-    from gw.restart_q_storage import _deck_named_the_key
+    from gw.restart_q_storage import resolve_restart_q_storage
 
-    assert _deck_named_the_key(
-        types.SimpleNamespace(raw_input_keys=frozenset({"restart_q_storage"})))
-    assert not _deck_named_the_key(
-        types.SimpleNamespace(raw_input_keys=frozenset({"nval"})))
-    # A config with no record at all — a hand-built params dict, or an older
-    # caller — must answer "did not ask" rather than raising or shouting.
-    assert not _deck_named_the_key(types.SimpleNamespace())
-    assert not _deck_named_the_key(
-        types.SimpleNamespace(raw_input_keys=None))
-
-
-def test_the_key_still_works_because_removal_is_the_owners_step():
-    """DEPRECATED-BUT-FUNCTIONAL.  A pinned deck's behaviour is untouched.
-
-    The ruling schedules the deletion; it does not ask this branch to take
-    it.  ``si_bse_debug`` pins ``full`` deliberately and its README schedules
-    that pin to be deleted WITH the key rather than before it, so the key
-    must keep resolving exactly as it did.
-    """
-    from gw.restart_q_storage import (RESTART_Q_STORAGE,
-                                      resolve_restart_q_storage)
-    from gw.gw_config import _DEFAULTS
-
-    assert RESTART_Q_STORAGE == ("auto", "full", "ibz"), (
-        "the key is still functional; its legal set does not shrink before "
-        "the owner-reviewed deletion")
-    assert _DEFAULTS["restart_q_storage"] == "full"
     assert resolve_restart_q_storage(
         "full", _closed_and_reduced(), context="gate").mode == "full"
     assert resolve_restart_q_storage(

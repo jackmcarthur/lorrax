@@ -972,49 +972,6 @@ _DEFAULTS = {
     # was not built by the run's compute mode it is omitted and named,
     # rather than manufactured to fill a dataset slot.
     "write_qsgw_datasets": False,
-    # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
-    # DEFAULT full — the q_irr wedge is OPT-IN PER DECK, which is what
-    # DESIGN_symmetry_restart_followup.md ruled and what this key was built
-    # to obey: "the deck key keeps full-BZ storage as the default until the
-    # owner rules on centroid regeneration, and the q_irr path is opt-in per
-    # deck."  It shipped briefly defaulting to ``auto`` and the 2026-08-08
-    # landing census measured what that cost — nine red cells across the GW
-    # and BSE restart paths on the two decks whose centroid sets are already
-    # orbit-closed.  A default that moves bytes is a default that has to be
-    # asked for.
-    #   full — the DEFAULT.  Preserve today's bytes exactly, unconditionally.
-    #          Does not ask the closure question, so it is also the control
-    #          arm of any A/B.
-    #   auto — store the pre-unfold IBZ wedge when the deck's centroid set is
-    #          orbit-closed AND this run's q path actually reduced; the full
-    #          BZ otherwise.  On a non-closed set (today's Si production
-    #          960-centroid deck: 47 of 48 ops violating) this is byte-for-byte
-    #          today's file.  On a CLOSED set it is ~8x smaller.
-    #   ibz  — REFUSE on a set that is not storable, naming which of the two
-    #          conditions failed.  For a deck that believes it is closed and
-    #          wants to be told the day it stops being.
-    # BEFORE YOU SET auto OR ibz ON A CLOSED-SET DECK: the readers do not
-    # unfold yet.  ``bse_io._MunuSlabPlan`` refuses a wedge outright (at every
-    # process count, not only P>1), and the GW restart reader refuses it too
-    # since the same landing — see ``file_io.tagged_arrays``.  The wedge is
-    # therefore usable today by runs that DISCARD the restart artifact or read
-    # it back through the serial h5py path.
-    #
-    # ⚠ THIS WHOLE KEY IS TRANSITIONAL — OWNER RULING 2026-08-08 ~13:20.
-    # `full` is where it rests until the key is DELETED, not a permanent
-    # setting to tune.  The owner's ruling is that symmetry should never have
-    # needed a mode switch at all: "symmetries should not need an auto mode —
-    # if symmetries are not to be used, the wavefunction file should've been
-    # generated with no symmetries."  The WFN file already answers the
-    # question this key asks, so the end state is storage that FOLLOWS the
-    # file — the wedge whenever the deck carries symmetries, readers that
-    # always unfold — with `restart_q_storage` retired entirely rather than
-    # defaulted differently.  That work is the GW+BSE restart consolidation
-    # registered in tests/KNOWN_FAILURES.md; do not build on this key.
-    # See gw/restart_q_storage.py for the resolution and the seam, and
-    # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
-    # decision this key selects.
-    "restart_q_storage": "full",
     # ``compute_mode`` is the single axis describing the self-energy
     # ansatz, and it is REQUIRED — the empty default means NOT DECLARED
     # and refuses at ``from_input_file``.  Values:
@@ -1554,6 +1511,16 @@ _LEGACY_DECK_KEYS = frozenset({
     # cbm|none|<float>.  ``MinimaxConfig.energy_reference`` keeps the
     # internal "midgap" default for the resolver's other callers.
     "minimax_energy_reference",     # warn-and-ignore (pinned to midgap)
+    # 0.1.0: the owner ruled this key TRANSITIONAL on 2026-08-08 ("symmetry
+    # should never have needed a mode switch -- the WFN file already
+    # answers the question"), and shipping a knob scheduled for deletion in
+    # a release is a public API you then have to deprecate.  Storage is
+    # pinned to ``full`` internally, which is what the default already was
+    # and what every in-tree deck ran.  ``auto``/``ibz`` REFUSE (they asked
+    # for a wedge that is no longer written); ``full`` is redundant, not
+    # wrong, and warns.  The wedge-unfold READER in file_io.tagged_arrays
+    # stays -- files written on the wedge must still load.
+    "restart_q_storage",            # refuse on auto/ibz, else ignore
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1600,11 +1567,6 @@ _NORMALIZE_STR = {
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_probe_chi_reuse",
-    # ``restart_q_storage`` normalises here and is VALIDATED at parse time
-    # against RESTART_Q_STORAGE, the same shape ``hartree_source`` uses: a
-    # key whose wrong value would otherwise surface as a refusal deep in the
-    # restart write, after the compute.
-    "restart_q_storage",
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
@@ -1622,14 +1584,6 @@ _NULLABLE_BOOL = frozenset()
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({"zeta_nband"})
-
-#: Reserved slot in the params dict holding the set of deck keys the DECK
-#: named.  Leading underscore because it is not a deck key and must never
-#: match one: ``read_lorrax_input`` builds params from ``_DEFAULTS.items()``
-#: and every real key comes from there, so a name that cannot appear in
-#: ``_DEFAULTS`` cannot collide.  Read once, into ``GWConfig.raw_input_keys``.
-_DECK_NAMED_KEYS = "_deck_named_keys"
-
 
 # ---------------------------------------------------------------------------
 #  Input file parser
@@ -1831,6 +1785,34 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        _rqs = section.get("restart_q_storage", fallback=None)
+        if _rqs is not None:
+            _rqs_val = str(_rqs).strip().lower()
+            if _rqs_val in ("auto", "ibz"):
+                raise ValueError(
+                    f"restart_q_storage = {_rqs_val} "
+                    f"({_deck_key_line(lines, start, end, 'restart_q_storage')}"
+                    f") is no longer available: the key was deleted in 0.1.0 "
+                    f"(owner ruling 2026-08-08 -- symmetry never needed a "
+                    f"mode switch, the WFN file already answers the "
+                    f"question) and restart storage is pinned to the full "
+                    f"BZ.  Those two values asked for the pre-unfold q "
+                    f"wedge, which is no longer WRITTEN; files already on "
+                    f"the wedge still load (file_io.tagged_arrays unfolds "
+                    f"them).  Delete the line.")
+            import warnings
+            warnings.warn(
+                "Input key 'restart_q_storage' is no longer supported and "
+                "will be ignored: restart storage is pinned to the full BZ, "
+                "which is what 'full' asked for.  Remove it from your input "
+                "file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "restart_q_storage",
+                "IGNORED — storage is pinned to the full BZ, which is what "
+                "'full' selected"))
+
         if section.get("minimax_energy_reference", fallback=None) is not None:
             import warnings
             warnings.warn(
@@ -2004,20 +1986,8 @@ def read_lorrax_input(filename: str) -> dict:
 
         # Build params from _DEFAULTS, overriding with parsed values
         params = {}
-        # WHICH KEYS THE DECK ITSELF NAMED.  ``params`` cannot answer this
-        # afterwards — a deck pinning a key to its default and a deck that
-        # never mentions it produce the identical entry — and the difference
-        # matters to anything that must speak only to decks that opted in.
-        # Its first consumer is the ``restart_q_storage`` deprecation notice
-        # (owner ruling 2026-08-08: the key is scheduled for deletion), which
-        # must fire for a deck that pins it and stay silent for the other
-        # ~forty, or it is noise nobody reads.  Recorded here, where the
-        # answer is free, rather than re-parsed by each consumer.
-        named = set()
         for key, default in _DEFAULTS.items():
             raw = section.get(key, fallback=None)
-            if raw is not None:
-                named.add(key)
             if raw is None:
                 params[key] = default
             elif key in _NULLABLE_BOOL:
@@ -2040,10 +2010,8 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = str(raw)
             if key in _NORMALIZE_STR and isinstance(params[key], str):
                 params[key] = params[key].strip().lower()
-        params[_DECK_NAMED_KEYS] = frozenset(named)
     else:
         params = dict(_DEFAULTS)
-        params[_DECK_NAMED_KEYS] = frozenset()
 
     # Parse optional QE K_POINTS block
     if kp_idx is not None:
@@ -2502,21 +2470,6 @@ class LorraxConfig:
     #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
     #: which compute mode produces it.
     write_qsgw_datasets: bool
-    #: RAW ``restart_q_storage`` request — "full" (the default) | "auto" |
-    #: "ibz".  Validated at parse time, resolved LATE
-    #: (``gw.restart_q_storage``): ``auto``'s answer depends on the run's
-    #: centroid set, which does not exist yet here.  ``full`` needs no
-    #: resolution but still goes through the same seam, so there is one
-    #: resolution point rather than a fast path beside it.  Same ``_raw``
-    #: convention as ``compute_mode_raw``.
-    restart_q_storage_raw: str
-    #: The deck keys THIS DECK NAMED, as opposed to inherited from
-    #: ``_DEFAULTS``.  Empty for a config built from a hand-made params dict,
-    #: which is why every consumer must treat "absent" as "did not ask" — see
-    #: ``gw.restart_q_storage._deck_named_the_key``.  Exists so a key that is
-    #: on its way out can speak to the decks that pin it without speaking to
-    #: every other deck in the tree.
-    raw_input_keys: frozenset
     compute_mode_raw: str         # one of ComputeMode.value strings (required)
     qp_solver_raw: str            # one of QPSolver.value strings
     bispinor: bool
@@ -3046,29 +2999,6 @@ class LorraxConfig:
                 f"hartree_source={_hartree_source!r} is not one of "
                 f"{HARTREE_SOURCES}.  H0 = kin_ion + V_H is a ~500 eV "
                 "cancellation; this key is not guessed.")
-        # Same treatment, same reason, for the restart q-set.  Validated
-        # here and NOT resolved here: ``auto`` resolves against the closure
-        # answer, which needs the run's centroid set and its symmetry
-        # tables, so the field below is the RAW request and
-        # ``gw.restart_q_storage.resolve_restart_q_storage`` turns it into a
-        # mode once those exist.  (``hartree_source`` can be stored resolved
-        # because its ``auto`` resolves against a file already on disk; this
-        # one cannot, and the ``_raw`` suffix says which kind it is — the
-        # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
-        from gw.restart_q_storage import RESTART_Q_STORAGE
-        # The ``or`` fallback must agree with ``_DEFAULTS`` — it is reached
-        # only by a caller that built the params dict by hand and left the
-        # key out, and a fallback that disagreed with the registered default
-        # would make THAT caller silently take a different storage decision.
-        _restart_q_storage = str(
-            _g("restart_q_storage") or "full").strip().lower()
-        if _restart_q_storage not in RESTART_Q_STORAGE:
-            raise ValueError(
-                f"restart_q_storage={_restart_q_storage!r} is not one of "
-                f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
-                "restart tensors are STORED on; a value nobody recognises "
-                "is not silently read as the default.")
-
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
@@ -3168,8 +3098,6 @@ class LorraxConfig:
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
-            restart_q_storage_raw=_restart_q_storage,
-            raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
             compute_mode_raw=_compute_mode_raw,
             qp_solver_raw=str(_g("qp_solver") or "one_shot_dft").strip().lower(),
             bispinor=bool(_g("bispinor")),

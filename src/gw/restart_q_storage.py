@@ -488,9 +488,17 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
             context=context)
-    decision = resolve_restart_q_storage(
-        getattr(config, "restart_q_storage_raw", "auto"), res,
-        context=context)
+    # PINNED TO ``full``.  The ``restart_q_storage`` deck key was deleted
+    # in 0.1.0 (owner ruling 2026-08-08: "symmetry should not need a mode
+    # switch -- if symmetries are not to be used, the wavefunction file
+    # should've been generated with no symmetries"), and ``full`` is what
+    # its default already was and what every in-tree deck ran.  The
+    # resolution still goes through :func:`resolve_restart_q_storage` --
+    # one resolution point, and the announcement below is what tells an
+    # operator which q-set their file carries -- rather than short-circuiting
+    # past it, because the end state is storage that FOLLOWS the WFN's own
+    # symmetry and that lands HERE, at this call, not at a deleted key.
+    decision = resolve_restart_q_storage("full", res, context=context)
     # ANNOUNCED, ONCE, ON RANK 0 — same discipline as the suppress key.
     # A run whose restart file changed SHAPE and said nothing is a run
     # nobody can tell from one whose centroid set quietly stopped closing.
@@ -501,56 +509,7 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
             ("restart_q_storage", decision.mode, decision.requested, context),
             f"  [restart_write] {decision.describe()}",
             scope="rank0")
-        # THE DEPRECATION, AND ONLY FOR A DECK THAT ASKED.  The key is
-        # scheduled for DELETION, not for a better default (owner ruling
-        # 2026-08-08 ~13:20), so a deck that names it is building on
-        # something with an end date and should be told once.  A deck that
-        # does not name it sees nothing: warning on the default path would
-        # print this for every deck in the tree, which is how a deprecation
-        # notice becomes noise nobody reads — and the default is not what is
-        # being deprecated, the KEY is.
-        if _deck_named_the_key(config):
-            announce_once(
-                ("restart_q_storage_deprecated", decision.requested),
-                f"\n  *** LORRAX restart_q_storage = "
-                f"{decision.requested!r} is set explicitly by this deck, and "
-                f"this key is SCHEDULED FOR DELETION (owner ruling "
-                f"2026-08-08).\n"
-                f"      why:  symmetry never needed a mode switch — the WFN "
-                f"file already answers the question.  A deck-level\n"
-                f"            tri-state was always a second, weaker source "
-                f"of truth about the same fact.\n"
-                f"      then: restart storage will simply FOLLOW the WFN's "
-                f"own symmetry and both readers will always\n"
-                f"            unfold, after which this key goes away "
-                f"entirely.  Do not build on it.\n"
-                f"      see:  DESIGN_restart_consolidation.md; "
-                f"docs/input_reference.md. ***\n",
-                scope="rank0")
     return decision
-
-
-def _deck_named_the_key(config) -> bool:
-    """Did the DECK write ``restart_q_storage``, or is this just the default?
-
-    The deprecation above must fire for a deck that pins the key and stay
-    silent for one that never mentions it, and those two are
-    indistinguishable from the resolved value alone — a deck pinning ``full``
-    and a deck saying nothing both arrive here as ``"full"``.  The config
-    parser records the raw keys it saw, so the question is asked of that
-    rather than inferred from the value.
-
-    Conservative on purpose: a config object that carries no record of its
-    own raw keys answers ``False``, because a deprecation notice that fires
-    on every run is worse than one that fires on none.
-    """
-    seen = getattr(config, "raw_input_keys", None)
-    if seen is None:
-        return False
-    try:
-        return "restart_q_storage" in seen
-    except TypeError:                                    # pragma: no cover
-        return False
 
 
 __all__ = ["RESTART_Q_STORAGE", "RestartQStorage", "closure_for_restart",
