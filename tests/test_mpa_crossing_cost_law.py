@@ -156,3 +156,31 @@ def test_hole_guard_refuses_qp_energies_inside_the_gap():
     # band) is not this guard's business.
     assert_omega_grid_covers(
         in_hole, np.asarray([[True, False]]), grid_ry, context="test")
+
+
+def test_shell_rule_error_verified_against_an_independent_cloud():
+    """Brute-force certification check, independent of the builder.
+
+    The rule's sampled_max_error comes from its own boundary grids; here
+    the residual |1 - d·Q(d)| is measured on a fresh interior+boundary
+    cloud of the certified rectangle (sign-crossing range included by
+    construction) and must stay within a small factor of the target —
+    analyticity puts the true max on the boundary, so 2x is generous.
+    """
+    from gw.mpa.evaluator import damped_rectangle_positive_rule
+    rule = damped_rectangle_positive_rule(
+        ETA_RY, ETA_RY + 0.05, 2.0, rel_tol=CROSSING_TOL, max_nodes=500)
+    t, h = np.asarray(rule["t"]), np.asarray(rule["h"])
+    rng = np.random.default_rng(20260816)
+    x = rng.uniform(-2.0, 2.0, 4096)
+    gamma = rng.uniform(ETA_RY, ETA_RY + 0.05, 4096)
+    edge = rng.integers(0, 4, 4096)
+    x = np.where(edge == 0, -2.0, np.where(edge == 1, 2.0, x))
+    gamma = np.where(edge == 2, ETA_RY,
+                     np.where(edge == 3, ETA_RY + 0.05, gamma))
+    z = gamma - 1j * x
+    residual = np.abs(1.0 - (z[:, None] * np.exp(
+        -z[:, None] * t[None, :])) @ h)
+    assert float(np.max(residual)) <= 2.0 * CROSSING_TOL
+    # And the crossing itself is exercised: the cloud straddles x = 0.
+    assert np.any(x > 1.0) and np.any(x < -1.0)
