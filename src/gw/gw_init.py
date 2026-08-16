@@ -879,6 +879,147 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 		for b in edges))
 
 
+#: Env override for the band-sum degeneracy guard: ``snap`` (or ``off``)
+#: downgrades the refusal below.  Same three-mode vocabulary as
+#: ``common.band_degeneracy.MODES`` and the BSE's ``--band-degeneracy``; it is
+#: an ENV knob rather than a deck key because it is an escape hatch for a
+#: deck you are debugging, not a property of the calculation you would want
+#: recorded in the input file.  ``AGENT_PREAMBLE``: never set it to make a
+#: gate pass.
+_BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
+
+
+def _refuse_split_under_restart(cfg, *, print_fn=print):
+	"""A restart cannot change the χ/Σ split.  Refuse rather than reuse.
+
+	``restart = true`` reuses ``V_q``, ``W0``, ``psi_full_y`` and the ζ
+	tensors from a previous run, and the restart stamp
+	(``file_io.tagged_arrays``) records FIVE band edges — b0..b4 — which is
+	exactly the set that does NOT distinguish a split from an unsplit run at
+	the same loaded extent.  So a deck that flips ``number_bands_chi`` while
+	restarting would silently reuse a W built at the OTHER χ count and report
+	rc=0: the "wrong physics at rc=0" case the stamp exists to prevent, seen
+	from the one angle it cannot see.
+
+	Extending the stamp is the eventual fix; refusing is the correct fix
+	today, and it costs a split deck nothing it had before (no split deck can
+	have produced a restart file).
+	"""
+	if cfg.bands.split and bool(getattr(cfg, "restart", False)):
+		raise ValueError(
+			f"restart = true is refused with a SPLIT band count "
+			f"(number_bands_chi={cfg.bands.chi}, "
+			f"number_bands_sigma={cfg.bands.sigma}).  The restart stamp "
+			f"records b0..b4 only, and b4 is max(chi, sigma) — so it cannot "
+			f"tell a run that screened at {cfg.bands.chi} bands from one "
+			f"that screened at {cfg.bands.sigma}, and the reused V_q / W0 / "
+			f"zeta tensors would silently be the other run's.  Either set "
+			f"restart = false, or run the split deck from scratch in its own "
+			f"directory.")
+
+
+def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
+	"""Do the χ and Σ band-sum tops each cut a clean multiplet boundary?
+
+	SAME QUESTION AS ``check_zeta_fit_windows``, ONE INDEX OVER, and the same
+	answer for the same reason: a band sum truncated inside a degenerate
+	multiplet keeps half an irrep, and half a multiplet is not a subspace of
+	anything.  Measured on the Si 4×4×4 SOC deck, ``nband = 60`` slices a
+	multiplet and costs **1.957 meV of within-star Σ spread** — a quantity
+	that is exactly zero when the cut is clean (floor 0.0010 meV).  Star
+	covariance is an identity, not a convergence parameter, so that spread is
+	an error with no knob to reduce it.
+
+	MODE, AND WHY IT IS NOT UNIFORM — the same grandfather clause
+	``check_zeta_fit_windows`` documents, and for the same census reason:
+
+	* An edge that arrives through the UMBRELLA (``number_bands`` / the
+	  transitional ``nband``) is checked ``snap`` — reported loudly, never
+	  fatal.  Every deck in the tree sits on such an edge, chosen before this
+	  check existed; flipping them to ``strict`` would refuse decks that have
+	  been producing frozen references for months, and it would also break
+	  the bit-identity claim this feature is required to hold (a refusal is
+	  not a byte-identical ``eqp0.dat``).
+	* An edge the deck NAMED — ``number_bands_chi`` or
+	  ``number_bands_sigma`` — REFUSES.  Naming one of these keys is a
+	  brand-new, explicit request for a specific edge on a deck that by
+	  construction has no history, which is precisely the argument that made
+	  ``zeta_nband``'s edge strict on 2026-08-11.
+
+	``LORRAX_BAND_DEGENERACY=snap`` (or ``off``) downgrades the refusal for
+	both, and says so in the log when it does.  The two counts are checked
+	INDEPENDENTLY and the message names the legal edges for the one that
+	failed, so a deck with two bad edges learns about both.
+	"""
+	from common import band_degeneracy as _bd
+	energies = getattr(wfn, "energies", None)
+	if energies is None:
+		log("  [band sum] closure NOT CHECKED: this loader exposes no "
+		    "`energies`.  That is an absence, not a pass.")
+		return
+	enk = np.asarray(energies)[0]
+	nb = int(enk.shape[1])
+	gaps = _bd.boundary_min_gaps(enk)
+	override = os.environ.get(_BAND_DEGENERACY_ENV, "").strip().lower()
+	if override and override not in _bd.MODES:
+		raise ValueError(
+			f"{_BAND_DEGENERACY_ENV}={override!r} is not one of "
+			f"{_bd.MODES}.  A guard override with an unrecognised value is "
+			f"not silently ignored.")
+	for edge, key, what in (
+			(int(band_slices.b4_chi), "number_bands_chi", "chi0/W band sum"),
+			(int(band_slices.b4_sigma), "number_bands_sigma",
+			 "Sigma band sum")):
+		named = key in cfg.bands.named
+		mode = override or ("strict" if named else "snap")
+		# The PADDED edge cuts nothing real: ψ above b_id_4_user is zero, so
+		# the boundary there is between a real band and a pad band and the
+		# gap is meaningless.  Ask about the LOGICAL count instead, which is
+		# what the physics truncates at.
+		logical = min(edge, int(cfg.bands.chi if key.endswith("chi")
+		                        else cfg.bands.sigma))
+		if logical >= nb:
+			log(f"    {what} edge {logical} exempt (at or past the "
+			    f"{nb} bands this WFN carries — cuts nothing).")
+			continue
+		gap_mev = float(gaps[logical]) * 13605.693122994
+		if gap_mev > _bd.DEGENERACY_TOL_RY * 13605.693122994:
+			log(f"    {what} edge {logical} clean: min gap "
+			    f"{gap_mev:.3g} meV.")
+			continue
+		legal = [b for b in range(int(band_slices.b2) + 1, nb)
+		         if gaps[b] > _bd.DEGENERACY_TOL_RY]
+		near = ([b for b in legal if b <= logical][-3:]
+		        + [b for b in legal if b > logical][:3])
+		detail = (
+			f"{what} is truncated at {logical} bands, and that boundary "
+			f"SPLITS A DEGENERATE MULTIPLET: the tightest gap across it "
+			f"anywhere in the BZ is {gap_mev:.4g} meV, against a "
+			f"{_bd.DEGENERACY_TOL_RY * 13605.693122994:.3g} meV tolerance.  "
+			f"Half a multiplet is not a symmetry-adapted subspace; on the Si "
+			f"4x4x4 SOC deck a sliced band sum cost 1.957 meV of within-star "
+			f"Sigma spread, which is an identity violation and has no "
+			f"convergence knob.  Legal edges for THIS count near {logical}: "
+			f"{near or 'none in range'}.")
+		if mode == "off":
+			log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
+			    f"CHECKED.) ***")
+		elif mode == "snap":
+			log(f"    *** {detail}  Continuing: "
+			    + (f"{_BAND_DEGENERACY_ENV}={override} was set."
+			       if override else
+			       f"this edge arrived through the umbrella `number_bands`, "
+			       f"which is grandfathered to a warning.  Set `{key}` "
+			       f"explicitly to have it enforced.") + " ***")
+		else:
+			raise _bd.BandWindowDegeneracyError(
+				f"{detail}  This edge was requested BY NAME (`{key}` = "
+				f"{logical}), so it is enforced rather than warned about.  "
+				f"Set `{key}` to one of the legal edges above, or set "
+				f"{_BAND_DEGENERACY_ENV}=snap to continue anyway (it logs "
+				f"loudly, and it changes the physics rather than fixing it).")
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.

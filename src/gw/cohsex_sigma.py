@@ -190,7 +190,10 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
     def sigma_coh(wfns, W_q, V_q):
         """Coulomb-hole:  Σ_COH = +project[ FFT[ G_RI(R) · (W-V)(R) / (2·√Nk) ] ]."""
         s = wfns.slices
-        G_ri = build_G(wfns.xn(s.full), wfns.yr(s.full))
+        # ``sigma_sum``, not ``full``: the Coulomb-hole resolution-of-identity
+        # G IS the Σ band sum, and ``full`` is the LOADED extent
+        # (= max(chi, sigma)).  They are the same slice on every unsplit deck.
+        G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
         return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
                         _convolve(G_ri, W_q - V_q, -0.5))
 
