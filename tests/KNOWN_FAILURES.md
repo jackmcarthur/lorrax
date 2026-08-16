@@ -1433,6 +1433,44 @@ that has nothing to do with what it tests. Any new header on
 (1) is recorded rather than repaired: it is a real 25.7 meV diagnosis and not
 in the symmetry-consolidation scope this branch is doing.
 
+### The QSGW band partition is an unguarded, NON-CONTIGUOUS band cut
+
+Found 2026-08-15 by a shape-based audit of every band-axis truncation in the
+tree, prompted by the owner's degeneracy question.  **Reported, not fixed:
+the fix is a behaviour change to the QSGW Hamiltonian, not a diagnostic.**
+
+`src/gw/scissor.py:238-240` `classify_bands_in_grid` classifies a band as
+in-grid by an **all-k** predicate:
+
+    in_window_kn = (E >= omega_min_ev) & (E <= omega_max_ev)
+    band_in_grid = np.all(in_window_kn, axis=0)
+
+`src/gw/sc_iteration.py:1978-1987` makes that BOTH the `protected_mask` and
+the `in_range_mask`, and `src/gw/band_partition.py:148-151` then zeroes every
+off-diagonal outside `protected × protected`.
+
+**Bands degenerate at one k need not be degenerate at another**, and the
+predicate is all-k, so band `n` can be in-grid while its multiplet partner
+`n+1` is not.  Half a multiplet then carries full off-diagonal Σ and half
+takes a scalar scissor — "not a subspace of anything" — and the result is
+`eigh`'d and reported as QP energies.  This is exactly the hazard the
+degeneracy safeguards exist for, and `band_partition.py` neither imports nor
+mentions `common.band_degeneracy`.
+
+Two things make it invisible today:
+
+- `BandPartition.warn_if_protected_outside_grid` (`band_partition.py:82-101`)
+  checks only `protected & ~in_range`, and the ONE construction in the tree
+  passes the same mask twice (`sc_iteration.py:1986-1987`), so the set is
+  identically empty and **the warning can never fire as wired**.
+- `_check_kstar_spread` (`sc_iteration.py:1180`) runs on `delta_h_qp`
+  **before** the partition is applied at `:1222`, so the star-spread
+  enforcement does not cover the partition boundary at all.
+
+Whoever picks this up: the question is whether the mask should be promoted to
+whole multiplets (which widens the protected set and changes H_qp), or whether
+the partition boundary should merely be reported.  That is an owner call.
+
 ### `tools/gen_input_reference.py` REFUSES to run, so `docs/input_reference.md` is hand-maintained
 
 MEASURED 2026-08-15, incidental to the `sc_on_ibz` default flip. The generator
