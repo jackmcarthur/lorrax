@@ -1108,13 +1108,31 @@ def _star_spread_over_multiplets(sigma_tot_kij_ev, sym, e_dft_ry,
 
     MEASURED on the Si production deck, 2026-08-15: **60 of 60 bands sit
     inside a multiplet** (group sizes 4, 4, 8, 8, 8, 8, 20 — the top twenty
-    are one block with EXACTLY zero gaps), and that is tolerance-insensitive
-    from 1 meV down to 13.6 µeV.  So on that deck there is no band anywhere
-    in the window for which the per-band spread is well defined, and no
-    choice of band CUT can change that.  This is the diagnostic that can
-    tell a gauge artifact from a real symmetry break; the per-band one
-    cannot, and is retained only because it is what the historical figures
-    and the BerkeleyGW comparison are quoted in.
+    are one block with EXACTLY zero gaps), tolerance-insensitive from 1 meV
+    down to 13.6 µeV.  So on that deck there is no band anywhere in the
+    window for which the per-band spread is well defined.
+
+    READ THIS WITH THE DECK'S BAND EDGE IN HAND.  That deck runs
+    ``nband = 60`` on a 62-band WFN, and edge 60 has a min gap over k of
+    **0.000000 meV** — it slices a multiplet in the ζ / Σ band sum.  Move it
+    to a clean edge (40: 818 meV, 36: 157 meV) and every Σ channel's
+    within-star spread goes to **exactly 0.0000**.  So the large numbers this
+    function is used to interpret are a SLICED EDGE first and a band-label
+    gauge second; this diagnostic separates the second from a real symmetry
+    break, and ``boundary_min_gaps`` ON THE FULL MEAN FIELD is what catches
+    the first.
+
+    THE TRAP, because this function's own grouping is exposed to it:
+    ``boundary_min_gaps`` returns ``+inf`` at ``b = nb`` by construction, so
+    handed an already-truncated window it CANNOT see the truncation that
+    produced it — on the 60-band window it calls edge 60 clean, and on the
+    62-band mean field it reports 0.000000 meV.  The ``e_dft_ry`` passed here
+    is the Σ window, so the TOP group of the grouping below is only as
+    trustworthy as the deck's edge; it says nothing about whether that edge
+    was a safe place to stop.
+
+    The per-band metric is retained beside this one because it is what the
+    historical figures and the BerkeleyGW comparison are quoted in.
 
     Returned per band (the multiplet's spread divided by its size) so the two
     vectors are directly comparable element by element.
