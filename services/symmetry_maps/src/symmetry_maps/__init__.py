@@ -217,7 +217,11 @@ from symmetry_maps.orbit_syms import (
     canonicalize_orbit,
     centroid_source_map_and_wrap,
     fft_grid_pullback_perm,
+    grid_point_image_perm,
     orbit_images,
+    r_action_forward,
+    r_action_forward_one,
+    snap_to_grid_and_split_wrap,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
@@ -245,7 +249,10 @@ __all__ = [
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
-    "fft_grid_pullback_perm", "recover_symmorphic_density_point_group",
+    "fft_grid_pullback_perm", "grid_point_image_perm",
+    "r_action_forward", "r_action_forward_one",
+    "snap_to_grid_and_split_wrap",
+    "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
     "CLOSURE_TOL_DEFAULT",

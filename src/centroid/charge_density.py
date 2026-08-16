@@ -191,13 +191,14 @@ def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
     ops = np.asarray(sym_ops, dtype=np.int64).reshape(-1, 3, 3)
     if ops.shape[0] <= 1:
         return f
-    ix, iy, iz = np.meshgrid(*(np.arange(n) for n in N), indexing="ij")
-    n_idx = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1)   # (P,3)
     flat = f.ravel()
     acc = np.zeros_like(flat)
     for M in ops:
-        img = (n_idx @ M.T) % N[None, :]
-        acc += flat[img[:, 0] * (N[1] * N[2]) + img[:, 1] * N[2] + img[:, 2]]
+        # THROUGH THE SERVICE.  This used to open-code the grid permutation
+        # and its radix flatten, byte-identically with the copy inside
+        # ``symmetry_maps.recover_symmorphic_density_point_group`` — the two
+        # were the same eleven characters of index arithmetic in two packages.
+        acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
     return (acc / ops.shape[0]).reshape(f.shape)
 
 

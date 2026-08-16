@@ -29,6 +29,9 @@ from jax import lax
 
 from common import timing
 from . import distribution as dist
+from ffi import _services as _lx_services        # noqa: F401
+_lx_services.ensure_on_path()
+import symmetry_maps as _sym                     # noqa: E402
 
 
 BOHR_TO_ANG = 0.529177210544
@@ -267,7 +270,11 @@ def assign_labels_orbit_chunked(
 
         # Pass 1: orbit distance per (point, rep-in-chunk).
         def sym_loop(s, orbit_d):
-            image_chunk = (rep_chunk @ Rinv[s].T + tau[s])
+            # NO WRAP, deliberately: `_orbit_d2_chunk` is a minimum-image
+            # metric carrying its own explicit offset table, so folding the
+            # image into [0,1) first would put it on the wrong replica.
+            image_chunk = _sym.r_action_forward_one(
+                rep_chunk, Rinv[s], tau[s], wrap=False)
             return jnp.minimum(orbit_d, _orbit_d2_chunk(
                 positions, image_chunk, metric, offsets))
 
@@ -285,7 +292,8 @@ def assign_labels_orbit_chunked(
         winning_rep = rep_chunk[local_c]                           # (P, 3)
 
         def tie_sym_loop(s, tie_mask):
-            image_p = winning_rep @ Rinv[s].T + tau[s]             # (P, 3)
+            image_p = _sym.r_action_forward_one(                   # (P, 3)
+                winning_rep, Rinv[s], tau[s], wrap=False)   # min-image metric
             d2_s = _orbit_d2_per_point(positions, image_p, metric, offsets)
             is_tied = d2_s <= local_d + tie_tol
             return tie_mask.at[:, s].set(is_tied)
@@ -375,7 +383,8 @@ def _orbit_local_update_accumulators(positions, reps, rho, labels, tie_mask,
 
     def sym_body(s, carry):
         sum_wd, sum_w = carry
-        image_p = rep_per_point @ Rinv[s].T + tau[s]            # (P, 3)
+        image_p = _sym.r_action_forward_one(                    # (P, 3)
+            rep_per_point, Rinv[s], tau[s], wrap=False)     # min-image metric
         delta_image = _min_image_delta(
             positions - image_p, metric, offsets
         )                                                        # (P, 3)
@@ -566,7 +575,7 @@ def _orbit_distance_sq(positions, rep, metric, offsets, Rinv, tau):
     ``pbc_distance_sq_single``.
     """
     def body(s, best):
-        image = (rep @ Rinv[s].T + tau[s]) % 1.0
+        image = _sym.r_action_forward_one(rep, Rinv[s], tau[s], wrap=True)
         return jnp.minimum(
             best, pbc_distance_sq_single(positions, image, metric, offsets)
         )
