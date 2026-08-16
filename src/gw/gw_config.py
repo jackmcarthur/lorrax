@@ -824,7 +824,54 @@ _DEFAULTS = {
     # System geometry
     "nval": 5,
     "ncond": 5,
-    "nband": 100,
+    # ── THE BAND-COUNT FAMILY ───────────────────────────────────────────
+    # FOUR keys, ONE resolver (:func:`resolve_band_counts`), and this dict
+    # is the only place a NUMBER lives.
+    #
+    #   number_bands         the umbrella.  Sizes BOTH consumers.  100.
+    #   number_bands_chi     χ0/W screening band count.   None = follow it.
+    #   number_bands_sigma   Σ band-sum count.            None = follow it.
+    #   nband                TRANSITIONAL ALIAS of ``number_bands``.  None.
+    #
+    # WHY THE SPLIT (2026-08-16, owner request).  ``number_bands`` sized two
+    # convergence behaviours that are not the same behaviour, measured on the
+    # Si 4×4×4 SOC deck:
+    #
+    #   * The **Σ** band sum extrapolates.  ``sigma_band_extrapolation``
+    #     fits S_∞ + A/N from three partial sums and takes the truncation
+    #     error from 106.2 meV MAE raw to 18.3 meV at 248 bands — i.e. Σ can
+    #     be run at FEWER bands and corrected.
+    #   * The **χ** band count does not.  Holding Σ fixed and sweeping only
+    #     the screening's band count 40 → 248 moves band-edge Σ_CH by
+    #     50–222 meV, and the last rung 224 → 248 still moves the median
+    #     state by 40.7 meV NON-MONOTONICALLY, so there is no 1/N to fit.
+    #
+    # With one key the two cannot be configured apart, and the study above
+    # had to vary BerkeleyGW's ``epsilon`` count to isolate the W side at
+    # all.  "χ at full bands, Σ at fewer plus extrapolation" is both the
+    # physically right configuration and the cheap one, and this is the pair
+    # of keys that expresses it.
+    #
+    # WHY ``number_bands`` OWNS THE 100 AND ``nband`` IS None.  A default is
+    # a number, and a number must live in exactly one entry or the two spell
+    # different runs the day one of them moves.  ``number_bands`` is the
+    # canonical spelling going forward (owner ruling 2026-08-16: the rest of
+    # the deck migrates to ``number_bands_*`` shortly), so it holds the
+    # value; ``nband`` is ``None`` = "the deck did not say", which is the
+    # only way to tell a deck that pinned the alias from one that never
+    # mentioned it.  Both spellings run; naming BOTH with DIFFERENT values
+    # is a refusal, not a precedence puzzle.
+    #
+    # WHAT THE ISDF ζ FIT GETS: ``max(chi, sigma)``.  The interpolation basis
+    # has to span the pair densities of whichever consumer reaches higher, so
+    # the ψ this run loads spans ``[b0, b4)`` with ``b4`` built from the max
+    # and the SMALLER consumer takes a narrower window inside it.  The winner
+    # is logged (``BandCounts.describe``); a silent ``max`` is a day of
+    # mis-debugging.
+    "number_bands": 100,
+    "number_bands_chi": None,
+    "number_bands_sigma": None,
+    "nband": None,
     # ζ-FIT BAND-WINDOW TOP, decoupled from the χ0/Σ band-sum top
     # (2026-08-11).  ``None`` (the default) means "follow ``nband``", which
     # is what this axis did for its whole history and what keeps every
@@ -843,9 +890,13 @@ _DEFAULTS = {
     # which is not a ζ-basis effect at all.  Set this instead and the band
     # sum keeps its bands.
     #
-    # It only ever NARROWS: ``zeta_nband > nband`` is refused, because the
-    # centroid ψ is loaded once over ``[b0, b4)`` and there is nothing above
-    # b4 to fit.  Its edge takes a STRICT ``band_degeneracy`` check (an
+    # It only ever NARROWS: a ``zeta_nband`` above the ISDF fit's own top —
+    # ``max(number_bands_chi, number_bands_sigma)`` since 2026-08-16 — is
+    # refused, because the centroid ψ is loaded once over ``[b0, b4)`` and
+    # there is nothing above b4 to fit.  (It narrows the fit INSIDE that
+    # window; the χ/Σ split narrows the two band SUMS inside the same
+    # window.  The three are independent and compose.)
+    # Its edge takes a STRICT ``band_degeneracy`` check (an
     # explicit request is a new deck, so there is no census to grandfather):
     # a ζ-fit window that splits a multiplet fits half of an irrep, and ζ is
     # what the IBZ cascade unfolds.  See the ``nband`` entry in
@@ -1486,8 +1537,12 @@ _DEFAULTS = {
     "ppm_invalid_mode": "static_limit",
     # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
     # OFF by default.  ON evaluates the Sigma_c band sum at THREE band
-    # counts in one pass -- nband*{~50%, ~75%, 100%} of the conduction
-    # range, snapped so no cut splits a degenerate multiplet -- by building
+    # counts in one pass -- 80%, 90% and 100% of the TOTAL SIGMA band count
+    # (``number_bands_sigma``, NOT ``number_bands_chi`` and NOT of the
+    # conduction range: see band_extrapolation.BRACKET_FRACTIONS for the
+    # measurement, and note that this line said "~50%, ~75% of the
+    # conduction range" while the code said neither), with the two interior
+    # cuts PREFERRING a multiplet-clean boundary -- by building
     # three DISJOINT band-bracket Green's functions per tau against one
     # W(tau), and fits S(N) = S_inf + A/N to extrapolate to infinite bands.
     # GN-PPM only.  REFUSES BY NAME (never silently disables) when the band
@@ -1607,7 +1662,18 @@ _NULLABLE_BOOL = frozenset()
 #: and a band edge that parsed as ``52.0`` — or, worse, accepted ``52.5``
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
-_NULLABLE_INT = frozenset({"zeta_nband"})
+_NULLABLE_INT = frozenset({
+    "zeta_nband",
+    # The band-count family's three "the deck did not say" slots.  They are
+    # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
+    # distinguishable from any integer a deck could write — and integer for
+    # the same reason too: a band edge that parsed as ``248.0``, or worse
+    # accepted ``248.5`` and truncated it, is a band edge nobody can reason
+    # about.  See ``resolve_band_counts``.
+    "number_bands_chi",
+    "number_bands_sigma",
+    "nband",
+})
 
 #: Keys whose default is None but whose explicit value is a STRING — the
 #: bare ``default is None`` parser branch is the nullable-float one.
@@ -1619,6 +1685,217 @@ _NULLABLE_STR = frozenset({"occ_smearing_family"})
 #: and every real key comes from there, so a name that cannot appear in
 #: ``_DEFAULTS`` cannot collide.  Read once, into ``GWConfig.raw_input_keys``.
 _DECK_NAMED_KEYS = "_deck_named_keys"
+
+#: Reserved slot holding the resolved :class:`BandCounts`.  Same convention
+#: and the same reason as ``_DECK_NAMED_KEYS``: resolution happens ONCE, in
+#: ``read_lorrax_input``, and the answer travels in the params dict rather
+#: than being re-derived by every consumer.  Re-deriving it would not even be
+#: possible after the fact — ``read_lorrax_input`` MIRRORS the resolved load
+#: top back onto ``params["nband"]`` for the tools that read the dict
+#: directly, which erases the distinction a second resolution would need.
+_BAND_COUNTS = "_band_counts"
+
+
+# ---------------------------------------------------------------------------
+#  Band counts: one resolver, one precedence, four keys
+# ---------------------------------------------------------------------------
+
+class BandCountConflict(ValueError):
+    """Two band-count keys were set and they disagree.
+
+    Refusal, not coercion.  Every silent resolution of this case is wrong for
+    somebody: picking the umbrella throws away the specific request the deck
+    took the trouble to write, picking the specific makes the umbrella a lie
+    for the OTHER consumer, and picking the max or the min invents a run
+    nobody asked for.  So it is named, with both values quoted and the edit
+    that fixes it spelled out.
+    """
+
+
+@dataclass(frozen=True)
+class BandCounts:
+    """The resolved χ and Σ band counts, and what the ISDF fit is sized by.
+
+    Constructed exactly once per run, by :func:`resolve_band_counts`.  The
+    only three numbers below this point are :attr:`chi`, :attr:`sigma` and
+    :attr:`isdf`; nothing downstream re-reads a deck key to get a band count.
+
+    Attributes
+    ----------
+    chi, sigma : int
+        The χ0/W band count and the Σ band-sum count, both fully resolved
+        (never ``None``): a deck that names only the umbrella gets them equal
+        to it, which is the whole of the bit-identity claim.
+    isdf : int
+        ``max(chi, sigma)`` — the top of the band window the ψ is loaded over
+        and therefore the window the ISDF ζ fit is built for.  The
+        interpolation basis has to span the pair densities of whichever
+        consumer reaches higher; sizing it by the smaller one would leave the
+        larger consumer extrapolating in the ζ basis.
+    named : frozenset[str]
+        Which of the four keys the DECK itself wrote.  Kept so consumers can
+        distinguish "asked for this edge by name" (→ strict degeneracy check,
+        the ``zeta_nband`` precedent) from "inherited it" (→ the grandfather
+        clause), without re-parsing the deck.
+    """
+
+    chi: int
+    sigma: int
+    named: frozenset = frozenset()
+
+    @property
+    def isdf(self) -> int:
+        """Band-window top the ISDF ζ fit is built for: ``max(chi, sigma)``."""
+        return max(self.chi, self.sigma)
+
+    @property
+    def isdf_source(self) -> str:
+        """Which count won the ``max``: ``"chi"``, ``"sigma"`` or ``"tied"``."""
+        if self.chi > self.sigma:
+            return "chi"
+        if self.sigma > self.chi:
+            return "sigma"
+        return "tied"
+
+    @property
+    def split(self) -> bool:
+        """True when the two consumers were given DIFFERENT counts."""
+        return self.chi != self.sigma
+
+    def describe(self) -> str:
+        """The one line a run logs so the ``max`` is never silent.
+
+        Named in the brief that asked for the split: "log which count won the
+        ``max`` and what the fit was built for.  A silent ``max`` is the kind
+        of thing that gets mis-debugged for a day."
+        """
+        if not self.split:
+            return (f"band counts: chi = sigma = {self.chi}; ISDF zeta fit "
+                    f"sized for {self.isdf} bands (the two counts are TIED, "
+                    f"so the fit spans both)")
+        return (f"band counts: chi = {self.chi}, sigma = {self.sigma}; ISDF "
+                f"zeta fit sized for {self.isdf} bands, SET BY "
+                f"number_bands_{self.isdf_source} (the larger); the smaller "
+                f"count ({min(self.chi, self.sigma)}) does NOT size the fit")
+
+
+#: The umbrella key and its transitional alias, canonical spelling first.
+_UMBRELLA_KEYS = ("number_bands", "nband")
+
+#: Consumer key -> the attribute it resolves into.
+_SPECIFIC_KEYS = {"number_bands_chi": "chi", "number_bands_sigma": "sigma"}
+
+
+def resolve_band_counts(params: dict, deck_named=None) -> BandCounts:
+    """Resolve the four band-count keys into one :class:`BandCounts`.
+
+    **THE ONLY PLACE THIS PRECEDENCE EXISTS.**  Four keys with two spellings
+    of the umbrella is exactly the shape that grows a second, disagreeing
+    resolution in a consumer six weeks later, so there is one function, it is
+    pure, and it is directly testable without a deck, a WFN or jax.
+
+    PRECEDENCE, in order:
+
+    1. ``nband`` is a TRANSITIONAL ALIAS of ``number_bands``.  Either
+       spelling sets the umbrella.  Both set to DIFFERENT values → refuse
+       (:class:`BandCountConflict`).
+    2. The umbrella supplies BOTH consumers.  A deck that names only it —
+       every deck in the tree today — gets ``chi == sigma == umbrella``, and
+       that is the bit-identity claim.
+    3. ``number_bands_chi`` / ``number_bands_sigma`` override their own
+       consumer and nothing else.
+    4. Naming the umbrella AND a specific key with DIFFERENT values → refuse.
+       "The umbrella overrides both" and "a specific key overrides its
+       consumer" are both true and they contradict each other exactly here;
+       this codebase has been bitten repeatedly by silent coercion, so the
+       contradiction is reported rather than broken by fiat.  Naming them
+       with the SAME value is redundant, not wrong, and is accepted.
+
+    Parameters
+    ----------
+    params : dict
+        A params dict from :func:`read_lorrax_input`, or any dict with the
+        same keys.  Missing keys fall back to ``_DEFAULTS``.
+    deck_named : iterable of str, optional
+        The keys the deck itself wrote.  Defaults to
+        ``params[_DECK_NAMED_KEYS]`` and then to "every key whose value is
+        not None", so a hand-made dict behaves sensibly.  This is what
+        separates "set to 100" from "defaulted to 100": without it a deck
+        that pinned ``number_bands = 100`` beside ``number_bands_chi = 248``
+        would be indistinguishable from one that pinned neither, and rule 4
+        could not fire.
+    """
+    if deck_named is None:
+        deck_named = params.get(_DECK_NAMED_KEYS)
+    if deck_named is None:
+        # No provenance supplied (a hand-made params dict).  "Present with a
+        # non-None value" is the best available proxy — and it is read WITHOUT
+        # the ``_DEFAULTS`` fallback, so a dict that simply omits a key is not
+        # credited with naming it.
+        deck_named = {k for k in (_UMBRELLA_KEYS + tuple(_SPECIFIC_KEYS))
+                      if params.get(k) is not None}
+    named = frozenset(str(k).lower() for k in deck_named)
+
+    def _val(key):
+        v = params.get(key, _DEFAULTS.get(key))
+        return None if v is None or v == "" else int(v)
+
+    # --- 1. umbrella, from either spelling -----------------------------
+    # A key's VALUE is only consulted when the deck NAMED it.  Reading
+    # ``number_bands`` unconditionally would let its default (100) outrank an
+    # explicit ``nband = 248``, which is the alias silently not working —
+    # exactly the failure the alias exists to prevent.
+    canonical, alias = _UMBRELLA_KEYS
+    u_canonical = _val(canonical) if canonical in named else None
+    u_alias = _val(alias) if alias in named else None
+    if (u_canonical is not None and u_alias is not None
+            and u_canonical != u_alias):
+        raise BandCountConflict(
+            f"the deck sets BOTH `{canonical} = {u_canonical}` and the "
+            f"transitional alias `{alias} = {u_alias}`, and they disagree.  "
+            f"`{alias}` is an accepted spelling of `{canonical}`, not a "
+            f"second axis, so there is no rule that makes one of these win "
+            f"without discarding the other.  Delete one of the two lines "
+            f"(keep `{canonical}` — `{alias}` is transitional).")
+    umbrella = u_canonical if u_canonical is not None else u_alias
+    umbrella_named = umbrella is not None
+    if umbrella is None:
+        umbrella = int(_DEFAULTS[canonical])
+
+    # --- 2/3/4. the two consumers --------------------------------------
+    resolved = {}
+    for key, attr in _SPECIFIC_KEYS.items():
+        v = _val(key)
+        if key not in named or v is None:
+            resolved[attr] = umbrella          # rule 2
+            continue
+        if umbrella_named and v != umbrella:   # rule 4
+            which = canonical if canonical in named else alias
+            other = "sigma" if attr == "chi" else "chi"
+            raise BandCountConflict(
+                f"the deck sets the umbrella `{which} = {umbrella}` AND "
+                f"`{key} = {v}`, and they disagree.  `{which}` sets BOTH "
+                f"band counts, so this deck says the {attr} count is "
+                f"{umbrella} and also that it is {v}.  Pick one of:\n"
+                f"    - drop `{which}` and set `number_bands_chi` / "
+                f"`number_bands_sigma` explicitly (both of them — whichever "
+                f"you leave out falls back to the umbrella default "
+                f"{int(_DEFAULTS[canonical])}, which is almost certainly not "
+                f"what you meant);\n"
+                f"    - drop `{key}` and run both consumers at {umbrella};\n"
+                f"    - keep `{which} = {v}` if {v} is what you meant for "
+                f"the {other} count too.\n"
+                f"Nothing is coerced here: silently preferring either value "
+                f"would run a calculation this deck did not describe.")
+        resolved[attr] = v                     # rule 3
+
+    for attr, v in resolved.items():
+        if v < 1:
+            raise ValueError(
+                f"number_bands_{attr} = {v} is not a band count; it must be "
+                f">= 1.")
+    return BandCounts(chi=int(resolved["chi"]), sigma=int(resolved["sigma"]),
+                      named=named & (set(_UMBRELLA_KEYS) | set(_SPECIFIC_KEYS)))
 
 
 # ---------------------------------------------------------------------------
@@ -1926,6 +2203,29 @@ def read_lorrax_input(filename: str) -> dict:
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
+
+    # --- Band counts: resolve ONCE, here ------------------------------
+    # ``number_bands`` / ``number_bands_chi`` / ``number_bands_sigma`` /
+    # ``nband`` collapse into two numbers plus their max, and this is the
+    # only call to the resolver on the deck path.  Resolving here rather
+    # than in ``LorraxConfig`` is what lets the params dict stay honest for
+    # the tools that read it directly (``bandstructure.htransform``,
+    # ``psp.get_DFT_mtxels``, ``gw.kin_ion_io``, ``file_io.epsreader``):
+    # they ask for ``params["nband"]`` and must get the LOADED band extent,
+    # which after the split is ``max(chi, sigma)`` — the same number they
+    # always got on an unsplit deck.
+    #
+    # The mirror is why this is not idempotent and why the answer is
+    # cached in ``params[_BAND_COUNTS]`` instead of being re-derived: after
+    # the write-back, ``nband`` no longer says what the DECK said, so a
+    # second ``resolve_band_counts`` on this dict would see an umbrella that
+    # the deck never wrote.
+    _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
+    params[_BAND_COUNTS] = _counts
+    params["number_bands_chi"] = _counts.chi
+    params["number_bands_sigma"] = _counts.sigma
+    params["number_bands"] = _counts.isdf
+    params["nband"] = _counts.isdf
 
     # Parse optional QE K_POINTS block
     if kp_idx is not None:
@@ -2613,7 +2913,18 @@ class LorraxConfig:
     # --- System geometry (top-level; hot path) ---
     nval: int
     ncond: int
+    #: The LOADED band extent = ``bands.isdf`` = ``max(chi, sigma)``.  On
+    #: every deck that names only the umbrella (or only the transitional
+    #: ``nband`` alias) this is exactly the umbrella, which is why the whole
+    #: tree reads unchanged.  On a SPLIT deck it is the larger of the two
+    #: counts: the ψ is loaded once over ``[b0, b4)`` and the smaller
+    #: consumer takes a narrower window inside it.  A consumer that wants
+    #: "how many bands does χ0 sum" or "how many does Σ sum" must ask
+    #: ``bands.chi`` / ``bands.sigma``, never this field.
     nband: int
+    #: The resolved band-count family.  See :func:`resolve_band_counts` for
+    #: the precedence and :meth:`BandCounts.describe` for the log line.
+    bands: BandCounts
     #: ζ-fit band-window top.  ``None`` == follow ``nband`` (every deck
     #: written before 2026-08-11); an int NARROWS the ζ fit's band ranges
     #: without touching ``b4``, the χ0/Σ band-sum top.  See ``_DEFAULTS``.
@@ -3409,32 +3720,47 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
-        # ζ-fit window top.  Empty / unset / equal-to-nband all collapse to
-        # None — "follow nband" — so the decoupled branch in
+        # BAND COUNTS.  ``read_lorrax_input`` already resolved them (once) and
+        # left the answer in the params dict; a hand-made dict that never went
+        # through the parser gets resolved here instead.  Either way there is
+        # exactly one ``resolve_band_counts`` call per config.
+        _bands = params.get(_BAND_COUNTS)
+        if not isinstance(_bands, BandCounts):
+            _bands = resolve_band_counts(params)
+
+        # ζ-fit window top.  Empty / unset / equal-to-the-ISDF-top all collapse
+        # to None — "follow the loaded window" — so the decoupled branch in
         # ``gw.gw_init.fit_zeta`` is not entered at all and the fit is
         # bit-identical (b4 is the PADDED edge; a redundant zeta_nband=nband
-        # must not silently un-pad it).
+        # must not silently un-pad it).  The bound is ``bands.isdf``, i.e.
+        # max(chi, sigma): that is the window the ψ is loaded over and so the
+        # only window there is anything to fit inside.
         _zeta_nband_raw = _g("zeta_nband")
         if _zeta_nband_raw in (None, ""):
             _zeta_nband = None
         else:
             _zeta_nband = int(_zeta_nband_raw)
-            if _zeta_nband < 1 or _zeta_nband > int(_g("nband")):
+            if _zeta_nband < 1 or _zeta_nband > _bands.isdf:
                 raise ValueError(
-                    f"zeta_nband={_zeta_nband} must be in [1, nband="
-                    f"{int(_g('nband'))}].  It NARROWS the band window ζ is "
-                    f"fitted on; it cannot widen it, because the centroid ψ "
-                    f"this run loads spans [b0, b4) and there are no bands "
-                    f"above b4 to fit.  Raise nband if you want more bands in "
-                    f"the fit AND in the chi0/Sigma band sum.")
-            if _zeta_nband == int(_g("nband")):
+                    f"zeta_nband={_zeta_nband} must be in [1, {_bands.isdf}] "
+                    f"— the ISDF fit's band-window top, which is "
+                    f"max(number_bands_chi={_bands.chi}, "
+                    f"number_bands_sigma={_bands.sigma}).  zeta_nband NARROWS "
+                    f"the band window ζ is fitted on; it cannot widen it, "
+                    f"because the centroid ψ this run loads spans [b0, b4) "
+                    f"and there are no bands above b4 to fit.  Raise "
+                    f"number_bands (or whichever of number_bands_chi / "
+                    f"number_bands_sigma is the larger) if you want more "
+                    f"bands in the fit AND in the band sum that owns them.")
+            if _zeta_nband == _bands.isdf:
                 _zeta_nband = None
 
         return cls(
             # Top-level: system + mode flags
             nval=int(_g("nval")),
             ncond=int(_g("ncond")),
-            nband=int(_g("nband")),
+            nband=int(_bands.isdf),
+            bands=_bands,
             zeta_nband=_zeta_nband,
             sys_dim=int(_g("sys_dim")),
             density_self_consistent=bool(_g("density_self_consistent")),

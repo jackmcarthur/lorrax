@@ -388,8 +388,14 @@ def plan_band_brackets(
     n_occ : int
         Occupied bands in the Σ band sum (``b2 - b0``).
     nb_logical, nb_padded : int
-        Real and mesh-padded band counts of the sum (``b4_user - b0`` and
-        ``b4 - b0``).  The last bracket runs to ``nb_padded`` so the plan
+        Real and mesh-padded band counts **of the Σ band sum** —
+        ``b4_sigma - b0`` in both cases, with ``b4_sigma`` carrying the mesh
+        pad only when Σ is the LARGER of the two counts (``common.meta``).
+        **Never the χ count and never the loaded extent.**  Since 2026-08-16
+        those are three different numbers on a split deck: the ψ is loaded
+        over ``max(chi, sigma)`` and Σ sums a window inside it, so reading
+        ``b_id_4_user`` / ``s.nb_full`` here would bracket a curve this run
+        never evaluates.  The last bracket runs to ``nb_padded`` so the plan
         still covers every band the un-bracketed path summed; the pad bands
         contribute exactly zero, so ``counts`` stays logical.
 
@@ -419,12 +425,15 @@ def plan_band_brackets(
         raise BandExtrapolationRefused(
             f"sigma_band_extrapolation = true, but the Σ_c band sum has "
             f"n_cond = {n_cond} unoccupied bands against n_occ = {n_occ} "
-            f"occupied ones (nband = {nb_logical}).  The feature extrapolates "
-            f"the UNOCCUPIED tail, and it is only meaningful when that tail "
-            f"is the larger part of the sum: it requires n_cond > n_occ.  "
-            f"Raise the deck's `nband` to at least {2 * n_occ + 1} "
-            f"(n_occ is set by the electron count, not by a deck key), or "
-            f"set sigma_band_extrapolation = false.")
+            f"occupied ones (number_bands_sigma = {nb_logical}).  The feature "
+            f"extrapolates the UNOCCUPIED tail, and it is only meaningful "
+            f"when that tail is the larger part of the sum: it requires "
+            f"n_cond > n_occ.  Raise the deck's `number_bands_sigma` (or the "
+            f"umbrella `number_bands`, which sets it) to at least "
+            f"{2 * n_occ + 1} (n_occ is set by the electron count, not by a "
+            f"deck key), or set sigma_band_extrapolation = false.  Raising "
+            f"`number_bands_chi` will NOT help: this feature brackets the Σ "
+            f"band sum and never reads the χ count.")
 
     e = np.asarray(enk_ry, dtype=np.float64)[:, :nb_logical]
     if e.ndim != 2 or e.shape[1] != nb_logical:
@@ -539,12 +548,15 @@ def plan_band_brackets(
         raise BandExtrapolationRefused(
             f"sigma_band_extrapolation: the three band counts collapsed onto "
             f"{counts} (requested {requested + (nb_logical,)} from fractions "
-            f"{tuple(fractions)} of nband = {nb_logical}).  Three DISTINCT, "
-            f"ascending counts are required — two coincident points cannot "
-            f"determine a two-parameter fit.  At nband = {nb_logical} the "
-            f"sampling fractions are less than one band apart.  Raise the "
-            f"deck's `nband` to at least {need}, or set "
-            f"sigma_band_extrapolation = false.")
+            f"{tuple(fractions)} of number_bands_sigma = {nb_logical}).  "
+            f"Three DISTINCT, ascending counts are required — two coincident "
+            f"points cannot determine a two-parameter fit.  At "
+            f"number_bands_sigma = {nb_logical} the sampling fractions are "
+            f"less than one band apart.  Raise the deck's "
+            f"`number_bands_sigma` (or the umbrella `number_bands`, which "
+            f"sets it) to at least {need}, or set "
+            f"sigma_band_extrapolation = false.  `number_bands_chi` is not "
+            f"the count these fractions are of.")
 
     bounds = tuple(
         (int(a), int(b)) for a, b in

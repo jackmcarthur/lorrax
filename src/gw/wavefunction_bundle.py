@@ -47,6 +47,23 @@ class BandSlices:
         b3  end of the sigma/QP evaluation window
         b4  highest band (end of full computational window)
 
+    Two further edges since 2026-08-16, the χ / Σ band-count split:
+        b4_chi    top of the χ0/W band sum   (``number_bands_chi``)
+        b4_sigma  top of the Σ band sum      (``number_bands_sigma``)
+
+    ``b4`` is ``max(b4_chi, b4_sigma)`` PADDED to the world size — the extent
+    the ψ is loaded over and therefore the window the ISDF ζ fit is built
+    for.  On an unsplit deck all three coincide and every slice below is
+    exactly what it was before the split existed.
+
+    **``full`` IS NOT THE Σ BAND SUM.**  It is the ALLOCATION extent: what
+    was loaded, what ζ was fitted on, what the four ψ copies are shaped by.
+    Before the split those were the same number as the Σ sum and the name
+    got used for both.  The Σ band sum is :attr:`sigma_sum`; the χ0
+    conduction leg is :attr:`cond`.  A consumer that reaches for ``full`` to
+    mean "the bands my sum runs over" is asking for the larger consumer's
+    count and will silently ignore the split.
+
     All slices are LOCAL (relative to b0).
     """
     b0: int
@@ -54,33 +71,83 @@ class BandSlices:
     b2: int
     b3: int
     b4: int
-    val:   slice   # [0, b2-b0)       valence
-    cond:  slice   # [b2-b0, b4-b0)   conduction
-    sigma: slice   # [0, b3-b0)       QP evaluation window
-    full:  slice   # [0, b4-b0)       all bands
-    occ:   slice   # [0, b2-b0)       occupied
+    val:   slice   # [0, b2-b0)          valence
+    cond:  slice   # [b2-b0, b4_chi-b0)  chi0 conduction leg
+    sigma: slice   # [0, b3-b0)          QP evaluation window
+    full:  slice   # [0, b4-b0)          everything LOADED (== the ISDF window)
+    occ:   slice   # [0, b2-b0)          occupied
+    b4_chi: int = 0        # 0 == "not split": resolves to b4
+    b4_sigma: int = 0
+    sigma_sum: slice = slice(0, 0)   # [0, b4_sigma-b0)  the Sigma band sum
+    #: [b2-b0, b4-b0) — conduction bands over the LOADED window, i.e. the
+    #: UNION of what χ0 and Σ reach.  Exactly ``cond`` on an unsplit deck.
+    #: Its one consumer is the minimax τ-axis (``build_static_quadrature``),
+    #: which certifies a 1/x rule on ``[x_min, x_max]`` and is then reused by
+    #: BOTH stages: an interval built from the χ conduction top alone would
+    #: not cover Σ's transitions on a deck whose Σ count is the larger one,
+    #: and the resulting quadrature error is invisible at the seam that
+    #: caused it.
+    cond_all: slice = slice(0, 0)
 
     @classmethod
-    def from_band_edges(cls, b0: int, b1: int, b2: int, b3: int, b4: int) -> BandSlices:
+    def from_band_edges(cls, b0: int, b1: int, b2: int, b3: int, b4: int,
+                        *, b4_chi: int | None = None,
+                        b4_sigma: int | None = None) -> BandSlices:
         if not (b0 <= b1 <= b2 <= b3 <= b4):
             raise ValueError(f"Invalid band edges: {(b0, b1, b2, b3, b4)}")
         nb_full = b4 - b0
+        b4_chi = b4 if b4_chi in (None, 0) else int(b4_chi)
+        b4_sigma = b4 if b4_sigma in (None, 0) else int(b4_sigma)
+        for name, edge in (("b4_chi", b4_chi), ("b4_sigma", b4_sigma)):
+            if not (b2 <= edge <= b4):
+                raise ValueError(
+                    f"Invalid {name}={edge}: it is a band-sum top inside the "
+                    f"loaded window and must satisfy b2={b2} <= {name} <= "
+                    f"b4={b4}.  (Below b2 the sum would not reach the first "
+                    f"unoccupied band; above b4 there is no loaded ψ.)")
+        if max(b4_chi, b4_sigma) != b4:
+            raise ValueError(
+                f"Invalid split: max(b4_chi={b4_chi}, b4_sigma={b4_sigma}) = "
+                f"{max(b4_chi, b4_sigma)} != b4={b4}.  b4 is the PADDED top "
+                f"of the larger consumer, so the larger consumer must own it "
+                f"exactly; see common.meta.Meta.from_system.")
         return cls(
             b0=b0, b1=b1, b2=b2, b3=b3, b4=b4,
             val=slice(0, b2 - b0),
-            cond=slice(b2 - b0, nb_full),
+            cond=slice(b2 - b0, b4_chi - b0),
             sigma=slice(0, b3 - b0),
             full=slice(0, nb_full),
             occ=slice(0, b2 - b0),
+            b4_chi=b4_chi,
+            b4_sigma=b4_sigma,
+            sigma_sum=slice(0, b4_sigma - b0),
+            cond_all=slice(b2 - b0, nb_full),
         )
 
     @property
     def nb_full(self) -> int:
+        """Bands LOADED (== the ISDF ζ-fit window).  Not the Σ sum."""
         return self.b4 - self.b0
 
     @property
     def nb_sigma(self) -> int:
+        """Bands in the QP EVALUATION window (b3-b0).  Not the Σ band sum."""
         return self.b3 - self.b0
+
+    @property
+    def nb_chi(self) -> int:
+        """Bands in the χ0/W band sum."""
+        return self.b4_chi - self.b0
+
+    @property
+    def nb_sigma_sum(self) -> int:
+        """Bands in the Σ band sum (the count the extrapolation brackets)."""
+        return self.b4_sigma - self.b0
+
+    @property
+    def is_split(self) -> bool:
+        """True when χ and Σ were given different band counts."""
+        return self.b4_chi != self.b4_sigma
 
     @property
     def sigma_range(self) -> tuple[int, int]:
@@ -89,7 +156,7 @@ class BandSlices:
 
     @property
     def full_range(self) -> tuple[int, int]:
-        """Global (start, end) for full band window: (b0, b4)."""
+        """Global (start, end) for the LOADED band window: (b0, b4)."""
         return (self.b0, self.b4)
 
 
