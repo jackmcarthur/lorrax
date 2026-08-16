@@ -56,7 +56,11 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
-    psi_coh_xn, psi_coh_yr = wfns.xn(s.full), wfns.yr(s.full)
+    # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
+    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
+    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
+    # wired for consistency and has never executed under a split.
+    psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
@@ -167,6 +171,12 @@ def integrate_sigma_store(
 def _branches(wfns, omega, efermi_ry, occupation_state=None):
     """The four causal branches, with occupation and energy kept separate.
 
+    Band axis is ``slices.sigma_sum`` -- the Sigma band count, not the
+    chi one -- for the same reason as the psi slices above: these index
+    the SAME band axis the causal branches sum over.  That choice is
+    orthogonal to the occupation one below: the slice says WHICH bands
+    are summed, the weights say with what amplitude.
+
     ``occupation_state=None`` is the incumbent insulating semantics,
     bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
     With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
@@ -177,8 +187,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     (docs/theory/finite-occupation-screening.md).
     """
     if occupation_state is None:
-        energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
-        occupied = wfns.occ[:, wfns.slices.full] > 0.5
+        energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
+        occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
         # Do not clip these distances at zero.  In a small-gap or inverted
         # system an unoccupied state may sit below E_F (or an occupied state
         # above it); occupation still chooses the band sum.  A cell whose
@@ -195,8 +205,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
-                    wfns.enk.shape)[:, wfns.slices.full]
-    energy = wfns.enk[:, wfns.slices.full] - mu
+                    wfns.enk.shape)[:, wfns.slices.sigma_sum]
+    energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),

@@ -335,7 +335,10 @@ def test_snapping_never_starves_a_later_cut():
 
 
 def test_refuses_only_when_the_fractions_themselves_collapse():
-    """The surviving refusal names nband, because nband is what fixes it."""
+    """The surviving refusal names the SIGMA count, because that is what
+    fixes it.  Since the chi/Sigma split (2026-08-16) "raise nband" is not
+    actionable advice on a deck whose two counts differ, and raising the CHI
+    count would not move a single bracket."""
     nk, nb = 4, 3
     e = np.tile(np.linspace(1.0, 2.0, nb), (nk, 1))
     with pytest.raises(BandExtrapolationRefused) as exc:
@@ -343,7 +346,9 @@ def test_refuses_only_when_the_fractions_themselves_collapse():
                            nb_logical=nb, nb_padded=nb,
                            fractions=(0.80, 0.90))
     msg = str(exc.value)
-    assert "DISTINCT" in msg and "nband" in msg
+    assert "DISTINCT" in msg and "number_bands_sigma" in msg
+    assert "number_bands_chi" in msg, (
+        "the refusal must say which count does NOT fix it")
     assert "0.8" in msg, "the refusal must show the fractions it used"
 
 
@@ -356,7 +361,10 @@ def test_refuses_when_ncond_le_nval():
     msg = str(exc.value)
     assert "sigma_band_extrapolation" in msg
     assert "n_cond" in msg and "n_occ" in msg
-    assert "nband" in msg, "the refusal must name the knob that fixes it"
+    assert "number_bands_sigma" in msg, \
+        "the refusal must name the knob that fixes it"
+    assert "number_bands_chi" in msg, \
+        "...and the one that does not"
 
 
 def test_disabled_returns_the_trivial_single_bracket_plan():
