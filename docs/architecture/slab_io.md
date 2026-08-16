@@ -100,8 +100,8 @@ rank that skips one call deadlocks the rest with no traceback
 
 ## One HDF5 library per file {#one-owner}
 
-*Measured 2026-08-15, JID 57038615, metallic MPA-QSGW on 4 A100. Landed as
-`c1563a25` + `81c99c95` on `integ/metal-mpa-qsgw-2026-08-15`. Owner:
+*Measured 2026-08-15, JID 57038615, metallic MPA-QSGW on 4 A100. On branch
+`integ/metal-mpa-qsgw-2026-08-15` as `c1563a25` + `81c99c95`. Owner:
 `src/file_io/hdf5_owner.py`; hazard class recorded by the sandbox as
 claims/0110, by the audits as A1.*
 
@@ -227,8 +227,8 @@ clean** — that acceptance test exists today.
 ## The operation journal {#journal}
 
 *Spec: `reports/metal_mpa_plan_2026-08-15/SLAB_IO_ROOT_CAUSE_AUDIT.md` §C.
-Implementation `src/file_io/h5_journal.py`, LANDED as `18bb48ea` on
-`integ/metal-mpa-qsgw-2026-08-15`. Knob spellings and defaults are the
+Implementation `src/file_io/h5_journal.py`, on branch
+`integ/metal-mpa-qsgw-2026-08-15` as `18bb48ea`. Knob spellings and defaults are the
 [env registry](../dev/env_vars.md)'s; they are repeated here because a
 debugger reading this page at 3am should not have to open a second one.
 The fingerprints in [Failure modes](#failures) below name the lines it
@@ -961,7 +961,7 @@ hypothesis explains all three:
   widen the window, and this pipeline's churn is measured at [1027
   cross-library alternations per iteration](#alternations).
 
-**Fix (B1), LANDED as `ef98d47f`:** `copy_index_to_host` takes the XLA
+**Fix (B1), on branch `integ/metal-mpa-qsgw-2026-08-15` as `ef98d47f`:** `copy_index_to_host` takes the XLA
 stream the handler already receives (`LRX_STREAM_PARAM`); the CUDA arm
 becomes `cudaMemcpyAsync(dst, src, n, D2H, xla_stream)` followed by
 `cudaStreamSynchronize(xla_stream)`. Eleven call sites (eight read, three
@@ -969,7 +969,7 @@ write). **The host arm is unchanged and the host leg was never affected**
 — there the buffer is already host-resident, so `copy_index_to_host`
 degrades to a `memcpy` and there is no stream to race.
 
-**Fix (B2), LANDED as `15eef55f`:** a mutex-guarded registry of live
+**Fix (B2), on branch `integ/metal-mpa-qsgw-2026-08-15` as `15eef55f`:** a mutex-guarded registry of live
 `PhdfCtx*` in `context.cc` (`register_live_ctx` at open,
 `unregister_live_ctx` at close), consulted by `shard_index.h`'s
 `check_live_ctx` on the value that came off the copy and **before anything
