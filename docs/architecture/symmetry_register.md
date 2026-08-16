@@ -523,76 +523,122 @@ the tests that establish closure behaviour.
 (`centroids_frac_960_orbitclosed.txt`, `closed=True` at 1.000e-06 on 48 ops,
 same count, same deck) moved the within-star Σ spread only 2.611 → 1.964 meV at
 the compared bands and 41.34 → 39.88 meV over the full window (**both figures
-are the PER-BAND metric, since measured to be ~84 % band-label gauge — see
-"THE 41.34 meV IS 84 % A BAND-LABEL ARTIFACT" below**) — while making
+are the PER-BAND metric AT A SLICED BAND EDGE, and are WITHDRAWN as evidence
+about closure — see "THE SI STAR SPREAD IS A BAND-SLICING ARTIFACT" below;
+both arms go to 0.0000 at a clean edge**) — while making
 BerkeleyGW agreement ~35× worse (sigTOT MAE 0.4329 → 14.9426 meV). Forcing
 closure did not fix the symptom it was believed to cause.
 
-## THE 41.34 meV IS 84 % A BAND-LABEL ARTIFACT — MEASURED 2026-08-15
+## THE SI STAR SPREAD IS A BAND-SLICING ARTIFACT — and the slice is in the DECK
 
-**Read this before quoting any star-spread number on this page.** The owner's
-hypothesis was that the star-spread ladder is an artifact of cutting through
-degenerate multiplets. **It is — but not through the CUT.** Two separate
-measurements, and they point in opposite directions:
+**Read this before quoting any star-spread number on this page.** Two lanes
+measured this on 2026-08-15 and the answers only look contradictory. Both are
+right; they varied different things.
 
-**1. The cut is innocent.** Restricting the ladder to degeneracy-clean cuts
-changes nothing. On the Si production deck the clean boundaries are
-`{8, 16, 20, 28, 36, 40}` — so the ladder's own rungs 8, 16, 40 and 60 are
-ALREADY clean, and only 24 is split. Dropping 24 changes no value (24 and the
-clean 28 both read 7.267). Tolerance-insensitive from 1 meV to 13.6 µeV.
+### The deck's `nband` edge is the cause, and it slices at ZERO gap
 
-**2. The band LABEL is not.** Inside a degenerate multiplet any unitary mixing
-of the subspace is an equally valid eigenbasis, so a per-band `Re Σ_bb` is not
-symmetry-invariant at all, while the TRACE over the multiplet is. **On this
-deck 60 of 60 bands sit inside a multiplet** (groups of 4, 4, 8, 8, 8, 8 and
-one of **20**), so there is no band anywhere in the window for which the
-per-band spread is well defined, and no choice of cut can change that.
-Measured, per group:
+`si_cohsex_debug` runs `nband = 60` on a WFN carrying **62** bands. Measured
+with `boundary_min_gaps` on the FULL mean field:
+
+| edge | min gap over k | clean? |
+|---|---|---|
+| 8 | 2540.408 meV | yes |
+| 16 | 283.348 | yes |
+| 20 | 228.290 | yes |
+| **24** | **0.000000** | **no** |
+| 28 | 393.797 | yes |
+| 36 | 156.992 | yes |
+| 40 | 818.241 | yes |
+| **60 — the deck's own edge** | **0.000000** | **no** |
+
+Holding the centroid set, `zeta_rcond` and P fixed and moving ONLY that edge,
+the within-star Σ spread goes to **exactly zero** (the other lane's
+measurement):
+
+| `nband` | edge gap | sigSX | sigCOH | sigTOT | V_H |
+|---|---|---|---|---|---|
+| 60 | **0 meV — slices** | 0.0270 | 1.9570 | 1.9430 | 0.0990 |
+| 40 | 818 meV clean | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+| 36 | 157 meV clean | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+
+**So the spread is a truncated-multiplet artifact in the ζ / Σ BAND SUM, not
+a property of the centroid set and not an artifact of the measurement.** The
+measuring instrument in that experiment uses no symmetry code and returns
+exact zeros on the same files at a clean edge.
+
+### THE TRAP THAT MADE THIS LOOK CLEAN — do not repeat it
+
+`boundary_min_gaps` returns `+inf` at `b = nb` by construction: within the
+array it is handed, the outer boundary cuts nothing. **So applied to an
+already-truncated window it CANNOT see the truncation that produced it.** On
+the 60-band Σ window it reports edge 60 as `+inf`, i.e. clean, while the same
+function on the 62-band mean field reports **0.000000 meV**. Measured, both
+numbers, same deck, same session.
+
+The first lane's analysis varied the REPORTING cut (the max over the first
+`n` entries of a fixed 60-band per-band vector) and correctly found that
+restricting to clean cuts changes nothing — 8, 16, 40 are already clean and
+only 24 is split. That conclusion is right about the reporting cut and says
+nothing about the deck's edge, which is the one that matters.
+
+**Rule: give `boundary_min_gaps` the FULL mean field, never the window you
+are about to slice out of it.**
+
+### The per-band spread is a sharp instrument, now that this is known
+
+At a clean band edge the per-band star spread reads **exactly 0.0000**, not
+"small". That makes it a discriminating check rather than a noisy one: any
+non-zero value is either a sliced edge or a real defect, and the two are
+separated by one `boundary_min_gaps` call on the mean field.
+
+### The degeneracy structure, and the subspace-invariant twin
+
+Within a degenerate multiplet any unitary mixing of the subspace is an
+equally valid eigenbasis, so a per-band `Re Σ_bb` is not symmetry-invariant
+while the TRACE over the multiplet is. On the Si 60-band window **60 of 60
+bands sit inside a multiplet** (groups of 4, 4, 8, 8, 8, 8 and one of 20),
+tolerance-insensitive from 1 meV to 13.6 µeV. Measured per group at the
+sliced `nband = 60`:
 
 | bands | size | per-band max | multiplet trace | ratio |
 |---|---|---|---|---|
-| 0–7 | 8 | 0.980 meV | **0.134** | 7.3× |
-| 8–15 | 8 | 2.611 | **0.593** | 4.4× |
+| 0–7 | 8 | 0.980 meV | 0.134 | 7.3× |
+| 8–15 | 8 | 2.611 | 0.593 | 4.4× |
 | 16–19 | 4 | 4.821 | 2.302 | 2.1× |
 | 20–27 | 8 | 7.267 | 2.835 | 2.6× |
 | 28–35 | 8 | 10.020 | 2.909 | 3.4× |
-| 36–39 | 4 | 9.471 | **6.734** | 1.4× |
+| 36–39 | 4 | 9.471 | 6.734 | 1.4× |
 | **40–59** | **20** | **41.338** | **3.604** | **11.5×** |
 
-**The headline 41.338 meV lives in the 20-fold block and collapses 11.5× to
-3.604 meV on the invariant.** Over the whole window the worst invariant
-residual is **6.734 meV** — and it is at bands 36–39, a different place
-entirely. Over the 16 bands the BerkeleyGW anchor compares, 2.611 → **0.593**.
+So even at the sliced edge the headline 41.338 meV is ~91 % band-label gauge
+in its own block, and the worst invariant residual is 6.734 meV. The
+diagnostic is emitted as `star_spread_multiplet_ev` /
+`star_spread_multiplet_ev_per_band` beside the per-band row
+(`gw_output._star_spread_over_multiplets`). The per-band row STAYS — it is
+what the historical figures and the BerkeleyGW gate threshold are quoted in.
 
-**What this revises.** Any statement on this page of the form "the Si deck's
-star spread is 41.34 meV" is quoting a quantity that is ~84 % eigensolver
-gauge. The genuinely subspace-invariant symmetry break on this deck is
-**6.7 meV worst-case, 0.59 meV over the compared bands**. The conditioning
-attribution below is **not eliminated** — 6.7 meV is not zero — but its
-magnitude was overstated ~6×, and every comparison that used the per-band
-number to rank centroid sets should be redone on the invariant one before it
-is believed. **That has NOT been done here**; only the production 960 set was
-measured.
-
-The diagnostic is now emitted: `star_spread_ev_per_band_multiplet` and
-`star_spread_ev_multiplet_max`, from
-`gw_output._star_spread_over_multiplets`, beside the per-band row. The
-per-band row STAYS, because it is what the historical figures and the
-BerkeleyGW gate threshold are quoted in — but the multiplet row is the one to
-quote for "is the symmetry broken".
+**WITHDRAWN: "orbit mode buys a tighter within-star spread."** Both arms of
+that comparison were measuring the same sliced edge, and both go to 0.0000 at
+a clean one. The orbit-closed-960 vs literal-960 numbers quoted below
+(2.611 → 1.964 and 41.34 → 39.88) are therefore **not** evidence about
+closure; they are two measurements of the same slicing artifact.
 
 ### The conditioning synthesis — hand this to whoever picks up the count question
 
 Three independent measurements in this tree point at ONE mechanism, and it is
-**conditioning, not geometry**. **Read the section immediately above first:
-item 1's "~40 meV" is now measured to be ~84 % band-label gauge, so this
-synthesis rests on a weaker foot than it did.**
+**conditioning, not geometry**. **ITEM 1 IS WITHDRAWN — read the section
+immediately above first.** Its "~40 meV" is a sliced band edge, not a
+centroid-count effect, so the synthesis now rests on items 2 and 3 alone and
+should be re-argued rather than quoted.
 
-1. The Si deck carries ~537–588 G per k, so **960 centroids is ~1.7×
-   over-complete** and 144 is ~0.25×. The 144 set measures a star spread of
-   exactly 0.000; both 960 sets measure ~40 meV, closed or not. **REVISED: on
-   the subspace-invariant metric the production 960 set reads 6.73 meV, not
-   41.34. The orbit-closed twin has NOT been re-measured on it.**
+1. ~~The Si deck carries ~537–588 G per k, so 960 centroids is ~1.7×
+   over-complete and 144 is ~0.25×. The 144 set measures a star spread of
+   exactly 0.000; both 960 sets measure ~40 meV, closed or not.~~
+   **WITHDRAWN 2026-08-15.** The ~40 meV is the deck's `nband = 60` edge
+   slicing a multiplet at 0.000 meV gap, not the centroid count: hold the
+   centroid set fixed and move only the edge to 40 or 36 and every Σ channel
+   goes to **exactly 0.0000**. This item was the synthesis's first leg and it
+   does not survive.
 2. A ledger row records **1776 centroids on a 588-G deck (3.0× over-complete)
    dropping 300+ modes per q at κ ≈ 1e10 and producing a 100 eV Σ_c with no
    refusal.**
