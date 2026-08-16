@@ -1433,6 +1433,64 @@ that has nothing to do with what it tests. Any new header on
 (1) is recorded rather than repaired: it is a real 25.7 meV diagnosis and not
 in the symmetry-consolidation scope this branch is doing.
 
+### BAND-SLICING AUDIT 2026-08-15 — which cuts are guarded, which are not
+
+Prompted by the owner's degeneracy question and searched BY SHAPE, not by
+name.  Context for why it matters: on `si_cohsex_debug` the deck's own
+`nband = 60` edge has a **min gap over k of 0.000000 meV** on the 62-band mean
+field, and moving it to a clean edge (40: 818 meV, 36: 157 meV) takes every Σ
+channel's within-star spread to **exactly 0.0000**.  A sliced band edge is not
+a theoretical hazard on this tree; it is the measured cause of the Si star
+spread.
+
+**`snap_cut_to_clean_boundary` DOES NOT EXIST** — no definition, no caller, no
+mention, in any branch's history (`git log --all -S` empty).
+`src/common/band_degeneracy.py` provides `boundary_min_gaps`,
+`resolve_band_window` (modes `strict|snap|off`) and `check_band_window`; the
+"widen to a clean boundary" behaviour is an inlined `while` loop inside
+`resolve_band_window`, not a separate helper.  Do not plan against it.
+
+**THE TRAP, measured:** `boundary_min_gaps` returns `+inf` at `b = nb` by
+construction, so **given an already-truncated window it cannot see the
+truncation that produced it**.  Handed the 60-band Σ window it calls edge 60
+clean; handed the 62-band mean field it reports 0.000000 meV.  Always pass the
+FULL mean field.
+
+**GUARDED** (all in the BSE path):
+
+| site | helper |
+|---|---|
+| `src/bse/bse_loading.py:861`, `:1202` | `resolve_band_window` |
+| `src/bse/bse_window.py:644` | `check_band_window` |
+| `src/bse/exciton_bands.py:1606` | `check_band_window` |
+| `src/bse/vq_interp.py:2493` | `check_band_window` |
+| `src/gw/gw_init.py:861` (ζ closure) | `check_band_window`, **warn-only** unless `zeta_nband` names the edge |
+
+**UNGUARDED and symmetry-sensitive** — the deliverable of this audit:
+
+| # | site | what is cut | note |
+|---|---|---|---|
+| 1 | `src/gw/gw_init.py:856-866` | the ζ fit window `b3`/`b4` | **measures the zero gap and PRINTS it without refusing.** A guard that measures the defect and proceeds. *Being fixed on another lane — do not touch.* |
+| 2 | `src/gw/sc_iteration.py:1978-1987` + `src/gw/scissor.py:238-240` | `protected_mask` — a NON-CONTIGUOUS cut deciding off-diagonal Σ | own entry below |
+| 3 | `src/gw/sigma_dispatch.py:308-310` | `v_h_np[:, b0:b3, b0:b3]` | V_H is on the Σ star-spread surface |
+| 4 | `src/bse/bse_window.py:597-602` | `min(nb_eqp, nb_full)` eqp overwrite of `enk_full` | QP energies |
+| 5 | `src/bse/exciton_bands.py:934-938` | `e_ht[:, :nc]` vs `e_st[:, :nc]` | the gate `sort`s both sides, so a truncated multiplet makes it compare different SETS — the one failure `sort` cannot detect |
+| 6 | `src/common/chi_from_dipole.py:156-157` | `arange(nelec, nb)` → S(ω) | k-summed |
+| 7 | `tools/bgw_sigma_hp_to_fixture.py:252,287-289` | `nb` then a star-spread max-min | offline tool; also still matches k by `Emf` at 2e-3 eV |
+| 8 | `tools/sigma_star_spread_decompose.py:334-335` | `kin[:, :nb, :nb]` → `diag_star_spread` | offline tool |
+
+**FIXED in this branch:** `tests/harness.py:998` `per_band[:nb].max()` — the
+star-spread consumer — sliced at whatever the BerkeleyGW fixture carried with
+no boundary check.  It now also reports `_cut_clean` (from the `Eo` column
+already in the same file, through `boundary_min_gaps`) and
+`_star_spread_multiplet`.  Reported, not refused: the fixture's band count is
+not ours to move, and the Si cut at 16 measures clean anyway.
+
+Not symmetry-sensitive, listed so nobody re-audits them: mesh-pad drops
+(`bse_feast.py:913`, `bse_densify.py:597`, `qsgw_density.py:717`,
+`sc_iteration.py:1741`, `mtxel_sweep.py:1180`) and print/plot paths
+(`run_nscf.py:436`, `htransform.py:1729`, `bse_feast.py:836`).
+
 ### The QSGW band partition is an unguarded, NON-CONTIGUOUS band cut
 
 Found 2026-08-15 by a shape-based audit of every band-axis truncation in the
