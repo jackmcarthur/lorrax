@@ -728,9 +728,12 @@ against `atol = 5e-4`, already `3.9e-2` on the never-crossing semicore
 bands, improved to 1.796 by the transported frame of claim 195 but still
 refusing). Rungs R2 (claim 180) and R3 (claims 181/182) stand; R4's fit half
 is claim 196 and its `eqp` half still awaits its rerun on the
-omega-reference-fixed tip; R6 landed as claims 198/200 (`§7.4`), and R5 —
-the one-shot metallic `Sigma` against the BerkeleyGW full-frequency
-reference — has not. Velocities everywhere on this route are DFT p-matrix
+omega-reference-fixed tip; R6 landed as claims 198/200/201 (`§7`); R5 is
+**half-landed** — the BerkeleyGW full-frequency metallic `Sigma` reference
+is parsed, band-matched and `E_F`-referenced with its protected window
+fixed at bands 9–16 by evidence (claim 191), but no LORRAX arm has been
+compared against it, so the cross-code number does not exist. Velocities
+everywhere on this route are DFT p-matrix
 elements, with the covariant-derivative upgrade parked on claim 183.
 
 ## 7. Self-consistency: the metallic QSGW map and its convergence
@@ -1044,10 +1047,13 @@ converged energies.
 
 Open, with the reason each is still open:
 
-- **No BerkeleyGW comparison of the converged spectrum.** Claims 198/200
-  are self-consistency of the LORRAX loop against its own criterion. The
-  accuracy question — including the `O(10%)`-of-head-channel cap that 4.4
-  puts on absolute QP energies at this mesh — is untouched by them.
+- **No BerkeleyGW comparison of the converged spectrum.** Claims
+  198/200/201 are self-consistency of the LORRAX loop against its own
+  criterion. The reference side of that comparison exists — the BGW
+  full-frequency metallic `Sigma`, parsed and band-matched, claim 191 —
+  and the LORRAX arm against it does not, so R5 stays half-landed. The
+  accuracy question, including the `O(10%)`-of-head-channel cap that 4.4
+  puts on absolute QP energies at this mesh, is untouched by any of them.
 - **Multi-node is broken, and pre-existing.** At 16 ranks on 4 nodes,
   12 of 16 die at `fit_driver.py:457` with *"file is already open for
   write"*, and an A/B at `bf57701b` fails identically (claim 198). Every
