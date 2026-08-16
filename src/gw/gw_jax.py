@@ -168,6 +168,54 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 	return terms
 
 
+def _refuse_deck_wfn_mismatch(config, wfn) -> None:
+	"""Refuse a deck the WFN cannot serve, at the WFN open.
+
+	The three conditions here are knowable the instant the file is open
+	and cost the whole run if they are not asked: everything after this
+	line is the ISDF fit and beyond.  They are NOT parse-time checks —
+	each needs a number that lives in the file.
+
+	``nband`` is the one that has been silently wrong.  Nothing checked it
+	against ``wfn.nbands``, and both readers pad past EOF in SILENCE:
+	``common/wfn_transforms.py`` sentinel-fills energies (:1676-1688) and
+	``load_psi_gflat_padded`` zero-fills ψ (:1799-1814).  So an oversized
+	``nband`` either ran a shorter band sum under the name of a longer one
+	or died with a message about "band chunk (64, 80)" arithmetic.  Note
+	this checks the USER's ``nband``, not ``meta.b_id_4`` — the mesh
+	round-up above it is deliberately allowed past EOF and is what the
+	zero-pad exists for.
+
+	``nspin`` had exactly one guard, at ``eqp_bgw.py``'s writer, i.e. at
+	the END of the run.  That one stays: ``eqp_bgw`` is also a standalone
+	CLI that opens WFN.h5 itself and never reaches this function.
+	"""
+	nbands_file = int(wfn.nbands)
+	if int(config.nband) > nbands_file:
+		raise ValueError(
+			f"nband = {int(config.nband)} exceeds the {nbands_file} bands in "
+			f"{config.paths.wfn_file}.  The readers zero-pad ψ and "
+			f"sentinel-fill energies past EOF WITHOUT a word, so this would "
+			f"run a {nbands_file}-band chi0/Sigma sum labelled "
+			f"{int(config.nband)}.  Set nband <= {nbands_file}, or produce a "
+			f"WFN with more bands.")
+	n_occ = int(wfn.nelec)
+	if int(config.nval) > n_occ:
+		raise ValueError(
+			f"nval = {int(config.nval)} exceeds the {n_occ} occupied bands in "
+			f"{config.paths.wfn_file}.  nval is an offset BELOW the occupied "
+			f"edge (b1 = n_occ - nval), so this asks for a negative band "
+			f"index.")
+	nspin_file = int(wfn.nspin)
+	if nspin_file != 1:
+		raise NotImplementedError(
+			f"LORRAX runs at nspin = 1; {config.paths.wfn_file} carries "
+			f"nspin = {nspin_file}.  The whole tree treats coefficient axis 1 "
+			f"as the SPINOR axis, so the two collinear spin channels are not "
+			f"addressable — a collinear-spin-polarised deck is a port, not a "
+			f"setting.  (Spin-orbit decks are nspinor = 2, nspin = 1.)")
+
+
 def main(argv=None):
 	_description = (
 		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM self-energy, "
@@ -267,6 +315,7 @@ def main(argv=None):
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
+	_refuse_deck_wfn_mismatch(config, wfn)
 	sym = symmetry_maps.SymMaps(wfn)
 	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
 	tmp_dir = os.path.join(input_dir, "tmp")
