@@ -231,6 +231,7 @@ def test_plan_cuts_are_clean_and_cover_every_band():
     gaps = boundary_min_gaps(e)
     for c in plan.counts[:-1]:
         assert gaps[c] > DEGENERACY_TOL_RY, f"cut {c} splits a multiplet"
+    assert not plan.notes, "a clean boundary was available; nothing to note"
     assert list(plan.counts) == sorted(set(plan.counts))
     # Contiguous, and covering [0, nb_padded) exactly — the partition claim
     # at the level of the plan, before any kernel is involved.
@@ -238,6 +239,31 @@ def test_plan_cuts_are_clean_and_cover_every_band():
     assert plan.bounds[-1][1] == nb
     for (a, b), (c, d) in zip(plan.bounds, plan.bounds[1:]):
         assert b == c, f"bracket gap/overlap between {(a, b)} and {(c, d)}"
+
+
+def test_fractions_are_of_the_total_band_count_not_the_conduction_count():
+    """The regression guard for the 2026-08-15 parametrisation change.
+
+    ``N_i = f * N_max``, NOT ``n_occ + f * n_cond``.  The two agree to ~2 %
+    when the occupied manifold is small — which is exactly why this needs a
+    fixture where it is LARGE, or the test would pass either way.  The
+    counting law that makes 1/N the right variable is written in the total
+    (module docstring: p = 1.481 measured for the total against 1.212 for
+    the conduction-only form), and the fit's lever arm is 1/N1 - 1/N3, which
+    is a ratio of totals.
+    """
+    nk, nb = 4, 200
+    n_occ = 80                                  # 40 % occupied: the two rules
+    e = np.tile(np.linspace(1.0, 20.0, nb), (nk, 1))   # differ by 24 bands
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=n_occ, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.90))
+    assert plan.counts == (160, 180, 200), plan.counts
+    conduction_rule = tuple(
+        int(round(n_occ + f * (nb - n_occ))) for f in (0.80, 0.90))
+    assert conduction_rule == (176, 188)
+    assert plan.counts[:2] != conduction_rule, \
+        "fractions must be of N_max, not of n_cond"
 
 
 def test_pad_bands_land_in_the_last_bracket():
@@ -253,6 +279,73 @@ def test_pad_bands_land_in_the_last_bracket():
 # ---------------------------------------------------------------------------
 #  (4)  the refusal
 # ---------------------------------------------------------------------------
+
+def test_unsnappable_interior_cut_falls_back_instead_of_refusing():
+    """A spectrum with no clean boundary near the cut must NOT stop the run.
+
+    The interior cuts are sampling points on a partial-sum curve, not Σ
+    windows: only N3 is a band sum anything downstream reports.  MEASURED
+    cost of a cut that splits a multiplet: <= 6.4 meV on the Si 4x4x4 SOC
+    deck.  Under SOC every Kramers pair is exactly degenerate, so clean
+    boundaries are sparse by construction and the old refusal fired on decks
+    whose unsnapped points work fine.  Trading <= 6.4 meV for a dead run is
+    the wrong trade, so this asserts the trade is not made.
+    """
+    # One exactly-degenerate block running to the TOP of the range, so the
+    # second interior cut has no clean boundary to reach at all.  (It has to
+    # reach the top: leave any clean boundary above the cut and the snapper
+    # finds it, and this stops testing the fallback.)
+    nk, nb = 4, 40
+    e = np.tile(np.linspace(1.0, 10.0, nb), (nk, 1))
+    e[:, 32:] = e[:, 32][:, None]
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=4, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.90))
+    assert plan.counts == (32, 36, 40), plan.counts
+    assert list(plan.counts) == sorted(set(plan.counts))
+    assert plan.notes, "the fallback must be reported, not silent"
+    joined = " ".join(plan.notes)
+    assert "UNSNAPPED" in joined
+    assert "36" in joined, "the note must name the cut it kept"
+    # And the report block carries it, so it reaches the log either way.
+    N = np.asarray(plan.counts, dtype=float)
+    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None, None])
+    assert "NOTE:" in format_extrapolation_report(plan, fit)
+
+
+def test_snapping_never_starves_a_later_cut():
+    """Snapping cut i upward must not consume the room cut i+1 needs.
+
+    Found by an exhaustive n_occ x nband sweep against the real Si deck
+    eigenvalues: at nband = 17 the first cut snapped 14 -> 16 = nb_logical-1,
+    the second had nowhere legal left, and the plan came back NON-ASCENDING
+    (16, 15, 17) and refused — on a spectrum with three perfectly good
+    sampling points in it.  The planner now reserves one band per remaining
+    interior cut.
+    """
+    nk, nb = 4, 17
+    e = np.tile(np.linspace(1.0, 10.0, nb), (nk, 1))
+    e[:, 13:16] = e[:, 13][:, None]        # multiplet straddling the top cut
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=5, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.90))
+    assert list(plan.counts) == sorted(set(plan.counts)), plan.counts
+    assert plan.counts[-1] == nb
+    assert all(plan.n_occ < c < nb for c in plan.counts[:-1])
+
+
+def test_refuses_only_when_the_fractions_themselves_collapse():
+    """The surviving refusal names nband, because nband is what fixes it."""
+    nk, nb = 4, 3
+    e = np.tile(np.linspace(1.0, 2.0, nb), (nk, 1))
+    with pytest.raises(BandExtrapolationRefused) as exc:
+        plan_band_brackets(enabled=True, enk_ry=e, n_occ=1,
+                           nb_logical=nb, nb_padded=nb,
+                           fractions=(0.80, 0.90))
+    msg = str(exc.value)
+    assert "DISTINCT" in msg and "nband" in msg
+    assert "0.8" in msg, "the refusal must show the fractions it used"
+
 
 def test_refuses_when_ncond_le_nval():
     e = _si_like_spectrum()
@@ -284,6 +377,7 @@ def test_disabled_returns_the_trivial_single_bracket_plan():
     # no cutoff-flavoured number to report) and NaN != NaN, so it is compared
     # by predicate rather than by equality.
     assert all(np.isnan(v) for v in plan.mean_energy_ev)
+    assert plan.notes == (), "the trivial plan decides nothing worth noting"
 
 
 def test_dispatch_refuses_the_key_on_a_non_ppm_mode():
@@ -321,6 +415,42 @@ def test_fit_recovers_an_exact_two_parameter_tail():
     assert np.allclose(fit.delta_tail, np.abs(A / N[-1]), atol=1e-11)
     assert float(np.max(np.abs(fit.residual))) < 1e-11
     assert "consistent" in trust_verdict(fit)
+    # The two SIGNED one-sided diagnostics.  On an exact series the pairwise
+    # intercepts coincide, so their signed difference is zero; A/N3 is the
+    # correction still being applied at the last point and is NOT zero — that
+    # asymmetry is the whole reason both are reported.
+    assert np.allclose(fit.pair_split, 0.0, atol=1e-11)
+    assert np.allclose(fit.a_over_n_last, A / N[-1], atol=1e-11)
+
+
+def test_the_signed_diagnostics_see_what_delta_model_cannot():
+    """``pair_split`` keeps the sign ``delta_model`` throws away.
+
+    Two curves whose preasymptotic bias runs in OPPOSITE directions have the
+    same |Δ_model| and must be distinguishable.  This is the property the
+    2026-08-15 measurement turned on: on a clean BerkeleyGW curve Δ_model was
+    18.8 meV with a ``consistent`` verdict while the true error was 55 meV
+    MAE — a bias all three points shared, which a scatter metric cannot see.
+    """
+    # S = S_inf + A/N +- B/N^2: the SAME 1/N series with the curvature term
+    # flipped.  Δ_model is identical between the two by construction, which
+    # is exactly the blindness being demonstrated.
+    N = np.array([80.0, 88.0, 100.0])
+    curved = [fit_band_extrapolation(N, (-1.0 + 30.0 / N + B / N ** 2)[:, None])
+              for B in (+400.0, -400.0)]
+    over, under = curved
+    assert np.allclose(over.delta_model, under.delta_model), \
+        "the fixture must give the two the SAME scatter, or it proves nothing"
+    assert np.sign(over.pair_split) != np.sign(under.pair_split), \
+        "pair_split must distinguish over- from under-correction"
+    # ...and the two intercepts really do land on opposite sides of the
+    # unperturbed answer, so the sign is reporting something true.
+    assert float(over.s_inf[0]) < -1.0 < float(under.s_inf[0])
+    # ``at()`` must carry the derived properties through, since they are the
+    # per-state numbers the log prints.
+    f1 = over.at((0,))
+    assert np.shape(f1.pair_split) == ()
+    assert np.allclose(f1.a_over_n_last, f1.amplitude / N[-1])
 
 
 def test_pairwise_intercepts_are_the_closed_form_two_point_solution():
@@ -337,6 +467,34 @@ def test_sign_reversal_is_called_out():
     S = np.array([-1.0, -0.5, -0.9])[:, None]      # non-monotone in 1/N
     fit = fit_band_extrapolation(N, S)
     assert "NOT TRUSTWORTHY" in trust_verdict(fit)
+
+
+def test_uncertainty_is_a_fraction_of_the_applied_correction():
+    """The bar scales with Delta_tail, and p99 is wider than p90.
+
+    It is an ENVELOPE, not a per-state bar: no per-state predictor works
+    (R^2 <= 0 for A/N3, Delta_model, pair_split and Delta_tail alike at the
+    shipped fractions), so what is asserted here is the contract — the bar
+    is a fraction of the correction actually applied, and it vanishes when
+    the correction does.
+    """
+    from gw.band_extrapolation import TAIL_UNCERTAINTY_FRACTION
+    p90, p99 = TAIL_UNCERTAINTY_FRACTION
+    assert 0.0 < p90 < p99 < 1.0, "a bar wider than the correction is useless"
+
+    N = np.array([100.0, 108.0, 124.0])
+    for A in (30.0, 60.0):
+        fit = fit_band_extrapolation(N, (-1.0 + A / N)[:, None])
+        assert np.allclose(fit.uncertainty("p90"), p90 * np.abs(fit.delta_tail))
+        assert np.allclose(fit.uncertainty("p99"), p99 * np.abs(fit.delta_tail))
+    # Doubling the tail doubles the bar — the bar is a scale on the
+    # correction, not an additive constant.
+    f1 = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    f2 = fit_band_extrapolation(N, (-1.0 + 60.0 / N)[:, None])
+    assert np.allclose(f2.uncertainty(), 2.0 * f1.uncertainty())
+    # A converged sum gets a zero bar rather than a floor.
+    flat = fit_band_extrapolation(N, np.full((3, 1), -1.0))
+    assert np.allclose(flat.uncertainty(), 0.0)
 
 
 def test_report_carries_full_band_and_extrapolated_side_by_side():
@@ -361,8 +519,21 @@ def test_report_carries_full_band_and_extrapolated_side_by_side():
     for needle in ("N1 =", "N2 =", "N3 =", "S_inf", "S(N3)", "A =",
                    "S_inf^(12)", "S_inf^(23)", "S_inf^(13)",
                    "Delta_tail", "Delta_model", "verdict",
-                   "VBM k=2 n=3", "envelope"):
+                   "VBM k=2 n=3", "envelope",
+                   # the SIGNED one-sided diagnostics, and the legend that
+                   # says what each of the three can and cannot see — the
+                   # verdict line is what an operator reads, so a
+                   # necessary-but-not-sufficient "consistent" has to say so
+                   # where it is read
+                   "pair_split", "A/N3", "SCATTER", "blind",
+                   "necessary, not sufficient",
+                   # the extrapolation uncertainty, and the label that keeps it
+                   # separate from "difference from BerkeleyGW"
+                   "(p90)", "(p99)", "EXTRAPOLATION uncertainty only",
+                   "ENVELOPE"):
         assert needle in text, f"report is missing {needle!r}"
+    assert "TOTAL band count" in text, \
+        "the report must say the fractions are of the total, not of n_cond"
     for c in plan.counts:
         assert str(c) in text
     # The named-state row must carry BOTH the full-band value and the
