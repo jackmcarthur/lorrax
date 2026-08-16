@@ -6,8 +6,8 @@ Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 1. Default → ``ONE_SHOT_DFT`` (standard G0W0).
 2. The deleted ``self_consistent`` BOOLEAN refuses, naming
    ``qp_solver = self_consistent``.
-3. Legacy ``sigma_at_dft_energies = true`` → ``ONE_SHOT_DFT`` (the orphan
-   flag's intended meaning IS the default; deprecated, honored).
+3. The deleted ``sigma_at_dft_energies`` is ignored with a word; the
+   run it named is the default.
 4. ``qp_solver = auto`` is gone with the boolean it read.
 5. Validation: ``fixed_point`` × static mode → error; the removed
    ``sigma_omega_accumulation = kij_stream`` spelling → parse-time error.
@@ -76,10 +76,17 @@ def test_the_self_consistent_boolean_refuses_naming_qp_solver(tmp_path):
     assert "qp_solver = self_consistent" in msg
 
 
-def test_legacy_sigma_at_dft_energies_resolves_and_warns(tmp_path):
+def test_sigma_at_dft_energies_is_ignored_and_says_so(tmp_path):
+    """Deleted 0.1.0.  It was parsed and never read for its whole life.
+
+    Warn-and-ignore rather than refuse (the ``slab_io`` rule): it never
+    changed a number, so an old deck keeps running and is told what it
+    lost.  The run it describes is the DEFAULT.
+    """
     with pytest.warns(DeprecationWarning, match="sigma_at_dft_energies"):
         cfg = _config(tmp_path, "sigma_at_dft_energies = true\n")
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
+    assert not hasattr(cfg.sigma, "sigma_at_dft_energies")
 
 
 def test_qp_solver_auto_is_no_longer_a_value(tmp_path):

@@ -41,7 +41,6 @@ sys_dim = 2
 compute_mode = cohsex
 screening_method = minimax
 fermi_reference = midgap
-sigma_at_dft_energies = true
 memory_per_device_gb = 28
 wfn_file = WFN.h5
 bare_coulomb_cutoff = 30.0

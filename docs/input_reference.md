@@ -119,7 +119,6 @@ page has to read it from.
 | `sigma_omega_accumulation` | `"auto"` | How per-branch Sigma(omega) contributions are accumulated (auto = pick by size). |
 | `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
-| `sigma_at_dft_energies` | false | DEPRECATED alias for qp_solver = one_shot_dft (now the default). |
 | `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |
 | `sigma_freq_debug_file` | `"sigma_freq_debug.dat"` | Path of the Sigma(omega) debug dump. |
 

@@ -1448,12 +1448,6 @@ _DEFAULTS = {
     "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
-    # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
-    # as an alias for ``qp_solver = one_shot_dft`` — which is now the
-    # default — via auto-resolution.  (The key was parsed-but-unread for
-    # its whole life; its intended meaning, authoritative at-DFT QP
-    # evaluation, is exactly QPSolver.ONE_SHOT_DFT.)
-    "sigma_at_dft_energies": False,
     # Debug
     "sigma_freq_debug_output": False,
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
@@ -1503,7 +1497,7 @@ _DEFAULTS = {
 # legacy/deprecation branch in ``read_lorrax_input`` (raise or dedicated
 # DeprecationWarning).  The unknown-key check skips these so one deck key
 # never draws two messages.  Keys that are deprecated but still in
-# _DEFAULTS (self_consistent, sigma_at_dft_energies) need no entry here.
+# _DEFAULTS need no entry here.
 _LEGACY_DECK_KEYS = frozenset({
     "use_shipped_minimax_tables",   # refused with replacement named
     "chunk_size",                   # warn-and-ignore (planner-owned)
@@ -1533,6 +1527,13 @@ _LEGACY_DECK_KEYS = frozenset({
     # other's value.  Refused for the same reason as the ansatz flags: it
     # chose between one-shot and a QSGW loop.
     "self_consistent",              # refuse -> qp_solver
+    # 0.1.0: PARSED-NEVER-READ for its whole life -- it was a
+    # ``DynamicSigmaConfig`` field with no reader anywhere in the tree.
+    # Its intended meaning, authoritative at-DFT QP evaluation, is exactly
+    # ``qp_solver = one_shot_dft``, which is the default.  Warn-and-ignore
+    # rather than refuse, on the ``slab_io`` rule: it never changed a
+    # number, so an old deck should keep running and be told what it lost.
+    "sigma_at_dft_energies",        # warn-and-ignore (qp_solver default)
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1805,21 +1806,20 @@ def read_lorrax_input(filename: str) -> dict:
                     "the bytes)"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
-        for legacy_key, replacement in (
-            ("sigma_at_dft_energies", "qp_solver = one_shot_dft (the default)"),
-        ):
-            if section.get(legacy_key, fallback=None) is not None:
-                import warnings
-                warnings.warn(
-                    f"Input key '{legacy_key}' is deprecated; it is honored "
-                    f"via ``qp_solver = auto`` resolution.  Set "
-                    f"'{replacement}' instead.",
-                    DeprecationWarning, stacklevel=2,
-                )
-                retired.append((
-                    legacy_key,
-                    f"deprecated but still HONORED via 'qp_solver = auto' "
-                    f"resolution; set '{replacement}' instead"))
+        if section.get("sigma_at_dft_energies", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'sigma_at_dft_energies' is no longer supported "
+                "and will be ignored.  It was PARSED AND NEVER READ for its "
+                "whole life; its intended meaning — authoritative at-DFT QP "
+                "evaluation — is 'qp_solver = one_shot_dft', which is the "
+                "default.  Remove it from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sigma_at_dft_energies",
+                "IGNORED — it was parsed and never read; its meaning is "
+                "'qp_solver = one_shot_dft', the default"))
 
         if retired:
             _print_deck_report(
@@ -2122,7 +2122,6 @@ class DynamicSigmaConfig:
     omega_layout: str
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
-    sigma_at_dft_energies: bool
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -2767,7 +2766,6 @@ class LorraxConfig:
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
-            sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
         )
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run
