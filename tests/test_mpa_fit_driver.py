@@ -61,6 +61,14 @@ _N_P = 4
 _OMEGA_M = 4.0
 _W_NAME = "W_qmunu_omega"
 
+#: The certification a hand-driven ``finalize_fit_store`` must carry
+#: since 2026-08-15 — a store the validator would refuse cannot be
+#: finalized at all (audit §E.3 item 1).  ``run_fit_driver`` builds its
+#: own from ``rcond``; these two cells finalize by hand, so they state
+#: thresholds loose enough never to be the reason the cell fails.
+_CERT = {"condition_max_allowed": 1.0e12,
+         "backward_error_max_allowed": 1.0}
+
 #: The sampling record the W(omega) file carries.  The double-parallel
 #: lines varpi_1 = 0.1 Ha and varpi_2 = 1 Ha, alpha = 1 for an
 #: insulator, and an n_p whose 2*n_p is the frequency count.
@@ -550,7 +558,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
             np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
 
     with pytest.raises(ValueError) as exc:
-        MS.finalize_fit_store(str(fit_path))
+        MS.finalize_fit_store(str(fit_path), certification=_CERT)
     msg = str(exc.value)
     q, lo, hi = skipped
     assert f"q={q}: columns" in msg
@@ -617,7 +625,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q,
             np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
-    ledger = MS.finalize_fit_store(str(fit_path))
+    ledger = MS.finalize_fit_store(str(fit_path), certification=_CERT)
     assert ledger["complete"]
 
     Om, Bp, _, _ = MS.read_fit_tensors(str(fit_path))

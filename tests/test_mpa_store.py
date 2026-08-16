@@ -53,6 +53,14 @@ from tests._mpa_test_geometry import (                            # noqa: E402
 _SEEDS = ((0, 0, 0), (4, 5, 0), (2, 2, 6), (9, 7, 6),
           (1, 2, 3), (7, 3, 4), (1, 1, 1), (5, 8, 9))
 
+#: The certification every ``finalize_fit_store`` below must carry, since
+#: 2026-08-15: a store the validator would refuse cannot be finalized at
+#: all (audit §E.3 item 1), so a cell whose subject is something else
+#: passes a pair of thresholds loose enough never to be the reason it
+#: fails.  The cells that are ABOUT certification state their own.
+_CERT = {"condition_max_allowed": 1.0e12,
+         "backward_error_max_allowed": 1.0}
+
 #: The sampling record every W(ω) file must carry.  Si-shaped: the
 #: double-parallel lines ϖ₁ = 0.1 Ha and ϖ₂ = 1 Ha, α = 1 for an
 #: insulator, and an n_p that makes 2·n_p = the frequency count below.
@@ -862,8 +870,8 @@ def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
     blocks they were taken from.
     """
     truth, _ = _staged_fit(tmpdir_path)
-    MS.finalize_fit_store(tmpdir_path,
-                          certification={"condition_max_allowed": 1e8})
+    MS.finalize_fit_store(
+        tmpdir_path, certification=dict(_CERT, condition_max_allowed=1e8))
     for (q, lo, hi), (Om, Bp, diag) in truth.items():
         gOm, gBp, gdiag, ledger = MS.read_fit_block(
             tmpdir_path, q, list(range(lo, hi)))
@@ -899,7 +907,7 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
         diag = {"condition": np.ones((n_mu, n_mu)),
                 "backward_error": np.zeros((n_mu, n_mu))}
         MS.write_fit_block(tmpdir_path, q, np.arange(n_mu), Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
     ledger = MS.fit_completion_ledger(tmpdir_path)
     assert ledger["energy_unit"] == "Ha"
@@ -972,11 +980,57 @@ def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
             tmpdir_path, expected_identity={"w_grid_hash": "wrong"})
 
 
-def test_sigma_refuses_an_uncertified_fit_store(tmpdir_path):
-    """A COMPLETE ledger is not an accuracy certificate."""
+def test_finalize_refuses_a_store_sigma_could_never_read(tmpdir_path):
+    """RED: the brick is refused at the finalize, not found at Σ.
+
+    Omitting the certification used to SUCCEED and leave a store
+    permanently unusable (audit §E.3 item 1): ``validate_fit_store``
+    refuses an uncertified store, a second finalize is refused, and every
+    writer refuses a finalized one — so nothing could repair it through
+    this API.  The refusal covers every shape of the same fault, because
+    a half-certified store bricks exactly as hard as an uncertified one:
+    absent, empty, one of the pair, present-but-infinite,
+    present-but-zero, present-but-not-a-number.
+    """
     _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
                 energy_unit="Ry")
-    MS.finalize_fit_store(tmpdir_path)
+    with pytest.raises(ValueError) as exc:
+        MS.finalize_fit_store(tmpdir_path)
+    msg = str(exc.value)
+    assert "got   :" in msg and "want  :" in msg and "fix   :" in msg, msg
+    assert "condition_max_allowed" in msg, msg
+    assert "backward_error_max_allowed" in msg, msg
+    for cert in ({},
+                 {"condition_max_allowed": 1e8},
+                 dict(_CERT, backward_error_max_allowed=np.inf),
+                 dict(_CERT, condition_max_allowed=0.0),
+                 dict(_CERT, condition_max_allowed="loose")):
+        with pytest.raises(ValueError, match="could never read"):
+            MS.finalize_fit_store(tmpdir_path, certification=cert)
+
+    # GREEN TWIN, and the point of refusing BEFORE the store is opened:
+    # none of that touched the file, so the certified finalize still
+    # round trips — through the validator that used to be unreachable.
+    ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
+    assert ledger["complete"]
+    assert ledger["certification"]["condition_max_allowed"] == \
+        _CERT["condition_max_allowed"]
+    assert MS.validate_fit_store(tmpdir_path)["complete"]
+
+
+def test_sigma_still_refuses_an_uncertified_store_it_finds_on_disk(
+        tmpdir_path):
+    """A COMPLETE ledger is not an accuracy certificate.
+
+    ``finalize_fit_store`` can no longer WRITE this file, but a store
+    stamped by an older writer can still be on disk — the validator is
+    the Σ stage's own gate and does not trust the producer, so it keeps
+    its refusal rather than inheriting the new precondition.
+    """
+    _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
+                energy_unit="Ry")
+    with h5py.File(tmpdir_path, "a") as f:      # the old writer's stamp
+        f.attrs["mpa_fit_complete"] = True
     with pytest.raises(ValueError, match="requires certified pole fits"):
         MS.validate_fit_store(tmpdir_path)
 
@@ -1023,7 +1077,7 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
     """
     _staged_fit(tmpdir_path, stop_after=4)
     with pytest.raises(ValueError) as exc:
-        MS.finalize_fit_store(tmpdir_path)
+        MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     msg = str(exc.value)
     assert "4 of 12" in msg, msg
     assert "q=1: columns 2-5" in msg, msg
@@ -1033,7 +1087,7 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
         Om, Bp, diag = _fit_block(3, 6, hi - lo, seed=lo)
         MS.write_fit_block(tmpdir_path, 1, list(range(lo, hi)), Om, Bp,
                            diag)
-    ledger = MS.finalize_fit_store(tmpdir_path)
+    ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     assert ledger["complete"] and ledger["finalized_utc"]
     MS.read_fit_tensors(tmpdir_path)
 
@@ -1047,9 +1101,9 @@ def test_a_second_finalize_refuses(tmpdir_path):
     — and the writer refuses that too.
     """
     _staged_fit(tmpdir_path)
-    MS.finalize_fit_store(tmpdir_path)                             # TWIN
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)        # TWIN
     with pytest.raises(ValueError, match="already finalized"):
-        MS.finalize_fit_store(tmpdir_path)
+        MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     Om, Bp, diag = _fit_block(3, 6, 2, seed=1)
     with pytest.raises(ValueError, match="FINALIZED"):
         MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
@@ -1130,7 +1184,7 @@ def test_extra_diagnostics_survive_the_round_trip(tmpdir_path):
     Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     _, _, got, _ = MS.read_fit_block(tmpdir_path, 0, list(range(4)))
     assert np.array_equal(got["n_poles_pruned"], diag["n_poles_pruned"])
 
@@ -1150,7 +1204,7 @@ def test_the_diagnostic_set_may_not_change_mid_fit(tmpdir_path):
         MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
     MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp,             # TWIN
                        dict(diag, held_out=np.ones((4, 2))))
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
 
 def test_the_ledger_records_ranges_and_their_worst_diagnostics(

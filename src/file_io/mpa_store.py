@@ -2912,6 +2912,55 @@ def validate_fit_store(src, *, expected_identity=None, mode="r"):
     return ledger
 
 
+def _require_certification(certification, dest):
+    """A certification :func:`validate_fit_store` will accept, or refuse.
+
+    THE PRESENCE AND THE VALUE, because the validator checks both and a
+    finalize is the last moment either can be fixed: a threshold that is
+    absent, non-numeric, non-finite or non-positive fails
+    ``validate_fit_store`` exactly as hard as no certification at all, and
+    a finalized store cannot be written to or finalized again.
+    """
+    cert = dict(certification or {})
+    missing, bad = [], []
+    for key in REQUIRED_DIAGNOSTICS:
+        name = key + "_max_allowed"
+        if name not in cert:
+            missing.append(name)
+            continue
+        try:
+            val = float(cert[name])
+        except (TypeError, ValueError):
+            bad.append(f"{name}={cert[name]!r}")
+            continue
+        if not np.isfinite(val) or val <= 0.0:
+            bad.append(f"{name}={cert[name]!r}")
+    if not missing and not bad:
+        return
+    faults = "; ".join(
+        ([f"missing {', '.join(missing)}"] if missing else [])
+        + ([f"unusable {', '.join(bad)}"] if bad else []))
+    raise ValueError(
+        "finalize_fit_store: refusing to finalize a store Σ could never "
+        "read\n"
+        f"  file  : {dest}\n"
+        f"  got   : certification={certification!r} — {faults}.\n"
+        f"  want  : a finite, positive "
+        + " and ".join(k + "_max_allowed" for k in REQUIRED_DIAGNOSTICS)
+        + ", the thresholds validate_fit_store enforces against the "
+        "observed maxima.  Finalizing without them stamps a store that "
+        "the validator refuses ('MPA Sigma requires certified pole "
+        "fits') and that NOTHING can repair: a second finalize is "
+        "refused and every writer refuses a finalized store.\n"
+        "  fix   : pass certification={"
+        + ", ".join(f"'{k}_max_allowed': <threshold>"
+                    for k in REQUIRED_DIAGNOSTICS)
+        + "}.  The fit driver's own values are the solver-consistency "
+        "pair 1/rcond and sqrt(eps) (gw/mpa/fit_driver.py); a stage with "
+        "no material tolerance of its own should reuse them rather than "
+        "leave the store uncertified.")
+
+
 def finalize_fit_store(dest, *, certification=None, mode="a"):
     """Stamp the store COMPLETE — once, and only when it is.
 
@@ -2927,18 +2976,21 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     regardless (``mpa_fit_condition_max``, ``mpa_fit_backward_error_max``,
     ``mpa_fit_n_blocks``).
 
-    **PASS ``certification``.  OMITTING IT BRICKS THE STORE FOR Σ, and the
-    damage cannot be repaired through this API.**  This docstring used to
-    say a consumer could "refuse on the evidence even when nobody declared
-    a threshold"; the only consumer in this tree does not.
-    :func:`validate_fit_store` REFUSES a store with no ``mpa_cert_*``
+    ``certification`` IS REQUIRED, and the keyword keeps its ``None``
+    default only so the omission fails by name instead of as a
+    ``TypeError``.  A ``certification`` that would not satisfy
+    :func:`validate_fit_store` — absent, empty, or missing/garbage in any
+    ``<key>_max_allowed`` for :data:`REQUIRED_DIAGNOSTICS` — is REFUSED
+    HERE, before the store is opened, because the resulting file would be
+    unusable AND unrepairable: the validator refuses an uncertified store
     ("MPA Sigma requires certified pole fits"), a second
     :func:`finalize_fit_store` is refused, and every writer refuses a
-    finalized store — so there is no way back.  The observed-maxima attrs
-    are, as of 2026-08-15, read by no code in ``src/`` or ``services/`` at
-    all; only tests assert them.  Making the omission a refusal (or making
-    ``validate_fit_store`` fall back to the observed maxima) is a code
-    change and is on the follow-up list.
+    finalized store, so there is no way back through this API.  A store
+    that cannot be validated must not be finalizable; the refusal is that
+    sentence in code.  (Before 2026-08-15 this call accepted the omission
+    and bricked the store for Σ — audit §E.3 item 1.)  The observed-maxima
+    attrs are read by no code in ``src/`` or ``services/``; only tests
+    assert them, which is why they are not a fallback.
 
     RANK-0 ONLY in production, and that is a real precondition, not a
     convention: the driver guards the call with ``process_rank() == 0`` and
@@ -2948,6 +3000,7 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     calling it while a SlabIO handle is live on the same path is exactly
     the case :mod:`file_io.hdf5_owner` refuses.  Returns the ledger.
     """
+    _require_certification(certification, dest)
     qs = _qs()
     with _h5(dest, mode) as grp:
         led = _open_fit(grp)
