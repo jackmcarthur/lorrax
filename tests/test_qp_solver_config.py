@@ -99,6 +99,52 @@ def test_the_debug_table_is_off_by_default_and_on_by_naming_a_file(tmp_path):
     assert not hasattr(cfg.debug, "sigma_freq_debug_output")
 
 
+@pytest.mark.parametrize("key, env", [
+    ("r_chunk_size", "LORRAX_R_CHUNK"),
+    ("gflat_chunk_size", "LORRAX_GFLAT_CHUNK"),
+    ("vq_g_chunk_size", "LORRAX_VQ_G_CHUNK"),
+])
+def test_the_demoted_chunk_keys_name_their_env_twin(tmp_path, key, env):
+    """Demoted, not deleted: the override seam is unchanged.
+
+    Warn-and-ignore rather than refuse — an HBM schedule moves bytes
+    between stages and changes no number, so an old deck should keep
+    running and be told where the dial went.
+    """
+    from gw.gw_config import read_lorrax_input
+
+    p = tmp_path / "deck_chunk.in"
+    p.write_text(_with_compute_mode(BASE_INPUT) + f"{key} = 64\n")
+    with pytest.warns(DeprecationWarning, match=key):
+        params = read_lorrax_input(str(p))
+    assert key not in params
+
+
+@pytest.mark.parametrize("env, field", [
+    ("LORRAX_R_CHUNK", "r_chunk_override"),
+    ("LORRAX_GFLAT_CHUNK", "gflat_chunk_size"),
+    ("LORRAX_VQ_G_CHUNK", "vq_g_chunk_size"),
+])
+def test_the_env_twin_reaches_the_same_memory_field(tmp_path, monkeypatch,
+                                                    env, field):
+    assert getattr(_config(tmp_path).memory, field) == 0
+    monkeypatch.setenv(env, "64")
+    assert getattr(_config(tmp_path).memory, field) == 64
+
+
+def test_a_non_integer_chunk_env_announces_and_falls_back(tmp_path,
+                                                          monkeypatch):
+    """``int(float("12.5"))`` would be a silently different schedule."""
+    from gw.gw_config import env_int, reset_env_announce_state
+
+    reset_env_announce_state()
+    lines: list[str] = []
+    monkeypatch.setenv("LORRAX_R_CHUNK", "12.5")
+    assert env_int("LORRAX_R_CHUNK", 0, print_fn=lines.append) == 0
+    assert "LORRAX SANITY" in "\n".join(lines)
+    assert "LORRAX_R_CHUNK" in "\n".join(lines)
+
+
 def test_there_is_no_bse_config_group(tmp_path):
     """Five keys, one dataclass, zero readers.
 

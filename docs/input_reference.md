@@ -47,8 +47,6 @@ page has to read it from.
 |---|---|---|
 | `centroids_file` | `"centroids_frac.txt"` | Charge-channel ISDF centroid table written by centroid.kmeans_cli. |
 | `centroids_file_current` | `""` | Second centroid table (Gordon-current weight) for the bispinor transverse channels; empty = not set. |
-| `gflat_chunk_size` | `0` | Flat-axis chunk of the r-chunk G-accumulation; 0 = planner-chosen, explicit > 0 wins. |
-| `vq_g_chunk_size` | `0` | V_q inner G-axis GEMM chunk; 0 = auto (largest divisor of ngkmax <= 4096). |
 | `zeta_ridge` | `0.0` | Opt-in Tikhonov ridge epsilon on the charge CCT (fraction of mean diagonal); 0 = bit-identical historical factor. Env LORRAX_ZETA_RIDGE. |
 | `charge_zeta_solve` | `"rank_truncate"` | Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky. |
 | `distributed_zeta_solve` | `"auto"` | Zeta back-solve tier: replicated | per_q | distributed (nothing O(mu^2) replicated); auto = replicated under the 4 GiB gather cap, else per_q. |
@@ -58,7 +56,6 @@ page has to read it from.
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
 | `band_chunk_size` | `16` | Bands per chunk in the band-chunked FFT/pair-density loops. |
-| `r_chunk_size` | `0` | Real-space columns per zeta-fit chunk; 0 = auto from the memory model. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
 ## Screening

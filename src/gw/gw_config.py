@@ -172,6 +172,32 @@ def env_float(name: str, default: float, *, print_fn=print,
         return default
 
 
+def env_int(name: str, default: int, *, print_fn=print) -> int:
+    """Canonical integer env parse: unset/blank → default, bad → ANNOUNCE.
+
+    :func:`env_float` one type along, and the difference is the point: a
+    chunk width is a COUNT, and ``int(float("12.5"))`` is a silently
+    different schedule than the one the operator asked for.  Both a
+    non-numeric value and a non-integral one announce and fall back,
+    naming the variable, so a knob that is not in force never looks like
+    one that is.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        key = (name, raw)
+        if key not in _ENV_ANNOUNCED:
+            _ENV_ANNOUNCED.add(key)
+            print_fn(f"  *** LORRAX SANITY: {name}={raw!r} is not an "
+                     f"integer; falling back to {default}.  The knob is NOT "
+                     f"in force. ***")
+        return default
+    return val
+
+
 # ---------------------------------------------------------------------------
 #  ζ-truncating env knobs
 # ---------------------------------------------------------------------------
@@ -1010,17 +1036,6 @@ _DEFAULTS = {
     #                   Zero persistent host residency (needed for
     #                   huge systems where host RAM can't hold ψ(G)).
     "gspace_mode": "host_cache",
-    # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
-    # per-scan-iter FFT box ``chunk_size · n_rtot``.
-    # 0 (default) = one-shot; the gflat memory model overrides this
-    # at runtime when its planner picks a smaller value, but cohsex.in
-    # > 0 wins over the planner.
-    "gflat_chunk_size": 0,
-    # V_q inner G-axis GEMM chunk size.  Bounds the per-q ``lax.scan``
-    # working set inside the per-q V_q kernel.
-    # 0 (default) = auto (``_pick_g_chunk(ngkmax)`` → largest divisor
-    # of ngkmax ≤ 4096).
-    "vq_g_chunk_size": 0,
     # ζ-fit solver path overrides (3-state).  Default ``auto`` picks
     # cuSolverMp on true 2D meshes (p_x ≥ 2 AND p_y ≥ 2) and the
     # JAX/CUDA fallback otherwise.  Force a path with ``on`` / ``off``.
@@ -1179,7 +1194,6 @@ _DEFAULTS = {
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
     "band_chunk_size": 16,
-    "r_chunk_size": 0,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -1488,7 +1502,26 @@ _LEGACY_DECK_KEYS = frozenset({
     # MPA head policy lands it joins the ``head_*`` family, which is where
     # head policy belongs, rather than reviving an ``mpa.*`` twin.
     "mpa_head_model",               # warn-and-ignore (one legal value)
+    # 0.1.0: the three planner OVERRIDES that are not ``band_chunk_size``.
+    # They move bytes between stages and change no number, which is the
+    # definition of an env knob in this tree (docs/dev/env_vars.md);
+    # freezing three HBM-schedule dials into a public deck would make
+    # every future planner change a compatibility question.  Their env
+    # twins are LORRAX_R_CHUNK / LORRAX_GFLAT_CHUNK / LORRAX_VQ_G_CHUNK,
+    # read at the same override seam.  ``band_chunk_size`` stays a deck
+    # key: it is the one an operator sizes a run by.
+    "r_chunk_size",                 # warn-and-ignore -> LORRAX_R_CHUNK
+    "gflat_chunk_size",             # warn-and-ignore -> LORRAX_GFLAT_CHUNK
+    "vq_g_chunk_size",              # warn-and-ignore -> LORRAX_VQ_G_CHUNK
 })
+
+#: The demoted chunk overrides: ``{deck key: env var}``.  One table so
+#: three warnings cannot drift from the three reads.
+_DEMOTED_CHUNK_KEYS = {
+    "r_chunk_size": "LORRAX_R_CHUNK",
+    "gflat_chunk_size": "LORRAX_GFLAT_CHUNK",
+    "vq_g_chunk_size": "LORRAX_VQ_G_CHUNK",
+}
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
 #: ``compute_mode`` value that now says it.  One table so the three
@@ -1699,13 +1732,13 @@ def read_lorrax_input(filename: str) -> dict:
             warnings.warn(
                 "Input key 'chunk_size' is no longer supported and will be "
                 "ignored (it was a no-op; chunk sizing is planner-owned — "
-                "see 'gflat_chunk_size' / 'band_chunk_size').",
+                "see 'band_chunk_size' / LORRAX_GFLAT_CHUNK).",
                 DeprecationWarning, stacklevel=2,
             )
             retired.append((
                 "chunk_size",
                 "IGNORED — it was a no-op; chunk sizing is planner-owned "
-                "(see 'gflat_chunk_size' / 'band_chunk_size')"))
+                "(see 'band_chunk_size' / LORRAX_GFLAT_CHUNK)"))
         for legacy_key in ("output_file", "eqp_output_file"):
             if section.get(legacy_key, fallback=None) is not None:
                 import warnings
@@ -1752,6 +1785,23 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        for _ck, _env in _DEMOTED_CHUNK_KEYS.items():
+            if section.get(_ck, fallback=None) is None:
+                continue
+            import warnings
+            warnings.warn(
+                f"Input key '{_ck}' was DEMOTED to the environment in "
+                f"0.1.0 and will be ignored here: it is an HBM-schedule "
+                f"override that moves bytes between stages and changes no "
+                f"number.  Export {_env}=<n> instead (0 or unset = the "
+                f"planner decides).",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                _ck,
+                f"IGNORED — demoted to the environment; export {_env}=<n> "
+                f"(0 or unset = the planner decides)"))
+
         if section.get("mpa_head_model", fallback=None) is not None:
             import warnings
             warnings.warn(
@@ -2337,9 +2387,11 @@ class MemoryConfig:
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
-    r_chunk_override: int         # 0 = auto
-    gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
-    vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
+    #: The three planner OVERRIDES, from the environment (0 = the planner
+    #: decides).  Deck keys until 0.1.0; see ``_DEMOTED_CHUNK_KEYS``.
+    r_chunk_override: int         # LORRAX_R_CHUNK
+    gflat_chunk_size: int         # LORRAX_GFLAT_CHUNK
+    vq_g_chunk_size: int          # LORRAX_VQ_G_CHUNK
 
 
 @dataclass(frozen=True)
@@ -2791,9 +2843,12 @@ class LorraxConfig:
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
             band_chunk_size=int(_g("band_chunk_size")),
-            r_chunk_override=int(_g("r_chunk_size")),
-            gflat_chunk_size=int(_g("gflat_chunk_size")),
-            vq_g_chunk_size=int(_g("vq_g_chunk_size")),
+            r_chunk_override=env_int("LORRAX_R_CHUNK", 0,
+                                     print_fn=print_fn),
+            gflat_chunk_size=env_int("LORRAX_GFLAT_CHUNK", 0,
+                                     print_fn=print_fn),
+            vq_g_chunk_size=env_int("LORRAX_VQ_G_CHUNK", 0,
+                                    print_fn=print_fn),
         )
         # SlabIO routing + auto-route GPU FFIs off on the CPU backend.
         # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both
