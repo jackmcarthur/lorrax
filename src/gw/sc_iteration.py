@@ -1176,8 +1176,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # read this (nk, nb, nb) array back twice to print one line.  Its
         # scalar read still synchronises, but the iteration synchronises
         # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
-        # ENFORCED, not printed -- see ``_check_kstar_spread``.
-        _check_kstar_spread(ks, delta_h_qp, print_fn=inputs.print_fn)
+        # MOVED, 2026-08-16: the star-spread enforcement used to run HERE,
+        # on the raw Sigma+V_H, and that is a different object from the one
+        # that ships.  ``apply_band_partition`` below zeroes every
+        # off-diagonal outside protected x protected, so it is the LAST thing
+        # that can break the star relation -- and until the partition was
+        # promoted to whole multiplets it could, by treating two members of a
+        # degenerate manifold differently.  Checking before it ran meant the
+        # gate certified an object the loop then modified.  See the call after
+        # ``apply_band_partition``.
         delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     if v_h_dft_new is not None:
@@ -1227,6 +1234,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         in_range_mask=inputs.partition.in_range_mask,
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
+    # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
+    # partition until 2026-08-16, which certified a matrix the loop then
+    # rewrote.  The partition is precisely the operation that could break the
+    # star relation -- a protected mask whose edge fell inside a degenerate
+    # multiplet gave one member off-diagonal Sigma and the other a scalar
+    # scissor -- so it is the one thing the check most needed to be after.
+    #
+    # This is a STRENGTHENING and it may turn red on a deck that passed
+    # before; that redness is correct and should be read as the partition
+    # breaking symmetry, not as this gate misfiring.  The mask is now promoted
+    # to whole multiplets at construction, which is what makes it pass.
+    #
+    # Full-BZ operand: the check needs every star member, and H_qp_dft_new is
+    # on the loop's k-set, so it is unfolded through the same map that
+    # reduced it.
+    if not ks.is_identity:
+        _check_kstar_spread(
+            ks, ks.broadcast(H_qp_dft_new), print_fn=inputs.print_fn)
 
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
@@ -1985,6 +2010,22 @@ def run_sc_driver(
     partition = BandPartition(
         protected_mask=in_range, in_range_mask=in_range)
     partition.warn_if_protected_outside_grid(print_fn=print_fn)
+    # THE PARTITION'S OWN BOUNDARIES, against the UNTRUNCATED mean field.
+    #
+    # ``classify_bands_in_grid`` is an all-k energy-window predicate, so the
+    # mask is not required to be contiguous and its edges are not required to
+    # fall between multiplets.  Report first — the number of splits and the
+    # gap they cut is what says how big the promotion below is — then promote,
+    # per the owner's ruling that degenerate spaces stay degenerate.
+    #
+    # ``wfn.energies[0]`` and NOT ``e_dft_active_kn_ry``: the active window is
+    # itself a slice, and ``boundary_min_gaps`` returns +inf at its outer edge
+    # by construction, so a window cannot see the cut that produced it.
+    _enk_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
+    _b0 = int(band_slices.sigma.start)
+    partition.report_multiplet_splits(_enk_full_ry, _b0, print_fn=print_fn)
+    partition = partition.promoted_to_multiplets(
+        _enk_full_ry, _b0, print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
     # independent jobs and only the first is optional:
