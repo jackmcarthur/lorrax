@@ -2842,6 +2842,7 @@ def run_sc_driver(
 
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
+    state_capacity: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
 
@@ -2885,6 +2886,32 @@ def final_qp_eigenstates(
     """
     E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
         state.H_qp_dft, n_occ, mesh_xy)
+    # ONE omega reference, fifth site (the final writers): the midgap rule
+    # is the insulating convention. A metallic run's eqp/sigma writers
+    # evaluated Sigma_c at midgap — 2.66 eV above the loop's fixed-N mu on
+    # sodium — distorting eqp0/eqp1.dat non-rigidly while the converged
+    # iterates were right (claim 0202 §2). The metallic reference is the
+    # fixed-N MP1 mu solved on THESE converged eigenvalues, same solver,
+    # width and capacity as the loop; uniform weights on the state's own
+    # k-set, the _solve_head_occupations convention.
+    if (state.occupation_state is not None
+            and str(state.occupation_state.smearing_family) == "mp1"):
+        if state_capacity is None:
+            raise ValueError(
+                "final_qp_eigenstates: a metallic occupation_state needs "
+                "state_capacity (spin_degeneracy_factor(wfn)) to place the "
+                "final mu; got None. The caller has the WFN in scope.")
+        from .efermi import solve_mp1_occupations
+        _E_np = np.asarray(E_ry, dtype=np.float64)
+        _st = state.occupation_state
+        _mu_ry, _ = solve_mp1_occupations(
+            _E_np,
+            np.full(_E_np.shape[0], 1.0 / _E_np.shape[0]),
+            float(_st.n_electrons),
+            float(_st.smearing_width_ry),
+            state_capacity=float(state_capacity),
+        )
+        efermi_ry = float(_mu_ry)
     return (
         np.asarray(E_ry, dtype=np.float64),
         np.asarray(U, dtype=np.complex128),
@@ -3053,8 +3080,10 @@ def dump_qp_wfn_artifacts(
     """
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy)
+        state, n_occ=n_occ, mesh_xy=mesh_xy,
+        state_capacity=float(spin_degeneracy_factor(wfn)))
     enk_irr_ry, U_irr = _on_kset(
         (enk_loop_ry, U_loop), kstar=kstar,
         have_ibz=state_on_ibz, want_ibz=True)
@@ -3121,7 +3150,10 @@ def dump_qp_wfn_artifacts(
     barrier("qp_wfn_h5_write")
     print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")
-    print_fn(f"  Final E_F (midgap, eV): {efermi_ry * RYD_TO_EV:.6f}")
+    _ref_kind = ("fixed-N mu" if (state.occupation_state is not None
+                 and str(state.occupation_state.smearing_family) == "mp1")
+                 else "midgap")
+    print_fn(f"  Final E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
     return qp_wfn_path, qp_rot_path, efermi_ry
 
 
