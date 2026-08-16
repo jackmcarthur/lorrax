@@ -217,6 +217,7 @@ def compute_sigma_c_mpa_omega_grid(
     crossing_target_error=None,
     max_rank,
     crossing_max_nodes,
+    omega_cluster_gap_ry=1.0,
     pole_batch_size=4,
     occupation_state=None,
     print_fn=print,
@@ -267,7 +268,8 @@ def compute_sigma_c_mpa_omega_grid(
             regularization_width_ry=regularization_width_ry,
             edge_factor=edge_factor, target_error=target_error,
             crossing_target_error=crossing_target_error,
-            max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
+            max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
+            omega_cluster_gap_ry=omega_cluster_gap_ry)
         print_fn(
             f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
             f"{geometry['n_windows']} logical windows")

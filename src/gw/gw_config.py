@@ -1433,10 +1433,18 @@ _DEFAULTS = {
     "mpa_sigma_sector_target_error": 6.5e-4,
     "mpa_sigma_crossing_target_error": 2.0e-3,
     "mpa_sigma_max_nodes": 96,
+    # Σ planner ω-clustering gap (Ry): with a gapped (patched) ω grid the
+    # crossing core decomposes per cluster; a contiguous grid is always
+    # one cluster and keeps the incumbent plan bit-for-bit.
+    "mpa_sigma_omega_cluster_gap_ry": 1.0,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
     "sigma_omega_step_ev": 0.25,
+    # "" = the contiguous [min, max] grid.  "lo:hi, lo:hi" (eV) = a union
+    # of uniform patches at sigma_omega_step_ev — the semicore dynamic-
+    # range spelling (docs/dev/crossing-rule-cost-law.md).
+    "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
     "sigma_window_edge_factor": 1.5,
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
@@ -2061,18 +2069,66 @@ class DynamicSigmaConfig:
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
+    #: ``sigma_omega_patches_ev``: "" (default, the contiguous
+    #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
+    #: patches at ``omega_step_ev``, replacing the contiguous grid.  This
+    #: is how a semicore run buys its dynamic range: dense points near
+    #: the valence window and near each semicore QP cluster, NO points
+    #: in the empty gap between them, so the MPA crossing rule never has
+    #: to resolve the gap (docs/dev/crossing-rule-cost-law.md).  The
+    #: Σ(ω)→E interpolation is searchsorted piecewise-linear and needs no
+    #: uniformity; solved QP energies landing inside a hole are refused
+    #: at the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).
+    omega_patches_ev: str = ""
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
+        self.parsed_omega_patches_ev()
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
+
+    def parsed_omega_patches_ev(self):
+        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
+
+        Parsed from ``"lo:hi, lo:hi"``.  Patches must be well-formed
+        (hi > lo), ascending, and separated by at least one step —
+        overlapping or touching patches are a deck typo, refused rather
+        than silently merged.
+        """
+        text = str(self.omega_patches_ev or "").strip()
+        if not text:
+            return []
+        patches = []
+        for piece in text.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            parts = piece.split(":")
+            try:
+                lo, hi = (float(parts[0]), float(parts[1])) \
+                    if len(parts) == 2 else (np.nan, np.nan)
+            except ValueError:
+                lo = hi = np.nan
+            if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+                raise ValueError(
+                    "sigma_omega_patches_ev must be 'lo:hi, lo:hi, ...' "
+                    f"with hi > lo in eV; could not parse {piece!r}")
+            patches.append((lo, hi))
+        for (l0, h0), (l1, h1) in zip(patches, patches[1:]):
+            if l1 < h0 + self.omega_step_ev:
+                raise ValueError(
+                    "sigma_omega_patches_ev patches must be ascending and "
+                    f"separated by at least one step; [{l0}:{h0}] then "
+                    f"[{l1}:{h1}] at step {self.omega_step_ev}. Merge "
+                    "them into one patch instead.")
+        return patches
 
 
 @dataclass(frozen=True)
@@ -2128,6 +2184,14 @@ class MPAConfig:
     sigma_sector_target_error: float
     sigma_crossing_target_error: float
     sigma_max_nodes: int
+    #: ``mpa_sigma_omega_cluster_gap_ry``: the Σ planner splits each
+    #: branch's |ω| evaluation values into clusters at gaps larger than
+    #: this, decomposing the crossing core per cluster (shell + Laplace
+    #: slabs) so the eta-resolved rule bandwidth is set by the cluster
+    #: span, not the dynamic range.  A contiguous grid is always one
+    #: cluster (the incumbent plan, bit-for-bit); pair with
+    #: ``sigma_omega_patches_ev`` to actually gap the grid.
+    sigma_omega_cluster_gap_ry: float = 1.0
 
     # pole_batch_size and the two Sigma target errors are validated at their
     # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
@@ -2167,6 +2231,11 @@ class MPAConfig:
                     "default 1e-5 Ha = 2e-5 Ry).")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
+        if not (np.isfinite(self.sigma_omega_cluster_gap_ry)
+                and self.sigma_omega_cluster_gap_ry > 0.0):
+            raise ValueError(
+                "mpa_sigma_omega_cluster_gap_ry must be finite and "
+                "positive (Ry); a huge value disables clustering")
 
     def sample_plan(self, omega_m_ry):
         """Return the configured double-parallel frequency plan in Ry.
@@ -2747,11 +2816,31 @@ class LorraxConfig:
         ``n = floor((max−min)/step + 0.5) + 1`` — the Ry grid is derived
         from this one by division so the two can never disagree in length
         or accumulate independent float-step rounding.
+
+        With ``sigma_omega_patches_ev`` set, the grid is the union of the
+        patches, each built by the SAME length-stable formula, ascending
+        by the patch validation.  ``sigma_omega_min/max_ev`` are ignored
+        then — the patches ARE the grid.
         """
         p = self.sigma
-        n = int(np.floor(
-            (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev + 0.5)) + 1
-        return p.omega_min_ev + p.omega_step_ev * np.arange(n, dtype=np.float64)
+        patches = p.parsed_omega_patches_ev()
+        if not patches:
+            n = int(np.floor(
+                (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev
+                + 0.5)) + 1
+            return (p.omega_min_ev
+                    + p.omega_step_ev * np.arange(n, dtype=np.float64))
+        pieces = []
+        for lo, hi in patches:
+            n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
+            pieces.append(lo + p.omega_step_ev * np.arange(
+                n, dtype=np.float64))
+        grid = np.concatenate(pieces)
+        if np.any(np.diff(grid) <= 0.0):
+            raise ValueError(
+                "sigma_omega_patches_ev produced a non-increasing grid; "
+                "patches must be ascending and disjoint")
+        return grid
 
     @property
     def omega_grid_ry(self):
@@ -2905,6 +2994,8 @@ class LorraxConfig:
             sigma_crossing_target_error=float(
                 _g("mpa_sigma_crossing_target_error")),
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
+            sigma_omega_cluster_gap_ry=float(
+                _g("mpa_sigma_omega_cluster_gap_ry")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
@@ -2916,6 +3007,7 @@ class LorraxConfig:
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
+            omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
         )
         _occ_family = _g("occ_smearing_family")
         _occ_family = (

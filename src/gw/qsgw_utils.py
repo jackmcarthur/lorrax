@@ -77,6 +77,48 @@ def interp_along_omega(
 # Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
 # ---------------------------------------------------------------------------
 
+def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
+                             context):
+    """Refuse solved QP energies inside a hole of a patched ω grid.
+
+    A patched grid (``sigma_omega_patches_ev``) has interior gaps by
+    design — that is what makes the MPA crossing rule's cost independent
+    of the dynamic range.  The Σ(ω)→E piecewise-linear interpolation is
+    silent about a hole: an energy in the gap would be interpolated
+    across it and come back plausible-looking and wrong.  So a hole is
+    detected from the grid itself (a step above 3× the median step) and
+    an in-grid-classified energy strictly inside one — more than one
+    median step from both hole edges — is a refusal that names the
+    energy and the fix (widen or add a patch).  Contiguous grids have
+    no holes and return immediately.
+    """
+    omega = np.asarray(omega_grid_ry, dtype=np.float64)
+    if omega.size < 2:
+        return
+    steps = np.diff(omega)
+    ref = float(np.median(steps))
+    holes = np.nonzero(steps > 3.0 * ref)[0]
+    if holes.size == 0:
+        return
+    E = np.asarray(E_kn_ry, dtype=np.float64)
+    mask = np.asarray(in_grid_mask, dtype=bool)
+    for i in holes:
+        lo, hi = float(omega[i] + ref), float(omega[i + 1] - ref)
+        inside = mask & (E > lo) & (E < hi)
+        if np.any(inside):
+            worst = float(E[inside].flat[0])
+            raise ValueError(
+                f"GATE omega_grid_hole ({context}): "
+                f"{int(np.sum(inside))} in-grid QP energies sit inside "
+                f"the ω-grid hole ({lo * RYD_TO_EV:.2f}, "
+                f"{hi * RYD_TO_EV:.2f}) eV — e.g. "
+                f"{worst * RYD_TO_EV:.3f} eV — where Σ(ω) would be "
+                "interpolated across the gap.  FALSE case: every solved "
+                "QP energy lies on a grid patch.  Widen the nearest "
+                "sigma_omega_patches_ev patch (QP energies drift between "
+                "QSGW iterations; leave headroom).")
+
+
 def solve_diagonal_sigma_fixed_point(
     h0_diag_ev: np.ndarray,
     sigma_omega_diag_ev: np.ndarray,
@@ -661,6 +703,9 @@ def solve_qp(
         classify_bands_in_grid, fit_scissor, full_bz_k_weights)
     band_in_grid, in_grid_kn_band = classify_bands_in_grid(
         E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
+    assert_omega_grid_covers(
+        E_sc_rel_ry, in_grid_kn_band, omega_grid_ry,
+        context="diagonal QSGW fixed point")
     n_bands_in = int(band_in_grid.sum())
     n_bands_total = int(band_in_grid.size)
     print_fn(
