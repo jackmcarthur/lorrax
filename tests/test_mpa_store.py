@@ -1311,5 +1311,66 @@ def test_a_slab_of_the_wrong_shape_refuses(tmpdir_path):
                         W[0][:, :n_mu - 1, :n_mu - 1])
 
 
+# ---------------------------------------------------------------------------
+# Arm 11 — EVERY h5py open this module makes is declared
+# ---------------------------------------------------------------------------
+
+def test_the_table_read_is_declared_to_the_registry(
+        tmpdir_path, tmp_path, monkeypatch):
+    """RED: ``read_w_tables`` was the ONE h5py open nobody could see.
+
+    It forwarded ``src`` straight to ``qirr_store.read_tables``, which
+    opens h5py itself, so the open was never declared to
+    :mod:`file_io.hdf5_owner` — and it is not a rare path: the fit driver
+    calls it on EVERY RANK to fetch the unfold tables (audit §E.3 item 2).
+    A blind spot there is a blind spot exactly where the store is
+    hottest, and neither the refusal nor the count could fire.
+
+    THE SYNTHETIC TWO-STACK SHAPE, as in ``test_hdf5_one_owner``: the FFI
+    side is a real ``note_open`` claim rather than a real phdf5 handle,
+    because what is under test is the DECLARATION, and faking the
+    transport must not fake the ownership.  Both instruments are asserted
+    — the registry (it refuses, and the refusal names this function) and
+    the journal (the allowed read leaves an h5py open line on this path,
+    in the one stream that carries both stacks).
+    """
+    from file_io import h5_journal as J
+    from file_io import hdf5_owner as HO
+
+    _write_w(tmpdir_path, n_omega=2)
+    monkeypatch.setenv(J.MODE_ENV, "1")
+    monkeypatch.setenv(J.DIR_ENV, str(tmp_path))
+    monkeypatch.delenv(HO.POLICY_ENV, raising=False)
+    HO.reset_for_test()
+    J.reset_for_test()
+    try:
+        # 1. THE REGISTRY.  With the FFI holding a write handle on this
+        #    path, a serial-h5py read is the undefined cross-stack case
+        #    A1 names — and the refusal carries the function, so a later
+        #    reader of the message knows which open to move.
+        token = HO.note_open(tmpdir_path, HO.STACK_FFI, "a",
+                             where="test: SlabIO(mode='a')")
+        try:
+            with pytest.raises(RuntimeError) as exc:
+                MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+            msg = str(exc.value)
+            assert "one-owner-per-file" in msg, msg
+            assert "mpa_store.read_w_tables" in msg, msg
+        finally:
+            HO.note_close(tmpdir_path, token)
+
+        # 2. THE JOURNAL.  The allowed read is COUNTED: the tables still
+        #    come back from the format layer, and the open is on the line.
+        tables = MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+        assert tables.canonical().digest()
+        with open(J.journal_path()) as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        want = f"stack=h5py op=open path={os.path.abspath(tmpdir_path)} "
+        assert [ln for ln in lines if want in ln], lines
+    finally:
+        HO.reset_for_test()
+        J.reset_for_test()
+
+
 if __name__ == "__main__":                              # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

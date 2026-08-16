@@ -401,10 +401,10 @@ def _qs():
 def _h5(target, mode, *, where=None):
     """THE serial-h5py door onto a store the FFI transport also drives.
 
-    Every h5py open in this module goes through here — with ONE measured
-    exception, named below — because every file this module writes is ALSO
-    written by ``SlabIO`` through a different HDF5 library instance (audit
-    A1; sandbox claims/0110).  What the door adds over a bare ``QirrDest``:
+    Every h5py open in this module goes through here, with no exception,
+    because every file this module writes is ALSO written by ``SlabIO``
+    through a different HDF5 library instance (audit A1; sandbox
+    claims/0110).  What the door adds over a bare ``QirrDest``:
 
     * it DECLARES the open to :mod:`file_io.hdf5_owner`, which refuses by
       name if the FFI currently holds a live handle on the same path and
@@ -425,14 +425,13 @@ def _h5(target, mode, *, where=None):
     flushed by this door, on any mode — the caller owns the handle and
     therefore owns its durability.  Only the path form gets the flush.
 
-    THE ONE OPEN THAT BYPASSES THIS DOOR, measured 2026-08-15:
-    :func:`read_w_tables` forwards straight to ``qirr_store.read_tables``,
-    which opens h5py itself and is never declared.  It runs on every rank
-    in production (``gw/mpa/fit_driver.py``, the unfold-table read), so the
-    registry has a blind spot there and cannot count or refuse it.  That is
-    a code fix, not a wording one, and it is on the follow-up list; until
-    it lands, do not read the invariant above as machine-enforced for that
-    path.
+    THE ONE OPEN THAT USED TO BYPASS IT was :func:`read_w_tables`, which
+    forwarded straight to ``qirr_store.read_tables`` and let the format
+    layer open h5py undeclared — on every rank, in production.  It routes
+    through here since 2026-08-15 (audit §E.3 item 2), which is what makes
+    the first sentence above a machine-enforced invariant rather than a
+    convention; ``test_the_table_read_is_declared_to_the_registry`` is the
+    cell that would notice it drifting back.
     """
     from .hdf5_owner import STACK_H5PY, is_write_mode, note_close, note_open
 
@@ -1501,8 +1500,18 @@ def read_w_tables(src, name, *, mode="r"):
     reading a v2 file does not have to know which module owns the table
     group.  They are ω-INDEPENDENT: one set for the whole frequency
     axis, because the symmetry operation acts on (q, μ, ν).
+
+    THROUGH :func:`_h5`, and that is the whole content of this wrapper.
+    ``qirr_store.read_tables`` opens h5py itself, so forwarding ``src``
+    to it was an h5py open the ownership registry could not see — the one
+    blind spot in this module's one-owner invariant, and not a rare one:
+    it runs on EVERY RANK in production (``gw/mpa/fit_driver.py``'s
+    unfold-table read).  The door takes the open and hands the already-open
+    group on, so the format layer still owns the reading and the registry
+    still owns the counting (audit §E.3 item 2).
     """
-    return _qs().read_tables(src, name, mode=mode)
+    with _h5(src, mode) as grp:
+        return _qs().read_tables(grp, name)
 
 
 # ---------------------------------------------------------------------------
