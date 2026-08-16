@@ -584,7 +584,7 @@ def _canonicalize_rep(rep, Rinv, tau):
     return canonicalize_orbit(rep[None, :], Rinv, tau)[0]
 
 
-@partial(jax.jit, static_argnames=['n_c'])
+@partial(jax.jit, static_argnames=['n_c', 'deterministic'])
 def kmeans_pp_init(
     positions_frac: jnp.ndarray,
     rho_flat: jnp.ndarray,
@@ -594,6 +594,7 @@ def kmeans_pp_init(
     offsets: jnp.ndarray | None = None,
     Rinv: jnp.ndarray | None = None,
     tau: jnp.ndarray | None = None,
+    deterministic: bool = False,
 ) -> jnp.ndarray:
     """Density-weighted k-means++ init.
 
@@ -602,6 +603,19 @@ def kmeans_pp_init(
     ``tau`` are given (default: identity-only ⇒ ordinary kmeans++).
     Centroids are canonicalised to a deterministic orbit member when
     sym data is provided.
+
+    ``deterministic=True`` replaces each Categorical draw with the ARGMAX of
+    the same score — the greedy D² (a.k.a. "greedy k-means++") variant.  The
+    objective it maximises is unchanged; only the tie-breaking between
+    near-equal candidates stops being random.  This exists because the seed
+    is the ONLY source of run-to-run variation in the whole centroid
+    pipeline: the Lloyd loop, the unfold and the pivoted-Cholesky prune are
+    each deterministic given their input, so the spread in downstream Sigma
+    agreement across seeds is entirely inherited from which local optimum
+    this initialisation happens to fall into.  Ties are broken to the lowest
+    flat grid index by ``argmax``, which on a symmetric density means the
+    initialisation itself is symmetry-covariant rather than accidentally
+    picking one member of a degenerate set.
     """
     if offsets is None:
         offsets = jnp.zeros((1, 3), dtype=jnp.int32)
@@ -615,7 +629,9 @@ def kmeans_pp_init(
     log_rho = jnp.log(jnp.maximum(rho_flat.astype(dtype), tiny))
 
     key, sub = jax.random.split(key)
-    first_cent = positions_frac[_gumbel_sample_argmax(log_rho, sub)]
+    first_cent = positions_frac[
+        jnp.argmax(log_rho) if deterministic
+        else _gumbel_sample_argmax(log_rho, sub)]
     if orbit_aware:
         first_cent = _canonicalize_rep(first_cent, Rinv, tau)
     centroids = jnp.zeros((n_c, 3), dtype=dtype).at[0].set(first_cent)
@@ -627,7 +643,9 @@ def kmeans_pp_init(
         centroids, min_d2, key = state
         key, sub = jax.random.split(key)
         log_w = jnp.log(jnp.maximum(min_d2, tiny)) + log_rho
-        new_cent = positions_frac[_gumbel_sample_argmax(log_w, sub)]
+        new_cent = positions_frac[
+            jnp.argmax(log_w) if deterministic
+            else _gumbel_sample_argmax(log_w, sub)]
         if orbit_aware:
             new_cent = _canonicalize_rep(new_cent, Rinv, tau)
         centroids = centroids.at[c_idx].set(new_cent)
@@ -687,8 +705,10 @@ def weighted_kmeans_jax(
         steps_taken: int.
         max_movement_sq: final max movement² in avec units squared.
     """
-    if init_method not in ('kpp', 'random'):
-        raise ValueError(f"init_method must be 'kpp' or 'random', got {init_method!r}")
+    if init_method not in ('kpp', 'random', 'greedy'):
+        raise ValueError(
+            f"init_method must be 'kpp', 'random' or 'greedy', "
+            f"got {init_method!r}")
     orbit_aware = R is not None
     if orbit_aware and (Rinv is None or tau is None):
         raise ValueError("orbit mode requires all of (R, Rinv, tau)")
@@ -708,12 +728,13 @@ def weighted_kmeans_jax(
     print(f"Grid: {Nx}×{Ny}×{Nz} = {positions.shape[0]} points; N_c = {N_c}")
 
     with timing.section("init"):
-        if init_method == 'kpp':
+        if init_method in ('kpp', 'greedy'):
             centroids = kmeans_pp_init(
                 positions, rho_flat, metric_tensor, N_c,
                 jax.random.PRNGKey(seed), offsets=offsets,
                 Rinv=Rinv if orbit_aware else None,
                 tau=tau if orbit_aware else None,
+                deterministic=(init_method == 'greedy'),
             )
         else:
             rho_p = rho_flat / jnp.sum(rho_flat)

@@ -67,6 +67,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("N_c", type=int, nargs="?", default=400,
                    help="Number of centroids (default 400).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--init", choices=("auto", "kpp", "random", "greedy"),
+                   default="auto",
+                   help="k-means initialisation. 'auto' (default) keeps the "
+                        "historical behaviour: k-means++, or density-weighted "
+                        "random above the N_c/n_rtot threshold. 'greedy' is "
+                        "the DETERMINISTIC greedy-D2 variant -- same "
+                        "objective, argmax instead of a Categorical draw -- "
+                        "which removes the only source of run-to-run "
+                        "variation in the pipeline (the Lloyd loop, the "
+                        "orbit unfold and the pivoted-Cholesky prune are all "
+                        "deterministic given their input, so seed spread in "
+                        "downstream Sigma agreement is inherited entirely "
+                        "from this step).")
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
                         "(default off — most prod runs don't want a popup).")
@@ -483,6 +496,9 @@ def main():
 
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
+        if args.init != "auto":
+            init_method, init_msg = args.init, (
+                f"init forced to {args.init!r} by --init")
         if init_msg is not None:
             print(init_msg)
         dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
