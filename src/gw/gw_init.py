@@ -37,7 +37,6 @@ from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 # keeps the copies identical.
 from .gw_config import (
 	env_bool,
-	active_zeta_truncating_knobs,
 	classify_xla_pool,
 	resolve_xla_gpu_memory_env,
 )
@@ -1209,36 +1208,15 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# complete-but-unstamped file, which _zeta_reuse_ok refits.  Rank 0
 	# only, then a barrier so no rank races ahead of the write.
 	#
-	# EXCEPT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
-	# breaks the r-chunk loop after N chunks (gw/isdf_fitting.py) and the
-	# writer downstream of the loop still calls ``mark_zeta_done``, so the
-	# partial ζ is stamped COMPLETE on disk.  Provenance records the
-	# CONFIGURATION, which a later production run in the same directory
-	# reproduces exactly — so stamping here would make _zeta_reuse_ok
-	# reuse a truncated ζ and produce silently wrong physics from a
-	# profiling knob.  Refusing the stamp breaks that chain outright
-	# (rule 4 of _zeta_reuse_ok: no provenance ⇒ refit).
-	#
-	# The writer now consults the SAME knob list before calling
-	# ``mark_zeta_done``, so a truncated file also carries
-	# ``zeta_is_done=False``.  The two guards stay separate on purpose —
-	# provenance answers "may a later run REUSE this", zeta_is_done answers
-	# "did the writer FINISH" — and either alone stops the reuse.
-	_trunc = active_zeta_truncating_knobs()
-	if _trunc:
-		_names = ", ".join(f"{k}={v}" for k, v in _trunc)
-		print_fn("")
-		print_fn("  " + "!" * 68)
-		print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
-		print_fn(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
-		print_fn( "  with fit_provenance, so no later run can reuse it.  The")
-		print_fn( "  writer also left isdf_header/zeta_is_done False, so no")
-		print_fn( "  restart path will trust it either.  Profiling only —")
-		print_fn( "  delete this file before any production run from this")
-		print_fn( "  directory.")
-		print_fn("  " + "!" * 68)
-		print_fn("")
-	elif jax.process_index() == 0:
+	# UNCONDITIONAL since 0.1.0.  It used to be skipped when a
+	# "truncating env knob" was in force -- there was exactly one,
+	# ``LORRAX_MAX_RCHUNKS=N``, which broke the r-chunk loop in
+	# ``gw/isdf_fitting.py`` after N chunks while the writer downstream
+	# still marked the file complete, so the partial zeta was stamped and
+	# a later production run in the same directory reused it: silently
+	# wrong physics from a profiling knob.  The knob is deleted, and with
+	# it both guards and the ``ZETA_TRUNCATING_ENV_KNOBS`` list they read.
+	if jax.process_index() == 0:
 		try:
 			from file_io.isdf_header import stamp_fit_provenance
 			stamp_fit_provenance(zeta_h5_path, _provenance)
@@ -1985,8 +1963,10 @@ def prepare_isdf_and_wavefunctions(
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
 			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
 			# the pipeline right after ζ-fit, before the expensive V_q
-			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_RCHUNK_DEBUG=1
-			# for fast per-r-chunk timing sweeps.
+			# stage.  Combine with LORRAX_RCHUNK_DEBUG=1 for per-r-chunk
+			# timing.  (LORRAX_MAX_RCHUNKS used to shorten the sweep
+			# further; it was deleted in 0.1.0 because it wrote a
+			# truncated ζ that two guards then had to disown.)
 			#
 			# The parse used to be a bare presence test, so *every* non-empty
 			# value exited — including ``LORRAX_EXIT_AFTER_ZETA=0``.  A debug

@@ -1156,47 +1156,42 @@ def test_config_uses_the_announcing_numeric_helpers():
 
 
 # ---------------------------------------------------------------------------
-# 5. Truncating-knob provenance guard
+# 5. The truncating-knob apparatus, deleted with the knob
 # ---------------------------------------------------------------------------
 
-def test_truncation_knobs_are_named_in_gw_init():
-    """``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop early, and the
-    writer still calls ``mark_zeta_done`` (isdf_fitting.py:1098).  If
-    ``gw_init`` then stamps ``fit_provenance`` (gw_init.py:478-486), the
-    TRUNCATED ζ becomes reusable by a later production run in the same
-    directory — silently wrong physics with no warning at all.
 
-    gw_init must therefore know which knobs truncate a fit.
+def test_the_truncating_knob_apparatus_is_gone():
+    """``LORRAX_MAX_RCHUNKS=N`` broke the r-chunk loop early, and the
+    writer still called ``mark_zeta_done`` (isdf_fitting.py) while
+    ``gw_init`` stamped ``fit_provenance`` — so the TRUNCATED ζ became
+    reusable by a later production run in the same directory.  Two guards
+    reading ``ZETA_TRUNCATING_ENV_KNOBS`` were added to disown the file
+    the knob had just written.
+
+    0.1.0 deletes the knob instead, and the whole apparatus with it: a
+    profiling dial that can write silently wrong physics is not worth the
+    machinery that makes it safe.  ``LORRAX_EXIT_AFTER_ZETA`` remains the
+    fit-only sweep, and it exits AFTER a complete fit.
+
+    Checked for the FAILURE signature — a surviving READ, which would be
+    a permanently-empty guard — rather than for the name's absence from
+    the source text: the comments that record why the knob went are
+    history, not readers.
     """
-    assert hasattr(gw_config, "ZETA_TRUNCATING_ENV_KNOBS")
-    assert "LORRAX_MAX_RCHUNKS" in gw_config.ZETA_TRUNCATING_ENV_KNOBS
-    assert hasattr(gw_config, "active_zeta_truncating_knobs")
-    with _Env(LORRAX_MAX_RCHUNKS=None):
-        assert gw_config.active_zeta_truncating_knobs() == []
-    with _Env(LORRAX_MAX_RCHUNKS="2"):
-        assert gw_config.active_zeta_truncating_knobs() == [
-            ("LORRAX_MAX_RCHUNKS", "2")]
-    # An empty value is not a truncation request.
-    with _Env(LORRAX_MAX_RCHUNKS=""):
-        assert gw_config.active_zeta_truncating_knobs() == []
+    assert not hasattr(gw_config, "ZETA_TRUNCATING_ENV_KNOBS")
+    assert not hasattr(gw_config, "active_zeta_truncating_knobs")
+    for mod in ("gw/gw_config.py", "gw/gw_init.py", "gw/isdf_fitting.py"):
+        tree = ast.parse(_read(mod), mod)
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        assert "active_zeta_truncating_knobs" not in names, mod
+        assert "ZETA_TRUNCATING_ENV_KNOBS" not in names, mod
+        strings = {n.value for n in ast.walk(tree)
+                   if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        assert "LORRAX_MAX_RCHUNKS" not in strings, mod
+    # RED TWIN: the two stamps the guards gated are still written.
+    assert "mark_zeta_done" in _read("gw/isdf_fitting.py")
+    assert "stamp_fit_provenance" in _read("gw/gw_init.py")
 
-
-def test_gw_init_consults_the_truncation_guard_before_stamping():
-    """Source-level: the provenance stamp must be guarded."""
-    src = _read("gw/gw_init.py")
-    assert "active_zeta_truncating_knobs" in src, (
-        "gw_init stamps fit_provenance unconditionally; a LORRAX_MAX_RCHUNKS "
-        "run therefore leaves a truncated ζ that _zeta_reuse_ok will reuse")
-    tree = ast.parse(src, "gw_init.py")
-    stamp_lines = [n.lineno for n in ast.walk(tree)
-                   if isinstance(n, ast.Call)
-                   and _func_name(n.func) == "stamp_fit_provenance"]
-    guard_lines = [n.lineno for n in ast.walk(tree)
-                   if isinstance(n, ast.Call)
-                   and _func_name(n.func) == "active_zeta_truncating_knobs"]
-    assert stamp_lines and guard_lines, (stamp_lines, guard_lines)
-    assert min(guard_lines) < min(stamp_lines), (
-        "the truncation guard must be evaluated before the stamp")
 
 
 # ---------------------------------------------------------------------------

@@ -455,46 +455,41 @@ def test_auditor_swallowed_barriers_does_not_fire_on_a_real_handler():
 # R4 — a truncated zeta must not be stamped complete
 # ===========================================================================
 
-def _audit_truncation_guard(src, name, stamp_fn):
-    """``[]`` when ``stamp_fn`` is reached only past a truncation check."""
-    tree = _tree(src, name)
-    calls = _call_names(tree)
-    stamps = calls.get(stamp_fn, [])
-    guards = calls.get("active_zeta_truncating_knobs", [])
-    if not stamps:
-        return ["%s never calls %s" % (name, stamp_fn)]
-    if not guards:
-        return ["%s calls %s with no truncation guard" % (name, stamp_fn)]
-    if min(guards) >= min(stamps):
-        return ["%s evaluates the truncation guard AFTER %s" % (name, stamp_fn)]
-    return []
+# The R4 guard apparatus is GONE with the knob it existed for.
+#
+# ``LORRAX_MAX_RCHUNKS=N`` broke the r-chunk loop early, the writer
+# downstream stamped ``zeta_is_done=True``, and ``gw_init`` then stamped
+# ``fit_provenance`` -- so a later production run in the same directory
+# REUSED a truncated zeta.  R4 added two guards, both reading
+# ``gw_config.ZETA_TRUNCATING_ENV_KNOBS``, to disown the file the knob had
+# just written.  0.1.0 deletes the knob instead: a profiling dial that can
+# write silently wrong physics is not worth the apparatus that makes it
+# safe.  ``LORRAX_EXIT_AFTER_ZETA`` is the fit-only sweep, and it exits
+# AFTER a complete fit.
+#
+# What survives is the requirement that no reader of the deleted list is
+# left behind -- an orphaned guard would be a permanently-empty check.
 
 
-def test_isdf_fitting_does_not_mark_a_truncated_zeta_done():
-    """R4.  ``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop early and the
-    writer downstream still stamped ``zeta_is_done=True`` — the file lying
-    about itself.  ``gw_init``'s existing guard blocks REUSE; this one stops
-    the claim being written."""
-    assert _audit_truncation_guard(
-        _read("gw/isdf_fitting.py"), "isdf_fitting", "mark_zeta_done") == []
+def test_no_truncating_knob_guard_survives_the_knob():
+    """A surviving READ, not a surviving mention: the comments recording
+    why the knob went are history."""
+    import ast
+
+    for mod in ("gw/isdf_fitting.py", "gw/gw_init.py", "gw/gw_config.py"):
+        tree = ast.parse(_read(mod), mod)
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        assert "active_zeta_truncating_knobs" not in names, mod
+        assert "ZETA_TRUNCATING_ENV_KNOBS" not in names, mod
+        strings = {n.value for n in ast.walk(tree)
+                   if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        assert "LORRAX_MAX_RCHUNKS" not in strings, mod
 
 
-def test_gw_init_still_guards_the_provenance_stamp():
-    """The sibling guard must not have regressed while R4 landed."""
-    assert _audit_truncation_guard(
-        _read("gw/gw_init.py"), "gw_init", "stamp_fit_provenance") == []
-
-
-def test_auditor_truncation_guard_can_fail():
-    """NEGATIVE CONTROL: unguarded, and guarded-too-late."""
-    unguarded = "def f(p):\n    mark_zeta_done(p)\n"
-    assert _audit_truncation_guard(unguarded, "u", "mark_zeta_done")
-    too_late = ("def f(p):\n    mark_zeta_done(p)\n"
-                "    t = active_zeta_truncating_knobs()\n")
-    bad = _audit_truncation_guard(too_late, "l", "mark_zeta_done")
-    assert bad and "AFTER" in bad[0], bad
-    missing = "def f(p):\n    pass\n"
-    assert _audit_truncation_guard(missing, "m", "mark_zeta_done")
+def test_the_stamps_are_still_written():
+    """RED TWIN: deleting the guards must not delete the stamps."""
+    assert "mark_zeta_done" in _read("gw/isdf_fitting.py")
+    assert "stamp_fit_provenance" in _read("gw/gw_init.py")
 
 
 # ===========================================================================

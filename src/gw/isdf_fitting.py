@@ -22,7 +22,7 @@ from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 # isdf.core imports too — plus an announcement for anything outside it).
 # See gw/gw_config.py's module comment and tests/test_env_grammar.py for
 # the drift gate.
-from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_bool
+from .gw_config import ZETA_RCOND_DEFAULT, env_bool
 
 from isdf.core import (
     c_q_from_psi_sm,
@@ -1165,44 +1165,6 @@ def fit_zeta_to_h5(
                       f"d_acc={_rss2 - _rss1:+.3f} "
                       f"rss_trim={_trimmed:.3f}GB", flush=True)
             r_progress.step()
-            # LORRAX_MAX_RCHUNKS=N: stop the r-chunk loop after N chunks
-            # for profiling/sweeping.  Clean python exit avoids the
-            # SLURM step-zombie issue you get from killing the python
-            # mid-run.  Off when unset.
-            #
-            # STRICT PARSE.  The old ``if _max_rchunks and ... >= int(...)``
-            # took any non-empty string as a request: ``=0`` — the natural
-            # spelling of "no limit" — is a truthy STRING whose int is 0, so
-            # ``(chunk_idx+1) >= 0`` fired on the very first chunk and
-            # truncated the fit to one r-chunk.  A non-numeric value raised a
-            # bare ``invalid literal for int()`` from inside the loop.  Both
-            # produce a PARTIAL ζ that the writer still marks complete, so
-            # they must refuse up front instead.
-            _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
-            _max_rchunks = _max_rchunks.strip() if _max_rchunks else ""
-            if _max_rchunks:
-                try:
-                    _max_n = int(_max_rchunks)
-                except ValueError:
-                    raise ValueError(
-                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} is not an "
-                        f"integer.  It truncates the ζ fit after N r-chunks "
-                        f"(profiling only); unset it to fit every chunk."
-                    ) from None
-                if _max_n < 1:
-                    raise ValueError(
-                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} must be >= 1.  "
-                        f"To disable the truncation, UNSET the variable — "
-                        f"'0' used to be accepted and truncated the fit to a "
-                        f"single r-chunk, silently."
-                    )
-            if _max_rchunks and (chunk_idx + 1) >= _max_n:
-                if jax.process_index() == 0:
-                    print(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
-                          f"reached after chunk {chunk_idx+1}; "
-                          f"breaking r-chunk loop for profiling.",
-                          flush=True)
-                break
 
 
     t_chunks_total = time.perf_counter() - t_chunk_start
@@ -1253,29 +1215,16 @@ def fit_zeta_to_h5(
     # whether the on-disk ζ is trustable; flipping it here (after the
     # global sync above) guarantees every rank's writes are durable.
     #
-    # NOT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
-    # breaks the r-chunk loop above after N chunks, so the tensor written
-    # a few lines up is a PARTIAL ζ — and this stamp is the file's own
-    # claim about itself.  ``gw_init`` already refuses to add
-    # ``fit_provenance`` in that case, which blocks REUSE; this stops the
-    # file lying in the first place.  The two guards are deliberately
-    # independent: provenance is about "may a later run reuse this", and
-    # ``zeta_is_done`` is about "did the writer finish", which it did not.
-    # Both read the one list in ``gw_config.ZETA_TRUNCATING_ENV_KNOBS``.
-    _trunc = active_zeta_truncating_knobs()
-    if _trunc and jax.process_index() == 0:
-        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        print("")
-        print("  " + "!" * 68)
-        print(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
-              f"(fewer than {num_chunks} r-chunks). ***")
-        print(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
-        print( "  complete (isdf_header/zeta_is_done stays False), so no")
-        print( "  restart or reuse path will trust it.  Profiling only —")
-        print( "  delete this file before any production run from this")
-        print( "  directory.")
-        print("  " + "!" * 68, flush=True)
-    elif jax.process_index() == 0:
+    # UNCONDITIONAL since 0.1.0.  It used to be skipped when a
+    # "truncating env knob" was in force -- there was exactly one,
+    # ``LORRAX_MAX_RCHUNKS=N``, which broke the r-chunk loop above after N
+    # chunks and left a PARTIAL zeta that this stamp would have called
+    # complete.  The knob, its two guards and the
+    # ``ZETA_TRUNCATING_ENV_KNOBS`` list they read are all deleted: a
+    # profiling dial that can write silently wrong physics is not worth
+    # the apparatus that makes it safe.  Use ``LORRAX_EXIT_AFTER_ZETA``
+    # for a fit-only sweep -- it exits AFTER a complete fit.
+    if jax.process_index() == 0:
         from file_io.isdf_header import mark_zeta_done
         mark_zeta_done(output_file)
 
