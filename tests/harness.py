@@ -1023,7 +1023,7 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
         eo = _parse_eo_column(output_file)
         e_ry = np.asarray([eo[k] for k in sorted(eo)]) / 13.6056980659
         if e_ry.ndim == 2 and e_ry.shape[1] >= nb:
-            gaps = boundary_min_gaps(e_ry)
+            gaps = boundary_min_gaps(e_ry, is_full_spectrum=False)
             out["_cut_clean"] = bool(nb >= gaps.size
                                      or gaps[nb] > DEGENERACY_TOL_RY)
     except Exception:                                          # noqa: BLE001

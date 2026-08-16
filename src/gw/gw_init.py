@@ -853,7 +853,11 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 		return
 	from common import band_degeneracy as _bd
 	enk = np.asarray(energies)[0]
-	gaps = _bd.boundary_min_gaps(enk)
+	# `enk` is `energies[0]` -- the loader's WHOLE ladder, not the zeta
+	# window -- which is what lets this seam see that the window's own
+	# edge slices.  Handing it the window instead would report +inf and
+	# certify the cut (band_degeneracy.boundary_min_gaps, 2026-08-15).
+	gaps = _bd.boundary_min_gaps(enk, is_full_spectrum=True)
 	for lo, hi, what in (
 			(band_range_left[0], band_range_left[1], "ISDF left window"),
 			(band_range_right[0], band_range_right[1], "ISDF right window")):
