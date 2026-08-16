@@ -34,7 +34,7 @@ __all__ = [
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky", "distributed_trsm",
-    "distributed_eigh",
+    "distributed_eigh", "batched_distributed_matmul",
     # batched ops (was slate/batched.py)
     "SlateBatchedLowerL", "batched_distributed_cholesky",
     "batched_distributed_trsm",
@@ -644,6 +644,7 @@ Restrictions
 
 _POTRF_TARGET = "lorrax_slate_batched_potrf"
 _TRSM_TARGET = "lorrax_slate_batched_trsm"
+_GEMM_TARGET = "lorrax_slate_batched_gemm"
 
 # _SIDE/_UPLO/_OP/_DIAG: shared with the single-matrix trsm section above
 # (batched.py carried an identical copy; merged).
@@ -659,6 +660,86 @@ _JIT_CACHE: dict = {}
 #: module's private spelling is kept because ``_scalapack`` and eight call
 #: sites in this file import it by that name; it is an alias, not a copy.
 _mesh_key = mesh_key
+
+
+def batched_distributed_matmul(
+    A: jax.Array, B: jax.Array, C: jax.Array, *, mesh: Mesh,
+    alpha=1.0, beta=0.0, transa: str = "N", transb: str = "N",
+) -> jax.Array:
+    """``slate::multiply`` over a face-sharded matrix stack.
+
+    A, B, and C are rank-3 ``P(None,'x','y')`` arrays; the result has C's
+    shape and returns at the same sharding.  The public
+    :func:`distrib_la.matmul` door supplies rank-2 lifting, placement,
+    provider resolution, and the optional zero C.  This backend requires a
+    process grid, float64 or complex128, N/T/C operation codes, exact
+    one-face-per-rank tiling, and one JAX process per mesh cell. CUDA uses
+    ``slate::Target::Devices``; CPU uses ``Target::HostTask``.
+    """
+    if A.ndim != 3 or B.ndim != 3 or C.ndim != 3:
+        raise ValueError("slate matmul expects three rank-3 operands")
+    if A.dtype != B.dtype or A.dtype != C.dtype:
+        raise ValueError("slate matmul operands must share dtype")
+    if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
+        raise ValueError(f"slate matmul supports float64/complex128; got {A.dtype}")
+    transa, transb = transa.upper(), transb.upper()
+    if transa not in "NTC" or transb not in "NTC":
+        raise ValueError("slate matmul transa/transb must be N/T/C")
+    px, py = validate_mesh(mesh, require_square=True)
+    nq, ar, ac = map(int, A.shape)
+    br, bc = int(B.shape[1]), int(B.shape[2])
+    m, ka = ((ar, ac) if transa == "N" else (ac, ar))
+    kb, n = ((br, bc) if transb == "N" else (bc, br))
+    if ka != kb or tuple(C.shape) != (nq, m, n):
+        raise ValueError(
+            f"slate matmul shapes disagree: A={A.shape}, B={B.shape}, "
+            f"C={C.shape}, trans={transa}/{transb}")
+    for dim, divisor, name in (
+            (ar, px, "A rows"), (ac, py, "A cols"),
+            (br, px, "B rows"), (bc, py, "B cols"),
+            (m, px, "C rows"), (n, py, "C cols")):
+        if dim % divisor:
+            raise ValueError(
+                f"slate matmul {name}={dim} not divisible by {divisor}")
+    ensure_registered(mesh)
+    ctx = get_or_init_context(mesh)
+    alpha, beta = complex(alpha), complex(beta)
+    attrs = dict(
+        nq=nq, m=m, n=n, k=ka,
+        a_rows=ar, a_cols=ac, b_rows=br, b_cols=bc,
+        mb_a=ar // px, nb_a=ac // py,
+        mb_b=br // px, nb_b=bc // py,
+        mb_c=m // px, nb_c=n // py,
+        transa={"N": 0, "T": 1, "C": 2}[transa],
+        transb={"N": 0, "T": 1, "C": 2}[transb],
+        alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
+        beta_re=float(beta.real), beta_im=float(beta.imag),
+        ctx_handle=int(ctx))
+    key = ("slate_gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape,
+           C.shape, transa, transb, alpha, beta, int(ctx))
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        local_out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+                 out_specs=P(None, "y", "x"), check_vma=False)
+        def _call(a, b, c):
+            return jax.ffi.ffi_call(
+                _GEMM_TARGET, local_out_t,
+                input_output_aliases={2: 0})(
+                    jnp.transpose(a, (0, 2, 1)),
+                    jnp.transpose(b, (0, 2, 1)),
+                    jnp.transpose(c, (0, 2, 1)), **attrs)
+
+        @partial(shard_map, mesh=mesh, in_specs=P(None, "y", "x"),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _untranspose(d):
+            return jnp.transpose(d, (0, 2, 1))
+
+        fn = jax.jit(lambda a, b, c: _untranspose(_call(a, b, c)),
+                     donate_argnums=(2,))
+        _JIT_CACHE[key] = fn
+    return fn(A, B, C)
 
 
 @dataclass(frozen=True)

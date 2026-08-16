@@ -41,14 +41,13 @@ from becoming the 2026-08-06 loss again.
 
 NEIGHBOURS THIS FILE STILL REACHES INTO.  Some cells here exercise
 production wiring in lorrax (``bandstructure.bse_setup``, ``isdf.core``,
-``runtime.padding``) or a backend that is NOT distrib_la's
-(``ffi.cublasmp`` -- cuBLASMp belongs to the future ``gemm`` service,
-charter wave 2).  They ride along behind :func:`_needs_monorepo`, which
+``runtime.padding``) or the fused W solve, which remains a monorepo-only
+cuBLASMp specialization.  They ride along behind :func:`_needs_monorepo`, which
 SKIPS with the reason naming what is missing, so a standalone install of
 this package still runs everything that is actually distrib_la's.  They
-move out at the replumb (step 3) and at the gemm extraction respectively;
-until then, deleting them would lose real coverage to make a boundary look
-tidy.
+move out at the replumb; until then, deleting them would lose real coverage
+to make a boundary look tidy.  Distributed GEMM itself is tested through
+the top-level :func:`distrib_la.matmul` surface below.
 
 Host platform: the slate ops also have CPU-backend handlers
 (``liblorrax_ffi_host.so``, registered under platform="cpu" -- see
@@ -245,13 +244,10 @@ needs_host_ffi = absent_or_broken(_HOST_STATE, _HOST_SKIP)
 def _needs_monorepo(what: str):
     """SKIP a cell whose subject has not been extracted into a service yet.
 
-    Two kinds ride along in this file: lorrax PRODUCTION WIRING (the
-    call sites distrib_la exists to serve — they leave at the replumb,
-    step 3) and cuBLASMp (a backend that belongs to the future ``gemm``
-    service, charter wave 2).  Both are real coverage; deleting them to
-    make the package boundary look tidy would trade a measured check for
-    a tidier import graph.  A standalone install skips them, naming what
-    is missing and who will own it.
+    LORRAX production wiring and the fused W solve ride along here.  They
+    are real coverage; deleting them to make the package boundary look tidy
+    would trade a measured check for a tidier import graph.  A standalone
+    install skips them, naming what is missing and who will own it.
     """
     if not os.path.isdir(os.path.join(_REPO, "src")):
         pytest.skip(f"no lorrax src/ next to this service (standalone "
@@ -396,8 +392,6 @@ def check_cusolvermp_eigh(mesh, dtype, n=32):
 
 
 def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
-    _needs_monorepo("cuBLASMp gemm")
-    from ffi.cublasmp import batched_distributed_gemm
     rng = np.random.default_rng(19)
     nq, m, k, n = 2, 32, 16, 24
     alpha, beta = ((1.3 - 0.7j, 0.4 + 0.2j)
@@ -416,9 +410,9 @@ def check_cublasmp_gemm(mesh, dtype, transa="C", transb="N"):
         A = _put(A_np, mesh, (None, "x", "y"))
         B = _put(B_np, mesh, (None, "x", "y"))
         C = _put(C_np, mesh, (None, "x", "y"))
-        return _gather(batched_distributed_gemm(
+        return _gather(D.matmul(
             A, B, C, mesh=mesh, alpha=alpha, beta=beta,
-            transa=transa, transb=transb))
+            transa=transa, transb=transb, backend="cublasmp"))
 
     D1 = solve()
     D2 = solve()

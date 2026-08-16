@@ -89,7 +89,7 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         return jax.device_put(arr, sharding)
 
     if check is None:
-        # The same falsy vocabulary as every other LORRAX knob.  A parse
+        # Accept the complete conventional falsy vocabulary.  A parse
         # that recognised only ""/"0"/"false" meant LORRAX_CHECK_REPLICA=off
         # silently ENABLED a P-linear all-gather (7.8 GB/rank at P=64,
         # scorecard Y.5) via a string that reads as "disabled".

@@ -21,9 +21,10 @@ the first exchange and dropped after the inverse exchange.  Padding is
 operation-safe: local Cholesky and LU solves replace padded A matrices by
 identity (and padded RHS matrices by zero); eigh may safely diagonalize its
 zero-Hermitian padding.  Matrix dimensions still have to tile the incoming
-``P(None,'x','y')`` face exactly; padding those dimensions would change the
-linear-algebra problem and belongs to the caller's existing extent-padding
-contract.
+``P(None,'x','y')`` face exactly.  Padding those dimensions would change the
+linear-algebra problem, so a consumer that needs it must pad before calling
+the plan and slice the result afterward; this route pads only the leading
+batch.
 """
 from __future__ import annotations
 
@@ -82,9 +83,8 @@ def validate_batch_reshard_operands(
         raise ValueError(
             f"batch_reshard {op}: the matrix face must tile the {px}x{py} "
             f"mesh exactly, but N={n} has remainders ({n % px},{n % py}). "
-            f"Pad the matrix extent through the caller's existing extent-"
-            f"padding contract; only the leading batch is padded by this "
-            f"route.")
+            f"Pad the matrix extent before calling and slice the result "
+            f"afterward; only the leading batch is padded by this route.")
 
     if op == "solve_lu":
         B = ops[1]
@@ -102,8 +102,8 @@ def validate_batch_reshard_operands(
             raise ValueError(
                 f"batch_reshard solve_lu: the RHS face is sharded over "
                 f"'y', but NRHS={nrhs} is not divisible by Py={py}.  Pad "
-                f"the RHS columns through the caller's existing extent-"
-                f"padding contract.")
+                f"the RHS columns before calling and slice the result "
+                f"afterward.")
 
     nb_pad = -(-nb // ndev) * ndev
     return nb, nb_pad - nb

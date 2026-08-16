@@ -115,8 +115,8 @@ ROUTE_BACKEND_BATCHED = "backend_batched"
 ROUTE_BATCH_RESHARD = "batch_reshard"
 
 #: Every route the toggle can name.  A vocabulary, like the backend names:
-#: importable with no jax and no ``.so``, so a test can enumerate the routes
-#: without a mesh.
+#: importable with no FFI ``.so``, so configuration code can enumerate the
+#: routes without probing a vendor library or constructing a mesh.
 BATCHED_ROUTES = (ROUTE_SCAN, ROUTE_BACKEND_BATCHED, ROUTE_BATCH_RESHARD)
 
 #: Public construction-time grammar.  ``scan`` and ``backend_batched`` stay
@@ -352,7 +352,7 @@ class Plan:
     # ---- introspection -------------------------------------------------
     @property
     def is_native(self) -> bool:
-        """True when the resolved backend is the in-tree JAX path."""
+        """True when the resolved backend is the native JAX path."""
         return self.backend == NATIVE
 
     @property
@@ -389,8 +389,8 @@ class Plan:
             second surface a caller can see or has to know about.
 
         (c) ``ROUTE_BATCH_RESHARD`` — move the batch axis onto the mesh
-            (the service-private sibling of
-            ``common.staged_reshard.face_to_batch_reshard``:
+            (the service-private staged exchange, kept inside this package
+            so an installed service has no upward dependency:
             ``P(None,'x','y') → P(('x','y'),None,None)``, two single-mesh-
             axis ``all_to_all``s, because the one-step move is not a tile
             permutation and GSPMD silently degrades it to
@@ -465,7 +465,7 @@ class Plan:
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what geometry."""
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
-        where = ("in-tree JAX, any layout" if self.is_native else
+        where = ("native JAX, any layout" if self.is_native else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
         n = "" if self.n is None else f", n={self.n}"
         return (f"{self.op}: {self.requested!r} -> {self.backend} "

@@ -586,6 +586,69 @@ def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
     return out
 
 
+def check_distributed_matmul(mesh, dtype="complex128", *,
+                             backend="off", batched_route="batch_reshard",
+                             nq=5, m=48, k=64, n=80):
+    """Top-level GEMM through a real provider or staged local route.
+
+    The provider cells enter cuBLASMp, PBLAS ``p?gemm`` or
+    ``slate::multiply`` on the real process grid.  The local cell uses a
+    deliberately ragged leading batch, exercising forward x/y exchanges,
+    local GEMM, and inverse y/x exchanges without an all-gather.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    ndev = int(mesh.devices.size)
+    if batched_route == D.ROUTE_BATCH_RESHARD and ndev > 1:
+        assert nq % ndev != 0, (
+            f"matmul batch nq={nq} divides P={ndev}; ragged padding is "
+            "not exercised")
+    rng = np.random.default_rng(20260816 + len(backend))
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    alpha = (1.25 - 0.375j if np.dtype(dtype).kind == "c" else 1.25)
+    beta = (-0.5 + 0.125j if np.dtype(dtype).kind == "c" else -0.5)
+    got = D.matmul(
+        _put(A_np, mesh, (None, "x", "y")),
+        _put(B_np, mesh, (None, "x", "y")),
+        _put(C_np, mesh, (None, "x", "y")),
+        mesh=mesh, alpha=alpha, beta=beta, backend=backend,
+        batched_route=batched_route)
+    assert got.sharding.spec == P(None, "x", "y")
+    got_np = _gather(got)
+    want = alpha * (A_np @ B_np) + beta * C_np
+    rel = _rel(got_np, want)
+    assert rel < RTOL, (
+        f"matmul {backend}/{batched_route} residual {rel:.3e}; "
+        f"shapes A={A_np.shape} B={B_np.shape} C={C_np.shape}")
+
+    # A conjugate-transpose catches descriptor/layout mistakes that an
+    # N,N square-product smoke cannot see.  The provider C buffer is
+    # donated, so this is a fresh call with fresh operands.
+    At_np = _rng_mat(rng, (2, k, m), dtype)
+    Bt_np = _rng_mat(rng, (2, k, n), dtype)
+    if backend == "cublasmp" and ndev > 1:
+        with _raises(ValueError, "not trustworthy"):
+            D.matmul(
+                _put(At_np, mesh, (None, "x", "y")),
+                _put(Bt_np, mesh, (None, "x", "y")),
+                mesh=mesh, transa="C", backend=backend,
+                batched_route=batched_route)
+        return {"nn_residual": rel, "conj_transpose": "refused"}
+    got_t = D.matmul(
+        _put(At_np, mesh, (None, "x", "y")),
+        _put(Bt_np, mesh, (None, "x", "y")),
+        mesh=mesh, transa="C", backend=backend,
+        batched_route=batched_route)
+    got_t_np = _gather(got_t)
+    want_t = np.conj(np.swapaxes(At_np, -1, -2)) @ Bt_np
+    rel_t = _rel(got_t_np, want_t)
+    assert rel_t < RTOL, (
+        f"matmul {backend}/{batched_route} transa=C residual {rel_t:.3e}")
+    return {"nn_residual": rel, "conj_transpose_residual": rel_t}
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -682,6 +745,13 @@ def test_batch_reshard_local_ops_smoke():
     check_batch_reshard_local_ops(_mesh_1x1("cpu"), nq=5, n=16, nrhs=8)
 
 
+def test_batch_reshard_matmul_smoke():
+    """The real staged movement is the P=4 CLI cell of the same body."""
+    check_distributed_matmul(
+        _mesh_1x1("cpu"), backend="off",
+        batched_route=D.ROUTE_BATCH_RESHARD, nq=5, m=8, k=12, n=16)
+
+
 def test_the_cli_cells_are_all_reachable():
     """Every ``_CLI_CELLS`` row names a function that exists and every
     check body is in the table.
@@ -735,6 +805,18 @@ _CLI_CELLS = [
      lambda mesh, dt: check_batched_eigh_dispatch(mesh, dt)),
     ("batch_reshard_local_ops", "",
      lambda mesh, dt: check_batch_reshard_local_ops(mesh, dt)),
+    ("matmul_batch_reshard", "",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="off", batched_route=D.ROUTE_BATCH_RESHARD)),
+    ("matmul_cublasmp", "CUDA",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="cublasmp", batched_route="auto", nq=4)),
+    ("matmul_scalapack", "cpu",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="scalapack", batched_route="auto", nq=4)),
+    ("matmul_slate", "",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="slate", batched_route="auto", nq=4)),
 ]
 
 

@@ -1,10 +1,11 @@
 """``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
 
-One door for ``eigh``, ``cholesky`` and ``solve_lu`` on an ``('x','y')``
-device mesh, over four backend families: **scalapack** (CPU preferred),
+One door for ``eigh``, ``cholesky``, ``solve_lu`` and ``matmul`` on an
+``('x','y')`` device mesh, over four backend families: **scalapack/PBLAS**
+(CPU preferred),
 **slate** (CPU fallback where it is not broken; ROCm always,
-declared-untested), **cusolvermp** (CUDA preferred) and **native** (pure
-JAX, everywhere).  A caller says what it wants computed and on which mesh;
+declared-untested), **cusolvermp/cuBLASMp** (CUDA preferred) and **native**
+(pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
 which library runs is a resolved fact it can read but never has to
 branch on.
 
@@ -12,10 +13,10 @@ THE PACKAGE IS THE DOOR.  There is no separate facade module: everything
 a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tests/test_layering.py`` fails on.  That is what makes
-"only distrib_la sees scalapack/slate/cusolvermp" checkable rather than
-aspirational — those three appear in exactly one dependency edge in this
-package (:mod:`distrib_la.loader`, which dlopens a ``.so`` by path) and in
-zero of its declared dependencies.
+"only distrib_la sees the provider families" checkable rather than
+aspirational — ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp appear in
+exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
+dlopens a ``.so`` by path) and in zero of its declared dependencies.
 
 The surface
 -----------
@@ -35,6 +36,12 @@ The surface
 ``Plan.native_fn``
     A pure, trace-safe closure — native backends only — for a call site
     that needs the math INSIDE its own ``jit``.
+``matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N',
+backend='auto', batched_route='auto')``
+    Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
+    plan.  The default dispatches to cuBLASMp, PBLAS or SLATE; the explicit
+    opt-in performs x/y face-to-batch exchanges, local GEMM, then y/x inverse
+    exchanges. ``backend='off'`` makes that route provider-free.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -76,6 +83,11 @@ from __future__ import annotations
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
+from distrib_la.matmul import (
+    MATMUL_BACKEND_CHOICES,
+    matmul,
+    resolve_matmul_backend,
+)
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTES,
@@ -106,6 +118,8 @@ from distrib_la.resolve import (
 __all__ = [
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
+    # distributed matrix multiplication
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_SCAN_UNROLL",

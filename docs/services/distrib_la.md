@@ -1,10 +1,50 @@
 # distrib_la — distributed dense linear algebra over a JAX device mesh
 
 `services/distrib_la/`. Independently installable (`pyproject.toml`,
-src-layout); depends on `lxkit` + jax and nothing else in LORRAX. Every
-vendor library it can reach — ScaLAPACK, SLATE, cuSOLVERMp — appears in
-exactly one dependency edge (`distrib_la.loader`, which `dlopen`s a `.so`
-by path) and in zero declared dependencies.
+src-layout); its runtime dependencies are `lxkit`, JAX, and NumPy. It imports
+nothing from LORRAX's `src/` or `common` packages. Every vendor library it can
+reach — ScaLAPACK/PBLAS, SLATE, cuSOLVERMp/cuBLASMp — appears behind exactly
+one dependency edge (`distrib_la.loader`, which `dlopen`s an optional provider `.so` by path)
+and in zero declared Python dependencies.
+
+## Standalone installation and capability model
+
+Python 3.12 or newer is required. From this source tree, install `lxkit` and
+`distrib_la` as two distributions; the editable spelling is useful for
+development but is not required:
+
+```bash
+cd services/distrib_la
+python -m pip install -e ../lxkit -e '.[test]'
+python -c "import distrib_la as d; print(d.BATCHED_ROUTE_CHOICES)"
+python -m pytest tests/test_distrib_la_shape_algebra.py \
+  tests/test_distrib_la_emulated_mesh.py \
+  tests/test_distrib_la_import_isolation.py \
+  tests/test_distrib_la_batch_reshard.py \
+  tests/test_distrib_la_matmul.py
+```
+
+An installed consumer imports only `distrib_la`'s top-level names. It does
+not call LORRAX's source-path bootstrap and does not need a LORRAX Python
+installation. Native JAX routes, capability reporting, and backend vocabulary
+work with no shared library present. NumPy is declared directly because the
+process-local placement and cuSOLVERMp context code import it at runtime; it
+is not merely a test dependency.
+
+`loader.get_lib()` has one optional import: it tries `h5py` in a caught block
+before `dlopen` so an already-installed h5py establishes the safe
+process-wide HDF5 symbol order. Absence is accepted and no public service API
+uses h5py, so it is intentionally not a hard dependency or package extra.
+
+The optional FFI provider is a separate capability. Set `LORRAX_FFI_SO`
+(CUDA) or `LORRAX_FFI_HOST_SO` (CPU) to an absolute path to a compatible
+library. Those historical environment names describe the provider ABI; they
+do not create an upward Python dependency. The current provider is built by
+LORRAX's C++ tree and exports a versioned handler ABI mirrored by this package.
+An absent `.so` does not break import, while an explicit missing, unstamped in
+strict mode, or ABI-incompatible pin refuses rather than falling through.
+`batched_route='batch_reshard'` with `backend='off'` is the completely
+provider-free spelling.
 
 ## Known limitation — `distributed_eigh` hangs at a 3×3 mesh for n ≥ 3072
 
@@ -62,9 +102,10 @@ hangs at a 3×3 mesh for every n ≥ 3072"). The run artifacts are under
 
 ## Purpose
 
-One door for `eigh`, `cholesky` and `solve_lu` on an `('x','y')` device
+One door for `eigh`, `cholesky`, `solve_lu`, and `matmul` on an `('x','y')`
+device
 mesh, so a driver says *what* to compute and *where*, never *which
-library*. Before this service the same three ops were dispatched from ten
+library*. Before the GEMM surface landed, the same three solver ops were dispatched from ten
 `src/` modules through four packages (`ffi.linalg`, `ffi.slate`,
 `ffi.scalapack`, `common.cholesky_2d`), with per-call-site guard ladders
 that disagreed; the worst measured consequence of that drift was a silent
@@ -94,10 +135,21 @@ failure that `tests/test_layering.py` fails on (with a red twin).
 | `dial_key()` | Factory-time dials folded into one tuple, for kernel cache keys. |
 | `probe_target`, `has_target` | Capability, with the ABSENT / BROKEN split (`lxkit.probe`). |
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='auto')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
+| `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='auto')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. Unlike `plan`, `backend='auto'` selects a distributed provider. |
+| `resolve_matmul_backend(requested, mesh, *, batched_route='auto') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
 single-phase API would have to lie about when it checked.
+
+One standalone limitation is intentional: under the native backend,
+`Plan.__call__`/automatic `Plan.batched` directly implement `eigh` only.
+Native Cholesky and LU channel policy remains caller-owned, so an installed
+consumer that wants those operations through the array-returning plan surface
+must select `batched_route='batch_reshard'`; Cholesky may alternatively select
+`backend='native2d'`, and either op may select an available FFI backend. The
+opaque `factor()`/`solve()` token surface is separate and is not changed by
+the batch route.
 
 ## Contract
 
@@ -118,8 +170,9 @@ single-phase API would have to lie about when it checked.
   re-raises `type(exc)(_why)`; a service-specific exception class would
   escape that handler and delete the `use_low_mem_eigh` refusal message.
 * **Layout.** Eigenvalues come back replicated; eigenvectors as **COLUMNS**,
-  on every backend. Batched inputs are `P(None,'x','y')`, single tiles
-  `P('x','y')`. `ensure_sharding` is the one place that is spelled.
+  on every backend. Plan and GEMM batched inputs are `P(None,'x','y')`, single
+  tiles `P('x','y')`; GEMM returns the same-rank face layout. `ensure_sharding`
+  is the one place that is spelled.
 * **Donation** is declared per op, not per call site:
   `eigh` donates nothing, `cholesky` donates argument 0, `solve_lu` donates
   0 and 1. A donated operand must be a fresh value at the call site.
@@ -150,8 +203,21 @@ including the declared-untested tier.
 | `cholesky` | `auto off native2d cusolvermp slate` | `native` | — (its CPU story is a channel-policy ladder in the caller, not one library) |
 | `solve_lu` | `auto off distributed cusolvermp scalapack` | `native` | cpu → **scalapack**, CUDA → **cusolvermp** |
 
-* `native` is the floor everywhere and the measured default at every
-  production tile size. `auto` never picks an FFI backend.
+The table above is the `Plan` resolver. GEMM has its own provider vocabulary
+and deliberately different default:
+
+| `matmul` request | CUDA | CPU | ROCm |
+|---|---|---|---|
+| `auto` or `distributed` | **cuBLASMp** | **PBLAS** (`pdgemm`/`pzgemm`) | **SLATE** (`slate::multiply`) |
+| `cusolvermp` | **cuBLASMp** alias | refuse | refuse |
+| `cublasmp` | **cuBLASMp** | refuse | refuse |
+| `scalapack` | refuse | **PBLAS** | refuse |
+| `slate` | **SLATE** | **SLATE** | **SLATE** (declared-untested) |
+| `off` | provider-free `batch_reshard` only | provider-free `batch_reshard` only | provider-free `batch_reshard` only |
+
+* For `Plan`, `native` is the floor everywhere and the measured default at
+  every production tile size; its `auto` never picks an FFI backend. For
+  top-level `matmul`, `auto` means the platform's distributed provider.
 * `native2d` is the 2-D block-distributed tiled Cholesky (`_native2d`, the
   old `common/cholesky_2d`). Pure JAX, every platform, but a *different
   algorithm*: at n=10k on P=128 the replicated-reshard route costs 1.6
@@ -194,9 +260,92 @@ including the declared-untested tier.
   compiled-in 0. Both loaders therefore open **CUDA before cpu**
   (`_open_cuda_before_host`). See Antipatterns.
 
+## Distributed matrix multiplication
+
+`matmul` is a top-level operation rather than a `Plan` op:
+
+```python
+D = distrib_la.matmul(
+    A, B, C, mesh=mesh, alpha=alpha, beta=beta,
+    transa='N', transb='N', backend='auto', batched_route='auto')
+```
+
+It computes `D = alpha * op(A) @ op(B) + beta * C`, where each operation
+code is `N`, `T`, or `C`. `C` is optional only when `beta == 0`; in that case
+the service creates a zero addend. Real operands refuse complex `alpha` or
+`beta`. All operands must have the same dtype, the contraction dimensions
+must agree, and a supplied `C` must have exactly the output shape.
+
+| input rank | public input sharding | batch contract | output |
+|---|---|---|---|
+| 2 | `P('x','y')` | one matrix, internally lifted to batch 1 | rank 2, `P('x','y')` |
+| 3 | `P(None,'x','y')` | A, B, and C have the same nonempty leading batch | rank 3, `P(None,'x','y')` |
+
+With `batched_route='auto'`, the resolved provider receives the original
+face-sharded matrices: cuBLASMp on CUDA, PBLAS `pdgemm`/`pzgemm` on CPU, or
+`slate::multiply` on ROCm. Explicit `cublasmp`, `scalapack`, and `slate`
+requests never demote, and `cusolvermp` names its cuBLASMp sibling. Provider
+handlers accept `float64` and `complex128`, require an exact 2-D `('x','y')`
+mesh with y-minor process order, one JAX process per cell, and exact face
+tiling. They alias/donate `C` to the output. cuBLASMp and SLATE also require a
+square mesh; PBLAS supports rectangular grids. `backend='off'` has no
+provider and is therefore legal only with the staged route.
+
+With `batched_route='batch_reshard'`, the service pads a leading batch `B`
+to `Bp = ceil(B/(Px*Py)) * Px*Py`, using zero A, B, and C matrices. Zero is a
+safe synthetic GEMM row and all padded results are discarded. Each operand
+then follows these collectives inside one `shard_map`:
+
+| stage for a generic `X: (Bp,R,C)` | per-device shape | collective |
+|---|---|---|
+| incoming face | `(Bp, R/Px, C/Py)` | — |
+| x forward | `(Bp/Px, R, C/Py)` | x `all_to_all(split_axis=0, concat_axis=1)` |
+| y forward | `(Bp/(Px*Py), R, C)` | y `all_to_all(split_axis=0, concat_axis=2)` |
+
+Local devices apply `op(A)` and `op(B)`, run `jnp.matmul`, and add `beta*C`.
+For `D: (Bp,M,N)`, the literal inverse is deliberately in reverse order:
+
+| stage for D | per-device shape | collective |
+|---|---|---|
+| local result | `(Bp/(Px*Py), M, N)` | — |
+| y inverse | `(Bp/Px, M, N/Py)` | y `all_to_all(split_axis=2, concat_axis=0)` |
+| x inverse | `(Bp, M/Px, N/Py)` | x `all_to_all(split_axis=1, concat_axis=0)` |
+| returned face | original leading batch only | drop the padded rows |
+
+This is staged device-to-device movement, never a host gather and never a
+direct sharding constraint that could rematerialize a full stack. It accepts
+a ragged leading batch, but deliberately does **not** pad matrix dimensions:
+physical rows of A/B/C must divide `Px`, physical columns must divide `Py`,
+and output M/N must do the same. These checks run before placement or a
+collective. Rank, batch, dtype, contraction, operation-code, scalar, and
+missing-C errors also refuse eagerly.
+
+The staged route is a capacity tradeoff. Each device holds
+`ceil(B/(Px*Py))` complete A, B, and D matrices (plus C when `beta != 0`),
+the still-live caller faces/padded faces, collective exchange buffers, and
+JAX GEMM workspace. With `beta == 0`, no synthetic C is allocated or
+exchanged.
+Rank-2 input is padded to `Px*Py`, so each device still holds one complete
+operand set even though only one row is real. Use it only when those complete
+matrices fit comfortably; the provider route remains the default for matrices
+that require 2-D distribution for capacity.
+
+Provider-specific refusals still matter when a provider is selected. A
+non-`off` provider request is resolved and probed even with
+`batched_route='batch_reshard'`; use `backend='off'` for a provider-free call.
+An unavailable handler, wrong platform, partial-world mesh, unsupported
+provider dtype, or incompatible face extent refuses rather than falling back.
+Multi-rank cuBLASMp accepts only `transa='N', transb='N'`. The real P=4 gate
+found that transpose-A returns a wrong result, while transpose-B can return
+rank-divergent `INVALID_VALUE` and deadlock. Both are refused before the
+provider call; pretranspose into the ordinary face layout, select PBLAS/SLATE,
+or use the staged route.
+
 ## Tests
 
-Four tiers, markers `services` + `distrib_la`, applied by a collection hook
+The suite spans local algebra, emulated devices, real processes, FFI/ELF
+acceptance, import isolation, and skip honesty. Markers `services` +
+`distrib_la` are applied by a collection hook
 (a `pytestmark` in a conftest is silent — `tests/test_service_selection.py`
 measures that the marks arrived).
 
@@ -205,6 +354,7 @@ measures that the marks arrived).
 | L-a shape/contract algebra | `test_distrib_la_shape_algebra.py` | nothing — a laptop, milliseconds |
 | L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | route-c staged movement | `test_distrib_la_batch_reshard.py` | four emulated CPU devices; all three local kernels, ragged batches, inverse round trip + wrong-order red twin |
+| GEMM provider + staged contract | `test_distrib_la_matmul.py` | four emulated CPU devices; backend vocabulary, rank-2 and ragged rank-3 GEMM, transpose codes, and exact x/y + y/x schedule |
 | L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
 | contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |
 | C++ / ELF acceptance | `test_so_acceptance.py` | binutils + a pinned `.so`; reads the ELF, never dlopens |
@@ -215,11 +365,40 @@ measures that the marks arrived).
   and padding round-trips, with the anti-tautology self-assertion (the pad
   divisor must be provably non-vacuous).
 * **Every check ships with the case where it returns FALSE.** No exceptions.
-* Run it standalone: `pytest services/distrib_la/tests` (never loads
-  `tests/conftest.py`). Run it from the monorepo: `pytest -m distrib_la`.
+* From an installed editable package in `services/distrib_la`, run
+  `python -m pytest`. From the repository root, run
+  `python -m pytest services/distrib_la/tests`; the service conftest loads
+  first and creates four emulated CPU devices before JAX imports. Neither
+  spelling loads the monorepo `tests/conftest.py`. Before the GEMM surface
+  landed, the source-only/emulated floor at commit `0ba29095` was **82
+  passed**, including **13** focused route-(c) cells. The current total also
+  includes `test_distrib_la_matmul.py`; use collection/run output rather than
+  treating the historical count as a present invariant.
+* Run it as part of LORRAX with `python -m pytest -m distrib_la`.
   Deselect: `--no-services` / `--only-service=NAME`, never a second `-m`
   (`pyproject` sets `addopts = "-m 'not extra'"` and an explicit `-m`
   REPLACES it, silently re-enabling 26 deselected suites).
+* The scheduler-specific real-GPU gate is deliberately separate from the
+  installable package's local suite. On Perlmutter it is:
+
+  ```bash
+  export LX_BASE_MODULE=lorrax_J070
+  lx run -N 1 -G 4 -n 4 python3 -u \
+    services/distrib_la/tests/test_distrib_la_multiproc.py \
+    --mesh 2x2 --only batch_reshard_local_ops
+  ```
+
+  On 2026-08-15, commit `0ba29095`, that solver gate ran a ragged batch of five on
+  four CUDA ranks and passed `complex128` and `float64` for `eigh`,
+  `cholesky`, and `solve_lu`: **2 cells / 0 failures**. The gate asserts the
+  output shardings before its test-only host readback. It predates `matmul`
+  and is not evidence for either GEMM provider execution or staged GEMM on
+  real CUDA processes.
+* `python -m pytest` runs the FFI/ELF and machine-profile gates as well. On
+  Perlmutter, the profile promises working provider libraries, so the full
+  suite requires the documented `LORRAX_FFI_{,HOST_}SO` pins and dependent
+  library paths; missing promised capabilities fail skip honesty instead of
+  being counted as acceptable standalone skips.
 * Perlmutter floor, 2026-08-07, HEAD `eeece71`, BUILD_NOTES pins: full-suite
   `-m distrib_la` **130 cells / 0 failed / 22 skipped** (was 124 / 8 failed
   before the SONAME fix); service-only by path **250 / 0 / 3**, of which
@@ -250,7 +429,8 @@ Regression detection = diffing baseline files across branches.
 > into that change — read the A/B table for this route, not
 > `baselines/*.json`, until a regeneration leg lands.
 
-**`auto` resolves to `native` everywhere, and the numbers say why.**
+**For the three `Plan` ops, `auto` resolves to `native` everywhere, and the
+numbers say why.** (`matmul` uses the separate provider default above.)
 
 | op | backend | mesh | shape (nq, n) | s |
 |---|---|---|---|---|
@@ -313,7 +493,7 @@ There is no in-tree edit that moves this. `block_size` does not either
 | 1024 | **0.27120** | 0.55437 | 2.04× |
 | 2048 | **1.48904** | 4.12157 | 2.77× |
 
-`auto` → `native` (`resolve.py`) is therefore **vindicated on both
+`Plan`'s `auto` → `native` (`resolve.py`) is therefore **vindicated on both
 platforms**, at every size anyone has measured. Do not change it.
 
 ### `distributed` eigh is for CAPACITY, not speed — and that regime is UNMEASURED
@@ -391,44 +571,90 @@ choice collapses to **`Plan.batched_route`, the one place that decides**:
 * **(c)** `ROUTE_BATCH_RESHARD` — reshard
   `(q, μ_x, ν_y) → (q_xy, μ, ν)`, run the op locally with the native
   JAX kernel per matrix, and reshard matrix outputs back through the literal
-  inverse exchange. This serves
-  the very-large-`N_μ` doctrine right up to single-matrix capacity
-  **without paying any distributed-library fixed cost** — which the tables
-  above show is the entire cost below n ≈ 10⁴.
+  inverse exchange. This serves batches of matrices below single-device
+  capacity **without paying any distributed-library fixed cost** — which the
+  tables above show is the entire cost below n ≈ 10⁴.
 
 (a)/(b)/(c) behind one toggle point is how small-system, non-distributed
 linalg happens **without a parallel API**.
 
-**Route (c) is built without an upward package dependency.**
-`common.staged_reshard.face_to_batch_reshard` established the exchange:
-`P(None,'x','y') → P(('x','y'),None,None)` as two single-mesh-axis
-`all_to_all`s, because the one-step move is not a tile permutation and
-GSPMD silently degrades it to replicate-then-partition (measured 64×
-per-rank residency blow-up, job 7882974). `distrib_la` is independently
-installable and therefore cannot import `common`; its private
-`_batch_reshard` module carries the same `split_b_first` schedule and its
-literal inverse inside one `shard_map`:
+**Route (c) is built without an upward package dependency.** A direct
+`P(None,'x','y') → P(('x','y'),None,None)` constraint is not a tile
+permutation: GSPMD has lowered it as replicate-then-partition, with a measured
+64× per-rank residency blow-up (job 7882974). The package therefore owns a
+small private implementation in `_batch_reshard`; it imports no LORRAX
+`common` module. Forward movement and its literal inverse run inside one
+`shard_map`, using only device collectives. For padded global batch `Bp`, the
+local shapes and exact `all_to_all` arguments are:
 
-```
-face→batch: x(split q, join μ), then y(split q, join ν)
-batch→face: y(split ν, join q), then x(split μ, join q)
-```
+| step | operation | local shape after the step |
+|---|---|---|
+| input face | `P(None,'x','y')` | `(Bp, N/Px, N/Py)` |
+| forward x | `all_to_all('x', split_axis=0, concat_axis=1, tiled=True)` | `(Bp/Px, N, N/Py)` |
+| forward y | `all_to_all('y', split_axis=0, concat_axis=2, tiled=True)` | `(Bp/(Px·Py), N, N)` |
+| inverse y | `all_to_all('y', split_axis=2, concat_axis=0, tiled=True)` | `(Bp/Px, N, N/Py)` |
+| inverse x | `all_to_all('x', split_axis=1, concat_axis=0, tiled=True)` | `(Bp, N/Px, N/Py)` |
+
+Thus x splits batch and joins matrix rows, then y splits batch and joins
+matrix columns; the inverse must run y then x. A wrong-order inverse is
+shape-correct on a square mesh, so the test suite contains both a bit-exact
+movement round trip and a red twin proving that x-then-y scrambles the data.
+No operand or output gathers through the host.
 
 The local kernels are `jnp.linalg.eigh`, `jnp.linalg.cholesky`, and
-`jnp.linalg.solve`, covering every array-returning `Plan.batched` op.
-Eigh eigenvalues take a device `all_gather` back to the service's replicated
-vector contract; eigenvectors, factors, and solve outputs take the inverse
-`all_to_all` pair. Nothing gathers through the host. A leading batch that
-does not divide `Px·Py` is padded and dropped inside the route: zero-Hermitian
-for eigh, identity A for Cholesky/LU, and zero RHS for LU. Matrix faces keep
-the existing exact-tiling contract (`N % Px == N % Py == 0`, and
-`NRHS % Py == 0` for LU); violations refuse before placement or collective
-entry. Backend-only `block_size` is consumed at the route boundary and never
-leaks into `jnp.linalg.*`.
+`jnp.linalg.solve`, covering all three array-returning `Plan.batched` ops.
+Outputs preserve the ordinary service contract:
+
+* `eigh`: eigenvalues `(B,N)` are restored with a device
+  `all_gather(('x','y'), axis=0, tiled=True)` and returned replicated at
+  `P()`; eigenvectors take the inverse exchanges and return at
+  `P(None,'x','y')`.
+* `cholesky`: factors take the inverse exchanges and return at
+  `P(None,'x','y')`.
+* `solve_lu`: solutions take the inverse exchanges and return at
+  `P(None,'x','y')`.
+
+Ragged batch handling is internal. `Bp = ceil(B/(Px·Py))·Px·Py`, and
+synthetic rows are dropped after the inverse. Eigh gets zero-Hermitian rows;
+Cholesky and LU replace each synthetic A with identity; LU's synthetic RHS
+is zero. Those are safe inputs to the local kernels and prevent padded
+Cholesky/LU rows from producing singular-factor NaNs. This padding covers
+only the leading batch. Matrix faces must tile exactly
+(`N % Px == N % Py == 0`), and LU RHS columns must obey
+`NRHS % Py == 0`; rank/shape/dtype/extent violations refuse eagerly before
+placement or collective entry. A consumer may pad a matrix/RHS extent before
+the call and slice afterward, but the package cannot infer that transformation
+without changing the mathematical problem.
+
+Backend-only `block_size` is consumed at the route boundary and never reaches
+`jnp.linalg.*`. `compute_evecs` is likewise consumed for `eigh`, because the
+public result always contains eigenvectors; any other unsupported keyword
+refuses with `TypeError` instead of leaking into a local kernel.
 
 The public opt-in is construction-time:
 `plan(..., batched_route='batch_reshard')`; `Plan.batched(...)` remains the
-single call surface. `auto` is byte-for-byte the historical selection.
+single call surface. Route selection and backend selection are orthogonal:
+the requested backend is still resolved and, if explicit, probed before route
+(c) runs its native kernel. Use `backend='off'` when no provider capability is
+intended. `auto` preserves the historical choice exactly: native `eigh` and
+FFI backends with a stacked entry resolve to `backend_batched`; remaining FFI
+backends resolve to `scan`. `Plan.describe()` records both the requested and
+resolved backend and the requested and resolved batch route.
+
+Plan construction also calls the package-local `warm_mesh_cliques(mesh)`.
+It is a cached no-op for GPU/NCCL, non-MPI CPU transports, single-process
+runs, and already-warmed meshes. On multi-process JAX CPU with
+`JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, it synchronously compiles tiny
+`psum`s for the x, y, and flattened `(x,y)` cliques on the main thread before
+the route's `all_to_all`s can be compiled from an intra-op worker.
+
+**Capacity is the route's hard boundary.** After the two forward exchanges,
+each device holds `Bp/(Px·Py)` complete `N×N` matrices and runs a native
+dense solver on them. At least one full matrix, its matrix-shaped output, and
+the solver workspace must fit on one device; multiple local batch elements
+increase that peak further. The exchanges are volume-preserving, but they do
+not make a single matrix smaller. When one full matrix cannot fit, retain the
+default/distributed tile route rather than selecting `batch_reshard`.
 
 #### What the restructure cost and bought
 
@@ -586,16 +812,15 @@ evidence — the SLATE trsm back-solve had never run before step 2:
 * **Re-deriving a mesh identity by hand.** Use `mesh_key(mesh)`. `id(mesh)`
   as a cache key is only safe when the cached value retains the mesh, and
   the case where it does not is exactly where somebody re-spells it.
-* **Bypassing the `sys.path` bootstrap.** `services/*/src` is on no
-  `PYTHONPATH` any launcher sets: `lx` rewrites the container `PYTHONPATH`
-  to exactly `<checkout>/src` and the Shifter image pip-installs nothing.
-  A module that imports `distrib_la` must call `ffi._services.ensure_on_path()`
-  first (`tests/test_service_path_bootstrap.py` runs the bare-`sys.path`
-  import in a subprocess). This is transitional plumbing with an owner
-  decision behind it — do not paper over it with a `sys.path.insert` of
-  your own, and do not assume a green pytest leg proves it: the service
-  conftest puts services on the path during collection, so a broken
-  bootstrap is a **green-suite / red-cluster** failure.
+* **Confusing an installed package with LORRAX's source-checkout
+  bootstrap.** A normal consumer installs `lxkit` and `distrib_la` and then
+  imports the latter directly; it must not import `ffi._services` or edit
+  `sys.path`. Only an uninstalled LORRAX checkout needs the transitional
+  `ffi._services.ensure_on_path()` call, because `lx` sets container
+  `PYTHONPATH` to `<checkout>/src` and does not install `services/*/src`.
+  `tests/test_service_path_bootstrap.py` covers that LORRAX integration
+  seam, while the package's own import-isolation suite proves the installed
+  service has no upward dependency.
 * **Assuming the two platform `.so`s are independent.** They share
   `libslate.so.2` / `libblaspp.so.2` by SONAME. Opening the host library
   first gives every CUDA SLATE handler a `blas::get_device_count()` of 0

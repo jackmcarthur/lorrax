@@ -1,24 +1,33 @@
-# The SLATE backend — distributed dense linear algebra on GPUs from JAX
+# The SLATE backend — distributed dense linear algebra from JAX
 
-Was `src/ffi/slate/README.md`.  The python package it documented is
-`distrib_la._slate` now, reached through
-`distrib_la.backend_module("slate")` — the wave-0 replumb deleted the
-`ffi.slate` re-export package, which was its own stated deletion gate.
-Names below that read `ffi.slate.X` are `distrib_la._slate.X`; the C++
-under `src/ffi/cpp/slate/` did not move and the FFI target strings are
-frozen (ffi_layout.md invariant 1).
+This is the backend-maintainer companion to the public service guide at
+`docs/services/distrib_la.md`. `distrib_la` remains independently installable:
+its Python package imports no LORRAX module, and SLATE is an optional FFI
+capability rather than a Python dependency. The current compatible provider
+is built by LORRAX's `src/ffi/cpp/slate/` tree; the build sections below
+document that provider, not an installation prerequisite for native routes.
+
+The backend implementation is consolidated in private module
+`distrib_la._slate`, reached by maintainers through the public
+`distrib_la.backend_module("slate")` lookup. Consumers use `plan`, `factor`,
+`solve`, and top-level `matmul`; importing `_slate` directly is outside the
+public package API.
+The old `ffi.slate` re-export and split `cholesky.py`, `trsm.py`, `eigh.py`,
+`batched.py`, and `context.py` files no longer exist.
 
 JAX FFI wrappers around [SLATE](https://icl.utk.edu/slate/) (a tile-based
 MPI + GPU dense linear algebra library from ICL).  Currently exposes:
 
 - `distributed_cholesky(A, mesh)` → `SlateLowerL`  (`slate::potrf`)
 - `distributed_trsm(A_or_handle, B, mesh, ...)`   (`slate::trsm`)
+- `batched_distributed_matmul(A, B, C, mesh, ...)` (`slate::multiply`)
 - `distributed_eigh(A, mesh)` → `(W, Q)`           (`slate::heev`; W AND
   true column eigenvectors — `A @ Q == Q @ diag(W)` at ~1e-14.  The
   historical "eigvec layout artifact" was root-caused 2026-07-10: the
   FFI read stale device tiles without `tileGetForReading` — heev's
   back-transform leaves the valid Z copy on the host — plus a missing
-  local-transpose pair on top.  Fixed in eigh.py / ../cpp/slate/eigh_ffi.cc.)
+  local-transpose pair on top. Fixed in `distrib_la._slate` and
+  `src/ffi/cpp/slate/eigh_ffi.cc`.)
 
 cholesky, trsm and eigh hit machine-precision residuals (~1e-16 /
 ~1e-14) on meshes with `p == q` or `q == 1` (N×1) where
@@ -26,34 +35,47 @@ cholesky, trsm and eigh hit machine-precision residuals (~1e-16 /
 for trsm, which used to abort the whole job.  `1×q` meshes are rejected
 (SLATE-internal stride assertion — see Restrictions).
 
-## Quick start
+## Public quick start
 
 ```python
+import jax
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from distrib_la import plan, factor, solve
-# ...or, for the raw handle API this page documents:
-from distrib_la._slate import distributed_cholesky, distributed_trsm
+from distrib_la import factor, matmul, solve
 
 mesh = Mesh(np.asarray(jax.devices()).reshape(p, q), ('x', 'y'))
-A    = jax.device_put(A_np, NamedSharding(mesh, P('x', 'y')))   # Hermitian PD
-B    = jax.device_put(B_np, NamedSharding(mesh, P('x', 'y')))
+A = jax.device_put(A_stack, NamedSharding(mesh, P(None, 'x', 'y')))
+B = jax.device_put(B_stack, NamedSharding(mesh, P(None, 'x', 'y')))
 
-L_handle = distributed_cholesky(A, mesh=mesh)
-X_fwd    = distributed_trsm(L_handle, B, mesh=mesh, op='N')   # L X = B
-X_adj    = distributed_trsm(L_handle, B, mesh=mesh, op='C')   # L^H X = B
+token = factor('cholesky', A, mesh, backend='slate', n=A.shape[-1])
+X = solve(token, B)  # solves A[q] @ X[q] == B[q]
 
-L_jax = L_handle.to_jax_lower()   # standard row-major lower-tri L
+# The public door lifts rank-2 operands or accepts the rank-3 face stacks
+# above. backend='auto' also selects SLATE on a ROCm mesh.
+D = matmul(A, B, mesh=mesh, backend='slate')
 ```
 
-Smoke tests / benches (via the LORRAX module — `module load lorrax`
-sets the select_gpu / Cray MPICH / LD_PRELOAD / XLA memory flags):
+The token intentionally hides `SlateLowerL`; it cannot be reshared or passed
+through `jit`. Backend maintainers who need the raw primitives may use
+`slate = distrib_la.backend_module('slate')`, but application code should not.
+
+Local service tests and the current Perlmutter multi-process spelling are:
 
 ```bash
-lxalloc
-lxrun python3 -u -m common.slate_cholesky_trsm_test -n 256 --dtype c128
-lxrun python3 -u -m common.slate_batched_test --nbatch 8 -n 128 --mesh 2x2 --dtype c128
-lxrun python3 -u -m common.slate_chol_trsm_bench --mesh 2x2 -n 1024
+cd services/distrib_la
+python -m pytest tests/test_distrib_la_contract.py -k slate
+python -m pytest tests/test_distrib_la_matmul.py
+
+cd ../..
+export LX_BASE_MODULE=lorrax_J070
+lx run -N 1 -G 4 -n 4 python3 -u \
+  services/distrib_la/tests/test_distrib_la_multiproc.py \
+  --mesh 2x2 --only slate
 ```
+
+The claims-style performance driver is
+`services/distrib_la/bench/bench_distrib_la.py`. It records baselines and is
+not a pass/fail test.
 
 ## Design rationale
 
@@ -65,7 +87,7 @@ Three coordinated pieces make SLATE play nicely with JAX-sharded data:
    — pure local op, no inter-rank comm.  The transposed bytes are the
    original block in col-major layout, which SLATE reads correctly.
 
-2. **MPI rank remap** (C++ `../cpp/slate/context.cc`).  SLATE's `fromDevices`
+2. **MPI rank remap** (C++ `src/ffi/cpp/slate/context.cc`).  SLATE's `fromDevices`
    hardcodes `GridOrder::Col` (rank of tile `(i, j)` = `i + j*p`),
    while JAX's C-order mesh reshape puts shard `(mx, my)` on rank
    `mx*q + my`.  These don't agree for `p != 1, q != 1`, so we
@@ -73,9 +95,9 @@ Three coordinated pieces make SLATE play nicely with JAX-sharded data:
    to rebuild the comm such that SLATE's tile-to-rank assignment matches
    JAX's shard-to-rank assignment.
 
-3. **GPU-aware MPI** (wired up by `config/modulefiles/lorrax/...lua`
-   → `lxrun` / `lxshell`, build-time by `../cpp/run_shifter.sh`, both via
-   `../cpp/in_container.sh`).  Cray MPICH on Perlmutter does GPU-Direct
+3. **GPU-aware MPI** (wired up by the `lx` launch environment, build-time by
+   `src/ffi/cpp/run_shifter.sh` through `src/ffi/cpp/in_container.sh`).
+   Cray MPICH on Perlmutter does GPU-Direct
    RDMA over Slingshot (the closest equivalent to NCCL for any
    MPI-based library) only when `MPICH_GPU_SUPPORT_ENABLED=1` and
    `libmpi_gtl_cuda.so` is loaded.  shifter's `--module=mpich`
@@ -89,26 +111,55 @@ The combination yields the standard SLATE convention (`side='L',
 uplo='L', op='N'`) for the trsm of a Cholesky factor: no inverted
 sides, no opaque-handle gymnastics inside the user's mental model.
 
+## Distributed GEMM
+
+The public `distrib_la.matmul` door maps `backend='slate'` to
+`slate::multiply`. It accepts rank-2 `P('x','y')` matrices or rank-3
+`P(None,'x','y')` stacks and returns the same-rank face layout. Rank 2 is
+lifted to a one-element stack before the private wrapper; the handler loops
+over rank-3 stack elements while reusing the process-grid context. Operation
+codes are `N`, `T`, and `C`, and the full contract is
+`alpha * op(A) @ op(B) + beta * C` for `float64` or `complex128`.
+
+The CUDA handler in `gemm_ffi.cc` constructs matrices with `fromDevices` and
+runs `slate::multiply(..., Target::Devices)`. The host handler in
+`gemm_host_ffi.cc` uses `fromScaLAPACK` and `Target::HostTask`. Both consume
+the same JAX face layout, reuse the context's MPI rank remap, and alias C as D
+when XLA honours donation. The wrapper locally transposes row-major JAX tiles
+on entry and transposes the result back on exit, just as the other SLATE
+surfaces do.
+
+This provider path is the default `matmul` route on ROCm; explicit `slate`
+also selects it on CUDA or CPU when the matching handler exists. It is
+distinct from `batched_route='batch_reshard'`, which exchanges faces x then y,
+runs local JAX GEMM, and exchanges D back y then x. A non-`off` SLATE request
+is still capability-probed even with that staged route; use `backend='off'`
+for a provider-free staged call. Leading-batch padding belongs only to the
+staged route. The SLATE provider loops the batch as supplied and requires all
+physical and output matrix extents to tile the process grid exactly.
+
 ## Restrictions / known gaps
 
 - `mesh` must have axes named `('x', 'y')`.  No 3-D-mesh / sub-mesh
   selection yet (see *GWJAX adaptation* below for the workaround).
 - `p * q == jax.process_count()`.  Partial-world / sub-comm calls
   aren't implemented.
-- `p == q` or `q == 1` (N×1) — with both axes > 1 and `p != q`, the
+- The solver wrappers require `p == q` or `q == 1` (N×1) — with both axes > 1
+  and `p != q`, the
   square SLATE tile size cannot give one tile per rank on both axes, so
   JAX's block shards and SLATE's block-cyclic tiles diverge (silent
   wrong answers).  `1×q` grids additionally hit a size-dependent SLATE
   assertion (`internal_batch.hh:290: group.ld[m] == Mij.stride()`,
   SIGABRT on all ranks): local stride `lld = n` ≠ tile size `nb = n/q`,
   and SLATE's device-region batching wants uniform strides.  `p ≥ q`
-  meshes have `lld == nb` and are safe.  `validate_tile_layout`
-  (context.py) rejects both classes; use the transposed (q×1) mesh.
+  meshes have `lld == nb` and are safe. `validate_tile_layout` in
+  `distrib_la._slate` rejects both classes; use the transposed (q×1) mesh.
   The batched wrappers' per-slice `(1, Py)` sub-grid is the same stride
   class — production-validated on 2×2, but the 1×4 `nbatch=8, n=128`
   assert repro documented below remains an accepted risk there.
 - `heev` additionally requires `p == q` (SLATE's algorithm).
-- Default tile size `nb = n // max(p, q)` is the ONLY layout-consistent
+- For solver matrices, default tile size `nb = n // max(p, q)` is the ONLY
+  layout-consistent
   value on multi-rank meshes (one tile per rank); `block_size=`
   overrides are rejected there and only allowed on a 1×1 mesh.  The
   same invariant is why trsm's X needed per-dimension tile sizes in the
@@ -116,7 +167,11 @@ sides, no opaque-handle gymnastics inside the user's mental model.
   rank): the old square-`nb` X on a rectangular RHS aborted every rank
   via an uncatchable `blas::Error` from a SLATE OpenMP task (2×2) or
   silently mis-assembled B (1×4).  Fixed 2026-07-10 in
-  `../cpp/slate/{trsm,batched_trsm}_ffi.cc`.
+  `src/ffi/cpp/slate/{trsm,batched_trsm}_ffi.cc`. Distributed GEMM also
+  requires a square process grid: with one face tile per operand, SLATE's
+  inner tile count is `Py` for A but `Px` for B on an N/N rectangular grid.
+  The public resolver, private wrapper, and C++ handler all refuse that
+  geometry before entering SLATE; PBLAS remains valid on rectangular grids.
 - Exceptions thrown inside SLATE's OpenMP tasks CANNOT be caught by the
   FFI handler's try/catch — they `std::terminate` all ranks.  Layout
   preconditions must be validated Python-side before invoking the FFI
@@ -124,6 +179,10 @@ sides, no opaque-handle gymnastics inside the user's mental model.
 - 3 local transposes per cholesky+trsm chain.  At `n ~ 1k–4k` on
   4 A100s the chain runs ~150–500 ms; below ~1k the transposes are a
   visible fraction of total time.
+- SLATE GEMM accepts only F64/C128, matching operand dtypes, `N/T/C` operation
+  codes, a nonempty matching rank-3 batch (or the public rank-2 lifting), and
+  A/B/D physical extents divisible by the corresponding mesh axes. A supplied
+  C must match D exactly; `C=None` is legal only when `beta == 0`.
 
 ## GWJAX adaptation: batched `(Nq, Nmu, Nmu)` cholesky+trsm
 
@@ -132,9 +191,8 @@ User scenario: a batch of `Nmu × Nmu` Hermitian PD matrices, depth
 be 2-D-sharded; multiple batch elements should be processed in
 parallel across the available GPUs.
 
-**Implemented** — see [`batched.py`](batched.py),
-[`../cpp/slate/batched_potrf_ffi.cc`](../cpp/slate/batched_potrf_ffi.cc),
-[`../cpp/slate/batched_trsm_ffi.cc`](../cpp/slate/batched_trsm_ffi.cc).  The sharding
+**Implemented** in `distrib_la._slate` plus
+`src/ffi/cpp/slate/{batched_potrf,batched_trsm}_ffi.cc`. The sharding
 contract is `P('x', None, 'y')`: batch across `'x'`, inner matrix
 across `'y'`.  Each X-row of the mesh gets its own MPI sub-comm of
 size `Py` (`MPI_Comm_split` by `x_rank`, via
@@ -164,28 +222,26 @@ of scope; cuSOLVERMp is the answer if you need rectangular meshes.
   for-loop for small-n Hermitian batches; SLATE remains the AMD-GPU
   fallback path (HIP/Frontier).
 - ~~**`heev` eigenvectors.**~~  RESOLVED 2026-07-10 — stale MOSI tile
-  read + missing transpose pair; see `../cpp/slate/eigh_ffi.cc`.
+  read + missing transpose pair; see `src/ffi/cpp/slate/eigh_ffi.cc`.
 - **`gels` / least-squares.**  Useful for the ISDF fitting paths
   (separate ticket).
 
 ## Files
 
-- `cholesky.py` — `distributed_cholesky` + `SlateLowerL` handle.
-- `trsm.py`     — `distributed_trsm` (handle + plain-array paths).
-- `eigh.py`     — `distributed_eigh`.
-- `batched.py`  — `batched_distributed_{cholesky,trsm}` + `SlateBatchedLowerL`.
-- `context.py`  — per-(p,q) `MPI_Comm` + `SlateCtx` cache + `validate_mesh`
-                  + `get_or_init_subrow_context` for the batched sub-comm.
-- `../cpp/slate/ctx.h`           — `SlateCtx` struct.
-- `../cpp/slate/context.cc`      — `lrx_slate_{context,subrow_context}_create/destroy/init_mpi`.
-- `cpp/{eigh,potrf,trsm}_ffi.cc` — XLA FFI handlers per op (CUDA).
-- `cpp/batched_{potrf,trsm}_ffi.cc` — batched variants (sub-row comm, CUDA).
-- `../cpp/slate/host_ffi.cc` — host-platform variants of all five handlers
-  (JAX CPU backend; compiled only into `liblorrax_ffi_host.so`).
-- `scripts/stage_cray.sh` — populate `$HOME/software/lorrax_slate_cray/stage`
-  with libsci + libmpi_gtl_cuda + xpmem + lustreapi (run once per
-  module update).
-- `scripts/build_perlmutter.sh` — reproducible SLATE builds (see below).
+- `services/distrib_la/src/distrib_la/_slate.py` — Python contexts,
+  validation, handles, and all single/stacked wrappers.
+- `services/distrib_la/src/distrib_la/factor.py` — the public opaque-token
+  Cholesky factor/solve path.
+- `services/distrib_la/src/distrib_la/loader.py` — provider discovery,
+  handler registration, ABI check, and CUDA-before-host load order.
+- `src/ffi/cpp/slate/{ctx.h,context.cc}` — provider contexts and MPI remap.
+- `src/ffi/cpp/slate/{eigh,potrf,trsm,gemm}_ffi.cc` — CUDA handlers per op;
+  GEMM calls `slate::multiply`.
+- `src/ffi/cpp/slate/batched_{potrf,trsm}_ffi.cc` — batched sub-row handlers.
+- `src/ffi/cpp/slate/host_ffi.cc` and `gemm_host_ffi.cc` — CPU variants in
+  `liblorrax_ffi_host.so`.
+- `src/ffi/cpp/stage/slate_build_perlmutter.sh` — reproducible provider
+  SLATE builds (see below).
 
 ## Building
 
@@ -239,8 +295,9 @@ export LORRAX_SLATE_INSTALL_DIR=...                            # LDLIB override
 
 ### CPU story — host platform SUPPORTED (2026-07-10)
 
-The slate ops run on the JAX CPU backend through host handler variants
-(`../cpp/slate/host_ffi.cc`): `fromScaLAPACK()` on the host buffers (same 2-D
+The SLATE ops run on the JAX CPU backend through host handler variants
+(`src/ffi/cpp/slate/host_ffi.cc`, plus `gemm_host_ffi.cc` for multiply):
+`fromScaLAPACK()` on the host buffers (same 2-D
 block-cyclic layout + GridOrder::Col as `fromDevices`, so the local
 transposes, comm rank-remap, and every mesh/tile validation carry
 unchanged), `Target::HostTask`, plain `memcpy` staging, no stream ctx.
@@ -255,7 +312,7 @@ built host-side (Cray PE, no container) against the `cpu`
 the container's jaxlib (the runtime the .so must match).  The script
 fails if the result links any CUDA-stack library.
 
-`ffi_loader.py` registers the host handlers under `platform="cpu"` and
+`distrib_la.loader` registers the host handlers under `platform="cpu"` and
 the CUDA ones under `platform="CUDA"` — same target names, so
 `jax.ffi.ffi_call` sites resolve by lowering platform exactly like
 jaxlib's cpu (lapack) vs CUDA (cusolver) kernel split.  Wrapper call
@@ -313,7 +370,7 @@ Tests: `services/distrib_la/tests/test_distrib_la_contract.py` (the
 `test_distrib_la_multiproc.py --mesh 2x2`; run via `lx run` / `lx test`
 inside an allocation.  The benches are `services/distrib_la/bench/`.
 
-### Batched variant — `batched.py`, `batched_{potrf,trsm}_ffi.cc`
+### Batched variant — `_slate.py`, `batched_{potrf,trsm}_ffi.cc`
 
 For the GWJAX `(Nq, Nmu, Nmu)` workload, `batched_distributed_cholesky`
 and `batched_distributed_trsm` take a 3-D input sharded
@@ -325,9 +382,10 @@ per-rank batch calling `slate::potrf` / `slate::trsm` on each slice.
 SLATE has no native batched potrf, so the "batching" is literally a
 C++ for-loop — but the sub-comm setup is shared across iterations,
 which is the only bit that matters for amortising Python↔XLA dispatch
-overhead.  See `batched.py` docstring for the full shape contract and
-`src/common/slate_batched_test.py` for a 4-GPU 2×2 correctness test
-(machine precision).
+overhead. See the `batched_distributed_cholesky` and
+`batched_distributed_trsm` docstrings in `distrib_la._slate` for the full
+shape contract and `test_distrib_la_multiproc.py` for the real 4-rank
+correctness gate.
 
 ## References
 
