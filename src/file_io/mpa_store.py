@@ -1,8 +1,13 @@
 """Frequency-resolved W restart tensors and the B/Omega fit store.
 
 This module owns MPA sample and pole bytes.  It remains dependency-light:
-nothing here imports from ``gw``, and the ``symmetry_maps`` door is imported
-lazily through :func:`_qs`, so importing ``file_io`` still costs no jax.
+nothing here imports from ``gw``, the ``symmetry_maps`` door is imported
+lazily through :func:`_qs`, and every ``jax`` import is inside the function
+that needs it — so importing THIS MODULE costs no jax.  (Importing the
+``file_io`` PACKAGE does, and has since the wfn_loader extraction:
+``file_io/__init__.py`` imports ``wfn_loader`` at module scope and that
+imports jax.  Re-measured 2026-08-15; this sentence used to claim the
+package was jax-free and it has not been for some time.)
 
 WHAT THIS FORMAT IS.  The multipole-W fit needs W_c evaluated on the
 double-parallel sampling grid — 2·n_p complex frequencies on two lines
@@ -21,7 +26,9 @@ frequency-free file would hold, so the axis is REMOVABLE later without
 touching any downstream reader — the fit stage can graduate to holding
 one frequency at a time, or the axis can be dropped entirely for a
 static-W run, and neither is a format migration.
-:func:`read_w_slab` is that read, and the removability claim has a test.
+:func:`read_w_slab` is that read — the HOST-SEAM spelling of it; the
+production reader is :func:`read_w_slab_collective`, which reads the same
+bytes through SlabIO.  The removability claim has a test.
 
 THE WEDGE APPLIES PER FREQUENCY.  W_c(q, ω) transforms under the space
 group exactly as W_c(q) does at each ω separately — the symmetry
@@ -70,13 +77,36 @@ eight.  Readers re-pad against their OWN count via ``n_mu_padded=``.
 THE COLUMN READER IS THE MEMORY ARGUMENT.  Per-element plasmon-pole
 fits want a few ν columns ACROSS ALL FREQUENCIES, never a full
 (N_μ, N_μ) frequency slab and never all of ω for a full row-block.
-:func:`read_w_columns` is that read and :func:`choose_column_budget` is
-its arithmetic; the budget is sized so the returned block costs about
+:func:`read_w_columns` is that read (again the host seam; production goes
+through :func:`read_w_columns_collective`) and :func:`choose_column_budget`
+is its arithmetic; the budget is sized so the returned block costs about
 what ONE (N_μ, N_μ) tile costs, which is the unit the owner's
 constraint is stated in.  The block is 1-D SHARDED ON THE ROW AXIS
 ONLY — never 2-D — because the fit is elementwise in (μ, ν) and a
 second split on the column axis buys nothing while making every rank's
 column count a function of the mesh shape.
+
+EVERY FILE THIS MODULE TOUCHES IS TOUCHED THROUGH TWO HDF5 LIBRARY
+INSTANCES, and that is the module's sharpest operational constraint.
+The bytes go through ``SlabIO`` (the FFI's cray parallel libhdf5); the
+ledger, the attrs and the unfold tables go through h5py (its own
+bundled libhdf5).  Two instances, two metadata caches, two open-file
+tables, one file — undefined the moment they overlap with a writer
+(audit A1; sandbox claims/0110;
+``docs/architecture/slab_io.md#one-owner``).  So:
+
+* **every** h5py open in this module goes through :func:`_h5`, which
+  declares to :mod:`file_io.hdf5_owner` and is refused BY NAME if the
+  FFI holds a live handle on the same path.  A new h5py open added
+  outside that door is a defect, not a shortcut;
+* the collective readers do their h5py work BEFORE the collective
+  handle opens and none after — :class:`PoleReader` holds ONE
+  ``SlabIO`` across an iteration's pole batches for exactly that
+  reason;
+* the alternation is COUNTED, per path, and reported: measured 2026-08-15
+  at **1027 cross-library alternations on one file in one SC
+  iteration**, most of them this module's own fit-block writer.
+  ``LORRAX_HDF5_ONE_OWNER=strict`` turns the count into a refusal.
 
 Testing note: everything below is exercised host-side with plain h5py
 at LOGICAL extents.  The phdf5 FFI is not built on WSL, so the format
@@ -86,10 +116,17 @@ format; the ``SlabIO`` write path (where each rank contributes its own
 leg in ``tests/multi_device/mpa_fit_stream_gate.py``, and
 :func:`stamp_w_omega` exists for exactly that split — the producer
 writes the bytes with the machinery it already has and this stamps
-them.  The serial :func:`allocate_w_omega` / :func:`write_w_slab` /
-:func:`allocate_fit_store` / :func:`write_fit_block` family is the HOST
-TEST SEAM those suites run on — zero ``src`` callers; production writes
-through the ``*_collective`` forms.
+them.  The serial family is the HOST TEST SEAM those suites run on —
+**zero ``src`` callers, by design**; production writes and reads
+through the ``*_collective`` forms.  Re-counted 2026-08-15, the family
+is larger than this note used to say, and the full list matters because
+"no src caller" is otherwise read as "dead":
+:func:`allocate_w_omega`, :func:`write_w_slab`, :func:`read_w_slab`,
+:func:`read_w_columns`, :func:`allocate_fit_store`,
+:func:`write_fit_block`, :func:`write_head_fit`, :func:`read_head_fit`,
+:func:`read_fit_block`, :func:`read_fit_tensors` and :func:`read_poles`.
+Each has a ``*_collective`` twin (or, for :func:`read_poles`,
+:class:`PoleReader`) that production uses instead.
 """
 
 from __future__ import annotations
@@ -260,7 +297,25 @@ def assert_occupation_stamps(src, occupation_state, *, where="fit store"):
 
     Refuses an unstamped store outright — a metallic reuse of a store
     that predates the stamps cannot certify compatibility and must be
-    regenerated.  Never called on the same-run write path.
+    regenerated.  Never called on the same-run write path (W4: stamps are
+    asserted at REUSE sites only; claim 0194).
+
+    WHAT IS ACTUALLY COMPARED, because the summary line over-reaches:
+    ``occ_hash``, ``smearing_family``, ``smearing_width_ry`` and
+    ``occ_nelec``.  **``mu_ry`` is NOT compared** — it is carried in the
+    failure message for context only, so a store whose chemical potential
+    differs from the run's passes this gate.
+
+    ``occupation_state`` is duck-typed and must expose ``occ_hash``,
+    ``mu_ry``, ``smearing_family``, ``smearing_width_ry`` and
+    ``n_electrons`` (which is stamped under the key ``occ_nelec`` — the
+    attribute and the stamp are deliberately spelled differently and that
+    is the only place it is written down).
+
+    Rank-local and serial.  ``src`` is a path (this call's ``_h5`` owns the
+    handle) or an open h5py group (the caller owns it); the read is
+    hard-wired ``mode='r'``, so passing the PATH while holding the file
+    open ``'a'`` yourself puts a second h5py handle on it.
     """
     stamps = read_occupation_stamps(src)
     if stamps is None:
@@ -346,10 +401,10 @@ def _qs():
 def _h5(target, mode, *, where=None):
     """THE serial-h5py door onto a store the FFI transport also drives.
 
-    Every h5py open in this module goes through here, because every file
-    this module writes is ALSO written by ``SlabIO`` through a different
-    HDF5 library instance (audit A1; sandbox claims/0110).  What the door
-    adds over a bare ``QirrDest``:
+    Every h5py open in this module goes through here — with ONE measured
+    exception, named below — because every file this module writes is ALSO
+    written by ``SlabIO`` through a different HDF5 library instance (audit
+    A1; sandbox claims/0110).  What the door adds over a bare ``QirrDest``:
 
     * it DECLARES the open to :mod:`file_io.hdf5_owner`, which refuses by
       name if the FFI currently holds a live handle on the same path and
@@ -365,6 +420,19 @@ def _h5(target, mode, *, where=None):
     h5py File/Group (the caller owns it; the door still declares it, since
     a live foreign handle is exactly what the registry needs to know
     about).  ``where`` defaults to the calling function's name.
+
+    THE FLUSH IS OWNED-ONLY.  A caller-supplied File/Group is never
+    flushed by this door, on any mode — the caller owns the handle and
+    therefore owns its durability.  Only the path form gets the flush.
+
+    THE ONE OPEN THAT BYPASSES THIS DOOR, measured 2026-08-15:
+    :func:`read_w_tables` forwards straight to ``qirr_store.read_tables``,
+    which opens h5py itself and is never declared.  It runs on every rank
+    in production (``gw/mpa/fit_driver.py``, the unfold-table read), so the
+    registry has a blind spot there and cannot count or refuse it.  That is
+    a code fix, not a wording one, and it is on the follow-up list; until
+    it lands, do not read the invariant above as machine-enforced for that
+    path.
     """
     from .hdf5_owner import STACK_H5PY, is_write_mode, note_close, note_open
 
@@ -646,6 +714,29 @@ def allocate_w_omega_collective(
     process.  After that collective handle closes, rank zero stamps the small
     q-wedge tables, frequency grid, and readiness ledger, then all processes
     synchronize before any slab write begins.
+
+    COLLECTIVE over ``mesh_xy``: every rank calls it, in the same order.
+
+    ``dest`` MUST BE A PATH.  Unlike the serial :func:`allocate_w_omega`,
+    which takes an open group or a path, this one hands ``dest`` to
+    ``SlabIO``, which ``str()``s it — an h5py Group would be stringified
+    into a filename.
+
+    ``omega`` is ``(n_omega,)`` complex, ``omega_line`` ``(n_omega,)``
+    int32, ``tables`` a ``QirrTables`` at the LOGICAL μ extent, and
+    ``energy_unit`` one of :data:`FIT_ENERGY_UNITS`; the serial twin
+    documents each in full.
+
+    RETURNS A RANK-DIVERGENT VALUE: rank 0 gets the :func:`read_w_header`
+    dict, every other rank gets ``None``.  A caller that indexes the return
+    crashes on all ranks but zero, and one that BRANCHES on it diverges the
+    mesh.  Discard it unless you are on rank 0 and know it.  (Making the
+    return uniform is a code change and is on the follow-up list.)
+
+    The open sequence is FFI ``'w'`` → close → rank-0 h5py ``'a'`` →
+    barrier: sequential cross-stack alternation with a write on each side,
+    which :mod:`file_io.hdf5_owner` counts and which
+    ``LORRAX_HDF5_ONE_OWNER=strict`` refuses.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -906,11 +997,22 @@ def write_w_slab_collective(
 ):
     """Write one native sharded W(z) slab and then commit readiness.
 
-    ``W_q_munu`` remains on its ``P(None, 'x', 'y')`` layout.  SlabIO
-    inserts the singleton frequency axis, clips only the device-dependent
-    mu padding against ``global_shape``, and closes collectively before rank
+    ``W_q_munu`` remains on its ``P(None, 'x', 'y')`` layout — REQUIRED,
+    and enforced by ``_require_layout``.  It is rank 3,
+    ``(n_q, n_mu_padded, n_mu_padded)``; SlabIO inserts the singleton
+    frequency axis, clips only the device-dependent mu padding against
+    ``global_shape`` (which must be the rank-4
+    ``(n_omega, n_q, n_mu, n_mu)``), and closes collectively before rank
     zero updates the small readiness ledger.  A failed data write therefore
     leaves the slab explicitly unready.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO).
+
+    RETURNS A RANK-DIVERGENT VALUE — the new ready count on rank 0,
+    ``None`` elsewhere.  Both production callers discard it, which is the
+    only reason this is latent rather than live; see
+    :func:`allocate_w_omega_collective` for the same hazard and the same
+    follow-up.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -959,6 +1061,19 @@ def read_w_slab_collective(
     is valid for any MPA frequency tensor with this layout (in particular
     both ``chi(z)`` and ``Wc(z)``); the historical ``W`` in its name denotes
     the on-disk format, not an extra transport.
+
+    COLLECTIVE over ``mesh_xy``: every rank calls it, in the same order,
+    for the same ``i_omega``.  ``src`` must be a PATH (SlabIO).
+
+    RETURNS ``(slab, header)``.  ``slab`` is
+    ``(n_q_on_disk, n_mu_padded, n_mu_padded)`` complex128 — the μ extent
+    is ``mesh_divisible_shape``'s round-up, NOT ``header['n_mu']``.  The
+    4-D read is issued at ``P(None, None, 'x', 'y')`` and the returned 3-D
+    array therefore carries ``P(None, 'x', 'y')``; that is inferred from the
+    leading index, not asserted on the way out.  ``header`` is
+    :func:`read_w_header`'s dict, read with h5py on every rank BEFORE the
+    collective handle opens (read-only on both stacks, which the one-owner
+    registry allows and counts).
     """
     from jax.sharding import PartitionSpec as P
     from file_io.slab_io import SlabIO, mesh_divisible_shape
@@ -1007,7 +1122,21 @@ def _open_w(grp, name):
 def read_w_header(src, name, *, mode="r"):
     """Everything the file CLAIMS about ``name``, reading no tensor data.
 
-    Returns a plain dict.  Every cross-check the format owns runs here,
+    Returns a plain dict with these keys, every one of which some reader
+    below indexes by name: ``format_version``, ``freq_axis``, ``n_omega``,
+    ``omega`` ``(n_omega,)`` complex128, ``omega_line`` ``(n_omega,)``
+    int32, ``omega_units``, ``sampling``, ``grid_hash``, ``data_ready``
+    ``(n_omega,)`` bool, ``n_ready``, ``q_storage``, ``n_q_on_disk``,
+    ``n_q_full``, ``n_mu``, ``n_rmu_logical``, ``centroid_hash``,
+    ``table_hash``, ``closure_verdict``, ``provenance``.
+
+    Rank-local and serial, but called on every rank from three collective
+    functions — a collective caller must invoke it uniformly.  ``src`` is a
+    path (this call's ``_h5`` owns the handle) or an already-open group (the
+    caller owns it, and ``mode`` is then IGNORED by ``QirrDest``: the
+    parameter looks live and is not).
+
+    Every cross-check the format owns runs here,
     so a caller that got a header back has already been told the file is
     self-consistent, and every reader below calls this first rather than
     repeating the checks — one implementation of "what does this file
@@ -1416,10 +1545,18 @@ def choose_column_budget(n_mu, n_omega, tile_bytes=None,
     122 880 B, and the budget is exactly **30 columns** — 16·480·30·16 =
     3 686 400 B, the tile to the byte.
 
-    Clamped to at least 1: a budget of zero columns is not a budget, it
-    is a refusal to make progress, and the honest failure for a grid so
-    long that one column busts a tile is to hand back 1 and let the
-    caller see the cost in :func:`describe_column_cost`.
+    Clamped BOTH WAYS: to at least 1, and to at most ``n_mu``.  The lower
+    clamp is the interesting one — a budget of zero columns is not a
+    budget, it is a refusal to make progress, and the honest failure for a
+    grid so long that one column busts a tile is to hand back 1 and let the
+    caller see the cost in :func:`describe_column_cost`.  The UPPER clamp
+    is not in the closed form above and it bites whenever ``tile_bytes``
+    is generous: measured 2026-08-15, ``choose_column_budget(480, 16)`` is
+    30 as the worked example says, but ``choose_column_budget(480, 16,
+    100*2**20)`` returns **480**, not the 853 the formula gives.  A caller
+    that sizes an ``n_cols_buffer`` off the published formula and passes a
+    large budget is refused by :func:`read_w_columns_collective`.
+    Reconciling the two is a code change and is on the follow-up list.
 
     Parameters
     ----------
@@ -1457,6 +1594,14 @@ def describe_column_cost(n_mu, n_omega, n_cols, tile_bytes=None,
     Separate from the refusal so the same numbers can be printed by a
     driver that is deciding rather than failing — a message a caller can
     only see by triggering an exception is a message that gets read once.
+
+    KNOWN DEFECT, measured 2026-08-15, prose cannot fix it: when
+    ``tile_bytes`` is passed the sentence prints ``n_mu*n_mu*itemsize B =
+    <tile_bytes>``, an equation that is false for any budget that is not
+    one tile, and it ends with a ``choose_column_budget(n_mu, n_omega)``
+    call that omits the very arguments the number was computed with — so a
+    reader who types the printed call gets a different answer.  Trust the
+    numbers, not the arithmetic, until the follow-up lands.
     """
     n_mu = int(n_mu)
     n_omega = int(n_omega)
@@ -1870,6 +2015,24 @@ def allocate_fit_store_collective(
     metadata file would pin the multi-gigabyte fit store to one OST.  After
     SlabIO closes, rank zero stamps only the small ledger/tables and a barrier
     makes the complete store visible before any block is written.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO), and
+    ``mode`` is REFUSED unless ``'w'`` — this call owns the inode.
+
+    ``diagnostic_keys`` is required and must be a superset of
+    :data:`REQUIRED_DIAGNOSTICS`; one ``fit_<key>`` dataset of
+    ``(n_q, n_mu, n_mu)`` float64 is created per key, so the set is fixed
+    at allocation and cannot grow later.  ``unfold_tables``,
+    ``occupation_state`` and the three identity hashes are stamped as the
+    serial twin documents them.
+
+    RETURNS :func:`fit_completion_ledger`, and unlike its
+    ``allocate_w_omega_collective`` neighbour this return IS uniform across
+    ranks.
+
+    Open sequence: FFI ``'w'`` → barrier → rank-0 h5py ``'a'`` → barrier →
+    all-rank h5py ``'r'``.  Cross-stack alternation with writes on both
+    sides; ``LORRAX_HDF5_ONE_OWNER=strict`` refuses it.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -2116,7 +2279,34 @@ def write_head_fit_collective(
     model="multipole",
     occupation_state=None,
 ):
-    """Collectively publish one tiny scalar head fit through SlabIO."""
+    """Collectively publish one tiny scalar head fit through SlabIO.
+
+    COLLECTIVE over ``mesh_xy`` (three barriers).  ``dest`` must be a PATH.
+
+    SHAPES AND UNITS.  All four arrays are flattened to 1-D complex128.
+    ``sample_z``/``sample_Wc`` share an extent — 2·n_p in production — and
+    ``Omega_p``/``B_p`` share a DIFFERENT one, n_p; the two pairs are not
+    required to agree with each other.  Units follow the serial
+    :func:`write_head_fit`: ``sample_Wc`` stays in Coulomb-head atomic
+    units, while ``sample_z``, ``Omega_p`` and ``B_p`` use ``energy_unit``
+    (the pole residue carries one energy factor).
+
+    REPLICATED INPUT, RANK-0 BYTES.  The vectors are published through
+    ``SlabIO.write_attr``, which queues and lets only rank 0's copy land at
+    close — so every rank must supply identical values, and a rank-dependent
+    array here is silently discarded on all ranks but one.
+
+    ORDERING PRECONDITION: the BODY fit must already be finalized and its
+    ``w_grid_hash`` must equal ``grid_hash``; both are refused here.  A head
+    cannot be attached to an incomplete store.
+
+    FORMAT VERSION 2, AND IT IS NOT THE SERIAL PAIR'S.
+    :func:`write_head_fit` stamps 1 and :func:`read_head_fit` refuses
+    anything else; this writer stamps 2 and
+    :func:`read_head_fit_collective` refuses anything else.  The two pairs
+    CANNOT read each other's heads.  Four HDF5 opens per call: all-rank
+    h5py ``'r'``, rank-0 h5py ``'a'``, FFI ``'a'``, rank-0 h5py ``'a'``.
+    """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
 
@@ -2183,7 +2373,32 @@ def write_head_fit_collective(
 
 
 def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
-    """Collectively read and certify the scalar head fit through SlabIO."""
+    """Collectively read and certify the scalar head fit through SlabIO.
+
+    COLLECTIVE over ``mesh_xy``.  ``src`` must be a PATH.  Every open on
+    this path is read-only (h5py ``'r'`` twice, then FFI ``'r'``), which is
+    the cross-stack concurrency the one-owner registry allows.
+
+    WHAT IS READ, stated because this is the call that produced failure
+    signature S3 (``docs/architecture/slab_io.md#s3``): the four
+    ``mpa_head/{sample_z,sample_Wc,Omega_p,B_p}`` vectors, WHOLE, with
+    ``partition_spec=P(None)`` and **no offset and no shape** — so the
+    extent comes from the dataset and the offset that reaches the FFI is
+    zero.  ``sample_z``/``sample_Wc`` are 2·n_p long, ``Omega_p``/``B_p``
+    are n_p.  A nonzero ``offset_base`` in a refusal from this call is not
+    an arithmetic mistake in this function; it is the marshal.
+
+    RETURNS HOST NUMPY, not sharded arrays, despite taking ``mesh_xy``:
+    the four vectors come back ``np.complex128`` via ``as_numpy=True``,
+    alongside ``units``, ``diagnostics``, ``provenance``, ``model``,
+    ``occupation_stamps`` and ``ready``.
+
+    "CERTIFY" MEANS: :func:`validate_fit_store` on the body, head
+    ``format_version == 2``, ``ready``, head-vs-body ``mpa_grid_hash``,
+    a known head model, and observed ``condition`` / ``backward_error``
+    against the stamped ``*_max_allowed``.  Those two thresholds DEFAULT TO
+    INFINITY when absent, so an unstamped head certifies vacuously.
+    """
     from jax.sharding import PartitionSpec as P
 
     from file_io.slab_io import SlabIO
@@ -2414,6 +2629,33 @@ def write_fit_block_collective(
     Pole and diagnostic bytes never leave their owning devices.  Only after
     all collective writes have closed does rank zero advance the small
     completion ledger; a barrier publishes that commit to every rank.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH.  Returns the
+    updated ledger, uniformly on every rank.
+
+    SHAPES AND SPECS, all enforced.  ``Omega_p_block`` and ``B_p_block`` are
+    ``(n_p, 1, n_mu_padded, n_cols_buffer)`` on
+    ``P(None, None, ('x', 'y'), None)``; each ``diag_block[key]`` is
+    ``(1, n_rows, width)`` on ``P(None, ('x', 'y'))`` (a two-entry spec for
+    a rank-3 array, relying on JAX canonicalization).  ``mu_cols`` must be
+    ONE CONTIGUOUS RANGE.
+
+    ``block_condition_max``, ``block_backward_error_max`` and
+    ``diagnostics_finite`` are host scalars that MUST BE IDENTICAL ON EVERY
+    RANK — only rank 0's are committed.  The driver satisfies that with a
+    ``lax.pmax``/``lax.pmin`` reduction before the call; nothing here checks
+    it.
+
+    THE COST, measured 2026-08-15 and disclosed because it is the dominant
+    term in the store's HDF5 traffic: **five opens per block, four of them
+    h5py** — the ledger read, a ``diagnostic_keys`` attr read, the FFI
+    write, the rank-0 commit, and the ledger read again.  At the R6 deck's
+    464 blocks per iteration that is ~1900 h5py and ~464 FFI opens on one
+    file per iteration, and it is the h5py→FFI→h5py alternation
+    :mod:`file_io.hdf5_owner` counts.  **This function therefore cannot run
+    under ``LORRAX_HDF5_ONE_OWNER=strict``**, which is the target state
+    audit A1 names; removing three of the four h5py opens is on the
+    follow-up list.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -2551,12 +2793,23 @@ def _canonical_diagnostics(diag_block, n_rows, n_cols):
 def fit_completion_ledger(src, *, mode="r"):
     """Which column ranges of which q are fitted — a plain dict.
 
-    ``blocks_done`` is the authority (one bool per (q, column));
-    ``journal`` is the append-only record of the order they arrived in,
-    with each block's worst condition and backward error beside it.  The
-    two are not redundant: the ledger answers "is this column done",
-    the journal answers "what did the block that did it look like", and
-    the Σ stage's certification needs the second.
+    ``blocks_done`` is the authority — ``(n_q, n_mu)`` bool, indexed
+    ``blocks_done[iq, cols]``.  ``journal`` is the append-only record of the
+    order the blocks arrived in: ``(n_blocks, 3)`` int64 of
+    ``[iq, lo, hi]`` and NOTHING ELSE.  The per-block worst condition and
+    backward error are SEPARATE 1-D keys, ``block_condition_max`` and
+    ``block_backward_error_max``, with the scalar reductions under
+    ``condition_max`` / ``backward_error_max``; this docstring used to put
+    them inside ``journal``, and a caller indexing ``journal[:, 3]`` for a
+    condition number gets an IndexError.  The two structures are not
+    redundant: the ledger answers "is this column done", the journal
+    answers "in what order", and the Σ stage's certification reads the
+    maxima.
+
+    Rank-local and serial, but invoked on every rank by three collective
+    functions — a collective caller must invoke it uniformly.  ``src`` is a
+    path or an already-open group; this is the door in this module most
+    often passed both ways.
     """
     qs = _qs()
     with _h5(src, mode) as grp:
@@ -2613,6 +2866,16 @@ def validate_fit_store(src, *, expected_identity=None, mode="r"):
     ``w_centroid_hash`` from the screening object currently in use.  The
     fit's own declared ``*_max_allowed`` certification thresholds are always
     enforced against its observed maxima.
+
+    IT VALIDATES THE LEDGER, NOT THE BYTES.  Every check is on ledger
+    attributes: COMPLETE, the energy unit, the optional identity hashes,
+    the PRESENCE of the ``mpa_cert_*`` thresholds, and observed-vs-allowed
+    maxima.  ``Omega_p`` and ``B_p`` are never opened — not their shape,
+    not their dtype, not their finiteness.  Read the summary line as "the
+    contract Σ relies on", not "the poles were checked".
+
+    Returns the :func:`fit_completion_ledger` dict, which callers use for
+    ``n_p``.  Rank-local and serial; ``src`` is a path or an open group.
     """
     ledger = fit_completion_ledger(src, mode=mode)
     if not ledger["complete"]:
@@ -2660,9 +2923,30 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     one of them is made against a different state.
 
     ``certification`` is stamped as ``mpa_cert_*`` — the thresholds the
-    Σ stage should hold these poles to.  The OBSERVED maxima are
-    stamped regardless, so a consumer can refuse on the evidence even
-    when nobody declared a threshold.
+    Σ stage should hold these poles to.  The OBSERVED maxima are stamped
+    regardless (``mpa_fit_condition_max``, ``mpa_fit_backward_error_max``,
+    ``mpa_fit_n_blocks``).
+
+    **PASS ``certification``.  OMITTING IT BRICKS THE STORE FOR Σ, and the
+    damage cannot be repaired through this API.**  This docstring used to
+    say a consumer could "refuse on the evidence even when nobody declared
+    a threshold"; the only consumer in this tree does not.
+    :func:`validate_fit_store` REFUSES a store with no ``mpa_cert_*``
+    ("MPA Sigma requires certified pole fits"), a second
+    :func:`finalize_fit_store` is refused, and every writer refuses a
+    finalized store — so there is no way back.  The observed-maxima attrs
+    are, as of 2026-08-15, read by no code in ``src/`` or ``services/`` at
+    all; only tests assert them.  Making the omission a refusal (or making
+    ``validate_fit_store`` fall back to the observed maxima) is a code
+    change and is on the follow-up list.
+
+    RANK-0 ONLY in production, and that is a real precondition, not a
+    convention: the driver guards the call with ``process_rank() == 0`` and
+    barriers after it.  Called on every rank this is a concurrent
+    multi-process h5py write plus an "already finalized" race.  ``dest`` is
+    a path or an open group; the default ``mode='a'`` is a WRITE open, so
+    calling it while a SlabIO handle is live on the same path is exactly
+    the case :mod:`file_io.hdf5_owner` refuses.  Returns the ledger.
     """
     qs = _qs()
     with _h5(dest, mode) as grp:
@@ -2779,10 +3063,17 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
 def read_fit_tensors(src, *, allow_partial=False, mode="r"):
     """The whole ``(Omega_p, B_p, diagnostics, ledger)``.
 
-    For tests and offline inspection.  The Σ stage does NOT read this —
-    it streams contiguous pole ranges through :func:`read_poles` and
-    never holds the whole tensor.  Same finalize refusal as
-    :func:`read_fit_block`.
+    For tests and offline inspection.  The Σ stage does NOT read this — it
+    streams contiguous pole ranges through :class:`PoleReader` (opened by
+    :func:`open_pole_reader`) and never holds the whole tensor.  This used
+    to name :func:`read_poles`, which the Σ stage stopped using when
+    ``PoleReader`` landed.
+
+    ``Omega_p`` and ``B_p`` come back ``(n_p, n_q, n_mu, n_mu)``
+    complex128 and ``diagnostics`` as ``{key: (n_q, n_mu, n_mu) float64}``
+    — the whole tensor, on this rank, which is the cost the first
+    paragraph is warning about.  Serial; ``src`` is a path or an open
+    group.  Same finalize refusal as :func:`read_fit_block`.
     """
     qs = _qs()
     with _h5(src, mode) as grp:
@@ -2943,16 +3234,24 @@ class PoleReader:
     two independent HDF5 library instances, once per batch.
 
     This reader collapses that to: read the ledger and the unfold tables
-    with h5py ONCE, CLOSE h5py, then hold ONE ``SlabIO`` open for every
-    batch of the iteration.  Two properties, and the second is the one
-    that matters more than the arithmetic:
+    with h5py FIRST (two opens, or one when the store is not wedge-packed),
+    CLOSE h5py, then hold ONE ``SlabIO`` open for every batch of the
+    iteration.  Two properties, and the second is the one that matters more
+    than the arithmetic:
 
     * the churn drops from ``3·n_batches`` opens per walk to ``2 + 1``;
     * **no h5py open happens while the collective handle is live**, so
       the alternation the two libraries cannot survive does not occur at
-      all inside a Σ stage.  ``file_io.hdf5_owner`` enforces that rather
-      than trusting this docstring: a stray h5py open on this path while
-      this reader is alive refuses by name.
+      all inside a Σ stage.
+
+    HOW MUCH OF THAT IS MACHINE-ENFORCED, precisely — because the sentence
+    here used to claim all of it.  This reader opens ``SlabIO`` READ-ONLY,
+    and :mod:`file_io.hdf5_owner` refuses a cross-stack overlap only when
+    one side can WRITE.  So a stray h5py **write** open on this path while
+    the reader is alive refuses by name; a stray h5py **read** open is
+    ALLOWED BY DESIGN and merely counted.  The no-h5py-while-live property
+    above is upheld by this class's own ordering, and by the registry only
+    for writers.
 
     The handle is released in a ``finally`` — use it as a context manager,
     or call :meth:`close` from one.  A refusal raised mid-walk (an
@@ -3018,7 +3317,14 @@ class PoleReader:
 
 
 def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
-    """A :class:`PoleReader` for one iteration's pole walk."""
+    """A :class:`PoleReader` for one iteration's pole walk.
+
+    COLLECTIVE: this opens a ``SlabIO`` handle, so every rank must call it,
+    in the same order, and every rank must close it — use ``with``, or a
+    ``close()`` in a ``finally``.  ``src`` must be a PATH.  While the
+    reader lives, do not open this path with h5py (see :class:`PoleReader`
+    for exactly how much of that the registry enforces).
+    """
     return PoleReader(src, mesh_xy=mesh_xy, allow_partial=allow_partial,
                       mode=mode)
 
@@ -3037,9 +3343,26 @@ def read_poles(
     """Read one contiguous pole range with two collective SlabIO reads.
 
     The leading pole axis is always retained.  ``pole_slice=None`` reads it
-    completely; an integer reads a length-one range.  This is the sole
-    pole tensor reader.  A mesh read is always sharded — pass
-    ``return_sharded=True`` with ``mesh_xy``; there is no gather path.
+    completely; an integer reads a length-one range.  A mesh read is always
+    sharded — pass ``return_sharded=True`` with ``mesh_xy``; there is no
+    gather path.
+
+    THE SUMMARY LINE DESCRIBES ONE OF TWO BRANCHES, and the contract
+    changes with ``mesh_xy``:
+
+    * ``mesh_xy`` given — COLLECTIVE, two ``SlabIO`` reads through
+      :func:`open_pole_reader`; ``src`` must be a PATH; returns two sharded
+      ``jax.Array``s of ``(n_poles, n_q, n_mu_padded, n_mu_padded)`` on
+      ``P(None, None, 'x', 'y')``, where the pad is
+      ``runtime.padding.padded_mu_extent``, not ``mesh_divisible_shape``.
+    * ``mesh_xy=None`` — SERIAL, rank-local, no SlabIO and nothing
+      collective; ``src`` may be a path or an open h5py group; returns two
+      HOST numpy arrays at the LOGICAL ``(n_poles, n_q, n_mu, n_mu)``.
+
+    Returns the 2-tuple ``(Omega_p, B_p)`` either way.  This is NOT the
+    sole pole reader — :func:`read_fit_block`, :func:`read_fit_tensors` and
+    :meth:`PoleReader.read` also read these datasets, and the production Σ
+    reader is the last of those; this function has no ``src`` caller.
 
     ONE range per call, so a caller reading SEVERAL ranges of one file —
     every Σ stage does — opens and closes the store once per range.  Use
