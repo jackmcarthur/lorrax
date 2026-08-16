@@ -542,3 +542,115 @@ def test_report_carries_full_band_and_extrapolated_side_by_side():
     side_by_side = [ln for ln in text.splitlines()
                     if "full" in ln and "S_inf =" in ln]
     assert side_by_side, "no line carries S(N3) and S_inf side by side"
+
+
+# ---------------------------------------------------------------------------
+#  PERSISTENCE — the feature must reach an artifact, not only a log line
+# ---------------------------------------------------------------------------
+
+def _extrap_fit_and_plan(nk=6, nb=5):
+    """A plan + fit with a real (nk, nb) state shape, as the driver has."""
+    e = _si_like_spectrum()
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=2,
+        nb_logical=e.shape[1], nb_padded=e.shape[1])
+    N = np.asarray(plan.counts, dtype=float)
+    rng = np.random.default_rng(11)
+    S = ((-1.0 + 30.0 / N)[:, None, None]
+         + 0.01 * rng.standard_normal((1, nk, nb)))
+    return plan, fit_band_extrapolation(N, S)
+
+
+def test_payload_carries_the_fit_and_its_provenance():
+    from gw.band_extrapolation import (
+        EXTRAP_DATASETS, extrapolation_h5_payload)
+    plan, fit = _extrap_fit_and_plan()
+    pay = extrapolation_h5_payload(plan, fit)
+    assert set(pay["arrays"]) == set(EXTRAP_DATASETS)
+    for name, arr in pay["arrays"].items():
+        assert np.shape(arr) == (6, 5), f"{name} lost the (nk, nb) shape"
+    assert np.allclose(pay["arrays"]["sigma_c_extrap_inf_kn_ev"], fit.s_inf)
+    assert np.allclose(pay["arrays"]["sigma_c_extrap_last_kn_ev"],
+                       fit.s_at_counts[-1])
+    a = pay["attrs"]
+    # The provenance a reader needs to interpret the number without the log.
+    assert list(a["band_counts"]) == list(plan.counts)
+    assert "consistent" in a["verdict"] or "TRUSTWORTHY" in a["verdict"]
+    assert len(a["uncertainty_fraction_p90_p99"]) == 2
+    assert "planner_notes" in a, "a snap fallback must be readable from the file"
+
+
+def test_sinf_reaches_sigma_mnk_h5_and_off_vs_on_differ(tmp_path):
+    """THE ANTI-VACUITY GATE.
+
+    Before 2026-08-15 a run with the feature ON and one with it OFF wrote
+    byte-identical artifacts -- every dataset of ``sigma_mnk.h5`` identical
+    to 8e-15 -- while the log reported an 848 meV correction.  Any test of
+    the extrapolated Sigma therefore passed by measuring the
+    un-extrapolated cube.  This asserts the two files DIFFER, and that the
+    difference is the fit.
+    """
+    h5py = pytest.importorskip("h5py")
+    from file_io import write_sigma_omega_h5
+    from gw.band_extrapolation import (
+        EXTRAP_DATASETS, extrapolation_h5_payload)
+
+    n_omega, nk, nb = 3, 6, 5
+    rng = np.random.default_rng(5)
+
+    def c(*shape):
+        return (rng.standard_normal(shape)
+                + 1j * rng.standard_normal(shape)).astype(np.complex128)
+
+    omega = np.linspace(-2.0, 2.0, n_omega)
+    cube, sx, h = c(n_omega, nk, nb, nb), c(nk, nb, nb), c(nk, nb, nb)
+    plan, fit = _extrap_fit_and_plan(nk=nk, nb=nb)
+    pay = extrapolation_h5_payload(plan, fit)
+
+    paths = {}
+    for tag, extra in (("off", None), ("on", pay)):
+        p = str(tmp_path / f"sigma_mnk_{tag}.h5")
+        write_sigma_omega_h5(
+            p, omega, None, sigma_c_kij_ev=cube, sigma_sx_kij_ev=sx,
+            hartree_kij_ev=h, mesh=_mesh_1x1(), star=None,
+            band_extrapolation=extra)
+        paths[tag] = p
+
+    with h5py.File(paths["off"], "r") as f:
+        off = set(f.keys())
+    with h5py.File(paths["on"], "r") as f:
+        on = set(f.keys())
+        s_inf = np.asarray(f["sigma_c_extrap_inf_kn_ev"][()])
+        attrs = dict(f["sigma_c_extrap_inf_kn_ev"].attrs)
+
+    assert on - off == set(EXTRAP_DATASETS), (
+        f"feature ON must add exactly the fit datasets; added {sorted(on-off)}")
+    assert not (off - on), "feature ON must not drop anything"
+    assert np.allclose(s_inf, fit.s_inf), "S_inf did not survive the write"
+    # The un-extrapolated value is beside it, so the correction is a
+    # subtraction rather than a reconstruction.
+    with h5py.File(paths["on"], "r") as f:
+        last = np.asarray(f["sigma_c_extrap_last_kn_ev"][()])
+    assert not np.allclose(s_inf, last), \
+        "S_inf == S(N3) would mean no correction was applied at all"
+    assert "verdict" in attrs and "band_counts" in attrs, \
+        "a reader of the dataset alone must be able to tell if it was trusted"
+
+
+def test_extrap_datasets_are_registered_for_star_extraction():
+    """They must go through the SAME k extraction and stamp as the cubes.
+
+    The invariant that matters for S_inf is exact star covariance, and it is
+    only checkable on a persisted, stamped array.  A dataset absent from
+    SIGMA_K_AXIS is REFUSED by the extractor rather than written on a
+    guessed axis, so this also pins that they are never silently full-BZ in
+    a k_irr file.
+    """
+    # file_io pulls the wfn_loader import chain, which needs h5py; on a
+    # platform without it this cell is an ABSENCE, not a measurement.
+    pytest.importorskip("h5py")
+    from file_io.sigma_output import SIGMA_K_AXIS
+    from gw.band_extrapolation import EXTRAP_DATASETS
+    for name in EXTRAP_DATASETS:
+        assert SIGMA_K_AXIS.get(name) == 0, \
+            f"{name} must declare k on axis 0 (it is band-diagonal (nk, nb))"

@@ -455,6 +455,24 @@ def plan_band_brackets(
     # the unsnapped points work fine (measured: nband = 60 on this very
     # deck).  Trading ≤ 6.4 meV for a run that stops is the wrong trade.
     #
+    # ⚠ THE ≤ 6.4 meV IS ABOUT THE FIT RESIDUAL AND IS SILENT ABOUT STAR
+    # COVARIANCE.  It was measured against BerkeleyGW's k-RESOLVED
+    # ch_converge curve, where star covariance is not visible at all.  The
+    # part that measurement could not see (established 2026-08-15 on the
+    # orbit-closed set): S(N) is a deterministic POINTWISE function of three
+    # partial sums, each exactly the Σ_c of a run at that band cut; a clean
+    # cut is exactly star-covariant (0.0000 meV, floor 0.0010) and a SLICED
+    # cut is not (1.957 meV of sigCOH spread at nband = 60).  A pointwise
+    # function of star-covariant inputs is star-covariant, so:
+    #
+    #     S_∞ is exactly star-covariant IFF every interior cut is clean.
+    #
+    # So the fallback is a real trade, not a free one, and it must be
+    # RECORDED every time it fires — which is why every branch below appends
+    # to ``notes`` and none of them is allowed to be silent.
+    # ``tests/test_band_extrapolation_star_covariance.py`` accepts a refusal
+    # or a recorded fallback and fails only on silence.
+    #
     # N₃ is not snapped here at all — it is the caller's `nb_logical`, the
     # band sum the deck asked for, and it is BerkeleyGW's `number_bands`
     # degeneracy check (not this one) that governs it.
@@ -477,6 +495,17 @@ def plan_band_brackets(
             # so the distinctness check below refuses with the actionable
             # message, rather than letting snap_cut_to_clean_boundary raise
             # its own ValueError about inverted bounds.
+            #
+            # NOTE EVEN HERE.  This branch normally ends in the refusal
+            # below, but it must not be the one path that can emit an
+            # unsnapped cut SILENTLY: an unsnapped interior cut costs the
+            # star covariance of S_∞ (see below), and
+            # ``tests/test_band_extrapolation_star_covariance.py`` fails on
+            # silence, not on the fallback.
+            notes.append(
+                f"interior cut {req} kept UNSNAPPED: no room left between "
+                f"{lo_bound} and {hi_bound} for another cut below N3 = "
+                f"{nb_logical}.")
             snapped.append(req)
             lo_bound = req + 1
             continue
@@ -739,6 +768,67 @@ def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
             f"intercepts agree to well within the applied correction.")
 
 
+#: Dataset names the fit contributes to ``sigma_mnk.h5``, all ``(nk, nb)``
+#: band-diagonal and all in eV — the same unit and the same band diagonal as
+#: ``sigma_c_kij_ev``'s, evaluated at the same E_nk on the same ω grid.
+EXTRAP_DATASETS = (
+    "sigma_c_extrap_inf_kn_ev",     # S_∞, the extrapolated Σ_c
+    "sigma_c_extrap_last_kn_ev",    # S(N₃), the ordinary full-band Σ_c
+    "sigma_c_extrap_ampl_kn_ev",    # A, the 1/N coefficient
+    "sigma_c_extrap_sigma_kn_ev",   # the p90 uncertainty envelope
+)
+
+
+def extrapolation_h5_payload(plan: BandBracketPlan, fit: ExtrapolationFit,
+                             *, scale: float = 1.0) -> dict:
+    """The arrays and attributes ``sigma_mnk.h5`` should carry for this fit.
+
+    WHY THIS EXISTS.  Until 2026-08-15 the fitted ``S_∞`` was PRINTED and
+    written nowhere, so a run with the feature ON and one with it OFF
+    produced byte-identical artifacts — ``sigma_diag.dat`` identical, every
+    dataset of ``sigma_mnk.h5`` identical to 8e-15 — while the log reported
+    an 848 meV correction at the VBM.  The feature's entire output lived in
+    a log line: it could not be gated, diffed, regression-tested, or
+    consumed downstream, and a star-spread test on the written Σ passed
+    VACUOUSLY because it was measuring the un-extrapolated cube.
+
+    Four ``(nk, nb)`` arrays go in, not one.  ``S_∞`` alone tells a reader
+    the answer but not how far it moved or whether to believe it, and the
+    other three are already computed: ``S(N₃)`` is the un-extrapolated value
+    at the same states (so the correction is a subtraction, not a
+    reconstruction), ``A`` is how much correction is still being applied at
+    the largest count, and the uncertainty is the envelope from
+    :data:`TAIL_UNCERTAINTY_FRACTION`.
+
+    The verdict and the band counts ride as ATTRIBUTES rather than arrays:
+    they are per-run, not per-state.
+    """
+    def _arr(a):
+        return np.asarray(a, dtype=np.complex128) * scale
+
+    return {
+        "arrays": {
+            "sigma_c_extrap_inf_kn_ev": _arr(fit.s_inf),
+            "sigma_c_extrap_last_kn_ev": _arr(fit.s_at_counts[-1]),
+            "sigma_c_extrap_ampl_kn_ev": _arr(fit.amplitude),
+            "sigma_c_extrap_sigma_kn_ev": _arr(fit.uncertainty("p90")),
+        },
+        "attrs": {
+            "band_counts": np.asarray(plan.counts, dtype=np.int64),
+            "band_counts_requested": np.asarray(plan.requested,
+                                                dtype=np.int64),
+            "bracket_fractions": np.asarray(BRACKET_FRACTIONS,
+                                            dtype=np.float64),
+            "n_occ": int(plan.n_occ),
+            "n_cond": int(plan.n_cond),
+            "uncertainty_fraction_p90_p99": np.asarray(
+                TAIL_UNCERTAINTY_FRACTION, dtype=np.float64),
+            "verdict": str(trust_verdict(fit)),
+            "planner_notes": " | ".join(plan.notes) if plan.notes else "",
+        },
+    }
+
+
 def format_extrapolation_report(
     plan: BandBracketPlan,
     fit: ExtrapolationFit,
@@ -853,7 +943,9 @@ def format_extrapolation_report(
 
 __all__ = [
     "BRACKET_FRACTIONS",
+    "EXTRAP_DATASETS",
     "TAIL_UNCERTAINTY_FRACTION",
+    "extrapolation_h5_payload",
     "BandBracketPlan",
     "BandExtrapolationRefused",
     "ExtrapolationFit",
