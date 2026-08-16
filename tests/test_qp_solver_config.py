@@ -357,6 +357,83 @@ def test_every_tracked_fixture_deck_has_no_dead_keys(tmp_path):
         + "\n".join(f"  {k}: {v}" for k, v in offenders.items()))
 
 
+# ---------------------------------------------------------------------------
+# Renamed-key aliases (``_ALIASES``).  The table ships EMPTY — the rename
+# phases populate it — so these tests inject a row rather than pinning a
+# spelling that does not exist yet.  What is under test is the mechanism:
+# an old spelling parses as the new key, says so once, and a deck naming
+# both with different values refuses.
+# ---------------------------------------------------------------------------
+
+#: Same as ``BASE_INPUT`` minus ``nband`` — the alias tests set that key
+#: through the alias, and configparser refuses a duplicate option.
+ALIAS_BASE_INPUT = """\
+[cohsex]
+nval = 2
+ncond = 2
+memory_per_device_gb = 4.0
+"""
+
+
+@pytest.fixture
+def _alias_row(monkeypatch):
+    """One ``old_nband -> nband`` row, live for the duration of a test."""
+    from gw import gw_config
+    monkeypatch.setitem(gw_config._ALIASES, "old_nband", "nband")
+    return ("old_nband", "nband")
+
+
+def test_alias_old_spelling_parses_as_the_new_key(tmp_path, capsys,
+                                                  _alias_row):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_alias.in"
+    p.write_text(ALIAS_BASE_INPUT + "old_nband = 42\n")
+    with pytest.warns(DeprecationWarning, match="old_nband"):
+        params = read_lorrax_input(str(p))
+    assert params["nband"] == 42
+    out = capsys.readouterr().out
+    # One rank-0 line naming BOTH spellings; not an "unrecognized" report.
+    assert "old_nband (line 5): parsed as 'nband'" in out
+    assert "not a recognized deck key" not in out
+
+
+def test_alias_survives_strict_keys(tmp_path, _alias_row):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_alias_strict.in"
+    p.write_text(ALIAS_BASE_INPUT + "strict_keys = true\nold_nband = 42\n")
+    with pytest.warns(DeprecationWarning):
+        params = read_lorrax_input(str(p))     # must not raise
+    assert params["nband"] == 42
+
+
+def test_alias_both_spellings_same_value_is_not_ambiguous(tmp_path,
+                                                          _alias_row):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_alias_agree.in"
+    p.write_text(ALIAS_BASE_INPUT + "old_nband = 42\nnband = 42\n")
+    with pytest.warns(DeprecationWarning):
+        params = read_lorrax_input(str(p))
+    assert params["nband"] == 42
+
+
+def test_alias_both_spellings_different_values_refuse(tmp_path, _alias_row):
+    from gw.gw_config import read_lorrax_input
+    p = tmp_path / "deck_alias_conflict.in"
+    p.write_text(ALIAS_BASE_INPUT + "old_nband = 42\nnband = 7\n")
+    with pytest.raises(ValueError) as exc:
+        read_lorrax_input(str(p))
+    # Both spellings AND both values named — the deck author has to be able
+    # to see which line to delete.
+    assert "old_nband" in str(exc.value) and "nband" in str(exc.value)
+    assert "42" in str(exc.value) and "7" in str(exc.value)
+
+
+def test_alias_table_ships_empty(tmp_path):
+    """Seeded empty: a row here is a rename phase's deliberate gesture."""
+    from gw.gw_config import _ALIASES
+    assert _ALIASES == {}
+
+
 def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
     # Keys with an explicit legacy branch (dedicated DeprecationWarning or
     # refusal) must NOT also be reported as unknown — one key, one message.

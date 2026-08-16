@@ -1452,6 +1452,23 @@ _LEGACY_DECK_KEYS = frozenset({
     "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
 })
 
+#: RENAMED deck keys: ``{old spelling: new spelling}``.  One release of
+#: grace per rename — the old key parses AS the new one and says so once
+#: on rank 0, so a deck written for the previous release keeps steering
+#: the same knob instead of being dropped by the unknown-key check.
+#:
+#: A deck that names BOTH spellings with DIFFERENT values REFUSES.  Either
+#: precedence rule (old wins / new wins) runs a value the deck did not
+#: unambiguously ask for, and that is the failure class the whole
+#: deck-hygiene apparatus in this file exists to remove; naming both with
+#: the SAME value is redundant, not ambiguous, and passes.
+#:
+#: SEEDED EMPTY on purpose.  The 0.1.0 rename phases add their rows here;
+#: this entry is the mechanism landing ahead of them, so no rename has to
+#: also invent its own compatibility branch.  Removing a row is the
+#: gesture that ends an old spelling's grace period.
+_ALIASES: dict[str, str] = {}
+
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
     "compute_mode",
@@ -1688,6 +1705,47 @@ def read_lorrax_input(filename: str) -> dict:
                     for key, note in retired))
 
 
+        # --- Renamed keys (``_ALIASES``) -------------------------------
+        # Rewrite the old spelling into the new one IN THE SECTION, before
+        # the unknown-key check and before the params build, so every
+        # downstream reader (getboolean/getint/getfloat, the normaliser,
+        # the deck-named-keys set) sees exactly what a deck written with
+        # the new name produces.  A translation that stopped at the params
+        # dict would have to be repeated at each of those.
+        renamed = []
+        for _old_key, _new_key in _ALIASES.items():
+            _old_raw = section.get(_old_key, fallback=None)
+            if _old_raw is None:
+                continue
+            _new_raw = section.get(_new_key, fallback=None)
+            if (_new_raw is not None
+                    and str(_new_raw).strip() != str(_old_raw).strip()):
+                raise ValueError(
+                    f"{filename} names both '{_old_key}' "
+                    f"({_deck_key_line(lines, start, end, _old_key)}) and its "
+                    f"replacement '{_new_key}' "
+                    f"({_deck_key_line(lines, start, end, _new_key)}) with "
+                    f"DIFFERENT values ({_old_raw!r} vs {_new_raw!r}).  "
+                    f"'{_old_key}' is the retired spelling of '{_new_key}'; "
+                    f"delete it and keep the value you meant.")
+            if _new_raw is None:
+                section[_new_key] = _old_raw
+            import warnings
+            warnings.warn(
+                f"Input key '{_old_key}' was renamed to '{_new_key}'; it is "
+                f"honored for one release.  Update the input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            renamed.append((_old_key, _new_key))
+        if renamed:
+            _print_deck_report(
+                f"read_lorrax_input: {len(renamed)} renamed deck key(s) in "
+                f"{filename}:\n"
+                + "\n".join(
+                    f"    {old} ({_deck_key_line(lines, start, end, old)}): "
+                    f"parsed as '{new}' — update the input file"
+                    for old, new in renamed))
+
         # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
         # like any other unknown deck key — reported by the unknown-key
         # check below, never steering anything): ``isdf_memory_mode``
@@ -1716,7 +1774,8 @@ def read_lorrax_input(filename: str) -> dict:
         # ``strict_keys``, REFUSED a valid deck outright.  Fold both sides
         # so recognition matches the lookup that already happens.
         _known = ({k.lower() for k in _DEFAULTS}
-                  | {k.lower() for k in _LEGACY_DECK_KEYS})
+                  | {k.lower() for k in _LEGACY_DECK_KEYS}
+                  | {k.lower() for k in _ALIASES})
         unknown = [k for k in section if k.lower() not in _known]
         if unknown:
             located = [f"{key} ({_deck_key_line(lines, start, end, key)})"
