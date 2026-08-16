@@ -1463,8 +1463,8 @@ def run_self_consistency(
     print_fn = inputs.print_fn
     _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
-    # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
-    # deprecated override, applied at config construction).
+    # E-history dump dir from config.sc, deck-only (the
+    # LORRAX_SC_DUMP_DIR env twin was deleted in 0.1.0).
     _dump_dir = inputs.config.sc.dump_dir
 
     # One-shot fast path: no acceleration needed.
@@ -2018,8 +2018,8 @@ def run_sc_driver(
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
-    # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
-    # deprecated overrides, applied at config construction).
+    # Loop knobs from ``config.sc``, deck-only (the six LORRAX_SC_* env
+    # twins were deleted in 0.1.0).
     sc = config.sc
     print_fn(f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
              f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}"

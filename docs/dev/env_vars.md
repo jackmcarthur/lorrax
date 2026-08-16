@@ -134,24 +134,25 @@ These change the numbers a run produces.  Their home is `cohsex.in`.
 
 ### 1a. Env twins that still work (deprecated, loud)
 
-The SC family was promoted first (`gw_config.py` `_sc_env` pattern); the
-ζ conditioning pair was promoted by workstream AV (2026-07-27): the key
-is the source of truth, a non-empty env var still overrides, and the
+The ζ conditioning pair was promoted by workstream AV (2026-07-27): the
+key is the source of truth, a non-empty env var still overrides, and the
 override prints a rank-0 deprecation notice (once per process,
 `isdf/core.py::_deprecated_env_float`).  ζ-fit provenance records the
 EFFECTIVE (post-override) value, so a rerun that drops the env cannot
 silently reuse a ζ fit at a different conditioning cutoff.
 
+The SC family was promoted first (the `gw_config.py` `_sc_env` pattern),
+and its six twins — `LORRAX_SC_MAX_ITER` / `_TOL_EV` / `_ACCEL` /
+`_DEPTH` / `_MIXING` / `_DUMP_DIR` — were **DELETED in 0.1.0** together
+with the shim that read them.  An env var that outranks the deck on a
+physics knob makes a run unreproducible from its own input file, and
+these had been deprecated since the `sc_*` keys landed (2026-07-08).
+`sc_eigh` never had one. The `sc_*` deck keys are unchanged.
+
 | env twin (deprecated) | input key | default | effect |
 |---|---|---|---|
 | `LORRAX_ZETA_RCOND` | `zeta_rcond` | `1e-8` | Relative eigenvalue cutoff of the rank-revealing ζ pseudo-inverse (both the replicated and the distributed `rank_truncate` factor, `isdf/core.py`). THE conditioning knob of the μ ladder: at μ=1998 it alone decides `n_keep ≈ 1015/1998` with no spectral gap (scorecard K). |
 | `LORRAX_ZETA_RIDGE` | `zeta_ridge` | `0` | Additive Tikhonov ridge on `C_q` before the ζ factorization. Superseded by `rank_truncate` as the conditioning cure; kept for the cholesky route. |
-| `LORRAX_SC_MAX_ITER` | `sc_max_iter` | — | self-consistency loop cap |
-| `LORRAX_SC_TOL_EV` | `sc_tol_ev` | — | SC convergence tol |
-| `LORRAX_SC_ACCEL` | `sc_accelerator` | — | SC accelerator choice |
-| `LORRAX_SC_DEPTH` | `sc_history_depth` | — | SC history depth |
-| `LORRAX_SC_MIXING` | `sc_mixing` | — | SC mixing |
-| `LORRAX_SC_DUMP_DIR` | `sc_dump_dir` | — | SC dump dir |
 
 No live harness depends on the ζ env twins (audited 2026-07-27: the one
 historical user is the completed one-off

@@ -11,8 +11,8 @@ Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 4. ``qp_solver = auto`` is gone with the boolean it read.
 5. Validation: ``fixed_point`` × static mode → error; the removed
    ``sigma_omega_accumulation = kij_stream`` spelling → parse-time error.
-6. ``SCConfig``: sc_* input keys parsed; ``LORRAX_SC_*`` envs honored as
-   deprecated overrides; knob validation.
+6. ``SCConfig``: sc_* input keys parsed and DECK-ONLY (the six
+   ``LORRAX_SC_*`` env twins were deleted in 0.1.0); knob validation.
 
 All tests run on a throwaway input file — no WFN, no GPU, no jit.
 """
@@ -283,23 +283,49 @@ def test_sc_input_keys(tmp_path):
             sc.mixing, sc.dump_dir) == (7, 1.0e-6, "linear", 3, 0.5, "sc_hist")
 
 
-def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
-    monkeypatch.setenv("LORRAX_SC_MAX_ITER", "3")
-    monkeypatch.setenv("LORRAX_SC_TOL_EV", "1e-10")
-    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
-    monkeypatch.setenv("LORRAX_SC_DEPTH", "2")
-    monkeypatch.setenv("LORRAX_SC_MIXING", "0.25")
-    monkeypatch.setenv("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")
+def test_the_sc_env_twins_no_longer_outrank_the_deck(tmp_path, monkeypatch):
+    """All six DELETED in 0.1.0, with the ``_sc_env`` shim.
+
+    An env var that outranks the deck on a physics knob makes a run
+    unreproducible from its own input file.  Checked for the FAILURE
+    signature — every twin exported at once, and the DECK's values must
+    come out — rather than for the absence of a helper.
+    """
+    for name, val in (("LORRAX_SC_MAX_ITER", "3"),
+                      ("LORRAX_SC_TOL_EV", "1e-10"),
+                      ("LORRAX_SC_ACCEL", "linear"),
+                      ("LORRAX_SC_DEPTH", "2"),
+                      ("LORRAX_SC_MIXING", "0.25"),
+                      ("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")):
+        monkeypatch.setenv(name, val)
     lines: list[str] = []
     path = tmp_path / "cohsex_env.in"
-    path.write_text(_with_compute_mode(BASE_INPUT + "sc_max_iter = 99\n"))
+    path.write_text(_with_compute_mode(
+        BASE_INPUT + "sc_max_iter = 99\nsc_accelerator = rcrop\n"))
     sc = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
     ).sc
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (3, 1.0e-10, "linear", 2, 0.25,
-                                        "/tmp/sc_dump")
-    assert any("deprecated env override" in l for l in lines)
+            sc.mixing, sc.dump_dir) == (99, 1.0e-4, "rcrop", 5, 1.0, None)
+    assert not any("deprecated env override" in l for l in lines)
+
+
+def test_the_sc_env_shim_is_gone_from_the_source():
+    """No reader may survive the row's deletion from the registry."""
+    import ast
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "gw_config.py").read_text()
+    tree = ast.parse(src)
+    # A comment naming the deleted shim is history, not a reader; a
+    # DEFINITION of it is the thing this cell exists to catch.
+    assert not [n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_sc_env"]
+    strings = {n.value for n in ast.walk(tree)
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    for name in ("LORRAX_SC_MAX_ITER", "LORRAX_SC_TOL_EV", "LORRAX_SC_ACCEL",
+                 "LORRAX_SC_DEPTH", "LORRAX_SC_MIXING", "LORRAX_SC_DUMP_DIR"):
+        assert name not in strings
 
 
 def test_sc_bad_accelerator_rejected(tmp_path):

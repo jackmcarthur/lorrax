@@ -1005,8 +1005,8 @@ _DEFAULTS = {
     "vnl_velocity_sign": "",
     "do_G0": True,
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
-    # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
-    # still honored as deprecated overrides.
+    # Promoted from the LORRAX_SC_* env vars (2026-07-08); those six env
+    # twins were DELETED in 0.1.0 — the deck is the only source.
     "sc_max_iter": 20,
     "sc_tol_ev": 1.0e-4,
     "sc_accelerator": "rcrop",   # rcrop | linear
@@ -2335,9 +2335,10 @@ class MPAConfig:
 class SCConfig:
     """Self-consistency loop knobs (read only when qp_solver=self_consistent).
 
-    Promoted from the ``LORRAX_SC_*`` env vars (NEXT_TARGETS #11); the
-    envs are still honored as deprecated overrides at config construction
-    (``from_input_file`` prints a note when one is active).
+    Promoted from the ``LORRAX_SC_*`` env vars (NEXT_TARGETS #11), whose
+    six deprecated twins were DELETED in 0.1.0: an env var that outranks
+    the deck on a physics knob makes a run unreproducible from its own
+    input file.  This group is deck-only.
 
     - ``max_iter`` / ``tol_ev``: loop length and RMS-ΔE convergence (eV).
     - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
@@ -2815,40 +2816,19 @@ class LorraxConfig:
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
         )
-        # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
-        # of the sc_* input keys (kept so existing sweep scripts run
-        # unchanged); a note is printed whenever one is active.
-        def _sc_env(env_key: str, cast, file_val, input_key: str):
-            raw_env = os.environ.get(env_key)
-            if raw_env is None or raw_env == "":
-                return file_val
-            val = cast(raw_env)
-            print_fn(
-                f"  [config] {env_key}={raw_env} (deprecated env override; "
-                f"set '{input_key} = {raw_env}' in cohsex.in instead)")
-            return val
-
+        # SC loop knobs — deck only.  The six LORRAX_SC_* env twins and
+        # the ``_sc_env`` shim that read them were DELETED in 0.1.0: an
+        # env var that outranks the deck on a physics knob makes a run
+        # unreproducible from its own input file, and these six had
+        # already been deprecated since the keys landed (2026-07-08).
+        # ``sc_eigh`` never had one, for exactly this reason.
         sc = SCConfig(
-            max_iter=_sc_env(
-                "LORRAX_SC_MAX_ITER", int, int(_g("sc_max_iter")),
-                "sc_max_iter"),
-            tol_ev=_sc_env(
-                "LORRAX_SC_TOL_EV", float, float(_g("sc_tol_ev")),
-                "sc_tol_ev"),
-            accelerator=_sc_env(
-                "LORRAX_SC_ACCEL", lambda s: str(s).strip().lower(),
-                str(_g("sc_accelerator")).strip().lower(), "sc_accelerator"),
-            history_depth=_sc_env(
-                "LORRAX_SC_DEPTH", int, int(_g("sc_history_depth")),
-                "sc_history_depth"),
-            mixing=_sc_env(
-                "LORRAX_SC_MIXING", float, float(_g("sc_mixing")),
-                "sc_mixing"),
-            dump_dir=_sc_env(
-                "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
-                "sc_dump_dir") or None,
-            # No env override: the LORRAX_SC_* envs are deprecated and a
-            # new knob must not add one.
+            max_iter=int(_g("sc_max_iter")),
+            tol_ev=float(_g("sc_tol_ev")),
+            accelerator=str(_g("sc_accelerator")).strip().lower(),
+            history_depth=int(_g("sc_history_depth")),
+            mixing=float(_g("sc_mixing")),
+            dump_dir=str(_g("sc_dump_dir") or "") or None,
             eigh=str(_g("sc_eigh")).strip().lower(),
         )
         memory = MemoryConfig(
