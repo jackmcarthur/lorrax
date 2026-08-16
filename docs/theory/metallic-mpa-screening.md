@@ -981,7 +981,7 @@ cells disagree about which side they are on. Spelled `f == 1.0` it would
 have turned whole semicore shells into crossing bands as soon as the `erfc`
 tail stopped rounding to exactly 1.0.
 
-What it was worth, measured on sodium (claim 0223, arms `18_`/`20_`/`19_`
+What it was worth, measured on sodium (claim 0224, arms `18_`/`20_`/`19_`
 of `runs/Na/02_soc48b_qsgw_mpa`, one-shot, 48 bands × 512 full-BZ k, and
 claim 0212 for the `[-5,+5]` numbers):
 
@@ -1179,7 +1179,7 @@ Open, with the reason each is still open:
 | the 2.7934 eV omega-reference error and its four sites | commits `59d7ea20`, `90b8275d`, `6fe3fcb8`, `cd5b0aa4` |
 | scissor identity law; the all-zero-diagonal wreckage it fixed | commit `bf57701b` |
 | crossing bands in neither scissor fit class; the saturation convention | commits `5b0ced2d`, `8a73e2fe`, `tests/test_scissor_crossing_classes.py` |
-| the old val fits (`0.9100` / `+1.1978`) and their `+4.84` vs `-12.86` eV semicore | claim 0212, and the `19_`/`18_` arm pair of claim 0223 |
+| the old val fits (`0.9100` / `+1.1978`), the new `+1.0201`, the rmse `0.209 -> 0.018`, and the 2s numbers | claim 0212, and the `18_`/`20_`/`19_` three-arm split of claim 0224 |
 | `max\|dE\|` criterion; the `sqrt(n_elem)` autopsy (60.2x vs 72x predicted) | commit `4a6ef831` |
 | entry-solved occupations; the metallic rCROP refusal deleted | commit `178f62b8` |
 | entry-solve vs end-solve first three calls (0.316 vs 0.404 eV); rCROP 0.389 meV in 9 calls; the production ruling; the two tolerance floors | claim 201 |
