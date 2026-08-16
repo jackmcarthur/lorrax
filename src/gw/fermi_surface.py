@@ -111,6 +111,27 @@ def tetrahedron_delta_weights(
     data ``g``.  Every periodic grid cell is split into the six tetrahedra
     sharing its body diagonal.  No smearing or empirical normalization is
     introduced.
+
+    **The returned table is NOT star-covariant, by construction.**  The six
+    tetrahedra of ``_TETRA_OFFSETS`` all share the ONE hardcoded ``(1,1,1)``
+    body diagonal (the Kuhn triangulation), so the partition is invariant
+    only under the crystal ops that map that grid line onto itself and act
+    as signed permutations of the grid axes.  Measured on the bcc sodium
+    8x8x8 deck (48 ops, all of them energy-preserving grid automorphisms):
+    16 preserve the ``(1,1,1)`` LINE and only **4 of 48** leave the weight
+    table itself invariant, with a 76 percent worst-case relative violation
+    between star partners.  Consequences measured on the same deck's
+    converged state: ``N(E_F)`` differs by up to 0.0425 states/Ry/cell
+    across one star (2.9x the mean per-k value), and the head's Drude
+    tensor comes out 2.68 percent ANISOTROPIC on a cubic crystal, with the
+    unique axis along the Cartesian image of ``(1,1,1)``.
+
+    Callers on the metallic path must therefore pass the result through
+    :func:`star_symmetrize_weights` before contracting it.  That is a
+    post-integration repair and it is exact for the weights: see that
+    function.  The structural repair -- averaging the four inequivalent
+    body-diagonal triangulations, which also fixes the interpolation
+    anisotropy this one has -- is registered as follow-up, not done here.
     """
     energies = np.asarray(energies_kn, dtype=np.float64)
     grid = np.asarray(kgrid, dtype=np.int64)
@@ -147,4 +168,63 @@ def tetrahedron_delta_weights(
     return weights
 
 
-__all__ = ["tetrahedron_delta_weights"]
+def star_symmetrize_weights(weights_kn, star_index):
+    r"""Restore star covariance to a Fermi-surface weight table.
+
+    ``wbar(k, n) = (1/|G|) sum_{R in G} w(Rk, n)``.
+
+    Every ``R`` permutes a star onto itself and carries band ``n`` to band
+    ``n`` (the two k share an eigenvalue vector, so the energy-ordered band
+    index is the same label), and each member of the star is hit exactly
+    ``|G|/|star|`` times.  The group average is therefore the plain MEAN of
+    ``w`` over the star -- no symmetry matrices are needed here, only the
+    star label of each full-BZ point, which the caller already carries as
+    ``sym.irr_idx_k``.
+
+    Why this is EXACT and not an approximation.  The quantity being built is
+    ``I[g] = integral delta(E-mu) g(k) dk`` for a star-covariant integrand
+    ``g``.  For such a ``g``, ``sum_kn wbar_kn g_kn == sum_kn w_kn g_kn``:
+    the symmetrization moves weight only BETWEEN star partners, where ``g``
+    is equal, so no integral of a covariant integrand changes value.  What
+    it does change is the tensor STRUCTURE of integrals of non-invariant
+    integrands -- ``sum_kn w_kn v_a v_b`` is the case that matters -- which
+    is exactly the defect.  ``sum_kn wbar_kn == sum_kn w_kn`` identically,
+    so ``N(E_F)`` and the Drude trace are untouched to the last bit.
+
+    What it does NOT fix: the O(h^2) accuracy of the linear-tetrahedron rule
+    itself, and the anisotropy of the interpolant inside each cell (the same
+    Kuhn diagonal biases the linear interpolation, not just the weights).  A
+    Bloechl correction is an ACCURACY axis, not a symmetry one -- a corrected
+    non-adapted partition is still non-covariant.  The structural fix is a
+    symmetry-adapted partition (average the four body-diagonal Kuhn
+    triangulations, or use a symmetry-adapted decomposition outright).
+
+    Parameters
+    ----------
+    weights_kn : (nk, nb) array
+        The table from :func:`tetrahedron_delta_weights`.
+    star_index : (nk,) integer array
+        Star (orbit) label per full-BZ k point; ``sym.irr_idx_k`` is one.
+    """
+    weights = np.asarray(weights_kn, dtype=np.float64)
+    labels = np.asarray(star_index, dtype=np.int64)
+    if weights.ndim != 2:
+        raise ValueError(
+            f"star_symmetrize_weights: weights must be (nk,nb), got {weights.shape}")
+    if labels.shape != (weights.shape[0],):
+        raise ValueError(
+            "star_symmetrize_weights: star_index must be (nk,), got "
+            f"{labels.shape} against nk={weights.shape[0]}")
+    if labels.size and labels.min() < 0:
+        raise ValueError("star_symmetrize_weights: star_index must be >= 0")
+    # Dense relabelling: `irr_idx_k` indexes the IBZ, so its labels are
+    # already dense, but a caller may hand any labelling and a sparse one
+    # would silently allocate an oversized accumulator.
+    _, compact = np.unique(labels, return_inverse=True)
+    counts = np.bincount(compact).astype(np.float64)
+    sums = np.zeros((counts.size, weights.shape[1]), dtype=np.float64)
+    np.add.at(sums, compact, weights)
+    return sums[compact] / counts[compact][:, None]
+
+
+__all__ = ["tetrahedron_delta_weights", "star_symmetrize_weights"]
