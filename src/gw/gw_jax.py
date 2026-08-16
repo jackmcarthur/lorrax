@@ -16,14 +16,30 @@ in this file, in execution order:
     E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
     eqp0/eqp1/σ.dat = write_results(...)                   # writers, debug tables       (gw_output)
 
-Two orthogonal config axes pivot the flow: ``compute_mode`` — the
-self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``,
-plus ``mpa``, which is declared on the axis and refused at entry until
-its Σ stage lands) — and ``qp_solver`` — how QP energies are extracted
-from Σ (``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
-self-consistent path iterates the same ``compute_sigma_xc`` dispatch;
-iteration 1 reproduces the one-shot result exactly (gated by
+THREE orthogonal config axes pivot the flow:
+
+``compute_mode`` — the self-energy ansatz (``x_only`` / ``cohsex`` /
+``gn_ppm`` / ``hl_ppm``, plus ``mpa``, which is declared on the axis and
+refused at entry until its Σ stage lands).
+
+``qp_solver`` — whether Σ is REBUILT (``one_shot_dft`` / ``fixed_point``
+/ ``self_consistent``).  The self-consistent path iterates the same
+``compute_sigma_xc`` dispatch; iteration 1 reproduces the one-shot result
+exactly (gated by
 ``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``).
+
+``self_energy_eval_type`` — which QP definition the run REPORTS.
+``linearized`` writes the BGW pair (eqp0 = Newton at E_DFT, eqp1 =
+Z-linearized) off the Σ DIAGONALS; ``hermitianized`` writes the
+eigenvalues of the ``eigh`` line above, so OFF-DIAGONAL Σ moves the bands
+and eqp1 == eqp0.  Note where it acts: the H-build and eigh happen on
+EVERY path regardless, so this axis changes no computation at all — only
+which of two already-computed quantities reaches ``eqp{0,1}.dat``.  Unset
+resolves from ``qp_solver`` (self_consistent → hermitianized, else
+linearized) and ``linearized`` × ``self_consistent`` is REFUSED rather
+than coerced.  ``one_shot_dft`` × ``hermitianized`` — a single-shot
+QSGW-style rediagonalisation with no self-consistency — is the
+configuration separating this axis from ``qp_solver`` exists to reach.
 
 Deliberate physics absences (do not "fix" these): G(τ) is never
 materialized — it exists only as ψψ*-phases inside the χ₀/Σ kernels;
