@@ -25,6 +25,13 @@ The headline **41.338 meV lives in the 20-fold block and is 91 % gauge.**
 The worst invariant residual over the whole window is 6.734 meV, at bands
 36-39 — a different place entirely.
 
+AND ALL OF IT IS MEASURED AT A SLICED BAND EDGE.  That deck runs
+``nband = 60`` on a 62-band WFN and edge 60 has a min gap over k of
+**0.000000 meV**; at a clean edge (40 or 36) every Σ channel's within-star
+spread is **exactly 0.0000**.  So the table above describes a run that should
+not have been made, and the reason to keep the diagnostic is that it tells a
+gauge artifact from a real break once the edge is clean.
+
 These cells pin the property, not the numbers: that the multiplet-resolved
 spread is defined, that it is bounded by the per-band one on a degenerate
 block, and that it is EXACTLY equal to it where a band is isolated.
