@@ -92,6 +92,31 @@ def test_fixed_point_static_mode_rejected(tmp_path):
         cfg.qp_solver
 
 
+def test_bispinor_with_self_consistent_refuses_naming_the_dropped_term(
+        tmp_path):
+    """The SC path never threads ``wfns_transverse``, so Σ^B vanishes.
+
+    Checked for the FAILURE signature: the message must name Σ^B, because
+    "unsupported combination" would not tell an operator that the run they
+    already have is missing a term.
+    """
+    cfg = _config(tmp_path, "bispinor = true\nqp_solver = self_consistent\n")
+    with pytest.raises(ValueError) as exc:
+        cfg.qp_solver
+    msg = str(exc.value)
+    assert "bispinor" in msg and "self_consistent" in msg
+    assert "Σ^B" in msg and "DROPPED" in msg
+
+
+@pytest.mark.parametrize("solver", ["one_shot_dft", "fixed_point"])
+def test_bispinor_with_the_non_sc_solvers_still_resolves(tmp_path, solver):
+    """RED TWIN: only the SC leg is refused."""
+    cfg = _config(tmp_path,
+                  f"bispinor = true\ncompute_mode = gn_ppm\n"
+                  f"qp_solver = {solver}\n")
+    assert cfg.qp_solver is QPSolver(solver)
+
+
 def test_kij_stream_refused_at_parse(tmp_path):
     # kij_stream was REMOVED (2026-07-31).  A removed VALUE of a known
     # key must refuse at parse with the removal named — never silently

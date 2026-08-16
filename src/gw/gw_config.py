@@ -2431,6 +2431,8 @@ class LorraxConfig:
 
         - ``fixed_point`` × static mode → error (no ω-grid to solve on;
           a silent no-op would blur the axis).
+        - ``self_consistent`` × ``bispinor`` → error (the SC path drops
+          Σ^B; see the refusal below).
         """
         raw = (self.qp_solver_raw or "auto").strip().lower()
         if raw == "auto":
@@ -2458,6 +2460,25 @@ class LorraxConfig:
                 f"({_dynamic}); static Σ ({mode.value}) has no ω-grid "
                 f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
                 f"physics for static Σ) or self_consistent.")
+        if solver is QPSolver.SELF_CONSISTENT and self.bispinor:
+            # NOT a capability gap to be filled by threading two more
+            # arguments -- it is a SILENT one.  The transverse wavefunctions
+            # and the bispinor V_q path reach Σ only through the one-shot
+            # call (gw_jax.py:475-490); sc_iteration.py:1126-1149 passes
+            # neither, and sigma_dispatch.py:442-443 defaults both to None,
+            # whose fold-in is a structural no-op.  So the combination ran
+            # to completion at rc=0 with Σ^B entirely absent -- the exact
+            # failure class the loud guard one branch over was written to
+            # prevent.
+            raise ValueError(
+                "bispinor = true with qp_solver = self_consistent is "
+                "refused: the self-consistent path never threads the "
+                "transverse wavefunctions or the bispinor V_q into "
+                "sigma_dispatch, so the bare-Breit Σ^B is DROPPED and the "
+                "run finishes at rc=0 reporting a scalar QSGW result under "
+                "a bispinor deck's name.  Use qp_solver = one_shot_dft (or "
+                "fixed_point) for bispinor runs; SC over the transverse "
+                "channel is phase 2 (BISPINOR_DHFB_DESIGN.md).")
         return solver
 
     @property
