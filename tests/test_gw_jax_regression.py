@@ -286,6 +286,20 @@ def test_si_production_matches_berkeleygw(si_session):
             f"  star spread: {stats['_star_spread']:.4f} meV "
             f"(limit {_BGW_STAR_SPREAD_MAX_MEV}) — symmetry-equivalent "
             f"k-points disagree with each other")
+    # Report the band-cut's degeneracy status and the subspace-invariant
+    # twin alongside the gated number, so the margin AND its meaning are
+    # both auditable.  MEASURED 2026-08-15: over these 16 bands the per-band
+    # spread reads 2.611 meV and the multiplet-trace spread 0.593 meV — the
+    # per-band figure is inflated ~4.4x by the arbitrariness of the band
+    # label inside a degenerate multiplet, and on this deck EVERY band is
+    # inside one.  Neither is gated on here; the gate stays on the
+    # historical quantity so its threshold keeps its meaning.
+    _report_headroom(
+        "si_bgw_star_spread",
+        f"per-band {stats['_star_spread']:.4f} meV; multiplet-trace "
+        f"{stats['_star_spread_multiplet']} meV; band cut at {16} is "
+        f"{'CLEAN' if stats['_cut_clean'] else 'NOT clean'} "
+        f"(cut_clean={stats['_cut_clean']})")
     if failures:
         pytest.fail(
             "Si production deck no longer agrees with BerkeleyGW "

@@ -1052,6 +1052,68 @@ def _star_spread_of_sigma_diag(sigma_tot_kij_ev, sym):
     return per_band, float(per_band.max(initial=0.0)), n_members
 
 
+def _star_spread_over_multiplets(sigma_tot_kij_ev, sym, e_dft_ry,
+                                 *, tol_ry=None):
+    """The same spread, but on DEGENERATE SUBSPACES instead of single bands.
+
+    WHY THIS EXISTS, and it is not a refinement of the per-band number — it
+    answers a question the per-band number CANNOT.
+
+    Inside a degenerate multiplet the individual band index is arbitrary: the
+    eigensolver may order or mix members differently at symmetry-equivalent
+    k, and nothing forbids it, because any unitary mixing within the subspace
+    is an equally valid eigenbasis.  So ``Re Σ_bb`` for a single ``b`` inside
+    a multiplet is NOT a symmetry-invariant quantity, and comparing it across
+    a star measures the eigensolver's gauge as much as the physics.  The
+    TRACE over the whole multiplet is invariant under that mixing — it is the
+    same subspace either way — so its spread across a star is a clean
+    symmetry diagnostic where the per-band one is not.
+
+    MEASURED on the Si production deck, 2026-08-15: **60 of 60 bands sit
+    inside a multiplet** (group sizes 4, 4, 8, 8, 8, 8, 20 — the top twenty
+    are one block with EXACTLY zero gaps), and that is tolerance-insensitive
+    from 1 meV down to 13.6 µeV.  So on that deck there is no band anywhere
+    in the window for which the per-band spread is well defined, and no
+    choice of band CUT can change that.  This is the diagnostic that can
+    tell a gauge artifact from a real symmetry break; the per-band one
+    cannot, and is retained only because it is what the historical figures
+    and the BerkeleyGW comparison are quoted in.
+
+    Returned per band (the multiplet's spread divided by its size) so the two
+    vectors are directly comparable element by element.
+    """
+    if sym is None or e_dft_ry is None:
+        return None
+    from common.band_degeneracy import DEGENERACY_TOL_RY, boundary_min_gaps
+
+    tol = float(DEGENERACY_TOL_RY if tol_ry is None else tol_ry)
+    labels = np.asarray(sym.irr_idx_k)
+    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    e = np.asarray(e_dft_ry, dtype=np.float64)
+    if e.ndim != 2 or e.shape[1] != diag.shape[1]:
+        return None
+    # THE SAME boundary rule the band-window safeguards use, so "clean" means
+    # one thing in this tree: min over k of the gap across each boundary.
+    gaps = boundary_min_gaps(e)
+    bounds, start = [], 0
+    nb = diag.shape[1]
+    for b in range(1, nb + 1):
+        if b == nb or gaps[b] > tol:
+            bounds.append((start, b))
+            start = b
+
+    out = np.zeros(nb, dtype=np.float64)
+    for lab in np.unique(labels):
+        rows = diag[labels == lab]
+        if rows.shape[0] <= 1:
+            continue
+        for lo, hi in bounds:
+            tr = rows[:, lo:hi].sum(axis=1)          # trace over the subspace
+            out[lo:hi] = np.maximum(
+                out[lo:hi], (tr.max() - tr.min()) / float(hi - lo))
+    return out
+
+
 def write_results(
     results: GWResults,
     sigma_diag_file: str,
@@ -1212,11 +1274,21 @@ def write_results(
     _spread_per_band, _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
         sx_out + corr_out, sym)
 
+    # THE DEGENERACY-RESOLVED TWIN.  Measured on the SAME full-BZ Sigma and
+    # the SAME star labels, but on degenerate SUBSPACES rather than single
+    # bands, because a per-band Re Sigma_bb inside a multiplet is not a
+    # symmetry-invariant quantity at all.  It takes the DFT ladder to know
+    # where the multiplets are, and that is the array the window was sliced
+    # out of.
+    _spread_multiplet = _star_spread_over_multiplets(
+        sx_out + corr_out, sym, np.asarray(results.E_dft_ry, dtype=np.float64))
+
     write_sigma_to_file(
         _wedge(sx_out),
         sigma_diag_file,
         star_spread_ev=_star_spread_ev,
         star_spread_per_band_ev=_spread_per_band,
+        star_spread_multiplet_ev=_spread_multiplet,
         n_star_members=_nstar,
         sigma_coh_kij_eV=_wedge(corr_out),
         hartree_kij_eV=_wedge(sig_h_out),

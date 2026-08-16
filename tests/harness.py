@@ -862,10 +862,14 @@ def _parse_star_spread_header(path: Path):
     16 bands the BerkeleyGW fixture covers read 2.61.  The band scope is
     the consumer's knowledge, so the consumer takes its own max.
     """
-    per_band, n_members = None, None
+    per_band, multiplet, n_members = None, None, None
     for ln in Path(path).read_text().splitlines():
         if not ln.startswith("#") and ln.strip():
             break
+        m = re.match(r"#\s*star_spread_ev_per_band_multiplet\s+(.*)$", ln)
+        if m:
+            multiplet = np.asarray([float(x) for x in m.group(1).split()])
+            continue
         m = re.match(r"#\s*star_spread_ev_per_band\s+(.*)$", ln)
         if m:
             per_band = np.asarray([float(x) for x in m.group(1).split()])
@@ -876,7 +880,7 @@ def _parse_star_spread_header(path: Path):
             n_members = int(n.group(1)) if n else None
     if per_band is None:
         return None
-    return per_band, n_members
+    return per_band, multiplet, n_members
 
 
 def compare_to_bgw(output_file: Path, fixture: Path, labels=(
@@ -987,7 +991,7 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
             f"gw_output before the writer reduces to the wedge; without it "
             f"there is nothing here to report, and recomputing it from a "
             f"wedge file would return a fake 0.000.")
-    per_band, n_members = hdr
+    per_band, multiplet, n_members = hdr
     if per_band.shape[0] < nb:
         raise AssertionError(
             f"star-spread row covers {per_band.shape[0]} bands but this "
@@ -996,6 +1000,46 @@ def compare_to_bgw(output_file: Path, fixture: Path, labels=(
     # THE CONSUMER'S OWN SCOPE: the max over exactly the bands compared
     # above, not the driver's whole sigma window.
     out["_star_spread"] = float(per_band[:nb].max()) * 1e3
+
+    # ── THE CUT THIS COMPARISON MAKES, AND WHETHER IT IS CLEAN ────────────
+    # ``nb`` is whatever the BerkeleyGW fixture happens to carry, and until
+    # 2026-08-15 it was applied with no check at all.  A band boundary that
+    # falls INSIDE a degenerate multiplet is not a safe place to truncate:
+    # within a multiplet the band index is arbitrary, so a truncated sum is
+    # not invariant under the group where a complete one is.  The energies
+    # to decide it are in this very file (the ``Eo=`` column), and the rule
+    # is the tree's one rule -- ``common.band_degeneracy.boundary_min_gaps``.
+    #
+    # REPORTED, NOT REFUSED.  This is a diagnostic, the fixture's band count
+    # is not ours to move, and on the Si anchor the cut at 16 MEASURES CLEAN
+    # anyway.  A refusal here would fail a gate over a property of a
+    # reference file rather than of the code under test.
+    out["_cut_clean"] = None
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from common.band_degeneracy import (DEGENERACY_TOL_RY,
+                                            boundary_min_gaps)
+        eo = _parse_eo_column(output_file)
+        e_ry = np.asarray([eo[k] for k in sorted(eo)]) / 13.6056980659
+        if e_ry.ndim == 2 and e_ry.shape[1] >= nb:
+            gaps = boundary_min_gaps(e_ry)
+            out["_cut_clean"] = bool(nb >= gaps.size
+                                     or gaps[nb] > DEGENERACY_TOL_RY)
+    except Exception:                                          # noqa: BLE001
+        pass                                    # diagnostic only, never fatal
+
+    # ── THE SUBSPACE-INVARIANT TWIN ───────────────────────────────────────
+    # ``_star_spread`` is a PER-BAND max-min, and a per-band ``Re Sigma_bb``
+    # inside a degenerate multiplet is not a symmetry-invariant quantity:
+    # any unitary mixing within the subspace is an equally valid eigenbasis.
+    # MEASURED on the Si production deck 2026-08-15, where 60 of 60 bands
+    # sit inside a multiplet: per-band 41.338 meV over the full window
+    # against 6.734 meV on the multiplet traces, and 2.611 -> 0.593 meV over
+    # the 16 bands THIS comparison spans.  Both are reported because they
+    # answer different questions; the multiplet one is the one to quote for
+    # "is the symmetry broken".
+    out["_star_spread_multiplet"] = (
+        float(multiplet[:nb].max()) * 1e3 if multiplet is not None else None)
     out["_nstar"] = n_members
     return out
 

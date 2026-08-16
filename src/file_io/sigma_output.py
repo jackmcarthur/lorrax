@@ -80,6 +80,7 @@ def write_sigma_to_file(
 	kpoints_crys,
 	star_spread_ev=None,
 	star_spread_per_band_ev=None,
+	star_spread_multiplet_ev=None,
 	n_star_members=None,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
@@ -249,6 +250,25 @@ def write_sigma_to_file(
 					f"expected ({nbands},) — one entry per written band.")
 			f.write("# star_spread_ev_per_band "
 			        + " ".join(f"{float(v):.9e}" for v in _pb) + "\n")
+		if star_spread_multiplet_ev is not None:
+			# THE DEGENERACY-RESOLVED TWIN, and it is not a refinement of the
+			# row above -- it answers a question that one cannot.  A single
+			# band inside a degenerate multiplet has no symmetry-invariant
+			# Re Sigma_bb: any unitary mixing within the subspace is an
+			# equally valid eigenbasis, so the per-band row measures the
+			# eigensolver's gauge there as much as the physics.  The TRACE
+			# over the multiplet IS invariant.  Entries are per band (the
+			# subspace spread divided by its size) so the two rows compare
+			# element by element; where a band is isolated the two agree by
+			# construction.  See gw_output._star_spread_over_multiplets.
+			_mp = np.asarray(star_spread_multiplet_ev, dtype=np.float64)
+			if _mp.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_multiplet_ev has shape {_mp.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			f.write(f"# star_spread_ev_multiplet_max {float(_mp.max()):.9e}\n")
+			f.write("# star_spread_ev_per_band_multiplet "
+			        + " ".join(f"{float(v):.9e}" for v in _mp) + "\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
 			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
