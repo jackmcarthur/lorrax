@@ -116,7 +116,6 @@ page has to read it from.
 | `sigma_regularization_ev` | `0.25` | Retarded broadening of Sigma(omega) in eV. In MPA this is a literal external `eta`, applied once in addition to each fitted pole width; it is not a pole-fit width or an HGL scale. Must be finite and positive. |
 | `sigma_window_edge_factor` | `1.5` | MPA core/sector partition margin in `T = max(abs(omega_min),abs(omega_max)) + factor*eta`. It moves work between exact quadrature families and does not add a second broadening. |
 | `sigma_omega_batch_size` | `4` | Omega points evaluated per batch in the Sigma^c(omega) loop. |
-| `sigma_omega_accumulation` | `"auto"` | How per-branch Sigma(omega) contributions are accumulated (auto = pick by size). |
 | `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
 | `sigma_freq_debug_output` | false | Dump the per-branch Sigma(omega) debug table. |

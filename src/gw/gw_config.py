@@ -1418,7 +1418,6 @@ _DEFAULTS = {
     "sigma_regularization_ev": 0.25,
     "sigma_window_edge_factor": 1.5,
     "sigma_omega_batch_size": 4,
-    "sigma_omega_accumulation": "auto",
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
     #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
     #       tiles are gathered into the FULL cube on EVERY rank
@@ -1534,6 +1533,12 @@ _LEGACY_DECK_KEYS = frozenset({
     # rather than refuse, on the ``slab_io`` rule: it never changed a
     # number, so an old deck should keep running and be told what it lost.
     "sigma_at_dft_energies",        # warn-and-ignore (qp_solver default)
+    # 0.1.0: ZERO CONSUMERS.  Its two legal values ``auto`` and ``kij``
+    # were byte-identical -- ppm_sigma.py:866 mentions the key in a
+    # COMMENT, not a branch -- so the key survived only to carry the
+    # refusal for the removed ``kij_stream`` spelling.  That refusal moves
+    # into the branch below and the key goes.
+    "sigma_omega_accumulation",     # refuse on kij_stream, else ignore
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1576,7 +1581,7 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "sc_eigh",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
-    "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
+    "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_probe_chi_reuse",
@@ -1806,6 +1811,34 @@ def read_lorrax_input(filename: str) -> dict:
                     "the bytes)"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
+        # ``sigma_omega_accumulation``: the key is gone, but the REMOVED
+        # value it used to refuse must keep refusing.  A deck carrying
+        # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
+        # longer exists; silently rerouting it to the host-tile path is
+        # the silent-downgrade failure, key or no key.
+        _accum = section.get("sigma_omega_accumulation", fallback=None)
+        if _accum is not None and str(_accum).strip().lower() == "kij_stream":
+            raise ValueError(
+                "sigma_omega_accumulation = kij_stream was REMOVED "
+                "(2026-07-31), and the whole key was deleted in 0.1.0: its "
+                "surviving values 'auto' and 'kij' were byte-identical and "
+                "nothing read them.  Host-tile accumulation is the only "
+                "mode.  Delete the line; for the sharded Sigma cube use "
+                "'sigma_omega_layout = sharded'.")
+        if _accum is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'sigma_omega_accumulation' is no longer supported "
+                "and will be ignored: its two remaining values were "
+                "byte-identical and nothing read them.  Remove it from your "
+                "input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sigma_omega_accumulation",
+                "IGNORED — 'auto' and 'kij' were byte-identical and nothing "
+                "read the key; host-tile accumulation is the only mode"))
+
         if section.get("sigma_at_dft_energies", fallback=None) is not None:
             import warnings
             warnings.warn(
@@ -2118,7 +2151,6 @@ class DynamicSigmaConfig:
     regularization_ev: float
     window_edge_factor: float
     omega_batch_size: int
-    omega_accumulation: str
     omega_layout: str
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
@@ -2130,12 +2162,6 @@ class DynamicSigmaConfig:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
         if self.fermi_reference not in ("vbm", "midgap"):
             raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-        if self.omega_accumulation == "kij_stream":
-            raise ValueError(
-                "sigma_omega_accumulation = kij_stream was REMOVED; use "
-                "'kij' or 'auto' with sigma_omega_layout = sharded")
-        if self.omega_accumulation not in ("auto", "kij"):
-            raise ValueError("sigma_omega_accumulation must be auto/kij.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
@@ -2761,8 +2787,6 @@ class LorraxConfig:
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
-            omega_accumulation=str(
-                _g("sigma_omega_accumulation")).strip().lower(),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),

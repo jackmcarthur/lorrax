@@ -863,8 +863,8 @@ def compute_sigma_c_ppm_omega_grid(
     omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
     omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
 
-    # fermi_reference / omega_accumulation are validated + normalized at
-    # PPMConfig construction; used directly here (fermi → traced bool below).
+    # fermi_reference is validated + normalized at PPMConfig
+    # construction; used directly here (fermi → traced bool below).
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
@@ -944,7 +944,8 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
-    # 2026-07-31; ``omega_accumulation`` is auto|kij, both host tiles).
+    # 2026-07-31; the ``sigma_omega_accumulation`` key that selected it
+    # was deleted in 0.1.0 -- its two survivors were byte-identical).
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
     n_omega = int(omega_req.size)
