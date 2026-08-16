@@ -4,11 +4,11 @@ Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 (G0W0_SC_TOGGLE_DESIGN.md §2a):
 
 1. Default → ``ONE_SHOT_DFT`` (standard G0W0).
-2. Legacy ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated,
-   honored).
+2. The deleted ``self_consistent`` BOOLEAN refuses, naming
+   ``qp_solver = self_consistent``.
 3. Legacy ``sigma_at_dft_energies = true`` → ``ONE_SHOT_DFT`` (the orphan
    flag's intended meaning IS the default; deprecated, honored).
-4. Explicit ``qp_solver`` overrides the legacy flags.
+4. ``qp_solver = auto`` is gone with the boolean it read.
 5. Validation: ``fixed_point`` × static mode → error; the removed
    ``sigma_omega_accumulation = kij_stream`` spelling → parse-time error.
 6. ``SCConfig``: sc_* input keys parsed; ``LORRAX_SC_*`` envs honored as
@@ -64,10 +64,16 @@ def test_default_is_one_shot_dft(tmp_path):
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
 
 
-def test_legacy_self_consistent_resolves_and_warns(tmp_path):
-    with pytest.warns(DeprecationWarning, match="self_consistent"):
-        cfg = _config(tmp_path, "self_consistent = true\n")
-    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+def test_the_self_consistent_boolean_refuses_naming_qp_solver(tmp_path):
+    """It was a KEY named exactly like another key's VALUE.
+
+    Refused, not ignored: it chose between one-shot and a QSGW loop.
+    """
+    with pytest.raises(ValueError) as exc:
+        _config(tmp_path, "self_consistent = true\n")
+    msg = str(exc.value)
+    assert "self_consistent" in msg
+    assert "qp_solver = self_consistent" in msg
 
 
 def test_legacy_sigma_at_dft_energies_resolves_and_warns(tmp_path):
@@ -76,11 +82,17 @@ def test_legacy_sigma_at_dft_energies_resolves_and_warns(tmp_path):
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
 
 
-def test_explicit_overrides_legacy(tmp_path):
-    with pytest.warns(DeprecationWarning):
-        cfg = _config(
-            tmp_path, "self_consistent = true\nqp_solver = one_shot_dft\n")
-    assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
+def test_qp_solver_auto_is_no_longer_a_value(tmp_path):
+    """``auto`` existed only to read the deleted boolean."""
+    cfg = _config(tmp_path, "qp_solver = auto\n")
+    with pytest.raises(ValueError, match="auto"):
+        cfg.qp_solver
+
+
+@pytest.mark.parametrize("solver", ["one_shot_dft", "self_consistent"])
+def test_explicit_qp_solver_values_resolve(tmp_path, solver):
+    assert _config(tmp_path,
+                   f"qp_solver = {solver}\n").qp_solver is QPSolver(solver)
 
 
 def test_explicit_fixed_point_dynamic(tmp_path):

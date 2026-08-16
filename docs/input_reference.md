@@ -148,9 +148,8 @@ page has to read it from.
 |---|---|---|
 | `density_self_consistent` | false | Rebuild V_H from the current orbitals every SC iteration instead of rotating the fixed DFT V_H into the QP basis; off keeps QSGW fixed-density. |
 | `sc_on_ibz` | false | Run the SC loop's H/E/U and carried state on the IBZ, broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton. |
-| `qp_solver` | `"auto"` | QP extraction: one_shot_dft (G0W0 at E_DFT; auto default) | fixed_point (on-shell) | self_consistent (QSGW loop). |
+| `qp_solver` | `"one_shot_dft"` | QP extraction: one_shot_dft (G0W0 at E_DFT; the default) | fixed_point (on-shell) | self_consistent (QSGW loop). The `auto` value and the `self_consistent` BOOLEAN it read were deleted for 0.1.0; that spelling now REFUSES naming this key. `self_consistent` also refuses together with `bispinor = true` (the SC path drops Sigma^B). |
 | `do_G0` | true | Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run. |
-| `self_consistent` | false | DEPRECATED alias for qp_solver = self_consistent. |
 | `sc_max_iter` | `20` | Self-consistency iteration cap. |
 | `sc_tol_ev` | `0.0001` | Self-consistency convergence tolerance (eV). |
 | `sc_accelerator` | `"rcrop"` | SC mixing accelerator: rcrop | linear. |

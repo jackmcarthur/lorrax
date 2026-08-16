@@ -1038,12 +1038,16 @@ _DEFAULTS = {
     # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
     "compute_mode": "",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
-    # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
-    # from the deprecated ``self_consistent`` key (true → self_consistent)
-    # and otherwise defaults to "one_shot_dft" (standard G0W0).  New input
-    # files should set it explicitly:
-    #   "one_shot_dft" | "fixed_point" | "self_consistent".
-    "qp_solver": "auto",
+    # extracted from Σ (see the ``QPSolver`` enum):
+    #   "one_shot_dft" (default; standard G0W0) | "fixed_point"
+    #   | "self_consistent".
+    # Unlike ``compute_mode`` this axis HAS a right default -- G0W0 is
+    # what a GW code does when not asked otherwise -- so it keeps one.
+    # The ``auto`` value went with the deprecated ``self_consistent``
+    # BOOLEAN it existed to read (0.1.0); a solver named `self_consistent`
+    # and a boolean named `self_consistent` meaning the same thing was one
+    # spelling too many.
+    "qp_solver": "one_shot_dft",
     "bispinor": False,
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
@@ -1065,10 +1069,6 @@ _DEFAULTS = {
     # named failure mode reproduced in one line of a deck.
     "vnl_velocity_sign": "",
     "do_G0": True,
-    # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
-    # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
-    # wired for ALL modes (mode-agnostic sigma_dispatch), not just COHSEX.
-    "self_consistent": False,
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
     # Promoted from the LORRAX_SC_* env vars (2026-07-08); the envs are
     # still honored as deprecated overrides.
@@ -1528,6 +1528,11 @@ _LEGACY_DECK_KEYS = frozenset({
     "do_screened",                  # refuse -> compute_mode
     "use_ppm_sigma",                # refuse -> compute_mode
     "ppm_model",                    # refuse -> compute_mode
+    # 0.1.0: the deprecated BOOLEAN spelling of ``qp_solver =
+    # self_consistent``.  Two keys, one of them named exactly like the
+    # other's value.  Refused for the same reason as the ansatz flags: it
+    # chose between one-shot and a QSGW loop.
+    "self_consistent",              # refuse -> qp_solver
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1717,6 +1722,16 @@ def read_lorrax_input(filename: str) -> dict:
                   "A deck that named none of the three used to run COHSEX "
                   "by accident of the defaults.")
 
+        if section.get("self_consistent", fallback=None) is not None:
+            raise ValueError(
+                f"Input key 'self_consistent' "
+                f"({_deck_key_line(lines, start, end, 'self_consistent')}) "
+                f"was deleted in 0.1.0: it was the BOOLEAN spelling of "
+                f"'qp_solver = self_consistent', i.e. a key named exactly "
+                f"like another key's value.  Write "
+                f"'qp_solver = self_consistent' for the QSGW loop, or "
+                f"'qp_solver = one_shot_dft' (the default) for G0W0.")
+
         # RETIRED-KEY REPORT.  A key with an explicit legacy branch is
         # exempt from the unknown-key check below so one deck key never
         # draws two messages — but that exemption left
@@ -1791,7 +1806,6 @@ def read_lorrax_input(filename: str) -> dict:
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
         for legacy_key, replacement in (
-            ("self_consistent", "qp_solver = self_consistent"),
             ("sigma_at_dft_energies", "qp_solver = one_shot_dft (the default)"),
         ):
             if section.get(legacy_key, fallback=None) is not None:
@@ -2435,10 +2449,9 @@ class LorraxConfig:
     #: every other deck in the tree.
     raw_input_keys: frozenset
     compute_mode_raw: str         # one of ComputeMode.value strings (required)
-    qp_solver_raw: str            # "auto" | one of QPSolver.value strings
+    qp_solver_raw: str            # one of QPSolver.value strings
     bispinor: bool
     do_G0: bool
-    self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     no_degen_averaging: bool
     degen_avg_tol_ry: float
 
@@ -2496,18 +2509,13 @@ class LorraxConfig:
 
     @property
     def qp_solver(self) -> QPSolver:
-        """Resolve ``qp_solver`` from explicit input or legacy flags.
+        """How QP energies are extracted from Σ.
 
-        ``qp_solver = auto`` (the default) resolves:
-
-        1. ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated
-           key, still honored);
-        2. else → ``ONE_SHOT_DFT`` — standard G0W0 is the default.
-           (The deprecated ``sigma_at_dft_energies = true`` alias also
-           lands here: its intended meaning — authoritative at-DFT QP
-           evaluation — IS the default.)
-
-        An explicit setting overrides the legacy flag.
+        Defaults to ``one_shot_dft`` — standard G0W0 is what a GW code
+        does when not asked otherwise.  Unlike ``compute_mode`` this axis
+        keeps a default; what it lost in 0.1.0 is the ``auto`` value,
+        which existed only to read the deprecated ``self_consistent``
+        boolean (a key named exactly like this key's value).
 
         Validation (mutually inconsistent axis combinations):
 
@@ -2516,18 +2524,16 @@ class LorraxConfig:
         - ``self_consistent`` × ``bispinor`` → error (the SC path drops
           Σ^B; see the refusal below).
         """
-        raw = (self.qp_solver_raw or "auto").strip().lower()
-        if raw == "auto":
-            solver = (QPSolver.SELF_CONSISTENT if self.self_consistent
-                      else QPSolver.ONE_SHOT_DFT)
-        else:
-            try:
-                solver = QPSolver(raw)
-            except ValueError as exc:
-                raise ValueError(
-                    f"qp_solver={raw!r} invalid; expected one of: "
-                    f"{', '.join(s.value for s in QPSolver)}, or 'auto'."
-                ) from exc
+        raw = (self.qp_solver_raw or "one_shot_dft").strip().lower()
+        try:
+            solver = QPSolver(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"qp_solver={raw!r} invalid; expected one of: "
+                f"{', '.join(s.value for s in QPSolver)}.  ('auto' was "
+                f"deleted in 0.1.0 with the ``self_consistent`` boolean it "
+                f"read; the default is one_shot_dft.)"
+            ) from exc
         mode = self.compute_mode
         if solver is QPSolver.FIXED_POINT and not mode.is_dynamic:
             # The list of dynamic modes is read off the enum, not typed
@@ -3102,10 +3108,9 @@ class LorraxConfig:
             restart_q_storage_raw=_restart_q_storage,
             raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
             compute_mode_raw=_compute_mode_raw,
-            qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
+            qp_solver_raw=str(_g("qp_solver") or "one_shot_dft").strip().lower(),
             bispinor=bool(_g("bispinor")),
             do_G0=bool(_g("do_G0")),
-            self_consistent=bool(_g("self_consistent")),
             no_degen_averaging=bool(_g("no_degen_averaging")),
             degen_avg_tol_ry=float(_g("degen_avg_tol_ry")),
             # Sub-dataclass groups
