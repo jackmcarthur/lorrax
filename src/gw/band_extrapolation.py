@@ -13,9 +13,9 @@ sum at three band counts in ONE pass and extrapolates to N → ∞ instead.
 THE THREE POINTS COME FROM DISJOINT BRACKETS, NOT THREE RUNS.  The band axis
 is cut into three contiguous brackets
 
-    bracket 0   [0, N₁)          occupied + the first 50 % of the conduction bands
-    bracket 1   [N₁, N₂)         50 % → 75 %
-    bracket 2   [N₂, N₃)         75 % → 100 %
+    bracket 0   [0, N₁)          everything up to 80 % of the TOTAL band count
+    bracket 1   [N₁, N₂)         80 % → 90 %
+    bracket 2   [N₂, N₃)         90 % → 100 %
 
 and the τ kernel builds one G(τ) per bracket, contracting each against the
 SAME, singly-computed W(τ).  Because the brackets PARTITION the band sum, a
@@ -45,31 +45,150 @@ something other than band convergence:
   * **Σ_c only.**  Σ_x is a bare-exchange sum over OCCUPIED states; it has no
     slow unoccupied tail and is not extrapolated.
 
+WHERE THE POINTS GO, AND WHY SMOOTH IS NOT ASYMPTOTIC.  This is the one thing
+about the feature that is not obvious, and it was measured rather than argued
+— see ``BRACKET_FRACTIONS`` for the table.  There are TWO band scales, an
+order of magnitude apart, and the fractions have to clear the second:
+
+  * The band sum stops resolving individual states — bumpy becomes smooth —
+    at ``n_cond ≈ n_val``.  From there the 1/N model already fits with
+    R² ≥ 0.998.
+  * The fitted INTERCEPT is not accurate until ``N ≈ 0.8·N_max``.  The
+    running exact two-point intercept is still 30–50 meV from its limit at
+    71 % of the range and settles inside ±10 meV only above 94 %.
+
+A fit can therefore have R² = 0.9994 and an intercept 47 meV wrong: the
+residual is set by how well the model tracks a several-hundred-meV rise,
+while the intercept error is set by a small smooth curvature that every point
+in a low window shares.  **No residual, R² or scatter statistic can see it**
+— which is also why ``Δ_model`` alone is not a sufficient diagnostic and why
+:class:`ExtrapolationFit` carries the two SIGNED numbers below beside it.
+
+FRACTIONS OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION COUNT.  The model is
+written in ``N_eff``, and the free-electron counting law that makes 1/N the
+right variable is written in the total count measured from the bottom of the
+band manifold.  Measured on the Si 4×4×4 SOC deck's own eigenvalues:
+
+    N_total vs (Ē_N − E_bandbottom)   →  p = 1.481,  R² = 0.9988   (3/2 ✓)
+    N_cond  vs (Ē_N − E_CBM)          →  p = 1.212,  R² = 0.9979   (✗)
+
+Only the total count obeys N ∝ (E − E₀)^{3/2}.  The fit's lever arm is
+1/N₁ − 1/N₃, which depends on the RATIO N₁/N₃ — again a fraction of the
+total.  On a deck with a small occupied manifold the two parametrisations
+differ by ~2 % and nothing distinguishes them; on one with a large occupied
+manifold ``n_occ + 0.8·n_cond`` sits far below ``0.8·N_max`` and they diverge
+badly.
+
 THE FIT HAS EXACTLY TWO FREE PARAMETERS.
 
     S(N) = S_∞ + A / N_eff,        N_eff = N_occ + N_c = N
 
-fitted by ordinary least squares in 1/N over the three points.  The shifted
-three-parameter form ``A/(N − N₀)`` with N₀ free is DELIBERATELY NOT USED:
-three parameters against three points interpolates exactly, has zero
-residual by construction, and therefore tests nothing.  With two parameters
-the third point is a genuine check, which is what the pairwise intercepts
-below report.
+fitted by ordinary least squares in 1/N over the three points.  Two
+parameters, and the limit point is 1/N → 0.
 
-THE DIAGNOSTICS ARE THE POINT.  A two-parameter fit through three points
-always returns a number; whether that number means anything is decided by
-whether the three points are already in the asymptotic 1/N regime.  The
-exact two-point intercepts
+**THE THREE-PARAMETER FORMS WERE TESTED AGAINST THE DENSE CURVE AND
+REJECTED.  Do not re-litigate this without new data.**  Against BerkeleyGW's
+``ch_converge.dat`` on the Si 4×4×4 SOC deck at 124 bands, 192 (k, band)
+states, MAE / max error in meV against BGW's own band-converged CH:
+
+    3 points, 2 par, (0.80, 0.90)          14.2 /  26.5     noise ×6.6
+    3 points, 3 par S_∞+A/N+B/N², wide     18.0 /  69.2     noise ×4.7
+    3 points, 3 par, top-weighted          57.5 / 216.9     noise ×112.3
+    4 points, 3 par, wide                  15.5 /  86.5     noise ×4.0
+
+**THE SHIFTED LAW ``S_∞ + A/(N + N₀)`` WAS ALSO TESTED, WITH N₀ FITTED ON
+THE DENSE CURVE AND THEN HELD FIXED** — the move that makes it two
+parameters in production and answers "is there a functional form for the
+crossover from non-1/N to 1/N".  **There is not, on this deck.**  N₀ comes
+out SMALL and NEGATIVE with a large spread and a strong window dependence
+(median −1.5 fitted over [16, 124], drifting to −6.0 over [40, 124], p25/p75
+spanning −7.5…+2), and it does **not** correspond to ``n_val = 8``, to the
+measured bumpy→smooth transition at ``n_cond ≈ 7–10``, or to anything else
+physical.  It is a fitted nuisance, not a crossover scale.
+
+Held fixed at the calibrated value it buys ~15–25 % at LOW fractions and
+essentially nothing where the sampling actually sits: at nband 124,
+(0.50, 0.75) improves 35.3 → 27.6 meV MAE, but (0.80, 0.90) only 14.2 →
+13.7 and its MAX gets WORSE, 26.5 → 31.4.  **And it does not buy the ability
+to sample lower, which was the whole reason to want it**: (0.50, 0.75) with
+N₀ fitted in-sample on this very deck is 27.6 meV, still 2× worse than
+(0.80, 0.90) with N₀ = 0 at 14.2.  Moving the window beats modelling the
+crossover.
+
+A CALIBRATED BIAS CORRECTION was tested too, and the result is the argument
+for leaving the centre alone.  Scaling the applied correction by an optimal
+``g`` gives g = 0.788 at (nband 76, 0.50/0.75) rising to **g = 0.9885 at the
+shipped (nband 124, 0.80/0.90)**, where the in-sample gain is 14.2 → 13.7
+meV — nothing.  At the recommended fractions the estimator is already
+unbiased; there is no centre left to tune, only an honest bar to report.
+
+The three-parameter form absorbs the curvature and does help at low
+``nband``, but (a) its MAX error is no better, and the worst states are what
+a QP window is judged on; (b) it is catastrophically ill-conditioned at
+exactly the top-weighted spacings the two-parameter form wants — 112× noise
+amplification, against 6.6× — so the two changes fight each other; (c)
+through three points it is an INTERPOLANT: zero residual by construction, no
+third-point check, ``Δ_model`` undefined.  The one respectable variant is a
+FOURTH bracket with a 3-parameter least squares, and it is beaten by three
+points at (0.80, 0.90) while costing another G(τ) build.  ("noise ×" is the
+2-norm of the row of the design-matrix pseudo-inverse that produces S_∞: the
+factor by which an INDEPENDENT per-point error reaches the intercept.  A
+common-mode error passes through 1:1 for every estimator.)
+
+THE DIAGNOSTICS ARE THE POINT — BUT THEY SEE DIFFERENT THINGS.  A
+two-parameter fit through three points always returns a number; whether that
+number means anything is decided by whether the three points are already in
+the asymptotic 1/N regime.  The exact two-point intercepts
 
     S_∞^(ij) = (N_j·S_j − N_i·S_i) / (N_j − N_i)
 
 are free (they are the closed-form solution of the same model on a pair) and
-they answer exactly that: if the model held, all three would coincide.
-``Δ_model`` is their spread about the fit and measures preasymptotic
-curvature; ``Δ_tail`` is how much the extrapolation moved the largest
-computed point.  ``Δ_model`` comparable to ``Δ_tail`` — or a sign reversal
-between the (1,2) and (2,3) intervals — means the correction is not
-resolved by these three counts and the extrapolation must not be trusted.
+if the model held, all three would coincide.  Three numbers are reported and
+they are NOT interchangeable:
+
+``Δ_model`` — the pairwise intercepts' spread about the fit.  A measure of
+    SCATTER.  It sees preasymptotic curvature that makes the three points
+    disagree; **it cannot see a bias the three points share.**  Measured on
+    a clean BerkeleyGW curve at counts (52, 76, 100): ``Δ_model`` median
+    18.8 meV, ratio to ``Δ_tail`` 0.057, verdict ``consistent`` on 100 % of
+    768 state-fits with ZERO sign reversals — while the true intercept error
+    was 55 meV MAE and 167 meV max.  So a passing ratio is necessary and not
+    sufficient, and a ``NOT TRUSTWORTHY`` verdict on a real deck is evidence
+    about the Σ_c being fitted, not about the sampling.
+
+``pair_split`` = S_∞^(1,2) − S_∞^(2,3) — the same information UNSIGNED in
+    ``Δ_model``, kept SIGNED.  Its magnitude bounds the residual curvature
+    and its sign says which way the bias runs, which the absolute value
+    throws away.  8.2–52.1 meV at the old fractions, 2–20 meV at these.
+
+``a_over_n_last`` = A / N₃ — how much correction the model is still applying
+    AT the largest computed point.  A one-sided number: it is large exactly
+    when the sum has not finished, and unlike ``Δ_model`` it does not go
+    quiet when all three points share the same error.
+
+``Δ_tail`` — how far the extrapolation moved the largest computed point.
+    The size of the correction, not its error.
+
+GN/HL-PPM ONLY IS A CORRECTNESS GUARD, NOT A SCOPE LIMITATION.  The refusal
+in ``gw.sigma_dispatch`` on a non-PPM ``compute_mode`` reads like "we only
+wired it up for PPM".  It is stronger than that: **the 1/N → 0 limit point
+is itself mode-dependent, and it is wrong for a static Coulomb hole.**
+Measured against BerkeleyGW's EXACT static CH (the closure sum — no band
+sum, no extrapolation in it), same deck, same estimator, MAE in meV:
+
+    nband                         60      76     100     124
+    static COHSEX, 1/N → 0      94.9    96.6   202.8   288.2    ← WORSE
+    GN-PPM,        1/N → 0     171.3    97.4    55.1    32.8    ← better
+
+The COHSEX arm ANTI-CONVERGES: more bands determine the line better and
+drive it more confidently past the right answer, overshooting the exact
+value by ~340 meV.  The GPP self-energy's high-energy intermediate states
+are suppressed by the pole denominator, so its band sum genuinely exhausts
+itself inside the 1/N regime; the static Coulomb hole has no such
+suppression and its tail keeps contributing past where the 1/N law was
+calibrated.  Routing this feature at a static mode would produce a number
+that looks converged, carries a ``consistent`` verdict, and gets worse the
+more you spend on it.
 
 BAND COUNTS, NOT AN ENERGY CUTOFF.  The cut is a number of bands because
 JAX's shapes are static: a band count is a compile-time slice, an energy
@@ -91,9 +210,82 @@ from common.band_degeneracy import (
 from common.units import RYD_TO_EV
 
 
-#: The two interior sampling fractions of the CONDUCTION band count.  The
-#: third point is always the full range, so it needs no fraction.
-BRACKET_FRACTIONS: tuple[float, float] = (0.50, 0.75)
+#: The two interior sampling fractions of the TOTAL band count ``N_max``.
+#: The third point is always the full range, so it needs no fraction.
+#:
+#: MEASURED, 2026-08-15, against BerkeleyGW's dense ``ch_converge.dat`` on the
+#: Si 4×4×4 SYM/SOC deck (25 Ry, 8 irreducible k, n_occ = 8) at the largest
+#: degeneracy-legal band count it supports, 124.  The score is against BGW's
+#: OWN band-converged GN-PPM Coulomb hole — ``sigma_hp.log`` col 6 from a
+#: ``frequency_dependence 3`` + ``exact_static_ch 1`` arm, i.e. partial sum
+#: plus static remainder, an independent quantity with no extrapolation in it
+#: — over all 192 (k, band) states.  MAE / max, meV:
+#:
+#:     fractions        nband 76      nband 100     nband 124
+#:     ------------------------------------------------------------
+#:     raw, no extrap  470.2 / 813   350.8 / 616   281.4 / 500
+#:     (0.50, 0.75)     97.4 / 353    55.1 / 167    32.8 /  89.7   ← was
+#:     (0.60, 0.80)     73.4 / 221    44.8 / 122    21.5 /  63.2
+#:     (0.70, 0.85)     73.3 / 234    39.3 / 115    17.3 /  41.0
+#:     (0.80, 0.90)     73.4 / 179    31.8 /  82.4  14.2 /  26.5   ← is
+#:     dense LSQ over [0.8·N_max, N_max], every band:  14.1 /  26.8
+#:
+#: Two things that decided it.  The gain is 1.7× in MAE and 3.4× in max error
+#: at nband 124 for ZERO extra compute — same three brackets, same one pass,
+#: same fit.  And at (0.80, 0.90) the three-point estimate is already AT the
+#: floor: it matches what a least squares over every band in [100, 124]
+#: achieves, so nothing is left on the table from better sampling and the
+#: residual ~14 meV is the 1/N model's own error against BerkeleyGW.
+#:
+#: Why not higher: the gain saturates ((0.85, 0.925) measured 12.2 meV MAE,
+#: no better than 0.80/0.90 within the reference's own spread) while the
+#: lever arm 1/N₁ − 1/N₃ shrinks and the noise amplification rises 6.6 → 10.2.
+#:
+#: Why not fractions of ``n_cond``: see the module docstring — the counting
+#: law that makes 1/N right is written in the TOTAL count, p = 1.481 measured,
+#: against 1.212 for the conduction-only alternative.
+#:
+#: Report: ``sandbox:reports/ch_converge_band_extrapolation_2026-08-15/``,
+#: which carries the three ``ch_converge.dat`` arms and the analysis scripts.
+BRACKET_FRACTIONS: tuple[float, float] = (0.80, 0.90)
+
+
+#: Extrapolation uncertainty, as a fraction of the correction actually applied
+#: (``Delta_tail``).  ``(p90, p99)``.
+#:
+#: A PER-STATE ERROR BAR IS NOT AVAILABLE AND THIS IS NOT ONE.  Regressing the
+#: true error on every per-state number the fit carries — ``A/N3``,
+#: ``Delta_model``, ``pair_split``, ``Delta_tail`` — gives R² <= 0 at the
+#: shipped fractions (measured: A/N3 R² = -0.213, Delta_model -0.178,
+#: pair_split -0.237 at nband 124 / (0.80, 0.90)), and a bar calibrated from
+#: A/N3 covers 13.5 % of states at 1σ and 41.7 % at 3σ.  The reason is that at
+#: these fractions the residual error is no longer the smooth 1/N² bias those
+#: numbers track; it is per-state band-structure texture, which is invisible
+#: to all four.
+#:
+#: What IS stable is the error as a FRACTION OF THE CORRECTION.  Over 16
+#: (nband x fractions) configurations on the Si 4x4x4 SOC deck, scored against
+#: BerkeleyGW's band-converged GN-PPM CH, |error| / Delta_tail:
+#:
+#:     configuration                    median     p90     max
+#:     nband 124, (0.80, 0.90)   ←ship    4.31%  14.44%  22.46%
+#:     nband 100, (0.80, 0.90)            9.08%  17.55%  23.14%
+#:     nband 124, (0.50, 0.75)           11.11%  23.17%  30.23%
+#:     worst of all 16 configurations    18.04%  35.47%  45.03%
+#:
+#: The p90 ratio moves by only 2.5x across every configuration measured and
+#: shrinks monotonically as the sampling moves up and nband rises, so 0.15 is
+#: a p90 bar at the shipped configuration and a conservative one below it.
+#:
+#: THIS IS THE EXTRAPOLATION UNCERTAINTY ONLY.  It does not include, and must
+#: not be added to, the difference from BerkeleyGW: the reference it was
+#: calibrated against is BGW's static remainder, which for a GPP self-energy
+#: is itself a construction (the factor-of-1/2 form, exact only for the static
+#: Coulomb hole).  Nor does it cover the ISDF basis, the W-side band count
+#: (~100 meV at the band edges on this deck, and NOT extrapolated by this
+#: feature), or anything else in the run.  One deck, one system: treat the
+#: coefficients as calibrated rather than universal.
+TAIL_UNCERTAINTY_FRACTION: tuple[float, float] = (0.15, 0.25)
 
 
 class BandExtrapolationRefused(ValueError):
@@ -130,6 +322,12 @@ class BandBracketPlan:
         docstring.  Never consumed.
     enabled : bool
         False for the trivial single-bracket plan.
+    notes : tuple[str, ...]
+        Anything the planner had to decide that the caller would otherwise
+        not know — currently the degeneracy-snap fallbacks.  Carried as data
+        rather than printed here so it is testable without capturing stdout;
+        the driver prints it beside the plan line, and an empty tuple is the
+        ordinary case.
     """
 
     bounds: tuple[tuple[int, int], ...]
@@ -139,6 +337,7 @@ class BandBracketPlan:
     n_cond: int
     mean_energy_ev: tuple[float, ...]
     enabled: bool
+    notes: tuple[str, ...] = ()
 
     @property
     def n_brackets(self) -> int:
@@ -233,30 +432,89 @@ def plan_band_brackets(
             f"plan_band_brackets: expected (nk, >={nb_logical}) energies, "
             f"got shape {np.shape(enk_ry)}")
 
-    requested = tuple(int(round(n_occ + f * n_cond)) for f in fractions)
-    # The interior cuts are snapped so no bracket boundary splits a
-    # degenerate multiplet — the same constraint BerkeleyGW enforces on a
-    # band-count convergence series, and the same one-number-per-boundary
-    # test ``common.band_degeneracy`` already owns.  The top cut is the end
-    # of the input and is not a cut at all.
+    # Fractions of the TOTAL band count — see the module docstring; the
+    # counting law that makes 1/N the right variable is written in the total,
+    # and the fit's lever arm depends on the ratio N₁/N₃.
+    requested = tuple(int(round(f * nb_logical)) for f in fractions)
+
+    # ── SNAPPING THE INTERIOR CUTS IS A PREFERENCE, NOT A CONSTRAINT ────
+    # The interior cuts are SAMPLING POINTS ON A PARTIAL-SUM CURVE, not
+    # truncations of a delivered Σ.  Nothing downstream consumes a bracket
+    # boundary as a window: S(N₁) and S(N₂) are read, fitted and discarded,
+    # and only N₃ = nb_logical is the band sum the run actually reports.  So
+    # a cut that lands inside a multiplet costs accuracy, not correctness —
+    # MEASURED at ≤ 6.4 meV on the Si 4×4×4 SOC deck, and in half the cases
+    # the UNSNAPPED points were slightly better, because snapping moves the
+    # sample away from the requested fraction and the fraction is the thing
+    # that matters (report §8).
+    #
+    # It is kept as a preference because a clean cut is free when one is
+    # available.  It is NOT kept as a refusal: under SOC every Kramers pair
+    # is exactly degenerate, so clean boundaries are sparse by construction,
+    # and at (0.80, 0.90) the old behaviour REFUSED outright on decks where
+    # the unsnapped points work fine (measured: nband = 60 on this very
+    # deck).  Trading ≤ 6.4 meV for a run that stops is the wrong trade.
+    #
+    # N₃ is not snapped here at all — it is the caller's `nb_logical`, the
+    # band sum the deck asked for, and it is BerkeleyGW's `number_bands`
+    # degeneracy check (not this one) that governs it.
+    notes: list[str] = []
     snapped: list[int] = []
     lo_bound = n_occ + 1
-    for req in requested:
-        cut = snap_cut_to_clean_boundary(
-            e, req, tol_ry=tol_ry, lo=lo_bound, hi=nb_logical - 1)
-        snapped.append(int(cut))
-        lo_bound = int(cut) + 1
+    n_interior = len(requested)
+    for i_cut, req in enumerate(requested):
+        req = int(req)
+        # RESERVE ROOM FOR THE CUTS THAT COME AFTER THIS ONE.  Without this,
+        # snapping the first cut UPWARD can eat the last clean boundary and
+        # leave the second with nowhere legal to go — which turned into a
+        # refusal on a spectrum that has three perfectly good sampling points
+        # in it (seen at nband = 17 on the Si deck: cut 1 snapped 14 -> 16,
+        # and 16 is nb_logical - 1).  One band per remaining interior cut is
+        # the minimum that keeps the counts strictly ascending.
+        hi_bound = nb_logical - 1 - (n_interior - 1 - i_cut)
+        if lo_bound > hi_bound:
+            # No room left below N₃ for another cut.  Record the raw request
+            # so the distinctness check below refuses with the actionable
+            # message, rather than letting snap_cut_to_clean_boundary raise
+            # its own ValueError about inverted bounds.
+            snapped.append(req)
+            lo_bound = req + 1
+            continue
+        req = int(min(max(req, lo_bound), hi_bound))
+        try:
+            cut = int(snap_cut_to_clean_boundary(
+                e, req, tol_ry=tol_ry, lo=lo_bound, hi=hi_bound))
+        except BandWindowDegeneracyError:
+            cut = req
+            notes.append(
+                f"interior cut {req} kept UNSNAPPED: no multiplet-clean "
+                f"boundary exists in [{lo_bound}, {hi_bound}] at tol "
+                f"{tol_ry * RYD_TO_EV * 1e3:.3f} meV.  The cut is a sampling "
+                f"point on a partial-sum curve, not a Σ window, so this "
+                f"costs accuracy (<= ~6 meV measured) and not correctness.")
+        snapped.append(cut)
+        lo_bound = cut + 1
     counts = tuple(snapped) + (nb_logical,)
 
+    # What survives as a refusal: three counts that are not DISTINCT and
+    # ascending.  After the fallback above this can only happen when the
+    # requested FRACTIONS themselves collide — i.e. nb_logical is too small
+    # for 0.80/0.90/1.00 to resolve into three integers — which is a real
+    # "raise nband", not a spectrum accident.
     if len(set(counts)) != len(counts) or list(counts) != sorted(counts):
+        # The smallest fraction gap has to be worth at least one band, plus
+        # the floor at n_occ+1 that the first cut is clamped to.
+        gaps = np.diff(np.sort(np.asarray(tuple(fractions) + (1.0,), float)))
+        need = max(int(np.ceil(1.0 / max(float(gaps.min()), 1e-12))),
+                   2 * n_occ + 1)
         raise BandExtrapolationRefused(
-            f"sigma_band_extrapolation: degeneracy snapping collapsed the "
-            f"three band counts onto {counts} (requested "
-            f"{requested + (nb_logical,)}).  Three DISTINCT, ascending counts "
-            f"are required — two coincident points cannot determine a "
-            f"two-parameter fit.  The spectrum has a multiplet wide enough to "
-            f"swallow the gap between the sampling fractions at nband = "
-            f"{nb_logical}; raise nband, or set "
+            f"sigma_band_extrapolation: the three band counts collapsed onto "
+            f"{counts} (requested {requested + (nb_logical,)} from fractions "
+            f"{tuple(fractions)} of nband = {nb_logical}).  Three DISTINCT, "
+            f"ascending counts are required — two coincident points cannot "
+            f"determine a two-parameter fit.  At nband = {nb_logical} the "
+            f"sampling fractions are less than one band apart.  Raise the "
+            f"deck's `nband` to at least {need}, or set "
             f"sigma_band_extrapolation = false.")
 
     bounds = tuple(
@@ -272,6 +530,7 @@ def plan_band_brackets(
         n_cond=n_cond,
         mean_energy_ev=mean_e,
         enabled=True,
+        notes=tuple(notes),
     )
 
 
@@ -295,6 +554,52 @@ class ExtrapolationFit:
     delta_tail: np.ndarray        # (...)      |S_∞^fit − S₃|
     delta_model: np.ndarray       # (...)      max_ij |S_∞^(ij) − S_∞^fit|
     residual: np.ndarray          # (...)      max_i |S_i − model(N_i)|
+
+    # ── THE TWO SIGNED, ONE-SIDED DIAGNOSTICS ───────────────────────────
+    # Derived rather than stored: both are exact functions of fields the fit
+    # already carries, so ``at()`` restricts them for free and there is no
+    # second place that can go stale.  See the module docstring for what
+    # each one can and cannot see; the short version is that ``delta_model``
+    # is a SCATTER metric and is blind to an error the three points share,
+    # which is the error that actually dominates.
+
+    @property
+    def pair_split(self) -> np.ndarray:
+        """S_∞^(1,2) − S_∞^(2,3), SIGNED.
+
+        The same information ``delta_model`` reduces to an absolute value.
+        Its magnitude bounds the residual curvature; its sign says which way
+        the preasymptotic bias runs, and the sign is the half that says
+        whether the extrapolation is over- or under-correcting.
+        """
+        return self.pair_s_inf[(0, 1)] - self.pair_s_inf[(1, 2)]
+
+    def uncertainty(self, quantile: str = "p90") -> np.ndarray:
+        """Extrapolation uncertainty as a fraction of the applied correction.
+
+        ``|S_inf - S_true| <~ f * Delta_tail`` with ``f`` from
+        :data:`TAIL_UNCERTAINTY_FRACTION` — an ENVELOPE calibrated against
+        BerkeleyGW on one deck, not a per-state error bar (there is no
+        working per-state predictor; see the constant's comment for the
+        R² <= 0 measurement that rules the obvious candidates out).
+
+        Extrapolation only.  Not the difference from BerkeleyGW, not the
+        ISDF basis, not the W-side band count.
+        """
+        p90, p99 = TAIL_UNCERTAINTY_FRACTION
+        f = {"p90": p90, "p99": p99}[quantile]
+        return f * np.abs(self.delta_tail)
+
+    @property
+    def a_over_n_last(self) -> np.ndarray:
+        """A / N₃ — the correction the model is still applying AT the last point.
+
+        One-sided: large exactly when the band sum has not finished.  Unlike
+        ``delta_model`` it does not go quiet when all three points carry the
+        same error, which is why it is reported beside it rather than
+        instead of it.
+        """
+        return self.amplitude / float(self.counts[-1])
 
     def at(self, index) -> "ExtrapolationFit":
         """Restrict every field to a subset of the trailing state axes.
@@ -467,7 +772,8 @@ def format_extrapolation_report(
         f"  -- {label} band-convergence extrapolation "
         f"(S(N) = S_inf + A/N, 2 parameters, 3 points) --",
         f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   "
-        f"fractions = {BRACKET_FRACTIONS}",
+        f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
+        f"{plan.counts[-1]}",
     ]
     for i, (req, got, (lo, hi), me) in enumerate(zip(
             plan.requested, plan.counts, plan.bounds, plan.mean_energy_ev)):
@@ -475,6 +781,8 @@ def format_extrapolation_report(
         lines.append(
             f"     N{i + 1} = {got:5d}   bracket [{lo:5d}, {hi:5d})   "
             f"<E> = {me:9.3f} {unit}{snap}")
+    for note in plan.notes:
+        lines.append(f"     NOTE: {note}")
 
     for slabel, index in (states or []):
         f1 = fit.at(index)
@@ -493,6 +801,13 @@ def format_extrapolation_report(
             f"       Delta_tail = {_mx(f1.delta_tail):.6f} {unit}   "
             f"Delta_model = {_mx(f1.delta_model):.6f} {unit}   "
             f"residual = {_mx(f1.residual):.3e} {unit}",
+            f"       pair_split = {_sg(f1.pair_split):+12.6f} {unit}   "
+            f"A/N3 = {_sg(f1.a_over_n_last):+12.6f} {unit}   "
+            f"(both SIGNED -- see below)",
+            f"       S_inf = {_sg(f1.s_inf):+.6f} +/- "
+            f"{_mx(f1.uncertainty('p90')):.6f} (p90) / "
+            f"{_mx(f1.uncertainty('p99')):.6f} (p99) {unit}"
+            f"   <- EXTRAPOLATION uncertainty only",
             f"       verdict: {trust_verdict(f1)}",
         ]
 
@@ -505,13 +820,40 @@ def format_extrapolation_report(
         f"       max Delta_tail = {_mx(fit.delta_tail):.6f} {unit}   "
         f"max Delta_model = {_mx(fit.delta_model):.6f} {unit}   "
         f"max residual = {_mx(fit.residual):.3e} {unit}",
+        f"       max |pair_split| = {_mx(fit.pair_split):.6f} {unit}   "
+        f"max |A/N3| = {_mx(fit.a_over_n_last):.6f} {unit}",
         f"       verdict: {trust_verdict(fit)}",
+        # WHAT EACH DIAGNOSTIC CAN AND CANNOT SEE.  Printed rather than left
+        # to the docstring because the verdict line above is what an operator
+        # reads, and a "consistent" that is necessary-but-not-sufficient has
+        # to say so where it is read.  Measured on a clean BerkeleyGW curve:
+        # verdict "consistent" on 100 % of 768 state-fits, zero sign
+        # reversals, while the true intercept error was 55 meV MAE / 167 max.
+        f"     [reading these] Delta_model is a SCATTER metric: it sees the "
+        f"three points DISAGREEING, and is blind to an error they SHARE -- "
+        f"which is the error that dominates.  A 'consistent' verdict is "
+        f"necessary, not sufficient.",
+        f"       pair_split is Delta_model kept SIGNED: its sign says which "
+        f"way the preasymptotic bias runs (negative => the fit is "
+        f"over-correcting).  A/N3 is one-sided: it is the correction still "
+        f"being applied at the largest band count, and stays loud when "
+        f"Delta_model goes quiet.",
+        f"       Both shrink when the sampling moves up the band range; "
+        f"neither is a substitute for raising nband when A/N3 is comparable "
+        f"to the accuracy you need.",
+        f"       The +/- is {100*TAIL_UNCERTAINTY_FRACTION[0]:.0f} % / "
+        f"{100*TAIL_UNCERTAINTY_FRACTION[1]:.0f} % of Delta_tail -- an "
+        f"ENVELOPE calibrated against BerkeleyGW on one deck, NOT a per-state "
+        f"bar (no per-state predictor works: R^2 <= 0 for all four numbers "
+        f"above).  It covers the EXTRAPOLATION only -- not the difference "
+        f"from BerkeleyGW, the ISDF basis, or the W-side band count.",
     ]
     return "\n".join(lines)
 
 
 __all__ = [
     "BRACKET_FRACTIONS",
+    "TAIL_UNCERTAINTY_FRACTION",
     "BandBracketPlan",
     "BandExtrapolationRefused",
     "ExtrapolationFit",

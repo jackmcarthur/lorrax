@@ -573,22 +573,48 @@ def compute_sigma_xc(
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
-    # ── A DECK KEY THAT NO KERNEL READS IS REFUSED, NOT IGNORED ─────────
-    # ``sigma_band_extrapolation`` is wired into the GN/HL two-point PPM Σ
-    # kernel and nothing else (owner scope).  Reaching MPA / COHSEX /
-    # X_ONLY with it set would produce a perfectly ordinary run whose log
-    # simply lacks the extrapolation block — the exact failure mode
-    # measurement-discipline rule 1 names, where a green A/B measured
-    # nothing because one arm silently dropped the knob.
+    # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
+    # Two independent reasons, and the second is the load-bearing one.
+    #
+    # (1) Wiring.  ``sigma_band_extrapolation`` is read by the GN/HL
+    #     two-point PPM Σ kernel and nothing else.  Reaching MPA / COHSEX /
+    #     X_ONLY with it set would produce a perfectly ordinary run whose
+    #     log simply lacks the extrapolation block — the exact failure mode
+    #     measurement-discipline rule 1 names, where a green A/B measured
+    #     nothing because one arm silently dropped the knob.
+    #
+    # (2) THE MATH ITSELF IS MODE-DEPENDENT.  The extrapolation's limit
+    #     point is 1/N → 0, and that limit is WRONG for a static Coulomb
+    #     hole.  MEASURED 2026-08-15 against BerkeleyGW's exact static CH
+    #     (the closure sum — no band sum and no extrapolation in it), Si
+    #     4×4×4 SOC, 192 (k, band) states, MAE in meV:
+    #
+    #         nband                     60      76     100     124
+    #         static COHSEX, 1/N → 0  94.9    96.6   202.8   288.2   WORSE
+    #         GN-PPM,        1/N → 0 171.3    97.4    55.1    32.8   better
+    #
+    #     The static arm ANTI-CONVERGES — more bands determine the line
+    #     better and drive it more confidently ~340 meV past the right
+    #     answer — because the static CH's high-energy tail is not
+    #     suppressed by a pole denominator and keeps contributing past where
+    #     the 1/N law was calibrated.  So routing this at a static mode
+    #     would not merely fail to log; it would return a wrong number
+    #     carrying a "consistent" verdict that gets worse the more you spend
+    #     on it.  Report: sandbox
+    #     reports/ch_converge_band_extrapolation_2026-08-15/.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
         raise NotImplementedError(
             f"sigma_band_extrapolation = true with compute_mode = "
             f"{getattr(mode, 'value', mode)}.  The band-convergence "
             f"extrapolation is wired into the two-point plasmon-pole Σ_c "
-            f"kernel only (gn_ppm / hl_ppm); this mode's Σ kernel does not "
-            f"build band-bracket Green's functions, so the key would steer "
-            f"nothing.  Use compute_mode = gn_ppm, or unset "
-            f"sigma_band_extrapolation.")
+            f"kernel only (gn_ppm / hl_ppm), and this is a CORRECTNESS "
+            f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
+            f"mode-dependent, and on a static Coulomb hole it overshoots "
+            f"the exact answer by ~340 meV and gets WORSE with more bands "
+            f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
+            f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
+            f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, or "
+            f"unset sigma_band_extrapolation.")
 
     # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
     # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
