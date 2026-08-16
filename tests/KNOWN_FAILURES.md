@@ -1529,6 +1529,26 @@ Two things make it invisible today:
   **before** the partition is applied at `:1222`, so the star-spread
   enforcement does not cover the partition boundary at all.
 
+**RESOLVED 2026-08-16 — owner ruling: "I want degenerate spaces degenerate in
+LORRAX."**  Both halves landed.  `BandPartition.report_multiplet_splits` names
+every splitting boundary and the gap it cuts; `promoted_to_multiplets` grows
+the mask outward so no manifold is split, and `run_sc_driver` calls them in
+that order.  `_check_kstar_spread` moved to AFTER `apply_band_partition`, so
+it now gates the object that ships.
+
+**MEASURED on `gnppm_debug`, the only committed deck running the SC path:
+`28/46 protected; no boundary splits a multiplet`** — the promotion is a no-op
+there, `eqp0`/`eqp1`/`sigma_diag` are byte-identical, and the reordered
+star-spread gate reads `0.000e+00`.  So no number moved on any in-tree deck,
+the reorder did not turn anything red, and **no deck exercises the promotion**
+— `tests/test_band_partition_multiplets.py` carries the whole burden of
+proving it works, and its mutation is verified red.
+
+On a deck whose mask does split, every QSGW number moves; that is the accepted
+consequence and anything computed there beforehand is superseded.
+
+Retained below: the cost analysis that preceded the ruling.
+
 **IS IT CHEAP?  The diagnostic is; the fix is not, and they are different
 changes.**
 
