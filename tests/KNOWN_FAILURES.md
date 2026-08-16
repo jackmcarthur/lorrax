@@ -1211,8 +1211,12 @@ against a decision that has not been taken.
     "which k is this" dict for finite-difference neighbours.  Full-BZ →
     full-BZ, exact integer keys, so no aliasing; listed only because it
     duplicates the grid lookup the service owns.  Diagnostic path.
-12. **`src/file_io/epsreader.py:136` `unfold_eps_comps` — ADDED
-    2026-08-15, previously registered NOWHERE.**  A fifth independent
+12. ~~`src/file_io/epsreader.py:136` `unfold_eps_comps`~~ — **DELETED
+    2026-08-16.**  Registered 2026-08-15, removed the next day; a tombstone
+    at the site records why and points at the canonical rotation.  Kept in
+    this list because the SHAPE recurs: a τ-blind G-rotation, admitted as
+    such in its own comment, sitting on a re-exported class with no live
+    caller for long enough that nothing knew it was there.  Original entry:  A fifth independent
     `G' = S·G − G_umklapp` in `src/`, found by re-counting the register's
     "four implementations" claim by reading.  Two things make it worth a
     row rather than a fix:
