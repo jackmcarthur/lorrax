@@ -124,6 +124,19 @@ def matvec_operands(data: dict) -> tuple:
     )
 
 
+def ladder_matvec_operands(data: dict) -> tuple:
+    """The 14 operands of a ``ladder_rung_slots`` matvec: the ordinary 10 plus
+    the rung's four PHYSICAL (rolled, un-flipped) psi arrays.  Falls back to
+    the density arrays when the payload carries no rung slots — that is a raw
+    payload, where the density arrays ARE physical (the q=0 identity cells)."""
+    return matvec_operands(data) + (
+        data.get("psi_c_W_X", data["psi_c_X"]),
+        data.get("psi_c_W_Y", data["psi_c_Y"]),
+        data.get("psi_v_W_X", data["psi_v_X"]),
+        data.get("psi_v_W_Y", data["psi_v_Y"]),
+    )
+
+
 def _apply_shifted_matvec(
     matvec,
     x: jax.Array,
@@ -212,22 +225,62 @@ def build_preconditioner_diagonal_sharded(
     return jax.lax.with_sharding_constraint(diag_full, diag_sharding)
 
 
-def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol):
+def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
+                      x0=None, resid_relative_to: str = "b"):
     """Diagonally right-preconditioned GMRES with a while-loop early exit.
 
-    Pure function of its RUNTIME args ``(b, diag_h, z, operands)``; ``matvec`` /
-    ``max_iter`` / ``tol`` are the static structure.  ``operands`` is the
-    :func:`matvec_operands` 10-tuple — threading it as an argument (not a
-    closed-over ``data`` dict) is why one compiled solve serves every q / omega
-    (see :func:`_get_gmres_solver`).  Returns ``(x, k_iters)``."""
+    Pure function of its RUNTIME args ``(b, diag_h, z, operands, tol, x0)``;
+    ``matvec`` / ``max_iter`` / ``resid_relative_to`` are the static structure.
+    ``operands`` is the :func:`matvec_operands` 10-tuple — threading it as an
+    argument (not a closed-over ``data`` dict) is why one compiled solve serves
+    every q / omega (see :func:`_get_gmres_solver`).  ``tol`` may be a traced
+    scalar, so a caller may sweep it without recompiling.  Returns
+    ``(x, k_iters)``.
+
+    ``x0`` — the initial guess, RUNTIME.  ``None`` keeps the historical
+    Jacobi-shaped start ``M^{-1} b``.  That start is not always an improvement
+    on zero: on the ladder screening operator it was MEASURED to make
+    ``||r0||`` 8-11x ``||b||`` (opt_shifts, 2026-08-16), i.e. the "initial
+    guess" is an order of magnitude WORSE than starting from nothing, so a
+    caller that wants ``x0 = 0`` can now ask for it.
+
+    ``resid_relative_to`` — the denominator of the early-exit test.
+
+    * ``"b"`` (DEFAULT since 2026-08-16): exit on ``||r_k|| <= tol * ||b||``,
+      which is what every caller in this tree writes down when it passes a
+      ``tol``, and what the true-residual gates then measure.
+    * ``"r0"``: the historical behaviour — ``||r_k|| <= tol * ||r_0||`` with
+      ``r_0`` the residual of the PRECONDITIONED start above.  Because that
+      start is the bad one, callers were delivered a residual ~10x LOOSER than
+      the number they passed (measured four independent times on the ladder
+      operator: nominal 1e-9, delivered true 1.08e-8).  Kept only so the change
+      can be A/B'd; it is a defect, not a mode.
+
+    THE LEAST SQUARES IS SOLVED ONCE, NOT PER ITERATION.  The early-exit test
+    needs only the NORM of the GMRES residual, which the Givens rotations that
+    triangularize the Hessenberg deliver for free (``|g_rot[k+1]|``) at ``O(k)``
+    per iteration.  The historical spelling re-solved a dense
+    ``(max_iter+1, max_iter)`` ``lstsq`` — an SVD whose cost is set by the CAP
+    and not by the iterations actually taken — at EVERY iteration, measured at
+    2.0 ms of a 15.6 ms column-iteration at ``max_iter=300``
+    (opt_precond/RESULTS.md §9).  The final ``y`` still comes from that same
+    ``lstsq`` on the same final ``H`` and ``g``, so the answer is unchanged
+    bit-for-bit; only the ~k redundant SVDs are gone, and the rotations are
+    the standard stable ones (never the normal equations — see the note at the
+    exit ``lstsq``).
+    """
+    if resid_relative_to not in ("b", "r0"):
+        raise ValueError(
+            f"resid_relative_to must be 'b' or 'r0', got {resid_relative_to!r}")
     one = jnp.asarray(1.0, dtype=b.dtype)
     m_inv = one / (z - diag_h)
     if m_inv.ndim == b.ndim - 1:
         m_inv = m_inv[None, ...]
 
-    x0 = m_inv * b
+    x0 = m_inv * b if x0 is None else x0.astype(b.dtype)
     r0 = b - _apply_shifted_matvec(matvec, x0, z, operands).astype(b.dtype)
     beta = jnp.linalg.norm(r0)
+    den = jnp.linalg.norm(b) if resid_relative_to == "b" else beta
 
     zero = jnp.asarray(0.0, dtype=beta.dtype)
     v0 = jnp.where(beta == zero, r0, r0 / beta)
@@ -238,72 +291,110 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol):
     Z = jnp.zeros(z_shape, dtype=b.dtype)
     H = jnp.zeros((max_iter + 1, max_iter), dtype=b.dtype)
     g = jnp.zeros((max_iter + 1,), dtype=b.dtype).at[0].set(beta)
-    y = jnp.zeros((max_iter,), dtype=b.dtype)
+    # ACCUMULATED Givens rotation.  Q is the product of every rotation applied
+    # so far, so the residual recurrence needs no replay loop: the rotated
+    # right-hand side is Q g = beta Q[:, 0] because g = beta e_0.  One
+    # (max_iter+1)^2 replicated matrix — 0.65 MiB at max_iter=200, the same
+    # class as the Hessenberg beside it, and it buys the removal of a
+    # data-dependent inner loop (see the body).
+    Q = jnp.eye(max_iter + 1, dtype=b.dtype)
+    krylov_axes = tuple(range(1, 1 + b.ndim))
 
     def cond(state):
         k, rel, *_ = state
         return jnp.logical_and(k < max_iter, rel > tol)
 
     def body(state):
-        k, rel, V, Z, H, g, y = state
+        k, rel, V, Z, H, g, Q = state
 
         v_k = V[k]
         z_k = m_inv * v_k
         Z = Z.at[k].set(z_k)
         w = _apply_shifted_matvec(matvec, z_k, z, operands).astype(b.dtype)
 
-        def arnoldi(i, carry):
-            w_local, H_local = carry
-            h = jnp.vdot(V[i], w_local)
-            H_local = H_local.at[i, k].set(h)
-            w_local = w_local - h * V[i]
-            return w_local, H_local
-
-        w, H = jax.lax.fori_loop(0, k + 1, arnoldi, (w, H))
-
-        # Reorthogonalization — a second (DGKS) classical Gram-Schmidt pass.
-        # Stiff finite-q screening operators (bse_w_exact --compare-wq: V_q
+        # ORTHOGONALIZE WITH TWO CLASSICAL PASSES (CGS2), NOT A LOOP.
+        #
+        # Numerics first, because this replaced a modified Gram-Schmidt pass
+        # plus a DGKS repeat and that pair was there for a measured reason:
+        # stiff finite-q screening operators (bse_w_exact --compare-wq: V_q
         # carries a large G=0 Coulomb head) lose Arnoldi orthogonality
         # catastrophically under a SINGLE pass (||VᴴV−I|| → O(1) by ~20
         # iters), which makes the projected residual falsely tiny and the
         # whole solve rounding-dependent (converges in numpy, DIVERGES in
-        # jit — true residual O(1)).  The second pass restores orthogonality
-        # to machine precision (||VᴴV−I|| ≲ 1e-14), so the projected residual
-        # is trustworthy for the early-exit and the reconstructed x is
-        # correct.  For well-conditioned / q=0 tiles the correction is ~1e-16
-        # (already orthogonal) so the q=0 closure is unchanged.
-        def reorth(i, carry):
-            w_local, H_local = carry
-            corr = jnp.vdot(V[i], w_local)
-            H_local = H_local.at[i, k].add(corr)
-            w_local = w_local - corr * V[i]
-            return w_local, H_local
+        # jit — true residual O(1)).  CGS2 — classical Gram-Schmidt applied
+        # twice — is unconditionally stable to O(eps) (Giraud, Langou,
+        # Rozloznik 2005), i.e. it is not a weakening of MGS+MGS but the
+        # standard strengthening of it; the SECOND pass is what both spellings
+        # rely on and it is kept.
+        #
+        # Cost, which is why the shape changed.  A dynamic-trip inner loop on
+        # XLA:GPU reads its predicate back to the HOST every step: the two
+        # loops here were ~2k device→host round trips per GMRES iteration, and
+        # O9's kernel profile (2026-08-16) measured ~19 of them per iteration
+        # with 61.6 % of the GPU idle waiting.  Each pass is now ONE reduction
+        # over the whole V block.  The rows of V above k are identically zero
+        # — nothing has written them yet — so their coefficients come out exact
+        # zeros and no mask is needed; the arithmetic is over max_iter+1 rows
+        # instead of k+1, which is a few percent of one rung matvec.
+        #
+        # SHARDING: the reduction is over the pair-basis axes (c on x, v on y),
+        # so it emits ONE all-reduce of a (max_iter+1,) vector per pass, where
+        # the loop emitted k+1 all-reduces of a scalar each — fewer AND
+        # smaller collectives.  The back-projection is local (h is replicated).
+        def _project(w_local):
+            h_local = jnp.sum(jnp.conj(V) * w_local, axis=krylov_axes)
+            return w_local - jnp.tensordot(h_local, V, axes=(0, 0)), h_local
 
-        w, H = jax.lax.fori_loop(0, k + 1, reorth, (w, H))
+        w, h_first = _project(w)
+        w, h_corr = _project(w)
+        H = H.at[:, k].set(h_first + h_corr)
+
         h_next = jnp.linalg.norm(w)
         H = H.at[k + 1, k].set(h_next)
         v_next = jnp.where(h_next == 0.0, w, w / h_next)
         V = V.at[k + 1].set(v_next)
 
-        # GMRES minimization min_y ‖g − H y‖ via a STABLE least-squares
-        # (QR/SVD through ``lstsq``), NOT the normal equations HᴴH — those
-        # square the Hessenberg condition number.  Finite-q screening tiles
-        # (bse_w_exact --compare-wq) carry a large G=0 Coulomb head, so
-        # cond(H) ~ 1e8 ⇒ cond(HᴴH) ~ 1e17 ≈ 1/eps, at which the normal-eq
-        # solve returns a garbage y that trips the projected early-exit with a
-        # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
-        # accurate at that conditioning; head-less/q=0 tiles are well
-        # conditioned so the q=0 closure is unchanged.  The trailing zero
-        # columns of the padded Hessenberg get min-norm y=0.
-        y = jnp.linalg.lstsq(H, g, rcond=None)[0]
-        resid = jnp.linalg.norm(g - H @ y)
-        rel = jnp.where(beta == zero, zero, resid / beta)
+        # --- residual norm by Givens, LOOP-FREE --------------------------
+        # Applying the rotations already accumulated is ONE gemv against Q
+        # (the running product of them), and adding the new rotation is a
+        # two-row combination of Q.  The replay loop this replaces was the
+        # third data-dependent inner loop in the body, i.e. k more host round
+        # trips per iteration.  Unitary pair [[c, s], [−conj(s), conj(c)]]
+        # with c = conj(a)/r, s = conj(bb)/r, r = hypot(|a|, |bb|) —
+        # real-positive pivot, no branch on a == 0.  g = beta e_0, so the
+        # rotated right-hand side is beta Q[:, 0] and the GMRES residual norm
+        # is its trailing entry.
+        hcol = Q @ H[:, k]
+        a, bb = hcol[k], hcol[k + 1]
+        r = jnp.sqrt(jnp.abs(a) ** 2 + jnp.abs(bb) ** 2).astype(b.dtype)
+        safe = jnp.where(r == 0, jnp.ones_like(r), r)
+        c_k = jnp.where(r == 0, jnp.ones_like(r), jnp.conj(a) / safe)
+        s_k = jnp.where(r == 0, jnp.zeros_like(r), jnp.conj(bb) / safe)
+        q_k, q_k1 = Q[k], Q[k + 1]
+        Q = Q.at[k].set(c_k * q_k + s_k * q_k1).at[k + 1].set(
+            -jnp.conj(s_k) * q_k + jnp.conj(c_k) * q_k1)
+        resid = beta * jnp.abs(Q[k + 1, 0])
+        rel = jnp.where(den == zero, zero, resid / den)
 
-        return k + 1, rel, V, Z, H, g, y
+        return k + 1, rel, V, Z, H, g, Q
 
     rel0 = jnp.asarray(jnp.inf, dtype=beta.dtype)
-    init = (0, rel0, V, Z, H, g, y)
-    k_final, _, V, Z, H, g, y = jax.lax.while_loop(cond, body, init)
+    init = (0, rel0, V, Z, H, g, Q)
+    k_final, _, V, Z, H, g, Q = jax.lax.while_loop(cond, body, init)
+
+    # GMRES minimization min_y ‖g − H y‖ via a STABLE least-squares
+    # (QR/SVD through ``lstsq``), NOT the normal equations HᴴH — those
+    # square the Hessenberg condition number.  Finite-q screening tiles
+    # (bse_w_exact --compare-wq) carry a large G=0 Coulomb head, so
+    # cond(H) ~ 1e8 ⇒ cond(HᴴH) ~ 1e17 ≈ 1/eps, at which the normal-eq
+    # solve returns a garbage y that trips the projected early-exit with a
+    # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
+    # accurate at that conditioning; head-less/q=0 tiles are well
+    # conditioned so the q=0 closure is unchanged.  The trailing zero
+    # columns of the padded Hessenberg get min-norm y=0.  ONE call, on the
+    # H the loop exited with — the same matrix the historical per-iteration
+    # spelling ended on, hence the same y to the bit.
+    y = jnp.linalg.lstsq(H, g, rcond=None)[0]
 
     x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
     return x, k_final
@@ -322,20 +413,28 @@ def _get_gmres_solver(
     arrays (``matvec_operands``) are runtime args.  So a finite-q W_q loop, which
     solves a different screening operator per q, reuses ONE executable (it just
     passes a different operand tuple) instead of recompiling per q.  The cache key
-    is ``(id(matvec), max_iter, tol, dtype)`` — genuinely different operator
+    is ``(id(matvec), max_iter, dtype)`` — genuinely different operator
     structures (screening vs optical, TDA vs full) build distinct ``matvec``
     objects and so get distinct entries; the cache holds a reference to ``matvec``
-    so its ``id()`` cannot be reused by a later object while the entry is live."""
-    key = (id(matvec), max_iter, float(tol), str(dtype))
+    so its ``id()`` cannot be reused by a later object while the entry is live.
+
+    ``tol`` is NOT part of the key any more: it is a RUNTIME argument of the
+    compiled program (it appears only in the ``while_loop`` predicate), so a
+    caller that sweeps tolerances — a tol-sensitivity gate, an oracle leg beside
+    a production leg — reuses one executable instead of paying a full compile
+    per value."""
+    key = (id(matvec), max_iter, str(dtype))
     hit = _GMRES_SOLVER_CACHE.get(key)
     if hit is not None:
-        return hit[1]
+        return lambda b, diag_h, z, operands: hit[1](
+            b, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64))
 
     solver = jax.jit(
-        lambda b, diag_h, z, operands: _gmres_solve_core(
-            matvec, b, diag_h, z, operands, max_iter, tol))
+        lambda b, diag_h, z, operands, tol_rt: _gmres_solve_core(
+            matvec, b, diag_h, z, operands, max_iter, tol_rt))
     _GMRES_SOLVER_CACHE[key] = (matvec, solver)
-    return solver
+    return lambda b, diag_h, z, operands: solver(
+        b, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64))
 
 
 def gmres_solve_sharded_jit(

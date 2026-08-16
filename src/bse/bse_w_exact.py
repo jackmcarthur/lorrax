@@ -116,23 +116,50 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     return matvec, diag_h, gen, snapshot, make_bse_shardings(mesh_xy)
 
 
-def _roll_k_axis_host(arr_np, q, nkx, nky, nkz):
-    """Host-side (numpy) roll of an on-grid tensor by ``+q`` on the C-order
-    (nkx,nky,nkz) k-axis (axis 0).  ``out[k] = arr[k − q]`` on the wrapped grid,
-    i.e. it gathers the conduction quantity at ``k − q`` into slot ``k`` — the
-    shift that reproduces the stored ``W0_qmunu[q_flat]`` tile (see
+#: ``(q, nkx, nky, nkz) -> flat int32 k permutation``.  Tiny (nk entries) and a
+#: pure function of the grid, so memoising it costs nothing and keeps the host
+#: out of the per-q path entirely.
+_ROLL_INDEX_CACHE: dict = {}
+
+
+def _roll_k_index(q, nkx, nky, nkz):
+    """The ``+q`` roll of the C-order (nkx,nky,nkz) k-axis, AS AN INDEX.
+
+    Returns the flat ``(nk,)`` int32 permutation ``idx`` with
+    ``out[k] = arr[idx[k]] = arr[k − q]`` on the wrapped grid — the shift that
+    gathers the conduction quantity at ``k − q`` into slot ``k`` and so
+    reproduces the stored ``W0_qmunu[q_flat]`` tile (see
     :func:`build_finite_q_data`).
 
-    Done on host (numpy), NOT device ``jnp.roll``: a static device roll bakes the
-    q-offset into the compiled program, so a different q recompiled the roll once
-    per q.  Rolling on host (arrays are small — psi_c is a few tens of MB) yields
-    the rolled array as plain DATA that ``device_put`` uploads with the target
-    sharding, so no per-q compile — the whole finite-q loop stays dispatch-only
-    after the first engine build."""
-    tail = arr_np.shape[1:]
-    a = arr_np.reshape((nkx, nky, nkz) + tail)
-    a = np.roll(a, shift=(int(q[0]), int(q[1]), int(q[2])), axis=(0, 1, 2))
-    return a.reshape((nkx * nky * nkz,) + tail)
+    WHY AN INDEX AND NOT A ROLL OF THE DATA.  The roll has to be compile-stable
+    — a *static* device ``jnp.roll`` bakes the q-offset into the program and
+    recompiles once per q, which is why this used to be done on host (numpy)
+    with the rolled array uploaded as plain DATA.  But the host round trip is
+    not the only way to get compile stability: hand the DEVICE a runtime index
+    and the program is q-independent by construction, because q enters as an
+    argument rather than as a constant.  The index is ``nk`` int32s — 36 B on
+    the gnppm fixture — against the psi_c stack the host path moved.
+
+    MEASURED (evidence/sync_audit, 2026-08-16, gnppm 399/9k fixture): the host
+    path cost 24.6 ms per q at 1 process and 20.0 ms at 4, moving 2.2 MiB
+    device→host plus 8.8 MiB host→device EVERY q (a ``gather_to_host`` of
+    ψ_c is a cross-process ``process_allgather`` at P>1, so that traffic is on
+    the network); the index path costs 5.9 ms / 9.1 ms and moves ZERO bytes
+    across the host boundary.  Bit-identical on every returned slot at every q
+    — a permutation is a permutation.
+
+    The gather itself is also communication-free: every array rolled here is
+    sharded on a DIFFERENT axis than k (ψ on μ over 'x'/'y', ε replicated), so
+    ``take`` on axis 0 stays entirely inside each shard."""
+    key = (int(q[0]) % nkx, int(q[1]) % nky, int(q[2]) % nkz, nkx, nky, nkz)
+    idx = _ROLL_INDEX_CACHE.get(key)
+    if idx is None:
+        flat = np.arange(nkx * nky * nkz, dtype=np.int32).reshape(nkx, nky, nkz)
+        idx = np.ascontiguousarray(
+            np.roll(flat, shift=(key[0], key[1], key[2]),
+                    axis=(0, 1, 2)).reshape(-1), dtype=np.int32)
+        _ROLL_INDEX_CACHE[key] = idx
+    return idx
 
 
 def build_finite_q_data(data, q, mesh_xy):
@@ -149,8 +176,9 @@ def build_finite_q_data(data, q, mesh_xy):
     Remap (``q = (qx,qy,qz)`` integer grid steps; C-order flat
     ``k = ix·nky·nkz + iy·nkz + iz``):
 
-      * ``psi_c`` / ``eps_c`` ← ``jnp.roll(·, shift=+q)`` on the reshaped
-        (nkx,nky,nkz) k-axis ⇒ slot ``k`` holds the conduction value at ``k − q``.
+      * ``psi_c`` / ``eps_c`` ← rolled by ``+q`` on the (nkx,nky,nkz) k-axis
+        (a device gather through :func:`_roll_k_index`) ⇒ slot ``k`` holds the
+        conduction value at ``k − q``.
         The pair density is then ``M^q_cvk(μ) = Σ_s conj(ψ_c[k−q](μ)) ψ_v[k](μ)``
         and ``D^q = ε_c[k−q] − ε_v[k]``; summed over k this is exactly the GW
         producer's χ₀(q) convolution ``Σ_k Gc_k Gv*_{k+q}`` (relabel k→k−q), which
@@ -183,18 +211,28 @@ def build_finite_q_data(data, q, mesh_xy):
     sh = make_bse_shardings(mesh_xy)
     dq = dict(data)
     dq["V_q0"] = data["V_q_full"][:, :, qx, qy, qz]
-    # Roll on host (see _roll_k_axis_host) so a different q needs no new compile;
-    # device_put uploads the rolled array straight into the target sharding.
-    # Process-local placement of the rolled HOST arrays (identical on
-    # every rank: same source tensor, same q).  Plain ``device_put`` of
-    # host data onto a multi-process sharding fires JAX's hidden
-    # ``assert_equal`` all-gather — P × nbytes per call, three calls per
-    # finite-q point (scorecard AA.1).  LORRAX_CHECK_REPLICA=1 re-arms it.
-    # gather_to_host, not device_get: psi_c_X is sh.psi_x = P(None,None,None,'x')
-    # -- sharded on its LAST axis -- and eps_c is replicated but NOT fully
-    # addressable at P>1, so both raise under device_get.  The helper's three
-    # arms cover each case (allgather / local shard 0 / plain device_get) and
-    # leave the 1-GPU path exactly as it was.
+    # THE ROLL IS A DEVICE GATHER THROUGH A RUNTIME INDEX (see _roll_k_index),
+    # so a different q needs no new compile AND no host round trip.  The index
+    # is nk int32s, staged process-locally: plain ``device_put`` of host data
+    # onto a multi-process sharding fires JAX's hidden ``assert_equal``
+    # all-gather (scorecard AA.1), and LORRAX_CHECK_REPLICA=1 re-arms it.
+    #
+    # This replaced a gather_to_host(psi_c) -> numpy roll -> three
+    # device_put_process_local round trips.  Measured 2026-08-16
+    # (evidence/sync_audit): 24.6 -> 5.9 ms per q at 1 process, 20.0 -> 9.1 ms
+    # at 4, and 11.0 MiB per q of host traffic -> 0.  Do not put the host roll
+    # back: at P>1 the ψ_c gather is a ``process_allgather``, i.e. the whole
+    # conduction stack crossed the NETWORK once per irreducible q.
+    idx = device_put_process_local(
+        _roll_k_index((qx, qy, qz), nkx, nky, nkz),
+        NamedSharding(mesh_xy, P()))
+
+    def _roll(arr, target):
+        # axis 0 is k; every array rolled here is sharded on some OTHER axis
+        # (ψ on μ, ε replicated), so this gather never leaves a shard.
+        return jax.lax.with_sharding_constraint(
+            jnp.take(arr, idx, axis=0), target)
+
     #
     # ── THE CONJUGATE VERTEX ─────────────────────────────────────────────────
     # ψ comes back CONJUGATED, on BOTH legs, and this is the finite-q fix.
@@ -233,12 +271,21 @@ def build_finite_q_data(data, q, mesh_xy):
     # a TRS-broken system.  It leaves the optical BSE convention untouched, and
     # it is inert on the preconditioner diagonal (``diag(K)`` is real and
     # conjugation-invariant because V_q is Hermitian).
-    psi_c_q = np.conj(_roll_k_axis_host(
-        gather_to_host(data["psi_c_X"]), (qx, qy, qz), nkx, nky, nkz))
-    dq["psi_c_X"] = device_put_process_local(psi_c_q, sh.psi_x)
-    dq["psi_c_Y"] = device_put_process_local(psi_c_q, sh.psi_y)
-    dq["eps_c"] = device_put_process_local(_roll_k_axis_host(
-        gather_to_host(data["eps_c"]), (qx, qy, qz), nkx, nky, nkz), sh.eps)
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # ψ_c_Y carries the SAME values as ψ_c_X on a different sharding (the
+    # loader's ``with_sharding_constraint`` copy, bse_loading; likewise
+    # enforce_trs_pair_gauge), so each is rolled on its own layout — two local
+    # gathers rather than one gather plus a reshard.  The ``.get`` fallback
+    # keeps a payload that never built the Y copy working; it costs one
+    # reshard and never fires in tree.
+    psi_c_X_q = _roll(data["psi_c_X"], sh.psi_x)
+    psi_c_Y_q = _roll(data.get("psi_c_Y", data["psi_c_X"]), sh.psi_y)
+    dq["psi_c_X"] = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_c_X_q), sh.psi_x)
+    dq["psi_c_Y"] = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_c_Y_q), sh.psi_y)
+    dq["eps_c"] = _roll(data["eps_c"], sh.eps)
     # ψ_v does not roll (the valence leg stays at k) but it DOES conjugate: a
     # vertex flip applied to one leg only is not a flip, it is a different (and
     # wrong) operator.  On device — no roll means no host round trip to reuse.
@@ -254,24 +301,351 @@ def build_finite_q_data(data, q, mesh_xy):
         compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.psi_x)
     dq["M_Y"] = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(dq["psi_c_Y"], dq["psi_v_Y"]), sh.psi_y)
+    # The flip is EXACT for the four density vertices (above) and WRONG for
+    # the direct rung: the rung is bilinear in (c,c')/(v,v') band pairs and
+    # must consume the PHYSICAL (rolled, UN-flipped) arrays — running it on
+    # the conjugated ones was value-invisible at q=0 and a 3.6e-4 break of
+    # W(-q) = conj(W(q)) at finite q (claim 0215).  The rung therefore gets
+    # its own four operand slots (bse_ring_comm ladder_rung_slots /
+    # bse_feast.ladder_matvec_operands): psi_c rolled un-conjugated, psi_v
+    # the original arrays VERBATIM (aliases — zero copies).  A conj-wrap
+    # compensation inside the rung appliers was tried first and refuted by
+    # block-level measurement (probe_block_compare, 2026-08-16).
+    dq["psi_c_W_X"] = psi_c_X_q       # rolled, NOT conjugated
+    dq["psi_c_W_Y"] = psi_c_Y_q
+    dq["psi_v_W_X"] = data["psi_v_X"]
+    dq["psi_v_W_Y"] = data["psi_v_Y"]
+    dq["vertex_flipped"] = True
     return dq
+
+
+def _canonical_phase(vec_flat):
+    """Deterministic phase for one band function: the largest-|entry| element
+    (lowest index on exact ties — np.argmax) is made real-positive.  This is
+    the 'largest-element phase-fixing' convention of the determinism contract:
+    the phase depends on the FUNCTION, not on how upstream happened to phase
+    it, so the same WFN yields the same phased band up to upstream jitter."""
+    k = int(np.argmax(np.abs(vec_flat)))
+    a = vec_flat[k]
+    m = abs(a)
+    return vec_flat * (np.conj(a) / m) if m > 0 else vec_flat
+
+
+def _canonical_subspace_basis(Psi):
+    """Span-anchored deterministic orthonormal basis of a degenerate block.
+
+    ``Psi`` is (m, L) — m orthonormal states, L = flattened samples.  The
+    returned basis depends only on span(Psi) plus fixed conventions — NOT on
+    the incoming basis realization, which upstream GPU nondeterminism varies
+    run to run (the registered defect: iteration counts varying, one spurious
+    refusal).  Construction: project coordinate probes e_j into the span in
+    FIXED index order (coefficients c_j = Psi conj at e_j — for orthonormal
+    rows the projector coefficients are Psi[:, j]), Gram-Schmidt in that
+    order in coefficient space (Euclidean = the band metric), skip probes
+    whose residual is below 1e-6 of the block scale, then canonical-phase
+    each resulting function.  No eigh/SVD anywhere: decompositions realize
+    degenerate-subspace freedom chaotically; fixed-order projections do not."""
+    m, L = Psi.shape
+    scale = float(np.linalg.norm(Psi) / np.sqrt(m))
+    cols = []
+    for j in range(L):
+        c = np.conj(Psi[:, j])          # coefficients of P e_j in the basis
+        for u in cols:
+            c = c - u * np.vdot(u, c)
+        n = float(np.linalg.norm(c))
+        if n > 1e-6 * scale:
+            cols.append(c / n)
+            if len(cols) == m:
+                break
+    if len(cols) != m:                   # pragma: no cover
+        raise ValueError(
+            "GATE trs_gauge_canonical_basis_deficient: fixed-order probes "
+            f"spanned {len(cols)}/{m} of a degenerate block — numerically "
+            "collapsed block. doc: bse_w_exact.enforce_trs_pair_gauge")
+    V = np.stack(cols, axis=1)           # (m, m) unitary
+    out = V.T @ Psi
+    for r in range(m):
+        out[r] = _canonical_phase(out[r])
+    return out
+
+
+def _realize_trim_block(Psi):
+    """Deterministic REAL basis of a conj-closed scalar block at a TRIM point.
+
+    ``Psi`` is (mu, m) columns.  ``conj(Psi) = Psi C`` (C unitary
+    complex-symmetric under exact TRS; refusal below otherwise).  Real
+    vectors are built as ``r = c + C conj(c)`` (fixed by the antiunitary
+    involution: ``C conj(r) = r`` using ``C conj(C) = 1``) from FIXED-ORDER
+    coordinate probes, Gram-Schmidt in fixed order, sign-fixed by the
+    largest element — span-anchored and decomposition-free, per the
+    determinism contract (same WFN -> same canonical gauge)."""
+    C, _, _, _ = np.linalg.lstsq(Psi, np.conj(Psi), rcond=None)
+    misclose = float(np.abs(np.conj(Psi) - Psi @ C).max())
+    scale = float(np.abs(Psi).max())
+    if misclose > 1e-8 * max(scale, 1e-300):
+        raise ValueError(
+            "GATE trs_gauge_block_not_conj_closed: a degenerate block at a "
+            f"TRIM k-point is not closed under conjugation (residual "
+            f"{misclose:.3e} on scale {scale:.3e}). A degenerate partner "
+            "probably sits outside the band window; widen the window or run "
+            "with w_rpa. doc: bse_w_exact.enforce_trs_pair_gauge")
+    C = 0.5 * (C + C.T)
+    m = C.shape[0]
+    cols = []
+    probes = np.conj(Psi.T)              # (m, mu): probes[:, j] = Psi^dag e_j
+    for j in range(Psi.shape[0]):
+        c = probes[:, j]
+        r = c + C @ np.conj(c)
+        for u in cols:
+            r = r - u * np.vdot(u, r)
+        n = float(np.linalg.norm(r))
+        if n > 1e-6:
+            cols.append(r / n)
+            if len(cols) == m:
+                break
+    if len(cols) != m:                   # pragma: no cover
+        raise ValueError(
+            "GATE trs_gauge_canonical_basis_deficient: real-structure probes "
+            f"spanned {len(cols)}/{m} of a TRIM block. "
+            "doc: bse_w_exact.enforce_trs_pair_gauge")
+    V = np.stack(cols, axis=1)
+    out = Psi @ V                        # columns are real functions
+    for r in range(m):
+        col = out[:, r]
+        k = int(np.argmax(np.abs(col)))
+        if col[k].real < 0:
+            out[:, r] = -col
+    return out
+
+
+def _kramers_canonicalize_trim_block(Psi, R):
+    """Deterministic Kramers-canonical pairing at a spinor TRIM point.
+
+    ``Psi`` is (m, ns, mu), m EVEN.  ``phi_{2j+1} = Theta phi_{2j}``, with
+    phi_{2j} chosen from FIXED-ORDER coordinate probes projected into the
+    remaining subspace, canonical-phased — span-anchored, decomposition-free
+    (determinism contract; the previous argmax-pivot greedy realized GPU
+    input jitter as a different gauge per run)."""
+    m = Psi.shape[0]
+    if m % 2:
+        raise ValueError(
+            "GATE trs_gauge_kramers_odd_block: a degenerate block at a TRIM "
+            f"point has ODD size {m} on a spinor deck — Kramers requires even "
+            "multiplicity, so either the degeneracy grouping tolerance split "
+            "a pair or the deck breaks TRS. doc: bse_w_exact.enforce_trs_pair_gauge")
+    F = Psi.reshape(m, -1).T                        # (ns*mu, m)
+    Th = np.stack([_theta(Psi[j:j + 1], R)[0] for j in range(m)]).reshape(m, -1).T
+    S, _, _, _ = np.linalg.lstsq(F, Th, rcond=None)
+    misclose = float(np.abs(Th - F @ S).max())
+    scale = float(np.abs(F).max())
+    if misclose > 1e-8 * max(scale, 1e-300):
+        raise ValueError(
+            "GATE trs_gauge_block_not_theta_closed: a degenerate TRIM block "
+            f"is not closed under Theta = i*sigma_y*K (residual {misclose:.3e} "
+            f"on scale {scale:.3e}); a Kramers partner probably sits outside "
+            "the band window. doc: bse_w_exact.enforce_trs_pair_gauge")
+    cols = []
+    L = F.shape[0]
+    jprobe = 0
+    while len(cols) < m and jprobe < L:
+        c1 = np.conj(F[jprobe, :])                  # probe e_j's coefficients
+        jprobe += 1
+        for u in cols:
+            c1 = c1 - u * np.vdot(u, c1)
+        n = float(np.linalg.norm(c1))
+        if n <= 1e-6:
+            continue
+        c1 = c1 / n
+        # canonical phase from the resulting FUNCTION's largest sample
+        f1 = F @ c1
+        a = f1[int(np.argmax(np.abs(f1)))]
+        c1 = c1 * (np.conj(a) / abs(a))
+        c2 = S @ np.conj(c1)
+        c2 = c2 - c1 * np.vdot(c1, c2)
+        c2 = c2 / np.linalg.norm(c2)
+        cols += [c1, c2]
+    if len(cols) != m:                   # pragma: no cover
+        raise ValueError(
+            "GATE trs_gauge_canonical_basis_deficient: Kramers probes "
+            f"spanned {len(cols)}/{m} of a TRIM block. "
+            "doc: bse_w_exact.enforce_trs_pair_gauge")
+    V = np.stack(cols, axis=1)
+    return np.tensordot(V.T, Psi, axes=(1, 0))
+
+
+def _spin_rotation(nspinor):
+    """The unitary part of TRS: Theta = R K.  Scalar: R = 1.  Spinor:
+    R = i*sigma_y = [[0, 1], [-1, 0]] — REAL orthogonal, R^2 = -1 (Kramers)."""
+    if nspinor == 1:
+        return np.eye(1)
+    if nspinor == 2:
+        return np.array([[0.0, 1.0], [-1.0, 0.0]])
+    raise ValueError(f"nspinor={nspinor}?")
+
+
+def _theta(psi_k, R):
+    """Theta psi for one k-slot (nb, ns, mu): R on the spin axis, conj."""
+    return np.einsum("st,btm->bsm", R, np.conj(psi_k))
+
+
+def _trs_fix_band_array(psi, eps, grid, *, label):
+    """psi (nk, nb, ns, mu), eps (nk, nb) -> TRS/Kramers pair gauge on copies.
+
+    For every k-pair (k, -k) the -k states are REPLACED by ``Theta psi(k)``
+    (``Theta = i sigma_y K`` for spinors, plain K for scalars — any eigenbasis
+    of H(-k) may be, since the assembled W is invariant under unitary mixing
+    within the band window).  At TRIM points (k == -k) each degenerate block
+    is rotated to real functions (scalar) or to the Kramers-canonical pairing
+    (spinor).  Energies are symmetrized after an agreement check.
+
+    Note the sigma_y itself is INVISIBLE to the ladder operator: every
+    contraction it performs is a spin-singlet s-summed bilinear
+    ``sum_s conj(psi^s) phi^s``, and R real-orthogonal cancels there
+    identically — which is WHY the scalar derivation (w_ladder step 8)
+    carries over.  R is kept so the overwritten arrays are genuine H(-k)
+    eigenstates, not just operator-equivalent ones."""
+    nk = psi.shape[0]
+    ns = psi.shape[2]
+    R = _spin_rotation(ns)
+    psi = psi.copy()
+    eps = eps.copy()
+    idx = np.arange(nk).reshape(grid)
+    coords = np.stack(np.unravel_index(np.arange(nk), grid), axis=1)
+    neg = idx[tuple(((-coords) % np.array(grid)).T)]
+    de = float(np.abs(eps - eps[neg]).max())
+    if de > 1e-6:
+        raise ValueError(
+            f"GATE trs_gauge_energies_disagree: eps_{label}(k) vs "
+            f"eps_{label}(-k) differ by {de:.3e} Ry — the deck's k-grid is "
+            "not TRS-consistent, so the conj-pattern anti-resonant channel "
+            "has no exact gauge. doc: bse_w_exact.enforce_trs_pair_gauge")
+    eps = 0.5 * (eps + eps[neg])
+    for k in range(nk):
+        kn = int(neg[k])
+        if k < kn:
+            # Canonicalize the SOURCE slot first — span-anchored degenerate
+            # blocks + largest-element band phases — so the Theta-overwrite
+            # propagates a run-invariant gauge.  Upstream GPU nondeterminism
+            # realizes degenerate subspaces differently per run (registered
+            # defect: varying iteration counts, one spurious refusal); the
+            # canonical gauge depends only on the spans and the fixed
+            # conventions, so the same WFN yields the same output up to
+            # upstream jitter magnitude, and identical input is bit-identical.
+            e = eps[k]
+            b0 = 0
+            while b0 < e.size:
+                b1 = b0 + 1
+                while b1 < e.size and e[b1] - e[b1 - 1] < 1e-8:
+                    b1 += 1
+                if b1 - b0 > 1:
+                    blk = psi[k, b0:b1].reshape(b1 - b0, -1)
+                    psi[k, b0:b1] = _canonical_subspace_basis(blk).reshape(
+                        psi[k, b0:b1].shape)
+                else:
+                    flat = _canonical_phase(psi[k, b0].reshape(-1))
+                    psi[k, b0] = flat.reshape(psi[k, b0].shape)
+                b0 = b1
+            psi[kn] = _theta(psi[k], R)
+        elif k == kn:
+            e = eps[k]
+            b0 = 0
+            while b0 < e.size:
+                b1 = b0 + 1
+                while b1 < e.size and e[b1] - e[b1 - 1] < 1e-8:
+                    b1 += 1
+                if ns == 1:
+                    blk = psi[k, b0:b1, 0, :].T      # (mu, m)
+                    psi[k, b0:b1, 0, :] = _realize_trim_block(blk).T
+                else:
+                    psi[k, b0:b1] = _kramers_canonicalize_trim_block(
+                        psi[k, b0:b1], R)
+                b0 = b1
+    return psi, eps
+
+
+def enforce_trs_pair_gauge(data, mesh_xy):
+    """Fix the Bloch gauge to ``psi(-k) = conj(psi(k))`` — the LADDER's need.
+
+    Why this exists: the ladder operator's anti-resonant channel is built by
+    the conj-pattern ``K^AA = conj(K^RR)`` on the SAME +q-rolled arrays (the
+    step-4 hybrid row, ``w_ladder`` derivation).  That identification of the
+    code's Y labels with the physical de-excitation pairs at ``-q`` is an
+    antiunitary TRS fold, and it is EXACT only in the gauge
+    ``psi(-k) = conj(psi(k))``.  The diagonalizer's gauge is arbitrary, so on
+    a raw deck the Y channel carries wrong-gauge content — invisible at q=0
+    (the two channels share one transition space there), invisible to per-q
+    hermiticity (``conj(K_d)`` is Hermitian in ANY gauge), invisible to the
+    RPA (the ring is a band-window-invariant dyad and D is real), and
+    measured as a 1.043e-03 violation of ``W(-q) = conj(W(q))`` by the
+    FIRST-PRINCIPLES dense ladder operator itself on the gnppm 2v2c fixture
+    (2026-08-16; the production number on the closure fixture was 3.579e-04,
+    claim 0215).  Fixing the gauge is a pure basis choice: every
+    gauge-invariant object (RPA W, hermiticity, band energies, densities) is
+    unchanged, which is why the RPA arm never needed it.
+
+    SPINORS are handled by the same machinery with ``Theta = i sigma_y K``
+    (Kramers pair gauge): the ladder operator's every contraction is a
+    spin-singlet s-summed bilinear ``sum_s conj(psi^s) phi^s``, in which the
+    real-orthogonal ``i sigma_y`` cancels IDENTICALLY — so the scalar step-8
+    derivation carries over unchanged once the pair gauge is enforced, and a
+    "drop the sigma_y" red twin is a NO-OP by the same theorem (sigma_y is
+    observable only in eigenstate validity, which the wholesale pair
+    overwrite makes moot).  TRIM points get the Kramers-canonical pairing
+    ``phi_{2j+1} = Theta phi_{2j}`` per degenerate block (even multiplicity
+    enforced).
+
+    Cost: one host pass over psi_c/psi_v (same class as the per-q host roll
+    in :func:`build_finite_q_data`); O(nk nb ns mu) + an eigh or Kramers
+    sweep per degenerate TRIM block.  Returns a shallow copy with psi/eps/M
+    slots replaced.
+    """
+    grid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
+    sh = make_bse_shardings(mesh_xy)
+    out = dict(data)
+    psi_c, eps_c = _trs_fix_band_array(
+        gather_to_host(data["psi_c_X"]), np.asarray(jax.device_get(data["eps_c"])),
+        grid, label="c")
+    psi_v, eps_v = _trs_fix_band_array(
+        gather_to_host(data["psi_v_X"]), np.asarray(jax.device_get(data["eps_v"])),
+        grid, label="v")
+    out["psi_c_X"] = device_put_process_local(psi_c, sh.psi_x)
+    out["psi_c_Y"] = device_put_process_local(psi_c, sh.psi_y)
+    out["psi_v_X"] = device_put_process_local(psi_v, sh.psi_x)
+    out["psi_v_Y"] = device_put_process_local(psi_v, sh.psi_y)
+    out["eps_c"] = device_put_process_local(eps_c, sh.eps)
+    out["eps_v"] = device_put_process_local(eps_v, sh.eps)
+    out["M_X"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.psi_x)
+    out["M_Y"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(out["psi_c_Y"], out["psi_v_Y"]), sh.psi_y)
+    return out
+
+
+def _symmetry_tables(input_file: str):
+    """The ONE canonical ``SymMaps`` object for ``input_file``'s WFN.
+
+    Carries the IBZ q-wedge (``q_irr_kgrid_int``) AND the full-BZ unfold tables
+    (``irr_idx_q``, ``sym_idx_q``, ``q_irr_full_idx``) the ladder facade hands to
+    ``symmetry_maps.unfold_isdf_operator``.  Single source: no BSE-side copy of
+    the wedge arithmetic — :func:`_symmetry_reduced_q_list` is a projection of
+    this, not a second construction."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
+    from symmetry_maps import SymMaps
+    from .bse_io import _parse_wfn_path
+    return SymMaps(WfnLoader(_parse_wfn_path(input_file)))
 
 
 def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
     """Symmetry-reduced (IBZ) q-grid points as integer kgrid steps ``(n_q, 3)``,
     from the ONE canonical ``SymMaps`` table (``q_irr_kgrid_int``); no new sym
     helper.  Row 0 is Γ = (0,0,0)."""
-    from ffi import _services
-    _services.ensure_on_path()
-    from wfn_loader import WfnLoader
-    from symmetry_maps import SymMaps
-    from .bse_io import _parse_wfn_path
-    wfn = WfnLoader(_parse_wfn_path(input_file))
-    sym = SymMaps(wfn)
-    return np.asarray(sym.q_irr_kgrid_int, dtype=int)
+    return np.asarray(_symmetry_tables(input_file).q_irr_kgrid_int, dtype=int)
 
 
-def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
+def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
+                            resid_relative_to: str = "b"):
     """Cached jitted per-column-scan block-GMRES engine for the screening
     resolvent — the stage-2 SOLVE of :func:`apply_screening_resolvent_block`.
 
@@ -284,16 +658,21 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
     dispatch-only — replacing the old top-level ``lax.scan`` that closed over the
     per-q ``data`` and recompiled the ~4.8 s scan once per q.
 
-    Cache key ``(id(matvec), max_iter, tol, dtype)`` keeps the operator-identity
-    safety: genuinely different structures (screening vs optical, TDA vs full)
-    carry distinct ``matvec`` objects and so distinct engines."""
-    key = (id(matvec), int(max_iter), float(tol), str(dtype))
+    Cache key ``(id(matvec), max_iter, resid_relative_to, dtype)`` keeps the
+    operator-identity safety: genuinely different structures (screening vs
+    optical, TDA vs full) carry distinct ``matvec`` objects and so distinct
+    engines.  ``tol`` is NOT in the key — it rides in as a runtime argument
+    (it appears only in the ``while_loop`` predicate), so a tolerance sweep
+    reuses one executable.  ``resid_relative_to`` IS in the key because it is
+    a different stopping rule and so a different program; see
+    :func:`bse_feast._gmres_solve_core` for what the two mean."""
+    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype))
     hit = _BLOCK_GMRES_CACHE.get(key)
     if hit is not None:
-        return hit[1]
+        return _bind_tol(hit[1], tol)
 
     @jax.jit
-    def _block(rhs, diag_h, z, operands):
+    def _block(rhs, diag_h, z, operands, tol_rt):
         # rhs: (2, nu, c, v, k) — scan the per-column GMRES over the probe axis nu.
         rhs_scan = jnp.moveaxis(rhs, 1, 0)  # (nu, 2, c, v, k)
 
@@ -305,7 +684,8 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
             # campaign's most-run shifted solve — was the one solver whose
             # iteration count no log could ever show.  Carried out for LOGGING.
             x, k_used = _gmres_solve_core(matvec, rhs_i, diag_h, z, operands,
-                                          max_iter, tol)
+                                          max_iter, tol_rt,
+                                          resid_relative_to=resid_relative_to)
             r_true = rhs_i - _apply_shifted_matvec(matvec, x, z, operands)
             nrhs = jnp.linalg.norm(rhs_i)
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
@@ -313,17 +693,104 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype):
             s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
             return carry, (s[0], resid, k_used)
 
-        _, (s_all, resids, iters) = jax.lax.scan(_solve_col, None, rhs_scan)
+        # unroll=1: ONE Krylov workspace alive at a time.  The workspace is
+        # O(max_iter) pair-basis vectors plus an O(max_iter^2) replicated
+        # Hessenberg, so unrolling the probe axis multiplies the solve's memory
+        # peak by the unroll factor for no arithmetic saving — the ladder
+        # matvec amortises only 1.11x over a 16-wide block (measured,
+        # opt_integration 2026-08-16), i.e. the probe axis carries no width win
+        # to buy the memory with.
+        _, (s_all, resids, iters) = jax.lax.scan(_solve_col, None, rhs_scan,
+                                                 unroll=1)
         s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
         return s_all, resids, iters
 
     _BLOCK_GMRES_CACHE[key] = (matvec, _block)
-    return _block
+    return _bind_tol(_block, tol)
+
+
+def _bind_tol(block, tol):
+    """Bind the runtime ``tol`` so callers keep the 4-argument call shape."""
+    return lambda rhs, diag_h, z, operands: block(
+        rhs, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64))
+
+
+def build_probe_rhs(G_zeta, data, gen, sh):
+    """Stage 1 (SEED) alone: the probe block's pair-basis right-hand side.
+
+    ``z``-INDEPENDENT — it reads only the probe block and the q-shifted payload
+    — so a caller that sweeps frequencies at fixed ``(q, probe block)`` builds
+    it ONCE here and hands it to :func:`apply_screening_resolvent_block` as
+    ``rhs=``, instead of paying the reshard + generator dispatch again at every
+    ``z``.  Extracted, not duplicated: the function below calls this one.
+
+    Returns ``rhs`` on ``sh.X_full`` = ``(2, n_probe, c_X, v_Y, k)``.
+    """
+    px, py = sh.X.mesh.devices.shape
+    n_probe = int(G_zeta.shape[0])
+    if n_probe % py != 0:
+        raise ValueError(
+            f"probe block n_probe={n_probe} must be a multiple of py={py} "
+            "(reduce-scatter tiles nu over y); pad the probe block with zero rows.")
+    n_rmu = int(data["V_q0"].shape[0])
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    # Process-local (scorecard AA.1): the probe block is identical on every
+    # rank; ``np.broadcast_to`` keeps the host operand a zero-copy view, so
+    # each rank materialises only its own shard — where plain ``device_put``
+    # of the materialised broadcast paid a P × n_probe·n_rmu·nk·8 B
+    # assert_equal all-gather.  LORRAX_CHECK_REPLICA=1 re-arms the check.
+    # REAL probe blocks only, refused rather than cast.  The stage-1 seed is
+    # float64 all the way to ``gen``, and ``np.asarray(x, dtype=np.float64)``
+    # on a complex array DISCARDS the imaginary part with a ComplexWarning —
+    # not an error — so a caller handing this a complex probe block (a
+    # Lanczos start vector, a rotated basis) would get a silently wrong tile.
+    # Every probe in the tree today is a real unit column or the identity, so
+    # this is a real assumption being stated, not a capability being removed.
+    G0 = np.asarray(G_zeta)
+    if np.iscomplexobj(G0):
+        raise TypeError(
+            "the probe block is complex; the screening seed is real-valued "
+            "(float64 through the transition generator) and casting here "
+            "would discard the imaginary part silently.  Split a complex "
+            "probe into its real and imaginary blocks and solve both, or "
+            "widen the generator's dtype deliberately.")
+    G = np.asarray(G0, dtype=np.float64)
+    # UPLOAD THE PROBE BLOCK, BROADCAST ON DEVICE.  ``np.broadcast_to`` is a
+    # 0-stride VIEW on host, but ``device_put_process_local`` slices a
+    # hyperslab out of it and numpy materialises the contiguous copy right
+    # there — so uploading the broadcast paid n_probe·n_rmu·nk·8 B of host
+    # allocation, memcpy and H2D for a tensor carrying only n_probe·n_rmu
+    # numbers, once per (q, probe block).  Broadcasting on device divides that
+    # by nk: 9x on the gnppm fixture, 216x on a 6x6x6 grid, and the seed is
+    # rebuilt at every irreducible q.  MEASURED 2026-08-16
+    # (evidence/sync_audit, chunk = full basis): H2D over a 5-q wedge
+    # 54.7 -> 6.1 MiB, per-q staging 16.0 -> 15.5 ms at 1 process and
+    # 23.1 -> 21.7 ms at 4.  Bit-identical — a broadcast is a copy.
+    #
+    # NOT hoisted out of the q loop, though the uploaded block IS
+    # q-independent: holding one staged tensor per probe block across q costs
+    # n_rmu·n_rmu·nk·8 B of DEVICE memory regardless of chunking, which is
+    # exactly the budget ``probe_chunk`` exists to bound.  Measured, the hoist
+    # buys a further 6.1 MiB of H2D per wedge over this; it is not worth
+    # taking the memory knob back.
+    g = device_put_process_local(
+        np.ascontiguousarray(G, dtype=np.float64), sh.S_k0)
+    r = jax.lax.with_sharding_constraint(
+        jnp.broadcast_to(g[:, :, None], (n_probe, n_rmu, nk)), sh.S)
+    f = jax.lax.with_sharding_constraint(
+        gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
+    return jax.lax.with_sharding_constraint(
+        jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
 
 
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     snapshot, sh, *, max_iter, tol,
-                                    return_iters: bool = False):
+                                    return_iters: bool = False,
+                                    operands_fn=matvec_operands,
+                                    rhs=None,
+                                    resid_relative_to: str = "b",
+                                    solve_data=None,
+                                    snapshot_v=None):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response
@@ -396,41 +863,39 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
         in-tree gates and two other driver arms unpack the 2-tuple; a
         ``return_iters=False`` caller sees exactly the contract it always had.
     """
-    px, py = sh.X.mesh.devices.shape
-    n_probe = int(G_zeta.shape[0])
-    if n_probe % py != 0:
-        raise ValueError(
-            f"probe block n_probe={n_probe} must be a multiple of py={py} "
-            "(reduce-scatter tiles nu over y); pad the probe block with zero rows.")
-    n_rmu = int(data["V_q0"].shape[0])
-    nk = int(data["nkx"] * data["nky"] * data["nkz"])
-
     # --- Stage 1: SEED (zeta -> pair), batched over the whole probe block. ---
-    # Process-local (scorecard AA.1): the probe block is identical on every
-    # rank; ``np.broadcast_to`` keeps the host operand a zero-copy view, so
-    # each rank materialises only its own shard — where plain ``device_put``
-    # of the materialised broadcast paid a P × n_probe·n_rmu·nk·8 B
-    # assert_equal all-gather.  LORRAX_CHECK_REPLICA=1 re-arms the check.
-    G = np.asarray(G_zeta, dtype=np.float64)
-    r = device_put_process_local(
-        np.broadcast_to(G[:, :, None], (n_probe, n_rmu, nk)), sh.S)
-    f = jax.lax.with_sharding_constraint(
-        gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
-    rhs = jax.lax.with_sharding_constraint(
-        jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)  # (2, nu, c, v, k)
+    # z-independent, so a frequency sweep may hoist it (``rhs=``) — see
+    # :func:`build_probe_rhs`, which is where it lives.
+    if rhs is None:
+        rhs = build_probe_rhs(G_zeta, data, gen, sh)      # (2, nu, c, v, k)
 
     # --- Stage 2: SOLVE via the cached jitted per-column-scan GMRES engine. ---
     # The engine is keyed on the operator STRUCTURE (matvec); the q/omega-dependent
     # operand arrays flow in as runtime args, so it compiles ONCE and every later
     # q / omega is dispatch-only.  z is passed as a device scalar (not a Python
     # complex) so a different omega stays a runtime arg, never a baked constant.
-    solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype)
+    solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype,
+                                     resid_relative_to)
+    # operands_fn must match the matvec's build: matvec_operands (10) for
+    # every raw-payload operator, ladder_matvec_operands (14) for a
+    # ladder_rung_slots build (bse_ring_comm).
+    #
+    # ``solve_data`` / ``snapshot_v`` are the ROUTE-A seam, and they are
+    # argument substitutions rather than a second pipeline: hand the SOLVE a
+    # payload whose ``V_q0`` is zero and the PROJECT the identity, and the
+    # three stages return ``T = Pi v`` (the ring-lifted resolvent) instead of
+    # ``v Pi v``; the caller then closes with the dense
+    # ``W - v = v T (I - T)^{-1}`` Dyson.  The SEED keeps the physical ``v``
+    # either way, so ``rhs``, the residual denominator and the iteration
+    # counts mean the same thing on both routes.
     s_all, resids, iters = solver(rhs, diag_h,
                                   jnp.asarray(z, dtype=jnp.complex128),
-                                  matvec_operands(data))
+                                  operands_fn(data if solve_data is None
+                                              else solve_data))
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
-    W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
+    W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"],
+                      data["V_q0"] if snapshot_v is None else snapshot_v)
     if return_iters:
         return W_tile, resids, iters
     return W_tile, resids
@@ -699,16 +1164,22 @@ def main(argv=None) -> None:
         # W_q, and compare each against its OWN stored (W0_qmunu - V_qmunu)[q_flat]
         # tile (finite-q tiles are ~3% non-covariant under centroid permutation, so
         # NEVER validate by sym-unfolding between q's — always vs the own tile).
+        # THE q LOOP LIVES IN ``w_ladder.sweep_q_wedge`` — this arm is a caller.
+        # Function-level import: w_ladder imports this module at module level
+        # (it reuses build_finite_q_data / apply_screening_resolvent_block), so a
+        # module-level import here would be a cycle.  Same shape as the GW stage
+        # helper's lazy `import bse`.
+        from .w_ladder import sweep_q_wedge
         q_list = _symmetry_reduced_q_list(args.input)
         nky_, nkz_ = int(data["nky"]), int(data["nkz"])
-        # Build the q-INDEPENDENT resolvent engine ONCE.  matvec / gen / snapshot
-        # depend only on (mesh, k-grid, pad sizes) — NOT on q — so they are shared
-        # across every q; only the operand DATA (rolled psi_c/eps_c, the
-        # V_qmunu[q] tile, the hoisted M's) and the preconditioner diagonal change,
-        # and those flow as RUNTIME ARGS into the single compiled block-GMRES
-        # engine.  Result: the engine compiles once (first q) and every later q is
-        # dispatch-only (PHASE2_LOG "per-q recompile elimination").
-        matvec, _, gen, snapshot, sh = _build_rpa_resolvent(mesh_xy, data)
+        # The q-INDEPENDENT resolvent engine is built ONCE inside the sweep.
+        # matvec / gen / snapshot depend only on (mesh, k-grid, pad sizes) — NOT
+        # on q — so they are shared across every q; only the operand DATA (rolled
+        # psi_c/eps_c, the V_qmunu[q] tile, the hoisted M's) and the
+        # preconditioner diagonal change, and those flow as RUNTIME ARGS into the
+        # single compiled block-GMRES engine.  Result: the engine compiles once
+        # (first q) and every later q is dispatch-only (PHASE2_LOG "per-q
+        # recompile elimination").
         print(f"\nFinite-q W_q resolvent cross-check: {len(q_list)} symmetry-reduced "
               f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile")
         print("shared resolvent engine (matvec/gen/snapshot) built once; per-q "
@@ -724,31 +1195,39 @@ def main(argv=None) -> None:
         print(hdr)
         print("-" * len(hdr))
         rel_by_q = []
-        for iq, qv in enumerate(q_list):
-            qx, qy, qz = int(qv[0]), int(qv[1]), int(qv[2])
-            q_flat = qx * nky_ * nkz_ + qy * nkz_ + qz
-            # BUILD: q-shifted operands + preconditioner diagonal + probe cols.
-            t_b0 = time.perf_counter()
+        # Per-q state the two callbacks share: the disk tile and the probe
+        # columns chosen from it, plus the build/solve wall clocks the table
+        # prints.  ``_probe_blocks`` runs inside the sweep AFTER the q-shifted
+        # payload exists, so ``build[s]`` still covers exactly what it used to.
+        st = {"T": None, "cols": None, "t_build": 0.0, "t0": time.perf_counter()}
+
+        def _build_hook(iq, q, dq):
+            qx, qy, qz = q
             with timing.section("w_exact.wq_build"):
-                dq = build_finite_q_data(data, (qx, qy, qz), mesh_xy)
-                ensure_W_R(dq, include_W=False, mesh_xy=mesh_xy)
-                diag_hq = build_preconditioner_diagonal_sharded(
-                    dq, mesh_xy, include_W=False, use_tda=False)
                 W0 = gather_to_host(data["W_q"][:, :, qx, qy, qz])
                 Vq = gather_to_host(data["V_q_full"][:, :, qx, qy, qz])
-                T = W0 - Vq
-                cols, _ = _select_compare_cols(T, nlog, args.n_cols, args.seed)
-                jax.block_until_ready(diag_hq)
-            t_build = time.perf_counter() - t_b0
-            # SOLVE (trace+compile on the FIRST q, dispatch-only afterwards).
-            t_s0 = time.perf_counter()
-            with timing.section("w_exact.resolve_q"):
-                W_tile, resids, gm_iters = _resolve_wc_columns(
-                    cols, z, dq, matvec, diag_hq, gen, snapshot, sh,
-                    max_iter=args.gmres_max_iter, tol=args.gmres_tol,
-                    return_iters=True)
-                jax.block_until_ready((W_tile, resids, gm_iters))
-            t_solve = time.perf_counter() - t_s0
+                st["T"] = W0 - Vq
+                st["cols"], _ = _select_compare_cols(
+                    st["T"], nlog, args.n_cols, args.seed)
+            st["t_build"] = time.perf_counter() - st["t0"]
+            st["t0"] = time.perf_counter()
+
+        def _probe_blocks(iq, q):
+            # Unit-column probe block for the selected columns, zero-padded up to
+            # a multiple of py — the same block _resolve_wc_columns builds.
+            cols = np.asarray(st["cols"], dtype=int)
+            n_pad_probe = int(math.ceil(len(cols) / py_) * py_)
+            G = np.zeros((n_pad_probe, n_rmu), dtype=np.float64)
+            for i, nu0 in enumerate(cols):
+                G[i, int(nu0)] = 1.0
+            return [(0, len(cols), G)]
+
+        def _on_result(iq, q, iz, zval, c0, n_real, W_tile, resids, gm_iters):
+            qx, qy, qz = q
+            q_flat = qx * nky_ * nkz_ + qy * nkz_ + qz
+            jax.block_until_ready((W_tile, resids, gm_iters))
+            t_solve = time.perf_counter() - st["t0"]
+            cols, T = st["cols"], st["T"]
             # COMPARE: host-side rel_err vs the own (W0-V)[q_flat] tile.
             with timing.section("w_exact.wq_compare"):
                 wc = gather_to_host(W_tile)
@@ -760,8 +1239,17 @@ def main(argv=None) -> None:
                     for i, nu0 in enumerate(cols)])
             print(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
                   f"{np.median(rels):11.3e} {rr.max():11.3e} {int(gi.max()):7d} "
-                  f"{t_build:9.3f} {t_solve:9.3f}")
+                  f"{st['t_build']:9.3f} {t_solve:9.3f}")
             rel_by_q.append(rels.max())
+            st["t0"] = time.perf_counter()
+
+        py_ = int(mesh_xy.devices.shape[1])
+        with timing.section("w_exact.resolve_q"):
+            sweep_q_wedge(
+                data, mesh_xy, q_list, [z], include_w=False,
+                probe_blocks_for_q=_probe_blocks,
+                gmres_tol=args.gmres_tol, gmres_max_iter=args.gmres_max_iter,
+                on_result=_on_result, build_hook=_build_hook)
         print("-" * len(hdr))
         rel_by_q = np.asarray(rel_by_q)
         print(f"\nmax per-q rel_err = {rel_by_q.max():.3e}   median = "
