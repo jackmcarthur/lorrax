@@ -802,7 +802,47 @@ is worth measuring. Note what was NOT established: that the on-disk file at
 that anchor actually was 26.7 GB (the run is gone), and that a production deck
 still uses μ = 2406.
 
-### The `_MunuSlabPlan` blocker: what it says, and what would settle it
+### `_MunuSlabPlan`: UNBLOCKED AND LANDED, 2026-08-15
+
+The refusal is gone. The sharded BSE reader takes a q-wedge restart, unfolds
+it through the same `file_io.tagged_arrays._unfold_wedge` the GW leg has used
+since `536cbac9`, and `si_bse_debug`'s `restart_q_storage` pin is removed.
+
+**Acceptance, `si_bse_debug` GW+BSE end to end at P=4, `auto` vs `full`:**
+
+| | `full` | `auto` (wedge) |
+|---|---|---|
+| `isdf_tensors_480.h5` | 541,335,584 B | **130,299,936 B** (4.15×, −392 MB) |
+| BSE lowest-8 eigenvalues | — | **bit-identical** |
+| `eqp0`/`eqp1`/`sigma_diag` | — | **byte-identical** |
+
+The log line to look for is
+`BSE-sharded: q-WEDGE restart, unfolding 8 -> 64 q through the symmetry service`.
+
+**Γ needs no collective.** Γ is its own orbit parent, so the single-q `V_q0`
+read stays ONE hyperslab at Γ's wedge row. That is asserted against the file's
+own tables — identity permutation, zero lattice wrap, not time-reversed — never
+assumed, and any other single-q read on a wedge refuses by name.
+
+**What still refuses**, and it is now about reconstructibility rather than
+cost: a q extent below the k-grid with no unfold tables is a truncated or
+mis-stamped file, not a wedge. Re-deriving the tables from *this* run's `sym`
+is deliberately not offered — a table that reconstructs the tensor must be the
+table that deconstructed it. An OVERSIZED q extent gets a message that does
+**not** mention `restart_q_storage`, because no setting of it produces or fixes
+that; an existing cell pins exactly this.
+
+**The trap that would have flattered the result**, carried into the code
+comment and not only the report: without `JAX_ENABLE_X64=1` JAX silently
+truncates complex128 to complex64, halving the bytes actually moved while the
+predicted-size arithmetic still counts 16 B/element — a clean 2× inflation of
+the measured bandwidth with only a `UserWarning` to show for it.
+
+Remaining, and neither is cost: the single-q route for a non-Γ q on a wedge
+(refused by name, no in-tree caller), and `DESIGN_restart_consolidation.md`,
+which four sites defer to and **is still not in the repository**.
+
+### The original blocker, kept for the record: what it said, and what settled it
 
 Audited by reading, 2026-08-15. **The refusal is at
 `src/bse/bse_loading.py:530-556`, and its own comment says in capitals
