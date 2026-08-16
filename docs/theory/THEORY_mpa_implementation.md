@@ -695,8 +695,9 @@ Use these dependencies when moving beyond the validated profile.
   $E(n_b) = E_\infty + A/n_b$ over three widely spread rungs reproduces them
   to 15 meV RMS — a 52x lever on the 787 meV error it corrects — and beats
   $1/n_b^2$ by 4-5x in both codes. Practice, therefore: align on per-run
-  $\mu$, drop the outermost band pair at each window edge (they are
-  non-monotone in $n_b$ and inflate the fit residual 8x), fit $E_\infty +
+  $\mu$, drop the outermost band pair at each window edge (they can be
+  non-monotone in $n_b$: on the BGW arm they take the all-band fit residual
+  from 15.17 to 42.70 meV RMS and 56.1 to 346.6 meV max), fit $E_\infty +
   A/n_b$ on three rungs, and report the extrapolated correction beside the
   number — that deck still owes $-528$ meV mean at 68 bands. Two limits of
   this result, both measured: energy-*local* differences already cancel it
