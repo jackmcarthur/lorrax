@@ -1359,7 +1359,6 @@ _DEFAULTS = {
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
     "regenerate_minimax_tables": False,
-    "minimax_energy_reference": "midgap",
     # PPM
     # WHICH two-point pole-fit ansatz is ``compute_mode``'s job:
     #   gn_ppm — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
@@ -1546,6 +1545,15 @@ _LEGACY_DECK_KEYS = frozenset({
     # ignored it, so 'vbm' moved the PPM split alone and disagreed with the
     # rest of the run.  No in-tree deck ever set it to anything but midgap.
     "fermi_reference",              # warn-and-ignore (pinned to midgap)
+    # 0.1.0: a knob that cannot change an answer is not configuration.
+    # The shift is ALGEBRAICALLY NEUTRAL for chi0/W -- only E_c - E_v
+    # enters, as ``resolve_minimax_energy_reference``'s own docstring
+    # says.  It was also unvalidated (``ScreeningConfig.__post_init__``
+    # checked only ``method``, so a typo died deep in the resolver) and
+    # its field comment claimed midgap|vbm while the resolver also took
+    # cbm|none|<float>.  ``MinimaxConfig.energy_reference`` keeps the
+    # internal "midgap" default for the resolver's other callers.
+    "minimax_energy_reference",     # warn-and-ignore (pinned to midgap)
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1587,7 +1595,7 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
-    "wcoul0_source", "screening_method", "minimax_energy_reference",
+    "wcoul0_source", "screening_method",
     "sigma_omega_layout",
     "w_dyson_solver",
     "ppm_invalid_mode",
@@ -1823,6 +1831,22 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        if section.get("minimax_energy_reference", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'minimax_energy_reference' is no longer supported "
+                "and will be ignored: the shift it selected is "
+                "algebraically neutral for chi0/W (only E_c - E_v enters), "
+                "so no value of it could change a result.  The internal "
+                "default (midgap) is pinned in MinimaxConfig.  Remove it "
+                "from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "minimax_energy_reference",
+                "IGNORED — algebraically neutral for chi0/W (only E_c - E_v "
+                "enters); the internal midgap default is pinned"))
+
         if section.get("fermi_reference", fallback=None) is not None:
             import warnings
             warnings.warn(
@@ -2141,7 +2165,6 @@ class ScreeningConfig:
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
-    minimax_energy_reference: str  # "midgap" | "vbm"
 
     def __post_init__(self):
         # REFUSE, naming what IS supported, instead of silently resolving
@@ -2623,7 +2646,6 @@ class LorraxConfig:
             target_error=self.screening.minimax_target_error,
             max_nodes=self.screening.minimax_max_nodes,
             regenerate_tables=self.screening.regenerate_minimax_tables,
-            energy_reference=self.screening.minimax_energy_reference,
         )
 
     @property
@@ -2774,7 +2796,6 @@ class LorraxConfig:
             minimax_target_error=float(_g("minimax_target_error")),
             minimax_max_nodes=int(_g("minimax_max_nodes")),
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
-            minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
         )
         ppm = PPMConfig(
             omega_p=float(_g("ppm_omega_p")),

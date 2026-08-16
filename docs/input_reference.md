@@ -83,7 +83,6 @@ page has to read it from.
 | `minimax_target_error` | `1e-06` | Target scalar error of the chi0 time/frequency quadrature. MPA applies it to the static, imaginary-axis, and damped-line sample evaluators; keep this tighter than the Sigma budgets because the pole fit can amplify sample noise. |
 | `minimax_max_nodes` | `64` | Node cap for interval minimax solves and per-panel Gauss-order cap for an MPA damped line. It is not a cap on the total nodes across all damped-line panels. |
 | `regenerate_minimax_tables` | false | Force re-solving the minimax tables instead of reusing cached ones. |
-| `minimax_energy_reference` | `"midgap"` | Energy reference for the minimax transition range (midgap default). |
 | `mpa_n_poles` | `8` | Number of MPA poles and therefore the number of points on each double-parallel sampling line (`2*mpa_n_poles` samples total). |
 | `mpa_material_class` | `"insulator"` | Sampling geometry: `insulator` puts the first near-line point at zero; `metal` puts it at `i*2e-5 Ry`. Metallic sample plans can be constructed, but the production χ/Σ evaluator still refuses until occupation-weighted interband/intraband terms land. |
 | `mpa_sampling_alpha` | `1` | Real-coordinate exponent for the nested partition, `omega_n = omega_m*s_n^alpha`; supported values are 1 and 2. |

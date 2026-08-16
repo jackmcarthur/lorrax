@@ -20,6 +20,13 @@ class MinimaxConfig:
     target_error: float = 1.0e-6
     max_nodes: int = 64
     regenerate_tables: bool = False
+    #: THE energy zero the band energies are shifted by before the Laplace
+    #: fit.  No deck key: the ``minimax_energy_reference`` one was deleted
+    #: in 0.1.0 because the shift is algebraically neutral for chi0/W (only
+    #: E_c - E_v enters), so no value of it could change a result.  The
+    #: field stays because ``resolve_minimax_energy_reference`` accepts a
+    #: float or a callable and a future consumer on a non-neutral integrand
+    #: would need it; "midgap" is its one shipped value.
     energy_reference: str | float | int | None = "midgap"
     crossing_max_nodes: int = 500
     crossing_eps_q: float = 1.0e-3
