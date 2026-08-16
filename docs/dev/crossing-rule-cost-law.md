@@ -155,3 +155,39 @@ that information demand is genuine):
   exceeds the monolithic rule at Na and Fe scale.  The winning cut is
   the coarse 3-way split above, whose bulks are logarithmic and whose
   single shell per (branch, cluster) is range-independent.
+
+## 6. What this does NOT fix: the fit-side sibling (design only)
+
+Fe F3's failure chain is a FIT pathology, upstream of everything here:
+the 209 eV transition span pushed the noncrossing minimax family to
+R = 1.5e13 (uncertified), the Loewner fit put poles at 1255 eV — six
+times beyond the sampling line's span — and 33.2% of residue mass sat
+above 16 eV (the census discriminator; healthy Si ≈ 1.5%, pathological
+≈ 49%), ending in an all-NaN σ_c behind rc = 0.  The quadrature
+decomposition makes the *evaluation* of whatever poles exist cheap at
+any depth; it does not make a bad pole fit good.
+
+The design that remains (the directive's candidate 4): the
+Loewner/MPA sample-line span should NOT be stretched to cover deep
+semicore transitions.  The deep-transition block sees W(ω′) far above
+the plasmon region, where the screening is essentially static/bare and
+smooth; it belongs in a separate few-pole (or COHSEX-static) channel
+fitted on its own narrow window, so the main fit's pole budget stays in
+the plasmon region and the census stays healthy.  The W-av head already
+shows the pattern (a dedicated low-order channel for a structurally
+different piece).  Sketch:
+
+1. Split the χ/W sampling plan by transition depth at the same
+   crossing-edge scale the Σ planner uses; fit the deep block with 1–2
+   poles (or take its static limit) on a sample line matched to its
+   span.
+2. Feed the Σ planner both pole sets; the deep set's poles are, by
+   construction, DEEP (a > crossing_edge) and route through the
+   existing b_slab/stripe log-cost family — no new window classes.
+3. Extend the census to certify per-channel: main-fit residue mass
+   above 16 eV must stay in the healthy band; the deep channel's poles
+   must sit inside its own fitted window.
+
+This touches `sampling.py`/`sample_plan.py`/`fit_driver.py` and the
+census, none of which this landing modifies.  Until it lands, Fe F3's
+NaN is expected to persist regardless of the ω-grid used.
