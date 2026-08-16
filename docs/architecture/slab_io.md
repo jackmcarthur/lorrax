@@ -227,9 +227,12 @@ clean** — that acceptance test exists today.
 ## The operation journal {#journal}
 
 *Spec: `reports/metal_mpa_plan_2026-08-15/SLAB_IO_ROOT_CAUSE_AUDIT.md` §C.
-Implementation `src/file_io/h5_journal.py`, landing as `<commit>` on
-`integ/metal-mpa-qsgw-2026-08-15`. The fingerprints in [Failure
-modes](#failures) below name the lines it emits.*
+Implementation `src/file_io/h5_journal.py`, LANDED as `18bb48ea` on
+`integ/metal-mpa-qsgw-2026-08-15`. Knob spellings and defaults are the
+[env registry](../dev/env_vars.md)'s; they are repeated here because a
+debugger reading this page at 3am should not have to open a second one.
+The fingerprints in [Failure modes](#failures) below name the lines it
+emits.*
 
 The journal is the **black box for a segfault**: one choke-pointed,
 line-buffered, per-rank log of every HDF5 operation, cheap enough to leave
