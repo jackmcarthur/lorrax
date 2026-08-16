@@ -651,6 +651,10 @@ def main(argv=None):
 	sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
 	sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
 	omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
+	# The energies THIS Σ was evaluated at (E_DFT one-shot, the map's input
+	# QP energies under SC).  Not degen-averaged below with the Σ channels:
+	# it is a spectrum, not a self-energy component.
+	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
 	head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
@@ -746,6 +750,7 @@ def main(argv=None):
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 		omega_rel_ev=omega_rel_ev,
+		e_eval_ev=e_eval_ev,
 		efermi_ev=efermi_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
@@ -761,6 +766,7 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
+			e_eval_ev=e_eval_ev,
 			print_fn=print0,
 		)
 		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix

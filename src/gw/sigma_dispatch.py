@@ -80,6 +80,13 @@ class SigmaResult:
                                 Z-factor central difference.
     sigma_c_at_dft_diag_ev    : (nk, nb)  diag(Σ_c) at E_DFT (eV).
     omega_dft_rel_ev          : (nk, nb)  E_DFT − E_F (eV).
+    e_eval_ev                 : (nk, nb)  the energies the QSGW ansatz
+                                EVALUATED this Σ at — ``e_qp_ev``, i.e.
+                                E_DFT for a one-shot call and the map's
+                                input (converged, under self-consistency)
+                                QP energies for an SC iteration.  eqp1's
+                                linearization is centred here; see
+                                ``eqp_bgw.assemble_eqp``.
     omega_grid_ev             : (nω,)     ω-grid in eV.
     omega_grid_ry             : (nω,)     ω-grid in Ry.
     head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal.
@@ -100,6 +107,7 @@ class SigmaResult:
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
+    e_eval_ev: np.ndarray | None = None
     omega_grid_ev: np.ndarray | None = None
     omega_grid_ry: np.ndarray | None = None
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
@@ -147,12 +155,16 @@ ROTATED_TO_DFT_FIELDS = (
 #: whose band indices must label the states whose energies E_i, E_j it
 #: is evaluated at, so the construction is only itself in that basis;
 #: it is also the (nω, nk, nb, nb) sharded tensor and the contents of
-#: sigma_mnk.h5.  The other two are already band DIAGONALS, on which a
-#: basis rotation does not act element-wise.
+#: sigma_mnk.h5.  The other three are already band DIAGONALS, on which a
+#: basis rotation does not act element-wise.  ``e_eval_ev`` belongs here
+#: for the strongest form of that reason: it is the list of energies
+#: E_i whose band index MUST be the one the cube's band index is, since
+#: the ansatz pairs them element-wise.
 SIGMA_BASIS_FIELDS = (
     "sigma_c_omega_kij_ry",
     "sigma_c_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
+    "e_eval_ev",
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
@@ -357,6 +369,15 @@ def finalize_dynamic_sigma(
     :class:`SigmaResult`.  The fixed-point solve and optional scissor remain
     in :func:`gw.qsgw_utils.solve_qp`, which consumes the retained omega cube;
     there is still one owner of that energy-update policy.
+
+    ``e_qp_ev`` — THE ENERGIES THIS SPECTRUM IS EVALUATED AT — is both the
+    QSGW build's evaluation point below and, carried out on the result as
+    ``e_eval_ev``, the point eqp1's linearization is centred at.  It is
+    E_DFT for a one-shot call (so the eqp writers are unchanged there,
+    bit-for-bit) and the map's input QP energies under self-consistency,
+    which at convergence is where the QP poles are.  The at-DFT
+    interpolation beside it stays at E_DFT: it is what eqp0 and the
+    ``sig_c(Edft)`` diagnostics mean.
     """
     import common.timing as timing
     from .dynamic_sigma import (
@@ -425,6 +446,13 @@ def finalize_dynamic_sigma(
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
+        # The energies THIS call's Σ spectrum was evaluated at, kept so the
+        # eqp1 writer can centre its linearization where the QP pole
+        # actually is.  Absolute eV (not ω-relative) on purpose: the
+        # consumer forms the relative pair with the one ω reference it also
+        # forms ``e_dft_rel_ev`` with, rather than round-tripping this
+        # through a second subtraction and addition.
+        e_eval_ev=np.asarray(e_qp_ev, dtype=np.float64),
         omega_grid_ev=config.omega_grid_ev,
         omega_grid_ry=config.omega_grid_ry,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,

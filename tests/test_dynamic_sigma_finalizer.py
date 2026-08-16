@@ -72,6 +72,9 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
         calls.append("qsgw")
         assert got_sigma is post_head and got_mesh is mesh
         np.testing.assert_array_equal(omega, [-1.0, 1.0])
+        # The QSGW ansatz is evaluated at e_qp_ev on the finalize's OWN
+        # reference — one subtraction, not a second opinion about the zero.
+        np.testing.assert_array_equal(energy, np.asarray([[2.0, 3.0]]) - 7.0)
         return qsgw_xc, {"n_clipped": 0, "frac_clipped": 0.0}
 
     def append(path, cube, **kwargs):
@@ -92,7 +95,7 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     )
     result = dispatch.finalize_dynamic_sigma(
         body, head,
-        sig_x=sig_x, sig_h=sig_h, e_qp_ev=np.zeros((1, 2)),
+        sig_x=sig_x, sig_h=sig_h, e_qp_ev=np.asarray([[2.0, 3.0]]),
         config=config, meta=object(), mesh_xy=mesh, sym=object(),
         wfn=SimpleNamespace(efermi=0.0), band_slices=object(),
         input_dir="/tmp", print_fn=lambda *_: None,
@@ -106,3 +109,7 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     np.testing.assert_array_equal(result.omega_dft_rel_ev, 6.0)
     assert result.efermi_dft_ev == 7.0
     assert result.omega_reference_provenance == "fixed-N mu"
+    # The energies this Σ was EVALUATED at are carried out on the result,
+    # absolute eV, because that is where eqp1 has to be linearized and the
+    # writer cannot re-derive them (``eqp_bgw.compute_eqp_diag``).
+    np.testing.assert_array_equal(result.e_eval_ev, [[2.0, 3.0]])

@@ -1,4 +1,5 @@
-"""Format-byte-identity check for the BGW eqp.dat writer.
+"""Format-byte-identity check for the BGW eqp.dat writer, and the
+question of WHERE eqp1 is linearized.
 
 The BerkeleyGW reference values come straight out of an unmodified
 ``Sigma`` run — they're loaded back into the writer to verify we emit
@@ -11,7 +12,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from gw.eqp_bgw import write_bgw_eqp
+from gw.eqp_bgw import (
+	assemble_eqp, compute_z_factor_from_omega_grid, write_bgw_eqp)
 
 
 # Single-k-point block from
@@ -110,3 +112,219 @@ def test_writer_adds_single_line_diagnostic_comments(tmp_path, reference_block):
 			str(out), kpts, e_dft, e_qp, band_offset=18,
 			comments=("not\none line",),
 		)
+
+
+# ---------------------------------------------------------------------------
+# WHERE eqp1 IS LINEARIZED — the Z-factor centre and the Σ that goes with it
+# ---------------------------------------------------------------------------
+#
+# THE DISCRIMINATING CASE IS A CURVED Σ.  For a linear Σ_c(ω) the
+# derivative is the same everywhere and no test can tell the two centres
+# apart; a quadratic has dΣ/dω = b + 2cE, so "at E_DFT" and "at E_qp" are
+# different numbers and a run that centres in the wrong place says so.
+# The ω grid is 0.25 eV like gw_jax's and every centre below is a grid
+# point, so the linear interpolation is exact AT the sample points and the
+# ±0.5 eV central difference of a quadratic is exact analytically — the
+# expected values here are closed form, not a second implementation.
+
+_A, _B, _C = 0.30, -0.20, 0.05          # Σ_c(ω) = a + bω + cω², eV
+_OMEGA = np.arange(-5.0, 5.0 + 1e-9, 0.25)
+
+
+def _sigma_quadratic(shape=(1, 1)):
+	"""Σ_c on the ω grid, shape ``(nω,) + shape``, complex like the real one."""
+	sig = _A + _B * _OMEGA + _C * _OMEGA ** 2
+	return np.broadcast_to(
+		sig[(slice(None),) + (None,) * len(shape)],
+		(_OMEGA.size,) + shape).astype(np.complex128)
+
+
+def _sigma_c(e_rel):
+	return _A + _B * e_rel + _C * e_rel ** 2
+
+
+def _dsigma_c(e_rel):
+	return _B + 2.0 * _C * e_rel
+
+
+def test_z_factor_is_the_derivative_at_the_centre_it_is_handed():
+	"""Z and Σ_c come back at the centre passed in, not at some fixed one."""
+	e_dft_rel = np.array([[0.0]])
+	e_qp_rel = np.array([[2.0]])          # a converged QP energy 2 eV away
+	sig = _sigma_quadratic()
+
+	s_dft, z_dft = compute_z_factor_from_omega_grid(
+		sigma_c_omega_diag_ev=sig, omega_rel_ev=_OMEGA,
+		e_dft_rel_ev=e_dft_rel)
+	s_qp, z_qp = compute_z_factor_from_omega_grid(
+		sigma_c_omega_diag_ev=sig, omega_rel_ev=_OMEGA,
+		e_dft_rel_ev=e_qp_rel)
+
+	# 1 - 1/Z IS the central difference, so this checks the derivative
+	# itself against the analytic b + 2cE at each centre.
+	np.testing.assert_allclose(1.0 - 1.0 / z_dft, _dsigma_c(0.0), atol=1e-12)
+	np.testing.assert_allclose(1.0 - 1.0 / z_qp, _dsigma_c(2.0), atol=1e-12)
+	np.testing.assert_allclose(s_dft.real, _sigma_c(0.0), atol=1e-12)
+	np.testing.assert_allclose(s_qp.real, _sigma_c(2.0), atol=1e-12)
+	# The curvature is the whole point: the two Z's must actually differ,
+	# or this test would pass on code that ignores its centre argument.
+	assert abs(float(z_qp.item()) - float(z_dft.item())) > 0.15, (z_dft, z_qp)
+
+
+def _assemble_one_state(*, e_dft_ev, h0_ev, e_eval_ev=None, dE_ev=0.5):
+	"""``assemble_eqp`` on one (k, n) with the quadratic Σ_c above.
+
+	ω reference = 0, so absolute and ω-relative energies coincide and the
+	test never has to restate the one-reference rule to exercise it.
+	Σ_x = 0 and V_H = 0, so H₀ is ``h0_ev`` exactly and Δ(E) is
+	``h0 + Σ_c(E) − E``.  The mean-field gate is off: these are toy
+	numbers chosen for the Newton algebra, not a physical H₀, and the
+	gate has its own tests.
+	"""
+	kw = {}
+	if e_eval_ev is not None:
+		kw = dict(e_eval_ev=np.asarray(e_eval_ev, dtype=np.float64),
+		          e_eval_rel_ev=np.asarray(e_eval_ev, dtype=np.float64))
+	return assemble_eqp(
+		kpoints_irr_frac=np.zeros((1, 3)),
+		band_offset=0,
+		e_dft_ev=np.asarray(e_dft_ev, dtype=np.float64),
+		kin_ion_diag_ev=np.asarray(h0_ev, dtype=np.float64),
+		hartree_diag_ev=np.zeros((1, 1)),
+		sigma_x_diag_ev=np.zeros((1, 1)),
+		sigma_c_omega_diag_ev=_sigma_quadratic(),
+		omega_rel_ev=_OMEGA,
+		e_dft_rel_ev=np.asarray(e_dft_ev, dtype=np.float64),
+		dE_ev=dE_ev,
+		mean_field_gate=False,
+		print_fn=lambda *_a, **_k: None,
+		**kw,
+	)
+
+
+def test_eqp1_centred_at_the_evaluation_energies_returns_the_fixed_point():
+	"""At a converged Σ the linearized answer IS the converged energy.
+
+	Construct the exact fixed point of ``E = H₀ + ReΣ_c(E)`` at
+	E_qp = 2 eV — the self-consistent case, where Σ was built from a
+	spectrum that already solves its own QP equation — and put E_DFT
+	2 eV below it.  Centred at E_qp the Newton residual is identically
+	zero, so eqp1 = E_qp for ANY Z: that is the property that makes the
+	eqp1 column of a converged QSGW run mean something.  Centred at
+	E_DFT, as the writer did unconditionally, it is not.
+	"""
+	e_qp = 2.0
+	h0 = e_qp - _sigma_c(e_qp)               # exact fixed point at E_qp
+	e_dft = 0.0
+
+	fixed = _assemble_one_state(
+		e_dft_ev=[[e_dft]], h0_ev=[[h0]], e_eval_ev=[[e_qp]])
+	np.testing.assert_allclose(fixed.eqp1_ev, [[e_qp]], atol=1e-12)
+
+	# eqp0 is untouched by the centring: still the zeroth-order Newton
+	# step from E_DFT, which pairs with the file's E_DFT column.
+	np.testing.assert_allclose(
+		fixed.eqp0_ev, [[h0 + _sigma_c(e_dft)]], atol=1e-12)
+
+	# And the old, at-DFT linearization is measurably NOT the fixed
+	# point — the defect this centring fixes, in one number.
+	at_dft = _assemble_one_state(e_dft_ev=[[e_dft]], h0_ev=[[h0]])
+	z_dft = 1.0 / (1.0 - _dsigma_c(e_dft))
+	np.testing.assert_allclose(
+		at_dft.eqp1_ev,
+		[[e_dft + z_dft * (h0 + _sigma_c(e_dft) - e_dft)]], atol=1e-12)
+	assert abs(float(at_dft.eqp1_ev.item()) - e_qp) > 0.05, (
+		"the at-DFT and at-E_qp linearizations must differ here, or this "
+		"test cannot see the defect")
+
+
+def test_eqp1_uses_the_z_and_the_sigma_of_its_own_centre():
+	"""Away from a fixed point, eqp1 = E_ref + Z(E_ref)·Δ(E_ref) exactly."""
+	e_dft, e_qp, h0 = 0.0, 2.0, 1.5
+	got = _assemble_one_state(
+		e_dft_ev=[[e_dft]], h0_ev=[[h0]], e_eval_ev=[[e_qp]])
+	z_qp = 1.0 / (1.0 - _dsigma_c(e_qp))
+	want = e_qp + z_qp * (h0 + _sigma_c(e_qp) - e_qp)
+	np.testing.assert_allclose(got.eqp1_ev, [[want]], atol=1e-12)
+	np.testing.assert_allclose(got.z_factor, [[z_qp]], atol=1e-12)
+
+
+def test_one_shot_evaluation_energies_are_byte_identical_to_the_old_path(
+		tmp_path):
+	"""E_eval == E_DFT (every one-shot run) must not move a single bit.
+
+	Not ``allclose``: the assertion is bitwise on the arrays and
+	byte-for-byte on the two files the assembly writes, because "the
+	insulating one-shot path is unchanged" is a claim about the emitted
+	artifacts and nothing weaker would catch a re-associated sum.
+	"""
+	rng = np.random.default_rng(20260816)
+	nk, nb = 3, 5
+	e_dft = rng.uniform(-3.0, 3.0, size=(nk, nb))
+	h0 = rng.uniform(-4.0, 4.0, size=(nk, nb))
+	# A Σ_c that varies per (k, n) so Z is not one number repeated.
+	sig = (_sigma_quadratic((nk, nb))
+	       * (1.0 + 0.1 * rng.uniform(size=(nk, nb)))[None, :, :])
+
+	def build(with_eval):
+		kw = (dict(e_eval_ev=e_dft.copy(), e_eval_rel_ev=e_dft.copy())
+		      if with_eval else {})
+		return assemble_eqp(
+			kpoints_irr_frac=np.zeros((nk, 3)),
+			band_offset=0,
+			e_dft_ev=e_dft, kin_ion_diag_ev=h0,
+			hartree_diag_ev=np.zeros((nk, nb)),
+			sigma_x_diag_ev=rng.uniform(-1.0, 1.0, size=(nk, nb)) * 0.0 + 0.7,
+			sigma_c_omega_diag_ev=sig, omega_rel_ev=_OMEGA,
+			e_dft_rel_ev=e_dft,
+			mean_field_gate=False,
+			print_fn=lambda *_a, **_k: None,
+			**kw)
+
+	old, new = build(False), build(True)
+	np.testing.assert_array_equal(old.eqp0_ev, new.eqp0_ev)
+	np.testing.assert_array_equal(old.eqp1_ev, new.eqp1_ev)
+	assert old.eqp1_ev.tobytes() == new.eqp1_ev.tobytes()
+	# The assembly must also RECORD that it did not move the centre, so a
+	# reader of the object cannot conclude a shifted linearization from a
+	# run that had none.
+	assert new.e_eval_ev is None
+
+	def body(assembly, tag):
+		p0 = tmp_path / f"eqp0_{tag}.dat"
+		p1 = tmp_path / f"eqp1_{tag}.dat"
+		assembly.write(eqp0_path=str(p0), eqp1_path=str(p1))
+		# Drop the provenance line: it carries a timestamp.
+		return tuple(p.read_text().partition("\n")[2] for p in (p0, p1))
+
+	assert body(old, "old") == body(new, "new")
+
+
+def test_assemble_eqp_refuses_half_an_evaluation_point():
+	"""The absolute and ω-relative halves are one argument in two forms."""
+	with pytest.raises(ValueError, match="halves of ONE linearization"):
+		assemble_eqp(
+			kpoints_irr_frac=np.zeros((1, 3)), band_offset=0,
+			e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.zeros((1, 1)),
+			hartree_diag_ev=np.zeros((1, 1)),
+			sigma_x_diag_ev=np.zeros((1, 1)),
+			sigma_c_omega_diag_ev=_sigma_quadratic(), omega_rel_ev=_OMEGA,
+			e_dft_rel_ev=np.zeros((1, 1)),
+			e_eval_ev=np.zeros((1, 1)),          # ... and no e_eval_rel_ev
+			mean_field_gate=False,
+			print_fn=lambda *_a, **_k: None)
+
+
+def test_static_modes_ignore_an_evaluation_point_and_keep_eqp1_eq_eqp0():
+	"""No ω grid ⇒ no derivative to centre; eqp1 == eqp0, as in BGW."""
+	got = assemble_eqp(
+		kpoints_irr_frac=np.zeros((1, 3)), band_offset=0,
+		e_dft_ev=np.array([[0.0]]), kin_ion_diag_ev=np.array([[1.5]]),
+		hartree_diag_ev=np.zeros((1, 1)),
+		sigma_x_diag_ev=np.zeros((1, 1)),
+		sigma_c_at_dft_diag_ev=np.array([[0.3]]),
+		e_eval_ev=np.array([[2.0]]), e_eval_rel_ev=np.array([[2.0]]),
+		mean_field_gate=False,
+		print_fn=lambda *_a, **_k: None)
+	np.testing.assert_array_equal(got.eqp0_ev, got.eqp1_ev)
+	assert got.z_factor is None and got.e_eval_ev is None
