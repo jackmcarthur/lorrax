@@ -835,8 +835,9 @@ already exists) and one *fewer* solve per call. Insulating decks
 
 ### 7.3 The criterion is `max|dE|` over the non-scissored bands
 
-`sc_iteration.protected_band_convergence` is the stop rule, and it is
-deliberately the crudest defensible one:
+`sc_iteration.protected_band_convergence` is the stop rule, and it tests
+the quantity a reader of the run actually cares about — band energies —
+rather than a norm that bounds them:
 
 $$
 \max_{(n,k)\ \in\ \mathcal{P}}
