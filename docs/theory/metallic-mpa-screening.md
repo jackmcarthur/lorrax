@@ -4,7 +4,9 @@ This chapter is the authoritative description of metallic (finite-occupation)
 screening in LORRAX: the occupation-weighted response, the metal frequency
 plan and the measured reasoning behind it, the two `q->0` heads and their
 order of limits, the finite-`q` body, the occupation-weighted self-energy,
-and the per-iteration QSGW occupation state. It subsumes the former
+the per-iteration QSGW occupation state, and the metallic self-consistency
+loop — what one map call rebuilds, the stop rule, and the measured
+convergence. It subsumes the former
 `finite-occupation-screening.md`, which is now a pointer here; the in-code
 references to that filename remain valid through it.
 
@@ -715,7 +717,320 @@ is claim 196 and its eqp half awaits a rerun; velocities everywhere on this
 route are DFT p-matrix elements, with the covariant-derivative upgrade
 parked on claim 183.
 
-## 7. Claims ledger for this page
+## 7. Self-consistency: the metallic QSGW map and its convergence
+
+Sections 1–6 build one evaluation of the screening and the self-energy.
+This section is about the *map* they compose into, and about the only
+metallic self-consistency result that exists: sodium converges, under
+damping, and diverges without it.
+
+### 7.1 What one map call rebuilds
+
+The QSGW map is
+
+$$
+F(H)=H_{\mathrm{KIH}}+\Delta H\!\left[\,H,\ \mathrm{occ}(H)\,\right],
+$$
+
+with `H_KIH` the immutable kinetic-plus-ion operator: `sc_iteration`
+assembles `H_out = inputs.kin_ion_dft + delta_h_dft`, so the *input* `H`
+never enters additively (claim 197(k)). On a metal, one call rebuilds
+everything downstream of the spectrum:
+
+1. **Occupations**, entry-solved from the spectrum of this call's `H`
+   (6.1).
+2. **Screening.** The MPA sample plan is re-evaluated and refit — chi
+   samples, the Dyson solve, the bounded column Loewner fit — because the
+   orbitals and transition energies moved; the per-iteration stores are
+   written fresh under `sc_%04d` names and only one complete pair is kept
+   on disk (`retain_iteration_artifacts`). Nothing model-shaped lives in
+   `SCState`.
+3. **The `q->0` head**, rebuilt by `build_iteration_head_response` on this
+   call's velocities (rotated into the current QP basis by the same `U`)
+   and this call's occupations, then mini-BZ averaged and refit with the
+   scalar Loewner policy on the body's identical `z` grid (4.2). The
+   converged sodium run took the `sc_head_update = dft_velocity` route
+   (6.4), so those velocities are DFT `p`-matrix elements.
+4. **`Sigma`**, with `sigma_efermi_ry` from the state's `mu_ry` (6.1), the
+   band partition, the scissor of 7.5, and the Hermitian QSGW operator
+   build.
+
+**The one-omega-reference rule.** `Sigma_c(omega)`'s grid is *relative*, and
+on a metal it is measured from the fixed-N `mu`; on the sodium deck that is
+`2.7934 eV` away from the loader's midgap/VBM convention, so any consumer
+sampling it against the wrong reference reads the cube in the wrong place.
+Four sites had to agree, and each was fixed where it lived:
+
+| site | rule | commit |
+|---|---|---|
+| grid build (`sigma_dispatch`) | one `mu` per iteration | (incumbent) |
+| finalize interpolation (`dynamic_sigma.finalize_dynamic_sigma`, `eval_sigma_c_at_dft_energies`) | `efermi_ry` argument; `None` = the incumbent `wfn.efermi`, PPM bit-identical | `59d7ea20` |
+| band partition window (`run_sc_driver`) | metallic decks anchor `[omega_min, omega_max]` at the fixed-N MP1 `mu` of the full-BZ table with uniform weights | `90b8275d`, `6fe3fcb8` |
+| the from-disk assembler (`eqp_bgw.make_eqp_bgw`) | `sigma_mnk.h5` stamps `omega_reference_ev` **and its provenance** on `omega_ev` itself (`write_sigma_omega_h5`, read back by `read_omega_reference`); an unstamped *metallic* file is refused by name, an unstamped insulating one still falls back to midgap bit-identically | `cd5b0aa4` |
+
+The two measured symptoms of getting this wrong are worth keeping, because
+they look like physics: near-`E_F` QP corrections of `+2.0..+2.9 eV`
+(mean `+2.42`, i.e. the 2.79 eV reference error) from the finalizer, and
+`0/48` bands in range from the partition — which scissored every band with
+a fit that had no samples and returned `diag(0)`, printing a 24.677 eV
+"inter-iteration RMS" that is just `RMS|E_DFT|` against zeros (commits
+`59d7ea20`, `90b8275d`; the zero-diagonal mechanism is 7.5). Claim 200's
+converged run stamps `1.507789 eV (fixed-N mu)`, not the 4.44 eV midgap of
+the same spectrum's VBM/CBM.
+
+### 7.2 The entry-solve rule, and why it is what makes acceleration definable
+
+Before `178f62b8`, the same MP1 solve ran at the *end* of a call and its
+result was carried into the *next* one — a one-generation lag (the
+metallic-invariant audit's finding A5). Two consequences, one numerical
+and one structural:
+
+- **Numerical.** Chi, head and `Sigma` at call `n+1` paired current
+  energies with the occupations of the previous spectrum. Measured on the
+  same undamped linear deck, the first three map calls give
+  `0.871369 / 0.514006 / 0.315953 eV` under the entry solve against
+  `0.871369 / 0.549794 / 0.404293 eV` under the end solve (claim 198) —
+  identical at call 1, where both rules see the same starting state, and
+  22% better by call 3, with a *stable* contraction ratio (0.590, 0.615)
+  where the end-solve arm's was already climbing (0.631, 0.735). The
+  entry-solve numbers are from the arm at
+  `runs/Na/02_soc48b_qsgw_mpa/05_rcrop_ab/linear/ab_linear_0815_161250.log`
+  (jobid 57038615); **their claim row has not landed** — see 7.6.
+- **Structural, and this is the load-bearing one.** With an end-solve
+  carry, `F` depends on the *trajectory* that produced `H`, not on `H`:
+  it is exact only along the `sc_mixing = 1` linear path, where the
+  accepted iterate is the previous call's output. Solving at entry makes
+  the occupations a function of the iterate, `occ = occ(H)`, so `F(H)` is
+  a self-map of `H` alone — the contract `_run_rcrop`'s own header always
+  stated (*"`gw_iteration_map` reads `state.iteration` and
+  `state.H_qp_dft` and nothing else"*). Every evaluation, accepted or
+  trial, gets occupations consistent with its own `H` by construction,
+  which is exactly the property an acceleration trajectory needs to be
+  well-defined.
+
+Fixed points are unchanged: at `H* = F(H*)` the two rules see the same
+spectrum. The cost is zero extra diagonalizations (the entry `eigh`
+already exists) and one *fewer* solve per call. Insulating decks
+(`occ_broadening = 0`) take the `None` branch and are bit-identical.
+
+### 7.3 The criterion is `max|dE|` over the non-scissored bands
+
+`sc_iteration.protected_band_convergence` is the stop rule, and it is
+deliberately the crudest defensible one:
+
+$$
+\max_{(n,k)\ \in\ \mathcal{P}}
+\left|E^{\mathrm{out}}_{nk}-E^{\mathrm{in}}_{nk}\right| < \texttt{sc\_tol\_ev},
+\qquad
+\mathcal{P}=\{\texttt{protected\_mask}\ \cup\ \texttt{in\_range\_mask}\},
+$$
+
+evaluated on **one map call's output against that same call's input**, on
+non-trial calls only. Four choices in it, each with a reason:
+
+- **`L-infinity`, not RMS.** "Every band moved less than the cutoff" is a
+  statement about the worst band. The RMS figures are printed as
+  diagnostics and are never compared to the cutoff; the run log says which
+  number is the criterion, because the old prose calling an operator RMS
+  and a band RMS "approximately equal" is what hid the defect below for as
+  long as it did.
+- **Output-vs-input, not iterate-vs-iterate.** The two coincide only at
+  `sc_mixing = 1`; at any damping the accepted iterate is a blend and its
+  differences are *soft* — a loop can then "converge" by damping rather
+  than by solving (6.2 owns this argument; `_run_linear_mixing` and the
+  rCROP path apply the identical predicate to the unmixed map output).
+- **The union of the two masks.** `apply_band_partition` substitutes a
+  scissor diagonal exactly where `in_range_mask` is false, so an in-range
+  non-protected band keeps its own `Sigma`-derived diagonal and is a
+  genuine degree of freedom. Scissored bands are excluded because their
+  energies are `alpha*E_DFT + beta` with the coefficients refit each call
+  *from* the in-range corrections — including them re-counts in-range drift
+  through the fit. Zero non-scissored bands, or a mask length that
+  disagrees with the active window, **refuse** rather than answer.
+- **No second stopping rule.** `rcrop_nojit` is called with `tol = 0.0`:
+  the accelerator accelerates and the caller decides, on the exact
+  eigenvalue test that is free because the map already diagonalizes `H`.
+
+**What it replaced, and the autopsy that closes (commit `4a6ef831`).** The
+previous rule stopped on an `L2` norm of the `H` residual with the
+per-band tolerance converted by `sqrt(n_elem)`. For Hermitian `H`, Weyl
+gives `|dlambda_i| <= ||dH||_2 <= ||dH||_F = ||f||_2`, so the only sound
+conversion is `tol_resid = tol_ry` with no factor at all. On Si `4x4x4`
+SYM/SOC at `P=4` the carry is `(64, 24, 24)`, `sqrt(n_elem) = 192`; a 2 meV
+request became a `2.8223e-02 Ry` threshold, rCROP returned converged at
+`||f||_2 = 2.3618e-02 Ry`, and `max|dE|` over the non-scissored bands at
+that very call was `0.120477 eV` — **60.2x** the cutoff. With the measured
+Weyl slack `||dH||_F / max|dlambda| = 2.67`, the predicted looseness is
+`192 / 2.67 = 72x` against `60.2x` observed; nothing is unaccounted for.
+The same deck under plain linear mixing landed within `0.313 meV` of the
+rCROP answer, so this was a stopping-rule defect and not a physics one.
+
+**The floor is real and it is close.** On the sodium deck the criterion is
+an `L-infinity` over **two** bands — the Fermi-crossing Kramers pair, the
+only non-scissored bands the frozen window leaves (7.5) — and the 1 meV
+cutoff used for the converged run sits *at* the banked `omega`-grid
+half-step floor of `1.42 meV` on band energies (claims 198, 200). A
+tighter cutoff on this deck would be measuring the grid, not the map.
+The companion analysis script defaults to the same set, parsed from the
+snapshot's own `active_scissored_bands_1based` comment rather than from a
+band window written down somewhere else (claim 198, audit finding A3).
+
+### 7.4 The measured characterization: damping is the whole difference
+
+Same deck, same tree, same budget, one key changed (claims 198 and 200,
+jobid 57038615, tip `81c99c95`; `P=4` on one node).
+
+| arm | `max\|dE\|` per map call (eV) | verdict |
+|---|---|---|
+| undamped, `sc_mixing = 1.0` | 0.871369 0.549794 0.404293 0.290045 **\|** 0.344554 0.469577 0.788125 1.356513 | contracts four calls, then **diverges** |
+| damped, `sc_mixing = 0.5` | 0.871369 0.164167 0.043921 0.014123 0.005356 0.002062 **0.000833** | **CONVERGED** in 7 calls |
+
+The undamped arm turns and grows at ratios `1.19 / 1.36 / 1.68 / 1.72`,
+ending *above* where it started; at the turn `RMS_all(48)` jumps 5x
+(0.229 → 1.075), the argmax relocates from `k=292` to `k=355`, and `mu`
+oscillates with growing amplitude (`|dmu|` 4.2e-2 → 1.0e-1 eV). That
+trajectory reproduces **bit-identically on all eight points** at commit
+`bf57701b`, i.e. before that session's HDF5-lifecycle work, which is what
+licenses calling the divergence physics rather than I/O (claim 198).
+
+The damped arm contracts geometrically with ratios
+`0.188 / 0.268 / 0.322 / 0.379 / 0.385` — `rho` rising toward ~0.39 rather
+than falling, the signature of a linear rate, not of superlinear
+convergence — and stops **on the criterion at 7 calls of a cap of 8**, not
+on the cap (claim 200). `mu` converges with it: `1.51693 → 1.51114 →
+1.50877 → 1.50779 eV` with `|dmu|` falling
+`1.41e-2 → 5.80e-3 → 2.37e-3 → 9.79e-4 eV`, against the undamped arm's
+*growing* `|dmu|` — the sloshing is damped, not masked. The converged
+protected pair (claim 200): `eqp0.dat` bands 9/10 span `+1.1332` to
+`+6.9125 eV` with mean QP correction `+1.8831 eV`; `eqp1.dat` `+1.0072` to
+`+6.6780 eV`, mean `+1.1701 eV`; 1392 rows each with **zero** zero-valued
+rows (claim 196 §3's all-zero trap is absent on the multi-iteration path),
+and bands 9 and 10 agree to `~5e-5 eV` — the Kramers degeneracy this
+`nspinor = 2` deck should show, an unrequested internal check that passes.
+
+What this does **not** say: that the amplifying mechanism is identified.
+The audit's A5 (occupation lag) met its own deferral condition verbatim,
+but A4 — band-index pairing across iterates under the `eigvalsh` sort, of
+which the `k=292 -> 355` argmax relocation is a candidate symptom —
+remains unseparated from it (claim 200). Damping fixing the amplitude is
+not a diagnosis, and these two arms ran under the *end*-solve rule that
+7.2 replaced; the entry-solve arms are 7.6.
+
+### 7.5 Two anchors that decide which bands are even being converged
+
+**The scissor's no-information law (commit `bf57701b`).** The
+out-of-range scissor fits `E_QP = alpha*E_DFT + beta` per class by weighted
+least squares. An empty class must return the **identity**
+(`alpha = 1, beta = 0`, scissored bands keep `E_DFT`) and a single sample a
+**rigid shift** (`alpha = 1`, `beta` the one `dE`); the previous
+`(0, 0)` return extrapolated every scissored band to `E_QP = 0` exactly.
+A metal is where this fires, and sodium is the worst case of it: the only
+protected bands *cross* `E_F`, so neither the valence nor the conduction
+class had clean samples, all 46 scissored diagonals became `0.0`,
+`eigvalsh`'s ascending sort interleaved 46 zeros with the two real
+eigenvalues, and every downstream observable inherited the wreckage — the
+migrating populated-band snapshots, a `max|dE|` that was the VBM to six
+decimals (a difference against a zero cell), the `mu` walk to `-0.20 eV`
+(MP1 solved on a three-quarters-zero table), and the iteration-2 MPA
+conditioning trip (chi on that spectrum). The law is not metal-specific;
+the crossing protected set is what makes a metal reach it.
+
+**The frozen window (claim 197(k), BAND_SHIFT_ANALYSIS §7).** The
+`Sigma` `omega` window is anchored on `mu`
+(`omega_min_ev = config value + efermi_ev`) and the `in_range`/protected
+masks are computed **once**, in `run_sc_driver`, from the **DFT** spectrum
+— on a metal from the fixed-N MP1 `mu` of that spectrum (7.1) — and then
+frozen for the whole SC run. They do not re-anchor as the QP spectrum
+drifts. `protected_band_convergence` is written against an
+*iteration-local* `BandPartition` by contract, but today's driver hands it
+the same frozen pair every call, so the criterion inherits the freeze:
+the set of bands being converged is the set the **DFT** spectrum put in
+range.
+
+This is a window sensitivity, not a gauge freedom, and the distinction is
+argued from the source in claim 197(k): a uniform shift `H -> H + cI` is a
+**true null direction** of `F` (`dF/dc = 0` exactly), because `H_KIH` pins
+the absolute level and every channel by which `H` reaches `Sigma` is `mu`-
+or difference-referenced — the fixed-N solve (`mu -> mu + c`, `f_kn`
+unchanged), chi and `W` through energy differences, the `Sigma_c` argument
+and its poles co-shifting, and the scissor's `beta -> beta + c` at fixed
+`alpha`. The numerical probe of that statement was descoped from claim 197
+and has not been run, so it is analytic. What the freeze *does* expose is
+a real drift: on the Si ladder of claim 197 the QP spectrum moves over half
+an eV on a window of default half-width 5 eV, and the mean QP correction on
+sodium's converged protected pair is `+1.88 eV` (7.4). A deck whose QP
+spectrum carries a band across the frozen window edge is the untested case
+(audit A4).
+
+### 7.6 rCROP on metals: refused, then legalized, and not yet measured
+
+**Why it was refused, and it was a state-consistency argument, not a
+tuning preference.** Under the end-solve rule the occupation state was a
+*sequential* object: exact only along the `sc_mixing = 1` linear
+trajectory, where the accepted iterate is the previous call's output.
+rCROP mixes only the Hamiltonian; it cannot preserve that state, and its
+trial iterates would be evaluated with occupations belonging to some other
+`H`. `gw_config` therefore refused `sc_accelerator != linear` whenever
+`occ_broadening > 0`, and claim 198 records the refusal as honoured rather
+than tuned past — with the honest note that rCROP's soundness evidence at
+that point was the **insulating** Si lineage.
+
+**What the entry solve changes.** The refusal is deleted (`178f62b8`), and
+a metallic rCROP deck parses, because the reason for it is gone: 7.2's
+self-map property makes trial and accepted evaluations equally consistent.
+Separately, `4a6ef831` removed rCROP's own early-stop defect (7.3), so a
+metallic rCROP arm now stops on the same `L-infinity` criterion as the
+linear arm rather than on an `L2` proxy.
+
+**Status: measured runs exist, claims do not.** A 3-iteration
+linear-vs-rCROP A/B and an 8-iteration rCROP horizon run were launched on
+jobid 57038615 into `runs/Na/02_soc48b_qsgw_mpa/05_rcrop_ab/`
+(`RUNS_INFLIGHT.md` rows owned by `claude-rcrop-metals`). **As of
+2026-08-15 the sandbox ledger ends at claim 200 and carries no row for
+them**, so this chapter quotes no rCROP-on-metal trajectory; the one
+entry-solve number it does quote (7.2) is cited to that arm's log, marked
+as claim-pending, and must be replaced by its claim row when one lands.
+
+### 7.7 What metallic self-consistency does not yet establish
+
+Open, with the reason each is still open:
+
+- **No BerkeleyGW comparison of the converged spectrum.** Claims 198/200
+  are self-consistency of the LORRAX loop against its own criterion. The
+  accuracy question — including the `O(10%)`-of-head-channel cap that 4.4
+  puts on absolute QP energies at this mesh — is untouched by them.
+- **Multi-node is broken, and pre-existing.** At 16 ranks on 4 nodes,
+  12 of 16 die at `fit_driver.py:457` with *"file is already open for
+  write"*, and an A/B at `bf57701b` fails identically (claim 198). Every
+  number in 7.4 is 4 ranks on one node.
+- **A4 vs A5 unseparated** (7.4).
+- **The A1 hazard is reduced, not eliminated.** Two core libhdf5
+  instances are mapped in one process (cross-major), and the per-file churn
+  was **measured** at 1027 cross-library alternations on one file in one
+  iteration against the audit's ~25 estimate (claim 198). The landed
+  mitigation is a per-process one-owner registry (`file_io/hdf5_owner.py`,
+  `LORRAX_HDF5_ONE_OWNER`), a single h5py door in `mpa_store`, and one
+  `SlabIO` held across an iteration's pole batches; the sibling-file split
+  that would remove the class is specified but not scheduled. Two attempts
+  at the damped arm produced one intermittent garbage-offset head-fit read
+  (registered in the sandbox `KNOWN_LORRAX_ISSUES`). The stream-ordering
+  fix for the raced control-operand reads (`ef98d47f`, `15eef55f`) and its
+  acceptance run (`07_damped_streamfix/`) are in flight with **no claim as
+  of this writing**.
+- **The static-wing Schur fold is unblocked but unmeasured.** 4.1's
+  `2.827e-7` fold correction is dynamic-wing tool scope; a completed
+  metallic QSGW iteration now exists (claim 200), so the static-wing
+  measurement can be made — it has not been.
+- **R4's `eqp` half is still owed.** Claim 196 covers the fit half only
+  and explicitly invalidates its own `eqp`-derived numbers (they predate
+  the omega-reference fix of 7.1); the rerun on the fixed tip has not
+  landed.
+- **The velocity route is still `dft_velocity`.** The parallel-transport
+  gate refuses on this artifact for reasons upstream of the frame
+  (claims 183, 195; 6.4), so the converged run's head velocities are DFT
+  `p`-matrix elements.
+
+## 8. Claims ledger for this page
 
 | statement in this page | evidence |
 |---|---|
@@ -726,9 +1041,19 @@ parked on claim 183.
 | `kappa_TF^2 = 0.7086 bohr^-2`, +12.8% vs BGW, fold 2.8e-7 | claim 181 |
 | five-estimator `N(E_F)` spread; tetrahedron anchor; `O(10%)` absolute-energy cap | claim 182 |
 | velocity-gate failure blocking R4–R6; gate not lifted | claim 183, commit `a5b1002b` |
+| transported-frame re-gate `3.169 -> 1.796`, still refusing | claim 195, commit `1bae7d73` |
+| fit conditioning at the shifted origin; no `n_p` census pathology on Na | claim 196 |
+| the 2.7934 eV omega-reference error and its four sites | commits `59d7ea20`, `90b8275d`, `6fe3fcb8`, `cd5b0aa4` |
+| scissor identity law; the all-zero-diagonal wreckage it fixed | commit `bf57701b` |
+| `max\|dE\|` criterion; the `sqrt(n_elem)` autopsy (60.2x vs 72x predicted) | commit `4a6ef831` |
+| entry-solved occupations; the metallic rCROP refusal deleted | commit `178f62b8` |
+| entry-solve vs end-solve first three calls, 0.315953 vs 0.404293 eV | `05_rcrop_ab/linear/ab_linear_0815_161250.log`, jobid 57038615 — **claim pending** |
+| undamped divergence trajectory; bit-identical pre-change A/B; multi-node break; 1027 alternations | claim 198 |
+| damped convergence 0.833 meV in 7 calls; `mu` and `\|dmu\|`; converged QP pair; 1.42 meV grid floor | claim 200 |
+| uniform shift a null direction of `F`; the frozen window and mask caveat | claim 197(k) |
 
 Anything in this page not in that table is either code structure (verify by
-symbol — every named symbol exists at `a5b1002b`) or published literature
+symbol — every named symbol exists at `941db3a7`) or published literature
 (references below).
 
 ## References
