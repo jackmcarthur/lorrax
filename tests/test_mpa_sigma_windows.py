@@ -337,3 +337,157 @@ def test_nonpositive_eta_refuses():
             assert "eta must be finite and positive" in str(exc)
         else:
             raise AssertionError(f"invalid eta {eta!r} was accepted")
+
+
+# ---------------------------------------------------------------------------
+#  Clustered decomposition (docs/dev/crossing-rule-cost-law.md)
+# ---------------------------------------------------------------------------
+
+def _oracle_total(plan, B, Omega, n_omega, shape):
+    """Sum EVERY plan window through the production scalar algebra.
+
+    The same executor arithmetic as the incumbent oracles above, but
+    accumulated per global omega index across all windows, so it fails on
+    any orientation, prefactor, omega-slicing, reference-anchor, or
+    coverage mistake in a decomposed plan — the whole class of error the
+    measured -8x sliver disagreement came from.
+    """
+    got = np.zeros((n_omega,) + shape, dtype=np.complex128)
+    for row in plan:
+        window = row.window
+        build_all = jax.jit(jax.vmap(
+            lambda t: build_shared_w_tau(
+                B, Omega, jnp.asarray(row.pole_indices),
+                jnp.asarray(row.bounds), jnp.asarray(row.phase_real),
+                window.E_ref_B, t)))
+        W_t = np.asarray(build_all(window.nodes.t))
+        t = np.asarray(window.nodes.t)
+        alpha = np.asarray(window.nodes.alpha)
+        E_row = np.asarray(row.E_A)[0]
+        mask = np.asarray(window.mask_A)[0]
+        weight = (np.ones(E_row.shape)
+                  if row.band_weight is None
+                  else np.asarray(row.band_weight)[0])
+        G_t = np.sum(
+            weight[mask, None] * np.exp(
+                -1j * (E_row[mask, None] - window.E_ref_A) * t[None, :]),
+            axis=0)
+        for w_abs, w_idx in zip(np.asarray(row.omega_abs),
+                                np.asarray(row.omega_idx)):
+            coeff = (window.prefactor * alpha * np.exp(
+                -1j * (window.E_ref_A + window.E_ref_B
+                       - window.omega_sign * float(w_abs)) * t))
+            got[int(w_idx)] += np.sum(
+                (coeff * G_t)[:, None, None, None] * W_t, axis=0)
+    return got
+
+
+def test_gapped_omega_grid_decomposes_the_core_and_matches_the_exact_sum():
+    """Two ω clusters: the core splits into shell + slabs, same physics.
+
+    Every band lies in a different cell for the two clusters (pos slab,
+    shell, neg slab), so the sum over the five windows reproduces the
+    exact denominator sum only if every orientation, conjugate placement,
+    reference anchor, and ω slice is right.
+    """
+    energies = np.asarray([0.1, 1.2, 3.0, 3.6])
+    omega = np.asarray([0.45, 3.45])
+    E_A = jnp.asarray(energies[None, :])
+    branch = _SigmaBranch(
+        "pos_cond", E_A, jnp.ones_like(E_A, dtype=bool), "cond", False,
+        omega, np.arange(omega.size))
+    Omega = jnp.asarray([[[[0.30 - 0.05j]]]])
+    B = jnp.asarray([[[[0.7 + 0.2j]]]])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5)
+    plan, geometry = SW.build_shared_sigma_windows(
+        summaries, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-6, crossing_target_error=1.0e-6,
+        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+
+    names = sorted(row.window.name for row in plan)
+    assert names == [
+        "c_neg_slab", "c_neg_slab", "c_pos_slab", "core", "core"]
+    # The two cluster shells share one cached rule object's node count.
+    shells = [row for row in plan if row.window.name == "core"]
+    assert shells[0].window.n_tau == shells[1].window.n_tau
+    # Each window serves exactly its own cluster's ω subset.
+    for row in plan:
+        assert row.omega_abs.size == 1
+
+    eta = geometry["eta_ry"]
+    pole = complex(Omega[0, 0, 0, 0]) - 1j * eta
+    residue = np.asarray(B[0])
+    got = _oracle_total(plan, B, Omega, omega.size, residue.shape)
+    for i, w in enumerate(omega):
+        want = -sum(residue / (w - e - pole) for e in energies)
+        np.testing.assert_allclose(got[i], want, rtol=5.0e-6, atol=5.0e-6)
+
+
+def test_gapped_omega_grid_decomposes_the_metal_sliver_and_matches():
+    """Sliver corner + sign-definite slabs reproduce the exact sd sum.
+
+    A fractional val branch (weights ≠ 1) whose wrong-side state makes a
+    sliver: with a gapped ω grid the sliver decomposes into the damped
+    crossing corner (ω and a both small) plus Laplace cells; summed with
+    the branch's ordinary windows it must equal the exact fractional
+    denominator sum in this family's +ω orientation.
+    """
+    energies = np.asarray([-0.02, 1.1])
+    weights = np.asarray([0.6, 1.0])
+    omega = np.asarray([0.1, 0.45, 3.45])
+    E_A = jnp.asarray(energies[None, :])
+    branch = _SigmaBranch(
+        "pos_val", E_A, jnp.ones_like(E_A, dtype=bool), "val", False,
+        omega, np.arange(omega.size),
+        band_weight=jnp.asarray(weights[None, :]))
+    Omega = jnp.asarray([[[[0.30 - 0.05j]]]])
+    B = jnp.asarray([[[[0.7 + 0.2j]]]])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5)
+    plan, geometry = SW.build_shared_sigma_windows(
+        summaries, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-6, crossing_target_error=1.0e-6,
+        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+
+    names = sorted(row.window.name for row in plan)
+    assert "sd_core" in names and "sd_shallow_slab" in names
+
+    eta = geometry["eta_ry"]
+    pole = complex(Omega[0, 0, 0, 0]) - 1j * eta
+    residue = np.asarray(B[0])
+    got = _oracle_total(plan, B, Omega, omega.size, residue.shape)
+    for i, w in enumerate(omega):
+        want = -sum(
+            f * residue / (w + e + pole)
+            for e, f in zip(energies, weights))
+        np.testing.assert_allclose(got[i], want, rtol=5.0e-6, atol=5.0e-6)
+
+
+def test_contiguous_grid_keeps_the_monolithic_plan_bitwise():
+    """A gap-free ω grid must reproduce the incumbent plan exactly."""
+    branches = _branches()
+    poles = jnp.stack(_poles())
+    summaries = SW.summarize_sigma_poles(
+        poles, jnp.ones_like(poles), branches,
+        regularization_width_ry=0.2, edge_factor=1.5)
+    kwargs = dict(
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-4, max_rank=96,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+    base, base_report = SW.build_shared_sigma_windows(
+        summaries, branches, **kwargs)
+    huge_gap, huge_report = SW.build_shared_sigma_windows(
+        summaries, branches, omega_cluster_gap_ry=1.0e6, **kwargs)
+    assert [(row.window.name, row.window.provenance,
+             row.omega_idx.tolist()) for row in base] == [
+        (row.window.name, row.window.provenance,
+         row.omega_idx.tolist()) for row in huge_gap]
+    assert {k: v for k, v in base_report.items()
+            if k != "omega_cluster_gap_ry"} == {
+        k: v for k, v in huge_report.items()
+        if k != "omega_cluster_gap_ry"}
