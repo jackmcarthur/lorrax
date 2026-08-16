@@ -324,6 +324,53 @@ def test_mixed_case_key_survives_strict_keys(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# UNIMPLEMENTED_OPTIONS — declared-but-not-built option VALUES, refused at
+# parse time.  Both rows previously died deep in a kernel, after the WFN
+# read and the whole screening stage.
+# ---------------------------------------------------------------------------
+
+def test_ppm_invalid_mode_imaginary_refuses_at_parse_time(tmp_path):
+    """It used to die inside the Σ^c kernel (ppm_sigma.py:877)."""
+    with pytest.raises(NotImplementedError) as exc:
+        _config(tmp_path, "ppm_invalid_mode = imaginary\n")
+    msg = str(exc.value)
+    assert "ppm_invalid_mode = imaginary" in msg
+    assert "complex-Omega" in msg
+
+
+@pytest.mark.parametrize("value",
+                         ["zero", "2ry", "static_limit", "skip", "infinity"])
+def test_the_other_invalid_pole_values_still_parse(tmp_path, value):
+    """RED TWIN: only the one value with no code path is refused."""
+    assert (_config(tmp_path, f"ppm_invalid_mode = {value}\n")
+            .ppm.invalid_mode == value)
+
+
+def test_unimplemented_option_values_stay_legal_vocabulary(tmp_path):
+    """Parseable, refused — the same contract UNIMPLEMENTED_MODES has.
+
+    A config echo, a layering test or an operator reading a deck back must
+    be able to NAME the value; what must not happen is spending a run on
+    it.  So the validators that own the vocabulary still accept both.
+    """
+    from gw.gw_config import MPAConfig, PPMConfig, UNIMPLEMENTED_OPTIONS
+
+    assert set(UNIMPLEMENTED_OPTIONS) == {
+        ("mpa_material_class", "metal"),
+        ("ppm_invalid_mode", "imaginary"),
+    }
+    # Neither validator refuses the value it owns.
+    PPMConfig(model="gn", omega_p=2.0, fallback_omega=2.0,
+              head_omega_h_ry=None, probe_chi_reuse="off",
+              sigma_target_error=1e-6, sigma_max_nodes=64,
+              invalid_mode="imaginary")
+    MPAConfig(n_poles=8, material_class="metal", sampling_alpha=1,
+              varpi_near_ry=0.2, varpi_far_ry=2.0, head_model="fixed_dft",
+              pole_batch_size=4, sigma_sector_target_error=6.5e-4,
+              sigma_crossing_target_error=2.0e-3, sigma_max_nodes=96)
+
+
+# ---------------------------------------------------------------------------
 # Parse-time band-window / dimensionality ranges.  ``zeta_nband`` was the
 # only one of the five ever checked here; the other four each died far
 # downstream, in the vocabulary of whatever site tripped over them.

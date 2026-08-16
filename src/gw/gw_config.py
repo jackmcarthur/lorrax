@@ -546,6 +546,59 @@ def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
         f"different self-energy ansatz under that name: {reason}")
 
 
+# ---------------------------------------------------------------------------
+#  Option VALUES that are declared but do not yet run
+# ---------------------------------------------------------------------------
+#
+# :data:`UNIMPLEMENTED_MODES` one level down.  A value can be legal
+# vocabulary (its validator accepts it, it normalises, it round-trips
+# through the config) and still have no code path — and the two entries
+# below both proved it the expensive way, by dying deep in a kernel after
+# the WFN read, the ISDF fit and the whole screening stage.
+#
+# Same contract as the mode table: the value stays PARSEABLE (a config
+# echo, a layering test or an operator reading a deck back must be able
+# to name it), and ``from_input_file`` is where it refuses — before
+# anything is spent.  Removing a row is the landing gesture.
+#
+# ``(key, value) -> why not yet``, keyed by the DECK spelling because
+# that is the word the operator typed.
+UNIMPLEMENTED_OPTIONS: dict[tuple[str, str], str] = {
+    ("mpa_material_class", "metal"): (
+        "the metallic double-parallel sample plan builds "
+        "(config.mpa.sample_plan), but build_mpa_fit cannot evaluate it "
+        "until the occupation-weighted interband/intraband chi and Sigma "
+        "branches land — today it dies at gw/mpa/model.py after the ISDF "
+        "fit.  See gw/wavefunction_bundle.py for the three sites the "
+        "fractional-occupation port has to change"
+    ),
+    ("ppm_invalid_mode", "imaginary"): (
+        "BGW's invalid_gpp_mode 1 keeps the invalid pole at imaginary "
+        "Omega, which needs a complex-Omega path through the Sigma^c "
+        "kernel that does not exist — today it dies inside that kernel.  "
+        "The other four values (zero / 2ry / static_limit / skip) all run"
+    ),
+}
+
+
+def refuse_unimplemented_options(params, *, context: str = "this run"):
+    """Refuse every declared-but-not-built option VALUE in ``params``.
+
+    Reads the deck dict rather than the built config so the refusal
+    happens before the sub-dataclasses are constructed — one of the two
+    rows below would otherwise be checked by a validator that already
+    accepted the value, and the other by no validator at all.
+    """
+    for (key, value), reason in UNIMPLEMENTED_OPTIONS.items():
+        raw = params.get(key)
+        if raw is None or str(raw).strip().lower() != value:
+            continue
+        raise NotImplementedError(
+            f"{key} = {value} is declared but not yet implemented, so "
+            f"{context} refuses at parse time rather than dying after the "
+            f"screening stage: {reason}.")
+
+
 class QPSolver(str, enum.Enum):
     """How QP energies are extracted from Σ — orthogonal to ``compute_mode``.
 
@@ -2554,6 +2607,10 @@ class LorraxConfig:
         from file_io import resolve_input_paths
 
         params = read_lorrax_input(filename)
+        # Before the memory probe, the device query and the sub-dataclass
+        # construction: a value with no code path is knowable from the
+        # deck alone, so it must not reach any of them.
+        refuse_unimplemented_options(params, context="the LORRAX config")
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
 
