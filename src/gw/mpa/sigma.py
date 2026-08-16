@@ -214,6 +214,7 @@ def compute_sigma_c_mpa_omega_grid(
     crossing_max_nodes=500,
     pole_batch_size=4,
     fit_identity=None,
+    expected_screening_diagrams=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -223,7 +224,9 @@ def compute_sigma_c_mpa_omega_grid(
     executor rereads and releases the same four-pole ranges.  No complete
     pole axis exists on host or device.
     """
-    ledger = validate_fit_store(fit_src, expected_identity=fit_identity)
+    ledger = validate_fit_store(
+        fit_src, expected_identity=fit_identity,
+        expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = _branches(wfns, omega_grid_ry, efermi_ry)

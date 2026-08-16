@@ -313,6 +313,37 @@ def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
     return False
 
 
+def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
+    """Stamp which diagram set produced this ``W0_qmunu`` (QUALITY_PATTERNS #10).
+
+    Data outlives the config that made it, and ``W0_qmunu`` is the most
+    reused artifact this driver writes — the BSE reads it, the downfold
+    driver reads it, a later restart reads it, and none of them has a
+    Coulomb config of its own to check it against.  RPA and ladder-corrected
+    W have identical shapes, identical flags and identical plausibility,
+    so the file has to say which one it is.
+
+    ``screening_diagrams = w_rpa`` is stamped too, not only ``w_bse``: an
+    absent attr then means "written before the axis existed" rather than
+    "written by the RPA path", and those are different facts.  Rank-0 h5py
+    metadata write, after SlabIO has released the file — the same
+    discipline, for the same reason, as the ``W0_ready`` stamp itself.
+    """
+    import h5py
+    from common.collectives import barrier, process_rank
+
+    diagrams = getattr(
+        getattr(config, "screening", None), "diagrams", None)
+    if diagrams is None:
+        return
+    if process_rank() == 0:
+        with h5py.File(tensors_filename, "a") as f:
+            if "W0_qmunu" in f:
+                f["W0_qmunu"].attrs["screening_diagrams"] = str(
+                    getattr(diagrams, "value", diagrams))
+    barrier("restart_screening_diagrams_stamp")
+
+
 def persist_w0_and_head(
     W_q,
     *,
@@ -323,6 +354,7 @@ def persist_w0_and_head(
     mesh_xy,
     sym=None,
     centroid_indices=None,
+    static_head_only: bool = False,
     print_fn=print,
 ):
     """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
@@ -347,6 +379,18 @@ def persist_w0_and_head(
     file-exists arm is not redundant with the key: a ``restart = true`` run
     reuses tensors it did not write, and would otherwise re-stamp a W0 into
     a file the deck said to leave alone.
+
+    ``static_head_only`` DECLARES that ``W_q`` is the ω = 0 W and nothing
+    else, so the stored ω grid is ``{0}`` whatever the run's compute mode
+    is.  It exists for exactly one caller: the ``screening_diagrams =
+    w_bse`` stage helper, whose first leg computes the RPA W(0) that the
+    ladder kernel consumes and persists THAT — under every mode, MPA
+    included.  It is a NAMED OPT-IN rather than a relaxation of the
+    dynamic-mode refusal below, because the two say different things.  The
+    refusal says "this mode's W was not sampled at {0, probe}, so do not
+    stamp that grid onto the file"; this flag says "the array in my hand
+    was sampled at {0} and I am telling you so".  A caller that cannot
+    make that statement still gets the refusal.
     """
     if not config.do_screened:
         return
@@ -389,6 +433,7 @@ def persist_w0_and_head(
                              mesh=mesh_xy,
                              qirr=_qirr.with_capture(
                                  take_pre_unfold("W0_qmunu")))
+    _stamp_screening_diagrams(tensors_filename, config)
     with _tmg.section("persist_w0.head_static"):
         head_static = head_resolver.at(0.0 + 0.0j)
     # THE STORED ω GRID IS THE PROBE SET, so it is the POLE MODEL that
@@ -398,7 +443,13 @@ def persist_w0_and_head(
     # dynamic-else-GN read here would stamp {0, iω_p} onto a file whose W
     # was never evaluated there — a restart artifact that lies quietly.
     ppm_model = config.compute_mode.ppm_model
-    if ppm_model is not None:
+    if static_head_only:
+        # The caller declared a single-frequency W.  {0} is then the true
+        # sample set of the artifact being written, not an inherited one,
+        # and it is the same grid a static mode would store.
+        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0], dtype=np.float64)
+    elif ppm_model is not None:
         # GN-PPM: probe at iωp on the imaginary axis.
         # HL-PPM: probe at Ω on the real axis (above all transitions).
         if ppm_model == "hl":

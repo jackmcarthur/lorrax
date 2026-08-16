@@ -116,9 +116,19 @@ def _fit_fixed_head(fit_path, head_resolver, probe_omega):
         fit_max_abs_residual=residual, model="fixed_dft_gn")
 
 
-def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
+def _solve_wc(sample_path, V, z, q_idx, meta, mesh_xy, dyson_solver=None):
+    """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
+
+    Signature IS the seam (see :func:`build_mpa_fit`'s ``wc_source``): the
+    sample store, the wedge V, the z-list, the wedge q index and the mesh.
+    ``z`` is carried rather than a bare count because a source that does
+    not solve a Dyson equation — the ``screening_diagrams = w_bse`` ladder
+    — needs the frequencies themselves, and passing a length would have
+    made it derive them from a second copy of the sample plan.
+    """
     from gw.w_isdf import solve_w
 
+    n_z = int(np.asarray(z).size)
     shape = (n_z, q_idx.size, meta.n_rmu, meta.n_rmu)
     for index in range(n_z):
         chi, _ = mpa_store.read_w_slab_collective(
@@ -132,18 +142,31 @@ def _solve_wc(sample_path, V, n_z, q_idx, meta, mesh_xy, dyson_solver=None):
         del chi, Wc
 
 
-def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy):
+def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
+              provenance=None):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
-        tile_bytes=tile_bytes)
+        tile_bytes=tile_bytes, provenance=provenance)
 
 
 def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
-    tile_bytes=None, print_fn=print,
+    tile_bytes=None, wc_source=None, print_fn=print,
 ):
-    """Write chi/Wc samples and fitted q-wedge poles; return the fit path."""
+    """Write chi/Wc samples and fitted q-wedge poles; return the fit path.
+
+    ``wc_source`` is the ONE seam ``screening_diagrams`` moves.  ``None``
+    (the default) is :func:`_solve_wc` — Wc(z) from the Dyson solve of the
+    sampled chi, the RPA path, byte-for-byte what this function has always
+    done.  Under ``w_bse`` the caller passes
+    ``gw.screening_bse.make_ladder_wc_source(...)``, which writes the same
+    per-z, per-wedge-q ``Wc`` slabs into the same store from the ladder
+    resolvent instead.  Everything downstream of the seam — the sample
+    plan, the Pade fit, the SlabIO store lifecycle, the head fit and the
+    Sigma consumer — is the same code on both branches; the ONLY
+    difference the store records is the provenance stamp below.
+    """
     if config.mpa.material_class != "insulator":
         raise NotImplementedError(
             "GATE mpa_metal_evaluator_unavailable: the configured metallic "
@@ -172,6 +195,14 @@ def build_mpa_fit(
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
+    # PROVENANCE (QUALITY_PATTERNS #10).  RPA poles and ladder poles have
+    # identical shapes, identical certification and identical
+    # plausibility; only the stamp distinguishes them, and the Sigma
+    # consumer asserts it at load (mpa_store.validate_fit_store).
+    diagrams = str(getattr(
+        getattr(config.screening, "diagrams", "w_rpa"), "value",
+        getattr(config.screening, "diagrams", "w_rpa")))
+    provenance = {"screening_diagrams": diagrams}
     common = dict(
         mesh_xy=mesh_xy, n_omega=z_all.size, n_q_on_disk=q_idx.size,
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
@@ -179,7 +210,8 @@ def build_mpa_fit(
         omega=z_all, omega_line=line, energy_unit="Ry",
         sampling={"protocol": "double_parallel", "varpi": varpi,
                   "n_p": n_p, "alpha": config.mpa.sampling_alpha,
-                  "omega_max": omega_m})
+                  "omega_max": omega_m},
+        provenance=provenance)
     mpa_store.allocate_w_omega_collective(
         sample_path, _CHI, mode="w", **common)
     mpa_store.allocate_w_omega_collective(
@@ -220,11 +252,12 @@ def build_mpa_fit(
                 z_all.size)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
-    _solve_wc(
-        sample_path, V, z_all.size, q_idx, meta, mesh_xy,
+    (wc_source or _solve_wc)(
+        sample_path, V, z_all, q_idx, meta, mesh_xy,
         config.backend.w_dyson_solver)
     _, report = _fit_body(
-        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy)
+        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
+        provenance=provenance)
     # ``write_head_fit`` is an intentionally small serial-h5py metadata
     # writer.  The body fit above is collective SlabIO; letting every rank
     # enter this final delete/create/write sequence races one HDF5 group.

@@ -654,6 +654,10 @@ def compute_sigma_xc(
             max_rank=int(config.mpa.sigma_max_nodes),
             crossing_max_nodes=max(500, int(config.mpa.sigma_max_nodes)),
             pole_batch_size=int(config.mpa.pole_batch_size),
+            # PROVENANCE ASSERT AT LOAD: these poles were fitted to a W
+            # this run's screening_diagrams either did or did not produce,
+            # and the two are indistinguishable in the bytes.
+            expected_screening_diagrams=config.screening.diagrams,
             print_fn=print_fn)
         head = mpa_store.read_head_fit(fit_path, to_unit="Ry")
         sigma_bands = wfns.slices.sigma

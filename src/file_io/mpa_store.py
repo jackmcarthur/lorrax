@@ -2289,15 +2289,43 @@ def fit_completion_ledger(src, *, mode="r"):
         }
 
 
-def validate_fit_store(src, *, expected_identity=None, mode="r"):
+def validate_fit_store(src, *, expected_identity=None,
+                       expected_screening_diagrams=None, mode="r"):
     """Validate the finalized fit contract before Sigma reads pole bytes.
 
     ``expected_identity`` may name ``w_grid_hash``, ``w_table_hash`` and
     ``w_centroid_hash`` from the screening object currently in use.  The
     fit's own declared ``*_max_allowed`` certification thresholds are always
     enforced against its observed maxima.
+
+    ``expected_screening_diagrams`` is the run's ``screening_diagrams``
+    value.  RPA poles and ladder-corrected poles are the same shape, pass
+    the same certification and read back equally plausibly, so the only
+    thing separating them is the stamp the writer left — which makes this
+    the load-time half of QUALITY_PATTERNS #10.  A store with NO stamp is
+    refused rather than assumed RPA: "written before the axis existed" and
+    "written by the RPA path" are different facts, and silently reading the
+    first as the second is how a ladder fit gets consumed as an RPA one.
     """
     ledger = fit_completion_ledger(src, mode=mode)
+    if expected_screening_diagrams is not None:
+        want = str(getattr(expected_screening_diagrams, "value",
+                           expected_screening_diagrams))
+        got = ledger["provenance"].get("screening_diagrams")
+        if got is None:
+            raise ValueError(
+                f"MPA fit store carries no screening_diagrams stamp, so it "
+                f"cannot say whether its poles came from the RPA W or the "
+                f"ladder-corrected W; this run is {want!r}.  Regenerate the "
+                f"fit with a writer that stamps it (gw.mpa.model."
+                f"build_mpa_fit does).")
+        if str(got) != want:
+            raise ValueError(
+                f"MPA fit provenance mismatch: the store was built with "
+                f"screening_diagrams = {str(got)!r} and this run is "
+                f"{want!r}.  The two produce different W and therefore "
+                f"different poles; reusing one for the other is the "
+                f"changed-band-window class of silent reuse.")
     if not ledger["complete"]:
         raise ValueError("MPA Sigma requires a finalized pole fit store")
     if ledger["energy_unit"] not in FIT_ENERGY_UNITS:
