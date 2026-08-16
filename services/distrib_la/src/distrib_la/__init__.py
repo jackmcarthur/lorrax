@@ -1,10 +1,11 @@
 """``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
 
-One door for ``polar_factor``, ``eigh``, ``cholesky`` and ``solve_lu`` on an
-``('x','y')`` device mesh, over four backend families: **scalapack** (CPU preferred),
+One door for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
+``matmul`` on an ``('x','y')`` device mesh, over four backend families:
+**scalapack/PBLAS** (CPU preferred),
 **slate** (CPU fallback where it is not broken; ROCm always,
-declared-untested), **cusolvermp** (CUDA preferred) and **native** (pure
-JAX, everywhere).  A caller says what it wants computed and on which mesh;
+declared-untested), **cusolvermp/cuBLASMp** (CUDA preferred) and **native**
+(pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
 which library runs is a resolved fact it can read but never has to
 branch on.
 
@@ -12,10 +13,10 @@ THE PACKAGE IS THE DOOR.  There is no separate facade module: everything
 a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tests/test_layering.py`` fails on.  That is what makes
-"only distrib_la sees scalapack/slate/cusolvermp" checkable rather than
-aspirational — those three appear in exactly one dependency edge in this
-package (:mod:`distrib_la.loader`, which dlopens a ``.so`` by path) and in
-zero of its declared dependencies.
+"only distrib_la sees the provider families" checkable rather than
+aspirational — ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp appear in
+exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
+dlopens a ``.so`` by path) and in zero of its declared dependencies.
 
 The surface
 -----------
@@ -23,7 +24,7 @@ polar_factor(A, mesh, ...) -> (L, s)
     Square distributed polar/SVD through a Hermitian dilation and one planned
     Hermitian eigensolve.  The planned form separates eager resolution from
     the trace-safe operation used in streamed k-point loops.
-``plan(op, mesh, *, backend='auto', n=None) -> Plan``
+``plan(op, mesh, *, backend='auto', n=None, batched_route='auto') -> Plan``
     Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
     ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
     back replicated, eigenvectors as COLUMNS, on every backend.
@@ -32,12 +33,19 @@ polar_factor(A, mesh, ...) -> (L, s)
     ``batched_route`` is the ONE place that says how a given stack will
     actually run: the scan, or the backend's own stacked entry where the
     library has one (a backend-internal optimization behind the same
-    interface, never a second surface).  A third route — move the batch
-    axis onto the mesh and run the local kernel — is reserved and named
-    there.  Introspection: a caller reads it, never branches on it.
+    interface, never a second surface).  The opt-in third route moves the
+    batch axis onto the mesh, runs the device-local native kernel, and moves
+    matrix outputs back through explicit staged collectives.  Production
+    selection is ``BATCHED_ROUTE_CHOICES = ('auto', 'batch_reshard')``.
 ``Plan.native_fn``
     A pure, trace-safe closure — native backends only — for a call site
     that needs the math INSIDE its own ``jit``.
+``matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N',
+backend='auto', batched_route='auto')``
+    Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
+    plan.  The default dispatches to cuBLASMp, PBLAS or SLATE; the explicit
+    opt-in performs x/y face-to-batch exchanges, local GEMM, then y/x inverse
+    exchanges. ``backend='off'`` makes that route provider-free.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -79,7 +87,13 @@ from __future__ import annotations
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
+from distrib_la.matmul import (
+    MATMUL_BACKEND_CHOICES,
+    matmul,
+    resolve_matmul_backend,
+)
 from distrib_la.plan import (
+    BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTES,
     BATCHED_SCAN_UNROLL,
     DONATES,
@@ -111,9 +125,11 @@ __all__ = [
     "Plan", "plan", "ensure_sharding", "DONATES",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
+    # distributed matrix multiplication
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
-    "ROUTE_BATCH_RESHARD", "BATCHED_SCAN_UNROLL",
+    "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_SCAN_UNROLL",
     # factor / solve
     "FactorToken", "factor", "solve",
     # resolution

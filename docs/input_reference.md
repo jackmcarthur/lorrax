@@ -167,8 +167,25 @@ page has to read it from.
 | `sc_eigh` | `"auto"` | Eigh for the per-iteration (nk, nb, nb) carry: native = k-sharded batch, one whole (nb, nb) tile per device; distributed = one tile spread over the mesh; auto = distributed once a tile exceeds a fraction of `memory_per_device_gb` and the mesh divides nb, else native. Layout only — the eigenvalues agree and the physics does not change. |
 | `distributed_cholesky` | `"auto"` | Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate. |
 | `distributed_lu` | `"auto"` | Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only). |
+| `distrib_la_batched_route` | `"auto"` | Schedule used by every array-returning `distrib_la.Plan.batched` call. `auto` preserves the plan's normal distributed scan or backend-batched implementation (the robust default when one matrix must stay mesh-sharded). `batch_reshard` explicitly moves `H_k(m_X,n_Y)` to `H_{k_XY}(m,n)`, runs the local JAX operation on each device's whole matrices, and reshards outputs back to the plan contract. Use only when one complete matrix plus its result/workspace fits on each device. Backend resolution and the Plan I/O contract stay unchanged, but this explicit call route executes the local JAX kernel rather than the resolved backend. It does not apply to opaque `factor()`/`solve()` token routes. The htransform and exciton-band CLIs expose the same spelling as `--distrib-la-batched-route`; CLI wins over the deck. |
 | `eigh_backend` | `"auto"` | BSE/htransform distributed-eigh sites: auto|off = q-batched native eigh; distributed | cusolvermp | slate | scalapack spread ONE tile over the mesh. CLI --eigh-backend overrides. |
 | `use_low_mem_eigh` | false | Same axis by intent: one (rank,rank) matrix does not fit a rank; true + auto => distributed; true + off refused at parse. |
+
+`distrib_la_batched_route = batch_reshard` and
+`use_low_mem_eigh = true` are contradictory and refuse during input
+resolution: the former requires a complete matrix on a device while the
+latter says that residency is unsafe.  GWJAX reads the deck key through its
+shared `BackendConfig`; htransform and exciton-bands read the same deck key
+and optionally override it with the identically-valued CLI flag.  The k-means
+executable is intentionally not given this option: it is the centroid
+preprocessing step and runs its own distributed greedy pivoted-Cholesky
+selection, not an array-returning `distrib_la.Plan.batched` operation.  Its
+~1000-centroid output is subsequently consumed by the GWJAX and htransform
+paths where this route applies.  Restart tensors and ζ provenance describe
+math/layout outputs, not an execution schedule, so selecting a different
+route does not by itself invalidate an otherwise reusable restart; route is
+included in compiled-kernel cache keys wherever it changes a closed-over
+Plan.
 
 ## BSE
 

@@ -1284,6 +1284,7 @@ def _to_host(x):
 
 def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                    eigh_backend: str = "auto", q_chunk: int = 48,
+                   distrib_la_batched_route: str = "auto",
                    keep_host_mirrors: bool = True, degrees=None,
                    fit_ecut=None):
     """STAGE 1.  Returns the coarse-side bundle ``prep``:
@@ -1339,7 +1340,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     # below.  auto|off resolve to the q-batched native path.  Hoisted, not
     # per-chunk: resolution dlopens, and the first FFI call builds a BLACS /
     # cuSOLVERMp context (scorecard L §5).
-    eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend)
+    eigh_plan = linalg_plan(
+        "eigh", mesh_xy, backend=eigh_backend,
+        batched_route=distrib_la_batched_route)
     q_chunk = int(min(q_chunk, nq,
                       max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
@@ -1451,7 +1454,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         nb_lead = sl.stop - sl.start
         (_eigh_batch, _clean_split) = _kernels(nb_lead)
         qb2, qb3 = _qb(nb_lead)
-        if eigh_plan.is_native:
+        if (eigh_plan.is_native
+                and distrib_la_batched_route == "auto"):
             lam, R = _eigh_batch(C_herm(sl))
         else:
             # Explicit distributed-FFI request.  ``plan.batched`` is the
@@ -2048,6 +2052,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
 def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
                        *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
+                       distrib_la_batched_route: str = "auto",
                        run_diagnostics=True, log_fn=print, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
@@ -2096,6 +2101,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # The host mirrors exist for run_nulls / eval_vq_host only — same switch.
     prep = prepare_coarse(zx, C_q, mesh_xy, alpha=alpha, eps_tik=eps_tik,
                           eigh_backend=eigh_backend,
+                          distrib_la_batched_route=distrib_la_batched_route,
                           keep_host_mirrors=run_diagnostics,
                           fit_ecut=fit_ecut)
     des = lr_design_blocks(zx, prep)
@@ -2536,7 +2542,8 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                   window_mode: str = "zeta",
                   degeneracy_mode: str = "strict",
                   degeneracy_tol_ry: float | None = None,
-                  n_guard: int | None = None):
+                  n_guard: int | None = None,
+                  distrib_la_batched_route: str | None = None):
     """One-time refit state: htransform handles + full-r α-basis.
 
     THE TWO-WINDOW CONTRACT.  There are two windows here and they are not the
@@ -2605,7 +2612,10 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             f"ABOVE the ζ-fit window; 0 is the zero-guard configuration the "
             f"f-shoulder row convicts, and there is nothing below it.")
 
-    from gw.gw_config import read_lorrax_input
+    from gw.gw_config import (
+        read_lorrax_input,
+        resolve_distrib_la_batched_route,
+    )
     from bandstructure.htransform import initialize_wfns
     from common.wfn_transforms import iter_psi_rchunk_bandwise
 
@@ -2633,6 +2643,8 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
            f"(read from {os.path.basename(zx['zeta_file'])} "
            f"isdf_header/fit_provenance, not from the deck)")
     params = read_lorrax_input(input_file)
+    _distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=distrib_la_batched_route)
     (wfn, sym, meta, _, _S, ctilde, B_at_mu, enk_sigma,
      W_proj) = initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy,
                                return_full_proj=True,
@@ -2858,6 +2870,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
             "galerkin_rel_zeta": gal_zeta,
             "rank": rank,
+            "distrib_la_batched_route": _distrib_la_batched_route,
             "v_on_set": make_v_on_set(zx, policy, log_fn=log_fn)}
 
 
@@ -3162,7 +3175,9 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
-            return_coeffs=True)
+            return_coeffs=True,
+            distrib_la_batched_route=rst.get(
+                "distrib_la_batched_route", "auto"))
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
         psi_m_r = None

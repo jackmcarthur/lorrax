@@ -134,6 +134,7 @@ def _solve_wc(
     head_response=None,
     wfn=None,
     config=None,
+    distrib_la_batched_route: str = "auto",
 ):
     from gw.qsgw_head import (
         IterationHeadSamples,
@@ -156,7 +157,9 @@ def _solve_wc(
     for index in range(n_z):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
-        W = solve_w(V, chi, meta, mesh_xy, dyson_solver=dyson_solver)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
         W.block_until_ready()
         if head_response is not None:
             head_samples.append(finalize_iteration_head_sample(
@@ -452,6 +455,8 @@ def build_mpa_fit(
         head_response=iteration_head_response,
         wfn=wfn if iteration_head_response is not None else None,
         config=config if iteration_head_response is not None else None,
+        distrib_la_batched_route=getattr(
+            config.backend, "distrib_la_batched_route", "auto"),
     )
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
