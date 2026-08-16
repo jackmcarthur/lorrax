@@ -404,11 +404,20 @@ def test_the_map_entry_solves_its_own_occupations():
     """The rCROP-enabling invariant, pinned at the source level.
 
     F(H) must be a self-map of H alone: gw_iteration_map solves its MP1
-    occupation state at ENTRY from the spectrum of the H it was handed
-    (wfns_qp.enk), and the carried state is diagnostic only.  The
-    discriminating failure this guards: a consumer rewired back to
-    state.occupation_state would make trial/accepted rCROP iterates
-    consume occupations from a different trajectory point.
+    occupation state at ENTRY from the spectrum of the H it was handed,
+    and the carried state is diagnostic only.  The discriminating failure
+    this guards: a consumer rewired back to state.occupation_state would
+    make trial/accepted rCROP iterates consume occupations from a different
+    trajectory point.
+
+    The energy ladder handed to the solve used to be spelled
+    ``wfns_qp.enk`` and is now built here as ``enk_entry`` — the immutable
+    DFT ladder with the active block replaced by THIS call's ``E_full``,
+    which is what ``rotate_wavefunctions`` puts in ``wfns_qp.enk`` anyway
+    (``wavefunction_bundle.py:616-619``).  The move is what lets the
+    sum-band tail scissor classify its bands from the same occupation
+    state; (a2) below pins the ordering that makes that true, so the two
+    fits can never be fed different occupations.
     """
     import ast
     import inspect
@@ -416,11 +425,28 @@ def test_the_map_entry_solves_its_own_occupations():
     from gw import sc_iteration
 
     src = inspect.getsource(sc_iteration.gw_iteration_map)
-    # (a) the entry solve exists and feeds from this call's spectrum
+    # (a) the entry solve exists and feeds from THIS call's spectrum -- the
+    # active block of the ladder is E_full, not anything off the carry.
     assert re.search(
         r"entry_occ_state, entry_surface_weight_kn = "
-        r"_solve_head_occupations\(\s*inputs, wfns_qp\.enk\)", src), \
+        r"_solve_head_occupations\(\s*\n?\s*inputs, enk_entry\)", src), \
         "gw_iteration_map lost its entry occupation solve"
+    assert re.search(
+        r"enk_entry = jax\.lax\.with_sharding_constraint\(\s*\n"
+        r"\s*jnp\.asarray\(inputs\.wfns_dft\.enk\)\.at\[\s*\n?"
+        r"\s*:, inputs\.band_slices\.sigma\]\.set\(\s*\n"
+        r"\s*jnp\.asarray\(E_full,", src), \
+        ("the entry ladder is no longer 'the DFT ladder with the active "
+         "block set to this call's E_full'")
+    # (a2) ...and it is solved BEFORE the sum-band tail scissor, so ONE
+    # occupation state serves both scissor fits.  Reversing these two would
+    # make the tail fit's band classification a generation stale, or
+    # circular (the tail scissor writes the ladder the solve would read).
+    i_solve = src.index("_solve_head_occupations(")
+    i_tail = src.index("tail_fit = fit_scissor(")
+    assert i_solve < i_tail, (
+        "the entry occupation solve must precede the sum-band tail scissor "
+        "fit; the tail fit's val/cond/crossing classes come from it")
     # (b) the metal chi/head/Sigma threading consumes the ENTRY state
     assert "metal_occ_state = (entry_occ_state" in src
     assert "head_occ_kn = entry_occ_state.f_kn" in src
