@@ -829,13 +829,42 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	rules the truncation out as the cause.
 	``tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md``
 
-	MODE, AND WHY IT IS NOT UNIFORM.  ``snap`` means "say so loudly and
-	continue" — the report-only twin has nothing to widen, so it degrades to a
-	warning by design — and it is a GRANDFATHER CLAUSE for the edges the tree's
-	existing decks already sit on.  Those arrive through ``nband``/``ncond``,
-	were chosen before this check existed, and flipping them to ``strict``
-	would refuse every one that happens to slice; that census has not been run.
-	Owner row.
+	MODE — THE GRANDFATHER CLAUSE IS CLOSED (2026-08-15).  This used to pass
+	``snap`` ("say so loudly and continue") for the ``nband``/``ncond`` edges,
+	as a grandfather clause for decks chosen before the check existed, with the
+	note that flipping to ``strict`` "would refuse every one that happens to
+	slice; that census has not been run."
+
+	The census has now been run on the one deck it matters most for, and the
+	grandfathered edge is NOT benign.  ``tests/regression/si_cohsex_debug`` —
+	the project's ONLY external BerkeleyGW check — sits at ``nband = 60``,
+	which on its own mean field slices a multiplet at min gap **0.000000 eV**,
+	and this very function printed ``edge 60 min gap 0 meV`` on every run of it
+	and continued.  MEASURED there, same exactly-orbit-closed centroid set,
+	same ``zeta_rcond``, P=4 fixed, only the edge moving (max star spread over
+	the 8 stars of the 64 full-BZ k, bands 0-15):
+
+	    nband=60 (slices)      sigSX 0.0270  sigCOH 1.9570  sigTOT 1.9430
+	                           V_H   0.0990                          meV
+	    nband=40 (clean 818meV) sigSX 0.0000  sigCOH 0.0000  sigTOT 0.0000
+	                           V_H   0.0000                          meV
+	    nband=36 (clean 157meV) all four columns 0.0000                meV
+
+	EXACTLY zero on every column at a clean edge.  Four other candidate causes
+	were each ruled out with their own measurement — the non-symmorphic tau
+	convention (verified against the atom set, 0/48 ops failing where the next
+	best convention fails 24/48), centroid orbit closure (0/48 ops failing,
+	checked op-by-op), the zeta solve (``zeta_rcond`` 1e-12 -> 1e-6 drops 34%
+	of the modes and moves the spread 0.005 meV) and the centroid quadrature
+	(V_H, a pure centroid sum, 0.099 -> 0.0000).  So this edge was the whole
+	effect.
+
+	The mode is therefore ``band_degeneracy.DEFAULT_MODE`` (strict) like every
+	other seam, and proceeding on a slicing edge is a NAMED, TRACED act:
+	``LORRAX_BAND_DEGENERACY=snap`` (warn and continue) or ``=off`` (silent),
+	the same vocabulary as the ``--band-degeneracy`` flag.  A deck that needs
+	the old behaviour still gets it; it just has to ask, and the ask appears in
+	the log.
 
 	The ``zeta_nband`` edge has no such decks.  Naming the key is an explicit,
 	brand-new request for a specific edge, so it is checked the way the BSE has
@@ -854,16 +883,35 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	from common import band_degeneracy as _bd
 	enk = np.asarray(energies)[0]
 	gaps = _bd.boundary_min_gaps(enk)
+	# The mode every other seam uses, overridable BY NAME so that proceeding
+	# on a slicing edge leaves a trace instead of being the default.
+	_mode = os.environ.get("LORRAX_BAND_DEGENERACY", "").strip().lower()
+	if _mode not in _bd.MODES:
+		if _mode:
+			raise ValueError(
+				f"LORRAX_BAND_DEGENERACY={_mode!r} is not one of {_bd.MODES}")
+		_mode = _bd.DEFAULT_MODE
+	else:
+		log(f"    [band window] mode overridden to {_mode!r} by "
+		    f"LORRAX_BAND_DEGENERACY — a slicing edge will NOT refuse.")
+	# Put the legal edges IN THE REFUSAL: the fix for this error is a number,
+	# and the operator should not have to go compute it.
+	_nb = int(enk.shape[1])
+	_clean = [b for b in range(1, min(_nb, len(gaps)))
+	          if np.isfinite(gaps[b]) and gaps[b] > _bd.DEGENERACY_TOL_RY]
+	_hint = (f"  Degeneracy-CLEAN edges on this mean field: "
+	         f"{_clean if len(_clean) <= 24 else _clean[:24] + ['...']}.  "
+	         f"Set nband/ncond (or zeta_nband) to one of them, or pass "
+	         f"LORRAX_BAND_DEGENERACY=snap to warn and continue.")
 	for lo, hi, what in (
 			(band_range_left[0], band_range_left[1], "ISDF left window"),
 			(band_range_right[0], band_range_right[1], "ISDF right window")):
-		strict = (zeta_nband is not None and int(hi) == int(zeta_nband))
+		named = (zeta_nband is not None and int(hi) == int(zeta_nband))
 		_bd.check_band_window(
-			enk, int(lo), int(hi), mode=("strict" if strict else "snap"),
-			log=log,
+			enk, int(lo), int(hi), mode=_mode, log=log,
 			where=(f"{what} (the ζ fit's pair space)"
-			       + (f" — deck key zeta_nband={zeta_nband}"
-			          if strict else "")))
+			       + (f" — deck key zeta_nband={zeta_nband}" if named else "")),
+			hint=_hint)
 	# Print the number even when it is fine: "no news" and "a good number"
 	# must not look alike (preamble measurement rule 10).
 	edges = sorted({int(band_range_left[1]), int(band_range_right[0]),

@@ -389,9 +389,14 @@ def check_band_window(
     tol_ry: float = DEGENERACY_TOL_RY,
     mode: str = DEFAULT_MODE,
     where: str = "band window",
+    hint: str = "",
     log=print,
 ) -> None:
     """Report-only twin of :func:`resolve_band_window` for a fixed window.
+
+    ``hint`` is appended AFTER the defect description, which is where a
+    remedy belongs: ``where`` is interpolated before it, so putting the fix
+    there makes the operator read the cure before the disease.
 
     Used where the window is an OUTPUT SHAPE the caller has already committed
     to — ``bandstructure.bse_setup.compute_wfns_fi``'s ``band_window_fi`` is
@@ -424,7 +429,8 @@ def check_band_window(
         return
     msg = (f"[band-window] {where}: window [{b_min}, {b_max}) cuts a "
            f"degenerate multiplet — " + "; ".join(bad) +
-           f".  Tolerance {float(tol_ry) * 1e3 * _EV_PER_RY:.3f} meV.")
+           f".  Tolerance {float(tol_ry) * 1e3 * _EV_PER_RY:.3f} meV."
+           + (f"  {hint}" if hint else ""))
     if mode == "strict":
         raise BandWindowDegeneracyError(msg)
     log(f"*** {msg} ***")

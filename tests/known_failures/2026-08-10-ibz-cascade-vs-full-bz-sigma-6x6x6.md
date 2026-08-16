@@ -233,6 +233,66 @@ and they matter more than the original finding did.
   frozen or published sits on the 4×4×4 deck, and the symmetry machinery is
   exact there to sub-µeV. No re-cut of anything is owed on account of this file.
 
+  > **CORRECTED 2026-08-15 — this bullet is true of what it measured and false
+  > of what it was read to mean, and that gap is why nobody looked at the
+  > 4×4×4 deck for a year.**
+  >
+  > What this file measured at 4×4×4 is **IBZ cascade vs forced full-BZ**
+  > (arm A vs arm B) — two CODE PATHS on the same deck with the same band
+  > window. They agree to sub-µeV, and that stands. But both paths inherit
+  > the *same* band window, so if that window is not a point-group-invariant
+  > subspace they are broken identically and agree with each other anyway.
+  > **A path-vs-path comparison is structurally blind to a non-invariant
+  > window.** It is not a measurement of star covariance, and it was read as
+  > one.
+  >
+  > MEASURED 2026-08-15 on `tests/regression/si_cohsex_debug` — the 4×4×4
+  > deck, and the project's only external BerkeleyGW check — **`nband = 60`
+  > slices a degenerate multiplet on its mean field, min gap over k
+  > 0.000000 eV at k=3.** `gw_init.check_zeta_fit_windows` printed
+  > `edge 60 min gap 0 meV` on every run of it and continued, because that
+  > seam passed `snap` as a grandfather clause. Max star spread over the 8
+  > stars of the 64 full-BZ k, bands 0–15, same exactly-orbit-closed centroid
+  > set, same `zeta_rcond`, P=4 fixed, only the edge moving:
+  >
+  > | nband | edge min gap | sigSX | sigCOH | sigTOT | V_H |
+  > |---|---|---|---|---|---|
+  > | 60 (shipped) | **0.000000 eV** | 0.0270 | **1.9570** | **1.9430** | 0.0990 |
+  > | 40 | 818 meV | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+  > | 36 | 157 meV | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+  >
+  > So the 4×4×4 corpus **is** touched: it carries the same defect this file
+  > root-caused at 6×6×6, one term over.
+  >
+  > **And this file's own reasoning explains why it was missed.** Its §3
+  > concludes "the row that decides the investigation is Σ_x" — and Σ_x is
+  > precisely the row a sliced edge barely moves: 0.027 meV here at the
+  > sliced edge, against 1.957 meV in the correlation term. Deciding on Σ_x
+  > was right for telling 6×6×6 from 4×4×4 *by severity*, and wrong for
+  > concluding 4×4×4 was clean.
+  >
+  > What is NOT invalidated: the fixture's **0.644 meV sigTOT agreement with
+  > BerkeleyGW**. The matched BGW arm runs `number_bands 60` with
+  > `degeneracy_check_override`, so both codes truncate the same multiplet and
+  > the cross-code comparison stays apples-to-apples. What is invalidated is
+  > any SYMMETRY conclusion drawn from that fixture.
+  >
+  > Four other candidate causes were each ruled out with their own
+  > measurement, so they are not owed a re-run: the non-symmorphic τ
+  > convention (`r' = inv(mtrx)·r + tnp/2π` verified against the ATOM set —
+  > 0/48 ops failing, next best 24/48), centroid orbit closure (0/48 ops
+  > failing, checked op-by-op rather than through the generator's own
+  > unfold), the ζ solve (`zeta_rcond` 1e-12 → 1e-6 drops 34 % of the modes
+  > and moves the spread by 0.005 meV) and the centroid quadrature (V_H, a
+  > pure centroid sum, 0.099 → 0.0000 meV).
+  >
+  > Landed with this correction: `check_zeta_fit_windows` now uses
+  > `band_degeneracy.DEFAULT_MODE` (strict) like every other seam and
+  > **refuses** on a zero-gap edge, naming the clean edges in the message;
+  > `LORRAX_BAND_DEGENERACY=snap|off` is the named, logged override.
+  > Evidence: `/pscratch/sd/j/jackm/si960_regen_2026-08-15/logs/arm_nb40.log`,
+  > `arm_nb36.log`, `arm_768_shardblk768.log`, `arm_rcond_1e-{12,8,6}.log`.
+
 ### 3. Which Σ term carries it
 
 The `sigma_diag_file` output carries the per-band decomposition, so the term

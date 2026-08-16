@@ -1,6 +1,50 @@
 Si 4x4x4 COHSEX regression fixture — TWO runs, one directory
 =============================================================
 
+> ### ⚠ BOTH DECKS SIT ON A BAND EDGE THAT SLICES A DEGENERATE MULTIPLET (measured 2026-08-15)
+>
+> `nband = 60` (production) cuts a multiplet on this mean field at **min gap
+> over k = 0.000000 eV, at k=3**.  A window holding half a multiplet is not a
+> point-group-invariant subspace, so nothing built on the ζ fit is exactly
+> symmetry-covariant.  `gw_init.check_zeta_fit_windows` printed
+> `edge 60 min gap 0 meV` on every run of this fixture and continued, because
+> that seam passed `snap` as a grandfather clause.  **It now REFUSES**
+> (`LORRAX_BAND_DEGENERACY=snap` is the named override), so this deck no
+> longer runs unmodified — see `tests/test_band_window_closure_fixture.py`,
+> which pins the measurement.
+>
+> Degeneracy-CLEAN edges on this mean field: **8, 16, 20, 28, 36, 40**.
+> Slicing: 24, 32, 44, 48, 52, 56, **60**.
+>
+> MEASURED cost, max star spread over the 8 stars of the 64 full-BZ k,
+> bands 0–15, same centroid set and `zeta_rcond`, only the edge moving:
+>
+> | nband | edge min gap | sigSX | sigCOH | sigTOT | V_H |
+> |---|---|---|---|---|---|
+> | **60 (shipped)** | 0.000000 eV | 0.0270 | **1.9570** | **1.9430** | 0.0990 |
+> | 40 | 818 meV | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+> | 36 | 157 meV | **0.0000** | **0.0000** | **0.0000** | **0.0000** |
+>
+> **WHAT THIS DOES NOT INVALIDATE — read this before re-cutting anything.**
+> The **0.644 meV sigTOT agreement with BerkeleyGW stands.**  The matched BGW
+> arm behind `bgw_sigma_hp_noavg.dat` runs `number_bands 60` with
+> `degeneracy_check_override`, so BerkeleyGW truncates the *same* multiplet in
+> the *same* band sum.  The cross-code comparison is apples-to-apples and the
+> anchor is doing its job.  What is invalidated is any SYMMETRY claim made
+> from this fixture — including within-star spread, which measures the edge
+> and not the machinery.
+>
+> **WHY THIS DECK WAS NOT RE-CUT.**  Re-cutting the LORRAX side alone would
+> silently change what `0.644 meV` means: the reference file is a BGW run at
+> `number_bands 60` and this directory ships no `WFNq.h5` / `epsmat.h5`, so
+> the BGW arm cannot be re-run here to match a new edge.  Changing one side of
+> a two-code comparison to fix a one-code property is the wrong trade.  The
+> symmetry property gets its own gate at a clean edge instead
+> (`tests/test_band_window_closure_fixture.py`), which needs no BerkeleyGW
+> reference at all because star covariance is LORRAX-internal.  Re-cutting
+> the anchor remains available and is an OWNER call: it costs a new BGW arm.
+
+
 This directory holds the project's only `sys_dim = 3` end-to-end COHSEX case
 and the project's only EXTERNAL check against BerkeleyGW.  It ships **two
 decks over one set of inputs**:
