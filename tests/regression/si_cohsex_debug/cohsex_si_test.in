@@ -39,11 +39,10 @@ nband = 60
 sys_dim = 3
 bare_coulomb_cutoff = 25.0
 
-do_screened = true
+compute_mode = cohsex
 bispinor = false
 qp_solver = one_shot_dft
 
-use_ppm_sigma = false
 screening_method = minimax
 
 # BGW q->0 head overlay (scalars only; no 185 MB vcoul body dump).

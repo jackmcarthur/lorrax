@@ -1015,20 +1015,28 @@ _DEFAULTS = {
     # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
     # decision this key selects.
     "restart_q_storage": "full",
-    # ``compute_mode`` is the single axis describing the self-energy ansatz.
-    # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
-    # ``ppm_model`` flags so existing input files keep working unchanged.
-    # New input files should set ``compute_mode`` explicitly:
+    # ``compute_mode`` is the single axis describing the self-energy
+    # ansatz, and it is REQUIRED — the empty default means NOT DECLARED
+    # and refuses at ``from_input_file``.  Values:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
+    #
+    # WHY REQUIRED.  Until 0.1.0 this key defaulted to ``"auto"``, which
+    # inferred the mode from ``do_screened`` / ``use_ppm_sigma`` /
+    # ``ppm_model`` — three booleans-ish flags whose eight combinations
+    # named four modes, one of which (use_ppm_sigma without do_screened)
+    # was a refusal.  A deck that named none of them ran COHSEX by
+    # accident of the defaults.  One line per deck buys single-point
+    # resolution forever; the three legacy flags are deleted (see
+    # ``_LEGACY_DECK_KEYS``).  It must still HAVE an entry here, because
+    # ``read_lorrax_input`` builds params from this table alone.
     #
     # ``mpa`` — the multipole-W ansatz, the owner's "FF" — PARSES TODAY AND
     # REFUSES TO RUN TODAY.  Its Σ stage has not landed, so the driver
     # stops at entry naming the mode rather than falling through to a
-    # plasmon-pole run; ``auto`` never infers it, and no legacy flag
-    # combination reaches it.  See ``UNIMPLEMENTED_MODES`` beside the enum
-    # for why the value ships ahead of the kernels, and the ``ComputeMode``
+    # plasmon-pole run.  See ``UNIMPLEMENTED_MODES`` beside the enum for
+    # why the value ships ahead of the kernels, and the ``ComputeMode``
     # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
-    "compute_mode": "auto",
+    "compute_mode": "",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
     # from the deprecated ``self_consistent`` key (true → self_consistent)
@@ -1036,7 +1044,6 @@ _DEFAULTS = {
     # files should set it explicitly:
     #   "one_shot_dft" | "fixed_point" | "self_consistent".
     "qp_solver": "auto",
-    "do_screened": True,
     "bispinor": False,
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
@@ -1074,7 +1081,6 @@ _DEFAULTS = {
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
-    "use_ppm_sigma": False,
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
     # true`` disables it and emits the raw QE-basis-dependent diagonals.
@@ -1355,12 +1361,12 @@ _DEFAULTS = {
     "regenerate_minimax_tables": False,
     "minimax_energy_reference": "midgap",
     # PPM
-    # ppm_model picks the two-point pole-fit ansatz:
-    #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
-    #          ppm_omega_p ≈ 2 Ry by default).
-    #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real,
-    #          chosen above all transition energies; default 200 Ry).
-    "ppm_model": "gn",
+    # WHICH two-point pole-fit ansatz is ``compute_mode``'s job:
+    #   gn_ppm — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
+    #            ppm_omega_p ≈ 2 Ry by default).
+    #   hl_ppm — Hybertsen-Louie: second probe at ω = ppm_omega_p (real,
+    #            chosen above all transition energies).
+    # (``ppm_model`` was the second spelling of that axis; deleted 0.1.0.)
     "ppm_omega_p": 2.0,
     "ppm_fallback_omega": 2.0,
     # Override the head pole frequency Ω_h directly (Ry).  Useful for
@@ -1512,7 +1518,33 @@ _LEGACY_DECK_KEYS = frozenset({
     # running and say what it lost.  See file_io/slab_io.py.
     "slab_io",                      # warn-and-ignore (one transport now)
     "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
+    # 0.1.0: the three legacy self-energy-ansatz flags that
+    # ``compute_mode = auto`` used to infer from.  REFUSED, not
+    # warn-and-ignored, because each of them CHANGED THE PHYSICS ARM: a
+    # deck carrying ``do_screened = false`` that quietly became a screened
+    # run is the wrong-arm-at-rc=0 failure this whole layer exists to
+    # stop.  ``compute_mode`` is required now, so an old deck has to be
+    # edited regardless; the refusal says what to write.
+    "do_screened",                  # refuse -> compute_mode
+    "use_ppm_sigma",                # refuse -> compute_mode
+    "ppm_model",                    # refuse -> compute_mode
 })
+
+#: The legacy-flag combination each retired ansatz flag stood for, as the
+#: ``compute_mode`` value that now says it.  One table so the three
+#: refusal messages cannot drift from each other.
+_RETIRED_MODE_FLAGS = {
+    "do_screened": (
+        "'do_screened = false' is 'compute_mode = x_only'; "
+        "'do_screened = true' is any of cohsex / gn_ppm / hl_ppm / mpa"),
+    "use_ppm_sigma": (
+        "'use_ppm_sigma = true' is 'compute_mode = gn_ppm' (or hl_ppm); "
+        "'use_ppm_sigma = false' with screening on is "
+        "'compute_mode = cohsex'"),
+    "ppm_model": (
+        "'ppm_model = gn' is 'compute_mode = gn_ppm' and 'ppm_model = hl' "
+        "is 'compute_mode = hl_ppm'"),
+}
 
 #: RENAMED deck keys: ``{old spelling: new spelling}``.  One release of
 #: grace per rename — the old key parses AS the new one and says so once
@@ -1541,7 +1573,6 @@ _NORMALIZE_STR = {
     "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
     "w_dyson_solver",
     "ppm_invalid_mode",
-    "ppm_model",
     "ppm_probe_chi_reuse",
     # ``restart_q_storage`` normalises here and is VALIDATED at parse time
     # against RESTART_Q_STORAGE, the same shape ``hartree_source`` uses: a
@@ -1666,6 +1697,25 @@ def read_lorrax_input(filename: str) -> dict:
             raise ValueError(
                 "Input key 'use_shipped_minimax_tables' is no longer supported. "
                 "Use 'regenerate_minimax_tables = true/false' instead.")
+
+        # The three retired self-energy-ansatz flags.  REFUSE: each one
+        # selected a physics arm, so ignoring it would run a different
+        # self-energy than the deck names.
+        _retired_modes = [k for k in _RETIRED_MODE_FLAGS
+                          if section.get(k, fallback=None) is not None]
+        if _retired_modes:
+            raise ValueError(
+                f"{len(_retired_modes)} retired self-energy flag(s) in "
+                f"{filename}; ``compute_mode`` is the single axis and it is "
+                f"required:\n"
+                + "\n".join(
+                    f"    {k} ({_deck_key_line(lines, start, end, k)}): "
+                    f"{_RETIRED_MODE_FLAGS[k]}"
+                    for k in _retired_modes)
+                + "\n  Delete the flag(s) and write one "
+                  "'compute_mode = x_only|cohsex|gn_ppm|hl_ppm|mpa' line.  "
+                  "A deck that named none of the three used to run COHSEX "
+                  "by accident of the defaults.")
 
         # RETIRED-KEY REPORT.  A key with an explicit legacy branch is
         # exempt from the unknown-key check below so one deck key never
@@ -2082,9 +2132,13 @@ class DynamicSigmaConfig:
 
 @dataclass(frozen=True)
 class PPMConfig:
-    """Parameters specific to the two-point plasmon-pole ansatz."""
-    # --- Model selection ---
-    model: str                    # "gn" | "hl" — picked by ComputeMode usually
+    """Parameters specific to the two-point plasmon-pole ansatz.
+
+    WHICH of the two fits runs is ``ComputeMode.ppm_model``, not a field
+    here: the ``model`` field was the deck key ``ppm_model``'s only
+    reader, and its only reader in turn was ``compute_mode = auto``.
+    Both are deleted (0.1.0) — one axis, one spelling.
+    """
     omega_p: float                # probe ω (Ry); imag for GN, real for HL
     fallback_omega: float
     head_omega_h_ry: float | None # override Ω_h directly (BGW comparisons)
@@ -2380,13 +2434,11 @@ class LorraxConfig:
     #: on its way out can speak to the decks that pin it without speaking to
     #: every other deck in the tree.
     raw_input_keys: frozenset
-    compute_mode_raw: str         # "auto" | one of ComputeMode.value strings
+    compute_mode_raw: str         # one of ComputeMode.value strings (required)
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
-    do_screened: bool
     bispinor: bool
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
-    use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
     no_degen_averaging: bool
     degen_avg_tol_ry: float
 
@@ -2415,13 +2467,12 @@ class LorraxConfig:
 
     @property
     def compute_mode(self) -> ComputeMode:
-        """Resolve ``compute_mode`` from explicit input or legacy flags.
+        """The self-energy ansatz the deck asked for.
 
-        ``compute_mode = auto`` (the default) infers from
-        ``do_screened`` / ``use_ppm_sigma`` / ``ppm.model``.  An explicit
-        setting overrides them; the legacy fields are still parsed for
-        back-compat but the enum is the load-bearing axis the driver
-        pivots on.
+        REQUIRED — there is no default and no ``auto``.  Both were
+        deleted for 0.1.0 with the three legacy flags ``auto`` inferred
+        from (``do_screened`` / ``use_ppm_sigma`` / ``ppm_model``); see
+        ``_DEFAULTS["compute_mode"]``.
 
         RESOLVING IS NOT PERMITTING.  This property answers "which mode
         did the deck ask for", and it answers it for every member of the
@@ -2430,39 +2481,18 @@ class LorraxConfig:
         :func:`refuse_unimplemented_compute_mode`, called at driver
         entry, so that config-only consumers (the deck echo, the layering
         tests, an operator reading a config back) can name the mode
-        without tripping over it.  ``auto`` never infers an unimplemented
-        mode: the legacy flags it reads predate all of them.
+        without tripping over it.
         """
-        raw = (self.compute_mode_raw or "auto").strip().lower()
-        if raw == "auto":
-            if self.use_ppm_sigma:
-                if not self.do_screened:
-                    raise ValueError(
-                        "use_ppm_sigma=true requires do_screened=true."
-                    )
-                return (
-                    ComputeMode.HL_PPM
-                    if str(self.ppm.model).strip().lower() == "hl"
-                    else ComputeMode.GN_PPM
-                )
-            return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
-        try:
-            explicit = ComputeMode(raw)
-        except ValueError as exc:
+        raw = (self.compute_mode_raw or "").strip().lower()
+        if not raw:
             raise ValueError(
-                f"compute_mode={raw!r} invalid; expected one of: "
-                f"{', '.join(m.value for m in ComputeMode)}, or 'auto'."
-            ) from exc
-        # The enum is load-bearing: an explicit screened mode contradicts
-        # the legacy ``do_screened = false``.  (Explicit ``x_only`` simply
-        # wins over the do_screened default — the driver derives its
-        # screening entirely from the mode.)
-        if explicit is not ComputeMode.X_ONLY and not self.do_screened:
-            raise ValueError(
-                f"compute_mode={raw!r} requires screening, but the legacy "
-                f"flag do_screened=false was also set. Remove one of the two."
-            )
-        return explicit
+                f"compute_mode is REQUIRED and this config carries none.  "
+                f"Write one of: "
+                f"{', '.join(m.value for m in ComputeMode)}.  It used to "
+                f"default to 'auto', which inferred the self-energy ansatz "
+                f"from three legacy flags; a deck naming none of them ran "
+                f"COHSEX by accident of the defaults.")
+        return coerce_compute_mode(raw)
 
     @property
     def qp_solver(self) -> QPSolver:
@@ -2477,8 +2507,7 @@ class LorraxConfig:
            lands here: its intended meaning — authoritative at-DFT QP
            evaluation — IS the default.)
 
-        An explicit setting overrides the legacy flags, mirroring how
-        ``compute_mode`` absorbs ``do_screened`` / ``use_ppm_sigma``.
+        An explicit setting overrides the legacy flag.
 
         Validation (mutually inconsistent axis combinations):
 
@@ -2696,7 +2725,6 @@ class LorraxConfig:
             minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
         )
         ppm = PPMConfig(
-            model=str(_g("ppm_model")).strip().lower(),
             omega_p=float(_g("ppm_omega_p")),
             fallback_omega=float(_g("ppm_fallback_omega")),
             head_omega_h_ry=(
@@ -2989,6 +3017,22 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
+        # ``compute_mode`` is REQUIRED.  Refused HERE rather than at the
+        # property, so a deck that forgot it fails at parse rather than at
+        # the driver's first read — and validated here too, so a TYPO
+        # fails at the same moment as an omission.
+        _compute_mode_raw = str(_g("compute_mode") or "").strip().lower()
+        if not _compute_mode_raw:
+            raise ValueError(
+                f"compute_mode is REQUIRED and {filename} does not set it.  "
+                f"Write one of: "
+                f"{', '.join(m.value for m in ComputeMode)}.  It used to "
+                f"default to 'auto', which inferred the self-energy ansatz "
+                f"from the do_screened / use_ppm_sigma / ppm_model flags "
+                f"(all three now deleted); a deck naming none of them ran "
+                f"COHSEX by accident of the defaults.")
+        coerce_compute_mode(_compute_mode_raw)
+
         # Band-window and dimensionality ranges, checked HERE because
         # ``zeta_nband`` below is the only one of the five that has ever
         # been.  Each of these otherwise dies far downstream and in the
@@ -3057,13 +3101,11 @@ class LorraxConfig:
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
             raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
-            compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
+            compute_mode_raw=_compute_mode_raw,
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
-            do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
             do_G0=bool(_g("do_G0")),
             self_consistent=bool(_g("self_consistent")),
-            use_ppm_sigma=bool(_g("use_ppm_sigma")),
             no_degen_averaging=bool(_g("no_degen_averaging")),
             degen_avg_tol_ry=float(_g("degen_avg_tol_ry")),
             # Sub-dataclass groups

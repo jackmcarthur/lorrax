@@ -106,10 +106,14 @@ def test_a_typo_gets_the_unknown_mode_error_not_the_refusal():
     assert not isinstance(exc.value, NotImplementedError)
 
 
-def test_auto_never_infers_the_unimplemented_mode():
-    """``compute_mode = auto`` reads legacy flags that predate every
-    unimplemented mode, so no combination of them can reach one.  This is
-    what makes the refusal safe to install: no existing deck acquires it.
+def test_the_resolver_never_hands_back_a_mode_the_deck_did_not_name():
+    """No inference path can reach an unimplemented mode.
+
+    Until 0.1.0 the danger was ``compute_mode = auto``, which INFERRED the
+    mode from three legacy flags; the test read the resolver's returns to
+    prove no combination reached one.  ``auto`` and the flags are gone and
+    the key is required, so the resolver returns exactly what the deck
+    named — and this reads the returns to prove that stays true.
     """
     source = (_GW / "gw_config.py").read_text()
     tree = ast.parse(source)
@@ -455,7 +459,7 @@ def test_the_documented_set_in_the_config_lists_the_new_value():
     deck author reads; a value missing from it is a value nobody finds."""
     source = (_GW / "gw_config.py").read_text()
     block = source[source.index("# ``compute_mode`` is the single axis"):
-                   source.index('"compute_mode": "auto"')]
+                   source.index('"compute_mode": ""')]
     for mode in ComputeMode:
         assert f'"{mode.value}"' in block
 

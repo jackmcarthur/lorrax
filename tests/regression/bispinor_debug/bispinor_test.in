@@ -43,7 +43,6 @@ memory_per_device_gb = 30.0
 
 restart = false
 
-do_screened = true
 compute_mode = gn_ppm
 
 # Explicit head bypass (no dipole.h5 / eps0mat.h5): both heads = 0.
@@ -55,7 +54,6 @@ output_file = sigma_diag_bispinor_test.dat
 sigma_diag_file = sigma_diag_bispinor_test.dat
 
 qp_solver = one_shot_dft
-use_ppm_sigma = true
 screening_method = minimax
 ppm_omega_p = 2.0
 ppm_fallback_omega = 2.0

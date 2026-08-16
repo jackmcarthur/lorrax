@@ -137,7 +137,7 @@ def test_a_deck_that_never_heard_of_the_key_gets_full(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
     assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
 
 
@@ -155,7 +155,7 @@ def test_the_hand_built_params_fallback_agrees_with_the_registered_default(
     from gw.gw_config import LorraxConfig, _DEFAULTS
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
     cfg = LorraxConfig.from_input_file(str(deck),
                                        print_fn=lambda *a, **k: None)
     assert cfg.restart_q_storage_raw == _DEFAULTS["restart_q_storage"]
@@ -173,7 +173,7 @@ def test_the_key_normalises_case_and_whitespace(tmp_path, spelling):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text(f"[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text(f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     f"restart_q_storage = {spelling}\n")
     got = read_lorrax_input(str(deck))["restart_q_storage"]
     assert got == spelling.strip().lower()
@@ -184,7 +184,7 @@ def test_the_key_is_not_an_unknown_deck_key(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     "strict_keys = true\nrestart_q_storage = full\n")
     assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
 
@@ -201,7 +201,7 @@ def test_the_key_reaches_the_dataclass_as_a_RAW_field(tmp_path, monkeypatch):
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     "restart_q_storage = auto\n")
     cfg = LorraxConfig.from_input_file(str(deck),
                                        print_fn=lambda *a, **k: None)
@@ -221,7 +221,7 @@ def test_a_typo_dies_at_parse_time_not_after_the_compute(tmp_path,
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     "restart_q_storage = wedge\n")
     with pytest.raises(ValueError, match=r"restart_q_storage='wedge'"):
         LorraxConfig.from_input_file(str(deck),
@@ -604,10 +604,10 @@ def test_the_parser_records_which_keys_the_deck_itself_named(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     bare = tmp_path / "bare.in"
-    bare.write_text("[LORRAX]\nnval = 4\nncond = 4\n")
+    bare.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\n")
     pinned = tmp_path / "pinned.in"
     pinned.write_text(
-        "[LORRAX]\nnval = 4\nncond = 4\nrestart_q_storage = full\n")
+        "[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nrestart_q_storage = full\n")
 
     bare_keys = read_lorrax_input(str(bare))["_deck_named_keys"]
     pin_keys = read_lorrax_input(str(pinned))["_deck_named_keys"]

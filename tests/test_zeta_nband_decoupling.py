@@ -111,7 +111,7 @@ def test_zeta_nband_equal_to_nband_collapses_to_unset_at_parse_time(tmp_path):
     from gw.gw_config import LorraxConfig, read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[cohsex]\nnval = 8\nncond = 52\nnband = 60\n"
+    deck.write_text("[cohsex]\ncompute_mode = cohsex\nnval = 8\nncond = 52\nnband = 60\n"
                     "zeta_nband = 60\n")
     params = read_lorrax_input(str(deck))
     assert params["zeta_nband"] == 60          # the deck said what it said
@@ -126,10 +126,10 @@ def test_an_unset_key_is_none_and_a_set_one_is_an_int(tmp_path):
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[cohsex]\nnval = 8\nncond = 44\nnband = 60\n")
+    deck.write_text("[cohsex]\ncompute_mode = cohsex\nnval = 8\nncond = 44\nnband = 60\n")
     assert LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_: None).zeta_nband is None
-    deck.write_text("[cohsex]\nnval = 8\nncond = 44\nnband = 60\n"
+    deck.write_text("[cohsex]\ncompute_mode = cohsex\nnval = 8\nncond = 44\nnband = 60\n"
                     "zeta_nband = 52\n")
     cfg = LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
     assert cfg.zeta_nband == 52 and isinstance(cfg.zeta_nband, int)
@@ -143,7 +143,7 @@ def test_a_non_integer_edge_is_refused_rather_than_truncated(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[cohsex]\nnband = 60\nzeta_nband = 52.5\n")
+    deck.write_text("[cohsex]\ncompute_mode = cohsex\nnband = 60\nzeta_nband = 52.5\n")
     with pytest.raises(ValueError):
         read_lorrax_input(str(deck))
 
@@ -155,7 +155,7 @@ def test_wider_than_nband_is_refused_by_name(tmp_path):
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[cohsex]\nnband = 60\nzeta_nband = 68\n")
+    deck.write_text("[cohsex]\ncompute_mode = cohsex\nnband = 60\nzeta_nband = 68\n")
     with pytest.raises(ValueError, match="zeta_nband"):
         LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
 

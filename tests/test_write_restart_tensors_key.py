@@ -86,7 +86,7 @@ def test_a_deck_that_never_heard_of_the_key_still_writes(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
     assert read_lorrax_input(str(deck))["write_restart_tensors"] is True
 
 
@@ -107,7 +107,7 @@ def test_the_key_parses_the_decks_boolean_grammar(tmp_path, spelling, want):
 
     deck = tmp_path / "cohsex.in"
     deck.write_text(
-        f"[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+        f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
         f"write_restart_tensors = {spelling}\n")
     got = read_lorrax_input(str(deck))["write_restart_tensors"]
     assert got is want
@@ -125,7 +125,7 @@ def test_the_key_is_not_an_unknown_deck_key(tmp_path, capsys):
 
     deck = tmp_path / "cohsex.in"
     deck.write_text(
-        "[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+        "[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
         "strict_keys = true\nwrite_restart_tensors = false\n")
     assert read_lorrax_input(str(deck))["write_restart_tensors"] is False
 
@@ -144,7 +144,7 @@ def test_the_key_reaches_the_config_object_the_driver_holds(tmp_path,
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     "write_restart_tensors = false\n")
     cfg = LorraxConfig.from_input_file(str(deck),
                                        print_fn=lambda *a, **k: None)
@@ -157,7 +157,7 @@ def test_the_key_reaches_the_config_object_the_driver_holds(tmp_path,
 # ---------------------------------------------------------------------------
 
 def _cfg(**kw):
-    base = dict(write_restart_tensors=True, do_screened=True)
+    base = dict(write_restart_tensors=True)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -209,7 +209,7 @@ def test_a_config_object_predating_the_key_still_writes():
     """
     from gw.gw_output import restart_tensor_writes_enabled
 
-    bare = types.SimpleNamespace(do_screened=True)
+    bare = types.SimpleNamespace()
     assert restart_tensor_writes_enabled(bare, "/tmp/x.h5") is True
 
 
@@ -255,8 +255,7 @@ def _persist(tmp_path, monkeypatch, *, key, precreate):
     # answers ``is_dynamic``, ``ppm_model`` and everything else the writer
     # asks it exactly as a run would.
     cfg = types.SimpleNamespace(
-        do_screened=True, write_restart_tensors=key,
-        compute_mode=ComputeMode.COHSEX)
+        write_restart_tensors=key, compute_mode=ComputeMode.COHSEX)
     persist_w0_and_head(
         object(), tensors_filename=str(path), head_resolver=_Resolver(),
         config=cfg, meta=types.SimpleNamespace(n_rmu=4), mesh_xy=None,
@@ -412,7 +411,7 @@ def test_bse_refuses_by_name_when_the_restart_file_is_absent(tmp_path):
     from bse import bse_io
 
     deck = tmp_path / "bse.in"
-    deck.write_text("[LORRAX]\nnval = 4\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\n")
     (tmp_path / "tmp").mkdir()
     with pytest.raises(FileNotFoundError) as exc:
         bse_io._find_restart_file(str(deck))
@@ -431,7 +430,7 @@ def test_the_missing_file_arm_is_distinct_from_the_ambiguous_arm(tmp_path):
     from bse import bse_io
 
     deck = tmp_path / "bse.in"
-    deck.write_text("[LORRAX]\nnval = 4\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\n")
     tmpdir = tmp_path / "tmp"
     tmpdir.mkdir()
     (tmpdir / "isdf_tensors_144.h5").write_bytes(b"")

@@ -342,13 +342,14 @@ def persist_w0_and_head(
     flow through automatically because ``HeadResolver`` consults the
     config's override fields first before falling back to s_tensor/epshead.
 
-    No-op unless ``config.do_screened``, the deck asked for restart tensor
-    writes (``write_restart_tensors``), and the restart file exists.  The
-    file-exists arm is not redundant with the key: a ``restart = true`` run
-    reuses tensors it did not write, and would otherwise re-stamp a W0 into
-    a file the deck said to leave alone.
+    No-op unless the mode builds a W (``compute_mode.needs_screening``),
+    the deck asked for restart tensor writes (``write_restart_tensors``),
+    and the restart file exists.  The file-exists arm is not redundant
+    with the key: a ``restart = true`` run reuses tensors it did not
+    write, and would otherwise re-stamp a W0 into a file the deck said to
+    leave alone.
     """
-    if not config.do_screened:
+    if not config.compute_mode.needs_screening:
         return
     if not restart_tensor_writes_enabled(config, tensors_filename):
         return
@@ -600,7 +601,8 @@ def write_freq_debug(
         _cols.append(
             ("coh_0", np.real(np.diagonal(
                 np.asarray(results.sig_coh), axis1=1, axis2=2)) * RYD_TO_EV))
-        if static_head_terms is not None and config.do_screened:
+        if (static_head_terms is not None
+                and config.compute_mode.needs_screening):
             _cols.append((
                 "sex_head",
                 _broadcast_head_diag_to_kij(static_head_terms.sigma_sx_diag),

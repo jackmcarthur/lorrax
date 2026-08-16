@@ -66,8 +66,6 @@ page has to read it from.
 
 | key | default | meaning |
 |---|---|---|
-| `do_screened` | true | Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it. |
-| `use_ppm_sigma` | false | Legacy flag for the dynamic PPM Sigma^c(omega); compute_mode=auto reads it. |
 | `w_dyson_solver` | `"auto"` | W Dyson plan: local (per-q pivoted LU; auto alias) | distributed (2-D block-cyclic backsolve; refuses loudly, never downgrades). |
 | `mc_average_vcoul_body` | true | Monte-Carlo mini-BZ average of the Coulomb body at every q!=0. Matches BGW's **default** `cell_average_cutoff` (1e12, average everywhere). Set **false** to match a BGW run with `cell_average_cutoff 1d-12` ("noavg"), which averages ONLY the literal q+G=0 element (vcoul_generator.f90:101-103). Mismatching it cost 136 meV MAE in bare Sigma_X on the Si 4x4x4 anchor; see tests/regression/si_cohsex_debug/README.md. |
 | `mc_average_placement` | off | WHERE the q!=0 mini-BZ average is applied. Orthogonal to `mc_average_vcoul_body`, which decides WHETHER one is computed. **off** (default) = today's placement: `<v>` is substituted into the argmin `\|q+G\|` slots of the one production V tile, which is then both the Dyson operator and the Dyson right-hand side (`w_isdf.py:382-384`). **bgw** = BerkeleyGW parity: the average is applied to W's HEAD CHANNEL as a real scalar per q-cell AFTER the Dyson solve, i.e. `W_head = eps_c^-1 <v>` with `eps_c` built from the bare `v` — the placement BGW's Sigma (`mtxel_cor.f90:1659-1662`) and BSE (`intkernel.f90:887`) both use, and the exact cell average of the screened head under the f-sum-rule scaling `chi ~ q^2`. **schur_avg** = the derivable target `<W>_C = <v eps^-1>_C`; wired and REFUSED (it needs `chi` inside the cell). q=0 is untouched in every mode. `off` reproduces every existing deck bit-identically; `bgw` moves W and therefore every frozen reference. Costs a second Dyson solve per q. Refuses on `restart = true` and on the bispinor V_q builder. See `src/gw/head_channel.py`. |
@@ -94,7 +92,6 @@ page has to read it from.
 | `mpa_varpi_far_ry` | `2.0` | Height in Ry of the far complex-frequency sampling line; must exceed `mpa_varpi_near_ry`. |
 | `mpa_head_model` | `"fixed_dft"` | MPA q→0 head policy. Only `fixed_dft` is accepted: fit and reuse the established two-point DFT scalar head while the body is rebuilt. This omits dynamic local-field head/wing feedback. |
 | `mpa_pole_batch_size` | `4` | Maximum fitted-pole slabs resident during MPA Sigma. Values 1–4 are accepted. This is an HBM schedule, not a spectral grouping. |
-| `ppm_model` | `"gn"` | Plasmon-pole ansatz: gn (Godby-Needs, imaginary probe) | hl (Hybertsen-Louie, real probe). |
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |
 | `ppm_head_omega_h_ry` | None | Override the q->0 head pole Omega_h (Ry) directly; None = compute normally. BGW comparison aid. |
@@ -105,7 +102,7 @@ page has to read it from.
 
 | key | default | meaning |
 |---|---|---|
-| `compute_mode` | `"auto"` | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto never infers mpa. mpa parses and REFUSES TO RUN until one real-material chi/W/fixed-head/Sigma/QSGW disk calculation passes end to end. Its internal components do not weaken that refusal. See [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
+| `compute_mode` | *(required)* | Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa. REQUIRED — there is no default and no `auto`; `auto` and the three legacy flags it inferred from (`do_screened`, `use_ppm_sigma`, `ppm_model`) were deleted for 0.1.0, and those spellings now REFUSE naming this key. mpa parses and REFUSES TO RUN until one real-material chi/W/fixed-head/Sigma/QSGW disk calculation passes end to end. Its internal components do not weaken that refusal. See [Multipole frequency integration](theory/THEORY_mpa_implementation.md). |
 | `no_degen_averaging` | false | Disable BGW-style averaging of diagonal Sigma within degenerate sets. |
 | `degen_avg_tol_ry` | `1e-06` | Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry). |
 | `ppm_sigma_target_error` | `1e-06` | Target error of the PPM Sigma^c tau-quadrature. |

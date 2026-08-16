@@ -37,8 +37,22 @@ memory_per_device_gb = 4.0
 
 def _config(tmp_path, extra: str = "", name: str = "cohsex_qp.in"):
     path = tmp_path / name
-    path.write_text(BASE_INPUT + extra)
+    path.write_text(_with_compute_mode(BASE_INPUT + extra))
     return LorraxConfig.from_input_file(str(path), print_fn=lambda *a, **k: None)
+
+
+def _with_compute_mode(body: str, mode: str = "cohsex") -> str:
+    """Supply ``compute_mode`` unless the case under test names its own.
+
+    The key is REQUIRED as of 0.1.0.  ``cohsex`` is what the deleted
+    ``compute_mode = auto`` resolved to for a deck that named none of the
+    three legacy flags, so every case that does not care about the mode
+    keeps the behaviour it was written against.
+    """
+    if re.search(r"^\s*compute_mode\s*[=:]", body, re.M):
+        return body
+    head, sep, rest = body.partition("\n")
+    return f"{head}{sep}compute_mode = {mode}\n{rest}"
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +181,7 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     monkeypatch.setenv("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")
     lines: list[str] = []
     path = tmp_path / "cohsex_env.in"
-    path.write_text(BASE_INPUT + "sc_max_iter = 99\n")
+    path.write_text(_with_compute_mode(BASE_INPUT + "sc_max_iter = 99\n"))
     sc = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
     ).sc
@@ -324,6 +338,78 @@ def test_mixed_case_key_survives_strict_keys(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# compute_mode is REQUIRED, and the three legacy ansatz flags it used to be
+# inferred from REFUSE.  They are refused rather than warn-and-ignored
+# because each of them selected a PHYSICS ARM.
+# ---------------------------------------------------------------------------
+
+def test_compute_mode_is_required(tmp_path):
+    from gw.gw_config import LorraxConfig
+
+    p = tmp_path / "deck_nomode.in"
+    p.write_text(BASE_INPUT)          # deliberately NOT _with_compute_mode
+    with pytest.raises(ValueError) as exc:
+        LorraxConfig.from_input_file(str(p), print_fn=lambda *a, **k: None)
+    msg = str(exc.value)
+    assert "compute_mode is REQUIRED" in msg
+    for mode in ("x_only", "cohsex", "gn_ppm", "hl_ppm", "mpa"):
+        assert mode in msg
+
+
+def test_a_typo_in_compute_mode_fails_at_parse_not_at_first_read(tmp_path):
+    """An omission and a typo must fail at the same moment."""
+    from gw.gw_config import LorraxConfig
+
+    p = tmp_path / "deck_typo.in"
+    p.write_text(_with_compute_mode(BASE_INPUT, mode="cohsexx"))
+    with pytest.raises(ValueError, match="cohsexx"):
+        LorraxConfig.from_input_file(str(p), print_fn=lambda *a, **k: None)
+
+
+def test_auto_is_no_longer_a_compute_mode_value(tmp_path):
+    from gw.gw_config import LorraxConfig
+
+    p = tmp_path / "deck_auto.in"
+    p.write_text(_with_compute_mode(BASE_INPUT, mode="auto"))
+    with pytest.raises(ValueError, match="auto"):
+        LorraxConfig.from_input_file(str(p), print_fn=lambda *a, **k: None)
+
+
+@pytest.mark.parametrize("line, needle", [
+    ("do_screened = false", "compute_mode = x_only"),
+    ("do_screened = true", "compute_mode = x_only"),
+    ("use_ppm_sigma = true", "compute_mode = gn_ppm"),
+    ("ppm_model = hl", "compute_mode = hl_ppm"),
+])
+def test_retired_ansatz_flags_refuse_naming_their_replacement(
+        tmp_path, line, needle):
+    from gw.gw_config import read_lorrax_input
+
+    p = tmp_path / "deck_retired_mode.in"
+    p.write_text(_with_compute_mode(BASE_INPUT) + line + "\n")
+    with pytest.raises(ValueError) as exc:
+        read_lorrax_input(str(p))
+    msg = str(exc.value)
+    assert line.split("=")[0].strip() in msg
+    assert needle in msg
+
+
+def test_all_three_retired_flags_are_named_at_once(tmp_path):
+    """One report, not three runs of trial and error."""
+    from gw.gw_config import read_lorrax_input
+
+    p = tmp_path / "deck_retired_all.in"
+    p.write_text(_with_compute_mode(BASE_INPUT)
+                 + "do_screened = true\nuse_ppm_sigma = true\n"
+                   "ppm_model = gn\n")
+    with pytest.raises(ValueError) as exc:
+        read_lorrax_input(str(p))
+    msg = str(exc.value)
+    assert all(k in msg for k in
+               ("do_screened", "use_ppm_sigma", "ppm_model"))
+
+
+# ---------------------------------------------------------------------------
 # UNIMPLEMENTED_OPTIONS — declared-but-not-built option VALUES, refused at
 # parse time.  Both rows previously died deep in a kernel, after the WFN
 # read and the whole screening stage.
@@ -360,7 +446,7 @@ def test_unimplemented_option_values_stay_legal_vocabulary(tmp_path):
         ("ppm_invalid_mode", "imaginary"),
     }
     # Neither validator refuses the value it owns.
-    PPMConfig(model="gn", omega_p=2.0, fallback_omega=2.0,
+    PPMConfig(omega_p=2.0, fallback_omega=2.0,
               head_omega_h_ry=None, probe_chi_reuse="off",
               sigma_target_error=1e-6, sigma_max_nodes=64,
               invalid_mode="imaginary")
@@ -379,7 +465,8 @@ def test_unimplemented_option_values_stay_legal_vocabulary(tmp_path):
 def _geom_config(tmp_path, *, nval=2, ncond=2, nband=10, sys_dim=2):
     path = tmp_path / "cohsex_geom.in"
     path.write_text(
-        f"[cohsex]\nnval = {nval}\nncond = {ncond}\nnband = {nband}\n"
+        f"[cohsex]\ncompute_mode = cohsex\n"
+        f"nval = {nval}\nncond = {ncond}\nnband = {nband}\n"
         f"sys_dim = {sys_dim}\nmemory_per_device_gb = 4.0\n")
     return LorraxConfig.from_input_file(str(path),
                                         print_fn=lambda *a, **k: None)
@@ -580,7 +667,7 @@ def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
     _pin_backend(monkeypatch, "cpu")
     lines: list[str] = []
     path = tmp_path / "cohsex_auto_cpu.in"
-    path.write_text(BASE_INPUT)
+    path.write_text(_with_compute_mode(BASE_INPUT))
     cfg = LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     assert cfg.backend.distributed_cholesky == "auto"

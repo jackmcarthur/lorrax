@@ -13,6 +13,7 @@ from gw.mpa import model, sample_plan
 
 _BASE = """\
 [cohsex]
+compute_mode = cohsex
 nval = 2
 ncond = 2
 nband = 10

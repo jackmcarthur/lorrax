@@ -530,7 +530,7 @@ def test_a_deck_that_never_heard_of_the_key_writes_nothing_new(tmp_path):
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n")
     assert read_lorrax_input(str(deck))["write_qsgw_datasets"] is False
 
 
@@ -544,7 +544,7 @@ def test_the_key_parses_the_decks_boolean_grammar(tmp_path, spelling, want):
 
     deck = tmp_path / "cohsex.in"
     deck.write_text(
-        f"[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+        f"[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
         f"write_qsgw_datasets = {spelling}\n")
     assert read_lorrax_input(str(deck))["write_qsgw_datasets"] is want
 
@@ -561,7 +561,7 @@ def test_the_key_is_not_an_unknown_deck_key_and_reaches_the_config(
     from gw.gw_config import LorraxConfig
 
     deck = tmp_path / "cohsex.in"
-    deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n"
+    deck.write_text("[LORRAX]\ncompute_mode = cohsex\nnval = 4\nncond = 4\nnband = 8\n"
                     "strict_keys = true\nwrite_qsgw_datasets = true\n")
     cfg = LorraxConfig.from_input_file(str(deck),
                                        print_fn=lambda *a, **k: None)

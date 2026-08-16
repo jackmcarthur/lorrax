@@ -41,6 +41,7 @@ from gw.gw_config import LorraxConfig, normalize_w_dyson_solver
 
 BASE_INPUT = """\
 [cohsex]
+compute_mode = cohsex
 nval = 2
 ncond = 2
 nband = 10

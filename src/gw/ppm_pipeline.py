@@ -183,9 +183,6 @@ def compute_ppm_sigma_pipeline(
     The ansatz-neutral finalizer injects that head, interpolates, writes and
     builds the QSGW matrix.
     """
-    if not config.do_screened:
-        raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
-
     # THE POLE MODEL IS THE ENTRY CONDITION.  This module is the two-point
     # plasmon-pole fit and everything below it — the probe frequency, the
     # head fit, the printed label — reads the mode as "HL, or else GN".
@@ -194,6 +191,10 @@ def compute_ppm_sigma_pipeline(
     # refusal at each of those three reads.  ``sigma_dispatch`` refuses it
     # before this call; this is the invariant restated where it is relied
     # upon, for the benefit of any other caller.
+    #
+    # It also SUBSUMES the ``do_screened`` guard that used to stand above
+    # it, which was already dead: both pole models are screened modes, so
+    # ``ppm_model is not None`` implies ``needs_screening``.
     ppm_model = config.compute_mode.ppm_model
     if ppm_model is None:
         raise NotImplementedError(
