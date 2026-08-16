@@ -509,6 +509,66 @@ $6.5\times10^{-4}$ to $2\times10^{-3}$ reduced the physical census from 478
 to 446 without a measurable change relative to the 478-node plan at the
 $5\times10^{-5}$ meV reporting scale.
 
+### 10.1 The Landau floor, and the omega-clustered decomposition
+
+The linear law above is not a defect of the order search.  Measured on the
+sodium semicore scan, the production rule costs $N_\times = 87F + 10$ at
+$\epsilon_\times=2\times10^{-3}$, $\eta=0.25$ eV — and a Landau-density
+count for ANY stable exponential-sum representation
+$Q(x)=\sum_l\alpha_l e^{-ixt_l}$ that is uniformly accurate on the
+sign-symmetric window gives $N \gtrsim (F/\gamma_{\min})\log(1/\epsilon)/\pi
+\approx 107F$ at these parameters: the target's Laplace content fills
+$t\in[0,\log(1/\epsilon)/\gamma_{\min}]$ and the window is $2F$ wide.  The
+global Gauss rule sits within tens of percent of the floor.  Free complex
+nodes cannot beat it either: the rotated-contour trick that makes the
+sign-definite sector family logarithmic (section 9) needs the domain inside
+a sector $|\arg d|\le\pi/2-\beta$, and the crossing rectangle fills the
+full sector as $F/\gamma\to\infty$ — a ray that decays for $x>0$ grows like
+$e^{|x|\tau\sin\psi}$ for $x<0$.  Rational nodes in $x$ do not factor
+$x=\omega-e-a$ and cannot ride the separable $\tau$ kernel at all.
+
+What IS wrong is the certified region.  For any single evaluation
+frequency, only the thin shell $|\omega-e-a|\lesssim$ (margins) crosses;
+the rest of the $[\omega_{\min},\omega_{\max}]\times$(transitions) product
+set is sign-definite and belongs to the logarithmic family.  The planner
+therefore clusters each branch's $|\omega|$ values at gaps larger than
+`mpa_sigma_omega_cluster_gap_ry` and, when there is more than one cluster,
+splits the core per cluster at the crossing-edge margin $m$:
+
+* bands $e < w_{\rm lo} - a_{\rm hi} - m$: the denominator
+  $\omega-e-a+i\gamma$ keeps a positive real part — a rotated-Laplace fit
+  in CONJUGATE node placement $t=+i\,\bar n$ (the retarded upper-half
+  denominator is the conjugate of the fit family's lower-half domain);
+* the shell: the positive causal rule of this section, with $F$ set by the
+  CLUSTER span and the pole bracket — independent of the dynamic range;
+* bands $e > w_{\rm hi} - a_{\rm lo} + m$: the plasmon-slab orientation of
+  the sector family.
+
+One cluster — every contiguous production grid — reproduces the monolithic
+plan bit for bit.  The metallic `sd_core` sliver decomposes on the same
+pattern (its $x=\omega+e+a$ crosses only where BOTH $\omega$ and $a$ are
+within the excursion scale).  The evaluation grid itself is gapped with
+`sigma_omega_patches_ev`, since $\Sigma(\omega)\to E$ interpolation is
+piecewise linear and needs no points where no QP energy lives; a solved
+energy inside a grid hole is a refusal at the QSGW seam.
+
+Measured at production $\eta$ and tolerances on the synthetic Fe-class
+geometry (valence window + one semicore cluster; every rule certified):
+
+| evaluation span | total nodes | linear law | largest rule |
+|---|---|---|---|
+| 52 eV  | 44 | 344  | 18 |
+| 105 eV | 45 | 679  | 18 |
+| 209 eV | 51 | 1349 | 18 |
+| 419 eV | 52 | 2689 | 18 |
+
+The damped total is exactly flat; only the sector-slab rank creeps
+logarithmically.  The cost is set by how many places the physics evaluates
+$\Sigma$, never by how far apart they are.  Derivation, executor-safety
+constraints (the conjugate placement grows factored exponentials, so the
+references anchor at the mask maximum and masked bands are clamped), and
+the rejected alternatives: `docs/dev/crossing-rule-cost-law.md`.
+
 ## 11. Shared spatial execution
 
 At one scalar time node, MPA constructs
