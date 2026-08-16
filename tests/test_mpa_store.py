@@ -236,23 +236,67 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
     sampling = dict(_SAMPLING, n_p=1)
     mesh = _mesh()
     shape = (1, _N_Q_IBZ, n_mu, n_mu)
-    MS.allocate_w_omega_collective(
+    assert MS.allocate_w_omega_collective(
         tmpdir_path, "W", mesh_xy=mesh, n_omega=1,
         n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables, omega=omega,
-        sampling=sampling, closure_verdict=verdict)
+        sampling=sampling, closure_verdict=verdict) is None
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     W_host = _w_omega(1, _N_Q_IBZ, n_mu)[0]
     W = jax.device_put(W_host, NamedSharding(mesh, P(None, "x", "y")))
+    # BOTH COLLECTIVES RETURN None ON EVERY RANK (audit §E.3 item 3).
+    # They used to hand back the real thing on rank 0 and None
+    # elsewhere, which is a mesh divergence waiting for the first caller
+    # that branches on the return; the readiness count they used to carry
+    # is read from the ledger below, where it lives.
     assert MS.write_w_slab_collective(
         tmpdir_path, "W", 0, W, mesh_xy=mesh,
-        global_shape=shape) == 1
+        global_shape=shape) is None
 
     got, header = MS.read_w_slab(tmpdir_path, "W", 0)
     np.testing.assert_array_equal(got, W_host)
     assert header["data_ready"].tolist() == [True]
+    assert header["n_ready"] == 1
     assert [call[0] for call in calls] == [
         "open", "create", "close", "open", "write", "close"]
+
+
+def test_the_collective_w_writers_answer_the_same_on_every_rank(
+        tmpdir_path, monkeypatch):
+    """RED: a collective whose RETURN TYPE depends on the rank is a trap.
+
+    ``allocate_w_omega_collective`` used to hand back rank 0's header and
+    ``None`` elsewhere; ``write_w_slab_collective`` the new ready count
+    and ``None`` elsewhere.  Every rank calls these, in order, so a caller
+    that writes ``if io_result:`` around the next collective takes the
+    branch on rank 0 only and hangs the mesh — latent solely because both
+    production callers discard the return (audit §E.3 item 3).  This runs
+    the same two calls as a NON-ZERO rank, which is the leg the cell above
+    (``process_rank`` pinned to 0) structurally cannot reach.
+    """
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+    tables, verdict, n_mu = _geometry()
+    mesh = _mesh()
+    shape = (1, _N_Q_IBZ, n_mu, n_mu)
+    W = jax.device_put(_w_omega(1, _N_Q_IBZ, n_mu)[0],
+                       NamedSharding(mesh, P(None, "x", "y")))
+    for rank in (0, 1):
+        monkeypatch.setattr(collectives, "process_rank", lambda r=rank: r)
+        assert MS.allocate_w_omega_collective(
+            tmpdir_path, "W", mesh_xy=mesh, n_omega=1, mode="w",
+            n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
+            omega=np.asarray([0.2 + 0.1j]),
+            sampling=dict(_SAMPLING, n_p=1),
+            closure_verdict=verdict) is None, f"rank {rank}"
+        assert MS.write_w_slab_collective(
+            tmpdir_path, "W", 0, W, mesh_xy=mesh,
+            global_shape=shape) is None, f"rank {rank}"
 
 
 def test_collective_reader_keeps_one_frequency_slab_sharded(

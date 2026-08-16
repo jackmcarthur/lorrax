@@ -726,11 +726,15 @@ def allocate_w_omega_collective(
     ``energy_unit`` one of :data:`FIT_ENERGY_UNITS`; the serial twin
     documents each in full.
 
-    RETURNS A RANK-DIVERGENT VALUE: rank 0 gets the :func:`read_w_header`
-    dict, every other rank gets ``None``.  A caller that indexes the return
-    crashes on all ranks but zero, and one that BRANCHES on it diverges the
-    mesh.  Discard it unless you are on rank 0 and know it.  (Making the
-    return uniform is a code change and is on the follow-up list.)
+    RETURNS ``None``, ON EVERY RANK.  It used to hand back rank 0's
+    :func:`read_w_header` dict and ``None`` everywhere else — a
+    rank-dependent return type, i.e. a mesh divergence waiting for the
+    first caller that branches on it (audit §E.3 item 3).  Uniform
+    ``None`` rather than a broadcast because nothing consumes it: both
+    production call sites (``gw/mpa/model.py``) discard it, and a rank
+    that wants the header can call :func:`read_w_header` — one more h5py
+    open, which a collective allocator must not pay on every rank for a
+    value nobody asked for.
 
     The open sequence is FFI ``'w'`` → close → rank-0 h5py ``'a'`` →
     barrier: sequential cross-stack alternation with a write on each side,
@@ -746,16 +750,14 @@ def allocate_w_omega_collective(
     with SlabIO(dest, mode=mode, mesh=mesh_xy) as io:
         io.create_dataset(name, shape=shape, dtype=dtype)
 
-    header = None
     if process_rank() == 0:
-        header = stamp_w_omega(
+        stamp_w_omega(
             dest, name, tables=tables, omega=omega, sampling=sampling,
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(shape[0], dtype=bool),
             n_rmu_logical=n_rmu_logical, provenance=provenance,
             energy_unit=energy_unit)
     barrier("mpa_w_omega_allocated")
-    return header
 
 
 def stamp_w_omega(
@@ -1007,11 +1009,12 @@ def write_w_slab_collective(
 
     COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO).
 
-    RETURNS A RANK-DIVERGENT VALUE — the new ready count on rank 0,
-    ``None`` elsewhere.  Both production callers discard it, which is the
-    only reason this is latent rather than live; see
-    :func:`allocate_w_omega_collective` for the same hazard and the same
-    follow-up.
+    RETURNS ``None``, ON EVERY RANK — it used to be the new ready count
+    on rank 0 and ``None`` elsewhere, the same rank-divergent hazard
+    :func:`allocate_w_omega_collective` carried (audit §E.3 item 3).  The
+    count is not lost, it is just not returned per slab: it lives in the
+    readiness ledger this call commits, and :func:`read_w_header` reports
+    it as ``n_ready`` / ``data_ready`` for a rank that asks.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -1035,13 +1038,11 @@ def write_w_slab_collective(
             global_shape=shape)
     del W4
 
-    n_ready = None
     if process_rank() == 0:
         with _h5(dest, "a") as grp:
             ds, mgrp = _open_w(grp, name)
-            n_ready = _mark_w_slab_ready(ds, mgrp, i_omega, ready)
+            _mark_w_slab_ready(ds, mgrp, i_omega, ready)
     barrier("mpa_w_slab_ready")
-    return n_ready
 
 
 def read_w_slab_collective(
@@ -2035,9 +2036,9 @@ def allocate_fit_store_collective(
     ``occupation_state`` and the three identity hashes are stamped as the
     serial twin documents them.
 
-    RETURNS :func:`fit_completion_ledger`, and unlike its
-    ``allocate_w_omega_collective`` neighbour this return IS uniform across
-    ranks.
+    RETURNS :func:`fit_completion_ledger`, UNIFORMLY — every rank reads it
+    back after the barrier, so this return does not depend on the rank
+    (which is now true of every collective in this module).
 
     Open sequence: FFI ``'w'`` → barrier → rank-0 h5py ``'a'`` → barrier →
     all-rank h5py ``'r'``.  Cross-stack alternation with writes on both
