@@ -105,9 +105,17 @@ def write_sigma_omega(
     meta,
     mesh_xy,
     sym=None,
+    band_extrapolation=None,
     print_fn=None,
 ) -> str:
-    """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz."""
+    """Write canonical ``sigma_mnk.h5`` for any dynamic Sigma ansatz.
+
+    ``band_extrapolation`` is the optional
+    ``{"arrays": {...}, "attrs": {...}}`` the Σ_c band-convergence fit
+    produces (``gw.band_extrapolation.extrapolation_h5_payload``).  None —
+    the default and every non-extrapolating run — writes exactly the file
+    that was written before the feature existed.
+    """
     from file_io import write_sigma_omega_h5
 
     out_path = sigma_omega_output_path(config, input_dir)
@@ -138,7 +146,8 @@ def write_sigma_omega(
             sigma_c_kij_ev=sigma_c_ev,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
             hartree_kij_ev=RYD_TO_EV * sig_h,
-            mesh=mesh_xy, star=star, print_fn=print_fn,
+            mesh=mesh_xy, star=star,
+            band_extrapolation=band_extrapolation, print_fn=print_fn,
         )
         return out_path
 
@@ -147,7 +156,8 @@ def write_sigma_omega(
         sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
         sigma_sx_kij_ev=RYD_TO_EV * sig_x,
         hartree_kij_ev=RYD_TO_EV * sig_h,
-        mesh=mesh_xy, star=star, print_fn=print_fn,
+        mesh=mesh_xy, star=star,
+        band_extrapolation=band_extrapolation, print_fn=print_fn,
     )
     return out_path
 

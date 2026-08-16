@@ -338,6 +338,7 @@ def finalize_dynamic_sigma(
     band_slices,
     input_dir: str,
     write_sigma_omega_h5: bool = True,
+    band_extrapolation: dict | None = None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
@@ -377,7 +378,8 @@ def finalize_dynamic_sigma(
                 sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
-                sym=sym, print_fn=print_fn,
+                sym=sym, band_extrapolation=band_extrapolation,
+                print_fn=print_fn,
             )
         else:
             sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
@@ -777,6 +779,7 @@ def compute_sigma_xc(
         sym=sym, wfn=wfn, band_slices=band_slices,
         input_dir=input_dir,
         write_sigma_omega_h5=write_sigma_omega_h5,
+        band_extrapolation=ppm_outputs.band_extrapolation,
         print_fn=print_fn,
     )
 

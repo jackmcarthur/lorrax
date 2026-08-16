@@ -25,6 +25,7 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
 from .band_extrapolation import (
+    extrapolation_h5_payload,
     fit_band_extrapolation,
     format_extrapolation_report,
     plan_band_brackets,
@@ -46,6 +47,14 @@ class PPMOutputs:
     # Kept separate: injection is shared by every dynamic ansatz in
     # ``dynamic_sigma.add_head_sigma_diag``.
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
+    # The band-extrapolation fit, as ``{"arrays": {...}, "attrs": {...}}``
+    # ready for ``sigma_mnk.h5``.  None when the feature is off, which is
+    # what keeps the default write path byte-identical.  It rides HERE
+    # rather than being written inside the pipeline because the Σ file is
+    # created once, by the shared dynamic finalizer, and a second writer
+    # for one dataset group is a second place for the star extraction and
+    # the k stamp to disagree.
+    band_extrapolation: dict | None = None
 
 
 def _fit_head_correction(
@@ -176,7 +185,7 @@ def _band_count_point(cube, i: int):
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
-) -> None:
+) -> dict:
     """Log the three band-count Σ_c's, the fit and its diagnostics.
 
     Reads the band DIAGONAL of each cumulative point at the SAME external
@@ -235,6 +244,9 @@ def _report_band_extrapolation(
                        f"E={unocc[kc, nc]:.4f} eV",
                        (int(kc), int(nc + n_occ))))
     print_fn(format_extrapolation_report(plan, fit, states=states))
+    # The arrays are already in eV on the band diagonal, which is the unit
+    # and the layout ``sigma_mnk.h5`` wants, so no scale is applied here.
+    return extrapolation_h5_payload(plan, fit)
 
 
 def compute_ppm_sigma_pipeline(
@@ -379,8 +391,9 @@ def compute_ppm_sigma_pipeline(
         # Step 4: the band-convergence extrapolation report.  After the head,
         # because the head is part of the Σ_c being reported; before the
         # return, because the cube's leading axis does not survive it.
+        extrap_payload = None
         if plan.enabled:
-            _report_band_extrapolation(
+            extrap_payload = _report_band_extrapolation(
                 sigma_omega, head_sigma_diag_w_kn_ry,
                 plan=plan, config=config, band_slices=band_slices,
                 wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
@@ -390,4 +403,5 @@ def compute_ppm_sigma_pipeline(
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
+        band_extrapolation=extrap_payload,
     )
