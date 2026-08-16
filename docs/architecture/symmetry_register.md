@@ -436,14 +436,70 @@ Three axes are irreducible and one of them is load-bearing:
    wrap because the Lloyd metric handles periodicity through an explicit
    min-image table, so wrapping there would be **wrong**, not redundant.
 
-What *is* mechanically free, and is the honest first step: `orbit_syms.py:145`
-≡ `charge_density.py:199` (pure deletion), `:334` ≡ `:342` (one local, eight
-lines apart), and one local `_image()` for the four `kmeans_isdf.py` spellings.
+### THE PLAN — what the five survivors are, for the owner to scope
+
+Written 2026-08-15 on request. **Not started.** Ordered by blast radius, and
+the first two are worth doing whatever is decided about the rest.
+
+**The five survivors.**
+
+| # | survivor | absorbs | why it cannot merge further |
+|---|---|---|---|
+| S1 | `centroid_source_map_and_wrap` — SOURCE map, snap-then-floor, RETURNS `L` | `orbit_syms.py:493` | the only one whose integer wrap is consumed (umklapp phase); must keep the expensive rounding |
+| S2 | `fft_grid_pullback_perm` — FORWARD map, DISCARDS `L` | `orbit_syms.py:1321` | inverts a permutation; safe with cheap rounding *because* it throws `L` away |
+| S3 | `orbit_images` — FORWARD, jax, `% 1.0`, no `L` | `:243`, `:334`, `:342` | inside `jit`/`vmap`; the two numpy twins are the same expression at a different backend |
+| S4 | `grid_point_image_perm` — FORWARD, INTEGER grid, `% N` | `orbit_syms.py:145`, `centroid/charge_density.py:199` | integer arithmetic end to end: no rounding question exists, so it must NOT be routed through S1/S2 |
+| S5 | `verify_centroid_orbit_closure`'s scorer — SOURCE, min-image | `:956` | its residual is a *measurement*, not a map; merging it into S1 would make the check share code with the thing it checks |
+
+`kmeans_isdf.py`'s four (`:270, :288, :378, :569`) fold into **S3** — but three
+of them **deliberately omit the wrap**, because the Lloyd metric handles
+periodicity through an explicit min-image table. S3 must therefore take
+`wrap=False`, and a shared helper that always wraps would be *wrong* there, not
+merely redundant. That is the single most dangerous line item in this plan.
+
+**Which rounding strategy wins: S1's, and it is not a preference.**
+`orbit_syms.py:494-503` records the mechanism — naive `np.floor` flips an `L`
+component 0 → −1 on tiny negative noise, "which produces a spurious
+`exp(±iπ/2)` phase in `unfold_isdf_operator`", measured on Si Fd-3m as **14 of
+64 q at rel err ~0.8**. So any survivor that RETURNS `L` must snap to
+FFT-grid integers before `floor`. S2 is safe with the cheap rounding *only*
+because it discards `L`, and that exemption has to be written at S2 or the next
+person "unifies" them and reintroduces the phase.
+
+**Blast radius.**
+
+- S4 is a **pure deletion** across a package boundary (`src/centroid` →
+  the service) and needs one new export. Zero numerical risk: integer in,
+  integer out. Do this one first.
+- S3 is three call sites, one of them jax — behaviour-preserving only if the
+  `wrap` flag is threaded correctly; the three `kmeans_isdf` sites are the risk.
+- S1/S2/S5 **should not be touched**. They are already one function each; the
+  "duplication" between them is the direction/rounding distinction the 4 eV hex
+  gap is named after. Consolidating them is how that bug returns.
+
+**So the honest target is 12 → 5 by deleting 7 restatements, not by unifying 5
+survivors into 1** — and 4 of the 7 are in a module (`kmeans_isdf.py`) this
+page did not previously name.
 
 **Not attempted here.** The item was scoped as "~6 copies, upgrade twice"; it
 is twelve across three packages with a measured rounding hazard between two of
-them. That is a different piece of work and it should be re-scoped by the owner
-rather than absorbed into a symmetry-consolidation diff.
+them.
+
+### `epsreader.py:136` is a DEFECT, independent of any of this
+
+`src/file_io/epsreader.py:136` `unfold_eps_comps` is a fifth `G' = S·G − G₀`
+that no consolidation reaches, and it should be decided on its own:
+
+- Its own comment at `:126` says **"NO SUPPORT FOR TAU (FRAC TRANS)
+  CURRENTLY"** — it is known-wrong on every non-symmorphic deck.
+- It has **no in-tree caller** (only `misc/archived_tests/`), yet `EPSReader`
+  is re-exported from `src/file_io/__init__.py:41`, so it is public surface.
+- It was registered **nowhere** until 2026-08-15.
+
+The decision owed is **delete or fix**, not "consolidate later". Deleting a
+re-exported public method is a surface change; fixing a method with no caller
+is speculative. Either is a one-commit answer and neither depends on the
+r-grid work.
 
 ### One documentation defect found while counting
 
@@ -582,7 +638,14 @@ only 24 is split. That conclusion is right about the reporting cut and says
 nothing about the deck's edge, which is the one that matters.
 
 **Rule: give `boundary_min_gaps` the FULL mean field, never the window you
-are about to slice out of it.**
+are about to slice out of it.**  **FIXED 2026-08-15**: `is_full_spectrum` is
+now a required keyword with no default, and a window's outer boundaries come
+back `nan` — neither `> tol` nor `<= tol`, so they cannot be certified either
+way and must be asked about the full spectrum.
+
+`snap_cut_to_clean_boundary` is **not** part of this and must not be
+re-implemented: it arrives with `feat/band-extrapolation-sampling-2026-08-15`
+(`81edc49c`), a separate worktree.
 
 ### The per-band spread is a sharp instrument, now that this is known
 
