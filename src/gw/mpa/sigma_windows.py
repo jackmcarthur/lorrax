@@ -603,11 +603,26 @@ def build_shared_sigma_windows(
                             "clustered core cells do not tile the core "
                             "support exactly — a band was lost or "
                             "double-counted.")
+                    phases_rows = phase.tolist()
                     if eb_s is not None:
+                        # Poles above a_cut cannot cross THIS cluster for
+                        # any actual band (e >= -excursion), so they leave
+                        # the eta-resolved shell for a sign-definite slab
+                        # below.  Without this cut the shell bandwidth is
+                        # the WHOLE shallow-pole spatial spread (~5 Ry on
+                        # the sodium store) and the decomposition loses to
+                        # the monolithic rule.
+                        a_cut = w_hi + margin
+                        keep = [i for i, row in enumerate(stats)
+                                if row[0] <= a_cut]
+                        a_hi_s = min(a_hi, a_cut)
                         f_c = max(abs(w - e - a)
                                   for w in (w_lo, w_hi)
                                   for e in eb_s
-                                  for a in (a_lo, a_hi))
+                                  for a in (a_lo, a_hi_s))
+                        rows_bounds = np.asarray(bounds)[keep].copy()
+                        rows_bounds[:, 1] = np.minimum(
+                            rows_bounds[:, 1], a_cut)
                         rule = _damped_rule_cached(
                             rule_cache, gamma_min, gamma_max, f_c,
                             crossing_error, crossing_max_nodes)
@@ -619,6 +634,7 @@ def build_shared_sigma_windows(
                             f"shell; omega cluster "
                             f"[{w_lo:.6e},{w_hi:.6e}]; eta {eta:.6e}; "
                             f"gamma [{gamma_min:.6e},{gamma_max:.6e}]; "
+                            f"a <= {a_cut:.6e}; "
                             f"f_max {rule['freq_max']:.6e}; target "
                             f"{crossing_error:.3e}; sampled error "
                             f"{rule['sampled_max_error']:.3e}; "
@@ -626,9 +642,46 @@ def build_shared_sigma_windows(
                             f"rank {rule['n_nodes']}")
                         output.append(SharedSigmaWindow(
                             win, _branch.E_A, omega_c, omega_idx_c,
-                            idx, bounds, phase,
+                            np.asarray(idx)[keep], rows_bounds,
+                            np.asarray(phase)[keep],
                             band_weight=_branch.band_weight))
-                    phases_rows = phase.tolist()
+                        deep_rows = [i for i, row in enumerate(stats)
+                                     if row[1] > a_cut]
+                        if deep_rows:
+                            kept_stats = [stats[i] for i in deep_rows]
+                            kept_phase = np.asarray(phase)[deep_rows]
+                            rectangles = _stats_rectangles(
+                                kept_stats, kept_phase.tolist(),
+                                lambda r_lo, _r_hi:
+                                    eb_s[0] + max(r_lo, a_cut) - w_hi,
+                                lambda _r_lo, r_hi:
+                                    eb_s[1] + r_hi - w_lo,
+                                eta)
+                            nodes, fit = _laplace_nodes(
+                                rectangles, sector_error, max_rank)
+                            nodes = _apply_external_damping(nodes, eta)
+                            deep_bounds = np.asarray(bounds)[
+                                deep_rows].copy()
+                            deep_bounds[:, 0] = np.maximum(
+                                deep_bounds[:, 0], a_cut)
+                            win = _window(
+                                "c_neg_slab", nodes, mask_s, eb_s[0], +1,
+                                "full", +neg, fit.sampled_max_error,
+                                f"uncrossable deep-pole side of the shell "
+                                f"(a > {a_cut:.6e}); omega cluster "
+                                f"[{w_lo:.6e},{w_hi:.6e}]; sampled error "
+                                f"{fit.sampled_max_error:.3e}; rank "
+                                f"{nodes.t.size}",
+                                e_ref_b=a_cut)
+                            E_A_local = jnp.where(
+                                jnp.reshape(jnp.asarray(mask_s),
+                                            _branch.E_A.shape),
+                                _branch.E_A, eb_s[0])
+                            output.append(SharedSigmaWindow(
+                                win, E_A_local, omega_c, omega_idx_c,
+                                np.asarray(idx)[deep_rows], deep_bounds,
+                                kept_phase,
+                                band_weight=_branch.band_weight))
                     if eb_n is not None:
                         rectangles = _stats_rectangles(
                             stats, phases_rows,

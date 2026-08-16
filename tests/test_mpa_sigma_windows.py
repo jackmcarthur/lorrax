@@ -491,3 +491,59 @@ def test_contiguous_grid_keeps_the_monolithic_plan_bitwise():
             if k != "omega_cluster_gap_ry"} == {
         k: v for k, v in huge_report.items()
         if k != "omega_cluster_gap_ry"}
+
+
+def test_wide_pole_spread_is_cut_from_each_cluster_shell():
+    """A pole far above a cluster's reach must not inflate its shell.
+
+    Two poles 2.7 Ry apart (the sodium store's real hazard: a ~5 Ry
+    shallow-pole spatial spread made every cluster shell pay ~90 nodes/Ry
+    of pole spread).  The low cluster's shell must exclude the deep pole
+    (a > w_hi + margin cannot cross it) and stay small; the excluded
+    pairs ride a sign-definite slab; and the summed plan still matches
+    the exact two-pole denominator sum at every omega.
+    """
+    energies = np.asarray([0.1, 1.2, 3.0])
+    omega = np.asarray([0.45, 3.45])
+    E_A = jnp.asarray(energies[None, :])
+    branch = _SigmaBranch(
+        "pos_cond", E_A, jnp.ones_like(E_A, dtype=bool), "cond", False,
+        omega, np.arange(omega.size))
+    Omega = jnp.asarray([[[[0.30 - 0.05j]]], [[[3.00 - 0.10j]]]])
+    B = jnp.asarray([[[[0.7 + 0.2j]]], [[[-0.4 + 0.6j]]]])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5)
+    plan, geometry = SW.build_shared_sigma_windows(
+        summaries, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-6, crossing_target_error=1.0e-6,
+        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+
+    shells = [row for row in plan if row.window.name == "core"]
+    assert len(shells) == 2
+    low = min(shells, key=lambda row: float(np.max(row.omega_abs)))
+    high = max(shells, key=lambda row: float(np.max(row.omega_abs)))
+    # The low cluster keeps only the near pole; its bandwidth is set by
+    # the cluster, not the 2.7 Ry pole spread.
+    assert low.pole_indices.tolist() == [0]
+    assert float(low.bounds[0][1]) < 3.0        # a_le capped below pole 2
+    assert low.window.n_tau < high.window.n_tau
+    # The cut pairs live somewhere: at least one sign-definite window
+    # carries pole 2 for the low cluster's omega.
+    low_omega = float(np.min(omega))
+    carriers = [row for row in plan
+                if 1 in row.pole_indices.tolist()
+                and low_omega in np.asarray(row.omega_abs)
+                and row.window.name != "core"]
+    assert carriers
+
+    eta = geometry["eta_ry"]
+    poles = [complex(Omega[p, 0, 0, 0]) - 1j * eta for p in range(2)]
+    residues = [np.asarray(B[p]) for p in range(2)]
+    got = _oracle_total(plan, B, Omega, omega.size, residues[0].shape)
+    for i, w in enumerate(omega):
+        want = -sum(res / (w - e - pole)
+                    for e in energies
+                    for res, pole in zip(residues, poles))
+        np.testing.assert_allclose(got[i], want, rtol=5.0e-6, atol=5.0e-6)
