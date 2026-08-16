@@ -337,12 +337,20 @@ def compute_ppm_sigma_pipeline(
         # gives the trivial one-bracket plan and the whole path below is
         # bit-identical to the un-bracketed code.
         s = wfns.slices
+        # THE FRACTIONS ARE OF THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
+        # / ``sigma_sum``, never ``b_id_4_user`` / ``full``: the latter pair
+        # is the LOADED extent = max(chi, sigma), so on a deck running χ at
+        # 248 and Σ at 100 they would bracket at ~(198, 223, 248) — three
+        # points on a curve this run never evaluates — instead of the
+        # ~(80, 90, 100) the Σ sum actually walks.  Identical on an unsplit
+        # deck, which is why nothing here changes for the tree's decks.
+        # Pinned by tests/test_band_extrapolation_sigma_count.py.
         plan = plan_band_brackets(
             enabled=bool(config.sigma.band_extrapolation),
-            enk_ry=np.asarray(wfns.enk[:, s.full]),
+            enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
             n_occ=int(s.b2 - s.b0),
-            nb_logical=int(meta.b_id_4_user or s.b4) - int(s.b0),
-            nb_padded=int(s.nb_full),
+            nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
+            nb_padded=int(s.nb_sigma_sum),
         )
         if plan.enabled:
             print_fn(

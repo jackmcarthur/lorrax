@@ -56,7 +56,11 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
-    psi_coh_xn, psi_coh_yr = wfns.xn(s.full), wfns.yr(s.full)
+    # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
+    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
+    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
+    # wired for consistency and has never executed under a split.
+    psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
@@ -140,8 +144,10 @@ def integrate_sigma_store(
 
 def _branches(wfns, omega, efermi_ry):
     """The four causal branches, with occupation and energy kept separate."""
-    energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
-    occupied = wfns.occ[:, wfns.slices.full] > 0.5
+    # ``sigma_sum`` for the same reason as the ψ slices above: these index
+    # the SAME band axis the causal branches sum over.
+    energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
+    occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
     # Do not clip these distances at zero.  In a small-gap or inverted
     # system an unoccupied state may sit below E_F (or an occupied state
     # above it); occupation still chooses the band sum.  The current internal
