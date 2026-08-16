@@ -39,7 +39,6 @@ sigma_omega_step_ev = 0.5
 sigma_regularization_ev = 0.25
 memory_per_device_gb = 28
 sigma_freq_debug_output = true
-fermi_reference = midgap
 wfn_file = WFN.h5
 output_file = sigma_diag_gnppm_test.dat
 sigma_diag_file = sigma_diag_gnppm_test.dat

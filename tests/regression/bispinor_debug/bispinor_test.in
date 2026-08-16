@@ -61,4 +61,3 @@ sigma_omega_min_ev = -4.0
 sigma_omega_max_ev = 4.0
 sigma_omega_step_ev = 1.0
 sigma_regularization_ev = 0.25
-fermi_reference = midgap

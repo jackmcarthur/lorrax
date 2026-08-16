@@ -1445,7 +1445,6 @@ _DEFAULTS = {
     # dynamical pole and adds the analytic static-COHSEX term for those
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
-    "fermi_reference": "midgap",
     "sigma_at_dft_extrapolate": False,
     # Debug
     "sigma_freq_debug_output": False,
@@ -1539,6 +1538,14 @@ _LEGACY_DECK_KEYS = frozenset({
     # refusal for the removed ``kij_stream`` spelling.  That refusal moves
     # into the branch below and the key goes.
     "sigma_omega_accumulation",     # refuse on kij_stream, else ignore
+    # 0.1.0: reached exactly ONE of the five independent Fermi-zero
+    # derivations in the Sigma path (gw/ppm_sigma.py's _prepare_sigma_state,
+    # where midgap is now pinned with the census in a comment).  The other
+    # four -- wfn.efermi in dynamic_sigma / sigma_dispatch / the MPA branch
+    # split, sc_iteration's hardcoded midgap, eqp_bgw's hardcoded midgap --
+    # ignored it, so 'vbm' moved the PPM split alone and disagreed with the
+    # rest of the run.  No in-tree deck ever set it to anything but midgap.
+    "fermi_reference",              # warn-and-ignore (pinned to midgap)
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1581,7 +1588,7 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "sc_eigh",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
-    "sigma_omega_layout", "fermi_reference",
+    "sigma_omega_layout",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_probe_chi_reuse",
@@ -1816,6 +1823,23 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        if section.get("fermi_reference", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'fermi_reference' is no longer supported and "
+                "will be ignored: it reached one of the five Fermi-zero "
+                "derivations in the Sigma path and the other four ignored "
+                "it, so 'vbm' moved the PPM occupied/empty split alone.  "
+                "The PPM site is pinned to midgap, which is what every "
+                "other site already computes.  Remove it from your input "
+                "file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "fermi_reference",
+                "IGNORED — it governed 1 of the 5 Fermi-zero sites; the PPM "
+                "site is pinned to midgap, matching the other four"))
+
         _accum = section.get("sigma_omega_accumulation", fallback=None)
         if _accum is not None and str(_accum).strip().lower() == "kij_stream":
             raise ValueError(
@@ -2152,7 +2176,6 @@ class DynamicSigmaConfig:
     window_edge_factor: float
     omega_batch_size: int
     omega_layout: str
-    fermi_reference: str
     sigma_at_dft_extrapolate: bool
 
     def __post_init__(self):
@@ -2160,8 +2183,6 @@ class DynamicSigmaConfig:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-        if self.fermi_reference not in ("vbm", "midgap"):
-            raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
@@ -2788,7 +2809,6 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
-            fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
         )
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides

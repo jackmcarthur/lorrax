@@ -153,16 +153,14 @@ def _prepare_sigma_state(
     B_q: jax.Array,
     Omega_q: jax.Array,
     valid_mask_q: jax.Array,
-    use_midgap: jax.Array,
     keep_invalid: jax.Array,
 ) -> _SigmaPhysicsState:
     """Derive Fermi level + derived energy/PPM arrays in one fused trace.
 
     Replaces ~9 eager jnp ops previously emitted at trace time by the sigma
-    driver.  ``use_midgap`` is a traced bool scalar; the caller passes
-    ``jnp.asarray(fermi_reference == 'midgap')``.  ``valid_mask_q`` is always
-    a real bool array (the caller substitutes ``jnp.ones_like(...)`` when
-    no mask is available), so the helper doesn't branch on None.
+    driver.  ``valid_mask_q`` is always a real bool array (the caller
+    substitutes ``jnp.ones_like(...)`` when no mask is available), so the
+    helper doesn't branch on None.
 
     ``keep_invalid`` is a traced bool implementing ``ppm_invalid_mode`` (BGW
     ``invalid_gpp_mode``) for poles with fitted ``Omega^2 < 0``: False = drop
@@ -184,8 +182,22 @@ def _prepare_sigma_state(
     vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
     cbm = jnp.min(jnp.where(unocc_mask, enk_full, 1.0e30))
     has_unocc = jnp.any(unocc_mask)
-    midgap_candidate = jnp.where(has_unocc, 0.5 * (vbm + cbm), vbm)
-    efermi = jnp.where(use_midgap, midgap_candidate, vbm)
+    # MIDGAP, hardcoded.  This used to read the ``fermi_reference`` deck
+    # key ('midgap' | 'vbm'), which was deleted in 0.1.0 because it
+    # reached THIS SITE AND NO OTHER.  There are five independent
+    # Fermi-zero derivations in the Sigma path -- here; ``wfn.efermi``
+    # (dynamic_sigma.py, sigma_dispatch.py, and the MPA branch split);
+    # sc_iteration.py's hardcoded 0.5*(vbm+cbm); eqp_bgw.py's hardcoded
+    # 0.5*(vbm_ev+cbm_ev); and gw/efermi.py's k-weighted metal-capable
+    # one -- so ``fermi_reference = vbm`` moved the PPM occupied/empty
+    # split and the omega=0 this kernel integrates against while the QSGW
+    # interpolation, the at-DFT evaluation and the whole MPA path kept
+    # omega=0 at wfn.efermi.  A knob that contradicts four of the five
+    # sites it appears to govern is worse than no knob.  The other four
+    # are all midgap constructions, so midgap is what this one is pinned
+    # to; unifying the five behind one resolver (extend gw/efermi.py) is
+    # the real fix and is a separate piece of work.
+    efermi = jnp.where(has_unocc, 0.5 * (vbm + cbm), vbm)
 
     E_cond = jnp.maximum(enk_full - efermi, 0.0)
     H_val = jnp.maximum(efermi - enk_full, 0.0)
@@ -846,7 +858,6 @@ def compute_sigma_c_ppm_omega_grid(
             f"HGL crossing quadrature ill-conditioned)")
         regularization_width_ry = xi_floor
     omega_batch_size = int(sigma_cfg.omega_batch_size)
-    fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
     if nk != int(enk_full.shape[0]):
@@ -862,9 +873,6 @@ def compute_sigma_c_ppm_omega_grid(
     idx_neg = np.where(omega_req < 0.0)[0]
     omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
     omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
-
-    # fermi_reference is validated + normalized at PPMConfig
-    # construction; used directly here (fermi → traced bool below).
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
@@ -892,7 +900,6 @@ def compute_sigma_c_ppm_omega_grid(
     with timing.section("sigma.state"):
         state = _prepare_sigma_state(
             enk_full, occ_full, B_q, Omega_q, valid_mask_q,
-            jnp.asarray(fermi_reference == "midgap", dtype=bool),
             jnp.asarray(keep_invalid, dtype=bool),
         )
     efermi = state.efermi

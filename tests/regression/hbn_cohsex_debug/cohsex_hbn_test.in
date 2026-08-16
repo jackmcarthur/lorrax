@@ -75,7 +75,6 @@ screening_method = minimax
 memory_per_device_gb = 28
 
 sigma_freq_debug_output = true
-fermi_reference = midgap
 
 wfn_file = WFN.h5
 # NO `output_file` KEY.  It is retired: the deck AS RUN at generation

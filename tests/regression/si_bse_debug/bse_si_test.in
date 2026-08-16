@@ -34,7 +34,6 @@ whead_0freq = 150.395600
 memory_per_device_gb = 28
 
 sigma_freq_debug_output = true
-fermi_reference = midgap
 
 wfn_file = WFN.h5
 output_file = eqp0_bse.dat

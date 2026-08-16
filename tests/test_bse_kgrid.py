@@ -40,7 +40,6 @@ nband = 40
 sys_dim = 2
 compute_mode = cohsex
 screening_method = minimax
-fermi_reference = midgap
 memory_per_device_gb = 28
 wfn_file = WFN.h5
 bare_coulomb_cutoff = 30.0

@@ -40,7 +40,6 @@ page has to read it from.
 | `ecutrho` | None | Density-grid cutoff (Ry) for the psp tools (kin_ion/dipole); None = the WFN's own ecutwfc. |
 | `bispinor` | false | Bispinor (4-spinor) run: 4-channel zeta-fit, Sigma^B transverse channels, two centroid files. |
 | `vnl_velocity_sign` | `""` | Relative sign of the `i[r, V_NL]` commutator in the assembled velocity, read by `psp.get_dipole_mtxels` and passed to `common.mtxel_sweep.dipole_operator`; the CLI `--vnl-velocity-sign` overrides it. `-1` (equivalently `shipped`) is the shipped assembly; `+1` (`flipped`) is the arm that reproduces BerkeleyGW's q→0 head. Empty means NOT DECLARED and resolves to the shipped sign, which is why the default is a string and not a float: a float default would make "unset" and an explicit `-1` indistinguishable, and the point of the stamp this feeds is to record which arm a given `dipole.h5` was built with. This key was absent from this page until 2026-08-10 while being present in `_DEFAULTS`. |
-| `fermi_reference` | `"midgap"` | Where E_F sits inside the gap for the G/W time kernels (midgap default). |
 
 ## ISDF / zeta
 
