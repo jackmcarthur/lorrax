@@ -69,17 +69,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--init", choices=("auto", "kpp", "random", "greedy"),
                    default="auto",
-                   help="k-means initialisation. 'auto' (default) keeps the "
-                        "historical behaviour: k-means++, or density-weighted "
-                        "random above the N_c/n_rtot threshold. 'greedy' is "
-                        "the DETERMINISTIC greedy-D2 variant -- same "
-                        "objective, argmax instead of a Categorical draw -- "
-                        "which removes the only source of run-to-run "
-                        "variation in the pipeline (the Lloyd loop, the "
-                        "orbit unfold and the pivoted-Cholesky prune are all "
-                        "deterministic given their input, so seed spread in "
-                        "downstream Sigma agreement is inherited entirely "
-                        "from this step).")
+                   help="k-means initialisation. 'auto' (default) is "
+                        "ORBIT-DEPENDENT: orbit mode gets 'greedy', point "
+                        "mode keeps k-means++ (or density-weighted random "
+                        "above the N_c/n_rtot threshold). 'greedy' is the "
+                        "DETERMINISTIC greedy-D2 variant: same score, argmax "
+                        "instead of a Categorical draw. It FORFEITS "
+                        "k-means++'s O(log k) expected-approximation "
+                        "guarantee, which depends on the randomised sampling; "
+                        "what saves it in practice is that the score is "
+                        "D^2*rho and not D^2, so the density weight suppresses "
+                        "the farthest-point outlier capture that is greedy "
+                        "D^2's classic failure. It is the orbit-mode default "
+                        "because orbit mode makes only ~N_c/n_sym placement "
+                        "decisions and seed randomness does not average out "
+                        "(measured spread 2.049 meV across seeds, against "
+                        "0.125 meV in point mode), and because greedy lands "
+                        "at the random distribution's mean rather than at "
+                        "either tail.")
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
                         "(default off — most prod runs don't want a popup).")
@@ -501,6 +508,9 @@ def main():
                 f"init forced to {args.init!r} by --init")
         if init_msg is not None:
             print(init_msg)
+        # The orbit-mode override needs ``orbit_aware``, which is resolved
+        # further down; applied there.
+        _init_auto = (args.init == "auto")
         dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
         if dense_warn is not None:
             print(dense_warn)
@@ -546,6 +556,36 @@ def main():
 
     R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(
         args, wfn, sym, charge_density)
+
+    # ── DEFAULT INIT IS ORBIT-DEPENDENT (owner ruling 2026-08-15) ──────────
+    # ORBIT mode defaults to the DETERMINISTIC greedy-D2 init; POINT mode
+    # keeps randomised k-means++.  This is not a preference; the two modes
+    # have different amounts of randomness to average over.
+    #
+    # MEASURED, Si 4x4x4 SOC at a degeneracy-clean band edge (nband=40),
+    # N_mu 768, P=4 fixed, sigTOT MAE vs a matched BerkeleyGW arm, per seed:
+    #
+    #   POINT mode (768 placement decisions):
+    #       2.391 2.432 2.391 2.516 2.460  ->  spread 0.125 meV (max/min 1.05x)
+    #   ORBIT mode (~24 placement decisions, each unfolding to ~48 points):
+    #       3.994 5.168 3.119 3.165        ->  spread 2.049 meV (max/min 1.66x)
+    #   ORBIT mode, greedy:  3.852 meV, and 3.852 every time
+    #
+    # With ~24 draws the randomness does not average out, and a single bad
+    # extremal pick costs ~4 % of the budget at once; with 768 it does average
+    # out and there is nothing to fix.  Greedy lands at the random
+    # distribution's MEAN (3.852 vs 3.862) -- a typical member, not a lucky
+    # one -- so determinism is free exactly where it is needed.  Point mode
+    # keeps the randomised draw because k-means++'s O(log k) expected-
+    # approximation guarantee depends on it and there is no variance problem
+    # there to trade it against.
+    if _init_auto and orbit_aware and init_method != "greedy":
+        init_method = "greedy"
+        print("  [init] orbit mode -> DETERMINISTIC greedy-D2 init (default). "
+              "Orbit mode makes ~N_c/n_sym placement decisions, so seed "
+              "randomness does not average out: measured spread 2.049 meV "
+              "across seeds against point mode's 0.125 meV.  Pass "
+              "--init kpp to restore the randomised draw.")
 
     with timing.section("setup.weight"):
         if args.centroid_weight is None:      # scalar defaults to band_range
@@ -595,6 +635,7 @@ def main():
             R=R, Rinv=Rinv, tau=tau,
         )
     centroids_frac = np.asarray(centroids)
+
 
     with timing.section("snap_unfold"):
         centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \

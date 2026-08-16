@@ -606,16 +606,33 @@ def kmeans_pp_init(
 
     ``deterministic=True`` replaces each Categorical draw with the ARGMAX of
     the same score — the greedy D² (a.k.a. "greedy k-means++") variant.  The
-    objective it maximises is unchanged; only the tie-breaking between
-    near-equal candidates stops being random.  This exists because the seed
-    is the ONLY source of run-to-run variation in the whole centroid
-    pipeline: the Lloyd loop, the unfold and the pivoted-Cholesky prune are
-    each deterministic given their input, so the spread in downstream Sigma
-    agreement across seeds is entirely inherited from which local optimum
-    this initialisation happens to fall into.  Ties are broken to the lowest
-    flat grid index by ``argmax``, which on a symmetric density means the
-    initialisation itself is symmetry-covariant rather than accidentally
-    picking one member of a degenerate set.
+    SCORE is unchanged; the SAMPLING is not.
+
+    WHAT IT COSTS, stated plainly because it is easy to under-sell.  This is
+    not merely a tie-break rule: argmax changes the seed DISTRIBUTION, not
+    only the resolution of near-equal candidates, and it **forfeits
+    k-means++'s O(log k) expected-approximation guarantee**, which is a
+    property of the randomised D² sampling and of nothing else.  A
+    deterministic greedy has no such bound and can in principle be driven
+    into a bad configuration by an adversarial density.
+
+    WHY IT DOES NOT BITE HERE.  The score is ``D²·ρ``, not ``D²``.  Plain
+    greedy-D² fails by capturing the farthest OUTLIER at every step; weighting
+    by the density suppresses exactly that, because an isolated point far from
+    everything is also a point where ρ is small.  The classic failure mode of
+    the deterministic variant is the one the density weight removes.
+
+    THE TIE-BREAK CLAUSE IS TRUE ONLY IN THE SYMMETRIC CASE, and that is where
+    it matters: on a symmetric density ``D²·ρ`` is a class function, so a whole
+    orbit ties at the top, and ``argmax``'s deterministic lowest-flat-index
+    rule is symmetry-covariant where a draw is not.  Do not read that as a
+    general statement about the two initialisations.
+
+    WHY IT EXISTS.  The seed is the ONLY source of run-to-run variation in the
+    whole centroid pipeline: the Lloyd loop, the unfold and the
+    pivoted-Cholesky prune are each deterministic given their input, so the
+    spread in downstream Sigma agreement across seeds is entirely inherited
+    from which local optimum this initialisation falls into.
     """
     if offsets is None:
         offsets = jnp.zeros((1, 3), dtype=jnp.int32)
