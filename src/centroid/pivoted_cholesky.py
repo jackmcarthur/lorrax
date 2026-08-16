@@ -1007,9 +1007,11 @@ def prune_candidates_by_pivoted_cholesky(
                     _act[M:] = False
                     _active_init = device_put_process_local(
                         _act, NamedSharding(mesh, PartitionSpec(select_axis)))
+                _score = os.environ.get(
+                    "LORRAX_ORBIT_BLOCK_SCORE", "ratio").strip().lower()
                 _sel_step = make_sharded_orbit_block_select(
                     mesh, M_pad, _kpts, _n_orb,
-                    mesh_axis=select_axis, tol_rel=tol_rel)
+                    mesh_axis=select_axis, tol_rel=tol_rel, score=_score)
                 (_piv, _L, _rank_j, _d_final, _d_taken, _trR_vec,
                  _psd) = _sel_step(G, _oid_jax, _active_init)
                 _piv.block_until_ready()
@@ -1035,7 +1037,8 @@ def prune_candidates_by_pivoted_cholesky(
         _n_del = int(_sel.sum())
         _rank = int(np.isin(_dense[_piv_np], _order).sum())
         if verbose:
-            _path = "host oracle" if _ob == "host" else "sharded"
+            _path = ("host oracle" if _ob == "host"
+                     else f"sharded, score={os.environ.get('LORRAX_ORBIT_BLOCK_SCORE', 'ratio').strip().lower()}")
             print(f"[pivoted_cholesky] ORBIT-BLOCK select ({_path}): "
                   f"{_order.shape[0]} orbits -> {_n_del} points, "
                   f"{_rank} rank-1 deflations "
@@ -1479,6 +1482,7 @@ def make_sharded_orbit_block_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    score: str = "ratio",
 ):
     """Sharded ORBIT-BLOCK pivoted-Cholesky select.
 
@@ -1487,14 +1491,32 @@ def make_sharded_orbit_block_select(
     the whole repair:
 
       1. **The pivot search is restricted to the OPEN orbit.**  When the open
-         orbit has no residual left, the next orbit is opened by maximum
-         residual TRACE over the orbits not yet admitted (a ``segment_sum``
-         plus one ``psum`` on an ``(n_orb+1,)`` vector -- orbit counts are
-         tens to hundreds, so this is cheap next to the O(M) work already in
-         the body).  On a sym-invariant Gram the trace is ``orbit_size x
-         d_rep``, so ranking by it weights an orbit by the number of points
-         it will actually cost -- the multiplicity weighting the old rule
-         did not have.
+         orbit has no residual left, the next orbit is opened by the best
+         score over the orbits not yet admitted (a ``segment_sum`` plus one
+         fused ``psum`` on an ``(n_orb+1,)`` pair -- orbit counts are tens to
+         hundreds, so this is cheap next to the O(M) work already in the
+         body).
+
+         THE COST MODEL, because the choice of score is not a preference.
+         Admitting orbit ``o`` costs ``s_o`` POINTS out of the user's point
+         budget and removes at most ``s_o * d_rep`` of residual trace.  That
+         is a knapsack with cost ``s_o`` and value ``<= s_o * d_rep``, and
+         greedy for knapsack ranks by value per unit COST:
+
+             value / cost  =  (s_o * d_rep) / s_o  =  d_rep      <- "ratio"
+             value         =   s_o * d_rep                       <- "trace"
+
+         ``trace`` is the right greedy only for an UNBUDGETED pick-k-orbits
+         problem -- which is the orbit-counting cost model the OLD code used,
+         and exactly the thing this commit series set out to remove.  The
+         delivered file is counted in POINTS, so ``ratio`` is the consistent
+         score and is the default.  The two orderings COINCIDE when every
+         orbit has the same size and diverge only where special positions
+         (``|stabiliser| > 1``) enter: on Si 4x4x4 the pools carry sizes
+         {8, 12, 24, 48}, so a size-8 orbit at ``d_rep = 5`` (5 units/point)
+         is ranked above a size-48 orbit at ``d_rep = 1`` (1 unit/point),
+         where ``trace`` ranks them 40 against 48 and takes the worse buy.
+         ``score='trace'`` is retained so the pair stays measurable.
 
       2. **The Schur update kills the PIVOT, not the orbit.**  The old body
          did one rank-1 update and then dropped all ``n_sym`` members
@@ -1586,10 +1608,27 @@ def make_sharded_orbit_block_select(
                 # Computed unconditionally (jit has no cheap branch here) and
                 # selected below; both terms are O(M) like the argmax already
                 # in this body.
-                seg = jax.ops.segment_sum(
+                _val = jax.ops.segment_sum(
                     jnp.where(unadm, d, 0.0), oid,
                     num_segments=n_orb + 1, indices_are_sorted=False)
-                seg = lax.psum(seg, axis_name=mesh_axis)
+                _cnt = jax.ops.segment_sum(
+                    jnp.where(unadm, 1.0, 0.0).astype(_val.dtype), oid,
+                    num_segments=n_orb + 1, indices_are_sorted=False)
+                # ONE psum for both halves -- same idiom as the fused
+                # L[p,:]/orbit-id broadcast in the point-mode body.
+                _fused = lax.psum(jnp.concatenate([_val, _cnt]),
+                                  axis_name=mesh_axis)
+                _val, _cnt = _fused[:n_orb + 1], _fused[n_orb + 1:]
+                if score == "ratio":
+                    seg = _val / jnp.maximum(_cnt, 1.0)
+                elif score == "trace":
+                    seg = _val
+                else:
+                    raise ValueError(
+                        f"score must be 'ratio' or 'trace'; got {score!r}")
+                # A fully-admitted orbit has no remaining members: exclude it
+                # explicitly rather than relying on its score being 0.
+                seg = jnp.where(_cnt > 0, seg, -jnp.inf)
                 seg = seg.at[n_orb].set(-jnp.inf)      # the pad sentinel bucket
                 cand = jnp.argmax(seg).astype(jnp.int32)
                 cur_new = jnp.where(need_new, cand, cur)
