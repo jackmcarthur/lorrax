@@ -41,6 +41,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier as _barrier, device_put_process_local
 
+from . import h5_journal as _journal
+
+#: The two HDF5 library instances, spelled as ``file_io.hdf5_owner`` and
+#: ``file_io.h5_journal`` spell them.  Every HDF5 call this module makes
+#: is journaled AT ISSUE under one of them — the collective transport
+#: under ``ffi``, the two serial-h5py metadata touches under ``h5py`` —
+#: so the per-rank journal shows both libraries' traffic on one file in
+#: one stream (SLAB_IO_ROOT_CAUSE_AUDIT.md §C).
+_J_FFI = "ffi"
+_J_H5PY = "h5py"
+
 
 def _rank0() -> bool:
     return jax.process_index() == 0
@@ -1680,7 +1691,12 @@ class _FfiBackend(_DatasetGeometry):
             where=f"SlabIO/_FfiBackend({os.path.basename(path)}, "
                   f"mode={mode!r})")
         try:
-            self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
+            # ISSUE-TIME journal line: this is the last Python statement
+            # before ``H5Fopen``/``H5Fcreate``, and the handle it is about
+            # to return cannot appear on it (SlabIO writes the completion
+            # line that carries the handle).
+            with _journal.op_scope("open", path, stack=_J_FFI, mode=mode):
+                self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
             # ``open_file`` has now brought MPI up (context.cc::
             # ensure_mpi_initialized).  Ask it how big the world REALLY is
             # before a single hyperslab is derived from
@@ -1797,10 +1813,13 @@ class _FfiBackend(_DatasetGeometry):
         # exists at a different shape or dtype, and reuses it when they
         # match: decisions.md 2026-08-04.  That refusal is what makes the
         # geometry recorded below authoritative.
-        ds_id = self._loader.phdf5_ensure_dataset(
-            self.fh, name, tuple(int(s) for s in shape),
-            str(jnp.dtype(dtype).name),
-        )
+        with _journal.op_scope("create", self.path, stack=_J_FFI, ds=name,
+                               cnt=tuple(int(s) for s in shape),
+                               mode=self.mode, handle=self.fh):
+            ds_id = self._loader.phdf5_ensure_dataset(
+                self.fh, name, tuple(int(s) for s in shape),
+                str(jnp.dtype(dtype).name),
+            )
         self._ds_ids[name] = ds_id
         self._remember_geom(name, shape, jnp.dtype(dtype))
         # THE ATTRS ARE WRITTEN.  Queued here and landed by
@@ -1886,7 +1905,9 @@ class _FfiBackend(_DatasetGeometry):
         # :meth:`_dataset_geom`'s docstring records as measured-fatal
         # (job 7888644, "file signature not found").
         with open_scope(self.path, STACK_H5PY, "r",
-                        where=f"_FfiBackend._introspect_dataset({name!r})"):
+                        where=f"_FfiBackend._introspect_dataset({name!r})"), \
+                _journal.op_scope("attr_r", self.path, stack=_J_H5PY,
+                                  ds=name, mode="r", handle=self.fh):
             with h5py.File(self.path, "r") as f:
                 ds = f[name]
                 shape = tuple(int(s) for s in ds.shape)
@@ -1902,7 +1923,9 @@ class _FfiBackend(_DatasetGeometry):
         # ``phdf5_ensure_dataset`` (see :meth:`create_dataset`).
         self._drain_pending()
         if readonly:
-            ds_id = self._loader.phdf5_open_dataset_ro(self.fh, name)
+            with _journal.op_scope("open", self.path, stack=_J_FFI, ds=name,
+                                   mode="r", handle=self.fh):
+                ds_id = self._loader.phdf5_open_dataset_ro(self.fh, name)
         else:
             raise RuntimeError(
                 f"dataset '{name}' not registered — call create_dataset first")
@@ -1980,10 +2003,19 @@ class _FfiBackend(_DatasetGeometry):
         if ds_shape is None:
             ds_shape = req_gshape
             self._drain_pending()
-            ds_id = self._loader.phdf5_ensure_dataset(
-                self.fh, name, tuple(int(s) for s in ds_shape),
-                str(jnp.dtype(A.dtype).name),
-            )
+            # The SECOND ensure_dataset site — a write that creates its
+            # own dataset.  Journaled like the first: an ``ensure`` is a
+            # collective H5Dcreate, i.e. file metadata, and a create this
+            # path made is one the reader of the log will otherwise not
+            # find any ``create`` line for.
+            with _journal.op_scope("create", self.path, stack=_J_FFI,
+                                   ds=name,
+                                   cnt=tuple(int(s) for s in ds_shape),
+                                   mode=self.mode, handle=self.fh):
+                ds_id = self._loader.phdf5_ensure_dataset(
+                    self.fh, name, tuple(int(s) for s in ds_shape),
+                    str(jnp.dtype(A.dtype).name),
+                )
             self._ds_ids[name] = ds_id
             self._remember_geom(name, ds_shape, A.dtype)
         elif global_shape is not None and req_gshape != ds_shape:
@@ -2308,7 +2340,13 @@ class _FfiBackend(_DatasetGeometry):
                       f"{_t_join:.1f} s; calling H5Fclose collectively",
                       flush=True)
             _t0 = _time.perf_counter()
-            self._close_file(self.fh)
+            # ISSUE-TIME, and this is the one that matters most: S1 is a
+            # SIGSEGV that lands in the writer-thread join inside this
+            # very call.  A journal whose last line is this one names the
+            # ctx handle that died (SLAB_IO_ROOT_CAUSE_AUDIT.md §A/S1).
+            with _journal.op_scope("close", self.path, stack=_J_FFI,
+                                   mode=self.mode, handle=self.fh):
+                self._close_file(self.fh)
             self.fh = 0
             _t_close = _time.perf_counter() - _t0
             if _verbose:
@@ -2349,6 +2387,10 @@ class _FfiBackend(_DatasetGeometry):
             import h5py
             with open_scope(self.path, STACK_H5PY, "a",
                             where="_FfiBackend.close deferred-attr reopen"), \
+                    _journal.op_scope(
+                        "attr_w", self.path, stack=_J_H5PY, mode="a",
+                        cnt=(len(self._deferred_attrs),
+                             len(self._deferred_ds_attrs))), \
                     h5py.File(self.path, "a") as h5:
                 for name, value in self._deferred_attrs:
                     if name in h5:

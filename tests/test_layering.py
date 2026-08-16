@@ -137,9 +137,18 @@ _L3_MODULES = frozenset({
     # its whole subject is which NATIVE LIBRARY INSTANCE, in this PROCESS,
     # holds a file open — the same class of fact ``_slab_io_ffi`` is made
     # of, and one no format reader is allowed to reason about.  It imports
-    # nothing from ``src/``.
+    # ``file_io.h5_journal`` and nothing else from ``src/``.
+    #
+    # ``file_io.h5_journal`` is the same level for the same reason: it is
+    # the per-rank text log of HDF5 handles, offsets and ctx pointers
+    # (SLAB_IO_ROOT_CAUSE_AUDIT.md §C), i.e. transport facts, and the two
+    # modules journal through each other — the registry writes the lines,
+    # the journal asks the registry who holds the file.  Both imports are
+    # function-local for that cycle.  Its only other ``src/`` import is
+    # ``common.collectives.process_rank`` (L3), for the rank in the
+    # filename.
     "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
-    "file_io.hdf5_owner",
+    "file_io.hdf5_owner", "file_io.h5_journal",
 })
 #: Whole packages at L3.  Two of the three services are here for the same
 #: reason ``ffi`` is: their entire subject is devices, meshes, processes,

@@ -74,6 +74,7 @@ __all__ = [
     "STACK_H5PY",
     "alternation_rows",
     "is_write_mode",
+    "live_verdict",
     "mapped_hdf5_libraries",
     "note_close",
     "note_open",
@@ -123,8 +124,16 @@ _TOKEN = [0]
 
 
 def policy() -> str:
-    """The alternation policy in force, from :data:`POLICY_ENV`."""
-    got = str(os.environ.get(POLICY_ENV, "measure")).strip().lower()
+    """The alternation policy in force, from :data:`POLICY_ENV`.
+
+    The name is spelled as a LITERAL here as well as in
+    :data:`POLICY_ENV`: ``tools/env_audit.py`` and
+    ``tests/test_env_registry.py`` resolve only literal arguments, so
+    this read was invisible to the gate that requires a
+    ``docs/dev/env_vars.md`` row — and the variable duly shipped without
+    one.  The constant stays for the messages and the tests.
+    """
+    got = str(os.environ.get("LORRAX_HDF5_ONE_OWNER", "measure")).strip().lower()
     if got not in _POLICIES:
         raise ValueError(
             f"{POLICY_ENV}={got!r} is not one of {_POLICIES}.  "
@@ -223,51 +232,108 @@ def _alternation_refusal(path, stack, mode, where, rec) -> str:
 # The door
 # ---------------------------------------------------------------------------
 
+def _live_verdict_locked(key: str) -> str:
+    """``free`` / ``ffi:1w`` / ``h5py+ffi:2r`` — who holds ``key`` now.
+
+    The registry's one-token answer to "what does this process currently
+    have open on this path", for the journal line's ``owner`` field.  It
+    is the STATE, not the outcome of a check: a refusal shows up in the
+    journal's ``rc``, and this field is what the refused open walked into.
+    """
+    live = _LIVE.get(key)
+    if not live:
+        return "free"
+    stacks = "+".join(sorted({h["stack"] for h in live}))
+    kind = "w" if any(is_write_mode(h["mode"]) for h in live) else "r"
+    return f"{stacks}:{len(live)}{kind}"
+
+
+def live_verdict(path) -> str:
+    """:func:`_live_verdict_locked` for a caller outside the lock."""
+    with _LOCK:
+        return _live_verdict_locked(_norm(path))
+
+
 def note_open(path, stack, mode, *, where: str) -> int:
     """Declare an HDF5 open.  Returns a token for :func:`note_close`.
 
     Refuses a cross-stack overlap that includes a writer, always; refuses
     sequential cross-stack alternation under ``strict``.
+
+    JOURNALED, both outcomes.  This is the one choke point every HDF5
+    open in this process passes through, whichever library instance is
+    opening it, so it is where :mod:`file_io.h5_journal` sees the two
+    stacks in one stream — and where a refusal dumps the crash ring
+    (audit SLAB_IO_ROOT_CAUSE_AUDIT.md §C).
     """
     if stack not in _STACK_LIB:
         raise ValueError(f"unknown HDF5 stack {stack!r}")
     key = _norm(path)
+    # Lazy, and it has to be: the journal imports this module back for
+    # :func:`live_verdict`.  ``sys.modules`` lookup after the first call.
+    from . import h5_journal
     with _LOCK:
-        live = _LIVE.get(key, [])
-        foreign = [h for h in live if h["stack"] != stack]
-        if foreign and (is_write_mode(mode)
-                        or any(is_write_mode(h["mode"]) for h in foreign)):
-            raise RuntimeError(
-                _overlap_refusal(key, stack, mode, where, live))
-        rec = _record(key)
-        if rec["last_stack"] not in (None, stack):
-            rec["alternations"] += 1
-            wrote = (rec["writes"][STACK_H5PY] or rec["writes"][STACK_FFI]
-                     or is_write_mode(mode))
-            if wrote:
-                rec["alternations_with_write"] += 1
-                if policy() == "strict":
-                    raise RuntimeError(
-                        _alternation_refusal(key, stack, mode, where, rec))
-        rec["opens"][stack] += 1
-        if is_write_mode(mode):
-            rec["writes"][stack] += 1
-        rec["last_stack"] = stack
-        _TOKEN[0] += 1
-        token = _TOKEN[0]
-        _LIVE.setdefault(key, []).append(
-            {"stack": stack, "mode": str(mode), "where": str(where),
-             "token": token})
-        return token
+        verdict = _live_verdict_locked(key)
+        try:
+            token = _claim(key, stack, mode, where)
+        except BaseException as exc:
+            h5_journal.fail("open", key, exc, stack=stack, mode=mode,
+                            owner=verdict)
+            raise
+    h5_journal.record("open", key, stack=stack, mode=mode,
+                      handle=f"tok{token}", owner=verdict)
+    return token
+
+
+def _claim(key: str, stack, mode, where) -> int:
+    """The refusals and the bookkeeping.  Caller holds :data:`_LOCK`."""
+    live = _LIVE.get(key, [])
+    foreign = [h for h in live if h["stack"] != stack]
+    if foreign and (is_write_mode(mode)
+                    or any(is_write_mode(h["mode"]) for h in foreign)):
+        raise RuntimeError(
+            _overlap_refusal(key, stack, mode, where, live))
+    rec = _record(key)
+    if rec["last_stack"] not in (None, stack):
+        rec["alternations"] += 1
+        wrote = (rec["writes"][STACK_H5PY] or rec["writes"][STACK_FFI]
+                 or is_write_mode(mode))
+        if wrote:
+            rec["alternations_with_write"] += 1
+            if policy() == "strict":
+                raise RuntimeError(
+                    _alternation_refusal(key, stack, mode, where, rec))
+    rec["opens"][stack] += 1
+    if is_write_mode(mode):
+        rec["writes"][stack] += 1
+    rec["last_stack"] = stack
+    _TOKEN[0] += 1
+    token = _TOKEN[0]
+    _LIVE.setdefault(key, []).append(
+        {"stack": stack, "mode": str(mode), "where": str(where),
+         "token": token})
+    return token
 
 
 def note_close(path, token: int) -> None:
-    """Release a handle declared by :func:`note_open`.  Never raises."""
+    """Release a handle declared by :func:`note_open`.  Never raises.
+
+    JOURNALED, for the same reason the open is: the pairing of a close
+    line with its open line is what says a handle was released BEFORE
+    the other library instance touched the path — the ordering audit A1
+    asks about and the one a segfault at close destroys the evidence of.
+    """
     key = _norm(path)
+    from . import h5_journal
     with _LOCK:
         live = _LIVE.get(key)
         if not live:
             return
+        held = next((h for h in live if h["token"] == token), None)
+        if held is not None:
+            h5_journal.record("close", key, stack=held["stack"],
+                              mode=held["mode"], handle=f"tok{token}",
+                              owner=_live_verdict_locked(key))
         _LIVE[key] = [h for h in live if h["token"] != token]
         if not _LIVE[key]:
             del _LIVE[key]

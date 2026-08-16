@@ -80,6 +80,13 @@ site/
 .tier2_cross_p/
 .restart_q_storage_ab/
 .padprobe/
+# The HDF5 operation journal and its crash rings (file_io/h5_journal.py).
+# Per-rank run artifacts, written into the working directory — which is a
+# run directory in production and this checkout when someone runs a driver
+# from here.
+h5_journal.rank*.log
+h5_journal_crash.rank*.txt
+
 # Stray compiler default-output scrap. Do NOT blanket-ignore *.out:
 # tracked reference files match it (src/psp/psp_dataclass.out,
 # tests/regression/cohsex_debug/sigma_*_ref.out).
