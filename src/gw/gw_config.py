@@ -13,7 +13,6 @@ along the same axes the input file's section comments already use:
     config.memory      — chunk sizing
     config.backend     — FFI/IO backend selection (gspace_io / w_dyson_solver)
     config.debug       — debug-only flags & file paths
-    config.bse         — BSE interpolation setup (htransform-driven)
     config.paths       — output filenames
 
 The top-level ``LorraxConfig`` retains only system geometry
@@ -2403,20 +2402,6 @@ class DebugConfig:
 
 
 @dataclass(frozen=True)
-class BSEConfig:
-    """BSE interpolation setup (htransform-driven fine-k wfn recovery).
-
-    See ``bandstructure.bse_setup.compute_wfns_fi``.  ``get_centroids_fi``
-    is the master gate; if False the rest is unused.
-    """
-    get_centroids_fi: bool
-    wfn_fi_min: int
-    wfn_fi_max: int
-    kgrid_fi: str
-    wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
-
-
-@dataclass(frozen=True)
 class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation.
 
@@ -2482,7 +2467,14 @@ class LorraxConfig:
     memory: MemoryConfig
     backend: BackendConfig
     debug: DebugConfig
-    bse: BSEConfig
+    # NO ``bse`` GROUP.  The five BSE-interpolation keys stay in _DEFAULTS
+    # -- they are real and the deck sets them -- but their consumers read
+    # the raw params dict: ``bandstructure.htransform`` re-parses the deck
+    # with ``read_cohsex_input`` and reads ``params["kgrid_fi"]`` etc.
+    # directly, and ``bse_setup`` takes them as arguments.  A frozen
+    # dataclass nobody read was a second, quieter copy of five values; it
+    # was deleted in 0.1.0.  Its one load-bearing line, the
+    # ``wfn_fi_q_chunk >= 0`` check, moved into ``from_input_file``.
 
     # --- Optional parsed blocks ---
     kpoints_crystal_b: dict | None = None
@@ -2976,16 +2968,13 @@ class LorraxConfig:
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file") or ""),
             write_wfn_h5=bool(_g("write_wfn_h5")),
         )
-        bse = BSEConfig(
-            get_centroids_fi=bool(_g("get_centroids_fi")),
-            wfn_fi_min=int(_g("wfn_fi_min")),
-            wfn_fi_max=int(_g("wfn_fi_max")),
-            kgrid_fi=str(_g("kgrid_fi") or ""),
-            wfn_fi_q_chunk=int(_g("wfn_fi_q_chunk")),
-        )
-        if bse.wfn_fi_q_chunk < 0:
+        # The BSE-interpolation keys have no config group (see the field
+        # list); this is the one thing the deleted ``BSEConfig`` did that
+        # a consumer of the raw params dict would not.
+        _wfn_fi_q_chunk = int(_g("wfn_fi_q_chunk"))
+        if _wfn_fi_q_chunk < 0:
             raise ValueError(
-                f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
+                f"wfn_fi_q_chunk={_wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
         # ``compute_mode`` is REQUIRED.  Refused HERE rather than at the
@@ -3087,7 +3076,6 @@ class LorraxConfig:
             memory=memory,
             backend=backend,
             debug=debug,
-            bse=bse,
             # Parsed blocks
             kpoints_crystal_b=params.get("kpoints_crystal_b"),
             input_dir=input_dir,

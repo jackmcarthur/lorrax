@@ -99,6 +99,29 @@ def test_the_debug_table_is_off_by_default_and_on_by_naming_a_file(tmp_path):
     assert not hasattr(cfg.debug, "sigma_freq_debug_output")
 
 
+def test_there_is_no_bse_config_group(tmp_path):
+    """Five keys, one dataclass, zero readers.
+
+    ``bandstructure.htransform`` re-parses the deck and reads the raw
+    params dict; ``bse_setup`` takes the values as arguments.  The frozen
+    group was a second, quieter copy — deleted in 0.1.0.  The KEYS stay.
+    """
+    from gw import gw_config
+
+    assert not hasattr(gw_config, "BSEConfig")
+    cfg = _config(tmp_path, "wfn_fi_q_chunk = 12\n")
+    assert not hasattr(cfg, "bse")
+    for key in ("get_centroids_fi", "wfn_fi_min", "wfn_fi_max", "kgrid_fi",
+                "wfn_fi_q_chunk"):
+        assert key in gw_config._DEFAULTS
+
+
+def test_the_q_chunk_refusal_survived_the_group(tmp_path):
+    """The one load-bearing line ``BSEConfig`` carried."""
+    with pytest.raises(ValueError, match="wfn_fi_q_chunk"):
+        _config(tmp_path, "wfn_fi_q_chunk = -3\n")
+
+
 def test_sigma_at_dft_energies_is_ignored_and_says_so(tmp_path):
     """Deleted 0.1.0.  It was parsed and never read for its whole life.
 
