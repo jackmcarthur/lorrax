@@ -736,9 +736,11 @@ elements, with the covariant-derivative upgrade parked on claim 183.
 ## 7. Self-consistency: the metallic QSGW map and its convergence
 
 Sections 1–6 build one evaluation of the screening and the self-energy.
-This section is about the *map* they compose into, and about the only
-metallic self-consistency result that exists: sodium converges, under
-damping, and diverges without it.
+This section is about the *map* they compose into, and about the metallic
+self-consistency results that exist: sodium diverges under the plain
+undamped iteration, converges under damping (claims 198, 200), and
+converges under the accelerator once the occupations are solved at entry
+(claim 201) — which is the production route.
 
 ### 7.1 What one map call rebuilds
 
