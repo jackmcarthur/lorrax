@@ -493,8 +493,7 @@ def test_unimplemented_option_values_stay_legal_vocabulary(tmp_path):
               sigma_target_error=1e-6, sigma_max_nodes=64,
               invalid_mode="imaginary")
     MPAConfig(n_poles=8, material_class="metal", sampling_alpha=1,
-              varpi_near_ry=0.2, varpi_far_ry=2.0, head_model="fixed_dft",
-              pole_batch_size=4, sigma_sector_target_error=6.5e-4,
+              varpi_near_ry=0.2, varpi_far_ry=2.0, pole_batch_size=4, sigma_sector_target_error=6.5e-4,
               sigma_crossing_target_error=2.0e-3, sigma_max_nodes=96)
 
 

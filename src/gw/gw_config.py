@@ -1358,7 +1358,6 @@ _DEFAULTS = {
     "mpa_sampling_alpha": 1,
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
-    "mpa_head_model": "fixed_dft",
     "mpa_pole_batch_size": 4,
     # Both targets bound the same dimensionless relative residual
     # |1-d Q(d)|.  They are separate because the positive crossing rule is
@@ -1531,6 +1530,12 @@ _LEGACY_DECK_KEYS = frozenset({
     # picking one for the deck would be this parser inventing an output
     # path.  The refusal names the line to write.
     "sigma_freq_debug_output",      # refuse -> sigma_freq_debug_file
+    # 0.1.0: ONE legal value (``fixed_dft``); anything else raised.  Same
+    # argument that retired ``slab_io`` / ``use_ffi_io``: a key whose only
+    # legal setting is its default is not configuration.  When a second
+    # MPA head policy lands it joins the ``head_*`` family, which is where
+    # head policy belongs, rather than reviving an ``mpa.*`` twin.
+    "mpa_head_model",               # warn-and-ignore (one legal value)
 })
 
 #: The legacy-flag combination each retired ansatz flag stood for, as the
@@ -1795,6 +1800,21 @@ def read_lorrax_input(filename: str) -> dict:
         # ``kij_stream`` asked for a streamed-HDF5 accumulator that no
         # longer exists; silently rerouting it to the host-tile path is
         # the silent-downgrade failure, key or no key.
+        if section.get("mpa_head_model", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'mpa_head_model' is no longer supported and will "
+                "be ignored: 'fixed_dft' was its only legal value, so it "
+                "never selected anything.  The MPA q->0 head still fits and "
+                "reuses the two-point DFT scalar head while the body is "
+                "rebuilt.  Remove it from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "mpa_head_model",
+                "IGNORED — 'fixed_dft' was its only legal value; the head "
+                "policy is unchanged"))
+
         if section.get("sigma_freq_debug_output", fallback=None) is not None:
             raise ValueError(
                 f"Input key 'sigma_freq_debug_output' "
@@ -2253,7 +2273,6 @@ class MPAConfig:
     sampling_alpha: int
     varpi_near_ry: float
     varpi_far_ry: float
-    head_model: str
     pole_batch_size: int
     sigma_sector_target_error: float
     sigma_crossing_target_error: float
@@ -2271,9 +2290,6 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        if self.head_model != "fixed_dft":
-            raise NotImplementedError(
-                "mpa_head_model currently supports only 'fixed_dft'")
         if not 1 <= self.pole_batch_size <= 4:
             raise ValueError("mpa_pole_batch_size must be in [1, 4]")
         if not (0.0 < self.sigma_sector_target_error < 1.0
@@ -2789,7 +2805,6 @@ class LorraxConfig:
             sampling_alpha=int(_g("mpa_sampling_alpha")),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
-            head_model=str(_g("mpa_head_model")).strip().lower(),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             sigma_sector_target_error=float(
                 _g("mpa_sigma_sector_target_error")),

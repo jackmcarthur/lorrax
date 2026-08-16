@@ -604,7 +604,6 @@ mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
-mpa_head_model = fixed_dft
 mpa_pole_batch_size = 4
 
 mpa_sigma_sector_target_error = 6.5e-4

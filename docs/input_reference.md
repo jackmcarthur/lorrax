@@ -88,7 +88,6 @@ page has to read it from.
 | `mpa_sampling_alpha` | `1` | Real-coordinate exponent for the nested partition, `omega_n = omega_m*s_n^alpha`; supported values are 1 and 2. |
 | `mpa_varpi_near_ry` | `0.2` | Height in Ry of the near complex-frequency sampling line. |
 | `mpa_varpi_far_ry` | `2.0` | Height in Ry of the far complex-frequency sampling line; must exceed `mpa_varpi_near_ry`. |
-| `mpa_head_model` | `"fixed_dft"` | MPA q→0 head policy. Only `fixed_dft` is accepted: fit and reuse the established two-point DFT scalar head while the body is rebuilt. This omits dynamic local-field head/wing feedback. |
 | `mpa_pole_batch_size` | `4` | Maximum fitted-pole slabs resident during MPA Sigma. Values 1–4 are accepted. This is an HBM schedule, not a spectral grouping. |
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |
