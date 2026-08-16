@@ -77,7 +77,8 @@ from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
 from .efermi import OccupationState
 from .gw_config import ComputeMode
-from .scissor import ScissorFit, apply_conduction_scissor_to_tail, fit_scissor
+from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
+                      classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
 from .wavefunction_bundle import (
     BandSlices, Wavefunctions, rotate_wavefunctions)
@@ -536,6 +537,29 @@ def _solve_head_occupations(
         constant_values=0.0,
     )
     return occ_state, surface_kn
+
+
+def _assert_index_mask_matches_classes(inputs: SCInputs, classes) -> None:
+    """Refuse if the step mask and the three-way rule disagree.
+
+    On a deck with STEP occupations the two are the same statement: with no
+    band crossing E_F, "below the lowest crossing band" degenerates to
+    "fully occupied", which is the ``arange(nb) < meta.nelec`` cut that
+    ``run_sc_driver`` freezes into ``valence_mask_active_kn``.  Saying so as
+    a refusal rather than a comment is what keeps the insulating path
+    byte-identical as the metal path grows: if the two ever part, the
+    insulating scissor has silently changed class on some band, and that is
+    exactly the failure this whole change is about.
+    """
+    nb = int(inputs.e_dft_active_kn_ry.shape[1])
+    want = np.arange(nb) < int(inputs.meta.nelec)
+    got = np.arange(nb) < int(classes.valence_stop)
+    if int(classes.n_crossing) or not np.array_equal(want, got):
+        raise ValueError(
+            "SC scissor: a step-occupation ('fixed' family) deck must "
+            "reproduce the frozen index mask exactly, but the three-way "
+            f"classification gives {classes.summary()} against "
+            f"meta.nelec = {int(inputs.meta.nelec)} over {nb} active bands.")
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1403,61 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     U_full = U_qp if ks.is_identity else ks.broadcast(U_qp)
     E_full = E_qp_ry if ks.is_identity else ks.broadcast(E_qp_ry)
 
+    # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
+    # the spectrum of the H actually being mapped.  This makes the
+    # iteration a genuine self-map F(H) = Sigma[H, occ(H)] — the contract
+    # _run_rcrop's own header states ("gw_iteration_map reads
+    # state.iteration and state.H_qp_dft and nothing else") and the one
+    # rCROP's trial/accept trajectory requires: every F(H) evaluation,
+    # trial or accepted, gets occupations consistent with ITS H by
+    # construction.  The previous flow solved this same quantity at
+    # END-of-iteration and carried it into the NEXT call — a
+    # one-generation lag (audit A5) that was exact only on the
+    # mixing=1 linear trajectory, which is why rCROP was refused on
+    # metallic decks.  At a fixed point H* = F(H*) the two rules
+    # coincide, so the converged answer is unchanged.  Insulating decks
+    # (occ_broadening = 0) return (None, None): bit-identical path.
+    #
+    # SOLVED HERE, ABOVE THE TAIL SCISSOR, so that ONE occupation state
+    # serves the whole map call — including BOTH scissor fits, which now
+    # classify their val/cond/crossing bands from it.  The ladder handed
+    # over is the same one ``rotate_wavefunctions`` assembles for
+    # ``wfns_qp.enk`` (``wavefunction_bundle.py:616-619``): the DFT ladder
+    # with the active block replaced by this iteration's eigenvalues.  The
+    # only columns that can differ from the old spelling
+    # (``_solve_head_occupations(inputs, wfns_qp.enk)``, called after the
+    # rotation) are the sum-band tail ``[b3, b4_user)`` on iterations that
+    # ran the tail scissor — bands hundreds of eV above mu, where f is
+    # exactly 0 under either ladder.  Reading them from the tail scissor
+    # was also the circular half: the tail scissor's own band classes now
+    # come from this state.
+    # Replicated, like the bundle's own enk (``rotate_wavefunctions``
+    # constrains it to ``P(None, None)`` right after the same update), so
+    # the host-side MP1 solve cannot meet an array that spans
+    # non-addressable devices.
+    with inputs.mesh_xy:
+        enk_entry = jax.lax.with_sharding_constraint(
+            jnp.asarray(inputs.wfns_dft.enk).at[
+                :, inputs.band_slices.sigma].set(
+                    jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype)),
+            NamedSharding(inputs.mesh_xy, P(None, None)))
+    entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
+        inputs, enk_entry)
+    # THE THREE-WAY SCISSOR CLASSIFICATION, once per map call.  Valence is
+    # everything below the lowest Fermi-crossing band, conduction everything
+    # above the highest, and the crossing bands enter NEITHER fit (owner
+    # ruling 2026-08-16; the damage the old occupied-index mask did on
+    # sodium is quantified in gw/scissor.py's header and claim 0212).
+    # ``None`` on an insulating deck: the caller keeps the index mask, which
+    # IS this rule when nothing crosses.
+    scissor_classes = None
+    if entry_occ_state is not None:
+        scissor_classes = classify_scissor_bands(entry_occ_state.f_kn)
+        if str(entry_occ_state.smearing_family) == "fixed":
+            _assert_index_mask_matches_classes(inputs, scissor_classes)
+        inputs.print_fn(
+            f"    SC scissor classes: {scissor_classes.summary()}")
+
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
     # immutable active DFT ladder.  The logical stop is b4_user, not padded
@@ -1402,11 +1481,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fit_mask_kn = np.broadcast_to(
             np.asarray(inputs.partition.in_range_mask, dtype=bool)[None, :],
             e_dft_fit_ev.shape)
+        # SAME three-way classification as the active-window scissor below.
+        # It matters here too: the tail law that gets applied is the
+        # CONDUCTION one, and under the old index mask a Fermi-crossing
+        # band above the occupied cut (sodium's band 10 of nval = 10) was a
+        # conduction sample.
+        valence_kn = np.asarray(valence_fit, dtype=bool)
+        if scissor_classes is not None:
+            valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
+            fit_mask_kn = fit_mask_kn & ~crossing_kn
         tail_fit = fit_scissor(
             E_dft_kn_ev=e_dft_fit_ev,
             E_qp_kn_ev=(
                 np.asarray(E_qp_ry, dtype=np.float64) * RYD_TO_EV),
-            valence_mask_kn=np.asarray(valence_fit, dtype=bool),
+            valence_mask_kn=valence_kn,
             fit_mask_kn=fit_mask_kn,
             k_weights=k_star_weights(ks),
         )
@@ -1434,23 +1522,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
-    # ENTRY-SOLVED metallic occupations: one MP1 state per map CALL, from
-    # the spectrum of the H actually being mapped (wfns_qp.enk is the
-    # eigensystem of state.H_qp_dft rotated above).  This makes the
-    # iteration a genuine self-map F(H) = Sigma[H, occ(H)] — the contract
-    # _run_rcrop's own header states ("gw_iteration_map reads
-    # state.iteration and state.H_qp_dft and nothing else") and the one
-    # rCROP's trial/accept trajectory requires: every F(H) evaluation,
-    # trial or accepted, gets occupations consistent with ITS H by
-    # construction.  The previous flow solved this same quantity at
-    # END-of-iteration and carried it into the NEXT call — a
-    # one-generation lag (audit A5) that was exact only on the
-    # mixing=1 linear trajectory, which is why rCROP was refused on
-    # metallic decks.  At a fixed point H* = F(H*) the two rules
-    # coincide, so the converged answer is unchanged.  Insulating decks
-    # (occ_broadening = 0) return (None, None): bit-identical path.
-    entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
-        inputs, wfns_qp.enk)
+    # (``entry_occ_state`` was solved above, before the tail scissor that
+    # feeds ``enk_base`` — see the block after ``E_full``.)
 
     # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
     # orbitals, alongside Sigma_i and from the same U_qp, both feeding
@@ -1756,6 +1829,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     scissor_E_qp_kn_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_act, val_mask,
         inputs.partition.in_range_mask, ks,
+        band_classes=scissor_classes,
         print_fn=inputs.print_fn,
     )
     H_qp_dft_new = apply_band_partition(
@@ -1833,6 +1907,7 @@ def _scissor_E_qp_for_outofrange(
     valence_mask_kn: jax.Array,
     in_range_mask: jax.Array,
     kstar,
+    band_classes=None,
     print_fn=None,
 ) -> tuple[jax.Array, object | None]:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
@@ -1860,6 +1935,20 @@ def _scissor_E_qp_for_outofrange(
     means the weights cannot be omitted, and cannot be built from a
     different k-set than the rows.  On an identity map
     ``k_star_weights`` returns ones and the arithmetic is unchanged.
+
+    ``band_classes`` (a ``scissor.ScissorBandClasses``, or None) OVERRIDES
+    ``valence_mask_kn``.  It carries the metal's three-way split — valence
+    below the lowest Fermi-crossing band, conduction above the highest,
+    crossing bands in neither fit class.  ``valence_mask_kn`` remains the
+    insulating path's two-way "occupied at DFT occupation" index mask,
+    which on a metal is the bug this argument exists to fix: it filed
+    sodium's Fermi-crossing Kramers pair as VALENCE, and in the ``[-5,+5]``
+    window those two bands were the val fit's ONLY in-window samples
+    (n_v = 1024, α = 0.9100), whose extrapolation to the 2s semicore was
+    wrong by 17.5 eV and wrong in sign against BerkeleyGW (claim 0212).
+    Excluding them empties the class there, and an empty class is the
+    identity (``bf57701b``) — a refusal to extrapolate rather than a
+    Fermi-surface-anchored line.
     """
     from .scissor import k_star_weights
 
@@ -1873,20 +1962,32 @@ def _scissor_E_qp_for_outofrange(
         H_qp_dft_full, axis1=1, axis2=2)))
     in_range_kn = np.broadcast_to(
         in_range[None, :], e_dft_np.shape).astype(bool)
+    # THE THREE-WAY CLASSIFICATION.  ``band_classes`` is None on an
+    # insulating deck and the historical two-way index mask is used
+    # verbatim — the step mask IS this rule when no band crosses E_F, so
+    # that path is byte-identical, not merely equivalent.
+    valence_kn = np.asarray(valence_mask_kn, dtype=bool)
+    crossing_kn = None
+    fit_mask_kn = in_range_kn
+    if band_classes is not None:
+        valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
+        fit_mask_kn = in_range_kn & ~crossing_kn
     fit = fit_scissor(
         e_dft_np * RYD_TO_EV,
         H_diag_np * RYD_TO_EV,
-        valence_mask_kn=np.asarray(valence_mask_kn, dtype=bool),
-        fit_mask_kn=in_range_kn,
+        valence_mask_kn=valence_kn,
+        fit_mask_kn=fit_mask_kn,
         k_weights=k_star_weights(kstar),
     )
     if print_fn is not None:
         # The two arms' agreement is readable here: ``n`` differs with the
         # k-set, ``w`` must not.
         print_fn(f"    SC scissor: {fit.summary()}")
-    # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.
+    # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.  The SAME boundary indices
+    # that split the fit split the prediction, so a band cannot be fit as
+    # one class and extrapolated as another.
     delta_ev = fit.predict(
-        e_dft_np * RYD_TO_EV, np.asarray(valence_mask_kn, dtype=bool))
+        e_dft_np * RYD_TO_EV, valence_kn, crossing_mask=crossing_kn)
     return jnp.asarray((e_dft_np + delta_ev / RYD_TO_EV)), fit
 
 
