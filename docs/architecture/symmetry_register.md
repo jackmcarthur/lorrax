@@ -672,20 +672,52 @@ in jax.
    `unfold_isdf_operator` numbers are correctness (bit-identity at 1×1/2×2/4×1
    emulated, plus four real CPU processes) — never wall time.
 
-**DERIVED, not measured — and it says the deck size does not matter.** The
+**The deck size does not matter, and that is why this was measurable.** The
 unfold moves `C · nq_full · μ² · 16` bytes over the interconnect; the wedge
 saves reading `(nq_full − nq_ibz) · μ² · 16` bytes off disk. **μ² cancels.**
 The wedge wins iff
 
-    B_net  >  C · [ nq_full / (nq_full − nq_ibz) ] · B_disk
+    B_net  >  [ nq_full / (nq_full − nq_ibz) ] · B_disk
 
 and at the 7.6× reduction of the μ = 2406 anchor the bracket is **1.152**. So
-the verdict is a bandwidth ratio, not a size question, and a modest deck
-answers it provided the object is large enough to be bandwidth- rather than
-latency-bound. The one committed disk number is SlabIO phdf5 at
-**2.919 GiB/s (16 ranks)** against serial h5py **0.17 GiB/s (P=4)**
-(`bse_loading.py:455-458`). **Not run here** — stated so the next person
-measures the right thing rather than sizing a deck to μ = 2406.
+the verdict is a bandwidth ratio, not a size question. Nobody needs to build
+a μ = 2406 deck to settle it.
+
+### MEASURED 2026-08-15 — and the cost basis does not survive
+
+`unfold_isdf_operator` timed on **4 × A100, a real 2×2 device mesh over
+NVLink**, complex128 (`JAX_ENABLE_X64=1`; without it JAX silently truncates to
+complex64 and halves the bytes, which inflates the answer 2×), 5 reps after a
+warm-up call, at the μ = 2406 anchor's own q geometry (144 q → 19, 7.6×):
+
+| μ | full-BZ tensor | unfold | **B_net** | **B_net / B_disk** | verdict |
+|---|---|---|---|---|---|
+| 2048 | 9.000 GiB | 0.157 s | **57.4 GiB/s** | **19.7×** | wedge |
+| 1024 | 2.250 GiB | 0.041 s | 54.3 GiB/s | 18.6× | wedge |
+| 512 | 0.562 GiB | 0.015 s | 38.5 GiB/s | 13.2× | wedge |
+| 256 | 0.141 GiB | 0.007 s | 20.7 GiB/s | 7.1× | wedge |
+
+against `B_disk = 2.919 GiB/s` — the tree's own committed SlabIO phdf5 figure
+at 16 ranks (`bse_loading.py:455-458`) — and a bracket of **1.152**.
+
+**The wedge wins by 6–17× at every size tested**, and by 17× at μ = 2048,
+which is within 15 % of the anchor's μ. Reproducible to ~1.5 % with the sizes
+run in reverse order (that ordering check matters: run first, μ = 256 measured
+6.4 GiB/s against 20.7 GiB/s run last — the difference is warm-up, and a
+single-size run would have reported the low number).
+
+Even granting disk **10× faster** than the committed figure, the μ = 2048
+margin is still 1.9×. The cost argument does not hold on this hardware.
+
+**Scope, stated because it bounds the conclusion.** Single node, four GPUs,
+NVLink — which IS the geometry `_MunuSlabPlan` runs at P = 4, but a
+multi-node BSE would cross Slingshot instead and is NOT covered. The shapes
+are synthetic (a valid per-op cyclic permutation, zero umklapp wrap): this
+measures TRANSPORT, and the table's contents change which element lands where,
+not how many bytes move. `B_disk` is quoted from the tree, not re-measured.
+And this is the cost only — items 1–3 above (the insertion, the `V_q0` route,
+the missing design doc) are untouched, so **this does not by itself authorise
+lifting the refusal.** What it removes is the stated reason for it.
 
 **Two defects found while auditing the refusal:**
 
