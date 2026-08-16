@@ -588,15 +588,15 @@ output wing.  Frequencies are blocked inside each ring, so the transition
 weight temporary is bounded and no band-pair-by-centroid tensor is stored.
 Each sample is folded through total W while that body slab is resident.
 
-The QSGW order is sequential.  The first half of iteration `i` evaluates the
-direct head on the full MPA grid using the chemical potential and occupations
-carried from iteration `i-1`.  Only after Sigma/H assembly and the current
-orbital rotation does the fixed-electron MP1 solve produce the state consumed
-by iteration `i+1`.  That carried state is one `gw.efermi.OccupationState`
-and reaches the finite-q body and Sigma as well as the head correction;
-[Metallic MPA screening](metallic-mpa-screening.md) owns what each consumer
-does with it, which pieces are threaded end to end and which are not, and the
-capability-gate status.
+Each QSGW map call solves its own occupation state at entry, from the
+spectrum of the Hamiltonian it was handed, and evaluates the direct head on
+the full MPA grid with that state's chemical potential and occupations; the
+same state reaches the finite-q body and Sigma.  There is no carry between
+calls, which is what makes the map a function of its Hamiltonian alone.
+[Metallic MPA screening](metallic-mpa-screening.md) owns that rule and its
+consequences, what each consumer does with the state, which pieces are
+threaded end to end and which are not, the capability-gate status, and the
+measured self-consistency behaviour.
 
 One-shot and diagonal fixed-point QP solvers can consume a finalized external
 pole store.  Fully self-consistent QSGW rebuilds the body and head models
@@ -604,10 +604,12 @@ because each iteration changes the orbitals and transition energies.  The
 bounded path is `chi(z)` q-wedge store -> one-slab Dyson and head finalization
 -> `Wc(z)` q-wedge store -> bounded body-column and scalar-head Loewner fits.
 Sigma subsequently reads and unfolds four body pole/residue slabs at a time
-and reads the small head fit collectively.  Public `compute_mode = mpa`
-remains disabled until one real-material run traverses the complete
-chi/W/head/Sigma/QSGW chain; this section describes landed internal plumbing,
-not a metallic-screening capability claim.
+and reads the small head fit collectively.  Public `compute_mode = mpa` is
+no longer gated at driver entry — the row was deleted at `9c9b23dc` once a
+real metallic run traversed the complete chi/W/head/Sigma/QSGW chain — and
+what that lift does and does not assert is stated once, in
+[Metallic MPA screening](metallic-mpa-screening.md) §6.4.  Read this section
+as landed plumbing: it is not itself a capability claim.
 
 
 The MPA body applies the configured $\eta$ to every pole. The current generic
