@@ -15,8 +15,8 @@ from common.units import RYD_TO_EV
 # The channel-availability table (L1, jax-free) — the writers below ask it
 # which Σ channels a run built instead of hand-checking mode strings.
 from .gw_config import (
-    ComputeMode, SigmaChannel, UNIMPLEMENTED_MODES, explain_missing_channels,
-    mode_builds_channels, sigma_channels_for)
+    ComputeMode, SelfEnergyEvalType, SigmaChannel, UNIMPLEMENTED_MODES,
+    explain_missing_channels, mode_builds_channels, sigma_channels_for)
 
 # ---------------------------------------------------------------------------
 # Results container
@@ -109,6 +109,16 @@ class GWResults:
     kin_ion_has_hartree: bool = False
     #: 'stored' | 'folded' | 'isdf' | 'gspace' — see file_io.kin_ion.
     hartree_source: str | None = None
+    #: Which QP-energy definition eqp0.dat / eqp1.dat REPORT
+    #: (:class:`gw.gw_config.SelfEnergyEvalType`).  ``LINEARIZED`` is the
+    #: BGW Newton + Z-factor pair assembled from the Σ DIAGONALS at
+    #: E_DFT; ``HERMITIANIZED`` reports the eigenvalues of the QP
+    #: Hamiltonian ``H = kin_ion + ½(Σ+Σ†) + V_H`` that the driver
+    #: already builds and diagonalises — i.e. the numbers that carry the
+    #: OFF-DIAGONAL Σ.  Defaulted to ``LINEARIZED`` so a container built
+    #: by any caller that predates this field reports exactly what it
+    #: reported before.
+    eval_type: SelfEnergyEvalType = SelfEnergyEvalType.LINEARIZED
 
 
 # ---------------------------------------------------------------------------
@@ -1173,7 +1183,7 @@ def write_results(
             )
         e_dft_rel_ev_irr = e_dft_ev_irr - float(results.efermi_ev)
 
-    assemble_eqp(
+    assembly = assemble_eqp(
         kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
         band_offset=results.band_start,
         e_dft_ev=e_dft_ev_irr,
@@ -1189,7 +1199,57 @@ def write_results(
         hartree_source=results.hartree_source,
         kin_ion_has_hartree=results.kin_ion_has_hartree,
         print_fn=print_fn,
-    ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
+    )
+    # ── THE eval_type SEAM — which QP definition eqp{0,1}.dat report ──────
+    # LINEARIZED leaves ``assembly`` exactly as assembled above: this
+    # branch is not entered at all, so the default path is untouched code,
+    # not re-derived numbers.  That is what makes the bit-identity claim
+    # structural rather than a tolerance.
+    #
+    # HERMITIANIZED replaces the reported pair with the eigenvalues of the
+    # QP Hamiltonian.  It does NOT skip the assembly: the V_H seam
+    # (``resolve_hartree_diag_ev``) and the mean-field gate
+    # (``_warn_on_unphysical_h0``) run and print identically in both
+    # arms, and ``sigma_diag.dat``'s columns keep their meaning — only the
+    # two REPORTED columns change.  ``results.E_qp_ry`` is the eigh the
+    # driver already performed on ``½(H+H†)`` with H = kin_ion + Σ_xc +
+    # V_H; no second diagonalisation is built here, and the ``irr_idx``
+    # subset is the same ``sym.kirr_fullids`` reduction the linearized
+    # columns above use (a REDUCTION to the wedge, not a symmetry
+    # unfolding — nothing is reconstructed).
+    #
+    # eqp1 == eqp0 by construction, and that is the physics, not a
+    # placeholder: off-diagonal Σ has already moved the bands, so there is
+    # no Newton step left to Z-linearize.  The static-COHSEX path reports
+    # the identical pair for the same structural reason (Z=1), so every
+    # downstream eqp1.dat consumer keeps working.
+    if results.eval_type is SelfEnergyEvalType.HERMITIANIZED:
+        import dataclasses
+        e_herm_ev = (
+            np.asarray(results.E_qp_ry, dtype=np.float64)[irr_idx] * r2e)
+        if e_herm_ev.shape != assembly.eqp0_ev.shape:
+            raise ValueError(
+                f"write_results: hermitianized reporting needs E_qp_ry on "
+                f"the same (k_irr, band) grid as the linearized assembly, "
+                f"but got {e_herm_ev.shape} against {assembly.eqp0_ev.shape}. "
+                f"E_qp_ry must be the eigh of the FULL-BZ H over the same "
+                f"active window [{results.band_start}, {results.band_stop}).")
+        assembly = dataclasses.replace(
+            assembly, eqp0_ev=e_herm_ev, eqp1_ev=e_herm_ev)
+        _shift = e_herm_ev - assembly.e_dft_ev
+        print_fn(
+            "  eval_type: hermitianized — eqp0/eqp1 report the "
+            "REDIAGONALIZED H_qp eigenvalues (off-diagonal Σ included); "
+            "eqp1 == eqp0 by construction.")
+        print_fn(
+            f"    ΔE = E_qp − E_DFT over the wedge: "
+            f"mean {_shift.mean():+.4f} eV, "
+            f"min {_shift.min():+.4f} eV, max {_shift.max():+.4f} eV")
+    else:
+        print_fn(
+            "  eval_type: linearized — eqp0 = Newton at E_DFT, "
+            "eqp1 = Z-linearized (BGW).")
+    assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
     # ── eqp_g0w0.dat (PPM non-SC only) — explicit Re/Im of H₀+Σ_xc(E_DFT) ──
     if (

@@ -2723,6 +2723,30 @@ class LorraxConfig:
         return solver
 
     @property
+    def self_energy_eval_type(self) -> SelfEnergyEvalType:
+        """How QP energies are EXTRACTED from the built Σ, for reporting.
+
+        The third axis (:class:`SelfEnergyEvalType`), orthogonal to
+        ``compute_mode`` and ``qp_solver``.  Already resolved — and, for
+        the one bad pairing, already REFUSED — at config construction by
+        ``resolve_self_energy_eval_type``, which stores the verdict on
+        ``self.sc.eval_type``.
+
+        This property exists so the ONE-SHOT driver can read the axis
+        without reaching into ``SCConfig``, whose docstring says it is
+        read only under self-consistency.  That sentence stays true of
+        the LOOP knobs (max_iter, tol_ev, stages, history_depth, …);
+        ``eval_type`` is the one field on that record which is not a
+        loop knob, because the axis it names is defined for every solver
+        — the whole point of separating it from ``qp_solver`` is that
+        ONE-SHOT × HERMITIANIZED is a real configuration (a single-shot
+        QSGW-style rediagonalisation, no self-consistency).  Reading it
+        through here rather than through ``config.sc`` is what keeps
+        that legibility.
+        """
+        return self.sc.eval_type
+
+    @property
     def minimax_config(self):
         """Math-internal :class:`gw.minimax_config.MinimaxConfig` for χ₀."""
         from .minimax_config import MinimaxConfig

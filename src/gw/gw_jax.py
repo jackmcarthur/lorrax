@@ -68,7 +68,8 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	ComputeMode, LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
+	ComputeMode, LorraxConfig, QPSolver, SelfEnergyEvalType,
+	refuse_unimplemented_compute_mode)
 from .gw_init import prepare_isdf_and_wavefunctions
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
@@ -673,6 +674,57 @@ def main(argv=None):
 	sanity.check_finite("kin_ion (from kin_ion.h5)", kin_ion, print_fn=print0)
 	sanity.check_finite("Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0)
 
+	# ---- self_energy_eval_type: which QP definition gets REPORTED ----
+	# Resolved (and, for linearized × self_consistent, already REFUSED) at
+	# config construction.  The Σ build and the H-build/eigh below are the
+	# SAME code for both values — this axis selects only what eqp{0,1}.dat
+	# report, which is why nothing above this line branches on it.
+	eval_type = config.self_energy_eval_type
+	print0(f"  self_energy_eval_type: {eval_type.value}")
+	if eval_type is SelfEnergyEvalType.HERMITIANIZED:
+		# THE WINDOW GUARD, AND WHY ONLY THIS ARM NEEDS IT.  The linearized
+		# report reads Σ DIAGONALS, so a window edge that splits a
+		# degenerate multiplet costs it nothing.  Hermitianized REDIAGONALIZES
+		# inside the window: a sliced multiplet means half an irrep is mixed
+		# and its partner is not, so the reported eigenvalue depends on where
+		# the window happened to cut.  That is a wrong number with no local
+		# symptom, which is exactly the class ``common.band_degeneracy``
+		# exists to refuse.
+		#
+		# STRICT, by the ``zeta_nband`` precedent (gw_init.check_zeta_fit_windows):
+		# naming this key is an explicit, brand-new request for this
+		# evaluation, so there is no census of existing decks sitting on a
+		# sliced edge to grandfather, and the honest move is to refuse rather
+		# than to whisper.
+		from common.band_degeneracy import boundary_min_gaps, check_band_window
+		_enk_ry = np.asarray(enk_dft, dtype=np.float64)
+		try:
+			check_band_window(
+				_enk_ry, int(band_slices.b0), int(band_slices.b3),
+				mode="strict",
+				where=("sigma band window (self_energy_eval_type = "
+				       "hermitianized rediagonalizes inside it)"),
+				log=print0)
+		except Exception as _exc:
+			# NAME THE LEGAL EDGES.  A refusal that only says "band 60 is
+			# degenerate" leaves the user to bisect ncond by hand; the gaps
+			# are already computed, so the edges that DO clear the tolerance
+			# are free to report.
+			from common.band_degeneracy import DEGENERACY_TOL_RY
+			_gaps = boundary_min_gaps(_enk_ry)
+			_legal = [b for b in range(int(band_slices.b0) + 1, len(_gaps))
+			          if np.isfinite(_gaps[b]) and _gaps[b] > DEGENERACY_TOL_RY]
+			raise type(_exc)(
+				f"{_exc}\n  Legal upper edges for this deck (b3 values whose "
+				f"gap clears the tolerance): "
+				f"{_legal if _legal else '(none below the loaded band count)'}."
+				f"\n  Either move the sigma window to one of those, or use "
+				f"self_energy_eval_type = linearized, whose diagonal report "
+				f"is insensitive to the cut."
+			) from _exc
+		print0("    band-window closure: OK for rediagonalization "
+		       f"(window [{int(band_slices.b0)}, {int(band_slices.b3)}))")
+
 	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
 	# one statement and normally seconds, but it is O(nk·nb³) and it is the
 	# only dense LAPACK call on the post-Σ path, so it is the row that tells
@@ -737,6 +789,7 @@ def main(argv=None):
 		tensors_filename=tensors_filename,
 		kin_ion_has_hartree=kin_ion_has_hartree,
 		hartree_source=hartree_source,
+		eval_type=eval_type,
 	)
 	if meta.rank == 0:
 		# Optional Σ-decomposition debug table (no-op unless
