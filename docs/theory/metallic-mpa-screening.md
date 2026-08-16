@@ -949,7 +949,79 @@ that 7.2 replaced. Damped linear is therefore how metallic sodium was
 *first* converged, not the recommended way to converge one: the production
 ruling is entry-solve rCROP, and 7.6 is where that is argued and measured.
 
-### 7.5 Two anchors that decide which bands are even being converged
+### 7.5 Three anchors that decide which bands are even being converged
+
+**Which bands the scissor is even allowed to be fit to (owner ruling
+2026-08-16, commits `5b0ced2d` / `8a73e2fe`).** The out-of-range scissor
+has two classes, so it needs a rule for assigning bands to them. It used
+one: `valence_mask_kn`, "occupied at DFT occupation" — in the driver, the
+frozen index cut `arange(nb_active) < meta.nelec`. On an insulator that is
+the step occupation and there is nothing to decide. **On a metal it is not
+a classification at all**, and it files every Fermi-crossing band as
+valence, which is the one label that cannot be right: over its own k-set a
+crossing band is both occupied and empty, so a line fit through it is a
+line fit through the Fermi surface. The rule now is
+
+    valence class    = bands BELOW the LOWEST band that crosses E_F
+    conduction class = bands ABOVE the HIGHEST band that crosses E_F
+    crossing bands   = in NEITHER fit class
+
+and it costs nothing to exclude them, because a crossing band is inside the
+`Sigma` `omega` window by construction and is therefore in the protected /
+full-`Sigma` set, which never consumes a scissor law.
+
+The classification is per band over all k, from *this* iteration's
+`OccupationState` (`gw.scissor.classify_scissor_bands`, fed the entry-solved
+`f_kn` of 7.6): every cell saturated full, every cell saturated empty, or
+crossing. **Saturated**, not `0 < f < 1`: MP1 overshoots and `f_kn` is never
+clipped (7.1), so a band a width below `mu` carries `f ~ 1.008` and one
+above `f ~ -0.008`; a cell is full at `f >= 1 - 1e-8` and empty at
+`f <= 1e-8`, and a band is crossing if any cell is fractional *or* if its
+cells disagree about which side they are on. Spelled `f == 1.0` it would
+have turned whole semicore shells into crossing bands as soon as the `erfc`
+tail stopped rounding to exactly 1.0.
+
+What it was worth, measured on sodium (claim 0223, arms `18_`/`20_`/`19_`
+of `runs/Na/02_soc48b_qsgw_mpa`, one-shot, 48 bands × 512 full-BZ k, and
+claim 0212 for the `[-5,+5]` numbers):
+
+| `omega` window | old valence fit | new valence fit |
+|---|---|---|
+| `[-5,+5]` | n_v = 1024, **100% crossing samples**, `alpha = 0.9100`, `beta = -0.0015` eV | class **empty** → identity |
+| `[-28,+26]` | n_v = 4096, 2p **plus** the crossing pair (bands 3-10), `alpha = +1.1978`, `beta = -0.4565` eV, **rmse 0.209 eV** | n_v = 3072, 2p alone (bands 3-8), `alpha = +1.0201`, `beta = -4.6397` eV, **rmse 0.018 eV** |
+
+The residual is the direct statement: **the old valence cloud was not a
+line and the new one is** — 0.209 eV of unexplained scatter against 0.018,
+because two of its eight bands were the Fermi surface. Evaluated on its own
+class against the full-GW reference for the 2p (arms `15_`/`16_`, mean QP
+correction `-5.1178` eV), the new law gives `-5.1120` (+0.006) and the old
+`-5.1047` (+0.013).
+
+**The `[-5,+5]` window is where it matters most and where it is
+unambiguous.** There the old law extrapolates the 2s semicore
+(`E_DFT = -52.16` eV) to **+4.69 eV** where full GW gives **-12.14** —
+wrong by 16.8 eV *and wrong in sign*. Under the new rule that window has no
+true-valence band in range at all, so the class is empty and the law is the
+identity (the paragraph below): `dE = 0`, wrong by 12.1 eV, but wrong
+*visibly*, and in a direction that cannot invent a level. **An identity
+refuses to extrapolate; a crossing-anchored line extrapolates confidently
+and wrongly.** The same boundary indices split the fit and the prediction,
+so a band cannot be fit as one class and extrapolated as another; a
+crossing band that is somehow out of range also gets `dE = 0`.
+
+**What this newly EXPOSES, recorded because it does not flatter the
+change.** On the wide `[-28,+26]` window the old law's 2s prediction
+(`-10.77` eV) is CLOSER to full GW (`-12.14`) than the new law's
+(`-5.69`) — by 1.37 eV against 6.46. That is not evidence the crossing pair
+carried valence information; it is the crossing pair steepening `alpha` by
+accident, in a direction that happened to help a 29 eV extrapolation beyond
+the deepest fitted band. What the clean fit shows is the real limit: **the
+QP correction is not affine from the 2p down to the 2s**, and a
+two-parameter law fit at `-23.5` eV cannot reach `-52.2` eV whatever its
+samples are. The remedy is claim 0212's, not the scissor's — put the
+semicore *inside* the `Sigma` window (`15_` lands within 0.688 eV of
+BerkeleyGW's `Eqp0` where the scissor is 17.53 eV off) — and the old rule
+was masking that conclusion behind a number that looked adequate.
 
 **The scissor's no-information law (commit `bf57701b`).** The
 out-of-range scissor fits `E_QP = alpha*E_DFT + beta` per class by weighted
@@ -1106,6 +1178,8 @@ Open, with the reason each is still open:
 | fit conditioning at the shifted origin; no `n_p` census pathology on Na | claim 196 |
 | the 2.7934 eV omega-reference error and its four sites | commits `59d7ea20`, `90b8275d`, `6fe3fcb8`, `cd5b0aa4` |
 | scissor identity law; the all-zero-diagonal wreckage it fixed | commit `bf57701b` |
+| crossing bands in neither scissor fit class; the saturation convention | commits `5b0ced2d`, `8a73e2fe`, `tests/test_scissor_crossing_classes.py` |
+| the old val fits (`0.9100` / `+1.1978`) and their `+4.84` vs `-12.86` eV semicore | claim 0212, and the `19_`/`18_` arm pair of claim 0223 |
 | `max\|dE\|` criterion; the `sqrt(n_elem)` autopsy (60.2x vs 72x predicted) | commit `4a6ef831` |
 | entry-solved occupations; the metallic rCROP refusal deleted | commit `178f62b8` |
 | entry-solve vs end-solve first three calls (0.316 vs 0.404 eV); rCROP 0.389 meV in 9 calls; the production ruling; the two tolerance floors | claim 201 |
