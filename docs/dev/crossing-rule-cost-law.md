@@ -156,6 +156,42 @@ that information demand is genuine):
   the coarse 3-way split above, whose bulks are logarithmic and whose
   single shell per (branch, cluster) is range-independent.
 
+## 5b. Measured on the real sodium store (arm 21)
+
+The synthetic table above has zero pole spread; the sodium store's
+shallow poles spread over ~4.8 Ry of position, which is what the first
+cut of the decomposition missed (its cluster shells kept the full pole
+bracket and LOST to the monolithic rule, 2104 vs 1550 plan nodes).
+With the per-cluster crossing-pole cut (`a_cut = w_hi + margin`; poles
+above it cannot cross that cluster and ride a sign-definite slab), the
+real [−66:−48, −32:−20, −7:7] eV plan measures (bool-occupation
+planner replica, no slivers):
+
+| cluster | shell nodes before cut | after cut |
+|---|---|---|
+| Fermi (+ω half) | 493 | 121 |
+| Fermi (−ω half) | 472 | 97 |
+| 2p | 493 | 275 |
+| 2s | 493 | 493 |
+| **plan total** | **2104** | **1209** |
+
+against 1550 for the monolithic contiguous plan.  The 2s cluster's
+shell keeps the full spread because its crossing set genuinely reaches
+every shallow pole (`a_cut ≈ a_hi` there) — the residual cost is pole
+physics, not geometry, and shrinking it is the fit-side channel of §6.
+
+End-to-end GPU (one-shot Na semicore, 4 ranks): the contiguous replay
+at the new tip reproduces the 15_ reference to ≤ 0.06 meV on all ten
+in-grid bands with 5723 vs 5725 tau dispatches — the bit-parity class.
+The patched-grid arm's dispatch count and band physics are recorded in
+`runs/Na/02_soc48b_qsgw_mpa/21_patched_omega_grid_20260816/`.
+
+The same law is what unlocks the η = 0.10 eV fix (claims 0243/0246):
+γ_min halves-and-more steepen the slope to ~224 nodes/Ry, so the
+monolithic condwin rule (~6 Ry) needed ~1300 nodes and REFUSED at the
+500 floor — the η=0.10 arm's NaN.  Decomposed cluster shells at
+1–3 Ry certify at 224–774 nodes under the production ceiling.
+
 ## 6. What this does NOT fix: the fit-side sibling (design only)
 
 Fe F3's failure chain is a FIT pathology, upstream of everything here.
