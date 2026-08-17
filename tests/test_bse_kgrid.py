@@ -13,6 +13,10 @@ fine grid.  Unset or == coarse → the coarse bundle is returned byte-identicall
   3. **Densify** (fixture+GPU): a small 3×3→6×6 run returns a fine-grid bundle
      with the right shapes (nk=36, band/μ dims unchanged) and a W_q on the fine
      k-lattice, and it is solvable (finite, ordered, positive eigenvalues).
+  4. **The slab refuses** (fixture+GPU): the fixture IS a slab, and on the
+     DEFAULT head arm the same densification must REFUSE rather than
+     re-attach the bulk 3-D pole.  Cells 2 and 3 therefore name the
+     documented ``legacy`` arm — see ``LEGACY_HEAD``.
 
 All 1-GPU (no 16-GPU gating).
 """
@@ -47,19 +51,6 @@ wfn_file = WFN.h5
 bare_coulomb_cutoff = 30.0
 """
 
-# THE SAME DECK ON THE ``legacy`` HEAD ARM, and why three cells below need it.
-#
-# This fixture is MoS2: ``sys_dim = 2``.  The default ``w_head_densify = c1``
-# re-attaches W's Γ head analytically per fine q from ``gw.head_densify``,
-# whose integrand is the BULK pole ``8π/|q|²`` — and since 2026-08-17 that
-# stage REFUSES a slab instead of running the 3D expression on it (the 2D head
-# is a ``|q|`` cusp, so the error grew without bound as the fine grid
-# densified).  The three densifying cells below gate ψ/ε/V_q0/W SHAPES and the
-# exchange tile, none of which is the head channel, so they run the documented
-# ``legacy`` arm and stay exactly as informative as they were.  The refusal
-# itself is gated by ``test_the_slab_refuses_the_bulk_head_rather_than_running_it``.
-_KG_INPUT_LEGACY = _KG_INPUT + "w_head_densify = legacy\n"
-
 
 def test_parse_grid_spec():
     from bse.bse_io import _parse_grid_spec
@@ -83,7 +74,6 @@ def _make_run(tmp_path):
     os.symlink(f"{FXDIR}/WFN.h5", run / "WFN.h5")
     os.symlink(f"{FXDIR}/centroids_frac_640.txt", run / "centroids_frac_640.txt")
     (run / "cohsex_kg.in").write_text(_KG_INPUT)
-    (run / "cohsex_kg_legacy.in").write_text(_KG_INPUT_LEGACY)
     return run
 
 
@@ -99,11 +89,34 @@ needs_mos2_fixture = pytest.mark.skipif(
     reason="MoS2 3x3 640-centroid fixture not present")
 
 
-def _load(restart, inp, mesh_xy, bse_k_grid):
+#: THE SLAB HEAD ARM, and why three cells below have to name it.
+#:
+#: This fixture is MoS2: ``sys_dim = 2``.  The default ``w_head_densify = c1``
+#: re-attaches W's Γ head analytically per fine q from ``gw.head_densify``,
+#: whose integrand is the BULK pole ``8π/|q|²`` — and since 2026-08-17 that
+#: stage REFUSES a slab rather than running the 3-D expression on it (in 2D
+#: the head is a ``|q|`` cusp, so the error grew without bound as the fine
+#: grid densified).  The three densifying cells below gate ψ/ε/V_q0/W shapes
+#: and the exchange tile, none of which is the head channel, so they take the
+#: documented ``legacy`` arm and stay exactly as informative as they were.
+#: The refusal is gated on its own by
+#: ``test_the_slab_refuses_the_bulk_head_rather_than_running_it``.
+#:
+#: It is passed as an ARGUMENT, not written into the deck, and that is not a
+#: style choice: ``gw_config.read_lorrax_input`` builds params only out of
+#: ``_DEFAULTS``, ``w_head_densify`` is not a key there, and so a deck line
+#: saying ``w_head_densify = legacy`` is dropped on the floor and the run
+#: silently takes ``c1``.  Registered in the sandbox's KNOWN_LORRAX_ISSUES
+#: (2026-08-17); out of scope here.
+LEGACY_HEAD = "legacy"
+
+
+def _load(restart, inp, mesh_xy, bse_k_grid, w_head_densify=None):
     from bse.bse_io import load_bse_data_from_restart_sharded
     return load_bse_data_from_restart_sharded(
         restart, n_val=2, n_cond=2, mesh_xy=mesh_xy, input_file=str(inp),
-        inject_head=True, bse_k_grid=bse_k_grid)
+        inject_head=True, bse_k_grid=bse_k_grid,
+        w_head_densify=w_head_densify)
 
 
 @needs_mos2_fixture
@@ -137,10 +150,10 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
 
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
-    inp = run / "cohsex_kg_legacy.in"          # slab: see _KG_INPUT_LEGACY
+    inp = run / "cohsex_kg.in"
     mesh_xy = _create_mesh_xy(1, 1)
     d0 = _load(restart, inp, mesh_xy, None)
-    df = _load(restart, inp, mesh_xy, (6, 6, 1))
+    df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)   # slab arm
 
     assert (int(df["nkx"]), int(df["nky"]), int(df["nkz"])) == (6, 6, 1)
     nk_f = 36
@@ -205,7 +218,7 @@ def test_the_slab_refuses_the_bulk_head_rather_than_running_it(tmp_path):
     assert "sys_dim = 2" in inp.read_text()
     mesh_xy = _create_mesh_xy(1, 1)
     with pytest.raises(NotImplementedError, match="SLAB_2D"):
-        _load(restart, inp, mesh_xy, (6, 6, 1))
+        _load(restart, inp, mesh_xy, (6, 6, 1))    # no arm named → the default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,11 +291,11 @@ def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
     from bse.bse_w_exact import _create_mesh_xy
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
-    inp = run / "cohsex_kg_legacy.in"          # slab: see _KG_INPUT_LEGACY
+    inp = run / "cohsex_kg.in"
     assert "head_minibz_average" not in inp.read_text()
     mesh_xy = _create_mesh_xy(1, 1)
-    d0 = _load(restart, inp, mesh_xy, None)          # coarse 3×3×1
-    df = _load(restart, inp, mesh_xy, (6, 6, 1))     # densified 6×6×1
+    d0 = _load(restart, inp, mesh_xy, None)                        # coarse 3×3×1
+    df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)      # fine 6×6×1
 
     a = np.asarray(jax.device_get(d0["V_q0"]))
     b = np.asarray(jax.device_get(df["V_q0"]))
@@ -312,11 +325,11 @@ def test_densify_optin_matches_prefix_construction(tmp_path):
 
     run = _make_run(tmp_path)
     inp = run / "cohsex_on.in"
-    inp.write_text(_KG_INPUT_LEGACY + "head_minibz_average = true\n")
+    inp.write_text(_KG_INPUT + "head_minibz_average = true\n")
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     mesh_xy = _create_mesh_xy(1, 1)
     d0 = _load(restart, inp, mesh_xy, None)
-    df = _load(restart, inp, mesh_xy, (6, 6, 1))
+    df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)   # slab arm
 
     # ── the pre-fix statements, replayed ────────────────────────────────
     n_rmu_pad = int(d0["n_rmu_pad"])
