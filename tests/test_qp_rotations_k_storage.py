@@ -208,6 +208,42 @@ def test_ibz_refuses_rather_than_falling_back(tmp_path):
                k_storage="ibz", star_tables=_TABLES)
 
 
+def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
+    """The writer must not produce a file its own reader would refuse.
+
+    ``kin_ion.read_star_map`` refuses when the stored k extent does not equal
+    ``irr_idx_k.max() + 1``, because it cannot tell that from a truncated
+    slab.  The round trip alone does NOT catch it: the round trip only reads
+    rows the tables point at, so a stored k that is never an orbit parent
+    reconstructs perfectly and still leaves an unreadable file.  This is the
+    register's ``cohsex_debug`` shape — file wedge 4, star wedge 3, where
+    stored row 1 is the time-reverse of row 2 and never a parent.
+    """
+    irr = np.array([0, 0, 2, 2, 3, 3], dtype=np.int32)   # row 1 never a parent
+    tables = (irr, _SYM, _NSS)
+    from file_io.kin_ion import broadcast_ibz_to_full_bz as _bc
+    rng = np.random.default_rng(11)
+    nb = 3
+    u4 = (rng.normal(size=(4, nb, nb)) + 1j * rng.normal(size=(4, nb, nb)))
+    U = np.asarray(_bc(u4, *tables))
+    E = np.asarray(_bc(rng.normal(size=(4, nb)), *tables))
+    kpts = np.asarray(_bc(rng.normal(size=(4, 3)), *tables))
+    rows = np.array([0, 1, 2, 4], dtype=np.int32)
+
+    def _w(k_storage, **kw):
+        return write_qp_rotations_h5(
+            str(tmp_path / f"np_{k_storage}.h5"), U_mnk=U, E_qp_nk=E,
+            band_start=0, band_stop=nb, kpoints_crys=kpts,
+            nkx=2, nky=1, nkz=1, kirr_to_kfull=rows,
+            k_storage=k_storage, star_tables=tables, **kw)
+
+    with pytest.raises(ValueError, match="never an orbit parent"):
+        _w("ibz")
+    said = []
+    assert _w("auto", print_fn=said.append) == K_STORAGE_FULL
+    assert any("never an orbit parent" in s for s in said), said
+
+
 def test_the_wedge_arm_refuses_without_the_tables_it_would_file(tmp_path):
     """A tensor whose reconstruction tables live elsewhere silently decays."""
     U, E, kpts = _star_consistent_payload()

@@ -223,24 +223,47 @@ def write_qp_rotations_h5(
                 f"write_qp_rotations_h5: irr_idx_k describes {irr.size} "
                 f"full-BZ k but the arrays carry {nk_full} rows — the "
                 f"tables and the arrays are not the same calculation.")
+        # THE READER'S OWN CONSISTENCY CONDITION, CHECKED AT THE WRITER.
+        # ``kin_ion.read_star_map`` refuses a file whose stored k extent does
+        # not equal ``irr_idx_k.max() + 1``, and that can fail here without
+        # the round trip noticing: the round trip only reads rows the tables
+        # POINT AT, so a file-wedge row that is never an orbit parent — the
+        # register's ``cohsex_debug`` case, where row 1 is the time-reverse of
+        # row 2 — is reconstructed fine and still leaves a table the reader
+        # will not accept.  Refusing here is the difference between a writer
+        # that cannot produce an unreadable file and one that merely usually
+        # does not.
+        n_star = int(irr.max(initial=-1)) + 1
+        nk_red = int(np.asarray(kirr_full_bz).size)
+        reasons = []
+        if n_star != nk_red:
+            reasons.append(
+                f"the file wedge has {nk_red} rows but irr_idx_k names only "
+                f"{n_star} distinct parents, so {nk_red - n_star} stored k "
+                f"are never an orbit parent and file_io.kin_ion.read_star_map "
+                f"would refuse the file — it cannot tell that from a "
+                f"truncated slab")
         reduced, worst = _wedge_reduction(payload, kirr_full_bz, star_tables)
         bad = {n: d for n, d in worst.items() if d != 0.0}
         if bad:
-            detail = ", ".join(f"{n} max|Δ| = {d:.6e}"
-                               for n, d in sorted(bad.items()))
+            reasons.append(
+                "the full-BZ rows are not the unfold of the wedge rows ("
+                + ", ".join(f"{n} max|Δ| = {d:.6e}"
+                            for n, d in sorted(bad.items())) + ")")
+        if reasons:
+            detail = "; ".join(reasons)
             if k_storage == "ibz":
                 raise ValueError(
-                    f"write_qp_rotations_h5: k_storage='ibz' was asked for, "
-                    f"but the full-BZ rows are NOT the unfold of the wedge "
-                    f"rows ({detail}).  Storing the wedge would discard rows "
-                    f"no reader can rebuild.  U_mnk is a stack of "
-                    f"EIGENVECTORS — defined up to a phase, and up to a "
-                    f"unitary mixing inside a degenerate multiplet — so this "
-                    f"is the expected answer for a run whose off-wedge rows "
-                    f"came from their own eigh rather than from a broadcast. "
-                    f"Use k_storage='auto' to fall back to full-BZ storage.")
-            say(f"  qp_wfn_rotations: k_storage='auto' -> FULL BZ; the "
-                f"round trip does not reproduce the arrays ({detail}).")
+                    f"write_qp_rotations_h5: k_storage='ibz' was asked for "
+                    f"and the wedge form is not writable — {detail}.  Storing "
+                    f"it would discard rows no reader can rebuild.  U_mnk is "
+                    f"a stack of EIGENVECTORS — defined up to a phase, and up "
+                    f"to a unitary mixing inside a degenerate multiplet — so "
+                    f"a round-trip failure is the expected answer for a run "
+                    f"whose off-wedge rows came from their own eigh rather "
+                    f"than from a broadcast.  Use k_storage='auto' to fall "
+                    f"back to full-BZ storage.")
+            say(f"  qp_wfn_rotations: k_storage='auto' -> FULL BZ; {detail}.")
         else:
             stored = K_STORAGE_IBZ
             payload = reduced
