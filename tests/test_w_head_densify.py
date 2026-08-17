@@ -495,25 +495,47 @@ def test_a_complex_head_scalar_is_refused_before_it_can_be_attached():
         head_scalar_pointwise(q[None, :], S_bad)
 
 
-def test_a_hermitian_but_transpose_antisymmetric_head_is_refused_everywhere():
-    """A real-q form cannot silently erase the antisymmetric head component."""
+def test_a_hermitian_transpose_antisymmetric_head_is_projected_everywhere(capsys):
+    """Every real-q consumer reports S-S.T and uses exactly its longitudinal part."""
     S_bad = np.asarray(_S_ISO, dtype=np.complex128).copy()
     S_bad[0, 1] = 0.01j
     S_bad[1, 0] = -0.01j
     assert np.array_equal(S_bad, S_bad.conj().T), (
         "the red tensor must be Hermitian, the case whose contraction is real")
     assert not np.array_equal(S_bad, S_bad.T)
+    S_longitudinal = 0.5 * (S_bad + S_bad.T)
 
-    with pytest.raises(ValueError, match="transpose-symmetry precondition"):
-        head_scalar_pointwise(np.asarray([[0.1, 0.2, 0.3]]), S_bad)
-    with pytest.raises(ValueError, match="vcoul.Bulk3D.q0_average"):
-        Bulk3D().q0_average(
-            _geom("fcc"), (2, 2, 2), S_cart=S_bad,
-            nsamples=8, method="uniform", qmc_reps=1)
-    with pytest.raises(ValueError, match="vcoul.Slab2D.q0_average"):
-        Slab2D().q0_average(
-            _geom("hex"), (2, 2, 1), S_cart=S_bad,
-            nsamples=8, method="uniform", qmc_reps=1)
+    q = np.asarray([[0.1, 0.2, 0.3]])
+    pointwise = head_scalar_pointwise(q, S_bad)
+    pointwise_longitudinal = head_scalar_pointwise(q, S_longitudinal)
+    assert np.array_equal(pointwise, pointwise_longitudinal)
+
+    bulk = Bulk3D()
+    bulk_args = (_geom("fcc"), (2, 2, 2))
+    bulk_value = bulk.q0_average(
+        *bulk_args, S_cart=S_bad,
+        nsamples=8, method="uniform", qmc_reps=1)
+    bulk_longitudinal = bulk.q0_average(
+        *bulk_args, S_cart=S_longitudinal,
+        nsamples=8, method="uniform", qmc_reps=1)
+    assert all(np.array_equal(got, expected) for got, expected in
+               zip(bulk_value, bulk_longitudinal))
+
+    slab = Slab2D()
+    slab_args = (_geom("hex"), (2, 2, 1))
+    slab_value = slab.q0_average(
+        *slab_args, S_cart=S_bad,
+        nsamples=8, method="uniform", qmc_reps=1)
+    slab_longitudinal = slab.q0_average(
+        *slab_args, S_cart=S_longitudinal,
+        nsamples=8, method="uniform", qmc_reps=1)
+    assert all(np.array_equal(got, expected) for got, expected in
+               zip(slab_value, slab_longitudinal))
+
+    diagnostic = capsys.readouterr().out
+    assert diagnostic.count("S_cart transpose asymmetry") == 6
+    assert diagnostic.count("WARNING:") == 3
+    assert "||S-S.T||_F/||S||_F" in diagnostic
 
 
 # ===========================================================================

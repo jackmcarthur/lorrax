@@ -10,12 +10,14 @@ of the density-response S-tensor in this tree, and it is the one
     chi_{G'=0}(q -> 0, omega)  =  q_a  S_ab(omega)  q_b ,
 
 with ``q`` in Cartesian 1/bohr and ``S`` a (3, 3) complex array per
-frequency.  Transpose symmetry, ``S.T == S``, is a precondition supplied by
-the q-sampling (normally through inversion pairing), not an identity of this
-formula.  ``compute_S_omega`` does not symmetrize or enforce it.  Every real-q
-consumer checks it before contraction: ``gw.head_densify`` and the 2D/3D
-``vcoul.q0_average`` paths then evaluate ``einsum('qi,ij,qj->q', rq, S, rq)``
-against Cartesian mini-BZ draws to form ``W = v/(1 - v·qSq)``.
+frequency.  ``compute_S_omega`` requires symmetry-complete k-point sampling
+before its output can be interpreted as a dielectric tensor; it neither
+completes that sampling nor makes the tensor symmetric by construction.
+Every real-q consumer reports ``||S-S.T||_F/||S||_F`` as a sampling
+diagnostic, then explicitly uses the longitudinal part
+``S^(L) = (S + S.T)/2``.  This projection is lossless for the scalar density
+head because ``q_i S_ij q_j == q_i S^(L)_ij q_j`` identically, while an
+antisymmetric transverse/Hall response may remain physical.
 
 The second builder in the tree, ``psp.run_sternheimer``'s
 ``compute_s_tensor_contrib_at_q0``, computes the same physical object by
@@ -235,4 +237,3 @@ __all__ = [
     "compute_S_omega",
     "s_tensor_crystal_hessian_to_cartesian_q2",
 ]
-

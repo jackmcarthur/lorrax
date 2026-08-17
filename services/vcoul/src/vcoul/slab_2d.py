@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vcoul.base import SysDim, check_head_tensor_symmetry, v_qG_single
+from vcoul.base import SysDim, report_head_tensor_asymmetry, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
                           minibz_voronoi_batches, sample_minibz_qpoints)
@@ -135,11 +135,15 @@ class Slab2D:
 
         if S_cart is not None:
             S = jnp.asarray(S_cart, dtype=jnp.complex128)
-            check_head_tensor_symmetry(S, "vcoul.Slab2D.q0_average")
+            report_head_tensor_asymmetry(S, "vcoul.Slab2D.q0_average")
+            # q_i S_ij q_j == q_i (S_ij + S_ji)/2 q_j identically for real q:
+            # this longitudinal projection is deliberate and lossless here.
+            S_longitudinal = 0.5 * (S + S.T)
             wmeans = []
             for rq in batches:
                 vq = _vq_sobol(rq).astype(jnp.complex128)
-                qSq = jnp.einsum('qi,ij,qj->q', rq, S, rq)
+                qSq = jnp.einsum(
+                    'qi,ij,qj->q', rq, S_longitudinal, rq)
                 wmeans.append(jnp.mean(vq / (1.0 - vq * qSq)))
             wcoul0 = jnp.mean(jnp.stack(wmeans))
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)

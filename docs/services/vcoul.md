@@ -105,6 +105,13 @@ Explicit requests refuse; only `auto` demotes, and it announces once.
 performed without telling anyone. With scipy present — every production
 machine — `"sobol"` is bit-identical to the pre-extraction code.
 
+`report_head_tensor_asymmetry` reports
+`||S-S.T||_F/||S||_F` at each real-q head contraction as a sampling
+diagnostic. It never refuses: `q_i S_ij q_j` is identically unchanged by
+replacing `S` with its longitudinal part `(S + S.T)/2`, and an
+antisymmetric transverse/Hall response may be physical. The 2D and 3D
+`q0_average` paths make that projection explicitly before contracting.
+
 The head slot is `argmin |q+G|²`, all of it, and every tied slot gets the
 tied set's mean. This was settled on 2026-08-08 and it is the one place
 in this service where a physics choice is made rather than preserved.

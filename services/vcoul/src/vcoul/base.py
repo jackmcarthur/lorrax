@@ -36,25 +36,26 @@ from vcoul.geometry import CoulombGeometry
 
 __all__ = ["SysDim", "CoulombKernel", "get_kernel", "v_qG_table",
            "v_qG_single", "HeadSlotTable", "head_slot_table",
-           "check_head_tensor_symmetry"]
+           "report_head_tensor_asymmetry"]
 
 
-def check_head_tensor_symmetry(S_cart, where: str,
-                               rtol: float = 1e-10) -> float:
-    """Report and enforce the transpose symmetry required by ``q^T S q``.
+def report_head_tensor_asymmetry(S_cart, where: str,
+                                 rtol: float = 1e-10) -> float:
+    """Report transpose asymmetry before a longitudinal ``q^T S q`` use.
 
-    Real-q quadratic forms discard ``S - S.T`` identically, so every such
-    contraction must call this before evaluating the form.  The tolerance
-    matches ``gw.head_densify._refuse_complex``'s relative head tolerance.
+    Real-q quadratic forms cannot see ``S - S.T``.  The residual is therefore
+    a sampling diagnostic, not a precondition on the physical transverse
+    response.  Values above ``rtol`` are announced as warnings but never
+    refused; the contraction sites explicitly project the longitudinal part.
 
     Parameters
     ----------
     S_cart : array_like, shape (3, 3)
         Cartesian q-squared response tensor.
     where : str
-        Contraction site named in the diagnostic and refusal.
+        Contraction site named in the diagnostic.
     rtol : float, optional
-        Maximum ``||S-S.T||_F / ||S||_F``.
+        ``||S-S.T||_F / ||S||_F`` threshold for a sampling warning.
 
     Returns
     -------
@@ -67,18 +68,12 @@ def check_head_tensor_symmetry(S_cart, where: str,
     scale = float(np.linalg.norm(S))
     asym = float(np.linalg.norm(S - S.T))
     rel = asym / scale if scale > 0.0 else 0.0
+    warning = "WARNING: " if rel > rtol else ""
     print(
-        f"  S_cart transpose asymmetry [{where}]: "
-        f"||S-S.T||_F/||S||_F = {rel:.6e} (limit {rtol:.0e})",
+        f"  {warning}S_cart transpose asymmetry [{where}]: "
+        f"||S-S.T||_F/||S||_F = {rel:.6e}",
         flush=True,
     )
-    if rel > rtol:
-        raise ValueError(
-            f"{where}: S_cart violates the transpose-symmetry precondition: "
-            f"||S-S.T||_F/||S||_F = {rel:.6e} > {rtol:.0e}.  A real-q "
-            f"quadratic form q^T S q discards this antisymmetric component "
-            f"identically; refusing prevents the sampling defect from being "
-            f"silently projected away.")
     return rel
 
 

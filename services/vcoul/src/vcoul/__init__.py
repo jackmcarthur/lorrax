@@ -78,9 +78,9 @@ from vcoul.base import (
     CoulombKernel,
     HeadSlotTable,
     SysDim,
-    check_head_tensor_symmetry,
     get_kernel,
     head_slot_table,
+    report_head_tensor_asymmetry,
     v_qG_single,
     v_qG_table,
 )
@@ -126,7 +126,7 @@ __all__ = [
     "CoulombGeometry",
     # dispatch + the v(q+G) driver
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
-    "HeadSlotTable", "head_slot_table", "check_head_tensor_symmetry",
+    "HeadSlotTable", "head_slot_table", "report_head_tensor_asymmetry",
     "Bulk3D", "Slab2D", "Box0D",
     # mini-BZ sampling / averaging
     "wrap_points_to_voronoi", "minibz_voronoi_batches",

@@ -209,7 +209,10 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
     if S.shape != (3, 3):
         raise ValueError(f"head_scalar_pointwise: S_cart must be (3,3); "
                          f"got {S.shape}")
-    vcoul.check_head_tensor_symmetry(S, "head_scalar_pointwise")
+    vcoul.report_head_tensor_asymmetry(S, "head_scalar_pointwise")
+    # q_i S_ij q_j == q_i (S_ij + S_ji)/2 q_j identically for real q:
+    # this longitudinal projection is deliberate and lossless here.
+    S_longitudinal = 0.5 * (S + S.T)
     q2 = np.einsum("qi,qi->q", q, q)
     if np.any(q2 <= 0.0):
         raise ValueError(
@@ -220,7 +223,7 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
             "point of the split: the object at Γ is an integral, not a "
             "sample.)")
     vq = EIGHT_PI / q2
-    qSq = np.einsum("qi,ij,qj->q", q, S, q)
+    qSq = np.einsum("qi,ij,qj->q", q, S_longitudinal, q)
     val = vq / (1.0 - vq * qSq)
     _refuse_complex(val, "head_scalar_pointwise")
     return np.real(val).reshape(lead)
@@ -229,12 +232,12 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
 def _refuse_complex(val, where: str, rtol: float = 1e-10) -> None:
     """Refuse a head scalar with a physically meaningful imaginary part.
 
-    This guard sees only the transpose-symmetric part of ``S_cart`` because
-    the real-q quadratic form discards the antisymmetric part identically;
-    :func:`vcoul.check_head_tensor_symmetry` checks that part first.  For a
-    Hermitian tensor at real z, passing that check makes S real, so this guard
-    is unreachable.  It remains live for a transpose-symmetric complex tensor
-    from finite omega or eta, as the regression test exercises.
+    This guard sees only the explicitly projected longitudinal part of
+    ``S_cart`` because the real-q quadratic form discards the antisymmetric
+    part identically.  For a Hermitian tensor at real z that projection is
+    real, so this guard is unreachable.  It remains live for a
+    transpose-symmetric complex tensor from finite omega or eta, as the
+    regression test exercises.
 
     The rank-one update is Hermitian ONLY because its coefficient is real.
     A complex coefficient makes ``s·conj(g₀)⊗g₀`` non-Hermitian by exactly
