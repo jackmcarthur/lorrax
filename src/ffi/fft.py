@@ -899,9 +899,8 @@ def conv_kminor_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
 
     * ``off``  → ``(False, ...)``, always.
     * ``on``   → ``require_conv_kminor`` (RAISES, naming the fix, if the
-      platform or the handler cannot serve it), then the residency bound,
-      which also raises rather than silently falling through: a caller that
-      said ``on`` asked not to be routed elsewhere without being told.
+      platform or the handler cannot serve it), then delegates the final
+      device-specific residency decision to the handler.
     * ``auto`` → ``(True, ...)`` when CUDA + handler + the row fits;
       ``(False, reason)`` otherwise, and the caller takes its own path.  No
       exception, no per-call output — see the dial docstring for why the
@@ -910,22 +909,10 @@ def conv_kminor_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
     mode = CONV_KMINOR_GATE.mode()
     if mode == "off":
         return False, "LORRAX_CONV_KMINOR_FFI=off"
-    fits = conv_kminor_row_fits(kgrid)
     if mode == "on":
         require_conv_kminor(mesh)          # raises with the fix named
-        if not fits:
-            nk = int(np.prod([int(v) for v in kgrid]))
-            raise RuntimeError(
-                f"LORRAX_CONV_KMINOR_FFI=on, but this call's k-grid "
-                f"{tuple(int(v) for v in kgrid)} (nk={nk}) needs more shared "
-                f"memory for ONE k-row than the {_CONV_KMINOR_AUTO_SMEM_FLOOR}"
-                f" B every CUDA device guarantees.  The handler may still "
-                f"serve it — it raises its ceiling to the DEVICE maximum and "
-                f"reports the real bound — so either drop to the default "
-                f"`auto` (which falls through to the XLA chain here) or call "
-                f"the handler directly and read its refusal, which quotes "
-                f"this device's own maximum.")
-        return True, "on"
+        return True, "on; device handler derives the residency ceiling"
+    fits = conv_kminor_row_fits(kgrid)
     ok, why = conv_kminor_available(mesh)
     if not ok:
         return False, why
