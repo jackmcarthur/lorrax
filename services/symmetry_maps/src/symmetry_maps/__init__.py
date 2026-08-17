@@ -183,6 +183,7 @@ from symmetry_maps.maps import (
     slice_q_full_to_ibz,
     star_broadcast,
     reduce_full_bz_to_file_wedge,
+    star_tables_of,
     unfold_file_wedge_to_full_bz,
     unfold_star_wedge_to_full_bz,
     star_select,
@@ -254,7 +255,7 @@ __all__ = [
     "apply_band_matrix_symmetry",
     # the two named unfolds (file wedge vs star wedge)
     "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
-    "reduce_full_bz_to_file_wedge",
+    "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "mix_channels_by_proper_rotation",
