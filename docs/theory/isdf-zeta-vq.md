@@ -146,6 +146,35 @@ channel tiles and restores their Cartesian mixing after symmetry unfolding.
 
 ## 5. Irreducible-q cascade
 
+### Centroid-set symmetry is not operator symmetry
+
+Let \(G_{\mathrm{atom}}\) be the full space group of the atomic positions and
+\(G_{\mathrm{elec}}^{\mathrm{sp}}\) the spatial electronic or magnetic
+subgroup stored with the WFN. Magnetic order and a `nosym` calculation may
+reduce the latter, so
+\(G_{\mathrm{elec}}^{\mathrm{sp}}\subseteq G_{\mathrm{atom}}\). Centroid
+construction must close the point set under \(G_{\mathrm{atom}}\):
+
+$$
+g\,\{r_\mu\}=\{r_\mu\}
+\qquad\text{for every }g\in G_{\mathrm{atom}}.
+$$
+
+This is safe because closure under the larger atomic group implies closure
+under every electronic subgroup. It also prevents magnetic order from
+changing the real-space quadrature merely by hiding crystallographic
+operations in the WFN header. The centroid selector must therefore obtain
+its orbit group from the atomic structure, not from the WFN's electronic
+symmetry table; a `nosym` WFN is not a substitute and should be confined to
+tests that specifically require it.
+
+Operator unfolding has the opposite constraint: wavefunctions, \(V_q\), and
+other electronic tensors use only the WFN's electronic table, including its
+allowed antiunitary rows. Applying an additional atomic symmetry to an
+electronic operator would restore a symmetry the Hamiltonian does not have.
+The set/operator distinction is the reason the larger centroid group is
+harmless (sandbox claim 0232).
+
 The G-flat file uses the irreducible q wedge only when the centroid set closes
 under the complete spatial-plus-time-reversal table. For a symmetry operation
 \(s\), the transformed interpolation points satisfy

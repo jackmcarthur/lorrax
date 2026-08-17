@@ -131,10 +131,10 @@ set is not orbit closed or is incompatible with the FFT grid. The q-reduced
 Coulomb path then falls back to a full-zone calculation; it never uses an
 incomplete symmetry table.
 
-For a WFN whose stored group is reduced by spinor bookkeeping, centroid
-selection may recover additional *charge-density* symmetries. This can improve
-the real-space quadrature without enlarging the group used to unfold
-wavefunctions or \(V_q\).
+The atomic group used to construct a centroid set is owned by
+[G-flat interpolation vectors and \(V_q\)](isdf-zeta-vq.md#centroid-set-symmetry-is-not-operator-symmetry).
+This section assumes that closed set and applies only the WFN's electronic or
+magnetic group to operators.
 
 ## 5. Matrix unfolding
 

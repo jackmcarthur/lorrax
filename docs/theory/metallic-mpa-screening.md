@@ -4,6 +4,7 @@ This chapter is the authoritative description of metallic (finite-occupation)
 screening in LORRAX: the occupation-weighted response, the metal frequency
 plan and the measured reasoning behind it, the two `q->0` heads and their
 order of limits, the finite-`q` body, the occupation-weighted self-energy,
+the conventions required for a like-for-like BerkeleyGW comparison,
 the per-iteration QSGW occupation state, and the metallic self-consistency
 loop — what one map call rebuilds, the stop rule, and the measured
 convergence. It subsumes the former
@@ -23,10 +24,11 @@ W_c(z)=\sum_p\frac{2\Omega_pB_p}{z^2-\Omega_p^2},
 \qquad \Omega_p=a_p-i\Gamma_p .
 $$
 
-Verification banner: every named symbol in this page was read at commit
-`941db3a7` on `integ/metal-mpa-qsgw-2026-08-15` (2026-08-15; sections 1–5
-unchanged since the `a5b1002b` reading); measured numbers carry their claim
-row or probe record. `compute_mode = mpa` **no
+Verification banner: the q0 bundle in section 5.7 was read at integration
+tip `bb885e01`; the file-backed Coulomb convention was read on
+`feat/bgw-metal-vcoul-file-2026-08-16` at `130f4d7b`. Other implementation
+pins and measured numbers appear beside their statement or in section 8.
+`compute_mode = mpa` **no
 longer refuses at driver entry**: `gw_config.UNIMPLEMENTED_MODES` was
 emptied at `9c9b23dc` (2026-08-15) once the metal pipeline ran end to end.
 Section 6.4 states exactly what that lift does and does not assert — it is
@@ -650,6 +652,107 @@ for the linear law. Full derivation and the executor-safety constraints:
 `docs/theory/THEORY_mpa_implementation.md` §10.1 and
 `docs/dev/crossing-rule-cost-law.md`.
 
+### 5.7 Comparing metallic Sigma against BerkeleyGW
+
+A cross-code comparison is meaningful only after both codes discretize the
+same continuum equations in the same way. Three finite-grid conventions are
+numerically material on a metal: the Coulomb value assigned to a singular
+cell, the object called the `q=0` head, and the damping already carried by a
+fitted pole. None is an implementation error by itself; mixing conventions
+measures the convention difference instead of the self-energy algorithm.
+
+#### 5.7.1 Point value versus cell average in the singular Coulomb slot
+
+Let \(C_q\) be the mini-BZ cell represented by a mesh point \(q\), and let
+\(G_*(q)\) minimize \(\lvert q+G\rvert\). A point quadrature assigns the
+finite value \(4\pi/\lvert q+G_*\rvert^2\) at nonzero \(q+G_*\), while a
+cell-average quadrature assigns
+
+$$
+\bar v_{C_q}=\frac{1}{\lvert C_q\rvert}
+\int_{C_q}\frac{4\pi}{\lvert q'+G_*\rvert^2}\,dq'.
+$$
+
+The point rule is the ordinary mesh quadrature; the cell average analytically
+integrates the rapid variation inside the represented cell. Both converge to
+the same Coulomb integral as the mesh is refined. They are nevertheless
+different finite-grid estimators, especially for the first shell around
+Gamma, so one code must not average a slot that the other samples as a point.
+The BerkeleyGW sodium comparison used point values away from the literal
+singular cell, whereas the original LORRAX arm averaged the minimum-
+\(\lvert q+G\rvert\) slot in every nonzero-\(q\) cell. That mismatch moved
+Fermi-shell exchange by order \(0.1\) eV; the one-key matched arm reduced the
+residual to the few-meV scale (sandbox claims 0246 and 0253). These claims own
+the tables.
+
+#### 5.7.2 The head is an order-of-limits convention
+
+Section 4 defines LORRAX's physical metal head: an exact static
+\(\omega\to0\)-then-\(q\to0\) Thomas–Fermi limit and a separate dynamic
+\(q\to0\)-first tensor. BerkeleyGW full-frequency Sigma instead consumes the
+dielectric row at its finite shifted \(q_0\); its zero-frequency contour panel
+then supplies the static-like half residue. The two constructions are
+legitimate answers to different finite-grid questions, but they are not the
+same head and should not be compared as though they were.
+
+For a diagnostic that removes this choice without importing either code's
+head into the other, subtract each code's own contribution before taking the
+difference:
+
+$$
+\Delta\Sigma^{\mathrm{outside}\ q_0}
+=\left(\Sigma^{L}-C^{L}_{q_0}\right)
+-\left(\Sigma^{B}-C^{B}_{q_0}\right).
+$$
+
+Here \(C_{q_0}\) may be the scalar head or, preferably, the complete dynamic
+head+wings+body cell. Removing only one side, or subtracting one code's cell
+from both totals, creates a third convention. Offline subtraction also keeps
+each production Dyson solve and pole fit intact and permits an algebraic
+closure check. Head-only removal prices this distinction at about 17 meV;
+the complete-cell result remains about 18 meV and leaves most of the
+correlation discrepancy outside \(q_0\) (sandbox claims 0227 and 0252).
+
+#### 5.7.3 Pole width plus denominator eta is stacked broadening
+
+An epsilon calculation with finite broadening produces fitted poles
+\(\Omega_p=a_p-i\Gamma_p\); the width \(\Gamma_p\) already carries that
+smearing into \(W_c\). Adding the deck's `sigma_regularization_ev = eta`
+literally to every Sigma denominator changes the damping from
+\(\Gamma_p\) to \(\Gamma_p+\eta\). BerkeleyGW contour deformation uses
+the broadened epsilon data but adds no corresponding denominator eta, so a
+BerkeleyGW comparison with nonzero LORRAX eta counts the epsilon broadening
+once on one side and again on the other.
+
+This is a finite-\(q\), same-band effect, not a missing special case at
+\(q=0\): the separately evaluated head is analytic and eta-free. At Gamma
+band 9, changing eta from 0 to 0.25 eV moved the scoped same-band term by
+\(+22.4-86.4i\) meV, and the full stored-pole replay measured 88.7%
+imaginary-part inflation (sandbox claims 0243 and 0246). Reducing eta is not
+safe by deck edit alone: the old sign-crossing rule refuses or becomes
+non-finite as its damping shrinks. Any parity fix is therefore gated on the
+certified omega-clustered, logarithmic-range decomposition in
+[the crossing-rule cost law](../dev/crossing-rule-cost-law.md).
+
+#### 5.7.4 The `bgw_metal_*` convention family
+
+These keys select a comparison convention; they are not accuracy levels:
+
+| convention | theory emulated | use it when |
+|---|---|---|
+| `bgw_metal_q0_treatment = exact` | LORRAX's exact metallic limits from section 4 | producing a LORRAX result or converging its physical \(q\to0\) treatment |
+| `bgw_metal_q0_treatment = bgw_q0shift` | BerkeleyGW's finite-grid bundle: point-valued nonzero singular slots, the BerkeleyGW bare \(q_0\) estimate, and the shifted-\(q_0\) Dyson head with wing/body coupling | comparing directly with a BerkeleyGW full-frequency Sigma run on the same grid |
+| `bgw_metal_q0_vector` | the actual finite \(q_0\) row used by BerkeleyGW, not a tunable small-\(q\) model | identifying that row from the matched BerkeleyGW epsilon file; never tune it to improve agreement |
+| `bgw_metal_vcoul_file` | BerkeleyGW's own finite-grid \(v(q,G)\), including its \(q_0,G=0\) scalar | eliminating Coulomb-estimator differences in a strict A/B made from the same WFN, grid and cutoff; do not treat the imported table as a portable production model |
+
+Spelling, defaults, compatibility checks and file requirements remain owned
+by the [input reference](../input_reference.md). As of 2026-08-16 the q0
+family is available on `feat/bgw-metal-q0-treatment-2026-08-16` and at this
+integration tip; the file-backed Coulomb source is available on
+`feat/bgw-metal-vcoul-file-2026-08-16`, whose input-reference row travels
+with its implementation. Neither convention changes the Sigma eta or the MPA
+quadrature plan, so those axes must still be matched independently.
+
 ## 6. The QSGW occupation cycle
 
 ### 6.1 One state per map call, solved at entry
@@ -1198,6 +1301,9 @@ Open, with the reason each is still open:
 | origin contour rule 1,007,048 nodes; far line 31; thresholds and decision | `runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md`, commit `82f81933` |
 | finite-q static kernel `max_rel 3.720e-16` vs dense oracle; fixture origin-shift `2.556e-5` | same probe record, P=4 gate JID 56986042 |
 | mask-semantics error 1.14/0.72/0.22; permanent `>5e-2` floor | commit `c560065c`, `tests/test_sigma_fermi_split.py` |
+| finite-grid Coulomb point/cell-average distinction and matched one-key arm | claims 0246 and 0253 |
+| exact-limit versus finite-`q0` head; both-sides head/full-cell removal | claims 0227 and 0252 |
+| fitted-pole width plus literal denominator eta; finite-`q` scale | claims 0243 and 0246 |
 | dynamic head vs BGW: −93.9 meV peak, RMS 2.043e-4, `omega_p` 6.0892 eV, `mu` to 6.2e-7 eV | claim 180 (JID 57005734) |
 | `kappa_TF^2 = 0.7086 bohr^-2`, +12.8% vs BGW, fold 2.8e-7 | claim 181 |
 | five-estimator `N(E_F)` spread; tetrahedron anchor; `O(10%)` absolute-energy cap | claim 182 |
@@ -1215,9 +1321,9 @@ Open, with the reason each is still open:
 | damped convergence 0.833 meV in 7 calls; `mu` and `\|dmu\|`; converged QP pair; 1.42 meV grid floor | claim 200 |
 | uniform shift a null direction of `F`; the frozen window and mask caveat | claim 197(k) |
 
-Anything in this page not in that table is either code structure (verify by
-symbol — every named symbol exists at `941db3a7`) or published literature
-(references below).
+Anything in this page not in that table is either code structure (verify at
+the commit cited beside the statement) or published literature (references
+below).
 
 ## References
 
