@@ -104,6 +104,13 @@ class SigmaResult:
     sigma_xc_kij_ry: jax.Array
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
+    #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
+    #: when ``use_band_extrapolation`` is driving this stage.  ``sigma_xc_
+    #: kij_ry`` is then the EXTRAPOLATED one and is what enters H; this twin
+    #: exists so the driver can diagonalize both once per iteration and print
+    #: the correction at the eqp level.  None everywhere else, which is what
+    #: keeps the default path's object graph unchanged.
+    sigma_xc_kij_ry_unextrap: jax.Array | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
@@ -145,6 +152,15 @@ ROTATED_TO_DFT_FIELDS = (
     "v_h_kij_ry",
     "sigma_x_kij_ry",
     "sigma_xc_kij_ry",
+    # The un-extrapolated N₃ twin of ``sigma_xc_kij_ry``, present only when
+    # the band extrapolation is driving.  It is here and not in
+    # ``SIGMA_BASIS_FIELDS`` because it is the SAME KIND OF OBJECT as the
+    # field above it -- a QSGW static Σ_xc matrix -- and the driver's whole
+    # use for it is to build a second H in the DFT basis and diagonalize it
+    # beside the first.  A twin that came back in the QP basis while its
+    # partner came back rotated would report a "correction" that was mostly
+    # the basis difference.
+    "sigma_xc_kij_ry_unextrap",
     "sigma_sx_kij_ry",
     "sigma_coh_kij_ry",
 )
@@ -359,6 +375,7 @@ def finalize_dynamic_sigma(
     input_dir: str,
     write_sigma_omega_h5: bool = True,
     band_extrapolation: dict | None = None,
+    sigma_c_body_omega_unextrap: jax.Array | None = None,
     print_fn: Callable = print,
     efermi_ry=None,
 ) -> SigmaResult:
@@ -433,6 +450,23 @@ def finalize_dynamic_sigma(
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
+        # ── THE SECOND QSGW MATRIX: N₃, UN-EXTRAPOLATED ─────────────────
+        # Built only when the band extrapolation is driving, and built the
+        # SAME way as the one above so the pair differs in exactly one thing:
+        # whether Σ_c carries the extrapolated band tail.  Same head (the
+        # q->0 head is band-diagonal with no unoccupied sum, hence
+        # bracket-independent), same ω grid, same E_qp, same clipping policy.
+        # Its only consumer is the driver's side-by-side eqp report; it is
+        # never mixed into the carry.
+        sigma_xc_qsgw_unextrap = None
+        if sigma_c_body_omega_unextrap is not None:
+            sigma_c_omega_unextrap = add_head_sigma_diag(
+                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry)
+            sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
+                sigma_c_omega_unextrap, sig_x_rep,
+                omega_grid_ev, e_qp_rel_ev, mesh_xy,
+            )
+
         # Only append when this call created the base file.  SC iterations
         # pass False and append once, in the cube's own basis, at convergence.
         if write_sigma_omega_h5:
@@ -445,6 +479,7 @@ def finalize_dynamic_sigma(
         v_h_kij_ry=sig_h,
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
+        sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
@@ -604,19 +639,63 @@ def compute_sigma_xc(
     #     carrying a "consistent" verdict that gets worse the more you spend
     #     on it.  Report: sandbox
     #     reports/ch_converge_band_extrapolation_2026-08-15/.
+    # ── RECONCILING THE GUARD WITH A DEFAULT-ON KEY ─────────────────────
+    # Before 2026-08-16 the key defaulted OFF, so "set it on a non-PPM mode"
+    # was always a deliberate act and refusing was the whole answer.  The key
+    # now defaults ON, and a refusal that fires on the DEFAULT would make
+    # every COHSEX / MPA / X_ONLY run in the tree unrunnable — two gates
+    # fighting, with the operator caught in the middle.
+    #
+    # So the guard splits on PROVENANCE, which is the only thing that
+    # distinguishes the two situations:
+    #
+    #   explicitly named + non-PPM  ->  REFUSE.  The operator wrote the knob
+    #       down; silently doing nothing with it is exactly how a green A/B
+    #       comes to measure nothing (measurement-discipline rule 1).
+    #   defaulted + non-PPM         ->  DISABLE, and SAY SO.  The run is not
+    #       what the key is for, the key was not asked for, and killing it
+    #       would be refusing a run over a default the operator never chose.
+    #
+    # Both branches keep the physics guard intact: no static-mode Σ is ever
+    # extrapolated either way.  What changes is who gets refused.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
-        raise NotImplementedError(
-            f"sigma_band_extrapolation = true with compute_mode = "
-            f"{getattr(mode, 'value', mode)}.  The band-convergence "
-            f"extrapolation is wired into the two-point plasmon-pole Σ_c "
-            f"kernel only (gn_ppm / hl_ppm), and this is a CORRECTNESS "
-            f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
-            f"mode-dependent, and on a static Coulomb hole it overshoots "
-            f"the exact answer by ~340 meV and gets WORSE with more bands "
-            f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
-            f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
-            f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, or "
-            f"unset sigma_band_extrapolation.")
+        explicit = bool(getattr(
+            config.sigma, "band_extrapolation_explicit", False))
+        if explicit:
+            raise NotImplementedError(
+                f"use_band_extrapolation = true with compute_mode = "
+                f"{getattr(mode, 'value', mode)}.  The band-convergence "
+                f"extrapolation is wired into the two-point plasmon-pole Σ_c "
+                f"kernel only (gn_ppm / hl_ppm), and this is a CORRECTNESS "
+                f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
+                f"mode-dependent, and on a static Coulomb hole it overshoots "
+                f"the exact answer by ~340 meV and gets WORSE with more bands "
+                f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
+                f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
+                f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, or "
+                f"set use_band_extrapolation = false.  (This deck NAMES the "
+                f"key; had it been left at its default the feature would have "
+                f"disabled itself here with a note instead of refusing.)")
+        # AUTO-DISABLED, LOUDLY.  Printed at the Σ seam every iteration
+        # rather than once at startup: a staged run changes mode between
+        # stages, and the fact "this stage did not extrapolate" belongs
+        # beside that stage's Σ, not in a banner scrolled past an hour ago.
+        print_fn(
+            f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
+            f"{getattr(mode, 'value', mode)} (no deck key named it; "
+            f"use_band_extrapolation defaults on).  The 1/N -> 0 limit is "
+            f"MODE-DEPENDENT and is wrong for a static Coulomb hole: "
+            f"measured against BerkeleyGW's exact static CH it ANTI-converges, "
+            f"94.9 -> 288.2 meV MAE as nband goes 60 -> 124, overshooting by "
+            f"~340 meV, while GN-PPM improves 171.3 -> 32.8 over the same "
+            f"range.  This stage's Σ is the ordinary full-band sum.")
+        # NOTHING IS REBOUND HERE, deliberately.  ``config.sigma.
+        # band_extrapolation`` is read in exactly one place — the GN/HL-PPM
+        # pipeline's ``plan_band_brackets`` call — and this branch is the one
+        # where that pipeline is NOT reached.  Rewriting the config to keep it
+        # cosmetically truthful would mean a ``dataclasses.replace`` of the
+        # whole frozen LorraxConfig (re-running its __post_init__) to change a
+        # field with no remaining reader.  The log line above is the record.
 
     # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
     # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
@@ -880,6 +959,8 @@ def compute_sigma_xc(
         input_dir=input_dir,
         write_sigma_omega_h5=write_sigma_omega_h5,
         band_extrapolation=ppm_outputs.band_extrapolation,
+        sigma_c_body_omega_unextrap=(
+            ppm_outputs.sigma_c_body_omega_unextrap),
         print_fn=print_fn,
     )
 
