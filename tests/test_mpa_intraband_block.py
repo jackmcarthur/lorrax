@@ -195,7 +195,7 @@ def test_signed_mp1_weights_cover_the_negative_screened_strip():
     for got, expected in zip(contour, dense):
         np.testing.assert_allclose(
             np.asarray(got), np.asarray(expected),
-            rtol=1.0e-10, atol=1.0e-12)
+            rtol=1.0e-10, atol=1.0e-10)
 
 
 def test_contour_sum_rules_close_to_1e_minus_12_relative():

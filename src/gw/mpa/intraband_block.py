@@ -213,6 +213,11 @@ def _relative_error(model, exact):
         numerator / jnp.maximum(denominator, floor))))
 
 
+def _frobenius_norm(value):
+    return float(jax.device_get(jnp.sqrt(
+        jnp.real(jnp.vdot(value, value)))))
+
+
 def _contour_geometry(pair_block, W0bar):
     """Derived two-sided zeta strip, with the zeta=0 pole excluded."""
     u, w, _vertices = pair_block
@@ -222,8 +227,10 @@ def _contour_geometry(pair_block, W0bar):
     # Frobenius is a valid upper bound for the unspecified matrix norm in the
     # ruling and avoids a second spectral problem at N_mu scale.
     w_norm = float(jax.device_get(jnp.linalg.norm(W0bar)))
-    interaction = w_norm * float(np.sum(2.0 * np.abs(w_host)))
-    zeta_max = lambda_q * lambda_q + interaction
+    interaction_bound = w_norm * float(np.sum(2.0 * np.abs(w_host)))
+    bare_zeta = lambda_q * lambda_q
+    interaction = interaction_bound
+    zeta_max = bare_zeta + interaction
     if not np.isfinite(zeta_max) or zeta_max <= 0.0:
         raise ValueError(
             "GATE intraband_contour_domain: derived zeta_max must be finite "
@@ -244,8 +251,12 @@ def _contour_geometry(pair_block, W0bar):
     # resolved distance from sqrt's branch point is required for T1
     # quadrature convergence; the independent M/V closures refuse if a mode
     # falls into this machine-only gap.
-    zero_gap = max(0.25 * float(np.min(positive_u2)),
-                   np.finfo(np.float64).eps * zeta_max)
+    zero_gap = (
+        np.finfo(np.float64).eps * zeta_max
+        if np.any(w_host < 0.0)
+        else max(0.25 * float(np.min(positive_u2)),
+                 np.finfo(np.float64).eps * zeta_max)
+    )
     # The interaction radius is the derived imaginary excursion.  Its only
     # floor is roundoff separation from the real axis.
     height = max(interaction,
@@ -267,10 +278,9 @@ def _initial_intervals(pair_block, W0bar):
     negative_active = bool(np.any(w < 0.0) and left < -zero_gap)
     n_positive = MIN_CLUSTERS - int(negative_active)
     edges = [zero_gap]
-    for numerator in range(1, n_positive):
-        cut = int(np.ceil(numerator * u2.size / n_positive))
-        cut = min(max(cut, 1), u2.size - 1)
-        edge = 0.5 * (float(u2[cut - 1]) + float(u2[cut]))
+    gap_order = np.argsort(np.diff(u2))[::-1][:n_positive - 1]
+    for gap_index in np.sort(gap_order):
+        edge = 0.5 * (float(u2[gap_index]) + float(u2[gap_index + 1]))
         edge = min(max(edge, np.nextafter(edges[-1], np.inf)), right)
         edges.append(edge)
     edges.append(right)
@@ -287,12 +297,33 @@ def _quadrature_nodes(interval, height, order):
     """Counter-clockwise Gauss-Legendre nodes and dz weights on a rectangle."""
     lo, hi = (float(interval[0]), float(interval[1]))
     x, weight = np.polynomial.legendre.leggauss(int(order))
-    segments = (
+    coarse_segments = (
         (complex(lo, -height), complex(hi, -height)),
         (complex(hi, -height), complex(hi, height)),
         (complex(hi, height), complex(lo, height)),
         (complex(lo, height), complex(lo, -height)),
     )
+    segments = []
+    for start, stop in coarse_segments:
+        if start.real == stop.real and start.imag * stop.imag < 0.0:
+            scale = min(
+                height,
+                max(abs(start.real),
+                    np.finfo(np.float64).eps * height),
+            )
+            ordinates = [0.0]
+            radius = scale
+            while radius < height:
+                ordinates.extend((-radius, radius))
+                radius *= 2.0
+            ordinates.extend((-height, height))
+            ordinates = sorted(set(ordinates))
+            if start.imag > stop.imag:
+                ordinates.reverse()
+            points = [complex(start.real, value) for value in ordinates]
+            segments.extend(zip(points[:-1], points[1:]))
+        else:
+            segments.append((start, stop))
     for start, stop in segments:
         midpoint = 0.5 * (start + stop)
         half = 0.5 * (stop - start)
@@ -309,11 +340,14 @@ def _retarded_sqrt_on_interval(zeta, interval):
     return np.sqrt(complex(zeta))
 
 
-def _moments_at_order(pair_block, W0bar, intervals, order, V_total):
+def _moments_at_order(
+        pair_block, W0bar, intervals, order, V_total, *, height=None):
     mesh = _mesh_of(W0bar, "_moments_at_order")
     matrix_shard = NamedSharding(mesh, P("x", "y"))
     pole_shard = NamedSharding(mesh, P(None, "x", "y"))
-    _left, _zero_gap, _right, height = _contour_geometry(pair_block, W0bar)
+    _left, _zero_gap, _right, max_height = _contour_geometry(
+        pair_block, W0bar)
+    height = max_height if height is None else float(height)
     shape = tuple(W0bar.shape)
     M_rows, V_rows, T1_rows, T2_rows = [], [], [], []
     normalization = 1.0 / (2.0j * np.pi)
@@ -360,7 +394,7 @@ def _cluster_moment_matrices(
         raise ValueError(
             "GATE intraband_contour_intervals: intervals must be nonempty "
             "ordered (lo,hi) pairs")
-    left, zero_gap, right, _height = _contour_geometry(pair_block, W0bar)
+    left, zero_gap, right, height = _contour_geometry(pair_block, W0bar)
     negative = tuple(value for value in intervals if value[1] < 0.0)
     positive = tuple(value for value in intervals if value[0] > 0.0)
     negative_domain_ok = (
@@ -397,18 +431,44 @@ def _cluster_moment_matrices(
     for order in _QUADRATURE_ORDERS:
         current = _moments_at_order(
             pair_block, W0bar, intervals, order, V_total)
+        movements = (np.inf,) * 4
         if previous is not None:
-            movement = max(
-                _relative_error(value, old)
-                for value, old in zip(current, previous)
+            mass_scale = max(
+                sum(_frobenius_norm(current[0][index])
+                    for index in range(int(current[0].shape[0]))),
+                sum(_frobenius_norm(previous[0][index])
+                    for index in range(int(previous[0].shape[0]))),
+                np.finfo(np.float64).tiny,
             )
+            static_scale = max(
+                sum(_frobenius_norm(current[1][index])
+                    for index in range(int(current[1].shape[0]))),
+                sum(_frobenius_norm(previous[1][index])
+                    for index in range(int(previous[1].shape[0]))),
+                np.finfo(np.float64).tiny,
+            )
+            zeta_radius = float(np.hypot(max(abs(left), right), height))
+            scales = (
+                mass_scale,
+                static_scale,
+                np.sqrt(zeta_radius) * mass_scale,
+                zeta_radius * mass_scale,
+            )
+            movements = tuple(
+                _frobenius_norm(value - old) / scale
+                for value, old, scale in zip(current, previous, scales))
+            movement = max(movements)
         m_closure = _relative_error(jnp.sum(current[0], axis=0), M_total)
         v_closure = _relative_error(jnp.sum(current[1], axis=0), V_total)
         if jax.process_index() == 0:
             print(
                 "[intraband-contour] "
                 f"clusters={len(intervals)} order={order} "
-                f"movement={movement:.6e} Sigma_M_rel={m_closure:.6e} "
+                f"movement={movement:.6e} "
+                "move_M/V/T1/T2="
+                f"{movements[0]:.3e}/{movements[1]:.3e}/"
+                f"{movements[2]:.3e}/{movements[3]:.3e} "
+                f"Sigma_M_rel={m_closure:.6e} "
                 f"Sigma_V_rel={v_closure:.6e}",
                 flush=True,
             )
