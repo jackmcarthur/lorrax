@@ -1236,6 +1236,7 @@ def write_results(
     *,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
+    qp_rotations_k_storage: str = "auto",
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1559,6 +1560,12 @@ def write_results(
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
         nkx, nky, nkz = kgrid
+        # The service owns the (irr_idx_k, sym_idx_k, n_sym_spatial) triple
+        # — ``n_sym_spatial`` from ``sym_mats_k``, not from the WFN header,
+        # which is the derivation the unfold side conjugates by.
+        from ffi import _services as _svc
+        _svc.ensure_on_path()
+        import symmetry_maps as _sm
         write_qp_rotations_h5(
             os.path.join(input_dir, "qp_wfn_rotations.h5"),
             U_mnk=results.U_qp,
@@ -1569,6 +1576,9 @@ def write_results(
             nkx=nkx, nky=nky, nkz=nkz,
             kpoints_reduced=kpts_irr,
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            k_storage=str(qp_rotations_k_storage),
+            star_tables=_sm.star_tables_of(sym),
+            print_fn=print_fn,
         )
 
     # ── Status summary ────────────────────────────────────────────────────

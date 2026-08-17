@@ -2983,7 +2983,9 @@ def run_sc_driver(
             kstar=kstar_io, state_on_ibz=kstar is not None,
             wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
             logical_band_stop=int(meta.b_id_4_user),
-            output_dir=input_dir, print_fn=print_fn,
+            output_dir=input_dir,
+            qp_rotations_k_storage=config.qp_rotations_k_storage,
+            print_fn=print_fn,
         )
         rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -3231,6 +3233,7 @@ def dump_qp_wfn_artifacts(
     logical_band_stop: int | None = None,
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
+    qp_rotations_k_storage: str = "auto",
     print_fn: Callable = print,
 ) -> tuple[str, str, float]:
     """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
@@ -3365,6 +3368,13 @@ def dump_qp_wfn_artifacts(
             band_start=band_slices.b0, band_stop=band_slices.b3,
             enk_full_base_ry=enk_full_base_ry,
         )
+        # The tables come from the SERVICE's own accessor, never re-spelled
+        # here: ``n_sym_spatial`` is derived from ``sym_mats_k`` rather than
+        # from the WFN header, and that derivation is the one the unfold
+        # side uses to decide which rows get conjugated.
+        from ffi import _services as _svc
+        _svc.ensure_on_path()
+        import symmetry_maps as _sm
         write_qp_rotations_h5(
             qp_rot_path,
             U_mnk=U_full,
@@ -3374,6 +3384,9 @@ def dump_qp_wfn_artifacts(
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
             kpoints_reduced=np.asarray(wfn.kpoints, dtype=np.float64),
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            k_storage=str(qp_rotations_k_storage),
+            star_tables=_sm.star_tables_of(sym),
+            print_fn=print_fn,
         )
     barrier("qp_wfn_h5_write")
     print_fn(f"  QP WFN:       {qp_wfn_path}")

@@ -802,6 +802,7 @@ def main(argv=None):
 			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
 			sym=sym,
 			write_qp_rotations=not rotations_written,
+			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,
 		)
 	timing.record("gw_jax.output", time.perf_counter() - _t_out)

@@ -8,9 +8,120 @@ Two writers live here:
   rotated and energies replaced.  This is the canonical "QP WFN" output
   consumed by downstream BSE / restart paths that just want a WFN.h5
   drop-in replacement.
+
+WHICH k-SET ``qp_wfn_rotations.h5`` IS STORED ON
+------------------------------------------------------------------------
+Historically: the full BZ, always, with nothing on the file saying so.
+Now: the FILE WEDGE (``wfn.kpoints``, ``sym.nk_red`` rows — the k-set
+``kirr_to_kfull`` already addressed) when the writer can PROVE the
+reduction loses nothing, and the full BZ otherwise.
+
+The stamping model is ``kin_ion.h5``'s and the constants are ITS
+constants, imported rather than re-spelled: ``k_storage`` /
+``k_storage_version`` / ``n_sym_spatial`` per dataset, the two unfold
+tables beside the arrays, and **a dataset with no ``k_storage`` attr read
+as ``"full"``**.  One stamp contract for three files is the point; a
+second copy here would be a second place for the version and the refusals
+to drift.
+
+WHY THE PROOF, AND WHY IT IS NOT OPTIONAL.  ``U_mnk`` is NOT a scalar
+operator like ``kin_ion``.  It is a stack of EIGENVECTORS, defined up to a
+phase and — inside a degenerate multiplet — up to a unitary mixing, so
+"the star relation holds for this quantity" is a statement about HOW THIS
+RUN PRODUCED IT, not about the physics:
+
+* Self-consistent runs with ``sc_on_ibz`` (the default) diagonalise on the
+  wedge and broadcast, so the full-BZ rows ARE gathers and the wedge form
+  is exact.
+* The one-shot path runs an independent ``eigh`` at every full-BZ k
+  (``gw_jax.py``), so its off-wedge rows are a different gauge and
+  discarding them WOULD lose information.
+
+Both write this file.  Rather than encode which caller is which — a rule
+that decays the moment a third producer appears — :func:`write_qp_rotations_h5`
+performs the round trip on the arrays in hand and keeps the wedge only if
+it reproduces them.  ``"auto"`` therefore means "the wedge, if this run's
+own numbers say the wedge is enough", and a file that carries the stamp is
+a file whose reconstruction was checked by the process that wrote it.
+
+Nothing here weakens the absent-means-full rule: an old file, a
+hand-written test file and a full-BZ file written today are all read
+verbatim, because the discriminator is an attribute no old writer wrote.
 """
+import os
+
 import numpy as np
 import h5py
+
+from .kin_ion import (
+    IRR_IDX_DATASET,
+    K_STORAGE_ATTR,
+    K_STORAGE_FULL,
+    K_STORAGE_IBZ,
+    K_STORAGE_VALUES,
+    K_STORAGE_VERSION,
+    K_STORAGE_VERSION_ATTR,
+    N_SYM_SPATIAL_ATTR,
+    SYM_IDX_DATASET,
+    broadcast_ibz_to_full_bz,
+)
+
+#: Legal values of the ``qp_rotations_k_storage`` input key.  Same three
+#: words as ``restart_q_storage`` (``gw.restart_q_storage.RESTART_Q_STORAGE``)
+#: so a deck author learns one vocabulary, not two:
+#:
+#:   auto — store the file wedge IF the round trip reproduces the full-BZ
+#:          arrays exactly; the full BZ otherwise, saying which array and
+#:          by how much.
+#:   full — the old bytes, unconditionally.  Does not ask the question.
+#:   ibz  — REFUSE rather than fall back, for a run that believes its rows
+#:          are gathers and wants to be told the day they stop being.
+QP_ROTATIONS_K_STORAGE = ("auto", "full", "ibz")
+
+#: The k-indexed datasets of ``qp_wfn_rotations.h5``.  ``kpoints_crys`` is
+#: in the list on purpose: it LABELS ``U_mnk``'s rows, so a file whose
+#: arrays were reduced and whose coordinates were not is a file that lies
+#: about which k each row belongs to.
+QP_ROT_K_DATASETS = (
+    "U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg", "kpoints_crys")
+
+
+def _wedge_reduction(payload, kirr_to_kfull, star_tables):
+    """``(reduced_payload, worst_by_name)`` — the round trip, MEASURED.
+
+    Reduces every array in ``payload`` to the file wedge by taking the
+    ``kirr_to_kfull`` rows, unfolds each straight back through the single
+    adapter, and returns the reduced arrays beside the worst absolute
+    deviation of the reconstruction from the array it came from.
+
+    It is deliberately the WHOLE round trip and not a cheaper equivalence
+    check.  What the caller needs to know is not "do these rows look like a
+    star" but "will the reader that unfolds this file get back the bytes I
+    am about to discard", and the only statement of that is the reader's own
+    composition, run forwards.
+
+    ``reduce`` is a plain row take rather than
+    ``symmetry_maps.reduce_full_bz_to_file_wedge`` because the table is
+    already in hand — ``kirr_to_kfull`` IS ``sym.kirr_fullids``, which is
+    what that function selects by — and the writer has no ``SymMaps``.  The
+    UNFOLD, which is the half with a convention in it, goes through
+    ``kin_ion.broadcast_ibz_to_full_bz`` like every other unfold in the
+    tree.
+    """
+    rows = np.asarray(kirr_to_kfull, dtype=np.int64)
+    irr_idx_k, sym_idx_k, n_sym_spatial = star_tables
+    reduced, worst = {}, {}
+    for name, arr in payload.items():
+        if arr is None:
+            continue
+        full = np.asarray(arr)
+        red = full[rows]
+        back = np.asarray(broadcast_ibz_to_full_bz(
+            red, irr_idx_k, sym_idx_k, n_sym_spatial))
+        reduced[name] = red
+        worst[name] = (float(np.max(np.abs(back - full)))
+                       if full.size else 0.0)
+    return reduced, worst
 
 
 def write_qp_rotations_h5(
@@ -25,6 +136,9 @@ def write_qp_rotations_h5(
     nkz: int,
     kpoints_reduced: np.ndarray = None,
     kirr_to_kfull: np.ndarray = None,
+    k_storage: str = "full",
+    star_tables=None,
+    print_fn=None,
 ):
     """Write QP rotation matrices and eigenvalues to HDF5 file.
     
@@ -42,31 +156,137 @@ def write_qp_rotations_h5(
         nkx, nky, nkz: k-mesh dimensions
         kpoints_reduced: Reduced k-points from WFN.h5 (nk_red, 3), optional
         kirr_to_kfull: Mapping from reduced k-point index to full zone index, optional
-    
+        k_storage: one of :data:`QP_ROTATIONS_K_STORAGE`.  ``"full"`` (the
+               default, and what every caller got before this argument
+               existed) writes the arrays exactly as handed over.  ``"auto"``
+               and ``"ibz"`` reduce them to the FILE WEDGE and stamp the
+               file, and both need ``kirr_to_kfull`` and ``star_tables``.
+        star_tables: ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — the tables
+               the reader unfolds with, written INTO the file beside the
+               arrays.  A table that lives elsewhere is a table that
+               silently decays when anything upstream is regenerated.
+        print_fn: where the storage decision is announced, or ``None``.
+
     For postprocessing WFN.h5 → WFN_qp.h5:
         1. Load WFN.h5 coefficients for bands [band_start:band_stop]
         2. For each k-point k:
            c_qp[n, G] = Σ_m U[k, m, n] * c_dft[m, G]  (matrix form: c_qp = U^T @ c_dft)
         3. Replace eigenvalues with E_qp_nk (convert to Rydberg if needed)
         4. Write rotated coefficients back to WFN_qp.h5
+
+    ON A WEDGE-STORED FILE, ``kirr_to_kfull`` BECOMES ``arange(nk_red)``.
+    It is defined as "the row of ``U_mnk``/``kpoints_crys`` holding reduced
+    k-point ``ik_red``", and on a wedge-stored file that row IS ``ik_red``.
+    Rewriting it is what keeps ``postprocess.rotate_wfn_to_qp`` and
+    ``gw.eqp_bgw`` — both of which index ``U_mnk[kirr_to_kfull[ik]]`` —
+    correct with no change at all, and it keeps the module's own coordinate
+    check (``kpoints_crys[kirr_to_kfull] == wfn.kpoints``) meaningful rather
+    than tautological, because ``kpoints_crys`` is reduced with everything
+    else.  The old value is preserved as ``kirr_to_kfull_in_full_bz`` for
+    anything that wants to know where these rows sat in the full zone.
     """
+    if k_storage not in QP_ROTATIONS_K_STORAGE:
+        raise ValueError(
+            f"write_qp_rotations_h5: k_storage={k_storage!r} is none of "
+            f"{QP_ROTATIONS_K_STORAGE}.")
+
+    say = print_fn if print_fn is not None else (lambda *_a, **_k: None)
+    payload = {
+        "U_mnk": np.asarray(U_mnk),
+        "E_qp_nk_hartree": np.asarray(E_qp_nk),
+        "E_qp_nk_rydberg": np.asarray(E_qp_nk) * 2.0,
+        "kpoints_crys": np.asarray(kpoints_crys, dtype=np.float64),
+    }
+    stored = K_STORAGE_FULL
+    kirr_full_bz = (None if kirr_to_kfull is None
+                    else np.asarray(kirr_to_kfull, dtype=np.int32))
+
+    if k_storage != "full":
+        # EVERY WAY THE REQUEST CANNOT BE HONOURED, NAMED SEPARATELY.  A
+        # single "cannot reduce" would make the two very different causes
+        # — no tables, and tables that do not reconstruct — look alike, and
+        # only one of them is a reason to regenerate anything.
+        missing = [n for n, v in (("kirr_to_kfull", kirr_to_kfull),
+                                  ("star_tables", star_tables)) if v is None]
+        if missing:
+            raise ValueError(
+                f"write_qp_rotations_h5: k_storage={k_storage!r} needs "
+                f"{missing} and got None.  The wedge form is only writable "
+                f"by a caller that also hands over the tables the reader "
+                f"unfolds with; there is no re-derivation here, because a "
+                f"table that reconstructs the tensor must be the table that "
+                f"deconstructed it.")
+        nk_full = int(payload["U_mnk"].shape[0])
+        irr = np.asarray(star_tables[0], dtype=np.int32)
+        if irr.size != nk_full:
+            raise ValueError(
+                f"write_qp_rotations_h5: irr_idx_k describes {irr.size} "
+                f"full-BZ k but the arrays carry {nk_full} rows — the "
+                f"tables and the arrays are not the same calculation.")
+        reduced, worst = _wedge_reduction(payload, kirr_full_bz, star_tables)
+        bad = {n: d for n, d in worst.items() if d != 0.0}
+        if bad:
+            detail = ", ".join(f"{n} max|Δ| = {d:.6e}"
+                               for n, d in sorted(bad.items()))
+            if k_storage == "ibz":
+                raise ValueError(
+                    f"write_qp_rotations_h5: k_storage='ibz' was asked for, "
+                    f"but the full-BZ rows are NOT the unfold of the wedge "
+                    f"rows ({detail}).  Storing the wedge would discard rows "
+                    f"no reader can rebuild.  U_mnk is a stack of "
+                    f"EIGENVECTORS — defined up to a phase, and up to a "
+                    f"unitary mixing inside a degenerate multiplet — so this "
+                    f"is the expected answer for a run whose off-wedge rows "
+                    f"came from their own eigh rather than from a broadcast. "
+                    f"Use k_storage='auto' to fall back to full-BZ storage.")
+            say(f"  qp_wfn_rotations: k_storage='auto' -> FULL BZ; the "
+                f"round trip does not reproduce the arrays ({detail}).")
+        else:
+            stored = K_STORAGE_IBZ
+            payload = reduced
+            kpoints_crys = reduced["kpoints_crys"]
+            # see the docstring: on a wedge file the reduced row IS the row
+            kirr_to_kfull = np.arange(len(kirr_full_bz), dtype=np.int32)
+            say(f"  qp_wfn_rotations: k axis REDUCED to the file wedge, "
+                f"{nk_full} -> {len(kirr_full_bz)} rows; the round trip "
+                f"reproduces every dataset exactly (max|Δ| = 0).")
+
     with h5py.File(filepath, 'w') as f:
         # Main data
-        f.create_dataset('U_mnk', data=U_mnk, dtype=np.complex128)
-        f.create_dataset('E_qp_nk_hartree', data=E_qp_nk, dtype=np.float64)
-        f.create_dataset('E_qp_nk_rydberg', data=E_qp_nk * 2.0, dtype=np.float64)  # Also save in Ry
-        
+        f.create_dataset('U_mnk', data=payload["U_mnk"], dtype=np.complex128)
+        f.create_dataset('E_qp_nk_hartree', data=payload["E_qp_nk_hartree"], dtype=np.float64)
+        f.create_dataset('E_qp_nk_rydberg', data=payload["E_qp_nk_rydberg"], dtype=np.float64)  # Also save in Ry
+
         # Metadata
         f.create_dataset('band_range', data=np.array([band_start, band_stop], dtype=np.int32))
         f.create_dataset('kpoints_crys', data=kpoints_crys, dtype=np.float64)
         f.create_dataset('kgrid', data=np.array([nkx, nky, nkz], dtype=np.int32))
-        
+
         # Optional: reduced k-points and mapping for easy WFN.h5 lookup
         if kpoints_reduced is not None:
             f.create_dataset('kpoints_reduced', data=kpoints_reduced, dtype=np.float64)
         if kirr_to_kfull is not None:
             f.create_dataset('kirr_to_kfull', data=kirr_to_kfull, dtype=np.int32)
-        
+
+        # ---- the k-basis declaration -------------------------------------
+        # Only on the wedge arm.  A full-BZ file is left EXACTLY as it was,
+        # attrs included, so "absent means full" keeps its meaning and this
+        # change cannot be detected downstream of a `full` run at all.
+        if stored == K_STORAGE_IBZ:
+            irr_idx_k, sym_idx_k, n_sym_spatial = star_tables
+            f.create_dataset(IRR_IDX_DATASET,
+                             data=np.asarray(irr_idx_k, dtype=np.int32))
+            f.create_dataset(SYM_IDX_DATASET,
+                             data=np.asarray(sym_idx_k, dtype=np.int32))
+            f.create_dataset('kirr_to_kfull_in_full_bz', data=kirr_full_bz,
+                             dtype=np.int32)
+            for name in QP_ROT_K_DATASETS:
+                d = f[name]
+                d.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
+                d.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
+                d.attrs[N_SYM_SPATIAL_ATTR] = int(n_sym_spatial)
+                d.attrs['nk_full'] = int(np.asarray(irr_idx_k).size)
+
         # Attributes for documentation
         f.attrs['description'] = (
             'QP rotation data for transforming DFT wavefunctions to QP basis. '
@@ -80,6 +300,56 @@ def write_qp_rotations_h5(
                 'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
                 'for the reduced k-point ik_red from WFN.h5'
             )
+    return stored
+
+
+# ---------------------------------------------------------------------------
+# Reading it back on the full BZ
+# ---------------------------------------------------------------------------
+
+def qp_rotations_k_storage(h5_path: str, dataset: str = "U_mnk") -> str:
+    """``"ibz"`` or ``"full"`` — what ``dataset`` of this file is stored on.
+
+    Absent attr means :data:`~file_io.kin_ion.K_STORAGE_FULL`, which is what
+    makes every file written before this format keep its exact meaning.
+    """
+    with h5py.File(h5_path, "r") as f:
+        if dataset not in f:
+            raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
+        stored = str(f[dataset].attrs.get(K_STORAGE_ATTR, K_STORAGE_FULL))
+    if stored not in K_STORAGE_VALUES:
+        raise ValueError(
+            f"{os.path.basename(h5_path)}: {dataset}.{K_STORAGE_ATTR} is "
+            f"{stored!r}, neither {K_STORAGE_IBZ!r} nor {K_STORAGE_FULL!r}.")
+    return stored
+
+
+def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
+    """``qp_wfn_rotations.h5``'s k-indexed arrays, ON THE FULL BZ.
+
+    THE unfolding option the wedge form owes its consumers, and the reason
+    the wedge form is safe to write at all: anything that wants the array
+    the old writer produced calls this and gets it, wedge-stored file or
+    not.  A full-BZ file is read verbatim — the unfold is not attempted,
+    because the tables are not there and the rows are not stars.
+
+    Reuses ``kin_ion.read_star_map`` for the stamp contract rather than
+    re-implementing it, so the version number, the table names and every
+    refusal have ONE definition across ``kin_ion.h5``, ``sigma_mnk.h5`` and
+    this file.
+    """
+    from .kin_ion import read_star_map
+    names = tuple(datasets) if datasets is not None else QP_ROT_K_DATASETS
+    star = read_star_map(h5_path, names[0])
+    out = {}
+    with h5py.File(h5_path, "r") as f:
+        for name in names:
+            if name not in f:
+                continue
+            arr = np.asarray(f[name][()])
+            out[name] = (arr if star is None
+                         else np.asarray(broadcast_ibz_to_full_bz(arr, *star)))
+    return out
 
 
 # ---------------------------------------------------------------------------
