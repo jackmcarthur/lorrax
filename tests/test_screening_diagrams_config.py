@@ -819,6 +819,33 @@ def test_the_wedge_residual_gate_refuses_an_absent_residual():
         assert got is not None and float(got.max()) == 2.0
 
 
+def test_the_production_cap_accepts_the_measured_nb20_krylov_depth(monkeypatch):
+    """The wide-window scalar-Si solve needs 242 iterations, not a looser tol.
+
+    The former 200 cap returned a finite tile with a 9.17e-3 true residual.
+    At identical operands/tolerance the same columns converge normally at
+    iterations 240--242.  This cell pins the production caller's headroom and
+    its independent residual gate: a 242-iteration, 9e-7 result must pass.
+    """
+    import numpy as np
+    from bse import w_ladder
+    from gw import screening_bse
+
+    class _MeasuredWideWindow:
+        gmres_resid = np.asarray([9.0e-7], dtype=np.float64)
+        gmres_iters = np.asarray([242], dtype=np.int64)
+
+    def _fake(*_args, gmres_max_iter, **_kwargs):
+        assert gmres_max_iter >= 300
+        return _MeasuredWideWindow()
+
+    monkeypatch.setattr(w_ladder, "compute_wc_qwedge", _fake)
+    got = screening_bse._ladder_wedge(
+        "restart.h5", [0.0 + 0.0j], None, input_file="deck.in",
+        print_fn=lambda *_a, **_k: None)
+    assert got.gmres_iters[0] == 242
+
+
 # ---------------------------------------------------------------------------
 # 7. Provenance (QUALITY_PATTERNS #10)
 # ---------------------------------------------------------------------------
