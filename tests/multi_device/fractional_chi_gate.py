@@ -7,12 +7,17 @@ RUNTIME = initialize_communicator_stack()
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import process_count, process_rank, resolve_mesh
-from gw.w_isdf import compute_chi0_contour_fractional
+from gw.w_isdf import (
+    compute_chi0_contour_fractional,
+    intraband_chi1,
+    intraband_pair_block,
+)
 from gw.wavefunction_bundle import (
     BandSlices,
     PSI_XN_SPEC,
@@ -53,6 +58,46 @@ def _dense(psi, enk, occ, time, weights, z):
                         * np.outer(M, np.conj(M))[None, :, :]
                     )
     return out / np.sqrt(float(nk))
+
+
+def _dense_crossing_block(psi, enk, occ, kminq_rows, q_row, z):
+    """Independent exact-K oracle for full/selected/complement chi rows."""
+    nk, nb, _, nmu = psi.shape
+    kmq = np.asarray(kminq_rows[q_row], np.int64)
+    support = (
+        np.any(occ != 0.0, axis=0) & np.any(occ != 1.0, axis=0)
+    )
+    same_delta = enk[kmq, :] - enk
+    lambda_q = (
+        float(np.max(np.abs(same_delta[:, support])))
+        if np.any(support) else 0.0
+    )
+    full = np.zeros((nmu, nmu), np.complex128)
+    selected = np.zeros_like(full)
+    complement = np.zeros_like(full)
+    n_selected = 0
+    n_cross_band = 0
+    for k in range(nk):
+        for a in range(nb):
+            for b in range(nb):
+                delta = enk[kmq[k], b] - enk[k, a]
+                delta_f = occ[k, a] - occ[kmq[k], b]
+                vertex = np.einsum(
+                    "sm,sm->m", np.conj(psi[k, a]), psi[kmq[k], b])
+                coefficient = (
+                    delta_f * (-2.0 * delta / (delta * delta - z * z))
+                    / (2.0 * np.sqrt(float(nk)))
+                )
+                term = coefficient * np.outer(vertex, np.conj(vertex))
+                full += term
+                in_block = delta_f != 0.0 and abs(delta) <= lambda_q
+                if in_block:
+                    selected += term
+                    n_selected += 1
+                    n_cross_band += int(a != b)
+                else:
+                    complement += term
+    return full, selected, complement, n_selected, n_cross_band
 
 
 def main():
@@ -194,11 +239,78 @@ def main():
         )
     if rel_s > 5.0e-12:
         raise AssertionError("finite-q static divided-difference mismatch")
+
+    # --- WP1: exact crossing block, all wedge rows and three z ----------
+    # One near-static point, one strip point and one far-line point.  The
+    # oracle independently repeats the literal S(q) definition; it does not
+    # call either production selector/evaluator.
+    z_cross = np.array([2.0e-5j, 0.77 + 0.24j, 2.0j])
+    worst_selected = 0.0
+    worst_complement = 0.0
+    blocks = []
+    for q_row in range(nk):
+        block = intraband_pair_block(
+            wfns_mp1,
+            SimpleNamespace(nk_tot=nk, n_rmu=nmu),
+            state,
+            kminq,
+            q_row,
+        )
+        blocks.append(block)
+        if block[2][0].sharding.spec != P(None, "x"):
+            raise AssertionError("crossing P_x lost its pair/x sharding")
+        if block[2][1].sharding.spec != P(None, "y"):
+            raise AssertionError("crossing P_y lost its pair/y sharding")
+        if q_row == 0 and int(block[0].size) != 0:
+            raise AssertionError("Gamma crossing block is not empty")
+        for z_value in z_cross:
+            chi1_row = intraband_chi1(block, z_value)
+            if chi1_row.sharding.spec != P("x", "y"):
+                raise AssertionError("chi1 row lost its x/y sharding")
+            got_block = np.asarray(multihost_utils.process_allgather(
+                chi1_row, tiled=True))
+            (want_full, want_block, want_complement,
+             n_selected, n_cross_band) = _dense_crossing_block(
+                psi, enk, occ_mp1, kminq, q_row, z_value)
+            scale_b = max(float(np.max(np.abs(want_block))), 1.0e-300)
+            rel_b = float(np.max(np.abs(got_block - want_block))) / scale_b
+            scale_c = max(
+                float(np.max(np.abs(want_complement))), 1.0e-300)
+            rel_c = float(np.max(np.abs(
+                (want_full - got_block) - want_complement))) / scale_c
+            worst_selected = max(worst_selected, rel_b)
+            worst_complement = max(worst_complement, rel_c)
+            if q_row == 0:
+                if n_selected != 0 or np.any(got_block != 0.0):
+                    raise AssertionError(
+                        "Gamma S(q) or chi1 is not identically empty")
+            elif n_selected == 0 or n_cross_band == 0:
+                raise AssertionError(
+                    "finite-q fixture did not exercise the selected "
+                    "near-degenerate cross-band channel")
+    if rank == 0:
+        print(
+            "[fractional-chi] crossing block all-q/three-z "
+            "selected max_rel={:.3e} complement max_rel={:.3e}".format(
+                worst_selected, worst_complement),
+            flush=True,
+        )
+    if worst_selected > 1.0e-12 or worst_complement > 1.0e-12:
+        raise AssertionError("crossing-block dense/complement mismatch")
+    chi1_wedge_dist = jnp.stack([
+        intraband_chi1(block, z_cross[1]) for block in blocks
+    ])
+    if chi1_wedge_dist.sharding.spec != P(None, "x", "y"):
+        raise AssertionError("stacked chi1 wedge lost its q/x/y sharding")
+    chi1_wedge = np.asarray(multihost_utils.process_allgather(
+        chi1_wedge_dist, tiled=True))
+    if chi1_wedge.shape != (nk, nmu, nmu):
+        raise AssertionError(
+            "stacked crossing wedge has wrong global shape: "
+            + str(chi1_wedge.shape))
     multihost_utils.sync_global_devices("fractional_chi_gate_pass")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        finalize_process()
+    main()
+    finalize_process()

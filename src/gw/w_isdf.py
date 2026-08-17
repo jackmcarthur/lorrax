@@ -1153,6 +1153,237 @@ def _occupation_support_slices(
     )
 
 
+def intraband_pair_block(
+    wfns,
+    meta,
+    occupation_state,
+    kminq_rows,
+    q_row,
+):
+    r"""Build the exact finite-q crossing block for one stored wedge row.
+
+    For ``a=(n,k)`` and ``b=(m,k-q)``, the selected set is
+
+    ``S(q) = {(a,b): f_a != f_b and |E_b-E_a| <= Lambda(q)}``,
+
+    where ``Lambda(q)`` is the largest exact same-band ``|E_b-E_a|``
+    inside the overlap of the exact ``f`` and ``1-f`` occupation supports.
+    Equality is deliberate throughout: carried MP1 occupations are neither
+    clipped nor thresholded, and transition energies are literal band-energy
+    differences (never ``q.v``).
+
+    Returns
+    -------
+    u_s : jax.Array, shape (n_pair,), Ry, replicated
+        Exact signed transition energies ``E_b(k-q)-E_a(k)``.
+    w_s : jax.Array, shape (n_pair,), Ry, replicated
+        Raw-chi weights ``(f_a-f_b) u_s / (2 sqrt(N_k))``.  The common
+        ``2/(sqrt(N_k) n_spin n_spinor)`` Dyson prefactor is applied once by
+        :func:`solve_w`, just as for every existing chi builder.
+    P_s : tuple[jax.Array, jax.Array]
+        Two shardings of the one logical vertex
+        ``P_s(mu)=sum_spin conj(psi_a(mu))*psi_b(mu)``: shapes
+        ``(n_pair,n_mu)`` on mesh axes ``x`` and ``y`` respectively.  The
+        duplicate layout is the same wavefunction-class convention owned by
+        :class:`gw.wavefunction_bundle.Wavefunctions`; it lets
+        :func:`intraband_chi1` form an ``(x,y)`` output without replicating a
+        vertex table or materializing any extra ``n_mu**2`` object.
+    """
+    if getattr(occupation_state, "smearing_family", None) != "mp1":
+        raise ValueError(
+            "GATE intraband_block_needs_mp1: intraband_pair_block requires "
+            "OccupationState.smearing_family == 'mp1'; got "
+            f"{getattr(occupation_state, 'smearing_family', None)!r}")
+
+    energies = np.asarray(jax.device_get(wfns.enk), dtype=np.float64)
+    occupations = np.asarray(
+        jax.device_get(occupation_state.f_kn), dtype=np.float64)
+    if energies.ndim != 2 or occupations.shape != energies.shape:
+        raise ValueError(
+            "intraband crossing block requires matching (nk,nb) energies "
+            f"and occupations; got {energies.shape} and {occupations.shape}")
+    if not np.all(np.isfinite(energies)) or not np.all(
+            np.isfinite(occupations)):
+        raise ValueError(
+            "intraband crossing block requires finite carried energies and "
+            "MP1 occupations")
+    nk, nb = energies.shape
+    if int(meta.nk_tot) != nk:
+        raise ValueError(
+            f"intraband crossing block has nk={nk}, expected "
+            f"meta.nk_tot={meta.nk_tot}")
+    if int(wfns.psi_xr.shape[0]) != nk or int(wfns.psi_xr.shape[1]) < nb:
+        raise ValueError(
+            "centroid wavefunctions do not cover the intraband energy table")
+    if int(wfns.psi_xr.shape[-1]) != int(meta.n_rmu):
+        raise ValueError(
+            "intraband crossing block centroid extent does not match meta: "
+            f"{wfns.psi_xr.shape[-1]} vs {meta.n_rmu}")
+
+    rows = np.asarray(kminq_rows, dtype=np.int64)
+    q_row = int(q_row)
+    if rows.ndim != 2 or rows.shape[1] != nk:
+        raise ValueError(
+            "intraband crossing block kminq_rows must have shape "
+            f"(n_q,{nk}); got {rows.shape}")
+    if not 0 <= q_row < rows.shape[0]:
+        raise IndexError(
+            f"intraband crossing block q_row={q_row} is outside "
+            f"[0,{rows.shape[0]})")
+    kmq = rows[q_row]
+    if not np.array_equal(np.sort(kmq), np.arange(nk, dtype=np.int64)):
+        raise ValueError(
+            "intraband crossing block k->k-q row must be a permutation of "
+            f"[0,{nk}); got row {q_row}")
+
+    # The occupation-support window is the exact overlap of the f and 1-f
+    # supports.  A no-slop MP1 overshoot therefore remains in the window.
+    # Lambda is measured only from same-band transitions, but the selected
+    # block below includes every near-degenerate interband partner too.
+    support = (
+        np.any(occupations != 0.0, axis=0)
+        & np.any(occupations != 1.0, axis=0)
+    )
+    same_band_delta = energies[kmq, :] - energies
+    lambda_q = (
+        float(np.max(np.abs(same_band_delta[:, support])))
+        if np.any(support) else 0.0
+    )
+
+    energy_b = energies[kmq, :]
+    occupation_b = occupations[kmq, :]
+    delta = energy_b[:, None, :] - energies[:, :, None]
+    delta_f = occupations[:, :, None] - occupation_b[:, None, :]
+    if np.any((delta == 0.0) & (delta_f != 0.0)):
+        raise ValueError(
+            "GATE intraband_equal_energy_occupation: exact equal-energy "
+            "pairs must carry equal MP1 occupations")
+    selected = (delta_f != 0.0) & (np.abs(delta) <= lambda_q)
+    k_idx, a_idx, b_idx = np.nonzero(selected)
+    kmq_idx = kmq[k_idx]
+    u_s = delta[k_idx, a_idx, b_idx]
+    w_s = (
+        delta_f[k_idx, a_idx, b_idx] * u_s
+        / (2.0 * np.sqrt(float(nk)))
+    )
+
+    mesh = getattr(getattr(wfns.psi_xr, "sharding", None), "mesh", None)
+    if mesh is None:
+        raise ValueError(
+            "intraband crossing block requires globally NamedSharded "
+            "centroid wavefunctions")
+    replicated_pair = NamedSharding(mesh, P(None))
+
+    def _replicated_small(value, dtype, sharding):
+        host = np.asarray(value, dtype=dtype)
+        return jax.make_array_from_callback(
+            host.shape, sharding, lambda index: host[index])
+
+    k_j = _replicated_small(k_idx, np.int32, replicated_pair)
+    kmq_j = _replicated_small(kmq_idx, np.int32, replicated_pair)
+    a_j = _replicated_small(a_idx, np.int32, replicated_pair)
+    b_j = _replicated_small(b_idx, np.int32, replicated_pair)
+
+    # Advanced indexing otherwise lets eager JAX choose a process-local
+    # result.  Pin both logical copies to their wavefunction-class layouts;
+    # chi1 then contracts directly to P('x','y') without an all-gathered
+    # pair table or a replicated N_mu**2 result.
+    vertex_key = ("intraband_pair_vertices", id(mesh))
+    vertex_kernel = _chi_minimax_kernel_cache.get(vertex_key)
+    if vertex_kernel is None:
+        def _selected_vertices(psi_xr, psi_yr, k, kmq, a, b):
+            psi_a_x = psi_xr[k, a, :, :]
+            psi_b_x = psi_xr[kmq, b, :, :]
+            psi_a_y = psi_yr[k, a, :, :]
+            psi_b_y = psi_yr[kmq, b, :, :]
+            return (
+                jnp.einsum(
+                    "tsm,tsm->tm", jnp.conj(psi_a_x), psi_b_x,
+                    optimize=True),
+                jnp.einsum(
+                    "tsm,tsm->tm", jnp.conj(psi_a_y), psi_b_y,
+                    optimize=True),
+            )
+
+        vertex_kernel = jax.jit(
+            _selected_vertices,
+            out_shardings=(
+                NamedSharding(mesh, P(None, "x")),
+                NamedSharding(mesh, P(None, "y")),
+            ),
+        )
+        _chi_minimax_kernel_cache[vertex_key] = vertex_kernel
+    p_x, p_y = vertex_kernel(
+        wfns.psi_xr, wfns.psi_yr, k_j, kmq_j, a_j, b_j)
+    return (
+        _replicated_small(u_s, np.float64, replicated_pair),
+        _replicated_small(w_s, np.float64, replicated_pair),
+        (p_x, p_y),
+    )
+
+
+def intraband_chi1(block, z):
+    r"""Evaluate one crossing block's exact known-pole chi contribution.
+
+    ``chi1(mu,nu,z) = sum_s [-2 w_s/(u_s**2-z**2)]
+    P_s(mu) conj(P_s(nu))`` in the raw-chi normalization consumed by
+    :func:`solve_w`.  ``z`` is in Ry on the real axis or upper half-plane.
+    An empty block returns exact zeros, which is the Gamma-row invariant.
+    """
+    u_s, w_s, vertices = block
+    if not isinstance(vertices, tuple) or len(vertices) != 2:
+        raise TypeError(
+            "intraband_chi1 expects the (P_x, P_y) vertex pair returned by "
+            "intraband_pair_block")
+    p_x, p_y = vertices
+    if u_s.ndim != 1 or w_s.shape != u_s.shape:
+        raise ValueError(
+            "intraband_chi1 requires matching one-dimensional u_s and w_s")
+    if (p_x.ndim != 2 or p_y.ndim != 2
+            or p_x.shape[0] != u_s.shape[0]
+            or p_y.shape[0] != u_s.shape[0]):
+        raise ValueError(
+            "intraband_chi1 vertex pair must have shapes "
+            "(n_pair,n_mu_x/y) matching u_s")
+    zc = complex(z)
+    if not (np.isfinite(zc.real) and np.isfinite(zc.imag)) or zc.imag < 0.0:
+        raise ValueError(
+            "intraband_chi1 requires a finite z on the real axis or upper "
+            f"half-plane; got {zc!r}")
+    mesh = getattr(getattr(p_x, "sharding", None), "mesh", None)
+    if mesh is None:
+        raise ValueError(
+            "intraband_chi1 requires globally NamedSharded pair vertices")
+
+    evaluate_key = ("intraband_chi1", id(mesh))
+    evaluate_kernel = _chi_minimax_kernel_cache.get(evaluate_key)
+    if evaluate_kernel is None:
+        def _evaluate(u, w, px, py, z_value):
+            coefficient = -2.0 * w / (u * u - z_value * z_value)
+            return jnp.einsum(
+                "s,sm,sn->mn", coefficient, px, jnp.conj(py),
+                optimize=True)
+
+        evaluate_kernel = jax.jit(
+            _evaluate,
+            out_shardings=NamedSharding(mesh, P("x", "y")),
+        )
+        _chi_minimax_kernel_cache[evaluate_key] = evaluate_kernel
+    z_host = np.asarray(zc, dtype=np.complex128)
+    z_value = jax.make_array_from_callback(
+        z_host.shape,
+        NamedSharding(mesh, P()),
+        lambda index: z_host[index],
+    )
+    return evaluate_kernel(
+        u_s,
+        w_s,
+        p_x,
+        p_y,
+        z_value,
+    )
+
+
 def _chi0_fractional_contour_args(
     wfns,
     time_nodes,

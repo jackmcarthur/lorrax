@@ -60,6 +60,26 @@ def test_unknown_material_class_is_a_parse_error(tmp_path):
         _config(tmp_path, "mpa_material_class = semimetal\n")
 
 
+def test_intraband_block_is_metal_only_and_does_not_move_alpha(tmp_path):
+    with pytest.raises(ValueError, match="mpa_intraband_block") as excinfo:
+        _config(tmp_path, "mpa_intraband_block = true\n")
+    assert "metal-only" in str(excinfo.value)
+
+    base = _config(tmp_path / "base", "mpa_n_poles = 4\n" + _METAL_KEYS)
+    enabled = _config(
+        tmp_path / "enabled",
+        "mpa_n_poles = 4\n" + _METAL_KEYS
+        + "mpa_intraband_block = true\n",
+    )
+    assert base.mpa.intraband_block is False
+    assert enabled.mpa.intraband_block is True
+    assert base.mpa.sampling_alpha == enabled.mpa.sampling_alpha == 1
+    np.testing.assert_array_equal(
+        sample_plan.plan_z(base.mpa.sample_plan(8.0)),
+        sample_plan.plan_z(enabled.mpa.sample_plan(8.0)),
+    )
+
+
 def test_metal_evaluator_refuses_before_creating_output(tmp_path):
     # The blanket capability gate is discharged; the entry now refuses a
     # metal plan without an OccupationState, still before any inode exists.

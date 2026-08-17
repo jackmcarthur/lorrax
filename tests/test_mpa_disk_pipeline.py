@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 
 from gw.mpa import model
@@ -94,6 +95,164 @@ def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
     ]
     for i, event in enumerate(events[1::2]):
         np.testing.assert_array_equal(event[2], 3.0 * np.asarray(chi[i]))
+
+
+@pytest.mark.parametrize(
+    "material_class", ("insulator", "metal"), ids=("Si", "Na"))
+def test_intraband_key_off_preserves_legacy_store_bytes(
+        monkeypatch, material_class):
+    """Key-off Si/Na proxy: the legacy read/solve/write bytes do not move."""
+    V = jnp.asarray(np.stack([np.eye(2), 2 * np.eye(2)]),
+                    dtype=jnp.complex128)
+    chi = tuple(
+        jnp.full((2, 2, 2), index + 1, dtype=jnp.complex128)
+        for index in range(3))
+
+    def run(config):
+        events = []
+
+        def read(_path, name, index, *, mesh_xy):
+            events.append(("read", name, index))
+            return chi[index], {}
+
+        def write(_path, name, index, value, *, mesh_xy, global_shape):
+            host = np.asarray(value)
+            events.append((
+                "write", name, index, host.dtype.str, host.shape,
+                host.tobytes(order="C")))
+
+        monkeypatch.setattr(
+            model.mpa_store, "read_w_slab_collective", read)
+        monkeypatch.setattr(
+            model.mpa_store, "write_w_slab_collective", write)
+        monkeypatch.setattr(
+            "gw.w_isdf.solve_w",
+            lambda Vq, cq, *_args, **_kw: Vq + 3.0 * cq)
+        model._solve_wc(
+            "samples.h5", V, 3, np.array([0, 1]),
+            SimpleNamespace(n_rmu=2), _mesh(), config=config)
+        return events
+
+    legacy = run(None)
+    explicit_off = run(SimpleNamespace(
+        mpa=SimpleNamespace(
+            material_class=material_class, intraband_block=False),
+        head=SimpleNamespace(uses_bgw_metal_q0shift=False)))
+    assert explicit_off == legacy
+
+
+def _block_config():
+    return SimpleNamespace(
+        mpa=SimpleNamespace(
+            material_class="metal", intraband_block=True),
+        head=SimpleNamespace(uses_bgw_metal_q0shift=False),
+    )
+
+
+def test_intraband_double_dyson_writes_the_exact_remainder(monkeypatch):
+    """WP2: every one of 24 samples gets full/remainder Dyson solves."""
+    V = np.array([
+        [[0.31, 0.04], [0.02, 0.27]],
+        [[0.24, -0.03j], [0.03j, 0.35]],
+    ], dtype=np.complex128)
+    chi = np.array([
+        [[-0.18, 0.03], [0.01, -0.14]],
+        [[-0.21, 0.02j], [-0.01j, -0.16]],
+    ], dtype=np.complex128)
+    chi1 = np.array([
+        np.zeros((2, 2), np.complex128),
+        [[-0.04, 0.01j], [-0.02j, -0.03]],
+    ])
+    chi_samples = np.stack([
+        chi + (index * 1.0e-3) * np.eye(2)[None, :, :]
+        for index in range(24)
+    ])
+    chi1_samples = np.stack([
+        chi1 * (1.0 + index / 100.0)
+        for index in range(24)
+    ])
+    written = []
+    solve_inputs = []
+
+    def read(_path, name, index, *, mesh_xy):
+        if name == model._CHI:
+            return jnp.asarray(chi_samples[index]), {}
+        if name == model._CHI1:
+            return jnp.asarray(chi1_samples[index]), {}
+        raise AssertionError(name)
+
+    def solve(Vq, cq, *_args, **_kwargs):
+        c_host = np.asarray(cq)
+        solve_inputs.append(c_host.copy())
+        out = np.stack([
+            np.linalg.solve(np.eye(2) - V[i] @ c_host[i], V[i])
+            for i in range(2)
+        ])
+        return jnp.asarray(out)
+
+    monkeypatch.setattr(model.mpa_store, "read_w_slab_collective", read)
+    monkeypatch.setattr(
+        model.mpa_store, "write_w_slab_collective",
+        lambda _p, name, i, value, **_k: written.append(
+            (name, i, np.asarray(value))))
+    monkeypatch.setattr("gw.w_isdf.solve_w", solve)
+
+    model._solve_wc(
+        "samples.h5", jnp.asarray(V),
+        np.linspace(0.2, 1.3, 24) + 0.1j,
+        np.array([0, 1]), SimpleNamespace(n_rmu=2), _mesh(),
+        config=_block_config())
+
+    assert len(solve_inputs) == 48
+    assert [(name, i) for name, i, _ in written] == [
+        (model._WC, index) for index in range(24)
+    ]
+    for index in range(24):
+        sample_chi = chi_samples[index]
+        sample_chi1 = chi1_samples[index]
+        np.testing.assert_array_equal(solve_inputs[2 * index], sample_chi)
+        np.testing.assert_allclose(
+            solve_inputs[2 * index + 1], sample_chi - sample_chi1,
+            rtol=0, atol=0)
+        W = np.stack([
+            np.linalg.solve(np.eye(2) - V[i] @ sample_chi[i], V[i])
+            for i in range(2)
+        ])
+        W0 = np.stack([
+            np.linalg.solve(
+                np.eye(2) - V[i] @ (sample_chi[i] - sample_chi1[i]),
+                V[i])
+            for i in range(2)
+        ])
+        np.testing.assert_allclose(
+            written[index][2], W0 - V, rtol=2e-15, atol=2e-15)
+        # Direct sample-exactness reconstruction: DeltaW_exact is the
+        # second Dyson's exact difference, never fitted or linearized.
+        delta_w_exact = W - W0
+        np.testing.assert_allclose(
+            W0 + delta_w_exact, W, rtol=2e-15, atol=2e-15)
+
+
+def test_intraband_double_dyson_refuses_a_nonempty_gamma(monkeypatch):
+    V = jnp.eye(2, dtype=jnp.complex128)[None, :, :]
+    chi = jnp.zeros_like(V)
+    chi1 = jnp.ones_like(V)
+
+    def read(_path, name, index, *, mesh_xy):
+        if name == model._CHI:
+            return chi, {}
+        # The first sample is clean: the runtime invariant must remain live
+        # on every one of the later samples too.
+        return (jnp.zeros_like(chi1) if index == 0 else chi1), {}
+
+    monkeypatch.setattr(model.mpa_store, "read_w_slab_collective", read)
+    monkeypatch.setattr(
+        model.mpa_store, "write_w_slab_collective", lambda *a, **k: None)
+    monkeypatch.setattr("gw.w_isdf.solve_w", lambda Vq, *_a, **_k: Vq)
+    with pytest.raises(ValueError, match="intraband_gamma_empty"):
+        model._solve_wc(
+            "samples.h5", V, np.array([0.2j, 0.4j]), np.array([0]),
+            SimpleNamespace(n_rmu=2), _mesh(), config=_block_config())
 
 
 def test_fit_walk_consumes_wc_not_chi(monkeypatch):

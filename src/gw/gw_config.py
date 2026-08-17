@@ -1736,6 +1736,11 @@ _DEFAULTS = {
     "mpa_n_poles": 8,
     "mpa_material_class": "insulator",
     "mpa_sampling_alpha": 1,
+    # Exact finite-q crossing-block subtraction before the MPA body fit.
+    # Default off preserves every pre-feature sample/store byte.  This is
+    # metal-only physics, not a sampling-grid variant: alpha remains its
+    # independent production/default value of 1.
+    "mpa_intraband_block": False,
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
     # Height (Ry) of the metal near line's FIRST sample, z_1^1 = i*shift --
@@ -3109,6 +3114,7 @@ class MPAConfig:
     n_poles: int
     material_class: str
     sampling_alpha: int
+    intraband_block: bool
     varpi_near_ry: float
     varpi_far_ry: float
     #: Metal near-line origin shift in Ry; ``None`` = the published
@@ -3147,6 +3153,10 @@ class MPAConfig:
                 f"got {self.material_class!r}")
         if self.sampling_alpha not in (1, 2):
             raise ValueError("mpa_sampling_alpha must be 1 or 2")
+        if self.intraband_block and self.material_class != "metal":
+            raise ValueError(
+                "mpa_intraband_block is a metal-only key: set "
+                "mpa_material_class = metal, or remove/disable the block")
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
@@ -4015,6 +4025,7 @@ class LorraxConfig:
             n_poles=int(_g("mpa_n_poles")),
             material_class=str(_g("mpa_material_class")).strip().lower(),
             sampling_alpha=int(_g("mpa_sampling_alpha")),
+            intraband_block=bool(_g("mpa_intraband_block")),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
             metal_origin_shift_ry=(

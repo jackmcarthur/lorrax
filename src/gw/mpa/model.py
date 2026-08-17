@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from file_io import mpa_store
@@ -12,7 +13,19 @@ from gw.mpa import evaluator, fit_driver, sample_plan
 
 
 _CHI = "chi_qmunu_z"
+_CHI1 = "chi1_qmunu_z"
 _WC = "Wc_qmunu_z"
+
+
+def _intraband_enabled(config):
+    """Return the declared crossing-block state; missing means legacy off."""
+    mpa = None if config is None else getattr(config, "mpa", None)
+    enabled = bool(getattr(mpa, "intraband_block", False))
+    if enabled and getattr(mpa, "material_class", None) != "metal":
+        raise ValueError(
+            "GATE mpa_intraband_block_metal_only: mpa_intraband_block is "
+            "defined only for mpa_material_class = metal")
+    return enabled
 
 
 def make_mpa_plan(config, quad):
@@ -139,7 +152,7 @@ def _solve_wc(
     print_fn=print,
     distrib_la_batched_route: str = "auto",
 ):
-    """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
+    """THE DEFAULT ``wc_source``: full W for the head, remainder Wc to fit.
 
     Signature IS the seam (see :func:`build_mpa_fit`'s ``wc_source``): the
     sample store, the wedge V, the z-list, the wedge q index and the mesh.
@@ -158,6 +171,8 @@ def _solve_wc(
         finalize_iteration_head_sample,
     )
     from gw.w_isdf import solve_w
+
+    intraband = _intraband_enabled(config)
 
     raw_z = np.asarray(z)
     if raw_z.ndim == 0 and np.issubdtype(raw_z.dtype, np.integer):
@@ -210,6 +225,25 @@ def _solve_wc(
     for index in range(n_z):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
+        chi1 = None
+        chi_remainder = None
+        if intraband:
+            chi1, _ = mpa_store.read_w_slab_collective(
+                sample_path, _CHI1, index, mesh_xy=mesh_xy)
+            gamma_matches = np.flatnonzero(
+                np.asarray(q_idx, dtype=np.int64) == 0)
+            if gamma_matches.size != 1:
+                raise ValueError(
+                    "GATE intraband_gamma_empty: an enabled intraband block "
+                    "requires exactly one Gamma row in the stored q wedge")
+            gamma_abs = float(jnp.max(jnp.abs(
+                chi1[int(gamma_matches[0])])).block_until_ready())
+            if gamma_abs != 0.0:
+                raise ValueError(
+                    "GATE intraband_gamma_empty: chi1(Gamma) must be "
+                    "identically zero at every sample; "
+                    f"index={index}, max_abs={gamma_abs:.16e}")
+            chi_remainder = chi - chi1
         chi_q0 = None
         if bgw_q0 is not None:
             # ``solve_w`` donates the full chi buffer.  Retain only one
@@ -221,6 +255,13 @@ def _solve_wc(
             V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
         W.block_until_ready()
+        W0 = None
+        if intraband:
+            W0 = solve_w(
+                V, chi_remainder, meta, mesh_xy,
+                dyson_solver=dyson_solver,
+                distrib_la_batched_route=distrib_la_batched_route)
+            W0.block_until_ready()
         if bgw_q0 is not None:
             from gw.head_correction import (
                 bgw_q0shift_head_sample,
@@ -258,12 +299,17 @@ def _solve_wc(
                 config=config,
                 mesh=mesh_xy,
             ))
-        Wc = W - V
+        # The full W above remains the sole head input.  Only the body fit
+        # target changes: with the crossing block enabled it is the exact
+        # double-Dyson remainder W0-V at every stamped sample.
+        Wc = (W0 if intraband else W) - V
         Wc.block_until_ready()
         mpa_store.write_w_slab_collective(
             sample_path, _WC, index, Wc, mesh_xy=mesh_xy,
             global_shape=shape)
         del chi, W, Wc
+        if intraband:
+            del chi1, chi_remainder, W0
 
     if head_response is None:
         return tuple(head_samples) if bgw_q0 is not None else None
@@ -343,6 +389,7 @@ def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
     energy_reference, occupation_state, write_full, write_wedge,
     static_gamma_override, gamma_row, kminq_rows,
+    intraband_blocks=None, write_intraband=None,
 ):
     """Evaluate every plan point through its route's kernel.
 
@@ -363,6 +410,7 @@ def _evaluate_samples(
         compute_chi0_contour,
         compute_chi0_contour_fractional,
         compute_chi0_static_fractional,
+        intraband_chi1,
         occupation_support_bandwidth,
     )
 
@@ -380,6 +428,24 @@ def _evaluate_samples(
             wfns.enk, occupation_state.f_kn,
             occupation_window_threshold=occ_window)
 
+    if (intraband_blocks is None) != (write_intraband is None):
+        raise ValueError(
+            "intraband sample plumbing requires both intraband_blocks and "
+            "write_intraband, or neither")
+
+    def _emit(point, chi, *, wedge):
+        (write_wedge if wedge else write_full)(point, chi)
+        if intraband_blocks is None:
+            return
+        # The shifted near_00 grid coordinate stores the exact static
+        # divided-difference value.  Subtract the matching exact chi1(0),
+        # not chi1(i*shift), so the split is algebraically exact.
+        z_block = 0.0j if point["role"] == "near_00" else point["z"]
+        chi1_rows = [
+            intraband_chi1(block, z_block) for block in intraband_blocks
+        ]
+        write_intraband(point, jnp.stack(chi1_rows, axis=0))
+
     for point in routes["existing"]:
         if not metal:
             used = quad if point["character"] == "static" else \
@@ -395,7 +461,7 @@ def _evaluate_samples(
                 and static_gamma_override is not None
             ):
                 chi = chi.at[0].set(static_gamma_override[0])
-            write_full(point, chi)
+            _emit(point, chi, wedge=False)
         elif point["role"].startswith("near"):
             # The shifted-origin slot stores the exact static value; the
             # fit reads sample_z = i*varpi_1, and the inconsistency is
@@ -405,7 +471,7 @@ def _evaluate_samples(
                 kminq_rows=kminq_rows)
             if static_gamma_override is not None and gamma_row is not None:
                 chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
-            write_wedge(point, chi_w)
+            _emit(point, chi_w, wedge=True)
         else:
             # Far pure-imaginary point: the fractional contour is cheap at
             # O(1) Ry line heights (31 nodes at varpi=1, tol 1e-6).
@@ -420,7 +486,7 @@ def _evaluate_samples(
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
                 occupation_window_threshold=occ_window)
-            write_full(point, chi)
+            _emit(point, chi, wedge=False)
 
     for varpi_i, points in routes["lines"]:
         z = np.asarray([point["z"] for point in points])
@@ -451,7 +517,7 @@ def _evaluate_samples(
                 energy_reference=energy_reference)
         values = (values,) if z.size == 1 else values
         for point, chi in zip(points, values):
-            write_full(point, chi)
+            _emit(point, chi, wedge=False)
 
 
 def build_mpa_fit(
@@ -517,6 +583,25 @@ def build_mpa_fit(
                 "single-frequency vhead/whead overrides")
 
     q_idx, tables, closure_verdict = _q_wedge(sym, centroid_indices, meta)
+    metal = config.mpa.material_class != "insulator"
+    kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
+    gamma_matches = np.flatnonzero(np.asarray(q_idx, np.int64) == 0)
+    gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
+    intraband_blocks = None
+    if _intraband_enabled(config):
+        from gw.w_isdf import intraband_pair_block
+
+        intraband_blocks = [
+            intraband_pair_block(
+                wfns, meta, occupation_state, kminq_rows, q_row)
+            for q_row in range(int(q_idx.size))
+        ]
+        if gamma_row is None or int(intraband_blocks[gamma_row][0].size) != 0:
+            count = -1 if gamma_row is None else int(
+                intraband_blocks[gamma_row][0].size)
+            raise ValueError(
+                "GATE intraband_gamma_empty: the exact crossing selection "
+                "must be empty at Gamma; selected pair count=" + str(count))
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
@@ -550,15 +635,14 @@ def build_mpa_fit(
         sample_path, _CHI, mode="w", **common)
     mpa_store.allocate_w_omega_collective(
         sample_path, _WC, mode="a", **common)
+    if intraband_blocks is not None:
+        mpa_store.allocate_w_omega_collective(
+            sample_path, _CHI1, mode="a", **common)
 
     routes = sample_plan.plan_routes(plan)
-    metal = config.mpa.material_class != "insulator"
-    kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
     static_gamma_override = (
         iteration_head_response.static_chi_body_gamma
         if iteration_head_response is not None else None)
-    gamma_matches = np.flatnonzero(np.asarray(q_idx, np.int64) == 0)
-    gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
 
     def _write_full(point, chi):
         _write_sample(
@@ -571,13 +655,24 @@ def build_mpa_fit(
             sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
             global_shape=(z_all.size, q_idx.size, meta.n_rmu, meta.n_rmu))
 
+    def _write_intraband(point, chi1_wedge):
+        chi1_wedge.block_until_ready()
+        mpa_store.write_w_slab_collective(
+            sample_path, _CHI1, point["index"], chi1_wedge,
+            mesh_xy=mesh_xy,
+            global_shape=(z_all.size, q_idx.size,
+                          meta.n_rmu, meta.n_rmu))
+
     _evaluate_samples(
         wfns, routes, quad, config, meta, mesh_xy,
         energy_reference=energy_reference,
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,
         static_gamma_override=static_gamma_override,
-        gamma_row=gamma_row, kminq_rows=kminq_rows)
+        gamma_row=gamma_row, kminq_rows=kminq_rows,
+        intraband_blocks=intraband_blocks,
+        write_intraband=(
+            _write_intraband if intraband_blocks is not None else None))
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
     if wc_source is None:

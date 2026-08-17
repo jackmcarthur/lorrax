@@ -562,3 +562,67 @@ def test_metal_plan_dispatch_census(monkeypatch):
             occupation_state=None,
             write_full=lambda p, chi: None, write_wedge=lambda p, chi: None,
             static_gamma_override=None, gamma_row=None, kminq_rows=None)
+
+
+def test_intraband_sample_plumbing_subtracts_all_24_plan_points(monkeypatch):
+    """WP2 census: Np=12 means exactly 24 analytic chi1 sample slabs."""
+    from gw.mpa import model, sample_plan
+
+    n_q, n_mu = 2, 2
+
+    def _fractional(*args, **kwargs):
+        z = np.asarray(args[3]).reshape(-1)
+        rows = tuple(np.zeros((n_q, n_mu, n_mu), np.complex128)
+                     for _ in z)
+        return rows[0] if len(rows) == 1 else rows
+
+    monkeypatch.setattr(
+        w_isdf, "compute_chi0_contour_fractional", _fractional)
+    monkeypatch.setattr(
+        w_isdf, "compute_chi0_static_fractional",
+        lambda *a, **k: np.zeros((n_q, n_mu, n_mu), np.complex128))
+    monkeypatch.setattr(
+        w_isdf, "occupation_support_bandwidth", lambda *a, **k: 3.0)
+    monkeypatch.setattr(
+        model.evaluator, "damped_line_rule",
+        lambda *a, **k: {"t": np.array([0.2]), "h": np.array([0.3])})
+
+    calls = []
+
+    def _chi1(block, z):
+        calls.append((block, complex(z)))
+        return np.full((n_mu, n_mu), complex(z), np.complex128)
+
+    monkeypatch.setattr(w_isdf, "intraband_chi1", _chi1)
+    config = SimpleNamespace(
+        mpa=SimpleNamespace(
+            material_class="metal", intraband_block=True,
+            occupation_window_threshold=0.995),
+        minimax_config=SimpleNamespace(target_error=1e-6, max_nodes=64))
+    state = SimpleNamespace(
+        f_kn=np.array([[1.0, 0.5, 0.0]]), mu_ry=0.1,
+        smearing_family="mp1", smearing_width_ry=0.04)
+    routes = sample_plan.plan_routes(sample_plan.mpa_plan(
+        12, 3.0, material_class="metal", energy_unit="Ry"))
+    written = []
+
+    model._evaluate_samples(
+        SimpleNamespace(enk=np.array([[0.0]]), occ=None), routes,
+        SimpleNamespace(x_max=3.0), config, meta=None, mesh_xy=None,
+        energy_reference=0.0, occupation_state=state,
+        write_full=lambda p, chi: None,
+        write_wedge=lambda p, chi: None,
+        static_gamma_override=None, gamma_row=0,
+        kminq_rows=np.zeros((n_q, 1), np.int32),
+        intraband_blocks=("q0", "q1"),
+        write_intraband=lambda p, chi: written.append(
+            (p["index"], p["role"], np.asarray(chi))))
+
+    assert len(written) == 24
+    assert sorted(index for index, _role, _chi in written) == list(range(24))
+    assert len(calls) == 24 * n_q
+    origin = [row for row in written if row[1] == "near_00"]
+    assert len(origin) == 1
+    assert np.all(origin[0][2] == 0.0), (
+        "the shifted-origin slot stores static chi, so it must subtract "
+        "the matching analytic chi1(0)")
