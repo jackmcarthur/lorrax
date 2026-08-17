@@ -563,14 +563,15 @@ def _evaluate_gap_chi(
     wfns, occupation_state, config, meta, mesh_xy,
 ):
     """The design's five held-out points on the 0.2-Ry line."""
-    from gw.mpa import evaluator
+    from gw.mpa import evaluator, intraband_block
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
         occupation_support_bandwidth,
     )
 
+    z0 = intraband_block.GAP_CERTIFICATE_LOWEST_REAL_RY
     z_gap = np.asarray(
-        [0.04 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
+        [z0 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
          0.30 + 0.2j, 0.60 + 0.2j], dtype=np.complex128)
     occ_window = float(config.mpa.occupation_window_threshold)
     delta_max = occupation_support_bandwidth(

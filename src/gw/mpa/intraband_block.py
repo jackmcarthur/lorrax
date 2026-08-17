@@ -35,6 +35,7 @@ MOMENT_REL_TOL = SAMPLE_REL_TOL
 _V_PLATEAU_REL_TOL = 1.0e-3
 MIN_CLUSTERS = 3
 MAX_CLUSTERS = 6
+GAP_CERTIFICATE_LOWEST_REAL_RY = 0.04
 _QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
 _RESOLVENT_BATCH_NODES = 8
 
@@ -273,10 +274,11 @@ def _contour_geometry(pair_block, W0bar, *, origin_gap=None):
     # strip missed half of both exact totals.  That is a mandatory sum-rule
     # refusal, not a physical model.
     zeta_min = -interaction
-    # The initial exclusion is the lowest certified positive bisection edge,
-    # not the machine-epsilon slit previously forced by signed MP1 weights.
-    # A caller may shrink it, but only after the held-out gap certificate asks
-    # for more origin resolution.  M/V closure remains independently binding.
+    # Low-level contour callers retain the smallest data-resolved exclusion.
+    # The production adaptive driver overrides this with
+    # ``_certified_origin_gap``.  Keeping these policies separate matters for
+    # the D_M dichotomy: diagnostic/oracle calls must not silently exclude a
+    # finite screened mode merely because no gap certificate was supplied.
     minimum_gap = np.finfo(np.float64).eps * zeta_max
     initial_gap = max(0.25 * float(np.min(positive_u2)), minimum_gap)
     zero_gap = initial_gap if origin_gap is None else float(origin_gap)
@@ -294,21 +296,46 @@ def _contour_geometry(pair_block, W0bar, *, origin_gap=None):
     return zeta_min, zero_gap, zeta_max, height
 
 
+def _certified_origin_gap(pair_block, W0bar):
+    """Initial production exclusion from the lowest held-out edge.
+
+    The held-out certificate is expressed in real frequency ``z`` whereas
+    the contour is in ``zeta=z**2``.  This policy must not depend on the
+    smallest bare transition: production crossing rows contain arbitrarily
+    near-degenerate pairs, and D_M/D_V adjudicate anything excluded here.
+    """
+    _left, _data_gap, zeta_max, _height = _contour_geometry(pair_block, W0bar)
+    minimum_gap = np.finfo(np.float64).eps * zeta_max
+    return max(
+        min(GAP_CERTIFICATE_LOWEST_REAL_RY ** 2, 0.5 * zeta_max),
+        minimum_gap,
+    )
+
+
 def _initial_intervals(pair_block, W0bar, *, origin_gap=None):
     """Three certified tiles, extending negative for signed MP1 weights."""
     left, zero_gap, right, _height = _contour_geometry(
         pair_block, W0bar, origin_gap=origin_gap)
     u2 = np.sort(np.square(np.abs(_host_replicated(pair_block[0]))))
+    # An adaptive gap may exclude many bare near-zero pairs.  They are
+    # intentionally adjudicated by D_M/D_V, so they cannot also nominate a
+    # positive-interval split below the active contour edge.
+    u2 = u2[(u2 >= zero_gap) & (u2 <= right)]
     w = _host_replicated(pair_block[1])
     negative_active = bool(np.any(w < 0.0) and left < -zero_gap)
     n_positive = MIN_CLUSTERS - int(negative_active)
     edges = [zero_gap]
-    gap_order = np.argsort(np.diff(u2))[::-1][:n_positive - 1]
-    for gap_index in np.sort(gap_order):
-        edge = 0.5 * (float(u2[gap_index]) + float(u2[gap_index + 1]))
-        edge = min(max(edge, np.nextafter(edges[-1], np.inf)), right)
-        edges.append(edge)
-    edges.append(right)
+    if u2.size >= n_positive:
+        gap_order = np.argsort(np.diff(u2))[::-1][:n_positive - 1]
+        for gap_index in np.sort(gap_order):
+            edge = 0.5 * (float(u2[gap_index]) + float(u2[gap_index + 1]))
+            edge = min(max(edge, np.nextafter(edges[-1], np.inf)), right)
+            edges.append(edge)
+        edges.append(right)
+    else:
+        # Preserve the three-cluster starting contract even when the adaptive
+        # gap leaves fewer bare energies available to nominate internal cuts.
+        edges = list(np.linspace(zero_gap, right, n_positive + 1))
     if any(not lo < hi for lo, hi in zip(edges[:-1], edges[1:])):
         edges = list(np.linspace(zero_gap, right, n_positive + 1))
     intervals = ([(float(left), float(-zero_gap))]
@@ -799,7 +826,9 @@ def build_row(
 
     diagnostic_z = tuple(
         complex(value) for value in np.asarray(z_samples).reshape(-1))
-    _left, origin_gap, zeta_max, _height = _contour_geometry(pair_block, W0bar)
+    _left, _unused_gap, zeta_max, _height = _contour_geometry(
+        pair_block, W0bar)
+    origin_gap = _certified_origin_gap(pair_block, W0bar)
     minimum_gap = np.finfo(np.float64).eps * zeta_max
     intervals = _initial_intervals(
         pair_block, W0bar, origin_gap=origin_gap)
@@ -913,6 +942,7 @@ def pad_row(row, n_poles):
 
 
 __all__ = [
+    "GAP_CERTIFICATE_LOWEST_REAL_RY",
     "ClusterClosure",
     "IntrabandRow",
     "MAX_CLUSTERS",

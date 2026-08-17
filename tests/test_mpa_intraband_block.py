@@ -253,16 +253,19 @@ def test_signed_measure_uses_interval_width_not_deleted_trace_variance():
 def test_adaptive_and_machine_origin_gaps_have_identical_total_static():
     """WP3-A3 gap A/B: deflation routing cannot change the z=0 total."""
     mesh, W0, vertices, u, w, _block = _fixture(n_pair=18)
-    signed_w = w.copy()
-    signed_w[::2] *= -4.0
+    # Keep all finite screened modes well outside the certified origin gap;
+    # the separate D_M regression covers the mandatory refusal when one is
+    # excluded.  This A/B isolates the static identity of the two legal gaps.
+    u = u + 0.04
     block = (
         _put(mesh, u, P(None)),
-        _put(mesh, signed_w, P(None)),
+        _put(mesh, w, P(None)),
         (_put(mesh, vertices, P(None, "x")),
          _put(mesh, vertices, P(None, "y"))),
     )
     W0j = _put(mesh, W0, P("x", "y"))
-    _left, adaptive_gap, zeta_max, _height = IB._contour_geometry(block, W0j)
+    _left, _data_gap, zeta_max, _height = IB._contour_geometry(block, W0j)
+    adaptive_gap = IB._certified_origin_gap(block, W0j)
     machine_gap = np.finfo(np.float64).eps * zeta_max
     assert adaptive_gap > machine_gap
 
@@ -277,6 +280,28 @@ def test_adaptive_and_machine_origin_gaps_have_identical_total_static():
             Omega, Bp, 0.0j)))
     scale = max(np.linalg.norm(statics[0]), np.finfo(np.float64).tiny)
     assert np.linalg.norm(statics[0] - statics[1]) / scale <= 1.0e-12
+
+
+def test_near_degenerate_pair_does_not_collapse_the_adaptive_origin_gap():
+    """The real production signature must start at the certified edge."""
+    mesh, W0, vertices, u, w, _block = _fixture(n_pair=18)
+    u[:-1] = np.linspace(
+        np.sqrt(np.finfo(np.float64).eps) * 1.0e-6, 0.039, len(u) - 1)
+    block = (
+        _put(mesh, u, P(None)),
+        _put(mesh, w, P(None)),
+        (_put(mesh, vertices, P(None, "x")),
+         _put(mesh, vertices, P(None, "y"))),
+    )
+    W0j = _put(mesh, W0, P("x", "y"))
+    _left, _data_gap, zeta_max, _height = IB._contour_geometry(block, W0j)
+    gap = IB._certified_origin_gap(block, W0j)
+    machine_gap = np.finfo(np.float64).eps * zeta_max
+    assert gap == pytest.approx(IB.GAP_CERTIFICATE_LOWEST_REAL_RY ** 2)
+    assert gap > machine_gap
+    intervals = IB._initial_intervals(block, W0j, origin_gap=gap)
+    assert len(intervals) == IB.MIN_CLUSTERS
+    assert all(hi < 0.0 or lo >= gap for lo, hi in intervals)
 
 
 def test_contour_sum_rules_close_to_1e_minus_12_relative():
