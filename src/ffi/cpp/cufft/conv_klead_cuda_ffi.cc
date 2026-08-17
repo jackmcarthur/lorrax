@@ -1,21 +1,17 @@
-// conv_klead_cuda_ffi.cc — half-absorbed Sigma fused convolution, CUDA leg.
+// conv_klead_cuda_ffi.cc — zero-transpose Sigma fused convolution, CUDA leg.
 //
 //   U[k,a,mx,b,my] = scale * FFT_k(IFFT_k(T) * IFFT_k(W)[k,mx,my])
 //
 // The public T/U seam stays in Sigma's native k-leading layout.  The Python
-// wrapper pays the conditionally-authorized ONE transpose on entry and hands
-// this handler Tm=(a,mx,b,my,nk), so consecutive x threads load a contiguous
-// k-row exactly like the certified k-minor sibling.  W remains k-leading and
-// is transformed inside the call; U is emitted k-leading directly from the
-// store, absorbing the would-be output transpose.  Once resident, the direct
+// wrapper hands this handler T=(nk,a,mx,b,my) without a pack.  W remains
+// k-leading and is transformed inside the call; U is emitted k-leading
+// directly from the store.  Once resident, the direct
 // twiddle-ring passes are unchanged: runtime axis extents, no per-size
 // compilation, odd shared row stride, device-derived residency, and a named
 // refusal.
 //
-// This remains one kernel implementation, selected only after the original
-// native-copy prototype measured >20% below the k-minor per-byte rate.  The
-// plan-based k-leading member (lorrax_mklfft_gw_conv) remains the caller's
-// unsupported-shape fallback.
+// This remains one kernel implementation.  The plan-based k-leading member
+// (lorrax_mklfft_gw_conv) remains the caller's unsupported-shape fallback.
 
 #include <algorithm>
 #include <atomic>
@@ -243,15 +239,16 @@ __device__ __forceinline__ void lrx_conv_body(
     }
     __syncthreads();
 
-    // Half-absorbed input: Tm is k-minor, so x threads read its contiguous
-    // k-row.  W stays k-leading; its separate load keeps j fast so adjacent
-    // flattened threads read adjacent mu-nu elements at fixed k.
+    // Native input: T stays k-leading across the FFI.  This baseline maps x
+    // threads to k and therefore reads one transform row at stride Tg; the
+    // staged successor replaces only this load map.  W's separate load keeps
+    // j fast so adjacent flattened threads read adjacent mu-nu elements.
     {
         const int j = threadIdx.y;
         const long long r = r0 + j;
         for (int k = lane; k < nk; k += tpr) {
             lrx_c2 tv = {0.0, 0.0};
-            if (r < Tg) tv = tin[r * nk + k];
+            if (r < Tg) tv = tin[(long long)k * Tg + r];
             ts[(long long)j * SP + k] = tv;
         }
     }
@@ -605,17 +602,16 @@ static ffi::Error ConvKLeadDispatch(
     if (td.size() != 5 || wd.size() != 3 || ud.size() != 5) {
         return ffi::Error(
             ffi::ErrorCode::kInvalidArgument,
-            "conv_klead: expected Tm (a,mx,b,my,nk), U (nk,a,mx,b,my), "
-            "and W (nk,mx,my).");
+            "conv_klead: expected T/U (nk,a,mx,b,my) and W (nk,mx,my).");
     }
-    const int64_t a = td[0], mx = td[1], b = td[2], my = td[3], nk = td[4];
+    const int64_t nk = td[0], a = td[1], mx = td[2], b = td[3], my = td[4];
     if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||
         wd[0] != nk || wd[1] != mx || wd[2] != my ||
         ud[0] != nk || ud[1] != a || ud[2] != mx || ud[3] != b ||
         ud[4] != my) {
         std::ostringstream os;
-        os << "conv_klead: shape mismatch — Tm(a=" << a << ",mx=" << mx
-           << ",b=" << b << ",my=" << my << ",nk=" << nk << ") vs W("
+        os << "conv_klead: shape mismatch — T(nk=" << nk << ",a=" << a
+           << ",mx=" << mx << ",b=" << b << ",my=" << my << ") vs W("
            << wd[0] << "," << wd[1] << "," << wd[2] << ") vs kgrid ("
            << nkx << "," << nky << "," << nkz << ").";
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
@@ -656,7 +652,7 @@ static ffi::Error ConvKLeadDispatch(
         if (!once.exchange(true)) {
             std::fprintf(stderr,
                 "[conv_klead] first call: kgrid=(%lld,%lld,%lld) nk=%lld "
-                "Tm=(%lld,%lld,%lld,%lld,nk) trail=%lld scale=%.9e rb=%d "
+                "T=(nk,%lld,%lld,%lld,%lld) trail=%lld scale=%.9e rb=%d "
                 "tpr=%d ept=%d sp=%d smem=%d B grid=%lld output=k-leading\n",
                 (long long)nkx, (long long)nky, (long long)nkz,
                 (long long)nk, (long long)a, (long long)mx, (long long)b,

@@ -48,13 +48,13 @@ def test_loader_and_isolated_build_target_are_registered():
     assert "$<TARGET_OBJECTS:build_conv_klead_cuda>" in cmake
 
 
-def test_half_absorbed_path_has_one_input_pack_and_no_output_pack():
+def test_zero_transpose_path_passes_native_kleading_t_directly():
     root = Path(__file__).resolve().parents[1]
     text = (root / "src/ffi/fft.py").read_text()
     body = text.split("def make_conv_klead_ffi(", 1)[1].split(
         "# ===========================================================================", 1)[0]
-    assert body.count("jnp.moveaxis(t_local, 0, -1)") == 1
-    assert "jnp.moveaxis(" not in body.split("ffi_call", 1)[1]
+    assert "jnp.moveaxis(" not in body
+    assert "t_local, w_local, **attrs" in body
     assert "input_output_aliases" not in body
 
 

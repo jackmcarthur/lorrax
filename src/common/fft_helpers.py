@@ -481,11 +481,11 @@ def make_fused_conv_klead(
 ) -> Callable:
     """Direct fused conv in Sigma's native **k-LEADING** layout.
 
-    Same public shapes as :func:`make_flat_k_gw_conv`.  The measured
-    half-absorbed form packs T k-minor once on input; the CUDA-only handler
-    keeps T and W row pairs in shared memory, performs the two inverse
-    transforms, multiply, and forward transform in one traversal, and emits
-    the result in Sigma's native k-leading layout from its store.
+    Same public shapes as :func:`make_flat_k_gw_conv`.  The CUDA-only handler
+    keeps the public T/W/U arrays k-leading, assembles T and W row pairs in
+    shared memory, performs the two inverse transforms, multiply, and forward
+    transform in one traversal, and emits the result in Sigma's native
+    k-leading layout from its store.
     It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
     plan-based member as the off/unsupported path.
     """

@@ -516,9 +516,9 @@ def make_gw_conv_ffi(
 # ===========================================================================
 # This member keeps the same (nk,a,mx,b,my)/(nk,mx,my) ABI as gw_conv but
 # replaces the nine cuFFT axis passes with one direct, SMEM-resident kernel.
-# Both public operands arrive k-leading.  The measured half-absorbed factory
-# packs T once so the kernel's x threads load contiguous k; W remains
-# k-leading and the store emits U k-leading without an output pack.
+# Both public operands arrive k-leading.  The zero-transpose factory keeps T,
+# W and U k-leading end to end.  The handler assembles resident k
+# rows itself and emits U k-leading without an output pack.
 # It transforms W inside the call because Sigma has no solve-wide W_R cache.
 #
 # Default OFF: production continues to use GW_CONV_TARGET unless the caller's
@@ -551,8 +551,8 @@ CONV_KLEAD_GATE = Gate(
         "CUDA": (
             "[conv_klead] Sigma k-leading IFFT(G)·IFFT(W)·FFT -> direct "
             "CUDA FFI handler ({target}): one SMEM-resident traversal, "
-            "runtime twiddle-ring extents, one input pack selected by the "
-            "copy-rate gate, k-leading store, c128 only."),
+            "runtime twiddle-ring extents, zero global transposes, "
+            "k-leading store, c128 only."),
     },
     refuse_platform_msg=(
         "LORRAX_CONV_KLEAD_FFI=on requires Sigma's direct k-leading CUDA "
@@ -664,11 +664,10 @@ def make_conv_klead_ffi(
     """Direct fused convolution for Sigma's native **k-leading** layout.
 
     Returns ``fn(T, W) -> U`` for public ``T/U (nk,a,mx,b,my)`` and
-    ``W (nk,mx,my)``.  The selected half-absorbed form pays one explicit
-    ``T -> (a,mx,b,my,nk)`` transpose on entry, then executes both inverse
-    transforms, the broadcast multiply, the forward transform, and all norms
-    in one CUDA kernel whose store emits U k-leading.  There is no transpose
-    on output.
+    ``W (nk,mx,my)``.  T, W and U remain k-leading across the call.  The CUDA
+    handler executes both inverse transforms, the broadcast multiply, the
+    forward transform, and all norms, and its store emits U k-leading.  There
+    is no global transpose on either side.
     """
     require_conv_klead(mesh)
     nkx, nky, nkz = (int(v) for v in kgrid)
@@ -691,13 +690,9 @@ def make_conv_klead_ffi(
             raise ValueError(
                 f"conv_klead T/W shard shapes disagree: {t_local.shape} vs "
                 f"{w_local.shape}.")
-        # Conditional fallback selected by measurement: ONE explicit pack on
-        # input makes k contiguous for the certified direct-copy pattern.  The
-        # handler absorbs the inverse permutation into its k-leading store.
-        t_minor = jnp.moveaxis(t_local, 0, -1)
         out_t = jax.ShapeDtypeStruct(t_local.shape, t_local.dtype)
         return jax.ffi.ffi_call(CONV_KLEAD_TARGET, out_t)(
-            t_minor, w_local, **attrs)
+            t_local, w_local, **attrs)
 
     from common.shard_map import shard_map
     _sm = shard_map(
