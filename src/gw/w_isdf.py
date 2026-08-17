@@ -1200,9 +1200,12 @@ def _chi0_fractional_contour_args(
     f_slice, u_slice = _occupation_support_slices(
         occ_full, occupation_window_threshold)
     eref = 0.0 if energy_reference is None else float(energy_reference)
+    # Keep host-created values on the host until ``in_shardings`` places them
+    # on ``mesh_xy``.  ``jnp.asarray`` would commit them to JAX's default
+    # backend, which need not be the backend of the caller-supplied mesh.
     args = (
-        jnp.asarray(time_nodes, dtype=jnp.float64),
-        jnp.asarray(projection_rows, dtype=jnp.complex128),
+        np.asarray(time_nodes, dtype=np.float64),
+        np.asarray(projection_rows, dtype=np.complex128),
         wfns.xn(f_slice),
         wfns.yr(f_slice),
         wfns.yr(u_slice),
@@ -1211,7 +1214,7 @@ def _chi0_fractional_contour_args(
         wfns.enk[:, u_slice],
         occ_full[:, f_slice],
         occ_full[:, u_slice],
-        jnp.asarray(eref, dtype=jnp.float64),
+        np.asarray(eref, dtype=np.float64),
     )
     return args, z_values.size
 

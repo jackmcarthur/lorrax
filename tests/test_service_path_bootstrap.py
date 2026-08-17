@@ -98,7 +98,8 @@ _SRC = str(_REPO / "src")
 #: converted module-scope consumers ride the same one bootstrap block, so
 #: one executing cell falsifies the class; the Si COHSEX fixture run is
 #: what covers them end to end on the cluster.
-#: The four ``symmetry_maps`` pairs came from that service's own branch,
+#: The original four ``symmetry_maps`` pairs came from that service's own
+#: branch,
 #: where each was MEASURED through :func:`_bare_run` at the replumb rather
 #: than assumed reachable.  The landing merge re-measures them, because the
 #: merge itself changed their import lists: every one of the four now also
@@ -118,6 +119,7 @@ _MODULE_SCOPE_CONSUMERS = (
     ("file_io", "wfn_loader"),
     ("psp.operator_checks", "wfn_loader"),
     ("centroid.charge_density", "symmetry_maps"),
+    ("centroid.kmeans_isdf", "symmetry_maps"),
     ("centroid.pivoted_cholesky", "symmetry_maps"),
     ("psp.get_DFT_mtxels", "symmetry_maps"),
     ("psp.run_sternheimer", "symmetry_maps"),
@@ -197,7 +199,6 @@ _FFI_BLOCKED_CONSUMERS = (
     "centroid.kmeans_cli",
     "gw.gw_jax",
     "gw.kin_ion_io",
-    "psp.get_dipole_mtxels",
     "psp.orbital_magnetization",
 )
 
