@@ -142,7 +142,12 @@ def test_compaction_renumbers_a_noncontiguous_wedge():
     assert rows.tolist() == [0, 1, 4], (
         "the kept rows are the first occurrence of each star, in order")
     assert compact.tolist() == [0, 1, 1, 1, 2, 1, 1, 1, 2]
-    # The property ``read_star_map`` checks: max label + 1 == stored rows.
+    # The property ``read_star_map`` checks: the number of DISTINCT stars
+    # equals the stored row count.  Asserted alongside ``max + 1`` because
+    # compaction is what makes the two agree, and the reader stopped
+    # trusting ``max + 1`` on 2026-08-17 precisely because an uncompacted
+    # table can satisfy it while describing a different slab.
+    assert int(np.unique(compact).size) == len(rows)
     assert int(compact.max()) + 1 == len(rows)
 
 
