@@ -23,14 +23,43 @@ Five questions:
   1. V_H         — the FFT round trip, wired to the loader's ψ + D10 table.
   2. kin+ion     — T + V_loc + V_NL summed ON THE KET in one sweep.  Also
                    the answer to "did V_NL fit the Operator protocol".
-  3. dipole      — 2(k+G)ψ − ∂V_NL/∂K ψ, three Cartesian components on
-                   one sweep, with the component axis replicated.
+  3. dipole      — 2(k+G)ψ ± ∂V_NL/∂K ψ, three Cartesian components on
+                   one sweep, with the component axis replicated.  BOTH
+                   ARMS OF THE SIGN, for the reason below.
   4. the boundary — ``blocks_to_host`` (replicated and owner_only) against
                    the same reference, including the band-pad trim.
   5. end to end  — ``compute_hartree_matrix`` itself, the edited function.
 
 Plus: one compile for the whole k sweep, and per-rank VmHWM — a plan
 that merely RELOCATED a peak looks clean on rank 0 alone.
+
+WHY CHECK 3 SWEEPS TWICE, AND WHY THE ONE-ARM VERSION WAS A DEFECT
+------------------------------------------------------------------
+``dipole_operator`` assembles ``p ± ∂V_NL/∂K`` under a
+``vnl_velocity_sign`` knob, and its DEFAULT flipped from ``-1`` to
+``+1`` on 2026-08-09 (``6b3ffc1f``, an owner ruling measured against
+BerkeleyGW's q→0 head).  This file was written on 2026-08-04 and its
+local-plan reference hard-coded ``p_cart - v_nl``; ``6b3ffc1f`` did not
+touch it.  From that day the two sides of check 3 were DIFFERENT
+OPERATORS, and check 3 reported ``4.364e-01`` — the whole of which is
+``max|2·∂V_NL/∂K| / max|p − ∂V_NL/∂K|`` and none of which is a sweep
+defect.  Nobody saw it until 2026-08-17 because two unrelated bit-rot
+defects — the stale ``common.symmetry_maps`` import and the
+``psi_G.sharding.spec`` print, each commented at its own line — had made
+this file an ImportError since 2026-08-07, two days BEFORE the ruling
+that stranded it.  It has never been possible to observe.
+
+The repair is not to re-pin the reference to today's default — that
+just re-arms the same trap for the next ruling.  ``p`` and
+``∂V_NL/∂K`` are accumulated SEPARATELY by the local plan, both arms
+are assembled from them, and BOTH are swept and compared.  That is also
+the property the call site needs: ``psp.get_dipole_mtxels.main``
+resolves the sign at run time from a CLI flag or a deck key, so a gate
+that certifies one arm certifies half its runs.  Running the two arms
+in one process additionally exercises ``_operator_key``'s sign entry on
+a real deck — two arms that hashed the same would silently share a
+compiled program, which is the hazard
+``tests/test_dipole_vnl_velocity_sign.py`` gates synthetically.
 
 Env: MTX_DECK (input file), MTX_NB.
 """
@@ -50,7 +79,9 @@ from common import Meta                                       # noqa: E402
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
 from common.jax_compile_cache import _STATE as CC_STATE        # noqa: E402
-from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,  # noqa: E402
+from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,      # noqa: E402
+                                VNL_VELOCITY_SIGN_SHIPPED,
+                                SweepGeometry, band_sphere_spec,
                                 blocks_to_host, dipole_operator,
                                 kinetic_operator,
                                 local_potential_operator, sum_operators,
@@ -195,7 +226,13 @@ def main():
     hwm0 = vmhwm_gib()
     vh_ref = np.zeros((nk, nb, nb), dtype=np.complex128)
     ki_ref = np.zeros((nk, nb, nb), dtype=np.complex128)
-    dip_ref = np.zeros((nk, 3, nb, nb), dtype=np.complex128)
+    # THE TWO HALVES OF THE VELOCITY, KEPT APART.  Storing the assembled
+    # ``p ± ∂V_NL/∂K`` here would bake one arm of ``vnl_velocity_sign``
+    # into the reference, which is exactly the defect this file carried
+    # from 2026-08-09 to 2026-08-17 (module docstring).  The arms are
+    # assembled below, one per sweep.
+    p_ref = np.zeros((nk, 3, nb, nb), dtype=np.complex128)
+    vnl_ref = np.zeros((nk, 3, nb, nb), dtype=np.complex128)
     t0 = time.time()
     for ik in range(nk):
         box = load_kpoint_fftbox_local(wfn, meta, ik, nb, bispinor=bispinor)
@@ -211,12 +248,25 @@ def main():
             g_mask=g_mask)
         v_nl = compute_vnl_velocity_cart(box, G_pad, kpt, vnl_setup,
                                          g_mask=g_mask)
-        dip_ref[ik] = np.asarray(p_cart - v_nl)
+        p_ref[ik] = np.asarray(p_cart)
+        vnl_ref[ik] = np.asarray(v_nl)
         del box
     t_local = time.time() - t0
     hwm_local = vmhwm_gib()
     p0(f"[mtxel] local plan  {t_local:7.3f}s   VmHWM {hwm0:.3f} -> "
        f"{hwm_local:.3f} GiB (the per-k full-band box)")
+
+    def dip_ref_at(sign):
+        """The local plan's velocity at one arm of ``vnl_velocity_sign``.
+
+        Written as a BRANCH and not as ``p + sign*v``, mirroring
+        ``dipole_operator``'s own reason: a complex array times a real
+        ``-1.0`` goes through the full complex product and turns ``+0.0``
+        into ``-0.0``, which is numerically nothing and is not bit
+        identity.  The reference has to execute the same expression the
+        operator does or the gate is measuring its own arithmetic.
+        """
+        return p_ref + vnl_ref if sign > 0.0 else p_ref - vnl_ref
 
     # ---- the SWEEP, constructed exactly as the three call sites do -------
     psi_G = wfn.load(bands=(0, nb), k="full_bz",
@@ -264,29 +314,57 @@ def main():
     H_ki.block_until_ready()
     t_ki, c_ki = time.time() - t0, CC_STATE.compiles - c0
 
-    c0 = CC_STATE.compiles
-    t0 = time.time()
-    H_dip = sweep_matrix_elements(
-        psi_G, operator=dipole_operator(geom, bvec=wfn.bvec, blat=wfn.blat,
-                                        vnl_setup=vnl_setup), **kw)
-    H_dip.block_until_ready()
-    t_dip, c_dip = time.time() - t0, CC_STATE.compiles - c0
+    # BOTH ARMS, default first.  ``_operator_key`` carries the sign, so
+    # these are two compiled programs; if they were ever one, the second
+    # arm below would reproduce the first and BOTH comparisons could not
+    # pass at once.
+    ARMS = ((VNL_VELOCITY_SIGN_FLIPPED, "p + dV_NL/dK  [default]"),
+            (VNL_VELOCITY_SIGN_SHIPPED, "p - dV_NL/dK  [legacy]"))
+    H_dip, t_dip, c_dip = {}, {}, {}
+    for sign, _label in ARMS:
+        c0 = CC_STATE.compiles
+        t0 = time.time()
+        H = sweep_matrix_elements(
+            psi_G, operator=dipole_operator(geom, bvec=wfn.bvec,
+                                            blat=wfn.blat,
+                                            vnl_setup=vnl_setup,
+                                            vnl_velocity_sign=sign), **kw)
+        H.block_until_ready()
+        H_dip[sign] = H
+        t_dip[sign] = time.time() - t0
+        c_dip[sign] = CC_STATE.compiles - c0
+    H_dip_def = H_dip[VNL_VELOCITY_SIGN_FLIPPED]
     hwm_sweep = vmhwm_gib()
 
     p0(f"[mtxel] sweep V_H {t_vh:7.3f}s  kin+ion {t_ki:7.3f}s  "
-       f"dipole {t_dip:7.3f}s   VmHWM {hwm_sweep:.3f} GiB")
+       f"dipole {t_dip[VNL_VELOCITY_SIGN_FLIPPED]:7.3f}s (+arm) "
+       f"{t_dip[VNL_VELOCITY_SIGN_SHIPPED]:7.3f}s (-arm)   "
+       f"VmHWM {hwm_sweep:.3f} GiB")
     p0(f"[mtxel] compiles per sweep (nk={nk}; ONE lowering is the D10 "
-       f"claim): V_H={c_vh} kin_ion={c_ki} dipole={c_dip}")
+       f"claim): V_H={c_vh} kin_ion={c_ki} "
+       f"dipole={c_dip[VNL_VELOCITY_SIGN_FLIPPED]}"
+       f"/{c_dip[VNL_VELOCITY_SIGN_SHIPPED]}")
     p0(f"[mtxel] specs: V_H {getattr(H_vh.sharding, 'spec', H_vh.sharding)} "
        f"{H_vh.shape}   dipole "
-       f"{getattr(H_dip.sharding, 'spec', H_dip.sharding)} {H_dip.shape}")
+       f"{getattr(H_dip_def.sharding, 'spec', H_dip_def.sharding)} "
+       f"{H_dip_def.shape}")
 
     # ---- 1-3. per shard --------------------------------------------------
     worst = [shard_vs_reference(H_vh, pad_ref(vh_ref), "V_H", p0),
              shard_vs_reference(H_ki, pad_ref(ki_ref), "kin+ion (T+V_loc+V_NL)",
-                                p0),
-             shard_vs_reference(H_dip, pad_ref(dip_ref), "dipole (p - dV_NL/dK)",
                                 p0)]
+    for sign, label in ARMS:
+        worst.append(shard_vs_reference(H_dip[sign],
+                                        pad_ref(dip_ref_at(sign)),
+                                        f"dipole {label}", p0))
+    # The two arms must also DIFFER by 2·∂V_NL/∂K, or the sign never
+    # reached the kernel and both comparisons passed against the same
+    # array.  This is the "parsed, stored, never read" failure mode.
+    arm_gap = float(np.abs(np.asarray(2.0 * vnl_ref)).max()) / max(
+        float(np.abs(dip_ref_at(VNL_VELOCITY_SIGN_SHIPPED)).max()), 1e-300)
+    p0(f"[mtxel] {'arm separation 2|dV_NL/dK| / |p-dV_NL/dK|':<38} "
+       f"         {arm_gap:.3e}   "
+       f"{'OK' if arm_gap > 1e-6 else 'DEGENERATE — the arms are the same'}")
 
     # ---- 4. the boundary -------------------------------------------------
     worst.append(host_vs_reference(blocks_to_host(H_vh, nb=nb), vh_ref,
@@ -300,10 +378,11 @@ def main():
         print(f"[mtxel] rank={rank:03d} FAIL owner_only returned an array "
              f"on a peer", flush=True)
         worst.append(1.0)
-    dip_h = blocks_to_host(H_dip, nb=nb, owner_only=True)
+    dip_h = blocks_to_host(H_dip_def, nb=nb, owner_only=True)
     if rank == 0:
-        worst.append(host_vs_reference(dip_h, dip_ref,
-                                       "blocks_to_host dipole owner", p0))
+        worst.append(host_vs_reference(
+            dip_h, dip_ref_at(VNL_VELOCITY_SIGN_FLIPPED),
+            "blocks_to_host dipole owner", p0))
 
     # ---- 5. end to end: the edited compute_hartree_matrix -----------------
     vh_e2e = compute_hartree_matrix(
