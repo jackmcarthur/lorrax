@@ -769,6 +769,26 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	size changed — a physical band window that depends on the process count is
 	exactly what ``Meta``'s own pad note is careful to keep out of the physics.
 	A requested edge is honoured exactly or refused.
+
+	THE SIZING RULE, STATED RATHER THAN INHERITED (2026-08-16, the χ/Σ split).
+	The fit's right range tops out at ``b4``, and ``b4`` is the padded top of
+	``max(number_bands_chi, number_bands_sigma)``.  That ``max`` is not an
+	implementation convenience — it is the guard against a documented
+	eV-scale failure.  ``docs/dev/isdf_basis_adequacy_at_large_nband.md``
+	records a run whose ISDF window was clamped to a SMALL band range and used
+	for a large one: QP gap **0.36 eV where the answer is 3.1–3.7 eV**, with a
+	NEGATIVE ``eqp1``, passing every gate in the suite (el_compare 1.9e-11, H0
+	3.9e-5, W Dyson 1.9e-14, Σ_X within 0.03 %) because every one of them is
+	upstream of or orthogonal to Σ_c.  Re-selecting the SAME NUMBER of
+	centroids against a representative window moved the gap monotonically to
+	3.14 / 3.72 eV.
+
+	So: the interpolation basis must span the pair densities of whichever
+	consumer reaches higher.  Sizing it by the SMALLER count would rebuild
+	exactly that failure, one index over — χ0 or Σ (whichever is the larger)
+	would consume pair densities the basis was never fitted to represent, and
+	nothing downstream would notice.  :func:`assert_isdf_window_is_the_max`
+	states the invariant where it can fail; this is why.
 	"""
 	left = (band_slices.b0, band_slices.b3)
 	right = (band_slices.b1, band_slices.b4)
@@ -885,33 +905,74 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 _BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
 
 
-def _refuse_split_under_restart(cfg, *, print_fn=print):
-	"""A restart cannot change the χ/Σ split.  Refuse rather than reuse.
+def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
+                                  *, log=print):
+	"""THE SIZING RULE, ENFORCED AT THE SEAM THAT CONSUMES IT.
 
-	``restart = true`` reuses ``V_q``, ``W0``, ``psi_full_y`` and the ζ
-	tensors from a previous run, and the restart stamp
-	(``file_io.tagged_arrays``) records FIVE band edges — b0..b4 — which is
-	exactly the set that does NOT distinguish a split from an unsplit run at
-	the same loaded extent.  So a deck that flips ``number_bands_chi`` while
-	restarting would silently reuse a W built at the OTHER χ count and report
-	rc=0: the "wrong physics at rc=0" case the stamp exists to prevent, seen
-	from the one angle it cannot see.
+	*The ISDF basis must span the band window its consumers actually reach.*
+	With one band count that was automatic.  With two it is a ``max``, and a
+	``max`` that is only implied by how ``b4`` happens to be computed is one
+	refactor away from being the ``min``.
 
-	Extending the stamp is the eventual fix; refusing is the correct fix
-	today, and it costs a split deck nothing it had before (no split deck can
-	have produced a restart file).
+	WHAT IT COSTS TO GET WRONG, measured, not feared.
+	``docs/dev/isdf_basis_adequacy_at_large_nband.md``: a run whose ISDF
+	window was clamped to a small band range and then used for a large one
+	returned a QP gap of **0.36 eV** where the answer is **3.1–3.7 eV**, with
+	a NEGATIVE ``eqp1`` fundamental gap — and **passed every gate the project
+	runs**, because all of them are upstream of or orthogonal to Σ_c
+	(el_compare 1.86e-11 eV, gate_h0 3.9e-5 eV, W Dyson residual 1.9e-14,
+	density/TRS 1.3e-14, bare Σ_X within 0.03 %, head fit 0.026 %).  The fix
+	was to re-select the SAME NUMBER of centroids against a representative
+	window; the gap then moved monotonically to 3.135 / 3.723 eV.  So this is
+	a class of error that is invisible to everything except a check placed
+	exactly here.
+
+	THREE THINGS ARE CHECKED, and they are different questions:
+
+	1. The fit's right range tops out at ``max(b4_chi, b4_sigma)`` (== ``b4``,
+	   the padded edge).  A window sized by the smaller consumer is refused
+	   outright — that is the failure above, one index over.
+	2. If ``zeta_nband`` narrows the fit BELOW either band sum's top, the
+	   consumer above it is running on an EXTRAPOLATED ζ basis.  Reported per
+	   consumer, loudly, and named — narrowing is a legitimate request
+	   (``zeta_nband`` exists for the BSE's Galerkin capacity bound) but it
+	   must never be silent about which sum it undercuts.
+	3. The window and the count that set it are logged unconditionally, so
+	   "no news" and "a good number" do not look alike.
 	"""
-	if cfg.bands.split and bool(getattr(cfg, "restart", False)):
+	top = int(band_range_right[1])
+	b4_chi, b4_sigma = int(band_slices.b4_chi), int(band_slices.b4_sigma)
+	expected = max(b4_chi, b4_sigma)
+	if zeta_nband is None and top != expected:
 		raise ValueError(
-			f"restart = true is refused with a SPLIT band count "
-			f"(number_bands_chi={cfg.bands.chi}, "
-			f"number_bands_sigma={cfg.bands.sigma}).  The restart stamp "
-			f"records b0..b4 only, and b4 is max(chi, sigma) — so it cannot "
-			f"tell a run that screened at {cfg.bands.chi} bands from one "
-			f"that screened at {cfg.bands.sigma}, and the reused V_q / W0 / "
-			f"zeta tensors would silently be the other run's.  Either set "
-			f"restart = false, or run the split deck from scratch in its own "
-			f"directory.")
+			f"ISDF ζ-fit window top is {top} but the band sums reach "
+			f"max(chi={b4_chi}, sigma={b4_sigma}) = {expected}.  The "
+			f"interpolation basis MUST span the pair densities of whichever "
+			f"consumer reaches higher; a basis fitted to the smaller window "
+			f"and used for the larger one is the 0.36 eV / negative-gap "
+			f"failure in docs/dev/isdf_basis_adequacy_at_large_nband.md, "
+			f"which passed every gate in the suite.  This is a code defect, "
+			f"not a deck error.")
+	source = ("tied" if b4_chi == b4_sigma
+	          else ("number_bands_chi" if b4_chi > b4_sigma
+	                else "number_bands_sigma"))
+	log(f"    ζ-fit window sized for {top} bands "
+	    f"(band sums reach chi {b4_chi}, sigma {b4_sigma}; the max is set by "
+	    f"{source})"
+	    + ("" if zeta_nband is None
+	       else f", NARROWED from {expected} by deck key zeta_nband={top}"))
+	if zeta_nband is not None:
+		for edge, what, key in ((b4_chi, "χ0/W band sum", "number_bands_chi"),
+		                        (b4_sigma, "Σ band sum", "number_bands_sigma")):
+			if top < edge:
+				log(f"    *** zeta_nband={top} is BELOW the {what}'s top "
+				    f"({key} → band {edge}).  Bands [{top}, {edge}) of that "
+				    f"sum are built on pair densities whose ζ basis was "
+				    f"never fitted to them — the basis is EXTRAPOLATED "
+				    f"there.  This is the mechanism behind the 0.36 eV gap "
+				    f"in docs/dev/isdf_basis_adequacy_at_large_nband.md; it "
+				    f"is permitted because you asked for it by name, and it "
+				    f"is not checked by any other gate. ***")
 
 
 def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
@@ -1038,6 +1099,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# and the ``zeta_nband`` decoupling if the deck asked for one.
 	band_range_left, band_range_right = zeta_fit_band_ranges(
 		band_slices, getattr(cfg, "zeta_nband", None), log=print_fn)
+	assert_isdf_window_is_the_max(
+		band_slices, band_range_right, getattr(cfg, "zeta_nband", None),
+		log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
 		getattr(cfg, "zeta_nband", None), log=print_fn)

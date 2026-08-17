@@ -70,7 +70,7 @@ import common.timing as timing
 from .gw_config import (
 	ComputeMode, LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
-                      check_band_sum_degeneracy, _refuse_split_under_restart)
+                      check_band_sum_degeneracy)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import compute_screening_model
@@ -301,8 +301,7 @@ def main(argv=None):
 		       f"{band_slices.b4_sigma}); psi is LOADED over "
 		       f"[{band_slices.b0}, {band_slices.b4}) "
 		       f"(padded from {meta.b_id_4_user} to the world size).")
-	_refuse_split_under_restart(config, print_fn=print0)
-	check_band_sum_degeneracy(wfn, config, band_slices, print_fn=print0)
+	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
 
 	# ---- sigma_omega_layout=sharded: resolve-time geometry/backend gate ----
 	# The config-level axis checks (self_consistent) already ran
