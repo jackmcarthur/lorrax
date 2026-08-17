@@ -393,7 +393,8 @@ def compute_static_w(
                                        getattr(config.backend,
                                                "distrib_la_batched_route",
                                                "auto")))
-            if head_channel is None:
+            if (head_channel is None
+                    or str(getattr(head_channel, "mode", "off")) == "off"):
                 with timing.section(
                         "W.exec", announce=True,
                         label=f"{_w} Dyson solve ({nq_solve} q, mu={_mu}, "
@@ -746,6 +747,7 @@ def compute_screening_model(
             energy_reference=e_ref, plan=mpa_plan,
             iteration_head_response=iteration_head_response,
             occupation_state=occupation_state,
+            head_channel=head_channel,
             print_fn=print_fn)
         result = {"mpa_fit": fit_path}
         if iteration_head is not None:
