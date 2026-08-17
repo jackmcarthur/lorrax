@@ -192,6 +192,44 @@ monolithic condwin rule (~6 Ry) needed ~1300 nodes and REFUSED at the
 500 floor — the η=0.10 arm's NaN.  Decomposed cluster shells at
 1–3 Ry certify at 224–774 nodes under the production ceiling.
 
+### 5c. The transferability matrix (owner mandate 2026-08-17)
+
+Measured with EXACT production occupations (mp1, w = 0.01 Ry) on the
+real stores; full tables in
+`runs/Na/02_soc48b_qsgw_mpa/21_patched_omega_grid_20260816/hardening_matrix.txt`:
+
+* **Single-cluster degeneracy** — on production-shaped contiguous
+  grids, insulating (Si class) and metallic (Na class, sliver paths
+  exercised), the clustering knob is inert window-by-window
+  (`test_single_cluster_degeneracy_on_both_config_classes`).
+* **Na 3-cluster end-to-end (GPU)** — patched vs monolithic at the
+  same frozen tip: max |ΔE_QP| ≤ 0.19 meV on all ten in-grid bands,
+  3669 vs 5723 tau dispatches.  Exact plan: cores 209/142/319/537
+  (Fermi±, 2p, 2s), total 2076 nodes of which 531 is the
+  single-cluster (+ω) sliver kept verbatim for parity — the known
+  next lever, a policy decision not a defect.
+* **Fe-class transfer** — real F3 store (78 q × 600² × 8 poles,
+  208.8 eV band span), patched grid [−93:−85, −59:−50, −10:+12] eV:
+  the incumbent monolithic rule (f_max ≈ 20.3 Ry, ~1776 nodes by the
+  law) **REFUSES at the 500 floor**; the decomposed plan builds with
+  every window certified — 23 windows, 2792 nodes, cores
+  275/187/493/709 (valence±, 3p, 3s).  The 3s shell at −90 eV costs
+  what Na's whole deep window used to cost: cluster + pole geometry,
+  never the span.
+* **Sensitivity, no cliffs** — gap ∈ {0.25, 0.5} Ry identical plans;
+  1.0 Ry merges Fermi+2p (2004 nodes, still fine); 2.0 Ry merges 2s
+  too (3214 — more expensive, certified, no refusal).  η ∈
+  {0.10, 0.15, 0.25, 0.50} eV: totals 4626/3232/2076/1184, largest
+  rule 1313/884/537/275 — smooth ~1/η, everything certifies under the
+  2000 ceiling (the η = 0.10 unlock, demonstrated on the real
+  geometry).
+* **The 2s non-win is fundamental to the FIT, not the planner** — the
+  per-pole-row position spreads (Na rows span 1.5–10 Ry each,
+  heavily overlapping; Fe likewise) mean no row selection can narrow
+  the 2s cluster's crossing bracket: at ω ≈ E(2s) the crossing set
+  genuinely draws on every shallow row.  Shrinking it requires the
+  fit-side deep-transition channel of §6.
+
 ## 6. What this does NOT fix: the fit-side sibling (design only)
 
 Fe F3's failure chain is a FIT pathology, upstream of everything here.
