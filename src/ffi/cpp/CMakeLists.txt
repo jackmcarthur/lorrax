@@ -497,6 +497,25 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
     )
 endif()
 if(LORRAX_CUFFT_ON)
+    # Isolated compile target for the Sigma k-leading direct convolution.
+    # `cmake --build <dir> --target build_conv_klead_cuda` recompiles this TU
+    # without relinking the full vendor stack; the production shared object
+    # consumes the exact same object, so the quick-iteration artifact cannot
+    # drift from the shipped one.
+    add_library(build_conv_klead_cuda OBJECT
+        cufft/conv_klead_cuda_ffi.cc)
+    set_target_properties(build_conv_klead_cuda PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(build_conv_klead_cuda SYSTEM PRIVATE
+        "${JAX_FFI_INCLUDE_DIR}"
+        "${CUDA_TOOLKIT_ROOT}/include"
+        "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        "${NVRTC_INCLUDE_DIR}")
+    target_include_directories(build_conv_klead_cuda PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    target_compile_options(build_conv_klead_cuda PRIVATE
+        -Wall -Wextra)
     list(APPEND LORRAX_FFI_SOURCES
         cufft/fft_flat_k_cuda_ffi.cc
         # k-MINOR fused conv (BSE ladder-W rung, 2026-08-16).  Rides the same
@@ -505,6 +524,7 @@ if(LORRAX_CUFFT_ON)
         # written in the kernel, sized by the call's attributes.  If the cuFFT
         # probe is ever split from the nvrtc probe, this file follows nvrtc.
         cufft/conv_kminor_cuda_ffi.cc
+        $<TARGET_OBJECTS:build_conv_klead_cuda>
     )
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
