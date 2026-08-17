@@ -193,7 +193,13 @@ def test_a_gapped_deck_never_reaches_the_thresholded_line_at_all():
     from gw.mpa.sigma import _branches
 
     class _Slices:
-        full = slice(0, 4)
+        # ``sigma_sum`` and DELIBERATELY NOT ``full`` -- the same stub ruling
+        # as tests/test_mpa_sigma.py, made there by a07abaa7.  Since the
+        # chi/Sigma split those are different windows: ``full`` is the LOADED
+        # extent max(chi, sigma) and ``sigma_sum`` is the band sum these
+        # branches run over.  Omitting ``full`` makes this cell fail loudly if
+        # ``_branches`` ever reads the loaded extent again.
+        sigma_sum = slice(0, 4)
 
     class _Wfns:
         enk = jnp.asarray([[-0.6, -0.2, 0.3, 0.9]])
@@ -450,7 +456,9 @@ def test_the_mpa_branch_supports_honour_the_threshold_end_to_end():
     from gw.mpa.sigma import _branches
 
     class _Slices:
-        full = slice(0, 5)
+        # ``sigma_sum``, not ``full`` -- see the note on the gapped-deck stub
+        # above and tests/test_mpa_sigma.py.
+        sigma_sum = slice(0, 5)
 
     wfns = SimpleNamespace(
         enk=jnp.asarray([[-0.6, -0.2, 0.0, 0.2, 0.9]]),
