@@ -69,10 +69,85 @@ import jax.numpy as jnp
 
 
 __all__ = [
+    "OCCUPATION_WINDOW_THRESHOLD_DEFAULT",
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
-    "fermi_level_step", "mp1_negative_derivative", "mp1_occupations",
+    "band_in_occupation_window", "fermi_level_step",
+    "mp1_negative_derivative", "mp1_occupations",
+    "occupation_weight_floor",
     "occupied_band_count", "solve_mp1_occupations", "step_occupations",
 ]
+
+
+# ---------------------------------------------------------------------------
+#  The occupancy threshold that decides whether a band is in a
+#  Green's-function branch at all.  ONE predicate, ONE floor, ONE default —
+#  every consumer imports from here rather than re-spelling the rule.  The
+#  consumers are listed in ``docs/input_reference.md`` under
+#  ``occupation_window_threshold``.
+# ---------------------------------------------------------------------------
+
+#: Deck default for ``occupation_window_threshold``.  See
+#: :func:`occupation_weight_floor` for the occupancy→weight mapping and
+#: :func:`band_in_occupation_window` for the rule itself.
+OCCUPATION_WINDOW_THRESHOLD_DEFAULT = 0.995
+
+
+def occupation_weight_floor(occupation_window_threshold):
+    """Map the deck's OCCUPANCY threshold onto a branch-WEIGHT floor.
+
+    The deck key is an occupancy because that is how the knob is reasoned
+    about ("keep a band until it is 99.5% occupied"), but every cut is on a
+    branch WEIGHT, which is ``f`` on the occupied/hole branch and ``1 − f``
+    on the empty/electron branch (``gw/mpa/sigma.py`` ``val_weight=f,
+    cond_weight=1.0 - f``; ``gw/w_isdf.py`` ``band_weight=occ_f`` and
+    ``band_weight=1.0 - occ_u``).  A band at occupancy 0.995 therefore
+    carries weight 0.995 in the occupied branch and 0.005 in the empty one,
+    and a band at occupancy 0.005 the mirror pair, so ONE floor
+    ``1 − threshold`` cuts both branches symmetrically at the same physical
+    distance from a filled/empty state.  Occupancy 0.995 ⇒ floor 0.005.
+
+    ``threshold = 1.0`` gives floor 0.0, i.e. ``abs(w) > 0.0`` ≡ ``w != 0.0``
+    — the exact incumbent rule, bit-for-bit, at every consumer.  That is the
+    deliberate escape hatch and the A/B control for this knob.
+    """
+    t = float(occupation_window_threshold)
+    if not (np.isfinite(t) and 0.5 <= t <= 1.0):
+        raise ValueError(
+            "occupation_window_threshold must be an occupancy in [0.5, 1.0]; "
+            f"got {occupation_window_threshold!r}.  It is the occupancy at "
+            "which a band stops counting toward a Green's-function branch; "
+            "the weight floor applied is 1 - threshold.  1.0 reproduces the "
+            "exact `weight != 0` rule.")
+    return 1.0 - t
+
+
+def band_in_occupation_window(weight, weight_floor):
+    """``abs(weight) > weight_floor`` — the one band-inclusion predicate.
+
+    MAGNITUDE, NEVER A ONE-SIDED CUT.  :attr:`OccupationState.f_kn` is never
+    clipped (MP1's overshoot beyond [0, 1] is part of the configured
+    quadrature — see :func:`mp1_occupations`), so a band just above μ carries
+    a NEGATIVE occupied-branch weight, down to about **-0.0355** at the MP1
+    lobe minimum — seven times the 0.005 floor the default threshold sets.
+    ``weight > floor`` would silently discard every one of them; the exact
+    incumbent rule ``weight != 0.0`` kept them, and
+    ``mpa: wrong-side fractional states keep their branch's algebra``
+    (6d3b6b47) exists to route them correctly.  ``abs`` keeps them and drops
+    only what is genuinely negligible.
+
+    EXACT ZEROS STAY EXCLUDED at every threshold, since ``0 > floor`` is
+    false for floor ≥ 0.  The reason the exact rule existed is preserved
+    rather than traded away: the exact cut excludes only what UNDERFLOWED to
+    zero, which for MP1 is ~54 smearing widths out from μ — the -0.53 Ry
+    phantom excursion of the first metallic Σ arm (claim 0196), whose
+    smallest live weight was the subnormal 2.67e-322.  A fixed occupancy
+    threshold instead cuts at a fixed number of smearing widths (0.995 ⇒
+    about 4.28), because the MP1 weight depends on ``(E-μ)/(2W)`` alone.
+
+    Works on numpy and jax arrays alike; returns whatever ``abs``/``>`` give
+    for the operand type, so a caller keeps its own array library.
+    """
+    return abs(weight) > weight_floor
 
 # Tolerance for "the cumulative occupancy lands exactly on the target",
 # i.e. the gapped case.  Scaled by the target so it is relative.

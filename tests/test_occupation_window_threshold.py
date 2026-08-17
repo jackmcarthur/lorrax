@@ -278,7 +278,10 @@ def test_the_key_reaches_the_planner_through_MPAConfig():
             inspect.signature(fn).parameters), fn.__name__
 
     src = inspect.getsource(compute_sigma_c_mpa_omega_grid)
-    assert src.count("occupation_window_threshold=occupation_window_threshold") == 2
+    # Three now, not two: the BRANCH BUILD reads the same value as the pole
+    # census and the window build, so the supports the executor masks with
+    # and the geometry the planner sizes cannot come from different windows.
+    assert src.count("occupation_window_threshold=occupation_window_threshold") == 3
 
 
 def test_the_key_has_a_row_in_the_input_reference():
@@ -292,3 +295,346 @@ def test_the_key_has_a_row_in_the_input_reference():
     # The two facts a future reader must not have to rediscover.
     assert "1 - threshold" in rows[0]
     assert "MAGNITUDE" in rows[0]
+
+
+# ==========================================================================
+#  ALL PATHS.  The rule above lived at ONE site (the MPA Sigma planner's
+#  A-space).  Everything below pins the other occupancy-based
+#  band-inclusion decisions onto the SAME helper, the same default and the
+#  same magnitude predicate -- and pins, by name, the two sites that
+#  deliberately do NOT honour it.
+# ==========================================================================
+
+def test_there_is_exactly_one_helper_and_one_default():
+    """No second key, no second default, no re-spelled predicate.
+
+    ``gw.efermi`` owns the occupancy->weight map and the predicate; the
+    planner's ``_weight_floor`` is that same function object, not a copy
+    that could drift from it.
+    """
+    from gw import efermi
+    from gw import ppm_windows, w_isdf
+
+    assert SW._weight_floor is efermi.occupation_weight_floor
+    assert (SW.OCCUPATION_WINDOW_THRESHOLD_DEFAULT
+            is efermi.OCCUPATION_WINDOW_THRESHOLD_DEFAULT)
+    for mod in (ppm_windows, w_isdf):
+        assert (mod.occupation_weight_floor
+                is efermi.occupation_weight_floor), mod.__name__
+        assert (mod.band_in_occupation_window
+                is efermi.band_in_occupation_window), mod.__name__
+        assert (mod.OCCUPATION_WINDOW_THRESHOLD_DEFAULT
+                is efermi.OCCUPATION_WINDOW_THRESHOLD_DEFAULT), mod.__name__
+
+
+def test_the_predicate_is_a_magnitude_at_the_helper_itself():
+    from gw.efermi import band_in_occupation_window as keep
+    w = np.asarray([0.0, 0.004, -0.004, 0.006, -0.006, -0.0355, 1.0])
+    np.testing.assert_array_equal(
+        keep(w, 0.005), [False, False, False, True, True, True, True])
+    # floor 0.0 is the exact incumbent rule, at the helper, bit-for-bit.
+    np.testing.assert_array_equal(keep(w, 0.0), w != 0.0)
+
+
+# --------------------------------------------------------------------------
+# SITE 2: the Sigma BRANCH supports (gw.ppm_windows.branches_for_omega_grid).
+# Both drivers build their four branches here, so this is where cond_mask /
+# val_mask stop being the exact `f != 1` / `f != 0` rule.
+# --------------------------------------------------------------------------
+
+def _branch_masks(f, threshold):
+    """cond/val supports the branch builder hands the planner+executor."""
+    from gw.ppm_windows import branches_for_omega_grid
+    f = jnp.asarray(np.asarray(f, dtype=np.float64)[None, :])
+    E = jnp.zeros_like(f)
+    branches = branches_for_omega_grid(
+        np.asarray([0.0, 0.25]), E_cond=E, H_val=-E,
+        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_weight=1.0 - f, val_weight=f,
+        occupation_window_threshold=threshold)
+    got = {}
+    for b in branches:
+        got[b.space] = np.asarray(b.base_mask_A)[0]
+    return got["cond"], got["val"]
+
+
+def test_branch_supports_are_cut_by_the_threshold_on_both_sides():
+    #        deep occ   near-1      fractional  near-0      empty
+    f = [1.0, 0.9990, 0.50, 0.0010, 0.0]
+    cond, val = _branch_masks(f, 0.995)
+    # cond weight is 1-f: [0, 0.001, 0.5, 0.999, 1.0]
+    assert cond.tolist() == [False, False, True, True, True]
+    # val weight is f: [1.0, 0.999, 0.5, 0.001, 0]
+    assert val.tolist() == [True, True, True, False, False]
+
+
+def test_branch_supports_keep_the_negative_mp1_lobe():
+    """f = -0.0355 is the lobe minimum: seven floors deep, and REAL.
+
+    A one-sided `w > floor` drops it from the val branch.  The exact
+    incumbent rule kept it; so must the threshold.
+    """
+    f = [0.95, -0.0355, 1.0355]
+    cond, val = _branch_masks(f, 0.995)
+    # val weight f = [0.95, -0.0355, 1.0355] -- all three clear 0.005.
+    assert val.tolist() == [True, True, True]
+    # cond weight 1-f = [0.05, 1.0355, -0.0355] -- likewise.
+    assert cond.tolist() == [True, True, True]
+    one_sided = np.asarray([0.95, -0.0355, 1.0355]) > 0.005
+    assert one_sided.tolist() == [True, False, True], (
+        "fixture no longer discriminates the two rules")
+
+
+@pytest.mark.parametrize("f", [
+    [1.0, 0.9990, 0.50, 0.0010, 0.0],
+    [0.95, -0.0355, 1.0355],
+    [1.0, 2.67e-322, 0.5, 1.0 - 2.67e-322, 0.0],
+])
+def test_threshold_one_reproduces_the_exact_branch_supports(f):
+    """The A/B control: threshold 1.0 == `f != 1` / `f != 0`, bit-for-bit."""
+    cond, val = _branch_masks(f, 1.0)
+    fa = np.asarray(f, dtype=np.float64)
+    np.testing.assert_array_equal(cond, fa != 1.0)
+    np.testing.assert_array_equal(val, fa != 0.0)
+
+
+def test_a_weightless_branch_never_reaches_the_predicate_at_all():
+    """The insulator/GN-PPM claim is about EXECUTION, not equal numbers.
+
+    ``branches_for_omega_grid`` called without weights -- every insulating
+    MPA plan, and EVERY GN-PPM branch, since that driver has no fractional
+    occupancy to supply -- must not run the thresholded line.  Counting is
+    stronger than an artifact diff, which could agree for other reasons.
+    """
+    from gw import ppm_windows
+
+    calls = {"n": 0}
+    real = ppm_windows.band_in_occupation_window
+
+    def counting(weight, floor):
+        calls["n"] += 1
+        return real(weight, floor)
+
+    occ = jnp.asarray(np.asarray([[1.0, 1.0, 0.0, 0.0]]))
+    E = jnp.asarray(np.asarray([[-0.6, -0.2, 0.3, 0.9]]))
+    ppm_windows.band_in_occupation_window = counting
+    try:
+        branches = ppm_windows.branches_for_omega_grid(
+            np.asarray([-0.25, 0.0, 0.25]), E_cond=E, H_val=-E,
+            cond_mask=(occ <= 0.5), val_mask=(occ > 0.5),
+            occupation_window_threshold=0.995)
+    finally:
+        ppm_windows.band_in_occupation_window = real
+    assert branches, "fixture produced no branches"
+    assert all(b.band_weight is None for b in branches)
+    assert calls["n"] == 0, (
+        "a weightless branch reached the occupancy predicate")
+
+
+def test_the_mpa_branch_builder_forwards_the_deck_value():
+    """One value from the deck reaches the branch build AND both planner
+    entry points -- the supports cannot diverge from the geometry."""
+    import inspect
+    from gw.mpa.sigma import _branches, compute_sigma_c_mpa_omega_grid
+
+    assert "occupation_window_threshold" in (
+        inspect.signature(_branches).parameters)
+    src = inspect.getsource(compute_sigma_c_mpa_omega_grid)
+    assert src.count(
+        "occupation_window_threshold=occupation_window_threshold") == 3
+
+
+def test_the_mpa_branch_supports_honour_the_threshold_end_to_end():
+    """``_branches`` with a state, through the real entry point."""
+    from types import SimpleNamespace
+    from gw.mpa.sigma import _branches
+
+    class _Slices:
+        full = slice(0, 5)
+
+    wfns = SimpleNamespace(
+        enk=jnp.asarray([[-0.6, -0.2, 0.0, 0.2, 0.9]]),
+        occ=jnp.asarray([[1.0, 1.0, 0.5, 0.0, 0.0]]),
+        slices=_Slices())
+    state = SimpleNamespace(
+        f_kn=jnp.asarray([[1.0, 0.999, 0.5, 0.001, 0.0]]), mu_ry=0.0)
+
+    thr = {b.space: np.asarray(b.base_mask_A)[0]
+           for b in _branches(wfns, np.asarray([0.0, 0.25]), 0.0,
+                              occupation_state=state,
+                              occupation_window_threshold=0.995)}
+    exact = {b.space: np.asarray(b.base_mask_A)[0]
+             for b in _branches(wfns, np.asarray([0.0, 0.25]), 0.0,
+                                occupation_state=state,
+                                occupation_window_threshold=1.0)}
+    assert thr["val"].tolist() == [True, True, True, False, False]
+    assert exact["val"].tolist() == [True, True, True, True, False]
+    assert thr["cond"].tolist() == [False, False, True, True, True]
+    assert exact["cond"].tolist() == [False, True, True, True, True]
+
+
+# --------------------------------------------------------------------------
+# SITE 3: the chi0 fractional occupation supports
+# (gw.w_isdf._occupation_support_slices).  The one consumer where the cut
+# removes bands from a CONTRACTION -- the slices index wfns.xn/yr -- rather
+# than masking them, and it also sizes the damped-line rule.
+# --------------------------------------------------------------------------
+
+def _slices(occ, threshold):
+    from gw.w_isdf import _occupation_support_slices
+    return _occupation_support_slices(
+        np.asarray(occ, dtype=np.float64), threshold)
+
+
+def test_chi_supports_narrow_with_the_threshold():
+    """A near-empty band leaves the f support; a near-full one leaves u."""
+    occ = [[1.0, 0.999, 0.5, 0.001, 0.0]]
+    assert _slices(occ, 1.0) == (slice(0, 4), slice(1, 5))
+    assert _slices(occ, 0.995) == (slice(0, 3), slice(2, 5))
+
+
+def test_chi_supports_keep_the_negative_mp1_lobe():
+    """Band 0 is held ONLY by a wrong-side negative weight.
+
+    Under `w > floor` the f support would start at band 1 and the whole
+    negative lobe would leave chi0's occupied Green's function.
+    """
+    occ = [[-0.0355, 0.9, 0.0]]
+    f_slice, _ = _slices(occ, 0.995)
+    assert f_slice == slice(0, 2)
+    one_sided = np.asarray([-0.0355, 0.9, 0.0]) > 0.005
+    assert one_sided.tolist() == [False, True, False], (
+        "fixture no longer discriminates the two rules")
+
+
+def test_chi_supports_still_exclude_exact_zeros():
+    occ = [[0.0, 0.9, 0.4, 0.0]]
+    for threshold in (1.0, 0.995, 0.9):
+        f_slice, _ = _slices(occ, threshold)
+        assert f_slice == slice(1, 3), threshold
+
+
+@pytest.mark.parametrize("occ", [
+    [[1.0, 0.82, 0.10, 0.0], [1.0, 0.61, 0.25, 0.0], [1.0, 0.74, -0.01, 0.0]],
+    [[1.0, 0.999, 0.5, 0.001, 0.0]],
+    [[1.0, 2.67e-322, 0.0]],
+])
+def test_chi_threshold_one_reproduces_the_exact_supports(occ):
+    """Floor 0.0 is `occ != 0` / `occ != 1`, bit-for-bit."""
+    a = np.asarray(occ, dtype=np.float64)
+    f_sup = np.flatnonzero(np.any(a != 0.0, axis=0))
+    u_sup = np.flatnonzero(np.any(a != 1.0, axis=0))
+    want = (slice(int(f_sup[0]), int(f_sup[-1]) + 1),
+            slice(int(u_sup[0]), int(u_sup[-1]) + 1))
+    assert _slices(occ, 1.0) == want
+
+
+@pytest.mark.parametrize("threshold", [1.0, 0.9999, 0.995, 0.9, 0.5])
+def test_a_gapped_occupation_table_gives_one_support_at_every_threshold(
+        threshold):
+    """The insulator invariance, argued rather than sampled.
+
+    A gapped table stores exactly 0 or exactly 1, so both branch weights are
+    exactly 0 or exactly 1 too, and `abs(w) > floor` for floor in [0, 0.5]
+    can only be `w == 1`.  The supports are therefore threshold-independent
+    by algebra, and equal to the exact rule's.  This cell is the algebra
+    checked, at both ends of the allowed range and in between.
+    """
+    occ = [[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]
+    assert _slices(occ, threshold) == (slice(0, 2), slice(2, 4))
+
+
+def test_the_rule_bandwidth_reads_the_same_supports_as_the_kernel():
+    """`occupation_support_bandwidth` must read the slices the kernel gets.
+
+    MEASURED PROPERTY, and it is not the one a reader expects: on a
+    monotone occupation table the bandwidth is threshold-INVARIANT, because
+    it spans OUTER edges -- ``min(E over f)`` is the deepest band, whose
+    occupancy is ~1 and which therefore never leaves the f support, and
+    ``max(E over u)`` is the highest band, whose (1-f) is ~1 and which never
+    leaves u.  The threshold narrows the supports at their INNER edges.  So
+    the saving here is BANDS IN THE CONTRACTION, not quadrature nodes; the
+    reason the threshold is still an argument to this function is that the
+    two must read one support, and a non-monotone table (band crossings,
+    MP1 overshoot) can move the outer edge too.
+    """
+    from gw.w_isdf import occupation_support_bandwidth
+
+    e = np.asarray([[-2.0, -0.5, 0.0, 0.4, 1.5]])
+    occ = np.asarray([[0.999, 0.9, 0.5, 0.1, 0.001]])
+    for threshold in (1.0, 0.995):
+        f_slice, u_slice = _slices(occ, threshold)
+        assert occupation_support_bandwidth(
+            e, occ, occupation_window_threshold=threshold) == pytest.approx(
+                float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))), threshold
+    # The supports DO narrow -- that is the cost the threshold buys back.
+    assert _slices(occ, 1.0) == (slice(0, 5), slice(0, 5))
+    assert _slices(occ, 0.995) == (slice(0, 4), slice(1, 5))
+    # ...while the span they subtend does not, on this monotone table.
+    assert (occupation_support_bandwidth(e, occ,
+                                         occupation_window_threshold=0.995)
+            == occupation_support_bandwidth(e, occ,
+                                            occupation_window_threshold=1.0))
+
+
+def test_the_chi_fit_driver_uses_one_window_for_rule_and_kernel():
+    """gw.mpa.model reads the deck key ONCE and gives it to every consumer,
+    so the rule bandwidth and the band slices cannot disagree."""
+    import inspect
+    from gw.mpa.model import _evaluate_samples as _fn
+
+    src = inspect.getsource(_fn)
+    assert "occ_window = float(config.mpa.occupation_window_threshold)" in src
+    assert src.count("occupation_window_threshold=occ_window") == 3
+
+
+# --------------------------------------------------------------------------
+# The two sites that deliberately do NOT honour the threshold.  Pinned so a
+# reader sees a decision rather than an omission, and so closing either one
+# flips a test rather than passing silently.
+# --------------------------------------------------------------------------
+
+def test_the_gn_ppm_sigma_driver_has_no_occupancy_to_threshold():
+    """Not an omission: that driver has no fractional occupancy at all.
+
+    ``ppm_sigma._prepare_sigma_state`` splits ``wfns.occ > 0.5`` -- an
+    INTEGER step on a table ``wavefunction_bundle._build_occ`` fills as
+    ``(enk <= efermi)`` -- and passes no weights to
+    ``branches_for_omega_grid``, so every GN-PPM branch has
+    ``band_weight=None`` and there is nothing for an occupancy threshold to
+    cut.  Closing this means porting fractional occupations into that
+    driver first (its own ``TODO(metal-greens)``); the threshold then
+    governs it through the existing call with no further change.
+    """
+    import inspect
+    from gw import ppm_sigma
+    from gw.wavefunction_bundle import _build_occ
+
+    state_src = inspect.getsource(ppm_sigma._prepare_sigma_state)
+    assert "occ_mask = occ_full > 0.5" in state_src
+    assert "TODO(metal-greens)" in state_src, (
+        "the step-occupation gap lost its marker")
+    assert "(enk_host <= float(efermi))" in inspect.getsource(_build_occ)
+
+    driver = inspect.getsource(ppm_sigma.compute_sigma_c_ppm_omega_grid)
+    call = driver[driver.index("branches_for_omega_grid("):]
+    call = call[:call.index(")")]
+    assert "cond_weight" not in call and "val_weight" not in call, (
+        "GN-PPM now supplies branch weights -- it must also pass "
+        "occupation_window_threshold, and this cell must become an "
+        "end-to-end assertion instead of a documented gap")
+
+
+def test_the_static_occupation_projector_is_not_thresholded():
+    """``cohsex_sigma.build_Gij`` weights EVERY Sigma band by f and drops
+    none.  Thresholding it would delete electrons from the Hartree density,
+    which its own fixed-N guard already refuses -- so the exact diag(f) is
+    correct there and stays."""
+    import inspect
+    from gw.cohsex_sigma import build_Gij
+
+    src = inspect.getsource(build_Gij)
+    assert "occupation_window_threshold" not in src
+    assert "Gij[:, idx, idx] = f_win.astype(np.complex128)" in src
+    assert "hartree density would be missing weight carried by bands" in (
+        src.lower())
