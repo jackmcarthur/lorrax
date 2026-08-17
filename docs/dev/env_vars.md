@@ -185,6 +185,11 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    `services/wfn_loader/src/wfn_loader/loader.py`) → the `slab_io`/backend config
    section, so the read path is recorded alongside the write path.
 
+**Guard escape hatch (physics, not a capability):**
+`LORRAX_OCCUPATION_SUPPORT` defaults to unset (strict refusal); the sole
+case-insensitive nonempty value `allow-truncated` logs the support bounds and
+continues, and every other value refuses by name.
+
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
 timing belongs in the job script, not the physics input).

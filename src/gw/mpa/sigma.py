@@ -168,7 +168,7 @@ def integrate_sigma_store(
         return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry, occupation_state=None):
+def _branches(wfns, omega, efermi_ry, occupation_state=None, *, print_fn=print):
     """The four causal branches, with occupation and energy kept separate.
 
     Band axis is ``slices.sigma_sum`` -- the Sigma band count, not the
@@ -184,7 +184,9 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     with f≠0 at weight f, the cond branch every band with f≠1 at weight
     1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
     overshoot (f<0 or f>1) rides through unchanged
-    (docs/theory/finite-occupation-screening.md).
+    (docs/theory/finite-occupation-screening.md).  Before slicing, the
+    metallic path refuses unless ``sigma_sum`` contains the full exact
+    ``supp(f)``.
     """
     if occupation_state is None:
         energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
@@ -204,6 +206,12 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
             f"state: efermi_ry={float(efermi_ry):.12g} Ry vs "
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
+    from gw.w_isdf import assert_sigma_contains_occupation_support
+    assert_sigma_contains_occupation_support(
+        wfns.enk, occupation_state.f_kn, wfns.slices.sigma_sum,
+        band_offset=getattr(wfns.slices, "b0", 0),
+        where="mpa.sigma._branches",
+        log=print_fn)
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
                     wfns.enk.shape)[:, wfns.slices.sigma_sum]
     energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
@@ -252,7 +260,8 @@ def compute_sigma_c_mpa_omega_grid(
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = _branches(wfns, omega_grid_ry, efermi_ry,
-                         occupation_state=occupation_state)
+                         occupation_state=occupation_state,
+                         print_fn=print_fn)
     summaries = []
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader

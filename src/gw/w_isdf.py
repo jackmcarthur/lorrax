@@ -1113,8 +1113,12 @@ def _exact_occupation_support_slices(occupations):
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
-    f_support = np.any(occ != 0.0, axis=0)
-    u_support = np.any(occ != 1.0, axis=0)
+    # MAGNITUDE is load-bearing for MP1: its wrong-side lobe is negative
+    # (about -0.0355 at the extremum), but is still occupied support.  The
+    # magnitude spelling is bit-equivalent to the old ``!= 0`` no-slop rule,
+    # including signed zero, while making the support definition explicit.
+    f_support = np.any(np.abs(occ) != 0.0, axis=0)
+    u_support = np.any(np.abs(1.0 - occ) != 0.0, axis=0)
     if not np.any(f_support) or not np.any(u_support):
         raise ValueError(
             "fractional contour chi0 needs at least one nonzero f band and "
@@ -1464,6 +1468,95 @@ def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
     f_slice, u_slice = _exact_occupation_support_slices(occupations_kn)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
+
+
+OCCUPATION_SUPPORT_ENV = "LORRAX_OCCUPATION_SUPPORT"
+OCCUPATION_SUPPORT_ALLOW_TRUNCATED = "allow-truncated"
+
+
+class OccupationSupportTruncationError(ValueError):
+    """``number_bands_sigma`` truncates exact metallic ``supp(f)``."""
+
+
+def assert_sigma_contains_occupation_support(
+    energies_kn_ry,
+    occupations_kn,
+    sigma_sum,
+    *,
+    band_offset=0,
+    where="",
+    log=print,
+):
+    """Refuse when the Sigma band sum omits exact occupied support.
+
+    The guard is deliberately about ``supp(f)`` only.  Omitting a nonzero
+    occupied weight removes a physical term that no later band weight can
+    restore; truncating the high ``(1-f)`` tail is the convergence axis that
+    ``number_bands_sigma`` and band extrapolation exist to control.
+
+    ``occupation_support_bandwidth`` is evaluated over the same exact,
+    magnitude-bounded support and is quoted in every refusal/warning.  The
+    override is intentionally loud: ``LORRAX_OCCUPATION_SUPPORT=allow-truncated``
+    logs the identical numbers and continues with a deliberately incomplete
+    occupied sum.
+    """
+    e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
+    f = np.asarray(jax.device_get(occupations_kn), dtype=np.float64)
+    if e.ndim != 2:
+        raise ValueError(
+            "occupation-support guard needs energies with shape (nk, nb), "
+            f"got {e.shape}")
+    if f.shape != e.shape:
+        if f.size != e.size:
+            raise ValueError(
+                "occupation-support guard needs occupations matching the "
+                f"energies {e.shape}, got {f.shape}")
+        f = np.reshape(f, e.shape)
+
+    f_slice, _ = _exact_occupation_support_slices(f)
+    sigma_start = 0 if sigma_sum.start is None else int(sigma_sum.start)
+    sigma_stop = e.shape[1] if sigma_sum.stop is None else int(sigma_sum.stop)
+    if sigma_sum.step not in (None, 1):
+        raise ValueError(
+            "occupation-support guard needs a contiguous sigma_sum slice; "
+            f"got {sigma_sum}")
+    if sigma_start <= int(f_slice.start) and sigma_stop >= int(f_slice.stop):
+        return
+
+    offset = int(band_offset)
+    configured = offset + sigma_stop
+    required = offset + int(f_slice.stop)
+    bandwidth_ry = occupation_support_bandwidth(e, f)
+    tag = f" ({where})" if where else ""
+    message = (
+        f"metallic occupation support{tag}: number_bands_sigma={configured} "
+        f"truncates exact supp(f).\n"
+        f"  sigma_sum=[{offset + sigma_start}, {configured}), while the "
+        f"magnitude-bounded |f| != 0 support is "
+        f"[{offset + int(f_slice.start)}, {required}); required minimum "
+        f"number_bands_sigma={required}.\n"
+        f"  occupation_support_bandwidth={bandwidth_ry:.12g} Ry over the "
+        f"same no-slop occupation supports.  Raise number_bands_sigma to at "
+        f"least {required}, or set "
+        f"{OCCUPATION_SUPPORT_ENV}={OCCUPATION_SUPPORT_ALLOW_TRUNCATED} to "
+        f"WARN and continue with deliberately truncated occupied support.")
+
+    # Literal at the read site is intentional: tests/test_env_registry.py's
+    # AST audit can then prove that the documented spelling covers this read.
+    override = os.environ.get(
+        "LORRAX_OCCUPATION_SUPPORT", "").strip().lower()
+    if override == OCCUPATION_SUPPORT_ALLOW_TRUNCATED:
+        log("  *** WARNING: " + message.replace("\n", "\n  *** ")
+            + f"\n  *** Continuing because {OCCUPATION_SUPPORT_ENV}="
+              f"{OCCUPATION_SUPPORT_ALLOW_TRUNCATED} was set. ***")
+        return
+    if override:
+        raise OccupationSupportTruncationError(
+            message + f"\n  Unrecognised {OCCUPATION_SUPPORT_ENV}="
+            f"{os.environ.get('LORRAX_OCCUPATION_SUPPORT')!r}; accepted grammar "
+            f"is unset (refuse) or "
+            f"{OCCUPATION_SUPPORT_ALLOW_TRUNCATED!r} (warn and continue).")
+    raise OccupationSupportTruncationError(message)
 
 
 def compute_chi0_static_fractional(

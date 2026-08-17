@@ -387,10 +387,10 @@ def compute_ppm_sigma_pipeline(
     builds the QSGW matrix.
 
     ``occupation_state`` is the iteration's
-    :class:`gw.efermi.OccupationState`, carried through to the one
-    occupation projector this pipeline builds (the invalid-pole
-    static-COHSEX term in ``ppm_sigma``).  ``None`` — every insulating
-    deck — keeps the integer projector bit-for-bit.
+    :class:`gw.efermi.OccupationState`, used to guard the Sigma band slice
+    and carried through to the one occupation projector this pipeline builds
+    (the invalid-pole static-COHSEX term in ``ppm_sigma``).  ``None`` — every
+    insulating deck — keeps the integer projector bit-for-bit.
     """
     if not config.do_screened:
         raise ValueError("PPM Σ^c pipeline requires do_screened=true.")
@@ -470,6 +470,12 @@ def compute_ppm_sigma_pipeline(
         # Before precompile_sigma, so a mismatch costs no compile and no Σ.
         assert_brackets_match_ols_abscissae(
             plan, s, meta=meta, where="ppm_pipeline plan seam")
+        if occupation_state is not None:
+            from .w_isdf import assert_sigma_contains_occupation_support
+            assert_sigma_contains_occupation_support(
+                wfns.enk, occupation_state.f_kn, s.sigma_sum,
+                band_offset=s.b0, where="ppm_pipeline plan seam",
+                log=print_fn)
         if plan.enabled:
             print_fn(
                 f"  Σc band extrapolation: ON — {plan.n_brackets} disjoint "
