@@ -44,6 +44,7 @@ def test_function_reexports_are_the_door_objects():
     assert gcv0._round_up_fft_size is vcoul._round_up_fft_size
     assert frb.read_bgw_vcoul is vcoul.read_bgw_vcoul
     assert frb.fill_v_grid_for_q is vcoul.fill_v_grid_for_q
+    assert frb.fill_v_sphere_for_q is vcoul.fill_v_sphere_for_q
     assert frb.BGWVcoulTable is vcoul.BGWVcoulTable
     assert gcb.SysDim is vcoul.SysDim
 
