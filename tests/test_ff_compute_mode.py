@@ -247,6 +247,63 @@ def test_the_sigma_dispatch_no_longer_reaches_the_ppm_pipeline_by_else():
     assert "refuse_unimplemented_compute_mode(mode" in body
 
 
+class _ReachedStaticChannels(Exception):
+    """Sentinel proving a mode passed the dispatch's early refusals."""
+
+
+def _call_sigma_dispatch_until_static_channels(monkeypatch, mode, material):
+    import types
+
+    import gw.cohsex_sigma as cohsex_sigma
+    from gw.sigma_dispatch import compute_sigma_xc
+
+    def reached(*_args, **_kwargs):
+        raise _ReachedStaticChannels
+
+    monkeypatch.setattr(cohsex_sigma, "compute_v_h_sigma_x", reached)
+    return compute_sigma_xc(
+        mode,
+        wfns=None,
+        V_q=None,
+        W_by_role={},
+        e_qp_ev=None,
+        static_head_terms=None,
+        head_resolver=None,
+        quad=None,
+        config=types.SimpleNamespace(
+            mpa=types.SimpleNamespace(material_class=material)),
+        meta=None,
+        mesh_xy=None,
+        sym=None,
+        wfn=None,
+        band_slices=None,
+        input_dir=".",
+    )
+
+
+@pytest.mark.parametrize("mode", (ComputeMode.GN_PPM, ComputeMode.HL_PPM))
+def test_metal_ppm_sigma_refuses_the_two_fermi_level_split(monkeypatch, mode):
+    with pytest.raises(ValueError) as excinfo:
+        _call_sigma_dispatch_until_static_channels(monkeypatch, mode, "metal")
+
+    message = str(excinfo.value)
+    assert mode.value in message
+    assert "two Fermi levels" in message
+    assert "insulator-only" in message
+    assert "TODO(metal-greens)" in message
+    assert "compute_mode = mpa" in message
+
+
+@pytest.mark.parametrize(
+    ("mode", "material"),
+    ((ComputeMode.GN_PPM, "insulator"), (ComputeMode.MPA, "metal")),
+)
+def test_metal_ppm_refusal_leaves_supported_dispatches_untouched(
+        monkeypatch, mode, material):
+    with pytest.raises(_ReachedStaticChannels):
+        _call_sigma_dispatch_until_static_channels(monkeypatch, mode, material)
+
+
 def test_the_ppm_pipeline_turns_away_a_mode_with_no_pole_model():
     """The pipeline reads the mode as "HL, or else GN" in three places.
 

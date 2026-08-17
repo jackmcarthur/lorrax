@@ -573,6 +573,16 @@ def compute_sigma_xc(
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
+    if config.mpa.material_class == "metal" and mode.ppm_model is not None:
+        raise ValueError(
+            "compute_sigma_xc: mpa_material_class = metal with "
+            f"compute_mode = {mode.value} is refused.  GN-PPM/HL-PPM "
+            "Sigma is insulator-only for occupations until "
+            "TODO(metal-greens): it would use two Fermi levels in one "
+            "iteration, splitting its Green's function at the T=0/midgap "
+            "E_F from wfns.occ while metal screening, rho, and the head use "
+            "the fixed-N MP1 mu.  Use compute_mode = mpa for metals.")
+
     # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
     # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
     # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
