@@ -152,6 +152,10 @@ from symmetry_maps.maps import (
     star_broadcast,
     star_select,
     star_spread,
+    star_tables_of,
+    unfold_file_wedge_to_full_bz,
+    reduce_full_bz_to_file_wedge,
+    unfold_star_wedge_to_full_bz,
     tau_phase_row,
     spinor_rotation_for_sym_row,
     unfold_psi,
@@ -210,6 +214,8 @@ __all__ = [
     "SymMaps", "kgrid_shift_map", "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
+    "star_tables_of", "unfold_file_wedge_to_full_bz",
+    "reduce_full_bz_to_file_wedge", "unfold_star_wedge_to_full_bz",
     # directed band-matrix edges: pure table + the one symmetry action
     "directed_edge_orbit_table", "q_stencil_orbit_table",
     "apply_band_matrix_symmetry",

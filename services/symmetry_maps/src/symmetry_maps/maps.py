@@ -2336,6 +2336,38 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     return _broadcast_rows(A_irr, take, conj)
 
 
+# ── PROBE-ONLY GRAFT (star-freshness lane, 2026-08-17) ───────────────
+# Copied VERBATIM from feat/wedge-storage-migration-2026-08-16 @ 0916b51a
+# so that reports/wedge_storage_migration_2026-08-16/artifacts/
+# probe_star_relation.py runs unmodified against main @ 67ff9d1b.
+# Pure additions: no existing symbol is touched, star_broadcast is
+# byte-identical to main's apart from its keyword default (unused here,
+# both call sites below pass trs_reference explicitly).
+
+def star_tables_of(sym):
+    return (np.asarray(sym.irr_idx_k, dtype=np.int32),
+            np.asarray(sym.sym_idx_k, dtype=np.int32),
+            int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
+
+
+_star_tables_of = star_tables_of
+
+
+def unfold_file_wedge_to_full_bz(sym, data):
+    irr, sidx, nss = _star_tables_of(sym)
+    return star_broadcast(data, irr, sidx, nss, trs_reference="ibz_slab")
+
+
+def reduce_full_bz_to_file_wedge(sym, data):
+    rows = np.asarray(sym.kirr_fullids, dtype=np.int32)
+    return _take_rows(data, rows)
+
+
+def unfold_star_wedge_to_full_bz(sym, data):
+    irr, sidx, nss = _star_tables_of(sym)
+    return star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
+
+
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
     """max residual of ``A_full`` against its own star, by the right rule.
 

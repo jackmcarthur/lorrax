@@ -1096,6 +1096,20 @@ def main(argv=None):
     # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
     # stays in the legacy layout (see ``store_ibz`` below).
     store_ibz = not bool(args.fold_hartree and args.hartree)
+    # ---- PROBE-ONLY (star-freshness lane, 2026-08-17) -------------------
+    # The generator's own module header names the ONLY check that can fail:
+    # "a regenerated table diffed element-by-element against one the full-BZ
+    # path produced".  The full-BZ path was retired when the unfold moved to
+    # the reader, so there is nothing left in-tree that evaluates T+V_loc+V_NL
+    # independently at every full-BZ k.  LX_PROBE_KIN_ION_FULL_BZ=1 restores
+    # exactly that: the SAME sweep, the SAME operators, the k-set swapped to
+    # "full_bz" (so psi comes from WfnLoader's symmetry unfold) and NO star
+    # broadcast afterwards.  Default-off; touches nothing when unset.
+    probe_full_bz = os.environ.get("LX_PROBE_KIN_ION_FULL_BZ") == "1"
+    if probe_full_bz:
+        store_ibz = False
+        print0("[PROBE] LX_PROBE_KIN_ION_FULL_BZ=1: computing kin_ion "
+               "INDEPENDENTLY at every full-BZ k (no star broadcast)")
     v_h_all = None
     if args.hartree:
         with timing.section("build_V_H"):
@@ -1138,9 +1152,10 @@ def main(argv=None):
     # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
-    nk_irr = int(wfn.nkpts)
-    gtab = padded_gvectors(wfn, k="ibz")
-    psi_G = wfn.load(bands=(0, nb_eff), k="ibz",
+    _kset = "full_bz" if probe_full_bz else "ibz"
+    nk_irr = int(sym.nk_tot) if probe_full_bz else int(wfn.nkpts)
+    gtab = padded_gvectors(wfn, k=_kset)
+    psi_G = wfn.load(bands=(0, nb_eff), k=_kset,
                      sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb_eff,
@@ -1160,10 +1175,11 @@ def main(argv=None):
         H_kin_ion = sweep_matrix_elements(
             psi_G, operator=sum_operators(*terms), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k="ibz"),
+            box_index=wfn.box_index(k=_kset),
             # the file's own IBZ k, for the same reason as the V_H sweep:
             # ψ and the G-list here are the raw IBZ slab.
-            kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
+            kvecs=np.asarray(sym.unfolded_kpts if probe_full_bz
+                             else wfn.kpoints, dtype=np.float64))
         # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
         # cannot take a sharded operand, so the block is gathered to the
         # owner here and nowhere else.  ``owner_only`` keeps the peers'
@@ -1171,7 +1187,7 @@ def main(argv=None):
         # leaves this block is the IBZ slab itself — the star broadcast
         # used to follow immediately and now happens at the reader.
         kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
-        kin_ion_all = (kin_ion_irr if store_ibz
+        kin_ion_all = (kin_ion_irr if (store_ibz or probe_full_bz)
                        else broadcast_ibz_to_full_bz(kin_ion_irr, sym))
     del H_kin_ion, psi_G
 
@@ -1186,7 +1202,7 @@ def main(argv=None):
     # ``resolve_soc_mode`` can only announce an assumption — this one can
     # still MEASURE whether the assumption was wrong, by asking whether
     # T+V_loc+V_NL splits a manifold that ``el`` holds degenerate.
-    if rank == 0 and kin_ion_irr is not None:
+    if rank == 0 and kin_ion_irr is not None and not probe_full_bz:
         from psp.operator_checks import check_degeneracy_consistency
         _en = np.asarray(wfn.energies)
         _en = _en[0] if _en.ndim == 3 else _en          # (nk, nb), Ry
@@ -1297,8 +1313,10 @@ def main(argv=None):
                 # ``nrk`` and ``k_set_computed`` predate the storage change
                 # and keep their meaning: ``nk - nrk`` full-BZ rows are
                 # symmetry copies, not independent evaluations.
-                ds.attrs["nrk"] = int(wfn.nkpts)
-                ds.attrs["k_set_computed"] = "ibz"
+                ds.attrs["nrk"] = (int(sym.nk_tot) if probe_full_bz
+                                   else int(wfn.nkpts))
+                ds.attrs["k_set_computed"] = ("full_bz_probe" if probe_full_bz
+                                              else "ibz")
                 if v_h_all is not None and not folded:
                     vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
                                           dtype=np.complex128)
