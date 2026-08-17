@@ -515,6 +515,7 @@ def _solve_head_occupations(
         np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64),
         tuple(int(x) for x in inputs.wfn.kgrid),
         float(mu_ry),
+        symmetry_matrices=np.asarray(inputs.sym.sym_mats_k),
     )
     # POST-INTEGRATION STAR SYMMETRIZATION.  The six tetrahedra all share one
     # hardcoded (1,1,1) body diagonal, so the weight table is NOT star

@@ -16,14 +16,20 @@ Pure numpy + the module under test.  No device, no container, no fixtures.
 Measured counterpart on the real deck (bcc Na 8x8x8, 48 ops, converged
 metallic MPA-QSGW state): 4 of 48 ops leave the raw table invariant, the
 Drude tensor is 2.68 percent anisotropic, and after symmetrization it is
-isotropic to 7e-13 with the trace unchanged to the last bit.
+isotropic to 7e-13 with the trace unchanged to the last bit.  The production
+caller now supplies those operations to average the 12-member decomposition
+orbit; the legacy no-keyword path tested below remains unchanged.
 """
 import itertools
 
 import numpy as np
 import pytest
 
-from gw.fermi_surface import star_symmetrize_weights, tetrahedron_delta_weights
+from gw.fermi_surface import (
+    _tetrahedron_decomposition_orbit,
+    star_symmetrize_weights,
+    tetrahedron_delta_weights,
+)
 
 
 # --- a synthetic simple-cubic deck -----------------------------------------
@@ -42,6 +48,31 @@ def _cubic_ops():
                 m[i, j] = signs[i]
             ops.append(m)
     return ops
+
+
+def _bcc_ops():
+    """Cubic operations in the primitive reciprocal basis of the Na deck."""
+    bvec = np.asarray(((1, 0, 1), (-1, 1, 0), (0, -1, 1)),
+                      dtype=np.float64)
+    change_basis = np.linalg.inv(bvec.T)
+    ops = [change_basis @ op @ bvec.T for op in _cubic_ops()]
+    assert all(np.allclose(op, np.rint(op), rtol=0.0, atol=1.0e-14)
+               for op in ops)
+    return [np.rint(op).astype(np.int64) for op in ops]
+
+
+def _orbit_labels(indices, grid, operations):
+    key = {tuple(r): i for i, r in enumerate(np.mod(indices, grid))}
+    label = np.full(indices.shape[0], -1, dtype=np.int64)
+    nstar = 0
+    for i, r in enumerate(np.mod(indices, grid)):
+        if label[i] >= 0:
+            continue
+        for matrix in operations:
+            label[key[tuple(np.mod(matrix @ r, grid))]] = nstar
+        nstar += 1
+    assert np.all(label >= 0)
+    return label
 
 
 def _deck():
@@ -64,16 +95,7 @@ def _deck():
     velocities = (2.0 * np.pi * np.sin(2.0 * np.pi * kfrac)).T[:, :, None]
 
     # exact orbits under the 48 cubic ops, built from the ops themselves
-    key = {tuple(r): i for i, r in enumerate(np.mod(idx, g))}
-    label = np.full(idx.shape[0], -1, dtype=np.int64)
-    nstar = 0
-    for i, r in enumerate(np.mod(idx, g)):
-        if label[i] >= 0:
-            continue
-        for m in _cubic_ops():
-            label[key[tuple(np.mod(m @ r, g))]] = nstar
-        nstar += 1
-    assert np.all(label >= 0)
+    label = _orbit_labels(idx, g, _cubic_ops())
     return kfrac, energies, velocities, label
 
 
@@ -145,6 +167,54 @@ def test_drude_tensor_isotropy_on_a_cubic_deck(deck, weights):
     assert _anisotropy(d_sym) < 1.0e-12, (
         f"star-symmetrized Drude tensor is not isotropic: {d_sym!r}")
     assert np.trace(d_sym) == pytest.approx(np.trace(d_raw), rel=1.0e-14)
+
+
+@pytest.fixture(scope="module")
+def bcc_covariant_weights():
+    grid = np.asarray(_GRID, dtype=np.int64)
+    idx = np.asarray(list(np.ndindex(*_GRID)), dtype=np.int64)
+    kfrac = idx / grid[None, :]
+    operations = _bcc_ops()
+    labels = _orbit_labels(idx, grid, operations)
+
+    seed = (np.cos(2.0 * np.pi * kfrac[:, 0])
+            + 0.37 * np.cos(2.0 * np.pi * (kfrac[:, 1] + kfrac[:, 2])))
+    energies = np.empty(idx.shape[0], dtype=np.float64)
+    for star in np.unique(labels):
+        members = labels == star
+        energies[members] = np.mean(seed[members])
+    levels = np.unique(energies)
+    middle = len(levels) // 2
+    mu = 0.5 * (levels[middle - 1] + levels[middle])
+
+    assert len(operations) == 48
+    assert len(_tetrahedron_decomposition_orbit(operations)) == 12
+    weights = tetrahedron_delta_weights(
+        energies[:, None], kfrac, grid, mu,
+        symmetry_matrices=np.asarray(operations),
+    )
+    return idx, labels, operations, weights
+
+
+def test_bcc_na_base_weights_carry_all_48_operations(
+        bcc_covariant_weights):
+    """The 12-partition orbit closes the bcc Na primitive-basis gap."""
+    idx, _, operations, weights = bcc_covariant_weights
+    grid = np.asarray(_GRID, dtype=np.int64)
+    key = {tuple(r): i for i, r in enumerate(idx)}
+    for operation in operations:
+        perm = np.asarray([
+            key[tuple(np.mod(operation @ r, grid))] for r in idx
+        ])
+        assert np.allclose(weights[perm], weights, rtol=1.0e-13,
+                           atol=1.0e-15)
+
+
+def test_bcc_na_posthoc_symmetrization_is_idempotent(
+        bcc_covariant_weights):
+    _, labels, _, weights = bcc_covariant_weights
+    symmetrized = star_symmetrize_weights(weights, labels)
+    assert np.max(np.abs(symmetrized - weights)) < 1.0e-14
 
 
 def test_star_symmetrize_refuses_a_mismatched_label_array(weights):
