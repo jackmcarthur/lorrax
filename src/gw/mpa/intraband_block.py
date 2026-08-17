@@ -214,7 +214,7 @@ def _relative_error(model, exact):
 
 
 def _contour_geometry(pair_block, W0bar):
-    """Derived positive-zeta strip and its machine-only outer guard."""
+    """Derived two-sided zeta strip, with the zeta=0 pole excluded."""
     u, w, _vertices = pair_block
     u_host = _host_replicated(u).astype(np.float64, copy=False)
     w_host = _host_replicated(w).astype(np.float64, copy=False)
@@ -234,35 +234,53 @@ def _contour_geometry(pair_block, W0bar):
         raise ValueError(
             "GATE intraband_contour_domain: crossing block has no nonzero "
             "transition energy")
-    # Zero must remain outside the V contours.  Keeping the left edge a
-    # resolved distance from sqrt's branch point is required for the T1
-    # quadrature to converge; the independent M/V closures are the authority
-    # and refuse if screening moved a collective pole below this edge.
-    left = max(0.25 * float(np.min(positive_u2)),
-               np.finfo(np.float64).eps * zeta_max)
+    # H=diag(u**2)+low-rank is non-Hermitian when MP1 weights change sign.
+    # The norm bound therefore applies on *both* sides of the bare positive
+    # spectrum.  Production row 2 is the decisive case: a positive-only
+    # strip missed half of both exact totals.  That is a mandatory sum-rule
+    # refusal, not a physical model.
+    zeta_min = -interaction
+    # Zero must remain outside every V contour.  Keeping both inner edges a
+    # resolved distance from sqrt's branch point is required for T1
+    # quadrature convergence; the independent M/V closures refuse if a mode
+    # falls into this machine-only gap.
+    zero_gap = max(0.25 * float(np.min(positive_u2)),
+                   np.finfo(np.float64).eps * zeta_max)
     # The interaction radius is the derived imaginary excursion.  Its only
     # floor is roundoff separation from the real axis.
     height = max(interaction,
                  128.0 * np.finfo(np.float64).eps * zeta_max)
-    return left, zeta_max, height
+    if not 0.0 < zero_gap < zeta_max:
+        raise ValueError(
+            "GATE intraband_contour_domain: derived two-sided strip cannot "
+            "exclude zeta=0: "
+            f"zeta_min={zeta_min:.17e}, zero_gap={zero_gap:.17e}, "
+            f"zeta_max={zeta_max:.17e}")
+    return zeta_min, zero_gap, zeta_max, height
 
 
 def _initial_intervals(pair_block, W0bar):
-    """Three energy-quantile tiles spanning the complete derived strip."""
-    left, right, _height = _contour_geometry(pair_block, W0bar)
+    """Three certified tiles, extending negative for signed MP1 weights."""
+    left, zero_gap, right, _height = _contour_geometry(pair_block, W0bar)
     u2 = np.sort(np.square(np.abs(_host_replicated(pair_block[0]))))
-    edges = [left]
-    for numerator in range(1, MIN_CLUSTERS):
-        cut = int(np.ceil(numerator * u2.size / MIN_CLUSTERS))
+    w = _host_replicated(pair_block[1])
+    negative_active = bool(np.any(w < 0.0) and left < -zero_gap)
+    n_positive = MIN_CLUSTERS - int(negative_active)
+    edges = [zero_gap]
+    for numerator in range(1, n_positive):
+        cut = int(np.ceil(numerator * u2.size / n_positive))
         cut = min(max(cut, 1), u2.size - 1)
         edge = 0.5 * (float(u2[cut - 1]) + float(u2[cut]))
         edge = min(max(edge, np.nextafter(edges[-1], np.inf)), right)
         edges.append(edge)
     edges.append(right)
     if any(not lo < hi for lo, hi in zip(edges[:-1], edges[1:])):
-        edges = list(np.linspace(left, right, MIN_CLUSTERS + 1))
-    return [(float(lo), float(hi))
-            for lo, hi in zip(edges[:-1], edges[1:])]
+        edges = list(np.linspace(zero_gap, right, n_positive + 1))
+    intervals = ([(float(left), float(-zero_gap))]
+                 if negative_active else [])
+    intervals.extend((float(lo), float(hi))
+                     for lo, hi in zip(edges[:-1], edges[1:]))
+    return intervals
 
 
 def _quadrature_nodes(interval, height, order):
@@ -282,11 +300,20 @@ def _quadrature_nodes(interval, height, order):
             yield midpoint + half * xi, half * wi
 
 
+def _retarded_sqrt_on_interval(zeta, interval):
+    """Analytic square-root branch local to one side of the zero gap."""
+    if float(interval[1]) < 0.0:
+        # sqrt(-zeta) has its cut on the positive-zeta axis, outside a
+        # negative interval contour.  The -i sheet is the retarded fold.
+        return -1.0j * np.sqrt(-complex(zeta))
+    return np.sqrt(complex(zeta))
+
+
 def _moments_at_order(pair_block, W0bar, intervals, order, V_total):
     mesh = _mesh_of(W0bar, "_moments_at_order")
     matrix_shard = NamedSharding(mesh, P("x", "y"))
     pole_shard = NamedSharding(mesh, P(None, "x", "y"))
-    _left, _right, height = _contour_geometry(pair_block, W0bar)
+    _left, _zero_gap, _right, height = _contour_geometry(pair_block, W0bar)
     shape = tuple(W0bar.shape)
     M_rows, V_rows, T1_rows, T2_rows = [], [], [], []
     normalization = 1.0 / (2.0j * np.pi)
@@ -312,7 +339,8 @@ def _moments_at_order(pair_block, W0bar, intervals, order, V_total):
                 # -C/lambda.  This minus makes V=R(0).  Subtracting R(0)
                 # analytically removes the nearby but excluded zeta=0 pole.
                 V = V - factor * (R - V_total) / zeta
-                T1 = T1 + factor * np.sqrt(zeta) * R
+                T1 = T1 + factor * _retarded_sqrt_on_interval(
+                    zeta, interval) * R
                 T2 = T2 + factor * zeta * R
         M_rows.append(jax.lax.with_sharding_constraint(M, matrix_shard))
         V_rows.append(jax.lax.with_sharding_constraint(V, matrix_shard))
@@ -332,16 +360,34 @@ def _cluster_moment_matrices(
         raise ValueError(
             "GATE intraband_contour_intervals: intervals must be nonempty "
             "ordered (lo,hi) pairs")
-    left, right, _height = _contour_geometry(pair_block, W0bar)
+    left, zero_gap, right, _height = _contour_geometry(pair_block, W0bar)
+    negative = tuple(value for value in intervals if value[1] < 0.0)
+    positive = tuple(value for value in intervals if value[0] > 0.0)
+    negative_domain_ok = (
+        (negative
+         and abs(negative[0][0] - left) <= 8.0 * abs(np.spacing(left))
+         and abs(negative[-1][1] + zero_gap)
+         <= 8.0 * abs(np.spacing(zero_gap)))
+        or not negative
+    )
     tiled = (
-        abs(intervals[0][0] - left) <= 8.0 * np.spacing(left)
-        and abs(intervals[-1][1] - right) <= 8.0 * np.spacing(right)
-        and all(a[1] == b[0] for a, b in zip(intervals[:-1], intervals[1:]))
+        len(negative) + len(positive) == len(intervals)
+        and positive
+        and negative_domain_ok
+        and abs(positive[0][0] - zero_gap)
+        <= 8.0 * abs(np.spacing(zero_gap))
+        and abs(positive[-1][1] - right) <= 8.0 * abs(np.spacing(right))
+        and all(a[1] == b[0]
+                for group in (negative, positive)
+                for a, b in zip(group[:-1], group[1:]))
+        and tuple((*negative, *positive)) == intervals
     )
     if not tiled:
         raise ValueError(
             "GATE intraband_contour_intervals: intervals do not exactly tile "
-            f"the derived [{left:.17e},{right:.17e}] strip")
+            "a closure-certifiable strip "
+            f"([{left:.17e},{-zero_gap:.17e}] U) "
+            f"[{zero_gap:.17e},{right:.17e}]")
 
     M_total, V_total = _exact_moment_totals(pair_block, W0bar)
     previous = None
@@ -407,6 +453,27 @@ def _compress_moments(mesh, M, V, T1, T2):
     """The landed elementwise two-moment match fed by contour moments."""
     matrix_shard = NamedSharding(mesh, P("x", "y"))
     pole_shard = NamedSharding(mesh, P(None, "x", "y"))
+    # A derived norm bound may leave a contour with provably no enclosed
+    # mode.  Its numerical integral is roundoff, not a stored pole.  Removing
+    # such a row is allowed only far inside the already-enforced sum-rule
+    # tolerance; both independent totals must say it is empty.
+    M_scale = max(float(jax.device_get(jnp.linalg.norm(jnp.sum(M, axis=0)))),
+                  np.finfo(np.float64).tiny)
+    V_scale = max(float(jax.device_get(jnp.linalg.norm(jnp.sum(V, axis=0)))),
+                  np.finfo(np.float64).tiny)
+    keep = np.asarray([
+        (float(jax.device_get(jnp.linalg.norm(M[index]))) / M_scale
+         > 0.1 * SUM_RULE_REL_TOL)
+        or (float(jax.device_get(jnp.linalg.norm(V[index]))) / V_scale
+            > 0.1 * SUM_RULE_REL_TOL)
+        for index in range(int(M.shape[0]))
+    ], dtype=bool)
+    if not np.any(keep):
+        raise ValueError(
+            "GATE intraband_contour_empty: every certified contour has "
+            "zero M and V weight")
+    active = jnp.asarray(np.flatnonzero(keep), dtype=jnp.int32)
+    M, V, T1, T2 = (value[active] for value in (M, V, T1, T2))
     widths = _cluster_widths(M, T1, T2)
     Omega_rows, B_rows = [], []
     folded_elements = 0
@@ -534,7 +601,7 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
                     fold_el, drop_el, width)
         if error <= float(sample_rel_tol) and static_error <= STATIC_REL_TOL:
             break
-        if len(intervals) >= MAX_CLUSTERS:
+        if int(Om.shape[0]) >= MAX_CLUSTERS:
             raise ValueError(
                 "GATE intraband_cluster_budget: six contour clusters do not "
                 "meet the fixed block certificate; "
@@ -544,11 +611,12 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
         intervals = _split_largest_trace_interval(intervals, M, pair_block)
 
     Om, Bp, error, static_error, fold_el, drop_el, width = selected
-    _print_memory_model(pair_block, W0bar, len(intervals))
+    n_poles = int(Om.shape[0])
+    _print_memory_model(pair_block, W0bar, n_poles)
     return IntrabandRow(
         Omega_p=Om,
         B_p=Bp,
-        n_poles=int(len(intervals)),
+        n_poles=n_poles,
         n_modes=n_pair,
         sample_max_rel_error=float(error),
         static_max_rel_error=float(static_error),

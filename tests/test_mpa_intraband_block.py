@@ -131,7 +131,8 @@ def test_5598_mode_row_builds_without_pair_square_allocation(capsys, monkeypatch
 def _dense_partition_moments(mesh, W0, block, intervals):
     eigenvalues, left, right, _weights = IB._dense_reference_modes(W0, block)
     lam = np.asarray(eigenvalues, dtype=np.complex128)
-    left_bound, _right_bound, height = IB._contour_geometry(block, W0)
+    _left_bound, _zero_gap, _right_bound, height = IB._contour_geometry(
+        block, W0)
     rows = [[], [], [], []]
     for lo, hi in intervals:
         select = ((lam.real >= lo) & (lam.real <= hi)
@@ -145,7 +146,11 @@ def _dense_partition_moments(mesh, W0, block, intervals):
         C = l @ r
         rows[0].append(-C)
         rows[1].append((l / lc[None, :]) @ r)
-        rows[2].append(-(l * jnp.sqrt(lc)[None, :]) @ r)
+        roots = jnp.asarray([
+            IB._retarded_sqrt_on_interval(value, (lo, hi))
+            for value in lam[select]
+        ])
+        rows[2].append(-(l * roots[None, :]) @ r)
         rows[3].append(-(l * lc[None, :]) @ r)
     sharding = NamedSharding(mesh, P(None, "x", "y"))
     return tuple(jax.device_put(jnp.stack(values), sharding) for values in rows)
@@ -170,6 +175,27 @@ def test_contour_moments_and_compression_match_dense_reference():
     np.testing.assert_allclose(
         np.asarray(contour_poles[1]), np.asarray(dense_poles[1]),
         rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_signed_mp1_weights_cover_the_negative_screened_strip():
+    mesh, W0, vertices, u, w, _block = _fixture(n_pair=18)
+    signed_w = w.copy()
+    signed_w[::2] *= -4.0
+    block = (
+        _put(mesh, u, P(None)),
+        _put(mesh, signed_w, P(None)),
+        (_put(mesh, vertices, P(None, "x")),
+         _put(mesh, vertices, P(None, "y"))),
+    )
+    W0j = _put(mesh, W0, P("x", "y"))
+    intervals = IB._initial_intervals(block, W0j)
+    assert intervals[0][1] < 0.0 < intervals[1][0]
+    contour = IB._cluster_moment_matrices(block, W0j, intervals)
+    dense = _dense_partition_moments(mesh, W0j, block, intervals)
+    for got, expected in zip(contour, dense):
+        np.testing.assert_allclose(
+            np.asarray(got), np.asarray(expected),
+            rtol=1.0e-10, atol=1.0e-12)
 
 
 def test_contour_sum_rules_close_to_1e_minus_12_relative():
