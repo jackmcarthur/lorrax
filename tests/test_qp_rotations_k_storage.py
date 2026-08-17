@@ -19,8 +19,9 @@ from file_io.kin_ion import (                                    # noqa: E402
     SYM_IDX_DATASET,
 )
 from file_io.qp_wfn import (                                     # noqa: E402
-    QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE, qp_rotations_k_storage,
-    read_qp_rotations_full_bz, write_qp_rotations_h5,
+    QP_ROT_FULL_BZ_DATASETS, QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE,
+    qp_rotations_k_storage, read_qp_rotations_full_bz,
+    write_qp_rotations_h5,
 )
 
 
@@ -51,9 +52,12 @@ def _star_consistent_payload(nb=3, seed=0):
     e_red = rng.normal(size=(_NK_RED, nb))
     k_red = rng.normal(size=(_NK_RED, 3))
     from file_io.kin_ion import broadcast_ibz_to_full_bz as _bc
+    # kpoints are NOT star-consistent and must not be: k is the one quantity
+    # here that the symmetry operation changes.  Distinct rows on purpose, so
+    # a cell that reduced them would fail.
     return (np.asarray(_bc(u_red, *_TABLES)),
             np.asarray(_bc(e_red, *_TABLES)),
-            np.asarray(_bc(k_red, *_TABLES)))
+            rng.normal(size=(_NK_FULL, 3)))
 
 
 def _write(tmp_path, name, U, E, kpts, **kw):
@@ -84,13 +88,15 @@ def test_wedge_stored_file_unfolds_back_to_the_full_bz_arrays(tmp_path):
 
     with h5py.File(ref, "r") as f:
         assert f["U_mnk"].shape[0] == _NK_RED, "arrays were not reduced"
-        assert f["kpoints_crys"].shape[0] == _NK_RED
+        # ...and the coordinate/index tables did NOT move
+        assert f["kpoints_crys"].shape[0] == _NK_FULL
+        assert np.array_equal(f["kpoints_crys"][()], kpts)
+        assert np.array_equal(f["kirr_to_kfull"][()], _KIRR_TO_KFULL)
 
     got = read_qp_rotations_full_bz(ref)
     assert np.array_equal(got["U_mnk"], U)
     assert np.array_equal(got["E_qp_nk_hartree"], E)
     assert np.array_equal(got["E_qp_nk_rydberg"], E * 2.0)
-    assert np.array_equal(got["kpoints_crys"], kpts)
 
 
 def test_the_wedge_and_full_arms_read_back_identically(tmp_path):
@@ -153,7 +159,7 @@ def test_an_unstamped_file_is_read_as_full_bz_and_never_reinterpreted(tmp_path):
     assert stored == K_STORAGE_FULL
 
     with h5py.File(path, "r") as f:
-        for name in QP_ROT_K_DATASETS:
+        for name in QP_ROT_K_DATASETS + QP_ROT_FULL_BZ_DATASETS:
             assert K_STORAGE_ATTR not in f[name].attrs, (
                 f"{name} carries a {K_STORAGE_ATTR} attr on the full arm; "
                 f"the full-BZ file must be byte-for-byte what it always was")
@@ -276,27 +282,32 @@ def test_the_stamp_is_the_kin_ion_contract_and_the_tables_travel_with_it(tmp_pat
             assert int(a[N_SYM_SPATIAL_ATTR]) == _NSS
 
 
-def test_kirr_to_kfull_keeps_meaning_the_row_that_holds_that_k(tmp_path):
-    """The in-file index table is rewritten with the arrays, not left stale.
+def test_the_coordinate_and_index_tables_do_not_move(tmp_path):
+    """``kpoints_crys`` / ``kirr_to_kfull`` stay full-BZ, and that is the design.
 
-    ``rotate_wfn_to_qp`` and ``eqp_bgw`` both do ``U_mnk[kirr_to_kfull[ik]]``.
-    On a wedge-stored file that row IS ``ik``, so the table becomes the
-    identity and both readers stay correct with no change.  A wedge-stored
-    array left addressed by full-BZ indices is the silent-corruption case:
-    MEASURED against an 8-row dataset on the Si map
-    ``[0, 1, 2, 5, 6, 7, 10, 27]``, six of the eight indices return the
-    WRONG ROW with no error at all.
+    The unfold is a GATHER — every member of a star gets its parent's row —
+    which is right for an operator that commutes with the symmetry and wrong
+    for the k-VECTORS, because k is the one quantity in this file that the
+    operation changes.  MEASURED on a real ``si_cohsex_debug`` run:
+    reducing ``kpoints_crys`` and gathering it back gives
+    ``max|Δ| = 7.500000e-01``, and 3/4 is not a reciprocal-lattice vector, so
+    no modulo-G reading rescues it.
+
+    They cost 1,536 and 32 bytes there against 3.5 MB of ``U_mnk``, so
+    nothing is lost by leaving them alone — and leaving them alone is what
+    lets ``rotate_wfn_to_qp`` and ``eqp_bgw`` unfold the arrays and then
+    index by full-BZ k exactly as before.
     """
     U, E, kpts = _star_consistent_payload()
-    path, _ = _write(tmp_path, "idx.h5", U, E, kpts,
-                     k_storage="ibz", star_tables=_TABLES)
+    path, stored = _write(tmp_path, "idx.h5", U, E, kpts,
+                          k_storage="ibz", star_tables=_TABLES)
+    assert stored == K_STORAGE_IBZ
     with h5py.File(path, "r") as f:
-        assert np.array_equal(f["kirr_to_kfull"][()], np.arange(_NK_RED))
-        assert np.array_equal(f["kirr_to_kfull_in_full_bz"][()],
-                              _KIRR_TO_KFULL)
-        # the rows a stale consumer would take are the RIGHT ones
-        assert np.array_equal(f["U_mnk"][()][f["kirr_to_kfull"][()]],
-                              U[_KIRR_TO_KFULL])
-        # ...and the coordinates still label them
-        assert np.array_equal(f["kpoints_crys"][()][f["kirr_to_kfull"][()]],
-                              kpts[_KIRR_TO_KFULL])
+        assert np.array_equal(f["kirr_to_kfull"][()], _KIRR_TO_KFULL)
+        assert np.array_equal(f["kpoints_crys"][()], kpts)
+        for name in QP_ROT_FULL_BZ_DATASETS:
+            assert K_STORAGE_ATTR not in f[name].attrs, (
+                f"{name} must NOT be stamped — it did not move")
+    # the consumers' composition: unfold, then index by full-BZ k
+    got = read_qp_rotations_full_bz(path)
+    assert np.array_equal(got["U_mnk"][_KIRR_TO_KFULL], U[_KIRR_TO_KFULL])

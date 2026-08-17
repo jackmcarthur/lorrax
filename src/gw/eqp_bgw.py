@@ -974,17 +974,26 @@ def _read_eval_energies_ev(
 	because both are legitimate answers to "what did Σ get evaluated at"
 	and which one is on disk depends on the deck:
 
-	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, full BZ, ALREADY on the
-	    sigma window (its band axis is ``band_range``), so it is indexed
-	    by ``kirr_to_kfull`` and not sliced in bands.
+	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, ALREADY on the sigma
+	    window (its band axis is ``band_range``), so it is indexed by
+	    ``kirr_to_kfull`` and not sliced in bands.  It is read through
+	    ``file_io.qp_wfn.read_qp_rotations_full_bz`` because that array may
+	    be stored on the file wedge; ``kirr_to_kfull`` is always a full-BZ
+	    index, so the indexing below is unchanged either way.  A file with
+	    no ``k_storage`` attr comes back verbatim.
 	``WFN_qp.h5``           — ``mf_header/kpoints/el``, the WFN file's own
 	    k-set (the IBZ) and ALL bands, so it is sliced in bands and not
 	    in k.
 	"""
 	with h5py.File(path, "r") as f:
-		if "E_qp_nk_rydberg" in f:
-			e = np.asarray(f["E_qp_nk_rydberg"], dtype=np.float64)
-			return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
+		has_rot = "E_qp_nk_rydberg" in f
+	if has_rot:
+		from file_io.qp_wfn import read_qp_rotations_full_bz
+		e = np.asarray(read_qp_rotations_full_bz(
+			path, datasets=("E_qp_nk_rydberg",))["E_qp_nk_rydberg"],
+			dtype=np.float64)
+		return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
+	with h5py.File(path, "r") as f:
 		if "mf_header/kpoints/el" in f:
 			e = np.asarray(f["mf_header/kpoints/el"], dtype=np.float64)
 			return e[0][:, int(band_start):int(band_stop)] * RYD_TO_EV
