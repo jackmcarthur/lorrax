@@ -489,10 +489,14 @@ class ScreeningDiagrams(str, enum.Enum):
     (see :class:`ComputeMode`'s docstring) applies here.
 
     NOT EVERY COMBINATION IS SUPPORTED.  ``w_bse`` is refused at parse
-    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver and
-    ``mc_average_placement != off`` — see
+    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver,
+    ``mc_average_placement != off`` and a declared metal
+    (``mpa_material_class = metal``) — see
     :func:`refuse_unsupported_screening_diagrams`, which carries the
-    reason for each.
+    reason for each.  INSULATORS ONLY is the one of those that a deck key
+    cannot always express: a metallic WFN on a deck that declares nothing
+    is refused at the stage instead, on the occupations themselves
+    (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
     """
 
     W_RPA = "w_rpa"
@@ -573,6 +577,40 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "built; running without it would feed iteration N's ladder the "
         "iteration-1 W(0) and report the result as QSGW-hat.  Named "
         "deferral, DESIGN_2026-08-15.md section 1",
+    ),
+    (
+        # THE ONLY DECK KEY THAT DECLARES A METALLIC TREATMENT, surveyed
+        # over ``_DEFAULTS`` 2026-08-16: ``mpa_material_class``.  There is
+        # no smearing / temperature / occupation key in this parser at all
+        # (the occupations are the WFN's, and the one Fermi-adjacent key,
+        # ``fermi_reference = vbm | midgap``, names where E_F sits INSIDE a
+        # gap and so declares the opposite).  That is why this row is one
+        # predicate and not a disjunction: a second clause here would name
+        # a key that does not exist, and the metallic WFN that carries no
+        # declaring key at all is caught by the RUNTIME occupation gate
+        # (gw/screening_bse.py, GATE w_bse_insulators_only), not by
+        # inventing a parse-time proxy for it.
+        "w_bse_insulators_only",
+        lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
+                     .strip().lower() != "insulator"),
+        lambda cfg: f"mpa_material_class = {cfg.mpa.material_class}",
+        "mpa_material_class = insulator (the default) -- w_bse v1 serves "
+        "insulating systems only",
+        "drop mpa_material_class (or set it to insulator) for a gapped "
+        "system, or keep screening_diagrams = w_rpa for a metal",
+        "the ladder operator, its TRS-gauge machinery and every "
+        "certification this feature has are INSULATOR-DERIVED: integer "
+        "occupations and a gapped D throughout (the pair basis is a "
+        "band-index cut at nelec, and the resolvent's poles are the "
+        "transition energies that cut produces).  Partial occupations "
+        "enter BOTH -- the pair basis gains partially-blocked transitions "
+        "and (z - H)^-1 gains poles at ~0 -- in ways nothing here has "
+        "measured, so the run would produce a complete, plausible W under "
+        "a diagram set that was never verified for it.  Same shape and "
+        "same reason as the MPA metal gate (src/gw/mpa/model.py, GATE "
+        "mpa_metal_evaluator_unavailable): the metallic SAMPLE PLAN "
+        "exists there too, and building it is still not a claim that the "
+        "occupation-weighted evaluators behind it have landed",
     ),
     (
         "w_bse_head_placement_unimplemented",

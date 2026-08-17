@@ -149,6 +149,8 @@ def test_the_default_is_spelled_the_same_in_both_places():
      "compute_mode = cohsex\nqp_solver = self_consistent\n"),
     ("w_bse_head_placement_unimplemented",
      "compute_mode = cohsex\nmc_average_placement = bgw\n"),
+    ("w_bse_insulators_only",
+     "compute_mode = cohsex\nmpa_material_class = metal\n"),
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -214,10 +216,48 @@ def test_w_rpa_decks_are_untouched_by_every_rule(tmp_path):
     for extra in ("compute_mode = x_only\n",
                   "compute_mode = hl_ppm\n",
                   "compute_mode = cohsex\nqp_solver = self_consistent\n",
-                  "compute_mode = cohsex\nmc_average_placement = bgw\n"):
+                  "compute_mode = cohsex\nmc_average_placement = bgw\n",
+                  "compute_mode = cohsex\nmpa_material_class = metal\n"):
         config = _config(tmp_path, extra, name="rpa_arm.in")
         assert config.screening.diagrams is ScreeningDiagrams.W_RPA
         refuse_unsupported_screening_diagrams(config)   # must not raise
+
+
+def test_a_metal_deck_still_parses_and_runs_under_w_rpa(tmp_path):
+    """THE INSULATOR GATE IS SCOPED TO ``w_bse`` AND MUST STAY THERE.
+
+    ``mpa_material_class = metal`` is a legal, live setting on every path
+    that is not this feature — the MPA sample plan builds a metallic
+    double-parallel geometry from it today, and its own evaluator gate
+    (``mpa.model``, ``mpa_metal_evaluator_unavailable``) is the one that
+    decides whether that plan can be consumed.  A screening-diagram axis
+    that started refusing metal decks in general would be answering a
+    question it was not asked, on behalf of a component that already
+    answers it.
+    """
+    config = _config(tmp_path, "compute_mode = mpa\nmpa_material_class = metal\n")
+    assert config.screening.diagrams is ScreeningDiagrams.W_RPA
+    assert config.mpa.material_class == "metal"
+    refuse_unsupported_screening_diagrams(config)       # must not raise
+
+
+def test_the_insulator_refusal_names_the_mpa_metal_gate_it_mirrors(tmp_path):
+    """It refuses for the SAME reason MPA refuses a metallic plan.
+
+    The shape being copied on purpose: a metallic *geometry* is
+    constructible on both axes (MPA's sample plan; a WFN with partial
+    occupations), and on neither does constructibility mean the
+    occupation-weighted evaluators behind it exist.  Naming the sibling
+    gate is what stops the two from drifting into different stories about
+    the same missing work.
+    """
+    with pytest.raises(ValueError) as exc:
+        _config(tmp_path,
+                "screening_diagrams = w_bse\ncompute_mode = cohsex\n"
+                "mpa_material_class = metal\n")
+    message = str(exc.value)
+    assert "mpa_metal_evaluator_unavailable" in message
+    assert "insulator" in message
 
 
 def test_every_rule_has_all_five_parts_and_a_unique_id():
@@ -237,6 +277,164 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
                            (doc, "why")):
             assert isinstance(text, str) and len(text) > 8, (
                 f"{rule_id}: {part} is missing or too short to be advice")
+
+
+# ---------------------------------------------------------------------------
+# 2b. The runtime half of ``w_bse_insulators_only`` — the occupations
+#     themselves, for the metallic WFN no deck key declares
+# ---------------------------------------------------------------------------
+
+def _occ(nspin=1, nk=3, nb=8, n_occ=4):
+    """An insulating ``mf_header/kpoints/occ``: ``(nspin, nk, nb)`` in {0,1}."""
+    import numpy as np
+
+    occ = np.zeros((nspin, nk, nb), dtype=np.float64)
+    occ[:, :, :n_occ] = 1.0
+    return occ
+
+
+def test_the_runtime_gate_passes_an_insulating_occupation_array():
+    """The green case, and the number it returns is the margin.
+
+    A gapped mean field writes exact 0.0 / 1.0, so the worst
+    distance-from-integer is 0.0 — not merely under tolerance.  Reporting
+    the margin rather than a bool is what lets the run log say how much
+    room the gate had.
+    """
+    from gw.screening_bse import refuse_fractional_occupations
+
+    worst = refuse_fractional_occupations(
+        _occ(), band_lo=0, band_hi=8, source="unit.h5",
+        print_fn=lambda *a, **k: None)
+    assert worst == 0.0
+
+
+def test_the_runtime_gate_refuses_a_fractional_occupation_in_the_active_window():
+    """THE CASE NO DECK KEY CAN DECLARE: a metallic WFN on a silent deck.
+
+    ``mpa_material_class`` is the only key in the parser that says "metal",
+    and nothing at all in a deck describes the WFN's occupations — so a
+    smeared mean field reaches the stage looking exactly like an insulating
+    one until something reads ``occ``.  The refusal carries the SAME rule
+    id as its parse-time twin (one grep for an operator) and the same five
+    parts, and it names the offending (spin, k, band) so the reader can go
+    look at it.
+    """
+    from gw.screening_bse import refuse_fractional_occupations
+
+    occ = _occ()
+    occ[0, 2, 3] = 0.62                      # a partially filled band at E_F
+    with pytest.raises(NotImplementedError) as exc:
+        refuse_fractional_occupations(
+            occ, band_lo=0, band_hi=8, source="metal.h5",
+            print_fn=lambda *a, **k: None)
+    message = str(exc.value)
+    assert "w_bse_insulators_only" in message
+    for part in ("got:", "want:", "fix:", "why:", "doc:"):
+        assert part in message, f"runtime refusal is missing '{part}'"
+    assert "spin 0, k-point 2, band 3" in message
+    assert "mpa_metal_evaluator_unavailable" in message
+
+
+def test_the_runtime_gate_tolerance_separates_noise_from_a_partial_filling():
+    """1e-6 sits in an EMPTY band, which is why it is a safe threshold.
+
+    Below it there is only float/HDF5 representation noise; above it there
+    is only physics (an occupation within 1e-6 of a step value is >13 kT
+    from E_F at any smearing a GW deck uses).  Both ends are pinned here so
+    that a future edit to the constant has to argue with both.
+    """
+    import numpy as np
+
+    from gw.screening_bse import _OCC_INTEGER_TOL, refuse_fractional_occupations
+
+    assert _OCC_INTEGER_TOL == 1e-6
+    noisy = _occ()
+    noisy[0, 0, 0] = 1.0 - 1e-9
+    assert refuse_fractional_occupations(
+        noisy, band_lo=0, band_hi=8, source="noise.h5",
+        print_fn=lambda *a, **k: None) == pytest.approx(1e-9)
+    partial = _occ()
+    partial[0, 0, 0] = 1.0 - 1e-3
+    with pytest.raises(NotImplementedError, match="w_bse_insulators_only"):
+        refuse_fractional_occupations(
+            partial, band_lo=0, band_hi=8, source="smeared.h5",
+            print_fn=lambda *a, **k: None)
+    # An occupation of 2.0 is an INTEGER: some WFN spin conventions write
+    # the two-electron value, and that is not a partial filling.
+    two = _occ()
+    two[:, :, :4] = 2.0
+    assert refuse_fractional_occupations(
+        two, band_lo=0, band_hi=8, source="two.h5",
+        print_fn=lambda *a, **k: None) == 0.0
+    assert np.isfinite(_OCC_INTEGER_TOL)
+
+
+def test_the_runtime_gate_is_scoped_to_the_run_s_own_band_window():
+    """It asks about the bands the ladder actually builds from.
+
+    ``[b0, b4)`` is the pair basis and the resolvent's pole set.  The
+    scoping is not a loophole — the window straddles E_F by construction
+    (``b2 = nelec`` is inside it), so a partially filled band cannot sit
+    above ``b4`` — and a window that does not intersect the file's bands is
+    a caller error, refused rather than silently empty.
+    """
+    from gw.screening_bse import refuse_fractional_occupations
+
+    occ = _occ(nb=12)
+    occ[0, 1, 11] = 0.5                      # outside a [0, 8) window
+    assert refuse_fractional_occupations(
+        occ, band_lo=0, band_hi=8, source="wide.h5",
+        print_fn=lambda *a, **k: None) == 0.0
+    with pytest.raises(NotImplementedError, match="w_bse_insulators_only"):
+        refuse_fractional_occupations(
+            occ, band_lo=0, band_hi=12, source="wide.h5",
+            print_fn=lambda *a, **k: None)
+    with pytest.raises(ValueError, match="does not intersect"):
+        refuse_fractional_occupations(
+            occ, band_lo=99, band_hi=120, source="wide.h5",
+            print_fn=lambda *a, **k: None)
+
+
+def test_the_stage_reads_the_wfn_occupations_and_not_the_step_built_bundle():
+    """``wfns.occ`` CANNOT fire this gate, so the gate must not read it.
+
+    ``wavefunction_bundle._build_occ`` builds the bundle's occupations from
+    a band-index cut or one E_F comparison — {0, 1} by construction.  A
+    gate reading it would be a green light with a name.  The mean field's
+    own ``mf_header/kpoints/occ`` is the only array in this pipeline where
+    a smeared occupation survives, and it is read through the same
+    ``file_io.mf_header`` reader ``WfnLoader`` uses.
+    """
+    import inspect
+
+    from gw import screening_bse
+
+    src = inspect.getsource(screening_bse._refuse_metallic_mean_field)
+    assert "read_mf_header" in src and ".occs" in src
+    assert "wfns.occ" not in src
+    assert "meta.band_edges" in src
+
+
+def test_the_occupation_gate_runs_before_any_compute_in_the_stage():
+    """Cost order, and it is the reason the check is placed where it is.
+
+    Everything the gate needs is metadata the run already has; learning it
+    after the chi0 build would spend the expensive part of the run to be
+    told something the WFN said at load.  Pinned as an ORDER in the
+    production entry point, the same way the closure gate's composition is.
+    """
+    import inspect
+
+    from gw import screening_bse
+
+    src = inspect.getsource(screening_bse.prepare_ladder_restart)
+    order = [src.index(name) for name in (
+        "_refuse_metallic_mean_field(", "_refuse_unusable_restart(",
+        "compute_static_w(")]
+    assert order == sorted(order), (
+        "prepare_ladder_restart no longer checks the occupations and the "
+        "restart handoff BEFORE the RPA static leg")
 
 
 # ---------------------------------------------------------------------------

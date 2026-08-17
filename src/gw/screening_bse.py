@@ -49,6 +49,16 @@ w_bse (``gw_config.refuse_unsupported_screening_diagrams``,
 refusal held rather than assuming it: a non-None ``head_channel`` reaching
 here is a bug in the parse gate, not a case to serve.
 
+INSULATORS ONLY, AND THE GATE IS IN TWO PLACES BECAUSE THE SIGNAL IS.
+The ladder, its TRS-gauge machinery and every certification behind this
+feature assume integer occupations and a gapped D.  A deck that DECLARES a
+metal (``mpa_material_class = metal``) is refused at parse time
+(``gw_config._W_BSE_REFUSALS``, ``w_bse_insulators_only``); a metallic WFN
+on a deck that declares nothing is refused HERE, on the mean field's own
+occupations, before any compute (:func:`refuse_fractional_occupations`,
+same rule id).  Neither is redundant: no deck key describes the WFN's
+occupations, and no WFN read happens at parse time.
+
 WHY THE ``import bse`` CALLS ARE INSIDE THE FUNCTIONS.  Not a level
 violation -- ``gw`` and ``bse`` are both L1 and an L1->L1 call is legal
 (docs/architecture/layers.md).  It is a PYTHON CYCLE: ``bse`` already
@@ -170,6 +180,136 @@ def _wedge_field(wedge, names, dtype):
 # ---------------------------------------------------------------------------
 # Preconditions
 # ---------------------------------------------------------------------------
+
+#: HOW FAR FROM AN INTEGER AN OCCUPATION MAY SIT AND STILL BE ONE.
+#:
+#: 1e-6, and both ends of that choice are measured rather than tasteful.
+#: BELOW it there is only representation noise: a gapped mean field writes
+#: exactly 0.0 / 1.0 (or the file's spin convention's 2.0) into
+#: ``mf_header/kpoints/occ``, float64 round-trips through HDF5 exactly, and
+#: LORRAX's own writer sets the array from a step function
+#: (``file_io/wfn_writer.py``:103).  ABOVE it there is only physics: an
+#: occupation within 1e-6 of a step value sits more than 13 kT from E_F for
+#: any smearing a GW deck is run at, contributes nothing to a pair basis and
+#: cannot be what makes a system metallic.  So the band between the two is
+#: empty by construction -- the tolerance never has to adjudicate a close
+#: case, which is the property a gate wants and a threshold on a physical
+#: quantity usually does not have.
+_OCC_INTEGER_TOL = 1e-6
+
+
+def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
+                                  print_fn=print):
+    """Refuse ``w_bse`` on a mean field with PARTIAL occupations.
+
+    THE PARSE-TIME TWIN AND WHY BOTH EXIST.  ``mpa_material_class = metal``
+    is refused in ``gw_config._W_BSE_REFUSALS`` under this same rule id,
+    and it is the only deck key in the parser that declares a metallic
+    treatment.  A metallic WFN handed to a deck that declares nothing is
+    therefore invisible until something looks at the OCCUPATIONS, and this
+    is that look.  Same id on both so an operator greps once.
+
+    WHY THE WFN'S OWN ``occ`` ARRAY AND NOT ``wfns.occ``.  The bundle's
+    occupation array is BUILT here, by ``wavefunction_bundle._build_occ``,
+    as a step function -- a band-index cut at ``b2`` or a comparison
+    against one E_F.  It is {0, 1} by construction, so a gate reading it
+    could never fire, and a gate that cannot fire is worse than no gate:
+    it is a green light with a name.  ``mf_header/kpoints/occ`` is what
+    the DFT run actually resolved, fractional entries and all, and it is
+    the only place in this pipeline where a smeared occupation survives.
+
+    ``band_lo`` / ``band_hi`` are the run's active band window ``[b0, b4)``
+    -- the bands the ladder's pair basis and the resolvent's poles are
+    built from.  Scoping to it is not a loophole: the window straddles E_F
+    by construction (``b2 = nelec`` is inside it), so a partially filled
+    band -- which by definition sits AT E_F -- cannot hide above ``b4``.
+
+    ``occs`` is ``(nspin, nk, nb)`` as ``mf_header`` reads it; a 2D
+    ``(nk, nb)`` array is accepted for the unit cells.  Returns the worst
+    distance-from-integer it saw, so a caller can report the margin.
+    """
+    occ = np.asarray(occs, dtype=np.float64)
+    if occ.ndim == 2:
+        occ = occ[None, :, :]
+    if occ.ndim != 3:
+        raise ValueError(
+            f"refuse_fractional_occupations: occupations must be "
+            f"(nspin, nk, nb) or (nk, nb); got {occ.shape} from {source}.")
+    lo = max(0, int(band_lo))
+    hi = min(int(band_hi), int(occ.shape[-1]))
+    if hi <= lo:
+        raise ValueError(
+            f"refuse_fractional_occupations: the active band window "
+            f"[{band_lo}, {band_hi}) does not intersect the {occ.shape[-1]} "
+            f"bands {source} carries.")
+    window = occ[:, :, lo:hi]
+    distance = np.abs(window - np.rint(window))
+    worst = float(distance.max()) if distance.size else 0.0
+    if worst > _OCC_INTEGER_TOL:
+        s, k, n = (int(i) for i in
+                   np.unravel_index(int(distance.argmax()), distance.shape))
+        raise NotImplementedError(
+            f"GATE w_bse_insulators_only: screening_diagrams = w_bse is "
+            f"refused on a mean field with partial occupations.\n"
+            f"  got:  occupation {float(window[s, k, n])!r} at "
+            f"(spin {s}, k-point {k}, band {n + lo}) of {source} -- "
+            f"{worst:.3e} from the nearest integer, tolerance "
+            f"{_OCC_INTEGER_TOL:g}\n"
+            f"  want: integer occupations across the active band window "
+            f"[{lo}, {hi}) -- an insulating (gapped) mean field\n"
+            f"  fix:  run this system with screening_diagrams = w_rpa, or "
+            f"point w_bse at a gapped mean field\n"
+            f"  why:  the ladder operator, its TRS-gauge machinery and "
+            f"every certification this feature has are insulator-derived: "
+            f"integer occupations and a gapped D throughout.  Partial "
+            f"occupations enter both the pair basis (partially blocked "
+            f"transitions the band-index cut does not model) and the "
+            f"resolvent poles (transitions at ~0 energy), and neither is "
+            f"verified here -- the run would produce a complete, plausible "
+            f"W under a diagram set that was never checked for it.  Same "
+            f"shape as the MPA metal gate (src/gw/mpa/model.py, GATE "
+            f"mpa_metal_evaluator_unavailable).  The deck-key twin of this "
+            f"refusal (mpa_material_class = metal) fires at PARSE time in "
+            f"gw_config.refuse_unsupported_screening_diagrams; this one "
+            f"catches the metallic WFN that no deck key declared.\n"
+            f"  doc:  docs/input_reference.md '## Screening', "
+            f"screening_diagrams.")
+    print_fn(
+        f"  w_bse: occupations are integer across bands [{lo}, {hi}) of "
+        f"{os.path.basename(str(source))} (worst deviation {worst:.2e} <= "
+        f"{_OCC_INTEGER_TOL:g}) -- insulating mean field, the only kind "
+        f"the ladder is certified for.")
+    return worst
+
+
+def _refuse_metallic_mean_field(config, meta, *, print_fn=print):
+    """Read the run's own WFN occupations and hand them to the gate above.
+
+    BEFORE ANY COMPUTE, beside the restart preconditions and for the same
+    reason: it is knowable from inputs the run already has, and learning
+    it after the chi0 build costs the expensive part of the run to be told
+    something the WFN said all along.
+
+    The read is the mf_header metadata block only -- a few kB of
+    ``(nspin, nk, nb)`` doubles, not a coefficient -- through the same
+    ``file_io.mf_header`` reader ``WfnLoader`` itself uses, so there is no
+    second opinion about how a WFN's occupations are spelled.
+    """
+    from file_io.mf_header import read_mf_header
+
+    path = str(getattr(getattr(config, "paths", None), "wfn_file", "") or "")
+    if not path or not os.path.exists(path):
+        raise ValueError(
+            f"GATE w_bse_insulators_only: screening_diagrams = w_bse checks "
+            f"the mean field's occupations before it builds anything, and "
+            f"the deck's wfn_file ({path!r}) is not readable from this "
+            f"stage.  The ladder is certified for insulators only, so the "
+            f"check is not optional; fix the path or run w_rpa.")
+    band_lo, band_hi = int(meta.band_edges[0]), int(meta.band_edges[-1])
+    return refuse_fractional_occupations(
+        read_mf_header(path).occs, band_lo=band_lo, band_hi=band_hi,
+        source=path, print_fn=print_fn)
+
 
 def _refuse_unusable_restart(config, meta, sym, centroid_indices,
                              tensors_filename, *, print_fn=print):
@@ -334,6 +474,12 @@ def prepare_ladder_restart(
             "opinion about the same channel.  Fix the parse gate, do not "
             "serve this here.")
 
+    # THE TWO PRECONDITION BLOCKS, in cost order.  The occupation gate runs
+    # FIRST because it is the cheapest read in the stage (an mf_header
+    # metadata block) and because it is the one that decides whether this
+    # SYSTEM is one the ladder is certified for at all -- a question that
+    # outranks whether the restart handoff is wired.
+    _refuse_metallic_mean_field(config, meta, print_fn=print_fn)
     _refuse_unusable_restart(config, meta, sym, centroid_indices,
                              tensors_filename, print_fn=print_fn)
 
@@ -702,4 +848,5 @@ __all__ = [
     "compute_screening_ladder",
     "make_ladder_wc_source",
     "prepare_ladder_restart",
+    "refuse_fractional_occupations",
 ]
