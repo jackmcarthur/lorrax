@@ -391,7 +391,7 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 # ============================================================================
 # THE FUSED-CONV FAMILY at the factory seam
 # ============================================================================
-# Two entries, ONE contract:
+# Three entries, ONE contract:
 #
 #     U = scale · FFT_k( IFFT_k(X) · K )
 #
@@ -402,14 +402,15 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 # memory layout the one kernel has to read:
 #
 #     make_flat_k_gw_conv     k LEADING     lorrax_mklfft_gw_conv     cpu+CUDA
+#     make_fused_conv_klead   k LEADING     lorrax_cufft_conv_klead  CUDA
 #     make_fused_conv_kminor  k MINOR-most  lorrax_cufft_conv_kminor  CUDA
 #
-# Pick by your resident layout, and do NOT transpose to reach the other one:
-# transposing to reach a fused kernel spends exactly what the fusion saves.
-# The family contract, the measurement behind the split, and the reason the
-# k-minor member takes its kernel already in R space all live in ONE place —
-# ``ffi/fft.py``'s module docstring.  This block is the seam, not a second
-# copy of it.
+# Pick by resident layout; callers do not independently transpose to reach a
+# different member.  The measured Sigma factory is the one owned exception:
+# its conditional half-absorbed form packs once internally and emits the
+# inverse permutation from the store.  The family contract, measurements and
+# the reason k-minor takes its kernel already in R space live in ONE place —
+# ``ffi/fft.py``'s module docstring.  This block is the seam, not a second copy.
 # ============================================================================
 
 
@@ -467,6 +468,30 @@ def make_fused_conv_kminor(
     from ffi.fft import make_conv_kminor_ffi as _impl
     return _impl(mesh, kgrid, x_spec, k_spec,
                  norm=norm, mult=mult, out_layout=out_layout)
+
+
+def make_fused_conv_klead(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+) -> Callable:
+    """Direct fused conv in Sigma's native **k-LEADING** layout.
+
+    Same public shapes as :func:`make_flat_k_gw_conv`.  The CUDA-only handler
+    keeps the public T/W/U arrays k-leading, coalesces the mu-nu-major global
+    loads into a bounded shared-memory transpose/residency bank, assembles T
+    and W row pairs, performs the two inverse transforms, multiply, and forward
+    transform in one traversal, and emits the result in Sigma's native
+    k-leading layout from its coalesced store.
+    It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
+    plan-based member as the off/unsupported path.
+    """
+    from ffi.fft import make_conv_klead_ffi as _impl
+    return _impl(mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
 
 
 

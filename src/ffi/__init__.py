@@ -38,6 +38,10 @@ FFI_DIAL_ENV = (
     # custom call, so two ranks disagreeing on it compile modules that are not
     # merely tuned differently — they have different op sets.
     "LORRAX_CONV_KMINOR_FFI",
+    # Sigma's direct k-leading fused-conv accelerator.  Default OFF, but
+    # auto/on emit a different custom call and therefore belong in every
+    # cross-rank compile fingerprint and factory cache key.
+    "LORRAX_CONV_KLEAD_FFI",
 )
 
 
@@ -59,10 +63,10 @@ def ffi_dial_key() -> tuple:
         ``gw.cohsex_sigma._make_cohsex_kernels``
         ``gw.w_isdf._get_chi_minimax_kernel``
 
-    All three reads are tier-1 lexical (no JAX backend init) and O(1) —
+    All five reads are tier-1 lexical (no JAX backend init) and O(1) —
     safe in any cache-lookup path at any P.
     """
-    from ffi.fft import (conv_kminor_mode, fft_ffi_enabled,
+    from ffi.fft import (conv_klead_mode, conv_kminor_mode, fft_ffi_enabled,
                          fused_fft_ffi_enabled)
     from ffi.gemm import gemm_ffi_enabled as bands_gemm_ffi_enabled
     return (
@@ -73,6 +77,7 @@ def ffi_dial_key() -> tuple:
         # emit different programs on a mesh where the capability is absent,
         # so a boolean key would let one be served from the other's cache.
         ("conv_kminor_ffi", conv_kminor_mode()),
+        ("conv_klead_ffi", conv_klead_mode()),
     )
 
 

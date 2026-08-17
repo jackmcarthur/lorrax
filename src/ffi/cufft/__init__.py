@@ -16,18 +16,19 @@ in-tree.  A ``ffi/cufft/flat_k.py`` mirroring ``ffi/fft.py`` would
 duplicate every line of it and force call sites to branch on a platform they
 are not supposed to know about.
 
-ONE TARGET HERE IS **NOT** MIRRORED, and its name says so:
+TWO TARGETS HERE ARE **NOT** MIRRORED, and their names say so:
 
     lorrax_cufft_conv_kminor  CufftConvKMinorCudaFfi   (CUDA only)
+    lorrax_cufft_conv_klead   CufftConvKLeadCudaFfi    (CUDA only)
 
-the fused-conv family's k-MINOR member (``cpp/cufft/conv_kminor_cuda_ffi.cc``,
-2026-08-16).  It is a hand-written CUDA kernel rather than a vendor-library
-call, so there is no host twin to register the same string against — and
+These are the fused-conv family's certified k-MINOR member and Sigma's direct
+public-k-leading member (``cpp/cufft/conv_k{minor,lead}_cuda_ffi.cc``,
+2026-08-16).  They are hand-written CUDA kernels rather than vendor-library
+calls, so there is no host twin to register either string against — and
 borrowing the ``mklfft`` prefix would promise a cpu handler that does not
-exist, turning a cpu mesh's REFUSAL into a silent resolution failure.  Its
-Python still lives in ``ffi.fft`` beside the k-strided member, because they
-are two entries of one family and the choice between them is the caller's
-resident k layout.
+exist, turning a cpu mesh's REFUSAL into a silent resolution failure.  Their
+Python still lives in ``ffi.fft`` beside the plan-based member, because all
+three are entries of one family and the choice is a measured caller policy.
 
 **The Python for both platforms lives in** ``ffi.fft`` (the target strings
 were coined by the CPU prototype and kept; the name is historical, the
@@ -59,9 +60,9 @@ Multi-GPU / sharded meshes are UNMEASURED — every GPU log is
 """
 
 #: The target strings this library registers.  The first two are identical to
-#: the host table; the third is CUDA-only and named for it (see the docstring).
+#: the host table; the remaining two are CUDA-only and named for it.
 CUDA_TARGETS = ("lorrax_mklfft_flat_k", "lorrax_mklfft_gw_conv",
-                "lorrax_cufft_conv_kminor")
+                "lorrax_cufft_conv_kminor", "lorrax_cufft_conv_klead")
 
 #: target → the C++ symbol THIS library exports (host exports different
 #: symbols for the same targets; see ``ffi_loader._CUDA_TARGET_SYMBOLS``).
@@ -69,6 +70,7 @@ CUDA_SYMBOLS = {
     "lorrax_mklfft_flat_k":     "CufftFlatKCudaFfi",
     "lorrax_mklfft_gw_conv":    "CufftGwConvCudaFfi",
     "lorrax_cufft_conv_kminor": "CufftConvKMinorCudaFfi",
+    "lorrax_cufft_conv_klead":  "CufftConvKLeadCudaFfi",
 }
 
 __all__ = ["CUDA_TARGETS", "CUDA_SYMBOLS"]
