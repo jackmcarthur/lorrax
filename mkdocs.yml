@@ -85,6 +85,7 @@ nav:
       - LT splitting and the exchange head: theory/lt-exchange-head.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - MPA compute mode (declared, not yet runnable): theory/THEORY_mpa_implementation.md
+      - Metallic MPA screening: theory/metallic-mpa-screening.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md

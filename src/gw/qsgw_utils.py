@@ -77,6 +77,48 @@ def interp_along_omega(
 # Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
 # ---------------------------------------------------------------------------
 
+def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
+                             context):
+    """Refuse solved QP energies inside a hole of a patched ω grid.
+
+    A patched grid (``sigma_omega_patches_ev``) has interior gaps by
+    design — that is what makes the MPA crossing rule's cost independent
+    of the dynamic range.  The Σ(ω)→E piecewise-linear interpolation is
+    silent about a hole: an energy in the gap would be interpolated
+    across it and come back plausible-looking and wrong.  So a hole is
+    detected from the grid itself (a step above 3× the median step) and
+    an in-grid-classified energy strictly inside one — more than one
+    median step from both hole edges — is a refusal that names the
+    energy and the fix (widen or add a patch).  Contiguous grids have
+    no holes and return immediately.
+    """
+    omega = np.asarray(omega_grid_ry, dtype=np.float64)
+    if omega.size < 2:
+        return
+    steps = np.diff(omega)
+    ref = float(np.median(steps))
+    holes = np.nonzero(steps > 3.0 * ref)[0]
+    if holes.size == 0:
+        return
+    E = np.asarray(E_kn_ry, dtype=np.float64)
+    mask = np.asarray(in_grid_mask, dtype=bool)
+    for i in holes:
+        lo, hi = float(omega[i] + ref), float(omega[i + 1] - ref)
+        inside = mask & (E > lo) & (E < hi)
+        if np.any(inside):
+            worst = float(E[inside].flat[0])
+            raise ValueError(
+                f"GATE omega_grid_hole ({context}): "
+                f"{int(np.sum(inside))} in-grid QP energies sit inside "
+                f"the ω-grid hole ({lo * RYD_TO_EV:.2f}, "
+                f"{hi * RYD_TO_EV:.2f}) eV — e.g. "
+                f"{worst * RYD_TO_EV:.3f} eV — where Σ(ω) would be "
+                "interpolated across the gap.  FALSE case: every solved "
+                "QP energy lies on a grid patch.  Widen the nearest "
+                "sigma_omega_patches_ev patch (QP energies drift between "
+                "QSGW iterations; leave headroom).")
+
+
 def solve_diagonal_sigma_fixed_point(
     h0_diag_ev: np.ndarray,
     sigma_omega_diag_ev: np.ndarray,
@@ -661,6 +703,9 @@ def solve_qp(
         classify_bands_in_grid, fit_scissor, full_bz_k_weights)
     band_in_grid, in_grid_kn_band = classify_bands_in_grid(
         E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
+    assert_omega_grid_covers(
+        E_sc_rel_ry, in_grid_kn_band, omega_grid_ry,
+        context="diagonal QSGW fixed point")
     n_bands_in = int(band_in_grid.sum())
     n_bands_total = int(band_in_grid.size)
     print_fn(
@@ -768,11 +813,45 @@ def plot_qp_energy_comparison(
     return output_png
 
 
+# ---------------------------------------------------------------------------
+# Managed-file cleanup — shared by the SC loop's disk-bounded artifacts
+# ---------------------------------------------------------------------------
+
+def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
+    """Rank-0 scan-and-unlink of managed files, then a collective barrier.
+
+    Removes every entry of ``dir_path`` whose NAME fullmatches ``pattern``
+    and whose full path is not in ``keep``, on rank 0 only; all ranks then
+    meet at ``barrier_tag`` so the directory looks the same everywhere on
+    return.  Returns the removed names (empty off rank 0).  Shared by
+    ``sc_iteration._clear_sc_eqp_snapshots`` and
+    ``gw.mpa.model.retain_iteration_artifacts``; each caller owns its own
+    regex, keep-set and report line.
+    """
+    import os
+    import re
+    from common.collectives import barrier, process_rank
+
+    managed = re.compile(pattern)
+    keep = set(keep)
+    root = os.path.abspath(os.fspath(dir_path))
+    removed = []
+    if process_rank() == 0 and os.path.isdir(root):
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if managed.fullmatch(name) and path not in keep:
+                os.remove(path)
+                removed.append(name)
+    barrier(barrier_tag, print_fn=print_fn)
+    return removed
+
+
 __all__ = [
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
     "interp_along_omega",
     "plot_qp_energy_comparison",
+    "remove_managed",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
 ]

@@ -41,6 +41,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier as _barrier, device_put_process_local
 
+from . import h5_journal as _journal
+
+#: The two HDF5 library instances, spelled as ``file_io.hdf5_owner`` and
+#: ``file_io.h5_journal`` spell them.  Every HDF5 call this module makes
+#: is journaled AT ISSUE under one of them — the collective transport
+#: under ``ffi``, the two serial-h5py metadata touches under ``h5py`` —
+#: so the per-rank journal shows both libraries' traffic on one file in
+#: one stream (SLAB_IO_ROOT_CAUSE_AUDIT.md §C).
+_J_FFI = "ffi"
+_J_H5PY = "h5py"
+
 
 def _rank0() -> bool:
     return jax.process_index() == 0
@@ -1668,12 +1679,36 @@ class _FfiBackend(_DatasetGeometry):
                       f"mode={mode} file stripe_count={_c} stripe_size={_s} B "
                       f"(the file's own inode, not the policy){_warn}",
                       flush=True)
-        self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
-        # ``open_file`` has now brought MPI up (context.cc::
-        # ensure_mpi_initialized).  Ask it how big the world REALLY is
-        # before a single hyperslab is derived from jax.process_count().
-        # See _assert_mpi_world for the measurement this exists for.
-        _assert_mpi_world(mesh)
+        # ONE HDF5 LIBRARY INSTANCE PER OPEN FILE (audit A1; claims/0110).
+        # Declared BEFORE the collective open, so a path h5py already
+        # holds open in a way that can write is refused by name here
+        # instead of surfacing as "file signature not found" or a native
+        # segfault later.  ``file_io.hdf5_owner`` owns the rule and the
+        # message; this line owns only "the FFI is opening this path now".
+        from .hdf5_owner import STACK_FFI, note_close, note_open
+        self._owner_token: int | None = note_open(
+            path, STACK_FFI, mode,
+            where=f"SlabIO/_FfiBackend({os.path.basename(path)}, "
+                  f"mode={mode!r})")
+        try:
+            # ISSUE-TIME journal line: this is the last Python statement
+            # before ``H5Fopen``/``H5Fcreate``, and the handle it is about
+            # to return cannot appear on it (SlabIO writes the completion
+            # line that carries the handle).
+            with _journal.op_scope("open", path, stack=_J_FFI, mode=mode):
+                self.fh: int = self._open_file(path, mesh=mesh, mode=mode)
+            # ``open_file`` has now brought MPI up (context.cc::
+            # ensure_mpi_initialized).  Ask it how big the world REALLY is
+            # before a single hyperslab is derived from
+            # jax.process_count().  See _assert_mpi_world for the
+            # measurement this exists for.
+            _assert_mpi_world(mesh)
+        except BaseException:
+            # An open that failed holds nothing; leaving it registered
+            # would refuse every later legitimate open on this path.
+            note_close(path, self._owner_token)
+            self._owner_token = None
+            raise
         self._ds_ids: dict[str, int] = {}
         # Replicated record of every dataset's LOGICAL geometry — the
         # thing ``valid_shape`` is derived from.  See _DatasetGeometry.
@@ -1778,10 +1813,13 @@ class _FfiBackend(_DatasetGeometry):
         # exists at a different shape or dtype, and reuses it when they
         # match: decisions.md 2026-08-04.  That refusal is what makes the
         # geometry recorded below authoritative.
-        ds_id = self._loader.phdf5_ensure_dataset(
-            self.fh, name, tuple(int(s) for s in shape),
-            str(jnp.dtype(dtype).name),
-        )
+        with _journal.op_scope("create", self.path, stack=_J_FFI, ds=name,
+                               cnt=tuple(int(s) for s in shape),
+                               mode=self.mode, handle=self.fh):
+            ds_id = self._loader.phdf5_ensure_dataset(
+                self.fh, name, tuple(int(s) for s in shape),
+                str(jnp.dtype(dtype).name),
+            )
         self._ds_ids[name] = ds_id
         self._remember_geom(name, shape, jnp.dtype(dtype))
         # THE ATTRS ARE WRITTEN.  Queued here and landed by
@@ -1858,10 +1896,22 @@ class _FfiBackend(_DatasetGeometry):
         if name in cache:
             return cache[name]
         import h5py
-        with h5py.File(self.path, "r") as f:
-            ds = f[name]
-            shape = tuple(int(s) for s in ds.shape)
-            dtype = np.dtype(ds.dtype)
+
+        from .hdf5_owner import STACK_H5PY, open_scope
+        # This is the serial-h5py read that happens WHILE this backend's
+        # collective handle is live.  It is legal only because both sides
+        # are read-only here; ``hdf5_owner`` refuses it by name the moment
+        # the live FFI handle can write, which is exactly the case
+        # :meth:`_dataset_geom`'s docstring records as measured-fatal
+        # (job 7888644, "file signature not found").
+        with open_scope(self.path, STACK_H5PY, "r",
+                        where=f"_FfiBackend._introspect_dataset({name!r})"), \
+                _journal.op_scope("attr_r", self.path, stack=_J_H5PY,
+                                  ds=name, mode="r", handle=self.fh):
+            with h5py.File(self.path, "r") as f:
+                ds = f[name]
+                shape = tuple(int(s) for s in ds.shape)
+                dtype = np.dtype(ds.dtype)
         cache[name] = (shape, dtype)
         return shape, dtype
 
@@ -1873,7 +1923,9 @@ class _FfiBackend(_DatasetGeometry):
         # ``phdf5_ensure_dataset`` (see :meth:`create_dataset`).
         self._drain_pending()
         if readonly:
-            ds_id = self._loader.phdf5_open_dataset_ro(self.fh, name)
+            with _journal.op_scope("open", self.path, stack=_J_FFI, ds=name,
+                                   mode="r", handle=self.fh):
+                ds_id = self._loader.phdf5_open_dataset_ro(self.fh, name)
         else:
             raise RuntimeError(
                 f"dataset '{name}' not registered — call create_dataset first")
@@ -1951,10 +2003,19 @@ class _FfiBackend(_DatasetGeometry):
         if ds_shape is None:
             ds_shape = req_gshape
             self._drain_pending()
-            ds_id = self._loader.phdf5_ensure_dataset(
-                self.fh, name, tuple(int(s) for s in ds_shape),
-                str(jnp.dtype(A.dtype).name),
-            )
+            # The SECOND ensure_dataset site — a write that creates its
+            # own dataset.  Journaled like the first: an ``ensure`` is a
+            # collective H5Dcreate, i.e. file metadata, and a create this
+            # path made is one the reader of the log will otherwise not
+            # find any ``create`` line for.
+            with _journal.op_scope("create", self.path, stack=_J_FFI,
+                                   ds=name,
+                                   cnt=tuple(int(s) for s in ds_shape),
+                                   mode=self.mode, handle=self.fh):
+                ds_id = self._loader.phdf5_ensure_dataset(
+                    self.fh, name, tuple(int(s) for s in ds_shape),
+                    str(jnp.dtype(A.dtype).name),
+                )
             self._ds_ids[name] = ds_id
             self._remember_geom(name, ds_shape, A.dtype)
         elif global_shape is not None and req_gshape != ds_shape:
@@ -2279,12 +2340,29 @@ class _FfiBackend(_DatasetGeometry):
                       f"{_t_join:.1f} s; calling H5Fclose collectively",
                       flush=True)
             _t0 = _time.perf_counter()
-            self._close_file(self.fh)
+            # ISSUE-TIME, and this is the one that matters most: S1 is a
+            # SIGSEGV that lands in the writer-thread join inside this
+            # very call.  A journal whose last line is this one names the
+            # ctx handle that died (SLAB_IO_ROOT_CAUSE_AUDIT.md §A/S1).
+            with _journal.op_scope("close", self.path, stack=_J_FFI,
+                                   mode=self.mode, handle=self.fh):
+                self._close_file(self.fh)
             self.fh = 0
             _t_close = _time.perf_counter() - _t0
             if _verbose:
                 print(f"  [SlabIO.close] H5Fclose returned in "
                       f"{_t_close:.1f} s", flush=True)
+        # RELEASE THE FFI CLAIM HERE, between H5Fclose and the rank-0
+        # h5py reopen below — not at the end of the method.  The reopen
+        # is the OTHER HDF5 library instance touching this same path, and
+        # it is legal precisely because MPI-IO has already let go; a claim
+        # still held across it would make this method refuse itself, and
+        # correctly so.  Unconditional (not inside ``if self.fh``) so a
+        # double close or a handle that never opened still releases.
+        from .hdf5_owner import STACK_H5PY, note_close, open_scope
+        if getattr(self, "_owner_token", None) is not None:
+            note_close(self.path, self._owner_token)
+            self._owner_token = None
         # Now that MPI-IO has released the file, rank 0 can safely
         # reopen with h5py to tack on the deferred small-metadata
         # datasets (omega_ev and friends) and the deferred dataset
@@ -2307,7 +2385,13 @@ class _FfiBackend(_DatasetGeometry):
                 and (self._deferred_attrs or self._deferred_ds_attrs)
                 and jax.process_index() == 0):
             import h5py
-            with h5py.File(self.path, "a") as h5:
+            with open_scope(self.path, STACK_H5PY, "a",
+                            where="_FfiBackend.close deferred-attr reopen"), \
+                    _journal.op_scope(
+                        "attr_w", self.path, stack=_J_H5PY, mode="a",
+                        cnt=(len(self._deferred_attrs),
+                             len(self._deferred_ds_attrs))), \
+                    h5py.File(self.path, "a") as h5:
                 for name, value in self._deferred_attrs:
                     if name in h5:
                         del h5[name]
@@ -2319,6 +2403,11 @@ class _FfiBackend(_DatasetGeometry):
                 # delete-and-recreates by name and a recreated dataset
                 # would come back stripped of anything stamped first.
                 _apply_dataset_attrs(h5, self._deferred_ds_attrs)
+                # Explicit flush before close: this is the ONE serial-h5py
+                # write onto a file the FFI also drives, so its bytes must
+                # be durable before any rank's next collective open sees
+                # the superblock (audit A1 item 3).
+                h5.flush()
         # Same reason as the write-ordering barriers above: rank 0 may
         # have just rewritten datasets in this file with serial h5py, and
         # no other rank may reopen it until that is durable.

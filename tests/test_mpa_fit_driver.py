@@ -1,4 +1,4 @@
-"""The MPA fit stage end to end, and the 14-pass accumulation lemma.
+"""The MPA fit stage end to end: disk in, budgeted fit, poles out.
 
 CPU only, ``JAX_PLATFORMS=cpu``; nothing here touches a cluster.
 
@@ -43,33 +43,10 @@ h5py = pytest.importorskip("h5py")
 pytest.importorskip("symmetry_maps.qirr_store")
 jax = pytest.importorskip("jax")
 
-from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
-                           verify_centroid_orbit_closure)
-from symmetry_maps import qirr_store as QS                        # noqa: E402
-
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import fit_driver, pade_fit, sampling, tiling         # noqa: E402
-
-#: The synthetic FFT grid the centroid set lives on.
-_FFT = np.array([12, 12, 12], dtype=np.int64)
-
-#: A GLIDE: {sigma_z | tau = (1/2, 0, 0)}.  Order two, so {I, g} is a
-#: group and the orbits really close.  tau x grid = (6, 0, 0) is integer
-#: on the 12-grid, so images land on grid points.
-_SYMS = np.stack([np.eye(3, dtype=np.int64),
-                  np.diag([1, 1, -1]).astype(np.int64)])
-_TNP = np.array([[0.0, 0.0, 0.0], [np.pi, 0.0, 0.0]])
-
-#: 5 full-BZ q folding onto 3 IBZ parents, two through TIME-REVERSED
-#: rows, so the antiunitary branch of the table is live.
-_IRR = np.array([0, 1, 1, 2, 2], dtype=np.int32)
-_SYM = np.array([0, 1, 0, 3, 0], dtype=np.int32)
-_N_SYM_SPATIAL = 2
-_N_Q_IBZ = 3
-
-_Q_IRR = np.array([[0.0, 0.0, 0.0],
-                   [1 / 3, 0.0, 1 / 4],
-                   [0.0, 1 / 3, 1 / 3]])
+from tests._mpa_test_geometry import (                            # noqa: E402
+    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, geometry)
 
 #: Twelve seeds, every one with first index < 6.  The glide maps
 #: (r0, r1, r2) -> (r0 + 6, r1, -r2), so no seed is its own image and no
@@ -84,6 +61,14 @@ _N_P = 4
 _OMEGA_M = 4.0
 _W_NAME = "W_qmunu_omega"
 
+#: The certification a hand-driven ``finalize_fit_store`` must carry
+#: since 2026-08-15 — a store the validator would refuse cannot be
+#: finalized at all (audit §E.3 item 1).  ``run_fit_driver`` builds its
+#: own from ``rcond``; these two cells finalize by hand, so they state
+#: thresholds loose enough never to be the reason the cell fails.
+_CERT = {"condition_max_allowed": 1.0e12,
+         "backward_error_max_allowed": 1.0}
+
 #: The sampling record the W(omega) file carries.  The double-parallel
 #: lines varpi_1 = 0.1 Ha and varpi_2 = 1 Ha, alpha = 1 for an
 #: insulator, and an n_p whose 2*n_p is the frequency count.
@@ -93,50 +78,14 @@ _SAMPLING = {"varpi": [0.1, 1.0], "n_p": _N_P, "alpha": 1,
 
 @pytest.fixture(scope="module", autouse=True)
 def _host_slabio_for_driver_tests():
-    """Exercise the collective API on CPU; PHDF5 itself has cluster tests."""
+    """Exercise the collective API on CPU; PHDF5 itself has cluster tests.
+
+    The shim itself is the suites' shared ``HostSlabIO`` in
+    ``tests/_mpa_test_geometry.py``.
+    """
     import file_io.slab_io as slab_io
-    from jax.sharding import NamedSharding
 
     original = slab_io.SlabIO
-
-    class HostSlabIO:
-        def __init__(self, path, *, mode, mesh):
-            self.file = h5py.File(path, mode)
-            self.mesh = mesh
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            self.file.close()
-
-        def create_dataset(self, name, *, shape, dtype, **_):
-            if name not in self.file:
-                self.file.create_dataset(name, shape=shape, dtype=dtype)
-
-        def read_slab(self, name, *, shape, offset, valid_shape,
-                      partition_spec, **_):
-            out = np.zeros(shape, dtype=self.file[name].dtype)
-            extent = tuple(min(valid_shape[d], shape[d],
-                               self.file[name].shape[d] - offset[d])
-                           for d in range(len(shape)))
-            dst = tuple(slice(0, n) for n in extent)
-            src = tuple(slice(offset[d], offset[d] + extent[d])
-                        for d in range(len(shape)))
-            out[dst] = self.file[name][src]
-            return jax.device_put(
-                out, NamedSharding(self.mesh, partition_spec))
-
-        def write_slab(self, name, value, *, offset, valid_shape, **_):
-            host = np.asarray(jax.device_get(value))
-            extent = tuple(min(valid_shape[d], host.shape[d],
-                               self.file[name].shape[d] - offset[d])
-                           for d in range(host.ndim))
-            dst = tuple(slice(offset[d], offset[d] + extent[d])
-                        for d in range(host.ndim))
-            src = tuple(slice(0, n) for n in extent)
-            self.file[name][dst] = host[src]
-
     slab_io.SlabIO = HostSlabIO
     yield
     slab_io.SlabIO = original
@@ -203,32 +152,12 @@ def test_collective_fit_allocation_refuses_inode_preserving_mode(
 
 
 # ---------------------------------------------------------------------------
-# Geometry, the planted field, and the W(omega) file
+# Geometry (the shared glide builder, this suite's seeds), the planted
+# field, and the W(omega) file
 # ---------------------------------------------------------------------------
 
-def _closed_centroid_set():
-    """The union of the seeds' orbits — closed by definition."""
-    S = np.asarray(_SYMS, dtype=np.float64)
-    rinv = np.rint(np.linalg.inv(S)).astype(np.int64)
-    tint = np.rint(np.asarray(_TNP, dtype=np.float64) / (2.0 * np.pi)
-                   * _FFT).astype(np.int64)
-    imgs = set()
-    for r in np.asarray(_SEEDS, dtype=np.int64):
-        for s in range(S.shape[0]):
-            imgs.add(tuple(((rinv[s] @ r + tint[s]) % _FFT).tolist()))
-    return np.array(sorted(imgs), dtype=np.int32)
-
-
 def _geometry():
-    """``(tables, verdict, n_mu)`` for the synthetic closed set."""
-    cent = _closed_centroid_set()
-    verdict = verify_centroid_orbit_closure(
-        cent.astype(np.float64) / _FFT, _SYMS, tnp=_TNP, fft_grid=_FFT)
-    assert verdict.closed, verdict.describe()
-    perm, L = centroid_source_map_and_wrap(
-        cent, _SYMS, _TNP, _FFT, validate=True, extend_trs=True)
-    tables = QS.QirrTables(_IRR, _SYM, _Q_IRR, perm, L, _N_SYM_SPATIAL)
-    return tables, verdict, int(cent.shape[0])
+    return geometry(_SEEDS)
 
 
 def _planted_field(n_p, n_q, n_mu):
@@ -629,7 +558,7 @@ def test_red_twin_a_skipped_block_refuses_finalize_and_names_the_range(
             np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
 
     with pytest.raises(ValueError) as exc:
-        MS.finalize_fit_store(str(fit_path))
+        MS.finalize_fit_store(str(fit_path), certification=_CERT)
     msg = str(exc.value)
     q, lo, hi = skipped
     assert f"q={q}: columns" in msg
@@ -696,7 +625,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
         fit_driver.fit_one_block(
             str(planted["w_path"]), _W_NAME, str(fit_path), q,
             np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy)
-    ledger = MS.finalize_fit_store(str(fit_path))
+    ledger = MS.finalize_fit_store(str(fit_path), certification=_CERT)
     assert ledger["complete"]
 
     Om, Bp, _, _ = MS.read_fit_tensors(str(fit_path))
@@ -741,13 +670,8 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
                                * MS.COMPLEX128_BYTES)
     assert r["bytes_budget_total"] == r["blocks_walked"] * r["tile_bytes"]
 
-    # One vmapped dispatch per block for the fit, one for the
-    # diagnostics — and behind them two complete fits and three Pade
-    # solves per element, because the store requires a backward error
-    # the fit kernel does not return.
+    # One vmapped dispatch per block, one Pade solve per element.
     assert r["fit_dispatches"] == r["blocks_walked"]
-    assert r["diagnostic_dispatches"] == 0
-    assert r["full_fits"] == r["elements_fitted"]
     assert r["pade_solves"] == r["elements_fitted"]
 
     sec = r["seconds"]
@@ -760,7 +684,7 @@ def test_cost_report_is_arithmetically_consistent(planted, fitted):
 def test_cost_report_text_states_what_the_plan_demands(fitted, capsys):
     """Printed once at finalize, and it says the load-bearing numbers."""
     text = fitted["text"]
-    for token in ("logical outputs", "dispatches", "full fits",
+    for token in ("logical outputs", "dispatches",
                   "pole solves", "bytes read", "peak block", "seconds",
                   "columns read", "elements fitted"):
         assert token in text, f"cost report omits {token!r}"
@@ -796,3 +720,53 @@ def test_the_planted_field_is_symmetric_in_mu_nu(planted):
     W = planted["W"]
     np.testing.assert_allclose(W, np.swapaxes(W, -1, -2),
                                rtol=1e-13, atol=1e-13)
+
+
+# ---------------------------------------------------------------------------
+# Occupation provenance through the DRIVER path (claim 0194 regression)
+# ---------------------------------------------------------------------------
+
+def test_driver_writes_occupation_stamps_when_given_a_state(planted,
+                                                            mesh_xy):
+    """The body fit store carries the five occ stamps end-to-end.
+
+    Claim 0194: the metallic np6 arm refused on 'no occupation stamps
+    present' because run_fit_driver dropped the state two frames above
+    the stamper — the writer existed, its caller never passed the state.
+    This drives the DRIVER path (not stamp_occupation_provenance
+    directly) with a duck-typed state and reads the stamps back through
+    the production reader, so the regression cannot silently return.
+    """
+    import types
+    state = types.SimpleNamespace(
+        occ_hash="deadbeefdeadbeef", mu_ry=0.121, smearing_family="mp1",
+        smearing_width_ry=0.01, n_electrons=10.0)
+    fit_path = planted["root"] / "mpa_fit_stamped.h5"
+    fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path),
+        planted["z"], planted["n_p"], mesh_xy=mesh_xy,
+        occupation_state=state)
+    got = MS.read_occupation_stamps(str(fit_path))
+    assert got["occ_hash"] == "deadbeefdeadbeef"
+    assert got["smearing_family"] == "mp1"
+    np.testing.assert_allclose(
+        [got["mu_ry"], got["smearing_width_ry"], got["occ_nelec"]],
+        [0.121, 0.01, 10.0], rtol=0, atol=0)
+    MS.assert_occupation_stamps(str(fit_path), state, where="regression")
+
+
+def test_insulating_driver_store_carries_no_occupation_stamps(fitted):
+    """Default path unchanged: no state, no stamps, byte-compat."""
+    import h5py
+    with h5py.File(str(fitted["path"]), "r") as f:
+        # walk every object: the five mpa_ occ attrs must appear nowhere
+        bad = []
+        def _check(name, obj):
+            for k in obj.attrs:
+                if str(k).startswith("mpa_occ") or str(k) == "mpa_mu_ry":
+                    bad.append((name, str(k)))
+        f.visititems(_check)
+        for k in f.attrs:
+            if str(k).startswith("mpa_occ") or str(k) == "mpa_mu_ry":
+                bad.append(("/", str(k)))
+    assert bad == [], f"insulating store carries occ stamps: {bad}"

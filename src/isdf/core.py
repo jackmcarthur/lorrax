@@ -2868,6 +2868,7 @@ def _factor_c_q_distributed_rank_truncate(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     indefinite: bool = False,
+    distrib_la_batched_route: str = "auto",
 ) -> jax.Array:
     """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED.
 
@@ -2950,8 +2951,9 @@ def _factor_c_q_distributed_rank_truncate(
     # (one descriptor + one workspace for the whole (nq, μ, μ) stack) and
     # falls back to a per-q loop for a backend that has none, so this call
     # site does not encode which is which.
-    eigh_plan = linalg_plan('eigh', mesh_xy, backend='distributed',
-                            n=int(n_pad))
+    eigh_plan = linalg_plan(
+        'eigh', mesh_xy, backend='distributed', n=int(n_pad),
+        batched_route=distrib_la_batched_route)
     W, V = eigh_plan.batched(C_q)
 
     px = int(mesh_xy.shape['x'])
@@ -3202,6 +3204,7 @@ def factor_c_q(
     zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_rcond: float = 1e-10,
+    distrib_la_batched_route: str = "auto",
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -3350,7 +3353,8 @@ def factor_c_q(
             return _factor_c_q_distributed_rank_truncate(
                 C_q, mesh_xy, n_rmu_logical,
                 zeta_rcond=float(transverse_zeta_rcond),
-                indefinite=True), None
+                indefinite=True,
+                distrib_la_batched_route=distrib_la_batched_route), None
         if t_kind == 'scalapack_lu':
             return _factor_c_q_transverse_scalapack(
                 C_q, mesh_xy, n_rmu_logical), None
@@ -3378,7 +3382,8 @@ def factor_c_q(
     # back-solve sees the operator it expects.
     if solver_kind == 'distributed_rank_truncate':
         return _factor_c_q_distributed_rank_truncate(
-            C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond)
+            C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     # Replicated dense factor — the mesh-INVARIANT charge factor.  Fires for
     # the 'replicated_cholesky' / 'replicated_rank_truncate' auto picks
@@ -3467,8 +3472,10 @@ def factor_c_q(
     # keeps one.  ``plan`` itself is cheap and NOT cached: native2d
     # resolution runs no dlopen and no process_count, only the tile
     # divisibility check that ``block_size_for`` above already did.
-    return linalg_plan('cholesky', mesh_xy, backend='native2d',
-                       n=int(n_rmu)).batched(C_q, block_size=block_size)
+    return linalg_plan(
+        'cholesky', mesh_xy, backend='native2d', n=int(n_rmu),
+        batched_route=distrib_la_batched_route,
+    ).batched(C_q, block_size=block_size)
 
 
 # Cache for solve function
@@ -3595,6 +3602,7 @@ def solve_zeta(
     n_rmu_logical: int | None = None,
     zeta_gather: str = "replicated",
     lu_piv: jax.Array | None = None,
+    distrib_la_batched_route: str = "auto",
 ) -> jax.Array:
     """
     Solve for zeta_q given pre-computed system matrix from
@@ -3805,7 +3813,7 @@ def solve_zeta(
             'solve_lu', mesh_xy,
             backend=('scalapack' if solver_kind == 'scalapack_lu'
                      else 'cusolvermp'),
-            n=n_log)
+            n=n_log, batched_route=distrib_la_batched_route)
 
         def _dist_ridged_lu(L_log, Z_log):
             # The μ-slice to the LOGICAL extent (via solve_at_logical;
@@ -4323,6 +4331,7 @@ def _make_fit_one_rchunk_kernel(
     q_irr_full_idx: np.ndarray | None = None,
     zeta_gather: str = 'replicated',
     lu_hoisted: bool = False,
+    distrib_la_batched_route: str = "auto",
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` that
@@ -4430,7 +4439,8 @@ def _make_fit_one_rchunk_kernel(
             cct_trace_per_q=cct_trace_per_q,
             n_rmu_logical=int(meta.n_rmu),
             zeta_gather=zeta_gather,
-            lu_piv=lu_piv)
+            lu_piv=lu_piv,
+            distrib_la_batched_route=distrib_la_batched_route)
 
     @jax.jit
     def _kernel(
@@ -4496,6 +4506,7 @@ def fit_one_rchunk(
     cct_trace_per_q: jax.Array | None = None,
     zeta_gather: str = 'replicated',
     lu_piv: jax.Array | None = None,
+    distrib_la_batched_route: str = "auto",
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -4527,6 +4538,7 @@ def fit_one_rchunk(
         bool(is_charge),
         str(solver_kind),
         str(zeta_gather),
+        str(distrib_la_batched_route),
         bool(lu_piv is not None),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
@@ -4550,6 +4562,7 @@ def fit_one_rchunk(
             q_irr_full_idx=q_irr_full_idx,
             zeta_gather=str(zeta_gather),
             lu_hoisted=bool(lu_piv is not None),
+            distrib_la_batched_route=str(distrib_la_batched_route),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path

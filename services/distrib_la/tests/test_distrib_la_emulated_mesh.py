@@ -627,23 +627,15 @@ def test_without_the_declaration_the_handle_case_fails_unreadably(
     assert calls, "the library was never reached, so nothing was learned"
 
 
-def test_the_reserved_batch_reshard_route_refuses_by_name(monkeypatch):
-    """Route (c) is a NAME with no code, and asking for it says so.
-
-    The reserved slot exists so that adding the batch-axis reshard is an
-    edit in the one place that already decides, rather than a new surface.
-    A reserved name that silently did something else — fell back to the
-    scan, say — would defeat the whole point of reserving it.
-    """
+def test_an_unknown_batched_route_still_refuses_by_closed_vocabulary(
+        monkeypatch):
+    """Route (c) is built; a misspelling still cannot fall back to scan."""
     import jax.numpy as jnp
     mesh = _mesh(2, 2)
     p = _stand_in_plan(monkeypatch, "eigh", "slate", mesh,
                        _eigh_stand_in([]))
     rng = np.random.default_rng(4046)
     A = jnp.asarray(_hpd(rng, 2, 8, "complex128"))
-    with pytest.raises(NotImplementedError) as ei:
-        p.batched(A, _route=D.ROUTE_BATCH_RESHARD)
-    assert "face_to_batch_reshard" in str(ei.value)
     with pytest.raises(ValueError) as ei2:
         p.batched(A, _route="whatever")
     assert D.ROUTE_SCAN in str(ei2.value)

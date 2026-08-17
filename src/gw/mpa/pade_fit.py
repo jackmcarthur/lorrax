@@ -66,13 +66,13 @@ than 16 eV.  A backward-stable solve of a problem that has itself gone
 singular returns the exact answer to a nearby question, and the nearby
 question was no longer this one.
 
-So the pole-finding is selectable (:data:`SOLVE_MODES`) while everything
+So the eigensolver is selectable (:data:`EIG_MODES`) while everything
 else -- the model, the guards, the canonical sort, the mandatory residue
 refit, the returned ``(B_p, Omega_p)`` -- is shared and unchanged.  The
 default is the Loewner pencil, which interpolates the same ``2n_p``
 values with the same ``n_p`` poles and never forms a power of ``x``.
 The published Pade route remains reachable, both because it is what the
-papers specify and because ``solve="pade", affine=False`` reproduces the
+papers specify and because the removed Pade solve reproduced the
 shipped 2026-08-09 solve exactly, which is the only way to keep
 exhibiting the disease this module was reconditioned to cure.
 
@@ -172,21 +172,36 @@ DEFAULT_GUARDS = {
 
 _GUARD_KEYS = tuple(DEFAULT_GUARDS)
 
-#: The two denominator solves.  Both answer the SAME interpolation
-#: problem -- ``n_p`` poles through ``2*n_p`` samples of ``W_c`` in
-#: ``x = z**2`` -- and both return ``(B_p, Omega_p)`` in the identical
-#: representation; they differ only in the algebra that gets there, and
-#: therefore only in what finite precision does to the answer.
+#: THE DENOMINATOR SOLVE.  ``SOLVE_MODES`` was a two-entry tuple until
+#: 2026-08-15; it is no longer a symbol, and this block is the record of
+#: the choice it used to express.  Both modes answered the SAME
+#: interpolation problem -- ``n_p`` poles through ``2*n_p`` samples of
+#: ``W_c`` in ``x = z**2`` -- and both returned ``(B_p, Omega_p)`` in the
+#: identical representation; they differed only in the algebra that got
+#: there, and therefore only in what finite precision did to the answer.
 #:
 #: ``"loewner"``
-#:     The fixed-support Loewner pencil.  DEFAULT.  Never forms a power
-#:     of ``x``, so the Vandermonde conditioning is simply absent.
-#: ``"pade"``
-#:     The published cross-multiplied Pade-in-z^2 system (sigma-paper
-#:     Eqs. S9/S8), with the affine domain map of
-#:     :func:`_affine_domain`.  ``affine=False`` on top of this is the
-#:     shipped 2026-08-09 solve exactly, and is the red twin.
-SOLVE_MODES = ("loewner", "pade")
+#:     The fixed-support Loewner pencil.  Never forms a power of ``x``,
+#:     so the Vandermonde conditioning is simply absent.  **The only
+#:     solve.**
+#:
+#: THE ``"pade"`` MODE WAS REMOVED 2026-08-15 (owner ruling).  It was the
+#: published cross-multiplied Pade-in-z^2 system (sigma-paper Eqs. S9/S8)
+#: with an affine domain map; ``solve="pade", affine=False`` reproduced
+#: the shipped 2026-08-09 solve exactly and was the red twin.  The
+#: verdict table below is KEPT because it is the record of WHY Loewner
+#: won, and it should outlive the code it describes.  Closing
+#: measurement: JID 56960468, live artifacts at
+#: ``mpa_damped_sigma_n10_0814/run/``.
+#:
+#: THE TENSION, STATED SO IT IS NOT UNDONE BY ACCIDENT: deleting the
+#: mode removes the ability to re-run that negative control.  That is
+#: acceptable, and it is the SAME distinction that made restoring
+#: ``residue_width_census`` correct -- a superseded IMPLEMENTATION only
+#: re-answers a settled question, whereas an INSTRUMENT diagnoses future
+#: unknowns.  Keep instruments; delete superseded implementations, and
+#: keep their verdict.  Re-adding a second solve mode needs a NEW
+#: question, not this one.
 
 #: Measured on 36,096 production ``W_c`` elements of the frozen Si
 #: 4x4x4 deck (q in {0,1,21,63}, all 1128 rows, columns 0:8), reading
@@ -225,14 +240,15 @@ SOLVE_MODES = ("loewner", "pade")
 #: beside it.
 
 
-#: WHO FINDS THE ROOTS, once the denominator algebra has said which
-#: matrix they are the eigenvalues of.  Orthogonal to
-#: :data:`SOLVE_MODES`: that names which matrix, this names the
-#: eigensolver, and both modes above feed both backends here.
+#: WHO FINDS THE ROOTS, once the Loewner pencil has said which matrix
+#: they are the eigenvalues of.  Orthogonal to the solve: that names
+#: which matrix, this names the eigensolver.
 #:
 #: ``"lapack"``
-#:     ``jnp.linalg.eigvals``.  DEFAULT, because it is what every store
-#:     on disk was made with.  On GPU it reaches ``cusolver_geev_ffi``,
+#:     ``jnp.linalg.eigvals``.  DEFAULT for direct calls; the disk fit
+#:     driver stamps ``eig="jax_qr"`` (``fit_driver._FIT_EIG``), which is
+#:     what the accepted Si store was made with.  On GPU this backend
+#:     reaches ``cusolver_geev_ffi``,
 #:     which does not batch: measured on this tree at ``n_p = 8``, the
 #:     per-element cost is 1012 us at 1024 elements and 1045 us at 4096,
 #:     i.e. flat in the batch, which is the signature of a per-matrix
@@ -256,7 +272,7 @@ def _eigvals(M, eig):
 
     The branch is on a Python string resolved at trace time, so both arms
     are static-shape and this stays one ``jit``/``vmap`` kernel either
-    way -- the same discipline :data:`SOLVE_MODES` follows.
+    way.
     """
 
     if eig == "jax_qr":
@@ -394,73 +410,6 @@ def _x_normalisation(z_samples):
     x_max = jnp.max(jnp.abs(x))
     x_max = jnp.where(x_max > 0, x_max, 1.0).astype(jnp.float64)
     return x, x_max
-
-
-def _affine_domain(x):
-    """Centre and half-width of the sample set's own real extent.
-
-    THE MAP.  ``t = (x - centre) / scale`` with ``centre`` the midpoint
-    and ``scale`` the half-width of ``[min_j Re x_j, max_j Re x_j]``.  It
-    is read off the SAMPLE SET, so it is a property of the grid the file
-    was evaluated on and never a tuned constant.
-
-    WHY THE REAL EXTENT AND NOT THE MODULUS.  The shipped normalisation
-    ``x_hat = x / max_j|x_j|`` is a pure scaling about the ORIGIN, and
-    the origin is at the edge of the sampled set rather than inside it:
-    on the double-parallel grid ``Re x`` runs from ``-varpi_2**2`` to
-    ``omega_m**2 - varpi_1**2`` -- for the Si deck, ``[-1, +6.36] Ha^2``
-    -- so ``x_hat`` lands the samples in ``[-0.14, +0.86]``, a set whose
-    Chebyshev-like transfinite diameter is far smaller than 1 and whose
-    monomial Vandermonde is correspondingly worse conditioned.  Centring
-    first is one line and it is worth two orders of magnitude of
-    conditioning at ``n_p = 10`` (measured; see the module note).
-
-    Returns ``(centre, scale)``, both traced scalars.
-    """
-
-    lo = jnp.min(jnp.real(x))
-    hi = jnp.max(jnp.real(x))
-    centre = (0.5 * (hi + lo)).astype(jnp.float64)
-    scale = (0.5 * (hi - lo)).astype(jnp.float64)
-    scale = jnp.where(scale > 0, scale, 1.0)
-    return centre, scale
-
-
-def build_pade_system(W_samples, z_samples, n_p, *, affine=True):
-    """Return ``(A, rhs, t, centre, scale)`` of the cross-multiplied system.
-
-    With ``x = z**2`` and ``t = (x - centre)/scale``, the model
-    ``P(t)/Q(t)`` with ``Q`` monic of degree ``n_p`` and ``P`` of degree
-    ``n_p - 1`` gives the linear system in ``2*n_p`` unknowns
-    ``[d_0..d_{n_p-1}, c_0..c_{n_p-1}]``::
-
-        sum_k d_k t_j^k  -  W_j sum_k c_k t_j^k  =  W_j t_j^{n_p}
-
-    which is the even-in-z form of the sigma paper's Eq. (S9).
-
-    ``affine=True`` (the default) takes ``(centre, scale)`` from
-    :func:`_affine_domain`.  ``affine=False`` is the SHIPPED
-    normalisation -- ``centre = 0``, ``scale = x_max`` -- i.e. the plan's
-    z_max scaling on its own, kept reachable because it is the red twin:
-    the conditioning pathology this module was reconditioned to cure is
-    only exhibitable by the solve that has it.  Without ANY rescaling the
-    raw Vandermonde over ``x`` is hopeless well before ``n_p ~ 8``, so
-    ``affine=False`` is a weaker normalisation and not an absent one.
-    """
-
-    n = int(n_p)
-    w = jnp.asarray(W_samples, dtype=jnp.complex128)
-    x, x_max = _x_normalisation(z_samples)
-    if affine:
-        centre, scale = _affine_domain(x)
-    else:
-        centre, scale = jnp.zeros((), dtype=jnp.float64), x_max
-    t = (x - centre.astype(jnp.complex128)) / scale.astype(jnp.complex128)
-
-    vand = jnp.vander(t, n, increasing=True)
-    A = jnp.concatenate([vand, -w[:, None] * vand], axis=1)
-    rhs = w * t ** n
-    return A, rhs, t, centre, scale
 
 
 def _backward_error(A, rhs, y):
@@ -745,8 +694,6 @@ def fit_mpa_poles(
     guards=None,
     refit_after_guards=True,
     rcond=1.0e-13,
-    solve=SOLVE_MODES[0],
-    affine=True,
     eig=EIG_MODES[0],
 ):
     """Fit ``n_p`` MPA poles to one element's ``2*n_p`` samples of W_c.
@@ -772,20 +719,11 @@ def fit_mpa_poles(
         ran.
     rcond
         Relative singular-value cutoff for both least-squares solves.
-    solve
-        Which denominator algebra finds the poles; one of
-        :data:`SOLVE_MODES`.  Both give ``(B_p, Omega_p)`` in the same
-        representation and both feed the identical guards, canonical
-        sort and residue refit -- the choice is numerical, not physical.
-    affine
-        ``"pade"`` mode only: use the affine domain map of
-        :func:`_affine_domain`.  ``solve="pade", affine=False`` is the
-        shipped 2026-08-09 solve exactly, and is how the conditioning
-        pathology is exhibited.
     eig
-        Which eigensolver finds the roots of whichever matrix ``solve``
-        chose; one of :data:`EIG_MODES`.  ``"lapack"`` is the default and
-        is what every store on disk was made with.  ``"jax_qr"`` stays
+        Which eigensolver finds the Loewner roots; one of
+        :data:`EIG_MODES`.  ``"lapack"`` is the default
+        here; the disk driver stamps ``eig="jax_qr"``, which made the
+        accepted Si store.  ``"jax_qr"`` stays
         inside XLA and is the only one of the two that batches, but it
         does NOT reproduce the other bit for bit -- see
         :data:`EIG_MODES`.
@@ -803,11 +741,6 @@ def fit_mpa_poles(
     _require_x64()
     _check_sample_support(W_samples, z_samples, n_p)
     cfg = _resolve_guards(guards)
-    if solve not in SOLVE_MODES:
-        raise ValueError(
-            f"GATE solve_mode_known: solve={solve!r} is not one of "
-            f"{SOLVE_MODES}. FALSE case: solve names a denominator "
-            "algebra this kernel implements.")
     _check_eig_mode(eig)
     n = int(n_p)
 
@@ -816,27 +749,11 @@ def fit_mpa_poles(
     x, x_max = _x_normalisation(z)
     x_hat = x / x_max.astype(jnp.complex128)
 
-    # --- Stages 1 and 2: the denominator solve and its roots, both of
-    # which vary with ``solve`` and NOTHING ELSE DOES.  Every mode hands
-    # the same object to stage 3: ``b_hat = Omega**2 / x_max``, the
-    # scaled pole positions in the x = z**2 plane.  The branch is on a
-    # Python string, so it is resolved at trace time and both arms are
-    # static-shape -- this stays one jit/vmap kernel either way.
-    if solve == "loewner":
-        b_hat, cond, s_max, s_min, bwd = _loewner_roots(
-            w, x_hat, n, rcond, eig)
-    else:
-        A, rhs, _t, x_centre, x_scale = build_pade_system(
-            w, z, n, affine=affine)
-        coef, cond, s_max, s_min = _solve_normalised(A, rhs, rcond)
-        bwd = _backward_error(A, rhs, coef)
-        # Roots come back in the t plane; ``b_hat`` lives in the x/x_max
-        # plane.  Composing the two scalars BEFORE touching the roots
-        # keeps ``affine=False`` bit-identical to the shipped solve,
-        # where the composition is exactly ``1.0`` and ``0.0``.
-        rescale = (x_scale / x_max).astype(jnp.complex128)
-        offset = (x_centre / x_max).astype(jnp.complex128)
-        b_hat = _companion_roots(coef[n:], eig) * rescale + offset
+    # --- Stages 1 and 2: the denominator solve and its roots.  Hands
+    # stage 3 ``b_hat = Omega**2 / x_max``, the scaled pole positions in
+    # the x = z**2 plane.  One solve since 2026-08-15 (see the record
+    # above the verdict table).
+    b_hat, cond, s_max, s_min, bwd = _loewner_roots(w, x_hat, n, rcond, eig)
 
     # --- Stage 3: residues BEFORE any guard fires.  These are the
     # all-sample complex LS residues of the raw fit; they are what
@@ -950,8 +867,6 @@ def fit_mpa_poles_batched(
     guards=None,
     refit_after_guards=True,
     rcond=1.0e-13,
-    solve=SOLVE_MODES[0],
-    affine=True,
     eig=EIG_MODES[0],
 ):
     """``fit_mpa_poles`` vmapped over the leading (element) axis.
@@ -961,9 +876,8 @@ def fit_mpa_poles_batched(
     ``(Omega, B, diag)`` with a leading ``n_elements`` axis on every leaf,
     bit-identical to looping ``fit_mpa_poles`` over the rows.
 
-    ``solve`` and ``affine`` are static and shared across the tile, so
-    the mapped function has one shape and one trace whichever mode is
-    chosen; this stays a single ``jit``-able kernel.
+    ``eig`` is static and shared across the tile, so the mapped function
+    has one shape and one trace; this stays a single ``jit``-able kernel.
     """
 
     tile = jnp.asarray(W_tile, dtype=jnp.complex128)
@@ -976,8 +890,7 @@ def fit_mpa_poles_batched(
     def _one(w_row):
         return fit_mpa_poles(
             w_row, z_samples, n_p, guards=guards,
-            refit_after_guards=refit_after_guards, rcond=rcond,
-            solve=solve, affine=affine, eig=eig)
+            refit_after_guards=refit_after_guards, rcond=rcond, eig=eig)
 
     return jax.vmap(_one)(tile)
 

@@ -44,6 +44,22 @@ SIGMA_K_AXIS = {
 	"qp_static_cohsex_ev": 0,
 }
 
+#: The ω axis, and the two attrs on it that say what it is measured FROM.
+#: ``omega_ev`` has always been a RELATIVE axis; nothing in the file said
+#: relative to what, so every post-hoc consumer guessed, and the one that
+#: guessed insulating midgap mis-sampled Σ_c(ω) by a measured 2.79 eV on
+#: the sodium metal deck (audit A2).  One name, defined once, used by the
+#: writer and by :func:`read_omega_reference`.
+OMEGA_DATASET = "omega_ev"
+OMEGA_REFERENCE_ATTR = "omega_reference_ev"
+OMEGA_REFERENCE_PROVENANCE_ATTR = "omega_reference_provenance"
+
+#: The provenance values the driver stamps.  ``fixed-N mu`` is the metal
+#: path's chemical potential from the fixed-N MP1 solve; ``midgap`` is the
+#: insulating loader convention (``wfn.efermi``, ½(VBM+CBM)).
+OMEGA_REFERENCE_FIXED_N_MU = "fixed-N mu"
+OMEGA_REFERENCE_MIDGAP = "midgap"
+
 #: The datasets :func:`write_sigma_omega_h5` creates the file with.  Every
 #: run that writes ``sigma_mnk.h5`` at all writes these, so the appender
 #: below can use any one of them that is present to learn the file's own k
@@ -796,6 +812,8 @@ def write_sigma_omega_h5(
 	k_chunk_size: int = 16,
 	mesh=None,
 	star=None,
+	omega_reference_ev=None,
+	omega_reference_provenance=None,
 	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
@@ -825,6 +843,16 @@ def write_sigma_omega_h5(
 	    the COMPLETE arrays, and only then are rows dropped.  Measuring
 	    after the drop would measure nothing — there would be one member
 	    per star left to compare.
+
+	``omega_reference_ev`` / ``omega_reference_provenance``
+	    THE ENERGY ``omega_ev`` IS MEASURED FROM, and where it came from
+	    ("fixed-N mu" or "midgap").  ``omega_ev`` is a RELATIVE axis and
+	    always was; until this stamp existed the file did not say relative
+	    to WHAT, so every post-hoc consumer had to guess, and
+	    ``gw.eqp_bgw.make_eqp_bgw`` guessed the insulating midgap — a
+	    measured 2.79 eV mis-sampling of Σ_c(ω) on the sodium metal deck
+	    (audit A2).  Optional only so a pre-stamp file still writes; a
+	    metallic consumer REFUSES an unstamped file rather than assume.
 	"""
 	from .slab_io import SlabIO
 
@@ -884,6 +912,14 @@ def write_sigma_omega_h5(
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
+		# The ω axis's own reference, stamped ON the ω axis — one place to
+		# look, and it cannot drift away from the array it describes.
+		if omega_reference_ev is not None:
+			io.stamp_dataset_attrs(OMEGA_DATASET, {
+				OMEGA_REFERENCE_ATTR: float(omega_reference_ev),
+				OMEGA_REFERENCE_PROVENANCE_ATTR: str(
+					omega_reference_provenance or "unstated"),
+			})
 		if star is not None:
 			# The tables live in the same file as the arrays they describe.
 			# A table that lives elsewhere is a table that silently decays
@@ -915,6 +951,29 @@ def write_sigma_omega_h5(
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 	return abs_path
+
+
+def read_omega_reference(filepath):
+	"""``(reference_ev, provenance)`` off a ``sigma_mnk.h5``, or ``(None, None)``.
+
+	THE ONE READER OF THE STAMP, so its location is stated once.  ``None``
+	means the file predates the stamp (audit A2) — not that its ω axis is
+	absolute.  A consumer that cannot tolerate a guess must REFUSE on
+	``None`` rather than substitute its own convention; that substitution,
+	made silently, is the defect the stamp exists to close.
+	"""
+	abs_path = os.path.abspath(filepath)
+	with h5py.File(abs_path, "r") as h5:
+		if OMEGA_DATASET not in h5:
+			return None, None
+		attrs = h5[OMEGA_DATASET].attrs
+		if OMEGA_REFERENCE_ATTR not in attrs:
+			return None, None
+		ref = float(attrs[OMEGA_REFERENCE_ATTR])
+		prov = attrs.get(OMEGA_REFERENCE_PROVENANCE_ATTR, "unstated")
+	if isinstance(prov, bytes):
+		prov = prov.decode("utf-8")
+	return ref, str(prov)
 
 
 # ===========================================================================

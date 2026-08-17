@@ -438,7 +438,8 @@ static ffi::Future WriteDispatch(
     {
         // No ctx yet, so there is nothing to announce through.
         std::string herr;
-        if (!copy_index_to_host(handle_host, handle_buf.untyped_data(),
+        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
+                                handle_buf.untyped_data(),
                                 2 * sizeof(int64_t), &herr)) {
             ffi::Promise p;
             ffi::Future f(p);
@@ -470,6 +471,19 @@ static ffi::Future WriteDispatch(
         return fail(ffi::ErrorCode::kInvalidArgument,
                     "phdf5 write: ctx_handle is null");
     }
+    // Audit B2: the handle is validated against the live-ctx registry BEFORE
+    // ``fail`` (which reads ctx->rank) or the task closure captures it.  On
+    // THIS path a stale ctx is not merely a bad read — it is an H5Dwrite into
+    // a file the process no longer owns.
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, handle_host[0], "phdf5 write", &live_err)) {
+            ffi::Promise p;
+            ffi::Future f(p);
+            p.SetError(ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err));
+            return f;
+        }
+    }
 
     const auto dims = A.dimensions();
     const size_t N = dims.size();
@@ -500,17 +514,22 @@ static ffi::Future WriteDispatch(
     }
 
     // Seam 2 — fetch the small index buffers (N × 8 bytes = 24-40 bytes
-    // typically).  CUDA: blocking cudaMemcpy D2H, microseconds.  Host:
-    // the XLA buffer is already host-resident, so a plain memcpy.
+    // typically).  CUDA: an ``xla_stream``-ordered cudaMemcpyAsync D2H plus a
+    // stream synchronize, microseconds (the unordered form raced the operand
+    // producer — SLAB_IO_ROOT_CAUSE_AUDIT.md B1; on THIS path a raced offset
+    // lands collective writes at wrong file offsets, which is route (ii) to
+    // the segfault-at-close).  Host: the XLA buffer is already host-resident,
+    // so a plain memcpy.
     std::string idx_err;
     std::vector<int64_t> offset_host(N);
-    if (!copy_index_to_host(offset_host.data(), offset_buf.untyped_data(),
+    if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
+                            offset_buf.untyped_data(),
                             N * sizeof(int64_t), &idx_err)) {
         return fail(ffi::ErrorCode::kInternal,
                     "phdf5 write: index copy(offset) failed: " + idx_err);
     }
     std::vector<int64_t> valid_shape_host(N);
-    if (!copy_index_to_host(valid_shape_host.data(),
+    if (!copy_index_to_host(LRX_STREAM_ARG valid_shape_host.data(),
                             valid_shape_buf.untyped_data(),
                             N * sizeof(int64_t), &idx_err)) {
         return fail(ffi::ErrorCode::kInternal,

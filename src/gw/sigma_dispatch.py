@@ -6,8 +6,11 @@ The dispatch decides which Σ kernel runs internally; the iteration map
 sees one signature and one result type.
 
 The dispatch is EXHAUSTIVE over ``gw_config.ComputeMode``: a mode with
-no kernel here is refused by name, not absorbed by the last branch.  MPA
-is that case today.
+no kernel here is refused by name, not absorbed by the last branch.
+MPA has a branch below and is no longer gated at entry: its
+``gw_config.UNIMPLEMENTED_MODES`` row was deleted once the metal pipeline
+ran end to end.  The site-level refusals are the safety now — a metal plan
+without an ``OccupationState`` is still refused by name.
 
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
@@ -20,9 +23,12 @@ Every band-indexed field comes back in the basis of the ``wfns`` bundle
 this module was handed; the four field tuples beside the dataclass say
 which of them a consumer sees in which basis.
 
-This module owns *no compute* of its own — every kernel lives under
-``cohsex_sigma`` (static channels), ``ppm_pipeline`` (dynamic Σ_c) or
-``qsgw_utils`` (the QSGW Hermitisation).  It only orchestrates.
+The Σ kernels live under ``cohsex_sigma`` (static channels),
+``ppm_pipeline`` (two-point PPM Σ_c), ``gw.mpa`` (multipole Σ_c) and
+``qsgw_utils`` (the QSGW Hermitisation); this module orchestrates them
+and owns the shared dynamic-Σ finalization seam
+(:func:`finalize_dynamic_sigma`: head injection, at-DFT interpolation,
+file write, QSGW build).
 """
 
 from __future__ import annotations
@@ -74,6 +80,13 @@ class SigmaResult:
                                 Z-factor central difference.
     sigma_c_at_dft_diag_ev    : (nk, nb)  diag(Σ_c) at E_DFT (eV).
     omega_dft_rel_ev          : (nk, nb)  E_DFT − E_F (eV).
+    e_eval_ev                 : (nk, nb)  the energies the QSGW ansatz
+                                EVALUATED this Σ at — ``e_qp_ev``, i.e.
+                                E_DFT for a one-shot call and the map's
+                                input (converged, under self-consistency)
+                                QP energies for an SC iteration.  eqp1's
+                                linearization is centred here; see
+                                ``eqp_bgw.assemble_eqp``.
     omega_grid_ev             : (nω,)     ω-grid in eV.
     omega_grid_ry             : (nω,)     ω-grid in Ry.
     head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal.
@@ -94,11 +107,17 @@ class SigmaResult:
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     omega_dft_rel_ev: np.ndarray | None = None
+    e_eval_ev: np.ndarray | None = None
     omega_grid_ev: np.ndarray | None = None
     omega_grid_ry: np.ndarray | None = None
     head_sigma_diag_w_kn_ry: np.ndarray | None = None
     sigma_omega_h5_path: str | None = None
     efermi_dft_ev: float | None = None
+    #: Which convention ``efermi_dft_ev`` IS — "fixed-N mu" or "midgap".
+    #: Carried beside the number so the end-of-SC writer stamps the same
+    #: answer the finalize interpolated with (audit A2), instead of
+    #: re-deriving it from a config key one layer further from the choice.
+    omega_reference_provenance: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -136,20 +155,24 @@ ROTATED_TO_DFT_FIELDS = (
 #: whose band indices must label the states whose energies E_i, E_j it
 #: is evaluated at, so the construction is only itself in that basis;
 #: it is also the (nω, nk, nb, nb) sharded tensor and the contents of
-#: sigma_mnk.h5.  The other two are already band DIAGONALS, on which a
-#: basis rotation does not act element-wise.
+#: sigma_mnk.h5.  The other three are already band DIAGONALS, on which a
+#: basis rotation does not act element-wise.  ``e_eval_ev`` belongs here
+#: for the strongest form of that reason: it is the list of energies
+#: E_i whose band index MUST be the one the cube's band index is, since
+#: the ansatz pairs them element-wise.
 SIGMA_BASIS_FIELDS = (
     "sigma_c_omega_kij_ry",
     "sigma_c_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
+    "e_eval_ev",
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
-#: path: ``omega_dft_rel_ev`` is E_DFT − E_F (``ppm_pipeline.py``:219-223,
-#: from ``get_enk_bandrange``).  TRAP: under self-consistency it labels
-#: bands by the DFT index while ``sigma_c_at_dft_diag_ev`` — the
-#: interpolation it drives, ``ppm_pipeline.py``:236 — labels them by the
-#: QP index.
+#: path: ``omega_dft_rel_ev`` is E_DFT − E_F, built from
+#: ``get_enk_bandrange`` in ``dynamic_sigma.eval_sigma_c_at_dft_energies``.
+#: TRAP: under self-consistency it labels bands by the DFT index while
+#: ``sigma_c_at_dft_diag_ev`` — the interpolation it drives, in that same
+#: function — labels them by the QP index.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
 )
@@ -160,6 +183,7 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ry",
     "sigma_omega_h5_path",
     "efermi_dft_ev",
+    "omega_reference_provenance",
 )
 
 
@@ -335,6 +359,7 @@ def finalize_dynamic_sigma(
     input_dir: str,
     write_sigma_omega_h5: bool = True,
     print_fn: Callable = print,
+    efermi_ry=None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -344,6 +369,15 @@ def finalize_dynamic_sigma(
     :class:`SigmaResult`.  The fixed-point solve and optional scissor remain
     in :func:`gw.qsgw_utils.solve_qp`, which consumes the retained omega cube;
     there is still one owner of that energy-update policy.
+
+    ``e_qp_ev`` — THE ENERGIES THIS SPECTRUM IS EVALUATED AT — is both the
+    QSGW build's evaluation point below and, carried out on the result as
+    ``e_eval_ev``, the point eqp1's linearization is centred at.  It is
+    E_DFT for a one-shot call (so the eqp writers are unchanged there,
+    bit-for-bit) and the map's input QP energies under self-consistency,
+    which at convergence is where the QP poles are.  The at-DFT
+    interpolation beside it stays at E_DFT: it is what eqp0 and the
+    ``sig_c(Edft)`` diagnostics mean.
     """
     import common.timing as timing
     from .dynamic_sigma import (
@@ -360,11 +394,13 @@ def finalize_dynamic_sigma(
 
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
-         efermi_dft_ev) = eval_sigma_c_at_dft_energies(
+         efermi_dft_ev,
+         omega_reference_provenance) = eval_sigma_c_at_dft_energies(
             sigma_c_omega,
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
+            efermi_ry=efermi_ry,
         )
 
         if write_sigma_omega_h5:
@@ -373,17 +409,19 @@ def finalize_dynamic_sigma(
                 sig_x=sig_x, sig_h=sig_h,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
+                omega_reference_ev=efermi_dft_ev,
+                omega_reference_provenance=omega_reference_provenance,
                 sym=sym, print_fn=print_fn,
             )
         else:
             sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
 
-        # Static Sigma_x is added in the QSGW kernel.  E_F is the same WFN
-        # reference used above for the DFT-frequency interpolation.
+        # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
+        # reference the interpolation above used — one omega reference per
+        # finalize, or the two reads sample different grid positions.
         omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         e_qp_rel_ev = (
-            np.asarray(e_qp_ev, dtype=np.float64)
-            - float(wfn.efermi) * RYD_TO_EV)
+            np.asarray(e_qp_ev, dtype=np.float64) - efermi_dft_ev)
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
@@ -408,11 +446,19 @@ def finalize_dynamic_sigma(
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         omega_dft_rel_ev=omega_dft_rel_ev,
+        # The energies THIS call's Σ spectrum was evaluated at, kept so the
+        # eqp1 writer can centre its linearization where the QP pole
+        # actually is.  Absolute eV (not ω-relative) on purpose: the
+        # consumer forms the relative pair with the one ω reference it also
+        # forms ``e_dft_rel_ev`` with, rather than round-tripping this
+        # through a second subtraction and addition.
+        e_eval_ev=np.asarray(e_qp_ev, dtype=np.float64),
         omega_grid_ev=config.omega_grid_ev,
         omega_grid_ry=config.omega_grid_ry,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         sigma_omega_h5_path=sigma_omega_h5_path,
         efermi_dft_ev=efermi_dft_ev,
+        omega_reference_provenance=omega_reference_provenance,
     )
 
 
@@ -430,7 +476,6 @@ def compute_sigma_xc(
     static_head_terms,
     head_resolver,
     quad,
-    e_ref: float,
     config,
     meta,
     mesh_xy: Mesh,
@@ -444,6 +489,8 @@ def compute_sigma_xc(
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
     omit_v_h: bool = False,
+    iteration_head=None,
+    occupation_state=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -468,6 +515,10 @@ def compute_sigma_xc(
           the ω-zero anchor for the PPM two-point fit.
         * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
           for the second fit point.
+        * ``"mpa_fit"`` — on-disk path of the MPA screening-model fit
+          store (``gw.screening.compute_screening_model`` for
+          ``ComputeMode.MPA``); the MPA branch reads it instead of an
+          in-memory W.
 
         ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
         means picking the role labels it needs in
@@ -476,19 +527,28 @@ def compute_sigma_xc(
         no plumbing changes elsewhere.  Until it has a branch here it is
         refused by name; it is never served by the PPM one.
     e_qp_ev
-        Per-(k, n) QP energies (eV) used by the PPM QSGW build to evaluate
-        Σ_c(E_m, E_n).  Required for PPM modes; ignored for static.
+        Per-(k, n) QP energies (eV) used by the QSGW build to evaluate
+        Σ_c(E_m, E_n).  Required for dynamic modes; ignored for static.
     static_head_terms, head_resolver
         q→0 head plumbing; ``static_head_terms`` is None when ``do_G0`` is
         false in the config.
-    quad, e_ref
+    quad
         Static minimax quadrature for χ₀; produced by
         ``minimax_screening.build_static_quadrature`` once per W solve.
     config, meta, mesh_xy, sym, wfn, band_slices, input_dir
         Standard driver scaffolding.
     Gij
-        Optional band-space occupation projector; ``None`` builds the
-        default DFT-occ projector inside the static kernels.
+        Optional band-space occupation projector; ``None`` builds it
+        inside the static kernels from ``occupation_state``.  Supplying
+        both is refused (``cohsex_sigma._resolve_Gij``).
+    occupation_state
+        The iteration's :class:`gw.efermi.OccupationState`.  It reaches
+        BOTH halves of Σ here: the MPA branch below (µ, stamps, the
+        fractional contour) and — since this commit — the static
+        channels, so Σ_X / Σ_SX / V_H and the PPM invalid-pole static
+        term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
+        the insulating default and every static channel is then
+        bit-for-bit the integer ``occ > 0.5`` projector.
     wfns_transverse, bispinor_v_q_path
         Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
         tile file).  Both-or-neither; Σ^B is folded into ``sig_x`` by
@@ -534,6 +594,7 @@ def compute_sigma_xc(
             compute_bare_x=True,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
+            occupation_state=occupation_state,
         )
     else:
         cohsex = compute_v_h_sigma_x(
@@ -542,6 +603,7 @@ def compute_sigma_xc(
             static_head_terms=static_head_terms,
             wfns_transverse=wfns_transverse,
             bispinor_v_q_path=bispinor_v_q_path,
+            occupation_state=occupation_state,
         )
     sig_h = cohsex["sig_h"]
     sig_x = cohsex["sig_x"]
@@ -630,21 +692,50 @@ def compute_sigma_xc(
             sigma_coh_kij_ry=sig_coh,
         )
 
+    # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
+    # energies — one check above both branches, one message.
+    if e_qp_ev is None:
+        raise ValueError(
+            f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
+            "(QP energies for the QSGW Σ_c evaluation).")
+
     if mode is ComputeMode.MPA:
         from file_io import mpa_store
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+        from .mpa.sigma_windows import CROSSING_NODE_FLOOR
 
-        if e_qp_ev is None:
-            raise ValueError("MPA Sigma requires QP evaluation energies")
         try:
             fit_path = W_by_role["mpa_fit"]
         except KeyError as exc:
             raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+        if config.mpa.material_class == "metal":
+            # Metal deck-key consistency is refused at config parse
+            # (_validate_occupation_smearing); here the run-level facts:
+            # the one-occupation-state rule, and head/body provenance.
+            if occupation_state is None:
+                raise ValueError(
+                    "MPA Sigma under mpa_material_class = metal requires "
+                    "the iteration's occupation_state (fixed-N MP1 solve); "
+                    "got None. The QSGW driver passes it; a direct caller "
+                    "must construct one from the current spectrum.")
+            # No stamp assert here: this is a SAME-RUN site (the fit store
+            # was written by this run's screening step), and W4 rules that
+            # stamps are asserted at REUSE sites only — a same-run
+            # write-then-read cannot detect the cross-iteration leak it
+            # would claim to guard (claim 0194: the assert here was
+            # unsatisfiable while no writer path carried the state).
+            # assert_occupation_stamps remains the cross-run reuse gate.
+        # One chemical potential per iteration: the metal reference is the
+        # state's fixed-N mu, never the loader's midgap/VBM efermi.
+        sigma_efermi_ry = (float(occupation_state.mu_ry)
+                           if occupation_state is not None
+                           else float(wfn.efermi))
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
-            efermi_ry=float(wfn.efermi),
+            efermi_ry=sigma_efermi_ry,
+            occupation_state=occupation_state,
             regularization_width_ry=(
                 float(config.sigma.regularization_ev) / RYD_TO_EV),
             edge_factor=float(config.sigma.window_edge_factor),
@@ -652,16 +743,33 @@ def compute_sigma_xc(
             crossing_target_error=float(
                 config.mpa.sigma_crossing_target_error),
             max_rank=int(config.mpa.sigma_max_nodes),
-            crossing_max_nodes=max(500, int(config.mpa.sigma_max_nodes)),
+            crossing_max_nodes=max(
+                CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
+            omega_cluster_gap_ry=float(
+                config.mpa.sigma_omega_cluster_gap_ry),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
-        head = mpa_store.read_head_fit(fit_path, to_unit="Ry")
-        sigma_bands = wfns.slices.sigma
+        head = mpa_store.read_head_fit_collective(
+            fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+        # One occupation state per iteration: head fit vs body (skips when
+        # occupation_state is None; refuses an unstamped head under metal).
+        from .mpa.sigma import assert_head_body_occupation_match
+        assert_head_body_occupation_match(
+            head.get("occupation_stamps") or {}, occupation_state)
+        if iteration_head is None:
+            sigma_bands = wfns.slices.sigma
+            head_enk = np.asarray(wfns.enk[:, sigma_bands])
+            head_occ = np.asarray(wfns.occ[:, sigma_bands])
+            head_efermi = sigma_efermi_ry
+        else:
+            head_enk = np.asarray(iteration_head.sigma_energies_ry)
+            head_occ = np.asarray(iteration_head.sigma_occupations)
+            head_efermi = float(iteration_head.efermi_ry)
         head_diag = compute_complex_pole_head_sigma_diag(
             omega_grid_ry=np.asarray(config.omega_grid_ry),
-            enk_ry=np.asarray(wfns.enk[:, sigma_bands]),
-            efermi_ry=float(wfn.efermi),
-            occupations=np.asarray(wfns.occ[:, sigma_bands]),
+            enk_ry=head_enk,
+            efermi_ry=head_efermi,
+            occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
@@ -671,7 +779,11 @@ def compute_sigma_xc(
             sym=sym, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
-            print_fn=print_fn)
+            print_fn=print_fn,
+            # The MPA grid was built against this mu (one chemical
+            # potential per iteration); the finalizer must read it back
+            # against the same reference.
+            efermi_ry=sigma_efermi_ry)
 
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this
@@ -696,10 +808,6 @@ def compute_sigma_xc(
             f"gw.screening.screening_requests_for.")
 
     # Dynamic PPM modes: need W_static + W_probe.
-    if e_qp_ev is None:
-        raise ValueError(
-            f"compute_sigma_xc: PPM mode {mode!r} requires e_qp_ev "
-            "(QP energies for the QSGW Σ_c evaluation).")
     if "probe" not in W_by_role:
         raise KeyError(
             f"compute_sigma_xc: PPM mode {mode!r} requires "
@@ -713,6 +821,8 @@ def compute_sigma_xc(
         config=config, meta=meta, mesh_xy=mesh_xy,
         head_resolver=head_resolver,
         band_slices=band_slices, wfn=wfn, sym=sym,
+        iteration_head=iteration_head,
+        occupation_state=occupation_state,
         print_fn=print_fn,
     )
 

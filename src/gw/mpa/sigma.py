@@ -7,12 +7,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
-from file_io.mpa_store import read_poles, validate_fit_store
+from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
-from gw.ppm_windows import _iter_branches
+from gw.ppm_windows import branches_for_omega_grid
 
 from .sigma_windows import (build_shared_sigma_windows,
                             summarize_sigma_poles)
@@ -37,49 +38,6 @@ def _batch_rows(row, batch):
     )
 
 
-def execution_census(plan, n_poles, pole_batch_size=4):
-    """Return physical tau dispatches after memory batching."""
-    pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    batches = [range(lo, min(lo + pole_batch_size, n_poles))
-               for lo in range(0, n_poles, pole_batch_size)]
-    sweeps = nodes = 0
-    for batch in batches:
-        for row in plan:
-            if _batch_rows(row, batch) is not None:
-                sweeps += 1
-                nodes += row.window.n_tau
-    return {"n_sweeps": sweeps, "n_tau": nodes}
-
-
-def integrate_sigma_windows(
-    wfns,
-    Omega_poles,
-    B_poles,
-    plan,
-    omega_grid_ry,
-    meta,
-    mesh_xy,
-    *,
-    pole_batch_size=4,
-    print_fn=print,
-):
-    """Compute ``Sigma_c(omega)`` from resident pole fields (test adapter)."""
-    if not plan:
-        raise ValueError("MPA Sigma needs pole fields and a nonempty plan")
-    if (Omega_poles.ndim != 4 or B_poles.shape != Omega_poles.shape
-            or not int(Omega_poles.shape[0])):
-        raise ValueError("Omega_poles and B_poles must share (p,q,mu,mu)")
-    batch_size = _bounded_pole_batch_size(pole_batch_size)
-
-    n_poles = int(Omega_poles.shape[0])
-    batches = ((lo, Omega_poles[lo:lo + batch_size],
-                B_poles[lo:lo + batch_size])
-               for lo in range(0, n_poles, batch_size))
-    return _integrate_sigma_batches(
-        wfns, batches, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-        pole_batch_size=batch_size, print_fn=print_fn)
-
-
 def _integrate_sigma_batches(
     wfns,
     batches,
@@ -92,7 +50,7 @@ def _integrate_sigma_batches(
     pole_batch_size,
     print_fn,
 ):
-    """One spatial executor for resident arrays and streamed fit slabs."""
+    """One spatial executor for streamed fit slabs."""
     omega = np.asarray(omega_grid_ry, np.float64)
     if omega.ndim != 1 or not omega.size:
         raise ValueError("omega_grid_ry must be a nonempty vector")
@@ -122,8 +80,19 @@ def _integrate_sigma_batches(
             if selected is None:
                 continue
             pole_indices, bounds, phase_real = (
-                jax.device_put(x, small) for x in selected)
+                device_put_process_local(x, small) for x in selected)
             win = row.window
+            weight = getattr(row, "band_weight", None)
+            if weight is None:
+                # Incumbent bool selector — the kernel's mask path, bit-exact.
+                selector = jnp.asarray(win.mask_A)
+            else:
+                # Metallic: fold support × fractional weight into one float
+                # operand; the kernel dtype-dispatches it onto build_G_tau's
+                # band_weight seam.  Never clipped.
+                selector = (jnp.asarray(win.mask_A, jnp.float64)
+                            * jnp.reshape(jnp.asarray(weight, jnp.float64),
+                                          np.asarray(win.mask_A).shape))
             accumulator.begin_window(
                 win.nodes.t, win.nodes.alpha,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
@@ -133,7 +102,7 @@ def _integrate_sigma_batches(
             for t in np.asarray(jax.device_get(win.nodes.t), np.complex128):
                 sigma_tau = tau_kernel(
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    row.E_A, jnp.asarray(win.mask_A), B, Omega,
+                    row.E_A, selector, B, Omega,
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),
                     jnp.asarray(t, dtype=jnp.complex128))
@@ -164,38 +133,74 @@ def integrate_sigma_store(
     pole_batch_size=4,
     print_fn=print,
 ):
-    """Read, unfold, consume, and release one pole range at a time."""
+    """Read, unfold, consume, and release one pole range at a time.
+
+    ``fit_src`` is a store path, or a live
+    :class:`~file_io.mpa_store.PoleReader` whose collective handle the
+    caller owns — which is what
+    :func:`compute_sigma_c_mpa_omega_grid` passes, so the census walk and
+    this executor walk share ONE open handle for the whole iteration
+    instead of opening the store once per pole batch (audit A1).  Given a
+    path, this function owns a reader for the length of its own walk.
+    """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
-    def batches():
+    def batches(reader):
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            Omega, B = read_poles(
-                fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
-                unfold=True, return_sharded=True, to_unit="Ry")
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
             yield lo, Omega, B
 
-    return _integrate_sigma_batches(
-        wfns, batches(), int(n_poles), plan, omega_grid_ry, meta, mesh_xy,
-        pole_batch_size=batch_size, print_fn=print_fn)
+    def run(reader):
+        return _integrate_sigma_batches(
+            wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
+            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+
+    if isinstance(fit_src, PoleReader):
+        return run(fit_src)
+    with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+        return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry):
-    """The four causal branches, with occupation and energy kept separate."""
-    omega = np.asarray(omega, np.float64)
-    idx_pos, idx_neg = np.where(omega >= 0.0)[0], np.where(omega < 0.0)[0]
-    energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
-    occupied = wfns.occ[:, wfns.slices.full] > 0.5
-    # Do not clip these distances at zero.  In a small-gap or inverted
-    # system an unoccupied state may sit below E_F (or an occupied state
-    # above it); occupation still chooses the band sum.  The current internal
-    # planner refuses a nominally sign-definite cell that then crosses zero.
-    # Public MPA remains disabled until that cell is split and rerouted.
-    return _iter_branches(
-        omega_pos=omega[idx_pos], idx_pos=idx_pos,
-        omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
-        E_cond=energy, H_val=-energy,
-        cond_mask=~occupied, val_mask=occupied)
+def _branches(wfns, omega, efermi_ry, occupation_state=None):
+    """The four causal branches, with occupation and energy kept separate.
+
+    ``occupation_state=None`` is the incumbent insulating semantics,
+    bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
+    With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
+    exact fractional supports and weights: the val branch sums EVERY band
+    with f≠0 at weight f, the cond branch every band with f≠1 at weight
+    1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
+    overshoot (f<0 or f>1) rides through unchanged
+    (docs/theory/finite-occupation-screening.md).
+    """
+    if occupation_state is None:
+        energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
+        occupied = wfns.occ[:, wfns.slices.full] > 0.5
+        # Do not clip these distances at zero.  In a small-gap or inverted
+        # system an unoccupied state may sit below E_F (or an occupied state
+        # above it); occupation still chooses the band sum.  A cell whose
+        # rectangle then crosses zero is rerouted through the crossing core
+        # by the planner's excursion-deepened edge (sigma_windows._geometry).
+        return branches_for_omega_grid(
+            omega, E_cond=energy, H_val=-energy,
+            cond_mask=~occupied, val_mask=occupied)
+    mu = float(occupation_state.mu_ry)
+    if abs(float(efermi_ry) - mu) > 1.0e-12:
+        raise ValueError(
+            "MPA Sigma got efermi_ry inconsistent with its occupation "
+            f"state: efermi_ry={float(efermi_ry):.12g} Ry vs "
+            f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
+            "per iteration — pass the state's own mu.")
+    f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
+                    wfns.enk.shape)[:, wfns.slices.full]
+    energy = wfns.enk[:, wfns.slices.full] - mu
+    return branches_for_omega_grid(
+        omega, E_cond=energy, H_val=-energy,
+        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_weight=1.0 - f, val_weight=f)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -208,55 +213,103 @@ def compute_sigma_c_mpa_omega_grid(
     efermi_ry,
     regularization_width_ry,
     edge_factor=1.5,
-    target_error=1.0e-4,
+    target_error,
     crossing_target_error=None,
-    max_rank=96,
-    crossing_max_nodes=500,
+    max_rank,
+    crossing_max_nodes,
+    omega_cluster_gap_ry=1.0,
     pole_batch_size=4,
-    fit_identity=None,
+    occupation_state=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
+
+    ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
+    the incumbent insulating semantics, bit-exact.  With a state, the causal
+    branches carry exact fractional supports and (f, 1−f) weights, and
+    ``efermi_ry`` must equal ``occupation_state.mu_ry``.
 
     Pole tensors are read collectively in their native sharding.  A first
     four-pole walk retains only scalar geometry for planning; the spatial
     executor rereads and releases the same four-pole ranges.  No complete
     pole axis exists on host or device.
     """
-    ledger = validate_fit_store(fit_src, expected_identity=fit_identity)
+    # No expected_identity here: build_mpa_fit rebuilds the store every
+    # iteration, so a within-run identity would be read back from the file
+    # under test. A cross-run reuse path must call validate_fit_store with
+    # the live screening's hashes itself.
+    ledger = validate_fit_store(fit_src)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(wfns, omega_grid_ry, efermi_ry)
+    branches = _branches(wfns, omega_grid_ry, efermi_ry,
+                         occupation_state=occupation_state)
     summaries = []
-    for lo in range(0, n_poles, int(pole_batch_size)):
-        hi = min(lo + int(pole_batch_size), n_poles)
-        Omega, B = read_poles(
-            fit_src, pole_slice=slice(lo, hi), mesh_xy=mesh_xy,
-            unfold=True, return_sharded=True, to_unit="Ry")
-        summaries.extend(summarize_sigma_poles(
-            Omega, B, branches,
+    # ONE collective handle for the census walk, the planner, and the
+    # executor walk — the whole Σ stage of this iteration.  The reader
+    # does its h5py reads (ledger, unfold tables) before that handle
+    # exists and none after, so no serial-h5py open on this store
+    # overlaps or interleaves with the FFI one anywhere inside a Σ stage
+    # (audit A1; hdf5_owner enforces it).  The context manager is the
+    # release path: a refusal from the planner or the executor must still
+    # close the handle on every rank.
+    with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+        for lo in range(0, n_poles, int(pole_batch_size)):
+            hi = min(lo + int(pole_batch_size), n_poles)
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            summaries.extend(summarize_sigma_poles(
+                Omega, B, branches,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor, pole_offset=lo))
+            del Omega, B
+        plan, geometry = build_shared_sigma_windows(
+            summaries, branches,
             regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor, pole_offset=lo))
-        del Omega, B
-    plan, geometry = build_shared_sigma_windows(
-        None, branches, pole_summaries=summaries,
-        regularization_width_ry=regularization_width_ry,
-        edge_factor=edge_factor, target_error=target_error,
-        crossing_target_error=crossing_target_error,
-        max_rank=max_rank, crossing_max_nodes=crossing_max_nodes)
-    physical = execution_census(plan, n_poles, pole_batch_size)
-    print_fn(
-        f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-        f"{geometry['n_windows']} logical windows, "
-        f"{physical['n_tau']} physical tau dispatches")
-    return integrate_sigma_store(
-        wfns, fit_src, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-        pole_batch_size=pole_batch_size, print_fn=print_fn)
+            edge_factor=edge_factor, target_error=target_error,
+            crossing_target_error=crossing_target_error,
+            max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
+            omega_cluster_gap_ry=omega_cluster_gap_ry)
+        print_fn(
+            f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+            f"{geometry['n_windows']} logical windows")
+        return integrate_sigma_store(
+            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            pole_batch_size=pole_batch_size, print_fn=print_fn)
+
+
+def assert_head_body_occupation_match(head_attrs, occupation_state):
+    """Refuse when the head fit and the body Sigma disagree about occupations.
+
+    ``head_attrs`` is the stamp dict a head-fit reader returns.  One
+    occupation state per iteration is the rule (ARCHITECTURE W2.d/W3); the
+    head's stamped ``occ_hash``/``mu_ry`` must equal the body's.  A metal
+    run with an UNSTAMPED head fit refuses too — an unverifiable stamp is
+    not a pass.  Insulating runs (state None) skip the check.
+    """
+    if occupation_state is None:
+        return
+    stamped_hash = head_attrs.get("occ_hash")
+    stamped_mu = head_attrs.get("mu_ry")
+    if stamped_hash is None or stamped_mu is None:
+        raise ValueError(
+            "metallic MPA Sigma requires an occupation-stamped head fit "
+            "(occ_hash + mu_ry attrs); this store has "
+            f"occ_hash={stamped_hash!r}, mu_ry={stamped_mu!r}.  Refit the "
+            "head with the current iteration's occupation state.")
+    if (str(stamped_hash) != str(occupation_state.occ_hash)
+            or abs(float(stamped_mu) - float(occupation_state.mu_ry))
+            > 1.0e-12):
+        raise ValueError(
+            "head fit and Sigma body carry different occupation states: "
+            f"head (occ_hash={stamped_hash}, mu={float(stamped_mu):.12g}) "
+            f"vs body (occ_hash={occupation_state.occ_hash}, "
+            f"mu={float(occupation_state.mu_ry):.12g}).  One state per "
+            "iteration; rebuild the stale artifact.")
 
 
 __all__ = [
+    "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
-    "execution_census",
     "integrate_sigma_store",
-    "integrate_sigma_windows",
 ]

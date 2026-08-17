@@ -12,6 +12,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from ._compat import deprecated_alias
+from .directed_edges import apply_band_matrix_symmetry
 from ._shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -1429,14 +1430,11 @@ class SymMaps:
         qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]  # Automatic broadcasting
 
         # Find unique q-vectors (already vectorized)
-        self.all_unfolded_qpts = np.unique(qpt_vecs.reshape(-1, 3), axis=0)
-
-        # Generate indices using vectorized operations
-        self.all_unfolded_qpt_ids = np.zeros((len(self.kvecs_asints), len(self.kvecs_asints)), dtype=np.int32)
-        # This is still a loop but operates on whole arrays at once
-        for i, q in enumerate(self.all_unfolded_qpts):
-            mask = (qpt_vecs == q).all(axis=2)
-            self.all_unfolded_qpt_ids[mask] = i
+        self.all_unfolded_qpts, inverse = np.unique(
+            qpt_vecs.reshape(-1, 3), axis=0, return_inverse=True)
+        self.all_unfolded_qpt_ids = inverse.reshape(
+            len(self.kvecs_asints), len(self.kvecs_asints),
+        ).astype(np.int32)
 
         # Eager q-IBZ reduction (was lazy in `find_irreducible_qpoints`; that
         # method is gone — all consumers read these instance attrs directly).
@@ -1860,71 +1858,70 @@ class SymMaps:
             numpy.ndarray: kq_map[ik,iq] = index of k-q in full k-point grid,
                           where ik is index in full grid, iq is index in reduced grid
         """
-        # Initialize mapping array
-        nk_full = len(full_kpts)
-        nk_red = wfn.nkpts
-        kq_map = np.zeros((nk_full, nk_red), dtype=np.int32)
-        
-        # Get reduced k-points
-        reduced_kpts = np.asarray(wfn.kpoints)
-        
-        # For each full k-point and each reduced q-point
-        for ik in range(nk_full):
-            k = full_kpts[ik]
-            for iq in range(nk_red):
-                q = reduced_kpts[iq]
-
-                # Calculate k-q; use periodic distance to find match
-                kminusq = k - q
-
-                # Periodic distance: min |full_kpts - kminusq - G| over G
-                delta = full_kpts - kminusq[None, :]
-                delta = delta - np.round(delta)  # wrap differences to [-0.5, 0.5)
-                diffs = np.sum(np.abs(delta), axis=1)
-                min_diff = np.min(diffs)
-
-                if min_diff > 1e-4:
-                    raise ValueError(f"k-q point {kminusq} not found in k-point grid")
-
-                kq_idx = np.argmin(diffs)
-                if kq_idx >= nk_full:
-                    raise ValueError(f"Invalid k-q mapping: {kq_idx} >= {nk_full}")
-
-                kq_map[ik, iq] = kq_idx
-
-        return kq_map
+        return self._get_kminusq_index_map(
+            full_kpts, np.asarray(wfn.kpoints), name="reduced q grid")
 
     def get_kminusqfull_map(self, wfn, full_kpts):
-        # Initialize mapping array
-        nk_full = len(full_kpts)
-        nk_red = wfn.nkpts
-        kq_map = np.zeros((nk_full, nk_full), dtype=np.int32)
+        del wfn
+        return self._get_kminusq_index_map(
+            full_kpts, full_kpts, name="full q grid")
 
-        # For each full k-point and each reduced q-point
-        for ik in range(nk_full):
-            k = full_kpts[ik]
-            for iq in range(nk_full):
-                q = full_kpts[iq]
+    @staticmethod
+    def _get_kminusq_index_map(full_kpts, qpts, *, name):
+        """Map ``k-q`` to the periodic full-grid row in O(Nk*Nq).
 
-                # Calculate k-q; use periodic distance to find match
-                kminusq = k - q
+        The old implementation performed a nearest-point search over the
+        complete k grid for every pair, making the full map O(Nk**3) in
+        Python.  Uniform-grid coordinates are exact modulo a reciprocal
+        lattice vector, so a quantized periodic-coordinate lookup gives the
+        same row directly.  The quantization is much tighter than the
+        historical 1e-4 acceptance tolerance.
+        """
+        full = np.asarray(full_kpts, dtype=np.float64)
+        qarr = np.asarray(qpts, dtype=np.float64)
+        if full.ndim != 2 or full.shape[1] != 3:
+            raise ValueError(
+                f"full_kpts must have shape (Nk, 3); got {full.shape}")
+        if qarr.ndim != 2 or qarr.shape[1] != 3:
+            raise ValueError(
+                f"qpts must have shape (Nq, 3); got {qarr.shape}")
 
-                # Periodic distance: min |full_kpts - kminusq - G| over G
-                delta = full_kpts - kminusq[None, :]
-                delta = delta - np.round(delta)  # wrap differences to [-0.5, 0.5)
-                diffs = np.sum(np.abs(delta), axis=1)
-                min_diff = np.min(diffs)
+        key_scale = np.int64(100_000_000)
 
-                if min_diff > 1e-4:
-                    raise ValueError(f"k-q point {kminusq} not found in k-point grid")
+        def _keys(points):
+            wrapped = np.mod(points, 1.0)
+            return np.mod(
+                np.rint(wrapped * key_scale).astype(np.int64), key_scale)
 
-                kq_idx = np.argmin(diffs)
-                if kq_idx >= nk_full:
-                    raise ValueError(f"Invalid k-q mapping: {kq_idx} >= {nk_full}")
+        full_keys = _keys(full)
+        lookup = {tuple(row): i for i, row in enumerate(full_keys)}
+        if len(lookup) != len(full):
+            raise ValueError("full k-point grid contains periodic duplicates")
 
-                kq_map[ik, iq] = kq_idx
-
-        return kq_map
+        target_keys = _keys(full[:, None, :] - qarr[None, :, :])
+        flat_keys = target_keys.reshape(-1, 3)
+        flat_map = np.fromiter(
+            (lookup.get(tuple(row), -1) for row in flat_keys),
+            dtype=np.int32,
+            count=flat_keys.shape[0],
+        )
+        # Preserve the former 1e-4 acceptance for unusually noisy input
+        # coordinates without charging every ordinary grid point for a dense
+        # nearest-neighbour search.
+        for bad in np.flatnonzero(flat_map < 0):
+            ik, iq = np.unravel_index(int(bad), target_keys.shape[:2])
+            kminusq = full[ik] - qarr[iq]
+            delta = full - kminusq[None, :]
+            delta -= np.round(delta)
+            diffs = np.sum(np.abs(delta), axis=1)
+            hit = int(np.argmin(diffs))
+            min_diff = float(diffs[hit])
+            if min_diff > 1e-4:
+                raise ValueError(
+                    f"k-q point {kminusq} from {name} not found in k-point "
+                    f"grid (nearest periodic L1 distance {min_diff:.3e})")
+            flat_map[bad] = hit
+        return flat_map.reshape(target_keys.shape[:2])
     
     def get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
         """Return BGW's kg0 for the selected full-zone k-point.
@@ -2140,10 +2137,7 @@ def _broadcast_rows(A_irr, take, trs):
     """``A_irr[take]`` with ``conj`` on the rows ``trs`` marks."""
     if not isinstance(A_irr, jax.Array):
         out = np.asarray(A_irr)[take]
-        if np.any(trs):
-            out = np.where(trs.reshape((-1,) + (1,) * (out.ndim - 1)),
-                           np.conj(out), out)
-        return out
+        return apply_band_matrix_symmetry(out, antiunitary=trs)
     out_sh = _row_out_sharding(A_irr)
     ndim = int(A_irr.ndim)
     any_trs = bool(np.any(trs))
@@ -2157,7 +2151,7 @@ def _broadcast_rows(A_irr, take, trs):
         def _f(x):
             out = x[take_j]
             if any_trs:
-                out = jnp.where(trs_j, jnp.conj(out), out)
+                out = apply_band_matrix_symmetry(out, antiunitary=trs_j)
             return out
         return _jit_with(_f, out_sh)
 
@@ -2224,7 +2218,8 @@ def _star_stats(A_full, members, refs, conj):
             return 0.0, scale
         bshape = (-1,) + (1,) * (A.ndim - 1)
         gathered = A[refs]
-        ref_v = np.where(conj.reshape(bshape), np.conj(gathered), gathered)
+        ref_v = apply_band_matrix_symmetry(
+            gathered, antiunitary=conj.reshape(bshape))
         return float(np.abs(A[members] - ref_v).max()), scale
 
     out_sh = _scalar_out_sharding(A_full)
@@ -2244,7 +2239,8 @@ def _star_stats(A_full, members, refs, conj):
             if n_mem == 0:
                 return jnp.stack([jnp.zeros_like(scale), scale])
             gathered = x[ref_j]
-            ref_v = jnp.where(conj_j, jnp.conj(gathered), gathered)
+            ref_v = apply_band_matrix_symmetry(
+                gathered, antiunitary=conj_j)
             return jnp.stack([jnp.max(jnp.abs(x[mem_j] - ref_v)), scale])
         return _jit_with(_f, out_sh)
 

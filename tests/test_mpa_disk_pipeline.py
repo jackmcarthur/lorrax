@@ -113,14 +113,38 @@ def test_fit_walk_consumes_wc_not_chi(monkeypatch):
     assert seen["kwargs"]["mesh_xy"] == _mesh()
 
 
-def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
-    reads = []
+class _FakeReader:
+    """Stands in for ``mpa_store.PoleReader``, counting its own lifetime."""
 
-    def read(_src, *, pole_slice, **kwargs):
-        reads.append((pole_slice.start, pole_slice.stop, kwargs))
+    def __init__(self, log):
+        self.log = log
+        self.closed = False
+
+    def read(self, pole_slice, **kwargs):
+        assert not self.closed, "read after close"
+        self.log.append((pole_slice.start, pole_slice.stop, kwargs))
         n = pole_slice.stop - pole_slice.start
         return (jnp.zeros((n, 1, 1, 1), jnp.complex128),
                 jnp.zeros((n, 1, 1, 1), jnp.complex128))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+
+def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
+    """Contiguous four-pole ranges, and ONE reader for the whole walk.
+
+    The range arithmetic is the original claim: no complete pole axis
+    exists on host or device, so the executor walks ``pole_batch_size``
+    at a time.  The reader COUNT is the audit-A1 claim added beside it —
+    the store used to be opened and closed once per batch, through two
+    different HDF5 library instances, and now one handle serves them all.
+    """
+    reads = []
+    opened = []
 
     def consume(_wfns, batches, n_poles, *_args, **_kwargs):
         got = [(lo, int(O.shape[0]), int(B.shape[0]))
@@ -128,7 +152,11 @@ def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
         assert n_poles == 10
         return got
 
-    monkeypatch.setattr(mpa_sigma, "read_poles", read)
+    def open_reader(src, *, mesh_xy, **kwargs):
+        opened.append(src)
+        return _FakeReader(reads)
+
+    monkeypatch.setattr(mpa_sigma, "open_pole_reader", open_reader)
     monkeypatch.setattr(mpa_sigma, "_integrate_sigma_batches", consume)
     got = mpa_sigma.integrate_sigma_store(
         None, "poles.h5", 10, (), np.array([0.0]), None, _mesh(),
@@ -137,6 +165,38 @@ def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
     assert [(lo, hi) for lo, hi, _ in reads] == [(0, 4), (4, 8), (8, 10)]
     assert all(row[2]["unfold"] and row[2]["return_sharded"]
                for row in reads)
+    assert opened == ["poles.h5"], (
+        f"one reader for the whole walk, not one per batch; got {opened}")
+
+
+def test_sigma_store_reuses_a_reader_the_caller_already_opened(monkeypatch):
+    """A live reader passed in is USED, not reopened.
+
+    This is how ``compute_sigma_c_mpa_omega_grid`` shares one collective
+    handle between its census walk and this executor walk — the whole
+    Σ stage of an iteration on one open file.  If this path reopened, the
+    census and the executor would be two handles again and audit A1's
+    churn cut would be half done while looking whole.
+    """
+    reads = []
+
+    def consume(_wfns, batches, *_args, **_kwargs):
+        return [lo for lo, _O, _B in batches]
+
+    def open_reader(*_a, **_k):
+        raise AssertionError("a live reader must not be reopened")
+
+    monkeypatch.setattr(mpa_sigma, "open_pole_reader", open_reader)
+    monkeypatch.setattr(mpa_sigma, "_integrate_sigma_batches", consume)
+    reader = _FakeReader(reads)
+    monkeypatch.setattr(mpa_sigma, "PoleReader", _FakeReader)
+    got = mpa_sigma.integrate_sigma_store(
+        None, reader, 6, (), np.array([0.0]), None, _mesh(),
+        pole_batch_size=4)
+    assert got == [0, 4]
+    assert not reader.closed, (
+        "the caller owns the handle it passed in; the executor must not "
+        "close it out from under the census that is still using it")
 
 
 def test_sigma_store_refuses_more_than_four_resident_poles():

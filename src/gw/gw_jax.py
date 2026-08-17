@@ -161,6 +161,8 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 	"""
 	head = head_resolver.at(0.0 + 0.0j)
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
+	# TODO(metal-sigma): this one-shot static Sigma head still uses the
+	# ifmax band boundary.  Port it with the rest of metallic Sigma.
 	occ_mask = np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	terms = compute_static_head_terms_from_sample(
 		head, occ=occ_mask, cell_volume=meta.cell_volume, nk_tot=meta.nk_tot)
@@ -170,10 +172,9 @@ def _compute_static_head(head_resolver, meta, do_screened, print0):
 
 def main(argv=None):
 	_description = (
-		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM self-energy, "
-		"one-shot or self-consistent (see gw_config.ComputeMode / "
-		"QPSolver).  compute_mode = mpa is declared but refuses to run "
-		"until its Σ stage lands.")
+		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
+		"self-energy, one-shot or self-consistent (see "
+		"gw_config.ComputeMode / QPSolver).")
 	argp = argparse.ArgumentParser(
 		allow_abbrev=False, description=_description)
 	argp.add_argument(
@@ -264,6 +265,19 @@ def main(argv=None):
 		device_kind=jax.devices()[0].device_kind if jax.devices() else "unknown",
 		print_fn=print0,
 	)
+
+	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
+	# from /proc/self/maps, printed, not asserted (audit A1 fix 3).  Two
+	# instances — h5py's bundled libhdf5 and the FFI's cray
+	# libhdf5_parallel — alternately touching one file is the standing
+	# explanation for the metallic driver's iteration-3 rank-0 segfault,
+	# and until now the condition was INFERRED from the deployed
+	# artifacts' NEEDED entries rather than observed in the running
+	# process.  ``file_io.hdf5_owner`` prints again after each SC
+	# iteration's store cycle, with the paths that were touched through
+	# both.
+	from file_io.hdf5_owner import probe as _hdf5_probe
+	_hdf5_probe("startup", print_fn=print0)
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
@@ -409,7 +423,7 @@ def main(argv=None):
 		W_by_role = compute_screening_model(
 			mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
 			centroid_indices=centroid_indices, config=config, meta=meta,
-			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"),
+			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
 			label="oneshot", head_resolver=head_resolver,
 			head_channel=getattr(isdf, 'head_channel', None),
 			static_only=qp_solver is QPSolver.SELF_CONSISTENT,
@@ -480,7 +494,7 @@ def main(argv=None):
 				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,
-				quad=quad, e_ref=e_ref,
+				quad=quad,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, band_slices=band_slices,
 				input_dir=input_dir,
@@ -575,6 +589,10 @@ def main(argv=None):
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
 	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
+	# ``rotations_written`` is run_sc_driver's own report of whether it
+	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
+	# than re-deriving the predicate.
+	rotations_written = False
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
 		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
@@ -586,7 +604,7 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
-			sigma_result, sigma_total, _ = run_sc_driver(
+			sigma_result, sigma_total, _, rotations_written = run_sc_driver(
 				wfns, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
@@ -633,6 +651,10 @@ def main(argv=None):
 	sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
 	sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
 	omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
+	# The energies THIS Σ was evaluated at (E_DFT one-shot, the map's input
+	# QP energies under SC).  Not degen-averaged below with the Σ channels:
+	# it is a spectrum, not a self-energy component.
+	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
 	head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
@@ -728,6 +750,7 @@ def main(argv=None):
 		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 		omega_rel_ev=omega_rel_ev,
+		e_eval_ev=e_eval_ev,
 		efermi_ev=efermi_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
@@ -743,6 +766,7 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
+			e_eval_ev=e_eval_ev,
 			print_fn=print0,
 		)
 		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix
@@ -775,9 +799,7 @@ def main(argv=None):
 			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
 			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
 			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
-			write_qp_rotations=not (
-				qp_solver is QPSolver.SELF_CONSISTENT
-				and config.debug.write_wfn_h5),
+			write_qp_rotations=not rotations_written,
 			print_fn=print0,
 		)
 	timing.record("gw_jax.output", time.perf_counter() - _t_out)

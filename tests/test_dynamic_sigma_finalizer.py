@@ -55,17 +55,26 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     def evaluate(got_sigma, **kwargs):
         calls.append("interp")
         assert got_sigma is post_head
-        return (np.full((1, 2), 4.0), np.full((1, 2), 6.0), 7.0)
+        return (np.full((1, 2), 4.0), np.full((1, 2), 6.0), 7.0,
+                "fixed-N mu")
 
     def write(got_sigma, **kwargs):
         calls.append("write")
         assert got_sigma is post_head
+        # THE FINALIZE'S OWN ANSWER REACHES THE WRITER (audit A2): the
+        # stamp is not re-derived at the write site, so the file records
+        # the reference the interpolation above actually used.
+        assert kwargs["omega_reference_ev"] == 7.0
+        assert kwargs["omega_reference_provenance"] == "fixed-N mu"
         return "/tmp/sigma_mnk.h5"
 
     def build(got_sigma, got_x, omega, energy, got_mesh):
         calls.append("qsgw")
         assert got_sigma is post_head and got_mesh is mesh
         np.testing.assert_array_equal(omega, [-1.0, 1.0])
+        # The QSGW ansatz is evaluated at e_qp_ev on the finalize's OWN
+        # reference — one subtraction, not a second opinion about the zero.
+        np.testing.assert_array_equal(energy, np.asarray([[2.0, 3.0]]) - 7.0)
         return qsgw_xc, {"n_clipped": 0, "frac_clipped": 0.0}
 
     def append(path, cube, **kwargs):
@@ -86,7 +95,7 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     )
     result = dispatch.finalize_dynamic_sigma(
         body, head,
-        sig_x=sig_x, sig_h=sig_h, e_qp_ev=np.zeros((1, 2)),
+        sig_x=sig_x, sig_h=sig_h, e_qp_ev=np.asarray([[2.0, 3.0]]),
         config=config, meta=object(), mesh_xy=mesh, sym=object(),
         wfn=SimpleNamespace(efermi=0.0), band_slices=object(),
         input_dir="/tmp", print_fn=lambda *_: None,
@@ -99,3 +108,48 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     np.testing.assert_array_equal(result.sigma_c_at_dft_diag_ev, 4.0)
     np.testing.assert_array_equal(result.omega_dft_rel_ev, 6.0)
     assert result.efermi_dft_ev == 7.0
+    assert result.omega_reference_provenance == "fixed-N mu"
+    # The energies this Σ was EVALUATED at are carried out on the result,
+    # absolute eV, because that is where eqp1 has to be linearized and the
+    # writer cannot re-derive them (``eqp_bgw.compute_eqp_diag``).
+    np.testing.assert_array_equal(result.e_eval_ev, [[2.0, 3.0]])
+
+
+def test_the_sc_driver_does_not_overwrite_the_finalize_omega_reference():
+    """The reference that reaches the eqp writer is the finalize's own.
+
+    ``run_sc_driver`` hands the driver's post-Σ seam a rebased copy of the
+    last iteration's ``SigmaResult``, and ``gw_jax`` puts its
+    ``efermi_dft_ev`` straight into ``GWResults.efermi_ev``, which is the
+    single number ``gw_output.write_results`` forms ``e_dft_rel_ev`` (and
+    the eqp1 centre) from.  That field used to be re-filled here with the
+    loader's ``wfn.efermi`` — mid-gap ½(VBM+CBM) of the DFT spectrum —
+    unconditionally, so a metallic run's eqp0/eqp1.dat sampled Σ_c(ω)
+    2.932 eV away from the reference its own grid was built with on the
+    sodium 8×8×8 deck (measured: those files reassemble from disk to
+    3.6e-4 eV at wfn.efermi and to 3.7 eV at the loop's fixed-N μ).
+
+    AST, not a run: the defect is one keyword in one call, it is invisible
+    to every shape/finiteness gate, and reproducing it end to end costs a
+    self-consistent QSGW.  Static modes never fill the field, which is
+    what the unconditional re-fill was for — so the ``else`` arm may
+    still be ``wfn.efermi``; what may not come back is dropping the test.
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "sc_iteration.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_sc_driver")
+    kw = [k for call in ast.walk(fn)
+          if isinstance(call, ast.Call) for k in call.keywords
+          if k.arg == "efermi_dft_ev"]
+    assert len(kw) == 1, f"expected exactly one efermi_dft_ev=, got {len(kw)}"
+    value = kw[0].value
+    assert isinstance(value, ast.IfExp), (
+        "run_sc_driver must keep the dynamic finalize's own omega "
+        "reference and fall back to wfn.efermi only where there is none; "
+        f"got an unconditional {ast.dump(value)[:90]}")
+    assert (isinstance(value.body, ast.Attribute)
+            and value.body.attr == "efermi_dft_ev"), ast.dump(value.body)[:90]

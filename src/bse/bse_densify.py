@@ -447,6 +447,7 @@ def _interpolate_bse_data_to_grid(
     mesh_xy: Mesh,
     *,
     head_channel: dict | None = None,
+    distrib_la_batched_route: str | None = None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -501,7 +502,10 @@ def _interpolate_bse_data_to_grid(
     """
     from bandstructure import htransform as ht
     from bandstructure.bse_setup import compute_wfns_fi
-    from gw.gw_config import read_lorrax_input
+    from gw.gw_config import (
+        read_lorrax_input,
+        resolve_distrib_la_batched_route,
+    )
 
     from . import vq_interp
 
@@ -522,6 +526,8 @@ def _interpolate_bse_data_to_grid(
            f"W (zero-pad in R)")
 
     params = read_lorrax_input(input_file)
+    _distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=distrib_la_batched_route)
 
     # ── WHICH ISDF BASIS THE htransform FITS IN ───────────────────────────
     # On a NATIVE bundle: the deck's own table, and ``keep`` is None — this
@@ -580,7 +586,8 @@ def _interpolate_bse_data_to_grid(
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=coarse_grid, kgrid_fi=fine_grid,
-        band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn)
+        band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
+        distrib_la_batched_route=_distrib_la_batched_route)
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
     y4 = NamedSharding(mesh_xy, P(None, None, None, "y"))
@@ -659,6 +666,7 @@ def _interpolate_bse_data_to_grid(
         # reproduction).  This arm is bit-for-bit the pre-2026-08-09 behaviour.
         vqm = vq_interp.build_vq_evaluator(
             restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
+            distrib_la_batched_route=_distrib_la_batched_route,
             log_fn=log_fn)
         gstar, head_val = vq_interp.minibz_head_vlr(
             vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)

@@ -385,6 +385,12 @@ def test_the_route_vocabulary_is_importable_and_closed():
     assert len(set(BATCHED_ROUTES)) == 3
     assert all(isinstance(r, str) and r for r in BATCHED_ROUTES)
 
+    # Production selection is intentionally narrower than the internal
+    # implementation vocabulary: auto owns scan/backend_batched, while the
+    # universal flag can opt into the staged local route.
+    from distrib_la import BATCHED_ROUTE_CHOICES
+    assert BATCHED_ROUTE_CHOICES == ("auto", ROUTE_BATCH_RESHARD)
+
 
 def test_the_scan_unroll_is_one_and_is_a_named_constant():
     """``unroll=1`` is the DEFAULT, deliberately, and deliberately named.

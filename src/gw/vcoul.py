@@ -31,6 +31,7 @@ def compute_q0_averages(
 	epshead,
 	meta: Meta,
 	S_cart: jnp.ndarray | None = None,
+	static_kappa2: jnp.ndarray | None = None,
 	nsamples: int = 2**18,
 	method: str = "auto",
 	qmc_reps: int = 10,
@@ -53,11 +54,15 @@ def compute_q0_averages(
 	same thing while SAYING so once (``vcoul.minibz``'s announce-or-refuse
 	gate).  A caller that wants the old silence back should not have it; a
 	caller that wants a refusal instead passes ``method="sobol"``.
+
+	For a 3D metal at exactly zero frequency, ``static_kappa2`` selects the
+	Thomas-Fermi order of limits, ``<8*pi/(q^2+kappa_TF^2)>``.  It is mutually
+	exclusive with the finite-frequency ``S_cart`` representation.
 	"""
 	from .coulomb import get_kernel
 	return get_kernel(getattr(meta, 'sys_dim', None)).q0_average(
 		wfn, meta,
-		S_cart=S_cart, epshead=epshead,
+		S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
 		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
 		analytic_sphere=analytic_sphere,
 	)

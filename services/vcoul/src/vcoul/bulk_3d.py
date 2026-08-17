@@ -46,6 +46,7 @@ class Bulk3D:
         self, geometry: CoulombGeometry, kgrid, *,
         S_cart=None,
         epshead=None,
+        static_kappa2=None,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
@@ -77,6 +78,20 @@ class Bulk3D:
             # vc0_mean: average v(q) across all sampled q-points, mean over reps.
             means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
             vc0_mean = jnp.mean(jnp.stack(means))
+
+        if static_kappa2 is not None:
+            if S_cart is not None:
+                raise ValueError(
+                    "q0_average accepts either static_kappa2 or S_cart, not both")
+            kappa2 = jnp.asarray(static_kappa2, dtype=jnp.complex128)
+            if kappa2.ndim != 0 or float(jnp.real(kappa2)) <= 0.0:
+                raise ValueError("static_kappa2 must be one positive scalar")
+            wmeans = []
+            for rq in batches:
+                q2 = jnp.einsum("qi,qi->q", rq, rq)
+                wmeans.append(jnp.mean(8.0 * jnp.pi / (q2 + kappa2)))
+            wcoul0 = jnp.mean(jnp.stack(wmeans))
+            return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
 
         if S_cart is not None:
             # Anisotropic screened: w0 = ⟨ v / (1 - v · qᵀSq) ⟩ on the same q's.

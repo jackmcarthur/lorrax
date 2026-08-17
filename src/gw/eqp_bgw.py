@@ -23,10 +23,17 @@ diagonal QP energies BGW writes are the standard Newton iteration on
 the on-shell Σ:
 
     eqp0[k,n] = E_DFT[k,n] + Δ(k,n, E_DFT[k,n])               (zeroth order)
-    eqp1[k,n] = E_DFT[k,n] + Z[k,n] · Δ(k,n, E_DFT[k,n])      (linearized)
-    Z[k,n]   = 1 / (1 - dRe[Σ_c]/dω | ω = E_DFT[k,n])
+    eqp1[k,n] = E_ref[k,n] + Z[k,n] · Δ(k,n, E_ref[k,n])      (linearized)
+    Z[k,n]   = 1 / (1 - dRe[Σ_c]/dω | ω = E_ref[k,n])
 
 Σ_x and V_H are ω-independent, so only Σ_c contributes to Z.
+
+``E_ref`` is the spectrum Σ WAS EVALUATED AT, which is E_DFT in a
+one-shot G0W0 run — BGW's case, and the case these files are formatted
+for — and the converged QP energies under self-consistency, where
+linearizing at E_DFT instead would centre the difference eV away from
+the pole.  :func:`compute_eqp_diag` owns that choice and documents it;
+eqp0 is at E_DFT always.
 
 Inputs (per LORRAX gw_jax run directory)
 ----------------------------------------
@@ -269,13 +276,21 @@ def compute_z_factor_from_omega_grid(
 	*,
 	sigma_c_omega_diag_ev: np.ndarray,  # (n_omega, nk, nb)
 	omega_rel_ev: np.ndarray,           # (n_omega,)  — ω axis relative to E_F
-	e_dft_rel_ev: np.ndarray,           # (nk, nb)    — E_DFT - E_F
+	e_dft_rel_ev: np.ndarray,           # (nk, nb)    — the CENTRE, E - E_F
 	dE_ev: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
-	"""Interpolate Σ_c at E_DFT and central-difference Z = 1 / (1 − dRe[Σ_c]/dω).
+	"""Interpolate Σ_c at a centre energy and central-difference
+	Z = 1 / (1 − dRe[Σ_c]/dω) there.
 
-	Returns ``(sigma_c_at_dft_diag_ev, z_factor)``, both shape ``(nk, nb)``.
-	``sigma_c_at_dft_diag_ev`` is complex; ``z_factor`` is real.
+	Returns ``(sigma_c_at_centre_diag_ev, z_factor)``, both shape
+	``(nk, nb)``.  The Σ_c value is complex; ``z_factor`` is real.
+
+	``e_dft_rel_ev`` NAMES THE CENTRE, and the name is the one-shot case,
+	not a claim about every caller.  eqp0 always wants E_DFT − E_F here;
+	eqp1 wants the energies the Σ spectrum was BUILT at (see
+	:func:`assemble_eqp`), which is the same array in a one-shot run and
+	the converged QP energies under self-consistency.  Whatever is passed
+	must be ω-relative on the SAME reference the ω grid was built with.
 
 	``dE_ev`` plays the role of BGW's ``finite_difference_spacing``; 0.5 eV
 	matches the BGW default.  For the ω-grid spacing of 0.25 eV used by
@@ -296,7 +311,7 @@ def compute_z_factor_from_omega_grid(
 	sigma_c_minus = interp_along_omega(
 		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev)
 
-	# Central-difference dRe[Σ_c]/dω at E_DFT
+	# Central-difference dRe[Σ_c]/dω at the centre
 	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)
 	z_factor = 1.0 / (1.0 - dsigma_dE)
 	return sigma_c_at_dft, z_factor
@@ -371,23 +386,51 @@ def compute_eqp_diag(
 	sigma_c_at_dft_diag_ev: np.ndarray, # (nk, nb)  — on-shell Σ_c
 	e_dft_ev: np.ndarray,               # (nk, nb)
 	z_factor: np.ndarray | None = None, # (nk, nb)  — None ⇒ Z=1 (static modes)
+	# The eqp1 linearization point, when it is NOT E_DFT (see below).
+	# Both or neither; None ⇒ the historical at-DFT linearization.
+	sigma_c_at_eval_diag_ev: np.ndarray | None = None,  # (nk, nb)
+	e_eval_ev: np.ndarray | None = None,                # (nk, nb)
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Return zeroth-order and Z-linearized BGW QP energies.
 
 	Computes::
 
-	    Δ(k,n)  = (kin_ion + V_H + Σ_x + Σ_c(E_DFT) − E_DFT).real
-	    eqp0    = E_DFT + Δ                          (zeroth-order Newton)
-	    eqp1    = E_DFT + Z · Δ                      (linearized; Z=1 if None)
+	    Δ(k,n,E) = (kin_ion + V_H + Σ_x + Σ_c(E) − E).real
+	    eqp0     = E_DFT + Δ(E_DFT)                  (zeroth-order Newton)
+	    eqp1     = E_ref  + Z · Δ(E_ref)             (linearized; Z=1 if None)
+
+	**Where E_ref is, and why it is not always E_DFT.** eqp1 is one Newton
+	step on the QP equation ``E = h₀ + ReΣ(E)``, linearized about a
+	reference energy; Z = 1/(1 − dΣ/dω) is the derivative AT that same
+	reference.  BGW's G0W0 takes E_ref = E_DFT because that is the only
+	spectrum a one-shot run has, and this function does the same whenever
+	``e_eval_ev is None`` — bit-for-bit the historical expression.  Under
+	self-consistency the spectrum Σ was built from is the converged QP
+	one, so E_DFT is the wrong place to linearize: the central difference
+	then samples Σ(ω) eV away from the pole it is meant to characterise
+	(2.4 eV at Γ on the sodium 8×8×8 deck), and the residual Δ it
+	multiplies is not small.  Passing the evaluation energies makes the
+	step consistent — at convergence Δ(E_qp) ≈ 0 and eqp1 reproduces the
+	converged iterate, which is the statement eqp1 is supposed to make.
+
+	eqp0 is UNTOUCHED by this: it stays the at-E_DFT zeroth-order value
+	that pairs with the ``E_DFT`` column of the file, in every mode.
 
 	For static modes (COHSEX) the on-shell Σ_c is just the static value and
 	there is no ω-grid to differentiate, so callers pass ``z_factor=None``
 	and ``eqp1 == eqp0`` trivially — matching BGW's behavior in static runs.
 
-	For dynamic modes (GN-PPM, HL-PPM) the caller obtains both
-	``sigma_c_at_dft_diag_ev`` and ``z_factor`` from
-	:func:`compute_z_factor_from_omega_grid`.
+	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
+	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
+	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
 	"""
+	if (sigma_c_at_eval_diag_ev is None) != (e_eval_ev is None):
+		raise ValueError(
+			"compute_eqp_diag: sigma_c_at_eval_diag_ev and e_eval_ev are "
+			"the two halves of ONE linearization point — pass both or "
+			"neither; got "
+			f"sigma_c_at_eval={'set' if sigma_c_at_eval_diag_ev is not None else 'None'}, "
+			f"e_eval={'set' if e_eval_ev is not None else 'None'}")
 	sigma_xc_at_dft = sigma_x_diag_ev + sigma_c_at_dft_diag_ev
 	delta_at_dft = (
 		kin_ion_diag_ev + hartree_diag_ev + sigma_xc_at_dft - e_dft_ev
@@ -405,8 +448,14 @@ def compute_eqp_diag(
 	eqp0 = e_dft_ev + delta_at_dft
 	if z_factor is None:
 		eqp1 = eqp0  # Z=1 trivially
-	else:
+	elif e_eval_ev is None:
 		eqp1 = e_dft_ev + z_factor * delta_at_dft
+	else:
+		delta_at_eval = (
+			kin_ion_diag_ev + hartree_diag_ev
+			+ sigma_x_diag_ev + sigma_c_at_eval_diag_ev - e_eval_ev
+		).real
+		eqp1 = e_eval_ev + z_factor * delta_at_eval
 	return eqp0, eqp1
 
 
@@ -507,6 +556,9 @@ class EqpAssembly:
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
 	nspin: int = 1
+	#: Where eqp1 was linearized, when that was not E_DFT (self-consistent
+	#: runs).  None on every one-shot path, where it IS E_DFT.
+	e_eval_ev: np.ndarray | None = None
 
 	def write(self, *, eqp0_path: str, eqp1_path: str) -> tuple[str, str]:
 		"""Emit the exact-BGW-format eqp0.dat / eqp1.dat pair."""
@@ -533,6 +585,10 @@ def assemble_eqp(
 	sigma_c_omega_diag_ev: np.ndarray | None = None,       # (n_omega, nk, nb)
 	omega_rel_ev: np.ndarray | None = None,                # (n_omega,)
 	e_dft_rel_ev: np.ndarray | None = None,                # (nk, nb)
+	# The eqp1 linearization point — see step 3 below.  Absolute eV and
+	# ω-relative eV of the SAME energies; both or neither.
+	e_eval_ev: np.ndarray | None = None,                   # (nk, nb)
+	e_eval_rel_ev: np.ndarray | None = None,               # (nk, nb)
 	dE_ev: float = 0.5,
 	nspin: int = 1,
 	# The V_H seam (see resolve_hartree_diag_ev)
@@ -550,9 +606,22 @@ def assemble_eqp(
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
-	3. Σ_c at E_DFT and the central-difference Z-factor, when an ω-grid
-	   is supplied (:func:`compute_z_factor_from_omega_grid`);
+	3. Σ_c at E_DFT — always, it is what eqp0 means — and, when the
+	   caller says the Σ spectrum was evaluated somewhere else
+	   (``e_eval_ev``), a SECOND interpolation and central-difference
+	   Z there, which is where eqp1 is linearized
+	   (:func:`compute_z_factor_from_omega_grid`, and
+	   :func:`compute_eqp_diag` for why);
 	4. the Newton update (:func:`compute_eqp_diag`).
+
+	**The evaluation point, and the one-omega-reference rule.**
+	``e_eval_ev`` / ``e_eval_rel_ev`` are the same energies in absolute
+	and ω-relative eV, and the caller forms the relative one with the SAME
+	reference it formed ``e_dft_rel_ev`` with — the reference the Σ(ω)
+	grid was built with, never a second opinion about it.  Passing them
+	equal to the DFT arrays is not merely allowed but the one-shot case,
+	and the code then takes the single-interpolation path and reproduces
+	the historical numbers bit-for-bit.
 
 	The gate lives HERE rather than in ``compute_eqp_diag`` (which must
 	stay a silent pure function — pinned by
@@ -585,6 +654,12 @@ def assemble_eqp(
 		# for the post-hoc CLI alike.  O's policy kept, its duplicate
 		# wording dropped.
 
+	if (e_eval_ev is None) != (e_eval_rel_ev is None):
+		raise ValueError(
+			"assemble_eqp: e_eval_ev and e_eval_rel_ev are the absolute and "
+			"ω-relative halves of ONE linearization point — pass both or "
+			"neither")
+	sigma_c_at_eval = None
 	if sigma_c_omega_diag_ev is None:
 		# Static mode: no ω-grid, Z = 1 trivially.
 		if sigma_c_at_dft_diag_ev is None:
@@ -594,6 +669,8 @@ def assemble_eqp(
 				"e_dft_rel_ev (dynamic modes)")
 		z_factor = None
 		sigma_c_at_dft = sigma_c_at_dft_diag_ev
+		# No derivative to centre; eqp1 == eqp0 whatever was passed.
+		e_eval_ev = None
 	else:
 		if omega_rel_ev is None or e_dft_rel_ev is None:
 			raise ValueError(
@@ -606,6 +683,31 @@ def assemble_eqp(
 			e_dft_rel_ev=e_dft_rel_ev,
 			dE_ev=dE_ev,
 		)
+		# THE SECOND CENTRE, and only when it is a different one.  The
+		# equality test is what keeps every one-shot run — where the Σ
+		# spectrum IS evaluated at E_DFT, so the caller passes the same
+		# numbers — on exactly the code above, hence bit-for-bit on the
+		# historical answer.  It is an ``array_equal``, not a tolerance:
+		# these arrays are either literally the same energies or a
+		# different spectrum.
+		if e_eval_rel_ev is not None and not np.array_equal(
+			np.asarray(e_eval_rel_ev, dtype=np.float64),
+			np.asarray(e_dft_rel_ev, dtype=np.float64),
+		):
+			sigma_c_at_eval, z_factor = compute_z_factor_from_omega_grid(
+				sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+				omega_rel_ev=omega_rel_ev,
+				e_dft_rel_ev=e_eval_rel_ev,
+				dE_ev=dE_ev,
+			)
+			print_fn(
+				"  eqp1 linearization: Σ was evaluated away from E_DFT this "
+				f"call (max |E_eval − E_DFT| = "
+				f"{float(np.max(np.abs(np.asarray(e_eval_ev, dtype=np.float64) - np.asarray(e_dft_ev, dtype=np.float64)))):.4f} eV) "
+				"— Z and the Σ_c it multiplies are centred there, not at "
+				"E_DFT.  eqp0 stays at E_DFT.")
+		else:
+			e_eval_ev = None
 
 	eqp0_ev, eqp1_ev = compute_eqp_diag(
 		kin_ion_diag_ev=kin_ion_diag_ev,
@@ -614,6 +716,8 @@ def assemble_eqp(
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
 		e_dft_ev=e_dft_ev,
 		z_factor=z_factor,
+		sigma_c_at_eval_diag_ev=sigma_c_at_eval,
+		e_eval_ev=e_eval_ev,
 	)
 	return EqpAssembly(
 		kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
@@ -628,6 +732,8 @@ def assemble_eqp(
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
 		nspin=int(nspin),
+		e_eval_ev=(None if e_eval_ev is None
+		           else np.asarray(e_eval_ev, dtype=np.float64)),
 	)
 
 
@@ -738,9 +844,79 @@ def write_eqp_bgw_in_memory(
 	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 
+#: Occupations this far from an integer are FRACTIONAL, i.e. a smeared
+#: Fermi surface.  Loose on purpose: the question here is "is there a
+#: mid-gap to fall back on", and one partially filled state anywhere in
+#: the BZ answers it, whatever the smearing width.
+_OCC_INTEGER_TOL = 1.0e-6
+
+
+def _metallic_occupations(ifmax, occupations):
+	"""``(metallic, why)`` from a WFN's own occupation record.
+
+	TWO INDEPENDENT SIGNATURES, either of which means "no mid-gap exists":
+
+	* ``ifmax`` — the highest occupied band, per k — is not the same at
+	  every k.  That is a band crossing E_F, which is what a Fermi surface
+	  IS; ``max(ifmax)`` then names a band that is empty at some k, and
+	  ½(VBM+CBM) computed across that split is not a gap centre.
+	* any occupation is strictly fractional.  A smeared metal's states at
+	  E_F are partially filled by construction.
+
+	Reported separately because they answer different questions when a
+	reader comes back to a refusal: the first is geometry, the second is
+	smearing.  ``occupations=None`` (a WFN without the dataset) simply
+	does not contribute its half.
+	"""
+	reasons = []
+	ifmax = np.asarray(ifmax)
+	if ifmax.size and int(np.min(ifmax)) != int(np.max(ifmax)):
+		reasons.append(
+			f"ifmax varies across k ({int(np.min(ifmax))}..{int(np.max(ifmax))}"
+			") — a band crosses E_F")
+	if occupations is not None:
+		occ = np.asarray(occupations, dtype=np.float64)
+		frac = np.abs(occ - np.rint(occ)) > _OCC_INTEGER_TOL
+		if bool(np.any(frac)):
+			reasons.append(
+				f"{int(np.count_nonzero(frac))} of {occ.size} occupations "
+				f"are fractional (max deviation "
+				f"{float(np.max(np.abs(occ - np.rint(occ)))):.3e})")
+	return bool(reasons), "; ".join(reasons) or "insulating"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator: read the run directory and emit eqp{0,1}.dat
 # ---------------------------------------------------------------------------
+
+def _read_eval_energies_ev(
+	path: str, *, kirr_to_kfull: np.ndarray, band_start: int, band_stop: int,
+) -> np.ndarray:
+	"""The IBZ × sigma-window energies (eV) a QP artifact carries.
+
+	Reads either of the two files a run writes its converged spectrum to,
+	because both are legitimate answers to "what did Σ get evaluated at"
+	and which one is on disk depends on the deck:
+
+	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, full BZ, ALREADY on the
+	    sigma window (its band axis is ``band_range``), so it is indexed
+	    by ``kirr_to_kfull`` and not sliced in bands.
+	``WFN_qp.h5``           — ``mf_header/kpoints/el``, the WFN file's own
+	    k-set (the IBZ) and ALL bands, so it is sliced in bands and not
+	    in k.
+	"""
+	with h5py.File(path, "r") as f:
+		if "E_qp_nk_rydberg" in f:
+			e = np.asarray(f["E_qp_nk_rydberg"], dtype=np.float64)
+			return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
+		if "mf_header/kpoints/el" in f:
+			e = np.asarray(f["mf_header/kpoints/el"], dtype=np.float64)
+			return e[0][:, int(band_start):int(band_stop)] * RYD_TO_EV
+	raise ValueError(
+		f"{os.path.basename(path)} carries neither 'E_qp_nk_rydberg' "
+		f"(qp_wfn_rotations.h5) nor 'mf_header/kpoints/el' (WFN_qp.h5); it "
+		f"cannot say what energies Sigma was evaluated at.")
+
 
 def make_eqp_bgw(
 	run_dir: str,
@@ -749,6 +925,7 @@ def make_eqp_bgw(
 	kin_ion_path: Optional[str] = None,
 	sigma_mnk_path: Optional[str] = None,
 	qp_rotations_path: Optional[str] = None,
+	eval_energies_path: Optional[str] = None,
 	eqp0_out: str = "eqp0.dat",
 	eqp1_out: str = "eqp1.dat",
 	finite_difference_spacing_ev: float = 0.5,
@@ -757,6 +934,19 @@ def make_eqp_bgw(
 
 	All file paths default to standard names inside ``run_dir``.  Returns
 	``(eqp0_path, eqp1_path)``.
+
+	``eval_energies_path`` — WHERE eqp1 IS LINEARIZED, and OPT-IN by
+	design.  ``sigma_mnk.h5`` stamps the ω reference its axis is relative
+	to but does not record which spectrum the run evaluated Σ at, and the
+	two candidates on disk are not interchangeable: for a SELF-CONSISTENT
+	run ``WFN_qp.h5`` / ``qp_wfn_rotations.h5`` hold exactly the converged
+	energies Σ was built from and are the right answer, while for a
+	ONE-SHOT run those same files hold ``eigh(H₀+Σ)`` — an OUTPUT of the
+	Σ that was built at E_DFT, and centring the linearization there would
+	be a different, wrong calculation.  Nothing in the files distinguishes
+	the two cases, so this function will not guess: absent this argument
+	it linearizes at E_DFT, which is correct for one-shot and is what
+	every historical call did.  See :func:`compute_eqp_diag`.
 	"""
 	wfn_path = wfn_path or os.path.join(run_dir, "WFN.h5")
 	kin_ion_path = kin_ion_path or os.path.join(run_dir, "kin_ion.h5")
@@ -776,6 +966,8 @@ def make_eqp_bgw(
 		# energies: (nspin, nk, nbands_total) in Ry
 		energies_ry = np.asarray(wfn["mf_header/kpoints/el"])
 		ifmax = np.asarray(wfn["mf_header/kpoints/ifmax"])  # (nspin, nk) 1-based
+		occupations = (np.asarray(wfn["mf_header/kpoints/occ"])
+		               if "mf_header/kpoints/occ" in wfn else None)
 	if nspin != 1:
 		raise NotImplementedError("LORRAX runs at nspin=1; got nspin={}".format(nspin))
 
@@ -801,18 +993,78 @@ def make_eqp_bgw(
 			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
 		)
 
-	# Mid-gap Fermi level from the IBZ DFT energies (matches gw_jax convention)
-	n_occ = int(np.max(ifmax[0]))                       # 1-based highest occ
-	occ_idx_local = n_occ - 1 - band_start              # within the window
-	if occ_idx_local < 0 or occ_idx_local + 1 >= nb_window:
+	# ── THE ω REFERENCE: the file's stamp first, midgap only as a legacy
+	#    fallback on a file that is demonstrably insulating (audit A2) ──
+	#
+	# ``sigma_mnk.h5``'s ω axis is RELATIVE, and which zero it is relative
+	# to is a property of the RUN that wrote it, not of the WFN this
+	# function can see.  The in-run consumers take the finalizer's
+	# ``efermi_dft_ev``; this CLI used to recompute ½(VBM+CBM) instead,
+	# which on the metal path samples Σ_c(ω) at energies shifted by
+	# (mu − midgap) — a measured 2.79 eV on the sodium deck, showing up as
+	# a spurious ~+2.4 eV near-E_F QP correction.  So: prefer the stamp;
+	# where there is none, fall back to midgap ONLY if the occupations say
+	# insulating, and REFUSE otherwise rather than guess wrong by default.
+	from file_io.sigma_output import read_omega_reference
+	stamped_ev, stamped_provenance = read_omega_reference(sigma_mnk_path)
+	metallic, why = _metallic_occupations(ifmax, occupations)
+
+	if stamped_ev is not None:
+		efermi_ev = float(stamped_ev)
+	elif metallic:
 		raise ValueError(
-			"sigma window does not bracket VBM/CBM: band_range="
-			f"[{band_start},{band_stop}), VBM index={n_occ - 1}"
-		)
-	vbm_ev = float(np.max(e_dft_ev[:, : occ_idx_local + 1]))
-	cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
-	efermi_ev = 0.5 * (vbm_ev + cbm_ev)
+			f"make_eqp_bgw: {os.path.basename(sigma_mnk_path)} carries no "
+			f"omega_reference_ev stamp, and {os.path.basename(wfn_path)} "
+			f"has METALLIC occupations ({why}).\n"
+			f"  got  : an unstamped Sigma_c(omega) cube whose axis zero is "
+			f"unknown, and a run whose zero is the fixed-N chemical "
+			f"potential mu, not mid-gap.\n"
+			f"  want : the reference the run interpolated with.  Assuming "
+			f"mid-gap here samples Sigma_c at energies shifted by "
+			f"(mu - midgap) — 2.79 eV on the sodium deck — and produces "
+			f"eqp files that look plausible and are wrong.  There is no "
+			f"mid-gap on a metal: the band that would define it crosses "
+			f"E_F.\n"
+			f"  fix  : regenerate sigma_mnk.h5 with a driver that stamps "
+			f"omega_reference_ev (every write since audit A2 does), or "
+			f"take eqp0/eqp1 from the run's own output rather than "
+			f"reassembling them from disk.  Any comparison already made "
+			f"from an unstamped metallic cube through this path is "
+			f"invalid.")
+	else:
+		# Mid-gap Fermi level from the IBZ DFT energies — the pre-stamp
+		# insulating convention, kept so every file written before the
+		# stamp existed still assembles bit-identically.
+		n_occ = int(np.max(ifmax[0]))                   # 1-based highest occ
+		occ_idx_local = n_occ - 1 - band_start          # within the window
+		if occ_idx_local < 0 or occ_idx_local + 1 >= nb_window:
+			raise ValueError(
+				"sigma window does not bracket VBM/CBM: band_range="
+				f"[{band_start},{band_stop}), VBM index={n_occ - 1}"
+			)
+		vbm_ev = float(np.max(e_dft_ev[:, : occ_idx_local + 1]))
+		cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
+		efermi_ev = 0.5 * (vbm_ev + cbm_ev)
+		stamped_provenance = "midgap (unstamped file, insulating occupations)"
+	print(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
 	e_dft_rel_ev = e_dft_ev - efermi_ev
+
+	# The eqp1 linearization point, on the SAME reference — one subtraction
+	# with one ω zero, exactly as the line above.
+	e_eval_ev = e_eval_rel_ev = None
+	if eval_energies_path is not None:
+		e_eval_ev = _read_eval_energies_ev(
+			eval_energies_path, kirr_to_kfull=kirr_to_kfull,
+			band_start=band_start, band_stop=band_stop)
+		if e_eval_ev.shape != e_dft_ev.shape:
+			raise ValueError(
+				f"eval energies from {os.path.basename(eval_energies_path)} "
+				f"have shape {e_eval_ev.shape}, but the sigma window on the "
+				f"IBZ is {e_dft_ev.shape}")
+		e_eval_rel_ev = e_eval_ev - efermi_ev
+		print(f"  eqp1 linearized at {os.path.basename(eval_energies_path)} "
+		      f"(max |E_eval − E_DFT| = "
+		      f"{float(np.max(np.abs(e_eval_ev - e_dft_ev))):.4f} eV)")
 
 	# kin_ion (Ry → eV), pulled on the IBZ wedge directly.
 	#
@@ -919,6 +1171,8 @@ def make_eqp_bgw(
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
+		e_eval_ev=e_eval_ev,
+		e_eval_rel_ev=e_eval_rel_ev,
 		dE_ev=finite_difference_spacing_ev,
 		nspin=1,
 		hartree_source=_src,
@@ -940,6 +1194,13 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--kin-ion", default=None, help="Path to kin_ion.h5")
 	p.add_argument("--sigma-mnk", default=None, help="Path to sigma_mnk.h5")
 	p.add_argument("--qp-rotations", default=None, help="Path to qp_wfn_rotations.h5")
+	p.add_argument(
+		"--eval-energies", default=None,
+		help="WFN_qp.h5 or qp_wfn_rotations.h5 holding the energies Sigma "
+		     "was evaluated at, for the eqp1 linearization.  SELF-CONSISTENT "
+		     "runs only — on a one-shot run those files hold eigh(H0+Sigma), "
+		     "an output, and passing them centres eqp1 in the wrong place.  "
+		     "Default: linearize at E_DFT (correct for one-shot)")
 	p.add_argument("--eqp0", default="eqp0.dat", help="Output eqp0 filename (relative to run_dir unless absolute)")
 	p.add_argument("--eqp1", default="eqp1.dat", help="Output eqp1 filename (relative to run_dir unless absolute)")
 	p.add_argument(
@@ -958,6 +1219,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 		kin_ion_path=args.kin_ion,
 		sigma_mnk_path=args.sigma_mnk,
 		qp_rotations_path=args.qp_rotations,
+		eval_energies_path=args.eval_energies,
 		eqp0_out=args.eqp0,
 		eqp1_out=args.eqp1,
 		finite_difference_spacing_ev=args.finite_difference_spacing,

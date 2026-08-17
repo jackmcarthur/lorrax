@@ -168,6 +168,7 @@ def fit_zeta_to_h5(
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_solve: str = "ridge",
     transverse_zeta_rcond: float = 1e-10,
+    distrib_la_batched_route: str = "auto",
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
@@ -555,12 +556,14 @@ def fit_zeta_to_h5(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                transverse_zeta_rcond=float(transverse_zeta_rcond))
+                transverse_zeta_rcond=float(transverse_zeta_rcond),
+                distrib_la_batched_route=distrib_la_batched_route)
         else:
             L_q = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
-                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond)
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                distrib_la_batched_route=distrib_la_batched_route)
             lu_piv = None
         # A distributed library factor is an OPAQUE token: no ``.shape``
         # to print and no single buffer to block on (a ScaLAPACK token
@@ -1087,6 +1090,7 @@ def fit_zeta_to_h5(
                         cct_trace_per_q=cct_trace_per_q,
                         zeta_gather=_resolved_zeta_gather,
                         lu_piv=lu_piv,
+                        distrib_la_batched_route=distrib_la_batched_route,
                     )
                     zeta_chunk.block_until_ready()
             finally:

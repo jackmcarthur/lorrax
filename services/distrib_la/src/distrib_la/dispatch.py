@@ -10,14 +10,16 @@ from __future__ import annotations
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from distrib_la.plan import ROUTE_SCAN, ensure_sharding, plan as _plan
+from distrib_la.plan import (ROUTE_BATCH_RESHARD, ROUTE_SCAN,
+                             ensure_sharding, plan as _plan)
 from distrib_la.resolve import EIGH_BACKENDS, NATIVE
 
 __all__ = ["dispatch_batched_eigh", "EIGH_BACKENDS"]
 
 
 def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
-                          *, _force_serial: bool = False):
+                          *, batched_route: str = "auto",
+                          _force_serial: bool = False):
     """A STACK of Hermitian matrices, backend-dispatched.
 
     Parameters
@@ -26,6 +28,9 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
     mesh_xy : ('x','y') device mesh
     backend : any ``EIGH_BACKENDS`` name; ``'distributed'`` resolves to the
         platform's distributed eigh (ScaLAPACK on host, cuSOLVERMp on CUDA).
+    batched_route : ``'auto'`` or ``'batch_reshard'``.  Passed to
+        :func:`distrib_la.plan`; the latter stages the batch over the mesh,
+        runs device-local ``jnp.linalg.eigh``, and stages eigenvectors back.
     _force_serial : test-only.  Force the scan route even when the backend
         has a stacked entry, so both routes are reachable on one mesh —
         see "GATE" below.  Never pass it from production code.
@@ -139,13 +144,19 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
     workspace, so ScaLAPACK eigh keeps
     :data:`~distrib_la.plan.ROUTE_BACKEND_BATCHED`.
     """
-    if backend in ("auto", "off", NATIVE):
+    # Preserve the zero-plan-overhead native fast path when no alternative
+    # route was requested.  An explicit batch_reshard MUST go through Plan:
+    # it needs the face sharding even though the backend resolves native.
+    if (str(batched_route).strip().lower() == "auto"
+            and backend in ("auto", "off", NATIVE)):
         return jnp.linalg.eigh(A)
     if A.ndim != 3 or A.shape[1] != A.shape[2]:
         raise ValueError(
             f"dispatch_batched_eigh: expected (Nq, N, N); got {A.shape}")
-    p = _plan("eigh", mesh_xy, backend=backend, n=int(A.shape[1]))
-    if p.is_native:                        # (unreachable: resolve has NO
+    p = _plan("eigh", mesh_xy, backend=backend, n=int(A.shape[1]),
+              batched_route=batched_route)
+    if p.is_native and p.batched_route != ROUTE_BATCH_RESHARD:
+                                           # (unreachable: resolve has NO
         return jnp.linalg.eigh(A)          # silent FFI→native fallback for
                                            # any op — explicit requests
                                            # refuse, and auto/off returned

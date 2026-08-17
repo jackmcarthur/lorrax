@@ -34,7 +34,7 @@ from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 # kept alongside the COHSEX kernels because it's only consumed here.
 # ---------------------------------------------------------------------------
 
-def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
+def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
     """Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
 
     **Band coverage — the Hartree density is complete regardless of
@@ -56,6 +56,38 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     numpy; the ``device_put`` at the end places it on the mesh.
     DO NOT "fix" back to ``jnp``.
     """
+    # With an occupation state (duck-typed gw.efermi.OccupationState) the
+    # projector is diag(f) — exact for insulators too: step occupations are
+    # exactly {0.0, 1.0}, so diag(f) == the eye(nocc) block bit-for-bit
+    # (asserted in tests/test_sigma_fermi_split.py).  Weights are never
+    # clipped: an MP-overshoot band (f<0 or f>1) contributes with its sign.
+    if occupation_state is not None:
+        f = np.asarray(occupation_state.f_kn, dtype=np.float64)
+        f = f.reshape(int(meta.nk_tot), -1)
+        if f.shape[1] < int(meta.nb_sigma):
+            raise ValueError(
+                f"build_Gij: occupation state carries {f.shape[1]} bands but "
+                f"the sigma window needs {int(meta.nb_sigma)}.")
+        f_win = f[:, : int(meta.nb_sigma)]
+        # The metallic form of the same V_H-silently-small hazard the
+        # integer guard below prevents: electrons carried by bands outside
+        # the Σ window would silently leave the Hartree density.
+        n_win = float(np.sum(f_win)) / float(meta.nk_tot)
+        n_target = float(occupation_state.n_electrons)
+        if abs(n_win - n_target) > 1.0e-8:
+            raise ValueError(
+                f"build_Gij: the sigma window holds {n_win:.10f} electrons "
+                f"but the occupation state solved for {n_target:.10f}.  The "
+                "Hartree density would be missing weight carried by bands "
+                "outside the window; widen nb_sigma or re-solve.")
+        Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma),
+                       dtype=np.complex128)
+        idx = np.arange(int(meta.nb_sigma))
+        Gij[:, idx, idx] = f_win.astype(np.complex128)
+        from common.collectives import device_put_process_local
+        return device_put_process_local(
+            Gij, NamedSharding(mesh_xy, P(None, None, None)))
+    # Integer path (occupation_state None) — unchanged, bit-exact.
     # The coverage claim above, enforced rather than merely asserted in
     # prose: if the Σ window were ever narrower than the occupied
     # manifold, ``min`` would silently drop occupied bands out of ρ and
@@ -81,6 +113,25 @@ def build_Gij(meta, mesh_xy: Mesh) -> jax.Array:
     from common.collectives import device_put_process_local
     return device_put_process_local(
         Gij, NamedSharding(mesh_xy, P(None, None, None)))
+
+
+def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
+    """The ONE place the static Σ entries decide their occupation projector.
+
+    ``Gij`` supplied by the caller still wins — the SC-COHSEX loop iterates
+    on its own projector.  But a caller handing in BOTH a projector and an
+    occupation state is asking for two occupation models in one Σ, and the
+    state is the one that would be silently dropped (the exact class of
+    defect this threading exists to close).  Refuse instead; TASTE 13.
+    """
+    if Gij is None:
+        return build_Gij(meta, mesh_xy, occupation_state)
+    if occupation_state is not None:
+        raise ValueError(
+            "static Sigma: both an explicit Gij and an occupation_state "
+            "were supplied.  The explicit projector would silently ignore "
+            "the state's diag(f) weights; pass one or the other.")
+    return Gij
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +280,7 @@ def compute_cohsex_sigma(
     compute_bare_x: bool = True,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    occupation_state=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
 
@@ -248,6 +300,12 @@ def compute_cohsex_sigma(
         separately to the bare-X pass.
     compute_bare_x
         Whether to also compute Σ_X (bare exchange) using V_q.
+    occupation_state
+        The iteration's :class:`gw.efermi.OccupationState`, or ``None``.
+        ``None`` is the insulating default and keeps the integer ``occ >
+        0.5`` projector bit-for-bit; a state makes Σ_X / Σ_SX / V_H read
+        the same ``diag(f)`` weights Σ_c already uses.  Mutually
+        exclusive with an explicit ``Gij`` (see :func:`_resolve_Gij`).
 
     Returns
     -------
@@ -265,8 +323,7 @@ def compute_cohsex_sigma(
     upstream in ``ppm_sigma`` and is only collapsed into a replicated
     Σ_xc^QSGW after the energy-domain contraction.
     """
-    if Gij is None:
-        Gij = build_Gij(meta, mesh_xy)
+    Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
 
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
@@ -338,6 +395,7 @@ def compute_v_h_sigma_x(
     static_head_terms=None,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    occupation_state=None,
 ) -> dict:
     """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
 
@@ -358,9 +416,12 @@ def compute_v_h_sigma_x(
     Bispinor: identical to ``compute_cohsex_sigma``'s ``compute_bare_x``
     branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
     and ``bispinor_v_q_path`` are supplied.
+
+    ``occupation_state`` carries the same contract as in
+    :func:`compute_cohsex_sigma`: ``None`` is insulating and bit-exact,
+    a state puts ``diag(f)`` into Σ_X and V_H.
     """
-    if Gij is None:
-        Gij = build_Gij(meta, mesh_xy)
+    Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot))
     rep = NamedSharding(mesh_xy, P(None, None, None))
@@ -402,5 +463,4 @@ def compute_v_h_sigma_x(
         "sig_h":   sig_h,
         "sig_x":   sig_x,
     }
-
 

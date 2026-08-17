@@ -598,7 +598,8 @@ _EIGH_PAD_SENTINEL_RY = 1e10
 
 
 @timing.timed("sc.eigh", watch=True)
-def distributed_eigh_bands(H, *, mesh: Mesh):
+def distributed_eigh_bands(H, *, mesh: Mesh,
+                           distrib_la_batched_route: str = "auto"):
     """(E, U_qp) for every k, with NO ``(nb, nb)`` ever on one rank.
 
     ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`;
@@ -708,7 +709,9 @@ def distributed_eigh_bands(H, *, mesh: Mesh):
         j = jnp.arange(nb_pad)[None, :]
         on_pad_diag = ((i == j) & (i >= nb))[None]
         H_j = jnp.where(on_pad_diag, _EIGH_PAD_SENTINEL_RY, H_j)
-    E, U = dispatch_batched_eigh(H_j, mesh, "distributed")
+    E, U = dispatch_batched_eigh(
+        H_j, mesh, "distributed",
+        batched_route=distrib_la_batched_route)
     if nb_pad != nb:
         # THE SEAM. Drop by COUNT, never by value — same shape contract the
         # rCROP carry restores at sc_iteration.py:1509-1514. Callers get the

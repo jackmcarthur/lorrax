@@ -53,6 +53,7 @@ from file_io import mpa_store
 from gw.mpa import pade_fit, tiling
 
 __all__ = [
+    "fit_scalar_samples",
     "fit_one_block",
     "format_cost_report",
     "run_fit_driver",
@@ -71,13 +72,67 @@ _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
 # root finder.  The Padé algebra remains reachable directly through
 # ``pade_fit`` as a diagnostic red twin; the disk driver must not silently
 # choose between two numerical methods.
-_FIT_SOLVE = "loewner"
-_FIT_AFFINE = True
 _FIT_EIG = "jax_qr"
 
 
 @functools.lru_cache(maxsize=None)
-def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
+def _scalar_fit_kernel(n_p, guard_items, rcond):
+    """One replicated scalar fit using the production Loewner policy."""
+    import jax
+    import jax.numpy as jnp
+
+    guards = dict(guard_items)
+    n = int(n_p)
+
+    @jax.jit
+    def _kernel(samples, z):
+        return pade_fit.fit_mpa_poles(
+            samples, z, n, guards=guards, rcond=float(rcond),
+            eig=_FIT_EIG)
+
+    return _kernel
+
+
+def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
+    """Fit one scalar Wc sample vector with the body driver's exact policy."""
+    import jax
+    import jax.numpy as jnp
+
+    n = int(n_p)
+    z = np.asarray(z_samples, dtype=np.complex128)
+    wc = np.asarray(Wc, dtype=np.complex128)
+    if z.shape != (2 * n,) or wc.shape != z.shape:
+        raise ValueError(
+            "scalar MPA head requires Wc and z with shape (2*n_p,); "
+            f"got Wc={wc.shape}, z={z.shape}, n_p={n}")
+    resolved = pade_fit._resolve_guards(guards)
+    kernel = _scalar_fit_kernel(
+        n, tuple(sorted(resolved.items())), float(rcond))
+    Omega, B, diagnostics = kernel(
+        jnp.asarray(wc), jnp.asarray(z))
+    Omega, B, diagnostics = jax.device_get((Omega, B, diagnostics))
+    valid = np.asarray(diagnostics["valid"], dtype=bool)
+    if not np.any(valid):
+        raise ValueError("scalar MPA head fit rejected every pole")
+    return {
+        "Omega_p": np.asarray(Omega, dtype=np.complex128)[valid],
+        "B_p": np.asarray(B, dtype=np.complex128)[valid],
+        "condition": float(np.asarray(diagnostics["cond_pade"])),
+        "backward_error": float(np.asarray(diagnostics["backward_error"])),
+        "max_abs_residual": float(
+            np.asarray(diagnostics["max_abs_residual"])),
+        "n_valid": int(np.asarray(diagnostics["n_valid"])),
+        # Loewner is the only solve (chore 8e2f7f76); the pair is kept in
+        # the report so stores keep stamping their provenance explicitly.
+        "solve": "loewner",
+        "affine": True,
+        "eig": _FIT_EIG,
+        "rcond": float(rcond),
+    }
+
+
+@functools.lru_cache(maxsize=None)
+def _sharded_fit_kernel(mesh_xy, n_p, rcond):
     """One compiled local-row Loewner fit; columns remain replicated."""
     import jax
     import jax.numpy as jnp
@@ -90,7 +145,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
     block_spec = P(None, None, row_axes, None)
     pole_spec = P(None, None, row_axes, None)
     diag_spec = P(None, row_axes, None)
-    guards = dict(guard_items)
+    guards = pade_fit._resolve_guards(None)
     n = int(n_p)
 
     def _local(block, z, row_ids, n_mu_logical, n_cols_logical):
@@ -99,7 +154,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, guard_items, rcond):
         tile = samples.reshape(n_rows * n_cols, n_omega)
         Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
             tile, z, n, guards=guards, rcond=rcond,
-            solve=_FIT_SOLVE, affine=_FIT_AFFINE, eig=_FIT_EIG)
+            eig=_FIT_EIG)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
@@ -149,7 +204,6 @@ def fit_one_block(
     mesh_xy,
     n_cols_buffer=None,
     tile_bytes=None,
-    guards=None,
     rcond=1.0e-13,
     header=None,
 ):
@@ -228,9 +282,7 @@ def fit_one_block(
             f"sampled for, or the file is not a double-parallel grid.")
 
     t_fit = time.perf_counter()
-    resolved = pade_fit._resolve_guards(guards)
-    guard_items = tuple(sorted(resolved.items()))
-    kernel = _sharded_fit_kernel(mesh_xy, n, guard_items, float(rcond))
+    kernel = _sharded_fit_kernel(mesh_xy, n, float(rcond))
     z_dev = device_put_process_local(
         z, NamedSharding(mesh_xy, P(None)))
     row_ids = device_put_process_local(
@@ -268,8 +320,6 @@ def fit_one_block(
         "bytes_read": (n_omega * n_mu * n_cols
                        * mpa_store.COMPLEX128_BYTES),
         "fit_dispatches": 1,
-        "diagnostic_dispatches": 0,
-        "full_fits": int(n_mu * n_cols),
         "pade_solves": int(n_mu * n_cols),
         "seconds_read": t_read,
         "seconds_fit": t_fit,
@@ -286,10 +336,9 @@ def run_fit_driver(
     *,
     mesh_xy,
     tile_bytes=None,
-    guards=None,
     rcond=1.0e-13,
-    certification=None,
     provenance=None,
+    occupation_state=None,
     report_stream=None,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
@@ -311,17 +360,15 @@ def run_fit_driver(
     rcond = float(rcond)
     if not 0.0 < rcond < 1.0:
         raise ValueError("run_fit_driver requires 0 < rcond < 1")
-    if certification is None:
-        # These are solver-consistency guards, not material tolerances.
-        # A solve beyond 1/rcond is numerically rank deficient by its own
-        # truncation policy; sqrt(eps) is the ordinary backward-stability
-        # ceiling for complex128 arithmetic.  Observable accuracy remains a
-        # separate held-out/direct-denominator gate.
-        certification = {
-            "condition_max_allowed": 1.0 / rcond,
-            "backward_error_max_allowed": float(
-                np.sqrt(np.finfo(np.float64).eps)),
-        }
+    # Solver-consistency guards, not material tolerances.  A solve beyond
+    # 1/rcond is numerically rank deficient by its own truncation policy;
+    # sqrt(eps) is the ordinary backward-stability ceiling for complex128.
+    # Observable accuracy remains a separate held-out gate.
+    certification = {
+        "condition_max_allowed": 1.0 / rcond,
+        "backward_error_max_allowed": float(
+            np.sqrt(np.finfo(np.float64).eps)),
+    }
     t_total = time.perf_counter()
     header = mpa_store.read_w_header(w_src, w_name)
     n_mu = header["n_mu"]
@@ -346,8 +393,7 @@ def run_fit_driver(
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     fit_provenance = dict(provenance or {})
     fit_provenance.update({
-        "solve_mode": _FIT_SOLVE,
-        "solve_affine": _FIT_AFFINE,
+        "solve_mode": "loewner",   # the only solve since 2026-08-15
         "solve_rcond": rcond,
         "eig_mode": _FIT_EIG,
         "fit_fused": True,
@@ -360,15 +406,15 @@ def run_fit_driver(
         table_hash=header["table_hash"],
         centroid_hash=header["centroid_hash"],
         unfold_tables=mpa_store.read_w_tables(w_src, w_name),
-        provenance=fit_provenance)
+        provenance=fit_provenance,
+        occupation_state=occupation_state)
 
     report = {
         "n_q": int(n_q),
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
-        "solve": _FIT_SOLVE,
-        "affine": _FIT_AFFINE,
+        "solve": "loewner",
         "eig": _FIT_EIG,
         "rcond": rcond,
         "n_cols_budget": int(plan["n_cols"]),
@@ -381,8 +427,6 @@ def run_fit_driver(
         "bytes_read": 0,
         "peak_block_bytes": 0,
         "fit_dispatches": 0,
-        "diagnostic_dispatches": 0,
-        "full_fits": 0,
         "pade_solves": 0,
         "seconds": {"read": 0.0, "fit": 0.0, "write": 0.0,
                     "finalize": 0.0, "total": 0.0},
@@ -393,7 +437,7 @@ def run_fit_driver(
         stats = fit_one_block(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
             mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
-            tile_bytes=tile_bytes, guards=guards, rcond=rcond,
+            tile_bytes=tile_bytes, rcond=rcond,
             header=header)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1
@@ -403,8 +447,6 @@ def run_fit_driver(
         report["peak_block_bytes"] = max(report["peak_block_bytes"],
                                          stats["bytes_read"])
         report["fit_dispatches"] += stats["fit_dispatches"]
-        report["diagnostic_dispatches"] += stats["diagnostic_dispatches"]
-        report["full_fits"] += stats["full_fits"]
         report["pade_solves"] += stats["pade_solves"]
         report["seconds"]["read"] += stats["seconds_read"]
         report["seconds"]["fit"] += stats["seconds_fit"]
@@ -447,10 +489,9 @@ def format_cost_report(report):
     merely because it is one dispatch, and the two numbers are printed
     beside each other so nobody has to infer the second from the first.
 
-    The three counts distinguish scheduler launches, elementwise fits and
-    Padé solves.  They are equal up to the number of elements per block:
-    conditioning, backward error and the finished-model residual are all
-    produced by the same fit.
+    The two counts distinguish scheduler launches from per-element pole
+    solves; conditioning, backward error and the finished-model residual
+    are all produced by the same solve.
     """
     r = report
     sec = r["seconds"]
@@ -471,12 +512,9 @@ def format_cost_report(report):
         f"  elements fitted {r['elements_fitted']}",
         f"  logical outputs {r['logical_outputs']} "
         f"(= 2*n_p per element: n_p Omega + n_p B)",
-        f"  dispatches      {r['fit_dispatches']} fit + "
-        f"{r['diagnostic_dispatches']} diagnostic, vmapped",
-        f"  full fits       {r['full_fits']} "
-        f"(1 per element; diagnostics reuse the same solve)",
+        f"  dispatches      {r['fit_dispatches']} fit, vmapped",
         f"  pole solves     {r['pade_solves']} "
-        f"(1 per element)",
+        f"(1 per element; diagnostics reuse the same solve)",
         f"  bytes read      {r['bytes_read']} B "
         f"({r['bytes_read'] / mib:.2f} MiB) against a budget of "
         f"{r['bytes_budget_total']} B "

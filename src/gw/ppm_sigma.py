@@ -65,7 +65,7 @@ from .minimax_screening import (
 )
 from .ppm_windows import (
     _SigmaWindow,
-    _iter_branches,
+    branches_for_omega_grid,
     _build_windows_for_branch,
     window_mask_B_bounds,
     _to_host_np,
@@ -178,6 +178,8 @@ def _prepare_sigma_state(
     excludes them here — and in every other Ω/B consumer — with no mask
     argument (ROOT_CAUSE.md 2026-07-08; PADDING_AUDIT item 3).
     """
+    # TODO(metal-greens): the finite-occupation Green's-function/Sigma
+    # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
 
@@ -606,7 +608,6 @@ def _run_sigma_branch(
     meta,
     log_tag: str = "",
     print_fn=print,
-    omega_batch_size: int = 4,
     use_shipped_minimax_tables: bool = True,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
@@ -722,6 +723,7 @@ def _compute_invalid_static_sigma(
     invalid_mask: jax.Array,
     meta,
     mesh_xy: Mesh,
+    occupation_state=None,
 ) -> np.ndarray:
     """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
 
@@ -754,12 +756,19 @@ def _compute_invalid_static_sigma(
 
     Returns the replicated host tensor (nk, nb_sigma, nb_sigma) in Ry,
     to be added to Σ_c at EVERY ω (the term is ω-independent).
+
+    ``occupation_state`` is the iteration's
+    :class:`gw.efermi.OccupationState` (``None`` ⇒ the integer projector,
+    bit-exact insulating behaviour).  It matters here for the same reason
+    it matters in ``cohsex_sigma``: the screened-exchange half of this
+    term runs over the OCCUPIED manifold, so on a metal the Fermi-shell
+    bands must enter with their fractional weights.
     """
     from .cohsex_sigma import _make_cohsex_kernels, build_Gij
 
     sigma_sx_k, sigma_coh_k, _ = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot))
-    Gij = build_Gij(meta, mesh_xy)
+    Gij = build_Gij(meta, mesh_xy, occupation_state)
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
     with mesh_xy:
@@ -795,6 +804,7 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_cfg: DynamicSigmaConfig,
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
+    occupation_state=None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
@@ -804,6 +814,11 @@ def compute_sigma_c_ppm_omega_grid(
     a stale/typo'd name must raise, not silently default); the derived
     ω-grid arrives as an explicit data argument.  ``ppm_cfg``/``quad``
     never travel below this driver.
+
+    ``occupation_state`` is forwarded to the invalid-pole static-COHSEX
+    term only (the sole occupation projector this driver builds); the
+    dynamic branches take their occupations from ``wfns.occ``.  ``None``
+    is the insulating default and is bit-exact.
     """
 
     s = wfns.slices
@@ -845,7 +860,6 @@ def compute_sigma_c_ppm_omega_grid(
             f"(A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ would make the "
             f"HGL crossing quadrature ill-conditioned)")
         regularization_width_ry = xi_floor
-    omega_batch_size = int(sigma_cfg.omega_batch_size)
     fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -855,16 +869,9 @@ def compute_sigma_c_ppm_omega_grid(
     omega_req = np.asarray(omega_values_ry, dtype=np.float64)
     if omega_req.ndim != 1 or omega_req.size == 0:
         raise ValueError("omega_values_ry must be a 1D non-empty array.")
-    omega_batch_size = int(max(1, omega_batch_size))
 
-    # Split omega grid into positive and negative relative to Fermi level
-    idx_pos = np.where(omega_req >= 0.0)[0]
-    idx_neg = np.where(omega_req < 0.0)[0]
-    omega_pos = np.asarray(omega_req[idx_pos], dtype=np.float64)
-    omega_neg_abs = np.asarray(-omega_req[idx_neg], dtype=np.float64)
-
-    # fermi_reference / omega_accumulation are validated + normalized at
-    # PPMConfig construction; used directly here (fermi → traced bool below).
+    # fermi_reference is validated + normalized at config construction;
+    # used directly here (fermi → traced bool below).
 
     # ppm_invalid_mode (BGW ``invalid_gpp_mode``): how to treat poles whose
     # fitted Omega^2 came out < 0.  'zero'/'skip' drop them (BGW mode 0);
@@ -936,7 +943,8 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_static_host = None
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
-            wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy)
+            wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+            occupation_state=occupation_state)
         print_fn(
             "  GN invalid modes → static COHSEX: max|Σ_static| = "
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV "
@@ -944,7 +952,7 @@ def compute_sigma_c_ppm_omega_grid(
         )
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
-    # 2026-07-31; ``omega_accumulation`` is auto|kij, both host tiles).
+    # 2026-07-31).
     nk_proj = int(psi_proj_xr.shape[0])
     nb_proj = int(psi_proj_xr.shape[1])
     n_omega = int(omega_req.size)
@@ -998,16 +1006,14 @@ def compute_sigma_c_ppm_omega_grid(
         mesh_xy=mesh_xy,
         meta=meta,
         print_fn=print_fn,
-        omega_batch_size=omega_batch_size,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
     # See _iter_branches for how each branch's physical identity fixes its
     # denominator/prefactor signs (no ±1 sign fields are carried).
-    branches = _iter_branches(
-        omega_pos=omega_pos, idx_pos=idx_pos,
-        omega_neg_abs=omega_neg_abs, idx_neg=idx_neg,
+    branches = branches_for_omega_grid(
+        omega_req,
         E_cond=E_cond, H_val=H_val,
         cond_mask=cond_mask, val_mask=val_mask,
     )

@@ -40,7 +40,12 @@ from isdf import factor_c_q
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
 # this driver reads a raw params dict rather than a LorraxConfig, which is
 # exactly the case that function exists for.
-from gw.gw_config import eigh_backend_choices, resolve_eigh_backend
+from gw.gw_config import (
+    distrib_la_batched_route_choices,
+    eigh_backend_choices,
+    resolve_distrib_la_batched_route,
+    resolve_eigh_backend,
+)
 from common.fft_helpers import make_flat_k_ifftn
 # Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
 # size, so it divides that product only by luck.  Raw, that is a refusal, not a
@@ -1857,6 +1862,13 @@ def main(argv=None):
                              "mesh, where it means ScaLAPACK pzheevd.  "
                              "OVERRIDES the input-file ``eigh_backend`` key "
                              "(default: use the key, which defaults to auto).")
+    parser.add_argument(
+        "--distrib-la-batched-route", default=None,
+        choices=distrib_la_batched_route_choices(),
+        help="OVERRIDES the input-file distrib_la_batched_route key for "
+             "every Plan.batched call in this driver. auto preserves the "
+             "backend's robust distributed route; batch_reshard moves q "
+             "onto the mesh and runs whole-matrix local JAX linalg.")
     args = parser.parse_args(argv)
     log = _make_logger(args.verbose)
 
@@ -1882,6 +1894,8 @@ def main(argv=None):
     # folds in.  This driver used to inline the precedence and never call
     # it, so the deck key moved nothing here.
     eigh_backend = resolve_eigh_backend(params, override=args.eigh_backend)
+    distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=args.distrib_la_batched_route)
     # The INTENT travels too.  ``compute_wfns_fi`` refuses at resolve time
     # under this flag rather than falling back to the whole-matrix native
     # path (bse_setup's no-fallback contract); passing only the resolved
@@ -1967,6 +1981,7 @@ def main(argv=None):
                 mesh_xy=mesh_xy, a_band_index=args.a_band,
                 eigh_backend=eigh_backend,
                 use_low_mem_eigh=use_low_mem_eigh, log_fn=log,
+                distrib_la_batched_route=distrib_la_batched_route,
             )
         log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
             f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "

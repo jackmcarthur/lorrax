@@ -2,8 +2,10 @@
 
 "What happens to σ^τ after the kernel returns": the ω-kernel projection (one
 numpy function — the single source of truth), the accumulator protocol, and
-**one** async-D2H accumulator (`_TauAccumulator`) whose sink
-(`_MemoryTileSink`) turns each finished window into in-memory Σ tiles.
+two accumulators: `_TauAccumulator` (async-D2H per τ; its `_MemoryTileSink`
+holds each finished window as per-rank host Σ tiles) and
+`DeviceOmegaAccumulator` (folds each σ^τ into a sharded on-device ω-cube;
+nothing moves to host before finalize).
 (The streamed-h5 sink twin and the `kij_stream` accumulation mode were
 REMOVED 2026-07-31: single-process-only, superseded by the host tiles +
 sharded ω-cube layout.)  The τ loop just adds per-τ contributions and
@@ -23,6 +25,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
+
+from common.collectives import device_put_process_local
 
 from .ppm_windows import _SigmaWindow
 
@@ -544,6 +548,8 @@ class DeviceOmegaAccumulator:
         if self._shape[0] != self._omega.size:
             raise ValueError(
                 "DeviceOmegaAccumulator: shape[0] must equal n_omega")
+        # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
+        # ×2 while a crossing window holds its temporary cube open.
         self._total = _device_output_zeros(self._shape, sharding)()
         self._window = None
         self._coeff = None
@@ -588,7 +594,8 @@ class DeviceOmegaAccumulator:
             raise RuntimeError("no open frequency window")
         if self._index >= self._coeff.shape[0]:
             raise RuntimeError("more sigma(tau) tiles than quadrature nodes")
-        coeff = jax.device_put(self._coeff[self._index], self._replicated)
+        coeff = device_put_process_local(
+            self._coeff[self._index], self._replicated)
         self._index += 1
         if self._window is None:
             self._total = _device_omega_add(self._sharding)(

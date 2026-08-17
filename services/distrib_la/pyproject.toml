@@ -5,25 +5,34 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "distrib_la"
 version = "0.1.0"
-description = "Distributed dense linear algebra over a JAX device mesh: eigh, cholesky, LU solve, factor/solve — one door over ScaLAPACK, SLATE, cuSOLVERMp and the in-tree JAX paths"
+description = "Distributed dense linear algebra over a JAX device mesh: polar/SVD, eigh, Cholesky, LU solve, and matmul over native JAX, ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp"
+readme = "README.md"
 requires-python = ">=3.12"
 
-# THE QUARANTINE, DECLARED.  ScaLAPACK / SLATE / cuSOLVERMp appear nowhere
-# in this list because nothing here links them: they are reached through
+# THE QUARANTINE, DECLARED.  ScaLAPACK/PBLAS, SLATE, and
+# cuSOLVERMp/cuBLASMp appear nowhere in this list because nothing here links
+# them: they are reached through
 # `jax.ffi` handlers inside a LORRAX `.so` that `distrib_la.loader`
 # dlopens by path.  That is the charter's "only distrib_la sees
-# scalapack/slate/cusolvermp" made structural — an installed distrib_la on
-# a machine with no `.so` imports fine, answers `list_backends`, and
+# scalapack/PBLAS/slate/cusolvermp/cuBLASMp" made structural — an installed
+# distrib_la on a machine with no `.so` imports fine, answers `list_backends`, and
 # refuses every FFI backend by name.
 #
 # lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims).
 # jax is the substrate this whole package is written in; unlike lxkit,
 # `import distrib_la` DOES import jax, and that is correct: every public
-# entry point takes a `jax.sharding.Mesh`.
-dependencies = ["lxkit", "jax"]
+# entry point takes a `jax.sharding.Mesh`.  numpy is also a runtime
+# dependency: the collective placement helper and cuSOLVERMp context bridge
+# import it directly, so relying on jax's transitive dependency would
+# under-declare this distribution's own import boundary.
+# loader.get_lib() also makes a best-effort, caught ``import h5py`` before
+# dlopen so an ALREADY-INSTALLED h5py wins the HDF5 symbol-order race.  h5py
+# is not required by this package and absence is deliberately accepted, so it
+# is not a dependency or an extra here.
+dependencies = ["lxkit", "jax", "numpy"]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0.0", "numpy"]
+test = ["pytest>=8.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

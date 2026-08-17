@@ -47,11 +47,6 @@ __all__ = ["choose_column_budget", "column_blocks", "describe_column_cost",
            "fit_schedule", "one_tile_bytes", "plan_column_walk",
            "row_shard_spec"]
 
-#: The block returned by ``mpa_store.read_w_columns`` is
-#: ``(n_omega, N_μ_rows, n_cols)``, and the row axis is 1.
-ROW_AXIS = 1
-
-
 def row_shard_spec(mesh_axis="x"):
     """The ONLY sharding a column block may carry: rows over one axis.
 

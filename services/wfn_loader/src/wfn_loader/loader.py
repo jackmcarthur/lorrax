@@ -77,6 +77,7 @@ baselines); ``services/wfn_loader/docs/DESIGN.md`` (why).
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 import types
 from pathlib import Path
 from typing import Iterator, Literal, Sequence
@@ -91,10 +92,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ._collectives import device_put_process_local
 
 
-__all__ = ["WfnLoader"]
+__all__ = ["IBZRows", "WfnLoader"]
 
 
-KSpec = Sequence[int] | Literal["ibz", "full_bz"]
+@dataclass(frozen=True)
+class IBZRows:
+    """Explicit raw WFN-file IBZ rows, without symmetry unfolding."""
+
+    rows: tuple[int, ...]
+
+
+KSpec = Sequence[int] | IBZRows | Literal["ibz", "full_bz"]
 
 
 class WfnLoader:
@@ -156,11 +164,37 @@ class WfnLoader:
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
 
         # Derived band-fill metadata — same names WFNReader exposed.
-        # ``ifmax`` is the 1-based index of the highest occupied band.
+        # ``ifmax`` is the 1-based index of the highest band with nonzero
+        # occupation.  It is a BAND BOUNDARY, not an electron count: in a
+        # metal the last band can be only partially occupied.
         if np.size(self.ifmax) > 0:
             self.nelec = int(np.max(self.ifmax))
         else:
             self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
+        weights = np.asarray(self.kweights, dtype=np.float64)
+        weight_sum = float(weights.sum())
+        if (weights.shape != (int(self.nkpts),)
+                or not np.all(np.isfinite(weights))
+                or np.any(weights < 0.0)
+                or not np.isfinite(weight_sum)
+                or weight_sum <= 0.0):
+            raise ValueError(
+                "WFN k-point weights must be finite, nonnegative, and have "
+                f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
+        occs = np.asarray(self.occs, dtype=np.float64)
+        if occs.shape != (int(self.nspin), int(self.nkpts), int(self.nbands)):
+            raise ValueError(
+                "WFN occupations have shape "
+                f"{occs.shape}, expected "
+                f"({int(self.nspin)},{int(self.nkpts)},{int(self.nbands)}).")
+        # BerkeleyGW's WFN convention counts 2/(nspin*nspinor) electrons per
+        # unit occupation.  Unlike ``nelec=max(ifmax)``, this remains the
+        # physical fixed-N target for fractional occupations.
+        state_capacity = 2.0 / (
+            float(max(int(self.nspin), 1))
+            * float(max(int(self.nspinor), 1)))
+        self.num_electrons = state_capacity * float(np.einsum(
+            "k,skb->", weights / weight_sum, occs, optimize=True))
         _nb = int(self.energies.shape[-1])
         _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
         self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
@@ -242,6 +276,9 @@ class WfnLoader:
         # that can turn a time-reversal row into a conjugated ψ, so
         # gating there covers every backend (eager / phdf5).
         #
+        # TODO(metal-symmetry): form this diagnostic density with the WFN
+        # occupation weights; ``nelec=max(ifmax)`` overfills its current
+        # occupied-band-only window for a metal.
         # Runs last in ``__init__`` because it needs ``nelec``,
         # ``kweights``, ``box_index`` and the open file handle.  Cost is
         # occupied-bands-only on a ±-closed k-subsample — order a second
@@ -531,6 +568,8 @@ class WfnLoader:
           unfold=True.
         - explicit list: interpreted as **full-BZ indices**, unfold=True.
         """
+        if isinstance(k, IBZRows):
+            return np.asarray(k.rows, dtype=np.int32), False
         if isinstance(k, str):
             if k == "ibz":
                 return np.arange(self.nkpts, dtype=np.int32), False
@@ -541,6 +580,8 @@ class WfnLoader:
         return np.asarray(k, dtype=np.int32), True
 
     def _k_cache_key(self, k: KSpec) -> tuple:
+        if isinstance(k, IBZRows):
+            return ("ibz_rows", tuple(int(v) for v in k.rows))
         if isinstance(k, str):
             return (k,)
         return ("list", tuple(int(v) for v in k))

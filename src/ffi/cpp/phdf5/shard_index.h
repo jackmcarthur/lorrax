@@ -109,6 +109,45 @@ std::string vec_to_string(const std::vector<T>& v)
     std::fflush(stderr);
 }
 
+// The ctx-handle liveness check — SLAB_IO_ROOT_CAUSE_AUDIT.md B2.
+//
+// Call this on the value that came off seam 2 (``copy_index_to_host``) and
+// BEFORE anything dereferences it — including before the ``fail`` lambdas,
+// which announce through ``ctx->rank``.  ``ctx_is_live`` consults the
+// registry context.cc maintains across open/close; an address that is not in
+// it is a stale, doubly-closed, foreign-leg or raced handle, and the only
+// safe thing to do with it is refuse by name.
+//
+// ON RANK-INVARIANCE, since this header's preamble forbids rank-local checks:
+// the handle operand IS replicated by construction (the shard_map passes it
+// with ``P()``), so in every correct execution this predicate reaches the
+// same verdict everywhere, exactly like the ``!ctx`` test it sits beside.
+// The case it fires in is by definition the incorrect one — a race, which is
+// per-rank — and there a refusal on a proper subset is not the hazard the
+// preamble is about.  The alternative on that path is a dereference of a
+// garbage pointer: a hang with a printed reason beats a SIGSEGV with none.
+[[maybe_unused]] bool check_live_ctx(
+    const PhdfCtx* ctx, int64_t raw_handle, const char* who, std::string* err)
+{
+    size_t n_live = 0;
+    if (ctx_is_live(ctx, &n_live)) return true;
+    std::ostringstream os;
+    os << who << ": stale or foreign ctx handle -- stream race or double "
+          "close."
+       << "  got=0x" << std::hex << (unsigned long long)raw_handle << std::dec
+       << " (not in this library's live-ctx registry; " << n_live
+       << " context(s) currently open)."
+       << "  want= a handle returned by lrx_phdf5_open on THIS platform leg "
+          "and not yet closed."
+       << "  fix= see SLAB_IO_ROOT_CAUSE_AUDIT.md B1 (stream-order the "
+          "control-operand copies) and B2 (this refusal); if B1 is already "
+          "in the loaded .so, look for a close/use ordering bug or a handle "
+          "minted by the other leg.";
+    *err = os.str();
+    announce_error(nullptr, *err);   // NOT through ctx: it may not be memory
+    return false;
+}
+
 // prod(dims) * elt_bytes, refusing on overflow instead of wrapping.
 //
 // The wrapped product is not a cosmetic problem: it is what ``ensure_pinned``

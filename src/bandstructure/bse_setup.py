@@ -311,6 +311,7 @@ def compute_wfns_fi(
     return_coeffs: bool = False,
     eigh_backend: str = "auto",
     use_low_mem_eigh: bool = False,
+    distrib_la_batched_route: str = "auto",
     reshard_route: str | None = None,
     log_fn=None,
 ):
@@ -575,8 +576,9 @@ def compute_wfns_fi(
     # DEADLOCKS on rectangular blocks — and rank divisibility) fires HERE,
     # before any q is solved.  See distrib_la.resolve_backend for the order.
     try:
-        eigh_plan = linalg_plan("eigh", mesh_xy, backend=_eigh_requested,
-                                n=rank)
+        eigh_plan = linalg_plan(
+            "eigh", mesh_xy, backend=_eigh_requested, n=rank,
+            batched_route=distrib_la_batched_route)
     except (ValueError, RuntimeError) as exc:
         _why = str(exc)
         if "divisible" in _why:
@@ -597,7 +599,8 @@ def compute_wfns_fi(
                 f"({rank}, {rank}) matrix per device, which is what this "
                 f"flag says is unaffordable.") from None
         raise type(exc)(_why) from None
-    native = eigh_plan.is_native
+    native = (eigh_plan.is_native
+              and distrib_la_batched_route == "auto")
     if use_low_mem_eigh and native:
         # Belt and braces: 'distributed' never resolves to native in
         # distrib_la's resolver (it raises instead), so this is unreachable

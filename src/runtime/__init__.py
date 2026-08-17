@@ -371,6 +371,22 @@ def set_default_env(*, platform: str = "gpu") -> None:
     see :func:`_check_allocator_env`.
     """
     os.environ.setdefault("JAX_ENABLE_X64", "1")
+    # HDF5 FILE LOCKING OFF BY DEFAULT (audit A1, 2026-08-15).  A LORRAX
+    # process maps TWO independent HDF5 library instances — h5py's bundled
+    # wheel libhdf5 and the FFI's cray libhdf5_parallel — and the stores
+    # are touched through both, sequentially.  Each instance takes its own
+    # advisory locks and cannot see the other's, so one instance's stale
+    # lock refuses the other's legitimate open with "unable to lock file"
+    # on a file nothing is actually writing.
+    #
+    # A MITIGATION, NOT A FIX, and the difference matters: this masks
+    # LOCK-level refusals only.  The metadata-cache divergence between the
+    # two instances is untouched by it, and that is the actual A1 hazard —
+    # ``file_io.hdf5_owner`` is what refuses a live cross-stack overlap and
+    # counts the sequential alternation that remains.  HDF5 reads this at
+    # file-open time, so setting it here (before any store is opened)
+    # rather than at some module's import is what makes it order-independent.
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
