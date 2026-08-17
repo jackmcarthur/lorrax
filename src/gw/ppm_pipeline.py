@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
@@ -26,9 +27,11 @@ import common.timing as timing
 
 from .band_extrapolation import (
     extrapolation_h5_payload,
+    extrapolation_weights,
     fit_band_extrapolation,
     format_extrapolation_report,
     plan_band_brackets,
+    sc_tolerance_ruling,
 )
 from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
@@ -55,6 +58,15 @@ class PPMOutputs:
     # for one dataset group is a second place for the star extraction and
     # the k stamp to disagree.
     band_extrapolation: dict | None = None
+    # The UN-EXTRAPOLATED N₃ body cube, present only when the feature is on.
+    # ``sigma_c_body_omega`` above is then the EXTRAPOLATED Σ_c and is what
+    # drives E_nk; this one exists so the driver can diagonalize the ordinary
+    # full-band Σ once per iteration too and report the correction at the eqp
+    # level, where it is a statement about the answer rather than about Σ.
+    # None when the feature is off — the field is then not merely unused but
+    # absent from every downstream branch, which is what keeps that path
+    # bit-identical.
+    sigma_c_body_omega_unextrap: jax.Array | None = None
 
 
 def _fit_head_correction(
@@ -182,6 +194,47 @@ def _band_count_point(cube, i: int):
     return jax.jit(lambda a: a[i], out_shardings=out)(cube)
 
 
+def _extrapolated_point(cube, weights):
+    """``S_inf`` over the leading bracket axis: ``sum_b w_b * cube[b]``.
+
+    THE OPERATION THAT MAKES THE EXTRAPOLATED Σ A LEGITIMATE HAMILTONIAN.
+    ``weights`` are the REAL ordinary-least-squares coefficients from
+    ``band_extrapolation.extrapolation_weights`` — they depend only on the
+    three band COUNTS, so this is one fixed affine combination applied
+    identically to every (ω, k, i, j) element.
+
+    Hermiticity survives it EXACTLY, not approximately.  Each cumulative
+    bracket point is Hermitian in (i, j); a real scalar times a complex
+    number commutes with conjugation bit-for-bit in IEEE arithmetic; and the
+    three-term reduction is performed in the same order for element (i, j)
+    and element (j, i) because the contraction is over the LEADING axis and
+    the weights do not depend on the trailing indices.  So
+    ``S_inf[j, i] == conj(S_inf[i, j])`` to the last bit, and the next SC
+    iteration's eigenvectors stay consistent with its own eigenvalues.
+    ``tests/test_band_extrapolation.py::
+    test_extrapolated_sigma_is_hermitian_to_machine_precision`` is the gate.
+
+    Sharding is restated on the way out for the same reason
+    :func:`_band_count_point` restates it: the leading axis is dropped, and
+    ``sigma_omega_layout=sharded``'s contract is that consumers read the
+    layout off the array rather than trusting XLA to propagate it through a
+    reduction.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+
+    def _combine(a):
+        return jnp.tensordot(jnp.asarray(w, dtype=a.dtype), a, axes=(0, 0))
+
+    sharding = getattr(cube, "sharding", None)
+    if not isinstance(sharding, NamedSharding):
+        return _combine(cube)
+    spec = tuple(sharding.spec)
+    if len(spec) != int(getattr(cube, "ndim", 0)):
+        return _combine(cube)
+    out = NamedSharding(sharding.mesh, P(*spec[1:]))
+    return jax.jit(_combine, out_shardings=out)(cube)
+
+
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
@@ -244,6 +297,33 @@ def _report_band_extrapolation(
                        f"E={unocc[kc, nc]:.4f} eV",
                        (int(kc), int(nc + n_occ))))
     print_fn(format_extrapolation_report(plan, fit, states=states))
+
+    # ── WHAT THIS RUN DOES WITH THE NUMBER ──────────────────────────────
+    # Until 2026-08-16 the fit was reported and then discarded: S(N₃) drove
+    # the Hamiltonian and S_inf lived in a log line and four h5 datasets.  It
+    # now drives E_nk, and a reader of this block must not have to infer that
+    # from the absence of a statement.
+    print_fn(
+        f"     [driving] E_nk for this iteration is built from S_inf (the "
+        f"EXTRAPOLATED Sigma_c), not S(N3).  Sigma is extrapolated FIRST and "
+        f"diagonalized SECOND: the fit is a fixed REAL linear combination of "
+        f"the three cumulative band-bracket sums, so the result is exactly "
+        f"Hermitian and is a legitimate static self-energy.  Extrapolating "
+        f"EIGENVALUES instead would produce a spectrum belonging to no "
+        f"Hamiltonian.")
+
+    # ── THE TOLERANCE RULING ────────────────────────────────────────────
+    # Printed HERE, beside the fit that sets the bar, and once per SC
+    # iteration because this pipeline runs once per SC iteration.  See
+    # ``band_extrapolation.sc_tolerance_ruling`` for why this warns rather
+    # than refusing — in short, ``sc_tol_ev`` defaults to 0.1 meV against a
+    # bar of tens of meV, so a refusal would fire on the shipped default, and
+    # the two numbers answer different questions anyway.
+    tol_ev = getattr(getattr(config, "sc", None), "tol_ev", None)
+    if tol_ev is not None:
+        _, ruling = sc_tolerance_ruling(fit, float(tol_ev))
+        print_fn(ruling)
+
     # The arrays are already in eV on the band diagonal, which is the unit
     # and the layout ``sigma_mnk.h5`` wants, so no scale is applied here.
     return extrapolation_h5_payload(plan, fit)
@@ -373,8 +453,24 @@ def compute_ppm_sigma_pipeline(
         # the shape it has always had.  The last element IS the ordinary
         # full-band Σ_c (the cumulative sum's final term), so at
         # n_bracket = 1 this index is the identity.
-        sigma_c_body_omega = _band_count_point(
+        sigma_c_body_omega_n3 = _band_count_point(
             sigma_omega.sigma_c_kij, sigma_omega.sigma_c_kij.shape[0] - 1)
+        # ── WHICH Σ DRIVES THE ITERATION ────────────────────────────────
+        # ON: the EXTRAPOLATED Σ_c, so the band-sum tail is included in the
+        # E_nk the SC loop converges.  The un-extrapolated N₃ cube is kept
+        # beside it — not as a fallback, but so the driver can diagonalize
+        # BOTH once per iteration and report the eqp-level correction side
+        # by side.  Extrapolating Σ and then diagonalizing is the only order
+        # that yields a Hermitian operator; see ``_extrapolated_point``.
+        # OFF: ``sigma_c_body_omega`` IS the N₃ point and the second cube is
+        # None, so the object graph below is exactly what it always was.
+        sigma_c_body_omega = sigma_c_body_omega_n3
+        sigma_c_body_omega_unextrap = None
+        if plan.enabled:
+            sigma_c_body_omega = _extrapolated_point(
+                sigma_omega.sigma_c_kij,
+                extrapolation_weights(sigma_omega.band_counts))
+            sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
@@ -404,4 +500,5 @@ def compute_ppm_sigma_pipeline(
         sigma_c_body_omega=sigma_c_body_omega,
         head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
         band_extrapolation=extrap_payload,
+        sigma_c_body_omega_unextrap=sigma_c_body_omega_unextrap,
     )
