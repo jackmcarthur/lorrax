@@ -516,6 +516,23 @@ if(LORRAX_CUFFT_ON)
         "${CMAKE_CURRENT_SOURCE_DIR}/common")
     target_compile_options(build_conv_klead_cuda PRIVATE
         -Wall -Wextra)
+    # Isolated compile target for the ISDF CCT/ZCT post-pair kernel.  Keep it
+    # separate from the sibling object's ownership lane while feeding the
+    # same production shared object.
+    add_library(build_conv_kpair_cuda OBJECT
+        cufft/conv_kpair_cuda_ffi.cc)
+    set_target_properties(build_conv_kpair_cuda PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(build_conv_kpair_cuda SYSTEM PRIVATE
+        "${JAX_FFI_INCLUDE_DIR}"
+        "${CUDA_TOOLKIT_ROOT}/include"
+        "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        "${NVRTC_INCLUDE_DIR}")
+    target_include_directories(build_conv_kpair_cuda PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    target_compile_options(build_conv_kpair_cuda PRIVATE
+        -Wall -Wextra)
     list(APPEND LORRAX_FFI_SOURCES
         cufft/fft_flat_k_cuda_ffi.cc
         # k-MINOR fused conv (BSE ladder-W rung, 2026-08-16).  Rides the same
@@ -525,6 +542,7 @@ if(LORRAX_CUFFT_ON)
         # probe is ever split from the nvrtc probe, this file follows nvrtc.
         cufft/conv_kminor_cuda_ffi.cc
         $<TARGET_OBJECTS:build_conv_klead_cuda>
+        $<TARGET_OBJECTS:build_conv_kpair_cuda>
     )
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
