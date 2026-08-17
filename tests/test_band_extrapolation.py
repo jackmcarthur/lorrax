@@ -497,6 +497,27 @@ def test_uncertainty_is_a_fraction_of_the_applied_correction():
     assert np.allclose(flat.uncertainty(), 0.0)
 
 
+def test_fit_refuses_anything_but_three_points():
+    """Two points must be refused AT THE FIT, not at whoever indexes it.
+
+    The fit itself is well posed on two points, so the old ``>= 2`` guard let
+    a two-point call construct successfully; every consumer then died with
+    ``KeyError((1, 2))`` because ``pair_split``, ``trust_verdict``, the log
+    block and the h5 payload all name that pair.  Verified 2026-08-16 on the
+    pre-fix code: the construction succeeded and returned s_inf = -2.0333.
+    """
+    S2 = np.array([[-1.0], [-1.2]])
+    with pytest.raises(ValueError, match="exactly 3 counts"):
+        fit_band_extrapolation([100, 124], S2)
+    with pytest.raises(ValueError, match="exactly 3 counts"):
+        fit_band_extrapolation([100, 108, 116, 124], np.full((4, 1), -1.0))
+    # and the supported arity still builds every consumer without raising
+    N3 = np.array([100.0, 108.0, 124.0])
+    fit = fit_band_extrapolation(N3, (-1.0 + 30.0 / N3)[:, None])
+    assert np.isfinite(np.real(fit.pair_split)).all()
+    assert isinstance(trust_verdict(fit), str)
+
+
 def test_report_carries_full_band_and_extrapolated_side_by_side():
     e = _si_like_spectrum()
     nb = e.shape[1]
