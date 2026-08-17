@@ -710,8 +710,9 @@ head+wings+body cell. Removing only one side, or subtracting one code's cell
 from both totals, creates a third convention. Offline subtraction also keeps
 each production Dyson solve and pole fit intact and permits an algebraic
 closure check. Head-only removal prices this distinction at about 17 meV;
-the complete-cell result remains about 18 meV and leaves most of the
-correlation discrepancy outside \(q_0\) (sandbox claims 0227 and 0252).
+the source-consistent complete-cell result is 16.5 meV and leaves most of the
+correlation discrepancy outside \(q_0\) (sandbox claims 0227 and 0252, with
+claim 0275 correcting 0252's external-projector orientation).
 
 #### 5.7.3 Pole width plus denominator eta is stacked broadening
 
@@ -725,13 +726,14 @@ BerkeleyGW comparison with nonzero LORRAX eta counts the epsilon broadening
 once on one side and again on the other.
 
 This is a finite-\(q\), same-band effect, not a missing special case at
-\(q=0\): the separately evaluated head is analytic and eta-free. At Gamma
-band 9, changing eta from 0 to 0.25 eV moved the scoped same-band term by
-\(+22.4-86.4i\) meV, and the full stored-pole replay measured 88.7%
-imaginary-part inflation (sandbox claims 0243 and 0246). Reducing eta is not
-safe by deck edit alone: the old sign-crossing rule refuses or becomes
-non-finite as its damping shrinks. Any parity fix is therefore gated on the
-certified omega-clustered, logarithmic-range decomposition in
+\(q=0\): the separately evaluated head is analytic and eta-free. Claims 0243
+and 0246 established the stacking mechanism; source-consistent closure
+corrected the c620 Gamma-band-9 eta A/B to
+\(-38.8+165.7i\) meV and superseded claim 0246's numeric replay without
+changing that mechanism (sandbox claim 0275). Reducing eta is not safe by
+deck edit alone: the old sign-crossing rule refuses or becomes non-finite as
+its damping shrinks. Any parity fix is therefore gated on the certified
+omega-clustered, logarithmic-range decomposition in
 [the crossing-rule cost law](../dev/crossing-rule-cost-law.md).
 
 #### 5.7.4 The `bgw_metal_*` convention family
@@ -1302,8 +1304,8 @@ Open, with the reason each is still open:
 | finite-q static kernel `max_rel 3.720e-16` vs dense oracle; fixture origin-shift `2.556e-5` | same probe record, P=4 gate JID 56986042 |
 | mask-semantics error 1.14/0.72/0.22; permanent `>5e-2` floor | commit `c560065c`, `tests/test_sigma_fermi_split.py` |
 | finite-grid Coulomb point/cell-average distinction and matched one-key arm | claims 0246 and 0253 |
-| exact-limit versus finite-`q0` head; both-sides head/full-cell removal | claims 0227 and 0252 |
-| fitted-pole width plus literal denominator eta; finite-`q` scale | claims 0243 and 0246 |
+| exact-limit versus finite-`q0` head; both-sides head/full-cell removal | claims 0227 and 0252; numeric correction in claim 0275 |
+| fitted-pole width plus literal denominator eta; finite-`q` scale | claims 0243 and 0246; source-consistent correction in claim 0275 |
 | dynamic head vs BGW: −93.9 meV peak, RMS 2.043e-4, `omega_p` 6.0892 eV, `mu` to 6.2e-7 eV | claim 180 (JID 57005734) |
 | `kappa_TF^2 = 0.7086 bohr^-2`, +12.8% vs BGW, fold 2.8e-7 | claim 181 |
 | five-estimator `N(E_F)` spread; tetrahedron anchor; `O(10%)` absolute-energy cap | claim 182 |
