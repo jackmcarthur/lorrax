@@ -596,11 +596,84 @@ compressible would move physics.
 | `zeta_q.h5` | **q-IBZ** by default | no `q_storage` attr — basis inferred from shape |
 | `mpa_*.h5` | **q-IBZ** always | most complete stamping in the tree (rank-checked v2) |
 | `WFN.h5` / `WFN_qp.h5` | **IBZ** | BGW's own header *is* the declaration |
-| `isdf_tensors.h5` `V_qmunu`/`W0_qmunu` | **full BZ by default** | wedge machinery exists and is tested; default is `"full"` |
-| `isdf_tensors.h5` `psi_full_y` | **full BZ, no option** | |
-| `qp_wfn_rotations.h5` | **full BZ** | only wedge rows are ever read |
-| `dipole.h5` | **full BZ** | |
+| `isdf_tensors.h5` `V_qmunu`/`W0_qmunu` | **q-IBZ by default**, stamped | `restart_q_storage` default moved `"full"` → `"auto"` 2026-08-16; `full` survives as the escape hatch and the A/B control |
+| `isdf_tensors.h5` `psi_full_y` | **full BZ, no option** | and the option is NOT a gather — see below |
+| `qp_wfn_rotations.h5` | **file wedge when the writer can prove it**, stamped | `qp_rotations_k_storage` default `"auto"`; the writer runs the reader's round trip and keeps the wedge only if it reproduces the arrays |
+| `dipole.h5` | **full BZ** | NOT convertible by a gather — measured, below |
 | `v_q_bispinor.h5` | **full BZ always** | unfolds before writing |
+
+### The three rows that are NOT one operation
+
+`kin_ion`, `v_hartree` and Σ move onto a wedge through `star_broadcast`,
+which is a **pure row gather plus `conj` on the time-reversed rows**. That
+works because they are SCALAR operators: each commutes with every space-group
+operation and with time reversal, so a star holds one matrix.
+
+The three artifacts still on the full BZ are not scalars, and each fails the
+gather in its own way. **Measured 2026-08-16** on the committed fixtures
+(`reports/wedge_storage_migration_2026-08-16/artifacts/probe_star_relation.py`):
+
+| quantity | what the index is | plain gather | the rule that works |
+|---|---|---|---|
+| `deltaE` | none (energies) | **exact** | gather |
+| `dipole_cart` | Cartesian component of **v̂** | **rel 2.0 — 200 % wrong** | `R_cart_forward` on the component axis, `conj` on TRS rows, **and −1 on TRS rows** |
+| `psi_full_y` | ψ on the centroid grid | untested | centroid permutation + L-phase + spinor rotation + the `unfold_psi` TRS rule |
+| `U_mnk` | eigenvector gauge | run-dependent | *there is no rule* — see `qp_wfn_rotations.h5` below |
+
+`dipole_cart` is the sharp one, because both halves of the failure are
+measurable separately and both are ~100 % of the signal:
+
+* **si_cohsex_debug** (64 k → 8, 48 spatial ops, **0 time-reversed rows**):
+  plain gather `max|Δ| = 4.800535` against a scale of 2.400268 — **rel 2.000**.
+  With `R_proper` applied untransposed, 3.687563. With it **transposed**
+  (i.e. `R_cart_forward`), **4.000962e-15**. Exact.
+* **gnppm_debug** (9 k, 4 of 9 rows time-reversed): transposed-`R` + `conj`
+  gives spatial rows **0.000000e+00** and TRS rows **2.836690** — again
+  rel 2.000, which is what `+v` against `−v` looks like. Adding **−1 on the
+  antiunitary rows** takes the whole array to **2.703570e-15**.
+
+So the complete rule is `d_a(gk) = −1^{TRS} · R_cart_forward[s]_{ab} ·
+conj^{TRS}(d_b(k))`, and the sign is there because **v̂ is odd under time
+reversal** while `kin_ion`/`v_hartree` are even. The tree already said the
+transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
+rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
+TRANSPOSE of this matrix", and the scorecard above records it as *named but
+unused*. The TRS sign was not written down anywhere.
+
+**`cohsex_debug` does not reproduce this** (spatial rows 5.317e-02, TRS rows
+2.759753) and is **not** evidence against the rule: that deck's own
+`kin_ion.h5` is 8.04 Ry away from its star relation, i.e. the fixture predates
+the current symmetry map. Judge the rule on the two decks whose fixtures ARE
+star-consistent.
+
+**`dipole.h5` was NOT converted, and the reason is the standing HOLD, not the
+arithmetic.** The rule above is the same shape as the one the bispinor
+unfolding audit is deciding — an `R` on a component index plus a sign under
+time reversal — and §2 of this page records `mix_channels_by_proper_rotation`
+as carrying **exactly** that unresolved disagreement (the offline fixture is
+transposed row-for-row against live code, and its TRS half carries `−R` where
+live code carries `+R`). Building a second Cartesian-index unfold while the
+convention is under audit would confound both efforts. The measurement above
+is offered to that audit as a second, independent data point on a
+non-bispinor quantity.
+
+### `absent ⇒ full` — re-measured, and the range is wider than recorded
+
+The four committed `kin_ion.h5` fixtures whose rows do not satisfy the star
+relation, through the file-wedge round trip, 2026-08-16:
+
+| fixture | `nk_tot` → file wedge | `max|Δ|` |
+|---|---|---|
+| `gnppm_debug` | 9 → 9 | **31.05 Ry** |
+| `bispinor_debug` | 9 → 9 | **12.44 Ry** |
+| `cohsex_debug` | 9 → 4 | **8.04 Ry** |
+| `si_cohsex_debug` | 64 → 8 | 2.0e-03 Ry |
+| `si_bse_debug` | 64 → 8 | 0 (exact) |
+| `hbn_cohsex_debug` | 18 → 18 | 0 (exact) |
+
+This page previously said "up to 7.8 Ry". The worst is **31.05 Ry**, four
+times that. The conclusion is unchanged and stronger: a file without a
+`k_storage` stamp is full-BZ, full stop.
 
 ---
 
@@ -780,13 +853,48 @@ The text writers moved earlier in this branch are not exposed to this, because
 they are parsed by block rather than indexed by k — the hazard is specific to
 array-indexed formats.
 
-## `qp_wfn_rotations.h5` → wedge: DROPPED
+## `qp_wfn_rotations.h5` → wedge: LANDED 2026-08-16, on a proof rather than a claim
 
-Investigated 2026-08-15, **not implemented, and not to be re-opened off the
-survey's ranking**.  Lossy, silently corrupting for six of eight in-range
-indices, and worth ~3 MB. Recorded because each answer
-contradicts what the I/O survey asserted, and because the same three questions
-apply to every remaining wedge candidate.
+The 2026-08-15 investigation below said DROPPED and it was **half right for a
+reason worth keeping**. What follows first is what changed; the original text
+is kept underneath because two of its three answers still stand.
+
+**The lossiness argument is PATH-SPECIFIC, not general.** Re-read
+2026-08-16, `sc_iteration.py:998-1003` is now a `vh.rebuild` timing comment
+and the quoted sentence lives at `gw_output.py:476` — where it is about the
+**one-shot** dump only. Under `config.sc_on_ibz`, which **defaults to `True`**
+(`gw_config.py:888`), `final_qp_eigenstates` runs its `eigh` on the STAR
+WEDGE (`sc_iteration.py:3100-3101`) and `_loop_arrays_on_full_bz`
+(`:3135-3153`) obtains the full-BZ rows by `KStarMap.broadcast` — a gather
+with TRS conjugation. On the default SC path the off-wedge rows **are**
+reconstructible, by the very function that produced them.
+
+**So the discriminator is the run, not the file format**, and the writer now
+asks it instead of assuming either answer.
+`file_io.qp_wfn.write_qp_rotations_h5` reduces to the file wedge, unfolds
+straight back through `kin_ion.broadcast_ibz_to_full_bz` — the reader's own
+composition — and keeps the wedge **only when the reconstruction reproduces
+the arrays exactly**. `auto` falls back to full-BZ storage naming the array
+that failed and by how much; `ibz` refuses instead of falling back; `full` is
+byte-for-byte the old file, attrs included. A stamped file is one whose
+reconstruction was checked by the process that wrote it.
+
+**The wedge is the FILE wedge**, which is the k-set `kirr_to_kfull` already
+addressed, so `kirr_to_kfull` becomes `arange(nk_red)` and both in-tree
+consumers (`postprocess.rotate_wfn_to_qp:174`, `gw.eqp_bgw:986`) stay correct
+with no change; the old table is kept as `kirr_to_kfull_in_full_bz`.
+
+**One claim below is FALSE and was load-bearing: "only wedge rows are ever
+read."** `tests/test_invariance_gates.py:223-230` reads the WHOLE
+`E_qp_nk_rydberg` and asserts it elementwise against a frozen `(9, 46)`
+full-BZ `.npy` (`gnppm_debug/eqp_rotations_fixedpoint_ref.npy`). It survives
+only because `gnppm_debug`'s file wedge is 9 of 9 — the deck does not reduce —
+so the shape does not move. Had that gate run on `si_cohsex_debug` (64 → 8) it
+would have tripped its own shape assert. A second reader,
+`tests/multi_device/sigma_omega_layout_ab.py:459-462`, also compares whole
+arrays. Neither is in `src/`, and both were missed by the survey.
+
+### The original 2026-08-15 text, kept — two of its three answers still stand
 
 **1. Are the non-wedge `U_mnk` rows computed, or broadcast?  COMPUTED.**
 Both producers do `E_qp_ry, U_qp = eigh(state.H_qp_dft)`
@@ -799,6 +907,10 @@ reconstructible by any gather, because an eigenvector is defined up to a phase
 and, inside a degenerate multiplet, up to a unitary mixing. Defensible while
 nothing reads them (verified: nothing does), but it is a different change and
 must be described as one.
+
+> **SUPERSEDED 2026-08-16 — true of the one-shot path, false of the default
+> SC path.** See above. The *caution* it expresses is right and is why the
+> writer proves the round trip rather than trusting a mode flag.
 
 **2. Does a stale reader of a newly-written file fail loudly?  NO.**
 Measured with h5py on the real Si map `kirr_to_kfull = [0,1,2,5,6,7,10,27]`

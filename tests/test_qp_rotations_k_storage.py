@@ -94,7 +94,18 @@ def test_wedge_stored_file_unfolds_back_to_the_full_bz_arrays(tmp_path):
 
 
 def test_the_wedge_and_full_arms_read_back_identically(tmp_path):
-    """The A/B a consumer actually cares about: same numbers, fewer bytes."""
+    """The A/B a consumer actually cares about: same numbers, fewer bytes.
+
+    "Fewer bytes" is asserted on the ARRAYS, not on the file, and the
+    distinction is not pedantry — MEASURED here, the wedge file is BIGGER
+    (11,880 against 10,240) at this fixture's 3x3x3 scale, because two
+    index tables plus four sets of attrs cost more HDF5 metadata than a
+    6-row-to-3-row reduction of a 3x3 complex block saves.  The saving is
+    real and proportional at deck scale (Si production: ``U_mnk``
+    {64,60,60} complex128 = 3.52 MB against {8,60,60} = 0.44 MB), and an
+    assertion on the file size would be asserting the metadata overhead of
+    whatever fixture happened to be here.
+    """
     U, E, kpts = _star_consistent_payload()
     p_full, s_full = _write(tmp_path, "full.h5", U, E, kpts)
     p_ibz, s_ibz = _write(tmp_path, "ibz.h5", U, E, kpts,
@@ -104,8 +115,16 @@ def test_the_wedge_and_full_arms_read_back_identically(tmp_path):
     b = read_qp_rotations_full_bz(p_ibz)
     for name in QP_ROT_K_DATASETS:
         assert np.array_equal(a[name], b[name]), name
-    import os
-    assert os.path.getsize(p_ibz) < os.path.getsize(p_full)
+
+    def _array_bytes(path):
+        with h5py.File(path, "r") as f:
+            return sum(int(f[n].id.get_storage_size())
+                       for n in QP_ROT_K_DATASETS)
+
+    full_b, ibz_b = _array_bytes(p_full), _array_bytes(p_ibz)
+    assert ibz_b * _NK_FULL == full_b * _NK_RED, (
+        f"the k-indexed arrays should shrink by exactly "
+        f"{_NK_FULL}/{_NK_RED}: {full_b} -> {ibz_b} bytes")
 
 
 # ---------------------------------------------------------------------------
