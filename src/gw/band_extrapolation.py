@@ -5,10 +5,29 @@ the Green's function,
 
     Σ_c(ω) = Σ_n  ψ_n ⊗ ψ_n*  ⊗  [W-dependent kernel](ω − E_n),
 
-and its unoccupied tail decays like 1/N: the states above the QP window
+and its unoccupied tail decays slowly: the states above the QP window
 contribute a small, same-signed, slowly-vanishing amount that a brute-force
 band count only removes by being enormous.  This module evaluates the SAME
-sum at three band counts in ONE pass and extrapolates to N → ∞ instead.
+sum at three band counts in ONE pass and extrapolates instead.
+
+⚠ **THE 1/N LAW THIS MODULE FITS IS NOT THE MEASURED DECAY, AND THE ERROR
+THAT CAUSES IS ONE-SIGNED.  Measured 2026-08-16 — see
+``sandbox:reports/ch_converge_functional_forms_2026-08-16/``.**  On a 508-band
+Si arm the local convergence power climbs monotonically 1.28 → 2.29 across
+N = 100 → 300 and never approaches 1.  The kinematics are fine (the band
+ladder is free-electron to 1 %, and the counting law below reproduces the
+low-N behaviour); the drift is entirely in the matrix elements, whose
+effective falloff ``|M|² ~ E^-a`` runs a = 1.83 at N = 60 to 3.94 at N = 380.
+Because the data decays FASTER than 1/N over the window sampled here, a 1/N
+fit projects more remaining tail than exists and lands BELOW the truth on
+every state at every band count.  Scored against a MEASURED S(508):
+45.8 meV median at N_max = 152, 17.5 at 260, 3.5 at 396, always undershooting.
+
+The form is kept for now because it is what has been validated end to end and
+the replacement is not yet implemented; it is documented here so that no
+reader takes "decays like 1/N" as established.  The screened-Coulomb cutoff
+was tested as the cause and REFUTED (tripling W's G-space moves the exponent
+by ≤ 0.001).
 
 THE THREE POINTS COME FROM DISJOINT BRACKETS, NOT THREE RUNS.  The band axis
 is cut into three contiguous brackets
@@ -114,6 +133,36 @@ to sample lower, which was the whole reason to want it**: (0.50, 0.75) with
 N₀ fitted in-sample on this very deck is 27.6 meV, still 2× worse than
 (0.80, 0.90) with N₀ = 0 at 14.2.  Moving the window beats modelling the
 crossover.
+
+**THE NEW DATA THE INJUNCTION ABOVE ASKS FOR NOW EXISTS (2026-08-16), AND IT
+CHANGES TWO OF THESE CONCLUSIONS.**  A 508-band Si arm gives a MEASURED
+S(508), so estimators can be scored held-out instead of against a reference
+that is itself a fit or a model.  Under that protocol:
+
+  * The shifted law was re-searched over ``N₀`` AND the exponent JOINTLY,
+    rather than with the exponent pinned to 1.  ``S_∞ + A/(N + 50)²`` cuts
+    the sliding-window intercept travel 42.7 → 3.9 meV and transfers
+    out-of-sample to a different SCF, cutoff and band count (travel 4.8
+    against 36.4 for 1/N).  It is still NOT shippable — ``N₀ ≈ +50`` has no
+    counterpart in the mean field (the DFT bands give n₀ = 0), and (N₀, q)
+    drifts to ~(110, 3.0) over the extended range — so it is a shape
+    diagnostic, not a form.  But "there is no crossover form on this deck" is
+    too strong as written above; what is true is that no FIXED one describes
+    N = 100…500.
+  * A FOURTH point does not help this estimator.  Held-out against S(508),
+    4 points at (0.70, 0.80, 0.90) are WORSE than 3 at (0.80, 0.90) at every
+    band count (47.8 vs 45.8 at N_max = 152, 20.4 vs 17.5 at 260): the extra
+    sample extends the lever into the region where the form is more wrong,
+    and that costs more than the conditioning gain (noise ×3.5 vs ×5.9) wins.
+    The defensible reason to want a fourth point is a held-out prediction of
+    the fourth shell as an uncertainty estimate — not accuracy.
+
+The leading replacement is a spectrum-resolved SHELL estimator: fit the
+per-state decay from the ratio of the two observed shell increments against
+spectral moments of the real DFT eigenvalues, then integrate the remaining
+tail to the finite basis endpoint.  Held-out against S(508) it beats this
+module's estimator at every band count, and it needs exactly the three points
+this module already computes.  Not implemented here yet.
 
 A CALIBRATED BIAS CORRECTION was tested too, and the result is the argument
 for leaving the centre alone.  Scaling the applied correction by an optimal
@@ -244,6 +293,20 @@ from common.units import RYD_TO_EV
 #: Why not fractions of ``n_cond``: see the module docstring — the counting
 #: law that makes 1/N right is written in the TOTAL count, p = 1.481 measured,
 #: against 1.212 for the conduction-only alternative.
+#:
+#: ⚠ THE REFERENCE THESE FRACTIONS WERE CHOSEN AGAINST IS A MODEL, NOT A
+#: MEASUREMENT.  "partial sum plus static remainder ... no extrapolation in
+#: it" is true about extrapolation and misleading about bias: BerkeleyGW's
+#: static remainder assumes the neglected GPP tail is 1/2 the static one, and
+#: the measured ratio on this deck runs 2.26 at N = 60 to 3.34 at N = 124,
+#: rising.  Scored against a dense fit instead, that oracle is +14.0 meV mean
+#: / +15.3 median off over 192 states, ONE-SIGNED — 3-5x the sampling error
+#: these fractions were selected to minimise.  So the RANKING above is
+#: probably sound (the bias is common-mode across rows) but the absolute
+#: numbers are not, and (0.80, 0.90) has never been re-derived against a
+#: reference-free target.  A 508-band arm now provides one — a MEASURED
+#: S(508) — and re-deriving the fractions under it is open work.
+#: See ``sandbox:reports/ch_converge_functional_forms_2026-08-16/``.
 #:
 #: Report: ``sandbox:reports/ch_converge_band_extrapolation_2026-08-15/``,
 #: which carries the three ``ch_converge.dat`` arms and the analysis scripts.
@@ -681,8 +744,18 @@ def fit_band_extrapolation(
     """
     N = np.asarray(counts, dtype=np.float64)
     S = np.asarray(s_at_counts)
-    if N.ndim != 1 or N.size < 2:
-        raise ValueError(f"fit_band_extrapolation: need >=2 counts, got {N}")
+    # EXACTLY three, not ">= 2".  The fit itself is well posed on two points,
+    # but every consumer indexes the (1, 2) pair by name — ``pair_split``,
+    # ``trust_verdict``, the log block, the h5 payload — so a two-point fit
+    # CONSTRUCTS and then dies with ``KeyError((1, 2))`` at whichever consumer
+    # runs first.  Verified 2026-08-16.  Refusing here turns a confusing
+    # downstream crash into a statement about the input.
+    if N.ndim != 1 or N.size != 3:
+        raise ValueError(
+            f"fit_band_extrapolation: need exactly 3 counts, got {N}.  "
+            f"The two-parameter fit needs three points to have a residual at "
+            f"all, and the diagnostics are built on the three pairwise "
+            f"intercepts.")
     if S.shape[0] != N.size:
         raise ValueError(
             f"fit_band_extrapolation: S leading axis {S.shape[0]} != "
@@ -746,6 +819,16 @@ def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
     Reported as prose, not as a refusal: the numbers are the product, and a
     run that stops on a soft quality metric would be worse than one that
     prints the metric.
+
+    ``ratio_warn = 0.35`` IS NOT A MEASURED THRESHOLD.  Every other constant
+    in this module carries a provenance paragraph; this one does not, and it
+    should be read as a round number chosen to sit well above the 0.057 ratio
+    measured on a clean curve (module docstring) and well below 1.  Nothing
+    has calibrated where between those it belongs, and the docstring's own
+    warning applies with full force: a passing ratio was measured to coexist
+    with a 55 meV MAE / 167 meV max intercept error, so tightening this number
+    would not have caught that and loosening it would not have missed it.
+    Treat a verdict as a statement about SCATTER only.
     """
     d_tail = float(np.max(np.abs(np.real(fit.delta_tail))))
     d_model = float(np.max(np.abs(np.real(fit.delta_model))))
