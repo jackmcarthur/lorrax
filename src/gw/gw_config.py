@@ -2263,6 +2263,93 @@ def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
     return bool(next(iter(named.values()))), True
 
 
+def sigma_stage_modes(config, fallback=None) -> tuple:
+    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order.
+
+    **THIS FUNCTION EXISTS BECAUSE A PREVIOUS ANALYSIS WAS WRONG, and the
+    correction is worth stating rather than silently applying.**  The
+    2026-08-16 SC-wiring branch concluded from a ``git log --all`` /
+    ``git grep --all`` search that ``sc_stage_N_type`` "does not exist on any
+    branch", and mapped per-stage behaviour onto ``compute_mode`` as the only
+    available proxy.  The search was run in a single-branch checkout, where
+    ``--all`` covers only FETCHED refs, so the null was a statement about that
+    checkout's remotes.  The keys are real: ``origin/feat/staged-sc-2026-08-15``
+    (98289d77) carries ``SC_STAGE_TYPES`` (``none | cohsex | gnppm | mpa``),
+    ``SCStage(mode, cutoff_ev, max_iter)``, ``default_sc_ladder`` and
+    ``resolve_sc_stages`` in this file, plus ``SCConfig.stages`` and
+    ``run_staged_self_consistency`` in ``gw.sc_iteration``.
+
+    WHAT THE REAL INTERFACE CHANGES, AND WHAT IT DOES NOT.
+
+    * It does NOT invalidate the ``compute_mode`` seam.  Read against the real
+      branch, ``run_staged_self_consistency`` rebuilds each stage's inputs with
+      ``dataclasses.replace(config, compute_mode_raw=stage.mode.value)`` and
+      passes ``stage.mode`` into ``compute_sigma_xc``, so during a stage the
+      dispatched ``mode`` **is** that stage's mode.  A per-stage guard written
+      against ``compute_mode`` therefore fires per stage already.  That part of
+      the SC branch was accidentally right.
+    * It DOES invalidate the REFUSAL.  A refusal is a statement about the whole
+      RUN, and under a ladder the stage in front of you is not the run.  With
+      the guard written per-stage, an explicitly-named key would kill:
+      ``sc_stage_1_type = cohsex, sc_stage_2_type = gnppm`` at stage 1 (before
+      reaching the very stage that consumes the key), and the SHIPPED DEFAULT
+      LADDER for ``compute_mode = mpa`` — ``(GN_PPM @5 meV, MPA @2 meV)`` — at
+      stage 2, after paying for a full GN-PPM stage.  Both are runs that must
+      work.  Hence this function, and hence the refusal below is asked about
+      the LADDER rather than about one stage.
+
+    Parameters
+    ----------
+    config
+        A :class:`LorraxConfig`, or anything shaped like one.  Read entirely
+        through ``getattr`` so it is correct **before** the staged-SC branch
+        merges (no ``config.sc.stages`` → the deck's single ``compute_mode``)
+        and **after** it merges (the resolved ladder), with no edit here.
+    fallback
+        Mode to report when the config exposes neither a ladder nor a
+        ``compute_mode`` — a hand-made namespace in a unit test, or a config
+        whose ``compute_mode`` property refuses.  Callers pass the mode they
+        are currently dispatching, which is the only honest answer available.
+    """
+    stages = getattr(getattr(config, "sc", None), "stages", None) or ()
+    modes = []
+    for stage in stages:
+        raw = getattr(stage, "mode", stage)
+        try:
+            modes.append(coerce_compute_mode(raw))
+        except (ValueError, TypeError):
+            continue
+    if not modes:
+        try:
+            modes = [coerce_compute_mode(config.compute_mode)]
+        except (AttributeError, ValueError, TypeError):
+            modes = []
+    if not modes and fallback is not None:
+        try:
+            modes = [coerce_compute_mode(fallback)]
+        except (ValueError, TypeError):
+            modes = []
+    # Order-preserving dedupe: the ladder is short and a reader of the refusal
+    # wants "which schemes does this run use", not a repetition count.
+    seen, out = set(), []
+    for m in modes:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return tuple(out)
+
+
+def band_extrapolation_is_consumable(modes) -> bool:
+    """Does ANY stage of this run reach the kernel that reads the key?
+
+    ``ppm_model is not None`` is the exact predicate: the extrapolation is
+    wired into the two-point GN/HL plasmon-pole Σ_c kernel and nothing else.
+    Deliberately NOT ``is_dynamic`` — that is True for MPA, which is dynamic
+    and still does not consume this key.
+    """
+    return any(getattr(m, "ppm_model", None) is not None for m in modes)
+
+
 # ---------------------------------------------------------------------------
 #  Input file parser
 # ---------------------------------------------------------------------------
