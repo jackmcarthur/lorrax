@@ -39,9 +39,9 @@ from common.jax_compile_cache import ensure_jax_compile_cache
 
 _sigma_tau_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
-#: Cache of :class:`SpatialKernel` bundles — not of a single callable, since
-#: 2026-08-15 the W-only half is hoistable; the optional bracket-batched tail
-#: keeps that W shared through the production fused handler as well.
+#: Cache of :class:`SpatialKernel` PAIRS (prep_w, conv_project) — not of a
+#: single callable, since 2026-08-15: the W-only half is hoistable and the
+#: band-bracket loop hoists it.
 _sigma_spatial_kernel_cache: dict[tuple[object, ...], "SpatialKernel"] = {}
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
@@ -102,7 +102,7 @@ def _fft_ffi_fused_enabled() -> bool:
 
 
 def _make_project_ri_reduce_scatter(
-    mesh_xy: Mesh, *, merged_x: bool = False, leading_brackets: bool = False,
+    mesh_xy: Mesh, *, merged_x: bool = False,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
 
@@ -206,41 +206,15 @@ def _make_project_ri_reduce_scatter(
     """
     from common.contract_bands import contract_bands_block_reshard
 
-    hint = (
-        "Both existing sigma call sites pad via pad_sigma_window; "
-        "meta.py rounds b_id_4 to world_size but NOT the sigma band "
-        "window (b3-b0), so a new unpadded caller is a real hazard, "
-        "not a tautology.")
-    if not leading_brackets:
-        # Keep the ordinary and length-one-bracket lowering untouched.  In
-        # particular, the latter is required to be bit-identical to the
-        # unbracketed path rather than merely close.
-        return contract_bands_block_reshard(
-            mesh_xy,
-            channels=("none" if merged_x else "split_reim"),
-            divisibility_hint=hint,
-        )
-
-    project_leading = contract_bands_block_reshard(
-        mesh_xy, channels="none", extra="leading", divisibility_hint=hint)
-    if merged_x:
-        return project_leading
-
-    def project_split_leading(psi_xr, sigma_brackets, psi_yn):
-        """Project all bracket x (real, imag) channels as one real batch.
-
-        ``contract_bands_block_reshard`` deliberately refuses
-        ``channels='split_reim', extra='leading'`` and prescribes this exact
-        carrier: make the channel axis part of the real leading batch, then
-        split its output back into the Sigma-owned channel tuple.
-        """
-        n_brackets = sigma_brackets.shape[0]
-        carrier = jnp.concatenate(
-            (jnp.real(sigma_brackets), jnp.imag(sigma_brackets)), axis=0)
-        projected = project_leading(psi_xr, carrier, psi_yn)
-        return (projected[:n_brackets], projected[n_brackets:])
-
-    return project_split_leading
+    return contract_bands_block_reshard(
+        mesh_xy,
+        channels=("none" if merged_x else "split_reim"),
+        divisibility_hint=(
+            "Both existing sigma call sites pad via pad_sigma_window; "
+            "meta.py rounds b_id_4 to world_size but NOT the sigma band "
+            "window (b3-b0), so a new unpadded caller is a real hazard, "
+            "not a tautology."),
+    )
 
 
 class SpatialKernel(NamedTuple):
@@ -258,10 +232,6 @@ class SpatialKernel(NamedTuple):
     ``conv_project(psi_xr, psi_yn, G_k, W_prep) -> Sigma``
         The G-dependent remainder: the G transform, the R-space multiply,
         the forward transform and the ψ projection.  Paid ONCE PER G(τ).
-    ``conv_project_brackets(psi_xr, psi_yn, G_batch, W_prep) -> Sigma``
-        Optional multi-bracket tail.  G's replicated bracket label is folded
-        into an existing transform-batch axis, so one handler call transforms
-        W once and the leading-extra projector sees one GEMM batch.
 
     Composed back to back this is exactly the single callable this factory
     used to return; the split exists so the caller can place the loop
@@ -269,7 +239,6 @@ class SpatialKernel(NamedTuple):
     """
     prep_w: Callable[..., jax.Array]
     conv_project: Callable[..., jax.Array]
-    conv_project_brackets: Callable[..., jax.Array] | None
 
 
 def get_sigma_spatial_kernel(
@@ -277,7 +246,6 @@ def get_sigma_spatial_kernel(
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
     merged_x: bool = False,
-    batch_brackets: bool = False,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -288,18 +256,20 @@ def get_sigma_spatial_kernel(
     spatial kernel.  A genuine three-point vertex remains a different
     contraction and should not be hidden behind this interface.
 
-    Returned as a :class:`SpatialKernel` bundle rather than one callable so a
+    Returned as a :class:`SpatialKernel` pair rather than one callable so a
     caller with several G(τ) per W(τ) can hoist the W half.  WHAT THAT BUYS,
     AND WHERE IT DOES NOT:
 
       * decomposed chain (``LORRAX_FFT_FFI_FUSED=0``) — ``ifftn(W)`` is one
         of the three transforms, so hoisting it across ``n`` G's takes the
         FFT count from ``3n`` to ``2n + 1``;
-      * fused chain (``=1``, the certified production default) — the handler
-        signature stays ``(G_k, W_k) -> sigma_k``.  For multiple brackets the
-        replicated bracket label is folded into G's unsharded transform-batch
-        axis, so the same handler transforms W once without a C++/ABI change.
-        This deliberately materializes one sharded G tile per bracket.
+      * fused chain (``=1``, the certified production default) — all three
+        transforms are inside ONE ``gw_conv`` FFI call whose signature is
+        ``(G_k, W_k) -> sigma_k``.  ``ifftn(W)`` therefore happens inside the
+        handler and is recomputed per G.  Hoisting it needs a second handler
+        entry that accepts W already in R-space, i.e. a C++/ABI change to
+        ``liblorrax_ffi.so``; that is deliberately NOT done here.  The cost is
+        ``n`` W-transforms instead of one — a third of the FFT chain.
     """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
@@ -307,7 +277,7 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x), bool(batch_brackets))
+           bool(merged_x))
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -330,10 +300,6 @@ def get_sigma_spatial_kernel(
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
     project = _make_project_ri_reduce_scatter(mesh_xy, merged_x=merged_x)
-    project_brackets = (
-        _make_project_ri_reduce_scatter(
-            mesh_xy, merged_x=merged_x, leading_brackets=True)
-        if batch_brackets else None)
 
     @jax.jit
     def prep_w(W_q):
@@ -349,40 +315,8 @@ def get_sigma_spatial_kernel(
         else:
             sigma_k = _G_fftn(_G_ifftn(G_k) * W_prep * inv_sqrt_nk)
         return project(psi_proj_xr, sigma_k, psi_proj_yn)
-
-    if batch_brackets:
-        @partial(jax.jit, donate_argnums=(2,))
-        def conv_project_brackets(
-            psi_proj_xr, psi_proj_yn, G_k_batched, W_prep,
-        ):
-            """Convolve/project a bracket batch with one W transform.
-
-            ``G_k_batched`` folds the replicated bracket axis into G's first
-            unsharded spin-batch axis.  The flat-k handler transforms only k,
-            so that fold is a pure batch relabel: no bracket can mix with
-            another.  Restore the leading axis before the shared projector.
-            """
-            if use_fused_ffi:
-                sigma_batched = _gw_conv(G_k_batched, W_prep)
-            else:
-                sigma_batched = _G_fftn(
-                    _G_ifftn(G_k_batched) * W_prep * inv_sqrt_nk)
-            nk, bs, mx, s2, my = sigma_batched.shape
-            s = psi_proj_xr.shape[2]
-            n_brackets = bs // s
-            sigma_brackets = jnp.swapaxes(
-                sigma_batched.reshape(nk, n_brackets, s, mx, s2, my),
-                0, 1)
-            return project_brackets(
-                psi_proj_xr, sigma_brackets, psi_proj_yn)
-    else:
-        conv_project_brackets = None
     if not _stage_timing_enabled():
-        pair = SpatialKernel(
-            prep_w=prep_w,
-            conv_project=conv_project,
-            conv_project_brackets=conv_project_brackets,
-        )
+        pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
         _sigma_spatial_kernel_cache[key] = pair
         return pair
     if use_fused_ffi:
@@ -394,9 +328,6 @@ def get_sigma_spatial_kernel(
         _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),
                               donate_argnums=(0,))
     _project_j = jax.jit(project, donate_argnums=(1,))
-    _project_brackets_j = (
-        jax.jit(project_brackets, donate_argnums=(1,))
-        if batch_brackets else None)
 
     def prep_w_staged(W_q):
         """``sigma.tau.w_prep`` — the ONCE-PER-τ half, timed on its own row.
@@ -431,41 +362,7 @@ def get_sigma_spatial_kernel(
             sec.watch(out)
         return out
 
-    if batch_brackets:
-        def conv_project_brackets_staged(
-            psi_proj_xr, psi_proj_yn, G_k_batched, W_prep,
-        ):
-            """Diagnostic split of the batched spatial operation sequence."""
-            if use_fused_ffi:
-                with timing.section("sigma.tau.GW_conv_ffi") as sec:
-                    sigma_batched = _conv_j(G_k_batched, W_prep)
-                    sec.watch(sigma_batched)
-            else:
-                with timing.section("sigma.tau.G_ifft") as sec:
-                    G_R = _G_ifft_j(G_k_batched)
-                    sec.watch(G_R)
-                with timing.section("sigma.tau.GW_mult_fft") as sec:
-                    sigma_batched = _mult_fft_j(G_R, W_prep)
-                    sec.watch(sigma_batched)
-            nk, bs, mx, s2, my = sigma_batched.shape
-            s = psi_proj_xr.shape[2]
-            n_brackets = bs // s
-            sigma_brackets = jnp.swapaxes(
-                sigma_batched.reshape(nk, n_brackets, s, mx, s2, my),
-                0, 1)
-            with timing.section("sigma.tau.project_rs") as sec:
-                out = _project_brackets_j(
-                    psi_proj_xr, sigma_brackets, psi_proj_yn)
-                sec.watch(out)
-            return out
-    else:
-        conv_project_brackets_staged = None
-
-    pair = SpatialKernel(
-        prep_w=prep_w_staged,
-        conv_project=conv_project_staged,
-        conv_project_brackets=conv_project_brackets_staged,
-    )
+    pair = SpatialKernel(prep_w=prep_w_staged, conv_project=conv_project_staged)
     _sigma_spatial_kernel_cache[key] = pair
     return pair
 
@@ -525,13 +422,13 @@ def _get_sigma_kij_kernel(
     run.  The bounds are Python ints baked into the trace, so this is still
     ONE compiled program and ONE dispatch per τ.
 
-    WHAT DOES NOT PARTITION: ``G_k`` lives in the ISDF centroid basis, whose
-    extent is ``N_μ`` — independent of how many bands went into it.  For two
-    or more brackets the G tiles are therefore concatenated along an
-    unsharded batch dimension and traverse the fused convolution and leading-
-    extra projector together.  This retains one G-sized tile per bracket,
-    but stages W only once and exposes the equal-shape projection GEMMs as a
-    batch.  The length-one path stays on the original scalar lowering.
+    WHAT DOES NOT PARTITION, and why the feature is not free: ``G_k`` lives
+    in the ISDF centroid basis, whose extent is ``N_μ`` — independent of how
+    many bands went into it.  The FFT chain and the ψ projection that follow
+    therefore cost the same per bracket as they do for the full band range,
+    and three brackets pay them three times.  That 3× on the dominant term
+    is the accepted price of the feature; see :class:`SpatialKernel` for the
+    one part of it (``ifftn(W)``) that can be hoisted, and where it cannot.
     """
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
@@ -539,10 +436,8 @@ def _get_sigma_kij_kernel(
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
-    batch_brackets = brackets is not None and len(brackets) > 1
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
-        batch_brackets=batch_brackets)
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x)
 
     def _bracketed(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                    E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):
@@ -572,27 +467,6 @@ def _get_sigma_kij_kernel(
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
 
-    def _bracketed_batched(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv,
-    ):
-        """Build disjoint G slices, then batch their shared spatial tail.
-
-        Concatenating on G's first spin axis folds the replicated bracket
-        label into an axis the flat-k service already treats as a transform
-        batch.  Unlike zero-padding the unequal band slices, this preserves
-        the exact band-sum FLOP count.  The trade is one sharded G-sized live
-        tile per bracket; no centroid axis is ever replicated.
-        """
-        G_tiles = []
-        for lo, hi in brackets:
-            G_tiles.append(build_g(
-                psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
-                E_A[:, lo:hi], mask_A[:, lo:hi], E_ref_A, t_node))
-        G_k_batched = jnp.concatenate(G_tiles, axis=1)
-        return conv(
-            psi_proj_xr, psi_proj_yn, G_k_batched, W_prep)
-
     if not _stage_timing_enabled():
         _build_g = lambda xn, yr, E, mask, ref, t: build_G_tau(   # noqa: E731
             xn, yr, E, 1j * t, e_ref=ref, mask=mask)
@@ -611,11 +485,6 @@ def _get_sigma_kij_kernel(
                                E_ref_A, t_node)
                 return spatial.conv_project(
                     psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            if batch_brackets:
-                return _bracketed_batched(
-                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A, mask_A, E_ref_A, t_node, W_prep,
-                    _build_g, spatial.conv_project_brackets)
             return _bracketed(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_prep,
@@ -644,11 +513,6 @@ def _get_sigma_kij_kernel(
                                  E_ref_A, t_node)
             return spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep)
-        if batch_brackets:
-            return _bracketed_batched(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_prep,
-                _build_g_timed, spatial.conv_project_brackets)
         # Python-level loop over already-jitted stages: the barrier is not
         # available (and not needed) here — each stage jit completes before
         # the next is dispatched, so the one-G-at-a-time property holds a
@@ -684,9 +548,9 @@ def _get_sigma_tau_kernel(
     Laplace path — owner order 2026-07-28).
 
     ``brackets``: the band-bracket plan (``gw.band_extrapolation``), ALWAYS a
-    tuple on this GN-PPM entry point — length 1 in the ordinary case, and the
-    planner-selected count when extrapolating.  The output always carries a
-    leading bracket axis, so there is exactly one shape below here.  W(τ)
+    tuple on this GN-PPM entry point — length 1 in the ordinary case, 3 when
+    extrapolating.  The output therefore always carries a leading bracket
+    axis, so there is exactly one shape and one code path below here.  W(τ)
     is built ONCE per τ above the bracket loop and shared by every bracket;
     that is the whole design and it is why this argument lives on the kernel
     rather than on its caller.
