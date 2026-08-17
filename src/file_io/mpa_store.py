@@ -2893,8 +2893,28 @@ def _validate_intraband_row(ledger, q, Omega, Bp, where):
     return iq, Om, Br
 
 
+def _record_intraband_row_scalars(grp, iq, row_scalars):
+    """Fill one q slot of each per-q float provenance attribute.
+
+    These are provenance attributes, not ledger state: the array is sized
+    from the already-allocated pole axis, so no schema or version changes.
+    """
+    if not row_scalars:
+        return
+    n_q = int(grp["Omega_p"].shape[1])
+    for key, value in row_scalars.items():
+        name = "mpa_intra_" + str(key)
+        stored = np.asarray(
+            grp.attrs.get(name, np.full(n_q, np.nan)), dtype=np.float64)
+        if stored.shape != (n_q,):
+            stored = np.full(n_q, np.nan, dtype=np.float64)
+        stored[int(iq)] = float(value)
+        grp.attrs[name] = stored
+
+
 def write_intraband_row(
-    dest, q, Omega_p_row, B_p_row, *, anomaly_counts=None, mode="a",
+    dest, q, Omega_p_row, B_p_row, *, anomaly_counts=None,
+    row_scalars=None, mode="a",
 ):
     """Write one host v2 suffix row and advance its independent ledger.
 
@@ -2918,6 +2938,7 @@ def write_intraband_row(
             name = "mpa_intra_" + str(key)
             grp.attrs[name] = np.int64(
                 int(grp.attrs.get(name, 0)) + int(value))
+        _record_intraband_row_scalars(grp, iq, row_scalars)
         return fit_completion_ledger(grp)
 
 
@@ -2931,6 +2952,7 @@ def write_intraband_row_collective(
     poles_finite,
     poles_causal,
     anomaly_counts=None,
+    row_scalars=None,
 ):
     """Collectively append one native-sharded crossing-block q row.
 
@@ -3005,6 +3027,7 @@ def write_intraband_row_collective(
                 name = "mpa_intra_" + str(key)
                 grp.attrs[name] = np.int64(
                     int(grp.attrs.get(name, 0)) + int(value))
+            _record_intraband_row_scalars(grp, iq, row_scalars)
     barrier(f"mpa_intraband_row_{iq}_committed")
     return fit_completion_ledger_collective(
         dest, key=f"intraband-row-{iq}")

@@ -428,10 +428,15 @@ def _append_intraband_rows(fit_path, rows, slabs, mesh_xy):
             "folded_elements": row.folded_elements,
             "dropped_elements": row.dropped_elements,
         }
+        scalars = {} if row is None else {
+            "zero_mode_weight": row.zero_mode_weight,
+            "zero_mode_pole_shift": row.zero_mode_pole_shift,
+            "zero_mode_cluster": float(row.zero_mode_cluster),
+        }
         mpa_store.write_intraband_row_collective(
             fit_path, iq, Omega[:, None, :, :], Bp[:, None, :, :],
             mesh_xy=mesh_xy, poles_finite=finite, poles_causal=causal,
-            anomaly_counts=anomaly)
+            anomaly_counts=anomaly, row_scalars=scalars)
 
 
 def _evaluate_fit_prefix(fit_path, n_p_fit, z_values, mesh_xy):
@@ -1016,6 +1021,12 @@ def build_mpa_fit(
                  if row is not None), default=0.0),
             "intraband_builder_max_cluster_width_ry": max(
                 (row.cluster_width_max_ry for row in rows
+                 if row is not None), default=0.0),
+            "intraband_zero_mode_weight_max": max(
+                (row.zero_mode_weight for row in rows
+                 if row is not None), default=0.0),
+            "intraband_zero_mode_pole_shift_max": max(
+                (row.zero_mode_pole_shift for row in rows
                  if row is not None), default=0.0),
         })
         if process_rank() == 0:

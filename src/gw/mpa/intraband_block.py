@@ -29,6 +29,10 @@ SAMPLE_REL_TOL = 4.0e-3
 STATIC_REL_TOL = 2.0e-11
 SUM_RULE_REL_TOL = 1.0e-12
 MOMENT_REL_TOL = SAMPLE_REL_TOL
+# A static deficit is admitted as zero-mode weight only when doubling the
+# quadrature order leaves it this stationary; anything that still shrinks is
+# quadrature error and keeps refining toward the sum-rule refusal.
+_V_PLATEAU_REL_TOL = 1.0e-3
 MIN_CLUSTERS = 3
 MAX_CLUSTERS = 6
 _QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
@@ -54,6 +58,26 @@ class IntrabandRow:
     folded_elements: int
     dropped_elements: int
     cluster_width_max_ry: float
+    zero_mode_weight: float = 0.0
+    zero_mode_cluster: int = -1
+    zero_mode_pole_shift: float = 0.0
+
+
+@dataclass(frozen=True)
+class ClusterClosure:
+    """Post-merge closure record for one row's contour tiling.
+
+    ``zero_mode_weight`` is ``||D_V||/||V_total||`` measured *before* the
+    deflation merge; after the merge both closures are exact identities.
+    """
+
+    quadrature_order: int
+    m_closure: float
+    v_closure_before_merge: float
+    v_closure_after_merge: float
+    zero_mode_weight: float
+    zero_mode_cluster: int
+    zero_mode_pole_shift: float
 
 
 def _mesh_of(value, where):
@@ -386,9 +410,121 @@ def _moments_at_order(
     )
 
 
+def _representative_omega(M, V):
+    """Trace-moment pole location per cluster, on the retarded sheet.
+
+    This is the same trace-ratio idiom the intrinsic widths already use.  It
+    is a diagnostic summary of the elementwise match ``Omega^2 = -M/V``, and
+    it is what "lowest-|Omega| cluster" means as a fixed structural rule.
+    """
+    roots = []
+    for index in range(int(M.shape[0])):
+        mass = complex(jax.device_get(jnp.trace(M[index])))
+        static = complex(jax.device_get(jnp.trace(V[index])))
+        if static == 0.0:
+            roots.append(complex(np.inf, 0.0))
+            continue
+        ratio = -mass / static
+        if not np.isfinite(ratio):
+            roots.append(complex(np.inf, 0.0))
+            continue
+        root = np.sqrt(complex(ratio))
+        if root.real < 0.0:
+            root = -root
+        if root.imag > 0.0:
+            root = root.conjugate()
+        roots.append(complex(root))
+    return roots
+
+
+def _finite_lambda_clusters(M, M_total):
+    """Clusters carrying material asymptotic weight, i.e. finite-lambda.
+
+    A machine-zero mode has ``M``-content proportional to its own ``lambda``,
+    so a cluster with no asymptotic weight cannot host the deflated static
+    weight; §2.4b's merge target must be a genuine finite-lambda cluster.
+    """
+    scale = max(_frobenius_norm(M_total), np.finfo(np.float64).tiny)
+    return [
+        index for index in range(int(M.shape[0]))
+        if _frobenius_norm(M[index]) / scale > SUM_RULE_REL_TOL
+    ]
+
+
+def _merge_zero_mode(M, V, M_total, V_total, m_closure, v_closure, order):
+    """§2.4b deflation-merge, applied before the two-moment match.
+
+    The dichotomy is codified here and nowhere else: an open ``M`` closure is
+    a missed *finite*-lambda mode and refuses; a closed ``M`` closure with a
+    nonzero ``D_V`` is the machine-zero screened mode's static weight, which
+    the sum rule defines with no free parameter.
+    """
+    if m_closure > SUM_RULE_REL_TOL:
+        raise ValueError(
+            "GATE intraband_contour_sum_rule: the asymptotic closure is open "
+            f"(||D_M||/||M_total||={m_closure:.6e} > "
+            f"{SUM_RULE_REL_TOL:.1e}) at quadrature order {order}.  A missed "
+            "finite-lambda mode carries asymptotic weight, so it can never "
+            "masquerade as zero-mode static weight; the static deficiency "
+            f"(||D_V||/||V_total||={v_closure:.6e}) is NOT merged.  Fix the "
+            "contour tiling.")
+
+    D_V = V_total - jnp.sum(V, axis=0)
+    candidates = _finite_lambda_clusters(M, M_total)
+    if not candidates:
+        raise ValueError(
+            "GATE intraband_zero_mode_merge: no finite-lambda cluster exists "
+            "to receive the deflated zero-mode static weight "
+            f"(||D_V||/||V_total||={v_closure:.6e}); every contour is "
+            "asymptotically dark.")
+    before = _representative_omega(M, V)
+    target = min(candidates, key=lambda index: abs(before[index]))
+
+    index_axis = jnp.arange(int(V.shape[0]))[:, None, None]
+    merged = jnp.where(index_axis == target, V + D_V[None, :, :], V)
+    merged = jax.lax.with_sharding_constraint(merged, V.sharding)
+    after = _representative_omega(M, merged)
+    reference = max(abs(before[target]), np.finfo(np.float64).tiny)
+    pole_shift = float(abs(after[target] - before[target]) / reference)
+
+    v_after = _relative_error(jnp.sum(merged, axis=0), V_total)
+    m_after = _relative_error(jnp.sum(M, axis=0), M_total)
+    if jax.process_index() == 0:
+        print(
+            "[intraband-zero-mode] "
+            f"merge_cluster={target} n_clusters={int(V.shape[0])} "
+            f"zero_mode_weight={v_closure:.6e} "
+            f"omega_c1_before={abs(before[target]):.6e} "
+            f"omega_c1_after={abs(after[target]):.6e} "
+            f"pole_shift_rel={pole_shift:.6e} "
+            f"post_merge_Sigma_M_rel={m_after:.6e} "
+            f"post_merge_Sigma_V_rel={v_after:.6e}",
+            flush=True,
+        )
+    if m_after > SUM_RULE_REL_TOL or v_after > SUM_RULE_REL_TOL:
+        raise ValueError(
+            "GATE intraband_contour_sum_rule: post-merge closure is not an "
+            f"identity: Sigma_M_rel={m_after:.6e}, Sigma_V_rel={v_after:.6e}, "
+            f"tolerance={SUM_RULE_REL_TOL:.1e}")
+    return merged, ClusterClosure(
+        quadrature_order=int(order),
+        m_closure=float(m_closure),
+        v_closure_before_merge=float(v_closure),
+        v_closure_after_merge=float(v_after),
+        zero_mode_weight=float(v_closure),
+        zero_mode_cluster=int(target),
+        zero_mode_pole_shift=pole_shift,
+    )
+
+
 def _cluster_moment_matrices(
         pair_block, W0bar, intervals, *, moment_rel_tol=MOMENT_REL_TOL):
-    """Contour M/V/T1/T2 with mandatory movement and sum-rule refusals."""
+    """Contour M/V/T1/T2 with mandatory movement and sum-rule refusals.
+
+    Returns ``(M, V, T1, T2, closure)``.  ``V`` already carries the §2.4b
+    deflation merge, so both sum rules hold as exact identities on the
+    returned moments.
+    """
     intervals = tuple((float(lo), float(hi)) for lo, hi in intervals)
     if not intervals or any(not lo < hi for lo, hi in intervals):
         raise ValueError(
@@ -425,6 +561,7 @@ def _cluster_moment_matrices(
 
     M_total, V_total = _exact_moment_totals(pair_block, W0bar)
     previous = None
+    previous_v_closure = None
     movement = np.inf
     m_closure = np.inf
     v_closure = np.inf
@@ -472,11 +609,31 @@ def _cluster_moment_matrices(
                 f"Sigma_V_rel={v_closure:.6e}",
                 flush=True,
             )
-        if (movement <= float(moment_rel_tol)
-                and m_closure <= SUM_RULE_REL_TOL
-                and v_closure <= SUM_RULE_REL_TOL):
-            return current
+        # A machine-zero screened mode leaves a static deficit that no
+        # refinement removes (claim 0319: 3.277321e-3 at orders 16 and 32).
+        # Quadrature error does not behave that way, so the static closure
+        # stays a convergence criterion until it *plateaus*: only a
+        # refinement-invariant D_V is admitted as zero-mode weight, and a
+        # shrinking one keeps refining to the order-512 refusal.
+        plateaued = (
+            previous_v_closure is not None
+            and abs(v_closure - previous_v_closure)
+            <= _V_PLATEAU_REL_TOL * max(v_closure, previous_v_closure)
+        )
+        # Once the quadrature has converged, what is left is the spectral
+        # domain, not the rule.  Adjudicate the dichotomy here: an open M
+        # closure refuses by name now rather than burning six more orders
+        # into a message that never says why.
+        settled = (m_closure > SUM_RULE_REL_TOL
+                   or v_closure <= SUM_RULE_REL_TOL
+                   or plateaued)
+        if movement <= float(moment_rel_tol) and settled:
+            merged, closure = _merge_zero_mode(
+                current[0], current[1], M_total, V_total,
+                m_closure, v_closure, order)
+            return (current[0], merged, current[2], current[3], closure)
         previous = current
+        previous_v_closure = v_closure
     raise ValueError(
         "GATE intraband_contour_sum_rule: quadrature failed mandatory "
         f"closure at order {_QUADRATURE_ORDERS[-1]}: "
@@ -499,6 +656,21 @@ def _cluster_widths(M, T1, T2):
         mean2 = np.real(second / mass)
         variance = float(mean2 - mean1 * mean1)
         tolerance = 256.0 * np.finfo(np.float64).eps * max(abs(mean2), 1.0)
+        if variance < -tolerance and mean2 < 0.0:
+            # mean zeta < 0 is the overdamped side of the strip: Omega there
+            # is purely imaginary, so the real-Omega trace variance is not an
+            # intrinsic width and its sign carries no information.  Name it
+            # and carry zero rather than refuse on a quantity the retarded
+            # fold will not consume (only near-real roots take a width).
+            if jax.process_index() == 0:
+                print(
+                    "[intraband-cluster-width] overdamped interval "
+                    f"{index}: mean_zeta={mean2:.6e} < 0, trace variance "
+                    f"{variance:.6e} is not a real-Omega width; width=0",
+                    flush=True,
+                )
+            widths.append(0.0)
+            continue
         if variance < -tolerance:
             raise ValueError(
                 "GATE intraband_cluster_width: material negative trace "
@@ -639,7 +811,7 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
     intervals = _initial_intervals(pair_block, W0bar)
     selected = None
     while True:
-        M, V, T1, T2 = _cluster_moment_matrices(
+        M, V, T1, T2, closure = _cluster_moment_matrices(
             pair_block, W0bar, intervals,
             moment_rel_tol=min(MOMENT_REL_TOL, float(sample_rel_tol)))
         Om, Bp, fold_el, drop_el, width = _compress_moments(
@@ -658,19 +830,25 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
             evaluate_pole_sum(Om, Bp, 0.0j), exact_static)
         error = max(errors, default=0.0)
         selected = (Om, Bp, error, static_error,
-                    fold_el, drop_el, width)
+                    fold_el, drop_el, width, closure)
         if error <= float(sample_rel_tol) and static_error <= STATIC_REL_TOL:
             break
-        if int(Om.shape[0]) >= MAX_CLUSTERS:
+        # Empty contours are dropped by the compression, so the stored pole
+        # count can lag the interval count; bound BOTH or the bisection can
+        # run past the store's allocated maximum without ever tripping.
+        if (int(Om.shape[0]) >= MAX_CLUSTERS
+                or len(intervals) >= MAX_CLUSTERS):
             raise ValueError(
                 "GATE intraband_cluster_budget: six contour clusters do not "
                 "meet the fixed block certificate; "
+                f"intervals={len(intervals)}, stored_poles={int(Om.shape[0])}, "
                 f"sample_max_rel={error:.6e}, static_max_rel="
                 f"{static_error:.6e}, allowed_sample={float(sample_rel_tol):.6e}, "
                 f"allowed_static={STATIC_REL_TOL:.6e}")
         intervals = _split_largest_trace_interval(intervals, M, pair_block)
 
-    Om, Bp, error, static_error, fold_el, drop_el, width = selected
+    (Om, Bp, error, static_error,
+     fold_el, drop_el, width, closure) = selected
     n_poles = int(Om.shape[0])
     _print_memory_model(pair_block, W0bar, n_poles)
     return IntrabandRow(
@@ -686,6 +864,9 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
         folded_elements=int(fold_el),
         dropped_elements=int(drop_el),
         cluster_width_max_ry=float(width),
+        zero_mode_weight=float(closure.zero_mode_weight),
+        zero_mode_cluster=int(closure.zero_mode_cluster),
+        zero_mode_pole_shift=float(closure.zero_mode_pole_shift),
     )
 
 
@@ -711,6 +892,7 @@ def pad_row(row, n_poles):
 
 
 __all__ = [
+    "ClusterClosure",
     "IntrabandRow",
     "MAX_CLUSTERS",
     "MODEL",
