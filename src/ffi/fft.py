@@ -693,7 +693,12 @@ def make_conv_klead_ffi(
                 f"conv_klead T/W shard shapes disagree: {t_local.shape} vs "
                 f"{w_local.shape}.")
         out_t = jax.ShapeDtypeStruct(t_local.shape, t_local.dtype)
-        return jax.ffi.ffi_call(CONV_KLEAD_TARGET, out_t)(
+        # Safe in-place: each block loads all k values for its disjoint row
+        # set into shared memory before any output store; no block later reads
+        # another row.
+        return jax.ffi.ffi_call(
+            CONV_KLEAD_TARGET, out_t, input_output_aliases={0: 0},
+        )(
             t_local, w_local, **attrs)
 
     from common.shard_map import shard_map
