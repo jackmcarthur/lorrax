@@ -1116,6 +1116,36 @@ def build_bse_ring_matvec_full(
         for that A/B and for any bisection.  If the sign/convention forks move
         ``_antiresonant_row``, that cell goes RED rather than the two rows
         drifting silently.
+
+        TWO -> ONE WAS TRIED AND IS REFUTED.  The obvious next step is to stack
+        the two surviving applications: they are INDEPENDENT operands of the
+        SAME operator (same ``psi``, same ``W_R``, different ``T``), XLA
+        schedules them strictly serially under every flag, and
+        ``apply_W_from_T`` is row-count-agnostic on both arms — so
+        ``jnp.concatenate([T_res, T_anti], axis=0)``, ONE application, and two
+        slices back is a legal and bit-identical rewrite.  MEASURED on the
+        gnppm fixture (n_rmu 399, 3x3x1, nspinor 2; one A100, BFC; in-process
+        A/B, and the build order swapped as a control):
+
+            arm                     nb=1              nb=4
+            XLA chain           +1.7 % faster     +0.6 % faster
+            FUSED k-minor       -15 %  SLOWER     -11 %  SLOWER
+
+        Both arms agree BIT-EXACTLY with the unstacked path (rel 0.0e+00), so
+        this is a scheduling result and not a numerics one.  The sign flips
+        because of what consumes ``T``: the XLA chain's first op is a
+        reshape/FFT that XLA fuses the ``concatenate`` INTO (peak unchanged),
+        while the fused kernel is a CUSTOM CALL, whose operand must be
+        materialized — the concatenate becomes a real copy of the doubled
+        tile, measured as +152 MiB peak at nb=1 (788.0 vs 636.1) and +0.44
+        ms/col, i.e. about two HBM passes over the pair.  Since ``auto`` (the
+        kernel) is the default and the faster arm, a win on the slower arm
+        does not pay for a 15 % loss on the default one, and the stacking is
+        NOT taken.  Evidence:
+        ``reports/screening_diagrams_wbse/evidence/rung_pair_batch/``.
+        The general lesson, which outlives this rung: batching operands across
+        a fused custom call has to pay for materializing the batched operand,
+        and only an arm whose first consumer is fusable gets that for free.
         """
         X, Y = X_full[0], X_full[1]
         DX = apply_D_term(X, eps_c, eps_v)
