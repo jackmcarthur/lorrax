@@ -853,8 +853,11 @@ def compute_sigma_c_ppm_omega_grid(
 
     s = wfns.slices
     if plan is None:
-        plan = trivial_plan(int(s.nb_full), int(s.b2 - s.b0),
-                            int(meta.b_id_4_user or s.b4) - int(s.b0))
+        # The Σ count, not the loaded extent — see the comment at the
+        # ``plan_band_brackets`` call in ``ppm_pipeline`` for why these are
+        # different numbers on a split deck and the same one otherwise.
+        plan = trivial_plan(int(s.nb_sigma_sum), int(s.b2 - s.b0),
+                            int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
     brackets = plan.bounds
     n_brk = plan.n_brackets
     psi_proj_xr = wfns.xr(s.sigma)
