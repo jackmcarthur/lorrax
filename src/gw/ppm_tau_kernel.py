@@ -461,8 +461,26 @@ def _get_sigma_kij_kernel(
                  E_A, mask_A, W_prep, prev) = jax.lax.optimization_barrier(
                     (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                      E_A, mask_A, W_prep, prev))
+            # ``mask_A[..., lo:hi]``, NOT ``mask_A[:, lo:hi]``.  The band axis
+            # is the LAST one on this array and only sometimes the second:
+            # the occupancy mask arrives as ``(nk, nb)`` on a 2x2 processor
+            # mesh, which squeezes the leading nspin axis, and as
+            # ``(1, nk, nb)`` on a 1x1 mesh, which does not.  ``[:, lo:hi]``
+            # is the band axis in the first case and cuts *nk* in the second,
+            # so a 1x1-mesh run died in ``build_G_tau``'s shape normalisation
+            # with ``cannot reshape (1, 9, 52) into (9, 42)`` (MoS2 gnppm,
+            # 3 brackets) and ``(1, 20, 20) -> (64, 20)`` (Si, ONE bracket —
+            # so this was never specific to the extrapolation; the trivial
+            # single-bracket plan hits it too, which made it a defect in the
+            # DEFAULT path).  Ellipsis indexing is correct at either rank.
+            # ``psi_coh_yr`` and ``E_A`` keep ``[:, lo:hi]`` because their
+            # band axis really is axis 1 at every rank they are built with.
+            # ``greens_function_kernel.build_G_tau``'s reshape-to-``enk``
+            # workaround still runs and is now redundant rather than
+            # load-bearing: it could not save this path anyway, because it
+            # runs AFTER the slice that corrupted the array.
             G_k = build_g(psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
-                          E_A[:, lo:hi], mask_A[:, lo:hi], E_ref_A, t_node)
+                          E_A[:, lo:hi], mask_A[..., lo:hi], E_ref_A, t_node)
             prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
@@ -519,9 +537,16 @@ def _get_sigma_kij_kernel(
         # fortiori.  Walltime is NOT comparable to the fused path.
         outs = []
         for lo, hi in brackets:
+            # ``[..., lo:hi]`` for the same reason as the fused path above —
+            # this is the SECOND copy of that slice and it carried the same
+            # defect.  The registered issue named only the fused one
+            # (``ppm_tau_kernel.py:465``), so a fix applied there alone would
+            # have left every ``LORRAX_SIGMA_STAGE_TIMING`` run on a 1x1 mesh
+            # still broken, and broken in the mode an operator reaches for
+            # precisely when they are already debugging.
             G_k = _build_g_timed(
                 psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
-                E_A[:, lo:hi], mask_A[:, lo:hi], E_ref_A, t_node)
+                E_A[:, lo:hi], mask_A[..., lo:hi], E_ref_A, t_node)
             outs.append(spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep))
         return _stack_channels(outs, mesh_xy)
