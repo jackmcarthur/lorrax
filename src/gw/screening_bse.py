@@ -455,6 +455,44 @@ def _assert_restart_is_loadable(tensors_filename, *, print_fn=print):
 # Stage 1+2: the RPA static leg and its persist
 # ---------------------------------------------------------------------------
 
+def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None):
+    """Run ``_gate_w`` as a non-negotiable ``w_bse`` stage refusal.
+
+    ``common.sanity`` defaults to warn-and-continue because its generic gates
+    also cover legacy paths.  That policy is unsafe here: every ``w_bse`` W is
+    either the ladder kernel's input or the operator Sigma will consume, so a
+    failed invariant would bless known-bad physics with rc=0.  Pin strict only
+    for this stage, regardless of the process-wide ``LORRAX_SANITY`` default,
+    and restore the operator's setting before returning or refusing.
+    """
+    from common import sanity
+
+    previous = os.environ.get("LORRAX_SANITY")
+    os.environ["LORRAX_SANITY"] = "strict"
+    try:
+        _gate_w(W, req, print_fn=print_fn, kgrid=kgrid)
+    except sanity.SanityError as exc:
+        raise ValueError(
+            f"GATE w_bse_w_stage_invariants: screening_diagrams = w_bse "
+            f"refuses a screened-interaction stage that failed _gate_w.\n"
+            f"  got:  {stage}: {exc}\n"
+            f"  want: finite W, q=0 hermiticity residual <= 1e-6, and -- "
+            f"for omega on the imaginary axis -- q<->-q conjugate "
+            f"reciprocity residual <= 1e-5\n"
+            f"  fix:  do not consume or publish this run's downstream "
+            f"artifacts; fix the named W stage and rerun, or use "
+            f"screening_diagrams = w_rpa until the ladder path is repaired\n"
+            f"  why:  this W enters the BSE/Sigma physics directly; warning "
+            f"and continuing would turn a measured invariant violation into "
+            f"plausible rc=0 quasiparticle output\n"
+            f"  doc:  docs/input_reference.md '## Screening', "
+            f"screening_diagrams; docs/dev/QUALITY_PATTERNS.md #7.") from exc
+    finally:
+        if previous is None:
+            os.environ.pop("LORRAX_SANITY", None)
+        else:
+            os.environ["LORRAX_SANITY"] = previous
+
 def prepare_ladder_restart(
     wfns, V_q, *, quad, e_ref, sym, centroid_indices, config, meta, mesh_xy,
     tensors_filename, head_resolver, head_channel=None, print_fn=print,
@@ -503,8 +541,10 @@ def prepare_ladder_restart(
     with timing.section("W.gate", announce=True,
                         label="W[static] (RPA, ladder kernel) "
                               "finiteness + hermiticity gate"):
-        _gate_w(W0_rpa, ScreeningRequest(0.0 + 0.0j, "static"),
-                print_fn=print_fn, kgrid=tuple(meta.kgrid))
+        _gate_w_or_refuse(
+            W0_rpa, ScreeningRequest(0.0 + 0.0j, "static"),
+            stage="RPA input W[static] for the ladder kernel",
+            print_fn=print_fn, kgrid=tuple(meta.kgrid))
 
     with timing.section("gw_jax.persist_w0"):
         persist_w0_and_head(
@@ -796,7 +836,9 @@ def compute_screening_ladder(
         with timing.section("W.gate", announce=True,
                             label=f"W[{req.role}] (ladder) finiteness + "
                                   f"hermiticity gate"):
-            _gate_w(W_q, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
+            _gate_w_or_refuse(
+                W_q, req, stage=f"assembled ladder W[{req.role}]",
+                print_fn=print_fn, kgrid=tuple(meta.kgrid))
         W_by_role[req.role] = W_q
     return W_by_role
 

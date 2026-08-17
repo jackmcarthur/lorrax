@@ -24,6 +24,7 @@ much as imports the ladder helper.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import sys
 
@@ -748,12 +749,61 @@ def test_the_ladder_stage_composes_exactly_the_steps_the_closure_gate_drives():
     src = inspect.getsource(screening_bse.compute_screening_ladder)
     order = [src.index(name) for name in (
         "prepare_ladder_restart(", "_ladder_wedge(",
-        "_assert_wedge_matches_run(", "_assemble_full_bz_w(", "_gate_w(")]
+        "_assert_wedge_matches_run(", "_assemble_full_bz_w(",
+        "_gate_w_or_refuse(")]
     assert order == sorted(order), (
         "compute_screening_ladder no longer calls prepare -> wedge -> "
         "wedge-check -> assemble -> gate in that order; the closure gate "
         "drives the middle three directly and would stop covering the "
         "production composition")
+
+
+@pytest.mark.parametrize("level", [None, "0", "1"])
+def test_w_bse_w_gate_is_a_five_part_refusal_regardless_of_sanity_default(
+        monkeypatch, level):
+    """A broken ladder W cannot inherit sanity's warn/off global policy.
+
+    The three-point q grid makes q=1 and q=2 a +/- pair.  Their unequal
+    real values pass finiteness and q=0 hermiticity, then fail exactly the
+    production reciprocity observable at 5e-1.  ``got`` must preserve that
+    value so the refusal names what failed rather than only saying "bad W".
+    """
+    import numpy as np
+    from gw import screening_bse
+    from gw.screening import ScreeningRequest
+
+    if level is None:
+        monkeypatch.delenv("LORRAX_SANITY", raising=False)
+    else:
+        monkeypatch.setenv("LORRAX_SANITY", level)
+    W = np.asarray([[[1.0]], [[1.0]], [[2.0]]], dtype=np.complex128)
+    with pytest.raises(ValueError) as exc:
+        screening_bse._gate_w_or_refuse(
+            W, ScreeningRequest(0.0 + 0.0j, "static"),
+            stage="assembled ladder W[static]", kgrid=(3, 1, 1),
+            print_fn=lambda *a, **k: None)
+    message = str(exc.value)
+    assert "w_bse_w_stage_invariants" in message
+    for part in ("got:", "want:", "fix:", "why:", "doc:"):
+        assert part in message
+    assert "q<->-q conjugate reciprocity" in message
+    assert "5.000e-01 > 1.0e-05" in message
+    assert os.environ.get("LORRAX_SANITY") == level
+
+
+def test_w_bse_w_gate_restores_sanity_after_a_healthy_stage(monkeypatch):
+    """The stage-local strict pin must not change later global gate policy."""
+    import numpy as np
+    from gw import screening_bse
+    from gw.screening import ScreeningRequest
+
+    monkeypatch.setenv("LORRAX_SANITY", "off")
+    W = np.ones((3, 1, 1), dtype=np.complex128)
+    screening_bse._gate_w_or_refuse(
+        W, ScreeningRequest(0.0 + 0.0j, "static"),
+        stage="healthy scalar ladder W[static]", kgrid=(3, 1, 1),
+        print_fn=lambda *a, **k: None)
+    assert os.environ["LORRAX_SANITY"] == "off"
 
 
 def test_the_z_list_comes_from_the_role_plan_and_not_a_second_table():
