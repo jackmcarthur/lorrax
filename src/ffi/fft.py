@@ -668,8 +668,10 @@ def make_conv_klead_ffi(
     Returns ``fn(T, W) -> U`` for public ``T/U (nk,a,mx,b,my)`` and
     ``W (nk,mx,my)``.  T, W and U remain k-leading across the call.  The CUDA
     handler executes both inverse transforms, the broadcast multiply, the
-    forward transform, and all norms, and its store emits U k-leading.  There
-    is no global transpose on either side.
+    forward transform, and all norms, and its store emits U k-leading.  The
+    handler reads each disjoint T row fully into shared memory before writing
+    the corresponding U row, so T aliases U and no second full-size buffer is
+    allocated.  There is no global transpose on either side.
     """
     require_conv_klead(mesh)
     nkx, nky, nkz = (int(v) for v in kgrid)
@@ -693,8 +695,9 @@ def make_conv_klead_ffi(
                 f"conv_klead T/W shard shapes disagree: {t_local.shape} vs "
                 f"{w_local.shape}.")
         out_t = jax.ShapeDtypeStruct(t_local.shape, t_local.dtype)
-        return jax.ffi.ffi_call(CONV_KLEAD_TARGET, out_t)(
-            t_local, w_local, **attrs)
+        return jax.ffi.ffi_call(
+            CONV_KLEAD_TARGET, out_t, input_output_aliases={0: 0},
+        )(t_local, w_local, **attrs)
 
     from common.shard_map import shard_map
     _sm = shard_map(

@@ -57,14 +57,14 @@ def test_loader_and_isolated_build_target_are_registered():
     assert "$<TARGET_OBJECTS:build_conv_klead_cuda>" in cmake
 
 
-def test_zero_transpose_path_passes_native_kleading_t_directly():
+def test_zero_transpose_path_passes_and_aliases_native_kleading_t_directly():
     root = Path(__file__).resolve().parents[1]
     text = (root / "src/ffi/fft.py").read_text()
     body = text.split("def make_conv_klead_ffi(", 1)[1].split(
         "# ===========================================================================", 1)[0]
     assert "jnp.moveaxis(" not in body
     assert "t_local, w_local, **attrs" in body
-    assert "input_output_aliases" not in body
+    assert "input_output_aliases={0: 0}" in body
 
 
 def test_dial_is_in_both_cross_rank_registries():
