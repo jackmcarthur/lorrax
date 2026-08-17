@@ -24,8 +24,8 @@ directory the repo already keeps such gates in.
 
 WHAT IT ASSERTS, on every rank, on every addressable shard:
 
-  1. ``cumsum(3 brackets, axis=0)[-1] == 1 full-band bracket`` to 1e-12
-     relative — the partition claim, both channel plans;
+  1. ``cumsum(live BandBracketPlan, axis=0)[-1] == 1 full-band bracket``
+     to 1e-12 relative — the partition claim, both channel plans;
   2. the single-bracket kernel is BIT-IDENTICAL (``max|Δ| == 0``) to the
      un-bracketed ``brackets=None`` kernel MPA still uses — the default-path
      claim, at the shape where a sharding drift would show;
@@ -75,6 +75,7 @@ def main() -> None:
               f"devices={n_dev} mesh=2x2 platform={jax.devices()[0].platform}",
               flush=True)
 
+    from gw.band_extrapolation import plan_band_brackets
     from gw.ppm_tau_kernel import _get_sigma_kij_kernel, _get_sigma_tau_kernel
     from common.collectives import device_put_process_local
 
@@ -93,7 +94,8 @@ def main() -> None:
     psi_yr = put(c(nk, nb, 1, n_mu), P(None, None, None, 'y'))
     psi_xr = put(c(nk, m, 1, n_mu), P(None, None, None, 'x'))
     psi_yn = put(c(nk, 1, n_mu, m), P(None, None, 'y', None))
-    E_A = put(np.abs(rng.standard_normal((nk, nb))), P(None, None))
+    energies = np.tile(np.linspace(-1.0, 2.0, nb), (nk, 1))
+    E_A = put(energies, P(None, None))
     mask_A = jnp.asarray(rng.random((nk, nb)) > 0.3)
     B_q = put(c(nk, n_mu, n_mu), P(None, 'x', 'y'))
     Omega_q = put(np.abs(rng.standard_normal((nk, n_mu, n_mu))) + 0.1,
@@ -107,7 +109,10 @@ def main() -> None:
                 jnp.asarray(0.25, dtype=jnp.float64),
                 jnp.asarray(0.10, dtype=jnp.float64),
                 jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128))
-    brk3 = ((0, 5), (5, 9), (9, nb))
+    plan3 = plan_band_brackets(
+        enabled=True, enk_ry=energies, n_occ=3,
+        nb_logical=nb, nb_padded=nb)
+    brk3 = plan3.bounds
 
     # ---- 1 + 3: partition, both channel plans, per addressable shard -----
     for merged_x in (True, False):

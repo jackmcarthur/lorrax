@@ -151,6 +151,36 @@ def test_brackets_partition_the_band_sum(merged_x):
             f"The brackets do not partition the band sum.")
 
 
+@pytest.mark.parametrize("merged_x", [True, False])
+def test_four_uneven_planned_brackets_partition_the_band_sum(merged_x):
+    """A future fourth bracket is count/width agnostic in the kernel.
+
+    The deliberately uneven 50/25/12.5/12.5 split is produced by the planner,
+    not copied into the kernel call as hand-written bounds.
+    """
+    mesh = _mesh_1x1()
+    nk, nb = 8, 16
+    op = _operands(mesh, nk=nk, nb=nb)
+    energies = np.tile(np.linspace(-1.0, 2.0, nb), (nk, 1))
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=energies, n_occ=4,
+        nb_logical=nb, nb_padded=nb,
+        fractions=(0.50, 0.75, 0.875))
+    assert plan.n_brackets == 4
+    assert tuple(hi - lo for lo, hi in plan.bounds) == (8, 4, 2, 2)
+
+    one = _run_tau(mesh, op, ((0, nb),), merged_x=merged_x)
+    four = _run_tau(mesh, op, plan.bounds, merged_x=merged_x)
+    chans_one = (one,) if merged_x else one
+    chans_four = (four,) if merged_x else four
+    for c1, c4 in zip(chans_one, chans_four):
+        assert c4.shape[0] == 4
+        total = np.cumsum(c4, axis=0)[-1]
+        scale = max(float(np.max(np.abs(c1[0]))), 1e-300)
+        err = float(np.max(np.abs(total - c1[0]))) / scale
+        assert err < 1e-12, err
+
+
 def test_single_bracket_is_bit_identical_to_the_full_band_kernel():
     """The length-1 leading axis must not perturb a single bit.
 
