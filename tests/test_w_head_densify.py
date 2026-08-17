@@ -80,9 +80,13 @@ def _build(geom, cg, fg, S=_S_ISO, *, gamma_cell="fine", whead=_WHEAD,
            ref_grid=None):
     ref_grid = tuple(ref_grid or cg)
     gamma_ref = gamma_cell_head_scalar(geom, ref_grid, S)
+    # ``sys_dim=3`` EXPLICITLY.  Every cell in this file is about the bulk
+    # pole, and since 2026-08-17 omitting the argument is a refusal rather
+    # than a silent bulk-3D assumption — see
+    # ``test_an_unstamped_sys_dim_is_refused_not_defaulted_to_bulk``.
     return build_fine_head_scalars(
         geom, cg, fg, S, head_ref=whead, gamma_ref=gamma_ref,
-        ref_grid=ref_grid, gamma_cell=gamma_cell), gamma_ref
+        ref_grid=ref_grid, sys_dim=3, gamma_cell=gamma_cell), gamma_ref
 
 
 # ===========================================================================
@@ -308,7 +312,7 @@ def test_a_broken_partition_is_refused_not_absorbed():
         with pytest.raises(AssertionError, match="fundamental domain"):
             hd.build_fine_head_scalars(
                 geom, cg, fg, _S_ISO, head_ref=_WHEAD, gamma_ref=gamma_ref,
-                ref_grid=cg)
+                ref_grid=cg, sys_dim=3)
     finally:
         hd.coarse_gamma_cell_weights = good
 
@@ -513,6 +517,82 @@ def test_the_slab_is_refused_by_name_not_run_with_the_bulk_pole():
                                 gamma_ref=gamma_ref, ref_grid=cg, sys_dim=2)
 
 
+def test_an_unstamped_sys_dim_is_refused_not_defaulted_to_bulk():
+    """``sys_dim=None`` REFUSES.  This is the cell that keeps the escape shut.
+
+    The refusal above could not fire on either shipping path until
+    2026-08-17, and the reason was one line here: ``_refuse_non_bulk``
+    returned on ``None``, and ``Meta`` has no ``sys_dim`` field for
+    ``bse.bse_densify.build_w_head_channel``'s ``getattr(meta, "sys_dim",
+    None)`` to find.  So a ``sys_dim = 2`` deck with ``bse_k_grid``
+    densification and the default ``w_head_densify = c1`` re-attached
+    ``8π/|q|²`` — with no exception, no warning, and a confident provenance
+    ratio in the log — and the error GREW as the fine grid densified.
+
+    Two arms, because the escape has two ends: the guard itself, and the
+    caller that feeds it.
+    """
+    geom = _geom("fcc")
+    cg, fg = (2, 2, 2), (4, 4, 4)
+    gamma_ref = gamma_cell_head_scalar(geom, cg, _S_ISO)
+
+    # (a) THE GUARD.  Omitting the keyword is an error, not a request for 3D.
+    with pytest.raises(ValueError, match="sys_dim was not supplied"):
+        build_fine_head_scalars(geom, cg, fg, _S_ISO, head_ref=_WHEAD,
+                                gamma_ref=gamma_ref, ref_grid=cg,
+                                sys_dim=None)
+
+    # (b) THE CALLER.  A Meta with no stamp is refused BEFORE the S tensor is
+    # resolved and before the 2.6M-sample Γ-cell integral, so the message is
+    # about dimensionality rather than about a missing dipole.h5.  ``wfn`` /
+    # ``sym`` are None on purpose: reaching them at all would mean the check
+    # ran too late.
+    import types
+    from bse.bse_densify import build_w_head_channel
+    with pytest.raises(ValueError, match="carries no ``sys_dim``"):
+        build_w_head_channel(
+            None, None, types.SimpleNamespace(), {},
+            coarse_grid=cg, fine_grid=fg, whead=_WHEAD, ref_grid=cg,
+            input_file=None, restart_file=None, log_fn=lambda *a, **k: None)
+
+
+def test_the_bse_meta_is_stamped_with_the_decks_sys_dim():
+    """RED TWIN for the OTHER end: ``htransform.initialize_wfns`` must stamp it.
+
+    That function builds the only ``Meta`` on the bandstructure/BSE lane —
+    the one ``bse.bse_densify``'s ``bse_k_grid`` leg, ``bse.exciton_bands``'
+    ``--w-coarse-grid`` leg and ``bse.vq_interp.refit_prepare`` all hold — so
+    if the stamp goes away the refusal above starts firing on WORKING 3D
+    decks and someone will reach for a default.  Read as TEXT: importing
+    ``bandstructure.htransform`` pulls the FFI gate in, and this cell has no
+    business needing a built ``.so`` to read an assignment.
+    """
+    import ast
+    import os as _os
+    from bse import bse_densify
+
+    src_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(bse_densify.__file__))),
+        "bandstructure", "htransform.py")
+    fn = next(n for n in ast.walk(ast.parse(open(src_path).read()))
+              if isinstance(n, ast.FunctionDef) and n.name == "initialize_wfns")
+
+    stamps = [n for n in ast.walk(fn)
+              if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Attribute) and t.attr == "sys_dim"
+                      for t in n.targets)]
+    assert stamps, (
+        "initialize_wfns no longer stamps ``sys_dim`` on the Meta it builds; "
+        "gw.head_densify's bulk-3D refusal then sees None on every BSE "
+        "densification and cannot decide anything")
+
+    # and it comes from the DECK, not from a literal
+    src = ast.unparse(stamps[0].value)
+    assert "params" in src and "sys_dim" in src, (
+        f"the sys_dim stamp is {src!r} — it must read the deck's key, not "
+        f"invent a dimensionality")
+
+
 def test_the_pointwise_head_refuses_q_equals_zero():
     """There is no pointwise value at Γ — the object there is an integral."""
     with pytest.raises(ValueError, match="cell average|CELL AVERAGE"):
@@ -535,7 +615,7 @@ def test_the_grids_must_nest():
     with pytest.raises(ValueError, match="positive multiple"):
         build_fine_head_scalars(geom, (3, 3, 3), (4, 4, 4), _S_ISO,
                                 head_ref=_WHEAD, gamma_ref=gamma_ref,
-                                ref_grid=(3, 3, 3))
+                                ref_grid=(3, 3, 3), sys_dim=3)
 
 
 # ---------------------------------------------------------------------------

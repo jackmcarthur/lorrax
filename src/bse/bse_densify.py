@@ -334,10 +334,12 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     wfn, sym, meta : loader / symmetry table / system parameters
         ``wfn`` supplies the Coulomb geometry (``blat·bvec`` rows and Ω) via
         :meth:`vcoul.CoulombGeometry.from_wfn`; ``meta.sys_dim`` gates the
-        bulk-3D-only refusal; ``sym`` is read only by the ``dipole.h5``
-        fallback route for ``S_cart`` (a restart that carries
+        bulk-3D-only refusal and is REQUIRED — a Meta without it is refused,
+        not assumed bulk (see the body); ``sym`` is read only by the
+        ``dipole.h5`` fallback route for ``S_cart`` (a restart that carries
         ``S_cart_head`` never touches it).  Both densification call sites
-        already hold all three from their htransform leg.
+        already hold all three from their htransform leg, which is also where
+        the ``sys_dim`` stamp is put on.
     params : dict
         Deck keys.  ``head_minibz_average`` must match the GW run — it selects
         the Baldereschi-Tosatti analytic-sphere branch of the estimator.
@@ -359,6 +361,35 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     from vcoul import CoulombGeometry
 
     params = params or {}
+
+    # ── DIMENSIONALITY FIRST, before the S tensor and before the 2.6M-sample
+    # Γ-cell integral: a slab deck must hear "this stage is bulk-3D only",
+    # not "your dipole.h5 is missing".
+    #
+    # ``Meta`` has no ``sys_dim`` field — it is STAMPED on the two Metas the
+    # tree builds, by ``gw.gw_jax.main`` and by
+    # ``bandstructure.htransform.initialize_wfns`` (which is the one BOTH
+    # shipping densification paths hold: the ``bse_k_grid`` bundle leg below
+    # and ``bse.exciton_bands``' ``--w-coarse-grid`` leg).  Until 2026-08-17
+    # this read ``getattr(meta, "sys_dim", None)`` into a guard that RETURNED
+    # on ``None``, and htransform did not stamp: so the bulk-3D refusal could
+    # not fire on either path, and a ``sys_dim = 2`` deck re-attached
+    # ``8π/|q|²`` — the untruncated 3D pole — where the true 2D head goes as
+    # ``8π·z_c/|q_∥|``.  That error has no fixed size: it GROWS as the fine
+    # grid densifies, which is the one thing a densification is for.
+    sys_dim = getattr(meta, "sys_dim", None)
+    if sys_dim is None:
+        raise ValueError(
+            "w_head_densify = c1: the Meta handed to "
+            "bse.bse_densify.build_w_head_channel carries no ``sys_dim``, so "
+            "gw.head_densify cannot tell a bulk deck from a slab and would "
+            "run the 3D pole on both.  ``Meta`` has no sys_dim field; it is "
+            "stamped, by gw.gw_jax.main on the GW driver's Meta and by "
+            "bandstructure.htransform.initialize_wfns on this caller's.  A "
+            "Meta arriving here without it was built by a third site, and "
+            "that site is the fix — do not default it to 3 here.")
+    head_densify._refuse_non_bulk(sys_dim)
+
     S_cart, prov = resolve_head_S_cart(
         restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
         params=params, print_fn=log_fn)
@@ -383,7 +414,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     S_fine = head_densify.build_fine_head_scalars(
         geom, coarse_grid, fine_grid, S_cart,
         head_ref=float(whead), gamma_ref=gamma_ref, ref_grid=ref_grid,
-        sys_dim=getattr(meta, "sys_dim", None),
+        sys_dim=sys_dim,
         analytic_sphere=analytic_sphere, gamma_cell=gamma_cell)
 
     # THE SUM RULE, reported on the deck.  The head channel's zone average is

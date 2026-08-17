@@ -47,6 +47,19 @@ wfn_file = WFN.h5
 bare_coulomb_cutoff = 30.0
 """
 
+# THE SAME DECK ON THE ``legacy`` HEAD ARM, and why three cells below need it.
+#
+# This fixture is MoS2: ``sys_dim = 2``.  The default ``w_head_densify = c1``
+# re-attaches W's Γ head analytically per fine q from ``gw.head_densify``,
+# whose integrand is the BULK pole ``8π/|q|²`` — and since 2026-08-17 that
+# stage REFUSES a slab instead of running the 3D expression on it (the 2D head
+# is a ``|q|`` cusp, so the error grew without bound as the fine grid
+# densified).  The three densifying cells below gate ψ/ε/V_q0/W SHAPES and the
+# exchange tile, none of which is the head channel, so they run the documented
+# ``legacy`` arm and stay exactly as informative as they were.  The refusal
+# itself is gated by ``test_the_slab_refuses_the_bulk_head_rather_than_running_it``.
+_KG_INPUT_LEGACY = _KG_INPUT + "w_head_densify = legacy\n"
+
 
 def test_parse_grid_spec():
     from bse.bse_io import _parse_grid_spec
@@ -70,6 +83,7 @@ def _make_run(tmp_path):
     os.symlink(f"{FXDIR}/WFN.h5", run / "WFN.h5")
     os.symlink(f"{FXDIR}/centroids_frac_640.txt", run / "centroids_frac_640.txt")
     (run / "cohsex_kg.in").write_text(_KG_INPUT)
+    (run / "cohsex_kg_legacy.in").write_text(_KG_INPUT_LEGACY)
     return run
 
 
@@ -123,7 +137,7 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
 
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
-    inp = run / "cohsex_kg.in"
+    inp = run / "cohsex_kg_legacy.in"          # slab: see _KG_INPUT_LEGACY
     mesh_xy = _create_mesh_xy(1, 1)
     d0 = _load(restart, inp, mesh_xy, None)
     df = _load(restart, inp, mesh_xy, (6, 6, 1))
@@ -161,6 +175,37 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
     assert np.all(np.isfinite(evs))
     assert np.all(np.diff(evs) >= -1e-6)               # ascending
     assert evs[0] > 0.0                                # bound state above zero
+
+
+@needs_mos2_fixture
+@pytest.mark.gpu
+def test_the_slab_refuses_the_bulk_head_rather_than_running_it(tmp_path):
+    """A ``sys_dim = 2`` deck + ``bse_k_grid`` + the DEFAULT head arm REFUSES.
+
+    This is the shipping configuration the defect lived in, on a real slab
+    fixture: MoS2 3×3×1 densified to 6×6×1 with ``w_head_densify`` unset, so
+    it resolves to ``c1``.  Before 2026-08-17 this computed — it re-attached
+    the untruncated 3D pole ``8π/|q|²`` at every fine q inside the coarse Γ
+    cell, where the true 2D head goes as ``8π·z_c/|q_∥|``, and printed a
+    provenance ratio saying the head matched.  Nothing raised, and the error
+    grew as the fine grid densified.
+
+    Two things had to be true for that: ``Meta`` has no ``sys_dim`` field and
+    ``bandstructure.htransform.initialize_wfns`` did not stamp one, and
+    ``gw.head_densify._refuse_non_bulk`` returned on ``None``.  Both are
+    fixed; this cell is the end-to-end statement that the refusal now reaches
+    the deck.
+    """
+    harness.skip_unless_gpu(pytest)
+    from bse.bse_w_exact import _create_mesh_xy
+    run = _make_run(tmp_path)
+    restart = str(run / "tmp" / "isdf_tensors_640.h5")
+    inp = run / "cohsex_kg.in"                 # w_head_densify unset → c1
+    assert "w_head_densify" not in inp.read_text()
+    assert "sys_dim = 2" in inp.read_text()
+    mesh_xy = _create_mesh_xy(1, 1)
+    with pytest.raises(NotImplementedError, match="SLAB_2D"):
+        _load(restart, inp, mesh_xy, (6, 6, 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,8 +278,8 @@ def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
     from bse.bse_w_exact import _create_mesh_xy
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
-    inp = run / "cohsex_kg.in"
-    assert "head_minibz_average" not in (run / "cohsex_kg.in").read_text()
+    inp = run / "cohsex_kg_legacy.in"          # slab: see _KG_INPUT_LEGACY
+    assert "head_minibz_average" not in inp.read_text()
     mesh_xy = _create_mesh_xy(1, 1)
     d0 = _load(restart, inp, mesh_xy, None)          # coarse 3×3×1
     df = _load(restart, inp, mesh_xy, (6, 6, 1))     # densified 6×6×1
@@ -267,7 +312,7 @@ def test_densify_optin_matches_prefix_construction(tmp_path):
 
     run = _make_run(tmp_path)
     inp = run / "cohsex_on.in"
-    inp.write_text(_KG_INPUT + "head_minibz_average = true\n")
+    inp.write_text(_KG_INPUT_LEGACY + "head_minibz_average = true\n")
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     mesh_xy = _create_mesh_xy(1, 1)
     d0 = _load(restart, inp, mesh_xy, None)

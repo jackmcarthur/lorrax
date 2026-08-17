@@ -1317,6 +1317,38 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                f"for is interior to fH.")
     bispinor = bool(params.get("bispinor", False))
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
+    # ``sys_dim`` IS A DECK KEY AND ``Meta`` HAS NO FIELD FOR IT.  The GW
+    # driver stamps it on the Meta it builds (``gw_jax.main``:
+    # ``meta.sys_dim = config.sys_dim``) and every dimension-aware consumer
+    # reads ``meta.sys_dim`` off that stamp.  This is the OTHER Meta in the
+    # tree — the one the bandstructure driver, ``bse.bse_densify``'s
+    # ``bse_k_grid`` densification, ``bse.exciton_bands``' ``--w-coarse-grid``
+    # leg and ``bse.vq_interp.refit_prepare`` all use — so it is stamped here,
+    # from the same key, once, rather than at each of those four call sites.
+    #
+    # WITHOUT THIS the stamp was simply absent, and every consumer that reads
+    # it defensively fell back to bulk 3D: ``gw.coulomb.get_kernel(None)``
+    # returns ``Bulk3D``, and ``gw.head_densify._refuse_non_bulk(None)``
+    # returned without deciding anything.  The second one was the expensive
+    # case — on a slab deck the C1 head channel re-attached ``8π/|q|²``, the
+    # untruncated 3D pole, where the true 2D head goes as ``8π·z_c/|q_∥|``,
+    # and the error GROWS as the fine grid densifies.  See
+    # ``gw.head_densify.build_fine_head_scalars`` and
+    # ``bse.bse_densify.build_w_head_channel``.
+    #
+    # ``read_lorrax_input`` resolves ``sys_dim`` from ``gw_config._DEFAULTS``
+    # for every deck, so the key is present on every real caller; a params
+    # dict assembled by hand and missing it is refused rather than defaulted,
+    # because a default here is exactly the silent 3D assumption above.
+    if "sys_dim" not in params:
+        raise KeyError(
+            "initialize_wfns: params carries no 'sys_dim', so the Meta this "
+            "builds cannot be stamped with the deck's dimensionality and "
+            "every dimension-aware consumer downstream would silently assume "
+            "bulk 3D.  Build params with gw.gw_config.read_lorrax_input (it "
+            "fills the key from _DEFAULTS for every deck), or set it "
+            "explicitly.  Do NOT default it here.")
+    meta.sys_dim = int(params["sys_dim"])
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
 
     # Optionally override energies with EQP values from a file only if explicitly requested via CLI

@@ -493,11 +493,14 @@ def build_fine_head_scalars(
           to be checked, it is the identity the harness needs to be honest:
           the arm that simulates a coarse W must put back the head the fine
           run really had.
-    sys_dim : optional
+    sys_dim : REQUIRED — ``None`` refuses
         Refused unless bulk 3D.  The slab twin is a separate stage: in 2D the
         head is a ``|q|`` cusp rather than a ``1/q²`` pole and the estimator
         is ``slab_2d.q0_average``, so silently running the 3D pole on a slab
-        would be a wrong number with no shape error.
+        would be a wrong number with no shape error.  The keyword keeps its
+        ``None`` default only so the refusal can SAY which site failed to
+        supply it (:func:`_refuse_non_bulk`); omitting it is an error, not a
+        request for bulk 3D.
     analytic_sphere, nsamples, method, qmc_reps
         Passed to :func:`gamma_cell_head_scalar`; must match the GW run.
     gamma_cell : {"fine", "coarse"}
@@ -591,9 +594,33 @@ def build_fine_head_scalars(
 
 
 def _refuse_non_bulk(sys_dim) -> None:
-    """Bulk 3D only, said out loud.  See ``build_fine_head_scalars``."""
+    """Bulk 3D only, said out loud.  See ``build_fine_head_scalars``.
+
+    ``None`` REFUSES.  It used to ``return`` — and that one line made the 2D
+    refusal below unreachable from the only two paths that ship: ``Meta`` has
+    no ``sys_dim`` field, so ``bse.bse_densify.build_w_head_channel``'s
+    ``getattr(meta, "sys_dim", None)`` handed ``None`` for every BSE
+    densification whose Meta nobody had stamped, and a slab deck got the 3D
+    pole with no exception, no warning and a confident provenance ratio in the
+    log.  Both Meta-construction sites now stamp it (``gw.gw_jax.main`` for
+    the GW driver, ``bandstructure.htransform.initialize_wfns`` for the
+    bandstructure/BSE lane), so an absent value can only mean a THIRD site
+    that does not — and the honest answer to "which dimensionality" is a
+    question, not ``3``.
+    """
     if sys_dim is None:
-        return
+        raise ValueError(
+            "head_densify: sys_dim was not supplied, so the bulk-3D-only "
+            "refusal below cannot decide anything and the 3D pole "
+            "v(q) = 8π/|q|² would run on an unknown geometry.  ``Meta`` has "
+            "no sys_dim field: it is STAMPED, by gw.gw_jax.main on the GW "
+            "driver's Meta and by bandstructure.htransform.initialize_wfns on "
+            "the one the bandstructure leg and both BSE densification paths "
+            "(bse.bse_densify's bse_k_grid bundle, bse.exciton_bands' "
+            "--w-coarse-grid) use.  A Meta reaching here without it was built "
+            "by a site that does neither, and that site is the fix — passing "
+            "sys_dim=3 here to make this go away re-opens exactly the escape "
+            "this refusal replaced.")
     from vcoul import SysDim
     try:
         sd = SysDim(int(sys_dim))
