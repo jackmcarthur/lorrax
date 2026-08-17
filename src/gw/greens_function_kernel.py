@@ -109,7 +109,7 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
 
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
-                E_min=None, E_max=None):
+                band_weight=None, E_min=None, E_max=None):
     """G(t)_k(μ, ν) = Σ_n ψ_n(μ) · exp(-t · (e_n - e_ref)) · ψ_n*(ν).
 
     Unified time-evolution G builder shared by χ₀ (imaginary-time) and
@@ -136,12 +136,22 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                                  padded bands break the equivalence.  An
                                  energy-range window must NOT be passed here;
                                  use E_min/E_max, which costs no buffer.
+    band_weight: (nk, nb) real or complex or None.  A physical linear
+                 Green-function weight applied after the phase is formed.
+                 Fractional-response callers use f or 1-f here.  The weight
+                 stays out of windowed_exp_iEt so that helper remains the
+                 fused phase/window primitive.  Weights are never
+                 square-rooted or clipped.
+
 
     Returns (nk, s, μ_X, s, μ_Y) flat-k.  Thin wrapper around ``build_G``
     with phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref),
     optionally further gated by the band-identity ``mask``.
     """
     phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref)
+    if band_weight is not None:
+        band_weight = jnp.reshape(band_weight, enk.shape)
+        phases = phases * band_weight.astype(phases.dtype)
     if mask is not None:
         # mask gates phases per (k, n), so it must share enk's shape.  Some Σ
         # branches deliver it as (1, nk, nb) on a 1×1 processor mesh — the occ

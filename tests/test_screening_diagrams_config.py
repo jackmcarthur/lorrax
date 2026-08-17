@@ -49,6 +49,14 @@ nband = 10
 memory_per_device_gb = 4.0
 """
 
+_METAL_KEYS = """\
+mpa_material_class = metal
+occ_smearing_family = mp1
+occ_smearing_width_ry = 0.02
+fermi_reference = mp1_fixed_n
+sigma_omega_layout = sharded
+"""
+
 
 def _config(tmp_path, extra="", name="screening_diagrams.in"):
     path = tmp_path / name
@@ -117,7 +125,8 @@ def test_the_dataclass_itself_refuses_a_value_off_the_axis():
     """
     with pytest.raises(ValueError) as exc:
         ScreeningConfig(
-            method="minimax", minimax_target_error=1e-6, minimax_max_nodes=64,
+            method="minimax", occ_broadening_ev=0.0,
+            minimax_target_error=1e-6, minimax_max_nodes=64,
             regenerate_minimax_tables=False, minimax_energy_reference="midgap",
             diagrams="w_bse")          # a STRING, not the member
     message = str(exc.value)
@@ -150,7 +159,7 @@ def test_the_default_is_spelled_the_same_in_both_places():
     ("w_bse_head_placement_unimplemented",
      "compute_mode = cohsex\nmc_average_placement = bgw\n"),
     ("w_bse_insulators_only",
-     "compute_mode = cohsex\nmpa_material_class = metal\n"),
+     "compute_mode = cohsex\n" + _METAL_KEYS),
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -196,17 +205,15 @@ def test_the_hl_ppm_refusal_cites_the_known_broadening_discrepancy(tmp_path):
 def test_the_supported_combinations_parse(tmp_path, extra):
     """The other half of a refusal matrix: what it does NOT refuse.
 
-    ``mpa`` is on this list deliberately.  Its Σ stage refuses to run at
-    driver entry for its own reasons; that is a different axis, and
-    ``screening_diagrams`` must not add a second refusal on top of it or
-    the day MPA lands nobody will know which one to delete.
+    ``mpa`` is on this list deliberately: its insulating path is live, and
+    this axis supports the ladder W at the same sample-plan frequencies.
     """
     config = _config(tmp_path, "screening_diagrams = w_bse\n" + extra)
     assert config.screening.diagrams is ScreeningDiagrams.W_BSE
 
 
 def test_w_rpa_decks_are_untouched_by_every_rule(tmp_path):
-    """Not one of the four combinations refuses under the default.
+    """Not one of the refusal-table combinations fires under the default.
 
     The refusal function returns before resolving ``compute_mode`` or
     ``qp_solver`` on a ``w_rpa`` deck, so a default deck cannot acquire a
@@ -217,7 +224,7 @@ def test_w_rpa_decks_are_untouched_by_every_rule(tmp_path):
                   "compute_mode = hl_ppm\n",
                   "compute_mode = cohsex\nqp_solver = self_consistent\n",
                   "compute_mode = cohsex\nmc_average_placement = bgw\n",
-                  "compute_mode = cohsex\nmpa_material_class = metal\n"):
+                  "compute_mode = mpa\n" + _METAL_KEYS):
         config = _config(tmp_path, extra, name="rpa_arm.in")
         assert config.screening.diagrams is ScreeningDiagrams.W_RPA
         refuse_unsupported_screening_diagrams(config)   # must not raise
@@ -226,37 +233,33 @@ def test_w_rpa_decks_are_untouched_by_every_rule(tmp_path):
 def test_a_metal_deck_still_parses_and_runs_under_w_rpa(tmp_path):
     """THE INSULATOR GATE IS SCOPED TO ``w_bse`` AND MUST STAY THERE.
 
-    ``mpa_material_class = metal`` is a legal, live setting on every path
-    that is not this feature — the MPA sample plan builds a metallic
-    double-parallel geometry from it today, and its own evaluator gate
-    (``mpa.model``, ``mpa_metal_evaluator_unavailable``) is the one that
-    decides whether that plan can be consumed.  A screening-diagram axis
-    that started refusing metal decks in general would be answering a
-    question it was not asked, on behalf of a component that already
-    answers it.
+    ``mpa_material_class = metal`` is a legal, live setting on the RPA
+    branch: the metal merge supplies fractional-occupation chi, W and Sigma.
+    A screening-diagram axis that started refusing metal decks in general
+    would break that production path while claiming to guard only the
+    distinct ladder operator.
     """
-    config = _config(tmp_path, "compute_mode = mpa\nmpa_material_class = metal\n")
+    config = _config(tmp_path, "compute_mode = mpa\n" + _METAL_KEYS)
     assert config.screening.diagrams is ScreeningDiagrams.W_RPA
     assert config.mpa.material_class == "metal"
     refuse_unsupported_screening_diagrams(config)       # must not raise
 
 
-def test_the_insulator_refusal_names_the_mpa_metal_gate_it_mirrors(tmp_path):
-    """It refuses for the SAME reason MPA refuses a metallic plan.
+def test_the_insulator_refusal_names_the_live_metal_alternative(tmp_path):
+    """The refusal points a metal deck to the live RPA implementation.
 
-    The shape being copied on purpose: a metallic *geometry* is
-    constructible on both axes (MPA's sample plan; a WFN with partial
-    occupations), and on neither does constructibility mean the
-    occupation-weighted evaluators behind it exist.  Naming the sibling
-    gate is what stops the two from drifting into different stories about
-    the same missing work.
+    The metal merge makes MPA+RPA production-capable; it does not change the
+    ladder's insulator-only derivation.  The diagnostic must state both facts
+    so the new metal capability and the older ladder refusal cannot be read
+    as contradictory global claims.
     """
     with pytest.raises(ValueError) as exc:
         _config(tmp_path,
                 "screening_diagrams = w_bse\ncompute_mode = cohsex\n"
-                "mpa_material_class = metal\n")
+                + _METAL_KEYS)
     message = str(exc.value)
-    assert "mpa_metal_evaluator_unavailable" in message
+    assert "screening_diagrams = w_rpa" in message
+    assert "metallic MPA screening/Sigma pipeline is live" in message
     assert "insulator" in message
 
 
@@ -333,7 +336,7 @@ def test_the_runtime_gate_refuses_a_fractional_occupation_in_the_active_window()
     for part in ("got:", "want:", "fix:", "why:", "doc:"):
         assert part in message, f"runtime refusal is missing '{part}'"
     assert "spin 0, k-point 2, band 3" in message
-    assert "mpa_metal_evaluator_unavailable" in message
+    assert "metallic MPA screening/Sigma pipeline remains available" in message
 
 
 def test_the_runtime_gate_tolerance_separates_noise_from_a_partial_filling():
@@ -521,7 +524,8 @@ def test_mpa_gets_the_ladder_through_the_wc_source_seam_only(
         lambda *a, **k: "LADDER_SOURCE")
     monkeypatch.setattr(
         model, "build_mpa_fit",
-        lambda *a, **k: seen.setdefault("wc_source", k.get("wc_source")))
+        lambda *a, **k: (
+            seen.setdefault("wc_source", k.get("wc_source")), None))
 
     for extra, expect in (("screening_diagrams = w_bse\n", "LADDER_SOURCE"),
                           ("", None)):
@@ -538,13 +542,15 @@ def test_the_default_wc_source_is_the_rpa_dyson_solve():
     """``wc_source = None`` means ``_solve_wc`` — stated, not inferred.
 
     The RPA arm's bit-identity rests on this default, so it is pinned
-    rather than left to the reader of a ``(wc_source or _solve_wc)``.
+    rather than left to inference from a generic callable expression.
     """
     import inspect
     from gw.mpa import model
 
     src = inspect.getsource(model.build_mpa_fit)
-    assert "(wc_source or _solve_wc)(" in src
+    assert "if wc_source is None:" in src
+    assert "iteration_head = _solve_wc(" in src
+    assert "iteration_head = wc_source(" in src
     assert inspect.signature(model.build_mpa_fit).parameters[
         "wc_source"].default is None
 

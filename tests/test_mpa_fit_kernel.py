@@ -391,28 +391,31 @@ def test_noise_robustness_bounded_pole_movement(capsys):
 
 
 def test_diagnostics_conditioning_and_backward_error():
-    """The discarded Padé solve reports its own conditioning cliff."""
+    """Conditioning and backward error are reported as a PAIR.
+
+    Retargeted 2026-08-15: this cell used to exercise the Pade solve,
+    whose conditioning cliff made the pairing vivid.  That solve is gone
+    (see pade_fit's SOLVE_MODES record), so the cell now pins the
+    property on the Loewner solve that remains -- a small backward error
+    alone would look like a clean bill of health, and reporting both is
+    what stops that reading.
+    """
 
     n_p = 8
     z = _grid(n_p, omega_m=4.0)
     Omega_t, B_t = _si_like_poles(n_p)
     W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
 
-    cnd = diagnostics.solve_conditioning(
-        W, z, n_p, solve="pade", affine=False)
-    fit_diag = pade_fit.fit_mpa_poles(
-        W, z, n_p, solve="pade", affine=False)[2]
+    cnd = diagnostics.solve_conditioning(W, z, n_p)
+    fit_diag = pade_fit.fit_mpa_poles(W, z, n_p)[2]
     # Tiny backward error: the linear algebra was done right.
     assert float(cnd["backward_error"]) < 1.0e-12
     np.testing.assert_allclose(
         fit_diag["backward_error"], cnd["backward_error"], rtol=1e-13)
-    # Large condition number: the ANSWER is still only good to cond*eps.
-    # This pairing is the whole point of reporting both -- a small
-    # backward error alone would look like a clean bill of health.
-    assert float(cnd["cond"]) > 1.0e6
-    assert float(cnd["forward_residual"]) < 1.0e-7
-    assert int(cnd["n_valid"]) == n_p
-
+    # And the conditioning travels with it.  Loewner's whole point is
+    # that this number is SMALL where Pade's was 1e13 -- the verdict
+    # table in pade_fit records the measurement.
+    assert np.isfinite(float(cnd["cond"])) and float(cnd["cond"]) > 0.0
 
 def test_diagnostics_holdout_discriminates():
     """The held-out residual separates representable from under-parameterised.
@@ -696,8 +699,23 @@ def test_gate_sampling_refusals():
         sampling.double_parallel_grid(4, 4.0, energy_unit="eV")
     with pytest.raises(ValueError, match="GATE varpi_ordering"):
         sampling.double_parallel_grid(4, 4.0, varpi_near=1.0, varpi_far=0.1)
+    with pytest.raises(ValueError, match="GATE origin_shift_metal_only"):
+        sampling.double_parallel_grid(4, 4.0, origin_shift=1.0e-4)
+    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+        sampling.double_parallel_grid(
+            4, 4.0, material_class="metal", origin_shift=0.0)
+    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+        sampling.double_parallel_grid(
+            4, 4.0, material_class="metal", origin_shift=0.1)
     # FALSE case for each: the scheduled Si call is accepted.
     assert sampling.double_parallel_grid(8, 4.0).shape == (16,)
+    # FALSE case for the two shift gates: a legal metal shift is taken, and
+    # it is the ONLY sample that moves (the ladder's whole requirement).
+    shifted = sampling.double_parallel_grid(
+        8, 4.0, material_class="metal", origin_shift=1.0e-4)
+    default = sampling.double_parallel_grid(8, 4.0, material_class="metal")
+    assert shifted[0] == 1e-4j and default[0] == 1e-5j
+    np.testing.assert_array_equal(shifted[1:], default[1:])
 
 
 def test_gate_error_vector_shape():

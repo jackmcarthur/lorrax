@@ -1,17 +1,18 @@
-"""Locate, load and register the LORRAX FFI library — the LINALG half.
+"""Locate, load and register optional distrib_la FFI provider libraries.
 
 Ported from LORRAX ``src/ffi/common/ffi_loader.py`` at 96a6399, carrying
 only what the distributed-linalg backends need: the two platform library
 specs, the linalg target→C++-symbol tables, the ctypes declarations for
-the cuSOLVERMp and SLATE context lifecycles, and the probe.  The FFT,
-GEMM and phdf5 halves of that loader stay in lorrax, which still owns
-them.
+the cuSOLVERMp/SLATE contexts, and the probe. Distributed GEMM is part of
+this service as well: cuBLASMp, PBLAS, and SLATE multiply handlers are in
+the same two provider libraries. Only unrelated FFT, private fused W-solve,
+host bands-GEMM, and phdf5 surfaces remain in LORRAX's loader.
 
 THIS IS THE QUARANTINE BOUNDARY.  Everything in this package that knows a
 vendor library exists knows it through this module: one ``dlopen``, one
 symbol table, one probe.  ``pyproject.toml`` declares no ScaLAPACK, no
-SLATE and no cuSOLVERMp because none of them is linked here — they are
-inside a ``.so`` that this file opens by path.
+SLATE, cuSOLVERMp, or cuBLASMp because none is linked here — they are inside
+a ``.so`` that this file opens by path.
 
 The tables are the SERVICE's, the policy is lxkit's
 --------------------------------------------------
@@ -26,10 +27,12 @@ Environment
 ``LORRAX_FFI_SO``       absolute path to ``liblorrax_ffi.so`` (CUDA)
 ``LORRAX_FFI_HOST_SO``  absolute path to ``liblorrax_ffi_host.so`` (cpu)
 
-The SAME two variables lorrax's loader reads, deliberately: a run pins its
-library once and both loaders resolve the same file.  They GRANT A
-CAPABILITY and never select a backend — backend choice is a deck key, and
-:mod:`distrib_la.resolve` reads no environment at all.
+These historical names identify the currently supported provider ABI, whose
+C++ implementation lives in LORRAX.  A standalone installation may pin a
+compatible provider by absolute path; it need not import or install the
+LORRAX Python package.  The variables GRANT A CAPABILITY and never select a
+backend — backend choice is an API argument, and :mod:`distrib_la.resolve`
+reads no environment at all.
 
 An explicit pin that is missing is a REFUSAL, never a fall-through
 (2026-08-06): a stale or mistyped pin used to be appended to the candidate
@@ -159,6 +162,7 @@ _LIB_PATHS: Dict[str, str] = {}
 # inside the .so on the input buffer's element type.
 # ---------------------------------------------------------------------------
 _CUDA_TARGET_SYMBOLS = {
+    "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
@@ -168,6 +172,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":                  "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":         "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":          "SlateBatchedTrsmFfi",
+    "lorrax_slate_batched_gemm":          "SlateBatchedGemmFfi",
 }
 
 # The host variants: the SAME target names registered under platform="cpu"
@@ -183,10 +188,12 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_trsm":                    "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":           "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":            "SlateBatchedTrsmHostFfi",
+    "lorrax_slate_batched_gemm":            "SlateBatchedGemmHostFfi",
     "lorrax_scalapack_eigh":                "ScalapackEighHostFfi",
     "lorrax_scalapack_batched_solve_lu":    "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_batched_getrf":       "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs":       "ScalapackBatchedGetrsHostFfi",
+    "lorrax_scalapack_batched_gemm":        "ScalapackBatchedGemmHostFfi",
 }
 
 #: Per-platform library spec.  ``build_subdir`` is relative to

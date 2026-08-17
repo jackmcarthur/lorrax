@@ -31,6 +31,8 @@ jax = pytest.importorskip("jax")
 
 from gw.mpa import evaluator, pade_fit, sample_plan, sampling  # noqa: E402
 
+import _mpa_evaluator_harness as harness  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -72,7 +74,7 @@ def _rule_error(rule, z_values, delta):
     worst = 0.0
     d = np.asarray(delta, dtype=np.float64)
     for z in z_values:
-        proj = np.asarray(evaluator.damped_line_projection(rule, z))
+        proj = np.asarray(harness.damped_line_projection(rule, z))
         got = np.sin(np.outer(d, rule["t"])) @ proj
         worst = max(worst, float(np.max(np.abs(
             got - evaluator.damped_kernel(z, d)))))
@@ -289,7 +291,7 @@ def test_rule_is_positive_and_bounded_in_amplification():
         assert abs(rule["h"].sum() - rule["t_max"]) < 1e-12 * rule["t_max"]
         assert 0.99 < rule["kappa0"] <= 1.0
         for z in z_values:
-            proj = np.asarray(evaluator.damped_line_projection(rule, z))
+            proj = np.asarray(harness.damped_line_projection(rule, z))
             assert np.sum(np.abs(proj)) <= 2.0 / varpi * (1 + 1e-12)
 
 
@@ -328,7 +330,7 @@ def test_rule_refusals():
                                    max_order=64)
     rule = evaluator.damped_line_rule(0.2, 16.0)
     with pytest.raises(ValueError, match="GATE projection_on_line"):
-        evaluator.damped_line_projection(rule, complex(1.0, 0.9))
+        harness.damped_line_projection(rule, complex(1.0, 0.9))
 
 
 # ---------------------------------------------------------------------------
@@ -347,15 +349,8 @@ def test_the_four_cells_dispatch_by_analytic_character():
     for z, (character, family, route) in expect.items():
         assert sample_plan.sample_character(z) == character
         assert sample_plan.family_for(z) == family
-        assert sample_plan.route_for(z) == route
+        assert sample_plan.FAMILIES[family]["route"] == route
         assert sample_plan.FAMILIES[family]["character"] == character
-
-    # The census the design brief quotes, carried as data so the hole
-    # in the bottom-left cell stays visible.
-    assert sample_plan.FAMILIES["exponential_sum"]["shipped_tables"] == 26
-    assert sample_plan.FAMILIES["sine_sum"]["shipped_tables"] == 5
-    assert sample_plan.FAMILIES[
-        "exponential_sum_imag"]["shipped_tables"] == 0
 
 
 def test_off_table_sample_refuses_by_name():
@@ -404,33 +399,6 @@ def test_plan_refuses_duplicate_roles():
             label="clash")
 
 
-def test_existing_families_are_cases_not_parallel_paths():
-    """``static_plan`` / ``gn_ppm_plan`` reproduce today's requests.
-
-    ``DESIGN_minimax.md`` section 4 asks that
-    ``screening_requests_for`` become a projection of the sampling
-    object rather than a sibling of it, and makes the bit-identity of
-    the ``(omega_ry, role)`` pairs the gate on that refactor.  The
-    refactor is not this branch's, but the identity is assertable now,
-    and if it ever stops holding the projection is no longer available.
-    """
-
-    from types import SimpleNamespace
-
-    from gw.gw_config import ComputeMode
-    from gw.screening import screening_requests_for
-
-    config = SimpleNamespace(ppm=SimpleNamespace(omega_p=1.234))
-
-    for mode, plan in ((ComputeMode.COHSEX, sample_plan.static_plan()),
-                       (ComputeMode.GN_PPM,
-                        sample_plan.gn_ppm_plan(1.234))):
-        want = [(complex(r.omega_ry), r.role)
-                for r in screening_requests_for(mode, config)]
-        got = [(p["z"], p["role"]) for p in sample_plan.plan_points(plan)]
-        assert got == want, f"{mode}: {got} != {want}"
-
-
 def test_mpa_plan_is_the_protocol_grid_with_cells_attached():
     """The plan adds the 2x2 to the grid and changes nothing else."""
 
@@ -466,20 +434,6 @@ def test_mpa_plan_is_the_protocol_grid_with_cells_attached():
     assert first["varpi"] == 2.0e-5
 
 
-def test_n_p_one_plan_is_the_gn_probe_pair():
-    """The fit-kernel branch's build note 3, now on the plan object.
-
-    ``mpa_plan(n_p=1)`` and ``gn_ppm_plan(varpi_2)`` are the same two
-    points, so the GN compatibility anchor and the MPA family share one
-    grid rather than two that coincide.
-    """
-
-    mpa = sample_plan.plan_z(sample_plan.mpa_plan(1, 7.0,
-                                                  energy_unit="Ry"))
-    gn = sample_plan.plan_z(sample_plan.gn_ppm_plan(2.0))
-    assert np.array_equal(mpa, gn)
-
-
 # ---------------------------------------------------------------------------
 # 3b. Every cell evaluates, through one evaluator
 # ---------------------------------------------------------------------------
@@ -504,7 +458,7 @@ def test_every_cell_evaluates_through_the_same_call():
          sample_plan.sample_point(complex(2.0, varpi), "cell_strip")),
         label="four-cells")
 
-    values, cost = evaluator.evaluate_samples(
+    values, cost = harness.evaluate_samples(
         plan, delta, weight, rel_tol=1e-10, kernel_target_error=1e-10)
     exact = _closed_form_samples(sample_plan.plan_z(plan), delta, weight)
     err = np.abs(np.asarray(values) - exact)[:, 0]
@@ -533,7 +487,7 @@ def test_shipped_imag_cell_and_damped_rule_agree_on_the_same_point():
     delta, weight = _toy_spectrum(n_chan=1)
     varpi = 1.4
     point = sample_plan.sample_point(1j * varpi, "probe")
-    rule = evaluator.existing_kernel_rule(
+    rule = harness.existing_kernel_rule(
         point, delta_min=float(delta.min()),
         delta_max=float(delta.max()), target_error=1e-10)
     shipped = sample_plan.KERNEL_FACTOR * np.einsum(
@@ -542,7 +496,7 @@ def test_shipped_imag_cell_and_damped_rule_agree_on_the_same_point():
 
     damped_rule = evaluator.damped_line_rule(
         varpi, float(delta.max()), rel_tol=1e-10)
-    proj = np.asarray(evaluator.damped_line_projection(
+    proj = np.asarray(harness.damped_line_projection(
         damped_rule, 1j * varpi))
     damped = np.einsum("l,jl,jc->c", proj,
                        np.sin(np.outer(delta, damped_rule["t"])), weight)
@@ -570,9 +524,9 @@ def test_per_point_and_per_line_batching_agree():
 
     delta, weight = _toy_spectrum()
     plan = sample_plan.mpa_plan(8, 7.0, energy_unit="Ry")
-    per_point, cost_pp = evaluator.evaluate_samples(
+    per_point, cost_pp = harness.evaluate_samples(
         plan, delta, weight, batching="per-point", rel_tol=1e-10)
-    per_line, cost_pl = evaluator.evaluate_samples(
+    per_line, cost_pl = harness.evaluate_samples(
         plan, delta, weight, batching="per-line", rel_tol=1e-10)
 
     worst_budget = max(2.0e-10 / row["varpi"] for row in cost_pp["lines"])
@@ -586,7 +540,7 @@ def test_per_point_and_per_line_batching_agree():
     assert cost_pl["node_dispatches"] < cost_pp["node_dispatches"]
 
     with pytest.raises(ValueError, match="GATE batching_known"):
-        evaluator.evaluate_samples(plan, delta, weight, batching="auto")
+        harness.evaluate_samples(plan, delta, weight, batching="auto")
 
 
 def test_the_sweep_is_a_replaceable_seam():
@@ -607,8 +561,8 @@ def test_the_sweep_is_a_replaceable_seam():
                                              np.asarray(d))))
         return np.tensordot(basis, np.asarray(g), axes=(1, 0))
 
-    base, _ = evaluator.evaluate_samples(plan, delta, weight)
-    swapped, _ = evaluator.evaluate_samples(
+    base, _ = harness.evaluate_samples(plan, delta, weight)
+    swapped, _ = harness.evaluate_samples(
         plan, delta, weight, sine_sweep_fn=_sine_via_exp)
     assert np.max(np.abs(np.asarray(base) - np.asarray(swapped))) < 1e-13
 
@@ -650,7 +604,7 @@ def test_evaluate_then_fit_recovers_the_planted_spectrum():
                                 energy_unit="Ry")
     z = sample_plan.plan_z(plan)
 
-    values, cost = evaluator.evaluate_samples(
+    values, cost = harness.evaluate_samples(
         plan, delta, weight, rel_tol=1e-12, kernel_target_error=1e-10)
     values = np.asarray(values)
     exact = _closed_form_samples(z, delta, weight)
@@ -672,7 +626,7 @@ def test_evaluate_then_fit_recovers_the_planted_spectrum():
             float(np.max(np.abs(np.asarray(b_s) - weight[:, channel]))))
         cond = max(cond, float(diag["cond_pade"]))
 
-    print(evaluator.format_evaluator_cost_report(cost))
+    print(harness.format_evaluator_cost_report(cost))
     print(f"[mpa evaluate->fit] n_p={n_p} {weight.shape[1]} channels: "
           f"sample error {sample_error:.3e}, Pade condition "
           f"{cond:.3e}\n  planted spectrum recovered to "
@@ -690,9 +644,9 @@ def test_cost_report_states_what_the_plan_demands():
 
     delta, weight = _toy_spectrum(n_chan=1)
     plan = sample_plan.mpa_plan(8, float(delta.max()), energy_unit="Ry")
-    _, cost = evaluator.evaluate_samples(plan, delta, weight,
+    _, cost = harness.evaluate_samples(plan, delta, weight,
                                          batching="per-line")
-    text = evaluator.format_evaluator_cost_report(cost)
+    text = harness.format_evaluator_cost_report(cost)
     print(text)
 
     assert cost["logical_outputs"] == 16

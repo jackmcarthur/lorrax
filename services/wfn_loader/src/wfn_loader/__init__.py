@@ -53,6 +53,7 @@ targets.  Its cells moved with it.
 from __future__ import annotations
 
 from wfn_loader.loader import (
+    IBZRows,
     KSpec,
     WfnLoader,
     _bispinor_lift_kernel,
@@ -63,7 +64,7 @@ from wfn_loader.loader import (
 
 __all__ = [
     # the class, and the k-spec vocabulary its methods take
-    "WfnLoader", "KSpec",
+    "WfnLoader", "KSpec", "IBZRows",
     # module-level helpers the in-tree tests pin by name (see above)
     "_phdf5_unfold_kernel",
     "_sharded_zero_proto_fn", "_get_bispinor_lift_jit",

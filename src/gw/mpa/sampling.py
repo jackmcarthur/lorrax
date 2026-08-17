@@ -52,8 +52,12 @@ import numpy as np
 _VARPI_NEAR = {"Ha": 0.1, "Ry": 0.2}
 _VARPI_FAR = {"Ha": 1.0, "Ry": 2.0}
 
-# The metal origin shift: z_1^1 = i * 1e-5 Ha, a stability dodge around
-# zero-energy intraband transitions -- NOT a physical broadening.
+# The metal origin shift DEFAULT: z_1^1 = i * 1e-5 Ha, a stability dodge
+# around zero-energy intraband transitions -- NOT a physical broadening.
+# The Ry column is the same physical height in LORRAX-native Rydberg, so
+# every Ry entry is TWICE its Ha partner.  Overridable per call through
+# ``double_parallel_grid(origin_shift=...)`` and, from a deck, through
+# ``mpa_metal_origin_shift_ry`` (always Ry, because deck keys are).
 _METAL_ORIGIN_SHIFT = {"Ha": 1.0e-5, "Ry": 2.0e-5}
 
 _MATERIAL_CLASSES = ("insulator", "metal")
@@ -83,7 +87,13 @@ POLE_SCHEDULE = {
 }
 
 
-def partition_fractions(n_p, *, ladder_floor_octaves=3):
+#: Origin-ladder floor: bisect ``[0, x_1]`` while its width exceeds
+#: ``2**-_LADDER_FLOOR_OCTAVES``.  Raise to 4 to get the origin-refining
+#: family instead (see the WHAT IS A CALL note in partition_fractions).
+_LADDER_FLOOR_OCTAVES = 3
+
+
+def partition_fractions(n_p):
     """Return the ``n_p`` real-axis partition fractions of ``omega_m``.
 
     The returned tuple is ascending, starts at ``Fraction(0)``, ends at
@@ -93,7 +103,7 @@ def partition_fractions(n_p, *, ladder_floor_octaves=3):
 
     THE RULE.  Start from ``{0, 1}``.  Bisect the origin-adjacent
     interval ``[0, x_1]`` repeatedly while its width exceeds
-    ``2**-ladder_floor_octaves`` -- this lays down the geometric ladder
+    ``2**-_LADDER_FLOOR_OCTAVES`` -- this lays down the geometric ladder
     ``0, 1/8, 1/4, 1/2, 1`` that the paper tabulates for ``n_p <= 5``.
     Thereafter bisect the WIDEST remaining interval, ties broken toward
     the origin, never re-entering ``[0, x_1]``.
@@ -113,7 +123,7 @@ def partition_fractions(n_p, *, ladder_floor_octaves=3):
     choice is taken because the origin interval is already the densest
     region in the ``alpha``-warped coordinate and because refining it
     further pushes samples toward the ``z = 0`` point that the near line
-    already covers exactly.  ``ladder_floor_octaves`` is the knob: raise
+    already covers exactly.  ``_LADDER_FLOOR_OCTAVES`` is the knob: raise
     it to 4 to get the origin-refining family instead.  This call is
     inert for every schedule at or below ``n_p = 9`` -- Si 8, Al 8, Na 8
     -- and first bites at hBN/TiO2 (10-11) and Cu (12-15).
@@ -130,18 +140,12 @@ def partition_fractions(n_p, *, ladder_floor_octaves=3):
         raise ValueError(
             f"GATE n_p_positive: n_p={n_p!r} is not a positive integer. "
             "FALSE case: int(n_p) >= 1.")
-    floor_oct = int(ladder_floor_octaves)
-    if floor_oct < 0:
-        raise ValueError(
-            f"GATE ladder_floor_nonnegative: ladder_floor_octaves="
-            f"{ladder_floor_octaves!r} is negative. "
-            "FALSE case: int(ladder_floor_octaves) >= 0.")
 
     if n == 1:
         return (Fraction(0),)
 
     pts = [Fraction(0), Fraction(1)]
-    floor_width = Fraction(1, 2 ** floor_oct)
+    floor_width = Fraction(1, 2 ** _LADDER_FLOOR_OCTAVES)
 
     # Phase 1 -- the geometric ladder into the origin.
     while len(pts) < n and (pts[1] - pts[0]) > floor_width:
@@ -153,7 +157,8 @@ def partition_fractions(n_p, *, ladder_floor_octaves=3):
         if not widths:
             raise ValueError(
                 f"GATE partition_exhausted: no interior interval left to "
-                f"bisect at n_p={n} with ladder_floor_octaves={floor_oct}. "
+                f"bisect at n_p={n} with a ladder floor of "
+                f"2**-{_LADDER_FLOOR_OCTAVES}. "
                 "FALSE case: n_p small enough that the ladder plus the "
                 "interior bisections supply n_p distinct points.")
         widest = max(widths)
@@ -164,7 +169,7 @@ def partition_fractions(n_p, *, ladder_floor_octaves=3):
     return tuple(pts)
 
 
-def partition_omegas(n_p, omega_m, *, alpha=1, ladder_floor_octaves=3):
+def partition_omegas(n_p, omega_m, *, alpha=1):
     """Return the ``n_p`` real-axis sample energies, ascending.
 
     ``omega_n = (fraction)**alpha * omega_m`` -- metals paper Eq. (11),
@@ -188,7 +193,7 @@ def partition_omegas(n_p, omega_m, *, alpha=1, ladder_floor_octaves=3):
             "positive energy. FALSE case: float(omega_m) > 0 and finite; "
             "omega_m is the largest included transition energy.")
 
-    fracs = partition_fractions(n_p, ladder_floor_octaves=ladder_floor_octaves)
+    fracs = partition_fractions(n_p)
     return np.asarray([float(f) ** a * om for f in fracs], dtype=np.float64)
 
 
@@ -200,8 +205,8 @@ def double_parallel_grid(
     alpha=1,
     varpi_near=None,
     varpi_far=None,
+    origin_shift=None,
     energy_unit="Ha",
-    ladder_floor_octaves=3,
 ):
     """Return the ``2*n_p`` complex sample points of the DP protocol.
 
@@ -223,6 +228,15 @@ def double_parallel_grid(
         Line heights.  ``None`` takes the published defaults for
         ``energy_unit``: 0.1 and 1 Ha (equivalently 0.2 and 2 Ry).
         Passing them explicitly means the caller owns their units.
+    origin_shift
+        Height of the METAL near line's first sample, ``z_1^1 = i*shift``.
+        Exactly ``varpi_near``'s shape: ``None`` takes the published
+        default for ``energy_unit`` (1e-5 Ha, equivalently 2e-5 Ry), and
+        passing it explicitly means the caller owns its units.  Refused
+        under ``material_class="insulator"``, whose first sample is
+        ``z = 0`` exactly and would silently ignore it, and refused
+        unless ``0 < origin_shift < varpi_near``.  From a deck this is
+        ``mpa_metal_origin_shift_ry``.
     energy_unit
         ``"Ha"`` or ``"Ry"``; selects defaults only.
 
@@ -268,8 +282,24 @@ def double_parallel_grid(
             "FALSE case: 0 < varpi_near < varpi_far -- the near line "
             "resolves structure, the far line carries the envelope.")
 
-    omegas = partition_omegas(
-        n, omega_m, alpha=alpha, ladder_floor_octaves=ladder_floor_octaves)
+    shift = (_METAL_ORIGIN_SHIFT[energy_unit] if origin_shift is None
+             else float(origin_shift))
+    if origin_shift is not None and material_class == "insulator":
+        raise ValueError(
+            f"GATE origin_shift_metal_only: origin_shift={origin_shift!r} "
+            "was passed with material_class='insulator', whose near line's "
+            "first sample is z = 0 exactly -- the shift would be silently "
+            "ignored. FALSE case: material_class == 'metal', or "
+            "origin_shift is None.")
+    if material_class == "metal" and not (0.0 < shift < vn):
+        raise ValueError(
+            f"GATE origin_shift_ordering: origin_shift={shift!r} is not "
+            f"strictly inside (0, varpi_near={vn!r}) in {energy_unit}. "
+            "FALSE case: 0 < origin_shift < varpi_near -- the shift dodges "
+            "the zero-energy intraband pile-up (a stability dodge, not a "
+            "broadening) without climbing off the near line it sits on.")
+
+    omegas = partition_omegas(n, omega_m, alpha=alpha)
 
     near = omegas + 1j * vn
     far = omegas + 1j * vf
@@ -279,7 +309,7 @@ def double_parallel_grid(
     if material_class == "insulator":
         near[0] = 0.0 + 0.0j
     else:
-        near[0] = 1j * _METAL_ORIGIN_SHIFT[energy_unit]
+        near[0] = 1j * shift
 
     grid = np.concatenate([near, far]).astype(np.complex128)
 

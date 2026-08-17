@@ -142,17 +142,14 @@ def test_auto_never_infers_the_unimplemented_mode():
 # 2. The refusal
 # ---------------------------------------------------------------------------
 
-def test_selecting_it_refuses_and_names_the_mode_and_the_next_step():
-    """The refusal an operator actually sees."""
-    with pytest.raises(NotImplementedError) as exc:
-        refuse_unimplemented_compute_mode(ComputeMode.MPA,
-                                          context="the LORRAX GW driver")
-    msg = str(exc.value)
-    assert "mpa" in msg
-    assert "the LORRAX GW driver" in msg
-    assert "real-material chi/W/fixed-head/Sigma/QSGW" in msg
-    assert "end to end" in msg
-    assert "THEORY_mpa_implementation.md" in msg
+def test_mpa_mode_passes_the_entry_gate():
+    """The landing gesture, taken: the MPA row is deleted, so the entry
+    check passes MPA through and the registry is empty.  Site-level
+    refusals (metal-needs-occupations, deck-key cross-validation) remain
+    the safety and are pinned in their own suites."""
+    refuse_unimplemented_compute_mode(ComputeMode.MPA,
+                                      context="the LORRAX GW driver")
+    assert UNIMPLEMENTED_MODES == {}
 
 
 def test_the_document_the_refusal_points_at_is_in_the_tree():
@@ -335,7 +332,8 @@ def test_ppm_model_separates_the_two_questions_the_tree_was_conflating():
     assert ComputeMode.HL_PPM.ppm_model == "hl"
     assert ComputeMode.COHSEX.ppm_model is None
     assert ComputeMode.X_ONLY.ppm_model is None
-    assert [m.is_dynamic for m in _RUNNABLE] == [False, False, True, True]
+    assert [m.is_dynamic for m in _RUNNABLE] == [
+        False, False, True, True, True]
 
 
 def test_no_module_dispatches_on_the_mode_through_a_bare_else():

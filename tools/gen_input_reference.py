@@ -105,8 +105,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "sigma_omega_step_ev": ("Sigma", "Sigma(omega) grid step (eV)."),
     "sigma_regularization_ev": ("Sigma", "Lorentzian regularization of the Sigma(omega) evaluation (eV)."),
     "sigma_window_edge_factor": ("Sigma", "Widens the minimax window past the sigma omega-grid edges (T = omega_max + factor*xi)."),
-    "sigma_omega_batch_size": ("Sigma", "Omega points evaluated per batch in the Sigma^c(omega) loop."),
-    "sigma_omega_accumulation": ("Sigma", "How per-branch Sigma(omega) contributions are accumulated (auto = pick by size)."),
     "sigma_omega_layout": ("Sigma", "Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1)."),
     "no_degen_averaging": ("Sigma", "Disable BGW-style averaging of diagonal Sigma within degenerate sets."),
     "degen_avg_tol_ry": ("Sigma", "Degeneracy tolerance for the averaging (BGW TOL_Degeneracy = 1e-6 Ry)."),

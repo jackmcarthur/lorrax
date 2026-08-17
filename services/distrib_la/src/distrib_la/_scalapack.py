@@ -34,6 +34,7 @@ from distrib_la._slate import (_mesh_key, ensure_registered,
                                get_or_init_context, validate_mesh)
 
 __all__ = [
+    "batched_distributed_matmul",
     "batched_distributed_eigh",
     "distributed_eigh",
     "validate_eigh_mesh",
@@ -81,9 +82,92 @@ pseudo-inverse) across meshes — never ``Z`` itself.
 """
 
 _EIGH_TARGET = "lorrax_scalapack_eigh"
+_GEMM_TARGET = "lorrax_scalapack_batched_gemm"
 
 # jit(shard_map) cache per signature — eager shard_map re-traces per call.
 _JIT_CACHE: dict = {}
+
+
+def batched_distributed_matmul(
+    A: jax.Array, B: jax.Array, C: jax.Array, *, mesh: Mesh,
+    alpha=1.0, beta=0.0, transa: str = "N", transb: str = "N",
+) -> jax.Array:
+    """PBLAS ``pdgemm``/``pzgemm`` over a face-sharded matrix stack.
+
+    A, B, and C are rank-3 ``P(None,'x','y')`` arrays; the result has C's
+    shape and returns at the same sharding.  The public
+    :func:`distrib_la.matmul` door supplies rank-2 lifting, placement,
+    provider resolution, and the optional zero C.  This backend requires a
+    CPU process grid, float64 or complex128, N/T/C operation codes, exact
+    one-face-per-rank tiling, and one JAX process per mesh cell.
+    """
+    if A.ndim != 3 or B.ndim != 3 or C.ndim != 3:
+        raise ValueError("scalapack matmul expects three rank-3 operands")
+    if A.dtype != B.dtype or A.dtype != C.dtype:
+        raise ValueError("scalapack matmul operands must share dtype")
+    if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
+        raise ValueError(
+            f"scalapack matmul supports float64/complex128; got {A.dtype}")
+    transa, transb = transa.upper(), transb.upper()
+    if transa not in "NTC" or transb not in "NTC":
+        raise ValueError("scalapack matmul transa/transb must be N/T/C")
+    if mesh.devices.flat[0].platform != "cpu":
+        raise ValueError("scalapack matmul is host-only")
+    px, py = validate_mesh(mesh)
+    nq, ar, ac = map(int, A.shape)
+    br, bc = int(B.shape[1]), int(B.shape[2])
+    m, ka = ((ar, ac) if transa == "N" else (ac, ar))
+    kb, n = ((br, bc) if transb == "N" else (bc, br))
+    if ka != kb or tuple(C.shape) != (nq, m, n):
+        raise ValueError(
+            f"scalapack matmul shapes disagree: A={A.shape}, B={B.shape}, "
+            f"C={C.shape}, trans={transa}/{transb}")
+    for dim, divisor, name in (
+            (ar, px, "A rows"), (ac, py, "A cols"),
+            (br, px, "B rows"), (bc, py, "B cols"),
+            (m, px, "C rows"), (n, py, "C cols")):
+        if dim % divisor:
+            raise ValueError(
+                f"scalapack matmul {name}={dim} not divisible by {divisor}")
+    ensure_registered(mesh)
+    ctx = get_or_init_context(mesh)
+    alpha, beta = complex(alpha), complex(beta)
+    attrs = dict(
+        nq=nq, m=m, n=n, k=ka,
+        a_rows=ar, a_cols=ac, b_rows=br, b_cols=bc,
+        mb_a=ar // px, nb_a=ac // py,
+        mb_b=br // px, nb_b=bc // py,
+        mb_c=m // px, nb_c=n // py,
+        transa={"N": 0, "T": 1, "C": 2}[transa],
+        transb={"N": 0, "T": 1, "C": 2}[transb],
+        alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
+        beta_re=float(beta.real), beta_im=float(beta.imag),
+        ctx_handle=int(ctx))
+    key = ("scalapack_gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape,
+           C.shape, transa, transb, alpha, beta, int(ctx))
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        local_out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+                 out_specs=P(None, "y", "x"), check_vma=False)
+        def _call(a, b, c):
+            return jax.ffi.ffi_call(
+                _GEMM_TARGET, local_out_t,
+                input_output_aliases={2: 0})(
+                    jnp.transpose(a, (0, 2, 1)),
+                    jnp.transpose(b, (0, 2, 1)),
+                    jnp.transpose(c, (0, 2, 1)), **attrs)
+
+        @partial(shard_map, mesh=mesh, in_specs=P(None, "y", "x"),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _untranspose(d):
+            return jnp.transpose(d, (0, 2, 1))
+
+        fn = jax.jit(lambda a, b, c: _untranspose(_call(a, b, c)),
+                     donate_argnums=(2,))
+        _JIT_CACHE[key] = fn
+    return fn(A, B, C)
 
 
 def validate_eigh_mesh(mesh: Mesh) -> tuple[int, int]:

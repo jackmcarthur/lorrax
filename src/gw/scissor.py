@@ -8,11 +8,50 @@ tensor; outside the grid we extrapolate the QP correction
 
     ΔE_nk := E_QP_nk − E_DFT_nk  =  ⟨n| Σ_xc − V_xc^DFT |n⟩_k
 
-by a pair of affine laws, refit at each SC iteration — one for valence bands
-(occupied at DFT occupation) and one for conduction:
+by a pair of affine laws, refit at each SC iteration — one for the valence
+class and one for the conduction class:
 
     ΔE_v(E) = α_v · E + β_v
     ΔE_c(E) = α_c · E + β_c
+
+Which bands are valence and which are conduction
+------------------------------------------------
+On an insulator this is the step occupation and there is nothing to decide.
+On a METAL it is a decision, and the wrong one is expensive.  The rule this
+module implements (owner ruling, 2026-08-16) is:
+
+    valence class   = bands BELOW the LOWEST band that crosses E_F
+    conduction class = bands ABOVE the HIGHEST band that crosses E_F
+    Fermi-crossing bands belong to NEITHER fit class
+
+A crossing band is not valence data and it is not conduction data: over its
+own k-set it is BOTH, so a line fit through it is a line fit through the
+Fermi surface.  Those bands are the protected/full-Σ set anyway — nothing
+downstream needs a scissor law for them — so excluding them from the fit
+costs nothing and removes the only samples that cannot be labelled.
+
+Measured cost of getting this wrong (claim 0212, sodium
+``runs/Na/02_soc48b_qsgw_mpa``, 48 bands × 512 full-BZ k, the semicore
+window family).  Under the old "occupied at DFT occupation" index mask the
+Fermi-crossing Kramers pair (bands 9-10) sat in the VALENCE class:
+
+* ``[-5,+5]`` window: the val fit's only in-window samples WERE the
+  crossing pair — n_v = 1024 samples, 100% crossing — giving α = 0.9100,
+  β = −0.0015 eV.  Extrapolated to the 2s semicore at E − μ = −53.8 eV that
+  law predicts **+4.84 eV** where BerkeleyGW's Eqp0 is **−12.86 eV**:
+  wrong by 17.5 eV and wrong in SIGN.  Under the rule above the valence
+  class is EMPTY in that window and the law is the identity — which is a
+  refusal to extrapolate, and it is more honest than a Fermi-surface-
+  anchored line.
+* ``[-28,+26]`` window: the val fit mixed the 2p semicore with the same
+  crossing pair (8 bands, n_v = 4096) → α = 1.1978.  Under the rule the
+  class is the 2p alone.
+
+:func:`classify_scissor_bands` derives the three classes from an
+``OccupationState``'s ``f_kn``; the boundary indices it returns are what
+both the fit masks and :meth:`ScissorFit.predict` use, so a band is
+classified once per iteration and the fit and the prediction cannot
+disagree.
 
 The scissor is applied at the **eigenvalue level** in the diagonal Σ(E)
 fixed-point: out-of-grid bands receive E_QP = E_DFT + (α·E_DFT + β); the
@@ -118,7 +157,8 @@ class ScissorFit:
     w_fit_v: float
     w_fit_c: float
 
-    def predict(self, E_ev: np.ndarray, valence_mask: np.ndarray) -> np.ndarray:
+    def predict(self, E_ev: np.ndarray, valence_mask: np.ndarray,
+                *, crossing_mask: np.ndarray | None = None) -> np.ndarray:
         """Evaluate the scissor **correction** ΔE = E_QP − E_DFT at each (k, n).
 
         Returns ``ΔE = (α − 1) · E + β`` so callers can add it to their
@@ -131,12 +171,26 @@ class ScissorFit:
             Input DFT energies, same reference as at fit time.
         valence_mask : np.ndarray, (nk, nb) of bool
             True where the valence law applies; False → conduction.
+        crossing_mask : np.ndarray, (nk, nb) of bool, optional
+            Bands in NEITHER fit class (the Fermi-crossing set of
+            :class:`ScissorBandClasses`).  ΔE is 0 there — the identity, the
+            same no-information law an empty class gets: a band we refused
+            to FIT is a band we refuse to EXTRAPOLATE.  In practice these
+            bands are inside the Σ(ω) window and protected, so the caller's
+            ``in_range_mask`` discards this entry anyway; the case where it
+            does not is a band that crosses E_F at one k and leaves the
+            window at another, and there ``E_QP = E_DFT`` is the honest
+            answer.  ``None`` (the default) is the historical two-way
+            behaviour, bit for bit.
         """
         E = np.asarray(E_ev, dtype=np.float64)
         vm = np.asarray(valence_mask, dtype=bool)
         delta_v = (self.alpha_v - 1.0) * E + self.beta_v_ev
         delta_c = (self.alpha_c - 1.0) * E + self.beta_c_ev
-        return np.where(vm, delta_v, delta_c)
+        out = np.where(vm, delta_v, delta_c)
+        if crossing_mask is not None:
+            out = np.where(np.asarray(crossing_mask, dtype=bool), 0.0, out)
+        return out
 
     def summary(self) -> str:
         return (
@@ -239,6 +293,190 @@ def classify_bands_in_grid(
     kn_in_grid_band = np.broadcast_to(
         band_in_grid[None, :], E.shape).astype(bool)
     return band_in_grid, kn_in_grid_band
+
+
+# ---------------------------------------------------------------------------
+# Three-way val / crossing / cond classification from the occupation table
+# ---------------------------------------------------------------------------
+
+#: A cell ``f`` counts as FULL at ``f >= 1 - FRACTIONAL_TOL`` and EMPTY at
+#: ``f <= FRACTIONAL_TOL``; anything strictly between is FRACTIONAL.  The
+#: tolerance is NOT cosmetic and it is not an "≈ 1" convenience:
+#:
+#: * MP1 (Methfessel-Paxton order 1) OVERSHOOTS.  ``f_kn`` is never clipped
+#:   (``efermi.OccupationState`` says so in its own docstring), so a band a
+#:   width or two below μ carries ``f ≈ 1.008`` and one above carries
+#:   ``f ≈ −0.008``.  A test written as ``0 < f < 1`` would call the
+#:   overshoot cells "not fractional" for the wrong reason and, worse, a
+#:   test written as ``f == 1.0`` would call every deep band fractional the
+#:   moment the erfc tail stops rounding to exactly 1.0.
+#: * The classification must therefore be "which SIDE is this cell on, and
+#:   is it saturated there", which is what the two-sided tolerance says.
+#:
+#: 1e-8 is far outside float64 noise on a saturated erfc tail (which
+#: reaches exact 1.0/0.0 by |E − μ| ≈ 6 widths) and far inside any genuine
+#: partial occupation (the smallest one the Fermi surface produces is
+#: O(width) in energy, i.e. O(0.1) in f).
+FRACTIONAL_TOL = 1.0e-8
+
+
+@dataclass(frozen=True)
+class ScissorBandClasses:
+    """Which bands are valence, which cross E_F, and which are conduction.
+
+    Held as two BOUNDARY INDICES rather than a per-band label array, because
+    the owner's rule is stated in terms of boundaries and because the two
+    consumers need the classes at different band widths — the fit sees the
+    active window ``nb_active``, the occupation table may be the padded
+    parallel-transport manifold ``nb_storage``, and the sum-band tail fit
+    sees the full ladder.  Index arithmetic is width-agnostic; a label array
+    would have to be padded, and padding a label array is how the wrong
+    band gets the wrong class.
+
+    Attributes
+    ----------
+    valence_stop : int
+        Bands ``[0, valence_stop)`` are the valence fit class — everything
+        strictly below the lowest Fermi-crossing band.
+    conduction_start : int
+        Bands ``[conduction_start, nb)`` are the conduction fit class —
+        everything strictly above the highest Fermi-crossing band.
+
+    The gap ``[valence_stop, conduction_start)`` is the crossing set, and it
+    is exactly the set of bands carrying a fractional cell — the crossing
+    bands cannot be non-contiguous on an energy-sorted band axis, and
+    :func:`classify_scissor_bands` refuses a table where they are.  So
+    ``n_crossing`` is ``conduction_start - valence_stop`` and is not stored
+    twice.
+    """
+
+    valence_stop: int
+    conduction_start: int
+
+    def __post_init__(self):
+        if not (0 <= int(self.valence_stop) <= int(self.conduction_start)):
+            raise ValueError(
+                "ScissorBandClasses: need 0 <= valence_stop <= "
+                f"conduction_start; got {self.valence_stop!r}, "
+                f"{self.conduction_start!r}")
+
+    @property
+    def n_crossing(self) -> int:
+        """How many bands are in neither fit class."""
+        return int(self.conduction_start) - int(self.valence_stop)
+
+    def masks(self, shape) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(valence_kn, crossing_kn)`` broadcast to ``(nk, nb)``.
+
+        ``valence_kn`` is what ``fit_scissor`` wants as ``valence_mask_kn``
+        and ``ScissorFit.predict`` as ``valence_mask``; ``crossing_kn`` is
+        what the caller ANDs OUT of its ``fit_mask_kn`` and passes to
+        ``predict`` as ``crossing_mask``.  Everything that is neither is
+        conduction, so two masks describe three classes.
+        """
+        nk, nb = int(shape[0]), int(shape[1])
+        idx = np.arange(nb)
+        val = idx < int(self.valence_stop)
+        cross = (~val) & (idx < int(self.conduction_start))
+        return (np.broadcast_to(val[None, :], (nk, nb)),
+                np.broadcast_to(cross[None, :], (nk, nb)))
+
+    def summary(self) -> str:
+        """One line, 1-BASED band labels — the convention the logs use."""
+        v = ("none" if self.valence_stop == 0
+             else f"1-{self.valence_stop}")
+        gap = self.conduction_start - self.valence_stop
+        x = ("none" if gap == 0
+             else f"{self.valence_stop + 1}-{self.conduction_start}")
+        return (f"val = bands {v}, Fermi-crossing = bands {x} "
+                f"(n={self.n_crossing}), "
+                f"cond = bands {self.conduction_start + 1}+ "
+                f"[crossing excluded from both fits]")
+
+
+def classify_scissor_bands(
+    f_kn,
+    *,
+    frac_tol: float = FRACTIONAL_TOL,
+) -> ScissorBandClasses:
+    """Derive the valence / crossing / conduction boundaries from ``f_kn``.
+
+    Per BAND, over all k:
+
+    * every cell FULL (``f >= 1 - frac_tol``)   → the band is fully occupied
+    * every cell EMPTY (``f <= frac_tol``)      → the band is fully empty
+    * anything else — a fractional cell anywhere, or full at one k and empty
+      at another — → the band CROSSES E_F.
+
+    Then, per the owner's rule, ``valence_stop`` is the lowest crossing
+    band's index and ``conduction_start`` is the highest crossing band's
+    index + 1.  With no crossing band at all (an insulator's step table, or
+    a "metal" whose k-grid happens to gap) the crossing set is empty and the
+    boundaries collapse onto the occupied-band count — which is exactly the
+    step mask, so the insulating path is unchanged by construction.
+
+    Refuses if a fully-occupied band lands at or above ``valence_stop``, or
+    a fully-empty band below ``conduction_start`` — equivalently, if the
+    crossing bands are not contiguous.  With bands energy-sorted within each
+    k (every producer here is ``eigvalsh`` or QE, both ascending) that is
+    impossible: if band n is full at every k and band m > n crosses, then at
+    the k where m is fractional ``E[k,m] >= E[k,n]``, so m cannot be
+    saturated-full there and n cannot be above m.  The same argument in
+    reverse forbids an empty band below a crossing one.  Tripping the
+    refusal therefore means the band axis is not energy-sorted, and a
+    boundary-index rule is the wrong rule for that table — better to say so
+    than to silently misclassify a shell.
+
+    Note this is a statement about SATURATION, not about the raw value of
+    ``f``: MP1 is non-monotonic in E (that is the overshoot), but "which
+    side of μ, and saturated there" is monotonic, which is what makes the
+    boundary indices well defined at all.
+
+    Parameters
+    ----------
+    f_kn : array_like, (nk, nb)
+        Occupations, NOT clipped — an ``OccupationState.f_kn``.
+    frac_tol : float
+        Saturation tolerance; see :data:`FRACTIONAL_TOL`.
+    """
+    f = np.asarray(f_kn, dtype=np.float64)
+    if f.ndim != 2 or min(f.shape) < 1:
+        raise ValueError(
+            f"classify_scissor_bands: f_kn must be a nonempty (nk, nb); "
+            f"got shape {f.shape}")
+    tol = float(frac_tol)
+    if not (0.0 <= tol < 0.5):
+        raise ValueError(
+            f"classify_scissor_bands: frac_tol must be in [0, 0.5); got {tol!r}")
+
+    nb = int(f.shape[1])
+    band_full = np.all(f >= 1.0 - tol, axis=0)
+    band_empty = np.all(f <= tol, axis=0)
+    band_crossing = ~(band_full | band_empty)
+
+    idx = np.arange(nb)
+    if bool(band_crossing.any()):
+        v_stop = int(idx[band_crossing].min())
+        c_start = int(idx[band_crossing].max()) + 1
+    else:
+        # No crossing band: the boundaries collapse and the classes are
+        # exactly "full" and "empty".  Contiguity is checked below like any
+        # other case, so a non-prefix full set refuses here too.
+        v_stop = c_start = int(band_full.sum())
+
+    bad_full = np.nonzero(band_full & (idx >= v_stop))[0]
+    bad_empty = np.nonzero(band_empty & (idx < c_start))[0]
+    if bad_full.size or bad_empty.size:
+        raise ValueError(
+            "classify_scissor_bands: the occupation table is not consistent "
+            "with an energy-sorted band axis, so the below-lowest-crossing / "
+            "above-highest-crossing rule cannot label it.  Crossing bands "
+            f"(0-based) {np.nonzero(band_crossing)[0].tolist()} put the "
+            f"boundaries at [0,{v_stop}) / [{c_start},{nb}), but fully "
+            f"occupied bands {bad_full.tolist()} are not below the first and "
+            f"fully empty bands {bad_empty.tolist()} are not above the last.")
+
+    return ScissorBandClasses(valence_stop=v_stop, conduction_start=c_start)
 
 
 # ---------------------------------------------------------------------------
@@ -354,11 +592,17 @@ def fit_scissor(
         inputs are reduced to the real part, matching the convention of
         ``solve_diagonal_sigma_fixed_point``.
     valence_mask_kn : np.ndarray, (nk, nb) of bool
-        True for occupied bands (at DFT occupation), False for conduction.
+        True where the valence law applies, False where the conduction law
+        does.  On a metal build it from :func:`classify_scissor_bands` —
+        "below the lowest Fermi-crossing band" — NOT from an occupied-band
+        index cut, which puts crossing bands in the valence class.
     fit_mask_kn : np.ndarray, (nk, nb) of bool
         True where the point is trusted enough to enter the fit —
-        typically "E_kn lies inside the Σ(ω) grid".  Applied
-        independently within valence and conduction.
+        "E_kn lies inside the Σ(ω) grid" AND NOT a Fermi-crossing band.
+        Applied independently within valence and conduction, so this is the
+        mask that makes the crossing set enter neither.  It is a separate
+        argument from ``valence_mask_kn`` precisely because a two-valued
+        mask cannot express a three-way classification.
     k_weights : np.ndarray, (nk,) — REQUIRED, keyword-only
         How many full-BZ k each row stands for.  Build it with
         :func:`full_bz_k_weights` or :func:`k_star_weights`; do not spell
@@ -423,6 +667,28 @@ def fit_scissor(
         E_dft_sorted[mask_v], E_qp_sorted[mask_v], w_v)
     alpha_c, beta_c, _ = _wls_line(
         E_dft_sorted[mask_c], E_qp_sorted[mask_c], w_c)
+    # No-information laws.  _wls_line returns (0, 0) on an empty class and
+    # (0, y0) on a single sample; as an E_QP = α·E + β scissor those
+    # extrapolate every band to ZERO / to a constant — on the metallic
+    # sodium deck the Fermi-crossing pair gave the classes no clean
+    # samples, every scissored diagonal became exactly 0.0, and eigvalsh's
+    # ascending sort interleaved 46 zeros with the two real eigenvalues
+    # (the migrating-band snapshots, max|dE| = VBM to six decimals).
+    # Zero samples ⇒ identity (keep E_DFT); one sample ⇒ rigid shift.
+    for _cls in ("v", "c"):
+        _m, _w = (mask_v, w_v) if _cls == "v" else (mask_c, w_c)
+        _n = int(_m.sum())
+        if _n == 0:
+            _a, _b = 1.0, 0.0
+        elif _n == 1:
+            _a = 1.0
+            _b = float((E_qp_sorted - E_dft_sorted)[_m][0])
+        else:
+            continue
+        if _cls == "v":
+            alpha_v, beta_v = _a, _b
+        else:
+            alpha_c, beta_c = _a, _b
     resid_v = (E_qp_sorted - E_dft_sorted)[mask_v] - (
         (alpha_v - 1.0) * E_dft_sorted[mask_v] + beta_v)
     resid_c = (E_qp_sorted - E_dft_sorted)[mask_c] - (
@@ -442,9 +708,12 @@ def fit_scissor(
 
 
 __all__ = [
+    "FRACTIONAL_TOL",
+    "ScissorBandClasses",
     "ScissorFit",
     "apply_conduction_scissor_to_tail",
     "classify_bands_in_grid",
+    "classify_scissor_bands",
     "fit_scissor",
     "full_bz_k_weights",
     "k_star_weights",

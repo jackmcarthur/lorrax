@@ -33,7 +33,7 @@ import configparser
 import enum
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import numpy as np
@@ -579,17 +579,13 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "deferral, DESIGN_2026-08-15.md section 1",
     ),
     (
-        # THE ONLY DECK KEY THAT DECLARES A METALLIC TREATMENT, surveyed
-        # over ``_DEFAULTS`` 2026-08-16: ``mpa_material_class``.  There is
-        # no smearing / temperature / occupation key in this parser at all
-        # (the occupations are the WFN's, and the one Fermi-adjacent key,
-        # ``fermi_reference = vbm | midgap``, names where E_F sits INSIDE a
-        # gap and so declares the opposite).  That is why this row is one
-        # predicate and not a disjunction: a second clause here would name
-        # a key that does not exist, and the metallic WFN that carries no
-        # declaring key at all is caught by the RUNTIME occupation gate
-        # (gw/screening_bse.py, GATE w_bse_insulators_only), not by
-        # inventing a parse-time proxy for it.
+        # ``mpa_material_class`` is the authority for which MPA material
+        # formulation the deck requests.  The metal branch now also requires
+        # explicit smearing metadata, but that metadata does not weaken this
+        # rule: every certified w_bse path is insulating, so the material
+        # class alone is the complete parse-time predicate.  A fractional
+        # WFN whose deck never declares metal is caught by the runtime
+        # occupation gate (gw/screening_bse.py, the same rule id).
         "w_bse_insulators_only",
         lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
                      .strip().lower() != "insulator"),
@@ -606,11 +602,10 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "enter BOTH -- the pair basis gains partially-blocked transitions "
         "and (z - H)^-1 gains poles at ~0 -- in ways nothing here has "
         "measured, so the run would produce a complete, plausible W under "
-        "a diagram set that was never verified for it.  Same shape and "
-        "same reason as the MPA metal gate (src/gw/mpa/model.py, GATE "
-        "mpa_metal_evaluator_unavailable): the metallic SAMPLE PLAN "
-        "exists there too, and building it is still not a claim that the "
-        "occupation-weighted evaluators behind it have landed",
+        "a diagram set that was never verified for it.  The metallic MPA "
+        "screening/Sigma pipeline is live under screening_diagrams = w_rpa; "
+        "that is the supported alternative, not evidence that the distinct "
+        "ladder operator has acquired fractional-occupation semantics",
     ),
     (
         "w_bse_head_placement_unimplemented",
@@ -718,12 +713,7 @@ def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
 # REMOVING A ROW IS THE LANDING GESTURE.  When the MPA fit stage lands,
 # its author deletes this entry and the suite that pins the refusal fails
 # loudly until it is rewritten to pin the new behaviour.
-UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {
-    ComputeMode.MPA: (
-        "the real-material chi/W/fixed-head/Sigma/QSGW disk pipeline "
-        "must pass end to end; see THEORY_mpa_implementation.md"
-    ),
-}
+UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {}
 
 
 def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
@@ -898,6 +888,57 @@ def eigh_backend_choices() -> tuple:
     return tuple(BACKEND_CHOICES["eigh"])
 
 
+def distrib_la_batched_route_choices() -> tuple[str, ...]:
+    """User-facing batch-route vocabulary from the ``distrib_la`` door.
+
+    ``auto`` preserves the resolved backend's established scan/stacked-FFI
+    route.  ``batch_reshard`` moves the batch axis onto the device mesh and
+    runs the service's local JAX kernel on whole per-device matrices.  Keep
+    this resolver beside :func:`eigh_backend_choices`: deck and CLI parsers
+    must not grow frozen copies of a service-owned vocabulary.
+    """
+    try:
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import BATCHED_ROUTE_CHOICES
+    except ImportError:
+        # A source-only install can parse decks before services/ is installed.
+        # The service contract test pins this fallback equal to the live list.
+        return ("auto", "batch_reshard")
+    return tuple(BATCHED_ROUTE_CHOICES)
+
+
+def resolve_distrib_la_batched_route(
+        params, *, override: str | None = None) -> str:
+    """Resolve the universal distrib_la batch schedule from deck/CLI input.
+
+    ``use_low_mem_eigh`` says that one complete eigensolver tile cannot fit
+    on a device; ``batch_reshard`` requires exactly that residency.  Refuse
+    the contradictory pair here, before either the GW or standalone BSE
+    drivers allocate a matrix.
+    """
+    raw = (override if override is not None else
+           (params.get("distrib_la_batched_route", "auto")
+            if hasattr(params, "get") else "auto"))
+    route = str("auto" if raw is None else raw).strip().lower()
+    choices = distrib_la_batched_route_choices()
+    if route not in choices:
+        raise ValueError(
+            f"distrib_la_batched_route={route!r} invalid; expected "
+            f"{' / '.join(choices)}.")
+    if (route == "batch_reshard" and hasattr(params, "get")
+            and bool(params.get("use_low_mem_eigh", False))):
+        raise ValueError(
+            "distrib_la_batched_route='batch_reshard' contradicts "
+            "use_low_mem_eigh=true: batch_reshard places one complete "
+            "matrix (and its result/workspace) on each participating "
+            "device, while use_low_mem_eigh asserts that whole-tile "
+            "residency is not safe.  Keep distrib_la_batched_route=auto "
+            "for the robust face-sharded eigensolver route, or disable "
+            "use_low_mem_eigh only when a full tile fits.")
+    return route
+
+
 def resolve_eigh_backend(params, *, override: str | None = None) -> str:
     """``(eigh_backend, use_low_mem_eigh)`` → ONE backend string.
 
@@ -1014,6 +1055,13 @@ _DEFAULTS = {
     # boundary.  Sigma stays on the full BZ -- it is an FFT over the
     # k-grid.  Off keeps the loop entirely full-BZ.
     "sc_on_ibz": False,
+    # Update the q->0 head from the current QSGW Hamiltonian through the
+    # precomputed parallel-transport connection.  Explicit opt-in preserves
+    # every historical deck and makes a missing/stale artifact a refusal.
+    # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
+    # p-matrix velocity stage only, without the connection.
+    "sc_head_update": "off",       # off | parallel_transport | dft_velocity
+    "parallel_transport_file": "parallel_transport.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1269,6 +1317,14 @@ _DEFAULTS = {
     #       explicit, never auto-picked.  (SLATE getrf not yet written.)
     "distributed_cholesky": "auto",
     "distributed_lu":       "auto",
+    # Universal schedule for every array-returning ``distrib_la.Plan.batched``
+    # call.  ``auto`` preserves the robust distributed/backend-batched route
+    # selected by each plan.  ``batch_reshard`` is the small-matrix/high-HBM
+    # opt-in: P(None,'x','y') -> P(('x','y'),None,None), local JAX linalg on
+    # each device's whole matrices, then the inverse reshard.  Backend
+    # resolution and the Plan I/O contract stay unchanged; this explicit
+    # route runs the local JAX kernel in place of that backend for the call.
+    "distrib_la_batched_route": "auto",
     #   eigh_backend = auto | off | distributed | cusolvermp | slate
     #                | scalapack
     #       Hermitian eigensolver for the BSE/htransform distributed-eigh
@@ -1425,6 +1481,16 @@ _DEFAULTS = {
     # (lu → local with a DeprecationWarning; lstsq was removed.)
     "w_dyson_solver": "auto",
     "mc_average_vcoul_body": True,
+    # One explicit BerkeleyGW-emulation contract for the metallic q=0 cell.
+    # ``exact`` is the shipped LORRAX limit.  ``bgw_q0shift`` bundles the
+    # three BGW conventions that must move together: no finite-q body-slot
+    # averaging, the analytic-sphere q=0 bare-head estimator, and screening
+    # sampled at a finite shifted q0.  It deliberately does not select an
+    # occupation/spectral broadening or an MPA quadrature.
+    "bgw_metal_q0_treatment": "exact",
+    # Reduced reciprocal coordinates of BGW's epsilon q0 sample.  The
+    # shipping comparison grid is 8x8x8, so (0,0,1/8) is one grid step.
+    "bgw_metal_q0_vector": "0 0 0.125",
     # WHERE the q != 0 mini-BZ Coulomb average is APPLIED.  Orthogonal to
     # ``mc_average_vcoul_body``, which decides WHETHER an average is computed.
     #   "off"  (default) -- today's placement: <v> is substituted into the
@@ -1463,6 +1529,12 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # Opt-in finite-q W-av preprocessing.  The flags select the first and
+    # second reciprocal-grid stencil shells written beside the PT data; they
+    # do not activate the not-yet-complete metallic finite-q screening path.
+    "w_av_first_neighbors": False,
+    "w_av_second_neighbors": False,
+
     # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
     # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
     # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
@@ -1508,6 +1580,12 @@ _DEFAULTS = {
     #        ladder kernel's W_R.  Refused against x_only / hl_ppm /
     #        qp_solver = self_consistent / mc_average_placement != off.
     "screening_diagrams": "w_rpa",
+    # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
+    # Zero preserves the historical step-occupation path.  The first
+    # consumer is the per-iteration QSGW parallel-transport head; the same
+    # key is intentionally reserved for later Green-function/screening
+    # consumers so there is one occupation convention for the whole code.
+    "occ_broadening": 0.0,
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
     "regenerate_minimax_tables": False,
@@ -1554,7 +1632,15 @@ _DEFAULTS = {
     "mpa_sampling_alpha": 1,
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
-    "mpa_head_model": "fixed_dft",
+    # Height (Ry) of the metal near line's FIRST sample, z_1^1 = i*shift --
+    # the published stability dodge around zero-energy intraband
+    # transitions, NOT a broadening.  Unset (the default) = the published
+    # 1e-5 Ha = 2e-5 Ry constant in ``gw.mpa.sampling._METAL_ORIGIN_SHIFT``,
+    # which is bit-for-bit every grid built before this key existed.  A
+    # METAL-ONLY key: an insulating deck's first sample is z = 0 exactly, so
+    # setting it there is refused rather than ignored.  Ry like every deck
+    # key, and therefore TWICE the Ha value the papers quote.
+    "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
     # Both targets bound the same dimensionless relative residual
     # |1-d Q(d)|.  They are separate because the positive crossing rule is
@@ -1563,14 +1649,20 @@ _DEFAULTS = {
     "mpa_sigma_sector_target_error": 6.5e-4,
     "mpa_sigma_crossing_target_error": 2.0e-3,
     "mpa_sigma_max_nodes": 96,
+    # Σ planner ω-clustering gap (Ry): with a gapped (patched) ω grid the
+    # crossing core decomposes per cluster; a contiguous grid is always
+    # one cluster and keeps the incumbent plan bit-for-bit.
+    "mpa_sigma_omega_cluster_gap_ry": 1.0,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
     "sigma_omega_step_ev": 0.25,
+    # "" = the contiguous [min, max] grid.  "lo:hi, lo:hi" (eV) = a union
+    # of uniform patches at sigma_omega_step_ev — the semicore dynamic-
+    # range spelling (docs/dev/crossing-rule-cost-law.md).
+    "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
     "sigma_window_edge_factor": 1.5,
-    "sigma_omega_batch_size": 4,
-    "sigma_omega_accumulation": "auto",
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
     #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
     #       tiles are gathered into the FULL cube on EVERY rank
@@ -1599,6 +1691,13 @@ _DEFAULTS = {
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
     "fermi_reference": "midgap",
+    # DFT occupation smearing of the starting point.  REQUIRED as a pair
+    # when ``mpa_material_class = metal``; refused under insulator.  These
+    # are deck keys because WFN.h5 does NOT carry them: mf_header stores
+    # el/occ/w but no smearing family and no degauss (verified 2026-08-15
+    # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
+    "occ_smearing_family": None,
+    "occ_smearing_width_ry": None,
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
     # as an alias for ``qp_solver = one_shot_dft`` — which is now the
@@ -1661,6 +1760,10 @@ _LEGACY_DECK_KEYS = frozenset({
     # running and say what it lost.  See file_io/slab_io.py.
     "slab_io",                      # warn-and-ignore (one transport now)
     "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
+    # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
+    # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
+    # keeps its dedicated parse refusal; other values warn-and-ignore.
+    "sigma_omega_accumulation",
 })
 
 # Keys whose string values should be lowercased and stripped
@@ -1669,9 +1772,11 @@ _NORMALIZE_STR = {
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
+    "sc_head_update",
     "wcoul0_source", "screening_method", "screening_diagrams",
     "minimax_energy_reference",
-    "sigma_omega_accumulation", "sigma_omega_layout", "fermi_reference",
+    "sigma_omega_layout", "fermi_reference",
+    "occ_smearing_family",
     "w_dyson_solver",
     "ppm_invalid_mode",
     "ppm_model",
@@ -1684,6 +1789,7 @@ _NORMALIZE_STR = {
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
+    "distrib_la_batched_route",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -1698,6 +1804,10 @@ _NULLABLE_BOOL = frozenset()
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({"zeta_nband"})
+
+#: Keys whose default is None but whose explicit value is a STRING — the
+#: bare ``default is None`` parser branch is the nullable-float one.
+_NULLABLE_STR = frozenset({"occ_smearing_family"})
 
 #: Reserved slot in the params dict holding the set of deck keys the DECK
 #: named.  Leading underscore because it is not a deck key and must never
@@ -1871,6 +1981,26 @@ def read_lorrax_input(filename: str) -> dict:
                     "IGNORED — one sharded-slab transport, not deck-selectable "
                     "(it never changed a number, only which library moved "
                     "the bytes)"))
+        # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
+        # accumulation is the only mode, so the key steered nothing.  The
+        # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
+        _acc = section.get("sigma_omega_accumulation", fallback=None)
+        if _acc is not None:
+            if _acc.strip().strip('"\'').lower() == "kij_stream":
+                raise ValueError(
+                    "sigma_omega_accumulation = kij_stream was REMOVED; "
+                    "host-tile accumulation is the only mode "
+                    "(sigma_omega_layout selects the end-of-stage layout)")
+            import warnings
+            warnings.warn(
+                "Input key 'sigma_omega_accumulation' is no longer "
+                "supported and will be ignored (host-tile accumulation is "
+                "the only mode).  Remove it from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sigma_omega_accumulation",
+                "IGNORED — host-tile accumulation is the only mode"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
         for legacy_key, replacement in (
@@ -1973,6 +2103,8 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = section.getboolean(key)
             elif key in _NULLABLE_INT:
                 params[key] = section.getint(key)
+            elif key in _NULLABLE_STR:
+                params[key] = str(raw)
             elif isinstance(default, bool):
                 params[key] = section.getboolean(key)
             elif isinstance(default, int):
@@ -2048,6 +2180,7 @@ class FilePaths:
     # ``None`` falls back to the scalar charge-only path (CC tile only).
     centroids_file_current: str | None
     kin_ion_file: str
+    parallel_transport_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -2069,6 +2202,42 @@ def _normalize_placement(value):
     return normalize_placement(value)
 
 
+BGW_METAL_Q0_TREATMENTS = ("exact", "bgw_q0shift")
+
+
+def _normalize_bgw_metal_q0_treatment(value) -> str:
+    mode = str(value or "exact").strip().lower()
+    if mode not in BGW_METAL_Q0_TREATMENTS:
+        raise ValueError(
+            f"bgw_metal_q0_treatment = {value!r} is not recognised; expected "
+            "'exact' or 'bgw_q0shift'.")
+    return mode
+
+
+def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
+    """Parse one reduced-coordinate q0 vector without guessing its units."""
+    raw = str(value or "").replace(",", " ").split()
+    if len(raw) != 3:
+        raise ValueError(
+            "bgw_metal_q0_vector must contain exactly three reduced "
+            f"reciprocal coordinates; got {value!r}.")
+    try:
+        q0 = tuple(float(component) for component in raw)
+    except ValueError as exc:
+        raise ValueError(
+            "bgw_metal_q0_vector must contain three finite numbers; "
+            f"got {value!r}.") from exc
+    if not all(np.isfinite(component) for component in q0):
+        raise ValueError(
+            "bgw_metal_q0_vector must contain three finite numbers; "
+            f"got {value!r}.")
+    if max(abs(component) for component in q0) <= 1.0e-14:
+        raise ValueError(
+            "bgw_metal_q0_vector must be nonzero: BerkeleyGW's metallic "
+            "epsilon q0 sample is a shifted grid point.")
+    return q0
+
+
 @dataclass(frozen=True)
 class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs.
@@ -2085,14 +2254,27 @@ class HeadConfig:
     whead_0freq: float | None     # explicit override W_h[ω=0]
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
+    bgw_metal_q0_treatment: str   # "exact" | "bgw_q0shift"
+    bgw_metal_q0_vector: tuple[float, float, float]
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
+    w_av_first_neighbors: bool
+    w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
     bgw_vcoul_sym_wfn: str | None
+
+    @property
+    def uses_bgw_metal_q0shift(self) -> bool:
+        return self.bgw_metal_q0_treatment == "bgw_q0shift"
+
+    @property
+    def analytic_q0_sphere(self) -> bool:
+        """Whether the q=0 bare head uses the analytic-sphere split."""
+        return self.head_minibz_average or self.uses_bgw_metal_q0shift
 
 
 @dataclass(frozen=True)
@@ -2117,6 +2299,7 @@ class ScreeningConfig:
     defect the ``restart_q_storage`` note above describes.
     """
     method: str                   # "minimax" -- the only supported value
+    occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
@@ -2124,6 +2307,8 @@ class ScreeningConfig:
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
 
     def __post_init__(self):
+        if self.occ_broadening_ev < 0.0:
+            raise ValueError("occ_broadening must be >= 0 eV.")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from
         # the pre-minimax era) was accepted here for months and always ran
@@ -2172,31 +2357,70 @@ class DynamicSigmaConfig:
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
-    omega_batch_size: int
-    omega_accumulation: str
     omega_layout: str
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
+    #: ``sigma_omega_patches_ev``: "" (default, the contiguous
+    #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
+    #: patches at ``omega_step_ev``, replacing the contiguous grid.  This
+    #: is how a semicore run buys its dynamic range: dense points near
+    #: the valence window and near each semicore QP cluster, NO points
+    #: in the empty gap between them, so the MPA crossing rule never has
+    #: to resolve the gap (docs/dev/crossing-rule-cost-law.md).  The
+    #: Σ(ω)→E interpolation is searchsorted piecewise-linear and needs no
+    #: uniformity; solved QP energies landing inside a hole are refused
+    #: at the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).
+    omega_patches_ev: str = ""
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-        if self.fermi_reference not in ("vbm", "midgap"):
-            raise ValueError("fermi_reference must be 'vbm' or 'midgap'.")
-        if self.omega_accumulation == "kij_stream":
+        self.parsed_omega_patches_ev()
+        if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
-                "sigma_omega_accumulation = kij_stream was REMOVED; use "
-                "'kij' or 'auto' with sigma_omega_layout = sharded")
-        if self.omega_accumulation not in ("auto", "kij"):
-            raise ValueError("sigma_omega_accumulation must be auto/kij.")
+                "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
-        if self.omega_batch_size < 1:
-            raise ValueError("sigma_omega_batch_size must be >= 1.")
+
+    def parsed_omega_patches_ev(self):
+        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
+
+        Parsed from ``"lo:hi, lo:hi"``.  Patches must be well-formed
+        (hi > lo), ascending, and separated by at least one step —
+        overlapping or touching patches are a deck typo, refused rather
+        than silently merged.
+        """
+        text = str(self.omega_patches_ev or "").strip()
+        if not text:
+            return []
+        patches = []
+        for piece in text.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            parts = piece.split(":")
+            try:
+                lo, hi = (float(parts[0]), float(parts[1])) \
+                    if len(parts) == 2 else (np.nan, np.nan)
+            except ValueError:
+                lo = hi = np.nan
+            if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+                raise ValueError(
+                    "sigma_omega_patches_ev must be 'lo:hi, lo:hi, ...' "
+                    f"with hi > lo in eV; could not parse {piece!r}")
+            patches.append((lo, hi))
+        for (l0, h0), (l1, h1) in zip(patches, patches[1:]):
+            if l1 < h0 + self.omega_step_ev:
+                raise ValueError(
+                    "sigma_omega_patches_ev patches must be ascending and "
+                    f"separated by at least one step; [{l0}:{h0}] then "
+                    f"[{l1}:{h1}] at step {self.omega_step_ev}. Merge "
+                    "them into one patch instead.")
+        return patches
 
 
 @dataclass(frozen=True)
@@ -2245,12 +2469,24 @@ class MPAConfig:
     sampling_alpha: int
     varpi_near_ry: float
     varpi_far_ry: float
-    head_model: str
+    #: Metal near-line origin shift in Ry; ``None`` = the published
+    #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
+    metal_origin_shift_ry: float | None
     pole_batch_size: int
     sigma_sector_target_error: float
     sigma_crossing_target_error: float
     sigma_max_nodes: int
+    #: ``mpa_sigma_omega_cluster_gap_ry``: the Σ planner splits each
+    #: branch's |ω| evaluation values into clusters at gaps larger than
+    #: this, decomposing the crossing core per cluster (shell + Laplace
+    #: slabs) so the eta-resolved rule bandwidth is set by the cluster
+    #: span, not the dynamic range.  A contiguous grid is always one
+    #: cluster (the incumbent plan, bit-for-bit); pair with
+    #: ``sigma_omega_patches_ev`` to actually gap the grid.
+    sigma_omega_cluster_gap_ry: float = 1.0
 
+    # pole_batch_size and the two Sigma target errors are validated at their
+    # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
@@ -2263,16 +2499,35 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        if self.head_model != "fixed_dft":
-            raise NotImplementedError(
-                "mpa_head_model currently supports only 'fixed_dft'")
-        if not 1 <= self.pole_batch_size <= 4:
-            raise ValueError("mpa_pole_batch_size must be in [1, 4]")
-        if not (0.0 < self.sigma_sector_target_error < 1.0
-                and 0.0 < self.sigma_crossing_target_error < 1.0):
-            raise ValueError("MPA Sigma target errors must lie in (0, 1)")
+        # The origin shift is metal-only geometry: an insulating plan puts
+        # its first near-line sample at z = 0 exactly, so a shift there is
+        # an off-dial that must refuse rather than be ignored.
+        if self.metal_origin_shift_ry is not None:
+            if self.material_class != "metal":
+                raise ValueError(
+                    "mpa_metal_origin_shift_ry is a metal-only key "
+                    f"(mpa_material_class = {self.material_class} here): it "
+                    "moves the METAL near line's first sample off zero, and "
+                    "an insulating plan samples z = 0 exactly. Remove it, or "
+                    "set mpa_material_class = metal.")
+            if not (0.0 < self.metal_origin_shift_ry < self.varpi_near_ry):
+                raise ValueError(
+                    "mpa_metal_origin_shift_ry must satisfy 0 < shift < "
+                    f"mpa_varpi_near_ry; got shift = "
+                    f"{self.metal_origin_shift_ry!r} Ry against "
+                    f"mpa_varpi_near_ry = {self.varpi_near_ry!r} Ry. The "
+                    "shift dodges the zero-energy intraband pile-up without "
+                    "climbing off the near line it sits on. NOTE the unit: "
+                    "this key is Ry like every deck key, so it is TWICE the "
+                    "Hartree value the multipole papers quote (published "
+                    "default 1e-5 Ha = 2e-5 Ry).")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
+        if not (np.isfinite(self.sigma_omega_cluster_gap_ry)
+                and self.sigma_omega_cluster_gap_ry > 0.0):
+            raise ValueError(
+                "mpa_sigma_omega_cluster_gap_ry must be finite and "
+                "positive (Ry); a huge value disables clustering")
 
     def sample_plan(self, omega_m_ry):
         """Return the configured double-parallel frequency plan in Ry.
@@ -2289,8 +2544,16 @@ class MPAConfig:
             alpha=self.sampling_alpha,
             varpi_near=self.varpi_near_ry,
             varpi_far=self.varpi_far_ry,
+            origin_shift=self.metal_origin_shift_ry,
             energy_unit="Ry",
         )
+
+
+#: The ``sc_head_update`` values that rebuild the q->0 head every QSGW
+#: iteration, i.e. the ones a fractionally occupied deck may choose.  One
+#: tuple, so the vocabulary, the mandatory-metal rule and the driver's
+#: dispatch cannot disagree about what "a metal head mode" is.
+METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
 
 @dataclass(frozen=True)
@@ -2324,6 +2587,14 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     eigh: str = "auto"    # "auto" | "native" | "distributed"
+    #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
+    #: values are the METAL head modes: both run the per-iteration head
+    #: chain, and they differ only in the velocity operator they feed it —
+    #: ``parallel_transport`` adds the covariant DΔH correction from the
+    #: saved Berry connection, ``dft_velocity`` uses the exact DFT p-matrix
+    #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
+    #: test against; do not spell the pair out a second time.
+    head_update: str = "off"
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -2342,6 +2613,11 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
+        if self.head_update not in ("off",) + METAL_HEAD_UPDATES:
+            raise ValueError(
+                "sc_head_update must be 'off', "
+                + " or ".join(repr(v) for v in METAL_HEAD_UPDATES)
+                + f"; got {self.head_update!r}.")
 
 
 @dataclass(frozen=True)
@@ -2377,6 +2653,7 @@ class BackendConfig:
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
+    distrib_la_batched_route: str  # "auto" | "batch_reshard"
     eigh_backend: str          # resolved: auto|off|distributed|cusolvermp|
                                #           slate|scalapack (use_low_mem_eigh
                                #           already folded in)
@@ -2397,6 +2674,8 @@ class BackendConfig:
                if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
             f"distributed_lu={self.distributed_lu}, "
+            + (f"distrib_la_batched_route={self.distrib_la_batched_route}, "
+               if self.distrib_la_batched_route != "auto" else "")
             + (f"eigh_backend={self.eigh_backend}"
                + (" (use_low_mem_eigh)" if self.use_low_mem_eigh else "")
                + ", " if self.eigh_backend != "auto" else "")
@@ -2436,6 +2715,98 @@ class BSEConfig:
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 
+#: Relative tolerance on the ``occ_smearing_width_ry`` / ``occ_broadening``
+#: agreement.  Loose enough that the eV<->Ry round trip cannot trip it (a
+#: deck written with CODATA 13.605693122994 eV/Ry and read back through
+#: ``common.units.RYD_TO_EV`` = 13.6056980659 differs by 3.6e-7 relative),
+#: tight enough that a CONVENTION error — the factor of two between the QE
+#: degauss and BerkeleyGW's half-width — is three orders of magnitude clear
+#: of it.
+_OCC_WIDTH_RTOL = 1.0e-4
+
+
+def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
+    """Cross-key deck validation for the metallic occupation model.
+
+    Metal decks must declare the smearing pair and the two Sigma keys the
+    metallic MPA path actually honors; insulating decks must not carry the
+    smearing pair at all (an off-dial refusal, never a silent ignore).
+    Module-level so tests exercise it without a full parse.
+
+    THE WIDTH CONVENTION, stated once, here, because two keys carry it.
+    ``occ_smearing_width_ry`` and ``occ_broadening`` are the SAME width in
+    different units: BerkeleyGW's ``occ_broadening``, whose MP1 argument is
+    ``(E - mu) / (2 * width)``.  The QE ``degauss`` is TWICE it.  A deck
+    that sets both and disagrees is refused below rather than silently
+    resolved, because the two ways of being wrong (halving or doubling the
+    smearing) are indistinguishable in the output.
+    """
+    if mpa.material_class == "metal":
+        if family is None or width_ry is None:
+            raise ValueError(
+                "mpa_material_class = metal requires the occupation "
+                "smearing pair: set occ_smearing_family = mp1 and "
+                "occ_smearing_width_ry = <BerkeleyGW occ_broadening, in "
+                "Ry> = <the QE degauss, in Ry> / 2. "
+                "They cannot be derived from WFN.h5 (mf_header carries "
+                "no smearing metadata).")
+        if family != "mp1":
+            raise ValueError(
+                "occ_smearing_family supports only 'mp1' "
+                f"(Methfessel-Paxton order 1); got {family!r}. Other "
+                "families need their own occupation solve and error "
+                "certificates before they can be honored.")
+        if not width_ry > 0.0:
+            raise ValueError(
+                "occ_smearing_width_ry must be > 0 for a metal; got "
+                f"{width_ry!r}")
+        if sigma.fermi_reference != "mp1_fixed_n":
+            raise ValueError(
+                "mpa_material_class = metal requires fermi_reference = "
+                f"mp1_fixed_n (got {sigma.fermi_reference!r}): the metallic "
+                "Sigma measures energies against the fixed-N MP1 chemical "
+                "potential, not a gap-derived reference.")
+        if sigma.omega_layout != "sharded":
+            raise ValueError(
+                "mpa_material_class = metal requires sigma_omega_layout = "
+                f"sharded (got {sigma.omega_layout!r}): the MPA Sigma "
+                "emits the mesh-sharded omega cube only.")
+    else:
+        if family is not None or width_ry is not None:
+            raise ValueError(
+                "occ_smearing_family / occ_smearing_width_ry are metal-only "
+                "keys (mpa_material_class = insulator here). Remove them, "
+                "or set mpa_material_class = metal.")
+        if sigma.fermi_reference == "mp1_fixed_n":
+            raise ValueError(
+                "fermi_reference = mp1_fixed_n requires "
+                "mpa_material_class = metal (it names the fixed-N MP1 "
+                "chemical potential, which insulating decks do not solve).")
+
+    # Cross-key width agreement, checked last so the class-level off-dial
+    # refusals above own their own messages.  ``occ_broadening = 0`` is the
+    # documented "step occupations" dial, not a width, so it is never a
+    # disagreement — the b24/b40 step-occupation control arms deliberately
+    # set exactly that beside a live smearing pair.
+    broadening_ev = float(screening.occ_broadening_ev)
+    if width_ry is not None and broadening_ev > 0.0:
+        broadening_ry = broadening_ev / RYD_TO_EV
+        if abs(width_ry - broadening_ry) > _OCC_WIDTH_RTOL * abs(broadening_ry):
+            raise ValueError(
+                "occ_smearing_width_ry and occ_broadening are the SAME "
+                "width in different units, and this deck's two values "
+                f"disagree: occ_smearing_width_ry = {width_ry!r} Ry vs "
+                f"occ_broadening = {broadening_ev!r} eV = "
+                f"{broadening_ry:.12g} Ry (RYD_TO_EV = {RYD_TO_EV}). "
+                "Both are BerkeleyGW's occ_broadening, whose MP1 argument "
+                "is (E-mu)/(2*width); the QE degauss is TWICE either of "
+                f"them, so this deck implies degauss = {2.0 * width_ry:.12g}"
+                f" Ry from the first key and {2.0 * broadening_ry:.12g} Ry "
+                "from the second. Set occ_smearing_width_ry = degauss/2 "
+                "and occ_broadening = occ_smearing_width_ry * "
+                f"{RYD_TO_EV} eV/Ry, or remove one of them.")
+
+
 @dataclass(frozen=True)
 class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation.
@@ -2472,6 +2843,19 @@ class LorraxConfig:
     sc_on_ibz: bool
     #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
     hartree_source: str
+    #: DFT occupation smearing of the starting point ("mp1" = Methfessel-
+    #: Paxton order 1, the only certified family).  REQUIRED as a pair when
+    #: ``mpa_material_class = metal``; refused under insulator.  Deck keys,
+    #: not derived: WFN.h5's mf_header carries el/occ/w but no smearing
+    #: metadata (see ``_DEFAULTS``).  Validated by
+    #: ``_validate_occupation_smearing``.
+    #:
+    #: ``occ_smearing_width_ry`` IS ``occ_broadening`` in Ry — BerkeleyGW's
+    #: convention, MP1 argument ``(E-mu)/(2*width)`` — and therefore HALF
+    #: the QE ``degauss``.  It is the metal path's single width source; see
+    #: :attr:`occ_broadening_ry`.
+    occ_smearing_family: str | None
+    occ_smearing_width_ry: float | None
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
@@ -2539,9 +2923,71 @@ class LorraxConfig:
     # guessing a deck beside the restart.
     input_file: str = ""
 
+    def __post_init__(self):
+        """Refuse fractional-occupation settings outside their landed scope."""
+        if self.screening.occ_broadening_ev == 0.0:
+            return
+        if self.qp_solver is not QPSolver.SELF_CONSISTENT:
+            raise ValueError(
+                "occ_broadening > 0 is currently implemented only for "
+                "qp_solver=self_consistent.")
+        if self.sc.head_update not in METAL_HEAD_UPDATES:
+            raise ValueError(
+                "occ_broadening > 0 currently updates only the QSGW head; "
+                "set sc_head_update to one of "
+                + ", ".join(METAL_HEAD_UPDATES)
+                + ".")
+        # rCROP is legal on metallic decks since the ENTRY-solve rule
+        # (2026-08-15): gw_iteration_map solves its MP1 occupation state
+        # from the spectrum of the H it is handed, every call, so F(H) is
+        # a self-map of H alone and any accelerator trajectory (trial or
+        # accepted iterates) gets occupations consistent with its own H
+        # by construction.  The refusal this replaces guarded the old
+        # END-of-iteration carry, which was exact only on the mixing=1
+        # linear trajectory.
+
     # ------------------------------------------------------------------
     #  Derived config objects
     # ------------------------------------------------------------------
+
+    @property
+    def occ_broadening_ry(self) -> float:
+        """THE occupation-smearing width consumed at runtime, in Ry.
+
+        One width, one owner.  Every MP1 solve in the driver reads this
+        and nothing else, so the two deck keys that carry the width can
+        no longer feed different numbers into different stages.
+
+        CONVENTION — BerkeleyGW's, not QE's.  ``gw.efermi``'s MP1
+        argument is ``(E - mu) / (2 * width)`` (``_mp1_values``), the same
+        form BerkeleyGW uses (``Common/input_utils.f90:380``), so this
+        width is HALF the QE ``degauss``.  Measured, not asserted: at
+        ``degauss = 0.02 Ry`` the sodium SOC deck's BGW arm reproduces
+        QE's own stored occupations to 7.1e-12 with ``occ_broadening =
+        0.13605693122994 eV = 0.01 Ry`` (CLAIMS 185), and LORRAX's mu
+        lands 6.2e-7 eV from QE's E_F at the same width (CLAIMS 180).
+        ``OccupationState.smearing_width_ry`` — the field this feeds and
+        the one stamped into the MPA fit store — is the same quantity
+        under the same name.
+
+        SOURCE.  ``occ_smearing_width_ry`` when the deck declares it (the
+        metal path); otherwise ``occ_broadening`` converted from eV, which
+        is every insulating and pre-metal deck and is bit-for-bit what
+        those decks used before this key existed.  When both are set
+        ``_validate_occupation_smearing`` has already refused any
+        disagreement beyond ``_OCC_WIDTH_RTOL``, so the branch cannot
+        change the physics of a deck that carries both — it only decides
+        which of two agreeing numbers is the exact one, and the deck's own
+        Ry value is the one that did not make a round trip through eV.
+
+        NOT A DIAL.  ``occ_broadening == 0`` remains the switch that
+        selects step occupations (``sc_iteration._solve_head_occupations``
+        and the metal V_H rebuild both read it as such); this property
+        answers "how wide", never "whether".
+        """
+        if self.occ_smearing_width_ry is not None:
+            return float(self.occ_smearing_width_ry)
+        return float(self.screening.occ_broadening_ev) / RYD_TO_EV
 
     @property
     def compute_mode(self) -> ComputeMode:
@@ -2673,11 +3119,31 @@ class LorraxConfig:
         ``n = floor((max−min)/step + 0.5) + 1`` — the Ry grid is derived
         from this one by division so the two can never disagree in length
         or accumulate independent float-step rounding.
+
+        With ``sigma_omega_patches_ev`` set, the grid is the union of the
+        patches, each built by the SAME length-stable formula, ascending
+        by the patch validation.  ``sigma_omega_min/max_ev`` are ignored
+        then — the patches ARE the grid.
         """
         p = self.sigma
-        n = int(np.floor(
-            (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev + 0.5)) + 1
-        return p.omega_min_ev + p.omega_step_ev * np.arange(n, dtype=np.float64)
+        patches = p.parsed_omega_patches_ev()
+        if not patches:
+            n = int(np.floor(
+                (p.omega_max_ev - p.omega_min_ev) / p.omega_step_ev
+                + 0.5)) + 1
+            return (p.omega_min_ev
+                    + p.omega_step_ev * np.arange(n, dtype=np.float64))
+        pieces = []
+        for lo, hi in patches:
+            n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
+            pieces.append(lo + p.omega_step_ev * np.arange(
+                n, dtype=np.float64))
+        grid = np.concatenate(pieces)
+        if np.any(np.diff(grid) <= 0.0):
+            raise ValueError(
+                "sigma_omega_patches_ev produced a non-increasing grid; "
+                "patches must be ascending and disjoint")
+        return grid
 
     @property
     def omega_grid_ry(self):
@@ -2762,6 +3228,55 @@ class LorraxConfig:
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
 
+        # Resolve the bundled metallic q0 contract before constructing any
+        # typed group.  ``mc_average_vcoul_body`` defaults to true for every
+        # historical deck, but BGW's noavg metal comparison requires false.
+        # Only an EXPLICIT contradictory value refuses: an absent key is the
+        # compatibility case this bundle exists to override, while an
+        # explicit false is already compatible and remains visible in the
+        # provenance line.
+        _bgw_q0_mode = _normalize_bgw_metal_q0_treatment(
+            _g("bgw_metal_q0_treatment"))
+        _bgw_q0_vector = _parse_bgw_metal_q0_vector(
+            _g("bgw_metal_q0_vector"))
+        if _bgw_q0_mode == "bgw_q0shift" and int(_g("sys_dim")) != 3:
+            raise ValueError(
+                "bgw_metal_q0_treatment = bgw_q0shift is defined only for "
+                "3-D metals (sys_dim = 3); this deck sets "
+                f"sys_dim = {int(_g('sys_dim'))}.")
+        _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
+        _effective_named_keys = set(_named_keys)
+        if _bgw_q0_mode == "exact":
+            # An explicit spelling of the shipping default must serialize to
+            # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
+            # otherwise the one field that would distinguish them.
+            _effective_named_keys.discard("bgw_metal_q0_treatment")
+            if _bgw_q0_vector == _parse_bgw_metal_q0_vector(
+                    _DEFAULTS["bgw_metal_q0_vector"]):
+                _effective_named_keys.discard("bgw_metal_q0_vector")
+        _mc_average_vcoul_body = bool(_g("mc_average_vcoul_body"))
+        if _bgw_q0_mode == "bgw_q0shift":
+            if ("mc_average_vcoul_body" in _named_keys
+                    and _mc_average_vcoul_body):
+                raise ValueError(
+                    "contradictory deck settings: "
+                    "bgw_metal_q0_treatment = bgw_q0shift requires "
+                    "mc_average_vcoul_body = false, but the deck explicitly "
+                    "sets mc_average_vcoul_body = true. Remove that key or "
+                    "set it to false.")
+            _mc_origin = (
+                "explicit compatible mc_average_vcoul_body=false"
+                if "mc_average_vcoul_body" in _named_keys
+                else "inherited mc_average_vcoul_body=true")
+            print_fn(
+                "  [config provenance] bgw_metal_q0_treatment="
+                "bgw_q0shift: overriding mc_average_vcoul_body -> false "
+                f"({_mc_origin}); q0 reduced vector="
+                f"{_bgw_q0_vector}. Analytic-sphere v-head and finite-q0 "
+                "W head/wings are enabled; eta/broadening and MPA "
+                "quadrature are unchanged.")
+            _mc_average_vcoul_body = False
+
         # --- Build sub-dataclasses ---
         cents_curr = _g("centroids_file_current")
         cents_curr_resolved = str(cents_curr) if cents_curr else None
@@ -2770,6 +3285,7 @@ class LorraxConfig:
             centroids_file=str(_g("centroids_file")),
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
+            parallel_transport_file=str(_g("parallel_transport_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
@@ -2781,12 +3297,16 @@ class LorraxConfig:
             vhead=_g("vhead"),
             whead_0freq=_g("whead_0freq"),
             whead_imfreq=_g("whead_imfreq"),
-            mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            mc_average_vcoul_body=_mc_average_vcoul_body,
+            bgw_metal_q0_treatment=_bgw_q0_mode,
+            bgw_metal_q0_vector=_bgw_q0_vector,
             mc_average_placement=_normalize_placement(
                 _g("mc_average_placement")),
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
+            w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
+            w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
             zeta_cutoff=_g("zeta_cutoff"),
             use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
@@ -2795,6 +3315,7 @@ class LorraxConfig:
         )
         screening = ScreeningConfig(
             method=str(_g("screening_method")).strip().lower(),
+            occ_broadening_ev=float(_g("occ_broadening")),
             minimax_target_error=float(_g("minimax_target_error")),
             minimax_max_nodes=int(_g("minimax_max_nodes")),
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
@@ -2819,13 +3340,17 @@ class LorraxConfig:
             sampling_alpha=int(_g("mpa_sampling_alpha")),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
-            head_model=str(_g("mpa_head_model")).strip().lower(),
+            metal_origin_shift_ry=(
+                float(_g("mpa_metal_origin_shift_ry"))
+                if _g("mpa_metal_origin_shift_ry") is not None else None),
             pole_batch_size=int(_g("mpa_pole_batch_size")),
             sigma_sector_target_error=float(
                 _g("mpa_sigma_sector_target_error")),
             sigma_crossing_target_error=float(
                 _g("mpa_sigma_crossing_target_error")),
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
+            sigma_omega_cluster_gap_ry=float(
+                _g("mpa_sigma_omega_cluster_gap_ry")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
@@ -2833,14 +3358,31 @@ class LorraxConfig:
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
-            omega_batch_size=int(_g("sigma_omega_batch_size")),
-            omega_accumulation=str(
-                _g("sigma_omega_accumulation")).strip().lower(),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
+            omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
         )
+        # With patches, omega_min/max_ev ARE the patch hull.  Consumers
+        # read these fields as "the Σ grid's reach" (the SC partition's
+        # in-grid classification above all); leaving them at the deck
+        # defaults silently scissored every band outside [-5, +5] on the
+        # first patched run — Σ was computed on the deep clusters and
+        # then never consulted (measured: arm 21, SC partition 2/48).
+        _patches = sigma.parsed_omega_patches_ev()
+        if _patches:
+            sigma = _dc_replace(
+                sigma, omega_min_ev=float(_patches[0][0]),
+                omega_max_ev=float(_patches[-1][1]))
+        _occ_family = _g("occ_smearing_family")
+        _occ_family = (
+            str(_occ_family).strip().lower()
+            if _occ_family is not None else None)
+        _occ_width = _g("occ_smearing_width_ry")
+        _occ_width = float(_occ_width) if _occ_width is not None else None
+        _validate_occupation_smearing(
+            mpa, sigma, screening, _occ_family, _occ_width)
         # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
         # of the sc_* input keys (kept so existing sweep scripts run
         # unchanged); a note is printed whenever one is active.
@@ -2876,6 +3418,7 @@ class LorraxConfig:
             # No env override: the LORRAX_SC_* envs are deprecated and a
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),
+            head_update=str(_g("sc_head_update")).strip().lower(),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
@@ -2908,6 +3451,7 @@ class LorraxConfig:
         # Distributed-linalg axes.
         _dist_chol = str(_g("distributed_cholesky")).strip().lower()
         _dist_lu = str(_g("distributed_lu")).strip().lower()
+        _distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         if _dist_chol not in ("auto", "off", "cusolvermp", "slate"):
             raise ValueError(
                 f"distributed_cholesky={_dist_chol!r} invalid; expected "
@@ -3036,6 +3580,7 @@ class LorraxConfig:
             w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,
+            distrib_la_batched_route=_distrib_la_batched_route,
             eigh_backend=_eigh_backend,
             use_low_mem_eigh=_use_low_mem_eigh,
             zeta_ridge=float(_g("zeta_ridge")),
@@ -3126,11 +3671,17 @@ class LorraxConfig:
             density_self_consistent=bool(_g("density_self_consistent")),
             sc_on_ibz=bool(_g("sc_on_ibz")),
             hartree_source=_hartree_source,
+            occ_smearing_family=_occ_family,
+            occ_smearing_width_ry=_occ_width,
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
-            raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
+            # Build from a stable sequence.  Equal sets reached through an
+            # absent key versus an explicit default can retain different
+            # hash-table histories; pickling those frozensets then need not
+            # be byte-identical even though the typed values compare equal.
+            raw_input_keys=frozenset(sorted(_effective_named_keys)),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),

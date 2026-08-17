@@ -714,6 +714,7 @@ def close_keep_mask(values, keep, *, rtol=DEFAULT_RTOL, direction=None):
       position is admitted.
     """
     import jax.numpy as jnp
+    from jax import lax
 
     d = resolve_direction(direction)
     v = jnp.asarray(values)
@@ -721,7 +722,10 @@ def close_keep_mask(values, keep, *, rtol=DEFAULT_RTOL, direction=None):
     n = mag.shape[-1]
     keep = jnp.asarray(keep, dtype=bool)
 
-    order = jnp.argsort(-mag, axis=-1)
+    sort_values = jnp.broadcast_to(
+        jnp.arange(n, dtype=jnp.int32), mag.shape)
+    _, order = lax.sort_key_val(
+        -mag, sort_values, dimension=mag.ndim - 1, is_stable=True)
     mag_s = jnp.take_along_axis(mag, order, axis=-1)
     keep_s = jnp.take_along_axis(keep, order, axis=-1)
     n_keep = jnp.sum(keep_s, axis=-1)
@@ -770,7 +774,10 @@ def close_keep_mask(values, keep, *, rtol=DEFAULT_RTOL, direction=None):
                      & (n_keep < n)[..., None])
         keep_s_out = keep_s & ~straddled
 
-    inv = jnp.argsort(order, axis=-1)
+    inverse_values = jnp.broadcast_to(
+        jnp.arange(n, dtype=jnp.int32), order.shape)
+    _, inv = lax.sort_key_val(
+        order, inverse_values, dimension=order.ndim - 1, is_stable=True)
     keep_out = jnp.take_along_axis(keep_s_out, inv, axis=-1)
     return keep_out, n_keep, jnp.sum(keep_s_out, axis=-1)
 

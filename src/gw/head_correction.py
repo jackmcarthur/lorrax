@@ -31,6 +31,15 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.units import RYD_TO_EV
 
 
+def _analytic_q0_sphere(params) -> bool:
+    """One compatibility-preserving resolver for the q=0 v estimator."""
+    return (
+        bool(params.get("head_minibz_average", False))
+        or str(params.get("bgw_metal_q0_treatment", "exact")).strip().lower()
+        == "bgw_q0shift"
+    )
+
+
 @dataclass(frozen=True)
 class HeadSample:
     """Resolved q=0 Coulomb head sample at one frequency."""
@@ -82,6 +91,155 @@ class StaticHeadTerms:
     wcoul0: complex
     wc_head_0: complex
     source: str
+
+
+@dataclass(frozen=True)
+class BGWQ0Channel:
+    """One finite grid-q head channel used as BGW's epsilon q0 sample."""
+
+    requested_full_index: int
+    representative_full_index: int
+    wedge_row: int
+    q0_reduced: tuple[float, float, float]
+    g_head: object                 # (1, n_mu), sharded on the centroid axis
+    v_bare: float
+
+
+def resolve_bgw_q0_channel(
+    config, sym, q_wedge_full_indices, head_channel, *, kgrid,
+):
+    """Bind the deck's reduced q0 vector to one stored W-wedge row.
+
+    The shifted point must be exactly on the WFN grid.  Its irreducible
+    representative may point in another symmetry-equivalent direction; the
+    scalar epsilon-inverse head is invariant under that operation, and the
+    head-channel vector is therefore taken from the representative row that
+    the Dyson solve actually stores.
+    """
+    if not bool(config.head.uses_bgw_metal_q0shift):
+        return None
+    if head_channel is None:
+        raise ValueError(
+            "bgw_metal_q0_treatment=bgw_q0shift requires the finite-q "
+            "Coulomb head channel, but GW initialization did not build it.")
+    kgrid = np.asarray(kgrid, dtype=np.int64)
+    if kgrid.shape != (3,) or np.any(kgrid <= 0):
+        raise ValueError(
+            "BGW q0 resolution requires a positive 3-D kgrid; "
+            f"got {kgrid}.")
+    q0 = np.asarray(config.head.bgw_metal_q0_vector, dtype=np.float64)
+    steps_float = q0 * kgrid
+    steps = np.rint(steps_float).astype(np.int64)
+    if not np.allclose(steps_float, steps, rtol=0.0, atol=1.0e-10):
+        raise ValueError(
+            "bgw_metal_q0_vector must lie on the deck's reciprocal grid: "
+            f"q0={tuple(q0)}, kgrid={tuple(int(n) for n in kgrid)}, "
+            f"q0*kgrid={tuple(float(x) for x in steps_float)}.")
+    full_steps = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    target_mod = np.mod(steps, kgrid)
+    matches = np.flatnonzero(np.all(
+        np.mod(full_steps, kgrid[None, :]) == target_mod[None, :], axis=1))
+    if matches.size != 1:
+        raise ValueError(
+            "bgw_metal_q0_vector did not identify exactly one full-grid q: "
+            f"q0={tuple(q0)}, matches={matches.tolist()}.")
+    requested = int(matches[0])
+    wedge_row = int(np.asarray(sym.irr_idx_q, dtype=np.int64)[requested])
+    q_idx = np.asarray(q_wedge_full_indices, dtype=np.int64)
+    if not 0 <= wedge_row < q_idx.size:
+        raise ValueError(
+            "BGW q0 irreducible row is outside the stored W wedge: "
+            f"row={wedge_row}, wedge size={q_idx.size}.")
+    representative = int(q_idx[wedge_row])
+    multiplicity = int(np.asarray(head_channel.mult)[representative])
+    if multiplicity != 1:
+        raise ValueError(
+            "bgw_metal_q0_vector must select a unique G=0-like head slot; "
+            f"its irreducible representative has multiplicity {multiplicity}.")
+    v_bare = float(np.asarray(head_channel.v_bare)[representative])
+    if not np.isfinite(v_bare) or v_bare <= 0.0:
+        raise ValueError(
+            "bgw_metal_q0_vector selected no finite bare Coulomb head "
+            f"(representative full-q row {representative}, v={v_bare}).")
+    return BGWQ0Channel(
+        requested_full_index=requested,
+        representative_full_index=representative,
+        wedge_row=wedge_row,
+        q0_reduced=tuple(float(x) for x in q0),
+        g_head=head_channel.g_head[representative, 0:1, :],
+        v_bare=v_bare,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("mesh_xy",))
+def finite_q0_epsinv_head(
+    chi_q0,
+    W_q0,
+    g_head_q0,
+    v_bare,
+    chi_prefactor,
+    *,
+    mesh_xy: Mesh,
+):
+    r"""Return the full finite-q ``epsilon^{-1}_{00}``, including wings.
+
+    In the centroid representation the selected plane-wave channel is
+    ``V_0 = v_0 |conj(g)><g|``.  With the already solved
+    ``W=(1-V chi)^{-1}V``, the exact bordered-Dyson scalar is
+
+    ``epsinv_00 = 1 + v_0 <g| chi (1 + W chi) |conj(g)>``.
+
+    Thus the regular finite-q W tile supplies the head, both wings, and the
+    body Schur fold without forming a plane-wave epsilon matrix.  Every
+    ``(mu,nu)`` object remains two-dimensionally sharded; only two vectors
+    and the final scalar are resharded/reduced.
+    """
+    chi = jnp.asarray(chi_q0) * jnp.asarray(
+        chi_prefactor, dtype=jnp.asarray(chi_q0).dtype)
+    W = jnp.asarray(W_q0)
+    g = jnp.asarray(g_head_q0)
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    sh_q = NamedSharding(mesh_xy, P(None))
+    u_x = jax.lax.with_sharding_constraint(jnp.conj(g), sh_x)
+    u_y = jax.lax.with_sharding_constraint(jnp.conj(g), sh_y)
+    r_x = jax.lax.with_sharding_constraint(g, sh_x)
+    chi_u_x = jnp.einsum("qmn,qn->qm", chi, u_y, optimize=True)
+    chi_u_y = jax.lax.with_sharding_constraint(chi_u_x, sh_y)
+    W_chi_u_x = jnp.einsum("qmn,qn->qm", W, chi_u_y, optimize=True)
+    l_x = u_x + W_chi_u_x
+    l_y = jax.lax.with_sharding_constraint(l_x, sh_y)
+    chi_l_x = jnp.einsum("qmn,qn->qm", chi, l_y, optimize=True)
+    response = jnp.einsum("qm,qm->q", r_x, chi_l_x, optimize=True)
+    epsinv = 1.0 + jnp.asarray(v_bare, dtype=response.dtype) * response
+    return jax.lax.with_sharding_constraint(epsinv, sh_q)
+
+
+def bgw_q0shift_vhead(wfn, meta):
+    """BGW analytic-sphere mini-BZ bare head, in LORRAX's raw units."""
+    from gw.vcoul import compute_q0_averages
+
+    vc0, _ = compute_q0_averages(
+        wfn,
+        jnp.asarray(1.0, dtype=jnp.float64),
+        meta,
+        S_cart=None,
+        analytic_sphere=True,
+    )
+    return complex(vc0)
+
+
+def bgw_q0shift_head_sample(vc0, epsinv, omega) -> HeadSample:
+    """Compose BGW's finite-q epsilon head with its q=0 v-cell average."""
+    eps = complex(epsinv)
+    v = complex(vc0)
+    return HeadSample(
+        vc0=v,
+        wcoul0=eps * v,
+        source="bgw_q0shift(analytic-sphere v; finite-q0 epsinv head+wings)",
+        omega=complex(omega),
+        S_cart=None,
+    )
 
 
 def _representative_entry(diag: jnp.ndarray) -> complex:
@@ -292,7 +450,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 jnp.asarray(eps0.epshead, dtype=jnp.complex128),
                 meta,
                 S_cart=None,
-                analytic_sphere=bool(params.get("head_minibz_average", False)),
+                analytic_sphere=_analytic_q0_sphere(params),
             )
             source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
             return HeadSample(
@@ -321,7 +479,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 jnp.asarray(0.0, dtype=jnp.float64),
                 meta,
                 S_cart=S_cart_omega,
-                analytic_sphere=bool(params.get("head_minibz_average", False)),
+                analytic_sphere=_analytic_q0_sphere(params),
             )
         source = "s_tensor" if abs(omega_val) <= 1.0e-14 else f"s_tensor(omega={omega_val} Ry)"
         return HeadSample(
@@ -391,6 +549,8 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
             nelec=nelec, print_fn=print_fn)
         _check_dipole_provenance(dipole_path, params=params or {}, wfn=wfn,
                                  print_fn=print_fn)
+    # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
+    # step occupation; metallic QSGW uses the explicit weighted PT head.
     occ = np.zeros((nk_tot, nb), dtype=float)
     occ[:, :max(0, min(nelec, nb))] = 1.0
     f_nk = jnp.asarray(occ, dtype=jnp.float64)
@@ -550,6 +710,7 @@ class HeadResolver:
             "whead_0freq": head.whead_0freq,
             "whead_imfreq": head.whead_imfreq,
             "head_minibz_average": head.head_minibz_average,
+            "bgw_metal_q0_treatment": head.bgw_metal_q0_treatment,
         }
         self._input_dir = input_dir
         self._wfn = wfn
@@ -884,6 +1045,8 @@ def format_static_head_diagnostics(head: StaticHeadTerms) -> str:
 def _expand_band_diagonal_to_kij_jit(diag, *, nk_tot: int, nb: int):
     """JIT'd body of :func:`expand_band_diagonal_to_kij`."""
     eye = jnp.eye(nb, dtype=jnp.complex128)
+    if diag.ndim == 2:
+        return eye[None, :, :] * diag[:, :, None]
     one_k = eye[None, :, :] * diag[None, :, None]
     return jnp.broadcast_to(one_k, (nk_tot, nb, nb))
 
@@ -896,7 +1059,16 @@ def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
     ~6 eager-pjit cache misses per call into one cached XLA module.
     """
     diag_arr = jnp.asarray(diag, dtype=jnp.complex128)
-    nb = int(diag_arr.shape[0])
+    if diag_arr.ndim == 1:
+        nb = int(diag_arr.shape[0])
+    elif diag_arr.ndim == 2:
+        if int(diag_arr.shape[0]) != int(nk_tot):
+            raise ValueError(
+                f"k-dependent diagonal has {diag_arr.shape[0]} rows, "
+                f"expected nk_tot={nk_tot}")
+        nb = int(diag_arr.shape[1])
+    else:
+        raise ValueError("band diagonal must be (nb,) or (nk,nb)")
     return _expand_band_diagonal_to_kij_jit(diag_arr, nk_tot=int(nk_tot), nb=nb)
 
 
@@ -1009,6 +1181,7 @@ def compute_ppm_head_sigma_diag(
     enk_ry: np.ndarray,
     efermi_ry: float,
     n_occ: int,
+    occupations: np.ndarray | None = None,
     cell_volume: float,
     nk_tot: int,
     eta: float = 1.0e-6,
@@ -1032,8 +1205,11 @@ def compute_ppm_head_sigma_diag(
     if abs(head.R_h) < 1.0e-30 or abs(head.omega_h) < 1.0e-30:
         return np.zeros((n_omega, nk, nb), dtype=np.complex128)
 
-    f = np.zeros((nb,), dtype=np.float64)
-    f[: max(0, min(int(n_occ), nb))] = 1.0
+    if occupations is None:
+        f = np.zeros((nb,), dtype=np.float64)
+        f[: max(0, min(int(n_occ), nb))] = 1.0
+    else:
+        f = np.asarray(occupations, dtype=np.float64)
     return compute_complex_pole_head_sigma_diag(
         omega_grid_ry=omega,
         enk_ry=enk,

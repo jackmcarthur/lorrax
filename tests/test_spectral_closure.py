@@ -458,6 +458,24 @@ def test_the_jit_face_is_batched_and_independent_per_q():
         "a retained rank that depends on which q share a chunk")
 
 
+@pytest.mark.gpu
+def test_the_jit_face_compiles_at_n620_with_x64_indices():
+    """The production N_mu=620 inverse permutation must compile on GPU."""
+    jax = pytest.importorskip("jax")
+    if jax.default_backend() != "gpu":
+        pytest.skip("the s32/s64 permutation-sort refusal is GPU-only")
+    jax.config.update("jax_enable_x64", True)
+    jnp = jax.numpy
+
+    n_mu = 620
+    values = jnp.linspace(2.0, 1.0, n_mu, dtype=jnp.float64)
+    keep = jnp.arange(n_mu, dtype=jnp.int32) < 400
+    keep_out, n_pre, n_post = jax.jit(sc.close_keep_mask)(values, keep)
+
+    assert keep_out.shape == (n_mu,)
+    assert int(n_pre) == 400 and int(n_post) == 400
+
+
 def test_the_jit_face_never_snaps_through_an_exactly_null_tail():
     """Zero pad columns are mutually 'degenerate' and must never be swept in.
 

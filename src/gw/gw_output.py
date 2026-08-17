@@ -100,9 +100,17 @@ class GWResults:
     # relative to the DFT mid-gap E_F.  None in static modes ⇒ Z=1.
     sigma_c_omega_diag_ev: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
-    # Mid-gap Fermi level computed once in ``ppm_pipeline`` from
-    # ``meta.nelec`` (NOT from the sigma-window band count).  Required
-    # by the eqp.dat writer in PPM modes; ``None`` in static modes.
+    # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
+    # absolute eV, shape (nk_full, nb_sigma).  E_DFT for a one-shot run;
+    # the map's input QP energies under self-consistency.  eqp1's
+    # linearization is centred here — ``eqp_bgw.compute_eqp_diag``.
+    e_eval_ev: np.ndarray | None = None
+    # The ω reference the Σ(ω) grid was built with and the finalize
+    # interpolated at — a fixed-N μ on a metal, mid-gap on an insulator.
+    # Computed once in the dynamic finalize (``dynamic_sigma``) from
+    # ``meta.nelec`` (NOT from the sigma-window band count) and carried,
+    # never re-derived.  Required by the eqp.dat writer in dynamic modes;
+    # ``None`` in static modes.
     efermi_ev: float | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
@@ -558,6 +566,7 @@ def write_freq_debug(
     omega_dft_rel_ev,
     head_sigma_diag_w_kn_ry,
     omega_grid_ry,
+    e_eval_ev=None,
     print_fn=print,
 ):
     """Optional Σ-decomposition debug table (rank-0 caller, all in eV).
@@ -567,8 +576,10 @@ def write_freq_debug(
     Σ_tot − E_DFT extrapolated by the Z-factor central-difference slope
     of dRe[Σ_c]/dω at E=E_DFT).  By construction
     ``eqp0 ≟ kin_ion + V_H + x_bare + sig_c(Edft).Re`` exactly, and
-    ``eqp1 ≟ E_DFT + Z·(eqp0 − E_DFT)`` with Z=1 in static modes
-    (degenerate eqp1==eqp0).  Head corrections are also exposed as
+    ``eqp1 ≟ E_ref + Z·Δ(E_ref)`` with Z=1 in static modes
+    (degenerate eqp1==eqp0) and E_ref = ``e_eval_ev`` — the energies Σ
+    was evaluated at, E_DFT unless a self-consistent run says otherwise
+    (``eqp_bgw.compute_eqp_diag``).  Head corrections are also exposed as
     their own columns: ``x_head`` (always when the head is computed)
     and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
     (static, screened mode).
@@ -614,6 +625,7 @@ def write_freq_debug(
             "x_head",
             _broadcast_head_diag_to_kij(static_head_terms.sigma_x_diag),
         ))
+    _sigma_c_at_eval_for_eqp = _e_eval_for_eqp = None
     if use_ppm_c:
         # Compute Σ_c(E_DFT) + Z via the SAME recipe the eqp{0,1}.dat
         # writer uses, so the freq_debug sig_c(Edft) column and the
@@ -629,6 +641,27 @@ def write_freq_debug(
                 e_dft_rel_ev=_e_dft_rel_ev,
             ))
         _cols.append(("sig_c(Edft)", _sigma_c_at_dft_for_eqp))
+        # The eqp1 linearization point, when Σ was evaluated away from
+        # E_DFT.  The ``sig_c(Edft)`` column above stays at E_DFT — that is
+        # what its name says — and only the eqp1 column below moves, which
+        # is what keeps this table's eqp{0,1} the same math as the
+        # eqp{0,1}.dat writer rather than a second opinion about it.
+        if e_eval_ev is not None:
+            _e_eval_ev = np.asarray(e_eval_ev, dtype=np.float64)
+            _e_eval_rel_ev = _e_eval_ev - float(results.efermi_ev or 0.0)
+            if not np.array_equal(_e_eval_rel_ev, _e_dft_rel_ev):
+                _sigma_c_at_eval_for_eqp, _z_factor = (
+                    compute_z_factor_from_omega_grid(
+                        sigma_c_omega_diag_ev=np.asarray(
+                            results.sigma_c_omega_diag_ev,
+                            dtype=np.complex128),
+                        omega_rel_ev=np.asarray(
+                            results.omega_rel_ev, dtype=np.float64),
+                        e_dft_rel_ev=_e_eval_rel_ev,
+                    ))
+                _e_eval_for_eqp = _e_eval_ev
+                _cols.append(("E_eval", _e_eval_ev))
+                _cols.append(("sig_c(Eeval)", _sigma_c_at_eval_for_eqp))
         # PPM analytic head interpolated at the same E_DFT − E_F used
         # for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
         # → cancellation analyses work column-by-column).
@@ -687,6 +720,10 @@ def write_freq_debug(
             _sigma_c_at_dft_for_eqp, dtype=np.complex128),
         e_dft_ev=_e_dft_ev_full,
         z_factor=_z_factor,
+        sigma_c_at_eval_diag_ev=(
+            None if _sigma_c_at_eval_for_eqp is None
+            else np.asarray(_sigma_c_at_eval_for_eqp, dtype=np.complex128)),
+        e_eval_ev=_e_eval_for_eqp,
     )
     _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
     _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
@@ -1059,7 +1096,10 @@ def write_results(
     1. ``sigma_diag.dat``  — LORRAX per-(k,n) Σ-decomposition diagnostic.
     2. ``eqp0.dat``        — BGW-format zeroth-order QP energies.
     3. ``eqp1.dat``        — BGW-format Z-linearized QP energies (Z=1 in
-       static COHSEX, BGW central-difference Z in PPM modes).
+       static COHSEX, BGW central-difference Z in dynamic modes).  The
+       linearization is centred on the energies Σ was evaluated at
+       (``results.e_eval_ev``): E_DFT for one-shot — BGW's own case — and
+       the converged QP energies under self-consistency.
     Conditional:
 
     4. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
@@ -1204,8 +1244,8 @@ def write_results(
     else:
         sigma_c_at_dft_diag_ev = np.diagonal(corr_out[irr_idx], axis1=1, axis2=2)
 
-    # E_DFT relative to mid-gap E_F (matches gw_jax convention).  Only
-    # needed when there is a finite ω-grid to interpolate against.
+    # E_DFT relative to the run's ω reference (matches gw_jax convention).
+    # Only needed when there is a finite ω-grid to interpolate against.
     # ``results.efermi_ev`` is the canonical value computed once upstream
     # in ``dynamic_sigma.eval_sigma_c_at_dft_energies`` from the actual
     # number of occupied bands (``meta.nelec``); the writer used to
@@ -1213,6 +1253,7 @@ def write_results(
     # every sigma-window band as occupied → efermi = top-of-window-band.
     sigma_c_omega_diag_ev_irr = None
     e_dft_rel_ev_irr = None
+    e_eval_ev_irr = e_eval_rel_ev_irr = None
     if results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None:
         sigma_c_omega_diag_ev_irr = np.asarray(
             results.sigma_c_omega_diag_ev, dtype=np.complex128
@@ -1223,6 +1264,22 @@ def write_results(
                 "fill GWResults.efermi_ev from ppm_outputs.efermi_dft_ev."
             )
         e_dft_rel_ev_irr = e_dft_ev_irr - float(results.efermi_ev)
+        # WHERE eqp1 IS LINEARIZED.  Same k subset, same band window and —
+        # load-bearing — the SAME single ω reference as the line above, so
+        # the two centres are positions on one axis and not two
+        # conventions.  Equal to E_DFT on every one-shot path (that IS
+        # where a one-shot Σ is evaluated), which the assembly detects and
+        # takes the historical single-interpolation branch for.
+        if results.e_eval_ev is not None:
+            e_eval_ev_irr = np.asarray(
+                results.e_eval_ev, dtype=np.float64)[irr_idx]
+            if e_eval_ev_irr.shape != e_dft_ev_irr.shape:
+                raise ValueError(
+                    "write_results: GWResults.e_eval_ev has IBZ shape "
+                    f"{e_eval_ev_irr.shape} against E_DFT {e_dft_ev_irr.shape} "
+                    "— the energies Sigma was evaluated at must be on the "
+                    "driver's full-BZ k-set and the sigma band window.")
+            e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
     assemble_eqp(
         kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
@@ -1235,6 +1292,8 @@ def write_results(
         sigma_c_omega_diag_ev=sigma_c_omega_diag_ev_irr,
         omega_rel_ev=results.omega_rel_ev,
         e_dft_rel_ev=e_dft_rel_ev_irr,
+        e_eval_ev=e_eval_ev_irr,
+        e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
         hartree_source=results.hartree_source,

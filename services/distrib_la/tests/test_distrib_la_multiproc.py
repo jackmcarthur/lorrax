@@ -524,6 +524,131 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
     return out
 
 
+def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
+                                  nrhs=32):
+    """Route (c), all array-returning ops, including a ragged batch.
+
+    This body is shared by pytest's 1x1 smoke and the real P=4 CLI matrix.
+    On the latter ``nq=5`` is deliberately not divisible by four, so the
+    op-safe pad/drop path is load-bearing.  Every result is checked at the
+    ordinary Plan.batched output layout before the test-only host readback.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    ndev = int(mesh.devices.size)
+    if ndev > 1:
+        assert nq % ndev != 0, (
+            f"route-c gate batch nq={nq} divides P={ndev}; the ragged "
+            f"padding this gate claims to cover is vacuous")
+    rng = np.random.default_rng(20260815)
+    out = {}
+
+    A_eigh = _herm(rng, nq, n, dtype)
+    W, Z = D.plan(
+        "eigh", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_eigh, mesh, (None, "x", "y")))
+    assert W.sharding.is_fully_replicated
+    assert Z.sharding.spec == P(None, "x", "y")
+    W_np, Z_np = _gather(W), _gather(Z)
+    out["eigh_values"] = _rel(W_np, np.linalg.eigvalsh(A_eigh))
+    out["eigh_residual"] = _rel(
+        A_eigh @ Z_np, Z_np * W_np[:, None, :])
+    assert out["eigh_values"] < 1e-10
+    assert out["eigh_residual"] < RTOL
+
+    A_chol = _hpd(rng, nq, n, dtype)
+    L = D.plan(
+        "cholesky", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_chol, mesh, (None, "x", "y")), block_size=17)
+    assert L.sharding.spec == P(None, "x", "y")
+    L_np = _gather(L)
+    out["cholesky"] = _rel(L_np, np.linalg.cholesky(A_chol))
+    out["cholesky_residual"] = _rel(
+        L_np @ np.conj(np.swapaxes(L_np, -1, -2)), A_chol)
+    assert out["cholesky"] < RTOL
+    assert out["cholesky_residual"] < RTOL
+
+    A_lu = _hpd(rng, nq, n, dtype)
+    B_lu = _rng_mat(rng, (nq, n, nrhs), dtype)
+    X = D.plan(
+        "solve_lu", mesh, backend="off", n=n,
+        batched_route=D.ROUTE_BATCH_RESHARD,
+    ).batched(_put(A_lu, mesh, (None, "x", "y")),
+              _put(B_lu, mesh, (None, "x", "y")))
+    assert X.sharding.spec == P(None, "x", "y")
+    X_np = _gather(X)
+    out["solve"] = _rel(X_np, np.linalg.solve(A_lu, B_lu))
+    out["solve_residual"] = _resid(A_lu, X_np, B_lu)
+    assert out["solve"] < RTOL
+    assert out["solve_residual"] < 1e-10
+    return out
+
+
+def check_distributed_matmul(mesh, dtype="complex128", *,
+                             backend="off", batched_route="batch_reshard",
+                             nq=5, m=48, k=64, n=80):
+    """Top-level GEMM through a real provider or staged local route.
+
+    The provider cells enter cuBLASMp, PBLAS ``p?gemm`` or
+    ``slate::multiply`` on the real process grid.  The local cell uses a
+    deliberately ragged leading batch, exercising forward x/y exchanges,
+    local GEMM, and inverse y/x exchanges without an all-gather.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    ndev = int(mesh.devices.size)
+    if batched_route == D.ROUTE_BATCH_RESHARD and ndev > 1:
+        assert nq % ndev != 0, (
+            f"matmul batch nq={nq} divides P={ndev}; ragged padding is "
+            "not exercised")
+    rng = np.random.default_rng(20260816 + len(backend))
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    alpha = (1.25 - 0.375j if np.dtype(dtype).kind == "c" else 1.25)
+    beta = (-0.5 + 0.125j if np.dtype(dtype).kind == "c" else -0.5)
+    got = D.matmul(
+        _put(A_np, mesh, (None, "x", "y")),
+        _put(B_np, mesh, (None, "x", "y")),
+        _put(C_np, mesh, (None, "x", "y")),
+        mesh=mesh, alpha=alpha, beta=beta, backend=backend,
+        batched_route=batched_route)
+    assert got.sharding.spec == P(None, "x", "y")
+    got_np = _gather(got)
+    want = alpha * (A_np @ B_np) + beta * C_np
+    rel = _rel(got_np, want)
+    assert rel < RTOL, (
+        f"matmul {backend}/{batched_route} residual {rel:.3e}; "
+        f"shapes A={A_np.shape} B={B_np.shape} C={C_np.shape}")
+
+    # A conjugate-transpose catches descriptor/layout mistakes that an
+    # N,N square-product smoke cannot see.  The provider C buffer is
+    # donated, so this is a fresh call with fresh operands.
+    At_np = _rng_mat(rng, (2, k, m), dtype)
+    Bt_np = _rng_mat(rng, (2, k, n), dtype)
+    if backend == "cublasmp" and ndev > 1:
+        with _raises(ValueError, "not trustworthy"):
+            D.matmul(
+                _put(At_np, mesh, (None, "x", "y")),
+                _put(Bt_np, mesh, (None, "x", "y")),
+                mesh=mesh, transa="C", backend=backend,
+                batched_route=batched_route)
+        return {"nn_residual": rel, "conj_transpose": "refused"}
+    got_t = D.matmul(
+        _put(At_np, mesh, (None, "x", "y")),
+        _put(Bt_np, mesh, (None, "x", "y")),
+        mesh=mesh, transa="C", backend=backend,
+        batched_route=batched_route)
+    got_t_np = _gather(got_t)
+    want_t = np.conj(np.swapaxes(At_np, -1, -2)) @ Bt_np
+    rel_t = _rel(got_t_np, want_t)
+    assert rel_t < RTOL, (
+        f"matmul {backend}/{batched_route} transa=C residual {rel_t:.3e}")
+    return {"nn_residual": rel, "conj_transpose_residual": rel_t}
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -615,6 +740,18 @@ def test_batched_eigh_dispatch_gate_native_arm():
     assert float(jnp.max(jnp.abs(Z_off - Z_nat))) == 0.0
 
 
+def test_batch_reshard_local_ops_smoke():
+    """The real staged movement is the P=4 CLI cell of the same body."""
+    check_batch_reshard_local_ops(_mesh_1x1("cpu"), nq=5, n=16, nrhs=8)
+
+
+def test_batch_reshard_matmul_smoke():
+    """The real staged movement is the P=4 CLI cell of the same body."""
+    check_distributed_matmul(
+        _mesh_1x1("cpu"), backend="off",
+        batched_route=D.ROUTE_BATCH_RESHARD, nq=5, m=8, k=12, n=16)
+
+
 def test_the_cli_cells_are_all_reachable():
     """Every ``_CLI_CELLS`` row names a function that exists and every
     check body is in the table.
@@ -666,6 +803,20 @@ _CLI_CELLS = [
          mesh, dt, backend="cusolvermp", op="solve_lu")),
     ("batched_eigh_dispatch", "cpu",
      lambda mesh, dt: check_batched_eigh_dispatch(mesh, dt)),
+    ("batch_reshard_local_ops", "",
+     lambda mesh, dt: check_batch_reshard_local_ops(mesh, dt)),
+    ("matmul_batch_reshard", "",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="off", batched_route=D.ROUTE_BATCH_RESHARD)),
+    ("matmul_cublasmp", "CUDA",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="cublasmp", batched_route="auto", nq=4)),
+    ("matmul_scalapack", "cpu",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="scalapack", batched_route="auto", nq=4)),
+    ("matmul_slate", "",
+     lambda mesh, dt: check_distributed_matmul(
+         mesh, dt, backend="slate", batched_route="auto", nq=4)),
 ]
 
 

@@ -41,7 +41,7 @@ from common import jax_profile
 import common.timing as timing
 from .gw_config import (
     ComputeMode, ScreeningDiagrams, coerce_screening_diagrams, env_bool,
-    refuse_unimplemented_compute_mode)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +129,9 @@ def screening_requests_for(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
     if mode is ComputeMode.MPA:
         # MPA owns a shared multi-frequency disk walk, not independent W
-        # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver.
+        # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver
+        # directly; the gw_config.UNIMPLEMENTED_MODES row that used to gate
+        # that path has been deleted.
         return []
     raise ValueError(
         f"screening_requests_for: unknown compute mode {mode!r}")
@@ -160,6 +162,7 @@ def compute_static_w(
     section: str = "chi0_W",
     fused_probe_chi=None,
     chi0_override: jax.Array | None = None,
+    gamma_chi_override: jax.Array | None = None,
     head_channel=None,
 ):
     """W = (1 − Vχ₀)⁻¹V on the full BZ, solved on the IBZ wedge when legal.
@@ -352,6 +355,18 @@ def compute_static_w(
                     chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
                                           energy_reference=e_ref)
                     chi0_q.block_until_ready()
+            if gamma_chi_override is not None:
+                gamma = jnp.asarray(gamma_chi_override)
+                expected = (1, int(meta.n_rmu), int(meta.n_rmu))
+                if tuple(gamma.shape) != expected:
+                    raise ValueError(
+                        "Gamma chi override must have shape "
+                        f"{expected}, got {gamma.shape}")
+                with timing.section(
+                        "chi.gamma_static", announce=True,
+                        label=f"{_w} exact static fractional Gamma body"):
+                    chi0_q = chi0_q.at[0].set(gamma[0])
+                    chi0_q.block_until_ready()
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
             if use_ibz_w:
@@ -375,15 +390,23 @@ def compute_static_w(
             with timing.section("W.compile", announce=True,
                                 label=f"{_w} Dyson compile"):
                 precompile_solve_w(V_q_solve, chi0_q_solve, meta, mesh_xy,
-                                   dyson_solver=config.backend.w_dyson_solver)
-            if head_channel is None:
+                                   dyson_solver=config.backend.w_dyson_solver,
+                                   distrib_la_batched_route=(
+                                       getattr(config.backend,
+                                               "distrib_la_batched_route",
+                                               "auto")))
+            if (head_channel is None
+                    or str(getattr(head_channel, "mode", "off")) == "off"):
                 with timing.section(
                         "W.exec", announce=True,
                         label=f"{_w} Dyson solve ({nq_solve} q, mu={_mu}, "
                               f"{'IBZ wedge' if use_ibz_w else 'full BZ'})"):
                     W_q_solve = solve_w(
                         V_q_solve, chi0_q_solve, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     # χ₀ is donated inside solve_w — the reference is
                     # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                     del chi0_q_solve
@@ -419,11 +442,17 @@ def compute_static_w(
                     # (nq, μ, μ) transient, live only across the first LU.
                     W_body0 = solve_w(
                         V_body_solve, chi0_q_solve.copy(), meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     del V_body_solve
                     W_bare = solve_w(
                         V_bare_solve, chi0_q_solve, meta, mesh_xy,
-                        dyson_solver=config.backend.w_dyson_solver)
+                        dyson_solver=config.backend.w_dyson_solver,
+                        distrib_la_batched_route=(
+                            getattr(config.backend,
+                                    "distrib_la_batched_route", "auto")))
                     del chi0_q_solve, V_bare_solve
                     W_q_solve = _hc.combine_head_channel(
                         W_body0, W_bare, head_channel, q_index=q_idx)
@@ -491,6 +520,7 @@ def compute_screening(
     mesh_xy,
     print_fn: Callable = print,
     head_channel=None,
+    iteration_head_response=None,
 ) -> dict[str, jax.Array]:
     """Evaluate W at each requested frequency.
 
@@ -591,13 +621,19 @@ def compute_screening(
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
                     role=req.role, fused_probe_chi=fused_plan,
-                    head_channel=head_channel)
+                    head_channel=head_channel,
+                    gamma_chi_override=(
+                        iteration_head_response.static_chi_body_gamma
+                        if iteration_head_response is not None else None))
             else:
                 W_static = compute_static_w(
                     wfns, V_q, quad, e_ref=e_ref,
                     sym=sym, centroid_indices=centroid_indices,
                     config=config, meta=meta, mesh_xy=mesh_xy,
-                    role=req.role, head_channel=head_channel)
+                    role=req.role, head_channel=head_channel,
+                    gamma_chi_override=(
+                        iteration_head_response.static_chi_body_gamma
+                        if iteration_head_response is not None else None))
             with timing.section("W.gate", announce=True,
                                 label=f"{_w} finiteness + hermiticity gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
@@ -683,8 +719,12 @@ def compute_screening_model(
     mesh_xy,
     run_dir,
     label,
+    wfn=None,
     head_resolver=None,
     head_channel=None,
+    mpa_plan=None,
+    iteration_head_response=None,
+    occupation_state=None,
     static_only=False,
     tensors_filename=None,
     print_fn=print,
@@ -716,7 +756,7 @@ def compute_screening_model(
         if static_only:
             return {}
         if head_resolver is None:
-            raise ValueError("MPA screening requires a fixed head resolver")
+            raise ValueError("MPA screening requires a head resolver")
         from .mpa.model import build_mpa_fit
         # ``wc_source = None`` is the RPA seam default (``mpa.model._solve_wc``,
         # the Dyson solve of the sampled chi).  Under w_bse the same per-z,
@@ -732,12 +772,19 @@ def compute_screening_model(
                 mesh_xy=mesh_xy, tensors_filename=tensors_filename,
                 head_resolver=head_resolver, head_channel=head_channel,
                 print_fn=print_fn)
-        fit_path = build_mpa_fit(
-            run_dir, label, wfns=wfns, V_q=V_q, quad=quad, sym=sym,
+        fit_path, iteration_head = build_mpa_fit(
+            run_dir, label, wfns=wfns, wfn=wfn, V_q=V_q, quad=quad, sym=sym,
             centroid_indices=centroid_indices, head_resolver=head_resolver,
             config=config, meta=meta, mesh_xy=mesh_xy,
-            energy_reference=e_ref, print_fn=print_fn, wc_source=wc_source)
-        return {"mpa_fit": fit_path}
+            energy_reference=e_ref, plan=mpa_plan,
+            iteration_head_response=iteration_head_response,
+            occupation_state=occupation_state,
+            head_channel=head_channel,
+            wc_source=wc_source, print_fn=print_fn)
+        result = {"mpa_fit": fit_path}
+        if iteration_head is not None:
+            result["iteration_head"] = iteration_head
+        return result
 
     if diagrams is ScreeningDiagrams.W_BSE:
         from .screening_bse import compute_screening_ladder
@@ -767,7 +814,8 @@ def compute_screening_model(
     return compute_screening(
         wfns, V_q, requests, quad=quad, e_ref=e_ref, sym=sym,
         centroid_indices=centroid_indices, config=config, meta=meta,
-        mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel)
+        mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel,
+        iteration_head_response=iteration_head_response)
 
 
 def driver_persists_w0(mode, config) -> bool:

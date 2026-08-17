@@ -31,9 +31,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifndef LORRAX_FFI_NO_CUDA
@@ -293,6 +295,42 @@ static hid_t h5_open_or_create(const std::string& path, int mode_flag, hid_t fap
         default:
             return H5I_INVALID_HID;
     }
+}
+
+// ─── The live-ctx registry (ctx.h has the argument; audit B2) ────────────
+//
+// Function-local statics rather than namespace-scope objects so there is no
+// static-initialization-order question with the HDF5 / MPI singletons around
+// them, and so the whole thing is inert until the first open.  The mutex is
+// held only across an unordered_set operation on a set whose size is the
+// number of simultaneously open files (1-3 in every deck measured), so it is
+// never contended for meaningfully.
+static std::mutex& live_ctx_mu() {
+    static std::mutex m;
+    return m;
+}
+static std::unordered_set<const PhdfCtx*>& live_ctx_set() {
+    static std::unordered_set<const PhdfCtx*> s;
+    return s;
+}
+
+void register_live_ctx(PhdfCtx* ctx) {
+    if (!ctx) return;
+    std::lock_guard<std::mutex> lk(live_ctx_mu());
+    live_ctx_set().insert(ctx);
+}
+
+bool unregister_live_ctx(PhdfCtx* ctx) {
+    if (!ctx) return false;
+    std::lock_guard<std::mutex> lk(live_ctx_mu());
+    return live_ctx_set().erase(ctx) != 0;
+}
+
+bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live) {
+    std::lock_guard<std::mutex> lk(live_ctx_mu());
+    const auto& s = live_ctx_set();
+    if (n_live) *n_live = s.size();
+    return ctx && s.count(ctx) != 0;
 }
 
 // Undo a PARTIALLY built ctx.
@@ -767,6 +805,12 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
         }
     });
 
+    // LAST, and only on the success path: from here on this pointer is a
+    // handle the handlers will accept (audit B2).  Registering earlier would
+    // publish a ctx that a throw from any of the dozen sites above could
+    // still hand to ``abandon_partial_ctx``, which deletes it — the exact
+    // dangling-handle state the registry exists to detect.
+    register_live_ctx(ctx);
     return ctx;
 }
 
@@ -962,6 +1006,29 @@ hid_t open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name) {
 
 void close_ctx(PhdfCtx* ctx) {
     if (!ctx) return;
+
+    // FIRST, before a single resource is torn down (audit B2): a handle whose
+    // ctx is being closed must stop being acceptable at the moment close
+    // BEGINS, not when it ends.  A handler that arrives during the drain
+    // below would otherwise pass the liveness check and then use a file_id
+    // that H5Fclose is about to invalidate.
+    //
+    // The erase is also the DOUBLE-CLOSE guard, which is why it tests: the
+    // erase-and-test is one locked operation, so the second close of a handle
+    // says so and returns instead of joining a joined thread, H5Fclose-ing a
+    // closed file and deleting freed memory.  ``close_ctx`` cannot throw (it
+    // is an extern "C" void, also reached from atexit), so this announces.
+    if (!unregister_live_ctx(ctx)) {
+        std::fprintf(stderr,
+            "[phdf5 ERROR rank=-1] phdf5 close: stale or foreign ctx handle "
+            "-- double close or stream race.  got=%p (not in this library's "
+            "live-ctx registry).  want= a handle from lrx_phdf5_open on this "
+            "platform leg, closed exactly once.  fix= see "
+            "SLAB_IO_ROOT_CAUSE_AUDIT.md B2; nothing was torn down.\n",
+            (const void*)ctx);
+        std::fflush(stderr);
+        return;
+    }
 
     // Drain and stop the writer thread first — any pending H5Dwrite
     // must complete before we H5Dclose/H5Fclose below.  Setting

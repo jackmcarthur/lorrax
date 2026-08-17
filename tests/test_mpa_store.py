@@ -6,8 +6,9 @@ built on WSL, so the format is tested where its claims actually live —
 the attrs, the ranks, the ledgers and the refusals — exactly the way the
 symmetry lane tested the q_irr format it extends.  The ``SlabIO`` write
 path, where every rank contributes its own (μ, ν) hyperslab and no rank
-holds the whole array, is what ``mpa_store.stamp_w_omega`` exists for and
-it gets its PERLMUTTER LEG WHEN THIS IS INTEGRATED.  Nothing here claims
+holds the whole array, is what ``mpa_store.stamp_w_omega`` exists for;
+its Perlmutter leg is ``tests/multi_device/mpa_fit_stream_gate.py``.
+Nothing here claims
 multi-rank coverage; ``test_the_column_block_is_sharded_on_rows_only``
 tests the REFUSAL that keeps the sharding 1-D, not the sharding itself.
 
@@ -28,6 +29,7 @@ checkpoint's format layer and nothing else.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -38,43 +40,27 @@ import pytest
 h5py = pytest.importorskip("h5py")
 pytest.importorskip("symmetry_maps.qirr_store")
 
-from symmetry_maps import (centroid_source_map_and_wrap,          # noqa: E402
-                           verify_centroid_orbit_closure)
+from symmetry_maps import verify_centroid_orbit_closure           # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import tiling                                         # noqa: E402
+from tests._mpa_test_geometry import (                            # noqa: E402
+    FFT as _FFT, SYMS as _SYMS, TNP as _TNP, N_Q_FULL as _N_Q_FULL,
+    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, closed_centroid_set, geometry)
 
-#: The synthetic FFT grid the centroid set lives on.
-_FFT = np.array([12, 12, 12], dtype=np.int64)
-
-#: A GLIDE: {σ_z | τ = (1/2, 0, 0)}.  Order two — applying it twice gives
-#: {I | (1, 0, 0)} ≡ the identity mod the lattice — so {I, g} is a group
-#: and the orbits really close.  τ×grid = (6, 0, 0) is integer on the
-#: 12-grid, so images land on grid points.  Copied in spirit from the
-#: symmetry lane's umklapp arm because it is the one in-memory geometry
-#: in the tree whose L rows are non-trivial.
-_SYMS = np.stack([np.eye(3, dtype=np.int64),
-                  np.diag([1, 1, -1]).astype(np.int64)])
-_TNP = np.array([[0.0, 0.0, 0.0], [np.pi, 0.0, 0.0]])
-
-#: 5 full-BZ q folding onto 3 IBZ parents, two of them through the
-#: TIME-REVERSED rows (index >= n_sym_spatial = 2), so the antiunitary
-#: branch of the unfold is live at every frequency.
-_IRR = np.array([0, 1, 1, 2, 2], dtype=np.int32)
-_SYM = np.array([0, 1, 0, 3, 0], dtype=np.int32)
-_N_SYM_SPATIAL = 2
-_N_Q_IBZ = 3
-_N_Q_FULL = 5
-
-#: IBZ q's with non-zero components on every axis, so exp(2πi q·L) is
-#: not accidentally 1.
-_Q_IRR = np.array([[0.0, 0.0, 0.0],
-                   [1 / 3, 0.0, 1 / 4],
-                   [0.0, 1 / 3, 1 / 3]])
-
+#: Eight seeds whose glide orbits union to this suite's centroid set;
+#: the builder itself lives in tests/_mpa_test_geometry.py.
 _SEEDS = ((0, 0, 0), (4, 5, 0), (2, 2, 6), (9, 7, 6),
           (1, 2, 3), (7, 3, 4), (1, 1, 1), (5, 8, 9))
+
+#: The certification every ``finalize_fit_store`` below must carry, since
+#: 2026-08-15: a store the validator would refuse cannot be finalized at
+#: all (audit §E.3 item 1), so a cell whose subject is something else
+#: passes a pair of thresholds loose enough never to be the reason it
+#: fails.  The cells that are ABOUT certification state their own.
+_CERT = {"condition_max_allowed": 1.0e12,
+         "backward_error_max_allowed": 1.0}
 
 #: The sampling record every W(ω) file must carry.  Si-shaped: the
 #: double-parallel lines ϖ₁ = 0.1 Ha and ϖ₂ = 1 Ha, α = 1 for an
@@ -84,33 +70,15 @@ _SAMPLING = {"varpi": [0.1, 1.0], "n_p": 3, "alpha": 1,
 
 
 # ---------------------------------------------------------------------------
-# Geometry
+# Geometry — one shared builder, this suite's seeds
 # ---------------------------------------------------------------------------
 
 def _closed_centroid_set():
-    """The union of the seeds' orbits — closed under the group by
-    definition, so the closure verdict is a property of this function."""
-    S = np.asarray(_SYMS, dtype=np.float64)
-    rinv = np.rint(np.linalg.inv(S)).astype(np.int64)
-    tint = np.rint(np.asarray(_TNP, dtype=np.float64) / (2.0 * np.pi)
-                   * _FFT).astype(np.int64)
-    imgs = set()
-    for r in np.asarray(_SEEDS, dtype=np.int64):
-        for s in range(S.shape[0]):
-            imgs.add(tuple(((rinv[s] @ r + tint[s]) % _FFT).tolist()))
-    return np.array(sorted(imgs), dtype=np.int32)
+    return closed_centroid_set(_SEEDS)
 
 
 def _geometry():
-    """``(tables, verdict, n_mu)`` for the synthetic closed set."""
-    cent = _closed_centroid_set()
-    verdict = verify_centroid_orbit_closure(
-        cent.astype(np.float64) / _FFT, _SYMS, tnp=_TNP, fft_grid=_FFT)
-    assert verdict.closed, verdict.describe()
-    perm, L = centroid_source_map_and_wrap(
-        cent, _SYMS, _TNP, _FFT, validate=True, extend_trs=True)
-    tables = QS.QirrTables(_IRR, _SYM, _Q_IRR, perm, L, _N_SYM_SPATIAL)
-    return tables, verdict, int(cent.shape[0])
+    return geometry(_SEEDS)
 
 
 def _w_omega(n_omega, n_q, n_mu, seed=17):
@@ -241,33 +209,26 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
 
     calls = []
 
-    class FakeSlabIO:
+    class RecordingSlabIO(HostSlabIO):
+        """The shared host shim, plus the call census this test needs."""
+
         def __init__(self, path, *, mode, mesh):
             calls.append(("open", mode, mesh))
-            self.file = h5py.File(path, mode)
+            super().__init__(path, mode=mode, mesh=mesh)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            self.file.close()
+        def __exit__(self, *exc):
+            super().__exit__(*exc)
             calls.append(("close",))
 
-        def create_dataset(self, name, *, shape, dtype):
-            calls.append(("create", name, tuple(shape)))
-            self.file.create_dataset(name, shape=shape, dtype=dtype)
+        def create_dataset(self, name, **kw):
+            calls.append(("create", name))
+            super().create_dataset(name, **kw)
 
-        def write_slab(self, name, value, *, offset, global_shape):
-            host = np.asarray(value)
-            valid = tuple(min(host.shape[d], global_shape[d] - offset[d])
-                          for d in range(host.ndim))
-            target = tuple(slice(offset[d], offset[d] + valid[d])
-                           for d in range(host.ndim))
-            source = tuple(slice(0, n) for n in valid)
-            self.file[name][target] = host[source]
-            calls.append(("write", name, tuple(offset), valid))
+        def write_slab(self, name, value, **kw):
+            super().write_slab(name, value, **kw)
+            calls.append(("write", name))
 
-    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     monkeypatch.setattr(collectives, "process_rank", lambda: 0)
     monkeypatch.setattr(collectives, "barrier", lambda _name: False)
 
@@ -276,23 +237,67 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
     sampling = dict(_SAMPLING, n_p=1)
     mesh = _mesh()
     shape = (1, _N_Q_IBZ, n_mu, n_mu)
-    MS.allocate_w_omega_collective(
+    assert MS.allocate_w_omega_collective(
         tmpdir_path, "W", mesh_xy=mesh, n_omega=1,
         n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables, omega=omega,
-        sampling=sampling, closure_verdict=verdict)
+        sampling=sampling, closure_verdict=verdict) is None
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     W_host = _w_omega(1, _N_Q_IBZ, n_mu)[0]
     W = jax.device_put(W_host, NamedSharding(mesh, P(None, "x", "y")))
+    # BOTH COLLECTIVES RETURN None ON EVERY RANK (audit §E.3 item 3).
+    # They used to hand back the real thing on rank 0 and None
+    # elsewhere, which is a mesh divergence waiting for the first caller
+    # that branches on the return; the readiness count they used to carry
+    # is read from the ledger below, where it lives.
     assert MS.write_w_slab_collective(
         tmpdir_path, "W", 0, W, mesh_xy=mesh,
-        global_shape=shape) == 1
+        global_shape=shape) is None
 
     got, header = MS.read_w_slab(tmpdir_path, "W", 0)
     np.testing.assert_array_equal(got, W_host)
     assert header["data_ready"].tolist() == [True]
+    assert header["n_ready"] == 1
     assert [call[0] for call in calls] == [
         "open", "create", "close", "open", "write", "close"]
+
+
+def test_the_collective_w_writers_answer_the_same_on_every_rank(
+        tmpdir_path, monkeypatch):
+    """RED: a collective whose RETURN TYPE depends on the rank is a trap.
+
+    ``allocate_w_omega_collective`` used to hand back rank 0's header and
+    ``None`` elsewhere; ``write_w_slab_collective`` the new ready count
+    and ``None`` elsewhere.  Every rank calls these, in order, so a caller
+    that writes ``if io_result:`` around the next collective takes the
+    branch on rank 0 only and hangs the mesh — latent solely because both
+    production callers discard the return (audit §E.3 item 3).  This runs
+    the same two calls as a NON-ZERO rank, which is the leg the cell above
+    (``process_rank`` pinned to 0) structurally cannot reach.
+    """
+    import common.collectives as collectives
+    import file_io.slab_io as slab_io
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
+    monkeypatch.setattr(collectives, "barrier", lambda _name: False)
+    tables, verdict, n_mu = _geometry()
+    mesh = _mesh()
+    shape = (1, _N_Q_IBZ, n_mu, n_mu)
+    W = jax.device_put(_w_omega(1, _N_Q_IBZ, n_mu)[0],
+                       NamedSharding(mesh, P(None, "x", "y")))
+    for rank in (0, 1):
+        monkeypatch.setattr(collectives, "process_rank", lambda r=rank: r)
+        assert MS.allocate_w_omega_collective(
+            tmpdir_path, "W", mesh_xy=mesh, n_omega=1, mode="w",
+            n_q_on_disk=_N_Q_IBZ, n_mu=n_mu, tables=tables,
+            omega=np.asarray([0.2 + 0.1j]),
+            sampling=dict(_SAMPLING, n_p=1),
+            closure_verdict=verdict) is None, f"rank {rank}"
+        assert MS.write_w_slab_collective(
+            tmpdir_path, "W", 0, W, mesh_xy=mesh,
+            global_shape=shape) is None, f"rank {rank}"
 
 
 def test_collective_reader_keeps_one_frequency_slab_sharded(
@@ -300,29 +305,19 @@ def test_collective_reader_keeps_one_frequency_slab_sharded(
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     calls = []
 
-    class FakeSlabIO:
-        def __init__(self, path, *, mode, mesh):
-            self.path = path
+    class RecordingSlabIO(HostSlabIO):
+        """The shared host shim, plus the open/close census."""
 
         def __enter__(self):
             calls.append("open")
-            return self
+            return super().__enter__()
 
-        def __exit__(self, *_):
+        def __exit__(self, *exc):
             calls.append("close")
-
-        def read_slab(self, name, *, shape, offset, valid_shape,
-                      partition_spec):
-            with h5py.File(self.path, "r") as f:
-                raw = np.asarray(f[name][offset[0]:offset[0] + 1])
-            out = np.zeros(shape, dtype=raw.dtype)
-            out[tuple(slice(0, n) for n in raw.shape)] = raw
-            import jax
-            from jax.sharding import NamedSharding
-            return jax.device_put(out, NamedSharding(_mesh(), partition_spec))
+            super().__exit__(*exc)
 
     import file_io.slab_io as slab_io
-    monkeypatch.setattr(slab_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     got, header = MS.read_w_slab_collective(
         tmpdir_path, "W_qmunu_omega", 1, mesh_xy=_mesh())
     np.testing.assert_array_equal(np.asarray(got), W[1])
@@ -534,6 +529,22 @@ def test_the_column_budget_is_the_tile_arithmetic():
     # Never zero, and never more columns than there are.
     assert MS.choose_column_budget(8, 4096) == 1
     assert MS.choose_column_budget(16, 1) == 16
+    # BOTH CLAMPS ARE PUBLISHED NOW (audit §E.3 item 5): the upper one is
+    # what a generous budget meets, and the docstring's own worked case.
+    assert MS.choose_column_budget(480, 16, 100 * 2 ** 20) == 480
+
+    # And the sentence prints the arithmetic that RAN (item 4): the tile
+    # product only when the budget IS one tile, and a call a reader can
+    # type to get the number beside it.
+    one_tile = MS.describe_column_cost(480, 16, 30)
+    assert "one (N_mu, N_mu) tile, 480*480*16 B = 3686400 B" in one_tile
+    assert ("choose_column_budget(480, 16, tile_bytes=3686400, "
+            "itemsize=16) allows 30") in one_tile
+    big = MS.describe_column_cost(480, 16, 100, tile_bytes=100 * 2 ** 20)
+    assert "480*480*16" not in big, big      # the false equation is gone
+    assert f"budget of {100 * 2 ** 20} B" in big
+    assert (f"choose_column_budget(480, 16, tile_bytes={100 * 2 ** 20}, "
+            "itemsize=16) allows 480") in big
 
 
 def test_a_column_request_that_busts_the_budget_refuses(tmpdir_path):
@@ -653,9 +664,9 @@ def test_the_walk_covers_every_column_exactly_once():
 # Arm 6 — the version-2 discriminant.  THE RED TWIN THAT MOTIVATES IT.
 # ---------------------------------------------------------------------------
 
-def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
+def test_a_rank_4_tensor_stamped_version_1_is_refused_by_the_v1_reader(
         tmpdir_path):
-    """THE HAZARD, CONSTRUCTED — and now refused by BOTH readers.
+    """THE HAZARD, CONSTRUCTED — and refused where every consumer reads.
 
     The malicious case is built to be maximally quiet: ``n_omega`` is
     chosen EQUAL to the wedge extent, so a version-1 reader's
@@ -676,15 +687,13 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
     which put the check inside ``read_tensor`` above ``read_tables`` and
     before any extent is believed.  So the assertion is inverted here
     rather than deleted: the line that used to pin the corruption now
-    pins its absence, and the test keeps its job of being the red twin
-    that says which reader is protecting whom.
+    pins its absence.
 
-    Both refusals are asserted because they protect different people.
-    ``qirr_store.read_tensor`` protects the consumer who has never heard
-    of a frequency axis and is simply reading a restart file — that is
-    the one that matters, and it is the one that did not exist before.
-    ``mpa_store.read_qirr_tensor`` protects the consumer who knows both
-    layouts and asked the dispatcher.
+    ``qirr_store.read_tensor`` is where the refusal matters: it protects
+    the consumer who has never heard of a frequency axis and is simply
+    reading a restart file.  (``mpa_store``'s dispatcher wrapper, which
+    reached the same refusal by delegation, is deleted — a wrapper
+    protects only the callers who use it.)
     """
     tables, verdict, n_mu = _geometry()
     n_omega = _N_Q_IBZ            # THE COINCIDENCE, on purpose
@@ -710,55 +719,6 @@ def test_a_rank_4_tensor_stamped_version_1_is_refused_by_both_readers(
     assert "qirr_format_version=1" in msg and "rank 3" in msg, msg
     assert "rank 4" in msg or str(tuple(W.shape)) in msg, msg
     assert "RANK IS THE DISCRIMINANT" in msg, msg
-
-    # AND THROUGH THE DISPATCHER, which reaches the same refusal by
-    # delegating rather than by keeping a second copy of it.
-    with pytest.raises(ValueError) as exc2:
-        MS.read_qirr_tensor(tmpdir_path, name, unfold=False)
-    msg2 = str(exc2.value)
-    assert "rank 3" in msg2 and "RANK IS THE DISCRIMINANT" in msg2, msg2
-
-
-def test_the_widened_reader_dispatches_both_versions(tmpdir_path):
-    """{1, 2} through one door, and the v1 bytes are untouched.
-
-    The dispatcher exists so a generic consumer is never SILENTLY
-    wrong.  It must therefore be a no-op for the case that already
-    worked: a version-1 file read through it is the same array and the
-    same header the version-1 reader returns, ``array_equal`` and
-    field for field.
-    """
-    W, tables, verdict, _, _, _ = _write_w(tmpdir_path, n_omega=4)
-    v1 = tmpdir_path.replace("w.h5", "v1.h5")
-    QS.write_qirr_tensor(v1, "W0_qmunu", W[0], tables=tables,
-                         closure_verdict=verdict)
-
-    a, ha = QS.read_tensor(v1, "W0_qmunu", unfold=False)
-    b, hb = MS.read_qirr_tensor(v1, "W0_qmunu", unfold=False)
-    assert np.array_equal(a, b)
-    assert ha == hb
-
-    full, hdr = MS.read_qirr_tensor(tmpdir_path, "W_qmunu_omega")
-    assert full.shape == W.shape
-    assert np.array_equal(full, W)
-    assert hdr["format_version"] == 2
-
-
-def test_a_rank_3_dataset_stamped_version_2_refuses(tmpdir_path):
-    """RED, the mirror: version 2 without the axis is not version 2.
-
-    The discriminant runs both directions.  A rank-3 dataset stamped 2
-    is a file claiming a frequency axis it does not have, which would
-    make ``ds[i]`` a q row read as a whole slab.
-    """
-    W, tables, verdict, _, _, _ = _write_w(tmpdir_path, n_omega=4)
-    v1 = tmpdir_path.replace("w.h5", "v1.h5")
-    QS.write_qirr_tensor(v1, "W0_qmunu", W[0], tables=tables,
-                         closure_verdict=verdict)
-    with h5py.File(v1, "a") as f:
-        f["W0_qmunu"].attrs[QS.QIRR_VERSION_ATTR] = np.int64(2)
-    with pytest.raises(ValueError, match="rank 4"):
-        MS.read_qirr_tensor(v1, "W0_qmunu", unfold=False)
 
 
 def test_the_frequency_attr_and_the_version_must_agree(tmpdir_path):
@@ -971,8 +931,8 @@ def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
     blocks they were taken from.
     """
     truth, _ = _staged_fit(tmpdir_path)
-    MS.finalize_fit_store(tmpdir_path,
-                          certification={"condition_max_allowed": 1e8})
+    MS.finalize_fit_store(
+        tmpdir_path, certification=dict(_CERT, condition_max_allowed=1e8))
     for (q, lo, hi), (Om, Bp, diag) in truth.items():
         gOm, gBp, gdiag, ledger = MS.read_fit_block(
             tmpdir_path, q, list(range(lo, hi)))
@@ -1008,7 +968,7 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
         diag = {"condition": np.ones((n_mu, n_mu)),
                 "backward_error": np.zeros((n_mu, n_mu))}
         MS.write_fit_block(tmpdir_path, q, np.arange(n_mu), Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
     ledger = MS.fit_completion_ledger(tmpdir_path)
     assert ledger["energy_unit"] == "Ha"
@@ -1032,7 +992,7 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
     MS.write_head_fit(
         tmpdir_path, z, wc, poles, residues, energy_unit="Ha",
         fit_condition=17.0, fit_backward_error=2.0e-12,
-        fit_max_abs_residual=4.0e-8)
+        fit_max_abs_residual=4.0e-8, model="fixed_dft_gn")
 
     got = MS.read_head_fit(tmpdir_path, to_unit="Ry")
     np.testing.assert_array_equal(got["sample_z"], 2.0 * z)
@@ -1051,6 +1011,20 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
     with pytest.raises(ValueError, match="NOT READY"):
         MS.read_head_fit(tmpdir_path)
+
+
+def test_bgw_q0shift_head_model_is_a_certified_store_protocol():
+    """The producer's public model tag must survive the reader allowlist."""
+    assert "bgw_q0shift_loewner" in MS._HEAD_FIT_MODELS
+
+
+def test_collective_head_writer_closes_all_ledger_readers_before_rank0_write():
+    """The all-rank h5py read must finish before rank 0 opens for write."""
+    source = inspect.getsource(MS.write_head_fit_collective)
+    ledger = source.index("ledger = fit_completion_ledger(dest)")
+    handoff = source.index('barrier("mpa_head_ledger_readers_closed")')
+    writer = source.index("if process_rank() == 0:")
+    assert ledger < handoff < writer
 
 
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
@@ -1081,11 +1055,57 @@ def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
             tmpdir_path, expected_identity={"w_grid_hash": "wrong"})
 
 
-def test_sigma_refuses_an_uncertified_fit_store(tmpdir_path):
-    """A COMPLETE ledger is not an accuracy certificate."""
+def test_finalize_refuses_a_store_sigma_could_never_read(tmpdir_path):
+    """RED: the brick is refused at the finalize, not found at Σ.
+
+    Omitting the certification used to SUCCEED and leave a store
+    permanently unusable (audit §E.3 item 1): ``validate_fit_store``
+    refuses an uncertified store, a second finalize is refused, and every
+    writer refuses a finalized one — so nothing could repair it through
+    this API.  The refusal covers every shape of the same fault, because
+    a half-certified store bricks exactly as hard as an uncertified one:
+    absent, empty, one of the pair, present-but-infinite,
+    present-but-zero, present-but-not-a-number.
+    """
     _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
                 energy_unit="Ry")
-    MS.finalize_fit_store(tmpdir_path)
+    with pytest.raises(ValueError) as exc:
+        MS.finalize_fit_store(tmpdir_path)
+    msg = str(exc.value)
+    assert "got   :" in msg and "want  :" in msg and "fix   :" in msg, msg
+    assert "condition_max_allowed" in msg, msg
+    assert "backward_error_max_allowed" in msg, msg
+    for cert in ({},
+                 {"condition_max_allowed": 1e8},
+                 dict(_CERT, backward_error_max_allowed=np.inf),
+                 dict(_CERT, condition_max_allowed=0.0),
+                 dict(_CERT, condition_max_allowed="loose")):
+        with pytest.raises(ValueError, match="could never read"):
+            MS.finalize_fit_store(tmpdir_path, certification=cert)
+
+    # GREEN TWIN, and the point of refusing BEFORE the store is opened:
+    # none of that touched the file, so the certified finalize still
+    # round trips — through the validator that used to be unreachable.
+    ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
+    assert ledger["complete"]
+    assert ledger["certification"]["condition_max_allowed"] == \
+        _CERT["condition_max_allowed"]
+    assert MS.validate_fit_store(tmpdir_path)["complete"]
+
+
+def test_sigma_still_refuses_an_uncertified_store_it_finds_on_disk(
+        tmpdir_path):
+    """A COMPLETE ledger is not an accuracy certificate.
+
+    ``finalize_fit_store`` can no longer WRITE this file, but a store
+    stamped by an older writer can still be on disk — the validator is
+    the Σ stage's own gate and does not trust the producer, so it keeps
+    its refusal rather than inheriting the new precondition.
+    """
+    _staged_fit(tmpdir_path, n_q=1, n_mu=2, n_p=1, n_cols=2,
+                energy_unit="Ry")
+    with h5py.File(tmpdir_path, "a") as f:      # the old writer's stamp
+        f.attrs["mpa_fit_complete"] = True
     with pytest.raises(ValueError, match="requires certified pole fits"):
         MS.validate_fit_store(tmpdir_path)
 
@@ -1132,7 +1152,7 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
     """
     _staged_fit(tmpdir_path, stop_after=4)
     with pytest.raises(ValueError) as exc:
-        MS.finalize_fit_store(tmpdir_path)
+        MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     msg = str(exc.value)
     assert "4 of 12" in msg, msg
     assert "q=1: columns 2-5" in msg, msg
@@ -1142,7 +1162,7 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
         Om, Bp, diag = _fit_block(3, 6, hi - lo, seed=lo)
         MS.write_fit_block(tmpdir_path, 1, list(range(lo, hi)), Om, Bp,
                            diag)
-    ledger = MS.finalize_fit_store(tmpdir_path)
+    ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     assert ledger["complete"] and ledger["finalized_utc"]
     MS.read_fit_tensors(tmpdir_path)
 
@@ -1156,9 +1176,9 @@ def test_a_second_finalize_refuses(tmpdir_path):
     — and the writer refuses that too.
     """
     _staged_fit(tmpdir_path)
-    MS.finalize_fit_store(tmpdir_path)                             # TWIN
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)        # TWIN
     with pytest.raises(ValueError, match="already finalized"):
-        MS.finalize_fit_store(tmpdir_path)
+        MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     Om, Bp, diag = _fit_block(3, 6, 2, seed=1)
     with pytest.raises(ValueError, match="FINALIZED"):
         MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
@@ -1239,7 +1259,7 @@ def test_extra_diagnostics_survive_the_round_trip(tmpdir_path):
     Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     _, _, got, _ = MS.read_fit_block(tmpdir_path, 0, list(range(4)))
     assert np.array_equal(got["n_poles_pruned"], diag["n_poles_pruned"])
 
@@ -1259,7 +1279,7 @@ def test_the_diagnostic_set_may_not_change_mid_fit(tmpdir_path):
         MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
     MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp,             # TWIN
                        dict(diag, held_out=np.ones((4, 2))))
-    MS.finalize_fit_store(tmpdir_path)
+    MS.finalize_fit_store(tmpdir_path, certification=_CERT)
 
 
 def test_the_ledger_records_ranges_and_their_worst_diagnostics(
@@ -1344,8 +1364,12 @@ def test_a_tensor_without_its_omega_group_refuses(tmpdir_path):
 def test_the_column_helpers_refuse_a_malformed_request(tmpdir_path):
     """RED cluster on the column argument itself."""
     _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    with pytest.raises(ValueError, match="repeats a column"):
-        MS.normalise_columns([1, 1, 2], n_mu)
+    with pytest.raises(ValueError, match="repeats a column") as exc:
+        MS.normalise_columns([1, 1, 2, 5, 5], n_mu)
+    # THE COLUMNS THAT REPEAT, under the label "repeats a column".  It
+    # used to name the first four DISTINCT columns, which sends a reader
+    # debugging a duplicate to three innocent indices (audit §E.3 item 11).
+    assert "[1, 5]" in str(exc.value), str(exc.value)
     with pytest.raises(IndexError, match="logical columns"):
         MS.normalise_columns([0, n_mu], n_mu)
     with pytest.raises(TypeError, match="boolean mask"):
@@ -1364,6 +1388,67 @@ def test_a_slab_of_the_wrong_shape_refuses(tmpdir_path):
     with pytest.raises(ValueError, match="per frequency"):
         MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 0,
                         W[0][:, :n_mu - 1, :n_mu - 1])
+
+
+# ---------------------------------------------------------------------------
+# Arm 11 — EVERY h5py open this module makes is declared
+# ---------------------------------------------------------------------------
+
+def test_the_table_read_is_declared_to_the_registry(
+        tmpdir_path, tmp_path, monkeypatch):
+    """RED: ``read_w_tables`` was the ONE h5py open nobody could see.
+
+    It forwarded ``src`` straight to ``qirr_store.read_tables``, which
+    opens h5py itself, so the open was never declared to
+    :mod:`file_io.hdf5_owner` — and it is not a rare path: the fit driver
+    calls it on EVERY RANK to fetch the unfold tables (audit §E.3 item 2).
+    A blind spot there is a blind spot exactly where the store is
+    hottest, and neither the refusal nor the count could fire.
+
+    THE SYNTHETIC TWO-STACK SHAPE, as in ``test_hdf5_one_owner``: the FFI
+    side is a real ``note_open`` claim rather than a real phdf5 handle,
+    because what is under test is the DECLARATION, and faking the
+    transport must not fake the ownership.  Both instruments are asserted
+    — the registry (it refuses, and the refusal names this function) and
+    the journal (the allowed read leaves an h5py open line on this path,
+    in the one stream that carries both stacks).
+    """
+    from file_io import h5_journal as J
+    from file_io import hdf5_owner as HO
+
+    _write_w(tmpdir_path, n_omega=2)
+    monkeypatch.setenv(J.MODE_ENV, "1")
+    monkeypatch.setenv(J.DIR_ENV, str(tmp_path))
+    monkeypatch.delenv(HO.POLICY_ENV, raising=False)
+    HO.reset_for_test()
+    J.reset_for_test()
+    try:
+        # 1. THE REGISTRY.  With the FFI holding a write handle on this
+        #    path, a serial-h5py read is the undefined cross-stack case
+        #    A1 names — and the refusal carries the function, so a later
+        #    reader of the message knows which open to move.
+        token = HO.note_open(tmpdir_path, HO.STACK_FFI, "a",
+                             where="test: SlabIO(mode='a')")
+        try:
+            with pytest.raises(RuntimeError) as exc:
+                MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+            msg = str(exc.value)
+            assert "one-owner-per-file" in msg, msg
+            assert "mpa_store.read_w_tables" in msg, msg
+        finally:
+            HO.note_close(tmpdir_path, token)
+
+        # 2. THE JOURNAL.  The allowed read is COUNTED: the tables still
+        #    come back from the format layer, and the open is on the line.
+        tables = MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+        assert tables.canonical().digest()
+        with open(J.journal_path()) as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        want = f"stack=h5py op=open path={os.path.abspath(tmpdir_path)} "
+        assert [ln for ln in lines if want in ln], lines
+    finally:
+        HO.reset_for_test()
+        J.reset_for_test()
 
 
 if __name__ == "__main__":                              # pragma: no cover

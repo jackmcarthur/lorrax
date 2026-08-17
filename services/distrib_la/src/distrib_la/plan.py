@@ -40,8 +40,9 @@ The reason to insist on it is that a scan is a place where a decision can
 live.  A Python loop over ``nb`` matrices is ``nb`` separate calls the
 compiler never sees together, and there is nowhere in it to put "run this
 batch some other way".  A scan is one node, so the choice of HOW a batch
-executes collapses to :attr:`Plan.batched_route` — today two routes, with a
-third reserved and named there.
+executes collapses to :attr:`Plan.batched_route`: the distributed scan, a
+backend's stacked entry, or staged batch-axis movement around a device-local
+native kernel.
 
 TWO PHASES, and they stay two
 -----------------------------
@@ -86,8 +87,8 @@ from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
 __all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
-           "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
-           "ROUTE_BATCH_RESHARD"]
+           "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES", "ROUTE_SCAN",
+           "ROUTE_BACKEND_BATCHED", "ROUTE_BATCH_RESHARD"]
 
 
 #: ``unroll=`` for the batched scan — route ``ROUTE_SCAN`` below.
@@ -110,13 +111,18 @@ BATCHED_SCAN_UNROLL = 1
 ROUTE_SCAN = "scan"
 #: (b) the backend's own stacked FFI entry point, where the library has one.
 ROUTE_BACKEND_BATCHED = "backend_batched"
-#: (c) RESERVED, not implemented — see :attr:`Plan.batched_route`.
+#: (c) staged batch-axis reshard + a device-local native JAX kernel.
 ROUTE_BATCH_RESHARD = "batch_reshard"
 
 #: Every route the toggle can name.  A vocabulary, like the backend names:
-#: importable with no jax and no ``.so``, so a test can enumerate the routes
-#: without a mesh.
+#: importable with no FFI ``.so``, so configuration code can enumerate the
+#: routes without probing a vendor library or constructing a mesh.
 BATCHED_ROUTES = (ROUTE_SCAN, ROUTE_BACKEND_BATCHED, ROUTE_BATCH_RESHARD)
+
+#: Public construction-time grammar.  ``scan`` and ``backend_batched`` stay
+#: implementation details selected by ``auto``; the one user-facing opt-in is
+#: route (c), which changes the memory/capacity tradeoff deliberately.
+BATCHED_ROUTE_CHOICES = ("auto", ROUTE_BATCH_RESHARD)
 
 #: ``jit``-compiled batched scans, one per (op, backend, mesh, signature).
 #:
@@ -323,8 +329,13 @@ class Plan:
         one (which also runs the divisibility guard at resolve time).
     in_sharding, batch_in_sharding
         WHERE an operand has to live for this plan: ``P('x','y')`` for a
-        single tile, ``P(None,'x','y')`` for a stack.  ``None`` on a native
-        plan, which accepts any layout.
+        single tile, ``P(None,'x','y')`` for a stack.  ``None`` on an
+        automatic native plan, which accepts any layout; an explicit
+        batch-reshard native plan exposes the face shardings because staged
+        movement starts from that contract.
+    requested_batched_route
+        The construction-time public selection, ``'auto'`` or
+        ``'batch_reshard'``. :attr:`batched_route` is the resolved route.
     donates
         Which positional operands this OP donates — see :data:`DONATES`.
     """
@@ -336,11 +347,12 @@ class Plan:
     n: int | None
     in_sharding: NamedSharding | None
     batch_in_sharding: NamedSharding | None
+    requested_batched_route: str = "auto"
 
     # ---- introspection -------------------------------------------------
     @property
     def is_native(self) -> bool:
-        """True when the resolved backend is the in-tree JAX path."""
+        """True when the resolved backend is the native JAX path."""
         return self.backend == NATIVE
 
     @property
@@ -376,17 +388,19 @@ class Plan:
             backend-internal optimization BEHIND this interface, never a
             second surface a caller can see or has to know about.
 
-        (c) ``ROUTE_BATCH_RESHARD`` — **RESERVED.  Not implemented; asking
-            for it raises.**  Move the batch axis onto the mesh
-            (``common.staged_reshard.face_to_batch_reshard``:
+        (c) ``ROUTE_BATCH_RESHARD`` — move the batch axis onto the mesh
+            (the service-private staged exchange, kept inside this package
+            so an installed service has no upward dependency:
             ``P(None,'x','y') → P(('x','y'),None,None)``, two single-mesh-
             axis ``all_to_all``s, because the one-step move is not a tile
             permutation and GSPMD silently degrades it to
             replicate-then-partition) and run the LOCAL jax kernel on each
-            rank's own matrices, then move back.  The movement primitive
-            already exists and is documented there; wiring it is the work.
+            rank's own matrices, then move back through the literal inverse
+            pair of ``all_to_all``s.  Eigh eigenvalues use a device
+            ``all_gather`` to recover this service's replicated-vector
+            contract; no output is gathered through the host.
 
-            The reason it is worth a reserved name: for every matrix that
+            The reason it is worth a named route: for every matrix that
             fits on one device, the distributed libraries' cost IS their
             fixed per-call charge — cuSOLVERMp eigh is a flat ~1.55 s per
             matrix from n=64 to n=1024, where native replicated is 1.5 ms
@@ -395,11 +409,23 @@ class Plan:
             call at all, and it is how small-system linalg happens without
             a second, parallel API.
 
-        Choosing between them is deliberately NOT a caller-facing dial.
-        ``batched()`` takes a private ``_route`` override that the
-        batched-vs-serial bit-identity gate uses to run both routes on the
-        same operands; production code passes nothing and gets this.
+        ``plan(..., batched_route=...)`` is the one caller-facing selection:
+        ``'auto'`` preserves the historical route, while ``'batch_reshard'``
+        opts into (c).  ``batched()`` also keeps a private ``_route``
+        override solely for route-comparison gates.
         """
+        if self.requested_batched_route not in BATCHED_ROUTE_CHOICES:
+            raise ValueError(
+                f"unknown requested batched route "
+                f"{self.requested_batched_route!r} (known: "
+                f"{'|'.join(BATCHED_ROUTE_CHOICES)})")
+        if self.requested_batched_route == ROUTE_BATCH_RESHARD:
+            return ROUTE_BATCH_RESHARD
+        if self.is_native:
+            # jnp.linalg.eigh owns a true stacked entry; the native
+            # cholesky/solve plans reach Plan.batched only under explicit
+            # route (c), because their auto implementation is caller-owned.
+            return ROUTE_BACKEND_BATCHED
         if _IMPL[(self.op, self.backend)]["many"] is not None:
             return ROUTE_BACKEND_BATCHED
         return ROUTE_SCAN
@@ -439,11 +465,12 @@ class Plan:
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what geometry."""
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
-        where = ("in-tree JAX, any layout" if self.is_native else
+        where = ("native JAX, any layout" if self.is_native else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
         n = "" if self.n is None else f", n={self.n}"
         return (f"{self.op}: {self.requested!r} -> {self.backend} "
-                f"({where}{n})")
+                f"({where}{n}); batched "
+                f"{self.requested_batched_route!r} -> {self.batched_route}")
 
     # ---- calling -------------------------------------------------------
     def _entry(self, key: str):
@@ -501,12 +528,29 @@ class Plan:
         module exists to make once — the same reason there is no
         ``backend=`` on a call and only on :func:`plan`.
         """
+        route = self.batched_route if _route is None else _route
+        if route not in BATCHED_ROUTES:
+            raise ValueError(
+                f"unknown batched route {route!r} "
+                f"(known: {'|'.join(BATCHED_ROUTES)})")
+
+        # Route (c) deliberately runs the pure-JAX operation even when the
+        # plan resolved an FFI backend.  Its layout contract still starts at
+        # the same face sharding, including on an explicit native plan.
+        if route == ROUTE_BATCH_RESHARD:
+            return self._batch_reshard((A, *args), kwargs)
+
         if self.is_native:
+            if route != ROUTE_BACKEND_BATCHED:
+                raise NotImplementedError(
+                    f"native {self.op} has no route {route!r}; its automatic "
+                    f"batched entry is {ROUTE_BACKEND_BATCHED!r}, and the "
+                    f"only public alternative is "
+                    f"{ROUTE_BATCH_RESHARD!r}.")
             return self(A, *args, **kwargs)
+
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
-
-        route = self.batched_route if _route is None else _route
         if route == ROUTE_BACKEND_BATCHED:
             many, post = self._entry("many")
             if many is None:
@@ -519,16 +563,33 @@ class Plan:
             return post(self.backend, *out) if post is not None else out
         if route == ROUTE_SCAN:
             return self._scan_over_single(ops, kwargs)
-        if route == ROUTE_BATCH_RESHARD:
-            raise NotImplementedError(
-                f"route {ROUTE_BATCH_RESHARD!r} is RESERVED and not built: "
-                f"it would move the batch axis onto the mesh with "
-                f"common.staged_reshard.face_to_batch_reshard and run the "
-                f"local jax kernel per matrix.  See Plan.batched_route for "
-                f"what it is for and why the name exists before the code.")
-        raise ValueError(
-            f"unknown batched route {route!r} "
-            f"(known: {'|'.join(BATCHED_ROUTES)})")
+        raise AssertionError(f"unhandled batched route {route!r}")
+
+    def _batch_reshard(self, ops: tuple, kwargs: dict):
+        """Route (c): staged movement, local native op, staged inverse."""
+        options = dict(kwargs)
+        # A block size configures a distributed library descriptor.  The
+        # local JAX kernel has no such descriptor, so retaining the keyword
+        # would make a universal route flag fail only at call time.
+        options.pop("block_size", None)
+        if self.op == "eigh":
+            # The public contract returns (W, Z) on every route.  Computing Z
+            # even when a backend-specific hint says it may be ignored is the
+            # only native spelling that preserves that contract.
+            options.pop("compute_evecs", None)
+        if options:
+            raise TypeError(
+                f"batch_reshard {self.op}: keyword(s) "
+                f"{', '.join(sorted(options))} have no native-JAX meaning")
+
+        from distrib_la._batch_reshard import (
+            batch_reshard_call, validate_batch_reshard_operands,
+        )
+        # Shape refusals precede even the face placement, and therefore
+        # precede every collective in the route.
+        validate_batch_reshard_operands(self.op, self.mesh, ops)
+        ops = tuple(ensure_sharding(x, self.batch_in_sharding) for x in ops)
+        return batch_reshard_call(self.op, self.mesh, ops)
 
     def _scan_over_single(self, ops: tuple, kwargs: dict):
         """Route (a): ``lax.scan`` over this plan's own single-matrix call.
@@ -585,7 +646,7 @@ class Plan:
 
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
-         n: int | None = None) -> Plan:
+         n: int | None = None, batched_route: str = "auto") -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
     Every guard (vocabulary, platform, known-broken combinations,
@@ -611,6 +672,10 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     n
         Matrix extent, when known.  Passing it turns the divisibility rule
         into a resolve-time error instead of a call-time one.
+    batched_route
+        ``'auto'`` preserves the historical backend-batched/scan choice;
+        ``'batch_reshard'`` stages the batch over the mesh and runs the
+        device-local native JAX operation.  See :attr:`Plan.batched_route`.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -620,10 +685,22 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     """
     if op not in OPS:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
+    batched_route = str(batched_route).strip().lower()
+    if batched_route not in BATCHED_ROUTE_CHOICES:
+        raise ValueError(
+            f"unknown batched route {batched_route!r} (known: "
+            f"{'|'.join(BATCHED_ROUTE_CHOICES)})")
     resolved = resolve_backend(op, backend, mesh_xy, n=n)
     ffi = resolved != NATIVE
-    tile = NamedSharding(mesh_xy, P("x", "y")) if ffi else None
-    stack = NamedSharding(mesh_xy, P(None, "x", "y")) if ffi else None
+    face = ffi or batched_route == ROUTE_BATCH_RESHARD
+    tile = NamedSharding(mesh_xy, P("x", "y")) if face else None
+    stack = NamedSharding(mesh_xy, P(None, "x", "y")) if face else None
+    if batched_route == ROUTE_BATCH_RESHARD:
+        # Eager plan construction is the legal place for runtime setup; the
+        # returned Plan.batched remains trace-safe.
+        from distrib_la._collectives import warm_mesh_cliques
+        warm_mesh_cliques(mesh_xy)
     return Plan(op=op, requested=str(backend), backend=resolved,
                 mesh=mesh_xy, n=None if n is None else int(n),
-                in_sharding=tile, batch_in_sharding=stack)
+                in_sharding=tile, batch_in_sharding=stack,
+                requested_batched_route=batched_route)

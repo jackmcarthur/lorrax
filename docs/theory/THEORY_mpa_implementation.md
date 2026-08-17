@@ -7,12 +7,16 @@ by an object defined earlier. Exact deck defaults belong to the
 [input reference](../input_reference.md); equations and validity domains belong
 here.
 
-`compute_mode = mpa` is declared but still refuses at driver entry. The
-disk-bounded chi-to-W-to-fit pipeline, the shared Sigma planner, and the common
-dynamic-Sigma finalizer exist on this feature branch. Public enablement waits
-for one real-material calculation to traverse that complete path with the
-fixed-head approximation and pass its numerical gate. The refusal is owned by
-`gw_config.UNIMPLEMENTED_MODES`; internal component tests do not weaken it.
+`compute_mode = mpa` **runs**: the entry refusal owned by
+`gw_config.UNIMPLEMENTED_MODES` was removed at `9c9b23dc` (2026-08-15) on
+`integ/metal-mpa-qsgw-2026-08-15`, which is pushed but **not** an ancestor of
+`origin/main`. The condition it waited on — one real-material calculation
+traversing the disk-bounded chi-to-W-to-fit pipeline, the shared Sigma planner
+and the common dynamic-Sigma finalizer end to end — was met by a three-iteration
+metallic QSGW run on the Na deck. Read that narrowly: it means the mode parses
+and executes, **not** that the result converged (it did not) and not that the
+numbers are validated. Convergence and the BGW comparison continue under rungs
+R5/R6; the per-site refusals that guard physics preconditions are untouched.
 
 ## 1. One pipeline, three approximations
 
@@ -138,9 +142,9 @@ sample and pole stores; the readers compare these identities rather than
 assuming that equal shapes mean equal physics.
 
 `gw.mpa.sampling` owns only this geometry. `gw.mpa.sample_plan` classifies the
-points and chooses an evaluator. Constructing a metallic plan is supported;
-evaluating it is not yet supported because occupation-weighted interband and
-intraband chi and Sigma terms have not landed.
+points and chooses an evaluator. Metallic plans are evaluated as well as
+constructed; which kernel serves each metal point, and the measured reasoning,
+belong to [Metallic MPA screening](metallic-mpa-screening.md).
 
 ## 4. How each chi sample is evaluated
 
@@ -329,10 +333,11 @@ energy, the four insulating branches are
 The table determines the usual topology, not the answer by decree. The
 planner computes bounds from actual signed energies and live fitted poles. A
 nominally sign-definite rectangle whose lower bound reaches zero refuses
-instead of silently applying a divergent Laplace representation. Supporting
-small, inverted, or fractional-occupation systems requires splitting such a
-cell at the actual denominator boundary and supplying the missing occupation
-physics.
+instead of silently applying a divergent Laplace representation. Small,
+inverted, and fractional-occupation systems are where that happens for a
+physical reason rather than a planning mistake; the occupation weights and
+the split that keeps the rectangles sign definite are owned by
+[Metallic MPA screening](metallic-mpa-screening.md).
 
 ## 8. The core, electronic stripe, and plasmon slab
 
@@ -504,6 +509,66 @@ $6.5\times10^{-4}$ to $2\times10^{-3}$ reduced the physical census from 478
 to 446 without a measurable change relative to the 478-node plan at the
 $5\times10^{-5}$ meV reporting scale.
 
+### 10.1 The Landau floor, and the omega-clustered decomposition
+
+The linear law above is not a defect of the order search.  Measured on the
+sodium semicore scan, the production rule costs $N_\times = 87F + 10$ at
+$\epsilon_\times=2\times10^{-3}$, $\eta=0.25$ eV — and a Landau-density
+count for ANY stable exponential-sum representation
+$Q(x)=\sum_l\alpha_l e^{-ixt_l}$ that is uniformly accurate on the
+sign-symmetric window gives $N \gtrsim (F/\gamma_{\min})\log(1/\epsilon)/\pi
+\approx 107F$ at these parameters: the target's Laplace content fills
+$t\in[0,\log(1/\epsilon)/\gamma_{\min}]$ and the window is $2F$ wide.  The
+global Gauss rule sits within tens of percent of the floor.  Free complex
+nodes cannot beat it either: the rotated-contour trick that makes the
+sign-definite sector family logarithmic (section 9) needs the domain inside
+a sector $|\arg d|\le\pi/2-\beta$, and the crossing rectangle fills the
+full sector as $F/\gamma\to\infty$ — a ray that decays for $x>0$ grows like
+$e^{|x|\tau\sin\psi}$ for $x<0$.  Rational nodes in $x$ do not factor
+$x=\omega-e-a$ and cannot ride the separable $\tau$ kernel at all.
+
+What IS wrong is the certified region.  For any single evaluation
+frequency, only the thin shell $|\omega-e-a|\lesssim$ (margins) crosses;
+the rest of the $[\omega_{\min},\omega_{\max}]\times$(transitions) product
+set is sign-definite and belongs to the logarithmic family.  The planner
+therefore clusters each branch's $|\omega|$ values at gaps larger than
+`mpa_sigma_omega_cluster_gap_ry` and, when there is more than one cluster,
+splits the core per cluster at the crossing-edge margin $m$:
+
+* bands $e < w_{\rm lo} - a_{\rm hi} - m$: the denominator
+  $\omega-e-a+i\gamma$ keeps a positive real part — a rotated-Laplace fit
+  in CONJUGATE node placement $t=+i\,\bar n$ (the retarded upper-half
+  denominator is the conjugate of the fit family's lower-half domain);
+* the shell: the positive causal rule of this section, with $F$ set by the
+  CLUSTER span and the pole bracket — independent of the dynamic range;
+* bands $e > w_{\rm hi} - a_{\rm lo} + m$: the plasmon-slab orientation of
+  the sector family.
+
+One cluster — every contiguous production grid — reproduces the monolithic
+plan bit for bit.  The metallic `sd_core` sliver decomposes on the same
+pattern (its $x=\omega+e+a$ crosses only where BOTH $\omega$ and $a$ are
+within the excursion scale).  The evaluation grid itself is gapped with
+`sigma_omega_patches_ev`, since $\Sigma(\omega)\to E$ interpolation is
+piecewise linear and needs no points where no QP energy lives; a solved
+energy inside a grid hole is a refusal at the QSGW seam.
+
+Measured at production $\eta$ and tolerances on the synthetic Fe-class
+geometry (valence window + one semicore cluster; every rule certified):
+
+| evaluation span | total nodes | linear law | largest rule |
+|---|---|---|---|
+| 52 eV  | 44 | 344  | 18 |
+| 105 eV | 45 | 679  | 18 |
+| 209 eV | 51 | 1349 | 18 |
+| 419 eV | 52 | 2689 | 18 |
+
+The damped total is exactly flat; only the sector-slab rank creeps
+logarithmically.  The cost is set by how many places the physics evaluates
+$\Sigma$, never by how far apart they are.  Derivation, executor-safety
+constraints (the conjugate placement grows factored exponentials, so the
+references anchor at the mask maximum and masked bands are clamped), and
+the rejected alternatives: `docs/dev/crossing-rule-cost-law.md`.
+
 ## 11. Shared spatial execution
 
 At one scalar time node, MPA constructs
@@ -566,12 +631,46 @@ S_{\mathrm{eff}}(z)=S_0(z)
 +\frac{Y(z)W_{\mathrm{body},\Gamma}(z)Z(z)}{V_{\mathrm{cell}}}.
 $$
 
-The sharded $YWZ$ contraction exists, but the producer that rebuilds $S_0$,
-$Y$, and $Z$ from the current orbitals is not connected. The staged MPA driver
-therefore fits the established two-point DFT scalar head once and labels it
-`fixed_dft_gn`. This approximation omits dynamic local-field head/wing
-feedback. It is especially suspect near gap closure and under orbital
-self-consistency.
+`gw.head_correction.fold_cartesian_head_wings_sharded` owns this contraction
+without gathering the body tile.  MPA now builds one frequency plan and gives
+the exact same complex `z` array to the body and to the QSGW direct-head
+response.  Each Dyson slab may finalize one head sample while total
+`W_body,Gamma(z)` is resident; only the 3x3 result survives.  The scalar
+`Wc_head(z) = W_head(z) - v_head` is fit with the same Loewner policy, guards,
+and complex sample grid as the body and is published collectively through
+SlabIO beside the body poles.
+
+The MPA path supplies independent complex left/right centroid wings at every
+sample.  The direct all-band contraction keeps the two stored centroid-
+sharded wavefunction copies, distributes equal band-pair tiles over all
+`Px*Py` ranks, and circulates a tile only around the mesh axis matching its
+output wing.  Frequencies are blocked inside each ring, so the transition
+weight temporary is bounded and no band-pair-by-centroid tensor is stored.
+Each sample is folded through total W while that body slab is resident.
+
+Each QSGW map call solves its own occupation state at entry, from the
+spectrum of the Hamiltonian it was handed, and evaluates the direct head on
+the full MPA grid with that state's chemical potential and occupations; the
+same state reaches the finite-q body and Sigma.  There is no carry between
+calls, which is what makes the map a function of its Hamiltonian alone.
+[Metallic MPA screening](metallic-mpa-screening.md) owns that rule and its
+consequences, what each consumer does with the state, which pieces are
+threaded end to end and which are not, the capability-gate status, and the
+measured self-consistency behaviour.
+
+One-shot and diagonal fixed-point QP solvers can consume a finalized external
+pole store.  Fully self-consistent QSGW rebuilds the body and head models
+because each iteration changes the orbitals and transition energies.  The
+bounded path is `chi(z)` q-wedge store -> one-slab Dyson and head finalization
+-> `Wc(z)` q-wedge store -> bounded body-column and scalar-head Loewner fits.
+Sigma subsequently reads and unfolds four body pole/residue slabs at a time
+and reads the small head fit collectively.  Public `compute_mode = mpa` is
+no longer gated at driver entry — the row was deleted at `9c9b23dc` once a
+real metallic run traversed the complete chi/W/head/Sigma/QSGW chain — and
+what that lift does and does not assert is stated once, in
+[Metallic MPA screening](metallic-mpa-screening.md) §6.4.  Read this section
+as landed plumbing: it is not itself a capability claim.
+
 
 The MPA body applies the configured $\eta$ to every pole. The current generic
 complex-pole head consumer uses the stored head pole without adding the same
@@ -586,7 +685,7 @@ Hermitian QSGW operator, and apply the existing outside-band scissor. A
 self-consistent MPA calculation must rebuild chi, W, and the body pole fit
 after each orbital update. Writing q-wedge chi, W, and pole stores on every
 iteration is supported by the bounded dataflow above; no model tensor belongs
-in `SCState`.
+in `SCState`. When `sc_head_update = parallel_transport`, the fixed-DFT fallback head is replaced per iteration by the direct QP-basis head described above.
 
 ## 13. Validated starting profile
 
@@ -604,7 +703,6 @@ mpa_material_class = insulator
 mpa_sampling_alpha = 1
 mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
-mpa_head_model = fixed_dft
 mpa_pole_batch_size = 4
 
 mpa_sigma_sector_target_error = 6.5e-4
@@ -640,6 +738,37 @@ Use these dependencies when moving beyond the validated profile.
   linearly with the new transition bandwidth. Keep the old pole count only if
   held-out W and QP values remain converged.
 
+- **More bands in the Sigma sum — and how to extrapolate them.** Measured on
+  a one-shot GN-PPM Si ladder at $n_b = 28/40/68$ with a band-matched
+  BerkeleyGW arm at every rung (claim 197; the MPA arm of this ladder was not
+  run, and §5.3b's broadening caveat forbids reading the GN-PPM numbers as
+  MPA ones). **94.6%** of the mean-square 28-vs-68-band error is a *rigid
+  shift* of the whole spectrum (BGW 92.7%): aligning each run on its own
+  $\mu$ cuts RMS $|\Delta E_{QP}|$ from **787 meV to 186 meV**, within 1.6%
+  of the best possible uniform shift, so there is no cleverer reference than
+  per-run $\mu$. The residual is not noise but a clean linear stretch,
+  $\Delta E = s + \alpha (E - \bar E)$ with $\alpha \approx +0.031$, which
+  with the shift explains 99.2% of the variance; the two codes agree on $s$
+  to 2% and on $\alpha$ to 4%, which is why the mechanism is read as
+  truncating the $\Sigma_c$ intermediate-state sum rather than as an
+  implementation difference. The tail is textbook $1/n_b$: a per-$(k,n)$ fit
+  $E(n_b) = E_\infty + A/n_b$ over three widely spread rungs reproduces them
+  to 15 meV RMS — a 52x lever on the 787 meV error it corrects — and beats
+  $1/n_b^2$ by 4-5x in both codes. Practice, therefore: align on per-run
+  $\mu$, drop the outermost band pair at each window edge (they can be
+  non-monotone in $n_b$: on the BGW arm they take the all-band fit residual
+  from 15.17 to 42.70 meV RMS and 56.1 to 346.6 meV max), fit $E_\infty +
+  A/n_b$ on three rungs, and report the extrapolated correction beside the
+  number — that deck still owes $-528$ meV mean at 68 bands. Two limits of
+  this result, both measured: energy-*local* differences already cancel it
+  (the direct gap at $\Gamma$ moves 5.5 meV while the levels move 787 meV)
+  while wide-window differences do not (valence bandwidth $+268$ meV), and
+  it does **not** carry to the screening channel at all — on the Na head
+  ladder a best rigid $\omega$-shift removes only ~24% of RMS
+  $|\Delta \chi^{00}|$ and a best amplitude rescale 39%, so the head's
+  finite-band error is a change of spectral *shape* and a shift-and-stretch
+  ansatz is wrong for $W$.
+
 - **A wider Sigma interval.** Both $T$ and the crossing beat bandwidth $F$
   grow. Crossing rank is approximately linear in the added bandwidth; sector
   ranks grow logarithmically until a window boundary changes. A finer output
@@ -667,11 +796,13 @@ Use these dependencies when moving beyond the validated profile.
   sweeps, not the approximation. The production interface refuses values above
   four until a larger resident batch is memory-certified.
 
-- **Small-gap or metallic occupations.** The sample-grid functions exist, but
-  the evaluator still refuses. Occupied and empty selection must come from
-  actual occupations, fractional weights must enter both chi and Sigma, and any
-  sign-straddling energy cell must be split before the mode can be called
-  metallic.
+- **Small-gap or metallic occupations.** Owned by
+  [Metallic MPA screening](metallic-mpa-screening.md). The cost model changes
+  in two places: the origin row leaves the sampled-quadrature family for an
+  exact divided-difference tile scan, and the damped-line bandwidth is set by
+  the occupation supports rather than by $\omega_m$, so it grows with the
+  smearing width as well as the band window. Sigma rank grows because the
+  crossing core absorbs the Fermi-surface straddle.
 
 ## 15. Ownership map
 
