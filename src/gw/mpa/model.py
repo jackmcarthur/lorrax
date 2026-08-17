@@ -533,6 +533,13 @@ def build_mpa_fit(
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
         occupation_state=occupation_state)
+    # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
+    # writer opens the same file through serial h5py.  A context-manager
+    # return is rank-local: without this process barrier rank 0 can enter
+    # h5py while a slower peer still owns the FFI writer, leaving HDF5's
+    # superblock write-consistency flag set and refusing the ledger open.
+    from common.collectives import barrier
+    barrier("mpa_body_fit_closed_before_head")
     if isinstance(iteration_head, tuple):
         head_fit_samples = iteration_head
         iteration_head = None
