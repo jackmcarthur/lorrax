@@ -88,15 +88,14 @@ axis**, because that decides which memory layout the one kernel must read.
     member      k axis in X   handler target              platforms  factory
     ----------  ------------  --------------------------  ---------  --------
     k-strided   LEADING       lorrax_mklfft_gw_conv       cpu, CUDA  make_gw_conv_ffi
-    k-leading   LEADING*      lorrax_cufft_conv_klead     CUDA       make_conv_klead_ffi
+    k-leading   LEADING       lorrax_cufft_conv_klead     CUDA       make_conv_klead_ffi
     k-minor     MINOR-most    lorrax_cufft_conv_kminor    CUDA       make_conv_kminor_ffi
 
 THE CHOICE IS THE CALLER'S RESIDENT LAYOUT, AND IT IS MEASURED, NOT A TASTE.
-``LEADING*`` is the conditional Sigma exception: its native-copy prototype
-measured 22.0% below the certified k-minor per-byte rate under BFC, crossing
-the owner's 20% fallback trigger.  The shipped half-absorbed form therefore
-pays exactly one input pack to k-minor and emits k-leading from the store; it
-does not expose that packed layout to the caller.
+The k-leading member keeps public T, W and U k-leading.  Its kernel coalesces
+the load into resident shared-memory rows and writes k-leading output; there is
+no global pack or transpose.  No production Sigma caller exists until the
+separate caller seam lands.
 The k-strided member reads a k-major tile through cuFFT's advanced data
 layout (``cufftPlanMany64`` istride=T, idist=1), which is exactly right for
 the Σ τ kernel: its ``dot`` layout is k-major, so the handler REMOVES a
@@ -112,10 +111,8 @@ stride to degrade — and it can emit a chosen output PERMUTATION from the store
 so a downstream consumer's layout costs nothing extra.
 
 So: pick the member whose k position matches the tile you already hold.  A
-caller does not independently transpose to reach another member.  The one
-exception is the measured, owned half-absorbed policy inside the Sigma factory
-above: one input pack, with the inverse permutation absorbed by the store.
-New members belong here, beside these two, under the same contract.
+caller does not independently transpose to reach another member.  New members
+belong here under the same contract.
 """
 
 from __future__ import annotations
@@ -165,7 +162,7 @@ __all__ = [
     "conv_kminor_available", "conv_kminor_scale", "make_conv_kminor_ffi",
     "conv_kminor_plan", "conv_kminor_row_fits",
     "conv_kminor_out_shape", "conv_kminor_out_spec",
-    # Sigma's direct k-leading fused-conv accelerator.
+    # The direct k-leading fused-conv candidate (no production Sigma caller).
     "CONV_KLEAD_TARGET", "CONV_KLEAD_GATE",
     "conv_klead_mode", "conv_klead_enabled", "require_conv_klead",
     "conv_klead_available", "conv_klead_plan", "conv_klead_row_fits",
@@ -182,8 +179,9 @@ GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 #: there is no host twin, so a shared string would promise a cpu handler that
 #: does not exist and a cpu mesh would resolve to nothing instead of refusing.
 CONV_KMINOR_TARGET = "lorrax_cufft_conv_kminor"
-#: Sigma's CUDA-only DIRECT k-leading member.  Unlike GW_CONV_TARGET this is
-#: one SMEM-resident traversal rather than a cuFFT advanced-layout plan.
+#: CUDA-only direct k-leading candidate.  Unlike GW_CONV_TARGET this is one
+#: SMEM-resident traversal rather than a cuFFT advanced-layout plan.  No
+#: production Sigma caller exists until its separate caller seam lands.
 CONV_KLEAD_TARGET = "lorrax_cufft_conv_klead"
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
@@ -512,7 +510,7 @@ def make_gw_conv_ffi(
 
 
 # ===========================================================================
-# THE FUSED-CONV FAMILY, member 2 of 3: direct k-LEADING (Sigma)
+# THE FUSED-CONV FAMILY, member 2 of 3: direct k-LEADING candidate
 # ===========================================================================
 # This member keeps the same (nk,a,mx,b,my)/(nk,mx,my) ABI as gw_conv but
 # replaces the nine cuFFT axis passes with one direct, SMEM-resident kernel.
@@ -521,9 +519,9 @@ def make_gw_conv_ffi(
 # rows itself and emits U k-leading without an output pack.
 # It transforms W inside the call because Sigma has no solve-wide W_R cache.
 #
-# Default OFF: production continues to use GW_CONV_TARGET unless the caller's
-# integration seam explicitly resolves this accelerator.  `auto` is a safe
-# capability choice; `on` is the certification mode and never demotes.
+# Default OFF.  This is a callable candidate, but no production Sigma caller
+# exists until its separate seam lands.  `auto` is a safe capability choice;
+# `on` is the certification mode and never demotes.
 CONV_KLEAD_GATE = Gate(
     env="LORRAX_CONV_KLEAD_FFI",
     target=CONV_KLEAD_TARGET,
@@ -537,26 +535,28 @@ CONV_KLEAD_GATE = Gate(
         "CufftConvKLeadCudaFfi; the per-call plan then checks runtime axes "
         "and the conservative shared-memory floor"),
     auto_on_msg=(
-        "[conv_klead] auto -> ON: Sigma's direct k-leading fused convolution "
-        "({target}) is available.  Each call still resolves its runtime "
-        "k-grid axes and conservative row-residency floor."),
+        "[conv_klead] auto -> ON: k-leading fused-convolution candidate "
+        "({target}) available; no production Sigma caller yet.  Each direct "
+        "call still resolves its runtime k-grid axes and conservative "
+        "row-residency floor."),
     auto_off_msg=(
-        "[conv_klead] auto -> OFF: Sigma keeps the certified plan-based "
-        "k-leading gw_conv handler.  Reason: {reason}"),
+        "[conv_klead] auto -> OFF: k-leading fused-convolution candidate "
+        "unavailable; no production Sigma caller yet.  Reason: {reason}"),
     off_announce_msg=(
-        "[LORRAX_CONV_KLEAD_FFI] =0: Sigma's direct k-leading fused "
-        "convolution is disabled; production keeps lorrax_mklfft_gw_conv."),
+        "[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate "
+        "disabled; no production Sigma caller yet."),
     label={"CUDA": "direct k-leading fused conv CUDA"},
     resolved_msg={
         "CUDA": (
-            "[conv_klead] Sigma k-leading IFFT(G)·IFFT(W)·FFT -> direct "
-            "CUDA FFI handler ({target}): one SMEM-resident traversal, "
+            "[conv_klead] k-leading fused-convolution candidate available; "
+            "no production Sigma caller yet.  Direct CUDA FFI handler "
+            "({target}): one SMEM-resident traversal, "
             "runtime twiddle-ring extents, zero global transposes, "
             "k-leading store, c128 only."),
     },
     refuse_platform_msg=(
-        "LORRAX_CONV_KLEAD_FFI=on requires Sigma's direct k-leading CUDA "
-        "kernel, but this mesh is '{platform}'.  Use off/auto to retain "
+        "LORRAX_CONV_KLEAD_FFI=on requires the k-leading CUDA candidate, "
+        "but this mesh is '{platform}'.  Use off/auto to retain "
         "lorrax_mklfft_gw_conv, which serves both CPU and CUDA."),
     refuse_probe_msg=(
         "LORRAX_CONV_KLEAD_FFI=on requested {label}, but FFI target "
@@ -571,7 +571,7 @@ _CONV_KLEAD_AXIS_MAX = 24
 
 
 def conv_klead_mode() -> str:
-    """``"off"`` | ``"auto"`` | ``"on"`` for the direct Sigma member."""
+    """``"off"`` | ``"auto"`` | ``"on"`` for the k-leading candidate."""
     return CONV_KLEAD_GATE.mode()
 
 
@@ -693,7 +693,12 @@ def make_conv_klead_ffi(
                 f"conv_klead T/W shard shapes disagree: {t_local.shape} vs "
                 f"{w_local.shape}.")
         out_t = jax.ShapeDtypeStruct(t_local.shape, t_local.dtype)
-        return jax.ffi.ffi_call(CONV_KLEAD_TARGET, out_t)(
+        # Safe in-place: each block loads all k values for its disjoint row
+        # set into shared memory before any output store; no block later reads
+        # another row.
+        return jax.ffi.ffi_call(
+            CONV_KLEAD_TARGET, out_t, input_output_aliases={0: 0},
+        )(
             t_local, w_local, **attrs)
 
     from common.shard_map import shard_map
@@ -847,7 +852,7 @@ CONV_KMINOR_GATE = Gate(
 
 
 def conv_kminor_mode() -> str:
-    """``"on"`` | ``"off"`` — the raw ``LORRAX_CONV_KMINOR_FFI`` grammar."""
+    """``"off"`` | ``"auto"`` | ``"on"`` for ``LORRAX_CONV_KMINOR_FFI``."""
     return CONV_KMINOR_GATE.mode()
 
 
@@ -894,9 +899,8 @@ def conv_kminor_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
 
     * ``off``  → ``(False, ...)``, always.
     * ``on``   → ``require_conv_kminor`` (RAISES, naming the fix, if the
-      platform or the handler cannot serve it), then the residency bound,
-      which also raises rather than silently falling through: a caller that
-      said ``on`` asked not to be routed elsewhere without being told.
+      platform or the handler cannot serve it), then delegates the final
+      device-specific residency decision to the handler.
     * ``auto`` → ``(True, ...)`` when CUDA + handler + the row fits;
       ``(False, reason)`` otherwise, and the caller takes its own path.  No
       exception, no per-call output — see the dial docstring for why the
@@ -905,22 +909,10 @@ def conv_kminor_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
     mode = CONV_KMINOR_GATE.mode()
     if mode == "off":
         return False, "LORRAX_CONV_KMINOR_FFI=off"
-    fits = conv_kminor_row_fits(kgrid)
     if mode == "on":
         require_conv_kminor(mesh)          # raises with the fix named
-        if not fits:
-            nk = int(np.prod([int(v) for v in kgrid]))
-            raise RuntimeError(
-                f"LORRAX_CONV_KMINOR_FFI=on, but this call's k-grid "
-                f"{tuple(int(v) for v in kgrid)} (nk={nk}) needs more shared "
-                f"memory for ONE k-row than the {_CONV_KMINOR_AUTO_SMEM_FLOOR}"
-                f" B every CUDA device guarantees.  The handler may still "
-                f"serve it — it raises its ceiling to the DEVICE maximum and "
-                f"reports the real bound — so either drop to the default "
-                f"`auto` (which falls through to the XLA chain here) or call "
-                f"the handler directly and read its refusal, which quotes "
-                f"this device's own maximum.")
-        return True, "on"
+        return True, "on; device handler derives the residency ceiling"
+    fits = conv_kminor_row_fits(kgrid)
     ok, why = conv_kminor_available(mesh)
     if not ok:
         return False, why

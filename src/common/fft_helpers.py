@@ -406,11 +406,10 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 #     make_fused_conv_kminor  k MINOR-most  lorrax_cufft_conv_kminor  CUDA
 #
 # Pick by resident layout; callers do not independently transpose to reach a
-# different member.  The measured Sigma factory is the one owned exception:
-# its conditional half-absorbed form packs once internally and emits the
-# inverse permutation from the store.  The family contract, measurements and
-# the reason k-minor takes its kernel already in R space live in ONE place —
-# ``ffi/fft.py``'s module docstring.  This block is the seam, not a second copy.
+# different member.  Public k-leading T/W/U remain k-leading: that handler
+# coalesces loads into resident rows and writes k-leading output, with no global
+# pack or transpose.  No production Sigma caller exists until its separate
+# seam lands.  The full family contract lives in ``ffi/fft.py``.
 # ============================================================================
 
 
@@ -460,9 +459,11 @@ def make_fused_conv_kminor(
     ``(d0,nk,d3,d1,d4,d2)`` permutation emitted from the STORE, so a
     downstream layout costs nothing extra.
 
-    CUDA only, and **default OFF** (``LORRAX_CONV_KMINOR_FFI``): a new
-    hand-written kernel, exercised at P=1 only.  Sibling:
-    :func:`make_flat_k_gw_conv`.  Implementation:
+    CUDA only.  Default ``auto``: use the handler when the platform,
+    registered target, dtype, and conservative 48-KiB row-residency check
+    allow it; otherwise execute the caller's reference implementation.  ``on``
+    requires the handler and delegates the final device-specific residency
+    decision to C++.  Sibling: :func:`make_flat_k_gw_conv`.  Implementation:
     :func:`ffi.fft.make_conv_kminor_ffi`.
     """
     from ffi.fft import make_conv_kminor_ffi as _impl
@@ -488,7 +489,8 @@ def make_fused_conv_klead(
     transform in one traversal, and emits the result in Sigma's native
     k-leading layout from its coalesced store.
     It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
-    plan-based member as the off/unsupported path.
+    plan-based member as the off/unsupported path.  No production Sigma caller
+    exists until its separate caller seam lands.
     """
     from ffi.fft import make_conv_klead_ffi as _impl
     return _impl(mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)

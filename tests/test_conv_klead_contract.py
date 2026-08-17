@@ -64,7 +64,7 @@ def test_zero_transpose_path_passes_native_kleading_t_directly():
         "# ===========================================================================", 1)[0]
     assert "jnp.moveaxis(" not in body
     assert "t_local, w_local, **attrs" in body
-    assert "input_output_aliases" not in body
+    assert "input_output_aliases={0: 0}" in body
 
 
 def test_dial_is_in_both_cross_rank_registries():
