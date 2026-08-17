@@ -364,7 +364,7 @@ def _relative_frobenius(model, exact):
 
 
 def _build_intraband_rows(sample_path, V, z, intraband_blocks, mesh_xy):
-    """Build one frozen-static eigenmode block at a time."""
+    """Build one frozen-static resolvent-moment block at a time."""
     from gw.mpa import intraband_block
 
     Wc0, _ = mpa_store.read_w_slab_collective(
@@ -377,15 +377,7 @@ def _build_intraband_rows(sample_path, V, z, intraband_blocks, mesh_xy):
         if int(pair_block[0].shape[0]) == 0:
             rows.append(None)
             continue
-        try:
-            row = intraband_block.build_row(
-                W0bar[iq], pair_block, z_block)
-        except ValueError as exc:
-            if "GATE intraband_dense_eigenproblem_size" not in str(exc):
-                raise
-            raise ValueError(
-                f"GATE intraband_dense_eigenproblem_size at wedge q row "
-                f"{iq}: {exc}") from exc
+        row = intraband_block.build_row(W0bar[iq], pair_block, z_block)
         rows.append(row)
     del Wc0, W0bar
     n_poles = max(

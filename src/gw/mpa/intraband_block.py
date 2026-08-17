@@ -1,27 +1,15 @@
 """Frozen-static screened finite-q crossing block.
 
-This module is deliberately a row-at-a-time builder.  Its only dense
-``N_mu x N_mu`` input is the already distributed static remainder solve and
-its only objects of that class that survive are the ordinary pole slabs the
-MPA store already owns.  The pair-space eigenproblem is replicated; no rank
-gathers a centroid-space matrix.
+Production constructs spectral-projector moments from the centroid-space
+resolvent.  Every contour node evaluates the landed WP1 crossing kernel and
+solves only an ``N_mu x N_mu`` system.  Pair data remain the two sharded
+``N_s x N_mu`` vertex tables plus ``O(N_s)`` scalars; production never forms
+``H`` or any other ``N_s x N_s`` object.
 
-For ``chi1 = P D(z) P^H`` and ``W0bar = W0(0)`` it constructs
-
-``H = diag(u**2) + 2 diag(w) P^H W0bar P``
-
-and the exact modal expansion of
-
-``W0bar P (H-z**2 I)^-1 diag(-2w) P^H W0bar``.
-
-Contiguous residue-weighted clusters are then collapsed element by element.
-The two stored moments are the exact static value and the exact ``z^-2``
-coefficient.  Consequently each compressed element has
-
-``Cbar = sum C_m`` and ``Omega_bar**2 = Cbar / sum(C_m/lambda_m)``;
-``Bbar = -Cbar/(2 Omega_bar)`` is exactly the pole-store convention.  The
-imaginary part selected by this complex second moment is the block's
-intrinsic Landau width; no executor eta enters here.
+The old pair-space eigensolve survives only as
+:func:`_dense_reference_modes`, a tests-only oracle for small fixtures.  The
+production moments are compressed into the existing pole-store convention;
+the store and Sigma lifecycle are deliberately unchanged.
 """
 
 from __future__ import annotations
@@ -36,18 +24,18 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 MODEL = "intraband_eigenmode_v1"
 
-# A numerical acceptance, not an input or a physical parameter.  It is the
-# design's stated ~4e-3 ceiling for the known block on its stamped support.
+# Numerical acceptances, never input keys or physical parameters.
 SAMPLE_REL_TOL = 4.0e-3
 STATIC_REL_TOL = 2.0e-11
+SUM_RULE_REL_TOL = 1.0e-12
+MOMENT_REL_TOL = SAMPLE_REL_TOL
 MIN_CLUSTERS = 3
 MAX_CLUSTERS = 6
-# Claim 0282's dense eigenproblem is explicitly sized at N_s ~ 1--4k.
-# Crossing this ceiling is not an invitation to allocate until the GPU dies:
-# it means the construction's scaling premise is false for this q row.
-MAX_DENSE_MODES = 4096
+_QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
+_RESOLVENT_BATCH_NODES = 8
 
-_MODE_KERNELS = {}
+_DENSE_REFERENCE_KERNELS = {}
+_RESOLVENT_PLANS = {}
 
 
 @dataclass(frozen=True)
@@ -76,287 +64,492 @@ def _mesh_of(value, where):
 
 
 def _host_replicated(value):
-    """Host view of a deliberately replicated small array."""
+    """Host view of a deliberately replicated small scalar table."""
     return np.asarray(jax.device_get(value.addressable_data(0)))
 
 
-def _mode_kernel(mesh):
-    cached = _MODE_KERNELS.get(id(mesh))
-    if cached is not None:
-        return cached
-    w_shard = NamedSharding(mesh, P("x", "y"))
-    px_shard = NamedSharding(mesh, P(None, "x"))
-    py_shard = NamedSharding(mesh, P(None, "y"))
-    rep1 = NamedSharding(mesh, P(None))
-    left_shard = NamedSharding(mesh, P("x", None))
-    right_shard = NamedSharding(mesh, P(None, "y"))
+def _dense_reference_modes(W0bar, pair_block):
+    """Return dense pair-space modes for tests; never called by production.
 
-    @jax.jit
-    def build(W0bar, u, w, p_x, p_y):
-        # W0bar@P and P^H@W0bar remain sharded on their one centroid axis.
-        Wp = jax.lax.with_sharding_constraint(
-            W0bar @ jnp.transpose(p_y), left_shard)
-        pW = jax.lax.with_sharding_constraint(
-            jnp.conj(p_x) @ W0bar, right_shard)
-        A = jax.lax.with_sharding_constraint(
-            jnp.conj(p_x) @ Wp, NamedSharding(mesh, P(None, None)))
-        H = jnp.diag(u * u) + (2.0 * w[:, None]) * A
-        eigenvalues, X = jnp.linalg.eig(H)
-        Xinv = jnp.linalg.inv(X)
-        left = jax.lax.with_sharding_constraint(Wp @ X, left_shard)
-        right = jax.lax.with_sharding_constraint(
-            Xinv @ ((-2.0 * w)[:, None] * pW), right_shard)
-        left_norm = jnp.sqrt(jnp.sum(jnp.abs(left) ** 2, axis=0))
-        right_norm = jnp.sqrt(jnp.sum(jnp.abs(right) ** 2, axis=1))
-        weights = jax.lax.with_sharding_constraint(
-            left_norm * right_norm, rep1)
-        return eigenvalues, left, right, weights
+    This is the claim-0315 eigensolve retained as the <=2k synthetic oracle.
+    Its private name and isolated cache make an accidental production call
+    visible in review and in the no-``N_s**2`` acceptance test.
+    """
+    mesh = _mesh_of(W0bar, "_dense_reference_modes")
+    kernel = _DENSE_REFERENCE_KERNELS.get(id(mesh))
+    if kernel is None:
+        rep1 = NamedSharding(mesh, P(None))
+        left_shard = NamedSharding(mesh, P("x", None))
+        right_shard = NamedSharding(mesh, P(None, "y"))
 
-    _MODE_KERNELS[id(mesh)] = build
-    return build
+        @jax.jit
+        def kernel(W0, u, w, p_x, p_y):
+            Wp = jax.lax.with_sharding_constraint(
+                W0 @ jnp.transpose(p_y), left_shard)
+            pW = jax.lax.with_sharding_constraint(
+                jnp.conj(p_x) @ W0, right_shard)
+            A = jax.lax.with_sharding_constraint(
+                jnp.conj(p_x) @ Wp,
+                NamedSharding(mesh, P(None, None)))
+            H = jnp.diag(u * u) + (2.0 * w[:, None]) * A
+            eigenvalues, X = jnp.linalg.eig(H)
+            Xinv = jnp.linalg.inv(X)
+            left = jax.lax.with_sharding_constraint(Wp @ X, left_shard)
+            right = jax.lax.with_sharding_constraint(
+                Xinv @ ((-2.0 * w)[:, None] * pW), right_shard)
+            left_norm = jnp.sqrt(jnp.sum(jnp.abs(left) ** 2, axis=0))
+            right_norm = jnp.sqrt(jnp.sum(jnp.abs(right) ** 2, axis=1))
+            weights = jax.lax.with_sharding_constraint(
+                left_norm * right_norm, rep1)
+            return eigenvalues, left, right, weights
 
+        _DENSE_REFERENCE_KERNELS[id(mesh)] = kernel
 
-def _retarded_modes(eigenvalues, left, right, weights):
-    """Choose the retarded sheet, preserving the static modal sum."""
-    lam = np.asarray(eigenvalues, dtype=np.complex128)
-    wt = np.asarray(weights, dtype=np.float64)
-    roots = np.sqrt(lam)
-    negative = roots.real < 0.0
-    roots[negative] *= -1.0
-    # A real-positive eigenvalue routinely returns a root with an O(eps)
-    # imaginary part after a non-Hermitian eigensolve.  Snap that roundoff
-    # to the real axis: an anomaly count is evidence, not a floating-point
-    # sign-bit census.  Material upper-half-plane roots are still folded and
-    # remain visible in the named count.
-    root_scale = max(
-        float(np.max(np.abs(roots))) if roots.size else 0.0, 1.0)
-    sheet_tol = 64.0 * np.finfo(np.float64).eps * root_scale
-    near_real = np.abs(roots.imag) <= sheet_tol
-    roots[near_real] = roots[near_real].real + 0.0j
-    upper = roots.imag > sheet_tol
-    folded = int(np.count_nonzero(upper))
-    roots[upper] = np.conj(roots[upper])
-    folded_lambda = roots * roots
-
-    floor = np.finfo(np.float64).eps * root_scale
-    weight_scale = max(float(np.max(wt)) if wt.size else 0.0, 1.0)
-    live = wt > np.finfo(np.float64).eps * weight_scale
-    keep = np.isfinite(roots) & (roots.real > floor)
-    material_drop = (~keep) & live
-    if np.any(material_drop):
-        # The design permits a named drop, but it may never be silent.  The
-        # caller receives the count and its sample/static certificate will
-        # fail if the lost residue was material.
-        pass
-    keep_idx = np.flatnonzero(keep)
-    if keep_idx.size == 0:
-        raise ValueError(
-            "GATE intraband_retarded_sheet: no crossing eigenmode remains "
-            "on Re Omega > 0, Im Omega <= 0")
-    ratio = np.ones(lam.shape, dtype=np.complex128)
-    changed = upper & (lam != 0.0)
-    ratio[changed] = folded_lambda[changed] / lam[changed]
-    # C -> C * lambda_fold/lambda keeps C/lambda, hence z=0, exact.
-    right = right * jnp.asarray(ratio[:, None])
-    return (
-        roots[keep_idx],
-        left[:, keep_idx],
-        right[keep_idx, :],
-        wt[keep_idx],
-        folded,
-        int(np.count_nonzero(~keep)),
-    )
+    u, w, vertices = pair_block
+    p_x, p_y = vertices
+    return kernel(W0bar, u, w, p_x, p_y)
 
 
-def _weighted_clusters(omega, weights, n_cluster):
-    """Deterministic residue-weighted Lloyd clustering on complex Omega."""
-    points = np.column_stack((omega.real, omega.imag))
-    n = int(points.shape[0])
-    k = int(n_cluster)
-    if not 1 <= k <= n:
-        raise ValueError(f"cluster count {k} is outside [1,{n}]")
-    weight = np.asarray(weights, dtype=np.float64)
-    if not np.all(np.isfinite(weight)) or np.any(weight < 0.0):
-        raise ValueError("intraband modal residue weights must be finite >= 0")
-    if not np.any(weight > 0.0):
-        weight = np.ones_like(weight)
-    order = np.lexsort((points[:, 1], points[:, 0]))
-    cumulative = np.cumsum(weight[order])
-    targets = (np.arange(k, dtype=np.float64) + 0.5) * cumulative[-1] / k
-    seeds = order[np.searchsorted(cumulative, targets, side="left")]
-    centers = points[seeds].copy()
-    labels = np.full(n, -1, dtype=np.int32)
-    for _ in range(32):
-        distance = np.sum((points[:, None, :] - centers[None, :, :]) ** 2,
-                          axis=2)
-        updated = np.argmin(distance, axis=1).astype(np.int32)
-        if np.array_equal(updated, labels):
-            break
-        labels = updated
-        nearest = np.min(distance, axis=1)
-        for group in range(k):
-            members = labels == group
-            if np.any(members):
-                centers[group] = np.average(
-                    points[members], axis=0, weights=weight[members])
-            else:
-                pick = int(np.argmax(weight * nearest))
-                centers[group] = points[pick]
-                labels[pick] = group
-    # Stable pole order is increasing real center, then width.
-    center_order = np.lexsort((centers[:, 1], centers[:, 0]))
-    remap = np.empty(k, dtype=np.int32)
-    remap[center_order] = np.arange(k, dtype=np.int32)
-    return remap[labels]
+def _z_for_zeta(zeta):
+    """Return a square root accepted by WP1; only its square enters chi1."""
+    root = np.sqrt(complex(zeta))
+    if root.imag < 0.0:
+        root = -root
+    return complex(root)
 
 
-def _compress(mesh, omega, left, right, weights, labels, n_cluster):
-    """Per-element static/z^-2 two-moment compression."""
+def _face_matmul(A, B, mesh):
+    """Multiply face-sharded matrices without a replicated production tile."""
+    if jax.process_count() == 1:
+        return A @ B
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import matmul
+    return matmul(A, B, mesh=mesh, backend="distributed")
+
+
+def _resolvents_at_zeta(pair_block, W0bar, zetas):
+    """Evaluate a small node batch with face-sharded GEMMs and N_mu solves."""
+    from gw.w_isdf import intraband_chi1
+
+    zetas = tuple(complex(value) for value in zetas)
+    if not zetas:
+        raise ValueError("_resolvents_at_zeta requires at least one node")
+    mesh = _mesh_of(W0bar, "_resolvents_at_zeta")
+    extent = int(W0bar.shape[0])
     matrix_shard = NamedSharding(mesh, P("x", "y"))
-    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
-    lam = jnp.asarray(omega * omega)
-    Omega_rows, B_rows = [], []
-    folded_elements = 0
-    dropped_elements = 0
-    cluster_widths = []
-    for group in range(int(n_cluster)):
-        idx_host = np.flatnonzero(labels == group)
-        idx = jnp.asarray(idx_host, dtype=jnp.int32)
-        l = left[:, idx]
-        r = right[idx, :]
-        C = jax.lax.with_sharding_constraint(l @ r, matrix_shard)
-        C0 = jax.lax.with_sharding_constraint(
-            (l / lam[idx][None, :]) @ r, matrix_shard)
-        scale = jnp.maximum(jnp.max(jnp.abs(C0)), 1.0)
-        live = jnp.abs(C0) > np.finfo(np.float64).eps * scale
-        lambda_bar = jnp.where(live, C / C0, 1.0 + 0.0j)
-        root = jnp.sqrt(lambda_bar)
-        root = jnp.where(jnp.real(root) < 0.0, -root, root)
-        fold = live & (jnp.imag(root) > 0.0)
-        root = jnp.where(fold, jnp.conj(root), root)
-        invalid = live & (
-            ~jnp.isfinite(root) | (jnp.real(root) <= 0.0))
-        active = live & ~invalid
-        # Retarded folding changes lambda.  Re-form C from the exact static
-        # moment so the z=0 anchor remains an identity even on an anomalous
-        # element; the separately measured z^-2 error exposes the change.
-        C_retarded = C0 * root * root
-        root = jnp.where(active, root, 1.0 + 0.0j)
-        B = jnp.where(active, -C_retarded / (2.0 * root), 0.0 + 0.0j)
-        Omega_rows.append(jax.lax.with_sharding_constraint(root, matrix_shard))
-        B_rows.append(jax.lax.with_sharding_constraint(B, matrix_shard))
-        folded_elements += int(jax.device_get(jnp.count_nonzero(fold)))
-        dropped_elements += int(jax.device_get(jnp.count_nonzero(invalid)))
-
-        wg = np.asarray(weights)[idx_host]
-        og = np.asarray(omega)[idx_host]
-        if np.sum(wg) > 0.0:
-            center = np.sum(wg * og) / np.sum(wg)
-            cluster_widths.append(float(np.sqrt(
-                np.sum(wg * np.abs(og - center) ** 2) / np.sum(wg))))
-        else:
-            cluster_widths.append(0.0)
-    return (
-        jax.lax.with_sharding_constraint(jnp.stack(Omega_rows), pole_shard),
-        jax.lax.with_sharding_constraint(jnp.stack(B_rows), pole_shard),
-        folded_elements,
-        dropped_elements,
-        max(cluster_widths, default=0.0),
+    stack_shard = NamedSharding(mesh, P(None, "x", "y"))
+    chi_stack = jax.lax.with_sharding_constraint(
+        jnp.stack([
+            intraband_chi1(pair_block, _z_for_zeta(zeta))
+            for zeta in zetas
+        ]),
+        stack_shard,
     )
+    W_stack = jax.lax.with_sharding_constraint(
+        jnp.broadcast_to(W0bar, (len(zetas), extent, extent)), stack_shard)
+    Wchi = jax.lax.with_sharding_constraint(
+        _face_matmul(W_stack, chi_stack, mesh), stack_shard)
+    rhs = jax.lax.with_sharding_constraint(
+        _face_matmul(Wchi, W_stack, mesh), stack_shard)
+    identity = jnp.eye(extent, dtype=jnp.complex128)[None, :, :]
+    system = jax.lax.with_sharding_constraint(identity - Wchi, stack_shard)
+
+    if jax.process_count() == 1:
+        result = jnp.linalg.solve(system, rhs)
+    else:
+        key = (id(mesh), extent)
+        solve_plan = _RESOLVENT_PLANS.get(key)
+        if solve_plan is None:
+            from ffi import _services
+            _services.ensure_on_path()
+            from distrib_la import plan as linalg_plan
+            solve_plan = linalg_plan(
+                "solve_lu", mesh, backend="distributed", n=extent)
+            _RESOLVENT_PLANS[key] = solve_plan
+            if jax.process_index() == 0:
+                print(
+                    "  [intraband-contour] resolvent_solve="
+                    f"{solve_plan.describe()} batch_nodes="
+                    f"{_RESOLVENT_BATCH_NODES}",
+                    flush=True,
+                )
+        # solve_lu donates both operands; system and rhs are fresh buffers.
+        result = solve_plan.batched(system, rhs)
+    return jax.lax.with_sharding_constraint(result, stack_shard)
 
 
-def evaluate_pole_sum(Omega_p, B_p, z):
-    """Evaluate poles in the store's own ``2 Omega B/(z^2-Omega^2)`` form."""
-    zc = jnp.asarray(complex(z), dtype=jnp.complex128)
-    return jnp.sum(
-        2.0 * Omega_p * B_p / (zc * zc - Omega_p * Omega_p), axis=0)
+def _resolvent_at_zeta(pair_block, W0bar, zeta):
+    """Direct one-node evaluation, including the independent zeta=0 anchor."""
+    mesh = _mesh_of(W0bar, "_resolvent_at_zeta")
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    return jax.lax.with_sharding_constraint(
+        _resolvents_at_zeta(pair_block, W0bar, (zeta,))[0], matrix_shard)
 
 
-def _evaluate_modes(left, right, omega, z):
-    lam = jnp.asarray(omega * omega)
-    return (left / (lam - complex(z) ** 2)[None, :]) @ right
+def _exact_moment_totals(pair_block, W0bar):
+    """Independent static and high-frequency anchors for contour closure."""
+    _u, w, vertices = pair_block
+    p_x, p_y = vertices
+    mesh = _mesh_of(W0bar, "_exact_moment_totals")
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    V_total = _resolvent_at_zeta(pair_block, W0bar, 0.0j)
+    C1 = jax.lax.with_sharding_constraint(
+        jnp.einsum(
+            "s,sm,sn->mn", 2.0 * w, p_x, jnp.conj(p_y), optimize=True),
+        matrix_shard,
+    )
+    M_total = jax.lax.with_sharding_constraint(
+        _face_matmul(_face_matmul(W0bar, C1, mesh), W0bar, mesh),
+        matrix_shard)
+    return M_total, V_total
 
 
 def _relative_error(model, exact):
     numerator = jnp.real(jnp.vdot(model - exact, model - exact))
     denominator = jnp.real(jnp.vdot(exact, exact))
     floor = np.finfo(np.float64).tiny
-    return float(jax.device_get(jnp.sqrt(numerator / jnp.maximum(
-        denominator, floor))))
+    return float(jax.device_get(jnp.sqrt(
+        numerator / jnp.maximum(denominator, floor))))
+
+
+def _contour_geometry(pair_block, W0bar):
+    """Derived positive-zeta strip and its machine-only outer guard."""
+    u, w, _vertices = pair_block
+    u_host = _host_replicated(u).astype(np.float64, copy=False)
+    w_host = _host_replicated(w).astype(np.float64, copy=False)
+    lambda_q = float(np.max(np.abs(u_host)))
+    # Frobenius is a valid upper bound for the unspecified matrix norm in the
+    # ruling and avoids a second spectral problem at N_mu scale.
+    w_norm = float(jax.device_get(jnp.linalg.norm(W0bar)))
+    interaction = w_norm * float(np.sum(2.0 * np.abs(w_host)))
+    zeta_max = lambda_q * lambda_q + interaction
+    if not np.isfinite(zeta_max) or zeta_max <= 0.0:
+        raise ValueError(
+            "GATE intraband_contour_domain: derived zeta_max must be finite "
+            f"and positive; got {zeta_max!r}")
+    zeta_max = float(np.nextafter(zeta_max, np.inf))
+    positive_u2 = np.square(np.abs(u_host[u_host != 0.0]))
+    if positive_u2.size == 0:
+        raise ValueError(
+            "GATE intraband_contour_domain: crossing block has no nonzero "
+            "transition energy")
+    # Zero must remain outside the V contours.  Keeping the left edge a
+    # resolved distance from sqrt's branch point is required for the T1
+    # quadrature to converge; the independent M/V closures are the authority
+    # and refuse if screening moved a collective pole below this edge.
+    left = max(0.25 * float(np.min(positive_u2)),
+               np.finfo(np.float64).eps * zeta_max)
+    # The interaction radius is the derived imaginary excursion.  Its only
+    # floor is roundoff separation from the real axis.
+    height = max(interaction,
+                 128.0 * np.finfo(np.float64).eps * zeta_max)
+    return left, zeta_max, height
+
+
+def _initial_intervals(pair_block, W0bar):
+    """Three energy-quantile tiles spanning the complete derived strip."""
+    left, right, _height = _contour_geometry(pair_block, W0bar)
+    u2 = np.sort(np.square(np.abs(_host_replicated(pair_block[0]))))
+    edges = [left]
+    for numerator in range(1, MIN_CLUSTERS):
+        cut = int(np.ceil(numerator * u2.size / MIN_CLUSTERS))
+        cut = min(max(cut, 1), u2.size - 1)
+        edge = 0.5 * (float(u2[cut - 1]) + float(u2[cut]))
+        edge = min(max(edge, np.nextafter(edges[-1], np.inf)), right)
+        edges.append(edge)
+    edges.append(right)
+    if any(not lo < hi for lo, hi in zip(edges[:-1], edges[1:])):
+        edges = list(np.linspace(left, right, MIN_CLUSTERS + 1))
+    return [(float(lo), float(hi))
+            for lo, hi in zip(edges[:-1], edges[1:])]
+
+
+def _quadrature_nodes(interval, height, order):
+    """Counter-clockwise Gauss-Legendre nodes and dz weights on a rectangle."""
+    lo, hi = (float(interval[0]), float(interval[1]))
+    x, weight = np.polynomial.legendre.leggauss(int(order))
+    segments = (
+        (complex(lo, -height), complex(hi, -height)),
+        (complex(hi, -height), complex(hi, height)),
+        (complex(hi, height), complex(lo, height)),
+        (complex(lo, height), complex(lo, -height)),
+    )
+    for start, stop in segments:
+        midpoint = 0.5 * (start + stop)
+        half = 0.5 * (stop - start)
+        for xi, wi in zip(x, weight):
+            yield midpoint + half * xi, half * wi
+
+
+def _moments_at_order(pair_block, W0bar, intervals, order, V_total):
+    mesh = _mesh_of(W0bar, "_moments_at_order")
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
+    _left, _right, height = _contour_geometry(pair_block, W0bar)
+    shape = tuple(W0bar.shape)
+    M_rows, V_rows, T1_rows, T2_rows = [], [], [], []
+    normalization = 1.0 / (2.0j * np.pi)
+    for interval in intervals:
+        M = jnp.zeros(shape, dtype=jnp.complex128)
+        V = jnp.zeros(shape, dtype=jnp.complex128)
+        T1 = jnp.zeros(shape, dtype=jnp.complex128)
+        T2 = jnp.zeros(shape, dtype=jnp.complex128)
+        nodes = tuple(_quadrature_nodes(interval, height, order))
+        for start in range(0, len(nodes), _RESOLVENT_BATCH_NODES):
+            batch = nodes[start:start + _RESOLVENT_BATCH_NODES]
+            R_batch = _resolvents_at_zeta(
+                pair_block, W0bar, (zeta for zeta, _dz in batch))
+            for R, (zeta, dz) in zip(R_batch, batch):
+                factor = normalization * dz
+                M = M + factor * R
+                # R=C/(lambda-zeta), so the CCW residue of R/zeta is
+                # -C/lambda.  This minus makes V=R(0).  Subtracting R(0)
+                # analytically removes the nearby but excluded zeta=0 pole.
+                V = V - factor * (R - V_total) / zeta
+                T1 = T1 + factor * np.sqrt(zeta) * R
+                T2 = T2 + factor * zeta * R
+        M_rows.append(jax.lax.with_sharding_constraint(M, matrix_shard))
+        V_rows.append(jax.lax.with_sharding_constraint(V, matrix_shard))
+        T1_rows.append(jax.lax.with_sharding_constraint(T1, matrix_shard))
+        T2_rows.append(jax.lax.with_sharding_constraint(T2, matrix_shard))
+    return tuple(
+        jax.lax.with_sharding_constraint(jnp.stack(rows), pole_shard)
+        for rows in (M_rows, V_rows, T1_rows, T2_rows)
+    )
+
+
+def _cluster_moment_matrices(
+        pair_block, W0bar, intervals, *, moment_rel_tol=MOMENT_REL_TOL):
+    """Contour M/V/T1/T2 with mandatory movement and sum-rule refusals."""
+    intervals = tuple((float(lo), float(hi)) for lo, hi in intervals)
+    if not intervals or any(not lo < hi for lo, hi in intervals):
+        raise ValueError(
+            "GATE intraband_contour_intervals: intervals must be nonempty "
+            "ordered (lo,hi) pairs")
+    left, right, _height = _contour_geometry(pair_block, W0bar)
+    tiled = (
+        abs(intervals[0][0] - left) <= 8.0 * np.spacing(left)
+        and abs(intervals[-1][1] - right) <= 8.0 * np.spacing(right)
+        and all(a[1] == b[0] for a, b in zip(intervals[:-1], intervals[1:]))
+    )
+    if not tiled:
+        raise ValueError(
+            "GATE intraband_contour_intervals: intervals do not exactly tile "
+            f"the derived [{left:.17e},{right:.17e}] strip")
+
+    M_total, V_total = _exact_moment_totals(pair_block, W0bar)
+    previous = None
+    movement = np.inf
+    m_closure = np.inf
+    v_closure = np.inf
+    for order in _QUADRATURE_ORDERS:
+        current = _moments_at_order(
+            pair_block, W0bar, intervals, order, V_total)
+        if previous is not None:
+            movement = max(
+                _relative_error(value, old)
+                for value, old in zip(current, previous)
+            )
+        m_closure = _relative_error(jnp.sum(current[0], axis=0), M_total)
+        v_closure = _relative_error(jnp.sum(current[1], axis=0), V_total)
+        if jax.process_index() == 0:
+            print(
+                "[intraband-contour] "
+                f"clusters={len(intervals)} order={order} "
+                f"movement={movement:.6e} Sigma_M_rel={m_closure:.6e} "
+                f"Sigma_V_rel={v_closure:.6e}",
+                flush=True,
+            )
+        if (movement <= float(moment_rel_tol)
+                and m_closure <= SUM_RULE_REL_TOL
+                and v_closure <= SUM_RULE_REL_TOL):
+            return current
+        previous = current
+    raise ValueError(
+        "GATE intraband_contour_sum_rule: quadrature failed mandatory "
+        f"closure at order {_QUADRATURE_ORDERS[-1]}: "
+        f"moment_movement={movement:.6e}, Sigma_M_rel={m_closure:.6e}, "
+        f"Sigma_V_rel={v_closure:.6e}, sum_tolerance={SUM_RULE_REL_TOL:.1e}, "
+        f"movement_tolerance={float(moment_rel_tol):.1e}")
+
+
+def _cluster_widths(M, T1, T2):
+    """Trace moments -> one parameter-free intrinsic width per interval."""
+    widths = []
+    for index in range(int(M.shape[0])):
+        mass = complex(jax.device_get(jnp.trace(M[index])))
+        first = complex(jax.device_get(jnp.trace(T1[index])))
+        second = complex(jax.device_get(jnp.trace(T2[index])))
+        if mass == 0.0:
+            widths.append(0.0)
+            continue
+        mean1 = np.real(first / mass)
+        mean2 = np.real(second / mass)
+        variance = float(mean2 - mean1 * mean1)
+        tolerance = 256.0 * np.finfo(np.float64).eps * max(abs(mean2), 1.0)
+        if variance < -tolerance:
+            raise ValueError(
+                "GATE intraband_cluster_width: material negative trace "
+                f"variance {variance:.6e} in interval {index}")
+        if abs(variance) <= tolerance:
+            variance = 0.0
+        widths.append(float(np.sqrt(max(variance, 0.0))))
+    return np.asarray(widths, dtype=np.float64)
+
+
+def _compress_moments(mesh, M, V, T1, T2):
+    """The landed elementwise two-moment match fed by contour moments."""
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
+    widths = _cluster_widths(M, T1, T2)
+    Omega_rows, B_rows = [], []
+    folded_elements = 0
+    dropped_elements = 0
+    for group, width in enumerate(widths):
+        Mc = M[group]
+        Vc = V[group]
+        scale = jnp.maximum(jnp.max(jnp.abs(Vc)), 1.0)
+        live = jnp.abs(Vc) > np.finfo(np.float64).eps * scale
+        lambda_bar = jnp.where(live, -Mc / Vc, 1.0 + 0.0j)
+        root_raw = jnp.sqrt(lambda_bar)
+        root_raw = jnp.where(jnp.real(root_raw) < 0.0, -root_raw, root_raw)
+        fold = live & (jnp.imag(root_raw) > 0.0)
+        root = jnp.where(fold, jnp.conj(root_raw), root_raw)
+        invalid = live & (~jnp.isfinite(root) | (jnp.real(root) <= 0.0))
+        active = live & ~invalid
+        root_scale = jnp.maximum(jnp.max(jnp.abs(root)), 1.0)
+        near_real = jnp.abs(jnp.imag(root)) <= (
+            64.0 * np.finfo(np.float64).eps * root_scale)
+        root = jnp.where(active & near_real & (width > 0.0),
+                         jnp.real(root) - 1.0j * width, root)
+        root = jnp.where(active, root, 1.0 + 0.0j)
+        # Re-solve from V after a retarded fold or imposed trace width.
+        B = jnp.where(active, -Vc * root / 2.0, 0.0 + 0.0j)
+        Omega_rows.append(jax.lax.with_sharding_constraint(root, matrix_shard))
+        B_rows.append(jax.lax.with_sharding_constraint(B, matrix_shard))
+        folded_elements += int(jax.device_get(jnp.count_nonzero(fold)))
+        dropped_elements += int(jax.device_get(jnp.count_nonzero(invalid)))
+    return (
+        jax.lax.with_sharding_constraint(jnp.stack(Omega_rows), pole_shard),
+        jax.lax.with_sharding_constraint(jnp.stack(B_rows), pole_shard),
+        folded_elements,
+        dropped_elements,
+        float(np.max(widths, initial=0.0)),
+    )
+
+
+def evaluate_pole_sum(Omega_p, B_p, z):
+    """Evaluate poles in the store's ``2 Omega B/(z^2-Omega^2)`` form."""
+    zc = jnp.asarray(complex(z), dtype=jnp.complex128)
+    return jnp.sum(
+        2.0 * Omega_p * B_p / (zc * zc - Omega_p * Omega_p), axis=0)
+
+
+def _split_largest_trace_interval(intervals, M, pair_block):
+    weights = np.asarray([
+        abs(complex(jax.device_get(jnp.trace(M[index]))))
+        for index in range(len(intervals))
+    ])
+    u2 = np.square(np.abs(_host_replicated(pair_block[0])))
+    members = []
+    for index, (lo, hi) in enumerate(intervals):
+        values = np.sort(u2[(u2 >= lo) & (u2 <= hi)])
+        members.append(values)
+        if values.size < 2:
+            weights[index] = -np.inf
+    if not np.any(np.isfinite(weights)):
+        raise ValueError(
+            "GATE intraband_cluster_budget: no interval containing two bare "
+            "crossing energies remains available for bisection")
+    index = int(np.argmax(weights))
+    lo, hi = intervals[index]
+    values = members[index]
+    gaps = np.diff(values)
+    gap_index = int(np.argmax(gaps))
+    midpoint = 0.5 * (float(values[gap_index])
+                      + float(values[gap_index + 1]))
+    if not lo < midpoint < hi:
+        raise ValueError(
+            "GATE intraband_cluster_budget: largest-moment interval cannot "
+            f"be bisected: [{lo:.17e},{hi:.17e}]")
+    return (intervals[:index]
+            + [(lo, midpoint), (midpoint, hi)]
+            + intervals[index + 1:])
+
+
+def _print_memory_model(pair_block, W0bar, n_interval):
+    n_pair = int(pair_block[0].shape[0])
+    n_mu = int(W0bar.shape[0])
+    scalar_bytes = 2 * n_pair * np.dtype(np.float64).itemsize
+    vertex_bytes = 2 * n_pair * n_mu * np.dtype(np.complex128).itemsize
+    matrix_bytes = n_mu * n_mu * np.dtype(np.complex128).itemsize
+    if jax.process_index() == 0:
+        print(
+            "[intraband-memory] "
+            f"n_pair={n_pair} n_mu={n_mu} intervals={n_interval} "
+            f"pair_scalars_bytes={scalar_bytes} "
+            f"pair_vertices_bytes={vertex_bytes} "
+            f"largest_matrix_bytes={matrix_bytes} ns_squared_arrays=0",
+            flush=True,
+        )
 
 
 def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
-    """Build and certify one frozen-static crossing row.
-
-    The smallest residue-weighted cluster count meeting ``sample_rel_tol``
-    is selected, starting at the design floor of three and ending at the
-    fixed implementation ceiling of six.  The tolerance is an API keyword
-    only for synthetic red/green twins; production calls never source it
-    from configuration.
-    """
+    """Build one row by certified contour moments and greedy bisection."""
     mesh = _mesh_of(W0bar, "build_row")
-    u, w, vertices = pair_block
-    p_x, p_y = vertices
-    n_pair = int(u.shape[0])
+    n_pair = int(pair_block[0].shape[0])
     if n_pair == 0:
         raise ValueError("build_row is not called for the empty Gamma block")
-    if n_pair > MAX_DENSE_MODES:
-        h_gib = n_pair * n_pair * np.dtype(np.complex128).itemsize / 2**30
-        raise ValueError(
-            "GATE intraband_dense_eigenproblem_size: exact crossing "
-            f"selection has {n_pair} modes, above the design ceiling "
-            f"{MAX_DENSE_MODES}; H alone would occupy {h_gib:.3f} GiB "
-            "before eigenvectors, inverse, residues, or solver workspace. "
-            "Refusing rather than truncating the certified selection or "
-            "attempting an uncertified dense eigensolve outside the "
-            "design's priced size regime")
-    eigenvalues, left, right, weights = _mode_kernel(mesh)(
-        W0bar, u, w, p_x, p_y)
-    eigen_host = _host_replicated(eigenvalues)
-    weights_host = _host_replicated(weights)
-    omega, left, right, weights_host, folded, dropped = _retarded_modes(
-        eigen_host, left, right, weights_host)
 
-    z = tuple(complex(value) for value in np.asarray(z_samples).reshape(-1))
-    candidates = range(
-        min(MIN_CLUSTERS, len(omega)),
-        min(MAX_CLUSTERS, len(omega)) + 1,
-    )
+    z_values = tuple(
+        complex(value) for value in np.asarray(z_samples).reshape(-1))
+    intervals = _initial_intervals(pair_block, W0bar)
     selected = None
-    for n_cluster in candidates:
-        labels = _weighted_clusters(omega, weights_host, n_cluster)
-        Om, Bp, fold_el, drop_el, width = _compress(
-            mesh, omega, left, right, weights_host, labels, n_cluster)
+    while True:
+        M, V, T1, T2 = _cluster_moment_matrices(
+            pair_block, W0bar, intervals,
+            moment_rel_tol=min(MOMENT_REL_TOL, float(sample_rel_tol)))
+        Om, Bp, fold_el, drop_el, width = _compress_moments(
+            mesh, M, V, T1, T2)
         errors = [
             _relative_error(
                 evaluate_pole_sum(Om, Bp, value),
-                _evaluate_modes(left, right, omega, value),
+                _resolvent_at_zeta(pair_block, W0bar, complex(value) ** 2),
             )
-            for value in z
+            for value in z_values
         ]
+        # This is deliberately another direct WP1+solve evaluation, not a
+        # contour reconstruction or an alias of a sample slot.
+        exact_static = _resolvent_at_zeta(pair_block, W0bar, 0.0j)
         static_error = _relative_error(
-            evaluate_pole_sum(Om, Bp, 0.0j),
-            _evaluate_modes(left, right, omega, 0.0j),
-        )
-        selected = (n_cluster, Om, Bp, max(errors, default=0.0),
-                    static_error, fold_el, drop_el, width)
-        if selected[3] <= float(sample_rel_tol) \
-                and static_error <= STATIC_REL_TOL:
+            evaluate_pole_sum(Om, Bp, 0.0j), exact_static)
+        error = max(errors, default=0.0)
+        selected = (Om, Bp, error, static_error,
+                    fold_el, drop_el, width)
+        if error <= float(sample_rel_tol) and static_error <= STATIC_REL_TOL:
             break
-    if selected is None:
-        raise ValueError("GATE intraband_cluster_support: no live modes")
-    n_cluster, Om, Bp, error, static_error, fold_el, drop_el, width = selected
+        if len(intervals) >= MAX_CLUSTERS:
+            raise ValueError(
+                "GATE intraband_cluster_budget: six contour clusters do not "
+                "meet the fixed block certificate; "
+                f"sample_max_rel={error:.6e}, static_max_rel="
+                f"{static_error:.6e}, allowed_sample={float(sample_rel_tol):.6e}, "
+                f"allowed_static={STATIC_REL_TOL:.6e}")
+        intervals = _split_largest_trace_interval(intervals, M, pair_block)
+
+    Om, Bp, error, static_error, fold_el, drop_el, width = selected
+    _print_memory_model(pair_block, W0bar, len(intervals))
     return IntrabandRow(
         Omega_p=Om,
         B_p=Bp,
-        n_poles=int(n_cluster),
-        n_modes=int(len(omega)),
+        n_poles=int(len(intervals)),
+        n_modes=n_pair,
         sample_max_rel_error=float(error),
         static_max_rel_error=float(static_error),
-        certified=bool(error <= float(sample_rel_tol)
-                       and static_error <= STATIC_REL_TOL),
-        folded_modes=int(folded),
-        dropped_modes=int(dropped),
+        certified=True,
+        folded_modes=0,
+        dropped_modes=0,
         folded_elements=int(fold_el),
         dropped_elements=int(drop_el),
         cluster_width_max_ry=float(width),
@@ -367,8 +560,7 @@ def pad_row(row, n_poles):
     """Pad a shorter certified q row with causal, exactly dark poles."""
     target = int(n_poles)
     if target < row.n_poles:
-        raise ValueError(
-            f"cannot pad {row.n_poles} intraband poles to {target}")
+        raise ValueError(f"cannot pad {row.n_poles} intraband poles to {target}")
     if target == row.n_poles:
         return row.Omega_p, row.B_p
     n_mu = int(row.Omega_p.shape[-1])
@@ -388,10 +580,11 @@ def pad_row(row, n_poles):
 __all__ = [
     "IntrabandRow",
     "MAX_CLUSTERS",
-    "MAX_DENSE_MODES",
     "MODEL",
+    "MOMENT_REL_TOL",
     "SAMPLE_REL_TOL",
     "STATIC_REL_TOL",
+    "SUM_RULE_REL_TOL",
     "build_row",
     "evaluate_pole_sum",
     "pad_row",

@@ -1,4 +1,6 @@
-"""WP3 frozen-static crossing-block algebra and compression gates."""
+"""WP3/3-A frozen-static crossing-block algebra and compression gates."""
+
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -99,18 +101,99 @@ def test_padding_is_causal_and_exactly_dark():
     np.testing.assert_array_equal(np.asarray(Omega[row.n_poles:]), 1.0)
 
 
-def test_dense_eigenproblem_refuses_above_the_design_mode_ceiling():
+def test_5598_mode_row_builds_without_pair_square_allocation(capsys, monkeypatch):
     mesh, W0, _vertices, _u, _w, _block = _fixture()
-    count = IB.MAX_DENSE_MODES + 1
-    vertices = np.ones((count, W0.shape[0]), np.complex128)
+    count = 5598
+    rng = np.random.default_rng(317)
+    vertices = (
+        rng.normal(size=(count, W0.shape[0]))
+        + 1j * rng.normal(size=(count, W0.shape[0]))) * 1.0e-3
     block = (
-        _put(mesh, np.linspace(0.04, 0.2, count), P(None)),
-        _put(mesh, np.full(count, 1.0e-4), P(None)),
+        _put(mesh, np.linspace(0.08, 0.081, count), P(None)),
+        _put(mesh, np.full(count, 1.0e-8), P(None)),
         (_put(mesh, vertices, P(None, "x")),
          _put(mesh, vertices, P(None, "y"))),
     )
-    with pytest.raises(
-            ValueError, match=r"dense_eigenproblem_size.*4097.*4096"):
-        IB.build_row(
-            _put(mesh, W0, P("x", "y")), block,
-            np.asarray([0.04 + 0.2j]))
+    monkeypatch.setattr(
+        IB, "_dense_reference_modes",
+        lambda *_args, **_kwargs: pytest.fail("production called dense oracle"))
+    row = IB.build_row(
+        _put(mesh, W0, P("x", "y")), block,
+        np.asarray([0.0j, 0.04 + 0.2j]), sample_rel_tol=1.0)
+    assert row.n_modes == 5598
+    assert row.certified
+    output = capsys.readouterr().out
+    assert "n_pair=5598" in output
+    assert "ns_squared_arrays=0" in output
+    assert "_dense_reference_modes" not in inspect.getsource(IB.build_row)
+
+
+def _dense_partition_moments(mesh, W0, block, intervals):
+    eigenvalues, left, right, _weights = IB._dense_reference_modes(W0, block)
+    lam = np.asarray(eigenvalues, dtype=np.complex128)
+    left_bound, _right_bound, height = IB._contour_geometry(block, W0)
+    rows = [[], [], [], []]
+    for lo, hi in intervals:
+        select = ((lam.real >= lo) & (lam.real <= hi)
+                  & (np.abs(lam.imag) < height))
+        # Adjacent intervals share only a measure-zero boundary.  These
+        # synthetic modes are separated from every constructed edge.
+        idx = jnp.asarray(np.flatnonzero(select), dtype=jnp.int32)
+        l = left[:, idx]
+        r = right[idx, :]
+        lc = jnp.asarray(lam[select])
+        C = l @ r
+        rows[0].append(-C)
+        rows[1].append((l / lc[None, :]) @ r)
+        rows[2].append(-(l * jnp.sqrt(lc)[None, :]) @ r)
+        rows[3].append(-(l * lc[None, :]) @ r)
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    return tuple(jax.device_put(jnp.stack(values), sharding) for values in rows)
+
+
+def test_contour_moments_and_compression_match_dense_reference():
+    mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=18)
+    W0j = _put(mesh, W0, P("x", "y"))
+    intervals = IB._initial_intervals(block, W0j)
+    contour = IB._cluster_moment_matrices(
+        block, W0j, intervals, moment_rel_tol=1.0e-10)
+    dense = _dense_partition_moments(mesh, W0j, block, intervals)
+    for got, expected in zip(contour, dense):
+        np.testing.assert_allclose(
+            np.asarray(got), np.asarray(expected), rtol=1.0e-10, atol=1.0e-12)
+
+    contour_poles = IB._compress_moments(mesh, *contour)
+    dense_poles = IB._compress_moments(mesh, *dense)
+    np.testing.assert_allclose(
+        np.asarray(contour_poles[0]), np.asarray(dense_poles[0]),
+        rtol=1.0e-10, atol=1.0e-12)
+    np.testing.assert_allclose(
+        np.asarray(contour_poles[1]), np.asarray(dense_poles[1]),
+        rtol=1.0e-10, atol=1.0e-12)
+
+
+def test_contour_sum_rules_close_to_1e_minus_12_relative():
+    mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=21)
+    W0j = _put(mesh, W0, P("x", "y"))
+    moments = IB._cluster_moment_matrices(
+        block, W0j, IB._initial_intervals(block, W0j))
+    M_total, V_total = IB._exact_moment_totals(block, W0j)
+    assert IB._relative_error(jnp.sum(moments[0], axis=0), M_total) <= 1.0e-12
+    assert IB._relative_error(jnp.sum(moments[1], axis=0), V_total) <= 1.0e-12
+
+
+@pytest.mark.parametrize("moment_index", [0, 1], ids=["M", "V"])
+def test_contour_sum_rule_mismatch_is_a_refusal(monkeypatch, moment_index):
+    mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=9)
+    W0j = _put(mesh, W0, P("x", "y"))
+    intervals = IB._initial_intervals(block, W0j)
+    original = IB._moments_at_order
+
+    def broken(*args, **kwargs):
+        values = list(original(*args, **kwargs))
+        values[moment_index] = values[moment_index] * 0.99
+        return tuple(values)
+
+    monkeypatch.setattr(IB, "_moments_at_order", broken)
+    with pytest.raises(ValueError, match=r"intraband_contour_sum_rule"):
+        IB._cluster_moment_matrices(block, W0j, intervals)
