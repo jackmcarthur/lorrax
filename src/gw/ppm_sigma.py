@@ -837,6 +837,7 @@ def compute_sigma_c_ppm_omega_grid(
     term only (the sole occupation projector this driver builds); the
     dynamic branches take their occupations from ``wfns.occ``.  ``None``
     is the insulating default and is bit-exact.
+
     ``plan`` is the band-bracket plan (:mod:`gw.band_extrapolation`).
     ``None`` means the trivial one — a single bracket over every band —
     which is the ordinary Σ_c and is bit-identical to the un-bracketed
