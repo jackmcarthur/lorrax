@@ -459,10 +459,27 @@ def plan_band_brackets(
     Raises
     ------
     BandExtrapolationRefused
-        When extrapolation is requested and ``n_cond <= n_occ`` (the tail
+        When extrapolation is requested and ``n_cond < n_occ`` (the tail
         being extrapolated is then shorter than the occupied block and the
         1/N model has no room to be tested), or when degeneracy snapping
         collapses two of the three cuts onto each other.
+
+        THE THRESHOLD IS ``n_cond >= n_occ``, i.e. ``nband >= 2*n_occ``.
+        Owner ruling 2026-08-16, whose words were "kill the calculation if
+        the number of bands requested is not >= 2*N_electrons".  It is
+        written in ``n_occ`` rather than in ``N_electrons`` because that is
+        the SPIN-CONVENTION-INDEPENDENT form of the same condition: under
+        SOC/noncolin ``n_occ = N_electrons``, without SOC
+        ``n_occ = N_electrons/2``, and in BOTH cases the condition says "at
+        least as many conduction bands as valence".  Writing it in the
+        electron count would silently mean two different things on the two
+        deck families.
+
+        This RELAXES the threshold that shipped before 2026-08-16, which
+        refused on ``n_cond <= n_occ`` (strictly greater).  The equality
+        case ``n_cond == n_occ`` now runs.  There is ONE gate at ONE
+        threshold: the "counts collapsed" refusal below reports the same
+        ``2*n_occ`` floor rather than a second, tighter one.
     """
     n_occ = int(n_occ)
     nb_logical = int(nb_logical)
@@ -478,16 +495,24 @@ def plan_band_brackets(
     # converged, and the operator would have no way to tell the feature was
     # off (measurement-discipline rule 1: an ignored deck key is how a green
     # A/B comes to measure nothing).
-    if n_cond <= n_occ:
+    if n_cond < n_occ:
         raise BandExtrapolationRefused(
-            f"sigma_band_extrapolation = true, but the Σ_c band sum has "
+            f"use_band_extrapolation is ON, but the Σ_c band sum has "
             f"n_cond = {n_cond} unoccupied bands against n_occ = {n_occ} "
             f"occupied ones (nband = {nb_logical}).  The feature extrapolates "
             f"the UNOCCUPIED tail, and it is only meaningful when that tail "
-            f"is the larger part of the sum: it requires n_cond > n_occ.  "
-            f"Raise the deck's `nband` to at least {2 * n_occ + 1} "
+            f"is at least as large as the occupied block: it requires "
+            f"n_cond >= n_occ, i.e. nband >= 2*n_occ = {2 * n_occ}.\n"
+            f"  The owner's form of this rule is "
+            f"'nband >= 2*N_electrons'.  It is enforced here in n_occ "
+            f"because that is the SPIN-CONVENTION-INDEPENDENT statement of "
+            f"the same thing: under SOC/noncolin n_occ = N_electrons, "
+            f"without SOC n_occ = N_electrons/2, and in both cases the "
+            f"condition means 'at least as many conduction bands as "
+            f"valence'.\n"
+            f"  Raise the deck's `nband` to at least {2 * n_occ } "
             f"(n_occ is set by the electron count, not by a deck key), or "
-            f"set sigma_band_extrapolation = false.")
+            f"set use_band_extrapolation = false.")
 
     e = np.asarray(enk_ry, dtype=np.float64)[:, :nb_logical]
     if e.ndim != 2 or e.shape[1] != nb_logical:
@@ -597,17 +622,21 @@ def plan_band_brackets(
         # The smallest fraction gap has to be worth at least one band, plus
         # the floor at n_occ+1 that the first cut is clamped to.
         gaps = np.diff(np.sort(np.asarray(tuple(fractions) + (1.0,), float)))
+        # ONE GATE, ONE THRESHOLD.  The activation gate above is
+        # ``n_cond >= n_occ`` (nband >= 2*n_occ); this floor must be the SAME
+        # number, or a deck that clears one refusal lands on a second with a
+        # different answer to "how many bands do I need".
         need = max(int(np.ceil(1.0 / max(float(gaps.min()), 1e-12))),
-                   2 * n_occ + 1)
+                   2 * n_occ)
         raise BandExtrapolationRefused(
-            f"sigma_band_extrapolation: the three band counts collapsed onto "
+            f"use_band_extrapolation: the three band counts collapsed onto "
             f"{counts} (requested {requested + (nb_logical,)} from fractions "
             f"{tuple(fractions)} of nband = {nb_logical}).  Three DISTINCT, "
             f"ascending counts are required — two coincident points cannot "
             f"determine a two-parameter fit.  At nband = {nb_logical} the "
             f"sampling fractions are less than one band apart.  Raise the "
             f"deck's `nband` to at least {need}, or set "
-            f"sigma_band_extrapolation = false.")
+            f"use_band_extrapolation = false.")
 
     bounds = tuple(
         (int(a), int(b)) for a, b in
@@ -803,6 +832,74 @@ def fit_band_extrapolation(
     )
 
 
+def extrapolation_weights(counts) -> np.ndarray:
+    """The REAL coefficients ``c`` with ``S_inf = sum_i c_i * S(N_i)``.
+
+    WHY THIS EXISTS SEPARATELY FROM :func:`fit_band_extrapolation`.  That
+    function fits the band DIAGONAL and returns diagnostics; this one returns
+    the three numbers that let a caller apply the same fit to an object it
+    would be absurd to run a regression on — the full ``(nomega, nk, nb, nb)``
+    Σ_c cube that becomes the QP Hamiltonian.  Both are the SAME estimator,
+    and ``tests/test_band_extrapolation.py::
+    test_weights_reproduce_the_fit_intercept`` pins them together so the
+    number the log reports and the number that drives the iteration cannot
+    drift apart.
+
+    THIS IS WHY "EXTRAPOLATE Σ, THEN DIAGONALIZE" IS THE ONLY DEFENSIBLE
+    ORDER, and the reason is visible in the return type.  Ordinary least
+    squares of ``S_inf + A/N`` is LINEAR in the observations, so its
+    intercept is a fixed affine combination of them whose coefficients depend
+    only on the band COUNTS -- not on Σ, not on k, not on the band index.
+    Two consequences, both load-bearing:
+
+      * ``c`` is REAL.  A real linear combination of Hermitian matrices is
+        Hermitian, ELEMENTWISE and to machine precision: ``S_b[j, i]`` is
+        exactly ``conj(S_b[i, j])`` out of the kernel, a real scalar multiply
+        commutes with conjugation exactly in IEEE arithmetic, and the sum is
+        formed in the same order for both elements.  So the extrapolated Σ is
+        a legitimate static self-energy and the next iteration's eigenvectors
+        stay consistent with its own eigenvalues.
+      * The alternative -- diagonalizing each bracket and extrapolating the
+        EIGENVALUES -- is not the same operation and does not correspond to
+        any Hamiltonian.  Eigenvalues are not linear in the matrix, so the
+        extrapolated set is not the spectrum of anything; feeding it back
+        would pair iteration ``i+1``'s energies with eigenvectors belonging
+        to a different operator.  The band-sum tail is a property of Σ, not
+        of the spectrum, so Σ is where the fit belongs.
+
+    ``sum(c) == 1`` identically (the ``x_i - xbar`` terms cancel), which is
+    the statement that the estimator is an affine combination -- it preserves
+    a Σ that does not depend on the band count, so a converged band sum comes
+    through unchanged rather than being scaled.
+
+    Parameters
+    ----------
+    counts : sequence of int, length 3
+        ``N_eff`` at each point, as in :func:`fit_band_extrapolation`.
+
+    Returns
+    -------
+    (3,) float64 ndarray
+    """
+    N = np.asarray(counts, dtype=np.float64)
+    if N.ndim != 1 or N.size != 3:
+        raise ValueError(
+            f"extrapolation_weights: need exactly 3 counts, got {N}.  Same "
+            f"requirement as fit_band_extrapolation -- the two must describe "
+            f"the same estimator.")
+    x = 1.0 / N
+    xbar = float(np.mean(x))
+    Sxx = float(np.sum((x - xbar) ** 2))
+    if Sxx <= 0.0:
+        raise ValueError(
+            "extrapolation_weights: the three band counts are degenerate in "
+            f"1/N ({N}) -- no slope is determined.")
+    # s_inf = mean(S) - A*xbar with A = sum_i (x_i - xbar) S_i / Sxx, so
+    # c_i = 1/n - xbar*(x_i - xbar)/Sxx.  Written out rather than via lstsq
+    # so the realness is manifest at the call site.
+    return (1.0 / float(N.size)) - xbar * (x - xbar) / Sxx
+
+
 def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
     """One line saying whether the three points support the 1/N model.
 
@@ -849,6 +946,104 @@ def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
                 f"counts do not resolve the 1/N tail.  Use more bands.")
     return (f"consistent — Δ_model/Δ_tail = {ratio:.2f}; the three pairwise "
             f"intercepts agree to well within the applied correction.")
+
+
+def tolerance_bar_ev(fit: ExtrapolationFit, quantile: str = "p90") -> tuple:
+    """``(median, max)`` of the extrapolation uncertainty over all states, eV.
+
+    Two numbers because they answer different questions and the module has a
+    standing rule against reporting the max alone: a max over (k, band) is set
+    by the top of the QP window, whose Σ_c is the largest and least converged
+    quantity in the run, so it describes that state rather than the
+    calculation (see :meth:`ExtrapolationFit.at`).  The MEDIAN is the bar on a
+    typical state and is what the ruling below triggers on; the MAX is quoted
+    beside it as the envelope.
+    """
+    u = np.abs(np.real(np.asarray(fit.uncertainty(quantile))))
+    return float(np.median(u)), float(np.max(u))
+
+
+def sc_tolerance_ruling(fit: ExtrapolationFit, tol_ev: float,
+                        *, quantile: str = "p90") -> tuple:
+    """Is the SC convergence tolerance inside the extrapolation's own bar?
+
+    Returns ``(inside: bool, text: str)``.  ``text`` is always a block worth
+    printing; ``inside`` says whether it is a warning or a statement.
+
+    THE RULING, 2026-08-16: this WARNS, unmissably and every iteration.  It
+    does NOT refuse.  Both halves were argued, and the two reasons for
+    warning are independent -- either alone would settle it.
+
+    (1) A REFUSAL WOULD FIRE ON THE SHIPPED DEFAULT.  ``sc_tol_ev`` defaults
+        to 1.0e-4 eV = 0.1 meV (``gw_config._DEFAULTS``) and
+        ``use_band_extrapolation`` now defaults to TRUE, while the bar on
+        this deck family runs to tens of meV.  The default configuration is
+        therefore ALWAYS "inside the bar" by two to three orders of
+        magnitude.  A gate that refuses the combination the code ships with
+        is not a safety property; it is a build that cannot run, and it
+        would be routed around within a day by the first operator who needs
+        a number.
+
+    (2) THE TWO NUMBERS DO NOT MEASURE THE SAME THING, so "inside" is not an
+        inconsistency to refuse -- it is a misreading to prevent.
+        ``sc_tol_ev`` bounds the ITERATION-TO-ITERATION displacement of E_nk:
+        it asks "has the fixed point been reached".  The extrapolation bar is
+        a SYSTEMATIC uncertainty on the absolute Σ_c: it asks "where is the
+        fixed point".  A systematic, iteration-independent bias in Σ_c does
+        not stop the loop reaching its fixed point to 0.1 meV; it MOVES the
+        fixed point.  So a run that reports "converged, RMS dE = 8e-5 eV" is
+        making a TRUE statement about the iteration and would be making a
+        FALSE one about the accuracy of E_nk -- and nothing in the loop
+        distinguishes those two readings on the operator's behalf.  That is
+        what this block exists to do, and refusing would be answering a
+        question about accuracy by breaking a mechanism about convergence.
+
+    WHAT WOULD ACTUALLY JUSTIFY A REFUSAL, and is a different measurement:
+    the extrapolated correction WOBBLING between iterations by more than
+    ``tol_ev``.  That is not a systematic bias, it is iteration noise
+    injected into the fixed-point map, and it can genuinely prevent
+    convergence rather than relocate it.  The driver reports the
+    per-iteration change in ``Delta_tail`` for exactly this reason
+    (``gw.sc_iteration``); this function cannot see it, because it is handed
+    one iteration's fit.
+    """
+    med, mx = tolerance_bar_ev(fit, quantile)
+    tol = float(tol_ev)
+    inside = bool(tol < med)
+    head = ("*** SC TOLERANCE IS INSIDE THE EXTRAPOLATION BAR ***"
+            if inside else
+            "SC tolerance vs extrapolation bar")
+    lines = [
+        f"     {head}",
+        f"       sc_tol_ev              = {tol * 1e3:11.4f} meV  "
+        f"(per-band RMS dE between SC iterations)",
+        f"       extrapolation {quantile:<4s}     = {med * 1e3:11.4f} meV "
+        f"median over states, {mx * 1e3:.4f} meV max "
+        f"({100 * TAIL_UNCERTAINTY_FRACTION[0]:.0f} % of Delta_tail)",
+    ]
+    if inside:
+        lines += [
+            f"       The loop is being asked to converge "
+            f"{med / tol if tol > 0 else float('inf'):,.0f}x TIGHTER than "
+            f"the uncertainty on the quantity it is converging.",
+            f"       THESE ARE NOT THE SAME NUMBER AND THIS IS NOT A "
+            f"CONTRADICTION.  sc_tol_ev bounds the ITERATION-TO-ITERATION "
+            f"displacement -- 'has the fixed point been reached'.  The bar "
+            f"is a SYSTEMATIC uncertainty on absolute Sigma_c -- 'where IS "
+            f"the fixed point'.  A converged run here is genuinely converged "
+            f"and its E_nk is genuinely uncertain by the bar.",
+            f"       SO: do NOT quote the SC residual as the accuracy of "
+            f"E_nk.  Quote {med * 1e3:.3f} meV (median) / {mx * 1e3:.3f} meV "
+            f"(max envelope), and note it covers the EXTRAPOLATION ONLY -- "
+            f"not the difference from BerkeleyGW, the ISDF basis, or the "
+            f"W-side band count.",
+        ]
+    else:
+        lines.append(
+            f"       Tolerance is outside the median bar; the SC residual is "
+            f"a meaningful statement at this scale.  The bar still covers "
+            f"the EXTRAPOLATION only.")
+    return inside, "\n".join(lines)
 
 
 #: Dataset names the fit contributes to ``sigma_mnk.h5``, all ``(nk, nb)``
@@ -1029,12 +1224,15 @@ __all__ = [
     "EXTRAP_DATASETS",
     "TAIL_UNCERTAINTY_FRACTION",
     "extrapolation_h5_payload",
+    "extrapolation_weights",
     "BandBracketPlan",
     "BandExtrapolationRefused",
     "ExtrapolationFit",
     "fit_band_extrapolation",
     "format_extrapolation_report",
     "plan_band_brackets",
+    "sc_tolerance_ruling",
+    "tolerance_bar_ev",
     "trivial_plan",
     "trust_verdict",
 ]

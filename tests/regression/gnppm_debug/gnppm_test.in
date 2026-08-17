@@ -27,6 +27,19 @@ centroids_file = centroids_frac_399.txt
 nval = 26
 ncond = 20
 nband = 46
+# EXPLICITLY OFF, 2026-08-16.  `use_band_extrapolation` now defaults TRUE and
+# hard-refuses `nband < 2*n_occ`; this deck's n_occ is 26 (= WFN nelec), so it
+# would need nband >= 52 and it has 46.
+#
+# THE KEY IS SET FALSE RATHER THAN THE BAND COUNT RAISED, and that is the
+# deliberate choice.  This deck is a frozen-reference regression fixture
+# (eqp_ref.dat, tests/test_invariance_gates.py, the one-shot == SC-iteration-1
+# gate).  Raising nband changes every number it exists to compare, so "fixing"
+# it that way would silently retire the comparison instead of preserving it.
+# What this deck measures is the GN-PPM Sigma against a pinned reference, not
+# band convergence.  A deck that wants to exercise the extrapolation should be
+# a new variant with enough bands, not this one.
+use_band_extrapolation = false
 sys_dim = 2
 do_screened = true
 bispinor = false
