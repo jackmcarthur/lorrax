@@ -1,6 +1,6 @@
 """Batched 3-D FFT and the FUSED-CONV FAMILY — the ``LORRAX_FFT_FFI`` /
 ``LORRAX_FFT_FFI_FUSED`` / ``LORRAX_CONV_KMINOR_FFI`` /
-``LORRAX_CONV_KLEAD_FFI`` services.
+``LORRAX_CONV_KLEAD_FFI`` / ``LORRAX_CONV_KPAIR_FFI`` services.
 
 The Python half of the flat-k FFT handlers.  ONE set of ``ffi_call`` sites
 serves BOTH platforms, because the two libraries deliberately register the
@@ -71,7 +71,7 @@ carries no copy of its own.  The equivalence pin ``wk_REL/gatecheck.py``
 (cells A2/E/E2) now guards the re-export seam rather than a second copy.
 
 ================================================================================
-THE FUSED-CONV FAMILY — one contract, three resident-layout engines
+THE FUSED-CONV FAMILY — one contract, four resident-layout engines
 ================================================================================
 Beyond the plain transform, this module owns a FAMILY of fused convolution
 entries.  Every member computes the same thing::
@@ -90,6 +90,7 @@ axis**, because that decides which memory layout the one kernel must read.
     k-strided   LEADING       lorrax_mklfft_gw_conv       cpu, CUDA  make_gw_conv_ffi
     k-leading   LEADING       lorrax_cufft_conv_klead     CUDA       make_conv_klead_ffi
     k-minor     MINOR-most    lorrax_cufft_conv_kminor    CUDA       make_conv_kminor_ffi
+    k-pair      3-D LEADING   lorrax_cufft_conv_kpair     CUDA       make_fused_conv_kpair
 
 THE CHOICE IS THE CALLER'S RESIDENT LAYOUT, AND IT IS MEASURED, NOT A TASTE.
 The k-leading member keeps public T, W and U k-leading.  Its kernel coalesces
@@ -167,6 +168,11 @@ __all__ = [
     "conv_klead_mode", "conv_klead_enabled", "require_conv_klead",
     "conv_klead_available", "conv_klead_plan", "conv_klead_row_fits",
     "conv_klead_scale", "make_conv_klead_ffi",
+    # ISDF CCT/ZCT rank-7 pair convolution, device-local inside shard_map.
+    "CONV_KPAIR_TARGET", "CONV_KPAIR_GATE",
+    "conv_kpair_mode", "conv_kpair_available", "conv_kpair_plan",
+    "conv_kpair_resident_bytes", "conv_kpair_scale",
+    "make_fused_conv_kpair",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
@@ -183,6 +189,9 @@ CONV_KMINOR_TARGET = "lorrax_cufft_conv_kminor"
 #: SMEM-resident traversal rather than a cuFFT advanced-layout plan.  No
 #: production Sigma caller exists until its separate caller seam lands.
 CONV_KLEAD_TARGET = "lorrax_cufft_conv_klead"
+#: CUDA-only ISDF post-pair contraction.  Unlike the broadcast members, both
+#: operands are full-rank and the two spin axes disappear from the result.
+CONV_KPAIR_TARGET = "lorrax_cufft_conv_kpair"
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -727,7 +736,247 @@ def make_conv_klead_ffi(
 
 
 # ===========================================================================
-# THE FUSED-CONV FAMILY, member 3 of 3: k-MINOR
+# ISDF CCT/ZCT post-pair convolution: two full-rank k-LEADING operands
+# ===========================================================================
+CONV_KPAIR_GATE = Gate(
+    env="LORRAX_CONV_KPAIR_FFI",
+    target=CONV_KPAIR_TARGET,
+    platforms=("CUDA",),
+    modes=("off", "auto", "on"),
+    default="auto",
+    off_label="the ISDF XLA IFFT/conjugate/gamma/FFT reference chain",
+    off_policy="fallback",
+    auto_capability=(
+        "the mesh is CUDA, the loaded device library exports "
+        "CufftConvKPairCudaFfi, the runtime axes are in [1,24], and the "
+        "shape is in the measured native-fast region"),
+    auto_on_msg=(
+            "[conv_kpair] auto -> ON: the ISDF post-pair CUDA accelerator "
+            "({target}) is available; the plan selected its measured-fast "
+            "resident/device arm from mirrored byte arithmetic."),
+    auto_off_msg=(
+        "[conv_kpair] auto -> OFF: ISDF keeps the XLA post-pair reference "
+        "chain. Reason: {reason}"),
+    off_announce_msg=(
+        "[LORRAX_CONV_KPAIR_FFI] =off: ISDF keeps the XLA post-pair "
+        "reference chain."),
+    label={"CUDA": "ISDF two-input k-convolution CUDA"},
+    resolved_msg={
+        "CUDA": (
+            "[conv_kpair] ISDF post-pair CUDA handler ({target}) available: "
+            "rank-7 full operands, monomial gamma contraction, resident and "
+            "over-residency arms, c128 only."),
+    },
+    refuse_platform_msg=(
+        "LORRAX_CONV_KPAIR_FFI=on requires the ISDF CUDA accelerator, but "
+        "this mesh is '{platform}'. Use off/auto for the XLA reference "
+        "chain."),
+    refuse_probe_msg=(
+        "LORRAX_CONV_KPAIR_FFI=on requested {label}, but FFI target "
+        "'{target}' is unusable on platform '{platform}': {reason} Rebuild "
+        "the CUDA leg (isolated target: build_conv_kpair_cuda; shared "
+        "library: src/ffi/cpp/build.sh) and point LORRAX_FFI_SO at it, or "
+        "select off/auto for the XLA reference chain."),
+)
+
+_CONV_KPAIR_AXIS_MAX = 24
+_CONV_KPAIR_AUTO_SMEM_FLOOR = 49152
+# Shape thresholds, not device identifiers.  The representative A100 sweep
+# finds charge native-fast through 14^3 and at 15^3 once rows >= 1024.  Spin's
+# extra arithmetic and third resident bank move its over-floor crossover:
+# 12^3--15^3 lose at 64 rows but win at 1024.  Both channels lose at 16^3,
+# as do the two-stage 24^3 coverage cases.  Evidence is the sandbox artifact
+# reports/conv_kpair_zeta_2026-08-17/evidence/
+# crossover_sweep_spin_final.log, plus bench_two_stage_*.log beside it.
+_CONV_KPAIR_AUTO_NK_ALWAYS = 14**3
+_CONV_KPAIR_AUTO_NK_LARGE_ROW = 15**3
+_CONV_KPAIR_AUTO_LARGE_ROWS = 1024
+
+
+def conv_kpair_mode() -> str:
+    """``off`` | ``auto`` | ``on`` for the ISDF post-pair accelerator."""
+    return CONV_KPAIR_GATE.mode()
+
+
+def conv_kpair_available(mesh: Mesh) -> tuple[bool, str]:
+    """Non-raising CUDA/handler probe used by ``auto`` and reports."""
+    try:
+        CONV_KPAIR_GATE.require(mesh, target=CONV_KPAIR_TARGET)
+    except Exception as exc:  # noqa: BLE001 -- the reason is the result
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "CUDA"
+
+
+def conv_kpair_resident_bytes(kgrid, ns: int, rows: int = 1) -> int:
+    """Exact dynamic-SMEM expression mirrored from the native planner.
+
+    One block owns ``rows`` independent trailing rows.  Charge reuses its
+    first transform bank as the accumulator; a nontrivial spin contraction
+    needs a third bank.  Every bank has odd complex-element stride, followed
+    by the three O(axis) twiddle rings.
+    """
+    kg = tuple(int(v) for v in kgrid)
+    if len(kg) != 3 or min(kg) < 1 or max(kg) > _CONV_KPAIR_AXIS_MAX:
+        return -1
+    if int(ns) < 1:
+        return -1
+    nk = math.prod(kg)
+    banks = 2 if int(ns) == 1 else 3
+    return 16 * (banks * int(rows) * (nk | 1) + sum(kg))
+
+
+def conv_kpair_plan(
+    mesh: Mesh,
+    kgrid,
+    ns: int,
+    trailing_shape,
+) -> tuple[str, str]:
+    """Return ``(xla|resident|two_stage|device, reason)`` for one local tile.
+
+    This is the Python mirror of the native byte arithmetic.  ``on`` performs
+    only the Gate capability check and deliberately returns ``device``: C++
+    owns the final axis/residency/refusal verdict.  ``auto`` additionally
+    applies the measured shape crossover so an over-residency coverage arm is
+    never selected when the XLA reference is expected to be faster.
+    """
+    mode = conv_kpair_mode()
+    kg = tuple(int(v) for v in kgrid)
+    tail = tuple(int(v) for v in trailing_shape)
+    if mode == "off":
+        return "xla", "LORRAX_CONV_KPAIR_FFI=off"
+    if mode == "on":
+        CONV_KPAIR_GATE.require(mesh, target=CONV_KPAIR_TARGET)
+        return "device", "on; C++ derives the final residency/refusal verdict"
+    ok, why = conv_kpair_available(mesh)
+    if not ok:
+        return "xla", why
+    if (len(kg) != 3 or min(kg) < 1
+            or max(kg) > _CONV_KPAIR_AXIS_MAX):
+        return "xla", (
+            f"k-grid axes {kg} are outside [1,{_CONV_KPAIR_AXIS_MAX}]")
+    if len(tail) != 2 or min(tail) < 1 or int(ns) < 1:
+        return "xla", f"unsupported local shape ns={ns}, trailing={tail}"
+    nk = math.prod(kg)
+    rows = math.prod(tail)
+    need = conv_kpair_resident_bytes(kg, int(ns))
+    if need <= _CONV_KPAIR_AUTO_SMEM_FLOOR:
+        return "resident", (
+            f"resident minimum={need} B <= portable "
+            f"{_CONV_KPAIR_AUTO_SMEM_FLOOR} B")
+    charge_fast = (int(ns) == 1 and (
+        nk <= _CONV_KPAIR_AUTO_NK_ALWAYS
+        or (nk <= _CONV_KPAIR_AUTO_NK_LARGE_ROW
+            and rows >= _CONV_KPAIR_AUTO_LARGE_ROWS)))
+    spin_fast = (int(ns) == 2
+                 and nk <= _CONV_KPAIR_AUTO_NK_LARGE_ROW
+                 and rows >= _CONV_KPAIR_AUTO_LARGE_ROWS)
+    if charge_fast or spin_fast:
+        return "device", (
+            f"measured native-fast region: ns={ns}, nk={nk}, rows={rows}; resident "
+            f"minimum={need} B, final device residency delegated to C++")
+    return "xla", (
+        f"measured XLA-fast region: ns={ns}, nk={nk}, rows={rows}; charge "
+        f"boundary is nk<={_CONV_KPAIR_AUTO_NK_ALWAYS}, or "
+        f"nk<={_CONV_KPAIR_AUTO_NK_LARGE_ROW} with rows>="
+        f"{_CONV_KPAIR_AUTO_LARGE_ROWS}; spin requires the large-row bound "
+        "outside the portable resident floor; two-stage remains available "
+        "under LORRAX_CONV_KPAIR_FFI=on")
+
+
+def conv_kpair_scale(norm: str | None, nk: int, mult: float = 1.0) -> float:
+    """Fold two inverse norms and one forward norm into one scalar."""
+    si = ffi_fft_scale("ifftn", norm, nk)
+    return si * si * ffi_fft_scale("fftn", norm, nk) * float(mult)
+
+
+def _conv_kpair_phase_codes(phase, ns: int, label: str) -> np.ndarray:
+    """Encode exact monomial phases as 0:+1, 1:+i, 2:-1, 3:-i."""
+    values = np.asarray(phase, dtype=np.complex128).reshape(-1)
+    if values.size != ns:
+        raise ValueError(f"conv_kpair {label} phase has {values.size} entries; ns={ns}")
+    quadrants = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+    codes = np.empty(ns, dtype=np.int64)
+    for i, value in enumerate(values):
+        hits = np.flatnonzero(np.abs(quadrants - value) <= 1e-14)
+        if hits.size != 1:
+            raise ValueError(
+                f"conv_kpair {label} phase[{i}]={value!r} is not in "
+                "{+1,+i,-1,-i}")
+        codes[i] = int(hits[0])
+    return codes
+
+
+def make_fused_conv_kpair(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    *,
+    perm_l,
+    phase_l,
+    perm_r,
+    phase_r,
+    arm: str = "device",
+    norm: str | None = "forward",
+    mult: float = 1.0,
+) -> Callable:
+    """Build the device-local rank-7 CCT/ZCT post-pair custom call.
+
+    The returned callable is intentionally *not* wrapped in another
+    ``shard_map``: both production sites invoke it inside their existing map,
+    so the handler sees one local ``(col,mu)`` tile and introduces no
+    collective.  A/B are `(kx,ky,kz,ns,col,mu,ns)`; U drops the spin axes.
+    """
+    CONV_KPAIR_GATE.require(mesh, target=CONV_KPAIR_TARGET)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    arm_codes = {"device": 0, "resident": 1, "two_stage": 2}
+    if arm not in arm_codes:
+        raise ValueError(f"conv_kpair arm={arm!r}; expected {tuple(arm_codes)}")
+    p_l = np.asarray(perm_l, dtype=np.int64).reshape(-1)
+    p_r = np.asarray(perm_r, dtype=np.int64).reshape(-1)
+    if p_l.size != p_r.size or p_l.size < 1:
+        raise ValueError(
+            f"conv_kpair permutation sizes disagree: {p_l.size} vs {p_r.size}")
+    ns = int(p_l.size)
+    if (sorted(int(v) for v in p_l) != list(range(ns))
+            or sorted(int(v) for v in p_r) != list(range(ns))):
+        raise ValueError("conv_kpair perm_l/perm_r must each be a permutation of range(ns)")
+    attrs = dict(
+        nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
+        scale=np.float64(conv_kpair_scale(norm, nk, mult)),
+        requested_arm=np.int64(arm_codes[arm]),
+        perm_l=p_l, phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+        perm_r=p_r, phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+    )
+
+    def _conv_kpair(A, B):
+        if A.dtype != jnp.complex128 or B.dtype != jnp.complex128:
+            raise TypeError(
+                f"conv_kpair is complex128 ONLY and never up-casts; got "
+                f"A={A.dtype}, B={B.dtype}.")
+        if A.ndim != 7 or B.ndim != 7 or A.shape != B.shape:
+            raise ValueError(
+                f"conv_kpair expects equal rank-7 A/B operands; got "
+                f"{A.shape} / {B.shape}.")
+        if tuple(int(v) for v in A.shape[:3]) != (nkx, nky, nkz):
+            raise ValueError(
+                f"conv_kpair leading shape {A.shape[:3]} != kgrid "
+                f"{(nkx, nky, nkz)}")
+        if int(A.shape[3]) != ns or int(A.shape[6]) != ns:
+            raise ValueError(
+                f"conv_kpair spin axes {A.shape[3]}/{A.shape[6]} != ns={ns}")
+        out_t = jax.ShapeDtypeStruct(
+            A.shape[:3] + A.shape[4:6], A.dtype)
+        # No alias is claimed: rank reduction makes U smaller than either
+        # input, and both complete input rows remain live until their spin
+        # accumulation finishes.  The native handler rejects pointer aliasing
+        # too, so a future wrapper cannot weaken this proof accidentally.
+        return jax.ffi.ffi_call(CONV_KPAIR_TARGET, out_t)(A, B, **attrs)
+
+    return _conv_kpair
+
+
+# ===========================================================================
+# THE FUSED-CONV FAMILY, k-MINOR broadcast member
 # ===========================================================================
 # The k-strided member above reads a k-LEADING tile through cuFFT's advanced
 # data layout.  This one reads a k-MINOR tile — the layout a caller holds when

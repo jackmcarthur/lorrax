@@ -109,6 +109,41 @@ _pair_density_cache = {}  # pair-density kernel
 _pair_pipeline_sm_cache = {}  # pair-density shard_map pipeline kernel
 
 
+def _conv_kpair_static_gamma(gamma, ns: int):
+	"""Host-stable monomial data for the conv_kpair attribute ABI.
+
+	The existing XLA arm keeps gamma arrays as runtime operands.  The FFI ABI
+	uses attributes because every channel's monomial is invariant across the
+	whole compiled C/Z kernel; including the values in the caller cache key
+	prevents one Lorentz channel from reusing another's executable.
+	"""
+	if gamma is None:
+		return (np.arange(ns, dtype=np.int64),
+		        np.ones(ns, dtype=np.complex128))
+	perm, phase = gamma
+	return (np.asarray(perm, dtype=np.int64).reshape(ns),
+	        np.asarray(phase, dtype=np.complex128).reshape(ns))
+
+
+def _conv_kpair_setup(mesh_xy, kgrid, ns, trailing_shape, gamma_L, gamma_R):
+	"""Resolve one post-pair arm and construct its device-local callable."""
+	from ffi.fft import conv_kpair_plan, make_fused_conv_kpair
+
+	arm, reason = conv_kpair_plan(mesh_xy, kgrid, ns, trailing_shape)
+	p_l, ph_l = _conv_kpair_static_gamma(gamma_L, ns)
+	p_r, ph_r = _conv_kpair_static_gamma(gamma_R, ns)
+	gamma_key = (
+		tuple(int(v) for v in p_l), tuple(complex(v) for v in ph_l),
+		tuple(int(v) for v in p_r), tuple(complex(v) for v in ph_r),
+	)
+	if arm == "xla":
+		return arm, reason, None, gamma_key
+	kernel = make_fused_conv_kpair(
+		mesh_xy, kgrid, perm_l=p_l, phase_l=ph_l,
+		perm_r=p_r, phase_r=ph_r, arm=arm, norm="forward")
+	return arm, reason, kernel, gamma_key
+
+
 def pair_density(
 	psi_rmuT_X: jax.Array,
 	psi_rcol_Y: jax.Array,
@@ -316,12 +351,19 @@ def c_q_from_psi_sm(
 	n_col = int(psi_l_Y.shape[3])
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	p_x = int(mesh_xy.shape['x'])
+	p_y = int(mesh_xy.shape['y'])
+	pair_arm, _pair_reason, pair_kernel, pair_gamma_key = _conv_kpair_setup(
+		mesh_xy, kgrid, ns, (n_col // p_y, n_rmu // p_x),
+		gamma_L, gamma_R)
 
 	cache_key = ('c_q_from_psi_sm', id(mesh_xy), nk, n_rmu, n_col, ns,
-	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id)
+	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id,
+	             pair_arm, pair_gamma_key)
 	if cache_key not in _pair_pipeline_sm_cache:
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
+		_pair_kernel = pair_kernel
 		L_spec = P(None, 'x', None, None)
 		R_spec = P(None, None, None, 'y')
 		out_spec = P(None, 'x', 'y')
@@ -356,25 +398,31 @@ def c_q_from_psi_sm(
 			# Rank-7: (kx, ky, kz, ns_l, col, μ, ns_r).
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_l
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
 			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
 			del P_r
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			# Reduce over the spin axes (3=ns_l, 6=ns_r) of the rank-7
-			# form.  Output rank-5: (kx, ky, kz, col, μ).
-			C_R = gamma_double_contract(
-				P_l_R_conj, P_r_R,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(3, 6),
-			)
-			del P_l_R_conj, P_r_R
-			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+			if _pair_kernel is not None:
+				# Already inside shard_map: this is one device-local custom call,
+				# with no nested map and therefore no new collective.
+				C_q_3d = _pair_kernel(P_l_3d, P_r_3d)
+				del P_l_3d, P_r_3d
+			else:
+				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R_conj = jnp.conj(P_l_R)
+				del P_l_3d, P_l_R
+				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				del P_r_3d
+				# Reduce over the spin axes (3=ns_l, 6=ns_r) of the rank-7
+				# form.  Output rank-5: (kx, ky, kz, col, μ).
+				C_R = gamma_double_contract(
+					P_l_R_conj, P_r_R,
+					perm_L=None if _lhs_id else perm_L_,
+					phase_L=None if _lhs_id else phase_L_,
+					perm_R=None if _rhs_id else perm_R_,
+					phase_R=None if _rhs_id else phase_R_,
+					spin_axes=(3, 6),
+				)
+				del P_l_R_conj, P_r_R
+				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 			# Reshape back to (nk, col, μ); transpose final two axes
 			# to satisfy out_spec ``P(None, 'x', 'y')`` for (nk, μ, col).
 			# This transpose acts on the rank-3 reduced form (~16 MB),
@@ -506,16 +554,19 @@ def z_q_from_psi_sm(
 
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	pair_arm, _pair_reason, pair_kernel, pair_gamma_key = _conv_kpair_setup(
+		mesh_xy, kgrid, ns, (r_loc, n_rmu // p_x), gamma_L, gamma_R)
 
 	cache_key = (
 		'z_q_from_psi_sm_streaming', id(mesh_xy), id(psi_G_store),
 		nk, n_rmu, n_zchunk, ns, nb_l, nb_r, nkx, nky, nkz,
 		lhs_id, rhs_id, bcr, (L_lo_g, L_hi_g), (R_lo_g, R_hi_g),
-		tuple(int(s) for s in fft_grid),
+		tuple(int(s) for s in fft_grid), pair_arm, pair_gamma_key,
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 		_lhs_id = lhs_id
 		_rhs_id = rhs_id
+		_pair_kernel = pair_kernel
 		_psi_G_store = psi_G_store
 		fft_grid_t = tuple(int(s) for s in fft_grid)
 
@@ -843,26 +894,31 @@ def z_q_from_psi_sm(
 				body, (P_l_init, P_r_init),
 				jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
 
-			# Post-pair pipeline (byte-identical to today's tail per §2.7).
+			# Post-pair pipeline: the XLA branch below remains the unchanged
+			# reference tail; the native branch replaces exactly that subgraph.
 			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_l
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
 			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
 			del P_r
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			Z_R = gamma_double_contract(
-				P_l_R_conj, P_r_R,
-				perm_L=None if _lhs_id else perm_L_,
-				phase_L=None if _lhs_id else phase_L_,
-				perm_R=None if _rhs_id else perm_R_,
-				phase_R=None if _rhs_id else phase_R_,
-				spin_axes=(3, 6),
-			)
-			del P_l_R_conj, P_r_R
-			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+			if _pair_kernel is not None:
+				Z_q_3d = _pair_kernel(P_l_3d, P_r_3d)
+				del P_l_3d, P_r_3d
+			else:
+				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R_conj = jnp.conj(P_l_R)
+				del P_l_3d, P_l_R
+				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				del P_r_3d
+				Z_R = gamma_double_contract(
+					P_l_R_conj, P_r_R,
+					perm_L=None if _lhs_id else perm_L_,
+					phase_L=None if _lhs_id else phase_L_,
+					perm_R=None if _rhs_id else perm_R_,
+					phase_R=None if _rhs_id else phase_R_,
+					spin_axes=(3, 6),
+				)
+				del P_l_R_conj, P_r_R
+				Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
 			return jnp.transpose(
 				Z_q_3d.reshape(nkx * nky * nkz, r_loc, mu_loc),
 				(0, 2, 1))
@@ -3873,9 +3929,9 @@ def solve_zeta(
     q_batch = min(q_chunk_size, nq)
     nq_padded = round_up(nq, q_batch)
 
-    # Dispatch on solver_kind (already resolved above) — independent of
-    # vertex_mu_L so the rchunk kernel cache can collapse transverse
-    # channels with the same solver_kind into a single compile.
+    # Dispatch on solver_kind (already resolved above).  The solve itself is
+    # independent of the particular transverse gamma; the outer r-chunk
+    # factory may still specialize that gamma for an FFI attribute.
     use_lu = (solver_kind == 'lu')
     # ``use_lu`` selects a pivoted-LU back-solve for transverse channels
     # (γ̃^i, i∈{1,2,3}).  CCT^μ for those channels is Hermitian but
@@ -4326,7 +4382,7 @@ def _make_fit_one_rchunk_kernel(
     q_chunk_size: int,
     kvecs_frac,
     psi_G_store,
-    is_charge: bool = True,
+    vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     zeta_gather: str = 'replicated',
@@ -4357,6 +4413,17 @@ def _make_fit_one_rchunk_kernel(
     the ZCT, the Z_q→Z_col reshard, and the Cholesky solve.
     """
     nk_tot = meta.nk_tot
+    vertex_mu_L = int(vertex_mu_L)
+    if vertex_mu_L < 0 or vertex_mu_L > 3:
+        raise ValueError(
+            f"vertex_mu_L={vertex_mu_L}; gamma attribute ABI supports 0..3")
+    is_charge = vertex_mu_L == 0
+    # conv_kpair's monomial is an FFI attribute, hence compile-time state.
+    # Capture it before tracing rather than converting the historical runtime
+    # gamma operands inside z_q_from_psi_sm (which would be illegal for JAX
+    # tracers).  The cache keys vertex_mu_L below, so channels cannot reuse an
+    # executable carrying another channel's attributes.
+    gamma_static = None if is_charge else _gamma_perm_phase_mu(vertex_mu_L)
     # In-memory shapes throughout this kernel use the PADDED μ extent.
     # ψ enters at padded (Phase 3a's load_centroids contract); all
     # bilinear consumers / WSCs / inner-jit boundary checks see
@@ -4400,7 +4467,9 @@ def _make_fit_one_rchunk_kernel(
         # (algebraically identical: einsum is linear in psi_X·psi_Y).
         psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
         psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
-        gamma_mu = None if is_charge else (gamma_perm, gamma_phase)
+        # gamma_perm/gamma_phase remain in this callable's compatibility ABI,
+        # but the FFI path must use the closure-captured attribute values.
+        gamma_mu = gamma_static
         # Round 6 streaming pair density + IFFT + γ̃·γ̃ + FFT — single
         # shard_map; io_callback pulls per-bc ψ(G) from the host store
         # inside the lax.scan body.  Output Z_q at FULL-BZ q-shape.
@@ -4517,11 +4586,11 @@ def fit_one_rchunk(
     includes ``id(psi_G_store)`` to avoid reusing a compile built against
     a different store.
     """
-    # vertex_mu_L splits into two runtime/closure pieces: a structural
-    # ``is_charge`` (Python bool — keys the cache, separates the chol
-    # branch from the gamma-fold branch) and the gamma matrix
-    # ``(perm, phase)`` (runtime jit args — μ=1/2/3 all reuse the same
-    # compiled HLO since the values never appear as static constants).
+    # conv_kpair passes the monomial gamma as FFI attributes, so the Lorentz
+    # channel is structural and keys the cache.  The historical runtime gamma
+    # operands remain in the callable ABI, but the native post-pair path uses
+    # the factory's closure-captured values; μ=1/2/3 therefore compile
+    # separately instead of trying to turn tracers into host attributes.
     is_charge = (int(vertex_mu_L) == 0)
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
     cache_key = (
@@ -4535,7 +4604,7 @@ def fit_one_rchunk(
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
-        bool(is_charge),
+        int(vertex_mu_L),
         str(solver_kind),
         str(zeta_gather),
         str(distrib_la_batched_route),
@@ -4557,7 +4626,7 @@ def fit_one_rchunk(
             q_chunk_size,
             kvecs_frac,
             psi_G_store,
-            is_charge=bool(is_charge),
+            vertex_mu_L=int(vertex_mu_L),
             solver_kind=str(solver_kind),
             q_irr_full_idx=q_irr_full_idx,
             zeta_gather=str(zeta_gather),
