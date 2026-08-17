@@ -504,30 +504,52 @@ def test_a_run_with_no_consuming_stage_still_REFUSES_an_explicit_key():
         "cannot tell which stage list was consulted")
 
 
-def test_an_mpa_stage_is_refused_UPSTREAM_and_never_reaches_this_guard():
-    """SCOPE NOTE, measured rather than assumed.
+def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
+    """The behavioural test the scope note promised, cashed in.
 
-    An MPA stage cannot exercise the guard today: ``compute_sigma_xc`` calls
-    ``refuse_unimplemented_compute_mode`` first (``sigma_dispatch.py:559``,
-    against ``gw_config.UNIMPLEMENTED_MODES``), and MPA is still listed there.
-    So the auto-disable never prints for MPA and the dynamic-mode branch of
-    its note is UNREACHABLE in production.
+    THIS CELL REPLACES ``test_an_mpa_stage_is_refused_UPSTREAM_and_never_
+    reaches_this_guard``, whose docstring said in as many words: "When MPA is
+    implemented this test will fail, which is the correct moment to check
+    that branch behaviourally."  That moment is the metal MPA-QSGW merge
+    (``origin/main`` f597dd05), which emptied ``gw_config.UNIMPLEMENTED_MODES``
+    — it is now ``{}`` — so ``refuse_unimplemented_compute_mode`` is a no-op
+    for MPA and an MPA stage reaches the band-extrapolation guard for real.
 
-    That is worth a test rather than silence, because the SC branch's note
-    was written as if an MPA stage would reach it and recite the static
-    Coulomb-hole measurement at it.  When MPA is implemented this test will
-    fail, which is the correct moment to check that branch behaviourally.
+    What must be true now: the guard AUTO-DISABLES rather than refusing (a
+    PPM stage in the same ladder consumes the key, so this stage is skipped,
+    not fatal), it names the stage, and it gives the DYNAMIC reason.  It must
+    NOT recite the static Coulomb-hole anti-convergence measurement, which
+    was measured on static COHSEX and is not evidence about MPA;
+    ``test_the_dynamic_branch_does_not_recite_the_static_measurement`` pins
+    the same claim in the source text, and this one pins it in behaviour.
+
+    The dispatch is expected to fail AFTER the guard: this file's ``_dispatch``
+    passes ``wfns=None``, which no real Σ stage can consume.  That is a
+    harness limit, not the property under test, so the failure is allowed and
+    the assertions are all about what was PRINTED before it.
     """
     cfg_mod = _gw_config()
     CM = cfg_mod.ComputeMode
+    assert cfg_mod.UNIMPLEMENTED_MODES == {}, (
+        "this cell exists because MPA stopped being gated at entry; if "
+        "something is unimplemented again, say which and why here")
     said = []
-    with pytest.raises(NotImplementedError) as exc:
+    with pytest.raises(BaseException):
         _dispatch(CM.MPA, _cfg([CM.GN_PPM, CM.MPA], explicit=True),
                   print_fn=said.append)
-    assert "mpa" in str(exc.value).lower()
-    assert said == [], (
-        "if the guard now prints for MPA, the mode became implemented and "
-        "the dynamic branch below needs a behavioural test")
+    notes = [s for s in said if "band extrapolation" in s]
+    assert notes, (
+        f"an MPA stage must reach the band-extrapolation guard and say so; "
+        f"printed: {said}")
+    note = " ".join(notes)
+    assert "AUTO-DISABLED" in note, note
+    assert "mpa" in note.lower(), note
+    # The dynamic reason, not the static one.
+    assert "MPA is dynamic" in note, note
+    assert "no bracket axis to fit" in note, note
+    assert "94.9" not in note and "288.2" not in note, (
+        f"the static Coulomb-hole measurement must not be recited at a "
+        f"dynamic stage — that is inventing evidence: {note}")
 
 
 def test_the_dynamic_branch_does_not_recite_the_static_measurement():
