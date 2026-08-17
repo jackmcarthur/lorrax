@@ -71,8 +71,46 @@ def _plan(**kw):
     return be, be.plan_band_brackets(**kw)
 
 
+def test_at_least_one_parametrised_arm_actually_plans():
+    """The parametrised cell above must not be able to pass on refusals alone.
+
+    THE SECOND HALF OF THE SAME FIX.  Naming the exception classes stops an
+    UNRELATED refusal being absorbed, but a degeneracy refusal on every single
+    arm would still leave the parametrised cell green while testing nothing --
+    it would report four passes for four arms that never reached the property.
+    This cell holds all four nbands itself (rather than relying on state shared
+    between parametrised runs, which xdist distributes across workers and does
+    not share) and asserts that the planner produced a real plan for at least
+    one of them.
+
+    It is deliberately weak -- ONE arm, not all four -- because a genuine
+    degeneracy refusal on a particular band count is a legitimate outcome that
+    this suite must keep tolerating.  What it does not tolerate is the whole
+    parametrisation going quiet at once.
+    """
+    enk = _enk_ry()
+    be = pytest.importorskip("gw.band_extrapolation")
+    planned, refused = [], []
+    for nband in (40, 36, 28, 20):
+        if nband > enk.shape[1]:
+            continue
+        try:
+            _, plan = _plan(enabled=True, enk_ry=enk, n_occ=8,
+                            nb_logical=nband, nb_padded=nband)
+        except (bd.BandWindowDegeneracyError,
+                be.BandExtrapolationRefused) as e:
+            refused.append((nband, f"{type(e).__name__}: {e}"))
+        else:
+            planned.append((nband, tuple(int(c) for c in plan.counts)))
+    assert planned, (
+        "plan_band_brackets refused EVERY parametrised band count "
+        f"{[n for n, _ in refused]}, so the star-covariance parametrisation "
+        f"above is passing without ever exercising an interior cut.  "
+        f"Refusals:\n" + "\n".join(f"  nband={n}: {m}" for n, m in refused))
+
+
 @pytest.mark.parametrize("nband", [40, 36, 28, 20])
-def test_interior_cuts_are_degeneracy_clean_or_say_so(nband):
+def test_interior_cuts_are_degeneracy_clean_or_say_so(nband, record_property):
     """Every interior cut is clean, or the plan RECORDS that it is not.
 
     Silence is the failure mode this guards: a cut that quietly lands
@@ -82,20 +120,43 @@ def test_interior_cuts_are_degeneracy_clean_or_say_so(nband):
     enk = _enk_ry()
     if nband > enk.shape[1]:
         pytest.skip(f"fixture has {enk.shape[1]} bands < nband={nband}")
+    be = pytest.importorskip("gw.band_extrapolation")
     try:
-        be, plan = _plan(enabled=True, enk_ry=enk, n_occ=8,
-                         nb_logical=nband, nb_padded=nband)
-    except (bd.BandWindowDegeneracyError, ValueError) as e:
-        # REFUSING is a pass.  The property is "never silently slice", and a
-        # planner that stops rather than emit a mid-multiplet cut satisfies
-        # it.  The two branches differ here on purpose:
-        # `feat/band-extrapolation-2026-08-15` REFUSES (this path);
-        # `feat/band-extrapolation-sampling-2026-08-15` @ 81edc49c relaxed it
-        # to fall back UNSNAPPED, which is the case the assertion below
-        # covers.  Both are acceptable to this cell; silence is not.
-        assert "clean boundary" in str(e) or "degenerate" in str(e).lower(), (
-            f"planner raised, but not about degeneracy: {e}")
+        _, plan = _plan(enabled=True, enk_ry=enk, n_occ=8,
+                        nb_logical=nband, nb_padded=nband)
+    except (bd.BandWindowDegeneracyError,
+            be.BandExtrapolationRefused) as e:
+        # REFUSING is a pass FOR THIS PROPERTY, and only for this one.  The
+        # property is "never silently slice", and a planner that stops rather
+        # than emit a mid-multiplet cut satisfies it.  The two branches differ
+        # here on purpose: `feat/band-extrapolation-2026-08-15` REFUSES (this
+        # path); `feat/band-extrapolation-sampling-2026-08-15` @ 81edc49c
+        # relaxed it to fall back UNSNAPPED, which the assertion below covers.
+        #
+        # ⚠ THE EXCEPT CLAUSE USED TO NAME `ValueError`, AND THAT MADE THIS
+        # CELL STOP BEING A GATE.  `BandExtrapolationRefused` SUBCLASSES
+        # `ValueError` (`gw/band_extrapolation.py`), so catching the base
+        # swallowed EVERY refusal `plan_band_brackets` can raise -- including
+        # ones that have nothing to do with degeneracy, and including refusals
+        # added after this test was written.  The 2026-08-16 band-count gate
+        # change (`n_cond <= n_occ` -> `n_cond < n_occ`) passed this cell both
+        # BEFORE and AFTER for exactly that reason: a test that counts a
+        # refusal as success is not a gate.  Naming the two classes explicitly
+        # is what makes an unrelated `ValueError` -- a shape error, a typo, a
+        # new precondition -- come out as the FAILURE it is instead of a pass.
+        msg = str(e)
+        assert "clean boundary" in msg or "degenerate" in msg.lower(), (
+            f"plan_band_brackets refused at nband={nband}, but NOT about "
+            f"degeneracy: {type(e).__name__}: {msg}\n"
+            f"This cell accepts a degeneracy refusal as satisfying "
+            f"'never silently slice'.  It does not accept any other refusal, "
+            f"because a refusal for another reason means the planner never "
+            f"reached the property under test and this cell measured nothing.")
+        # Reported as a refusal, not silently as a pass: without this the arm
+        # is indistinguishable in the run log from one that planned cleanly.
+        record_property("outcome", f"REFUSED(degeneracy): {msg}")
         return
+    record_property("outcome", f"PLANNED counts={tuple(int(c) for c in plan.counts)}")
     # the deck's untruncated ladder, not a window -- the plan's interior
     # cuts are checked against it
     gaps = bd.boundary_min_gaps(enk, is_full_spectrum=True)
