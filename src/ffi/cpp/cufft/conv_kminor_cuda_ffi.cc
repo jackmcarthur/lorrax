@@ -1274,16 +1274,22 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
             return fail_sticky("cuModuleGetFunction",
                                std::string(name) + ": " + cu_err(cr));
         }
-        // Raise the arm's ALLOWED dynamic-shared maximum to the device's, so
-        // a large k-row can be resident.  This changes only what a launch MAY
-        // request; every launch still asks for exactly what its plan needs, so
-        // the common small-k launches keep their L1 carve-out.  A failure here
-        // is not fatal — it just leaves the 48 KB default, which plan_launch
-        // will then respect — so it is recorded, not raised.
-        //   8 == CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES (cuda.h);
-        //   spelled numerically because the driver enum is not in scope here.
+        // Dynamic shared-memory opt-in is part of the launch contract.  Never
+        // advertise a ceiling that was not established for every function the
+        // planner may select.
         if (smem_optin > 49152) {
-            (void)api.FuncSetAttribute(arms.fn[e - 1], 8, smem_optin);
+            cr = api.FuncSetAttribute(
+                arms.fn[e - 1],
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_optin);
+            if (cr != CUDA_SUCCESS) {
+                api.ModuleUnload(mod);
+                return fail_sticky(
+                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                    std::string(name) + ": requested " +
+                        std::to_string(smem_optin) + " B: CUresult=" +
+                        std::to_string(static_cast<int>(cr)) + " (" +
+                        cu_err(cr) + ")");
+            }
         }
     }
     for (int a = 0; a < 3; ++a) {
@@ -1297,7 +1303,18 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
                                std::string(name) + ": " + cu_err(cr));
         }
         if (smem_optin > 49152) {
-            (void)api.FuncSetAttribute(arms.ctg[a], 8, smem_optin);
+            cr = api.FuncSetAttribute(
+                arms.ctg[a],
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_optin);
+            if (cr != CUDA_SUCCESS) {
+                api.ModuleUnload(mod);
+                return fail_sticky(
+                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                    std::string(name) + ": requested " +
+                        std::to_string(smem_optin) + " B: CUresult=" +
+                        std::to_string(static_cast<int>(cr)) + " (" +
+                        cu_err(cr) + ")");
+            }
         }
     }
     // Record the envelope only once every arm is loaded and raised, so a plan

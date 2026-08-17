@@ -500,8 +500,21 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
                                std::string(name) + ": " + cu_err(cr));
         }
         if (smem_optin > 49152) {
-            // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES == 8.
-            (void)api.FuncSetAttribute(arms.fn[e - 1], 8, smem_optin);
+            // Dynamic shared-memory opt-in is part of the launch contract.
+            // Never advertise a ceiling that was not established for every
+            // function the planner may select.
+            cr = api.FuncSetAttribute(
+                arms.fn[e - 1],
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_optin);
+            if (cr != CUDA_SUCCESS) {
+                api.ModuleUnload(mod);
+                return fail_sticky(
+                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                    std::string(name) + ": requested " +
+                        std::to_string(smem_optin) + " B: CUresult=" +
+                        std::to_string(static_cast<int>(cr)) + " (" +
+                        cu_err(cr) + ")");
+            }
         }
     }
     arms.smem_max = smem_optin > 49152 ? smem_optin : 49152;
