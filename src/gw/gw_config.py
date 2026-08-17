@@ -1500,6 +1500,15 @@ _DEFAULTS = {
     # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
     "occ_smearing_family": None,
     "occ_smearing_width_ry": None,
+    # Far-tail clamp on the MP1 occupation table, applied AT EVALUATION
+    # (inside the fixed-N root), so mu is solved for the clamped table and
+    # the fixed-N invariant is asserted against what consumers receive.
+    # |f| < tol -> 0, |1-f| < tol -> 1.  Nothing near the Fermi surface is
+    # touched: gw.efermi.occupation_clamp_tol caps this 35x below MP1's
+    # overshoot extremum 0.0354579, which is configured quadrature.  0.0
+    # disables it bit-for-bit.  Insulating decks are unaffected by
+    # construction (their table is already exactly 0/1).
+    "occupation_clamp_tol": 1e-8,
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
     # as an alias for ``qp_solver = one_shot_dft`` — which is now the
@@ -2638,6 +2647,15 @@ class LorraxConfig:
     #: :attr:`occ_broadening_ry`.
     occ_smearing_family: str | None
     occ_smearing_width_ry: float | None
+    #: ``occupation_clamp_tol``: the distance from 0 or 1 within which an
+    #: MP1 occupation is snapped to EXACTLY 0 or 1, applied at the point
+    #: the occupations are evaluated and therefore inside the fixed-N root
+    #: (``gw.efermi.clamp_occupation_tail``).  Distinct from
+    #: ``occupation_window_threshold``, which decides band membership of a
+    #: Green's-function branch and is not replaced by this.  Validated at
+    #: its consumer (``gw.efermi.occupation_clamp_tol``), the same shape
+    #: ``occupation_window_threshold`` uses.
+    occupation_clamp_tol: float
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
@@ -3445,6 +3463,7 @@ class LorraxConfig:
             hartree_source=_hartree_source,
             occ_smearing_family=_occ_family,
             occ_smearing_width_ry=_occ_width,
+            occupation_clamp_tol=float(_g("occupation_clamp_tol")),
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),

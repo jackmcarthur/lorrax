@@ -55,6 +55,15 @@ relativistic spinor WFN and 2 for a spin-restricted scalar WFN.  Their
 ``broadening_ry`` follows BerkeleyGW ``occ_broadening``: the MP1
 argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
 ``broadening_ry=degauss/2``.
+
+TWO OCCUPANCY RULES LIVE HERE AND THEY ARE NOT THE SAME RULE.
+``occupation_window_threshold`` (:func:`band_in_occupation_window`) decides
+which bands are worth putting in a Green's-function branch — a per-consumer
+band-set question.  ``occupation_clamp_tol``
+(:func:`clamp_occupation_tail`) decides whether a meaningless value exists
+in the table at all, and it is applied once, at evaluation, so every
+consumer sees the same support.  Neither subsumes the other and neither
+should be collapsed into the other.
 """
 
 from __future__ import annotations
@@ -69,11 +78,14 @@ import jax.numpy as jnp
 
 
 __all__ = [
+    "OCCUPATION_CLAMP_TOL_DEFAULT",
+    "OCCUPATION_CLAMP_TOL_MAX",
     "OCCUPATION_WINDOW_THRESHOLD_DEFAULT",
+    "MP1_LOBE_EXTREMUM",
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
-    "band_in_occupation_window", "fermi_level_step",
+    "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "mp1_negative_derivative", "mp1_occupations",
-    "occupation_weight_floor",
+    "occupation_clamp_tol", "occupation_weight_floor",
     "occupied_band_count", "solve_mp1_occupations", "step_occupations",
 ]
 
@@ -149,6 +161,112 @@ def band_in_occupation_window(weight, weight_floor):
     """
     return abs(weight) > weight_floor
 
+
+# ---------------------------------------------------------------------------
+#  The far-tail clamp.  ADDITIVE TO, NOT A REPLACEMENT FOR, the threshold
+#  above: they answer different questions.  ``occupation_window_threshold``
+#  decides which bands are worth putting in a Green's-function branch;
+#  the clamp decides whether a meaningless value exists in the table at all.
+# ---------------------------------------------------------------------------
+
+#: MP1's extremum outside [0, 1], reached at ``x = sqrt(3/2) = 1.224745``:
+#: ``f = -0.0354579065701`` below mu's mirror point and ``1.0354579065701``
+#: above it.  Closed form, not a measurement — ``f'(x) = 0`` for
+#: ``f(x) = erfc(x)/2 - x*exp(-x^2)/(2*sqrt(pi))`` is ``2x^2 = 3``.  This
+#: number is the ONLY thing standing between the clamp and the overshoot,
+#: so it is a named constant and :func:`occupation_clamp_tol` refuses
+#: anything that could approach it.
+MP1_LOBE_EXTREMUM = 0.0354579065701095
+
+#: Hard ceiling on the clamp tolerance: 35x below :data:`MP1_LOBE_EXTREMUM`.
+#: A tolerance at or above the extremum would flatten the whole negative
+#: lobe to zero, i.e. delete part of the configured quadrature.  Refusing
+#: at 1e-3 makes that unreachable BY CONSTRUCTION rather than by the
+#: default happening to be small.
+OCCUPATION_CLAMP_TOL_MAX = 1e-3
+
+#: Deck default for ``occupation_clamp_tol``.  Puts the MP1 table's own
+#: support at ``|x| < 4.30834``, i.e. ``|E - mu| < 8.6167 * W`` — 1.17 eV at
+#: ``W = 0.01 Ry``.  The unclamped table's support edge sits instead at
+#: ``x = 27.2971``, which is ``sqrt(-ln(smallest float64 subnormal)) =
+#: 27.2844`` to four figures: the radius at which ``exp(-x^2)`` stops being
+#: REPRESENTABLE, not any physical scale.  That is 54.59 * W = 7.43 eV at
+#: ``W = 0.01 Ry``, 5.4x room-temperature kT.
+OCCUPATION_CLAMP_TOL_DEFAULT = 1e-8
+
+
+def occupation_clamp_tol(value) -> float:
+    """Validate the far-tail clamp tolerance and return it as a float.
+
+    ``0.0`` disables the clamp exactly — ``abs(f) < 0.0`` is false for every
+    finite ``f`` — which is the A/B control and the bit-for-bit escape hatch,
+    the same role ``occupation_window_threshold = 1.0`` plays for the
+    threshold.  The upper bound is :data:`OCCUPATION_CLAMP_TOL_MAX`; see
+    :func:`clamp_occupation_tail` for why it is where it is.
+    """
+    t = float(value)
+    if not (np.isfinite(t) and 0.0 <= t <= OCCUPATION_CLAMP_TOL_MAX):
+        raise ValueError(
+            "occupation_clamp_tol must be in [0.0, "
+            f"{OCCUPATION_CLAMP_TOL_MAX!r}]; got {value!r}.  It is the "
+            "distance from 0 or 1 within which an MP1 occupation is snapped "
+            "to exactly 0 or 1.  The ceiling is 35x below MP1's overshoot "
+            f"extremum {MP1_LOBE_EXTREMUM!r}, which is part of the "
+            "configured quadrature and must never be clamped away; 0.0 "
+            "disables the clamp bit-for-bit.")
+    return t
+
+
+def clamp_occupation_tail(f, clamp_tol):
+    """Snap the FAR TAIL of an occupation table to exact 0 / 1.
+
+    ``abs(f) < tol -> 0.0`` and ``abs(1 - f) < tol -> 1.0``.  Nothing else
+    moves, and nothing moves by more than ``tol``.
+
+    WHY THE TABLE AND NOT EACH CONSUMER.  Left unclamped, an MP1 table's
+    support is set by where ``exp(-x^2)`` underflows — ``x = 27.2971``,
+    which is ``sqrt(-ln(5e-324))`` to four figures.  That is a float64
+    property, not a physical one: it puts nonzero weight on states 54.59
+    smearing widths from mu (7.43 eV at ``W = 0.01 Ry``) and it moves if a
+    backend flushes subnormals.  Fixing the table once makes every
+    downstream support backend-independent, instead of leaving each
+    consumer to defend against underflow separately.  At the default
+    ``tol = 1e-8`` the support becomes ``|x| < 4.30834``, i.e.
+    ``|E - mu| < 8.6167 * W``.
+
+    IT CANNOT REACH THE OVERSHOOT, BY CONSTRUCTION.  ``f_kn`` is never
+    clipped: MP1 overshoots [0, 1] near the Fermi surface and that
+    overshoot is part of the configured quadrature (measured -0.0316 to
+    1.0022 on the Na bcc SOC deck; closed-form extremum
+    :data:`MP1_LOBE_EXTREMUM` = 0.03546 at ``x = sqrt(3/2)``).  This is a
+    clamp on the VALUE's distance from 0 or 1, and
+    :func:`occupation_clamp_tol` caps that distance at 1e-3 — 35x below the
+    extremum — so no admissible tolerance can move a value by enough to
+    reach it.  The largest change this function can make to any element is
+    ``tol``; the smallest change that would damage the overshoot is
+    ``MP1_LOBE_EXTREMUM``.  The one place the clamp does fire inside the
+    lobe is the isolated zero crossing at ``x = 0.841882``, where ``f``
+    passes through 0 and is already within ``tol`` of it over a window
+    ``4.5e-8`` wide in ``x``; setting a value of 1e-9 to 0 there is the
+    intent, not a violation of it.
+
+    NOT APPLIED TO ``-df/dE``.  :func:`mp1_negative_derivative` is a
+    different quantity with different consumers (the Fermi-surface weight),
+    and this key says nothing about it.  Deliberate, not an oversight.
+
+    ON AN INSULATING TABLE THIS IS A NO-OP BY CONSTRUCTION: every entry is
+    already exactly 0.0 or 1.0, so both ``where`` predicates select the
+    identity branch at every element.
+
+    Traced-safe: pure ``jnp`` on float64, no host readback, so it composes
+    inside the fixed-N root as well as after it.
+    """
+    f = jnp.asarray(f, dtype=jnp.float64)
+    tol = jnp.asarray(clamp_tol, dtype=jnp.float64)
+    f = jnp.where(jnp.abs(f) < tol, 0.0, f)
+    return jnp.where(jnp.abs(1.0 - f) < tol, 1.0, f)
+
+
 # Tolerance for "the cumulative occupancy lands exactly on the target",
 # i.e. the gapped case.  Scaled by the target so it is relative.
 _EXACT_FILL_RTOL = 1e-9
@@ -160,14 +278,24 @@ _MP1_BRACKET_WIDTHS = 16.0
 _MP1_BISECTION_STEPS = 64
 
 
-def _mp1_values(E, chemical_potential, broadening):
-    """BerkeleyGW v4 MP1 formula on float64 JAX operands."""
+def _mp1_values(E, chemical_potential, broadening, clamp_tol):
+    """BerkeleyGW v4 MP1 formula on float64 JAX operands, tail-clamped.
+
+    THE CLAMP IS APPLIED HERE, AT THE POINT OF EVALUATION, and therefore
+    inside the fixed-N root as well: ``_solve_mp1_kernel``'s ``count(mu)``
+    calls this function, so the mu it finds is the one that makes the
+    CLAMPED table hit the electron target.  Clamping the table after the
+    root instead would round the tail and then fail
+    :func:`assert_fixed_n` — the invariant would be asserted against a
+    table nobody solved for.  See :func:`clamp_occupation_tail`.
+    """
     x = (E - chemical_potential) / (2.0 * broadening)
     gaussian = jnp.exp(-jnp.square(x))
     # For an absurdly small width, avoid leaking the limiting inf*0 as NaN.
     correction = jnp.where(jnp.isfinite(x), x * gaussian, 0.0)
-    return (0.5 * (1.0 - jax.lax.erf(x))
-            - correction / (2.0 * jnp.sqrt(jnp.pi)))
+    return clamp_occupation_tail(
+        0.5 * (1.0 - jax.lax.erf(x)) - correction / (2.0 * jnp.sqrt(jnp.pi)),
+        clamp_tol)
 
 
 def _mp1_negative_derivative_values(E, chemical_potential, broadening):
@@ -179,17 +307,28 @@ def _mp1_negative_derivative_values(E, chemical_potential, broadening):
 
 
 @jax.jit
-def mp1_occupations(E_kn, chemical_potential, broadening_ry) -> jax.Array:
+def _mp1_occupations_kernel(E_kn, chemical_potential, broadening_ry,
+                            clamp_tol) -> jax.Array:
+    return _mp1_values(
+        jnp.asarray(E_kn, dtype=jnp.float64),
+        jnp.asarray(chemical_potential, dtype=jnp.float64),
+        jnp.asarray(broadening_ry, dtype=jnp.float64),
+        jnp.asarray(clamp_tol, dtype=jnp.float64))
+
+
+def mp1_occupations(E_kn, chemical_potential, broadening_ry,
+                    clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT) -> jax.Array:
     """First-order MP occupations with BerkeleyGW width semantics.
 
     ``broadening_ry`` is ``occ_broadening`` converted to Ry; the
     argument is ``(E-mu)/(2*broadening_ry)``.  MP1's small overshoot beyond
-    [0, 1] is deliberately retained.
+    [0, 1] is deliberately retained; only the FAR TAIL is snapped to exact
+    0/1, at ``clamp_tol`` (:func:`clamp_occupation_tail`).  Pass
+    ``clamp_tol=0.0`` for the unclamped table.
     """
-    return _mp1_values(
-        jnp.asarray(E_kn, dtype=jnp.float64),
-        jnp.asarray(chemical_potential, dtype=jnp.float64),
-        jnp.asarray(broadening_ry, dtype=jnp.float64))
+    return _mp1_occupations_kernel(
+        E_kn, chemical_potential, broadening_ry,
+        occupation_clamp_tol(clamp_tol))
 
 
 @jax.jit
@@ -209,19 +348,24 @@ def mp1_negative_derivative(
 
 
 @jax.jit
-def _solve_mp1_kernel(E, w, target, broadening, capacity):
-    """Pure fixed-shape device root plus final occupations."""
+def _solve_mp1_kernel(E, w, target, broadening, capacity, clamp_tol):
+    """Pure fixed-shape device root plus final occupations.
+
+    ONE ``_mp1_values`` FOR BOTH THE COUNT AND THE TABLE, so the clamp is
+    inside the root: mu is chosen to make the clamped table hit ``target``.
+    """
     E = jnp.asarray(E, dtype=jnp.float64)
     w = jnp.asarray(w, dtype=jnp.float64)
     target = jnp.asarray(target, dtype=jnp.float64)
     broadening = jnp.asarray(broadening, dtype=jnp.float64)
     capacity = jnp.asarray(capacity, dtype=jnp.float64)
+    clamp_tol = jnp.asarray(clamp_tol, dtype=jnp.float64)
     tail = _MP1_BRACKET_WIDTHS * broadening
     bracket0 = (jnp.min(E) - tail, jnp.max(E) + tail)
 
     def count(mu):
         return capacity * jnp.einsum(
-            "k,kn->", w, _mp1_values(E, mu, broadening))
+            "k,kn->", w, _mp1_values(E, mu, broadening, clamp_tol))
 
     def bisect(_iteration, bracket):
         lo, hi = bracket
@@ -234,12 +378,13 @@ def _solve_mp1_kernel(E, w, target, broadening, capacity):
     lo, hi = jax.lax.fori_loop(
         0, _MP1_BISECTION_STEPS, bisect, bracket0)
     mu = 0.5 * (lo + hi)
-    return mu, _mp1_values(E, mu, broadening)
+    return mu, _mp1_values(E, mu, broadening, clamp_tol)
 
 
 def solve_mp1_occupations(
     E_kn, kweights, n_electrons: float, broadening_ry: float, *,
     state_capacity: float,
+    clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[jax.Array, jax.Array]:
     """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
 
@@ -248,6 +393,10 @@ def solve_mp1_occupations(
     star multiplicities on an IBZ).  A fully relativistic state has
     ``state_capacity=1``; a restricted scalar state has 2.  Use the
     canonical ``spin_degeneracy_factor(wfn)``.
+
+    ``clamp_tol`` snaps the far tail to exact 0/1 INSIDE the root, so the
+    returned ``(mu, f_kn)`` pair satisfies the fixed-electron constraint on
+    the clamped table (:func:`clamp_occupation_tail`).  ``0.0`` disables it.
 
     Validation is host-only and reads no eigenvalues.  Root and occupations
     are one fixed-iteration JAX kernel with no Python loop or scalar readback.
@@ -279,7 +428,8 @@ def solve_mp1_occupations(
         raise ValueError(
             f"solve_mp1_occupations: n_electrons={target!r} outside (0, {maximum})")
 
-    return _solve_mp1_kernel(E_kn, w, target, broadening, capacity)
+    return _solve_mp1_kernel(E_kn, w, target, broadening, capacity,
+                             occupation_clamp_tol(clamp_tol))
 
 
 @jax.jit
@@ -486,7 +636,12 @@ class OccupationState:
     table it was not computed from.
 
     ``f_kn`` is NEVER clipped — MP1's overshoot beyond [0, 1] is part of the
-    configured quadrature (see :func:`mp1_occupations`).
+    configured quadrature (see :func:`mp1_occupations`).  The far tail IS
+    snapped to exact 0/1 (:func:`clamp_occupation_tail`), which is a
+    different operation on a disjoint part of the table: the clamp happens
+    inside :func:`solve_mp1_occupations`'s root, BEFORE this object exists,
+    so ``occ_hash`` and the fixed-N assertion both describe the clamped
+    table and no consumer sees a value the solver did not solve for.
     """
 
     f_kn: jax.Array          # (nk, nb), float64, never clipped
@@ -526,17 +681,23 @@ class OccupationState:
 
     @classmethod
     def solve_mp1(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
-                  state_capacity: float) -> "OccupationState":
+                  state_capacity: float,
+                  clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
+                  ) -> "OccupationState":
         """Fixed-N MP1 state via :func:`solve_mp1_occupations` (one solver).
 
         ``state_capacity`` follows the module convention (1 for a fully
         relativistic spinor state, 2 for a restricted scalar one).  The
         frozen interface sketch omitted it; without it the fixed-N invariant
         is wrong by a factor of 2 on scalar decks.
+
+        ``clamp_tol`` is applied inside the root, so ``assert_fixed_n``
+        below tests the table this object actually carries.
         """
         mu, f = solve_mp1_occupations(
             E_kn, kweights, float(n_electrons), float(width_ry),
-            state_capacity=float(state_capacity))
+            state_capacity=float(state_capacity),
+            clamp_tol=float(clamp_tol))
         state = cls(f_kn=f, mu_ry=float(mu), smearing_family="mp1",
                     smearing_width_ry=float(width_ry),
                     n_electrons=float(n_electrons))
