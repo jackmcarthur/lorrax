@@ -517,6 +517,13 @@ def _merge_zero_mode(M, V, M_total, V_total, m_closure, v_closure, order):
     )
 
 
+def _has_plateaued(value, previous):
+    """True when doubling the quadrature order stopped moving a closure."""
+    return (previous is not None
+            and abs(value - previous)
+            <= _V_PLATEAU_REL_TOL * max(value, previous))
+
+
 def _cluster_moment_matrices(
         pair_block, W0bar, intervals, *, moment_rel_tol=MOMENT_REL_TOL):
     """Contour M/V/T1/T2 with mandatory movement and sum-rule refusals.
@@ -562,6 +569,8 @@ def _cluster_moment_matrices(
     M_total, V_total = _exact_moment_totals(pair_block, W0bar)
     previous = None
     previous_v_closure = None
+    previous_m_closure = None
+    current = None
     movement = np.inf
     m_closure = np.inf
     v_closure = np.inf
@@ -615,18 +624,19 @@ def _cluster_moment_matrices(
         # stays a convergence criterion until it *plateaus*: only a
         # refinement-invariant D_V is admitted as zero-mode weight, and a
         # shrinking one keeps refining to the order-512 refusal.
-        plateaued = (
-            previous_v_closure is not None
-            and abs(v_closure - previous_v_closure)
-            <= _V_PLATEAU_REL_TOL * max(v_closure, previous_v_closure)
+        v_plateaued = _has_plateaued(v_closure, previous_v_closure)
+        m_plateaued = _has_plateaued(m_closure, previous_m_closure)
+        # Both closures stay convergence criteria until they *plateau*.  A
+        # refinement-invariant deficiency is a spectral-domain fact (claim
+        # 0319: D_V = 3.277321e-3 at orders 16 and 32); a shrinking one is
+        # quadrature error and must keep refining.  Adjudicating an open M
+        # closure the moment it stops improving buys the dichotomy's own
+        # message instead of a generic order-512 failure.
+        settled = (
+            (m_closure <= SUM_RULE_REL_TOL
+             and (v_closure <= SUM_RULE_REL_TOL or v_plateaued))
+            or (m_closure > SUM_RULE_REL_TOL and m_plateaued)
         )
-        # Once the quadrature has converged, what is left is the spectral
-        # domain, not the rule.  Adjudicate the dichotomy here: an open M
-        # closure refuses by name now rather than burning six more orders
-        # into a message that never says why.
-        settled = (m_closure > SUM_RULE_REL_TOL
-                   or v_closure <= SUM_RULE_REL_TOL
-                   or plateaued)
         if movement <= float(moment_rel_tol) and settled:
             merged, closure = _merge_zero_mode(
                 current[0], current[1], M_total, V_total,
@@ -634,6 +644,13 @@ def _cluster_moment_matrices(
             return (current[0], merged, current[2], current[3], closure)
         previous = current
         previous_v_closure = v_closure
+        previous_m_closure = m_closure
+    if m_closure > SUM_RULE_REL_TOL:
+        # Orders exhausted with the spectral domain still incomplete: name
+        # the dichotomy rather than the loop that ran out.
+        _merge_zero_mode(
+            current[0], current[1], M_total, V_total,
+            m_closure, v_closure, _QUADRATURE_ORDERS[-1])
     raise ValueError(
         "GATE intraband_contour_sum_rule: quadrature failed mandatory "
         f"closure at order {_QUADRATURE_ORDERS[-1]}: "

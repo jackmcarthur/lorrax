@@ -285,7 +285,8 @@ def test_static_deficiency_is_merged_not_refused(monkeypatch):
     assert IB._relative_error(jnp.sum(M, axis=0), M_total) <= 1.0e-12
 
 
-def _screening_channel_fixture(k=0.25, eps=1.0e-9, n_pair=18):
+def _screening_channel_fixture(k=0.25, eps=1.0e-9, n_pair=18,
+                               signed_bulk=True):
     """A perfectly-screened relaxational channel beside a signed continuum.
 
     One crossing pair carries a machine-small transition energy with an MP1
@@ -306,7 +307,8 @@ def _screening_channel_fixture(k=0.25, eps=1.0e-9, n_pair=18):
                 + 1j * rng.normal(size=(n_pair, n_mu))) / 3.0
     u = np.linspace(0.04, 0.19, n_pair)
     w = np.linspace(2.0e-4, 1.1e-3, n_pair)
-    w[::2] *= -4.0
+    if signed_bulk:
+        w[::2] *= -4.0
     u = np.concatenate(([eps], u))
     w = np.concatenate(([k * eps * eps], w))
     vertices = np.vstack([0.7 * vertices[0:1], vertices])
@@ -319,33 +321,27 @@ def _screening_channel_fixture(k=0.25, eps=1.0e-9, n_pair=18):
     return mesh, W0, vertices, u, w, block
 
 
-def test_all_positive_bulk_zero_channel_refuses_on_the_open_m_closure():
-    """The other arm of the same construction, on the same fixture family.
+def test_a_transient_open_m_closure_keeps_refining_before_it_adjudicates():
+    """The dichotomy is read only where the quadrature has stopped moving.
 
-    With an all-positive bulk the derived strip's largest-gap tiling does not
-    enclose every finite mode, so ``D_M`` opens.  The dichotomy must resolve
-    to the refusal even though ``D_V`` is large -- large static deficiency is
-    never on its own a licence to merge.
+    On an all-positive bulk with one screened channel the asymptotic closure
+    is 9.3e-5 at order 16 and 3.3e-8 at order 32 -- open, but still falling by
+    three orders per doubling.  Refusing there would call ordinary quadrature
+    error a missed finite mode.  The plateau rule keeps refining to order 64,
+    where M closes at 1e-14 and the genuine static deficiency merges.
     """
-    mesh, W0, vertices, u, w, _block = _screening_channel_fixture(n_pair=9)
-    w = w.copy()
-    w[1::2] = np.abs(w[1::2])
-    w[2::2] = np.abs(w[2::2])
-    w[0] = -abs(w[0])
-    block = (
-        _put(mesh, u, P(None)),
-        _put(mesh, w, P(None)),
-        (_put(mesh, vertices, P(None, "x")),
-         _put(mesh, vertices, P(None, "y"))),
-    )
+    mesh, W0, _vertices, _u, _w, block = _screening_channel_fixture(
+        k=-0.25, n_pair=9, signed_bulk=False)
     W0j = _put(mesh, W0, P("x", "y"))
-    with pytest.raises(ValueError) as excinfo:
-        IB._cluster_moment_matrices(
-            block, W0j, IB._initial_intervals(block, W0j))
-    message = str(excinfo.value)
-    assert "intraband_contour_sum_rule" in message
-    assert "masquerade" in message
-    assert "NOT merged" in message
+    M, V, _T1, _T2, closure = IB._cluster_moment_matrices(
+        block, W0j, IB._initial_intervals(block, W0j))
+    assert closure.quadrature_order >= 64
+    assert closure.m_closure <= IB.SUM_RULE_REL_TOL
+    assert closure.zero_mode_weight > 1.0e-2
+    assert closure.v_closure_after_merge <= IB.SUM_RULE_REL_TOL
+    M_total, V_total = IB._exact_moment_totals(block, W0j)
+    assert IB._relative_error(jnp.sum(V, axis=0), V_total) <= 1.0e-12
+    assert IB._relative_error(jnp.sum(M, axis=0), M_total) <= 1.0e-12
 
 
 def test_perfect_screening_channel_merges_and_anchors_z0_exactly():
@@ -360,13 +356,14 @@ def test_perfect_screening_channel_merges_and_anchors_z0_exactly():
     _lo, zero_gap, _hi, _height = IB._contour_geometry(block, W0j)
     inside = np.abs(lam) < zero_gap
     assert int(inside.sum()) == 1
-    V_dense = (C / lam[:, None, None]).sum(axis=0)
-    dV_dense = (C[inside] / lam[inside, None, None]).sum(axis=0)
     dM_dense = -C[inside].sum(axis=0)
+    # What the dense oracle CAN say: the excluded mode carries no asymptotic
+    # weight.  What it cannot say is how much static weight it carries -- a
+    # `lambda ~ 1e-18` eigenvalue of a matrix of norm 1e-2 is below the dense
+    # eigensolver's resolution by twelve orders, which is precisely why the
+    # ruling prices `V0` by the sum rule and not by a measurement.
     assert (np.linalg.norm(dM_dense) / np.linalg.norm(C.sum(axis=0))
             <= 1.0e-12)
-    dense_weight = np.linalg.norm(dV_dense) / np.linalg.norm(V_dense)
-    assert dense_weight > 1.0e-3
 
     # The contour construction, at the fixed initial tiling: the sum rule
     # prices exactly the weight the dense oracle localizes, and both closures
@@ -374,7 +371,7 @@ def test_perfect_screening_channel_merges_and_anchors_z0_exactly():
     intervals = IB._initial_intervals(block, W0j)
     M, V, T1, T2, closure = IB._cluster_moment_matrices(block, W0j, intervals)
     M_total, V_total = IB._exact_moment_totals(block, W0j)
-    assert closure.zero_mode_weight == pytest.approx(dense_weight, rel=1.0e-4)
+    assert closure.zero_mode_weight > 1.0e-2
     assert closure.zero_mode_cluster >= 0
     assert closure.zero_mode_pole_shift > 0.0
     assert closure.m_closure <= IB.SUM_RULE_REL_TOL
@@ -390,7 +387,7 @@ def test_perfect_screening_channel_merges_and_anchors_z0_exactly():
     got = np.asarray(IB.evaluate_pole_sum(Om, Bp, 0.0j))
     exact = _direct(W0, vertices, u, w, 0.0)
     assert (np.linalg.norm(got - exact) / np.linalg.norm(exact)) <= 1.0e-12
-    # ... and the dense modal sum is that same static limit, so "matching the
-    # dense lambda -> 0 limit at z = 0" is one identity, not two tolerances.
+    # `exact` here IS the dense `lambda -> 0` limit: the direct Dyson solve
+    # at z=0 sums every mode's `C_m/lambda_m`, the excluded one included.
     np.testing.assert_allclose(
-        np.asarray(V_dense), exact, rtol=1.0e-10, atol=1.0e-12)
+        got, np.asarray(V_total), rtol=1.0e-10, atol=1.0e-12)

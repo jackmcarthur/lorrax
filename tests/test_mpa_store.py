@@ -1013,6 +1013,30 @@ def test_v2_fit_prefix_and_intraband_suffix_have_independent_ledgers(
         assert int(f.attrs["mpa_intra_folded_modes"]) == 1
 
 
+def test_intraband_row_scalars_land_as_one_per_q_attribute_vector(
+        tmpdir_path):
+    """WP3-A2 provenance: the zero-mode weight is recorded per q row."""
+    n_q = 3
+    MS.allocate_fit_store(
+        tmpdir_path, n_q=n_q, n_mu=2, n_p=2, n_p_fit=1,
+        intraband_model="intraband_eigenmode_v1", energy_unit="Ry")
+    for q in range(n_q):
+        Om, Bp, diag = _fit_block(1, 2, 2, seed=131 + q)
+        MS.write_fit_block(tmpdir_path, q, [0, 1], Om, Bp, diag)
+        MS.write_intraband_row(
+            tmpdir_path, q,
+            np.full((1, 2, 2), 0.05 - 0.001j),
+            np.ones((1, 2, 2), np.complex128),
+            row_scalars={"zero_mode_weight": 1.0e-3 * (q + 1),
+                         "zero_mode_cluster": float(q)})
+    with h5py.File(tmpdir_path, "r") as f:
+        weight = np.asarray(f.attrs["mpa_intra_zero_mode_weight"])
+        cluster = np.asarray(f.attrs["mpa_intra_zero_mode_cluster"])
+    assert weight.shape == cluster.shape == (n_q,)
+    np.testing.assert_allclose(weight, [1.0e-3, 2.0e-3, 3.0e-3])
+    np.testing.assert_allclose(cluster, [0.0, 1.0, 2.0])
+
+
 def test_v2_sigma_refuses_a_failed_gap_observable(tmpdir_path):
     """WP4: certification values are consumed, not decorative attrs."""
     MS.allocate_fit_store(
