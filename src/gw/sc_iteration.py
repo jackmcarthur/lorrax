@@ -75,7 +75,8 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
-from .efermi import OccupationState
+from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
+                     as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
 from .gw_config import ComputeMode
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
@@ -405,7 +406,8 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 w_ibz,
                 float(inputs.wfn.num_electrons),
                 inputs.config.occ_broadening_ry,
-                state_capacity=capacity)
+                state_capacity=capacity,
+                clamp_tol=float(inputs.config.occupation_clamp_tol))
             deviation = assert_wfn_occupation_consistency(
                 check_state, np.asarray(inputs.wfn.occs[0]), w_ibz,
                 state_capacity=capacity,
@@ -483,6 +485,7 @@ def _solve_head_occupations(
         target_electrons,
         width_ry,
         state_capacity=capacity,
+        clamp_tol=float(inputs.config.occupation_clamp_tol),
     )
     occ_kn = jnp.pad(
         occ_logical,
@@ -1054,7 +1057,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
         occ_state = OccupationState.solve_mp1(
             E_qp_ry, kweights, float(inputs.wfn.num_electrons),
             inputs.config.occ_broadening_ry,
-            state_capacity=float(spin_degeneracy_factor(inputs.wfn)))
+            state_capacity=float(spin_degeneracy_factor(inputs.wfn)),
+            clamp_tol=float(inputs.config.occupation_clamp_tol))
         e_f = occ_state.mu_ry
         occ = occ_state.f_kn
         inputs.print_fn(
@@ -2953,7 +2957,8 @@ def run_sc_driver(
             np.full(_e_part.shape[0], 1.0 / _e_part.shape[0]),
             float(wfn.num_electrons),
             float(config.occ_broadening_ry),
-            state_capacity=float(spin_degeneracy_factor(wfn)))
+            state_capacity=float(spin_degeneracy_factor(wfn)),
+            clamp_tol=float(config.occupation_clamp_tol))
         efermi_ev = float(_mu_ry) * RYD_TO_EV
     else:
         efermi_ev = float(wfn.efermi) * RYD_TO_EV
@@ -3081,6 +3086,7 @@ def run_sc_driver(
             output_dir=input_dir,
             qp_rotations_k_storage=config.qp_rotations_k_storage,
             print_fn=print_fn,
+            clamp_tol=float(config.occupation_clamp_tol),
         )
         rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -3163,6 +3169,7 @@ def run_sc_driver(
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
     state_capacity: float | None = None,
+    clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
 
@@ -3230,6 +3237,12 @@ def final_qp_eigenstates(
             float(_st.n_electrons),
             float(_st.smearing_width_ry),
             state_capacity=float(state_capacity),
+            # SAME clamp as the loop's solve, for the same reason
+            # ``state_capacity`` is a kwarg here: ``SCState`` carries the
+            # occupation TABLE, not the solver settings that made it, and
+            # two mu's from two differently-parameterised solves is the
+            # shadow-accounting failure this module exists to avoid.
+            clamp_tol=float(clamp_tol),
         )
         efermi_ry = float(_mu_ry)
     return (
@@ -3340,6 +3353,7 @@ def dump_qp_wfn_artifacts(
     output_dir: str,
     qp_rotations_k_storage: str = "auto",
     print_fn: Callable = print,
+    clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[str, str, float]:
     """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
 
@@ -3423,7 +3437,8 @@ def dump_qp_wfn_artifacts(
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
         state, n_occ=n_occ, mesh_xy=mesh_xy,
-        state_capacity=float(spin_degeneracy_factor(wfn)))
+        state_capacity=float(spin_degeneracy_factor(wfn)),
+        clamp_tol=float(clamp_tol))
     enk_full_ry, U_full = _loop_arrays_on_full_bz(
         (enk_loop_ry, U_loop), kstar=kstar, state_on_ibz=state_on_ibz)
     # Full BZ → file wedge, by name.  One reduction, two arrays; the k
