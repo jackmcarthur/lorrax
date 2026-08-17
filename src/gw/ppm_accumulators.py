@@ -37,6 +37,36 @@ def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
             * xp.exp(-1j * (e_ref - sign * omega) * t))
 
 
+def _coeff_times_x(np_, coeff, X):
+    """``coeff[ω] · X``, with or without a LEADING BAND-BRACKET AXIS on X.
+
+    ``X`` is ``(nk, i, j)`` when the caller planned no brackets and
+    ``(n_bracket, nk, i, j)`` when it planned some.  Both are live contracts
+    and this helper is the one place that knows the difference:
+
+    * ``ppm_tau_kernel._NO_BRACKETS`` states it outright — "the band-bracket
+      plan a caller gets when it asks for none: ONE bracket over every band,
+      and NO leading bracket axis on the output".  The MPA / shared-multipole
+      shape and every direct consumer of this function (notably
+      ``tests/test_ppm_crossing_completion.py``, which exercises the crossing
+      completion on a bare window) are un-bracketed.
+    * The band-extrapolation path plans three brackets and ships the 4-D form.
+
+    THE BRACKET AXIS IS NOT FUSED WITH ANYTHING.  It stays a leading INDEX;
+    ω is inserted after it, and the (i, j) band axes are untouched.  That is
+    the same separability rule the bracket loop in ``ppm_tau_kernel`` keeps —
+    the partition is an index operation on the band axis and never mixes with
+    an elementwise factor along it.
+    """
+    if X.ndim == 4:                     # (n_bracket, nk, i, j)
+        return coeff.reshape(1, -1, 1, 1, 1) * X[:, None, ...]
+    if X.ndim == 3:                     # (nk, i, j) -- no bracket axis
+        return coeff.reshape(-1, 1, 1, 1) * X[None, ...]
+    raise ValueError(
+        f"_project_tau_onto_omega_np: sigma tile must be (nk, i, j) or "
+        f"(n_bracket, nk, i, j); got shape {tuple(X.shape)}")
+
+
 def _project_tau_onto_omega_np(
     sigma_re: np.ndarray, sigma_im: np.ndarray | None, omega_vec: np.ndarray,
     t_node: complex, alpha_eff: complex, omega_sign: float, pref: float,
@@ -119,7 +149,7 @@ def _project_tau_onto_omega_np(
                 "consumer (project_code=1) — the crossing window needs the "
                 "(S_R, S_I) pair and must dispatch the two-channel kernel "
                 "(ppm_sigma window dispatch bug).")
-        contrib = coeff.reshape(1, -1, 1, 1, 1) * sigma_re[:, None, ...]
+        contrib = _coeff_times_x(np, coeff, sigma_re)
         return np.asarray(contrib, dtype=np.complex128)
     # Two-channel (S_R, S_I) pair: crossing windows only.  The Laplace
     # recombine branch (pair at code=0) died when the merge became the
@@ -144,7 +174,7 @@ def _project_tau_onto_omega_np(
     # operator: it couples element (i, j) to element (j, i), which the
     # (m_X, n_Y)-sharded per-shard tiles here cannot see.
     X = sigma_re + 1j * sigma_im
-    contrib = coeff.reshape(1, -1, 1, 1, 1) * X[:, None, ...]
+    contrib = _coeff_times_x(np, coeff, X)
     return np.asarray(contrib, dtype=np.complex128)
 
 
