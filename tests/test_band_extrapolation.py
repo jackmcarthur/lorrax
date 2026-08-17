@@ -208,7 +208,7 @@ def _si_like_spectrum():
 
 def test_snapped_cuts_are_clean_against_the_actual_eigenvalues():
     e = _si_like_spectrum()
-    gaps = boundary_min_gaps(e)
+    gaps = boundary_min_gaps(e, is_full_spectrum=True)  # fixture IS the whole spectrum
     clean = {b for b in range(1, e.shape[1]) if gaps[b] > DEGENERACY_TOL_RY}
     split = {b for b in range(1, e.shape[1])} - clean
     assert split, "the fixture must contain SPLIT boundaries to be a test"
@@ -228,7 +228,7 @@ def test_plan_cuts_are_clean_and_cover_every_band():
     nb = e.shape[1]
     plan = plan_band_brackets(
         enabled=True, enk_ry=e, n_occ=2, nb_logical=nb, nb_padded=nb)
-    gaps = boundary_min_gaps(e)
+    gaps = boundary_min_gaps(e, is_full_spectrum=True)  # fixture IS the whole spectrum
     for c in plan.counts[:-1]:
         assert gaps[c] > DEGENERACY_TOL_RY, f"cut {c} splits a multiplet"
     assert not plan.notes, "a clean boundary was available; nothing to note"

@@ -231,9 +231,13 @@ def snap_cut_to_clean_boundary(
 
     Notes
     -----
-    The outer boundaries (0 and ``nb``) are ``+inf`` in
-    :func:`boundary_min_gaps` and are therefore always clean — the walk
-    terminates.
+    The walk terminates on the ``lo``/``hi`` bounds, which every caller
+    sets strictly inside ``(0, nb)``: this snaps INTERIOR cuts only.  It
+    does NOT rely on the outer boundaries being clean — since b27f98c3
+    they are ``nan`` on a window rather than ``+inf``, and this function
+    asks ``boundary_min_gaps`` for the window reading deliberately.  A
+    caller that widens the range to an outer boundary gets the refusal
+    below rather than a false certification.
     """
     e = np.asarray(enk_ry, dtype=np.float64)
     nb = int(e.shape[1])
@@ -242,7 +246,18 @@ def snap_cut_to_clean_boundary(
     if not (0 <= lo <= hi <= nb):
         raise ValueError(
             f"snap_cut_to_clean_boundary: bad bounds lo={lo} hi={hi} nb={nb}")
-    gaps = boundary_min_gaps(e)
+    # ``is_full_spectrum=False`` -- the CONSERVATIVE branch, and it cannot
+    # change any answer this function gives.  Callers hand it a WINDOW
+    # (``band_extrapolation.plan_band_brackets`` slices
+    # ``enk_ry[:, :nb_logical]``), so ``False`` is the honest label; and
+    # the walk below only ever considers candidates in ``[lo, hi]``, which
+    # every caller sets strictly inside ``(0, nb)`` because this function
+    # snaps INTERIOR cuts only.  ``gaps[0]`` and ``gaps[nb]`` -- the two
+    # elements the flag changes -- are therefore never read.  ``False``
+    # additionally means that if a future caller DID widen the range, a
+    # window edge would come back ``nan`` and be refused rather than
+    # certified, which is the failure b27f98c3 exists to prevent.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
     tol = float(tol_ry)
     cut = int(min(max(int(cut), lo), hi))
     for delta in range(0, max(cut - lo, hi - cut) + 1):

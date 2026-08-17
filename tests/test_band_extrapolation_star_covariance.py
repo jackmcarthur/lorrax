@@ -96,7 +96,9 @@ def test_interior_cuts_are_degeneracy_clean_or_say_so(nband):
         assert "clean boundary" in str(e) or "degenerate" in str(e).lower(), (
             f"planner raised, but not about degeneracy: {e}")
         return
-    gaps = bd.boundary_min_gaps(enk)
+    # the deck's untruncated ladder, not a window -- the plan's interior
+    # cuts are checked against it
+    gaps = bd.boundary_min_gaps(enk, is_full_spectrum=True)
     notes = " ".join(getattr(plan, "notes", ()) or ())
     interior = [int(c) for c in plan.counts[:-1]]
     for cut in interior:

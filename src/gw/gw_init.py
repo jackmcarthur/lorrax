@@ -1020,7 +1020,13 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 		return
 	enk = np.asarray(energies)[0]
 	nb = int(enk.shape[1])
-	gaps = _bd.boundary_min_gaps(enk)
+	# ``enk`` is ``wfn.energies``, the UNTRUNCATED mean-field ladder -- not
+	# the Sigma window.  That is exactly the pattern b27f98c3's docstring
+	# prescribes ("pass the untruncated ladder and the window bounds"):
+	# the edges checked below (b4_chi, b4_sigma) are WINDOW bounds, and the
+	# only array that can say whether they slice a multiplet is the full
+	# ladder.  Same array and same answer as gw_init.py's other call site.
+	gaps = _bd.boundary_min_gaps(enk, is_full_spectrum=True)
 	override = os.environ.get(_BAND_DEGENERACY_ENV, "").strip().lower()
 	if override and override not in _bd.MODES:
 		raise ValueError(
