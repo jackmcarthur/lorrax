@@ -384,6 +384,7 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
     GATE,
     fft_ffi_enabled,
     make_gw_conv_ffi as _make_gw_conv_ffi,
+    make_gw_conv_real_w_ffi as _make_gw_conv_real_w_ffi,
     make_flat_k_fft_ffi as _make_flat_k_fft_ffi,
 )
 
@@ -408,6 +409,20 @@ def make_flat_k_gw_conv(
     """
     return _make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec,
                              norm=norm, mult=mult)
+
+
+def make_flat_k_gw_conv_real_w(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+) -> Callable:
+    """Fused flat-k convolution whose W operand is already in real space."""
+    return _make_gw_conv_real_w_ffi(
+        mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
 
 
 

@@ -106,15 +106,18 @@ from ffi.gate import Gate
 # version shim was the actual defect.
 
 __all__ = [
-    "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE", "FUSED_GATE",
+    "FLAT_K_TARGET", "GW_CONV_TARGET", "GW_CONV_REAL_W_TARGET",
+    "GATE", "FUSED_GATE",
     "fft_ffi_enabled", "fft_ffi_mode",
     "fused_fft_ffi_enabled", "fused_fft_ffi_mode",
     "require_fft_ffi", "make_flat_k_fft_ffi", "make_gw_conv_ffi",
+    "make_gw_conv_real_w_ffi",
     "ffi_fft_scale", "validate_flat_spec",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
 GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
+GW_CONV_REAL_W_TARGET = "lorrax_mklfft_gw_conv_real_w"
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -389,7 +392,48 @@ def make_gw_conv_ffi(
     that constructs this factory has already decided to use the handler, so
     "which flag is set" is not the question being asked here.
     """
-    require_fft_ffi(mesh, GW_CONV_TARGET)
+    return _make_gw_conv_ffi(
+        mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult,
+        target=GW_CONV_TARGET, real_w=False)
+
+
+def make_gw_conv_real_w_ffi(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+) -> Callable:
+    """Fused G convolution with an already inverse-transformed W operand.
+
+    ``fn(G_flat, W_real_flat)`` computes
+    ``fftn(ifftn(G) * W_real * mult)``.  This sibling of
+    :func:`make_gw_conv_ffi` lets a caller with several G tiles transform
+    their common W once while retaining the handler's in-place G/S buffer.
+    The W operand has the same ``(nk,mx,my)`` shape and sharding; only its
+    representation differs.  Both platform handlers mirror the target.
+    """
+    return _make_gw_conv_ffi(
+        mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult,
+        target=GW_CONV_REAL_W_TARGET, real_w=True)
+
+
+def _make_gw_conv_ffi(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None,
+    mult: float,
+    target: str,
+    real_w: bool,
+) -> Callable:
+    """Shared lowering for the reciprocal-W and real-W convolution targets."""
+    require_fft_ffi(mesh, target)
+    w_name = "W_R" if real_w else "W"
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     g_flat = validate_flat_spec(g_spec, "G")
@@ -402,17 +446,17 @@ def make_gw_conv_ffi(
     def _local(g_local, w_local):
         if g_local.ndim != 5 or w_local.ndim != 3:
             raise ValueError(
-                f"gw_conv expects local G (nk, a, mx, b, my) and W "
+                f"gw_conv expects local G (nk, a, mx, b, my) and {w_name} "
                 f"(nk, mx, my); got {g_local.shape} / {w_local.shape}.")
         if (g_local.shape[0] != w_local.shape[0]
                 or g_local.shape[2] != w_local.shape[1]
                 or g_local.shape[4] != w_local.shape[2]):
             raise ValueError(
-                f"gw_conv G/W shard shapes disagree: {g_local.shape} vs "
+                f"gw_conv G/{w_name} shard shapes disagree: {g_local.shape} vs "
                 f"{w_local.shape} (need G[0]==W[0], G[2]==W[1], G[4]==W[2]).")
         out_t = jax.ShapeDtypeStruct(g_local.shape, g_local.dtype)
         return jax.ffi.ffi_call(
-            GW_CONV_TARGET, out_t,
+            target, out_t,
             input_output_aliases={0: 0},  # sigma_k in G_k's buffer when dead
         )(g_local, w_local, **attrs)
 

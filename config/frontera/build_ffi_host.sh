@@ -271,7 +271,7 @@ lrx_slate_init_mpi_host lrx_slate_context_create_host"
     WANT="$WANT ScalapackBatchedSolveLuHostFfi \
 ScalapackBatchedGetrfHostFfi ScalapackBatchedGetrsHostFfi \
 ScalapackEighHostFfi \
-MklFftFlatKHostFfi MklFftGwConvHostFfi"
+MklFftFlatKHostFfi MklFftGwConvHostFfi MklFftGwConvRealWHostFfi"
 fi
 echo "[build_host] --- exported handlers ---"
 # Read the dynamic symbol table ONCE.  `nm -D "$SO" | grep -q ...` inside a

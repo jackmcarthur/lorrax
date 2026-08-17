@@ -8,6 +8,9 @@ registers the SAME XLA target STRINGS as the host MKL-DFTI handlers —
                             MklFftFlatKHostFfi  (ffi_loader.py:142)
     lorrax_mklfft_gw_conv   CufftGwConvCudaFfi  (ffi_loader.py:106)
                             MklFftGwConvHostFfi (ffi_loader.py:143)
+    lorrax_mklfft_gw_conv_real_w
+                            CufftGwConvRealWCudaFfi
+                            MklFftGwConvRealWHostFfi
 
 — so ONE platform-agnostic ``jax.ffi.ffi_call`` per site resolves the right
 handler from the LOWERING platform, exactly the way jaxlib splits its own
@@ -46,19 +49,24 @@ Multi-GPU / sharded meshes are UNMEASURED — every GPU log is
 """
 
 #: The target strings this library registers — identical to the host table.
-CUDA_TARGETS = ("lorrax_mklfft_flat_k", "lorrax_mklfft_gw_conv")
+CUDA_TARGETS = (
+    "lorrax_mklfft_flat_k", "lorrax_mklfft_gw_conv",
+    "lorrax_mklfft_gw_conv_real_w",
+)
 
 #: target → the C++ symbol THIS library exports (host exports different
 #: symbols for the same targets; see ``ffi_loader._CUDA_TARGET_SYMBOLS``).
 CUDA_SYMBOLS = {
     "lorrax_mklfft_flat_k":  "CufftFlatKCudaFfi",
     "lorrax_mklfft_gw_conv": "CufftGwConvCudaFfi",
+    "lorrax_mklfft_gw_conv_real_w": "CufftGwConvRealWCudaFfi",
 }
 
 __all__ = ["CUDA_TARGETS", "CUDA_SYMBOLS"]
 
 _REDIRECT = frozenset({
-    "make_flat_k_fft_ffi", "make_gw_conv_ffi", "require_fft_ffi",
+    "make_flat_k_fft_ffi", "make_gw_conv_ffi", "make_gw_conv_real_w_ffi",
+    "require_fft_ffi",
     "fft_ffi_enabled", "fft_ffi_mode", "fused_fft_ffi_enabled",
     "fused_fft_ffi_mode", "GATE", "FUSED_GATE", "flat_k",
 })

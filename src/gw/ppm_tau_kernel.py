@@ -225,10 +225,9 @@ class SpatialKernel(NamedTuple):
         decomposed chain that is ``ifftn(W)`` — the R-space screened
         interaction — and hoisting it is the one real saving available to a
         caller that contracts SEVERAL G(τ) against the same W(τ) (the band
-        brackets).  On the fused ``gw_conv`` chain it is the IDENTITY,
-        because that entry point's ABI takes W in k-space and performs its
-        transform inside the pinned handler; see the note in
-        :func:`get_sigma_spatial_kernel`.
+        brackets).  On the fused ``gw_conv`` chain it is the identity for one
+        G; for multiple brackets it is ``ifftn(W)`` and the G-dependent tail
+        uses the mirrored real-W handler.
     ``conv_project(psi_xr, psi_yn, G_k, W_prep) -> Sigma``
         The G-dependent remainder: the G transform, the R-space multiply,
         the forward transform and the ψ projection.  Paid ONCE PER G(τ).
@@ -246,6 +245,7 @@ def get_sigma_spatial_kernel(
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
     merged_x: bool = False,
+    shared_w_fused: bool = False,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
@@ -263,21 +263,20 @@ def get_sigma_spatial_kernel(
       * decomposed chain (``LORRAX_FFT_FFI_FUSED=0``) — ``ifftn(W)`` is one
         of the three transforms, so hoisting it across ``n`` G's takes the
         FFT count from ``3n`` to ``2n + 1``;
-      * fused chain (``=1``, the certified production default) — all three
-        transforms are inside ONE ``gw_conv`` FFI call whose signature is
-        ``(G_k, W_k) -> sigma_k``.  ``ifftn(W)`` therefore happens inside the
-        handler and is recomputed per G.  Hoisting it needs a second handler
-        entry that accepts W already in R-space, i.e. a C++/ABI change to
-        ``liblorrax_ffi.so``; that is deliberately NOT done here.  The cost is
-        ``n`` W-transforms instead of one — a third of the FFT chain.
+      * fused chain (``=1``, the certified production default) — one G uses
+        the original ``(G_k, W_k) -> sigma_k`` entry unchanged.  A caller
+        with several G tiles selects its mirrored real-W sibling: ``prep_w``
+        transforms W once, then each G keeps the same in-place fused
+        IFFT(G)·W_R·FFT tail.  This preserves one-G-at-a-time liveness.
     """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
     from common.fft_helpers import (
-        make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
+        make_flat_k_fftn, make_flat_k_gw_conv,
+        make_flat_k_gw_conv_real_w, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x))
+           bool(merged_x), bool(shared_w_fused))
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -291,9 +290,13 @@ def get_sigma_spatial_kernel(
         # with the R-space G tile chunked away inside the handler.  The
         # decomposed helpers below are deliberately NOT built on this route
         # (their announce/probe belongs to LORRAX_FFT_FFI).
-        _gw_conv = make_flat_k_gw_conv(
-            mesh_xy, kgrid, _G_spec, _V_spec,
-            norm='ortho', mult=inv_sqrt_nk)
+        make_conv = (make_flat_k_gw_conv_real_w
+                     if shared_w_fused else make_flat_k_gw_conv)
+        _gw_conv = make_conv(mesh_xy, kgrid, _G_spec, _V_spec,
+                             norm='ortho', mult=inv_sqrt_nk)
+        if shared_w_fused:
+            _V_ifftn = make_flat_k_ifftn(
+                mesh_xy, kgrid, _V_spec, norm='ortho')
     else:
         _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _G_spec, norm='ortho')
         _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
@@ -305,7 +308,7 @@ def get_sigma_spatial_kernel(
     def prep_w(W_q):
         """The W-only half of the chain — see :class:`SpatialKernel`."""
         if use_fused_ffi:
-            return W_q
+            return _V_ifftn(W_q) if shared_w_fused else W_q
         return _V_ifftn(W_q)[:, None, :, None, :]
 
     @partial(jax.jit, donate_argnums=(2,))
@@ -321,10 +324,11 @@ def get_sigma_spatial_kernel(
         return pair
     if use_fused_ffi:
         _conv_j = jax.jit(_gw_conv, donate_argnums=(0,))
+        if shared_w_fused:
+            _V_ifft_j = jax.jit(_V_ifftn, donate_argnums=(0,))
     else:
         _G_ifft_j = jax.jit(_G_ifftn, donate_argnums=(0,))
-        _V_ifft_j = jax.jit(lambda W_q: _V_ifftn(W_q)[:, None, :, None, :],
-                            donate_argnums=(0,))
+        _V_ifft_j = jax.jit(_V_ifftn, donate_argnums=(0,))
         _mult_fft_j = jax.jit(lambda G_R, V_R: _G_fftn(G_R * V_R * inv_sqrt_nk),
                               donate_argnums=(0,))
     _project_j = jax.jit(project, donate_argnums=(1,))
@@ -332,15 +336,15 @@ def get_sigma_spatial_kernel(
     def prep_w_staged(W_q):
         """``sigma.tau.w_prep`` — the ONCE-PER-τ half, timed on its own row.
 
-        On the fused chain this is the identity and the row reads ~0: that
-        is the measurement, not an instrumentation gap.  It is what says
-        whether ``ifftn(W)`` was genuinely hoisted or is being paid inside
-        ``sigma.tau.GW_conv_ffi`` once per bracket.
+        On the fused one-G chain this is the identity and the row reads ~0.
+        With multiple brackets it is the one shared W inverse transform.
         """
-        if use_fused_ffi:
+        if use_fused_ffi and not shared_w_fused:
             return W_q
         with timing.section("sigma.tau.w_prep") as sec:
             V_R = _V_ifft_j(W_q)
+            if not use_fused_ffi:
+                V_R = V_R[:, None, :, None, :]
             sec.watch(V_R)
         return V_R
 
@@ -426,9 +430,9 @@ def _get_sigma_kij_kernel(
     in the ISDF centroid basis, whose extent is ``N_μ`` — independent of how
     many bands went into it.  The FFT chain and the ψ projection that follow
     therefore cost the same per bracket as they do for the full band range,
-    and three brackets pay them three times.  That 3× on the dominant term
-    is the accepted price of the feature; see :class:`SpatialKernel` for the
-    one part of it (``ifftn(W)``) that can be hoisted, and where it cannot.
+    and three brackets pay them three times.  The W inverse transform is the
+    exception: the multi-bracket fused route hoists it while retaining the
+    one-G-at-a-time loop; see :class:`SpatialKernel`.
     """
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
@@ -437,7 +441,8 @@ def _get_sigma_kij_kernel(
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x)
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
+        shared_w_fused=(brackets is not None and len(brackets) > 1))
 
     def _bracketed(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                    E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):

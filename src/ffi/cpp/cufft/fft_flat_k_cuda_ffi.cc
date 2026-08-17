@@ -672,10 +672,11 @@ static ffi::Error FlatKDispatch(
 //  kernel multiplies S by the broadcast V_R and the folded scale, and the
 //  forward exec runs in place on S.  No G-sized scratch anywhere.
 // ---------------------------------------------------------------------------
-static ffi::Error GwConvDispatch(
+static ffi::Error GwConvDispatchImpl(
     cudaStream_t stream,
     ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
-    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f,
+    bool real_w)
 {
     announce_inert_host_knobs();
     if (G.element_type() != ffi::DataType::C128 ||
@@ -721,33 +722,44 @@ static ffi::Error GwConvDispatch(
                          "[cufft_flat_k] gw_conv first call: nk=(%ld,%ld,%ld) "
                          "G trail (a=%ld,mx=%ld,b=%ld,my=%ld) Tg=%ld Tv=%ld "
                          "scale_i=%.6e scale_f=%.6e aliased=%d "
-                         "vr_arena=%.1f MB\n",
+                         "W=%s vr_arena=%.1f MB\n",
                          (long)nkx, (long)nky, (long)nkz, (long)a, (long)mx,
                          (long)b, (long)my, (long)Tg, (long)Tv, scale_i,
-                         scale_f, (int)aliased, nk * Tv * 16.0 / 1e6);
+                         scale_f, (int)aliased,
+                         real_w ? "real" : "reciprocal",
+                         real_w ? 0.0 : nk * Tv * 16.0 / 1e6);
         }
     }
 
-    ffi::Error e = ensure_arena(&g_vr, &g_vr_cap,
-                                (size_t)nk * Tv * sizeof(C128), "V_R");
-    if (!e.success()) return e;
-    C128* vr = static_cast<C128*>(g_vr);
+    ffi::Error e = ffi::Error::Success();
+    const C128* vr = w_in;
+    if (!real_w) {
+        e = ensure_arena(&g_vr, &g_vr_cap,
+                         (size_t)nk * Tv * sizeof(C128), "V_R");
+        if (!e.success()) return e;
+        vr = static_cast<const C128*>(g_vr);
+    }
 
     PlanEntry *plan_v = nullptr, *plan_g = nullptr;
-    e = get_plan(PlanKey{nkx, nky, nkz, Tv, Tv}, &plan_v);
-    if (!e.success()) return e;
+    if (!real_w) {
+        e = get_plan(PlanKey{nkx, nky, nkz, Tv, Tv}, &plan_v);
+        if (!e.success()) return e;
+    }
     e = get_plan(PlanKey{nkx, nky, nkz, Tg, Tg}, &plan_g);
     if (!e.success()) return e;
 
-    // stage 1: V_R = unscaled IFFT[W] (scale folded into the kernel below).
-    e = exec(plan_v, stream, w_in, vr, CUFFT_INVERSE, "gw_conv W ifft");
-    if (!e.success()) return e;
+    // stage 1: V_R = unscaled IFFT[W] when W arrives in reciprocal space.
+    // The real-W sibling receives an already norm-scaled V_R and skips it.
+    if (!real_w) {
+        e = exec(plan_v, stream, w_in, const_cast<C128*>(vr),
+                 CUFFT_INVERSE, "gw_conv W ifft");
+        if (!e.success()) return e;
+    }
     // stage 2a: S = unscaled IFFT[G] (in place under the granted alias).
     e = exec(plan_g, stream, g_in, s_out, CUFFT_INVERSE, "gw_conv G ifft");
     if (!e.success()) return e;
-    // stage 2b: S *= V_R(bcast) · scale_i²·scale_f  (all three transform
-    // scales commute with the linear FFTs; one fused factor — the same
-    // value-level reassociation class as the host handler's scale-fold).
+    // stage 2b: scale_i for G times scale_f, plus scale_i for W only when
+    // this handler transformed W itself.  All scales commute with the FFTs.
     KernelPack* kp = nullptr;
     e = get_kernels(&kp);
     if (!e.success()) return e;
@@ -755,7 +767,7 @@ static ffi::Error GwConvDispatch(
         double* sd_ptr = reinterpret_cast<double*>(s_out);
         const double* vd_ptr = reinterpret_cast<const double*>(vr);
         long long nk_ll = nk, a_ll = a, mx_ll = mx, b_ll = b, my_ll = my;
-        double total_scale = scale_i * scale_i * scale_f;
+        double total_scale = scale_i * (real_w ? 1.0 : scale_i) * scale_f;
         void* args[] = {&sd_ptr, &vd_ptr, &nk_ll, &a_ll, &mx_ll, &b_ll,
                         &my_ll, &total_scale};
         e = launch(kp->mult_fn, stream, nk * Tg, args, "gw_conv mult kernel");
@@ -765,6 +777,24 @@ static ffi::Error GwConvDispatch(
     e = exec(plan_g, stream, s_out, s_out, CUFFT_FORWARD, "gw_conv S fft");
     if (!e.success()) return e;
     return ffi::Error::Success();
+}
+
+static ffi::Error GwConvDispatch(
+    cudaStream_t stream,
+    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+{
+    return GwConvDispatchImpl(stream, G, W, S, nkx, nky, nkz,
+                              scale_i, scale_f, /*real_w=*/false);
+}
+
+static ffi::Error GwConvRealWDispatch(
+    cudaStream_t stream,
+    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+{
+    return GwConvDispatchImpl(stream, G, W, S, nkx, nky, nkz,
+                              scale_i, scale_f, /*real_w=*/true);
 }
 
 }  // namespace lorrax_ffi::cufft_flat_k
@@ -798,3 +828,17 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale_i")         // inverse-transform scale (both IFFTs)
         .Attr<double>("scale_f"));       // forward scale × caller multiplier
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CufftGwConvRealWCudaFfi,
+    lorrax_ffi::cufft_flat_k::GwConvRealWDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()      // G (nk, a, mx, b, my) c128
+        .Arg<xla::ffi::AnyBuffer>()      // W_R (nk, mx, my) c128
+        .Ret<xla::ffi::AnyBuffer>()      // S shape(G) (may alias G)
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale_i")
+        .Attr<double>("scale_f"));

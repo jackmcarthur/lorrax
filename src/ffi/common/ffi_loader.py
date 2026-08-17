@@ -108,6 +108,7 @@ _CUDA_TARGET_SYMBOLS = {
     # exactly the phdf5 same-target/different-symbol split.
     "lorrax_mklfft_flat_k":         "CufftFlatKCudaFfi",
     "lorrax_mklfft_gw_conv":        "CufftGwConvCudaFfi",
+    "lorrax_mklfft_gw_conv_real_w": "CufftGwConvRealWCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
@@ -155,6 +156,7 @@ _HOST_TARGET_SYMBOLS = {
     # LORRAX_FFT_FFI backend of common.fft_helpers (FFT-FFI prototype).
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
+    "lorrax_mklfft_gw_conv_real_w":   "MklFftGwConvRealWHostFfi",
     # MKL batched-GEMM handler (cpp/mklblas) — the LORRAX_BANDS_GEMM_FFI
     # body of common.contract_bands (contract_bands_block_reshard).
     "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",

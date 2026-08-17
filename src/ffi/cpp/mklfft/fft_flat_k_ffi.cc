@@ -663,9 +663,10 @@ static Arena& vr_arena() {
     return a;
 }
 
-static ffi::Error GwConvDispatch(
+static ffi::Error GwConvDispatchImpl(
     ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
-    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f,
+    bool real_w)
 {
     if (G.element_type() != ffi::DataType::C128 ||
         W.element_type() != ffi::DataType::C128 ||
@@ -705,14 +706,17 @@ static ffi::Error GwConvDispatch(
 
     const long d0 = (long)nkx, d1 = (long)nky, d2 = (long)nkz;
 
-    // --- stage 1: V_R = IFFT[W] into the arena (strided, trail stride Tv).
+    // The arena mutex also serializes descriptor execution across concurrent
+    // callbacks.  Keep that lock even when real W makes the arena unnecessary.
     Arena& ar = vr_arena();
     std::unique_lock<std::mutex> ar_lock(ar.mu);  // serializes concurrent convs
-    if ((int64_t)ar.buf.size() < nk * Tv) ar.buf.resize(nk * Tv);
-    C128* vr = ar.buf.data();
-    {
+    const C128* vr = w_in;
+    if (!real_w) {
+        if ((int64_t)ar.buf.size() < nk * Tv) ar.buf.resize(nk * Tv);
+        vr = ar.buf.data();
         ffi::Error e = run_flat_batch(d0, d1, d2, Tv, /*forward=*/false,
-                                      scale_i, w_in, vr);
+                                      scale_i, w_in,
+                                      const_cast<C128*>(vr));
         if (!e.success()) return e;
     }
 
@@ -731,11 +735,12 @@ static ffi::Error GwConvDispatch(
                          "[mklfft] gw_conv first call: nk=(%ld,%ld,%ld) "
                          "G trail (a=%ld,mx=%ld,b=%ld,my=%ld) Tg=%ld Tv=%ld "
                          "scale_i=%.6e scale_f=%.6e aliased=%d threads=%d "
-                         "chunk=%ld arena=%.1f MB\n",
+                         "chunk=%ld W=%s arena=%.1f MB\n",
                          (long)nkx, (long)nky, (long)nkz, (long)a, (long)mx,
                          (long)b, (long)my, (long)Tg, (long)Tv, scale_i,
                          scale_f, (int)aliased, nthr, (long)C,
-                         nk * Tv * 16.0 / 1e6);
+                         real_w ? "real" : "reciprocal",
+                         real_w ? 0.0 : nk * Tv * 16.0 / 1e6);
         }
     }
 
@@ -808,6 +813,22 @@ static ffi::Error GwConvDispatch(
     return ffi::Error::Success();
 }
 
+static ffi::Error GwConvDispatch(
+    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+{
+    return GwConvDispatchImpl(G, W, S, nkx, nky, nkz,
+                              scale_i, scale_f, /*real_w=*/false);
+}
+
+static ffi::Error GwConvRealWDispatch(
+    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+{
+    return GwConvDispatchImpl(G, W, S, nkx, nky, nkz,
+                              scale_i, scale_f, /*real_w=*/true);
+}
+
 }  // namespace lorrax_ffi::mklfft
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -834,3 +855,16 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale_i")         // inverse-transform scale (both IFFTs)
         .Attr<double>("scale_f"));       // forward scale × caller multiplier
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MklFftGwConvRealWHostFfi,
+    lorrax_ffi::mklfft::GwConvRealWDispatch,
+    xla::ffi::Ffi::Bind()
+        .Arg<xla::ffi::AnyBuffer>()      // G (nk, a, mx, b, my) c128
+        .Arg<xla::ffi::AnyBuffer>()      // W_R (nk, mx, my) c128
+        .Ret<xla::ffi::AnyBuffer>()      // S shape(G) (may alias G)
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale_i")
+        .Attr<double>("scale_f"));

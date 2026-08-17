@@ -44,6 +44,7 @@ from ffi.mklfft import (
     require_fft_ffi,          # announce-or-REFUSE on a mesh
     make_flat_k_fft_ffi,      # the two plain transforms
     make_gw_conv_ffi,         # the fused convolution
+    make_gw_conv_real_w_ffi,  # fused tail with a pretransformed W
 )
 
 fft = make_flat_k_fft_ffi(mesh, kgrid, spec, kind='ifftn'|'fftn',
@@ -53,6 +54,10 @@ y = fft(x)                       # (nk, *trail) -> (nk, *trail), c128
 
 conv = make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec, norm='ortho', mult=1.0)
 sigma = conv(G_flat, W_flat)     # G (nk,a,mx,b,my), W (nk,mx,my)
+
+conv_r = make_gw_conv_real_w_ffi(
+    mesh, kgrid, g_spec, v_spec, norm='ortho', mult=1.0)
+sigma = conv_r(G_flat, W_real_flat)
 ```
 
 | | |
@@ -63,6 +68,13 @@ sigma = conv(G_flat, W_flat)     # G (nk,a,mx,b,my), W (nk,mx,my)
 | norms | computed in Python (`ffi_fft_scale`) to match `jnp.fft` exactly, shipped to the handler as a plain scale.  The handlers implement no norm convention of their own |
 | `input_output_aliases` | `{0: 0}` — shape-preserving, so aliasing is legal and is the terminal form of donation (zero extra big tiles when the operand is dead) |
 | `mult` (conv only) | folded into the forward-transform scale, e.g. Σ's `-1/√N_k` |
+
+The real-W convolution is the multi-consumer sibling of the original fused
+call.  Its second operand is already `ifftn(W, norm=norm)`, so several G
+tiles can share that transform while each call still aliases one G tile to
+its output.  It is representation-distinct, not shape-distinct: the W shape,
+dtype, and sharding contract are unchanged.  The one-consumer path continues
+to use `make_gw_conv_ffi`, preserving its operation order bit for bit.
 
 Refusals, split by phase (`docs/dev/ffi_gate_contract.md` §1.5):
 
@@ -163,6 +175,7 @@ Do not stage it as a pure move.
 |---|---|---|
 | `lorrax_mklfft_flat_k` | `MklFftFlatKHostFfi` (`ffi_loader.py:142`) | `CufftFlatKCudaFfi` (`:105`) |
 | `lorrax_mklfft_gw_conv` | `MklFftGwConvHostFfi` (`:143`) | `CufftGwConvCudaFfi` (`:106`) |
+| `lorrax_mklfft_gw_conv_real_w` | `MklFftGwConvRealWHostFfi` | `CufftGwConvRealWCudaFfi` |
 
 One platform-agnostic `ffi_call` per site therefore resolves the right
 handler from the LOWERING platform — the same split jaxlib uses for cpu
@@ -199,11 +212,13 @@ also why there is no shared C++ handler base (`TEMPLATE.md:188-195`).
 2. **cuFFT plan workspace**: taken by jaxlib's `FftThunk` from a runtime
    scratch allocator, so it is **not in XLA's buffer assignment at all**
    (`src/runtime/aot_memory.py`).
-3. **LORRAX arenas** — *only under `LORRAX_FFT_FFI` on CUDA*: the handler
+3. **LORRAX arenas** — *only under `LORRAX_FFT_FFI` on CUDA*: the reciprocal-W handler
    disables cuFFT auto-allocation (`fft_flat_k_cuda_ffi.cc:435`) and
    `cudaMalloc`s two grow-only arenas of its own (`:401-425`), invisible to
    both 1 and 2.  The `V_R` arena is **measured at 99.7 MB** at production
-   shape (`audit_gpu_fft.log:64`).
+   shape (`audit_gpu_fft.log:64`).  The real-W convolution needs no `V_R`
+   arena because that array is its input; it retains only the plan workspace
+   arena for the G transform.
 
 **Status, 2026-07-30 — this was the service's worst defect and it is
 FIXED**, by the `fft_helpers` owner in the same wave as this document.
