@@ -3419,7 +3419,11 @@ class LorraxConfig:
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
-            raw_input_keys=frozenset(_effective_named_keys),
+            # Build from a stable sequence.  Equal sets reached through an
+            # absent key versus an explicit default can retain different
+            # hash-table histories; pickling those frozensets then need not
+            # be byte-identical even though the typed values compare equal.
+            raw_input_keys=frozenset(sorted(_effective_named_keys)),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
