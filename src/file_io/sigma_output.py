@@ -51,6 +51,12 @@ SIGMA_K_AXIS = {
 	"sigma_c_extrap_last_kn_ev": 0,
 	"sigma_c_extrap_ampl_kn_ev": 0,
 	"sigma_c_extrap_sigma_kn_ev": 0,
+	# The estimator-specific fourth array.  ``ampl`` is A (the 1/N
+	# coefficient) and is written by ``band_index_only``; ``beta`` is the
+	# per-state decay exponent and is written by ``spectral_shell``.  Two
+	# names rather than one reused name, so a file says which estimator made
+	# it even to a reader who never looks at the attributes.
+	"sigma_c_extrap_beta_kn": 0,
 }
 
 #: The ω axis, and the two attrs on it that say what it is measured FROM.
