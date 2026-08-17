@@ -547,3 +547,74 @@ def test_wide_pole_spread_is_cut_from_each_cluster_shell():
                     for e in energies
                     for res, pole in zip(residues, poles))
         np.testing.assert_allclose(got[i], want, rtol=5.0e-6, atol=5.0e-6)
+
+
+def _production_shaped_case(metallic):
+    """A [-5,+5] eV @ 0.25 production grid on synthetic Si/Na-like data.
+
+    Insulating (metallic=False) = the Si config class: bool masks, a gap
+    at the Fermi level.  Metallic (metallic=True) = the Na production
+    class: fractional weights, wrong-side slivers, sd_core paths.  Both
+    are single-cluster grids, so the plan must be the incumbent
+    monolithic one regardless of the clustering knob.
+    """
+    ryd = 13.605693122994
+    omega = np.abs(np.arange(-5.0, 5.01, 0.25)) / ryd
+    omega = np.asarray(sorted(set(np.round(omega, 12))))
+    idx = np.arange(omega.size)
+    cond = jnp.asarray([[0.08, 0.6, 1.4, 3.2]])
+    val = jnp.asarray([[-0.01 if metallic else 0.05, 0.4, 1.1, 2.8]])
+    mask = jnp.ones_like(cond, dtype=bool)
+    weight = (jnp.asarray([[0.7, 1.0, 1.0, 1.0]]) if metallic else None)
+    branches = [
+        _SigmaBranch("pos_cond", cond, mask, "cond", False, omega, idx,
+                     band_weight=weight),
+        _SigmaBranch("pos_val", val, mask, "val", False, omega, idx,
+                     band_weight=weight),
+        _SigmaBranch("neg_cond", cond, mask, "cond", True, omega, idx,
+                     band_weight=weight),
+        _SigmaBranch("neg_val", val, mask, "val", True, omega, idx,
+                     band_weight=weight),
+    ]
+    poles = jnp.asarray([[[[0.35 - 0.06j, 0.5 - 0.2j]]],
+                         [[[2.9 - 0.4j, 3.4 - 0.9j]]]])
+    return branches, poles
+
+
+def test_single_cluster_degeneracy_on_both_config_classes():
+    """Transfer hardening (a): on production-shaped contiguous grids —
+    insulating (Si class) AND metallic (Na class) — the clustering knob
+    must be inert: the plan at the default gap is bit-identical to the
+    plan with clustering disabled (huge gap), window by window."""
+    for metallic in (False, True):
+        branches, poles = _production_shaped_case(metallic)
+        summaries = SW.summarize_sigma_poles(
+            poles, jnp.ones_like(poles), branches,
+            regularization_width_ry=0.25 / 13.605693122994,
+            edge_factor=1.5)
+        kwargs = dict(
+            regularization_width_ry=0.25 / 13.605693122994,
+            edge_factor=1.5, target_error=6.5e-4,
+            crossing_target_error=2.0e-3, max_rank=96,
+            crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+        base, base_rep = SW.build_shared_sigma_windows(
+            summaries, branches, **kwargs)
+        huge, huge_rep = SW.build_shared_sigma_windows(
+            summaries, branches, omega_cluster_gap_ry=1.0e9, **kwargs)
+        assert len(base) == len(huge)
+        for a, b in zip(base, huge):
+            assert a.window.name == b.window.name
+            assert a.window.provenance == b.window.provenance
+            assert a.window.prefactor == b.window.prefactor
+            assert a.window.omega_sign == b.window.omega_sign
+            np.testing.assert_array_equal(
+                np.asarray(a.window.nodes.t), np.asarray(b.window.nodes.t))
+            np.testing.assert_array_equal(a.omega_idx, b.omega_idx)
+            np.testing.assert_array_equal(a.bounds, b.bounds)
+        assert ({k: v for k, v in base_rep.items()
+                 if k != "omega_cluster_gap_ry"}
+                == {k: v for k, v in huge_rep.items()
+                    if k != "omega_cluster_gap_ry"})
+        if metallic:
+            assert any(r.window.name == "sd_core" for r in base), \
+                "the metallic replica must exercise the sliver path"
