@@ -1223,6 +1223,78 @@ def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
                           -200.0, 0.0, unit="eV", print_fn=print_fn)
 
 
+def _report_extrapolation_eqp_shift(
+    H_extrap, H_unextrap, *, mesh_xy, n_occ, iteration, print_fn) -> None:
+    """Diagonalize both Σ's H and report the correction AT THE EQP LEVEL.
+
+    WHY A SECOND DIAGONALIZATION IS WORTH ITS COST.  The extrapolation report
+    in ``gw.ppm_pipeline`` states the correction to Σ_c on the band diagonal.
+    That is not the same number as the correction to E_nk, and the difference
+    is not a detail: Σ's off-diagonals move too, so the eigenvalue shift is
+    the diagonal shift PLUS the eigenvector response, and near a small gap the
+    second term is not small.  The quantity an operator acts on is the eqp
+    level, so the eqp level is what gets reported beside its un-extrapolated
+    twin.
+
+    TWO DIAGONALIZATIONS, NOT FOUR.  Both are ``eigvalsh`` — eigenvalues only,
+    no eigenvectors, because nothing here feeds back into the iteration.  The
+    rejected alternative is diagonalizing each of the three band brackets and
+    extrapolating the EIGENVALUES, which is four diagonalizations AND is
+    wrong: eigenvalues are not linear in the matrix, so an extrapolated
+    spectrum is the spectrum of no Hamiltonian (see
+    ``band_extrapolation.extrapolation_weights``).
+
+    THE H's HERE ARE PRE-PARTITION, and that is the right pair to compare.
+    ``apply_band_partition`` masks off-diagonals of non-protected bands and
+    overwrites out-of-range diagonals with the per-iteration scissor; on the
+    protected, in-range bands — the QP window, which is what this report is
+    about — it changes nothing.  Comparing the pre-partition pair keeps the
+    two arms differing in exactly ONE thing, the band-sum tail in Σ_c, rather
+    than also differing in a scissor refitted separately on each.
+    """
+    _, eigvalsh = _kshard_eigh_kernels(mesh_xy, _band_rotation_spec())
+    e_ext = np.asarray(eigvalsh(H_extrap), dtype=np.float64) * RYD_TO_EV
+    e_n3 = np.asarray(eigvalsh(H_unextrap), dtype=np.float64) * RYD_TO_EV
+    d = e_ext - e_n3
+    nb = e_ext.shape[1]
+    n_occ = max(0, min(int(n_occ), nb))
+
+    lines = [
+        f"    -- band-extrapolation effect on E_nk, iteration "
+        f"{iteration} (two eigvalsh: extrapolated vs N3) --",
+    ]
+    if n_occ and n_occ < nb:
+        # eigvalsh returns ASCENDING eigenvalues, so the band cut at n_occ is
+        # the VBM/CBM split on both arms by construction.
+        vbm_e, cbm_e = e_ext[:, n_occ - 1].max(), e_ext[:, n_occ].min()
+        vbm_3, cbm_3 = e_n3[:, n_occ - 1].max(), e_n3[:, n_occ].min()
+        lines += [
+            f"       VBM   S(N3) = {vbm_3:+11.6f}  ->  S_inf = "
+            f"{vbm_e:+11.6f} eV   ({vbm_e - vbm_3:+.6f})",
+            f"       CBM   S(N3) = {cbm_3:+11.6f}  ->  S_inf = "
+            f"{cbm_e:+11.6f} eV   ({cbm_e - cbm_3:+.6f})",
+            f"       gap   S(N3) = {cbm_3 - vbm_3:+11.6f}  ->  S_inf = "
+            f"{cbm_e - vbm_e:+11.6f} eV   "
+            f"({(cbm_e - vbm_e) - (cbm_3 - vbm_3):+.6f})",
+        ]
+    lines.append(
+        f"       over all (k, band): mean {d.mean():+.6f}  "
+        f"RMS {float(np.sqrt(np.mean(d ** 2))):.6f}  "
+        f"max |dE| {float(np.max(np.abs(d))):.6f} eV")
+    # THE SIGN IS THE DIAGNOSTIC.  The 1/N law was measured to decay FASTER
+    # than the data over the sampled window, so the fit projects more
+    # remaining tail than exists and lands BELOW the truth on every state
+    # (module docstring, 2026-08-16).  A correction that is not one-signed
+    # here is therefore a statement about this deck, and worth seeing.
+    frac_neg = float(np.mean(d < 0.0))
+    lines.append(
+        f"       {100 * frac_neg:.1f} % of states moved DOWN.  The 1/N form "
+        f"is known to undershoot one-signed against a measured S(508); a "
+        f"MIXED sign here means this deck's three points are not in the "
+        f"regime the form was calibrated on.")
+    print_fn("\n".join(lines))
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -1794,6 +1866,29 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+
+    # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
+    # Present only when ``use_band_extrapolation`` drove this stage's Σ.
+    # Assembled through the SAME three steps as the carry above — k-select,
+    # rotate to the DFT basis with the SAME U, add the same density-SC V_H —
+    # so the two Hamiltonians differ in exactly one thing: whether Σ_c
+    # carries the extrapolated band tail.  It is diagonalized, reported and
+    # dropped; it never reaches the carry, rCROP or any artifact.
+    sigma_xc_unextrap = getattr(
+        sigma_result, "sigma_xc_kij_ry_unextrap", None)
+    if sigma_xc_unextrap is not None:
+        delta_h_qp_n3 = sigma_result.v_h_kij_ry + sigma_xc_unextrap
+        if not ks.is_identity:
+            delta_h_qp_n3 = ks.select(delta_h_qp_n3)
+        delta_h_dft_n3 = _rotate_to_dft_basis(
+            delta_h_qp_n3, U_qp, mesh=inputs.mesh_xy)
+        if v_h_dft_new is not None:
+            delta_h_dft_n3 = delta_h_dft_n3 + v_h_dft_new
+        _report_extrapolation_eqp_shift(
+            H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
+            mesh_xy=inputs.mesh_xy, n_occ=n_occ,
+            iteration=state.iteration, print_fn=inputs.print_fn)
+
     if state.iteration == 0:
         _residency_census(
             (("kin_ion_dft", inputs.kin_ion_dft),
@@ -2958,6 +3053,16 @@ def run_sc_driver(
         sigma_coh_kij_ry=(
             _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_coh_kij_ry is not None else None),
+        # The un-extrapolated N₃ twin travels with its partner or not at all.
+        # It is None on every non-extrapolating run; when it is present,
+        # leaving it in the QP basis while ``sigma_xc_kij_ry`` beside it is
+        # rotated is exactly the silent-basis-mismatch this seam exists to
+        # prevent — and it would show up as a "band-extrapolation correction"
+        # that was mostly the basis difference.
+        sigma_xc_kij_ry_unextrap=(
+            _rotate_to_dft_basis(
+                sigma_result.sigma_xc_kij_ry_unextrap, U, mesh=mesh_xy)
+            if sigma_result.sigma_xc_kij_ry_unextrap is not None else None),
         sigma_omega_h5_path=sigma_omega_h5_path,
         # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
         # This line used to read ``float(wfn.efermi) * RYD_TO_EV``

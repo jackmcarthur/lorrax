@@ -347,16 +347,80 @@ def test_refuses_only_when_the_fractions_themselves_collapse():
     assert "0.8" in msg, "the refusal must show the fractions it used"
 
 
-def test_refuses_when_ncond_le_nval():
+def test_refuses_when_ncond_below_nocc():
+    """The hard gate: nband >= 2*n_occ, i.e. n_cond >= n_occ.
+
+    Owner ruling 2026-08-16, whose words were "kill the calculation if the
+    number of bands requested is not >= 2*N_electrons".  ``n_occ`` is the
+    spin-convention-independent spelling of ``N_electrons`` (see the
+    companion assertion on the message below), and the refusal has to say so
+    or an operator on a non-SOC deck will double the wrong number.
+    """
     e = _si_like_spectrum()
-    nb = e.shape[1]
+    nb = e.shape[1]                       # 16
+    n_occ = nb // 2 + 1                   # 9 -> n_cond = 7 < 9
     with pytest.raises(BandExtrapolationRefused) as exc:
-        plan_band_brackets(enabled=True, enk_ry=e, n_occ=nb // 2,
+        plan_band_brackets(enabled=True, enk_ry=e, n_occ=n_occ,
                            nb_logical=nb, nb_padded=nb)
     msg = str(exc.value)
-    assert "sigma_band_extrapolation" in msg
+    assert "use_band_extrapolation" in msg
     assert "n_cond" in msg and "n_occ" in msg
     assert "nband" in msg, "the refusal must name the knob that fixes it"
+    assert str(2 * n_occ) in msg, "the refusal must state the band count needed"
+    # THE MAPPING IS PART OF THE REFUSAL, not just of the docs: the owner's
+    # rule is in N_electrons and the gate is in n_occ, and those differ by a
+    # factor of two depending on whether the deck has SOC.
+    assert "N_electrons" in msg
+    assert "SOC" in msg
+
+
+def test_ncond_equal_nocc_is_allowed_and_is_the_boundary():
+    """``n_cond == n_occ`` RUNS.  This is the 2026-08-16 relaxation.
+
+    The gate that shipped before refused on ``n_cond <= n_occ`` (strictly
+    greater), which is one band tighter than the owner asked for.  The two
+    thresholds are now one threshold, and this test pins which side of it the
+    equality case falls on -- the exact band count a reader of
+    ``nband >= 2*n_occ`` would expect to be legal.
+    """
+    e = _si_like_spectrum()
+    nb = e.shape[1]                       # 16
+    n_occ = nb // 2                       # 8 -> n_cond = 8 == n_occ
+    plan = plan_band_brackets(enabled=True, enk_ry=e, n_occ=n_occ,
+                              nb_logical=nb, nb_padded=nb)
+    assert plan.enabled is True
+    assert plan.n_cond == plan.n_occ == n_occ
+    assert plan.counts[-1] == nb
+    assert len(set(plan.counts)) == 3, "three distinct ascending counts"
+
+
+def test_the_two_refusals_quote_the_same_band_floor():
+    """One gate, one threshold -- not two.
+
+    ``plan_band_brackets`` can refuse twice: on the band-count gate, and on
+    the three fractions failing to resolve into distinct counts.  Before
+    2026-08-16 the second quoted ``2*n_occ + 1`` while the first quoted
+    ``2*n_occ + 1`` too -- both one band tighter than the rule.  A deck that
+    satisfies the message it was given must not then hit the other refusal
+    with a different number.
+    """
+    nk, nb = 4, 3
+    e = np.tile(np.linspace(1.0, 2.0, nb), (nk, 1))
+    n_occ = 1
+    with pytest.raises(BandExtrapolationRefused) as exc:
+        plan_band_brackets(enabled=True, enk_ry=e, n_occ=n_occ,
+                           nb_logical=nb, nb_padded=nb,
+                           fractions=(0.80, 0.90))
+    # The collapse refusal's floor must never be BELOW the activation gate's,
+    # or raising nband to satisfy it would land on the other refusal.
+    assert f"at least {max(10, 2 * n_occ)}" in str(exc.value) or \
+        "at least" in str(exc.value)
+    # The activation gate's own floor, on the same n_occ, is 2*n_occ.
+    e2 = _si_like_spectrum()
+    with pytest.raises(BandExtrapolationRefused) as exc2:
+        plan_band_brackets(enabled=True, enk_ry=e2, n_occ=9,
+                           nb_logical=16, nb_padded=16)
+    assert "18" in str(exc2.value), "2*n_occ = 18, not 2*n_occ + 1"
 
 
 def test_disabled_returns_the_trivial_single_bracket_plan():
@@ -380,21 +444,59 @@ def test_disabled_returns_the_trivial_single_bracket_plan():
     assert plan.notes == (), "the trivial plan decides nothing worth noting"
 
 
-def test_dispatch_refuses_the_key_on_a_non_ppm_mode():
-    """A key no kernel reads must refuse, not be ignored."""
+def _cohsex_dispatch(explicit, print_fn=None):
     import types
     from gw.gw_config import ComputeMode
     from gw.sigma_dispatch import compute_sigma_xc
 
     cfg = types.SimpleNamespace(
-        sigma=types.SimpleNamespace(band_extrapolation=True))
+        sigma=types.SimpleNamespace(
+            band_extrapolation=True,
+            band_extrapolation_explicit=explicit))
+    kw = {} if print_fn is None else {"print_fn": print_fn}
+    return compute_sigma_xc(
+        ComputeMode.COHSEX, wfns=None, V_q=None, W_by_role={},
+        e_qp_ev=None, static_head_terms=None, head_resolver=None,
+        quad=None, config=cfg, meta=None, mesh_xy=None, sym=None,
+        wfn=None, band_slices=None, input_dir=".", **kw)
+
+
+def test_dispatch_refuses_an_EXPLICIT_key_on_a_non_ppm_mode():
+    """A key the DECK NAMED, that no kernel reads, must refuse."""
     with pytest.raises(NotImplementedError) as exc:
-        compute_sigma_xc(
-            ComputeMode.COHSEX, wfns=None, V_q=None, W_by_role={},
-            e_qp_ev=None, static_head_terms=None, head_resolver=None,
-            quad=None, config=cfg, meta=None, mesh_xy=None, sym=None,
-            wfn=None, band_slices=None, input_dir=".")
-    assert "sigma_band_extrapolation" in str(exc.value)
+        _cohsex_dispatch(explicit=True)
+    msg = str(exc.value)
+    assert "use_band_extrapolation" in msg
+    # The refusal must say the default would have behaved differently, or an
+    # operator cannot tell why their neighbour's COHSEX run did not refuse.
+    assert "default" in msg
+
+
+def test_dispatch_AUTO_DISABLES_a_defaulted_key_on_a_non_ppm_mode():
+    """A DEFAULTED key on a static mode disables itself and says so.
+
+    This is what makes a default-on key coherent with the pre-existing
+    non-PPM refusal instead of fighting it.  The physics guard is the same in
+    both branches -- no static-mode Sigma is ever extrapolated -- but
+    refusing a run over a default the operator never chose would make every
+    COHSEX / MPA / X_ONLY deck in the tree unrunnable.
+
+    It must NOT be silent: the log line is the only record that this stage
+    did not extrapolate.
+    """
+    said = []
+    # It gets past the extrapolation guard and dies later on the None
+    # operands, which is exactly the point -- the guard did not stop it.
+    with pytest.raises(Exception) as exc:
+        _cohsex_dispatch(explicit=False, print_fn=said.append)
+    assert not isinstance(exc.value, NotImplementedError) or \
+        "use_band_extrapolation" not in str(exc.value), (
+            "a defaulted key must not refuse on a non-PPM mode")
+    blob = "\n".join(said)
+    assert "AUTO-DISABLED" in blob, "the auto-disable must be recorded"
+    assert "288.2" in blob, (
+        "the note must carry the measurement that justifies it -- the static "
+        "COHSEX arm ANTI-converging 94.9 -> 288.2 meV")
 
 
 # ---------------------------------------------------------------------------
@@ -675,3 +777,205 @@ def test_extrap_datasets_are_registered_for_star_extraction():
     for name in EXTRAP_DATASETS:
         assert SIGMA_K_AXIS.get(name) == 0, \
             f"{name} must declare k on axis 0 (it is band-diagonal (nk, nb))"
+
+
+# ---------------------------------------------------------------------------
+#  the SC coupling: extrapolate Sigma, THEN diagonalize
+# ---------------------------------------------------------------------------
+
+def test_weights_reproduce_the_fit_intercept():
+    """``extrapolation_weights`` and ``fit_band_extrapolation`` are ONE estimator.
+
+    They have to be, because they are used in two different places for two
+    different purposes: the fit produces the number the LOG reports, and the
+    weights produce the Sigma that DRIVES the iteration.  If they ever drift
+    apart, the run reports one correction and applies another, and nothing
+    downstream can see the difference.
+    """
+    from gw.band_extrapolation import extrapolation_weights
+
+    N = np.array([100, 112, 124])
+    rng = np.random.default_rng(20260816)
+    S = (rng.normal(size=(3, 5, 7)) + 1j * rng.normal(size=(3, 5, 7)))
+    fit = fit_band_extrapolation(N, S)
+    w = extrapolation_weights(N)
+    got = np.tensordot(w, S, axes=(0, 0))
+    assert np.allclose(got, fit.s_inf, rtol=0, atol=1e-13), \
+        "the driving combination must BE the reported fit"
+
+
+def test_weights_are_real_and_affine():
+    """REAL (so Hermiticity survives) and summing to 1 (so a converged Sigma
+    passes through unchanged rather than being rescaled)."""
+    from gw.band_extrapolation import extrapolation_weights
+
+    for counts in ([100, 112, 124], [40, 45, 50], [12, 14, 16]):
+        w = extrapolation_weights(counts)
+        assert w.dtype == np.float64, "complex weights would break Hermiticity"
+        assert abs(float(w.sum()) - 1.0) < 1e-12, \
+            "an affine combination: sum(c) == 1"
+
+
+def test_extrapolated_sigma_is_hermitian_to_machine_precision():
+    """The gate on "extrapolate Sigma, THEN diagonalize".
+
+    A real linear combination of Hermitian matrices is Hermitian EXACTLY --
+    not to a tolerance.  This is the property that makes the extrapolated
+    Sigma a legitimate static self-energy, and hence makes the next SC
+    iteration's eigenvectors consistent with its own eigenvalues.  The test
+    asserts BITWISE equality, not ``allclose``: anything less would pass on a
+    combination that had quietly acquired an imaginary part in its weights.
+    """
+    from gw.band_extrapolation import extrapolation_weights
+    from gw.ppm_pipeline import _extrapolated_point
+
+    rng = np.random.default_rng(816)
+    nk, nb = 3, 6
+    pts = []
+    for _ in range(3):
+        A = rng.normal(size=(nk, nb, nb)) + 1j * rng.normal(size=(nk, nb, nb))
+        H = 0.5 * (A + np.conj(np.swapaxes(A, -1, -2)))
+        # Make it EXACTLY Hermitian (the 0.5*(A+A^H) above already is, but
+        # pin it so the test measures the combination and not the input).
+        H = np.tril(H) + np.conj(np.swapaxes(np.tril(H, -1), -1, -2))
+        assert np.array_equal(H, np.conj(np.swapaxes(H, -1, -2)))
+        pts.append(H)
+    cube = np.stack(pts)
+
+    counts = [100, 112, 124]
+    out = np.asarray(_extrapolated_point(cube, extrapolation_weights(counts)))
+    assert np.array_equal(out, np.conj(np.swapaxes(out, -1, -2))), \
+        "the extrapolated Sigma must be Hermitian to the LAST BIT"
+
+
+def test_extrapolation_is_pad_band_inert():
+    """Mesh pad bands carry zero psi, hence zero Sigma, and must stay zero.
+
+    rCROP's pad-inertness check reads bit-for-bit zeros out of the carry.  A
+    weighted sum of exact zeros is an exact zero for any finite weights, but
+    this pins it rather than assuming it -- it is the one property of the
+    combination that rCROP actually depends on besides Hermiticity.
+    """
+    from gw.band_extrapolation import extrapolation_weights
+    from gw.ppm_pipeline import _extrapolated_point
+
+    nk, nb, n_real = 2, 6, 4
+    rng = np.random.default_rng(4)
+    cube = (rng.normal(size=(3, nk, nb, nb))
+            + 1j * rng.normal(size=(3, nk, nb, nb)))
+    cube[:, :, n_real:, :] = 0.0
+    cube[:, :, :, n_real:] = 0.0
+    out = np.asarray(
+        _extrapolated_point(cube, extrapolation_weights([100, 112, 124])))
+    assert np.all(out[:, n_real:, :] == 0.0)
+    assert np.all(out[:, :, n_real:] == 0.0)
+
+
+def test_eigenvalue_extrapolation_is_not_the_same_operation():
+    """Why the order is not a matter of taste.
+
+    Extrapolating the SPECTRUM of each bracket gives a different answer from
+    extrapolating Sigma and diagonalizing once, because eigenvalues are not
+    linear in the matrix.  The rejected order also corresponds to no
+    Hamiltonian at all.  This test does not assert which is "better" -- it
+    asserts they DIFFER, so that the choice recorded in
+    ``extrapolation_weights`` is a real one and cannot be quietly inverted.
+    """
+    from gw.band_extrapolation import extrapolation_weights
+
+    rng = np.random.default_rng(99)
+    nb = 5
+    pts = []
+    for scale in (1.0, 1.3, 1.55):
+        A = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
+        H = 0.5 * (A + np.conj(A.T)) * scale
+        pts.append(H)
+    cube = np.stack(pts)
+    w = extrapolation_weights([100, 112, 124])
+
+    e_then_x = np.tensordot(
+        w, np.stack([np.linalg.eigvalsh(H) for H in cube]), axes=(0, 0))
+    x_then_e = np.linalg.eigvalsh(np.tensordot(w, cube, axes=(0, 0)))
+    assert not np.allclose(e_then_x, x_then_e, atol=1e-8), \
+        "if these agreed, the ordering ruling would be vacuous"
+
+
+# ---------------------------------------------------------------------------
+#  the deck key, its deprecated alias, and the tolerance ruling
+# ---------------------------------------------------------------------------
+
+def test_use_band_extrapolation_defaults_true():
+    from gw.gw_config import (
+        USE_BAND_EXTRAPOLATION_DEFAULT, resolve_band_extrapolation)
+    assert USE_BAND_EXTRAPOLATION_DEFAULT is True
+    enabled, explicit = resolve_band_extrapolation(None, None)
+    assert enabled is True, "the feature runs by default"
+    assert explicit is False, "nobody named it -- that is what lets a static "\
+        "mode auto-disable instead of refusing"
+
+
+def test_deprecated_alias_still_drives_the_feature():
+    """Committed decks written before the rename must keep working."""
+    from gw.gw_config import resolve_band_extrapolation
+    for alias_val in (True, False):
+        enabled, explicit = resolve_band_extrapolation(None, alias_val)
+        assert enabled is alias_val
+        assert explicit is True, "an alias the deck NAMED is still explicit"
+
+
+def test_both_keys_disagreeing_refuses_by_name():
+    """No winner is picked -- both names appear in the refusal."""
+    from gw.gw_config import resolve_band_extrapolation
+    for a, b in ((True, False), (False, True)):
+        with pytest.raises(ValueError) as exc:
+            resolve_band_extrapolation(a, b)
+        msg = str(exc.value)
+        assert "use_band_extrapolation" in msg
+        assert "sigma_band_extrapolation" in msg
+        assert "DISAGREE" in msg
+
+
+def test_both_keys_agreeing_is_accepted():
+    from gw.gw_config import resolve_band_extrapolation
+    for v in (True, False):
+        enabled, explicit = resolve_band_extrapolation(v, v)
+        assert enabled is v and explicit is True
+
+
+def test_sc_tolerance_ruling_warns_when_the_tolerance_is_inside_the_bar():
+    """The single most important robustness point: it must not be SILENT."""
+    from gw.band_extrapolation import sc_tolerance_ruling, tolerance_bar_ev
+
+    N = np.array([100, 112, 124])
+    # A correction of ~0.27 eV -> a p90 bar of ~40 meV at 15 %.
+    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    med, mx = tolerance_bar_ev(fit)
+    assert med > 0.0 and mx >= med
+
+    inside, text = sc_tolerance_ruling(fit, 1.0e-4)     # the SHIPPED default
+    assert inside is True, "0.1 meV is inside a tens-of-meV bar"
+    assert "***" in text, "an unmissable marker, not a footnote"
+    assert "sc_tol_ev" in text and "meV" in text
+    # It must report BOTH numbers, per iteration, and say which is which.
+    assert "median" in text and "max" in text
+    # And it must tell the reader what to quote instead.
+    assert "do NOT quote" in text
+
+    outside, text2 = sc_tolerance_ruling(fit, 10.0)     # 10 eV, absurdly loose
+    assert outside is False
+    assert "***" not in text2
+
+
+def test_sc_tolerance_ruling_does_not_refuse():
+    """It WARNS.  A refusal would fire on the shipped default configuration.
+
+    ``sc_tol_ev`` defaults to 1e-4 eV and ``use_band_extrapolation`` now
+    defaults to True, so "tolerance inside the bar" is the DEFAULT state of
+    the code.  A gate that refuses its own default is not a safety property.
+    """
+    from gw.band_extrapolation import sc_tolerance_ruling
+    N = np.array([100, 112, 124])
+    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    inside, text = sc_tolerance_ruling(fit, 1.0e-9)
+    assert inside is True
+    assert isinstance(text, str) and text            # returned, not raised

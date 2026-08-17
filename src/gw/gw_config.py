@@ -1691,16 +1691,44 @@ _DEFAULTS = {
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
     # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
-    # OFF by default.  ON evaluates the Sigma_c band sum at THREE band
-    # counts in one pass -- nband*{~50%, ~75%, 100%} of the conduction
-    # range, snapped so no cut splits a degenerate multiplet -- by building
-    # three DISJOINT band-bracket Green's functions per tau against one
-    # W(tau), and fits S(N) = S_inf + A/N to extrapolate to infinite bands.
-    # GN-PPM only.  REFUSES BY NAME (never silently disables) when the band
-    # sum has n_cond <= n_occ.  Costs ~3x the Sigma tau-loop wall: G(tau)
-    # lives in the centroid basis, so the FFT chain and the psi projection
-    # are paid once per bracket regardless of how the bands are split.
-    "sigma_band_extrapolation": False,
+    # ON by default since 2026-08-16 (owner ruling).  ON evaluates the
+    # Sigma_c band sum at THREE band counts in one pass -- 80 %, 90 % and
+    # 100 % of the TOTAL band count, interior cuts preferring a
+    # degeneracy-clean boundary -- by building three DISJOINT band-bracket
+    # Green's functions per tau against one W(tau), fits S(N) = S_inf + A/N,
+    # and USES the extrapolated Sigma_c as the E_nk that self-consistent
+    # iterations see.  Costs ~3x the Sigma tau-loop wall: G(tau) lives in
+    # the centroid basis, so the FFT chain and the psi projection are paid
+    # once per bracket regardless of how the bands are split.
+    #
+    # HARD GATE: REFUSES BY NAME when the Sigma band sum has n_cond < n_occ,
+    # i.e. nband < 2*n_occ.  The owner's form is "nband >= 2*N_electrons";
+    # n_occ is the spin-convention-independent way to write it (SOC/noncolin
+    # n_occ = N_electrons, otherwise N_electrons/2).  See
+    # gw.band_extrapolation.plan_band_brackets.
+    #
+    # PER-STAGE AUTO-DISABLE: the 1/N -> 0 limit is MODE-DEPENDENT and is
+    # WRONG for a static Coulomb hole (measured: static COHSEX MAE 94.9 ->
+    # 288.2 meV as nband 60 -> 124, ANTI-converging, against GN-PPM 171.3 ->
+    # 32.8).  So on a non-PPM compute_mode this key DISABLES ITSELF with a
+    # recorded note rather than refusing the run -- but only when it is at
+    # its default.  A deck that names it explicitly on a non-PPM mode still
+    # REFUSES, because an explicitly requested knob that silently does
+    # nothing is how a green A/B comes to measure nothing.
+    # THE DEFAULT IS TRUE -- see USE_BAND_EXTRAPOLATION_DEFAULT.  The entry
+    # here is None ("no deck named it") because the resolver has to tell
+    # "the deck said false" from "the deck said nothing": only the former
+    # turns the feature off, and only the former makes a non-PPM mode refuse
+    # instead of auto-disabling.  Both keys are tri-state for that reason.
+    "use_band_extrapolation": None,
+    # DEPRECATED ALIAS (transitional, 2026-08-16) for use_band_extrapolation.
+    # Kept so committed decks and fixtures do not break.  Naming BOTH keys
+    # with DIFFERENT values REFUSES BY NAME rather than picking a winner --
+    # same migration shape as nband -> number_bands.  Its default is None
+    # ("not named"), not False: the resolver distinguishes "the deck said
+    # false" from "the deck said nothing", and only the former can turn the
+    # feature off.
+    "sigma_band_extrapolation": None,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
     # when ``mpa_material_class = metal``; refused under insulator.  These
@@ -1806,7 +1834,15 @@ _NORMALIZE_STR = {
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
 # input-file value parses as bool.  The parse loop needs the set because
 # ``default is None`` otherwise means "nullable float".
-_NULLABLE_BOOL = frozenset()
+_NULLABLE_BOOL = frozenset({
+    # Both halves of the 2026-08-16 band-extrapolation migration.  Tri-state
+    # so ``resolve_band_extrapolation`` can distinguish a deck that SAID
+    # false from one that said nothing -- the difference between "turn it
+    # off" and "let the default stand", and the difference between refusing
+    # a non-PPM mode and auto-disabling on it.
+    "use_band_extrapolation",
+    "sigma_band_extrapolation",
+})
 
 #: Keys whose default is ``None`` ("unset") but whose explicit value is an
 #: INTEGER.  Same role ``_NULLABLE_BOOL`` plays for tri-state booleans: the
@@ -1826,6 +1862,73 @@ _NULLABLE_STR = frozenset({"occ_smearing_family"})
 #: and every real key comes from there, so a name that cannot appear in
 #: ``_DEFAULTS`` cannot collide.  Read once, into ``GWConfig.raw_input_keys``.
 _DECK_NAMED_KEYS = "_deck_named_keys"
+
+
+#: What ``use_band_extrapolation`` means when no deck names either spelling.
+#: TRUE since 2026-08-16 (owner ruling): the band-convergence extrapolation of
+#: Σ_c runs by default and its extrapolated result is the E_nk that
+#: self-consistent iterations see.  Lives here as a named constant rather than
+#: inline in ``_DEFAULTS`` because ``_DEFAULTS`` has to carry ``None`` for the
+#: tri-state resolution below, and a reader looking up "what is the default"
+#: must not find ``None`` and conclude "off".
+USE_BAND_EXTRAPOLATION_DEFAULT = True
+
+#: The current key and its deprecated alias, in message order.
+_BAND_EXTRAP_KEYS = ("use_band_extrapolation", "sigma_band_extrapolation")
+
+
+def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
+    """Resolve the two spellings into ``(enabled, explicit)``.
+
+    ``use_band_extrapolation`` is the key; ``sigma_band_extrapolation`` is a
+    TRANSITIONAL alias kept so committed decks and fixtures do not break.
+    Both arrive tri-state: ``None`` means the deck did not name that spelling.
+
+    Returns
+    -------
+    enabled : bool
+        Whether the feature is on.
+    explicit : bool
+        Whether a deck NAMED either spelling.  This is not decoration -- it
+        selects between two different behaviours on a non-PPM ``compute_mode``
+        (``gw.sigma_dispatch``): a defaulted-on key AUTO-DISABLES with a
+        recorded note so that staged / static runs stay usable, while an
+        explicitly-named one REFUSES.  Silently ignoring a knob the operator
+        wrote down is how a green A/B comes to measure nothing.
+
+    Raises
+    ------
+    ValueError
+        When both spellings are named and they DISAGREE.  Refusing by name
+        rather than picking a winner: whichever precedence we chose, half the
+        decks that hit it would silently get the other one, and the operator
+        would have no signal.  Same migration shape as ``nband`` ->
+        ``number_bands``.
+    """
+    named = {k: v for k, v in zip(_BAND_EXTRAP_KEYS, (use_val, alias_val))
+             if v is not None}
+    if len(named) == 2 and bool(use_val) != bool(alias_val):
+        raise ValueError(
+            f"Deck names BOTH band-extrapolation keys and they DISAGREE: "
+            f"use_band_extrapolation = {bool(use_val)!r} against the "
+            f"deprecated alias sigma_band_extrapolation = "
+            f"{bool(alias_val)!r}.\n"
+            f"  These are the same switch under two names, so there is no "
+            f"consistent run to produce and no winner will be picked for "
+            f"you.  Remove ONE of them -- keep `use_band_extrapolation`, "
+            f"which is the current spelling; `sigma_band_extrapolation` is "
+            f"deprecated (2026-08-16) and is honored only for decks written "
+            f"before the rename.")
+    if not named:
+        return bool(USE_BAND_EXTRAPOLATION_DEFAULT), False
+    if alias_val is not None and print_fn is not None:
+        print_fn(
+            f"  *** DEPRECATED KEY: `sigma_band_extrapolation` is "
+            f"transitional and will be removed; it is honored here as "
+            f"`use_band_extrapolation = {bool(alias_val)}`.  Rename it in "
+            f"this deck.")
+    # Both named and AGREEING is fine, and lands here on either value.
+    return bool(next(iter(named.values()))), True
 
 
 # ---------------------------------------------------------------------------
@@ -2383,10 +2486,18 @@ class DynamicSigmaConfig:
     #: uniformity; solved QP energies landing inside a hole are refused
     #: at the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).
     omega_patches_ev: str = ""
-    #: Band-convergence extrapolation of Sigma_c.  Read ONLY by the GN-PPM
-    #: pipeline (``gw.ppm_pipeline``); MPA and COHSEX do not consult it and
-    #: are not wired for it.
-    band_extrapolation: bool = False
+    #: Band-convergence extrapolation of Sigma_c, resolved from
+    #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
+    #: ``sigma_band_extrapolation`` by
+    #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
+    #: (``gw.ppm_pipeline``); on a non-PPM ``compute_mode`` it is turned OFF
+    #: with a recorded note (or refused -- see ``band_extrapolation_explicit``)
+    #: by ``gw.sigma_dispatch``, because the 1/N limit is mode-dependent and
+    #: wrong for a static Coulomb hole.
+    band_extrapolation: bool = USE_BAND_EXTRAPOLATION_DEFAULT
+    #: Did a deck NAME either spelling?  Selects between auto-disabling and
+    #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.
+    band_extrapolation_explicit: bool = False
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -3378,7 +3489,12 @@ class LorraxConfig:
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
-            band_extrapolation=bool(_g("sigma_band_extrapolation")),
+            **dict(zip(
+                ("band_extrapolation", "band_extrapolation_explicit"),
+                resolve_band_extrapolation(
+                    _g("use_band_extrapolation"),
+                    _g("sigma_band_extrapolation"),
+                    print_fn=_print_deck_report))),
         )
         # With patches, omega_min/max_ev ARE the patch hull.  Consumers
         # read these fields as "the Σ grid's reach" (the SC partition's
