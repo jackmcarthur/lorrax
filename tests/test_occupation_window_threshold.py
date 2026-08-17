@@ -23,8 +23,11 @@ implementation breaks:
 
 Scope: this file is a unit file.  It exercises the planner's support rule
 and the config plumbing.  It does not run a driver and says nothing about
-QP energies; that is the smearing sweep in
-``reports/occupation_window_threshold_2026-08-16/``.
+QP energies -- those come from the deck-level A/B whose evidence is
+archived at
+``/global/cfs/cdirs/m4598/jackm/occupation_window_threshold_2026-08-16/``
+(the closed form behind the numbers quoted below is ``analysis/mp1_shell.py``
+there, and the real-deck sweep is ``analysis/planner_sweep.py``).
 """
 
 import numpy as np
