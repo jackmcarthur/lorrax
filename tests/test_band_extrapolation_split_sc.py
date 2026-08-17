@@ -438,10 +438,12 @@ def test_the_mpa_default_ladder_is_consumable():
     cfg_mod = _gw_config()
     CM = cfg_mod.ComputeMode
     assert cfg_mod.band_extrapolation_is_consumable((CM.GN_PPM, CM.MPA))
-    # and MPA alone is not -- ppm_model is None for it, dynamic though it is
-    assert not cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
+    # MPA owns a bracketed band contraction now; it is a consumer even
+    # without a preceding PPM stage.  is_dynamic alone remains insufficient
+    # for future ansatzes, so the predicate names MPA explicitly.
+    assert cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
     assert CM.MPA.is_dynamic and CM.MPA.ppm_model is None, (
-        "the predicate must be ppm_model, not is_dynamic: MPA separates them")
+        "MPA consumes brackets without becoming a two-point PPM model")
 
 
 def test_a_static_only_ladder_is_not_consumable():
@@ -504,52 +506,24 @@ def test_a_run_with_no_consuming_stage_still_REFUSES_an_explicit_key():
         "cannot tell which stage list was consulted")
 
 
-def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
-    """The behavioural test the scope note promised, cashed in.
+def test_an_mpa_stage_bypasses_the_nonconsumer_refusal_and_builds_a_plan():
+    """The claim-0289 refusal is gone only for the now-wired MPA consumer.
 
-    THIS CELL REPLACES ``test_an_mpa_stage_is_refused_UPSTREAM_and_never_
-    reaches_this_guard``, whose docstring said in as many words: "When MPA is
-    implemented this test will fail, which is the correct moment to check
-    that branch behaviourally."  That moment is the metal MPA-QSGW merge
-    (``origin/main`` f597dd05), which emptied ``gw_config.UNIMPLEMENTED_MODES``
-    — it is now ``{}`` — so ``refuse_unimplemented_compute_mode`` is a no-op
-    for MPA and an MPA stage reaches the band-extrapolation guard for real.
-
-    What must be true now: the guard AUTO-DISABLES rather than refusing (a
-    PPM stage in the same ladder consumes the key, so this stage is skipped,
-    not fatal), it names the stage, and it gives the DYNAMIC reason.  It must
-    NOT recite the static Coulomb-hole anti-convergence measurement, which
-    was measured on static COHSEX and is not evidence about MPA;
-    ``test_the_dynamic_branch_does_not_recite_the_static_measurement`` pins
-    the same claim in the source text, and this one pins it in behaviour.
-
-    The dispatch is expected to fail AFTER the guard: this file's ``_dispatch``
-    passes ``wfns=None``, which no real Σ stage can consume.  That is a
-    harness limit, not the property under test, so the failure is allowed and
-    the assertions are all about what was PRINTED before it.
+    The None-operand dispatch harness cannot reach MPA planning because the
+    shared static channels execute first, so pin the exact production seams
+    structurally: MPA is excluded from the nonconsumer guard and its own
+    branch builds and passes a band plan to the MPA sigma executor.
     """
-    cfg_mod = _gw_config()
-    CM = cfg_mod.ComputeMode
-    assert cfg_mod.UNIMPLEMENTED_MODES == {}, (
-        "this cell exists because MPA stopped being gated at entry; if "
-        "something is unimplemented again, say which and why here")
-    said = []
-    with pytest.raises(BaseException):
-        _dispatch(CM.MPA, _cfg([CM.GN_PPM, CM.MPA], explicit=True),
-                  print_fn=said.append)
-    notes = [s for s in said if "band extrapolation" in s]
-    assert notes, (
-        f"an MPA stage must reach the band-extrapolation guard and say so; "
-        f"printed: {said}")
-    note = " ".join(notes)
-    assert "AUTO-DISABLED" in note, note
-    assert "mpa" in note.lower(), note
-    # The dynamic reason, not the static one.
-    assert "MPA is dynamic" in note, note
-    assert "no bracket axis to fit" in note, note
-    assert "94.9" not in note and "288.2" not in note, (
-        f"the static Coulomb-hole measurement must not be recited at a "
-        f"dynamic stage — that is inventing evidence: {note}")
+    src = open(os.path.join(_SRC, "gw", "sigma_dispatch.py"),
+               encoding="utf-8").read()
+    refusal = src[src.index("if (bool(config.sigma.band_extrapolation)"):]
+    refusal = refusal[:refusal.index("Static channels")]
+    assert "mode is not ComputeMode.MPA" in refusal
+    mpa = src[src.index("if mode is ComputeMode.MPA:"):]
+    mpa = mpa[:mpa.index("THE EXHAUSTIVENESS SEAM")]
+    assert "plan_band_brackets(" in mpa
+    assert "band_plan=mpa_band_plan" in mpa
+    assert "AUTO-DISABLED" not in mpa
 
 
 def test_the_dynamic_branch_does_not_recite_the_static_measurement():

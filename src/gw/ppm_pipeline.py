@@ -258,6 +258,7 @@ def _extrapolated_point(cube, weights):
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+    efermi_ry=None,
 ) -> dict:
     """Log the three band-count Σ_c's, the fit and its diagnostics.
 
@@ -279,7 +280,8 @@ def _report_band_extrapolation(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
     enk_ev = np.asarray(enk_dft) * RYD_TO_EV
-    omega_eval_ev = enk_ev - float(wfn.efermi) * RYD_TO_EV
+    omega_eval_ev = enk_ev - float(
+        wfn.efermi if efermi_ry is None else efermi_ry) * RYD_TO_EV
     omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     head = (None if head_sigma_diag_w_kn_ry is None
             else np.asarray(head_sigma_diag_w_kn_ry))

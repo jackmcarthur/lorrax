@@ -599,7 +599,12 @@ def compute_sigma_xc(
     :class:`SigmaResult` populated per the mode.
     """
     from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
-    from .ppm_pipeline import compute_ppm_sigma_pipeline
+    from .ppm_pipeline import (
+        _band_count_point,
+        _extrapolated_point,
+        _report_band_extrapolation,
+        compute_ppm_sigma_pipeline,
+    )
 
     # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
     # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
@@ -611,12 +616,13 @@ def compute_sigma_xc(
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
-    # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
+    # ── STATIC/NONCONSUMER CORRECTNESS GUARD ────────────────────────────
     # Two independent reasons, and the second is the load-bearing one.
     #
     # (1) Wiring.  ``sigma_band_extrapolation`` is read by the GN/HL
-    #     two-point PPM Σ kernel and nothing else.  Reaching MPA / COHSEX /
-    #     X_ONLY with it set would produce a perfectly ordinary run whose
+    #     two-point PPM kernels and the MPA kernel.  Reaching COHSEX /
+    #     X_ONLY (or a future unbracketed ansatz) with it set would produce a
+    #     perfectly ordinary run whose
     #     log simply lacks the extrapolation block — the exact failure mode
     #     measurement-discipline rule 1 names, where a green A/B measured
     #     nothing because one arm silently dropped the knob.
@@ -681,7 +687,8 @@ def compute_sigma_xc(
     # Asking the LADDER instead makes both runnable and still refuses the
     # case the guard was written for: an explicit key on a run in which no
     # stage is a plasmon-pole model.
-    if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
+    if (bool(config.sigma.band_extrapolation)
+            and mode.ppm_model is None and mode is not ComputeMode.MPA):
         explicit = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
         run_modes = sigma_stage_modes(config, fallback=mode)
@@ -878,6 +885,11 @@ def compute_sigma_xc(
 
     if mode is ComputeMode.MPA:
         from file_io import mpa_store
+        from .band_extrapolation import (
+            assert_brackets_match_ols_abscissae,
+            extrapolation_weights,
+            plan_band_brackets,
+        )
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid
         from .mpa.sigma_windows import CROSSING_NODE_FLOOR
@@ -908,6 +920,28 @@ def compute_sigma_xc(
         sigma_efermi_ry = (float(occupation_state.mu_ry)
                            if occupation_state is not None
                            else float(wfn.efermi))
+        mpa_band_plan = None
+        if bool(config.sigma.band_extrapolation):
+            s = wfns.slices
+            mpa_band_plan = plan_band_brackets(
+                enabled=True,
+                enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
+                n_occ=int(s.b2 - s.b0),
+                nb_logical=(int(meta.b_id_4_sigma_user or s.b4)
+                            - int(s.b0)),
+                nb_padded=int(s.nb_sigma_sum),
+            )
+            assert_brackets_match_ols_abscissae(
+                mpa_band_plan, s, meta=meta,
+                where="sigma_dispatch MPA plan seam")
+            print_fn(
+                f"  Σc band extrapolation: ON for MPA — "
+                f"{mpa_band_plan.n_brackets} disjoint band increments "
+                f"{mpa_band_plan.bounds}; cumulative band counts "
+                f"{mpa_band_plan.counts} (requested "
+                f"{mpa_band_plan.requested}).")
+            for note in mpa_band_plan.notes:
+                print_fn(f"  Σc band extrapolation: {note}")
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
@@ -925,6 +959,7 @@ def compute_sigma_xc(
             omega_cluster_gap_ry=float(
                 config.mpa.sigma_omega_cluster_gap_ry),
             pole_batch_size=int(config.mpa.pole_batch_size),
+            band_plan=mpa_band_plan,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -949,13 +984,30 @@ def compute_sigma_xc(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+        body_for_sc = body.sigma_c_kij
+        body_unextrap = None
+        extrap_payload = None
+        if mpa_band_plan is not None:
+            body_unextrap = _band_count_point(
+                body.sigma_c_kij, body.sigma_c_kij.shape[0] - 1)
+            body_for_sc = _extrapolated_point(
+                body.sigma_c_kij,
+                extrapolation_weights(body.band_counts))
+            extrap_payload = _report_band_extrapolation(
+                body, head_diag,
+                plan=mpa_band_plan, config=config,
+                band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
+                mesh_xy=mesh_xy, print_fn=print_fn,
+                efermi_ry=sigma_efermi_ry)
         return finalize_dynamic_sigma(
-            body.sigma_c_kij, head_diag,
+            body_for_sc, head_diag,
             sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
             config=config, meta=meta, mesh_xy=mesh_xy,
             sym=sym, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
+            band_extrapolation=extrap_payload,
+            sigma_c_body_omega_unextrap=body_unextrap,
             print_fn=print_fn,
             # The MPA grid was built against this mu (one chemical
             # potential per iteration); the finalizer must read it back

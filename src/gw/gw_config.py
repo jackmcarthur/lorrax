@@ -2084,12 +2084,13 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
 def band_extrapolation_is_consumable(modes) -> bool:
     """Does ANY stage of this run reach the kernel that reads the key?
 
-    ``ppm_model is not None`` is the exact predicate: the extrapolation is
-    wired into the two-point GN/HL plasmon-pole Σ_c kernel and nothing else.
-    Deliberately NOT ``is_dynamic`` — that is True for MPA, which is dynamic
-    and still does not consume this key.
+    The two-point GN/HL plasmon-pole stages and the MPA stage consume the
+    shared band-bracket plan.  Deliberately NOT ``is_dynamic``: that would
+    silently make every future dynamic ansatz a consumer before it had a
+    bracketed band contraction and OLS/trust path of its own.
     """
-    return any(getattr(m, "ppm_model", None) is not None for m in modes)
+    return any(getattr(m, "ppm_model", None) is not None
+               or m is ComputeMode.MPA for m in modes)
 
 
 # ---------------------------------------------------------------------------
@@ -2645,8 +2646,8 @@ class DynamicSigmaConfig:
     #: Band-convergence extrapolation of Sigma_c, resolved from
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
-    #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
-    #: (``gw.ppm_pipeline``); on a non-PPM ``compute_mode`` it is turned OFF
+    #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM and MPA
+    #: pipelines; on a non-consuming ``compute_mode`` it is turned OFF
     #: with a recorded note (or refused -- see ``band_extrapolation_explicit``)
     #: by ``gw.sigma_dispatch``, because the 1/N limit is mode-dependent and
     #: wrong for a static Coulomb hole.
