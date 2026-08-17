@@ -340,6 +340,9 @@ def run_fit_driver(
     provenance=None,
     occupation_state=None,
     report_stream=None,
+    n_extra_poles=0,
+    extra_pole_model=None,
+    finalize=True,
 ):
     """The whole fit stage: allocate, walk, stage, finalize, report.
 
@@ -357,6 +360,13 @@ def run_fit_driver(
     decision nobody reads.
     """
     n = int(n_p)
+    n_extra = int(n_extra_poles)
+    if n_extra < 0:
+        raise ValueError("run_fit_driver requires n_extra_poles >= 0")
+    if n_extra and str(extra_pole_model) != "intraband_eigenmode_v1":
+        raise ValueError(
+            "run_fit_driver: an extra pole suffix requires "
+            "extra_pole_model='intraband_eigenmode_v1'")
     rcond = float(rcond)
     if not 0.0 < rcond < 1.0:
         raise ValueError("run_fit_driver requires 0 < rcond < 1")
@@ -399,7 +409,9 @@ def run_fit_driver(
         "fit_fused": True,
     })
     mpa_store.allocate_fit_store_collective(
-        fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
+        fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu,
+        n_p=n + n_extra, n_p_fit=(n if n_extra else None),
+        intraband_model=(extra_pole_model if n_extra else None),
         diagnostic_keys=_DIAGNOSTIC_KEYS,
         energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
@@ -414,6 +426,8 @@ def run_fit_driver(
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
+        "n_p_fit": n,
+        "n_p_extra": n_extra,
         "solve": "loewner",
         "eig": _FIT_EIG,
         "rcond": rcond,
@@ -459,11 +473,21 @@ def run_fit_driver(
         raise ValueError(
             "run_fit_driver: refusing collective finalize because the fit "
             "ledger still has unfinished columns")
-    if process_rank() == 0:
-        mpa_store.finalize_fit_store(
-            fit_dest, certification=certification)
-    barrier("mpa_fit_finalized")
-    ledger = mpa_store.fit_completion_ledger(fit_dest)
+    if finalize:
+        if n_extra:
+            raise ValueError(
+                "run_fit_driver: cannot finalize before the declared extra "
+                "pole suffix is appended; call with finalize=False, write "
+                "the suffix, then finalize once with its certifications")
+        if process_rank() == 0:
+            mpa_store.finalize_fit_store(
+                fit_dest, certification=certification)
+        barrier("mpa_fit_finalized")
+        ledger = mpa_store.fit_completion_ledger_collective(
+            fit_dest, key="fit-driver-finalized")
+    else:
+        barrier("mpa_fit_prefix_complete")
+        ledger = before
     report["seconds"]["finalize"] = time.perf_counter() - t_fin
 
     report["logical_outputs"] = 2 * n * report["elements_fitted"]
@@ -471,6 +495,7 @@ def run_fit_driver(
                                     * report["tile_bytes"])
     report["condition_max"] = ledger["condition_max"]
     report["backward_error_max"] = ledger["backward_error_max"]
+    report["certification"] = certification
     report["seconds"]["total"] = time.perf_counter() - t_total
 
     if report_stream is not None and process_rank() == 0:

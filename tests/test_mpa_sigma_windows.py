@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from gw.mpa import sigma_windows as SW
 from gw.ppm_tau_kernel import build_shared_w_tau
@@ -115,6 +116,55 @@ def test_actual_windows_match_all_four_causal_denominators():
                 B_host[p] / (omega - energy - pole)
                 for p, pole in enumerate(poles))
         np.testing.assert_allclose(got, want, rtol=2.0e-6, atol=3.0e-6)
+
+
+def test_small_rank_one_intraband_pole_plans_and_replays_at_eta_zero():
+    """WP4: the appended 0.05-Ry pole uses the ordinary planner/executor."""
+    energy, omega = 0.02, 0.03
+    branch = _SigmaBranch(
+        "pos_cond", jnp.asarray([[energy]]), jnp.asarray([[True]]),
+        "cond", False, np.asarray([omega]), np.asarray([0]))
+    pole = 0.05 - 0.01j
+    vector = np.asarray([0.7 + 0.2j, -0.3 + 0.4j])
+    residue = np.outer(vector, vector.conj())
+    Omega = jnp.full((1, 1, 2, 2), pole, dtype=jnp.complex128)
+    B = jnp.asarray(residue[None, None, :, :])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, [branch], regularization_width_ry=0.0,
+        edge_factor=1.5)
+    plan, geometry = SW.build_shared_sigma_windows(
+        summaries, [branch], regularization_width_ry=0.0,
+        edge_factor=1.5, target_error=1.0e-7, max_rank=128,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
+    assert geometry["eta_ry"] == 0.0
+    assert plan
+    got = np.zeros_like(residue)
+    for row in plan:
+        win = row.window
+        build_all = jax.jit(jax.vmap(
+            lambda t: build_shared_w_tau(
+                B, Omega, jnp.asarray(row.pole_indices),
+                jnp.asarray(row.bounds), jnp.asarray(row.phase_real),
+                win.E_ref_B, t)))
+        W_t = np.asarray(build_all(win.nodes.t))[:, 0]
+        t = np.asarray(win.nodes.t)
+        alpha = np.asarray(win.nodes.alpha)
+        G_t = np.exp(-1j * (energy - win.E_ref_A) * t)
+        coeff = (win.prefactor * alpha
+                 * np.exp(-1j * (win.E_ref_A + win.E_ref_B
+                                  - win.omega_sign * omega) * t))
+        got += np.sum(coeff[:, None, None] * G_t[:, None, None] * W_t,
+                      axis=0)
+    # pos_cond carries the causal Sigma prefactor -1 (the planner's ``neg``
+    # convention); compare the executor with that branch-exact denominator,
+    # not with W alone.
+    want = -residue / (omega - energy - pole)
+    np.testing.assert_allclose(got, want, rtol=3.0e-6, atol=3.0e-6)
+
+    with pytest.raises(ValueError, match="unsupported live poles"):
+        SW.summarize_sigma_poles(
+            jnp.full_like(Omega, -0.05 + 0.01j), B, [branch],
+            regularization_width_ry=0.0, edge_factor=1.5)
 
 
 def test_actual_stripe_and_slab_match_direct_complex_denominators():
@@ -322,11 +372,11 @@ def test_exact_zero_residue_pole_does_not_change_geometry(monkeypatch):
                 for row in base]
 
 
-def test_nonpositive_eta_refuses():
+def test_negative_or_nonfinite_eta_refuses():
     summaries = SW.summarize_sigma_poles(
         jnp.stack(_poles()), jnp.ones_like(jnp.stack(_poles())), _branches(),
         regularization_width_ry=0.2, edge_factor=1.5)
-    for eta in (0.0, -0.2, np.nan):
+    for eta in (-0.2, np.nan):
         try:
             SW.build_shared_sigma_windows(
                 summaries, _branches(),
@@ -334,7 +384,7 @@ def test_nonpositive_eta_refuses():
                 edge_factor=1.5, target_error=1.0e-4, max_rank=96,
                 crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
         except ValueError as exc:
-            assert "eta must be finite and positive" in str(exc)
+            assert "eta must be finite and non-negative" in str(exc)
         else:
             raise AssertionError(f"invalid eta {eta!r} was accepted")
 

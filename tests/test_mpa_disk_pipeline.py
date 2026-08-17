@@ -328,6 +328,30 @@ def test_sigma_store_reads_contiguous_four_pole_ranges(monkeypatch):
         f"one reader for the whole walk, not one per batch; got {opened}")
 
 
+def test_sigma_batch_walk_crosses_the_fit_block_boundary(monkeypatch):
+    """WP4: a batch may contain the last fit poles and first block poles."""
+    reads = []
+
+    def consume(_wfns, batches, n_poles, *_args, **_kwargs):
+        assert n_poles == 9
+        got = []
+        for lo, Omega, _B in batches:
+            got.append((lo, lo + int(Omega.shape[0])))
+        return got
+
+    monkeypatch.setattr(
+        mpa_sigma, "open_pole_reader",
+        lambda *_a, **_k: _FakeReader(reads))
+    monkeypatch.setattr(mpa_sigma, "_integrate_sigma_batches", consume)
+    got = mpa_sigma.integrate_sigma_store(
+        None, "v2-poles.h5", 9, (), np.array([0.0]), None, _mesh(),
+        pole_batch_size=4)
+    assert got == [(0, 4), (4, 8), (8, 9)]
+    n_fit = 6
+    assert any(lo < n_fit < hi for lo, hi in got), (
+        "the synthetic v2 boundary must lie inside a real executor batch")
+
+
 def test_sigma_store_reuses_a_reader_the_caller_already_opened(monkeypatch):
     """A live reader passed in is USED, not reopened.
 

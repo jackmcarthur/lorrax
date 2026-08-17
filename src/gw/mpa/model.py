@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import jax
 import numpy as np
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -342,11 +343,275 @@ def _solve_wc(
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
-              provenance=None, occupation_state=None):
+              provenance=None, occupation_state=None, n_extra_poles=0,
+              finalize=True):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
         tile_bytes=tile_bytes, provenance=provenance,
-        occupation_state=occupation_state)
+        occupation_state=occupation_state,
+        n_extra_poles=n_extra_poles,
+        extra_pole_model=(
+            "intraband_eigenmode_v1" if n_extra_poles else None),
+        finalize=finalize)
+
+
+def _relative_frobenius(model, exact):
+    numerator = jnp.real(jnp.vdot(model - exact, model - exact))
+    denominator = jnp.real(jnp.vdot(exact, exact))
+    value = jnp.sqrt(numerator / jnp.maximum(
+        denominator, np.finfo(np.float64).tiny))
+    return float(np.asarray(value.block_until_ready()))
+
+
+def _build_intraband_rows(sample_path, V, z, intraband_blocks, mesh_xy):
+    """Build one frozen-static eigenmode block at a time."""
+    from gw.mpa import intraband_block
+
+    Wc0, _ = mpa_store.read_w_slab_collective(
+        sample_path, _WC, 0, mesh_xy=mesh_xy)
+    W0bar = Wc0 + V
+    z_block = np.asarray(z, dtype=np.complex128).copy()
+    z_block[0] = 0.0j
+    rows = []
+    for iq, pair_block in enumerate(intraband_blocks):
+        if int(pair_block[0].shape[0]) == 0:
+            rows.append(None)
+            continue
+        try:
+            row = intraband_block.build_row(
+                W0bar[iq], pair_block, z_block)
+        except ValueError as exc:
+            if "GATE intraband_dense_eigenproblem_size" not in str(exc):
+                raise
+            raise ValueError(
+                f"GATE intraband_dense_eigenproblem_size at wedge q row "
+                f"{iq}: {exc}") from exc
+        rows.append(row)
+    del Wc0, W0bar
+    n_poles = max(
+        (row.n_poles for row in rows if row is not None), default=0)
+    if n_poles < 1:
+        raise ValueError(
+            "GATE intraband_finite_q_empty: every crossing-block row is "
+            "empty; Gamma must be empty but finite q must contribute")
+    return rows, int(n_poles)
+
+
+def _padded_intraband_arrays(rows, n_poles, n_mu, mesh_xy):
+    """Return row slabs plus the stacked wedge field used by certificates."""
+    from gw.mpa import intraband_block
+
+    pole_shard = NamedSharding(mesh_xy, P(None, "x", "y"))
+    slabs = []
+    for row in rows:
+        if row is None:
+            Om = jnp.ones((n_poles, n_mu, n_mu), dtype=jnp.complex128)
+            Bp = jnp.zeros((n_poles, n_mu, n_mu), dtype=jnp.complex128)
+            Om = jax.lax.with_sharding_constraint(Om, pole_shard)
+            Bp = jax.lax.with_sharding_constraint(Bp, pole_shard)
+        else:
+            Om, Bp = intraband_block.pad_row(row, n_poles)
+        slabs.append((Om, Bp))
+    field_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.stack([value[0] for value in slabs], axis=1), field_shard)
+    B = jax.lax.with_sharding_constraint(
+        jnp.stack([value[1] for value in slabs], axis=1), field_shard)
+    return slabs, Omega, B
+
+
+def _append_intraband_rows(fit_path, rows, slabs, mesh_xy):
+    """Append every q row and leave the store unfinalized for certification."""
+    for iq, (row, (Omega, Bp)) in enumerate(zip(rows, slabs)):
+        live = jnp.abs(Bp) != 0.0
+        nonfinite = jnp.count_nonzero(
+            ~jnp.isfinite(Omega) | ~jnp.isfinite(Bp))
+        bad = jnp.count_nonzero(
+            live & ((jnp.real(Omega) <= 0.0) | (jnp.imag(Omega) > 0.0)))
+        finite = int(np.asarray(nonfinite.block_until_ready())) == 0
+        causal = int(np.asarray(bad.block_until_ready())) == 0
+        anomaly = {} if row is None else {
+            "folded_modes": row.folded_modes,
+            "dropped_modes": row.dropped_modes,
+            "folded_elements": row.folded_elements,
+            "dropped_elements": row.dropped_elements,
+        }
+        mpa_store.write_intraband_row_collective(
+            fit_path, iq, Omega[:, None, :, :], Bp[:, None, :, :],
+            mesh_xy=mesh_xy, poles_finite=finite, poles_causal=causal,
+            anomaly_counts=anomaly)
+
+
+def _evaluate_fit_prefix(fit_path, n_p_fit, z_values, mesh_xy):
+    """Evaluate a staged Loewner prefix without ever reading its suffix."""
+    values = None
+    with mpa_store.open_pole_reader(
+            fit_path, mesh_xy=mesh_xy, allow_partial=True) as reader:
+        for lo in range(0, int(n_p_fit), 4):
+            hi = min(lo + 4, int(n_p_fit))
+            Omega, Bp = reader.read(
+                slice(lo, hi), unfold=False, return_sharded=True,
+                to_unit="Ry")
+            batch = [jnp.sum(
+                2.0 * Omega * Bp
+                / (complex(z) ** 2 - Omega * Omega), axis=0)
+                for z in z_values]
+            if values is None:
+                values = batch
+            else:
+                values = [old + add for old, add in zip(values, batch)]
+            del Omega, Bp
+    return tuple(values)
+
+
+def _two_shortest_finite_q_rows(q_idx, kgrid):
+    """Indices of the two shortest non-Gamma irreducible star rows."""
+    grid = np.asarray(kgrid, dtype=np.int64)
+    rows = []
+    for row, flat in enumerate(np.asarray(q_idx, dtype=np.int64)):
+        coord = np.asarray(np.unravel_index(int(flat), tuple(grid)))
+        wrapped = np.minimum(coord, grid - coord) / grid
+        norm = float(np.linalg.norm(wrapped))
+        if norm > 0.0:
+            rows.append((norm, int(flat), row))
+    if len(rows) < 2:
+        raise ValueError(
+            "GATE intraband_gap_stars: fewer than two finite-q wedge rows")
+    return np.asarray([item[2] for item in sorted(rows)[:2]], np.int32)
+
+
+def _combined_relative(models, exacts):
+    numerator = 0.0
+    denominator = 0.0
+    for model, exact in zip(models, exacts):
+        numerator = numerator + jnp.real(jnp.vdot(model - exact,
+                                                   model - exact))
+        denominator = denominator + jnp.real(jnp.vdot(exact, exact))
+    value = jnp.sqrt(numerator / jnp.maximum(
+        denominator, np.finfo(np.float64).tiny))
+    return float(np.asarray(value.block_until_ready()))
+
+
+def _maximum_relative(models, exacts):
+    """Worst Frobenius-relative member of a stamped observable family."""
+    return max(
+        (_relative_frobenius(model, exact)
+         for model, exact in zip(models, exacts)),
+        default=0.0,
+    )
+
+
+def _certify_intraband_support(
+    sample_path, fit_path, V, z, Omega_intra, B_intra, meta, mesh_xy,
+    *, dyson_solver, distrib_la_batched_route,
+):
+    """Measure exact-DeltaW and total-model errors on all stamped samples."""
+    from gw.mpa.intraband_block import evaluate_pole_sum
+    from gw.w_isdf import solve_w
+
+    prefix = _evaluate_fit_prefix(
+        fit_path, mpa_store.fit_completion_ledger(fit_path)["n_p_fit"],
+        z, mesh_xy)
+    exact_delta, model_delta = [], []
+    exact_total, model_total, prefix_exact = [], [], []
+    for index, z_value in enumerate(z):
+        chi, _ = mpa_store.read_w_slab_collective(
+            sample_path, _CHI, index, mesh_xy=mesh_xy)
+        remainder, _ = mpa_store.read_w_slab_collective(
+            sample_path, _WC, index, mesh_xy=mesh_xy)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        full_wc = W - V
+        block_z = 0.0j if index == 0 else z_value
+        block = evaluate_pole_sum(Omega_intra, B_intra, block_z)
+        exact_delta.append(full_wc - remainder)
+        model_delta.append(block)
+        exact_total.append(full_wc)
+        model_total.append(prefix[index] + block)
+        prefix_exact.append(remainder)
+        del chi, remainder, W
+    block_error = _maximum_relative(model_delta, exact_delta)
+    total_error = _maximum_relative(model_total, exact_total)
+    prefix_error = _maximum_relative(prefix, prefix_exact)
+    static_error = _relative_frobenius(model_delta[0], exact_delta[0])
+    return {
+        "block_sample_frobenius_relative": block_error,
+        "total_sample_frobenius_relative": total_error,
+        "remainder_fit_frobenius_relative": prefix_error,
+        "static_frobenius_relative": static_error,
+        "block_sample_combined_frobenius_relative": _combined_relative(
+            model_delta, exact_delta),
+        "total_sample_combined_frobenius_relative": _combined_relative(
+            model_total, exact_total),
+        "remainder_fit_combined_frobenius_relative": _combined_relative(
+            prefix, prefix_exact),
+    }
+
+
+def _evaluate_gap_chi(
+    wfns, occupation_state, config, meta, mesh_xy,
+):
+    """The design's five held-out points on the 0.2-Ry line."""
+    from gw.mpa import evaluator
+    from gw.w_isdf import (
+        compute_chi0_contour_fractional,
+        occupation_support_bandwidth,
+    )
+
+    z_gap = np.asarray(
+        [0.04 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
+         0.30 + 0.2j, 0.60 + 0.2j], dtype=np.complex128)
+    occ_window = float(config.mpa.occupation_window_threshold)
+    delta_max = occupation_support_bandwidth(
+        wfns.enk, occupation_state.f_kn,
+        occupation_window_threshold=occ_window)
+    rule = evaluator.damped_line_rule(
+        0.2, delta_max + float(np.max(z_gap.real)),
+        rel_tol=config.minimax_config.target_error,
+        max_order=config.minimax_config.max_nodes)
+    values = compute_chi0_contour_fractional(
+        wfns, rule["t"], rule["h"], z_gap, meta, mesh_xy,
+        occupations=occupation_state.f_kn,
+        energy_reference=float(occupation_state.mu_ry),
+        occupation_window_threshold=occ_window)
+    return z_gap, tuple(values)
+
+
+def _certify_intraband_gap(
+    fit_path, V, z_gap, chi_gap, q_idx, Omega_intra, B_intra,
+    meta, mesh_xy, *, dyson_solver, distrib_la_batched_route,
+):
+    """Held-out total-W observable on the two shortest finite-q stars."""
+    from gw.mpa.intraband_block import evaluate_pole_sum
+    from gw.w_isdf import solve_w
+
+    rows = _two_shortest_finite_q_rows(q_idx, meta.kgrid)
+    n_fit = mpa_store.fit_completion_ledger(fit_path)["n_p_fit"]
+    prefix = _evaluate_fit_prefix(fit_path, n_fit, z_gap, mesh_xy)
+    exacts, fit_only, with_block = [], [], []
+    for index, (z_value, chi_full) in enumerate(zip(z_gap, chi_gap)):
+        chi = _to_wedge(chi_full, q_idx, mesh_xy)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        exact = (W - V)[rows]
+        block = evaluate_pole_sum(Omega_intra, B_intra, z_value)
+        exacts.append(exact)
+        fit_only.append(prefix[index][rows])
+        with_block.append((prefix[index] + block)[rows])
+        del chi, W
+    return {
+        "q_rows": rows,
+        "fit_only_frobenius_relative": _maximum_relative(
+            fit_only, exacts),
+        "with_block_frobenius_relative": _maximum_relative(
+            with_block, exacts),
+        "fit_only_combined_frobenius_relative": _combined_relative(
+            fit_only, exacts),
+        "with_block_combined_frobenius_relative": _combined_relative(
+            with_block, exacts),
+    }
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -697,9 +962,88 @@ def build_mpa_fit(
         iteration_head = wc_source(
             sample_path, V, z_all, q_idx, meta, mesh_xy,
             config.backend.w_dyson_solver)
-    _, report = _fit_body(
-        sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
-        provenance=provenance, occupation_state=occupation_state)
+    if intraband_blocks is None:
+        _, report = _fit_body(
+            sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
+            provenance=provenance, occupation_state=occupation_state)
+    else:
+        from common.collectives import barrier, process_rank
+        from gw.mpa import intraband_block
+
+        rows, n_p_intra = _build_intraband_rows(
+            sample_path, V, z_all, intraband_blocks, mesh_xy)
+        slabs, Omega_intra, B_intra = _padded_intraband_arrays(
+            rows, n_p_intra, meta.n_rmu, mesh_xy)
+        _, report = _fit_body(
+            sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
+            provenance=provenance, occupation_state=occupation_state,
+            n_extra_poles=n_p_intra, finalize=False)
+        _append_intraband_rows(fit_path, rows, slabs, mesh_xy)
+
+        dyson = config.backend.w_dyson_solver
+        distrib_route = getattr(
+            config.backend, "distrib_la_batched_route", "auto")
+        support_cert = _certify_intraband_support(
+            sample_path, fit_path, V, z_all, Omega_intra, B_intra,
+            meta, mesh_xy, dyson_solver=dyson,
+            distrib_la_batched_route=distrib_route)
+        z_gap, chi_gap = _evaluate_gap_chi(
+            wfns, occupation_state, config, meta, mesh_xy)
+        gap_cert = _certify_intraband_gap(
+            fit_path, V, z_gap, chi_gap, q_idx, Omega_intra, B_intra,
+            meta, mesh_xy, dyson_solver=dyson,
+            distrib_la_batched_route=distrib_route)
+
+        gap_allowed = max(
+            np.finfo(np.float64).eps,
+            min(4.0e-3,
+                3.0 * support_cert["total_sample_frobenius_relative"]))
+        certification = dict(report["certification"])
+        certification.update({
+            "intraband_sample_max_rel_error":
+                support_cert["block_sample_frobenius_relative"],
+            "intraband_sample_max_rel_error_max_allowed":
+                intraband_block.SAMPLE_REL_TOL,
+            "intraband_static_max_rel_error":
+                support_cert["static_frobenius_relative"],
+            "intraband_static_max_rel_error_max_allowed":
+                intraband_block.STATIC_REL_TOL,
+            "intraband_gap_max_rel_error":
+                gap_cert["with_block_frobenius_relative"],
+            "intraband_gap_max_rel_error_max_allowed": gap_allowed,
+            "intraband_support_total_frobenius_relative":
+                support_cert["total_sample_frobenius_relative"],
+            "intraband_support_remainder_frobenius_relative":
+                support_cert["remainder_fit_frobenius_relative"],
+            "intraband_gap_fit_only_frobenius_relative":
+                gap_cert["fit_only_frobenius_relative"],
+            "intraband_gap_q_rows": ",".join(
+                map(str, np.asarray(gap_cert["q_rows"]).tolist())),
+            "intraband_builder_max_compression_rel_error": max(
+                (row.sample_max_rel_error for row in rows
+                 if row is not None), default=0.0),
+            "intraband_builder_max_cluster_width_ry": max(
+                (row.cluster_width_max_ry for row in rows
+                 if row is not None), default=0.0),
+        })
+        if process_rank() == 0:
+            mpa_store.finalize_fit_store(
+                fit_path, certification=certification)
+        barrier("mpa_fit_with_intraband_finalized")
+        ledger = mpa_store.fit_completion_ledger_collective(
+            fit_path, key="intraband-finalized")
+        report["certification"] = certification
+        report["n_p_intraband"] = n_p_intra
+        report["n_p_total"] = ledger["n_p"]
+        report["intraband_support"] = support_cert
+        report["intraband_gap"] = gap_cert
+        print_fn(
+            "  MPA intraband block: "
+            f"M_p={n_p_intra}, support="
+            f"{support_cert['block_sample_frobenius_relative']:.3e}, "
+            f"static={support_cert['static_frobenius_relative']:.3e}, "
+            f"gap={gap_cert['with_block_frobenius_relative']:.3e} "
+            f"(allowed {gap_allowed:.3e})")
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter

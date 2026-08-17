@@ -44,6 +44,7 @@ from symmetry_maps import verify_centroid_orbit_closure           # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
 from file_io import mpa_store as MS                               # noqa: E402
+from gw.mpa import intraband_block as IB                         # noqa: E402
 from gw.mpa import tiling                                         # noqa: E402
 from tests._mpa_test_geometry import (                            # noqa: E402
     FFT as _FFT, SYMS as _SYMS, TNP as _TNP, N_Q_FULL as _N_Q_FULL,
@@ -61,6 +62,15 @@ _SEEDS = ((0, 0, 0), (4, 5, 0), (2, 2, 6), (9, 7, 6),
 #: fails.  The cells that are ABOUT certification state their own.
 _CERT = {"condition_max_allowed": 1.0e12,
          "backward_error_max_allowed": 1.0}
+
+_INTRA_CERT = {
+    "intraband_sample_max_rel_error": 1.0e-4,
+    "intraband_sample_max_rel_error_max_allowed": 4.0e-3,
+    "intraband_static_max_rel_error": 1.0e-14,
+    "intraband_static_max_rel_error_max_allowed": 2.0e-11,
+    "intraband_gap_max_rel_error": 8.0e-4,
+    "intraband_gap_max_rel_error_max_allowed": 1.0e-3,
+}
 
 #: The sampling record every W(ω) file must carry.  Si-shaped: the
 #: double-parallel lines ϖ₁ = 0.1 Ha and ϖ₂ = 1 Ha, α = 1 for an
@@ -955,6 +965,166 @@ def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
         assert f.attrs["mpa_cert_condition_max_allowed"] == 1e8
         assert f.attrs["mpa_fit_w_grid_hash"] == "sha256:deadbeef"
         assert int(f.attrs["mpa_fit_n_blocks"]) == 2 * 3
+
+
+def test_v2_fit_prefix_and_intraband_suffix_have_independent_ledgers(
+        tmpdir_path):
+    """WP3: the fit cannot certify zero-filled slots as an appended block."""
+    n_q, n_mu, n_fit, n_intra = 2, 3, 2, 1
+    ledger = MS.allocate_fit_store(
+        tmpdir_path, n_q=n_q, n_mu=n_mu, n_p=n_fit + n_intra,
+        n_p_fit=n_fit, intraband_model="intraband_eigenmode_v1",
+        energy_unit="Ry")
+    assert ledger["format_version"] == \
+        MS.MPA_FIT_FORMAT_VERSION_INTRABAND == 2
+    assert ledger["n_p"] == 3 and ledger["n_p_fit"] == 2
+    assert ledger["n_p_intraband"] == 1
+    for q in range(n_q):
+        Om, Bp, diag = _fit_block(n_fit, n_mu, n_mu, seed=81 + q)
+        MS.write_fit_block(
+            tmpdir_path, q, np.arange(n_mu), Om, Bp, diag)
+    with pytest.raises(ValueError, match="unwritten q rows"):
+        MS.finalize_fit_store(
+            tmpdir_path, certification=dict(_CERT, **_INTRA_CERT))
+
+    suffix = []
+    for q in range(n_q):
+        Om = np.full((n_intra, n_mu, n_mu), 0.05 - 0.002j)
+        Bp = np.full_like(Om, (q + 1) * (0.2 + 0.1j))
+        suffix.append((Om, Bp))
+        MS.write_intraband_row(
+            tmpdir_path, q, Om, Bp,
+            anomaly_counts={"folded_modes": q})
+    with pytest.raises(ValueError, match="intraband_sample"):
+        MS.finalize_fit_store(tmpdir_path, certification=_CERT)
+    ledger = MS.finalize_fit_store(
+        tmpdir_path, certification=dict(_CERT, **_INTRA_CERT))
+    assert ledger["complete"] and ledger["intraband_complete"]
+    assert ledger["intraband_rows_done"].tolist() == [True, True]
+    Om, Bp, _diag, got = MS.read_fit_tensors(tmpdir_path)
+    assert Om.shape == Bp.shape == (3, n_q, n_mu, n_mu)
+    for q, (want_Om, want_Bp) in enumerate(suffix):
+        np.testing.assert_array_equal(Om[n_fit:, q], want_Om)
+        np.testing.assert_array_equal(Bp[n_fit:, q], want_Bp)
+    assert got["certification"]["intraband_gap_max_rel_error"] == 8.0e-4
+    assert MS.validate_fit_store(tmpdir_path)["n_p"] == 3
+    with h5py.File(tmpdir_path, "r") as f:
+        assert f.attrs["mpa_intra_model"] == "intraband_eigenmode_v1"
+        assert int(f.attrs["mpa_intra_folded_modes"]) == 1
+
+
+def test_v2_sigma_refuses_a_failed_gap_observable(tmpdir_path):
+    """WP4: certification values are consumed, not decorative attrs."""
+    MS.allocate_fit_store(
+        tmpdir_path, n_q=1, n_mu=2, n_p=2, n_p_fit=1,
+        intraband_model="intraband_eigenmode_v1", energy_unit="Ry")
+    Om, Bp, diag = _fit_block(1, 2, 2, seed=91)
+    MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)
+    MS.write_intraband_row(
+        tmpdir_path, 0,
+        np.full((1, 2, 2), 0.05 - 0.001j),
+        np.ones((1, 2, 2), np.complex128))
+    failed = dict(_CERT, **_INTRA_CERT)
+    failed["intraband_gap_max_rel_error"] = 2.0e-3
+    MS.finalize_fit_store(tmpdir_path, certification=failed)
+    with pytest.raises(ValueError, match="failed certification.*gap"):
+        MS.validate_fit_store(tmpdir_path)
+
+
+def test_fit_only_allocation_keeps_the_v1_meaning(tmpdir_path):
+    """M_p=0 is the legacy layout, with no half-stamped suffix metadata."""
+    ledger = MS.allocate_fit_store(
+        tmpdir_path, n_q=1, n_mu=2, n_p=2, n_p_fit=2,
+        intraband_model=None)
+    assert ledger["format_version"] == MS.MPA_FIT_FORMAT_VERSION == 1
+    assert ledger["n_p_fit"] == ledger["n_p"] == 2
+    assert ledger["n_p_intraband"] == 0
+    with h5py.File(tmpdir_path, "r") as f:
+        assert "mpa_fit_n_p_fit" not in f.attrs
+        assert "mpa_intra_n_poles" not in f.attrs
+        assert "intraband_rows_done" not in f[MS.MPA_FIT_SUFFIX]
+
+
+def test_zero_intraband_poles_are_byte_identical_to_legacy(
+        tmp_path, monkeypatch):
+    """WP3: spelling M_p=0 cannot perturb even the HDF5 file bytes."""
+    legacy = tmp_path / "legacy.h5"
+    explicit_zero = tmp_path / "explicit_zero.h5"
+    monkeypatch.setattr(MS, "_utc_now", lambda: "2026-08-17T00:00:00+00:00")
+    common = dict(n_q=2, n_mu=3, n_p=2, energy_unit="Ry",
+                  provenance={"deck": "zero-block-byte-gate"})
+    MS.allocate_fit_store(legacy, **common)
+    MS.allocate_fit_store(
+        explicit_zero, **common, n_p_fit=2, intraband_model=None)
+    assert legacy.read_bytes() == explicit_zero.read_bytes()
+
+
+def test_intraband_block_matches_direct_nonidentity_star_rebuild():
+    """WP3: directly rebuilt A/B equals the store's spatial-star unfold."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    tables, _verdict, n_mu = _geometry()
+    irr = np.asarray(tables.irr_idx_q)
+    sym = np.asarray(tables.sym_idx_q)
+    n_spatial = int(tables.n_sym_spatial)
+    candidates = np.flatnonzero((sym > 0) & (sym < n_spatial))
+    assert candidates.size, "synthetic glide geometry needs a spatial star"
+    iq = int(candidates[0])
+    parent, s = int(irr[iq]), int(sym[iq])
+    perm = np.asarray(tables.sym_perm[s])
+    qL = (np.asarray(tables.L_table[s], dtype=float)
+          @ np.asarray(tables.q_irr_frac)[parent])
+    phase = np.exp(2j * np.pi * qL)
+
+    mesh = _mesh()
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    pair_x_shard = NamedSharding(mesh, P(None, "x"))
+    pair_y_shard = NamedSharding(mesh, P(None, "y"))
+    rep = NamedSharding(mesh, P(None))
+    rng = np.random.default_rng(90210)
+    raw = (rng.normal(size=(n_mu, n_mu))
+           + 1j * rng.normal(size=(n_mu, n_mu)))
+    W0 = 0.01 * (raw + raw.conj().T) + 0.2 * np.eye(n_mu)
+    n_pair = 6
+    vertices = (rng.normal(size=(n_pair, n_mu))
+                + 1j * rng.normal(size=(n_pair, n_mu))) / 4.0
+    u = np.linspace(0.04, 0.18, n_pair)
+    w = np.linspace(1.0e-4, 8.0e-4, n_pair)
+    samples = np.linspace(0.04, 0.60, 24) + 0.2j
+
+    def build(W, Pv):
+        return IB.build_row(
+            jax.device_put(jnp.asarray(W), matrix_shard),
+            (jax.device_put(jnp.asarray(u), rep),
+             jax.device_put(jnp.asarray(w), rep),
+             (jax.device_put(jnp.asarray(Pv), pair_x_shard),
+              jax.device_put(jnp.asarray(Pv), pair_y_shard))),
+            samples, sample_rel_tol=1.0e-10)
+
+    parent_row = build(W0, vertices)
+    member_W0 = (phase[:, None] * W0[np.ix_(perm, perm)]
+                 * np.conj(phase)[None, :])
+    member_vertices = vertices[:, perm] * phase[None, :]
+    member_row = build(member_W0, member_vertices)
+    assert parent_row.n_poles == member_row.n_poles
+
+    for pole in range(parent_row.n_poles):
+        Omega_wedge = np.ones((_N_Q_IBZ, n_mu, n_mu), np.complex128)
+        B_wedge = np.zeros_like(Omega_wedge)
+        Omega_wedge[parent] = np.asarray(parent_row.Omega_p[pole])
+        B_wedge[parent] = np.asarray(parent_row.B_p[pole])
+        Omega_full, B_full = MS.unfold_pole_field(
+            jnp.asarray(Omega_wedge), jnp.asarray(B_wedge), tables,
+            mesh_xy=mesh)
+        np.testing.assert_allclose(
+            np.asarray(Omega_full[iq]),
+            np.asarray(member_row.Omega_p[pole]),
+            rtol=2.0e-9, atol=2.0e-11)
+        np.testing.assert_allclose(
+            np.asarray(B_full[iq]), np.asarray(member_row.B_p[pole]),
+            rtol=2.0e-9, atol=2.0e-11)
 
 
 def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):

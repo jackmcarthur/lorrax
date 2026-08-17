@@ -135,6 +135,7 @@ import contextlib
 import datetime
 import hashlib
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -201,6 +202,16 @@ FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
 #: another.
 REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
 
+# The analytic suffix is not trusted merely because its bytes exist.  These
+# are the three observables the design requires the builder to measure before
+# Sigma may consume it: agreement on the stamped support, the exact static
+# identity, and the independent gap-region W reconstruction.
+REQUIRED_INTRABAND_CERTIFICATIONS = (
+    "intraband_sample_max_rel_error",
+    "intraband_static_max_rel_error",
+    "intraband_gap_max_rel_error",
+)
+
 #: Every scalar-head fit model :func:`read_head_fit` knows how to
 #: interpret.  The reader refuses an unknown model rather than serving
 #: poles whose fitting protocol nobody can name.
@@ -216,6 +227,17 @@ _HEAD_FIT_MODELS = (
 #: format's version: the two files have separate lifetimes and a reader
 #: of one is not a reader of the other.
 MPA_FIT_FORMAT_VERSION = 1
+
+#: Version 2 extends the pole-axis meaning from "all poles came from the
+#: Loewner fit" to the explicit split ``[fit | analytic intraband]``.  A v1
+#: reader must refuse such a file rather than treating the suffix as fitted
+#: poles; the current reader accepts both versions and validates the split
+#: before exposing a ledger.
+MPA_FIT_FORMAT_VERSION_INTRABAND = 2
+MPA_FIT_FORMAT_VERSIONS_READABLE = (
+    MPA_FIT_FORMAT_VERSION,
+    MPA_FIT_FORMAT_VERSION_INTRABAND,
+)
 
 #: Attr marking the leading frequency axis.  Its presence is the ATTR
 #: half of the rank cross-check, and the string names what is removable.
@@ -1907,7 +1929,8 @@ def read_w_columns_collective(
 def _initialise_fit_metadata(
     grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
     centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
-    preserve_payload=False, occupation_state=None,
+    preserve_payload=False, occupation_state=None, n_p_fit=None,
+    intraband_model=None,
 ):
     """Rank-zero-only small metadata half of fit-store allocation."""
     qs = _qs()
@@ -1928,7 +1951,27 @@ def _initialise_fit_metadata(
     if diagnostic_keys is not None:
         led.attrs["diagnostic_keys"] = ",".join(sorted(diagnostic_keys))
 
-    grp.attrs["mpa_fit_format_version"] = np.int64(MPA_FIT_FORMAT_VERSION)
+    n_p_fit = n_p if n_p_fit is None else int(n_p_fit)
+    n_p_intra = int(n_p) - n_p_fit
+    if not 1 <= n_p_fit <= int(n_p) or n_p_intra < 0:
+        raise ValueError(
+            "MPA fit pole split requires 1 <= n_p_fit <= n_p_total; got "
+            f"n_p_fit={n_p_fit}, n_p_total={int(n_p)}")
+    if n_p_intra:
+        if str(intraband_model) != "intraband_eigenmode_v1":
+            raise ValueError(
+                "an appended intraband pole suffix requires "
+                "intraband_model='intraband_eigenmode_v1'")
+        version = MPA_FIT_FORMAT_VERSION_INTRABAND
+        led.create_dataset(
+            "intraband_rows_done", data=np.zeros((n_q,), dtype=bool))
+        grp.attrs["mpa_fit_n_p_fit"] = np.int64(n_p_fit)
+        grp.attrs["mpa_intra_n_poles"] = np.int64(n_p_intra)
+        grp.attrs["mpa_intra_model"] = str(intraband_model)
+        grp.attrs["mpa_intra_complete"] = False
+    else:
+        version = MPA_FIT_FORMAT_VERSION
+    grp.attrs["mpa_fit_format_version"] = np.int64(version)
     if energy_unit is not None:
         grp.attrs[FIT_ENERGY_UNIT_ATTR] = str(energy_unit)
     grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
@@ -1963,6 +2006,8 @@ def allocate_fit_store(
     dtype=None,
     provenance=None,
     occupation_state=None,
+    n_p_fit=None,
+    intraband_model=None,
     mode="a",
 ):
     """Create the staged B_q / Ω_q store with an EMPTY completion ledger.
@@ -2010,7 +2055,8 @@ def allocate_fit_store(
             grp, n_q=n_q, n_mu=n_mu, n_p=n_p, energy_unit=energy_unit,
             grid_hash=grid_hash, table_hash=table_hash,
             centroid_hash=centroid_hash, unfold_tables=unfold_tables,
-            provenance=provenance, occupation_state=occupation_state)
+            provenance=provenance, occupation_state=occupation_state,
+            n_p_fit=n_p_fit, intraband_model=intraband_model)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -2026,6 +2072,7 @@ def allocate_fit_store_collective(
     dest, *, mesh_xy, n_q, n_mu, n_p, diagnostic_keys,
     energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
     unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
+    n_p_fit=None, intraband_model=None,
     mode="w",
 ):
     """Allocate a fit store without any rank owning a pole tensor.
@@ -2047,13 +2094,15 @@ def allocate_fit_store_collective(
     ``occupation_state`` and the three identity hashes are stamped as the
     serial twin documents them.
 
-    RETURNS :func:`fit_completion_ledger`, UNIFORMLY — every rank reads it
-    back after the barrier, so this return does not depend on the rank
-    (which is now true of every collective in this module).
+    RETURNS :func:`fit_completion_ledger` UNIFORMLY through
+    :func:`fit_completion_ledger_collective`: rank zero reads the small
+    metadata record after the publication barrier and broadcasts it, so no
+    peer reopens the inode that the collective writer just closed.
 
     Open sequence: FFI ``'w'`` → barrier → rank-0 h5py ``'a'`` → barrier →
-    all-rank h5py ``'r'``.  Cross-stack alternation with writes on both
-    sides; ``LORRAX_HDF5_ONE_OWNER=strict`` refuses it.
+    rank-0 h5py ``'r'`` → byte broadcast.  Cross-stack alternation with
+    writes on both sides remains visible to the ownership audit;
+    ``LORRAX_HDF5_ONE_OWNER=strict`` refuses it.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -2092,9 +2141,11 @@ def allocate_fit_store_collective(
                 table_hash=table_hash, centroid_hash=centroid_hash,
                 unfold_tables=unfold_tables, provenance=provenance,
                 diagnostic_keys=keys, preserve_payload=True,
-                occupation_state=occupation_state)
+                occupation_state=occupation_state, n_p_fit=n_p_fit,
+                intraband_model=intraband_model)
     barrier("mpa_fit_metadata_allocated")
-    return fit_completion_ledger(dest)
+    return fit_completion_ledger_collective(
+        dest, key="allocate-fit-store")
 
 
 def _utc_now():
@@ -2110,12 +2161,37 @@ def _open_fit(grp):
             f"have been fitted.  A staged store without its ledger is a "
             f"tensor of poles indistinguishable from a tensor of zeros.")
     version = int(grp.attrs.get("mpa_fit_format_version", -1))
-    if version != MPA_FIT_FORMAT_VERSION:
+    if version not in MPA_FIT_FORMAT_VERSIONS_READABLE:
         raise ValueError(
             f"mpa_store: fit store is format version {version}; this "
-            f"reader is version {MPA_FIT_FORMAT_VERSION}.  Refusing "
+            f"reader accepts {list(MPA_FIT_FORMAT_VERSIONS_READABLE)}.  "
+            "Refusing "
             f"rather than guessing.")
-    return grp[MPA_FIT_SUFFIX]
+    led = grp[MPA_FIT_SUFFIX]
+    if version == MPA_FIT_FORMAT_VERSION_INTRABAND:
+        required = (
+            "mpa_fit_n_p_fit", "mpa_intra_n_poles", "mpa_intra_model",
+            "mpa_intra_complete",
+        )
+        missing = [name for name in required if name not in grp.attrs]
+        if "intraband_rows_done" not in led:
+            missing.append(MPA_FIT_SUFFIX + "/intraband_rows_done")
+        if missing:
+            raise ValueError(
+                "mpa_store: v2 intraband fit store is missing "
+                + ", ".join(missing))
+        n_total = int(grp.attrs["mpa_fit_n_p"])
+        n_fit = int(grp.attrs["mpa_fit_n_p_fit"])
+        n_intra = int(grp.attrs["mpa_intra_n_poles"])
+        if n_fit < 1 or n_intra < 1 or n_fit + n_intra != n_total:
+            raise ValueError(
+                "mpa_store: v2 pole split is inconsistent: "
+                f"n_total={n_total}, n_fit={n_fit}, n_intra={n_intra}")
+        if str(grp.attrs["mpa_intra_model"]) != "intraband_eigenmode_v1":
+            raise ValueError(
+                "mpa_store: v2 pole suffix has unknown intraband model "
+                f"{grp.attrs['mpa_intra_model']!r}")
+    return led
 
 
 def _append(dset, values):
@@ -2564,7 +2640,8 @@ def write_fit_block(
     Bp = np.asarray(B_p_block)
     with _h5(dest, mode) as grp:
         led = _open_fit(grp)
-        n_p = int(grp.attrs["mpa_fit_n_p"])
+        n_p = int(grp.attrs.get(
+            "mpa_fit_n_p_fit", grp.attrs["mpa_fit_n_p"]))
         n_q = int(grp.attrs["mpa_fit_n_q"])
         n_mu = int(grp.attrs["mpa_fit_n_mu_logical"])
         if bool(grp.attrs.get("mpa_fit_complete", False)):
@@ -2623,8 +2700,13 @@ def write_fit_block(
 
         lo, hi, sel = _column_span(cols)
         sel = slice(lo, hi) if sel is None else sel
-        grp["Omega_p"][:, iq, :, sel] = Om
-        grp["B_p"][:, iq, :, sel] = Bp
+        # Version 2 reserves a suffix for the independently journalled
+        # intraband block.  A fit block owns the prefix only: spelling the
+        # slice explicitly prevents h5py from trying to broadcast n_p_fit
+        # rows across n_p_total rows and, more importantly, makes it
+        # impossible for a fit retry to overwrite an appended block.
+        grp["Omega_p"][:n_p, iq, :, sel] = Om
+        grp["B_p"][:n_p, iq, :, sel] = Bp
         for key in REQUIRED_DIAGNOSTICS:
             grp["fit_" + key][iq, :, sel] = diag[key]
         for key, arr in diag.items():
@@ -2729,11 +2811,12 @@ def write_fit_block_collective(
         raise ValueError(
             "write_fit_block_collective: pole blocks must agree and have "
             "shape (n_p,1,n_mu_padded,n_cols_buffer)")
-    if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
+    if n_p != ledger["n_p_fit"] or n_rows < ledger["n_mu"] \
             or width < int(cols.size):
         raise ValueError(
             f"write_fit_block_collective: pole block {tuple(Om.shape)} is "
-            f"incompatible with n_p={ledger['n_p']}, n_mu={ledger['n_mu']}, "
+            f"incompatible with n_p_fit={ledger['n_p_fit']}, "
+            f"n_mu={ledger['n_mu']}, "
             f"columns={int(cols.size)}")
     keys = tuple(sorted(diag_block))
     stamped = None
@@ -2756,7 +2839,7 @@ def write_fit_block_collective(
     with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
         valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
         valid_diag = (1, ledger["n_mu"], int(cols.size))
-        global_pole = (n_p, ledger["n_q"], ledger["n_mu"],
+        global_pole = (ledger["n_p"], ledger["n_q"], ledger["n_mu"],
                        ledger["n_mu"])
         global_diag = (ledger["n_q"], ledger["n_mu"], ledger["n_mu"])
         io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
@@ -2774,7 +2857,157 @@ def write_fit_block_collective(
                               block_condition_max,
                               block_backward_error_max)
     barrier(f"mpa_fit_block_{iq}_{lo}_{hi}_committed")
-    return fit_completion_ledger(dest)
+    return fit_completion_ledger_collective(
+        dest, key=f"fit-block-{iq}-{lo}-{hi}")
+
+
+def _validate_intraband_row(ledger, q, Omega, Bp, where):
+    """Return a normalized v2 row or refuse before any pole bytes move."""
+    if ledger["format_version"] != MPA_FIT_FORMAT_VERSION_INTRABAND:
+        raise ValueError(
+            f"{where}: this is a v{ledger['format_version']} fit-only "
+            "store; appended crossing poles require a v2 allocation")
+    if ledger["complete"]:
+        raise ValueError(f"{where}: store is already finalized")
+    iq = int(q)
+    if not 0 <= iq < ledger["n_q"]:
+        raise IndexError(f"{where}: q={iq} outside [0,{ledger['n_q']})")
+    if bool(ledger["intraband_rows_done"][iq]):
+        raise ValueError(f"{where}: intraband q row {iq} is already written")
+    Om = np.asarray(Omega)
+    Br = np.asarray(Bp)
+    want = (ledger["n_p_intraband"], ledger["n_mu"], ledger["n_mu"])
+    if Om.shape != want or Br.shape != want:
+        raise ValueError(
+            f"{where}: Omega/B row shapes {Om.shape}/{Br.shape}, expected "
+            f"{want}")
+    if not np.all(np.isfinite(Om)) or not np.all(np.isfinite(Br)):
+        raise ValueError(f"{where}: intraband row contains non-finite poles")
+    live = np.abs(Br) != 0.0
+    bad = live & ((Om.real <= 0.0) | (Om.imag > 0.0))
+    if np.any(bad):
+        raise ValueError(
+            f"{where}: {int(np.count_nonzero(bad))} live appended poles "
+            "are off the retarded sheet (require Re Omega > 0 and "
+            "Im Omega <= 0)")
+    return iq, Om, Br
+
+
+def write_intraband_row(
+    dest, q, Omega_p_row, B_p_row, *, anomaly_counts=None, mode="a",
+):
+    """Write one host v2 suffix row and advance its independent ledger.
+
+    This serial twin exists for tests and offline construction.  Production
+    uses :func:`write_intraband_row_collective`, which never gathers an
+    ``N_mu**2`` row onto a rank.
+    """
+    with _h5(dest, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        iq, Om, Br = _validate_intraband_row(
+            ledger, q, Omega_p_row, B_p_row, "write_intraband_row")
+        lo = int(ledger["n_p_fit"])
+        hi = lo + int(ledger["n_p_intraband"])
+        grp["Omega_p"][lo:hi, iq, :, :] = Om
+        grp["B_p"][lo:hi, iq, :, :] = Br
+        led = _open_fit(grp)
+        done = np.asarray(led["intraband_rows_done"][()], dtype=bool)
+        done[iq] = True
+        led["intraband_rows_done"][...] = done
+        for key, value in (anomaly_counts or {}).items():
+            name = "mpa_intra_" + str(key)
+            grp.attrs[name] = np.int64(
+                int(grp.attrs.get(name, 0)) + int(value))
+        return fit_completion_ledger(grp)
+
+
+def write_intraband_row_collective(
+    dest,
+    q,
+    Omega_p_row,
+    B_p_row,
+    *,
+    mesh_xy,
+    poles_finite,
+    poles_causal,
+    anomaly_counts=None,
+):
+    """Collectively append one native-sharded crossing-block q row.
+
+    ``Omega_p_row`` and ``B_p_row`` are
+    ``(M_p,1,n_mu_padded,n_mu_padded)`` on
+    ``P(None,None,'x','y')``.  The small booleans and anomaly counts must be
+    identical on every rank; the builder obtains them with global
+    reductions before this call.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    ledger = fit_completion_ledger(dest)
+    if ledger["format_version"] != MPA_FIT_FORMAT_VERSION_INTRABAND:
+        raise ValueError(
+            "write_intraband_row_collective requires a v2 pole-split store")
+    if ledger["complete"]:
+        raise ValueError("write_intraband_row_collective: store is finalized")
+    iq = int(q)
+    if not 0 <= iq < ledger["n_q"]:
+        raise IndexError(
+            f"write_intraband_row_collective: q={iq} outside "
+            f"[0,{ledger['n_q']})")
+    if bool(ledger["intraband_rows_done"][iq]):
+        raise ValueError(
+            f"write_intraband_row_collective: q row {iq} already written")
+    if not bool(poles_finite):
+        raise ValueError(
+            "write_intraband_row_collective: non-finite appended poles")
+    if not bool(poles_causal):
+        raise ValueError(
+            "write_intraband_row_collective: live appended poles are off "
+            "the retarded sheet")
+    spec = P(None, None, "x", "y")
+    for label, arr in (("Omega", Omega_p_row), ("B", B_p_row)):
+        _require_layout(
+            arr, mesh_xy, spec,
+            f"write_intraband_row_collective: {label} must be on "
+            "P(None,None,'x','y')")
+    shape = tuple(map(int, Omega_p_row.shape))
+    if tuple(B_p_row.shape) != shape or len(shape) != 4:
+        raise ValueError(
+            "write_intraband_row_collective: Omega/B must share rank-4 "
+            "shape (M_p,1,n_mu_padded,n_mu_padded)")
+    m, one, nrow, ncol = shape
+    if (m != ledger["n_p_intraband"] or one != 1
+            or nrow < ledger["n_mu"] or ncol < ledger["n_mu"]):
+        raise ValueError(
+            "write_intraband_row_collective: row shape "
+            f"{shape} is incompatible with M_p={ledger['n_p_intraband']} "
+            f"and n_mu={ledger['n_mu']}")
+    lo = int(ledger["n_p_fit"])
+    valid = (m, 1, ledger["n_mu"], ledger["n_mu"])
+    total = (ledger["n_p"], ledger["n_q"], ledger["n_mu"],
+             ledger["n_mu"])
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.write_slab(
+            "Omega_p", Omega_p_row, offset=(lo, iq, 0, 0),
+            global_shape=total, valid_shape=valid)
+        io.write_slab(
+            "B_p", B_p_row, offset=(lo, iq, 0, 0),
+            global_shape=total, valid_shape=valid)
+    if process_rank() == 0:
+        with _h5(dest, "a") as grp:
+            led = _open_fit(grp)
+            done = np.asarray(led["intraband_rows_done"][()], dtype=bool)
+            done[iq] = True
+            led["intraband_rows_done"][...] = done
+            for key, value in (anomaly_counts or {}).items():
+                name = "mpa_intra_" + str(key)
+                grp.attrs[name] = np.int64(
+                    int(grp.attrs.get(name, 0)) + int(value))
+    barrier(f"mpa_intraband_row_{iq}_committed")
+    return fit_completion_ledger_collective(
+        dest, key=f"intraband-row-{iq}")
 
 
 def _canonical_diagnostics(diag_block, n_rows, n_cols):
@@ -2863,6 +3096,14 @@ def fit_completion_ledger(src, *, mode="r"):
         out = {
             "format_version": int(grp.attrs["mpa_fit_format_version"]),
             "n_p": int(grp.attrs["mpa_fit_n_p"]),
+            "n_p_fit": int(grp.attrs.get(
+                "mpa_fit_n_p_fit", grp.attrs["mpa_fit_n_p"])),
+            "n_p_intraband": int(grp.attrs.get(
+                "mpa_intra_n_poles", 0)),
+            "intraband_model": qs.qirr_attr_str(
+                grp, "mpa_intra_model"),
+            "intraband_complete": bool(grp.attrs.get(
+                "mpa_intra_complete", False)),
             "n_q": int(grp.attrs["mpa_fit_n_q"]),
             "n_q_full": int(grp.attrs.get(
                 "mpa_fit_n_q_full", grp.attrs["mpa_fit_n_q"])),
@@ -2884,10 +3125,77 @@ def fit_completion_ledger(src, *, mode="r"):
             "certification": certification,
             "provenance": provenance,
         }
+        out["intraband_rows_done"] = (
+            np.asarray(led["intraband_rows_done"][()], dtype=bool)
+            if "intraband_rows_done" in led else None)
         for key, vals in maxima.items():
             out["block_" + key + "_max"] = vals
             out[key + "_max"] = float(vals.max()) if vals.size else None
         return out
+
+
+_COLLECTIVE_LEDGER_CALLS = 0
+
+
+def fit_completion_ledger_collective(src, *, key):
+    """Read a small fit ledger once and publish it uniformly.
+
+    COLLECTIVE across JAX processes.  A collective SlabIO writer followed by
+    rank-zero h5py metadata used to hand ownership to an all-rank h5py read.
+    Fresh HDF5 1.14 can still expose the just-closed writer flag to one of
+    those peer opens after the publication barrier.  Keep the HDF5 metadata
+    owner on rank zero and broadcast only the small Python ledger through the
+    already-live distributed KV store.  This is not a pole/data gather:
+    production Na carries about 18 KiB here, independent of ``N_mu**2``.
+
+    ``key`` names the call site in failure messages.  A process-local call
+    counter is safe because entering this function non-uniformly is already a
+    collective-programming error; it also prevents a repeated path in one
+    coordinator lifetime from reusing a KV key.
+    """
+    from common.collectives import process_count, process_rank
+
+    if process_count() <= 1:
+        return fit_completion_ledger(src)
+
+    global _COLLECTIVE_LEDGER_CALLS
+    sequence = int(_COLLECTIVE_LEDGER_CALLS)
+    _COLLECTIVE_LEDGER_CALLS += 1
+    path = os.fspath(src)
+    digest = hashlib.sha256(os.fsencode(path)).hexdigest()[:16]
+    base = f"lorrax/mpa-ledger/{digest}/{sequence}/{str(key)}"
+
+    payload = b""
+    if process_rank() == 0:
+        try:
+            payload = pickle.dumps(
+                (True, fit_completion_ledger(src)), protocol=5)
+        except Exception as exc:  # publish the refusal; do not strand peers
+            payload = pickle.dumps(
+                (False, type(exc).__name__, str(exc)), protocol=5)
+
+    from ffi.common.broadcast import broadcast_bytes
+
+    size_buf = np.zeros(8, dtype=np.uint8)
+    if process_rank() == 0:
+        size_buf[:] = np.frombuffer(
+            np.asarray(len(payload), dtype="<u8").tobytes(), dtype=np.uint8)
+    size_buf = broadcast_bytes(size_buf, key=base + "/size")
+    size = int(np.frombuffer(size_buf.tobytes(), dtype="<u8")[0])
+    if size < 1:
+        raise RuntimeError(
+            f"fit_completion_ledger_collective({key}): rank zero "
+            "published an empty ledger payload")
+    data = np.zeros(size, dtype=np.uint8)
+    if process_rank() == 0:
+        data[:] = np.frombuffer(payload, dtype=np.uint8)
+    data = broadcast_bytes(data, key=base + "/payload")
+    result = pickle.loads(data.tobytes())
+    if not bool(result[0]):
+        raise RuntimeError(
+            f"fit_completion_ledger_collective({key}): rank-zero "
+            f"{result[1]}: {result[2]}")
+    return result[1]
 
 
 def validate_fit_store(src, *, expected_identity=None,
@@ -2968,6 +3276,34 @@ def validate_fit_store(src, *, expected_identity=None,
             raise ValueError(
                 f"MPA fit failed its stored certification: {metric}="
                 f"{got!r} exceeds {allowed!r}")
+    if ledger["n_p_intraband"]:
+        if (ledger["intraband_model"] != "intraband_eigenmode_v1"
+                or not ledger["intraband_complete"]):
+            raise ValueError(
+                "MPA Sigma requires a completed intraband_eigenmode_v1 "
+                "suffix, not a merely allocated pole range")
+        cert = ledger["certification"]
+        missing = []
+        for metric in REQUIRED_INTRABAND_CERTIFICATIONS:
+            for key in (metric, metric + "_max_allowed"):
+                if key not in cert:
+                    missing.append(key)
+        if missing:
+            raise ValueError(
+                "MPA Sigma requires certified appended intraband poles; "
+                "the store is missing " + ", ".join(missing))
+        for metric in REQUIRED_INTRABAND_CERTIFICATIONS:
+            got = float(cert[metric])
+            allowed = float(cert[metric + "_max_allowed"])
+            if (not np.isfinite(got) or got < 0.0
+                    or not np.isfinite(allowed) or allowed <= 0.0):
+                raise ValueError(
+                    "MPA intraband certification is unusable: "
+                    f"{metric}={got!r}, allowed={allowed!r}")
+            if got > allowed:
+                raise ValueError(
+                    "MPA appended intraband poles failed certification: "
+                    f"{metric}={got:.8e} exceeds {allowed:.8e}")
     return ledger
 
 
@@ -2995,7 +3331,33 @@ def _require_certification(certification, dest):
         if not np.isfinite(val) or val <= 0.0:
             bad.append(f"{name}={cert[name]!r}")
     if not missing and not bad:
-        return
+        # A v2 store has three additional measured observables.  Check them
+        # before the irreversible completeness stamp for the same reason as
+        # the fit diagnostics above: a finalized-but-uncertifiable suffix is
+        # a permanently bricked store.
+        try:
+            ledger = fit_completion_ledger(dest)
+        except (OSError, ValueError):
+            ledger = None
+        if ledger is not None and ledger["n_p_intraband"]:
+            for metric in REQUIRED_INTRABAND_CERTIFICATIONS:
+                for name in (metric, metric + "_max_allowed"):
+                    if name not in cert:
+                        missing.append(name)
+                        continue
+                    try:
+                        val = float(cert[name])
+                    except (TypeError, ValueError):
+                        bad.append(f"{name}={cert[name]!r}")
+                        continue
+                    if (not np.isfinite(val)
+                            or (name.endswith("_max_allowed") and val <= 0.0)
+                            or (not name.endswith("_max_allowed") and val < 0.0)):
+                        bad.append(f"{name}={cert[name]!r}")
+            if not missing and not bad:
+                return
+        else:
+            return
     faults = "; ".join(
         ([f"missing {', '.join(missing)}"] if missing else [])
         + ([f"unusable {', '.join(bad)}"] if bad else []))
@@ -3088,6 +3450,16 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
                 (" ..." if len(gaps) > 6 else "") +
                 "  Stamping it complete would tell the Σ stage that "
                 "zeros are poles.")
+        if int(grp.attrs.get("mpa_intra_n_poles", 0)):
+            intra_done = np.asarray(
+                led["intraband_rows_done"][()], dtype=bool)
+            if not intra_done.all():
+                missing = np.flatnonzero(~intra_done)
+                raise ValueError(
+                    "finalize_fit_store: appended intraband suffix has "
+                    f"unwritten q rows {_ranges(missing)}; a zero-filled "
+                    "suffix is not an absent crossing block")
+            grp.attrs["mpa_intra_complete"] = True
         grp.attrs["mpa_fit_complete"] = True
         grp.attrs["mpa_fit_finalized_utc"] = _utc_now()
         for key in REQUIRED_DIAGNOSTICS:

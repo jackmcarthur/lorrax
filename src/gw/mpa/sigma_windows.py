@@ -104,8 +104,8 @@ def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
     eta = float(regularization_width_ry)
-    if not np.isfinite(eta) or eta <= 0.0:
-        raise ValueError("MPA sigma eta must be finite and positive")
+    if not np.isfinite(eta) or eta < 0.0:
+        raise ValueError("MPA sigma eta must be finite and non-negative")
     # Fractional occupations give EVERY branch a possible negative-E_A shell
     # (width ~ few×degauss): the crossing branches through their own support,
     # and the statically-sign-definite branches through wrong-side states (an
