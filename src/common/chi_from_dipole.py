@@ -9,11 +9,13 @@ of the density-response S-tensor in this tree, and it is the one
 
     chi_{G'=0}(q -> 0, omega)  =  q_a  S_ab(omega)  q_b ,
 
-with ``q`` in Cartesian 1/bohr and ``S`` a symmetric (3, 3) complex
-array per frequency.  Every reader assumes exactly that — ``gw.
-head_correction`` passes it straight through as ``S_cart``, and
-``vcoul.Bulk3D.q0_average`` contracts it as ``einsum('qi,ij,qj->q', rq,
-S, rq)`` against Cartesian mini-BZ draws to form ``W = v/(1 - v·qSq)``.
+with ``q`` in Cartesian 1/bohr and ``S`` a (3, 3) complex array per
+frequency.  Transpose symmetry, ``S.T == S``, is a precondition supplied by
+the q-sampling (normally through inversion pairing), not an identity of this
+formula.  ``compute_S_omega`` does not symmetrize or enforce it.  Every real-q
+consumer checks it before contraction: ``gw.head_densify`` and the 2D/3D
+``vcoul.q0_average`` paths then evaluate ``einsum('qi,ij,qj->q', rq, S, rq)``
+against Cartesian mini-BZ draws to form ``W = v/(1 - v·qSq)``.
 
 The second builder in the tree, ``psp.run_sternheimer``'s
 ``compute_s_tensor_contrib_at_q0``, computes the same physical object by

@@ -209,6 +209,7 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
     if S.shape != (3, 3):
         raise ValueError(f"head_scalar_pointwise: S_cart must be (3,3); "
                          f"got {S.shape}")
+    vcoul.check_head_tensor_symmetry(S, "head_scalar_pointwise")
     q2 = np.einsum("qi,qi->q", q, q)
     if np.any(q2 <= 0.0):
         raise ValueError(
@@ -227,6 +228,13 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
 
 def _refuse_complex(val, where: str, rtol: float = 1e-10) -> None:
     """Refuse a head scalar with a physically meaningful imaginary part.
+
+    This guard sees only the transpose-symmetric part of ``S_cart`` because
+    the real-q quadratic form discards the antisymmetric part identically;
+    :func:`vcoul.check_head_tensor_symmetry` checks that part first.  For a
+    Hermitian tensor at real z, passing that check makes S real, so this guard
+    is unreachable.  It remains live for a transpose-symmetric complex tensor
+    from finite omega or eta, as the regression test exercises.
 
     The rank-one update is Hermitian ONLY because its coefficient is real.
     A complex coefficient makes ``s·conj(g₀)⊗g₀`` non-Hermitian by exactly

@@ -35,7 +35,51 @@ import numpy as np
 from vcoul.geometry import CoulombGeometry
 
 __all__ = ["SysDim", "CoulombKernel", "get_kernel", "v_qG_table",
-           "v_qG_single", "HeadSlotTable", "head_slot_table"]
+           "v_qG_single", "HeadSlotTable", "head_slot_table",
+           "check_head_tensor_symmetry"]
+
+
+def check_head_tensor_symmetry(S_cart, where: str,
+                               rtol: float = 1e-10) -> float:
+    """Report and enforce the transpose symmetry required by ``q^T S q``.
+
+    Real-q quadratic forms discard ``S - S.T`` identically, so every such
+    contraction must call this before evaluating the form.  The tolerance
+    matches ``gw.head_densify._refuse_complex``'s relative head tolerance.
+
+    Parameters
+    ----------
+    S_cart : array_like, shape (3, 3)
+        Cartesian q-squared response tensor.
+    where : str
+        Contraction site named in the diagnostic and refusal.
+    rtol : float, optional
+        Maximum ``||S-S.T||_F / ||S||_F``.
+
+    Returns
+    -------
+    float
+        The reported relative transpose asymmetry.
+    """
+    S = np.asarray(S_cart, dtype=np.complex128)
+    if S.shape != (3, 3):
+        raise ValueError(f"{where}: S_cart must be (3,3); got {S.shape}")
+    scale = float(np.linalg.norm(S))
+    asym = float(np.linalg.norm(S - S.T))
+    rel = asym / scale if scale > 0.0 else 0.0
+    print(
+        f"  S_cart transpose asymmetry [{where}]: "
+        f"||S-S.T||_F/||S||_F = {rel:.6e} (limit {rtol:.0e})",
+        flush=True,
+    )
+    if rel > rtol:
+        raise ValueError(
+            f"{where}: S_cart violates the transpose-symmetry precondition: "
+            f"||S-S.T||_F/||S||_F = {rel:.6e} > {rtol:.0e}.  A real-q "
+            f"quadratic form q^T S q discards this antisymmetric component "
+            f"identically; refusing prevents the sampling defect from being "
+            f"silently projected away.")
+    return rel
 
 
 class SysDim(int, enum.Enum):

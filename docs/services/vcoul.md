@@ -26,7 +26,7 @@ loaders and `Meta` stay on the LORRAX side of the door; the service speaks
 ## API
 
 The door is the top-level package; LORRAX imports `vcoul` public names and
-never a submodule. The surface is 30 names; the ones that carry the
+never a submodule. The surface is 34 names; the ones that carry the
 architecture are these.
 
 `CoulombGeometry` is a frozen dataclass of the four things every kernel

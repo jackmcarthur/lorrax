@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vcoul.base import SysDim, v_qG_single
+from vcoul.base import SysDim, check_head_tensor_symmetry, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
                           sample_minibz_qpoints)
@@ -96,6 +96,7 @@ class Bulk3D:
         if S_cart is not None:
             # Anisotropic screened: w0 = ⟨ v / (1 - v · qᵀSq) ⟩ on the same q's.
             S = jnp.asarray(S_cart, dtype=jnp.complex128)
+            check_head_tensor_symmetry(S, "vcoul.Bulk3D.q0_average")
             wmeans = []
             for rq in batches:
                 vq = self._vq_isotropic(rq).astype(jnp.complex128)

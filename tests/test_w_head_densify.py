@@ -45,7 +45,7 @@ from gw.head_densify import (                                  # noqa: E402
     EIGHT_PI, attach_head_channel, build_fine_head_scalars,
     coarse_gamma_cell_weights, fine_q_cart, gamma_cell_head_scalar,
     head_channel_zone_average, head_scalar_pointwise)
-from vcoul import CoulombGeometry                              # noqa: E402
+from vcoul import Bulk3D, CoulombGeometry, Slab2D              # noqa: E402
 
 pytestmark = pytest.mark.census
 
@@ -493,6 +493,27 @@ def test_a_complex_head_scalar_is_refused_before_it_can_be_attached():
     S_bad = _S_ISO * (1.0 + 0.3j)
     with pytest.raises(ValueError, match="Hermiticity"):
         head_scalar_pointwise(q[None, :], S_bad)
+
+
+def test_a_hermitian_but_transpose_antisymmetric_head_is_refused_everywhere():
+    """A real-q form cannot silently erase the antisymmetric head component."""
+    S_bad = np.asarray(_S_ISO, dtype=np.complex128).copy()
+    S_bad[0, 1] = 0.01j
+    S_bad[1, 0] = -0.01j
+    assert np.array_equal(S_bad, S_bad.conj().T), (
+        "the red tensor must be Hermitian, the case whose contraction is real")
+    assert not np.array_equal(S_bad, S_bad.T)
+
+    with pytest.raises(ValueError, match="transpose-symmetry precondition"):
+        head_scalar_pointwise(np.asarray([[0.1, 0.2, 0.3]]), S_bad)
+    with pytest.raises(ValueError, match="vcoul.Bulk3D.q0_average"):
+        Bulk3D().q0_average(
+            _geom("fcc"), (2, 2, 2), S_cart=S_bad,
+            nsamples=8, method="uniform", qmc_reps=1)
+    with pytest.raises(ValueError, match="vcoul.Slab2D.q0_average"):
+        Slab2D().q0_average(
+            _geom("hex"), (2, 2, 1), S_cart=S_bad,
+            nsamples=8, method="uniform", qmc_reps=1)
 
 
 # ===========================================================================
