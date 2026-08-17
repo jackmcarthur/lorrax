@@ -220,7 +220,13 @@ def build_preconditioner_diagonal_sharded(
     if use_tda:
         return diag_h
 
-    diag_full = jnp.stack([diag_h, -diag_h], axis=0)[:, None, ...]
+    # The ladder's antiresonant row carries the conjugate diagonal:
+    # H_AA = -conj(H_RR).  This distinction is invisible when ``diag_h`` is
+    # real, but finite-q / band-edge truncation can leave a small legitimate
+    # anti-Hermitian residue in the exact diagonal.  Keep that residue paired
+    # with the operator rather than preconditioning the bottom row with the
+    # resonant convention.
+    diag_full = jnp.stack([diag_h, -jnp.conj(diag_h)], axis=0)[:, None, ...]
     diag_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
     return jax.lax.with_sharding_constraint(diag_full, diag_sharding)
 

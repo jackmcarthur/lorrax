@@ -1,20 +1,22 @@
 """Gates for the ONE ``diag(H_BSE)``: FEAST's builder is now an adapter.
 
 ``bse_feast.build_preconditioner_diagonal_sharded`` used to be a second,
-independent implementation of the object
+independent implementation of the resonant object
 ``bse_davidson_helpers.build_bse_exact_diagonal`` assembles — eight un-jitted
 einsums that arrived independently at the same ``+1/nk`` exchange / ``−1/nk``
 direct normalisation, rebuilt ``M_X``/``M_Y`` from ``psi`` instead of reading the
 payload's hoisted pair amplitudes, and paid eight program constructions per call
-(PRECOND_BUILD_FREE.md §7.1).
+(PRECOND_BUILD_FREE.md §7.1).  The reference below retains that independent
+resonant arithmetic, then applies the separately gated non-TDA row convention
+``[diag_h, -conj(diag_h)]``.
 
 Measured on the Si 4x4x4 record deck at P=4 BEFORE they were merged, the two
 agreed to ``max|Δ| = 1.11e-16 Ry = 1.5e-15 eV`` on a 0.62 Ry signal — the same
 round-off the canonical builder already scores against the dense operator, so
-neither was wrong (FIX_construction_defects.md §2).  This file is what keeps
-them from drifting apart again: the OLD implementation is transcribed here
-verbatim as the reference, so any future edit to either side has to explain
-itself against the arithmetic that was actually shipped.
+neither resonant construction was wrong (FIX_construction_defects.md §2).
+This file is what keeps them from drifting apart again: the old resonant
+implementation is transcribed here as the reference, so any future edit to
+either side has to explain itself against the arithmetic that was shipped.
 
 Two of the cells are RED TWINS.  ``test_adapter_reads_the_payloads_M_X`` fails
 if the adapter goes back to rebuilding the pair amplitudes locally; it passes
@@ -85,9 +87,8 @@ def _payload(seed=20260808, w_scale=1.0):
     }
 
 
-def _feast_diag_old(data, mesh_xy, include_W=True, use_tda=True):
-    """``build_preconditioner_diagonal_sharded`` as it shipped before the
-    consolidation, transcribed unchanged.  THE reference for these cells."""
+def _feast_diag_reference(data, mesh_xy, include_W=True, use_tda=True):
+    """Independent pre-consolidation resonant arithmetic plus the gated row."""
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
@@ -114,7 +115,7 @@ def _feast_diag_old(data, mesh_xy, include_W=True, use_tda=True):
     if use_tda:
         return jax.lax.with_sharding_constraint(
             diag_h, NamedSharding(mesh_xy, P("x", "y", None)))
-    diag_full = jnp.stack([diag_h, -diag_h], axis=0)[:, None, ...]
+    diag_full = jnp.stack([diag_h, -jnp.conj(diag_h)], axis=0)[:, None, ...]
     return jax.lax.with_sharding_constraint(
         diag_full, NamedSharding(mesh_xy, P(None, None, "x", "y", None)))
 
@@ -124,10 +125,10 @@ def _feast_diag_old(data, mesh_xy, include_W=True, use_tda=True):
 @pytest.mark.parametrize("include_W,use_tda", [
     (True, True), (False, True), (True, False), (False, False),
 ])
-def test_adapter_matches_the_old_implementation(mesh, include_W, use_tda):
+def test_adapter_matches_the_independent_reference(mesh, include_W, use_tda):
     data = _payload()
-    ref = np.asarray(_feast_diag_old(data, mesh, include_W=include_W,
-                                     use_tda=use_tda))
+    ref = np.asarray(_feast_diag_reference(data, mesh, include_W=include_W,
+                                           use_tda=use_tda))
     new = np.asarray(BF.build_preconditioner_diagonal_sharded(
         data, mesh, include_W=include_W, use_tda=use_tda))
     assert new.shape == ref.shape
@@ -145,6 +146,30 @@ def test_feast_keeps_the_diagonal_complex(mesh):
     assert float(jnp.max(jnp.abs(jnp.imag(out)))) > 0.0, (
         "the complex route returned a real-valued diagonal; the residue that "
         "distinguishes it from Davidson's has been dropped")
+
+
+def test_nontda_antiresonant_diagonal_is_negative_conjugate(mesh):
+    """The two preconditioner rows follow the production matvec convention.
+
+    A real-only fixture cannot distinguish ``-diag_h`` from
+    ``-conj(diag_h)`` and would let the original defect pass.  ``_payload``
+    deliberately produces a non-real exact diagonal, so this cell is the red
+    twin for the antiresonant row measured by basis-vector applications of the
+    ladder matvec: ``H_AA = -conj(H_RR)``.
+    """
+    data = _payload(seed=20260816)
+    resonant = np.asarray(BF.build_preconditioner_diagonal_sharded(
+        data, mesh, include_W=True, use_tda=True))
+    full = np.asarray(BF.build_preconditioner_diagonal_sharded(
+        data, mesh, include_W=True, use_tda=False))
+
+    assert np.max(np.abs(resonant.imag)) > 1e-6, (
+        "the fixture lost the non-real diagonal that distinguishes the two "
+        "antiresonant conventions")
+    assert np.array_equal(full[0, 0], resonant)
+    assert np.array_equal(full[1, 0], -np.conj(resonant))
+    assert np.max(np.abs(full[1, 0] + resonant)) > 1e-6, (
+        "the red twin did not distinguish -diag_h from -conj(diag_h)")
 
 
 def test_complex_and_real_routes_share_the_real_part_exactly(mesh):
