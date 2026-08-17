@@ -658,6 +658,57 @@ def test_trs_gauge_refuses_a_non_trs_kgrid():
         enforce_trs_pair_gauge(broken, mesh)
 
 
+def _trim_block_with_orthogonal_noise(amplitude):
+    """Three-state conjugation-closed block plus controlled payload noise."""
+    rng = np.random.default_rng(817)
+    real_basis, _ = np.linalg.qr(rng.standard_normal((96, 4)))
+    unitary, _ = np.linalg.qr(
+        rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3)))
+    exact = real_basis[:, :3] @ unitary
+    # The fourth real direction is outside the exact block.  An imaginary
+    # perturbation there cannot be absorbed by a change of in-block gauge.
+    noisy = exact.copy()
+    noisy[:, 0] += 1j * amplitude * real_basis[:, 3]
+    return noisy
+
+
+def test_trim_conjugation_gate_uses_the_two_leg_payload_error_model():
+    """The calibrated relative bar admits construction noise, not structure.
+
+    One stored-WFN error enters ``conj(Psi) - Psi C`` twice.  The green arm
+    sits above the old 1e-8 ceiling but below the derived 2e-8 two-leg bar;
+    doubling the same orthogonal error is the red boundary arm.
+    """
+    from bse.bse_w_exact import (_TRS_BLOCK_CONJ_RTOL,
+                                 _realize_trim_block)
+
+    green = _trim_block_with_orthogonal_noise(1.6e-8)
+    C = np.linalg.lstsq(green, np.conj(green), rcond=None)[0]
+    rel = (float(np.abs(np.conj(green) - green @ C).max())
+           / float(np.abs(green).max()))
+    assert 1.0e-8 < rel < _TRS_BLOCK_CONJ_RTOL, (
+        f"the green control no longer discriminates the old and new bars: {rel:.3e}")
+    _realize_trim_block(green)
+
+    red = _trim_block_with_orthogonal_noise(3.2e-8)
+    with pytest.raises(ValueError, match="two-leg payload-construction bar"):
+        _realize_trim_block(red)
+
+
+def test_trim_conjugation_gate_still_refuses_a_missing_partner():
+    """Dropping one member of a conjugate triplet stays an O(1) refusal."""
+    from bse.bse_w_exact import _realize_trim_block
+
+    rng = np.random.default_rng(64)
+    real_basis, _ = np.linalg.qr(rng.standard_normal((96, 3)))
+    omega = np.exp(2j * np.pi / 3)
+    dft3 = np.asarray([[1, 1, 1], [1, omega, omega**2],
+                       [1, omega**2, omega]], dtype=np.complex128) / np.sqrt(3)
+    cut = (real_basis @ dft3)[:, :2]
+    with pytest.raises(ValueError, match="trs_gauge_block_not_conj_closed"):
+        _realize_trim_block(cut)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_w_ladder_matches_dense_oracle_on_a_mesh(px, py):
