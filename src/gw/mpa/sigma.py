@@ -10,6 +10,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
+from gw.band_extrapolation import MPA_BRACKET_INSULATOR_GATE
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -48,6 +49,7 @@ def _integrate_sigma_batches(
     mesh_xy,
     *,
     pole_batch_size,
+    band_plan=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -57,21 +59,32 @@ def _integrate_sigma_batches(
 
     s = wfns.slices
     # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
-    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
-    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
-    # wired for consistency and has never executed under a split.
+    # The BandBracketPlan bounds are relative to this exact slice, just as its
+    # cumulative counts are; changing either side independently corrupts the
+    # estimator-neutral handoff even when the final full-band point looks sane.
     psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
-    shape = (omega.size, int(psi_proj_xr.shape[0]),
-             int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
-    output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    base_shape = (omega.size, int(psi_proj_xr.shape[0]),
+                  int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+    brackets = None if band_plan is None else tuple(band_plan.bounds)
+    if brackets is None:
+        shape = base_shape
+        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        omega_axis = 0
+    else:
+        shape = (len(brackets), *base_shape)
+        output_sharding = NamedSharding(
+            mesh_xy, P(None, None, None, "x", "y"))
+        omega_axis = 1
     accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding)
+        omega, shape=shape, sharding=output_sharding,
+        omega_axis=omega_axis)
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
-        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)))
+        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        brackets=brackets)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
@@ -117,12 +130,28 @@ def _integrate_sigma_batches(
         del B, Omega
 
     sigma = strip_sigma_window(accumulator.finalize(), nb_real)
+    if brackets is not None:
+        # The tau kernel returns DISJOINT increments.  Cumulate after all
+        # z/window contributions so element i is exactly S(N_i), matching the
+        # PPM SigmaOmegaResult estimator handoff without selecting an estimator.
+        sigma = jax.jit(
+            lambda a: jnp.cumsum(a, axis=0),
+            out_shardings=sigma.sharding)(sigma)
+        widths = tuple(int(hi) - int(lo) for lo, hi in brackets)
+        print_fn(
+            f"  MPA Sigma band brackets: bounds={brackets}, widths={widths}; "
+            f"sum(widths)={sum(widths)} == single-sum bands="
+            f"{int(s.nb_sigma_sum)}.  Cumulative SigmaOmegaResult contract "
+            f"shape={tuple(int(x) for x in sigma.shape)}, "
+            f"band_counts={tuple(int(x) for x in band_plan.counts)}; "
+            f"estimator=NONE, full-band point [-1] drives this pass.")
     print_fn(f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
              f"({n_poles} poles, batches of {batch_size})")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma)
+        sigma_c_kij=sigma,
+        band_counts=(() if band_plan is None else tuple(band_plan.counts)))
 
 
 def integrate_sigma_store(
@@ -135,9 +164,16 @@ def integrate_sigma_store(
     mesh_xy,
     *,
     pole_batch_size=4,
+    band_plan=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
+
+    With ``band_plan`` the result carries one leading cumulative bracket axis:
+    ``sigma_c_kij[i]`` is the full per-z/window MPA sum through
+    ``band_plan.counts[i]``.  This is sampling machinery only.  It neither
+    imports nor calls an extrapolation estimator, and the final point drives
+    the present calculation.
 
     ``fit_src`` is a store path, or a live
     :class:`~file_io.mpa_store.PoleReader` whose collective handle the
@@ -160,7 +196,8 @@ def integrate_sigma_store(
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, band_plan=band_plan,
+            print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -230,6 +267,7 @@ def compute_sigma_c_mpa_omega_grid(
     omega_cluster_gap_ry=1.0,
     pole_batch_size=4,
     occupation_state=None,
+    band_plan=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -251,6 +289,21 @@ def compute_sigma_c_mpa_omega_grid(
     ledger = validate_fit_store(fit_src)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
+    if band_plan is not None:
+        from gw.band_extrapolation import (
+            assert_brackets_match_ols_abscissae)
+        assert_brackets_match_ols_abscissae(
+            band_plan, wfns.slices, meta=meta,
+            where="mpa sigma bracket partition")
+        if occupation_state is not None:
+            raise NotImplementedError(
+                f"GATE {MPA_BRACKET_INSULATOR_GATE}: an occupation_state "
+                f"reached bracketed MPA Sigma.  got: metallic occupation "
+                f"weights; want: insulating occupations; fix: set "
+                f"use_band_extrapolation = false until "
+                f"feat/occupation-support-guard-2026-08-16 lands; why: "
+                f"sigma_sum may truncate occupied support; doc: sandbox "
+                f"claim 0288.")
     branches = _branches(wfns, omega_grid_ry, efermi_ry,
                          occupation_state=occupation_state)
     summaries = []
@@ -285,7 +338,8 @@ def compute_sigma_c_mpa_omega_grid(
             f"{geometry['n_windows']} logical windows")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, band_plan=band_plan,
+            print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
@@ -319,6 +373,7 @@ def assert_head_body_occupation_match(head_attrs, occupation_state):
 
 
 __all__ = [
+    "MPA_BRACKET_INSULATOR_GATE",
     "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
     "integrate_sigma_store",

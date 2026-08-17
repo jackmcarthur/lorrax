@@ -101,9 +101,9 @@ class SigmaOmegaResult:
     # (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS THE BAND-COUNT
     # AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
     # ``[0, band_counts[i])``, so ``sigma_c_kij[-1]`` is the ordinary
-    # full-band Σ_c and is what every downstream consumer takes.  Length 1
-    # in the ordinary case (``band_counts == (nband,)``), 3 under
-    # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
+    # full-band Σ_c and is what every downstream consumer takes.  The
+    # runtime length is the BandBracketPlan's count (1 is the ordinary path;
+    # current PPM/MPA sampling uses 3, but consumers must not hard-code it).
     #
     # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
     # SHARDING (single source of truth): replicated/uncommitted under
@@ -112,8 +112,8 @@ class SigmaOmegaResult:
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
     #: The LOGICAL band count each leading-axis element sums to.  Aligned
-    #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
-    #: and nothing else needs either.
+    #: with ``sigma_c_kij``'s axis 0.  PPM hands both to its estimator; MPA
+    #: currently exposes the same contract with estimator=NONE.
     band_counts: tuple[int, ...] = ()
 
 

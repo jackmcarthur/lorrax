@@ -218,10 +218,13 @@ they are NOT interchangeable:
 ``Δ_tail`` — how far the extrapolation moved the largest computed point.
     The size of the correction, not its error.
 
-GN/HL-PPM ONLY IS A CORRECTNESS GUARD, NOT A SCOPE LIMITATION.  The refusal
-in ``gw.sigma_dispatch`` on a non-PPM ``compute_mode`` reads like "we only
-wired it up for PPM".  It is stronger than that: **the 1/N → 0 limit point
-is itself mode-dependent, and it is wrong for a static Coulomb hole.**
+THE PLAN IS ESTIMATOR-AGNOSTIC; THE 1/N ESTIMATOR IS NOT.  GN/HL-PPM consume
+the cumulative points through the estimator below.  MPA consumes the same
+``BandBracketPlan`` points with ``estimator=NONE``: its final point drives the
+calculation and the full leading-axis cube is the documented seam for a future
+shell estimator.  The static-mode refusal in ``gw.sigma_dispatch`` is stronger
+than a wiring limitation: **the 1/N → 0 limit point is mode-dependent, and it
+is wrong for a static Coulomb hole.**
 Measured against BerkeleyGW's EXACT static CH (the closure sum — no band
 sum, no extrapolation in it), same deck, same estimator, MAE in meV:
 
@@ -351,6 +354,67 @@ BRACKET_FRACTIONS: tuple[float, float] = (0.80, 0.90)
 TAIL_UNCERTAINTY_FRACTION: tuple[float, float] = (0.15, 0.25)
 
 
+MPA_BRACKET_INSULATOR_GATE = "mpa_band_brackets_insulators_only"
+_OCC_INTEGER_TOL = 1.0e-6
+
+
+def refuse_mpa_bracket_metallic_occupations(
+    occs, *, band_lo, band_hi, source, print_fn=print,
+):
+    """Runtime half of the insulator-only MPA band-bracket gate.
+
+    The declared-key twin rejects a deck that declares
+    ``mpa_material_class = metal`` while band brackets are enabled.  This
+    half reads the mean field's own occupations so a metallic WFN cannot pass
+    merely because the deck claimed ``insulator``.  Both refusals carry the
+    same rule id for one-search diagnosis.
+    """
+    occ = np.asarray(occs, dtype=np.float64)
+    if occ.ndim == 2:
+        occ = occ[None, :, :]
+    if occ.ndim != 3:
+        raise ValueError(
+            "refuse_mpa_bracket_metallic_occupations: occupations must be "
+            f"(nspin, nk, nb) or (nk, nb); got {occ.shape} from {source}.")
+    lo = max(0, int(band_lo))
+    hi = min(int(band_hi), int(occ.shape[-1]))
+    if hi <= lo:
+        raise ValueError(
+            "refuse_mpa_bracket_metallic_occupations: active Sigma band "
+            f"window [{band_lo}, {band_hi}) does not intersect the "
+            f"{occ.shape[-1]} bands {source} carries.")
+    window = occ[:, :, lo:hi]
+    distance = np.abs(window - np.rint(window))
+    worst = float(distance.max()) if distance.size else 0.0
+    if worst > _OCC_INTEGER_TOL:
+        s, k, n = (int(i) for i in
+                   np.unravel_index(int(distance.argmax()), distance.shape))
+        raise NotImplementedError(
+            f"GATE {MPA_BRACKET_INSULATOR_GATE}: MPA band-bracket partial "
+            f"sums are refused on a mean field with partial occupations.\n"
+            f"  got:  occupation {float(window[s, k, n])!r} at "
+            f"(spin {s}, k-point {k}, band {n + lo}) of {source} -- "
+            f"{worst:.3e} from the nearest integer, tolerance "
+            f"{_OCC_INTEGER_TOL:g}\n"
+            f"  want: integer occupations across the Sigma band window "
+            f"[{lo}, {hi}) -- an insulating mean field\n"
+            f"  fix:  set use_band_extrapolation = false for this metallic "
+            f"MPA run; enable the brackets only after "
+            f"feat/occupation-support-guard-2026-08-16 lands\n"
+            f"  why:  number_bands_sigma can currently truncate exact "
+            f"occupied support before mpa.sigma._branches slices sigma_sum, "
+            f"which silently corrupts every cumulative partial sum.  The "
+            f"occupation-support guard is therefore a prerequisite for the "
+            f"metal path, not an estimator choice.\n"
+            f"  doc: sandbox claim 0288 and "
+            f"reports/mpa_brackets_2026-08-16/REPORT.md.")
+    print_fn(
+        f"  MPA band brackets: GATE {MPA_BRACKET_INSULATOR_GATE} PASS; "
+        f"occupations are integer across bands [{lo}, {hi}) of {source} "
+        f"(worst deviation {worst:.2e} <= {_OCC_INTEGER_TOL:g}).")
+    return worst
+
+
 class BandExtrapolationRefused(ValueError):
     """``sigma_band_extrapolation`` was requested but cannot be honored.
 
@@ -363,6 +427,13 @@ class BandExtrapolationRefused(ValueError):
 @dataclass(frozen=True)
 class BandBracketPlan:
     """Which band ranges the τ kernel sums, and what each cumulative cut means.
+
+    This object is a SAMPLING contract, not an estimator contract.  A consumer
+    must produce one leading-axis value for every runtime ``bounds`` entry,
+    cumulatively aligned with ``counts``; it must not assume three entries or
+    the current 80/10/10 widths.  A one-entry plan is the ordinary full sum and
+    must preserve that path bit-for-bit.  GN/HL-PPM may fit these points; MPA
+    deliberately does not in the insulators-first machinery pass.
 
     Attributes
     ----------
@@ -1445,11 +1516,13 @@ __all__ = [
     "BandBracketCountMismatch",
     "BandBracketPlan",
     "BandExtrapolationRefused",
+    "MPA_BRACKET_INSULATOR_GATE",
     "assert_brackets_match_ols_abscissae",
     "ExtrapolationFit",
     "fit_band_extrapolation",
     "format_extrapolation_report",
     "plan_band_brackets",
+    "refuse_mpa_bracket_metallic_occupations",
     "sc_tolerance_ruling",
     "tolerance_bar_ev",
     "trivial_plan",

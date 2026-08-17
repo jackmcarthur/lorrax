@@ -2084,12 +2084,15 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
 def band_extrapolation_is_consumable(modes) -> bool:
     """Does ANY stage of this run reach the kernel that reads the key?
 
-    ``ppm_model is not None`` is the exact predicate: the extrapolation is
-    wired into the two-point GN/HL plasmon-pole Σ_c kernel and nothing else.
-    Deliberately NOT ``is_dynamic`` — that is True for MPA, which is dynamic
-    and still does not consume this key.
+    The two-point GN/HL plasmon-pole stages consume both the bracket points
+    and the incumbent 1/N estimator.  MPA consumes only the estimator-neutral
+    bracket machinery and deliberately leaves its full-band point unchanged.
+    Deliberately NOT ``is_dynamic`` — future dynamic ansatzes do not acquire
+    this contract merely by joining that category.
     """
-    return any(getattr(m, "ppm_model", None) is not None for m in modes)
+    return any(
+        getattr(m, "ppm_model", None) is not None or m is ComputeMode.MPA
+        for m in modes)
 
 
 # ---------------------------------------------------------------------------
@@ -2645,11 +2648,12 @@ class DynamicSigmaConfig:
     #: Band-convergence extrapolation of Sigma_c, resolved from
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
-    #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
-    #: (``gw.ppm_pipeline``); on a non-PPM ``compute_mode`` it is turned OFF
-    #: with a recorded note (or refused -- see ``band_extrapolation_explicit``)
-    #: by ``gw.sigma_dispatch``, because the 1/N limit is mode-dependent and
-    #: wrong for a static Coulomb hole.
+    #: :func:`resolve_band_extrapolation`.  The GN/HL-PPM pipeline consumes
+    #: both the cumulative points and its incumbent estimator.  Insulating
+    #: MPA consumes the same cumulative-point machinery but NO estimator; its
+    #: full-band point remains the answer.  Static modes turn the key off with
+    #: a recorded note (or refuse an unconsumable explicit key), because the
+    #: 1/N limit is mode-dependent and wrong for a static Coulomb hole.
     band_extrapolation: bool = USE_BAND_EXTRAPOLATION_DEFAULT
     #: Did a deck NAME either spelling?  Selects between auto-disabling and
     #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.

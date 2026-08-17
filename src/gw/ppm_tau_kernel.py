@@ -707,27 +707,35 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
+    brackets: tuple[tuple[int, int], ...] | None = None,
 ) -> Callable[..., jax.Array]:
-    """Return the GN tau kernel with a selected multipole W(tau) builder.
+    """Return the MPA tau kernel with a selected multipole W(tau) builder.
 
     All spatial work is the established ``build_G_tau -> fused GW FFT ->
     contract_bands`` path.  This wrapper changes only the scalar frequency
     synthesis: several poles and compatible windows are summed into one W
-    tile before that unchanged convolution.  It always uses the single
-    complex projection carrier; HGL's missing sine arm is completed once by
+    tile before that unchanged convolution.  Optional ``brackets`` are the
+    same static disjoint band slices used by the PPM kernel; they produce a
+    leading increment axis while W(tau) is still built exactly once.  The
+    wrapper always uses the single complex projection carrier; HGL's missing
+    sine arm is completed once by
     :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
     """
     kgrid = tuple(int(x) for x in kgrid)
     from ffi import ffi_dial_key
 
-    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key())
+    brackets = (None if brackets is None else
+                tuple((int(lo), int(hi)) for lo, hi in brackets))
+    key = (id(mesh_xy), kgrid, brackets,
+           _stage_timing_enabled(), ffi_dial_key())
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     sigma_kij = _get_sigma_kij_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
+        brackets=brackets)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,

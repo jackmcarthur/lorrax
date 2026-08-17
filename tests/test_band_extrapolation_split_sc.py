@@ -438,10 +438,10 @@ def test_the_mpa_default_ladder_is_consumable():
     cfg_mod = _gw_config()
     CM = cfg_mod.ComputeMode
     assert cfg_mod.band_extrapolation_is_consumable((CM.GN_PPM, CM.MPA))
-    # and MPA alone is not -- ppm_model is None for it, dynamic though it is
-    assert not cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
+    # MPA consumes the raw cumulative points, not the PPM estimator.
+    assert cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
     assert CM.MPA.is_dynamic and CM.MPA.ppm_model is None, (
-        "the predicate must be ppm_model, not is_dynamic: MPA separates them")
+        "MPA's machinery contract must not pretend it has a PPM pole model")
 
 
 def test_a_static_only_ladder_is_not_consumable():
@@ -504,30 +504,8 @@ def test_a_run_with_no_consuming_stage_still_REFUSES_an_explicit_key():
         "cannot tell which stage list was consulted")
 
 
-def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
-    """The behavioural test the scope note promised, cashed in.
-
-    THIS CELL REPLACES ``test_an_mpa_stage_is_refused_UPSTREAM_and_never_
-    reaches_this_guard``, whose docstring said in as many words: "When MPA is
-    implemented this test will fail, which is the correct moment to check
-    that branch behaviourally."  That moment is the metal MPA-QSGW merge
-    (``origin/main`` f597dd05), which emptied ``gw_config.UNIMPLEMENTED_MODES``
-    — it is now ``{}`` — so ``refuse_unimplemented_compute_mode`` is a no-op
-    for MPA and an MPA stage reaches the band-extrapolation guard for real.
-
-    What must be true now: the guard AUTO-DISABLES rather than refusing (a
-    PPM stage in the same ladder consumes the key, so this stage is skipped,
-    not fatal), it names the stage, and it gives the DYNAMIC reason.  It must
-    NOT recite the static Coulomb-hole anti-convergence measurement, which
-    was measured on static COHSEX and is not evidence about MPA;
-    ``test_the_dynamic_branch_does_not_recite_the_static_measurement`` pins
-    the same claim in the source text, and this one pins it in behaviour.
-
-    The dispatch is expected to fail AFTER the guard: this file's ``_dispatch``
-    passes ``wfns=None``, which no real Σ stage can consume.  That is a
-    harness limit, not the property under test, so the failure is allowed and
-    the assertions are all about what was PRINTED before it.
-    """
+def test_an_mpa_stage_is_no_longer_auto_disabled():
+    """MPA now consumes bracket machinery, while no estimator is implied."""
     cfg_mod = _gw_config()
     CM = cfg_mod.ComputeMode
     assert cfg_mod.UNIMPLEMENTED_MODES == {}, (
@@ -537,50 +515,20 @@ def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
     with pytest.raises(BaseException):
         _dispatch(CM.MPA, _cfg([CM.GN_PPM, CM.MPA], explicit=True),
                   print_fn=said.append)
-    notes = [s for s in said if "band extrapolation" in s]
-    assert notes, (
-        f"an MPA stage must reach the band-extrapolation guard and say so; "
-        f"printed: {said}")
-    note = " ".join(notes)
-    assert "AUTO-DISABLED" in note, note
-    assert "mpa" in note.lower(), note
-    # The dynamic reason, not the static one.
-    assert "MPA is dynamic" in note, note
-    assert "no bracket axis to fit" in note, note
-    assert "94.9" not in note and "288.2" not in note, (
-        f"the static Coulomb-hole measurement must not be recited at a "
-        f"dynamic stage — that is inventing evidence: {note}")
+    note = " ".join(said)
+    assert "AUTO-DISABLED" not in note, note
 
 
-def test_the_dynamic_branch_does_not_recite_the_static_measurement():
-    """The source-text form of the same claim, which IS checkable today.
-
-    MPA is DYNAMIC (``is_dynamic`` True, ``ppm_model`` None).  The static
-    Coulomb-hole anti-convergence measurement (94.9 -> 288.2 meV) is not
-    evidence about it, and reciting it there would be inventing evidence for
-    a mode it was never measured on.  The guard therefore branches on
-    ``is_dynamic`` and gives the two cases different reasons.
-    """
+def test_mpa_bypasses_the_static_estimator_guard():
+    """MPA samples brackets; it must not enter the static 1/N refusal."""
     src = open(os.path.join(_SRC, "gw", "sigma_dispatch.py"),
                encoding="utf-8").read()
-    guard = src[src.index("AUTO-DISABLED, LOUDLY"):]
+    guard = src[src.index("STATIC-MODE ESTIMATOR GUARD"):]
     guard = guard[:guard.index("Static channels")]
-    probe = 'getattr(mode, "is_dynamic", False)'
-    assert probe in guard, "the note must branch on whether the stage is dynamic"
-    # Slice relative to the branch itself: there is an EARLIER if/else in this
-    # region (the explicit-vs-defaulted provenance note), so an absolute
-    # ``index("else:")`` finds the wrong one and silently yields an empty
-    # slice that every ``not in`` assertion passes.
-    start = guard.index(probe)
-    tail = guard[start:]
-    split_at = tail.index("else:")
-    dynamic, static = tail[:split_at], tail[split_at:]
-    assert dynamic.strip() and static.strip(), "branch slicing failed"
-    assert "288.2" not in dynamic, (
-        "the dynamic-mode reason must not quote the static-CH measurement")
-    assert "never been measured" in dynamic or "unvalidated" in dynamic
-    assert "288.2" in static, (
-        "the static reason must keep the measurement that justifies it")
+    assert "mode is not ComputeMode.MPA" in guard
+    assert "estimator=NONE" in src[:src.index("STATIC-MODE ESTIMATOR GUARD")]
+    assert 'getattr(mode, "is_dynamic", False)' not in guard
+    assert "288.2" in guard, "static refusal must retain its measurement"
 
 
 def test_a_static_stage_still_carries_the_measurement_that_justifies_it():

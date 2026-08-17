@@ -599,7 +599,7 @@ def compute_sigma_xc(
     :class:`SigmaResult` populated per the mode.
     """
     from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
-    from .ppm_pipeline import compute_ppm_sigma_pipeline
+    from .ppm_pipeline import _band_count_point, compute_ppm_sigma_pipeline
 
     # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
     # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
@@ -611,15 +611,74 @@ def compute_sigma_xc(
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
 
-    # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
+    # ── MPA BAND BRACKETS: INSULATORS-ONLY, TWO-HALF REFUSAL ─────────────
+    # The declared-key half catches a deck that says "metal".  The measured
+    # half reads the WFN's own occupations, rather than ``wfns.occ`` (a step
+    # function constructed by the bundle), so an undeclared metallic mean
+    # field cannot pass.  Both carry the same rule id.  This guard is about
+    # the cumulative PARTIAL SUMS, not an estimator: number_bands_sigma may
+    # truncate occupied support until feat/occupation-support-guard-2026-08-16
+    # lands, so every estimator would receive corrupted inputs.
+    mpa_band_plan = None
+    if (mode is ComputeMode.MPA
+            and bool(config.sigma.band_extrapolation)):
+        from .band_extrapolation import (
+            assert_brackets_match_ols_abscissae, plan_band_brackets,
+            MPA_BRACKET_INSULATOR_GATE,
+            refuse_mpa_bracket_metallic_occupations)
+
+        material_class = str(config.mpa.material_class).strip().lower()
+        if material_class != "insulator":
+            raise NotImplementedError(
+                f"GATE {MPA_BRACKET_INSULATOR_GATE}: MPA band-bracket "
+                f"partial sums are refused for a declared metal.\n"
+                f"  got:  mpa_material_class = {config.mpa.material_class}\n"
+                f"  want: mpa_material_class = insulator and integer WFN "
+                f"occupations\n"
+                f"  fix:  set use_band_extrapolation = false for this "
+                f"metallic MPA run; enable it only after "
+                f"feat/occupation-support-guard-2026-08-16 lands\n"
+                f"  why:  number_bands_sigma can currently truncate exact "
+                f"occupied support before mpa.sigma._branches slices "
+                f"sigma_sum, silently corrupting all cumulative bracket "
+                f"points; this blocks every estimator equally\n"
+                f"  doc: sandbox claim 0288 and "
+                f"reports/mpa_brackets_2026-08-16/REPORT.md.")
+
+        s = wfns.slices
+        refuse_mpa_bracket_metallic_occupations(
+            wfn.occs,
+            band_lo=int(s.b0),
+            band_hi=int(meta.b_id_4_sigma_user or s.b4_sigma),
+            source=str(getattr(config.paths, "wfn_file", "WFN.h5")),
+            print_fn=print_fn)
+        mpa_band_plan = plan_band_brackets(
+            enabled=True,
+            enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
+            n_occ=int(s.b2 - s.b0),
+            nb_logical=(int(meta.b_id_4_sigma_user or s.b4) - int(s.b0)),
+            nb_padded=int(s.nb_sigma_sum),
+        )
+        assert_brackets_match_ols_abscissae(
+            mpa_band_plan, s, meta=meta,
+            where="mpa sigma dispatch plan seam")
+        print_fn(
+            f"  MPA Sigma band-bracket sampling: ON — "
+            f"{mpa_band_plan.n_brackets} disjoint brackets "
+            f"{mpa_band_plan.bounds}, cumulative counts "
+            f"{mpa_band_plan.counts}; estimator=NONE.  S(N_last), the "
+            f"ordinary full-band MPA Sigma, drives this pass.")
+        for note in mpa_band_plan.notes:
+            print_fn(f"  MPA Sigma band brackets: {note}")
+
+    # ── STATIC-MODE ESTIMATOR GUARD ─────────────────────────────────
     # Two independent reasons, and the second is the load-bearing one.
     #
-    # (1) Wiring.  ``sigma_band_extrapolation`` is read by the GN/HL
-    #     two-point PPM Σ kernel and nothing else.  Reaching MPA / COHSEX /
-    #     X_ONLY with it set would produce a perfectly ordinary run whose
-    #     log simply lacks the extrapolation block — the exact failure mode
-    #     measurement-discipline rule 1 names, where a green A/B measured
-    #     nothing because one arm silently dropped the knob.
+    # (1) Wiring.  GN/HL-PPM consume cumulative bracket points through the
+    #     measured 1/N estimator.  MPA consumes the SAME sampling machinery but
+    #     deliberately selects NO estimator in this pass.  COHSEX / X_ONLY have
+    #     neither consumer, so an explicitly named key there would silently do
+    #     nothing — the exact failure mode measurement-discipline rule 1 names.
     #
     # (2) THE MATH ITSELF IS MODE-DEPENDENT.  The extrapolation's limit
     #     point is 1/N → 0, and that limit is WRONG for a static Coulomb
@@ -635,16 +694,16 @@ def compute_sigma_xc(
     #     better and drive it more confidently ~340 meV past the right
     #     answer — because the static CH's high-energy tail is not
     #     suppressed by a pole denominator and keeps contributing past where
-    #     the 1/N law was calibrated.  So routing this at a static mode
-    #     would not merely fail to log; it would return a wrong number
-    #     carrying a "consistent" verdict that gets worse the more you spend
-    #     on it.  Report: sandbox
+    #     the 1/N law was calibrated.  So routing the 1/N estimator at a
+    #     static mode would not merely fail to log; it would return a wrong
+    #     number carrying a "consistent" verdict that gets worse the more you
+    #     spend on it.  Report: sandbox
     #     reports/ch_converge_band_extrapolation_2026-08-15/.
     # ── RECONCILING THE GUARD WITH A DEFAULT-ON KEY ─────────────────────
     # Before 2026-08-16 the key defaulted OFF, so "set it on a non-PPM mode"
     # was always a deliberate act and refusing was the whole answer.  The key
     # now defaults ON, and a refusal that fires on the DEFAULT would make
-    # every COHSEX / MPA / X_ONLY run in the tree unrunnable — two gates
+    # every COHSEX / X_ONLY run in the tree unrunnable — two gates
     # fighting, with the operator caught in the middle.
     #
     # So the guard splits on PROVENANCE, which is the only thing that
@@ -676,12 +735,15 @@ def compute_sigma_xc(
     #   sc_stage_1_type = cohsex, sc_stage_2_type = gnppm
     #       -> dies at stage 1, one stage short of the consumer.
     #   compute_mode = mpa  (the DEFAULT ladder is GN_PPM then MPA)
-    #       -> dies at stage 2, after paying for a full GN-PPM stage.
+    #       -> MPA now consumes raw bracket points but no estimator; it bypasses
+    #          this static-only guard and retains its metallic refusal above.
     #
     # Asking the LADDER instead makes both runnable and still refuses the
     # case the guard was written for: an explicit key on a run in which no
     # stage is a plasmon-pole model.
-    if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
+    if (bool(config.sigma.band_extrapolation)
+            and mode.ppm_model is None
+            and mode is not ComputeMode.MPA):
         explicit = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
         run_modes = sigma_stage_modes(config, fallback=mode)
@@ -719,25 +781,12 @@ def compute_sigma_xc(
                    f"the run")
         else:
             why = ("no deck key named it; use_band_extrapolation defaults on")
-        # The JUSTIFICATION differs by stage kind and must not be recited
-        # wrongly.  A static mode gets the measured static-CH anti-convergence;
-        # MPA is DYNAMIC, so that measurement is not about it, and claiming it
-        # were would be inventing evidence.
-        if getattr(mode, "is_dynamic", False):
-            because = (
-                "MPA is dynamic, so the static Coulomb-hole measurement below "
-                "is NOT the reason here: the reason is that the 1/N -> 0 "
-                "limit has never been measured for this ansatz and its Σ_c is "
-                "not built by the bracketed two-point PPM kernel, so there is "
-                "no bracket axis to fit.  Extrapolating it would be an "
-                "unvalidated claim, not a correction")
-        else:
-            because = (
-                "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
-                "static Coulomb hole: measured against BerkeleyGW's exact "
-                "static CH it ANTI-converges, 94.9 -> 288.2 meV MAE as nband "
-                "goes 60 -> 124, overshooting by ~340 meV, while GN-PPM "
-                "improves 171.3 -> 32.8 over the same range")
+        because = (
+            "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
+            "static Coulomb hole: measured against BerkeleyGW's exact "
+            "static CH it ANTI-converges, 94.9 -> 288.2 meV MAE as nband "
+            "goes 60 -> 124, overshooting by ~340 meV, while GN-PPM "
+            "improves 171.3 -> 32.8 over the same range")
         print_fn(
             f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
             f"{getattr(mode, 'value', mode)} ({why}).  {because}.  "
@@ -925,6 +974,7 @@ def compute_sigma_xc(
             omega_cluster_gap_ry=float(
                 config.mpa.sigma_omega_cluster_gap_ry),
             pole_batch_size=int(config.mpa.pole_batch_size),
+            band_plan=mpa_band_plan,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")
@@ -949,8 +999,15 @@ def compute_sigma_xc(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+        # ``SigmaOmegaResult`` is the shared estimator handoff: PPM and MPA
+        # both expose cumulative bracket points on its leading axis.  This
+        # pass is machinery-only, so select the final point and call no fit.
+        body_full = (
+            body.sigma_c_kij if mpa_band_plan is None else
+            _band_count_point(
+                body.sigma_c_kij, body.sigma_c_kij.shape[0] - 1))
         return finalize_dynamic_sigma(
-            body.sigma_c_kij, head_diag,
+            body_full, head_diag,
             sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
             config=config, meta=meta, mesh_xy=mesh_xy,
             sym=sym, wfn=wfn, band_slices=band_slices,

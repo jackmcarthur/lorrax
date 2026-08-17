@@ -532,6 +532,24 @@ def _device_omega_add(sharding):
 
 
 @lru_cache(maxsize=8)
+def _device_omega_add_axis(sharding, omega_axis):
+    """Insert omega behind any leading bookkeeping axes.
+
+    The historical axis-0 expression above remains a separate fast path so
+    an ordinary, un-bracketed MPA run executes exactly the old operation.
+    MPA band brackets use this helper with ``omega_axis == 1`` and carry the
+    disjoint bracket increments untouched through the same frequency fold.
+    """
+    def add(acc, sigma, coeff):
+        coeff_shape = [1] * acc.ndim
+        coeff_shape[int(omega_axis)] = -1
+        return (acc + coeff.reshape(tuple(coeff_shape))
+                * jnp.expand_dims(sigma, axis=int(omega_axis)))
+
+    return jax.jit(add, donate_argnums=(0,), out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
 def _device_output_add(sharding):
     return jax.jit(
         lambda total, window: total + window,
@@ -549,14 +567,18 @@ class DeviceOmegaAccumulator:
     overflowing two factors whose product is well conditioned.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding):
+    def __init__(self, omega_vec, *, shape, sharding, omega_axis=0):
         self._shape = tuple(int(n) for n in shape)
         self._sharding = sharding
+        self._omega_axis = int(omega_axis)
         self._replicated = NamedSharding(sharding.mesh, P())
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
-        if self._shape[0] != self._omega.size:
+        if not 0 <= self._omega_axis < len(self._shape):
+            raise ValueError("DeviceOmegaAccumulator: invalid omega_axis")
+        if self._shape[self._omega_axis] != self._omega.size:
             raise ValueError(
-                "DeviceOmegaAccumulator: shape[0] must equal n_omega")
+                "DeviceOmegaAccumulator: shape[omega_axis] must equal "
+                "n_omega")
         # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
         # ×2 while a crossing window holds its temporary cube open.
         self._total = _device_output_zeros(self._shape, sharding)()
@@ -607,11 +629,21 @@ class DeviceOmegaAccumulator:
             self._coeff[self._index], self._replicated)
         self._index += 1
         if self._window is None:
-            self._total = _device_omega_add(self._sharding)(
-                self._total, sigma_tau, coeff)
+            if self._omega_axis == 0:
+                self._total = _device_omega_add(self._sharding)(
+                    self._total, sigma_tau, coeff)
+            else:
+                self._total = _device_omega_add_axis(
+                    self._sharding, self._omega_axis)(
+                        self._total, sigma_tau, coeff)
         else:
-            self._window = _device_omega_add(self._sharding)(
-                self._window, sigma_tau, coeff)
+            if self._omega_axis == 0:
+                self._window = _device_omega_add(self._sharding)(
+                    self._window, sigma_tau, coeff)
+            else:
+                self._window = _device_omega_add_axis(
+                    self._sharding, self._omega_axis)(
+                        self._window, sigma_tau, coeff)
 
     def end_window(self):
         if self._coeff is None:
