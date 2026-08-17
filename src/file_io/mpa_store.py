@@ -2302,7 +2302,7 @@ def write_head_fit_collective(
 ):
     """Collectively publish one tiny scalar head fit through SlabIO.
 
-    COLLECTIVE over ``mesh_xy`` (three barriers).  ``dest`` must be a PATH.
+    COLLECTIVE over ``mesh_xy`` (four barriers).  ``dest`` must be a PATH.
 
     SHAPES AND UNITS.  All four arrays are flattened to 1-D complex128.
     ``sample_z``/``sample_Wc`` share an extent — 2·n_p in production — and
@@ -2360,6 +2360,14 @@ def write_head_fit_collective(
         raise ValueError(
             "scalar-head grid hash does not match the fitted body grid")
 
+    # ``fit_completion_ledger`` is an all-rank serial-h5py read.  Rank 0
+    # must not open the same inode for write until every peer has closed
+    # that reader: otherwise a fast rank 0 sets HDF5's superblock write-open
+    # flag while a slower peer is still entering its read, which that peer
+    # refuses as "file is already open for write".  The following barrier
+    # is therefore a reader->single-writer ownership transfer, not optional
+    # synchronization around the later parallel payload write.
+    barrier("mpa_head_ledger_readers_closed")
     if process_rank() == 0:
         with _h5(dest, "a") as grp:
             _open_fit(grp)
