@@ -53,7 +53,14 @@ def test_branches_metallize_only_with_an_occupation_state():
     occ = np.asarray([[1.0, 0.6, 0.0]])
     wfns = SimpleNamespace(
         enk=jnp.asarray(enk), occ=jnp.asarray(occ),
-        slices=SimpleNamespace(full=slice(0, 3)))
+        # ``sigma_sum`` and DELIBERATELY NOT ``full`` — the same stub the
+        # cell above carries, and for the same reason (18f4baa3).  This cell
+        # arrived with the metal branch, where ``_branches`` still read
+        # ``full``; after the chi/Sigma split that name is the LOADED extent
+        # max(chi, sigma) and the causal branching is a statement about the
+        # SIGMA band sum.  Omitting ``full`` makes the cell fail loudly if
+        # the production code reaches back for the larger consumer's count.
+        slices=SimpleNamespace(sigma_sum=slice(0, 3)))
     omega = np.asarray([0.0, 0.4])
 
     legacy = _branches(wfns, omega, 0.25)
