@@ -1715,7 +1715,9 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
+def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None,
+		print_fn=print, bgw_v_grid_fn=None, bgw_v_sphere_fn=None,
+		sym=None, centroid_indices=None):
 	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
 
 	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
@@ -1908,6 +1910,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						sys_dim=meta.sys_dim,
 						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
 						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+						bgw_v_grid_fn=bgw_v_grid_fn,
+						bgw_v_sphere_fn=bgw_v_sphere_fn,
 						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
 						       if meta.sys_dim == 0 else None),
 						g_chunk=(int(cfg.memory.vq_g_chunk_size)
@@ -1990,6 +1994,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
 						bare_coulomb_cutoff=vcoul_cutoff_ry,
 						bgw_v_grid_fn=bgw_v_grid_fn,
+						bgw_v_sphere_fn=bgw_v_sphere_fn,
 						sym=sym,
 						centroid_indices=_cent_idx_np,
 						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
@@ -2128,7 +2133,8 @@ def build_wavefunction_bundle(
 
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
-	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None, **_ignored,
+	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
+	bgw_v_sphere_fn=None, **_ignored,
 ):
 	"""ISDF pipeline (non-restart path reads top-to-bottom):
 
@@ -2280,6 +2286,7 @@ def prepare_isdf_and_wavefunctions(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
+				bgw_v_sphere_fn=bgw_v_sphere_fn,
 				sym=sym, centroid_indices=centroid_indices)
 			# P5 — post-V_q.  V_q's transient peak just happened inside
 			# compute_V_q; this probe captures what survives (V_qmunu,
@@ -2512,7 +2519,26 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
-			if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
+			if getattr(cfg.head, 'bgw_metal_vcoul_file', None):
+				# Reuse ψ and the expensive ISDF/ζ fit, but not a V tensor
+				# stamped under another Coulomb policy.  Contract the saved ζ
+				# against the file-supplied v(q,G), which feeds both Sigma_x and
+				# the subsequent W assembly.
+				zeta_path = os.path.join(tmp_dir, "zeta_q.h5")
+				V_qmunu, G0, head_channel = compute_V_q(
+					zeta_path, wfn, meta, mesh_xy, cfg,
+					print_fn=print0,
+					bgw_v_grid_fn=bgw_v_grid_fn,
+					bgw_v_sphere_fn=bgw_v_sphere_fn,
+					sym=sym, centroid_indices=centroid_indices)
+				from common import sanity as _vcoul_sanity
+				_vcoul_sanity.check_finite(
+					"BGW-file rebuilt V_q", V_qmunu, print_fn=print0)
+				print0(
+					"  [bgw metal vcoul provenance] restart reused ψ and the "
+					"ISDF/ζ fit, but rebuilt V_q from tmp/zeta_q.h5 with "
+					"bgw_metal_vcoul_file; the restart V tensor was not reused.")
+			elif bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
 				zeta_path = os.path.join(tmp_dir, "zeta_q.h5")
 				bvec = CoulombGeometry.from_wfn(wfn).bvec
 				vcoul_cutoff_ry = (

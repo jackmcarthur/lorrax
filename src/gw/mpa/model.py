@@ -136,6 +136,7 @@ def _solve_wc(
     sym=None,
     wfn=None,
     config=None,
+    head_resolver=None,
     print_fn=print,
     distrib_la_batched_route: str = "auto",
 ):
@@ -181,12 +182,20 @@ def _solve_wc(
         bgw_q0 = resolve_bgw_q0_channel(
             config, sym, q_idx,
             head_channel, kgrid=meta.kgrid)
-        bgw_vhead = bgw_q0shift_vhead(wfn, meta)
+        bgw_vhead = (
+            None if head_resolver is None
+            else head_resolver.bare_vc0_override)
+        if bgw_vhead is None:
+            bgw_vhead = bgw_q0shift_vhead(wfn, meta)
+            _v_source = "analytic-sphere"
+        else:
+            bgw_vhead = complex(bgw_vhead)
+            _v_source = "bgw_metal_vcoul_file"
         print_fn(
             "  [bgw q0 provenance] finite epsilon q0="
             f"{bgw_q0.q0_reduced}, full row={bgw_q0.requested_full_index}, "
             f"wedge row={bgw_q0.wedge_row} (representative full row "
-            f"{bgw_q0.representative_full_index}); analytic-sphere "
+            f"{bgw_q0.representative_full_index}); {_v_source} "
             f"v_head={bgw_vhead.real:.12e} raw, "
             f"{bgw_vhead.real / (float(meta.nk_tot) * float(meta.cell_volume)):.12e} "
             "after 1/(Nk*Omega).")
@@ -589,6 +598,7 @@ def build_mpa_fit(
             sym=sym,
             wfn=wfn,
             config=config,
+            head_resolver=head_resolver,
             print_fn=print_fn,
             distrib_la_batched_route=getattr(
                 config.backend, "distrib_la_batched_route", "auto"),

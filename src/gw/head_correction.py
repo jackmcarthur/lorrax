@@ -699,9 +699,11 @@ class HeadResolver:
     """
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
-                 "_print_fn", "_cache")
+                 "_print_fn", "_cache", "_bare_vc0_override",
+                 "_bare_vc0_source")
 
-    def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
+    def __init__(self, config, input_dir, wfn, sym, meta, print_fn, *,
+                 bare_vc0_override=None, bare_vc0_source=None):
         head = config.head
         self._params = {
             "wcoul0_source": head.wcoul0_source,
@@ -717,7 +719,15 @@ class HeadResolver:
         self._sym = sym
         self._meta = meta
         self._print_fn = print_fn
+        self._bare_vc0_override = (
+            None if bare_vc0_override is None else complex(bare_vc0_override))
+        self._bare_vc0_source = bare_vc0_source
         self._cache: dict[tuple[float, float], HeadSample] = {}
+
+    @property
+    def bare_vc0_override(self) -> complex | None:
+        """Raw q0,G0 value supplied by ``bgw_metal_vcoul_file``."""
+        return self._bare_vc0_override
 
     def _cache_key(self, omega) -> tuple[float, float]:
         z = complex(omega)
@@ -733,6 +743,22 @@ class HeadResolver:
             self._params, self._input_dir, self._wfn, self._sym,
             self._meta, self._print_fn, omega=omega,
         )
+        if self._bare_vc0_override is not None:
+            if abs(sample.vc0) == 0.0:
+                raise ValueError(
+                    "bgw_metal_vcoul_file cannot replace a zero computed "
+                    "q0 bare head while preserving the selected screened-W "
+                    "head convention.")
+            eps_eff = sample.wcoul0 / sample.vc0
+            sample = HeadSample(
+                vc0=self._bare_vc0_override,
+                wcoul0=self._bare_vc0_override * eps_eff,
+                source=(
+                    f"{self._bare_vc0_source or 'bgw_metal_vcoul_file'} "
+                    f"bare v; {sample.source} screened ratio"),
+                omega=sample.omega,
+                S_cart=sample.S_cart,
+            )
         self._cache[key] = sample
         return sample
 

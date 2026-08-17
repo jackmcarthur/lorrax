@@ -1631,6 +1631,10 @@ _DEFAULTS = {
     # Reduced reciprocal coordinates of BGW's epsilon q0 sample.  The
     # shipping comparison grid is 8x8x8, so (0,0,1/8) is one grid step.
     "bgw_metal_q0_vector": "0 0 0.125",
+    # Production parity lever: replace the complete bare-Coulomb q/G table
+    # (including the raw q0,G0 head) with a BGW ``write_vcoul`` artifact.
+    # Empty is the byte-inert shipping path.
+    "bgw_metal_vcoul_file": "",
     # WHERE the q != 0 mini-BZ Coulomb average is APPLIED.  Orthogonal to
     # ``mc_average_vcoul_body``, which decides WHETHER an average is computed.
     #   "off"  (default) -- today's placement: <v> is substituted into the
@@ -2899,6 +2903,7 @@ class HeadConfig:
     mc_average_vcoul_body: bool
     bgw_metal_q0_treatment: str   # "exact" | "bgw_q0shift"
     bgw_metal_q0_vector: tuple[float, float, float]
+    bgw_metal_vcoul_file: str | None
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
@@ -3957,6 +3962,8 @@ class LorraxConfig:
             _g("bgw_metal_q0_treatment"))
         _bgw_q0_vector = _parse_bgw_metal_q0_vector(
             _g("bgw_metal_q0_vector"))
+        _bgw_metal_vcoul_file = (
+            str(_g("bgw_metal_vcoul_file") or "").strip() or None)
         if _bgw_q0_mode == "bgw_q0shift" and int(_g("sys_dim")) != 3:
             raise ValueError(
                 "bgw_metal_q0_treatment = bgw_q0shift is defined only for "
@@ -3964,6 +3971,34 @@ class LorraxConfig:
                 f"sys_dim = {int(_g('sys_dim'))}.")
         _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
         _effective_named_keys = set(_named_keys)
+        if _bgw_metal_vcoul_file is None:
+            _effective_named_keys.discard("bgw_metal_vcoul_file")
+        else:
+            if int(_g("sys_dim")) != 3:
+                raise ValueError(
+                    "bgw_metal_vcoul_file is defined only for 3-D metallic "
+                    f"Coulomb tables (sys_dim = 3); this deck sets sys_dim = "
+                    f"{int(_g('sys_dim'))}.")
+            conflicting = []
+            if bool(_g("use_bgw_vcoul")):
+                conflicting.append("use_bgw_vcoul")
+            if str(_g("bgw_vcoul_file") or "").strip():
+                conflicting.append("bgw_vcoul_file")
+            if _g("vhead") is not None:
+                conflicting.append("vhead")
+            if conflicting:
+                raise ValueError(
+                    "contradictory deck settings: bgw_metal_vcoul_file and "
+                    f"{', '.join(conflicting)} select competing bare-Coulomb "
+                    "sources. Remove the legacy/explicit head source; "
+                    "bgw_metal_q0_treatment=bgw_q0shift is compatible and "
+                    "continues to define screened W only.")
+            print_fn(
+                "  [config provenance] bgw_metal_vcoul_file="
+                f"{_bgw_metal_vcoul_file}: BGW supplies every bare v(q,G), "
+                "including q0,G0. If bgw_metal_q0_treatment=bgw_q0shift, "
+                "the file takes precedence over its analytic bare-head "
+                "estimator while finite-q0 screened W remains enabled.")
         if _bgw_q0_mode == "exact":
             # An explicit spelling of the shipping default must serialize to
             # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
@@ -4018,6 +4053,7 @@ class LorraxConfig:
             mc_average_vcoul_body=_mc_average_vcoul_body,
             bgw_metal_q0_treatment=_bgw_q0_mode,
             bgw_metal_q0_vector=_bgw_q0_vector,
+            bgw_metal_vcoul_file=_bgw_metal_vcoul_file,
             mc_average_placement=_normalize_placement(
                 _g("mc_average_placement")),
             mc_average_placement_vcoul=(
