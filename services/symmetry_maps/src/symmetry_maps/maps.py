@@ -2388,7 +2388,7 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
 # change.  Resist making this four: a THIRD unfold means the
 # parameterisation is wrong, not that another name is needed.
 
-def _star_tables_of(sym):
+def star_tables_of(sym):
     """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` off a live ``SymMaps``.
 
     ``n_sym_spatial`` is derived from ``sym_mats_k`` (always ``2·ntran``
@@ -2396,10 +2396,22 @@ def _star_tables_of(sym):
     because that is the derivation :func:`unfold_psi` uses to decide which
     rows get conjugated when it BUILDS ψ(Sk).  Reading it from the header
     instead lets the producer and the consumer of that convention drift.
+
+    PUBLIC because a WRITER needs it too, not only the unfolds below.  A
+    file that stores a wedge has to file the reconstruction tables beside
+    the arrays (``kin_ion.h5``'s ``irr_idx_k``/``sym_idx_k``, and now
+    ``qp_wfn_rotations.h5``'s), and the alternative to exporting this is
+    every writer re-spelling the ``// 2`` — which is precisely the
+    header-vs-``sym_mats_k`` drift the paragraph above exists to prevent.
     """
     return (np.asarray(sym.irr_idx_k, dtype=np.int32),
             np.asarray(sym.sym_idx_k, dtype=np.int32),
             int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
+
+
+#: The private spelling this function had while it was unfold-only.  Kept
+#: as an alias so the in-module call sites below read unchanged.
+_star_tables_of = star_tables_of
 
 
 def unfold_file_wedge_to_full_bz(sym, data):
