@@ -140,6 +140,7 @@ def write_sigma_omega(
     relative to produces the unstamped file audit A2 is about.  Both come
     straight from :func:`eval_sigma_c_at_dft_energies`, which owns the
     choice.
+
     ``band_extrapolation`` is the optional
     ``{"arrays": {...}, "attrs": {...}}`` the Σ_c band-convergence fit
     produces (``gw.band_extrapolation.extrapolation_h5_payload``).  None —

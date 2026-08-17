@@ -487,7 +487,6 @@ def _get_sigma_kij_kernel(
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
 
-
     if not _stage_timing_enabled():
         _build_g = _g_from_selector
 
