@@ -300,7 +300,12 @@ def _moments_at_order(pair_block, W0bar, intervals, order, V_total):
             batch = nodes[start:start + _RESOLVENT_BATCH_NODES]
             R_batch = _resolvents_at_zeta(
                 pair_block, W0bar, (zeta for zeta, _dz in batch))
-            for R, (zeta, dz) in zip(R_batch, batch):
+            # A globally sharded jax.Array deliberately refuses Python's
+            # iterator protocol: no process owns the full face.  The node
+            # coordinate is replicated, so integer indexing is the legal
+            # global operation and leaves the matrix at P('x','y').
+            for node_index, (zeta, dz) in enumerate(batch):
+                R = R_batch[node_index]
                 factor = normalization * dz
                 M = M + factor * R
                 # R=C/(lambda-zeta), so the CCW residue of R/zeta is

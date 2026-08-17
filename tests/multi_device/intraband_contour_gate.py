@@ -55,6 +55,10 @@ def main():
     if any(tuple(shard.data.shape) != (len(zetas), 2, 2)
            for shard in got_j.addressable_shards):
         raise AssertionError("a rank materialized a full N_mu-square result")
+    indexed = got_j[1]
+    if indexed.sharding.spec != P("x", "y"):
+        raise AssertionError(
+            f"indexed contour node has sharding {indexed.sharding.spec}")
     got = np.asarray(multihost_utils.process_allgather(got_j, tiled=True))
 
     want = []
