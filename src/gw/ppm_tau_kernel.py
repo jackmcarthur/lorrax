@@ -274,8 +274,10 @@ def get_sigma_spatial_kernel(
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
     from common.fft_helpers import (
-        make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
+        make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn,
+        make_fused_conv_klead)
     from ffi import ffi_dial_key
+    from ffi.fft import conv_klead_plan
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            bool(merged_x))
     if key in _sigma_spatial_kernel_cache:
@@ -286,12 +288,15 @@ def get_sigma_spatial_kernel(
     inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
     use_fused_ffi = _fft_ffi_fused_enabled()
     if use_fused_ffi:
-        # ONE fused FFTW3-ABI (host) / cuFFT (CUDA) FFI call per rank per τ:
+        use_direct_klead, _ = conv_klead_plan(mesh_xy, kgrid)
+        # ONE fused vendor-plan or direct CUDA FFI call per rank per tau:
         # sigma_k = fftn(ifftn(G_k)·ifftn(W_q)[:,None,:,None,:]·inv_sqrt_nk)
         # with the R-space G tile chunked away inside the handler.  The
         # decomposed helpers below are deliberately NOT built on this route
         # (their announce/probe belongs to LORRAX_FFT_FFI).
-        _gw_conv = make_flat_k_gw_conv(
+        conv_factory = (make_fused_conv_klead
+                        if use_direct_klead else make_flat_k_gw_conv)
+        _gw_conv = conv_factory(
             mesh_xy, kgrid, _G_spec, _V_spec,
             norm='ortho', mult=inv_sqrt_nk)
     else:
