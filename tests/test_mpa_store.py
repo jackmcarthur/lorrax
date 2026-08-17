@@ -1012,6 +1012,11 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         MS.read_head_fit(tmpdir_path)
 
 
+def test_bgw_q0shift_head_model_is_a_certified_store_protocol():
+    """The producer's public model tag must survive the reader allowlist."""
+    assert "bgw_q0shift_loewner" in MS._HEAD_FIT_MODELS
+
+
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
         tmpdir_path):
     MS.allocate_fit_store(

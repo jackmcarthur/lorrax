@@ -207,6 +207,7 @@ REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
 _HEAD_FIT_MODELS = (
     "fixed_dft_gn",
     "dft_direct_loewner",
+    "bgw_q0shift_loewner",
     "qsgw_direct_loewner",
     "qsgw_schur_loewner",
 )
