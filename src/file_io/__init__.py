@@ -100,4 +100,9 @@ from .kin_ion import (
 )
 from .centroids import load_centroids
 from .paths import resolve_input_paths
-from .read_bgw_vcoul import read_bgw_vcoul, fill_v_grid_for_q, BGWVcoulTable
+from .read_bgw_vcoul import (
+    BGWVcoulTable,
+    fill_v_grid_for_q,
+    fill_v_sphere_for_q,
+    read_bgw_vcoul,
+)

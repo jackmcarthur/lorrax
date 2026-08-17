@@ -83,7 +83,12 @@ from vcoul.base import (
     v_qG_single,
     v_qG_table,
 )
-from vcoul.bgw_parity import BGWVcoulTable, fill_v_grid_for_q, read_bgw_vcoul
+from vcoul.bgw_parity import (
+    BGWVcoulTable,
+    fill_v_grid_for_q,
+    fill_v_sphere_for_q,
+    read_bgw_vcoul,
+)
 from vcoul.box_0d import Box0D
 from vcoul.box_fft import (
     N_IN_BOX,

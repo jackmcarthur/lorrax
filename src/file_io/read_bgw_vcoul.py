@@ -48,7 +48,11 @@ _services.ensure_on_path()
 from vcoul import (                                         # noqa: E402,F401
     BGWVcoulTable,
     fill_v_grid_for_q,
+    fill_v_sphere_for_q,
     read_bgw_vcoul,
 )
 
-__all__ = ["BGWVcoulTable", "read_bgw_vcoul", "fill_v_grid_for_q"]
+__all__ = [
+    "BGWVcoulTable", "read_bgw_vcoul", "fill_v_grid_for_q",
+    "fill_v_sphere_for_q",
+]

@@ -6,25 +6,28 @@ where qx,qy,qz are fractional k-point coords and Gx,Gy,Gz are integer Miller
 indices. BGW's vcoul value is ``<8π/|q+G+δq|²>_miniBZ`` (MC-averaged) in
 Rydberg units (before multiplication by ``fact = 1/(Nk·Ω)``).
 
-This is useful to bypass LORRAX's approximate G=0-only mini-BZ average in the
-3D semiconductor case, when BGW's all-G MC averaging matters (small k-grids).
+Sigma writes the q walk once per requested outer k-point.  The first walk is
+the one used for the first (normally Gamma) Sigma k-point and is the table
+consumed here; later walks can use a different little group and repeat or add
+q blocks.  The parser therefore stops at the first repeated q coordinate.
 
-NUMPY ONLY, and moved VERBATIM in the extraction — including
-:meth:`BGWVcoulTable.find_q_index`'s missing q0 fallback, which is a
-registered owner question (repair-or-delete on the whole ``use_bgw_vcoul``
-surface), not something to quietly fix inside a refactor.  This module is
-the BGW PARITY surface; the file reading it does is a text ``loadtxt``
-with no HDF5 and no lorrax path resolution, so it rides in the service
-while the deck's ``head.bgw_vcoul_file`` / ``resolve_input_path`` logic
-stays in ``gw.compute_vcoul.build_bgw_v_grid_fn``.
+NUMPY ONLY.  Path resolution and WFN/grid validation stay in ``gw``; this
+service owns only the text grammar and integer q/G mapping.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import os
 
 import numpy as np
 
-__all__ = ["BGWVcoulTable", "read_bgw_vcoul", "fill_v_grid_for_q"]
+__all__ = [
+    "BGWVcoulTable",
+    "fill_v_grid_for_q",
+    "fill_v_sphere_for_q",
+    "read_bgw_vcoul",
+]
 
 
 @dataclass
@@ -40,6 +43,24 @@ class BGWVcoulTable:
     q_fracs: np.ndarray
     G_miller_per_q: list
     vcoul_per_q: list
+    source_path: str | None = None
+    sha256: str | None = None
+
+    @property
+    def n_G(self) -> int:
+        """Total number of (q,G) rows in the retained q walk."""
+        return sum(int(np.asarray(g).shape[0]) for g in self.G_miller_per_q)
+
+    def q0_vcoul_raw(self) -> float:
+        """Return BGW's raw-Ry q=0,G=0 value, before ``1/(Nq*Omega)``."""
+        iq, _, _ = self.find_q_index((0.0, 0.0, 0.0), sym_mats_k=None)
+        G = np.asarray(self.G_miller_per_q[iq], dtype=np.int32)
+        rows = np.nonzero(np.all(G == 0, axis=1))[0]
+        if rows.size != 1:
+            raise ValueError(
+                "BGW vcoul q=0 block must contain exactly one G=(0,0,0) "
+                f"row; found {int(rows.size)} in {self.source_path or '<table>'}.")
+        return float(np.asarray(self.vcoul_per_q[iq])[int(rows[0])])
 
     def find_q_index(self, q_frac, tol: float = 1e-4, sym_mats_k=None) -> tuple[int, np.ndarray, np.ndarray]:
         """Find stored q_table symmetry-equivalent to q_frac.
@@ -92,7 +113,23 @@ class BGWVcoulTable:
         raise ValueError(f"No BGW q-point matches {q_frac} (after symmetry search)")
 
 
-def read_bgw_vcoul(path: str) -> BGWVcoulTable:
+def _q_key(q) -> tuple[int, int, int]:
+    return tuple(np.rint(np.mod(np.asarray(q, dtype=np.float64), 1.0) * 1e8)
+                 .astype(np.int64).tolist())
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_bgw_vcoul(path: str, *, compute_sha256: bool = True) -> BGWVcoulTable:
     """Parse a BGW vcoul text file.
 
     Returns a BGWVcoulTable with one entry per IBZ q-point — the q-blocks
@@ -112,35 +149,125 @@ def read_bgw_vcoul(path: str) -> BGWVcoulTable:
     obtained via the BGW symmetry path in
     :meth:`BGWVcoulTable.find_q_index`, not from later blocks.
     """
-    arr = np.loadtxt(path)
-    q_all = arr[:, 0:3]
-    G_all = arr[:, 3:6].astype(np.int32)
-    v_all = arr[:, 6]
-
-    # Round q's to 8 decimals so floating-point noise groups together
-    q_key_all = np.round(np.mod(q_all, 1.0) * 1e8).astype(np.int64)
-
+    source_path = os.path.realpath(os.fspath(path))
     q_fracs, G_miller_per_q, vcoul_per_q = [], [], []
-    seen_keys: set[tuple] = set()
-    i = 0
-    while i < arr.shape[0]:
-        key = tuple(q_key_all[i])
-        block_end = i
-        while block_end < arr.shape[0] and tuple(q_key_all[block_end]) == key:
-            block_end += 1
-        if key in seen_keys:
-            break
-        seen_keys.add(key)
-        q_fracs.append(np.asarray(key, dtype=np.float64) / 1e8)
-        G_miller_per_q.append(np.asarray(G_all[i:block_end], dtype=np.int32))
-        vcoul_per_q.append(np.asarray(v_all[i:block_end], dtype=np.float64))
-        i = block_end
+    seen_keys: set[tuple[int, int, int]] = set()
+    current_key = None
+    current_G: list[tuple[int, int, int]] = []
+    current_v: list[float] = []
+
+    def finish_block():
+        if current_key is None:
+            return
+        if not current_G:
+            raise ValueError(
+                f"BGW vcoul file {source_path} has an empty q block "
+                f"for {current_key}.")
+        q_fracs.append(np.asarray(current_key, dtype=np.float64) / 1e8)
+        G_miller_per_q.append(np.asarray(current_G, dtype=np.int32))
+        vcoul_per_q.append(np.asarray(current_v, dtype=np.float64))
+
+    with open(source_path, "rt", encoding="ascii") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            fields = line.split()
+            if not fields:
+                continue
+            if len(fields) != 7:
+                raise ValueError(
+                    f"BGW vcoul file {source_path}, line {line_no}: expected "
+                    f"7 fields (qx qy qz Gx Gy Gz vcoul), found {len(fields)}.")
+            try:
+                q = tuple(float(fields[i]) for i in range(3))
+                G = tuple(int(fields[i]) for i in range(3, 6))
+                value = float(fields[6])
+            except ValueError as exc:
+                raise ValueError(
+                    f"BGW vcoul file {source_path}, line {line_no}: invalid "
+                    "q/G/value field.") from exc
+            if not np.all(np.isfinite(q)) or not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"BGW vcoul file {source_path}, line {line_no}: q and "
+                    "vcoul must be finite and vcoul must be nonnegative.")
+            key = _q_key(q)
+            if current_key is None:
+                current_key = key
+                seen_keys.add(key)
+            elif key != current_key:
+                finish_block()
+                if key in seen_keys:
+                    break
+                seen_keys.add(key)
+                current_key = key
+                current_G = []
+                current_v = []
+            current_G.append(G)
+            current_v.append(value)
+        else:
+            finish_block()
+
+    if not q_fracs:
+        raise ValueError(f"BGW vcoul file {source_path} contains no complete q block.")
 
     return BGWVcoulTable(
         q_fracs=np.asarray(q_fracs, dtype=np.float64),
         G_miller_per_q=G_miller_per_q,
         vcoul_per_q=vcoul_per_q,
+        source_path=source_path,
+        sha256=_sha256_file(source_path) if compute_sha256 else None,
     )
+
+
+def fill_v_sphere_for_q(
+    table: BGWVcoulTable,
+    q_frac,
+    g_miller,
+    cell_volume: float,
+    *,
+    tol: float = 1e-4,
+    sym_mats_k=None,
+    require_exact_sphere: bool = True,
+) -> np.ndarray:
+    """Map one BGW q block onto an explicit LORRAX Miller-G list.
+
+    Unlike :func:`fill_v_grid_for_q`, this strict production form has no
+    zero-valued "missing" sentinel.  Every requested G must occur exactly
+    once and, by default, the transformed BGW sphere must contain no extra G.
+    Returned values are divided by ``cell_volume`` but not by ``Nq``; the
+    latter is applied by LORRAX's q summation, matching BGW's later ``fact``.
+    """
+    requested = np.asarray(g_miller, dtype=np.int32)
+    if requested.ndim != 2 or requested.shape[-1] != 3:
+        raise ValueError(
+            f"g_miller must have shape (n_G,3); got {requested.shape}.")
+    iq, S_k, kg0 = table.find_q_index(
+        q_frac, tol=tol, sym_mats_k=sym_mats_k)
+    stored = np.asarray(table.G_miller_per_q[iq], dtype=np.int32)
+    transformed = np.einsum(
+        "ij,gj->gi", S_k.astype(np.int32), stored) - kg0[None, :]
+    values = np.asarray(table.vcoul_per_q[iq], dtype=np.float64)
+
+    lookup: dict[tuple[int, int, int], float] = {}
+    for G, value in zip(transformed, values):
+        key = tuple(int(x) for x in G)
+        if key in lookup:
+            raise ValueError(
+                f"BGW vcoul file {table.source_path or '<table>'} has duplicate "
+                f"G={key} after q/umklapp mapping for q={tuple(q_frac)}.")
+        lookup[key] = float(value)
+
+    requested_keys = [tuple(int(x) for x in G) for G in requested]
+    requested_set = set(requested_keys)
+    missing = sorted(requested_set.difference(lookup))
+    extra = sorted(set(lookup).difference(requested_set))
+    if missing or (require_exact_sphere and extra):
+        raise ValueError(
+            "bgw_metal_vcoul_file G-sphere/cutoff mismatch at "
+            f"q={tuple(float(x) for x in q_frac)}: missing {len(missing)} "
+            f"G and extra {len(extra)} G; first missing={missing[:3]}, "
+            f"first extra={extra[:3]}. Check bare_coulomb_cutoff and the "
+            "WFN used by BerkeleyGW.")
+    return np.asarray([lookup[key] for key in requested_keys], dtype=np.float64) \
+        / float(cell_volume)
 
 
 def fill_v_grid_for_q(
