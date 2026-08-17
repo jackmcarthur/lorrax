@@ -681,3 +681,41 @@ def test_the_key_still_works_because_removal_is_the_owners_step():
         "full", _closed_and_reduced(), context="gate").mode == "full"
     assert resolve_restart_q_storage(
         "auto", _closed_and_reduced(), context="gate").mode == "ibz"
+
+
+def test_force_full_bz_demotes_auto_because_no_wedge_was_produced(monkeypatch):
+    """``LORRAX_FORCE_FULL_BZ=1`` bypasses the wedge, so there is none to store.
+
+    The deposit that offers the pre-unfold block lives INSIDE the IBZ
+    cascade (``gw/v_q_g_flat.py:592``, ``gw/screening.py:479``).  The bypass
+    skips that branch entirely, while the closure question ``auto`` asks —
+    is the centroid set orbit-closed, does the q grid reduce — is about the
+    DECK and answers "yes" either way.  Resolving ``ibz`` there yields a
+    decision with nothing captured, which ``write_restart_state_to_h5``
+    refuses by design rather than slicing the unfolded tensor.
+
+    MEASURED 2026-08-16: with the default at ``auto`` and without this
+    demotion, ``test_invariance_gates::test_ibz_equals_full_bz`` went red —
+    its leg B is a fresh full pipeline under the bypass.  It is not a
+    test-only path: any run using the bypass would have died at the writer.
+
+    ``ibz`` is NOT demoted.  That value means "refuse rather than fall
+    back", and a run that asked for it while bypassing the wedge should be
+    told, not accommodated.
+    """
+    from gw.restart_q_storage import resolve_restart_q_storage_for_run
+
+    class _Cfg:
+        restart_q_storage_raw = "auto"
+
+    monkeypatch.setenv("LORRAX_FORCE_FULL_BZ", "1")
+    d = resolve_restart_q_storage_for_run(
+        _Cfg(), sym=None, centroid_indices=None, fft_grid=None,
+        print_fn=lambda *_a, **_k: None, context="unit")
+    assert d.mode == "full"
+
+    monkeypatch.delenv("LORRAX_FORCE_FULL_BZ")
+    d = resolve_restart_q_storage_for_run(
+        _Cfg(), sym=None, centroid_indices=None, fft_grid=None,
+        print_fn=lambda *_a, **_k: None, context="unit")
+    assert d.requested == "auto"

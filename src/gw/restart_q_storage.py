@@ -482,15 +482,33 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
     a resolution the WRITER took, which is what makes
     :func:`assert_capture_matches` a real check rather than a tautology.
     """
+    # ``LORRAX_FORCE_FULL_BZ=1`` BYPASSES THE WEDGE IN COMPUTE, SO THERE IS
+    # NO WEDGE TO STORE.  The deposit that offers the pre-unfold block lives
+    # inside the IBZ cascade (``v_q_g_flat.py:592``, ``screening.py:479``);
+    # the bypass skips that branch entirely, while the closure question this
+    # function asks — is the centroid set orbit-closed, does the q grid
+    # reduce — is about the DECK and answers "yes" either way.  Resolving
+    # ``ibz`` there produces a decision with nothing captured, which
+    # ``write_restart_state_to_h5`` refuses by design rather than slicing the
+    # unfolded tensor.
+    #
+    # MEASURED 2026-08-16: with the default at ``auto`` this took
+    # ``test_invariance_gates::test_ibz_equals_full_bz`` red — its leg B is a
+    # fresh full pipeline under ``LORRAX_FORCE_FULL_BZ=1`` — and it is not a
+    # test-only path: any run using the bypass would have died at the writer.
+    # The demotion is the same principle as the rest of the key: storage
+    # follows what the run actually did.
+    requested = str(getattr(config, "restart_q_storage_raw", "auto"))
+    from .gw_config import env_bool
+    if env_bool("LORRAX_FORCE_FULL_BZ", False) and requested != "ibz":
+        requested = "full"
     res = None
     if sym is not None and centroid_indices is not None:
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
             context=context)
-    decision = resolve_restart_q_storage(
-        getattr(config, "restart_q_storage_raw", "auto"), res,
-        context=context)
+    decision = resolve_restart_q_storage(requested, res, context=context)
     # ANNOUNCED, ONCE, ON RANK 0 — same discipline as the suppress key.
     # A run whose restart file changed SHAPE and said nothing is a run
     # nobody can tell from one whose centroid set quietly stopped closing.
