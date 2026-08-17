@@ -1,4 +1,4 @@
-"""The ladder-W rung on the k-MINOR FUSED CONV handler — opt-in, DEFAULT OFF.
+"""The ladder-W rung on the k-MINOR FUSED CONV handler — default ``auto``.
 
 This module is the BSE-side consumer of the fused-conv family's k-MINOR
 member (``ffi.fft.make_conv_kminor_ffi``, reached through the
@@ -32,32 +32,16 @@ priced target for this module is 0.32–0.52 ms in place of the 3.64 ms, i.e.
 2.8–3.1× on the matvec; after it the encode/decode GEMMs (1012 µs) are the
 largest remaining term.
 
-WHY A SEPARATE MODULE AND NOT AN EDIT
--------------------------------------
-``bse_ring_comm.py`` is owned by the integration lane.  The whole opt-in is
-three lines there (see ``integrate_conv_kminor.patch`` beside this file's
-evidence directory), and every line of behaviour lives here, so the two lanes
-cannot collide and the rung file keeps one spelling of the chain plus a hook.
+Both production BSE ring builders call the router in this module.  Default
+``auto`` uses the CUDA handler when the platform, registered target, dtype,
+and conservative 48-KiB row-residency check allow it; otherwise it executes
+the caller's reference implementation.  ``on`` requires the handler and
+delegates the final device-specific residency decision to C++.  The handler's
+rank-local shard contract has been certified at P>1.
 
-**DEFAULT OFF.**  ``LORRAX_CONV_KMINOR_FFI=1`` opts in.  The handler is new
-custom CUDA device code exercised at P=1 on one A100; the XLA chain is the
-certified production path.  ``conv_kminor_rung_supported`` is the honest
-answer to "may this run here" and REFUSES rather than demoting — in
-particular for the fp32-GMRES arm, whose payload ``bse_feast.
-_build_gmres_data_fp32`` casts to c64 and which the c128-only handler must
-turn away instead of silently up-casting the arithmetic being measured.
-
-SCOPE, stated because it is narrower than the module reads
-----------------------------------------------------------
-* The RING rung only.  The TDA stack rung (``bse_stack_matvec._w_stack``)
-  sits inside one big ``shard_map`` and calls ``local_fftn3`` directly;
-  ``shard_map`` cannot nest, so it has no FFI route at all — the same
-  structural limit O7 recorded.
-* P=1, 1×1 mesh.  The handler is rank-local by construction (it multiplies
-  rank-local tiles and implements no reshard, exactly like every other FFT
-  handler here) and the specs below carry μ on ``'x'`` / ν on ``'y'`` as
-  production does, so P>1 should be a measurement rather than a port — but
-  it is a measurement nobody has taken.
+The c128-only rule remains part of routing: the fp32-GMRES arm casts its
+payload to c64, so ``auto`` keeps the reference chain while explicit ``on``
+refuses instead of silently up-casting the arithmetic being measured.
 """
 from __future__ import annotations
 

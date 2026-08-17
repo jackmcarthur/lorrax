@@ -43,6 +43,9 @@ namespace lorrax_ffi::conv_klead {
 
 namespace ffi = ::xla::ffi;
 
+// Policy envelope, not a hardware limit. Axis <= 24 is the validated direct-DFT
+// domain; larger axes route to lorrax_mklfft_gw_conv even if SMEM would fit.
+// Keep in sync with ffi/fft.py::_CONV_KLEAD_AXIS_MAX and its contract test.
 static constexpr int kAxisMax = 24;
 static constexpr int kSmemPreferred = 32768;
 static constexpr int kEptMax = 8;
@@ -218,6 +221,9 @@ __device__ __forceinline__ void lrx_conv_body(
     lrx_c2* tw = ws + (long long)RB * SP;
     long long* wrow = (long long*)(tw + ntw);
 
+    // Store O(n) twiddle rings; lrx_pass advances (mid*j)%len by add/sub.
+    // This avoids an O(n^2) table and per-size radix specializations in the
+    // validated <=24 envelope.
     for (int i = tid; i < ntw; i += nthr) {
         int m, len;
         if (i < n0) { m = i; len = n0; }
@@ -243,6 +249,9 @@ __device__ __forceinline__ void lrx_conv_body(
     }
     __syncthreads();
 
+    // In-place T/U aliasing is safe: each block stages the complete T rows for
+    // its disjoint row set before any output store, and blocks never read one
+    // another's rows.
     // T stays k-leading across the FFI.  Flattened threads keep j fast, so
     // each fixed-k group reads consecutive mu-nu-major global elements.  The
     // scatter into odd-stride ts[j,k] is the in-SMEM transpose and ts itself
@@ -415,10 +424,21 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
             : api.err);
     }
     CUcontext ctx = nullptr;
-    api.CtxGetCurrent(&ctx);
+    CUresult cr = api.CtxGetCurrent(&ctx);
+    if (cr != CUDA_SUCCESS) {
+        return fail("cuCtxGetCurrent",
+                    "CUresult=" + std::to_string(static_cast<int>(cr)) +
+                        " (" + cu_err(cr) + ")");
+    }
     if (ctx == nullptr) {
         LRX_CUDA_CHECK(cudaFree(nullptr), "context bind (cudaFree(0))");
-        api.CtxGetCurrent(&ctx);
+        cr = api.CtxGetCurrent(&ctx);
+        if (cr != CUDA_SUCCESS) {
+            return fail("cuCtxGetCurrent after context bind",
+                        "CUresult=" +
+                            std::to_string(static_cast<int>(cr)) + " (" +
+                            cu_err(cr) + ")");
+        }
         if (ctx == nullptr) return fail("context bind", "no current CUDA context");
     }
     auto it = cache.find(ctx);
@@ -454,6 +474,8 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     char arch[64];
     std::snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d",
                   cc_major, cc_minor);
+    // Only the architecture is explicit. FMA contraction intentionally stays
+    // at NVRTC's default; parity is value-level (~1e-15), not bitwise.
     const char* opts[] = {arch};
     nr = nvrtcCompileProgram(prog, 1, opts);
     if (nr != NVRTC_SUCCESS) {
@@ -487,7 +509,7 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     }
 
     CUmodule mod = nullptr;
-    CUresult cr = api.ModuleLoadData(&mod, image.data());
+    cr = api.ModuleLoadData(&mod, image.data());
     if (cr != CUDA_SUCCESS) return fail_sticky("cuModuleLoadData", cu_err(cr));
     KernelArms arms;
     for (int e = 1; e <= kEptMax; ++e) {
@@ -541,6 +563,9 @@ struct LaunchCfg {
 static bool plan_launch(int nk, int n0, int n1, int n2, int smem_max,
                         LaunchCfg* cfg, std::string* why) {
     const int ntw = n0 + n1 + n2;
+    // Pad each complex row to an odd element stride.  When threads read fixed
+    // k across rows, an even stride aliases shared-memory banks; one slot
+    // removes it.
     const int sp = nk | 1;
     // Combined allocation: the coalesced-load staging destination is the
     // resident T bank itself, alongside the resident W bank, twiddle rings,
@@ -631,9 +656,10 @@ static ffi::Error ConvKLeadDispatch(
     auto wd = W.dimensions();
     auto ud = U->dimensions();
     if (td.size() != 5 || wd.size() != 3 || ud.size() != 5) {
-        return ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "conv_klead: expected T/U (nk,a,mx,b,my) and W (nk,mx,my).");
+        std::ostringstream os;
+        os << "conv_klead: expected ranks T=5, W=3, U=5; got T="
+           << td.size() << ", W=" << wd.size() << ", U=" << ud.size();
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     const int64_t nk = td[0], a = td[1], mx = td[2], b = td[3], my = td[4];
     if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||

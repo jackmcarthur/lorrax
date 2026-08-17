@@ -32,15 +32,13 @@ FFI_DIAL_ENV = (
     "LORRAX_FFT_FFI",
     "LORRAX_FFT_FFI_FUSED",
     "LORRAX_BANDS_GEMM_FFI",
-    # The fused-conv family's k-minor member (ffi.fft, 2026-08-16).  Default
-    # OFF, but it belongs here for the same reason the others do and MORE
-    # strongly: =1 replaces an ifft/multiply/fft/transpose chain with ONE
-    # custom call, so two ranks disagreeing on it compile modules that are not
-    # merely tuned differently — they have different op sets.
+    # The fused-conv family's k-minor member.  Default auto may select either
+    # the CUDA custom call or the caller's reference chain, so rank agreement
+    # is part of the compiled-op contract.
     "LORRAX_CONV_KMINOR_FFI",
-    # Sigma's direct k-leading fused-conv accelerator.  Default OFF, but
-    # auto/on emit a different custom call and therefore belong in every
-    # cross-rank compile fingerprint and factory cache key.
+    # Direct k-leading candidate, default off.  No production Sigma caller
+    # exists until its separate seam lands; retain the dial in cross-rank and
+    # factory fingerprints for the candidate API and future caller.
     "LORRAX_CONV_KLEAD_FFI",
 )
 

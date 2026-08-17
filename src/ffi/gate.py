@@ -20,37 +20,30 @@ dial has to get right, in one place instead of three drifting copies:
    resolve time with the reason and the fix; the only silences are the
    ones a gate DECLARES (:attr:`Gate.silent_platform_demote`).
 
-REQUIRED, NOT OPTIONAL (owner ruling, ``docs/architecture/decisions.md``
-2026-08-01).  The FFI layer is an essential part of the build: every gate
-now defaults ON, a missing or unloadable library is a STARTUP refusal that
-names the ``.so`` (:meth:`Gate.enforce`, called by
-``runtime.initialize_communicator_stack`` right after the mesh is built),
-and ``=0`` is an explicit debug opt-OUT whose meaning is per-gate
-(:attr:`Gate.off_policy`): where a native-JAX twin still exists for a
-structural reason it runs, announced; where the certified FFI path made the
-twin deletable, the twin is GONE and ``=0`` refuses, naming the deletion.
-The old ``auto`` capability-detection tier was deleted with the same
-ruling — auto-demotion to a duplicate compute path is exactly what the
-ruling forbids ("a refusal at startup ... not a silent demotion to a
-slower path").  ``auto`` is gone from :data:`MODE_SPELLINGS` too: no
-gate could declare it (:meth:`enabled` / :meth:`resolve` / :meth:`enforce`
-have no auto branch, so a gate listing it would resolve ``=auto``
-silently as ``on``), and a stale ``=auto`` export already announces the
-grammar note and takes the default without a vocabulary entry.
+REQUIRED LAYERS AND OPTIONAL ACCELERATORS.  Required-layer gates default ON;
+a missing library refuses at startup, and ``=0`` either selects an announced
+debug fallback or refuses when the duplicate was deleted (owner ruling,
+``docs/architecture/decisions.md`` 2026-08-01).  Optional accelerators may
+instead declare ``auto`` or default OFF when their off path is the certified
+reference implementation.  An ``auto`` gate must name its capability test;
+startup announces which arm was selected, and per-call planners own any dtype
+or shape checks that cannot be known at startup.
 
 Two tiers — keeping them apart is the whole reason this module exists
 ---------------------------------------------------------------------
 :meth:`Gate.enabled` — **tier 1, LEXICAL.**  Reads the env var and nothing
-    else (the modes are two-valued now that ``auto`` is gone, so no probe
-    and no platform read).  It never touches the JAX backend, so it is safe
-    before ``jax.distributed.initialize`` — which it must be, because
-    consumers use it as a KERNEL-CACHE KEY at factory time
+    else.  It reports whether the mode is anything other than ``off``;
+    ``auto`` remains a lexical answer here, with no probe or platform read.
+    It never touches the JAX backend, so it is safe before
+    ``jax.distributed.initialize`` — which it must be, because consumers use
+    it as a KERNEL-CACHE KEY at factory time
     (``gw.ppm_tau_kernel``'s ``pipeline_key``/``cache_key``).
 
 :meth:`Gate.resolve` — **tier 2, MESH-AWARE.**  Takes the platform from the
     live devices, so it is exact; it needs a ``Mesh`` and therefore an
     initialized backend.  Returns the FFI platform key to lower on, or
-    ``None`` when the gate is off.  This is where requests refuse.
+    ``None`` when the gate is off or an ``auto`` capability is absent.  An
+    explicit ``on`` request refuses if it cannot be served.
 
 :meth:`Gate.enforce` — **tier 2, STARTUP.**  The required-layer contract:
     called once per gate by ``runtime.initialize_communicator_stack`` right
@@ -108,29 +101,16 @@ __all__ = [
 # anything else is a grammar error.  ("" — unset or whitespace — always maps
 # to the gate's declared default, never to a mode spelling.)
 #
-# TWO-VALUED, deliberately.  The ``auto`` capability-detection tier was
-# deleted with decisions.md 2026-08-01 and there is no ``auto`` branch left
-# in :meth:`Gate.enabled` / :meth:`Gate.resolve` / :meth:`Gate.enforce` — so
-# a vocabulary entry for it could only mislead: a gate that declared
-# ``modes=("auto", ...)`` would accept ``=auto`` and then behave as ``on``
-# with no announcement, which is the silent-downgrade shape the ruling
-# forbids.  A stale ``=auto`` export is a grammar error and is announced as
-# one.  If an auto tier ever returns it needs a resolver, not a token.
+# Required-layer gates use on/off.  ``auto`` is admitted only for an optional
+# accelerator whose off path is a certified reference implementation and whose
+# declaration names the capability test.  Its per-call planner owns dtype and
+# shape policy; ``on`` never silently demotes.
 # ---------------------------------------------------------------------------
 MODE_SPELLINGS: dict[str, tuple[str, ...]] = {
     "off":  ("0", "off", "false", "no"),
     "on":   ("1", "on", "true", "yes"),
-    # ``auto`` — CAPABILITY DETECTION, and it is back for exactly one shape of
-    # dial.  The 2026-08-01 ruling deleted it because the gates it applied to
-    # were REQUIRED layers whose ``auto`` demoted onto a duplicate compute path
-    # ("a refusal at startup ... not a silent demotion to a slower path").  A
-    # dial whose OFF state is the CERTIFIED production path is the opposite
-    # case: there is no duplicate to demote onto, because the fallthrough IS
-    # the reference implementation, and refusing at startup would make an
-    # OPTIONAL accelerator mandatory.  ``ffi_gate_contract.md`` §3.2 already
-    # states the price of declaring it — "No auto unless you can name the
-    # capability test AND the measured reason" — so a gate that declares this
-    # mode must also fill :attr:`auto_capability`, which is that name.
+    # Capability detection for optional accelerators with certified fallbacks.
+    # A gate declaring it must also provide ``auto_capability``.
     "auto": ("auto",),
 }
 
@@ -243,7 +223,7 @@ def mesh_ffi_platform(mesh) -> str:
 
 @dataclass(frozen=True)
 class Gate:
-    """One env-gated, REQUIRED FFI capability (decisions.md 2026-08-01).
+    """One env-gated FFI capability (decisions.md 2026-08-01).
 
     Every message is a field rather than generated prose: these strings are
     the product (harnesses grep the announce lines; refusals must name the
@@ -256,7 +236,7 @@ class Gate:
     target: str                       #: default FFI target to probe
     platforms: tuple[str, ...]        #: ffi_loader keys this dial exists on
     modes: tuple[str, ...]            #: THIS gate's vocabulary, in help order
-    default: str                      #: what unset/empty means: "on"|"off"
+    default: str                      #: what unset/empty means: on|off|auto
     off_label: str                    #: what =0 selects, for announcements
     label: Mapping[str, str] = field(default_factory=dict)   #: platform → name
     # -- required-layer policy (decisions.md 2026-08-01) ----------------
@@ -302,7 +282,7 @@ class Gate:
         At construction, not at the first env read: ``mode()`` would
         otherwise ``KeyError`` on ``MODE_SPELLINGS[m]`` on whichever rank
         happened to read the variable first.  The check is what makes the
-        two-valued table above safe to rely on — a mode with no resolver
+        named table above safe to rely on — a mode with no resolver
         branch cannot be declared into existence.
         """
         unknown = [m for m in self.modes if m not in MODE_SPELLINGS]
@@ -327,7 +307,7 @@ class Gate:
     # -- tier 0: grammar ------------------------------------------------
 
     def mode(self) -> str:
-        """``"on"`` | ``"off"`` — this gate's strict grammar.
+        """This gate's declared ``"off"`` / ``"auto"`` / ``"on"`` mode.
 
         Unset/empty → :attr:`default`.  A value outside :attr:`modes`
         announces once (rank-locally: the env is per-process) and returns
@@ -356,12 +336,11 @@ class Gate:
     # -- tier 1: lexical (cache-key safe) -------------------------------
 
     def enabled(self) -> bool:
-        """Is this capability ON?  **Never initializes the JAX backend.**
+        """Is this capability lexically not OFF?  No backend initialization.
 
         THE function consumers key their kernel caches on.  Answers from
-        the env alone (the vocabulary is two-valued since the ``auto``
-        capability-detection tier was deleted, decisions.md 2026-08-01);
-        no probe, no platform read, O(1) at any call site.
+        the env alone; ``auto`` is True here because mesh/shape routing happens
+        later.  No probe, no platform read, O(1) at any call site.
         """
         return self.mode() != "off"
 
@@ -430,7 +409,9 @@ class Gate:
 
         * ``off`` — ``None``.  No probe, no library load, nothing printed
           (the opt-out announcement is :meth:`enforce`'s, once at startup).
-        * ``on`` (the default) — out-of-scope platform ⇒ ``None``,
+        * ``auto`` — return the platform only when the registered handler is
+          available; otherwise ``None`` so the certified reference path runs.
+        * ``on`` — out-of-scope platform ⇒ ``None``,
           announced on rank 0 unless :attr:`silent_platform_demote`
           declares why silence is right (the platform's own native lowering
           IS the required path there); in scope ⇒ :meth:`require`, which
@@ -460,17 +441,21 @@ class Gate:
         return self.require(mesh, target=target)
 
     def enforce(self, mesh) -> str | None:
-        """The startup contract of the REQUIRED FFI layer (decisions.md
-        2026-08-01).  Called once per gate by
+        """The startup contract for a required layer or optional accelerator.
+
+        Called once per gate by
         ``runtime.initialize_communicator_stack`` right after the mesh is
         built, so the outcome is decided — and any refusal fires — at
         STARTUP, not at the first kernel factory mid-run.
 
-        * default / ``on`` — :meth:`require`: a missing or unloadable
+        * ``on`` — :meth:`require`: a missing or unloadable
           library REFUSES here, naming the ``.so`` (``probe_target``'s
           three-way reason, verbatim).  Out-of-scope platform ⇒ ``None``,
           silently when :attr:`silent_platform_demote` declares why (the
           platform's native lowering is the required path there).
+        * ``auto`` — announce whether platform plus registered-target probing
+          selected the handler or the certified reference path.  Per-call
+          dtype/shape planning remains with the consumer.
         * ``off`` with ``off_policy="fallback"`` — the retained native
           path runs; announced once, rank-locally, as an uncertified debug
           opt-out.

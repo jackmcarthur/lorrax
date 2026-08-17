@@ -1168,10 +1168,21 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
                              : api.err));
     }
     CUcontext ctx = nullptr;
-    api.CtxGetCurrent(&ctx);
+    CUresult cr = api.CtxGetCurrent(&ctx);
+    if (cr != CUDA_SUCCESS) {
+        return fail("cuCtxGetCurrent",
+                    "CUresult=" + std::to_string(static_cast<int>(cr)) +
+                        " (" + cu_err(cr) + ")");
+    }
     if (ctx == nullptr) {
         LRX_CUDA_CHECK(cudaFree(nullptr), "context bind (cudaFree(0))");
-        api.CtxGetCurrent(&ctx);
+        cr = api.CtxGetCurrent(&ctx);
+        if (cr != CUDA_SUCCESS) {
+            return fail("cuCtxGetCurrent after context bind",
+                        "CUresult=" +
+                            std::to_string(static_cast<int>(cr)) + " (" +
+                            cu_err(cr) + ")");
+        }
         if (ctx == nullptr) {
             return fail("context bind", "no current CUDA context");
         }
@@ -1257,7 +1268,7 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     }
 
     CUmodule mod = nullptr;
-    CUresult cr = api.ModuleLoadData(&mod, image.data());
+    cr = api.ModuleLoadData(&mod, image.data());
     if (cr != CUDA_SUCCESS) {
         return fail_sticky("cuModuleLoadData", cu_err(cr));
     }
