@@ -10,6 +10,7 @@ import pytest
 
 from gw import w_isdf
 from gw.band_extrapolation import trivial_plan
+from gw.efermi import mp1_occupations
 from gw.mpa.sigma import _branches
 from gw.ppm_pipeline import compute_ppm_sigma_pipeline
 from gw.ppm_sigma import compute_sigma_c_ppm_omega_grid
@@ -77,6 +78,7 @@ def test_mpa_override_warns_with_the_same_numbers_and_continues(monkeypatch):
         _OMEGA,
         0.0,
         occupation_state=_state([1.0, 1.0, 0.4, 0.2, 0.0, 0.0]),
+        band_extrapolation_active=True,
         print_fn=lines.append,
     )
     assert branches
@@ -86,6 +88,70 @@ def test_mpa_override_warns_with_the_same_numbers_and_continues(monkeypatch):
     assert "required minimum number_bands_sigma=4" in text
     assert "occupation_support_bandwidth=4" in text
     assert "Continuing because LORRAX_OCCUPATION_SUPPORT=allow-truncated" in text
+    assert "extrapolated Sigma_c AND its uncertainty bar are VOID" in text
+    assert "every bracket shares the missing weight" in text
+
+
+def test_active_threshold_sets_the_4275w_minimum_without_edge_flapping(
+    monkeypatch,
+):
+    monkeypatch.delenv(w_isdf.OCCUPATION_SUPPORT_ENV, raising=False)
+    width = 0.01
+    enk = np.asarray([[-0.10, -0.02, 0.0, 4.275 * width,
+                       4.30 * width, 52.0 * width]])
+    f = np.asarray(mp1_occupations(enk, 0.0, width))
+    assert abs(f[0, 3]) > 0.005
+    assert abs(f[0, 4]) < 0.005
+    assert f[0, 5] != 0.0  # exact support reaches the subnormal tail
+
+    with pytest.raises(w_isdf.OccupationSupportTruncationError) as exc:
+        w_isdf.assert_sigma_contains_occupation_support(
+            enk,
+            f,
+            slice(0, 3),
+            occupation_window_threshold=0.995,
+        )
+    text = str(exc.value)
+    assert "occupation_window_threshold=0.995" in text
+    assert "required minimum number_bands_sigma=4" in text
+
+    # One marginal active band weighs 6e-5 of this branch.  It is inactive
+    # at 0.99 and within the measured 7e-5 adequacy ceiling at 0.995/0.999,
+    # so the same Sigma top is accepted across all three nearby thresholds.
+    marginal_f = np.asarray([[1.0] * 100 + [0.006, 0.0]])
+    marginal_e = np.arange(marginal_f.size, dtype=np.float64)[None, :]
+    for threshold in (0.99, 0.995, 0.999):
+        w_isdf.assert_sigma_contains_occupation_support(
+            marginal_e,
+            marginal_f,
+            slice(0, 100),
+            occupation_window_threshold=threshold,
+        )
+
+
+def test_absent_threshold_preserves_the_exact_support_rule_bit_for_bit(
+    monkeypatch,
+):
+    monkeypatch.delenv(w_isdf.OCCUPATION_SUPPORT_ENV, raising=False)
+    width = 0.01
+    enk = np.asarray([[-0.10, -0.02, 0.0, 4.275 * width,
+                       4.30 * width, 52.0 * width]])
+    f = np.asarray(mp1_occupations(enk, 0.0, width))
+    exact_f = np.any(np.abs(f) != 0.0, axis=0)
+    exact_u = np.any(np.abs(1.0 - f) != 0.0, axis=0)
+    f_idx, u_idx = np.flatnonzero(exact_f), np.flatnonzero(exact_u)
+    old_bandwidth = (
+        np.max(enk[:, u_idx[0]:u_idx[-1] + 1])
+        - np.min(enk[:, f_idx[0]:f_idx[-1] + 1]))
+    assert w_isdf.occupation_support_bandwidth(enk, f) == old_bandwidth
+
+    with pytest.raises(w_isdf.OccupationSupportTruncationError) as exc:
+        w_isdf.assert_sigma_contains_occupation_support(
+            enk, f, slice(0, 3))
+    text = str(exc.value)
+    assert "magnitude-bounded |f| != 0 support is [0, 6)" in text
+    assert "required minimum number_bands_sigma=6" in text
+    assert "occupation_window_threshold" not in text
 
 
 def test_a_sigma_sum_containing_supp_f_is_silent(monkeypatch):

@@ -1100,25 +1100,41 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
 
 
 
-def _exact_occupation_support_slices(occupations):
-    """Smallest contiguous f and (1-f) band supports without truncation.
+def _occupation_support_floor(occupation_window_threshold):
+    """Active branch-weight floor; ``None`` selects the exact legacy rule."""
+    if occupation_window_threshold is None:
+        return None
+    threshold = float(occupation_window_threshold)
+    if not (np.isfinite(threshold) and 0.5 <= threshold <= 1.0):
+        raise ValueError(
+            "occupation_window_threshold must be an occupancy in [0.5, 1.0]; "
+            f"got {occupation_window_threshold!r}")
+    return 1.0 - threshold
 
-    Equality is intentional.  MP1 occupations may overshoot [0, 1], so this
-    helper neither clips nor applies a tolerance.  It only drops bands whose
-    stored weight is exactly zero on every k, or exactly one on every k.
-    Partially occupied bands consequently belong to both slices.
+
+def _occupation_support_slices(occupations, occupation_window_threshold=None):
+    """Smallest contiguous active f and (1-f) band supports.
+
+    A present ``occupation_window_threshold`` applies the active branch rule
+    ``abs(weight) > 1 - threshold``.  ``None`` is deliberately different
+    from a default value: it preserves the lineage's exact nonzero rule
+    bit-for-bit when the deck key does not exist yet.
     """
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
-    # MAGNITUDE is load-bearing for MP1: its wrong-side lobe is negative
-    # (about -0.0355 at the extremum), but is still occupied support.  The
-    # magnitude spelling is bit-equivalent to the old ``!= 0`` no-slop rule,
-    # including signed zero, while making the support definition explicit.
-    f_support = np.any(np.abs(occ) != 0.0, axis=0)
-    u_support = np.any(np.abs(1.0 - occ) != 0.0, axis=0)
+    floor = _occupation_support_floor(occupation_window_threshold)
+    if floor is None:
+        # MAGNITUDE is load-bearing for MP1: its wrong-side lobe is negative
+        # (about -0.0355 at the extremum), but is still occupied support.
+        # This is bit-equivalent to the incumbent exact rule.
+        f_support = np.any(np.abs(occ) != 0.0, axis=0)
+        u_support = np.any(np.abs(1.0 - occ) != 0.0, axis=0)
+    else:
+        f_support = np.any(np.abs(occ) > floor, axis=0)
+        u_support = np.any(np.abs(1.0 - occ) > floor, axis=0)
     if not np.any(f_support) or not np.any(u_support):
         raise ValueError(
             "fractional contour chi0 needs at least one nonzero f band and "
@@ -1129,6 +1145,11 @@ def _exact_occupation_support_slices(occupations):
         slice(int(f_idx[0]), int(f_idx[-1]) + 1),
         slice(int(u_idx[0]), int(u_idx[-1]) + 1),
     )
+
+
+def _exact_occupation_support_slices(occupations):
+    """Compatibility spelling for the exact, absent-key support rule."""
+    return _occupation_support_slices(occupations, None)
 
 
 def _chi0_fractional_contour_args(
@@ -1455,27 +1476,32 @@ def compute_chi0_static_fractional_gamma(
     )(psi_x, psi_y, e, f, surface)
 
 
-def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
-    """Largest transition energy over the exact occupation supports, Ry.
+def occupation_support_bandwidth(
+    energies_kn_ry,
+    occupations_kn,
+    occupation_window_threshold=None,
+):
+    """Largest transition energy over the active occupation supports, Ry.
 
-    ``max(E over the (1-f) support) − min(E over the f support)`` with the
-    no-slop support rule of :func:`_exact_occupation_support_slices`: only
-    weights stored as exactly 0 or exactly 1 are dropped, so an MP1
-    overshoot band at a support edge is included.  This — not
-    ``quad.x_max`` — sizes the damped-line rule bandwidth on metal plans,
-    where the occupied and empty supports overlap.
+    The optional threshold must be the same config value used by the branch
+    consumer.  An absent value retains the exact historical bandwidth.
     """
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
-    f_slice, u_slice = _exact_occupation_support_slices(occupations_kn)
+    f_slice, u_slice = _occupation_support_slices(
+        occupations_kn, occupation_window_threshold)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
 
 
 OCCUPATION_SUPPORT_ENV = "LORRAX_OCCUPATION_SUPPORT"
 OCCUPATION_SUPPORT_ALLOW_TRUNCATED = "allow-truncated"
+# Measured maximum discarded branch-weight fraction for thresholds
+# 0.99/0.995/0.999 over W=0.0025--0.04 Ry.  Only a PRESENT threshold may use
+# this adequacy allowance; the absent-key exact rule remains exact.
+OCCUPATION_SUPPORT_RELATIVE_SLOP = 7.0e-5
 
 
 class OccupationSupportTruncationError(ValueError):
-    """``number_bands_sigma`` truncates exact metallic ``supp(f)``."""
+    """``number_bands_sigma`` truncates active metallic ``supp(f)``."""
 
 
 def assert_sigma_contains_occupation_support(
@@ -1484,21 +1510,23 @@ def assert_sigma_contains_occupation_support(
     sigma_sum,
     *,
     band_offset=0,
+    occupation_window_threshold=None,
+    band_extrapolation_active=False,
     where="",
     log=print,
 ):
-    """Refuse when the Sigma band sum omits exact occupied support.
+    """Refuse when the Sigma band sum inadequately covers active ``supp(f)``.
 
     The guard is deliberately about ``supp(f)`` only.  Omitting a nonzero
     occupied weight removes a physical term that no later band weight can
     restore; truncating the high ``(1-f)`` tail is the convergence axis that
     ``number_bands_sigma`` and band extrapolation exist to control.
 
-    ``occupation_support_bandwidth`` is evaluated over the same exact,
-    magnitude-bounded support and is quoted in every refusal/warning.  The
-    override is intentionally loud: ``LORRAX_OCCUPATION_SUPPORT=allow-truncated``
-    logs the identical numbers and continues with a deliberately incomplete
-    occupied sum.
+    A present ``occupation_window_threshold`` selects the active rule
+    ``abs(f) > 1-threshold``.  ``None`` preserves exact support.  Under a
+    threshold only, a marginal omission is adequate when its active-weight
+    fraction is at most :data:`OCCUPATION_SUPPORT_RELATIVE_SLOP`; the reported
+    required minimum remains the top of the full active support.
     """
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
     f = np.asarray(jax.device_get(occupations_kn), dtype=np.float64)
@@ -1513,42 +1541,81 @@ def assert_sigma_contains_occupation_support(
                 f"energies {e.shape}, got {f.shape}")
         f = np.reshape(f, e.shape)
 
-    f_slice, _ = _exact_occupation_support_slices(f)
+    f_slice, _ = _occupation_support_slices(
+        f, occupation_window_threshold)
     sigma_start = 0 if sigma_sum.start is None else int(sigma_sum.start)
     sigma_stop = e.shape[1] if sigma_sum.stop is None else int(sigma_sum.stop)
     if sigma_sum.step not in (None, 1):
         raise ValueError(
             "occupation-support guard needs a contiguous sigma_sum slice; "
             f"got {sigma_sum}")
-    if sigma_start <= int(f_slice.start) and sigma_stop >= int(f_slice.stop):
+    fully_contained = (
+        sigma_start <= int(f_slice.start)
+        and sigma_stop >= int(f_slice.stop))
+    floor = _occupation_support_floor(occupation_window_threshold)
+    omitted_fraction = 0.0
+    if not fully_contained and floor is not None and floor > 0.0:
+        active_weight = np.where(np.abs(f) > floor, np.abs(f), 0.0)
+        total_weight = float(np.sum(active_weight))
+        inside = np.zeros(f.shape[1], dtype=bool)
+        inside[max(0, sigma_start):min(e.shape[1], sigma_stop)] = True
+        omitted_weight = float(np.sum(active_weight[:, ~inside]))
+        omitted_fraction = omitted_weight / total_weight
+        if omitted_fraction <= OCCUPATION_SUPPORT_RELATIVE_SLOP:
+            return
+    if fully_contained:
         return
 
     offset = int(band_offset)
     configured = offset + sigma_stop
     required = offset + int(f_slice.stop)
-    bandwidth_ry = occupation_support_bandwidth(e, f)
+    bandwidth_ry = occupation_support_bandwidth(
+        e, f, occupation_window_threshold)
     tag = f" ({where})" if where else ""
+    if floor is None:
+        support_rule = "magnitude-bounded |f| != 0 support"
+        support_kind = "exact supp(f)"
+        bandwidth_rule = "same no-slop occupation supports"
+        adequacy = ""
+    else:
+        threshold = float(occupation_window_threshold)
+        support_rule = (
+            f"active |f| > {floor:.12g} support selected by "
+            f"occupation_window_threshold={threshold:.12g}")
+        support_kind = "active supp(f)"
+        bandwidth_rule = "same active occupation supports"
+        adequacy = (
+            f"\n  omitted active |f| fraction={omitted_fraction:.12g}; "
+            f"adequate-containment ceiling="
+            f"{OCCUPATION_SUPPORT_RELATIVE_SLOP:.12g}.")
     message = (
         f"metallic occupation support{tag}: number_bands_sigma={configured} "
-        f"truncates exact supp(f).\n"
+        f"truncates {support_kind}.\n"
         f"  sigma_sum=[{offset + sigma_start}, {configured}), while the "
-        f"magnitude-bounded |f| != 0 support is "
-        f"[{offset + int(f_slice.start)}, {required}); required minimum "
-        f"number_bands_sigma={required}.\n"
+        f"{support_rule} is [{offset + int(f_slice.start)}, {required}); "
+        f"required minimum number_bands_sigma={required}."
+        f"{adequacy}\n"
         f"  occupation_support_bandwidth={bandwidth_ry:.12g} Ry over the "
-        f"same no-slop occupation supports.  Raise number_bands_sigma to at "
-        f"least {required}, or set "
-        f"{OCCUPATION_SUPPORT_ENV}={OCCUPATION_SUPPORT_ALLOW_TRUNCATED} to "
-        f"WARN and continue with deliberately truncated occupied support.")
+        f"{bandwidth_rule}.  Raise number_bands_sigma to at least {required}, "
+        f"or set {OCCUPATION_SUPPORT_ENV}="
+        f"{OCCUPATION_SUPPORT_ALLOW_TRUNCATED} to WARN and continue with "
+        f"deliberately truncated occupied support.")
 
     # Literal at the read site is intentional: tests/test_env_registry.py's
     # AST audit can then prove that the documented spelling covers this read.
     override = os.environ.get(
         "LORRAX_OCCUPATION_SUPPORT", "").strip().lower()
     if override == OCCUPATION_SUPPORT_ALLOW_TRUNCATED:
-        log("  *** WARNING: " + message.replace("\n", "\n  *** ")
-            + f"\n  *** Continuing because {OCCUPATION_SUPPORT_ENV}="
-              f"{OCCUPATION_SUPPORT_ALLOW_TRUNCATED} was set. ***")
+        warning = ("  *** WARNING: " + message.replace("\n", "\n  *** ")
+                   + f"\n  *** Continuing because {OCCUPATION_SUPPORT_ENV}="
+                     f"{OCCUPATION_SUPPORT_ALLOW_TRUNCATED} was set. ***")
+        if band_extrapolation_active:
+            warning += (
+                "\n  *** use_band_extrapolation is active: the extrapolated "
+                "Sigma_c AND its uncertainty bar are VOID under occupied-"
+                "support truncation; every bracket shares the missing weight "
+                "and scatter diagnostics cannot see a shared error. ***")
+        log(warning)
         return
     if override:
         raise OccupationSupportTruncationError(

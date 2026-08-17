@@ -822,6 +822,7 @@ def compute_sigma_c_ppm_omega_grid(
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
     occupation_state=None,
+    occupation_window_threshold=None,
     plan: 'BandBracketPlan | None' = None,
     print_fn=print,
 ) -> SigmaOmegaResult:
@@ -875,7 +876,10 @@ def compute_sigma_c_ppm_omega_grid(
         from .w_isdf import assert_sigma_contains_occupation_support
         assert_sigma_contains_occupation_support(
             wfns.enk, occupation_state.f_kn, s.sigma_sum,
-            band_offset=s.b0, where="ppm_sigma bracket partition",
+            band_offset=s.b0,
+            occupation_window_threshold=occupation_window_threshold,
+            band_extrapolation_active=plan.enabled,
+            where="ppm_sigma bracket partition",
             log=print_fn)
     brackets = plan.bounds
     n_brk = plan.n_brackets

@@ -470,11 +470,17 @@ def compute_ppm_sigma_pipeline(
         # Before precompile_sigma, so a mismatch costs no compile and no Σ.
         assert_brackets_match_ols_abscissae(
             plan, s, meta=meta, where="ppm_pipeline plan seam")
+        occupation_window_threshold = None
         if occupation_state is not None:
             from .w_isdf import assert_sigma_contains_occupation_support
+            occupation_window_threshold = getattr(
+                config.mpa, "occupation_window_threshold", None)
             assert_sigma_contains_occupation_support(
                 wfns.enk, occupation_state.f_kn, s.sigma_sum,
-                band_offset=s.b0, where="ppm_pipeline plan seam",
+                band_offset=s.b0,
+                occupation_window_threshold=occupation_window_threshold,
+                band_extrapolation_active=plan.enabled,
+                where="ppm_pipeline plan seam",
                 log=print_fn)
         if plan.enabled:
             print_fn(
@@ -496,6 +502,7 @@ def compute_ppm_sigma_pipeline(
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
                 occupation_state=occupation_state,
+                occupation_window_threshold=occupation_window_threshold,
                 plan=plan,
                 print_fn=print_fn,
             )

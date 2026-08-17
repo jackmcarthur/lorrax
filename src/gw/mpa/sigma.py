@@ -168,7 +168,16 @@ def integrate_sigma_store(
         return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry, occupation_state=None, *, print_fn=print):
+def _branches(
+    wfns,
+    omega,
+    efermi_ry,
+    occupation_state=None,
+    *,
+    occupation_window_threshold=None,
+    band_extrapolation_active=False,
+    print_fn=print,
+):
     """The four causal branches, with occupation and energy kept separate.
 
     Band axis is ``slices.sigma_sum`` -- the Sigma band count, not the
@@ -185,8 +194,9 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None, *, print_fn=print):
     1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
     overshoot (f<0 or f>1) rides through unchanged
     (docs/theory/finite-occupation-screening.md).  Before slicing, the
-    metallic path refuses unless ``sigma_sum`` contains the full exact
-    ``supp(f)``.
+    metallic path refuses unless ``sigma_sum`` adequately contains the
+    support selected by ``occupation_window_threshold``; an absent threshold
+    preserves the full exact ``supp(f)`` rule.
     """
     if occupation_state is None:
         energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
@@ -210,6 +220,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None, *, print_fn=print):
     assert_sigma_contains_occupation_support(
         wfns.enk, occupation_state.f_kn, wfns.slices.sigma_sum,
         band_offset=getattr(wfns.slices, "b0", 0),
+        occupation_window_threshold=occupation_window_threshold,
+        band_extrapolation_active=band_extrapolation_active,
         where="mpa.sigma._branches",
         log=print_fn)
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
@@ -236,6 +248,8 @@ def compute_sigma_c_mpa_omega_grid(
     max_rank,
     crossing_max_nodes,
     omega_cluster_gap_ry=1.0,
+    occupation_window_threshold=None,
+    band_extrapolation_active=False,
     pole_batch_size=4,
     occupation_state=None,
     print_fn=print,
@@ -261,6 +275,8 @@ def compute_sigma_c_mpa_omega_grid(
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     branches = _branches(wfns, omega_grid_ry, efermi_ry,
                          occupation_state=occupation_state,
+                         occupation_window_threshold=occupation_window_threshold,
+                         band_extrapolation_active=band_extrapolation_active,
                          print_fn=print_fn)
     summaries = []
     # ONE collective handle for the census walk, the planner, and the
