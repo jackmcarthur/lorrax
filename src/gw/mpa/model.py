@@ -132,8 +132,12 @@ def _solve_wc(
     dyson_solver=None,
     *,
     head_response=None,
+    head_channel=None,
+    sym=None,
     wfn=None,
     config=None,
+    z_samples=None,
+    print_fn=print,
     distrib_la_batched_route: str = "auto",
 ):
     from gw.qsgw_head import (
@@ -141,6 +145,27 @@ def _solve_wc(
         finalize_iteration_head_sample,
     )
     from gw.w_isdf import solve_w
+
+    bgw_q0 = None
+    bgw_vhead = None
+    bgw_epsinv = []
+    if config is not None and bool(config.head.uses_bgw_metal_q0shift):
+        from gw.head_correction import (
+            bgw_q0shift_vhead,
+            resolve_bgw_q0_channel,
+        )
+        bgw_q0 = resolve_bgw_q0_channel(
+            config, sym, q_idx,
+            head_channel, kgrid=meta.kgrid)
+        bgw_vhead = bgw_q0shift_vhead(wfn, meta)
+        print_fn(
+            "  [bgw q0 provenance] finite epsilon q0="
+            f"{bgw_q0.q0_reduced}, full row={bgw_q0.requested_full_index}, "
+            f"wedge row={bgw_q0.wedge_row} (representative full row "
+            f"{bgw_q0.representative_full_index}); analytic-sphere "
+            f"v_head={bgw_vhead.real:.12e} raw, "
+            f"{bgw_vhead.real / (float(meta.nk_tot) * float(meta.cell_volume)):.12e} "
+            "after 1/(Nk*Omega).")
 
     if head_response is not None and len(head_response.omegas) < int(n_z):
         raise ValueError("MPA head response does not cover the body sample grid")
@@ -157,11 +182,45 @@ def _solve_wc(
     for index in range(n_z):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
+        chi_q0 = None
+        if bgw_q0 is not None:
+            # ``solve_w`` donates the full chi buffer.  Retain only one
+            # distributed (mu,nu) row for the finite-q epsilon scalar; no
+            # process materialises an N_mu^2 object.
+            q0row = int(bgw_q0.wedge_row)
+            chi_q0 = chi[q0row:q0row + 1].copy()
         W = solve_w(
             V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
         W.block_until_ready()
-        if head_response is not None:
+        if bgw_q0 is not None:
+            from gw.head_correction import (
+                bgw_q0shift_head_sample,
+                finite_q0_epsinv_head,
+            )
+            from gw.w_isdf import _w_solve_pref_scalar
+            epsinv = finite_q0_epsinv_head(
+                chi_q0,
+                W[q0row:q0row + 1],
+                bgw_q0.g_head,
+                bgw_q0.v_bare,
+                _w_solve_pref_scalar(meta),
+                mesh_xy=mesh_xy,
+            )
+            eps_value = complex(np.asarray(epsinv)[0])
+            bgw_epsinv.append(eps_value)
+            omega = (
+                complex(head_response.omegas[index])
+                if head_response is not None
+                else complex(np.asarray(z_samples)[index]))
+            head_samples.append(
+                bgw_q0shift_head_sample(bgw_vhead, eps_value, omega))
+            print_fn(
+                f"  [bgw q0] sample {index:02d}: z={omega!r}, "
+                f"epsinv_00(head+wings)={eps_value.real:.12e}"
+                + (f"{eps_value.imag:+.12e}j" if eps_value.imag else ""))
+            del chi_q0, epsinv
+        elif head_response is not None:
             head_samples.append(finalize_iteration_head_sample(
                 head_response,
                 index,
@@ -179,17 +238,26 @@ def _solve_wc(
         del chi, W, Wc
 
     if head_response is None:
-        return None
+        return tuple(head_samples) if bgw_q0 is not None else None
     for index in range(int(n_z), len(head_response.omegas)):
-        head_samples.append(finalize_iteration_head_sample(
-            head_response,
-            index,
-            None,
-            wfn=wfn,
-            meta=meta,
-            config=config,
-            mesh=mesh_xy,
-        ))
+        if bgw_q0 is not None:
+            # Metallic MPA appends only the exact-static do_G0 sample after
+            # the fit grid.  The near-line origin row was evaluated with the
+            # exact divided-difference chi, so its finite-q epsinv is the
+            # identical static response and is reused here.
+            from gw.head_correction import bgw_q0shift_head_sample
+            head_samples.append(bgw_q0shift_head_sample(
+                bgw_vhead, bgw_epsinv[0], head_response.omegas[index]))
+        else:
+            head_samples.append(finalize_iteration_head_sample(
+                head_response,
+                index,
+                None,
+                wfn=wfn,
+                meta=meta,
+                config=config,
+                mesh=mesh_xy,
+            ))
     return IterationHeadSamples(
         omegas=head_response.omegas,
         samples=tuple(head_samples),
@@ -352,7 +420,7 @@ def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
-    occupation_state=None, print_fn=print,
+    occupation_state=None, head_channel=None, print_fn=print,
 ):
     """Write body/head samples and fits; return path plus iteration head."""
     # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
@@ -453,25 +521,44 @@ def build_mpa_fit(
         sample_path, V, z_all.size, q_idx, meta, mesh_xy,
         config.backend.w_dyson_solver,
         head_response=iteration_head_response,
-        wfn=wfn if iteration_head_response is not None else None,
-        config=config if iteration_head_response is not None else None,
+        head_channel=head_channel,
+        sym=sym,
+        wfn=wfn,
+        config=config,
+        z_samples=z_all,
+        print_fn=print_fn,
         distrib_la_batched_route=getattr(
             config.backend, "distrib_la_batched_route", "auto"),
     )
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
         occupation_state=occupation_state)
-    if iteration_head is None:
+    # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
+    # writer opens the same file through serial h5py.  A context-manager
+    # return is rank-local: without this process barrier rank 0 can enter
+    # h5py while a slower peer still owns the FFI writer, leaving HDF5's
+    # superblock write-consistency flag set and refusing the ledger open.
+    from common.collectives import barrier
+    barrier("mpa_body_fit_closed_before_head")
+    if isinstance(iteration_head, tuple):
+        head_fit_samples = iteration_head
+        iteration_head = None
+        head_model = "bgw_q0shift_loewner"
+    elif iteration_head is None:
         head_fit_samples = tuple(
             head_resolver.at(complex(z)) for z in z_all)
         head_model = "dft_direct_loewner"
     else:
         head_fit_samples = iteration_head.samples[:z_all.size]
-        head_model = (
-            "qsgw_schur_loewner"
-            if iteration_head_response.Y_x is not None
-            else "qsgw_direct_loewner"
-        )
+        if bool(getattr(
+                config.head, "uses_bgw_metal_q0shift", False)):
+            head_model = "bgw_q0shift_loewner"
+        else:
+            head_model = (
+                "qsgw_schur_loewner"
+                if iteration_head_response.Y_x is not None
+                else "qsgw_direct_loewner"
+            )
     fit_ledger = mpa_store.fit_completion_ledger(fit_path)
     _fit_head_samples(
         fit_path,

@@ -29,6 +29,7 @@ checkpoint's format layer and nothing else.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -1010,6 +1011,20 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
     with pytest.raises(ValueError, match="NOT READY"):
         MS.read_head_fit(tmpdir_path)
+
+
+def test_bgw_q0shift_head_model_is_a_certified_store_protocol():
+    """The producer's public model tag must survive the reader allowlist."""
+    assert "bgw_q0shift_loewner" in MS._HEAD_FIT_MODELS
+
+
+def test_collective_head_writer_closes_all_ledger_readers_before_rank0_write():
+    """The all-rank h5py read must finish before rank 0 opens for write."""
+    source = inspect.getsource(MS.write_head_fit_collective)
+    ledger = source.index("ledger = fit_completion_ledger(dest)")
+    handoff = source.index('barrier("mpa_head_ledger_readers_closed")')
+    writer = source.index("if process_rank() == 0:")
+    assert ledger < handoff < writer
 
 
 def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(

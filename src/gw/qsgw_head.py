@@ -1639,7 +1639,9 @@ def head_samples_from_s(
             static_kappa2=(
                 jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
                 if is_static_metal else None),
-            analytic_sphere=bool(config.head.head_minibz_average),
+            analytic_sphere=bool(getattr(
+                config.head, "analytic_q0_sphere",
+                config.head.head_minibz_average)),
         )
         out.append(
             HeadSample(

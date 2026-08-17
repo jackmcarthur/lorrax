@@ -1419,10 +1419,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
                         centroid_indices, vcoul_cutoff_ry, print_fn=print):
-	"""Build the q != 0 Coulomb head channel, or ``None`` on the default path.
+	"""Build a q != 0 Coulomb head channel only when a consumer needs it.
 
-	``mc_average_placement = off`` returns ``None`` before anything is read,
-	so the shipped path costs one string comparison.  Any other mode reads
+	The exact/default combination returns ``None`` before anything is read,
+	so the shipped path costs two string comparisons.  A non-default
+	``mc_average_placement`` or ``bgw_metal_q0_treatment=bgw_q0shift`` reads
 	the ζ head-slot columns (``v_q_g_flat.compute_head_channel_zeta``), pairs
 	them with the head-slot ``v`` table, expands the per-IBZ-q scalars onto
 	the full BZ, and optionally re-sources the mini-BZ enhancement from a
@@ -1436,7 +1437,8 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	                           refuse_if_unimplemented)
 
 	mode = str(getattr(cfg.head, 'mc_average_placement', PLACEMENT_OFF))
-	if mode == PLACEMENT_OFF:
+	needs_bgw_q0 = bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False))
+	if mode == PLACEMENT_OFF and not needs_bgw_q0:
 		return None
 	refuse_if_unimplemented(mode)
 	if int(meta.sys_dim) != 3:
@@ -1719,6 +1721,18 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 				"every q != 0.  Deciding the placement for one builder and not "
 				"the other would make that divergence permanent.  Run with "
 				"bispinor = false, or land the bispinor v_head_fn first.")
+		if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
+			# The BGW q0 mode does not rescale the bispinor V tile.  It needs
+			# only the charge-charge head vector at one finite q, which is
+			# carried by the ordinary charge ζ file even in a bispinor run.
+			with ZetaLoader(zeta_h5_path, mesh=mesh_xy) as zeta_io:
+				with mesh_xy:
+					head_channel = _build_head_channel(
+						zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+						mesh_xy=mesh_xy, sym=sym,
+						centroid_indices=_cent_C_idx_for_orchestrator,
+						vcoul_cutoff_ry=vcoul_cutoff_ry,
+						print_fn=print_fn)
 	else:
 		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
 		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
@@ -2160,13 +2174,10 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu.block_until_ready()
 		print0("  Chunked ISDF path complete")
 	else:
-		# ``mc_average_placement`` needs the ζ head-slot columns, and a
-		# restart deliberately does NOT re-run ``compute_V_q``
-		# (gw_init.py's restart branch reuses ``V_qmunu`` verbatim), so
-		# there is nothing to build them from.  Refuse rather than run the
-		# default placement under a deck that asked for another one — that
-		# silent inheritance is the exact defect class the restart
-		# Coulomb-policy stamp exists to make loud.
+		# ``mc_average_placement`` changes the finite-q W operator and still
+		# cannot reuse a restart V.  ``bgw_metal_q0_treatment``, by contrast,
+		# needs only one finite-q head vector from the already fitted ζ file;
+		# build that channel below without repeating either ISDF fit or V_q.
 		head_channel = None
 		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
 			raise RuntimeError(
@@ -2249,6 +2260,26 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, band_slices, mesh_xy,
 				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
 				enk_full=rs.enk_full, print_fn=print0)
+			if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
+				zeta_path = os.path.join(tmp_dir, "zeta_q.h5")
+				bvec = CoulombGeometry.from_wfn(wfn).bvec
+				vcoul_cutoff_ry = (
+					float(wfn.ecutwfc)
+					if cfg.head.bare_coulomb_cutoff is None
+					else float(cfg.head.bare_coulomb_cutoff))
+				cent_idx_np = np.asarray(
+					jax.device_get(centroid_indices), dtype=np.int32)
+				with ZetaLoader(zeta_path, mesh=mesh_xy) as zeta_io:
+					with mesh_xy:
+						head_channel = _build_head_channel(
+							zeta_io, cfg=cfg, meta=meta, wfn=wfn,
+							bvec=bvec, mesh_xy=mesh_xy, sym=sym,
+							centroid_indices=cent_idx_np,
+							vcoul_cutoff_ry=vcoul_cutoff_ry,
+							print_fn=print0)
+				print0(
+					"  [bgw q0 provenance] restart reused V_q and ζ fit; "
+					"loaded only the finite-q0 head channel from tmp/zeta_q.h5.")
 			# Bispinor restart: the transverse-centroid ψ round-trips
 			# through the per-channel ``psi_full_y_transverse`` dataset
 			# (written 2026-07-27+).  Anything missing or mismatched is
