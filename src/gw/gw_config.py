@@ -999,48 +999,69 @@ _DEFAULTS = {
     # rather than manufactured to fill a dataset slot.
     "write_qsgw_datasets": False,
     # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
-    # DEFAULT full — the q_irr wedge is OPT-IN PER DECK, which is what
-    # DESIGN_symmetry_restart_followup.md ruled and what this key was built
-    # to obey: "the deck key keeps full-BZ storage as the default until the
-    # owner rules on centroid regeneration, and the q_irr path is opt-in per
-    # deck."  It shipped briefly defaulting to ``auto`` and the 2026-08-08
-    # landing census measured what that cost — nine red cells across the GW
-    # and BSE restart paths on the two decks whose centroid sets are already
-    # orbit-closed.  A default that moves bytes is a default that has to be
-    # asked for.
-    #   full — the DEFAULT.  Preserve today's bytes exactly, unconditionally.
-    #          Does not ask the closure question, so it is also the control
-    #          arm of any A/B.
-    #   auto — store the pre-unfold IBZ wedge when the deck's centroid set is
-    #          orbit-closed AND this run's q path actually reduced; the full
-    #          BZ otherwise.  On a non-closed set (today's Si production
-    #          960-centroid deck: 47 of 48 ops violating) this is byte-for-byte
-    #          today's file.  On a CLOSED set it is ~8x smaller.
+    # DEFAULT auto — storage FOLLOWS THE WFN FILE.  This is the end state the
+    # owner ruled for on 2026-08-08 ~13:20, quoted below, and it became
+    # reachable on 2026-08-15 when the last reader learned to unfold.
+    #   auto — the DEFAULT.  Store the pre-unfold IBZ wedge when the deck's
+    #          centroid set is orbit-closed AND this run's q path actually
+    #          reduced; the full BZ otherwise.  On a non-closed set (the Si
+    #          production 960-centroid deck: 47 of 48 ops violating) this is
+    #          byte-for-byte the old file.  On a CLOSED set it is ~8x smaller
+    #          — MEASURED on ``si_bse_debug`` GW+BSE end to end at P=4:
+    #          ``isdf_tensors_480.h5`` 541,335,584 -> 130,299,936 B (4.15x),
+    #          BSE lowest-8 eigenvalues bit-identical, eqp0/eqp1/sigma_diag
+    #          byte-identical.
+    #   full — preserve the old bytes exactly, unconditionally.  The escape
+    #          hatch for a frozen reference or a stale out-of-tree consumer,
+    #          and the control arm of any A/B: it does not ask the closure
+    #          question at all, so it cannot be changed by the answer.
     #   ibz  — REFUSE on a set that is not storable, naming which of the two
     #          conditions failed.  For a deck that believes it is closed and
     #          wants to be told the day it stops being.
-    # BEFORE YOU SET auto OR ibz ON A CLOSED-SET DECK: the readers do not
-    # unfold yet.  ``bse_io._MunuSlabPlan`` refuses a wedge outright (at every
-    # process count, not only P>1), and the GW restart reader refuses it too
-    # since the same landing — see ``file_io.tagged_arrays``.  The wedge is
-    # therefore usable today by runs that DISCARD the restart artifact or read
-    # it back through the serial h5py path.
     #
-    # ⚠ THIS WHOLE KEY IS TRANSITIONAL — OWNER RULING 2026-08-08 ~13:20.
-    # `full` is where it rests until the key is DELETED, not a permanent
-    # setting to tune.  The owner's ruling is that symmetry should never have
-    # needed a mode switch at all: "symmetries should not need an auto mode —
-    # if symmetries are not to be used, the wavefunction file should've been
-    # generated with no symmetries."  The WFN file already answers the
-    # question this key asks, so the end state is storage that FOLLOWS the
-    # file — the wedge whenever the deck carries symmetries, readers that
-    # always unfold — with `restart_q_storage` retired entirely rather than
-    # defaulted differently.  That work is the GW+BSE restart consolidation
-    # registered in tests/KNOWN_FAILURES.md; do not build on this key.
+    # WHY THE DEFAULT MOVED, AND WHAT HAD TO BE TRUE FIRST.  It shipped
+    # briefly defaulting to ``auto`` and the 2026-08-08 landing census
+    # measured nine red cells across the GW and BSE restart paths — because
+    # at that date THE READERS DID NOT UNFOLD.  That is the sentence this
+    # comment used to carry as a standing warning, and it stopped being true:
+    # the GW restart reader has unfolded since ``536cbac9``
+    # (``file_io.tagged_arrays._unfold_wedge``, applied at ``:1098`` and
+    # ``:1197``), and ``bse._MunuSlabPlan``'s refusal was lifted 2026-08-15
+    # (``bse_loading.py:707-711`` unfolds through the SAME function).  The
+    # cost argument behind that refusal was measured and did not survive:
+    # 57.4 GiB/s unfold against 2.919 GiB/s disk, a 6-17x win at every size
+    # tested, with mu^2 cancelling out of the comparison entirely.
+    #
+    # THE RULING THIS IMPLEMENTS, verbatim: "symmetries should not need an
+    # auto mode — if symmetries are not to be used, the wavefunction file
+    # should've been generated with no symmetries."  The WFN file already
+    # answers the question this key asks.  ``auto`` IS "follow the file";
+    # the key survives only as the escape hatch and the A/B control, and is
+    # still slated for deletion by the GW+BSE restart consolidation
+    # registered in tests/KNOWN_FAILURES.md.  Do not build on it.
     # See gw/restart_q_storage.py for the resolution and the seam, and
     # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
     # decision this key selects.
-    "restart_q_storage": "full",
+    "restart_q_storage": "auto",
+    # ``qp_rotations_k_storage``: on WHICH k-set is qp_wfn_rotations.h5
+    # stored?  Same three words as ``restart_q_storage``, and DEFAULT auto
+    # for the same reason — storage follows the WFN file.  The wedge here is
+    # the FILE wedge (``wfn.kpoints``, ``sym.nk_red`` rows), which is the
+    # k-set ``kirr_to_kfull`` already addressed, so a wedge-stored file needs
+    # no change at all in ``postprocess.rotate_wfn_to_qp`` or ``gw.eqp_bgw``.
+    #
+    # ``auto`` IS NOT "reduce whenever symmetry allows".  ``U_mnk`` is a
+    # stack of eigenvectors, defined up to a phase and up to a unitary
+    # mixing inside a degenerate multiplet, so whether the off-wedge rows
+    # are redundant depends on how THIS RUN made them: the SC loop under
+    # ``sc_on_ibz`` broadcasts them from the wedge (redundant), while the
+    # one-shot path runs an independent ``eigh`` at every full-BZ k (NOT
+    # redundant).  ``file_io.qp_wfn.write_qp_rotations_h5`` therefore runs
+    # the reader's own round trip on the arrays in hand and keeps the wedge
+    # only when it reproduces them exactly; ``auto`` falls back to full-BZ
+    # storage and says which array failed and by how much, and ``ibz``
+    # refuses instead of falling back.
+    "qp_rotations_k_storage": "auto",
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
@@ -1605,6 +1626,10 @@ _NORMALIZE_STR = {
     # key whose wrong value would otherwise surface as a refusal deep in the
     # restart write, after the compute.
     "restart_q_storage",
+    # ``qp_rotations_k_storage`` normalises and validates the same way, for
+    # the same reason: its wrong value would otherwise surface as a refusal
+    # in the post-SC artifact dump, after the whole self-consistency.
+    "qp_rotations_k_storage",
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
@@ -2667,6 +2692,12 @@ class LorraxConfig:
     #: resolution point rather than a fast path beside it.  Same ``_raw``
     #: convention as ``compute_mode_raw``.
     restart_q_storage_raw: str
+    #: ``qp_rotations_k_storage`` — "auto" (the default) | "full" | "ibz".
+    #: NOT a ``_raw``: unlike ``restart_q_storage`` there is nothing to
+    #: resolve late, because the question it asks ("do these rows unfold
+    #: back to what I hold?") is answered by the arrays themselves at the
+    #: writer, not by a centroid set that does not exist yet.
+    qp_rotations_k_storage: str
     #: The deck keys THIS DECK NAMED, as opposed to inherited from
     #: ``_DEFAULTS``.  Empty for a config built from a hand-made params dict,
     #: which is why every consumer must treat "absent" as "did not ask" — see
@@ -3394,13 +3425,25 @@ class LorraxConfig:
         # key out, and a fallback that disagreed with the registered default
         # would make THAT caller silently take a different storage decision.
         _restart_q_storage = str(
-            _g("restart_q_storage") or "full").strip().lower()
+            _g("restart_q_storage") or "auto").strip().lower()
         if _restart_q_storage not in RESTART_Q_STORAGE:
             raise ValueError(
                 f"restart_q_storage={_restart_q_storage!r} is not one of "
                 f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
                 "restart tensors are STORED on; a value nobody recognises "
                 "is not silently read as the default.")
+
+        from file_io.qp_wfn import QP_ROTATIONS_K_STORAGE
+        # Same ``or`` caveat as above: this fallback is reached only by a
+        # hand-built params dict and must agree with ``_DEFAULTS``.
+        _qp_rot_k_storage = str(
+            _g("qp_rotations_k_storage") or "auto").strip().lower()
+        if _qp_rot_k_storage not in QP_ROTATIONS_K_STORAGE:
+            raise ValueError(
+                f"qp_rotations_k_storage={_qp_rot_k_storage!r} is not one "
+                f"of {QP_ROTATIONS_K_STORAGE}.  This key selects the k-set "
+                "qp_wfn_rotations.h5 is STORED on; a value nobody "
+                "recognises is not silently read as the default.")
 
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
@@ -3456,6 +3499,7 @@ class LorraxConfig:
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
+            qp_rotations_k_storage=_qp_rot_k_storage,
             # Build from a stable sequence.  Equal sets reached through an
             # absent key versus an explicit default can retain different
             # hash-table histories; pickling those frozensets then need not
