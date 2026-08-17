@@ -434,6 +434,14 @@ def write_restart_state_to_h5(
                 [int(band_slices.b0), int(band_slices.b1),
                  int(band_slices.b2), int(band_slices.b3),
                  int(band_slices.b4)], dtype=np.int64))
+            # THE χ / Σ SPLIT, IN A SEPARATE ATTR ON PURPOSE (2026-08-16).
+            # Widening ``band_window`` from 5 entries to 7 would have made
+            # every restart file already on disk compare unequal and strand
+            # it.  A new attr instead: absent == "written by an unsplit run",
+            # which resolves to (b4, b4) and matches an unsplit run exactly.
+            io.write_attr("band_window_split", np.asarray(
+                [int(band_slices.b4_chi), int(band_slices.b4_sigma)],
+                dtype=np.int64))
         if mode == "w":
             io.write_attr("n_rmu_logical", np.int64(int(n_rmu_logical)))
         # COULOMB-KERNEL PROVENANCE.  Unconditional on the ``w`` pass: a
@@ -762,8 +770,40 @@ def assert_restart_window_matches(filename, band_slices=None,
     """
     with h5py.File(filename, "r") as f:
         stored_w = np.asarray(f["band_window"]).tolist() if "band_window" in f else None
+        stored_split = (np.asarray(f["band_window_split"]).tolist()
+                        if "band_window_split" in f else None)
         stored_mu = (int(np.asarray(f["n_rmu_logical"])[()])
                      if "n_rmu_logical" in f else None)
+
+    # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
+    # point.  Every tensor in this file is a function of the SCREENING side or
+    # of the loaded extent: ``V_qmunu`` / ``W0_qmunu`` are built from the χ0
+    # band sum, ``psi_full_y`` / ``enk_full`` / ζ span [b0, b4) =
+    # max(chi, sigma) — which ``band_window``'s b4 already pins.  NOTHING on
+    # disk is a function of ``number_bands_sigma``: Σ slices [0, b4_sigma) out
+    # of tensors that already exist.
+    #
+    # So a Σ-count sweep at fixed χ reuses this file legitimately — which is
+    # the case the split exists to make cheap (χ at full bands, Σ short and
+    # extrapolated), and it is why this is a targeted check rather than a
+    # blanket "no restart under a split".  Changing χ is refused, for exactly
+    # the reason the 5-tuple check above exists.
+    if band_slices is not None:
+        want_split = (int(band_slices.b4_chi), int(band_slices.b4_sigma))
+        if stored_split is None and stored_w is not None:
+            stored_split = [int(stored_w[4]), int(stored_w[4])]
+        if stored_split is not None and int(stored_split[0]) != want_split[0]:
+            raise ValueError(
+                f"Restart file {filename} was written with a chi0/W band sum "
+                f"topping out at band {int(stored_split[0])}, but this run "
+                f"has number_bands_chi -> band {want_split[0]}.  V_qmunu and "
+                f"W0_qmunu ARE the screening, so reusing them would run this "
+                f"deck's Sigma against the OTHER deck's W and report rc=0 "
+                f"(the same silent-misindex class as the band-window check "
+                f"below; see job 7874375).  Either restore the original "
+                f"number_bands_chi, or set restart=false.  Note that "
+                f"number_bands_SIGMA may be changed freely on a restart: no "
+                f"tensor in this file depends on it.")
 
     if stored_w is not None and band_slices is not None:
         want = [int(band_slices.b0), int(band_slices.b1), int(band_slices.b2),
