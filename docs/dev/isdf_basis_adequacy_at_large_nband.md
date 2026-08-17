@@ -181,6 +181,49 @@ half the basis cannot be ISDF-resolved), but it is a change. On this deck the
 ceiling is `nb <= 1964` at 30 Ry and `nb <= 3597` at 45 Ry, so `nb=1024` and
 `nb=2048` both clear it.
 
+## 5b. The rule under TWO band counts (`number_bands_chi` / `number_bands_sigma`)
+
+Since 2026-08-16 a deck can size the chi0/W band sum and the Sigma band sum
+independently (`docs/input_reference.md`). That splits the sentence this whole
+document is built on — *"the ISDF basis must be selected against the band window
+`Sigma_c` actually consumes"* — because there are now two consuming windows.
+
+**The rule is `max`, and it is not a convenience.** The interpolation basis has
+to span the pair densities of whichever consumer reaches higher:
+
+    ISDF window top  =  max(number_bands_chi, number_bands_sigma)
+
+The psi is loaded once over `[b0, b4)` with `b4` the padded top of the LARGER
+count, the zeta fit runs on that window, and the SMALLER consumer takes a
+narrower slice inside it. Sizing the basis by the smaller count would rebuild
+this document's Section 2 failure exactly one index over: the larger sum would
+consume pair densities the basis was never fitted to represent, and — as Section
+1's table shows — every gate in the suite would still pass.
+
+Where it is enforced, so it cannot drift back to a `min` under a refactor:
+
+| what | where |
+|---|---|
+| the `max` itself | `gw_config.BandCounts.isdf`, one property, one definition |
+| the invariant at the consuming seam | `gw_init.assert_isdf_window_is_the_max`, called from `fit_zeta`; refuses, quoting this document |
+| "which count won, and what the fit was built for" | logged every run by `BandCounts.describe()` and by that assert; a silent `max` is not acceptable |
+| tests | `tests/test_band_count_split.py` §4 and §7 |
+
+**`zeta_nband` still narrows, and now says what it undercuts.** Narrowing the
+fit below a band sum's top is a legitimate request (the BSE's Galerkin capacity
+bound is why the key exists), but the consumer left above it is then running on
+an extrapolated zeta basis — this document's mechanism. That is now reported per
+consumer, by name, every run.
+
+**Centroid SELECTION is a separate object and is not covered by the above.**
+The prune window belongs to `centroid/kmeans_cli.py` and is chosen when the
+centroid file is built, before any deck names a band count. Its default is the
+full WFN conduction window (Section 5), which is a superset of any deck's
+`max(chi, sigma)`, so the default composes correctly. If you narrow it by hand
+with `--prune-n-cond`, narrow it to at least `max(chi, sigma)` — not to the
+smaller of the two. **Not verified here**: no split-deck centroid set has been
+built against a hand-narrowed prune window.
+
 ## 6. Gate: pinned Sigma reference
 
 One fixed, cheap configuration is re-run and its QP gap asserted against pinned

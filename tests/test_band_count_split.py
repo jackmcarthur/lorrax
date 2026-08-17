@@ -494,15 +494,111 @@ def test_a_clean_pair_of_edges_prints_the_numbers_anyway():
     assert "chi0/W band sum" in text and "Sigma band sum" in text
 
 
-def test_restart_is_refused_under_a_split():
-    """The restart stamp records b0..b4 and b4 is max(chi, sigma), so it
-    cannot tell a run that screened at 248 bands from one that screened at
-    100.  Reusing the other run's V_q / W0 at rc=0 is exactly what that stamp
-    exists to prevent, seen from the one angle it cannot see."""
+def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
+    """THE ASYMMETRY IS THE POINT, and it is what makes the owner's "use
+    ``restart`` after the first run of a deck" rule usable with a split.
+
+    Every tensor in a restart bundle is a function of the SCREENING side or
+    of the loaded extent: ``V_qmunu`` / ``W0_qmunu`` ARE the screening,
+    ``psi_full_y`` / ``enk_full`` / zeta span ``[b0, b4) = max(chi, sigma)``
+    which the 5-tuple's b4 already pins.  NOTHING on disk is a function of
+    ``number_bands_sigma`` — Sigma slices ``[0, b4_sigma)`` out of tensors
+    that already exist.  So a Sigma-count sweep at fixed chi may reuse the
+    file (which is exactly the configuration the split exists to make cheap),
+    and a changed chi must refuse.
+
+    A file with NO ``band_window_split`` attr was written by an unsplit run;
+    it resolves to ``(b4, b4)``, so it matches an unsplit run exactly and
+    refuses a chi-changed one.  Widening ``band_window`` itself from 5 to 7
+    entries would instead have stranded every restart file on disk.
+    """
+    h5py = pytest.importorskip("h5py")
+    import tempfile
+    from file_io.tagged_arrays import assert_restart_window_matches
+
+    def _file(tmp, window, split):
+        path = os.path.join(tmp, "restart.h5")
+        with h5py.File(path, "w") as f:
+            f["band_window"] = np.asarray(window, dtype=np.int64)
+            if split is not None:
+                f["band_window_split"] = np.asarray(split, dtype=np.int64)
+        return path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # written by a split run: chi 28, sigma 20, loaded extent 28
+        path = _file(tmp, (0, 0, 8, 20, 28), (28, 20))
+        same = _slices(b0=0, b1=0, b2=8, b3=20, b4=28,
+                       b4_chi=28, b4_sigma=20)
+        assert_restart_window_matches(path, band_slices=same)   # identical
+
+        # Sigma moved, chi held: legitimate reuse, no refusal
+        moved_sigma = _slices(b0=0, b1=0, b2=8, b3=20, b4=28,
+                              b4_chi=28, b4_sigma=16)
+        assert_restart_window_matches(path, band_slices=moved_sigma)
+
+        # chi moved: refuse, and say which key
+        moved_chi = _slices(b0=0, b1=0, b2=8, b3=20, b4=24,
+                            b4_chi=24, b4_sigma=20)
+        with pytest.raises(ValueError, match="number_bands_chi"):
+            assert_restart_window_matches(path, band_slices=moved_chi)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # a PRE-SPLIT file: no band_window_split attr at all
+        legacy = _file(tmp, (0, 0, 8, 20, 28), None)
+        unsplit = _slices(b0=0, b1=0, b2=8, b3=20, b4=28)
+        assert_restart_window_matches(legacy, band_slices=unsplit)
+        with pytest.raises(ValueError, match="number_bands_chi"):
+            assert_restart_window_matches(
+                legacy, band_slices=_slices(b0=0, b1=0, b2=8, b3=20, b4=28,
+                                            b4_chi=20, b4_sigma=28))
+
+
+# ---------------------------------------------------------------------------
+# (7) THE ISDF SIZING RULE — the eV-scale failure this guards
+# ---------------------------------------------------------------------------
+
+def test_the_isdf_window_invariant_refuses_a_window_sized_by_the_smaller():
+    """``docs/dev/isdf_basis_adequacy_at_large_nband.md``: an ISDF window
+    clamped to a small band range and used for a large one returned a QP gap
+    of 0.36 eV where the answer is 3.1-3.7 eV, with a NEGATIVE eqp1, and
+    passed every gate in the suite because all of them are upstream of or
+    orthogonal to Sigma_c.  The ``max`` is the guard against that, one index
+    over, and a ``max`` that is only implied by how b4 is computed is one
+    refactor away from being a ``min``.  So it is asserted where it fails.
+    """
     pytest.importorskip("jax")
     from gw import gw_init
-    gw_init._refuse_split_under_restart(
-        _cfg_stub(248, 248, ("number_bands",), restart=True))   # no split: ok
-    with pytest.raises(ValueError, match="restart"):
-        gw_init._refuse_split_under_restart(
-            _cfg_stub(248, 100, ("number_bands_chi",), restart=True))
+    s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
+    # the right range the resolver actually returns: tops out at the max
+    gw_init.assert_isdf_window_is_the_max(s, (0, 28), None, log=lambda *_: None)
+    with pytest.raises(ValueError, match="0.36 eV"):
+        # a window sized by the SMALLER consumer
+        gw_init.assert_isdf_window_is_the_max(s, (0, 20), None,
+                                              log=lambda *_: None)
+
+
+def test_the_isdf_sizing_line_names_the_count_that_set_it():
+    pytest.importorskip("jax")
+    from gw import gw_init
+    lines = []
+    s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
+    gw_init.assert_isdf_window_is_the_max(s, (0, 28), None, log=lines.append)
+    text = "\n".join(lines)
+    assert "28" in text and "20" in text
+    assert "number_bands_chi" in text, "the winner must be named"
+
+
+def test_narrowing_the_fit_below_a_band_sum_is_reported_per_consumer():
+    """``zeta_nband`` may narrow the fit below a band sum's top — the BSE's
+    Galerkin capacity bound is a legitimate reason — but the consumer left
+    above it is then running on an EXTRAPOLATED zeta basis, which is the
+    documented mechanism, and it must never be silent."""
+    pytest.importorskip("jax")
+    from gw import gw_init
+    lines = []
+    s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
+    gw_init.assert_isdf_window_is_the_max(s, (0, 16), 16, log=lines.append)
+    text = "\n".join(lines)
+    assert text.count("EXTRAPOLATED") == 2, (
+        "both consumers top out above 16, so both must be reported")
+    assert "number_bands_chi" in text and "number_bands_sigma" in text
