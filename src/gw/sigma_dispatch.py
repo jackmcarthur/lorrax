@@ -924,6 +924,8 @@ def compute_sigma_xc(
                 CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
             omega_cluster_gap_ry=float(
                 config.mpa.sigma_omega_cluster_gap_ry),
+            occupation_window_threshold=float(
+                config.mpa.occupation_window_threshold),
             pole_batch_size=int(config.mpa.pole_batch_size),
             # PROVENANCE ASSERT AT LOAD: these poles were fitted to a W
             # this run's screening_diagrams either did or did not produce,

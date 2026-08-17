@@ -1704,6 +1704,14 @@ _DEFAULTS = {
     # crossing core decomposes per cluster; a contiguous grid is always
     # one cluster and keeps the incumbent plan bit-for-bit.
     "mpa_sigma_omega_cluster_gap_ry": 1.0,
+    # OCCUPANCY at which a band leaves a metallic Green's-function branch.
+    # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
+    # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
+    # a magnitude, because MP1 f_kn is never clipped and a wrong-side band
+    # carries a NEGATIVE weight that must be kept.  1.0 reproduces the
+    # historical exact `weight != 0` rule bit-for-bit.  Metal-only: an
+    # insulating branch has no weight and is untouched.
+    "occupation_window_threshold": 0.995,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
@@ -3001,6 +3009,15 @@ class MPAConfig:
     #: cluster (the incumbent plan, bit-for-bit); pair with
     #: ``sigma_omega_patches_ev`` to actually gap the grid.
     sigma_omega_cluster_gap_ry: float = 1.0
+    #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
+    #: counting toward a metallic Green's-function branch.  The Σ planner's
+    #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
+    #: floor it applies is ``1 − threshold`` — 0.995 ⇒ ``|weight| > 0.005``
+    #: — and it is a MAGNITUDE because MP1 occupations are never clipped.
+    #: 1.0 recovers the historical exact ``weight != 0`` rule.  Validated at
+    #: its consumer (``gw.mpa.sigma_windows._weight_floor``) per the ruling
+    #: below.
+    occupation_window_threshold: float = 0.995
 
     # pole_batch_size and the two Sigma target errors are validated at their
     # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
@@ -3879,6 +3896,8 @@ class LorraxConfig:
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
             sigma_omega_cluster_gap_ry=float(
                 _g("mpa_sigma_omega_cluster_gap_ry")),
+            occupation_window_threshold=float(
+                _g("occupation_window_threshold")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
