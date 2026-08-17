@@ -191,9 +191,14 @@ symplectic ``[[A, B], [-B, -A]]`` at all (step 4), and even its ``A - B`` is
 ``D - W_d + W_d^B != D``.  The ``w_omega_chain`` z^2 reduction hard-assumes BOTH
 (``w_omega_chain.py:39-46``: ``S = D^{1/2}(A+B)D^{1/2}``, seed scaled by
 ``D^{1/2}``, three-term recurrence in a Euclidean metric), so it is
-STRUCTURALLY REFUSED for the ladder — see :func:`refuse_chain_path`.  A
-generalized reduction through ``bse_nontda.make_ab_appliers``' product form is
-the named optimization deferral.  v1 evaluates every frequency with its own
+STRUCTURALLY REFUSED for the ladder — see :func:`refuse_chain_path`.  The
+hybrid row also rules out ``bse_nontda.make_ab_appliers`` and the SDY product
+form: the un-conjugated ring dyad is not the complex-symmetric coupling block
+that their real-linear ``F/G`` actions require.  The applicable certificate is
+full-space pseudo-Hermiticity, ``eta H = (eta H)^dag`` with
+``eta = diag(I, -I)``; it is not SDY's N-dimensional kappa-metric certificate.
+The general frequency path therefore retains the full 2N operator
+(``w_ladder_freq``); the direct path evaluates each frequency with its own
 shifted block-GMRES solve.
 
 **6. What hermiticity is, and is not, established.**  With the step-4 row,
@@ -408,11 +413,14 @@ def refuse_chain_path(include_w: bool) -> None:
         "holds for the RPA screening operator (A = D + V, B = V) and is broken "
         "by the ladder: A - B = D - W_d + W_d^B. Using the chain here would "
         "silently evaluate a DIFFERENT operator at every frequency, not an "
-        "approximation of this one. The reduction generalizes with "
-        "(A-B)^{1/2} in place of D^{1/2}, applied through "
-        "bse_nontda.make_ab_appliers (bse_nontda.py:288) — that is the named "
-        "optimization deferral and it is not half-built here. v1 evaluates "
-        "each frequency with its own shifted block-GMRES solve "
+        "approximation of this one. The hybrid row also rules out the SDY "
+        "product form: its un-conjugated ring dyad is not the "
+        "complex-symmetric B required by SDY's real-linear F/G actions. The "
+        "correct structural certificate is full-space eta-pseudo-Hermiticity "
+        "(eta H = (eta H)^dag, eta = diag(I,-I)), not the N-dimensional SDY "
+        "kappa metric. A reusable frequency basis must retain the full 2N "
+        "operator, as w_ladder_freq does. The direct path evaluates each "
+        "frequency with its own shifted block-GMRES solve "
         "(bse_w_exact.apply_screening_resolvent_block).")
 
 
