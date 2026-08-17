@@ -829,23 +829,30 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	rules the truncation out as the cause.
 	``tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-6x6x6.md``
 
-	MODE, AND WHY IT IS NOT UNIFORM.  ``snap`` means "say so loudly and
-	continue" — the report-only twin has nothing to widen, so it degrades to a
-	warning by design — and it is a GRANDFATHER CLAUSE for the edges the tree's
-	existing decks already sit on.  Those arrive through ``nband``/``ncond``,
-	were chosen before this check existed, and flipping them to ``strict``
-	would refuse every one that happens to slice; that census has not been run.
-	Owner row.
+	STRICT AT THE CONSUMER.  A cut edge is not made safer by having arrived
+	through an old ``nband``/``ncond`` key.  Scalar-Si c192 gave the missing
+	discriminator on 2026-08-17: the same WFN and centroids at fit edge 12 had
+	``V(q)-conj(V(-q)) = 9.691e-2``, while moving only the edge to the closed
+	band 14 gave ``2.685e-8``.  The wavefunction prefix itself failed TRS
+	subspace closure by 3.79e-1 at edge 12 and passed at 3.50e-9 at edge 14;
+	the full degenerate blocks passed at 4.86e-9.  On that controlled pair the
+	fit window is the first broken object.  This does not claim that every
+	reciprocity residual has that one cause: the 648-centroid production fit
+	retains a separate q-unfold spatial-realization defect even at a closed
+	window, handled at the q-grid owning site rather than weakened here.
+	Every fit edge therefore uses ``strict`` and refuses before the expensive
+	fit.  This matches :mod:`common.band_degeneracy`'s owner-selected default;
+	the old warning-only grandfather clause is removed.
 
-	The ``zeta_nband`` edge has no such decks.  Naming the key is an explicit,
-	brand-new request for a specific edge, so it is checked the way the BSE has
-	checked its own windows since 2026-08-10 and it REFUSES
-	(``BandWindowDegeneracyError``, naming the band and the gap).  It matters
-	most exactly here: on a spin-orbit deck every band is a Kramers pair, so
-	every ODD edge splits one — Si 4×4×4 gives 53, 55 and 57 at exactly
-	0.000 meV — and several even edges split a 4- or 6-fold irrep at
-	high-symmetry k (50, 54 and 56, the last at 0.259 meV).  52 clears by
-	6.870 meV and is the only legal edge at or below 57 on that deck.
+	A fit ending at the LAST band stored in WFN.h5 is also refused.  The
+	outer-edge ``+inf`` convention only means "nothing beyond this ARRAY"; it
+	does not prove the physical multiplet ended there.  The scalar-Si 60-band
+	production WFN demonstrates the distinction: its occupied density passed
+	all 48 spatial operations at 5.43e-10, yet the selected 60-band prefix had
+	wavefunction-level little-group residual 9.96e-1 and produced V reciprocity
+	3.280e-2.  A WFN
+	with at least one spare band makes the top gap measurable.  Without that
+	spare, closure is absent evidence, not a pass.
 	"""
 	if energies is None:
 		log("  [band window] closure NOT CHECKED: this loader exposes no "
@@ -857,13 +864,22 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	for lo, hi, what in (
 			(band_range_left[0], band_range_left[1], "ISDF left window"),
 			(band_range_right[0], band_range_right[1], "ISDF right window")):
-		strict = (zeta_nband is not None and int(hi) == int(zeta_nband))
+		if int(hi) >= int(enk.shape[1]):
+			raise _bd.BandWindowDegeneracyError(
+				f"[band-window] {what} (the ζ fit's pair space): upper "
+				f"boundary band {int(hi)} reaches the available WFN extent "
+				f"({int(enk.shape[1])} bands), so its degeneracy closure cannot "
+				f"be checked.  The outer-array boundary cuts nothing in the "
+				f"stored table but may still cut a physical multiplet.  Regenerate "
+				f"WFN.h5 with at least one spare band above {int(hi)}, then rerun; "
+				f"a fit window is accepted only when its upper gap is measured.")
 		_bd.check_band_window(
-			enk, int(lo), int(hi), mode=("strict" if strict else "snap"),
+			enk, int(lo), int(hi), mode="strict",
 			log=log,
 			where=(f"{what} (the ζ fit's pair space)"
 			       + (f" — deck key zeta_nband={zeta_nband}"
-			          if strict else "")))
+			          if zeta_nband is not None and int(hi) == int(zeta_nband)
+			          else "")))
 	# Print the number even when it is fine: "no news" and "a good number"
 	# must not look alike (preamble measurement rule 10).
 	edges = sorted({int(band_range_left[1]), int(band_range_right[0]),

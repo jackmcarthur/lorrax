@@ -576,6 +576,24 @@ def _compute_V_q_g_flat_one_tile(
         # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
         # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+        unfold_sym = full_to_irr_sym
+        if timing_label == "CC":
+            from .qgrid_symmetry import (
+                trs_pair_coherent_unfold_sym_idx,
+                trs_project_self_negative_q_rows,
+            )
+            unfold_sym = trs_pair_coherent_unfold_sym_idx(
+                full_to_irr_idx, full_to_irr_sym, kgrid=tuple(kgrid),
+                q_irr_full_idx=sym.q_irr_full_idx,
+                n_sym_spatial=n_sym_spatial)
+            V_acc = trs_project_self_negative_q_rows(
+                V_acc, sym.q_irr_full_idx, kgrid=tuple(kgrid))
+            if verbose and jax.process_index() == 0:
+                n_rewired = int(np.count_nonzero(
+                    np.asarray(unfold_sym) != np.asarray(full_to_irr_sym)))
+                print(f"  V_q g-flat [CC] unfold: {n_rewired} q rows use "
+                      "a TRS-composed partner so q/-q share one spatial "
+                      "realization.", flush=True)
         # THE PRE-UNFOLD BLOCK, OFFERED TO WHOEVER IS WRITING THE RESTART.
         # This is the array the q_irr format persists — the design's
         # load-bearing decision, because ``unfold(stored)`` is then the
@@ -594,16 +612,16 @@ def _compute_V_q_g_flat_one_tile(
                 "V_qmunu", V_acc,
                 n_rmu_logical=int(zeta_L_loader.n_rmu),
                 q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
-                sym_idx_q=full_to_irr_sym, sym_perm=sym_perm,
+                sym_idx_q=unfold_sym, sym_perm=sym_perm,
                 L_table=L_table, n_sym_spatial=n_sym_spatial)
         V_acc = unfold_isdf_operator(
-            V_acc, irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
+            V_acc, irr_idx=full_to_irr_idx, sym_idx=unfold_sym,
             sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
             mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
         if write_g0:
             g0_acc = _unfold_g0_ibz_to_full(
                 g0_acc, full_to_irr_idx=full_to_irr_idx,
-                full_to_irr_sym=full_to_irr_sym,
+                full_to_irr_sym=unfold_sym,
                 sym_perm=sym_perm, mesh_xy=mesh_xy,
                 n_sym_spatial=n_sym_spatial)
 

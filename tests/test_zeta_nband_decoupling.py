@@ -21,12 +21,13 @@ THE THREE THINGS THIS FILE HAS TO HOLD.
    other outcome silently re-fits every ζ in the tree.  ``zeta_nband = nband``
    collapses to "unset" at parse time for the same reason: it must not un-pad
    ``b4`` through a redundant statement of the default.
-2. **ILLEGAL EDGES REFUSE BY NAME.**  The new edge is checked STRICT while the
-   ``nband``/``ncond`` edges stay ``snap`` — not an inconsistency but the point
-   of the grandfather clause: existing decks sit on edges chosen before the
-   check existed, and naming ``zeta_nband`` is a brand-new explicit request.
+2. **ILLEGAL EDGES REFUSE BY NAME.**  Every ζ-fit edge is checked STRICT,
+   whether it came from ``nband``/``ncond`` or the newer ``zeta_nband`` key.
+   A cut pair space is non-invariant regardless of which input selected it.
    On the Si SOC deck 52 is legal by 6.870 meV and 56 is not (0.259 meV, a
-   4-fold irrep at k=0); every odd edge splits a Kramers pair outright.
+   4-fold irrep at k=0); every odd edge splits a Kramers pair outright.  A fit
+   ending at the WFN's last stored band also refuses because there is no upper
+   gap with which to certify physical multiplet closure.
 3. **THE DECOUPLING REACHES THE FIT.**  A key that parsed and was read by
    nobody is the failure mode ``AGENT_PREAMBLE``'s A/B rule names.  ``fit_zeta``
    must take its two ranges from this resolver, and the fit + the provenance
@@ -200,30 +201,35 @@ def test_every_odd_edge_splits_a_kramers_pair_and_refuses(odd):
                                   log=lambda *_: None)
 
 
-def test_the_nband_edges_stay_snap_when_the_key_is_unset():
-    """THE GRANDFATHER CLAUSE, asserted rather than assumed.  Flipping the
-    ``nband``/``ncond`` edges to strict would refuse every deck in the tree
-    whose window happens to slice, and that census has not been run (owner
-    row).  A branch that made them strict as a side effect of this key would
-    be that census happening by accident."""
+def test_the_nband_edges_are_strict_when_the_key_is_unset():
+    """An inherited edge and an explicit edge obey the same physics."""
+    from common.band_degeneracy import BandWindowDegeneracyError
     gi = _init()
-    said = []
     enk = _soc_spectrum()
-    gi.check_zeta_fit_windows(enk, (0, 55), (0, 55), None, log=said.append)
-    assert any("cuts a degenerate multiplet" in s for s in said), (
-        "the snap arm went silent — it must still SAY so, loudly")
+    with pytest.raises(BandWindowDegeneracyError, match="band 55"):
+        gi.check_zeta_fit_windows(
+            enk, (0, 55), (0, 55), None, log=lambda *_: None)
 
 
-def test_only_the_zeta_nband_edge_goes_strict_not_the_other_one():
-    """``left`` is capped at ``min(b3, zeta_nband)``.  When b3 < zeta_nband the
-    left edge is b3 — an ``ncond`` edge — and it keeps the grandfather clause
-    even though the same call is checking a strict one."""
+def test_both_edges_are_strict_when_zeta_nband_is_present():
+    """``zeta_nband`` must not hide an independently cut ``ncond`` edge."""
+    from common.band_degeneracy import BandWindowDegeneracyError
     gi = _init()
-    said = []
     enk = _soc_spectrum()
     # left edge 55 (an ncond edge, splits a pair) + right edge 52 (legal)
-    gi.check_zeta_fit_windows(enk, (0, 55), (0, 52), 52, log=said.append)
-    assert any("band 55" in s for s in said)
+    with pytest.raises(BandWindowDegeneracyError, match="band 55"):
+        gi.check_zeta_fit_windows(
+            enk, (0, 55), (0, 52), 52, log=lambda *_: None)
+
+
+def test_a_fit_at_the_wfn_top_refuses_unverifiable_closure():
+    """The array edge is not evidence that the physical multiplet ended."""
+    from common.band_degeneracy import BandWindowDegeneracyError
+    gi = _init()
+    enk = _soc_spectrum()[:, :, :60]
+    with pytest.raises(BandWindowDegeneracyError, match="spare band"):
+        gi.check_zeta_fit_windows(
+            enk, (0, 60), (0, 60), None, log=lambda *_: None)
 
 
 def test_a_loader_with_no_energies_says_absence_not_pass():

@@ -57,10 +57,8 @@ def test_the_closed_window_passes():
     check_band_window(e, 0, 62, mode="strict", where="ISDF left window")
 
 
-def test_snap_warns_instead_of_raising_which_is_how_the_seam_ships():
-    """The ζ seam calls with mode='snap': it must SAY so and continue,
-    because flipping it to strict would refuse every deck in the tree whose
-    window happens to slice and that census has not been run."""
+def test_snap_warns_when_a_caller_explicitly_asks_for_the_primitive():
+    """The primitive keeps its debug mode; the production ζ seam is strict."""
     e = _si666_like()
     said = []
     check_band_window(e, 0, 60, mode="snap", log=said.append,

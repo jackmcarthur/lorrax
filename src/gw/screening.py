@@ -471,6 +471,26 @@ def compute_static_w(
                               f"({nq_solve} q -> {int(meta.nk_tot)} q)"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
+                    from .qgrid_symmetry import (
+                        trs_pair_coherent_unfold_sym_idx,
+                        trs_project_self_negative_q_rows,
+                    )
+                    unfold_sym = trs_pair_coherent_unfold_sym_idx(
+                        full_to_irr_idx, full_to_irr_sym,
+                        kgrid=tuple(meta.kgrid),
+                        q_irr_full_idx=sym.q_irr_full_idx,
+                        n_sym_spatial=n_sym_spatial)
+                    W_q_solve = trs_project_self_negative_q_rows(
+                        W_q_solve, sym.q_irr_full_idx,
+                        kgrid=tuple(meta.kgrid))
+                    if jax.process_index() == 0:
+                        n_rewired = int(np.count_nonzero(
+                            np.asarray(unfold_sym)
+                            != np.asarray(full_to_irr_sym)))
+                        print(
+                            f"  W[{_w}] unfold: {n_rewired} q rows use a "
+                            "TRS-composed partner so q/-q share one spatial "
+                            "realization.")
                     # W's PRE-UNFOLD BLOCK, offered to whoever is writing
                     # the restart — same contract, same reason, same
                     # no-op-outside-a-scope as the V site in v_q_g_flat.
@@ -483,12 +503,12 @@ def compute_static_w(
                         "W0_qmunu", W_q_solve,
                         n_rmu_logical=int(meta.n_rmu),
                         q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
-                        sym_idx_q=full_to_irr_sym, sym_perm=sym_perm,
+                        sym_idx_q=unfold_sym, sym_perm=sym_perm,
                         L_table=L_table, n_sym_spatial=n_sym_spatial)
                     W_q = unfold_isdf_operator(
                         W_q_solve,
                         irr_idx=full_to_irr_idx,
-                        sym_idx=full_to_irr_sym,
+                        sym_idx=unfold_sym,
                         sym_perm=sym_perm, L_table=L_table,
                         q_irr_frac=q_irr_frac,
                         mesh_xy=mesh_xy,

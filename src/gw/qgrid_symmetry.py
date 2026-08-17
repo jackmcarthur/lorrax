@@ -123,3 +123,116 @@ def resolve_qgrid_symmetry_tables(
         # repeat resolves along the run are silent.
         announce_once(res.announce_key, msg, scope="rank0")
     return res
+
+
+def trs_pair_coherent_unfold_sym_idx(
+    irr_idx, sym_idx, *, kgrid, q_irr_full_idx, n_sym_spatial,
+):
+    """Choose one spatial realization for every non-TRIM q/-q pair.
+
+    A centrosymmetric crystal can map both q and -q from one irreducible
+    parent using two unrelated *spatial* rows.  That is mathematically
+    equivalent only when the operator stored in the finite ISDF basis is
+    exactly point-group covariant.  The scalar-Si production discriminator
+    showed why an unfold must not rely on that stronger condition: its
+    closed 50-band wavefunction subspace is covariant at 2.19e-9, while the
+    648-centroid fitted operator is not covariant closely enough to survive
+    the ill-conditioned zeta solve.
+
+    Keep one member's selected spatial row and make the other member use the
+    same row composed with time reversal.  ``unfold_isdf_operator`` then
+    applies its derived conjugation rule, so q/-q reciprocity depends only on
+    TRS and not on an unrelated spatial gauge.  Irreducible representatives
+    and self-negative q rows are unchanged; no value is averaged or
+    projected.
+
+    This policy was first shipped for ladder W in ``screening_bse``.  It is
+    owned here because bare V, RPA W, and ladder W must use the same q-grid
+    realization.
+    """
+    grid = tuple(int(v) for v in kgrid)
+    n_full = int(np.prod(grid))
+    irr = np.asarray(irr_idx, dtype=np.int32)
+    original = np.asarray(sym_idx, dtype=np.int32)
+    n_spatial = int(n_sym_spatial)
+    if irr.shape != (n_full,) or original.shape != (n_full,):
+        raise ValueError(
+            "GATE trs_pair_unfold_map: irr_idx and sym_idx must each have "
+            f"the full k-grid extent {n_full}; got {irr.shape} and "
+            f"{original.shape} for kgrid={grid}.")
+    if (n_spatial <= 0 or np.any(original < 0)
+            or np.any(original >= 2 * n_spatial)):
+        lo = int(original.min()) if original.size else 0
+        hi = int(original.max()) if original.size else -1
+        raise ValueError(
+            "GATE trs_pair_unfold_map: symmetry rows must lie in "
+            f"[0, 2*n_sym_spatial) with n_sym_spatial={n_spatial}; got "
+            f"range [{lo}, {hi}].")
+
+    reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
+    out = original.copy()
+    coords = np.stack(np.unravel_index(np.arange(n_full), grid), axis=1)
+    neg = np.ravel_multi_index(
+        tuple(((-coords) % np.asarray(grid, dtype=np.int64)).T), grid)
+    for iq, jq_value in enumerate(neg):
+        jq = int(jq_value)
+        if iq >= jq:
+            continue
+        if int(irr[iq]) != int(irr[jq]):
+            raise ValueError(
+                "GATE trs_pair_unfold_map: q and -q do not share an "
+                f"irreducible parent ({iq}->{int(irr[iq])}, "
+                f"{jq}->{int(irr[jq])}).  A TRS composition is valid only "
+                "for one solved wedge row; do not fabricate reciprocity "
+                "across two independently solved rows.")
+
+        if iq in reps:
+            source = iq
+        elif jq in reps:
+            source = jq
+        elif (original[iq] < n_spatial) != (original[jq] < n_spatial):
+            source = iq if original[iq] < n_spatial else jq
+        else:
+            source = iq
+        partner = jq if source == iq else iq
+        source_row = int(original[source])
+        out[partner] = (source_row + n_spatial
+                        if source_row < n_spatial
+                        else source_row - n_spatial)
+    return out
+
+
+def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
+    """Apply the one-element TRS group projector at q == -q.
+
+    Pair-coherent unfold handles every two-element q/-q orbit without
+    changing a solved value.  A TRIM row is a one-element orbit, so there is
+    no partner row from which to reconstruct it: the exact constraint is
+    ``A_q = conj(A_q)`` in the restart convention.  A finite band sum or an
+    ill-conditioned ISDF backsolve can leave a small anti-TRS component even
+    when the non-TRIM pairs are exact.  Remove only that component with the
+    unique group average ``(A + conj(A))/2``.
+
+    ``operator`` remains distributed exactly as supplied; this is an
+    elementwise operation and performs no host gather.  ``q_full_idx`` names
+    the full-grid point represented by each leading-axis row, so the helper
+    works on either an irreducible wedge or the full BZ.
+    """
+    import jax.numpy as jnp
+
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    qidx = np.asarray(q_full_idx, dtype=np.int64).reshape(-1)
+    n_full = int(np.prod(grid))
+    if np.any(qidx < 0) or np.any(qidx >= n_full):
+        raise ValueError(
+            "GATE trs_fixed_q_projector: q_full_idx lies outside the "
+            f"full k-grid extent {n_full}: {qidx.tolist()}.")
+    if int(operator.shape[0]) != int(qidx.size):
+        raise ValueError(
+            "GATE trs_fixed_q_projector: operator q extent does not match "
+            f"q_full_idx ({int(operator.shape[0])} != {int(qidx.size)}).")
+    coords = np.stack(np.unravel_index(qidx, tuple(grid)), axis=1)
+    fixed = np.all((2 * coords) % grid[None, :] == 0, axis=1)
+    mask = jnp.asarray(fixed).reshape((qidx.size,) + (1,) * (operator.ndim - 1))
+    projected = 0.5 * (operator + jnp.conj(operator))
+    return jnp.where(mask, projected, operator)

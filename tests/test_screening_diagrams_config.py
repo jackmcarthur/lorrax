@@ -998,6 +998,63 @@ def test_ladder_unfold_refuses_two_independently_solved_q_partners():
             n_sym_spatial=1)
 
 
+def test_pair_coherent_rows_restore_reciprocity_without_spatial_covariance():
+    """The row policy must not assume a finite fitted parent is PG-covariant."""
+    import numpy as np
+    from gw.qgrid_symmetry import trs_pair_coherent_unfold_sym_idx
+
+    grid = (4, 4, 1)
+    irr = np.asarray(
+        [5, 0, 6, 0, 0, 1, 2, 3, 7, 4, 8, 4, 0, 3, 2, 1],
+        dtype=np.int32)
+    selected = np.asarray(
+        [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3],
+        dtype=np.int32)
+    reps = np.asarray([0, 1, 2, 5, 6, 7, 8, 9, 10], dtype=np.int32)
+    coherent = trs_pair_coherent_unfold_sym_idx(
+        irr, selected, kgrid=grid, q_irr_full_idx=reps,
+        n_sym_spatial=3)
+
+    # Rows 0..2 are spatial, 3..5 their TRS-composed copies.  The parent
+    # deliberately does not commute with row 2's centroid permutation.
+    perms = np.asarray([[0, 1], [0, 1], [1, 0],
+                        [0, 1], [0, 1], [1, 0]], dtype=np.int32)
+    parent = np.asarray([[1 + 2j, 3 + 4j], [5 + 6j, 7 + 8j]])
+
+    def image(row):
+        p = perms[row]
+        out = parent[np.ix_(p, p)]
+        return np.conj(out) if row >= 3 else out
+
+    # q rows 1 and 3 are negatives with one wedge parent.  The generic
+    # first-match choices (0,2) ask parent to be spatially covariant and fail.
+    assert not np.allclose(image(selected[1]), np.conj(image(selected[3])))
+    # The coherent choices (0,3) use one spatial realization plus TRS.
+    assert np.array_equal(image(coherent[1]),
+                          np.conj(image(coherent[3])))
+
+
+def test_trs_fixed_q_projector_changes_only_self_negative_rows():
+    import jax.numpy as jnp
+    import numpy as np
+    from gw.qgrid_symmetry import trs_project_self_negative_q_rows
+
+    grid = (4, 1, 1)
+    rows = jnp.asarray([
+        [[1 + 2j]],
+        [[3 + 4j]],
+        [[5 + 6j]],
+        [[7 + 8j]],
+    ])
+    got = np.asarray(trs_project_self_negative_q_rows(
+        rows, np.arange(4), kgrid=grid))
+    # q=0 and q=2 are their own negatives; q=1 and q=3 are a pair and are
+    # handled by the row-map policy, not by this fixed-point projector.
+    assert np.all(got[[0, 2]].imag == 0.0)
+    assert np.array_equal(got[[0, 2]].real, np.asarray(rows)[[0, 2]].real)
+    assert np.array_equal(got[[1, 3]], np.asarray(rows)[[1, 3]])
+
+
 # ---------------------------------------------------------------------------
 # 9. Docs
 # ---------------------------------------------------------------------------
