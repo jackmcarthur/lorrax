@@ -747,6 +747,8 @@ def compute_sigma_xc(
                 CROSSING_NODE_FLOOR, int(config.mpa.sigma_max_nodes)),
             omega_cluster_gap_ry=float(
                 config.mpa.sigma_omega_cluster_gap_ry),
+            occupation_window_threshold=float(
+                config.mpa.occupation_window_threshold),
             pole_batch_size=int(config.mpa.pole_batch_size),
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(

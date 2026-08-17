@@ -9,6 +9,7 @@ here; execution is the existing GN tau kernel through
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple
 
 import jax
@@ -41,6 +42,10 @@ _INF = np.inf
 #: Node ceiling for the positive causal crossing rule: keeps the validated
 #: 500-node safety margin even when mpa_sigma_max_nodes is set lower.
 CROSSING_NODE_FLOOR = 500
+
+#: Deck default for ``occupation_window_threshold`` — see :func:`_weight_floor`
+#: for the occupancy→weight mapping and :func:`_a_space` for the rule itself.
+OCCUPATION_WINDOW_THRESHOLD_DEFAULT = 0.995
 
 
 def _selector(a_hi=_INF, gamma_lo=-_INF, gamma_hi=_INF):
@@ -90,7 +95,7 @@ def _stats_by_pole(Omega, B, bounds):
     return tuple(out)
 
 
-def _geometry(branches, regularization_width_ry, edge_factor):
+def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
     eta = float(regularization_width_ry)
@@ -110,7 +115,8 @@ def _geometry(branches, regularization_width_ry, edge_factor):
     # geometry is unchanged bit-for-bit.
     excursion = 0.0
     for b in branches:
-        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
+        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool),
+                             weight_floor)
         if eb is not None:
             excursion = max(excursion, -min(eb[0], 0.0))
     crossing_edge = omega_max + float(edge_factor) * eta + excursion
@@ -131,10 +137,18 @@ def summarize_sigma_poles(
     regularization_width_ry,
     edge_factor,
     pole_offset=0,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
-    """Reduce one resident pole batch to the scalar planning evidence."""
+    """Reduce one resident pole batch to the scalar planning evidence.
+
+    ``occupation_window_threshold`` MUST match the value handed to
+    :func:`build_shared_sigma_windows` — the two share ``_geometry``, and a
+    mismatch would select poles against one support and windows against
+    another.  Both come from the single deck key in production.
+    """
     _omega_max, _eta, _crossing_edge, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor)
+        branches, regularization_width_ry, edge_factor,
+        _weight_floor(occupation_window_threshold))
     if B_poles.shape != Omega_poles.shape:
         raise ValueError("Omega_poles and B_poles must have identical shapes")
     nonfinite, bad = map(int, jax.device_get(
@@ -170,17 +184,69 @@ def _rows_from_summaries(summaries, name, bounds, phase_real):
             np.asarray(phases, dtype=bool), stats)
 
 
-def _a_space(branch, predicate):
+def _weight_floor(occupation_window_threshold):
+    """Map the deck's OCCUPANCY threshold onto a branch-WEIGHT floor.
+
+    The deck key is an occupancy because that is how the knob is reasoned
+    about ("keep a band until it is 99.5% occupied"), but the cut in
+    :func:`_a_space` is on the branch weight, which is ``f`` on the
+    occupied/hole branch and ``1 − f`` on the empty/electron branch
+    (``gw/mpa/sigma.py`` ``val_weight=f, cond_weight=1.0 - f``).  A band at
+    occupancy 0.995 therefore carries weight 0.995 in the val branch and
+    0.005 in the cond branch, and one at occupancy 0.005 the mirror pair, so
+    ONE floor ``1 − threshold`` cuts both branches symmetrically at the same
+    physical distance from a filled/empty state.  Occupancy 0.995 ⇒ floor
+    0.005.
+
+    ``threshold = 1.0`` gives floor 0.0, i.e. ``abs(w) > 0.0`` ≡ ``w != 0.0``
+    — the exact incumbent rule, bit-for-bit.  That is the deliberate escape
+    hatch and the A/B control for this knob.
+    """
+    t = float(occupation_window_threshold)
+    if not (np.isfinite(t) and 0.5 <= t <= 1.0):
+        raise ValueError(
+            "occupation_window_threshold must be an occupancy in [0.5, 1.0]; "
+            f"got {occupation_window_threshold!r}.  It is the occupancy at "
+            "which a band stops counting toward a Green's-function branch; "
+            "the weight floor applied is 1 - threshold.  1.0 reproduces the "
+            "exact `weight != 0` rule.")
+    return 1.0 - t
+
+
+def _a_space(branch, predicate, weight_floor=0.0):
     E = np.asarray(jax.device_get(branch.E_A), dtype=np.float64)
     base = np.asarray(jax.device_get(branch.base_mask_A), dtype=bool)
     if branch.band_weight is not None:
         # Metallic branches select multiplicatively (mask x weight in the
-        # executor), so base_mask_A spans the whole window and exactly-zero
+        # executor), so base_mask_A spans the whole window and negligible
         # weights would widen the geometry with bands that contribute
         # nothing — the -0.53 Ry phantom excursion of the first metallic
-        # arm. Geometry sees the exact nonzero support only.
+        # arm, whose val branch reached out to a smallest live weight of
+        # 2.67e-322 (a subnormal) because the cut was the EXACT `w != 0.0`.
+        # An exact cut only excludes what underflowed to zero, which is
+        # ~54 smearing widths out; the occupancy threshold cuts at the
+        # physical few-widths shell instead (0.995 ⇒ |w| > 0.005 ⇒ about
+        # 4.3 widths).  Exact zeros are still excluded, since 0 is not
+        # > 0.005, so that history is preserved, not traded away.
+        #
+        # MAGNITUDE, not a one-sided cut.  OccupationState.f_kn is NEVER
+        # clipped (efermi.py: "MP1's overshoot beyond [0, 1] is part of the
+        # configured quadrature"), so a band just above mu carries a
+        # NEGATIVE val weight — down to about -0.035 at the MP1 lobe
+        # minimum.  `w > floor` would silently discard every one of them,
+        # which the incumbent `w != 0.0` kept and which
+        # `mpa: wrong-side fractional states keep their branch's algebra`
+        # (6d3b6b47) exists to route correctly.  `abs(w) > floor` keeps
+        # them and drops only what is genuinely negligible.
+        #
+        # WIDENING THIS COSTS GEOMETRY, NOT JUST BANDS: the support's
+        # min(E_A) sets `excursion` in _geometry, which deepens
+        # crossing_edge for EVERY branch and moves work between the
+        # sign-definite and crossing quadrature families.  That is the
+        # mechanism by which an over-wide support refused outright at
+        # -0.53 Ry.  Lower the threshold only with a plan-level A/B.
         w = np.asarray(jax.device_get(branch.band_weight), dtype=np.float64)
-        base = base & (w != 0.0)
+        base = base & (np.abs(w) > float(weight_floor))
     mask = base & predicate(E)
     values = E[mask]
     if not values.size:
@@ -365,6 +431,7 @@ def build_shared_sigma_windows(
     max_rank: int,
     crossing_max_nodes: int,
     omega_cluster_gap_ry: float = 1.0,
+    occupation_window_threshold: float = OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Build the complete MPA frequency plan from summarized pole bounds.
 
@@ -396,6 +463,13 @@ def build_shared_sigma_windows(
     rotated-Laplace family; the metallic sd sliver decomposes on the same
     pattern.  Derivation and cost law:
     ``docs/dev/crossing-rule-cost-law.md``.
+
+    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
+    Green's-function branch; :func:`_weight_floor` converts it to the branch
+    weight floor ``1 - threshold`` that :func:`_a_space` applies.  It only
+    reaches branches carrying a ``band_weight`` (metals); an insulating plan
+    has ``band_weight=None`` and is untouched, bit-for-bit.  It MUST equal
+    the value given to :func:`summarize_sigma_poles`.
     """
     sector_error = float(target_error)
     crossing_error = (sector_error if crossing_target_error is None
@@ -407,8 +481,12 @@ def build_shared_sigma_windows(
     summaries = tuple(pole_summaries)
     if not summaries:
         raise ValueError("MPA Sigma needs at least one pole summary")
+    # ONE floor for the whole plan: bind it once so no support below can
+    # silently plan against a different band set than _geometry measured.
+    weight_floor = _weight_floor(occupation_window_threshold)
+    a_space = functools.partial(_a_space, weight_floor=weight_floor)
     omega_max, eta, crossing_edge, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor)
+        branches, regularization_width_ry, edge_factor, weight_floor)
     selected = {
         name: _rows_from_summaries(summaries, name, bounds, False)
         for name, bounds in selectors.items()
@@ -435,7 +513,7 @@ def build_shared_sigma_windows(
         crossing = (branch.space == "cond") != branch.neg_omega_half
         neg = -1.0 if branch.neg_omega_half else 1.0
         if not crossing:
-            mask, eb = _a_space(branch, lambda E: np.ones(E.shape, bool))
+            mask, eb = a_space(branch, lambda E: np.ones(E.shape, bool))
             if eb is None:
                 continue
             if branch.band_weight is None or eb[0] > sd_edge:
@@ -443,12 +521,12 @@ def build_shared_sigma_windows(
                     ("all", selected["all"]),
                 ])], -1, -neg))
                 continue
-            mask_hi, eb_hi = _a_space(branch, lambda E: E > sd_edge)
+            mask_hi, eb_hi = a_space(branch, lambda E: E > sd_edge)
             if eb_hi is not None:
                 sign_specs.append((branch, [("single", mask_hi, eb_hi, [
                     ("all", selected["all"]),
                 ])], -1, -neg))
-            mask_lo, eb_lo = _a_space(branch, lambda E: E <= sd_edge)
+            mask_lo, eb_lo = a_space(branch, lambda E: E <= sd_edge)
             if eb_lo is not None:
                 sign_specs.append((branch, [("sd_slab", mask_lo, eb_lo, [
                     ("deep", selected["deep"]),
@@ -457,13 +535,13 @@ def build_shared_sigma_windows(
             continue
 
         crossing_branches.append((branch, neg))
-        mask_slab, eb_slab = _a_space(
+        mask_slab, eb_slab = a_space(
             branch, lambda E: np.ones(E.shape, bool))
         if eb_slab is not None:
             sign_specs.append((branch, [("b_slab", mask_slab, eb_slab, [
                 ("deep", selected["deep"]),
             ])], +1, +neg))
-        mask, eb = _a_space(branch, lambda E: E > crossing_edge)
+        mask, eb = a_space(branch, lambda E: E > crossing_edge)
         if eb is not None:
             sign_specs.append((branch, [("a_stripe", mask, eb, [
                 ("shallow", selected["shallow"]),
@@ -538,7 +616,7 @@ def build_shared_sigma_windows(
         if idx.size and monolithic:
             core_masks, f_max = [], 0.0
             for branch, neg in crossing_branches:
-                mask, eb = _a_space(branch, lambda E: E <= crossing_edge)
+                mask, eb = a_space(branch, lambda E: E <= crossing_edge)
                 core_masks.append((branch, neg, mask, eb))
                 if eb is not None:
                     w_lo = float(np.min(branch.omega_abs))
@@ -575,7 +653,7 @@ def build_shared_sigma_windows(
                         band_weight=_branch.band_weight))
         elif idx.size:
             for _branch, neg, clusters in branch_clusters:
-                mask_core, eb_core = _a_space(
+                mask_core, eb_core = a_space(
                     _branch, lambda E: E <= crossing_edge)
                 if eb_core is None:
                     continue
@@ -586,14 +664,14 @@ def build_shared_sigma_windows(
                     omega_idx_c = idx_all[om_sel]
                     e_lo_split = w_lo - a_hi - margin
                     e_hi_split = w_hi - a_lo + margin
-                    mask_p, eb_p = _a_space(
+                    mask_p, eb_p = a_space(
                         _branch,
                         lambda E: (E < e_lo_split) & (E <= crossing_edge))
-                    mask_s, eb_s = _a_space(
+                    mask_s, eb_s = a_space(
                         _branch,
                         lambda E: (E >= e_lo_split) & (E <= e_hi_split)
                         & (E <= crossing_edge))
-                    mask_n, eb_n = _a_space(
+                    mask_n, eb_n = a_space(
                         _branch,
                         lambda E: (E > e_hi_split) & (E <= crossing_edge))
                     if not np.array_equal(
