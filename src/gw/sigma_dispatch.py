@@ -960,6 +960,10 @@ def compute_sigma_xc(
                 config.mpa.sigma_omega_cluster_gap_ry),
             pole_batch_size=int(config.mpa.pole_batch_size),
             band_plan=mpa_band_plan,
+            # PROVENANCE ASSERT AT LOAD: these poles were fitted to a W
+            # this run's screening_diagrams either did or did not produce,
+            # and the two are indistinguishable in the bytes.
+            expected_screening_diagrams=config.screening.diagrams,
             print_fn=print_fn)
         head = mpa_store.read_head_fit_collective(
             fit_path, mesh_xy=mesh_xy, to_unit="Ry")

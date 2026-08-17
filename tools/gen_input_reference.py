@@ -72,6 +72,7 @@ KEYS: dict[str, tuple[str, str]] = {
     # ---- Screening ----
     "do_screened": ("Screening", "Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it."),
     "screening_method": ("Screening", "chi0 frequency treatment (minimax quadrature is the only production method)."),
+    "screening_diagrams": ("Screening", "Which diagrams W sums: w_rpa (default, W = (1 - V chi0)^-1 V) | w_bse (ladder-corrected W(z) - v = v (z - H)^-1 v, with the statically screened direct rung in H). ORTHOGONAL to screening_method (how the chi0 frequency integral is taken) and to compute_mode (which Sigma ansatz asks for W). Supported under w_bse: cohsex, gn_ppm, mpa, single-shot. Refused at parse time under w_bse: x_only, hl_ppm, qp_solver = self_consistent, mc_average_placement != off."),
     "minimax_target_error": ("Screening", "Target uniform error of the minimax time/frequency quadrature."),
     "minimax_max_nodes": ("Screening", "Node-count cap for the minimax quadrature solver."),
     "regenerate_minimax_tables": ("Screening", "Force re-solving the minimax tables instead of reusing cached ones."),

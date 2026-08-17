@@ -462,6 +462,201 @@ def coerce_compute_mode(mode) -> ComputeMode:
         ) from exc
 
 
+class ScreeningDiagrams(str, enum.Enum):
+    """WHICH DIAGRAMS build the W that Σ consumes — the screening axis.
+
+    Orthogonal to :class:`ComputeMode` (which Σ *ansatz* is evaluated) and
+    to ``screening_method`` (how the χ₀ frequency integral is done).  Those
+    two say *at which frequencies* W is wanted and *how the quadrature is
+    taken*; this one says *which series* W sums.
+
+    - ``W_RPA`` — the random-phase approximation, ``W = (1 − Vχ₀)⁻¹V``.
+      The only screening LORRAX had before 2026-08-15 and the default, so
+      a deck that does not name this key is bit-identical to every deck
+      written before it.
+    - ``W_BSE`` — ladder-corrected W: ``W(ω) − v = v (ω − H)⁻¹ v`` with the
+      statically screened direct rung ``−W(0)`` in the kernel of ``H``.
+      Two-stage by construction — the RPA ``W(0)`` of the first stage IS
+      the ``W_R`` the ladder kernel consumes — which is why this value
+      changes the dataflow rather than one solver call.
+
+    WHY AN ENUM AND NOT A BOOL.  ``ladder_screening = true`` would name the
+    one alternative that exists today and spend the axis: the resolvent
+    formalism admits more than one diagram set (TDA vs full symplectic,
+    test-charge vs test-electron), and each is a *value* on this axis, not
+    a second boolean beside it.  The same reasoning that spelled
+    ``compute_mode`` as an enum of ansätze rather than ``use_ppm_sigma``
+    (see :class:`ComputeMode`'s docstring) applies here.
+
+    NOT EVERY COMBINATION IS SUPPORTED.  ``w_bse`` is refused at parse
+    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver,
+    ``mc_average_placement != off`` and a declared metal
+    (``mpa_material_class = metal``) — see
+    :func:`refuse_unsupported_screening_diagrams`, which carries the
+    reason for each.  INSULATORS ONLY is the one of those that a deck key
+    cannot always express: a metallic WFN on a deck that declares nothing
+    is refused at the stage instead, on the occupations themselves
+    (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
+    """
+
+    W_RPA = "w_rpa"
+    W_BSE = "w_bse"
+
+
+def coerce_screening_diagrams(value) -> ScreeningDiagrams:
+    """Accept a :class:`ScreeningDiagrams`, its ``.value``, or a string.
+
+    Same shape and same reason as :func:`coerce_compute_mode`: the parser,
+    a hand-built stub config and a deck-echo path all reach the axis
+    holding different spellings of the same request, and normalising in
+    ONE place is what keeps the dispatch a single answer.  A typo raises
+    naming the legal set — it never resolves to the default.
+    """
+    if isinstance(value, ScreeningDiagrams):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return ScreeningDiagrams(str(raw).strip().lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"screening_diagrams={raw!r} is not a known screening diagram "
+            f"set; expected one of: "
+            f"{', '.join(d.value for d in ScreeningDiagrams)}."
+        ) from exc
+
+
+#: WHICH COMBINATIONS OF ``screening_diagrams = w_bse`` v1 REFUSES, and why.
+#:
+#: Each entry is ``rule_id -> (predicate, got, want, fix, doc)``; the
+#: refusal text is assembled from the five so every message has the same
+#: five parts and no rule can be added without answering all of them.
+#: Predicates take the resolved :class:`LorraxConfig`.
+#:
+#: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``,
+#: ``mpa`` and ``qp_solver = one_shot_dft`` / ``fixed_point``.
+_W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
+    (
+        "w_bse_needs_a_screened_mode",
+        lambda cfg: cfg.compute_mode is ComputeMode.X_ONLY,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "a mode that consumes W: cohsex, gn_ppm, or mpa",
+        "drop screening_diagrams (or set it to w_rpa) for a bare-exchange "
+        "run, or pick a screened compute_mode",
+        "x_only builds no W at all, so a ladder-corrected W would be "
+        "computed and discarded.  A key that parses and changes nothing is "
+        "the ctsp defect (docs/architecture/decisions.md, 2026-08-06 "
+        "ruling), and it is refused here rather than repeated",
+    ),
+    (
+        "w_bse_hl_ppm_broadening_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.HL_PPM,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "cohsex (ladder W(0)), gn_ppm (ladder W(0) + W(i*omega_p)), or mpa",
+        "use gn_ppm, whose probe sits on the imaginary axis where the "
+        "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
+        "the HL probe is a REAL-axis frequency, and (z - H)^-1 on the real "
+        "axis needs a broadening (eta / xi) policy that this tree does not "
+        "have a single answer for: GN-PPM and MPA already evaluate Sigma at "
+        "silently different broadenings on the same deck "
+        "(KNOWN_LORRAX_ISSUES.md:131 and :134 -- a 5.7x gap, floor applied "
+        "by one side only).  Improvising a third convention for the ladder "
+        "on top of that is how the discrepancy would become permanent, so "
+        "v1 refuses instead.  Same shape as the wired-but-refused "
+        "schur_avg placement (src/gw/head_channel.py:153)",
+    ),
+    (
+        "w_bse_self_consistency_unimplemented",
+        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
+        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
+        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "run w_bse single-shot; for a QSGW loop keep screening_diagrams = "
+        "w_rpa until the per-iteration cycle lands",
+        "the ladder reads its kernel W_R back out of the restart file the "
+        "same run just wrote, so every SC iteration needs its own "
+        "persist/reload cycle with its own provenance.  That cycle is not "
+        "built; running without it would feed iteration N's ladder the "
+        "iteration-1 W(0) and report the result as QSGW-hat.  Named "
+        "deferral, DESIGN_2026-08-15.md section 1",
+    ),
+    (
+        # ``mpa_material_class`` is the authority for which MPA material
+        # formulation the deck requests.  The metal branch now also requires
+        # explicit smearing metadata, but that metadata does not weaken this
+        # rule: every certified w_bse path is insulating, so the material
+        # class alone is the complete parse-time predicate.  A fractional
+        # WFN whose deck never declares metal is caught by the runtime
+        # occupation gate (gw/screening_bse.py, the same rule id).
+        "w_bse_insulators_only",
+        lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
+                     .strip().lower() != "insulator"),
+        lambda cfg: f"mpa_material_class = {cfg.mpa.material_class}",
+        "mpa_material_class = insulator (the default) -- w_bse v1 serves "
+        "insulating systems only",
+        "drop mpa_material_class (or set it to insulator) for a gapped "
+        "system, or keep screening_diagrams = w_rpa for a metal",
+        "the ladder operator, its TRS-gauge machinery and every "
+        "certification this feature has are INSULATOR-DERIVED: integer "
+        "occupations and a gapped D throughout (the pair basis is a "
+        "band-index cut at nelec, and the resolvent's poles are the "
+        "transition energies that cut produces).  Partial occupations "
+        "enter BOTH -- the pair basis gains partially-blocked transitions "
+        "and (z - H)^-1 gains poles at ~0 -- in ways nothing here has "
+        "measured, so the run would produce a complete, plausible W under "
+        "a diagram set that was never verified for it.  The metallic MPA "
+        "screening/Sigma pipeline is live under screening_diagrams = w_rpa; "
+        "that is the supported alternative, not evidence that the distinct "
+        "ladder operator has acquired fractional-occupation semantics",
+    ),
+    (
+        "w_bse_head_placement_unimplemented",
+        lambda cfg: str(cfg.head.mc_average_placement) != "off",
+        lambda cfg: f"mc_average_placement = {cfg.head.mc_average_placement}",
+        "mc_average_placement = off (the default)",
+        "leave mc_average_placement at off under w_bse, or keep "
+        "screening_diagrams = w_rpa to use the BGW head placement",
+        "v1 policy is that the q=0 head/wing channel stays RPA and the "
+        "ladder replaces the BODY only (DESIGN_2026-08-15.md section 5).  "
+        "mc_average_placement moves W's head scalar AFTER the Dyson solve, "
+        "which is a second opinion about the same channel; the two "
+        "policies would compose silently and the result would be neither. "
+        "The ladder q->0 head is the named deferral this refusal protects",
+    ),
+)
+
+
+def refuse_unsupported_screening_diagrams(config) -> None:
+    """Refuse the ``w_bse`` combinations v1 does not serve, at PARSE time.
+
+    Called from :meth:`LorraxConfig.from_input_file` once the record
+    exists, because every predicate here reads a RESOLVED axis
+    (``compute_mode`` and ``qp_solver`` are properties that fold in the
+    legacy flags) and re-deriving them beside the parse would be a second
+    opinion about the same question -- the shadow-accounting failure
+    class, QUALITY_PATTERNS #3.
+
+    NO-OP FOR ``w_rpa``, evaluated first and returning before any property
+    is touched: a default deck must not acquire a new parse-time
+    resolution -- and hence a new possible refusal -- from this function
+    existing.
+    """
+    diagrams = coerce_screening_diagrams(
+        getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if diagrams is not ScreeningDiagrams.W_BSE:
+        return
+    for rule_id, predicate, got, want, fix, doc in _W_BSE_REFUSALS:
+        if not predicate(config):
+            continue
+        raise ValueError(
+            f"GATE {rule_id}: screening_diagrams = w_bse is refused with "
+            f"{got(config)}.\n"
+            f"  got:  screening_diagrams = w_bse, {got(config)}\n"
+            f"  want: {want}\n"
+            f"  fix:  {fix}\n"
+            f"  why:  {doc}.\n"
+            f"  doc:  docs/input_reference.md '## Screening', "
+            f"screening_diagrams.")
+
+
 def sigma_channels_for(mode) -> frozenset[SigmaChannel]:
     """The Σ channels ``mode`` builds, per :data:`MODE_SIGMA_CHANNELS`."""
     resolved = coerce_compute_mode(mode)
@@ -1425,6 +1620,17 @@ _DEFAULTS = {
     "whead_imfreq": None,
     # Screening / minimax
     "screening_method": "minimax",
+    # WHICH DIAGRAMS W sums.  Orthogonal to screening_method (how the chi0
+    # frequency integral is taken) and to compute_mode (which Sigma ansatz
+    # asks for W):
+    #   "w_rpa" (DEFAULT) — W = (1 - V chi0)^-1 V, every deck written
+    #        before 2026-08-15, bit-identical.
+    #   "w_bse" — ladder-corrected W(omega) - v = v (omega - H)^-1 v with
+    #        the statically screened direct rung -W(0) in H's kernel.  The
+    #        RPA W(0) is still computed and persisted first; it IS the
+    #        ladder kernel's W_R.  Refused against x_only / hl_ppm /
+    #        qp_solver = self_consistent / mc_average_placement != off.
+    "screening_diagrams": "w_rpa",
     # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
     # Zero preserves the historical step-occupation path.  The first
     # consumer is the per-iteration QSGW parallel-transport head; the same
@@ -1665,7 +1871,8 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "sc_eigh",
     "sc_head_update",
-    "wcoul0_source", "screening_method", "minimax_energy_reference",
+    "wcoul0_source", "screening_method", "screening_diagrams",
+    "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
     "occ_smearing_family",
     "w_dyson_solver",
@@ -2587,6 +2794,15 @@ class ScreeningConfig:
     check below, which is what makes it honest: before that check the
     field was pure decoration, so ``screening_method = ctsp`` parsed,
     normalised, and ran minimax without a word.
+
+    ``diagrams`` is a DIFFERENT axis and it does have a second branch:
+    ``method`` says how the chi0 frequency integral is taken, ``diagrams``
+    says which series W sums (RPA, or the BSE ladder).  The fork lives in
+    ``gw.screening.compute_screening_model`` and nowhere else.  Its
+    default is spelled here as well as in ``_DEFAULTS`` so a hand-built
+    config -- a tool, a test stub -- takes the SAME decision the parser
+    would; a fallback that disagreed with the registered default is the
+    defect the ``restart_q_storage`` note above describes.
     """
     method: str                   # "minimax" -- the only supported value
     occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
@@ -2594,6 +2810,7 @@ class ScreeningConfig:
     minimax_max_nodes: int
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
+    diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
 
     def __post_init__(self):
         if self.occ_broadening_ev < 0.0:
@@ -2618,6 +2835,24 @@ class ScreeningConfig:
                 f"never selected a different method, so replacing it with "
                 f"'screening_method = minimax' (or deleting the key, "
                 f"which defaults to minimax) changes no result.")
+        # REFUSE a spelling this axis does not have, naming the two it
+        # does.  The parser already normalises through
+        # ``coerce_screening_diagrams``; this is the guard for every OTHER
+        # constructor of this record (tools, test stubs, a future reader),
+        # so the axis cannot acquire a third value by assignment.
+        if not isinstance(self.diagrams, ScreeningDiagrams):
+            raise ValueError(
+                f"screening_diagrams = {self.diagrams!r} is not supported.  "
+                f"The legal set is exactly "
+                f"{{{', '.join(d.value for d in ScreeningDiagrams)}}}: "
+                f"'w_rpa' (default) sums the random-phase series "
+                f"W = (1 - V chi0)^-1 V, and 'w_bse' sums the ladder series "
+                f"W(w) - v = v (w - H)^-1 v with the statically screened "
+                f"direct rung in H.  Pass a ScreeningDiagrams member or run "
+                f"the value through gw_config.coerce_screening_diagrams, "
+                f"which raises with this same set for a typo.  This axis is "
+                f"ORTHOGONAL to screening_method and to compute_mode; see "
+                f"docs/input_reference.md '## Screening'.")
 
 
 @dataclass(frozen=True)
@@ -3205,6 +3440,17 @@ class LorraxConfig:
 
     # --- Input directory (for resolving relative paths at runtime) ---
     input_dir: str = ""
+    # --- The deck this config was parsed from -------------------------
+    # ``input_dir``'s missing half.  A stage that has to hand the DECK to
+    # another component -- not a path resolved out of it -- had no way to
+    # name it: the driver's ``args.input`` died at ``from_input_file``.  The
+    # first such consumer is the ``screening_diagrams = w_bse`` handoff:
+    # ``bse.w_ladder.compute_wc_qwedge`` needs the deck because the
+    # irreducible q wedge comes from ``SymMaps``, which is built from the
+    # WFN the DECK names, and no restart file records it.  Empty for a
+    # config built by hand, and the consumer refuses on empty rather than
+    # guessing a deck beside the restart.
+    input_file: str = ""
 
     def __post_init__(self):
         """Refuse fractional-occupation settings outside their landed scope."""
@@ -3603,6 +3849,7 @@ class LorraxConfig:
             minimax_max_nodes=int(_g("minimax_max_nodes")),
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
             minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
+            diagrams=coerce_screening_diagrams(_g("screening_diagrams")),
         )
         ppm = PPMConfig(
             model=str(_g("ppm_model")).strip().lower(),
@@ -3963,7 +4210,7 @@ class LorraxConfig:
             if _zeta_nband == _bands.isdf:
                 _zeta_nband = None
 
-        return cls(
+        resolved = cls(
             # Top-level: system + mode flags
             nval=int(_g("nval")),
             ncond=int(_g("ncond")),
@@ -4009,4 +4256,12 @@ class LorraxConfig:
             # Parsed blocks
             kpoints_crystal_b=params.get("kpoints_crystal_b"),
             input_dir=input_dir,
+            input_file=os.path.abspath(filename),
         )
+        # CROSS-KEY, and therefore after the record exists: the w_bse
+        # refusals read resolved axes (compute_mode / qp_solver fold in the
+        # legacy flags), and the honest way to ask which mode a deck chose
+        # is to ask the resolver, not to re-derive it here.  A w_rpa deck
+        # returns from this call before either property is touched.
+        refuse_unsupported_screening_diagrams(resolved)
+        return resolved

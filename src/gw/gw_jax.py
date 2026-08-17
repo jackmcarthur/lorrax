@@ -73,7 +73,7 @@ from .gw_init import (prepare_isdf_and_wavefunctions,
                       check_band_sum_degeneracy)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
-from .screening import compute_screening_model
+from .screening import compute_screening_model, driver_persists_w0
 from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
 from .degen_average import (
@@ -446,6 +446,7 @@ def main(argv=None):
 			label="oneshot", head_resolver=head_resolver,
 			head_channel=getattr(isdf, 'head_channel', None),
 			static_only=qp_solver is QPSolver.SELF_CONSISTENT,
+			tensors_filename=tensors_filename,
 			print_fn=print0)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
@@ -466,7 +467,7 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if mode is not ComputeMode.MPA:
+	if driver_persists_w0(mode, config):
 		with timing.section("gw_jax.persist_w0"):
 			persist_w0_and_head(
 				W_by_role.get("static", V_q),

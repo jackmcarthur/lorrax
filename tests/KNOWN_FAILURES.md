@@ -2461,3 +2461,48 @@ misleading exit code.  Prose: `SIGMA_SCALING.md` §9.  The guarding cells are
 `tests/test_jax_profile_section_allowlist.py`, six of them; they pin the
 allowlist's behaviour, including that an empty or whitespace value means
 "unset" rather than "trace nothing", and they say nothing about the segfault.
+
+---
+
+## 2026-08-16 — two cells in `tests/test_w_bse_wiring_closure.py` are RED ON PURPOSE
+
+Branch `feat/screening-diagrams-wbse-2026-08-15` (`screening_diagrams =
+w_rpa | w_bse`). These are NOT infrastructure failures and NOT flakes; each is
+a measurement that came out against the feature, and each is left failing
+deliberately rather than `xfail`-ed, because an `xfail` would make the suite
+green while `w_bse` is wrong at finite q.
+
+```
+tests/test_w_bse_wiring_closure.py::test_the_ladder_w_passes_the_production_w_gate_at_finite_q
+tests/test_w_bse_wiring_closure.py::test_the_ladder_operator_obeys_q_conjugate_reciprocity_without_the_unfold
+```
+
+**What they measure.** The ladder screening operator violates
+`W(-q) = conj(W(q))` — the property the BSE kernel's own hermiticity reduces to
+(`common/sanity.py:511-533`), and the one `gw/screening._gate_w` checks over the
+whole flat-q axis. Measured on a 2x2 in-process mesh, gnppm_debug fixture,
+`n_rmu = 399`, full-basis probe, `lx` JID 57064957:
+
+| observable | value | bar |
+|---|---:|---:|
+| assembled full-BZ ladder tile, `max abs(W_q - conj(W_-q)) / max abs W` | **7.251e-05** | 1e-05 |
+| the SAME assembly with `include_w=False` (RPA operator, same plumbing) | 7.153e-12 | — |
+| the production `W0_qmunu` off disk | 7.151e-12 | — |
+| operator only: solve at `q` and at `-q` separately, NO symmetry table | RPA **4.081e-11**, LADDER **3.579e-04** | — |
+| per-q hermiticity of the ladder W, all five q_irr | 1.316e-11 … 3.408e-11 | 1e-06 |
+
+So the assembly is exonerated to three significant figures and hermiticity is
+clean everywhere; the break is in the operator, and it is the KNOWN_FAILURES
+line 1248 class (finite-q vertex conjugation, invisible at q=0) reappearing in
+the ladder's direct rung.
+
+**Do not** loosen `_gate_w`, and do not mark these `xfail` to get a green
+board. `KNOWN_LORRAX_ISSUES.md` (sandbox) carries the defect row; the fix is
+theory and is the owner's. The rest of the file — the wiring-closure gate
+itself — is GREEN at 8.507e-09 (q=0) and 9.273e-09 (finite q_irr) against a
+1e-08 ceiling.
+
+Evidence:
+`/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/reports/screening_diagrams_wbse/evidence/`
+— `operator_reciprocity_mesh4.*`, `ladder_finiteq_gate_mesh4.*`,
+`closure_gate_mesh4.*`, `combined_mesh4.*`. Sandbox claims 0214 / 0215.

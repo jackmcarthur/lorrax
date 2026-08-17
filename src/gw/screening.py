@@ -39,7 +39,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import jax_profile
 import common.timing as timing
-from .gw_config import ComputeMode, env_bool
+from .gw_config import (
+    ComputeMode, ScreeningDiagrams, coerce_screening_diagrams, env_bool,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +726,7 @@ def compute_screening_model(
     iteration_head_response=None,
     occupation_state=None,
     static_only=False,
+    tensors_filename=None,
     print_fn=print,
 ):
     """Build the screening representation consumed by one Sigma ansatz.
@@ -733,13 +736,42 @@ def compute_screening_model(
     frequency walk cannot be represented as independent screening requests.
     ``static_only`` is the pre-SC restart seed used by ordinary modes; MPA
     rebuilds its model inside each iteration and therefore returns nothing.
+
+    THE ``screening_diagrams`` FORK LIVES HERE AND NOWHERE ELSE.  The role
+    plan (:func:`screening_requests_for`) and the Σ dispatch are identical
+    for both values — the same Σ ansatz wants W at the same frequencies
+    either way; only WHICH W satisfies the request changes.  ``w_rpa``
+    therefore reaches exactly the statements it reached before the fork
+    existed, which is what keeps the frozen Si pins and the 0.644 meV BGW
+    cell bit-identical.
+
+    ``tensors_filename`` is the ISDF restart file.  It is unused by the
+    ``w_rpa`` path and REQUIRED by ``w_bse``, which persists the RPA W(0)
+    into it and then hands the path to the BSE ladder facade; a caller
+    that cannot supply it gets a named refusal rather than a fallback.
     """
+    diagrams = coerce_screening_diagrams(
+        getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
         if head_resolver is None:
             raise ValueError("MPA screening requires a head resolver")
         from .mpa.model import build_mpa_fit
+        # ``wc_source = None`` is the RPA seam default (``mpa.model._solve_wc``,
+        # the Dyson solve of the sampled chi).  Under w_bse the same per-z,
+        # per-wedge-q Wc(z) slabs come off the ladder resolvent instead; the
+        # sample plan, the Pade fit and the SlabIO store lifecycle are the
+        # same objects either way.
+        wc_source = None
+        if diagrams is ScreeningDiagrams.W_BSE:
+            from .screening_bse import make_ladder_wc_source
+            wc_source = make_ladder_wc_source(
+                wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                centroid_indices=centroid_indices, config=config, meta=meta,
+                mesh_xy=mesh_xy, tensors_filename=tensors_filename,
+                head_resolver=head_resolver, head_channel=head_channel,
+                print_fn=print_fn)
         fit_path, iteration_head = build_mpa_fit(
             run_dir, label, wfns=wfns, wfn=wfn, V_q=V_q, quad=quad, sym=sym,
             centroid_indices=centroid_indices, head_resolver=head_resolver,
@@ -748,11 +780,32 @@ def compute_screening_model(
             iteration_head_response=iteration_head_response,
             occupation_state=occupation_state,
             head_channel=head_channel,
-            print_fn=print_fn)
+            wc_source=wc_source, print_fn=print_fn)
         result = {"mpa_fit": fit_path}
         if iteration_head is not None:
             result["iteration_head"] = iteration_head
         return result
+
+    if diagrams is ScreeningDiagrams.W_BSE:
+        from .screening_bse import compute_screening_ladder
+        return compute_screening_ladder(
+            mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+            centroid_indices=centroid_indices, config=config, meta=meta,
+            mesh_xy=mesh_xy, tensors_filename=tensors_filename,
+            head_resolver=head_resolver, head_channel=head_channel,
+            static_only=static_only, print_fn=print_fn)
+    if diagrams is not ScreeningDiagrams.W_RPA:
+        # EXHAUSTIVENESS, not defensive programming.  A member added to
+        # ScreeningDiagrams without a branch here would otherwise fall into
+        # the RPA path below and produce a complete, plausible W under
+        # another diagram set's name — the failure ``compute_mode``'s
+        # dispatch audit (16e0c9c0) closed on its own axis.
+        raise ValueError(
+            f"compute_screening_model: screening_diagrams = "
+            f"{diagrams.value!r} has no branch here.  Every member of "
+            f"gw_config.ScreeningDiagrams needs one "
+            f"({', '.join(d.value for d in ScreeningDiagrams)}); it is "
+            f"refused rather than served the RPA path under its name.")
 
     requests = screening_requests_for(mode, config)
     if static_only:
@@ -763,6 +816,38 @@ def compute_screening_model(
         centroid_indices=centroid_indices, config=config, meta=meta,
         mesh_xy=mesh_xy, print_fn=print_fn, head_channel=head_channel,
         iteration_head_response=iteration_head_response)
+
+
+def driver_persists_w0(mode, config) -> bool:
+    """Does the DRIVER own the W0 restart flush for this run?
+
+    Two runs answer no, for opposite reasons, and the driver should not
+    have to know either:
+
+    * ``compute_mode = mpa`` — there is no ``{0, probe}`` head grid to
+      stamp beside a W sampled on the double-parallel plan, so
+      ``gw_output.persist_w0_and_head`` refuses that shape by name
+      (gw_output.py, the ``is_dynamic``-without-``ppm_model`` branch) and
+      the driver has never called it.
+    * ``screening_diagrams = w_bse`` — the stage helper has ALREADY
+      persisted, because the RPA W(0) it wrote is the input the ladder
+      facade reads back.  ``W_by_role["static"]`` at this point is the
+      LADDER W, and re-persisting would stamp it into ``W0_qmunu``, where
+      every downstream consumer (BSE, downfold, a later restart) reads
+      that dataset as the RPA static screened Coulomb.  Silently writing a
+      different operator under an established dataset's name is the
+      provenance failure class (QUALITY_PATTERNS #10), so the answer is
+      "already done", not "do it again".
+
+    Lives here rather than in ``gw_jax`` so the driver keeps one call and
+    no mode/diagram arithmetic, and so the two reasons sit next to the
+    fork that creates the second one.
+    """
+    if mode is ComputeMode.MPA:
+        return False
+    diagrams = coerce_screening_diagrams(
+        getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    return diagrams is not ScreeningDiagrams.W_BSE
 
 
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
@@ -837,4 +922,5 @@ __all__ = [
     "compute_static_w",
     "compute_screening",
     "compute_screening_model",
+    "driver_persists_w0",
 ]

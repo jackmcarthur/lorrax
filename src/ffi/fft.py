@@ -1,5 +1,6 @@
-"""Flat-k batched 3-D FFT — the ``LORRAX_FFT_FFI`` / ``LORRAX_FFT_FFI_FUSED``
-service.
+"""Batched 3-D FFT and the FUSED-CONV FAMILY — the ``LORRAX_FFT_FFI`` /
+``LORRAX_FFT_FFI_FUSED`` / ``LORRAX_CONV_KMINOR_FFI`` /
+``LORRAX_CONV_KLEAD_FFI`` services.
 
 The Python half of the flat-k FFT handlers.  ONE set of ``ffi_call`` sites
 serves BOTH platforms, because the two libraries deliberately register the
@@ -68,6 +69,53 @@ single implementation.  ``common/fft_helpers.py`` delegated — it imports
 the gate and both wrapper bodies from here (``fft_helpers.py:304``) and
 carries no copy of its own.  The equivalence pin ``wk_REL/gatecheck.py``
 (cells A2/E/E2) now guards the re-export seam rather than a second copy.
+
+================================================================================
+THE FUSED-CONV FAMILY — one contract, three resident-layout engines
+================================================================================
+Beyond the plain transform, this module owns a FAMILY of fused convolution
+entries.  Every member computes the same thing::
+
+    U = scale · FFT_k( IFFT_k(X) · K )
+
+— one custom call for both transforms, the broadcast multiply against a
+STORED kernel ``K``, and every norm factor folded into ONE constant, so the
+R-space intermediate never materialises and the platform's missing-'ortho'
+scale passes are never emitted.  What distinguishes the members is nothing
+about the mathematics: it is **where the caller's tile already keeps its k
+axis**, because that decides which memory layout the one kernel must read.
+
+    member      k axis in X   handler target              platforms  factory
+    ----------  ------------  --------------------------  ---------  --------
+    k-strided   LEADING       lorrax_mklfft_gw_conv       cpu, CUDA  make_gw_conv_ffi
+    k-leading   LEADING*      lorrax_cufft_conv_klead     CUDA       make_conv_klead_ffi
+    k-minor     MINOR-most    lorrax_cufft_conv_kminor    CUDA       make_conv_kminor_ffi
+
+THE CHOICE IS THE CALLER'S RESIDENT LAYOUT, AND IT IS MEASURED, NOT A TASTE.
+``LEADING*`` is the conditional Sigma exception: its native-copy prototype
+measured 22.0% below the certified k-minor per-byte rate under BFC, crossing
+the owner's 20% fallback trigger.  The shipped half-absorbed form therefore
+pays exactly one input pack to k-minor and emits k-leading from the store; it
+does not expose that packed layout to the caller.
+The k-strided member reads a k-major tile through cuFFT's advanced data
+layout (``cufftPlanMany64`` istride=T, idist=1), which is exactly right for
+the Σ τ kernel: its ``dot`` layout is k-major, so the handler REMOVES a
+transpose that would otherwise be paid on both sides of every transform.
+Handed a tile that is already k-minor it is the wrong engine, and by a
+growing margin — the strided plan's cost scales with the batch stride, and
+for a caller whose stride is a full μ·ν tile that is measured at 1.61× the
+XLA chain at nk=64 and 4.00× at nk=216 (2026-08-16,
+``reports/screening_diagrams_wbse/evidence/opt_fftffi/``).  The k-minor
+member exists for that caller: it reads the contiguous k-minor tile where it
+lies, with a DIRECT per-axis DFT — no radix, no plan, and therefore no batch
+stride to degrade — and it can emit a chosen output PERMUTATION from the store
+so a downstream consumer's layout costs nothing extra.
+
+So: pick the member whose k position matches the tile you already hold.  A
+caller does not independently transpose to reach another member.  The one
+exception is the measured, owned half-absorbed policy inside the Sigma factory
+above: one input pack, with the inverse permutation absorbed by the store.
+New members belong here, beside these two, under the same contract.
 """
 
 from __future__ import annotations
@@ -111,10 +159,32 @@ __all__ = [
     "fused_fft_ffi_enabled", "fused_fft_ffi_mode",
     "require_fft_ffi", "make_flat_k_fft_ffi", "make_gw_conv_ffi",
     "ffi_fft_scale", "validate_flat_spec",
+    # the fused-conv family's k-MINOR member (see the module docstring)
+    "CONV_KMINOR_TARGET", "CONV_KMINOR_GATE",
+    "conv_kminor_mode", "conv_kminor_enabled", "require_conv_kminor",
+    "conv_kminor_available", "conv_kminor_scale", "make_conv_kminor_ffi",
+    "conv_kminor_plan", "conv_kminor_row_fits",
+    "conv_kminor_out_shape", "conv_kminor_out_spec",
+    # Sigma's direct k-leading fused-conv accelerator.
+    "CONV_KLEAD_TARGET", "CONV_KLEAD_GATE",
+    "conv_klead_mode", "conv_klead_enabled", "require_conv_klead",
+    "conv_klead_available", "conv_klead_plan", "conv_klead_row_fits",
+    "conv_klead_scale", "make_conv_klead_ffi",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
+#: The fused-conv family's k-STRIDED member.  ONE target string for both
+#: platforms (the host and CUDA libraries register it under different C++
+#: symbols) — the name is historical, coined by the CPU prototype.
 GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
+#: The fused-conv family's k-MINOR member.  CUDA-ONLY, and named for the
+#: vendor leg that carries it rather than borrowing the ``mklfft`` prefix:
+#: there is no host twin, so a shared string would promise a cpu handler that
+#: does not exist and a cpu mesh would resolve to nothing instead of refusing.
+CONV_KMINOR_TARGET = "lorrax_cufft_conv_kminor"
+#: Sigma's CUDA-only DIRECT k-leading member.  Unlike GW_CONV_TARGET this is
+#: one SMEM-resident traversal rather than a cuFFT advanced-layout plan.
+CONV_KLEAD_TARGET = "lorrax_cufft_conv_klead"
 
 #: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
 #: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
@@ -359,6 +429,9 @@ def make_flat_k_fft_ffi(
     return _flat_k_fft_ffi
 
 
+# ===========================================================================
+# THE FUSED-CONV FAMILY, member 1 of 3: plan-based k-STRIDED
+# ===========================================================================
 def make_gw_conv_ffi(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
@@ -368,8 +441,13 @@ def make_gw_conv_ffi(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution — the second FFI entry point (the FFTW3 ABI
-    on cpu, cuFFT + fused multiply kernel on CUDA).
+    """FUSED flat-k convolution, **k-LEADING** — the family's k-strided member
+    (the FFTW3 ABI on cpu, cuFFT + fused multiply kernel on CUDA).
+
+    Its sibling is :func:`make_conv_kminor_ffi`, which computes the same
+    expression for a caller whose tile keeps k MINOR-most; see the module
+    docstring's family table for which one a given caller wants and why the
+    choice is a measurement rather than a preference.
 
     Returns ``fn(G_flat, W_flat) -> sigma_flat`` computing, value-identically
     to the decomposed helper sequence (~1e-15 rel; gated, not bit-exact)::
@@ -431,3 +509,617 @@ def make_gw_conv_ffi(
         return _sm(G_flat, W_flat)
 
     return _gw_conv
+
+
+# ===========================================================================
+# THE FUSED-CONV FAMILY, member 2 of 3: direct k-LEADING (Sigma)
+# ===========================================================================
+# This member keeps the same (nk,a,mx,b,my)/(nk,mx,my) ABI as gw_conv but
+# replaces the nine cuFFT axis passes with one direct, SMEM-resident kernel.
+# Both public operands arrive k-leading.  The zero-transpose factory keeps T,
+# W and U k-leading end to end.  The handler assembles resident k
+# rows itself and emits U k-leading without an output pack.
+# It transforms W inside the call because Sigma has no solve-wide W_R cache.
+#
+# Default OFF: production continues to use GW_CONV_TARGET unless the caller's
+# integration seam explicitly resolves this accelerator.  `auto` is a safe
+# capability choice; `on` is the certification mode and never demotes.
+CONV_KLEAD_GATE = Gate(
+    env="LORRAX_CONV_KLEAD_FFI",
+    target=CONV_KLEAD_TARGET,
+    platforms=("CUDA",),
+    modes=("off", "auto", "on"),
+    default="off",
+    off_label="the certified plan-based k-leading gw_conv handler",
+    off_policy="fallback",
+    auto_capability=(
+        "the mesh is CUDA, the loaded device library exports "
+        "CufftConvKLeadCudaFfi; the per-call plan then checks runtime axes "
+        "and the conservative shared-memory floor"),
+    auto_on_msg=(
+        "[conv_klead] auto -> ON: Sigma's direct k-leading fused convolution "
+        "({target}) is available.  Each call still resolves its runtime "
+        "k-grid axes and conservative row-residency floor."),
+    auto_off_msg=(
+        "[conv_klead] auto -> OFF: Sigma keeps the certified plan-based "
+        "k-leading gw_conv handler.  Reason: {reason}"),
+    off_announce_msg=(
+        "[LORRAX_CONV_KLEAD_FFI] =0: Sigma's direct k-leading fused "
+        "convolution is disabled; production keeps lorrax_mklfft_gw_conv."),
+    label={"CUDA": "direct k-leading fused conv CUDA"},
+    resolved_msg={
+        "CUDA": (
+            "[conv_klead] Sigma k-leading IFFT(G)·IFFT(W)·FFT -> direct "
+            "CUDA FFI handler ({target}): one SMEM-resident traversal, "
+            "runtime twiddle-ring extents, zero global transposes, "
+            "k-leading store, c128 only."),
+    },
+    refuse_platform_msg=(
+        "LORRAX_CONV_KLEAD_FFI=on requires Sigma's direct k-leading CUDA "
+        "kernel, but this mesh is '{platform}'.  Use off/auto to retain "
+        "lorrax_mklfft_gw_conv, which serves both CPU and CUDA."),
+    refuse_probe_msg=(
+        "LORRAX_CONV_KLEAD_FFI=on requested {label}, but FFI target "
+        "'{target}' is unusable on platform '{platform}': {reason}  Rebuild "
+        "the CUDA leg (isolated compile target: build_conv_klead_cuda; "
+        "shared library: src/ffi/cpp/build.sh) and point LORRAX_FFI_SO at "
+        "the result, or select off/auto to retain lorrax_mklfft_gw_conv."),
+)
+
+_CONV_KLEAD_AUTO_SMEM_FLOOR = 49152
+_CONV_KLEAD_AXIS_MAX = 24
+
+
+def conv_klead_mode() -> str:
+    """``"off"`` | ``"auto"`` | ``"on"`` for the direct Sigma member."""
+    return CONV_KLEAD_GATE.mode()
+
+
+def conv_klead_enabled() -> bool:
+    """True unless the direct k-leading accelerator is explicitly off."""
+    return CONV_KLEAD_GATE.enabled()
+
+
+def conv_klead_row_fits(
+    kgrid, smem_bytes: int = _CONV_KLEAD_AUTO_SMEM_FLOOR,
+) -> bool:
+    """Whether one resident T/W row pair fits ``smem_bytes``.
+
+    Mirrors ``conv_klead_cuda_ffi.cc::plan_launch`` for the combined
+    allocation: the padded resident T row is also the coalesced-load staging
+    destination, beside one padded W row, three twiddle rings, and one aligned
+    int64 W-row offset.  The handler repeats the calculation against the
+    device's opt-in maximum; this mirror is the conservative ``auto``
+    serve/refuse decision only.
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    if min(nkx, nky, nkz) < 1:
+        return False
+    if max(nkx, nky, nkz) > _CONV_KLEAD_AXIS_MAX:
+        return False
+    nk = nkx * nky * nkz
+    return (16 * (2 * (nk | 1) + nkx + nky + nkz + 1)
+            <= int(smem_bytes))
+
+
+def require_conv_klead(mesh: Mesh) -> str:
+    """Announce or refuse the CUDA-only direct k-leading handler."""
+    return CONV_KLEAD_GATE.require(mesh, target=CONV_KLEAD_TARGET)
+
+
+def conv_klead_available(mesh: Mesh) -> tuple[bool, str]:
+    """Non-raising handler probe for auto routing and benchmark reports."""
+    try:
+        require_conv_klead(mesh)
+    except Exception as exc:  # noqa: BLE001 — reason is the result
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "CUDA"
+
+
+def conv_klead_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
+    """Resolve the off/auto/on capability policy for one runtime k-grid.
+
+    ``on`` requires the handler and lets its device-derived residency check
+    make the final decision.  ``auto`` is conservative: it selects the direct
+    member only inside the 48-KiB floor every supported CUDA device provides.
+    """
+    mode = CONV_KLEAD_GATE.mode()
+    kg = tuple(int(v) for v in kgrid)
+    axes_ok = len(kg) == 3 and min(kg) >= 1 and max(kg) <= _CONV_KLEAD_AXIS_MAX
+    if mode == "off":
+        return False, "LORRAX_CONV_KLEAD_FFI=off"
+    if mode == "on":
+        require_conv_klead(mesh)
+        if not axes_ok:
+            raise RuntimeError(
+                f"LORRAX_CONV_KLEAD_FFI=on requires each runtime k-grid axis "
+                f"in [1,{_CONV_KLEAD_AXIS_MAX}], got {kg}.  Use "
+                f"lorrax_mklfft_gw_conv (off/auto) for larger axes.")
+        return True, "on; device handler derives the residency ceiling"
+    ok, why = conv_klead_available(mesh)
+    if not ok:
+        return False, why
+    if not axes_ok:
+        return False, f"k-grid axes {kg} are outside [1,{_CONV_KLEAD_AXIS_MAX}]"
+    if not conv_klead_row_fits(kg):
+        return False, (
+            f"one resident T/W row pair for k-grid {kg} exceeds the "
+            f"{_CONV_KLEAD_AUTO_SMEM_FLOOR}-B auto floor")
+    return True, "auto"
+
+
+def conv_klead_scale(norm: str | None, nk: int, mult: float = 1.0) -> float:
+    """One folded scale for two inverse transforms and one forward transform."""
+    si = ffi_fft_scale("ifftn", norm, nk)
+    return si * si * ffi_fft_scale("fftn", norm, nk) * float(mult)
+
+
+def make_conv_klead_ffi(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None = "ortho",
+    mult: float = 1.0,
+) -> Callable:
+    """Direct fused convolution for Sigma's native **k-leading** layout.
+
+    Returns ``fn(T, W) -> U`` for public ``T/U (nk,a,mx,b,my)`` and
+    ``W (nk,mx,my)``.  T, W and U remain k-leading across the call.  The CUDA
+    handler executes both inverse transforms, the broadcast multiply, the
+    forward transform, and all norms, and its store emits U k-leading.  There
+    is no global transpose on either side.
+    """
+    require_conv_klead(mesh)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    g_flat = validate_flat_spec(g_spec, "T")
+    v_flat = validate_flat_spec(v_spec, "W")
+    attrs = dict(
+        nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
+        scale=np.float64(conv_klead_scale(norm, nk, mult)),
+    )
+
+    def _local(t_local, w_local):
+        if t_local.ndim != 5 or w_local.ndim != 3:
+            raise ValueError(
+                f"conv_klead expects local T (nk,a,mx,b,my) and W "
+                f"(nk,mx,my); got {t_local.shape} / {w_local.shape}.")
+        if (t_local.shape[0] != w_local.shape[0]
+                or t_local.shape[2] != w_local.shape[1]
+                or t_local.shape[4] != w_local.shape[2]):
+            raise ValueError(
+                f"conv_klead T/W shard shapes disagree: {t_local.shape} vs "
+                f"{w_local.shape}.")
+        out_t = jax.ShapeDtypeStruct(t_local.shape, t_local.dtype)
+        return jax.ffi.ffi_call(CONV_KLEAD_TARGET, out_t)(
+            t_local, w_local, **attrs)
+
+    from common.shard_map import shard_map
+    _sm = shard_map(
+        _local, mesh=mesh, in_specs=(g_flat, v_flat), out_specs=g_flat,
+        check_vma=False,
+    )
+
+    def _conv_klead(T, W):
+        if T.dtype != jnp.complex128 or W.dtype != jnp.complex128:
+            raise TypeError(
+                f"conv_klead is complex128 ONLY and never up-casts; got "
+                f"T={T.dtype}, W={W.dtype}.  Use lorrax_mklfft_gw_conv for "
+                f"another dtype.")
+        if T.ndim != 5 or W.ndim != 3:
+            raise ValueError(
+                f"conv_klead expects T rank 5 and W rank 3; got "
+                f"{T.shape} / {W.shape}.")
+        if int(T.shape[0]) != nk or int(W.shape[0]) != nk:
+            raise ValueError(
+                f"conv_klead leading extents {T.shape[0]}/{W.shape[0]} != "
+                f"nkx*nky*nkz = {nk}.")
+        return _sm(T, W)
+
+    return _conv_klead
+
+
+# ===========================================================================
+# THE FUSED-CONV FAMILY, member 3 of 3: k-MINOR
+# ===========================================================================
+# The k-strided member above reads a k-LEADING tile through cuFFT's advanced
+# data layout.  This one reads a k-MINOR tile — the layout a caller holds when
+# its k axis is already innermost — with a DIRECT per-axis DFT against a
+# runtime-built twiddle ring and no plan, so there is no batch stride to
+# degrade, and it can emit a chosen output PERMUTATION straight from the store.
+#
+# SIZE-AGNOSTIC: the transform length of each axis is a call ATTRIBUTE, not a
+# template parameter and not a compiled specialisation, so one code path serves
+# every (nkx,nky,nkz) — primes and mixed radices included.  The only bound is
+# RESIDENCY (the fused chain keeps the whole k-row live between its halves, so
+# a row must fit a block's shared memory); it is derived from the device at run
+# time and a k-grid over it is REFUSED BY NAME, quoting the device maximum and
+# naming the k-strided member as the alternative.  Handler:
+# ``src/ffi/cpp/cufft/conv_kminor_cuda_ffi.cc``.
+#
+# THE CONTRACT (generic; no caller is privileged):
+#     X : (d0, d1, d2, d3, d4, nk) c128, contiguous, nk MINOR-most, replicated
+#     K : (d1, d2, nk)             c128, ALREADY in R space, broadcast over
+#                                  d0/d3/d4
+#     U : out_layout=0 → shape(X), aliased to operand 0 (runs in place)
+#         out_layout=1 → (d0, nk, d3, d1, d4, d2), emitted by the STORE
+#
+# "an ifft·multiply·fft against a stored kernel over a designated axis" — the
+# five leading axes are free names.  A consumer with fewer than five folds its
+# free axes into d0/d3/d4; a consumer with a different downstream layout adds
+# an out_layout, it does not add a transpose.
+#
+# K IS NOT TRANSFORMED HERE, deliberately.  The stored kernel is the thing a
+# caller builds ONCE (the BSE's ``bse_feast.ensure_W_R`` caches
+# W_R = ifftn(W_q, norm='ortho') per solve; the tile is 22.9 MB at the gnppm
+# fixture) and reuses across every application.  Transforming it inside the
+# handler would repeat that transform on every call to save a call the caller
+# already made — the opposite trade from the k-strided member, whose Σ caller
+# has no such cache.  Same family, different amortisation; say which, do not
+# split the difference.
+
+#: The ``LORRAX_CONV_KMINOR_FFI`` dial — the family's k-minor member.
+#:
+#: **DEFAULT ``auto``** since the P>1 certification (2026-08-16).  Three modes,
+#: and the middle one is the point:
+#:
+#:   ``auto`` (default) — use the kernel when the mesh is CUDA, the loaded
+#:       device library exports the handler, AND the k-grid's row fits a
+#:       block's shared memory.  Otherwise fall through to the caller's XLA
+#:       chain, SILENTLY and CORRECTLY.  The silence is declared, not
+#:       accidental: the fallthrough is the CERTIFIED REFERENCE, not a
+#:       degraded twin, so there is nothing for a per-call warning to warn
+#:       about.  Exactly one line, in the startup report, says which arm the
+#:       run took.
+#:   ``on``  — require it; refuse by name (naming the ``.so`` and the rebuild)
+#:       if the platform or the handler cannot serve it.  For certification
+#:       runs that must not silently measure the other arm.
+#:   ``off`` — never; the XLA chain everywhere.
+#:
+#: WHY ``auto`` IS LEGITIMATE HERE and was deleted elsewhere: the dials it was
+#: removed from are REQUIRED layers, where auto demoted onto a duplicate
+#: compute path.  This dial's OFF state is the production implementation on
+#: every backend, so ``auto`` selects an ACCELERATOR when one is present
+#: rather than demoting when one is missing.  A CPU/ROCm/TPU mesh takes the
+#: XLA arm by construction — that is the "NVIDIA GPU backend only" safety, and
+#: it is a platform fact, not a runtime check that could go wrong.
+#:
+#: Read at FACTORY time, so the MODE (not a bool) is in ``ffi.ffi_dial_key``
+#: and the variable is in ``common.jax_compile_cache.RANK_FINGERPRINT_ENV``:
+#: it replaces four ops with one custom call, so two ranks disagreeing compile
+#: modules with different op sets.
+CONV_KMINOR_GATE = Gate(
+    env="LORRAX_CONV_KMINOR_FFI",
+    target=CONV_KMINOR_TARGET,
+    platforms=("CUDA",),
+    modes=("off", "auto", "on"),
+    default="auto",
+    off_label="the caller's XLA ifft/multiply/fft chain",
+    off_policy="fallback",
+    auto_capability=(
+        "the mesh is CUDA, the loaded device library exports "
+        "CufftConvKMinorCudaFfi, and the k-grid's row fits a block's shared "
+        "memory"),
+    auto_on_msg=(
+        "[conv_kminor] auto -> ON: the fused k-minor conv kernel ({target}) "
+        "serves this run's rung.  CUDA mesh, handler present.  Callers whose "
+        "k-grid is too large for one resident k-row still take the XLA chain "
+        "for that call, silently and correctly."),
+    auto_off_msg=(
+        "[conv_kminor] auto -> OFF: callers keep the XLA "
+        "ifft/multiply/fft chain, which is the certified path on every "
+        "backend.  Reason: {reason}"),
+    off_announce_msg=(
+        "[LORRAX_CONV_KMINOR_FFI] =0: the fused-conv family's k-minor member "
+        "is disabled by request; callers keep the XLA ifft/multiply/fft "
+        "chain.  The default is `auto`, which uses the kernel where it is "
+        "available and falls through where it is not."),
+    label={"CUDA": "k-minor fused conv CUDA"},
+    resolved_msg={
+        "CUDA": ("[conv_kminor] ifft·multiply·fft over the MINOR k axis -> "
+                 "fused CUDA FFI handler ({target}): one kernel, one read of "
+                 "the tile, one write, both norm factors folded into a "
+                 "single constant, and out_layout=1 emits the consumer's "
+                 "permuted layout from the store.  Direct per-axis DFT at "
+                 "the k-grid the call names — no radix specialisation, no "
+                 "plan, so no batch stride to degrade."),
+    },
+    refuse_platform_msg=(
+        "LORRAX_CONV_KMINOR_FFI=1 requires the fused-conv family's k-minor "
+        "member, which is CUDA-only, and this mesh's devices are "
+        "'{platform}'.  It is a CUDA kernel, not a library call, so there is "
+        "no host twin to demote to — unlike the k-strided member "
+        "(lorrax_mklfft_gw_conv), which both platforms serve.  Use the "
+        "default `auto` (it falls through to the XLA chain here), or unset "
+        "the dial."),
+    refuse_probe_msg=(
+        "LORRAX_CONV_KMINOR_FFI=1 requested the {label} backend, but FFI "
+        "target '{target}' is unusable on platform '{platform}': {reason}  "
+        "This handler is NEW (2026-08-16, "
+        "src/ffi/cpp/cufft/conv_kminor_cuda_ffi.cc): a device library built "
+        "before it exists loads fine and simply does not export "
+        "CufftConvKMinorCudaFfi.  Rebuild the CUDA leg "
+        "(src/ffi/cpp/build.sh) and point LORRAX_FFI_SO at the result, or "
+        "use the default `auto`, which falls through to the XLA chain."),
+)
+
+
+def conv_kminor_mode() -> str:
+    """``"on"`` | ``"off"`` — the raw ``LORRAX_CONV_KMINOR_FFI`` grammar."""
+    return CONV_KMINOR_GATE.mode()
+
+
+def conv_kminor_enabled() -> bool:
+    """True unless the dial is explicitly ``off``.
+
+    Tier 1 (lexical): env only, no backend init, legal in a kernel cache key.
+    It says nothing about whether the kernel will actually RUN — under ``auto``
+    that is a mesh-and-shape question, answered by :func:`conv_kminor_plan`."""
+    return CONV_KMINOR_GATE.enabled()
+
+
+#: The shared-memory a launch may assume WITHOUT the device opt-in.  The
+#: handler raises its own ceiling to the device maximum (queried, then
+#: ``cuFuncSetAttribute``), but Python cannot see that number without a device
+#: query of its own, and ``auto`` must not guess high: a guess that is too
+#: generous turns a silent fallthrough into a mid-run refusal.  So ``auto``
+#: uses the floor every CUDA device provides, and ``on`` lets the handler's own
+#: derived bound decide — which is the mode a caller picks precisely when it
+#: wants the real limit and a refusal if it is exceeded.
+_CONV_KMINOR_AUTO_SMEM_FLOOR = 49152
+
+
+def conv_kminor_row_fits(kgrid, smem_bytes: int = _CONV_KMINOR_AUTO_SMEM_FLOOR
+                         ) -> bool:
+    """Does ONE k-row of this grid fit ``smem_bytes`` of shared memory?
+
+    The residency bound, mirrored from the handler's ``plan_launch`` so the
+    Python side can answer it without a device round trip: the tile row is
+    padded to an ODD element stride, and the twiddle rings and the one-row
+    metadata slot share the block's allocation.
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    return 16 * ((nk | 1) + 1 + nkx + nky + nkz) <= int(smem_bytes)
+
+
+def conv_kminor_plan(mesh: Mesh, kgrid) -> tuple[bool, str]:
+    """``(use_kernel, reason)`` — THE routing decision, in one place.
+
+    This is what a consumer calls.  It folds the three-mode grammar, the
+    platform, the handler probe and the residency bound into one answer, so no
+    caller re-implements any part of the policy:
+
+    * ``off``  → ``(False, ...)``, always.
+    * ``on``   → ``require_conv_kminor`` (RAISES, naming the fix, if the
+      platform or the handler cannot serve it), then the residency bound,
+      which also raises rather than silently falling through: a caller that
+      said ``on`` asked not to be routed elsewhere without being told.
+    * ``auto`` → ``(True, ...)`` when CUDA + handler + the row fits;
+      ``(False, reason)`` otherwise, and the caller takes its own path.  No
+      exception, no per-call output — see the dial docstring for why the
+      silence is declared rather than sloppy.
+    """
+    mode = CONV_KMINOR_GATE.mode()
+    if mode == "off":
+        return False, "LORRAX_CONV_KMINOR_FFI=off"
+    fits = conv_kminor_row_fits(kgrid)
+    if mode == "on":
+        require_conv_kminor(mesh)          # raises with the fix named
+        if not fits:
+            nk = int(np.prod([int(v) for v in kgrid]))
+            raise RuntimeError(
+                f"LORRAX_CONV_KMINOR_FFI=on, but this call's k-grid "
+                f"{tuple(int(v) for v in kgrid)} (nk={nk}) needs more shared "
+                f"memory for ONE k-row than the {_CONV_KMINOR_AUTO_SMEM_FLOOR}"
+                f" B every CUDA device guarantees.  The handler may still "
+                f"serve it — it raises its ceiling to the DEVICE maximum and "
+                f"reports the real bound — so either drop to the default "
+                f"`auto` (which falls through to the XLA chain here) or call "
+                f"the handler directly and read its refusal, which quotes "
+                f"this device's own maximum.")
+        return True, "on"
+    ok, why = conv_kminor_available(mesh)
+    if not ok:
+        return False, why
+    if not fits:
+        return False, (
+            f"k-grid {tuple(int(v) for v in kgrid)} needs more than "
+            f"{_CONV_KMINOR_AUTO_SMEM_FLOOR} B of shared memory for one "
+            f"k-row")
+    return True, "auto"
+
+
+def require_conv_kminor(mesh: Mesh) -> str:
+    """Announce-or-REFUSE; returns the FFI platform key (``"CUDA"``).
+
+    Mode-independent, like every other ``Gate.require``: a caller that has
+    built this factory has already decided, so the only question here is
+    whether this mesh can serve the handler."""
+    return CONV_KMINOR_GATE.require(mesh, target=CONV_KMINOR_TARGET)
+
+
+def conv_kminor_available(mesh: Mesh) -> tuple[bool, str]:
+    """``(ok, reason)`` — the non-raising twin of :func:`require_conv_kminor`.
+
+    For callers that must CHOOSE and report: a bench that wants "handler
+    absent" as a row rather than a traceback, an opt-in hook that wants to
+    print why it stayed off.  Anything already committed to the fused path
+    calls :func:`require_conv_kminor` instead — silently selecting the other
+    arm is the demotion the gate doctrine forbids."""
+    try:
+        require_conv_kminor(mesh)
+    except Exception as exc:                       # noqa: BLE001 — reported
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "CUDA"
+
+
+def conv_kminor_scale(norm: str | None, nk: int, mult: float = 1.0) -> float:
+    """The ONE constant the handler applies: ``ifft norm · fft norm · mult``.
+
+    Folding both ``jnp.fft`` norm factors into a single multiply is what
+    deletes the pair of scale passes a cuFFT-backed chain emits (271 µs per
+    ladder matvec at the gnppm fixture).  Computed HERE, in Python, exactly as
+    :func:`ffi_fft_scale` is for the other members: the handlers implement no
+    norm convention of their own."""
+    return (ffi_fft_scale('ifftn', norm, nk)
+            * ffi_fft_scale('fftn', norm, nk)
+            * float(mult))
+
+
+def conv_kminor_out_shape(x_shape, out_layout: int) -> tuple[int, ...]:
+    """Output shape for an operand of shape ``x_shape`` at this ``out_layout``."""
+    d0, d1, d2, d3, d4, nk = (int(v) for v in x_shape)
+    if out_layout == 0:
+        return (d0, d1, d2, d3, d4, nk)
+    if out_layout == 1:
+        return (d0, nk, d3, d1, d4, d2)
+    raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+
+
+def conv_kminor_out_spec(x_spec: P, out_layout: int) -> P:
+    """The output ``PartitionSpec`` INDUCED by ``x_spec`` at this layout.
+
+    Derived, never passed: the permutation is a pure axis reorder, so each
+    logical axis carries its mesh axis with it, and a caller that supplied its
+    own spec could only supply one that disagreed."""
+    ax = tuple(x_spec)
+    if len(ax) != 6:
+        raise ValueError(
+            f"the k-minor conv contract is rank 6 (d0,d1,d2,d3,d4,nk); got "
+            f"spec {x_spec} of rank {len(ax)}.")
+    if out_layout == 0:
+        return P(*ax)
+    if out_layout == 1:
+        return P(ax[0], ax[5], ax[3], ax[1], ax[4], ax[2])
+    raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+
+
+def make_conv_kminor_ffi(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    x_spec: P,
+    k_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+    out_layout: int = 0,
+) -> Callable:
+    """FUSED convolution, **k-MINOR** — the family's k-minor member.
+
+    Returns ``fn(X, K) -> U`` computing, value-identically to the decomposed
+    chain up to reassociation (~1e-15 rel; gated, not bit-exact)::
+
+        U = scale · fftn_k( ifftn_k(X) · K[None, :, :, None, None, :] )
+
+    in ONE FFI call per rank, with ``scale = ifft-norm · fft-norm · mult``
+    applied once.
+
+    Parameters
+    ----------
+    x_spec, k_spec
+        Rank-6 ``PartitionSpec`` of ``X`` ``(d0,d1,d2,d3,d4,nk)`` with the k
+        axis REPLICATED, and rank-3 spec of ``K`` ``(d1,d2,nk)`` placing
+        ``d1``/``d2`` on the same mesh axes.  The handler multiplies
+        rank-local tiles and implements no reshard — the same contract every
+        member of this family carries.
+    kgrid
+        ``(nkx, nky, nkz)``, product equal to the minor extent.  The 3-D
+        structure exists only inside the kernel.
+    norm, mult
+        The two transforms' norm convention and any caller multiplier, folded
+        into one constant.  ``K`` is ALREADY in R space (see the section
+        header): ``norm`` describes what the HANDLER does, not how ``K`` was
+        built.
+    out_layout
+        ``0`` — ``shape(X)``, aliased to operand 0 so XLA may run it in place.
+        ``1`` — ``(d0, nk, d3, d1, d4, d2)`` emitted by the store, for a
+        consumer whose next op wants that layout; no alias (different shape).
+
+    FACTORY-time refusals: mesh platform, missing handler, malformed specs.
+    TRACE-time refusals: dtype, rank, extents — trace-time facts, and the
+    two-phase contract (``docs/dev/ffi_gate_contract.md`` §1.5) says a
+    resolver that claimed to check them earlier would be lying.
+    """
+    if out_layout not in (0, 1):
+        raise ValueError(
+            f"out_layout must be 0 (shape(X), aliasable in place) or 1 "
+            f"((d0,nk,d3,d1,d4,d2), the consumer permutation); got "
+            f"{out_layout!r}.")
+    require_conv_kminor(mesh)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    xax = tuple(x_spec)
+    if len(xax) != 6:
+        raise ValueError(
+            f"X spec must be rank 6 (d0,d1,d2,d3,d4,nk); got {x_spec}.")
+    if xax[5] is not None:
+        raise ValueError(
+            f"X spec {x_spec} shards the k axis.  The transform is "
+            f"device-local: the minor k axis must be REPLICATED (None) — the "
+            f"same contract as validate_flat_spec enforces for the k-strided "
+            f"member and the XLA helpers.")
+    kax = tuple(k_spec)
+    if len(kax) != 3 or kax[2] is not None:
+        raise ValueError(
+            f"K spec must be rank 3 (d1,d2,nk) with k replicated; got "
+            f"{k_spec}.")
+    if (kax[0], kax[1]) != (xax[1], xax[2]):
+        raise ValueError(
+            f"K spec {k_spec} places (d1,d2) on {(kax[0], kax[1])} but X spec "
+            f"{x_spec} places them on {(xax[1], xax[2])}.  The handler "
+            f"multiplies rank-local tiles and implements no reshard; make the "
+            f"two agree at the call site.")
+    o_spec = conv_kminor_out_spec(x_spec, out_layout)
+
+    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
+                 scale=np.float64(conv_kminor_scale(norm, nk, mult)),
+                 out_layout=np.int64(out_layout))
+
+    def _local(x_local, k_local):
+        if x_local.ndim != 6 or k_local.ndim != 3:
+            raise ValueError(
+                f"conv_kminor expects local X (d0,d1,d2,d3,d4,nk) and K "
+                f"(d1,d2,nk); got {x_local.shape} / {k_local.shape}.")
+        if (x_local.shape[1] != k_local.shape[0]
+                or x_local.shape[2] != k_local.shape[1]
+                or x_local.shape[5] != k_local.shape[2]):
+            raise ValueError(
+                f"conv_kminor X/K shard shapes disagree: {x_local.shape} vs "
+                f"{k_local.shape} (need X[1]==K[0], X[2]==K[1], X[5]==K[2]).")
+        out_t = jax.ShapeDtypeStruct(
+            conv_kminor_out_shape(x_local.shape, out_layout), x_local.dtype)
+        # The alias is legal ONLY at out_layout=0, where the result has the
+        # operand's shape.  At out_layout=1 the store is a permutation and the
+        # buffers genuinely differ; claiming an alias there would be a lie XLA
+        # would decline anyway.
+        kw = {"input_output_aliases": {0: 0}} if out_layout == 0 else {}
+        return jax.ffi.ffi_call(CONV_KMINOR_TARGET, out_t, **kw)(
+            x_local, k_local, **attrs)
+
+    from common.shard_map import shard_map     # see the import-cycle note
+    _sm = shard_map(_local, mesh=mesh,
+                    in_specs=(x_spec, k_spec), out_specs=o_spec,
+                    check_vma=False)
+
+    def _conv_kminor(X, K):
+        if X.dtype != jnp.complex128 or K.dtype != jnp.complex128:
+            raise TypeError(
+                f"conv_kminor is complex128 ONLY and does not up-cast; got "
+                f"X={X.dtype}, K={K.dtype}.  A c64 caller (the fp32-GMRES "
+                f"ladder arm casts its payload in "
+                f"bse_feast._build_gmres_data_fp32) must refuse here rather "
+                f"than silently change the arithmetic it is measuring.")
+        if X.ndim != 6 or K.ndim != 3:
+            raise ValueError(
+                f"conv_kminor expects X rank 6 and K rank 3; got {X.shape} / "
+                f"{K.shape}.")
+        if int(X.shape[5]) != nk or int(K.shape[2]) != nk:
+            raise ValueError(
+                f"conv_kminor minor extents {X.shape[5]}/{K.shape[2]} != "
+                f"nkx*nky*nkz = {nk}.")
+        return _sm(X, K)
+
+    return _conv_kminor

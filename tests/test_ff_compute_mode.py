@@ -31,6 +31,7 @@ import pytest
 
 from gw.gw_config import (
     MODE_SIGMA_CHANNELS,
+    ScreeningDiagrams,
     UNIMPLEMENTED_MODES,
     ComputeMode,
     SigmaChannel,
@@ -43,6 +44,17 @@ from gw.gw_config import (
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _GW = _REPO / "src" / "gw"
+
+#: A minimal stand-in config for the axis-only predicates below.  Carries
+#: the DEFAULT screening_diagrams, because these cells are about the mode
+#: axis and a run that never mentions the other one must answer as it
+#: always did.
+class _RpaConfig:
+    class screening:
+        diagrams = ScreeningDiagrams.W_RPA
+
+
+_RPA_CONFIG = _RpaConfig()
 
 #: The four modes whose Σ stage exists today.  Every "nothing moved"
 #: assertion below runs over exactly this set, so the day a fifth joins
@@ -169,16 +181,42 @@ def test_the_driver_refuses_at_entry_before_it_spends_anything():
     assert guard < source.index("isdf = prepare_isdf_and_wavefunctions(")
 
 
-def test_the_driver_imports_the_mode_axis_it_dispatches_on():
-    """The post-screening MPA branch must not depend on an unbound name."""
+def test_the_driver_imports_whatever_it_dispatches_the_w0_persist_on():
+    """The post-screening W0 persist must not depend on an unbound name.
+
+    REWRITTEN 2026-08-15, not deleted.  The claim is unchanged — the
+    driver's persist decision must be a name the driver actually has — but
+    the decision MOVED.  It used to be spelled ``mode is not
+    ComputeMode.MPA`` in ``gw_jax`` itself; the ``screening_diagrams =
+    w_bse`` branch gave it a SECOND reason to be False (the stage helper
+    has already persisted, and ``W_by_role["static"]`` is by then the
+    ladder W, so re-persisting would stamp the wrong operator into
+    ``W0_qmunu``).  Two reasons meant either two conditions in a driver
+    that is supposed to read as physics, or one predicate that owns both.
+    It is one predicate, ``gw.screening.driver_persists_w0``, and this cell
+    follows it: the driver imports it, and the ``ComputeMode.MPA`` half of
+    the decision is still named — just where the decision now lives.
+    """
     tree = ast.parse((_GW / "gw_jax.py").read_text())
     imported = {
-        alias.asname or alias.name
+        (node.module, alias.asname or alias.name)
         for node in tree.body if isinstance(node, ast.ImportFrom)
-        and node.module == "gw_config"
         for alias in node.names
     }
-    assert "ComputeMode" in imported
+    assert ("screening", "driver_persists_w0") in imported, (
+        "gw_jax dispatches its W0 persist on driver_persists_w0 and must "
+        "import it")
+
+    from gw.screening import driver_persists_w0
+    body = ast.unparse(next(
+        n for n in ast.walk(ast.parse((_GW / "screening.py").read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "driver_persists_w0"))
+    assert "ComputeMode.MPA" in body, (
+        "the MPA half of the persist decision is gone; if MPA's head "
+        "persistence landed, rewrite this cell to pin THAT")
+    assert driver_persists_w0(ComputeMode.MPA, _RPA_CONFIG) is False
+    for mode in (ComputeMode.COHSEX, ComputeMode.GN_PPM, ComputeMode.HL_PPM):
+        assert driver_persists_w0(mode, _RPA_CONFIG) is True
 
 
 # ---------------------------------------------------------------------------

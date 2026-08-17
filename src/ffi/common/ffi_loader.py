@@ -108,6 +108,18 @@ _CUDA_TARGET_SYMBOLS = {
     # exactly the phdf5 same-target/different-symbol split.
     "lorrax_mklfft_flat_k":         "CufftFlatKCudaFfi",
     "lorrax_mklfft_gw_conv":        "CufftGwConvCudaFfi",
+    # k-MINOR fused conv (cpp/cufft/conv_kminor_cuda_ffi.cc) — ifft·multiply·
+    # fft over a MINOR-most k axis, one kernel, no layout change on the
+    # caller's side.  CUDA-ONLY BY CONSTRUCTION and named accordingly: unlike
+    # the two rows above there is no host twin, so borrowing the "mklfft"
+    # target string would promise a cpu handler that does not exist.  A cpu
+    # mesh must refuse here, not resolve to nothing (ffi.fft.CONV_KMINOR_GATE).
+    "lorrax_cufft_conv_kminor":     "CufftConvKMinorCudaFfi",
+    # Sigma's direct family member: same public k-leading T/W/U contract as
+    # gw_conv.  Its conditionally selected half-absorbed handler receives the
+    # factory's one k-minor T pack and emits U k-leading from its store.
+    # CUDA-only; the plan-based gw_conv remains the CPU/fallback member.
+    "lorrax_cufft_conv_klead":      "CufftConvKLeadCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",

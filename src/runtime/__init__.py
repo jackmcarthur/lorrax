@@ -1564,11 +1564,20 @@ def _enforce_required_ffi(mesh) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import FUSED_GATE, GATE as _FFT_GATE
+    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, FUSED_GATE,
+                         GATE as _FFT_GATE)
     from ffi.gemm import GATE as _GEMM_GATE
 
     for gate in (_FFT_GATE, FUSED_GATE, _GEMM_GATE):
         gate.enforce(mesh)
+    # The CONV_K* dials are ACCELERATOR gates, so enforce() reports their
+    # platform/handler capability at startup while each caller resolves the
+    # runtime shape through its plan helper.  `auto` never raises; `on`
+    # refuses missing platform/handler capability by name; `off` announces
+    # the explicit opt-out.  The k-leading member defaults off and has no
+    # production consumer until its separately-reviewed Sigma seam lands.
+    CONV_KMINOR_GATE.enforce(mesh)
+    CONV_KLEAD_GATE.enforce(mesh)
 
 
 def _ffi_dial_facts() -> list:
@@ -1586,7 +1595,8 @@ def _ffi_dial_facts() -> list:
     out = []
     try:
         from ffi.gemm import GATE as _GEMM_GATE
-        from ffi.fft import GATE as _FFT_GATE, FUSED_GATE
+        from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
+                             GATE as _FFT_GATE, FUSED_GATE)
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
@@ -1594,7 +1604,13 @@ def _ffi_dial_facts() -> list:
     for gate, what in ((_GEMM_GATE, "the contract_bands right-GEMM "
                                     "contraction"),
                        (_FFT_GATE, "the flat-k 3-D FFT helper path"),
-                       (FUSED_GATE, "the fused IFFT-multiply-FFT tau kernel")):
+                       (FUSED_GATE, "the fused IFFT-multiply-FFT tau kernel"),
+                       (CONV_KMINOR_GATE,
+                        "the fused k-MINOR ifft-multiply-fft conv (the BSE "
+                        "ladder-W rung; accelerator)"),
+                       (CONV_KLEAD_GATE,
+                        "the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT "
+                        "conv (Sigma; accelerator, default off)")):
         try:
             mode = gate.mode()
             enabled = gate.enabled()
@@ -1607,6 +1623,9 @@ def _ffi_dial_facts() -> list:
                     "platforms": tuple(gate.platforms), "detail": detail,
                     "off_label": gate.off_label,
                     "off_policy": gate.off_policy,
+                    # Declared capability test, for the `auto` sentence above.
+                    # Empty for every gate that does not offer the mode.
+                    "auto_capability": getattr(gate, "auto_capability", ""),
                     # Captured HERE, not re-read in the formatter: the
                     # formatter is pure, and a report that re-read os.environ
                     # could print a value the gate never saw.
@@ -1987,12 +2006,32 @@ def format_startup_report(f: dict) -> list:
                      f"enforcement skips it by the gate's declared platform "
                      f"policy (the native lowering IS the required path "
                      f"there)")
+        elif d["mode"] == "auto":
+            # An OPT-IN ACCELERATOR, not a required layer: `auto` uses the
+            # handler where the capability is present and takes the caller's
+            # own certified path where it is not.  The startup block is the
+            # ONE place that says which happened, so it must not borrow the
+            # required-layer sentence, which would claim a route this run may
+            # not have taken.
+            route = (f"is routed through the FFI handler WHERE AVAILABLE and "
+                     f"through {d.get('off_label', 'the native path')} "
+                     f"otherwise (capability: {d.get('auto_capability', '')})")
         elif d["enabled"]:
             route = "is routed through the FFI handler (the required layer)"
         elif d.get("off_policy") == "refuse":
             route = ("has NOTHING to run — the native duplicate was "
                      "deleted (decisions.md 2026-08-01) and startup "
                      "enforcement refuses this setting")
+        elif d.get("default") == "off":
+            # An OPT-IN dial, where `off` is the CERTIFIED state.  The
+            # sentence below assumes the required-layer shape (dial defaults
+            # ON, so `off` means somebody opted out of the certified path)
+            # and would be exactly backwards here: it would call the
+            # production path uncertified and imply the run had asked for
+            # something.  Keyed on the DEFAULT, not on a name, so the next
+            # opt-in dial gets the right sentence for free.
+            route = (f"keeps {d.get('off_label', 'the default path')} — "
+                     f"this dial is OPT-IN and off is its certified state")
         else:
             route = (f"runs the retained opt-out path "
                      f"({d.get('off_label', 'native lowering')}), which is "

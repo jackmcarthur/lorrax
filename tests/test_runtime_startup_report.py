@@ -113,6 +113,26 @@ def _facts(**over):
              "off_policy": "fallback",
              "off_label": "decomposed three-FFT chain (still FFI-served)",
              "detail": "the fused IFFT-multiply-FFT tau kernel"},
+            # The one OPT-IN dial: default OFF, where `off` is the CERTIFIED
+            # state.  It is in this baseline so the roster cell below has
+            # something to find, and so the formatter's default=="off" branch
+            # is exercised by every rendering test rather than only by its own.
+            {"env": "LORRAX_CONV_KMINOR_FFI", "mode": "auto",
+             "enabled": True, "default": "auto",
+             "target": "lorrax_cufft_conv_kminor",
+             "platforms": ("CUDA",), "raw": None,
+             "off_policy": "fallback",
+             "off_label": "the caller's XLA ifft/multiply/fft chain",
+             "auto_capability": "CUDA mesh, handler present, row resident",
+             "detail": "the fused k-MINOR ifft-multiply-fft conv"},
+            {"env": "LORRAX_CONV_KLEAD_FFI", "mode": "off",
+             "enabled": False, "default": "off",
+             "target": "lorrax_cufft_conv_klead",
+             "platforms": ("CUDA",), "raw": None,
+             "off_policy": "fallback",
+             "off_label": "the certified plan-based k-leading gw_conv handler",
+             "auto_capability": "CUDA mesh, handler present, row resident",
+             "detail": "the direct fused k-LEADING Sigma conv"},
         ],
         "linalg": {"eigh": ["native", "scalapack"], "cholesky": ["native"],
                    "solve_lu": ["native", "scalapack"]},

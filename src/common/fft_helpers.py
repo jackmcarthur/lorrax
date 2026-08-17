@@ -388,6 +388,32 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 )
 
 
+# ============================================================================
+# THE FUSED-CONV FAMILY at the factory seam
+# ============================================================================
+# Three entries, ONE contract:
+#
+#     U = scale · FFT_k( IFFT_k(X) · K )
+#
+# — both transforms, the broadcast multiply against a STORED kernel, and every
+# norm factor as a single constant, in ONE FFI call per rank, so the R-space
+# intermediate never materialises.  The members differ ONLY in where the
+# caller's tile already keeps its k axis, because that is what decides which
+# memory layout the one kernel has to read:
+#
+#     make_flat_k_gw_conv     k LEADING     lorrax_mklfft_gw_conv     cpu+CUDA
+#     make_fused_conv_klead   k LEADING     lorrax_cufft_conv_klead  CUDA
+#     make_fused_conv_kminor  k MINOR-most  lorrax_cufft_conv_kminor  CUDA
+#
+# Pick by resident layout; callers do not independently transpose to reach a
+# different member.  The measured Sigma factory is the one owned exception:
+# its conditional half-absorbed form packs once internally and emits the
+# inverse permutation from the store.  The family contract, measurements and
+# the reason k-minor takes its kernel already in R space live in ONE place —
+# ``ffi/fft.py``'s module docstring.  This block is the seam, not a second copy.
+# ============================================================================
+
+
 def make_flat_k_gw_conv(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
@@ -397,17 +423,75 @@ def make_flat_k_gw_conv(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution ``fn(G_flat, W_flat) -> sigma_flat``:
+    """Fused conv, **k-LEADING** ``fn(G_flat, W_flat) -> sigma_flat``:
 
         sigma = fftn( ifftn(G) * ifftn(W)[:, None, :, None, :] * mult )
 
     with all three transforms + the broadcast multiply in ONE FFI call per
     rank, so the R-space G tile never materializes.  Sigma-family layout
     contract only; the plain helpers remain the entry point for everything
-    else.  Implementation: :func:`ffi.mklfft.make_gw_conv_ffi`.
+    else.  Sibling: :func:`make_fused_conv_kminor`, same expression for a
+    caller whose k axis is already minor-most.  Implementation:
+    :func:`ffi.fft.make_gw_conv_ffi`.
     """
     return _make_gw_conv_ffi(mesh, kgrid, g_spec, v_spec,
                              norm=norm, mult=mult)
+
+
+def make_fused_conv_kminor(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    x_spec: P,
+    k_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+    out_layout: int = 0,
+) -> Callable:
+    """Fused conv, **k-MINOR** ``fn(X, K) -> U``:
+
+        U = scale · fftn_k( ifftn_k(X) · K[None, :, :, None, None, :] )
+
+    ``X`` ``(d0,d1,d2,d3,d4,nk)``, ``K`` ``(d1,d2,nk)`` ALREADY in R space
+    (this member multiplies its stored kernel, it does not transform it — the
+    caller builds that once and reuses it; see ``ffi/fft.py``).  ONE FFI call:
+    both transforms, the broadcast multiply, both norm factors as a single
+    constant, and — at ``out_layout=1`` — a consumer's
+    ``(d0,nk,d3,d1,d4,d2)`` permutation emitted from the STORE, so a
+    downstream layout costs nothing extra.
+
+    CUDA only, and **default OFF** (``LORRAX_CONV_KMINOR_FFI``): a new
+    hand-written kernel, exercised at P=1 only.  Sibling:
+    :func:`make_flat_k_gw_conv`.  Implementation:
+    :func:`ffi.fft.make_conv_kminor_ffi`.
+    """
+    from ffi.fft import make_conv_kminor_ffi as _impl
+    return _impl(mesh, kgrid, x_spec, k_spec,
+                 norm=norm, mult=mult, out_layout=out_layout)
+
+
+def make_fused_conv_klead(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    g_spec: P,
+    v_spec: P,
+    *,
+    norm: str | None = 'ortho',
+    mult: float = 1.0,
+) -> Callable:
+    """Direct fused conv in Sigma's native **k-LEADING** layout.
+
+    Same public shapes as :func:`make_flat_k_gw_conv`.  The CUDA-only handler
+    keeps the public T/W/U arrays k-leading, coalesces the mu-nu-major global
+    loads into a bounded shared-memory transpose/residency bank, assembles T
+    and W row pairs, performs the two inverse transforms, multiply, and forward
+    transform in one traversal, and emits the result in Sigma's native
+    k-leading layout from its coalesced store.
+    It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
+    plan-based member as the off/unsupported path.
+    """
+    from ffi.fft import make_conv_klead_ffi as _impl
+    return _impl(mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
 
 
 

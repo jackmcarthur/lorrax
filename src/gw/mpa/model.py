@@ -125,7 +125,7 @@ def _fit_head_samples(
 def _solve_wc(
     sample_path,
     V,
-    n_z,
+    z,
     q_idx,
     meta,
     mesh_xy,
@@ -136,16 +136,40 @@ def _solve_wc(
     sym=None,
     wfn=None,
     config=None,
-    z_samples=None,
     print_fn=print,
     distrib_la_batched_route: str = "auto",
 ):
+    """THE DEFAULT ``wc_source``: Wc(z) = W(z) - V from the sampled chi.
+
+    Signature IS the seam (see :func:`build_mpa_fit`'s ``wc_source``): the
+    sample store, the wedge V, the z-list, the wedge q index and the mesh.
+    ``z`` is carried rather than a bare count because a source that does
+    not solve a Dyson equation — the ``screening_diagrams = w_bse`` ladder
+    — needs the frequencies themselves, and passing a length would have
+    made it derive them from a second copy of the sample plan.
+    The keyword-only state belongs to the expanded metallic/QSGW path:
+    it resolves the dynamic head from these same W samples and preserves
+    the one-occupation-state-per-iteration contract.  A ladder source is
+    reachable only for a single-shot insulator, so it implements the common
+    positional seam and never silently consumes this RPA-only head state.
+    """
     from gw.qsgw_head import (
         IterationHeadSamples,
         finalize_iteration_head_sample,
     )
     from gw.w_isdf import solve_w
 
+    raw_z = np.asarray(z)
+    if raw_z.ndim == 0 and np.issubdtype(raw_z.dtype, np.integer):
+        # Backward-compatible direct-call shape used by the disk-pipeline
+        # unit: RPA Wc itself needs only the count.  Production passes the
+        # stamped complex grid because the ladder source and the metallic
+        # finite-q0 head both need the actual abscissae.
+        n_z = int(raw_z)
+        z_values = None
+    else:
+        z_values = np.asarray(z, dtype=np.complex128).reshape(-1)
+        n_z = int(z_values.size)
     bgw_q0 = None
     bgw_vhead = None
     bgw_epsinv = []
@@ -166,6 +190,10 @@ def _solve_wc(
             f"v_head={bgw_vhead.real:.12e} raw, "
             f"{bgw_vhead.real / (float(meta.nk_tot) * float(meta.cell_volume)):.12e} "
             "after 1/(Nk*Omega).")
+        if head_response is None and z_values is None:
+            raise ValueError(
+                "MPA bgw_q0shift requires the stamped complex z grid, not "
+                "only its length")
 
     if head_response is not None and len(head_response.omegas) < int(n_z):
         raise ValueError("MPA head response does not cover the body sample grid")
@@ -212,7 +240,7 @@ def _solve_wc(
             omega = (
                 complex(head_response.omegas[index])
                 if head_response is not None
-                else complex(np.asarray(z_samples)[index]))
+                else complex(z_values[index]))
             head_samples.append(
                 bgw_q0shift_head_sample(bgw_vhead, eps_value, omega))
             print_fn(
@@ -268,10 +296,11 @@ def _solve_wc(
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
-              occupation_state=None):
+              provenance=None, occupation_state=None):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
-        tile_bytes=tile_bytes, occupation_state=occupation_state)
+        tile_bytes=tile_bytes, provenance=provenance,
+        occupation_state=occupation_state)
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -420,9 +449,21 @@ def build_mpa_fit(
     run_dir, label, *, wfns, V_q, quad, sym, centroid_indices, wfn=None,
     head_resolver, config, meta, mesh_xy, energy_reference=0.0,
     tile_bytes=None, plan=None, iteration_head_response=None,
-    occupation_state=None, head_channel=None, print_fn=print,
+    occupation_state=None, head_channel=None, wc_source=None, print_fn=print,
 ):
-    """Write body/head samples and fits; return path plus iteration head."""
+    """Write body/head samples and fits; return path plus iteration head.
+
+    ``wc_source`` is the ONE seam ``screening_diagrams`` moves.  ``None``
+    (the default) is :func:`_solve_wc` — Wc(z) from the Dyson solve of the
+    sampled chi, the RPA path, byte-for-byte what this function has always
+    done.  Under ``w_bse`` the caller passes
+    ``gw.screening_bse.make_ladder_wc_source(...)``, which writes the same
+    per-z, per-wedge-q ``Wc`` slabs into the same store from the ladder
+    resolvent instead.  Everything downstream of the seam — the sample
+    plan, the Pade fit, the SlabIO store lifecycle, the head fit and the
+    Sigma consumer — is the same code on both branches; the ONLY
+    difference the store records is the provenance stamp below.
+    """
     # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
     # discharged: occupation-weighted chi (fractional contour + finite-q
     # divided difference) and the weighted Sigma branches landed in Wave 1.
@@ -431,6 +472,11 @@ def build_mpa_fit(
     # refusal is now the only gate on the deck path: the driver-level
     # UNIMPLEMENTED_MODES row was deleted when the metal pipeline ran E2E.
     _require_metal_occupations(config, occupation_state)
+    if wc_source is not None and config.mpa.material_class != "insulator":
+        raise ValueError(
+            "GATE w_bse_insulators_only: an alternate ladder wc_source "
+            "requires mpa_material_class = insulator; keep the default "
+            "RPA source for a metal.")
     from common.collectives import barrier, process_rank
 
     root = os.path.abspath(os.fspath(run_dir))
@@ -465,6 +511,14 @@ def build_mpa_fit(
     sample_path, fit_path = iteration_artifact_paths(root, label)
     varpi = np.unique(z_all.imag)
     line = np.searchsorted(varpi, z_all.imag).astype(np.int32)
+    # PROVENANCE (QUALITY_PATTERNS #10).  RPA poles and ladder poles have
+    # identical shapes, identical certification and identical
+    # plausibility; only the stamp distinguishes them, and the Sigma
+    # consumer asserts it at load (mpa_store.validate_fit_store).
+    diagrams = str(getattr(
+        getattr(config.screening, "diagrams", "w_rpa"), "value",
+        getattr(config.screening, "diagrams", "w_rpa")))
+    provenance = {"screening_diagrams": diagrams}
     # The origin shift is stamped ONLY when the deck declared it: it enters
     # mpa_store's `extra` channel as the additive attr
     # ``mpa_prov_metal_origin_shift_ry``, outside _SAMPLING_ORDER and so
@@ -482,7 +536,7 @@ def build_mpa_fit(
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
         closure_verdict=closure_verdict,
         omega=z_all, omega_line=line, energy_unit="Ry",
-        sampling=sampling_record)
+        sampling=sampling_record, provenance=provenance)
     mpa_store.allocate_w_omega_collective(
         sample_path, _CHI, mode="w", **common)
     mpa_store.allocate_w_omega_collective(
@@ -517,22 +571,31 @@ def build_mpa_fit(
         gamma_row=gamma_row, kminq_rows=kminq_rows)
 
     V = _to_wedge(V_q, q_idx, mesh_xy)
-    iteration_head = _solve_wc(
-        sample_path, V, z_all.size, q_idx, meta, mesh_xy,
-        config.backend.w_dyson_solver,
-        head_response=iteration_head_response,
-        head_channel=head_channel,
-        sym=sym,
-        wfn=wfn,
-        config=config,
-        z_samples=z_all,
-        print_fn=print_fn,
-        distrib_la_batched_route=getattr(
-            config.backend, "distrib_la_batched_route", "auto"),
-    )
+    if wc_source is None:
+        iteration_head = _solve_wc(
+            sample_path, V, z_all, q_idx, meta, mesh_xy,
+            config.backend.w_dyson_solver,
+            head_response=iteration_head_response,
+            head_channel=head_channel,
+            sym=sym,
+            wfn=wfn,
+            config=config,
+            print_fn=print_fn,
+            distrib_la_batched_route=getattr(
+                config.backend, "distrib_la_batched_route", "auto"),
+        )
+    else:
+        if iteration_head_response is not None:
+            raise ValueError(
+                "GATE w_bse_self_consistency_unimplemented: a ladder "
+                "wc_source cannot consume per-iteration QSGW head state; "
+                "use screening_diagrams = w_rpa for self-consistency.")
+        iteration_head = wc_source(
+            sample_path, V, z_all, q_idx, meta, mesh_xy,
+            config.backend.w_dyson_solver)
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
-        occupation_state=occupation_state)
+        provenance=provenance, occupation_state=occupation_state)
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter

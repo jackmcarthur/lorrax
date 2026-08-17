@@ -265,6 +265,8 @@ def compute_sigma_c_mpa_omega_grid(
     crossing_max_nodes,
     omega_cluster_gap_ry=1.0,
     pole_batch_size=4,
+    fit_identity=None,
+    expected_screening_diagrams=None,
     occupation_state=None,
     band_plan=None,
     print_fn=print,
@@ -281,11 +283,9 @@ def compute_sigma_c_mpa_omega_grid(
     executor rereads and releases the same four-pole ranges.  No complete
     pole axis exists on host or device.
     """
-    # No expected_identity here: build_mpa_fit rebuilds the store every
-    # iteration, so a within-run identity would be read back from the file
-    # under test. A cross-run reuse path must call validate_fit_store with
-    # the live screening's hashes itself.
-    ledger = validate_fit_store(fit_src)
+    ledger = validate_fit_store(
+        fit_src, expected_identity=fit_identity,
+        expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     if band_plan is not None:
