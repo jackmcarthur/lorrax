@@ -214,8 +214,9 @@ def test_refuse_chain_path_refuses_the_ladder_and_names_the_reason():
     with pytest.raises(NotImplementedError) as exc:
         refuse_chain_path(True)
     msg = str(exc.value)
-    for token in ("A - B = D", "w_omega_chain", "make_ab_appliers"):
+    for token in ("A - B = D", "w_omega_chain", "SDY", "eta H", "full 2N"):
         assert token in msg, f"refusal text does not name {token!r}: {msg}"
+    assert "make_ab_appliers" not in msg
 
 
 def test_refuse_chain_path_permits_the_rpa_operator():
