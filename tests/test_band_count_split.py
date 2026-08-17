@@ -602,3 +602,51 @@ def test_narrowing_the_fit_below_a_band_sum_is_reported_per_consumer():
     assert text.count("EXTRAPOLATED") == 2, (
         "both consumers top out above 16, so both must be reported")
     assert "number_bands_chi" in text and "number_bands_sigma" in text
+
+
+# ---------------------------------------------------------------------------
+# (8) DOCUMENTATION — the key that ships with no row is how a no-op survives
+# ---------------------------------------------------------------------------
+
+def test_every_deck_key_has_a_row_in_the_input_reference():
+    """``docs/input_reference.md`` is the deck's documented surface, and
+    ``_DEFAULTS`` is its source of truth.  A key present in one and absent
+    from the other is how ``self_energy_eval_type`` shipped as a no-op nobody
+    noticed: nothing read it, nothing documented it, and nothing said so.
+
+    Measured when this test was written: the gap was already ZERO, so this
+    pins a property the tree HAS rather than announcing one it lacks — which
+    is the only kind of coverage assertion worth adding.  It costs nothing and
+    it fails on the next key added without a row, including the four this
+    feature introduces.
+
+    Deliberately NOT the converse (a row with no key): retired keys keep rows
+    on purpose, and ``_LEGACY_DECK_KEYS`` exists for exactly that.
+    """
+    import re
+    import pathlib
+    cfg = _gw_config()
+    doc = (pathlib.Path(_REPO) / "docs" / "input_reference.md").read_text()
+    rows = set(re.findall(r"^\|\s*`([^`]+)`\s*\|", doc, re.M))
+    missing = sorted(k for k in cfg._DEFAULTS if k not in rows)
+    assert not missing, (
+        f"{len(missing)} deck key(s) in _DEFAULTS with no row in "
+        f"docs/input_reference.md: {missing}")
+
+
+@pytest.mark.parametrize("key", [
+    "number_bands", "number_bands_chi", "number_bands_sigma", "nband"])
+def test_the_band_count_family_is_documented_as_a_family(key):
+    """Each of the four, and the three facts a reader needs that no single
+    row can be trusted to carry by accident: that the umbrella overrides
+    both, that disagreement refuses, and that the fit takes the max."""
+    import pathlib
+    doc = (pathlib.Path(_REPO) / "docs" / "input_reference.md").read_text()
+    assert f"| `{key}` |" in doc, f"`{key}` has no row"
+    row = next(l for l in doc.splitlines() if l.startswith(f"| `{key}` |"))
+    if key == "nband":
+        assert "alias" in row.lower(), "the alias must be documented as one"
+    if key in ("number_bands_chi", "number_bands_sigma"):
+        assert "refusal" in row.lower() or "refuses" in row.lower()
+    if key == "number_bands":
+        assert "BOTH" in row or "both" in row
