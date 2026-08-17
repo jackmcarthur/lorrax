@@ -585,10 +585,12 @@ def conv_klead_row_fits(
 ) -> bool:
     """Whether one resident T/W row pair fits ``smem_bytes``.
 
-    Mirrors ``conv_klead_cuda_ffi.cc::plan_launch`` for one row: two padded
-    c128 rows, three twiddle rings, and one int64 W-row offset.  The handler
-    repeats the same calculation against the device's opt-in maximum; this
-    Python mirror is the conservative ``auto`` decision only.
+    Mirrors ``conv_klead_cuda_ffi.cc::plan_launch`` for the combined
+    allocation: the padded resident T row is also the coalesced-load staging
+    destination, beside one padded W row, three twiddle rings, and one aligned
+    int64 W-row offset.  The handler repeats the calculation against the
+    device's opt-in maximum; this mirror is the conservative ``auto``
+    serve/refuse decision only.
     """
     nkx, nky, nkz = (int(v) for v in kgrid)
     if min(nkx, nky, nkz) < 1:
@@ -596,7 +598,7 @@ def conv_klead_row_fits(
     if max(nkx, nky, nkz) > _CONV_KLEAD_AXIS_MAX:
         return False
     nk = nkx * nky * nkz
-    return (16 * (2 * (nk | 1) + nkx + nky + nkz) + 8
+    return (16 * (2 * (nk | 1) + nkx + nky + nkz + 1)
             <= int(smem_bytes))
 
 

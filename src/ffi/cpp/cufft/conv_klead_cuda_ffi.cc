@@ -5,7 +5,11 @@
 // The public T/U seam stays in Sigma's native k-leading layout.  The Python
 // wrapper hands this handler T=(nk,a,mx,b,my) without a pack.  W remains
 // k-leading and is transformed inside the call; U is emitted k-leading
-// directly from the store.  Once resident, the direct
+// directly from the store.  Flattened threads read consecutive mu-nu elements
+// at fixed k from global memory and scatter them into the odd-stride resident
+// T bank, transposing inside shared memory while assembling each k-row.  The
+// resident bank is the staging tile; there is no second copy.  Once resident,
+// the direct
 // twiddle-ring passes are unchanged: runtime axis extents, no per-size
 // compilation, odd shared row stride, device-derived residency, and a named
 // refusal.
@@ -239,17 +243,22 @@ __device__ __forceinline__ void lrx_conv_body(
     }
     __syncthreads();
 
-    // Native input: T stays k-leading across the FFI.  This baseline maps x
-    // threads to k and therefore reads one transform row at stride Tg; the
-    // staged successor replaces only this load map.  W's separate load keeps
-    // j fast so adjacent flattened threads read adjacent mu-nu elements.
+    // T stays k-leading across the FFI.  Flattened threads keep j fast, so
+    // each fixed-k group reads consecutive mu-nu-major global elements.  The
+    // scatter into odd-stride ts[j,k] is the in-SMEM transpose and ts itself
+    // remains the resident transform bank: no second staging tile or barrier.
     {
-        const int j = threadIdx.y;
-        const long long r = r0 + j;
-        for (int k = lane; k < nk; k += tpr) {
+        int i = tid;
+        int k = i / RB, j = i - k * RB;
+        const int dk = nthr / RB, dj = nthr - dk * RB;
+        for (; i < tile; i += nthr) {
+            const long long r = r0 + j;
             lrx_c2 tv = {0.0, 0.0};
             if (r < Tg) tv = tin[(long long)k * Tg + r];
             ts[(long long)j * SP + k] = tv;
+            j += dj;
+            if (j >= RB) { j -= RB; k += 1; }
+            k += dk;
         }
     }
     {
@@ -520,27 +529,36 @@ static bool plan_launch(int nk, int n0, int n1, int n2, int smem_max,
                         LaunchCfg* cfg, std::string* why) {
     const int ntw = n0 + n1 + n2;
     const int sp = nk | 1;
-    // Two resident c128 rows (T and W), twiddle rings, and one int64 W-row
-    // offset per T row.  This exact expression owns the residency bound.
+    // Combined allocation: the coalesced-load staging destination is the
+    // resident T bank itself, alongside the resident W bank, twiddle rings,
+    // and 16-byte-aligned int64 W-row offsets.  There is deliberately no
+    // second transpose tile.  This exact expression owns the residency bound.
     auto smem_for = [&](long long rows) {
-        return 16LL * (2LL * rows * sp + ntw) + 8LL * rows;
+        const long long meta_slots = (rows + 1) / 2;
+        return 16LL * (2LL * rows * sp + ntw + meta_slots);
     };
     long long budget = kSmemPreferred;
     if (smem_for(1) > budget) budget = smem_max;
-    long long rb = (budget - 16LL * ntw) / (32LL * sp + 8LL);
+    long long rb = 0;
+    for (long long rows = kRowsMax; rows >= 1; --rows) {
+        if (smem_for(rows) <= budget) {
+            rb = rows;
+            break;
+        }
+    }
     if (rb < 1) {
         std::ostringstream os;
         os << "k-grid product nk=" << nk << " needs " << smem_for(1)
-           << " B of shared memory for ONE resident T/W row pair, but this "
-              "device permits " << smem_max << " B.  Residency is derived "
-              "from the loaded device, never guessed.  This direct handler "
-              "cannot serve the shape; use lorrax_mklfft_gw_conv, the "
-              "plan-based k-leading family member with no row-residency "
-              "requirement.";
+           << " B of shared memory for ONE coalesced-load/resident T row "
+              "plus its resident W row, rings, and aligned metadata, but this "
+              "device permits " << smem_max << " B.  The combined staging+"
+              "residency bound is derived from the loaded device, never "
+              "guessed.  This direct handler cannot serve the shape; use "
+              "lorrax_mklfft_gw_conv, the plan-based k-leading family member "
+              "with no row-residency requirement.";
         *why = os.str();
         return false;
     }
-    rb = std::min<long long>(rb, kRowsMax);
 
     long long tpr_want = (nk + kEptPref - 1) / kEptPref;
     if (tpr_want * rb < kBlockTarget) {

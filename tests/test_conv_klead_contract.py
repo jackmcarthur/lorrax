@@ -23,6 +23,15 @@ def test_residency_mirror_and_axis_envelope():
     assert not conv_klead_row_fits((24, 24, 24))
 
 
+def test_residency_mirror_prices_the_coalesced_resident_staging_row():
+    from ffi.fft import conv_klead_row_fits
+
+    # (1,1,1): the T staging destination/resident row and resident W row are
+    # 32 B total, rings are 48 B, aligned metadata is 16 B: no second tile.
+    assert conv_klead_row_fits((1, 1, 1), smem_bytes=96)
+    assert not conv_klead_row_fits((1, 1, 1), smem_bytes=95)
+
+
 @pytest.mark.parametrize(
     "norm,nk,want",
     [
