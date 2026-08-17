@@ -833,10 +833,11 @@ def compute_sigma_c_ppm_omega_grid(
     ω-grid arrives as an explicit data argument.  ``ppm_cfg``/``quad``
     never travel below this driver.
 
-    ``occupation_state`` is forwarded to the invalid-pole static-COHSEX
-    term only (the sole occupation projector this driver builds); the
-    dynamic branches take their occupations from ``wfns.occ``.  ``None``
-    is the insulating default and is bit-exact.
+    ``occupation_state`` drives the exact-occupation-support admissibility
+    guard and is forwarded to the invalid-pole static-COHSEX term (the sole
+    occupation projector this driver builds); the dynamic branches take
+    their occupations from ``wfns.occ``.  ``None`` is the insulating default
+    and is bit-exact.
 
     ``plan`` is the band-bracket plan (:mod:`gw.band_extrapolation`).
     ``None`` means the trivial one — a single bracket over every band —
@@ -870,6 +871,12 @@ def compute_sigma_c_ppm_omega_grid(
     # brackets ran past the Σ band sum: it would silently sum χ-only bands.
     assert_brackets_match_ols_abscissae(
         plan, s, meta=meta, where="ppm_sigma bracket partition")
+    if occupation_state is not None:
+        from .w_isdf import assert_sigma_contains_occupation_support
+        assert_sigma_contains_occupation_support(
+            wfns.enk, occupation_state.f_kn, s.sigma_sum,
+            band_offset=s.b0, where="ppm_sigma bracket partition",
+            log=print_fn)
     brackets = plan.bounds
     n_brk = plan.n_brackets
     psi_proj_xr = wfns.xr(s.sigma)
