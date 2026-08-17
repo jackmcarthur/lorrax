@@ -2425,9 +2425,38 @@ def unfold_file_wedge_to_full_bz(sym, data):
     Takes the ``SymMaps`` itself, not index tables: the tables are the
     service's business and a driver that holds one has already lost the
     abstraction.
+
+    ``irr_labels`` IS THE WHOLE DIFFERENCE BETWEEN THE TWO WEDGES, and
+    omitting it is what made this function a different operation from the
+    production reader.  ``star_broadcast`` with no labels addresses
+    ``data`` by POSITION AMONG DISTINCT STAR LABELS — right for a star
+    wedge, and right here only while the WFN's k-set IS that wedge.  The
+    rows of a FILE wedge are ``wfn.kpoints`` rows, so the labels are the
+    identity and the gather must be ``data[irr_idx_k]`` — which is
+    exactly what ``src/file_io/kin_ion.py``'s
+    ``broadcast_ibz_to_full_bz`` passes.  MEASURED 2026-08-17 on a random
+    operand, this function against that one: ``gnppm_debug`` (nk_red 9,
+    orbits 5) 3.82e+00, ``bispinor_debug`` (9, 5) 5.18e+00,
+    ``cohsex_debug`` (4, 3) 3.91e+00, and exactly 0.0 on
+    ``si_cohsex_debug`` / ``si_bse_debug`` / ``hbn_cohsex_debug``, where
+    ``nk_red == n_orbits``.  That partition is precisely the one a
+    "31.05 / 12.44 / 8.04 Ry star-relation failure" was reported over —
+    a real measurement taken with a broken instrument.
+    :func:`unfold_star_wedge_to_full_bz` below is the one that WANTS the
+    derived labels, and it says so by not passing any.
     """
     irr, sidx, nss = _star_tables_of(sym)
-    return star_broadcast(data, irr, sidx, nss, trs_reference="ibz_slab")
+    n_rows = int(np.shape(data)[0])
+    if n_rows != int(sym.nk_red):
+        raise ValueError(
+            f"unfold_file_wedge_to_full_bz: operand has {n_rows} rows but "
+            f"the FILE wedge is sym.nk_red = {int(sym.nk_red)}.  A "
+            f"{len(set(int(v) for v in irr))}-row operand is the STAR "
+            f"wedge — call unfold_star_wedge_to_full_bz for that one; the "
+            f"two are different functions wherever the two wedges differ.")
+    return star_broadcast(data, irr, sidx, nss,
+                          irr_labels=np.arange(n_rows, dtype=np.int32),
+                          trs_reference="ibz_slab")
 
 
 def reduce_full_bz_to_file_wedge(sym, data):
