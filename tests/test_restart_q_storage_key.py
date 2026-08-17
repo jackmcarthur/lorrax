@@ -105,40 +105,57 @@ def _closed_but_unreduced():
 # 1. The key
 # ---------------------------------------------------------------------------
 
-def test_the_key_defaults_to_full():
-    """FULL IS THE DESIGNED DEFAULT AND THE WEDGE IS OPT-IN PER DECK.
+def test_the_key_defaults_to_auto_because_storage_follows_the_wfn_file():
+    """AUTO IS THE DEFAULT AGAIN — and this cell has now held both values.
 
-    ``DESIGN_symmetry_restart_followup.md`` rules it in as many words —
-    "the deck key keeps full-BZ storage as the default until the owner rules
-    on centroid regeneration, and the q_irr path is opt-in per deck" — and
-    ``SPEC_qirr_restart_tensors.md`` agrees ("defaulting to whatever
-    preserves today's" bytes).
+    That history is the point, so read it before moving it a third time.
 
-    THIS CELL USED TO ASSERT ``auto``, citing a design-doc line that does not
-    exist in the design doc.  The 2026-08-08 landing census priced the
-    difference: with ``auto`` in ``_DEFAULTS``, both in-tree decks whose
-    centroid sets are orbit-closed silently began writing the q wedge, and
-    nine cells went red across the GW and BSE restart paths because neither
-    reader unfolds.  A default that changes the on-disk restart FORMAT is
-    exactly the kind that has to be asked for, which is what this cell now
-    holds.
+    It first asserted ``auto``, citing a design-doc line that did not exist.
+    It was moved to ``full`` because the 2026-08-08 landing census priced
+    the difference: with ``auto`` in ``_DEFAULTS`` both orbit-closed in-tree
+    decks silently began writing the q wedge and **nine cells went red
+    across the GW and BSE restart paths, because neither reader unfolded.**
+    That clause is the whole reason, and it stopped being true:
+
+    * the GW restart reader has unfolded since ``536cbac9``
+      (``file_io.tagged_arrays._unfold_wedge``, applied at ``:1098``/``:1197``)
+    * ``bse._MunuSlabPlan``'s refusal was lifted 2026-08-15 and
+      ``bse_loading.py:707-711`` unfolds through the SAME function
+    * the cost argument behind that refusal was measured and did not
+      survive: 57.4 GiB/s unfold against 2.919 GiB/s disk, 6-17x at every
+      size tested, with mu^2 cancelling out of the comparison entirely
+
+    So ``auto`` is now what the owner's 2026-08-08 ~13:20 ruling asked for
+    in the first place: "symmetries should not need an auto mode — if
+    symmetries are not to be used, the wavefunction file should've been
+    generated with no symmetries."  ``auto`` IS "follow the file"; on a
+    non-closed centroid set it is byte-for-byte ``full``.
+
+    WHAT WOULD JUSTIFY MOVING IT BACK: a reader that does not unfold.  Not
+    a red cell that pins the old bytes — that is a cell to update — and not
+    a preference for the smaller diff.
     """
     from gw.gw_config import _DEFAULTS
 
-    assert _DEFAULTS["restart_q_storage"] == "full"
+    assert _DEFAULTS["restart_q_storage"] == "auto"
 
 
-def test_a_deck_that_never_heard_of_the_key_gets_full(tmp_path):
-    """Every archived deck keeps parsing AND keeps its bytes.
+def test_a_deck_that_never_heard_of_the_key_gets_auto(tmp_path):
+    """Every archived deck keeps parsing, and now follows its own WFN.
 
-    The second half is the point: a deck written before this key existed
-    must not change on-disk format by standing still.
+    The bytes-preservation half moved deliberately: a deck that never named
+    the key gets ``auto``, which reduces IFF its centroid set is orbit-closed
+    AND its q path reduced.  On a non-closed set that is byte-for-byte the
+    old file, so "standing still changes nothing" still holds for every deck
+    that cannot reduce; for a deck that CAN, the file it writes is the one
+    its own symmetry says it should have been writing.  ``full`` is the
+    escape hatch for a deck that must be pinned to the old bytes.
     """
     from gw.gw_config import read_lorrax_input
 
     deck = tmp_path / "cohsex.in"
     deck.write_text("[LORRAX]\nnval = 4\nncond = 4\nnband = 8\n")
-    assert read_lorrax_input(str(deck))["restart_q_storage"] == "full"
+    assert read_lorrax_input(str(deck))["restart_q_storage"] == "auto"
 
 
 def test_the_hand_built_params_fallback_agrees_with_the_registered_default(
@@ -659,7 +676,7 @@ def test_the_key_still_works_because_removal_is_the_owners_step():
     assert RESTART_Q_STORAGE == ("auto", "full", "ibz"), (
         "the key is still functional; its legal set does not shrink before "
         "the owner-reviewed deletion")
-    assert _DEFAULTS["restart_q_storage"] == "full"
+    assert _DEFAULTS["restart_q_storage"] == "auto"
     assert resolve_restart_q_storage(
         "full", _closed_and_reduced(), context="gate").mode == "full"
     assert resolve_restart_q_storage(
