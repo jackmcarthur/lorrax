@@ -18,6 +18,7 @@ from gw.band_extrapolation import (
     fit_band_extrapolation,
     trivial_plan,
 )
+from gw.efermi import OCCUPATION_WINDOW_THRESHOLD_DEFAULT
 from gw.minimax_screening import MinimaxNodes
 from gw.ppm_windows import _SigmaWindow
 
@@ -89,6 +90,8 @@ def _load_mpa_sigma_without_io_stack():
     mpa_pkg = types.ModuleType("gw.mpa")
     mpa_pkg.__path__ = []
     windows = types.ModuleType("gw.mpa.sigma_windows")
+    windows.OCCUPATION_WINDOW_THRESHOLD_DEFAULT = (
+        OCCUPATION_WINDOW_THRESHOLD_DEFAULT)
     windows.build_shared_sigma_windows = lambda *a, **k: None
     windows.summarize_sigma_poles = lambda *a, **k: None
     names = ("file_io", "file_io.mpa_store", "gw.mpa",
