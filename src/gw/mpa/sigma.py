@@ -15,7 +15,8 @@ from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 
-from .sigma_windows import (build_shared_sigma_windows,
+from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                            build_shared_sigma_windows,
                             summarize_sigma_poles)
 
 
@@ -56,7 +57,11 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
-    psi_coh_xn, psi_coh_yr = wfns.xn(s.full), wfns.yr(s.full)
+    # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
+    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
+    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
+    # wired for consistency and has never executed under a split.
+    psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
@@ -164,21 +169,35 @@ def integrate_sigma_store(
         return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry, occupation_state=None):
+def _branches(wfns, omega, efermi_ry, occupation_state=None,
+              occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
     """The four causal branches, with occupation and energy kept separate.
+
+    Band axis is ``slices.sigma_sum`` -- the Sigma band count, not the
+    chi one -- for the same reason as the psi slices above: these index
+    the SAME band axis the causal branches sum over.  That choice is
+    orthogonal to the occupation one below: the slice says WHICH bands
+    are summed, the weights say with what amplitude.
 
     ``occupation_state=None`` is the incumbent insulating semantics,
     bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
     With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
-    exact fractional supports and weights: the val branch sums EVERY band
-    with f≠0 at weight f, the cond branch every band with f≠1 at weight
-    1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
+    fractional supports and weights: the val branch sums every band whose
+    weight f clears the occupancy window at weight f, the cond branch every
+    band whose weight 1−f clears it at weight 1−f.  Nothing is clipped and MP
     overshoot (f<0 or f>1) rides through unchanged
     (docs/theory/finite-occupation-screening.md).
+
+    ``occupation_window_threshold`` sets that window;
+    ``branches_for_omega_grid`` applies it.  1.0 restores the historical
+    ``f != 1`` / ``f != 0`` supports bit-for-bit.  Applying it here rather
+    than only in the planner keeps ONE support: ``sigma_windows._a_space``
+    re-applies the same floor to the same weights, so the two agree by
+    construction instead of by review.
     """
     if occupation_state is None:
-        energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
-        occupied = wfns.occ[:, wfns.slices.full] > 0.5
+        energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
+        occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
         # Do not clip these distances at zero.  In a small-gap or inverted
         # system an unoccupied state may sit below E_F (or an occupied state
         # above it); occupation still chooses the band sum.  A cell whose
@@ -195,12 +214,13 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
-                    wfns.enk.shape)[:, wfns.slices.full]
-    energy = wfns.enk[:, wfns.slices.full] - mu
+                    wfns.enk.shape)[:, wfns.slices.sigma_sum]
+    energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f)
+        cond_weight=1.0 - f, val_weight=f,
+        occupation_window_threshold=occupation_window_threshold)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -218,6 +238,7 @@ def compute_sigma_c_mpa_omega_grid(
     max_rank,
     crossing_max_nodes,
     omega_cluster_gap_ry=1.0,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
     expected_screening_diagrams=None,
@@ -231,6 +252,12 @@ def compute_sigma_c_mpa_omega_grid(
     branches carry exact fractional supports and (f, 1−f) weights, and
     ``efermi_ry`` must equal ``occupation_state.mu_ry``.
 
+    ``occupation_window_threshold`` is the OCCUPANCY below which a band is
+    still counted in a branch; the cut is ``|weight| > 1 - it``.  It is
+    forwarded from this one value to the BRANCH BUILD and to BOTH planner
+    entry points, which is what keeps the branch supports, the pole census
+    and the window build on one support.
+
     Pole tensors are read collectively in their native sharding.  A first
     four-pole walk retains only scalar geometry for planning; the spatial
     executor rereads and releases the same four-pole ranges.  No complete
@@ -241,8 +268,10 @@ def compute_sigma_c_mpa_omega_grid(
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(wfns, omega_grid_ry, efermi_ry,
-                         occupation_state=occupation_state)
+    branches = _branches(
+        wfns, omega_grid_ry, efermi_ry,
+        occupation_state=occupation_state,
+        occupation_window_threshold=occupation_window_threshold)
     summaries = []
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
@@ -261,7 +290,8 @@ def compute_sigma_c_mpa_omega_grid(
             summaries.extend(summarize_sigma_poles(
                 Omega, B, branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo))
+                edge_factor=edge_factor, pole_offset=lo,
+                occupation_window_threshold=occupation_window_threshold))
             del Omega, B
         plan, geometry = build_shared_sigma_windows(
             summaries, branches,
@@ -269,7 +299,8 @@ def compute_sigma_c_mpa_omega_grid(
             edge_factor=edge_factor, target_error=target_error,
             crossing_target_error=crossing_target_error,
             max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
-            omega_cluster_gap_ry=omega_cluster_gap_ry)
+            omega_cluster_gap_ry=omega_cluster_gap_ry,
+            occupation_window_threshold=occupation_window_threshold)
         print_fn(
             f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
             f"{geometry['n_windows']} logical windows")

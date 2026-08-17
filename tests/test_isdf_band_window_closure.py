@@ -80,7 +80,7 @@ def test_boundary_min_gaps_separates_the_sliced_edge_from_the_clean_ones():
     ones must be separated by orders of magnitude, not by a hair — that is
     what makes the tolerance a classification and not a tuned knob."""
     e = _si666_like()
-    g = boundary_min_gaps(e)
+    g = boundary_min_gaps(e, is_full_spectrum=True)
     _MEV_PER_RY = _EV_PER_RY * 1e3
     assert g[60] == pytest.approx(0.0, abs=1e-15)     # inside the manifold
     assert g[58] * _MEV_PER_RY > 100.0                # a real gap, in meV
@@ -90,13 +90,49 @@ def test_boundary_min_gaps_separates_the_sliced_edge_from_the_clean_ones():
     assert g[58] / max(g[60], 1e-300) > 1e6
 
 
-def test_outer_boundaries_cut_nothing_and_are_infinite():
-    """b=0 and b=nb separate nothing, so they can never be 'open'."""
+def test_outer_boundaries_cut_nothing_ON_A_FULL_SPECTRUM():
+    """b=0 and b=nb separate nothing — WHEN the array is the whole ladder."""
     e = _si666_like()
-    g = boundary_min_gaps(e)
+    g = boundary_min_gaps(e, is_full_spectrum=True)
     assert np.isinf(g[0]) and np.isinf(g[e.shape[1]])
     # ...and a window spanning the whole file is therefore always closed.
     check_band_window(e, 0, e.shape[1], mode="strict")
+
+
+def test_on_a_WINDOW_the_outer_boundaries_are_nan_not_infinite():
+    """The correctness fix of 2026-08-15, and the reason it was needed.
+
+    A window's own edges are the cuts somebody made.  Reporting +inf there
+    certifies as safe exactly what this module exists to catch, and it did:
+    on ``si_cohsex_debug`` (62 bands in the WFN, deck runs ``nband = 60``)
+    the sigma window reported +inf at edge 60 while the mean field reports
+    **0.000000 meV** — a sliced multiplet, worth ~2 meV of Sigma star spread
+    that goes to exactly 0.0000 at a clean edge.
+
+    ``nan`` and not ``0.0``: ``nan > tol`` and ``nan <= tol`` are BOTH False,
+    so a window edge can be neither certified clean nor silently called
+    dirty.  It has to be asked about the full spectrum.
+    """
+    e = _si666_like()
+    nb = e.shape[1]
+    g = boundary_min_gaps(e, is_full_spectrum=False)
+    assert np.isnan(g[0]) and np.isnan(g[nb])
+    # Neither comparison can succeed on nan — that is the whole point.
+    assert not (g[nb] > 1e-30)
+    assert not (g[nb] <= 1e-30)
+    # The INTERIOR is unaffected: same array, same answers, either way.
+    full = boundary_min_gaps(e, is_full_spectrum=True)
+    assert np.array_equal(g[1:nb], full[1:nb])
+
+
+def test_the_declaration_is_required_and_has_no_default():
+    """A caller who has not thought about it gets a TypeError.
+
+    Same doctrine as ``symmetry_maps``' ``trs_reference``: a choice whose
+    wrong branch is invisible to every cheap check does not get a default.
+    """
+    with pytest.raises(TypeError):
+        boundary_min_gaps(_si666_like())
 
 
 def test_both_isdf_windows_are_checked_not_just_the_outer_one():

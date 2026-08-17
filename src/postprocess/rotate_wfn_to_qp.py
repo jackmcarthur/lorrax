@@ -21,54 +21,69 @@ import h5py
 from file_io.mf_header import kpt_starts
 
 
-def find_kpoint_mapping(wfn_kpoints, rot_kpoints, kgrid, shift, tol=1e-6):
+def read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints):
+    """The wedge→full-BZ map, READ from the rotation file, never re-derived.
+
+    ``qp_wfn_rotations.h5`` already carries ``kirr_to_kfull``, written
+    straight from ``sym.kirr_fullids`` by both producers
+    (``gw.gw_jax``/``gw_output.write_results`` and
+    ``gw.sc_iteration``).  The symmetry service builds that table by
+    EXACT periodic match and RAISES on a miss (``maps.py:1340-1359``),
+    and its contract is ``unfolded_kpts[kirr_fullids] == wfn.kpoints``.
+
+    WHAT THIS REPLACED.  This module used to rebuild the same table with
+    a ``np.argmin`` over summed coordinate distances at ``tol=1e-6``
+    (``find_kpoint_mapping``), taking the nearest full-BZ k to each
+    reduced one with no uniqueness check — so two k within tolerance of
+    one another resolved silently to whichever came first, and the
+    rebuilt table then selected the QP rotation ``U_mnk[ik_full]`` and
+    the QP energy for that reduced k.  Those energies reach
+    ``eqp{0,1}.dat`` through ``gw.eqp_bgw``, which reads
+    ``kirr_to_kfull`` from this very file — so the two disagreeing about
+    a k meant the eqp columns and the rotated WFN disagreed too.  There
+    is now one table, produced by the service, and this module reads it.
+
+    The coordinates are CHECKED against it rather than searched: the map
+    must reproduce ``wfn.kpoints`` from ``kpoints_crys``, which is the
+    service's own contract restated at the point of use.
     """
-    Map reduced k-points from WFN.h5 to full zone indices in the rotation file.
-    
-    Args:
-        wfn_kpoints: Reduced k-points from WFN.h5 (nk_red, 3)
-        rot_kpoints: Full zone k-points from rotation file (nk_full, 3)
-        kgrid: k-grid dimensions [nkx, nky, nkz]
-        shift: k-grid shift
-        tol: Tolerance for k-point matching
-        
-    Returns:
-        kirr_to_kfull: Array mapping reduced k-point index to full zone index
-    """
-    nk_red = len(wfn_kpoints)
-    nk_full = len(rot_kpoints)
-    
-    # Generate full k-point grid
-    kx = np.linspace(0, 1, kgrid[0], endpoint=False) + shift[0] / kgrid[0]
-    ky = np.linspace(0, 1, kgrid[1], endpoint=False) + shift[1] / kgrid[1]
-    kz = np.linspace(0, 1, kgrid[2], endpoint=False) + shift[2] / kgrid[2]
-    
-    kpts_mesh = np.meshgrid(kx, ky, kz, indexing='ij')
-    full_kpoints_gen = np.stack([k.flatten() for k in kpts_mesh]).T
-    
-    kirr_to_kfull = np.zeros(nk_red, dtype=np.int32)
-    
-    for ik_red, k_red in enumerate(wfn_kpoints):
-        # Wrap reduced k-point to [0, 1)
-        k_wrapped = k_red % 1.0
-        k_wrapped[k_wrapped > 1.0 - tol] = 0.0
-        
-        # Find matching k-point in the full zone
-        diffs = np.abs(rot_kpoints - k_wrapped[None, :])
-        diffs = np.minimum(diffs, 1.0 - diffs)  # Account for periodicity
-        total_diff = np.sum(diffs, axis=1)
-        
-        min_idx = np.argmin(total_diff)
-        min_diff = total_diff[min_idx]
-        
-        if min_diff > tol:
+    with h5py.File(rot_file, 'r') as f_rot:
+        if 'kirr_to_kfull' not in f_rot:
             raise ValueError(
-                f"Reduced k-point {ik_red}: {k_red} not found in rotation file k-points. "
-                f"Minimum difference: {min_diff}"
-            )
-        
-        kirr_to_kfull[ik_red] = min_idx
-    
+                f"{os.path.basename(rot_file)} has no 'kirr_to_kfull' "
+                f"dataset.  Every rotation file the current drivers write "
+                f"carries it (from sym.kirr_fullids); a file without it "
+                f"predates that and cannot be used here — the mapping is "
+                f"NOT re-derived, because deriving it by nearest-coordinate "
+                f"search is the defect this function exists to remove.  "
+                f"Regenerate the rotation file.")
+        kirr_to_kfull = np.asarray(f_rot['kirr_to_kfull'][:], dtype=np.int32)
+
+    nk_red = len(wfn_kpoints)
+    if kirr_to_kfull.shape != (nk_red,):
+        raise ValueError(
+            f"kirr_to_kfull has shape {kirr_to_kfull.shape}, expected "
+            f"({nk_red},) — the rotation file and {nk_red}-point WFN are "
+            f"not the same calculation.")
+    if kirr_to_kfull.max(initial=-1) >= len(rot_kpoints):
+        raise ValueError(
+            f"kirr_to_kfull reaches full-BZ row {int(kirr_to_kfull.max())} "
+            f"but kpoints_crys has only {len(rot_kpoints)} rows.")
+
+    # The service's contract, checked here: unfolded_kpts[kirr_fullids]
+    # IS wfn.kpoints.  Comparison is modulo a lattice vector because the
+    # two files may hold a k in different periodic images.
+    d = np.asarray(rot_kpoints)[kirr_to_kfull] - np.asarray(wfn_kpoints)
+    d -= np.rint(d)
+    worst = float(np.max(np.abs(d))) if d.size else 0.0
+    if worst > 1e-6:
+        bad = int(np.argmax(np.max(np.abs(d), axis=1)))
+        raise ValueError(
+            f"kirr_to_kfull[{bad}] = {int(kirr_to_kfull[bad])} points at "
+            f"{np.asarray(rot_kpoints)[kirr_to_kfull[bad]].tolist()} but "
+            f"WFN reduced k-point {bad} is {np.asarray(wfn_kpoints)[bad].tolist()} "
+            f"(worst |Δk| = {worst:.2e}).  The rotation file and the WFN "
+            f"disagree about the k-set.")
     return kirr_to_kfull
 
 
@@ -88,10 +103,18 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
         print(f"Copying {wfn_file} -> {output_file}")
     shutil.copy2(wfn_file, output_file)
     
-    # Open rotation file
+    # Open rotation file.  THE ARRAYS COME BACK THROUGH THE ADAPTER, the
+    # coordinates straight off the file: ``U_mnk`` and ``E_qp_nk_rydberg``
+    # may be stored on the file wedge (``k_storage='ibz'``) and are unfolded
+    # here, while ``kpoints_crys`` and ``kirr_to_kfull`` are ALWAYS full-BZ
+    # and keep their old meaning, so everything below indexes by full-BZ k
+    # exactly as it always did.  A file with no ``k_storage`` attr is read
+    # verbatim, so a pre-format file is untouched by this.
+    from file_io.qp_wfn import read_qp_rotations_full_bz
+    _arr = read_qp_rotations_full_bz(rot_file)
+    U_mnk = _arr['U_mnk']                      # (nk_full, nb, nb)
+    E_qp_ry = _arr['E_qp_nk_rydberg']          # (nk_full, nb) in Rydberg
     with h5py.File(rot_file, 'r') as f_rot:
-        U_mnk = f_rot['U_mnk'][:]  # (nk_full, nb, nb)
-        E_qp_ry = f_rot['E_qp_nk_rydberg'][:]  # (nk_full, nb) in Rydberg
         band_range = f_rot['band_range'][:]  # [band_start, band_stop]
         rot_kpoints = f_rot['kpoints_crys'][:]  # (nk_full, 3)
         kgrid = f_rot['kgrid'][:]  # [nkx, nky, nkz]
@@ -125,7 +148,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
             print(f"  nspin={nspin}, nspinor={nspinor}")
     
     # Find mapping from reduced to full zone k-points
-    kirr_to_kfull = find_kpoint_mapping(wfn_kpoints, rot_kpoints, wfn_kgrid, wfn_shift)
+    kirr_to_kfull = read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints)
     
     if verbose:
         print(f"\nK-point mapping (reduced -> full zone):")
@@ -260,49 +283,6 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
     return kirr_to_kfull
 
 
-def add_kpoint_mapping_to_rotation_file(rot_file, wfn_file, verbose=True):
-    """
-    Add the k-point mapping from reduced to full zone to the rotation file.
-    This allows easy lookup of which rotation matrix to use for each reduced k-point.
-    
-    Args:
-        rot_file: Path to qp_wfn_rotations.h5
-        wfn_file: Path to WFN.h5 (to get reduced k-points)
-        verbose: Print progress information
-    """
-    # Read WFN k-points
-    with h5py.File(wfn_file, 'r') as f_wfn:
-        wfn_kpoints = f_wfn['mf_header/kpoints/rk'][:]
-        wfn_shift = f_wfn['mf_header/kpoints/shift'][:]
-        wfn_kgrid = f_wfn['mf_header/kpoints/kgrid'][:]
-    
-    # Read rotation file k-points
-    with h5py.File(rot_file, 'r') as f_rot:
-        rot_kpoints = f_rot['kpoints_crys'][:]
-    
-    # Compute mapping
-    kirr_to_kfull = find_kpoint_mapping(wfn_kpoints, rot_kpoints, wfn_kgrid, wfn_shift)
-    
-    # Add to rotation file
-    with h5py.File(rot_file, 'r+') as f_rot:
-        # Delete if exists
-        if 'kirr_to_kfull' in f_rot:
-            del f_rot['kirr_to_kfull']
-        if 'kpoints_reduced' in f_rot:
-            del f_rot['kpoints_reduced']
-        
-        f_rot.create_dataset('kirr_to_kfull', data=kirr_to_kfull, dtype=np.int32)
-        f_rot.create_dataset('kpoints_reduced', data=wfn_kpoints, dtype=np.float64)
-        f_rot.attrs['mapping_description'] = (
-            'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
-            'for the reduced k-point ik_red from WFN.h5'
-        )
-    
-    if verbose:
-        print(f"Added kirr_to_kfull mapping to {rot_file}")
-        print(f"  Shape: {kirr_to_kfull.shape}")
-
-
 def main():
     parser = argparse.ArgumentParser(allow_abbrev=False,
         description='Rotate DFT wavefunctions to QP basis using COHSEX rotation matrices.'
@@ -311,8 +291,6 @@ def main():
     parser.add_argument('rotation_file', help='QP rotation file (qp_wfn_rotations.h5)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output file (default: WFN_qp.h5 in same directory as WFN.h5)')
-    parser.add_argument('--add-mapping', action='store_true',
-                        help='Also add k-point mapping to the rotation file')
     parser.add_argument('--energy-only', action='store_true',
                         help='Only update energies, do not rotate wavefunctions (for debugging)')
     parser.add_argument('--quiet', '-q', action='store_true',
@@ -350,10 +328,11 @@ def main():
         print(f"Output WFN_qp:   {output_file}")
         print("=" * 60)
     
-    # Optionally add mapping to rotation file first
-    if args.add_mapping:
-        add_kpoint_mapping_to_rotation_file(rotation_file, wfn_file, verbose=verbose)
-    
+    # NOTE: there is deliberately no --add-mapping any more.  It recomputed
+    # kirr_to_kfull by nearest-coordinate search and OVERWROTE the dataset
+    # the symmetry service had already written from sym.kirr_fullids — i.e.
+    # it replaced the exact table with an approximation of itself.  Every
+    # rotation file the drivers write carries the real one.
     # Rotate wavefunctions (or just update energies if --energy-only)
     kirr_to_kfull = rotate_wfn_coefficients(
         wfn_file, rotation_file, output_file, verbose=verbose,

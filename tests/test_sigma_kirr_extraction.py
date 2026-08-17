@@ -142,7 +142,12 @@ def test_compaction_renumbers_a_noncontiguous_wedge():
     assert rows.tolist() == [0, 1, 4], (
         "the kept rows are the first occurrence of each star, in order")
     assert compact.tolist() == [0, 1, 1, 1, 2, 1, 1, 1, 2]
-    # The property ``read_star_map`` checks: max label + 1 == stored rows.
+    # The property ``read_star_map`` checks: the number of DISTINCT stars
+    # equals the stored row count.  Asserted alongside ``max + 1`` because
+    # compaction is what makes the two agree, and the reader stopped
+    # trusting ``max + 1`` on 2026-08-17 precisely because an uncompacted
+    # table can satisfy it while describing a different slab.
+    assert int(np.unique(compact).size) == len(rows)
     assert int(compact.max()) + 1 == len(rows)
 
 
@@ -377,7 +382,8 @@ def test_the_gauge_blind_arms_vanish_on_an_exact_star_relation():
              + 1j * rng.standard_normal((len(rows), 4, 4)))
     full = np.asarray(symmetry_maps.star_broadcast(
         wedge, compact, _SIDX, _NSS,
-        irr_labels=np.arange(len(rows), dtype=np.int32)))
+        irr_labels=np.arange(len(rows), dtype=np.int32),
+        trs_reference="star_row"))
 
     stats = sigma_star_spread_stats(full, rows, compact, _SIDX, _NSS)
     for arm in ("raw_ev", "frobenius_ev", "trace_ev"):

@@ -69,7 +69,8 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
 	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
-from .gw_init import prepare_isdf_and_wavefunctions
+from .gw_init import (prepare_isdf_and_wavefunctions,
+                      check_band_sum_degeneracy)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import compute_screening_model, driver_persists_w0
@@ -291,12 +292,30 @@ def main(argv=None):
 		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
 
-	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband, n_rmu, config.bispinor)
+	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband,
+	                        n_rmu, config.bispinor,
+	                        nband_chi=config.bands.chi,
+	                        nband_sigma=config.bands.sigma)
 	meta.rank = jax.process_index()
 	meta.n_proc = jax.process_count()
 	meta.sys_dim = config.sys_dim
 	meta.bispinor = config.bispinor
-	band_slices = BandSlices.from_band_edges(*meta.band_edges)
+	band_slices = BandSlices.from_band_edges(
+		*meta.band_edges, b4_chi=meta.b_id_4_chi, b4_sigma=meta.b_id_4_sigma)
+	# THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
+	# fit is exactly the thing a reader of this log needs and cannot infer:
+	# ``nband`` in the deck echo is already the max, so without this line a
+	# split deck and an unsplit one at the larger count print the same
+	# number.  Printed here, above the ζ fit, because this is where the
+	# window it is about is decided.
+	print0(f"  {config.bands.describe()}")
+	if config.bands.split:
+		print0(f"    chi0/W sums bands [{band_slices.b0}, "
+		       f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
+		       f"{band_slices.b4_sigma}); psi is LOADED over "
+		       f"[{band_slices.b0}, {band_slices.b4}) "
+		       f"(padded from {meta.b_id_4_user} to the world size).")
+	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
 
 	# ---- sigma_omega_layout=sharded: resolve-time geometry/backend gate ----
 	# The config-level axis checks (self_consistent) already ran
@@ -767,6 +786,7 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
+			sym=sym,
 			e_eval_ev=e_eval_ev,
 			print_fn=print0,
 		)
@@ -795,12 +815,13 @@ def main(argv=None):
 			eqp0_file=config.paths.eqp0_file,
 			eqp1_file=config.paths.eqp1_file,
 			input_dir=input_dir,
-			kpoints_crys=np.array(sym.unfolded_kpts, dtype=np.float64),
 			kgrid=meta.kgrid,
-			kpoints_irr_frac=np.array(wfn.kpoints, dtype=np.float64),
-			kpoints_reduced=np.array(wfn.kpoints, dtype=np.float64),
-			kirr_to_kfull=np.array(sym.kirr_fullids, dtype=np.int32),
+			# THE symmetry object, not tables off it.  Every k-basis
+			# decision is made where the data is written, through
+			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
+			sym=sym,
 			write_qp_rotations=not rotations_written,
+			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,
 		)
 	timing.record("gw_jax.output", time.perf_counter() - _t_out)

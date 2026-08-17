@@ -91,7 +91,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader                                    # noqa: E402
+from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
     HARTREE_DATASET, IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
     K_STORAGE_IBZ, K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR,
@@ -128,11 +128,42 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # ===========================================================================
 # ``kin_ion`` = T + V_loc + V_NL (and ``v_hartree`` = V_H) are SCALAR
 # operators built from the crystal's own potentials, so each commutes with
-# every operation of the space group AND with time reversal.  The WFN file
-# stores ψ on the IBZ only, and ψ(Sk) is *defined* — by
-# ``WfnLoader.load(k='full_bz')``, which is the only producer — as the
-# symmetry image of ψ(k_irr).  So the full-BZ table holds only ``nrk``
-# distinct matrices and computing it k by k is redundant work.
+# every operation of the space group AND with time reversal.  ψ(Sk) is
+# *defined* — by ``WfnLoader.load(k='full_bz')``, which is the only
+# producer — as the symmetry image of ψ at that k's ORBIT PARENT.  So the
+# full-BZ table holds only ``n_orbits`` distinct matrices and computing it
+# k by k is redundant work.
+#
+# WHICH WEDGE — AND THE WFN'S OWN k-SET IS NOT IT.  There are two
+# different reduced k-sets here and they are not the same size
+# (``docs/architecture/symmetry_register.md``, "THERE ARE TWO DIFFERENT
+# IBZs"):
+#
+#   FILE wedge — ``wfn.kpoints`` / ``wfn.load(k="ibz")``, length
+#     ``sym.nk_red``.  Whatever k the WFN happens to store.
+#   STAR wedge — one row per symmetry orbit, ``n_orbits`` of them:
+#     ``star_select``'s rows, which is what ``irr_idx_k`` addresses.
+#
+# They coincide on a WFN cut at the true IBZ (``si_cohsex_debug`` 8 = 8,
+# ``hbn_cohsex_debug`` 18 = 18) and they DO NOT on a WFN that stores more
+# k than the mesh has orbits (``gnppm_debug`` and ``bispinor_debug`` 9 vs
+# 5, ``cohsex_debug`` 4 vs 3).  This module sweeps and stores the STAR
+# wedge, via :func:`star_wedge_rows`, because that is the set
+# ``irr_idx_k`` and therefore every reader indexes.
+#
+# SWEEPING THE FILE WEDGE INSTEAD IS A REAL BUG, MEASURED 2026-08-17 on a
+# freshly generated ``gnppm_debug``.  A file-wedge row that is NOT an
+# orbit parent sits at a k that some other row is the parent of, and the
+# WFN's own ψ there is a DIFFERENT basis of the same eigenspaces from the
+# one ``load(k="full_bz")`` builds by symmetry — ``max|ψ_ibz − ψ_full|``
+# 3.3e-01…3.9e-01 with ``min|⟨n|n⟩|`` 0.012 on the four time-reversed
+# rows.  Those rows were computed, written, and then overwritten by the
+# reader's unfold: 4 of 9 of the sweep discarded, and a ``kin_ion.h5``
+# whose stored rows disagreed with its own star tables by 3.315e+01 Ry
+# off-diagonal (1.318e+01 on ``bispinor_debug``).  Only the parents were
+# ever read, so nothing downstream moved — which is exactly why it
+# survived.  The wedge sweep computes the parents and nothing else, so
+# the disagreement has no rows left to live on.
 #
 # But the symmetry table is TRS-AUGMENTED, and the two halves do NOT give
 # the same rule.  ``sym_mats_k`` is ``concat([S, -S])``: rows below
@@ -217,8 +248,41 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # full-BZ k-points.
 
 
+def star_wedge_rows(sym):
+    """``(wfn_rows, irr_idx_wedge)`` — the k to sweep, and the table for it.
+
+    ``wfn_rows`` are rows of the WFN's OWN k axis (``wfn.kpoints``,
+    ``wfn.load(k="ibz")``): exactly one per symmetry orbit, in
+    ``star_select``'s first-occurrence order.  ``irr_idx_wedge`` is
+    ``SymMaps.irr_idx_k`` RENUMBERED to index those rows, which is the
+    table that unfolds a slab computed on them.
+
+    Both come out of :func:`file_io.sigma_output.compact_star_tables`,
+    which ``sigma_mnk.h5`` has used since its wedge storage landed —
+    ONE renumbering rule in the tree, and first-occurrence order is what
+    makes it the order ``star_select``/``star_broadcast`` agree on (see
+    ``symmetry_maps._star_row_order``: on ``gnppm_debug`` the labels are
+    [0, 2, 6, 8, 7] and NOT the sorted [0, 2, 6, 7, 8], so sorting here
+    would return another star's matrix at two k).
+
+    ``wfn_rows`` is ``arange(nk_red)`` exactly when the WFN's k-set IS
+    the star wedge, which is every deck cut at a true IBZ; the callers
+    below use that to leave those decks bit-for-bit unchanged.
+    """
+    from file_io.sigma_output import compact_star_tables
+    irr_file = np.asarray(sym.irr_idx_k, dtype=np.int32)
+    rows_to_keep, irr_idx_wedge = compact_star_tables(irr_file)
+    return irr_file[rows_to_keep].astype(np.int32), irr_idx_wedge
+
+
 def star_tables(sym):
     """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — what an unfold needs.
+
+    ``irr_idx_k`` is renumbered onto the STAR wedge (:func:`star_wedge_rows`),
+    because that is the slab this module computes, stores and unfolds.
+    Filing ``SymMaps.irr_idx_k`` verbatim instead would claim ``nk_red``
+    stored rows for an ``n_orbits``-row slab — the inconsistency
+    :func:`file_io.kin_ion.read_star_map` exists to refuse.
 
     ``n_sym_spatial`` is derived from ``sym.sym_mats_k`` (always
     ``2·ntran`` long, both SymMaps branches) rather than from the WFN
@@ -230,14 +294,17 @@ def star_tables(sym):
     Called twice: once to unfold in memory (the gspace V_H route below)
     and once to write the tables into ``kin_ion.h5`` beside the slab they
     unfold, so the file and the run cannot disagree about them.
+    ``gw.dynamic_sigma`` also passes the result to
+    ``file_io.sigma_output``, which compacts what it is given — and
+    compaction is idempotent, so that path is unmoved.
     """
-    return (np.asarray(sym.irr_idx_k, dtype=np.int32),
+    return (star_wedge_rows(sym)[1],
             np.asarray(sym.sym_idx_k, dtype=np.int32),
             int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
 
 
 def broadcast_ibz_to_full_bz(A_irr, sym):
-    """``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
+    """``(n_orbits, …) → (nk_tot, …)`` through the star map, conj on TRS.
 
     The writer-side spelling of :func:`file_io.kin_ion.
     broadcast_ibz_to_full_bz`, which is THE adapter: this one only unpacks
@@ -246,12 +313,34 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     no second ``star_broadcast`` call — the AST gate now asserts that, in
     both directions.
 
+    ``A_irr``'s rows are the STAR wedge (:func:`star_wedge_rows`), which
+    is what every sweep in this module now produces; ``star_tables``
+    hands over the matching renumbered ``irr_idx_k``.
+
     ``None`` in, ``None`` out: the callers below gather with
     ``owner_only=True``, so the peers hold no table to broadcast.
     """
     if A_irr is None:
         return None
     return _broadcast_ibz_slab(np.asarray(A_irr), *star_tables(sym))
+
+
+def _wedge_sweep_kspec(wfn, sym):
+    """``(k_spec, kvecs, n_k)`` for a matrix-element sweep over the wedge.
+
+    The loader k-spec that selects one WFN row per symmetry orbit, that
+    row order's k-vectors, and the trip count.  Returned as ``"ibz"``
+    unchanged when the WFN's k-set already IS the star wedge, so every
+    deck cut at a true IBZ takes byte-for-byte the path it always took —
+    same loader cache key, same read, same scan.
+    """
+    rows, _ = star_wedge_rows(sym)
+    kpts = np.asarray(wfn.kpoints, dtype=np.float64)
+    n_red = int(wfn.nkpts)
+    if int(rows.size) == n_red and np.array_equal(rows, np.arange(n_red)):
+        return "ibz", kpts, n_red
+    return (IBZRows(tuple(int(r) for r in rows)),
+            kpts[rows], int(rows.size))
 
 
 # ---- artifact provenance ---------------------------------------------------
@@ -675,8 +764,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     decision baked into the return.  ``"full"`` (default, and what the
     driver's ``hartree_source=gspace`` route needs) returns the
     ``(nk_tot, nb, nb)`` star broadcast, exactly as before.  ``"ibz"``
-    returns the ``(nrk, nb, nb)`` block the sweep produced, un-broadcast,
-    for the CLI to persist: its consumer reads V_H back out of
+    returns the ``(n_orbits, nb, nb)`` block the sweep produced,
+    un-broadcast — the STAR wedge, see :func:`star_wedge_rows` — for the
+    CLI to persist: its consumer reads V_H back out of
     ``kin_ion.h5``, and ``file_io.kin_ion`` unfolds it there.  Nothing
     else about the computation changes, so the two answers are related by
     exactly one gather and the default path is bit-for-bit what it was.
@@ -739,10 +829,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                         dtype=jnp.float64)
     del rho_np
 
-    # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan over the IRREDUCIBLE k ----
+    # ---- 3. ⟨mk|V_H|nk⟩: ONE k-scan over the STAR WEDGE ----
     #
-    # THE k-SET IS THE IBZ, and the full-BZ table is the star broadcast of
-    # it — see "THE IRREDUCIBLE k-SET" at the head of this module for the
+    # THE k-SET IS THE STAR WEDGE, and the full-BZ table is the star
+    # broadcast of it — see "THE IRREDUCIBLE k-SET" at the head of this
+    # module for the
     # derivation, including the conjugation the time-reversed rows need.
     # V_H is a local scalar potential, so it commutes with the space group
     # and with time reversal like any other term here.
@@ -786,26 +877,27 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                                     blocks_to_host,
                                     local_potential_operator,
                                     sweep_matrix_elements)
-    nk_irr = int(wfn.nkpts)
-    gtab = padded_gvectors(wfn, k="ibz")
-    psi_G = wfn.load(bands=(0, nb), k="ibz", sharding=band_sphere_spec())
+    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    gtab = padded_gvectors(wfn, k=k_spec)
+    psi_G = wfn.load(bands=(0, nb), k=k_spec, sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb,
                          ns=int(psi_G.shape[2]), nk=nk_irr,
                          cell_volume=float(wfn.cell_volume))
-    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk_irr} IRREDUCIBLE k-points "
+    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk_irr} STAR-WEDGE k-points "
              f"(broadcast to {nk} full-BZ k), "
              f"{geom.nb} bands sharded over P={world}...")
     with timing.section("vh_matrix"):
         H_vh = sweep_matrix_elements(
             psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k="ibz"),
-            # ``wfn.kpoints``, NOT ``sym.unfolded_kpts``: ψ and the G-list
-            # are the raw IBZ slab, and the only k that belongs with them
-            # is the file's own — the pairing is self-consistent by
-            # definition, whatever wrapping convention the unfold uses.
-            kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
+            box_index=wfn.box_index(k=k_spec),
+            # The WFN's OWN k for these rows, NOT ``sym.unfolded_kpts``:
+            # ψ and the G-list here are the untransformed WFN slab, and
+            # the only k that belongs with them is the file's own — the
+            # pairing is self-consistent by definition, whatever wrapping
+            # convention the unfold uses.
+            kvecs=kvecs_irr)
         # THE BOUNDARY, stated rather than implied.  Both consumers want a
         # HOST array — the CLI writes it with serial h5py on rank 0
         # (``owner_only=True``), and ``sigma_dispatch``'s gspace route hands
@@ -1130,17 +1222,18 @@ def main(argv=None):
                                     local_potential_operator, sum_operators,
                                     sweep_matrix_elements, vnl_operator)
     #
-    # THE k-SET IS THE IBZ, and so is the WRITTEN table — see "THE
+    # THE k-SET IS THE STAR WEDGE, and so is the WRITTEN table — see "THE
     # IRREDUCIBLE k-SET" at the head of this module for the derivation,
-    # including the conjugation the time-reversed rows need.  T, V_loc and
+    # including the conjugation the time-reversed rows need and why the
+    # WFN's own k-set is NOT the wedge on every deck.  T, V_loc and
     # V_NL are built from the lattice and the atomic positions, so they are
     # exactly symmetric by construction and this is the sweep the argument
     # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
-    nk_irr = int(wfn.nkpts)
-    gtab = padded_gvectors(wfn, k="ibz")
-    psi_G = wfn.load(bands=(0, nb_eff), k="ibz",
+    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    gtab = padded_gvectors(wfn, k=k_spec)
+    psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
                      sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh_xy, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb_eff,
@@ -1150,7 +1243,7 @@ def main(argv=None):
              local_potential_operator(geom, V_loc_r)]
     if vnl_setup is not None:
         terms.append(vnl_operator(geom, vnl_setup))
-    print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {nk_irr} IRREDUCIBLE "
+    print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {nk_irr} STAR-WEDGE "
            f"k-points (broadcast to {sym.nk_tot} full-BZ k), "
            f"{geom.nb} bands sharded over P={world}...")
     # ONE ``kin_ion`` timing section around the WHOLE sweep, count 1 — not
@@ -1160,10 +1253,10 @@ def main(argv=None):
         H_kin_ion = sweep_matrix_elements(
             psi_G, operator=sum_operators(*terms), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k="ibz"),
-            # the file's own IBZ k, for the same reason as the V_H sweep:
-            # ψ and the G-list here are the raw IBZ slab.
-            kvecs=np.asarray(wfn.kpoints, dtype=np.float64))
+            box_index=wfn.box_index(k=k_spec),
+            # the WFN's own k for these rows, for the same reason as the
+            # V_H sweep: ψ and the G-list here are the untransformed slab.
+            kvecs=kvecs_irr)
         # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
         # cannot take a sharded operand, so the block is gathered to the
         # owner here and nowhere else.  ``owner_only`` keeps the peers'
@@ -1176,8 +1269,13 @@ def main(argv=None):
     del H_kin_ion, psi_G
 
     # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
-    # Free: the matrix is already here.  Run on the IRREDUCIBLE rows, which
-    # are the ones ``wfn.energies`` indexes; the full-BZ table is their star
+    # Free: the matrix is already here.  Run on the WEDGE rows, and pair
+    # them with the SAME WFN rows the sweep read — ``wfn.energies`` is
+    # indexed by the WFN's own k axis, so ``_wedge_rows`` has to be
+    # applied to it too.  A bare ``[:nk_irr]`` would take the FIRST
+    # ``n_orbits`` WFN rows, which are not the wedge on any deck where
+    # the two sets differ, and would then compare each k's matrix against
+    # another k's eigenvalues.  The full-BZ table is the wedge's star
     # broadcast and carries no independent information.
     #
     # This is the detector that needs NO metadata.  A BerkeleyGW WFN.h5
@@ -1191,7 +1289,8 @@ def main(argv=None):
         _en = np.asarray(wfn.energies)
         _en = _en[0] if _en.ndim == 3 else _en          # (nk, nb), Ry
         check_degeneracy_consistency(
-            np.asarray(kin_ion_irr)[:nk_irr], _en[:nk_irr, :nb_eff],
+            np.asarray(kin_ion_irr)[:nk_irr],
+            _en[star_wedge_rows(sym)[0], :nb_eff],
             label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
     del kin_ion_irr
 
@@ -1292,12 +1391,15 @@ def main(argv=None):
                 ds.attrs["wfn_checksum"] = _wfn_checksum(wfn_path)
                 ds.attrs["wfn_checksum_scope"] = _WFN_CHECKSUM_SCOPE
                 ds.attrs["generator_commit"] = _generator_commit()
-                # The k-set actually COMPUTED — always the IBZ, and now
-                # always the one stored too except under --fold-hartree.
-                # ``nrk`` and ``k_set_computed`` predate the storage change
-                # and keep their meaning: ``nk - nrk`` full-BZ rows are
-                # symmetry copies, not independent evaluations.
-                ds.attrs["nrk"] = int(wfn.nkpts)
+                # The k-set actually COMPUTED — always the STAR wedge, and
+                # now always the one stored too except under
+                # --fold-hartree.  ``nrk`` keeps its meaning (``nk - nrk``
+                # full-BZ rows are symmetry copies, not independent
+                # evaluations) but it is the ORBIT count, not
+                # ``wfn.nkpts``: on a WFN that stores more k than the mesh
+                # has orbits the two differ, and the number that describes
+                # this file is the number of rows in it.
+                ds.attrs["nrk"] = int(nk_irr)
                 ds.attrs["k_set_computed"] = "ibz"
                 if v_h_all is not None and not folded:
                     vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
@@ -1322,8 +1424,8 @@ def main(argv=None):
             (f"stored as '{HARTREE_DATASET}'" if args.hartree
              else "absent (ISDF route required)"))
     if rank == 0:
-        _store = (f"IBZ slab, unfolded to {sym.nk_tot} k on read "
-                  f"({sym.nk_tot / max(int(wfn.nkpts), 1):.2f}x)"
+        _store = (f"star wedge, unfolded to {sym.nk_tot} k on read "
+                  f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x)"
                   if store_ibz else "full BZ (legacy fold-in layout)")
         print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
                f"{kin_ion_all.shape} stored on the {_store}, "

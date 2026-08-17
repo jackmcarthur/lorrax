@@ -35,6 +35,17 @@ ncond = 4
 nband = 32
 sys_dim = 2
 bispinor = true
+# EXPLICITLY OFF, 2026-08-16.  `use_band_extrapolation` now defaults TRUE and
+# hard-refuses `nband < 2*n_occ`; this deck's n_occ is 26 (= WFN nelec), so it
+# would need nband >= 52.
+#
+# HERE THE BAND COUNT CANNOT BE RAISED AT ALL: the fixture WFN.h5 carries only
+# 34 bands, against the 52 the gate would want.  Setting the key false is the
+# only way this deck runs, and it is also the right answer for what the deck
+# measures — the bispinor (SOC, noncolin) Sigma path against a frozen
+# reference.  Note this deck is the one where the n_occ-vs-N_electrons mapping
+# bites: it is noncolin, so n_occ = N_electrons = 26, not 13.
+use_band_extrapolation = false
 
 centroids_file = centroids_frac_256.txt
 centroids_file_current = centroids_frac_209_current.txt

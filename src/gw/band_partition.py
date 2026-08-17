@@ -79,6 +79,120 @@ class BandPartition:
         ones = jnp.ones(nb_active, dtype=bool)
         return cls(protected_mask=ones, in_range_mask=ones)
 
+    def report_multiplet_splits(self, enk_full_ry, band_offset, *,
+                                print_fn=print):
+        """Which protected-mask boundaries cut a DEGENERATE MULTIPLET.
+
+        Returns ``(n_split, worst_gap_mev)`` and prints one line per split.
+
+        WHY THIS EXISTS.  ``protected_mask`` comes from
+        ``scissor.classify_bands_in_grid``, an ALL-k energy-window predicate,
+        so it is not required to be contiguous and its edges are not required
+        to fall between multiplets.  Bands degenerate at one k need not be
+        degenerate at another, so band ``n`` can be in-grid while its
+        multiplet partner ``n+1`` is not — and then
+        :func:`apply_band_partition` gives one member full off-diagonal Σ and
+        the other a scalar scissor.  Half a multiplet is not a subspace of
+        anything: within a degenerate manifold the band label is arbitrary, so
+        treating members differently makes the answer depend on an
+        eigensolver's ordering, and the result is ``eigh``'d and reported as
+        QP energies.
+
+        MEASURED ELSEWHERE ON THIS TREE, which is why this is not theoretical:
+        `si_cohsex_debug`'s ζ/Σ band edge slices at a **0.000000 meV** gap,
+        and moving it to a clean edge takes the within-star Σ spread from
+        ~2 meV to **exactly 0.0000**.
+
+        ``enk_full_ry`` MUST BE THE UNTRUNCATED LADDER, not the active window.
+        ``boundary_min_gaps`` returns ``+inf`` at ``b = nb`` by construction,
+        so handed a window it cannot see the very edge that made it — the
+        whole reason that function now demands ``is_full_spectrum``.
+        ``band_offset`` maps active index 0 onto its absolute band.
+
+        REPORT ONLY.  It changes nothing; :meth:`promoted_to_multiplets` is
+        the change.
+        """
+        from common.band_degeneracy import (DEGENERACY_TOL_RY,
+                                            boundary_min_gaps)
+
+        mask = np.asarray(self.protected_mask, dtype=bool)
+        e = np.asarray(enk_full_ry, dtype=np.float64)
+        gaps = boundary_min_gaps(e, is_full_spectrum=True)
+        edges = np.flatnonzero(np.diff(mask.astype(np.int8)) != 0) + 1
+        splits = []
+        for a in edges:
+            b = int(a) + int(band_offset)
+            if 0 < b < gaps.size - 1 and gaps[b] <= DEGENERACY_TOL_RY:
+                splits.append((int(a), b, float(gaps[b])))
+        if not splits:
+            print_fn(f"  SC partition: {int(mask.sum())}/{mask.size} protected; "
+                     f"no boundary splits a multiplet")
+            return 0, 0.0
+        _MEV = 13605.693122994
+        print_fn("  " + "=" * 70)
+        print_fn(f"  !!! SC partition: {len(splits)} protected-mask boundary/ies "
+                 f"CUT A DEGENERATE MULTIPLET")
+        for a, b, g in splits:
+            print_fn(f"  !!!   active band {a} (absolute {b}): min gap over k "
+                     f"= {g * _MEV:.6f} meV")
+        print_fn("  !!! Half a multiplet gets off-diagonal Sigma and half a "
+                 "scalar scissor;")
+        print_fn("  !!! within a multiplet the band label is arbitrary, so "
+                 "this makes H_qp")
+        print_fn("  !!! depend on the eigensolver's ordering.")
+        print_fn("  " + "=" * 70)
+        return len(splits), max(g for _, _, g in splits) * _MEV
+
+    def promoted_to_multiplets(self, enk_full_ry, band_offset, *,
+                               print_fn=print) -> "BandPartition":
+        """This partition with ``protected_mask`` grown to WHOLE multiplets.
+
+        Owner ruling, 2026-08-16: *"I want degenerate spaces degenerate in
+        LORRAX."*  A protected mask whose edge falls inside a degenerate
+        manifold is promoted OUTWARD until it does not — every member of a
+        multiplet that has any protected member becomes protected.
+
+        GROWING, NEVER SHRINKING, and the direction is not arbitrary: the
+        alternative (dropping the protected member) would remove off-diagonal
+        Σ from a band the ω-grid actually covers, which is a loss of physics
+        to buy the same invariance.  Growing admits a band whose Σ is
+        edge-clamped — visible, and what
+        :meth:`warn_if_protected_outside_grid` is for — rather than silently
+        discarding a correction that was properly evaluated.
+
+        THIS MOVES EVERY QSGW NUMBER on any deck where a boundary splits, and
+        that is the accepted consequence rather than a defect: more bands
+        carry full off-diagonal Σ, so ``H_qp`` differs and so does its
+        spectrum.  ``in_range_mask`` is NOT promoted — it answers a different
+        question (is this band's Σ on the grid) whose answer is per band and
+        genuinely not a multiplet property.
+        """
+        from common.band_degeneracy import (DEGENERACY_TOL_RY,
+                                            boundary_min_gaps)
+
+        mask = np.asarray(self.protected_mask, dtype=bool).copy()
+        e = np.asarray(enk_full_ry, dtype=np.float64)
+        gaps = boundary_min_gaps(e, is_full_spectrum=True)
+        nb = mask.size
+        # Group the ACTIVE window into multiplets using absolute boundaries.
+        out, start = mask.copy(), 0
+        for a in range(1, nb + 1):
+            b = a + int(band_offset)
+            closes = (a == nb) or (b >= gaps.size - 1) or (
+                gaps[b] > DEGENERACY_TOL_RY)
+            if closes:
+                if mask[start:a].any():
+                    out[start:a] = True
+                start = a
+        n_added = int(out.sum() - mask.sum())
+        if n_added:
+            print_fn(f"  SC partition: promoted {n_added} band(s) into whole "
+                     f"multiplets — protected {int(mask.sum())} -> "
+                     f"{int(out.sum())} of {nb} "
+                     f"(owner ruling: degenerate spaces stay degenerate)")
+        return BandPartition(protected_mask=jnp.asarray(out),
+                             in_range_mask=self.in_range_mask)
+
     def warn_if_protected_outside_grid(self, *, print_fn=print) -> None:
         """Loud all-caps warning if any protected band is outside the
         ω-grid — that breaks the partition's whole purpose."""

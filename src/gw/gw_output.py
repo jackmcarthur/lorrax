@@ -566,6 +566,7 @@ def write_freq_debug(
     omega_dft_rel_ev,
     head_sigma_diag_w_kn_ry,
     omega_grid_ry,
+    sym,
     e_eval_ev=None,
     print_fn=print,
 ):
@@ -727,8 +728,17 @@ def write_freq_debug(
     )
     _cols.append(("eqp0", _eqp0_ev.astype(np.float64)))
     _cols.append(("eqp1", _eqp1_ev.astype(np.float64)))
+    # THE WEDGE, like every other text file this module writes.  Each
+    # column above was built on the full BZ because that is the shape the
+    # Sigma arrays arrive in; the rows kept are the ones Sigma was
+    # actually extracted on, and the same reduction on the k-list names them.
+    from symmetry_maps import reduce_full_bz_to_file_wedge
+    _cols = [(name, np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(arr))))
+             for name, arr in _cols]
     write_sigma_freq_debug_table(
-        config.debug.sigma_freq_debug_file, _cols)
+        config.debug.sigma_freq_debug_file, _cols,
+        kpoints_crys=np.asarray(reduce_full_bz_to_file_wedge(
+            sym, np.asarray(sym.unfolded_kpts, dtype=np.float64))))
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
@@ -1073,21 +1083,160 @@ def _warn_on_unphysical_h0(
 # Result writer  (QE ``punch('all')`` pattern)
 # ---------------------------------------------------------------------------
 
+def _star_spread_of_sigma_diag(sigma_tot_kij_ev, sym):
+    """Per-band star spread of Re diag Σ_tot, plus its max and n members.
+
+    Returns ``(per_band (nb,), worst, n_members)``, all in eV, or
+    ``(None, None, None)`` when no labels are supplied — "not measured"
+    and "measured zero" are the two things this diagnostic must never
+    confuse, so the caller then writes no header line rather than a zero.
+
+    Takes ``sym`` and reads ``sym.irr_idx_k`` HERE — one star label per
+    full-BZ k.  Grouping by it is reading the service's table, not
+    reconstructing a star: no coordinates are compared, no symmetry
+    operation is applied, and no tolerance appears anywhere below.  It is
+    read at the point of use rather than handed down from the driver,
+    which is why ``gw_jax`` holds no index table at all.
+
+    PER BAND, AND THAT IS THE POINT.  The quantity is max−min across a
+    star's members, per band, of the REAL DIAGONAL.  Reducing it to a
+    single max HERE was wrong: the band SCOPE belongs to the consumer,
+    not the producer.  ``tests/harness.py``'s metric has always been
+    scoped to the bands its BerkeleyGW fixture covers (16 on the Si
+    anchor), while this driver's sigma window is whatever the deck asks
+    for (60 on the same deck) — so a producer-side max silently answered
+    a wider question than the gate was asking.  Measured on that deck:
+
+        bands[:8]  0.9796   bands[:16]  2.6111   bands[:24]  7.2668
+        bands[:32] 7.5926   bands[:40] 10.0203   bands[:60] 41.3376   (meV)
+
+    ``bands[:16] = 2.6111`` reproduces the historical figure exactly, so
+    the physics was never in question; only the scope was.  Emitting the
+    vector lets each consumer take the max over the bands it actually
+    compares, and would have made that diagnosable by reading the file
+    instead of by bisecting a band ladder.
+
+    The max is emitted beside it because that is what a human reads at a
+    glance.  Its documented blindness is unchanged: conjugating a
+    Hermitian block leaves the real diagonal exactly intact, so the TRS
+    class is asked in ``tests/test_star_offdiag_gate.py`` instead.
+    """
+    if sym is None:
+        return None, None, None
+    labels = np.asarray(sym.irr_idx_k)
+    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    if labels.shape[0] != diag.shape[0]:
+        raise ValueError(
+            f"sym.irr_idx_k has {labels.shape[0]} entries but Sigma has "
+            f"{diag.shape[0]} k-rows — the star table and the self-energy "
+            f"are on different k-sets.")
+    per_band = np.zeros(diag.shape[1], dtype=np.float64)
+    n_members = 0
+    for lab in np.unique(labels):
+        rows = diag[labels == lab]
+        n_members += int(rows.shape[0])
+        if rows.shape[0] > 1:
+            per_band = np.maximum(per_band, rows.max(0) - rows.min(0))
+    return per_band, float(per_band.max(initial=0.0)), n_members
+
+
+def _star_spread_over_multiplets(sigma_tot_kij_ev, sym, e_dft_ry,
+                                 *, tol_ry=None):
+    """The same spread, but on DEGENERATE SUBSPACES instead of single bands.
+
+    WHY THIS EXISTS, and it is not a refinement of the per-band number — it
+    answers a question the per-band number CANNOT.
+
+    Inside a degenerate multiplet the individual band index is arbitrary: the
+    eigensolver may order or mix members differently at symmetry-equivalent
+    k, and nothing forbids it, because any unitary mixing within the subspace
+    is an equally valid eigenbasis.  So ``Re Σ_bb`` for a single ``b`` inside
+    a multiplet is NOT a symmetry-invariant quantity, and comparing it across
+    a star measures the eigensolver's gauge as much as the physics.  The
+    TRACE over the whole multiplet is invariant under that mixing — it is the
+    same subspace either way — so its spread across a star is a clean
+    symmetry diagnostic where the per-band one is not.
+
+    MEASURED on the Si production deck, 2026-08-15: **60 of 60 bands sit
+    inside a multiplet** (group sizes 4, 4, 8, 8, 8, 8, 20 — the top twenty
+    are one block with EXACTLY zero gaps), tolerance-insensitive from 1 meV
+    down to 13.6 µeV.  So on that deck there is no band anywhere in the
+    window for which the per-band spread is well defined.
+
+    READ THIS WITH THE DECK'S BAND EDGE IN HAND.  That deck runs
+    ``nband = 60`` on a 62-band WFN, and edge 60 has a min gap over k of
+    **0.000000 meV** — it slices a multiplet in the ζ / Σ band sum.  Move it
+    to a clean edge (40: 818 meV, 36: 157 meV) and every Σ channel's
+    within-star spread goes to **exactly 0.0000**.  So the large numbers this
+    function is used to interpret are a SLICED EDGE first and a band-label
+    gauge second; this diagnostic separates the second from a real symmetry
+    break, and ``boundary_min_gaps`` ON THE FULL MEAN FIELD is what catches
+    the first.
+
+    THE TRAP, because this function's own grouping is exposed to it:
+    ``boundary_min_gaps`` returns ``+inf`` at ``b = nb`` by construction, so
+    handed an already-truncated window it CANNOT see the truncation that
+    produced it — on the 60-band window it calls edge 60 clean, and on the
+    62-band mean field it reports 0.000000 meV.  The ``e_dft_ry`` passed here
+    is the Σ window, so the TOP group of the grouping below is only as
+    trustworthy as the deck's edge; it says nothing about whether that edge
+    was a safe place to stop.
+
+    The per-band metric is retained beside this one because it is what the
+    historical figures and the BerkeleyGW comparison are quoted in.
+
+    Returned per band (the multiplet's spread divided by its size) so the two
+    vectors are directly comparable element by element.
+    """
+    if sym is None or e_dft_ry is None:
+        return None
+    from common.band_degeneracy import DEGENERACY_TOL_RY, boundary_min_gaps
+
+    tol = float(DEGENERACY_TOL_RY if tol_ry is None else tol_ry)
+    labels = np.asarray(sym.irr_idx_k)
+    diag = np.real(np.diagonal(np.asarray(sigma_tot_kij_ev), axis1=1, axis2=2))
+    e = np.asarray(e_dft_ry, dtype=np.float64)
+    if e.ndim != 2 or e.shape[1] != diag.shape[1]:
+        return None
+    # THE SAME boundary rule the band-window safeguards use, so "clean" means
+    # one thing in this tree: min over k of the gap across each boundary.
+    # The sigma WINDOW, not the mean field: the outer entries come back
+    # nan, and the loop below never reads them (it only ever asks about
+    # interior boundaries).  Declaring it honestly is what stops this
+    # grouping from silently certifying the deck's own band edge.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
+    bounds, start = [], 0
+    nb = diag.shape[1]
+    for b in range(1, nb + 1):
+        if b == nb or gaps[b] > tol:
+            bounds.append((start, b))
+            start = b
+
+    out = np.zeros(nb, dtype=np.float64)
+    for lab in np.unique(labels):
+        rows = diag[labels == lab]
+        if rows.shape[0] <= 1:
+            continue
+        for lo, hi in bounds:
+            tr = rows[:, lo:hi].sum(axis=1)          # trace over the subspace
+            out[lo:hi] = np.maximum(
+                out[lo:hi], (tr.max() - tr.min()) / float(hi - lo))
+    return out
+
+
 def write_results(
     results: GWResults,
     sigma_diag_file: str,
     eqp0_file: str,
     eqp1_file: str,
     input_dir: str,
-    kpoints_crys: np.ndarray,
     kgrid: tuple[int, int, int],
-    kpoints_irr_frac: np.ndarray,
-    kpoints_reduced: np.ndarray | None = None,
-    kirr_to_kfull: np.ndarray | None = None,
+    sym,
     print_fn=print,
     *,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
+    qp_rotations_k_storage: str = "auto",
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1123,14 +1272,22 @@ def write_results(
     input_dir : str
         Base directory for ancillary output files (eqp_g0w0.dat,
         qp_wfn_rotations.h5).
-    kpoints_crys : np.ndarray, (nk_full, 3)
-        Full-zone k-points in crystal coordinates (for qp_wfn_rotations).
     kgrid : (nkx, nky, nkz)
         k-mesh dimensions.
-    kpoints_irr_frac : np.ndarray, (nk_irr, 3)
-        IBZ-wedge k-points in fractional coords (used for BGW eqp{0,1}.dat).
-    kpoints_reduced, kirr_to_kfull : optional
-        Reduced-zone k-point mapping for restart metadata.
+    sym : SymMaps
+        THE symmetry object, not tables taken off it.  Every k-basis
+        decision here goes through the service:
+        ``reduce_full_bz_to_file_wedge`` for the rows, and the SAME call on
+        ``sym.unfolded_kpts`` for the coordinates that label them — the
+        wedge's k-list IS the full-BZ list reduced, so it needs no accessor
+        of its own and the two cannot disagree about which k they mean.
+
+        This replaced five index/coordinate arrays (``kpoints_crys``,
+        ``kpoints_irr_frac``, ``kpoints_reduced``, ``kirr_to_kfull``,
+        ``k_star_labels``) that the driver unpacked and handed over.  A
+        reader then had to reconstruct what the five meant and how they had
+        to agree; the reduction now happens where the data is written,
+        which is the only place that knows what it is writing.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1176,12 +1333,82 @@ def write_results(
     sig_h_out = r2e * results.sig_h
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
+    # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
+    # Sigma is EXTRACTED on the irreducible wedge; the full-BZ arrays this
+    # function receives are its symmetry image and carry no independent
+    # information.  So every text file below is written on the wedge, one
+    # block per ``wfn.kpoints`` entry, each block stating its crystal
+    # coordinate.  ``reduce_full_bz_to_file_wedge`` is the ONLY way rows
+    # are selected here, and ``kpts_irr`` — the same reduction applied to
+    # the k-list — labels exactly those rows.
+    #
+    # ``sym.unfolded_kpts`` (the full-BZ list) reaches disk unreduced for
+    # ``qp_wfn_rotations.h5`` alone, which stores the full zone on purpose.  A consumer that needs the full BZ unfolds
+    # through the symmetry service, as ``htransform.read_eqp_energies``
+    # and ``bse_io.apply_eqp_corrections`` now do.
+    from symmetry_maps import reduce_full_bz_to_file_wedge
+
+    def _wedge(a):
+        """full BZ -> the file wedge, through the service."""
+        return np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(a)))
+
+    # The wedge's k-list is the full-BZ list put through the SAME
+    # reduction, so the coordinates and the rows cannot disagree about
+    # which k they are: one selection applied twice.
+    kpts_irr = _wedge(np.asarray(sym.unfolded_kpts, dtype=np.float64))
+
+    # ── THE STAR SPREAD IS MEASURED HERE, BECAUSE HERE IS WHERE IT EXISTS ─
+    # ``_star_spread`` (tests/harness.py) is the worst per-band
+    # disagreement between members of ONE star of the real diagonal
+    # Sigma_tot.  It is a real diagnostic — 2.611 meV on the production
+    # anchor against 0.000 on the orbit-closed 144-point centroid set is
+    # how a non-orbit-closed set was caught — and it is the reason the
+    # full-BZ file existed at all.
+    #
+    # It CANNOT be recovered downstream from a wedge file: unfolding the
+    # wedge back through the service is a gather, so every member would
+    # equal its parent and the spread would read 0.000 by construction —
+    # a fake green, which is worse than no check.  The information is
+    # here and nowhere else, so it is measured here, on the full-BZ
+    # arrays, against the service's OWN star labels (``sym.irr_idx_k``),
+    # and recorded in the file's header for the consumer to read.
+    #
+    # PER BAND, not as one number: the band SCOPE is the consumer's
+    # knowledge, not the producer's.  ``compare_to_bgw`` compares only the
+    # bands its BerkeleyGW fixture covers; this driver's sigma window is
+    # whatever the deck asked for.  Emitting the vector lets the consumer
+    # take its own max; emitting only a producer-side max answered a wider
+    # question than the gate asked and read 41.34 meV where the gate's own
+    # scope reads 2.61.
+    #
+    # That is strictly better than what it replaced: the harness grouped
+    # k into stars by matching mean-field ENERGY vectors to 2e-3 eV — a
+    # fingerprint that aliases whenever two stars are degenerate, and one
+    # of the sites this branch is removing.
+    _spread_per_band, _star_spread_ev, _nstar = _star_spread_of_sigma_diag(
+        sx_out + corr_out, sym)
+
+    # THE DEGENERACY-RESOLVED TWIN.  Measured on the SAME full-BZ Sigma and
+    # the SAME star labels, but on degenerate SUBSPACES rather than single
+    # bands, because a per-band Re Sigma_bb inside a multiplet is not a
+    # symmetry-invariant quantity at all.  It takes the DFT ladder to know
+    # where the multiplets are, and that is the array the window was sliced
+    # out of.
+    _spread_multiplet = _star_spread_over_multiplets(
+        sx_out + corr_out, sym, np.asarray(results.E_dft_ry, dtype=np.float64))
+
     write_sigma_to_file(
-        sx_out,
+        _wedge(sx_out),
         sigma_diag_file,
-        sigma_coh_kij_eV=corr_out,
-        hartree_kij_eV=sig_h_out,
-        energies_dft_ev=r2e * np.asarray(results.E_dft_ry, dtype=np.float64),
+        star_spread_ev=_star_spread_ev,
+        star_spread_per_band_ev=_spread_per_band,
+        star_spread_multiplet_ev=_spread_multiplet,
+        n_star_members=_nstar,
+        sigma_coh_kij_eV=_wedge(corr_out),
+        hartree_kij_eV=_wedge(sig_h_out),
+        energies_dft_ev=(
+            r2e * _wedge(np.asarray(results.E_dft_ry, dtype=np.float64))),
+        kpoints_crys=kpts_irr,
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
@@ -1193,20 +1420,12 @@ def write_results(
     # Static modes (COHSEX) hand in ``sigma_c_omega_diag_ev=None`` ⇒ Z=1
     # ⇒ eqp1 == eqp0, matching BGW's behavior for static runs.
     #
-    # All gw_jax internal arrays live on the unfolded full BZ (nk_full);
-    # BGW's eqp{0,1}.dat lists only the IBZ wedge.  ``kirr_to_kfull[i]``
-    # is the full-BZ index of IBZ point ``i``; index with it to subset.
-    if kirr_to_kfull is None:
-        raise ValueError(
-            "write_results requires kirr_to_kfull for the BGW eqp{0,1}.dat "
-            "writer — pass sym.kirr_fullids."
-        )
-    irr_idx = np.asarray(kirr_to_kfull, dtype=np.int64)
-
+    # ``_wedge`` and ``kpts_irr`` are the ones resolved above, for every
+    # file this function writes; the eqp pair is no longer the exception.
     e_dft_ev_full = np.asarray(results.E_dft_ry, dtype=np.float64) * r2e
-    e_dft_ev_irr = e_dft_ev_full[irr_idx]
+    e_dft_ev_irr = _wedge(e_dft_ev_full)
     kin_ion_diag_ev = (
-        np.real(np.diagonal(results.kin_ion_ry[irr_idx], axis1=1, axis2=2)) * r2e
+        np.real(np.diagonal(_wedge(results.kin_ion_ry), axis1=1, axis2=2)) * r2e
     )
     # ── H₀'s Hartree term ─────────────────────────────────────────────────
     # Handed to the assembly PRE-seam: ``eqp_bgw.resolve_hartree_diag_ev``
@@ -1220,7 +1439,7 @@ def write_results(
     # runs ``_warn_on_unphysical_h0`` on the resolved arrays, so a broken
     # H₀ still reports itself exactly once, with the same wording.
     hartree_diag_ev = np.real(
-        np.diagonal(sig_h_out[irr_idx], axis1=1, axis2=2))
+        np.diagonal(_wedge(sig_h_out), axis1=1, axis2=2))
     # MODE-CORRECT exchange, not the bare one.  ``sx_out`` is already
     # resolved per mode ~50 lines up: results.sig_x under PPM (where Sigma =
     # Sigma_x + Sigma_c and bare X is right), results.sig_sx under static
@@ -1233,16 +1452,16 @@ def write_results(
     # the regression gate, which compares only the sigma_diag file -- and that
     # writer already uses sx_out, which is why the two disagreed by exactly
     # Sigma_SX (4.474 eV at Gamma band 1).
-    sigma_x_diag_ev = np.real(np.diagonal(sx_out[irr_idx], axis1=1, axis2=2))
+    sigma_x_diag_ev = np.real(np.diagonal(_wedge(sx_out), axis1=1, axis2=2))
     # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
     # the driver already computed; in static modes it is the static Σ_COH
     # diagonal (post-degen-averaging if enabled).
     if results.use_ppm and results.sigma_c_diag_at_dft_ry is not None:
         sigma_c_at_dft_diag_ev = (
-            np.asarray(results.sigma_c_diag_at_dft_ry, dtype=np.complex128)[irr_idx] * r2e
+            _wedge(np.asarray(results.sigma_c_diag_at_dft_ry, dtype=np.complex128)) * r2e
         )
     else:
-        sigma_c_at_dft_diag_ev = np.diagonal(corr_out[irr_idx], axis1=1, axis2=2)
+        sigma_c_at_dft_diag_ev = np.diagonal(_wedge(corr_out), axis1=1, axis2=2)
 
     # E_DFT relative to the run's ω reference (matches gw_jax convention).
     # Only needed when there is a finite ω-grid to interpolate against.
@@ -1257,7 +1476,10 @@ def write_results(
     if results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None:
         sigma_c_omega_diag_ev_irr = np.asarray(
             results.sigma_c_omega_diag_ev, dtype=np.complex128
-        )[:, irr_idx, :]
+        ).transpose(1, 0, 2)
+        # k axis is 1 on the omega cube; reduce on axis 0 and put it back.
+        sigma_c_omega_diag_ev_irr = _wedge(
+            sigma_c_omega_diag_ev_irr).transpose(1, 0, 2)
         if results.efermi_ev is None:
             raise ValueError(
                 "write_results: results.efermi_ev required for PPM Z-factor; "
@@ -1270,9 +1492,15 @@ def write_results(
         # conventions.  Equal to E_DFT on every one-shot path (that IS
         # where a one-shot Σ is evaluated), which the assembly detects and
         # takes the historical single-interpolation branch for.
+        # ``_wedge`` and NOT the deleted ``irr_idx`` gather.  This is the
+        # eqp1 linearisation centre (origin/main bf6072cd), and it is a
+        # full-BZ (nk, nb) array like ``e_dft_ev_full`` two blocks up — so
+        # it takes the SAME reduction, which is the whole point of this
+        # commit: one named selection, applied everywhere, never an index
+        # table held by the writer.
         if results.e_eval_ev is not None:
-            e_eval_ev_irr = np.asarray(
-                results.e_eval_ev, dtype=np.float64)[irr_idx]
+            e_eval_ev_irr = _wedge(
+                np.asarray(results.e_eval_ev, dtype=np.float64))
             if e_eval_ev_irr.shape != e_dft_ev_irr.shape:
                 raise ValueError(
                     "write_results: GWResults.e_eval_ev has IBZ shape "
@@ -1282,7 +1510,7 @@ def write_results(
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
     assemble_eqp(
-        kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
+        kpoints_irr_frac=kpts_irr,
         band_offset=results.band_start,
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
@@ -1316,26 +1544,41 @@ def write_results(
             * r2e
         )
         g0w0_path = os.path.join(input_dir, "eqp_g0w0.dat")
+        # The wedge, like every other text file here.  Its one former
+        # full-BZ consumer was the out-of-tree ``make_eqp_htformat.py``,
+        # which existed to PRE-UNFOLD this file for htransform; htransform
+        # now reads the wedge ``eqp1.dat`` and unfolds through the
+        # symmetry service, so that converter has no job left.
         write_eqp_g0w0(
             g0w0_path,
-            results.E_dft_ry * r2e,
-            h0_diag + results.sigma_xc_at_dft_ev,
+            _wedge(results.E_dft_ry * r2e),
+            _wedge(h0_diag + results.sigma_xc_at_dft_ev),
+            kpoints_crys=kpts_irr,
         )
         print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
         nkx, nky, nkz = kgrid
+        # The service owns the (irr_idx_k, sym_idx_k, n_sym_spatial) triple
+        # — ``n_sym_spatial`` from ``sym_mats_k``, not from the WFN header,
+        # which is the derivation the unfold side conjugates by.
+        from ffi import _services as _svc
+        _svc.ensure_on_path()
+        import symmetry_maps as _sm
         write_qp_rotations_h5(
             os.path.join(input_dir, "qp_wfn_rotations.h5"),
             U_mnk=results.U_qp,
             E_qp_nk=results.E_qp_ry / 2.0,  # Ry → Hartree
             band_start=results.band_start,
             band_stop=results.band_stop,
-            kpoints_crys=kpoints_crys,
+            kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),
             nkx=nkx, nky=nky, nkz=nkz,
-            kpoints_reduced=kpoints_reduced,
-            kirr_to_kfull=kirr_to_kfull,
+            kpoints_reduced=kpts_irr,
+            kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            k_storage=str(qp_rotations_k_storage),
+            star_tables=_sm.star_tables_of(sym),
+            print_fn=print_fn,
         )
 
     # ── Status summary ────────────────────────────────────────────────────

@@ -165,8 +165,8 @@ def check_star_helpers_keep_the_sharding(mesh):
 
     sel_h, labels = star_select(A, irr)
     sel_d, _ = star_select(dev, irr)
-    back_h = star_broadcast(sel_h, irr, sidx, 2, irr_labels=labels)
-    back_d = star_broadcast(sel_d, irr, sidx, 2, irr_labels=labels)
+    back_h = star_broadcast(sel_h, irr, sidx, 2, irr_labels=labels, trs_reference="star_row")
+    back_d = star_broadcast(sel_d, irr, sidx, 2, irr_labels=labels, trs_reference="star_row")
     assert sel_d.sharding.spec == sh.spec, sel_d.sharding.spec
     assert back_d.sharding.spec == sh.spec, back_d.sharding.spec
 

@@ -66,6 +66,22 @@ The surface
     unitary/antiunitary band-matrix action.  Nonsymmorphic phases enter through
     the endpoint sewing matrices; vector/covector mixing is an explicit
     caller-supplied component representation.
+``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz``
+    THE TWO NAMED UNFOLDS, taking a ``SymMaps`` rather than index tables
+    so a driver never holds one.  TWO, because there are two different
+    IBZs and they are NOT the same size: the FILE wedge (``wfn.kpoints``,
+    ``nk_red``, what every .dat is indexed by and what BerkeleyGW means)
+    and the STAR wedge (``star_select``'s, one row per orbit).  Measured,
+    they coincide on ``si_cohsex_debug`` (8 = 8) and diverge on
+    ``cohsex_debug`` (4 vs 3) and ``gnppm_debug`` (9 vs 5) — so ONE name
+    would have been right on the deck most gates run and silently wrong
+    elsewhere.  Both are thin wrappers over ONE backend
+    (``star_broadcast``); a THIRD means the parameterisation is wrong.
+``reduce_full_bz_to_file_wedge``
+    The one reduction: full BZ → the rows that ARE ``wfn.kpoints``, so a
+    writer never holds ``kirr_fullids``.  Pure selection.  NOT the exact
+    inverse of the file-wedge unfold — see its docstring.  There is no
+    star-wedge twin because that is ``star_select``.
 ``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
 ``slice_q_full_to_ibz``
     The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
@@ -96,10 +112,26 @@ The surface
 ``verify_centroid_orbit_closure`` / ``CentroidClosureVerdict``
     Orbit closure as a MEASUREMENT rather than an exception:
     ``centroid_source_map_and_wrap`` refuses on a non-closed set, this says
-    by how much and on which ops.  It is also **the one place in the
-    service where ``tnp = 2π·τ`` is divided**, and it has no positional
-    slot for the translations precisely so that no caller can pass the
-    wrong convention silently.
+    by how much and on which ops.  It has no positional slot for the
+    translations, and enforces a mutually-exclusive ``tnp=``/``tau=``
+    keyword pair, precisely so that no caller can pass the wrong
+    convention silently.
+
+    IT IS NOT "the one place the 2π is divided" — this doc used to say
+    that, and it is false: ``orbit_syms`` divides at :192, :478, :887 and
+    :1308, and multiplies back at :1224.  THE REAL RULE, which is what a
+    caller needs:
+
+      ``SymMaps.translations`` is RAW BGW ``tnp`` (= 2π·τ).
+      G-space consumes it UNDIVIDED — :func:`tau_phase_row` wants ``tnp``.
+      Real space DIVIDES by 2π — every ``orbit_syms`` entry point does.
+
+    So ``tau_phase_row(S, sym.translations[s], G)`` and
+    ``centroid_source_map_and_wrap(..., sym.translations)`` take the SAME
+    array and mean DIFFERENT things by it.  Both are right today only
+    because each happens to want the convention it gets; nothing checks
+    it.  Passing one's argument to the other is a 2π error that no shape
+    or dtype catches.
 ``resolve_qgrid_symmetry`` / ``QgridSymmetryResolution``
     The DECISION, taken once: verdict → mode (``"ibz"`` | ``"full_bz"``)
     → tables → reason, in one object.  Consumers of the q-axis unfold
@@ -150,6 +182,10 @@ from symmetry_maps.maps import (
     kgrid_shift_map,
     slice_q_full_to_ibz,
     star_broadcast,
+    reduce_full_bz_to_file_wedge,
+    star_tables_of,
+    unfold_file_wedge_to_full_bz,
+    unfold_star_wedge_to_full_bz,
     star_select,
     star_spread,
     tau_phase_row,
@@ -192,7 +228,11 @@ from symmetry_maps.orbit_syms import (
     canonicalize_orbit,
     centroid_source_map_and_wrap,
     fft_grid_pullback_perm,
+    grid_point_image_perm,
     orbit_images,
+    r_action_forward,
+    r_action_forward_one,
+    snap_to_grid_and_split_wrap,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
@@ -213,6 +253,9 @@ __all__ = [
     # directed band-matrix edges: pure table + the one symmetry action
     "directed_edge_orbit_table", "q_stencil_orbit_table",
     "apply_band_matrix_symmetry",
+    # the two named unfolds (file wedge vs star wedge)
+    "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
+    "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "mix_channels_by_proper_rotation",
@@ -221,7 +264,10 @@ __all__ = [
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
-    "fft_grid_pullback_perm", "recover_symmorphic_density_point_group",
+    "fft_grid_pullback_perm", "grid_point_image_perm",
+    "r_action_forward", "r_action_forward_one",
+    "snap_to_grid_and_split_wrap",
+    "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
     "CLOSURE_TOL_DEFAULT",

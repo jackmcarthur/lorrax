@@ -98,12 +98,33 @@ class PPMBuildResult:
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    # (n_omega, nk, nb, nb).  Layout is carried BY THE ARRAY'S OWN
+    # (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS THE BAND-COUNT
+    # AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
+    # ``[0, band_counts[i])``, so ``sigma_c_kij[-1]`` is the ordinary
+    # full-band Σ_c and is what every downstream consumer takes.  Length 1
+    # in the ordinary case (``band_counts == (nband,)``), 3 under
+    # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
+    #
+    # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
     # SHARDING (single source of truth): replicated/uncommitted under
     # sigma_omega_layout=replicated (historical), or
-    # P(None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
+    # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
     sigma_c_kij: jax.Array
+    #: The LOGICAL band count each leading-axis element sums to.  Aligned
+    #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
+    #: and nothing else needs either.
+    band_counts: tuple[int, ...] = ()
+    #: ``(n_bracket, nk, nb, nb)`` Ry, or ``None``.  The CUMULATIVE Coulomb-hole
+    #: half of the ``ppm_invalid_mode="static_limit"`` term at each of
+    #: ``band_counts`` — the part of Σ_c that is a static Coulomb hole and is
+    #: therefore folded in as a CONSTANT rather than extrapolated.  Present
+    #: only when the extrapolation is running (``len(band_counts) > 1``) and
+    #: the run has invalid poles to treat.  It is NOT a component to be added
+    #: to ``sigma_c_kij`` — that fold already happened; it is the evidence for
+    #: how much of ``S_inf`` was never extrapolated
+    #: (``band_extrapolation.static_limit_tail_ruling``).
+    static_coh_at_counts: np.ndarray | None = None
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -119,10 +140,12 @@ class _SigmaBranchTiles(NamedTuple):
     still attached (stripped once, after the gather).
     """
     tiles: list                      # list[np.ndarray], one per addressable shard
-    tile_index: list                 # list[tuple[slice, ...]] 4-D global indices
+    tile_index: list                 # list[tuple[slice, ...]] 5-D global indices
     devices: list                    # owning jax devices, aligned with tiles
-    spatial_padded: tuple            # (nk_proj, m_pad, n_pad) global padded extents
-    sharding: NamedSharding          # P(None, None, 'x', 'y') over the 4-D global
+    spatial_padded: tuple            # (n_brk, nk_proj, m_pad, n_pad) padded extents
+                                     # (the ω axis sits BETWEEN n_brk and nk_proj
+                                     # in the assembled cube, so it is not here)
+    sharding: NamedSharding          # P(None, None, None, 'x', 'y'), 5-D global
     nb_real: int                     # real QP window extent (pre-pad), for strip
 
 
@@ -606,6 +629,7 @@ def _run_sigma_branch(
     wfns,
     mesh_xy: Mesh,
     meta,
+    brackets: tuple[tuple[int, int], ...],
     log_tag: str = "",
     print_fn=print,
     use_shipped_minimax_tables: bool = True,
@@ -663,6 +687,7 @@ def _run_sigma_branch(
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        brackets=brackets,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
     # project="full" windows — owner order 2026-07-28); crossing windows
@@ -671,6 +696,7 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         merged_x=True,
+        brackets=brackets,
     )
 
     # One async-D2H accumulator over the memory-tile sink: Σ_c(ω,k,m,n)
@@ -678,9 +704,10 @@ def _run_sigma_branch(
     # the full (n_ω,n_k,n_b,n_b) buffer never exists on any GPU until the
     # final device assembly at finalize().  (copy_to_host_async + a short
     # deque overlap GPU-τ_{k+lag} with the numpy-τ_k accumulate.)
+    n_brk = len(brackets)
     sink = _MemoryTileSink(
-        shape=(n_omega, nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        shape=(n_brk, n_omega, nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
     )
     accumulator: _SigmaAccumulator = _TauAccumulator(
         omega_vec=omega_vec, sink=sink)
@@ -711,8 +738,8 @@ def _run_sigma_branch(
         tiles=tiles,
         tile_index=tile_index,
         devices=tile_devices,
-        spatial_padded=(nk_proj, m_pad, n_pad),
-        sharding=NamedSharding(mesh_xy, P(None, None, 'x', 'y')),
+        spatial_padded=(n_brk, nk_proj, m_pad, n_pad),
+        sharding=NamedSharding(mesh_xy, P(None, None, None, 'x', 'y')),
         nb_real=nb_proj,
     ), windows
 
@@ -790,6 +817,74 @@ def _compute_invalid_static_sigma(
     return np.asarray(sig_static.addressable_data(0), dtype=np.complex128)
 
 
+def _invalid_static_coh_by_bracket(
+    wfns,
+    Wc0_q: jax.Array,
+    invalid_mask: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+    brackets,
+) -> np.ndarray:
+    """The static-limit term's OWN band-count series, one point per bracket.
+
+    WHY THIS EXISTS — THE ONE PLACE THE PPM-ONLY GUARD CANNOT REACH.
+    ``gw.sigma_dispatch``'s guard keeps the band extrapolation away from a
+    static Coulomb hole because the ``1/N → 0`` limit is wrong for one (it
+    ANTI-converges: 94.9 → 288.2 meV MAE as nband goes 60 → 124, overshooting
+    BerkeleyGW's exact closure by ~340 meV — ``gw.band_extrapolation``'s module
+    docstring owns that measurement).  That guard is per-``compute_mode``, and
+    ``ppm_invalid_mode = "static_limit"`` — the SHIPPING DEFAULT — puts a
+    static Coulomb hole inside a Σ whose ``compute_mode`` genuinely IS
+    ``gn_ppm``.  The guard cannot see it because it is per-MODE, one logical
+    ISDF mode at a time, underneath the seam the guard checks.
+
+    WHAT IS AND IS NOT BAND-COUNT DEPENDENT.  The static-limit term is
+    ``Σ_static = −⟨G_occ·W_static⟩ + ½⟨G_RI·W_static⟩``.  The first half runs
+    over OCCUPIED states through ``Gij`` and is band-count independent for any
+    ``nband ≥ nelec``.  The second — the Coulomb hole — runs over ``s.full``
+    with no occupation projector, so it carries exactly the slowly convergent
+    unoccupied tail this module exists to worry about.  Only the second half is
+    measured here, and that is not a simplification: the extrapolation is an
+    AFFINE estimator with ``sum(c) == 1``, so any band-count-INDEPENDENT part
+    passes through it unchanged and cancels identically out of
+    ``S_inf − S(N₃)``.  The occupied half therefore cannot contribute to the
+    diagnostic even in principle.
+
+    IT IS FREE, WHICH IS WHY IT CAN BE ON BY DEFAULT.  ``G_RI`` is a plain band
+    sum, so the brackets PARTITION it the same way they partition Σ_c, and
+    ``n_brk`` contractions over disjoint sub-ranges cost the same total flops
+    as the one contraction over the whole range that runs anyway.  The price is
+    one extra pass of the COH channel, not ``n_brk`` extra passes.
+
+    Returns the replicated host tensor ``(n_brk, nk, nb_sigma, nb_sigma)`` in
+    Ry, holding the DISJOINT per-bracket contributions — the caller cumulates
+    them to get Σ_COH at each of the plan's band counts, in the same order and
+    by the same rule that turns the Σ_c brackets into band counts.
+    """
+    from .cohsex_sigma import _make_cohsex_kernels
+
+    _, sigma_coh_k, _ = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot))
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
+    out = []
+    with mesh_xy:
+        W_static = jnp.where(
+            jnp.asarray(invalid_mask, dtype=bool),
+            jnp.asarray(Wc0_q, dtype=jnp.complex128),
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+        )
+        zero = jnp.zeros_like(W_static)
+        for lo, hi in brackets:
+            coh = sigma_coh_k(wfns, W_static, zero,
+                              ri_bands=(int(lo), int(hi)))
+            coh = jax.lax.with_sharding_constraint(coh, rep)
+            coh.block_until_ready()
+            out.append(np.asarray(coh.addressable_data(0),
+                                  dtype=np.complex128))
+    return np.stack(out, axis=0)
+
+
 # ---------------------------------------------------------------------------
 #  Top-level sigma driver
 # ---------------------------------------------------------------------------
@@ -805,6 +900,7 @@ def compute_sigma_c_ppm_omega_grid(
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
     occupation_state=None,
+    plan: 'BandBracketPlan | None' = None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute Σ^c_kij(ω) via GN-PPM windowed minimax integration.
@@ -819,9 +915,41 @@ def compute_sigma_c_ppm_omega_grid(
     term only (the sole occupation projector this driver builds); the
     dynamic branches take their occupations from ``wfns.occ``.  ``None``
     is the insulating default and is bit-exact.
+
+    ``plan`` is the band-bracket plan (:mod:`gw.band_extrapolation`).
+    ``None`` means the trivial one — a single bracket over every band —
+    which is the ordinary Σ_c and is bit-identical to the un-bracketed
+    code this replaced.  A three-bracket plan makes the τ kernel build
+    three DISJOINT Green's functions per τ against one W(τ), and the
+    returned cube's leading axis carries their CUMULATIVE sums.
+
+    The quadrature, the ω grid, E_ref_A/E_ref_B, W(τ) and the ISDF
+    representation are all built from the FULL band range BEFORE the
+    bracket loop and shared verbatim by every bracket — which is what
+    makes the three points differ by band count and nothing else.
     """
+    from .band_extrapolation import (
+        assert_brackets_match_ols_abscissae, trivial_plan)
 
     s = wfns.slices
+    if plan is None:
+        # The Σ count, not the loaded extent — see the comment at the
+        # ``plan_band_brackets`` call in ``ppm_pipeline`` for why these are
+        # different numbers on a split deck and the same one otherwise.
+        plan = trivial_plan(int(s.nb_sigma_sum), int(s.b2 - s.b0),
+                            int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
+    # THE PARTITION IS ENTERED ON THE NEXT LINE.  Checked here as well as at
+    # the ``ppm_pipeline`` plan seam because this is where ``plan.bounds``
+    # stops being a description and becomes the slices ``_run_sigma_branch``
+    # takes of the ψ/E/mask operands — and because a plan reaching this
+    # function from anywhere else (a future caller, a fixture) gets the same
+    # guarantee.  ``psi_coh_*`` below are built over ``s.full``, the LOADED
+    # extent, so nothing about the slicing itself would complain if the
+    # brackets ran past the Σ band sum: it would silently sum χ-only bands.
+    assert_brackets_match_ols_abscissae(
+        plan, s, meta=meta, where="ppm_sigma bracket partition")
+    brackets = plan.bounds
+    n_brk = plan.n_brackets
     psi_proj_xr = wfns.xr(s.sigma)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
@@ -941,6 +1069,7 @@ def compute_sigma_c_ppm_omega_grid(
     # Computed once here, added to Σ_c at every ω (host tensor add, or
     # tile-local on the sharded layout — same values on both).
     sigma_static_host = None
+    static_coh_at_counts = None
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
@@ -950,6 +1079,16 @@ def compute_sigma_c_ppm_omega_grid(
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV "
             f"(diag max {float(np.max(np.abs(np.diagonal(sigma_static_host, axis1=1, axis2=2)))) * RYD_TO_EV:.4f} eV)"
         )
+        # THE CONTAMINANT'S OWN BAND-COUNT SERIES — measured, not assumed.
+        # Only when the band extrapolation is actually running (n_brk > 1):
+        # with one bracket there is no fit to contaminate and no reader to
+        # inform, and the extra COH pass would be paid for nothing.
+        if n_brk > 1:
+            static_coh_at_counts = np.cumsum(
+                _invalid_static_coh_by_bracket(
+                    wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+                    brackets),
+                axis=0)
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
     # 2026-07-31).
@@ -989,7 +1128,8 @@ def compute_sigma_c_ppm_omega_grid(
 
     sigma_kij_host = (
         None if sharded_layout
-        else np.zeros((n_omega, nk_proj, nb_proj, nb_proj), dtype=np.complex128)
+        else np.zeros((n_brk, n_omega, nk_proj, nb_proj, nb_proj),
+                      dtype=np.complex128)
     )
 
     common_branch_kwargs = dict(
@@ -1007,6 +1147,7 @@ def compute_sigma_c_ppm_omega_grid(
         meta=meta,
         print_fn=print_fn,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+        brackets=brackets,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
@@ -1058,8 +1199,12 @@ def compute_sigma_c_ppm_omega_grid(
         idx = np.asarray(br.omega_idx, dtype=np.int64)
         if tile_acc is None:
             tile_meta = branch_tiles
+            # The bracket axis leads and the branch's ω axis sits BEHIND it
+            # (a branch owns a subset of ω but every bracket), so the full-ω
+            # accumulator keeps t's axis 0 and widens axis 1.
             tile_acc = [
-                np.zeros((n_omega,) + t.shape[1:], dtype=np.complex128)
+                np.zeros((t.shape[0], n_omega) + t.shape[2:],
+                         dtype=np.complex128)
                 for t in branch_tiles.tiles]
         else:
             # All branches run the same ψ window on the same mesh, so
@@ -1071,7 +1216,7 @@ def compute_sigma_c_ppm_omega_grid(
                 f"{branch_tiles.spatial_padded} vs {tile_meta.spatial_padded}")
         with timing.section("sigma.branch_fold"):
             for d, t in enumerate(branch_tiles.tiles):
-                tile_acc[d][idx] += t
+                tile_acc[d][:, idx] += t
 
     # Single end-of-stage gather: assemble the global padded Σ_c from the
     # per-rank host tiles and reconstruct it on every rank's host — ONCE,
@@ -1084,8 +1229,10 @@ def compute_sigma_c_ppm_omega_grid(
     if not sharded_layout and tile_acc is not None:
         assert tile_meta.nb_real == nb_proj
         with timing.section("sigma.host_gather"):
-            padded_shape = (n_omega,) + tuple(
-                int(s) for s in tile_meta.spatial_padded)
+            # spatial_padded is (n_brk, nk, m_pad, n_pad); the ω axis is
+            # INSERTED at position 1, behind the leading bracket axis.
+            _sp = tuple(int(v) for v in tile_meta.spatial_padded)
+            padded_shape = (_sp[0], n_omega) + _sp[1:]
             if int(jax.process_count()) == 1:
                 # Every shard is addressable (single process, any device
                 # count — no shard-0 assumption, Bug C): pure host
@@ -1118,13 +1265,14 @@ def compute_sigma_c_ppm_omega_grid(
     # (it replaces 'sigma.host_gather', which does not run here).
     if sharded_layout:
         with timing.section("sigma.tile_finalize"):
-            gshape = (n_omega, nk_proj, nb_proj, nb_proj)
+            gshape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
             if tile_acc is None:
                 # No branch produced tiles (all-empty branches): a zero
                 # Σ_c, mirroring the replicated path's untouched zeros
                 # buffer.  Same metadata idiom as
                 # _MemoryTileSink.host_tiles()'s empty path.
-                sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+                sharding = NamedSharding(
+                    mesh_xy, P(None, None, None, 'x', 'y'))
                 devices = list(sharding.addressable_devices)
                 dmap = sharding.devices_indices_map(gshape)
                 local_shape = sharding.shard_shape(gshape)
@@ -1137,7 +1285,7 @@ def compute_sigma_c_ppm_omega_grid(
                 # resolved to identity — padded extents ARE the real
                 # extents (pattern #7: assert it, don't assume it).
                 assert tuple(int(s) for s in tile_meta.spatial_padded) \
-                    == (nk_proj, nb_proj, nb_proj), (
+                    == (n_brk, nk_proj, nb_proj, nb_proj), (
                     f"sharded Σ layout saw a padded window "
                     f"{tile_meta.spatial_padded} despite the "
                     f"divisibility guard (nb={nb_proj})")
@@ -1146,11 +1294,47 @@ def compute_sigma_c_ppm_omega_grid(
                 tile_index = tile_meta.tile_index
             # static_limit fold, rank-local — same per-element order as
             # the replicated path (branch sum first, then the static
-            # term); tile_index[d] is (ω-slice, k-slice, m-slice,
-            # n-slice) into the global cube.
+            # term); tile_index[d] is (bracket-slice, ω-slice, k-slice,
+            # m-slice, n-slice) into the global cube.
+            #
+            # THE TERM GOES INTO BRACKET 0 ONLY, not into every bracket.
+            # Adding it to every bracket would multiply it by the bracket
+            # index under the cumulative sum; adding it to the first puts it
+            # into all three cumulative sums exactly once.
+            #
+            # ⚠ THE REASON IS **NOT** THAT THE TERM IS BAND-COUNT
+            # INDEPENDENT.  It is not.  This comment used to claim it was
+            # ("no unoccupied tail"), and that claim is false: half of
+            # Σ_static is ``+½⟨G_RI·W_static⟩`` with ``G_RI`` a sum over
+            # ``s.full`` and NO occupation projector
+            # (``cohsex_sigma.sigma_coh``), i.e. precisely the Coulomb hole's
+            # slowly convergent unoccupied tail.  MEASURED — see the
+            # ``static-limit`` block the extrapolation report now prints.
+            #
+            # The real reason is the same one the PPM-only guard in
+            # ``sigma_dispatch`` is built on: **a static Coulomb hole must
+            # not be run through this estimator.**  Its ``1/N → 0`` limit
+            # ANTI-converges (94.9 → 288.2 meV MAE as nband goes 60 → 124,
+            # ~340 meV past BerkeleyGW's exact closure —
+            # ``band_extrapolation``'s module docstring).  Folding the term
+            # in as a CONSTANT is what keeps it out of the fitted slope: the
+            # estimator is affine with ``sum(c) == 1``, so a constant passes
+            # into ``S_inf`` 1:1 and contributes nothing to ``A``,
+            # ``Δ_tail``, ``Δ_model``, the residual or the verdict.  That is
+            # the right treatment and it is deliberate.
+            #
+            # What it COSTS is that this term is then pinned at ``N₃`` and
+            # never extrapolated, so ``S_inf`` carries a band-truncated
+            # static Coulomb hole that the reported extrapolation bar does
+            # not cover.  That residual is invisible by construction — a
+            # constant cancels out of every diagnostic above — which is why
+            # it is measured separately and reported by name
+            # (``_invalid_static_coh_by_bracket`` →
+            # ``band_extrapolation.static_limit_tail_ruling``) instead of
+            # being asserted away in a comment, as it was here.
             if sigma_static_host is not None:
-                for d, ix4 in enumerate(tile_index):
-                    tile_acc[d] += sigma_static_host[tuple(ix4[1:])][None, ...]
+                for d, ix5 in enumerate(tile_index):
+                    tile_acc[d][0] += sigma_static_host[tuple(ix5[2:])][None, ...]
             arrays = [jax.device_put(t, dev)
                       for t, dev in zip(tile_acc, devices)]
             sigma_kij_sharded = jax.make_array_from_single_device_arrays(
@@ -1159,15 +1343,31 @@ def compute_sigma_c_ppm_omega_grid(
     # static_limit: fold the ω-independent invalid-pole static-COHSEX
     # term into Σ_c at every ω (host add; the sharded layout folded it
     # tile-locally above — identical values).
+    # (Bracket 0 only — see the sharded twin above for why.)
     if sigma_static_host is not None and not sharded_layout:
-        sigma_kij_host += sigma_static_host[None, ...]
+        sigma_kij_host[0] += sigma_static_host[None, ...]
 
+    # ── THE BRACKETS BECOME BAND COUNTS ─────────────────────────────────
+    # Up to here the leading axis holds DISJOINT band brackets; a
+    # cumulative sum along it turns them into Σ_c at each of the plan's
+    # band counts, with the last element the ordinary full-band Σ_c.  At
+    # n_brk = 1 the cumulative sum is the identity on the values, which is
+    # what keeps the default path bit-identical.  Done in place on the
+    # replicated path so the default run pays no second copy of the cube.
     if sharded_layout:
-        sigma_kij_req = sigma_kij_sharded
+        # Axis 0 is replicated in the Σ sharding, so the scan is entirely
+        # shard-local; pin the output sharding so it cannot drift off the
+        # layout every consumer downstream reads.
+        sigma_kij_req = jax.jit(
+            lambda a: jnp.cumsum(a, axis=0),
+            out_shardings=sigma_kij_sharded.sharding)(sigma_kij_sharded)
     else:
+        np.cumsum(sigma_kij_host, axis=0, out=sigma_kij_host)
         sigma_kij_req = jnp.asarray(sigma_kij_host, dtype=jnp.complex128)
     return SigmaOmegaResult(
         omega_ry=np.asarray(omega_req, dtype=np.float64),
         omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
+        band_counts=tuple(int(c) for c in plan.counts),
+        static_coh_at_counts=static_coh_at_counts,
     )

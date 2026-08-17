@@ -35,6 +35,38 @@ from ._compat import deprecated_alias
 # Charge-density point group (recovery of symmetry a reduced WFN dropped)
 # ─────────────────────────────────────────────────────────────────────────
 
+def grid_point_image_perm(fft_grid, M) -> np.ndarray:
+    """FFT-grid permutation of a SYMMORPHIC INTEGER point-group operation.
+
+    ``perm[p]`` is the FLAT index of ``(M · n_p) mod N`` for every grid point
+    ``n_p`` of an ``N = (Nx, Ny, Nz)`` FFT box, in C order.  Gather with it
+    (``field.ravel()[perm]``) to move a grid-sampled field by ``M``.
+
+    THIS IS S4 OF THE r-GRID CONSOLIDATION, and it is the one member of that
+    family with NO ROUNDING QUESTION AT ALL: integers in, integers out, ``%``
+    on integers.  That is why it is separate from
+    :func:`centroid_source_map_and_wrap` and :func:`fft_grid_pullback_perm`
+    rather than routed through them — those two exist to manage a
+    float-to-grid snap that does not arise here, and sending this through
+    either would import a hazard it does not have.
+
+    τ = 0 BY CONSTRUCTION.  ``M`` must be a symmorphic integer operation that
+    maps the grid to itself, e.g. a row of
+    :func:`recover_symmorphic_density_point_group`.  There is no translation
+    argument, because a non-symmorphic τ is not generally a grid vector and
+    the caller would have to round it — which is the hazard above.
+
+    Replaces two byte-identical open-codings (this module's density-invariance
+    filter and ``centroid/charge_density.py``'s ``symmetrize_on_grid``), which
+    also shared the radix flatten on the following line.
+    """
+    N = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    ix, iy, iz = np.meshgrid(*(np.arange(int(n)) for n in N), indexing="ij")
+    n_idx = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1)   # (P, 3)
+    img = (n_idx @ np.asarray(M, dtype=np.int64).T) % N[None, :]
+    return (img[:, 0] * (N[1] * N[2]) + img[:, 1] * N[2] + img[:, 2])
+
+
 def recover_symmorphic_density_point_group(
     avec: np.ndarray,
     charge_density: np.ndarray,
@@ -136,14 +168,10 @@ def recover_symmorphic_density_point_group(
     rho = np.asarray(charge_density, dtype=np.float64)
     N = np.asarray(rho.shape, dtype=np.int64)
     scale = float(np.max(np.abs(rho))) or 1.0
-    ix, iy, iz = np.meshgrid(np.arange(N[0]), np.arange(N[1]), np.arange(N[2]),
-                             indexing="ij")
-    n_idx = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], axis=1)  # (P,3)
     rho_flat = rho.ravel()
     keep = []
     for M in holo:
-        img = (n_idx @ M.T) % N[None, :]                # r' = M·n  (mod grid)
-        img_flat = img[:, 0] * (N[1] * N[2]) + img[:, 1] * N[2] + img[:, 2]
+        img_flat = grid_point_image_perm(N, M)          # r' = M·n  (mod grid)
         if np.max(np.abs(rho_flat[img_flat] - rho_flat)) <= tol_rho * scale:
             keep.append(M)
     if not keep:                                        # identity always works
@@ -331,7 +359,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     # 1. Unfold + dedupe at fp tolerance.
     # ``r @ Rinv[s].T + τ[s]`` = Rinv·r + τ in column form (BGW r-action).
-    images = (np.einsum('ri,sji->srj', reps_np, Rinv) + tau[:, None, :]) % 1.0
+    images = r_action_forward(reps_np, Rinv, tau, wrap=True)
     flat = images.reshape(-1, 3)
     keys = np.round(flat * inv).astype(np.int64) % inv
     _, first_idx = np.unique(keys, axis=0, return_index=True)
@@ -339,7 +367,7 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     # 2. For each unique candidate, compute its canonical (lex-min) orbit
     #    member, then dense-encode the canonical triples as orbit_id.
-    cand_imgs = (np.einsum('ci,sji->scj', flat, Rinv) + tau[:, None, :]) % 1.0
+    cand_imgs = r_action_forward(flat, Rinv, tau, wrap=True)
     cand_keys = np.round(cand_imgs * inv).astype(np.int64) % inv     # (n_sym, n, 3)
     # Lex via np.lexsort on (z, y, x) — primary key first in argument order
     # is leftmost; lexsort treats the LAST key as primary. So pass (z, y, x)
@@ -357,6 +385,96 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────
 # Centroid orbit permutation π_s : r_{π_s(μ)} = S_s r_μ + τ_s  (mod 1)
 # ─────────────────────────────────────────────────────────────────────────
+
+def r_action_forward(points, Rinv, tau, *, wrap):
+    """BGW forward r-action ``r' = Rinv·r + τ``, for a STACK of operations.
+
+    ``points`` ``(n, 3)`` fractional, ``Rinv`` ``(n_sym, 3, 3)``, ``tau``
+    ``(n_sym, 3)`` in units of the lattice vectors (i.e. ``tnp / 2π``).
+    Returns ``(n_sym, n, 3)``.
+
+    ``wrap`` is REQUIRED and has no default, because both answers are used in
+    this tree and the wrong one is invisible:
+
+    * ``wrap=True`` — reduce into ``[0, 1)``.  What an orbit/dedupe caller
+      wants: two points a lattice vector apart ARE the same point.
+    * ``wrap=False`` — leave the image where it landed.  What a DISTANCE
+      caller wants, and it is not an oversight: ``centroid/kmeans_isdf.py``
+      feeds these images to a minimum-image metric that carries its own
+      explicit offset table, so wrapping first would fold the image onto the
+      wrong periodic replica before the metric ever sees it.  Three of that
+      module's four call sites deliberately do not wrap.
+
+    DIRECTION.  This is the FORWARD action.  The SOURCE action
+    ``y = S·(r − τ)`` is a different map with a different consumer and is NOT
+    obtainable from this by flipping an argument — see
+    :func:`centroid_source_map_and_wrap` and the module docstring's note on
+    the 4 eV hex-system gap that came from confusing the two.
+    """
+    img = (np.einsum('rj,sij->sri', np.asarray(points, dtype=np.float64),
+                     np.asarray(Rinv, dtype=np.float64))
+           + np.asarray(tau, dtype=np.float64)[:, None, :])
+    return img % 1.0 if wrap else img
+
+
+def r_action_forward_one(points, Rinv_s, tau_s, *, wrap):
+    """:func:`r_action_forward` for ONE operation, jax-traceable.
+
+    The single-op sibling, for callers inside ``jit`` / ``lax.fori_loop``
+    that index one ``Rinv[s]`` at a time (``centroid/kmeans_isdf.py``'s Lloyd
+    kernels).  ``wrap`` is required here for the same reason and carries the
+    same meaning; see :func:`r_action_forward`.
+    """
+    img = points @ Rinv_s.T + tau_s
+    return img % 1.0 if wrap else img
+
+
+def snap_to_grid_and_split_wrap(images_frac, fft_grid):
+    """Fractional r-images → ``(grid index in [0, N), lattice wrap L)``.
+
+    THE ONE PLACE THE SNAP/WRAP POLICY LIVES, and the reason this function
+    exists at all.  Both r-grid maps in this module need it, they need it in
+    OPPOSITE DIRECTIONS, and until 2026-08-16 they each carried their own
+    copy — so the rule below had to be upgraded TWICE, and only one of the two
+    copies actually implemented it.
+
+    Serves both directions because it takes the images already computed:
+    the SOURCE map ``y = S·(r − τ)`` (:func:`centroid_source_map_and_wrap`)
+    and the FORWARD map ``r' = Rinv·r + τ``
+    (:func:`fft_grid_pullback_perm`) differ in how ``images_frac`` was built
+    and not at all in how it must be split.
+
+    SNAP TO GRID INTEGERS **BEFORE** THE FLOOR — this is the load-bearing
+    line, and it is evidence, not taste.  Centroids and grid points live at
+    multiples of ``1/fft_grid``; ``mtrx`` and ``τ`` are commensurate (BGW
+    guarantee), so ``images_frac`` is also a multiple of ``1/fft_grid`` up to
+    ~1e-17 of floating-point noise.  A naive ``np.floor`` flips an ``L``
+    component from 0 → −1 whenever the true integer part is 0 and a tiny
+    NEGATIVE noise lands on ``floor``'s discontinuity, **which produces a
+    spurious ``exp(±iπ/2)`` phase in ``unfold_isdf_operator``**.  MEASURED at
+    the ISDF noise floor on Si Fd-3m (24³ FFT, non-symmorphic τ): the
+    unsnapped code gave **14 of 64 q at relative error ~0.8**.  Rounding to
+    the grid first removes the discontinuity entirely.
+
+    Anyone tempted to "simplify" this to ``images - np.floor(images)``: that
+    is the code that produced those 14 q.
+
+    Returns
+    -------
+    idx : (..., 3) int64
+        The image's FFT-grid index, already reduced into ``[0, N)``.
+    L : (..., 3) int64
+        The integer lattice vector the image crossed — the umklapp wrap.
+        :func:`centroid_source_map_and_wrap` CONSUMES this (it drives the
+        ``exp(2πi q·L)`` phase on ζ); :func:`fft_grid_pullback_perm`
+        DISCARDS it, for the reason written at that call site.
+    """
+    g = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    images_int = np.rint(np.asarray(images_frac, dtype=np.float64) * g
+                         ).astype(np.int64)
+    L = np.floor_divide(images_int, g)
+    return images_int - L * g, L
+
 
 def centroid_source_map_and_wrap(
     r_mu_fft_idx: np.ndarray,
@@ -491,27 +609,14 @@ def centroid_source_map_and_wrap(
     r_shifted = r_frac[None, :, :] - tau_frac[:, None, :]            # (n_sym, n_rmu, 3)
     # images_raw[s, μ, i] = (mtrx[s] · r_shifted[s, μ])_i = sum_j S[s,i,j] r_shifted[s,μ,j]
     images_raw = np.einsum('sij,srj->sri', S.astype(np.float64), r_shifted)
-    # Snap to FFT-grid integers BEFORE floor.  Centroids live at
-    # multiples of 1/fft_grid; mtrx and τ are commensurate (BGW guarantee),
-    # so images_raw is also a multiple of 1/fft_grid up to 1e-17
-    # floating-point noise.  Naive ``np.floor`` flips an L component
-    # from 0 → -1 whenever the true integer part is 0 but a tiny
-    # negative noise hits np.floor's discontinuity — which produces a
-    # spurious exp(±iπ/2) phase in unfold_isdf_operator.  Snapping fixes this
-    # cleanly; verified at ISDF noise floor on Si Fd-3m (24³ FFT,
-    # non-symmorphic τ) where the previous code gave 14/64 q's with
-    # rel err ~0.8 due to this exact off-by-one.
-    images_int = np.rint(images_raw * fft_grid_np[None, None, :]).astype(np.int64)
-    grid_per_axis = fft_grid_np[None, None, :]
-    L_wrap = (np.floor_divide(images_int, grid_per_axis)).astype(np.int8)
-    images_int_mod = images_int - L_wrap.astype(np.int64) * grid_per_axis
-    images = images_int_mod.astype(np.float64) / grid_per_axis.astype(np.float64)
-
-    # Snap back to FFT-grid integers.  If τ × FFTgrid isn't integer to
-    # roundoff, this rounding will land on a half-grid point and the
-    # subsequent dict lookup will fail — that's the right error signal.
-    img_idx = np.rint(images * fft_grid_np[None, None, :]).astype(np.int64)
-    img_idx = img_idx % fft_grid_np[None, None, :]              # wrap residual
+    # THE SNAP AND THE WRAP, through the one implementation
+    # (:func:`snap_to_grid_and_split_wrap`).  THIS map KEEPS ``L``: it is the
+    # lattice vector the image crossed, and it drives the umklapp phase
+    # ``exp(2πi q·L_μ)`` on ζ.  The reason the snap must precede the floor —
+    # and the 14/64 q at rel err ~0.8 that measured it — is written there.
+    img_idx, L_wrap_i = snap_to_grid_and_split_wrap(
+        images_raw, fft_grid_np)
+    L_wrap = L_wrap_i.astype(np.int8)
 
     # Build a fast lookup from FFT-grid triple → centroid index.
     radix1 = fft_grid_np[1] * fft_grid_np[2]
@@ -1317,13 +1422,29 @@ def fft_grid_pullback_perm(
     # Real-space transform uses Rinv = inv(S).
     Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)            # (n_sym, 3, 3)
 
-    # images[s, r] = r @ Rinv[s].T + τ[s]  (mod 1)
+    # images[s, r] = r @ Rinv[s].T + τ[s]
     images = (np.einsum('rj,sij->sri', r_frac, Rinv.astype(np.float64))
               + tau_frac[:, None, :])
-    images = images - np.floor(images)                            # in [0, 1)
 
-    img_idx = np.rint(images * fg[None, None, :]).astype(np.int64)
-    img_idx = img_idx % fg[None, None, :]                         # wrap residual
+    # ---- THE ``L``-DISCARDING EXEMPTION, and it is NOT an oversight -------
+    # This map DISCARDS the lattice wrap, and that is what makes it safe:
+    # a grid-point permutation only cares WHICH grid point the image landed
+    # on, never how many cells it crossed to get there.
+    #
+    # This used to be its own ``images - np.floor(images)`` on UNSNAPPED
+    # floats — the exact construction that gave 14/64 q at rel err ~0.8 in
+    # the SOURCE map, and which was harmless here for precisely the reason
+    # above: an off-by-one in ``L`` cancels out of a quantity that never
+    # reads ``L``.  It now shares the snapped kernel anyway, because a
+    # correctness rule with one compliant and one non-compliant copy is a
+    # rule that gets upgraded once and stays broken in the other place.
+    #
+    # DO NOT "unify" this with ``centroid_source_map_and_wrap`` on the
+    # strength of them now calling the same helper.  They are opposite
+    # DIRECTIONS (forward ``Rinv·r + τ`` here, source ``S·(r − τ)`` there),
+    # the module docstring cites a silent 4 eV gap on hex systems from
+    # confusing them, and only that one may consume the ``L`` this returns.
+    img_idx, _L_unused = snap_to_grid_and_split_wrap(images, fg)
 
     radix1 = ny * nz
     radix2 = nz

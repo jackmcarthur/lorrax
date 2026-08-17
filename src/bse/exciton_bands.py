@@ -1482,10 +1482,16 @@ def main(argv=None):
     # energies, so a QP-driven gap change cannot mis-slice); the interpolated
     # leg is corrected below, right after ``initialize_wfns``.
     #
-    # ``input_file=None`` on purpose: with it, apply_eqp_corrections asserts the
-    # eqp file is IBZ-sized (nk_ibz == sym.nk_red).  LORRAX's own GW writes
-    # eqp1.dat on the FULL BZ (one block per k of the WFN, same order), so the
-    # energy-matching branch is the correct one and it maps 1:1 here.
+    # ``args.input`` is passed, and the eqp file is the IRREDUCIBLE WEDGE.
+    # This used to pass ``input_file=None`` to reach a second code path that
+    # matched full-BZ k to wedge blocks by mean-field energy to 0.01 eV, on
+    # the stated grounds that "LORRAX's own GW writes eqp1.dat on the FULL
+    # BZ".  It does not — ``gw_output.py`` subsets through ``kirr_to_kfull``
+    # and ``gw_jax.py`` passes ``wfn.kpoints`` — so the assertion that
+    # branch was avoiding is the one that PASSES, and the heuristic was
+    # bespoke unfolding standing in for the symmetry service.  Both are
+    # gone; ``apply_eqp_corrections`` now unfolds through the service's
+    # single ``star_broadcast`` adapter and ``input_file`` is required.
     enk_qp_full = None
     if args.eqp:
         from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
@@ -1493,17 +1499,13 @@ def main(argv=None):
         import h5py as _h5py
         with _h5py.File(restart_file, "r") as _f:
             _enk_dft_full = np.asarray(_f["enk_full"][:])
-        # n_occ has to come from the WFN's ``ifmax`` (via ``input_file``), but
-        # ``input_file`` cannot be handed to apply_eqp_and_reslice_bands — it
-        # would reach apply_eqp_corrections' IBZ branch and assert.  Resolve it
-        # here and pass it explicitly instead.
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
         data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
-            restart_file, args.eqp, None, n_val, n_cond, n_occ_in,
+            restart_file, args.eqp, args.input, n_val, n_cond, n_occ_in,
             mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry)
-        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp)
+        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp, args.input)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
             f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "
@@ -1544,10 +1546,13 @@ def main(argv=None):
                                      mesh_xy=mesh_xy)
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
-        # its ``htransform.read_eqp_energies`` expects the "n=… EQP=…" text
-        # form, not the columnar eqp1.dat LORRAX's GW writes, and it swallows
-        # the parse failure with a log line — i.e. it would silently leave DFT
-        # energies in place.  One parser (``bse_io.read_bgw_eqp``) for both legs.
+        # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
+        # "n=… EQP=…" text form on the FULL BZ, not the columnar IBZ eqp1.dat
+        # LORRAX's GW writes, so it would refuse this file on both counts.
+        # (It refuses loudly — ``htransform.py:1313-1320`` raises SystemExit;
+        # this comment used to say it "swallows the parse failure with a log
+        # line", which has not been true since that FATAL was added.)
+        # One parser (``bse_io.read_bgw_eqp``) for both legs.
         _b0 = int(wfn.nelec) - int(params["nval"])
         _b1 = int(wfn.nelec) + int(params["ncond"])
         enk_sigma = jnp.asarray(enk_qp_full[:, _b0:_b1].T)      # (nb, nk) Ry

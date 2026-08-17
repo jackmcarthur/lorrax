@@ -112,28 +112,70 @@ class BandWindowDegeneracyError(RuntimeError):
     """A window boundary splits a degenerate multiplet, in ``strict`` mode."""
 
 
-def boundary_min_gaps(enk_ry: np.ndarray) -> np.ndarray:
+def boundary_min_gaps(enk_ry: np.ndarray, *,
+                      is_full_spectrum: bool) -> np.ndarray:
     """Smallest over k of the gap across each inter-band boundary.
 
     Parameters
     ----------
     enk_ry : (nk, nb) float array
         Band energies in **Rydberg**, ascending in the band axis at each k.
+    is_full_spectrum : bool
+        **REQUIRED, no default.**  ``True`` iff ``enk_ry`` is every band the
+        mean field carries, so that its outer boundaries really do cut
+        nothing.  ``False`` iff it is a WINDOW sliced out of a larger
+        spectrum — then the outer boundaries ARE cuts whose gaps this array
+        cannot see, and they come back ``nan``.
 
     Returns
     -------
     (nb + 1,) float array
         Element ``b`` is ``min_k |e[k, b] - e[k, b-1]|`` — the tightest gap
         anywhere in the BZ across the boundary that would separate bands
-        ``< b`` from bands ``>= b``.  The two outer boundaries ``b = 0`` and
-        ``b = nb`` cut nothing, so they are ``+inf``.
+        ``< b`` from bands ``>= b``.  The two outer boundaries are ``+inf``
+        on a full spectrum and ``nan`` on a window.
+
+    WHY THIS ARGUMENT EXISTS, AND WHY IT HAS NO DEFAULT
+    ---------------------------------------------------
+    This function used to return ``+inf`` at ``b = 0`` and ``b = nb``
+    unconditionally, on the reasoning that an outer boundary separates
+    nothing.  That is right when the array IS the spectrum and **exactly
+    backwards when it is a window**: the window's own edges are the cuts
+    somebody made, and reporting ``+inf`` there certifies as safe the one
+    thing this module exists to catch.
+
+    MEASURED, 2026-08-15, ``si_cohsex_debug`` — 62 bands in the WFN, deck
+    runs ``nband = 60``::
+
+        boundary_min_gaps(sigma window, 60 bands)[60]  ->  +inf   "clean"
+        boundary_min_gaps(mean field,   62 bands)[60]  ->  0.000000 meV
+
+    The second is the truth: that edge slices a multiplet, and moving it to
+    a clean edge (40: 818 meV, 36: 157 meV) takes every Σ channel's
+    within-star spread from ~2 meV to **exactly 0.0000**.  The first is what
+    a reader got, and it is why the ζ-window and star-spread analyses both
+    reported the sliced edge as safe.
+
+    A DEFAULT WOULD REBUILD THE TRAP.  Same doctrine as ``trs_reference`` in
+    ``symmetry_maps``: a choice whose wrong branch is invisible to every
+    cheap check does not get a default, because the caller who has not
+    thought about it must get a ``TypeError`` rather than a plausible wrong
+    answer.  ``nan`` rather than ``0.0`` for the unknowable case for the
+    same reason — ``nan > tol`` and ``nan <= tol`` are BOTH False, so a
+    window edge can be neither certified clean nor silently called dirty; it
+    has to be asked about the full spectrum.
+
+    If you want to know whether a WINDOW's own edges are clean, you cannot
+    learn it from the window.  Pass the untruncated ladder and the window
+    bounds to :func:`check_band_window`.
     """
     e = np.asarray(enk_ry, dtype=np.float64)
     if e.ndim != 2:
         raise ValueError(
             f"boundary_min_gaps: expected (nk, nb) energies, got shape {e.shape}")
     nb = e.shape[1]
-    gaps = np.full(nb + 1, np.inf, dtype=np.float64)
+    outer = np.inf if bool(is_full_spectrum) else np.nan
+    gaps = np.full(nb + 1, outer, dtype=np.float64)
     if nb >= 2:
         gaps[1:nb] = np.min(np.abs(np.diff(e, axis=1)), axis=0)
     return gaps
@@ -145,6 +187,90 @@ def _tightest_k(enk_ry: np.ndarray, b: int) -> tuple[int, float]:
     d = np.abs(e[:, b] - e[:, b - 1])
     k = int(np.argmin(d))
     return k, float(d[k])
+
+
+def snap_cut_to_clean_boundary(
+    enk_ry: np.ndarray,
+    cut: int,
+    *,
+    tol_ry: float = DEGENERACY_TOL_RY,
+    lo: int = 0,
+    hi: int | None = None,
+) -> int:
+    """Nearest band count ``<= hi`` whose boundary splits no multiplet.
+
+    THE SAME CONSTRAINT :func:`resolve_band_window` ENFORCES, asked as a
+    one-sided question.  ``resolve_band_window`` is given a *window* the user
+    asked for and may only widen it outward; this is given a single INTERNAL
+    sampling point — a band count at which a converging sum is to be
+    evaluated — where neither direction loses anything the user requested, so
+    the nearest clean boundary is the right answer and staying near the
+    requested fraction is what matters.  Both read the same one number per
+    boundary, :func:`boundary_min_gaps`; there is no second notion of "clean"
+    in the tree.
+
+    Parameters
+    ----------
+    enk_ry : (nk, nb) float array
+        Band energies in **Rydberg**, ascending in the band axis at each k.
+        Pass the array the sum will actually be truncated against.
+    cut : int
+        Requested band count (= boundary index: bands ``< cut`` are kept).
+    tol_ry : float
+        Two bands are "the same multiplet" within this, in Ry.
+    lo, hi : int
+        Inclusive search bounds on the returned count.  ``hi`` defaults to
+        ``nb``.  ``lo``/``hi`` are themselves returned unchecked when the
+        walk reaches them — the caller owns what a degenerate endpoint means.
+
+    Returns
+    -------
+    int
+        The clean boundary nearest ``cut``, ties broken DOWNWARD (fewer
+        bands), which keeps a set of ascending cuts from crossing.
+
+    Notes
+    -----
+    The walk terminates on the ``lo``/``hi`` bounds, which every caller
+    sets strictly inside ``(0, nb)``: this snaps INTERIOR cuts only.  It
+    does NOT rely on the outer boundaries being clean — since b27f98c3
+    they are ``nan`` on a window rather than ``+inf``, and this function
+    asks ``boundary_min_gaps`` for the window reading deliberately.  A
+    caller that widens the range to an outer boundary gets the refusal
+    below rather than a false certification.
+    """
+    e = np.asarray(enk_ry, dtype=np.float64)
+    nb = int(e.shape[1])
+    hi = nb if hi is None else int(hi)
+    lo = int(lo)
+    if not (0 <= lo <= hi <= nb):
+        raise ValueError(
+            f"snap_cut_to_clean_boundary: bad bounds lo={lo} hi={hi} nb={nb}")
+    # ``is_full_spectrum=False`` -- the CONSERVATIVE branch, and it cannot
+    # change any answer this function gives.  Callers hand it a WINDOW
+    # (``band_extrapolation.plan_band_brackets`` slices
+    # ``enk_ry[:, :nb_logical]``), so ``False`` is the honest label; and
+    # the walk below only ever considers candidates in ``[lo, hi]``, which
+    # every caller sets strictly inside ``(0, nb)`` because this function
+    # snaps INTERIOR cuts only.  ``gaps[0]`` and ``gaps[nb]`` -- the two
+    # elements the flag changes -- are therefore never read.  ``False``
+    # additionally means that if a future caller DID widen the range, a
+    # window edge would come back ``nan`` and be refused rather than
+    # certified, which is the failure b27f98c3 exists to prevent.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
+    tol = float(tol_ry)
+    cut = int(min(max(int(cut), lo), hi))
+    for delta in range(0, max(cut - lo, hi - cut) + 1):
+        for cand in ((cut - delta), (cut + delta)):     # downward tie-break
+            if lo <= cand <= hi and gaps[cand] > tol:
+                return int(cand)
+    # Unreachable while either endpoint is clean, which boundary_min_gaps
+    # guarantees for 0 and nb; a caller-restricted [lo, hi] can in principle
+    # contain no clean boundary at all, and that is a refusal, not a guess.
+    raise BandWindowDegeneracyError(
+        f"snap_cut_to_clean_boundary: no band count in [{lo}, {hi}] has a "
+        f"multiplet-clean boundary at tol "
+        f"{tol * 1e3 * _EV_PER_RY:.3f} meV (requested {cut}).")
 
 
 def resolve_band_window(
@@ -203,7 +329,10 @@ def resolve_band_window(
     e = np.asarray(enk_ry, dtype=np.float64)
     nb = e.shape[1]
     n_occ, n_val, n_cond = int(n_occ), int(n_val), int(n_cond)
-    gaps = boundary_min_gaps(e)
+    # These two read INTERIOR boundaries only (both guard 0 < b < nb), so
+    # the outer value cannot change their answers -- and they cannot know
+    # what the caller handed them, so they declare the conservative case.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
     tol = float(tol_ry)
 
     lo, hi = n_occ - n_val, n_occ + n_cond
@@ -343,7 +472,10 @@ def check_band_window(
     if mode == "off":
         return
     e = np.asarray(enk_ry, dtype=np.float64)
-    gaps = boundary_min_gaps(e)
+    # These two read INTERIOR boundaries only (both guard 0 < b < nb), so
+    # the outer value cannot change their answers -- and they cannot know
+    # what the caller handed them, so they declare the conservative case.
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
     nb = e.shape[1]
     bad = []
     for b, name in ((int(b_min), "lower"), (int(b_max), "upper")):

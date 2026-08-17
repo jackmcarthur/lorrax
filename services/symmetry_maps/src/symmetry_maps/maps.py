@@ -1195,10 +1195,25 @@ class SymMaps:
             self.q_irr_kgrid_int = self.kvecs_asints.copy()
             return
 
-        # BGW convention: `mtrx` (= `sym_matrices` here) acts on G-vectors
-        # in column form: `G' = mtrx @ G`. For real-space coords the
-        # corresponding action uses `Rinv = inv(mtrx)`: `r' = Rinv @ r + τ`
-        # (see orbit_syms.centroid_source_map_and_wrap,
+        # THE G-SPACE ACTION USES ``mtrx.T``, NOT ``mtrx``.  This comment
+        # used to say `G' = mtrx @ G`, which contradicts both the line
+        # directly below it (``sym_mats_k = mtrx.transpose(0,2,1)``) and
+        # the only place G is actually rotated
+        # (``wfn_loader/loader.py:604``, ``einsum('ij,kj->ki',
+        # sym_mats_k[sym_idx], k_gvecs)``).  It also contradicted the
+        # correct statement in ``syms_crystal_to_cartesian`` below
+        # (``G_full = mtrx.T @ G_irr = sym_mats_k @ G_irr``).
+        #
+        # It is corrected rather than deleted because a reader of
+        # ``SymMaps.__init__`` hits this before either of those, and the
+        # transposed convention it stated is the one the known-broken
+        # ``tests/bench/charge_density.py:159-174`` adopted — it rotates
+        # G with ``R_grid`` (= ``mtrx``) and is wrong on every
+        # non-symmorphic deck.
+        #
+        # So: k and G both transform with ``sym_mats_k = mtrx.T``
+        # (column form).  Real space uses `Rinv = inv(mtrx)`:
+        # `r' = Rinv @ r + τ` (see orbit_syms.centroid_source_map_and_wrap,
         # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
         # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
         self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
@@ -2261,7 +2276,7 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None, *, trs_reference="star_row"):
+                   irr_labels=None, *, trs_reference):
     """Spread an IBZ band-index quantity over the full BZ.
 
     ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
@@ -2302,6 +2317,20 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
     equality default: a caller that omitted them would get silently wrong
     matrices on every TRS pair (measured 3.6e-01 relative, job 7889235),
     and nothing downstream would notice.
+
+    ``trs_reference`` IS REQUIRED TOO, AND HAS NO DEFAULT.  It used to
+    default to ``"star_row"``, which is right for a ``star_select``
+    operand and wrong for a file slab — and the failure it produces is
+    the one nothing sees: 183.61 eV on the off-diagonals with the REAL
+    DIAGONAL EXACTLY INTACT, so the electron count, hermiticity, the
+    spectrum, the eqp.dat V_H column and the diagonal star-spread metric
+    all survive it.  A default is exactly the wrong shape for a choice
+    whose wrong branch is invisible to every cheap check, so there is
+    none: a caller that has not thought about which flavour its operand
+    is gets a ``TypeError`` at the call site instead of a plausible wrong
+    matrix.  ``KStarMap.broadcast`` does not take the argument because
+    its operand can only have come from :meth:`KStarMap.select`, which
+    fixes the answer to ``"star_row"`` by construction.
     """
     irr = np.asarray(irr_idx_k)
     sidx = np.asarray(sym_idx_k)
@@ -2334,6 +2363,141 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
             "from star_select, rows are full-BZ) or 'ibz_slab' (A_irr is "
             f"the untransformed IBZ slab); got {trs_reference!r}.")
     return _broadcast_rows(A_irr, take, conj)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# THE TWO NAMED UNFOLDS.  Two operations, ONE backend.
+# ─────────────────────────────────────────────────────────────────────────
+# There are two different IBZs in this tree and they are not the same size
+# (docs/architecture/symmetry_register.md, "THERE ARE TWO DIFFERENT IBZs"):
+#
+#   file wedge  — ``wfn.kpoints``, length ``sym.nk_red``, addressed by
+#                 ``kirr_fullids``.  What every .dat output is indexed by
+#                 and what BerkeleyGW means by the IBZ.
+#   star wedge  — what :func:`star_select` keeps, one row per orbit.
+#
+# MEASURED: they coincide on ``si_cohsex_debug`` (8 = 8) and diverge on
+# ``cohsex_debug`` (4 vs 3) and ``gnppm_debug`` (9 vs 5).  A single
+# ``unfold_ibz_to_full_bz`` would therefore be correct on the deck most
+# gates run and silently wrong on the others — so there are two names, and
+# the call site says which without the reader needing to know what
+# ``trs_reference`` means.
+#
+# They are thin wrappers over ONE backend (:func:`star_broadcast`), which
+# is what keeps a future spinor-rotation or bispinor upgrade a one-place
+# change.  Resist making this four: a THIRD unfold means the
+# parameterisation is wrong, not that another name is needed.
+
+def star_tables_of(sym):
+    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` off a live ``SymMaps``.
+
+    ``n_sym_spatial`` is derived from ``sym_mats_k`` (always ``2·ntran``
+    in both SymMaps branches) rather than read from the WFN header,
+    because that is the derivation :func:`unfold_psi` uses to decide which
+    rows get conjugated when it BUILDS ψ(Sk).  Reading it from the header
+    instead lets the producer and the consumer of that convention drift.
+
+    PUBLIC because a WRITER needs it too, not only the unfolds below.  A
+    file that stores a wedge has to file the reconstruction tables beside
+    the arrays (``kin_ion.h5``'s ``irr_idx_k``/``sym_idx_k``, and now
+    ``qp_wfn_rotations.h5``'s), and the alternative to exporting this is
+    every writer re-spelling the ``// 2`` — which is precisely the
+    header-vs-``sym_mats_k`` drift the paragraph above exists to prevent.
+    """
+    return (np.asarray(sym.irr_idx_k, dtype=np.int32),
+            np.asarray(sym.sym_idx_k, dtype=np.int32),
+            int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
+
+
+#: The private spelling this function had while it was unfold-only.  Kept
+#: as an alias so the in-module call sites below read unchanged.
+_star_tables_of = star_tables_of
+
+
+def unfold_file_wedge_to_full_bz(sym, data):
+    """FILE wedge → full BZ.  ``(sym.nk_red, …)`` → ``(sym.nk_tot, …)``.
+
+    The wedge as the WFN stores it — ``wfn.kpoints``, the k-set every
+    ``.dat`` output is indexed by and what BerkeleyGW calls the IBZ.  Use
+    this for anything read off disk in that indexing: ``eqp{0,1}.dat``,
+    ``sigma_diag.dat``, a ``kin_ion.h5`` slab.
+
+    Takes the ``SymMaps`` itself, not index tables: the tables are the
+    service's business and a driver that holds one has already lost the
+    abstraction.
+
+    ``irr_labels`` IS THE WHOLE DIFFERENCE BETWEEN THE TWO WEDGES, and
+    omitting it is what made this function a different operation from the
+    production reader.  ``star_broadcast`` with no labels addresses
+    ``data`` by POSITION AMONG DISTINCT STAR LABELS — right for a star
+    wedge, and right here only while the WFN's k-set IS that wedge.  The
+    rows of a FILE wedge are ``wfn.kpoints`` rows, so the labels are the
+    identity and the gather must be ``data[irr_idx_k]`` — which is
+    exactly what ``src/file_io/kin_ion.py``'s
+    ``broadcast_ibz_to_full_bz`` passes.  MEASURED 2026-08-17 on a random
+    operand, this function against that one: ``gnppm_debug`` (nk_red 9,
+    orbits 5) 3.82e+00, ``bispinor_debug`` (9, 5) 5.18e+00,
+    ``cohsex_debug`` (4, 3) 3.91e+00, and exactly 0.0 on
+    ``si_cohsex_debug`` / ``si_bse_debug`` / ``hbn_cohsex_debug``, where
+    ``nk_red == n_orbits``.  That partition is precisely the one a
+    "31.05 / 12.44 / 8.04 Ry star-relation failure" was reported over —
+    a real measurement taken with a broken instrument.
+    :func:`unfold_star_wedge_to_full_bz` below is the one that WANTS the
+    derived labels, and it says so by not passing any.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    n_rows = int(np.shape(data)[0])
+    if n_rows != int(sym.nk_red):
+        raise ValueError(
+            f"unfold_file_wedge_to_full_bz: operand has {n_rows} rows but "
+            f"the FILE wedge is sym.nk_red = {int(sym.nk_red)}.  A "
+            f"{len(set(int(v) for v in irr))}-row operand is the STAR "
+            f"wedge — call unfold_star_wedge_to_full_bz for that one; the "
+            f"two are different functions wherever the two wedges differ.")
+    return star_broadcast(data, irr, sidx, nss,
+                          irr_labels=np.arange(n_rows, dtype=np.int32),
+                          trs_reference="ibz_slab")
+
+
+def reduce_full_bz_to_file_wedge(sym, data):
+    """full BZ → FILE wedge.  ``(sym.nk_tot, …)`` → ``(sym.nk_red, …)``.
+
+    Selects the rows that ARE ``wfn.kpoints`` — the k-set every ``.dat``
+    output is indexed by — so a writer can reduce without ever holding
+    ``kirr_fullids``.  Pure row selection: no conjugation, no symmetry
+    operation, nothing to get the wrong way round.
+
+    NOT THE EXACT INVERSE of :func:`unfold_file_wedge_to_full_bz`, and the
+    asymmetry is real rather than an oversight.  This keeps one row per
+    STORED k; the unfold rebuilds every full-BZ k from its ORBIT PARENT.
+    Where the WFN carries two k in the same orbit — ``cohsex_debug``, where
+    file wedge row 1 is the time-reverse of row 2 — the round trip
+    reduce→unfold replaces row 1's own stored values with ``conj`` of row
+    2's.  Self-consistent, and correct if the two really are TRS partners,
+    but it is not the identity and must not be assumed to be.
+
+    There is deliberately no ``reduce_full_bz_to_star_wedge``: that is
+    :func:`star_select`, which already exists and returns the labels the
+    star round trip needs.
+    """
+    rows = np.asarray(sym.kirr_fullids, dtype=np.int32)
+    return _take_rows(data, rows)
+
+
+def unfold_star_wedge_to_full_bz(sym, data):
+    """STAR wedge → full BZ.  ``(n_orbits, …)`` → ``(sym.nk_tot, …)``.
+
+    The wedge :func:`star_select` produces — one row per symmetry orbit,
+    each row a FULL-BZ row carrying a ``sym_idx`` of its own.  Use this
+    for the round trip ``unfold_star_wedge_to_full_bz(sym,
+    star_select(A_full, sym.irr_idx_k)[0])``, which is the identity.
+
+    NOT interchangeable with :func:`unfold_file_wedge_to_full_bz`: the two
+    wedges differ in LENGTH on two of the three committed decks, and
+    coincide on the third.
+    """
+    irr, sidx, nss = _star_tables_of(sym)
+    return star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
 
 
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):

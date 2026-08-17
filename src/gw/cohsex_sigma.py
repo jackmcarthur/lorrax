@@ -17,6 +17,8 @@ optional and applied to SX/COH (and to the bare-X pass separately).
 """
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -186,11 +188,30 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
         return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
                         _convolve(G_occ, W_q, 1.0))
 
-    @jax.jit
-    def sigma_coh(wfns, W_q, V_q):
-        """Coulomb-hole:  Σ_COH = +project[ FFT[ G_RI(R) · (W-V)(R) / (2·√Nk) ] ]."""
+    @partial(jax.jit, static_argnames=("ri_bands",))
+    def sigma_coh(wfns, W_q, V_q, *, ri_bands=None):
+        """Coulomb-hole:  Σ_COH = +project[ FFT[ G_RI(R) · (W-V)(R) / (2·√Nk) ] ].
+
+        ``ri_bands`` RESTRICTS THE INTERMEDIATE-STATE SUM, and exists because
+        this term HAS one.  ``G_RI`` is a sum over every band in
+        ``s.sigma_sum`` with no occupation projector, i.e. the Coulomb hole's
+        slowly convergent unoccupied tail; ``None`` (the default, and the only
+        value any production caller passes) is ``s.sigma_sum`` -- the Σ band
+        sum, NOT the loaded extent ``s.full`` = max(chi, sigma), which is the
+        same slice on every unsplit deck.  A ``(lo, hi)`` half-open band
+        range restricts it, which is what lets a caller measure how much of
+        this term is band-truncation error rather than assert that it has
+        none — see ``gw.ppm_sigma._invalid_static_coh_by_bracket``.  An int
+        tuple rather than a ``slice`` because it is a jit static argument and
+        ``slice`` is not hashable before Python 3.12.
+        """
         s = wfns.slices
-        G_ri = build_G(wfns.xn(s.full), wfns.yr(s.full))
+        # ``sigma_sum``, not ``full``: the Coulomb-hole resolution-of-identity
+        # G IS the Σ band sum, and ``full`` is the LOADED extent
+        # (= max(chi, sigma)).  They are the same slice on every unsplit deck.
+        bands = (s.sigma_sum if ri_bands is None
+                 else slice(int(ri_bands[0]), int(ri_bands[1])))
+        G_ri = build_G(wfns.xn(bands), wfns.yr(bands))
         return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
                         _convolve(G_ri, W_q - V_q, -0.5))
 

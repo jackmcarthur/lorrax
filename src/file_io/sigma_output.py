@@ -42,6 +42,21 @@ SIGMA_K_AXIS = {
 	"qp_diag_self_consistent_ev": 0,
 	"qp_omega0_ev": 0,
 	"qp_static_cohsex_ev": 0,
+	# The Σ_c band-convergence fit, band-DIAGONAL (nk, nb), so k is axis 0.
+	# Registered here and not only written, because that is what puts them
+	# through the same star extraction and the same star-spread instrument
+	# as the cubes: the invariant that matters for S_inf is exact star
+	# covariance, and it is only checkable on a persisted, stamped array.
+	"sigma_c_extrap_inf_kn_ev": 0,
+	"sigma_c_extrap_last_kn_ev": 0,
+	"sigma_c_extrap_ampl_kn_ev": 0,
+	"sigma_c_extrap_sigma_kn_ev": 0,
+	# The estimator-specific fourth array.  ``ampl`` is A (the 1/N
+	# coefficient) and is written by ``band_index_only``; ``beta`` is the
+	# per-state decay exponent and is written by ``spectral_shell``.  Two
+	# names rather than one reused name, so a file says which estimator made
+	# it even to a reader who never looks at the attributes.
+	"sigma_c_extrap_beta_kn": 0,
 }
 
 #: The ω axis, and the two attrs on it that say what it is measured FROM.
@@ -93,6 +108,11 @@ def write_sigma_to_file(
 	hartree_kij_eV=None,
 	energies_dft_ev=None,
 	*,
+	kpoints_crys,
+	star_spread_ev=None,
+	star_spread_per_band_ev=None,
+	star_spread_multiplet_ev=None,
+	n_star_members=None,
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
@@ -102,6 +122,10 @@ def write_sigma_to_file(
 	Args:
 		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb)
 		filename: Output file path
+		kpoints_crys: (nk, 3) crystal coordinates, ONE ROW PER Sigma ROW.
+			REQUIRED, and checked against ``nk``.  See the k-BASIS note
+			below: this file's rows are whatever basis the caller's Sigma
+			is on, and this argument is how the file says which.
 		sigma_coh_kij_eV: Correlation-like self-energy in eV, shape (nk, nb, nb)
 		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
 		energies_dft_ev: DFT (mean-field) band energies in eV, shape (nk, nb).
@@ -112,8 +136,55 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+
+	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
+	------------------------------------------------
+	The block label ``k-point N`` is a POSITION in whatever array the
+	caller handed in, and nothing in the file used to say which k that
+	was.  Three separate downstream comparisons then paired this file's
+	rows against BerkeleyGW's IBZ blocks by position, because positions
+	0,1,2 coincide on Si 4x4x4 and only diverge from row 3 on (the true
+	map is ``[0,1,2,5,6,7,10,27]``).  The worst of them reported a
+	291 meV disagreement where the real figure was 28 meV; an earlier
+	one manufactured a 600 meV "non-symmorphic phase bug".
+
+	So the coordinate is written on every block, and ``kpoints_crys`` is
+	REQUIRED and length-checked against the Sigma rows.  A consumer can
+	now join on the coordinate instead of the position, and a reader can
+	see at a glance which basis the file is on -- an IBZ file and a
+	full-BZ file no longer look identical.
+
+	This writer does NOT decide the basis; ``gw_output.write_results``
+	does, and since 2026-08-15 it writes EVERY text file on the
+	irreducible wedge — the k-set Sigma is actually extracted on.  The
+	full-BZ arrays are that wedge's symmetry image and carry no
+	independent information, so writing them was writing the same numbers
+	several times under indices nothing in the file explained.
+	A consumer that genuinely needs the full BZ unfolds through the
+	symmetry service (``symmetry_maps.star_broadcast``, via
+	``file_io.kin_ion.broadcast_ibz_to_full_bz``), which is what
+	``htransform.read_eqp_energies`` and ``bse_io.apply_eqp_corrections``
+	do.  Nothing reconstructs a star by hand.
+
+	The coordinate goes on its OWN line, never appended to the
+	``k-point N:`` header and never onto a data row.  Both of those
+	placements break parsers in tree: htransform anchors its header
+	regex with ``$`` (``htransform.py:1153``), and six parsers
+	discriminate header-from-body by "exactly four whitespace tokens".
+	A separate ``#`` line is invisible to every one of them, exactly as
+	the existing ruler line already is.
 	"""
 	nk, nbands, _ = sigma_sx_kij_eV.shape
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		# The structural guard: handing 64 rows of full-BZ Sigma an
+		# 8-row IBZ k-list (or vice versa) is the mistake this file
+		# exists to make impossible, so it is refused rather than
+		# written out and discovered downstream.
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} "
+			f"Sigma k-rows of {os.path.basename(str(filename))} — the "
+			f"k-list and the self-energy are on different k-bases.")
 
 	# ------------------------------------------------------------------
 	# REAL-VS-COMPLEX IS ONE DECISION PER COLUMN, TAKEN OVER THE WHOLE ARRAY
@@ -183,8 +254,63 @@ def write_sigma_to_file(
 		f.write(provenance_header())
 		f.write("# Sigma output (all in eV)\n")
 		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
+		        f"states its crystal coordinate on a '# kcrys' line\n")
+		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
+		# ``gw_output._star_spread_of_sigma_diag``) because a wedge file
+		# cannot carry it: unfolding the wedge back is a gather, so the
+		# spread would read 0.000 by construction.  Recorded here so the
+		# check survives the file's move to the wedge.
+		if star_spread_ev is not None:
+			f.write(f"# star_spread_ev {float(star_spread_ev):.9e}   "
+			        f"# max over ALL {nbands} bands of the per-band max-min "
+			        f"of Re diag {total_label} within one star, over the "
+			        f"{int(n_star_members)} full-BZ k this wedge unfolds "
+			        f"to.  READ THE PER-BAND ROW BELOW, NOT THIS, IF YOU "
+			        f"COMPARE A BAND SUBSET: the band scope belongs to the "
+			        f"consumer, and this max answers the widest possible "
+			        f"question.  BLIND TO THE TRS CONJUGATION CLASS by "
+			        f"construction (conjugating a Hermitian block leaves "
+			        f"its real diagonal intact) — that question is gated in "
+			        f"tests/test_star_offdiag_gate.py\n")
+		if star_spread_per_band_ev is not None:
+			_pb = np.asarray(star_spread_per_band_ev, dtype=np.float64)
+			if _pb.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_per_band_ev has shape {_pb.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			f.write("# star_spread_ev_per_band "
+			        + " ".join(f"{float(v):.9e}" for v in _pb) + "\n")
+		if star_spread_multiplet_ev is not None:
+			# THE DEGENERACY-RESOLVED TWIN, and it is not a refinement of the
+			# row above -- it answers a question that one cannot.  A single
+			# band inside a degenerate multiplet has no symmetry-invariant
+			# Re Sigma_bb: any unitary mixing within the subspace is an
+			# equally valid eigenbasis, so the per-band row measures the
+			# eigensolver's gauge there as much as the physics.  The TRACE
+			# over the multiplet IS invariant.  Entries are per band (the
+			# subspace spread divided by its size) so the two rows compare
+			# element by element; where a band is isolated the two agree by
+			# construction.  See gw_output._star_spread_over_multiplets.
+			_mp = np.asarray(star_spread_multiplet_ev, dtype=np.float64)
+			if _mp.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_multiplet_ev has shape {_mp.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			# NAMED "star_spread_multiplet_ev*", NOT "star_spread_ev_*_multiplet".
+			# "# star_spread_ev" is already a PREFIX of
+			# "# star_spread_ev_per_band", and any reader that counts rows by
+			# prefix -- tests/test_eqp_kpoint_basis.py does -- breaks the
+			# moment a third key extends that stem.  Measured: the first
+			# spelling of this row did exactly that.  A new header key must
+			# not extend an existing one.
+			f.write(f"# star_spread_multiplet_ev {float(_mp.max()):.9e}\n")
+			f.write("# star_spread_multiplet_ev_per_band "
+			        + " ".join(f"{float(v):.9e}" for v in _mp) + "\n")
 		for k in range(nk):
 			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
 			f.write("-" * 100 + "\n")
 			for n in range(nbands):
 				sx_re = float(np.real(sx_diag[k, n]))
@@ -223,6 +349,8 @@ def write_eqp_g0w0(
 	eqp_path,
 	energies_dft_ev,
 	g0w0_diag_ev,
+	*,
+	kpoints_crys,
 ):
 	"""Write E_DFT next to diagonal (H0 + Sigma_xc(E_DFT)) for G0W0 comparisons.
 
@@ -234,6 +362,17 @@ def write_eqp_g0w0(
 		DFT eigenvalues in eV.
 	g0w0_diag_ev : array (nk, nb)
 		Diagonal matrix elements of (kin_ion + V_H + Sigma_xc(E_DFT)) in eV.
+	kpoints_crys : array (nk, 3)
+		Crystal coordinates, one row per energy row.  REQUIRED and
+		length-checked, for the reason spelled out in the k-BASIS note
+		of :func:`write_sigma_to_file` — this file has the same
+		``k-point N:`` block layout and was paired by position by the
+		same downstream scripts.  On the irreducible wedge, like every
+		other text file ``gw_output.write_results`` emits; its one
+		former full-BZ consumer was the out-of-tree
+		``make_eqp_htformat.py``, whose whole job was pre-unfolding this
+		file for htransform — which now reads the wedge and unfolds
+		through the symmetry service itself.
 	"""
 	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
 	g0w0_diag_ev = np.asarray(g0w0_diag_ev, dtype=np.complex128)
@@ -241,6 +380,12 @@ def write_eqp_g0w0(
 		raise ValueError(
 			f"Shape mismatch for eqp_g0w0: DFT {energies_dft_ev.shape} vs G0W0 {g0w0_diag_ev.shape}"
 		)
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (energies_dft_ev.shape[0], 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the "
+			f"{energies_dft_ev.shape[0]} energy k-rows of eqp_g0w0 — the "
+			f"k-list and the energies are on different k-bases.")
 
 	abs_path = os.path.abspath(eqp_path)
 	dirname = os.path.dirname(abs_path)
@@ -253,6 +398,8 @@ def write_eqp_g0w0(
 		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
 		for k in range(energies_dft_ev.shape[0]):
 			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
 			f.write("-" * 80 + "\n")
 			for n in range(energies_dft_ev.shape[1]):
 				e_dft = float(energies_dft_ev[k, n])
@@ -266,8 +413,21 @@ def write_eqp_g0w0(
 def write_sigma_freq_debug_table(
 	filepath: str,
 	columns: list[tuple[str, np.ndarray]],
+	*,
+	kpoints_crys,
 ) -> str:
 	"""Write a per-(k, n) decomposition table.
+
+	``kpoints_crys`` is (nk, 3) crystal coordinates, REQUIRED and
+	length-checked against the columns, and written as a ``# kcrys`` line
+	under each ``k-point N:`` header — the same rule the other two text
+	writers in this module follow, for the same reason.  This file carries
+	``k`` as a DATA COLUMN, which makes it look self-describing and is
+	exactly the trap: that integer is a position in whatever array the
+	caller passed, and pairing it against another code's k-order by value
+	is the mistake that produced 291 meV and 600 meV phantom
+	disagreements elsewhere in this tree.  The coordinate is the join key;
+	the integer is not.
 
 	Each entry in ``columns`` is a ``(name, array)`` pair, where ``array``
 	has shape ``(nk, nb)`` and is real or complex.  Real arrays produce one
@@ -293,6 +453,12 @@ def write_sigma_freq_debug_table(
 		if arr.shape != (nk, nb):
 			raise ValueError(
 				f"column {name!r}: shape {arr.shape} != ({nk}, {nb})")
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} k-rows "
+			f"of {os.path.basename(str(filepath))} — the k-list and the "
+			f"columns are on different k-bases.")
 
 	# Column header — Re/Im split for complex arrays.
 	header = ["k", "n"]
@@ -330,6 +496,8 @@ def write_sigma_freq_debug_table(
 		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
+			f.write(f"# kcrys {kpts[ik, 0]:15.9f}{kpts[ik, 1]:15.9f}"
+			        f"{kpts[ik, 2]:15.9f}\n")
 			for ib in range(nb):
 				row = [f"{ik:>{col_w}d}", f"{ib:>{col_w}d}"]
 				for name, arr in arrays:
@@ -581,10 +749,17 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 		M = np.moveaxis(M, k_axis - (1 if ndim == 4 else 0), 0)
 
 	sel = M[np.asarray(rows_to_keep)]
+	# ``star_row``: ``sel`` is rows taken out of the FULL-BZ array ``M``,
+	# so each row carries a ``sym_idx`` of its own and the predicate is the
+	# XOR — the same flavour ``star_select`` produces.  This used to ride
+	# the argument's default; the default is gone, because the other branch
+	# is wrong here by 183.61 eV on the off-diagonals with the real
+	# diagonal exactly intact, which nothing downstream would have seen.
 	unfolded = np.asarray(symmetry_maps.star_broadcast(
 		sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
 		int(n_sym_spatial),
-		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32)))
+		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
+		trs_reference="star_row"))
 	raw = float(np.abs(M - unfolded).max()) if M.size else 0.0
 
 	diag = frob = trace = 0.0
@@ -814,6 +989,7 @@ def write_sigma_omega_h5(
 	star=None,
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
+	band_extrapolation=None,
 	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
@@ -824,6 +1000,21 @@ def write_sigma_omega_h5(
 	  - sigma_c_kij_ev  (optional): (n_omega, nk, nb, nb)
 	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
 	  - hartree_kij_ev  (optional): (nk, nb, nb)
+	  - sigma_c_extrap_*_kn_ev (optional): (nk, nb) — the Σ_c
+	    band-convergence fit, present only when the run extrapolated
+
+	``band_extrapolation``
+	    ``{"arrays": {name: (nk, nb)}, "attrs": {...}}`` from
+	    ``gw.band_extrapolation.extrapolation_h5_payload``.  Until
+	    2026-08-15 the fitted ``S_inf`` reached NO artifact: a run with the
+	    feature on and one with it off were identical to 8e-15 in every
+	    dataset here while the log reported an 848 meV correction, so the
+	    feature could not be gated, diffed or consumed, and a star-spread
+	    test on this file passed vacuously by measuring the
+	    un-extrapolated cube.  The arrays ride the SAME extraction and
+	    stamp as the cubes rather than being appended raw, so ``S_inf``
+	    and ``sigma_c_kij_ev`` cannot disagree about which k the file
+	    holds.  ``None`` writes exactly the pre-feature file.
 
 	All large writes go through :mod:`file_io.slab_io`, which has one
 	transport (per-rank collective MPI-IO) and no selector.
@@ -892,6 +1083,11 @@ def write_sigma_omega_h5(
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
 	}
+	extrap_arrays = dict((band_extrapolation or {}).get("arrays", {}))
+	extrap_attrs = dict((band_extrapolation or {}).get("attrs", {}))
+	# Into the SAME payload, so the extraction, the stamp and the spread
+	# measurement are one code path for the cubes and the fit alike.
+	payload.update(extrap_arrays)
 
 	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
 	# QSGW appender rather than spelled twice.
@@ -950,6 +1146,22 @@ def write_sigma_omega_h5(
 				dtype=np.complex128, chunks=kij_chunks,
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		for name in extrap_arrays:
+			arr = payload[name]
+			if arr is None:
+				continue
+			arr = np.asarray(arr)
+			# The run-level facts (band counts, fractions, verdict, any
+			# planner fallback) ride on EVERY one of these datasets, so a
+			# reader that opens one of them alone still learns whether the
+			# number it is holding was trusted.
+			at = dict(_attrs(name) or {})
+			at.update(extrap_attrs)
+			io.create_dataset(name, shape=tuple(arr.shape),
+				dtype=np.complex128,
+				chunks=(min(k_chunk, arr.shape[0]),) + tuple(arr.shape[1:]),
+				attrs=at)
+			io.write_slab(name, arr)
 	return abs_path
 
 

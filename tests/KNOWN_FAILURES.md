@@ -1080,6 +1080,729 @@ the non-SC branch (`gw_jax.py:543`), where the whole object is DFT basis.
 a new Σ channel cannot join the wrong group silently.  It does not and
 cannot catch this: the mixing is in the consumer, not the declaration.
 
+## Bespoke IBZ→full-BZ unfolding outside the symmetry service — census
+
+REGISTER, 2026-08-15, `refactor/eqp-ibz-2026-08-15`.  The rule being
+enforced: `services/symmetry_maps` owns symmetry unfolding, and a driver
+that needs a full-BZ quantity from a wedge one calls it rather than
+open-coding a star expansion, an index map or a k-matching loop.  A
+by-shape sweep of `src/`, `tools/`, `scripts/` and the non-symmetry
+services found eleven sites.  **Two were in scope and are FIXED on that
+branch; the other nine are recorded here and NOT touched.**
+
+Ordered by "could silently produce a wrong pairing".
+
+### FIXED on this branch (five of eleven)
+
+1. `src/bse/bse_window.py` `apply_eqp_corrections` — matched each full-BZ
+   k to a wedge block of `eqp1.dat` by comparing MEAN-FIELD ENERGIES with
+   `tol_ev = 0.01`, reachable through `input_file=None`, live in
+   `src/bse/exciton_bands.py`'s `--eqp` path.  Right by accident (E_DFT is
+   constant over a star) and silently wrong once two stars agree to 10 meV
+   across the compared window — `best_ibz` then takes the QP shift from
+   the wrong star, and the `matched.all()` gate catches only NO match,
+   never a WRONG one.  Now one path, unfolding through the service
+   adapter; `input_file` is required.
+2. `src/bandstructure/htransform.py` `read_eqp_energies` — required a
+   PRE-UNFOLDED full-BZ text file (`nk == sym.nk_tot`) and paired its
+   `k-point N:` blocks to full-BZ k BY POSITION, checking only the count,
+   never a coordinate.  The unfold itself happened one hop upstream in an
+   out-of-tree `make_eqp_htformat.py`.  Now reads the wedge `eqp1.dat`
+   directly, verifies the block coordinates against the deck's own wedge,
+   and unfolds through the service.
+
+4. `src/postprocess/rotate_wfn_to_qp.py` `find_kpoint_mapping` — a
+   coordinate `argmin` at `tol=1e-6` with no uniqueness check, rebuilding
+   the table `sym.kirr_fullids` already is.  **The highest-value fix in
+   the list**: its output selected `U_mnk[ik_full]` and the QP energies
+   for each reduced k, and `gw.eqp_bgw` reads the SAME `kirr_to_kfull`
+   dataset out of `qp_wfn_rotations.h5` — so the two disagreeing about a
+   k meant the rotated WFN and `eqp{0,1}.dat` disagreed too.  The fix
+   turned out to be a deletion: the rotation file ALREADY carries
+   `kirr_to_kfull`, written from `sym.kirr_fullids` by both producers
+   (`gw_jax`/`write_results` and `sc_iteration.py:2365`), so the module
+   now READS it and checks the service's own contract
+   (`kpoints_crys[kirr_to_kfull] == wfn.kpoints`) rather than
+   re-deriving it.  `--add-mapping` and
+   `add_kpoint_mapping_to_rotation_file` are DELETED: that path
+   recomputed the map by nearest-coordinate search and *overwrote* the
+   service's dataset with an approximation of itself.  No jax import was
+   needed, so the module stays jax-free.
+5. `src/file_io/qe_save_reader.py` `_reduce_mp_to_ibz` — a 70-line
+   hand-rolled orbit reduction (`_EPS = 1e-5` grid snap, `equiv` parent
+   array, accumulated `wkk` weights), duplicating
+   `symmetry_maps.find_irreducible_bz_points`, which does it in INTEGER
+   kgrid coordinates with no tolerance at all and returns the orbit map
+   this one discarded.  Now delegates; weights come from
+   `np.bincount(irr_idx)`.
+   **THE TRANSPOSE CONVENTION WAS MEASURED, NOT ASSUMED.**  The old code
+   applied `S @ k` on the raw QE matrices while `SymMaps` builds its
+   k-table as `sym_matrices.transpose(0,2,1)` — different operations, and
+   no docstring settles which this grid wants.  Checked against the old
+   implementation on the committed fixtures: on `si_cohsex_debug`
+   (4x4x4, 48 ops, 8 IBZ points) the AS-STORED matrices reproduce it
+   exactly and the transposed ones move k by 2.5e-01; on the 2-op
+   `gnppm_debug` deck BOTH agree, which is why only a high-symmetry deck
+   decides it.  There is no test coverage of this function in tree and no
+   QE reference fixture, so that measurement is the only evidence — it is
+   pinned in `tests/test_unfold_through_the_service.py`.
+
+### STOPPED, and why — `vcoul/bgw_parity.py`
+
+Item 3 below is NOT fixed, deliberately, on two independent grounds.
+
+**The service does not expose what the rewrite needs.**  The call site
+needs `(iq, S_k, kg0)`: an index, the symmetry row, AND the integer
+umklapp vector, because `kg0` then shifts the whole G-list at
+`bgw_parity.py:189` (`G_input = S_k @ G_miller - kg0`).
+`find_irreducible_bz_points` returns `(irr_idx, sym_idx, irr_out)` and no
+`kg0`; recovering it means recomputing `q - S_k @ q_table` locally, i.e.
+putting back a piece of the hand-rolled matching the rule exists to
+remove.  It also wants a q-GRID to integerise against, which
+`bgw_parity` never receives — it holds fractions only.  Per the standing
+instruction, "the service can't do this yet" is the answer rather than a
+local workaround.
+
+**And the surface is already under an owner ruling.**  `use_bgw_vcoul`
+defaults False (`gw_config.py:1286`), no in-tree deck or fixture sets it
+true, and `file_io/read_bgw_vcoul.py:23` states outright that the
+surface is "data-dead in-tree" and under a repair-or-delete owner
+question.  Rewriting a data-dead path that may be deleted is work
+against a decision that has not been taken.
+
+### REGISTERED, not fixed
+
+3. `services/vcoul/src/vcoul/bgw_parity.py:44-92` `find_q_index` —
+   reconstructs the star `q = S_k·q̄ + G` in a double Python loop with
+   `tol = 1e-4` on fractional coordinates, FIRST MATCH WINS.  Two hazards:
+   the tolerance is loose enough to alias on a fine grid, and when the
+   little group is non-trivial the arbitrary `S_k` chosen is then used at
+   `bgw_parity.py:180` to rotate the whole G-list, so an equally-valid
+   different `S_k` gives a different G permutation.  Consumer:
+   `src/gw/compute_vcoul.py:245-261`, which can additionally source
+   `sym_mats_k` from a *different* WFN.  The module already carries this
+   as "a registered owner question (repair-or-delete on the whole
+   `use_bgw_vcoul` surface)".
+4. *(FIXED — see item 4 under "FIXED" above.)*
+5. *(FIXED — see item 5 under "FIXED" above.)*
+6. `src/gw/downfold_run.py:1445-1490` — integer-keyed dict map, well
+   guarded (membership refusal at `:1474`, bijectivity at `:1483`), EXCEPT
+   the `np.arange` identity fallback at `:1470`, which the code's own
+   comment says would "attach grid point i's transfer to wedge slot i and
+   write a ζ of plausible, wrong numbers".
+7. `src/bse/vq_interp.py:565-605` — rebuilds the full-BZ q list from a
+   `meshgrid` when `rk` is short, re-deriving the service's own wrap/C-order
+   convention.  Numerically gated and it refuses a genuine IBZ ζ, so the
+   risk is ORDERING drift if the writer's convention ever changes.
+8. `src/file_io/sigma_output.py:498-527` `compact_star_tables` — a Python
+   re-implementation of `star_select`'s first-occurrence row order, whose
+   own docstring says it must match that convention; it then feeds
+   `symmetry_maps.star_broadcast` at `:637-640`, so a drift produces a
+   silently wrong star assignment.
+9. `tools/sigma_star_spread_decompose.py:245-260` (and `:417`) — a THIRD
+   answer to the same compaction, using SORTED labels where the other two
+   use first occurrence.  Diagnostic tool.
+10. `tools/bgw_sigma_hp_to_fixture.py:265-272` and `:367-372` — maps BGW
+    IBZ k onto LORRAX k by comparing `Eo`/`E_dft` vectors at `2e-3`.
+    Self-referential: the fabricated star then feeds the `star_spread`
+    statistic at `:288`, i.e. the metric meant to DETECT a broken unfold is
+    computed over a star the tolerance invented.  Offline tool.
+11. `src/psp/orbital_magnetization.py:384-401` — a hand-built
+    "which k is this" dict for finite-difference neighbours.  Full-BZ →
+    full-BZ, exact integer keys, so no aliasing; listed only because it
+    duplicates the grid lookup the service owns.  Diagnostic path.
+12. ~~`src/file_io/epsreader.py:136` `unfold_eps_comps`~~ — **DELETED
+    2026-08-16.**  Registered 2026-08-15, removed the next day; a tombstone
+    at the site records why and points at the canonical rotation.  Kept in
+    this list because the SHAPE recurs: a τ-blind G-rotation, admitted as
+    such in its own comment, sitting on a re-exported class with no live
+    caller for long enough that nothing knew it was there.  Original entry:  A fifth independent
+    `G' = S·G − G_umklapp` in `src/`, found by re-counting the register's
+    "four implementations" claim by reading.  Two things make it worth a
+    row rather than a fix:
+    (a) it is **dead but shipped** — `EPSReader` is re-exported from
+    `src/file_io/__init__.py:41`, and its three in-tree instantiators
+    (`gw/head_correction.py:286-289` and two `scripts/checks/`) never call
+    this method; the only callers are under `misc/archived_tests/`;
+    (b) its own comment at `:126` says **"NO SUPPORT FOR TAU (FRAC
+    TRANS) CURRENTLY"**, i.e. it is known-wrong on every non-symmorphic
+    deck and nothing outside the file said so.
+    NOT FIXED HERE: repairing a method with no caller is speculative, and
+    deleting a re-exported public method is a surface change.  The
+    decision owed is delete-or-fix, not repair-in-place.
+
+**Correction to (3)'s recorded reason.**  It says "the service returns no
+`kg0`".  A reader who greps finds `SymMaps.get_umklapp_vector`
+(`maps.py:1944`) immediately and concludes this row is stale.  The method
+exists; the real blocker is that it is **index-keyed to a
+`(SymMaps, WFNReader)` pair**, and `bgw_parity.fill_v_grid_for_q`
+(`:147-153`) receives raw fractions and a bare matrix stack, never those
+objects.  Separately, `find_irreducible_bz_points` computes the rotation
+and discards the umklapp at `maps.py:102` — the `% kg` **is** the thrown-
+away `kg0`, and a `return_umklapp=True` there is about two lines.  The
+row stands; only its justification needed correcting.
+
+Test-side hand-rolls, lower priority and noted for completeness:
+`tests/test_scissor_weights.py:169-175, 296-302, 333-338` (a `_FakeKStar`
+oracle that re-implements the thing under test),
+`tests/test_restart_qirr_consumers.py:78-83`, and
+`tests/harness.py:803-830` `compare_to_bgw`, which assigns each LORRAX k
+to a BGW IBZ k "on the whole `Eo` vector, not on k coordinates, because
+the two codes do not order k the same way" — the same fingerprint class as
+(10), and with the same self-reference, since the star it builds is what
+`_star_spread` is then computed over.  The stated reason no longer holds:
+`sigma_diag.dat` now carries `# kcrys` on every block and BerkeleyGW's own
+`eqp.dat` carries coordinates in its headers, so a coordinate join is
+available on both sides.
+
+### Two rotation-math defects found by the 2026-08-15 symmetry inventory
+
+REGISTERED, not fixed — both are behaviour changes in gate/bench code and
+belong to the consolidation pass, not to the audit that found them.
+
+1. **FIXED 2026-08-15, and VERIFIED BY EXECUTION at P=4.**
+   `tests/multi_device/star_invariance_gate.py` used the WRONG TRS
+   predicate.
+
+   A/B on `cohsex_debug` (9 k, 3 stars, ntran=12, 3 TRS rows, and star
+   label 2's FIRST member is a TRS row — the only configuration in which
+   the two predicates differ), `srun -n 4`:
+
+   | predicate | check 0 classification | residual |
+   |---|---|---|
+   | fixed (XOR) | 3 spatial + 3 TRS pairs | **5.599e-10** |
+   | old (member's own flag) | 4 spatial + 2 TRS pairs | **1.400e-02** |
+
+   The old predicate puts ONE PAIR IN THE WRONG BUCKET and the residual
+   rises seven orders of magnitude — the false failure this row predicted,
+   now measured rather than reasoned.
+
+   **TWO THINGS THE EXECUTION ALSO ESTABLISHED, both worth knowing:**
+
+   (a) **The gate passes on a deck that does not exercise the branch.** On
+   `si_cohsex_debug` (64 k, 8 stars, ntran=48) it reports `TRS pairs=0`
+   and VERDICT PASS at 1.169e-15. There are no time-reversed rows in that
+   deck's selection, so a wrong TRS predicate is invisible there. Anyone
+   running this gate for TRS coverage must use a deck with TRS rows;
+   `cohsex_debug` is the one in tree.
+
+   (b) **...and it cannot pass on the deck that does.** `RTOL = 1e-10`
+   (`star_invariance_gate.py:77`) is tighter than `cohsex_debug`'s own
+   noise floor of 5.599e-10, so checks 1 and 3 report FAIL there **on
+   both legs**, before and after the fix, and the overall VERDICT is FAIL
+   either way. Those two checks route through the service's
+   `star_spread`/`star_broadcast`, which already used the correct XOR, so
+   they are unaffected by the predicate — it is purely a tolerance
+   calibrated for Si (1.169e-15) being applied to a deck three orders
+   noisier. NOT changed here: the gate is superseded (its four checks were
+   ported to `services/symmetry_maps/tests` on 2026-08-07) and retiring it
+   is on the owner's cleanup checklist. Recorded so the next person to run
+   it is not misled by a red that predates them.
+
+   Note the file's own docstring is stale on one point: it says it imports
+   `from common.symmetry_maps import ...` at :48, and it does not — it
+   imports `from symmetry_maps import ...` through the service door, which
+   is why it still runs at all.  It compares each star member against `T[mem[0]]` —
+   the star's first FULL-BZ row, i.e. `star_broadcast`'s `"star_row"`
+   operand — but decides conjugation with `if int(sidx[j]) >= n_spatial`,
+   which is the `"ibz_slab"` predicate.  That is exactly the mix-up
+   `star_broadcast`'s own docstring prices at **183.61 eV**
+   (`maps.py:2294-2303`: the two predicates disagree on 6 of 9 k-points on
+   `cohsex_debug`, with the real diagonal left exactly intact).  The right
+   predicate for `star_row` operands is the XOR, `_star_conj_flags`
+   (`maps.py:2167`, XOR at `:2194`).  Consequence: this gate will report a
+   FALSE FAILURE on any deck whose star begins on a time-reversed row.
+   It is a gate, not production, so nothing physical is wrong today.
+
+2. **`tests/bench/charge_density.py:135` `_symmetrise_density` is a broken
+   duplicate** of `src/gw/qsgw_density.py:270` `symmetrise_density`.
+   Three defects against the canonical: (a) NO τ phase at all, so it is
+   silently wrong on every non-symmorphic deck; (b) it rotates G with
+   `sym.R_grid` (= `mtrx`) where the live convention is `sym_mats_k`
+   (= `mtrx.T`) — the transposed convention, which is the one the stale
+   `maps.py` comment corrected in this commit used to state; (c) it works
+   in G-space with an FFT round trip instead of the r-grid permutation.
+   Called unconditionally at `tests/bench/charge_density.py:130`.
+   `src/psp/scf_potential.py:19-20` already records it as known broken.
+   Fix is deletion in favour of the canonical, not repair.
+
+Also noted, no action: `SymMaps.R_cart_forward` (`maps.py:1727`) exists
+solely to NAME the transpose a rank>=1 Cartesian index needs, and has
+**zero production consumers** — while the one live Cartesian-index
+rotation (`src/psp/orbital_magnetization.py:172-177`) uses `R_cart`
+untransposed.  Its defence (`:185-187`) is that the group is closed under
+inverse so the PROJECTOR is transpose-invariant; that argument covers the
+sum at `:189` but not obviously the per-op `keep` test at `:176`, which
+tests individual ops.
+
+### ~~`sc_on_ibz = true` HAS ROTTED~~ — FIXED 2026-08-15, and the default is now True
+
+**CLOSED.**  Kept because the shape of the failure is the reusable part.
+
+MEASURED 2026-08-15 on `gnppm_debug` with `qp_solver = self_consistent`.  The
+flag defaulted False, **no deck in the tree set it, and no regression deck ran
+the SC path at all** — every committed deck was `qp_solver = one_shot_dft`.  So
+nothing had exercised this since it was written.
+
+    sc_iteration.py:1397  _write_sc_eqp_snapshot
+      -> eqp_bgw.py:145   write_bgw_eqp
+    ValueError: e_qp shape (5, 46) does not match e_dft (9, 46)
+
+**5 and 9 are the two different IBZs.**  With `sc_on_ibz` on, the loop reduces
+H/E/U to the STAR wedge — 5 orbits on this deck — while
+`_write_sc_eqp_snapshot` handed the result to a writer expecting the FILE
+wedge, `wfn.kpoints`, which is 9 here.  It would NOT have crashed on
+`si_cohsex_debug`, where the two wedges coincide at 8 — the same "right where
+you test, wrong where you don't" shape.
+
+FIXED at both boundaries by routing star wedge → full BZ → file wedge through
+the service (`reduce_full_bz_to_file_wedge ∘ unfold_star_wedge_to_full_bz`);
+`dump_qp_wfn_artifacts`'s length-matching `placements` dict went with it.
+Default flipped to True on a measured A/B: **1e-6 meV per iterate under linear
+mixing**, with the rCROP trajectory k-set dependent by construction (24.45 meV
+by map call 5).  See `docs/architecture/symmetry_register.md`, "The SC loop
+crosses both wedges".
+
+**The lesson that outlives the bug**: a flag whose default is off, that no deck
+sets, on a path no deck runs, is not covered by any number of green cells.
+`tests/regression/gnppm_debug/gnppm_sc.in` now runs the SC path, and
+`tests/test_sc_on_ibz_wedges.py` pins the boundary.
+
+### TWO MORE pre-existing reds in `test_invariance_gates.py` — one FIXED, one that must NOT be re-frozen
+
+Found 2026-08-15 by sweeping the 22 test files this branch could plausibly
+touch. **Both reproduce IDENTICALLY at `0241118f`, the parent commit**, in a
+clean worktree, so neither is the `sc_on_ibz` work — whose whole source diff
+is two files (`gw_config.py`: the `sc_on_ibz` default; `sc_iteration.py`: the
+SC boundary), both reachable only under `qp_solver = self_consistent`, which
+neither of these gates uses.
+
+**1. `test_fixed_point_frozen_qp_rotations` — a VALUE difference, ~25.7 meV.**
+
+    Mismatched elements: 382 / 414 (92.3%)
+    Max absolute difference among violations: 0.00189262 Ry  (25.75 meV)
+    Max relative difference among violations: 0.1063308
+
+against `atol = 1e-6` Ry. Shapes agree — `(9, 46)`, the full BZ — so this is
+**not** the wedge move. It is a 25.7 meV move in `E_qp_nk_rydberg` on 92 % of
+elements of `qp_wfn_rotations.h5` from a `fixed_point` run, against
+`gnppm_debug/eqp_rotations_fixedpoint_ref.npy`, last touched at `b7654ee9`
+(the `zeta_rcond` 1e-8 + band-range-centroid default change).
+
+**DO NOT RE-FREEZE THIS ONE.** It is categorically unlike the three `.dat`
+references migrated in this branch: those were a k-SET change with values
+*proved* bit-identical (0.000000e+00 on both Si decks). This is a physics-level
+value change with no explanation attached, on the QP eigenvalues, and the
+first two columns still agree exactly (−5.651374, −1.595261, −1.363405) while
+the ones between them do not — a pattern that wants diagnosis, not a new
+reference. Candidate causes worth separating before anything is re-blessed:
+the `zeta_rcond`/centroid-weight defaults that moved at `b7654ee9`, versus
+anything in this branch's `4f26ecc5`/`74024fd1`/`954ba9c8` writer work.
+
+**2. `test_mu_pad_flip_invariance_bispinor` — DIAGNOSED AND FIXED. It was a
+test defect, and the physics invariant it guards holds exactly.**
+
+Ran the deck at `LORRAX_EXTRA_MU_PAD` 4 and 0 and diffed the three files the
+gate compares. Result:
+
+| file | differing DATA lines | differing HEADER lines |
+|---|---|---|
+| `sigma_diag_bispinor_test.dat` | **0** | 2 |
+| `eqp0.dat` | **0** | 0 |
+| `eqp1.dat` | **0** | 0 |
+
+Σ is **bit-identical** under the pad flip — the catastrophic transverse-pad
+class this gate exists to catch (MoS₂ 668→672 moved Σ^B tile(2,2) from −0.15
+to −117.9 eV) is not happening. The whole failure was:
+
+    # star_spread_ev 1.265016891e-08     (pad 0)
+    # star_spread_ev 1.265016181e-08     (pad 4)
+
+a **7.1e-15 eV** difference in the 8th significant figure of a 1.3e-8 eV
+quantity. `star_spread_ev` is a reduction over the full-BZ Σ printed to 9
+significant figures, added to the wedge writers by `4f26ecc5`/`74024fd1`, and
+on a clean deck its value IS roundoff. A reduction order over roundoff is not
+bit-reproducible and cannot be made so.
+
+FIXED at `tests/harness.py` `normalize_dat`, which now strips
+`# star_spread_ev` alongside `# Generated by LORRAX`. **The data is still
+compared byte for byte**, which is the whole content of the gate.
+
+The general point, worth more than this instance: **adding a header line to a
+file that a bit-identity gate compares can turn a real invariant into an
+unachievable one**, and it does so silently — the gate goes red for a reason
+that has nothing to do with what it tests. Any new header on
+`sigma_diag`/`eqp*` must be checked against `normalize_dat`.
+
+(1) is recorded rather than repaired: it is a real 25.7 meV diagnosis and not
+in the symmetry-consolidation scope this branch is doing.
+
+### BAND-SLICING AUDIT 2026-08-15 — which cuts are guarded, which are not
+
+Prompted by the owner's degeneracy question and searched BY SHAPE, not by
+name.  Context for why it matters: on `si_cohsex_debug` the deck's own
+`nband = 60` edge has a **min gap over k of 0.000000 meV** on the 62-band mean
+field, and moving it to a clean edge (40: 818 meV, 36: 157 meV) takes every Σ
+channel's within-star spread to **exactly 0.0000**.  A sliced band edge is not
+a theoretical hazard on this tree; it is the measured cause of the Si star
+spread.
+
+**`snap_cut_to_clean_boundary` DOES NOT EXIST** — no definition, no caller, no
+mention, in any branch's history (`git log --all -S` empty).
+`src/common/band_degeneracy.py` provides `boundary_min_gaps`,
+`resolve_band_window` (modes `strict|snap|off`) and `check_band_window`; the
+"widen to a clean boundary" behaviour is an inlined `while` loop inside
+`resolve_band_window`, not a separate helper.  Do not plan against it.
+
+**THE TRAP, measured:** `boundary_min_gaps` returns `+inf` at `b = nb` by
+construction, so **given an already-truncated window it cannot see the
+truncation that produced it**.  Handed the 60-band Σ window it calls edge 60
+clean; handed the 62-band mean field it reports 0.000000 meV.  Always pass the
+FULL mean field.
+
+**GUARDED** (all in the BSE path):
+
+| site | helper |
+|---|---|
+| `src/bse/bse_loading.py:861`, `:1202` | `resolve_band_window` |
+| `src/bse/bse_window.py:644` | `check_band_window` |
+| `src/bse/exciton_bands.py:1606` | `check_band_window` |
+| `src/bse/vq_interp.py:2493` | `check_band_window` |
+| `src/gw/gw_init.py:861` (ζ closure) | `check_band_window`, **warn-only** unless `zeta_nband` names the edge |
+
+**UNGUARDED and symmetry-sensitive** — the deliverable of this audit:
+
+| # | site | what is cut | note |
+|---|---|---|---|
+| 1 | `src/gw/gw_init.py:856-866` | the ζ fit window `b3`/`b4` | **measures the zero gap and PRINTS it without refusing.** A guard that measures the defect and proceeds. *Being fixed on another lane — do not touch.* |
+| 2 | `src/gw/sc_iteration.py:1978-1987` + `src/gw/scissor.py:238-240` | `protected_mask` — a NON-CONTIGUOUS cut deciding off-diagonal Σ | own entry below |
+| 3 | `src/gw/sigma_dispatch.py:308-310` | `v_h_np[:, b0:b3, b0:b3]` | V_H is on the Σ star-spread surface |
+| 4 | `src/bse/bse_window.py:597-602` | `min(nb_eqp, nb_full)` eqp overwrite of `enk_full` | QP energies |
+| 5 | `src/bse/exciton_bands.py:934-938` | `e_ht[:, :nc]` vs `e_st[:, :nc]` | the gate `sort`s both sides, so a truncated multiplet makes it compare different SETS — the one failure `sort` cannot detect |
+| 6 | `src/common/chi_from_dipole.py:156-157` | `arange(nelec, nb)` → S(ω) | k-summed |
+| 7 | `tools/bgw_sigma_hp_to_fixture.py:252,287-289` | `nb` then a star-spread max-min | offline tool; also still matches k by `Emf` at 2e-3 eV |
+| 8 | `tools/sigma_star_spread_decompose.py:334-335` | `kin[:, :nb, :nb]` → `diag_star_spread` | offline tool |
+
+**FIXED in this branch:** `tests/harness.py:998` `per_band[:nb].max()` — the
+star-spread consumer — sliced at whatever the BerkeleyGW fixture carried with
+no boundary check.  It now also reports `_cut_clean` (from the `Eo` column
+already in the same file, through `boundary_min_gaps`) and
+`_star_spread_multiplet`.  Reported, not refused: the fixture's band count is
+not ours to move, and the Si cut at 16 measures clean anyway.
+
+Not symmetry-sensitive, listed so nobody re-audits them: mesh-pad drops
+(`bse_feast.py:913`, `bse_densify.py:597`, `qsgw_density.py:717`,
+`sc_iteration.py:1741`, `mtxel_sweep.py:1180`) and print/plot paths
+(`run_nscf.py:436`, `htransform.py:1729`, `bse_feast.py:836`).
+
+### The QSGW band partition is an unguarded, NON-CONTIGUOUS band cut
+
+Found 2026-08-15 by a shape-based audit of every band-axis truncation in the
+tree, prompted by the owner's degeneracy question.  **Reported, not fixed:
+the fix is a behaviour change to the QSGW Hamiltonian, not a diagnostic.**
+
+`src/gw/scissor.py:238-240` `classify_bands_in_grid` classifies a band as
+in-grid by an **all-k** predicate:
+
+    in_window_kn = (E >= omega_min_ev) & (E <= omega_max_ev)
+    band_in_grid = np.all(in_window_kn, axis=0)
+
+`src/gw/sc_iteration.py:1978-1987` makes that BOTH the `protected_mask` and
+the `in_range_mask`, and `src/gw/band_partition.py:148-151` then zeroes every
+off-diagonal outside `protected × protected`.
+
+**Bands degenerate at one k need not be degenerate at another**, and the
+predicate is all-k, so band `n` can be in-grid while its multiplet partner
+`n+1` is not.  Half a multiplet then carries full off-diagonal Σ and half
+takes a scalar scissor — "not a subspace of anything" — and the result is
+`eigh`'d and reported as QP energies.  This is exactly the hazard the
+degeneracy safeguards exist for, and `band_partition.py` neither imports nor
+mentions `common.band_degeneracy`.
+
+Two things make it invisible today:
+
+- `BandPartition.warn_if_protected_outside_grid` (`band_partition.py:82-101`)
+  checks only `protected & ~in_range`, and the ONE construction in the tree
+  passes the same mask twice (`sc_iteration.py:1986-1987`), so the set is
+  identically empty and **the warning can never fire as wired**.
+- `_check_kstar_spread` (`sc_iteration.py:1180`) runs on `delta_h_qp`
+  **before** the partition is applied at `:1222`, so the star-spread
+  enforcement does not cover the partition boundary at all.
+
+**RESOLVED 2026-08-16 — owner ruling: "I want degenerate spaces degenerate in
+LORRAX."**  Both halves landed.  `BandPartition.report_multiplet_splits` names
+every splitting boundary and the gap it cuts; `promoted_to_multiplets` grows
+the mask outward so no manifold is split, and `run_sc_driver` calls them in
+that order.  `_check_kstar_spread` moved to AFTER `apply_band_partition`, so
+it now gates the object that ships.
+
+**MEASURED on `gnppm_debug`, the only committed deck running the SC path:
+`28/46 protected; no boundary splits a multiplet`** — the promotion is a no-op
+there, `eqp0`/`eqp1`/`sigma_diag` are byte-identical, and the reordered
+star-spread gate reads `0.000e+00`.  So no number moved on any in-tree deck,
+the reorder did not turn anything red, and **no deck exercises the promotion**
+— `tests/test_band_partition_multiplets.py` carries the whole burden of
+proving it works, and its mutation is verified red.
+
+On a deck whose mask does split, every QSGW number moves; that is the accepted
+consequence and anything computed there beforehand is superseded.
+
+Retained below: the cost analysis that preceded the ruling.
+
+**IS IT CHEAP?  The diagnostic is; the fix is not, and they are different
+changes.**
+
+- **Reporting it is cheap — ~20 lines, no behaviour change.**  Everything
+  needed is already in scope at `sc_iteration.py:1978`: `e_dft_ev` is the
+  array the mask was derived from, and `boundary_min_gaps` is one import.
+  The mask's INTERIOR transitions (`np.diff(mask)`) are exactly the boundaries
+  to test; its outer edges are the active window's own and come back `nan`
+  from `boundary_min_gaps(..., is_full_spectrum=False)`, which is the correct
+  answer — they cannot be judged from the window.  This is the honest minimum
+  and nothing about the calculation moves.
+- **Fixing it is NOT cheap.**  Promoting the mask to whole multiplets widens
+  the protected set, so more bands carry full off-diagonal Σ, so `H_qp`
+  changes and every QSGW number moves.  That is a physics decision with a
+  convergence story attached, not a guard.
+
+**The related one-line reorder is also not free.**  Moving
+`_check_kstar_spread` from `:1180` (before the partition) to after `:1222`
+would make it check the object that actually ships, and it is one line — but
+the partition is exactly the operation that could make that residual non-zero,
+so the reorder can turn the gate red on decks that pass today.  It is a
+strengthening, not a cleanup, and it wants its own measurement first: run it
+both ways on `gnppm_debug` and see whether the post-partition residual is
+still at the 1e-10 floor.
+
+Whoever picks this up: the ordering is (1) land the report, (2) measure the
+post-partition spread, (3) then decide about promoting the mask.
+
+### `tools/gen_input_reference.py` REFUSES to run, so `docs/input_reference.md` is hand-maintained
+
+MEASURED 2026-08-15, incidental to the `sc_on_ibz` default flip. The generator
+raises `SystemExit` on any key drift against `gw_config._DEFAULTS` and writes
+nothing, so the doc it owns cannot be regenerated:
+
+    gen_input_reference: key drift vs gw_config._DEFAULTS
+      missing one-liners for: ['mc_average_placement',
+        'mc_average_placement_vcoul', 'mpa_material_class', 'mpa_n_poles',
+        'mpa_pole_batch_size', 'mpa_sampling_alpha',
+        'mpa_sigma_crossing_target_error', 'mpa_sigma_max_nodes',
+        'mpa_sigma_sector_target_error', 'mpa_varpi_far_ry',
+        'mpa_varpi_near_ry', 'restart_q_storage', 'sc_eigh',
+        'write_restart_tensors']
+      stale entries for removed keys: ['slab_io', 'use_ffi_io']
+
+Pre-existing — none of those 16 keys is touched by this branch. The refusal is
+the right design (a doc that silently drops a key is worse than one that
+refuses), but the consequence is that **`docs/input_reference.md` has been
+edited by hand for as long as the drift has existed**, and nothing says so.
+The `sc_on_ibz` row was updated in BOTH places (`KEYS` in the generator and
+the rendered table) so the two agree whenever someone clears the drift.
+
+### THREE frozen references were stale from the moment the writers moved to the wedge
+
+MEASURED 2026-08-15, and this is the row the pre-merge anchor run existed to
+produce. When the text writers moved from the full BZ to the file wedge
+(commit `954ba9c8`, "writers take sym and reduce through the service"), **no
+frozen reference was migrated and no regression gate was run.** Three gates
+had been red ever since:
+
+| gate | output | reference | verdict |
+|---|---|---|---|
+| `test_si_production_matches_frozen_reference` | 480 rows (8 k) | 3840 (64 k) | RED |
+| `test_si_fast_matches_frozen_reference` | 160 (8 k) | 1280 (64 k) | RED |
+| `test_gw_jax_matches_reference[cohsex]` | 120 (4 k) | 270 (9 k) | RED |
+
+`gnppm_debug` (9 = 9), `bispinor_debug` (9 = 9) and `hbn_cohsex_debug`
+(18 = 18) stayed green **for the wrong reason** — on those decks the file
+wedge IS the full BZ, so the writers' k-set change was invisible. The three
+that broke are exactly the three where `nk_red < nk_tot`.
+
+**CONFIRMED PRE-EXISTING, not caused by the `sc_on_ibz` work**: the same
+`Row-count mismatch: output (480, 7), reference (3840, 7)` reproduces at
+`0241118f`, the parent commit, in a clean worktree.
+
+**Migrated, not regenerated — and the migration was proved before it was
+applied.** Each deck was re-run and the new wedge output compared, block by
+block, against the frozen full-BZ reference at the full-BZ indices
+`kirr_fullids`:
+
+| deck | `kirr_fullids` | max abs difference |
+|---|---|---|
+| `si_cohsex_debug` production | `[0,1,2,5,6,7,10,27]` | **0.000000e+00 eV** |
+| `si_cohsex_debug` fast | `[0,1,2,5,6,7,10,27]` | **0.000000e+00 eV** |
+| `cohsex_debug` | `[0,1,2,4]` | **1e-6 eV** (one VH digit, twice) |
+
+and every new block's `# kcrys` line was checked to equal `wfn.kpoints` in
+order. So the references still carry the frozen numbers; what changed is
+which k are present and the block framing. The two Si decks are bit-exact.
+`cohsex_debug`'s one deviation is a last-printed-digit VH move
+(`189.059483 → 189.059482`) at its 1e-6 gate; the other textual diffs on that
+deck are format-only — the OLD file printed VH real on some rows and complex
+on others, which was already internally inconsistent.
+
+**Re-freezing is normally the owner's call** (the `si_fast` gate's own skip
+message says so). It is done here because leaving three red regression gates
+across a merge is worse, and because the values were *proved* unchanged rather
+than re-blessed. It is a SEPARATE COMMIT so it can be reverted on its own.
+
+### `cohsex_debug` CANNOT run `sc_on_ibz`, and the reason couples two open questions
+
+MEASURED 2026-08-15.  `cohsex_debug` is the deck with the sharpest two-wedge
+divergence (file wedge 4, star wedge 3) and would be the ideal SC regression
+deck.  It refuses:
+
+    ValueError: k-star spread of Σ+V_H is 2.763726e-01 relative, above the
+    refusal threshold 1.0e-06.
+
+That is **not** a wedge bug — it is `_check_kstar_spread` working correctly on
+a genuinely non-star-invariant Σ.  `centroids_frac_60.txt` is one of the four
+deliberately non-orbit-closed sets, and its recorded closure residual is
+**2.762e-01** — the same number.  So the deck's Σ really does differ between
+members of a star, and selecting a representative would keep an arbitrary one.
+
+Consequence worth stating: **the centroid-closure question and the SC wedge
+question are coupled through this fixture.**  Anyone who regenerates
+`centroids_frac_60.txt` as orbit-closed changes which decks can exercise the SC
+path — and per the register, that set is KEEP-with-justification because
+`test_star_offdiag_gate.py` asserts its consequence as a fact.
+
+### MEASURED: independent per-k `eigh` is NOT a source of star-inequivalent E_qp
+
+Same run, `sc_on_ibz` OFF, so `H_qp_dft` is assembled and diagonalised
+independently at every one of the 9 full-BZ k:
+
+| quantity | star spread over 5 orbits |
+|---|---|
+| `E_DFT` | **0.0000 meV** |
+| `E_QP`  | **0.0000 meV** |
+
+(`eqp1.dat` prints `%15.9f` eV, so this bounds the spread below ~1e-6 meV, not
+merely below a meV.)
+
+So per-k diagonalisation reproduces star-equal eigenvalues **exactly**.  The
+8x redundant `eigh` is wasted work, but it is not a source of symmetry
+breaking, and **none** of the 2.6 -> 41 meV Sigma star spread can be
+attributed to it.
+
+CAVEAT ON SCOPE, and it matters: `gnppm_debug`'s centroid set
+(`centroids_frac_399.txt`) IS orbit-closed, so its Sigma star spread is
+already ~0 and this deck cannot discriminate the two causes.  The deck that
+shows 41 meV is `si_cohsex_debug`, which is `one_shot_dft`; testing it would
+need an SC variant, which `sc_on_ibz`'s rot currently blocks.  This result is
+CONSISTENT with the conditioning attribution and does not prove it.
+
+### MEASURED, AND IT OVERTURNS THE RECEIVED EXPLANATION: centroid non-closure is NOT what drives the Si production deck's star spread
+
+2026-08-15.  The tree has stated in several places — `si_cohsex_debug/README.md`,
+`test_gw_jax_regression.py`'s tolerance comment, and (until this entry)
+`docs/architecture/symmetry_register.md` — that the production deck's within-star
+Sigma spread is caused by `centroids_frac_960.txt` being a literal,
+non-orbit-closed point set.  **That was never measured against the alternative.
+It has now been, and it is wrong.**
+
+An orbit-closed 960-point set was generated for the same deck by the same
+procedure the orbit-closed 144 set follows (`kmeans_cli 960 --orbit --seed 42
+--prune-n-val 8 --prune-n-cond 52`), and verified `closed=True`, worst residual
+**1.000e-06 on 48 ops** — identical to the 144 set, both in pure fractional
+coordinates and on the deck's (24,24,24) FFT grid.  It is shipped beside the
+original as `centroids_frac_960_orbitclosed.txt`.  The deck was pointed at it and
+the anchor re-run.
+
+| quantity | non-closed 960 (shipping) | orbit-closed 960 |
+|---|---|---|
+| closure, on-grid | `False`, worst 1.318e-01, 47/48 ops | `True`, worst 1.000e-06 |
+| star spread `[:16]` | 2.6111 meV | **1.9642 meV** |
+| star spread `[:60]` | 41.3376 meV | **39.8758 meV** |
+| sigSX MAE / max vs BGW | 0.1509 / 0.3030 | **3.3336 / 11.8904** |
+| sigCOH MAE / max vs BGW | 0.3513 / 1.2141 | **11.9480 / 39.0121** |
+| sigTOT MAE / max vs BGW | 0.4329 / 1.2525 | **14.9426 / 41.1405** |
+
+**Closure removed essentially none of the spread** — 4% at the full 60-band
+window, 25% at the 16 bands the anchor compares.  If non-closure were the
+mechanism, a closed set would have gone to ~0.000, which is what the 144-point
+set measures.  It did not.
+
+**And it cost a factor of ~35 in agreement with BerkeleyGW**, taking every
+column far outside the gate (limits 1.5 MAE / 5.0 max).  So the orbit-closed
+anchor is worse on the axis the anchor exists to measure and no better on the
+axis it was supposed to fix.  The deck is therefore left on the shipping set and
+the gate is green; this is recorded rather than acted on.
+
+HYPOTHESIS, NOT ESTABLISHED, for what actually drives it: the spread tracks
+centroid COUNT, not geometry.  The 144-point set measures exactly 0.000; both
+960-point sets measure ~40 meV over the full window whether closed or not.  The
+zeta fit at 960 runs with condition numbers around 1e7-1e8 and an rcond of
+1e-10 (`[zeta rank_truncate]` on any run of this deck), so numerical rank
+truncation breaking the symmetry is the natural suspect.  Testing that means a
+count sweep at fixed closure, which has not been done.
+
+CONSEQUENCE FOR THE ORBIT-CLOSURE WORK GENERALLY: orbit closure remains correct
+and worth having — `centroid_source_map_and_wrap` REFUSES without it, and a
+non-closed set forces the q-axis to the full BZ.  What is now measured is that
+on this deck it is not the source of the star spread, so "regenerate on a closed
+set" is not a fix for that symptom.
+
+### MEASURED: how non-orbit-closed the Si production centroid set actually is
+
+2026-08-15, `refactor/eqp-ibz-2026-08-15`, Si production deck
+(`cohsex_si_test.in`, 960 literal centroids, 4x4x4, 64 k / 8 wedge).
+Star spread — the worst per-band max-min of Re diag Sigma_tot between
+members of one star — as a function of how many leading bands are
+included:
+
+| bands | star spread |
+|-------|-------------|
+| `[:8]`  |  0.9796 meV |
+| `[:16]` |  **2.6111 meV** |
+| `[:24]` |  7.2668 meV |
+| `[:32]` |  7.5926 meV |
+| `[:40]` | 10.0203 meV |
+| `[:60]` | **41.3376 meV** |
+
+`bands[:16] = 2.6111` reproduces the historical figure exactly — that is
+the whole scope the BerkeleyGW anchor fixture covers, and therefore the
+only part anyone had ever measured.  **The violation keeps growing with
+band index, to 41.3 meV over the deck's full 60-band sigma window**, i.e.
+sixteen times what the old scope could see.
+
+This is NOT a defect entry: the deck is documented as using a literal,
+non-orbit-closed 960-point centroid set, so the ISDF quadrature genuinely
+breaks the 48-op point group and a nonzero spread is expected
+(`tests/regression/si_cohsex_debug/README.md`, "Known defects"; the
+orbit-closed 144-point fast deck measures exactly 0.000).  What is new is
+the SIZE and the band dependence, which nobody had, because the metric
+was scoped to the fixture's 16 bands.  Anyone reopening the
+orbit-closure question wants this table: the cost of the non-closed set
+is concentrated in the conduction bands, not spread evenly.
+
+Reproduce: the writer now emits `# star_spread_ev_per_band` into
+`sigma_diag.dat`, so the ladder is readable off any run's output without
+instrumenting anything.
+
+### Aside: `_assert_matches_reference`'s "BYTE-IDENTICAL" branch is unreachable
+
+Noticed while re-freezing.  `tests/test_gw_jax_regression.py:140` reports
+`BYTE-IDENTICAL to the reference (atol not exercised)` when
+`output_file.read_text() == reference_file.read_text()`.  That comparison
+can never be true: `common.provenance.provenance_header` (`provenance.py:27`)
+stamps `datetime.now(UTC)` into the first line of every `.dat` LORRAX
+writes, so the output and any committed reference differ in byte 30 of
+line 1 no matter what the physics did.  Every frozen-gate pass has
+therefore gone through the tolerance path, and the headroom warning is the
+only report anyone has ever seen.  Harmless — the atol path IS the gate,
+and it prints the margin — but the branch is dead and its message implies
+a stronger check than exists.  The fix is one line (compare through
+`harness.normalize_dat`, which already strips exactly that line); not taken
+here because it changes what a green gate prints on every deck.
+
+The gate for the two fixed sites is
+`tests/test_unfold_through_the_service.py`: an AST layer that fails if
+either function stops calling the adapter or grows a nested k-loop back,
+plus a behavioural layer that fails if an unfold drops, duplicates or
+mis-parents a k.  Verified red against the pre-change source of both.
+
 ## `KStarMap.spread_rel` loses NaN on an emulated partitioned reduction
 
 OPEN, MEASURED, 2026-08-07, owner decision pending.  Carried in the suite

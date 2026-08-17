@@ -1,0 +1,79 @@
+[cohsex]
+# THE ONE DECK IN THE TREE THAT RUNS THE SELF-CONSISTENT PATH.
+#
+# Until 2026-08-15 there were none: every committed deck was
+# `qp_solver = one_shot_dft`.  That is why `sc_on_ibz = true` rotted
+# unnoticed until it crashed -- flipping its default would have changed no
+# suite result while leaving the path broken for anyone who enabled it
+# (tests/KNOWN_FAILURES.md, "`sc_on_ibz = true` HAS ROTTED").  This deck
+# exists so that cannot happen again.  It is a PATH gate, not a physics
+# result: two map calls, no frozen reference, nothing here is converged
+# and nothing here should be quoted.
+#
+# WHY THIS FIXTURE AND NOT A SMALLER ONE.  The SC loop's H/E/U run on the
+# STAR wedge and every `.dat` writer wants the FILE wedge, and those are
+# different objects (docs/architecture/symmetry_register.md, "THERE ARE
+# TWO DIFFERENT IBZs").  Measured over the whole fixture set on
+# 2026-08-15, file/star/`wfn.nkpts`:
+#
+#     si_cohsex_debug   8 / 8 / 8      si_bse_debug     8 / 8 / 8
+#     hbn_cohsex_debug 18 /18 /18      cohsex_debug     4 / 3 / 4
+#     gnppm_debug       9 / 5 / 9      bispinor_debug   9 / 5 / 9
+#
+# A deck where the two coincide cannot see the conflation at all, which
+# rules out the first three.  `cohsex_debug` (4 vs 3) would be the
+# sharpest case and CANNOT BE USED: its `centroids_frac_60.txt` is not
+# orbit-closed, so under `sc_on_ibz` the k-star spread of Sigma+V_H
+# measures 2.763726e-01 against a 1e-6 refusal threshold and the run stops
+# -- the gate working correctly, on a genuinely non-star-invariant Sigma.
+# (2.762e-01 is exactly that set's recorded closure residual.)  That
+# leaves gnppm_debug, whose 399-centroid set IS orbit-closed.
+#
+# LINEAR MIXING, DELIBERATELY, and it is the reason this deck is a
+# regression rather than a snapshot.  With `sc_accelerator = linear` and
+# `sc_mixing = 1` the iteration is exactly `x_{n+1} = F(x_n)`, and F is
+# k-set invariant: the on/off arms agree to 1e-6 meV -- the `%15.9f` print
+# floor -- at every iterate.  Under the DEFAULT rCROP they do not, because
+# rCROP's least-squares mixing minimises a residual summed over the loop's
+# own k-set (each orbit once on the star wedge, with its multiplicity on
+# the full BZ).  Same fixed point, different path: measured 24.45 meV
+# apart by map call 5 and 113.3 meV in the final eqp0 on this deck.  A
+# deck that pinned the rCROP path would be pinning the accelerator's
+# k-weighting, not the wedge algebra.
+#
+# `sc_on_ibz` IS NOT SET HERE.  It takes the default, so this deck is what
+# makes the default a tested thing rather than a declared one.
+#
+# RESTARTS from the `gnppm_test.in` session state (same WFN, same
+# centroids, same zeta) so it costs one Sigma chain and not an ISDF
+# rebuild: ~25 s at P=4 against ~31 s fresh.
+zeta_rcond = 1e-10
+compute_mode = gn_ppm
+restart = true
+centroids_file = centroids_frac_399.txt
+nval = 26
+ncond = 20
+nband = 46
+sys_dim = 2
+do_screened = true
+bispinor = false
+qp_solver = self_consistent
+sc_max_iter = 2
+sc_tol_ev = 1.0e-3
+sc_accelerator = linear
+sc_mixing = 1.0
+use_ppm_sigma = true
+screening_method = minimax
+ppm_omega_p = 2.0
+ppm_fallback_omega = 2.0
+sigma_omega_min_ev = -10.0
+sigma_omega_max_ev = 10.0
+sigma_omega_step_ev = 0.5
+sigma_regularization_ev = 0.25
+memory_per_device_gb = 28
+sigma_freq_debug_output = false
+fermi_reference = midgap
+wfn_file = WFN.h5
+output_file = sigma_diag_gnppm_sc.dat
+sigma_diag_file = sigma_diag_gnppm_sc.dat
+sigma_omega_h5_file = sigma_mnk_sc.h5

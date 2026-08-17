@@ -27,6 +27,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/sigma_dispatch.py` | Mode-agnostic Σ dispatch (one call per compute mode) | Driver wiring |
 | `src/gw/w_isdf.py` | χ₀ → W screening pipeline (CTSP, Dyson solve) | Screening / epsilon issues |
 | `src/gw/ppm_sigma.py` | GN-PPM dynamic self-energy Σ^c(ω) | Frequency-dependent sigma issues |
+| `src/gw/band_extrapolation.py` | Σ_c band-convergence extrapolation: the disjoint band-bracket plan (interior cuts prefer a clean multiplet boundary via `common/band_degeneracy.py`, falling back rather than refusing), the two-parameter 1/N fit and its trust diagnostics. Sampling fractions are of the TOTAL band count and are MEASURED against BerkeleyGW `ch_converge.dat` — read the comment at `BRACKET_FRACTIONS` before changing them. Deck key `sigma_band_extrapolation`, GN/HL-PPM only, which is a correctness guard | "how many bands does Σ_c need"; the Σ cube's leading bracket axis |
 | `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
 | `src/gw/minimax_config.py` | Shared minimax / sigma quadrature config | Quadrature setup |
 | `src/gw/head_correction.py` | q=0 head / wing correction | Head corrections |

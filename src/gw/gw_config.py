@@ -40,6 +40,14 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 
+# The estimator vocabulary lives with the estimators, not here: a second copy
+# of the value list is a second thing to keep in step.  ``band_extrapolation``
+# imports only ``common``, so this cannot cycle.
+from .band_extrapolation import (
+    BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
+    BAND_EXTRAPOLATION_ESTIMATORS,
+)
+
 
 # ---------------------------------------------------------------------------
 #  Environment grammar — ONE boolean vocabulary for the GW init/config layer
@@ -1019,7 +1027,54 @@ _DEFAULTS = {
     # System geometry
     "nval": 5,
     "ncond": 5,
-    "nband": 100,
+    # ── THE BAND-COUNT FAMILY ───────────────────────────────────────────
+    # FOUR keys, ONE resolver (:func:`resolve_band_counts`), and this dict
+    # is the only place a NUMBER lives.
+    #
+    #   number_bands         the umbrella.  Sizes BOTH consumers.  100.
+    #   number_bands_chi     χ0/W screening band count.   None = follow it.
+    #   number_bands_sigma   Σ band-sum count.            None = follow it.
+    #   nband                TRANSITIONAL ALIAS of ``number_bands``.  None.
+    #
+    # WHY THE SPLIT (2026-08-16, owner request).  ``number_bands`` sized two
+    # convergence behaviours that are not the same behaviour, measured on the
+    # Si 4×4×4 SOC deck:
+    #
+    #   * The **Σ** band sum extrapolates.  ``sigma_band_extrapolation``
+    #     fits S_∞ + A/N from three partial sums and takes the truncation
+    #     error from 106.2 meV MAE raw to 18.3 meV at 248 bands — i.e. Σ can
+    #     be run at FEWER bands and corrected.
+    #   * The **χ** band count does not.  Holding Σ fixed and sweeping only
+    #     the screening's band count 40 → 248 moves band-edge Σ_CH by
+    #     50–222 meV, and the last rung 224 → 248 still moves the median
+    #     state by 40.7 meV NON-MONOTONICALLY, so there is no 1/N to fit.
+    #
+    # With one key the two cannot be configured apart, and the study above
+    # had to vary BerkeleyGW's ``epsilon`` count to isolate the W side at
+    # all.  "χ at full bands, Σ at fewer plus extrapolation" is both the
+    # physically right configuration and the cheap one, and this is the pair
+    # of keys that expresses it.
+    #
+    # WHY ``number_bands`` OWNS THE 100 AND ``nband`` IS None.  A default is
+    # a number, and a number must live in exactly one entry or the two spell
+    # different runs the day one of them moves.  ``number_bands`` is the
+    # canonical spelling going forward (owner ruling 2026-08-16: the rest of
+    # the deck migrates to ``number_bands_*`` shortly), so it holds the
+    # value; ``nband`` is ``None`` = "the deck did not say", which is the
+    # only way to tell a deck that pinned the alias from one that never
+    # mentioned it.  Both spellings run; naming BOTH with DIFFERENT values
+    # is a refusal, not a precedence puzzle.
+    #
+    # WHAT THE ISDF ζ FIT GETS: ``max(chi, sigma)``.  The interpolation basis
+    # has to span the pair densities of whichever consumer reaches higher, so
+    # the ψ this run loads spans ``[b0, b4)`` with ``b4`` built from the max
+    # and the SMALLER consumer takes a narrower window inside it.  The winner
+    # is logged (``BandCounts.describe``); a silent ``max`` is a day of
+    # mis-debugging.
+    "number_bands": 100,
+    "number_bands_chi": None,
+    "number_bands_sigma": None,
+    "nband": None,
     # ζ-FIT BAND-WINDOW TOP, decoupled from the χ0/Σ band-sum top
     # (2026-08-11).  ``None`` (the default) means "follow ``nband``", which
     # is what this axis did for its whole history and what keeps every
@@ -1038,9 +1093,13 @@ _DEFAULTS = {
     # which is not a ζ-basis effect at all.  Set this instead and the band
     # sum keeps its bands.
     #
-    # It only ever NARROWS: ``zeta_nband > nband`` is refused, because the
-    # centroid ψ is loaded once over ``[b0, b4)`` and there is nothing above
-    # b4 to fit.  Its edge takes a STRICT ``band_degeneracy`` check (an
+    # It only ever NARROWS: a ``zeta_nband`` above the ISDF fit's own top —
+    # ``max(number_bands_chi, number_bands_sigma)`` since 2026-08-16 — is
+    # refused, because the centroid ψ is loaded once over ``[b0, b4)`` and
+    # there is nothing above b4 to fit.  (It narrows the fit INSIDE that
+    # window; the χ/Σ split narrows the two band SUMS inside the same
+    # window.  The three are independent and compose.)
+    # Its edge takes a STRICT ``band_degeneracy`` check (an
     # explicit request is a new deck, so there is no census to grandfather):
     # a ζ-fit window that splits a multiplet fits half of an irrep, and ζ is
     # what the IBZ cascade unfolds.  See the ``nband`` entry in
@@ -1051,10 +1110,36 @@ _DEFAULTS = {
     # instead of rotating the fixed DFT one into the QP basis.  Off keeps
     # QSGW fixed-density, which is what every result before 2026-08-04 was.
     "density_self_consistent": False,
-    # Run the SC loop's H / E / U on the IBZ, broadcasting back at the
-    # boundary.  Sigma stays on the full BZ -- it is an FFT over the
+    # Run the SC loop's H / E / U on the STAR wedge, broadcasting back at
+    # the boundary.  Sigma stays on the full BZ -- it is an FFT over the
     # k-grid.  Off keeps the loop entirely full-BZ.
-    "sc_on_ibz": False,
+    #
+    # DEFAULT FLIPPED False -> True, 2026-08-15, on the owner's standing
+    # directive that H^QP be built and eigh'd only on symmetry-reduced
+    # k-points.  Two measurements paid for the flip, both on
+    # ``gnppm_debug`` (file wedge 9, star wedge 5, so the two differ):
+    #
+    #   1. EQUIVALENCE, with ``sc_accelerator = linear``, ``sc_mixing = 1``:
+    #      the on and off arms agree to **1e-6 meV** -- the ``%15.9f``
+    #      print floor -- on E_QP at EVERY iterate and in the final
+    #      eqp0/eqp1, with identical k coordinates.  The map is exactly
+    #      k-set invariant, so the two arms have the same fixed point.
+    #
+    #   2. THE TRAJECTORY IS NOT, under the DEFAULT accelerator.  With
+    #      rCROP the same pair diverges to 24.45 meV by map call 5 and
+    #      113.3 meV in the final eqp0.  That is not a defect: rCROP's
+    #      least-squares mixing minimises a residual norm summed over the
+    #      loop's OWN k-set, so on the star wedge each orbit is counted
+    #      once and on the full BZ with its multiplicity.  Different
+    #      weights, different coefficients, same fixed point.  It does mean
+    #      an UNCONVERGED rCROP run's iterates move when this flag moves --
+    #      relevant given that the accepted Si QSGW run is on record as not
+    #      converged.
+    #
+    # This had rotted invisibly (crash at the eqp writer, the two wedges
+    # conflated) because no committed deck ran the SC path at all.  One now
+    # does: tests/regression/gnppm_debug/gnppm_sc.in.
+    "sc_on_ibz": True,
     # Update the q->0 head from the current QSGW Hamiltonian through the
     # precomputed parallel-transport connection.  Explicit opt-in preserves
     # every historical deck and makes a missing/stale artifact a refusal.
@@ -1168,48 +1253,69 @@ _DEFAULTS = {
     # rather than manufactured to fill a dataset slot.
     "write_qsgw_datasets": False,
     # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
-    # DEFAULT full — the q_irr wedge is OPT-IN PER DECK, which is what
-    # DESIGN_symmetry_restart_followup.md ruled and what this key was built
-    # to obey: "the deck key keeps full-BZ storage as the default until the
-    # owner rules on centroid regeneration, and the q_irr path is opt-in per
-    # deck."  It shipped briefly defaulting to ``auto`` and the 2026-08-08
-    # landing census measured what that cost — nine red cells across the GW
-    # and BSE restart paths on the two decks whose centroid sets are already
-    # orbit-closed.  A default that moves bytes is a default that has to be
-    # asked for.
-    #   full — the DEFAULT.  Preserve today's bytes exactly, unconditionally.
-    #          Does not ask the closure question, so it is also the control
-    #          arm of any A/B.
-    #   auto — store the pre-unfold IBZ wedge when the deck's centroid set is
-    #          orbit-closed AND this run's q path actually reduced; the full
-    #          BZ otherwise.  On a non-closed set (today's Si production
-    #          960-centroid deck: 47 of 48 ops violating) this is byte-for-byte
-    #          today's file.  On a CLOSED set it is ~8x smaller.
+    # DEFAULT auto — storage FOLLOWS THE WFN FILE.  This is the end state the
+    # owner ruled for on 2026-08-08 ~13:20, quoted below, and it became
+    # reachable on 2026-08-15 when the last reader learned to unfold.
+    #   auto — the DEFAULT.  Store the pre-unfold IBZ wedge when the deck's
+    #          centroid set is orbit-closed AND this run's q path actually
+    #          reduced; the full BZ otherwise.  On a non-closed set (the Si
+    #          production 960-centroid deck: 47 of 48 ops violating) this is
+    #          byte-for-byte the old file.  On a CLOSED set it is ~8x smaller
+    #          — MEASURED on ``si_bse_debug`` GW+BSE end to end at P=4:
+    #          ``isdf_tensors_480.h5`` 541,335,584 -> 130,299,936 B (4.15x),
+    #          BSE lowest-8 eigenvalues bit-identical, eqp0/eqp1/sigma_diag
+    #          byte-identical.
+    #   full — preserve the old bytes exactly, unconditionally.  The escape
+    #          hatch for a frozen reference or a stale out-of-tree consumer,
+    #          and the control arm of any A/B: it does not ask the closure
+    #          question at all, so it cannot be changed by the answer.
     #   ibz  — REFUSE on a set that is not storable, naming which of the two
     #          conditions failed.  For a deck that believes it is closed and
     #          wants to be told the day it stops being.
-    # BEFORE YOU SET auto OR ibz ON A CLOSED-SET DECK: the readers do not
-    # unfold yet.  ``bse_io._MunuSlabPlan`` refuses a wedge outright (at every
-    # process count, not only P>1), and the GW restart reader refuses it too
-    # since the same landing — see ``file_io.tagged_arrays``.  The wedge is
-    # therefore usable today by runs that DISCARD the restart artifact or read
-    # it back through the serial h5py path.
     #
-    # ⚠ THIS WHOLE KEY IS TRANSITIONAL — OWNER RULING 2026-08-08 ~13:20.
-    # `full` is where it rests until the key is DELETED, not a permanent
-    # setting to tune.  The owner's ruling is that symmetry should never have
-    # needed a mode switch at all: "symmetries should not need an auto mode —
-    # if symmetries are not to be used, the wavefunction file should've been
-    # generated with no symmetries."  The WFN file already answers the
-    # question this key asks, so the end state is storage that FOLLOWS the
-    # file — the wedge whenever the deck carries symmetries, readers that
-    # always unfold — with `restart_q_storage` retired entirely rather than
-    # defaulted differently.  That work is the GW+BSE restart consolidation
-    # registered in tests/KNOWN_FAILURES.md; do not build on this key.
+    # WHY THE DEFAULT MOVED, AND WHAT HAD TO BE TRUE FIRST.  It shipped
+    # briefly defaulting to ``auto`` and the 2026-08-08 landing census
+    # measured nine red cells across the GW and BSE restart paths — because
+    # at that date THE READERS DID NOT UNFOLD.  That is the sentence this
+    # comment used to carry as a standing warning, and it stopped being true:
+    # the GW restart reader has unfolded since ``536cbac9``
+    # (``file_io.tagged_arrays._unfold_wedge``, applied at ``:1098`` and
+    # ``:1197``), and ``bse._MunuSlabPlan``'s refusal was lifted 2026-08-15
+    # (``bse_loading.py:707-711`` unfolds through the SAME function).  The
+    # cost argument behind that refusal was measured and did not survive:
+    # 57.4 GiB/s unfold against 2.919 GiB/s disk, a 6-17x win at every size
+    # tested, with mu^2 cancelling out of the comparison entirely.
+    #
+    # THE RULING THIS IMPLEMENTS, verbatim: "symmetries should not need an
+    # auto mode — if symmetries are not to be used, the wavefunction file
+    # should've been generated with no symmetries."  The WFN file already
+    # answers the question this key asks.  ``auto`` IS "follow the file";
+    # the key survives only as the escape hatch and the A/B control, and is
+    # still slated for deletion by the GW+BSE restart consolidation
+    # registered in tests/KNOWN_FAILURES.md.  Do not build on it.
     # See gw/restart_q_storage.py for the resolution and the seam, and
     # DESIGN_symmetry_restart_followup.md for the pre-unfold-persistence
     # decision this key selects.
-    "restart_q_storage": "full",
+    "restart_q_storage": "auto",
+    # ``qp_rotations_k_storage``: on WHICH k-set is qp_wfn_rotations.h5
+    # stored?  Same three words as ``restart_q_storage``, and DEFAULT auto
+    # for the same reason — storage follows the WFN file.  The wedge here is
+    # the FILE wedge (``wfn.kpoints``, ``sym.nk_red`` rows), which is the
+    # k-set ``kirr_to_kfull`` already addressed, so a wedge-stored file needs
+    # no change at all in ``postprocess.rotate_wfn_to_qp`` or ``gw.eqp_bgw``.
+    #
+    # ``auto`` IS NOT "reduce whenever symmetry allows".  ``U_mnk`` is a
+    # stack of eigenvectors, defined up to a phase and up to a unitary
+    # mixing inside a degenerate multiplet, so whether the off-wedge rows
+    # are redundant depends on how THIS RUN made them: the SC loop under
+    # ``sc_on_ibz`` broadcasts them from the wedge (redundant), while the
+    # one-shot path runs an independent ``eigh`` at every full-BZ k (NOT
+    # redundant).  ``file_io.qp_wfn.write_qp_rotations_h5`` therefore runs
+    # the reader's own round trip on the arrays in hand and keeps the wedge
+    # only when it reproduces them exactly; ``auto`` falls back to full-BZ
+    # storage and says which array failed and by how much, and ``ibz``
+    # refuses instead of falling back.
+    "qp_rotations_k_storage": "auto",
     # ``compute_mode`` is the single axis describing the self-energy ansatz.
     # ``"auto"`` infers from the legacy ``do_screened`` / ``use_ppm_sigma`` /
     # ``ppm_model`` flags so existing input files keep working unchanged.
@@ -1653,6 +1759,14 @@ _DEFAULTS = {
     # crossing core decomposes per cluster; a contiguous grid is always
     # one cluster and keeps the incumbent plan bit-for-bit.
     "mpa_sigma_omega_cluster_gap_ry": 1.0,
+    # OCCUPANCY at which a band leaves a metallic Green's-function branch.
+    # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
+    # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
+    # a magnitude, because MP1 f_kn is never clipped and a wrong-side band
+    # carries a NEGATIVE weight that must be kept.  1.0 reproduces the
+    # historical exact `weight != 0` rule bit-for-bit.  Metal-only: an
+    # insulating branch has no weight and is untouched.
+    "occupation_window_threshold": 0.995,
     # Sigma frequency grid
     "sigma_omega_min_ev": -5.0,
     "sigma_omega_max_ev": 5.0,
@@ -1690,6 +1804,79 @@ _DEFAULTS = {
     # dynamical pole and adds the analytic static-COHSEX term for those
     # modes — see ppm_sigma._compute_invalid_static_sigma.
     "ppm_invalid_mode": "static_limit",
+    # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
+    # ON by default since 2026-08-16 (owner ruling).  ON evaluates the
+    # Sigma_c band sum at THREE band counts in one pass -- 80 %, 90 % and
+    # 100 % of the TOTAL **SIGMA** band count (``number_bands_sigma``, NOT
+    # ``number_bands_chi`` and NOT of the conduction range: see
+    # band_extrapolation.BRACKET_FRACTIONS for the measurement, and note
+    # that this line said "~50%, ~75% of the conduction range" while the
+    # code said neither), interior cuts preferring a degeneracy-clean
+    # boundary -- by building three DISJOINT band-bracket Green's functions
+    # per tau against one W(tau), fits S(N) = S_inf + A/N, and USES the
+    # extrapolated Sigma_c as the E_nk that self-consistent iterations see.
+    # Costs ~3x the Sigma tau-loop wall: G(tau) lives in the centroid basis,
+    # so the FFT chain and the psi projection are paid once per bracket
+    # regardless of how the bands are split.
+    #
+    # HARD GATE: REFUSES BY NAME when the Sigma band sum has n_cond < n_occ,
+    # i.e. number_bands_sigma < 2*n_occ.  The owner's form is
+    # "nband >= 2*N_electrons"; n_occ is the spin-convention-independent way
+    # to write it (SOC/noncolin n_occ = N_electrons, otherwise
+    # N_electrons/2).  THE COUNT IS THE SIGMA COUNT (merge ruling
+    # 2026-08-16): the gate is a statement about the sum being fitted, and
+    # ``number_bands_chi`` is never read by the planner -- raising it does
+    # not clear the refusal, and the message says so.  See
+    # gw.band_extrapolation.plan_band_brackets.
+    #
+    # PER-STAGE AUTO-DISABLE: the 1/N -> 0 limit is MODE-DEPENDENT and is
+    # WRONG for a static Coulomb hole (measured: static COHSEX MAE 94.9 ->
+    # 288.2 meV as nband 60 -> 124, ANTI-converging, against GN-PPM 171.3 ->
+    # 32.8).  So on a non-PPM compute_mode this key DISABLES ITSELF with a
+    # recorded note rather than refusing the run -- but only when it is at
+    # its default.  A deck that names it explicitly on a non-PPM mode still
+    # REFUSES, because an explicitly requested knob that silently does
+    # nothing is how a green A/B comes to measure nothing.
+    # THE DEFAULT IS TRUE -- see USE_BAND_EXTRAPOLATION_DEFAULT.  The entry
+    # here is None ("no deck named it") because the resolver has to tell
+    # "the deck said false" from "the deck said nothing": only the former
+    # turns the feature off, and only the former makes a non-PPM mode refuse
+    # instead of auto-disabling.  Both keys are tri-state for that reason.
+    "use_band_extrapolation": None,
+    # DEPRECATED ALIAS (transitional, 2026-08-16) for use_band_extrapolation.
+    # Kept so committed decks and fixtures do not break.  Naming BOTH keys
+    # with DIFFERENT values REFUSES BY NAME rather than picking a winner --
+    # same migration shape as nband -> number_bands.  Its default is None
+    # ("not named"), not False: the resolver distinguishes "the deck said
+    # false" from "the deck said nothing", and only the former can turn the
+    # feature off.
+    "sigma_band_extrapolation": None,
+    # WHICH band-convergence estimator consumes the three bracket sums.
+    # Both read the SAME three points; they differ only in what they do with
+    # them, so this key costs nothing and changes no compute.
+    #
+    #   spectral_shell   DEFAULT since 2026-08-17.  Solves one decay exponent
+    #                    PER EXTERNAL STATE from the ratio of the two observed
+    #                    shell increments against spectral moments of the DFT
+    #                    eigenvalues, then integrates the remaining tail to
+    #                    the finite plane-wave basis N_PW = min(ngk)*nspinor.
+    #                    Held out against a MEASURED S(508) on the Si 50 Ry
+    #                    508-band arm its median error is 4.7 / 14.7 / 12.5 /
+    #                    0.7 / 0.0 meV at N_max = 152 / 204 / 260 / 296 / 396,
+    #                    against 45.8 / 29.7 / 17.5 / 12.6 / 3.5 for the
+    #                    incumbent.  REFUSES BY NAME on a state whose two
+    #                    shells disagree in sign or whose exponent has no
+    #                    bracketed root -- it never clips and never
+    #                    substitutes.
+    #   band_index_only  The incumbent two-parameter S_inf + A/N least
+    #                    squares, under its honest name: the band INDEX is the
+    #                    only thing it looks at.  Kept, selectable, and
+    #                    bit-for-bit unchanged -- it is the same code path.
+    #
+    # See gw.band_extrapolation's module docstring for both derivations, the
+    # held-out table and the owner rulings (beta is per-state and is never
+    # pooled; the ladder comes from the DFT eigenvalues only).
+    "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
     # when ``mpa_material_class = metal``; refused under insulator.  These
@@ -1698,6 +1885,15 @@ _DEFAULTS = {
     # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
     "occ_smearing_family": None,
     "occ_smearing_width_ry": None,
+    # Far-tail clamp on the MP1 occupation table, applied AT EVALUATION
+    # (inside the fixed-N root), so mu is solved for the clamped table and
+    # the fixed-N invariant is asserted against what consumers receive.
+    # |f| < tol -> 0, |1-f| < tol -> 1.  Nothing near the Fermi surface is
+    # touched: gw.efermi.occupation_clamp_tol caps this 35x below MP1's
+    # overshoot extremum 0.0354579, which is configured quadrature.  0.0
+    # disables it bit-for-bit.  Insulating decks are unaffected by
+    # construction (their table is already exactly 0/1).
+    "occupation_clamp_tol": 1e-8,
     "sigma_at_dft_extrapolate": False,
     # Deprecated (2026-07-08): ``sigma_at_dft_energies = true`` is honored
     # as an alias for ``qp_solver = one_shot_dft`` — which is now the
@@ -1776,6 +1972,7 @@ _NORMALIZE_STR = {
     "wcoul0_source", "screening_method", "screening_diagrams",
     "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
+    "band_extrapolation_estimator",
     "occ_smearing_family",
     "w_dyson_solver",
     "ppm_invalid_mode",
@@ -1786,6 +1983,10 @@ _NORMALIZE_STR = {
     # key whose wrong value would otherwise surface as a refusal deep in the
     # restart write, after the compute.
     "restart_q_storage",
+    # ``qp_rotations_k_storage`` normalises and validates the same way, for
+    # the same reason: its wrong value would otherwise surface as a refusal
+    # in the post-SC artifact dump, after the whole self-consistency.
+    "qp_rotations_k_storage",
     # distributed-linalg backend axes (consumed both via LorraxConfig and
     # directly from the params dict by htransform / exciton_bands).
     "eigh_backend",
@@ -1795,7 +1996,15 @@ _NORMALIZE_STR = {
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
 # input-file value parses as bool.  The parse loop needs the set because
 # ``default is None`` otherwise means "nullable float".
-_NULLABLE_BOOL = frozenset()
+_NULLABLE_BOOL = frozenset({
+    # Both halves of the 2026-08-16 band-extrapolation migration.  Tri-state
+    # so ``resolve_band_extrapolation`` can distinguish a deck that SAID
+    # false from one that said nothing -- the difference between "turn it
+    # off" and "let the default stand", and the difference between refusing
+    # a non-PPM mode and auto-disabling on it.
+    "use_band_extrapolation",
+    "sigma_band_extrapolation",
+})
 
 #: Keys whose default is ``None`` ("unset") but whose explicit value is an
 #: INTEGER.  Same role ``_NULLABLE_BOOL`` plays for tri-state booleans: the
@@ -1803,7 +2012,18 @@ _NULLABLE_BOOL = frozenset()
 #: and a band edge that parsed as ``52.0`` — or, worse, accepted ``52.5``
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
-_NULLABLE_INT = frozenset({"zeta_nband"})
+_NULLABLE_INT = frozenset({
+    "zeta_nband",
+    # The band-count family's three "the deck did not say" slots.  They are
+    # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
+    # distinguishable from any integer a deck could write — and integer for
+    # the same reason too: a band edge that parsed as ``248.0``, or worse
+    # accepted ``248.5`` and truncated it, is a band edge nobody can reason
+    # about.  See ``resolve_band_counts``.
+    "number_bands_chi",
+    "number_bands_sigma",
+    "nband",
+})
 
 #: Keys whose default is None but whose explicit value is a STRING — the
 #: bare ``default is None`` parser branch is the nullable-float one.
@@ -1815,6 +2035,371 @@ _NULLABLE_STR = frozenset({"occ_smearing_family"})
 #: and every real key comes from there, so a name that cannot appear in
 #: ``_DEFAULTS`` cannot collide.  Read once, into ``GWConfig.raw_input_keys``.
 _DECK_NAMED_KEYS = "_deck_named_keys"
+
+#: Reserved slot holding the resolved :class:`BandCounts`.  Same convention
+#: and the same reason as ``_DECK_NAMED_KEYS``: resolution happens ONCE, in
+#: ``read_lorrax_input``, and the answer travels in the params dict rather
+#: than being re-derived by every consumer.  Re-deriving it would not even be
+#: possible after the fact — ``read_lorrax_input`` MIRRORS the resolved load
+#: top back onto ``params["nband"]`` for the tools that read the dict
+#: directly, which erases the distinction a second resolution would need.
+_BAND_COUNTS = "_band_counts"
+
+
+# ---------------------------------------------------------------------------
+#  Band counts: one resolver, one precedence, four keys
+# ---------------------------------------------------------------------------
+
+class BandCountConflict(ValueError):
+    """Two band-count keys were set and they disagree.
+
+    Refusal, not coercion.  Every silent resolution of this case is wrong for
+    somebody: picking the umbrella throws away the specific request the deck
+    took the trouble to write, picking the specific makes the umbrella a lie
+    for the OTHER consumer, and picking the max or the min invents a run
+    nobody asked for.  So it is named, with both values quoted and the edit
+    that fixes it spelled out.
+    """
+
+
+@dataclass(frozen=True)
+class BandCounts:
+    """The resolved χ and Σ band counts, and what the ISDF fit is sized by.
+
+    Constructed exactly once per run, by :func:`resolve_band_counts`.  The
+    only three numbers below this point are :attr:`chi`, :attr:`sigma` and
+    :attr:`isdf`; nothing downstream re-reads a deck key to get a band count.
+
+    Attributes
+    ----------
+    chi, sigma : int
+        The χ0/W band count and the Σ band-sum count, both fully resolved
+        (never ``None``): a deck that names only the umbrella gets them equal
+        to it, which is the whole of the bit-identity claim.
+    isdf : int
+        ``max(chi, sigma)`` — the top of the band window the ψ is loaded over
+        and therefore the window the ISDF ζ fit is built for.  The
+        interpolation basis has to span the pair densities of whichever
+        consumer reaches higher; sizing it by the smaller one would leave the
+        larger consumer extrapolating in the ζ basis.
+    named : frozenset[str]
+        Which of the four keys the DECK itself wrote.  Kept so consumers can
+        distinguish "asked for this edge by name" (→ strict degeneracy check,
+        the ``zeta_nband`` precedent) from "inherited it" (→ the grandfather
+        clause), without re-parsing the deck.
+    """
+
+    chi: int
+    sigma: int
+    named: frozenset = frozenset()
+
+    @property
+    def isdf(self) -> int:
+        """Band-window top the ISDF ζ fit is built for: ``max(chi, sigma)``."""
+        return max(self.chi, self.sigma)
+
+    @property
+    def isdf_source(self) -> str:
+        """Which count won the ``max``: ``"chi"``, ``"sigma"`` or ``"tied"``."""
+        if self.chi > self.sigma:
+            return "chi"
+        if self.sigma > self.chi:
+            return "sigma"
+        return "tied"
+
+    @property
+    def split(self) -> bool:
+        """True when the two consumers were given DIFFERENT counts."""
+        return self.chi != self.sigma
+
+    def describe(self) -> str:
+        """The one line a run logs so the ``max`` is never silent.
+
+        Named in the brief that asked for the split: "log which count won the
+        ``max`` and what the fit was built for.  A silent ``max`` is the kind
+        of thing that gets mis-debugged for a day."
+        """
+        if not self.split:
+            return (f"band counts: chi = sigma = {self.chi}; ISDF zeta fit "
+                    f"sized for {self.isdf} bands (the two counts are TIED, "
+                    f"so the fit spans both)")
+        return (f"band counts: chi = {self.chi}, sigma = {self.sigma}; ISDF "
+                f"zeta fit sized for {self.isdf} bands, SET BY "
+                f"number_bands_{self.isdf_source} (the larger); the smaller "
+                f"count ({min(self.chi, self.sigma)}) does NOT size the fit")
+
+
+#: The umbrella key and its transitional alias, canonical spelling first.
+_UMBRELLA_KEYS = ("number_bands", "nband")
+
+#: Consumer key -> the attribute it resolves into.
+_SPECIFIC_KEYS = {"number_bands_chi": "chi", "number_bands_sigma": "sigma"}
+
+
+def resolve_band_counts(params: dict, deck_named=None) -> BandCounts:
+    """Resolve the four band-count keys into one :class:`BandCounts`.
+
+    **THE ONLY PLACE THIS PRECEDENCE EXISTS.**  Four keys with two spellings
+    of the umbrella is exactly the shape that grows a second, disagreeing
+    resolution in a consumer six weeks later, so there is one function, it is
+    pure, and it is directly testable without a deck, a WFN or jax.
+
+    PRECEDENCE, in order:
+
+    1. ``nband`` is a TRANSITIONAL ALIAS of ``number_bands``.  Either
+       spelling sets the umbrella.  Both set to DIFFERENT values → refuse
+       (:class:`BandCountConflict`).
+    2. The umbrella supplies BOTH consumers.  A deck that names only it —
+       every deck in the tree today — gets ``chi == sigma == umbrella``, and
+       that is the bit-identity claim.
+    3. ``number_bands_chi`` / ``number_bands_sigma`` override their own
+       consumer and nothing else.
+    4. Naming the umbrella AND a specific key with DIFFERENT values → refuse.
+       "The umbrella overrides both" and "a specific key overrides its
+       consumer" are both true and they contradict each other exactly here;
+       this codebase has been bitten repeatedly by silent coercion, so the
+       contradiction is reported rather than broken by fiat.  Naming them
+       with the SAME value is redundant, not wrong, and is accepted.
+
+    Parameters
+    ----------
+    params : dict
+        A params dict from :func:`read_lorrax_input`, or any dict with the
+        same keys.  Missing keys fall back to ``_DEFAULTS``.
+    deck_named : iterable of str, optional
+        The keys the deck itself wrote.  Defaults to
+        ``params[_DECK_NAMED_KEYS]`` and then to "every key whose value is
+        not None", so a hand-made dict behaves sensibly.  This is what
+        separates "set to 100" from "defaulted to 100": without it a deck
+        that pinned ``number_bands = 100`` beside ``number_bands_chi = 248``
+        would be indistinguishable from one that pinned neither, and rule 4
+        could not fire.
+    """
+    if deck_named is None:
+        deck_named = params.get(_DECK_NAMED_KEYS)
+    if deck_named is None:
+        # No provenance supplied (a hand-made params dict).  "Present with a
+        # non-None value" is the best available proxy — and it is read WITHOUT
+        # the ``_DEFAULTS`` fallback, so a dict that simply omits a key is not
+        # credited with naming it.
+        deck_named = {k for k in (_UMBRELLA_KEYS + tuple(_SPECIFIC_KEYS))
+                      if params.get(k) is not None}
+    named = frozenset(str(k).lower() for k in deck_named)
+
+    def _val(key):
+        v = params.get(key, _DEFAULTS.get(key))
+        return None if v is None or v == "" else int(v)
+
+    # --- 1. umbrella, from either spelling -----------------------------
+    # A key's VALUE is only consulted when the deck NAMED it.  Reading
+    # ``number_bands`` unconditionally would let its default (100) outrank an
+    # explicit ``nband = 248``, which is the alias silently not working —
+    # exactly the failure the alias exists to prevent.
+    canonical, alias = _UMBRELLA_KEYS
+    u_canonical = _val(canonical) if canonical in named else None
+    u_alias = _val(alias) if alias in named else None
+    if (u_canonical is not None and u_alias is not None
+            and u_canonical != u_alias):
+        raise BandCountConflict(
+            f"the deck sets BOTH `{canonical} = {u_canonical}` and the "
+            f"transitional alias `{alias} = {u_alias}`, and they disagree.  "
+            f"`{alias}` is an accepted spelling of `{canonical}`, not a "
+            f"second axis, so there is no rule that makes one of these win "
+            f"without discarding the other.  Delete one of the two lines "
+            f"(keep `{canonical}` — `{alias}` is transitional).")
+    umbrella = u_canonical if u_canonical is not None else u_alias
+    umbrella_named = umbrella is not None
+    if umbrella is None:
+        umbrella = int(_DEFAULTS[canonical])
+
+    # --- 2/3/4. the two consumers --------------------------------------
+    resolved = {}
+    for key, attr in _SPECIFIC_KEYS.items():
+        v = _val(key)
+        if key not in named or v is None:
+            resolved[attr] = umbrella          # rule 2
+            continue
+        if umbrella_named and v != umbrella:   # rule 4
+            which = canonical if canonical in named else alias
+            other = "sigma" if attr == "chi" else "chi"
+            raise BandCountConflict(
+                f"the deck sets the umbrella `{which} = {umbrella}` AND "
+                f"`{key} = {v}`, and they disagree.  `{which}` sets BOTH "
+                f"band counts, so this deck says the {attr} count is "
+                f"{umbrella} and also that it is {v}.  Pick one of:\n"
+                f"    - drop `{which}` and set `number_bands_chi` / "
+                f"`number_bands_sigma` explicitly (both of them — whichever "
+                f"you leave out falls back to the umbrella default "
+                f"{int(_DEFAULTS[canonical])}, which is almost certainly not "
+                f"what you meant);\n"
+                f"    - drop `{key}` and run both consumers at {umbrella};\n"
+                f"    - keep `{which} = {v}` if {v} is what you meant for "
+                f"the {other} count too.\n"
+                f"Nothing is coerced here: silently preferring either value "
+                f"would run a calculation this deck did not describe.")
+        resolved[attr] = v                     # rule 3
+
+    for attr, v in resolved.items():
+        if v < 1:
+            raise ValueError(
+                f"number_bands_{attr} = {v} is not a band count; it must be "
+                f">= 1.")
+    return BandCounts(chi=int(resolved["chi"]), sigma=int(resolved["sigma"]),
+                      named=named & (set(_UMBRELLA_KEYS) | set(_SPECIFIC_KEYS)))
+
+
+#: What ``use_band_extrapolation`` means when no deck names either spelling.
+#: TRUE since 2026-08-16 (owner ruling): the band-convergence extrapolation of
+#: Σ_c runs by default and its extrapolated result is the E_nk that
+#: self-consistent iterations see.  Lives here as a named constant rather than
+#: inline in ``_DEFAULTS`` because ``_DEFAULTS`` has to carry ``None`` for the
+#: tri-state resolution below, and a reader looking up "what is the default"
+#: must not find ``None`` and conclude "off".
+USE_BAND_EXTRAPOLATION_DEFAULT = True
+
+#: The current key and its deprecated alias, in message order.
+_BAND_EXTRAP_KEYS = ("use_band_extrapolation", "sigma_band_extrapolation")
+
+
+def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
+    """Resolve the two spellings into ``(enabled, explicit)``.
+
+    ``use_band_extrapolation`` is the key; ``sigma_band_extrapolation`` is a
+    TRANSITIONAL alias kept so committed decks and fixtures do not break.
+    Both arrive tri-state: ``None`` means the deck did not name that spelling.
+
+    Returns
+    -------
+    enabled : bool
+        Whether the feature is on.
+    explicit : bool
+        Whether a deck NAMED either spelling.  This is not decoration -- it
+        selects between two different behaviours on a non-PPM ``compute_mode``
+        (``gw.sigma_dispatch``): a defaulted-on key AUTO-DISABLES with a
+        recorded note so that staged / static runs stay usable, while an
+        explicitly-named one REFUSES.  Silently ignoring a knob the operator
+        wrote down is how a green A/B comes to measure nothing.
+
+    Raises
+    ------
+    ValueError
+        When both spellings are named and they DISAGREE.  Refusing by name
+        rather than picking a winner: whichever precedence we chose, half the
+        decks that hit it would silently get the other one, and the operator
+        would have no signal.  Same migration shape as ``nband`` ->
+        ``number_bands``.
+    """
+    named = {k: v for k, v in zip(_BAND_EXTRAP_KEYS, (use_val, alias_val))
+             if v is not None}
+    if len(named) == 2 and bool(use_val) != bool(alias_val):
+        raise ValueError(
+            f"Deck names BOTH band-extrapolation keys and they DISAGREE: "
+            f"use_band_extrapolation = {bool(use_val)!r} against the "
+            f"deprecated alias sigma_band_extrapolation = "
+            f"{bool(alias_val)!r}.\n"
+            f"  These are the same switch under two names, so there is no "
+            f"consistent run to produce and no winner will be picked for "
+            f"you.  Remove ONE of them -- keep `use_band_extrapolation`, "
+            f"which is the current spelling; `sigma_band_extrapolation` is "
+            f"deprecated (2026-08-16) and is honored only for decks written "
+            f"before the rename.")
+    if not named:
+        return bool(USE_BAND_EXTRAPOLATION_DEFAULT), False
+    if alias_val is not None and print_fn is not None:
+        print_fn(
+            f"  *** DEPRECATED KEY: `sigma_band_extrapolation` is "
+            f"transitional and will be removed; it is honored here as "
+            f"`use_band_extrapolation = {bool(alias_val)}`.  Rename it in "
+            f"this deck.")
+    # Both named and AGREEING is fine, and lands here on either value.
+    return bool(next(iter(named.values()))), True
+
+
+def sigma_stage_modes(config, fallback=None) -> tuple:
+    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order.
+
+    **THIS FUNCTION EXISTS BECAUSE A PREVIOUS ANALYSIS WAS WRONG, and the
+    correction is worth stating rather than silently applying.**  The
+    2026-08-16 SC-wiring branch concluded from a ``git log --all`` /
+    ``git grep --all`` search that ``sc_stage_N_type`` "does not exist on any
+    branch", and mapped per-stage behaviour onto ``compute_mode`` as the only
+    available proxy.  The search was run in a single-branch checkout, where
+    ``--all`` covers only FETCHED refs, so the null was a statement about that
+    checkout's remotes.  The keys are real: ``origin/feat/staged-sc-2026-08-15``
+    (98289d77) carries ``SC_STAGE_TYPES`` (``none | cohsex | gnppm | mpa``),
+    ``SCStage(mode, cutoff_ev, max_iter)``, ``default_sc_ladder`` and
+    ``resolve_sc_stages`` in this file, plus ``SCConfig.stages`` and
+    ``run_staged_self_consistency`` in ``gw.sc_iteration``.
+
+    WHAT THE REAL INTERFACE CHANGES, AND WHAT IT DOES NOT.
+
+    * It does NOT invalidate the ``compute_mode`` seam.  Read against the real
+      branch, ``run_staged_self_consistency`` rebuilds each stage's inputs with
+      ``dataclasses.replace(config, compute_mode_raw=stage.mode.value)`` and
+      passes ``stage.mode`` into ``compute_sigma_xc``, so during a stage the
+      dispatched ``mode`` **is** that stage's mode.  A per-stage guard written
+      against ``compute_mode`` therefore fires per stage already.  That part of
+      the SC branch was accidentally right.
+    * It DOES invalidate the REFUSAL.  A refusal is a statement about the whole
+      RUN, and under a ladder the stage in front of you is not the run.  With
+      the guard written per-stage, an explicitly-named key would kill:
+      ``sc_stage_1_type = cohsex, sc_stage_2_type = gnppm`` at stage 1 (before
+      reaching the very stage that consumes the key), and the SHIPPED DEFAULT
+      LADDER for ``compute_mode = mpa`` — ``(GN_PPM @5 meV, MPA @2 meV)`` — at
+      stage 2, after paying for a full GN-PPM stage.  Both are runs that must
+      work.  Hence this function, and hence the refusal below is asked about
+      the LADDER rather than about one stage.
+
+    Parameters
+    ----------
+    config
+        A :class:`LorraxConfig`, or anything shaped like one.  Read entirely
+        through ``getattr`` so it is correct **before** the staged-SC branch
+        merges (no ``config.sc.stages`` → the deck's single ``compute_mode``)
+        and **after** it merges (the resolved ladder), with no edit here.
+    fallback
+        Mode to report when the config exposes neither a ladder nor a
+        ``compute_mode`` — a hand-made namespace in a unit test, or a config
+        whose ``compute_mode`` property refuses.  Callers pass the mode they
+        are currently dispatching, which is the only honest answer available.
+    """
+    stages = getattr(getattr(config, "sc", None), "stages", None) or ()
+    modes = []
+    for stage in stages:
+        raw = getattr(stage, "mode", stage)
+        try:
+            modes.append(coerce_compute_mode(raw))
+        except (ValueError, TypeError):
+            continue
+    if not modes:
+        try:
+            modes = [coerce_compute_mode(config.compute_mode)]
+        except (AttributeError, ValueError, TypeError):
+            modes = []
+    if not modes and fallback is not None:
+        try:
+            modes = [coerce_compute_mode(fallback)]
+        except (ValueError, TypeError):
+            modes = []
+    # Order-preserving dedupe: the ladder is short and a reader of the refusal
+    # wants "which schemes does this run use", not a repetition count.
+    seen, out = set(), []
+    for m in modes:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return tuple(out)
+
+
+def band_extrapolation_is_consumable(modes) -> bool:
+    """Does ANY stage of this run reach the kernel that reads the key?
+
+    ``ppm_model is not None`` is the exact predicate: the extrapolation is
+    wired into the two-point GN/HL plasmon-pole Σ_c kernel and nothing else.
+    Deliberately NOT ``is_dynamic`` — that is True for MPA, which is dynamic
+    and still does not consume this key.
+    """
+    return any(getattr(m, "ppm_model", None) is not None for m in modes)
 
 
 # ---------------------------------------------------------------------------
@@ -2123,6 +2708,29 @@ def read_lorrax_input(filename: str) -> dict:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
 
+    # --- Band counts: resolve ONCE, here ------------------------------
+    # ``number_bands`` / ``number_bands_chi`` / ``number_bands_sigma`` /
+    # ``nband`` collapse into two numbers plus their max, and this is the
+    # only call to the resolver on the deck path.  Resolving here rather
+    # than in ``LorraxConfig`` is what lets the params dict stay honest for
+    # the tools that read it directly (``bandstructure.htransform``,
+    # ``psp.get_DFT_mtxels``, ``gw.kin_ion_io``, ``file_io.epsreader``):
+    # they ask for ``params["nband"]`` and must get the LOADED band extent,
+    # which after the split is ``max(chi, sigma)`` — the same number they
+    # always got on an unsplit deck.
+    #
+    # The mirror is why this is not idempotent and why the answer is
+    # cached in ``params[_BAND_COUNTS]`` instead of being re-derived: after
+    # the write-back, ``nband`` no longer says what the DECK said, so a
+    # second ``resolve_band_counts`` on this dict would see an umbrella that
+    # the deck never wrote.
+    _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
+    params[_BAND_COUNTS] = _counts
+    params["number_bands_chi"] = _counts.chi
+    params["number_bands_sigma"] = _counts.sigma
+    params["number_bands"] = _counts.isdf
+    params["nband"] = _counts.isdf
+
     # Parse optional QE K_POINTS block
     if kp_idx is not None:
         j = kp_idx + 1
@@ -2372,6 +2980,24 @@ class DynamicSigmaConfig:
     #: uniformity; solved QP energies landing inside a hole are refused
     #: at the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).
     omega_patches_ev: str = ""
+    #: Band-convergence extrapolation of Sigma_c, resolved from
+    #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
+    #: ``sigma_band_extrapolation`` by
+    #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
+    #: (``gw.ppm_pipeline``); on a non-PPM ``compute_mode`` it is turned OFF
+    #: with a recorded note (or refused -- see ``band_extrapolation_explicit``)
+    #: by ``gw.sigma_dispatch``, because the 1/N limit is mode-dependent and
+    #: wrong for a static Coulomb hole.
+    band_extrapolation: bool = USE_BAND_EXTRAPOLATION_DEFAULT
+    #: Did a deck NAME either spelling?  Selects between auto-disabling and
+    #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.
+    band_extrapolation_explicit: bool = False
+    #: WHICH estimator consumes the three bracket sums --
+    #: ``spectral_shell`` (default) or ``band_index_only``.  Read once, by
+    #: ``gw.ppm_pipeline``.  It selects nothing about the COMPUTE: both
+    #: estimators read the same three points the same brackets produce, so
+    #: this is a post-processing choice and switching it re-does no Sigma.
+    band_extrapolation_estimator: str = BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -2385,6 +3011,22 @@ class DynamicSigmaConfig:
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
+        # REFUSE an unrecognised estimator, naming both, rather than falling
+        # back to the default.  A misspelling that silently ran the default
+        # would be an A/B measuring nothing -- the same rule
+        # ``screening_method`` states above, for the same reason.
+        if self.band_extrapolation_estimator not in (
+                BAND_EXTRAPOLATION_ESTIMATORS):
+            raise ValueError(
+                f"band_extrapolation_estimator = "
+                f"{self.band_extrapolation_estimator!r} is not a known "
+                f"band-convergence estimator.  The two are: 'spectral_shell' "
+                f"(the DEFAULT -- one decay exponent per external state from "
+                f"the two shell increments against spectral moments of the "
+                f"DFT eigenvalues, tail integrated to the finite plane-wave "
+                f"basis) and 'band_index_only' (the incumbent two-parameter "
+                f"S_inf + A/N least squares).  Both consume the SAME three "
+                f"bracket sums; neither changes what is computed.")
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
@@ -2484,6 +3126,15 @@ class MPAConfig:
     #: cluster (the incumbent plan, bit-for-bit); pair with
     #: ``sigma_omega_patches_ev`` to actually gap the grid.
     sigma_omega_cluster_gap_ry: float = 1.0
+    #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
+    #: counting toward a metallic Green's-function branch.  The Σ planner's
+    #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
+    #: floor it applies is ``1 − threshold`` — 0.995 ⇒ ``|weight| > 0.005``
+    #: — and it is a MAGNITUDE because MP1 occupations are never clipped.
+    #: 1.0 recovers the historical exact ``weight != 0`` rule.  Validated at
+    #: its consumer (``gw.mpa.sigma_windows._weight_floor``) per the ruling
+    #: below.
+    occupation_window_threshold: float = 0.995
 
     # pole_batch_size and the two Sigma target errors are validated at their
     # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
@@ -2833,7 +3484,18 @@ class LorraxConfig:
     # --- System geometry (top-level; hot path) ---
     nval: int
     ncond: int
+    #: The LOADED band extent = ``bands.isdf`` = ``max(chi, sigma)``.  On
+    #: every deck that names only the umbrella (or only the transitional
+    #: ``nband`` alias) this is exactly the umbrella, which is why the whole
+    #: tree reads unchanged.  On a SPLIT deck it is the larger of the two
+    #: counts: the ψ is loaded once over ``[b0, b4)`` and the smaller
+    #: consumer takes a narrower window inside it.  A consumer that wants
+    #: "how many bands does χ0 sum" or "how many does Σ sum" must ask
+    #: ``bands.chi`` / ``bands.sigma``, never this field.
     nband: int
+    #: The resolved band-count family.  See :func:`resolve_band_counts` for
+    #: the precedence and :meth:`BandCounts.describe` for the log line.
+    bands: BandCounts
     #: ζ-fit band-window top.  ``None`` == follow ``nband`` (every deck
     #: written before 2026-08-11); an int NARROWS the ζ fit's band ranges
     #: without touching ``b4``, the χ0/Σ band-sum top.  See ``_DEFAULTS``.
@@ -2856,6 +3518,15 @@ class LorraxConfig:
     #: :attr:`occ_broadening_ry`.
     occ_smearing_family: str | None
     occ_smearing_width_ry: float | None
+    #: ``occupation_clamp_tol``: the distance from 0 or 1 within which an
+    #: MP1 occupation is snapped to EXACTLY 0 or 1, applied at the point
+    #: the occupations are evaluated and therefore inside the fixed-N root
+    #: (``gw.efermi.clamp_occupation_tail``).  Distinct from
+    #: ``occupation_window_threshold``, which decides band membership of a
+    #: Green's-function branch and is not replaced by this.  Validated at
+    #: its consumer (``gw.efermi.occupation_clamp_tol``), the same shape
+    #: ``occupation_window_threshold`` uses.
+    occupation_clamp_tol: float
 
     # --- Core mode flags (top-level; hot path) ---
     restart: bool
@@ -2876,6 +3547,12 @@ class LorraxConfig:
     #: resolution point rather than a fast path beside it.  Same ``_raw``
     #: convention as ``compute_mode_raw``.
     restart_q_storage_raw: str
+    #: ``qp_rotations_k_storage`` — "auto" (the default) | "full" | "ibz".
+    #: NOT a ``_raw``: unlike ``restart_q_storage`` there is nothing to
+    #: resolve late, because the question it asks ("do these rows unfold
+    #: back to what I hold?") is answered by the arrays themselves at the
+    #: writer, not by a centroid set that does not exist yet.
+    qp_rotations_k_storage: str
     #: The deck keys THIS DECK NAMED, as opposed to inherited from
     #: ``_DEFAULTS``.  Empty for a config built from a hand-made params dict,
     #: which is why every consumer must treat "absent" as "did not ask" — see
@@ -3351,6 +4028,8 @@ class LorraxConfig:
             sigma_max_nodes=int(_g("mpa_sigma_max_nodes")),
             sigma_omega_cluster_gap_ry=float(
                 _g("mpa_sigma_omega_cluster_gap_ry")),
+            occupation_window_threshold=float(
+                _g("occupation_window_threshold")),
         )
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
@@ -3363,6 +4042,15 @@ class LorraxConfig:
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
+            band_extrapolation_estimator=str(
+                _g("band_extrapolation_estimator")
+                or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
+            **dict(zip(
+                ("band_extrapolation", "band_extrapolation_explicit"),
+                resolve_band_extrapolation(
+                    _g("use_band_extrapolation"),
+                    _g("sigma_band_extrapolation"),
+                    print_fn=_print_deck_report))),
         )
         # With patches, omega_min/max_ev ARE the patch hull.  Consumers
         # read these fields as "the Σ grid's reach" (the SC partition's
@@ -3615,13 +4303,25 @@ class LorraxConfig:
         # key out, and a fallback that disagreed with the registered default
         # would make THAT caller silently take a different storage decision.
         _restart_q_storage = str(
-            _g("restart_q_storage") or "full").strip().lower()
+            _g("restart_q_storage") or "auto").strip().lower()
         if _restart_q_storage not in RESTART_Q_STORAGE:
             raise ValueError(
                 f"restart_q_storage={_restart_q_storage!r} is not one of "
                 f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
                 "restart tensors are STORED on; a value nobody recognises "
                 "is not silently read as the default.")
+
+        from file_io.qp_wfn import QP_ROTATIONS_K_STORAGE
+        # Same ``or`` caveat as above: this fallback is reached only by a
+        # hand-built params dict and must agree with ``_DEFAULTS``.
+        _qp_rot_k_storage = str(
+            _g("qp_rotations_k_storage") or "auto").strip().lower()
+        if _qp_rot_k_storage not in QP_ROTATIONS_K_STORAGE:
+            raise ValueError(
+                f"qp_rotations_k_storage={_qp_rot_k_storage!r} is not one "
+                f"of {QP_ROTATIONS_K_STORAGE}.  This key selects the k-set "
+                "qp_wfn_rotations.h5 is STORED on; a value nobody "
+                "recognises is not silently read as the default.")
 
         debug = DebugConfig(
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
@@ -3640,32 +4340,47 @@ class LorraxConfig:
                 f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
                 f"or 0 for the default (= N_q_co, the coarse k-point count).")
 
-        # ζ-fit window top.  Empty / unset / equal-to-nband all collapse to
-        # None — "follow nband" — so the decoupled branch in
+        # BAND COUNTS.  ``read_lorrax_input`` already resolved them (once) and
+        # left the answer in the params dict; a hand-made dict that never went
+        # through the parser gets resolved here instead.  Either way there is
+        # exactly one ``resolve_band_counts`` call per config.
+        _bands = params.get(_BAND_COUNTS)
+        if not isinstance(_bands, BandCounts):
+            _bands = resolve_band_counts(params)
+
+        # ζ-fit window top.  Empty / unset / equal-to-the-ISDF-top all collapse
+        # to None — "follow the loaded window" — so the decoupled branch in
         # ``gw.gw_init.fit_zeta`` is not entered at all and the fit is
         # bit-identical (b4 is the PADDED edge; a redundant zeta_nband=nband
-        # must not silently un-pad it).
+        # must not silently un-pad it).  The bound is ``bands.isdf``, i.e.
+        # max(chi, sigma): that is the window the ψ is loaded over and so the
+        # only window there is anything to fit inside.
         _zeta_nband_raw = _g("zeta_nband")
         if _zeta_nband_raw in (None, ""):
             _zeta_nband = None
         else:
             _zeta_nband = int(_zeta_nband_raw)
-            if _zeta_nband < 1 or _zeta_nband > int(_g("nband")):
+            if _zeta_nband < 1 or _zeta_nband > _bands.isdf:
                 raise ValueError(
-                    f"zeta_nband={_zeta_nband} must be in [1, nband="
-                    f"{int(_g('nband'))}].  It NARROWS the band window ζ is "
-                    f"fitted on; it cannot widen it, because the centroid ψ "
-                    f"this run loads spans [b0, b4) and there are no bands "
-                    f"above b4 to fit.  Raise nband if you want more bands in "
-                    f"the fit AND in the chi0/Sigma band sum.")
-            if _zeta_nband == int(_g("nband")):
+                    f"zeta_nband={_zeta_nband} must be in [1, {_bands.isdf}] "
+                    f"— the ISDF fit's band-window top, which is "
+                    f"max(number_bands_chi={_bands.chi}, "
+                    f"number_bands_sigma={_bands.sigma}).  zeta_nband NARROWS "
+                    f"the band window ζ is fitted on; it cannot widen it, "
+                    f"because the centroid ψ this run loads spans [b0, b4) "
+                    f"and there are no bands above b4 to fit.  Raise "
+                    f"number_bands (or whichever of number_bands_chi / "
+                    f"number_bands_sigma is the larger) if you want more "
+                    f"bands in the fit AND in the band sum that owns them.")
+            if _zeta_nband == _bands.isdf:
                 _zeta_nband = None
 
         resolved = cls(
             # Top-level: system + mode flags
             nval=int(_g("nval")),
             ncond=int(_g("ncond")),
-            nband=int(_g("nband")),
+            nband=int(_bands.isdf),
+            bands=_bands,
             zeta_nband=_zeta_nband,
             sys_dim=int(_g("sys_dim")),
             density_self_consistent=bool(_g("density_self_consistent")),
@@ -3673,10 +4388,12 @@ class LorraxConfig:
             hartree_source=_hartree_source,
             occ_smearing_family=_occ_family,
             occ_smearing_width_ry=_occ_width,
+            occupation_clamp_tol=float(_g("occupation_clamp_tol")),
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
+            qp_rotations_k_storage=_qp_rot_k_storage,
             # Build from a stable sequence.  Equal sets reached through an
             # absent key versus an explicit default can retain different
             # hash-table histories; pickling those frozensets then need not

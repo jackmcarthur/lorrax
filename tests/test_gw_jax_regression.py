@@ -232,11 +232,20 @@ _BGW_TOL = {
 }
 
 # Symmetry-equivalent k MUST carry identical Σ.  MEASURED 2.611 meV on the
-# production deck — NOT zero, because centroids_frac_960.txt is a literal
-# (non-orbit-closed) point set, so the ISDF quadrature itself breaks the
-# 48-op point group.  The fast deck's orbit-closed 144-point set measures
-# exactly 0.000.  Gated loosely here to pin the known value without
-# pretending it is clean; see README.md "Known defects".
+# production deck over the 16 bands this fixture compares — NOT zero.
+#
+# THE CAUSE IS NOT KNOWN, and specifically it is NOT the centroid set's
+# non-closure, which is what this comment used to assert.  MEASURED
+# 2026-08-15: an orbit-closed 960-point set for the same deck
+# (centroids_frac_960_orbitclosed.txt, closed=True at 1.000e-06 on 48 ops)
+# moves this number only 2.611 -> 1.964 meV, while making agreement with
+# BerkeleyGW ~35x WORSE (sigTOT MAE 0.4329 -> 14.9426 meV).  The fast
+# deck's 144-point set measures exactly 0.000, so the spread tracks
+# centroid COUNT rather than closure; rank truncation in the zeta fit at
+# 960 is the untested suspect.  Full table in tests/KNOWN_FAILURES.md.
+#
+# Gated loosely here to pin the known value without pretending it is
+# clean; see README.md "Known defects".
 _BGW_STAR_SPREAD_MAX_MEV = 5.0
 
 
@@ -277,6 +286,20 @@ def test_si_production_matches_berkeleygw(si_session):
             f"  star spread: {stats['_star_spread']:.4f} meV "
             f"(limit {_BGW_STAR_SPREAD_MAX_MEV}) — symmetry-equivalent "
             f"k-points disagree with each other")
+    # Report the band-cut's degeneracy status and the subspace-invariant
+    # twin alongside the gated number, so the margin AND its meaning are
+    # both auditable.  MEASURED 2026-08-15: over these 16 bands the per-band
+    # spread reads 2.611 meV and the multiplet-trace spread 0.593 meV — the
+    # per-band figure is inflated ~4.4x by the arbitrariness of the band
+    # label inside a degenerate multiplet, and on this deck EVERY band is
+    # inside one.  Neither is gated on here; the gate stays on the
+    # historical quantity so its threshold keeps its meaning.
+    _report_headroom(
+        "si_bgw_star_spread",
+        f"per-band {stats['_star_spread']:.4f} meV; multiplet-trace "
+        f"{stats['_star_spread_multiplet']} meV; band cut at {16} is "
+        f"{'CLEAN' if stats['_cut_clean'] else 'NOT clean'} "
+        f"(cut_clean={stats['_cut_clean']})")
     if failures:
         pytest.fail(
             "Si production deck no longer agrees with BerkeleyGW "

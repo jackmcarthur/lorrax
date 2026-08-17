@@ -195,6 +195,82 @@ def write_bgw_eqp(
 	return abs_path
 
 
+def read_bgw_eqp(eqp_file: str):
+	"""Read a BerkeleyGW ``eqp{0,1}.dat`` — the inverse of :func:`write_bgw_eqp`.
+
+	Returns ``(kpts_irr (nk, 3), e_dft (nk, nb), e_qp (nk, nb),
+	band_offset)``; the energies are eV and the k-points are the CRYSTAL
+	COORDINATES the block headers carry, on the irreducible wedge the
+	writer emitted.
+
+	``band_offset`` is the 0-BASED ABSOLUTE index of column 0, recovered
+	from the file's own 1-based ``iband`` labels — the inverse of
+	:func:`write_bgw_eqp`'s ``band_offset``.  It is returned rather than
+	dropped because a consumer slicing an absolute band window
+	(``bandstructure.htransform``) cannot place these columns without it,
+	and the previous reader discarded it, which is why that consumer grew
+	a second eqp parser instead of using this one.
+
+	**Lives beside the writer on purpose.**  It used to sit in
+	``bse.bse_window``, which made it reachable only from BSE — so
+	``bandstructure.htransform`` grew a second, incompatible eqp parser of
+	its own rather than take a ``bandstructure → bse`` edge that exists
+	nowhere else in the tree.  One format, one reader, one writer, in one
+	module: a change to the layout cannot now update only half of them.
+
+	Ragged band counts are tolerated (short blocks are NaN-padded to the
+	widest), because a caller slicing a band window must be able to see
+	which states are absent rather than read a zero.
+	"""
+	kpts: list[list[float]] = []
+	e_dft_blocks: list[list[float]] = []
+	e_qp_blocks: list[list[float]] = []
+	first_band: int | None = None
+
+	with open(eqp_file) as f:
+		while True:
+			header = f.readline()
+			if not header:
+				break
+			stripped = header.strip()
+			if not stripped:
+				break
+			if stripped.startswith("#"):
+				continue
+			parts = header.split()
+			if len(parts) < 4:
+				break
+			kpts.append([float(parts[0]), float(parts[1]), float(parts[2])])
+			n_bands = int(parts[3])
+
+			e_dft_k, e_qp_k = [], []
+			for _ in range(n_bands):
+				cols = f.readline().split()
+				# (ispin, iband, E_DFT, E_QP); iband is 1-based ABSOLUTE.
+				if first_band is None:
+					first_band = int(cols[1])
+				e_dft_k.append(float(cols[2]))
+				e_qp_k.append(float(cols[3]))
+			e_dft_blocks.append(e_dft_k)
+			e_qp_blocks.append(e_qp_k)
+
+	if not kpts:
+		raise ValueError(
+			f"no k-point blocks parsed from {os.path.basename(eqp_file)} — "
+			f"expected the BerkeleyGW eqp layout this module writes "
+			f"(a '(3f13.9,i8)' k header, then that many '(2i8,2f15.9)' rows)")
+
+	max_band = max(len(b) for b in e_dft_blocks)
+	n_kpts = len(kpts)
+	e_dft = np.full((n_kpts, max_band), np.nan)
+	e_qp = np.full((n_kpts, max_band), np.nan)
+	for i in range(n_kpts):
+		nb = len(e_dft_blocks[i])
+		e_dft[i, :nb] = e_dft_blocks[i]
+		e_qp[i, :nb] = e_qp_blocks[i]
+	return np.array(kpts), e_dft, e_qp, int(first_band) - 1
+
+
 def verify_eqp_file(
 	path: str, *, nk: int, nb: int, nspin: int = 1,
 	print_fn=print,
@@ -898,17 +974,26 @@ def _read_eval_energies_ev(
 	because both are legitimate answers to "what did Σ get evaluated at"
 	and which one is on disk depends on the deck:
 
-	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, full BZ, ALREADY on the
-	    sigma window (its band axis is ``band_range``), so it is indexed
-	    by ``kirr_to_kfull`` and not sliced in bands.
+	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, ALREADY on the sigma
+	    window (its band axis is ``band_range``), so it is indexed by
+	    ``kirr_to_kfull`` and not sliced in bands.  It is read through
+	    ``file_io.qp_wfn.read_qp_rotations_full_bz`` because that array may
+	    be stored on the file wedge; ``kirr_to_kfull`` is always a full-BZ
+	    index, so the indexing below is unchanged either way.  A file with
+	    no ``k_storage`` attr comes back verbatim.
 	``WFN_qp.h5``           — ``mf_header/kpoints/el``, the WFN file's own
 	    k-set (the IBZ) and ALL bands, so it is sliced in bands and not
 	    in k.
 	"""
 	with h5py.File(path, "r") as f:
-		if "E_qp_nk_rydberg" in f:
-			e = np.asarray(f["E_qp_nk_rydberg"], dtype=np.float64)
-			return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
+		has_rot = "E_qp_nk_rydberg" in f
+	if has_rot:
+		from file_io.qp_wfn import read_qp_rotations_full_bz
+		e = np.asarray(read_qp_rotations_full_bz(
+			path, datasets=("E_qp_nk_rydberg",))["E_qp_nk_rydberg"],
+			dtype=np.float64)
+		return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
+	with h5py.File(path, "r") as f:
 		if "mf_header/kpoints/el" in f:
 			e = np.asarray(f["mf_header/kpoints/el"], dtype=np.float64)
 			return e[0][:, int(band_start):int(band_stop)] * RYD_TO_EV

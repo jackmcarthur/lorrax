@@ -75,7 +75,8 @@ from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
-from .efermi import OccupationState
+from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
+                     as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
 from .gw_config import ComputeMode
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
@@ -405,7 +406,8 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 w_ibz,
                 float(inputs.wfn.num_electrons),
                 inputs.config.occ_broadening_ry,
-                state_capacity=capacity)
+                state_capacity=capacity,
+                clamp_tol=float(inputs.config.occupation_clamp_tol))
             deviation = assert_wfn_occupation_consistency(
                 check_state, np.asarray(inputs.wfn.occs[0]), w_ibz,
                 state_capacity=capacity,
@@ -483,6 +485,7 @@ def _solve_head_occupations(
         target_electrons,
         width_ry,
         state_capacity=capacity,
+        clamp_tol=float(inputs.config.occupation_clamp_tol),
     )
     occ_kn = jnp.pad(
         occ_logical,
@@ -1054,7 +1057,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
         occ_state = OccupationState.solve_mp1(
             E_qp_ry, kweights, float(inputs.wfn.num_electrons),
             inputs.config.occ_broadening_ry,
-            state_capacity=float(spin_degeneracy_factor(inputs.wfn)))
+            state_capacity=float(spin_degeneracy_factor(inputs.wfn)),
+            clamp_tol=float(inputs.config.occupation_clamp_tol))
         e_f = occ_state.mu_ry
         occ = occ_state.f_kn
         inputs.print_fn(
@@ -1221,6 +1225,78 @@ def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
                       expect="negative", print_fn=print_fn)
     sanity.check_in_range("Σ_x diagonal (eV)", sig_x_diag_ev,
                           -200.0, 0.0, unit="eV", print_fn=print_fn)
+
+
+def _report_extrapolation_eqp_shift(
+    H_extrap, H_unextrap, *, mesh_xy, n_occ, iteration, print_fn) -> None:
+    """Diagonalize both Σ's H and report the correction AT THE EQP LEVEL.
+
+    WHY A SECOND DIAGONALIZATION IS WORTH ITS COST.  The extrapolation report
+    in ``gw.ppm_pipeline`` states the correction to Σ_c on the band diagonal.
+    That is not the same number as the correction to E_nk, and the difference
+    is not a detail: Σ's off-diagonals move too, so the eigenvalue shift is
+    the diagonal shift PLUS the eigenvector response, and near a small gap the
+    second term is not small.  The quantity an operator acts on is the eqp
+    level, so the eqp level is what gets reported beside its un-extrapolated
+    twin.
+
+    TWO DIAGONALIZATIONS, NOT FOUR.  Both are ``eigvalsh`` — eigenvalues only,
+    no eigenvectors, because nothing here feeds back into the iteration.  The
+    rejected alternative is diagonalizing each of the three band brackets and
+    extrapolating the EIGENVALUES, which is four diagonalizations AND is
+    wrong: eigenvalues are not linear in the matrix, so an extrapolated
+    spectrum is the spectrum of no Hamiltonian (see
+    ``band_extrapolation.extrapolation_weights``).
+
+    THE H's HERE ARE PRE-PARTITION, and that is the right pair to compare.
+    ``apply_band_partition`` masks off-diagonals of non-protected bands and
+    overwrites out-of-range diagonals with the per-iteration scissor; on the
+    protected, in-range bands — the QP window, which is what this report is
+    about — it changes nothing.  Comparing the pre-partition pair keeps the
+    two arms differing in exactly ONE thing, the band-sum tail in Σ_c, rather
+    than also differing in a scissor refitted separately on each.
+    """
+    _, eigvalsh = _kshard_eigh_kernels(mesh_xy, _band_rotation_spec())
+    e_ext = np.asarray(eigvalsh(H_extrap), dtype=np.float64) * RYD_TO_EV
+    e_n3 = np.asarray(eigvalsh(H_unextrap), dtype=np.float64) * RYD_TO_EV
+    d = e_ext - e_n3
+    nb = e_ext.shape[1]
+    n_occ = max(0, min(int(n_occ), nb))
+
+    lines = [
+        f"    -- band-extrapolation effect on E_nk, iteration "
+        f"{iteration} (two eigvalsh: extrapolated vs N3) --",
+    ]
+    if n_occ and n_occ < nb:
+        # eigvalsh returns ASCENDING eigenvalues, so the band cut at n_occ is
+        # the VBM/CBM split on both arms by construction.
+        vbm_e, cbm_e = e_ext[:, n_occ - 1].max(), e_ext[:, n_occ].min()
+        vbm_3, cbm_3 = e_n3[:, n_occ - 1].max(), e_n3[:, n_occ].min()
+        lines += [
+            f"       VBM   S(N3) = {vbm_3:+11.6f}  ->  S_inf = "
+            f"{vbm_e:+11.6f} eV   ({vbm_e - vbm_3:+.6f})",
+            f"       CBM   S(N3) = {cbm_3:+11.6f}  ->  S_inf = "
+            f"{cbm_e:+11.6f} eV   ({cbm_e - cbm_3:+.6f})",
+            f"       gap   S(N3) = {cbm_3 - vbm_3:+11.6f}  ->  S_inf = "
+            f"{cbm_e - vbm_e:+11.6f} eV   "
+            f"({(cbm_e - vbm_e) - (cbm_3 - vbm_3):+.6f})",
+        ]
+    lines.append(
+        f"       over all (k, band): mean {d.mean():+.6f}  "
+        f"RMS {float(np.sqrt(np.mean(d ** 2))):.6f}  "
+        f"max |dE| {float(np.max(np.abs(d))):.6f} eV")
+    # THE SIGN IS THE DIAGNOSTIC.  The 1/N law was measured to decay FASTER
+    # than the data over the sampled window, so the fit projects more
+    # remaining tail than exists and lands BELOW the truth on every state
+    # (module docstring, 2026-08-16).  A correction that is not one-signed
+    # here is therefore a statement about this deck, and worth seeing.
+    frac_neg = float(np.mean(d < 0.0))
+    lines.append(
+        f"       {100 * frac_neg:.1f} % of states moved DOWN.  The 1/N form "
+        f"is known to undershoot one-signed against a measured S(508); a "
+        f"MIXED sign here means this deck's three points are not in the "
+        f"regime the form was calibrated on.")
+    print_fn("\n".join(lines))
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
@@ -1787,13 +1863,43 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # read this (nk, nb, nb) array back twice to print one line.  Its
         # scalar read still synchronises, but the iteration synchronises
         # anyway in ``_run_linear_mixing`` / ``_run_rcrop``.
-        # ENFORCED, not printed -- see ``_check_kstar_spread``.
-        _check_kstar_spread(ks, delta_h_qp, print_fn=inputs.print_fn)
+        # MOVED, 2026-08-16: the star-spread enforcement used to run HERE,
+        # on the raw Sigma+V_H, and that is a different object from the one
+        # that ships.  ``apply_band_partition`` below zeroes every
+        # off-diagonal outside protected x protected, so it is the LAST thing
+        # that can break the star relation -- and until the partition was
+        # promoted to whole multiplets it could, by treating two members of a
+        # degenerate manifold differently.  Checking before it ran meant the
+        # gate certified an object the loop then modified.  See the call after
+        # ``apply_band_partition``.
         delta_h_qp = ks.select(delta_h_qp)
     delta_h_dft = _rotate_to_dft_basis(delta_h_qp, U_qp, mesh=inputs.mesh_xy)
     if v_h_dft_new is not None:
         delta_h_dft = delta_h_dft + v_h_dft_new
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
+
+    # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
+    # Present only when ``use_band_extrapolation`` drove this stage's Σ.
+    # Assembled through the SAME three steps as the carry above — k-select,
+    # rotate to the DFT basis with the SAME U, add the same density-SC V_H —
+    # so the two Hamiltonians differ in exactly one thing: whether Σ_c
+    # carries the extrapolated band tail.  It is diagonalized, reported and
+    # dropped; it never reaches the carry, rCROP or any artifact.
+    sigma_xc_unextrap = getattr(
+        sigma_result, "sigma_xc_kij_ry_unextrap", None)
+    if sigma_xc_unextrap is not None:
+        delta_h_qp_n3 = sigma_result.v_h_kij_ry + sigma_xc_unextrap
+        if not ks.is_identity:
+            delta_h_qp_n3 = ks.select(delta_h_qp_n3)
+        delta_h_dft_n3 = _rotate_to_dft_basis(
+            delta_h_qp_n3, U_qp, mesh=inputs.mesh_xy)
+        if v_h_dft_new is not None:
+            delta_h_dft_n3 = delta_h_dft_n3 + v_h_dft_new
+        _report_extrapolation_eqp_shift(
+            H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
+            mesh_xy=inputs.mesh_xy, n_occ=n_occ,
+            iteration=state.iteration, print_fn=inputs.print_fn)
+
     if state.iteration == 0:
         _residency_census(
             (("kin_ion_dft", inputs.kin_ion_dft),
@@ -1839,6 +1945,24 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         in_range_mask=inputs.partition.in_range_mask,
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
+    # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
+    # partition until 2026-08-16, which certified a matrix the loop then
+    # rewrote.  The partition is precisely the operation that could break the
+    # star relation -- a protected mask whose edge fell inside a degenerate
+    # multiplet gave one member off-diagonal Sigma and the other a scalar
+    # scissor -- so it is the one thing the check most needed to be after.
+    #
+    # This is a STRENGTHENING and it may turn red on a deck that passed
+    # before; that redness is correct and should be read as the partition
+    # breaking symmetry, not as this gate misfiring.  The mask is now promoted
+    # to whole multiplets at construction, which is what makes it pass.
+    #
+    # Full-BZ operand: the check needs every star member, and H_qp_dft_new is
+    # on the loop's k-set, so it is unfolded through the same map that
+    # reduced it.
+    if not ks.is_identity:
+        _check_kstar_spread(
+            ks, ks.broadcast(H_qp_dft_new), print_fn=inputs.print_fn)
 
     # The occupation state was ENTRY-solved from this call's own spectrum
     # and consumed by this call's chi/head/Sigma; no second solve happens
@@ -2010,23 +2134,49 @@ def _write_sc_eqp_snapshot(
     rCROP trial outputs are useful diagnostics but are not accepted iterates.
     This is not a second implementation of BGW's final ``eqp0`` / ``eqp1``
     equations; those remain solely in :mod:`gw.eqp_bgw`.
+
+    THE TWO WEDGES MEET HERE, and they are not the same size.  This writer
+    is a ``.dat`` writer, so its rows are the **file wedge** —
+    ``wfn.kpoints``, what BerkeleyGW means by the IBZ.  Under
+    ``sc_on_ibz`` the loop runs on the **star wedge** (one row per orbit),
+    which is SMALLER on two of the three committed decks: 4 vs 3 on
+    ``cohsex_debug``, 9 vs 5 on ``gnppm_debug``, and 8 = 8 on
+    ``si_cohsex_debug`` — the deck most gates run.  Handing the loop's rows
+    straight to this writer was the ``e_qp shape (5, 46) does not match
+    e_dft (9, 46)`` crash, and it would not have raised on Si.
+
+    So the star-wedge operand goes back through the full BZ and is then
+    reduced to the file wedge, by name, in that order.  Both hops are
+    symmetry service calls; nothing here holds an index table.
     """
     from common.collectives import process_rank
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import (
+        reduce_full_bz_to_file_wedge, unfold_star_wedge_to_full_bz)
+
     from .eqp_bgw import write_bgw_eqp
 
     if process_rank() != 0:
         return None
 
-    irr = np.asarray(inputs.sym.kirr_fullids, dtype=np.int64)
-    kpoints = np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64)[irr]
-    e_dft_full = np.asarray(
-        inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV
-    e_dft = e_dft_full[irr]
+    sym = inputs.sym
+
+    def _to_file_wedge(a):
+        return np.asarray(
+            reduce_full_bz_to_file_wedge(sym, np.asarray(a)),
+            dtype=np.float64)
+
+    kpoints = _to_file_wedge(
+        np.asarray(sym.unfolded_kpts, dtype=np.float64))
+    e_dft = _to_file_wedge(
+        np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
     e_output = np.asarray(e_output_kn_ev, dtype=np.float64)
-    # The loop is either full-BZ or already in the KStarMap's irreducible
-    # row order.  ``kirr_fullids`` selects only in the former case.
     if getattr(inputs, "kstar", None) is None:
-        e_output = e_output[irr]
+        e_output = _to_file_wedge(e_output)          # loop ran full-BZ
+    else:
+        e_output = _to_file_wedge(                    # loop ran star-wedge
+            unfold_star_wedge_to_full_bz(sym, e_output))
 
     active_scissored = np.flatnonzero(
         ~np.asarray(inputs.partition.in_range_mask, dtype=bool))
@@ -2807,7 +2957,8 @@ def run_sc_driver(
             np.full(_e_part.shape[0], 1.0 / _e_part.shape[0]),
             float(wfn.num_electrons),
             float(config.occ_broadening_ry),
-            state_capacity=float(spin_degeneracy_factor(wfn)))
+            state_capacity=float(spin_degeneracy_factor(wfn)),
+            clamp_tol=float(config.occupation_clamp_tol))
         efermi_ev = float(_mu_ry) * RYD_TO_EV
     else:
         efermi_ev = float(wfn.efermi) * RYD_TO_EV
@@ -2826,6 +2977,22 @@ def run_sc_driver(
     partition = BandPartition(
         protected_mask=in_range, in_range_mask=in_range)
     partition.warn_if_protected_outside_grid(print_fn=print_fn)
+    # THE PARTITION'S OWN BOUNDARIES, against the UNTRUNCATED mean field.
+    #
+    # ``classify_bands_in_grid`` is an all-k energy-window predicate, so the
+    # mask is not required to be contiguous and its edges are not required to
+    # fall between multiplets.  Report first — the number of splits and the
+    # gap they cut is what says how big the promotion below is — then promote,
+    # per the owner's ruling that degenerate spaces stay degenerate.
+    #
+    # ``wfn.energies[0]`` and NOT ``e_dft_active_kn_ry``: the active window is
+    # itself a slice, and ``boundary_min_gaps`` returns +inf at its outer edge
+    # by construction, so a window cannot see the cut that produced it.
+    _enk_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
+    _b0 = int(band_slices.sigma.start)
+    partition.report_multiplet_splits(_enk_full_ry, _b0, print_fn=print_fn)
+    partition = partition.promoted_to_multiplets(
+        _enk_full_ry, _b0, print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
     # independent jobs and only the first is optional:
@@ -2916,7 +3083,10 @@ def run_sc_driver(
             kstar=kstar_io, state_on_ibz=kstar is not None,
             wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
             logical_band_stop=int(meta.b_id_4_user),
-            output_dir=input_dir, print_fn=print_fn,
+            output_dir=input_dir,
+            qp_rotations_k_storage=config.qp_rotations_k_storage,
+            print_fn=print_fn,
+            clamp_tol=float(config.occupation_clamp_tol),
         )
         rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -2958,6 +3128,16 @@ def run_sc_driver(
         sigma_coh_kij_ry=(
             _rotate_to_dft_basis(sigma_result.sigma_coh_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_coh_kij_ry is not None else None),
+        # The un-extrapolated N₃ twin travels with its partner or not at all.
+        # It is None on every non-extrapolating run; when it is present,
+        # leaving it in the QP basis while ``sigma_xc_kij_ry`` beside it is
+        # rotated is exactly the silent-basis-mismatch this seam exists to
+        # prevent — and it would show up as a "band-extrapolation correction"
+        # that was mostly the basis difference.
+        sigma_xc_kij_ry_unextrap=(
+            _rotate_to_dft_basis(
+                sigma_result.sigma_xc_kij_ry_unextrap, U, mesh=mesh_xy)
+            if sigma_result.sigma_xc_kij_ry_unextrap is not None else None),
         sigma_omega_h5_path=sigma_omega_h5_path,
         # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
         # This line used to read ``float(wfn.efermi) * RYD_TO_EV``
@@ -2989,6 +3169,7 @@ def run_sc_driver(
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
     state_capacity: float | None = None,
+    clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
 
@@ -3056,6 +3237,12 @@ def final_qp_eigenstates(
             float(_st.n_electrons),
             float(_st.smearing_width_ry),
             state_capacity=float(state_capacity),
+            # SAME clamp as the loop's solve, for the same reason
+            # ``state_capacity`` is a kwarg here: ``SCState`` carries the
+            # occupation TABLE, not the solver settings that made it, and
+            # two mu's from two differently-parameterised solves is the
+            # shadow-accounting failure this module exists to avoid.
+            clamp_tol=float(clamp_tol),
         )
         efermi_ry = float(_mu_ry)
     return (
@@ -3065,18 +3252,25 @@ def final_qp_eigenstates(
     )
 
 
-def _on_kset(arrays, *, kstar, have_ibz: bool, want_ibz: bool):
-    """Move band-index arrays between the IBZ and the full BZ.
+def _loop_arrays_on_full_bz(arrays, *, kstar, state_on_ibz: bool):
+    """The loop's band-index arrays, on the FULL BZ, whichever wedge it ran on.
 
-    ``kstar.select`` / ``kstar.broadcast`` only.  A hand-rolled gather is
-    wrong on any TRS-reduced deck: Θ is antiunitary, so
-    ``O(-k) = conj(O(k))`` and not ``O(k)`` (symmetry_maps.py:1740-1751);
-    assuming equality is off by 3.6e-01 relative, job 7889235.
+    ONE DIRECTION ONLY, and that is the point.  The loop runs either on the
+    full BZ or on the STAR wedge (``KStarMap``, one row per orbit); the full
+    BZ is the k-set every consumer here can be reached from, because the
+    ``.dat``/WFN writers want the FILE wedge (``wfn.kpoints``) and the two
+    wedges are DIFFERENT SIZES on two of the three committed decks.  Going
+    star-wedge → full BZ → file wedge is the only route that is right on all
+    of them; a direct star→file hop does not exist and must not be invented.
+
+    ``kstar.broadcast`` only.  A hand-rolled gather is wrong on any
+    TRS-reduced deck: Θ is antiunitary, so ``O(-k) = conj(O(k))`` and not
+    ``O(k)`` (symmetry_maps.py:1740-1751); assuming equality is off by
+    3.6e-01 relative, job 7889235.
     """
-    if kstar is None or kstar.is_identity or have_ibz == want_ibz:
+    if kstar is None or kstar.is_identity or not state_on_ibz:
         return [np.asarray(a) for a in arrays]
-    op = kstar.select if want_ibz else kstar.broadcast
-    return [np.asarray(op(np.asarray(a))) for a in arrays]
+    return [np.asarray(kstar.broadcast(np.asarray(a))) for a in arrays]
 
 
 def dump_sigma_omega_h5_final(
@@ -3157,7 +3351,9 @@ def dump_qp_wfn_artifacts(
     logical_band_stop: int | None = None,
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
+    qp_rotations_k_storage: str = "auto",
     print_fn: Callable = print,
+    clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[str, str, float]:
     """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
 
@@ -3175,34 +3371,40 @@ def dump_qp_wfn_artifacts(
 
     THE TWO WRITERS ARE ON DIFFERENT k-SETS and neither is the loop's:
 
-    * ``write_qp_wfn_h5`` — the WFN FILE's k-set, ``wfn.nkpts``, checked
-      at qp_wfn.py:136.  A WFN file stores the IBZ by BGW convention and
-      this writer copies the source file's ``kpoints``/``mtrx``/``tnp``
-      through unchanged, so its ``U`` must be the rotation of the stored
-      ψ at the stored k.  ``KStarMap.select`` delivers exactly that only
-      because the row it takes — the first full-BZ member of each star —
-      is the stored k itself, reached by the IDENTITY operation.
-      MEASURED on mos2_4x4 (job 7889366): ``kirr_fullids`` =
-      [0,1,2,4,5,6,7,8,9,10] is strictly increasing (so ``select``'s row
-      order is ``wfn.kpoints`` order), ``sym_idx_k[kirr_fullids]`` is 0
-      at all 10 (so no member is a rotated or time-reversed image),
-      ``max|unfolded_kpts[kirr_fullids] − wfn.kpoints|`` = 5.6e-17, and
-      ``select(broadcast(A)) − A`` = 0 exactly.
+    * ``write_qp_wfn_h5`` — the **FILE WEDGE**, ``wfn.kpoints``, checked
+      at qp_wfn.py:136.  This writer copies the source file's
+      ``kpoints``/``mtrx``/``tnp`` through unchanged, so its ``U`` must be
+      the rotation of the STORED ψ at the STORED k, in the stored ORDER.
+      ``reduce_full_bz_to_file_wedge`` is the definition of that k-set —
+      ``kirr_fullids`` no longer reads the star labels, it matches
+      ``wfn.kpoints`` against the full grid directly and raises if a stored
+      k is not on it (fix/kirr-fullids-2026-08-08), so
+      ``unfolded_kpts[kirr_fullids] == wfn.kpoints`` holds on every deck by
+      construction.
 
-      ONE OF THOSE TWO PROPERTIES IS NOW ENFORCED AND THE OTHER STILL IS
-      NOT (fix/kirr-fullids-2026-08-08).  ``kirr_fullids`` no longer reads
-      the star labels; it matches ``wfn.kpoints`` against the full grid
-      directly and raises if a stored k is not on it, so
-      ``unfolded_kpts[kirr_fullids] == wfn.kpoints`` holds on every deck
-      by construction — and on three of the four in-tree decks it did NOT
-      hold before, which is what that change fixed.  The IDENTITY-operation
-      property is a separate fact and remains a property of the deck: it
-      holds on ``si_cohsex_debug`` and on mos2_4x4, and does not hold on
-      the 3x3x1 decks, where the register-don't-touch op-selection policy
-      assigns a rotation (on ``cohsex_debug``, a time-reversal row) to some
-      wedge rows whose k is nevertheless exactly right.  So this writer's
-      "U is the STORED ψ's rotation" claim still needs the probe on a new
-      symmetry group; what no longer needs it is the k itself.
+      IT IS NOT ``KStarMap.select``, and the difference is the two wedges.
+      ``select`` keeps one row per ORBIT — the STAR wedge.  MEASURED over
+      every committed deck, 2026-08-15 (``file wedge`` / ``star wedge`` /
+      ``wfn.nkpts``): si_cohsex_debug 8/8/8, si_bse_debug 8/8/8,
+      hbn_cohsex_debug 18/18/18, **cohsex_debug 4/3/4**,
+      **gnppm_debug 9/5/9**, **bispinor_debug 9/5/9**.
+
+      What the size-matching this replaces actually did, deck by deck:
+      where the two wedges coincide it picked ``select`` and was right;
+      on gnppm/bispinor ``wfn.nkpts`` equals ``nk_tot``, so it picked the
+      full BZ — right there too, because ``kirr_fullids`` measures as the
+      identity ``[0..8]`` on those decks; and on ``cohsex_debug``,
+      ``wfn.nkpts = 4`` is neither the star wedge (3) nor the full BZ (9),
+      so it REFUSED a run that is perfectly well defined.  The named
+      reduction is right on all six without a size argument.
+
+      The remaining un-enforced property is separate and unchanged: that
+      each stored k is reached from its orbit parent by the IDENTITY
+      operation.  It holds on ``si_cohsex_debug`` and on mos2_4x4 and does
+      NOT hold on the 3×3×1 decks (``sym_idx_k[kirr_fullids]`` measures
+      ``[0, 12, 0, 0]`` on ``cohsex_debug``, 12 = pure time reversal).
+      That claim still needs a probe on a new symmetry group; what no
+      longer needs one is the k itself, or its order.
     * ``write_qp_rotations_h5`` — the FULL BZ.  Its ``kpoints_crys``
       labels the rows of ``U_mnk``; the canonical writer of this same
       file passes ``sym.unfolded_kpts`` there (gw_output.py:865-875) and
@@ -3212,8 +3414,10 @@ def dump_qp_wfn_artifacts(
       from its slightly different post-Sigma eigensolve.
 
     ``state_on_ibz`` says which k-set the loop ran on (``config.sc_on_ibz``)
-    and ``kstar`` is the map; both writers are then reached by
-    :func:`_on_kset` from wherever the state is.
+    and ``kstar`` is the map.  The loop's rows reach the full BZ through
+    :func:`_loop_arrays_on_full_bz` and the file wedge through the service;
+    there is no star-wedge → file-wedge hop, because there is no such
+    operation.
 
     ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
     is required only when the final map used an energy-only tail scissor.
@@ -3224,41 +3428,42 @@ def dump_qp_wfn_artifacts(
 
     Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
     """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import reduce_full_bz_to_file_wedge
+
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
         state, n_occ=n_occ, mesh_xy=mesh_xy,
-        state_capacity=float(spin_degeneracy_factor(wfn)))
-    enk_irr_ry, U_irr = _on_kset(
-        (enk_loop_ry, U_loop), kstar=kstar,
-        have_ibz=state_on_ibz, want_ibz=True)
-    enk_full_ry, U_full = _on_kset(
-        (enk_loop_ry, U_loop), kstar=kstar,
-        have_ibz=state_on_ibz, want_ibz=False)
+        state_capacity=float(spin_degeneracy_factor(wfn)),
+        clamp_tol=float(clamp_tol))
+    enk_full_ry, U_full = _loop_arrays_on_full_bz(
+        (enk_loop_ry, U_loop), kstar=kstar, state_on_ibz=state_on_ibz)
+    # Full BZ → file wedge, by name.  One reduction, two arrays; the k
+    # labels ``write_qp_wfn_h5`` writes are ``wfn.kpoints`` and this is the
+    # selection that produces exactly those rows in exactly that order.
+    enk_wfn_ry, U_wfn = (
+        np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(a)))
+        for a in (enk_full_ry, U_full))
+    nk_full = int(U_full.shape[0])
+    nk_wfn_got, nk_wfn_want = int(U_wfn.shape[0]), int(wfn.nkpts)
     # State the two k-sets rather than letting a mismatch surface as a
     # shape error two frames down (that is how this was found: "U shape
     # (16, 128, 128) inconsistent with (nk=10, nb_active=128)").
-    nk_irr, nk_full = int(U_irr.shape[0]), int(U_full.shape[0])
-    nk_wfn = int(wfn.nkpts)
-    # THE FILE DECIDES WHICH PLACEMENT THE WFN WRITER GETS, not the BGW
-    # convention that a WFN stores the IBZ.  ``write_qp_wfn_h5`` copies the
-    # source file's kpoints/mtrx/tnp through unchanged, so its U must be the
-    # rotation of the stored ψ at the stored k — whichever k-set the file
-    # happens to hold.  mos2_4x4's WFN holds the full BZ (9), not its 5-point
-    # IBZ, and hard-wiring the IBZ placement refused a run that is fine.
-    placements = {nk_irr: (enk_irr_ry, U_irr), nk_full: (enk_full_ry, U_full)}
-    if nk_wfn not in placements or nk_full != int(sym.unfolded_kpts.shape[0]):
+    if (nk_wfn_got != nk_wfn_want
+            or nk_full != int(sym.unfolded_kpts.shape[0])):
         raise ValueError(
             f"dump_qp_wfn_artifacts: k-set placement failed — loop nk="
             f"{int(U_loop.shape[0])} (on_ibz={state_on_ibz}) gave "
-            f"WFN_qp nk={sorted(placements)} (need wfn.nkpts={nk_wfn}) and "
+            f"WFN_qp nk={nk_wfn_got} (need wfn.nkpts={nk_wfn_want}) and "
             f"rotations nk={nk_full} (need full BZ "
             f"{int(sym.unfolded_kpts.shape[0])}); kstar={kstar!r}")
-    enk_wfn_ry, U_wfn = placements[nk_wfn]
-    print_fn(f"  QP dump k-sets: WFN_qp {nk_wfn} (WFN file, "
-             f"{'IBZ' if nk_wfn == nk_irr else 'full BZ'}), "
-             f"rotations {nk_full} (full BZ), loop {int(U_loop.shape[0])}")
+    print_fn(f"  QP dump k-sets: WFN_qp {nk_wfn_got} (file wedge), "
+             f"rotations {nk_full} (full BZ), "
+             f"loop {int(U_loop.shape[0])}"
+             f"{' (star wedge)' if state_on_ibz else ' (full BZ)'}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
     if jax.process_index() == 0:
@@ -3283,6 +3488,13 @@ def dump_qp_wfn_artifacts(
             band_start=band_slices.b0, band_stop=band_slices.b3,
             enk_full_base_ry=enk_full_base_ry,
         )
+        # The tables come from the SERVICE's own accessor, never re-spelled
+        # here: ``n_sym_spatial`` is derived from ``sym_mats_k`` rather than
+        # from the WFN header, and that derivation is the one the unfold
+        # side uses to decide which rows get conjugated.
+        from ffi import _services as _svc
+        _svc.ensure_on_path()
+        import symmetry_maps as _sm
         write_qp_rotations_h5(
             qp_rot_path,
             U_mnk=U_full,
@@ -3292,6 +3504,9 @@ def dump_qp_wfn_artifacts(
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
             kpoints_reduced=np.asarray(wfn.kpoints, dtype=np.float64),
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            k_storage=str(qp_rotations_k_storage),
+            star_tables=_sm.star_tables_of(sym),
+            print_fn=print_fn,
         )
     barrier("qp_wfn_h5_write")
     print_fn(f"  QP WFN:       {qp_wfn_path}")
