@@ -26,6 +26,7 @@ from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
 from .band_extrapolation import (
+    assert_brackets_match_ols_abscissae,
     extrapolation_h5_payload,
     extrapolation_weights,
     fit_band_extrapolation,
@@ -459,6 +460,16 @@ def compute_ppm_sigma_pipeline(
             nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
             nb_padded=int(s.nb_sigma_sum),
         )
+        # ...AND THE COMMENT ABOVE IS NOT ENOUGH, SO THIS IS CHECKED.  A plan
+        # built from the wrong count is invisible in every weight-level
+        # diagnostic — the OLS coefficients depend only on the abscissae's
+        # RATIOS and the fractions are the same 0.80/0.90/1.00 of whichever
+        # count, so a wrong-count run is Hermitian, converges, and prints
+        # ordinary numbers.  This is the last place that can see it: here the
+        # plan and the band slices its brackets will slice are both in scope.
+        # Before precompile_sigma, so a mismatch costs no compile and no Σ.
+        assert_brackets_match_ols_abscissae(
+            plan, s, meta=meta, where="ppm_pipeline plan seam")
         if plan.enabled:
             print_fn(
                 f"  Σc band extrapolation: ON — {plan.n_brackets} disjoint "

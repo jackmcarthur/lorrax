@@ -850,7 +850,8 @@ def compute_sigma_c_ppm_omega_grid(
     bracket loop and shared verbatim by every bracket — which is what
     makes the three points differ by band count and nothing else.
     """
-    from .band_extrapolation import trivial_plan
+    from .band_extrapolation import (
+        assert_brackets_match_ols_abscissae, trivial_plan)
 
     s = wfns.slices
     if plan is None:
@@ -859,6 +860,16 @@ def compute_sigma_c_ppm_omega_grid(
         # different numbers on a split deck and the same one otherwise.
         plan = trivial_plan(int(s.nb_sigma_sum), int(s.b2 - s.b0),
                             int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
+    # THE PARTITION IS ENTERED ON THE NEXT LINE.  Checked here as well as at
+    # the ``ppm_pipeline`` plan seam because this is where ``plan.bounds``
+    # stops being a description and becomes the slices ``_run_sigma_branch``
+    # takes of the ψ/E/mask operands — and because a plan reaching this
+    # function from anywhere else (a future caller, a fixture) gets the same
+    # guarantee.  ``psi_coh_*`` below are built over ``s.full``, the LOADED
+    # extent, so nothing about the slicing itself would complain if the
+    # brackets ran past the Σ band sum: it would silently sum χ-only bands.
+    assert_brackets_match_ols_abscissae(
+        plan, s, meta=meta, where="ppm_sigma bracket partition")
     brackets = plan.bounds
     n_brk = plan.n_brackets
     psi_proj_xr = wfns.xr(s.sigma)
