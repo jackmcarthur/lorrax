@@ -61,6 +61,10 @@
 //       scale_i²·scale_f — value-level identical to the decomposed
 //       sequence (same reassociation class as the host handler's
 //       scale-fold; gated at ~1e-15, never claimed bit-exact).
+//   CufftGwConvRealWCudaFfi (target lorrax_mklfft_gw_conv_real_w)
+//       The same in-place G tail with an already inverse-transformed,
+//       norm-scaled W.  Multi-bracket callers share W preparation while
+//       retaining one G-sized operand at a time.
 //
 // DEVICE CODE WITHOUT NVCC: this TU is compiled by g++ against the CUDA
 // headers — the Frontera pip toolchain ships ptxas but NO nvcc driver, and
@@ -81,13 +85,14 @@
 //
 // Memory policy (scaling target: no hidden N_mu^2 allocations): plans are
 // created with auto-allocation OFF and share ONE grow-only device workspace
-// arena sized to the largest cufftMakePlanMany64 request; the fused handler
-// stages IFFT[W] in a second grow-only arena of the sharded W tile's size
-// (nk·mx·my·16 B).  Both are cudaMalloc'd outside the XLA allocator — safe
-// under the production env (ffi_env.sh: cuda_async allocator + preallocate
-// false) and logged under LORRAX_CUFFT_LOG, same class as the host
-// handler's malloc'd V_R arena.  Arena growth cudaDeviceSynchronize()s
-// first so no enqueued work can still reference the old allocation.
+// arena sized to the largest cufftMakePlanMany64 request; the reciprocal-W
+// convolution stages IFFT[W] in a second grow-only arena of the sharded W
+// tile's size (nk·mx·my·16 B), while the real-W sibling needs no such arena.
+// Both arenas are cudaMalloc'd outside the XLA allocator — safe under the
+// production env (ffi_env.sh: cuda_async allocator + preallocate false) and
+// logged under LORRAX_CUFFT_LOG, same class as the host handler's malloc'd
+// V_R arena.  Arena growth cudaDeviceSynchronize()s first so no enqueued work
+// can still reference the old allocation.
 //
 // Concurrency: one process mutex serializes plan-cache access, arena growth
 // and ENQUEUE of each handler's work.  Device-side ordering relies on all

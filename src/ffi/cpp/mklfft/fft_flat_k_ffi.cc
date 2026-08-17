@@ -37,6 +37,10 @@
 //       chunked over the trail so the big R-space intermediate NEVER
 //       materializes (per-thread compact buffer, ~4 MiB); `mult` is folded
 //       into the forward scale by the Python wrapper.
+//   MklFftGwConvRealWHostFfi (target lorrax_mklfft_gw_conv_real_w)
+//       The same one-G-at-a-time fused tail, but W is already inverse-
+//       transformed and norm-scaled.  Multi-bracket callers therefore share
+//       W preparation without stacking G-sized operands.
 //
 // In-place: the Python wrappers alias operand 0 to the result
 // (input_output_aliases={0:0}), so when the operand is dead XLA passes the
