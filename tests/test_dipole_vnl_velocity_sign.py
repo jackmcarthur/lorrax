@@ -382,6 +382,14 @@ def test_sweep_does_not_serve_one_arm_for_the_other(order):
 # 4. The refusal, and the producer's resolution order
 # ---------------------------------------------------------------------------
 
+def test_finite_q_producer_requires_explicit_velocity_sign():
+    import inspect
+    from psp.get_dipole_mtxels import compute_finite_q_mtxels
+
+    sign = inspect.signature(compute_finite_q_mtxels).parameters["vnl_velocity_sign"]
+    assert sign.default is inspect.Parameter.empty
+
+
 @pytest.mark.parametrize("bad", [0.0, 2.0, -0.5, "sideways"])
 def test_operator_refuses_anything_that_is_not_a_sign(bad):
     mesh = _mesh()

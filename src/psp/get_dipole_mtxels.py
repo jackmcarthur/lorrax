@@ -340,7 +340,7 @@ def compute_finite_q_mtxels(
     iq_list: list[int],
     nv_block: int,
     nc_block: int,
-    vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
+    vnl_velocity_sign: float,
     verbose: bool = True,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
@@ -573,8 +573,8 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     if val not in (VNL_VELOCITY_SIGN_SHIPPED, VNL_VELOCITY_SIGN_FLIPPED):
         raise ValueError(
             f"GATE vnl_velocity_sign: {raw!r} resolves to no arm.  The only "
-            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped, the default) "
-            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped); the words "
+            f"values are {VNL_VELOCITY_SIGN_SHIPPED} (shipped, legacy) "
+            f"and {VNL_VELOCITY_SIGN_FLIPPED} (flipped, the default); the words "
             f"{sorted(_VNL_SIGN_WORDS)} spell the same two.  This is a "
             f"SIGN, not a scale: an arbitrary multiplier would produce a "
             f"velocity operator that is neither arm of the open question "
