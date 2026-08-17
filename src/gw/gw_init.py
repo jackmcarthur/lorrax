@@ -769,6 +769,26 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	size changed — a physical band window that depends on the process count is
 	exactly what ``Meta``'s own pad note is careful to keep out of the physics.
 	A requested edge is honoured exactly or refused.
+
+	THE SIZING RULE, STATED RATHER THAN INHERITED (2026-08-16, the χ/Σ split).
+	The fit's right range tops out at ``b4``, and ``b4`` is the padded top of
+	``max(number_bands_chi, number_bands_sigma)``.  That ``max`` is not an
+	implementation convenience — it is the guard against a documented
+	eV-scale failure.  ``docs/dev/isdf_basis_adequacy_at_large_nband.md``
+	records a run whose ISDF window was clamped to a SMALL band range and used
+	for a large one: QP gap **0.36 eV where the answer is 3.1–3.7 eV**, with a
+	NEGATIVE ``eqp1``, passing every gate in the suite (el_compare 1.9e-11, H0
+	3.9e-5, W Dyson 1.9e-14, Σ_X within 0.03 %) because every one of them is
+	upstream of or orthogonal to Σ_c.  Re-selecting the SAME NUMBER of
+	centroids against a representative window moved the gap monotonically to
+	3.14 / 3.72 eV.
+
+	So: the interpolation basis must span the pair densities of whichever
+	consumer reaches higher.  Sizing it by the SMALLER count would rebuild
+	exactly that failure, one index over — χ0 or Σ (whichever is the larger)
+	would consume pair densities the basis was never fitted to represent, and
+	nothing downstream would notice.  :func:`assert_isdf_window_is_the_max`
+	states the invariant where it can fail; this is why.
 	"""
 	left = (band_slices.b0, band_slices.b3)
 	right = (band_slices.b1, band_slices.b4)
@@ -875,6 +895,188 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 		for b in edges))
 
 
+#: Env override for the band-sum degeneracy guard: ``snap`` (or ``off``)
+#: downgrades the refusal below.  Same three-mode vocabulary as
+#: ``common.band_degeneracy.MODES`` and the BSE's ``--band-degeneracy``; it is
+#: an ENV knob rather than a deck key because it is an escape hatch for a
+#: deck you are debugging, not a property of the calculation you would want
+#: recorded in the input file.  ``AGENT_PREAMBLE``: never set it to make a
+#: gate pass.
+_BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
+
+
+def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
+                                  *, log=print):
+	"""THE SIZING RULE, ENFORCED AT THE SEAM THAT CONSUMES IT.
+
+	*The ISDF basis must span the band window its consumers actually reach.*
+	With one band count that was automatic.  With two it is a ``max``, and a
+	``max`` that is only implied by how ``b4`` happens to be computed is one
+	refactor away from being the ``min``.
+
+	WHAT IT COSTS TO GET WRONG, measured, not feared.
+	``docs/dev/isdf_basis_adequacy_at_large_nband.md``: a run whose ISDF
+	window was clamped to a small band range and then used for a large one
+	returned a QP gap of **0.36 eV** where the answer is **3.1–3.7 eV**, with
+	a NEGATIVE ``eqp1`` fundamental gap — and **passed every gate the project
+	runs**, because all of them are upstream of or orthogonal to Σ_c
+	(el_compare 1.86e-11 eV, gate_h0 3.9e-5 eV, W Dyson residual 1.9e-14,
+	density/TRS 1.3e-14, bare Σ_X within 0.03 %, head fit 0.026 %).  The fix
+	was to re-select the SAME NUMBER of centroids against a representative
+	window; the gap then moved monotonically to 3.135 / 3.723 eV.  So this is
+	a class of error that is invisible to everything except a check placed
+	exactly here.
+
+	THREE THINGS ARE CHECKED, and they are different questions:
+
+	1. The fit's right range tops out at ``max(b4_chi, b4_sigma)`` (== ``b4``,
+	   the padded edge).  A window sized by the smaller consumer is refused
+	   outright — that is the failure above, one index over.
+	2. If ``zeta_nband`` narrows the fit BELOW either band sum's top, the
+	   consumer above it is running on an EXTRAPOLATED ζ basis.  Reported per
+	   consumer, loudly, and named — narrowing is a legitimate request
+	   (``zeta_nband`` exists for the BSE's Galerkin capacity bound) but it
+	   must never be silent about which sum it undercuts.
+	3. The window and the count that set it are logged unconditionally, so
+	   "no news" and "a good number" do not look alike.
+	"""
+	top = int(band_range_right[1])
+	b4_chi, b4_sigma = int(band_slices.b4_chi), int(band_slices.b4_sigma)
+	expected = max(b4_chi, b4_sigma)
+	if zeta_nband is None and top != expected:
+		raise ValueError(
+			f"ISDF ζ-fit window top is {top} but the band sums reach "
+			f"max(chi={b4_chi}, sigma={b4_sigma}) = {expected}.  The "
+			f"interpolation basis MUST span the pair densities of whichever "
+			f"consumer reaches higher; a basis fitted to the smaller window "
+			f"and used for the larger one is the 0.36 eV / negative-gap "
+			f"failure in docs/dev/isdf_basis_adequacy_at_large_nband.md, "
+			f"which passed every gate in the suite.  This is a code defect, "
+			f"not a deck error.")
+	source = ("tied" if b4_chi == b4_sigma
+	          else ("number_bands_chi" if b4_chi > b4_sigma
+	                else "number_bands_sigma"))
+	log(f"    ζ-fit window sized for {top} bands "
+	    f"(band sums reach chi {b4_chi}, sigma {b4_sigma}; the max is set by "
+	    f"{source})"
+	    + ("" if zeta_nband is None
+	       else f", NARROWED from {expected} by deck key zeta_nband={top}"))
+	if zeta_nband is not None:
+		for edge, what, key in ((b4_chi, "χ0/W band sum", "number_bands_chi"),
+		                        (b4_sigma, "Σ band sum", "number_bands_sigma")):
+			if top < edge:
+				log(f"    *** zeta_nband={top} is BELOW the {what}'s top "
+				    f"({key} → band {edge}).  Bands [{top}, {edge}) of that "
+				    f"sum are built on pair densities whose ζ basis was "
+				    f"never fitted to them — the basis is EXTRAPOLATED "
+				    f"there.  This is the mechanism behind the 0.36 eV gap "
+				    f"in docs/dev/isdf_basis_adequacy_at_large_nband.md; it "
+				    f"is permitted because you asked for it by name, and it "
+				    f"is not checked by any other gate. ***")
+
+
+def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
+	"""Do the χ and Σ band-sum tops each cut a clean multiplet boundary?
+
+	SAME QUESTION AS ``check_zeta_fit_windows``, ONE INDEX OVER, and the same
+	answer for the same reason: a band sum truncated inside a degenerate
+	multiplet keeps half an irrep, and half a multiplet is not a subspace of
+	anything.  Measured on the Si 4×4×4 SOC deck, ``nband = 60`` slices a
+	multiplet and costs **1.957 meV of within-star Σ spread** — a quantity
+	that is exactly zero when the cut is clean (floor 0.0010 meV).  Star
+	covariance is an identity, not a convergence parameter, so that spread is
+	an error with no knob to reduce it.
+
+	MODE, AND WHY IT IS NOT UNIFORM — the same grandfather clause
+	``check_zeta_fit_windows`` documents, and for the same census reason:
+
+	* An edge that arrives through the UMBRELLA (``number_bands`` / the
+	  transitional ``nband``) is checked ``snap`` — reported loudly, never
+	  fatal.  Every deck in the tree sits on such an edge, chosen before this
+	  check existed; flipping them to ``strict`` would refuse decks that have
+	  been producing frozen references for months, and it would also break
+	  the bit-identity claim this feature is required to hold (a refusal is
+	  not a byte-identical ``eqp0.dat``).
+	* An edge the deck NAMED — ``number_bands_chi`` or
+	  ``number_bands_sigma`` — REFUSES.  Naming one of these keys is a
+	  brand-new, explicit request for a specific edge on a deck that by
+	  construction has no history, which is precisely the argument that made
+	  ``zeta_nband``'s edge strict on 2026-08-11.
+
+	``LORRAX_BAND_DEGENERACY=snap`` (or ``off``) downgrades the refusal for
+	both, and says so in the log when it does.  The two counts are checked
+	INDEPENDENTLY and the message names the legal edges for the one that
+	failed, so a deck with two bad edges learns about both.
+	"""
+	from common import band_degeneracy as _bd
+	energies = getattr(wfn, "energies", None)
+	if energies is None:
+		log("  [band sum] closure NOT CHECKED: this loader exposes no "
+		    "`energies`.  That is an absence, not a pass.")
+		return
+	enk = np.asarray(energies)[0]
+	nb = int(enk.shape[1])
+	gaps = _bd.boundary_min_gaps(enk)
+	override = os.environ.get(_BAND_DEGENERACY_ENV, "").strip().lower()
+	if override and override not in _bd.MODES:
+		raise ValueError(
+			f"{_BAND_DEGENERACY_ENV}={override!r} is not one of "
+			f"{_bd.MODES}.  A guard override with an unrecognised value is "
+			f"not silently ignored.")
+	for edge, key, what in (
+			(int(band_slices.b4_chi), "number_bands_chi", "chi0/W band sum"),
+			(int(band_slices.b4_sigma), "number_bands_sigma",
+			 "Sigma band sum")):
+		named = key in cfg.bands.named
+		mode = override or ("strict" if named else "snap")
+		# The PADDED edge cuts nothing real: ψ above b_id_4_user is zero, so
+		# the boundary there is between a real band and a pad band and the
+		# gap is meaningless.  Ask about the LOGICAL count instead, which is
+		# what the physics truncates at.
+		logical = min(edge, int(cfg.bands.chi if key.endswith("chi")
+		                        else cfg.bands.sigma))
+		if logical >= nb:
+			log(f"    {what} edge {logical} exempt (at or past the "
+			    f"{nb} bands this WFN carries — cuts nothing).")
+			continue
+		gap_mev = float(gaps[logical]) * 13605.693122994
+		if gap_mev > _bd.DEGENERACY_TOL_RY * 13605.693122994:
+			log(f"    {what} edge {logical} clean: min gap "
+			    f"{gap_mev:.3g} meV.")
+			continue
+		legal = [b for b in range(int(band_slices.b2) + 1, nb)
+		         if gaps[b] > _bd.DEGENERACY_TOL_RY]
+		near = ([b for b in legal if b <= logical][-3:]
+		        + [b for b in legal if b > logical][:3])
+		detail = (
+			f"{what} is truncated at {logical} bands, and that boundary "
+			f"SPLITS A DEGENERATE MULTIPLET: the tightest gap across it "
+			f"anywhere in the BZ is {gap_mev:.4g} meV, against a "
+			f"{_bd.DEGENERACY_TOL_RY * 13605.693122994:.3g} meV tolerance.  "
+			f"Half a multiplet is not a symmetry-adapted subspace; on the Si "
+			f"4x4x4 SOC deck a sliced band sum cost 1.957 meV of within-star "
+			f"Sigma spread, which is an identity violation and has no "
+			f"convergence knob.  Legal edges for THIS count near {logical}: "
+			f"{near or 'none in range'}.")
+		if mode == "off":
+			log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
+			    f"CHECKED.) ***")
+		elif mode == "snap":
+			log(f"    *** {detail}  Continuing: "
+			    + (f"{_BAND_DEGENERACY_ENV}={override} was set."
+			       if override else
+			       f"this edge arrived through the umbrella `number_bands`, "
+			       f"which is grandfathered to a warning.  Set `{key}` "
+			       f"explicitly to have it enforced.") + " ***")
+		else:
+			raise _bd.BandWindowDegeneracyError(
+				f"{detail}  This edge was requested BY NAME (`{key}` = "
+				f"{logical}), so it is enforced rather than warned about.  "
+				f"Set `{key}` to one of the legal edges above, or set "
+				f"{_BAND_DEGENERACY_ENV}=snap to continue anyway (it logs "
+				f"loudly, and it changes the physics rather than fixing it).")
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
@@ -897,6 +1099,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# and the ``zeta_nband`` decoupling if the deck asked for one.
 	band_range_left, band_range_right = zeta_fit_band_ranges(
 		band_slices, getattr(cfg, "zeta_nband", None), log=print_fn)
+	assert_isdf_window_is_the_max(
+		band_slices, band_range_right, getattr(cfg, "zeta_nband", None),
+		log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
 		getattr(cfg, "zeta_nband", None), log=print_fn)

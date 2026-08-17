@@ -451,8 +451,14 @@ def plan_band_brackets(
     n_occ : int
         Occupied bands in the Σ band sum (``b2 - b0``).
     nb_logical, nb_padded : int
-        Real and mesh-padded band counts of the sum (``b4_user - b0`` and
-        ``b4 - b0``).  The last bracket runs to ``nb_padded`` so the plan
+        Real and mesh-padded band counts **of the Σ band sum** —
+        ``b4_sigma - b0`` in both cases, with ``b4_sigma`` carrying the mesh
+        pad only when Σ is the LARGER of the two counts (``common.meta``).
+        **Never the χ count and never the loaded extent.**  Since 2026-08-16
+        those are three different numbers on a split deck: the ψ is loaded
+        over ``max(chi, sigma)`` and Σ sums a window inside it, so reading
+        ``b_id_4_user`` / ``s.nb_full`` here would bracket a curve this run
+        never evaluates.  The last bracket runs to ``nb_padded`` so the plan
         still covers every band the un-bracketed path summed; the pad bands
         contribute exactly zero, so ``counts`` stays logical.
 
@@ -464,16 +470,46 @@ def plan_band_brackets(
         1/N model has no room to be tested), or when degeneracy snapping
         collapses two of the three cuts onto each other.
 
-        THE THRESHOLD IS ``n_cond >= n_occ``, i.e. ``nband >= 2*n_occ``.
-        Owner ruling 2026-08-16, whose words were "kill the calculation if
-        the number of bands requested is not >= 2*N_electrons".  It is
-        written in ``n_occ`` rather than in ``N_electrons`` because that is
-        the SPIN-CONVENTION-INDEPENDENT form of the same condition: under
-        SOC/noncolin ``n_occ = N_electrons``, without SOC
-        ``n_occ = N_electrons/2``, and in BOTH cases the condition says "at
-        least as many conduction bands as valence".  Writing it in the
-        electron count would silently mean two different things on the two
-        deck families.
+        THE THRESHOLD IS ``n_cond >= n_occ``, i.e.
+        ``number_bands_sigma >= 2*n_occ``.  Owner ruling 2026-08-16, whose
+        words were "kill the calculation if the number of bands requested is
+        not >= 2*N_electrons".  It is written in ``n_occ`` rather than in
+        ``N_electrons`` because that is the SPIN-CONVENTION-INDEPENDENT form
+        of the same condition: under SOC/noncolin ``n_occ = N_electrons``,
+        without SOC ``n_occ = N_electrons/2``, and in BOTH cases the
+        condition says "at least as many conduction bands as valence".
+        Writing it in the electron count would silently mean two different
+        things on the two deck families.
+
+        **WHICH COUNT THE GATE IS ABOUT — merge ruling, 2026-08-16.**  The
+        owner's rule was written before ``number_bands`` split into
+        ``number_bands_chi`` / ``number_bands_sigma``, so "nband" in it is
+        now ambiguous.  IT IS THE Σ COUNT, and only the Σ count.  The
+        argument is not a preference:
+
+          * The gate is a statement about the object being fitted.  The
+            feature fits ``S(N) = S_inf + A/N`` to the **Σ** band sum's
+            partial sums; ``n_cond`` and ``n_occ`` are the unoccupied and
+            occupied halves of THAT sum.  ``nb_logical`` is
+            ``b4_sigma - b0`` (see above), so the arithmetic in this
+            function is already Σ-only and a χ-flavoured reading of the
+            threshold would not correspond to anything computed here.
+          * A χ-side floor would refuse runs that are fine.  The physically
+            motivated configuration the split exists for is "χ at full
+            bands, Σ short and extrapolated"; there χ >= Σ, so a gate on
+            max(chi, sigma) is merely a weaker gate that lets an
+            under-banded Σ through — the exact failure the gate exists to
+            stop.  In the opposite split (Σ > χ) a χ-side floor would kill a
+            run whose Σ sum is perfectly well conditioned for the fit, over
+            a band count no part of this feature reads.
+          * χ0 has no 1/N fit and no occupied/unoccupied ratio this gate
+            could be a statement about.  A χ-side ``2*n_occ`` rule would be
+            a new, unmeasured physics claim smuggled in as a merge detail.
+
+        The refusal text therefore names ``number_bands_sigma`` explicitly
+        and says outright that raising ``number_bands_chi`` will not help.
+        Pinned by ``tests/test_band_extrapolation_sigma_count.py`` and
+        ``tests/test_band_extrapolation_split_sc.py``.
 
         This RELAXES the threshold that shipped before 2026-08-16, which
         refused on ``n_cond <= n_occ`` (strictly greater).  The equality
@@ -499,10 +535,11 @@ def plan_band_brackets(
         raise BandExtrapolationRefused(
             f"use_band_extrapolation is ON, but the Σ_c band sum has "
             f"n_cond = {n_cond} unoccupied bands against n_occ = {n_occ} "
-            f"occupied ones (nband = {nb_logical}).  The feature extrapolates "
-            f"the UNOCCUPIED tail, and it is only meaningful when that tail "
-            f"is at least as large as the occupied block: it requires "
-            f"n_cond >= n_occ, i.e. nband >= 2*n_occ = {2 * n_occ}.\n"
+            f"occupied ones (number_bands_sigma = {nb_logical}).  The feature "
+            f"extrapolates the UNOCCUPIED tail, and it is only meaningful "
+            f"when that tail is at least as large as the occupied block: it "
+            f"requires n_cond >= n_occ, i.e. number_bands_sigma >= 2*n_occ = "
+            f"{2 * n_occ}.\n"
             f"  The owner's form of this rule is "
             f"'nband >= 2*N_electrons'.  It is enforced here in n_occ "
             f"because that is the SPIN-CONVENTION-INDEPENDENT statement of "
@@ -510,9 +547,18 @@ def plan_band_brackets(
             f"without SOC n_occ = N_electrons/2, and in both cases the "
             f"condition means 'at least as many conduction bands as "
             f"valence'.\n"
-            f"  Raise the deck's `nband` to at least {2 * n_occ } "
-            f"(n_occ is set by the electron count, not by a deck key), or "
-            f"set use_band_extrapolation = false.")
+            f"  THE COUNT THIS GATE IS ABOUT IS THE Σ COUNT (merge ruling, "
+            f"2026-08-16).  The feature extrapolates the Σ band sum, so "
+            f"n_cond and n_occ here are both edges of THAT sum; raising "
+            f"`number_bands_chi` will NOT help, because this planner never "
+            f"reads the χ count.  There is deliberately NO 2*n_occ floor on "
+            f"the χ side: χ0 is a full band sum with no 1/N fit and no "
+            f"occupied/unoccupied ratio for the gate to be a statement "
+            f"about.\n"
+            f"  Raise the deck's `number_bands_sigma` (or the umbrella "
+            f"`number_bands`, which sets both counts) to at least "
+            f"{2 * n_occ} (n_occ is set by the electron count, not by a deck "
+            f"key), or set use_band_extrapolation = false.")
 
     e = np.asarray(enk_ry, dtype=np.float64)[:, :nb_logical]
     if e.ndim != 2 or e.shape[1] != nb_logical:
@@ -631,12 +677,15 @@ def plan_band_brackets(
         raise BandExtrapolationRefused(
             f"use_band_extrapolation: the three band counts collapsed onto "
             f"{counts} (requested {requested + (nb_logical,)} from fractions "
-            f"{tuple(fractions)} of nband = {nb_logical}).  Three DISTINCT, "
-            f"ascending counts are required — two coincident points cannot "
-            f"determine a two-parameter fit.  At nband = {nb_logical} the "
-            f"sampling fractions are less than one band apart.  Raise the "
-            f"deck's `nband` to at least {need}, or set "
-            f"use_band_extrapolation = false.")
+            f"{tuple(fractions)} of number_bands_sigma = {nb_logical}).  "
+            f"Three DISTINCT, ascending counts are required — two coincident "
+            f"points cannot determine a two-parameter fit.  At "
+            f"number_bands_sigma = {nb_logical} the sampling fractions are "
+            f"less than one band apart.  Raise the deck's "
+            f"`number_bands_sigma` (or the umbrella `number_bands`, which "
+            f"sets both counts) to at least {need}, or set "
+            f"use_band_extrapolation = false.  `number_bands_chi` is not the "
+            f"count these fractions are of.")
 
     bounds = tuple(
         (int(a), int(b)) for a, b in
