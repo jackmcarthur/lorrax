@@ -569,7 +569,7 @@ def _evaluate_gap_chi(
         occupation_support_bandwidth,
     )
 
-    z0 = intraband_block.GAP_CERTIFICATE_LOWEST_REAL_RY
+    z0 = intraband_block.GAP_CERTIFICATE_FIRST_REAL_RY
     z_gap = np.asarray(
         [z0 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
          0.30 + 0.2j, 0.60 + 0.2j], dtype=np.complex128)

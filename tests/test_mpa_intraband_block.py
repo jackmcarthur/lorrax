@@ -297,7 +297,8 @@ def test_near_degenerate_pair_does_not_collapse_the_adaptive_origin_gap():
     _left, _data_gap, zeta_max, _height = IB._contour_geometry(block, W0j)
     gap = IB._certified_origin_gap(block, W0j)
     machine_gap = np.finfo(np.float64).eps * zeta_max
-    assert gap == pytest.approx(IB.GAP_CERTIFICATE_LOWEST_REAL_RY ** 2)
+    assert gap == pytest.approx(
+        IB.GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY ** 2)
     assert gap > machine_gap
     intervals = IB._initial_intervals(block, W0j, origin_gap=gap)
     assert len(intervals) == IB.MIN_CLUSTERS
@@ -344,7 +345,8 @@ def test_deleting_one_finite_contour_refuses_on_dm_not_a_silent_merge(
     """
     mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=12)
     W0j = _put(mesh, W0, P("x", "y"))
-    intervals = IB._initial_intervals(block, W0j)
+    gap = IB._certified_origin_gap(block, W0j)
+    intervals = IB._initial_intervals(block, W0j, origin_gap=gap)
     original = IB._moments_at_order
 
     def deleted(*args, **kwargs):
@@ -355,7 +357,8 @@ def test_deleting_one_finite_contour_refuses_on_dm_not_a_silent_merge(
 
     monkeypatch.setattr(IB, "_moments_at_order", deleted)
     with pytest.raises(ValueError) as excinfo:
-        IB._cluster_moment_matrices(block, W0j, intervals)
+        IB._cluster_moment_matrices(
+            block, W0j, intervals, origin_gap=gap)
     message = str(excinfo.value)
     assert "intraband_contour_sum_rule" in message
     assert "masquerade" in message

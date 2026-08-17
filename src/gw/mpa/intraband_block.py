@@ -35,7 +35,9 @@ MOMENT_REL_TOL = SAMPLE_REL_TOL
 _V_PLATEAU_REL_TOL = 1.0e-3
 MIN_CLUSTERS = 3
 MAX_CLUSTERS = 6
-GAP_CERTIFICATE_LOWEST_REAL_RY = 0.04
+GAP_CERTIFICATE_FIRST_REAL_RY = 0.04
+GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY = (
+    0.5 * GAP_CERTIFICATE_FIRST_REAL_RY)
 _QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
 _RESOLVENT_BATCH_NODES = 8
 
@@ -297,17 +299,20 @@ def _contour_geometry(pair_block, W0bar, *, origin_gap=None):
 
 
 def _certified_origin_gap(pair_block, W0bar):
-    """Initial production exclusion from the lowest held-out edge.
+    """Initial production exclusion from the lowest certified bisection edge.
 
-    The held-out certificate is expressed in real frequency ``z`` whereas
-    the contour is in ``zeta=z**2``.  This policy must not depend on the
-    smallest bare transition: production crossing rows contain arbitrarily
-    near-degenerate pairs, and D_M/D_V adjudicate anything excluded here.
+    The first held-out point is 0.04 Ry, so the edge of the first resolution
+    cell between the exact origin anchor and that point is its 0.02-Ry
+    midpoint.  The contour is in ``zeta=z**2``.  This policy must not depend
+    on the smallest bare transition: production crossing rows contain
+    arbitrarily near-degenerate pairs, and D_M/D_V adjudicate anything
+    excluded here.
     """
     _left, _data_gap, zeta_max, _height = _contour_geometry(pair_block, W0bar)
     minimum_gap = np.finfo(np.float64).eps * zeta_max
     return max(
-        min(GAP_CERTIFICATE_LOWEST_REAL_RY ** 2, 0.5 * zeta_max),
+        min(GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY ** 2,
+            0.5 * zeta_max),
         minimum_gap,
     )
 
@@ -942,7 +947,8 @@ def pad_row(row, n_poles):
 
 
 __all__ = [
-    "GAP_CERTIFICATE_LOWEST_REAL_RY",
+    "GAP_CERTIFICATE_FIRST_REAL_RY",
+    "GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY",
     "ClusterClosure",
     "IntrabandRow",
     "MAX_CLUSTERS",
