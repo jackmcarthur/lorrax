@@ -117,9 +117,29 @@ def test_the_line_is_printed_before_the_refusal():
 # ---------------------------------------------------------------------------
 
 def test_gw_iteration_map_uses_the_checked_form():
-    """No surviving bare ``spread_rel`` print on the iteration path."""
+    """No surviving bare ``spread_rel`` print on the iteration path.
+
+    MIGRATED, not deleted, 2026-08-16.  This cell used to assert the literal
+    ``_check_kstar_spread(ks, delta_h_qp`` — the check's OLD position, on the
+    raw Sigma+V_H before ``apply_band_partition``.  The partition is the last
+    operation that can break the star relation (a protected mask whose edge
+    fell inside a degenerate multiplet gave one member off-diagonal Sigma and
+    the other a scalar scissor), so checking before it ran certified an object
+    the loop then rewrote; the call moved after it and its operand became the
+    unfolded ``H_qp_dft_new``.
+
+    The GUARDED PROPERTY IS UNCHANGED and is what is asserted here: the
+    enforcing call is on the iteration path, and no bare ``spread_rel`` print
+    came back beside it.  Pinning the operand SPELLING is what made this cell
+    break on a move that preserved its intent, so it pins the call and the
+    absence, not the argument text.
+    """
     src = pathlib.Path(sc_iteration.__file__).read_text()
     body = src[src.index("def gw_iteration_map("):
                src.index("def _scissor_E_qp_for_outofrange(")]
-    assert "_check_kstar_spread(ks, delta_h_qp" in body
-    assert "ks.spread_rel(" not in body
+    assert "_check_kstar_spread(" in body, (
+        "the enforcing call left gw_iteration_map; a printed spread is not a "
+        "gate, which is the whole point of this file")
+    assert "ks.spread_rel(" not in body, (
+        "a bare spread_rel came back on the iteration path — it must be "
+        "reached only through _check_kstar_spread, which refuses")
