@@ -165,17 +165,25 @@ def integrate_sigma_store(
         return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry, occupation_state=None):
+def _branches(wfns, omega, efermi_ry, occupation_state=None,
+              occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
     """The four causal branches, with occupation and energy kept separate.
 
     ``occupation_state=None`` is the incumbent insulating semantics,
     bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
     With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
-    exact fractional supports and weights: the val branch sums EVERY band
-    with f≠0 at weight f, the cond branch every band with f≠1 at weight
-    1−f — only exact 0/1 weights are dropped, nothing is clipped, and MP
+    fractional supports and weights: the val branch sums every band whose
+    weight f clears the occupancy window at weight f, the cond branch every
+    band whose weight 1−f clears it at weight 1−f.  Nothing is clipped and MP
     overshoot (f<0 or f>1) rides through unchanged
     (docs/theory/finite-occupation-screening.md).
+
+    ``occupation_window_threshold`` sets that window;
+    ``branches_for_omega_grid`` applies it.  1.0 restores the historical
+    ``f != 1`` / ``f != 0`` supports bit-for-bit.  Applying it here rather
+    than only in the planner keeps ONE support: ``sigma_windows._a_space``
+    re-applies the same floor to the same weights, so the two agree by
+    construction instead of by review.
     """
     if occupation_state is None:
         energy = wfns.enk[:, wfns.slices.full] - float(efermi_ry)
@@ -201,7 +209,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f)
+        cond_weight=1.0 - f, val_weight=f,
+        occupation_window_threshold=occupation_window_threshold)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -232,9 +241,10 @@ def compute_sigma_c_mpa_omega_grid(
     ``efermi_ry`` must equal ``occupation_state.mu_ry``.
 
     ``occupation_window_threshold`` is the OCCUPANCY below which a band is
-    still counted in a branch; the planner cuts on ``|weight| > 1 - it``.
-    It is forwarded to BOTH planner entry points from this one value, which
-    is what keeps the pole census and the window build on one support.
+    still counted in a branch; the cut is ``|weight| > 1 - it``.  It is
+    forwarded from this one value to the BRANCH BUILD and to BOTH planner
+    entry points, which is what keeps the branch supports, the pole census
+    and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  A first
     four-pole walk retains only scalar geometry for planning; the spatial
@@ -248,8 +258,10 @@ def compute_sigma_c_mpa_omega_grid(
     ledger = validate_fit_store(fit_src)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = _branches(wfns, omega_grid_ry, efermi_ry,
-                         occupation_state=occupation_state)
+    branches = _branches(
+        wfns, omega_grid_ry, efermi_ry,
+        occupation_state=occupation_state,
+        occupation_window_threshold=occupation_window_threshold)
     summaries = []
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader

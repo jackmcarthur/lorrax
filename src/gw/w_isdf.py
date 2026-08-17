@@ -35,6 +35,8 @@ import numpy as np
 from common import Meta, jax_profile
 from common.jax_compile_cache import ensure_jax_compile_cache
 from runtime.padding import round_up, solve_at_logical
+from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                     band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import MinimaxNodes
 
 
@@ -1100,25 +1102,49 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
 
 
 
-def _exact_occupation_support_slices(occupations):
+def _occupation_support_slices(
+        occupations,
+        occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
     """Smallest contiguous f and (1-f) band supports without truncation.
 
-    Equality is intentional.  MP1 occupations may overshoot [0, 1], so this
-    helper neither clips nor applies a tolerance.  It only drops bands whose
-    stored weight is exactly zero on every k, or exactly one on every k.
-    Partially occupied bands consequently belong to both slices.
+    THIS IS THE ONE PLACE χ₀'s TWO GREEN'S FUNCTIONS GET THEIR BANDS, and
+    unlike the Σ planner's mask it is a genuine COST cut: the returned slices
+    index ``wfns.xn``/``yr``, so a band outside them is absent from the
+    ``build_G_tau`` contraction rather than merely multiplied by a small
+    weight.  ``occupation_support_bandwidth`` reads the same two slices to
+    size the damped-line rule, so widening them also buys quadrature nodes.
+
+    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
+    support; the cut is on the branch WEIGHT — ``f`` on the occupied side,
+    ``1 − f`` on the empty side, matching ``band_weight=occ_f`` and
+    ``band_weight=1.0 - occ_u`` in the kernel — at the floor
+    ``1 − threshold``, by MAGNITUDE.  Nothing is clipped: MP1 occupations
+    overshoot [0, 1] and a wrong-side band's NEGATIVE weight is kept by
+    ``abs`` exactly as the historical rule kept it (the argument is at
+    ``gw.efermi.band_in_occupation_window``).  Partially occupied bands
+    belong to both slices, as before.
+
+    ``threshold = 1.0`` gives floor 0.0 and restores the historical exact
+    rule (``occ != 0`` / ``occ != 1``) bit-for-bit; an insulating table, whose
+    weights are exactly 0 or 1, gives the same two slices at EVERY threshold,
+    since ``abs(1) > floor`` and ``abs(0) > floor`` are threshold-independent
+    on [0.5, 1.0].
     """
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
-    f_support = np.any(occ != 0.0, axis=0)
-    u_support = np.any(occ != 1.0, axis=0)
+    floor = occupation_weight_floor(occupation_window_threshold)
+    f_support = np.any(band_in_occupation_window(occ, floor), axis=0)
+    u_support = np.any(band_in_occupation_window(1.0 - occ, floor), axis=0)
     if not np.any(f_support) or not np.any(u_support):
         raise ValueError(
-            "fractional contour chi0 needs at least one nonzero f band and "
-            "one nonzero (1-f) band")
+            "fractional contour chi0 needs at least one band clearing the "
+            f"occupation window on each side (threshold "
+            f"{float(occupation_window_threshold)!r} ⇒ |weight| > {floor!r}); "
+            "raise occupation_window_threshold toward 1.0 to widen the "
+            "supports, or check the occupation table")
     f_idx = np.flatnonzero(f_support)
     u_idx = np.flatnonzero(u_support)
     return (
@@ -1134,6 +1160,7 @@ def _chi0_fractional_contour_args(
     z_values,
     occupations,
     energy_reference,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Prepare the exact finite-occupation positive-time response."""
     time_nodes = np.asarray(time_nodes, dtype=np.float64)
@@ -1170,7 +1197,8 @@ def _chi0_fractional_contour_args(
         raise ValueError(
             "fractional contour occupation shape {} does not match energies "
             "{}".format(occ_full.shape, wfns.enk.shape))
-    f_slice, u_slice = _exact_occupation_support_slices(occ_full)
+    f_slice, u_slice = _occupation_support_slices(
+        occ_full, occupation_window_threshold)
     eref = 0.0 if energy_reference is None else float(energy_reference)
     args = (
         jnp.asarray(time_nodes, dtype=jnp.float64),
@@ -1198,6 +1226,7 @@ def compute_chi0_contour_fractional(
     *,
     occupations=None,
     energy_reference=0.0,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Evaluate retarded finite-occupation chi0 at complex frequencies.
 
@@ -1205,6 +1234,11 @@ def compute_chi0_contour_fractional(
     routine supplies exp(i*z*t) and both exact Keldysh terms.  It does not
     implement z=0: the gapless static limit contains the finite divided
     difference -df/dE and requires its own certified integration rule.
+
+    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves
+    one of the two Green's-function supports; it MUST be the same value the
+    caller gave ``occupation_support_bandwidth``, or the damped-line rule is
+    sized for transitions the band slices no longer contain.
     """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
@@ -1215,6 +1249,7 @@ def compute_chi0_contour_fractional(
         z_values,
         occupations,
         energy_reference,
+        occupation_window_threshold,
     )
     kernel = _get_chi_fractional_contour_kernel(mesh_xy, kgrid, n_out)
     values = kernel(*args)
@@ -1451,18 +1486,22 @@ def compute_chi0_static_fractional_gamma(
     )(psi_x, psi_y, e, f, surface)
 
 
-def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
-    """Largest transition energy over the exact occupation supports, Ry.
+def occupation_support_bandwidth(
+        energies_kn_ry, occupations_kn,
+        occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
+    """Largest transition energy over the occupation supports, Ry.
 
-    ``max(E over the (1-f) support) − min(E over the f support)`` with the
-    no-slop support rule of :func:`_exact_occupation_support_slices`: only
-    weights stored as exactly 0 or exactly 1 are dropped, so an MP1
-    overshoot band at a support edge is included.  This — not
-    ``quad.x_max`` — sizes the damped-line rule bandwidth on metal plans,
-    where the occupied and empty supports overlap.
+    ``max(E over the (1-f) support) − min(E over the f support)`` over the
+    SAME two slices :func:`_occupation_support_slices` hands the χ₀ kernel,
+    so the rule bandwidth and the bands it must resolve can never disagree —
+    which is why the threshold is an argument here rather than a second
+    default.  An MP1 overshoot band at a support edge is included, by
+    magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
+    bandwidth on metal plans, where the occupied and empty supports overlap.
     """
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
-    f_slice, u_slice = _exact_occupation_support_slices(occupations_kn)
+    f_slice, u_slice = _occupation_support_slices(
+        occupations_kn, occupation_window_threshold)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
 
 
@@ -1549,6 +1588,7 @@ def precompile_chi0_contour_fractional(
     *,
     occupations=None,
     energy_reference=0.0,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """AOT sibling of compute_chi0_contour_fractional."""
     ensure_jax_compile_cache()
@@ -1560,6 +1600,7 @@ def precompile_chi0_contour_fractional(
         z_values,
         occupations,
         energy_reference,
+        occupation_window_threshold,
     )
     _get_chi_fractional_contour_kernel(
         mesh_xy, kgrid, n_out).lower(*args).compile()

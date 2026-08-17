@@ -37,6 +37,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                     band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import (
     MinimaxNodes,
     solve_laplace_minimax_interval,
@@ -158,6 +160,7 @@ def _iter_branches(
     cond_mask: jax.Array, val_mask: jax.Array,
     cond_weight: jax.Array | None = None,
     val_weight: jax.Array | None = None,
+    weight_floor: float = 0.0,
 ) -> list[_SigmaBranch]:
     """Enumerate the 4 branches (A-space × ω-half), skipping empty ω halves.
 
@@ -172,7 +175,27 @@ def _iter_branches(
     +ω ones — they are not conjugated from the +ω result (the global
     Σ_c(−ω) = −[Σ_c(ω)]* identity does not hold; the reflection is per pole
     term, which is why the crossing role moves from cond to val across halves).
+
+    ``weight_floor`` is ``1 − occupation_window_threshold``
+    (``gw.efermi.occupation_weight_floor``): a band leaves a branch once its
+    branch weight's MAGNITUDE falls to the floor.  It is applied HERE, at the
+    one place all four branches are built, so no consumer of ``base_mask_A``
+    can plan or execute against a support the deck did not ask for.  A branch
+    with no weight — every insulating plan, and today every GN-PPM branch —
+    keeps the incumbent bool mask bit-for-bit, because there is no weight to
+    threshold; see the note in :func:`branches_for_omega_grid`.
     """
+    def _narrow(mask, weight):
+        # The identity that makes threshold = 1.0 the exact incumbent rule:
+        # floor 0.0 ⇒ abs(w) > 0.0 ⇔ w != 0.0.  None ⇒ the SAME OBJECT back,
+        # not merely an equal one, so the bool-mask path stays bit-exact and
+        # emits no jnp op at all.
+        if weight is None:
+            return mask
+        return mask & band_in_occupation_window(weight, weight_floor)
+
+    cond_mask = _narrow(cond_mask, cond_weight)
+    val_mask = _narrow(val_mask, val_weight)
     branches: list[_SigmaBranch] = []
     if omega_pos.size:
         branches += [
@@ -206,6 +229,7 @@ def branches_for_omega_grid(
     cond_mask: jax.Array, val_mask: jax.Array,
     cond_weight: jax.Array | None = None,
     val_weight: jax.Array | None = None,
+    occupation_window_threshold: float = OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ) -> list[_SigmaBranch]:
     """Split a signed ω grid at zero and enumerate the four causal branches.
 
@@ -213,6 +237,21 @@ def branches_for_omega_grid(
     the caller because the two drivers derive them differently (PPM clips
     E_cond/H_val at zero around an internally derived E_F; MPA keeps signed
     occupation-chosen distances for small-gap/inverted systems).
+
+    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
+    Green's-function branch; it is converted here to the weight floor
+    ``1 − threshold`` and applied to ``cond_mask``/``val_mask`` against the
+    supplied weights.  **It has an effect only where a weight is supplied.**
+
+    THE GN-PPM Σ DRIVER SUPPLIES NONE, and that is a real gap this key cannot
+    close on its own: ``ppm_sigma._prepare_sigma_state`` derives its two masks
+    as ``occ_full > 0.5`` from ``wfns.occ``, which ``wavefunction_bundle.
+    _build_occ`` fills as the STEP array ``(enk <= efermi)`` — so that driver
+    has no fractional occupancy anywhere, only an integer split, and there is
+    nothing for an occupancy threshold to cut.  Closing it means porting
+    fractional occupations into that driver first (its own
+    ``TODO(metal-greens)``), after which the threshold governs it through this
+    call with no further change.  Validated at this consumer.
     """
     omega = np.asarray(omega_grid_ry, np.float64)
     idx_pos, idx_neg = np.where(omega >= 0.0)[0], np.where(omega < 0.0)[0]
@@ -221,7 +260,8 @@ def branches_for_omega_grid(
         omega_neg_abs=-omega[idx_neg], idx_neg=idx_neg,
         E_cond=E_cond, H_val=H_val,
         cond_mask=cond_mask, val_mask=val_mask,
-        cond_weight=cond_weight, val_weight=val_weight)
+        cond_weight=cond_weight, val_weight=val_weight,
+        weight_floor=occupation_weight_floor(occupation_window_threshold))
 
 
 def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
