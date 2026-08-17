@@ -31,6 +31,7 @@ from .band_extrapolation import (
     extrapolation_weights,
     fit_band_extrapolation,
     format_extrapolation_report,
+    static_limit_tail_ruling,
     plan_band_brackets,
     sc_tolerance_ruling,
 )
@@ -343,6 +344,26 @@ def _report_band_extrapolation(
     if tol_ev is not None:
         _, ruling = sc_tolerance_ruling(fit, float(tol_ev))
         print_fn(ruling)
+
+    # ── THE PER-MODE CONTAMINANT THE PER-compute_mode GUARD CANNOT SEE ───
+    # ``ppm_invalid_mode = "static_limit"`` (the shipping default) puts an
+    # analytic static-COHSEX term inside this Σ_c.  The PPM-only guard in
+    # ``sigma_dispatch`` exists precisely to keep a static Coulomb hole out of
+    # this fit, and it cannot fire here because the ``compute_mode`` genuinely
+    # IS ``gn_ppm`` — the contamination is per-MODE, one logical ISDF mode at a
+    # time, underneath the seam that guard checks.  So the check lives HERE,
+    # beside the fit it qualifies, and triggers on the term rather than on the
+    # mode.  ``static_coh_at_counts`` is None when the run has no invalid poles
+    # or is not extrapolating, and there is then nothing to say.
+    static_coh = getattr(sigma_omega, "static_coh_at_counts", None)
+    if static_coh is not None:
+        # Same band diagonal, same states, same unit as ``points`` above: the
+        # term is ω-INDEPENDENT, so no interpolation onto ``omega_eval_ev`` is
+        # possible or needed and the diagonal is taken directly.
+        static_diag = np.einsum(
+            'bkii->bki', np.asarray(static_coh)) * RYD_TO_EV
+        _, static_ruling, _ = static_limit_tail_ruling(fit, static_diag)
+        print_fn(static_ruling)
 
     # The arrays are already in eV on the band diagonal, which is the unit
     # and the layout ``sigma_mnk.h5`` wants, so no scale is applied here.
