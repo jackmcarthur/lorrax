@@ -46,7 +46,7 @@ import numpy as np                                            # noqa: E402
 import jax                                                    # noqa: E402
 import jax.numpy as jnp                                       # noqa: E402
 
-from common import Meta, symmetry_maps                        # noqa: E402
+from common import Meta                                       # noqa: E402
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
 from common.jax_compile_cache import _STATE as CC_STATE        # noqa: E402
@@ -59,6 +59,12 @@ from common.wfn_transforms import load_kpoint_fftbox_local     # noqa: E402
 from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
                                  # with the owner's workspace fix)
 _services.ensure_on_path()
+# THE SERVICE, not ``from common import symmetry_maps``.  That shim was
+# deleted with the rest of the phase-wide forwarding shims and this line
+# went stale with it, which made the whole gate an ImportError at line
+# 49 — so the one gate ``compute_hartree_matrix``'s own comment names as
+# its certifier could not be run at all.  Found 2026-08-17.
+import symmetry_maps                                           # noqa: E402
 from wfn_loader import WfnLoader                               # noqa: E402
 from gw.gw_config import read_lorrax_input                     # noqa: E402
 from gw.kin_ion_io import (build_valence_density_distributed,   # noqa: E402
@@ -220,7 +226,13 @@ def main():
                          ngkmax=int(psi_G.shape[3]), nb=nb,
                          ns=int(psi_G.shape[2]), nk=nk,
                          cell_volume=float(wfn.cell_volume))
-    p0(f"[mtxel] psi_G {tuple(psi_G.shape)} spec={psi_G.sharding.spec}  "
+    # ``getattr``, because at P=1 the loader hands back a
+    # ``SingleDeviceSharding``, which carries no ``.spec`` — so this
+    # DIAGNOSTIC LINE was an AttributeError that killed the gate before
+    # any of its five checks ran.  Second bit-rot found in this file on
+    # 2026-08-17, after the stale ``common.symmetry_maps`` import above.
+    p0(f"[mtxel] psi_G {tuple(psi_G.shape)} "
+       f"spec={getattr(psi_G.sharding, 'spec', psi_G.sharding)}  "
        f"nb_logical={geom.nb_logical} nb_padded={geom.nb} "
        f"p_prod={geom.p_prod}")
     kw = dict(geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
@@ -265,8 +277,9 @@ def main():
        f"dipole {t_dip:7.3f}s   VmHWM {hwm_sweep:.3f} GiB")
     p0(f"[mtxel] compiles per sweep (nk={nk}; ONE lowering is the D10 "
        f"claim): V_H={c_vh} kin_ion={c_ki} dipole={c_dip}")
-    p0(f"[mtxel] specs: V_H {H_vh.sharding.spec} {H_vh.shape}   "
-       f"dipole {H_dip.sharding.spec} {H_dip.shape}")
+    p0(f"[mtxel] specs: V_H {getattr(H_vh.sharding, 'spec', H_vh.sharding)} "
+       f"{H_vh.shape}   dipole "
+       f"{getattr(H_dip.sharding, 'spec', H_dip.sharding)} {H_dip.shape}")
 
     # ---- 1-3. per shard --------------------------------------------------
     worst = [shard_vs_reference(H_vh, pad_ref(vh_ref), "V_H", p0),
