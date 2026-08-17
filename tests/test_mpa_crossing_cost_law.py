@@ -184,3 +184,20 @@ def test_shell_rule_error_verified_against_an_independent_cloud():
     assert float(np.max(residual)) <= 2.0 * CROSSING_TOL
     # And the crossing itself is exercised: the cloud straddles x = 0.
     assert np.any(x > 1.0) and np.any(x < -1.0)
+
+
+def test_patched_deck_hull_fields_are_the_patch_hull(tmp_path):
+    """The SC in-grid partition reads sigma.omega_min/max_ev as the grid
+    hull; with patches those fields must be the patch hull, or every
+    band outside the DEFAULT [-5, +5] silently takes the scissor while
+    Σ is computed on the deep clusters and never consulted (measured on
+    arm 21: SC partition 2/48 instead of 10/48)."""
+    from gw.gw_config import LorraxConfig
+    deck = tmp_path / "mpa.in"
+    deck.write_text("[lorrax]\nwfn_file = /dev/null\n"
+                    "sigma_omega_patches_ev = -66:-48, -32:-20, -7:7\n")
+    cfg = LorraxConfig.from_input_file(str(deck))
+    assert cfg.sigma.omega_min_ev == -66.0
+    assert cfg.sigma.omega_max_ev == 7.0
+    g = cfg.omega_grid_ev
+    assert g[0] == -66.0 and g[-1] == 7.0

@@ -33,7 +33,7 @@ import configparser
 import enum
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import numpy as np
@@ -3009,6 +3009,17 @@ class LorraxConfig:
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
         )
+        # With patches, omega_min/max_ev ARE the patch hull.  Consumers
+        # read these fields as "the Σ grid's reach" (the SC partition's
+        # in-grid classification above all); leaving them at the deck
+        # defaults silently scissored every band outside [-5, +5] on the
+        # first patched run — Σ was computed on the deep clusters and
+        # then never consulted (measured: arm 21, SC partition 2/48).
+        _patches = sigma.parsed_omega_patches_ev()
+        if _patches:
+            sigma = _dc_replace(
+                sigma, omega_min_ev=float(_patches[0][0]),
+                omega_max_ev=float(_patches[-1][1]))
         _occ_family = _g("occ_smearing_family")
         _occ_family = (
             str(_occ_family).strip().lower()
