@@ -177,6 +177,49 @@ def test_an_insulating_branch_has_no_weight_and_is_untouched(threshold):
     assert bounds == (-0.6, 0.4)
 
 
+def test_a_gapped_deck_never_reaches_the_thresholded_line_at_all():
+    """The insulator claim is about EXECUTION, not about equal numbers.
+
+    ``compute_sigma_xc`` passes ``occupation_state=None`` on a gapped deck
+    (``sc_iteration.py:1674`` builds ``metal_occ_state`` only under
+    ``material_class == 'metal'``), and ``_branches`` then leaves every
+    ``band_weight`` None -- so the guarded block inside ``_a_space`` is not
+    merely agreeing with the old rule, it does not run.  Asserting that here
+    is stronger than an artifact diff, which could match for other reasons.
+    """
+    from gw.mpa.sigma import _branches
+
+    class _Slices:
+        full = slice(0, 4)
+
+    class _Wfns:
+        enk = jnp.asarray([[-0.6, -0.2, 0.3, 0.9]])
+        occ = jnp.asarray([[1.0, 1.0, 0.0, 0.0]])   # gapped: exactly 0/1
+        slices = _Slices()
+
+    branches = _branches(_Wfns(), np.asarray([0.0, 0.25]), 0.0,
+                         occupation_state=None)
+    assert branches, "fixture produced no branches"
+    assert all(b.band_weight is None for b in branches)
+
+    calls = {"n": 0, "weighted": 0}
+    real = SW._a_space
+
+    def counting(branch, predicate, weight_floor=0.0):
+        calls["n"] += 1
+        calls["weighted"] += branch.band_weight is not None
+        return real(branch, predicate, weight_floor)
+
+    SW._a_space = counting
+    try:
+        SW._geometry(branches, 0.05, 1.5, SW._weight_floor(0.995))
+    finally:
+        SW._a_space = real
+    assert calls["n"] == len(branches)
+    assert calls["weighted"] == 0, (
+        "a gapped deck reached the weighted branch of _a_space")
+
+
 # --------------------------------------------------------------------------
 # The property the owner actually asked about: smearing-awareness
 # --------------------------------------------------------------------------
