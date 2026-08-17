@@ -15,7 +15,8 @@ from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 
-from .sigma_windows import (build_shared_sigma_windows,
+from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                            build_shared_sigma_windows,
                             summarize_sigma_poles)
 
 
@@ -228,6 +229,7 @@ def compute_sigma_c_mpa_omega_grid(
     max_rank,
     crossing_max_nodes,
     omega_cluster_gap_ry=1.0,
+    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
     expected_screening_diagrams=None,
@@ -240,6 +242,11 @@ def compute_sigma_c_mpa_omega_grid(
     the incumbent insulating semantics, bit-exact.  With a state, the causal
     branches carry exact fractional supports and (f, 1−f) weights, and
     ``efermi_ry`` must equal ``occupation_state.mu_ry``.
+
+    ``occupation_window_threshold`` is the OCCUPANCY below which a band is
+    still counted in a branch; the planner cuts on ``|weight| > 1 - it``.
+    It is forwarded to BOTH planner entry points from this one value, which
+    is what keeps the pole census and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  A first
     four-pole walk retains only scalar geometry for planning; the spatial
@@ -271,7 +278,8 @@ def compute_sigma_c_mpa_omega_grid(
             summaries.extend(summarize_sigma_poles(
                 Omega, B, branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo))
+                edge_factor=edge_factor, pole_offset=lo,
+                occupation_window_threshold=occupation_window_threshold))
             del Omega, B
         plan, geometry = build_shared_sigma_windows(
             summaries, branches,
@@ -279,7 +287,8 @@ def compute_sigma_c_mpa_omega_grid(
             edge_factor=edge_factor, target_error=target_error,
             crossing_target_error=crossing_target_error,
             max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
-            omega_cluster_gap_ry=omega_cluster_gap_ry)
+            omega_cluster_gap_ry=omega_cluster_gap_ry,
+            occupation_window_threshold=occupation_window_threshold)
         print_fn(
             f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
             f"{geometry['n_windows']} logical windows")
