@@ -1,5 +1,26 @@
 """Band-convergence extrapolation of the correlation self-energy Σ_c.
 
+TWO ESTIMATORS, ONE SET OF THREE POINTS.  Both read the SAME three cumulative
+bracket sums S(N₁), S(N₂), S(N₃) that the τ kernel already produces in one
+pass; they differ only in what they do with them.  The deck selects with
+``band_extrapolation_estimator``:
+
+  ``spectral_shell``   **the default since 2026-08-17.**  A spectrum-resolved
+      SHELL estimator: solve ONE exponent per external state from the ratio of
+      the two observed shell increments against spectral moments of the real
+      DFT eigenvalues, then integrate the remaining tail out to the finite
+      plane-wave basis.  ``SPECTRAL SHELL ESTIMATOR`` below.
+  ``band_index_only``  the incumbent two-parameter ``S_∞ + A/N`` least
+      squares.  Kept and selectable, unchanged bit-for-bit; renamed because
+      "1/N" names the only thing it looks at — the band INDEX — and the
+      measurement below is that the band index alone is not enough.
+
+Everything from ``WHAT CONVERGES SLOWLY`` to ``BAND COUNTS, NOT AN ENERGY
+CUTOFF`` describes machinery both estimators share (the brackets, what is held
+fixed across the three points, the counting law, the mode gate) or the
+``band_index_only`` fit and its own history.  Read the two estimator sections
+as the fork.
+
 WHAT CONVERGES SLOWLY.  Σ_c's intermediate-state sum runs over every band in
 the Green's function,
 
@@ -157,12 +178,13 @@ that is itself a fit or a model.  Under that protocol:
     The defensible reason to want a fourth point is a held-out prediction of
     the fourth shell as an uncertainty estimate — not accuracy.
 
-The leading replacement is a spectrum-resolved SHELL estimator: fit the
-per-state decay from the ratio of the two observed shell increments against
-spectral moments of the real DFT eigenvalues, then integrate the remaining
-tail to the finite basis endpoint.  Held-out against S(508) it beats this
-module's estimator at every band count, and it needs exactly the three points
-this module already computes.  Not implemented here yet.
+The replacement is a spectrum-resolved SHELL estimator: fit the per-state
+decay from the ratio of the two observed shell increments against spectral
+moments of the real DFT eigenvalues, then integrate the remaining tail to the
+finite basis endpoint.  Held-out against S(508) it beats this module's
+estimator at every band count, and it needs exactly the three points this
+module already computes.  **It is implemented here now (2026-08-17) and is the
+DEFAULT**; see ``SPECTRAL SHELL ESTIMATOR`` below.
 
 A CALIBRATED BIAS CORRECTION was tested too, and the result is the argument
 for leaving the centre alone.  Scaling the applied correction by an optimal
@@ -217,6 +239,117 @@ they are NOT interchangeable:
 
 ``Δ_tail`` — how far the extrapolation moved the largest computed point.
     The size of the correction, not its error.
+
+SPECTRAL SHELL ESTIMATOR — THE DEFAULT SINCE 2026-08-17.  The band index is
+the wrong variable and the section above says so with a measurement: the local
+convergence power climbs 1.28 → 2.29 over N = 100 → 300 because the MATRIX
+ELEMENTS fall off, and their falloff is a property of the ENERGY the
+intermediate state sits at, not of its position in a list.  So use the
+energies.  Nothing else about the run changes — the same three brackets, the
+same one pass, the same three numbers.
+
+Form the two SHELL increments actually observed,
+
+    D₂ = S(N₂) − S(N₁),        D₃ = S(N₃) − S(N₂),
+
+and assume the per-intermediate-state contribution is locally
+``c(E) ~ A·(E − E₀)^(−β)`` with an amplitude A and an exponent β that are
+constant across the top of the computed range and out into the tail.  Build
+spectral moments of the DFT eigenvalues over each shell and over the tail,
+
+    I_j(β)    = Σ_{i ∈ (N_{j-1}, N_j]}  w_i · ((ε_i − E₀)/E*)^(−β)
+    I_tail(β) = Σ_{i = N₃+1}^{N_T}      w_i · ((ε_i − E₀)/E*)^(−β)
+
+with ``w_i`` the k-point weights and ``ε_i`` the DFT eigenvalues.  Then
+
+    D₃/D₂ = I₃(β)/I₂(β)
+
+is ONE scalar equation in ONE unknown per external state, solved by bracketed
+root find on ``log I₃(β) − log I₂(β) − log|D₃/D₂|``, and
+
+    Ŝ = S(N₃) + D₃ · I_tail(β)/I₃(β).
+
+**A AND THE INTERCEPT ARE ELIMINATED ANALYTICALLY.**  A cancels in the ratio
+that determines β and again in the ratio that applies it; the intercept never
+appears because the estimator adds up the REMAINING tail rather than fitting a
+limit.  There is no nonlinear fit anywhere in this estimator and none is to be
+added — the whole reason it works at three points is that it has one unknown.
+``E*`` is an arbitrary conditioning scale: it enters every moment as the same
+multiplicative ``E*^β`` and cancels from both ratios exactly, so it can be any
+positive energy and is chosen only to keep the powers off the exponent rails.
+
+**β IS PER-STATE AND IS NEVER POOLED.  Owner ruling, not negotiable.**  The
+point of the estimator is that valence and conduction states genuinely
+converge differently; a pooled β averages that away and returns the estimator
+to a one-size-fits-all correction, which is the defect being fixed.  There is
+no pooling option, and pooling is not to be benchmarked back in.
+
+**E₀ AND THE BAND LADDER COME FROM THE DFT EIGENVALUES ONLY, NEVER FROM THE
+THREE Σ VALUES.**  E₀ is the bottom of the band manifold, obtained by fitting
+the free-electron (Weyl) form ``E_n = E₀ + C·(n + n₀)^(2/3)`` to the k-mean of
+the DFT ladder.  On the Si 50 Ry deck that fits with n₀ = 0 and R² = 0.99975.
+Letting any part of the ladder be informed by S(N₁..₃) would make the
+estimator a fit of the data to itself.
+
+**N_T, THE TARGET ENDPOINT, IS THE FINITE BASIS — NOT INFINITY.**  ``S(∞)``
+corresponds to no physical quantity: the band sum is EXACTLY complete at the
+plane-wave basis's own dimension, ``N_PW = ngk · nspinor`` read from the WFN,
+and there is nothing beyond it to converge to.  ``ngk`` varies by k-point
+(1604…1639 on the Si deck), and the default uses the MINIMUM — the band count
+at which no k-point is still short.  Where eigenvalues are needed past the
+WFN's own band count, and they always are (512 bands against N_PW = 3208 on
+that deck), the ladder is continued with the SAME Weyl form.  That
+continuation is used ONLY to extend the eigenvalue SEQUENCE; no self-energy,
+no matrix element and no exponent is ever taken from it.
+
+**FAILURE IS A NAMED REFUSAL, NEVER A CLIP.**  Three signatures, all per
+state, all refusals: (a) ``D₂`` and ``D₃`` of opposite sign or either exactly
+zero — the shells do not agree that there is a tail, so there is no ratio to
+invert; (b) no bracketed root of the β equation in
+:data:`SHELL_EXPONENT_BRACKET`; (c) a root pressed against a bracket edge,
+which is the clip a naive implementation would return as a value.  A failed
+state gets ``NaN`` and a named reason, never a substituted number, and the
+driver turns any failure inside the Σ band sum into a
+:class:`SpectralShellExtrapolationFailed` naming every failed state.  The
+alternative — falling back to ``S(N₃)`` or to the 1/N fit on the failed states
+— was rejected: it would ship a Σ built from two different estimators with
+nothing in the artifact saying which states came from which.
+
+MEASURED, HELD OUT, AGAINST A NUMBER BERKELEYGW COMPUTED.  The 508-band Si arm
+(50 Ry, ``sandbox:reports/band_tail_exponent_50ry_2026-08-16/``) gives a
+MEASURED ``S(508)``, so both estimators can be scored on data neither fitted.
+Median |error| over the 28 Fermi-window states, in meV:
+
+    N_max      band_index_only      spectral_shell
+    -------------------------------------------------
+    152             45.8                  4.7
+    204             29.7                 14.7
+    260             17.5                 12.5
+    296             12.6                  0.7
+    396              3.5                  0.0
+
+β came out 3.4–5.3 across those rungs, independently consistent with ``a + 1``
+from the dense increment fit (a = 1.83 → 3.94), which is the check that it is
+measuring the matrix-element falloff and not absorbing an arbitrary fit
+parameter.  **THE ERRORS ARE NON-MONOTONE IN N_max, AND THAT IS THE METHOD'S
+OWN BEHAVIOUR** — 4.7 at 152 against 14.7 at 204 is not a porting bug and is
+not to be tuned away.  The estimator is a two-shell local fit; which pair of
+shells it gets, and how well the local power law describes them, is not a
+monotone function of where the top of the range sits.
+
+WHAT THE ESTIMATOR IS APPLIED TO, AND WHY THAT NEEDED A RULING.  The fit is
+per external state, so its three combination coefficients ``[0, −r, 1 + r]``
+carry a ``(nk, nb)`` shape rather than being three scalars.  The Σ object that
+drives the iteration is the full ``(nω, nk, nb, nb)`` cube, whose element
+``(i, j)`` has TWO external states.  The coefficient applied there is the mean
+of the two states' own, ``r_ij = ½(r_i + r_j)``.  That choice is forced, not
+free: it is the unique symmetric rule that is exact on the diagonal (where the
+estimator is defined and measured) and that keeps ``Σ_b c_b = 1``, and
+symmetry is what makes the extrapolated Σ exactly Hermitian — the same
+argument :func:`extrapolation_weights` makes for the scalar case, which is
+required for "extrapolate Σ, then diagonalize" to yield a legitimate static
+self-energy.  A per-row rule would produce a non-Hermitian Σ and a spectrum
+belonging to no Hamiltonian.
 
 GN/HL-PPM ONLY IS A CORRECTNESS GUARD, NOT A SCOPE LIMITATION.  The refusal
 in ``gw.sigma_dispatch`` on a non-PPM ``compute_mode`` reads like "we only
@@ -1117,6 +1250,697 @@ def extrapolation_weights(counts) -> np.ndarray:
     return (1.0 / float(N.size)) - xbar * (x - xbar) / Sxx
 
 
+# ---------------------------------------------------------------------------
+#  The spectrum-resolved shell estimator
+# ---------------------------------------------------------------------------
+
+#: The band-convergence estimators a deck may select, and the default.
+#:
+#: ``spectral_shell`` is the default since 2026-08-17 (owner ruling): held out
+#: against a MEASURED S(508) it beats ``band_index_only`` at every band count
+#: on the Si 50 Ry arm — see the module docstring for the table.
+#: ``band_index_only`` is the incumbent ``S_∞ + A/N`` least squares under its
+#: honest name; it is kept, selectable, and bit-for-bit what it always was.
+BAND_EXTRAPOLATION_ESTIMATORS: tuple[str, ...] = (
+    "spectral_shell", "band_index_only")
+BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT: str = "spectral_shell"
+
+#: Bracket for the per-state exponent β, and the bisection depth.
+#:
+#: NOT A MEASURED THRESHOLD, and it must not become one by being tuned.  β is
+#: only meaningful where the local power law is: the measured values run
+#: 3.4–5.3 on the Si arm, an order of magnitude inside both edges.  The
+#: interval is wide on purpose so that a state whose root is NOT in the
+#: physical range hits :data:`SHELL_EXPONENT_EDGE_TOL` and REFUSES rather than
+#: being quietly clipped to a plausible-looking number.  Narrowing it would
+#: convert refusals into clips, which is exactly the failure the owner's
+#: ruling forbids.
+SHELL_EXPONENT_BRACKET: tuple[float, float] = (0.05, 40.0)
+SHELL_EXPONENT_BISECTIONS: int = 80
+
+#: A root this close (in β) to either bracket edge is a REFUSAL, not a value.
+#: 80 halvings of the interval leave the root located to ~3e-23, so a β that
+#: is still within 4e-5 of an edge means the bisection walked to the wall:
+#: ``f`` did not change sign inside, and what would be returned is the edge
+#: itself dressed up as a solution.
+SHELL_EXPONENT_EDGE_TOL: float = 1.0e-6 * (
+    SHELL_EXPONENT_BRACKET[1] - SHELL_EXPONENT_BRACKET[0])
+
+#: Offsets scanned when fitting ``E_n = E₀ + C·(n + n₀)^(2/3)``.  n₀ is a
+#: single integer shift of the band ladder, so an integer scan is the whole
+#: parameter space; on the Si deck the minimum lands at n₀ = 0.
+WEYL_N0_SCAN: tuple[float, float, float] = (0.0, 200.0, 1.0)
+
+#: Per-state failure codes.  Index into :data:`SHELL_FAILURE_REASONS`.
+SHELL_OK = 0
+SHELL_FAIL_SIGN = 1
+SHELL_FAIL_ZERO = 2
+SHELL_FAIL_NO_ROOT = 3
+SHELL_FAIL_EDGE = 4
+
+SHELL_FAILURE_REASONS = {
+    SHELL_OK: "ok",
+    SHELL_FAIL_SIGN: (
+        "D2 and D3 have OPPOSITE SIGN: the two observed shells disagree "
+        "about which way the band sum is still moving, so there is no tail "
+        "to integrate and |D3/D2| is not a decay ratio"),
+    SHELL_FAIL_ZERO: (
+        "D2 or D3 is exactly zero: the shell increment carries no "
+        "information about the falloff and the ratio is undefined"),
+    SHELL_FAIL_NO_ROOT: (
+        "no bracketed root: log I3(b) - log I2(b) - log|D3/D2| does not "
+        "change sign across the exponent bracket, so the observed shell "
+        "ratio is not reachable by ANY power law on this spectrum"),
+    SHELL_FAIL_EDGE: (
+        "the root is pressed against a bracket edge: the bisection walked "
+        "to the wall rather than converging inside, and returning the edge "
+        "would be a CLIP reported as a fit"),
+}
+
+
+class SpectralShellExtrapolationFailed(BandExtrapolationRefused):
+    """The spectral-shell estimator refused on at least one external state.
+
+    A separate name from :class:`BandExtrapolationRefused` because the fix is
+    different in kind: the other refusals are about a deck asking for
+    something the band counts cannot support, and the operator clears them by
+    raising ``number_bands_sigma``.  This one is about the DATA — two shells
+    that disagree about the sign of the remaining tail, or a shell ratio no
+    power law on this spectrum can produce.  Subclassed so an ``except
+    BandExtrapolationRefused`` that means "the extrapolation cannot run here"
+    still catches it.
+
+    WHY THIS IS A RUN-LEVEL REFUSAL AND NOT A PER-STATE FALLBACK.  The owner's
+    ruling is that a failed state says so and no value is substituted for it.
+    A ``NaN`` left in Σ would propagate into the QP Hamiltonian and take the
+    whole spectrum with it silently; falling back to ``S(N₃)`` or to the 1/N
+    fit on the failed states would ship a Σ assembled from two estimators with
+    nothing in the artifact recording which states came from which.  So the
+    run stops, names every failed state and its reason, and offers the two
+    honest ways forward: more bands, or ``band_extrapolation_estimator =
+    band_index_only``.
+    """
+
+
+@dataclass(frozen=True)
+class BandLadder:
+    """The DFT-only spectral ladder the shell moments are built on.
+
+    Nothing in here is derived from Σ.  It is the mean-field eigenvalue
+    sequence, its k-point weights, the band-manifold bottom ``E₀`` from the
+    Weyl fit, the conditioning scale ``E*``, and the finite-basis endpoint
+    ``N_T`` — the four things the estimator needs and the only four.
+
+    Band indices are 1-BASED and ABSOLUTE (band 1 is the lowest band in the
+    WFN), because the Weyl counting law ``E_n = E₀ + C(n + n₀)^(2/3)`` counts
+    from the bottom of the band manifold.  Callers whose Σ band sum starts
+    above band 1 pass their cuts through :meth:`absolute`.
+
+    Attributes
+    ----------
+    e_dft_ev : (n_dft, nk) float
+        DFT eigenvalues in eV, band-major.  Exactly what the WFN carries.
+    e_weyl_ev : (n_target - n_dft,) float
+        The ladder continued past the WFN's band count by the Weyl form.
+        k-INDEPENDENT by construction: the fit is to the k-mean, and at these
+        energies the k-dispersion of a band is a vanishing fraction of its
+        distance from E₀.  Used ONLY to extend the eigenvalue sequence.
+    w_k : (nk,) float
+        k-point weights, normalised to sum 1.  Ratios are weight-scale
+        invariant; the normalisation is for conditioning only.
+    e0_ev, n0, c_ev, r2 : float
+        The Weyl fit: ``E_n = e0_ev + c_ev·(n + n0)^(2/3)``, and its R².
+    estar_ev : float
+        The conditioning scale.  Cancels from every ratio (see the module
+        docstring); it exists so the powers stay off the exponent rails.
+    n_dft, n_target : int
+        The WFN's band count and the endpoint the tail is integrated to.
+    fit_window : (int, int)
+        The 1-based inclusive band range the Weyl fit used.
+    b0 : int
+        The absolute index of the band the caller's cuts are measured from
+        (0 when the Σ band sum starts at the first band, which is the
+        ordinary case).
+    """
+
+    e_dft_ev: np.ndarray
+    e_weyl_ev: np.ndarray
+    w_k: np.ndarray
+    e0_ev: float
+    n0: float
+    c_ev: float
+    r2: float
+    estar_ev: float
+    n_dft: int
+    n_target: int
+    fit_window: tuple[int, int]
+    b0: int = 0
+
+    def absolute(self, count: int) -> int:
+        """A caller's Σ-relative band count as an absolute band index."""
+        return int(count) + int(self.b0)
+
+    # ── the moments ─────────────────────────────────────────────────────
+    def log_moment(self, lo: int, hi: int, beta) -> np.ndarray:
+        """``log I(β)`` over ABSOLUTE bands ``(lo, hi]``, vectorised over β.
+
+        Computed as a log-sum-exp so that the ``x^(-β)`` powers cannot
+        overflow or flush to zero at the large β the bracket admits — which
+        is the only reason ``E*`` is not load-bearing here.
+
+        ``β`` may be a scalar or any array; the return has ``β``'s shape.
+        Bands whose ``ε − E₀`` is non-positive (there are none above the
+        occupied manifold on a converged mean field, but the ladder is not
+        assumed) contribute nothing and are dropped, not clamped.
+        """
+        b = np.asarray(beta, dtype=np.float64)
+        flat = b.ravel()
+        terms = []                      # each (n_terms, n_beta)
+        lo = int(lo)
+        hi = int(hi)
+
+        lo_d, hi_d = min(lo, self.n_dft), min(hi, self.n_dft)
+        if hi_d > lo_d:
+            x = (self.e_dft_ev[lo_d:hi_d] - self.e0_ev) / self.estar_ev
+            ok = x > 0.0
+            lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
+            lg = lg.reshape(-1, 1) * flat[None, :]
+            lgw = np.log(self.w_k)
+            lg = lg + np.tile(lgw, hi_d - lo_d)[:, None]
+            terms.append(np.where(np.isnan(lg), -np.inf, lg))
+
+        lo_w, hi_w = max(lo, self.n_dft), max(hi, self.n_dft)
+        if hi_w > lo_w:
+            x = ((self.e_weyl_ev[lo_w - self.n_dft:hi_w - self.n_dft]
+                  - self.e0_ev) / self.estar_ev)
+            ok = x > 0.0
+            lg = np.where(ok, -np.log(np.where(ok, x, 1.0)), np.nan)
+            # The extended ladder is k-independent, so each extended band
+            # carries the FULL k weight (which sums to 1) exactly once.
+            lg = lg.reshape(-1, 1) * flat[None, :]
+            terms.append(np.where(np.isnan(lg), -np.inf, lg))
+
+        if not terms:
+            return np.full(b.shape, -np.inf)
+        allt = np.concatenate(terms, axis=0)
+        m = np.max(allt, axis=0)
+        out = np.where(
+            np.isfinite(m),
+            m + np.log(np.sum(np.exp(allt - np.where(np.isfinite(m), m, 0.0)),
+                              axis=0)),
+            -np.inf)
+        return out.reshape(b.shape)
+
+    def moment(self, lo: int, hi: int, beta) -> np.ndarray:
+        """``I(β)`` over ABSOLUTE bands ``(lo, hi]``."""
+        return np.exp(self.log_moment(lo, hi, beta))
+
+    def describe(self) -> str:
+        return (
+            f"DFT ladder: E0 = {self.e0_ev:.4f} eV, n0 = {self.n0:g}, "
+            f"C = {self.c_ev:.6f} eV, R^2 = {self.r2:.5f} over bands "
+            f"[{self.fit_window[0]}, {self.fit_window[1]}]; E* = "
+            f"{self.estar_ev:.3f} eV; N_dft = {self.n_dft}, "
+            f"N_T = {self.n_target}")
+
+
+def weyl_ladder_fit(e_mean_ev: np.ndarray, lo: int, hi: int) -> tuple:
+    """Fit ``E_n = E₀ + C·(n + n₀)^(2/3)`` to the k-mean DFT ladder.
+
+    THE FREE-ELECTRON COUNTING LAW, USED AS A LADDER AND NOTHING ELSE.  In a
+    finite volume the number of plane-wave states below E grows as
+    ``(E − E₀)^{3/2}``, so the n-th one sits at ``E₀ + C·n^{2/3}``.  That is
+    a statement about counting, not about the material, which is why it
+    describes a real band ladder well enough to extend it (R² = 0.99975 on
+    the Si 50 Ry deck) while saying nothing about any matrix element.
+
+    ``n₀`` is scanned over :data:`WEYL_N0_SCAN` rather than fitted, because
+    for fixed ``n₀`` the model is LINEAR in ``(1, (n + n₀)^{2/3})`` and the
+    scan is therefore a sequence of exact least squares rather than a
+    nonlinear optimisation.  The module has a standing rule against
+    introducing a nonlinear fit into this estimator.
+
+    Parameters
+    ----------
+    e_mean_ev : (n_band,) float
+        Band energies in eV, averaged over k, indexed from band 1.
+    lo, hi : int
+        1-based inclusive band range to fit over.
+
+    Returns
+    -------
+    (e0_ev, n0, c_ev, r2)
+    """
+    e_mean_ev = np.asarray(e_mean_ev, dtype=np.float64)
+    lo, hi = int(lo), int(hi)
+    if not (1 <= lo < hi <= e_mean_ev.size):
+        raise ValueError(
+            f"weyl_ladder_fit: band window [{lo}, {hi}] is not inside "
+            f"[1, {e_mean_ev.size}]")
+    ns = np.arange(lo, hi + 1, dtype=np.float64)
+    e = e_mean_ev[ns.astype(np.int64) - 1]
+    ss_tot = float(np.sum((e - e.mean()) ** 2))
+    best = None
+    for n0 in np.arange(*WEYL_N0_SCAN):
+        x = (ns + n0) ** (2.0 / 3.0)
+        design = np.vstack([np.ones_like(x), x]).T
+        coef = np.linalg.lstsq(design, e, rcond=None)[0]
+        r = e - design @ coef
+        ss = float(r @ r)
+        if best is None or ss < best[0]:
+            best = (ss, float(coef[0]), float(n0), float(coef[1]))
+    ss, e0, n0, c = best
+    r2 = 1.0 - ss / ss_tot if ss_tot > 0 else float("nan")
+    return e0, n0, c, r2
+
+
+def plane_wave_band_count(ngk, nspinor: int) -> int:
+    """``N_PW`` — the band count at which the sum is EXACTLY complete.
+
+    The one-particle Hilbert space at k has dimension ``ngk(k)·nspinor``, so
+    a band sum reaching that count has summed every state there is and there
+    is nothing beyond it.  ``ngk`` varies by k (1604…1639 on the Si deck);
+    the MINIMUM is the count at which no k-point is still short, and it is
+    the conservative choice — a larger endpoint would ask the ladder to
+    continue past where some k-point has run out of basis.
+    """
+    ngk = np.asarray(ngk).ravel()
+    if ngk.size == 0:
+        raise ValueError("plane_wave_band_count: empty ngk")
+    return int(np.min(ngk)) * int(max(int(nspinor), 1))
+
+
+def build_band_ladder(
+    *,
+    enk_ry: np.ndarray,
+    kweights=None,
+    n_target: int,
+    b0: int = 0,
+    fit_window: "tuple[int, int] | None" = None,
+    estar_window: "tuple[int, int] | None" = None,
+) -> BandLadder:
+    """Assemble the :class:`BandLadder` the shell moments read.
+
+    Parameters
+    ----------
+    enk_ry : (nk, n_dft) float
+        DFT eigenvalues in Ry over the WFN's own k-set and band set —
+        ABSOLUTE band indexing, band 1 first.  This is ``wfn.energies[0]``.
+    kweights : (nk,) float or None
+        k-point weights.  ``None`` means uniform, which is the correct
+        reading of a full-BZ eigenvalue set.  Normalised here.
+    n_target : int
+        ``N_T``.  Ordinarily :func:`plane_wave_band_count`.
+    b0 : int
+        Absolute index of the band the CALLER's cuts are measured from.
+    fit_window : (int, int) or None
+        1-based inclusive band range for the Weyl fit.  ``None`` uses the
+        top 90 % of the DFT ladder, floored at ``b0 + 1``: the Weyl form is
+        asymptotic, so the fit belongs where the ladder already is.
+    estar_window : (int, int) or None
+        1-based inclusive band range whose median ``ε − E₀`` sets ``E*``.
+        ``None`` uses the upper half of the DFT ladder.  ``E*`` cancels from
+        every ratio, so this choice cannot move a result; it only keeps the
+        powers conditioned.
+    """
+    e = np.asarray(enk_ry, dtype=np.float64) * RYD_TO_EV
+    if e.ndim != 2:
+        raise ValueError(
+            f"build_band_ladder: expected (nk, n_band) energies, got "
+            f"shape {np.shape(enk_ry)}")
+    nk, n_dft = e.shape
+    n_target = int(n_target)
+    b0 = int(b0)
+    if n_target <= n_dft and n_target <= b0:
+        raise ValueError(
+            f"build_band_ladder: n_target = {n_target} does not reach past "
+            f"the band offset b0 = {b0}")
+
+    w = (np.full(nk, 1.0 / nk) if kweights is None
+         else np.asarray(kweights, dtype=np.float64).ravel()[:nk])
+    if w.size != nk or not np.all(w > 0):
+        raise ValueError(
+            f"build_band_ladder: need {nk} positive k weights, got {w}")
+    w = w / w.sum()
+
+    e_mean = e.mean(axis=0)
+    if fit_window is None:
+        lo = max(b0 + 1, int(round(0.10 * n_dft)), 1)
+        fit_window = (min(lo, n_dft - 1), n_dft)
+    e0, n0, c, r2 = weyl_ladder_fit(e_mean, *fit_window)
+
+    if estar_window is None:
+        estar_window = (max(1, n_dft // 2), n_dft)
+    lo_s, hi_s = int(estar_window[0]), int(estar_window[1])
+    estar = float(np.median(e[:, lo_s - 1:hi_s] - e0))
+    if not (estar > 0.0):
+        raise ValueError(
+            f"build_band_ladder: E* came out {estar}; the conditioning "
+            f"scale must be positive (bands {estar_window} lie at or below "
+            f"the fitted band bottom E0 = {e0} eV)")
+
+    n_ext = max(0, n_target - n_dft)
+    ns_ext = np.arange(n_dft + 1, n_dft + 1 + n_ext, dtype=np.float64)
+    e_weyl = e0 + c * (ns_ext + n0) ** (2.0 / 3.0)
+
+    return BandLadder(
+        e_dft_ev=np.ascontiguousarray(e.T),          # (n_dft, nk)
+        e_weyl_ev=e_weyl,
+        w_k=w,
+        e0_ev=float(e0),
+        n0=float(n0),
+        c_ev=float(c),
+        r2=float(r2),
+        estar_ev=estar,
+        n_dft=int(n_dft),
+        n_target=n_target,
+        fit_window=(int(fit_window[0]), int(fit_window[1])),
+        b0=b0,
+    )
+
+
+def solve_shell_exponents(ladder: BandLadder, shell2, shell3, ratio):
+    """Bracketed root find for ``β``, one per external state.
+
+    Solves ``log I₃(β) − log I₂(β) − log(ratio) = 0`` on
+    :data:`SHELL_EXPONENT_BRACKET` by bisection, vectorised over the state
+    axis.  ``g(β) = log I₃ − log I₂`` is strictly DECREASING — its derivative
+    is ``⟨log x⟩₂ − ⟨log x⟩₃`` and shell 3 sits above shell 2 — so the root
+    is unique where it exists, which is what makes a bracketed find the right
+    tool and a clip the wrong answer.
+
+    Parameters
+    ----------
+    ladder : BandLadder
+    shell2, shell3 : (int, int)
+        ABSOLUTE band ranges ``(lo, hi]`` of the two observed shells.
+    ratio : array
+        ``|D₃/D₂|`` per state, strictly positive and finite.
+
+    Returns
+    -------
+    (beta, code)
+        ``beta`` is NaN wherever ``code`` is not :data:`SHELL_OK`.
+    """
+    r = np.asarray(ratio, dtype=np.float64)
+    shape = r.shape
+    flat = r.ravel()
+    beta = np.full(flat.shape, np.nan)
+    code = np.full(flat.shape, SHELL_OK, dtype=np.int64)
+
+    bad = ~np.isfinite(flat) | (flat <= 0.0)
+    code[bad] = SHELL_FAIL_ZERO
+    live = ~bad
+    if not live.any():
+        return beta.reshape(shape), code.reshape(shape)
+
+    logr = np.log(flat[live])
+    lo_b, hi_b = SHELL_EXPONENT_BRACKET
+
+    def f(b):
+        return (ladder.log_moment(*shell3, b)
+                - ladder.log_moment(*shell2, b) - logr)
+
+    lo = np.full(logr.shape, float(lo_b))
+    hi = np.full(logr.shape, float(hi_b))
+    flo, fhi = f(lo), f(hi)
+    ok = np.isfinite(flo) & np.isfinite(fhi) & (flo * fhi <= 0.0)
+
+    for _ in range(SHELL_EXPONENT_BISECTIONS):
+        mid = 0.5 * (lo + hi)
+        fm = f(mid)
+        ok &= np.isfinite(fm)
+        take_hi = (flo * fm) <= 0.0
+        hi = np.where(take_hi, mid, hi)
+        fhi = np.where(take_hi, fm, fhi)
+        lo = np.where(take_hi, lo, mid)
+        flo = np.where(take_hi, flo, fm)
+    b = 0.5 * (lo + hi)
+
+    # A ROOT ON THE WALL IS A CLIP, NOT A FIT.  After 80 halvings a genuine
+    # interior root is located to ~1e-22; still sitting on an edge means the
+    # bisection never found a sign change inside.
+    on_edge = ((b - lo_b) <= SHELL_EXPONENT_EDGE_TOL) | (
+        (hi_b - b) <= SHELL_EXPONENT_EDGE_TOL)
+
+    sub_code = np.where(~ok, SHELL_FAIL_NO_ROOT,
+                        np.where(on_edge, SHELL_FAIL_EDGE, SHELL_OK))
+    sub_beta = np.where(sub_code == SHELL_OK, b, np.nan)
+    beta[live] = sub_beta
+    code[live] = sub_code
+    return beta.reshape(shape), code.reshape(shape)
+
+
+@dataclass(frozen=True)
+class SpectralShellFit:
+    """Result of the spectrum-resolved shell estimator.
+
+    Elementwise in the trailing (k, band) state axes, exactly as
+    :class:`ExtrapolationFit` is — every external state carries its own β and
+    its own tail ratio, which is the whole point (see the module docstring's
+    ruling on pooling).
+    """
+
+    counts: np.ndarray            # (3,) int — N₁, N₂, N₃, Σ-RELATIVE
+    s_at_counts: np.ndarray       # (3, ...) — S(N₁), S(N₂), S(N₃)
+    s_inf: np.ndarray             # (...)    — Ŝ; NaN where the state failed
+    beta: np.ndarray              # (...)    — the per-state exponent
+    tail_ratio: np.ndarray        # (...)    — I_tail(β)/I₃(β)
+    delta_tail: np.ndarray        # (...)    — |Ŝ − S(N₃)|
+    d2: np.ndarray                # (...)    — S(N₂) − S(N₁)
+    d3: np.ndarray                # (...)    — S(N₃) − S(N₂)
+    failure: np.ndarray           # (...) int — SHELL_* code
+    ladder: BandLadder
+    shells: tuple                 # ((lo,hi), (lo,hi), (lo,hi)) ABSOLUTE
+
+    @property
+    def n_failed(self) -> int:
+        return int(np.count_nonzero(np.asarray(self.failure) != SHELL_OK))
+
+    @property
+    def n_states(self) -> int:
+        return int(np.size(self.failure))
+
+    def weights(self) -> np.ndarray:
+        """``c`` with ``Ŝ = Σ_b c_b · S(N_b)``, shape ``(3,) + state shape``.
+
+        ``Ŝ = S(N₃) + D₃·r = 0·S(N₁) − r·S(N₂) + (1 + r)·S(N₃)``, so the
+        coefficients are REAL and sum to 1 identically — the same affine
+        property :func:`extrapolation_weights` documents, and for the same
+        reason: a Σ that does not depend on the band count must come through
+        unchanged rather than scaled.
+
+        Unlike the scalar case these carry the state shape, because β does.
+        Refuses on a failed state rather than emitting a coefficient for it.
+        """
+        if self.n_failed:
+            raise SpectralShellExtrapolationFailed(self.failure_report())
+        r = np.asarray(np.real(self.tail_ratio), dtype=np.float64)
+        return np.stack([np.zeros_like(r), -r, 1.0 + r], axis=0)
+
+    def uncertainty(self, quantile: str = "p90") -> np.ndarray:
+        """Extrapolation uncertainty as a fraction of the applied correction.
+
+        THE FRACTION IS THE ONE CALIBRATED FOR ``band_index_only`` and it has
+        NOT been re-calibrated here.  It is carried so the h5 payload and the
+        SC-tolerance block keep the same shape under both estimators, and it
+        is an ENVELOPE, not a per-state bar — see
+        :data:`TAIL_UNCERTAINTY_FRACTION`.  Because ``spectral_shell`` applies
+        a SMALLER correction where it is more accurate, this bar is
+        conservative on the states the held-out test scored; nothing has
+        measured it on the states it did not.
+        """
+        p90, p99 = TAIL_UNCERTAINTY_FRACTION
+        f = {"p90": p90, "p99": p99}[quantile]
+        return f * np.abs(self.delta_tail)
+
+    def at(self, index) -> "SpectralShellFit":
+        """Restrict every field to a subset of the trailing state axes.
+
+        An indexing operation, not a refit: the estimator is elementwise in
+        (k, band).  Same splice discipline as :meth:`ExtrapolationFit.at` —
+        ``s_at_counts`` carries the three-point axis in front.
+        """
+        idx = index if isinstance(index, tuple) else (index,)
+        return SpectralShellFit(
+            counts=self.counts,
+            s_at_counts=self.s_at_counts[(slice(None),) + idx],
+            s_inf=self.s_inf[index],
+            beta=self.beta[index],
+            tail_ratio=self.tail_ratio[index],
+            delta_tail=self.delta_tail[index],
+            d2=self.d2[index],
+            d3=self.d3[index],
+            failure=np.asarray(self.failure)[index],
+            ladder=self.ladder,
+            shells=self.shells,
+        )
+
+    def failure_report(self, *, limit: int = 12) -> str:
+        """Every failed state, named, with its reason.  '' when none failed."""
+        fail = np.asarray(self.failure)
+        idx = np.argwhere(fail != SHELL_OK)
+        if idx.size == 0:
+            return ""
+        d2 = np.real(np.asarray(self.d2))
+        d3 = np.real(np.asarray(self.d3))
+        lines = [
+            f"spectral_shell band extrapolation FAILED on {len(idx)} of "
+            f"{self.n_states} external states.  The estimator does not "
+            f"substitute a value for a failed state and does not clip an "
+            f"exponent to its bracket, so the run stops here.",
+            f"  band counts {tuple(int(c) for c in self.counts)}; shells "
+            f"(absolute band index) 2 = {self.shells[0]}, 3 = "
+            f"{self.shells[1]}, tail = {self.shells[2]}; "
+            f"{self.ladder.describe()}",
+        ]
+        for row in idx[:limit]:
+            key = tuple(int(v) for v in row)
+            reason = SHELL_FAILURE_REASONS[int(fail[key])]
+            lines.append(
+                f"    state {key}: D2 = {d2[key]:+.6e}, D3 = {d3[key]:+.6e} "
+                f"-- {reason}")
+        if len(idx) > limit:
+            lines.append(f"    ... and {len(idx) - limit} more.")
+        lines += [
+            "  TWO HONEST WAYS FORWARD.  Raise `number_bands_sigma` so the "
+            "two shells sit further into the tail where the local power law "
+            "holds; or set `band_extrapolation_estimator = band_index_only` "
+            "to run the incumbent S_inf + A/N fit, which always returns a "
+            "number and whose error against a measured S(508) is 3-10x "
+            "larger (see gw.band_extrapolation's module docstring).",
+        ]
+        return "\n".join(lines)
+
+
+def fit_band_extrapolation_spectral(
+    counts, s_at_counts: np.ndarray, ladder: BandLadder,
+) -> SpectralShellFit:
+    """The spectrum-resolved shell estimator over three points.
+
+    Parameters
+    ----------
+    counts : sequence of int, length 3
+        ``N₁, N₂, N₃`` — the band counts the three cumulative bracket sums
+        reach, in the CALLER's indexing (``ladder.b0`` converts them to
+        absolute band indices).
+    s_at_counts : (3, ...) complex array
+        The cumulative bracket sums, any trailing shape.
+    ladder : BandLadder
+        Built from the DFT eigenvalues alone.
+
+    Returns
+    -------
+    SpectralShellFit
+
+    Notes
+    -----
+    The shell increments are formed on the REAL part for the purpose of the
+    sign test and the ratio: β is a decay exponent of a real, positive
+    spectral falloff, and the imaginary part of Σ_c at a QP energy is a
+    lifetime, not a piece of the same tail.  The correction ``D₃·r`` is then
+    applied to the COMPLEX increment, so Im Σ_c is extrapolated with the same
+    per-state ratio rather than being dropped or fitted separately.
+    """
+    N = np.asarray(counts, dtype=np.int64)
+    S = np.asarray(s_at_counts)
+    if N.ndim != 1 or N.size != 3:
+        raise ValueError(
+            f"fit_band_extrapolation_spectral: need exactly 3 counts, got "
+            f"{N}.  The estimator reads two shell increments, which is three "
+            f"cumulative points.")
+    if S.shape[0] != N.size:
+        raise ValueError(
+            f"fit_band_extrapolation_spectral: S leading axis {S.shape[0]} "
+            f"!= {N.size} counts")
+    if not (N[0] < N[1] < N[2]):
+        raise ValueError(
+            f"fit_band_extrapolation_spectral: band counts {tuple(N)} are "
+            f"not strictly ascending; the shells would be empty or inverted.")
+
+    a1, a2, a3 = (ladder.absolute(int(c)) for c in N)
+    if a3 >= ladder.n_target:
+        raise BandExtrapolationRefused(
+            f"spectral_shell band extrapolation: the largest band count "
+            f"N3 = {int(N[2])} (absolute band {a3}) is already at or past "
+            f"the finite-basis endpoint N_T = {ladder.n_target} "
+            f"(= min(ngk)*nspinor).  There is no tail left to integrate: "
+            f"the band sum is complete, and the honest report is S(N3) "
+            f"itself.  Set `use_band_extrapolation = false`.")
+    shells = ((a1, a2), (a2, a3), (a3, ladder.n_target))
+
+    D2 = S[1] - S[0]
+    D3 = S[2] - S[1]
+    r2, r3 = np.real(D2), np.real(D3)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.abs(r3) / np.abs(r2)
+    beta, code = solve_shell_exponents(ladder, shells[0], shells[1], ratio)
+
+    # The two data-side refusals, applied AFTER the solve so that a state
+    # carrying both gets the more specific reason.
+    zero = (r2 == 0.0) | (r3 == 0.0)
+    sign = ~zero & (np.sign(r2) != np.sign(r3))
+    code = np.where(zero, SHELL_FAIL_ZERO, np.where(sign, SHELL_FAIL_SIGN,
+                                                    code))
+    beta = np.where(code == SHELL_OK, beta, np.nan)
+
+    good = code == SHELL_OK
+    safe_beta = np.where(good, beta, 1.0)
+    log_i3 = ladder.log_moment(*shells[1], safe_beta)
+    log_it = ladder.log_moment(*shells[2], safe_beta)
+    tail_ratio = np.where(good, np.exp(log_it - log_i3), np.nan)
+
+    s_inf = S[2] + D3 * tail_ratio
+    delta_tail = np.abs(s_inf - S[2])
+
+    return SpectralShellFit(
+        counts=N,
+        s_at_counts=S,
+        s_inf=s_inf,
+        beta=beta,
+        tail_ratio=tail_ratio,
+        delta_tail=delta_tail,
+        d2=D2,
+        d3=D3,
+        failure=code,
+        ladder=ladder,
+        shells=shells,
+    )
+
+
+def spectral_trust_verdict(fit: SpectralShellFit) -> str:
+    """One line saying whether the shell ratios support a local power law.
+
+    Unlike :func:`trust_verdict` there is no residual to inspect: the
+    estimator has one unknown and two shells, so it is an interpolant of the
+    ratio by construction and a "fit quality" number would be identically
+    zero.  What CAN be reported is (a) whether every state solved at all, and
+    (b) the spread of the per-state β, which is the estimator's own statement
+    about how differently the states are converging.  A tight spread is not
+    evidence the extrapolation is right; it is evidence the states agree.
+    """
+    if fit.n_failed:
+        return (f"NOT TRUSTWORTHY - {fit.n_failed} of {fit.n_states} states "
+                f"FAILED to produce an exponent (see the failure report); "
+                f"no value was substituted for them.")
+    b = np.asarray(np.real(fit.beta), dtype=np.float64).ravel()
+    b = b[np.isfinite(b)]
+    if b.size == 0:
+        return "NOT TRUSTWORTHY - no finite exponent on any state."
+    lo, med, hi = (float(np.percentile(b, 10)), float(np.median(b)),
+                   float(np.percentile(b, 90)))
+    note = ""
+    if lo < 1.0:
+        note = ("  b < 1 on the lowest decile: a tail that shallow is not "
+                "summable in the way the estimator assumes -- read the "
+                "correction as a lower bound.")
+    return (f"solved on all {fit.n_states} states - beta median {med:.2f}, "
+            f"p10/p90 {lo:.2f}/{hi:.2f}.  The per-state spread IS the "
+            f"resolution this estimator exists to provide; it is not a "
+            f"quality metric.{note}")
+
+
 def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
     """One line saying whether the three points support the 1/N model.
 
@@ -1165,8 +1989,14 @@ def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
             f"intercepts agree to well within the applied correction.")
 
 
-def tolerance_bar_ev(fit: ExtrapolationFit, quantile: str = "p90") -> tuple:
+def tolerance_bar_ev(fit, quantile: str = "p90") -> tuple:
     """``(median, max)`` of the extrapolation uncertainty over all states, eV.
+
+    Takes EITHER fit type.  Both :class:`ExtrapolationFit` and
+    :class:`SpectralShellFit` expose ``uncertainty(quantile)`` as a fraction
+    of their own ``Delta_tail``, and that is the only thing this reads — so
+    the SC-tolerance block below is one code path under both estimators
+    rather than two that could drift.
 
     Two numbers because they answer different questions and the module has a
     standing rule against reporting the max alone: a max over (k, band) is set
@@ -1180,9 +2010,11 @@ def tolerance_bar_ev(fit: ExtrapolationFit, quantile: str = "p90") -> tuple:
     return float(np.median(u)), float(np.max(u))
 
 
-def sc_tolerance_ruling(fit: ExtrapolationFit, tol_ev: float,
+def sc_tolerance_ruling(fit, tol_ev: float,
                         *, quantile: str = "p90") -> tuple:
     """Is the SC convergence tolerance inside the extrapolation's own bar?
+
+    Takes either fit type; see :func:`tolerance_bar_ev`.
 
     Returns ``(inside: bool, text: str)``.  ``text`` is always a block worth
     printing; ``inside`` says whether it is a warning or a statement.
@@ -1272,6 +2104,207 @@ EXTRAP_DATASETS = (
     "sigma_c_extrap_ampl_kn_ev",    # A, the 1/N coefficient
     "sigma_c_extrap_sigma_kn_ev",   # the p90 uncertainty envelope
 )
+
+#: The same, for ``spectral_shell``.  THREE OF THE FOUR NAMES ARE SHARED, and
+#: the fourth is DIFFERENT ON PURPOSE.  ``inf``, ``last`` and ``sigma`` mean
+#: the same thing under both estimators, so a consumer that reads the
+#: extrapolated Σ_c, the un-extrapolated one and the bar needs no fork.  But
+#: ``ampl`` is ``A``, the coefficient of ``1/N`` — a quantity the spectral
+#: estimator does not have and must not appear to have.  Writing β into a
+#: dataset named ``ampl`` would silently redefine a shipped array; the
+#: estimator-specific fourth name is how a reader can tell which estimator
+#: produced the file even without reading the ``estimator`` attribute.
+SPECTRAL_EXTRAP_DATASETS = (
+    "sigma_c_extrap_inf_kn_ev",     # Ŝ, the extrapolated Σ_c
+    "sigma_c_extrap_last_kn_ev",    # S(N₃), the ordinary full-band Σ_c
+    "sigma_c_extrap_beta_kn",       # β, the per-state exponent (dimensionless)
+    "sigma_c_extrap_sigma_kn_ev",   # the p90 uncertainty envelope
+)
+
+
+def spectral_h5_payload(plan: BandBracketPlan, fit: SpectralShellFit,
+                        *, scale: float = 1.0) -> dict:
+    """``sigma_mnk.h5``'s payload for a ``spectral_shell`` run.
+
+    The same four-array contract :func:`extrapolation_h5_payload` documents,
+    with β in place of the 1/N amplitude — see
+    :data:`SPECTRAL_EXTRAP_DATASETS` for why the name changes rather than the
+    meaning of an existing one.  ``β`` is dimensionless, so ``scale`` (a unit
+    conversion) is deliberately NOT applied to it.
+
+    The attributes carry the two facts a reader needs to reproduce the number
+    and cannot get from the arrays: which estimator ran, and the DFT-only
+    ladder it ran on (``E₀``, ``n₀``, ``E*``, ``N_T``, the shells).
+    """
+    def _arr(a):
+        return np.asarray(a, dtype=np.complex128) * scale
+
+    lad = fit.ladder
+    return {
+        "arrays": {
+            "sigma_c_extrap_inf_kn_ev": _arr(fit.s_inf),
+            "sigma_c_extrap_last_kn_ev": _arr(fit.s_at_counts[-1]),
+            "sigma_c_extrap_beta_kn": np.asarray(fit.beta,
+                                                 dtype=np.complex128),
+            "sigma_c_extrap_sigma_kn_ev": _arr(fit.uncertainty("p90")),
+        },
+        "attrs": {
+            "band_extrapolation_estimator": "spectral_shell",
+            "band_counts": np.asarray(plan.counts, dtype=np.int64),
+            "band_counts_requested": np.asarray(plan.requested,
+                                                dtype=np.int64),
+            "bracket_fractions": np.asarray(BRACKET_FRACTIONS,
+                                            dtype=np.float64),
+            "n_occ": int(plan.n_occ),
+            "n_cond": int(plan.n_cond),
+            "shell_bands_absolute": np.asarray(fit.shells, dtype=np.int64),
+            "ladder_e0_ev": float(lad.e0_ev),
+            "ladder_n0": float(lad.n0),
+            "ladder_c_ev": float(lad.c_ev),
+            "ladder_r2": float(lad.r2),
+            "ladder_estar_ev": float(lad.estar_ev),
+            "ladder_n_dft": int(lad.n_dft),
+            "ladder_n_target": int(lad.n_target),
+            "ladder_fit_window": np.asarray(lad.fit_window, dtype=np.int64),
+            "uncertainty_fraction_p90_p99": np.asarray(
+                TAIL_UNCERTAINTY_FRACTION, dtype=np.float64),
+            "verdict": str(spectral_trust_verdict(fit)),
+            "planner_notes": " | ".join(plan.notes) if plan.notes else "",
+        },
+    }
+
+
+def format_spectral_report(
+    plan: BandBracketPlan,
+    fit: SpectralShellFit,
+    *,
+    states: "list[tuple[str, object]] | None" = None,
+    label: str = "Sigma_c",
+    unit: str = "eV",
+    scale: float = 1.0,
+) -> str:
+    """The log block for ``spectral_shell``.  Same requirement as the 1/N one.
+
+    ONE log must carry the full-band value and the extrapolated value side by
+    side with everything that produced it — here the three band counts, the
+    three shells in ABSOLUTE band index, the DFT-only ladder, and the
+    per-state β and tail ratio.  A reader must be able to recompute Ŝ from
+    this block without opening the h5.
+    """
+    def _sg(a):
+        return float(np.real(np.asarray(a))) * scale
+
+    def _mx(a):
+        return float(np.max(np.abs(np.real(np.asarray(a))))) * scale
+
+    nan = float("nan")
+    lad = fit.ladder
+    lines = [
+        f"  -- {label} band-convergence extrapolation "
+        f"(estimator = spectral_shell: one exponent PER STATE from the two "
+        f"shell increments, tail integrated to the finite basis) --",
+        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   "
+        f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
+        f"{plan.counts[-1]}",
+    ]
+    for i, (req, got, (lo, hi), me) in enumerate(zip(
+            plan.requested, plan.counts, plan.bounds, plan.mean_energy_ev)):
+        snap = "" if req == got else f"  (requested {req}, snapped)"
+        lines.append(
+            f"     N{i + 1} = {got:5d}   bracket [{lo:5d}, {hi:5d})   "
+            f"<E> = {me:9.3f} {unit}{snap}")
+    for note in plan.notes:
+        lines.append(f"     NOTE: {note}")
+    lines += [
+        f"     {lad.describe()}",
+        f"       shells (ABSOLUTE band index, half-open at the low end): "
+        f"I2 over {fit.shells[0]}, I3 over {fit.shells[1]}, "
+        f"I_tail over {fit.shells[2]}",
+        f"       N_T = {lad.n_target} is the FINITE PLANE-WAVE BASIS "
+        f"(min(ngk)*nspinor), not infinity: the band sum is exactly complete "
+        f"there and S(inf) names no physical quantity.  Bands "
+        f"{lad.n_dft + 1}..{lad.n_target} come from the Weyl ladder, used to "
+        f"extend the EIGENVALUE SEQUENCE only.",
+    ]
+
+    for slabel, index in (states or []):
+        f1 = fit.at(index)
+        code = int(np.asarray(f1.failure))
+        if code != SHELL_OK:
+            lines += [
+                f"     [{slabel}]",
+                f"       *** FAILED: {SHELL_FAILURE_REASONS[code]}",
+                f"       D2 = {_sg(f1.d2):+12.6f}   D3 = {_sg(f1.d3):+12.6f} "
+                f"{unit}   -- no value is substituted for this state.",
+            ]
+            continue
+        lines += [
+            f"     [{slabel}]",
+            f"       S(N1={plan.counts[0]}) = {_sg(f1.s_at_counts[0]):+12.6f}   "
+            f"S(N2={plan.counts[1]}) = {_sg(f1.s_at_counts[1]):+12.6f}   "
+            f"S(N3={plan.counts[2]}) = {_sg(f1.s_at_counts[2]):+12.6f} {unit}",
+            f"       D2 = {_sg(f1.d2):+12.6f}   D3 = {_sg(f1.d3):+12.6f} "
+            f"{unit}   |D3/D2| = "
+            f"{(abs(_sg(f1.d3) / _sg(f1.d2)) if _sg(f1.d2) else nan):.6f}",
+            f"       beta = {float(np.real(f1.beta)):8.4f}   "
+            f"I_tail/I3 = {float(np.real(f1.tail_ratio)):10.6f}",
+            f"       S(N3) [full {plan.counts[-1]}-band Sigma_c] = "
+            f"{_sg(f1.s_at_counts[-1]):+12.6f} {unit}   ->   "
+            f"S_hat = {_sg(f1.s_inf):+12.6f} {unit}",
+            f"       Delta_tail = {_mx(f1.delta_tail):.6f} {unit}   "
+            f"= D3 * I_tail/I3, the whole correction",
+            f"       S_hat = {_sg(f1.s_inf):+.6f} +/- "
+            f"{_mx(f1.uncertainty('p90')):.6f} (p90) / "
+            f"{_mx(f1.uncertainty('p99')):.6f} (p99) {unit}"
+            f"   <- see below: this bar is INHERITED, not re-calibrated",
+        ]
+
+    b = np.asarray(np.real(fit.beta), dtype=np.float64).ravel()
+    b = b[np.isfinite(b)]
+    lines += [
+        f"     [envelope over ALL (k, band) of the QP window -- an upper "
+        f"bound, NOT the result: it is set by the top of the window, whose "
+        f"Sigma_c is the least converged quantity in the run]",
+        f"       max|S(N3)| = {_mx(fit.s_at_counts[-1]):.6f}   "
+        f"max|S_hat| = {_mx(fit.s_inf):.6f} {unit}   "
+        f"max Delta_tail = {_mx(fit.delta_tail):.6f} {unit}",
+        f"       beta over {fit.n_states} states: median "
+        f"{(float(np.median(b)) if b.size else float('nan')):.3f}, "
+        f"p10/p90 "
+        f"{(float(np.percentile(b, 10)) if b.size else float('nan')):.3f}/"
+        f"{(float(np.percentile(b, 90)) if b.size else float('nan')):.3f}, "
+        f"min/max "
+        f"{(float(b.min()) if b.size else float('nan')):.3f}/"
+        f"{(float(b.max()) if b.size else float('nan')):.3f}   "
+        f"({fit.n_failed} FAILED)",
+        f"       verdict: {spectral_trust_verdict(fit)}",
+        # WHAT THIS ESTIMATOR DOES AND DOES NOT REPORT.  The 1/N block's four
+        # diagnostics do not exist here and their absence must not read as an
+        # omission: they are statements about a two-parameter fit's residual
+        # structure, and this estimator has one unknown and no residual.
+        f"     [reading these] There is NO Delta_model, pair_split, residual "
+        f"or A/N3 here and their absence is not an omission: those are "
+        f"properties of a two-parameter LEAST SQUARES through three points.  "
+        f"This estimator solves ONE unknown from ONE ratio, so it reproduces "
+        f"|D3/D2| exactly by construction and a residual would be "
+        f"identically zero.",
+        f"       The per-state beta spread IS the diagnostic.  It is the "
+        f"resolution the estimator exists to provide -- valence and "
+        f"conduction states converge differently -- and it is NOT a quality "
+        f"metric: states agreeing on beta is not evidence that beta is "
+        f"right.",
+        f"       The +/- is {100*TAIL_UNCERTAINTY_FRACTION[0]:.0f} % / "
+        f"{100*TAIL_UNCERTAINTY_FRACTION[1]:.0f} % of Delta_tail -- the "
+        f"envelope CALIBRATED FOR band_index_only AND NOT RE-DERIVED HERE.  "
+        f"Held out against a measured S(508) this estimator's median error "
+        f"is 3-10x smaller than that one's, so the bar is conservative on "
+        f"the states that test covered and unmeasured on the rest.  It "
+        f"covers the EXTRAPOLATION only -- not the difference from "
+        f"BerkeleyGW, the ISDF basis, or the W-side band count.",
+    ]
+    if fit.n_failed:
+        lines.append("     " + fit.failure_report().replace("\n", "\n     "))
+    return "\n".join(lines)
 
 
 def extrapolation_h5_payload(plan: BandBracketPlan, fit: ExtrapolationFit,
@@ -1439,19 +2472,42 @@ def format_extrapolation_report(
 __all__ = [
     "BRACKET_FRACTIONS",
     "EXTRAP_DATASETS",
+    "SPECTRAL_EXTRAP_DATASETS",
     "TAIL_UNCERTAINTY_FRACTION",
+    "BAND_EXTRAPOLATION_ESTIMATORS",
+    "BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT",
+    "SHELL_EXPONENT_BRACKET",
+    "SHELL_EXPONENT_BISECTIONS",
+    "SHELL_EXPONENT_EDGE_TOL",
+    "SHELL_FAILURE_REASONS",
+    "SHELL_OK",
+    "SHELL_FAIL_SIGN",
+    "SHELL_FAIL_ZERO",
+    "SHELL_FAIL_NO_ROOT",
+    "SHELL_FAIL_EDGE",
     "extrapolation_h5_payload",
     "extrapolation_weights",
+    "spectral_h5_payload",
     "BandBracketCountMismatch",
     "BandBracketPlan",
     "BandExtrapolationRefused",
+    "BandLadder",
+    "SpectralShellExtrapolationFailed",
+    "SpectralShellFit",
     "assert_brackets_match_ols_abscissae",
+    "build_band_ladder",
     "ExtrapolationFit",
     "fit_band_extrapolation",
+    "fit_band_extrapolation_spectral",
     "format_extrapolation_report",
+    "format_spectral_report",
     "plan_band_brackets",
+    "plane_wave_band_count",
     "sc_tolerance_ruling",
+    "solve_shell_exponents",
+    "spectral_trust_verdict",
     "tolerance_bar_ev",
     "trivial_plan",
     "trust_verdict",
+    "weyl_ladder_fit",
 ]

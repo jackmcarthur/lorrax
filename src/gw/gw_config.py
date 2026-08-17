@@ -40,6 +40,14 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 
+# The estimator vocabulary lives with the estimators, not here: a second copy
+# of the value list is a second thing to keep in step.  ``band_extrapolation``
+# imports only ``common``, so this cannot cycle.
+from .band_extrapolation import (
+    BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
+    BAND_EXTRAPOLATION_ESTIMATORS,
+)
+
 
 # ---------------------------------------------------------------------------
 #  Environment grammar — ONE boolean vocabulary for the GW init/config layer
@@ -1582,6 +1590,32 @@ _DEFAULTS = {
     # false" from "the deck said nothing", and only the former can turn the
     # feature off.
     "sigma_band_extrapolation": None,
+    # WHICH band-convergence estimator consumes the three bracket sums.
+    # Both read the SAME three points; they differ only in what they do with
+    # them, so this key costs nothing and changes no compute.
+    #
+    #   spectral_shell   DEFAULT since 2026-08-17.  Solves one decay exponent
+    #                    PER EXTERNAL STATE from the ratio of the two observed
+    #                    shell increments against spectral moments of the DFT
+    #                    eigenvalues, then integrates the remaining tail to
+    #                    the finite plane-wave basis N_PW = min(ngk)*nspinor.
+    #                    Held out against a MEASURED S(508) on the Si 50 Ry
+    #                    508-band arm its median error is 4.7 / 14.7 / 12.5 /
+    #                    0.7 / 0.0 meV at N_max = 152 / 204 / 260 / 296 / 396,
+    #                    against 45.8 / 29.7 / 17.5 / 12.6 / 3.5 for the
+    #                    incumbent.  REFUSES BY NAME on a state whose two
+    #                    shells disagree in sign or whose exponent has no
+    #                    bracketed root -- it never clips and never
+    #                    substitutes.
+    #   band_index_only  The incumbent two-parameter S_inf + A/N least
+    #                    squares, under its honest name: the band INDEX is the
+    #                    only thing it looks at.  Kept, selectable, and
+    #                    bit-for-bit unchanged -- it is the same code path.
+    #
+    # See gw.band_extrapolation's module docstring for both derivations, the
+    # held-out table and the owner rulings (beta is per-state and is never
+    # pooled; the ladder comes from the DFT eigenvalues only).
+    "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
     # when ``mpa_material_class = metal``; refused under insulator.  These
@@ -1667,6 +1701,7 @@ _NORMALIZE_STR = {
     "sc_head_update",
     "wcoul0_source", "screening_method", "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
+    "band_extrapolation_estimator",
     "occ_smearing_family",
     "w_dyson_solver",
     "ppm_invalid_mode",
@@ -2654,6 +2689,12 @@ class DynamicSigmaConfig:
     #: Did a deck NAME either spelling?  Selects between auto-disabling and
     #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.
     band_extrapolation_explicit: bool = False
+    #: WHICH estimator consumes the three bracket sums --
+    #: ``spectral_shell`` (default) or ``band_index_only``.  Read once, by
+    #: ``gw.ppm_pipeline``.  It selects nothing about the COMPUTE: both
+    #: estimators read the same three points the same brackets produce, so
+    #: this is a post-processing choice and switching it re-does no Sigma.
+    band_extrapolation_estimator: str = BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -2667,6 +2708,22 @@ class DynamicSigmaConfig:
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
+        # REFUSE an unrecognised estimator, naming both, rather than falling
+        # back to the default.  A misspelling that silently ran the default
+        # would be an A/B measuring nothing -- the same rule
+        # ``screening_method`` states above, for the same reason.
+        if self.band_extrapolation_estimator not in (
+                BAND_EXTRAPOLATION_ESTIMATORS):
+            raise ValueError(
+                f"band_extrapolation_estimator = "
+                f"{self.band_extrapolation_estimator!r} is not a known "
+                f"band-convergence estimator.  The two are: 'spectral_shell' "
+                f"(the DEFAULT -- one decay exponent per external state from "
+                f"the two shell increments against spectral moments of the "
+                f"DFT eigenvalues, tail integrated to the finite plane-wave "
+                f"basis) and 'band_index_only' (the incumbent two-parameter "
+                f"S_inf + A/N least squares).  Both consume the SAME three "
+                f"bracket sums; neither changes what is computed.")
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
@@ -3644,6 +3701,9 @@ class LorraxConfig:
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
+            band_extrapolation_estimator=str(
+                _g("band_extrapolation_estimator")
+                or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
             **dict(zip(
                 ("band_extrapolation", "band_extrapolation_explicit"),
                 resolve_band_extrapolation(
