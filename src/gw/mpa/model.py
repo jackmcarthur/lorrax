@@ -369,9 +369,16 @@ def _evaluate_samples(
     metal = config.mpa.material_class != "insulator"
     _require_metal_occupations(config, occupation_state)
     omega_m = float(quad.x_max)
+    # ONE occupancy window for the whole fit: the rule bandwidth below and
+    # every fractional-chi call in this function read the same deck value, so
+    # the damped-line rule can never be sized for transitions the band slices
+    # no longer contain.  Same key, same default and same predicate as the
+    # Sigma planner's band window (gw.efermi.occupation_weight_floor).
+    occ_window = float(config.mpa.occupation_window_threshold)
     if metal:
         delta_max = occupation_support_bandwidth(
-            wfns.enk, occupation_state.f_kn)
+            wfns.enk, occupation_state.f_kn,
+            occupation_window_threshold=occ_window)
 
     for point in routes["existing"]:
         if not metal:
@@ -411,7 +418,8 @@ def _evaluate_samples(
                 np.asarray([point["z"]], dtype=np.complex128),
                 meta, mesh_xy,
                 occupations=occupation_state.f_kn,
-                energy_reference=float(occupation_state.mu_ry))
+                energy_reference=float(occupation_state.mu_ry),
+                occupation_window_threshold=occ_window)
             write_full(point, chi)
 
     for varpi_i, points in routes["lines"]:
@@ -430,7 +438,8 @@ def _evaluate_samples(
             values = compute_chi0_contour_fractional(
                 wfns, t, h, z, meta, mesh_xy,
                 occupations=occupation_state.f_kn,
-                energy_reference=float(occupation_state.mu_ry))
+                energy_reference=float(occupation_state.mu_ry),
+                occupation_window_threshold=occ_window)
         else:
             tau = np.concatenate((1j * t, -1j * t))
             signs = np.concatenate((np.ones(t.size, np.int8),

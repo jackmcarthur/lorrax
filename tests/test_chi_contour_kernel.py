@@ -249,7 +249,7 @@ def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
     want /= np.sqrt(float(nk))
     np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
 
-    f_slice, u_slice = w_isdf._exact_occupation_support_slices(wfns.occ)
+    f_slice, u_slice = w_isdf._occupation_support_slices(wfns.occ)
     assert f_slice == slice(0, 3)
     assert u_slice == slice(1, 4)
 
@@ -503,7 +503,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
     written = []
     quad = SimpleNamespace(x_max=1.5)
     config = SimpleNamespace(
-        mpa=SimpleNamespace(material_class="metal"),
+        mpa=SimpleNamespace(material_class="metal",
+                            occupation_window_threshold=1.0),
         minimax_config=SimpleNamespace(target_error=1e-6, max_nodes=64))
     state = SimpleNamespace(
         f_kn=np.array([[1.0, 0.5, 0.0]]), mu_ry=0.1,
@@ -534,7 +535,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
     calls.clear()
     written.clear()
     config_i = SimpleNamespace(
-        mpa=SimpleNamespace(material_class="insulator"),
+        mpa=SimpleNamespace(material_class="insulator",
+                            occupation_window_threshold=1.0),
         minimax_config=SimpleNamespace(target_error=1e-6, max_nodes=64))
     monkeypatch.setattr(
         "gw.minimax_screening.build_imag_quadrature",

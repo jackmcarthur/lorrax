@@ -18,6 +18,8 @@ import numpy as np
 
 import minimax
 
+from gw.efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                       band_in_occupation_window, occupation_weight_floor)
 from gw.mpa.evaluator import damped_rectangle_positive_rule
 from gw.minimax_screening import MinimaxNodes
 from gw.ppm_windows import _SigmaBranch, _SigmaWindow
@@ -43,9 +45,12 @@ _INF = np.inf
 #: 500-node safety margin even when mpa_sigma_max_nodes is set lower.
 CROSSING_NODE_FLOOR = 500
 
-#: Deck default for ``occupation_window_threshold`` — see :func:`_weight_floor`
-#: for the occupancy→weight mapping and :func:`_a_space` for the rule itself.
-OCCUPATION_WINDOW_THRESHOLD_DEFAULT = 0.995
+#: ``occupation_window_threshold`` lives in ``gw.efermi`` — ONE default, ONE
+#: occupancy→weight map, ONE predicate, shared with ``gw.ppm_windows`` (the
+#: Σ branch supports) and ``gw.w_isdf`` (the χ₀ occupation supports).  Re-bound
+#: here because this module's callers and tests have imported these names since
+#: the rule was introduced.
+_weight_floor = occupation_weight_floor
 
 
 def _selector(a_hi=_INF, gamma_lo=-_INF, gamma_hi=_INF):
@@ -184,35 +189,6 @@ def _rows_from_summaries(summaries, name, bounds, phase_real):
             np.asarray(phases, dtype=bool), stats)
 
 
-def _weight_floor(occupation_window_threshold):
-    """Map the deck's OCCUPANCY threshold onto a branch-WEIGHT floor.
-
-    The deck key is an occupancy because that is how the knob is reasoned
-    about ("keep a band until it is 99.5% occupied"), but the cut in
-    :func:`_a_space` is on the branch weight, which is ``f`` on the
-    occupied/hole branch and ``1 − f`` on the empty/electron branch
-    (``gw/mpa/sigma.py`` ``val_weight=f, cond_weight=1.0 - f``).  A band at
-    occupancy 0.995 therefore carries weight 0.995 in the val branch and
-    0.005 in the cond branch, and one at occupancy 0.005 the mirror pair, so
-    ONE floor ``1 − threshold`` cuts both branches symmetrically at the same
-    physical distance from a filled/empty state.  Occupancy 0.995 ⇒ floor
-    0.005.
-
-    ``threshold = 1.0`` gives floor 0.0, i.e. ``abs(w) > 0.0`` ≡ ``w != 0.0``
-    — the exact incumbent rule, bit-for-bit.  That is the deliberate escape
-    hatch and the A/B control for this knob.
-    """
-    t = float(occupation_window_threshold)
-    if not (np.isfinite(t) and 0.5 <= t <= 1.0):
-        raise ValueError(
-            "occupation_window_threshold must be an occupancy in [0.5, 1.0]; "
-            f"got {occupation_window_threshold!r}.  It is the occupancy at "
-            "which a band stops counting toward a Green's-function branch; "
-            "the weight floor applied is 1 - threshold.  1.0 reproduces the "
-            "exact `weight != 0` rule.")
-    return 1.0 - t
-
-
 def _a_space(branch, predicate, weight_floor=0.0):
     E = np.asarray(jax.device_get(branch.E_A), dtype=np.float64)
     base = np.asarray(jax.device_get(branch.base_mask_A), dtype=bool)
@@ -228,16 +204,8 @@ def _a_space(branch, predicate, weight_floor=0.0):
         # physical few-widths shell instead (0.995 ⇒ |w| > 0.005 ⇒ about
         # 4.3 widths).  Exact zeros are still excluded, since 0 is not
         # > 0.005, so that history is preserved, not traded away.
-        #
-        # MAGNITUDE, not a one-sided cut.  OccupationState.f_kn is NEVER
-        # clipped (efermi.py: "MP1's overshoot beyond [0, 1] is part of the
-        # configured quadrature"), so a band just above mu carries a
-        # NEGATIVE val weight — down to about -0.035 at the MP1 lobe
-        # minimum.  `w > floor` would silently discard every one of them,
-        # which the incumbent `w != 0.0` kept and which
-        # `mpa: wrong-side fractional states keep their branch's algebra`
-        # (6d3b6b47) exists to route correctly.  `abs(w) > floor` keeps
-        # them and drops only what is genuinely negligible.
+        # The magnitude/never-clipped argument is at
+        # ``gw.efermi.band_in_occupation_window``, which owns the predicate.
         #
         # WIDENING THIS COSTS GEOMETRY, NOT JUST BANDS: the support's
         # min(E_A) sets `excursion` in _geometry, which deepens
@@ -245,8 +213,14 @@ def _a_space(branch, predicate, weight_floor=0.0):
         # sign-definite and crossing quadrature families.  That is the
         # mechanism by which an over-wide support refused outright at
         # -0.53 Ry.  Lower the threshold only with a plan-level A/B.
+        #
+        # REDUNDANT-BY-DESIGN since the same floor is applied to the base
+        # masks at ``ppm_windows.branches_for_omega_grid``: this is the cut
+        # that OWNS the geometry, and it stays here so a branch built by any
+        # other route cannot plan a support the executor does not honour.
+        # Idempotent — same floor, same magnitude rule.
         w = np.asarray(jax.device_get(branch.band_weight), dtype=np.float64)
-        base = base & (np.abs(w) > float(weight_floor))
+        base = base & band_in_occupation_window(w, float(weight_floor))
     mask = base & predicate(E)
     values = E[mask]
     if not values.size:
