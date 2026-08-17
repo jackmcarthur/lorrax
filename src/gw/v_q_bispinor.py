@@ -172,6 +172,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     bdot: np.ndarray | None = None,
     g_chunk: int | None = None,
     bgw_v_grid_fn=None,                         # only meaningful for the CC tile
+    bgw_v_sphere_fn=None,                       # strict production CC override
     print_fn=print,
     verbose: bool = True,
     # IBZ cascade plumbing (default disabled — must opt in via gw_init).
@@ -304,6 +305,17 @@ def compute_V_q_bispinor_g_flat_to_h5(
                     v[qi] = np.where(v_at != 0.0, v_at, v[qi])
                 return v
             v_builder = _v_builder_with_bgw
+        if write_g0 and bgw_v_sphere_fn is not None:
+            _base = v_builder
+
+            def _v_builder_with_bgw_sphere(
+                    q_irr_frac, gvec_components, _base=_base):
+                v = np.asarray(_base(q_irr_frac, gvec_components))
+                for qi in range(q_irr_frac.shape[0]):
+                    v[qi] = np.asarray(bgw_v_sphere_fn(
+                        tuple(q_irr_frac[qi]), gvec_components[qi].T))
+                return v
+            v_builder = _v_builder_with_bgw_sphere
 
         if verbose and jax.process_index() == 0:
             print_fn(f"  [bispinor g-flat] tile "

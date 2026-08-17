@@ -70,7 +70,10 @@ import common.timing as timing
 from .gw_config import (
 	ComputeMode, LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
 from .gw_init import prepare_isdf_and_wavefunctions
-from .compute_vcoul import build_bgw_v_grid_fn
+from .compute_vcoul import (
+	build_bgw_metal_vcoul_source,
+	build_bgw_v_grid_fn,
+)
 from .minimax_screening import build_static_quadrature
 from .screening import compute_screening_model
 from .sigma_dispatch import compute_sigma_xc
@@ -334,11 +337,25 @@ def main(argv=None):
 		wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
 		nspinor=meta.nspinor)
 
+	# The production BGW file is read and validated before any Coulomb
+	# consumer is built.  Its q0 scalar is threaded into the same resolver as
+	# the body table, so Sigma_x/W cannot accidentally use different sources.
+	bgw_metal_vcoul = build_bgw_metal_vcoul_source(
+		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
+
 	# Single resolver for every q→0 head sample we'll need this run; the
 	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
 	# head all read from the same plumbing (overrides → epshead → s_tensor)
 	# so they share one cache.  See ``head_correction.HeadResolver``.
-	head_resolver = HeadResolver(config, input_dir, wfn, sym, meta, print0)
+	head_resolver = HeadResolver(
+		config, input_dir, wfn, sym, meta, print0,
+		bare_vc0_override=(
+			None if bgw_metal_vcoul is None
+			else bgw_metal_vcoul.q0_vcoul_raw),
+		bare_vc0_source=(
+			None if bgw_metal_vcoul is None
+			else f"bgw_metal_vcoul_file={bgw_metal_vcoul.path}"),
+	)
 
 	# Optional BGW vcoul override (purely diagnostic — bit-reproducible BGW
 	# comparisons).  Returns None when ``use_bgw_vcoul`` is False.
@@ -372,6 +389,9 @@ def main(argv=None):
 			tensors_filename=tensors_filename,
 			print0=print0,
 			bgw_v_grid_fn=bgw_v_grid_fn,
+			bgw_v_sphere_fn=(
+				None if bgw_metal_vcoul is None
+				else bgw_metal_vcoul.v_sphere_fn),
 		)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle

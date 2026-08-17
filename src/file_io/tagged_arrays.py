@@ -119,6 +119,7 @@ COULOMB_POLICY_KEYS = (
     "mc_average_placement_vcoul",
     "head_minibz_average",
     "bare_coulomb_cutoff",
+    "bgw_metal_vcoul_file",
     "use_bgw_vcoul",
     "bgw_vcoul_file",
     "sys_dim",
@@ -1255,5 +1256,4 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_rmuT_X_transverse=psi_rmuT_X_T,
         n_rmu_transverse_disk=n_rmu_T_disk,
     )
-
 

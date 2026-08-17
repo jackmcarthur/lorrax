@@ -27,6 +27,7 @@ G-chunked) lives in ``gw.v_q_g_flat`` / ``gw.v_q_bispinor``; nothing in
 this file does FFTs or μ × ν tiling any more.
 """
 
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import h5py
@@ -148,6 +149,7 @@ def compute_all_V_q(
     mc_average_vcoul_body: bool = True,
     bare_coulomb_cutoff: float | None = None,
     bgw_v_grid_fn=None,
+    bgw_v_sphere_fn=None,
     mu_chunk_size: int | None = None,   # legacy arg (allgather path); ignored
     q_batch_size: int | None = None,    # legacy arg (allgather path); ignored
     verbose: bool = True,
@@ -184,6 +186,7 @@ def compute_all_V_q(
             sys_dim=sys_dim, bdot=bdot,
             bare_coulomb_cutoff_ry=bare_coulomb_cutoff,
             bgw_v_grid_fn=bgw_v_grid_fn,
+            bgw_v_sphere_fn=bgw_v_sphere_fn,
             mc_average_vcoul_body=mc_average_vcoul_body,
             g_chunk=(int(g_chunk_size) if g_chunk_size > 0 else None),
             verbose=verbose, sym=sym,
@@ -200,6 +203,184 @@ def compute_all_V_q(
 # Optional BGW vcoul override (moved from gw/gw_driver_helpers.py 2026-07-09
 # — flag-gated diagnostic that belongs with the V_q machinery it feeds).
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BGWMetalVcoulSource:
+    """Validated production BGW Coulomb source.
+
+    ``v_sphere_fn`` maps an explicit q/G sphere to LORRAX's ``v/Omega``
+    convention.  ``q0_vcoul_raw`` remains pre-``1/(Nq*Omega)`` because the
+    scalar head channel applies that factor at its existing reduction seam.
+    """
+
+    v_sphere_fn: Callable[[tuple, np.ndarray], np.ndarray]
+    q0_vcoul_raw: float
+    path: str
+    sha256: str | None
+    n_q: int
+    n_G: int
+
+
+def build_bgw_metal_vcoul_source(
+    config, *, wfn, sym, input_dir: str, print_fn=print,
+) -> BGWMetalVcoulSource | None:
+    """Read, validate, and bind ``bgw_metal_vcoul_file`` to this WFN.
+
+    The file is BGW's formatted, raw-Ry ``write_vcoul`` output.  Validation
+    is intentionally eager: q representatives must match the WFN grid, every
+    q's integer G sphere must match ``bare_coulomb_cutoff``, and all regular
+    values must agree with the WFN reciprocal metric in BGW's 8*pi Ry
+    convention.  The only exempt value is q=0,G=0, which BGW cell-averages.
+    """
+    requested = getattr(config.head, "bgw_metal_vcoul_file", None)
+    if not requested:
+        return None
+
+    from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+    from vcoul import (
+        CoulombGeometry,
+        fill_v_sphere_for_q,
+        read_bgw_vcoul,
+    )
+
+    bgw_path = resolve_input_path(input_dir, requested)
+    table = read_bgw_vcoul(
+        bgw_path, compute_sha256=(jax.process_index() == 0))
+    kgrid = np.asarray(wfn.kgrid, dtype=np.int64)
+    if kgrid.shape != (3,) or np.any(kgrid <= 0):
+        raise ValueError(
+            "bgw_metal_vcoul_file requires a positive 3-D WFN q grid; "
+            f"found {tuple(np.asarray(wfn.kgrid).reshape(-1))}.")
+
+    q_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
+    q_wrapped = np.where(
+        q_int > kgrid[None, :] / 2,
+        q_int - kgrid[None, :], q_int).astype(np.float64)
+    q_expected = q_wrapped / kgrid[None, :]
+    if int(table.q_fracs.shape[0]) != int(q_expected.shape[0]):
+        raise ValueError(
+            "bgw_metal_vcoul_file q-grid mismatch: BGW's first sigma q walk "
+            f"contains {int(table.q_fracs.shape[0])} q points, but the WFN "
+            f"symmetry/q grid requires {int(q_expected.shape[0])} irreducible "
+            f"representatives on {tuple(int(x) for x in kgrid)}.")
+    for q in q_expected:
+        try:
+            table.find_q_index(q, sym_mats_k=None)
+        except ValueError as exc:
+            raise ValueError(
+                "bgw_metal_vcoul_file q-grid mismatch: no BGW first-walk "
+                f"representative matches WFN q={tuple(float(x) for x in q)} "
+                f"on grid {tuple(int(x) for x in kgrid)}.") from exc
+
+    cutoff = (
+        float(wfn.ecutwfc) if config.head.bare_coulomb_cutoff is None
+        else float(config.head.bare_coulomb_cutoff))
+    bvec = CoulombGeometry.from_wfn(wfn).bvec
+    sphere = compute_per_q_bare_coulomb_components(
+        tuple(int(x) for x in wfn.fft_grid), bvec, q_expected, cutoff)
+    components = sphere["gvec_components_padded"]
+    ngk = np.asarray(sphere["ngk_per_q"], dtype=np.int64)
+    cell_volume = float(wfn.cell_volume)
+    sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)
+
+    # Exact set and unit/metric gate.  BGW prints eight digits in E format;
+    # 8e-8 relative comfortably covers last-digit formatting without hiding
+    # a Hartree/Rydberg factor-of-two or a different lattice/cutoff.
+    for iq, q in enumerate(q_expected):
+        G = np.asarray(components[iq, :, :int(ngk[iq])].T, dtype=np.int32)
+        scaled = fill_v_sphere_for_q(
+            table, q, G, cell_volume,
+            sym_mats_k=sym_mats_k, require_exact_sphere=True)
+        K = (q[None, :] + G.astype(np.float64)) @ bvec
+        norm2 = np.einsum("gi,gi->g", K, K)
+        regular = norm2 > 1.0e-13
+        reference_raw = 8.0 * np.pi / norm2[regular]
+        actual_raw = scaled[regular] * cell_volume
+        if not np.allclose(
+                actual_raw, reference_raw, rtol=8.0e-8, atol=2.0e-8):
+            bad = int(np.flatnonzero(~np.isclose(
+                actual_raw, reference_raw, rtol=8.0e-8,
+                atol=2.0e-8))[0])
+            raise ValueError(
+                "bgw_metal_vcoul_file WFN/unit mismatch: a regular value at "
+                f"q={tuple(float(x) for x in q)} differs from BGW's Rydberg "
+                f"8*pi/|q+G|^2 convention (file={actual_raw[bad]:.12e}, "
+                f"WFN={reference_raw[bad]:.12e}). Check that BGW and LORRAX "
+                "use the same WFN, lattice, q grid, and bare_coulomb_cutoff.")
+
+    q0_raw = table.q0_vcoul_raw()
+    counts = [len(g) for g in table.G_miller_per_q]
+    print_fn(
+        "  [bgw metal vcoul provenance] "
+        f"file={bgw_path} sha256={table.sha256 or '<rank0-only>'} "
+        f"n_q={int(table.q_fracs.shape[0])} n_G={table.n_G} "
+        f"(per-q {min(counts)}..{max(counts)}), qgrid="
+        f"{tuple(int(x) for x in kgrid)}, cutoff={cutoff:.8g} Ry; "
+        f"raw q0,G0={q0_raw:.12e}. BGW values replace bare v in Sigma_x "
+        "and W; bgw_q0shift, if selected, still supplies finite-q0 epsinv.")
+
+    def v_sphere_fn(q_frac_tuple, g_miller):
+        # ζ may use a sphere larger than the bare-Coulomb cutoff.  Match the
+        # transformed BGW integer-G set into its padded row explicitly;
+        # unmatched ζ slots remain zero and no numeric vcoul value doubles
+        # as a "missing" marker.
+        requested_G = np.asarray(g_miller, dtype=np.int32)
+        iq, S_k, kg0 = table.find_q_index(
+            q_frac_tuple, sym_mats_k=sym_mats_k)
+        stored_G = np.asarray(table.G_miller_per_q[iq], dtype=np.int32)
+        expected_G = np.einsum(
+            "ij,gj->gi", S_k.astype(np.int32), stored_G) - kg0[None, :]
+        requested_positions: dict[tuple[int, int, int], list[int]] = {}
+        for pos, G in enumerate(requested_G):
+            requested_positions.setdefault(
+                tuple(int(x) for x in G), []).append(pos)
+        missing = []
+        duplicate = []
+        positions = []
+        for G in expected_G:
+            key = tuple(int(x) for x in G)
+            matches = requested_positions.get(key, [])
+            if not matches:
+                missing.append(key)
+            elif len(matches) != 1:
+                duplicate.append((key, len(matches)))
+            else:
+                positions.append(matches[0])
+        if missing or duplicate:
+            raise ValueError(
+                "bgw_metal_vcoul_file G-sphere/cutoff mismatch: the ζ "
+                f"sphere for q={tuple(q_frac_tuple)} is missing "
+                f"{len(missing)} BGW G rows and duplicates {len(duplicate)}; "
+                f"first missing={missing[:3]}, first duplicates={duplicate[:3]}.")
+        positions_arr = np.asarray(positions, dtype=np.int64)
+        logical = fill_v_sphere_for_q(
+            table, q_frac_tuple, requested_G[positions_arr], cell_volume,
+            sym_mats_k=sym_mats_k, require_exact_sphere=True)
+        # LORRAX carries the singular Gamma head as a separate rank-one
+        # scalar channel.  Preserve that decomposition: the file value is
+        # consumed through ``q0_vcoul_raw`` below, not duplicated in V_q.
+        q_bz = np.mod(np.asarray(q_frac_tuple, dtype=np.float64) + 0.5, 1.0) - 0.5
+        if np.all(np.abs(q_bz) < 1.0e-10):
+            g0 = np.flatnonzero(np.all(
+                requested_G[positions_arr] == 0, axis=1))
+            if g0.size != 1:
+                raise ValueError(
+                    "bgw_metal_vcoul_file q=0 sphere must map exactly one "
+                    f"G=(0,0,0) slot; found {int(g0.size)}.")
+            logical[int(g0[0])] = 0.0
+        out = np.zeros(requested_G.shape[0], dtype=np.float64)
+        out[positions_arr] = logical
+        return out
+
+    return BGWMetalVcoulSource(
+        v_sphere_fn=v_sphere_fn,
+        q0_vcoul_raw=q0_raw,
+        path=bgw_path,
+        sha256=table.sha256,
+        n_q=int(table.q_fracs.shape[0]),
+        n_G=table.n_G,
+    )
 
 def build_bgw_v_grid_fn(
     config, *,

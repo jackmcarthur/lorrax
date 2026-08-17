@@ -94,6 +94,41 @@ def test_absent_and_explicit_exact_are_byte_identical(tmp_path):
     assert absent_head == exact_head
 
 
+def test_absent_and_explicit_empty_vcoul_file_are_byte_identical(tmp_path):
+    absent = _config(tmp_path)
+    explicit_empty = _config(tmp_path, "bgw_metal_vcoul_file =\n")
+
+    assert dataclasses.asdict(absent) == dataclasses.asdict(explicit_empty)
+    assert pickle.dumps(absent, protocol=5) == pickle.dumps(
+        explicit_empty, protocol=5)
+    assert _plain_head_number(absent).tobytes() == _plain_head_number(
+        explicit_empty).tobytes()
+
+
+def test_vcoul_file_refuses_legacy_competing_source_by_both_names(tmp_path):
+    with pytest.raises(ValueError) as error:
+        _config(
+            tmp_path,
+            "bgw_metal_vcoul_file = vcoul\n"
+            "use_bgw_vcoul = true\n")
+    message = str(error.value)
+    assert "bgw_metal_vcoul_file" in message
+    assert "use_bgw_vcoul" in message
+
+
+def test_vcoul_file_precedes_q0shift_bare_estimator_and_announces(tmp_path):
+    messages = []
+    cfg = _config(
+        tmp_path,
+        "bgw_metal_q0_treatment = bgw_q0shift\n"
+        "bgw_metal_vcoul_file = vcoul\n",
+        messages=messages)
+    assert cfg.head.bgw_metal_vcoul_file == "vcoul"
+    report = "\n".join(messages)
+    assert "file takes precedence over its analytic bare-head estimator" in report
+    assert "finite-q0 screened W remains enabled" in report
+
+
 def test_bgw_q0shift_overrides_inherited_body_average_and_announces(tmp_path):
     messages = []
     cfg = _config(

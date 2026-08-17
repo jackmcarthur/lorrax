@@ -629,6 +629,7 @@ def compute_all_V_q_g_flat(
     bdot: np.ndarray | None = None,
     bare_coulomb_cutoff_ry: float | None = None,
     bgw_v_grid_fn=None,
+    bgw_v_sphere_fn=None,
     mc_average_vcoul_body: bool = True,
     g_chunk: int | None = None,
     verbose: bool = True,
@@ -697,6 +698,13 @@ def compute_all_V_q_g_flat(
                 iz = miller[2] % nz
                 v_at_sphere = v_full[ix * ny * nz + iy * nz + iz]
                 v[qi] = np.where(v_at_sphere != 0.0, v_at_sphere, v[qi])
+        # Production BGW source: direct integer-G mapping with exact sphere
+        # validation.  This intentionally replaces the complete row rather
+        # than using zero as a "missing" sentinel.
+        if bgw_v_sphere_fn is not None:
+            for qi in range(q_irr_frac.shape[0]):
+                v[qi] = np.asarray(bgw_v_sphere_fn(
+                    tuple(q_irr_frac[qi]), gvec_components[qi].T))
         return v.astype(np.complex128)
 
     return _compute_V_q_g_flat_one_tile(
