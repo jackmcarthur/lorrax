@@ -1057,6 +1057,15 @@ def test_zero_intraband_poles_are_byte_identical_to_legacy(
     MS.allocate_fit_store(
         explicit_zero, **common, n_p_fit=2, intraband_model=None)
     assert legacy.read_bytes() == explicit_zero.read_bytes()
+    for path in (legacy, explicit_zero):
+        for q in range(common["n_q"]):
+            Om, Bp, diag = _fit_block(
+                common["n_p"], common["n_mu"], common["n_mu"],
+                seed=731 + q)
+            MS.write_fit_block(
+                path, q, np.arange(common["n_mu"]), Om, Bp, diag)
+        MS.finalize_fit_store(path, certification=_CERT)
+    assert legacy.read_bytes() == explicit_zero.read_bytes()
 
 
 def test_intraband_block_matches_direct_nonidentity_star_rebuild():
