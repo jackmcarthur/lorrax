@@ -45,8 +45,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from .gw_config import (
-    ComputeMode, SigmaChannel, mode_builds_channels,
-    refuse_unimplemented_compute_mode)
+    ComputeMode, SigmaChannel, band_extrapolation_is_consumable,
+    mode_builds_channels, refuse_unimplemented_compute_mode,
+    sigma_stage_modes)
 
 
 # ---------------------------------------------------------------------------
@@ -596,21 +597,48 @@ def compute_sigma_xc(
     # So the guard splits on PROVENANCE, which is the only thing that
     # distinguishes the two situations:
     #
-    #   explicitly named + non-PPM  ->  REFUSE.  The operator wrote the knob
-    #       down; silently doing nothing with it is exactly how a green A/B
-    #       comes to measure nothing (measurement-discipline rule 1).
-    #   defaulted + non-PPM         ->  DISABLE, and SAY SO.  The run is not
-    #       what the key is for, the key was not asked for, and killing it
-    #       would be refusing a run over a default the operator never chose.
+    #   explicitly named + NO stage can consume it  ->  REFUSE.  The operator
+    #       wrote the knob down and nothing in this run will read it; silently
+    #       doing nothing with it is exactly how a green A/B comes to measure
+    #       nothing (measurement-discipline rule 1).
+    #   defaulted, or a LATER STAGE will consume it ->  DISABLE FOR THIS
+    #       STAGE, and SAY SO.  The stage is not what the key is for, but the
+    #       run may still be, and killing it would refuse a run that works.
     #
     # Both branches keep the physics guard intact: no static-mode Σ is ever
     # extrapolated either way.  What changes is who gets refused.
+    #
+    # ── THE REFUSAL IS ABOUT THE RUN, NOT ABOUT THIS STAGE ──────────────
+    # Corrected 2026-08-16 against the REAL staged-SC interface
+    # (``origin/feat/staged-sc-2026-08-15``, 98289d77), which the wiring
+    # branch had concluded did not exist — from an ``--all`` search in a
+    # single-branch checkout, where ``--all`` covers only fetched refs.
+    # See ``gw_config.sigma_stage_modes`` for the full correction.  The
+    # short form: ``run_staged_self_consistency`` rewrites ``compute_mode``
+    # per stage, so a per-stage DISABLE written against ``compute_mode`` was
+    # already right — but a per-stage REFUSAL is not, because it kills the
+    # run before the stage that would have consumed the key.  Two shipped
+    # configurations it would have killed:
+    #
+    #   sc_stage_1_type = cohsex, sc_stage_2_type = gnppm
+    #       -> dies at stage 1, one stage short of the consumer.
+    #   compute_mode = mpa  (the DEFAULT ladder is GN_PPM then MPA)
+    #       -> dies at stage 2, after paying for a full GN-PPM stage.
+    #
+    # Asking the LADDER instead makes both runnable and still refuses the
+    # case the guard was written for: an explicit key on a run in which no
+    # stage is a plasmon-pole model.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
         explicit = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
-        if explicit:
+        run_modes = sigma_stage_modes(config, fallback=mode)
+        consumable = band_extrapolation_is_consumable(run_modes)
+        ladder = " -> ".join(getattr(m, "value", str(m)) for m in run_modes)
+        if explicit and not consumable:
             raise NotImplementedError(
-                f"use_band_extrapolation = true with compute_mode = "
+                f"use_band_extrapolation = true, but NO stage of this run "
+                f"consumes it.  This run's Σ schemes are [{ladder}]; the "
+                f"stage refusing here is compute_mode = "
                 f"{getattr(mode, 'value', mode)}.  The band-convergence "
                 f"extrapolation is wired into the two-point plasmon-pole Σ_c "
                 f"kernel only (gn_ppm / hl_ppm), and this is a CORRECTNESS "
@@ -619,23 +647,48 @@ def compute_sigma_xc(
                 f"the exact answer by ~340 meV and gets WORSE with more bands "
                 f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
                 f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
-                f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, or "
-                f"set use_band_extrapolation = false.  (This deck NAMES the "
-                f"key; had it been left at its default the feature would have "
-                f"disabled itself here with a note instead of refusing.)")
+                f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, add "
+                f"a gnppm stage to the sc_stage_N_type ladder, or set "
+                f"use_band_extrapolation = false.  (This deck NAMES the key; "
+                f"had it been left at its default the feature would have "
+                f"disabled itself here with a note instead of refusing.  A "
+                f"ladder containing ANY gn_ppm / hl_ppm stage also does not "
+                f"refuse — the non-PPM stages in it disable themselves and the "
+                f"run continues.)")
         # AUTO-DISABLED, LOUDLY.  Printed at the Σ seam every iteration
         # rather than once at startup: a staged run changes mode between
         # stages, and the fact "this stage did not extrapolate" belongs
         # beside that stage's Σ, not in a banner scrolled past an hour ago.
+        if explicit:
+            why = (f"this deck NAMES the key and a PPM stage in this run's "
+                   f"ladder [{ladder}] will consume it — this stage is not "
+                   f"that one, so it is skipped here rather than refusing "
+                   f"the run")
+        else:
+            why = ("no deck key named it; use_band_extrapolation defaults on")
+        # The JUSTIFICATION differs by stage kind and must not be recited
+        # wrongly.  A static mode gets the measured static-CH anti-convergence;
+        # MPA is DYNAMIC, so that measurement is not about it, and claiming it
+        # were would be inventing evidence.
+        if getattr(mode, "is_dynamic", False):
+            because = (
+                "MPA is dynamic, so the static Coulomb-hole measurement below "
+                "is NOT the reason here: the reason is that the 1/N -> 0 "
+                "limit has never been measured for this ansatz and its Σ_c is "
+                "not built by the bracketed two-point PPM kernel, so there is "
+                "no bracket axis to fit.  Extrapolating it would be an "
+                "unvalidated claim, not a correction")
+        else:
+            because = (
+                "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
+                "static Coulomb hole: measured against BerkeleyGW's exact "
+                "static CH it ANTI-converges, 94.9 -> 288.2 meV MAE as nband "
+                "goes 60 -> 124, overshooting by ~340 meV, while GN-PPM "
+                "improves 171.3 -> 32.8 over the same range")
         print_fn(
             f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
-            f"{getattr(mode, 'value', mode)} (no deck key named it; "
-            f"use_band_extrapolation defaults on).  The 1/N -> 0 limit is "
-            f"MODE-DEPENDENT and is wrong for a static Coulomb hole: "
-            f"measured against BerkeleyGW's exact static CH it ANTI-converges, "
-            f"94.9 -> 288.2 meV MAE as nband goes 60 -> 124, overshooting by "
-            f"~340 meV, while GN-PPM improves 171.3 -> 32.8 over the same "
-            f"range.  This stage's Σ is the ordinary full-band sum.")
+            f"{getattr(mode, 'value', mode)} ({why}).  {because}.  "
+            f"This stage's Σ is the ordinary full-band sum.")
         # NOTHING IS REBOUND HERE, deliberately.  ``config.sigma.
         # band_extrapolation`` is read in exactly one place — the GN/HL-PPM
         # pipeline's ``plan_band_brackets`` call — and this branch is the one
