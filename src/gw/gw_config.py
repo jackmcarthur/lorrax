@@ -1286,6 +1286,16 @@ _DEFAULTS = {
     # (lu → local with a DeprecationWarning; lstsq was removed.)
     "w_dyson_solver": "auto",
     "mc_average_vcoul_body": True,
+    # One explicit BerkeleyGW-emulation contract for the metallic q=0 cell.
+    # ``exact`` is the shipped LORRAX limit.  ``bgw_q0shift`` bundles the
+    # three BGW conventions that must move together: no finite-q body-slot
+    # averaging, the analytic-sphere q=0 bare-head estimator, and screening
+    # sampled at a finite shifted q0.  It deliberately does not select an
+    # occupation/spectral broadening or an MPA quadrature.
+    "bgw_metal_q0_treatment": "exact",
+    # Reduced reciprocal coordinates of BGW's epsilon q0 sample.  The
+    # shipping comparison grid is 8x8x8, so (0,0,1/8) is one grid step.
+    "bgw_metal_q0_vector": "0 0 0.125",
     # WHERE the q != 0 mini-BZ Coulomb average is APPLIED.  Orthogonal to
     # ``mc_average_vcoul_body``, which decides WHETHER an average is computed.
     #   "off"  (default) -- today's placement: <v> is substituted into the
@@ -1985,6 +1995,42 @@ def _normalize_placement(value):
     return normalize_placement(value)
 
 
+BGW_METAL_Q0_TREATMENTS = ("exact", "bgw_q0shift")
+
+
+def _normalize_bgw_metal_q0_treatment(value) -> str:
+    mode = str(value or "exact").strip().lower()
+    if mode not in BGW_METAL_Q0_TREATMENTS:
+        raise ValueError(
+            f"bgw_metal_q0_treatment = {value!r} is not recognised; expected "
+            "'exact' or 'bgw_q0shift'.")
+    return mode
+
+
+def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
+    """Parse one reduced-coordinate q0 vector without guessing its units."""
+    raw = str(value or "").replace(",", " ").split()
+    if len(raw) != 3:
+        raise ValueError(
+            "bgw_metal_q0_vector must contain exactly three reduced "
+            f"reciprocal coordinates; got {value!r}.")
+    try:
+        q0 = tuple(float(component) for component in raw)
+    except ValueError as exc:
+        raise ValueError(
+            "bgw_metal_q0_vector must contain three finite numbers; "
+            f"got {value!r}.") from exc
+    if not all(np.isfinite(component) for component in q0):
+        raise ValueError(
+            "bgw_metal_q0_vector must contain three finite numbers; "
+            f"got {value!r}.")
+    if max(abs(component) for component in q0) <= 1.0e-14:
+        raise ValueError(
+            "bgw_metal_q0_vector must be nonzero: BerkeleyGW's metallic "
+            "epsilon q0 sample is a shifted grid point.")
+    return q0
+
+
 @dataclass(frozen=True)
 class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs.
@@ -2001,6 +2047,8 @@ class HeadConfig:
     whead_0freq: float | None     # explicit override W_h[ω=0]
     whead_imfreq: float | None    # explicit override W_h[iω_p]
     mc_average_vcoul_body: bool
+    bgw_metal_q0_treatment: str   # "exact" | "bgw_q0shift"
+    bgw_metal_q0_vector: tuple[float, float, float]
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
@@ -2011,6 +2059,15 @@ class HeadConfig:
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
     bgw_vcoul_sym_wfn: str | None
+
+    @property
+    def uses_bgw_metal_q0shift(self) -> bool:
+        return self.bgw_metal_q0_treatment == "bgw_q0shift"
+
+    @property
+    def analytic_q0_sphere(self) -> bool:
+        """Whether the q=0 bare head uses the analytic-sphere split."""
+        return self.head_minibz_average or self.uses_bgw_metal_q0shift
 
 
 @dataclass(frozen=True)
@@ -2925,6 +2982,55 @@ class LorraxConfig:
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
 
+        # Resolve the bundled metallic q0 contract before constructing any
+        # typed group.  ``mc_average_vcoul_body`` defaults to true for every
+        # historical deck, but BGW's noavg metal comparison requires false.
+        # Only an EXPLICIT contradictory value refuses: an absent key is the
+        # compatibility case this bundle exists to override, while an
+        # explicit false is already compatible and remains visible in the
+        # provenance line.
+        _bgw_q0_mode = _normalize_bgw_metal_q0_treatment(
+            _g("bgw_metal_q0_treatment"))
+        _bgw_q0_vector = _parse_bgw_metal_q0_vector(
+            _g("bgw_metal_q0_vector"))
+        if _bgw_q0_mode == "bgw_q0shift" and int(_g("sys_dim")) != 3:
+            raise ValueError(
+                "bgw_metal_q0_treatment = bgw_q0shift is defined only for "
+                "3-D metals (sys_dim = 3); this deck sets "
+                f"sys_dim = {int(_g('sys_dim'))}.")
+        _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
+        _effective_named_keys = set(_named_keys)
+        if _bgw_q0_mode == "exact":
+            # An explicit spelling of the shipping default must serialize to
+            # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
+            # otherwise the one field that would distinguish them.
+            _effective_named_keys.discard("bgw_metal_q0_treatment")
+            if _bgw_q0_vector == _parse_bgw_metal_q0_vector(
+                    _DEFAULTS["bgw_metal_q0_vector"]):
+                _effective_named_keys.discard("bgw_metal_q0_vector")
+        _mc_average_vcoul_body = bool(_g("mc_average_vcoul_body"))
+        if _bgw_q0_mode == "bgw_q0shift":
+            if ("mc_average_vcoul_body" in _named_keys
+                    and _mc_average_vcoul_body):
+                raise ValueError(
+                    "contradictory deck settings: "
+                    "bgw_metal_q0_treatment = bgw_q0shift requires "
+                    "mc_average_vcoul_body = false, but the deck explicitly "
+                    "sets mc_average_vcoul_body = true. Remove that key or "
+                    "set it to false.")
+            _mc_origin = (
+                "explicit compatible mc_average_vcoul_body=false"
+                if "mc_average_vcoul_body" in _named_keys
+                else "inherited mc_average_vcoul_body=true")
+            print_fn(
+                "  [config provenance] bgw_metal_q0_treatment="
+                "bgw_q0shift: overriding mc_average_vcoul_body -> false "
+                f"({_mc_origin}); q0 reduced vector="
+                f"{_bgw_q0_vector}. Analytic-sphere v-head and finite-q0 "
+                "W head/wings are enabled; eta/broadening and MPA "
+                "quadrature are unchanged.")
+            _mc_average_vcoul_body = False
+
         # --- Build sub-dataclasses ---
         cents_curr = _g("centroids_file_current")
         cents_curr_resolved = str(cents_curr) if cents_curr else None
@@ -2945,7 +3051,9 @@ class LorraxConfig:
             vhead=_g("vhead"),
             whead_0freq=_g("whead_0freq"),
             whead_imfreq=_g("whead_imfreq"),
-            mc_average_vcoul_body=bool(_g("mc_average_vcoul_body")),
+            mc_average_vcoul_body=_mc_average_vcoul_body,
+            bgw_metal_q0_treatment=_bgw_q0_mode,
+            bgw_metal_q0_vector=_bgw_q0_vector,
             mc_average_placement=_normalize_placement(
                 _g("mc_average_placement")),
             mc_average_placement_vcoul=(
@@ -3311,7 +3419,7 @@ class LorraxConfig:
             write_restart_tensors=bool(_g("write_restart_tensors")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
-            raw_input_keys=frozenset(params.get(_DECK_NAMED_KEYS, ())),
+            raw_input_keys=frozenset(_effective_named_keys),
             compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
