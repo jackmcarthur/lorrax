@@ -49,6 +49,7 @@ def _integrate_sigma_batches(
     mesh_xy,
     *,
     pole_batch_size,
+    band_plan=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -58,21 +59,31 @@ def _integrate_sigma_batches(
 
     s = wfns.slices
     # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
-    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
-    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
-    # wired for consistency and has never executed under a split.
+    # Identical on an unsplit deck.  The same slice also supplies the MPA
+    # band-bracket planner and its count-mismatch guard on a split deck.
     psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
-    shape = (omega.size, int(psi_proj_xr.shape[0]),
-             int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
-    output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    base_shape = (omega.size, int(psi_proj_xr.shape[0]),
+                  int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+    brackets = None if band_plan is None else tuple(band_plan.bounds)
+    if brackets is None:
+        shape = base_shape
+        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        omega_axis = 0
+    else:
+        shape = (len(brackets), *base_shape)
+        output_sharding = NamedSharding(
+            mesh_xy, P(None, None, None, "x", "y"))
+        omega_axis = 1
     accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding)
+        omega, shape=shape, sharding=output_sharding,
+        omega_axis=omega_axis)
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
-        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)))
+        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        brackets=brackets)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
@@ -118,12 +129,27 @@ def _integrate_sigma_batches(
         del B, Omega
 
     sigma = strip_sigma_window(accumulator.finalize(), nb_real)
+    if brackets is not None:
+        # The kernel returns DISJOINT increments.  Cumulate only after every
+        # tau/window contribution has been folded so point i is S(N_i), the
+        # exact object the shared OLS/trust machinery consumes.
+        sigma = jax.jit(
+            lambda a: jnp.cumsum(a, axis=0),
+            out_shardings=sigma.sharding)(sigma)
+        widths = tuple(int(hi) - int(lo) for lo, hi in brackets)
+        print_fn(
+            f"  MPA Sigma band brackets: bounds={brackets}, widths={widths}; "
+            f"sum(widths)={sum(widths)} == single-sum bands="
+            f"{int(s.nb_sigma_sum)}.  One bracketed kernel dispatch per tau; "
+            f"band-contraction work partitions the axis exactly, accumulator "
+            f"leading extent={len(brackets)}.")
     print_fn(f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
              f"({n_poles} poles, batches of {batch_size})")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma)
+        sigma_c_kij=sigma,
+        band_counts=(() if band_plan is None else tuple(band_plan.counts)))
 
 
 def integrate_sigma_store(
@@ -136,6 +162,7 @@ def integrate_sigma_store(
     mesh_xy,
     *,
     pole_batch_size=4,
+    band_plan=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -161,7 +188,8 @@ def integrate_sigma_store(
     def run(reader):
         return _integrate_sigma_batches(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
-            mesh_xy, pole_batch_size=batch_size, print_fn=print_fn)
+            mesh_xy, pole_batch_size=batch_size, band_plan=band_plan,
+            print_fn=print_fn)
 
     if isinstance(fit_src, PoleReader):
         return run(fit_src)
@@ -243,6 +271,7 @@ def compute_sigma_c_mpa_omega_grid(
     fit_identity=None,
     expected_screening_diagrams=None,
     occupation_state=None,
+    band_plan=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -268,10 +297,26 @@ def compute_sigma_c_mpa_omega_grid(
         expected_screening_diagrams=expected_screening_diagrams)
     n_poles = int(ledger["n_p"])
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
+    if band_plan is not None:
+        from gw.band_extrapolation import (
+            assert_brackets_match_ols_abscissae)
+        assert_brackets_match_ols_abscissae(
+            band_plan, wfns.slices, meta=meta,
+            where="mpa sigma bracket partition")
+        print_fn(
+            "  MPA Sigma band-bracket guard: "
+            "BandBracketCountMismatch check PASS")
     branches = _branches(
         wfns, omega_grid_ry, efermi_ry,
         occupation_state=occupation_state,
         occupation_window_threshold=occupation_window_threshold)
+    if band_plan is not None and occupation_state is not None:
+        # _branches cannot return until the support guard has accepted the
+        # exact sigma_sum slice.  Keep the low-level guard silent on success,
+        # but make its evaluation visible on the owner-requested bracket run.
+        print_fn(
+            "  MPA Sigma band-bracket guard: occupation-support check PASS "
+            "at mpa.sigma._branches")
     summaries = []
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
@@ -306,7 +351,8 @@ def compute_sigma_c_mpa_omega_grid(
             f"{geometry['n_windows']} logical windows")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+            pole_batch_size=pole_batch_size, band_plan=band_plan,
+            print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):

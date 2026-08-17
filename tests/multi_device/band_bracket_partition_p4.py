@@ -27,8 +27,9 @@ WHAT IT ASSERTS, on every rank, on every addressable shard:
   1. ``cumsum(3 brackets, axis=0)[-1] == 1 full-band bracket`` to 1e-12
      relative — the partition claim, both channel plans;
   2. the single-bracket kernel is BIT-IDENTICAL (``max|Δ| == 0``) to the
-     un-bracketed ``brackets=None`` kernel MPA still uses — the default-path
-     claim, at the shape where a sharding drift would show;
+     un-bracketed ``brackets=None`` kernel MPA uses when extrapolation is
+     off — the default-path claim, at the shape where a sharding drift would
+     show;
   3. the stacked output's sharding is ``P(None, None, 'x', 'y')`` with the
      bracket axis replicated, because the tile bookkeeping downstream reads
      it and assumes exactly that.
@@ -75,7 +76,10 @@ def main() -> None:
               f"devices={n_dev} mesh=2x2 platform={jax.devices()[0].platform}",
               flush=True)
 
-    from gw.ppm_tau_kernel import _get_sigma_kij_kernel, _get_sigma_tau_kernel
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
+    from gw.ppm_tau_kernel import (
+        _get_sigma_kij_kernel, _get_sigma_tau_kernel,
+        get_shared_sigma_tau_kernel)
     from common.collectives import device_put_process_local
 
     nk, nb, n_mu, m = 8, 12, 8, 4
@@ -159,6 +163,65 @@ def main() -> None:
     if rank == 0:
         print("[band-bracket-p4] default path bit-identical (max|d| = 0)",
               flush=True)
+
+    # ---- 4: the actual MPA shared-pole wrapper + device omega fold --------
+    # One pole and one tau are enough to pin the dispatch topology: bracketed
+    # MPA executes ONE shared kernel call, whose static slices partition the
+    # band axis internally; it never walks brackets in Python.
+    pole_indices = put(np.asarray([0], np.int32), P())
+    pole_bounds = put(np.asarray(
+        [[0.0, np.inf, -np.inf, -np.inf, np.inf, np.inf]]), P())
+    phase_real = put(np.asarray([False]), P())
+    shared_args = (
+        psi_xn, psi_yr, psi_xr, psi_yn, E_A, mask_A,
+        B_q[None], Omega_q[None], pole_indices, pole_bounds, phase_real,
+        jnp.asarray(0.25, dtype=jnp.float64),
+        jnp.asarray(0.10, dtype=jnp.float64),
+        jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128))
+    with mesh:
+        shared_base = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=None)(*shared_args)
+        shared_one = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=((0, nb),))(*shared_args)
+        shared_three = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh, kgrid=kgrid, brackets=brk3)(*shared_args)
+
+        omega = np.asarray([0.2])
+        base_acc = DeviceOmegaAccumulator(
+            omega, shape=(1, nk, m, m),
+            sharding=NamedSharding(mesh, P(None, None, 'x', 'y')))
+        brk_acc = DeviceOmegaAccumulator(
+            omega, shape=(3, 1, nk, m, m),
+            sharding=NamedSharding(
+                mesh, P(None, None, None, 'x', 'y')),
+            omega_axis=1)
+        for acc, tile in ((base_acc, shared_base),
+                          (brk_acc, shared_three)):
+            acc.begin_window(
+                np.asarray([0.3]), np.asarray([0.7]), omega_sign=1.0,
+                prefactor=1.0)
+            acc.add_tau(tile)
+            acc.end_window()
+        folded_base = base_acc.finalize()
+        folded_three = jax.jit(
+            lambda x: jnp.cumsum(x, axis=0),
+            out_shardings=brk_acc.finalize().sharding)(brk_acc.finalize())
+
+    for sb, so, st in zip(shared_base.addressable_shards,
+                          shared_one.addressable_shards,
+                          folded_three.addressable_shards):
+        if not np.array_equal(np.asarray(sb.data), np.asarray(so.data)[0]):
+            _fail("MPA shared wrapper changed a bit on the one-bracket arm")
+        base_tile = next(x for x in folded_base.addressable_shards
+                         if x.device == st.device)
+        if not np.allclose(np.asarray(st.data)[-1],
+                           np.asarray(base_tile.data), rtol=1e-12, atol=1e-12):
+            _fail("MPA omega-folded cumulative brackets do not recover "
+                  "the baseline")
+    if rank == 0:
+        print("[band-bracket-p4] MPA shared dispatch parity: baseline=1 "
+              f"bracketed=1 per tau; widths="
+              f"{tuple(hi-lo for lo, hi in brk3)} sum={nb}", flush=True)
         print("[band-bracket-p4] PASS", flush=True)
 
 

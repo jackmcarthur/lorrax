@@ -554,11 +554,14 @@ def _device_output_zeros(shape, sharding):
 
 
 @lru_cache(maxsize=8)
-def _device_omega_add(sharding):
-    return jax.jit(
-        lambda acc, sigma, coeff: (
-            acc + coeff.reshape((-1, 1, 1, 1)) * sigma[None, ...]),
-        donate_argnums=(0,), out_shardings=sharding)
+def _device_omega_add(sharding, omega_axis):
+    def add(acc, sigma, coeff):
+        coeff_shape = [1] * acc.ndim
+        coeff_shape[int(omega_axis)] = -1
+        return (acc + coeff.reshape(tuple(coeff_shape))
+                * jnp.expand_dims(sigma, axis=int(omega_axis)))
+
+    return jax.jit(add, donate_argnums=(0,), out_shardings=sharding)
 
 
 @lru_cache(maxsize=8)
@@ -576,19 +579,27 @@ class DeviceOmegaAccumulator:
     applies ``(Z-Z†)/(2i)`` once after its last tau, then adds it to the same
     result.  ``alpha`` is the quadrature weight before reference rephasing;
     combining ``E_ref_sum`` and omega in one exponential avoids separately
-    overflowing two factors whose product is well conditioned.
+    overflowing two factors whose product is well conditioned.  ``omega_axis``
+    defaults to the historical leading axis; MPA brackets put omega at axis 1
+    so all increments share the same frequency fold.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding):
+    def __init__(self, omega_vec, *, shape, sharding, omega_axis=0):
         self._shape = tuple(int(n) for n in shape)
         self._sharding = sharding
+        self._omega_axis = int(omega_axis)
         self._replicated = NamedSharding(sharding.mesh, P())
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
-        if self._shape[0] != self._omega.size:
+        if not 0 <= self._omega_axis < len(self._shape):
+            raise ValueError("DeviceOmegaAccumulator: invalid omega_axis")
+        if self._shape[self._omega_axis] != self._omega.size:
             raise ValueError(
-                "DeviceOmegaAccumulator: shape[0] must equal n_omega")
-        # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
-        # ×2 while a crossing window holds its temporary cube open.
+                "DeviceOmegaAccumulator: shape[omega_axis] must equal "
+                "n_omega")
+        # Per-rank ω-cube: [n_bracket·]nω·nk·(nb_pad/p_x)·
+        # (nb_pad/p_y)·16 bytes (c128), ×2 while a crossing window holds
+        # its temporary cube open.  The optional leading bracket extent is
+        # the MPA cumulative-increment path's only new storage.
         self._total = _device_output_zeros(self._shape, sharding)()
         self._window = None
         self._coeff = None
@@ -637,10 +648,12 @@ class DeviceOmegaAccumulator:
             self._coeff[self._index], self._replicated)
         self._index += 1
         if self._window is None:
-            self._total = _device_omega_add(self._sharding)(
+            self._total = _device_omega_add(
+                self._sharding, self._omega_axis)(
                 self._total, sigma_tau, coeff)
         else:
-            self._window = _device_omega_add(self._sharding)(
+            self._window = _device_omega_add(
+                self._sharding, self._omega_axis)(
                 self._window, sigma_tau, coeff)
 
     def end_window(self):

@@ -337,10 +337,11 @@ def test_the_weights_really_are_ratio_invariant():
     assert np.allclose(b, [-4.254729, 0.663885, 4.590844], atol=1e-6)
 
 
-def test_both_production_sites_call_the_refusal():
+def test_all_production_sites_call_the_refusal():
     """The refusal is worthless if it is not wired in.  Read out of the
     source, beside the AST pins above and for the same reason."""
-    for rel in ("gw/ppm_pipeline.py", "gw/ppm_sigma.py"):
+    for rel in ("gw/ppm_pipeline.py", "gw/ppm_sigma.py",
+                "gw/sigma_dispatch.py", "gw/mpa/sigma.py"):
         calls = _call_kwargs(os.path.join(_SRC, rel),
                              "assert_brackets_match_ols_abscissae")
         assert len(calls) == 1, (

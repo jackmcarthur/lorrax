@@ -937,7 +937,7 @@ def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
             f"both of which read like 'all the bands' and are not.  Raising "
             f"`number_bands_chi` will not clear this; it is not a deck fault "
             f"at all.  Fix the planner call site "
-            f"(`gw.ppm_pipeline`), not the deck.")
+            f"(`gw.ppm_pipeline` or the MPA dispatch), not the deck.")
 
     # (1) THE ABSCISSAE MUST BE THE PARTITION.  Read off the bounds, so this
     # cannot be satisfied by a plan whose counts were computed from anything

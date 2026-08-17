@@ -98,12 +98,14 @@ class PPMBuildResult:
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    # (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS THE BAND-COUNT
-    # AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
+    # Bracketed shape: (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS
+    # THE BAND-COUNT AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
     # ``[0, band_counts[i])``, so ``sigma_c_kij[-1]`` is the ordinary
     # full-band Σ_c and is what every downstream consumer takes.  Length 1
     # in the ordinary case (``band_counts == (nband,)``), 3 under
-    # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
+    # ``sigma_band_extrapolation``.  The historical unbracketed MPA path keeps
+    # its exact 4-D shape and empty ``band_counts`` when the feature is off;
+    # enabled MPA and both PPM modes use this bracketed carrier.
     #
     # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
     # SHARDING (single source of truth): replicated/uncommitted under
