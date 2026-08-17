@@ -78,12 +78,28 @@ from .kin_ion import (
 #:          are gathers and wants to be told the day they stop being.
 QP_ROTATIONS_K_STORAGE = ("auto", "full", "ibz")
 
-#: The k-indexed datasets of ``qp_wfn_rotations.h5``.  ``kpoints_crys`` is
-#: in the list on purpose: it LABELS ``U_mnk``'s rows, so a file whose
-#: arrays were reduced and whose coordinates were not is a file that lies
-#: about which k each row belongs to.
-QP_ROT_K_DATASETS = (
-    "U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg", "kpoints_crys")
+#: The datasets that MOVE onto the wedge — the physics arrays, and only
+#: those.  Each is star-invariant in the sense the gather needs: a member of
+#: a star holds the same matrix (or the same energies) as its parent.
+QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
+
+#: ``kpoints_crys`` and ``kirr_to_kfull`` STAY ON THE FULL BZ, always, and
+#: that is not an oversight.
+#:
+#: ``broadcast_ibz_to_full_bz`` is a GATHER: every member of a star receives
+#: its parent's row verbatim.  For an operator that commutes with the
+#: symmetry, that IS the right answer.  For the k-VECTORS it is not, because
+#: k is the one quantity in this file that the symmetry operation changes —
+#: a gather would hand every member of a star its parent's coordinates.
+#: MEASURED on ``si_cohsex_debug``: ``max|Δ| = 7.500000e-01``, and NOT a
+#: reciprocal-lattice vector, so no modulo-G reading rescues it.
+#:
+#: They are also 1,536 and 32 bytes on that deck against 3.5 MB of ``U_mnk``,
+#: so there is nothing to win.  Leaving them alone keeps the file's own
+#: coordinate table and index table meaning exactly what they always meant,
+#: which is what lets the two in-tree consumers unfold and then index as
+#: before.
+QP_ROT_FULL_BZ_DATASETS = ("kpoints_crys", "kirr_to_kfull")
 
 
 def _wedge_reduction(payload, kirr_to_kfull, star_tables):
@@ -174,16 +190,13 @@ def write_qp_rotations_h5(
         3. Replace eigenvalues with E_qp_nk (convert to Rydberg if needed)
         4. Write rotated coefficients back to WFN_qp.h5
 
-    ON A WEDGE-STORED FILE, ``kirr_to_kfull`` BECOMES ``arange(nk_red)``.
-    It is defined as "the row of ``U_mnk``/``kpoints_crys`` holding reduced
-    k-point ``ik_red``", and on a wedge-stored file that row IS ``ik_red``.
-    Rewriting it is what keeps ``postprocess.rotate_wfn_to_qp`` and
-    ``gw.eqp_bgw`` — both of which index ``U_mnk[kirr_to_kfull[ik]]`` —
-    correct with no change at all, and it keeps the module's own coordinate
-    check (``kpoints_crys[kirr_to_kfull] == wfn.kpoints``) meaningful rather
-    than tautological, because ``kpoints_crys`` is reduced with everything
-    else.  The old value is preserved as ``kirr_to_kfull_in_full_bz`` for
-    anything that wants to know where these rows sat in the full zone.
+    WHAT MOVES AND WHAT DOES NOT.  Only :data:`QP_ROT_K_DATASETS` is
+    reduced.  :data:`QP_ROT_FULL_BZ_DATASETS` — ``kpoints_crys`` and
+    ``kirr_to_kfull`` — stay on the full BZ and keep their exact old
+    values and meaning, because the unfold is a GATHER and k is the one
+    quantity in this file the symmetry operation changes.  So a consumer
+    reads the physics arrays through :func:`read_qp_rotations_full_bz`
+    and then indexes them by full-BZ k exactly as it always did.
     """
     if k_storage not in QP_ROTATIONS_K_STORAGE:
         raise ValueError(
@@ -195,7 +208,6 @@ def write_qp_rotations_h5(
         "U_mnk": np.asarray(U_mnk),
         "E_qp_nk_hartree": np.asarray(E_qp_nk),
         "E_qp_nk_rydberg": np.asarray(E_qp_nk) * 2.0,
-        "kpoints_crys": np.asarray(kpoints_crys, dtype=np.float64),
     }
     stored = K_STORAGE_FULL
     kirr_full_bz = (None if kirr_to_kfull is None
@@ -267,9 +279,6 @@ def write_qp_rotations_h5(
         else:
             stored = K_STORAGE_IBZ
             payload = reduced
-            kpoints_crys = reduced["kpoints_crys"]
-            # see the docstring: on a wedge file the reduced row IS the row
-            kirr_to_kfull = np.arange(len(kirr_full_bz), dtype=np.int32)
             say(f"  qp_wfn_rotations: k axis REDUCED to the file wedge, "
                 f"{nk_full} -> {len(kirr_full_bz)} rows; the round trip "
                 f"reproduces every dataset exactly (max|Δ| = 0).")
@@ -301,8 +310,6 @@ def write_qp_rotations_h5(
                              data=np.asarray(irr_idx_k, dtype=np.int32))
             f.create_dataset(SYM_IDX_DATASET,
                              data=np.asarray(sym_idx_k, dtype=np.int32))
-            f.create_dataset('kirr_to_kfull_in_full_bz', data=kirr_full_bz,
-                             dtype=np.int32)
             for name in QP_ROT_K_DATASETS:
                 d = f[name]
                 d.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ

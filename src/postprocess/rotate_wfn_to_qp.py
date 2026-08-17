@@ -103,10 +103,18 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
         print(f"Copying {wfn_file} -> {output_file}")
     shutil.copy2(wfn_file, output_file)
     
-    # Open rotation file
+    # Open rotation file.  THE ARRAYS COME BACK THROUGH THE ADAPTER, the
+    # coordinates straight off the file: ``U_mnk`` and ``E_qp_nk_rydberg``
+    # may be stored on the file wedge (``k_storage='ibz'``) and are unfolded
+    # here, while ``kpoints_crys`` and ``kirr_to_kfull`` are ALWAYS full-BZ
+    # and keep their old meaning, so everything below indexes by full-BZ k
+    # exactly as it always did.  A file with no ``k_storage`` attr is read
+    # verbatim, so a pre-format file is untouched by this.
+    from file_io.qp_wfn import read_qp_rotations_full_bz
+    _arr = read_qp_rotations_full_bz(rot_file)
+    U_mnk = _arr['U_mnk']                      # (nk_full, nb, nb)
+    E_qp_ry = _arr['E_qp_nk_rydberg']          # (nk_full, nb) in Rydberg
     with h5py.File(rot_file, 'r') as f_rot:
-        U_mnk = f_rot['U_mnk'][:]  # (nk_full, nb, nb)
-        E_qp_ry = f_rot['E_qp_nk_rydberg'][:]  # (nk_full, nb) in Rydberg
         band_range = f_rot['band_range'][:]  # [band_start, band_stop]
         rot_kpoints = f_rot['kpoints_crys'][:]  # (nk_full, 3)
         kgrid = f_rot['kgrid'][:]  # [nkx, nky, nkz]
