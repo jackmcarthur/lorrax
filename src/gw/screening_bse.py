@@ -24,8 +24,10 @@ kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
      ``W(z) - v`` bodies on the q wedge,
   4. adds ``v`` back, unfolds the wedge to the full BZ through the same
      ``symmetry_maps.unfold_isdf_operator`` service call the RPA path
-     uses, gates the result, and returns ``{role: W_q}`` in exactly the
-     shape and sharding the RPA path returns.
+     uses, with q/-q rows paired through that service's explicit TRS half
+     (the v1 ladder has a TRS gauge but not arbitrary spatial-gauge
+     covariance), gates the result, and returns ``{role: W_q}`` in exactly
+     the shape and sharding the RPA path returns.
 
 PERSIST-BEFORE-LOAD IS THE ORDERING CONSTRAINT OF THE WHOLE FEATURE, and
 it is the reason this helper exists at all rather than a flag on
@@ -705,15 +707,96 @@ def _assert_mu_width(tile, mu_target, *, where):
     return tile
 
 
+def _trs_pair_coherent_unfold_sym_idx(
+        irr_idx, sym_idx, *, kgrid, q_irr_full_idx, n_sym_spatial):
+    """Choose one spatial gauge per non-TRIM q/-q pair.
+
+    ``find_irreducible_bz_points`` is right to return the first symmetry row
+    that maps an irreducible q onto each full-BZ q.  A centrosymmetric crystal
+    can therefore map BOTH q and -q through unrelated spatial rows and never
+    select the explicit TRS half of the table.  That freedom is harmless for
+    a gauge-invariant operator such as bare V or RPA W, but it is not harmless
+    for the v1 ladder: its anti-resonant channel is only covariant after
+    :func:`bse.bse_w_exact.enforce_trs_pair_gauge`, not under an arbitrary
+    point-group re-realization of degenerate Bloch multiplets.
+
+    The wedge contains one actually solved value for the whole orbit.  Keep
+    every irreducible representative's existing spatial realization, and for
+    each q/-q pair synthesize the partner with the SAME spatial row composed
+    with TRS (row ``s +/- n_sym_spatial``).  This makes the generic unfold
+    service apply its derived conjugation rule instead of asking the ladder
+    for a spatial gauge covariance it does not possess.  No W value is
+    averaged or projected, and the operation changes only this ladder call's
+    local copy of the symmetry-row map.
+    """
+    grid = tuple(int(v) for v in kgrid)
+    n_full = int(np.prod(grid))
+    irr = np.asarray(irr_idx, dtype=np.int32)
+    original = np.asarray(sym_idx, dtype=np.int32)
+    n_spatial = int(n_sym_spatial)
+    if irr.shape != (n_full,) or original.shape != (n_full,):
+        raise ValueError(
+            "GATE w_bse_trs_pair_unfold_map: irr_idx and sym_idx must each "
+            f"have the full k-grid extent {n_full}; got {irr.shape} and "
+            f"{original.shape} for kgrid={grid}.")
+    if (n_spatial <= 0 or np.any(original < 0)
+            or np.any(original >= 2 * n_spatial)):
+        lo = int(original.min()) if original.size else 0
+        hi = int(original.max()) if original.size else -1
+        raise ValueError(
+            "GATE w_bse_trs_pair_unfold_map: the symmetry rows must lie in "
+            f"[0, 2*n_sym_spatial) with n_sym_spatial={n_spatial}; got "
+            f"range [{lo}, {hi}].")
+
+    reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
+    out = original.copy()
+    coords = np.stack(np.unravel_index(np.arange(n_full), grid), axis=1)
+    neg = np.ravel_multi_index(
+        tuple(((-coords) % np.asarray(grid, dtype=np.int64)).T), grid)
+    for iq, jq_value in enumerate(neg):
+        jq = int(jq_value)
+        if iq >= jq:                 # one visit per pair; TRIM is untouched
+            continue
+        if int(irr[iq]) != int(irr[jq]):
+            raise ValueError(
+                "GATE w_bse_trs_pair_unfold_map: q and -q do not share an "
+                f"irreducible parent ({iq}->{int(irr[iq])}, "
+                f"{jq}->{int(irr[jq])}).  The ladder is certified only on "
+                "a TRS-reduced wedge; do not fabricate reciprocity across "
+                "two independently solved rows.")
+
+        # Preserve an actually solved representative.  When the pair is two
+        # unfolded members of a larger star, preserve a spatial-only row if
+        # one is already present; otherwise the flat-index tie-break is fully
+        # deterministic.
+        if iq in reps:
+            source = iq
+        elif jq in reps:
+            source = jq
+        elif (original[iq] < n_spatial) != (original[jq] < n_spatial):
+            source = iq if original[iq] < n_spatial else jq
+        else:
+            source = iq
+        partner = jq if source == iq else iq
+        source_row = int(original[source])
+        out[partner] = (source_row + n_spatial
+                        if source_row < n_spatial
+                        else source_row - n_spatial)
+    return out
+
+
 def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
                         mesh_xy, label, print_fn=print):
     """``Wc(z)`` on the wedge -> ``W(z)`` on the full BZ.
 
     ``+ v`` first (the facade returns ``W - v`` bodies), then the SAME
     ``unfold_isdf_operator`` service call ``compute_static_w`` makes, with
-    the SAME tables from ``_resolve_ibz_q_list``.  Not a second unfold
-    written beside the first: one service, one set of tables, one
-    convention for the umklapp phase and the TRS conj.
+    the SAME geometry tables from ``_resolve_ibz_q_list``.  The ladder-only
+    symmetry-row view is made q/-q pair-coherent below because this v1
+    operator establishes only a TRS gauge, not arbitrary spatial-gauge
+    covariance.  This is not a second unfold: one service, one set of
+    centroid/phase tables, and one convention for the umklapp phase and TRS
+    conjugation.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -741,13 +824,22 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
     W_wedge = _assert_mu_width(
         wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+    ladder_unfold_sym = _trs_pair_coherent_unfold_sym_idx(
+        full_to_irr_idx, full_to_irr_sym, kgrid=tuple(meta.kgrid),
+        q_irr_full_idx=sym.q_irr_full_idx,
+        n_sym_spatial=n_sym_spatial)
+    n_rewired = int(np.count_nonzero(
+        ladder_unfold_sym != np.asarray(full_to_irr_sym)))
+    print_fn(
+        f"  W[{label}] ladder unfold: {n_rewired} q rows use a "
+        "TRS-composed partner to preserve one gauge per q/-q pair.")
     with timing.section("W.unfold_to_full_bz", announce=True,
                         label=f"W[{label}] ladder IBZ -> full-BZ unfold "
                               f"({int(W_wedge.shape[0])} q -> "
                               f"{int(meta.nk_tot)} q)"):
         W_q = unfold_isdf_operator(
             W_wedge,
-            irr_idx=full_to_irr_idx, sym_idx=full_to_irr_sym,
+            irr_idx=full_to_irr_idx, sym_idx=ladder_unfold_sym,
             sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
             mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
         del W_wedge

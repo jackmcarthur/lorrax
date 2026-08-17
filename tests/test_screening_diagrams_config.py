@@ -944,7 +944,62 @@ def test_the_mpa_fit_store_carries_the_tag_and_the_consumer_asserts_it():
 
 
 # ---------------------------------------------------------------------------
-# 8. Docs
+# 8. Ladder q/-q unfold gauge
+# ---------------------------------------------------------------------------
+
+def test_ladder_unfold_uses_one_spatial_gauge_for_each_q_pair():
+    """Representatives stay fixed; every partner is the same row plus TRS.
+
+    Pair 1/3 contains an irreducible representative.  Pair 4/12 belongs to
+    the same four-fold rotation orbit, whose representative is row 1, so
+    neither member is solved; its already-spatial member 12 is the
+    deterministic source.  The four TRIM rows on this even grid stay fixed.
+    """
+    import numpy as np
+    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
+
+    grid = (4, 4, 1)
+    # Orbit 0 is {(0,+1), (0,-1), (+1,0), (-1,0)}.  The remaining
+    # non-TRIM pairs each have their lower flat index as representative.
+    irr = np.asarray(
+        [5, 0, 6, 0, 0, 1, 2, 3, 7, 4, 8, 4, 0, 3, 2, 1],
+        dtype=np.int32)
+    sym = np.asarray(
+        [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3],
+        dtype=np.int32)
+    reps = np.asarray([0, 1, 2, 5, 6, 7, 8, 9, 10], dtype=np.int32)
+    got = _trs_pair_coherent_unfold_sym_idx(
+        irr, sym, kgrid=grid, q_irr_full_idx=reps, n_sym_spatial=3)
+
+    # Solved representatives and every self-negative q are value-untouched.
+    assert np.array_equal(got[reps], sym[reps])
+    assert np.array_equal(got[[0, 2, 8, 10]], sym[[0, 2, 8, 10]])
+    # q=1 is the representative, so q=3 becomes TRS composed with row 0.
+    assert got[1] == 0
+    assert got[3] == 3
+    # Neither q=4 nor q=12 is the representative; preserve spatial row 1 at 12.
+    assert got[12] == 1
+    assert got[4] == 4
+    # The helper never mutates the generic symmetry service's table.
+    assert np.array_equal(
+        sym, [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3])
+
+
+def test_ladder_unfold_refuses_two_independently_solved_q_partners():
+    """A TRS composition is valid only when q and -q share one wedge row."""
+    import numpy as np
+    import pytest
+    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
+
+    with pytest.raises(ValueError, match="do not fabricate reciprocity"):
+        _trs_pair_coherent_unfold_sym_idx(
+            np.asarray([0, 1, 2]), np.asarray([0, 0, 0]),
+            kgrid=(3, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2]),
+            n_sym_spatial=1)
+
+
+# ---------------------------------------------------------------------------
+# 9. Docs
 # ---------------------------------------------------------------------------
 
 def test_the_hand_written_reference_row_says_orthogonal_and_names_the_rules():
