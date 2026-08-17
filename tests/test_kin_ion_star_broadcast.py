@@ -847,3 +847,113 @@ def test_the_full_storage_stamp_round_trips_too(tmp_path):
     assert read_star_map(path, "kin_ion") is None
     assert np.array_equal(read_full_bz_dataset(path, "kin_ion"),
                           arrays["kin_ion"])
+
+
+# ===========================================================================
+# § WHICH WEDGE — the WFN's k-set is not always the star wedge
+# ===========================================================================
+# ``gw.kin_ion_io`` used to sweep ``wfn.load(k="ibz")``, the WFN's own k
+# rows, and file ``SymMaps.irr_idx_k`` verbatim beside them.  That is right
+# only while the WFN's k-set IS the star wedge.  It is not on
+# ``gnppm_debug``/``bispinor_debug`` (9 k, 5 orbits) or ``cohsex_debug``
+# (4 k, 3 orbits), and there the extra rows were computed from a ψ that no
+# consumer holds — ``load(k="full_bz")`` builds those k by symmetry from
+# their parent, and the two ψ are near-orthogonal on a time-reversed row
+# (``min|<n|n>|`` 0.012, measured 2026-08-17).  The rows were then
+# overwritten by the reader's own unfold, so the composed path was right
+# and the FILE was wrong by 3.315e+01 Ry off-diagonal.
+#
+# Two cells: the writer now sweeps one row per orbit and renumbers the
+# table onto it, and the reader's refusal counts DISTINCT stars so the
+# old shape cannot pass it again.
+
+#: Every committed deck with a WFN, including the three where the two
+#: wedges have different lengths — which is the whole point.
+_WEDGE_DECKS = ("gnppm_debug", "bispinor_debug", "cohsex_debug",
+                "si_cohsex_debug", "si_bse_debug", "hbn_cohsex_debug")
+
+
+def _wedge_rows_or_skip():
+    """``gw.kin_ion_io.star_wedge_rows``, imported lazily — see
+    :func:`_adapter_or_skip` for why the import cannot sit at module
+    scope."""
+    try:
+        from gw.kin_ion_io import star_wedge_rows
+    except Exception as exc:                                    # noqa: BLE001
+        pytest.skip(
+            f"gw.kin_ion_io needs a built FFI .so at import "
+            f"({type(exc).__name__}); the reader-side arm below runs "
+            f"everywhere")
+    return star_wedge_rows
+
+
+def _wfn_or_skip(deck):
+    p = os.path.join(_REG, deck, "WFN.h5")
+    if not os.path.isfile(p):
+        p = os.path.join(_REG, deck, "WFNsmall.h5")
+    if not os.path.isfile(p):
+        pytest.skip(f"no WFN for {deck} in this checkout")
+    return p
+
+
+@pytest.mark.parametrize("deck", _WEDGE_DECKS)
+def test_the_swept_wedge_is_one_row_per_star_and_its_table_is_dense(deck):
+    """THE writer-side gate for the k-basis fix.
+
+    Three properties, and the third is the one that makes the first two
+    safe: ``rows[irr_idx_wedge] == SymMaps.irr_idx_k``.  The renumbered
+    table composed with the rows it renumbers has to give the parent map
+    back exactly, or the file's unfold addresses a different star than
+    the sweep computed — which is invisible in every diagonal observable.
+    """
+    star_wedge_rows = _wedge_rows_or_skip()
+    sym = SymMaps(_Header(_wfn_or_skip(deck)))
+    irr = np.asarray(sym.irr_idx_k, dtype=np.int32)
+    rows, irr_wedge = star_wedge_rows(sym)
+
+    n_orbits = len(set(int(v) for v in irr))
+    assert rows.size == n_orbits, (
+        f"{deck}: swept {rows.size} k for {n_orbits} orbits")
+    assert np.array_equal(rows, _star_row_order(irr)[1]), (
+        f"{deck}: the swept rows must be star_select's own order — sorting "
+        f"them returns another star's matrix wherever the two differ")
+    assert np.array_equal(np.unique(irr_wedge), np.arange(n_orbits)), (
+        f"{deck}: the filed table must index the STORED rows densely, "
+        f"which is what read_star_map's star count checks")
+    assert np.array_equal(rows[irr_wedge], irr), (
+        f"{deck}: renumber∘rows is not the parent map")
+
+
+@pytest.mark.parametrize("deck", ("gnppm_debug", "bispinor_debug",
+                                  "cohsex_debug"))
+def test_the_two_wedges_really_do_differ_on_these_decks(deck):
+    """PRECONDITION for the cell above, stated so a fixture change shows.
+
+    If a regenerated WFN ever made ``nk_red == n_orbits`` on all three,
+    the wedge cell would still pass while testing nothing.
+    """
+    sym = SymMaps(_Header(_wfn_or_skip(deck)))
+    irr = np.asarray(sym.irr_idx_k)
+    assert len(set(int(v) for v in irr)) < int(sym.nk_red), (
+        f"{deck}: nk_red {int(sym.nk_red)} == n_orbits, so this deck no "
+        f"longer separates the file wedge from the star wedge")
+
+
+def test_read_star_map_counts_distinct_stars_not_the_max_label(tmp_path):
+    """RED TWIN for the refusal that did not fire.
+
+    ``gnppm_debug``'s own table: nine full-BZ k over five stars, labelled
+    ``[0,2,2,6,8,7,6,7,8]``.  ``max+1`` is 9 and the slab has 9 rows, so
+    the old spelling passed exactly the file it exists to catch.  Runs
+    without the FFI — the writer here is h5py and the reader under test
+    is the pure-host one.
+    """
+    irr = np.array([0, 2, 2, 6, 8, 7, 6, 7, 8], dtype=np.int32)
+    sidx = np.zeros(irr.size, dtype=np.int32)
+    assert int(irr.max()) + 1 == irr.size, (
+        "PRECONDITION: this table is the one max+1 gets wrong")
+    arrays = {"kin_ion": np.zeros((irr.size, 2, 2), dtype=np.complex128)}
+    path = str(_write_kin_ion(tmp_path / "kin_ion.h5", arrays,
+                              irr=irr, sidx=sidx, nss=1))
+    with pytest.raises(ValueError, match="do not describe the same"):
+        read_star_map(path, "kin_ion")

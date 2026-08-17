@@ -41,14 +41,22 @@ tell these apart — never infer from magnitudes.
 
 WHICH k-SET THE ARRAYS ARE STORED ON — read this before indexing one
 ----------------------------------------------------------------------
-Both ``kin_ion`` and ``v_hartree`` are computed on the IRREDUCIBLE wedge
-and, since the store-compressed change, **stored** there too: the file's
-k axis is ``nrk`` rows, not ``nk``, and the full-BZ table is rebuilt by
-:func:`broadcast_ibz_to_full_bz` when the array is read.  The reduction
-is the star count — 8× on the Si 4³/48-op decks, 1× on a deck whose every
-k is its own star — and it is exact by construction, because what is
-persisted is the very block the sweep produced one statement before the
-broadcast consumed it.
+Both ``kin_ion`` and ``v_hartree`` are computed on the STAR WEDGE — one
+row per symmetry orbit — and, since the store-compressed change,
+**stored** there too: the file's k axis is ``n_orbits`` rows, not ``nk``,
+and the full-BZ table is rebuilt by :func:`broadcast_ibz_to_full_bz` when
+the array is read.  The reduction is the star count — 8× on the Si 4³/48-op
+decks, 1× on a deck whose every k is its own star — and it is exact by
+construction, because what is persisted is the very block the sweep
+produced one statement before the broadcast consumed it.
+
+THE STAR WEDGE IS NOT ALWAYS THE WFN'S OWN k-SET, and the stored
+``irr_idx_k`` indexes the STORED ROWS, not ``SymMaps.irr_idx_k``'s
+upstream wedge labels: ``gnppm_debug`` stores 9 k over 5 orbits, and a
+table filed verbatim there would claim 9 stored rows for a 5-row slab.
+Both writers renumber through
+:func:`file_io.sigma_output.compact_star_tables`, and
+:func:`read_star_map` refuses a file where the two disagree.
 
 A file says so in the ``k_storage`` attr of each dataset, and carries the
 two tables the rebuild needs (:data:`IRR_IDX_DATASET`,
@@ -144,15 +152,16 @@ N_SYM_SPATIAL_ATTR = "n_sym_spatial"
 
 
 def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
-	"""``(nrk, …) → (nk_tot, …)`` through the star map, conjugating on TRS.
+	"""``(n_orbits, …) → (nk_tot, …)`` through the star map, conj on TRS.
 
 	THE adapter over :func:`symmetry_maps.star_broadcast`, so the
 	time-reversal rule has ONE implementation in the tree — one call site,
 	reached by both the reader here and ``gw.kin_ion_io``'s writer-side
 	wrapper.  ``star_broadcast`` orders ``A_irr`` by ``star_select``'s
-	first-occurrence rows; the rows here are raw IBZ indices, so the labels
-	passed are the identity — which makes its gather ``A[irr_idx_k]``, the
-	parent map, with ``conj`` applied on the time-reversed rows.
+	first-occurrence rows; the rows here are the file's own stored rows in
+	that order, and ``irr_idx_k`` was renumbered against them by the
+	writer, so the labels passed are the identity — which makes its gather
+	``A[irr_idx_k]``, with ``conj`` applied on the time-reversed rows.
 
 	``None`` in, ``None`` out: the writer's callers gather with
 	``owner_only=True``, so the peers hold no table to broadcast.
@@ -256,7 +265,18 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 		raise ValueError(
 			f"{os.path.basename(h5_path)}: {IRR_IDX_DATASET} {irr.shape} and "
 			f"{SYM_IDX_DATASET} {sidx.shape} must both be (nk_full,)")
-	n_star = int(irr.max(initial=-1)) + 1
+	# THE NUMBER OF DISTINCT STARS, not ``max + 1``.  The two agree only
+	# while the labels are dense, which is exactly what the writers are
+	# supposed to guarantee (``file_io.sigma_output.compact_star_tables``,
+	# and ``gw.kin_ion_io.star_tables`` through it) — so testing ``max+1``
+	# tested the writers' arithmetic instead of their output, and passed
+	# on the one shape this refusal exists to catch.  MEASURED 2026-08-17:
+	# ``gnppm_debug``'s ``irr_idx_k = [0,2,2,6,8,7,6,7,8]`` gives
+	# ``max+1 = 9`` against 9 stored rows and sails through, while the
+	# true star count is 5 and four of those rows were in a basis nothing
+	# reads.  ``np.unique`` costs a sort of ``nk_full`` int32 once per
+	# open and is the property the docstring already claimed.
+	n_star = int(np.unique(irr).size)
 	if n_star != nk_stored:
 		raise ValueError(
 			f"{os.path.basename(h5_path)}: {dataset} stores {nk_stored} k "
