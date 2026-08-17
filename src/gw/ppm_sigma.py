@@ -115,6 +115,16 @@ class SigmaOmegaResult:
     #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
     #: and nothing else needs either.
     band_counts: tuple[int, ...] = ()
+    #: ``(n_bracket, nk, nb, nb)`` Ry, or ``None``.  The CUMULATIVE Coulomb-hole
+    #: half of the ``ppm_invalid_mode="static_limit"`` term at each of
+    #: ``band_counts`` — the part of Σ_c that is a static Coulomb hole and is
+    #: therefore folded in as a CONSTANT rather than extrapolated.  Present
+    #: only when the extrapolation is running (``len(band_counts) > 1``) and
+    #: the run has invalid poles to treat.  It is NOT a component to be added
+    #: to ``sigma_c_kij`` — that fold already happened; it is the evidence for
+    #: how much of ``S_inf`` was never extrapolated
+    #: (``band_extrapolation.static_limit_tail_ruling``).
+    static_coh_at_counts: np.ndarray | None = None
 
 
 class _SigmaBranchTiles(NamedTuple):
@@ -797,6 +807,74 @@ def _compute_invalid_static_sigma(
     return np.asarray(sig_static.addressable_data(0), dtype=np.complex128)
 
 
+def _invalid_static_coh_by_bracket(
+    wfns,
+    Wc0_q: jax.Array,
+    invalid_mask: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+    brackets,
+) -> np.ndarray:
+    """The static-limit term's OWN band-count series, one point per bracket.
+
+    WHY THIS EXISTS — THE ONE PLACE THE PPM-ONLY GUARD CANNOT REACH.
+    ``gw.sigma_dispatch``'s guard keeps the band extrapolation away from a
+    static Coulomb hole because the ``1/N → 0`` limit is wrong for one (it
+    ANTI-converges: 94.9 → 288.2 meV MAE as nband goes 60 → 124, overshooting
+    BerkeleyGW's exact closure by ~340 meV — ``gw.band_extrapolation``'s module
+    docstring owns that measurement).  That guard is per-``compute_mode``, and
+    ``ppm_invalid_mode = "static_limit"`` — the SHIPPING DEFAULT — puts a
+    static Coulomb hole inside a Σ whose ``compute_mode`` genuinely IS
+    ``gn_ppm``.  The guard cannot see it because it is per-MODE, one logical
+    ISDF mode at a time, underneath the seam the guard checks.
+
+    WHAT IS AND IS NOT BAND-COUNT DEPENDENT.  The static-limit term is
+    ``Σ_static = −⟨G_occ·W_static⟩ + ½⟨G_RI·W_static⟩``.  The first half runs
+    over OCCUPIED states through ``Gij`` and is band-count independent for any
+    ``nband ≥ nelec``.  The second — the Coulomb hole — runs over ``s.full``
+    with no occupation projector, so it carries exactly the slowly convergent
+    unoccupied tail this module exists to worry about.  Only the second half is
+    measured here, and that is not a simplification: the extrapolation is an
+    AFFINE estimator with ``sum(c) == 1``, so any band-count-INDEPENDENT part
+    passes through it unchanged and cancels identically out of
+    ``S_inf − S(N₃)``.  The occupied half therefore cannot contribute to the
+    diagnostic even in principle.
+
+    IT IS FREE, WHICH IS WHY IT CAN BE ON BY DEFAULT.  ``G_RI`` is a plain band
+    sum, so the brackets PARTITION it the same way they partition Σ_c, and
+    ``n_brk`` contractions over disjoint sub-ranges cost the same total flops
+    as the one contraction over the whole range that runs anyway.  The price is
+    one extra pass of the COH channel, not ``n_brk`` extra passes.
+
+    Returns the replicated host tensor ``(n_brk, nk, nb_sigma, nb_sigma)`` in
+    Ry, holding the DISJOINT per-bracket contributions — the caller cumulates
+    them to get Σ_COH at each of the plan's band counts, in the same order and
+    by the same rule that turns the Σ_c brackets into band counts.
+    """
+    from .cohsex_sigma import _make_cohsex_kernels
+
+    _, sigma_coh_k, _ = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot))
+    rep = NamedSharding(mesh_xy, P(None, None, None))
+
+    out = []
+    with mesh_xy:
+        W_static = jnp.where(
+            jnp.asarray(invalid_mask, dtype=bool),
+            jnp.asarray(Wc0_q, dtype=jnp.complex128),
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+        )
+        zero = jnp.zeros_like(W_static)
+        for lo, hi in brackets:
+            coh = sigma_coh_k(wfns, W_static, zero,
+                              ri_bands=(int(lo), int(hi)))
+            coh = jax.lax.with_sharding_constraint(coh, rep)
+            coh.block_until_ready()
+            out.append(np.asarray(coh.addressable_data(0),
+                                  dtype=np.complex128))
+    return np.stack(out, axis=0)
+
+
 # ---------------------------------------------------------------------------
 #  Top-level sigma driver
 # ---------------------------------------------------------------------------
@@ -961,6 +1039,7 @@ def compute_sigma_c_ppm_omega_grid(
     # Computed once here, added to Σ_c at every ω (host tensor add, or
     # tile-local on the sharded layout — same values on both).
     sigma_static_host = None
+    static_coh_at_counts = None
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy)
@@ -969,6 +1048,16 @@ def compute_sigma_c_ppm_omega_grid(
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV "
             f"(diag max {float(np.max(np.abs(np.diagonal(sigma_static_host, axis1=1, axis2=2)))) * RYD_TO_EV:.4f} eV)"
         )
+        # THE CONTAMINANT'S OWN BAND-COUNT SERIES — measured, not assumed.
+        # Only when the band extrapolation is actually running (n_brk > 1):
+        # with one bracket there is no fit to contaminate and no reader to
+        # inform, and the extra COH pass would be paid for nothing.
+        if n_brk > 1:
+            static_coh_at_counts = np.cumsum(
+                _invalid_static_coh_by_bracket(
+                    wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+                    brackets),
+                axis=0)
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
     # 2026-07-31).
@@ -1178,13 +1267,40 @@ def compute_sigma_c_ppm_omega_grid(
             # m-slice, n-slice) into the global cube.
             #
             # THE TERM GOES INTO BRACKET 0 ONLY, not into every bracket.
-            # It is ω- AND band-count-independent (a static-COHSEX term
-            # over the occupied states and the RI window, with no
-            # unoccupied tail), so it is a CONSTANT offset on the band-sum
-            # series: adding it to the first bracket puts it into all three
-            # cumulative sums exactly once, which is what a constant offset
-            # must do.  Adding it to every bracket would multiply it by the
-            # bracket index under the cumulative sum.
+            # Adding it to every bracket would multiply it by the bracket
+            # index under the cumulative sum; adding it to the first puts it
+            # into all three cumulative sums exactly once.
+            #
+            # ⚠ THE REASON IS **NOT** THAT THE TERM IS BAND-COUNT
+            # INDEPENDENT.  It is not.  This comment used to claim it was
+            # ("no unoccupied tail"), and that claim is false: half of
+            # Σ_static is ``+½⟨G_RI·W_static⟩`` with ``G_RI`` a sum over
+            # ``s.full`` and NO occupation projector
+            # (``cohsex_sigma.sigma_coh``), i.e. precisely the Coulomb hole's
+            # slowly convergent unoccupied tail.  MEASURED — see the
+            # ``static-limit`` block the extrapolation report now prints.
+            #
+            # The real reason is the same one the PPM-only guard in
+            # ``sigma_dispatch`` is built on: **a static Coulomb hole must
+            # not be run through this estimator.**  Its ``1/N → 0`` limit
+            # ANTI-converges (94.9 → 288.2 meV MAE as nband goes 60 → 124,
+            # ~340 meV past BerkeleyGW's exact closure —
+            # ``band_extrapolation``'s module docstring).  Folding the term
+            # in as a CONSTANT is what keeps it out of the fitted slope: the
+            # estimator is affine with ``sum(c) == 1``, so a constant passes
+            # into ``S_inf`` 1:1 and contributes nothing to ``A``,
+            # ``Δ_tail``, ``Δ_model``, the residual or the verdict.  That is
+            # the right treatment and it is deliberate.
+            #
+            # What it COSTS is that this term is then pinned at ``N₃`` and
+            # never extrapolated, so ``S_inf`` carries a band-truncated
+            # static Coulomb hole that the reported extrapolation bar does
+            # not cover.  That residual is invisible by construction — a
+            # constant cancels out of every diagnostic above — which is why
+            # it is measured separately and reported by name
+            # (``_invalid_static_coh_by_bracket`` →
+            # ``band_extrapolation.static_limit_tail_ruling``) instead of
+            # being asserted away in a comment, as it was here.
             if sigma_static_host is not None:
                 for d, ix5 in enumerate(tile_index):
                     tile_acc[d][0] += sigma_static_host[tuple(ix5[2:])][None, ...]
@@ -1222,4 +1338,5 @@ def compute_sigma_c_ppm_omega_grid(
         omega_ev=np.asarray(omega_req * RYD_TO_EV, dtype=np.float64),
         sigma_c_kij=sigma_kij_req,
         band_counts=tuple(int(c) for c in plan.counts),
+        static_coh_at_counts=static_coh_at_counts,
     )

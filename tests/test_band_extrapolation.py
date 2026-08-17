@@ -979,3 +979,195 @@ def test_sc_tolerance_ruling_does_not_refuse():
     inside, text = sc_tolerance_ruling(fit, 1.0e-9)
     assert inside is True
     assert isinstance(text, str) and text            # returned, not raised
+
+
+# ---------------------------------------------------------------------------
+#  A LEADING nspin AXIS ON THE OCCUPANCY MASK  — the 1x1-mesh slice defect
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("brackets", [((0, 12),), ((0, 5), (5, 9), (9, 12))])
+def test_mask_with_a_leading_nspin_axis_gives_the_same_bracketed_sum(brackets):
+    """A ``(1, nk, nb)`` mask must slice on its BAND axis, not on ``nk``.
+
+    THE DEFECT THIS PINS, and why it was in the DEFAULT path.  ``_bracketed``
+    restricted the band range with ``mask_A[:, lo:hi]``.  That is the band axis
+    only while the mask is 2-D ``(nk, nb)``, which is what a 2x2 processor mesh
+    delivers because it squeezes the leading nspin axis.  A 1x1 mesh does NOT
+    squeeze it, so the mask arrives ``(1, nk, nb)`` and ``[:, lo:hi]`` cut
+    ``nk`` instead -- and the G build then died inside ``build_G_tau``'s shape
+    normalisation with ``cannot reshape (1, 9, 52) into (9, 42)``.
+
+    ``brackets=((0, nb),)`` is parametrised deliberately: the trivial
+    SINGLE-bracket plan is the ordinary non-extrapolated Sigma_c, so this was
+    never a band-extrapolation bug.  It was reproduced on clean ``97f6f544``
+    and it broke any GN-PPM run that reached ``_bracketed`` on one GPU.
+
+    The assertion is EXACT equality, not a tolerance: the two masks carry the
+    same bits, so a correct slice makes the two runs the same program.
+    """
+    mesh = _mesh_1x1()
+    nb = 12
+    # nk > nb ON PURPOSE.  The bad slice was ``mask_A[:, lo:hi]`` on a
+    # ``(1, nk, nb)`` array, which cuts nk to (hi-lo).  With nk <= nb that is
+    # a no-op for the trivial bracket ``(0, nb)`` and the SINGLE-bracket arm
+    # silently passes even against the defect -- verified: at 9444c724 with
+    # nk=8, nb=12 the 3-bracket arm failed and the 1-bracket arm did not.
+    # The reported single-bracket reproduction was ``(1, 20, 20) -> (64, 20)``,
+    # i.e. nk=64 against nb=20, so nk > nb is the condition that makes the
+    # DEFAULT path observable.  Both arms must fail at base and pass here.
+    # kgrid must multiply out to nk -- the gw_conv FFI checks it.
+    op = _operands(mesh, nk=16, nb=nb)
+    two_d = _run_tau(mesh, op, brackets, merged_x=True, kgrid=(4, 2, 2))
+
+    op3 = dict(op)
+    op3['mask_A'] = jnp.reshape(op['mask_A'], (1,) + op['mask_A'].shape)
+    assert op3['mask_A'].ndim == 3
+    three_d = _run_tau(mesh, op3, brackets, merged_x=True, kgrid=(4, 2, 2))
+
+    assert two_d.shape == three_d.shape, (
+        f"a leading nspin axis on the mask changed the output SHAPE: "
+        f"{two_d.shape} vs {three_d.shape} -- the slice cut the wrong axis.")
+    assert np.array_equal(two_d, three_d), (
+        f"a leading nspin axis on the mask changed the VALUES: "
+        f"max|delta| = {float(np.max(np.abs(three_d - two_d))):.3e}")
+
+
+# ---------------------------------------------------------------------------
+#  THE STATIC-LIMIT CONTAMINANT  — the check the per-compute_mode guard cannot
+#  make, because the compute_mode genuinely IS gn_ppm
+# ---------------------------------------------------------------------------
+
+def _fit_for_static_tests():
+    N = np.array([42, 46, 52])
+    return N, fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+
+
+def test_a_constant_offset_moves_S_inf_and_nothing_else():
+    """Why folding the static-limit term into bracket 0 is the RIGHT fold.
+
+    ``ppm_sigma`` adds the invalid-pole static-COHSEX term to bracket 0 only,
+    so after the cumulative sum it is a CONSTANT on the three band-count
+    points.  This estimator is affine, so a constant reaches ``S_inf`` 1:1 and
+    perturbs no diagnostic -- which makes the fold exactly equivalent to
+    "extrapolate the dynamical part, then add the static part back".  That
+    equivalence is the whole reason a static Coulomb hole inside a GN-PPM
+    Sigma does not get run through the 1/N law, and it is pinned here so a
+    future editor cannot "fix" the fold into a per-bracket one.
+    """
+    N, fit = _fit_for_static_tests()
+    C = 0.37
+    fit2 = fit_band_extrapolation(N, fit.s_at_counts + C)
+    assert np.max(np.abs((fit2.s_inf - fit.s_inf) - C)) < 1e-13
+    for nm, a, b in (("A", fit.amplitude, fit2.amplitude),
+                     ("delta_tail", fit.delta_tail, fit2.delta_tail),
+                     ("delta_model", fit.delta_model, fit2.delta_model),
+                     ("residual", fit.residual, fit2.residual)):
+        assert np.max(np.abs(np.asarray(b) - np.asarray(a))) < 1e-12, nm
+    # ... and therefore the verdict cannot see it either.
+    assert trust_verdict(fit) == trust_verdict(fit2)
+
+
+def test_static_limit_ruling_is_silent_on_a_band_independent_term():
+    """No band dependence, nothing omitted -- the ruling must not cry wolf."""
+    from gw.band_extrapolation import static_limit_tail_ruling
+    N, fit = _fit_for_static_tests()
+    flat = np.stack([np.full_like(np.asarray(fit.s_inf), -0.30)
+                     for _ in N])
+    exceeds, text, stats = static_limit_tail_ruling(fit, flat)
+    assert exceeds is False
+    assert stats["span_max_ev"] == 0.0
+    # Not exactly zero: it is C * (sum(weights) - 1), and that residual is
+    # ~8e-15 rather than 0 -- the module docstring's "sum(c) == 1 identically"
+    # is true analytically and not in IEEE arithmetic.  Pinned so the claim
+    # cannot quietly become load-bearing.
+    assert stats["delta_static_max_ev"] < 1e-12
+
+
+def test_static_limit_ruling_measures_the_tail_it_omits():
+    """A 1/N static term: the omitted tail is exactly the term's own residual.
+
+    THE NUMBER THE PER-compute_mode GUARD CANNOT PRODUCE.  ``sigma_dispatch``
+    refuses the extrapolation on a static ``compute_mode``, but
+    ``ppm_invalid_mode = "static_limit"`` -- the shipping default -- puts a
+    static Coulomb hole inside a Sigma whose mode IS ``gn_ppm``, one logical
+    ISDF mode at a time.  This is that check, moved below the mode.
+    """
+    from gw.band_extrapolation import static_limit_tail_ruling
+    N, fit = _fit_for_static_tests()
+    base = np.asarray(fit.s_inf)
+    # C(N) = -0.30 - 0.9/N: an exact two-parameter tail, so the estimator
+    # recovers the limit -0.30 and the omitted tail must be |C(N3) - (-0.30)|.
+    C = np.stack([np.full_like(base, -0.30 - 0.9 / n) for n in N])
+    exceeds, text, stats = static_limit_tail_ruling(fit, C)
+    assert abs(stats["delta_static_median_ev"] - 0.9 / N[-1]) < 1e-12
+    assert stats["span_median_ev"] > 0.0, (
+        "a band-DEPENDENT static term must report a nonzero span; the span is "
+        "the direct refutation of the 'band-count independent' claim that "
+        "used to justify the bracket-0 fold in ppm_sigma.")
+    # ESCALATION IS A COMPARISON, NOT A CONSTANT.  This fit's own correction is
+    # 30/N3 eV, so its p90 bar is 0.15*30/52 = 86.5 meV against a 17.3 meV
+    # static tail -- the omission is real, measured, and SMALLER than the bar
+    # the run already quotes, which is exactly the case that must NOT escalate.
+    # The escalating case is covered separately below.
+    assert abs(stats["ratio_median"]
+               - stats["delta_static_median_ev"] / stats["bar_median_ev"]) < 1e-12
+    assert exceeds is (stats["ratio_median"] > 1.0)
+    assert exceeds is False
+    assert "static-limit" in text and "ppm_invalid_mode = zero" not in text
+
+
+def test_static_limit_ruling_warns_and_does_not_refuse():
+    """It must not raise.  BOTH sides of this are shipping defaults.
+
+    ``ppm_invalid_mode`` defaults to ``static_limit`` and
+    ``use_band_extrapolation`` now defaults to True, so a refusal on their
+    conjunction would refuse the configuration the code ships with -- the same
+    reasoning that keeps ``sc_tolerance_ruling`` a warning.
+    """
+    from gw.band_extrapolation import static_limit_tail_ruling
+    N, fit = _fit_for_static_tests()
+    base = np.asarray(fit.s_inf)
+    C = np.stack([np.full_like(base, -3.0 - 500.0 / n) for n in N])
+    exceeds, text, stats = static_limit_tail_ruling(fit, C)   # must not raise
+    assert exceeds is True
+    assert isinstance(text, str) and text
+
+
+def test_static_limit_ruling_refuses_a_mismatched_bracket_plan():
+    """Comparing a static term built on other band counts is meaningless."""
+    from gw.band_extrapolation import static_limit_tail_ruling
+    N, fit = _fit_for_static_tests()
+    base = np.asarray(fit.s_inf)
+    with pytest.raises(ValueError, match="SAME cumulative band counts"):
+        static_limit_tail_ruling(fit, np.stack([base, base]))
+    with pytest.raises(ValueError, match="state axes"):
+        static_limit_tail_ruling(
+            fit, np.stack([np.zeros(base.shape + (2,))] * 3))
+
+
+def test_static_limit_ruling_does_not_escalate_on_a_ratio_of_two_zeros():
+    """A near-zero tail must not escalate however it compares to a ~0 bar.
+
+    MEASURED, not anticipated.  On a Si arm whose three bracket points came
+    out bit-identical -- the brackets above the deck's real band window
+    contributed exactly nothing, so ``Delta_tail`` was 0 -- this ruling
+    divided a ~1e-9 meV tail by a ~1e-14 meV bar, reported ``ratio = 122880``
+    and escalated on a run whose true omission was zero to every digit it
+    printed.  A ratio of two numbers that are both ~0 is not a signal, and a
+    warning that fires there would train its reader to ignore it.
+    """
+    from gw.band_extrapolation import (
+        static_limit_tail_ruling, STATIC_LIMIT_TAIL_FLOOR_EV)
+    N = np.array([62, 90, 100])
+    # Three IDENTICAL points: the exact degenerate case observed.
+    fit = fit_band_extrapolation(N, np.full((3, 4), 1.088910))
+    assert float(np.max(np.abs(fit.delta_tail))) == 0.0
+    C = np.stack([np.full((4,), -1e-9 * (1.0 + 1e-3 * i)) for i in range(3)])
+    exceeds, text, stats = static_limit_tail_ruling(fit, C)
+    assert stats["ratio_median"] > 1.0, (
+        "the guarded case is precisely the one where the RATIO is large")
+    assert stats["delta_static_median_ev"] < STATIC_LIMIT_TAIL_FLOOR_EV
+    assert exceeds is False, (
+        f"escalated on a {stats['delta_static_median_ev'] * 1e3:.3e} meV tail "
+        f"because the bar was {stats['bar_median_ev'] * 1e3:.3e} meV")
+    assert "Nothing to act on" in text

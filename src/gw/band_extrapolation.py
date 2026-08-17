@@ -1046,6 +1046,194 @@ def sc_tolerance_ruling(fit: ExtrapolationFit, tol_ev: float,
     return inside, "\n".join(lines)
 
 
+#: How large the static-limit term's own band tail may be, as a fraction of
+#: the extrapolation bar the run reports, before
+#: :func:`static_limit_tail_ruling` escalates from a statement to a warning.
+#:
+#: NOT A MEASURED THRESHOLD, and said so plainly rather than dressed up: it is
+#: 1.0, i.e. "escalate exactly when the unreported error term reaches the size
+#: of the reported one".  That is a definition, not a calibration, and it is
+#: the only bar that does not require a constant nobody has measured.  The
+#: numbers it is meant to catch are in
+#: ``sandbox:reports/ppm_static_limit_extrapolation_2026-08-16/``.
+STATIC_LIMIT_TAIL_WARN_FRACTION: float = 1.0
+
+#: Absolute floor, eV, below which the omitted static tail is not escalated no
+#: matter how it compares to the bar.
+#:
+#: THIS EXISTS BECAUSE A RATIO OF TWO NEAR-ZERO NUMBERS IS NOT A SIGNAL, and
+#: that was MEASURED rather than anticipated: on a Si arm whose three bracket
+#: points came out bit-identical (the brackets above the deck's real band
+#: window contributed exactly nothing, so ``Delta_tail`` was 0), the ruling
+#: divided a ~1e-9 meV tail by a ~1e-14 meV bar and reported
+#: ``ratio = 122880``, escalating on a run where the true omission was zero to
+#: every digit printed.  ``1e-4 eV`` = 0.1 meV is the default ``sc_tol_ev``,
+#: i.e. the tightest tolerance anything in this code asks for; below it there
+#: is no quantity this term could change.
+STATIC_LIMIT_TAIL_FLOOR_EV: float = 1.0e-4
+
+
+def static_limit_tail_ruling(
+    fit: ExtrapolationFit,
+    static_coh_at_counts,
+    *,
+    quantile: str = "p90",
+    warn_fraction: float = STATIC_LIMIT_TAIL_WARN_FRACTION,
+    floor_ev: float = STATIC_LIMIT_TAIL_FLOOR_EV,
+) -> tuple:
+    """How much of ``S_inf`` is a static Coulomb hole that was NOT extrapolated.
+
+    Returns ``(exceeds: bool, text: str, stats: dict)``.
+
+    THE HOLE THIS CLOSES.  ``sigma_dispatch``'s PPM-only guard keeps this
+    estimator away from a static Coulomb hole, because the ``1/N → 0`` limit
+    ANTI-converges for one — 94.9 → 288.2 meV MAE as nband goes 60 → 124,
+    ~340 meV past BerkeleyGW's exact closure (module docstring).  That guard
+    reads ``compute_mode``.  ``ppm_invalid_mode = "static_limit"`` — the
+    SHIPPING DEFAULT — adds an analytic static-COHSEX term for every pole whose
+    fitted ``Ω² < 0``, and it does so *underneath* the mode: the
+    ``compute_mode`` genuinely IS ``gn_ppm``, so a per-``compute_mode`` check
+    cannot observe a per-MODE contaminant and this survived registration
+    unmeasured.  **This function is that check moved to the level where the
+    contamination happens** — it triggers on the term itself, at whatever
+    ``compute_mode``, and it reports a number rather than an opinion.
+
+    WHAT IS ALREADY RIGHT, AND MUST NOT BE "FIXED".  ``ppm_sigma`` folds the
+    static term into bracket 0 ONLY, so it is a CONSTANT on the band-sum
+    series.  This estimator is affine with ``sum(c) == 1``, so a constant
+    passes into ``S_inf`` exactly 1:1 and contributes NOTHING to ``A``,
+    ``Δ_tail``, ``Δ_model``, the residual or :func:`trust_verdict`.  That is
+    equivalent to extrapolating the dynamical part alone and adding the static
+    part back afterwards, which is the correct treatment and is what the
+    anti-convergence measurement demands.  Band-resolving the term — making
+    ``S(N_i)`` carry ``Σ_static(N_i)`` — would feed a static Coulomb hole to
+    the 1/N law and is the one change this ruling exists to argue against.
+
+    WHAT IS LEFT, AND WHY IT IS INVISIBLE WITHOUT THIS.  A constant is not
+    band-count independent just because it is treated as one.  The term's
+    Coulomb-hole half runs over ``s.full`` with no occupation projector
+    (``cohsex_sigma.sigma_coh``), so it carries the same slowly convergent
+    unoccupied tail everything else here is about — and folding it in as a
+    constant pins it at ``N₃`` and never extrapolates it.  ``S_inf`` therefore
+    contains a band-truncated static Coulomb hole whose remaining tail the
+    reported bar does NOT cover, and *because* it is a constant, every
+    diagnostic above is blind to it by construction.  Nothing in the fit can
+    see this.  Only a separate measurement can, which is what
+    ``ppm_sigma._invalid_static_coh_by_bracket`` supplies.
+
+    THE NUMBER.  ``delta_static = Σ_i c_i·C(N_i) − C(N₃)`` — the correction
+    this estimator WOULD apply to the static term if it were allowed to.  It
+    is not applied; it is the SCALE of what is missing.  Its true magnitude is
+    smaller (the 1/N law overshoots a static CH), so ``delta_static`` is an
+    upper bound on the omitted tail rather than an estimate of it, and it is
+    reported that way.
+
+    ``span`` = ``C(N₃) − C(N₁)`` is quoted beside it as the direct refutation
+    of "this term is band-count independent": if that claim were true the span
+    would be zero.
+
+    Parameters
+    ----------
+    fit
+        The band-diagonal fit whose ``S_inf`` this qualifies.
+    static_coh_at_counts : ``(3, ...)`` array, eV
+        CUMULATIVE static-limit Coulomb-hole term at each of ``fit.counts``,
+        on the SAME trailing state axes as ``fit.s_inf``.
+    """
+    C = np.asarray(static_coh_at_counts)
+    if C.shape[0] != fit.counts.size:
+        raise ValueError(
+            f"static_limit_tail_ruling: static term has {C.shape[0]} band "
+            f"points but the fit has {fit.counts.size}.  They must be the "
+            f"SAME cumulative band counts — a mismatch means the two were "
+            f"built from different bracket plans, and comparing them would "
+            f"be meaningless rather than merely wrong.")
+    if C.shape[1:] != np.shape(fit.s_inf):
+        raise ValueError(
+            f"static_limit_tail_ruling: static term state axes {C.shape[1:]} "
+            f"!= fit state axes {np.shape(fit.s_inf)}.")
+
+    w = extrapolation_weights(fit.counts)
+    wb = w.reshape((-1,) + (1,) * (C.ndim - 1))
+    delta_static = np.sum(wb * C, axis=0) - C[-1]
+    span = C[-1] - C[0]
+
+    d = np.abs(np.real(delta_static))
+    d_med, d_max = float(np.median(d)), float(np.max(d))
+    s = np.abs(np.real(span))
+    bar_med, bar_max = tolerance_bar_ev(fit, quantile)
+    ratio = d_med / bar_med if bar_med > 0.0 else float("inf")
+    # BOTH conditions, and the floor is the one that stops a 0/0.  A tail
+    # below STATIC_LIMIT_TAIL_FLOOR_EV cannot move any quantity this code
+    # reports, so however it compares to a bar that is itself ~0, there is
+    # nothing to escalate.  See that constant for the run that proved it.
+    exceeds = bool(ratio > warn_fraction and d_med > floor_ev)
+
+    stats = {
+        "delta_static_median_ev": d_med,
+        "delta_static_max_ev": d_max,
+        "span_median_ev": float(np.median(s)),
+        "span_max_ev": float(np.max(s)),
+        "bar_median_ev": bar_med,
+        "bar_max_ev": bar_max,
+        "ratio_median": ratio,
+        "floor_ev": float(floor_ev),
+    }
+
+    head = ("*** STATIC-LIMIT TERM'S BAND TAIL EXCEEDS THE REPORTED "
+            "EXTRAPOLATION BAR ***" if exceeds else
+            "static-limit term inside the extrapolation bar")
+    lines = [
+        f"     -- ppm_invalid_mode = static_limit, INSIDE a band-extrapolated "
+        f"Sigma_c --",
+        f"     {head}",
+        f"       band-count SPAN  C(N3)-C(N1) = {stats['span_median_ev'] * 1e3:11.4f} meV "
+        f"median over states, {stats['span_max_ev'] * 1e3:.4f} meV max",
+        f"       omitted tail (upper bound)   = {d_med * 1e3:11.4f} meV "
+        f"median over states, {d_max * 1e3:.4f} meV max",
+        f"       reported extrapolation {quantile:<4s}  = {bar_med * 1e3:11.4f} meV "
+        f"median over states, {bar_max * 1e3:.4f} meV max",
+        f"       ratio (median/median)        = {ratio:11.4f}  "
+        f"(warn above {warn_fraction:.2f} AND tail above "
+        f"{floor_ev * 1e3:.3f} meV)",
+        f"       WHAT THIS IS.  The static-COHSEX term this run adds for its "
+        f"invalid PPM poles is folded into bracket 0 as a CONSTANT, which is "
+        f"CORRECT: a static Coulomb hole must not be run through the 1/N law "
+        f"(it anti-converges, ~340 meV past the exact answer, and gets WORSE "
+        f"with more bands).  The constant reaches S_inf 1:1 and moves no "
+        f"diagnostic above.",
+        f"       WHAT IT COSTS.  A SPAN of {stats['span_median_ev'] * 1e3:.3f} meV is a "
+        f"measurement that the term is NOT band-count independent, so pinning "
+        f"it at N3={int(fit.counts[-1])} leaves a static tail in S_inf that "
+        f"the bar above does NOT cover.  The omitted-tail number is what this "
+        f"estimator WOULD have applied and is an UPPER BOUND on the true "
+        f"omission, not an estimate of it.",
+    ]
+    if exceeds:
+        lines += [
+            f"       SO: the quoted extrapolation bar UNDERSTATES the band-"
+            f"convergence error of S_inf on a typical state, because the "
+            f"largest single band-truncation term left in it is not in the "
+            f"fit at all.  Either raise nband until the span collapses, or "
+            f"set `ppm_invalid_mode = zero` (BGW mode 0), which DROPS the "
+            f"invalid poles instead of making them static and leaves nothing "
+            f"here to omit.  Both are deck changes; neither is a code fix.",
+        ]
+    elif d_med <= floor_ev:
+        lines.append(
+            f"       The omitted static tail is below {floor_ev * 1e3:.3f} meV "
+            f"in absolute terms, so it cannot move any quantity this run "
+            f"reports and the ratio beside it is a ratio of two numbers that "
+            f"are both ~0.  Nothing to act on.")
+    else:
+        lines.append(
+            f"       The omitted static tail is smaller than the bar already "
+            f"reported, so quoting the bar is not misleading at this band "
+            f"count.  It is still a SEPARATE error term and does not belong "
+            f"inside it.")
+    return exceeds, "\n".join(lines), stats
+
+
 #: Dataset names the fit contributes to ``sigma_mnk.h5``, all ``(nk, nb)``
 #: band-diagonal and all in eV — the same unit and the same band diagonal as
 #: ``sigma_c_kij_ev``'s, evaluated at the same E_nk on the same ω grid.
