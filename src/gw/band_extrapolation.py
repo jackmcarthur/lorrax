@@ -704,6 +704,174 @@ def plan_band_brackets(
     )
 
 
+class BandBracketCountMismatch(BandExtrapolationRefused):
+    """The bracket partition and the OLS abscissae describe different sums.
+
+    A separate name from :class:`BandExtrapolationRefused` because it is a
+    different KIND of fault: the other refusals are about a deck that asked
+    for something the physics cannot deliver, and the operator fixes them by
+    changing a key.  This one is about the CODE having wired the planner to a
+    band count the Σ sum does not walk, and the operator cannot fix it at all.
+    Subclassed rather than freestanding so an ``except
+    BandExtrapolationRefused`` that means "the extrapolation cannot run here"
+    still catches it.
+    """
+
+
+def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
+                                        meta=None, where: str = "") -> None:
+    """Refuse unless the partition and the abscissae are the SAME band sum.
+
+    WHY THIS EXISTS, AND WHY NOTHING DOWNSTREAM CAN REPLACE IT.  Bracketing
+    the wrong band count is invisible in every weight-level diagnostic there
+    is.  :func:`extrapolation_weights` solves OLS in ``x = 1/N``, and its
+    coefficients depend only on the RATIOS of the abscissae (the ``x - xbar``
+    terms are homogeneous of degree 1 in ``1/N``, and ``xbar*(x-xbar)/Sxx``
+    is therefore scale-free).  The sampling fractions are the same
+    0.80/0.90/1.00 of whichever count is used, so the ratios are the same
+    too, and the weights barely move:
+
+        counts (80, 90, 100)     -> c = [-4.295082, +0.663934, +4.631148]
+        counts (198, 223, 248)   -> c = [-4.254729, +0.663885, +4.590844]
+
+    — 0.94 % apart at the largest coefficient, and ``sum(c) == 1`` in both.
+    So a run that brackets the WRONG count applies a nearly-correct operator
+    to the wrong three partial sums.  ``c`` is still real, so Σ_∞ is still
+    exactly Hermitian; the SC loop still converges; ``trust_verdict`` still
+    reads ordinary, because it inspects the fit's own residual structure and
+    that structure is self-consistent on the wrong curve.  There is no
+    downstream check that can see it.  Only the site where the plan meets the
+    band axis it will slice can, which is why this is called there.
+
+    WHAT IS COMPARED — the actual objects, never a second derivation of the
+    same number.  Re-deriving "the Σ count" here would be worthless: a rewire
+    that fed the planner the χ count would rewire the expectation with it and
+    the check would pass vacuously.  So:
+
+      * the abscissae are checked against THE PARTITION ITSELF — every
+        interior ``counts[i]`` must BE the cumulative top of bracket ``i``,
+        because those are the band sums the kernel will actually deliver;
+      * the partition is checked against ``slices``, the SAME
+        :class:`~gw.wavefunction_bundle.BandSlices` object from which
+        ``ppm_sigma._run_sigma_branch`` builds the ψ/E/mask operands it then
+        slices.  ``slices.nb_sigma_sum`` is the Σ band sum's extent; a plan
+        built from ``nb_full`` / ``b_id_4_user`` (the LOADED extent,
+        ``max(chi, sigma)``) or from the χ count disagrees with it the moment
+        the deck is split.
+
+    Parameters
+    ----------
+    plan
+        The plan whose ``bounds`` the τ kernel will slice by and whose
+        ``counts`` the OLS will use as abscissae.
+    slices
+        The band slices the Σ operands are built from.
+    meta
+        Optional; when given, ``meta.b_id_4_sigma_user`` supplies the LOGICAL
+        Σ top so the unpadded abscissa is checked too.
+    where
+        Call-site tag for the message.
+
+    Raises
+    ------
+    BandBracketCountMismatch
+    """
+    tag = f" ({where})" if where else ""
+    bounds = tuple(plan.bounds)
+    counts = tuple(plan.counts)
+
+    def refuse(what: str, detail: str) -> None:
+        raise BandBracketCountMismatch(
+            f"band extrapolation{tag}: {what}.\n"
+            f"  {detail}\n"
+            f"  THE BRACKET PARTITION AND THE OLS ABSCISSAE MUST BE THE SAME "
+            f"BAND SUM.  The partition is what the τ kernel slices "
+            f"(`ppm_tau_kernel._bracketed`, operands `[..., lo:hi]`); the "
+            f"abscissae are the N_i that `extrapolation_weights` inverts.  "
+            f"They are checked here and nowhere else because a mismatch is "
+            f"INVISIBLE downstream: OLS in 1/N depends only on the RATIOS of "
+            f"the abscissae, and the fractions are the same 0.80/0.90/1.00 "
+            f"of whichever count, so the weights move under 1 % — "
+            f"(80, 90, 100) gives [-4.295, +0.664, +4.631] and "
+            f"(198, 223, 248) gives [-4.255, +0.664, +4.591].  A wrong-count "
+            f"run therefore produces a Hermitian Σ, converges, and prints "
+            f"entirely ordinary numbers.\n"
+            f"  THE COUNT THIS FEATURE BRACKETS IS `number_bands_sigma`, via "
+            f"`BandSlices.sigma_sum` / `nb_sigma_sum` and "
+            f"`meta.b_id_4_sigma_user`.  It is NEVER `number_bands_chi`, and "
+            f"NEVER the LOADED extent max(chi, sigma) — which is what "
+            f"`BandSlices.full` / `nb_full` and `meta.b_id_4_user` carry, "
+            f"both of which read like 'all the bands' and are not.  Raising "
+            f"`number_bands_chi` will not clear this; it is not a deck fault "
+            f"at all.  Fix the planner call site "
+            f"(`gw.ppm_pipeline`), not the deck.")
+
+    # (1) THE ABSCISSAE MUST BE THE PARTITION.  Read off the bounds, so this
+    # cannot be satisfied by a plan whose counts were computed from anything
+    # other than the cuts the kernel will actually make.
+    if len(counts) != len(bounds):
+        refuse(f"the plan has {len(bounds)} bracket(s) but {len(counts)} "
+               f"OLS abscissa(e)",
+               f"bounds={bounds}, counts={counts}")
+    if bounds[0][0] != 0:
+        refuse("the bracket partition does not start at band 0",
+               f"first bracket is {bounds[0]}; the cumulative sums the "
+               f"abscissae name are all measured from band 0")
+    for i in range(len(bounds) - 1):
+        if bounds[i][1] != bounds[i + 1][0]:
+            refuse(f"the bracket partition has a gap or overlap at cut {i}",
+                   f"bracket {i} ends at {bounds[i][1]} and bracket {i + 1} "
+                   f"starts at {bounds[i + 1][0]}; a non-partition makes the "
+                   f"cumulative sums something other than S(N_i)")
+        if bounds[i][1] != counts[i]:
+            refuse(f"OLS abscissa {i} is not the band count bracket {i} "
+                   f"delivers",
+                   f"counts[{i}]={counts[i]} but the cumulative top of "
+                   f"bracket {i} is {bounds[i][1]}")
+
+    # (2) THE PARTITION MUST BE THE Σ BAND SUM.  ``slices`` is the object
+    # ``_run_sigma_branch`` builds the operands from, so this ties the plan to
+    # the band axis it will actually slice rather than to a repeat of the
+    # arithmetic that built it.
+    nb_sigma_padded = int(slices.nb_sigma_sum)
+    if int(bounds[-1][1]) != nb_sigma_padded:
+        extra = ""
+        nb_full = int(getattr(slices, "nb_full", -1))
+        nb_chi = int(getattr(slices, "nb_chi_sum", -1))
+        if int(bounds[-1][1]) == nb_full:
+            extra = (f"  That value IS the LOADED extent nb_full={nb_full} "
+                     f"= max(chi, sigma) — the classic wrong reach.")
+        elif int(bounds[-1][1]) == nb_chi:
+            extra = (f"  That value IS the χ count nb_chi_sum={nb_chi}.")
+        refuse(
+            f"the bracket partition spans {bounds[-1][1]} bands but the Σ "
+            f"band sum is {nb_sigma_padded} bands",
+            f"last bracket is {bounds[-1]}, so the τ kernel would slice to "
+            f"band {bounds[-1][1]}, while the Σ operands are built over "
+            f"slices.nb_sigma_sum = {nb_sigma_padded}.{extra}")
+
+    # (3) THE LARGEST ABSCISSA MUST BE THE LOGICAL Σ TOP.  N₃ is the band sum
+    # the run reports; the padded top may exceed it by the mesh pad, whose ψ
+    # is exactly zero, but nothing else may.
+    if int(counts[-1]) > nb_sigma_padded:
+        refuse(f"the largest OLS abscissa {counts[-1]} exceeds the Σ "
+               f"partition's {nb_sigma_padded} bands",
+               f"counts={counts}, last bracket={bounds[-1]}")
+    if meta is not None:
+        b0 = int(getattr(slices, "b0", 0))
+        logical_top = int(getattr(meta, "b_id_4_sigma_user", 0) or 0)
+        if logical_top:
+            nb_sigma_logical = logical_top - b0
+            if int(counts[-1]) != nb_sigma_logical:
+                refuse(
+                    f"the largest OLS abscissa is {counts[-1]} but the Σ "
+                    f"band sum is {nb_sigma_logical} logical bands",
+                    f"meta.b_id_4_sigma_user={logical_top}, slices.b0={b0}; "
+                    f"N₃ must be the band count the run reports, since the "
+                    f"fit's intercept is quoted as the N→∞ limit of THAT "
+                    f"series")
+
+
 # ---------------------------------------------------------------------------
 #  The fit
 # ---------------------------------------------------------------------------
@@ -1274,8 +1442,10 @@ __all__ = [
     "TAIL_UNCERTAINTY_FRACTION",
     "extrapolation_h5_payload",
     "extrapolation_weights",
+    "BandBracketCountMismatch",
     "BandBracketPlan",
     "BandExtrapolationRefused",
+    "assert_brackets_match_ols_abscissae",
     "ExtrapolationFit",
     "fit_band_extrapolation",
     "format_extrapolation_report",
