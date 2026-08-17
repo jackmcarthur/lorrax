@@ -207,7 +207,7 @@ REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
 # Sigma may consume it: agreement on the stamped support, the exact static
 # identity, and the independent gap-region W reconstruction.
 REQUIRED_INTRABAND_CERTIFICATIONS = (
-    "intraband_sample_max_rel_error",
+    "intraband_total_sample_max_rel_error",
     "intraband_static_max_rel_error",
     "intraband_gap_max_rel_error",
 )

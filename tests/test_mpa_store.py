@@ -64,8 +64,8 @@ _CERT = {"condition_max_allowed": 1.0e12,
          "backward_error_max_allowed": 1.0}
 
 _INTRA_CERT = {
-    "intraband_sample_max_rel_error": 1.0e-4,
-    "intraband_sample_max_rel_error_max_allowed": 4.0e-3,
+    "intraband_total_sample_max_rel_error": 1.0e-4,
+    "intraband_total_sample_max_rel_error_max_allowed": 4.0e-3,
     "intraband_static_max_rel_error": 1.0e-14,
     "intraband_static_max_rel_error_max_allowed": 2.0e-11,
     "intraband_gap_max_rel_error": 8.0e-4,
@@ -995,7 +995,7 @@ def test_v2_fit_prefix_and_intraband_suffix_have_independent_ledgers(
         MS.write_intraband_row(
             tmpdir_path, q, Om, Bp,
             anomaly_counts={"folded_modes": q})
-    with pytest.raises(ValueError, match="intraband_sample"):
+    with pytest.raises(ValueError, match="intraband_total_sample"):
         MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     ledger = MS.finalize_fit_store(
         tmpdir_path, certification=dict(_CERT, **_INTRA_CERT))
@@ -1027,14 +1027,17 @@ def test_intraband_row_scalars_land_as_one_per_q_attribute_vector(
             tmpdir_path, q,
             np.full((1, 2, 2), 0.05 - 0.001j),
             np.ones((1, 2, 2), np.complex128),
-            row_scalars={"zero_mode_weight": 1.0e-3 * (q + 1),
+            row_scalars={"block_sample_diag": 0.2 * (q + 1),
+                         "zero_mode_weight": 1.0e-3 * (q + 1),
                          "zero_mode_cluster": float(q)})
     with h5py.File(tmpdir_path, "r") as f:
         weight = np.asarray(f.attrs["mpa_intra_zero_mode_weight"])
         cluster = np.asarray(f.attrs["mpa_intra_zero_mode_cluster"])
+        diagnostic = np.asarray(f.attrs["mpa_intra_block_sample_diag"])
     assert weight.shape == cluster.shape == (n_q,)
     np.testing.assert_allclose(weight, [1.0e-3, 2.0e-3, 3.0e-3])
     np.testing.assert_allclose(cluster, [0.0, 1.0, 2.0])
+    np.testing.assert_allclose(diagnostic, [0.2, 0.4, 0.6])
 
 
 def test_v2_sigma_refuses_a_failed_gap_observable(tmpdir_path):
@@ -1134,7 +1137,7 @@ def test_intraband_block_matches_direct_nonidentity_star_rebuild():
              jax.device_put(jnp.asarray(w), rep),
              (jax.device_put(jnp.asarray(Pv), pair_x_shard),
               jax.device_put(jnp.asarray(Pv), pair_y_shard))),
-            samples, sample_rel_tol=1.0e-10)
+            samples)
 
     parent_row = build(W0, vertices)
     member_W0 = (phase[:, None] * W0[np.ix_(perm, perm)]

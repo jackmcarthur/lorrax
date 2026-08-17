@@ -363,7 +363,8 @@ def _relative_frobenius(model, exact):
     return float(np.asarray(value.block_until_ready()))
 
 
-def _build_intraband_rows(sample_path, V, z, intraband_blocks, mesh_xy):
+def _build_intraband_rows(
+        sample_path, V, z, intraband_blocks, mesh_xy, *, gap_certificates):
     """Build one frozen-static resolvent-moment block at a time."""
     from gw.mpa import intraband_block
 
@@ -377,7 +378,18 @@ def _build_intraband_rows(sample_path, V, z, intraband_blocks, mesh_xy):
         if int(pair_block[0].shape[0]) == 0:
             rows.append(None)
             continue
-        row = intraband_block.build_row(W0bar[iq], pair_block, z_block)
+        row = intraband_block.build_row(
+            W0bar[iq], pair_block, z_block,
+            gap_certificate=gap_certificates.get(iq))
+        if jax.process_index() == 0:
+            print(
+                "  [intraband-freeze] "
+                f"q_row={iq} block_sample_diag="
+                f"{row.sample_max_rel_error:.6e} "
+                f"gap_total={row.gap_max_rel_error:.6e} "
+                f"n_poles={row.n_poles}",
+                flush=True,
+            )
         rows.append(row)
     del Wc0, W0bar
     n_poles = max(
@@ -428,11 +440,12 @@ def _append_intraband_rows(fit_path, rows, slabs, mesh_xy):
             "folded_elements": row.folded_elements,
             "dropped_elements": row.dropped_elements,
         }
-        scalars = {} if row is None else {
+        scalars = ({"block_sample_diag": 0.0} if row is None else {
+            "block_sample_diag": row.sample_max_rel_error,
             "zero_mode_weight": row.zero_mode_weight,
             "zero_mode_pole_shift": row.zero_mode_pole_shift,
             "zero_mode_cluster": float(row.zero_mode_cluster),
-        }
+        })
         mpa_store.write_intraband_row_collective(
             fit_path, iq, Omega[:, None, :, :], Bp[:, None, :, :],
             mesh_xy=mesh_xy, poles_finite=finite, poles_causal=causal,
@@ -573,6 +586,80 @@ def _evaluate_gap_chi(
         energy_reference=float(occupation_state.mu_ry),
         occupation_window_threshold=occ_window)
     return z_gap, tuple(values)
+
+
+def _gap_row_certificates(
+    sample_path, fit_path, V, z_support, z_gap, chi_gap, q_idx, meta,
+    mesh_xy, *, dyson_solver, distrib_la_batched_route,
+):
+    """Return exact total-W §7.1 bisection callbacks for two q rows.
+
+    Each callback measures the candidate appended block only after adding
+    the already-fitted remainder prefix.  Its allowance is the §7.1 rule:
+    three times that candidate's on-support total residual, capped at 4e-3.
+    Block-only errors never enter the decision.
+    """
+    from gw.mpa.intraband_block import SAMPLE_REL_TOL, evaluate_pole_sum
+    from gw.w_isdf import solve_w
+
+    rows = _two_shortest_finite_q_rows(q_idx, meta.kgrid)
+    n_fit = mpa_store.fit_completion_ledger(fit_path)["n_p_fit"]
+    prefix_support_full = _evaluate_fit_prefix(
+        fit_path, n_fit, z_support, mesh_xy)
+    prefix_gap_full = _evaluate_fit_prefix(
+        fit_path, n_fit, z_gap, mesh_xy)
+    prefix_support = tuple(value[rows].copy()
+                           for value in prefix_support_full)
+    prefix_gap = tuple(value[rows].copy() for value in prefix_gap_full)
+    del prefix_support_full, prefix_gap_full
+
+    exact_support = []
+    for index in range(len(z_support)):
+        chi, _ = mpa_store.read_w_slab_collective(
+            sample_path, _CHI, index, mesh_xy=mesh_xy)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        exact_support.append((W - V)[rows].copy())
+        del chi, W
+
+    exact_gap = []
+    for chi_full in chi_gap:
+        chi = _to_wedge(chi_full, q_idx, mesh_xy)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        exact_gap.append((W - V)[rows].copy())
+        del chi, W
+
+    def make_callback(position):
+        def certify(Omega, Bp):
+            support_models = [
+                prefix_support[index][position]
+                + evaluate_pole_sum(
+                    Omega, Bp,
+                    0.0j if index == 0 else z_value)
+                for index, z_value in enumerate(z_support)
+            ]
+            support_exacts = [
+                value[position] for value in exact_support]
+            support_error = _maximum_relative(
+                support_models, support_exacts)
+            gap_models = [
+                prefix_gap[index][position]
+                + evaluate_pole_sum(Omega, Bp, z_value)
+                for index, z_value in enumerate(z_gap)
+            ]
+            gap_exacts = [value[position] for value in exact_gap]
+            gap_error = _maximum_relative(gap_models, gap_exacts)
+            allowed = max(
+                np.finfo(np.float64).eps,
+                min(SAMPLE_REL_TOL, 3.0 * support_error))
+            return gap_error, allowed
+        return certify
+
+    return {int(row): make_callback(position)
+            for position, row in enumerate(rows)}
 
 
 def _certify_intraband_gap(
@@ -967,25 +1054,37 @@ def build_mpa_fit(
         from common.collectives import barrier, process_rank
         from gw.mpa import intraband_block
 
-        rows, n_p_intra = _build_intraband_rows(
-            sample_path, V, z_all, intraband_blocks, mesh_xy)
-        slabs, Omega_intra, B_intra = _padded_intraband_arrays(
-            rows, n_p_intra, meta.n_rmu, mesh_xy)
+        # Reserve the bounded analytic suffix, fit the remainder first, then
+        # let the disjoint total-W gap observable drive block bisection.
+        # Dark causal padding keeps the on-disk suffix shape fixed at the
+        # design's M_p<=6 allocation while rows stop independently.
+        n_p_intra = intraband_block.MAX_CLUSTERS
         _, report = _fit_body(
             sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
             provenance=provenance, occupation_state=occupation_state,
             n_extra_poles=n_p_intra, finalize=False)
-        _append_intraband_rows(fit_path, rows, slabs, mesh_xy)
-
         dyson = config.backend.w_dyson_solver
         distrib_route = getattr(
             config.backend, "distrib_la_batched_route", "auto")
+        z_gap, chi_gap = _evaluate_gap_chi(
+            wfns, occupation_state, config, meta, mesh_xy)
+        gap_certificates = _gap_row_certificates(
+            sample_path, fit_path, V, z_all, z_gap, chi_gap, q_idx, meta,
+            mesh_xy, dyson_solver=dyson,
+            distrib_la_batched_route=distrib_route)
+        rows, n_p_intra = _build_intraband_rows(
+            sample_path, V, z_all, intraband_blocks, mesh_xy,
+            gap_certificates=gap_certificates)
+        n_p_built = n_p_intra
+        n_p_intra = intraband_block.MAX_CLUSTERS
+        slabs, Omega_intra, B_intra = _padded_intraband_arrays(
+            rows, n_p_intra, meta.n_rmu, mesh_xy)
+        _append_intraband_rows(fit_path, rows, slabs, mesh_xy)
+
         support_cert = _certify_intraband_support(
             sample_path, fit_path, V, z_all, Omega_intra, B_intra,
             meta, mesh_xy, dyson_solver=dyson,
             distrib_la_batched_route=distrib_route)
-        z_gap, chi_gap = _evaluate_gap_chi(
-            wfns, occupation_state, config, meta, mesh_xy)
         gap_cert = _certify_intraband_gap(
             fit_path, V, z_gap, chi_gap, q_idx, Omega_intra, B_intra,
             meta, mesh_xy, dyson_solver=dyson,
@@ -997,9 +1096,9 @@ def build_mpa_fit(
                 3.0 * support_cert["total_sample_frobenius_relative"]))
         certification = dict(report["certification"])
         certification.update({
-            "intraband_sample_max_rel_error":
-                support_cert["block_sample_frobenius_relative"],
-            "intraband_sample_max_rel_error_max_allowed":
+            "intraband_total_sample_max_rel_error":
+                support_cert["total_sample_frobenius_relative"],
+            "intraband_total_sample_max_rel_error_max_allowed":
                 intraband_block.SAMPLE_REL_TOL,
             "intraband_static_max_rel_error":
                 support_cert["static_frobenius_relative"],
@@ -1016,7 +1115,7 @@ def build_mpa_fit(
                 gap_cert["fit_only_frobenius_relative"],
             "intraband_gap_q_rows": ",".join(
                 map(str, np.asarray(gap_cert["q_rows"]).tolist())),
-            "intraband_builder_max_compression_rel_error": max(
+            "intraband_block_sample_diag_max": max(
                 (row.sample_max_rel_error for row in rows
                  if row is not None), default=0.0),
             "intraband_builder_max_cluster_width_ry": max(
@@ -1037,12 +1136,15 @@ def build_mpa_fit(
             fit_path, key="intraband-finalized")
         report["certification"] = certification
         report["n_p_intraband"] = n_p_intra
+        report["n_p_intraband_built"] = n_p_built
         report["n_p_total"] = ledger["n_p"]
         report["intraband_support"] = support_cert
         report["intraband_gap"] = gap_cert
         print_fn(
             "  MPA intraband block: "
-            f"M_p={n_p_intra}, support="
+            f"M_p={n_p_built}/{n_p_intra}, total_support="
+            f"{support_cert['total_sample_frobenius_relative']:.3e}, "
+            f"block_sample_diag="
             f"{support_cert['block_sample_frobenius_relative']:.3e}, "
             f"static={support_cert['static_frobenius_relative']:.3e}, "
             f"gap={gap_cert['with_block_frobenius_relative']:.3e} "

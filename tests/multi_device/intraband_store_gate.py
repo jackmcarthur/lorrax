@@ -29,8 +29,8 @@ N_INTRA = 1
 CERT = {
     "condition_max_allowed": 1.0e12,
     "backward_error_max_allowed": 1.0,
-    "intraband_sample_max_rel_error": 2.0e-4,
-    "intraband_sample_max_rel_error_max_allowed": 4.0e-3,
+    "intraband_total_sample_max_rel_error": 2.0e-4,
+    "intraband_total_sample_max_rel_error_max_allowed": 4.0e-3,
     "intraband_static_max_rel_error": 2.0e-14,
     "intraband_static_max_rel_error_max_allowed": 2.0e-11,
     "intraband_gap_max_rel_error": 6.0e-4,

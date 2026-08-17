@@ -50,7 +50,9 @@ class IntrabandRow:
     B_p: jax.Array
     n_poles: int
     n_modes: int
+    # The frozen-block error at the stored fit samples is diagnostic only.
     sample_max_rel_error: float
+    gap_max_rel_error: float
     static_max_rel_error: float
     certified: bool
     folded_modes: int
@@ -242,7 +244,7 @@ def _frobenius_norm(value):
         jnp.real(jnp.vdot(value, value)))))
 
 
-def _contour_geometry(pair_block, W0bar):
+def _contour_geometry(pair_block, W0bar, *, origin_gap=None):
     """Derived two-sided zeta strip, with the zeta=0 pole excluded."""
     u, w, _vertices = pair_block
     u_host = _host_replicated(u).astype(np.float64, copy=False)
@@ -271,21 +273,19 @@ def _contour_geometry(pair_block, W0bar):
     # strip missed half of both exact totals.  That is a mandatory sum-rule
     # refusal, not a physical model.
     zeta_min = -interaction
-    # Zero must remain outside every V contour.  Keeping both inner edges a
-    # resolved distance from sqrt's branch point is required for T1
-    # quadrature convergence; the independent M/V closures refuse if a mode
-    # falls into this machine-only gap.
-    zero_gap = (
-        np.finfo(np.float64).eps * zeta_max
-        if np.any(w_host < 0.0)
-        else max(0.25 * float(np.min(positive_u2)),
-                 np.finfo(np.float64).eps * zeta_max)
-    )
+    # The initial exclusion is the lowest certified positive bisection edge,
+    # not the machine-epsilon slit previously forced by signed MP1 weights.
+    # A caller may shrink it, but only after the held-out gap certificate asks
+    # for more origin resolution.  M/V closure remains independently binding.
+    minimum_gap = np.finfo(np.float64).eps * zeta_max
+    initial_gap = max(0.25 * float(np.min(positive_u2)), minimum_gap)
+    zero_gap = initial_gap if origin_gap is None else float(origin_gap)
     # The interaction radius is the derived imaginary excursion.  Its only
     # floor is roundoff separation from the real axis.
     height = max(interaction,
                  128.0 * np.finfo(np.float64).eps * zeta_max)
-    if not 0.0 < zero_gap < zeta_max:
+    if (not np.isfinite(zero_gap) or zero_gap < minimum_gap
+            or not zero_gap < zeta_max):
         raise ValueError(
             "GATE intraband_contour_domain: derived two-sided strip cannot "
             "exclude zeta=0: "
@@ -294,9 +294,10 @@ def _contour_geometry(pair_block, W0bar):
     return zeta_min, zero_gap, zeta_max, height
 
 
-def _initial_intervals(pair_block, W0bar):
+def _initial_intervals(pair_block, W0bar, *, origin_gap=None):
     """Three certified tiles, extending negative for signed MP1 weights."""
-    left, zero_gap, right, _height = _contour_geometry(pair_block, W0bar)
+    left, zero_gap, right, _height = _contour_geometry(
+        pair_block, W0bar, origin_gap=origin_gap)
     u2 = np.sort(np.square(np.abs(_host_replicated(pair_block[0]))))
     w = _host_replicated(pair_block[1])
     negative_active = bool(np.any(w < 0.0) and left < -zero_gap)
@@ -355,31 +356,21 @@ def _quadrature_nodes(interval, height, order):
             yield midpoint + half * xi, half * wi
 
 
-def _retarded_sqrt_on_interval(zeta, interval):
-    """Analytic square-root branch local to one side of the zero gap."""
-    if float(interval[1]) < 0.0:
-        # sqrt(-zeta) has its cut on the positive-zeta axis, outside a
-        # negative interval contour.  The -i sheet is the retarded fold.
-        return -1.0j * np.sqrt(-complex(zeta))
-    return np.sqrt(complex(zeta))
-
-
 def _moments_at_order(
-        pair_block, W0bar, intervals, order, V_total, *, height=None):
+        pair_block, W0bar, intervals, order, V_total, *, height=None,
+        origin_gap=None):
     mesh = _mesh_of(W0bar, "_moments_at_order")
     matrix_shard = NamedSharding(mesh, P("x", "y"))
     pole_shard = NamedSharding(mesh, P(None, "x", "y"))
     _left, _zero_gap, _right, max_height = _contour_geometry(
-        pair_block, W0bar)
+        pair_block, W0bar, origin_gap=origin_gap)
     height = max_height if height is None else float(height)
     shape = tuple(W0bar.shape)
-    M_rows, V_rows, T1_rows, T2_rows = [], [], [], []
+    M_rows, V_rows = [], []
     normalization = 1.0 / (2.0j * np.pi)
     for interval in intervals:
         M = jnp.zeros(shape, dtype=jnp.complex128)
         V = jnp.zeros(shape, dtype=jnp.complex128)
-        T1 = jnp.zeros(shape, dtype=jnp.complex128)
-        T2 = jnp.zeros(shape, dtype=jnp.complex128)
         nodes = tuple(_quadrature_nodes(interval, height, order))
         for start in range(0, len(nodes), _RESOLVENT_BATCH_NODES):
             batch = nodes[start:start + _RESOLVENT_BATCH_NODES]
@@ -397,16 +388,11 @@ def _moments_at_order(
                 # -C/lambda.  This minus makes V=R(0).  Subtracting R(0)
                 # analytically removes the nearby but excluded zeta=0 pole.
                 V = V - factor * (R - V_total) / zeta
-                T1 = T1 + factor * _retarded_sqrt_on_interval(
-                    zeta, interval) * R
-                T2 = T2 + factor * zeta * R
         M_rows.append(jax.lax.with_sharding_constraint(M, matrix_shard))
         V_rows.append(jax.lax.with_sharding_constraint(V, matrix_shard))
-        T1_rows.append(jax.lax.with_sharding_constraint(T1, matrix_shard))
-        T2_rows.append(jax.lax.with_sharding_constraint(T2, matrix_shard))
     return tuple(
         jax.lax.with_sharding_constraint(jnp.stack(rows), pole_shard)
-        for rows in (M_rows, V_rows, T1_rows, T2_rows)
+        for rows in (M_rows, V_rows)
     )
 
 
@@ -525,19 +511,21 @@ def _has_plateaued(value, previous):
 
 
 def _cluster_moment_matrices(
-        pair_block, W0bar, intervals, *, moment_rel_tol=MOMENT_REL_TOL):
-    """Contour M/V/T1/T2 with mandatory movement and sum-rule refusals.
+        pair_block, W0bar, intervals, *, moment_rel_tol=MOMENT_REL_TOL,
+        origin_gap=None):
+    """Contour M/V with mandatory movement and sum-rule refusals.
 
-    Returns ``(M, V, T1, T2, closure)``.  ``V`` already carries the §2.4b
-    deflation merge, so both sum rules hold as exact identities on the
-    returned moments.
+    Returns ``(M, V, closure)``.  ``V`` already carries the §2.4b deflation
+    merge, so both sum rules hold as exact identities on the returned
+    moments.  Width-only T1/T2 moments are intentionally absent.
     """
     intervals = tuple((float(lo), float(hi)) for lo, hi in intervals)
     if not intervals or any(not lo < hi for lo, hi in intervals):
         raise ValueError(
             "GATE intraband_contour_intervals: intervals must be nonempty "
             "ordered (lo,hi) pairs")
-    left, zero_gap, right, height = _contour_geometry(pair_block, W0bar)
+    left, zero_gap, right, height = _contour_geometry(
+        pair_block, W0bar, origin_gap=origin_gap)
     negative = tuple(value for value in intervals if value[1] < 0.0)
     positive = tuple(value for value in intervals if value[0] > 0.0)
     negative_domain_ok = (
@@ -576,8 +564,9 @@ def _cluster_moment_matrices(
     v_closure = np.inf
     for order in _QUADRATURE_ORDERS:
         current = _moments_at_order(
-            pair_block, W0bar, intervals, order, V_total)
-        movements = (np.inf,) * 4
+            pair_block, W0bar, intervals, order, V_total,
+            origin_gap=origin_gap)
+        movements = (np.inf,) * 2
         if previous is not None:
             mass_scale = max(
                 sum(_frobenius_norm(current[0][index])
@@ -593,13 +582,7 @@ def _cluster_moment_matrices(
                     for index in range(int(previous[1].shape[0]))),
                 np.finfo(np.float64).tiny,
             )
-            zeta_radius = float(np.hypot(max(abs(left), right), height))
-            scales = (
-                mass_scale,
-                static_scale,
-                np.sqrt(zeta_radius) * mass_scale,
-                zeta_radius * mass_scale,
-            )
+            scales = (mass_scale, static_scale)
             movements = tuple(
                 _frobenius_norm(value - old) / scale
                 for value, old, scale in zip(current, previous, scales))
@@ -611,9 +594,8 @@ def _cluster_moment_matrices(
                 "[intraband-contour] "
                 f"clusters={len(intervals)} order={order} "
                 f"movement={movement:.6e} "
-                "move_M/V/T1/T2="
-                f"{movements[0]:.3e}/{movements[1]:.3e}/"
-                f"{movements[2]:.3e}/{movements[3]:.3e} "
+                "move_M/V="
+                f"{movements[0]:.3e}/{movements[1]:.3e} "
                 f"Sigma_M_rel={m_closure:.6e} "
                 f"Sigma_V_rel={v_closure:.6e}",
                 flush=True,
@@ -641,7 +623,7 @@ def _cluster_moment_matrices(
             merged, closure = _merge_zero_mode(
                 current[0], current[1], M_total, V_total,
                 m_closure, v_closure, order)
-            return (current[0], merged, current[2], current[3], closure)
+            return (current[0], merged, closure)
         previous = current
         previous_v_closure = v_closure
         previous_m_closure = m_closure
@@ -659,46 +641,28 @@ def _cluster_moment_matrices(
         f"movement_tolerance={float(moment_rel_tol):.1e}")
 
 
-def _cluster_widths(M, T1, T2):
-    """Trace moments -> one parameter-free intrinsic width per interval."""
+def _cluster_widths(intervals):
+    """§2.2 interval half-width, with the named overdamped zero carry."""
     widths = []
-    for index in range(int(M.shape[0])):
-        mass = complex(jax.device_get(jnp.trace(M[index])))
-        first = complex(jax.device_get(jnp.trace(T1[index])))
-        second = complex(jax.device_get(jnp.trace(T2[index])))
-        if mass == 0.0:
-            widths.append(0.0)
-            continue
-        mean1 = np.real(first / mass)
-        mean2 = np.real(second / mass)
-        variance = float(mean2 - mean1 * mean1)
-        tolerance = 256.0 * np.finfo(np.float64).eps * max(abs(mean2), 1.0)
-        if variance < -tolerance and mean2 < 0.0:
-            # mean zeta < 0 is the overdamped side of the strip: Omega there
-            # is purely imaginary, so the real-Omega trace variance is not an
-            # intrinsic width and its sign carries no information.  Name it
-            # and carry zero rather than refuse on a quantity the retarded
-            # fold will not consume (only near-real roots take a width).
+    for index, (lo, hi) in enumerate(intervals):
+        if hi < 0.0:
             if jax.process_index() == 0:
                 print(
                     "[intraband-cluster-width] overdamped interval "
-                    f"{index}: mean_zeta={mean2:.6e} < 0, trace variance "
-                    f"{variance:.6e} is not a real-Omega width; width=0",
+                    f"{index}: zeta=[{lo:.6e},{hi:.6e}], width=0",
                     flush=True,
                 )
             widths.append(0.0)
             continue
-        if variance < -tolerance:
+        if lo <= 0.0:
             raise ValueError(
-                "GATE intraband_cluster_width: material negative trace "
-                f"variance {variance:.6e} in interval {index}")
-        if abs(variance) <= tolerance:
-            variance = 0.0
-        widths.append(float(np.sqrt(max(variance, 0.0))))
+                "GATE intraband_cluster_width: interval crosses the excluded "
+                f"origin: [{lo:.17e},{hi:.17e}]")
+        widths.append(0.5 * (np.sqrt(hi) - np.sqrt(lo)))
     return np.asarray(widths, dtype=np.float64)
 
 
-def _compress_moments(mesh, M, V, T1, T2):
+def _compress_moments(mesh, M, V, intervals):
     """The landed elementwise two-moment match fed by contour moments."""
     matrix_shard = NamedSharding(mesh, P("x", "y"))
     pole_shard = NamedSharding(mesh, P(None, "x", "y"))
@@ -722,8 +686,9 @@ def _compress_moments(mesh, M, V, T1, T2):
             "GATE intraband_contour_empty: every certified contour has "
             "zero M and V weight")
     active = jnp.asarray(np.flatnonzero(keep), dtype=jnp.int32)
-    M, V, T1, T2 = (value[active] for value in (M, V, T1, T2))
-    widths = _cluster_widths(M, T1, T2)
+    M, V = (value[active] for value in (M, V))
+    active_intervals = tuple(intervals[index] for index in np.flatnonzero(keep))
+    widths = _cluster_widths(active_intervals)
     Omega_rows, B_rows = [], []
     folded_elements = 0
     dropped_elements = 0
@@ -816,56 +781,94 @@ def _print_memory_model(pair_block, W0bar, n_interval):
         )
 
 
-def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
-    """Build one row by certified contour moments and greedy bisection."""
+def build_row(
+        W0bar, pair_block, z_samples, *, gap_certificate=None):
+    """Build one row with held-out-gap-driven greedy bisection.
+
+    ``z_samples`` are the 24 stored fit locations.  Their frozen-block error
+    is returned and printed by the caller as a freeze diagnostic only; it has
+    no refusal authority.  ``gap_certificate(Omega, B)`` evaluates the total
+    fit+block model against raw held-out W and returns ``(error, allowed)``;
+    it is the sole frequency-domain driver of interval bisection.  The final
+    total certificates remain model/store gates.
+    """
     mesh = _mesh_of(W0bar, "build_row")
     n_pair = int(pair_block[0].shape[0])
     if n_pair == 0:
         raise ValueError("build_row is not called for the empty Gamma block")
 
-    z_values = tuple(
+    diagnostic_z = tuple(
         complex(value) for value in np.asarray(z_samples).reshape(-1))
-    intervals = _initial_intervals(pair_block, W0bar)
+    _left, origin_gap, zeta_max, _height = _contour_geometry(pair_block, W0bar)
+    minimum_gap = np.finfo(np.float64).eps * zeta_max
+    intervals = _initial_intervals(
+        pair_block, W0bar, origin_gap=origin_gap)
     selected = None
     while True:
-        M, V, T1, T2, closure = _cluster_moment_matrices(
+        M, V, closure = _cluster_moment_matrices(
             pair_block, W0bar, intervals,
-            moment_rel_tol=min(MOMENT_REL_TOL, float(sample_rel_tol)))
+            moment_rel_tol=MOMENT_REL_TOL,
+            origin_gap=origin_gap)
         Om, Bp, fold_el, drop_el, width = _compress_moments(
-            mesh, M, V, T1, T2)
-        errors = [
-            _relative_error(
-                evaluate_pole_sum(Om, Bp, value),
-                _resolvent_at_zeta(pair_block, W0bar, complex(value) ** 2),
-            )
-            for value in z_values
-        ]
+            mesh, M, V, intervals)
+        if gap_certificate is None:
+            gap_error, gap_allowed = 0.0, np.inf
+        else:
+            gap_error, gap_allowed = map(float, gap_certificate(Om, Bp))
+            if (not np.isfinite(gap_error) or gap_error < 0.0
+                    or not np.isfinite(gap_allowed) or gap_allowed <= 0.0):
+                raise ValueError(
+                    "GATE intraband_gap_certificate: callback returned "
+                    f"error={gap_error!r}, allowed={gap_allowed!r}")
         # This is deliberately another direct WP1+solve evaluation, not a
         # contour reconstruction or an alias of a sample slot.
         exact_static = _resolvent_at_zeta(pair_block, W0bar, 0.0j)
         static_error = _relative_error(
             evaluate_pole_sum(Om, Bp, 0.0j), exact_static)
-        error = max(errors, default=0.0)
-        selected = (Om, Bp, error, static_error,
+        selected = (Om, Bp, gap_error, static_error,
                     fold_el, drop_el, width, closure)
-        if error <= float(sample_rel_tol) and static_error <= STATIC_REL_TOL:
+        if gap_error <= gap_allowed and static_error <= STATIC_REL_TOL:
             break
         # Empty contours are dropped by the compression, so the stored pole
         # count can lag the interval count; bound BOTH or the bisection can
         # run past the store's allocated maximum without ever tripping.
         if (int(Om.shape[0]) >= MAX_CLUSTERS
                 or len(intervals) >= MAX_CLUSTERS):
+            # The origin is shrunk only in response to a failed held-out gap
+            # certificate.  D_M and the two closure gates above are never
+            # caught here and therefore remain unconditional refusals.
+            next_gap = max(minimum_gap, 0.5 * origin_gap)
+            if (gap_certificate is not None and gap_error > gap_allowed
+                    and next_gap < origin_gap):
+                if jax.process_index() == 0:
+                    print(
+                        "[intraband-origin-gap] held-out gap certificate "
+                        f"requested shrink {origin_gap:.17e} -> "
+                        f"{next_gap:.17e}; gap_max_rel={gap_error:.6e} "
+                        f"allowed={gap_allowed:.6e}",
+                        flush=True,
+                    )
+                origin_gap = next_gap
+                intervals = _initial_intervals(
+                    pair_block, W0bar, origin_gap=origin_gap)
+                continue
             raise ValueError(
                 "GATE intraband_cluster_budget: six contour clusters do not "
-                "meet the fixed block certificate; "
+                "meet the held-out gap-region certificate; "
                 f"intervals={len(intervals)}, stored_poles={int(Om.shape[0])}, "
-                f"sample_max_rel={error:.6e}, static_max_rel="
-                f"{static_error:.6e}, allowed_sample={float(sample_rel_tol):.6e}, "
+                f"gap_max_rel={gap_error:.6e}, static_max_rel="
+                f"{static_error:.6e}, allowed_gap="
+                f"{gap_allowed:.6e}, "
                 f"allowed_static={STATIC_REL_TOL:.6e}")
         intervals = _split_largest_trace_interval(intervals, M, pair_block)
 
-    (Om, Bp, error, static_error,
+    (Om, Bp, gap_error, static_error,
      fold_el, drop_el, width, closure) = selected
+    diagnostic_error = max((
+        _relative_error(
+            evaluate_pole_sum(Om, Bp, value),
+            _resolvent_at_zeta(pair_block, W0bar, value ** 2),
+        ) for value in diagnostic_z), default=0.0)
     n_poles = int(Om.shape[0])
     _print_memory_model(pair_block, W0bar, n_poles)
     return IntrabandRow(
@@ -873,7 +876,8 @@ def build_row(W0bar, pair_block, z_samples, *, sample_rel_tol=SAMPLE_REL_TOL):
         B_p=Bp,
         n_poles=n_poles,
         n_modes=n_pair,
-        sample_max_rel_error=float(error),
+        sample_max_rel_error=float(diagnostic_error),
+        gap_max_rel_error=float(gap_error),
         static_max_rel_error=float(static_error),
         certified=True,
         folded_modes=0,
