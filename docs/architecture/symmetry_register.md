@@ -617,7 +617,7 @@ gather in its own way. **Measured 2026-08-16** on the committed fixtures
 |---|---|---|---|
 | `deltaE` | none (energies) | **exact** | gather |
 | `dipole_cart` | Cartesian component of **v̂** | **rel 2.0 — 200 % wrong** | `R_cart_forward` on the component axis, `conj` on TRS rows, **and −1 on TRS rows** |
-| `psi_full_y` | ψ on the centroid grid | untested | centroid permutation + L-phase + spinor rotation + the `unfold_psi` TRS rule |
+| `psi_full_y` | ψ on the centroid grid | **rel 1.640 — 164 % wrong** | centroid permutation + L-phase + spinor rotation + the `unfold_psi` TRS rule |
 | `U_mnk` | eigenvector gauge | run-dependent | *there is no rule* — see `qp_wfn_rotations.h5` below |
 
 `dipole_cart` is the sharp one, because both halves of the failure are
@@ -639,6 +639,17 @@ transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
 rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
 TRANSPOSE of this matrix", and the scorecard above records it as *named but
 unused*. The TRS sign was not written down anywhere.
+
+`psi_full_y` was measured on a real run's `isdf_tensors_144.h5`
+(`si_cohsex_debug` fast deck, 64 k → 8): a plain gather gives
+`max|Δ| = 3.634856e-02` against a scale of `2.2e-02`, **rel 1.640**. So the
+`star_broadcast` route is closed for ψ, which is the concrete form of "the
+option is not a gather". The two follow-up hypotheses tried in the same probe
+(the centroid permutation, and the same permutation on `|ψ|`) are
+**inconclusive rather than negative**: the only `sym_perm` on that file is the
+**q**-wedge table from `V_qmunu__qirr`, addressed by `sym_idx_q`, and the
+probe addressed it by `sym_idx_k`. A fair test needs the k-side centroid
+permutation, which nothing in the tree currently builds.
 
 **`cohsex_debug` does not reproduce this** (spatial rows 5.317e-02, TRS rows
 2.759753) and is **not** evidence against the rule: that deck's own

@@ -209,7 +209,7 @@ def test_ibz_refuses_rather_than_falling_back(tmp_path):
          + 1j * rng.normal(size=(_NK_FULL, 3, 3)))
     E = rng.normal(size=(_NK_FULL, 3))
     kpts = rng.normal(size=(_NK_FULL, 3))
-    with pytest.raises(ValueError, match="NOT the unfold"):
+    with pytest.raises(ValueError, match="not the unfold of the wedge rows"):
         _write(tmp_path, "refuse.h5", U, E, kpts,
                k_storage="ibz", star_tables=_TABLES)
 
@@ -225,16 +225,20 @@ def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
     register's ``cohsex_debug`` shape — file wedge 4, star wedge 3, where
     stored row 1 is the time-reverse of row 2 and never a parent.
     """
-    irr = np.array([0, 0, 2, 2, 3, 3], dtype=np.int32)   # row 1 never a parent
-    tables = (irr, _SYM, _NSS)
+    # FOUR stored k over THREE orbits, so wedge row 3 is never a parent —
+    # and the rows are chosen so the ROUND TRIP still succeeds, which is what
+    # makes this cell test the parent condition ALONE rather than two
+    # blockers at once.
     from file_io.kin_ion import broadcast_ibz_to_full_bz as _bc
+    tables = (_IRR, _SYM, _NSS)
     rng = np.random.default_rng(11)
     nb = 3
-    u4 = (rng.normal(size=(4, nb, nb)) + 1j * rng.normal(size=(4, nb, nb)))
-    U = np.asarray(_bc(u4, *tables))
-    E = np.asarray(_bc(rng.normal(size=(4, nb)), *tables))
-    kpts = np.asarray(_bc(rng.normal(size=(4, 3)), *tables))
-    rows = np.array([0, 1, 2, 4], dtype=np.int32)
+    u3 = (rng.normal(size=(_NK_RED, nb, nb))
+          + 1j * rng.normal(size=(_NK_RED, nb, nb)))
+    U = np.asarray(_bc(u3, *tables))
+    E = np.asarray(_bc(rng.normal(size=(_NK_RED, nb)), *tables))
+    kpts = rng.normal(size=(_NK_FULL, 3))
+    rows = np.array([0, 2, 4, 5], dtype=np.int32)       # 4 rows, 3 parents
 
     def _w(k_storage, **kw):
         return write_qp_rotations_h5(
