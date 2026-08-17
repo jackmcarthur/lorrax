@@ -750,7 +750,12 @@ def build_static_quadrature(wfns, minimax_config, *, print_fn=None):
     # TODO(metal-screening): derive this transition window from all pairs
     # with nonzero f_nk-f_mk, not the ifmax-based b2 cut.
     enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
+    # ``cond_all``, not ``cond``: this quadrature is built once and reused by
+    # BOTH χ0 and Σ, so its interval must cover the union of the two band
+    # sums.  ``cond`` is the χ0 leg only and would under-cover a deck whose
+    # ``number_bands_sigma`` is the larger of the two.  Identical to ``cond``
+    # on every unsplit deck (see BandSlices.cond_all).
+    enk_c = wfns.enk[:, s.cond_all]
     e_ref = resolve_minimax_energy_reference(
         enk_v, enk_c, reference=minimax_config.energy_reference)
 
