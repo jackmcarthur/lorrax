@@ -99,7 +99,7 @@ from .screening import (
 # Block-GMRES convergence for the ladder resolvent.  NOT deck keys in v1,
 # deliberately: these are the values ``bse_w_exact``'s CLI has carried
 # through every W-resolvent closure measurement on this tree
-# (``--gmres-tol 1e-10``, ``--gmres-max-iter 200``), and the wiring-closure
+# (``--gmres-tol 1e-10``; the historical cap was 200), and the wiring-closure
 # gate compares against the ~2.5e-9 minimax-quadrature floor, so the solver
 # residual has to sit orders BELOW the thing being measured rather than be
 # tuned per deck.  A deck key here would be a knob whose only safe setting
@@ -134,8 +134,19 @@ from .screening import (
 # with the ladder above so the next reader can move it in one line rather than
 # re-measure it.  A deck key would still be wrong: this is a numerics floor
 # derived from a measurement, not a per-deck preference.
+#
+# CAP.  The 200 inherited from the small closure fixture is too short for a
+# wider transition window.  On scalar Si 4x4x4 at nband=20, the last two
+# irreducible q points stop at 200 with true residuals 5.56e-3 and 9.17e-3,
+# then converge normally at 240-242 iterations to 9.48e-7 and 9.88e-7 when
+# allowed to continue.  Small imaginary shifts do not improve them, the exact
+# diagonal has min |z-diag(H)| = 5.12e-2 Ry, and its sampled high-band entries
+# match the production matvec to roundoff: this is a cap, not a pole or a bad
+# preconditioner.  300 keeps 58 iterations of measured headroom without making
+# the cap a deck knob; the returned true-residual and truncation gates still
+# decide acceptance.
 _GMRES_TOL = 1.0e-6
-_GMRES_MAX_ITER = 200
+_GMRES_MAX_ITER = 300
 
 #: The TIGHT tolerance, for gates that measure the ASSEMBLY against a
 #: quadrature floor (``tests/test_w_bse_wiring_closure.py``) or against a

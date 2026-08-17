@@ -36,9 +36,9 @@ shows no tracing-cache miss after the first ``(q, z)``.
 MEMORY HIGH-WATER, in decreasing order, and none of it ``N_mu^2``-class per
 rank:
 
-* the SOLVE peak is the replicated ``O(max_iter^2)`` GMRES workspace (3.12 MiB
-  at ``max_iter = 200``), which is ``N_mu``-INDEPENDENT and dominates both the
-  RPA and the ladder solve;
+* the SOLVE peak is the replicated ``O(max_iter^2)`` GMRES workspace (7.02 MiB
+  at the production ``max_iter = 300``), which is ``N_mu``-INDEPENDENT and
+  dominates both the RPA and the ladder solve;
 * inside the matvec, the ``T / T_R / U_R / U_q / U`` direct-rung chain, not the
   probe block: the ladder matvec's peak is 5.3x the RPA one for that reason;
 * the coupling rung (``bse_ring_comm._w_term_B`` -> ``_ring_sum_B_encode``)
