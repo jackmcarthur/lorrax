@@ -387,7 +387,9 @@ def _build_intraband_rows(
                 f"q_row={iq} block_sample_diag="
                 f"{row.sample_max_rel_error:.6e} "
                 f"gap_total={row.gap_max_rel_error:.6e} "
-                f"n_poles={row.n_poles}",
+                f"n_poles={row.n_poles} "
+                f"origin_gap_ry2={row.origin_gap_ry2:.6e} "
+                f"origin_gap_doublings={row.origin_gap_doublings}",
                 flush=True,
             )
         rows.append(row)
@@ -445,6 +447,8 @@ def _append_intraband_rows(fit_path, rows, slabs, mesh_xy):
             "zero_mode_weight": row.zero_mode_weight,
             "zero_mode_pole_shift": row.zero_mode_pole_shift,
             "zero_mode_cluster": float(row.zero_mode_cluster),
+            "origin_gap_ry2": row.origin_gap_ry2,
+            "origin_gap_doublings": float(row.origin_gap_doublings),
         })
         mpa_store.write_intraband_row_collective(
             fit_path, iq, Omega[:, None, :, :], Bp[:, None, :, :],

@@ -38,6 +38,19 @@ MAX_CLUSTERS = 6
 GAP_CERTIFICATE_FIRST_REAL_RY = 0.04
 GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY = (
     0.5 * GAP_CERTIFICATE_FIRST_REAL_RY)
+# Coordinator-authorized amendment, 2026-08-17 (DESIGN §2.4c Ruling 3, under
+# claim 0329's demand principle; ratification by the design author pending).
+# The adaptive gap shrinks on demand, and an OPEN D_M at the current edge is a
+# demand signal: asymptotic weight is by §2.4b's dichotomy a FINITE mode, so
+# the edge is excluding physics the contour is obliged to capture.  Before this
+# amendment the D_M refusal fired *before* any shrink path could run, which was
+# an ordering flaw and not a protection.  Its bound is unchanged: doublings
+# continue only while D_M improves, a plateau at machine precision closes and
+# merges the residual D_V, and a plateau that has NOT closed keeps the
+# unconditional refusal (a mode the contour cannot reach).  There is no descent
+# to eps*zeta_max: this cap refuses by name well before the ~52 dyadic
+# doublings §2.4c Ruling 3 rejected.
+MAX_ORIGIN_GAP_DOUBLINGS = 32
 _QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
 _RESOLVENT_BATCH_NODES = 8
 
@@ -66,6 +79,29 @@ class IntrabandRow:
     zero_mode_weight: float = 0.0
     zero_mode_cluster: int = -1
     zero_mode_pole_shift: float = 0.0
+    # The certified origin exclusion this row was built at, and how many
+    # demand-driven doublings reached it from the registered starting edge.
+    origin_gap_ry2: float = 0.0
+    origin_gap_doublings: int = 0
+    origin_gap_m_closure: float = 0.0
+
+
+class OpenAsymptoticClosure(ValueError):
+    """The §2.4b open-``D_M`` refusal, carrying the numbers it refused on.
+
+    It stays a ``ValueError`` with the same gate name and message, so every
+    caller without a demand path refuses exactly as before.  Only the
+    production driver catches it, and only to run the authorized
+    demand-driven origin-gap shrink; if that shrink stops improving ``D_M``
+    the same exception is re-raised untouched.
+    """
+
+    def __init__(self, message, *, m_closure, v_closure, order, origin_gap):
+        super().__init__(message)
+        self.m_closure = float(m_closure)
+        self.v_closure = float(v_closure)
+        self.order = int(order)
+        self.origin_gap = None if origin_gap is None else float(origin_gap)
 
 
 @dataclass(frozen=True)
@@ -469,7 +505,8 @@ def _finite_lambda_clusters(M, M_total):
     ]
 
 
-def _merge_zero_mode(M, V, M_total, V_total, m_closure, v_closure, order):
+def _merge_zero_mode(M, V, M_total, V_total, m_closure, v_closure, order,
+                     *, origin_gap=None):
     """§2.4b deflation-merge, applied before the two-moment match.
 
     The dichotomy is codified here and nowhere else: an open ``M`` closure is
@@ -478,14 +515,16 @@ def _merge_zero_mode(M, V, M_total, V_total, m_closure, v_closure, order):
     the sum rule defines with no free parameter.
     """
     if m_closure > SUM_RULE_REL_TOL:
-        raise ValueError(
+        raise OpenAsymptoticClosure(
             "GATE intraband_contour_sum_rule: the asymptotic closure is open "
             f"(||D_M||/||M_total||={m_closure:.6e} > "
             f"{SUM_RULE_REL_TOL:.1e}) at quadrature order {order}.  A missed "
             "finite-lambda mode carries asymptotic weight, so it can never "
             "masquerade as zero-mode static weight; the static deficiency "
             f"(||D_V||/||V_total||={v_closure:.6e}) is NOT merged.  Fix the "
-            "contour tiling.")
+            "contour tiling.",
+            m_closure=m_closure, v_closure=v_closure, order=order,
+            origin_gap=origin_gap)
 
     D_V = V_total - jnp.sum(V, axis=0)
     candidates = _finite_lambda_clusters(M, M_total)
@@ -540,6 +579,33 @@ def _has_plateaued(value, previous):
     return (previous is not None
             and abs(value - previous)
             <= _V_PLATEAU_REL_TOL * max(value, previous))
+
+
+def _demand_shrink_improves(value, previous):
+    """True when the last origin-gap doubling actually moved ``D_M`` down.
+
+    Same plateau idiom as the quadrature ladder, applied to the gap axis: a
+    deficit that a doubling leaves stationary is weight the contour cannot
+    reach by shrinking, so the unconditional refusal stands.
+    """
+    if previous is None:
+        return True
+    return value < previous and not _has_plateaued(value, previous)
+
+
+def _demand_shrink_has_pending_capture(pair_block, origin_gap):
+    """True when bare crossing energies still lie inside the excluded gap.
+
+    Improvement alone cannot be the sole continuation signal: a *discrete*
+    excluded mode holds ``D_M`` exactly constant until the edge passes below
+    it, so a step-to-step improvement rule would abandon precisely the finite
+    mode §2.4b says must be captured.  A bare crossing energy still inside the
+    exclusion is direct, parameter-free evidence that shrinking has something
+    left to reach.  When neither signal holds, the deficit is weight no edge
+    can reach and the unconditional refusal stands.
+    """
+    u2 = np.square(np.abs(_host_replicated(pair_block[0])))
+    return bool(np.any((u2 > 0.0) & (u2 < float(origin_gap))))
 
 
 def _cluster_moment_matrices(
@@ -654,7 +720,7 @@ def _cluster_moment_matrices(
         if movement <= float(moment_rel_tol) and settled:
             merged, closure = _merge_zero_mode(
                 current[0], current[1], M_total, V_total,
-                m_closure, v_closure, order)
+                m_closure, v_closure, order, origin_gap=origin_gap)
             return (current[0], merged, closure)
         previous = current
         previous_v_closure = v_closure
@@ -664,7 +730,8 @@ def _cluster_moment_matrices(
         # the dichotomy rather than the loop that ran out.
         _merge_zero_mode(
             current[0], current[1], M_total, V_total,
-            m_closure, v_closure, _QUADRATURE_ORDERS[-1])
+            m_closure, v_closure, _QUADRATURE_ORDERS[-1],
+            origin_gap=origin_gap)
     raise ValueError(
         "GATE intraband_contour_sum_rule: quadrature failed mandatory "
         f"closure at order {_QUADRATURE_ORDERS[-1]}: "
@@ -838,11 +905,58 @@ def build_row(
     intervals = _initial_intervals(
         pair_block, W0bar, origin_gap=origin_gap)
     selected = None
+    doublings = 0
+    open_m_closure = 0.0
+    previous_open_m = None
     while True:
-        M, V, closure = _cluster_moment_matrices(
-            pair_block, W0bar, intervals,
-            moment_rel_tol=MOMENT_REL_TOL,
-            origin_gap=origin_gap)
+        try:
+            M, V, closure = _cluster_moment_matrices(
+                pair_block, W0bar, intervals,
+                moment_rel_tol=MOMENT_REL_TOL,
+                origin_gap=origin_gap)
+        except OpenAsymptoticClosure as refusal:
+            # Amended trigger set (coordinator-authorized 2026-08-17): an open
+            # D_M at the current edge is itself demand.  The excluded weight is
+            # asymptotic, hence a finite mode by §2.4b, hence physics the
+            # contour must capture -- so the edge halves and the row is rebuilt
+            # rather than refusing before any shrink path could run.
+            next_gap = 0.5 * origin_gap
+            improving = _demand_shrink_improves(
+                refusal.m_closure, previous_open_m)
+            pending = _demand_shrink_has_pending_capture(
+                pair_block, origin_gap)
+            if (not (improving or pending) or next_gap <= minimum_gap
+                    or doublings >= MAX_ORIGIN_GAP_DOUBLINGS):
+                if jax.process_index() == 0:
+                    print(
+                        "[intraband-origin-gap] demand shrink exhausted: "
+                        f"doublings={doublings} "
+                        f"origin_gap={origin_gap:.17e} "
+                        f"D_M={refusal.m_closure:.6e} "
+                        f"previous_D_M="
+                        f"{-1.0 if previous_open_m is None else previous_open_m:.6e} "
+                        f"improving={improving} pending_capture={pending}; "
+                        "the unconditional D_M refusal stands",
+                        flush=True,
+                    )
+                raise
+            if jax.process_index() == 0:
+                print(
+                    "[intraband-origin-gap] open D_M demands capture: "
+                    f"shrink {origin_gap:.17e} -> {next_gap:.17e} "
+                    f"doubling={doublings + 1} "
+                    f"D_M={refusal.m_closure:.6e} "
+                    f"D_V={refusal.v_closure:.6e} "
+                    f"order={refusal.order}",
+                    flush=True,
+                )
+            previous_open_m = refusal.m_closure
+            open_m_closure = refusal.m_closure
+            origin_gap = next_gap
+            doublings += 1
+            intervals = _initial_intervals(
+                pair_block, W0bar, origin_gap=origin_gap)
+            continue
         Om, Bp, fold_el, drop_el, width = _compress_moments(
             mesh, M, V, intervals)
         if gap_certificate is None:
@@ -873,7 +987,8 @@ def build_row(
             # caught here and therefore remain unconditional refusals.
             next_gap = max(minimum_gap, 0.5 * origin_gap)
             if (gap_certificate is not None and gap_error > gap_allowed
-                    and next_gap < origin_gap):
+                    and next_gap < origin_gap
+                    and doublings < MAX_ORIGIN_GAP_DOUBLINGS):
                 if jax.process_index() == 0:
                     print(
                         "[intraband-origin-gap] held-out gap certificate "
@@ -883,6 +998,7 @@ def build_row(
                         flush=True,
                     )
                 origin_gap = next_gap
+                doublings += 1
                 intervals = _initial_intervals(
                     pair_block, W0bar, origin_gap=origin_gap)
                 continue
@@ -922,6 +1038,9 @@ def build_row(
         zero_mode_weight=float(closure.zero_mode_weight),
         zero_mode_cluster=int(closure.zero_mode_cluster),
         zero_mode_pole_shift=float(closure.zero_mode_pole_shift),
+        origin_gap_ry2=float(origin_gap),
+        origin_gap_doublings=int(doublings),
+        origin_gap_m_closure=float(open_m_closure),
     )
 
 
@@ -952,6 +1071,8 @@ __all__ = [
     "ClusterClosure",
     "IntrabandRow",
     "MAX_CLUSTERS",
+    "MAX_ORIGIN_GAP_DOUBLINGS",
+    "OpenAsymptoticClosure",
     "MODEL",
     "MOMENT_REL_TOL",
     "SAMPLE_REL_TOL",

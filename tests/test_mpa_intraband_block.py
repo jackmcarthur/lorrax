@@ -501,3 +501,103 @@ def test_perfect_screening_channel_merges_and_anchors_z0_exactly():
     # at z=0 sums every mode's `C_m/lambda_m`, the excluded one included.
     np.testing.assert_allclose(
         got, np.asarray(V_total), rtol=1.0e-10, atol=1.0e-12)
+
+
+def _excluded_finite_mode_fixture(u_excluded=0.012, w_excluded=1.0e-9):
+    """A finite screened mode strictly inside the registered starting edge.
+
+    The production signature at ``q_row=1``: the certified 0.02-Ry bisection
+    edge excludes material *asymptotic* weight, which by DESIGN §2.4b is a
+    finite mode and therefore demands capture.
+
+    The excluded pair is weakly coupled on purpose.  Screening moves a mode
+    by ``2 w_s p_s^H W0bar p_s``, so a strongly-coupled near-zero pair is
+    pushed straight out of the exclusion and nothing is missed; the physical
+    case the amendment exists for is the one where the mode *stays* inside.
+    Its asymptotic share is still seven orders above the ``1e-12`` closure
+    tolerance, which is what makes the refusal fire.
+    """
+    mesh, W0, vertices, u, w, _block = _fixture(n_pair=9)
+    extra = np.random.default_rng(4317).normal(size=(1, W0.shape[0]))
+    vertices = np.concatenate((vertices, extra + 0.4j * extra), axis=0)
+    u = np.concatenate((u, [u_excluded]))
+    w = np.concatenate((w, [w_excluded]))
+    block = (
+        _put(mesh, u, P(None)),
+        _put(mesh, w, P(None)),
+        (_put(mesh, vertices, P(None, "x")),
+         _put(mesh, vertices, P(None, "y"))),
+    )
+    return mesh, W0, vertices, u, w, block
+
+
+def test_open_dm_at_the_edge_demands_a_shrink_and_builds_through(capsys):
+    """WP3-A4 acceptance: an open D_M is a demand trigger, not a dead end.
+
+    Coordinator-authorized amendment, 2026-08-17.  The excluded mode carries
+    asymptotic weight, so the edge halves until the contour reaches it; the
+    doubling count is recorded on the row.
+    """
+    mesh, W0, vertices, u, w, block = _excluded_finite_mode_fixture()
+    W0j = _put(mesh, W0, P("x", "y"))
+    start = IB._certified_origin_gap(block, W0j)
+    assert start == pytest.approx(
+        IB.GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY ** 2)
+    # The mode really is inside the registered starting exclusion.
+    assert float(u[-1]) ** 2 < start
+
+    z = np.asarray([0.0j, 0.04 + 0.2j, 0.15 + 0.2j])
+    row = IB.build_row(W0j, block, z)
+    assert row.certified
+    assert row.origin_gap_doublings >= 1
+    assert row.origin_gap_ry2 < start
+    assert row.origin_gap_ry2 <= float(u[-1]) ** 2
+    assert row.origin_gap_m_closure > IB.SUM_RULE_REL_TOL
+    output = capsys.readouterr().out
+    assert "open D_M demands capture" in output
+
+    # Capturing the mode is what makes the z=0 anchor exact: the same build
+    # at the unshrunk edge cannot reach it at all.
+    got = np.asarray(IB.evaluate_pole_sum(row.Omega_p, row.B_p, 0.0j))
+    exact = _direct(W0, vertices, u, w, 0.0)
+    assert (np.linalg.norm(got - exact)
+            / np.linalg.norm(exact)) <= IB.STATIC_REL_TOL
+
+
+def test_without_the_demand_trigger_the_same_row_refuses_at_the_edge(
+        monkeypatch):
+    """The ordering flaw, isolated: no doublings allowed => the WP5 refusal."""
+    mesh, W0, _vertices, _u, _w, block = _excluded_finite_mode_fixture()
+    W0j = _put(mesh, W0, P("x", "y"))
+    monkeypatch.setattr(IB, "MAX_ORIGIN_GAP_DOUBLINGS", 0)
+    with pytest.raises(IB.OpenAsymptoticClosure) as excinfo:
+        IB.build_row(W0j, block, np.asarray([0.0j, 0.04 + 0.2j]))
+    assert "intraband_contour_sum_rule" in str(excinfo.value)
+    assert excinfo.value.m_closure > IB.SUM_RULE_REL_TOL
+
+
+def test_unreachable_asymptotic_weight_keeps_the_unconditional_refusal(
+        monkeypatch, capsys):
+    """Plateau WITHOUT closing: a mode no edge can reach still refuses.
+
+    The deleted contour sits far above the exclusion, so no doubling can
+    recover its weight and no bare energy remains inside the gap; the bound
+    on the amended trigger is exactly this arm.
+    """
+    mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=12)
+    W0j = _put(mesh, W0, P("x", "y"))
+    original = IB._moments_at_order
+
+    def deleted(*args, **kwargs):
+        values = list(original(*args, **kwargs))
+        mask = jnp.asarray(
+            [0.0] + [1.0] * (int(values[0].shape[0]) - 1))[:, None, None]
+        return tuple(value * mask for value in values)
+
+    monkeypatch.setattr(IB, "_moments_at_order", deleted)
+    with pytest.raises(IB.OpenAsymptoticClosure) as excinfo:
+        IB.build_row(W0j, block, np.asarray([0.0j, 0.04 + 0.2j]))
+    assert "intraband_contour_sum_rule" in str(excinfo.value)
+    assert "masquerade" in str(excinfo.value)
+    output = capsys.readouterr().out
+    assert "demand shrink exhausted" in output
