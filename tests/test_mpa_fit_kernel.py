@@ -138,6 +138,29 @@ def test_exact_recovery_metal_grid_alpha2():
     assert int(diag["n_valid"]) == n_p
 
 
+@pytest.mark.parametrize("corrected", [False, True])
+def test_production_residues_use_one_lstsq(monkeypatch, corrected):
+    """Selecting guarded solve inputs must not evaluate both residue fits."""
+
+    n_p = 4
+    z = _grid(n_p, omega_m=4.0)
+    Omega, B = _si_like_poles(n_p)
+    if corrected:
+        Omega[0] = 0.30 - 0.60j  # reflection guard must move this pole
+    W = pade_fit.synthesize_w_samples(Omega, B, z)
+    original = pade_fit._residue_lstsq
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pade_fit, "_residue_lstsq", counted)
+    _, _, diag = pade_fit.fit_mpa_poles(W, z, n_p)
+    assert len(calls) == 1
+    assert bool(diag["any_correction"]) is corrected
+
+
 # ---------------------------------------------------------------------------
 # (b) RED TWINS, one per guard, each with the refit proof
 # ---------------------------------------------------------------------------

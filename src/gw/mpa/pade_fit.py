@@ -755,14 +755,19 @@ def fit_mpa_poles(
     # above the verdict table).
     b_hat, cond, s_max, s_min, bwd = _loewner_roots(w, x_hat, n, rcond, eig)
 
-    # --- Stage 3: residues BEFORE any guard fires.  These are the
-    # all-sample complex LS residues of the raw fit; they are what
-    # ``refit_after_guards=False`` keeps.
+    # Keep the raw roots for the one-solve residue path below.  A corrected
+    # element must solve on its guarded, sorted poles; an untouched element
+    # must solve on this original order and sort the resulting coefficients
+    # afterwards.  Selecting those solve inputs lets both cases share ONE
+    # batched SVD without changing either case's arithmetic order.
+    b_hat_raw = b_hat
     scale = jnp.sqrt(x_max).astype(jnp.float64)
     Omega_raw = jnp.sqrt(b_hat * x_max.astype(jnp.complex128))
     valid_all = jnp.ones((n,), dtype=bool)
-    B_pre = _residue_lstsq(
-        x_hat, w, b_hat, valid_all, x_max, Omega_raw, rcond)
+    if not refit_after_guards:
+        # Diagnostic stale-residue twin: deliberately retain the raw fit.
+        B_pre = _residue_lstsq(
+            x_hat, w, b_hat, valid_all, x_max, Omega_raw, rcond)
 
     # --- Stage 4: the guards, in order.
     fired_reflection = jnp.zeros((n,), dtype=bool)
@@ -780,7 +785,8 @@ def fit_mpa_poles(
     order = jnp.lexsort((jnp.imag(Omega), jnp.real(Omega)))
     Omega = Omega[order]
     b_hat = b_hat[order]
-    B_pre = B_pre[order]
+    if not refit_after_guards:
+        B_pre = B_pre[order]
     fired_reflection = fired_reflection[order]
     fired_time_order = fired_time_order[order]
 
@@ -803,18 +809,24 @@ def fit_mpa_poles(
         | jnp.any(fired_coincident) | jnp.any(fired_range)
         | jnp.any(fired_null))
 
-    # --- Stage 5: THE MANDATORY RESIDUE REFIT.  Any guard that fired
-    # moved a pole or removed a column, so the pre-guard residues are
-    # stale.  ``jnp.where`` rather than a Python branch: ``any_correction``
-    # is a traced value under vmap, and the refit must be unconditional
-    # in the graph.
-    B_refit = _residue_lstsq(x_hat, w, b_hat, valid, x_max, Omega, rcond)
-    B_stale = jnp.where(valid, B_pre, 0.0 + 0.0j)
+    # --- Stage 5: THE MANDATORY RESIDUE REFIT, with one SVD per element.
+    # Before 2026-08-18 production solved residues on raw poles for every
+    # element, solved them AGAIN on guarded poles for every element, then
+    # selected one result.  The selection belongs on the solve INPUTS:
+    # corrected elements see exactly the old refit operands; untouched
+    # elements see exactly the old pre-fit operands and are sorted after the
+    # solve.  This preserves the mandatory refit without doing both solves.
     if refit_after_guards:
-        B = jnp.where(any_correction, B_refit, B_stale)
+        solve_b_hat = jnp.where(any_correction, b_hat, b_hat_raw)
+        solve_Omega = jnp.where(any_correction, Omega, Omega_raw)
+        solve_valid = jnp.where(any_correction, valid, valid_all)
+        B_solve = _residue_lstsq(
+            x_hat, w, solve_b_hat, solve_valid, x_max, solve_Omega, rcond)
+        B = jnp.where(any_correction, B_solve, B_solve[order])
+        B = jnp.where(valid, B, 0.0 + 0.0j)
         refit_performed = any_correction
     else:
-        B = B_stale
+        B = jnp.where(valid, B_pre, 0.0 + 0.0j)
         refit_performed = jnp.zeros((), dtype=bool)
 
     # --- Stage 6: achieved residual on the fitted samples.

@@ -171,15 +171,23 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
         n_valid = _diag(diag["n_valid"])
         Omega = jnp.where(valid[None, None], Omega, 0.0 + 0.0j)
         Bp = jnp.where(valid[None, None], Bp, 0.0 + 0.0j)
-        maxima = lax.pmax(
-            jnp.stack((jnp.max(condition), jnp.max(backward))), row_axes)
         finite = (
             jnp.all(jnp.isfinite(Omega)) & jnp.all(jnp.isfinite(Bp))
             & jnp.all(jnp.isfinite(condition))
             & jnp.all(jnp.isfinite(backward))
             & jnp.all(jnp.isfinite(residual))
             & jnp.all(jnp.isfinite(n_valid)))
-        finite = lax.pmin(finite.astype(jnp.int32), row_axes)
+        # One scalar-vector reduction, not a pmax plus a second synchronous
+        # integer pmin.  Pole fits are otherwise completely row-local; this
+        # is the only cross-rank communication in the compute kernel and it
+        # exists solely to certify the block before its collective write.
+        summary = lax.pmax(jnp.stack((
+            jnp.max(condition),
+            jnp.max(backward),
+            (~finite).astype(jnp.float64),
+        )), row_axes)
+        maxima = summary[:2]
+        finite = (summary[2] == 0.0).astype(jnp.int32)
         return (Omega, Bp, condition, backward, residual, n_valid,
                 maxima, finite)
 

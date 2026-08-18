@@ -208,9 +208,16 @@ def _qr_sweep(H, m, n):
     # naming mesh axes in this otherwise generic eigensolver.
     cs0 = (jnp.zeros((2, max(n - 1, 1)), dtype=H.dtype)
            + jnp.asarray(H[0, 0] * 0, dtype=H.dtype))
-    # TASTE rule-2 carve-out: per-device scratch carry seeded from the
-    # varying matrix; scan conversion not required.
-    H, cs = lax.fori_loop(0, max(n - 1, 0), left, (H, cs0))
+    # ``n`` is a tiny compile-time pole count (8/10/12 in production).
+    # Unroll this INNER loop so XLA sees static row slices and can fuse a
+    # whole QR sweep.  A ``fori_loop`` here made every one of the n-1 Givens
+    # rotations a runtime while-body: at Np=8 the real Si profile launched
+    # 6,272 copies of each loop kernel in eight fit blocks.  The outer sweep
+    # and deflation loops remain fixed-count loops, so compile size stays
+    # bounded by O(n), not O(n_sweeps*n**2).
+    H, cs = H, cs0
+    for k in range(max(n - 1, 0)):
+        H, cs = left(k, (H, cs))
 
     # --- R Q, the same rotations from the right in the SAME order.
     def right(k, carry):
@@ -223,7 +230,8 @@ def _qr_sweep(H, m, n):
         H = H.at[:, k + 1].set(-s.conj() * ck + c.conj() * ck1)
         return H, cs
 
-    H, _ = lax.fori_loop(0, max(n - 1, 0), right, (H, cs))
+    for k in range(max(n - 1, 0)):
+        H, cs = right(k, (H, cs))
     return H + jnp.diag(shift)
 
 
