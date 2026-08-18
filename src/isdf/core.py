@@ -463,7 +463,10 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 	``P(None, None, ('x','y'), None, None)``.  Thus every cached coefficient
 	is owned by exactly one rank; neither the full band window nor an r slab is
 	replicated.  The leading chunk axis preserves the store's uniform static
-	shape, including zero pad rows in its last chunk.
+	shape, including zero pad rows in its last chunk.  This is deliberate: a
+	ragged final item cannot be the output of the same ``lax.scan`` and would
+	create a second compiled cache/slice family.  For the 50-band Si window,
+	bc16 therefore carries 64 slots (28% pad; priced exactly by the planner).
 	"""
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nk = int(psi_G_store.meta.nk_tot)

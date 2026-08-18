@@ -27,13 +27,15 @@ def test_residency_mirror_prices_odd_banks_and_rings(ns, banks, want):
     assert conv_kpair_resident_bytes((25, 1, 1), ns) == -1
 
 
+@pytest.mark.parametrize("ns", [2, 4])
 @pytest.mark.parametrize("kgrid", [(3, 3, 3), (4, 4, 4), (2, 3, 5), (5, 5, 5)])
-def test_auto_selects_resident_for_representative_fit_shapes(monkeypatch, kgrid):
+def test_auto_selects_resident_for_representative_fit_shapes(
+        monkeypatch, kgrid, ns):
     from ffi import fft
 
     monkeypatch.setenv("LORRAX_CONV_KPAIR_FFI", "auto")
     _available(monkeypatch, fft)
-    arm, reason = fft.conv_kpair_plan(object(), kgrid, 2, (16, 16))
+    arm, reason = fft.conv_kpair_plan(object(), kgrid, ns, (16, 16))
     assert arm == "resident"
     assert "resident minimum=" in reason
 
@@ -115,3 +117,42 @@ def test_rchunk_gamma_attributes_are_captured_before_jit_trace():
         "_gamma_perm_phase_mu(vertex_mu_L)" in source)
     assert "gamma_mu = gamma_static" in source
     assert "int(vertex_mu_L)," in source
+
+
+def test_cq_and_zq_both_enter_the_shared_conv_plan():
+    import inspect
+    from isdf.core import c_q_from_psi_sm, z_q_from_psi_sm
+
+    assert "_conv_kpair_setup(" in inspect.getsource(c_q_from_psi_sm)
+    assert "_conv_kpair_setup(" in inspect.getsource(z_q_from_psi_sm)
+
+
+def test_ns2_setup_forwards_monomial_gamma_to_native_factory(monkeypatch):
+    from ffi import fft
+    from isdf.core import _conv_kpair_setup
+
+    seen = {}
+    monkeypatch.setattr(
+        fft, "conv_kpair_plan",
+        lambda mesh, kgrid, ns, trailing: (
+            seen.setdefault("plan", (mesh, kgrid, ns, trailing)) and "resident",
+            "test resident"))
+
+    def _factory(mesh, kgrid, **kwargs):
+        seen["factory"] = (mesh, kgrid, kwargs)
+        return "ns2-kernel"
+
+    monkeypatch.setattr(fft, "make_fused_conv_kpair", _factory)
+    mesh = object()
+    gamma_l = ([1, 0], [1j, -1j])
+    gamma_r = ([1, 0], [-1, 1])
+    arm, reason, kernel, gamma_key = _conv_kpair_setup(
+        mesh, (3, 3, 3), 2, (8, 12), gamma_l, gamma_r)
+
+    assert (arm, reason, kernel) == ("resident", "test resident", "ns2-kernel")
+    assert seen["plan"] == (mesh, (3, 3, 3), 2, (8, 12))
+    kwargs = seen["factory"][2]
+    assert kwargs["arm"] == "resident"
+    assert tuple(kwargs["perm_l"]) == (1, 0)
+    assert tuple(kwargs["phase_l"]) == (1j, -1j)
+    assert gamma_key[0] == (1, 0)

@@ -301,6 +301,10 @@ def plan_gflat_chunks(
 
     Overrides (each a ``cohsex.in`` knob; ``>0`` wins over the picker):
     ``r_chunk_override``, ``band_chunk_override``, ``gflat_chunk_size_override``.
+    The shipping no-key configuration passes ``band_chunk_override=16``:
+    the planner mesh-rounds it and caps it at the logical fit window.  An
+    explicit deck value ``band_chunk_size=0`` reaches this function as
+    ``band_chunk_override=None`` and opts into the full-window-first ladder.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -439,7 +443,11 @@ def plan_gflat_chunks(
     # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
     # all-P-sharded cache, never a replicated full-window object.  Price its
     # uniform final-chunk pad exactly; this becomes part of the persistent
-    # floor for all r-chunk stages.
+    # floor for all r-chunk stages.  The rectangular lax.scan result is one
+    # compiled shape family.  For a 50-band window at bc16 it intentionally
+    # holds 64 slots (28% pad; 7.25 vs 5.66 GB at P=1 on Si 80 Ry).  A ragged
+    # last allocation would split the scan/cache ABI into another executable,
+    # so the pad stays until that trade is measured as its own change.
     _cache_n_bc = math.ceil(fit_nb / band_chunk)
     persistent["psi_r_cache"] = _c128(
         nk, _cache_n_bc * band_chunk, ns, n_rtot, shard=p_xy)
@@ -503,9 +511,9 @@ def plan_gflat_chunks(
     # writes per-rank hyperslabs, so this costs the sharded amount. The
     # deleted h5py allgather branch is not a plan this source can execute and
     # therefore is not an option in the live model. Two tensors cross this
-    # seam and the binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and
-    # the G-flat ζ
-    # ``(n_q_disk, μ, ngkmax)`` — whenever ngkmax > μ the ζ write wins.
+    # seam and the binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and the
+    # G-flat ζ ``(n_q_disk, μ, ngkmax)``. Whenever ngkmax > μ, the ζ
+    # write wins.
     # Measured: memory-model.md §"Measured corrections behind the G-flat
     # terms" #3 (a 40,594,046,976 B all-gather, matched to the byte).
     _v_tensor = _c128(n_q_ibz, mu, mu, shard=p_xy)

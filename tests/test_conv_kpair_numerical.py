@@ -30,7 +30,7 @@ def _reference(jnp, a, b, perm_l, phase_l, perm_r, phase_r):
         ((16, 16, 16), "two_stage"),
     ],
 )
-@pytest.mark.parametrize("ns", [1, 2])
+@pytest.mark.parametrize("ns", [1, 2, 4])
 def test_conv_kpair_matches_xla(kgrid, arm, ns):
     import jax
     import jax.numpy as jnp
@@ -45,13 +45,21 @@ def test_conv_kpair_matches_xla(kgrid, arm, ns):
     if ns == 1:
         perm_l = perm_r = np.asarray([0], dtype=np.int64)
         phase_l = phase_r = np.asarray([1], dtype=np.complex128)
-    else:
+    elif ns == 2:
         # Two distinct non-identity monomials exercise both permutation and
         # all four exact phase quadrants across the double contraction.
         perm_l = np.asarray([1, 0], dtype=np.int64)
         phase_l = np.asarray([1j, -1j], dtype=np.complex128)
         perm_r = np.asarray([1, 0], dtype=np.int64)
         phase_r = np.asarray([-1, 1], dtype=np.complex128)
+    else:
+        # Production bispinor Meta lifts the WFN's two components to four
+        # channels.  Exercise a nontrivial permutation and every exact phase
+        # quadrant through the same generic device contract.
+        perm_l = np.asarray([1, 0, 3, 2], dtype=np.int64)
+        phase_l = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+        perm_r = np.asarray([2, 3, 0, 1], dtype=np.int64)
+        phase_r = np.asarray([-1j, -1, 1j, 1], dtype=np.complex128)
     rng = np.random.default_rng(7300 + int(np.prod(kgrid)) + ns)
     shape = tuple(kgrid) + (ns, 2, 3, ns)
     a_np = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)

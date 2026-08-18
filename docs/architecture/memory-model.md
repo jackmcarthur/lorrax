@@ -485,16 +485,24 @@ A/B/C/D totals; the full per-term breakdown (centroids, FFT box, `P_l`,
    Add the full-grid ψ(r) cache, band-flat sharded over all ranks (including
    its uniform final-chunk pad), and validate the resulting floor against the
    budget at every peak.  The cache has no μ axis and is never replicated.
+   The pad is the static `lax.scan` output shape, not an accidental estimate:
+   a 50-band window at bc16 carries 64 slots (28% overhead), measured/priced
+   as 7.25 rather than 5.66 GB at P=1 on Si 80 Ry.  A ragged last item would
+   require a second cache/slice executable family and is not a trivial memory
+   correction.
 2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
-   Try the full logical ζ-fit window first so the pair GEMM has one K
-   dimension and does not read/modify/write its rank-5 carry between band
-   chunks.  Admit it only when the measured FFT box and Stage-C pair/slab
-   accounting fit together at the requested r-chunk (or the planner's
-   performance floor).  If it does not fit, fall back through the historical
-   power-of-two family under that same guard.  The transport edge is rounded
-   up to a mesh multiple and its tail is zero-masked; the physics window is
-   unchanged.  `cfg.memory.band_chunk_size > 0` (cohsex.in) overrides the
-   picker; the deck default `0` delegates to it.
+   The shipping no-key value is the owner-selected 16.  Its pre-AOT P=4 Si
+   80 Ry premise (33 ms steady z_q at bc16 versus 46 ms full-window) was
+   refuted by the final-tree AOT A/B (31 ms versus 21 ms, respectively), so
+   the default is policy rather than a current performance claim.  It is
+   passed through `_bump_bc(16)`, so the mesh floor and logical-window cap
+   still apply.  An explicit deck value `0` opts into the planner ladder: try
+   the full logical ζ-fit window first so the pair GEMM has one K dimension
+   and does not read/modify/write its rank-5 carry between band chunks; if it
+   does not fit the measured FFT-box + Stage-C guard, fall back through the
+   historical power-of-two family.  Any positive deck value remains an
+   override.  Every transport tail is zero-masked; the physics window is
+   unchanged.
 3. **Pick `r_chunk`** — maximize subject to Peak C fitting after
    `band_chunk` is fixed.  Lower-bounded by `n_rmu` (per user spec: the
    eventual Σ_μν output occupies `n_rmu² · n_q · 16` bytes, so paying
@@ -522,6 +530,14 @@ fuses lifetimes that don't overlap — verified on MoS2 3×3 bispinor /
 2×2 mesh, `slot[1]` holds both a P-pair tensor and the band-chunk FFT
 box across non-overlapping windows.  Default `slots = 3`:
 `P_l_R_conj`, `P_r_R`, plus one XLA scratch slot.
+
+Do not reduce this to the two conv_kpair input carries by inspection of the
+CUDA kernel.  The enclosing scan/custom-call module still owns a third
+pair-sized BufferAssignment slot.  Measured 2026-08-18: a route-inferred
+two-slot trial on the MoS2 bispinor fixture planned r=72,304 at 23.40 GB, but
+the executable requested 31,984,978,688 bytes and OOMed.  Route-aware
+accounting therefore needs compiled-module evidence and is not a trivial
+subtraction of the old post-pair intermediates.
 
 Re-verify after any kernel change:
 
@@ -686,7 +702,8 @@ The post-Round-6 fused kernel `jit__z_q_from_psi_sm` replaced
 ~2–3× smaller because the bc-loop is now scan-aliased.  Binding peak
 post-Round-8 is the two rank-5 P-pair carries (`P_l_acc`, `P_r_acc`)
 which live across the γ̃ contract — `pair_density_slots` (3 on GPU XLA,
-4 on CPU XLA) captures this in the G-flat planner.
+4 on CPU XLA) captures this in the G-flat planner.  The same conservative
+bound remains active around a conv_kpair custom call for the reason above.
 
 Pre-Round-6 reference (legacy
 `tests/profiles/xprof/cohsex_prod-20260303-112900/...` — the blobs are tracked

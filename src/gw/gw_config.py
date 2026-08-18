@@ -1572,10 +1572,13 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    # 0 delegates to the memory planner, which prefers the full logical ζ
-    # window when its measured FFT box + pair accumulator fit.  Any explicit
-    # positive deck value remains an override.
-    "band_chunk_size": 0,
+    # Owner-selected no-key policy.  Its pre-AOT P=4 premise (Si 80 Ry:
+    # bc16 33 ms versus full-window 46 ms) reversed after the SM80 AOT merge
+    # (31 versus 21 ms), so 16 is not asserted to be the faster universal
+    # choice.  Explicit 0 opts into the full-window-first planner ladder; any
+    # positive value remains an override.  The planner mesh-rounds and caps
+    # all three forms at the logical zeta window.
+    "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
