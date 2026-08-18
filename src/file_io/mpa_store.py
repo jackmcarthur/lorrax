@@ -214,6 +214,10 @@ _HEAD_FIT_MODELS = (
     "bgw_q0shift_companion",
     "qsgw_direct_companion",
     "qsgw_schur_companion",
+    "dft_direct_thiele",
+    "bgw_q0shift_thiele",
+    "qsgw_direct_thiele",
+    "qsgw_schur_thiele",
 )
 
 #: Bump when the fit store's layout changes.  Independent of the W
@@ -2341,6 +2345,11 @@ def write_head_fit_collective(
     residues = np.ascontiguousarray(B_p, dtype=np.complex128).reshape(-1)
     if str(energy_unit) not in FIT_ENERGY_UNITS:
         raise ValueError("collective scalar head has an unsupported energy unit")
+    if str(model) not in _HEAD_FIT_MODELS:
+        raise ValueError(
+            f"write_head_fit_collective: scalar-head model {model!r} is "
+            f"not one of {_HEAD_FIT_MODELS}; refuse to publish a fitting "
+            "protocol that the matching reader cannot consume")
     if (z.size < 1 or poles.size < 1 or z.shape != wc.shape
             or poles.shape != residues.shape):
         raise ValueError("collective scalar head has inconsistent vector extents")
@@ -2478,9 +2487,9 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
     backward_limit = float(provenance.get(
         "backward_error_max_allowed", np.inf))
     if diagnostics["fit_condition"] > condition_limit:
-        raise ValueError("scalar-head Loewner fit exceeds its condition gate")
+        raise ValueError("scalar-head MPA fit exceeds its condition gate")
     if diagnostics["fit_backward_error"] > backward_limit:
-        raise ValueError("scalar-head Loewner fit exceeds its backward-error gate")
+        raise ValueError("scalar-head MPA fit exceeds its backward-error gate")
 
     prefix = MPA_HEAD_SUFFIX + "/"
     with SlabIO(src, mode="r", mesh=mesh_xy) as io:

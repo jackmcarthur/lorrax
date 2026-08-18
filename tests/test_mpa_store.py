@@ -1013,9 +1013,31 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         MS.read_head_fit(tmpdir_path)
 
 
-def test_bgw_q0shift_head_model_is_a_certified_store_protocol():
-    """The producer's public model tag must survive the reader allowlist."""
-    assert "bgw_q0shift_loewner" in MS._HEAD_FIT_MODELS
+@pytest.mark.parametrize("solve", ("loewner", "companion", "thiele"))
+@pytest.mark.parametrize(
+    "head", ("dft_direct", "bgw_q0shift", "qsgw_direct", "qsgw_schur"))
+def test_pole_solver_head_models_are_certified_store_protocols(head, solve):
+    """Every producer model tag must survive the reader allowlist."""
+    assert f"{head}_{solve}" in MS._HEAD_FIT_MODELS
+
+
+def test_collective_head_writer_refuses_protocol_unknown_to_reader():
+    """A producer cannot publish a tag the matching reader will reject."""
+
+    one = np.ones(1, dtype=np.complex128)
+    with pytest.raises(ValueError, match="matching reader cannot consume"):
+        MS.write_head_fit_collective(
+            "/not/opened/when/model/is/refused.h5",
+            one, one, one, one,
+            mesh_xy=None,
+            energy_unit="Ry",
+            fit_condition=1.0,
+            fit_backward_error=0.0,
+            fit_max_abs_residual=0.0,
+            grid_hash="unused",
+            fit_provenance={},
+            model="not_a_protocol",
+        )
 
 
 def test_collective_head_writer_closes_all_ledger_readers_before_rank0_write():
