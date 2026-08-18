@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+import enum
 import os
 
 import numpy as np
@@ -38,6 +39,22 @@ def _analytic_q0_sphere(params) -> bool:
         or str(params.get("bgw_metal_q0_treatment", "exact")).strip().lower()
         == "bgw_q0shift"
     )
+
+
+class HeadResponseKind(str, enum.Enum):
+    """Reduction state of the response that produced a scalar head.
+
+    The distinction is operational, not documentation: ``DIRECT_IRREDUCIBLE``
+    still needs the head/body Schur complement for a physical macroscopic W,
+    whereas ``MICRO_REDUCIBLE`` already contains that local-field resummation
+    and must never be folded again.
+    """
+
+    DIRECT_IRREDUCIBLE = "direct_irreducible"
+    FULL_LOCAL_FIELDS = "full_local_fields"
+    MICRO_REDUCIBLE = "micro_reducible"
+    OVERRIDE = "override"
+    OFF = "off"
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,7 @@ class HeadSample:
     #: to re-attach the head per fine q.  Persisted to the restart by
     #: ``file_io.write_head_scalars_to_h5`` so the BSE need not rebuild it.
     S_cart: np.ndarray | None = None
+    response_kind: HeadResponseKind = HeadResponseKind.DIRECT_IRREDUCIBLE
 
 
 @dataclass(frozen=True)
@@ -239,6 +257,7 @@ def bgw_q0shift_head_sample(vc0, epsinv, omega) -> HeadSample:
         source="bgw_q0shift(analytic-sphere v; finite-q0 epsinv head+wings)",
         omega=complex(omega),
         S_cart=None,
+        response_kind=HeadResponseKind.FULL_LOCAL_FIELDS,
     )
 
 
@@ -268,6 +287,7 @@ def resolve_head_override(params, omega) -> HeadSample | None:
         wcoul0=complex(whead_override),
         source=source,
         omega=omega_val,
+        response_kind=HeadResponseKind.OVERRIDE,
     )
 
 
@@ -425,48 +445,48 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
 
     want_source = str(params.get("wcoul0_source", "s_tensor")).strip().lower()
     if want_source not in ("epshead", "s_tensor"):
-        print_fn(f"Unknown wcoul0_source={want_source}; defaulting to 's_tensor'")
-        want_source = "s_tensor"
+        raise ValueError(
+            f"wcoul0_source={want_source!r} is invalid; expected 'epshead' "
+            "or 's_tensor'. The head source never falls back silently.")
 
     omega_val = complex(omega)
     eta = float(params.get("wcoul0_eta", 0.0) or 0.0)
     eps0_path = os.path.join(input_dir, "eps0mat.h5")
     dipole_path = os.path.join(input_dir, "dipole.h5")
 
-    def from_epshead() -> HeadSample | None:
+    def from_epshead() -> HeadSample:
         if not os.path.exists(eps0_path):
-            return None
-        try:
-            if abs(omega_val) > 1.0e-14:
-                print_fn(
-                    f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
-                )
-            from file_io.epsreader import EPSReader
-            from gw.vcoul import compute_q0_averages
-
-            eps0 = EPSReader(eps0_path)
-            vc0_mean, wcoul0 = compute_q0_averages(
-                wfn,
-                jnp.asarray(eps0.epshead, dtype=jnp.complex128),
-                meta,
-                S_cart=None,
-                analytic_sphere=_analytic_q0_sphere(params),
+            raise FileNotFoundError(
+                f"wcoul0_source=epshead requested {eps0_path}, but it does "
+                "not exist; refusing to substitute s_tensor.")
+        if abs(omega_val) > 1.0e-14:
+            print_fn(
+                f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
             )
-            source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
-            return HeadSample(
-                vc0=complex(vc0_mean),
-                wcoul0=complex(wcoul0),
-                source=source,
-                omega=omega_val,
-            )
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            print_fn(f"epshead wcoul0 failed: {exc}")
-            return None
+        from file_io.epsreader import EPSReader
+        from gw.vcoul import compute_q0_averages
 
-    def from_s_tensor() -> HeadSample | None:
+        eps0 = EPSReader(eps0_path)
+        vc0_mean, wcoul0 = compute_q0_averages(
+            wfn,
+            jnp.asarray(eps0.epshead, dtype=jnp.complex128),
+            meta,
+            S_cart=None,
+            analytic_sphere=_analytic_q0_sphere(params),
+        )
+        source = "epshead(0)" if abs(omega_val) > 1.0e-14 else "epshead"
+        return HeadSample(
+            vc0=complex(vc0_mean),
+            wcoul0=complex(wcoul0),
+            source=source,
+            omega=omega_val,
+        )
+
+    def from_s_tensor() -> HeadSample:
         if not os.path.exists(dipole_path):
-            print_fn(f"dipole.h5 not found at {dipole_path}; cannot build S(omega) wcoul0")
-            return None
+            raise FileNotFoundError(
+                f"wcoul0_source=s_tensor requested {dipole_path}, but it "
+                "does not exist; refusing to substitute epshead.")
         from gw.vcoul import compute_q0_averages
 
         from common import timing as _tmg
@@ -490,15 +510,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             S_cart=np.asarray(S_cart_omega, dtype=np.complex128),
         )
 
-    source_order = [want_source] + [s for s in ("epshead", "s_tensor") if s != want_source]
-    for source in source_order:
-        result = from_epshead() if source == "epshead" else from_s_tensor()
-        if result is not None:
-            return result
-
-    raise RuntimeError(
-        "Failed to resolve q=0 Coulomb head: neither explicit overrides nor supported sources are available."
-    )
+    return from_epshead() if want_source == "epshead" else from_s_tensor()
 
 
 def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
@@ -699,7 +711,8 @@ class HeadResolver:
     """
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
-                 "_print_fn", "_cache")
+                 "_print_fn", "_cache", "_direct_cache", "_policy",
+                 "_screened")
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
         head = config.head
@@ -712,29 +725,91 @@ class HeadResolver:
             "head_minibz_average": head.head_minibz_average,
             "bgw_metal_q0_treatment": head.bgw_metal_q0_treatment,
         }
+        from gw.gw_config import coerce_head_correction
+        self._policy = coerce_head_correction(
+            getattr(head, "correction", "full"))
+        self._screened = bool(getattr(config, "do_screened", True))
         self._input_dir = input_dir
         self._wfn = wfn
         self._sym = sym
         self._meta = meta
         self._print_fn = print_fn
         self._cache: dict[tuple[float, float], HeadSample] = {}
+        self._direct_cache: dict[tuple[float, float], HeadSample] = {}
 
     def _cache_key(self, omega) -> tuple[float, float]:
         z = complex(omega)
         return (round(z.real, 12), round(z.imag, 12))
 
-    def at(self, omega) -> HeadSample:
-        """Resolve (and memoize) the head sample at ``omega`` in Ry."""
+    @property
+    def wfn(self):
+        """The WFN whose transition manifold this provider validates."""
+        return self._wfn
+
+    def direct_at(self, omega) -> HeadSample:
+        """Return the configured no-local-field/direct diagnostic sample."""
         key = self._cache_key(omega)
-        cached = self._cache.get(key)
+        cached = self._direct_cache.get(key)
         if cached is not None:
             return cached
         sample = resolve_head_sample(
             self._params, self._input_dir, self._wfn, self._sym,
             self._meta, self._print_fn, omega=omega,
         )
-        self._cache[key] = sample
+        self._direct_cache[key] = sample
         return sample
+
+    def install_samples(self, samples) -> None:
+        """Install finalized samples, rejecting incomplete or double folds."""
+        from gw.gw_config import HeadCorrection
+
+        for sample in tuple(samples):
+            if not isinstance(sample, HeadSample):
+                raise TypeError("head provider accepts HeadSample objects only")
+            if self._policy is HeadCorrection.OFF:
+                raise ValueError(
+                    "head_correction=off cannot install a screened head")
+            if (self._policy is HeadCorrection.FULL
+                    and sample.response_kind
+                    not in (HeadResponseKind.FULL_LOCAL_FIELDS,
+                            HeadResponseKind.MICRO_REDUCIBLE,
+                            HeadResponseKind.OVERRIDE)):
+                raise ValueError(
+                    "head_correction=full requires a once-folded "
+                    "full_local_fields response or an already "
+                    "micro_reducible response; got "
+                    f"{sample.response_kind.value}. Refusing the unfolded "
+                    "epsilon head.")
+            self._cache[self._cache_key(sample.omega)] = sample
+
+    def at(self, omega) -> HeadSample:
+        """Resolve the policy-selected finalized head at ``omega`` in Ry."""
+        from gw.gw_config import HeadCorrection
+
+        key = self._cache_key(omega)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        if self._policy is HeadCorrection.OFF:
+            sample = HeadSample(
+                vc0=0.0j, wcoul0=0.0j, source="head_correction=off",
+                omega=complex(omega), S_cart=None,
+                response_kind=HeadResponseKind.OFF)
+            self._cache[key] = sample
+            return sample
+        direct = self.direct_at(omega)
+        if direct.response_kind is HeadResponseKind.OVERRIDE:
+            self._cache[key] = direct
+            return direct
+        if (self._policy is HeadCorrection.NO_LOCAL_FIELDS
+                or not self._screened):
+            self._cache[key] = direct
+            return direct
+        raise RuntimeError(
+            "head_correction=full was requested, but no finalized head was "
+            f"installed at omega={complex(omega)} Ry. Build compatible "
+            "wings/body (direct RPA) or a micro-reducible BSE resolvent; "
+            "the direct epsilon head is not a silent fallback.")
 
 
 def format_head_sample_diagnostics(head: HeadSample, *, include_screened: bool = True) -> str:

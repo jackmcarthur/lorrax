@@ -32,6 +32,7 @@ import pytest
 
 from gw.gw_config import (
     ComputeMode,
+    HeadCorrection,
     LorraxConfig,
     ScreeningConfig,
     ScreeningDiagrams,
@@ -80,6 +81,35 @@ def test_a_deck_that_never_mentions_the_key_resolves_to_w_rpa(tmp_path):
     config = _config(tmp_path)
     assert config.screening.diagrams is ScreeningDiagrams.W_RPA
     assert config.screening.diagrams.value == "w_rpa"
+
+
+def test_head_correction_defaults_full_and_legacy_do_g0_maps_to_off(tmp_path):
+    assert _config(tmp_path).head.correction is HeadCorrection.FULL
+    legacy = _config(tmp_path, "do_G0 = false\n", name="legacy_off.in")
+    assert legacy.head.correction is HeadCorrection.OFF
+    assert legacy.do_G0 is False
+
+
+@pytest.mark.parametrize(
+    "spelling, expected",
+    [("full", HeadCorrection.FULL),
+     ("NO_LOCAL_FIELDS", HeadCorrection.NO_LOCAL_FIELDS),
+     ("off", HeadCorrection.OFF)],
+)
+def test_public_head_policy_is_parsed_and_controls_the_legacy_mirror(
+        tmp_path, spelling, expected):
+    config = _config(
+        tmp_path, f"head_correction = {spelling}\n",
+        name=f"head_{spelling.lower()}.in")
+    assert config.head.correction is expected
+    assert config.do_G0 is (expected is not HeadCorrection.OFF)
+
+
+def test_contradictory_legacy_and_named_head_flags_refuse(tmp_path):
+    with pytest.raises(ValueError, match="contradictory deck settings"):
+        _config(
+            tmp_path, "do_G0 = false\nhead_correction = full\n",
+            name="contradictory_head.in")
 
 
 def test_the_value_normalises_like_every_other_string_key(tmp_path):

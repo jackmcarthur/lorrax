@@ -533,6 +533,14 @@ def persist_w0_and_head(
             # rebuilding S(ω) from dipole.h5 (gw.head_densify).  None on the
             # epshead branch, which has no tensor; the writer skips it then.
             S_cart=head_static.S_cart,
+            head_correction=getattr(
+                getattr(getattr(config, "head", None), "correction", None),
+                "value",
+                getattr(getattr(config, "head", None), "correction", None)),
+            response_kind=getattr(
+                getattr(head_static, "response_kind", None), "value",
+                getattr(head_static, "response_kind", None)),
+            head_source=head_static.source,
         )
     print_fn(
         f"  Persisted W0_qmunu + q=0 head scalars: "

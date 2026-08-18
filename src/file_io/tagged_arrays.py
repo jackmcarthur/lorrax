@@ -697,6 +697,9 @@ def write_head_scalars_to_h5(
     whead: np.ndarray | jnp.ndarray | None = None,
     omega_grid: np.ndarray | jnp.ndarray | None = None,
     S_cart: np.ndarray | jnp.ndarray | None = None,
+    head_correction: str | None = None,
+    response_kind: str | None = None,
+    head_source: str | None = None,
 ):
     """Persist q=0 Coulomb head scalars to the restart file.
 
@@ -713,6 +716,10 @@ def write_head_scalars_to_h5(
       tensor that PRODUCED ``whead[0]``, in the canonical convention of
       ``docs/theory/s-tensor-convention.md``.  ``None`` on the ``epshead``
       head branch, which fits an isotropic γ and has no tensor.
+    - ``head_correction``, ``response_kind``, and ``head_source``: optional
+      provenance attrs on ``whead``.  Together they distinguish a direct
+      epsilon head from a once-folded or already micro-reducible W head, so a
+      restart consumer cannot safely infer reduction state from array shape.
 
       WHY A TENSOR JOINS TWO SCALARS HERE.  ``whead`` is the cell average
       ``⟨v/(1 − v qᵀSq)⟩`` over ONE mini-BZ, so it is bound to the grid it was
@@ -742,6 +749,12 @@ def write_head_scalars_to_h5(
             ds = f.create_dataset("whead", data=arr)
             if omega_grid is not None:
                 ds.attrs["omega_grid"] = np.asarray(omega_grid, dtype=np.float64).reshape(-1)
+            if head_correction is not None:
+                ds.attrs["head_correction"] = str(head_correction)
+            if response_kind is not None:
+                ds.attrs["response_kind"] = str(response_kind)
+            if head_source is not None:
+                ds.attrs["head_source"] = str(head_source)
         if S_cart is not None:
             if "S_cart_head" in f:
                 del f["S_cart_head"]
@@ -1295,5 +1308,3 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_rmuT_X_transverse=psi_rmuT_X_T,
         n_rmu_transverse_disk=n_rmu_T_disk,
     )
-
-

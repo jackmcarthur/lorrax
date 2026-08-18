@@ -77,7 +77,7 @@ from common.units import RYD_TO_EV
 from .band_partition import BandPartition, apply_band_partition
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
-from .gw_config import ComputeMode
+from .gw_config import ComputeMode, HeadCorrection
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import SigmaResult, compute_sigma_xc
@@ -275,6 +275,10 @@ class SCInputs:
     #: Validated, device-resident Berry connection + exact DFT velocity.
     #: None preserves the historical fixed-DFT head path exactly.
     parallel_transport: object | None = None
+    #: Immutable DFT S/Y/Z response used by ``head_correction=full`` when
+    #: ``sc_head_update=off``.  Built once on the shared screening plan, not
+    #: rebuilt in every map call; the resident W still supplies the one fold.
+    fixed_dft_head_response: object | None = None
     print_fn: Callable = print
 
 
@@ -1300,6 +1304,31 @@ def _report_extrapolation_eqp_shift(
     print_fn("\n".join(lines))
 
 
+def _sc_head_frequency_plan(config, quad):
+    """Single frequency plan for SC body W and every head provenance arm."""
+    from .screening import screening_requests_for
+
+    requests = screening_requests_for(config.compute_mode, config)
+    mpa_plan = None
+    if config.compute_mode is ComputeMode.MPA:
+        from .mpa import sample_plan
+        from .mpa.model import make_mpa_plan
+
+        mpa_plan = make_mpa_plan(config, quad)
+        mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
+        head_omegas = [complex(value) for value in mpa_z]
+        # The metallic MPA grid starts just above the origin.  Preserve a
+        # separate exact-static sample for do_G0; it is nonanalytic and must
+        # never enter the Loewner sample vector.
+        if bool(config.do_G0) and not np.any(mpa_z == 0.0 + 0.0j):
+            head_omegas.append(0.0 + 0.0j)
+    else:
+        head_omegas = (
+            [complex(req.omega_ry) for req in requests]
+            if requests else [0.0 + 0.0j])
+    return requests, mpa_plan, head_omegas
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     """One self-consistent QSGW step in the DFT basis.
 
@@ -1315,7 +1344,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     call lives here directly — adding a new Σ scheme that wants extra
     W frequencies is purely a screening + compute_sigma_xc change.
     """
-    from .screening import compute_screening_model, screening_requests_for
+    from .screening import compute_screening_model
 
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
@@ -1621,27 +1650,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
-    requests = screening_requests_for(
-        inputs.config.compute_mode, inputs.config)
-
+    requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
+        inputs.config, inputs.quad)
     mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
-    mpa_plan = None
-    if mpa_mode:
-        from .mpa import sample_plan
-        from .mpa.model import make_mpa_plan
-
-        mpa_plan = make_mpa_plan(inputs.config, inputs.quad)
-        mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
-        head_omegas = [complex(value) for value in mpa_z]
-        # The metallic MPA grid starts just above the origin.  Preserve a
-        # separate exact-static sample for do_G0; it is nonanalytic and must
-        # never enter the Loewner sample vector.
-        if bool(inputs.config.do_G0) and not np.any(mpa_z == 0.0 + 0.0j):
-            head_omegas.append(0.0 + 0.0j)
-    else:
-        head_omegas = (
-            [complex(req.omega_ry) for req in requests]
-            if requests else [0.0 + 0.0j])
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -1652,13 +1663,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_head = None
     iteration_head_response = None
     iteration_static_head_terms = inputs.static_head_terms
+    head_occ_kn = None
     pt = getattr(inputs, "parallel_transport", None)
-    if pt is not None:
+    fixed_dft_full_head = inputs.fixed_dft_head_response is not None
+    if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
+        from .qsgw_head import finalize_iteration_head_samples
+    if pt is not None:
         from .qsgw_head import (
             assemble_delta_head_manifold,
             build_iteration_head_response,
-            finalize_iteration_head_samples,
         )
 
         nb_storage = int(pt.velocity_dft_cart.shape[-1])
@@ -1741,6 +1755,26 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"    SC head: {velocity_kind} + current-basis wings "
                 "from saved parallel transport/current centroid bundle "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)})")
+
+    elif fixed_dft_full_head:
+        # ``sc_head_update=off`` freezes the DFT direct response; it does not
+        # turn a requested macroscopic W head back into the no-local-field
+        # epsilon head.  Reuse the immutable DFT S/Y/Z on this iteration's
+        # exact frequency plan, then fold it once through this iteration's W.
+        # This branch keeps the public full/no-LF decision independent of the
+        # QSGW velocity-update choice.  Only the small 3x3/vector response is
+        # retained; body W remains 2-D sharded as before.
+        iteration_head_response = inputs.fixed_dft_head_response
+        head_occ_kn = np.asarray(
+            iteration_head_response.sigma_occupations, dtype=np.float64)
+        if tuple(iteration_head_response.omegas) != tuple(head_omegas):
+            raise ValueError(
+                "fixed DFT head response does not match the current "
+                "screening frequency plan")
+        inputs.print_fn(
+            "    SC head: fixed DFT direct response plus matching wings "
+            "on the current screening frequency plan; local fields fold "
+            "once through this iteration's W (sc_head_update=off)")
 
 
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
@@ -3036,6 +3070,22 @@ def run_sc_driver(
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
         print_fn=print_fn)
+    fixed_dft_head_response = None
+    if (parallel_transport is None
+            and config.head.correction is HeadCorrection.FULL):
+        # ``sc_head_update=off`` freezes this direct DFT response.  Build it
+        # once, on the same single-sourced frequency plan every map consumes,
+        # then fold it through each iteration's resident W exactly once.
+        from .qsgw_head import build_dft_head_response
+        _, _, fixed_head_omegas = _sc_head_frequency_plan(config, quad)
+        fixed_dft_head_response = build_dft_head_response(
+            wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
+            input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
+            config=config)
+        print_fn(
+            "  SC head: cached fixed DFT direct response and wings for "
+            f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
+            "them once through its resident W.")
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
@@ -3051,6 +3101,7 @@ def run_sc_driver(
         valence_mask_active_kn=val_mask_active,
         kstar=kstar,
         parallel_transport=parallel_transport,
+        fixed_dft_head_response=fixed_dft_head_response,
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
