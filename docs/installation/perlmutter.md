@@ -64,6 +64,22 @@ before running them.
 
 ## Native FFI stack on Perlmutter
 
+!!! danger "TODO — the embedded convolution kernels are A100-only"
+    The current CUDA build precompiles and embeds the `conv_kpair`,
+    `conv_kminor`, and `conv_klead` device kernels for **sm_80 only** — the
+    A100 architecture on Perlmutter. This deletes roughly 30 seconds of
+    runtime NVRTC work from a cold ζ process on this machine. It is not a
+    general GPU installation solution.
+
+    On any other GPU architecture the handlers emit an `AOT_ARCH_MISS` line
+    and automatically fall back to NVRTC, paying that compilation cost in
+    every new process. Before calling another architecture supported, the
+    installer must implement a real architecture list (a multi-architecture
+    fatbin) or compile the active architecture at installation time. Do not
+    copy the kernel into a second `.cu`: CMake extracts the one authored
+    `kKernelSrc` literal so the AOT image and NVRTC fallback cannot drift.
+    See [CUDA kernel migration](../dev/cuda_kernel_migration.md#aot-images-and-the-sm_80-installation-gap).
+
 The three native trees (cuSolverMp, parallel HDF5, SLATE) are staged once under
 `$HOME/software/lorrax_{nvhpc,phdf5_cray/stage,slate_cray/stage}` and bind-mounted into the
 container. Then `liblorrax_ffi.so` is built inside Shifter:

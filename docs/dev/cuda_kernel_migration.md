@@ -47,21 +47,26 @@ to lose to `nvcc`'s own scheduler.
 
 ---
 
-## 1. The build path, and why it needs no `nvcc`
+## 1. The build path and runtime fallback
 
-The device leg (`src/ffi/cpp/`, `LORRAX_FFI_PLATFORM=cuda`) is compiled by the
-host compiler against the CUDA *headers*. The kernels live in an **NVRTC
-source string** compiled once per process, for the compute capability queried
-from the runtime device, and loaded through driver-API entry points resolved by
-`dlsym`. Copy that structure; do not add a `.cu` translation unit unless you
-must (a `.cu` file drags `enable_language(CUDA)` and a real `nvcc` into every
-build of the leg, which the Frontera toolchain does not have).
+The device leg (`src/ffi/cpp/`, `LORRAX_FFI_PLATFORM=cuda`) keeps each direct
+kernel in one **NVRTC source string**. That string is the authored source for
+both routes: on the Perlmutter build, CMake extracts the literal into a
+generated `.cu`, compiles an sm_80 cubin with the nvcc already required by the
+cuBLASMp leg, and embeds it in `liblorrax_ffi.so`; at runtime, a matching A100
+loads the image through checked driver-API calls and never invokes NVRTC.
+
+When no matching image is embedded, the same literal is compiled for the
+queried device compute capability with NVRTC and loaded through driver-API
+entry points resolved by `dlsym`. A cuFFT-only/eigh-only build with
+`LORRAX_FFI_HAVE_CUBLASMP=OFF` still requires no nvcc and retains that route;
+do not move the AOT step outside that existing CUDA-language gate.
 
 What you get for free by following it:
 
-* **One `.so` serves every GPU generation.** The architecture string is built
-  at run time (`--gpu-architecture=sm_%d%d`), so there is no
-  `CMAKE_CUDA_ARCHITECTURES` to get wrong.
+* **The fallback serves every GPU generation.** The architecture string is
+  built at run time (`--gpu-architecture=sm_%d%d`). The embedded fast path is
+  currently narrower; see the installation gap below.
 * **No link-time `libcuda`.** The driver is absent on login and build nodes;
   `dlsym` against the already-loaded library (JAX loaded it) keeps the artifact
   linkable everywhere.
@@ -82,6 +87,23 @@ Build into an **isolated** directory (`LORRAX_FFI_BUILD_DIR=.../build_<lane>`),
 never the tree's `build/`, and select it per-run with `LORRAX_FFI_SO`. The
 precedent is the `distrib_la` `build_matmul_cuda` lane. `src/ffi/cpp/build.sh`
 runs the whole build contract (`scripts/verify_ffi_build.sh`) unchanged.
+
+### AOT images and the sm_80 installation gap
+
+!!! danger "TODO — implement a real multi-architecture installation build"
+    Only **sm_80** is prebuilt today. That is deliberate for Perlmutter's
+    A100s and removes a measured roughly 30-second NVRTC cold-start cost, but
+    it is not a general portability design. Any other architecture logs
+    `AOT_ARCH_MISS` and correctly uses the NVRTC fallback, paying the compile
+    cost per process.
+
+    Replace this with either a fatbin over an explicit, maintained
+    architecture list or an install-time compile for the detected GPU. Keep
+    the kernel text single-sourced: generate AOT inputs from `kKernelSrc` (as
+    the current CMake does), never maintain a parallel hand-written `.cu`.
+    Installers should read the prominent warnings in
+    [Perlmutter installation](../installation/perlmutter.md#native-ffi-stack-on-perlmutter)
+    and [FFI native libraries](../installation/ffi-native-libs.md#4-build-liblorrax_ffiso-non-shifter).
 
 ---
 
