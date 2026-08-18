@@ -38,18 +38,17 @@ LADDER W, and stamping that into ``W0_qmunu`` would put a different
 operator under a dataset every downstream consumer reads as the RPA
 static W.
 
-THE q=0 HEAD STAYS RPA (design section 5).  The head is not inside
-``W_q`` on either path: for 3D/2D the ``q=0, G=0`` slot of ``V_q`` is
-zeroed and the head is carried separately as the scalar channel
-``head_resolver`` owns (``vhead`` / ``whead``, persisted beside W0 and
-injected analytically into Sigma).  The ladder replaces the BODY, the
-head channel is untouched, and the only step that could move it --
-``mc_average_placement``'s post-solve head rescale via
-``head_channel.combine_head_channel`` -- is REFUSED at parse time under
-w_bse (``gw_config.refuse_unsupported_screening_diagrams``,
-``w_bse_head_placement_unimplemented``).  This helper asserts that
-refusal held rather than assuming it: a non-None ``head_channel`` reaching
-here is a bug in the parse gate, not a case to serve.
+THE q=0 HEAD RIDES THE SAME RESOLVENT.  The singular macroscopic slot is not
+inside ``W_q``: the body facade therefore solves three dipole right-hand
+sides on the identical full-window, full-2N operator and returns ``Xi_ab``.
+That tensor is already micro-reducible because the finite-G Hartree/ring term
+is in the operator.  ``head_correction=full`` restores only the omitted
+macroscopic bare-v channel through the mini-BZ reduction; applying the RPA
+``Y W Z`` fold to it again is explicitly forbidden as double counting.
+``no_local_fields`` retains the direct diagnostic and ``off`` removes the
+special Gamma cell.  The separate finite-q ``mc_average_placement`` policy
+remains refused under w_bse; a non-None ``head_channel`` reaching here is a
+parse-gate bug, not a case to serve.
 
 INSULATORS ONLY, AND THE GATE IS IN TWO PLACES BECAUSE THE SIGNAL IS.
 The ladder, its TRS-gauge machinery and every certification behind this
@@ -548,10 +547,25 @@ def prepare_ladder_restart(
             stage="RPA input W[static] for the ladder kernel",
             print_fn=print_fn, kgrid=tuple(meta.kgrid))
 
+    rpa_iteration_head = None
+    from .gw_config import HeadCorrection
+    if config.head.correction is HeadCorrection.FULL:
+        from .qsgw_head import (
+            build_dft_head_response, finalize_iteration_head_samples)
+        static_request = ScreeningRequest(0.0 + 0.0j, "static")
+        direct = build_dft_head_response(
+            wfns, np.asarray([0.0j]), input_dir=config.input_dir,
+            mesh=mesh_xy, wfn=head_resolver.wfn,
+            meta=meta, config=config)
+        rpa_iteration_head = finalize_iteration_head_samples(
+            direct, wfn=head_resolver.wfn, meta=meta,
+            config=config, mesh=mesh_xy, requests=[static_request],
+            W_by_role={"static": W0_rpa})
     with timing.section("gw_jax.persist_w0"):
         persist_w0_and_head(
             W0_rpa, tensors_filename=tensors_filename,
-            head_resolver=head_resolver, config=config, meta=meta,
+            head_resolver=head_resolver, iteration_head=rpa_iteration_head,
+            config=config, meta=meta,
             mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices,
             static_head_only=True, print_fn=print_fn)
     _assert_restart_is_loadable(tensors_filename, print_fn=print_fn)
@@ -563,7 +577,8 @@ def prepare_ladder_restart(
 # ---------------------------------------------------------------------------
 
 def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
-                  include_w=True, print_fn=print, gmres_tol=None):
+                  include_w=True, print_fn=print, gmres_tol=None,
+                  config=None, meta=None, wfn=None):
     """One call into ``bse.w_ladder``, with the residual gate on its output.
 
     ``gmres_tol`` defaults to the PRODUCTION constant :data:`_GMRES_TOL`.
@@ -598,10 +613,28 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     with timing.section("gw_jax.w_ladder", announce=True,
                         label=f"W ladder resolvent ({z.size} z, "
                               f"include_w={include_w})"):
+        head_kwargs = {}
+        if config is not None:
+            from .gw_config import HeadCorrection
+            if config.head.correction is HeadCorrection.FULL:
+                if meta is None or wfn is None:
+                    raise ValueError(
+                        "head_correction=full requires meta and wfn at the "
+                        "ladder facade so the resolvent normalization is "
+                        "defined")
+                from bse.head_resolvent import head_prefactor
+                head_kwargs = {
+                    "head_dipole_path": os.path.join(
+                        config.input_dir, "dipole.h5"),
+                    "head_n_occ": int(meta.nelec),
+                    "head_pref": head_prefactor(
+                        float(meta.cell_volume), int(meta.nk_tot),
+                        int(wfn.nspin), int(meta.nspinor)),
+                }
         wedge = compute_wc_qwedge(
             tensors_filename, z, mesh_xy, include_w=include_w,
             gmres_tol=tol, gmres_max_iter=_GMRES_MAX_ITER,
-            input_file=input_file)
+            input_file=input_file, **head_kwargs)
     resid = _wedge_field(wedge, _RESIDUAL_FIELDS, np.float64)
     iters = _wedge_field(wedge, _ITERATION_FIELDS, np.int64)
     # AN ABSENT RESIDUAL IS A REFUSAL, NOT A SKIPPED CHECK.  "no residuals
@@ -634,6 +667,43 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
             + ".  A truncated column returns a finite, plausible tile; "
               "it is refused here rather than fitted downstream.")
     return wedge
+
+
+def _finalize_ladder_head(wedge, *, config, meta, head_resolver, print_fn=print):
+    """Install the micro-reducible resolvent head without a second fold."""
+    from .gw_config import HeadCorrection
+    if config.head.correction is not HeadCorrection.FULL:
+        return None
+    result = getattr(wedge, "head_result", None)
+    if result is None:
+        raise RuntimeError(
+            "head_correction=full requested w_bse, but the ladder facade "
+            "returned no q->0 resolvent tensor")
+    worst = float(np.max(result.resids))
+    hottest = int(np.max(result.iters))
+    if not worst <= _residual_ceiling(_GMRES_TOL) or hottest >= _GMRES_MAX_ITER:
+        raise RuntimeError(
+            "w_bse q->0 head resolvent did not converge: max true residual "
+            f"{worst:.3e}, iterations {hottest}/{_GMRES_MAX_ITER}")
+    xi = np.asarray(result.xi, dtype=np.complex128)
+    xi_long = 0.5 * (xi + np.swapaxes(xi, -1, -2))
+    print_fn(
+        "  w_bse head: using micro-reducible BSE resolvent exactly once "
+        f"(max residual {worst:.2e}, max |Xi-Xi^T|/|Xi| "
+        f"{float(np.max(result.asym)):.2e}, dipole/operator Delta mismatch "
+        f"{float(result.delta_mismatch):.2e}); no Schur refold.")
+    from .qsgw_head import IterationHeadSamples, head_samples_from_s
+    samples = head_samples_from_s(
+        xi_long, result.z, wfn=head_resolver.wfn,
+        meta=meta, config=config, response_kind="micro_reducible",
+        source_prefix="bse_resolvent_micro")
+    resolved = IterationHeadSamples(
+        omegas=tuple(complex(z) for z in result.z), samples=samples,
+        sigma_energies_ry=np.empty((0, 0), dtype=np.float64),
+        sigma_occupations=np.empty((0, 0), dtype=np.float64),
+        efermi_ry=0.0)
+    head_resolver.install_samples(samples)
+    return resolved
 
 
 def _assert_wedge_matches_run(wedge, sym):
@@ -837,8 +907,12 @@ def compute_screening_ladder(
     wedge = _ladder_wedge(
         tensors_filename, z_list, mesh_xy,
         input_file=getattr(config, "input_file", ""),
-        include_w=include_w, print_fn=print_fn)
+        include_w=include_w, print_fn=print_fn,
+        config=config, meta=meta, wfn=head_resolver.wfn)
     _assert_wedge_matches_run(wedge, sym)
+    _finalize_ladder_head(
+        wedge, config=config, meta=meta, head_resolver=head_resolver,
+        print_fn=print_fn)
     wc = wedge.wc
     if int(wc.shape[0]) != len(z_list):
         raise ValueError(
@@ -904,8 +978,12 @@ def make_ladder_wc_source(
         wedge = _ladder_wedge(
             tensors_filename, z_all, mesh_,
             input_file=getattr(config, "input_file", ""),
-            include_w=True, print_fn=print_fn)
+            include_w=True, print_fn=print_fn,
+            config=config, meta=meta_, wfn=head_resolver.wfn)
         _assert_wedge_matches_run(wedge, sym)
+        iteration_head = _finalize_ladder_head(
+            wedge, config=config, meta=meta_, head_resolver=head_resolver,
+            print_fn=print_fn)
         shape = (z_all.size, q_idx.size, meta_.n_rmu, meta_.n_rmu)
         mu_target = int(V.shape[-1])
         for index in range(z_all.size):
@@ -917,6 +995,7 @@ def make_ladder_wc_source(
                 sample_path, _WC, index, Wc, mesh_xy=mesh_,
                 global_shape=shape)
             del Wc
+        return iteration_head
 
     return _wc_from_ladder
 

@@ -625,10 +625,15 @@ def build_mpa_fit(
         if bool(getattr(
                 config.head, "uses_bgw_metal_q0shift", False)):
             head_model = "bgw_q0shift_loewner"
+        elif (head_fit_samples
+              and getattr(getattr(head_fit_samples[0], "response_kind", None),
+                          "value", None) == "micro_reducible"):
+            head_model = "bse_resolvent_micro_loewner"
         else:
             head_model = (
                 "qsgw_schur_loewner"
-                if iteration_head_response.Y_x is not None
+                if (iteration_head_response is not None
+                    and iteration_head_response.Y_x is not None)
                 else "qsgw_direct_loewner"
             )
     fit_ledger = mpa_store.fit_completion_ledger(fit_path)

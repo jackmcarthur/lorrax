@@ -488,6 +488,11 @@ class WLadderWedge:
     gmres_resid: np.ndarray
     gmres_iters: np.ndarray
     include_w: bool
+    #: Optional q->0 tensor from the SAME transition manifold and operator.
+    #: It is micro-reducible (finite-G Hartree/local fields are already in
+    #: the resolvent), so consumers must restore only the omitted macroscopic
+    #: v head and must not apply a head/body Schur fold again.
+    head_result: object | None = None
 
 
 def _identity_probe_block(n_pad: int) -> np.ndarray:
@@ -668,6 +673,9 @@ def compute_wc_qwedge(
     input_file: Optional[str] = None,
     route: str = "auto",
     allow_replicated_dyson: bool = False,
+    head_dipole_path: Optional[str] = None,
+    head_n_occ: Optional[int] = None,
+    head_pref: Optional[float] = None,
 ) -> WLadderWedge:
     """Ladder ``W(z) - v`` bodies for every irreducible q and every requested z.
 
@@ -739,6 +747,14 @@ def compute_wc_qwedge(
     data = load_bse_data_from_restart_sharded(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
         input_file=input_file, inject_head=False, load_v_full=True)
+
+    head_args = (head_dipole_path, head_n_occ, head_pref)
+    if any(value is not None for value in head_args) and not all(
+            value is not None for value in head_args):
+        raise ValueError(
+            "ladder head requires head_dipole_path, head_n_occ, and "
+            "head_pref together; a partial request cannot identify the "
+            "transition manifold or normalization.")
 
     sym = _symmetry_tables(input_file)
     q_list = np.asarray(sym.q_irr_kgrid_int, dtype=int)
@@ -836,6 +852,30 @@ def compute_wc_qwedge(
     wc = jax.lax.with_sharding_constraint(
         stacked.astype(jnp.complex128), wedge_sh)
     _assert_pad_block_is_zero(wc, nlog)
+    head_result = None
+    if head_dipole_path is not None:
+        from .absorption_common import (
+            load_dipole_h5, slice_dipole_to_bse_window)
+        from .head_resolvent import (
+            build_head_dipole, build_head_operator, solve_head_tensor)
+
+        dipole_cart, delta_e, _ = load_dipole_h5(head_dipole_path)
+        n_val = int(data["n_val"])
+        n_cond = int(data["n_cond"])
+        d_alpha, delta_cv = slice_dipole_to_bse_window(
+            dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
+        velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
+        d_pair = build_head_dipole(
+            velocity_cv, delta_cv,
+            n_cond_pad=int(data["n_cond_pad"]),
+            n_val_pad=int(data["n_val_pad"]))
+        head_op = build_head_operator(mesh_xy, data, include_w=include_w)
+        head_result = solve_head_tensor(
+            head_op, data, d_pair, z_list_ry, pref=float(head_pref),
+            max_iter=int(gmres_max_iter), tol=float(gmres_tol),
+            arm=("micro_reducible_bse" if include_w
+                 else "micro_reducible_rpa_test2"),
+            delta_cvk=delta_cv)
     return WLadderWedge(
         wc=wc,
         n_rmu=nlog,
@@ -847,6 +887,7 @@ def compute_wc_qwedge(
         gmres_resid=resid,
         gmres_iters=iters,
         include_w=bool(include_w),
+        head_result=head_result,
     )
 
 

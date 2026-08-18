@@ -166,6 +166,10 @@ def _rebuild_run_state(run_dir, tensors_path):
         str(run_dir / config.paths.centroids_file), tuple(wfn.fft_grid))
     meta = Meta.from_system(
         wfn, sym, config.nval, config.ncond, config.nband, n_rmu)
+    # The driver assigns this after Meta construction.  Body-only closure
+    # cells never noticed its absence; the q0 scalar reduction is dimension
+    # aware and would otherwise compare the run's slab head to a bulk cell.
+    meta.sys_dim = config.sys_dim
     return config, sym, centroid_indices, meta
 
 
@@ -291,6 +295,7 @@ def test_include_w_false_reproduces_the_production_rpa_w0(wbse_closure_run,
     from jax.sharding import NamedSharding, PartitionSpec as P
     from runtime.padding import padded_mu_extent
     from gw import screening_bse
+    from wfn_loader import WfnLoader
 
     n_rmu = int(meta.n_rmu)
     # Keyed on THE MESH, not on ``jax.device_count()``: the pad extent has
@@ -318,12 +323,46 @@ def test_include_w_false_reproduces_the_production_rpa_w0(wbse_closure_run,
     # the wiring.  `_GMRES_TOL_TIGHT` exists for exactly this, and naming it
     # here keeps the two questions apart instead of forcing one constant to
     # answer both.
+    wfn = WfnLoader(str(run_dir / "WFN.h5"))
     wedge = screening_bse._ladder_wedge(
         str(tensors_path), [0.0 + 0.0j], mesh_xy,
         input_file=config.input_file, include_w=False,
         gmres_tol=screening_bse._GMRES_TOL_TIGHT,
-        print_fn=lambda *a, **k: None)
+        print_fn=lambda *a, **k: None, config=config, meta=meta, wfn=wfn)
     screening_bse._assert_wedge_matches_run(wedge, sym)
+
+    # QSGW-hat guide Test 2, on the REAL production payload.  Kd=0 is the
+    # facade's include_w=False arm, but Kx (the finite-G Hartree/ring term)
+    # remains in the full 2N resolvent.  It must therefore produce the same
+    # macroscopic RPA head as the direct S + Y W_body Z Schur path persisted
+    # by the reference driver.  This is deliberately not the K=0/IP control,
+    # which removes Kx too and reproduces only the no-local-field epsilon head.
+    assert wedge.head_result is not None
+    xi = np.asarray(wedge.head_result.xi[0])
+    xi_long = 0.5 * (xi + xi.T)
+    import h5py
+    with h5py.File(tensors_path, "r") as f:
+        S_schur = np.asarray(f["S_cart_head"][:], dtype=np.complex128)
+        W_schur = complex(np.asarray(f["whead"][:]).reshape(-1)[0])
+    tensor_rel = float(np.linalg.norm(xi_long - S_schur)) / max(
+        float(np.linalg.norm(S_schur)), 1.0e-300)
+    from gw.vcoul import compute_q0_averages
+    _, W_resolvent = compute_q0_averages(
+        wfn, jnp.asarray(0.0, dtype=jnp.float64), meta,
+        S_cart=jnp.asarray(xi_long),
+        analytic_sphere=bool(config.head.analytic_q0_sphere))
+    scalar_rel = abs(complex(W_resolvent) - W_schur) / max(
+        abs(W_schur), 1.0e-300)
+    print(
+        f"[head Test2 {mesh_shape[0]}x{mesh_shape[1]}] Kd=0, Kx retained: "
+        f"tensor rel {tensor_rel:.3e}; W resolvent={complex(W_resolvent).real:.9f}, "
+        f"W Schur={W_schur.real:.9f}, rel {scalar_rel:.3e}; "
+        f"head residual={float(np.max(wedge.head_result.resids)):.2e}")
+    assert scalar_rel < 1.0e-6, (
+        "QSGW-hat Test 2 failed: the micro-reducible Kd=0, Kx-retained "
+        f"resolvent head differs from the once-folded RPA head by "
+        f"{scalar_rel:.3e} (tensor difference {tensor_rel:.3e}).  Folding "
+        "the resolvent again is not a repair; it would double-count Kx.")
     W_full = np.asarray(jax.device_get(screening_bse._assemble_full_bz_w(
         wedge.wc[0], V_q, sym=sym, centroid_indices=centroid_indices,
         meta=meta, mesh_xy=mesh_xy, label="static",
@@ -452,6 +491,8 @@ def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
     from common import sanity
     from gw import screening_bse
     from gw.screening import ScreeningRequest, _gate_w
+    from gw.vcoul import compute_q0_averages
+    from wfn_loader import WfnLoader
 
     n_rmu = int(meta.n_rmu)
     mu_pad = padded_mu_extent(n_rmu, int(mesh_xy.devices.size))
@@ -465,11 +506,42 @@ def test_the_ladder_w_passes_the_production_w_gate_at_finite_q(
     # ladder W's per-q hermiticity and its finite-q reciprocity against the
     # PRODUCTION 1e-6 gate tolerance, so the solve must not be the thing
     # supplying the 1e-6.
+    wfn = WfnLoader(str(run_dir / "WFN.h5"))
     wedge = screening_bse._ladder_wedge(
         str(tensors_path), [0.0 + 0.0j], mesh_xy,
         input_file=config.input_file, include_w=True,
-        gmres_tol=screening_bse._GMRES_TOL_TIGHT, print_fn=print)
+        gmres_tol=screening_bse._GMRES_TOL_TIGHT, print_fn=print,
+        config=config, meta=meta, wfn=wfn)
     screening_bse._assert_wedge_matches_run(wedge, sym)
+
+    # The q=0 head must ride the SAME micro-reducible resolvent as the body.
+    # This is the production w_bse physics check, not a post-hoc Schur fold:
+    # Kx (finite-G Hartree/local fields) is already in ``xi``, while Kd is
+    # the direct ladder rung.  Folding this result again would count Kx
+    # twice.  For this semiconducting fixture the ladder must increase the
+    # screening, hence lower W relative to the once-folded RPA reference.
+    assert wedge.head_result is not None
+    xi = np.asarray(wedge.head_result.xi[0])
+    xi_long = 0.5 * (xi + xi.T)
+    v_head, W_bse = compute_q0_averages(
+        wfn, jnp.asarray(0.0, dtype=jnp.float64), meta,
+        S_cart=jnp.asarray(xi_long),
+        analytic_sphere=bool(config.head.analytic_q0_sphere))
+    import h5py
+    with h5py.File(tensors_path, "r") as f:
+        W_rpa = complex(np.asarray(f["whead"][:]).reshape(-1)[0])
+    eps_rpa = complex(v_head).real / W_rpa.real
+    eps_bse = complex(v_head).real / complex(W_bse).real
+    print(
+        f"[head trend {mesh_shape[0]}x{mesh_shape[1]}] "
+        f"W_RPA={W_rpa.real:.9f}, eps_RPA={eps_rpa:.9f}; "
+        f"W_BSE={complex(W_bse).real:.9f}, eps_BSE={eps_bse:.9f}; "
+        f"W_BSE/W_RPA={complex(W_bse).real / W_rpa.real:.9f}; "
+        f"head residual={float(np.max(wedge.head_result.resids)):.2e}")
+    assert 0.0 < complex(W_bse).real < W_rpa.real, (
+        "the ladder head did not increase static screening on the closure "
+        f"fixture: W_BSE={complex(W_bse).real:.9f}, "
+        f"W_RPA={W_rpa.real:.9f}")
 
     # (1) PER-q HERMITICITY OF THE LADDER W ITSELF, on the wedge, on the
     #     logical block.  ``W = (W - v) + v`` and v is Hermitian, so the
