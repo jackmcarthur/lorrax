@@ -1308,6 +1308,19 @@ def build_row(
             achieved_rcond, anchor_error, frozen_Om, frozen_Bp,
             frozen_gap_error, omega_scalar,
         )
+        if jax.process_index() == 0:
+            print(
+                "[intraband-even-certificate] "
+                f"clusters={int(Om.shape[0])} "
+                f"intervals={len(intervals)} "
+                f"origin_gap_ry2={origin_gap:.17e} "
+                f"ladder_nodes={int(ladder_z.size)} "
+                f"gap_max_rel={gap_error:.6e} "
+                f"static_max_rel={static_error:.6e} "
+                f"ls_rcond={achieved_rcond:.6e} "
+                f"frozen_gap_diag={frozen_gap_error:.6e}",
+                flush=True,
+            )
         certificate_green = (
             gap_error <= gap_allowed
             and external_error <= external_allowed
