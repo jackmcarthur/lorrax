@@ -1,6 +1,10 @@
 import numpy as np
+import pytest
+from types import SimpleNamespace
 
 from gw.head_correction import (
+    HeadResolver,
+    HeadResponseKind,
     HeadSample,
     compute_static_head_terms,
     fit_head_ppm,
@@ -8,6 +12,62 @@ from gw.head_correction import (
     resolve_head_override,
     static_head_terms_to_kij,
 )
+from gw.gw_config import HeadCorrection, coerce_head_correction
+
+
+def _resolver(policy, monkeypatch, *, screened=True):
+    head = SimpleNamespace(
+        correction=policy, wcoul0_source="s_tensor", wcoul0_eta=0.0,
+        vhead=None, whead_0freq=None, whead_imfreq=None,
+        head_minibz_average=False, bgw_metal_q0_treatment="exact")
+    config = SimpleNamespace(head=head, do_screened=screened)
+    direct = HeadSample(
+        vc0=100.0 + 0.0j, wcoul0=25.0 + 0.0j,
+        source="unit direct", omega=0.0j,
+        S_cart=np.eye(3),
+        response_kind=HeadResponseKind.DIRECT_IRREDUCIBLE)
+    monkeypatch.setattr(
+        "gw.head_correction.resolve_head_sample",
+        lambda *a, **k: direct)
+    return HeadResolver(config, ".", object(), object(), object(), lambda *a: None)
+
+
+def test_head_policy_enum_is_strict_and_has_one_physical_default_axis():
+    for value in HeadCorrection:
+        assert coerce_head_correction(value.value) is value
+    with pytest.raises(ValueError, match="full, no_local_fields, off"):
+        coerce_head_correction("local_fields_maybe")
+
+
+def test_full_policy_refuses_an_unfolded_direct_epsilon_head(monkeypatch):
+    resolver = _resolver(HeadCorrection.FULL, monkeypatch)
+    with pytest.raises(RuntimeError, match="no finalized head"):
+        resolver.at(0.0j)
+    with pytest.raises(ValueError, match="Refusing the unfolded epsilon head"):
+        resolver.install_samples([resolver.direct_at(0.0j)])
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [HeadResponseKind.FULL_LOCAL_FIELDS, HeadResponseKind.MICRO_REDUCIBLE],
+)
+def test_full_policy_accepts_only_once_reduced_head_kinds(monkeypatch, kind):
+    resolver = _resolver(HeadCorrection.FULL, monkeypatch)
+    final = HeadSample(
+        vc0=100.0 + 0.0j, wcoul0=30.0 + 0.0j,
+        source="unit final", omega=0.0j, S_cart=np.eye(3),
+        response_kind=kind)
+    resolver.install_samples([final])
+    assert resolver.at(0.0j) is final
+
+
+def test_diagnostic_and_off_policies_are_observable(monkeypatch):
+    no_lf = _resolver(HeadCorrection.NO_LOCAL_FIELDS, monkeypatch)
+    assert no_lf.at(0.0j).response_kind is HeadResponseKind.DIRECT_IRREDUCIBLE
+    off = _resolver(HeadCorrection.OFF, monkeypatch)
+    sample = off.at(0.0j)
+    assert sample.response_kind is HeadResponseKind.OFF
+    assert sample.vc0 == 0.0j and sample.wcoul0 == 0.0j
 
 
 def test_compute_static_head_terms_matches_cohsex_formulas():

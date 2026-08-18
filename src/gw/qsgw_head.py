@@ -44,6 +44,7 @@ __all__ = [
     "assemble_head_manifold",
     "build_iteration_head_samples",
     "build_iteration_head_response",
+    "build_dft_head_response",
     "covariant_cartesian_derivative",
     "covariant_structured_delta",
     "head_s_tensor_sharded",
@@ -1469,12 +1470,24 @@ def finalize_iteration_head_sample(
     survives the call. Left and right wings remain independent at complex
     frequency.
     """
+    from gw.gw_config import HeadCorrection, coerce_head_correction
+
+    policy = coerce_head_correction(
+        getattr(config.head, "correction", HeadCorrection.FULL))
     index = int(omega_index)
     if not 0 <= index < len(response.omegas):
         raise IndexError(
             f"head frequency index {index} outside [0,{len(response.omegas)})")
+    if policy is HeadCorrection.OFF:
+        from gw.head_correction import HeadResponseKind, HeadSample
+        return HeadSample(
+            vc0=0.0j, wcoul0=0.0j, source="head_correction=off",
+            omega=response.omegas[index], S_cart=None,
+            response_kind=HeadResponseKind.OFF)
     S_effective = response.S_direct[index]
-    if W_body_gamma is not None:
+    use_fold = (
+        policy is HeadCorrection.FULL and W_body_gamma is not None)
+    if use_fold:
         if response.Y_x is None or response.Z_y is None:
             raise ValueError(
                 "body-screened QSGW head requested without head/body wings")
@@ -1496,7 +1509,7 @@ def finalize_iteration_head_sample(
             mesh_xy=mesh,
         )
     static_kappa2 = response.static_kappa2_bohr2
-    if abs(response.omegas[index]) <= 1.0e-14:
+    if use_fold and abs(response.omegas[index]) <= 1.0e-14:
         static_kappa2 = _fold_static_kappa2(
             response, W_body_gamma, float(meta.cell_volume), mesh)
     return head_samples_from_s(
@@ -1506,6 +1519,9 @@ def finalize_iteration_head_sample(
         meta=meta,
         config=config,
         static_kappa2_bohr2=static_kappa2,
+        response_kind=("full_local_fields" if use_fold
+                       else "direct_irreducible"),
+        source_prefix=("head_schur" if use_fold else "head_direct"),
     )[0]
 
 
@@ -1530,8 +1546,26 @@ def finalize_iteration_head_samples(
     Passing no ``W_by_role`` intentionally produces the direct-head result.
     This keeps the one-shot diagnostic API and X-only path unchanged.
     """
+    from gw.gw_config import HeadCorrection, coerce_head_correction
+
+    policy = coerce_head_correction(
+        getattr(config.head, "correction", HeadCorrection.FULL))
+    if policy is HeadCorrection.OFF:
+        from gw.head_correction import HeadResponseKind, HeadSample
+        samples = tuple(
+            HeadSample(
+                vc0=0.0j, wcoul0=0.0j, source="head_correction=off",
+                omega=z, S_cart=None,
+                response_kind=HeadResponseKind.OFF)
+            for z in response.omegas)
+        return IterationHeadSamples(
+            omegas=response.omegas, samples=samples,
+            sigma_energies_ry=response.sigma_energies_ry,
+            sigma_occupations=response.sigma_occupations,
+            efermi_ry=response.efermi_ry)
     S_effective = response.S_direct
-    if W_by_role:
+    use_fold = policy is HeadCorrection.FULL and bool(W_by_role)
+    if use_fold:
         if response.Y_x is None or response.Z_y is None:
             raise ValueError(
                 "body-screened QSGW head requested without head/body wings")
@@ -1574,7 +1608,7 @@ def finalize_iteration_head_samples(
             mesh_xy=mesh,
         )
     static_kappa2 = response.static_kappa2_bohr2
-    if W_by_role and static_kappa2 is not None:
+    if use_fold and static_kappa2 is not None:
         static_indices = [
             i for i, z in enumerate(response.omegas) if abs(z) <= 1.0e-14]
         if len(static_indices) != 1:
@@ -1589,6 +1623,9 @@ def finalize_iteration_head_samples(
         meta=meta,
         config=config,
         static_kappa2_bohr2=static_kappa2,
+        response_kind=("full_local_fields" if use_fold
+                       else "direct_irreducible"),
+        source_prefix=("head_schur" if use_fold else "head_direct"),
     )
     return IterationHeadSamples(
         omegas=response.omegas,
@@ -1607,9 +1644,12 @@ def head_samples_from_s(
     meta,
     config,
     static_kappa2_bohr2: float | None = None,
+    response_kind="direct_irreducible",
+    source_prefix: str = "qsgw_parallel_transport",
 ) -> tuple[object, ...]:
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
-    from gw.head_correction import HeadSample, resolve_head_override
+    from gw.head_correction import (
+        HeadResponseKind, HeadSample, resolve_head_override)
     from gw.vcoul import compute_q0_averages
 
     S_host = np.asarray(S_cart_omega, dtype=np.complex128)
@@ -1624,6 +1664,7 @@ def head_samples_from_s(
         "whead_imfreq": config.head.whead_imfreq,
     }
     out = []
+    kind = HeadResponseKind(response_kind)
     for z, S in zip(omegas, S_host):
         override = resolve_head_override(params, z)
         if override is not None:
@@ -1648,13 +1689,14 @@ def head_samples_from_s(
                 vc0=complex(vc0),
                 wcoul0=complex(wc0),
                 source=(
-                    ("qsgw_parallel_transport_tf"
-                     if is_static_metal else "qsgw_parallel_transport")
+                    (f"{source_prefix}_tf"
+                     if is_static_metal else source_prefix)
                     if abs(z) <= 1.0e-14
-                    else f"qsgw_parallel_transport(omega={z} Ry)"
+                    else f"{source_prefix}(omega={z} Ry)"
                 ),
                 omega=z,
                 S_cart=None if is_static_metal else S,
+                response_kind=kind,
             )
         )
     return tuple(out)
@@ -1790,6 +1832,76 @@ def build_iteration_head_response(
         ],
         efermi_ry=float(efermi_ry),
     )
+
+
+def build_dft_head_response(
+    wfns,
+    omegas_ry,
+    *,
+    input_dir: str,
+    mesh: Mesh,
+    wfn,
+    meta,
+    config,
+) -> IterationHeadResponse:
+    """Build the one-shot DFT head on exactly the chi0 band manifold.
+
+    This is the non-self-consistent entry to the same sharded direct-head and
+    wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
+    use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
+    dipole file while the body uses ``number_bands_chi`` is refused by shape
+    and slicing here rather than silently mixing transition manifolds.
+    """
+    import os
+    from common.chi_from_dipole import read_dipole_h5
+
+    dipole_path = os.path.join(input_dir, "dipole.h5")
+    if not os.path.exists(dipole_path):
+        raise FileNotFoundError(
+            "head_correction=full requires dipole.h5 to build the direct "
+            f"head and wings; missing {dipole_path}.")
+    velocity_cart, _ = read_dipole_h5(dipole_path)
+    b0 = int(meta.b_id_0)
+    b4 = int(meta.b_id_4_chi_user)
+    nb_logical = b4 - b0
+    velocity_cart = np.asarray(velocity_cart)[:, :, b0:b4, b0:b4]
+    energies = jnp.asarray(wfns.enk[:, :nb_logical])
+    occupations = jnp.asarray(wfns.occ[:, :nb_logical])
+    if velocity_cart.shape[1:] != (
+            int(meta.nk_tot), nb_logical, nb_logical):
+        raise ValueError(
+            "dipole/chi head manifold mismatch: sliced velocity has "
+            f"{velocity_cart.shape}, expected "
+            f"(3,{int(meta.nk_tot)},{nb_logical},{nb_logical}) for global "
+            f"bands [{b0},{b4}).")
+    z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
+    S = head_s_tensor_sharded(
+        jnp.asarray(velocity_cart), energies, occupations, z,
+        mesh=mesh, nb_logical=nb_logical,
+        cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
+        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        eta_ry=float(config.head.wcoul0_eta))
+    Y_x, Z_y = head_wings_sharded(
+        jnp.asarray(velocity_cart), wfns, energies, occupations, z,
+        mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
+        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        eta_ry=float(config.head.wcoul0_eta))
+    e_host = np.asarray(energies)
+    n_occ_local = max(0, min(int(meta.nelec) - b0, nb_logical))
+    if 0 < n_occ_local < nb_logical:
+        efermi = 0.5 * (
+            float(np.max(e_host[:, n_occ_local - 1]))
+            + float(np.min(e_host[:, n_occ_local])))
+    else:
+        efermi = 0.0
+    return IterationHeadResponse(
+        omegas=tuple(complex(value) for value in z),
+        S_direct=S, Y_x=Y_x, Z_y=Z_y,
+        static_kappa2_bohr2=None,
+        static_Y_x=None, static_Z_y=None, static_chi_body_gamma=None,
+        sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
+        sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
+        efermi_ry=efermi)
 
 
 def build_iteration_head_samples(

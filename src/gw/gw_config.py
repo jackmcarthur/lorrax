@@ -424,6 +424,37 @@ def coerce_compute_mode(mode) -> ComputeMode:
         ) from exc
 
 
+class HeadCorrection(str, enum.Enum):
+    """Finite-grid treatment of the singular macroscopic ``q -> 0`` head.
+
+    ``FULL`` is the physical default: an irreducible direct response is
+    completed with its microscopic head/body wings exactly once, while an
+    already micro-reducible response (the BSE resolvent) is used as-is.
+    ``NO_LOCAL_FIELDS`` is the explicitly diagnostic epsilon-head value, and
+    ``OFF`` removes the special Gamma-cell contribution so brute-force k-grid
+    convergence can be studied.  The diagram choice remains the orthogonal
+    :class:`ScreeningDiagrams` axis.
+    """
+
+    FULL = "full"
+    NO_LOCAL_FIELDS = "no_local_fields"
+    OFF = "off"
+
+
+def coerce_head_correction(value) -> HeadCorrection:
+    """Normalize the public head policy without a silent fallback."""
+    if isinstance(value, HeadCorrection):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return HeadCorrection(str(raw).strip().lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"head_correction={raw!r} is not a known policy; expected one "
+            f"of: {', '.join(v.value for v in HeadCorrection)}."
+        ) from exc
+
+
 class ScreeningDiagrams(str, enum.Enum):
     """WHICH DIAGRAMS build the W that Σ consumes — the screening axis.
 
@@ -576,12 +607,11 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "mc_average_placement = off (the default)",
         "leave mc_average_placement at off under w_bse, or keep "
         "screening_diagrams = w_rpa to use the BGW head placement",
-        "v1 policy is that the q=0 head/wing channel stays RPA and the "
-        "ladder replaces the BODY only (DESIGN_2026-08-15.md section 5).  "
-        "mc_average_placement moves W's head scalar AFTER the Dyson solve, "
-        "which is a second opinion about the same channel; the two "
-        "policies would compose silently and the result would be neither. "
-        "The ladder q->0 head is the named deferral this refusal protects",
+        "head_correction=full obtains q=0 from the micro-reducible ladder "
+        "resolvent itself. mc_average_placement moves a finite-q W head "
+        "scalar AFTER the Dyson solve, which is a second post-solve policy "
+        "for the same singular channel; composing the two has not been "
+        "derived or certified, so it remains a named refusal",
     ),
 )
 
@@ -1566,6 +1596,10 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # Singular Gamma-cell policy.  ``full`` is the shipping macroscopic W
+    # head (microscopic local fields folded exactly once); the other two are
+    # convergence/diagnostic arms, not alternative diagram sets.
+    "head_correction": "full",
     # Opt-in finite-q W-av preprocessing.  The flags select the first and
     # second reciprocal-grid stencil shells written beside the PT data; they
     # do not activate the not-yet-complete metallic finite-q screening path.
@@ -1906,7 +1940,8 @@ _NORMALIZE_STR = {
     "sc_accelerator",
     "sc_eigh",
     "sc_head_update",
-    "wcoul0_source", "screening_method", "screening_diagrams",
+    "wcoul0_source", "head_correction", "screening_method",
+    "screening_diagrams",
     "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
     "band_extrapolation_estimator",
@@ -2792,6 +2827,7 @@ class HeadConfig:
     purely diagnostic (matches BGW's per-G mini-BZ averaging exactly for
     bit-reproducible comparisons).
     """
+    correction: HeadCorrection    # full | no_local_fields | off
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
     vhead: float | None           # explicit override v_h[ω=0]
@@ -3892,7 +3928,31 @@ class LorraxConfig:
             eqp1_file=str(_g("eqp1_file")),
             sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
         )
+        _head_correction = coerce_head_correction(_g("head_correction"))
+        _legacy_do_g0 = bool(_g("do_G0"))
+        if "do_G0" in _named_keys:
+            legacy_policy = (
+                HeadCorrection.FULL if _legacy_do_g0
+                else HeadCorrection.OFF)
+            if ("head_correction" in _named_keys
+                    and ((_head_correction is HeadCorrection.OFF)
+                         != (legacy_policy is HeadCorrection.OFF))):
+                raise ValueError(
+                    "contradictory deck settings: legacy do_G0 and "
+                    "head_correction request opposite Gamma-head policies. "
+                    "Remove do_G0 and use head_correction = full | "
+                    "no_local_fields | off.")
+            if "head_correction" not in _named_keys:
+                _head_correction = legacy_policy
+                print_fn(
+                    "  [config provenance] legacy do_G0 explicitly set: "
+                    f"mapping it to head_correction = "
+                    f"{_head_correction.value}. Prefer the named policy in "
+                    "new decks.")
+        _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
+
         head = HeadConfig(
+            correction=_head_correction,
             wcoul0_source=str(_g("wcoul0_source")).strip().lower(),
             wcoul0_eta=float(_g("wcoul0_eta") or 0.0),
             vhead=_g("vhead"),
@@ -4333,7 +4393,10 @@ class LorraxConfig:
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
-            do_G0=bool(_g("do_G0")),
+            # Compatibility mirror only.  Every new head decision reads the
+            # enum above; keeping this resolved bool prevents old consumers
+            # from disagreeing with ``head_correction = off``.
+            do_G0=_resolved_do_g0,
             self_consistent=bool(_g("self_consistent")),
             use_ppm_sigma=bool(_g("use_ppm_sigma")),
             no_degen_averaging=bool(_g("no_degen_averaging")),

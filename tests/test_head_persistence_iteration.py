@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from gw import gw_output, restart_q_storage
-from gw.head_correction import HeadSample
+from gw.head_correction import HeadResponseKind, HeadSample
 
 
 class _HeadSource:
@@ -36,6 +36,7 @@ def _config(*, material_class="metal"):
         mpa=SimpleNamespace(material_class=material_class),
         compute_mode=SimpleNamespace(
             value="gn_ppm", ppm_model="gn", is_dynamic=True),
+        head=SimpleNamespace(correction=SimpleNamespace(value="full")),
         ppm=SimpleNamespace(omega_p=2.0),
         screening=SimpleNamespace(diagrams=None),
     )
@@ -72,11 +73,13 @@ def test_qsgw_iteration_samples_are_the_only_persisted_head_source(
     iteration_head = _HeadSource({
         0.0j: HeadSample(
             vc0=101.0 + 0.0j, wcoul0=41.0 + 0.0j,
-            source="qsgw_parallel_transport", omega=0.0j, S_cart=S_static),
+            source="qsgw_parallel_transport", omega=0.0j, S_cart=S_static,
+            response_kind=HeadResponseKind.FULL_LOCAL_FIELDS),
         2.0j: HeadSample(
             vc0=102.0 + 0.0j, wcoul0=42.0 + 0.0j,
             source="qsgw_parallel_transport(omega=2j Ry)",
-            omega=2.0j, S_cart=S_probe),
+            omega=2.0j, S_cart=S_probe,
+            response_kind=HeadResponseKind.FULL_LOCAL_FIELDS),
     })
     forbidden_resolver = _HeadSource({})
     written = {}
@@ -100,6 +103,9 @@ def test_qsgw_iteration_samples_are_the_only_persisted_head_source(
         written["head"]["whead"],
         np.array([41.0 + 0.0j, 42.0 + 0.0j], dtype=np.complex128))
     np.testing.assert_array_equal(written["head"]["S_cart"], S_static)
+    assert written["head"]["head_correction"] == "full"
+    assert written["head"]["response_kind"] == "full_local_fields"
+    assert written["head"]["head_source"] == "qsgw_parallel_transport"
 
 
 def test_static_metal_without_s_cart_refuses_before_any_restart_write(

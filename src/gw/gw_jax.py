@@ -68,12 +68,14 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
+	HeadCorrection, LorraxConfig, QPSolver, ScreeningDiagrams,
+	refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
                       check_band_sum_degeneracy)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
-from .screening import compute_screening_model, driver_persists_w0
+from .screening import (
+	compute_screening_model, driver_persists_w0, screening_requests_for)
 from .sigma_dispatch import compute_sigma_xc
 from .qsgw_utils import extract_sigma_diag_replicated, solve_qp
 from .degen_average import (
@@ -150,13 +152,15 @@ def _setup_runtime() -> None:
 		) from exc
 
 
-def _compute_static_head(head_resolver, meta, do_screened, print0):
+def _compute_static_head(
+		head_resolver, meta, do_screened, print0, *, require_screened=True):
 	"""Resolve the q→0 head sample and its exact band-diagonal Σ terms.
 
 	Used by every mode: the bare-X head piece applies to static and
 	dynamic Σ alike (the SX/COH pieces additionally apply when screened).
 	"""
-	head = head_resolver.at(0.0 + 0.0j)
+	head = (head_resolver.at(0.0 + 0.0j) if require_screened
+	        else head_resolver.direct_at(0.0 + 0.0j))
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	# TODO(metal-sigma): this one-shot static Sigma head still uses the
 	# ifmax band boundary.  Port it with the rest of metallic Sigma.
@@ -231,6 +235,15 @@ def main(argv=None):
 	# because ``config.compute_mode`` already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
 	do_screened = mode.needs_screening
+	print0(
+		f"  Head policy: head_correction={config.head.correction.value}; "
+		f"screening_diagrams={config.screening.diagrams.value}; "
+		f"direct diagnostic source={config.head.wcoul0_source}. "
+		+ ({
+			HeadCorrection.FULL: "macroscopic W, local fields exactly once",
+			HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
+			HeadCorrection.OFF: "no special Gamma-cell contribution",
+		}[config.head.correction]))
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -431,6 +444,43 @@ def main(argv=None):
 		                    label="minimax tau-axis"):
 			quad, e_ref = build_static_quadrature(
 				wfns, config.minimax_config, print_fn=print0)
+
+	# One-shot and QSGW now share one response/finalization implementation.
+	# Build the irreducible DFT tensor and its wings on the exact chi0 band
+	# manifold before W, then retain only the tiny finalized head after W.
+	oneshot_head_response = None
+	oneshot_head_requests = None
+	oneshot_mpa_plan = None
+	if (do_screened
+			and config.head.correction is HeadCorrection.FULL
+			and config.screening.diagrams is ScreeningDiagrams.W_RPA
+			# MPA's self-consistent driver does no pre-map screening; its
+			# exact z plan and fixed/update head are built inside each map.
+			and not (mode.value == "mpa"
+			         and qp_solver is QPSolver.SELF_CONSISTENT)):
+		from .qsgw_head import build_dft_head_response
+		if mode.value == "mpa":
+			from .mpa import sample_plan
+			from .mpa.model import make_mpa_plan
+			oneshot_mpa_plan = make_mpa_plan(config, quad)
+			oneshot_omegas = np.asarray(
+				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
+		else:
+			oneshot_head_requests = screening_requests_for(mode, config)
+			if qp_solver is QPSolver.SELF_CONSISTENT:
+				oneshot_head_requests = [
+					r for r in oneshot_head_requests if r.role == "static"]
+			oneshot_omegas = np.asarray(
+				[complex(r.omega_ry) for r in oneshot_head_requests],
+				dtype=np.complex128)
+		if oneshot_omegas.size:
+			oneshot_head_response = build_dft_head_response(
+				wfns, oneshot_omegas, input_dir=input_dir, mesh=mesh_xy,
+				wfn=wfn, meta=meta, config=config)
+			print0(
+				"  head_correction=full: built direct DFT response and "
+				"head/body wings on the chi0 transition manifold; finalizing "
+				"once against the resident W(Gamma).")
 	# SC solves its own W's inside the iteration map; the static W is
 	# still solved once here to seed the W0 restart flush.
 	with timing.section("gw_jax.screening", announce=True,
@@ -442,8 +492,25 @@ def main(argv=None):
 			label="oneshot", head_resolver=head_resolver,
 			head_channel=getattr(isdf, 'head_channel', None),
 			static_only=qp_solver is QPSolver.SELF_CONSISTENT,
+			mpa_plan=oneshot_mpa_plan,
+			iteration_head_response=oneshot_head_response,
 			tensors_filename=tensors_filename,
 			print_fn=print0)
+
+	if oneshot_head_response is not None:
+		if mode.value == "mpa":
+			final_head = W_by_role.get("iteration_head")
+			if final_head is None:
+				raise RuntimeError(
+					"head_correction=full: MPA screening returned no finalized "
+					"head samples")
+		else:
+			from .qsgw_head import finalize_iteration_head_samples
+			final_head = finalize_iteration_head_samples(
+				oneshot_head_response, wfn=wfn, meta=meta, config=config,
+				mesh=mesh_xy, requests=oneshot_head_requests,
+				W_by_role=W_by_role)
+		head_resolver.install_samples(final_head.samples)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
@@ -472,7 +539,12 @@ def main(argv=None):
 				W_by_role.get("static", V_q),
 				tensors_filename=tensors_filename, head_resolver=head_resolver,
 				config=config, meta=meta, mesh_xy=mesh_xy,
-				sym=sym, centroid_indices=centroid_indices, print_fn=print0)
+				sym=sym, centroid_indices=centroid_indices,
+				# The pre-map SC seed solved static W only.  Do not stamp a
+				# probe head beside a body frequency that was never evaluated;
+				# the converged map persists its own full head grid below.
+				static_head_only=(qp_solver is QPSolver.SELF_CONSISTENT),
+				print_fn=print0)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
@@ -485,7 +557,12 @@ def main(argv=None):
 	if config.do_G0:
 		with timing.section("gw_jax.static_head"):
 			static_head_terms = _compute_static_head(
-				head_resolver, meta, do_screened, print0)
+				head_resolver, meta, do_screened, print0,
+				# Every two-point mode has a finalized static sample.  MPA's
+				# z-grid need not contain zero and this call contributes only
+				# bare X there, so it deliberately reads vc from the direct
+				# sample instead of inventing an unsampled W(0).
+				require_screened=(mode.value != "mpa"))
 
 	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
 	# The same ``compute_sigma_xc`` call the SC iteration map makes each
