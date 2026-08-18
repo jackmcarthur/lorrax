@@ -43,9 +43,7 @@ the Stage-A/D FFT box (``_fft_box_bytes`` compiles the production FFT helper
 at the real shape/mesh and reads XLA's buffer peak *plus* the cuFFT plan
 workspace, via ``common.fft_helpers.query_fft_peak_bytes`` ->
 ``runtime.aot_memory.aot_kernel_peak_bytes``) and the pair-density ``slots``
-count.  XLA uses 3 slots on GPU / 4 on CPU (a BufferAssignment fact); an
-active conv_kpair route holds the two input carries and separately prices the
-coverage arm's three spin-reduced work buffers.  Where a measurement is
+count (3 GPU / 4 CPU, an XLA BufferAssignment fact).  Where a measurement is
 unavailable the model demotes to an analytic bound and ANNOUNCES it from the
 rank it happened on — an un-measured term here is a silent OOM later.
 """
@@ -65,13 +63,6 @@ from runtime.aot_memory import announce_once as _announce
 
 
 _C128 = 16  # bytes per complex128
-
-# conv_kpair consumes the two rank-5 pair carries directly.  Its coverage arm
-# also requests exactly three rank-5-with-spin-reduced scratch arrays from
-# XLA's scratch allocator (wa, wb, tmp in conv_kpair_cuda_ffi.cc).  Counts live
-# here; byte sizes continue to come only from the model's dtype/shape algebra.
-_CONV_KPAIR_INPUT_SLOTS = 2
-_CONV_KPAIR_REDUCED_SCRATCH_SLOTS = 3
 
 
 def _c128(*dims, shard: int = 1) -> float:
@@ -191,12 +182,10 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
 _GATHERED_PSI_SLOTS = 2
 
 
-def _stage_C_slope(*, nk, ns, nq, mu, slots, conv_reduced_slots,
-                   p_xy, band_chunk, p_y) -> float:
+def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
     """Per-``cr`` bytes of the Stage-C transient (the binder): the ``slots``
-    concurrent pair-density accumulators, any conv_kpair spin-reduced
-    coverage scratch, the Z_q output, and the two psi(r) slabs the band-gather
-    machinery keeps live.
+    concurrent pair-density accumulators, the Z_q output, and the two psi(r)
+    slabs the band-gather machinery keeps live.
 
     THE GATHERED psi(r) SLAB IS SHARDED ON 'y' ONLY -- 1/p_y, not 1/P.
     ``z_q_from_psi_sm`` computes each rank's 1/P band block over the FULL
@@ -213,7 +202,6 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, conv_reduced_slots,
     terms" #2 (job 7874236, a single 271 GB allocation).
     """
     return (slots * _c128(nk, ns, ns, mu, shard=p_xy)   # pair carry
-            + conv_reduced_slots * _c128(nk, mu, shard=p_xy)
             + _c128(nq, mu, shard=p_xy)                 # Z_q / zeta_out
             # gathered psi(r): all bands, r-block only  -> /p_y
             + _GATHERED_PSI_SLOTS * _c128(nk, band_chunk, ns, shard=p_y)
@@ -240,9 +228,6 @@ class GFlatChunkPlan:
     p_min: int                    # rank floor
     budget_bytes: float
     target_utilization: float
-    pair_density_slots: int       # rank-5 ns² slots at Stage C
-    conv_reduced_slots: int       # rank-5 spin-reduced native scratch slots
-    conv_kpair_arm: str           # xla|resident|device|explicit
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -253,9 +238,6 @@ class GFlatChunkPlan:
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
             f"    gflat_cs      = {self.gflat_chunk_size}",
-            f"    Stage-C conv  = {self.conv_kpair_arm} "
-            f"({self.pair_density_slots} pair + "
-            f"{self.conv_reduced_slots} reduced slots)",
             f"    P_min (floor) = {self.p_min}",
             f"    budget        = {bg:.2f} GB/dev  (util {self.target_utilization:.2f})",
             f"    persistent    = {self.persistent_bytes/1e9:.2f} GB/dev",
@@ -348,11 +330,8 @@ def plan_gflat_chunks(
 
     if target_utilization is None:
         target_utilization = _default_util(ns)
-    # Resolved after the Stage-C guard shape is known.  Explicit slot counts
-    # are calibration/test overrides and deliberately bypass route inference.
-    slots = int(pair_density_slots) if pair_density_slots is not None else None
-    conv_reduced_slots = 0
-    conv_kpair_arm = "explicit" if slots is not None else "xla"
+    slots = pair_density_slots if pair_density_slots is not None \
+        else _pair_density_slots()
 
     budget = budget_gb * 1e9
     target = budget * target_utilization
@@ -425,35 +404,6 @@ def plan_gflat_chunks(
         r_for_band_guard = max(
             p_xy, r_for_band_guard - r_for_band_guard % p_xy)
 
-    if slots is None:
-        slots = _pair_density_slots()
-        # The production core asks this same factory with the local
-        # ``(r, mu)`` trailing shape.  If no concrete k-grid exists (only
-        # lightweight planner test doubles omit it), retain the XLA live-set.
-        kgrid = getattr(meta, "kgrid", None)
-        if kgrid is not None:
-            try:
-                from ffi.fft import conv_kpair_plan
-                conv_kpair_arm, _ = conv_kpair_plan(
-                    mesh_xy, tuple(int(v) for v in kgrid), ns,
-                    (max(1, r_for_band_guard // p_y),
-                     max(1, mu // p_x)))
-            except Exception as exc:
-                _announce(
-                    "conv-kpair-stage-c-route",
-                    "Stage-C conv_kpair route could not be resolved "
-                    f"({type(exc).__name__}: {exc}); retaining the "
-                    f"{slots}-slot XLA live-set")
-                conv_kpair_arm = "xla"
-        if conv_kpair_arm != "xla":
-            slots = _CONV_KPAIR_INPUT_SLOTS
-            # ``resident`` needs no global scratch.  ``device`` means the
-            # forced/on or over-portable-floor decision is delegated to C++;
-            # conservatively price its possible two-stage coverage arm.
-            conv_reduced_slots = (
-                0 if conv_kpair_arm == "resident"
-                else _CONV_KPAIR_REDUCED_SCRATCH_SLOTS)
-
     def _band_candidate_fits(bc: int) -> bool:
         n_bc = math.ceil(fit_nb / bc)
         # The cache is stacked by uniform transport chunks.  Its band slots
@@ -463,7 +413,6 @@ def plan_gflat_chunks(
             nk, n_bc * bc, ns, n_rtot, shard=p_xy)
         c_slope = _stage_C_slope(
             nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
-            conv_reduced_slots=conv_reduced_slots,
             p_xy=p_xy, band_chunk=bc, p_y=p_y)
         return (persistent_total + psi_r_cache
                 + max(_fft_for_bc(bc), c_slope * r_for_band_guard)
@@ -509,7 +458,6 @@ def plan_gflat_chunks(
     # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
     # (the gathered band axis), so the two knobs are coupled.
     C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
-                             conv_reduced_slots=conv_reduced_slots,
                              p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
     headroom_C = max(target - persistent_total, 0.0)
     if r_chunk_override and r_chunk_override > 0:
@@ -601,7 +549,4 @@ def plan_gflat_chunks(
         p_min=int(p_min),
         budget_bytes=float(budget),
         target_utilization=float(target_utilization),
-        pair_density_slots=int(slots),
-        conv_reduced_slots=int(conv_reduced_slots),
-        conv_kpair_arm=str(conv_kpair_arm),
     )

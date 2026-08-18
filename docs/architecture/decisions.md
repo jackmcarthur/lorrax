@@ -458,10 +458,14 @@ the cache/slice ABI into another compiled module family, so removing the 28%
 pad is not licensed as a trivial accounting correction.  The memory model must
 price the pad exactly and identify it in its documentation.
 
-When conv_kpair is selected, Stage C prices its two rank-5 input carries, not
-the stale XLA transpose/product live set.  Nonresident native scratch is
-spin-reduced and is accounted at its own shape.  This is an accounting change,
-not a new kernel or precision mode.
+The tempting route-only Stage-C correction is not trivial.  Although
+conv_kpair removes the old FFT/transpose/product chain inside the post-pair
+operator, XLA's enclosing scan/custom-call live set still requires the
+three-slot GPU BufferAssignment bound.  A two-slot trial admitted a bispinor
+P=4 r-chunk with a 23.40 GB estimate, after which the executable requested a
+31.985 GB arena and OOMed.  The conservative three-slot accounting therefore
+stays until a compiled-memory query can replace it; no route-shaped estimate
+is inferred from the CUDA kernel's internal scratch alone.
 
 ## Standing (recorded earlier, restated for one-page reference)
 

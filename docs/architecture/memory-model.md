@@ -414,26 +414,24 @@ The binding peak on most production runs.  The fused jit holds:
 
 - **Persistent**: centroids (L+R), `L_q`, `gflat_acc`.
 - **Transient (`pair_density_slots` concurrent rank-5 buffers)**:
-  `c128[n_k, n_s², n_rmu_local, r_chunk_local]`.  The count is both
-  **backend- and route-aware**.  It is 3 on GPU XLA (`P_l_R_conj`, `P_r_R`,
-  plus one XLA scratch — verified in the `module_0510` GPU HLO dump and
+  `c128[n_k, n_s², n_rmu_local, r_chunk_local]`.  Default is
+  **backend-aware** — 3 on GPU XLA (`P_l_R_conj`, `P_r_R`, plus one
+  XLA scratch — verified in the `module_0510` GPU HLO dump and
   `agent_d_hlo_calibration.md`) and 4 on CPU XLA (one extra
   concurrent slot scheduled by CPU XLA's BufferAssignment heuristic;
   verified at Si μ=384 scalar + bispinor charge + bispinor transverse,
   reports `CPU_OVERHEAD_DECOMP_2026-05-20.md` and
-  `CPU_PLANNER_LANDED_2026-05-20.md`).  When conv_kpair is active, the two
-  input carries are the only `n_s²` slots; its possible coverage arm's three
-  spin-reduced work buffers are priced separately as
-  `3·c128[n_k,n_rmu_local,r_chunk_local]`.  The resident arm has no global
-  scratch.  Route resolution uses the same `conv_kpair_plan` and local shape
-  as `isdf.core`; an explicit calibration slot count bypasses inference.
+  `CPU_PLANNER_LANDED_2026-05-20.md`).  Resolved at function-call
+  time via `_default_pair_density_slots()` in `gflat_memory_model.py`.
+  XLA's BufferAssignment reuses these slots for the FFT box and `Z_q`
+  intermediate when lifetimes don't overlap on both backends.
 
 ```
 peak_C ≈ 2·M_cent + M_L_q + slots · 16·n_k·n_s²·μ·B_r/p_xy + M_zeta_out
 ```
 
-On the XLA route, `pair_density_slots` is the
-**XLA-BufferAssignment-determined** count of concurrent rank-5 buffers.  Read it from
+The `pair_density_slots` constant is the **XLA-BufferAssignment-determined**
+count of concurrent rank-5 buffers.  Read it from
 `module_NNNN.jit__kernel.sm_*.memory-usage-report.txt` as the number of
 distinct preallocated-temp slots holding a P-pair-shaped value.  Update
 the defaults in `gflat_memory_model._peak_C_fit_one_rchunk` if a future
@@ -522,21 +520,22 @@ the corresponding sizing step.  No retry loop — the analytic inversion
 is one-shot.  If `B_r` would be < 1 the planner emits a descriptive
 error naming the binding peak.
 
-### Pair-density and conv_kpair slots
+### Pair-density slots (`slots`)
 
-Peak C's dominant transient is concurrent rank-5
-`c128[n_k, n_s², n_rmu/p_x, B_r/p_y]` tensors.  On the XLA route,
-BufferAssignment fuses lifetimes that don't overlap — verified on MoS2 3×3
-bispinor / 2×2 mesh, where `slot[1]` holds both a P-pair tensor and the
-band-chunk FFT box across non-overlapping windows.  GPU XLA uses 3 slots:
-`P_l_R_conj`, `P_r_R`, plus one XLA scratch slot (CPU XLA uses 4).
+Peak C's dominant transient is `slots` concurrent rank-5
+`c128[n_k, n_s², n_rmu/p_x, B_r/p_y]` tensors.  XLA's BufferAssignment
+fuses lifetimes that don't overlap — verified on MoS2 3×3 bispinor /
+2×2 mesh, `slot[1]` holds both a P-pair tensor and the band-chunk FFT
+box across non-overlapping windows.  Default `slots = 3`:
+`P_l_R_conj`, `P_r_R`, plus one XLA scratch slot.
 
-The native conv_kpair resident route consumes `P_l` and `P_r` directly and
-therefore charges 2 pair slots.  If Python delegates the final residency
-choice to the device, the model conservatively adds the coverage arm's exact
-three spin-reduced work buffers.  These are not multiplied by `n_s²`; pricing
-them as pair slots would merely replace the stale XLA overcharge with another
-one.
+Do not reduce this to the two conv_kpair input carries by inspection of the
+CUDA kernel.  The enclosing scan/custom-call module still owns a third
+pair-sized BufferAssignment slot.  Measured 2026-08-18: a route-inferred
+two-slot trial on the MoS2 bispinor fixture planned r=72,304 at 23.40 GB, but
+the executable requested 31,984,978,688 bytes and OOMed.  Route-aware
+accounting therefore needs compiled-module evidence and is not a trivial
+subtraction of the old post-pair intermediates.
 
 Re-verify after any kernel change:
 
@@ -700,9 +699,9 @@ The post-Round-6 fused kernel `jit__z_q_from_psi_sm` replaced
 `jit__compute_ZCT_LR` (formerly the peak binder); its own peak is
 ~2–3× smaller because the bc-loop is now scan-aliased.  Binding peak
 post-Round-8 is the two rank-5 P-pair carries (`P_l_acc`, `P_r_acc`)
-which live across the γ̃ contract.  `pair_density_slots` captures the
-3-on-GPU/4-on-CPU XLA live set; the active conv_kpair route instead records
-two pair inputs plus its route-specific spin-reduced scratch.
+which live across the γ̃ contract — `pair_density_slots` (3 on GPU XLA,
+4 on CPU XLA) captures this in the G-flat planner.  The same conservative
+bound remains active around a conv_kpair custom call for the reason above.
 
 Pre-Round-6 reference (legacy
 `tests/profiles/xprof/cohsex_prod-20260303-112900/...` — the blobs are tracked
