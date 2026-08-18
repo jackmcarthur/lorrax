@@ -597,10 +597,18 @@ def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
         assert_restart_window_matches(path, band_slices=moved_sigma)
 
         # chi moved: refuse, and say which key
-        moved_chi = _slices(b0=0, b1=0, b2=8, b3=20, b4=24,
-                            b4_chi=24, b4_sigma=20)
+        # Keep the loaded extent fixed: the fit-free exception does not make
+        # a narrower wavefunction/ISDF allocation reusable.  It only permits
+        # changing the chi sum inside the already-loaded union window.
+        moved_chi = _slices(b0=0, b1=0, b2=8, b3=20, b4=28,
+                            b4_chi=24, b4_sigma=28)
         with pytest.raises(ValueError, match="number_bands_chi"):
             assert_restart_window_matches(path, band_slices=moved_chi)
+        # A fit-free route may reuse the ISDF basis and bare V only when it
+        # explicitly promises to recompute chi/W.  The default above remains
+        # the refusal that protects every stored-screening consumer.
+        assert_restart_window_matches(
+            path, band_slices=moved_chi, recompute_screening=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         # a PRE-SPLIT file: no band_window_split attr at all
