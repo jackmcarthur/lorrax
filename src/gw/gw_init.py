@@ -819,7 +819,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 
 
 def check_zeta_fit_windows(energies, band_range_left, band_range_right,
-                           zeta_nband, *, log=print):
+                           zeta_nband, logical_band_stop, *, log=print):
 	"""ARE THESE TWO WINDOWS POINT-GROUP-INVARIANT SUBSPACES?
 
 	The guard already exists — ``common.band_degeneracy`` — and the BSE has
@@ -873,6 +873,11 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	3.280e-2.  A WFN
 	with at least one spare band makes the top gap measurable.  Without that
 	spare, closure is absent evidence, not a pass.
+
+	The fit ranges themselves retain mesh padding, but pad bands are exact-zero
+	storage slots, not a physical subspace.  ``logical_band_stop`` is therefore
+	the upper edge certified here; it is ``zeta_nband`` when explicitly narrowed
+	and otherwise the unpadded maximum band count held by ``Meta``.
 	"""
 	if energies is None:
 		log("  [band window] closure NOT CHECKED: this loader exposes no "
@@ -885,9 +890,16 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 	# edge slices.  Handing it the window instead would report +inf and
 	# certify the cut (band_degeneracy.boundary_min_gaps, 2026-08-15).
 	gaps = _bd.boundary_min_gaps(enk, is_full_spectrum=True)
-	for lo, hi, what in (
+	def _physical_hi(hi_storage):
+		hi_storage = int(hi_storage)
+		if (hi_storage == int(band_range_right[1])
+				and hi_storage > int(logical_band_stop)):
+			return int(logical_band_stop)
+		return hi_storage
+	for lo, hi_storage, what in (
 			(band_range_left[0], band_range_left[1], "ISDF left window"),
 			(band_range_right[0], band_range_right[1], "ISDF right window")):
+		hi = _physical_hi(hi_storage)
 		if int(hi) >= int(enk.shape[1]):
 			raise _bd.BandWindowDegeneracyError(
 				f"[band-window] {what} (the ζ fit's pair space): upper "
@@ -906,8 +918,9 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 			          else "")))
 	# Print the number even when it is fine: "no news" and "a good number"
 	# must not look alike (preamble measurement rule 10).
-	edges = sorted({int(band_range_left[1]), int(band_range_right[0]),
-	                int(band_range_right[1])})
+	edges = sorted({_physical_hi(band_range_left[1]),
+	                int(band_range_right[0]),
+	                _physical_hi(band_range_right[1])})
 	log("    ζ band-window closure: " + ", ".join(
 		f"edge {b} min gap {gaps[b] * 13605.693122994:.3g} meV"
 		if b < len(gaps) and np.isfinite(gaps[b])
@@ -1130,7 +1143,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
-		getattr(cfg, "zeta_nband", None), log=print_fn)
+		getattr(cfg, "zeta_nband", None),
+		(int(cfg.zeta_nband) if getattr(cfg, "zeta_nband", None) is not None
+		 else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4)),
+		log=print_fn)
 
 	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
 	# picked once by ``plan_gflat_chunks`` in the caller and live in
