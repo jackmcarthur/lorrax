@@ -48,7 +48,7 @@ from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
 from .gw_config import (
-    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
+    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel, SigmaFrequencyRoute,
     band_extrapolation_is_consumable,
     mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
     refuse_unimplemented_compute_mode,
@@ -794,6 +794,7 @@ def compute_sigma_xc(
     sym,
     wfn,
     band_slices,
+    centroid_indices=None,
     input_dir: str,
     Gij: jax.Array | None = None,
     wfns_transverse=None,
@@ -1357,6 +1358,40 @@ def compute_sigma_xc(
             "(QP energies for the QSGW Σ_c evaluation).")
 
     if mode is ComputeMode.MPA:
+        if config.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD:
+            if centroid_indices is None:
+                raise ValueError(
+                    "internal_ff_cd requires centroid_indices from the "
+                    "driver for the canonical q-wedge closure check")
+            from .internal_ff_cd import compute_internal_ff_cd
+            tier0 = compute_internal_ff_cd(
+                wfns, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+                sym=sym, wfn=wfn, band_slices=band_slices,
+                centroid_indices=centroid_indices, input_dir=input_dir,
+                occupation_state=occupation_state, print_fn=print_fn)
+            sigma_c_ev = np.asarray(tier0.sigma_c_diag_ev)
+            expected = (int(meta.nk_tot), int(meta.nb_sigma))
+            if sigma_c_ev.shape != expected:
+                raise ValueError(
+                    f"internal_ff_cd returned Sigma_c diagonal "
+                    f"{sigma_c_ev.shape}; expected {expected}")
+            sigma_c_diag_ry = jnp.asarray(sigma_c_ev / RYD_TO_EV)
+            sigma_c_matrix_ry = jax.vmap(jnp.diag)(sigma_c_diag_ry)
+            # Tier 0 is an on-shell diagonal one-shot reference.  This is
+            # the value that enters H; there is no hidden MPA/off-shell cube.
+            # fixed_point/self_consistent are refused at config resolution.
+            return SigmaResult(
+                v_h_kij_ry=sig_h,
+                sigma_x_kij_ry=sig_x,
+                sigma_xc_kij_ry=sig_x + sigma_c_matrix_ry,
+                sigma_c_at_dft_diag_ev=sigma_c_ev,
+                omega_dft_rel_ev=(
+                    np.asarray(wfns.enk[:, band_slices.sigma]) * RYD_TO_EV
+                    - float(tier0.efermi_ev)),
+                e_eval_ev=np.asarray(e_qp_ev, dtype=np.float64),
+                efermi_dft_ev=float(tier0.efermi_ev),
+                omega_reference_provenance="fixed-N MP1 mu",
+            )
         from file_io import mpa_store
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid

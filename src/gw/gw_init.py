@@ -43,6 +43,7 @@ from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 # copies identical.
 from .gw_config import (
 	env_bool,
+	SigmaFrequencyRoute,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
 	refuse_unsupported_bispinor_tt_head_correction,
@@ -3793,16 +3794,25 @@ def prepare_isdf_and_wavefunctions(
 		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
 		_restart_wfn_provenance_complete = (
 			_restart_source_record is not None)
+		recompute_screening = (
+			cfg.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD)
 		with timing.section(
 				"gw_jax.restart_load", announce=True,
 				label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
 				n_rmu_logical=int(meta.n_rmu),
-				low_mem_bands=bool(cfg.memory.low_mem_bands))
+				low_mem_bands=bool(cfg.memory.low_mem_bands),
+				recompute_screening=recompute_screening)
 			charge_zeta_identity_receipt = rs.charge_zeta_identity
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
+			if recompute_screening:
+				print0(
+					"  Restart screening stamp is not consumed: "
+					"internal_ff_cd recomputes direct chi0 and distributed W "
+					f"with number_bands_chi={band_slices.nb_chi}; only the "
+					"loaded wavefunctions/ISDF basis and bare V are reused.")
 			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
 			# line on a match, and a NAMED "not stamped" on a legacy file —
 			# the three are different facts and the log says which.  A
