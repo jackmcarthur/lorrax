@@ -414,24 +414,26 @@ The binding peak on most production runs.  The fused jit holds:
 
 - **Persistent**: centroids (L+R), `L_q`, `gflat_acc`.
 - **Transient (`pair_density_slots` concurrent rank-5 buffers)**:
-  `c128[n_k, n_s², n_rmu_local, r_chunk_local]`.  Default is
-  **backend-aware** — 3 on GPU XLA (`P_l_R_conj`, `P_r_R`, plus one
-  XLA scratch — verified in the `module_0510` GPU HLO dump and
+  `c128[n_k, n_s², n_rmu_local, r_chunk_local]`.  The count is both
+  **backend- and route-aware**.  It is 3 on GPU XLA (`P_l_R_conj`, `P_r_R`,
+  plus one XLA scratch — verified in the `module_0510` GPU HLO dump and
   `agent_d_hlo_calibration.md`) and 4 on CPU XLA (one extra
   concurrent slot scheduled by CPU XLA's BufferAssignment heuristic;
   verified at Si μ=384 scalar + bispinor charge + bispinor transverse,
   reports `CPU_OVERHEAD_DECOMP_2026-05-20.md` and
-  `CPU_PLANNER_LANDED_2026-05-20.md`).  Resolved at function-call
-  time via `_default_pair_density_slots()` in `gflat_memory_model.py`.
-  XLA's BufferAssignment reuses these slots for the FFT box and `Z_q`
-  intermediate when lifetimes don't overlap on both backends.
+  `CPU_PLANNER_LANDED_2026-05-20.md`).  When conv_kpair is active, the two
+  input carries are the only `n_s²` slots; its possible coverage arm's three
+  spin-reduced work buffers are priced separately as
+  `3·c128[n_k,n_rmu_local,r_chunk_local]`.  The resident arm has no global
+  scratch.  Route resolution uses the same `conv_kpair_plan` and local shape
+  as `isdf.core`; an explicit calibration slot count bypasses inference.
 
 ```
 peak_C ≈ 2·M_cent + M_L_q + slots · 16·n_k·n_s²·μ·B_r/p_xy + M_zeta_out
 ```
 
-The `pair_density_slots` constant is the **XLA-BufferAssignment-determined**
-count of concurrent rank-5 buffers.  Read it from
+On the XLA route, `pair_density_slots` is the
+**XLA-BufferAssignment-determined** count of concurrent rank-5 buffers.  Read it from
 `module_NNNN.jit__kernel.sm_*.memory-usage-report.txt` as the number of
 distinct preallocated-temp slots holding a P-pair-shaped value.  Update
 the defaults in `gflat_memory_model._peak_C_fit_one_rchunk` if a future
@@ -485,16 +487,22 @@ A/B/C/D totals; the full per-term breakdown (centroids, FFT box, `P_l`,
    Add the full-grid ψ(r) cache, band-flat sharded over all ranks (including
    its uniform final-chunk pad), and validate the resulting floor against the
    budget at every peak.  The cache has no μ axis and is never replicated.
+   The pad is the static `lax.scan` output shape, not an accidental estimate:
+   a 50-band window at bc16 carries 64 slots (28% overhead), measured/priced
+   as 7.25 rather than 5.66 GB at P=1 on Si 80 Ry.  A ragged last item would
+   require a second cache/slice executable family and is not a trivial memory
+   correction.
 2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
-   Try the full logical ζ-fit window first so the pair GEMM has one K
-   dimension and does not read/modify/write its rank-5 carry between band
-   chunks.  Admit it only when the measured FFT box and Stage-C pair/slab
-   accounting fit together at the requested r-chunk (or the planner's
-   performance floor).  If it does not fit, fall back through the historical
-   power-of-two family under that same guard.  The transport edge is rounded
-   up to a mesh multiple and its tail is zero-masked; the physics window is
-   unchanged.  `cfg.memory.band_chunk_size > 0` (cohsex.in) overrides the
-   picker; the deck default `0` delegates to it.
+   The shipping no-key value is 16 because the P=4 Si 80 Ry measurement was
+   33 ms steady z_q at bc16 versus 46 ms with full-window transport.  It is
+   passed through `_bump_bc(16)`, so the mesh floor and logical-window cap
+   still apply.  An explicit deck value `0` opts into the planner ladder: try
+   the full logical ζ-fit window first so the pair GEMM has one K dimension
+   and does not read/modify/write its rank-5 carry between band chunks; if it
+   does not fit the measured FFT-box + Stage-C guard, fall back through the
+   historical power-of-two family.  Any positive deck value remains an
+   override.  Every transport tail is zero-masked; the physics window is
+   unchanged.
 3. **Pick `r_chunk`** — maximize subject to Peak C fitting after
    `band_chunk` is fixed.  Lower-bounded by `n_rmu` (per user spec: the
    eventual Σ_μν output occupies `n_rmu² · n_q · 16` bytes, so paying
@@ -514,14 +522,21 @@ the corresponding sizing step.  No retry loop — the analytic inversion
 is one-shot.  If `B_r` would be < 1 the planner emits a descriptive
 error naming the binding peak.
 
-### Pair-density slots (`slots`)
+### Pair-density and conv_kpair slots
 
-Peak C's dominant transient is `slots` concurrent rank-5
-`c128[n_k, n_s², n_rmu/p_x, B_r/p_y]` tensors.  XLA's BufferAssignment
-fuses lifetimes that don't overlap — verified on MoS2 3×3 bispinor /
-2×2 mesh, `slot[1]` holds both a P-pair tensor and the band-chunk FFT
-box across non-overlapping windows.  Default `slots = 3`:
-`P_l_R_conj`, `P_r_R`, plus one XLA scratch slot.
+Peak C's dominant transient is concurrent rank-5
+`c128[n_k, n_s², n_rmu/p_x, B_r/p_y]` tensors.  On the XLA route,
+BufferAssignment fuses lifetimes that don't overlap — verified on MoS2 3×3
+bispinor / 2×2 mesh, where `slot[1]` holds both a P-pair tensor and the
+band-chunk FFT box across non-overlapping windows.  GPU XLA uses 3 slots:
+`P_l_R_conj`, `P_r_R`, plus one XLA scratch slot (CPU XLA uses 4).
+
+The native conv_kpair resident route consumes `P_l` and `P_r` directly and
+therefore charges 2 pair slots.  If Python delegates the final residency
+choice to the device, the model conservatively adds the coverage arm's exact
+three spin-reduced work buffers.  These are not multiplied by `n_s²`; pricing
+them as pair slots would merely replace the stale XLA overcharge with another
+one.
 
 Re-verify after any kernel change:
 
@@ -685,8 +700,9 @@ The post-Round-6 fused kernel `jit__z_q_from_psi_sm` replaced
 `jit__compute_ZCT_LR` (formerly the peak binder); its own peak is
 ~2–3× smaller because the bc-loop is now scan-aliased.  Binding peak
 post-Round-8 is the two rank-5 P-pair carries (`P_l_acc`, `P_r_acc`)
-which live across the γ̃ contract — `pair_density_slots` (3 on GPU XLA,
-4 on CPU XLA) captures this in the G-flat planner.
+which live across the γ̃ contract.  `pair_density_slots` captures the
+3-on-GPU/4-on-CPU XLA live set; the active conv_kpair route instead records
+two pair inputs plus its route-specific spin-reduced scratch.
 
 Pre-Round-6 reference (legacy
 `tests/profiles/xprof/cohsex_prod-20260303-112900/...` — the blobs are tracked

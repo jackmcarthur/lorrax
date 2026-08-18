@@ -55,9 +55,40 @@ def _cpu_mesh(p_x: int, p_y: int) -> Mesh:
     return Mesh(devs, axis_names=('x', 'y'))
 
 
-def test_deck_default_delegates_band_chunk_to_planner():
+def test_deck_default_is_bc16_for_parallel_throughput():
     from gw.gw_config import _DEFAULTS
-    assert _DEFAULTS["band_chunk_size"] == 0
+    assert _DEFAULTS["band_chunk_size"] == 16
+
+
+def test_deck_default_is_mesh_rounded_and_window_capped():
+    """The config default takes the positive-override path through _bump_bc."""
+    from gw.gw_config import _DEFAULTS
+
+    mesh = _cpu_mesh(2, 2)
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=mesh,
+        nb_total=120, fit_nb_total=14,
+        ngkmax=5000, n_q_disk=36,
+        budget_gb=28.0,
+        band_chunk_override=_DEFAULTS["band_chunk_size"],
+        r_chunk_override=4096,
+    )
+    # _bump_bc(16), capped at ceil(14/P)*P = 16.
+    assert plan.band_chunk == 16
+
+
+def test_deck_default_caps_below_sixteen_on_p1():
+    from gw.gw_config import _DEFAULTS
+
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=_cpu_mesh(1, 1),
+        nb_total=12, fit_nb_total=12,
+        ngkmax=5000, n_q_disk=36,
+        budget_gb=28.0,
+        band_chunk_override=_DEFAULTS["band_chunk_size"],
+        r_chunk_override=4096,
+    )
+    assert plan.band_chunk == 12
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +164,7 @@ def test_band_chunk_unchanged_on_single_device_mesh():
 
 
 # ---------------------------------------------------------------------------
-# Auto-pick path (no override) must also respect the floor.
+# Explicit-zero planner path (``band_chunk_override=None``) respects the floor.
 # ---------------------------------------------------------------------------
 
 
@@ -154,7 +185,7 @@ def test_band_chunk_autopick_respects_world_size_floor():
 
 
 def test_band_chunk_autopick_uses_full_zeta_window_when_it_fits():
-    """The fit-window K extent wins over the historical power-of-two pick."""
+    """Explicit deck 0 retains the full-window-first planner ladder."""
     mesh = _cpu_mesh(1, 1)
     plan = plan_gflat_chunks(
         meta=_fake_meta(nk_tot=64, nspinor=1, n_rmu=648, n_rtot=48**3),

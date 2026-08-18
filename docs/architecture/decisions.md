@@ -440,6 +440,29 @@ Licenses deleting: rectangular-mesh accommodation in the mesh resolver
 and any divisibility contortions that exist only to serve non-square
 grids. Does NOT license adding idle-rank truncation.
 
+## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
+
+The no-key `band_chunk_size` value is 16, mesh-rounded and capped at the
+logical ζ window.  The deciding workload is parallel throughput: on the Si
+80 Ry deck at P=4, bc16 with the shard-local ψ(r) cache measured 33 ms steady
+z_q versus 46 ms for full-window transport.  The full-window GEMM advantage
+was confined to P=1, which is not the design target.
+
+An explicit `band_chunk_size = 0` retains the full-window-first memory-planner
+ladder as an opt-in.  A positive value retains its override semantics.  The
+physics band window is unchanged in every mode; mesh pad bands are exact zero.
+
+The ψ(r) cache remains one rectangular, all-P band-sharded `lax.scan` result.
+At a 50-band window, bc16 therefore stores 64 slots.  A ragged tail would split
+the cache/slice ABI into another compiled module family, so removing the 28%
+pad is not licensed as a trivial accounting correction.  The memory model must
+price the pad exactly and identify it in its documentation.
+
+When conv_kpair is selected, Stage C prices its two rank-5 input carries, not
+the stale XLA transpose/product live set.  Nonresident native scratch is
+spin-reduced and is accounted at its own shape.  This is an accounting change,
+not a new kernel or precision mode.
+
 ## Standing (recorded earlier, restated for one-page reference)
 
 - Thousands-of-low-memory-processes is the scaling target: no N_mu^2-class

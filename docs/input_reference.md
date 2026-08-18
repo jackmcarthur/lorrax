@@ -62,7 +62,7 @@ page has to read it from.
 | `transverse_zeta_rcond` | `1e-10` | Transverse rank-truncation cutoff tau relative to |lambda|_max (rank_truncate family only; no env twin). |
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
-| `band_chunk_size` | `0` | Bands per chunk in the band-chunked FFT/pair-density loops. `0` = planner-chosen full logical ζ window when the measured FFT box plus pair accumulator fit; explicit > 0 wins. |
+| `band_chunk_size` | `16` | Bands per chunk in the band-chunked FFT/pair-density loops. The default is mesh-rounded and capped at the logical ζ window (P=4 throughput target: 33 ms at bc16 versus 46 ms full-window on Si 80 Ry, 2026-08-17). Explicit `0` opts into the planner's full-window-first memory ladder; explicit > 0 remains an override. |
 | `r_chunk_size` | `0` | Real-space columns per zeta-fit chunk; 0 = auto from the memory model. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
