@@ -160,7 +160,7 @@ def test_the_default_is_spelled_the_same_in_both_places():
     ("w_bse_head_placement_unimplemented",
      "compute_mode = cohsex\nmc_average_placement = bgw\n"),
     ("w_bse_insulators_only",
-     "compute_mode = cohsex\n" + _METAL_KEYS),
+     "compute_mode = mpa\n" + _METAL_KEYS),
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -256,7 +256,7 @@ def test_the_insulator_refusal_names_the_live_metal_alternative(tmp_path):
     """
     with pytest.raises(ValueError) as exc:
         _config(tmp_path,
-                "screening_diagrams = w_bse\ncompute_mode = cohsex\n"
+                "screening_diagrams = w_bse\ncompute_mode = mpa\n"
                 + _METAL_KEYS)
     message = str(exc.value)
     assert "screening_diagrams = w_rpa" in message

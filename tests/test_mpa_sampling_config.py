@@ -27,6 +27,7 @@ def _config(tmp_path, extra=""):
 
 
 _METAL_KEYS = (
+    "compute_mode = mpa\n"
     "mpa_material_class = metal\n"
     "occ_smearing_family = mp1\n"
     "occ_smearing_width_ry = 0.02\n"
@@ -131,6 +132,33 @@ def test_a_legal_metal_deck_parses_and_carries_the_pair(tmp_path):
     assert config.occ_smearing_family == "mp1"
     assert config.occ_smearing_width_ry == 0.02
     assert config.sigma.fermi_reference == "mp1_fixed_n"
+
+
+@pytest.mark.parametrize("mode", ("x_only", "cohsex", "gn_ppm", "hl_ppm"))
+def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
+        tmp_path, mode):
+    with pytest.raises(ValueError) as excinfo:
+        _config(
+            tmp_path,
+            _METAL_KEYS.replace(
+                "compute_mode = mpa", f"compute_mode = {mode}"))
+
+    message = str(excinfo.value)
+    assert "GATE metal_material_class_requires_mpa" in message
+    assert "mpa_material_class = metal" in message
+    assert f"compute_mode = {mode}" in message
+    assert "compute_mode = mpa" in message
+    assert "mpa_material_class = insulator" in message
+    assert "accepts no occupation_state" in message
+
+
+def test_a_metal_deck_refuses_auto_after_naming_its_resolved_mode(tmp_path):
+    with pytest.raises(ValueError) as excinfo:
+        _config(tmp_path, _METAL_KEYS.replace("compute_mode = mpa\n", ""))
+
+    message = str(excinfo.value)
+    assert "compute_mode = auto (resolved to cohsex)" in message
+    assert "compute_mode = mpa" in message
 
 
 def test_an_insulating_deck_carries_no_smearing_pair(tmp_path):

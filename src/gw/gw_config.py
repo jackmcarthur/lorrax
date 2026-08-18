@@ -3458,6 +3458,35 @@ def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
                 f"{RYD_TO_EV} eV/Ry, or remove one of them.")
 
 
+def _validate_metal_compute_mode(config):
+    """Bind the declared metal formulation to its occupation-aware mode."""
+    if config.mpa.material_class != "metal":
+        return
+    mode = config.compute_mode
+    if mode is ComputeMode.MPA:
+        return
+
+    raw_mode = (config.compute_mode_raw or "auto").strip().lower()
+    got_mode = (
+        f"compute_mode = auto (resolved to {mode.value})"
+        if raw_mode == "auto" else f"compute_mode = {mode.value}")
+    raise ValueError(
+        "GATE metal_material_class_requires_mpa: "
+        "mpa_material_class = metal is refused outside the "
+        "occupation-aware MPA path.\n"
+        f"  got: mpa_material_class = metal; {got_mode}\n"
+        "  want: mpa_material_class = metal with compute_mode = mpa\n"
+        "  fix: set compute_mode = mpa for a metal, or set "
+        "mpa_material_class = insulator for an x_only / cohsex / gn_ppm / "
+        "hl_ppm run\n"
+        f"  why: the compute_mode = {mode.value} head route accepts no "
+        "occupation_state and uses step occupations from the dipole/static "
+        "head path; it cannot honor the fixed-N MP1 mu, fractional "
+        "occupations, Drude term, or Thomas-Fermi limit declared by the "
+        "metal key\n"
+        "  doc: docs/theory/metallic-mpa-screening.md")
+
+
 @dataclass(frozen=True)
 class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation.
@@ -3601,7 +3630,8 @@ class LorraxConfig:
     input_file: str = ""
 
     def __post_init__(self):
-        """Refuse fractional-occupation settings outside their landed scope."""
+        """Refuse metallic settings outside their landed scope."""
+        _validate_metal_compute_mode(self)
         if self.screening.occ_broadening_ev == 0.0:
             return
         if self.qp_solver is not QPSolver.SELF_CONSISTENT:
