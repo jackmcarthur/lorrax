@@ -163,6 +163,60 @@ def test_leon_companion_construction_matches_independent_numpy_equations():
     assert wm < x_max  # catches accidental all-sample normalization
 
 
+def test_leon_thiele_construction_matches_independent_yambo_recursion():
+    """Appendix A.2 / Yambo ``mpa_E_solver_Pade``, line for line."""
+
+    n = 4
+    z = sampling.double_parallel_grid(
+        n, 6.0, material_class="metal", alpha=1, schedule="leon")
+    Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
+    w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    x = z ** 2
+    x_max = np.max(np.abs(x))
+
+    c = np.array(w, copy=True)
+    d_m1 = np.zeros(n + 1, dtype=np.complex128)
+    d_m2 = np.zeros(n + 1, dtype=np.complex128)
+    d_m1[0] = d_m2[0] = 1.0
+    d = d_m1.copy()
+    for i in range(1, 2 * n):
+        c_prev = c.copy()
+        c[i:] = ((c_prev[i - 1] - c_prev[i:])
+                 / ((x[i:] - x[i - 1]) * c_prev[i:]))
+        ci = c[i]
+        d = d_m1 - x[i - 1] * ci * d_m2
+        d[1:] += ci * d_m2[:-1]
+        d_m2, d_m1 = d_m1, d.copy()
+
+    coeffs = d[:n] / d[n]
+    companion = np.zeros((n, n), dtype=np.complex128)
+    companion[1:, :-1] = np.eye(n - 1)
+    companion[:, -1] = -coeffs
+    expected = np.linalg.eigvals(companion) / x_max
+
+    actual = np.asarray(pade_fit._leon_thiele_roots(
+        jnp.asarray(w), jnp.asarray(x), jnp.asarray(x / x_max),
+        jnp.asarray(x_max), n, eig="lapack")[0])
+    expected = expected[np.lexsort((expected.imag, expected.real))]
+    actual = actual[np.lexsort((actual.imag, actual.real))]
+    np.testing.assert_allclose(actual, expected, rtol=2e-10, atol=2e-10)
+
+
+def test_thiele_exact_recovery_on_published_metal_grid():
+    n = 4
+    z = sampling.double_parallel_grid(
+        n, 6.0, material_class="metal", alpha=1, schedule="leon")
+    Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
+    w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    Omega, B, diag = pade_fit.fit_mpa_poles(
+        w, z, n, solve="thiele")
+    ref_O, ref_B = _sorted_like_fit(Omega_t, B_t)
+    np.testing.assert_allclose(Omega, ref_O, rtol=2e-7, atol=2e-7)
+    np.testing.assert_allclose(B, ref_B, rtol=2e-6, atol=2e-6)
+    assert int(diag["n_valid"]) == n
+    assert float(diag["backward_error"]) < 1.0e-10
+
+
 def test_default_solve_is_explicit_loewner_bit_for_bit():
     """Adding a selector does not move one incumbent Loewner bit."""
 
