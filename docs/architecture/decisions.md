@@ -443,10 +443,12 @@ grids. Does NOT license adding idle-rank truncation.
 ## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
 
 The no-key `band_chunk_size` value is 16, mesh-rounded and capped at the
-logical ζ window.  The deciding workload is parallel throughput: on the Si
-80 Ry deck at P=4, bc16 with the shard-local ψ(r) cache measured 33 ms steady
-z_q versus 46 ms for full-window transport.  The full-window GEMM advantage
-was confined to P=1, which is not the design target.
+logical ζ window.  This was selected from a pre-AOT Si 80 Ry P=4 measurement
+of 33 ms steady z_q at bc16 versus 46 ms for full-window transport.  The
+required final-tree A/B reversed that result: with the merged SM80 AOT
+kernel, bc16 measured 31 ms and full-window 21 ms.  The owner retained bc16
+as the no-key policy after that refutation; it is not a current performance
+claim.
 
 An explicit `band_chunk_size = 0` retains the full-window-first memory-planner
 ladder as an opt-in.  A positive value retains its override semantics.  The

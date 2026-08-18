@@ -491,8 +491,10 @@ A/B/C/D totals; the full per-term breakdown (centroids, FFT box, `P_l`,
    require a second cache/slice executable family and is not a trivial memory
    correction.
 2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
-   The shipping no-key value is 16 because the P=4 Si 80 Ry measurement was
-   33 ms steady z_q at bc16 versus 46 ms with full-window transport.  It is
+   The shipping no-key value is the owner-selected 16.  Its pre-AOT P=4 Si
+   80 Ry premise (33 ms steady z_q at bc16 versus 46 ms full-window) was
+   refuted by the final-tree AOT A/B (31 ms versus 21 ms, respectively), so
+   the default is policy rather than a current performance claim.  It is
    passed through `_bump_bc(16)`, so the mesh floor and logical-window cap
    still apply.  An explicit deck value `0` opts into the planner ladder: try
    the full logical ζ-fit window first so the pair GEMM has one K dimension

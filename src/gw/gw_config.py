@@ -1572,12 +1572,12 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    # P=4 is the design target: on the Si 80 Ry deck, bc16 + the sharded
-    # psi(r) cache measured 33 ms steady z_q versus 46 ms for full-window
-    # transport (2026-08-17).  Therefore an omitted key uses 16.  An explicit
-    # 0 opts into the memory planner's full-window-first ladder; any positive
-    # deck value remains an override.  The planner mesh-rounds and caps all
-    # three forms at the logical zeta window.
+    # Owner-selected no-key policy.  Its pre-AOT P=4 premise (Si 80 Ry:
+    # bc16 33 ms versus full-window 46 ms) reversed after the SM80 AOT merge
+    # (31 versus 21 ms), so 16 is not asserted to be the faster universal
+    # choice.  Explicit 0 opts into the full-window-first planner ladder; any
+    # positive value remains an override.  The planner mesh-rounds and caps
+    # all three forms at the logical zeta window.
     "band_chunk_size": 16,
     "r_chunk_size": 0,
     # ISDF
