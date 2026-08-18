@@ -541,6 +541,7 @@ def main(argv=None):
 				sym=sym, wfn=wfn, band_slices=band_slices,
 				centroid_indices=centroid_indices,
 				input_dir=input_dir,
+				head_channel=getattr(isdf, 'head_channel', None),
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,
 				print_fn=print0,

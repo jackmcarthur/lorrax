@@ -353,7 +353,8 @@ def _save_checkpoint(path: Path, identity, completed, accumulators,
 
 
 def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
-                          mesh, sym, wfn, V_q, band_slices, print_fn):
+                          mesh, sym, wfn, V_q, band_slices, head_resolver,
+                          head_channel, print_fn):
     """The referee's pole-free static metallic head and eta=0 half residue."""
     from common.collectives import device_put_process_local
     from common.kq_mapping import kminq_idx_for_iq
@@ -368,48 +369,99 @@ def _compute_head_diag_ev(wfns, target_k, target_b, *, state, config, meta,
         np.asarray(wfns.enk), np.asarray(sym.unfolded_kpts),
         tuple(int(x) for x in wfn.kgrid), float(state.mu_ry))
     surface = star_symmetrize_weights(surface, np.asarray(sym.irr_idx_k))
-    surface_kn = jnp.asarray(surface * nk, dtype=jnp.float64)
-    velocity = load_dft_velocity_head(
-        config.paths.parallel_transport_file, mesh=mesh, wfn=wfn, meta=meta)
     nb = int(band_slices.nb_chi)
-    if nb > int(velocity.nb_logical):
-        raise ValueError(
-            "internal_ff_cd head response requests "
-            f"number_bands_chi={nb}, but the velocity store covers only "
-            f"{int(velocity.nb_logical)} bands")
-    identity = np.broadcast_to(
-        np.eye(nb, dtype=np.complex128)[None], (nk, nb, nb)).copy()
-    U = device_put_process_local(
-        identity, NamedSharding(mesh, P(None, "x", "y")))
-    response = build_iteration_head_response(
-        None, None, velocity.velocity_dft_cart, U,
-        wfns.enk[:, :nb], state.f_kn[:, :nb],
-        np.asarray([0.0 + 0.0j], np.complex128),
-        surface_weight_qp_kn=surface_kn[:, :nb], mesh=mesh,
-        kgrid=tuple(int(x) for x in wfn.kgrid),
-        bvec_cart=velocity.reciprocal_lattice_cart,
-        nb_logical=nb,
-        sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),
-        efermi_ry=float(state.mu_ry), wfn=wfn, meta=meta, config=config,
-        wfns_qp=wfns, eta_ry=0.0)
-    gamma_map = kminq_idx_for_iq(sym, 0)[None, :]
-    # The production head owns the tetrahedron surface convention.  Its
-    # body matrix is solved directly, exactly as in the referee route.
-    head_chi = response.static_chi_body_gamma.copy()
-    w_gamma = solve_w(
-        V_q[:1], head_chi, meta, mesh,
-        dyson_solver="distributed")[0]
-    sample = finalize_iteration_head_sample(
-        response, 0, w_gamma, wfn=wfn, meta=meta, config=config, mesh=mesh)
+    if bool(config.head.uses_bgw_metal_q0shift):
+        if head_channel is None or head_resolver is None:
+            raise ValueError(
+                "internal_ff_cd bgw_q0shift requires the driver's validated "
+                "finite-q0 head channel and head resolver")
+        from .head_correction import (
+            bgw_q0shift_head_sample,
+            finite_q0_epsinv_head,
+            resolve_bgw_q0_channel,
+        )
+        from .w_isdf import _w_solve_pref_scalar
+
+        q_full = np.asarray(sym.q_irr_full_idx, np.int32)
+        channel = resolve_bgw_q0_channel(
+            config, sym, q_full, head_channel,
+            kgrid=tuple(int(x) for x in meta.kgrid))
+        q_row = int(channel.wedge_row)
+        q_index = int(q_full[q_row])
+        kmq = kminq_idx_for_iq(sym, q_index)
+        direct = make_direct_kernel(mesh, nb_logical=nb)
+        chi_q0 = direct(
+            wfns.psi_xn, wfns.psi_yn, jnp.asarray(kmq), wfns.enk,
+            state.f_kn, jnp.asarray(surface, jnp.float64),
+            jnp.asarray([0.0 + 0.0j]))[0:1]
+        v_q0 = V_q[q_index:q_index + 1]
+        w_q0 = solve_w(
+            v_q0, chi_q0.copy(), meta, mesh,
+            dyson_solver="distributed")
+        epsinv = finite_q0_epsinv_head(
+            chi_q0, w_q0, channel.g_head, channel.v_bare,
+            _w_solve_pref_scalar(meta), mesh_xy=mesh)
+        eps_value = complex(np.asarray(epsinv)[0])
+        bare_vc0 = head_resolver.bare_vc0_override
+        if bare_vc0 is None:
+            raise ValueError(
+                "internal_ff_cd matched bgw_q0shift has no file-supplied "
+                "bare q0 scalar; analytic substitution is forbidden")
+        sample = bgw_q0shift_head_sample(
+            complex(bare_vc0), eps_value, 0.0 + 0.0j)
+        sample_source = (
+            "bgw_q0shift(bgw_metal_vcoul_file v; "
+            "finite-q0 epsinv head+wings)")
+        print_fn(
+            "  internal_ff_cd matched q0: finite epsilon q0="
+            f"{channel.q0_reduced}, wedge row={q_row}, "
+            f"epsinv_00={eps_value.real:+.12e}{eps_value.imag:+.12e}i; "
+            "bare head=bgw_metal_vcoul_file")
+    else:
+        # The exact-q0 production head owns the tetrahedron surface
+        # convention.  Its body matrix is solved directly, exactly as in the
+        # referee route.
+        surface_kn = jnp.asarray(surface * nk, dtype=jnp.float64)
+        velocity = load_dft_velocity_head(
+            config.paths.parallel_transport_file, mesh=mesh, wfn=wfn,
+            meta=meta)
+        if nb > int(velocity.nb_logical):
+            raise ValueError(
+                "internal_ff_cd head response requests "
+                f"number_bands_chi={nb}, but the velocity store covers only "
+                f"{int(velocity.nb_logical)} bands")
+        identity = np.broadcast_to(
+            np.eye(nb, dtype=np.complex128)[None], (nk, nb, nb)).copy()
+        U = device_put_process_local(
+            identity, NamedSharding(mesh, P(None, "x", "y")))
+        response = build_iteration_head_response(
+            None, None, velocity.velocity_dft_cart, U,
+            wfns.enk[:, :nb], state.f_kn[:, :nb],
+            np.asarray([0.0 + 0.0j], np.complex128),
+            surface_weight_qp_kn=surface_kn[:, :nb], mesh=mesh,
+            kgrid=tuple(int(x) for x in wfn.kgrid),
+            bvec_cart=velocity.reciprocal_lattice_cart,
+            nb_logical=nb,
+            sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),
+            efermi_ry=float(state.mu_ry), wfn=wfn, meta=meta, config=config,
+            wfns_qp=wfns, eta_ry=0.0)
+        head_chi = response.static_chi_body_gamma.copy()
+        w_gamma = solve_w(
+            V_q[:1], head_chi, meta, mesh,
+            dyson_solver="distributed")[0]
+        sample = finalize_iteration_head_sample(
+            response, 0, w_gamma, wfn=wfn, meta=meta, config=config, mesh=mesh)
+        sample_source = sample.source
     wc0 = complex(sample.wcoul0) - complex(sample.vc0)
     f_target = np.asarray(state.f_kn)[target_k, target_b]
     sigma = -(2.0 * f_target - 1.0) * wc0 * RYD_TO_EV / (
         2.0 * float(meta.cell_volume) * nk)
     print_fn(
-        f"  internal_ff_cd head: source={sample.source}, "
+        f"  internal_ff_cd head: source={sample_source}, "
         f"Wc0={wc0.real:+.9e}{wc0.imag:+.9e}i Ry, eta_W=0 exactly")
     return np.asarray(sigma, np.complex128), {
-        "source": sample.source,
+        "source": sample_source,
+        "bgw_metal_q0_treatment": str(config.head.bgw_metal_q0_treatment),
         "vc0": [float(complex(sample.vc0).real), float(complex(sample.vc0).imag)],
         "wcoul0": [float(complex(sample.wcoul0).real),
                     float(complex(sample.wcoul0).imag)],
@@ -442,6 +494,8 @@ def compute_internal_ff_cd(
     band_slices,
     centroid_indices,
     input_dir: str,
+    head_resolver=None,
+    head_channel=None,
     occupation_state=None,
     print_fn: Callable = print,
 ) -> InternalFFResult:
@@ -709,7 +763,8 @@ def compute_internal_ff_cd(
     head_ev, head_record = _compute_head_diag_ev(
         wfns, target_k, target_b, state=state, config=config, meta=meta,
         mesh=mesh_xy, sym=sym, wfn=wfn, V_q=V_q,
-        band_slices=band_slices, print_fn=print_fn)
+        band_slices=band_slices, head_resolver=head_resolver,
+        head_channel=head_channel, print_fn=print_fn)
     totals = np.stack(real_results) + imag_accum[None] + head_ev[None]
     re_steps_mev = 1000.0 * np.diff(np.real(totals), axis=0)
     im_steps_mev = 1000.0 * np.diff(np.imag(totals), axis=0)

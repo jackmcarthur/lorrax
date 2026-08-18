@@ -523,6 +523,7 @@ def compute_sigma_xc(
     band_slices,
     centroid_indices=None,
     input_dir: str,
+    head_channel=None,
     Gij: jax.Array | None = None,
     wfns_transverse=None,
     bispinor_v_q_path: str | None = None,
@@ -889,6 +890,7 @@ def compute_sigma_xc(
                 wfns, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
                 sym=sym, wfn=wfn, band_slices=band_slices,
                 centroid_indices=centroid_indices, input_dir=input_dir,
+                head_resolver=head_resolver, head_channel=head_channel,
                 occupation_state=occupation_state, print_fn=print_fn)
             sigma_c_ev = np.asarray(tier0.sigma_c_diag_ev)
             expected = (int(meta.nk_tot), int(meta.nb_sigma))
