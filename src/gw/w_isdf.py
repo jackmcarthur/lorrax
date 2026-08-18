@@ -1534,11 +1534,10 @@ def compute_chi0_static_fractional(
     precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
     the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
     the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
-    pairs.  One divided-difference sample per fit rides this route — the
-    shifted-origin slot of the metal double-parallel plan, whose damped
-    contour rule is unaffordable (probe record
-    ``runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md``:
-    ~1.0e6 nodes at varpi = 2e-5 Ry).  Returns ``(n_q, n_mu, n_mu)``
+    pairs.  This is the literal static member of the shared ordered-pair
+    evaluator; the metal MPA shifted-origin slot instead calls
+    :func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
+    Returns ``(n_q, n_mu, n_mu)``
     wedge rows in the raw-chi normalization expected by :func:`solve_w`,
     sharded ``P(None, 'x', 'y')``.
     """

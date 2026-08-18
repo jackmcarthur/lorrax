@@ -845,13 +845,15 @@ Use these dependencies when moving beyond the validated profile.
   Check W reconstruction, conditioning distributions, QP energies, and gaps.
 
 - **A different pole batch size.** This changes residency and repeated physical
-  sweeps, not the approximation. The production interface refuses values above
-  four until a larger resident batch is memory-certified.
+  sweeps, not the approximation. The default remains four; controlled runs may
+  request 1--8.  Na c620 on A100 completed with eight resident poles, while
+  ten required a 7.33-GiB contiguous allocation and OOMed on every rank;
+  values above eight are refused before reaching that measured failure.
 
 - **Small-gap or metallic occupations.** Owned by
   [Metallic MPA screening](metallic-mpa-screening.md). The cost model changes
   in two places: the origin row leaves the sampled-quadrature family for an
-  exact divided-difference tile scan, and the damped-line bandwidth is set by
+  exact direct-frequency ordered-pair tile scan, and the damped-line bandwidth is set by
   the occupation supports rather than by $\omega_m$, so it grows with the
   smearing width as well as the band window. Sigma rank grows because the
   crossing core absorbs the Fermi-surface straddle.

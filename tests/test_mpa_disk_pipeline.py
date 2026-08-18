@@ -199,7 +199,7 @@ def test_sigma_store_reuses_a_reader_the_caller_already_opened(monkeypatch):
         "close it out from under the census that is still using it")
 
 
-def test_sigma_store_accepts_twelve_and_refuses_more_resident_poles(monkeypatch):
+def test_sigma_store_accepts_eight_and_refuses_more_resident_poles(monkeypatch):
     reads = []
 
     monkeypatch.setattr(
@@ -208,16 +208,16 @@ def test_sigma_store_accepts_twelve_and_refuses_more_resident_poles(monkeypatch)
         mpa_sigma, "_integrate_sigma_batches",
         lambda _w, batches, *_a, **_k: [int(O.shape[0]) for _, O, _ in batches])
     got = mpa_sigma.integrate_sigma_store(
-        None, "poles.h5", 12, (), np.array([0.0]), None, _mesh(),
-        pole_batch_size=12)
-    assert got == [12]
+        None, "poles.h5", 8, (), np.array([0.0]), None, _mesh(),
+        pole_batch_size=8)
+    assert got == [8]
 
-    for size in (0, 13):
+    for size in (0, 9):
         try:
             mpa_sigma.integrate_sigma_store(
                 None, "poles.h5", 8, (), np.array([0.0]), None, _mesh(),
                 pole_batch_size=size)
         except ValueError as exc:
-            assert "[1, 12]" in str(exc)
+            assert "[1, 8]" in str(exc)
         else:
             raise AssertionError(f"pole_batch_size={size} was accepted")
