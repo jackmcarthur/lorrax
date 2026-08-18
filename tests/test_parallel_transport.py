@@ -441,6 +441,53 @@ def test_artifact_schema_is_slabio_only_and_names_the_head_manifold():
     assert OCCUPATIONS_DATASET == "dft_occupations_full"
 
 
+def test_connection_stage_registers_links_with_its_live_owner_before_read(
+        monkeypatch):
+    """An append handle must not ask h5py to rediscover its link geometry."""
+    events = []
+
+    class StopAfterRead(RuntimeError):
+        pass
+
+    class RecordingSlabIO:
+        def __init__(self, path, *, mode, mesh):
+            del path, mode, mesh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def create_dataset(self, name, *, shape, dtype):
+            events.append(("create", name, tuple(shape), np.dtype(dtype)))
+
+        def read_slab(self, name, *, shape, partition_spec):
+            del partition_spec
+            events.append(("read", name, tuple(shape)))
+            raise StopAfterRead
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    monkeypatch.setattr(pt_io, "SlabIO", RecordingSlabIO)
+    monkeypatch.setattr(
+        pt_io, "link_symmetry_reduction_applies", lambda sym, kgrid: False)
+    monkeypatch.setattr(
+        pt_io, "make_distributed_band_matmul", lambda mesh, n_batch_axes: None)
+    with np.testing.assert_raises(StopAfterRead):
+        pt_io._write_connection_stage(
+            "not-opened.h5",
+            wfn=types.SimpleNamespace(kgrid=np.asarray([8, 8, 8])),
+            sym=types.SimpleNamespace(nk_tot=1), mesh=mesh, nbands=3,
+            full_plus=np.zeros((1, 3), dtype=np.int32),
+            source_full=np.asarray([0], dtype=np.int32),
+            source_steps=np.zeros((1, 3), dtype=np.int32),
+            directed_edge_orbit_table=None, apply_band_matrix_symmetry=None)
+    assert events == [
+        ("create", LINKS_DATASET, (1, 3, 3, 3), np.dtype(np.complex128)),
+        ("read", LINKS_DATASET, (1, 3, 3, 3)),
+    ]
+
+
 
 _CROSSING_KGRID = (8, 8, 8)
 _CROSSING_BVEC = np.array([[1.1, 0.05, 0.0],
