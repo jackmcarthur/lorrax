@@ -182,10 +182,11 @@ def test_the_zeta_nband_edge_is_strict_and_52_is_legal_where_56_is_not():
     gi = _init()
     enk = _soc_spectrum(tight={56: 0.259})
     # 52 — legal, and the check is genuinely running (mode is strict)
-    gi.check_zeta_fit_windows(enk, (0, 52), (0, 52), 52, log=lambda *_: None)
+    gi.check_zeta_fit_windows(
+        enk, (0, 52), (0, 52), 52, 52, log=lambda *_: None)
     # 56 — REFUSED, and the message names the band
     with pytest.raises(BandWindowDegeneracyError, match="band 56"):
-        gi.check_zeta_fit_windows(enk, (0, 56), (0, 56), 56,
+        gi.check_zeta_fit_windows(enk, (0, 56), (0, 56), 56, 56,
                                   log=lambda *_: None)
 
 
@@ -197,7 +198,7 @@ def test_every_odd_edge_splits_a_kramers_pair_and_refuses(odd):
     gi = _init()
     enk = _soc_spectrum()
     with pytest.raises(BandWindowDegeneracyError, match=f"band {odd}"):
-        gi.check_zeta_fit_windows(enk, (0, odd), (0, odd), odd,
+        gi.check_zeta_fit_windows(enk, (0, odd), (0, odd), odd, odd,
                                   log=lambda *_: None)
 
 
@@ -208,7 +209,7 @@ def test_the_nband_edges_are_strict_when_the_key_is_unset():
     enk = _soc_spectrum()
     with pytest.raises(BandWindowDegeneracyError, match="band 55"):
         gi.check_zeta_fit_windows(
-            enk, (0, 55), (0, 55), None, log=lambda *_: None)
+            enk, (0, 55), (0, 55), None, 55, log=lambda *_: None)
 
 
 def test_both_edges_are_strict_when_zeta_nband_is_present():
@@ -219,7 +220,29 @@ def test_both_edges_are_strict_when_zeta_nband_is_present():
     # left edge 55 (an ncond edge, splits a pair) + right edge 52 (legal)
     with pytest.raises(BandWindowDegeneracyError, match="band 55"):
         gi.check_zeta_fit_windows(
-            enk, (0, 55), (0, 52), 52, log=lambda *_: None)
+            enk, (0, 55), (0, 52), 52, 52, log=lambda *_: None)
+
+
+def test_padding_is_not_a_physical_zeta_edge():
+    """Logical 46 is clean; a sliced padded edge 48 must not decide physics."""
+    gi = _init()
+    enk = _soc_spectrum(nb=52, tight={48: 0.0})
+    said = []
+    gi.check_zeta_fit_windows(
+        enk, (0, 48), (0, 48), None, 46, log=said.append)
+    text = "\n".join(said)
+    assert "edge 46 min gap" in text
+    assert "edge 48" not in text
+
+
+def test_a_sliced_logical_edge_still_refuses_when_storage_is_padded():
+    """Padding cannot hide a genuinely sliced physical boundary."""
+    from common.band_degeneracy import BandWindowDegeneracyError
+    gi = _init()
+    enk = _soc_spectrum(nb=52, tight={46: 0.259})
+    with pytest.raises(BandWindowDegeneracyError, match="band 46"):
+        gi.check_zeta_fit_windows(
+            enk, (0, 48), (0, 48), None, 46, log=lambda *_: None)
 
 
 def test_a_fit_at_the_wfn_top_refuses_unverifiable_closure():
@@ -229,13 +252,14 @@ def test_a_fit_at_the_wfn_top_refuses_unverifiable_closure():
     enk = _soc_spectrum()[:, :, :60]
     with pytest.raises(BandWindowDegeneracyError, match="spare band"):
         gi.check_zeta_fit_windows(
-            enk, (0, 60), (0, 60), None, log=lambda *_: None)
+            enk, (0, 60), (0, 60), None, 60, log=lambda *_: None)
 
 
 def test_a_loader_with_no_energies_says_absence_not_pass():
     gi = _init()
     said = []
-    gi.check_zeta_fit_windows(None, (0, 52), (0, 52), 52, log=said.append)
+    gi.check_zeta_fit_windows(
+        None, (0, 52), (0, 52), 52, 52, log=said.append)
     assert any("NOT CHECKED" in s and "not a pass" in s for s in said)
 
 
@@ -286,6 +310,8 @@ def test_fit_zeta_takes_its_ranges_from_the_resolver():
         "fit_zeta no longer calls the resolver — the deck key would parse and "
         "steer nothing")
     assert "check_zeta_fit_windows(" in body
+    assert "b_id_4_user" in body, (
+        "the production guard lost the logical unpadded band stop")
     assert "(band_slices.b1, band_slices.b4)" not in body, (
         "fit_zeta grew a second copy of the right band range; the resolver is "
         "the only place that arithmetic may live")
