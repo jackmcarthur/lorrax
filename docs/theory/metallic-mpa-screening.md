@@ -264,8 +264,9 @@ The cost driver is the truncation horizon `t_max ~ log(2/eps)/varpi`, not the
 tolerance — which is why loosening by two decades recovers only a third of
 the nodes. Against the pre-registered threshold ("certifies at `<= 256`
 nodes ⇒ contour permitted for origin rows") the contour route is ~4000×
-over, so the finite-`q` divided-difference route was built (commit
-`82f81933`): `w_isdf.compute_chi0_static_fractional`, dispatched from
+over, so the finite-`q` ordered-pair route was built (commit
+`82f81933`) and later corrected to evaluate the declared coordinate literally:
+`w_isdf.compute_chi0_direct_fractional`, dispatched from
 `model._evaluate_samples` for the near line's first point, with the far
 pure-imaginary point and every damped point on
 `compute_chi0_contour_fractional` (the far line is cheap: `O(1)` Ry heights,
@@ -274,14 +275,15 @@ pure-imaginary point and every damped point on
 metal breaks; the dispatch census test in `tests/test_chi_contour_kernel.py`
 fails if one ever does.
 
-The stored value at the shifted-origin slot is the exact static
-`chi0(0)` while the fit reads `sample_z = i*varpi_1`. At finite `q` the
-inconsistency is bounded by `(varpi_1/(q v_F))^2` — asserted on the oracle
-fixtures at first order (fixture-level `2.556e-5` on a non-TRS random
-fixture, `I1_origin_probe.md`); the deck-level quadratic estimate (~`4e-8`
-on Na `8^3`) is a run-ladder result and **has not been measured** — do not
-cite it as one. At `Gamma` the head overrides the row outright with the
-static order-of-limits value (section 4.1), so the bound never applies there.
+The stored finite-`q` value at the shifted-origin slot is now the literal
+`chi0(i*varpi_1)`: the file's ordinate and response describe the same
+analytic function.  The earlier implementation stamped that nonzero ordinate
+but wrote `chi0(0)`.  A direct Na audit found the substitution moved the raw
+response by as much as 0.776% over the 28 nonzero wedge rows (0.221% RMS), so
+the former quadratic estimate was not an accuracy certificate.  At `Gamma`
+the head still overrides the row explicitly with the static order-of-limits
+value (section 4.1); that is a declared head convention, not an accidental
+finite-`q` substitution.
 
 ### 2.4 Alternatives considered and rejected, with their numbers
 
@@ -293,7 +295,13 @@ static order-of-limits value (section 4.1), so the bound never applies there.
    `t_max = log(2/eps)/varpi` diverges, so the node count is unbounded below
    any fixed tolerance; the probe's `varpi_1` row is already the practical
    image of this divergence at `1e-5` Ha.
-3. **The separable resolvent-pair static target.** Approximate the smearing
+3. **The exact direct-frequency ordered-pair scan.** This is the selected
+   route for the single origin point.  At Na scale it completed in tens of
+   seconds per P4 arm, returns the distributed centroid matrix directly, and
+   has no quadrature convergence problem.  It remains an isolated-point
+   escape hatch rather than a full-frequency algorithm because its band-pair
+   work is quadratic.
+4. **The separable resolvent-pair static target.** Approximate the smearing
    function by a rational form `f(E) ≈ sum_j a_j/(E-z_j)`; then
 
    $$
@@ -309,7 +317,7 @@ static order-of-limits value (section 4.1), so the bound never applies there.
    pole certificate. At Na scale the exact tiled kernel is affordable for
    its single sample per fit (the TASTE-6 ruling with the per-step byte
    figure is restated in `_static_fractional_pair_scan`'s docstring, which
-   also forbids extending the route to dynamic samples).
+   also forbids extending the route to a full dynamic grid).
 
 ### 2.5 What "optimal given current theory" means
 
@@ -322,12 +330,11 @@ The plan is the optimum of a three-way trade, not a free choice:
 - **Loewner conditioning.** The origin sample sits four decades below
   `varpi_near` — the Loewner pencil acquires a near-isolated row, which is
   the top-ranked fit-health risk (rung R4 sweeps `N_p` in {6,8,10} against
-  the store's `fit_condition`/`condition_max_allowed` guards). Moving the
-  origin *further* down (smaller `varpi_1`) buys nothing physically (the
-  stored value is already exact static) and worsens both the conditioning
-  and the would-be contour cost; moving it *up* violates the published
-  protocol's stability rationale and enlarges the `(varpi_1/(q v_F))^2`
-  inconsistency. `1e-5` Ha is the published, validated compromise.
+  the store's `fit_condition`/`condition_max_allowed` guards).  The ordinate
+  must not be tuned by pretending that a static value was measured there.
+  Candidate shifts are instead evaluated literally and accepted only when
+  both the fit gate and the Sigma observable comparison pass. `1e-5` Ha is
+  the published starting point, not an accuracy proof for this deck.
 - **The shared-grid contract.** The scalar head fit must use the *identical*
   complex grid as the body — `build_mpa_fit` refuses otherwise ("QSGW head
   and MPA body must use the identical stamped z grid") — because head and
@@ -337,16 +344,16 @@ The plan is the optimum of a three-way trade, not a free choice:
   its single problematic row is solved by changing the *evaluator*, not the
   *geometry*.
 
-Within current theory — a certified damped-line family whose cost is
-`t_max ~ log(2/eps)/varpi`, a Loewner fit on `2N_p` shared samples, and an
-exact static kernel — no reachable rearrangement improves any leg without
-paying more on another. The genuinely better static evaluator (the certified
-separable target, 2.4.3) is staged, not skipped.
+Within current theory the certified route is a damped-line family for the
+ordinary samples, one exact direct-frequency origin evaluation, and a Loewner
+fit on `2N_p` shared samples.  The separable resolvent target (2.4.4) is the
+staged low-scaling replacement for that isolated quadratic scan.
 
 ## 3. The finite-`q` body
 
-Every stored wedge row of every dynamic sample is the fractional contour
-kernel; the shifted-origin row is the finite-`q` divided difference. The
+Every stored wedge row of every ordinary dynamic sample is the fractional
+contour kernel; the shifted-origin row is the exact finite-`q` direct-frequency
+ordered-pair response. The
 finite-`q` static kernel (`w_isdf.compute_chi0_static_fractional`) is the
 `Gamma` kernel's sibling through one shared tile scan
 (`_static_fractional_pair_scan`): for wedge row `j`, every `b`-side operand

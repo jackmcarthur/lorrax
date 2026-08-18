@@ -271,9 +271,10 @@ def _solve_wc(
     for index in range(int(n_z), len(head_response.omegas)):
         if bgw_q0 is not None:
             # Metallic MPA appends only the exact-static do_G0 sample after
-            # the fit grid.  The near-line origin row was evaluated with the
-            # exact divided-difference chi, so its finite-q epsinv is the
-            # identical static response and is reused here.
+            # the fit grid.  The Gamma row of the near-line origin sample was
+            # replaced by the same static order-of-limits response above, so
+            # that q=0 head value -- not the literal finite-q response -- is
+            # the one reused here.
             from gw.head_correction import bgw_q0shift_head_sample
             head_samples.append(bgw_q0shift_head_sample(
                 bgw_vhead, bgw_epsinv[0], head_response.omegas[index]))
@@ -305,7 +306,7 @@ def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
 
 
 def _metal_kminq_rows(sym, q_idx):
-    """Per-wedge-row flat ``k → k−q`` maps for the static origin sample.
+    """Per-wedge-row flat ``k → k−q`` maps for the direct origin sample.
 
     Row order follows the stored wedge (``sym.q_irr_full_idx`` order); the
     Gamma row's map must be the identity, which is asserted because it is

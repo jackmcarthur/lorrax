@@ -22,8 +22,8 @@ from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 
 def _bounded_pole_batch_size(value):
     size = int(value)
-    if not 1 <= size <= 12:
-        raise ValueError("MPA pole_batch_size must be in [1, 12]")
+    if not 1 <= size <= 8:
+        raise ValueError("MPA pole_batch_size must be in [1, 8]")
     return size
 
 
