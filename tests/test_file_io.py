@@ -788,6 +788,7 @@ from file_io._slab_io_ffi import (
     _normalize_slab_request,
     _normalize_valid_shape,
     _validate_block_divisible,
+    _warn_ignored_chunks,
 )
 from file_io.slab_io import SlabIO, probe_availability
 
@@ -1484,3 +1485,18 @@ def test_slabio_says_chunks_are_dropped_once_per_file(
     assert "chunky.h5" in about_chunks[0], (
         "the warning does not name the file it is about, so a caller "
         "writing several files cannot tell which one is contiguous")
+
+
+def test_slabio_chunks_warning_is_rank0_only(monkeypatch):
+    """A replicated layout fact must not produce one warning per rank."""
+    import warnings
+    import file_io._slab_io_ffi as slab_ffi
+
+    monkeypatch.setattr(slab_ffi, "_rank0", lambda: False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _warn_ignored_chunks(path="sigma_mnk.h5", name="sigma_total_kij_ev",
+                             chunks=(1, 2, 3))
+    assert not caught, (
+        "a nonzero rank repeated the rank-0 chunks warning: "
+        f"{[str(w.message) for w in caught]}")

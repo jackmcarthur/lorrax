@@ -219,9 +219,9 @@ silent overwrite.
 18. **`chunks=` is silently dropped on every SlabIO write** — so no file
     this transport creates is chunked, including all four `sigma_mnk.h5`
     datasets and the `zeta_q_G` store. The tree is honest about the
-    mechanism (`src/file_io/_slab_io_ffi.py:1751` and `:1856` both say
+    mechanism (`src/file_io/_slab_io_ffi.py:1752` and `:1860` both say
     `chunks=` cannot be honoured by this transport at all, and the warning
-    was demoted to once-per-file when that landed) but the **consequence**
+    is emitted once per file on rank 0) but the **consequence**
     is recorded nowhere a reader looking for open issues would find it,
     which is what this row fixes. Honouring it needs chunk dims plumbed
     through `lrx_phdf5_ensure_dataset`, which takes only name/shape/dtype

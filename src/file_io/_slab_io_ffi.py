@@ -57,6 +57,32 @@ def _rank0() -> bool:
     return jax.process_index() == 0
 
 
+def _warn_ignored_chunks(*, path: str, name: str,
+                         chunks: Sequence[int]) -> None:
+    """Warn once globally that the collective create ignores ``chunks``.
+
+    Every process owns an :class:`_FfiBackend`, so the backend-local
+    ``_chunks_warned`` flag alone means once *per process*.  Log the
+    replicated fact on rank 0 only; the caller still gets the warning,
+    while a P-rank run no longer buries it under P identical copies.
+    """
+    if not _rank0():
+        return
+    import warnings
+
+    want = tuple(int(c) for c in chunks)
+    warnings.warn(
+        f"SlabIO FFI transport: chunks={want} on "
+        f"create_dataset({name!r}) is not honoured, here or for any "
+        f"later dataset in {os.path.basename(path)} — HDF5 "
+        f"fixes layout at create time and the collective create "
+        f"takes no chunk dims, so the datasets are contiguous with "
+        f"the FAPL-level alignment set at ctx init.  Pre-create "
+        f"with h5py if the layout is load-bearing.",
+        stacklevel=4,
+    )
+
+
 # ``_barrier`` is ``common.collectives.barrier``.  It used to be a local
 # copy whose whole body was ``try: sync_global_devices(tag); except
 # Exception: pass`` — seven lines below an import of the very module that
@@ -1724,7 +1750,7 @@ class _FfiBackend(_DatasetGeometry):
         # :func:`_apply_dataset_attrs`.
         self._deferred_ds_attrs: list[tuple[str, dict]] = []
         # ``chunks=`` cannot be honoured by this transport at all and
-        # says so — once per file, not once per dataset.  See
+        # says so — once per file on rank 0, not once per dataset/rank.  See
         # :meth:`create_dataset`.
         self._chunks_warned: bool = False
         # Python-level async writer.  ``write_slab`` enqueues a callable
@@ -1841,23 +1867,14 @@ class _FfiBackend(_DatasetGeometry):
         # Honouring it means a chunk-dims argument on the C entry point,
         # not a change here.
         #
-        # ONCE PER FILE, though.  ``sigma_output`` passes chunks on all
-        # four of its datasets and every production Σ write was emitting
-        # four copies of this into the middle of the write telemetry,
+        # ONCE PER FILE ON RANK 0, though.  ``sigma_output`` passes chunks
+        # on all four of its datasets and every production Σ write was
+        # emitting four copies per rank into the middle of the telemetry,
         # which is how a warning stops being read — the same reason the
         # discard this replaces was invisible for four days.
         if chunks is not None and not self._chunks_warned:
-            import warnings
             self._chunks_warned = True
-            _want = tuple(int(c) for c in chunks)
-            warnings.warn(
-                f"SlabIO FFI transport: chunks={_want} on "
-                f"create_dataset({name!r}) is not honoured, here or for any "
-                f"later dataset in {os.path.basename(self.path)} — HDF5 "
-                f"fixes layout at create time and the collective create "
-                f"takes no chunk dims, so the datasets are contiguous with "
-                f"the FAPL-level alignment set at ctx init.  Pre-create "
-                f"with h5py if the layout is load-bearing.")
+            _warn_ignored_chunks(path=self.path, name=name, chunks=chunks)
 
     # ------------------------------------------------------------------
     def write_attr(self, name: str, value) -> None:
