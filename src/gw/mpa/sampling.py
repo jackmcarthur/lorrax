@@ -62,6 +62,7 @@ _METAL_ORIGIN_SHIFT = {"Ha": 1.0e-5, "Ry": 2.0e-5}
 
 _MATERIAL_CLASSES = ("insulator", "metal")
 _ENERGY_UNITS = ("Ha", "Ry")
+PARTITION_SCHEDULES = ("nested", "leon")
 
 # The published partition sets, in ascending order, as exact fractions of
 # omega_m BEFORE the alpha exponent is applied (metals paper Eq. 11).
@@ -169,7 +170,51 @@ def partition_fractions(n_p):
     return tuple(pts)
 
 
-def partition_omegas(n_p, omega_m, *, alpha=1):
+def leon_partition_fractions(n_p):
+    """Return the Leon/Yambo qPPS fractions for one sampling line.
+
+    This is the integer construction in Yambo's
+    ``FREQUENCIES_mpa_sampling`` for ``ps='2l', gs='qP'``.  It is the
+    executable continuation of the semi-homogeneous powers-of-two table
+    printed in Leon *et al.* (2023), including the branch above eight poles
+    where :func:`partition_fractions` deliberately made a different local
+    nesting choice.  The caller applies ``alpha`` afterwards.
+    """
+
+    n = int(n_p)
+    if n < 1:
+        raise ValueError(
+            f"GATE n_p_positive: n_p={n_p!r} is not a positive integer. "
+            "FALSE case: int(n_p) >= 1.")
+    if n == 1:
+        return (Fraction(0),)
+    if n == 2:
+        return (Fraction(0), Fraction(1))
+    if n == 3:
+        return (Fraction(0), Fraction(1, 2), Fraction(1))
+
+    level = (n - 1).bit_length() - 1
+    base = 2 ** level
+    remainder = (n - 1) % base
+    pts = [Fraction(0)]
+    if remainder > 0:
+        pts.extend(Fraction(i - 1, 2 * base)
+                   for i in range(2, 2 * remainder + 1))
+        pts.extend(Fraction(i - 1 - remainder, base)
+                   for i in range(2 * remainder + 1, n))
+    else:
+        pts.append(Fraction(1, 2 * base))
+        pts.extend(Fraction(i - 2 - remainder, base)
+                   for i in range(3, n))
+    pts.append(Fraction(1))
+    if len(pts) != n or tuple(pts) != tuple(sorted(set(pts))):
+        raise AssertionError(
+            "Leon qPPS construction did not produce n_p ordered, distinct "
+            "fractions")
+    return tuple(pts)
+
+
+def partition_omegas(n_p, omega_m, *, alpha=1, schedule="nested"):
     """Return the ``n_p`` real-axis sample energies, ascending.
 
     ``omega_n = (fraction)**alpha * omega_m`` -- metals paper Eq. (11),
@@ -193,7 +238,15 @@ def partition_omegas(n_p, omega_m, *, alpha=1):
             "positive energy. FALSE case: float(omega_m) > 0 and finite; "
             "omega_m is the largest included transition energy.")
 
-    fracs = partition_fractions(n_p)
+    mode = str(schedule).strip().lower()
+    if mode not in PARTITION_SCHEDULES:
+        raise ValueError(
+            f"GATE partition_schedule_known: schedule={schedule!r} is not "
+            f"one of {PARTITION_SCHEDULES}. FALSE case: 'nested' preserves "
+            "the LORRAX production extension; 'leon' reproduces Yambo's "
+            "published qPPS continuation.")
+    fracs = (partition_fractions(n_p) if mode == "nested"
+             else leon_partition_fractions(n_p))
     return np.asarray([float(f) ** a * om for f in fracs], dtype=np.float64)
 
 
@@ -203,6 +256,7 @@ def double_parallel_grid(
     *,
     material_class="insulator",
     alpha=1,
+    schedule="nested",
     varpi_near=None,
     varpi_far=None,
     origin_shift=None,
@@ -224,6 +278,9 @@ def double_parallel_grid(
         zero-energy intraband transitions, not a broadening).
     alpha
         Partition exponent, 1 or 2.  See ``partition_omegas``.
+    schedule
+        ``"nested"`` keeps LORRAX's production extension above eight poles;
+        ``"leon"`` uses the Leon/Yambo qPPS construction.
     varpi_near, varpi_far
         Line heights.  ``None`` takes the published defaults for
         ``energy_unit``: 0.1 and 1 Ha (equivalently 0.2 and 2 Ry).
@@ -299,7 +356,8 @@ def double_parallel_grid(
             "the zero-energy intraband pile-up (a stability dodge, not a "
             "broadening) without climbing off the near line it sits on.")
 
-    omegas = partition_omegas(n, omega_m, alpha=alpha)
+    omegas = partition_omegas(
+        n, omega_m, alpha=alpha, schedule=schedule)
 
     near = omegas + 1j * vn
     far = omegas + 1j * vf

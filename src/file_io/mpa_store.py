@@ -210,6 +210,10 @@ _HEAD_FIT_MODELS = (
     "bgw_q0shift_loewner",
     "qsgw_direct_loewner",
     "qsgw_schur_loewner",
+    "dft_direct_companion",
+    "bgw_q0shift_companion",
+    "qsgw_direct_companion",
+    "qsgw_schur_companion",
 )
 
 #: Bump when the fit store's layout changes.  Independent of the W

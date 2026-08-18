@@ -76,6 +76,30 @@ _SAMPLING = {"varpi": [0.1, 1.0], "n_p": _N_P, "alpha": 1,
              "omega_max": _OMEGA_M, "protocol": "double_parallel"}
 
 
+def test_scalar_companion_selector_stamps_component_diagnostics():
+    """The fit-stage selector reaches the scalar head policy unchanged."""
+
+    n_p = 4
+    z = sampling.double_parallel_grid(
+        n_p, 4.0, material_class="metal", alpha=2, schedule="leon")
+    omega_ref = np.asarray(
+        [0.7 - 0.08j, 1.4 - 0.12j, 2.2 - 0.18j, 3.0 - 0.22j])
+    residue_ref = np.asarray(
+        [1.0 + 0.1j, 0.7 - 0.2j, 0.4 + 0.05j, 0.2 - 0.03j])
+    samples = pade_fit.synthesize_w_samples(omega_ref, residue_ref, z)
+    fitted = fit_driver.fit_scalar_samples(
+        samples, z, n_p, solve="companion")
+    assert fitted["solve"] == "companion"
+    assert not fitted["affine"]
+    for key in (
+            "condition_support", "condition_denominator",
+            "backward_error_support", "backward_error_denominator"):
+        assert np.isfinite(fitted[key])
+    reconstructed = pade_fit.synthesize_w_samples(
+        fitted["Omega_p"], fitted["B_p"], z)
+    np.testing.assert_allclose(reconstructed, samples, rtol=2e-7, atol=2e-7)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _host_slabio_for_driver_tests():
     """Exercise the collective API on CPU; PHDF5 itself has cluster tests.
@@ -346,8 +370,7 @@ def test_p4_nondivisible_rows_are_padded_not_gathered(mesh_xy):
         jnp.arange(shape[2], dtype=jnp.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
     kernel = fit_driver._sharded_fit_kernel(
-        mesh_xy, n_p, tuple(sorted(pade_fit.DEFAULT_GUARDS.items())),
-        1.0e-13)
+        mesh_xy, n_p, 1.0e-13, "loewner")
     Om, Bp, *_, finite = kernel(
         block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
     got_om = np.asarray(jax.device_get(Om))
