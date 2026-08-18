@@ -22,8 +22,8 @@ from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 
 def _bounded_pole_batch_size(value):
     size = int(value)
-    if not 1 <= size <= 4:
-        raise ValueError("MPA pole_batch_size must be in [1, 4]")
+    if not 1 <= size <= 12:
+        raise ValueError("MPA pole_batch_size must be in [1, 12]")
     return size
 
 
@@ -259,9 +259,10 @@ def compute_sigma_c_mpa_omega_grid(
     and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  A first
-    four-pole walk retains only scalar geometry for planning; the spatial
-    executor rereads and releases the same four-pole ranges.  No complete
-    pole axis exists on host or device.
+    configured-batch walk retains only scalar geometry for planning; the
+    spatial executor rereads and releases the same pole ranges.  No complete
+    pole axis exists on host or device unless the deck explicitly chooses a
+    batch equal to its pole count.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
