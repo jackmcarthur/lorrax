@@ -326,6 +326,7 @@ def mpa_plan(
     *,
     material_class="insulator",
     alpha=1,
+    schedule="nested",
     varpi_near=None,
     varpi_far=None,
     origin_shift=None,
@@ -356,6 +357,7 @@ def mpa_plan(
 
     grid = sampling.double_parallel_grid(
         n_p, omega_m, material_class=material_class, alpha=alpha,
+        schedule=schedule,
         varpi_near=varpi_near, varpi_far=varpi_far,
         origin_shift=origin_shift, energy_unit=energy_unit)
     n = int(n_p)
@@ -363,7 +365,8 @@ def mpa_plan(
         sample_point(z, f"{'near' if k < n else 'far'}_{k % n:02d}",
                      index=k)
         for k, z in enumerate(grid))
-    return sampling_plan(
-        pts,
-        label=(f"mpa-double-parallel-n_p={n}-{material_class}"
-               f"-alpha={int(alpha)}"))
+    label = (f"mpa-double-parallel-n_p={n}-{material_class}"
+             f"-alpha={int(alpha)}")
+    if str(schedule).lower() != "nested":
+        label += f"-schedule={str(schedule).lower()}"
+    return sampling_plan(pts, label=label)

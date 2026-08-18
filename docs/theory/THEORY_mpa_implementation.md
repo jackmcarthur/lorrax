@@ -127,11 +127,14 @@ $z_0^{(1)}=i\,2\times10^{-5}$ Ry. That displacement is the published
 stability device around zero-energy transitions; it is not the Sigma
 broadening $\eta$. The far-line origin remains $i\varpi_2$.
 
-The fractions form a powers-of-two ladder near the origin and then bisect the
-widest remaining interval. Increasing $N_p$ inserts points without moving old
-ones. The published sets are reproduced exactly through $N_p=7$; the stated
-greedy extension first matters above nine poles. The exponent $\alpha=1$
-gives the linear grid, while $\alpha=2$ concentrates samples near zero.
+The default `nested` fractions form a powers-of-two ladder near the origin and
+then bisect the widest remaining interval. Increasing $N_p$ inserts points
+without moving old ones. The paper tabulates the sets through $N_p=7$.
+`mpa_sampling_schedule = leon` instead executes Yambo's qPPS integer
+continuation; the two constructions agree through $N_p=8$ and differ from
+$N_p=9$ onward. The exponent $\alpha=1$ gives the linear grid, while
+$\alpha=2$ concentrates samples near zero. The schedule is a stamped choice,
+not an adaptive fit parameter.
 
 The grid therefore adapts automatically when deeper valence bands or more
 conduction bands increase $\omega_m$: its real extent grows to the new maximum
@@ -272,9 +275,39 @@ $$
 $$
 
 The default solver is the normalized Loewner pencil. It interpolates the same
-$2N_p$ samples as the earlier power-basis Padé solve without forming a
-Vandermonde system. Companion roots are mapped to the retarded sheet,
-canonicalized, and followed by a residue refit against all samples. Exact-zero
+$2N_p$ samples without forming a Vandermonde system. The explicit
+`mpa_pole_solver = companion` alternative is the Leon/Yambo construction, not
+an affine or regularized Padé variant. Write $x_j=z_j^2$, split the stored
+samples into the near and far halves, and set
+
+$$
+W_m=\max_{j<N_p}|x_j|,\qquad
+Y_{jk}=\left(\frac{x_j}{W_m}\right)^k,\quad k=0,\ldots,N_p-1,
+$$
+
+$$
+M_{jk}=-W_c(z_j)Y_{jk},\qquad v_j=W_c(z_j)x_j^{N_p}.
+$$
+
+With subscripts 1 and 2 denoting the near and far halves, respectively, the
+published numerator elimination is
+
+$$
+T=Y_2Y_1^{-1},\qquad
+(TM_1-M_2)b=Tv_1-v_2.
+$$
+
+The coefficients in the original $x$ domain are
+$c_k=b_k/W_m^k$. The eigenvalues of the companion matrix with unit
+subdiagonal and last column $-c$ are $\Omega_p^2$. Both linear systems are
+solved directly, as in the published implementation: no row equilibration,
+SVD truncation, affine map, or tuned regularizer participates in the
+companion solve. The stored condition and backward-error gates take the worse
+of the $Y_1$ inversion and the eliminated denominator solve, and retain both
+component diagnostics.
+
+After either pole finder, the same retarded-sheet guards, canonical ordering,
+and unconstrained all-$2N_p$-sample residue least-squares refit run. Exact-zero
 residues denote pruned poles and are ignored when Sigma geometry is planned.
 
 The fit stores a condition estimate, backward error, sample residual, and
@@ -701,6 +734,8 @@ minimax_max_nodes = 64
 mpa_n_poles = 8
 mpa_material_class = insulator
 mpa_sampling_alpha = 1
+mpa_sampling_schedule = nested
+mpa_pole_solver = loewner
 mpa_varpi_near_ry = 0.2
 mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4

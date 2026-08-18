@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from gw.gw_config import LorraxConfig
-from gw.mpa import model, sample_plan
+from gw.mpa import model, sample_plan, sampling
 
 
 _BASE = """\
@@ -44,7 +44,6 @@ def test_metal_sampling_flags_build_the_configured_grid(tmp_path):
         "mpa_varpi_near_ry = 0.15\n"
         "mpa_varpi_far_ry = 1.5\n",
     )
-
     plan = config.mpa.sample_plan(8.0)
     np.testing.assert_array_equal(
         sample_plan.plan_z(plan),
@@ -53,6 +52,31 @@ def test_metal_sampling_flags_build_the_configured_grid(tmp_path):
             1.5j, 0.5 + 1.5j, 2.0 + 1.5j, 8.0 + 1.5j,
         ], dtype=np.complex128),
     )
+
+
+def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
+    config = _config(
+        tmp_path,
+        "mpa_n_poles = 15\n" + _METAL_KEYS
+        + "mpa_sampling_alpha = 2\n"
+        + "mpa_sampling_schedule = leon\n"
+        + "mpa_pole_solver = companion\n")
+    assert config.mpa.sampling_schedule == "leon"
+    assert config.mpa.pole_solver == "companion"
+    z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    expected_real = np.asarray(
+        [float(f) ** 2 * 8.0
+         for f in sampling.leon_partition_fractions(15)])
+    np.testing.assert_array_equal(z[:15].real, expected_real)
+
+
+@pytest.mark.parametrize(
+    "line,value",
+    [("mpa_sampling_schedule = improvised\n", "mpa_sampling_schedule"),
+     ("mpa_pole_solver = regularized\n", "mpa_pole_solver")])
+def test_unknown_leon_recipe_selector_refuses(tmp_path, line, value):
+    with pytest.raises(ValueError, match=value):
+        _config(tmp_path, line)
 
 
 def test_unknown_material_class_is_a_parse_error(tmp_path):

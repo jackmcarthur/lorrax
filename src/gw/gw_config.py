@@ -1742,6 +1742,11 @@ _DEFAULTS = {
     "mpa_n_poles": 8,
     "mpa_material_class": "insulator",
     "mpa_sampling_alpha": 1,
+    # The incumbent nested extension and the literal Leon/Yambo qPPS
+    # continuation agree through eight poles and differ from nine onward.
+    "mpa_sampling_schedule": "nested",
+    # Pole identification only; residue fitting and guards remain common.
+    "mpa_pole_solver": "loewner",
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
     # Height (Ry) of the metal near line's FIRST sample, z_1^1 = i*shift --
@@ -3115,6 +3120,8 @@ class MPAConfig:
     n_poles: int
     material_class: str
     sampling_alpha: int
+    sampling_schedule: str
+    pole_solver: str
     varpi_near_ry: float
     varpi_far_ry: float
     #: Metal near-line origin shift in Ry; ``None`` = the published
@@ -3153,6 +3160,14 @@ class MPAConfig:
                 f"got {self.material_class!r}")
         if self.sampling_alpha not in (1, 2):
             raise ValueError("mpa_sampling_alpha must be 1 or 2")
+        if self.sampling_schedule not in ("nested", "leon"):
+            raise ValueError(
+                "mpa_sampling_schedule must be 'nested' or 'leon'; "
+                f"got {self.sampling_schedule!r}")
+        if self.pole_solver not in ("loewner", "companion"):
+            raise ValueError(
+                "mpa_pole_solver must be 'loewner' or 'companion'; "
+                f"got {self.pole_solver!r}")
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
@@ -3199,6 +3214,7 @@ class MPAConfig:
             self.n_poles, omega_m_ry,
             material_class=self.material_class,
             alpha=self.sampling_alpha,
+            schedule=self.sampling_schedule,
             varpi_near=self.varpi_near_ry,
             varpi_far=self.varpi_far_ry,
             origin_shift=self.metal_origin_shift_ry,
@@ -4021,6 +4037,9 @@ class LorraxConfig:
             n_poles=int(_g("mpa_n_poles")),
             material_class=str(_g("mpa_material_class")).strip().lower(),
             sampling_alpha=int(_g("mpa_sampling_alpha")),
+            sampling_schedule=str(
+                _g("mpa_sampling_schedule")).strip().lower(),
+            pole_solver=str(_g("mpa_pole_solver")).strip().lower(),
             varpi_near_ry=float(_g("mpa_varpi_near_ry")),
             varpi_far_ry=float(_g("mpa_varpi_far_ry")),
             metal_origin_shift_ry=(
