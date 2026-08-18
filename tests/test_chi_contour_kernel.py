@@ -336,6 +336,25 @@ def _dense_static_finite_q(psi, enk, occ, surface, kminq_rows):
     return out / np.sqrt(float(nk))
 
 
+def _dense_dynamic_finite_q(psi, enk, occ, kminq_rows, z):
+    """Literal finite-z ordered-pair oracle."""
+    n_q = kminq_rows.shape[0]
+    nk, nb = enk.shape
+    nmu = psi.shape[-1]
+    out = np.zeros((n_q, nmu, nmu), np.complex128)
+    for j in range(n_q):
+        for k in range(nk):
+            kmq = int(kminq_rows[j, k])
+            for a in range(nb):
+                for b in range(nb):
+                    weight = ((occ[k, a] - occ[kmq, b])
+                              / (enk[k, a] - enk[kmq, b] + z))
+                    density = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    out[j] += weight * np.outer(density, np.conj(density))
+    return out / np.sqrt(float(nk))
+
+
 def test_static_fractional_finite_q_matches_divided_difference():
     """The finite-q static kernel: b rides at k-q; Gamma row = Gamma kernel.
 
@@ -393,6 +412,16 @@ def test_static_fractional_finite_q_matches_divided_difference():
                 f_kn=occ, mu_ry=mu, smearing_family="fixed",
                 smearing_width_ry=0.0),
             kminq_rows=kminq)
+
+    shifted_z = 2.0e-5j
+    shifted = w_isdf.compute_chi0_direct_fractional(
+        wfns, np.asarray([shifted_z]),
+        SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+        occupation_state=state, kminq_rows=kminq)
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(shifted)),
+        _dense_dynamic_finite_q(psi, enk, occ, kminq, shifted_z),
+        rtol=3e-13, atol=3e-13)
 
 
 def test_origin_row_static_value_bounds_the_shifted_sample():
@@ -496,7 +525,8 @@ def test_metal_plan_dispatch_census(monkeypatch):
         w_isdf, "compute_chi0_contour_fractional",
         _fake("fractional_contour"))
     monkeypatch.setattr(
-        w_isdf, "compute_chi0_static_fractional", _fake("static_dd", True))
+        w_isdf, "compute_chi0_direct_fractional",
+        _fake("direct_pair", True))
     monkeypatch.setattr(
         w_isdf, "occupation_support_bandwidth", lambda *a, **k: 3.0)
 
@@ -524,7 +554,7 @@ def test_metal_plan_dispatch_census(monkeypatch):
 
     assert "insulating_static" not in calls
     assert "insulating_contour" not in calls
-    assert calls.count("static_dd") == 1
+    assert calls.count("direct_pair") == 1
     roles = {role: kind for kind, role in written}
     assert roles.get("near_00") == "wedge"
     assert all(kind == "full" for kind, role in written if role != "near_00")

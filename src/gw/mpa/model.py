@@ -349,8 +349,8 @@ def _evaluate_samples(
 
     Insulating plans keep the historical kernels on a byte-identical code
     path.  Metal plans (shifted-origin double-parallel protocol) route the
-    near line's first sample through the exact static divided-difference
-    kernel — the damped contour rule at varpi = 2e-5 Ry needs ~1.0e6 nodes
+    near line's first sample through the exact direct ordered-pair kernel —
+    the damped contour rule at varpi = 2e-5 Ry needs ~1.0e6 nodes
     (probe record runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md)
     — and every other point through the fractional contour kernel with the
     rule bandwidth derived from the occupation supports, not ``quad.x_max``.
@@ -363,7 +363,7 @@ def _evaluate_samples(
         compute_chi0,
         compute_chi0_contour,
         compute_chi0_contour_fractional,
-        compute_chi0_static_fractional,
+        compute_chi0_direct_fractional,
         occupation_support_bandwidth,
     )
 
@@ -398,11 +398,13 @@ def _evaluate_samples(
                 chi = chi.at[0].set(static_gamma_override[0])
             write_full(point, chi)
         elif point["role"].startswith("near"):
-            # The shifted-origin slot stores the exact static value; the
-            # fit reads sample_z = i*varpi_1, and the inconsistency is
-            # bounded by (varpi_1/(q*v_F))^2 at finite q (W1.a-2).
-            chi_w = compute_chi0_static_fractional(
-                wfns, meta, mesh_xy, occupation_state=occupation_state,
+            # Evaluate the literal shifted coordinate.  The shift avoids an
+            # interpolation point at the metal's singular origin; writing a
+            # static divided difference into this nonzero slot instead moved
+            # the real Na response by up to 0.78% at finite q (claim 0385).
+            chi_w = compute_chi0_direct_fractional(
+                wfns, np.asarray([point["z"]], dtype=np.complex128),
+                meta, mesh_xy, occupation_state=occupation_state,
                 kminq_rows=kminq_rows)
             if static_gamma_override is not None and gamma_row is not None:
                 chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
