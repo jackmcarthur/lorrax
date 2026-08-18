@@ -302,6 +302,7 @@ class SCOutputs:
     sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
+    iteration_head: object | None
 
 
 @dataclass(frozen=True)
@@ -2018,6 +2019,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             sigma_basis_U=U_full,
             scissor_fit=scissor_fit,
             tail_scissor_fit=tail_fit,
+            iteration_head=iteration_head,
         ),
     )
 
@@ -2863,7 +2865,7 @@ def run_sc_driver(
     input_dir: str,
     enk_dft,
     print_fn: Callable = print,
-) -> tuple[SigmaResult, jax.Array, list[float], bool]:
+) -> tuple[SigmaResult, jax.Array, list[float], bool, object | None]:
     """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
 
     Wraps the whole SC machinery — band partition (protected / in-range /
@@ -2899,6 +2901,10 @@ def run_sc_driver(
         ``config.debug.write_wfn_h5`` artifact dump ran).  The driver's
         generic writer reads this fact instead of re-deriving the
         predicate, so it cannot overwrite the authoritative SC file.
+    iteration_head : IterationHeadSamples or None
+        The LAST map call's QSGW head samples, in the same basis and from the
+        same occupation state as ``sigma_result``.  Returned for the restart
+        writer only; it does not feed the fixed-point carry.
     """
     import dataclasses
 
@@ -3163,7 +3169,8 @@ def run_sc_driver(
                        if sigma_result.efermi_dft_ev is not None
                        else float(wfn.efermi) * RYD_TO_EV),
     )
-    return sigma_result_dft, sigma_total, rms_history, rotations_written
+    return (sigma_result_dft, sigma_total, rms_history, rotations_written,
+            state_final.outputs.iteration_head)
 
 
 def final_qp_eigenstates(

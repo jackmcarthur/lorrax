@@ -467,7 +467,10 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if driver_persists_w0(mode, config):
+	_defer_sc_metal_head = (
+		qp_solver is QPSolver.SELF_CONSISTENT
+		and str(getattr(config.mpa, "material_class", "insulator")) == "metal")
+	if driver_persists_w0(mode, config) and not _defer_sc_metal_head:
 		with timing.section("gw_jax.persist_w0"):
 			persist_w0_and_head(
 				W_by_role.get("static", V_q),
@@ -613,6 +616,7 @@ def main(argv=None):
 	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
 	# than re-deriving the predicate.
 	rotations_written = False
+	iteration_head = None
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
 		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
@@ -624,7 +628,8 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
-			sigma_result, sigma_total, _, rotations_written = run_sc_driver(
+			(sigma_result, sigma_total, _, rotations_written,
+			 iteration_head) = run_sc_driver(
 				wfns, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
@@ -634,6 +639,16 @@ def main(argv=None):
 				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 				band_slices=band_slices, input_dir=input_dir,
 				enk_dft=enk_dft, print_fn=print0)
+		if driver_persists_w0(mode, config):
+			with timing.section("gw_jax.persist_w0"):
+				persist_w0_and_head(
+					W_by_role.get("static", V_q),
+					tensors_filename=tensors_filename,
+					head_resolver=head_resolver,
+					iteration_head=iteration_head,
+					config=config, meta=meta, mesh_xy=mesh_xy,
+					sym=sym, centroid_indices=centroid_indices,
+					print_fn=print0)
 	else:
 		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
 		# E_DFT inside compute_sigma_xc (pass-through; also covers static

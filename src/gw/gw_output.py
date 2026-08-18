@@ -18,6 +18,8 @@ from .gw_config import (
     ComputeMode, SigmaChannel, UNIMPLEMENTED_MODES, explain_missing_channels,
     mode_builds_channels, sigma_channels_for)
 
+HEAD_PERSIST_ITERATION_SEAM = "head-persist-iteration-seam-v1"
+
 # ---------------------------------------------------------------------------
 # Results container
 # ---------------------------------------------------------------------------
@@ -357,6 +359,7 @@ def persist_w0_and_head(
     *,
     tensors_filename: str,
     head_resolver,
+    iteration_head=None,
     config,
     meta,
     mesh_xy,
@@ -399,6 +402,13 @@ def persist_w0_and_head(
     stamp that grid onto the file"; this flag says "the array in my hand
     was sampled at {0} and I am telling you so".  A caller that cannot
     make that statement still gets the refusal.
+
+    ``iteration_head`` is the QSGW map's resolved head sample set.  When it is
+    present it is the sole source of the persisted head scalars; the DFT-basis
+    ``head_resolver`` remains the bit-identical one-shot/default route.  A
+    self-consistent metal may not fall back to that default, and an iteration
+    sample without ``S_cart`` may not be written: doing either would let the
+    BSE rebuild a DFT tensor from ``dipole.h5`` beside a QSGW head scalar.
     """
     if not config.do_screened:
         return
@@ -406,6 +416,30 @@ def persist_w0_and_head(
         return
     if not os.path.exists(tensors_filename):
         return
+    is_sc_metal = (
+        getattr(config, "qp_solver", None) is not None
+        and getattr(config.qp_solver, "value", config.qp_solver)
+        == "self_consistent"
+        and str(getattr(getattr(config, "mpa", None), "material_class",
+                        "insulator")) == "metal"
+    )
+    if is_sc_metal and iteration_head is None:
+        raise ValueError(
+            "GATE persist_sc_metal_requires_iteration_head: refusing to "
+            "persist a self-consistent metal with the DFT-basis head_resolver. "
+            "Pass the QSGW map's iteration_head samples.")
+    head_static = None
+    if iteration_head is not None:
+        head_static = iteration_head.at(0.0 + 0.0j)
+        if head_static.S_cart is None:
+            raise ValueError(
+                "GATE persist_iteration_head_requires_s_cart: the QSGW "
+                "iteration's static head sample carries S_cart=None "
+                f"(source={head_static.source!r}). Refusing before writing "
+                "W0/head data: a BSE reload would otherwise rebuild a DFT "
+                "S tensor from dipole.h5 and report a false-green provenance "
+                "ratio.")
+    head_source = iteration_head if iteration_head is not None else head_resolver
     from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
     # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
     # created by ``write_restart_state_to_h5(init_W0=True)`` is
@@ -442,8 +476,9 @@ def persist_w0_and_head(
                              qirr=_qirr.with_capture(
                                  take_pre_unfold("W0_qmunu")))
     _stamp_screening_diagrams(tensors_filename, config)
-    with _tmg.section("persist_w0.head_static"):
-        head_static = head_resolver.at(0.0 + 0.0j)
+    if head_static is None:
+        with _tmg.section("persist_w0.head_static"):
+            head_static = head_source.at(0.0 + 0.0j)
     # THE STORED ω GRID IS THE PROBE SET, so it is the POLE MODEL that
     # decides it, not "is this run dynamic".  The two questions agreed for
     # as long as every dynamic mode was a two-point plasmon-pole fit; MPA
@@ -467,7 +502,7 @@ def persist_w0_and_head(
             omega_imp = 1j * float(config.ppm.omega_p)
             _omega_grid_entry = float(omega_imp.imag)
         with _tmg.section("persist_w0.head_imag"):
-            head_imag = head_resolver.at(omega_imp)
+            head_imag = head_source.at(omega_imp)
         whead_arr = np.array(
             [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
         omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
