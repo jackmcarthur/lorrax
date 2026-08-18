@@ -53,15 +53,11 @@ from .gw_config import (
 # at all, so a healthy run was indistinguishable from a hang (paid for
 # three times: AC.2, AF.4c, the 2.5 h silent c2406 screening stage).
 #
-# The cadence is now the UNIFIED timing infrastructure: every phase below
-# is a ``timing.section(..., announce=True, label=...)``, which prints a
-# timestamped enter line (so the last line on screen names what the run
-# is inside) and an exit line with the wall time — same formatter, same
-# rank-0 gate as ``LORRAX_TIMING_TRACE``, and the same node names in the
-# end-of-run stage table as before.  ``LoopProgress`` supplies the
-# bar/ETA cadence over the W roles themselves, in the same format as the
-# ζ chunk loop and the Σ τ sweep.  Print-only: no array is touched and
-# every phase body is unchanged.
+# The cadence uses the unified timing infrastructure. Potentially long
+# compile/build/solve phases announce entry and exit; cheap slices, unfolds
+# and gates are measured in the final tree without printing two lines on every
+# self-consistency iteration. ``LoopProgress`` supplies cadence over the W
+# roles themselves. Print-only: no array is touched.
 
 
 # ---------------------------------------------------------------------------
@@ -374,10 +370,7 @@ def compute_static_w(
                 _services.ensure_on_path()
                 from symmetry_maps import slice_q_full_to_ibz
                 _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-                with timing.section(
-                        "W.slice_to_ibz", announce=True,
-                        label=f"{_w} IBZ slice "
-                              f"({int(meta.nk_tot)} q -> {nq_solve} q)"):
+                with timing.section("W.slice_to_ibz"):
                     V_q_solve = slice_q_full_to_ibz(
                         V_q, sym.q_irr_full_idx, out_sharding=_nat)
                     chi0_q_solve = slice_q_full_to_ibz(
@@ -465,10 +458,7 @@ def compute_static_w(
                 from ffi import _services
                 _services.ensure_on_path()
                 from symmetry_maps import unfold_isdf_operator
-                with timing.section(
-                        "W.unfold_to_full_bz", announce=True,
-                        label=f"{_w} IBZ -> full-BZ unfold "
-                              f"({nq_solve} q -> {int(meta.nk_tot)} q)"):
+                with timing.section("W.unfold_to_full_bz"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
                     from .qgrid_symmetry import (
@@ -626,9 +616,8 @@ def compute_screening(
                 "  probe chi0 reuse (ppm_probe_chi_reuse=auto): no single "
                 "imag-axis probe request (HL/real-axis probes always take "
                 "the dedicated path) — reuse inactive.")
-    # Bar/ETA cadence over the W roles; every phase inside announces
-    # itself via ``timing.section(..., announce=True)`` (see the stage
-    # cadence note at the top of this module).
+    # Bar/ETA cadence over the W roles; long phases inside also announce via
+    # ``timing.section(..., announce=True)`` (see the note at module top).
     bar = LoopProgress(
         len(requests), print_fn,
         title="screening (chi0 -> W)", item_name="W role").start()
@@ -654,8 +643,7 @@ def compute_screening(
                     gamma_chi_override=(
                         iteration_head_response.static_chi_body_gamma
                         if iteration_head_response is not None else None))
-            with timing.section("W.gate", announce=True,
-                                label=f"{_w} finiteness + hermiticity gate"):
+            with timing.section("W.gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
                         kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W_static
@@ -682,8 +670,7 @@ def compute_screening(
                 chi0_override=chi0_probe_reused,
                 head_channel=head_channel)
             chi0_probe_reused = None   # donated into solve_w — dead ref
-            with timing.section("W.gate", announce=True,
-                                label=f"{_w} finiteness + hermiticity gate"):
+            with timing.section("W.gate"):
                 _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
             W_by_role[req.role] = W
             bar.step()
@@ -715,8 +702,7 @@ def compute_screening(
             config=config, meta=meta, mesh_xy=mesh_xy,
             role=req.role, force_full_bz=True, section="chi0_W_probe",
             head_channel=head_channel)
-        with timing.section("W.gate", announce=True,
-                            label=f"{_w} finiteness + hermiticity gate"):
+        with timing.section("W.gate"):
             _gate_w(W, req, print_fn=print_fn)
         W_by_role[req.role] = W
         bar.step()
