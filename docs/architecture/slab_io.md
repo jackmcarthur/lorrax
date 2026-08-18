@@ -329,6 +329,7 @@ logical shapes**. A caller does *not*:
 | whether the MPI world matches the JAX world | asserted at the first collective open, unconditionally ([Failure modes](#failures)) |
 | the mesh-divisible extent | omit `shape` and `read_slab` rounds up for you (below) |
 | whether the deployment can do parallel I/O | `assert_available()` runs at open and refuses naming the probe |
+| an HDF5 chunk layout | SlabIO's native collective create is contiguous and exposes no no-op `chunks=` argument; use a format-specific serial writer only where chunking is load-bearing |
 
 **Padding is SlabIO's business, not the caller's** (decisions.md
 2026-08-04):

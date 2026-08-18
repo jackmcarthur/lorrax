@@ -39,7 +39,7 @@ from typing import Any, Callable
 # main() even ran, even with tracing disabled — an observability knob
 # must never take down the run it observes (QUALITY_PATTERNS #8; audit
 # 2026-07-28).  Use-time reads also match the rest of LORRAX's env
-# flags (cf. ``_slab_io_mpi_host._env_flag``): tests/drivers that set
+# flags (cf. ``file_io._slab_io_ffi._env_flag``): tests/drivers that set
 # the env after import see the new value.
 _TRACE_TRUE = ("1", "true", "yes", "on")
 _TRACE_RANK0: bool | None = None

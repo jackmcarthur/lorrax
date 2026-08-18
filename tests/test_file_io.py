@@ -788,7 +788,6 @@ from file_io._slab_io_ffi import (
     _normalize_slab_request,
     _normalize_valid_shape,
     _validate_block_divisible,
-    _warn_ignored_chunks,
 )
 from file_io.slab_io import SlabIO, probe_availability
 
@@ -1424,11 +1423,7 @@ def test_slabio_create_dataset_does_not_warn_about_attrs(
         tmp_path, single_device_mesh):
     """The discard's ghost.  A warning here means the drop came back.
 
-    ``chunks`` is deliberately NOT passed: that one still warns, because
-    HDF5 fixes layout at create time and no later write can change it,
-    and a hint that is silently dropped is the next instance of this
-    same defect.  ``attrs`` is data and must be neither dropped nor
-    warned about.
+    ``attrs`` is data and must be neither dropped nor warned about.
     """
     _require_slabio()
     import warnings
@@ -1449,54 +1444,3 @@ def test_slabio_create_dataset_does_not_warn_about_attrs(
         f"create_dataset(attrs=) warned: {about_attrs}.  A transport that "
         f"drops the caller's data with a warning is the defect; the attrs "
         f"are written now and there is nothing to warn about")
-
-
-def test_slabio_says_chunks_are_dropped_once_per_file(
-        tmp_path, single_device_mesh):
-    """The other half of the same rule: say it, and say it once.
-
-    ``chunks`` genuinely cannot be honoured — HDF5 fixes layout at
-    H5Dcreate and the collective create takes no chunk dims — so unlike
-    ``attrs`` it stays a hint, and a hint that is dropped silently is
-    the next instance of this defect.  But ``sigma_output`` passes it on
-    all four of its datasets, and four copies in the middle of the write
-    telemetry is how a warning stops being read, which is how the attrs
-    discard survived four days of runs.  So: once per file, naming the
-    file, and covering the rest of it.
-    """
-    _require_slabio()
-    import warnings
-
-    path = tmp_path / "chunky.h5"
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with SlabIO(str(path), mode="w", mesh=single_device_mesh) as io:
-            io.create_dataset("A", shape=(3, 3), dtype=np.float64,
-                              chunks=(1, 3))
-            io.create_dataset("B", shape=(3, 3), dtype=np.float64,
-                              chunks=(1, 3))
-            io.create_dataset("C", shape=(3, 3), dtype=np.float64)
-            io.write_slab("A", np.ones((3, 3), dtype=np.float64))
-    about_chunks = [str(w.message) for w in caught
-                    if "chunks" in str(w.message)]
-    assert len(about_chunks) == 1, (
-        f"expected exactly one chunks warning for this file, got "
-        f"{len(about_chunks)}: {about_chunks}")
-    assert "chunky.h5" in about_chunks[0], (
-        "the warning does not name the file it is about, so a caller "
-        "writing several files cannot tell which one is contiguous")
-
-
-def test_slabio_chunks_warning_is_rank0_only(monkeypatch):
-    """A replicated layout fact must not produce one warning per rank."""
-    import warnings
-    import file_io._slab_io_ffi as slab_ffi
-
-    monkeypatch.setattr(slab_ffi, "_rank0", lambda: False)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        _warn_ignored_chunks(path="sigma_mnk.h5", name="sigma_total_kij_ev",
-                             chunks=(1, 2, 3))
-    assert not caught, (
-        "a nonzero rank repeated the rank-0 chunks warning: "
-        f"{[str(w.message) for w in caught]}")

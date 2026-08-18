@@ -544,7 +544,7 @@ The ROMIO `cb_*`/`ds_*` rows were FORCED defaults (`enable`/`disable`/
 On Frontera/Intel-MPI forcing `romio_cb_write=enable` measured *slower*
 than ROMIO's automatic policy under collective transfers (scorecard AI),
 so all four are now pure pass-throughs, matching the Python
-`_slab_io_mpi_host` writer.  Rule of thumb: bump `STRIPE_COUNT` to 32-64
+SlabIO native writer. Rule of thumb: bump `STRIPE_COUNT` to 32-64
 for writes > 10 GB. If the enclosing directory has an explicit
 `lfs setstripe` layout, the `striping_*` hints are no-ops (directory
 wins), and an EXISTING file keeps its inode's layout (mode='w' unlinks

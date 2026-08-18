@@ -2051,7 +2051,6 @@ def load_centroids_band_chunked(
     band_chunk_size: int = 64,
     k_chunk_size: int | None = None,
     *,
-    use_phdf5: bool = False,
     psi_G_flat: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """
@@ -2092,7 +2091,6 @@ def load_centroids_band_chunked(
     ``('x', 'y')`` = 16; SlabIO's auto-pad on the on-disk dataset
     closes that gap (see ``file_io.slab_io.create_dataset``).
     """
-    del use_phdf5  # WfnLoader's backend='auto' picks phdf5 when it's safe
     del sym        # WfnLoader builds its own SymMaps lazily
     from common import timing
     from runtime.padding import padded_mu_extent
@@ -2269,9 +2267,8 @@ def load_centroids_band_chunked(
         psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
         return psi_rmu, psi_rmuT
 
-    # Attribution barrier: on the PHDF5_HOST / process-local loader routes
-    # NOTHING above this line synchronizes the processes (independent
-    # h5py reads, local FFTs), so the first collective inside
+    # Attribution barrier: the process-local WfnLoader work above this line
+    # does not synchronize processes, so the first collective inside
     # ``_reshard_all`` absorbs ALL process skew accumulated since launch
     # (cold-start import/startup skew).  Measured: the identical
     # 606c/P=80 cell pair in job 7876541 recorded reshard = 92.6 s on

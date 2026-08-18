@@ -92,7 +92,7 @@ _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 # ``export LORRAX_MALLOC_TUNE=`` DISABLE a default-on knob while every other
 # live vocabulary in the tree — ``ffi/gate.py`` ("unset or whitespace
 # always maps to the gate's declared default"),
-# ``file_io._slab_io_mpi_host._env_flag`` and ``gw.gw_config.env_bool``
+# ``file_io._slab_io_ffi._env_flag`` and ``gw.gw_config.env_bool``
 # (which ``isdf.core`` imports since P1.3) —
 # reads blank as UNSET and returns the knob's default.  A blank export is
 # what a shell leaves behind for an unset variable expansion

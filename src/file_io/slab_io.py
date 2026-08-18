@@ -237,10 +237,9 @@ class SlabIO:
         *,
         shape: Sequence[int],
         dtype,
-        chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
     ) -> None:
-        """Pre-create a dataset with the given LOGICAL shape + dtype + chunks.
+        """Pre-create a dataset with the given LOGICAL shape and dtype.
 
         COLLECTIVE over the constructor's mesh: every rank calls it, in
         the same order, with the same ``name`` and ``shape``.  It drains
@@ -267,16 +266,15 @@ class SlabIO:
         wedge Σ cube lost its ``k_storage`` stamp and read back as
         full-BZ; see ``_slab_io_ffi._apply_dataset_attrs``.
 
-        ``chunks`` is a HINT and says so — once per file — when it
-        cannot be honoured: HDF5 fixes layout at create time and the
-        collective create takes no chunk dims, so a dataset this
-        transport creates is contiguous.
+        Datasets created by this transport are contiguous.  The native
+        collective create has no chunk-layout argument, so SlabIO does not
+        expose a no-op ``chunks=`` compatibility parameter.
         """
         with _journal.op_scope("create", self.path, stack=_STACK, ds=name,
                                cnt=tuple(int(s) for s in shape),
                                mode=self.mode, handle=self._handle()):
             self._backend.create_dataset(
-                name, shape=shape, dtype=dtype, chunks=chunks, attrs=attrs)
+                name, shape=shape, dtype=dtype, attrs=attrs)
 
     def write_attr(self, name: str, value) -> None:
         """QUEUE a small replicated dataset (e.g. ``omega_ev``) for close.
@@ -347,7 +345,6 @@ class SlabIO:
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
-        chunks: Sequence[int] | None = None,
     ) -> None:
         """Write A as a hyperslab of dataset ``name``.
 
@@ -385,7 +382,7 @@ class SlabIO:
                 name, A,
                 offset=offset, global_shape=global_shape,
                 valid_shape=valid_shape,
-                dtype=dtype, chunks=chunks,
+                dtype=dtype,
             )
 
     # ------------------------------------------------------------------

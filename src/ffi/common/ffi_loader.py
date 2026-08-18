@@ -1041,9 +1041,9 @@ def library_provenance(platform: str) -> str:
 def loaded_lib_path(platform: str) -> Optional[str]:
     """The .so path loaded for ``platform``, or None if none is loaded yet.
 
-    Pure lookup — never loads.  Exists for callers that need the file path
-    of an ALREADY-probed library (the ``slab_io=auto`` router hands it to a
-    subprocess MPI-bootstrap probe) without repeating the load side effects.
+    Pure lookup — never loads. Exists for callers that need the file path of
+    an already-probed library for the subprocess MPI-bootstrap probe without
+    repeating the load side effects.
     """
     return _LIB_PATHS.get(platform)
 

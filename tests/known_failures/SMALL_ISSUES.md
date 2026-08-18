@@ -216,18 +216,16 @@ silent overwrite.
     (`DOWNFOLD_DEFAULTS`) and is outside `_DEFAULTS` entirely.
     [compute-mode worker 2026-08-09; ASIDES_AUDIT.md §A6; docs lane
     2026-08-10]
-18. **`chunks=` is silently dropped on every SlabIO write** — so no file
-    this transport creates is chunked, including all four `sigma_mnk.h5`
-    datasets and the `zeta_q_G` store. The tree is honest about the
-    mechanism (`src/file_io/_slab_io_ffi.py:1752` and `:1860` both say
-    `chunks=` cannot be honoured by this transport at all, and the warning
-    is emitted once per file on rank 0) but the **consequence**
-    is recorded nowhere a reader looking for open issues would find it,
-    which is what this row fixes. Honouring it needs chunk dims plumbed
-    through `lrx_phdf5_ensure_dataset`, which takes only name/shape/dtype
-    today — a real but bounded FFI-signature change, and one to **sequence
-    with the FFI build-contract gates** rather than do casually.
-    [SlabIO-attrs worker 2026-08-09; ASIDES_AUDIT.md §A8]
+18. **RESOLVED 2026-08-18: `chunks=` was silently dropped by SlabIO.**
+    The two live callers that requested a chunk layout (`sigma_mnk.h5` and
+    `zeta_q_G`) now state only the layout the transport actually creates,
+    and the no-op `chunks=` arguments were deleted from SlabIO itself.
+    Collective files are explicitly contiguous. The serial downfold writer
+    retains its real h5py chunk layout because it writes and reads one q
+    slab at a time. Adding chunked collective output remains a future
+    on-disk-format change requiring chunk dims in
+    `lrx_phdf5_ensure_dataset`; it is no longer implied by a Python hint.
+    [SlabIO-attrs worker 2026-08-09; cleanup 2026-08-18]
 19. **Read the `Plan.batched` bit-identity gate and record what it actually
     asserts** — this is the cheap half of a two-part item. `FIX_bsesetup.md`
     O1 measured `Plan.batched` on `ROUTE_SCAN` over cuSOLVERMp diverging

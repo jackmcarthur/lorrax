@@ -1,10 +1,24 @@
-# Upgrade notes — origin/main → current HEAD (2026-08-01)
+# Upgrade notes
 
-What a user continuing from origin/main hits on this branch
-(`fix/zq-band-gather-device-invariance`, a fast-forward of ~210 commits).
-Every claim below is verified against the code at HEAD, not against memory.
-Grouped: what breaks, what warns, what changed silently-but-safely.
-Binding rulings behind the breaking changes: `docs/architecture/decisions.md`.
+User-visible changes, newest first. Binding rulings behind the breaking
+changes live in `docs/architecture/decisions.md`.
+
+## 2026-08-18 — retired HDF5 controls now refuse or are absent
+
+- GW decks containing `slab_io` or `use_ffi_io` now refuse with a targeted
+  removal message. Remove either line; SlabIO has one collective transport.
+- kmeans no longer accepts `--use-phdf5`; `WfnLoader` selects its one valid
+  scalable read path from runtime capability.
+- SlabIO no longer accepts `chunks=`. The argument was ignored and every
+  collective dataset was already contiguous. The sigma and zeta writers no
+  longer request a layout the native create cannot produce.
+- `LORRAX_PHDF5_CLOSE_VERBOSE` defaults to compact logging: empty/fast closes
+  are quiet, while queued or slow I/O still emits one summary. Set it to `1`
+  for the former per-phase diagnostics or `0` for silence.
+
+## Changes through 2026-08-01
+
+The remaining entries describe the earlier origin/main-to-HEAD upgrade.
 
 ## What breaks (refusals and hard errors)
 
@@ -75,13 +89,6 @@ silently. Consequence for removed keys:
 - `isdf_memory_mode` (auto | high_mem | low_mem) was removed with the W
   cleanup — warn-and-ignore. The W Dyson solve is selected by
   `w_dyson_solver = local | distributed`.
-
-**`use_ffi_io` is deprecated** (tri-state, default now unset; origin/main
-default was `true`). It still works: explicit `false` forces the
-`h5py_allgather` writer, `true` states a phdf5 preference, and `slab_io`
-takes precedence when both are set — each case prints one deprecation
-notice. Remove it from decks; the replacement is
-`slab_io = auto | phdf5_ffi | phdf5_host | h5py_allgather`.
 
 **Env-twin deprecations**: `LORRAX_ZETA_RCOND` / `LORRAX_ZETA_RIDGE` and the
 `LORRAX_SC_*` family still win over the deck keys when non-empty, printing a

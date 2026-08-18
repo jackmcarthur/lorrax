@@ -1579,26 +1579,18 @@ post-partition spread, (3) then decide about promoting the mask.
 
 ### `tools/gen_input_reference.py` REFUSES to run, so `docs/input_reference.md` is hand-maintained
 
-MEASURED 2026-08-15, incidental to the `sc_on_ibz` default flip. The generator
-raises `SystemExit` on any key drift against `gw_config._DEFAULTS` and writes
-nothing, so the doc it owns cannot be regenerated:
+REPRODUCED 2026-08-18. The stale selector entries were removed from the
+generator, but generation still stops before its key-drift check because
+`band_extrapolation_estimator` has a non-literal `_DEFAULTS` expression that
+the AST evaluator cannot resolve. It writes nothing and reports:
 
-    gen_input_reference: key drift vs gw_config._DEFAULTS
-      missing one-liners for: ['mc_average_placement',
-        'mc_average_placement_vcoul', 'mpa_material_class', 'mpa_n_poles',
-        'mpa_pole_batch_size', 'mpa_sampling_alpha',
-        'mpa_sigma_crossing_target_error', 'mpa_sigma_max_nodes',
-        'mpa_sigma_sector_target_error', 'mpa_varpi_far_ry',
-        'mpa_varpi_near_ry', 'restart_q_storage', 'sc_eigh',
-        'write_restart_tensors']
-      stale entries for removed keys: ['slab_io', 'use_ffi_io']
+    gen_input_reference: cannot evaluate the default for
+    'band_extrapolation_estimator'
 
-Pre-existing — none of those 16 keys is touched by this branch. The refusal is
-the right design (a doc that silently drops a key is worse than one that
-refuses), but the consequence is that **`docs/input_reference.md` has been
-edited by hand for as long as the drift has existed**, and nothing says so.
-The `sc_on_ibz` row was updated in BOTH places (`KEYS` in the generator and
-the rendered table) so the two agree whenever someone clears the drift.
+The refusal is safer than silently generating a false default, but the current
+consequence is that `docs/input_reference.md` remains hand-maintained. The
+sandbox defect register owns the exact current file:line; fixing the generator
+is outside this HDF5 cleanup.
 
 ### THREE frozen references were stale from the moment the writers moved to the wedge
 

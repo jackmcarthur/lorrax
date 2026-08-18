@@ -57,32 +57,6 @@ def _rank0() -> bool:
     return jax.process_index() == 0
 
 
-def _warn_ignored_chunks(*, path: str, name: str,
-                         chunks: Sequence[int]) -> None:
-    """Warn once globally that the collective create ignores ``chunks``.
-
-    Every process owns an :class:`_FfiBackend`, so the backend-local
-    ``_chunks_warned`` flag alone means once *per process*.  Log the
-    replicated fact on rank 0 only; the caller still gets the warning,
-    while a P-rank run no longer buries it under P identical copies.
-    """
-    if not _rank0():
-        return
-    import warnings
-
-    want = tuple(int(c) for c in chunks)
-    warnings.warn(
-        f"SlabIO FFI transport: chunks={want} on "
-        f"create_dataset({name!r}) is not honoured, here or for any "
-        f"later dataset in {os.path.basename(path)} — HDF5 "
-        f"fixes layout at create time and the collective create "
-        f"takes no chunk dims, so the datasets are contiguous with "
-        f"the FAPL-level alignment set at ctx init.  Pre-create "
-        f"with h5py if the layout is load-bearing.",
-        stacklevel=4,
-    )
-
-
 # ``_barrier`` is ``common.collectives.barrier``.  It used to be a local
 # copy whose whole body was ``try: sync_global_devices(tag); except
 # Exception: pass`` — seven lines below an import of the very module that
@@ -162,12 +136,9 @@ _STRIPE_UNIT_MAX = 4 << 20
 
 #: The boolean env grammar, ONE copy.  Mirrors the C++ writer's
 #: ``env_flag`` (``ffi/cpp/phdf5/context.cc``) so the Python and C++ halves
-#: of the phdf5 writer stay one grammar.  Inherited from the deleted
-#: ``_slab_io_mpi_host`` (which carried it for the same reason, when there
-#: were two Python writers); this file already spelled the same tuple
-#: inline three times, so the move consolidated rather than relocated.
-#: Kept local rather than taken from ``gw.gw_config``: that would be an
-#: uphill L3 -> L1 import, which is exactly what this change deleted.
+#: of the phdf5 writer stay one grammar. This file once spelled the same
+#: tuple inline three times; keeping one local copy avoids an uphill
+#: L3 -> L1 import.
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
 
@@ -178,6 +149,20 @@ def _env_flag(name: str, default: bool) -> bool:
     if v is None or not v.strip():
         return default
     return v.strip().lower() in _TRUE
+
+
+def _close_log_level() -> int:
+    """Return 0=quiet, 1=compact (default), or 2=explicit verbose.
+
+    Close progress remains visible when a queued collective can genuinely
+    take time, but empty/read-only closes no longer contribute four zero-time
+    lines to every GW log.  The historical boolean override stays compatible:
+    false spellings are quiet and any true spelling requests the old detail.
+    """
+    value = os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE")
+    if value is None or not value.strip():
+        return 1
+    return 0 if value.strip().lower() in _FALSE else 2
 
 
 def _stripe_policy(nranks: int) -> tuple[int, int]:
@@ -384,9 +369,8 @@ def file_stripe_layout(path: str) -> tuple[int, int] | None:
 def _replace_inode_for_write(path: str) -> None:
     """Rank-0 unlink + barrier so ``mode='w'`` REPLACES the file's inode.
 
-    Called by BOTH PHDF5 writers (:class:`_FfiBackend` and
-    ``_slab_io_mpi_host._MpiHostBackend``) before any rank opens the
-    file, UNCONDITIONALLY of ``lfs`` availability.  Rationale: a Lustre
+    Called by the one PHDF5 writer before any rank opens the file,
+    UNCONDITIONALLY of ``lfs`` availability. Rationale: a Lustre
     stripe layout is a property of the INODE, fixed at create time —
     ``lfs setstripe``, MPI-IO's ``striping_factor`` hint and
     ``H5Fcreate(H5F_ACC_TRUNC)`` are all no-ops against an existing
@@ -1749,10 +1733,6 @@ class _FfiBackend(_DatasetGeometry):
         # write is metadata on a file MPI-IO still holds open.  See
         # :func:`_apply_dataset_attrs`.
         self._deferred_ds_attrs: list[tuple[str, dict]] = []
-        # ``chunks=`` cannot be honoured by this transport at all and
-        # says so — once per file on rank 0, not once per dataset/rank.  See
-        # :meth:`create_dataset`.
-        self._chunks_warned: bool = False
         # Python-level async writer.  ``write_slab`` enqueues a callable
         # here; the ``AsyncDispatcher`` worker pops it and calls
         # ``jax.jit(shard_map(_per_rank))(A).block_until_ready()``.
@@ -1808,7 +1788,6 @@ class _FfiBackend(_DatasetGeometry):
         *,
         shape: Sequence[int],
         dtype,
-        chunks: Sequence[int] | None = None,
         attrs: dict | None = None,
     ) -> None:
         # ``phdf5_ensure_dataset`` is a collective HDF5 op (H5Dcreate)
@@ -1828,8 +1807,9 @@ class _FfiBackend(_DatasetGeometry):
         _t0 = _time.perf_counter()
         _flushed = self._drain_pending()
         _dt = _time.perf_counter() - _t0
+        _log_level = _close_log_level()
         if (_flushed and jax.process_index() == 0
-                and os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE", "1") != "0"):
+                and (_log_level >= 2 or _dt >= 1.0 or _flushed >= 1_000_000_000)):
             print(f"  [SlabIO.flush] {os.path.basename(self.path)}: "
                   f"{_flushed / 1e9:.2f} GB written in {_dt:.1f} s "
                   f"({_flushed / 1e6 / max(_dt, 1e-9):.0f} MB/s) before "
@@ -1857,25 +1837,6 @@ class _FfiBackend(_DatasetGeometry):
         # theirs to mutate between here and close().
         if attrs:
             self._deferred_ds_attrs.append((name, dict(attrs)))
-        # ``chunks``, by contrast, genuinely cannot be honoured after the
-        # fact by anyone: HDF5 fixes a dataset's layout at H5Dcreate, and
-        # neither ``lrx_phdf5_ensure_dataset`` (which takes name, shape
-        # and dtype, and nothing else) nor a later h5py reopen can change
-        # it.  So this stays a hint and stays said — it is the caller's
-        # only signal that the file will be contiguous, and dropping the
-        # signal as well as the layout is how the attrs defect happened.
-        # Honouring it means a chunk-dims argument on the C entry point,
-        # not a change here.
-        #
-        # ONCE PER FILE ON RANK 0, though.  ``sigma_output`` passes chunks
-        # on all four of its datasets and every production Σ write was
-        # emitting four copies per rank into the middle of the telemetry,
-        # which is how a warning stops being read — the same reason the
-        # discard this replaces was invisible for four days.
-        if chunks is not None and not self._chunks_warned:
-            self._chunks_warned = True
-            _warn_ignored_chunks(path=self.path, name=name, chunks=chunks)
-
     # ------------------------------------------------------------------
     def write_attr(self, name: str, value) -> None:
         # Deferred to close() to avoid interleaving rank-0 h5py with
@@ -1982,7 +1943,6 @@ class _FfiBackend(_DatasetGeometry):
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
-        chunks: Sequence[int] | None = None,
     ) -> None:
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
@@ -2306,10 +2266,10 @@ class _FfiBackend(_DatasetGeometry):
         # look like a hang.
         import time as _time
         _rank0 = (jax.process_index() == 0)
-        _verbose = _rank0 and bool(
-            os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE", "1") != "0")
+        _log_level = _close_log_level() if _rank0 else 0
+        _verbose = _log_level >= 2
         _pending = self._dispatcher.pending
-        if _verbose:
+        if _log_level and _pending:
             print(f"  [SlabIO.close] draining {_pending} pending writes "
                   f"for {os.path.basename(self.path)} …", flush=True)
         # ── A rank must not skip a collective because of its OWN error ──
@@ -2369,6 +2329,8 @@ class _FfiBackend(_DatasetGeometry):
             if _verbose:
                 print(f"  [SlabIO.close] H5Fclose returned in "
                       f"{_t_close:.1f} s", flush=True)
+        else:
+            _t_close = 0.0
         # RELEASE THE FFI CLAIM HERE, between H5Fclose and the rank-0
         # h5py reopen below — not at the end of the method.  The reopen
         # is the OTHER HDF5 library instance touching this same path, and
@@ -2431,5 +2393,12 @@ class _FfiBackend(_DatasetGeometry):
         _barrier("slab_io_ffi_close_attrs")
         self._deferred_attrs = []
         self._deferred_ds_attrs = []
+        _t_total = _t_drain + _t_join + _t_close
+        if (_log_level == 1
+                and (_pending or _drained_bytes or _t_total >= 1.0)):
+            _moved = f", {_drained_bytes / 1e9:.2f} GB" if _drained_bytes else ""
+            print(f"  [SlabIO.close] {os.path.basename(self.path)}: "
+                  f"{_pending} queued write{'s' if _pending != 1 else ''}{_moved}, "
+                  f"drain+join+H5Fclose {_t_total:.1f} s", flush=True)
         if _worker_error is not None:
             raise _worker_error

@@ -1950,15 +1950,10 @@ _LEGACY_DECK_KEYS = frozenset({
     "chunk_size",                   # warn-and-ignore (planner-owned)
     "output_file",                  # warn-and-ignore (sigma_diag_file)
     "eqp_output_file",              # warn-and-ignore (auto eqp0/eqp1)
-    # 2026-08-06: the sharded-slab transport is no longer selectable from
-    # a deck.  There was one correct value and three wrong ones, two of
-    # which named tiers that have been deleted; a key whose only legal
-    # setting is the default is not configuration.  Both are
-    # warn-and-ignore rather than refuse: they never changed a NUMBER,
-    # only which library moved the bytes, so an old deck should keep
-    # running and say what it lost.  See file_io/slab_io.py.
-    "slab_io",                      # warn-and-ignore (one transport now)
-    "use_ffi_io",                   # warn-and-ignore (deprecated 2026-07-27)
+    # Removed transport selectors.  Keep only these parse-time tombstones so
+    # an old deck cannot silently appear to select a deleted HDF5 path.
+    "slab_io",                      # refused (one transport now)
+    "use_ffi_io",                   # refused (one transport now)
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
@@ -2548,27 +2543,18 @@ def read_lorrax_input(filename: str) -> dict:
                     "IGNORED — the LORRAX-native eqp0 filename is now "
                     "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
                     "automatically"))
-        # ``slab_io`` / ``use_ffi_io`` had no branch at all: named in
-        # ``_LEGACY_DECK_KEYS`` (so skipped by the unknown-key check) and
-        # then handled nowhere, which is the silent case in its purest
-        # form.  There is one sharded-slab transport and the deck does not
-        # select it; see file_io/slab_io.py.
+        # There is one sharded-slab transport and the deck does not select
+        # it.  Refuse the deleted selectors by name: accepting and ignoring
+        # them made stale decks look as though their requested HDF5 route was
+        # still active.  The tombstones stay in ``_LEGACY_DECK_KEYS`` only so
+        # strict unknown-key handling does not mask this specific message.
         for legacy_key in ("slab_io", "use_ffi_io"):
             if section.get(legacy_key, fallback=None) is not None:
-                import warnings
-                warnings.warn(
+                raise ValueError(
                     f"Input key '{legacy_key}' is no longer supported and "
-                    f"will be ignored: there is one sharded-slab transport "
-                    f"and the deck does not select it.  It never changed a "
-                    f"number, only which library moved the bytes.  Remove "
-                    f"'{legacy_key}' from your input file.",
-                    DeprecationWarning, stacklevel=2,
+                    f"must be removed: there is one sharded-slab transport "
+                    f"and the deck does not select an HDF5 implementation."
                 )
-                retired.append((
-                    legacy_key,
-                    "IGNORED — one sharded-slab transport, not deck-selectable "
-                    "(it never changed a number, only which library moved "
-                    "the bytes)"))
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
         # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
@@ -2686,8 +2672,7 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = default
             elif key in _NULLABLE_BOOL:
                 # Tri-state boolean (default None = unset); an explicit
-                # value parses as bool.  Currently EMPTY — the last member
-                # (``use_ffi_io``) became a legacy key on 2026-08-06.
+                # value parses as bool.
                 params[key] = section.getboolean(key)
             elif key in _NULLABLE_INT:
                 params[key] = section.getint(key)

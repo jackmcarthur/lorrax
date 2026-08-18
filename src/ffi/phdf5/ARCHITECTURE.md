@@ -31,19 +31,11 @@ the host build the write side of (3) is *nothing at all*: XLA's CPU
 buffer already IS host memory, so `H5Dwrite` reads the local shard in
 place, with no pinned allocation, no copy and no event.
 
-`src/file_io/_slab_io_mpi_host.py` (mpi4py + h5py-parallel) remains as the
-**second** CPU tier, for a deployed host lib built before the write port;
-it needs an extra Python environment that the FFI does not.  All three
-writers produce byte-identical output.  Selection is automatic in
-`LorraxConfig.from_input_file` → `_route_cpu_slab_io`, which
-capability-probes the lib rather than guessing from the platform.
-
-The mpi4py path is synchronous (no Python worker thread) because there's
-no D2H to overlap and Cray MPICH's default `MPI_THREAD_SINGLE` deadlocks
-on cross-thread MPI-IO at `H5Fclose`; see its module docstring.  The FFI
-path keeps its writer thread on both platforms — one thread per ctx is
-what guarantees every rank enters the MPI-IO collectives in the same
-order.
+The former mpi4py + parallel-h5py CPU tier was deleted. Both platforms use
+this FFI transport; a missing host write handler is a refusal rather than a
+fallback or a deck-selected route. The writer thread is retained on both
+platforms — one thread per context guarantees that every rank enters the
+MPI-IO collectives in the same order.
 
 ------------------------------------------------------------------------
 

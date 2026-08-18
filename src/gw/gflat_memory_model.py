@@ -289,7 +289,6 @@ def plan_gflat_chunks(
     gflat_chunk_size_override: int | None = None,
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
-    slab_io_replicates: bool = True,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, r_chunk, q_chunk, gflat_chunk_size)`` so the
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
@@ -501,21 +500,18 @@ def plan_gflat_chunks(
            + _c128(mu, ngkmax, shard=p_y))              # ζ resharded on 'y'
 
     # Stage F — the restart-tensor WRITE (isdf_tensors_<n_rmu>.h5).  SlabIO
-    # writes per-rank hyperslabs, so this costs the SHARDED amount
-    # (``slab_io_replicates=False``, which every in-tree caller now passes).
-    # The replicated branch below described the H5PY_ALLGATHER backend,
-    # where each tensor landed UNSHARDED and TWICE (gathered device buffer
-    # + host numpy copy); that backend was deleted 2026-08-06 and the
-    # branch is kept only so an archived plan can still be re-derived.  TWO tensors cross this seam and the
-    # binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and the G-flat ζ
+    # writes per-rank hyperslabs, so this costs the sharded amount. The
+    # deleted h5py allgather branch is not a plan this source can execute and
+    # therefore is not an option in the live model. Two tensors cross this
+    # seam and the binder is the LARGER: V/W0 ``(n_q_ibz, μ, μ)`` and
+    # the G-flat ζ
     # ``(n_q_disk, μ, ngkmax)`` — whenever ngkmax > μ the ζ write wins.
     # Measured: memory-model.md §"Measured corrections behind the G-flat
     # terms" #3 (a 40,594,046,976 B all-gather, matched to the byte).
-    _v_tensor = _c128(n_q_ibz, mu, mu, shard=1 if slab_io_replicates else p_xy)
-    _gflat_tensor = _c128(nq_disk, mu, ngkmax,
-                          shard=1 if slab_io_replicates else p_xy)
+    _v_tensor = _c128(n_q_ibz, mu, mu, shard=p_xy)
+    _gflat_tensor = _c128(nq_disk, mu, ngkmax, shard=p_xy)
     _f_tensor = max(_v_tensor, _gflat_tensor)
-    F_t = 2.0 * _f_tensor if slab_io_replicates else _f_tensor
+    F_t = _f_tensor
 
     peaks = {
         "A_centroid_load": persistent_total + A_t,

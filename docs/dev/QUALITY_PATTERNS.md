@@ -90,8 +90,9 @@ The first production outing of the implied-Vxc guard caught a real
 double-count within hours of merging.
 
 ## 8. The env-coupled-behavior class — environment is capability, not policy
-`slab_io=auto` flips its writer when a package appears in the venv; the central
-conditioning knob (`zeta_rcond`) lived only in an env var; JAX reads platform
+The former `slab_io=auto` flipped its writer when a package appeared in the
+venv (that router is now deleted); the central conditioning knob (`zeta_rcond`)
+lived only in an env var; JAX reads platform
 env at import time (one banner call at module import silently pinned every CLI
 to one process). **Principle: physics- and routing-relevant choices change
 only via declared inputs (the input file); environment may grant capability

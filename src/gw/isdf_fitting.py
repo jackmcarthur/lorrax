@@ -18,8 +18,8 @@ from common.collectives import (
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 
 # Canonical boolean env grammar for this layer (same recognised token set
-# as file_io._slab_io_mpi_host._env_flag — and since P1.3 the one
-# isdf.core imports too — plus an announcement for anything outside it).
+# as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
+# announcement for anything outside it).
 # See gw/gw_config.py's module comment and tests/test_env_grammar.py for
 # the drift gate.
 from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_bool
@@ -864,8 +864,8 @@ def fit_zeta_to_h5(
         # — WFN.h5 ``wfns/coeffs`` style with a fixed ``ngkmax`` padded
         # G axis.  Per-q components live in
         # ``isdf_header/gvec_components`` (already serialised by the
-        # write_isdf_header call above).  Chunking: one row per q ×
-        # full μ × full ngkmax keeps per-q reads contiguous.
+        # write_isdf_header call above).  The row-major axis order keeps one
+        # full q slab contiguous without requesting an HDF5 chunk layout.
         _n_G_sph = (int(_gflat_ngkmax)
                      if _gflat_ngkmax is not None else n_rtot)
         zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
@@ -874,7 +874,6 @@ def fit_zeta_to_h5(
             'zeta_q_G',
             shape=(n_q_disk, n_rmu, _n_G_sph),
             dtype=np.complex128,
-            chunks=(1, n_rmu, _n_G_sph),
         )
 
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========

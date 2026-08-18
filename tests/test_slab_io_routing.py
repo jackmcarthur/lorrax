@@ -14,9 +14,8 @@ than adapted — they pinned the behaviour of code that no longer exists,
 and a test that survives the deletion of its subject is testing something
 else.  What remains, and is still worth pinning:
 
-1. Both retired deck keys are accepted and IGNORED with a warning, not
-   refused: they never changed a number, only which library moved the
-   bytes, so an old deck keeps running and says what it lost.
+1. Both retired deck keys are refused with a targeted removal message, so
+   an old deck cannot pretend it still selects an HDF5 route.
 2. ``LorraxConfig`` no longer carries a transport selector at all.
 3. The MPI launcher/singleton probes, which moved from ``gw.gw_config``
    (L1) down to ``file_io._slab_io_ffi`` (L3) with the availability
@@ -67,17 +66,10 @@ def _config(tmp_path, extra: str = "", name: str = "slab_io.in",
     "use_ffi_io = false",
     "use_ffi_io = true",
 ])
-def test_retired_transport_keys_are_ignored_not_refused(tmp_path, line):
-    """An old deck still parses, whatever it asked for.
-
-    Including ``slab_io = h5py_allgather``, which used to REFUSE above one
-    process.  That refusal was about a tier that could not hold the run's
-    own arrays; with the tier gone there is nothing to refuse -- the key
-    names a choice that no longer exists, which is a stale deck, not a
-    dangerous one.  The run gets the one transport either way.
-    """
-    cfg = _config(tmp_path, line + "\n")
-    assert cfg is not None
+def test_retired_transport_keys_are_refused(tmp_path, line):
+    """An old deck must remove selectors for HDF5 routes that no longer exist."""
+    with pytest.raises(ValueError, match="must be removed"):
+        _config(tmp_path, line + "\n")
 
 
 def test_config_carries_no_transport_selector(tmp_path):
@@ -95,13 +87,14 @@ def test_config_carries_no_transport_selector(tmp_path):
 def test_unknown_key_check_still_sees_real_typos(tmp_path):
     """Retiring a key must not blunt the typo check that guards the rest.
 
-    ``slab_io`` is exempted by name via ``_LEGACY_DECK_KEYS``; a
-    neighbouring misspelling must still be reported.
+    ``slab_io`` has a dedicated refusal via ``_LEGACY_DECK_KEYS``; a
+    neighbouring misspelling must still be reported by the typo check.
     """
     with pytest.raises(ValueError, match="slab_iox"):
         _config(tmp_path, "strict_keys = true\nslab_iox = phdf5_ffi\n")
-    # ...and the exempted spelling still parses under the same strictness.
-    assert _config(tmp_path, "strict_keys = true\nslab_io = phdf5_ffi\n")
+    # ...and the retired spelling keeps its targeted refusal under strictness.
+    with pytest.raises(ValueError, match="must be removed"):
+        _config(tmp_path, "strict_keys = true\nslab_io = phdf5_ffi\n")
 
 
 def test_gw_config_no_longer_defines_the_tier_vocabulary(tmp_path):
@@ -115,12 +108,62 @@ def test_gw_config_no_longer_defines_the_tier_vocabulary(tmp_path):
 
 
 def test_slab_io_module_exposes_one_transport():
-    """file_io.slab_io's public surface: no backend selector anywhere."""
+    """The public surface has neither a route nor an ignored layout knob."""
     import inspect
     from file_io import slab_io
-    params = inspect.signature(slab_io.SlabIO.__init__).parameters
-    assert set(params) == {"self", "path", "mode", "mesh"}, params
+    init_params = inspect.signature(slab_io.SlabIO.__init__).parameters
+    create_params = inspect.signature(slab_io.SlabIO.create_dataset).parameters
+    write_params = inspect.signature(slab_io.SlabIO.write_slab).parameters
+    assert set(init_params) == {"self", "path", "mode", "mesh"}, init_params
+    assert "chunks" not in create_params
+    assert "chunks" not in write_params
     assert not hasattr(slab_io, "SlabIOBackend")
+
+
+def test_deleted_hdf5_selectors_do_not_survive_in_neighbouring_apis():
+    """Pin the less visible selector threads removed with the deck keys."""
+    import ast
+    import inspect
+    from common.wfn_transforms import load_centroids_band_chunked
+    from gw.gflat_memory_model import plan_gflat_chunks
+
+    # kmeans_cli initializes the communicator stack at import time, so parser
+    # vocabulary is intentionally checked without importing the driver on a
+    # login/zero-GPU test process.
+    cli_path = (pathlib.Path(__file__).resolve().parents[1]
+                / "src" / "centroid" / "kmeans_cli.py")
+    cli_tree = ast.parse(cli_path.read_text())
+    options = {
+        arg.value
+        for node in ast.walk(cli_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    }
+    assert "--use-phdf5" not in options
+    assert "use_phdf5" not in inspect.signature(
+        load_centroids_band_chunked).parameters
+    assert "slab_io_replicates" not in inspect.signature(
+        plan_gflat_chunks).parameters
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, 1),
+    ("", 1),
+    ("0", 0),
+    ("false", 0),
+    ("1", 2),
+    ("true", 2),
+])
+def test_close_logging_defaults_to_compact(monkeypatch, value, expected):
+    """Empty closes stay quiet by default while explicit 0/1 remain compatible."""
+    if value is None:
+        monkeypatch.delenv("LORRAX_PHDF5_CLOSE_VERBOSE", raising=False)
+    else:
+        monkeypatch.setenv("LORRAX_PHDF5_CLOSE_VERBOSE", value)
+    assert slab_ffi._close_log_level() == expected
 
 
 def test_deleted_backend_modules_are_gone():

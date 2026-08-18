@@ -105,9 +105,8 @@ src/
 │   ├── centroids.py           centroid file loader
 │   ├── paths.py               path resolution helpers
 │   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
-│   └── slab_io.py             SlabIO: MPI-IO-like phdf5 writer (+ allgather fallback)
-│       _slab_io_ffi.py          phdf5 FFI backend
-│       _slab_io_allgather.py    plain-h5py rank-0 backend
+│   └── slab_io.py             SlabIO: one sharded MPI-IO transport
+│       _slab_io_ffi.py          collective parallel-HDF5 implementation
 │
 ├── ffi/                  # XLA FFI bridge to native libraries
 │   ├── common/                ffi_loader (ctypes) + cpp (CMake) → liblorrax_ffi.so
@@ -159,7 +158,7 @@ src/
 
 ### 2.1 `LorraxConfig` — `src/gw/gw_config.py`
 
-Loaded from `cohsex.in` via `LorraxConfig.from_input_file()`. Holds every flag the driver consults: file paths, band ranges, ISDF parameters, screening / PPM knobs, head-correction policy, `use_ffi_io`, `use_ppm_sigma`, `use_bgw_vcoul`, `memory_per_device_gb`, `sys_dim`, `bispinor`, `self_consistent`, etc. Two nested configs:
+Loaded from `cohsex.in` via `LorraxConfig.from_input_file()`. Holds every flag the driver consults: file paths, band ranges, ISDF parameters, screening / PPM knobs, head-correction policy, `use_ppm_sigma`, `use_bgw_vcoul`, `memory_per_device_gb`, `sys_dim`, `bispinor`, `self_consistent`, etc. HDF5 transport is deliberately absent from this configuration. Two nested configs:
 
 - `MinimaxConfig` (`minimax_config.py`) — static/imag-ω quadrature parameters.
 - `SigmaQuadratureConfig` — Σ^c(ω) window quadrature parameters.
@@ -249,13 +248,13 @@ Reads `eps0mat.h5` / `epsmat.h5`. Used only by the `epshead` head source (`head_
 
 ### 2.7 `SlabIO` — `src/file_io/slab_io.py`
 
-Sharded HDF5 writer with three backends (selected by `SlabIOBackend` enum; the deprecated `use_ffi_io: bool` kwarg/input-key is still coerced for back-compat):
-
-- `PHDF5_FFI` → `_slab_io_ffi.py` (parallel HDF5 via the phdf5 FFI). Each rank writes its own hyperslab; collective MPI-IO writes are the default (`LORRAX_PHDF5_COLLECTIVE_WRITES=0` reverts to independent — same knob, same default as the Python host writer since 2026-07-27), with rank-local replica dedup (`LORRAX_PHDF5_DEDUP_REPLICAS=0` disables). Available on BOTH backends: the C++ core compiles into the CUDA lib and, under `LORRAX_FFI_NO_CUDA`, into the CUDA-free host lib, where the D2H staging collapses to an in-place read of the XLA host buffer (workstream AE).
-- `PHDF5_HOST` → `_slab_io_mpi_host.py` (parallel HDF5 via mpi4py + h5py(parallel)). Same per-rank parallel-write semantics, driven from Python. Second CPU tier — for a host lib built without the write handler; needs the mpi4py overlay that the FFI path does not.
-- `H5PY_ALLGATHER` → `_slab_io_allgather.py` (all-gather to rank 0 then serial h5py). Last-resort fallback for systems without parallel HDF5; slow at scale, and the gather is the dominant collective in a large run.
-
-The `LorraxConfig.from_input_file` builder routes `slab_io = auto` (the default) UNCONDITIONALLY through a capability-probed router — no other input key gates it. On CPU, `_route_cpu_slab_io` probes `ffi_loader.probe_target('lorrax_phdf5_write', 'cpu')` and picks PHDF5_FFI → PHDF5_HOST (the tier-2 probe really runs `MPI_Init_thread`, so a PMI-mismatched harness demotes instead of dying) → H5PY_ALLGATHER. On GPU, `_route_gpu_slab_io` applies the same two conditions — the CUDA lib exports the write handler, and `_probe_mpi_bootstrap_ffi('CUDA')` says MPI can bootstrap — else PHDF5_HOST/H5PY_ALLGATHER. **Node count is not a condition.** It was until 2026-08-05, when the router declined PHDF5_FFI unconditionally at `SLURM_JOB_NUM_NODES > 1` without probing; that arm generalised an Intel-MPI-on-Frontera launcher misconfiguration to the Cray-MPICH/Shifter GPU path, and was deleted after 16 ranks on 4 Perlmutter nodes wrote and read bit-exactly through PHDF5_FFI with `MPI_Comm_size` asserted (see `docs/architecture/slab_io.md`). Every decision is logged with the tier and, on a demotion, the probe's reason. The deprecated `use_ffi_io` input key: `false` forces H5PY_ALLGATHER (warned), `true` is a no-op, and it is ignored when `slab_io` is explicit.
+Sharded HDF5 reader/writer with one transport: `_slab_io_ffi.py` dispatches
+each rank's local hyperslab through the parallel-HDF5 FFI and collective
+MPI-IO. The CUDA and host native libraries compile the same C++ transport;
+the host build reads XLA's CPU buffer in place instead of staging device data.
+There is no backend enum, Python parallel-h5py tier, rank-0 allgather fallback,
+or deck/API selector. A deployment without the required native handler refuses
+at file open rather than changing the memory model.
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
@@ -348,8 +347,7 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │  WFNReader, SymMaps, load_centroids
     │  Meta.from_system, BandSlices.from_band_edges
     │  mesh_xy = _build_mesh()
-    │  if slab_io is PHDF5_FFI: phdf5_init_mpi() (eager MPI_THREAD_MULTIPLE init;
-    │                            PHDF5_HOST warms mpi4py the same way)
+    │  phdf5_init_mpi() establishes the collective MPI-IO transport
     │  ensure_jax_compile_cache()
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -674,7 +672,7 @@ main                                       [gw/gw_jax.py]
 | **Write sigma_mnk.h5** | `file_io/sigma_output.py : write_sigma_omega_h5` |
 | **Write eqp0.dat / eqp1.dat** (IBZ wedge) | `gw/eqp_bgw.py : assemble_eqp`, `write_bgw_eqp` |
 | **Write sigma_diag.dat / eqp_g0w0.dat** (full BZ) | `file_io/sigma_output.py : write_sigma_to_file`, `write_eqp_g0w0` |
-| **SlabIO (phdf5 writer)** | `file_io/slab_io.py : SlabIO` (backends in `_slab_io_ffi.py` / `_slab_io_allgather.py`) |
+| **SlabIO (parallel-HDF5 transport)** | `file_io/slab_io.py : SlabIO` (implementation: `_slab_io_ffi.py`) |
 | **Centroid selection** | `centroid/kmeans_cli.py : main` (algorithm: `centroid/kmeans_isdf.py`) |
 | **Dipole generation** | `psp/get_dipole_mtxels.py : main` |
 | **kin_ion generation** | `gw/kin_ion_io.py : main` |

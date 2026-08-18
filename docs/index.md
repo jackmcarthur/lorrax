@@ -30,10 +30,9 @@ uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
     demotion to a JAX fallback, because the fallback paths were deleted. Verified
     2026-08-10 on a fresh clone at `88f28325`, the command above without the build
     step refuses with `RuntimeError: The required FFTW3-ABI host backend is
-    unavailable … Could not locate liblorrax_ffi_host.so`, and the fixture's own
-    `use_ffi_io = false` line no longer selects anything — that key became
-    warn-and-ignore on 2026-08-06, when the three I/O tiers collapsed to one
-    transport.
+    unavailable … Could not locate liblorrax_ffi_host.so`. The former
+    `use_ffi_io` and `slab_io` deck keys are now refused: the three I/O tiers
+    collapsed to one transport, so a deck cannot select an HDF5 implementation.
 
     `build_host.sh` needs a SLATE `gpu_backend=none` install and refuses without
     one, naming `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu` as the step

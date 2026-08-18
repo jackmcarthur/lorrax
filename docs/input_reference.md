@@ -9,13 +9,14 @@ generator writes the whole file when it succeeds — so regenerating would flatt
 `restart_q_storage`, `mc_average_placement` and a dozen others back to a
 sentence. Verified 2026-08-10: the script's `KEYS` table is missing entries for
 `mc_average_placement`, `mc_average_placement_vcoul`, `restart_q_storage`,
-`sc_eigh` and `write_restart_tensors`, and still carries the deleted `slab_io`
-and `use_ffi_io`, so today it refuses before writing — which is the only reason
-this page survived. Use it as a **drift checker** (it prints exactly which keys
-have appeared in or vanished from `_DEFAULTS`) and edit this page by hand.
+`sc_eigh` and `write_restart_tensors`, so today it refuses before writing —
+which is the only reason this page survived. The generator no longer carries
+the deleted HDF5 selector entries. Use it as a **drift checker** (it prints
+exactly which keys have appeared in or vanished from `_DEFAULTS`) and edit this
+page by hand.
 `gw_config._DEFAULTS` remains the single source of truth for deck keys.
-Unknown keys warn: a key not in `_DEFAULTS` and not covered by a legacy branch
-is reported in one aggregated rank-0 warning and ignored; `strict_keys = true`
+Unknown keys warn: a key not in `_DEFAULTS` and not covered by a removed-key
+branch is reported in one aggregated rank-0 warning and ignored; `strict_keys = true`
 upgrades this to a refusal naming every unknown key.
 Longer discussions of the load-bearing keys are in [drivers.md](drivers.md).
 

@@ -211,16 +211,13 @@ L3  substrate services (this page)
     │   └─ ffi.linalg (plan → resolve → dispatch;                  │
     │        backends: scalapack / slate / cusolvermp / native)    │
     │ ffi.io ─ parallel-HDF5 MPI-IO handlers (ffi.phdf5 = shim)    │
-    │ file_io.slab_io ─ sharded-slab HDF5 transport                │
-    │   └─ tiers: _slab_io_ffi (ffi.io) → _slab_io_mpi_host        │
-    │             (mpi4py+h5py) → _slab_io_allgather               │
-    │             [collapsing to ONE tier — see slab_io below]     │
+    │ file_io.slab_io ─ one sharded parallel-HDF5 transport        │
+    │   └─ _slab_io_ffi → ffi.io collective MPI-IO                │
     │ common.timing ─ instrumentation (leaf; no deps)              │
     └──────────────────────────────────────────────────────────────┘
 
 sanctioned upward edges (tests/test_layering.py, argued in layers.md §5):
- !R1  file_io.slab_io ──▶ gw.gw_config          (lazy; SlabIOBackend enum)
-      — closed by deletion on feat/slabio-one-backend-2026-08-06
+ !R1  file_io.slab_io ──▶ gw.gw_config          — CLOSED 2026-08-06
  !R2  solvers.sternheimer_solve ──▶ psp.dft_operators
  !R3  centroid.kmeans_isdf ──▶ centroid.orbit_syms   (lazy)
       — CLOSED 2026-08-07: orbit_syms moved to services/symmetry_maps/,
@@ -824,14 +821,10 @@ hyperslab, replacing ad-hoc allgather-to-rank-0 patterns.
 
 ```python
 class SlabIO:   # context manager
-    def __init__(self, path, *, mode: str = "w", mesh=None,
-                 backend=None,               # SlabIOBackend enum
-                 use_ffi_io: bool | None = None) -> None   # legacy, coerced
-    def create_dataset(self, name, *, shape, dtype, chunks=None,
-                       attrs=None) -> None
+    def __init__(self, path, *, mode: str = "w", mesh=None) -> None
+    def create_dataset(self, name, *, shape, dtype, attrs=None) -> None
     def write_slab(self, name, A, *, offset=None, global_shape=None,
-                   valid_shape=None, dtype=None, chunks=None,
-                   k_chunk_size=None) -> None
+                   valid_shape=None, dtype=None) -> None
     def read_slab(self, name, *, shape=None, dtype=None, offset=None,
                   valid_shape=None, mesh=None, partition_spec=None,
                   as_numpy: bool = False) -> jax.Array
@@ -839,38 +832,17 @@ class SlabIO:   # context manager
     def close(self) -> None
 ```
 
-**Contract on this branch.** Three backend tiers, selected by
-`SlabIOBackend` (defined in `gw.gw_config` — sanctioned exception R1;
-`slab_io = auto` in the deck resolves via the capability router in
-`LorraxConfig.from_input_file`):
-
-| tier | module | mechanism | requires |
-|---|---|---|---|
-| `PHDF5_FFI` | `_slab_io_ffi` | collective MPI-IO via `ffi.io` (CUDA lib or CUDA-free host lib) | mesh; the lib exports the handler |
-| `PHDF5_HOST` | `_slab_io_mpi_host` | same MPI-IO, driven by mpi4py + parallel h5py | mesh; the overlay |
-| `H5PY_ALLGATHER` | `_slab_io_allgather` | gather to rank 0, serial h5py | reachable at **exactly one process** |
-
-Resolve time: `PHDF5_FFI`/`PHDF5_HOST` without a mesh raise; a non-enum
-`backend` raises `TypeError`. Padding contract: files always store the
+**Contract.** One transport, implemented by `_slab_io_ffi`: each rank moves
+only its local hyperslab through `ffi.io` and collective MPI-IO. The same C++
+core is built into the CUDA and host native libraries. There is no backend
+selector or fallback; missing native support is a refusal. Padding contract:
+files always store the
 **logical** shape — producers pass `valid_shape` for the un-padded prefix,
 consumers request a mesh-divisible physical `shape` and get a zero-filled
-tail (driver-side padding is `runtime.padding`'s job). The host-MPI path
-writes synchronously by design (the threaded FFI deadlocks at `H5Fclose`
-under `MPI_THREAD_SINGLE` — `_slab_io_mpi_host.py` docstring).
+tail (driver-side padding is `runtime.padding`'s job).
 
-`H5PY_ALLGATHER` is a **refusal, not a fallback** above one process
-([decisions.md](decisions.md) 2026-08-05): it materialises the whole array
-on rank 0, which is the memory wall the per-rank-tile contract exists to
-avoid.
-
-### The interface is collapsing to one transport {#slab-io-one-transport}
-
-**On `feat/slabio-one-backend-2026-08-06` (unmerged — not an ancestor of
-`integration/2026-08-06` or of `origin/main`)** the three tiers, the enum,
-the router and the two deck keys are **deleted**, and the constructor
-becomes `SlabIO(path, *, mode="w", mesh)` — nothing else. This is the
-flagship worked example of the [hide-the-choice](#choice) position, and
-new services should be read against it:
+This is the flagship worked example of the [hide-the-choice](#choice)
+position:
 
 * **A caller no longer computes a mesh-divisible extent.** `read_slab`
   with no `shape` returns the dataset rounded *up* to the mesh-divisible
@@ -901,13 +873,14 @@ new services should be read against it:
   bit-exact per shard at nspinor 1/2/4 including bispinor. The previous
   full-file reader was guarded off above one process with no replacement.
 
-**Level / deps.** L3. `ffi.io` (lazy), mpi4py/h5py (lazy), the R1 lazy
-enum import — the last two go away with the tiers.
+**Level / deps.** L3. `ffi.io` (lazy). Small serial metadata operations may
+reopen with h5py only after collective close; ownership is enforced by
+`file_io.hdf5_owner`.
 
 **See also.** [`slab_io.md`](slab_io.md) — the transport in full: the
 per-rank-tile contract, the launcher requirement and the singleton-MPI
 trap it avoids, the measured striping policy, the certification, and the
-failure modes. That page is rewritten on the same branch.
+failure modes.
 
 ---
 

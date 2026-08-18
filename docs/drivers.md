@@ -67,7 +67,6 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--density-mode` | `scalar` | `scalar` = charge channel; `current` = Gordon-current weight for bispinor transverse channels (suffix `_current`) |
 | `--orbit` / `--no-orbit` | auto (on if n_sym>1) | symmetry-closed centroid set from orbit representatives |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
-| `--use-phdf5` | off | parallel-HDF5 loader for WFN.h5 too big for host RAM |
 | `LORRAX_CENTROID_RANK_TOL` (env) | 0.01 | rank-gate tolerance; lowering it is a deliberate override |
 
 Invariant: the selection window must span the sigma window `[0, nelec+ncond)` the GW run consumes; the default

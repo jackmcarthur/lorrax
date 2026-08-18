@@ -133,11 +133,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-orbit", action="store_true",
                    help="Force the literal-point (non-orbit) path even if "
                         "WFN.h5 has multiple sym ops. Overrides --orbit.")
-    p.add_argument("--use-phdf5", action="store_true",
-                   help="Pull G-space wavefunctions through the parallel-HDF5 "
-                        "FFI loader instead of the default WFNReader. "
-                        "Necessary for WFN.h5 files that don't fit in host "
-                        "RAM. Default off.")
     p.add_argument("--density-mode",
                    choices=("scalar", "current"),
                    default="scalar",
@@ -388,7 +383,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     max_band = n_val + n_cond
     kwargs: dict = dict(
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
-        orbit_id=orbit_id, use_phdf5=args.use_phdf5,
+        orbit_id=orbit_id,
         n_point_budget=(int(N_c) if orbit_id is not None else None),
     )
     if args.prune_window == "v_x_vc":

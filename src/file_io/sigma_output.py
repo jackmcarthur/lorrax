@@ -984,7 +984,6 @@ def write_sigma_omega_h5(
 	sigma_c_kij_ev=None,
 	sigma_sx_kij_ev=None,
 	hartree_kij_ev=None,
-	k_chunk_size: int = 16,
 	mesh=None,
 	star=None,
 	omega_reference_ev=None,
@@ -1097,10 +1096,6 @@ def write_sigma_omega_h5(
 		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
 		shape_ref = (n_omega, nk, nb, nb2)
 
-	k_chunk = max(1, int(k_chunk_size))
-	om_chunks  = (n_omega, min(k_chunk, nk), nb, nb2)
-	kij_chunks = (min(k_chunk, nk), nb, nb2)
-
 	total = payload["sigma_total_kij_ev"]
 	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
@@ -1126,24 +1121,24 @@ def write_sigma_omega_h5(
 			io.write_attr(SYM_IDX_DATASET,
 				np.asarray(sym_idx_k, dtype=np.int32))
 		io.create_dataset("sigma_total_kij_ev",
-			shape=shape_ref, dtype=np.complex128, chunks=om_chunks,
+			shape=shape_ref, dtype=np.complex128,
 			attrs=_attrs("sigma_total_kij_ev"))
 		io.write_slab("sigma_total_kij_ev", total)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
-				shape=shape_ref, dtype=np.complex128, chunks=om_chunks,
+				shape=shape_ref, dtype=np.complex128,
 				attrs=_attrs("sigma_c_kij_ev"))
 			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=tuple(sigma_sx_kij_ev.shape),
-				dtype=np.complex128, chunks=kij_chunks,
+				dtype=np.complex128,
 				attrs=_attrs("sigma_sx_kij_ev"))
 			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
-				dtype=np.complex128, chunks=kij_chunks,
+				dtype=np.complex128,
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 		for name in extrap_arrays:
@@ -1159,7 +1154,6 @@ def write_sigma_omega_h5(
 			at.update(extrap_attrs)
 			io.create_dataset(name, shape=tuple(arr.shape),
 				dtype=np.complex128,
-				chunks=(min(k_chunk, arr.shape[0]),) + tuple(arr.shape[1:]),
 				attrs=at)
 			io.write_slab(name, arr)
 	return abs_path

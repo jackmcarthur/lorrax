@@ -206,31 +206,11 @@ the three `LORRAX_FFI_*_DIR` stage roots, …) — the full table is in
 swap the `shifter` invocation in `lxrun`/`lxshell`/`lxpre`;
 `select_gpu.sh`, `in_container.sh` and the SLURM defaults are portable.
 
-## 5. CPU multi-process runs (Milan) — validated recipe, gloo-era
+## 5. CPU multi-process runs (Milan)
 
-Validated end-to-end at Si 4×4×4 μ=384 (1 node, 4 ranks × 8 threads);
-the same deck runs on GPU and CPU, with the FFI flags auto-routed from
-`jax.default_backend()` (`gw.gw_config.LorraxConfig.from_input_file`).
-One-time deps inside the venv — mpi4py and h5py built against
-`cray-hdf5-parallel` + `cray-mpich` (`--no-binary`, `HDF5_MPI=ON`);
-verify `h5py.get_config().mpi`. Launch: `salloc -C cpu`, then
-
-```bash
-export JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 OMP_NUM_THREADS=8
-srun --jobid=$SLURM_JOBID -N 1 -n 4 -c 8 --cpu-bind=cores \
-     $LORRAX_VENV/bin/python -u -m gw.gw_jax -i cohsex.in
-```
-
-What auto-routes on CPU: `slab_io=auto` → the capability router
-(FFI write handler → `PHDF5_HOST` → allgather); `distributed_cholesky
-= auto` passes THROUGH (on CPU it carries the replicated
-rank-truncation route — an earlier revision of this page said it
-demotes to `off`, which is exactly the rewrite behind the −161 eV bug
-in [linalg_ffi.md](../../dev/linalg_ffi.md) "Sharp edges");
-`distributed_lu` `auto` → `off`, announced; `pair_density_slots`
-3 → 4. The CPU
-path writes synchronously — the FFI's threaded design deadlocks at
-`H5Fclose` under Cray MPICH's default `MPI_THREAD_SINGLE`
-(`file_io/_slab_io_mpi_host.py` docstring). Note this pre-dates the
-`impl=mpi` migration; a modern multi-process CPU run on Perlmutter
-should expect the [transports](../transports.md) bring-up work first.
+The former gloo-era recipe and its mpi4py/parallel-h5py SlabIO tier are
+retired. Current CPU runs require the host native FFI and use the same single
+parallel-HDF5 transport as GPU runs; the `slab_io` and `use_ffi_io` deck keys
+are refused. Use `lx run` for compute-node execution and follow the current
+[transport bring-up](../transports.md) before treating a multi-process CPU run
+as certified.

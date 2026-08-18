@@ -638,7 +638,6 @@ def prune_candidates_by_pivoted_cholesky(
     verbose: bool = True,
     bispinor: bool = False,
     orbit_id: np.ndarray | None = None,
-    use_phdf5: bool = False,
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
 ):
@@ -646,8 +645,8 @@ def prune_candidates_by_pivoted_cholesky(
 
     Requires a 2-D mesh ``('x', 'y')`` (single-device callers pass a 1×1
     mesh — same shape gw_jax uses). Wavefunction loading goes through
-    ``load_centroids_band_chunked`` so the prune path is agnostic to which
-    G-space backend (WFNReader / phdf5 / future jax-multihost) is in use.
+    ``load_centroids_band_chunked`` through ``WfnLoader``'s single automatic
+    G-space path; the prune driver does not select an HDF5 implementation.
 
     When ``orbit_id`` is provided (one int per candidate, equal for sym-
     equivalent candidates), PC picks one pivot per orbit and the returned
@@ -780,7 +779,6 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_left=band_range_left,
             band_range_right=band_range_right,
             band_norms=band_norms,
-            use_phdf5=use_phdf5,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
@@ -1262,7 +1260,6 @@ def build_gram_q0_via_loadwfns(
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
     band_chunk_size: int = 64,
-    use_phdf5: bool = False,
     memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
@@ -1416,7 +1413,7 @@ def build_gram_q0_via_loadwfns(
               f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
               f"right={right_range} (nb={nb_right}), M={M}, "
               f"norms={'on' if band_norms is not None else 'off'}, "
-              f"backend={'phdf5' if use_phdf5 else 'WFNReader'}, "
+              f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
               f"band_chunk_size={band_chunk_size}")
 
@@ -1424,7 +1421,7 @@ def build_gram_q0_via_loadwfns(
     with timing.section("left.load"):
         psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
-            band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+            band_chunk_size=band_chunk_size,
         )
         if norms_l_j is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
@@ -1480,7 +1477,7 @@ def build_gram_q0_via_loadwfns(
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-                band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+                band_chunk_size=band_chunk_size,
             )
             if norms_r_j is not None:
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
@@ -1516,7 +1513,7 @@ def build_gram_q0_via_loadwfns(
     with timing.section("right.load"):
         psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-            band_chunk_size=band_chunk_size, use_phdf5=use_phdf5,
+            band_chunk_size=band_chunk_size,
         )
         if norms_r_j is not None:
             psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]

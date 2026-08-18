@@ -23,11 +23,10 @@ uv run python -m pytest -q                                    # regression smoke
 uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in   # run a GW calculation
 ```
 
-The third line runs a complete static-COHSEX calculation end-to-end on a fresh clone:
-the bundled fixture sets `use_ffi_io = false` and ships its own wavefunction, so it needs
-**no GPU and no native (FFI) build**. It is the fastest way to confirm LORRAX works on your
-machine. Everything distributed (sharded HDF5, distributed `eigh`, SLATE) additionally
-requires the native FFI stack — see [`docs/environment/overview.md`](docs/environment/overview.md).
+The third line runs a complete static-COHSEX calculation end-to-end on the bundled
+wavefunction. It needs no GPU, but the native host FFI build is required; HDF5 transport
+selection keys have been removed. See
+[`docs/environment/overview.md`](docs/environment/overview.md) for the native stack.
 
 On NERSC Perlmutter the harness is `lx`: `lx run <cmd>` puts one step on a compute node, `lx test` runs the default gate there. See [`docs/environment/machines/perlmutter.md`](docs/environment/machines/perlmutter.md) — the older `module load lorrax` + `lxalloc`/`lxrun`/`lxpre` workflow is superseded and documented there as history. On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 

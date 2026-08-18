@@ -105,22 +105,18 @@ _services.ensure_on_path()
 import symmetry_maps                                            # noqa: E402
 
 
-def _setup_runtime(config, mesh_xy, *, print_fn=print) -> None:
-	"""Pre-init phdf5's MPI, the one startup step that needs the config.
+def _setup_runtime() -> None:
+	"""Pre-init MPI for the one parallel-HDF5 transport.
 
 	**phdf5 ``MPI_Init_thread``**: when the slab-IO backend is the phdf5
 	FFI, eagerly enter ``MPI_THREAD_MULTIPLE`` so the first collective
 	``H5Fcreate`` (in ``zeta_fit_chunked``) doesn't pay the ~400 ms
-	MPI_Init cost on the critical path; failures are logged and swallowed.
+	MPI_Init cost on the critical path. A bring-up failure refuses the run.
 
-	This is what is LEFT of the old driver-local runtime setup.  Everything
+	This is what is LEFT of the old driver-local runtime setup. Everything
 	else it used to do — the JAX persistent compile cache in particular —
 	moved into ``runtime.initialize_communicator_stack`` at the top of this
-	module, because none of it depended on the parsed config and every
-	driver needed the same thing in the same order.  This step stays here
-	because it is the only one that does: it branches on
-	``config.backend.slab_io``, which does not exist until the input file
-	has been read.
+	module. Transport selection no longer depends on parsed configuration.
 	"""
 	# Unconditional since 2026-08-06: there is one transport and it always
 	# needs this MPI.  This used to branch on ``config.backend.slab_io`` --
@@ -257,7 +253,7 @@ def main(argv=None):
 	# Do NOT call prepare_mesh() again here: a second Mesh object is a second
 	# set of communicators and a second copy of every shape-keyed jit cache.
 	mesh_xy = RUNTIME.mesh
-	_setup_runtime(config, mesh_xy, print_fn=print0)
+	_setup_runtime()
 	print_banner(
 		backend=jax.default_backend(),
 		n_devices=len(jax.devices()),

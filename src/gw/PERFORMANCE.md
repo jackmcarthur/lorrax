@@ -27,7 +27,8 @@ side).
 
 Si 4×4×4 COHSEX (static), 64 k-points no-symmetry, scalar (`bispinor=False`),
 8v + 52c (60 bands), 480 ISDF centroids, `memory_per_device_gb=28`,
-`use_chunked_isdf=true`, `use_ffi_io=true`, default `auto → high_mem`
+`use_chunked_isdf=true`, with the single SlabIO transport and the default
+`auto → high_mem` memory policy
 ISDF mode.  Run dir: `runs/Si/B_compile_floor_check/`.  Canonical
 invocation:
 

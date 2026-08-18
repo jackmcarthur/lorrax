@@ -850,14 +850,11 @@ The all-to-all then removed the `p_y` factor outright: 5.2× on this slope at th
 
 ### 3. Stage F — the restart-tensor write takes the LARGER of two tensors
 
-On the `H5PY_ALLGATHER` SlabIO backend (the CPU default whenever the venv lacks
-mpi4py + h5py-parallel, which is the case on Frontera today)
-`_slab_io_allgather._to_host` process_allgathers the WHOLE tensor onto EVERY
-rank and then copies it to host numpy — each written tensor lands UNSHARDED,
-**twice** (gathered device buffer + host numpy copy). Nothing in stages A–E
-models an I/O-seam replication, which is why the planner once reported a
-6.70 GB HWM for a run that died past ζ-fit. `slab_io_replicates=False`
-(`PHDF5_FFI` / `PHDF5_HOST`, per-rank hyperslabs) drops it to the sharded cost.
+SlabIO writes per-rank hyperslabs, so the live planner charges one sharded
+tile. The former h5py allgather backend materialized the whole tensor on every
+rank and copied it again to host; that backend and the corresponding
+`slab_io_replicates` planner arm were deleted. The historical measurement
+below explains why that replicated arm could not remain a production option.
 
 TWO tensors cross this seam and the model must take the larger:
 

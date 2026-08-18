@@ -2192,15 +2192,8 @@ def prepare_isdf_and_wavefunctions(
 				                     if mem.band_chunk_size > 0 else None),
 				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 				                           if mem.gflat_chunk_size > 0 else None),
-				# Stage F (restart-tensor write) writes per-rank
-				# hyperslabs and therefore costs the SHARDED amount.  This
-				# used to be conditional: on the allgather backend
-				# ``_to_host`` process_allgathered the whole (n_q, μ, μ)
-				# tensor onto every rank and stage F was unsharded.  That
-				# backend is gone (2026-08-06), so the replicated branch is
-				# unreachable and the planner is told so explicitly rather
-				# than left on its ``True`` default.
-				slab_io_replicates=False,
+				# Stage F writes per-rank hyperslabs; the planner therefore
+				# charges only the local sharded tile.
 			)
 			if jax.process_index() == 0:
 				print0("")
