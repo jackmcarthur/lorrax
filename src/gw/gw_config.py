@@ -3081,9 +3081,10 @@ class MPAConfig:
             raise ValueError(
                 "mpa_sampling_schedule must be 'nested' or 'leon'; "
                 f"got {self.sampling_schedule!r}")
-        if self.pole_solver not in ("loewner", "companion"):
+        if self.pole_solver not in ("loewner", "companion", "thiele"):
             raise ValueError(
-                "mpa_pole_solver must be 'loewner' or 'companion'; "
+                "mpa_pole_solver must be 'loewner', 'companion', or "
+                "'thiele'; "
                 f"got {self.pole_solver!r}")
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(

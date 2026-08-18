@@ -71,10 +71,10 @@ else -- the model, the guards, the canonical sort, the mandatory residue
 refit, the returned ``(B_p, Omega_p)`` -- is shared and unchanged.  The
 default is the Loewner pencil, which interpolates the same ``2n_p``
 values with the same ``n_p`` poles and never forms a power of ``x``.
-The published Pade route remains reachable, both because it is what the
-papers specify and because the removed Pade solve reproduced the
-shipped 2026-08-09 solve exactly, which is the only way to keep
-exhibiting the disease this module was reconditioned to cure.
+Both published routes remain reachable: ``companion`` selects Yambo's
+optional LA construction and ``thiele`` selects its default PT
+reciprocal-difference construction.  This keeps the numerical-algebra
+choice separate from the shared model, guards, and residue refit.
 
 The guards, in order
 --------------------
@@ -244,11 +244,13 @@ _GUARD_KEYS = tuple(DEFAULT_GUARDS)
 EIG_MODES = ("lapack", "jax_qr")
 
 #: Pole-identification algebra.  ``loewner`` remains the default and its
-#: implementation is unchanged.  ``companion`` is the Leon/Yambo linear
-#: algorithm: eliminate the numerator through the two sampling halves, solve
-#: the resulting n-by-n denominator system, and diagonalize its companion
-#: matrix after mapping coefficients out of the near-line normalization.
-SOLVE_MODES = ("loewner", "companion")
+#: implementation is unchanged.  ``companion`` is Leon/Yambo's optional
+#: linear-algebra (``LA``) route.  ``thiele`` is its default Padé--Thiele
+#: (``PT``) reciprocal-difference recurrence, Appendix A.2 of Leon et al.
+#: (2021) and ``mpa_E_solver_Pade`` in Yambo 5.3.  Both published twins end
+#: in the same companion root finder and then use the shared LORRAX guards
+#: and all-sample residue refit.
+SOLVE_MODES = ("loewner", "companion", "thiele")
 
 
 def _eigvals(M, eig):
@@ -622,6 +624,63 @@ def _leon_companion_roots(w, x, x_max, n, eig="lapack"):
     )
 
 
+def _leon_thiele_roots(w, x, x_hat, x_max, n, eig="lapack"):
+    """Leon/Yambo Padé--Thiele recurrence and companion roots.
+
+    This is Appendix A.2, Eqs. (53)--(58), of Leon et al. (2021) in the
+    executable ordering of Yambo 5.3's ``mpa_E_solver_Pade``.  ``x`` is
+    ``z**2`` and retains the sample order exactly: near line ascending, then
+    far line ascending.  Thiele interpolation is order dependent in finite
+    precision, so no sorting or near/far interleave is permitted here.
+
+    ``c`` carries the reciprocal-difference table.  ``d_m1`` and ``d_m2``
+    are the coefficient vectors of consecutive denominator polynomials,
+    stored in ascending monomial order.  The recurrence
+
+        D_s(x) = D_{s-1}(x) - c_s (x - x_{s-1}) D_{s-2}(x)
+
+    produces a degree-``n`` denominator after ``2*n`` samples.  Dividing by
+    its leading coefficient makes it monic before the shared companion
+    eigensolve.
+
+    The recurrence itself has no matrix condition number.  Rather than stamp
+    Yambo's placeholder zero, diagnostics report the condition of the
+    equivalent Loewner interpolation problem.  It does not participate in
+    the Thiele solve; it says whether these same data determine a stable
+    type-(n-1,n) rational interpolant.  The caller replaces the provisional
+    zero backward witness with the unguarded rational-reconstruction residual
+    after the common residue solve.
+    """
+
+    c = w
+    d_m1 = jnp.zeros((n + 1,), dtype=jnp.complex128).at[0].set(1.0)
+    d_m2 = d_m1
+    d = d_m1
+
+    # Python bounds are static under jit/vmap; this unrolls the same short
+    # 2*n recurrence Yambo executes elementwise without data-dependent shape.
+    for i in range(1, 2 * n):
+        c_prev = c
+        numerator = c_prev[i - 1] - c_prev[i:]
+        denominator = (x[i:] - x[i - 1]) * c_prev[i:]
+        c = c.at[i:].set(numerator / denominator)
+        ci = c[i]
+
+        # D_s = D_{s-1} - ci * (x - x_{i-1}) * D_{s-2}.
+        d = d_m1 - x[i - 1] * ci * d_m2
+        d = d.at[1:].add(ci * d_m2[:-1])
+        d_m2, d_m1 = d_m1, d
+
+    coeffs = d[:n] / d[n]
+    roots_x = _companion_roots(coeffs, eig)
+
+    # Independent problem-conditioning witness; diagnostic only.
+    L, _ = _loewner_pencil(w, x_hat, n)
+    cond, s_max, s_min = _condition_2(L)
+    zero = jnp.zeros((), dtype=jnp.float64)
+    return roots_x / x_max.astype(jnp.complex128), cond, s_max, s_min, zero
+
+
 def _guard_reflection(b_hat):
     """Guard 1 -- metals-paper SI Eq. (S18).  Returns ``(b_hat, fired)``.
 
@@ -797,18 +856,18 @@ def fit_mpa_poles(
     rcond
         Relative singular-value cutoff for both least-squares solves.
     eig
-        Which eigensolver finds the Loewner roots; one of
-        :data:`EIG_MODES`.  ``"lapack"`` is the default
-        here; the disk driver stamps ``eig="jax_qr"``, which made the
-        accepted Si store.  ``"jax_qr"`` stays
-        inside XLA and is the only one of the two that batches, but it
-        does NOT reproduce the other bit for bit -- see
-        :data:`EIG_MODES`.
+        Which eigensolver finds the rational roots; one of
+        :data:`EIG_MODES`.  ``"lapack"`` is the default here.  The disk
+        driver stamps ``eig="jax_qr"`` for Loewner/LA and ``eig="lapack"``
+        for PT so the Yambo-default diagnostic ends in the same ``geev``
+        family.  The two backends do not reproduce each other bit for bit --
+        see :data:`EIG_MODES`.
     solve
         Pole-identification algebra, one of :data:`SOLVE_MODES`.
         ``"loewner"`` is the unchanged default.  ``"companion"`` is the
         literal Leon/Yambo two-half denominator elimination and companion
-        mapping; it adds no affine scaling or regularization.
+        mapping; it adds no affine scaling or regularization.  ``"thiele"``
+        is Yambo's default Padé--Thiele reciprocal-difference recurrence.
 
     Returns
     -------
@@ -846,12 +905,22 @@ def fit_mpa_poles(
         support_smax = s_max
         support_smin = s_min
         companion_wm = x_max
-    else:
+    elif solve == "companion":
         (b_hat, cond, s_max, s_min, bwd,
          cond_support, cond_denominator,
          backward_support, backward_denominator,
          support_smax, support_smin, companion_wm) = _leon_companion_roots(
              w, x, x_max, n, eig)
+    else:
+        b_hat, cond, s_max, s_min, bwd = _leon_thiele_roots(
+            w, x, x_hat, x_max, n, eig)
+        cond_support = cond
+        cond_denominator = cond
+        backward_support = bwd
+        backward_denominator = bwd
+        support_smax = s_max
+        support_smin = s_min
+        companion_wm = x_max
 
     # Keep the raw roots for the one-solve residue path below.  A corrected
     # element must solve on its guarded, sorted poles; an untouched element
@@ -862,10 +931,28 @@ def fit_mpa_poles(
     scale = jnp.sqrt(x_max).astype(jnp.float64)
     Omega_raw = jnp.sqrt(b_hat * x_max.astype(jnp.complex128))
     valid_all = jnp.ones((n,), dtype=bool)
-    if not refit_after_guards:
-        # Diagnostic stale-residue twin: deliberately retain the raw fit.
-        B_pre = _residue_lstsq(
+    if not refit_after_guards or solve == "thiele":
+        # The production guarded Loewner/companion path postpones this until
+        # after the guards, preserving main's one-residue-solve fast path.
+        # Thiele additionally needs the raw fit to define its backward
+        # witness, while the diagnostic stale-residue twin retains it.
+        B_raw = _residue_lstsq(
             x_hat, w, b_hat, valid_all, x_max, Omega_raw, rcond)
+        if not refit_after_guards:
+            B_pre = B_raw
+    if solve == "thiele":
+        # Thiele has no linear solve whose residual could serve as a backward
+        # witness.  The equivalent and stricter quantity is the normwise
+        # residual of its unguarded rational function after the shared
+        # all-sample residue solve.  This includes reciprocal-difference,
+        # polynomial, root-finding and residue errors before a physical guard
+        # is allowed to move or drop a pole.
+        raw_model = eval_mpa_model(Omega_raw, B_raw, z, valid=valid_all)
+        raw_num = jnp.linalg.norm(raw_model - w)
+        raw_den = jnp.linalg.norm(raw_model) + jnp.linalg.norm(w)
+        bwd = raw_num / jnp.where(raw_den > 0, raw_den, 1.0)
+        backward_support = bwd
+        backward_denominator = bwd
 
     # --- Stage 4: the guards, in order.
     fired_reflection = jnp.zeros((n,), dtype=bool)
