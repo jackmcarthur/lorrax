@@ -27,6 +27,7 @@ weather.
 """
 
 import time
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -120,6 +121,68 @@ def test_exact_recovery_si_np8_reports_precision(capsys):
               f"resid={float(diag['max_abs_residual']):.3e}")
     assert d_omega < 1.0e-7
     assert d_b < 1.0e-6
+
+
+def test_leon_companion_construction_matches_independent_numpy_equations():
+    """Eq. (46)--(50), including near-line normalization and root map."""
+
+    n = 4
+    z = sampling.double_parallel_grid(
+        n, 6.0, material_class="metal", alpha=2, schedule="leon")
+    Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
+    w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    x = z ** 2
+    x_max = np.max(np.abs(x))
+
+    wm = np.max(np.abs(x[:n]))
+    y = x / wm
+    Y = y[:, None] ** np.arange(n)[None, :]
+    Y1, Y2 = Y[:n], Y[n:]
+    M1 = -w[:n, None] * Y1
+    M2 = -w[n:, None] * Y2
+    v1 = w[:n] * x[:n] ** n
+    v2 = w[n:] * x[n:] ** n
+    transfer = Y2 @ np.linalg.inv(Y1)
+    denominator = transfer @ M1 - M2
+    rhs = transfer @ v1 - v2
+    b = np.linalg.solve(denominator, rhs)
+    coeffs = b / wm ** np.arange(n)
+    companion = np.zeros((n, n), dtype=np.complex128)
+    companion[1:, :-1] = np.eye(n - 1)
+    companion[:, -1] = -coeffs
+    expected = np.linalg.eigvals(companion) / x_max
+
+    got = pade_fit._leon_companion_roots(
+        jnp.asarray(w), jnp.asarray(x), jnp.asarray(x_max), n,
+        eig="lapack")
+    actual = np.asarray(got[0])
+    expected = expected[np.lexsort((expected.imag, expected.real))]
+    actual = actual[np.lexsort((actual.imag, actual.real))]
+    np.testing.assert_allclose(actual, expected, rtol=2e-10, atol=2e-10)
+    assert float(got[-1]) == pytest.approx(wm, rel=2e-15)
+    assert wm < x_max  # catches accidental all-sample normalization
+
+
+def test_default_solve_is_explicit_loewner_bit_for_bit():
+    """Adding a selector does not move one incumbent Loewner bit."""
+
+    n = 4
+    z = _grid(n)
+    Omega_t, B_t = _si_like_poles(n)
+    w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
+    implicit = pade_fit.fit_mpa_poles(w, z, n)
+    explicit = pade_fit.fit_mpa_poles(w, z, n, solve="loewner")
+    for left, right in zip(implicit[:2], explicit[:2]):
+        np.testing.assert_array_equal(left, right)
+    for key in implicit[2]:
+        np.testing.assert_array_equal(implicit[2][key], explicit[2][key])
+
+
+def test_leon_np15_qpps_fractions_are_the_yambo_integer_construction():
+    expected = tuple(Fraction(k, 16) for k in range(13)) + (
+        Fraction(14, 16), Fraction(1))
+    assert sampling.leon_partition_fractions(15) == expected
+    assert sampling.partition_fractions(15) != expected
 
 
 def test_exact_recovery_metal_grid_alpha2():
@@ -709,6 +772,13 @@ def test_gate_guard_keys_known():
     pade_fit.fit_mpa_poles(W, z, 4, guards={"reflection": False})
 
 
+def test_gate_solve_mode_known():
+    z = _grid(4)
+    W = np.ones(8, dtype=np.complex128)
+    with pytest.raises(ValueError, match="GATE solve_mode_known"):
+        pade_fit.fit_mpa_poles(W, z, 4, solve="pdae")
+
+
 def test_gate_sampling_refusals():
     with pytest.raises(ValueError, match="GATE n_p_positive"):
         sampling.double_parallel_grid(0, 4.0)
@@ -716,6 +786,8 @@ def test_gate_sampling_refusals():
         sampling.double_parallel_grid(4, 0.0)
     with pytest.raises(ValueError, match="GATE alpha_supported"):
         sampling.double_parallel_grid(4, 4.0, alpha=3)
+    with pytest.raises(ValueError, match="GATE partition_schedule_known"):
+        sampling.double_parallel_grid(4, 4.0, schedule="published-ish")
     with pytest.raises(ValueError, match="GATE material_class_known"):
         sampling.double_parallel_grid(4, 4.0, material_class="semimetal")
     with pytest.raises(ValueError, match="GATE energy_unit_known"):

@@ -66,18 +66,19 @@ __all__ = [
 #: some blocks and not others reads back as zero for the rest, and a
 #: zero condition number is a perfectly conditioned solve.
 _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
+_COMPANION_DIAGNOSTIC_KEYS = _DIAGNOSTIC_KEYS + (
+    "condition_support", "condition_denominator",
+    "backward_error_support", "backward_error_denominator")
 
-# One production pole fit.  These are the settings that made the accepted
-# Si store: the fixed-support Loewner pencil and the fully JAX-resident QR
-# root finder.  The Padé algebra remains reachable directly through
-# ``pade_fit`` as a diagnostic red twin; the disk driver must not silently
-# choose between two numerical methods.
+# Both stamped solve modes use the fully JAX-resident QR root finder.  Loewner
+# remains the deck default; selecting the Leon companion solve is explicit in
+# the deck and fit-store provenance.
 _FIT_EIG = "jax_qr"
 
 
 @functools.lru_cache(maxsize=None)
-def _scalar_fit_kernel(n_p, guard_items, rcond):
-    """One replicated scalar fit using the production Loewner policy."""
+def _scalar_fit_kernel(n_p, guard_items, rcond, solve):
+    """One replicated scalar fit using the selected stamped policy."""
     import jax
     import jax.numpy as jnp
 
@@ -88,12 +89,15 @@ def _scalar_fit_kernel(n_p, guard_items, rcond):
     def _kernel(samples, z):
         return pade_fit.fit_mpa_poles(
             samples, z, n, guards=guards, rcond=float(rcond),
-            eig=_FIT_EIG)
+            eig=_FIT_EIG, solve=solve)
 
     return _kernel
 
 
-def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
+def fit_scalar_samples(
+    Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13,
+    solve="loewner",
+):
     """Fit one scalar Wc sample vector with the body driver's exact policy."""
     import jax
     import jax.numpy as jnp
@@ -106,8 +110,9 @@ def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
             "scalar MPA head requires Wc and z with shape (2*n_p,); "
             f"got Wc={wc.shape}, z={z.shape}, n_p={n}")
     resolved = pade_fit._resolve_guards(guards)
+    pade_fit._check_solve_mode(solve)
     kernel = _scalar_fit_kernel(
-        n, tuple(sorted(resolved.items())), float(rcond))
+        n, tuple(sorted(resolved.items())), float(rcond), solve)
     Omega, B, diagnostics = kernel(
         jnp.asarray(wc), jnp.asarray(z))
     Omega, B, diagnostics = jax.device_get((Omega, B, diagnostics))
@@ -118,22 +123,28 @@ def fit_scalar_samples(Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13):
         "Omega_p": np.asarray(Omega, dtype=np.complex128)[valid],
         "B_p": np.asarray(B, dtype=np.complex128)[valid],
         "condition": float(np.asarray(diagnostics["cond_pade"])),
+        "condition_support": float(
+            np.asarray(diagnostics["cond_support"])),
+        "condition_denominator": float(
+            np.asarray(diagnostics["cond_denominator"])),
         "backward_error": float(np.asarray(diagnostics["backward_error"])),
+        "backward_error_support": float(
+            np.asarray(diagnostics["backward_error_support"])),
+        "backward_error_denominator": float(
+            np.asarray(diagnostics["backward_error_denominator"])),
         "max_abs_residual": float(
             np.asarray(diagnostics["max_abs_residual"])),
         "n_valid": int(np.asarray(diagnostics["n_valid"])),
-        # Loewner is the only solve (chore 8e2f7f76); the pair is kept in
-        # the report so stores keep stamping their provenance explicitly.
-        "solve": "loewner",
-        "affine": True,
+        "solve": solve,
+        "affine": solve == "loewner",
         "eig": _FIT_EIG,
         "rcond": float(rcond),
     }
 
 
 @functools.lru_cache(maxsize=None)
-def _sharded_fit_kernel(mesh_xy, n_p, rcond):
-    """One compiled local-row Loewner fit; columns remain replicated."""
+def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
+    """One compiled local-row fit; columns remain replicated."""
     import jax
     import jax.numpy as jnp
     from jax import lax
@@ -154,7 +165,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
         tile = samples.reshape(n_rows * n_cols, n_omega)
         Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
             tile, z, n, guards=guards, rcond=rcond,
-            eig=_FIT_EIG)
+            eig=_FIT_EIG, solve=solve)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
@@ -166,7 +177,11 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
             return jnp.where(valid, x.reshape(n_rows, n_cols), 0.0)[None]
 
         condition = _diag(diag["cond_pade"])
+        condition_support = _diag(diag["cond_support"])
+        condition_denominator = _diag(diag["cond_denominator"])
         backward = _diag(diag["backward_error"])
+        backward_support = _diag(diag["backward_error_support"])
+        backward_denominator = _diag(diag["backward_error_denominator"])
         residual = _diag(diag["max_abs_residual"])
         n_valid = _diag(diag["n_valid"])
         Omega = jnp.where(valid[None, None], Omega, 0.0 + 0.0j)
@@ -174,7 +189,11 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
         finite = (
             jnp.all(jnp.isfinite(Omega)) & jnp.all(jnp.isfinite(Bp))
             & jnp.all(jnp.isfinite(condition))
+            & jnp.all(jnp.isfinite(condition_support))
+            & jnp.all(jnp.isfinite(condition_denominator))
             & jnp.all(jnp.isfinite(backward))
+            & jnp.all(jnp.isfinite(backward_support))
+            & jnp.all(jnp.isfinite(backward_denominator))
             & jnp.all(jnp.isfinite(residual))
             & jnp.all(jnp.isfinite(n_valid)))
         # One scalar-vector reduction, not a pmax plus a second synchronous
@@ -188,14 +207,16 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond):
         )), row_axes)
         maxima = summary[:2]
         finite = (summary[2] == 0.0).astype(jnp.int32)
-        return (Omega, Bp, condition, backward, residual, n_valid,
-                maxima, finite)
+        return (Omega, Bp, condition, condition_support,
+                condition_denominator, backward, backward_support,
+                backward_denominator, residual, n_valid, maxima, finite)
 
     mapped = shard_map(
         _local, mesh=mesh_xy,
         in_specs=(block_spec, P(None), P(row_axes), P(), P()),
         out_specs=(pole_spec, pole_spec, diag_spec, diag_spec, diag_spec,
-                   diag_spec, P(None), P()),
+                   diag_spec, diag_spec, diag_spec, diag_spec, diag_spec,
+                   P(None), P()),
         check_vma=True)
     return jax.jit(mapped)
 
@@ -213,6 +234,7 @@ def fit_one_block(
     n_cols_buffer=None,
     tile_bytes=None,
     rcond=1.0e-13,
+    solve="loewner",
     header=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
@@ -290,13 +312,15 @@ def fit_one_block(
             f"sampled for, or the file is not a double-parallel grid.")
 
     t_fit = time.perf_counter()
-    kernel = _sharded_fit_kernel(mesh_xy, n, float(rcond))
+    pade_fit._check_solve_mode(solve)
+    kernel = _sharded_fit_kernel(mesh_xy, n, float(rcond), solve)
     z_dev = device_put_process_local(
         z, NamedSharding(mesh_xy, P(None)))
     row_ids = device_put_process_local(
         np.arange(n_mu_padded, dtype=np.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
-    (Omega, B, condition, backward, residual, n_valid,
+    (Omega, B, condition, condition_support, condition_denominator,
+     backward, backward_support, backward_denominator, residual, n_valid,
      maxima, finite) = kernel(
         block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
     Omega.block_until_ready()
@@ -307,8 +331,14 @@ def fit_one_block(
         "backward_error": backward,
         "residual": residual,
         "n_valid": n_valid,
-
     }
+    if solve == "companion":
+        diag_block.update({
+            "condition_support": condition_support,
+            "condition_denominator": condition_denominator,
+            "backward_error_support": backward_support,
+            "backward_error_denominator": backward_denominator,
+        })
     maxima_host = np.asarray(maxima.addressable_data(0), dtype=np.float64)
     finite_host = bool(np.asarray(finite.addressable_data(0)))
 
@@ -345,6 +375,7 @@ def run_fit_driver(
     mesh_xy,
     tile_bytes=None,
     rcond=1.0e-13,
+    solve="loewner",
     provenance=None,
     occupation_state=None,
     report_stream=None,
@@ -368,6 +399,7 @@ def run_fit_driver(
     rcond = float(rcond)
     if not 0.0 < rcond < 1.0:
         raise ValueError("run_fit_driver requires 0 < rcond < 1")
+    pade_fit._check_solve_mode(solve)
     # Solver-consistency guards, not material tolerances.  A solve beyond
     # 1/rcond is numerically rank deficient by its own truncation policy;
     # sqrt(eps) is the ordinary backward-stability ceiling for complex128.
@@ -401,14 +433,16 @@ def run_fit_driver(
     plan = tiling.plan_column_walk(n_mu, n_omega, tile_bytes)
     fit_provenance = dict(provenance or {})
     fit_provenance.update({
-        "solve_mode": "loewner",   # the only solve since 2026-08-15
+        "solve_mode": solve,
         "solve_rcond": rcond,
         "eig_mode": _FIT_EIG,
         "fit_fused": True,
     })
     mpa_store.allocate_fit_store_collective(
         fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
-        diagnostic_keys=_DIAGNOSTIC_KEYS,
+        diagnostic_keys=(
+            _DIAGNOSTIC_KEYS if solve == "loewner"
+            else _COMPANION_DIAGNOSTIC_KEYS),
         energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
@@ -422,7 +456,7 @@ def run_fit_driver(
         "n_mu": int(n_mu),
         "n_omega": int(n_omega),
         "n_p": n,
-        "solve": "loewner",
+        "solve": solve,
         "eig": _FIT_EIG,
         "rcond": rcond,
         "n_cols_budget": int(plan["n_cols"]),
@@ -446,6 +480,7 @@ def run_fit_driver(
             w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
             mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
             tile_bytes=tile_bytes, rcond=rcond,
+            solve=solve,
             header=header)
         ledger = stats["ledger"]
         report["blocks_walked"] += 1

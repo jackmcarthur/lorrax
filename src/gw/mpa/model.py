@@ -22,6 +22,7 @@ def make_mpa_plan(config, quad):
     plan = sample_plan.mpa_plan(
         n_p, omega_m, material_class=config.mpa.material_class,
         alpha=config.mpa.sampling_alpha,
+        schedule=config.mpa.sampling_schedule,
         varpi_near=config.mpa.varpi_near_ry,
         varpi_far=config.mpa.varpi_far_ry,
         origin_shift=config.mpa.metal_origin_shift_ry, energy_unit="Ry")
@@ -93,7 +94,7 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z):
 
 
 def _fit_head_samples(
-    fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model,
+    fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model, solve,
     occupation_state=None,
 ):
     """Fit scalar Wc_head on the body's exact complex-frequency grid."""
@@ -101,7 +102,7 @@ def _fit_head_samples(
         complex(sample.wcoul0) - complex(sample.vc0)
         for sample in head_samples
     ], dtype=np.complex128)
-    fitted = fit_driver.fit_scalar_samples(wc, z, n_p)
+    fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
     provenance = {
         "solve_mode": fitted["solve"],
         "solve_affine": fitted["affine"],
@@ -296,11 +297,11 @@ def _solve_wc(
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
-              provenance=None, occupation_state=None):
+              provenance=None, occupation_state=None, solve="loewner"):
     return fit_driver.run_fit_driver(
         sample_path, _WC, fit_path, z, n_p, mesh_xy=mesh_xy,
         tile_bytes=tile_bytes, provenance=provenance,
-        occupation_state=occupation_state)
+        occupation_state=occupation_state, solve=solve)
 
 
 def _metal_kminq_rows(sym, q_idx):
@@ -537,6 +538,8 @@ def build_mpa_fit(
     sampling_record = {"protocol": "double_parallel", "varpi": varpi,
                        "n_p": n_p, "alpha": config.mpa.sampling_alpha,
                        "omega_max": omega_m}
+    if config.mpa.sampling_schedule != "nested":
+        sampling_record["sampling_schedule"] = config.mpa.sampling_schedule
     if config.mpa.metal_origin_shift_ry is not None:
         sampling_record["metal_origin_shift_ry"] = float(
             config.mpa.metal_origin_shift_ry)
@@ -604,7 +607,8 @@ def build_mpa_fit(
             config.backend.w_dyson_solver)
     _, report = _fit_body(
         sample_path, fit_path, z_all, n_p, tile_bytes, mesh_xy,
-        provenance=provenance, occupation_state=occupation_state)
+        provenance=provenance, occupation_state=occupation_state,
+        solve=config.mpa.pole_solver)
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager
     # return is rank-local: without this process barrier rank 0 can enter
@@ -615,21 +619,21 @@ def build_mpa_fit(
     if isinstance(iteration_head, tuple):
         head_fit_samples = iteration_head
         iteration_head = None
-        head_model = "bgw_q0shift_loewner"
+        head_model = f"bgw_q0shift_{config.mpa.pole_solver}"
     elif iteration_head is None:
         head_fit_samples = tuple(
             head_resolver.at(complex(z)) for z in z_all)
-        head_model = "dft_direct_loewner"
+        head_model = f"dft_direct_{config.mpa.pole_solver}"
     else:
         head_fit_samples = iteration_head.samples[:z_all.size]
         if bool(getattr(
                 config.head, "uses_bgw_metal_q0shift", False)):
-            head_model = "bgw_q0shift_loewner"
+            head_model = f"bgw_q0shift_{config.mpa.pole_solver}"
         else:
             head_model = (
-                "qsgw_schur_loewner"
+                f"qsgw_schur_{config.mpa.pole_solver}"
                 if iteration_head_response.Y_x is not None
-                else "qsgw_direct_loewner"
+                else f"qsgw_direct_{config.mpa.pole_solver}"
             )
     fit_ledger = mpa_store.fit_completion_ledger(fit_path)
     _fit_head_samples(
@@ -640,6 +644,7 @@ def build_mpa_fit(
         fit_ledger["w_grid_hash"],
         mesh_xy,
         model=head_model,
+        solve=config.mpa.pole_solver,
         occupation_state=occupation_state,
     )
     print_fn(fit_driver.format_cost_report(report))
