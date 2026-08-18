@@ -784,8 +784,8 @@ def _entry_point_call_sequence():
 def test_the_entry_point_calls_the_phases_in_the_one_correct_order():
     seq = _entry_point_call_sequence()
     wanted = ["install_failfast_excepthook", "bootstrap", "prepare_mesh",
-              "ensure_jax_compile_cache", "collect_startup_facts",
-              "format_startup_report"]
+              "ensure_jax_compile_cache", "_install_pjrt_log_filter",
+              "collect_startup_facts", "format_startup_report"]
     idx = []
     for w in wanted:
         assert w in seq, f"{w} is not called by initialize_communicator_stack"

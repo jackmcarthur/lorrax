@@ -273,7 +273,10 @@ destruction deadlocks after fully-cold in-process compile storms (jobs
 7884928/7884989); `gw.gw_jax` is the adopter. Order: failfast hook → env defaults →
 collectives announcement → plugin skip → `jax.distributed` → backend init
 (the CPU demotion point) → mesh + warm-up → compile cache → the rank-0
-startup report. Refuses: an unrecognized `XLA_PYTHON_CLIENT_ALLOCATOR`
+startup report. The compile-cache step also arms an fd-level exact-line
+filter for OpenXLA's upstream-removed PjRt-IFRT executable-version notice;
+it does not change C++ log severity or suppress any other PJRT warning.
+Refuses: an unrecognized `XLA_PYTHON_CLIENT_ALLOCATOR`
 spelling (resolve time, before jaxlib turns it into a fake missing-backend
 error); a cuda-init failure **on a GPU node** is re-raised, never masked.
 Announces: every demotion tagged `DEMOTION:`, the resolved collectives

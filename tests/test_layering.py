@@ -104,7 +104,7 @@ _L3_MODULES = frozenset({
     # import, and a startup fact that only ``runtime`` consumes is a sibling
     # of ``runtime``, not something above it.
     "runtime", "runtime.aot_memory", "runtime.padding", "runtime.xla_memory",
-    "runtime.jax_support",
+    "runtime.jax_support", "runtime.pjrt_log_filter",
     # the cross-process service and its one policy client
     "common.collectives", "centroid.distribution",
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``

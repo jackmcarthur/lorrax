@@ -76,6 +76,9 @@ import subprocess
 # ``ModuleNotFoundError: No module named 'runtime.jax_support'`` from the
 # other tree.
 from .jax_support import enforce as _enforce_jax_support
+from .pjrt_log_filter import (install_pjrt_log_filter as
+                              _install_pjrt_log_filter,
+                              stop_pjrt_log_filter as _stop_pjrt_log_filter)
 
 
 _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
@@ -1282,6 +1285,9 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        must stay the small, sequentially-executed program that makes the
        warm-up work at all, and running it before the cache layer is
        installed keeps that measured behaviour byte-identical.
+       The exact-line PJRT stderr filter is installed immediately afterward:
+       it removes only OpenXLA's upstream-deleted executable-version notice,
+       while the compile cache and all compatibility checks remain live.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
 
@@ -1351,6 +1357,13 @@ def initialize_communicator_stack(*, platform: str = "gpu",
         # SILENT: a run that quietly lost its compile cache looks like a
         # performance regression with no cause in the log.
         cache_error = f"{type(exc).__name__}: {exc}"
+    try:
+        _install_pjrt_log_filter()
+    except Exception as exc:                                  # noqa: BLE001
+        # Log hygiene is never a reason to refuse a scientific run.  State
+        # the failure and leave fd 2 completely unmodified.
+        say(f"  [runtime] exact PJRT notice filter unavailable "
+            f"({type(exc).__name__}: {exc}); stderr is unfiltered")
     _t_cache = time.perf_counter()
     # -- 8 ------------------------------------------------------------------
     facts = collect_startup_facts(mesh, cache_error=cache_error)
@@ -1460,6 +1473,12 @@ def finalize_process(rc: int = 0):
     except Exception as exc:                              # noqa: BLE001
         _print_rank0(f"  [finalize] an atexit hook failed "
                      f"({type(exc).__name__}: {exc}); continuing")
+    pjrt_notices = _stop_pjrt_log_filter()
+    if pjrt_notices:
+        _print_rank0(
+            f"[runtime] filtered {pjrt_notices} repetition(s) on rank 0 of "
+            "the upstream-removed PjRt-IFRT cache-deserialization notice; "
+            "all other stderr was forwarded unchanged.")
     _print_rank0(
         "[runtime] process finalized explicitly (effects barrier, "
         "distributed shutdown, atexit hooks) and ending with os._exit: the "
