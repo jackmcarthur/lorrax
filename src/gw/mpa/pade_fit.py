@@ -172,36 +172,13 @@ DEFAULT_GUARDS = {
 
 _GUARD_KEYS = tuple(DEFAULT_GUARDS)
 
-#: THE DENOMINATOR SOLVE.  ``SOLVE_MODES`` was a two-entry tuple until
-#: 2026-08-15; it is no longer a symbol, and this block is the record of
-#: the choice it used to express.  Both modes answered the SAME
-#: interpolation problem -- ``n_p`` poles through ``2*n_p`` samples of
-#: ``W_c`` in ``x = z**2`` -- and both returned ``(B_p, Omega_p)`` in the
-#: identical representation; they differed only in the algebra that got
-#: there, and therefore only in what finite precision did to the answer.
-#:
-#: ``"loewner"``
-#:     The fixed-support Loewner pencil.  Never forms a power of ``x``,
-#:     so the Vandermonde conditioning is simply absent.  **The only
-#:     solve.**
-#:
-#: THE ``"pade"`` MODE WAS REMOVED 2026-08-15 (owner ruling).  It was the
-#: published cross-multiplied Pade-in-z^2 system (sigma-paper Eqs. S9/S8)
-#: with an affine domain map; ``solve="pade", affine=False`` reproduced
-#: the shipped 2026-08-09 solve exactly and was the red twin.  The
-#: verdict table below is KEPT because it is the record of WHY Loewner
-#: won, and it should outlive the code it describes.  Closing
-#: measurement: JID 56960468, live artifacts at
-#: ``mpa_damped_sigma_n10_0814/run/``.
-#:
-#: THE TENSION, STATED SO IT IS NOT UNDONE BY ACCIDENT: deleting the
-#: mode removes the ability to re-run that negative control.  That is
-#: acceptable, and it is the SAME distinction that made restoring
-#: ``residue_width_census`` correct -- a superseded IMPLEMENTATION only
-#: re-answers a settled question, whereas an INSTRUMENT diagnoses future
-#: unknowns.  Keep instruments; delete superseded implementations, and
-#: keep their verdict.  Re-adding a second solve mode needs a NEW
-#: question, not this one.
+#: DENOMINATOR-SOLVE HISTORY.  The affine or unscaled simultaneous ``2n``
+#: power-basis system measured below was removed on 2026-08-15.  The
+#: ``companion`` selector added for the 2026-08-18 Leon-recipe reconciliation
+#: is NOT that deleted implementation: it is the papers' and Yambo's literal
+#: two-half elimination, two direct ``n``-by-``n`` solves, near-line power
+#: normalization, coefficient unscaling, and companion matrix.  The old table
+#: remains useful evidence about a different finite-precision construction.
 
 #: Measured on 36,096 production ``W_c`` elements of the frozen Si
 #: 4x4x4 deck (q in {0,1,21,63}, all 1128 rows, columns 0:8), reading
@@ -266,6 +243,13 @@ _GUARD_KEYS = tuple(DEFAULT_GUARDS)
 #: under a store that was written before it existed.
 EIG_MODES = ("lapack", "jax_qr")
 
+#: Pole-identification algebra.  ``loewner`` remains the default and its
+#: implementation is unchanged.  ``companion`` is the Leon/Yambo linear
+#: algorithm: eliminate the numerator through the two sampling halves, solve
+#: the resulting n-by-n denominator system, and diagonalize its companion
+#: matrix after mapping coefficients out of the near-line normalization.
+SOLVE_MODES = ("loewner", "companion")
+
 
 def _eigvals(M, eig):
     """Eigenvalues of one small matrix, through the chosen backend.
@@ -289,6 +273,15 @@ def _check_eig_mode(eig):
             "is one: the two backends do not agree bit for bit, so a typo "
             "that silently read as the default would put poles in a store "
             "that cannot say which root-finder made them.")
+
+
+def _check_solve_mode(solve):
+    if solve not in SOLVE_MODES:
+        raise ValueError(
+            f"GATE solve_mode_known: solve={solve!r} is not one of "
+            f"{SOLVE_MODES}. FALSE case: solve names a pole-identification "
+            "algorithm this kernel implements; typos refuse rather than "
+            "silently selecting the default.")
 
 
 def _resolve_guards(guards):
@@ -546,6 +539,89 @@ def _companion_roots(c_coeffs, eig="lapack"):
     return _eigvals(comp, eig)
 
 
+def _condition_2(A):
+    """Return ``(cond_2, sigma_max, sigma_min)`` for one small matrix."""
+
+    s = jnp.linalg.svd(A, compute_uv=False)
+    s_max = s[0]
+    s_min = s[-1]
+    cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
+    return cond, s_max, s_min
+
+
+def _solve_backward_error(A, rhs, solution):
+    """Normwise backward error of one direct linear solve."""
+
+    num = jnp.linalg.norm(A @ solution - rhs)
+    den = (jnp.linalg.norm(A) * jnp.linalg.norm(solution)
+           + jnp.linalg.norm(rhs))
+    return num / jnp.where(den > 0, den, 1.0)
+
+
+def _leon_companion_roots(w, x, x_max, n, eig="lapack"):
+    """Leon/Yambo eliminated-denominator solve and companion roots.
+
+    This is the construction of Leon *et al.* (2021), Appendix A,
+    Eqs. (46)--(50), in the executable ordering used by Yambo's
+    ``mpa_E_solver``.  The caller supplies ``x=z**2`` with the near line in
+    ``[:n]`` and far line in ``[n:]``.  Its normalization is deliberately
+    NOT LORRAX's all-sample ``x_max``: Yambo sets ``Wm=max(abs(x[:n]))``.
+
+    In exact Yambo signs, for ``Y[j,k]=(x_j/Wm)**k``::
+
+        M = -W[:,None] * Y
+        v = W * x**n
+        T = Y2 @ inv(Y1)
+        (T @ M1 - M2) b = T @ v1 - v2
+        c_k = b_k / Wm**k
+
+    The eigenvalues of the companion matrix with last column ``-c`` are
+    ``Omega**2`` in the caller's original energy units.  Only then are they
+    mapped to LORRAX's shared ``b_hat=Omega**2/x_max`` residue domain.
+
+    The papers/Yambo use direct dense solves, so this path does too: no row
+    equilibration, affine map, truncated SVD, or fitted regularizer is added.
+    SVDs below are diagnostics only and do not participate in either solve.
+    """
+
+    wm = jnp.max(jnp.abs(x[:n]))
+    wm = jnp.where(wm > 0, wm, 1.0).astype(jnp.float64)
+    y = x / wm.astype(jnp.complex128)
+    powers = jnp.arange(n)
+    Y = y[:, None] ** powers[None, :]
+    Y1, Y2 = Y[:n], Y[n:]
+    w1, w2 = w[:n], w[n:]
+    x1, x2 = x[:n], x[n:]
+    M1 = -w1[:, None] * Y1
+    M2 = -w2[:, None] * Y2
+    v1 = w1 * x1 ** n
+    v2 = w2 * x2 ** n
+
+    eye = jnp.eye(n, dtype=jnp.complex128)
+    Y1_inv = jnp.linalg.solve(Y1, eye)
+    transfer = Y2 @ Y1_inv
+    denominator = transfer @ M1 - M2
+    rhs = transfer @ v1 - v2
+    b = jnp.linalg.solve(denominator, rhs)
+
+    coefficient_scale = wm.astype(jnp.complex128) ** powers
+    c = b / coefficient_scale
+    roots_x = _companion_roots(c, eig)
+
+    cond_support, support_smax, support_smin = _condition_2(Y1)
+    cond_denominator, denom_smax, denom_smin = _condition_2(denominator)
+    support_bwd = _solve_backward_error(Y1, eye, Y1_inv)
+    denom_bwd = _solve_backward_error(denominator, rhs, b)
+    cond = jnp.maximum(cond_support, cond_denominator)
+    bwd = jnp.maximum(support_bwd, denom_bwd)
+    return (
+        roots_x / x_max.astype(jnp.complex128),
+        cond, denom_smax, denom_smin, bwd,
+        cond_support, cond_denominator, support_bwd, denom_bwd,
+        support_smax, support_smin, wm,
+    )
+
+
 def _guard_reflection(b_hat):
     """Guard 1 -- metals-paper SI Eq. (S18).  Returns ``(b_hat, fired)``.
 
@@ -695,6 +771,7 @@ def fit_mpa_poles(
     refit_after_guards=True,
     rcond=1.0e-13,
     eig=EIG_MODES[0],
+    solve=SOLVE_MODES[0],
 ):
     """Fit ``n_p`` MPA poles to one element's ``2*n_p`` samples of W_c.
 
@@ -727,6 +804,11 @@ def fit_mpa_poles(
         inside XLA and is the only one of the two that batches, but it
         does NOT reproduce the other bit for bit -- see
         :data:`EIG_MODES`.
+    solve
+        Pole-identification algebra, one of :data:`SOLVE_MODES`.
+        ``"loewner"`` is the unchanged default.  ``"companion"`` is the
+        literal Leon/Yambo two-half denominator elimination and companion
+        mapping; it adds no affine scaling or regularization.
 
     Returns
     -------
@@ -742,6 +824,7 @@ def fit_mpa_poles(
     _check_sample_support(W_samples, z_samples, n_p)
     cfg = _resolve_guards(guards)
     _check_eig_mode(eig)
+    _check_solve_mode(solve)
     n = int(n_p)
 
     w = jnp.asarray(W_samples, dtype=jnp.complex128)
@@ -753,7 +836,22 @@ def fit_mpa_poles(
     # stage 3 ``b_hat = Omega**2 / x_max``, the scaled pole positions in
     # the x = z**2 plane.  One solve since 2026-08-15 (see the record
     # above the verdict table).
-    b_hat, cond, s_max, s_min, bwd = _loewner_roots(w, x_hat, n, rcond, eig)
+    if solve == "loewner":
+        b_hat, cond, s_max, s_min, bwd = _loewner_roots(
+            w, x_hat, n, rcond, eig)
+        cond_support = cond
+        cond_denominator = cond
+        backward_support = bwd
+        backward_denominator = bwd
+        support_smax = s_max
+        support_smin = s_min
+        companion_wm = x_max
+    else:
+        (b_hat, cond, s_max, s_min, bwd,
+         cond_support, cond_denominator,
+         backward_support, backward_denominator,
+         support_smax, support_smin, companion_wm) = _leon_companion_roots(
+             w, x, x_max, n, eig)
 
     # Keep the raw roots for the one-solve residue path below.  A corrected
     # element must solve on its guarded, sorted poles; an untouched element
@@ -838,6 +936,8 @@ def fit_mpa_poles(
         "valid": valid,
         "n_valid": jnp.sum(valid.astype(jnp.int32)),
         "cond_pade": cond,
+        "cond_support": cond_support,
+        "cond_denominator": cond_denominator,
         # THE BACKWARD ERROR, BESIDE THE CONDITION NUMBER IT IS READ WITH.
         # ``mpa_store.write_fit_block`` requires both and this kernel used
         # to return only the second, so the only supplier was a function
@@ -846,8 +946,13 @@ def fit_mpa_poles(
         # element for one block.  Returning it here is the perf lane's
         # proposed diff (MPA_16GPU_PLAN §FIT-EFFICIENCY), folded.
         "backward_error": bwd,
+        "backward_error_support": backward_support,
+        "backward_error_denominator": backward_denominator,
         "sigma_max_pade": s_max,
         "sigma_min_pade": s_min,
+        "sigma_max_support": support_smax,
+        "sigma_min_support": support_smin,
+        "companion_wm": companion_wm,
         "x_max": x_max,
         "n_reflected": jnp.sum(fired_reflection.astype(jnp.int32)),
         "n_time_order_flipped": jnp.sum(fired_time_order.astype(jnp.int32)),
@@ -880,6 +985,7 @@ def fit_mpa_poles_batched(
     refit_after_guards=True,
     rcond=1.0e-13,
     eig=EIG_MODES[0],
+    solve=SOLVE_MODES[0],
 ):
     """``fit_mpa_poles`` vmapped over the leading (element) axis.
 
@@ -902,7 +1008,8 @@ def fit_mpa_poles_batched(
     def _one(w_row):
         return fit_mpa_poles(
             w_row, z_samples, n_p, guards=guards,
-            refit_after_guards=refit_after_guards, rcond=rcond, eig=eig)
+            refit_after_guards=refit_after_guards, rcond=rcond, eig=eig,
+            solve=solve)
 
     return jax.vmap(_one)(tile)
 
