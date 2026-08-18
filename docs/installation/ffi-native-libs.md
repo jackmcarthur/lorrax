@@ -82,6 +82,17 @@ cmake --build build -j && cmake --install build
 
 ## 4. Build `liblorrax_ffi.so` (non-Shifter)
 
+!!! danger "TODO — direct-convolution AOT is sm_80 only"
+    With nvcc enabled, this build currently embeds direct-convolution cubins
+    for **sm_80 only** (Perlmutter's A100). Other GPU architectures still
+    work through a named runtime-NVRTC fallback, but a cold process can pay
+    about 30 seconds before its first convolution. A production installer
+    for another GPU must supply a real fatbin architecture list or an
+    install-time compile step; the present A100-only default is not portable.
+    The source remains single-copy: generated `.cu` files are extracted from
+    each handler's `kKernelSrc` literal. See
+    [CUDA kernel migration](../dev/cuda_kernel_migration.md#aot-images-and-the-sm_80-installation-gap).
+
 On NERSC the launcher `src/ffi/cpp/run_shifter.sh` sets the MPI env vars and runs
 `build.sh` inside the container (see [Perlmutter](perlmutter.md)). Off-container, drive
 CMake directly with explicit `-D` overrides — the CMake config already supports pointing at

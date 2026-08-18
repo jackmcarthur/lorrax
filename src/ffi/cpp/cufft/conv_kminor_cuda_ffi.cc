@@ -280,6 +280,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -303,6 +304,13 @@
 namespace lorrax_ffi::conv_kminor {
 
 namespace ffi = ::xla::ffi;
+
+#if LORRAX_FFI_HAVE_PREBUILT_SM80
+extern "C" {
+extern const unsigned char _binary_lrx_conv_kminor_sm80_cubin_start[];
+extern const unsigned char _binary_lrx_conv_kminor_sm80_cubin_end[];
+}
+#endif
 using C128 = std::complex<double>;
 
 // ---------------------------------------------------------------------------
@@ -1221,54 +1229,86 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
                        dev),
                    "query max dynamic shared memory per block (opt-in)");
 
-    nvrtcProgram prog = nullptr;
-    nvrtcResult nr = nvrtcCreateProgram(&prog, kKernelSrc,
-                                        "lrx_conv_kminor.cu",
-                                        0, nullptr, nullptr);
-    if (nr != NVRTC_SUCCESS) {
-        return fail_sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
+    std::vector<char> image;
+    const void* image_data = nullptr;
+    size_t image_size = 0;
+    bool used_cubin = true;
+    bool used_prebuilt = false;
+    double nvrtc_compile_ms = 0.0;
+#if LORRAX_FFI_HAVE_PREBUILT_SM80
+    if (cc_major == 8 && cc_minor == 0) {
+        const auto* begin = _binary_lrx_conv_kminor_sm80_cubin_start;
+        const auto* end = _binary_lrx_conv_kminor_sm80_cubin_end;
+        const uintptr_t begin_addr = reinterpret_cast<uintptr_t>(begin);
+        const uintptr_t end_addr = reinterpret_cast<uintptr_t>(end);
+        if (end_addr <= begin_addr) {
+            return fail_sticky("embedded sm_80 cubin",
+                               "linker image has empty or inverted bounds");
+        }
+        image_data = begin;
+        image_size = static_cast<size_t>(end_addr - begin_addr);
+        used_prebuilt = true;
     }
-    char arch[64];
-    std::snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d",
-                  cc_major, cc_minor);
-    // FMA contraction is left ON (the nvrtc default).  It is both faster and
-    // MORE accurate here — one rounding per complex multiply-accumulate
-    // instead of two — and bit-equality with XLA's radix emission was never
-    // on offer anyway (different algorithm); the gate is 1e-15, value-level.
-    const char* opts[] = {arch};
-    nr = nvrtcCompileProgram(prog, 1, opts);
-    if (nr != NVRTC_SUCCESS) {
-        size_t log_sz = 0;
-        std::string log;
-        if (nvrtcGetProgramLogSize(prog, &log_sz) == NVRTC_SUCCESS &&
-            log_sz > 1) {
-            log.resize(log_sz);
-            nvrtcGetProgramLog(prog, &log[0]);
+#endif
+    if (!used_prebuilt) {
+        if (mklpin::announce_here()) {
+            std::fprintf(stderr,
+                "[conv_kminor] AOT_ARCH_MISS: no embedded cubin for sm_%d%d; "
+                "paying runtime NVRTC compilation now\n",
+                cc_major, cc_minor);
+        }
+        nvrtcProgram prog = nullptr;
+        nvrtcResult nr = nvrtcCreateProgram(&prog, kKernelSrc,
+                                            "lrx_conv_kminor.cu",
+                                            0, nullptr, nullptr);
+        if (nr != NVRTC_SUCCESS) {
+            return fail_sticky("nvrtcCreateProgram", nvrtcGetErrorString(nr));
+        }
+        char arch[64];
+        std::snprintf(arch, sizeof(arch), "--gpu-architecture=sm_%d%d",
+                      cc_major, cc_minor);
+        // FMA contraction stays at NVRTC's default; the value gate is 1e-15.
+        const char* opts[] = {arch};
+        const auto nvrtc_t0 = std::chrono::steady_clock::now();
+        nr = nvrtcCompileProgram(prog, 1, opts);
+        nvrtc_compile_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - nvrtc_t0).count();
+        if (nr != NVRTC_SUCCESS) {
+            size_t log_sz = 0;
+            std::string log;
+            if (nvrtcGetProgramLogSize(prog, &log_sz) == NVRTC_SUCCESS &&
+                log_sz > 1) {
+                log.resize(log_sz);
+                nvrtcGetProgramLog(prog, &log[0]);
+            }
+            nvrtcDestroyProgram(&prog);
+            return fail_sticky(
+                "nvrtcCompileProgram",
+                std::string(nvrtcGetErrorString(nr)) + " — " + log);
+        }
+        nvrtcResult image_result;
+        if (nvrtcGetCUBINSize(prog, &image_size) == NVRTC_SUCCESS &&
+            image_size > 0) {
+            image.resize(image_size);
+            image_result = nvrtcGetCUBIN(prog, image.data());
+        } else if (nvrtcGetPTXSize(prog, &image_size) == NVRTC_SUCCESS &&
+                   image_size > 0) {
+            image.resize(image_size);
+            image_result = nvrtcGetPTX(prog, image.data());
+            used_cubin = false;
+        } else {
+            image_result = NVRTC_ERROR_INTERNAL_ERROR;
         }
         nvrtcDestroyProgram(&prog);
-        return fail_sticky("nvrtcCompileProgram",
-                           std::string(nvrtcGetErrorString(nr)) + " — " + log);
-    }
-    std::vector<char> image;
-    size_t sz = 0;
-    bool used_cubin = false;
-    if (nvrtcGetCUBINSize(prog, &sz) == NVRTC_SUCCESS && sz > 0) {
-        image.resize(sz);
-        nr = nvrtcGetCUBIN(prog, image.data());
-        used_cubin = true;
-    } else if (nvrtcGetPTXSize(prog, &sz) == NVRTC_SUCCESS && sz > 0) {
-        image.resize(sz);
-        nr = nvrtcGetPTX(prog, image.data());
-    } else {
-        nr = NVRTC_ERROR_INTERNAL_ERROR;
-    }
-    nvrtcDestroyProgram(&prog);
-    if (nr != NVRTC_SUCCESS || image.empty()) {
-        return fail_sticky("nvrtc get cubin/ptx", nvrtcGetErrorString(nr));
+        if (image_result != NVRTC_SUCCESS || image.empty()) {
+            return fail_sticky("nvrtc get cubin/ptx",
+                               nvrtcGetErrorString(image_result));
+        }
+        image_data = image.data();
     }
 
     CUmodule mod = nullptr;
-    cr = api.ModuleLoadData(&mod, image.data());
+    cr = api.ModuleLoadData(&mod, image_data);
     if (cr != CUDA_SUCCESS) {
         return fail_sticky("cuModuleLoadData", cu_err(cr));
     }
@@ -1331,12 +1371,20 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     // Record the envelope only once every arm is loaded and raised, so a plan
     // can never be made against a limit the kernels do not actually have.
     arms.smem_max = (smem_optin > 49152) ? smem_optin : 49152;
-    if (log_enabled()) {
+    if (used_prebuilt && log_enabled()) {
         std::fprintf(stderr,
-                     "[conv_kminor] NVRTC kernels compiled for sm_%d%d "
+            "[conv_kminor] AOT_SM80_HIT: loaded embedded sm_80 cubin "
+            "(%zu B, device %d, %d strided + 3 contiguous arms); NVRTC "
+            "skipped; dynamic shared max %d B -> largest k-row %d points\n",
+            image_size, dev, kEptMax, arms.smem_max,
+            arms.smem_max / 16 - 2);
+    } else if (log_enabled()) {
+        std::fprintf(stderr,
+                     "[conv_kminor] NVRTC kernels compiled for sm_%d%d in "
+                     "%.3f ms "
                      "(%zu B %s, device %d, %d strided + 3 contiguous arms); "
                      "dynamic shared max %d B -> largest k-row %d points\n",
-                     cc_major, cc_minor, image.size(),
+                     cc_major, cc_minor, nvrtc_compile_ms, image_size,
                      used_cubin ? "cubin" : "ptx", dev, kEptMax,
                      arms.smem_max, arms.smem_max / 16 - 2);
     }
