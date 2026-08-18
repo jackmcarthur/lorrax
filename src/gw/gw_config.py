@@ -2822,6 +2822,30 @@ def _normalize_bgw_metal_q0_treatment(value) -> str:
     return mode
 
 
+def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
+    """Refuse a BGW q0 bundle whose finite-q W channel is not consumed."""
+    if not bool(config.head.uses_bgw_metal_q0shift):
+        return
+    mode = config.compute_mode
+    if mode is ComputeMode.MPA:
+        return
+    raise ValueError(
+        "GATE bgw_q0shift_requires_mpa: "
+        "bgw_metal_q0_treatment = bgw_q0shift is refused with "
+        f"compute_mode = {mode.value}.\n"
+        f"  got:  bgw_metal_q0_treatment = bgw_q0shift, "
+        f"compute_mode = {mode.value}\n"
+        "  want: compute_mode = mpa\n"
+        "  fix:  use compute_mode = mpa to consume the matching finite-q0 "
+        "epsilon-inverse W head/wings, or set "
+        "bgw_metal_q0_treatment = exact\n"
+        "  why:  cohsex, gn_ppm, hl_ppm, and x_only do not consume the "
+        "finite-q0 epsilon-inverse channel; allowing the key would pair "
+        "BerkeleyGW's analytic-sphere v0 with a different W0\n"
+        "  doc:  docs/input_reference.md '## Screening', "
+        "bgw_metal_q0_treatment.")
+
+
 def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
     """Parse one reduced-coordinate q0 vector without guessing its units."""
     raw = str(value or "").replace(",", " ").split()
@@ -4430,5 +4454,6 @@ class LorraxConfig:
         # legacy flags), and the honest way to ask which mode a deck chose
         # is to ask the resolver, not to re-derive it here.  A w_rpa deck
         # returns from this call before either property is touched.
+        refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
         return resolved

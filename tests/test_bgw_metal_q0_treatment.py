@@ -97,7 +97,8 @@ def test_absent_and_explicit_exact_are_byte_identical(tmp_path):
 def test_bgw_q0shift_overrides_inherited_body_average_and_announces(tmp_path):
     messages = []
     cfg = _config(
-        tmp_path, "bgw_metal_q0_treatment = bgw_q0shift\n",
+        tmp_path,
+        "bgw_metal_q0_treatment = bgw_q0shift\ncompute_mode = mpa\n",
         messages=messages)
     assert cfg.head.mc_average_vcoul_body is False
     assert cfg.head.analytic_q0_sphere is True
