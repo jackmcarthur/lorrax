@@ -70,6 +70,11 @@ def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
     np.testing.assert_array_equal(z[:15].real, expected_real)
 
 
+def test_thiele_solver_is_deck_selectable(tmp_path):
+    config = _config(tmp_path, "mpa_pole_solver = thiele\n")
+    assert config.mpa.pole_solver == "thiele"
+
+
 @pytest.mark.parametrize(
     "line,value",
     [("mpa_sampling_schedule = improvised\n", "mpa_sampling_schedule"),

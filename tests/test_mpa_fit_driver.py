@@ -100,6 +100,26 @@ def test_scalar_companion_selector_stamps_component_diagnostics():
     np.testing.assert_allclose(reconstructed, samples, rtol=2e-7, atol=2e-7)
 
 
+def test_scalar_thiele_selector_stamps_yambo_root_backend():
+    """The PT diagnostic reaches Yambo's recurrence plus ``geev`` route."""
+
+    n_p = 4
+    z = sampling.double_parallel_grid(
+        n_p, 4.0, material_class="metal", alpha=1, schedule="leon")
+    omega_ref = np.asarray(
+        [0.7 - 0.08j, 1.4 - 0.12j, 2.2 - 0.18j, 3.0 - 0.22j])
+    residue_ref = np.asarray(
+        [1.0 + 0.1j, 0.7 - 0.2j, 0.4 + 0.05j, 0.2 - 0.03j])
+    samples = pade_fit.synthesize_w_samples(omega_ref, residue_ref, z)
+    fitted = fit_driver.fit_scalar_samples(
+        samples, z, n_p, solve="thiele")
+    assert fitted["solve"] == "thiele"
+    assert fitted["eig"] == "lapack"
+    reconstructed = pade_fit.synthesize_w_samples(
+        fitted["Omega_p"], fitted["B_p"], z)
+    np.testing.assert_allclose(reconstructed, samples, rtol=2e-7, atol=2e-7)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _host_slabio_for_driver_tests():
     """Exercise the collective API on CPU; PHDF5 itself has cluster tests.
@@ -344,6 +364,27 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     # complex128 round-trips exactly, so the disk leg must cost nothing.
     assert d_omega < 1.0e-7
     assert d_b < 1.0e-6
+
+
+def test_thiele_end_to_end_writes_extended_diagnostics(tmp_path, mesh_xy):
+    """PT must survive the disk driver, not only the scalar recurrence."""
+
+    w_path = tmp_path / "W_thiele.h5"
+    field = _write_w_file(w_path)
+    fit_path = tmp_path / "mpa_fit_thiele.h5"
+    ledger, report = fit_driver.run_fit_driver(
+        str(w_path), _W_NAME, str(fit_path), field["z"], field["n_p"],
+        mesh_xy=mesh_xy, solve="thiele")
+
+    assert ledger["complete"]
+    assert report["solve"] == "thiele"
+    assert report["eig"] == "lapack"
+    _, _, diagnostics, _ = MS.read_fit_tensors(str(fit_path))
+    for key in (
+            "condition_support", "condition_denominator",
+            "backward_error_support", "backward_error_denominator"):
+        assert key in diagnostics
+        assert np.all(np.isfinite(diagnostics[key]))
 
 
 def test_p4_nondivisible_rows_are_padded_not_gathered(mesh_xy):

@@ -66,14 +66,20 @@ __all__ = [
 #: some blocks and not others reads back as zero for the rest, and a
 #: zero condition number is a perfectly conditioned solve.
 _DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
-_COMPANION_DIAGNOSTIC_KEYS = _DIAGNOSTIC_KEYS + (
+_ALTERNATE_DIAGNOSTIC_KEYS = _DIAGNOSTIC_KEYS + (
     "condition_support", "condition_denominator",
     "backward_error_support", "backward_error_denominator")
 
-# Both stamped solve modes use the fully JAX-resident QR root finder.  Loewner
-# remains the deck default; selecting the Leon companion solve is explicit in
-# the deck and fit-store provenance.
+# Loewner and the linear companion diagnostic use the fully JAX-resident QR
+# root finder.  The Padé--Thiele diagnostic uses LAPACK/cuSOLVER ``geev``
+# because that is the root step in Yambo's published PT implementation; its
+# lack of GPU batching is accepted and printed as part of this diagnostic
+# route's cost rather than changing the algorithm being compared.
 _FIT_EIG = "jax_qr"
+
+
+def _fit_eig(solve):
+    return "lapack" if solve == "thiele" else _FIT_EIG
 
 
 @functools.lru_cache(maxsize=None)
@@ -84,12 +90,13 @@ def _scalar_fit_kernel(n_p, guard_items, rcond, solve):
 
     guards = dict(guard_items)
     n = int(n_p)
+    eig = _fit_eig(solve)
 
     @jax.jit
     def _kernel(samples, z):
         return pade_fit.fit_mpa_poles(
             samples, z, n, guards=guards, rcond=float(rcond),
-            eig=_FIT_EIG, solve=solve)
+            eig=eig, solve=solve)
 
     return _kernel
 
@@ -137,7 +144,7 @@ def fit_scalar_samples(
         "n_valid": int(np.asarray(diagnostics["n_valid"])),
         "solve": solve,
         "affine": solve == "loewner",
-        "eig": _FIT_EIG,
+        "eig": _fit_eig(solve),
         "rcond": float(rcond),
     }
 
@@ -158,6 +165,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
     diag_spec = P(None, row_axes, None)
     guards = pade_fit._resolve_guards(None)
     n = int(n_p)
+    eig = _fit_eig(solve)
 
     def _local(block, z, row_ids, n_mu_logical, n_cols_logical):
         samples = jnp.transpose(block[:, 0], (1, 2, 0))
@@ -165,7 +173,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
         tile = samples.reshape(n_rows * n_cols, n_omega)
         Omega, Bp, diag = pade_fit.fit_mpa_poles_batched(
             tile, z, n, guards=guards, rcond=rcond,
-            eig=_FIT_EIG, solve=solve)
+            eig=eig, solve=solve)
         Omega = jnp.transpose(
             Omega.reshape(n_rows, n_cols, n), (2, 0, 1))[:, None]
         Bp = jnp.transpose(
@@ -324,7 +332,7 @@ def fit_one_block(
         "residual": residual,
         "n_valid": n_valid,
     }
-    if solve == "companion":
+    if solve != "loewner":
         diag_block.update({
             "condition_support": condition_support,
             "condition_denominator": condition_denominator,
@@ -427,14 +435,14 @@ def run_fit_driver(
     fit_provenance.update({
         "solve_mode": solve,
         "solve_rcond": rcond,
-        "eig_mode": _FIT_EIG,
+        "eig_mode": _fit_eig(solve),
         "fit_fused": True,
     })
     mpa_store.allocate_fit_store_collective(
         fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
         diagnostic_keys=(
             _DIAGNOSTIC_KEYS if solve == "loewner"
-            else _COMPANION_DIAGNOSTIC_KEYS),
+            else _ALTERNATE_DIAGNOSTIC_KEYS),
         energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],
@@ -449,7 +457,7 @@ def run_fit_driver(
         "n_omega": int(n_omega),
         "n_p": n,
         "solve": solve,
-        "eig": _FIT_EIG,
+        "eig": _fit_eig(solve),
         "rcond": rcond,
         "n_cols_budget": int(plan["n_cols"]),
         "n_blocks_per_q": int(plan["n_blocks"]),
