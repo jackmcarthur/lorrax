@@ -25,6 +25,7 @@ from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 from .gw_config import ZETA_RCOND_DEFAULT, active_zeta_truncating_knobs, env_bool
 
 from isdf.core import (
+    build_psi_r_cache_sm,
     c_q_from_psi_sm,
     host_rss_gb as _host_rss_gb,
     factor_c_q,
@@ -913,9 +914,9 @@ def fit_zeta_to_h5(
             (_bfe_transport - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
 
-    # Build the host-resident ψ(G) store.  Both modes keep zero
-    # persistent device residency — the jit fetches one bc at a time
-    # via io_callback.  See :mod:`common.psi_G_store` for details.
+    # Build the host-resident ψ(G) staging store.  It supplies one band
+    # chunk at a time while the all-P-sharded ψ(r) cache is built below,
+    # then its host tiles are released before the r-chunk loop.
     from common.psi_G_store import build_psi_G_store
     psi_G_store = build_psi_G_store(
         wfn=wfn, sym=sym, mesh_xy=mesh_xy, meta=meta,
@@ -923,6 +924,30 @@ def fit_zeta_to_h5(
         bispinor=bispinor,
         mode=gspace_mode,
     )
+
+    # Hoist the full-grid ψ(G)->ψ(r) transforms once.  The cache's band
+    # axis is sharded over the complete ('x','y') mesh; no rank holds the
+    # full window at P>1, and there is no μ axis (hence no N_μ² object).
+    # ``file_reread`` still has a bounded host lifetime: populate once for
+    # this build, block until every io_callback has drained, then free it.
+    with timing.section("zeta_fit.build_psi_r_cache"):
+        psi_G_store.begin_rchunk(0, n_rtot)
+        try:
+            psi_r_cache = build_psi_r_cache_sm(
+                psi_G_store, mesh_xy=mesh_xy)
+            psi_r_cache.block_until_ready()
+        finally:
+            psi_G_store.end_rchunk()
+    _cache_local_bytes = sum(
+        int(shard.data.size) * int(shard.data.dtype.itemsize)
+        for shard in psi_r_cache.addressable_shards)
+    if jax.process_index() == 0:
+        print(f"  ψ(r) cache: {psi_r_cache.shape}, "
+              f"band-sharded over ('x','y'), "
+              f"{_cache_local_bytes / 1e9:.2f} GB local")
+    # The r-chunk loop consumes only the device cache.  Drop host ψ(G) now;
+    # g_index/kvecs remain staged properties used as compatibility operands.
+    psi_G_store.close()
 
     # ========== STEP 6: Loop over chunks ==========
     # Wall-clock totals for the end-of-fit timing line.  ``t_fit_total``
@@ -1067,48 +1092,39 @@ def fit_zeta_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            # file_reread mode: (re)build the host-side ψ(G) tiles
-            # for this r-chunk.  host_cache mode: no-op.
-            psi_G_store.begin_rchunk(r_start, r_end)
-
             _dbg_rchunk = env_bool("LORRAX_RCHUNK_DEBUG", False)
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
             t0 = time.perf_counter()
-            try:
-                with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
-                     jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
-                    zeta_chunk = fit_one_rchunk(
-                        psi_G_store=psi_G_store,
-                        psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
-                        psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
-                        L_q=L_q,
-                        norms_l=norms_l_jax,
-                        norms_r=norms_r_jax,
-                        r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
-                        mesh_xy=mesh_xy,
-                        meta=meta,
-                        band_chunk_ranges=band_chunk_ranges,
-                        band_range_left=band_range_left,
-                        band_range_right=band_range_right,
-                        band_range_full=band_range_full,
-                        actual_n_rchunk=actual_n_rchunk,
-                        q_chunk_size=q_chunk_size,
-                        kvecs_frac=kvecs_frac,
-                        vertex_mu_L=int(vertex_mu_L),
-                        solver_kind=_resolved_solver_kind,
-                        q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
-                        cct_trace_per_q=cct_trace_per_q,
-                        zeta_gather=_resolved_zeta_gather,
-                        lu_piv=lu_piv,
-                        distrib_la_batched_route=distrib_la_batched_route,
-                    )
-                    zeta_chunk.block_until_ready()
-            finally:
-                # MUST run after block_until_ready — under file_reread
-                # the host tiles are freed here and any still-pending
-                # io_callback would use-after-free.
-                psi_G_store.end_rchunk()
+            with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
+                 jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
+                zeta_chunk = fit_one_rchunk(
+                    psi_G_store=psi_G_store,
+                    psi_r_cache=psi_r_cache,
+                    psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
+                    psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
+                    L_q=L_q,
+                    norms_l=norms_l_jax,
+                    norms_r=norms_r_jax,
+                    r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                    mesh_xy=mesh_xy,
+                    meta=meta,
+                    band_chunk_ranges=band_chunk_ranges,
+                    band_range_left=band_range_left,
+                    band_range_right=band_range_right,
+                    band_range_full=band_range_full,
+                    actual_n_rchunk=actual_n_rchunk,
+                    q_chunk_size=q_chunk_size,
+                    kvecs_frac=kvecs_frac,
+                    vertex_mu_L=int(vertex_mu_L),
+                    solver_kind=_resolved_solver_kind,
+                    q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
+                    cct_trace_per_q=cct_trace_per_q,
+                    zeta_gather=_resolved_zeta_gather,
+                    lu_piv=lu_piv,
+                    distrib_la_batched_route=distrib_la_batched_route,
+                )
+                zeta_chunk.block_until_ready()
             _t_fit = time.perf_counter() - t0
             t_fit_total += _t_fit
             _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0

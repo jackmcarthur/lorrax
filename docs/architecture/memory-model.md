@@ -482,7 +482,9 @@ A/B/C/D totals; the full per-term breakdown (centroids, FFT box, `P_l`,
 `plan_gflat_chunks` is deterministic, no iterative search:
 
 1. **Compute persistent footprint** (centroids + `L_q` + `gflat_acc`).
-   Validate against the budget at every peak.
+   Add the full-grid ψ(r) cache, band-flat sharded over all ranks (including
+   its uniform final-chunk pad), and validate the resulting floor against the
+   budget at every peak.  The cache has no μ axis and is never replicated.
 2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
    Try the full logical ζ-fit window first so the pair GEMM has one K
    dimension and does not read/modify/write its rank-5 carry between band

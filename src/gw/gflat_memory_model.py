@@ -14,6 +14,7 @@ The whole model is two things summed:
     gflat_acc    nq·μ·ngkmax·16 / P      (÷P)
     4·ψ_copies   nk·μ·nb·ns·16, 2 on 'x' + 2 on 'y'  (÷√P — single-axis)
     loader_tbl   nk·n_rtot·4 + nk·ngkmax·16          (REPLICATED, no ÷P)
+    ψ(r)_cache   nk·nb_cache_pad·ns·n_rtot·16 / P    (band-flat over all P)
 
 **stage transients** — each stage adds ONE transient on top; they do not
 co-exist, so the HWM takes a ``max``, not a sum:
@@ -337,7 +338,17 @@ def plan_gflat_chunks(
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
         px, py = _factor_mesh(pp)
-        return sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
+        if band_chunk_override and band_chunk_override > 0:
+            floor_bc = int(band_chunk_override)
+        else:
+            floor_bc = fit_nb
+        floor_bc = max(pp, ((floor_bc + pp - 1) // pp) * pp)
+        fit_padded = max(pp, ((fit_nb + pp - 1) // pp) * pp)
+        floor_bc = min(floor_bc, fit_padded)
+        cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
+        psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
+        return (sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
+                + psi_r_cache)
 
     # ``loader_tables`` is P-INDEPENDENT, so if it alone busts the budget no
     # rank count fixes it — say so at once instead of stepping the search a
@@ -390,10 +401,16 @@ def plan_gflat_chunks(
             p_xy, r_for_band_guard - r_for_band_guard % p_xy)
 
     def _band_candidate_fits(bc: int) -> bool:
+        n_bc = math.ceil(fit_nb / bc)
+        # The cache is stacked by uniform transport chunks.  Its band slots
+        # are sharded over all P; only the final chunk's at-most-(bc-1) pad
+        # rows are extra, and they remain zero-masked.
+        psi_r_cache = _c128(
+            nk, n_bc * bc, ns, n_rtot, shard=p_xy)
         c_slope = _stage_C_slope(
             nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
             p_xy=p_xy, band_chunk=bc, p_y=p_y)
-        return (persistent_total
+        return (persistent_total + psi_r_cache
                 + max(_fft_for_bc(bc), c_slope * r_for_band_guard)
                 <= target)
 
@@ -419,6 +436,15 @@ def plan_gflat_chunks(
                 bc *= 2
 
     fft_box_A = _fft_for_bc(band_chunk)
+
+    # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
+    # all-P-sharded cache, never a replicated full-window object.  Price its
+    # uniform final-chunk pad exactly; this becomes part of the persistent
+    # floor for all r-chunk stages.
+    _cache_n_bc = math.ceil(fit_nb / band_chunk)
+    persistent["psi_r_cache"] = _c128(
+        nk, _cache_n_bc * band_chunk, ns, n_rtot, shard=p_xy)
+    persistent_total = sum(persistent.values())
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
     # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
