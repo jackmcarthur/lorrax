@@ -632,10 +632,16 @@ def build_mpa_fit(
         if bool(getattr(
                 config.head, "uses_bgw_metal_q0shift", False)):
             head_model = f"bgw_q0shift_{config.mpa.pole_solver}"
+        elif (head_fit_samples
+              and getattr(getattr(head_fit_samples[0], "response_kind", None),
+                          "value", None) == "micro_reducible"):
+            head_model = (
+                f"bse_resolvent_micro_{config.mpa.pole_solver}")
         else:
             head_model = (
                 f"qsgw_schur_{config.mpa.pole_solver}"
-                if iteration_head_response.Y_x is not None
+                if (iteration_head_response is not None
+                    and iteration_head_response.Y_x is not None)
                 else f"qsgw_direct_{config.mpa.pole_solver}"
             )
     fit_ledger = mpa_store.fit_completion_ledger(fit_path)
