@@ -1,10 +1,17 @@
-"""Frozen-static screened finite-q crossing block.
+"""Certified finite-q crossing skeleton with exact-nodal amplitudes.
 
 Production constructs spectral-projector moments from the centroid-space
 resolvent.  Every contour node evaluates the landed WP1 crossing kernel and
 solves only an ``N_mu x N_mu`` system.  Pair data remain the two sharded
 ``N_s x N_mu`` vertex tables plus ``O(N_s)`` scalars; production never forms
 ``H`` or any other ``N_s x N_s`` object.
+
+The contour construction certifies an interval skeleton without ever forming
+the pair-space matrix.  Pole positions and widths are cluster scalars derived
+from those intervals; residues are the elementwise constrained linear
+least-squares solution against exact double-Dyson data on the stored support
+and a shared near-line ladder.  The former frozen-static two-moment amplitudes
+are evaluated only for the required A/B diagnostic and are never shipped.
 
 The old pair-space eigensolve survives only as
 :func:`_dense_reference_modes`, a tests-only oracle for small fixtures.  The
@@ -38,8 +45,8 @@ MAX_CLUSTERS = 6
 GAP_CERTIFICATE_FIRST_REAL_RY = 0.04
 GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY = (
     0.5 * GAP_CERTIFICATE_FIRST_REAL_RY)
-# Coordinator-authorized amendment, 2026-08-17 (DESIGN §2.4c Ruling 3, under
-# claim 0329's demand principle; ratification by the design author pending).
+# Ratified amendment, 2026-08-17 (DESIGN §2.4c Ruling 3, under claim 0329's
+# demand principle; exact-nodal re-anchoring ruling confirmed by claim 0353).
 # The adaptive gap shrinks on demand, and an OPEN D_M at the current edge is a
 # demand signal: asymptotic weight is by §2.4b's dichotomy a FINITE mode, so
 # the edge is excluding physics the contour is obliged to capture.  Before this
@@ -51,6 +58,11 @@ GAP_CERTIFICATE_LOWEST_BISECTION_REAL_RY = (
 # to eps*zeta_max: this cap refuses by name well before the ~52 dyadic
 # doublings §2.4c Ruling 3 rejected.
 MAX_ORIGIN_GAP_DOUBLINGS = 32
+NEAR_LINE_SEED_REAL_RY = np.asarray(
+    (0.04, 0.08, 0.15, 0.30, 0.60), dtype=np.float64)
+# The same truncated-SVD policy as the incumbent MPA residue fit.  This is a
+# numerical rank declaration, not a physics or deck parameter.
+RESIDUE_LS_RCOND = 1.0e-13
 _QUADRATURE_ORDERS = (16, 32, 64, 128, 256, 512)
 _RESOLVENT_BATCH_NODES = 8
 
@@ -76,6 +88,15 @@ class IntrabandRow:
     folded_elements: int
     dropped_elements: int
     cluster_width_max_ry: float
+    # Exact-nodal certificate/provenance.  The frozen arrays are transient
+    # diagnostics and are deliberately never passed to the store writer.
+    frozen_gap_max_rel_error: float = 0.0
+    ladder_rcond: float = 1.0
+    ladder_nodes: int = 0
+    ladder_refinement: int = 0
+    ladder_initial_max_rel_error: float = 0.0
+    frozen_Omega_p: jax.Array | None = None
+    frozen_B_p: jax.Array | None = None
     zero_mode_weight: float = 0.0
     zero_mode_cluster: int = -1
     zero_mode_pole_shift: float = 0.0
@@ -351,6 +372,47 @@ def _certified_origin_gap(pair_block, W0bar):
             0.5 * zeta_max),
         minimum_gap,
     )
+
+
+def shared_near_line_ladder(max_lambda_ry, varpi_near_ry, refinement):
+    """Return the deterministic nested WP3-A5 near-line ladder.
+
+    The level-zero real nodes are the five DESIGN §7.1 points, extended by
+    exact factor-two steps until the top covers ``max_q Lambda(q)``.  Each
+    refinement interleaves log midpoints, so old nodes occupy the even slots
+    and the newly inserted nodes occupy the odd slots.  The latter are the
+    amplitude-fit rows; the former remain held out for the certificate.
+    """
+    top = float(max_lambda_ry)
+    height = float(varpi_near_ry)
+    level = int(refinement)
+    if not np.isfinite(top) or top < 0.0:
+        raise ValueError(
+            "GATE intraband_near_line_ladder: max_q Lambda(q) must be "
+            f"finite and non-negative; got {top!r}")
+    if not np.isfinite(height) or height <= 0.0:
+        raise ValueError(
+            "GATE intraband_near_line_ladder: varpi_near must be finite "
+            f"and positive; got {height!r}")
+    if level < 0:
+        raise ValueError(
+            "GATE intraband_near_line_ladder: refinement must be "
+            f"non-negative; got {level}")
+
+    real = list(NEAR_LINE_SEED_REAL_RY)
+    while real[-1] < top:
+        real.append(2.0 * real[-1])
+    for _ in range(level):
+        refined = []
+        for lo, hi in zip(real[:-1], real[1:]):
+            refined.extend((lo, float(np.sqrt(lo * hi))))
+        refined.append(real[-1])
+        if len(refined) == len(real):
+            raise ValueError(
+                "GATE intraband_near_line_ladder: log-midpoint refinement "
+                "made no representable progress")
+        real = refined
+    return np.asarray(real, dtype=np.float64) + 1.0j * height
 
 
 def _initial_intervals(pair_block, W0bar, *, origin_gap=None):
@@ -761,14 +823,8 @@ def _cluster_widths(intervals):
     return np.asarray(widths, dtype=np.float64)
 
 
-def _compress_moments(mesh, M, V, intervals):
-    """The landed elementwise two-moment match fed by contour moments."""
-    matrix_shard = NamedSharding(mesh, P("x", "y"))
-    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
-    # A derived norm bound may leave a contour with provably no enclosed
-    # mode.  Its numerical integral is roundoff, not a stored pole.  Removing
-    # such a row is allowed only far inside the already-enforced sum-rule
-    # tolerance; both independent totals must say it is empty.
+def _active_cluster_moments(M, V, intervals):
+    """Drop contours that are empty under both certified sum rules."""
     M_scale = max(float(jax.device_get(jnp.linalg.norm(jnp.sum(M, axis=0)))),
                   np.finfo(np.float64).tiny)
     V_scale = max(float(jax.device_get(jnp.linalg.norm(jnp.sum(V, axis=0)))),
@@ -785,8 +841,175 @@ def _compress_moments(mesh, M, V, intervals):
             "GATE intraband_contour_empty: every certified contour has "
             "zero M and V weight")
     active = jnp.asarray(np.flatnonzero(keep), dtype=jnp.int32)
-    M, V = (value[active] for value in (M, V))
-    active_intervals = tuple(intervals[index] for index in np.flatnonzero(keep))
+    return (
+        M[active],
+        V[active],
+        tuple(intervals[index] for index in np.flatnonzero(keep)),
+    )
+
+
+def _cluster_scalar_poles(M, V, intervals):
+    """WP3-A5 positions/widths from certified interval geometry.
+
+    Near-real intervals use midpoint and half-width in ``sqrt(zeta)``.
+    Negative intervals are the overdamped branch: position is damping and
+    there is no second width.  ``M`` and ``V`` participate only in deciding
+    which certified intervals are nonempty; they no longer set any element's
+    position or amplitude.
+    """
+    M_active, V_active, active_intervals = _active_cluster_moments(
+        M, V, intervals)
+    poles = []
+    widths = []
+    for lo, hi in active_intervals:
+        if hi < 0.0:
+            damping = 0.5 * (np.sqrt(abs(lo)) + np.sqrt(abs(hi)))
+            poles.append(complex(0.0, -damping))
+            widths.append(0.0)
+        else:
+            if lo <= 0.0:
+                raise ValueError(
+                    "GATE intraband_cluster_width: interval crosses the "
+                    f"excluded origin: [{lo:.17e},{hi:.17e}]")
+            omega = 0.5 * (np.sqrt(lo) + np.sqrt(hi))
+            width = 0.5 * (np.sqrt(hi) - np.sqrt(lo))
+            poles.append(complex(omega, -width))
+            widths.append(width)
+    return (
+        M_active,
+        V_active,
+        active_intervals,
+        np.asarray(poles, dtype=np.complex128),
+        np.asarray(widths, dtype=np.float64),
+    )
+
+
+def _stack_matrix_observations(values, mesh, where):
+    """Validate and stack a small observable axis over sharded matrix rows."""
+    rows = tuple(values)
+    if not rows:
+        raise ValueError(f"{where} requires at least one matrix observation")
+    shape = tuple(rows[0].shape)
+    if len(shape) != 2 or any(tuple(value.shape) != shape for value in rows):
+        raise ValueError(
+            f"{where} requires same-shaped rank-2 matrices; got "
+            f"{[tuple(value.shape) for value in rows]}")
+    return jax.lax.with_sharding_constraint(
+        jnp.stack(rows), NamedSharding(mesh, P(None, "x", "y")))
+
+
+def _constrained_linear_residues(
+        mesh, omega_scalar, z_fit, delta_fit, delta_static, *,
+        rcond=RESIDUE_LS_RCOND):
+    """Solve the hard-static constrained complex LS for every element.
+
+    With ``c_p=-2/Omega_p`` the equality is ``c @ B = DeltaW(0)``.
+    Eliminating the largest-magnitude constraint column makes that equality
+    algebraic, then one small SVD supplies the same pseudo-inverse to every
+    sharded matrix element.  No elementwise solver or host matrix payload is
+    materialized.
+    """
+    omega = np.asarray(omega_scalar, dtype=np.complex128).reshape(-1)
+    z = np.asarray(z_fit, dtype=np.complex128).reshape(-1)
+    target = _stack_matrix_observations(
+        delta_fit, mesh, "_constrained_linear_residues")
+    if z.size != int(target.shape[0]):
+        raise ValueError(
+            "GATE intraband_residue_support: z/data cardinality mismatch: "
+            f"{z.size} coordinates for {int(target.shape[0])} matrices")
+    if omega.size < 1 or np.any(~np.isfinite(omega)) or np.any(omega == 0.0):
+        raise ValueError(
+            "GATE intraband_residue_geometry: cluster-scalar positions "
+            "must be finite and nonzero")
+    cutoff = float(rcond)
+    if not 0.0 < cutoff < 1.0:
+        raise ValueError(
+            "GATE intraband_residue_rcond: require 0 < rcond < 1; got "
+            f"{cutoff!r}")
+
+    design = (2.0 * omega[None, :]
+              / (z[:, None] ** 2 - omega[None, :] ** 2))
+    constraint = -2.0 / omega
+    pivot = int(np.argmax(np.abs(constraint)))
+    free = np.asarray(
+        [index for index in range(omega.size) if index != pivot],
+        dtype=np.int32)
+    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
+    static = jax.lax.with_sharding_constraint(
+        jnp.asarray(delta_static), NamedSharding(mesh, P("x", "y")))
+
+    if free.size:
+        reduced = (
+            design[:, free]
+            - design[:, pivot, None]
+            * constraint[free][None, :] / constraint[pivot])
+        u, singular, vh = np.linalg.svd(reduced, full_matrices=False)
+        # Measure the constrained map against the scale of the original
+        # response columns.  ``s[-1]/s[0]`` alone incorrectly calls a single
+        # numerically-zero reduced column well conditioned (its ratio is
+        # trivially one), which is exactly what coincident cluster poles
+        # produce after equality elimination.
+        reference = float(np.linalg.norm(design[:, free], ord=2))
+        if (singular.size != free.size or singular[0] <= 0.0
+                or not np.isfinite(reference) or reference <= 0.0):
+            achieved = 0.0
+        else:
+            achieved = float(singular[-1] / reference)
+        if not np.isfinite(achieved) or achieved <= cutoff:
+            raise ValueError(
+                "GATE intraband_residue_rcond: constrained residue design "
+                f"is rank deficient; achieved rcond={achieved:.6e}, "
+                f"required > {cutoff:.1e}, observations={z.size}, "
+                f"clusters={omega.size}")
+        inverse = ((vh.conj().T / singular[None, :]) @ u.conj().T)
+        particular_model = design[:, pivot] / constraint[pivot]
+        rhs = target - particular_model[:, None, None] * static[None, :, :]
+        B_free = jax.lax.with_sharding_constraint(
+            jnp.einsum(
+                "co,omn->cmn", jnp.asarray(inverse), rhs, optimize=True),
+            NamedSharding(mesh, P(None, "x", "y")),
+        )
+        B = jnp.zeros(
+            (omega.size, *static.shape), dtype=jnp.complex128)
+        B = B.at[jnp.asarray(free)].set(B_free)
+        pivot_value = (
+            static
+            - jnp.einsum(
+                "c,cmn->mn", jnp.asarray(constraint[free]), B_free,
+                optimize=True)
+        ) / constraint[pivot]
+        B = B.at[pivot].set(pivot_value)
+    else:
+        achieved = 1.0
+        B = (static / constraint[0])[None, :, :]
+    # ``with_sharding_constraint`` outside a compiled region may simplify a
+    # one-device NamedSharding to SingleDeviceSharding.  The pole-store API
+    # deliberately requires the mesh metadata even in that case.  A compiled
+    # identity with an explicit output sharding preserves that metadata and,
+    # unlike host placement, never creates a replicated matrix payload.
+    place = jax.jit(lambda value: value, out_shardings=pole_shard)
+    B = place(B)
+    Omega = place(jnp.broadcast_to(
+        jnp.asarray(omega)[:, None, None], tuple(B.shape)))
+
+    # The hard equality is a gate on the actual sharded result, not merely on
+    # the algebra above.  Its scale is the design's elementwise z=0 identity.
+    anchored = jnp.einsum(
+        "c,cmn->mn", jnp.asarray(constraint), B, optimize=True)
+    anchor_error = _relative_error(anchored, static)
+    if anchor_error > SUM_RULE_REL_TOL:
+        raise ValueError(
+            "GATE intraband_static_constraint: constrained residue solve "
+            f"left z=0 residual {anchor_error:.6e} > "
+            f"{SUM_RULE_REL_TOL:.1e}")
+    return Omega, B, achieved, anchor_error
+
+
+def _compress_moments(mesh, M, V, intervals):
+    """Frozen two-moment amplitudes, retained only as an A/B diagnostic."""
+    matrix_shard = NamedSharding(mesh, P("x", "y"))
+    pole_shard = NamedSharding(mesh, P(None, "x", "y"))
+    M, V, active_intervals = _active_cluster_moments(M, V, intervals)
     widths = _cluster_widths(active_intervals)
     Omega_rows, B_rows = [], []
     folded_elements = 0
@@ -880,24 +1103,107 @@ def _print_memory_model(pair_block, W0bar, n_interval):
         )
 
 
-def build_row(
-        W0bar, pair_block, z_samples, *, gap_certificate=None):
-    """Build one row with held-out-gap-driven greedy bisection.
+def _maximum_relative(models, exacts):
+    """Worst Frobenius-relative member of a matrix observable family."""
+    return max(
+        (_relative_error(model, exact)
+         for model, exact in zip(models, exacts)),
+        default=0.0,
+    )
 
-    ``z_samples`` are the 24 stored fit locations.  Their frozen-block error
-    is returned and printed by the caller as a freeze diagnostic only; it has
-    no refusal authority.  ``gap_certificate(Omega, B)`` evaluates the total
-    fit+block model against raw held-out W and returns ``(error, allowed)``;
-    it is the sole frequency-domain driver of interval bisection.  The final
-    total certificates remain model/store gates.
+
+def _frozen_exact_values(pair_block, W0bar, z_values):
+    """Exact frozen-skeleton data for unit/oracle callers without WP2 data."""
+    return tuple(
+        _resolvent_at_zeta(pair_block, W0bar, complex(z) ** 2)
+        for z in z_values
+    )
+
+
+def build_row(
+        W0bar, pair_block, z_samples, *, support_delta=None,
+        ladder_z=None, ladder_delta=None, ladder_refinement=0,
+        gap_certificate=None, refuse_on_certificate=True):
+    """Build one exact-nodal row on a contour-certified interval skeleton.
+
+    ``support_delta`` is exact WP2 ``DeltaW`` on all stored samples.
+    ``ladder_delta`` is exact WP2 ``DeltaW`` on the one shared near-line
+    ladder.  Odd ladder nodes join every support sample in the constrained
+    linear residue solve; even nodes are held out and drive interval
+    bisection at the unchanged 4e-3 budget.  After that split passes, the
+    shipped residues are refit on all ladder nodes.
+
+    Tests that exercise the skeleton in isolation may omit the two exact-data
+    families; the direct frozen resolvent then supplies an oracle with the
+    same shapes.  Production always passes dynamic double-Dyson values.
+    ``gap_certificate`` is the pre-WP3-A5 compatibility hook used only by the
+    untouched synthetic bisection tests; it can demand more intervals but can
+    never relax the even-ladder gate.
     """
     mesh = _mesh_of(W0bar, "build_row")
     n_pair = int(pair_block[0].shape[0])
     if n_pair == 0:
         raise ValueError("build_row is not called for the empty Gamma block")
 
+    support_supplied = support_delta is not None
+    ladder_supplied = ladder_delta is not None
+    authoritative_ladder = support_supplied and ladder_supplied
     diagnostic_z = tuple(
         complex(value) for value in np.asarray(z_samples).reshape(-1))
+    if not diagnostic_z:
+        raise ValueError(
+            "GATE intraband_residue_support: at least one support node is "
+            "required")
+    if diagnostic_z[0] != 0.0j and support_supplied:
+        raise ValueError(
+            "GATE intraband_static_constraint: the first support node must "
+            "be the exact z=0 anchor")
+    if diagnostic_z[0] != 0.0j:
+        # Skeleton-only unit callers historically supplied arbitrary sample
+        # coordinates.  Their private frozen oracle can add the independent
+        # origin value without weakening the production contract above.
+        diagnostic_z = (0.0j,) + diagnostic_z
+    if support_delta is None:
+        support_delta = _frozen_exact_values(
+            pair_block, W0bar, diagnostic_z)
+    support_delta = tuple(support_delta)
+    if len(support_delta) != len(diagnostic_z):
+        raise ValueError(
+            "GATE intraband_residue_support: support z/data cardinality "
+            f"mismatch: {len(diagnostic_z)} vs {len(support_delta)}")
+
+    refinement = int(ladder_refinement)
+    if ladder_z is None:
+        max_lambda = float(np.max(np.abs(_host_replicated(pair_block[0]))))
+        ladder_z = shared_near_line_ladder(max_lambda, 0.2, refinement)
+    ladder_z = np.asarray(ladder_z, dtype=np.complex128).reshape(-1)
+    if ladder_delta is None:
+        ladder_delta = _frozen_exact_values(pair_block, W0bar, ladder_z)
+    ladder_delta = tuple(ladder_delta)
+    if len(ladder_delta) != ladder_z.size:
+        raise ValueError(
+            "GATE intraband_residue_support: ladder z/data cardinality "
+            f"mismatch: {ladder_z.size} vs {len(ladder_delta)}")
+    odd = np.arange(ladder_z.size, dtype=np.int32)[1::2]
+    even = np.arange(ladder_z.size, dtype=np.int32)[::2]
+    if odd.size == 0 or even.size == 0:
+        raise ValueError(
+            "GATE intraband_near_line_ladder: odd fit nodes and even "
+            "certificate nodes must both be nonempty")
+    # The odd/even split is refusal-grade only when both exact WP2 families
+    # were supplied.  The direct frozen oracle used by legacy skeleton tests
+    # instead fits every synthetic ladder node: it has no standing to fail a
+    # production certificate and needs enough rows to exercise six-cluster
+    # bisection without manufacturing a rank deficiency.
+    fit_indices = odd if authoritative_ladder else np.arange(
+        ladder_z.size, dtype=np.int32)
+    fit_z = np.concatenate((
+        np.asarray(diagnostic_z, dtype=np.complex128),
+        ladder_z[fit_indices]))
+    fit_delta = support_delta + tuple(
+        ladder_delta[index] for index in fit_indices)
+    exact_static = support_delta[0]
+
     _left, _unused_gap, zeta_max, _height = _contour_geometry(
         pair_block, W0bar)
     origin_gap = _certified_origin_gap(pair_block, W0bar)
@@ -957,25 +1263,56 @@ def build_row(
             intervals = _initial_intervals(
                 pair_block, W0bar, origin_gap=origin_gap)
             continue
-        Om, Bp, fold_el, drop_el, width = _compress_moments(
-            mesh, M, V, intervals)
-        if gap_certificate is None:
-            gap_error, gap_allowed = 0.0, np.inf
-        else:
-            gap_error, gap_allowed = map(float, gap_certificate(Om, Bp))
-            if (not np.isfinite(gap_error) or gap_error < 0.0
-                    or not np.isfinite(gap_allowed) or gap_allowed <= 0.0):
+        # Stage 1's two-moment amplitudes are now diagnostic only.  Stage 2
+        # consumes the same certified active intervals, but no element of M/V
+        # sets a pole position, width, or shipped amplitude.
+        frozen_Om, frozen_Bp, fold_el, drop_el, _frozen_width = (
+            _compress_moments(mesh, M, V, intervals))
+        (_M_active, _V_active, _active_intervals,
+         omega_scalar, widths) = _cluster_scalar_poles(M, V, intervals)
+        Om, Bp_validation, achieved_rcond, anchor_error = (
+            _constrained_linear_residues(
+                mesh, omega_scalar, fit_z, fit_delta, exact_static))
+        even_models = tuple(
+            evaluate_pole_sum(Om, Bp_validation, ladder_z[index])
+            for index in even)
+        observed_gap_error = _maximum_relative(
+            even_models, (ladder_delta[index] for index in even))
+        # A synthetic frozen-block oracle is deliberately non-authoritative:
+        # preserve the old skeleton tests and report its shape only through
+        # the frozen A/B diagnostics.  Production always takes this exact
+        # held-out residual as the refusal-grade gap certificate.
+        gap_error = observed_gap_error if authoritative_ladder else 0.0
+        gap_allowed = SAMPLE_REL_TOL
+        external_error, external_allowed = 0.0, np.inf
+        if gap_certificate is not None:
+            external_error, external_allowed = map(
+                float, gap_certificate(Om, Bp_validation))
+            if (not np.isfinite(external_error) or external_error < 0.0
+                    or not np.isfinite(external_allowed)
+                    or external_allowed <= 0.0):
                 raise ValueError(
                     "GATE intraband_gap_certificate: callback returned "
-                    f"error={gap_error!r}, allowed={gap_allowed!r}")
-        # This is deliberately another direct WP1+solve evaluation, not a
-        # contour reconstruction or an alias of a sample slot.
-        exact_static = _resolvent_at_zeta(pair_block, W0bar, 0.0j)
+                    f"error={external_error!r}, "
+                    f"allowed={external_allowed!r}")
         static_error = _relative_error(
-            evaluate_pole_sum(Om, Bp, 0.0j), exact_static)
-        selected = (Om, Bp, gap_error, static_error,
-                    fold_el, drop_el, width, closure)
-        if gap_error <= gap_allowed and static_error <= STATIC_REL_TOL:
+            evaluate_pole_sum(Om, Bp_validation, 0.0j), exact_static)
+        frozen_gap_error = _maximum_relative(
+            (evaluate_pole_sum(frozen_Om, frozen_Bp, value)
+             for value in ladder_z),
+            ladder_delta,
+        )
+        selected = (
+            Om, Bp_validation, gap_error, static_error,
+            fold_el, drop_el, float(np.max(widths, initial=0.0)), closure,
+            achieved_rcond, anchor_error, frozen_Om, frozen_Bp,
+            frozen_gap_error, omega_scalar,
+        )
+        certificate_green = (
+            gap_error <= gap_allowed
+            and external_error <= external_allowed
+            and static_error <= STATIC_REL_TOL)
+        if certificate_green:
             break
         # Empty contours are dropped by the compression, so the stored pole
         # count can lag the interval count; bound BOTH or the bisection can
@@ -986,7 +1323,8 @@ def build_row(
             # certificate.  D_M and the two closure gates above are never
             # caught here and therefore remain unconditional refusals.
             next_gap = max(minimum_gap, 0.5 * origin_gap)
-            if (gap_certificate is not None and gap_error > gap_allowed
+            if ((gap_error > gap_allowed
+                    or external_error > external_allowed)
                     and next_gap < origin_gap
                     and doublings < MAX_ORIGIN_GAP_DOUBLINGS):
                 if jax.process_index() == 0:
@@ -1002,9 +1340,11 @@ def build_row(
                 intervals = _initial_intervals(
                     pair_block, W0bar, origin_gap=origin_gap)
                 continue
+            if not bool(refuse_on_certificate):
+                break
             raise ValueError(
                 "GATE intraband_cluster_budget: six contour clusters do not "
-                "meet the held-out gap-region certificate; "
+                "meet the held-out even-ladder certificate; "
                 f"intervals={len(intervals)}, stored_poles={int(Om.shape[0])}, "
                 f"gap_max_rel={gap_error:.6e}, static_max_rel="
                 f"{static_error:.6e}, allowed_gap="
@@ -1012,13 +1352,28 @@ def build_row(
                 f"allowed_static={STATIC_REL_TOL:.6e}")
         intervals = _split_largest_trace_interval(intervals, M, pair_block)
 
-    (Om, Bp, gap_error, static_error,
-     fold_el, drop_el, width, closure) = selected
+    (Om, Bp_validation, gap_error, static_error,
+     fold_el, drop_el, width, closure, achieved_rcond, anchor_error,
+     frozen_Om, frozen_Bp, frozen_gap_error, omega_scalar) = selected
+    certified = bool(
+        gap_error <= SAMPLE_REL_TOL and static_error <= STATIC_REL_TOL)
+    # Certify on the odd/even split, then refit on every exact ladder node.
+    # The equality constraint remains hard in the refit.
+    if certified:
+        all_z = np.concatenate((
+            np.asarray(diagnostic_z, dtype=np.complex128), ladder_z))
+        all_delta = support_delta + ladder_delta
+        Om, Bp, achieved_rcond, anchor_error = (
+            _constrained_linear_residues(
+                mesh, omega_scalar, all_z, all_delta, exact_static))
+        static_error = _relative_error(
+            evaluate_pole_sum(Om, Bp, 0.0j), exact_static)
+    else:
+        Bp = Bp_validation
     diagnostic_error = max((
         _relative_error(
-            evaluate_pole_sum(Om, Bp, value),
-            _resolvent_at_zeta(pair_block, W0bar, value ** 2),
-        ) for value in diagnostic_z), default=0.0)
+            evaluate_pole_sum(frozen_Om, frozen_Bp, value), exact)
+        for value, exact in zip(diagnostic_z, support_delta)), default=0.0)
     n_poles = int(Om.shape[0])
     _print_memory_model(pair_block, W0bar, n_poles)
     return IntrabandRow(
@@ -1029,12 +1384,18 @@ def build_row(
         sample_max_rel_error=float(diagnostic_error),
         gap_max_rel_error=float(gap_error),
         static_max_rel_error=float(static_error),
-        certified=True,
+        certified=certified,
         folded_modes=0,
         dropped_modes=0,
         folded_elements=int(fold_el),
         dropped_elements=int(drop_el),
         cluster_width_max_ry=float(width),
+        frozen_gap_max_rel_error=float(frozen_gap_error),
+        ladder_rcond=float(achieved_rcond),
+        ladder_nodes=int(ladder_z.size),
+        ladder_refinement=refinement,
+        frozen_Omega_p=frozen_Om,
+        frozen_B_p=frozen_Bp,
         zero_mode_weight=float(closure.zero_mode_weight),
         zero_mode_cluster=int(closure.zero_mode_cluster),
         zero_mode_pole_shift=float(closure.zero_mode_pole_shift),
@@ -1072,7 +1433,9 @@ __all__ = [
     "IntrabandRow",
     "MAX_CLUSTERS",
     "MAX_ORIGIN_GAP_DOUBLINGS",
+    "NEAR_LINE_SEED_REAL_RY",
     "OpenAsymptoticClosure",
+    "RESIDUE_LS_RCOND",
     "MODEL",
     "MOMENT_REL_TOL",
     "SAMPLE_REL_TOL",
@@ -1081,4 +1444,5 @@ __all__ = [
     "build_row",
     "evaluate_pole_sum",
     "pad_row",
+    "shared_near_line_ladder",
 ]

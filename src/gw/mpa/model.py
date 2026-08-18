@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import jax
 import numpy as np
@@ -364,8 +365,10 @@ def _relative_frobenius(model, exact):
 
 
 def _build_intraband_rows(
-        sample_path, V, z, intraband_blocks, mesh_xy, *, gap_certificates):
-    """Build one frozen-static resolvent-moment block at a time."""
+        sample_path, V, z, intraband_blocks, mesh_xy, *, support_delta,
+        ladder_z, ladder_delta, ladder_refinement,
+        refuse_on_certificate):
+    """Build one exact-nodal row at a time on the certified skeleton."""
     from gw.mpa import intraband_block
 
     Wc0, _ = mpa_store.read_w_slab_collective(
@@ -380,14 +383,22 @@ def _build_intraband_rows(
             continue
         row = intraband_block.build_row(
             W0bar[iq], pair_block, z_block,
-            gap_certificate=gap_certificates.get(iq))
+            support_delta=tuple(value[iq] for value in support_delta),
+            ladder_z=ladder_z,
+            ladder_delta=tuple(value[iq] for value in ladder_delta),
+            ladder_refinement=ladder_refinement,
+            refuse_on_certificate=refuse_on_certificate)
         if jax.process_index() == 0:
             print(
-                "  [intraband-freeze] "
+                "  [intraband-reanchor] "
                 f"q_row={iq} block_sample_diag="
                 f"{row.sample_max_rel_error:.6e} "
-                f"gap_total={row.gap_max_rel_error:.6e} "
+                f"frozen_gap={row.frozen_gap_max_rel_error:.6e} "
+                f"even_ladder={row.gap_max_rel_error:.6e} "
                 f"n_poles={row.n_poles} "
+                f"ladder_nodes={row.ladder_nodes} "
+                f"ladder_refinement={row.ladder_refinement} "
+                f"ls_rcond={row.ladder_rcond:.6e} "
                 f"origin_gap_ry2={row.origin_gap_ry2:.6e} "
                 f"origin_gap_doublings={row.origin_gap_doublings}",
                 flush=True,
@@ -449,6 +460,12 @@ def _append_intraband_rows(fit_path, rows, slabs, mesh_xy):
             "zero_mode_cluster": float(row.zero_mode_cluster),
             "origin_gap_ry2": row.origin_gap_ry2,
             "origin_gap_doublings": float(row.origin_gap_doublings),
+            "frozen_gap_diag": row.frozen_gap_max_rel_error,
+            "ladder_rcond": row.ladder_rcond,
+            "ladder_nodes": float(row.ladder_nodes),
+            "ladder_refinement": float(row.ladder_refinement),
+            "ladder_initial_max_rel_error":
+                row.ladder_initial_max_rel_error,
         })
         mpa_store.write_intraband_row_collective(
             fit_path, iq, Omega[:, None, :, :], Bp[:, None, :, :],
@@ -515,9 +532,34 @@ def _maximum_relative(models, exacts):
     )
 
 
+def _exact_intraband_support(
+    sample_path, V, z, meta, mesh_xy, *, dyson_solver,
+    distrib_la_batched_route,
+):
+    """Read the 24 WP2 rows and return their exact double-Dyson DeltaW."""
+    from gw.w_isdf import solve_w
+
+    exact_delta = []
+    for index, _z_value in enumerate(z):
+        chi, _ = mpa_store.read_w_slab_collective(
+            sample_path, _CHI, index, mesh_xy=mesh_xy)
+        remainder, _ = mpa_store.read_w_slab_collective(
+            sample_path, _WC, index, mesh_xy=mesh_xy)
+        W = solve_w(
+            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        delta = jax.lax.with_sharding_constraint(
+            (W - V) - remainder,
+            NamedSharding(mesh_xy, P(None, "x", "y")))
+        delta.block_until_ready()
+        exact_delta.append(delta)
+        del chi, remainder, W
+    return tuple(exact_delta)
+
+
 def _certify_intraband_support(
     sample_path, fit_path, V, z, Omega_intra, B_intra, meta, mesh_xy,
-    *, dyson_solver, distrib_la_batched_route,
+    *, dyson_solver, distrib_la_batched_route, exact_delta=None,
 ):
     """Measure exact-DeltaW and total-model errors on all stamped samples."""
     from gw.mpa.intraband_block import evaluate_pole_sum
@@ -526,36 +568,50 @@ def _certify_intraband_support(
     prefix = _evaluate_fit_prefix(
         fit_path, mpa_store.fit_completion_ledger(fit_path)["n_p_fit"],
         z, mesh_xy)
-    exact_delta, model_delta = [], []
+    supplied_delta = None if exact_delta is None else tuple(exact_delta)
+    if supplied_delta is not None and len(supplied_delta) != len(z):
+        raise ValueError(
+            "intraband support certification received the wrong exact-DeltaW "
+            f"cardinality: {len(supplied_delta)} for {len(z)} samples")
+    exact_delta_rows, model_delta = [], []
     exact_total, model_total, prefix_exact = [], [], []
     for index, z_value in enumerate(z):
         chi, _ = mpa_store.read_w_slab_collective(
             sample_path, _CHI, index, mesh_xy=mesh_xy)
         remainder, _ = mpa_store.read_w_slab_collective(
             sample_path, _WC, index, mesh_xy=mesh_xy)
-        W = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
-            distrib_la_batched_route=distrib_la_batched_route)
-        full_wc = W - V
+        if supplied_delta is None:
+            W = solve_w(
+                V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
+                distrib_la_batched_route=distrib_la_batched_route)
+            full_wc = W - V
+            delta = full_wc - remainder
+        else:
+            delta = supplied_delta[index]
+            full_wc = remainder + delta
+            W = None
         block_z = 0.0j if index == 0 else z_value
         block = evaluate_pole_sum(Omega_intra, B_intra, block_z)
-        exact_delta.append(full_wc - remainder)
+        exact_delta_rows.append(delta)
         model_delta.append(block)
         exact_total.append(full_wc)
         model_total.append(prefix[index] + block)
         prefix_exact.append(remainder)
-        del chi, remainder, W
-    block_error = _maximum_relative(model_delta, exact_delta)
+        del chi, remainder
+        if W is not None:
+            del W
+    block_error = _maximum_relative(model_delta, exact_delta_rows)
     total_error = _maximum_relative(model_total, exact_total)
     prefix_error = _maximum_relative(prefix, prefix_exact)
-    static_error = _relative_frobenius(model_delta[0], exact_delta[0])
+    static_error = _relative_frobenius(
+        model_delta[0], exact_delta_rows[0])
     return {
         "block_sample_frobenius_relative": block_error,
         "total_sample_frobenius_relative": total_error,
         "remainder_fit_frobenius_relative": prefix_error,
         "static_frobenius_relative": static_error,
         "block_sample_combined_frobenius_relative": _combined_relative(
-            model_delta, exact_delta),
+            model_delta, exact_delta_rows),
         "total_sample_combined_frobenius_relative": _combined_relative(
             model_total, exact_total),
         "remainder_fit_combined_frobenius_relative": _combined_relative(
@@ -563,143 +619,180 @@ def _certify_intraband_support(
     }
 
 
-def _evaluate_gap_chi(
-    wfns, occupation_state, config, meta, mesh_xy,
+def _max_crossing_lambda(intraband_blocks):
+    """The replicated scalar ``max_q Lambda(q)`` for the shared ladder."""
+    maxima = []
+    for block in intraband_blocks:
+        if int(block[0].shape[0]) == 0:
+            continue
+        host = np.asarray(jax.device_get(block[0].addressable_data(0)))
+        maxima.append(float(np.max(np.abs(host), initial=0.0)))
+    if not maxima:
+        raise ValueError(
+            "GATE intraband_finite_q_empty: no finite-q crossing energy "
+            "exists to set the shared near-line ladder")
+    return max(maxima)
+
+
+def _evaluate_near_line_exact(
+    wfns, occupation_state, config, meta, mesh_xy, V, q_idx,
+    intraband_blocks, *, refinement, dyson_solver,
+    distrib_la_batched_route,
 ):
-    """The design's five held-out points on the 0.2-Ry line."""
-    from gw.mpa import evaluator, intraband_block
+    """One shared damped-line sweep plus the WP2 double Dyson per node."""
+    from gw.mpa import intraband_block
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
+        intraband_chi1,
         occupation_support_bandwidth,
+        solve_w,
     )
 
-    z0 = intraband_block.GAP_CERTIFICATE_FIRST_REAL_RY
-    z_gap = np.asarray(
-        [z0 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
-         0.30 + 0.2j, 0.60 + 0.2j], dtype=np.complex128)
+    max_lambda = _max_crossing_lambda(intraband_blocks)
+    height = float(config.mpa.varpi_near_ry)
+    z_ladder = intraband_block.shared_near_line_ladder(
+        max_lambda, height, refinement)
     occ_window = float(config.mpa.occupation_window_threshold)
     delta_max = occupation_support_bandwidth(
         wfns.enk, occupation_state.f_kn,
         occupation_window_threshold=occ_window)
     rule = evaluator.damped_line_rule(
-        0.2, delta_max + float(np.max(z_gap.real)),
+        height, delta_max + float(np.max(z_ladder.real)),
         rel_tol=config.minimax_config.target_error,
         max_order=config.minimax_config.max_nodes)
     values = compute_chi0_contour_fractional(
-        wfns, rule["t"], rule["h"], z_gap, meta, mesh_xy,
+        wfns, rule["t"], rule["h"], z_ladder, meta, mesh_xy,
         occupations=occupation_state.f_kn,
         energy_reference=float(occupation_state.mu_ry),
         occupation_window_threshold=occ_window)
-    return z_gap, tuple(values)
-
-
-def _gap_row_certificates(
-    sample_path, fit_path, V, z_support, z_gap, chi_gap, q_idx, meta,
-    mesh_xy, *, dyson_solver, distrib_la_batched_route,
-):
-    """Return exact total-W §7.1 bisection callbacks for two q rows.
-
-    Each callback measures the candidate appended block only after adding
-    the already-fitted remainder prefix.  Its allowance is the §7.1 rule:
-    three times that candidate's on-support total residual, capped at 4e-3.
-    Block-only errors never enter the decision.
-    """
-    from gw.mpa.intraband_block import SAMPLE_REL_TOL, evaluate_pole_sum
-    from gw.w_isdf import solve_w
-
-    rows = _two_shortest_finite_q_rows(q_idx, meta.kgrid)
-    n_fit = mpa_store.fit_completion_ledger(fit_path)["n_p_fit"]
-    prefix_support_full = _evaluate_fit_prefix(
-        fit_path, n_fit, z_support, mesh_xy)
-    prefix_gap_full = _evaluate_fit_prefix(
-        fit_path, n_fit, z_gap, mesh_xy)
-    prefix_support = tuple(value[rows].copy()
-                           for value in prefix_support_full)
-    prefix_gap = tuple(value[rows].copy() for value in prefix_gap_full)
-    del prefix_support_full, prefix_gap_full
-
-    exact_support = []
-    for index in range(len(z_support)):
-        chi, _ = mpa_store.read_w_slab_collective(
-            sample_path, _CHI, index, mesh_xy=mesh_xy)
-        W = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
-            distrib_la_batched_route=distrib_la_batched_route)
-        exact_support.append((W - V)[rows].copy())
-        del chi, W
-
-    exact_gap = []
-    for chi_full in chi_gap:
+    values = tuple(values)
+    matrix_stack_shard = NamedSharding(mesh_xy, P(None, "x", "y"))
+    exact_delta, exact_total = [], []
+    for z_value, chi_full in zip(z_ladder, values):
         chi = _to_wedge(chi_full, q_idx, mesh_xy)
+        chi1 = jax.lax.with_sharding_constraint(
+            jnp.stack([
+                intraband_chi1(block, z_value)
+                for block in intraband_blocks
+            ]),
+            matrix_stack_shard,
+        )
+        gamma = [index for index, block in enumerate(intraband_blocks)
+                 if int(block[0].shape[0]) == 0]
+        if len(gamma) != 1:
+            raise ValueError(
+                "GATE intraband_gamma_empty: shared near-line sweep requires "
+                "exactly one empty Gamma crossing row")
+        gamma_abs = float(jnp.max(jnp.abs(chi1[gamma[0]])).block_until_ready())
+        if gamma_abs != 0.0:
+            raise ValueError(
+                "GATE intraband_gamma_empty: chi1(Gamma) must be exactly "
+                f"zero on the shared ladder; got {gamma_abs:.16e}")
+        chi_remainder = chi - chi1
         W = solve_w(
             V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
             distrib_la_batched_route=distrib_la_batched_route)
-        exact_gap.append((W - V)[rows].copy())
-        del chi, W
-
-    def make_callback(position):
-        def certify(Omega, Bp):
-            support_models = [
-                prefix_support[index][position]
-                + evaluate_pole_sum(
-                    Omega, Bp,
-                    0.0j if index == 0 else z_value)
-                for index, z_value in enumerate(z_support)
-            ]
-            support_exacts = [
-                value[position] for value in exact_support]
-            support_error = _maximum_relative(
-                support_models, support_exacts)
-            gap_models = [
-                prefix_gap[index][position]
-                + evaluate_pole_sum(Omega, Bp, z_value)
-                for index, z_value in enumerate(z_gap)
-            ]
-            gap_exacts = [value[position] for value in exact_gap]
-            gap_error = _maximum_relative(gap_models, gap_exacts)
-            allowed = max(
-                np.finfo(np.float64).eps,
-                min(SAMPLE_REL_TOL, 3.0 * support_error))
-            return gap_error, allowed
-        return certify
-
-    return {int(row): make_callback(position)
-            for position, row in enumerate(rows)}
+        W0 = solve_w(
+            V, chi_remainder, meta, mesh_xy, dyson_solver=dyson_solver,
+            distrib_la_batched_route=distrib_la_batched_route)
+        delta = jax.lax.with_sharding_constraint(
+            W - W0, matrix_stack_shard)
+        total = jax.lax.with_sharding_constraint(
+            W - V, matrix_stack_shard)
+        delta.block_until_ready()
+        total.block_until_ready()
+        exact_delta.append(delta)
+        exact_total.append(total)
+        del chi, chi1, chi_remainder, W, W0
+    if jax.process_index() == 0:
+        print(
+            "  [intraband-ladder] shared sweep "
+            f"refinement={int(refinement)} nodes={z_ladder.size} "
+            f"varpi_near={height:.6e} max_q_Lambda={max_lambda:.6e} "
+            f"top={z_ladder[-1].real:.6e}",
+            flush=True,
+        )
+    return z_ladder, tuple(exact_delta), tuple(exact_total)
 
 
-def _certify_intraband_gap(
-    fit_path, V, z_gap, chi_gap, q_idx, Omega_intra, B_intra,
-    meta, mesh_xy, *, dyson_solver, distrib_la_batched_route,
+def _certify_intraband_reanchor_ab(
+    fit_path, ladder_z, exact_delta, exact_total, rows, mesh_xy,
 ):
-    """Held-out total-W observable on the two shortest finite-q stars."""
+    """Print the frozen-vs-reanchored A/B at all five §7.1 seed points."""
     from gw.mpa.intraband_block import evaluate_pole_sum
-    from gw.w_isdf import solve_w
 
-    rows = _two_shortest_finite_q_rows(q_idx, meta.kgrid)
+    height = float(np.imag(ladder_z[0]))
+    seed_indices = []
+    for real in (0.04, 0.08, 0.15, 0.30, 0.60):
+        matches = np.flatnonzero(ladder_z == complex(real, height))
+        if matches.size != 1:
+            raise ValueError(
+                "GATE intraband_near_line_ladder: the refined ladder lost "
+                f"the §7.1 seed {real:.2f}+{height:.6g}i")
+        seed_indices.append(int(matches[0]))
     n_fit = mpa_store.fit_completion_ledger(fit_path)["n_p_fit"]
-    prefix = _evaluate_fit_prefix(fit_path, n_fit, z_gap, mesh_xy)
-    exacts, fit_only, with_block = [], [], []
-    for index, (z_value, chi_full) in enumerate(zip(z_gap, chi_gap)):
-        chi = _to_wedge(chi_full, q_idx, mesh_xy)
-        W = solve_w(
-            V, chi, meta, mesh_xy, dyson_solver=dyson_solver,
-            distrib_la_batched_route=distrib_la_batched_route)
-        exact = (W - V)[rows]
-        block = evaluate_pole_sum(Omega_intra, B_intra, z_value)
-        exacts.append(exact)
-        fit_only.append(prefix[index][rows])
-        with_block.append((prefix[index] + block)[rows])
-        del chi, W
+    prefix = _evaluate_fit_prefix(fit_path, n_fit, ladder_z, mesh_xy)
+    frozen_delta, reanchored_delta = [], []
+    fit_only, frozen_total, reanchored_total, totals = [], [], [], []
+    q_rows = []
+    for iq, row in enumerate(rows):
+        if row is None:
+            continue
+        q_rows.append(iq)
+        frozen_models = [
+            evaluate_pole_sum(
+                row.frozen_Omega_p, row.frozen_B_p, ladder_z[index])
+            for index in seed_indices]
+        new_models = [
+            evaluate_pole_sum(row.Omega_p, row.B_p, ladder_z[index])
+            for index in seed_indices]
+        delta_exact = [exact_delta[index][iq] for index in seed_indices]
+        total_exact = [exact_total[index][iq] for index in seed_indices]
+        prefix_row = [prefix[index][iq] for index in seed_indices]
+        frozen_error = _maximum_relative(frozen_models, delta_exact)
+        new_error = _maximum_relative(new_models, delta_exact)
+        frozen_total_error = _maximum_relative(
+            [base + block for base, block in zip(prefix_row, frozen_models)],
+            total_exact)
+        new_total_error = _maximum_relative(
+            [base + block for base, block in zip(prefix_row, new_models)],
+            total_exact)
+        if jax.process_index() == 0:
+            print(
+                "  [intraband-reanchor-ab] "
+                f"q_row={iq} frozen_delta={frozen_error:.6e} "
+                f"exact_nodal_delta={new_error:.6e} "
+                f"frozen_total={frozen_total_error:.6e} "
+                f"exact_nodal_total={new_total_error:.6e}",
+                flush=True,
+            )
+        frozen_delta.extend(frozen_models)
+        reanchored_delta.extend(new_models)
+        fit_only.extend(prefix_row)
+        frozen_total.extend(
+            base + block for base, block in zip(prefix_row, frozen_models))
+        reanchored_total.extend(
+            base + block for base, block in zip(prefix_row, new_models))
+        totals.extend(total_exact)
+    delta_exacts = [
+        exact_delta[index][iq]
+        for iq in q_rows for index in seed_indices]
     return {
-        "q_rows": rows,
+        "q_rows": np.asarray(q_rows, dtype=np.int32),
         "fit_only_frobenius_relative": _maximum_relative(
-            fit_only, exacts),
+            fit_only, totals),
         "with_block_frobenius_relative": _maximum_relative(
-            with_block, exacts),
+            reanchored_total, totals),
+        "frozen_with_block_frobenius_relative": _maximum_relative(
+            frozen_total, totals),
+        "frozen_delta_frobenius_relative": _maximum_relative(
+            frozen_delta, delta_exacts),
+        "exact_nodal_delta_frobenius_relative": _maximum_relative(
+            reanchored_delta, delta_exacts),
         "fit_only_combined_frobenius_relative": _combined_relative(
-            fit_only, exacts),
+            fit_only, totals),
         "with_block_combined_frobenius_relative": _combined_relative(
-            with_block, exacts),
+            reanchored_total, totals),
     }
 
 
@@ -1060,7 +1153,7 @@ def build_mpa_fit(
         from gw.mpa import intraband_block
 
         # Reserve the bounded analytic suffix, fit the remainder first, then
-        # let the disjoint total-W gap observable drive block bisection.
+        # let exact held-out even-ladder DeltaW drive block bisection.
         # Dark causal padding keeps the on-disk suffix shape fixed at the
         # design's M_p<=6 allocation while rows stop independently.
         n_p_intra = intraband_block.MAX_CLUSTERS
@@ -1071,15 +1164,88 @@ def build_mpa_fit(
         dyson = config.backend.w_dyson_solver
         distrib_route = getattr(
             config.backend, "distrib_la_batched_route", "auto")
-        z_gap, chi_gap = _evaluate_gap_chi(
-            wfns, occupation_state, config, meta, mesh_xy)
-        gap_certificates = _gap_row_certificates(
-            sample_path, fit_path, V, z_all, z_gap, chi_gap, q_idx, meta,
-            mesh_xy, dyson_solver=dyson,
+        support_delta = _exact_intraband_support(
+            sample_path, V, z_all, meta, mesh_xy,
+            dyson_solver=dyson,
             distrib_la_batched_route=distrib_route)
-        rows, n_p_intra = _build_intraband_rows(
-            sample_path, V, z_all, intraband_blocks, mesh_xy,
-            gap_certificates=gap_certificates)
+
+        # Refinement one is the first certifiable ladder: it inserts odd fit
+        # nodes between the seed points while retaining every §7.1 seed in the
+        # held-out even set.  One further node doubling is mandatory for the
+        # anti-plateau A/B.  Further doublings occur only while a failing row
+        # strictly improves; a plateau is the ruled half-height-ladder request.
+        histories = [[] for _ in intraband_blocks]
+        anti_plateau_row = int(
+            _two_shortest_finite_q_rows(q_idx, meta.kgrid)[0])
+        refinement = 1
+        while True:
+            ladder_z, ladder_delta, ladder_total = (
+                _evaluate_near_line_exact(
+                    wfns, occupation_state, config, meta, mesh_xy,
+                    V, q_idx, intraband_blocks,
+                    refinement=refinement, dyson_solver=dyson,
+                    distrib_la_batched_route=distrib_route))
+            rows, n_p_intra = _build_intraband_rows(
+                sample_path, V, z_all, intraband_blocks, mesh_xy,
+                support_delta=support_delta,
+                ladder_z=ladder_z,
+                ladder_delta=ladder_delta,
+                ladder_refinement=refinement,
+                refuse_on_certificate=False)
+            for iq, row in enumerate(rows):
+                if row is not None:
+                    histories[iq].append(row.gap_max_rel_error)
+                    if process_rank() == 0:
+                        sequence = ",".join(
+                            f"{value:.6e}" for value in histories[iq])
+                        print(
+                            "  [intraband-ladder-residual] "
+                            f"q_row={iq} refinement={refinement} "
+                            f"sequence={sequence}",
+                            flush=True,
+                        )
+            if refinement == 1:
+                refinement = 2
+                continue
+            failing = [
+                iq for iq, row in enumerate(rows)
+                if row is not None and not row.certified]
+            plateau = []
+            for iq in failing:
+                previous, current = histories[iq][-2:]
+                if (not current < previous
+                        or intraband_block._has_plateaued(current, previous)):
+                    plateau.append((iq, previous, current))
+            if plateau:
+                detail = "; ".join(
+                    f"q_row={iq} {previous:.6e}->{current:.6e}"
+                    for iq, previous, current in plateau)
+                raise ValueError(
+                    "GATE intraband_near_line_plateau: held-out even-ladder "
+                    "residual remains above 4e-3 after node doubling and "
+                    f"interval bisection ({detail}).  The pre-registered "
+                    "next rung is a second ladder at varpi_near/2; request "
+                    "the separate ruling, do not tune this ladder.")
+            anti_history = histories[anti_plateau_row]
+            if (len(anti_history) < 2
+                    or not anti_history[-1] < anti_history[-2]):
+                before = np.nan if len(anti_history) < 2 else anti_history[-2]
+                after = np.nan if len(anti_history) < 2 else anti_history[-1]
+                raise ValueError(
+                    "GATE intraband_near_line_antiplateau: one mandatory "
+                    "ladder doubling did not strictly reduce the held-out "
+                    f"residual on q_row={anti_plateau_row}: "
+                    f"{before:.6e}->{after:.6e}")
+            if not failing:
+                break
+            refinement += 1
+
+        rows = [
+            (None if row is None else replace(
+                row,
+                ladder_initial_max_rel_error=float(histories[iq][0])))
+            for iq, row in enumerate(rows)
+        ]
         n_p_built = n_p_intra
         n_p_intra = intraband_block.MAX_CLUSTERS
         slabs, Omega_intra, B_intra = _padded_intraband_arrays(
@@ -1089,16 +1255,15 @@ def build_mpa_fit(
         support_cert = _certify_intraband_support(
             sample_path, fit_path, V, z_all, Omega_intra, B_intra,
             meta, mesh_xy, dyson_solver=dyson,
-            distrib_la_batched_route=distrib_route)
-        gap_cert = _certify_intraband_gap(
-            fit_path, V, z_gap, chi_gap, q_idx, Omega_intra, B_intra,
-            meta, mesh_xy, dyson_solver=dyson,
-            distrib_la_batched_route=distrib_route)
+            distrib_la_batched_route=distrib_route,
+            exact_delta=support_delta)
+        gap_cert = _certify_intraband_reanchor_ab(
+            fit_path, ladder_z, ladder_delta, ladder_total, rows, mesh_xy)
 
-        gap_allowed = max(
-            np.finfo(np.float64).eps,
-            min(4.0e-3,
-                3.0 * support_cert["total_sample_frobenius_relative"]))
+        gap_allowed = intraband_block.SAMPLE_REL_TOL
+        ladder_error = max(
+            (row.gap_max_rel_error for row in rows if row is not None),
+            default=0.0)
         certification = dict(report["certification"])
         certification.update({
             "intraband_total_sample_max_rel_error":
@@ -1110,7 +1275,7 @@ def build_mpa_fit(
             "intraband_static_max_rel_error_max_allowed":
                 intraband_block.STATIC_REL_TOL,
             "intraband_gap_max_rel_error":
-                gap_cert["with_block_frobenius_relative"],
+                ladder_error,
             "intraband_gap_max_rel_error_max_allowed": gap_allowed,
             "intraband_support_total_frobenius_relative":
                 support_cert["total_sample_frobenius_relative"],
@@ -1118,6 +1283,12 @@ def build_mpa_fit(
                 support_cert["remainder_fit_frobenius_relative"],
             "intraband_gap_fit_only_frobenius_relative":
                 gap_cert["fit_only_frobenius_relative"],
+            "intraband_gap_frozen_delta_frobenius_relative":
+                gap_cert["frozen_delta_frobenius_relative"],
+            "intraband_gap_exact_nodal_delta_frobenius_relative":
+                gap_cert["exact_nodal_delta_frobenius_relative"],
+            "intraband_gap_frozen_total_frobenius_relative":
+                gap_cert["frozen_with_block_frobenius_relative"],
             "intraband_gap_q_rows": ",".join(
                 map(str, np.asarray(gap_cert["q_rows"]).tolist())),
             "intraband_block_sample_diag_max": max(
@@ -1132,6 +1303,11 @@ def build_mpa_fit(
             "intraband_zero_mode_pole_shift_max": max(
                 (row.zero_mode_pole_shift for row in rows
                  if row is not None), default=0.0),
+            "intraband_ladder_refinement": float(refinement),
+            "intraband_ladder_nodes": float(ladder_z.size),
+            "intraband_ladder_rcond_min": min(
+                (row.ladder_rcond for row in rows if row is not None),
+                default=1.0),
         })
         if process_rank() == 0:
             mpa_store.finalize_fit_store(
@@ -1152,7 +1328,7 @@ def build_mpa_fit(
             f"block_sample_diag="
             f"{support_cert['block_sample_frobenius_relative']:.3e}, "
             f"static={support_cert['static_frobenius_relative']:.3e}, "
-            f"gap={gap_cert['with_block_frobenius_relative']:.3e} "
+            f"even_ladder={ladder_error:.3e} "
             f"(allowed {gap_allowed:.3e})")
     # ``_fit_body`` publishes through parallel HDF5 while the scalar-head
     # writer opens the same file through serial h5py.  A context-manager

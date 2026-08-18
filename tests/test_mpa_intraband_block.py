@@ -305,6 +305,81 @@ def test_near_degenerate_pair_does_not_collapse_the_adaptive_origin_gap():
     assert all(hi < 0.0 or lo >= gap for lo, hi in intervals)
 
 
+def test_wp3a5_shared_ladder_is_nested_and_covers_max_lambda():
+    coarse = IB.shared_near_line_ladder(1.3, 0.2, 0)
+    refined = IB.shared_near_line_ladder(1.3, 0.2, 1)
+    np.testing.assert_array_equal(
+        coarse.real[:5], IB.NEAR_LINE_SEED_REAL_RY)
+    assert coarse.real[-1] >= 1.3
+    assert coarse.real[-1] == 2.4
+    np.testing.assert_array_equal(refined[::2], coarse)
+    np.testing.assert_allclose(
+        refined[1::2].real,
+        np.sqrt(coarse[:-1].real * coarse[1:].real),
+        rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(refined.imag, 0.2)
+
+
+def test_wp3a5_cluster_positions_are_scalar_interval_geometry():
+    mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=18)
+    W0j = _put(mesh, W0, P("x", "y"))
+    intervals = IB._initial_intervals(block, W0j)
+    M, V, _closure = IB._cluster_moment_matrices(
+        block, W0j, intervals)
+    _Ma, _Va, active, omega, widths = IB._cluster_scalar_poles(
+        M, V, intervals)
+    for index, (lo, hi) in enumerate(active):
+        if hi < 0.0:
+            assert omega[index].real == 0.0
+            assert omega[index].imag == pytest.approx(
+                -0.5 * (np.sqrt(abs(lo)) + np.sqrt(abs(hi))))
+            assert widths[index] == 0.0
+        else:
+            assert omega[index].real == pytest.approx(
+                0.5 * (np.sqrt(lo) + np.sqrt(hi)))
+            assert omega[index].imag == pytest.approx(
+                -0.5 * (np.sqrt(hi) - np.sqrt(lo)))
+            assert widths[index] == pytest.approx(-omega[index].imag)
+
+
+def test_wp3a5_constrained_linear_residues_carry_static_weight_exactly():
+    mesh = _mesh()
+    omega = np.asarray((0.08 - 0.01j, 0.22 - 0.03j, 0.51 - 0.04j))
+    rng = np.random.default_rng(353)
+    residues = (rng.normal(size=(3, 4, 4))
+                + 1.0j * rng.normal(size=(3, 4, 4))) * 1.0e-3
+    z = np.asarray(
+        [0.0j, 0.04 + 0.2j, 0.08 + 0.2j, 0.15 + 0.2j,
+         0.30 + 0.2j, 0.60 + 0.2j, 0.0 + 0.5j, 0.0 + 1.0j])
+    exact = [
+        _put(mesh, np.sum(
+            2.0 * omega[:, None, None] * residues
+            / (value * value - omega[:, None, None] ** 2), axis=0),
+             P("x", "y"))
+        for value in z]
+    Omega, Bp, rcond, anchor = IB._constrained_linear_residues(
+        mesh, omega, z, exact, exact[0])
+    assert rcond > IB.RESIDUE_LS_RCOND
+    assert anchor <= IB.SUM_RULE_REL_TOL
+    stored = np.asarray(Omega)
+    for index, value in enumerate(omega):
+        np.testing.assert_array_equal(stored[index], value)
+    np.testing.assert_allclose(
+        np.asarray(IB.evaluate_pole_sum(Omega, Bp, 0.0j)),
+        np.asarray(exact[0]), rtol=1.0e-12, atol=1.0e-14)
+
+
+def test_wp3a5_constrained_residue_rcond_refuses_coincident_columns():
+    mesh = _mesh()
+    omega = np.asarray((0.2 - 0.01j, 0.2 - 0.01j))
+    z = np.asarray([0.0j, 0.1 + 0.2j, 0.3 + 0.2j])
+    target = [_put(mesh, np.eye(4, dtype=np.complex128), P("x", "y"))
+              for _ in z]
+    with pytest.raises(ValueError, match=r"intraband_residue_rcond"):
+        IB._constrained_linear_residues(
+            mesh, omega, z, target, target[0])
+
+
 def test_contour_sum_rules_close_to_1e_minus_12_relative():
     mesh, W0, _vertices, _u, _w, block = _fixture(n_pair=21)
     W0j = _put(mesh, W0, P("x", "y"))
