@@ -652,6 +652,10 @@ def _write_connection_stage(
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
+        io.create_dataset(
+            LINKS_DATASET,
+            shape=(int(source_full.size), 3, nb, nb),
+            dtype=np.complex128)
         source_links = io.read_slab(
             LINKS_DATASET,
             shape=(int(source_full.size), 3, nb_storage, nb_storage),
