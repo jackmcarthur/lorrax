@@ -136,6 +136,15 @@ $N_p=9$ onward. The exponent $\alpha=1$ gives the linear grid, while
 $\alpha=2$ concentrates samples near zero. The schedule is a stamped choice,
 not an adaptive fit parameter.
 
+Neither $\alpha$ nor $N_p$ is a periodic-table lookup. In particular, the
+published $\alpha=1$ result for one Na calculation is not a transferable
+certificate for another k mesh, screening window, broadening, or compressed
+basis. Metals can put much more structure near the origin than a uniform
+real-coordinate budget resolves. Converge the pair $(\alpha,N_p)$ against a
+held-out $W$ or, preferably, a matched full-frequency Sigma/QP referee. A
+small backward error on the sampled points cannot detect an under-resolved
+sampling manifold.
+
 The grid therefore adapts automatically when deeper valence bands or more
 conduction bands increase $\omega_m$: its real extent grows to the new maximum
 transition. The number of samples remains $2N_p$, so a much broader spectrum
@@ -275,10 +284,18 @@ $$
 $$
 
 The default solver is the normalized Loewner pencil. It interpolates the same
-$2N_p$ samples without forming a Vandermonde system. The explicit
-`mpa_pole_solver = companion` alternative is the Leon/Yambo construction, not
-an affine or regularized Padé variant. Write $x_j=z_j^2$, split the stored
-samples into the near and far halves, and set
+$2N_p$ samples without forming a Vandermonde system. Two published diagnostic
+routes are explicit deck choices. `mpa_pole_solver = companion` is Yambo's
+optional linear-algebra (`LA`) construction; `mpa_pole_solver = thiele` is its
+default Padé--Thiele (`PT`) reciprocal-difference recurrence and preserves the
+stored near-line-then-far-line sample order exactly. The Thiele denominator is
+converted to a companion matrix and diagonalized with the LAPACK/cuSOLVER
+`geev` family, matching Yambo's root step. All three routes then use the same
+LORRAX guards and all-$2N_p$-sample residue refit; selecting a pole solver does
+not silently select a different physical ansatz.
+
+For the optional LA construction, write $x_j=z_j^2$, split the stored samples
+into the near and far halves, and set
 
 $$
 W_m=\max_{j<N_p}|x_j|,\qquad
