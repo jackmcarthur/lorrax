@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import shutil
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -53,17 +54,96 @@ def test_common_storage_extent_handles_rectangular_meshes():
     assert band_storage_extent(mesh, 8) == 8
 
 
-def test_wfn_fingerprint_changes_with_fixed_gauge_file_identity(tmp_path):
-    path = tmp_path / "WFN.h5"
-    path.write_bytes(b"one fixed-gauge generation")
-    wfn = types.SimpleNamespace(
+def test_wfn_fingerprint_refuses_sampled_coefficient_mismatch(
+        tmp_path, monkeypatch):
+    """Equal headers must not hide a genuinely different fixed-gauge WFN."""
+    import h5py
+
+    path_a = tmp_path / "WFN_a.h5"
+    path_b = tmp_path / "WFN_b.h5"
+    coeffs = np.arange(24, dtype=np.float64).reshape(3, 1, 4, 2)
+    for path in (path_a, path_b):
+        with h5py.File(path, "w") as h5:
+            h5.create_dataset("wfns/gvecs", data=np.arange(
+                12, dtype=np.int32).reshape(4, 3))
+            h5.create_dataset("wfns/coeffs", data=coeffs)
+
+    # Change a sampled coefficient while every in-memory header field stays
+    # identical.  A path/inode fingerprint passes this test for the wrong
+    # reason; the red phase removes that identity and must then expose the
+    # collision until bounded coefficient content is included.
+    with h5py.File(path_b, "r+") as h5:
+        h5["wfns/coeffs"][0, 0, 0, 0] += 1.0e-12
+
+    common = dict(
         energies=np.asarray([[0.1, 0.2]]),
         kpoints=np.asarray([[0.0, 0.0, 0.0]]),
-        nelec=1, nspinor=1, nbands=2, path=str(path))
-    first = wfn_fingerprint(wfn)
-    path.write_bytes(b"another fixed-gauge generation")
-    second = wfn_fingerprint(wfn)
-    assert first != second
+        nelec=1, nspinor=1, nbands=2)
+    wfn_a = types.SimpleNamespace(path=str(path_a), **common)
+    wfn_b = types.SimpleNamespace(path=str(path_b), **common)
+    assert wfn_fingerprint(wfn_a) != wfn_fingerprint(wfn_b), (
+        "a coefficient mismatch inside the bounded sample must change the "
+        "fingerprint, or removing path/inode identity disables the guard")
+
+    from common import sanity
+    from psp.get_dipole_mtxels import (
+        check_dipole_provenance, stamp_dipole_provenance)
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    dipole = tmp_path / "dipole.h5"
+    with h5py.File(dipole, "w") as h5:
+        stamp_dipole_provenance(
+            h5, wfn=wfn_a, wfn_path=path_a,
+            nval=8, ncond=32, nband=40, nb_written=40,
+            bispinor=False, skip_vnl=False, vnl_mode="analytic")
+    lines = []
+    assert check_dipole_provenance(
+        dipole, wfn=wfn_b, nval=8, ncond=32, nband=40,
+        print_fn=lines.append) is False
+    assert any("prov_wfn_sha256" in line for line in lines)
+
+
+def test_wfn_fingerprint_accepts_byte_identical_copy(tmp_path):
+    """Filesystem identity is not part of the mean-field identity."""
+    import h5py
+
+    path_a = tmp_path / "first" / "WFN.h5"
+    path_b = tmp_path / "second" / "WFN.h5"
+    path_a.parent.mkdir()
+    path_b.parent.mkdir()
+    with h5py.File(path_a, "w") as h5:
+        h5.create_dataset("mf_header/versionnumber", data=np.asarray([1, 0]))
+        h5.create_dataset(
+            "wfns/gvecs", data=np.arange(12, dtype=np.int32).reshape(4, 3))
+        h5.create_dataset(
+            "wfns/coeffs",
+            data=np.arange(24, dtype=np.float64).reshape(3, 1, 4, 2))
+    shutil.copyfile(path_a, path_b)
+    assert path_a.read_bytes() == path_b.read_bytes()
+    assert path_a.stat().st_ino != path_b.stat().st_ino
+
+    common = dict(
+        energies=np.asarray([[0.1, 0.2]]),
+        kpoints=np.asarray([[0.0, 0.0, 0.0]]),
+        nelec=1, nspinor=1, nbands=2)
+    wfn_a = types.SimpleNamespace(path=str(path_a), **common)
+    wfn_b = types.SimpleNamespace(path=str(path_b), **common)
+    assert wfn_fingerprint(wfn_a) == wfn_fingerprint(wfn_b)
+
+    from psp.get_dipole_mtxels import (
+        check_dipole_provenance, stamp_dipole_provenance)
+
+    dipole = tmp_path / "dipole.h5"
+    with h5py.File(dipole, "w") as h5:
+        stamp_dipole_provenance(
+            h5, wfn=wfn_a, wfn_path=path_a,
+            nval=8, ncond=32, nband=40, nb_written=40,
+            bispinor=False, skip_vnl=False, vnl_mode="analytic")
+    lines = []
+    assert check_dipole_provenance(
+        dipole, wfn=wfn_b, nval=8, ncond=32, nband=40,
+        print_fn=lines.append) is True
+    assert any("window nval=8 ncond=32 nband=40" in line for line in lines)
 
 
 def test_artifact_refuses_an_aliased_fourth_order_mesh_before_io():

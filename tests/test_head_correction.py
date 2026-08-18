@@ -1,13 +1,36 @@
+import types
+
 import numpy as np
 
 from gw.head_correction import (
+    HeadResolver,
     HeadSample,
+    _dipole_window_from_params,
     compute_static_head_terms,
     fit_head_ppm,
     fit_head_ppm_from_samples,
     resolve_head_override,
     static_head_terms_to_kij,
 )
+
+
+def test_head_resolver_forwards_the_gw_run_dipole_window():
+    """The provenance message compares the reader's window, not defaults."""
+    head = types.SimpleNamespace(
+        wcoul0_source="s_tensor",
+        wcoul0_eta=0.0,
+        vhead=None,
+        whead_0freq=None,
+        whead_imfreq=None,
+        head_minibz_average=False,
+        bgw_metal_q0_treatment="off",
+    )
+    config = types.SimpleNamespace(
+        head=head, nval=8, ncond=32, nband=40)
+    wfn = types.SimpleNamespace(nbands=62, nelec=10)
+    resolver = HeadResolver(
+        config, ".", wfn, sym=None, meta=None, print_fn=lambda _msg: None)
+    assert _dipole_window_from_params(resolver._params, wfn) == (8, 32, 40)
 
 
 def test_compute_static_head_terms_matches_cohsex_formulas():
