@@ -75,6 +75,8 @@ class _MockPsiGStore:
         self.meta = _MetaStub()
         self.meta.fft_grid = (tuple(int(s) for s in fft_grid)
                               if fft_grid is not None else (4, 4, 4))
+        self.meta.nk_tot = int(nk)
+        self.meta.nspinor = int(ns)
         self._host_tiles = {(0, 0): np.asarray(psi_G, dtype=np.complex128)}
         self.band_chunk_ranges = tuple(
             (int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
@@ -362,6 +364,36 @@ def test_g1_1a_single_bc():
     max_rel = float(np.max(np.abs(Z_new - Z_ref))) / float(np.max(np.abs(Z_ref)))
     print(f"\nG1.1a single bc: max rel={max_rel:.4e}")
     np.testing.assert_allclose(Z_new, Z_ref, rtol=1e-10, atol=1e-12)
+
+
+def test_hoisted_psi_r_cache_matches_streaming_path():
+    """Cache construction changes lifetime and placement, not arithmetic."""
+    from isdf.core import build_psi_r_cache_sm
+
+    synth = _build_synth()
+    band_chunks = ((0, 4), (4, 8))
+    store = _MockPsiGStore(
+        synth['psi_G'], synth['g_index'], synth['kvecs_frac'],
+        band_chunks, fft_grid=synth['fft_grid'])
+    psi_l_X = _make_psi_X(synth, (0, 8), 1)
+    psi_r_X = _make_psi_X(synth, (0, 8), 2)
+
+    streaming = z_q_from_psi_sm(
+        psi_l_X, psi_r_X, store,
+        band_chunk_ranges=band_chunks,
+        band_range_left=(0, 8), band_range_right=(0, 8),
+        r_start_dyn=0, r_chunk_size=int(synth['n_zchunk']),
+        kgrid=synth['kgrid'], mesh_xy=MESH)
+    cache = build_psi_r_cache_sm(store, mesh_xy=MESH)
+    cached = z_q_from_psi_sm(
+        psi_l_X, psi_r_X, store, cache,
+        band_chunk_ranges=band_chunks,
+        band_range_left=(0, 8), band_range_right=(0, 8),
+        r_start_dyn=0, r_chunk_size=int(synth['n_zchunk']),
+        kgrid=synth['kgrid'], mesh_xy=MESH)
+
+    np.testing.assert_allclose(
+        np.asarray(cached), np.asarray(streaming), rtol=0.0, atol=0.0)
 
 
 # ---------------------------------------------------------------------------

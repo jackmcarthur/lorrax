@@ -2163,12 +2163,23 @@ def prepare_isdf_and_wavefunctions(
 			mem = cfg.memory
 			nb_total = ((band_slices.b3 - band_slices.b0)
 			            + (band_slices.b4 - band_slices.b1))
+			# The resident centroid copies follow the full consumer band
+			# inventory above, while the pair-GEMM K dimension follows the
+			# (possibly zeta_nband-narrowed) union of the ζ fit windows.
+			# Resolve the latter without logging; fit_zeta owns the one
+			# user-facing window announcement and its degeneracy checks.
+			_zeta_left, _zeta_right = zeta_fit_band_ranges(
+				band_slices, getattr(cfg, "zeta_nband", None),
+				log=lambda _message: None)
+			_zeta_fit_nb = (max(_zeta_left[1], _zeta_right[1])
+			                - min(_zeta_left[0], _zeta_right[0]))
 			# Q-axis on disk: conservative full-BZ (the transverse path
 			# writes IBZ-only, which is smaller).
 			_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
 			gflat_plan = plan_gflat_chunks(
 				meta=meta, mesh_xy=mesh_xy,
-				nb_total=nb_total, ngkmax=_ngkmax,
+				nb_total=nb_total, fit_nb_total=_zeta_fit_nb,
+				ngkmax=_ngkmax,
 				n_q_disk=int(meta.nk_tot),
 				budget_gb=float(mem.per_device_gb),
 				target_utilization=(mem.chunk_target_utilization

@@ -107,6 +107,7 @@ def host_rss_gb() -> float:
 # (gw_init clears it by name between runs). See ISDF_MOVE_PLAN.md STEP 2.
 _pair_density_cache = {}  # pair-density kernel
 _pair_pipeline_sm_cache = {}  # pair-density shard_map pipeline kernel
+_psi_r_cache_sm_cache = {}    # one-time ψ(G)->ψ(r) cache builders
 
 
 def _conv_kpair_static_gamma(gamma, ns: int):
@@ -454,10 +455,81 @@ def c_q_from_psi_sm(
 		perm_L, phase_L, perm_R, phase_R)
 
 
+def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
+	"""Hoist all ψ(G)->ψ(r) transforms out of the outer r-chunk loop.
+
+	The returned global array has shape
+	``(n_bc, nk, bpd_max*P, ns, n_rtot)`` and sharding
+	``P(None, None, ('x','y'), None, None)``.  Thus every cached coefficient
+	is owned by exactly one rank; neither the full band window nor an r slab is
+	replicated.  The leading chunk axis preserves the store's uniform static
+	shape, including zero pad rows in its last chunk.
+	"""
+	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
+	nk = int(psi_G_store.meta.nk_tot)
+	ns = int(psi_G_store.meta.nspinor)
+	n_rtot = math.prod(fft_grid)
+	n_bc = len(psi_G_store.band_chunk_ranges)
+	bpd_max = int(psi_G_store._bpd_max)
+	ngkmax = int(psi_G_store._per_rank_shape[3])
+	if n_bc <= 0 or bpd_max <= 0:
+		raise ValueError(
+			f"build_psi_r_cache_sm requires non-empty band chunks; "
+			f"n_bc={n_bc}, bpd_max={bpd_max}")
+
+	key = (
+		id(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
+		nk, ns, n_rtot, bpd_max, ngkmax, fft_grid,
+	)
+	fn = _psi_r_cache_sm_cache.get(key)
+	if fn is None:
+		_store = psi_G_store
+		out_sds = jax.ShapeDtypeStruct(
+			(nk, bpd_max, ns, ngkmax), jnp.complex128)
+
+		def _slice_host(x_idx, y_idx, bc_idx):
+			return _store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
+
+		@partial(
+			shard_map,
+			mesh=mesh_xy,
+			in_specs=(P(None, None, None, None), P(None, None)),
+			out_specs=P(None, None, ('x', 'y'), None, None),
+			check_vma=False,
+		)
+		def _local(g_index_dev, kvecs_frac_dev):
+			x_idx = jax.lax.axis_index('x')
+			y_idx = jax.lax.axis_index('y')
+
+			def body(_carry, bc_idx):
+				psi_G_bc = _io_callback(
+					_slice_host, out_sds, x_idx, y_idx, bc_idx,
+					ordered=False)
+				psi_r_bc = to_rchunk_inner(
+					psi_G_bc, g_index_dev, fft_grid,
+					jnp.int32(0), n_rtot,
+					kvecs_frac=kvecs_frac_dev, norm="ortho")
+				return _carry, psi_r_bc
+
+			_, cache = jax.lax.scan(
+				body, jnp.int32(0),
+				jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+			return cache
+
+		@jax.jit
+		def fn(g_index_dev, kvecs_frac_dev):
+			return _local(g_index_dev, kvecs_frac_dev)
+
+		_psi_r_cache_sm_cache[key] = fn
+
+	return fn(psi_G_store.g_index, psi_G_store.kvecs_frac)
+
+
 def z_q_from_psi_sm(
 	psi_l_X: jax.Array,
 	psi_r_X: jax.Array,
 	psi_G_store,
+	psi_r_cache: jax.Array | None = None,
 	*,
 	band_chunk_ranges: tuple[tuple[int, int], ...],
 	band_range_left: tuple[int, int],
@@ -476,7 +548,11 @@ def z_q_from_psi_sm(
 	``psi_r_Y`` with a ``lax.scan`` over band-chunks inside the
 	``shard_map`` body.  Per iter:
 
-	  1. ``io_callback`` pulls this rank's 1/P bands of bc ``i`` from
+	  1. The production path slices this rank's 1/P bands of bc ``i`` from
+	     ``psi_r_cache``, whose full-grid IFFT was hoisted once before the
+	     outer r-chunk loop.  The compatibility path (``psi_r_cache=None``)
+	     retains the historical ``io_callback`` + per-r-chunk IFFT.
+	     ``io_callback`` pulls this rank's 1/P bands of bc ``i`` from
 	     :class:`PsiGStore`'s host tile (band-flat-sharded over the
 	     full ``('x','y')`` mesh).
 	  2. :func:`common.wfn_transforms.to_rchunk_inner` does the local
@@ -507,6 +583,9 @@ def z_q_from_psi_sm(
 	                          provides ``_slice_local_tile_bc`` /
 	                          ``g_index`` / ``kvecs_frac``.  NOT a jit
 	                          argument.
+	    psi_r_cache         : optional all-P band-sharded cache with shape
+	                          ``(n_bc,nk,bpd_max*P,ns,n_rtot)``.  Production
+	                          supplies it; ``None`` is the test/reference path.
 	    band_chunk_ranges   : tuple of (b_lo, b_hi) global band indices.
 	    band_range_left     : (L_lo, L_hi) global L-window.  Must
 	                          satisfy nb_l == L_hi - L_lo.
@@ -541,6 +620,7 @@ def z_q_from_psi_sm(
 	r_loc = n_zchunk // p_y
 
 	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
+	use_psi_r_cache = psi_r_cache is not None
 	L_lo_g = int(band_range_left[0]); L_hi_g = int(band_range_left[1])
 	R_lo_g = int(band_range_right[0]); R_hi_g = int(band_range_right[1])
 	if L_hi_g - L_lo_g != nb_l:
@@ -562,6 +642,8 @@ def z_q_from_psi_sm(
 		nk, n_rmu, n_zchunk, ns, nb_l, nb_r, nkx, nky, nkz,
 		lhs_id, rhs_id, bcr, (L_lo_g, L_hi_g), (R_lo_g, R_hi_g),
 		tuple(int(s) for s in fft_grid), pair_arm, pair_gamma_key,
+		use_psi_r_cache,
+		(None if psi_r_cache is None else tuple(int(s) for s in psi_r_cache.shape)),
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 		_lhs_id = lhs_id
@@ -590,8 +672,6 @@ def z_q_from_psi_sm(
 		_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
 		for _bc in range(n_bc):
 			_bpd = int(_psi_G_store._bpd_per_bc[_bc])
-			if _bpd <= 0:
-				continue  # all-pad bc: every slot masked downstream
 			_nb_tot = _bpd * P_total  # == b_hi-b_lo (sharded load is P-divisible)
 			# Precondition guard (device-invariance audit): each band-chunk
 			# width MUST be world_size-divisible, else floor-div silently drops
@@ -605,6 +685,8 @@ def z_q_from_psi_sm(
 					f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
 					f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
 					f"band_chunk_size to a multiple of world_size")
+			if _bpd <= 0:
+				continue  # zero-width bc: every slot is masked downstream
 			# out pos p -> src slot (strided real bands compacted to front);
 			# tail (p >= _nb_tot) -> slot _bpd, a guaranteed-zero pad slot.
 			_p = np.arange(bpd_max_global)
@@ -697,14 +779,15 @@ def z_q_from_psi_sm(
 		g_index_spec    = P(None, None, None, None)
 		kvecs_frac_spec = P(None, None)
 
+		cache_spec = P(None, None, ('x', 'y'), None, None)
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(L_spec, L_spec, P(), P(), P(), P(), P(),
-		                   g_index_spec, kvecs_frac_spec),
+		                   g_index_spec, kvecs_frac_spec, cache_spec),
 		         out_specs=out_spec,
 		         check_vma=False)
 		def _local(psi_l_X_, psi_r_X_, perm_L_, phase_L_,
 		           perm_R_, phase_R_, r_start_,
-		           g_index_dev, kvecs_frac_dev):
+		           g_index_dev, kvecs_frac_dev, psi_r_cache_):
 			# Per-rank shapes:
 			#   psi_l_X_ : (nk, n_rmu_loc, nb_l, ns)   μ on 'x' (replicated bands)
 			#   psi_r_X_ : (nk, n_rmu_loc, nb_r, ns)
@@ -777,10 +860,6 @@ def z_q_from_psi_sm(
 				#     ordered=False per §3.4 (lax.scan(unroll=1) gives
 				#     sequential per-rank execution at runtime; ordered
 				#     is a perf knob, not correctness).
-				psi_G_bc_local = _io_callback(
-					_slicer_host, _slicer_out_sds,
-					x_idx, y_idx, bc_idx,
-					ordered=False)
 				# (2) IFFT + FULL r-chunk slab (NOT per-rank r_loc — see
 				#     "r-slab strategy" comment above).  Local FFT box
 				#     per rank is c128[nk, bpd_max, ns, n_rtot] ·
@@ -788,10 +867,18 @@ def z_q_from_psi_sm(
 				#     bpd_max, ns, n_zchunk] per rank.  Both per-iter,
 				#     aliased across iters by XLA's scan-internal
 				#     allocator → single slot of each.
-				psi_Y_bc_local_full_r = to_rchunk_inner(
-					psi_G_bc_local, g_index_dev, fft_grid_t,
-					r_start_, n_zchunk,
-					kvecs_frac=kvecs_frac_dev, norm="ortho")
+				if use_psi_r_cache:
+					psi_Y_bc_local_full_r = jax.lax.dynamic_slice_in_dim(
+						psi_r_cache_[bc_idx], r_start_, n_zchunk, axis=3)
+				else:
+					psi_G_bc_local = _io_callback(
+						_slicer_host, _slicer_out_sds,
+						x_idx, y_idx, bc_idx,
+						ordered=False)
+					psi_Y_bc_local_full_r = to_rchunk_inner(
+						psi_G_bc_local, g_index_dev, fft_grid_t,
+						r_start_, n_zchunk,
+						kvecs_frac=kvecs_frac_dev, norm="ortho")
 				# (3) Band-gather AND r-scatter in one shot.
 				#
 				#     The old code did all_gather(('x','y')) over bands at the
@@ -925,9 +1012,9 @@ def z_q_from_psi_sm(
 
 		@jax.jit
 		def fn(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
-		        g_index_, kvecs_frac_):
+		        g_index_, kvecs_frac_, psi_r_cache_):
 			return _local(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
-			              g_index_, kvecs_frac_)
+			              g_index_, kvecs_frac_, psi_r_cache_)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
 
@@ -945,9 +1032,15 @@ def z_q_from_psi_sm(
 	r_start_arg = (jnp.int32(int(r_start_dyn))
 	                if isinstance(r_start_dyn, (int, np.integer))
 	                else r_start_dyn)
+	if psi_r_cache is None:
+		# Unused compatibility operand.  Its sharded band axis is exactly P
+		# wide so every mesh can lower the same wrapper without allocating a
+		# full-grid cache merely to exercise the historical path.
+		psi_r_cache = jnp.zeros(
+			(1, 1, p_x * p_y, 1, 1), dtype=jnp.complex128)
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_l_X, psi_r_X, perm_L, phase_L, perm_R, phase_R, r_start_arg,
-		psi_G_store.g_index, psi_G_store.kvecs_frac)
+		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
 
 
 # Backward-compat shim removed — old z_q_from_psi_sm signature
@@ -4390,8 +4483,9 @@ def _make_fit_one_rchunk_kernel(
     distrib_la_batched_route: str = "auto",
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
-    over every piece of static structure + a :class:`PsiGStore` that
-    supplies per-bc ψ(G) slices from host memory.
+    over every piece of static structure + a :class:`PsiGStore` carrying
+    the static FFT metadata.  Production supplies the hoisted, all-P-sharded
+    ψ(r) cache as a dynamic argument.
 
     Returned function signature::
 
@@ -4403,10 +4497,9 @@ def _make_fit_one_rchunk_kernel(
             r_start_dyn,           # scalar int32
         )
 
-    ψ(G) is NOT a jit argument.  The bc-loop fetches each chunk from
-    the host-resident store via ``io_callback`` — only the currently
-    active bc lives on device.  See :mod:`common.psi_G_store` for
-    lifecycle + layout details.
+    ψ(G) is NOT a jit argument.  Its full-grid IFFT has already been done
+    once by :func:`build_psi_r_cache_sm`; the bc-loop slices the current
+    r-chunk from the band-flat sharded cache.
 
     The inner body fully composes the load-phase FFT + reshard, the
     band-chunk pair-density streaming loop (Python-unrolled at trace),
@@ -4461,6 +4554,7 @@ def _make_fit_one_rchunk_kernel(
     def z_q_phase(
         psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
         norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
+        psi_r_cache,
     ):
         # Pre-multiply by 1/norms so the pair-density einsum sees the
         # norm-scaled input without a per-bc divide inside the scan
@@ -4470,11 +4564,11 @@ def _make_fit_one_rchunk_kernel(
         # gamma_perm/gamma_phase remain in this callable's compatibility ABI,
         # but the FFI path must use the closure-captured attribute values.
         gamma_mu = gamma_static
-        # Round 6 streaming pair density + IFFT + γ̃·γ̃ + FFT — single
-        # shard_map; io_callback pulls per-bc ψ(G) from the host store
-        # inside the lax.scan body.  Output Z_q at FULL-BZ q-shape.
+        # Streaming pair density + γ̃·γ̃ + FFT — single shard_map.  The
+        # expensive full-grid ψ IFFT is hoisted outside the r-chunk loop.
+        # Output Z_q at FULL-BZ q-shape.
         return z_q_from_psi_sm(
-            psi_l_X_scaled, psi_r_X_scaled, psi_G_store,
+            psi_l_X_scaled, psi_r_X_scaled, psi_G_store, psi_r_cache,
             band_chunk_ranges=band_chunk_ranges,
             band_range_left=band_range_left,
             band_range_right=band_range_right,
@@ -4523,6 +4617,7 @@ def _make_fit_one_rchunk_kernel(
         gamma_phase,
         cct_trace_per_q,
         lu_piv,
+        psi_r_cache,
     ):
         # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
         # the AOT memory model path which lowers a single callable.
@@ -4541,7 +4636,8 @@ def _make_fit_one_rchunk_kernel(
         # production calls, take it fine.
         Z_q = z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
-            norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase)
+            norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
+            psi_r_cache)
         return solve_phase(Z_q, L_q, cct_trace_per_q,
                            lu_piv if lu_hoisted else None)
 
@@ -4554,6 +4650,7 @@ def _make_fit_one_rchunk_kernel(
 def fit_one_rchunk(
     *,
     psi_G_store,
+    psi_r_cache,
     psi_l_rmuT_X_fit,
     psi_r_rmuT_X_fit,
     L_q,
@@ -4580,11 +4677,10 @@ def fit_one_rchunk(
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
 
-    ``psi_G_store`` is captured in the jit closure (not a jit arg) so
-    the compiled kernel calls its ``_slice_local_tile_bc`` method via
-    io_callback inside ``z_q_from_psi_sm``'s scan body.  The cache key
-    includes ``id(psi_G_store)`` to avoid reusing a compile built against
-    a different store.
+    ``psi_G_store`` is captured for static FFT/store metadata, while
+    ``psi_r_cache`` is a dynamic, all-P band-sharded argument.  The cache key
+    includes ``id(psi_G_store)`` to avoid reusing a compile built against a
+    different layout.
     """
     # conv_kpair passes the monomial gamma as FFI attributes, so the Lorentz
     # channel is structural and keys the cache.  The historical runtime gamma
@@ -4604,6 +4700,7 @@ def fit_one_rchunk(
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
+        tuple(int(s) for s in psi_r_cache.shape),
         int(vertex_mu_L),
         str(solver_kind),
         str(zeta_gather),
@@ -4660,7 +4757,7 @@ def fit_one_rchunk(
         Z_q = fn.z_q_phase(
             psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
             norms_l, norms_r, r_start_dyn,
-            gamma_perm, gamma_phase)
+            gamma_perm, gamma_phase, psi_r_cache)
         Z_q.block_until_ready()
     _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
     _r1 = host_rss_gb() if _dbg else 0.0

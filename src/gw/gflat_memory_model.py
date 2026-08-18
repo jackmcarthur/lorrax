@@ -14,6 +14,7 @@ The whole model is two things summed:
     gflat_acc    nq·μ·ngkmax·16 / P      (÷P)
     4·ψ_copies   nk·μ·nb·ns·16, 2 on 'x' + 2 on 'y'  (÷√P — single-axis)
     loader_tbl   nk·n_rtot·4 + nk·ngkmax·16          (REPLICATED, no ÷P)
+    ψ(r)_cache   nk·nb_cache_pad·ns·n_rtot·16 / P    (band-flat over all P)
 
 **stage transients** — each stage adds ONE transient on top; they do not
 co-exist, so the HWM takes a ``max``, not a sum:
@@ -276,6 +277,7 @@ def plan_gflat_chunks(
     meta,
     mesh_xy,
     nb_total: int,
+    fit_nb_total: int | None = None,
     ngkmax: int,
     n_q_disk: int,
     budget_gb: float,
@@ -293,6 +295,11 @@ def plan_gflat_chunks(
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
     ``P_min`` and the binding stage.
 
+    ``nb_total`` sizes the resident centroid-wavefunction inventory;
+    ``fit_nb_total`` is the logical union of the two ζ fit windows and owns
+    the band-chunk K extent.  Keeping those extents separate matters when
+    ``zeta_nband`` narrows only the fit.
+
     Overrides (each a ``cohsex.in`` knob; ``>0`` wins over the picker):
     ``r_chunk_override``, ``band_chunk_override``, ``gflat_chunk_size_override``.
     """
@@ -308,6 +315,9 @@ def plan_gflat_chunks(
     n_rtot = int(meta.n_rtot)
     ngkmax = int(ngkmax)
     nb = int(nb_total)
+    fit_nb = int(fit_nb_total if fit_nb_total is not None else nb)
+    if fit_nb <= 0:
+        raise ValueError(f"fit_nb_total must be positive, got {fit_nb}")
     fft_grid = tuple(getattr(meta, 'fft_grid', None)
                      or (int(round(n_rtot ** (1 / 3))),) * 3)
     if n_q_ibz is None:
@@ -328,7 +338,17 @@ def plan_gflat_chunks(
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
         px, py = _factor_mesh(pp)
-        return sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
+        if band_chunk_override and band_chunk_override > 0:
+            floor_bc = int(band_chunk_override)
+        else:
+            floor_bc = fit_nb
+        floor_bc = max(pp, ((floor_bc + pp - 1) // pp) * pp)
+        fit_padded = max(pp, ((fit_nb + pp - 1) // pp) * pp)
+        floor_bc = min(floor_bc, fit_padded)
+        cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
+        psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
+        return (sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
+                + psi_r_cache)
 
     # ``loader_tables`` is P-INDEPENDENT, so if it alone busts the budget no
     # rank count fixes it — say so at once instead of stepping the search a
@@ -349,25 +369,82 @@ def plan_gflat_chunks(
         bc = int(bc)
         if p_xy > 1 and bc % p_xy != 0:
             bc = ((bc + p_xy - 1) // p_xy) * p_xy
-        return min(max(bc, p_xy), max(nb, p_xy))
+        # The physical transport chunk may extend past the logical ζ edge by
+        # at most P-1 zero-masked bands.  Do not clamp a rounded value back to
+        # a non-divisible logical edge (e.g. 50 -> 52 -> 50 at P=4).
+        fit_nb_padded = ((fit_nb + p_xy - 1) // p_xy) * p_xy
+        return min(max(bc, p_xy), max(fit_nb_padded, p_xy))
+
+    _fft_box_cache: dict[int, float] = {}
+
+    def _fft_for_bc(bc: int) -> float:
+        bc = int(bc)
+        if bc not in _fft_box_cache:
+            _fft_box_cache[bc] = _fft_box_bytes(
+                nk=nk, bc=bc, ns=ns, fft_grid=fft_grid,
+                mesh_xy=mesh_xy, p_xy=p_xy)
+        return _fft_box_cache[bc]
+
+    # The full-window decision accounts for both things whose live size the
+    # band chunk changes: the ψ(G)->ψ(r) FFT box (Stage A) and Stage C's
+    # pair-density accumulator plus gathered ψ slab.  With an explicit
+    # r-chunk override, price exactly that extent.  Otherwise use the
+    # planner's existing performance floor / max-chunk floor; Phase 2 may
+    # still choose a larger affordable r chunk after band K is resolved.
+    r_lo = min(mu, n_rtot)
+    if r_chunk_override and r_chunk_override > 0:
+        r_for_band_guard = min(int(r_chunk_override), n_rtot)
+    else:
+        r_for_band_guard = max(r_lo, math.ceil(n_rtot / max_chunks))
+    if p_xy > 1:
+        r_for_band_guard = max(
+            p_xy, r_for_band_guard - r_for_band_guard % p_xy)
+
+    def _band_candidate_fits(bc: int) -> bool:
+        n_bc = math.ceil(fit_nb / bc)
+        # The cache is stacked by uniform transport chunks.  Its band slots
+        # are sharded over all P; only the final chunk's at-most-(bc-1) pad
+        # rows are extra, and they remain zero-masked.
+        psi_r_cache = _c128(
+            nk, n_bc * bc, ns, n_rtot, shard=p_xy)
+        c_slope = _stage_C_slope(
+            nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+            p_xy=p_xy, band_chunk=bc, p_y=p_y)
+        return (persistent_total + psi_r_cache
+                + max(_fft_for_bc(bc), c_slope * r_for_band_guard)
+                <= target)
 
     if band_chunk_override and band_chunk_override > 0:
         band_chunk = _bump_bc(band_chunk_override)
     else:
-        # Largest power-of-2 band_chunk whose FFT box fits half the headroom.
-        headroom_A = max(target - persistent_total, 0.0)
-        bc = 1
-        while bc * 2 <= nb:
-            trial = _bump_bc(bc * 2)
-            box = _fft_box_bytes(nk=nk, bc=trial, ns=ns, fft_grid=fft_grid,
-                                 mesh_xy=mesh_xy, p_xy=p_xy)
-            if box > 0.5 * headroom_A:
-                break
-            bc *= 2
-        band_chunk = _bump_bc(bc)
+        # Prefer one GEMM K dimension spanning the whole logical ζ window.
+        # This removes rank-5 carry read/modify/write traffic between band
+        # chunks.  If the measured FFT box + existing Stage-C accounting do
+        # not fit, retain the old power-of-two family and choose its largest
+        # member admitted by the same memory guard.
+        full_window = _bump_bc(fit_nb)
+        if _band_candidate_fits(full_window):
+            band_chunk = full_window
+        else:
+            band_chunk = _bump_bc(1)
+            bc = 1
+            while bc * 2 <= fit_nb:
+                trial = _bump_bc(bc * 2)
+                if trial >= full_window or not _band_candidate_fits(trial):
+                    break
+                band_chunk = trial
+                bc *= 2
 
-    fft_box_A = _fft_box_bytes(nk=nk, bc=band_chunk, ns=ns, fft_grid=fft_grid,
-                               mesh_xy=mesh_xy, p_xy=p_xy)
+    fft_box_A = _fft_for_bc(band_chunk)
+
+    # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
+    # all-P-sharded cache, never a replicated full-window object.  Price its
+    # uniform final-chunk pad exactly; this becomes part of the persistent
+    # floor for all r-chunk stages.
+    _cache_n_bc = math.ceil(fit_nb / band_chunk)
+    persistent["psi_r_cache"] = _c128(
+        nk, _cache_n_bc * band_chunk, ns, n_rtot, shard=p_xy)
+    persistent_total = sum(persistent.values())
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
     # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
@@ -375,7 +452,6 @@ def plan_gflat_chunks(
     C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
                              p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
     headroom_C = max(target - persistent_total, 0.0)
-    r_lo = min(mu, n_rtot)                      # performance floor (§3)
     if r_chunk_override and r_chunk_override > 0:
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
