@@ -468,6 +468,31 @@ class SigmaChannel(str, enum.Enum):
         }[self]
 
 
+class SigmaFrequencyRoute(str, enum.Enum):
+    """Frequency representation used by the dynamic MPA compute mode.
+
+    ``INTERNAL_FF_CD`` is the Tier-0, fit-free contour-deformation route.
+    ``MPA`` is the scale route.  Keeping this axis separate from
+    :class:`ComputeMode` is deliberate: both routes build the same dynamic
+    Sigma channel, while only the latter compresses W into poles.
+    """
+
+    INTERNAL_FF_CD = "internal_ff_cd"
+    MPA = "mpa"
+
+
+def coerce_sigma_frequency_route(route) -> SigmaFrequencyRoute:
+    if isinstance(route, SigmaFrequencyRoute):
+        return route
+    raw = str(route).strip().lower()
+    try:
+        return SigmaFrequencyRoute(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"sigma_freq_route={raw!r} is not known; expected one of: "
+            + ", ".join(r.value for r in SigmaFrequencyRoute)) from exc
+
+
 #: WHICH Σ CHANNELS EACH MODE ACTUALLY BUILDS — the table the writers ask
 #: instead of hand-checking mode strings.
 #:
@@ -1682,6 +1707,12 @@ _DEFAULTS = {
     # for why the value ships ahead of the kernels, and the ``ComputeMode``
     # docstring for why it is spelled ``mpa`` rather than ``full_freq``.
     "compute_mode": "auto",
+    # Dynamic full-frequency route.  ``mpa`` preserves every pre-Tier-0
+    # deck byte-for-byte.  ``internal_ff_cd`` is the fit-free production
+    # reference: direct ordered-pair chi0, distributed Dyson W, and contour
+    # deformation.  The latter is deliberately explicit; ``auto`` never
+    # turns a scale run into the much dearer reference calculation.
+    "sigma_freq_route": "mpa",
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
     # from the deprecated ``self_consistent`` key (true → self_consistent)
@@ -2346,6 +2377,7 @@ _LEGACY_DECK_KEYS = frozenset({
 _NORMALIZE_STR = {
     "compute_mode",
     "bispinor_gw",
+    "sigma_freq_route",
     "qp_solver",
     "sc_accelerator",
     "sc_head_update",
@@ -4251,6 +4283,7 @@ class DynamicSigmaConfig:
     quadrature_eps: float = 1.0e-4
     quadrature_reduction_seconds: float = 120.0
     quadrature_cache_dir: str = "auto"
+    freq_route: SigmaFrequencyRoute = SigmaFrequencyRoute.MPA
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
@@ -4290,6 +4323,11 @@ class DynamicSigmaConfig:
     band_extrapolation_bracket_scheme_explicit: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.freq_route, SigmaFrequencyRoute):
+            raise ValueError(
+                "DynamicSigmaConfig.freq_route must be a "
+                "SigmaFrequencyRoute member; use "
+                "coerce_sigma_frequency_route for deck strings.")
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         if self.omega_max_ev < self.omega_min_ev:
@@ -5465,6 +5503,7 @@ class LorraxConfig:
             fit_reuse_file=(str(_g("mpa_fit_reuse_file")) or None),
         )
         sigma = DynamicSigmaConfig(
+            freq_route=coerce_sigma_frequency_route(_g("sigma_freq_route")),
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
@@ -5859,4 +5898,31 @@ class LorraxConfig:
         announce_legacy_sigma_axis_keys(
             _named_keys, resolved.compute_mode, resolved.qp_solver,
             print_fn=print_fn)
+        if resolved.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD:
+            if resolved.compute_mode is not ComputeMode.MPA:
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd is a dynamic Sigma "
+                    "route under compute_mode = mpa; no other compute_mode "
+                    "consumes it.")
+            if resolved.qp_solver is not QPSolver.ONE_SHOT_DFT:
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd currently produces "
+                    "the Tier-0 on-shell diagonal at E_DFT and therefore "
+                    "requires qp_solver = one_shot_dft. fixed_point and "
+                    "self_consistent require an off-shell matrix Sigma(omega) "
+                    "cube and are refused rather than silently using MPA.")
+            if resolved.screening.diagrams is not ScreeningDiagrams.W_RPA:
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd is certified for "
+                    "screening_diagrams = w_rpa only.")
+            if resolved.mpa.material_class != "metal":
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd currently promotes "
+                    "the certified metallic referee and requires "
+                    "mpa_material_class = metal.")
+            if not resolved.do_G0:
+                raise ValueError(
+                    "sigma_freq_route = internal_ff_cd requires do_G0 = true: "
+                    "the Tier-0 q->0 head and its exact eta_W=0 half-residue "
+                    "are part of the certified Sigma, not an optional add-on.")
         return resolved

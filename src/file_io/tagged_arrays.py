@@ -1064,7 +1064,8 @@ def write_head_scalars_to_h5(
 
 
 def assert_restart_window_matches(filename, band_slices=None,
-                                 n_rmu_logical=None) -> None:
+                                 n_rmu_logical=None,
+                                 *, recompute_screening: bool = False) -> None:
     """Refuse a restart whose tensors were built under a DIFFERENT band
     window or centroid count.
 
@@ -1117,10 +1118,13 @@ def assert_restart_window_matches(filename, band_slices=None,
                 f"band receipts: logical={logical}, carrier={carrier}. The "
                 "carrier may add only a zero-pad tail above the logical b4.")
 
-    # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
-    # point.  Every tensor in this file is a function of the SCREENING side or
-    # of the loaded extent: ``V_qmunu`` / ``W0_qmunu`` are built from the χ0
-    # band sum, ``psi_full_y`` / ``enk_full`` / ζ span [b0, b4) =
+    # THE χ COUNT MUST MATCH unless the caller explicitly promises to
+    # recompute every screening object; THE Σ COUNT NEED NOT, and the
+    # asymmetry is the point.  A restart bundle may carry ``W0_qmunu``, which
+    # IS a function of the chi sum.  Bare ``V_qmunu`` is not: it is a
+    # function of the ISDF basis, whose loaded extent is protected
+    # independently by the five-edge check below.  ``psi_full_y`` /
+    # ``enk_full`` / ζ span [b0, b4) =
     # max(chi, sigma) — which ``band_window``'s b4 already pins.  NOTHING on
     # disk is a function of ``number_bands_sigma``: Σ slices [0, b4_sigma) out
     # of tensors that already exist.
@@ -1128,8 +1132,10 @@ def assert_restart_window_matches(filename, band_slices=None,
     # So a Σ-count sweep at fixed χ reuses this file legitimately — which is
     # the case the split exists to make cheap (χ at full bands, Σ short and
     # extrapolated), and it is why this is a targeted check rather than a
-    # blanket "no restart under a split".  Changing χ is refused, for exactly
-    # the reason the 5-tuple check above exists.
+    # blanket "no restart under a split".  Changing χ is refused by default.
+    # The one explicit exception is a caller which recomputes every chi/W and
+    # consumes only the same-window wavefunctions/ISDF basis and bare V; the
+    # five-edge and centroid checks still bind that caller below.
     if band_slices is not None:
         want_b4_logical = int(
             getattr(band_slices, "b4_logical", 0) or band_slices.b4)
@@ -1145,7 +1151,9 @@ def assert_restart_window_matches(filename, band_slices=None,
                           int(band_slices.b4_sigma))
         if stored_split is None and stored_w is not None:
             stored_split = [int(stored_w[4]), int(stored_w[4])]
-        if stored_split is not None and int(stored_split[0]) != want_split[0]:
+        if (stored_split is not None
+                and int(stored_split[0]) != want_split[0]
+                and not recompute_screening):
             raise ValueError(
                 f"Restart file {filename} was written with a chi0/W band sum "
                 f"topping out at band {int(stored_split[0])}, but this run "
@@ -1737,7 +1745,8 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
-                              n_rmu_logical=None, low_mem_bands=False):
+                              n_rmu_logical=None, low_mem_bands=False,
+                              *, recompute_screening: bool = False):
     """Load canonical restart state, in ONE of two mutually exclusive ψ
     shapes selected by ``low_mem_bands`` (mirrors
     ``gw.wavefunction_bundle.Wavefunctions``'s ``layout`` tag).
@@ -1770,8 +1779,10 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     """
     from types import SimpleNamespace
     # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
-    assert_restart_window_matches(filename, band_slices=band_slices,
-                                  n_rmu_logical=n_rmu_logical)
+    assert_restart_window_matches(
+        filename, band_slices=band_slices,
+        n_rmu_logical=n_rmu_logical,
+        recompute_screening=recompute_screening)
     # Everything below arrives ALREADY sharded on mesh_xy and ALREADY at
     # the padded μ extent.  What used to be here — an 8-D/6-D collapse, a
     # ``jnp.pad`` on both μ axes of four tensors, and a
