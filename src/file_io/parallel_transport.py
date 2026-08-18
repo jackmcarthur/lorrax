@@ -652,6 +652,18 @@ def _write_connection_stage(
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
+        # This append handle did not create ``links_ibz`` even though the
+        # artifact initializer did.  Register the existing logical geometry
+        # collectively before the padded read: otherwise SlabIO has to learn
+        # it through a serial-h5py introspection while its writable parallel
+        # HDF5 handle is live, which the one-owner guard correctly refuses.
+        # ``create_dataset`` is idempotent for an identical existing dataset
+        # and leaves its contents untouched.
+        io.create_dataset(
+            LINKS_DATASET,
+            shape=(int(source_full.size), 3, nb, nb),
+            dtype=np.complex128,
+        )
         source_links = io.read_slab(
             LINKS_DATASET,
             shape=(int(source_full.size), 3, nb_storage, nb_storage),
