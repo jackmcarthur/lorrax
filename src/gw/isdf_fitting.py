@@ -896,10 +896,21 @@ def fit_zeta_to_h5(
     # bands — the resulting einsum still runs at the uniform
     # ``bc_size``, so it hits the same JIT cache.
     _bfs, _bfe = band_range_full
+    _p_xy = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
+    if band_chunk_size % _p_xy != 0:
+        raise ValueError(
+            f"band_chunk_size={band_chunk_size} is not divisible by the "
+            f"mesh size {_p_xy}")
+    # The physics window remains exactly [_bfs, _bfe): masks below use the
+    # logical endpoints.  Only the ψ(G) transport range is padded so every
+    # per-chunk band shard is P-divisible.  The loader and the pair masks
+    # zero/ignore these at-most-P-1 tail bands.
+    _bfe_transport = _bfs + ((_bfe - _bfs + _p_xy - 1) // _p_xy) * _p_xy
     band_chunk_ranges = [
         (_bfs + i * band_chunk_size,
-         min(_bfs + (i + 1) * band_chunk_size, _bfe))
-        for i in range((_bfe - _bfs + band_chunk_size - 1) // band_chunk_size)
+         min(_bfs + (i + 1) * band_chunk_size, _bfe_transport))
+        for i in range(
+            (_bfe_transport - _bfs + band_chunk_size - 1) // band_chunk_size)
     ]
 
     # Build the host-resident ψ(G) store.  Both modes keep zero

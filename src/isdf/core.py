@@ -590,8 +590,6 @@ def z_q_from_psi_sm(
 		_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
 		for _bc in range(n_bc):
 			_bpd = int(_psi_G_store._bpd_per_bc[_bc])
-			if _bpd <= 0:
-				continue  # all-pad bc: every slot masked downstream
 			_nb_tot = _bpd * P_total  # == b_hi-b_lo (sharded load is P-divisible)
 			# Precondition guard (device-invariance audit): each band-chunk
 			# width MUST be world_size-divisible, else floor-div silently drops
@@ -605,6 +603,8 @@ def z_q_from_psi_sm(
 					f"z_q band chunk {_bc} width {bcr[_bc][1]-bcr[_bc][0]} is not a "
 					f"multiple of world_size {P_total} (bpd_per_bc={_bpd}); set "
 					f"band_chunk_size to a multiple of world_size")
+			if _bpd <= 0:
+				continue  # zero-width bc: every slot is masked downstream
 			# out pos p -> src slot (strided real bands compacted to front);
 			# tail (p >= _nb_tot) -> slot _bpd, a guaranteed-zero pad slot.
 			_p = np.arange(bpd_max_global)

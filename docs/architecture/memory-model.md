@@ -483,10 +483,16 @@ A/B/C/D totals; the full per-term breakdown (centroids, FFT box, `P_l`,
 
 1. **Compute persistent footprint** (centroids + `L_q` + `gflat_acc`).
    Validate against the budget at every peak.
-2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C
-   FFT-box.  Maximize as a power-of-2 divisor of `nb_total` subject to
-   the FFT box fitting in 50 % of `target_utilization · budget` minus
-   persistent.  Override via `cfg.memory.band_chunk_size` (cohsex.in).
+2. **Pick `band_chunk` first** — primary lever on Peak A and Peak C.
+   Try the full logical ζ-fit window first so the pair GEMM has one K
+   dimension and does not read/modify/write its rank-5 carry between band
+   chunks.  Admit it only when the measured FFT box and Stage-C pair/slab
+   accounting fit together at the requested r-chunk (or the planner's
+   performance floor).  If it does not fit, fall back through the historical
+   power-of-two family under that same guard.  The transport edge is rounded
+   up to a mesh multiple and its tail is zero-masked; the physics window is
+   unchanged.  `cfg.memory.band_chunk_size > 0` (cohsex.in) overrides the
+   picker; the deck default `0` delegates to it.
 3. **Pick `r_chunk`** — maximize subject to Peak C fitting after
    `band_chunk` is fixed.  Lower-bounded by `n_rmu` (per user spec: the
    eventual Σ_μν output occupies `n_rmu² · n_q · 16` bytes, so paying
@@ -992,4 +998,3 @@ a new buffer the planner doesn't model — open an issue against
 (a) identify allocation site via `id(arr.sharding.mesh)` + Python
 trace; (b) classify lifetime (alive across which peaks?); (c) add
 a term to the appropriate `_peak_*` dict.
-

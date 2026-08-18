@@ -1572,7 +1572,10 @@ _DEFAULTS = {
     "gamma_contract_mode": "take",
     # Memory / chunking
     "memory_per_device_gb": 0.0,  # 0 = auto-detect
-    "band_chunk_size": 16,
+    # 0 delegates to the memory planner, which prefers the full logical ζ
+    # window when its measured FFT box + pair accumulator fit.  Any explicit
+    # positive deck value remains an override.
+    "band_chunk_size": 0,
     "r_chunk_size": 0,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):

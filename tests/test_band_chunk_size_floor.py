@@ -55,6 +55,11 @@ def _cpu_mesh(p_x: int, p_y: int) -> Mesh:
     return Mesh(devs, axis_names=('x', 'y'))
 
 
+def test_deck_default_delegates_band_chunk_to_planner():
+    from gw.gw_config import _DEFAULTS
+    assert _DEFAULTS["band_chunk_size"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Core regression: the CrI3 case (band_chunk_size=2, world_size=16)
 # ---------------------------------------------------------------------------
@@ -146,6 +151,49 @@ def test_band_chunk_autopick_respects_world_size_floor():
     p_xy = 16
     assert plan.band_chunk >= p_xy
     assert plan.band_chunk % p_xy == 0
+
+
+def test_band_chunk_autopick_uses_full_zeta_window_when_it_fits():
+    """The fit-window K extent wins over the historical power-of-two pick."""
+    mesh = _cpu_mesh(1, 1)
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(nk_tot=64, nspinor=1, n_rmu=648, n_rtot=48**3),
+        mesh_xy=mesh,
+        nb_total=120, fit_nb_total=50,
+        ngkmax=7000, n_q_disk=8,
+        budget_gb=28.0,
+        r_chunk_override=3456,
+        pair_density_slots=3,
+    )
+    assert plan.band_chunk == 50
+
+
+def test_band_chunk_autopick_mesh_pads_full_zeta_window():
+    """P=4 transports 52 bands but leaves the logical window at 50."""
+    mesh = _cpu_mesh(2, 2)
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(nk_tot=64, nspinor=1, n_rmu=648, n_rtot=48**3),
+        mesh_xy=mesh,
+        nb_total=120, fit_nb_total=50,
+        ngkmax=7000, n_q_disk=8,
+        budget_gb=28.0,
+        r_chunk_override=3456,
+        pair_density_slots=3,
+    )
+    assert plan.band_chunk == 52
+
+
+def test_band_chunk_deck_override_still_wins_over_full_window_default():
+    mesh = _cpu_mesh(1, 1)
+    plan = plan_gflat_chunks(
+        meta=_fake_meta(), mesh_xy=mesh,
+        nb_total=120, fit_nb_total=50,
+        ngkmax=5000, n_q_disk=36,
+        budget_gb=28.0,
+        band_chunk_override=16,
+        r_chunk_override=4096,
+    )
+    assert plan.band_chunk == 16
 
 
 # ---------------------------------------------------------------------------
