@@ -68,7 +68,8 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	LorraxConfig, QPSolver, refuse_unimplemented_compute_mode)
+	LorraxConfig, QPSolver, SigmaFrequencyRoute,
+	refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
                       check_band_sum_degeneracy)
 from .compute_vcoul import build_bgw_v_grid_fn
@@ -424,7 +425,8 @@ def main(argv=None):
 	# X_ONLY requests no screening at all.
 	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
 	quad, e_ref = None, None
-	if do_screened:
+	if (do_screened
+			and config.sigma.freq_route is not SigmaFrequencyRoute.INTERNAL_FF_CD):
 		# The minimax τ-axis, solved on G's actual spectral range — shared
 		# by every χ₀ build this run (static + probe W here, SC re-solves).
 		# TIMED because it is the classic mis-attribution on this path: the
@@ -517,6 +519,7 @@ def main(argv=None):
 				quad=quad,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, band_slices=band_slices,
+				centroid_indices=centroid_indices,
 				input_dir=input_dir,
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,

@@ -40,7 +40,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common import jax_profile
 import common.timing as timing
 from .gw_config import (
-    ComputeMode, ScreeningDiagrams, coerce_screening_diagrams, env_bool,
+    ComputeMode, ScreeningDiagrams, SigmaFrequencyRoute,
+    coerce_screening_diagrams, env_bool,
 )
 
 
@@ -773,6 +774,14 @@ def compute_screening_model(
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     if mode is ComputeMode.MPA:
+        if config.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD:
+            if static_only:
+                return {}
+            print_fn(
+                "  screening model: internal_ff_cd builds direct chi0 and "
+                "distributed W inside the streamed contour; no MPA sample "
+                "or fit store is created.")
+            return {}
         if static_only:
             return {}
         if head_resolver is None:

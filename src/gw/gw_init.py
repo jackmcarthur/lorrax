@@ -37,6 +37,7 @@ from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
 # keeps the copies identical.
 from .gw_config import (
 	env_bool,
+	SigmaFrequencyRoute,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
 	resolve_xla_gpu_memory_env,
@@ -2432,11 +2433,20 @@ def prepare_isdf_and_wavefunctions(
 				"anyway).")
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
+			recompute_screening = (
+				cfg.sigma.freq_route is SigmaFrequencyRoute.INTERNAL_FF_CD)
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
-				n_rmu_logical=int(meta.n_rmu))
+				n_rmu_logical=int(meta.n_rmu),
+				recompute_screening=recompute_screening)
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
+			if recompute_screening:
+				print0(
+					"  Restart screening stamp is not consumed: "
+					"internal_ff_cd recomputes direct chi0 and distributed W "
+					f"with number_bands_chi={band_slices.nb_chi}; only the "
+					"loaded wavefunctions/ISDF basis and bare V are reused.")
 			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
 			# line on a match, and a NAMED "not stamped" on a legacy file —
 			# the three are different facts and the log says which.  A
