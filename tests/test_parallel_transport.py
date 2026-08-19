@@ -342,75 +342,68 @@ def _identity_links(nk, nb):
 
 
 def test_completion_runs_shared_spectral_service_and_stamps(monkeypatch):
-    """Production completion calls the one shared derivative and stamps pass."""
+    """Producer completion calls the shared finite-link service and passes."""
     energies = np.array([[0.2, 0.8], [0.3, 0.9]])
-    A = np.zeros((3, 2, 2, 2), dtype=np.complex128)
-    exact = np.zeros_like(A)
+    occupations = np.array([[1.0, 0.0], [1.0, 0.0]])
+    exact = np.zeros((3, 2, 2, 2), dtype=np.complex128)
+    exact[:, :, 1, 0] = np.array(
+        [1.0 + 0.2j, 0.4 - 0.3j, -0.7 + 0.1j])[:, None]
+    exact[:, :, 0, 1] = np.conj(exact[:, :, 1, 0])
     plus = build_forward_neighbor_table(
         np.array([[0, 0, 0], [1, 0, 0]]), (2, 1, 1))
     calls = []
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
-    def covariant(H, A_arg, *, mesh, kgrid, bvec_cart):
-        calls.append((
-            tuple(H.shape), tuple(A_arg.shape), tuple(kgrid),
-            np.asarray(bvec_cart)))
-        return jnp.zeros_like(A)
+    def covariant(H, links, neighbors, spacing, *, band_matmul):
+        del band_matmul
+        calls.append((tuple(H.shape), tuple(links.shape),
+                      np.asarray(neighbors), np.asarray(spacing)))
+        return jnp.asarray(exact)
 
-    monkeypatch.setitem(
-        sys.modules, "gw.qsgw_head",
-        types.SimpleNamespace(
-            covariant_cartesian_derivative=covariant,
-            reduced_covector_to_cartesian=(
-                lambda cov, bvec: jnp.einsum(
-                    "ij,j...->i...", np.linalg.inv(np.asarray(bvec)), cov))))
+    monkeypatch.setattr(
+        pt_io, "fourth_order_covariant_derivative", covariant)
     monkeypatch.setattr(
         pt_io, "write_velocity_validation",
         lambda path, *, mesh, metrics: calls.append(("stamp", metrics.copy())))
     metrics = complete_velocity_validation(
         "not-opened.h5", mesh=mesh, kgrid=(2, 1, 1),
         bvec_cart=np.eye(3), energies_full=energies,
-        connection_cart=A, velocity_exact_cart=exact,
+        occupations_full=occupations, velocity_exact_cart=exact,
         links_full=_identity_links(2, 2), forward_neighbors=plus,
         atol=1.0e-12, rtol=1.0e-12)
     assert metrics["passed"]
-    # One sorted-frame diagnostic call plus one per reduced direction, all
-    # through the single shared service, at the artifact's shapes.
     derivative_calls = [c for c in calls if c[0] != "stamp"]
-    assert len(derivative_calls) == 4
-    for shapes in derivative_calls:
-        assert shapes[0] == (2, 2, 2)
-        assert shapes[1] == (3, 2, 2, 2)
-        assert shapes[2] == (2, 1, 1)
-    # The gate arm asks the service for d/d(kappa); only the diagnostic arm
-    # passes the physical reciprocal lattice.
-    assert sum(np.array_equal(c[3], np.eye(3)) for c in derivative_calls) == 4
+    assert len(derivative_calls) == 1
+    shapes = derivative_calls[0]
+    assert shapes[0] == (2, 2, 2)
+    assert shapes[1] == (3, 2, 2, 2)
+    np.testing.assert_array_equal(shapes[2], plus)
+    np.testing.assert_allclose(shapes[3], [0.5, 1.0, 1.0])
     assert calls[-1][0] == "stamp"
     assert calls[-1][1]["passed"]
-    assert calls[-1][1]["transport_holonomy"] < 1.0e-12
+    assert calls[-1][1]["transition_overlap_real"] == pytest.approx(1.0)
+    assert calls[-1][1]["head_response_trace_ratio"] == pytest.approx(1.0)
 
 
 def test_completion_sign_red_twin_stamps_failure_then_refuses(monkeypatch):
-    """A wrong shared derivative cannot leave a passing artifact."""
+    """A phase-reversed derivative fails even though its response is equal."""
     energies = np.array([[0.2, 0.8], [0.3, 0.9]])
-    A = np.zeros((3, 2, 2, 2), dtype=np.complex128)
-    exact = np.zeros_like(A)
+    occupations = np.array([[1.0, 0.0], [1.0, 0.0]])
+    exact = np.zeros((3, 2, 2, 2), dtype=np.complex128)
+    exact[:, :, 1, 0] = np.array(
+        [1.0 + 0.2j, 0.4 - 0.3j, -0.7 + 0.1j])[:, None]
+    exact[:, :, 0, 1] = np.conj(exact[:, :, 1, 0])
     plus = build_forward_neighbor_table(
         np.array([[0, 0, 0], [1, 0, 0]]), (2, 1, 1))
     stamps = []
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
-    def wrong_covariant(H, A_arg, *, mesh, kgrid, bvec_cart):
-        del H, A_arg, mesh, kgrid, bvec_cart
-        return jnp.ones_like(A)
+    def wrong_covariant(H, links, neighbors, spacing, *, band_matmul):
+        del H, links, neighbors, spacing, band_matmul
+        return -jnp.asarray(exact)
 
-    monkeypatch.setitem(
-        sys.modules, "gw.qsgw_head",
-        types.SimpleNamespace(
-            covariant_cartesian_derivative=wrong_covariant,
-            reduced_covector_to_cartesian=(
-                lambda cov, bvec: jnp.einsum(
-                    "ij,j...->i...", np.linalg.inv(np.asarray(bvec)), cov))))
+    monkeypatch.setattr(
+        pt_io, "fourth_order_covariant_derivative", wrong_covariant)
     monkeypatch.setattr(
         pt_io, "write_velocity_validation",
         lambda path, *, mesh, metrics: stamps.append(metrics.copy()))
@@ -419,11 +412,13 @@ def test_completion_sign_red_twin_stamps_failure_then_refuses(monkeypatch):
         complete_velocity_validation(
             "not-opened.h5", mesh=mesh, kgrid=(2, 1, 1),
             bvec_cart=np.eye(3), energies_full=energies,
-            connection_cart=A, velocity_exact_cart=exact,
+            occupations_full=occupations, velocity_exact_cart=exact,
             links_full=_identity_links(2, 2), forward_neighbors=plus,
             atol=1.0e-12, rtol=1.0e-12)
     assert len(stamps) == 1
     assert not stamps[0]["passed"]
+    assert stamps[0]["head_response_relative_frobenius"] < 1.0e-12
+    assert stamps[0]["transition_overlap_real"] == pytest.approx(-1.0)
 
 
 def test_artifact_schema_is_slabio_only_and_names_the_head_manifold():
@@ -538,17 +533,9 @@ def _two_band_crossing_fixture(crossing: bool, kgrid=_CROSSING_KGRID):
 
 
 def _run_fixture_gate(fixture, monkeypatch, atol=5.0e-4, rtol=5.0e-3):
-    from gw.qsgw_head import reduced_covector_to_cartesian
-
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
-    band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
-    spacing = 1.0 / np.asarray(fixture["kgrid"], dtype=np.float64)
-    connection = fourth_order_connection(
-        jnp.asarray(fixture["links"]), fixture["plus"], spacing,
-        band_matmul=band_matmul)
-    connection = reduced_covector_to_cartesian(connection, _CROSSING_BVEC)
-    connection = 0.5 * (
-        connection + jnp.swapaxes(jnp.conj(connection), -1, -2))
+    occupations = np.zeros_like(fixture["energies"])
+    occupations[:, 0] = 1.0
     stamped = []
     monkeypatch.setattr(
         pt_io, "write_velocity_validation",
@@ -556,7 +543,7 @@ def _run_fixture_gate(fixture, monkeypatch, atol=5.0e-4, rtol=5.0e-3):
     metrics = complete_velocity_validation(
         "not-opened.h5", mesh=mesh, kgrid=fixture["kgrid"],
         bvec_cart=_CROSSING_BVEC, energies_full=fixture["energies"],
-        connection_cart=connection,
+        occupations_full=occupations,
         velocity_exact_cart=fixture["velocity"],
         links_full=fixture["links"], forward_neighbors=fixture["plus"],
         atol=atol, rtol=rtol)
@@ -564,34 +551,9 @@ def _run_fixture_gate(fixture, monkeypatch, atol=5.0e-4, rtol=5.0e-3):
     return metrics
 
 
-def test_transported_frame_gate_passes_a_band_crossing_the_old_one_fails(
+def test_finite_link_gate_passes_a_band_crossing_and_refuses_wrong_orientation(
         monkeypatch):
-    """Measured on this fixture, 2026-08-15, against the PRE-0187 gate.
-
-    The pre-0187 arm — ``H = diag(E_sorted)`` against the stored connection,
-    which is what this module shipped at a5b1002b — REFUSES here:
-
-        max_abs 3.926513e+00   max_abs_diagonal 2.197639e+00
-        max_abs_offdiagonal 3.926513e+00   max_rel 1.008128e+02
-        against atol 5e-4 / rtol 5e-3
-
-    while the transported frame on the SAME fixture and the SAME tolerances
-    measures
-
-        max_abs 3.100581e-05   max_abs_diagonal 3.100581e-05
-        max_abs_offdiagonal 2.321940e-05   max_rel 8.533318e-04
-
-    i.e. 1.3e5 times tighter, with the diagonal — the crossing's own
-    signature — down by five orders.
-
-    and its diagonal is the tell: with H diagonal the commutator's diagonal
-    is A_nn(E_n-E_n)=0, so that number is purely the FFT derivative of
-    band-index-sorted E_n(k) ringing on the crossing kink.  The same numbers
-    are recomputed as the ``*_sorted_frame`` diagnostic below, so this test
-    keeps failing-first evidence rather than only remembering it.
-
-    The transported frame passes the same fixture at the same tolerances.
-    """
+    """The head-observable gate accepts a crossing and rejects bad links."""
     fixture = _two_band_crossing_fixture(crossing=True)
     assert fixture["min_band_diagonal"] < 0.1, "the window bands must cross"
     assert fixture["outer_gap"] > 2.0, "bands 3-4 must stay out of the window"
@@ -600,46 +562,21 @@ def test_transported_frame_gate_passes_a_band_crossing_the_old_one_fails(
 
     metrics = _run_fixture_gate(fixture, monkeypatch)
 
-    # The pre-0187 arm, recomputed here rather than remembered.
-    assert not metrics["passed_sorted_frame"]
-    assert metrics["max_abs_sorted_frame"] > 1.0
-    assert metrics["max_abs_diagonal_sorted_frame"] > 1.0
-
-    # The transported frame.
     assert metrics["passed"]
-    assert metrics["max_abs"] < 5.0e-4
-    # The crossing signature lives on the diagonal; it is gone, not reduced.
-    assert metrics["max_abs_diagonal"] < 1.0e-4
-    assert metrics["max_abs"] < 1.0e-3 * metrics["max_abs_sorted_frame"]
-    assert metrics["transport_holonomy"] > 1.0e-8, (
-        "a truncated window has a Wilson loop; a zero here would mean the "
-        "twist was never exercised")
+    assert metrics["head_response_relative_frobenius"] < 5.0e-3
+    assert metrics["transition_overlap_real"] > 0.995
 
     # Orientation red twin: conjugating the stored links flips the transport
     # AND the sign of the connection it builds, and must be refused.
     twin = dict(fixture)
     twin["links"] = np.conj(fixture["links"])
     with np.testing.assert_raises_regex(
-            RuntimeError, "transported frame"):
+            RuntimeError, "finite-link DFT head"):
         _run_fixture_gate(twin, monkeypatch)
 
 
-def test_transported_frame_is_not_weaker_on_a_non_crossing_window(monkeypatch):
-    """The insulating control: same model, window bands pulled 5 Ry apart.
-
-    The pre-0187 check is VALID here — no crossing, so no kinked sorted
-    spectrum, and its diagonal is already 6.625e-05.  The rule is that the
-    replacement must not be looser where the old one was sound.  Measured
-    2026-08-15, both arms from one call:
-
-        sorted frame   max_abs 8.559992e-02  diag 6.625289e-05
-                       offdiag 8.559992e-02  max_rel 2.155722e+00
-        transported    max_abs 8.975370e-05  diag 6.772537e-05
-                       offdiag 8.975370e-05  max_rel 5.036324e-02
-
-    953x tighter on the gate metric and on the off-diagonal; the diagonal
-    is within 2% of the old value, four orders below atol either way.
-    """
+def test_finite_link_gate_passes_a_non_crossing_window(monkeypatch):
+    """The same production gate accepts the separated insulating control."""
     fixture = _two_band_crossing_fixture(crossing=False)
     assert fixture["window_gap"] > 2.0, "the control must not cross"
     assert fixture["min_band_diagonal"] > 0.9, "no band swaps in the control"
@@ -649,10 +586,8 @@ def test_transported_frame_is_not_weaker_on_a_non_crossing_window(monkeypatch):
     metrics = _run_fixture_gate(fixture, monkeypatch)
 
     assert metrics["passed"]
-    assert metrics["max_abs"] <= metrics["max_abs_sorted_frame"]
-    assert metrics["max_abs_diagonal"] < 5.0e-4
-    assert metrics["max_abs_offdiagonal"] <= (
-        metrics["max_abs_offdiagonal_sorted_frame"])
+    assert metrics["head_response_relative_frobenius"] < 5.0e-3
+    assert metrics["transition_overlap_real"] > 0.995
 
 
 def test_transported_frame_closes_every_line_on_the_torus():

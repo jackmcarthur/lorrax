@@ -30,6 +30,7 @@ __all__ = [
     "build_g_wrap_lookup",
     "band_storage_extent",
     "fourth_order_connection",
+    "fourth_order_covariant_derivative",
     "g_wrap_for_forward_step",
     "g_wrap_for_step",
     "inverse_neighbor_table",
@@ -404,3 +405,93 @@ def fourth_order_connection(
         A = 0.5 * (A + jnp.swapaxes(jnp.conj(A), -1, -2))
         components.append(A)
     return jnp.stack(components, axis=0)
+
+
+def fourth_order_covariant_derivative(
+    operator_k: jax.Array,
+    forward_links: jax.Array,
+    forward_neighbors: np.ndarray,
+    reduced_spacing: Sequence[float],
+    *,
+    band_matmul,
+) -> jax.Array:
+    r"""Differentiate a band operator after finite-link parallel transport.
+
+    The stored forward link has the orientation
+
+    ``L_i(k) O(k+b_i) L_i(k)^H``.
+
+    Each neighbour is therefore expressed in the central ``k`` basis before
+    the fourth-order stencil is applied.  This is the discrete, structurally
+    gauge-covariant spelling of ``partial_i O - i[A_i,O]``; it avoids splitting
+    two large gauge-dependent terms whose finite-grid derivatives obey no
+    exact product rule.
+
+    Parameters
+    ----------
+    operator_k
+        ``(nk, nb, nb)`` complex band operator at ``P(None,'x','y')``.
+    forward_links
+        ``(3, nk, nb, nb)`` polar links at
+        ``P(None,None,'x','y')``.
+    forward_neighbors
+        Host ``(nk,3)`` table of the positive mesh neighbours.
+    reduced_spacing
+        Three positive reduced-coordinate mesh spacings.
+    band_matmul
+        Distributed batched matrix product for one leading batch axis.
+
+    Returns
+    -------
+    jax.Array
+        ``(3,nk,nb,nb)`` reduced-coordinate covariant derivative, retaining
+        the input's two-dimensional band tiling.
+    """
+    operator = jnp.asarray(operator_k)
+    links = jnp.asarray(forward_links)
+    plus = np.asarray(forward_neighbors, dtype=np.int32)
+    spacing = np.asarray(reduced_spacing, dtype=np.float64)
+    if operator.ndim != 3 or operator.shape[-2] != operator.shape[-1]:
+        raise ValueError(
+            "operator_k must be (nk,nb,nb); "
+            f"got {tuple(operator.shape)}")
+    expected_links = (3,) + tuple(operator.shape)
+    if tuple(links.shape) != expected_links:
+        raise ValueError(
+            f"forward_links must have shape {expected_links}; "
+            f"got {tuple(links.shape)}")
+    if plus.shape != (operator.shape[0], 3):
+        raise ValueError(
+            f"forward_neighbors must be ({operator.shape[0]},3); "
+            f"got {plus.shape}")
+    if spacing.shape != (3,) or np.any(spacing <= 0.0):
+        raise ValueError(
+            f"reduced_spacing must be three positive values; got {spacing}")
+
+    minus = inverse_neighbor_table(plus)
+
+    def _transport(transport, neighbour_operator):
+        return band_matmul(
+            band_matmul(transport, neighbour_operator),
+            jnp.swapaxes(jnp.conj(transport), -1, -2),
+        )
+
+    rows = []
+    for idir in range(3):
+        lp1 = links[idir]
+        kp1 = plus[:, idir]
+        kp2 = plus[kp1, idir]
+        km1 = minus[:, idir]
+        km2 = minus[km1, idir]
+        lp2 = band_matmul(lp1, lp1[kp1])
+        lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
+        lm2 = band_matmul(
+            lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
+        tp1 = _transport(lp1, operator[kp1])
+        tp2 = _transport(lp2, operator[kp2])
+        tm1 = _transport(lm1, operator[km1])
+        tm2 = _transport(lm2, operator[km2])
+        rows.append(
+            (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2)
+            / (12.0 * float(spacing[idir])))
+    return jnp.stack(rows, axis=0)

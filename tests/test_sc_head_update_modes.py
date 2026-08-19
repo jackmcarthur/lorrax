@@ -41,6 +41,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
+from common.parallel_transport import build_forward_neighbor_table
 from gw import qsgw_head
 from gw.gw_config import METAL_HEAD_UPDATES, LorraxConfig
 from gw.qsgw_head import (
@@ -159,7 +160,8 @@ def test_an_unknown_head_update_value_refuses_and_names_both_modes(tmp_path):
 # ---------------------------------------------------------------------------
 
 _SENTINEL = SimpleNamespace(
-    nb_logical=7, velocity_dft_cart=None, connection_cart=None,
+    nb_logical=7, velocity_dft_cart=None, forward_links=None,
+    forward_neighbors=None,
     reciprocal_lattice_cart=None, validation=None)
 
 
@@ -247,7 +249,11 @@ def test_the_dispatch_announces_the_dropped_correction(
 # 3. The head chain on DFT velocities
 # ---------------------------------------------------------------------------
 
-_KGRID = (2, 2, 2)
+_KGRID = (5, 5, 5)
+_KCOORDS = np.stack(
+    np.meshgrid(*(np.arange(n) for n in _KGRID), indexing="ij"), axis=-1
+).reshape(-1, 3)
+_FORWARD_NEIGHBORS = build_forward_neighbor_table(_KCOORDS, _KGRID)
 
 
 def _head_fixture(seed: int):
@@ -281,10 +287,11 @@ def _head_fixture(seed: int):
     )
 
 
-def _response(fx, *, connection, delta, U, wings=True):
+def _response(fx, *, links, delta, U, wings=True):
     return build_iteration_head_response(
         delta,
-        connection,
+        links,
+        (_FORWARD_NEIGHBORS if links is not None else None),
         jnp.asarray(fx.velocity),
         jnp.asarray(U),
         jnp.asarray(fx.energies),
@@ -308,18 +315,20 @@ def _response(fx, *, connection, delta, U, wings=True):
 def test_the_dft_velocity_chain_reproduces_the_transport_chain_at_zero_dh():
     """The whole chain, both routes, where they must agree exactly.
 
-    With DeltaH = 0 and A = 0 the covariant correction vanishes, so the
+    With DeltaH = 0 the finite-link correction vanishes, so the
     transport route reduces to the DFT-velocity route.  Agreement across
     S(z), the Drude term (surface weights are supplied), both ISDF wings
     and the static kappa^2 is the smoke test that the new branch skips only
     the correction and nothing else.
     """
     fx = _head_fixture(2026)
-    zeros_A = jnp.zeros((3, fx.nk, fx.nb, fx.nb), dtype=jnp.complex128)
+    identity_links = jnp.broadcast_to(
+        jnp.eye(fx.nb, dtype=jnp.complex128),
+        (3, fx.nk, fx.nb, fx.nb))
     zeros_dh = jnp.zeros((fx.nk, fx.nb, fx.nb), dtype=jnp.complex128)
 
-    transport = _response(fx, connection=zeros_A, delta=zeros_dh, U=fx.U)
-    dft = _response(fx, connection=None, delta=None, U=fx.U)
+    transport = _response(fx, links=identity_links, delta=zeros_dh, U=fx.U)
+    dft = _response(fx, links=None, delta=None, U=fx.U)
 
     np.testing.assert_allclose(
         np.asarray(dft.S_direct), np.asarray(transport.S_direct),
@@ -337,13 +346,13 @@ def test_the_dft_velocity_chain_reproduces_the_transport_chain_at_zero_dh():
 
 
 def test_a_real_delta_h_is_what_the_dft_velocity_mode_drops():
-    """Negative control for the cell above: with a genuine connection and
+    """Negative control for the cell above: with genuine links and
     DeltaH the two routes MUST differ, or the equality proved nothing."""
     fx = _head_fixture(3031)
     rng = np.random.default_rng(77)
-    raw_a = rng.normal(size=(3, fx.nk, fx.nb, fx.nb)) + 1j * rng.normal(
-        size=(3, fx.nk, fx.nb, fx.nb))
-    A = jnp.asarray(raw_a + np.swapaxes(raw_a.conj(), -1, -2))
+    links = jnp.broadcast_to(
+        jnp.eye(fx.nb, dtype=jnp.complex128),
+        (3, fx.nk, fx.nb, fx.nb))
     dh = np.zeros((fx.nk, fx.nb, fx.nb), dtype=np.complex128)
     block = rng.normal(size=(fx.nk, fx.na, fx.na)) + 1j * rng.normal(
         size=(fx.nk, fx.na, fx.na))
@@ -352,8 +361,8 @@ def test_a_real_delta_h_is_what_the_dft_velocity_mode_drops():
         size=(fx.nk, fx.nb - fx.na))
 
     transport = _response(
-        fx, connection=A, delta=jnp.asarray(dh), U=fx.U, wings=False)
-    dft = _response(fx, connection=None, delta=None, U=fx.U, wings=False)
+        fx, links=links, delta=jnp.asarray(dh), U=fx.U, wings=False)
+    dft = _response(fx, links=None, delta=None, U=fx.U, wings=False)
     assert np.max(np.abs(
         np.asarray(dft.S_direct) - np.asarray(transport.S_direct))) > 1e-3
 
@@ -367,7 +376,7 @@ def test_dft_velocity_rotates_into_the_qp_basis_every_iteration():
     """
     fx = _head_fixture(4102)
     got = np.asarray(_response(
-        fx, connection=None, delta=None, U=fx.U, wings=False).S_direct)
+        fx, links=None, delta=None, U=fx.U, wings=False).S_direct)
 
     rotated = rotate_velocity_active_to_qp(
         jnp.asarray(fx.velocity), jnp.asarray(fx.U), mesh=_mesh())
