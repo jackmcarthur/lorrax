@@ -465,22 +465,31 @@ def compute_static_w(
                         trs_pair_coherent_unfold_sym_idx,
                         trs_project_self_negative_q_rows,
                     )
+                    trs_allowed = bool(getattr(sym, "trs_allowed", True))
                     unfold_sym = trs_pair_coherent_unfold_sym_idx(
                         full_to_irr_idx, full_to_irr_sym,
                         kgrid=tuple(meta.kgrid),
                         q_irr_full_idx=sym.q_irr_full_idx,
-                        n_sym_spatial=n_sym_spatial)
+                        n_sym_spatial=n_sym_spatial,
+                        trs_allowed=trs_allowed)
                     W_q_solve = trs_project_self_negative_q_rows(
                         W_q_solve, sym.q_irr_full_idx,
-                        kgrid=tuple(meta.kgrid))
+                        kgrid=tuple(meta.kgrid),
+                        trs_allowed=trs_allowed)
                     if jax.process_index() == 0:
                         n_rewired = int(np.count_nonzero(
                             np.asarray(unfold_sym)
                             != np.asarray(full_to_irr_sym)))
-                        print(
-                            f"  W[{_w}] unfold: {n_rewired} q rows use a "
-                            "TRS-composed partner so q/-q share one spatial "
-                            "realization.")
+                        if trs_allowed:
+                            print(
+                                f"  W[{_w}] unfold: {n_rewired} q rows use a "
+                                "TRS-composed partner so q/-q share one "
+                                "spatial realization.")
+                        else:
+                            print(
+                                f"  W[{_w}] unfold: measured density breaks "
+                                "TRS; retaining independently solved q/-q "
+                                "rows and skipping the fixed-q TRS projector.")
                     # W's PRE-UNFOLD BLOCK, offered to whoever is writing
                     # the restart — same contract, same reason, same
                     # no-op-outside-a-scope as the V site in v_q_g_flat.

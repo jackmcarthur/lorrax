@@ -1028,6 +1028,20 @@ def test_ladder_unfold_refuses_two_independently_solved_q_partners():
             n_sym_spatial=1)
 
 
+def test_magnetic_unfold_retains_two_independently_solved_q_partners():
+    """Broken TRS means independent q/-q rows are physical, not an error."""
+    import numpy as np
+    from gw.qgrid_symmetry import trs_pair_coherent_unfold_sym_idx
+
+    original = np.asarray([0, 0, 0], dtype=np.int32)
+    got = trs_pair_coherent_unfold_sym_idx(
+        np.asarray([0, 1, 2]), original,
+        kgrid=(3, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2]),
+        n_sym_spatial=1, trs_allowed=False)
+    assert np.array_equal(got, original)
+    assert got is not original
+
+
 def test_pair_coherent_rows_restore_reciprocity_without_spatial_covariance():
     """The row policy must not assume a finite fitted parent is PG-covariant."""
     import numpy as np
@@ -1083,6 +1097,18 @@ def test_trs_fixed_q_projector_changes_only_self_negative_rows():
     assert np.all(got[[0, 2]].imag == 0.0)
     assert np.array_equal(got[[0, 2]].real, np.asarray(rows)[[0, 2]].real)
     assert np.array_equal(got[[1, 3]], np.asarray(rows)[[1, 3]])
+
+
+def test_magnetic_fixed_q_rows_are_not_projected_real():
+    """q == -q does not imply A(q) == A(q)* when TRS is broken."""
+    import jax.numpy as jnp
+    import numpy as np
+    from gw.qgrid_symmetry import trs_project_self_negative_q_rows
+
+    rows = jnp.asarray([[[1 + 2j]], [[3 + 4j]]])
+    got = trs_project_self_negative_q_rows(
+        rows, np.arange(2), kgrid=(2, 1, 1), trs_allowed=False)
+    assert np.array_equal(np.asarray(got), np.asarray(rows))
 
 
 # ---------------------------------------------------------------------------

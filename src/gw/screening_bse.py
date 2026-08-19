@@ -821,18 +821,26 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
     V_wedge = slice_q_full_to_ibz(V_q, sym.q_irr_full_idx, out_sharding=_nat)
     W_wedge = _assert_mu_width(
         wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
+    trs_allowed = bool(getattr(sym, "trs_allowed", True))
     W_wedge = trs_project_self_negative_q_rows(
-        W_wedge, sym.q_irr_full_idx, kgrid=tuple(meta.kgrid))
+        W_wedge, sym.q_irr_full_idx, kgrid=tuple(meta.kgrid),
+        trs_allowed=trs_allowed)
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
     ladder_unfold_sym = _trs_pair_coherent_unfold_sym_idx(
         full_to_irr_idx, full_to_irr_sym, kgrid=tuple(meta.kgrid),
         q_irr_full_idx=sym.q_irr_full_idx,
-        n_sym_spatial=n_sym_spatial)
+        n_sym_spatial=n_sym_spatial, trs_allowed=trs_allowed)
     n_rewired = int(np.count_nonzero(
         ladder_unfold_sym != np.asarray(full_to_irr_sym)))
-    print_fn(
-        f"  W[{label}] ladder unfold: {n_rewired} q rows use a "
-        "TRS-composed partner to preserve one gauge per q/-q pair.")
+    if trs_allowed:
+        print_fn(
+            f"  W[{label}] ladder unfold: {n_rewired} q rows use a "
+            "TRS-composed partner to preserve one gauge per q/-q pair.")
+    else:
+        print_fn(
+            f"  W[{label}] ladder unfold: measured density breaks TRS; "
+            "retaining independently solved q/-q rows and skipping the "
+            "fixed-q TRS projector.")
     with timing.section("W.unfold_to_full_bz", announce=True,
                         label=f"W[{label}] ladder IBZ -> full-BZ unfold "
                               f"({int(W_wedge.shape[0])} q -> "

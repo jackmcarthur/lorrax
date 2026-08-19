@@ -127,6 +127,7 @@ def resolve_qgrid_symmetry_tables(
 
 def trs_pair_coherent_unfold_sym_idx(
     irr_idx, sym_idx, *, kgrid, q_irr_full_idx, n_sym_spatial,
+    trs_allowed=True,
 ):
     """Choose one spatial realization for every non-TRIM q/-q pair.
 
@@ -145,6 +146,13 @@ def trs_pair_coherent_unfold_sym_idx(
     TRS and not on an unrelated spatial gauge.  Irreducible representatives
     and self-negative q rows are unchanged; no value is averaged or
     projected.
+
+    When the load-time density measurement says time reversal is broken,
+    ``trs_allowed=False`` is the physics gate: every independently solved
+    row is retained verbatim.  In particular, q and -q are then allowed to
+    have different irreducible parents.  This is not a permissive fallback;
+    imposing the conjugation relation in that case would change a magnetic
+    operator.
 
     This policy was first shipped for ladder W in ``screening_bse``.  It is
     owned here because bare V, RPA W, and ladder W must use the same q-grid
@@ -168,6 +176,9 @@ def trs_pair_coherent_unfold_sym_idx(
             "GATE trs_pair_unfold_map: symmetry rows must lie in "
             f"[0, 2*n_sym_spatial) with n_sym_spatial={n_spatial}; got "
             f"range [{lo}, {hi}].")
+
+    if not bool(trs_allowed):
+        return original.copy()
 
     reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
     out = original.copy()
@@ -202,7 +213,9 @@ def trs_pair_coherent_unfold_sym_idx(
     return out
 
 
-def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
+def trs_project_self_negative_q_rows(
+    operator, q_full_idx, *, kgrid, trs_allowed=True,
+):
     """Apply the one-element TRS group projector at q == -q.
 
     Pair-coherent unfold handles every two-element q/-q orbit without
@@ -212,6 +225,10 @@ def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
     ill-conditioned ISDF backsolve can leave a small anti-TRS component even
     when the non-TRIM pairs are exact.  Remove only that component with the
     unique group average ``(A + conj(A))/2``.
+
+    ``trs_allowed=False`` returns the operator unchanged after validating
+    the q-axis contract.  A self-negative momentum does not make a magnetic
+    operator real; only an actual time-reversal symmetry does.
 
     ``operator`` remains distributed exactly as supplied; this is an
     elementwise operation and performs no host gather.  ``q_full_idx`` names
@@ -231,6 +248,8 @@ def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
         raise ValueError(
             "GATE trs_fixed_q_projector: operator q extent does not match "
             f"q_full_idx ({int(operator.shape[0])} != {int(qidx.size)}).")
+    if not bool(trs_allowed):
+        return operator
     coords = np.stack(np.unravel_index(qidx, tuple(grid)), axis=1)
     fixed = np.all((2 * coords) % grid[None, :] == 0, axis=1)
     mask = jnp.asarray(fixed).reshape((qidx.size,) + (1,) * (operator.ndim - 1))

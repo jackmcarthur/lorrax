@@ -582,18 +582,26 @@ def _compute_V_q_g_flat_one_tile(
                 trs_pair_coherent_unfold_sym_idx,
                 trs_project_self_negative_q_rows,
             )
+            trs_allowed = bool(getattr(sym, "trs_allowed", True))
             unfold_sym = trs_pair_coherent_unfold_sym_idx(
                 full_to_irr_idx, full_to_irr_sym, kgrid=tuple(kgrid),
                 q_irr_full_idx=sym.q_irr_full_idx,
-                n_sym_spatial=n_sym_spatial)
+                n_sym_spatial=n_sym_spatial,
+                trs_allowed=trs_allowed)
             V_acc = trs_project_self_negative_q_rows(
-                V_acc, sym.q_irr_full_idx, kgrid=tuple(kgrid))
+                V_acc, sym.q_irr_full_idx, kgrid=tuple(kgrid),
+                trs_allowed=trs_allowed)
             if verbose and jax.process_index() == 0:
                 n_rewired = int(np.count_nonzero(
                     np.asarray(unfold_sym) != np.asarray(full_to_irr_sym)))
-                print(f"  V_q g-flat [CC] unfold: {n_rewired} q rows use "
-                      "a TRS-composed partner so q/-q share one spatial "
-                      "realization.", flush=True)
+                if trs_allowed:
+                    print(f"  V_q g-flat [CC] unfold: {n_rewired} q rows use "
+                          "a TRS-composed partner so q/-q share one spatial "
+                          "realization.", flush=True)
+                else:
+                    print("  V_q g-flat [CC] unfold: measured density breaks "
+                          "TRS; retaining independently solved q/-q rows and "
+                          "skipping the fixed-q TRS projector.", flush=True)
         # THE PRE-UNFOLD BLOCK, OFFERED TO WHOEVER IS WRITING THE RESTART.
         # This is the array the q_irr format persists — the design's
         # load-bearing decision, because ``unfold(stored)`` is then the
