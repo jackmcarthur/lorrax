@@ -47,7 +47,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from .gw_config import (
-    ComputeMode, SigmaChannel, band_extrapolation_is_consumable,
+    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
+    band_extrapolation_is_consumable,
     mode_builds_channels, refuse_unimplemented_compute_mode,
     sigma_stage_modes)
 
@@ -682,15 +683,26 @@ def compute_sigma_xc(
     # case the guard was written for: an explicit key on a run in which no
     # stage is a plasmon-pole model.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
-        explicit = bool(getattr(
+        explicit_switch = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
+        explicit_scheme = bool(getattr(
+            config.sigma, "band_extrapolation_bracket_scheme_explicit",
+            False))
+        explicit = explicit_switch or explicit_scheme
         run_modes = sigma_stage_modes(config, fallback=mode)
         consumable = band_extrapolation_is_consumable(run_modes)
         ladder = " -> ".join(getattr(m, "value", str(m)) for m in run_modes)
+        bracket_scheme = getattr(
+            config.sigma, "band_extrapolation_bracket_scheme",
+            BRACKET_SCHEME_DEFAULT)
         if explicit and not consumable:
             raise NotImplementedError(
-                f"use_band_extrapolation = true, but NO stage of this run "
-                f"consumes it.  This run's Σ schemes are [{ladder}]; the "
+                f"Band extrapolation was explicitly configured "
+                f"(use_band_extrapolation = true; "
+                f"band_extrapolation_bracket_scheme = "
+                f"{bracket_scheme}), but NO "
+                f"stage of this run consumes it.  This run's Σ schemes are "
+                f"[{ladder}]; the "
                 f"stage refusing here is compute_mode = "
                 f"{getattr(mode, 'value', mode)}.  The band-convergence "
                 f"extrapolation is wired into the two-point plasmon-pole Σ_c "

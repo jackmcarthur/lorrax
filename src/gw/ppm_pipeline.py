@@ -552,13 +552,14 @@ def compute_ppm_sigma_pipeline(
         # gives the trivial one-bracket plan and the whole path below is
         # bit-identical to the un-bracketed code.
         s = wfns.slices
-        # THE FRACTIONS ARE OF THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
+        # THE CUTS ARE WITHIN THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
         # / ``sigma_sum``, never ``b_id_4_user`` / ``full``: the latter pair
-        # is the LOADED extent = max(chi, sigma), so on a deck running χ at
-        # 248 and Σ at 100 they would bracket at ~(198, 223, 248) — three
-        # points on a curve this run never evaluates — instead of the
-        # ~(80, 90, 100) the Σ sum actually walks.  Identical on an unsplit
-        # deck, which is why nothing here changes for the tree's decks.
+        # is the LOADED extent = max(chi, sigma), so on a default-scheme deck
+        # running χ at 248 and Σ at 100 they would bracket at
+        # ~(198, 223, 248) — three points on a curve this run never evaluates
+        # — instead of ~(80, 90, 100).  The conduction-coordinate scheme
+        # likewise defines n_occ, n_cond and its DFT ladder inside this same
+        # Σ window.  Identical counts on an unsplit deck.
         # Pinned by tests/test_band_extrapolation_sigma_count.py.
         plan = plan_band_brackets(
             enabled=bool(config.sigma.band_extrapolation),
@@ -566,6 +567,8 @@ def compute_ppm_sigma_pipeline(
             n_occ=int(s.b2 - s.b0),
             nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
             nb_padded=int(s.nb_sigma_sum),
+            bracket_scheme=str(
+                config.sigma.band_extrapolation_bracket_scheme),
         )
         # ...AND THE COMMENT ABOVE IS NOT ENOUGH, SO THIS IS CHECKED.  A plan
         # built from the wrong count is invisible in every weight-level
@@ -579,7 +582,8 @@ def compute_ppm_sigma_pipeline(
             plan, s, meta=meta, where="ppm_pipeline plan seam")
         if plan.enabled:
             print_fn(
-                f"  Σc band extrapolation: ON — {plan.n_brackets} disjoint "
+                f"  Σc band extrapolation: ON — bracket scheme "
+                f"{plan.bracket_scheme}; {plan.n_brackets} disjoint "
                 f"band brackets {plan.bounds} against ONE W(τ) per τ; "
                 f"band counts {plan.counts} (requested {plan.requested}).")
             # Emitted HERE and not only in the report block at the end: a

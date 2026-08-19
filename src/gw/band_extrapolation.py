@@ -50,7 +50,8 @@ reader takes "decays like 1/N" as established.  The screened-Coulomb cutoff
 was tested as the cause and REFUTED (tripling W's G-space moves the exponent
 by ≤ 0.001).
 
-THE THREE POINTS COME FROM DISJOINT BRACKETS, NOT THREE RUNS.  The band axis
+THE THREE POINTS COME FROM DISJOINT BRACKETS, NOT THREE RUNS.  Under the
+default ``band_extrapolation_bracket_scheme = total_fractions``, the band axis
 is cut into three contiguous brackets
 
     bracket 0   [0, N₁)          everything up to 80 % of the TOTAL band count
@@ -104,10 +105,11 @@ in a low window shares.  **No residual, R² or scatter statistic can see it**
 — which is also why ``Δ_model`` alone is not a sufficient diagnostic and why
 :class:`ExtrapolationFit` carries the two SIGNED numbers below beside it.
 
-FRACTIONS OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION COUNT.  The model is
-written in ``N_eff``, and the free-electron counting law that makes 1/N the
-right variable is written in the total count measured from the bottom of the
-band manifold.  Measured on the Si 4×4×4 SOC deck's own eigenvalues:
+DEFAULT FRACTIONS ARE OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION COUNT.
+The incumbent model is written in ``N_eff``, and the free-electron counting
+law that makes 1/N the right variable is written in the total count measured
+from the bottom of the band manifold.  Measured on the Si 4×4×4 SOC deck's
+own eigenvalues:
 
     N_total vs (Ē_N − E_bandbottom)   →  p = 1.481,  R² = 0.9988   (3/2 ✓)
     N_cond  vs (Ē_N − E_CBM)          →  p = 1.212,  R² = 0.9979   (✗)
@@ -118,6 +120,22 @@ total.  On a deck with a small occupied manifold the two parametrisations
 differ by ~2 % and nothing distinguishes them; on one with a large occupied
 manifold ``n_occ + 0.8·n_cond`` sits far below ``0.8·N_max`` and they diverge
 badly.
+
+AN EXPLICIT CONDUCTION-COORDINATE GEOMETRY IS ALSO AVAILABLE.  The named
+``conduction_energy_midpoint`` scheme places N1 at half of the conduction
+bands included in the Sigma sum, snaps it to a multiplet-clean boundary, then
+places N2 at the clean rectangular boundary nearest halfway between N1 and N3
+in ``mean_k E[k,N-1]``.  It does NOT apply a global E_ck mask: every k keeps
+the same static band count.  This changes only cut placement; both estimators
+still use absolute band indices and the full DFT energy ladder.
+
+It is deliberately NOT the default.  On the measured Si GN-PPM curve its
+indirect-gap spread was 12.29 meV over N3=180..396 and 4.18 meV over
+N3=276..440, but 82.96 meV over N3=140..296; the incumbent total-80/90
+geometry also remained more accurate per state on that control.  One material
+does not establish a universal band threshold.  Existing decks therefore
+retain their numerical meaning, while production studies can name the new
+scheme and get its resolved cuts in the startup log and HDF5 provenance.
 
 THE FIT HAS EXACTLY TWO FREE PARAMETERS.
 
@@ -387,6 +405,7 @@ import numpy as np
 from common.band_degeneracy import (
     DEGENERACY_TOL_RY,
     BandWindowDegeneracyError,
+    boundary_min_gaps,
     snap_cut_to_clean_boundary,
 )
 from common.units import RYD_TO_EV
@@ -444,6 +463,22 @@ from common.units import RYD_TO_EV
 #: Report: ``sandbox:reports/ch_converge_band_extrapolation_2026-08-15/``,
 #: which carries the three ``ch_converge.dat`` arms and the analysis scripts.
 BRACKET_FRACTIONS: tuple[float, float] = (0.80, 0.90)
+
+#: Named geometries for the three cumulative band sums.  The incumbent stays
+#: the default: changing the meaning of existing decks would invalidate their
+#: convergence history, and the conduction-coordinate arm has only been
+#: measured on one Si curve.  ``conduction_energy_midpoint`` is therefore an
+#: explicit production option, not an inferred replacement.
+BRACKET_SCHEMES: tuple[str, str] = (
+    "total_fractions",
+    "conduction_energy_midpoint",
+)
+BRACKET_SCHEME_DEFAULT: str = "total_fractions"
+
+#: First point of the conduction-coordinate geometry.  The middle point is
+#: not another fraction: it is chosen halfway in k-mean DFT energy between
+#: this snapped boundary and N3.
+CONDUCTION_HALF_FRACTION: float = 0.50
 
 
 #: Extrapolation uncertainty, as a fraction of the correction actually applied
@@ -516,6 +551,15 @@ class BandBracketPlan:
         Mean band energy over ``[0, N_i)``, in eV relative to nothing in
         particular — a cutoff-flavoured REPORTING number, per the module
         docstring.  Never consumed.
+    bracket_scheme : str
+        Named rule that chose the interior cuts.  Stored in the output
+        artifact and printed before compilation; it is not reconstructed
+        from the counts because degeneracy snapping makes that ambiguous.
+    boundary_mean_energy_ev : tuple[float, ...]
+        ``mean_k E[k, N_i-1]`` in eV for each cut.  This is the coordinate
+        consumed by ``conduction_energy_midpoint`` and provenance for every
+        scheme.  Unlike ``mean_energy_ev`` it is a band-edge coordinate, not
+        the mean over all included states.
     enabled : bool
         False for the trivial single-bracket plan.
     notes : tuple[str, ...]
@@ -533,6 +577,8 @@ class BandBracketPlan:
     n_cond: int
     mean_energy_ev: tuple[float, ...]
     enabled: bool
+    bracket_scheme: str = BRACKET_SCHEME_DEFAULT
+    boundary_mean_energy_ev: tuple[float, ...] = ()
     notes: tuple[str, ...] = ()
 
     @property
@@ -557,6 +603,8 @@ def trivial_plan(nb_padded: int, n_occ: int, nb_logical: int) -> BandBracketPlan
         n_cond=int(nb_logical) - int(n_occ),
         mean_energy_ev=(float("nan"),),
         enabled=False,
+        bracket_scheme="disabled",
+        boundary_mean_energy_ev=(float("nan"),),
     )
 
 
@@ -569,6 +617,7 @@ def plan_band_brackets(
     nb_padded: int,
     tol_ry: float = DEGENERACY_TOL_RY,
     fractions: tuple[float, ...] = BRACKET_FRACTIONS,
+    bracket_scheme: str = BRACKET_SCHEME_DEFAULT,
 ) -> BandBracketPlan:
     """Build the bracket plan for one Σ stage.
 
@@ -594,6 +643,12 @@ def plan_band_brackets(
         never evaluates.  The last bracket runs to ``nb_padded`` so the plan
         still covers every band the un-bracketed path summed; the pad bands
         contribute exactly zero, so ``counts`` stays logical.
+    bracket_scheme : {"total_fractions", "conduction_energy_midpoint"}
+        ``total_fractions`` preserves the incumbent 80/90/100 total-band
+        geometry.  ``conduction_energy_midpoint`` places N1 at half the
+        included conduction manifold (then snaps it), and N2 at the clean
+        rectangular boundary nearest the midpoint in ``mean_k E[k,N-1]``.
+        The latter is an explicit compatibility spelling, never inferred.
 
     Raises
     ------
@@ -655,6 +710,19 @@ def plan_band_brackets(
     nb_padded = int(nb_padded)
     n_cond = nb_logical - n_occ
 
+    bracket_scheme = str(bracket_scheme).strip().lower()
+    if bracket_scheme not in BRACKET_SCHEMES:
+        raise ValueError(
+            f"band_extrapolation_bracket_scheme = {bracket_scheme!r} is "
+            f"not known; choose one of {BRACKET_SCHEMES}.")
+    if (bracket_scheme == "conduction_energy_midpoint"
+            and tuple(fractions) != BRACKET_FRACTIONS):
+        raise ValueError(
+            "plan_band_brackets: fractions and "
+            "bracket_scheme='conduction_energy_midpoint' cannot be combined; "
+            "that named scheme fixes N1 at half the conduction manifold and "
+            "derives N2 from energy, so fractions would be ignored.")
+
     if not enabled:
         return trivial_plan(nb_padded, n_occ, nb_logical)
 
@@ -699,10 +767,15 @@ def plan_band_brackets(
             f"plan_band_brackets: expected (nk, >={nb_logical}) energies, "
             f"got shape {np.shape(enk_ry)}")
 
-    # Fractions of the TOTAL band count — see the module docstring; the
-    # counting law that makes 1/N the right variable is written in the total,
-    # and the fit's lever arm depends on the ratio N₁/N₃.
+    # ``total_fractions`` is the incumbent geometry.  Keep this expression
+    # exactly as it was: it is the compatibility arm and its counts must not
+    # move.  The alternate geometry is resolved below because its N2 depends
+    # on the *snapped* N1, not on the raw conduction-half request.
     requested = tuple(int(round(f * nb_logical)) for f in fractions)
+    if bracket_scheme == "conduction_energy_midpoint":
+        requested = (
+            n_occ + int(round(CONDUCTION_HALF_FRACTION * n_cond)),
+        )
 
     # ── SNAPPING THE INTERIOR CUTS IS A PREFERENCE, NOT A CONSTRAINT ────
     # The interior cuts are SAMPLING POINTS ON A PARTIAL-SUM CURVE, not
@@ -746,7 +819,8 @@ def plan_band_brackets(
     notes: list[str] = []
     snapped: list[int] = []
     lo_bound = n_occ + 1
-    n_interior = len(requested)
+    n_interior = 2 if bracket_scheme == "conduction_energy_midpoint" \
+        else len(requested)
     for i_cut, req in enumerate(requested):
         req = int(req)
         # RESERVE ROOM FOR THE CUTS THAT COME AFTER THIS ONE.  Without this,
@@ -790,41 +864,92 @@ def plan_band_brackets(
                 f"costs accuracy (<= ~6 meV measured) and not correctness.")
         snapped.append(cut)
         lo_bound = cut + 1
+
+    if bracket_scheme == "conduction_energy_midpoint" and snapped:
+        # One rectangular band count at every k is non-negotiable: a literal
+        # global E_ck threshold gives k-dependent shapes and is a different
+        # kernel.  Instead use the k-mean DFT ladder as a scalar coordinate.
+        # N1 has already been snapped, so the target describes the geometry
+        # that will actually be fitted rather than the unsnapped request.
+        n1 = int(snapped[0])
+        boundary_energy = np.mean(e, axis=0)
+        target_ry = 0.5 * (
+            float(boundary_energy[n1 - 1])
+            + float(boundary_energy[nb_logical - 1]))
+        lo2, hi2 = n1 + 1, nb_logical - 1
+        if lo2 <= hi2:
+            raw_n2 = min(
+                range(lo2, hi2 + 1),
+                key=lambda n: (abs(float(boundary_energy[n - 1]) - target_ry),
+                               n),
+            )
+            gaps = boundary_min_gaps(e, is_full_spectrum=False)
+            clean = [n for n in range(lo2, hi2 + 1)
+                     if float(gaps[n]) > float(tol_ry)]
+            if clean:
+                n2 = min(
+                    clean,
+                    key=lambda n: (
+                        abs(float(boundary_energy[n - 1]) - target_ry), n),
+                )
+            else:
+                n2 = int(raw_n2)
+                notes.append(
+                    f"interior energy-midpoint cut {raw_n2} kept "
+                    f"UNSNAPPED: no multiplet-clean boundary exists in "
+                    f"[{lo2}, {hi2}] at tol "
+                    f"{tol_ry * RYD_TO_EV * 1e3:.3f} meV.  The cut is a "
+                    f"sampling point on a partial-sum curve, not a Σ "
+                    f"window, so this costs accuracy and not correctness.")
+            requested = (int(requested[0]), int(raw_n2))
+            snapped.append(int(n2))
     counts = tuple(snapped) + (nb_logical,)
 
     # What survives as a refusal: three counts that are not DISTINCT and
-    # ascending.  After the fallback above this can only happen when the
-    # requested FRACTIONS themselves collide — i.e. nb_logical is too small
-    # for 0.80/0.90/1.00 to resolve into three integers — which is a real
-    # "raise nband", not a spectrum accident.
+    # ascending.  That means the selected geometry has no room for three
+    # points below this N3 — a real "raise nband", not a spectrum accident.
     if len(set(counts)) != len(counts) or list(counts) != sorted(counts):
         # The smallest fraction gap has to be worth at least one band, plus
         # the floor at n_occ+1 that the first cut is clamped to.
-        gaps = np.diff(np.sort(np.asarray(tuple(fractions) + (1.0,), float)))
+        fraction_gaps = np.diff(np.sort(
+            np.asarray(tuple(fractions) + (1.0,), float)))
         # ONE GATE, ONE THRESHOLD.  The activation gate above is
         # ``n_cond >= n_occ`` (nband >= 2*n_occ); this floor must be the SAME
         # number, or a deck that clears one refusal lands on a second with a
         # different answer to "how many bands do I need".
-        need = max(int(np.ceil(1.0 / max(float(gaps.min()), 1e-12))),
-                   2 * n_occ)
+        if bracket_scheme == "total_fractions":
+            need = max(
+                int(np.ceil(1.0 / max(float(fraction_gaps.min()), 1e-12))),
+                2 * n_occ)
+            why = "the sampling fractions are less than one band apart"
+        else:
+            # Four conduction bands are the smallest manifold that can put
+            # one point at half and still leave a distinct middle and N3.
+            need = max(n_occ + 4, 2 * n_occ)
+            why = "the conduction manifold has no room for two interior cuts"
+        geometry = (
+            f"fractions {tuple(fractions)} of number_bands_sigma"
+            if bracket_scheme == "total_fractions" else
+            "conduction-half / k-mean-energy-midpoint geometry")
         raise BandExtrapolationRefused(
             f"use_band_extrapolation: the three band counts collapsed onto "
-            f"{counts} (requested {requested + (nb_logical,)} from fractions "
-            f"{tuple(fractions)} of number_bands_sigma = {nb_logical}).  "
+            f"{counts} (requested {requested + (nb_logical,)} from "
+            f"{geometry}, number_bands_sigma = {nb_logical}).  "
             f"Three DISTINCT, ascending counts are required — two coincident "
             f"points cannot determine a two-parameter fit.  At "
-            f"number_bands_sigma = {nb_logical} the sampling fractions are "
-            f"less than one band apart.  Raise the deck's "
+            f"number_bands_sigma = {nb_logical} {why}.  Raise the deck's "
             f"`number_bands_sigma` (or the umbrella `number_bands`, which "
             f"sets both counts) to at least {need}, or set "
-            f"use_band_extrapolation = false.  `number_bands_chi` is not the "
-            f"count these fractions are of.")
+            f"use_band_extrapolation = false.  `number_bands_chi` is not "
+            f"read by this planner and will not move these cuts.")
 
     bounds = tuple(
         (int(a), int(b)) for a, b in
         zip((0,) + counts[:-1], counts[:-1] + (nb_padded,)))
     mean_e = tuple(
         float(np.mean(e[:, :c])) * RYD_TO_EV for c in counts)
+    boundary_mean_e = tuple(
+        float(np.mean(e[:, c - 1])) * RYD_TO_EV for c in counts)
     return BandBracketPlan(
         bounds=bounds,
         counts=counts,
@@ -833,6 +958,8 @@ def plan_band_brackets(
         n_cond=n_cond,
         mean_energy_ev=mean_e,
         enabled=True,
+        bracket_scheme=bracket_scheme,
+        boundary_mean_energy_ev=boundary_mean_e,
         notes=tuple(notes),
     )
 
@@ -2310,6 +2437,56 @@ SPECTRAL_EXTRAP_DATASETS = (
 )
 
 
+def _bracket_h5_attrs(plan: BandBracketPlan) -> dict:
+    """Artifact provenance shared by both estimators.
+
+    ``bracket_fractions`` stays for compatibility, but is empty when fractions
+    did not select the cuts.  Writing 0.80/0.90 for the conduction-coordinate
+    scheme would be worse than omitting provenance: it would be a false fact.
+    """
+    if plan.bracket_scheme == "total_fractions":
+        # Preserve the incumbent artifact exactly: absence of the new scheme
+        # attribute means the historical/default total-fractions geometry.
+        return {
+            "bracket_fractions": np.asarray(
+                BRACKET_FRACTIONS, dtype=np.float64),
+        }
+    return {
+        "band_extrapolation_bracket_scheme": str(plan.bracket_scheme),
+        "bracket_fractions": np.asarray((), dtype=np.float64),
+        "bracket_boundary_mean_energy_ev": np.asarray(
+            plan.boundary_mean_energy_ev, dtype=np.float64),
+    }
+
+
+def _bracket_geometry_text(plan: BandBracketPlan) -> str:
+    """One log spelling of the planner semantics for both estimators."""
+    if plan.bracket_scheme == "total_fractions":
+        return (f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
+                f"{plan.counts[-1]}")
+    if plan.bracket_scheme == "conduction_energy_midpoint":
+        return (
+            "bracket scheme = conduction_energy_midpoint "
+            "(N1 at 50% of included conduction bands; N2 halfway in "
+            "k-mean DFT boundary energy)")
+    return f"bracket scheme = {plan.bracket_scheme}"
+
+
+def _bracket_report_lines(plan: BandBracketPlan, unit: str) -> list[str]:
+    """The resolved cuts, written identically by both estimator reports."""
+    lines: list[str] = []
+    for i, (req, got, (lo, hi), me, edge) in enumerate(zip(
+            plan.requested, plan.counts, plan.bounds, plan.mean_energy_ev,
+            plan.boundary_mean_energy_ev)):
+        snap = "" if req == got else f"  (requested {req}, snapped/derived)"
+        lines.append(
+            f"     N{i + 1} = {got:5d}   bracket [{lo:5d}, {hi:5d})   "
+            f"<E> = {me:9.3f} {unit}   "
+            f"mean_k E[N-1] = {edge:9.3f} {unit}{snap}")
+    lines.extend(f"     NOTE: {note}" for note in plan.notes)
+    return lines
+
+
 def spectral_h5_payload(plan: BandBracketPlan, fit: SpectralShellFit,
                         *, scale: float = 1.0) -> dict:
     """``sigma_mnk.h5``'s payload for a ``spectral_shell`` run.
@@ -2341,8 +2518,7 @@ def spectral_h5_payload(plan: BandBracketPlan, fit: SpectralShellFit,
             "band_counts": np.asarray(plan.counts, dtype=np.int64),
             "band_counts_requested": np.asarray(plan.requested,
                                                 dtype=np.int64),
-            "bracket_fractions": np.asarray(BRACKET_FRACTIONS,
-                                            dtype=np.float64),
+            **_bracket_h5_attrs(plan),
             "n_occ": int(plan.n_occ),
             "n_cond": int(plan.n_cond),
             "shell_bands_absolute": np.asarray(fit.shells, dtype=np.int64),
@@ -2387,22 +2563,14 @@ def format_spectral_report(
 
     nan = float("nan")
     lad = fit.ladder
+    geometry = _bracket_geometry_text(plan)
     lines = [
         f"  -- {label} band-convergence extrapolation "
         f"(estimator = spectral_shell: one exponent PER STATE from the two "
         f"shell increments, tail integrated to the finite basis) --",
-        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   "
-        f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
-        f"{plan.counts[-1]}",
+        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   {geometry}",
     ]
-    for i, (req, got, (lo, hi), me) in enumerate(zip(
-            plan.requested, plan.counts, plan.bounds, plan.mean_energy_ev)):
-        snap = "" if req == got else f"  (requested {req}, snapped)"
-        lines.append(
-            f"     N{i + 1} = {got:5d}   bracket [{lo:5d}, {hi:5d})   "
-            f"<E> = {me:9.3f} {unit}{snap}")
-    for note in plan.notes:
-        lines.append(f"     NOTE: {note}")
+    lines.extend(_bracket_report_lines(plan, unit))
     lines += [
         f"     {lad.describe()}",
         f"       shells (ABSOLUTE band index, half-open at the low end): "
@@ -2533,8 +2701,7 @@ def extrapolation_h5_payload(plan: BandBracketPlan, fit: ExtrapolationFit,
             "band_counts": np.asarray(plan.counts, dtype=np.int64),
             "band_counts_requested": np.asarray(plan.requested,
                                                 dtype=np.int64),
-            "bracket_fractions": np.asarray(BRACKET_FRACTIONS,
-                                            dtype=np.float64),
+            **_bracket_h5_attrs(plan),
             "n_occ": int(plan.n_occ),
             "n_cond": int(plan.n_cond),
             "uncertainty_fraction_p90_p99": np.asarray(
@@ -2574,21 +2741,13 @@ def format_extrapolation_report(
     def _mx(a):
         return float(np.max(np.abs(np.real(np.asarray(a))))) * scale
 
+    geometry = _bracket_geometry_text(plan)
     lines = [
         f"  -- {label} band-convergence extrapolation "
         f"(S(N) = S_inf + A/N, 2 parameters, 3 points) --",
-        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   "
-        f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
-        f"{plan.counts[-1]}",
+        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   {geometry}",
     ]
-    for i, (req, got, (lo, hi), me) in enumerate(zip(
-            plan.requested, plan.counts, plan.bounds, plan.mean_energy_ev)):
-        snap = "" if req == got else f"  (requested {req}, snapped)"
-        lines.append(
-            f"     N{i + 1} = {got:5d}   bracket [{lo:5d}, {hi:5d})   "
-            f"<E> = {me:9.3f} {unit}{snap}")
-    for note in plan.notes:
-        lines.append(f"     NOTE: {note}")
+    lines.extend(_bracket_report_lines(plan, unit))
 
     for slabel, index in (states or []):
         f1 = fit.at(index)
@@ -2659,6 +2818,9 @@ def format_extrapolation_report(
 
 __all__ = [
     "BRACKET_FRACTIONS",
+    "BRACKET_SCHEMES",
+    "BRACKET_SCHEME_DEFAULT",
+    "CONDUCTION_HALF_FRACTION",
     "EXTRAP_DATASETS",
     "SPECTRAL_EXTRAP_DATASETS",
     "TAIL_UNCERTAINTY_FRACTION",

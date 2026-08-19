@@ -184,6 +184,9 @@ def test_plan_band_brackets_is_called_with_the_sigma_fields():
         "int(meta.b_id_4_sigma_user or s.b4) - int(s.b0)", kw["nb_logical"]
     assert kw["nb_padded"] == "int(s.nb_sigma_sum)", kw["nb_padded"]
     assert kw["enk_ry"] == "np.asarray(wfns.enk[:, s.sigma_sum])", kw["enk_ry"]
+    assert kw["bracket_scheme"] == \
+        "str(config.sigma.band_extrapolation_bracket_scheme)", \
+        "the production planner must consume the typed deck choice"
 
 
 def test_trivial_plan_is_called_with_the_sigma_fields():

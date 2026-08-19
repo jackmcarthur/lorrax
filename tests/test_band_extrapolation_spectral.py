@@ -290,6 +290,42 @@ def test_the_deck_key_defaults_to_spectral_shell_and_refuses_a_typo():
         assert name in str(exc.value)
 
 
+def test_bracket_scheme_defaults_compatibly_and_refuses_ignored_or_bad_values():
+    from gw.band_extrapolation import BRACKET_SCHEMES, BRACKET_SCHEME_DEFAULT
+    from gw.gw_config import DynamicSigmaConfig
+
+    kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
+              regularization_ev=0.1, window_edge_factor=1.0,
+              omega_layout="replicated", fermi_reference="midgap",
+              sigma_at_dft_extrapolate=False, sigma_at_dft_energies=False)
+    assert DynamicSigmaConfig(
+        **kw).band_extrapolation_bracket_scheme == BRACKET_SCHEME_DEFAULT
+    for name in BRACKET_SCHEMES:
+        assert DynamicSigmaConfig(
+            **kw, band_extrapolation_bracket_scheme=name,
+        ).band_extrapolation_bracket_scheme == name
+    with pytest.raises(ValueError, match="band_extrapolation_bracket_scheme"):
+        DynamicSigmaConfig(**kw, band_extrapolation_bracket_scheme="energy")
+    with pytest.raises(ValueError, match="no bracket planner would consume"):
+        DynamicSigmaConfig(
+            **kw, band_extrapolation=False,
+            band_extrapolation_bracket_scheme="conduction_energy_midpoint",
+            band_extrapolation_bracket_scheme_explicit=True)
+
+
+def test_bracket_scheme_deck_key_is_normalized_and_recorded_explicit(tmp_path):
+    from gw.gw_config import read_lorrax_input
+
+    deck = tmp_path / "scheme.in"
+    deck.write_text(
+        "[cohsex]\n"
+        "band_extrapolation_bracket_scheme = Conduction_Energy_Midpoint\n")
+    params = read_lorrax_input(str(deck))
+    assert params["band_extrapolation_bracket_scheme"] == \
+        "conduction_energy_midpoint"
+    assert "band_extrapolation_bracket_scheme" in params["_deck_named_keys"]
+
+
 # ---------------------------------------------------------------------------
 #  the estimator recovers the law it assumes
 # ---------------------------------------------------------------------------
