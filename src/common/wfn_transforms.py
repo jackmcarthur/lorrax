@@ -40,6 +40,7 @@ in what happens after the IFFT.
 from __future__ import annotations
 
 import gc
+import math
 from functools import partial
 from typing import Sequence, TYPE_CHECKING
 
@@ -70,9 +71,20 @@ __all__ = [
     "process_local_mesh",
     "read_Gvecs_to_devices",
     "iter_psi_rchunk_bandwise",
+    "flat_r_carried_extent",
     "load_centroids_band_chunked",
     "load_psi_gflat_padded",
 ]
+
+
+def flat_r_carried_extent(
+    n_rtot: int, nspinor: int, mesh_xy: Mesh
+) -> int:
+    """Smallest physical-r extent legal for y-sharded psi and 2-D-sharded Q."""
+    p_all = int(mesh_xy.size)
+    p_y = int(mesh_xy.shape['y'])
+    r_align = math.lcm(p_y, p_all // math.gcd(p_all, int(nspinor)))
+    return round_up(int(n_rtot), r_align)
 
 
 # ---------------------------------------------------------------------------
@@ -1858,6 +1870,7 @@ def iter_psi_rchunk_bandwise(
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
+    r_pad_to: int | None = None,
     psi_G_flat: jax.Array | None = None,
 ):
     """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
@@ -1886,6 +1899,12 @@ def iter_psi_rchunk_bandwise(
     the same width — the extra bands then contribute exactly zero.
     ``None`` disables the pad (legacy per-chunk-shape behaviour).
 
+    ``r_pad_to`` zero-pads the yielded flat-r axis after the physical
+    FFT-grid slice.  It must be at least ``r_end-r_start``.  The added cells
+    are exact zeros, so free-r contractions and their Gram folds are
+    unchanged; this lets a caller carry an awkward FFT-grid extent on a
+    wider mesh without asking ``to_rchunk`` to read past the physical grid.
+
     ``psi_G_flat`` — optional device-resident ψ(G-flat) window covering
     ``band_range`` (band-sharded ``P(None, ('x','y'), None, None)``, as
     returned by :func:`load_psi_gflat_padded`).  When given, each band
@@ -1906,7 +1925,12 @@ def iter_psi_rchunk_bandwise(
     b_start, b_end = band_range
     nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
-    n_rchunk = int(r_end - r_start)
+    n_rchunk_valid = int(r_end - r_start)
+    n_rchunk = n_rchunk_valid if r_pad_to is None else int(r_pad_to)
+    if n_rchunk < n_rchunk_valid:
+        raise ValueError(
+            "iter_psi_rchunk_bandwise: r_pad_to must be at least the "
+            f"physical r length ({n_rchunk} < {n_rchunk_valid})")
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -1921,6 +1945,13 @@ def iter_psi_rchunk_bandwise(
     # shape).  Keeps the top-level ``jnp.zeros`` from being
     # rematerialised replicated on every device.
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    def _pad_r_axis(psi):
+        if n_rchunk == n_rchunk_valid:
+            return psi
+        return jnp.pad(
+            psi, ((0, 0), (0, 0), (0, 0),
+                  (0, n_rchunk - n_rchunk_valid)))
+
     _zeros_Y_cache: dict = {}
     def _zeros_Y(shape):
         fn = _zeros_Y_cache.get(shape)
@@ -1981,8 +2012,9 @@ def iter_psi_rchunk_bandwise(
                 psi_G_flat, int(bc_range[0]) - b_start, w, mesh_xy)
             psi_bc_Y = to_rchunk(
                 psi_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
+                int(r_start), n_rchunk_valid, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
+            psi_bc_Y = _pad_r_axis(psi_bc_Y)
             psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
             del psi_bc
             yield bc_range, psi_bc_Y
@@ -2005,8 +2037,9 @@ def iter_psi_rchunk_bandwise(
                     f"({int(loader.nbands)})")
             psi_bc_Y = to_rchunk(
                 psi_G_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
+                int(r_start), n_rchunk_valid, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
+            psi_bc_Y = _pad_r_axis(psi_bc_Y)
             psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
             del psi_G_bc
             yield bc_range, psi_bc_Y
@@ -2024,9 +2057,10 @@ def iter_psi_rchunk_bandwise(
                 psi_k_chunk = to_rchunk(
                     psi_G_flat,
                     g_index_full[k0:k1],
-                    meta.fft_grid, int(r_start), n_rchunk,
+                    meta.fft_grid, int(r_start), n_rchunk_valid,
                     mesh=mesh_xy, norm="ortho",
                     kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
+                psi_k_chunk = _pad_r_axis(psi_k_chunk)
                 psi_k_chunk = jax.lax.with_sharding_constraint(
                     psi_k_chunk, out_Y)
                 psi_bc_Y_full = psi_bc_Y_full.at[

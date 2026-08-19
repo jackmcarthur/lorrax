@@ -34,7 +34,7 @@ from common.units import RYD_TO_EV
 from runtime.padding import round_up
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
-    load_psi_gflat_padded,
+    load_psi_gflat_padded, flat_r_carried_extent,
 )
 from isdf import factor_c_q
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
@@ -611,41 +611,22 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # is 26.3 GB global: 6.6 GB/device on 'y' alone (times two for the
     # in+out pair the loop needs) versus 1.6 GB/device over ('x','y').
     #
-    # FITTED, not raw.  Splitting one array axis over the ('x','y') PRODUCT
-    # requires that product to divide the extent, and the extent here is
-    # ``nspinor · n_rtot`` — an FFT-box size, a datum, not something anyone
-    # rounded.  Raw, this line does not degrade at an awkward device count, it
-    # REFUSES: job 7882966 legs d16/d49/d64 all rc=1 with the same
-    # ``IndivisibleError`` on the cohsex fixture's 27000 = 2³·3³·5³, on the
-    # pre- AND post-rank-padding sources alike, which is what confines that
-    # gate to divisors of gcd(27000, 32) = 8.  It is the same class
-    # ``common/sharding_fit`` exists for, and this was the one member of the
-    # class not routed through it.
-    #
-    # The fitter keeps the LARGEST sub-product that divides rather than
-    # replicating outright, which is what makes it usable here: 27000 is
-    # indivisible by 64 but divisible by 8, so an 8x8 mesh keeps 8-way instead
-    # of refusing, and a 4x4 mesh keeps 4-way.  Only when NO sub-product
-    # divides (7x7: 27000 % 7 != 0) does Q go replicated, and then the
-    # announcement prints the per-device GiB — which for this array is the
-    # 26.3 GB figure above, i.e. a stop sign, correctly.
-    #
-    # NOT the cause of the P=64 htransform wall, and the two must not be
-    # conflated: on the MoS2 4x4 deck this extent is nspinor·n_rtot =
-    # 2·46080 = 92160, which divides 16 AND 64, so this line never fired
-    # there — that wall was the q-batch in bse_setup (see its ``bs`` block).
-    # Same class, different member, different failure mode: this one raises,
-    # that one silently replicated 32x.
-    #
-    # DURABLE FIX, as everywhere else in this class: pad rather than fit.  The
-    # r axis is a FREE index of the Q[α, x] contraction, so zero columns add
-    # zero columns to Q and G = Q Qᴴ sums over them — exactly-zero terms in a
-    # sum.  That is left undone here deliberately: it needs
-    # ``iter_psi_rchunk_bandwise`` to emit a padded r extent, which is a
-    # loader contract change, and it would re-block the G reduction (harmless
-    # but not free to gate).  ``sharding_fit.padded_extent`` is the call.
-    sharding_y = _fit(mesh_xy, P(None, ('x', 'y')),
-                      (rank, nspinor * n_rtot), "htransform.Q(r-axis)")
+    # Carry the free r index on the whole mesh product.  The physical FFT-box
+    # extent need not divide that product (CrI3: 2*1,406,250 is divisible by
+    # four but not sixteen), and fitting the sharding down to the lucky
+    # divisor leaves Q at 134 GiB/device.  Pad PHYSICAL r cells with exact
+    # zeros instead: ``iter_psi_rchunk_bandwise`` slices only the valid FFT
+    # grid and appends the zeros afterwards, so Q Q^H receives only zero
+    # columns and is mathematically unchanged.
+    p_all = int(mesh_xy.size)
+    n_r_carried = flat_r_carried_extent(n_rtot, nspinor, mesh_xy)
+    q_extent = nspinor * n_r_carried
+    sharding_y = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    if n_r_carried != n_rtot:
+        log_fn(
+            f"  Galerkin Q r-pad: {n_rtot} physical -> {n_r_carried} "
+            f"carried cells (+{n_r_carried - n_rtot} exact zeros; "
+            f"Q extent {nspinor*n_rtot} -> {q_extent}, {p_all}-way)")
     grid_xy_G = grid_xy
 
     @partial(jax.jit, donate_argnums=(0, 1), out_shardings=grid_xy_G)
@@ -685,7 +666,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # builds the whole (rank, nspinor·n_rtot) array on one device first and
     # only then distributes it — 23.4 GB in a single allocation at MoS2
     # 12x12 / n_μ=2412, which OOMs the card before the sharded copy exists.
-    Q = jax.jit(lambda: jnp.zeros((rank, nspinor * n_rtot),
+    Q = jax.jit(lambda: jnp.zeros((rank, q_extent),
                                   dtype=jnp.complex128),
                 out_shardings=sharding_y)()
     for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
@@ -693,6 +674,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             band_chunk_size=band_chunk_size,
             band_chunk_ranges=band_chunk_ranges,
             band_pad_to=_bc,
+            r_pad_to=n_r_carried,
             psi_G_flat=psi_G_win):
         bc = bc_range[1] - bc_range[0]
         bc_lo = bc_range[0] - b_start
