@@ -12,7 +12,7 @@ This section replaces the old `ENVIRONMENT_COMPREHENSIVE.md`. The pages:
 | this page | the layered runtime stack, JAX configuration, troubleshooting |
 | [Collective transports](transports.md) | gloo vs `impl=mpi` vs NCCL, with the measured verdicts |
 | [Frontera (TACC)](machines/frontera.md) | machine facts, cold start, build recipes, vendoring ledger |
-| [Perlmutter (NERSC)](machines/perlmutter.md) | Shifter module, FFI staging, what is and is not tested there |
+| [Perlmutter (NERSC)](machines/perlmutter.md) | GPU and CPU-MPI launch, FFI staging, rank-thread affinity, and what is and is not tested there |
 
 Three references deliberately stay **outside** this section — see the
 [register](../index.md#register) for the full ownership map:

@@ -270,6 +270,52 @@ not measured. The prelude also forces
 `LORRAX_MPI_FORCE_THREAD_MAIN`; communicator creation is owned by
 `common.collectives.warm_mesh_cliques()`.
 
+### CPU rank threads: one affinity mask, several thread populations
+
+`-c`/`LORRAX_CPUS_PER_TASK` gives each MPI rank an **allowed set of logical
+CPUs**. It does not divide that set among the work performed by the rank. A
+CPU rank can contain all of these at once:
+
+| population | controlled by | important limitation |
+|---|---|---|
+| XLA CPU workers for compiled `jax.numpy` operations | XLA and the rank affinity mask | `jax.numpy` is lowered by XLA, not executed by NumPy; one JAX device per rank is not one CPU thread; `OMP_NUM_THREADS` does not cap this pool |
+| LibSci/BLAS/SLATE OpenMP teams | `OMP_NUM_THREADS` and handler-specific controls printed in the startup block | the team is not assigned a private subset of the rank's CPUs |
+| Cray MPICH progress thread | `MPICH_ASYNC_PROGRESS=1` | required by the current route to obtain `MPI_THREAD_MULTIPLE`; it is not automatically given a reserved CPU |
+| Python/runtime and asynchronous-I/O threads | the OS within the same affinity mask | usually small, but can overlap compilation, I/O, and native calls |
+
+Unless a launcher supplies a measured binding policy, these threads inherit
+the same rank affinity mask and may migrate or contend on the same logical
+CPUs. `OMP_NUM_THREADS=14` with `-c16` therefore leaves *nominal headroom*; it
+does not prove that two CPUs are reserved for XLA and MPI. Synchronous native
+calls often leave other XLA workers idle, so oversubscription is also not
+proved merely by counting threads.
+
+The measured P=16/four-node smoke used `-c16`, `OMP_NUM_THREADS=14`, one JAX
+device per rank, and a live `MPI_THREAD_MULTIPLE` grant. It proved collective
+correctness, not thread placement or application scaling. The P=4/two-node
+GN-PPM calculation and P=4 ScaLAPACK, SLATE, and PHDF5 controls passed; GN-PPM
+selected its in-tree per-q solve and did not exercise ScaLAPACK. Do not turn
+off async progress for a performance experiment under this recipe: the live
+thread gate will correctly refuse the resulting FUNNELED grant.
+
+The next CPU-performance pass should, in order:
+
+1. record every thread's affinity and CPU residency after XLA initialization
+   and during one representative XLA kernel, one LibSci call, and MPI traffic;
+2. measure ranks-per-node, CPUs-per-rank, and OpenMP-team-size as a matrix,
+   reporting cold compile separately from warm execution;
+3. only then add `OMP_PLACES`/`OMP_PROC_BIND`, a supported XLA worker-pool cap,
+   or a dedicated progress-thread placement—do not guess a binding policy;
+4. repeat with an application at P=16 and then P=64/P=256 before making a
+   production-scale or multi-terabyte-workspace claim.
+
+The two unavoidable Perlmutter-specific seams remain the early
+`libpmi.so.0` preload and the async-progress request. Everything else is
+tracked, fail-closed build/activation plumbing around an unmodified ABI
+adapter; MPIwrapper is not a second MPI implementation. A fresh-machine
+reproduction still needs the pinned JAX 0.9.1 venv and the versioned Cray
+modules named by the builder.
+
 The PMI diagnosis and controls are allocation 57261316: no preload crashes in
 `PMI2_Init` (`lx-Xg1-203405-2056047-6411`), the stable SONAME preload passes
 (`lx-Xg1-204021-2096105-1906`), and `libpmi2.so.0` still crashes
