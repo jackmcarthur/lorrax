@@ -1,25 +1,28 @@
-"""Parallel-transport covariant velocity for the self-consistent GW head.
+"""Finite-link covariant velocity for the self-consistent GW head.
 
 The preprocessing job owns wavefunctions.  This module deliberately does
-not: its inputs are the saved Berry connection ``A_cart``, the independently
-exact DFT velocity, and the current fixed-DFT-basis QSGW Hamiltonian.  It
-implements
+not: its production inputs are saved nearest-neighbour overlap links, the
+independently exact DFT velocity, and the current fixed-DFT-basis QSGW
+Hamiltonian.  It implements the single gauge-covariant discrete object
 
-    D_k H = partial_k H - i [A, H]
-    v_Q   = v_DFT + D_k (H_Q - H_DFT)
+    v_Q = v_DFT + D_link (H_Q - H_DFT)
 
-and rebuilds the tiny Cartesian S tensor from the resulting band-tiled
-velocity.  When the current centroid wavefunctions are supplied it also
-builds the two q-linear head/body wings.  The wings stay centroid-sharded;
-only the final ``(n_omega, 3, 3)`` Schur-reduced tensor is replicated.
+where neighbouring operators are parallel-transported before a fourth-order
+finite-difference stencil is applied.  No separately differentiated H and
+Berry-connection commutator have to cancel on a finite grid.  The module
+rebuilds the tiny Cartesian S tensor from the resulting band-tiled velocity.
+When current centroid wavefunctions are supplied it also builds the two
+q-linear head/body wings.  The wings stay centroid-sharded; only the final
+``(n_omega, 3, 3)`` Schur-reduced tensor is replicated.
 
 Units and coordinates
 ---------------------
 Hamiltonians and frequencies are Ry.  ``bvec_cart`` has reciprocal lattice
 vectors as rows in 1/bohr, matching ``blat * WfnLoader.bvec``.  The FFT is
-over reduced coordinates kappa; multiplication by ``2*pi*R`` differentiates
-with respect to kappa and ``B^{-1}`` converts that covector to Cartesian k.
-There is no extra hbar conversion in LORRAX's Ry/bohr velocity convention.
+used only by the retained spectral/reference derivative; the production
+finite-link stencil differentiates on the reduced-coordinate kappa grid and
+``B^{-1}`` converts that covector to Cartesian k.  There is no extra hbar
+conversion in LORRAX's Ry/bohr velocity convention.
 """
 
 from __future__ import annotations

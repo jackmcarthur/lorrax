@@ -29,14 +29,15 @@ class _QStorage:
         return self
 
 
-def _config(*, material_class="metal"):
+def _config(*, material_class="metal", correction="full", head_update="off"):
     return SimpleNamespace(
         do_screened=True,
         qp_solver=SimpleNamespace(value="self_consistent"),
         mpa=SimpleNamespace(material_class=material_class),
         compute_mode=SimpleNamespace(
             value="gn_ppm", ppm_model="gn", is_dynamic=True),
-        head=SimpleNamespace(correction=SimpleNamespace(value="full")),
+        head=SimpleNamespace(correction=SimpleNamespace(value=correction)),
+        sc=SimpleNamespace(head_update=head_update),
         ppm=SimpleNamespace(omega_p=2.0),
         screening=SimpleNamespace(diagrams=None),
     )
@@ -140,6 +141,30 @@ def test_static_metal_without_s_cart_refuses_before_any_restart_write(
     assert written == {}
 
 
+def test_full_qsgw_insulator_cannot_fall_back_to_the_dft_seed_head(
+    tmp_path, monkeypatch,
+):
+    """The final-map requirement is physics-based, not metal-only."""
+    restart = tmp_path / "isdf_tensors_1.h5"
+    restart.touch()
+    written = {}
+    _patch_writer_plumbing(monkeypatch, written)
+
+    with pytest.raises(ValueError, match="persist_sc_requires_iteration_head"):
+        gw_output.persist_w0_and_head(
+            np.zeros((1, 1, 1), dtype=np.complex128),
+            tensors_filename=str(restart),
+            head_resolver=_HeadSource({}),
+            iteration_head=None,
+            config=_config(material_class="insulator"),
+            meta=SimpleNamespace(n_rmu=1),
+            mesh_xy=object(),
+            print_fn=lambda *_args: None,
+        )
+
+    assert written == {}
+
+
 def test_the_final_qsgw_map_threads_its_head_to_the_writer():
     """Pin both halves of the production seam, not only the writer signature."""
     gw_dir = Path(gw_output.__file__).resolve().parent
@@ -147,18 +172,83 @@ def test_the_final_qsgw_map_threads_its_head_to_the_writer():
     outputs = next(
         node for node in sc_tree.body
         if isinstance(node, ast.ClassDef) and node.name == "SCOutputs")
+    screening_payload = next(
+        node for node in sc_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "SCMapScreeningArtifacts")
+    payload_fields = {
+        node.target.id for node in screening_payload.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)}
+    assert payload_fields == {"static_w", "iteration_head", "static_head_terms"}
     assert any(
         isinstance(node, ast.AnnAssign)
-        and getattr(node.target, "id", None) == "iteration_head"
+        and getattr(node.target, "id", None) == "screening"
         for node in outputs.body)
 
-    tree = ast.parse((gw_dir / "gw_jax.py").read_text())
+    tree = sc_tree
     persist_calls = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and getattr(node.func, "id", None) == "persist_w0_and_head"
     ]
-    assert any(
+    assert len(persist_calls) == 1
+    assert all(
         any(keyword.arg == "iteration_head" for keyword in call.keywords)
         for call in persist_calls
     )
+    driver = next(
+        node for node in sc_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_sc_driver")
+    gates = [
+        node for node in ast.walk(driver)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("GATE sc_final_map_requires_iteration_head")]
+    assert gates, "the final-map head gate must not depend on restart writes"
+
+
+def test_final_map_capture_is_released_even_when_persistence_is_skipped():
+    """The driver's ownership seam must release the pre-unfold W in finally."""
+    gw_dir = Path(gw_output.__file__).resolve().parent
+    tree = ast.parse((gw_dir / "sc_iteration.py").read_text())
+    driver = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_sc_driver")
+    persistence_try = next(
+        node for node in ast.walk(driver)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(child, ast.Call)
+            and getattr(child.func, "id", None) == "persist_w0_and_head"
+            for child in ast.walk(node)))
+    cleanup_calls = [
+        child for statement in persistence_try.finalbody
+        for child in ast.walk(statement)
+        if isinstance(child, ast.Call)
+        and getattr(child.func, "id", None) == "take_pre_unfold"]
+    assert len(cleanup_calls) == 1
+    assert (len(cleanup_calls[0].args) == 1
+            and isinstance(cleanup_calls[0].args[0], ast.Constant)
+            and cleanup_calls[0].args[0].value == "W0_qmunu")
+
+
+def test_qp_diagonal_head_diagnostic_is_rotated_to_dft_on_four_devices():
+    """Exercise the host-diagonal/sharded-U seam, not a one-device surrogate."""
+    jax = pytest.importorskip("jax")
+    from jax.sharding import Mesh
+    from gw import sc_iteration
+
+    devices = jax.devices()
+    if len(devices) < 4:
+        pytest.skip("requires a 2x2 device mesh")
+    mesh = Mesh(np.asarray(devices[:4]).reshape(2, 2), ("x", "y"))
+    c, s = np.sqrt(0.75), 0.5
+    U = sc_iteration._place(
+        np.asarray([[[c, -s], [s, c]]], dtype=np.complex128),
+        mesh, sc_iteration._band_rotation_spec())
+    diag_qp = np.asarray([1.0, 3.0], dtype=np.complex128)
+    got = sc_iteration._rotate_head_diagonal_to_dft(
+        diag_qp, U, mesh=mesh)
+
+    np.testing.assert_allclose(np.asarray(got), [[1.5, 2.5]], rtol=0, atol=1e-7)

@@ -272,14 +272,37 @@ class SCInputs:
     #: built on the full BZ — Σ comes from an FFT over the k-grid, which
     #: needs the whole grid (decisions.md, TRS veto scope).
     kstar: object | None = None
-    #: Validated, device-resident Berry connection + exact DFT velocity.
-    #: None preserves the historical fixed-DFT head path exactly.
+    #: Validated, device-resident nearest-neighbour links + exact DFT
+    #: velocity.  None preserves the historical fixed-DFT head path exactly.
     parallel_transport: object | None = None
     #: Immutable DFT S/Y/Z response used by ``head_correction=full`` when
     #: ``sc_head_update=off``.  Built once on the shared screening plan, not
     #: rebuilt in every map call; the resident W still supplies the one fold.
     fixed_dft_head_response: object | None = None
     print_fn: Callable = print
+
+
+@dataclass(frozen=True)
+class SCMapScreeningArtifacts:
+    """Screening artifacts owned by one completed QSGW map evaluation.
+
+    These three values belong to the same map evaluation, and the static
+    terms are the exact ones passed to that map's Sigma build.  Under FULL,
+    the head and terms are folded through this map's exact static/probe W
+    role table.  Under NLF they deliberately remain independent of the W
+    body.  Keeping the artifacts together prevents a restart writer from
+    pairing a final head with a seed/previous W.  Only the static W is
+    retained; probe-frequency W is not restart-owned and must not survive
+    the map.
+
+    ``static_w`` stays in its producer's two-dimensional mesh sharding.  The
+    driver persists it once, immediately after the solver accepts this map,
+    then drops it before the post-SC artifact builds.
+    """
+
+    static_w: object | None
+    iteration_head: object | None
+    static_head_terms: object | None
 
 
 @dataclass(frozen=True)
@@ -306,7 +329,19 @@ class SCOutputs:
     sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
-    iteration_head: object | None
+    screening: SCMapScreeningArtifacts
+
+
+@dataclass(frozen=True)
+class SCDriverResult:
+    """Final, basis-labelled products returned to :mod:`gw.gw_jax`."""
+
+    sigma_result_dft: SigmaResult
+    sigma_total_dft: jax.Array
+    rms_history_ev: list[float]
+    rotations_written: bool
+    static_head_terms_dft: object | None
+    head_sigma_diag_dft_w_kn_ry: object | None
 
 
 @dataclass(frozen=True)
@@ -467,7 +502,7 @@ def _solve_head_occupations(
             f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
     nb_logical = int(pt.nb_logical)
     # The velocity is the one large dataset BOTH head modes carry; the
-    # connection is absent under sc_head_update = dft_velocity.  They are
+    # finite links are absent under sc_head_update = dft_velocity.  They are
     # written with identical shape, so the storage width is unchanged.
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
     if not (0 < nb_logical <= nb_storage <= int(energies.shape[1])):
@@ -2054,7 +2089,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             sigma_basis_U=U_full,
             scissor_fit=scissor_fit,
             tail_scissor_fit=tail_fit,
-            iteration_head=iteration_head,
+            screening=SCMapScreeningArtifacts(
+                # Restart owns only static W.  Retaining the full role table
+                # would keep a second large probe-frequency W alive for no
+                # consumer in GN/HL-PPM.
+                static_w=W_by_role.get("static"),
+                iteration_head=iteration_head,
+                static_head_terms=iteration_static_head_terms,
+            ),
         ),
     )
 
@@ -2382,35 +2424,48 @@ def _run_linear_mixing(
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
+    last_evaluated: SCState | None = None
     for it in range(max_iter):
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
         # See the note in ``_run_rcrop.residual_fn``; the shape is the
         # same here — ``state`` is both the loop carry and the argument
         # to the map, so without this rebind both generations of the
         # ω-cube are live for the whole of ``gw_iteration_map``.  The
-        # LAST iteration's is kept: it leaves the loop in ``state_new``.
+        # last completed map's payload is retained separately below.
         state = SCState(
             H_qp_dft=state.H_qp_dft,
             iteration=state.iteration,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
         )
-        state_new = gw_iteration_map(state, inputs)
+        map_input = state
+        state_map = gw_iteration_map(map_input, inputs)
         E_candidate_ev = (
-            np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
+            np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
+        # Outputs, W and head all describe the MAP INPUT.  Record that exact
+        # evaluated point before constructing an unevaluated mixed candidate.
+        # This is the state returned on convergence or budget exhaustion.
+        last_evaluated = SCState(
+            H_qp_dft=map_input.H_qp_dft,
+            iteration=state_map.iteration,
+            occupation_state=state_map.occupation_state,
+            head_surface_weight_kn=state_map.head_surface_weight_kn,
+            outputs=state_map.outputs,
+        )
         if mixing != 1.0:
-            H_mixed = (
-                mixing * state_new.H_qp_dft
-                + (1.0 - mixing) * state.H_qp_dft
+            H_next = (
+                mixing * state_map.H_qp_dft
+                + (1.0 - mixing) * map_input.H_qp_dft
             )
-            state_new = SCState(
-                H_qp_dft=H_mixed,
-                iteration=state_new.iteration,
-                occupation_state=state_new.occupation_state,
-                head_surface_weight_kn=state_new.head_surface_weight_kn,
-                outputs=state_new.outputs,
-            )
-        E_new_ev = np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV
+        else:
+            H_next = state_map.H_qp_dft
+        state_next = SCState(
+            H_qp_dft=H_next,
+            iteration=state_map.iteration,
+            occupation_state=state_map.occupation_state,
+            head_surface_weight_kn=state_map.head_surface_weight_kn,
+        )
+        E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new_ev.copy())
@@ -2418,12 +2473,12 @@ def _run_linear_mixing(
             float(np.sqrt(np.mean((E_new_ev - _e_history[-3]) ** 2)))
             if len(_e_history) >= 3 else float("nan"))
         print_fn(
-            f"  SC iter {state_new.iteration}: "
+            f"  SC iter {state_map.iteration}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         _write_sc_eqp_snapshot(
-            inputs, state_new, E_candidate_ev,
+            inputs, state_map, E_candidate_ev,
             call_index=it, role="linear", rms_ev=rms, rms2_ev=rms2,
         )
         # SAME CRITERION AS rCROP.  ``E_candidate_ev`` is the UNMIXED map
@@ -2434,13 +2489,26 @@ def _run_linear_mixing(
         verdict = protected_band_convergence(
             E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
         print_fn(f"    SC convergence: {verdict.summary()}")
-        state = state_new
-        E_prev_ev = E_new_ev
         if verdict.converged:
+            state = last_evaluated
             break
+        state = state_next
+        E_prev_ev = E_new_ev
+        if it + 1 < max_iter:
+            # ``state`` carries no outputs, but Python loop locals otherwise
+            # retain the completed map and ``last_evaluated`` while the NEXT
+            # Sigma/W is built.  Drop both large-payload owners now; the final
+            # iteration keeps them for the return below.
+            last_evaluated = None
+            state_map = None
 
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
-    return state, rms_history
+    if last_evaluated is None:
+        raise RuntimeError("linear self-consistency completed no map calls")
+    # At budget exhaustion ``state`` is the next mixed candidate and has not
+    # been evaluated.  Final artifacts must instead use the last map input and
+    # that input's exact Sigma/W/head payload.
+    return last_evaluated, rms_history
 
 
 def _run_rcrop(
@@ -2680,8 +2748,10 @@ def _run_rcrop(
         # residual is the residual at a probe point -- a diagnostic.
         if role != "trial" and _verdict.converged:
             raise _Converged(
-                SCState(H_qp_dft=state_out.H_qp_dft,
+                SCState(H_qp_dft=H,
                         iteration=_iter_idx[0],
+                        occupation_state=state_out.occupation_state,
+                        head_surface_weight_kn=state_out.head_surface_weight_kn,
                         outputs=state_out.outputs),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
@@ -2735,9 +2805,9 @@ def _run_rcrop(
         )
     except _Converged as stop:
         # The criterion fired inside the map.  Return the accepted
-        # iterate that met it, NOT rCROP's internal x: the two differ by
-        # one trial step and only this one carries an SCOutputs for the
-        # writers.  The pad-inertness check below reads the solver's
+        # map INPUT that met it, NOT F(input) and not rCROP's stale internal
+        # x: only this input was accepted and evaluated with the SCOutputs
+        # retained for the writers.  The pad-inertness check below reads the
         # final x, which this path never reaches -- say so rather than
         # skip it silently.
         print_fn(
@@ -2826,17 +2896,15 @@ def load_head_velocity_source(
     they differ in how much of it they need:
 
     ``parallel_transport``
-        the whole thing — Berry connection, the exact DFT velocity, and the
-        completed velocity-identity validation, all through
+        the whole thing — nearest-neighbour links, the exact DFT velocity,
+        and the completed velocity-identity validation, all through
         ``load_parallel_transport_head``.
 
     ``dft_velocity``
         the exact DFT p-matrix velocity stage ONLY, through
         ``load_dft_velocity_head``.  ``load_parallel_transport_head`` is
-        not called, not imported, and not reachable on this path — which is
-        the point: it currently dies on its first rank-0 scalar read
-        (claim 0188 blocker 1) and repairing that belongs to the
-        parallel-transport route, not to this one.
+        not called, not imported, and not reachable on this path; the mode
+        therefore has no finite-link derivative of Delta H.
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
     """
@@ -2861,7 +2929,7 @@ def load_head_velocity_source(
             pt_path, mesh=mesh, wfn=wfn, meta=meta)
         print_fn(
             "  SC head: loaded the exact DFT p-matrix velocity stage from "
-            f"{pt_path} (nb={source.nb_logical}); no Berry connection, so "
+            f"{pt_path} (nb={source.nb_logical}); no finite links, so "
             "the ΔH covariant velocity correction is OFF and the head runs "
             "on DFT velocities rotated into each iteration's QP basis "
             "(claim 0183 parks the covariant upgrade)")
@@ -2884,6 +2952,62 @@ def load_head_velocity_source(
     return source
 
 
+def _rotate_head_diagonal_to_dft(
+    diag, U_dft_to_qp, *, mesh, weight_dft_qp=None,
+):
+    """Return the DFT-basis diagonal of a QP-diagonal head operator.
+
+    If ``U[m,n] = <DFT_m|QP_n>``, then
+    ``diag(U diag(h) U†)_m = sum_n |U[m,n]|^2 h_n``.  ``diag`` may carry
+    no k axis, a k axis, or a leading frequency axis.  This avoids forming a
+    dense matrix solely for an opt-in per-band diagnostic.
+    """
+    # Explicit replicated placement: a host ``jnp.asarray`` would create a
+    # single-device array and then collide with the mesh-sharded U operand on
+    # multi-process runs (the same seam documented by ``_place`` itself).
+    d = _place(diag, mesh)
+    weight = (jnp.real(U_dft_to_qp * jnp.conj(U_dft_to_qp))
+              if weight_dft_qp is None else weight_dft_qp)
+    if d.ndim == 1:
+        out = jnp.einsum("kmn,n->km", weight, d)
+        return _place(out, mesh)
+    if d.ndim == 2:
+        out = jnp.einsum("kmn,kn->km", weight, d)
+        return _place(out, mesh)
+    if d.ndim == 3:
+        out = jnp.einsum("kmn,wkn->wkm", weight, d)
+        return _place(out, mesh)
+    raise ValueError(
+        "head diagonal must be (nb,), (nk,nb), or (nomega,nk,nb); "
+        f"got shape {tuple(d.shape)}")
+
+
+def _rotate_static_head_terms_to_dft(
+    head, U_dft_to_qp, *, mesh, weight_dft_qp,
+):
+    """Rotate every per-band static head contribution for final diagnostics."""
+    if head is None:
+        return None
+    import dataclasses
+
+    return dataclasses.replace(
+        head,
+        sigma_x_diag=_rotate_head_diagonal_to_dft(
+            head.sigma_x_diag, U_dft_to_qp, mesh=mesh,
+            weight_dft_qp=weight_dft_qp),
+        sigma_sx_diag=_rotate_head_diagonal_to_dft(
+            head.sigma_sx_diag, U_dft_to_qp, mesh=mesh,
+            weight_dft_qp=weight_dft_qp),
+        sigma_sx_minus_x_diag=_rotate_head_diagonal_to_dft(
+            head.sigma_sx_minus_x_diag, U_dft_to_qp, mesh=mesh,
+            weight_dft_qp=weight_dft_qp),
+        sigma_coh_diag=_rotate_head_diagonal_to_dft(
+            head.sigma_coh_diag, U_dft_to_qp, mesh=mesh,
+            weight_dft_qp=weight_dft_qp),
+        source=f"{head.source}; diagonal rotated QP->DFT",
+    )
+
+
 def run_sc_driver(
     wfns,
     V_q: jax.Array,
@@ -2902,9 +3026,10 @@ def run_sc_driver(
     centroid_indices,
     band_slices: BandSlices,
     input_dir: str,
+    tensors_filename: str,
     enk_dft,
     print_fn: Callable = print,
-) -> tuple[SigmaResult, jax.Array, list[float], bool, object | None]:
+) -> SCDriverResult:
     """Self-consistent QSGW, driver-facing: DFT inputs in, DFT-basis Σ out.
 
     Wraps the whole SC machinery — band partition (protected / in-range /
@@ -2940,10 +3065,12 @@ def run_sc_driver(
         ``config.debug.write_wfn_h5`` artifact dump ran).  The driver's
         generic writer reads this fact instead of re-deriving the
         predicate, so it cannot overwrite the authoritative SC file.
-    iteration_head : IterationHeadSamples or None
-        The LAST map call's QSGW head samples, in the same basis and from the
-        same occupation state as ``sigma_result``.  Returned for the restart
-        writer only; it does not feed the fixed-point carry.
+    static_head_terms_dft : StaticHeadTerms or None
+        The LAST map's exact static head terms, with their diagonal rotated
+        from that map's QP basis to the DFT basis used by the final debug
+        table.  Built only when that table is enabled.  Restart persistence
+        is completed inside this function so its W body and head samples
+        cannot be separated at the caller boundary.
     """
     import dataclasses
 
@@ -3125,10 +3252,74 @@ def run_sc_driver(
         mixing=sc.mixing,
     )
     sigma_result = state_final.outputs.sigma_result
+    screening = state_final.outputs.screening
+    requires_iteration_head = (
+        config.head.correction is HeadCorrection.FULL
+        or str(config.sc.head_update) != "off")
+    if requires_iteration_head and screening.iteration_head is None:
+        raise RuntimeError(
+            "GATE sc_final_map_requires_iteration_head: the accepted QSGW "
+            "map completed without the head samples requested by "
+            f"head_correction={config.head.correction.value!r}, "
+            f"sc_head_update={config.sc.head_update!r}")
+    requires_static_head_terms = (
+        bool(config.do_G0)
+        and config.head.correction is not HeadCorrection.OFF)
+    if requires_static_head_terms and screening.static_head_terms is None:
+        raise RuntimeError(
+            "GATE sc_final_map_requires_static_head_terms: the accepted "
+            "QSGW map returned head samples but no static Sigma-head terms")
     print_fn(
         f"  SC done: {len(rms_history)} GW map calls"
         + (f", final RMS ΔE = {rms_history[-1]:.4e} eV"
             if rms_history else " (one-shot)"))
+    if screening.static_head_terms is not None:
+        from .head_correction import format_static_head_diagnostics
+        print_fn("  SC final map: " + format_static_head_diagnostics(
+            screening.static_head_terms))
+
+    # ONE FINAL-MAP RESTART WRITE.  No seed W is persisted before the loop:
+    # a failed SC run therefore cannot leave W0_ready=true, and a successful
+    # one writes the static W body together with the head samples produced by
+    # the exact same accepted map.  ``persist_w0_and_head`` consumes the
+    # matching fixed-name pre-unfold capture when IBZ storage is selected.
+    from .restart_q_storage import take_pre_unfold
+    from .screening import driver_persists_w0
+    try:
+        if bool(config.do_screened) and driver_persists_w0(
+                config.compute_mode, config):
+            if screening.static_w is None:
+                raise RuntimeError(
+                    "GATE persist_sc_requires_final_static_w: the accepted "
+                    "QSGW map returned no static W body for restart "
+                    "persistence")
+            from .gw_output import persist_w0_and_head
+            with timing.section("gw_jax.persist_w0"):
+                persist_w0_and_head(
+                    screening.static_w,
+                    tensors_filename=tensors_filename,
+                    head_resolver=head_resolver,
+                    iteration_head=screening.iteration_head,
+                    config=config, meta=meta, mesh_xy=mesh_xy,
+                    sym=sym, centroid_indices=centroid_indices,
+                    print_fn=print_fn,
+                )
+    finally:
+        # The writer consumes this on an IBZ restart write.  On disabled,
+        # absent-file, or non-persisting paths the producer capture still
+        # owns the large pre-unfold W wedge, so the final-map owner must tear
+        # it down explicitly before post-SC artifacts are built.
+        take_pre_unfold("W0_qmunu")
+    # W0 is the only large object in the final-map payload.  Drop it before
+    # WFN/sigma artifact construction; the tiny head/term provenance remains.
+    screening = dataclasses.replace(screening, static_w=None)
+    state_final = dataclasses.replace(
+        state_final,
+        outputs=dataclasses.replace(
+            state_final.outputs,
+            screening=screening,
+        ),
+    )
 
     # Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
     # qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
@@ -3174,6 +3365,20 @@ def run_sc_driver(
     # routes each kind correctly; only the spec changed.
     U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
                _band_rotation_spec())
+    # These are diagnostics only.  Avoid an extra U-sized |U|^2 temporary and
+    # five distributed contractions on the default path where no debug table
+    # consumes them; when enabled, build the weight once and share it.
+    static_head_terms_dft = None
+    head_sigma_diag_dft = None
+    if bool(config.debug.sigma_freq_debug_output):
+        head_weight_dft_qp = jnp.real(U * jnp.conj(U))
+        static_head_terms_dft = _rotate_static_head_terms_to_dft(
+            state_final.outputs.screening.static_head_terms, U, mesh=mesh_xy,
+            weight_dft_qp=head_weight_dft_qp)
+        if sigma_result.head_sigma_diag_w_kn_ry is not None:
+            head_sigma_diag_dft = _rotate_head_diagonal_to_dft(
+                sigma_result.head_sigma_diag_w_kn_ry, U, mesh=mesh_xy,
+                weight_dft_qp=head_weight_dft_qp)
     sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
@@ -3225,8 +3430,14 @@ def run_sc_driver(
                        if sigma_result.efermi_dft_ev is not None
                        else float(wfn.efermi) * RYD_TO_EV),
     )
-    return (sigma_result_dft, sigma_total, rms_history, rotations_written,
-            state_final.outputs.iteration_head)
+    return SCDriverResult(
+        sigma_result_dft=sigma_result_dft,
+        sigma_total_dft=sigma_total,
+        rms_history_ev=rms_history,
+        rotations_written=rotations_written,
+        static_head_terms_dft=static_head_terms_dft,
+        head_sigma_diag_dft_w_kn_ry=head_sigma_diag_dft,
+    )
 
 
 def final_qp_eigenstates(

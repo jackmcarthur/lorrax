@@ -25,7 +25,9 @@ AST plus source text, no jax, so it runs anywhere.
 """
 import ast
 import pathlib
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -141,6 +143,60 @@ def test_rcrop_preserves_output_metadata_from_the_last_map():
     assert "_last_outputs[0] = None" in body
     assert "_last_outputs[0] = state_out.outputs" in body
     assert "outputs=_last_outputs[0]" in body
+
+
+def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
+    monkeypatch,
+):
+    """Distinct sentinels pin H/output ownership at budget exhaustion."""
+    jnp = pytest.importorskip("jax.numpy")
+    from gw import sc_iteration
+
+    payload = object()
+
+    def _map(state, _inputs):
+        return sc_iteration.SCState(
+            H_qp_dft=state.H_qp_dft + 2.0,
+            iteration=state.iteration + 1,
+            occupation_state="occupation-from-input-zero",
+            head_surface_weight_kn="surface-from-input-zero",
+            outputs=payload,
+        )
+
+    monkeypatch.setattr(sc_iteration, "gw_iteration_map", _map)
+    monkeypatch.setattr(sc_iteration, "_write_sc_eqp_snapshot",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sc_iteration, "_maybe_dump_e_history",
+                        lambda *_args, **_kwargs: None)
+    inputs = SimpleNamespace(partition=SimpleNamespace(
+        protected_mask=np.array([True]), in_range_mask=np.array([True])))
+    initial = sc_iteration.SCState(
+        H_qp_dft=jnp.zeros((1, 1, 1), dtype=jnp.complex128), iteration=0)
+    final, _ = sc_iteration._run_linear_mixing(
+        initial, inputs, max_iter=1, tol_ev=1.0e-12, mixing=0.25,
+        eigvalsh_kshard=lambda H: jnp.real(H[..., 0]),
+        print_fn=lambda *_args: None, dump_dir=None)
+
+    np.testing.assert_array_equal(np.asarray(final.H_qp_dft), 0.0)
+    assert final.outputs is payload
+    assert final.occupation_state == "occupation-from-input-zero"
+    assert final.head_surface_weight_kn == "surface-from-input-zero"
+
+
+def test_rcrop_early_stop_binds_outputs_to_the_accepted_map_input():
+    """AST red twin for the exception path hidden inside rcrop_nojit."""
+    fn = _func("_run_rcrop")
+    converged = [
+        node for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_Converged"]
+    assert len(converged) == 1
+    state_call = converged[0].args[0]
+    values = {kw.arg: kw.value for kw in state_call.keywords}
+    assert isinstance(values["H_qp_dft"], ast.Name)
+    assert values["H_qp_dft"].id == "H"
+    assert {"occupation_state", "head_surface_weight_kn", "outputs"} <= values.keys()
 
 
 def test_per_map_files_are_output_diagnostics_not_final_eqp_math():

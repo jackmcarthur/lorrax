@@ -1106,11 +1106,11 @@ _DEFAULTS = {
     # conflated) because no committed deck ran the SC path at all.  One now
     # does: tests/regression/gnppm_debug/gnppm_sc.in.
     "sc_on_ibz": True,
-    # Update the q->0 head from the current QSGW Hamiltonian through the
-    # precomputed parallel-transport connection.  Explicit opt-in preserves
+    # Update the q->0 head from the current QSGW Hamiltonian through saved
+    # nearest-neighbour parallel-transport links.  Explicit opt-in preserves
     # every historical deck and makes a missing/stale artifact a refusal.
     # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
-    # p-matrix velocity stage only, without the connection.
+    # p-matrix velocity stage only, without the links.
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
@@ -3247,8 +3247,9 @@ class SCConfig:
     #: "off" | "parallel_transport" | "dft_velocity".  The two non-off
     #: values are the METAL head modes: both run the per-iteration head
     #: chain, and they differ only in the velocity operator they feed it —
-    #: ``parallel_transport`` adds the covariant DΔH correction from the
-    #: saved Berry connection, ``dft_velocity`` uses the exact DFT p-matrix
+    #: ``parallel_transport`` adds the fourth-order finite-link covariant DΔH
+    #: correction from saved neighbour overlaps, ``dft_velocity`` uses the
+    #: exact DFT p-matrix
     #: velocity alone.  ``METAL_HEAD_UPDATES`` is the vocabulary consumers
     #: test against; do not spell the pair out a second time.
     head_update: str = "off"
@@ -3598,6 +3599,14 @@ class LorraxConfig:
 
     def __post_init__(self):
         """Refuse fractional-occupation settings outside their landed scope."""
+        if (self.qp_solver is QPSolver.SELF_CONSISTENT
+                and self.head.correction is HeadCorrection.OFF
+                and self.sc.head_update != "off"):
+            raise ValueError(
+                "sc_head_update requests a QSGW velocity/head rebuild, but "
+                "head_correction=off removes that channel. The update flag "
+                "does not override the head policy; set sc_head_update=off "
+                "or choose head_correction=full/no_local_fields.")
         if self.screening.occ_broadening_ev == 0.0:
             return
         if self.qp_solver is not QPSolver.SELF_CONSISTENT:

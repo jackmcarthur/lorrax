@@ -406,9 +406,11 @@ def persist_w0_and_head(
     ``iteration_head`` is the QSGW map's resolved head sample set.  When it is
     present it is the sole source of the persisted head scalars; the DFT-basis
     ``head_resolver`` remains the bit-identical one-shot/default route.  A
-    self-consistent metal may not fall back to that default, and an iteration
-    sample without ``S_cart`` may not be written: doing either would let the
-    BSE rebuild a DFT tensor from ``dipole.h5`` beside a QSGW head scalar.
+    self-consistent run whose head is updated (or whose full local-field head
+    is folded through iteration W) may not fall back to that default, and an
+    iteration sample without ``S_cart`` may not be written: doing either
+    would let the BSE rebuild a DFT tensor from ``dipole.h5`` beside a QSGW
+    head scalar.
     """
     if not config.do_screened:
         return
@@ -416,18 +418,26 @@ def persist_w0_and_head(
         return
     if not os.path.exists(tensors_filename):
         return
-    is_sc_metal = (
+    is_sc = (
         getattr(config, "qp_solver", None) is not None
         and getattr(config.qp_solver, "value", config.qp_solver)
         == "self_consistent"
-        and str(getattr(getattr(config, "mpa", None), "material_class",
-                        "insulator")) == "metal"
     )
-    if is_sc_metal and iteration_head is None:
+    _head_correction = getattr(
+        getattr(getattr(config, "head", None), "correction", None),
+        "value", getattr(getattr(config, "head", None), "correction", None))
+    _sc_head_update = str(getattr(getattr(config, "sc", None),
+                                  "head_update", "off"))
+    requires_iteration_head = (
+        is_sc and _head_correction != "off"
+        and (_head_correction == "full" or _sc_head_update != "off"))
+    if requires_iteration_head and iteration_head is None:
         raise ValueError(
-            "GATE persist_sc_metal_requires_iteration_head: refusing to "
-            "persist a self-consistent metal with the DFT-basis head_resolver. "
-            "Pass the QSGW map's iteration_head samples.")
+            "GATE persist_sc_requires_iteration_head: refusing to persist "
+            "self-consistent W with the DFT seed head_resolver when "
+            f"head_correction={_head_correction!r}, "
+            f"sc_head_update={_sc_head_update!r}. Pass the accepted QSGW "
+            "map's iteration_head samples.")
     head_static = None
     if iteration_head is not None:
         head_static = iteration_head.at(0.0 + 0.0j)
@@ -440,6 +450,40 @@ def persist_w0_and_head(
                 "S tensor from dipole.h5 and report a false-green provenance "
                 "ratio.")
     head_source = iteration_head if iteration_head is not None else head_resolver
+    # Resolve the complete scalar sample set BEFORE writing W.  A missing
+    # probe or unsupported dynamic grid must not leave a new W body paired
+    # with stale head datasets in an otherwise valid restart file.
+    from common import timing as _tmg
+    if head_static is None:
+        with _tmg.section("persist_w0.head_static"):
+            head_static = head_source.at(0.0 + 0.0j)
+    ppm_model = config.compute_mode.ppm_model
+    if static_head_only:
+        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0], dtype=np.float64)
+    elif ppm_model is not None:
+        if ppm_model == "hl":
+            omega_imp = complex(float(config.ppm.omega_p), 0.0)
+            _omega_grid_entry = float(omega_imp.real)
+        else:
+            omega_imp = 1j * float(config.ppm.omega_p)
+            _omega_grid_entry = float(omega_imp.imag)
+        with _tmg.section("persist_w0.head_imag"):
+            head_imag = head_source.at(omega_imp)
+        whead_arr = np.array(
+            [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
+    elif config.compute_mode.is_dynamic:
+        raise NotImplementedError(
+            f"persist_w0_and_head: compute_mode = "
+            f"{config.compute_mode.value} builds Σ_c(ω) without a two-point "
+            f"plasmon-pole probe, so the {{0, probe}} head grid this writer "
+            f"stores is not its sample set.  Give the mode its own head "
+            f"persistence when its Σ stage lands.")
+    else:
+        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
+        omega_grid = np.array([0.0], dtype=np.float64)
+
     from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
     # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
     # created by ``write_restart_state_to_h5(init_W0=True)`` is
@@ -457,7 +501,6 @@ def persist_w0_and_head(
     # self-consistency loop cannot re-store the first iteration's W.
     from .restart_q_storage import (resolve_restart_q_storage_for_run,
                                     take_pre_unfold)
-    from common import timing as _tmg
     with _tmg.section("persist_w0.resolve"):
         _qirr = resolve_restart_q_storage_for_run(
         config, sym=sym, centroid_indices=centroid_indices,
@@ -476,52 +519,6 @@ def persist_w0_and_head(
                              qirr=_qirr.with_capture(
                                  take_pre_unfold("W0_qmunu")))
     _stamp_screening_diagrams(tensors_filename, config)
-    if head_static is None:
-        with _tmg.section("persist_w0.head_static"):
-            head_static = head_source.at(0.0 + 0.0j)
-    # THE STORED ω GRID IS THE PROBE SET, so it is the POLE MODEL that
-    # decides it, not "is this run dynamic".  The two questions agreed for
-    # as long as every dynamic mode was a two-point plasmon-pole fit; MPA
-    # is dynamic and samples W on the double-parallel grid instead, so a
-    # dynamic-else-GN read here would stamp {0, iω_p} onto a file whose W
-    # was never evaluated there — a restart artifact that lies quietly.
-    ppm_model = config.compute_mode.ppm_model
-    if static_head_only:
-        # The caller declared a single-frequency W.  {0} is then the true
-        # sample set of the artifact being written, not an inherited one,
-        # and it is the same grid a static mode would store.
-        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
-        omega_grid = np.array([0.0], dtype=np.float64)
-    elif ppm_model is not None:
-        # GN-PPM: probe at iωp on the imaginary axis.
-        # HL-PPM: probe at Ω on the real axis (above all transitions).
-        if ppm_model == "hl":
-            omega_imp = complex(float(config.ppm.omega_p), 0.0)
-            _omega_grid_entry = float(omega_imp.real)
-        else:
-            omega_imp = 1j * float(config.ppm.omega_p)
-            _omega_grid_entry = float(omega_imp.imag)
-        with _tmg.section("persist_w0.head_imag"):
-            head_imag = head_source.at(omega_imp)
-        whead_arr = np.array(
-            [head_static.wcoul0, head_imag.wcoul0], dtype=np.complex128)
-        omega_grid = np.array([0.0, _omega_grid_entry], dtype=np.float64)
-    elif config.compute_mode.is_dynamic:
-        # Dynamic, but not a two-point pole fit: MPA today.  There is no
-        # probe frequency to record, and inventing one would be worse than
-        # a refusal — this is the file the next run reads W's head back
-        # from.  Unreachable from the driver (the mode is refused at
-        # entry); it stands so that landing the MPA Σ stage has to answer
-        # this question rather than inherit an answer.
-        raise NotImplementedError(
-            f"persist_w0_and_head: compute_mode = "
-            f"{config.compute_mode.value} builds Σ_c(ω) without a two-point "
-            f"plasmon-pole probe, so the {{0, probe}} head grid this writer "
-            f"stores is not its sample set.  Give the mode its own head "
-            f"persistence when its Σ stage lands.")
-    else:
-        whead_arr = np.array([head_static.wcoul0], dtype=np.complex128)
-        omega_grid = np.array([0.0], dtype=np.float64)
     with _tmg.section("persist_w0.write_head"):
         write_head_scalars_to_h5(
             tensors_filename,

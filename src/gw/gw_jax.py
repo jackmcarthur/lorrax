@@ -91,7 +91,6 @@ from .head_correction import (
 from .wavefunction_bundle import BandSlices
 from .gw_output import (
 	GWResults,
-	persist_w0_and_head,
 	print_banner,
 	print_system_summary,
 	write_freq_debug,
@@ -454,10 +453,10 @@ def main(argv=None):
 	if (do_screened
 			and config.head.correction is HeadCorrection.FULL
 			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			# MPA's self-consistent driver does no pre-map screening; its
-			# exact z plan and fixed/update head are built inside each map.
-			and not (mode.value == "mpa"
-			         and qp_solver is QPSolver.SELF_CONSISTENT)):
+			# Every self-consistent mode builds its exact frequency plan and
+			# response inside the map.  A pre-map response would exist only to
+			# seed a restart artifact and could be mistaken for final physics.
+			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		from .qsgw_head import build_dft_head_response
 		if mode.value == "mpa":
 			from .mpa import sample_plan
@@ -467,9 +466,6 @@ def main(argv=None):
 				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
 		else:
 			oneshot_head_requests = screening_requests_for(mode, config)
-			if qp_solver is QPSolver.SELF_CONSISTENT:
-				oneshot_head_requests = [
-					r for r in oneshot_head_requests if r.role == "static"]
 			oneshot_omegas = np.asarray(
 				[complex(r.omega_ry) for r in oneshot_head_requests],
 				dtype=np.complex128)
@@ -481,21 +477,24 @@ def main(argv=None):
 				"  head_correction=full: built direct DFT response and "
 				"head/body wings on the chi0 transition manifold; finalizing "
 				"once against the resident W(Gamma).")
-	# SC solves its own W's inside the iteration map; the static W is
-	# still solved once here to seed the W0 restart flush.
-	with timing.section("gw_jax.screening", announce=True,
-	                    label="screening (chi0 -> W)"):
-		W_by_role = compute_screening_model(
-			mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
-			centroid_indices=centroid_indices, config=config, meta=meta,
-			mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
-			label="oneshot", head_resolver=head_resolver,
-			head_channel=getattr(isdf, 'head_channel', None),
-			static_only=qp_solver is QPSolver.SELF_CONSISTENT,
-			mpa_plan=oneshot_mpa_plan,
-			iteration_head_response=oneshot_head_response,
-			tensors_filename=tensors_filename,
-			print_fn=print0)
+	# SC solves W inside each map and persists only the final accepted map.
+	# Do not perform a redundant DFT screening solve here: besides its cost,
+	# that seed body used to survive long enough to be paired with a final head.
+	if qp_solver is QPSolver.SELF_CONSISTENT:
+		W_by_role = {}
+	else:
+		with timing.section("gw_jax.screening", announce=True,
+		                    label="screening (chi0 -> W)"):
+			W_by_role = compute_screening_model(
+				mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+				centroid_indices=centroid_indices, config=config, meta=meta,
+				mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
+				label="oneshot", head_resolver=head_resolver,
+				head_channel=getattr(isdf, 'head_channel', None),
+				mpa_plan=oneshot_mpa_plan,
+				iteration_head_response=oneshot_head_response,
+				tensors_filename=tensors_filename,
+				print_fn=print0)
 
 	if oneshot_head_response is not None:
 		if mode.value == "mpa":
@@ -530,20 +529,15 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	_defer_sc_metal_head = (
-		qp_solver is QPSolver.SELF_CONSISTENT
-		and str(getattr(config.mpa, "material_class", "insulator")) == "metal")
-	if driver_persists_w0(mode, config) and not _defer_sc_metal_head:
+	if (driver_persists_w0(mode, config)
+			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		with timing.section("gw_jax.persist_w0"):
+			from .gw_output import persist_w0_and_head
 			persist_w0_and_head(
 				W_by_role.get("static", V_q),
 				tensors_filename=tensors_filename, head_resolver=head_resolver,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, centroid_indices=centroid_indices,
-				# The pre-map SC seed solved static W only.  Do not stamp a
-				# probe head beside a body frequency that was never evaluated;
-				# the converged map persists its own full head grid below.
-				static_head_only=(qp_solver is QPSolver.SELF_CONSISTENT),
 				print_fn=print0)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
@@ -555,14 +549,21 @@ def main(argv=None):
 	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
 	if config.do_G0:
-		with timing.section("gw_jax.static_head"):
-			static_head_terms = _compute_static_head(
-				head_resolver, meta, do_screened, print0,
-				# Every two-point mode has a finalized static sample.  MPA's
-				# z-grid need not contain zero and this call contributes only
-				# bare X there, so it deliberately reads vc from the direct
-				# sample instead of inventing an unsampled W(0).
-				require_screened=(mode.value != "mpa"))
+		# A screened SC+FULL map always builds/folds its own head.  Supplying
+		# and printing a direct DFT seed here would be false provenance even
+		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
+		# the direct/default route because that is the policy they consume.
+		_sc_full = (qp_solver is QPSolver.SELF_CONSISTENT
+		            and do_screened
+		            and config.head.correction is HeadCorrection.FULL)
+		if not _sc_full:
+			with timing.section("gw_jax.static_head"):
+				static_head_terms = _compute_static_head(
+					head_resolver, meta, do_screened, print0,
+					# MPA has no {0,probe} persistence grid; its one-shot
+					# static contribution here is bare X from the direct sample.
+					require_screened=(mode.value != "mpa" and
+					                  qp_solver is not QPSolver.SELF_CONSISTENT))
 
 	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
 	# The same ``compute_sigma_xc`` call the SC iteration map makes each
@@ -689,7 +690,7 @@ def main(argv=None):
 	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
 	# than re-deriving the predicate.
 	rotations_written = False
-	iteration_head = None
+	final_static_head_terms = static_head_terms
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
 		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
@@ -701,8 +702,7 @@ def main(argv=None):
 		# row when it fires and must not hide inside ``(untimed)``.
 		with timing.section("gw_jax.sc_driver", announce=True,
 		                    label="self-consistent QSGW driver"):
-			(sigma_result, sigma_total, _, rotations_written,
-			 iteration_head) = run_sc_driver(
+			sc_result = run_sc_driver(
 				wfns, V_q, kin_ion,
 				head_channel=getattr(isdf, 'head_channel', None),
 				quad=quad, e_ref=e_ref,
@@ -711,17 +711,12 @@ def main(argv=None):
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 				band_slices=band_slices, input_dir=input_dir,
+				tensors_filename=tensors_filename,
 				enk_dft=enk_dft, print_fn=print0)
-		if driver_persists_w0(mode, config):
-			with timing.section("gw_jax.persist_w0"):
-				persist_w0_and_head(
-					W_by_role.get("static", V_q),
-					tensors_filename=tensors_filename,
-					head_resolver=head_resolver,
-					iteration_head=iteration_head,
-					config=config, meta=meta, mesh_xy=mesh_xy,
-					sym=sym, centroid_indices=centroid_indices,
-					print_fn=print0)
+		sigma_result = sc_result.sigma_result_dft
+		sigma_total = sc_result.sigma_total_dft
+		rotations_written = sc_result.rotations_written
+		final_static_head_terms = sc_result.static_head_terms_dft
 	else:
 		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
 		# E_DFT inside compute_sigma_xc (pass-through; also covers static
@@ -741,13 +736,16 @@ def main(argv=None):
 	# TWO BASES ON ONE OBJECT on the SC path, by design: the finalize
 	# rotated ``sigma_dispatch.ROTATED_TO_DFT_FIELDS`` (sig_h, sig_x,
 	# sig_sx, sig_coh below) back to the DFT basis and left
-	# ``SIGMA_BASIS_FIELDS`` (sigma_c_omega, sigma_c_at_dft_ev,
-	# head_sigma_diag_w_kn_ry) in the QP basis, where the QSGW ansatz
+	# ``SIGMA_BASIS_FIELDS`` (sigma_c_omega, sigma_c_at_dft_ev) in the QP
+	# basis, where the QSGW ansatz
 	# that consumes Σ_c(ω) is defined.  Their band diagonals meet in
 	# ``sigma_xc_at_dft_ev`` below and in eqp{0,1}.dat
 	# (``eqp_bgw.compute_eqp_diag``); that sum is basis-consistent only
 	# at U = identity.  One-shot: every field is DFT basis and the
-	# question does not arise.
+	# question does not arise.  The separable analytic head diagonal is cheap
+	# enough to rotate without materialising its dense matrix; SC returns that
+	# as a separate DFT-basis diagnostic while leaving SigmaResult's
+	# basis-of-computation field untouched.
 	sig_h   = sigma_result.v_h_kij_ry
 	sig_x   = sigma_result.sigma_x_kij_ry
 	sig_sx  = (sigma_result.sigma_sx_kij_ry
@@ -765,7 +763,10 @@ def main(argv=None):
 	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-	head_sigma_diag_w_kn_ry = sigma_result.head_sigma_diag_w_kn_ry
+	head_sigma_diag_w_kn_ry = (
+		sc_result.head_sigma_diag_dft_w_kn_ry
+		if qp_solver is QPSolver.SELF_CONSISTENT
+		else sigma_result.head_sigma_diag_w_kn_ry)
 	omega_grid_ev = (
 		np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
 		if sigma_result.omega_grid_ev is not None else None)
@@ -788,6 +789,44 @@ def main(argv=None):
 			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 			tol_ry=float(config.degen_avg_tol_ry),
 			mesh_xy=mesh_xy)
+		# Head-only debug columns must undergo the SAME DFT-degenerate-set
+		# averaging as the Sigma components they decompose.  After the QP->DFT
+		# diagonal transform an occupied-projector contribution need not be
+		# identical in an arbitrary basis inside a degenerate manifold.
+		def _average_head_diag(diag):
+			arr = np.asarray(diag)
+			if arr.ndim == 1:
+				arr = np.broadcast_to(arr, np.asarray(enk_dft).shape)
+			if arr.ndim == 2:
+				return average_within_degenerate_sets(
+					arr, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+					tol_ry=float(config.degen_avg_tol_ry))
+			if arr.ndim == 3:
+				return np.stack([
+					average_within_degenerate_sets(
+						slab,
+						energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+						tol_ry=float(config.degen_avg_tol_ry))
+					for slab in arr], axis=0)
+			raise ValueError(
+				f"head diagnostic has unsupported shape {arr.shape}")
+
+		if final_static_head_terms is not None:
+			import dataclasses
+			final_static_head_terms = dataclasses.replace(
+				final_static_head_terms,
+				sigma_x_diag=_average_head_diag(
+					final_static_head_terms.sigma_x_diag),
+				sigma_sx_diag=_average_head_diag(
+					final_static_head_terms.sigma_sx_diag),
+				sigma_sx_minus_x_diag=_average_head_diag(
+					final_static_head_terms.sigma_sx_minus_x_diag),
+				sigma_coh_diag=_average_head_diag(
+					final_static_head_terms.sigma_coh_diag),
+			)
+		if head_sigma_diag_w_kn_ry is not None:
+			head_sigma_diag_w_kn_ry = _average_head_diag(
+				head_sigma_diag_w_kn_ry)
 
 	# ---- Single H-build + diagonalization on replicated arrays ----
 	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
@@ -870,7 +909,7 @@ def main(argv=None):
 		# ``debug.sigma_freq_debug_output``; see ``gw_output.write_freq_debug``).
 		write_freq_debug(
 			results, config=config,
-			static_head_terms=static_head_terms,
+			static_head_terms=final_static_head_terms,
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
