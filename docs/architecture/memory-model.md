@@ -24,7 +24,6 @@ Conventions throughout this doc:
 | Mesh axes | `'x'` = μ/centroid, `'y'` = r-chunk; `P = p_x · p_y` |
 | Budget detection | `memory_per_device_gb > 0` is used verbatim; zero calls `common.gpu_utils.get_device_memory_gb`, which reserves headroom from the detected free memory |
 | Target utilization | planner default: 0.90 scalar, 0.85 spinor (`nspinor=2`), 0.78 bispinor (`nspinor>=4`); positive `ISDF_CHUNK_TARGET_UTILIZATION` overrides it after clamping to `[0.85, 1.0]` |
-| Safety cap (opt-in) | `ISDF_ZCT_STAGE_CAP_GB` / `ISDF_ZCT_STAGE_CAP_FRAC` env vars for the ZCT stage only |
 
 Typical ranges (from production datasets):
 
@@ -47,10 +46,9 @@ Typical ranges (from production datasets):
 |-------|---------------------|-------|
 | **Centroid load (Peak A)** | fit-loop persistent floor + compiled centroid-load FFT box | `M_A = persistent + _fft_box_bytes(n_k, B_b, n_s, fft_grid, mesh)` |
 | **Centroid copies** | two X-sharded + two Y-sharded copies | `M_cent = 2·16·n_k·n_s·μ·n_b·(1/p_x+1/p_y)` |
-| **Stage-A FFT fallback** | used only when the compiled query is unavailable; announced as an under-predicting fallback | `4·16·B_b·n_s·n_r/P` (no cuFFT-plan term) |
+| **Stage-A FFT fallback** | used only when the compiled query is unavailable; announced as an under-predicting fallback | `4·16·n_k·B_b·n_s·n_r/P` (no cuFFT-plan term) |
 | **C_q build (Peak B)** | `P_l`, `P_r`, `C_q`, `L_q` | `M_B = persistent + 16·n_q·μ²/P + 2·16·n_k·n_s²·μ²/P` |
-| **fit_one_rchunk (Peak C)** | persistent base + rank-5 pair-density slots + `Z_q` + gathered/local ψ(r) slabs | see [§R-Chunk](#r-chunk-b_r) |
-| **ζ solve batch** | one `(μ, B_r)` RHS/output slice per q in the planner estimate | `B_q = clamp(floor((target − persistent)/(16·μ·B_r/P)), 1, n_q)` |
+| **fit + ζ solve (Peak C)** | larger of the pair-density/r-chunk live set and route-specific solve live set | see [§R-Chunk](#r-chunk-b_r) and [§Solve stage](#solve-stage) |
 | **accumulate_rchunk_to_gflat (Peak D)** | `gflat_acc`, `zeta_chunk`, two FFT-box-sized slots | `M_D = persistent + 16·n_q^disk·μ·B_r/P + 2·16·cs·n_r` |
 | **Vq contraction (Peak E)** | `V_acc`, one or two full IBZ ζ̃ slabs, and their X/Y resharded faces | see [§Vq G-Chunk](#vq-g-chunk) |
 | **Restart write (Peak F)** | larger of the sharded V/W0 tile and sharded G-flat ζ tile | `M_F = E_base + max(16·n_q^irr·μ²/P, 16·n_q^disk·μ·n_G/P)` |
@@ -59,8 +57,9 @@ Typical ranges (from production datasets):
 The fit-loop persistent floor is the sum of `L_q`, `gflat_acc`, four
 single-axis-sharded centroid copies, replicated loader tables, and the
 rectangular ψ(r) cache.  That cache is band-flat over all P ranks and prices
-the zero-padded final band chunk exactly.  `PsiGStore` holds the source
-ψ(G) tiles on the host; the fit pulls one rank-local band tile at a time.
+the zero-padded final band chunk exactly.  `PsiGStore` holds source ψ(G)
+tiles on the host only while that device cache is built; the r-chunk fit reads
+the cache and does not reread or re-FFT ψ(G).
 
 Peak E starts from a different, smaller base because `L_q`, `gflat_acc`, and
 the ψ(r) fit cache have been released.  It retains one X- and one
@@ -149,111 +148,90 @@ the system physically cannot fit; the solver raises a descriptive error.
 ## R-Chunk (`B_r`)
 
 `B_r` is the number of contiguous r-points per chunk (`x_chunk · ny · nz`).
-The **post-Round-8 G-flat path** routes the per-rchunk work through a
-single scan-inside-shard_map kernel; the binding allocation is the two
-rank-5 P-pair accumulators that live across the bc-scan body.
+The live G-flat path routes the r-chunk work through one
+scan-inside-shard_map kernel.  Its binding allocations are usually the
+rank-5 pair-density accumulators that live across the band-chunk scan.
 
-### Round-8 unified-FFT-pipeline model
+### Hoisted-ψ(r) cache model
 
-The pre-Round-6 model (six independent constraints, of which `reshard`
-and `pair` were typically binding) overstated the budget by ~3× at CrI3
-80 Ry.  The Round-6/7/8 rewrite (commits `5cadd4b → f567aa0 → c796420`
-on `agent/zeta-bc-scan-shardmap`) collapsed the bc-loop FFT-box slot
-pile-up from 58 concurrent slots down to **1** by pushing the band-chunk
-scan **inside** the shard_map body — the structural fix mandated by
-`feedback_path_d_scaffolding_pattern`.
+Production performs each local ψ(G)→ψ(r) transform once in
+`build_psi_r_cache_sm`.  Its `io_callback × lax.scan × shard_map` builder
+returns `(n_bc, n_k, B_b,padded, n_s, n_r)` with the band axis sharded over
+all P ranks.  After `block_until_ready`, the ordinary NumPy ψ(G) host tiles
+are released.  No FFT box or host callback is live in the outer r-chunk loop.
 
-Inside the new `z_q_from_psi_sm._local` (mirror coming for
-`c_q_from_psi_sm._local` in the planned Round-9 CCT port):
+For each band chunk, `z_q_from_psi_sm` slices the requested full-r slab from
+that cache, then performs the load-bearing data movement:
 
-```
-peak_C ≈ persistent_base + 2·M_P_carry + M_FFT_box + M_all_gather_slab
-       + M_psi_G_iter
-```
+1. `all_to_all('y')` splits r over `p_y` while concatenating y-owned band
+   blocks;
+2. `all_gather('x')` completes the band axis after r is already sharded;
+3. optional band compaction, the L/R masks, and the two pair-density
+   contractions update the scan carries.
 
-where each term is per-rank, c128 (CrI3 6×6 80 Ry, 4×4 mesh, n_rmu=376):
+The source slab is `c128[n_k, B_b/P, n_s, B_r]`; the gathered slab is
+`c128[n_k, B_b, n_s, B_r/p_y]`.  The planner conservatively prices two
+gathered slots because short-final-chunk compaction can keep a second copy
+live, plus one source slab.  Together with the pair-density and `Z_q` terms,
+that is exactly `_stage_C_slope`.  `lax.scan(..., unroll=1)` keeps each of
+these per-band-chunk transients to one reusable shape family.
 
-| Term | Shape | Bytes |
-|---|---|---|
-| `M_P_carry` (×2: L, R) | `(n_k, n_s², n_rmu/p_x, n_zchunk/p_y)` | 3.71 GiB each, both live to γ̃ contract |
-| `M_FFT_box` (scan-aliased) | `4 ×` `(n_k, bpd_max_local, n_s, n_r)` box copies, **plus** the cuFFT plan workspace (a separate term — see "cuFFT plan scratch") | ~5 GiB, 1 slot across all bc iters |
-| `M_all_gather_slab` (scan-aliased) | `(n_k, P·bpd_max_local, n_s, n_zchunk)` | ~1.36 GiB pre-r-slice, ~340 MB post-r-slice |
-| `M_psi_G_iter` (io_callback) | `(n_k, bpd_max, n_s, ngkmax)` per bc | ~80 MB |
-| `persistent_base` | centroids (L+R) + `L_q` | varies |
+The compatibility-only `psi_r_cache=None` route in `z_q_from_psi_sm` retains
+the historical per-r-chunk callback/IFFT for narrow tests.  The production
+driver never selects it, so the planner does not price it as an execution
+alternative.
 
-The key invariant: every transient inside the scan body **aliases to a
-single slot** across iterations.  This requires `lax.scan(..., unroll=1)`
-and the scan to live INSIDE the `shard_map`, NOT outside (the SPMD
-partitioner cannot prove aliasing across a global-sharded carry — see
-the `solve_zeta` 88 GB OOM in `isdf_fitting.py:1119-1141`).
+Two correctness invariants remain easy to violate:
 
-### Per-bc streaming scan invariants
+- r must be scattered on y before the final x band gather; a simple r slice
+  before gathering mixes band owners and r owners;
+- the L/R centroid arrays require symmetric front and back zero-padding,
+  because XLA clamps an out-of-bounds dynamic-slice start rather than
+  reporting an error.
 
-The Round-6 rewrite (commit `f567aa0`, BLOCKER fix `c796420`)
-established four load-bearing invariants in
-`z_q_from_psi_sm._local`.  Violations are silent — they produce wrong
-numerics, not crashes:
-
-1. **Per-bc io_callback pull.**  Each iter pulls one bc's bands from
-   `PsiGStore._host_tiles` via `io_callback(_slice_local_tile_bc, ...)`
-   with a static `out_sds` sized at `bpd_max · ns · ngkmax / P`.  Bands
-   are flat-sharded across `('x','y')` host-side, so each rank gets
-   `bpd_per_bc = bc_size / P` bands per bc.
-2. **IFFT-before-gather invariant.**  Each rank IFFTs its 1/P
-   band-slab over the **full** r-chunk before the all_gather.
-   Gathering bands first would force a full-bands FFT box per rank
-   (~80 GB at CrI3 6×6 80 Ry, infeasible).
-3. **Gather-then-slice for r-axis coherence.**  The all_gather over
-   `('x','y')` on the band axis stacks contributions from different
-   y-ranks; only AFTER the gather can each y-rank `dynamic_slice` its
-   per-rank `r_loc = n_zchunk / p_y` slab.  Slicing before the gather
-   silently produces wrong numerics (Round 6 Bug B, fixed in
-   `f567aa0`).
-4. **Symmetric front+back pad on `psi_l_X` / `psi_r_X`** (Round-7
-   BLOCKER `c796420`).  XLA's `dynamic_slice_in_dim` **silently clamps**
-   out-of-bounds starts to `max(0, axis_size - size)`, returning the
-   wrong physical bands.  Bispinor-transverse runs, asymmetric L/R
-   windows, and short final bcs all trigger this.  The fix is a
-   symmetric front+back pad sized so every per-bc slice lands in-bounds;
-   the L/R mask zeroes pad rows so the math is unchanged.  Cost: a few
-   extra band rows per einsum; <1 % wall.
-
-### Carry-sizing correctness gotcha
-
-The per-rank scan accumulator's r-dimension is `r_loc = n_zchunk / p_y`,
-**not** the full r-chunk.  `out_spec = P(None, 'x', 'y')` requires the
-per-rank output shape `(n_q, n_rmu/p_x, n_zchunk/p_y)`; the carry that
-feeds the post-scan γ̃ tail must already be at that extent.  Pre-flight
-invariant: `n_zchunk % p_y == 0` (the G-flat planner rounds `r_chunk`
-down to a multiple of `p_xy`).
+The per-rank scan accumulator's r-dimension is `B_r/p_y`, not the full
+r-chunk.  `out_spec = P(None, 'x', 'y')` requires
+`n_zchunk % p_y == 0`; the planner rounds `r_chunk` to a multiple of `p_xy`.
 
 ### Solve stage
 
-With `B_r` fixed, the planner prices one q's RHS/output slice as
+The solve holds both the sharded `Z_col` stack and its donated output
+accumulator:
 
 ```
-M_q_rhs = 16 · μ · B_r / P
-q_chunk = clamp(floor((target − persistent) / M_q_rhs), 1, n_q)
+M_rhs_stacks = 2 · 16 · n_q · μ · B_r / P
 ```
 
-This is the live planner formula, not a claim that every solve route has the
-same allocation.  `solve_zeta_from_L_q` has three routing cases:
+The factor term depends on `distributed_zeta_solve`:
 
-- the replicated gather route uses `q_chunk` as its vmapped compute batch;
+- the replicated gather route uses `q_chunk` as its vmapped compute batch and
+  adds `q_chunk · 16 · μ²` bytes;
 - the `per_q` gather route deliberately gathers one `(1, μ, μ)` factor
-  tile at a time and ignores the planned batch width;
+  tile plus its Y-gather row, adds `16 · μ² · (1 + 1/p_y)`, and fixes the
+  reported `q_chunk` to one;
 - distributed `FactorToken` routes keep the factor 2-D sharded and bypass the
-  replicated q-batch loop.
+  replicated q-batch loop, so their reported `q_chunk` is also one.
+
+For explicit `replicated`, the planner chooses
+
+```
+q_chunk = clamp(
+    floor((target − persistent − M_rhs_stacks) / (16 · μ²)),
+    1, n_q)
+```
+
+`auto` is conservatively priced by the same replicated formula.  The live
+resolver may narrow execution to `per_q`; it cannot make the plan optimistic.
+Peak C is `persistent + max(C_fit, C_solve)`.
 
 Consequently `q_chunk` is an active compute-batching choice on one route, not
 a universal live-memory cap and not a Vq q chunk.
 
 ## Q-Chunk (`B_q`)
 
-Bottleneck arrays depend on the selected solve route.  The single production
-planner chooses `B_q` from the RHS/output formula above.  The gather policy
-can narrow the actually gathered factor extent to one q, while a distributed
-factorization can remove the replicated-factor extent entirely.
+`q_chunk` is therefore an active memory-sized compute batch only for the
+replicated route.  The plan report prints the route it priced so a value of one
+on `per_q` or `distributed` cannot be mistaken for an execution throttle.
 
 ## Vq G-Chunk
 
@@ -273,8 +251,9 @@ chooses nor reports it.
 
 ### Per-q kernel allocation (V_q HWM)
 
-The planner's Peak E charges the objects whose extent does not shrink with the
-G chunk:
+The formulas below use the runtime IBZ extents.  The production planner call
+currently supplies conservative full-BZ counts for D–F, so its printed Peak E
+replaces `n_q^irr` with `n_q^full`:
 
 ```
 E_base = one centroid copy / p_x + one centroid copy / p_y
@@ -302,20 +281,25 @@ closure under the spatial sym ops succeeds.  Effects on memory:
 | `ζ_q.h5` (Si 4×4×4 80 Ry, ntran=8) | `c128[64, 432, 588]` ≈ 280 MB | `c128[8, 432, 588]` ≈ 35 MB | **× 8.0** |
 | `ζ_q.h5` (CrI3 6×6 80 Ry charge) | `c128[36, n_rmu, ~50k]` ≈ 35–80 GB | `c128[6, n_rmu, ~50k]` ≈ 6–13 GB | × 6 |
 | `V_q` in memory (any q-set) | `c128[n_q_full, n_rmu, n_rmu] / p_xy` | **same** (unfolded eagerly) | 0 |
-| `gflat_acc` in memory | `c128[n_q_full, n_rmu, ngkmax] / p_xy` | `c128[n_q_irr, n_rmu, ngkmax] / p_xy` | × `n_q_full / n_q_irr` |
+| runtime `gflat_acc` in memory | `c128[n_q_full, n_rmu, ngkmax] / p_xy` | `c128[n_q_irr, n_rmu, ngkmax] / p_xy` | × `n_q_full / n_q_irr` |
 | `unfold_v_q` umklapp phase | — | `c128[n_q_full, n_rmu]` replicated | new (tiny — ≤10 MB) |
 
-Three points worth keeping straight:
+Four points worth keeping straight:
 
-- **Disk-side and Peak-D-side only.**  `V_q` is unfolded inside
+- **The planner is conservatively full-BZ today.**
+  `prepare_isdf_and_wavefunctions` passes `n_q_disk=n_k_tot` and does not pass
+  `n_q_ibz`; therefore the printed D/E/F estimates do not claim the runtime
+  cascade savings in this table.  Wiring the resolved cascade extent into the
+  planner is a future efficiency change, not present behavior.
+
+- **Vq still becomes full-BZ in memory.**  `V_q` is unfolded inside
   `compute_V_q_..._to_h5` (`gw/v_q_g_flat.py`) eagerly to its full
   `(n_q_full, n_rmu, n_rmu)` shape sharded `P(None, 'x', 'y')`, then
   written to `isdf_tensors.h5` and passed to Σ on the full BZ — so the
   in-memory V_q footprint is identical with and without the cascade.
-- **Peak C in-memory footprint is unchanged.**  The fit operates per
-  `(r-chunk × bc)`; the IBZ reduction is purely a disk-write
-  optimization at `accumulate_rchunk_to_gflat`.  Peak C's HWM model is
-  the same as the full-BZ path.
+- **The pair-density part of Peak C is unchanged.**  The live IBZ solve can
+  shrink its q-leading RHS/factor stacks, but the production planner prices
+  those at full-BZ extent today.
 - **`unfold_v_q` transient is small.**  At peak it's
   `2 · 16 · n_q_full · n_rmu² / P` (the umklapp phase plus a permuted
   `V_at_irr` copy), which on Si 4×4×4 is ~1 MB and on CrI3 6×6 is
@@ -326,8 +310,8 @@ sym ops.  Regenerate centroids without `--no-orbit` and ensure
 `compute_centroid_sym_perm(..., extend_trs=True)` raises no closure
 error to activate it.  When inactive (centroid orbit not closed,
 bispinor transverse path, or `LORRAX_FORCE_FULL_BZ=1`),
-`write_ibz_only_charge = False` and `n_q^disk = n_k_tot`; the planner
-sees the full-BZ `gflat_acc` and Peak D ramps proportionally.
+`write_ibz_only_charge = False` and the runtime also uses
+`n_q^disk = n_k_tot`.
 
 Trigger paths to be aware of:
 
@@ -343,10 +327,11 @@ The full chain is in `gw/v_q_g_flat.py :: _resolve_ibz_q_list`.
 ## ψ(G) host store
 
 `PsiGStore` (`common/psi_G_store.py`) holds the G-space wavefunction
-coefficients in **pinned host memory**, tiled along the bc axis:
+coefficients in ordinary NumPy host memory during the one-time ψ(r) cache
+build:
 
-- Tile layout: `(n_k, bc, n_s, ngkmax) c128` per host-tile, one tile
-  per band-chunk index.
+- Per-rank layout: one contiguous `(n_k, n_b/P, n_s, ngkmax) c128` array;
+  `_slice_local_tile_bc` selects one band chunk from it.
 - Per-process residency: `n_b · n_k · n_s · ngkmax · 16 / total_procs`
   bytes (band-flat-sharded across all ranks).  At Si 4×4×4 25 Ry / 2
   procs: 0.03 GB/proc.  At CrI3 6×6 80 Ry / 16 procs: ~1.5 GB/proc
@@ -354,7 +339,8 @@ coefficients in **pinned host memory**, tiled along the bc axis:
 - Access pattern: `io_callback(_slice_local_tile_bc, out_sds=...)`
   pulls one bc's per-rank-local slab (`bpd_max · n_s · ngkmax`) into
   device memory inside each scan iter.  Single one-shot push to host
-  at populate time; many small pulls during ζ-fit.
+  at populate time; many small pulls during the cache-build scan.  After
+  `block_until_ready`, the host store is closed before the r-chunk loop.
 
 This is the **single source** for ψ(G) memory residency in the
 post-Round-6 pipeline — the previous `psi_G_device_full` device-side
@@ -372,7 +358,7 @@ location:
 |---|---|---|---|
 | **A** | `load_centroid_wfns` (pre-loop, once per channel) | centroid output being filled `(n_k, n_s, n_rmu, n_b/P)` | ψ(G)→r FFT box `4·16·n_k·B_b·n_s·n_r / (p_x · p_y)`, replicated `(n_k, n_r)` phase table |
 | **B** | `CCT + Cholesky` (pre-loop) | centroids (L+R copies) | open-spin `P_l + P_r (n_k, n_s², μ, μ)`, `C_q (n_q, μ, μ)`, `L_q (n_q, μ, μ)` |
-| **C** | `fit_one_rchunk` (inside r-chunk loop) | centroids + `L_q` (base) | `slots · 16·n_k·n_s²·μ_loc·r_loc` rank-5 P-pair concurrent slots, scan-aliased FFT box, `Z_q` output |
+| **C** | `fit_one_rchunk` + ζ solve (inside r-chunk loop) | centroids + `L_q` (base) | larger of the pair-density/r-chunk live set and route-specific RHS/output + factor-gather live set |
 | **D** | `accumulate_rchunk_to_gflat` (right after each `fit_one_rchunk`) | `gflat_acc (n_q^disk, n_rmu/p_xy, ngkmax)` | `zeta_chunk (n_q^disk, n_rmu/p_xy, B_r)`, per-scan-iter FFT box `cs · n_r · 16 · fft_factor` |
 | **E** | G-flat Vq contraction (post-fit) | one X- and one Y-sharded centroid copy | `V_acc`, one/two IBZ ζ̃ slabs, X/Y-resharded ζ̃ faces |
 | **F** | restart tensor write | same post-fit centroid base | larger of the sharded V/W0 tile and G-flat ζ tile |
@@ -403,7 +389,7 @@ peak_B = persistent_total
 
 ### Peak C — fit_one_rchunk
 
-The binding peak on most production runs.  The fused jit holds:
+The binding peak on most production runs.  The pair-density phase holds:
 
 - **Persistent**: centroids (L+R), `L_q`, `gflat_acc`.
 - **Transient (`pair_density_slots` concurrent rank-5 buffers)**:
@@ -416,15 +402,16 @@ The binding peak on most production runs.  The fused jit holds:
   reports `CPU_OVERHEAD_DECOMP_2026-05-20.md` and
   `CPU_PLANNER_LANDED_2026-05-20.md`).  Resolved at function-call
   time via `_pair_density_slots()` in `gflat_memory_model.py`.
-  XLA's BufferAssignment reuses these slots for the FFT box and `Z_q`
-  intermediate when lifetimes don't overlap on both backends.
+  XLA's BufferAssignment reuses these slots among pair intermediates and
+  `Z_q` when their lifetimes do not overlap.
 
 ```
-peak_C = persistent_total + C_slope · B_r
+peak_C = persistent_total + max(C_slope · B_r, solve_transient)
 ```
 
 `C_slope` is `_stage_C_slope`: pair-density slots + sharded `Z_q` +
-the gathered ψ(r) slabs described above.
+the gathered ψ(r) slabs described above.  `solve_transient` is the
+route-specific inventory in [§Solve stage](#solve-stage).
 
 The `pair_density_slots` constant is the **XLA-BufferAssignment-determined**
 count of concurrent rank-5 buffers.  Read it from
@@ -445,17 +432,17 @@ peak_D = persistent_total
 ```
 
 `gflat_acc` is already part of `persistent_total`.  It is the G-flat ζ
-accumulator (μ-flat sharded
-across mesh).  When the IBZ cascade activates, `n_q_disk = n_q_irr`,
-shrinking `gflat_acc` by the `n_q_full / n_q_irr` factor.
+accumulator (μ-flat sharded across the mesh).  The runtime object can use
+`n_q_irr` under the cascade, but the production planner call currently prices
+`n_q_disk = n_q_full` conservatively.
 
 ### Peaks E and F — post-fit Vq and tensor write
 
 These peaks use `E_base`, not the fit-loop persistent floor.  Peak E is the
 full-slab inventory in [§Vq G-Chunk](#vq-g-chunk).  Peak F adds the larger
-of the sharded `(n_q^irr, μ, μ)` V/W0 tensor and the sharded
-`(n_q^disk, μ, ngkmax)` G-flat ζ tensor.  SlabIO writes per-rank
-hyperslabs; the deleted all-gather writer is not an alternative modeled here.
+of the sharded V/W0 tensor and G-flat ζ tensor.  The planner currently uses
+full-BZ q extents for both.  SlabIO writes per-rank hyperslabs; the deleted
+all-gather writer is not an alternative modeled here.
 
 ### Sample planner output
 
@@ -494,16 +481,19 @@ short discrete ladders for mesh-compatible band chunks and the rank floor:
    override.  Every transport tail is zero-masked; the physics window is
    unchanged.
 3. **Pick `r_chunk`** — maximize subject to Peak C fitting after
-   `band_chunk` is fixed.  Lower-bounded by `n_rmu` (per user spec: the
+   `band_chunk` is fixed.  Automatic sizing is lower-bounded by `n_rmu` (the
    eventual Σ_μν output occupies `n_rmu² · n_q · 16` bytes, so paying
    less than `n_rmu` work per chunk is wasted iteration overhead).
    Upper-bounded by `n_rtot`, and `n_rtot / B_r ≤ max_chunks = 64`.
    Rounded *down* to a multiple of `p_xy` so the `(μ_X, r_Y)` sharding
-   at the solve output divides cleanly.
+   at the solve output divides cleanly.  A positive `r_chunk_size` is an
+   explicit override and may select a smaller mesh-compatible extent.
 4. **Pick `gflat_chunk_size`** from Peak D headroom, clamp to the live cap
    of 100 rows, floor at 4, and round down to a multiple of 4.
-5. **Pick `q_chunk`** from the remaining fit-floor headroom at the actual
-   `r_chunk`, using one sharded `(μ, r_chunk)` RHS/output slice per q.
+5. **Pick `q_chunk`** for the replicated route from headroom after two
+   sharded full-q RHS/output stacks, charging one replicated `(μ,μ)` factor
+   per batched q.  `auto` is priced the same way; `per_q` and `distributed`
+   report one because they bypass that batch.
 6. **Compute A–F peaks + HWM**.  A–D use the fit-loop persistent floor;
    E–F use the smaller post-fit centroid base.  HWM is their maximum.
 
@@ -516,9 +506,7 @@ of `GFlatChunkPlan`.
 
 Peak C's dominant transient is `slots` concurrent rank-5
 `c128[n_k, n_s², n_rmu/p_x, B_r/p_y]` tensors.  XLA's BufferAssignment
-fuses lifetimes that don't overlap — verified on MoS2 3×3 bispinor /
-2×2 mesh, `slot[1]` holds both a P-pair tensor and the band-chunk FFT
-box across non-overlapping windows.  Default `slots = 3`:
+fuses lifetimes that do not overlap.  Default `slots = 3`:
 `P_l_R_conj`, `P_r_R`, plus one XLA scratch slot.
 
 Do not reduce this to the two conv_kpair input carries by inspection of the
@@ -539,38 +527,9 @@ $ ls ./hlo/module_*.jit__kernel.sm_*.memory-usage-report.txt
 
 Search for the highest-numbered slot holding a `c128[n_k, n_s², ..., ...]`
 shape; that's the slot count.  Update
-`pair_density_slots_charge` / `pair_density_slots_transverse` in the
-planner if it changed.  See `reference_hlo_dump_workflow_lorrax.md` for
+`gflat_memory_model._pair_density_slots` if it changed.  See
+`reference_hlo_dump_workflow_lorrax.md` for
 the shifter-aware launcher.
-
-## Round-8 efficiency findings
-
-Headline numbers from the Round-6/7/8 push on
-`agent/zeta-bc-scan-shardmap` (CrI3 6×6 80 Ry, 16 GPUs):
-
-| Metric | Pre-Round-6 (`5cadd4b`) | Post-Round-8 (`c796420`) |
-|---|---:|---:|
-| FFT-box concurrent slots (HLO) | 58 | **1** |
-| Per-rank preallocated-temp peak | 48.63 GiB | 13–15 GiB |
-| `psi_Y_full` materialization | 30 GiB transient | absent |
-| `psi_G_device_full` tracer leak | yes | resolved |
-
-**Required composition.**  The kernel nests **four** primitives:
-`io_callback × lax.scan × shard_map × lax.all_gather`.  The
-io_callback pulls each rank's 1/P bands of one bc per scan iter; the
-all_gather reassembles the band axis after the IFFT but before the
-einsum (so the per-rank IFFT operates on 1/P bands → ~5 GiB FFT box
-instead of full bands → ~80 GB FFT box).  The `unroll=1` pin is
-load-bearing; defaulting to JAX's heuristic unroll defeats the entire
-fix.  Composition smoke-tested in `tests/test_io_callback_nested.py`.
-
-**Round-9 follow-up.**  Port `c_q_from_psi_sm._local` to mirror
-`z_q_from_psi_sm._local` (currently still uses the pre-Round-6
-pre-materialized `psi_l_Y`/`psi_r_Y` design, ~4 GB persistent residency
-that competes with the chol factor and ψ(G) host caches for the same
-budget).  The CCT migration is structurally identical to ZCT — see
-`reports/zeta_rchunk_memory_model_2026-05-13/round8_unified_fft_pipeline.md`
-§§5 for the per-commit plan.
 
 ## Automatic Sizing Algorithm
 
@@ -583,8 +542,8 @@ Run order in `gw_init.prepare_isdf_and_wavefunctions`:
 2. **One G-flat plan** (`plan_gflat_chunks`) resolves `band_chunk`,
    `r_chunk`, `q_chunk`, and `gflat_chunk_size`, plus the rank floor and
    A–F peaks.
-3. **Fit and solve** consume that plan.  The selected ζ-solve route may
-   override how factor tiles are gathered, as described under Q-Chunk.
+3. **Fit and solve** consume that plan.  The requested ζ-solve route is
+   already represented in Peak C and printed beside `q_chunk`.
 4. **Vq G chunk** resolves independently: explicit `vq_g_chunk_size`, or
    the largest divisor of `ngkmax` no greater than 4096.
 5. **Instrumentation**: the planner returns `peak_estimate_gb`,
@@ -650,9 +609,6 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
    diagnosed**.  Treat `HWM` as an estimate, not a bound, until it is.
 8. **Escape hatches**, in order:
    - `LORRAX_FORCE_FULL_BZ=1` — disables the IBZ cascade (debugging).
-   - `gspace_mode: file_reread` — rebuilds the host ψ(G) tiles for each
-     r chunk instead of retaining the host cache.  This saves host RAM; it
-     does not remove the planner's device-side ψ(r) cache term.
    - Grow the mesh.  All chunked terms shrink as `1/p_xy`; `M_cent`
      shrinks as `1/p_x + 1/p_y`.
 
@@ -663,27 +619,24 @@ Recommended stack (June 2025): XProf + TensorBoard memory viewer.
 1. Capture:
    `uv run python tools/profile_gw_xprof.py -i <input.in> --workdir <run_dir> --logdir ./profiles/xprof --name <tag>`
 2. Open UI: `uv run xprof ./profiles/xprof`
-3. Inspect Memory Viewer for `jit__z_q_from_psi_sm(...)` (post-Round-6
-   name), `jit__compute_C_q(...)`, and `jit__solve_all_q(...)`.
+3. Match modules to the `zeta_fit.build_psi_r_cache`, r-chunk pair-density,
+   ζ-solve, and Vq timing sections.  The cache builder owns the ψ FFT; the
+   r-chunk pair-density module must not contain it.
 
-Recent production traces (CrI3 6×6 80 Ry, 16 A100 / 4×4 mesh,
-`agent/zeta-bc-scan-shardmap`): `jit__z_q_from_psi_sm` peak ~13–15 GiB
-per rank (two rank-5 carry accumulators at 3.71 GiB each + scan-aliased
-FFT box ~5 GiB + scan-aliased post-gather slab ~340 MB);
-`jit__solve_all_q` four `Z_col`-sized buffers + `L_q` temp;
-`jit__unfold_v_q` per-q `V_full` materialization
-(`16 · n_q_full · n_rmu² / p_xy` ≈ 4.5 GiB / rank at CrI3 6×6) plus
-one transient `V_at_irr` of the same shape.
+Older Round-8 traces named the pair module `jit__z_q_from_psi_sm` and included
+a ~5 GiB scan-aliased FFT box.  They predate the ψ(r)-cache hoist and are
+historical evidence only; adding that FFT box to current Peak C double-counts
+work now owned by the one-time cache-builder module.
 
 ## Model Corrections
 
-The post-Round-6 fused kernel `jit__z_q_from_psi_sm` replaced
-`jit__compute_ZCT_LR` (formerly the peak binder); its own peak is
-~2–3× smaller because the bc-loop is now scan-aliased.  Binding peak
-post-Round-8 is the two rank-5 P-pair carries (`P_l_acc`, `P_r_acc`)
-which live across the γ̃ contract — `pair_density_slots` (3 on GPU XLA,
-4 on CPU XLA) captures this in the G-flat planner.  The same conservative
-bound remains active around a conv_kpair custom call for the reason above.
+The current production path hoists ψ(G)→ψ(r) out of the r-chunk loop.  Peak C
+therefore contains cache slices, band/r collectives, pair-density carries,
+and the solve — not an FFT box.  The two visible rank-5 carries
+(`P_l_acc`, `P_r_acc`) plus XLA scratch remain the binding family;
+`pair_density_slots` (3 on GPU XLA, 4 on CPU XLA) captures the measured
+BufferAssignment count.  The same conservative bound remains active around a
+`conv_kpair` custom call.
 
 Pre-Round-6 reference (legacy
 `tests/profiles/xprof/cohsex_prod-20260303-112900/...` — the blobs are tracked

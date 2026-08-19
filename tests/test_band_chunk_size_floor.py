@@ -250,3 +250,42 @@ def test_band_chunk_capped_at_nb_total_or_world_size():
     # built downstream will still be only nb_total wide, but the static
     # _bpd_max shape uses band_chunk // p_xy = 1 per device.
     assert plan.band_chunk >= 16
+
+
+# ---------------------------------------------------------------------------
+# The q batch is a replicated-factor batch, not only a sharded RHS batch.
+# ---------------------------------------------------------------------------
+
+
+def _solve_route_plan(route: str):
+    return plan_gflat_chunks(
+        meta=_fake_meta(
+            nk_tot=4, nspinor=1, n_rmu=512, n_rtot=4096),
+        mesh_xy=SimpleNamespace(shape={'x': 1, 'y': 1}),
+        nb_total=4, fit_nb_total=4,
+        ngkmax=100, n_q_disk=4,
+        budget_gb=0.055,
+        target_utilization=0.90,
+        band_chunk_override=4,
+        r_chunk_override=256,
+        pair_density_slots=3,
+        distributed_zeta_solve=route,
+    )
+
+
+def test_auto_solve_route_conservatively_prices_replicated_factors():
+    plan = _solve_route_plan("auto")
+    assert plan.zeta_solve_memory_route == "replicated (auto-conservative)"
+    assert 1 <= plan.q_chunk < 4, (
+        "the 55 MB budget cannot hold all four replicated 512x512 factors; "
+        f"planner nevertheless chose q_chunk={plan.q_chunk}")
+
+
+def test_nonreplicated_solve_routes_do_not_advertise_a_fake_q_batch():
+    per_q = _solve_route_plan("per_q")
+    distributed = _solve_route_plan("distributed")
+    assert per_q.q_chunk == distributed.q_chunk == 1
+    assert per_q.zeta_solve_memory_route.startswith("per_q")
+    assert distributed.zeta_solve_memory_route.startswith("distributed")
+    assert (per_q.peak_breakdown["C_fit_one_rchunk"]
+            >= distributed.peak_breakdown["C_fit_one_rchunk"])

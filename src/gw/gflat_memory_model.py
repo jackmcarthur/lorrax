@@ -150,7 +150,8 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
     cuFFT plan workspace, which is not in buffer assignment.  Both halves
     matter — the analytic factor alone under-predicted Si-10³ by 19 GiB
     (design §6), and the cuFFT half is >13.7 GB/rank at the CrI3 V_q box.
-    Otherwise: the analytic ``(bc/p_xy)·ns·n_rtot·16·4.0`` box-copy bound,
+    Otherwise: the analytic
+    ``nk·(bc/p_xy)·ns·n_rtot·16·4.0`` box-copy bound,
     which does NOT see the plan workspace — and announces that."""
     nx, ny, nz = (int(v) for v in fft_grid)
     n_rtot = nx * ny * nz
@@ -173,7 +174,7 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
               f"Stage A FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
               f"box-copy bound because {why}.  It does NOT include cuFFT plan "
               f"workspace, so this planner will UNDER-predict FFT-box stages")
-    return _c128(bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR
+    return _c128(nk, bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR
 
 
 #: Concurrent copies of the band-all_gathered FULL-r ψ(r) slab that XLA
@@ -224,6 +225,7 @@ class GFlatChunkPlan:
     r_chunk: int
     n_r_chunks: int
     q_chunk: int
+    zeta_solve_memory_route: str
     gflat_chunk_size: int
     hwm_bytes: float
     peak_breakdown: dict          # stage -> total per-rank bytes (persist+transient)
@@ -241,6 +243,7 @@ class GFlatChunkPlan:
             f"    band_chunk    = {self.band_chunk}",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
+            f"    ζ solve memory = {self.zeta_solve_memory_route}",
             f"    gflat_cs      = {self.gflat_chunk_size}",
             f"    P_min (floor) = {self.p_min}",
             f"    budget        = {bg:.2f} GB/dev  (util {self.target_utilization:.2f})",
@@ -293,6 +296,7 @@ def plan_gflat_chunks(
     gflat_chunk_size_override: int | None = None,
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
+    distributed_zeta_solve: str = "auto",
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, r_chunk, q_chunk, gflat_chunk_size)`` so the
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
@@ -309,6 +313,10 @@ def plan_gflat_chunks(
     the planner mesh-rounds it and caps it at the logical fit window.  An
     explicit deck value ``band_chunk_size=0`` reaches this function as
     ``band_chunk_override=None`` and opts into the full-window-first ladder.
+
+    ``distributed_zeta_solve`` controls the solve-memory inventory.  ``auto``
+    is conservatively priced as ``replicated``; the live resolver may choose
+    ``per_q`` at execution time, but that cannot make this plan optimistic.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -485,19 +493,51 @@ def plan_gflat_chunks(
         cs = min(cs, GFLAT_CHUNK_SIZE_CAP)
         gflat_cs = max(_GFLAT_CHUNK_FLOOR, (cs // 4) * 4)
 
-    # ---- q_chunk (ζ solve batch, sized at the ACTUAL chunk_r) ----------
-    # Production cuSolverMp 2-D solve has no replicated-L (§5 #6); the
-    # per-q buffer is one μ×cr RHS/output slice.  Fold q/k into this
-    # planner at the real chunk_r (fixes the legacy cr inconsistency).
-    per_q_solve = _c128(mu, r_chunk, shard=p_xy)
-    headroom_q = max(target - persistent_total, 0.0)
-    q_chunk = max(1, min(nq, int(headroom_q / per_q_solve))) if per_q_solve > 0 else 1
+    # ---- q_chunk + ζ solve peak, at the ACTUAL chunk_r -----------------
+    # ``replicated`` gathers one full (μ,μ) factor per q in the compute
+    # batch.  ``per_q`` structurally gathers exactly one factor and ignores
+    # q_chunk.  ``distributed`` keeps the factor 2-D sharded and also bypasses
+    # the replicated batch.  ``auto`` is deliberately priced as replicated:
+    # the live resolver may narrow it to per_q, but must never make the memory
+    # model optimistic.  Z_col and the donated output accumulator are both
+    # live across the solve and therefore contribute two full sharded RHS
+    # stacks independently of the factor route.
+    _solve_route_requested = str(distributed_zeta_solve).strip().lower()
+    if _solve_route_requested not in {
+            "auto", "replicated", "per_q", "distributed"}:
+        raise ValueError(
+            "distributed_zeta_solve must be auto, replicated, per_q, or "
+            f"distributed; got {distributed_zeta_solve!r}")
+    _rhs_stacks = 2 * _c128(nq, mu, r_chunk, shard=p_xy)
+    if _solve_route_requested == "distributed":
+        q_chunk = 1                    # ignored by the distributed route
+        solve_t = _rhs_stacks
+        _solve_memory_route = "distributed (2-D-sharded factor)"
+    elif _solve_route_requested == "per_q":
+        q_chunk = 1                    # ignored; one q is structural
+        # The inner shard_map holds the replicated tile plus its y-gather
+        # row, matching isdf.core's live-byte contract.
+        solve_t = (_rhs_stacks
+                   + _c128(mu, mu) * (1.0 + 1.0 / p_y))
+        _solve_memory_route = "per_q (one replicated factor)"
+    else:
+        _factor_per_q = _c128(mu, mu)
+        _factor_headroom = max(
+            target - persistent_total - _rhs_stacks, 0.0)
+        q_chunk = max(
+            1, min(nq, int(_factor_headroom / _factor_per_q)))
+        solve_t = _rhs_stacks + q_chunk * _factor_per_q
+        _solve_memory_route = (
+            "replicated (auto-conservative)"
+            if _solve_route_requested == "auto" else
+            "replicated")
 
     # ---- stage transients + per-stage peaks ----------------------------
     A_t = fft_box_A
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
-    C_t = C_slope * r_chunk
+    C_fit_t = C_slope * r_chunk
+    C_t = max(C_fit_t, solve_t)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
     # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit;
     # only ~2 ψ centroid copies are retained.  Transient = V_acc + the ζ
@@ -541,6 +581,7 @@ def plan_gflat_chunks(
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
         q_chunk=int(q_chunk),
+        zeta_solve_memory_route=_solve_memory_route,
         gflat_chunk_size=int(gflat_cs),
         hwm_bytes=float(hwm),
         peak_breakdown=peaks,

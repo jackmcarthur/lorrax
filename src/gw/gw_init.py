@@ -256,7 +256,6 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'band_range_left':      [int(band_range_left[0]), int(band_range_left[1])],
 		'band_range_right':     [int(band_range_right[0]), int(band_range_right[1])],
 		'bispinor':             bool(cfg.bispinor),
-		'gspace_mode':          str(cfg.gspace_mode),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
 		# EFFECTIVE (env-overridden) values, recorded via the SAME
@@ -1382,7 +1381,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
 			band_norms=_band_norms,
-			gspace_mode=cfg.gspace_mode,
 			distributed_cholesky=cfg.backend.distributed_cholesky,
 			distributed_lu=cfg.backend.distributed_lu,
 			distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
@@ -1606,8 +1604,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					bispinor=cfg.bispinor,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
-							band_norms=_band_norms,
-							gspace_mode=cfg.gspace_mode,
+					band_norms=_band_norms,
 					distributed_cholesky=cfg.backend.distributed_cholesky,
 					distributed_lu=cfg.backend.distributed_lu,
 					distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
@@ -2192,6 +2189,8 @@ def prepare_isdf_and_wavefunctions(
 				                     if mem.band_chunk_size > 0 else None),
 				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 				                           if mem.gflat_chunk_size > 0 else None),
+				distributed_zeta_solve=str(
+					cfg.backend.distributed_zeta_solve),
 				# Stage F writes per-rank hyperslabs; the planner therefore
 				# charges only the local sharded tile.
 			)
