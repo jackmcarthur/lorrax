@@ -6,11 +6,10 @@ Three questions, one per section:
    for a fractionally occupied deck accept EITHER metal head mode, and is
    the refusal that catches a metal deck with no head mode intact?
 2. **Dispatch** — does the ``dft_velocity`` route reach the
-   parallel-transport loader?  It must not: that loader currently dies on
-   its first rank-0 scalar read (claim 0188 blocker 1) and this mode is
-   deliberately not blocked behind that repair.  Pinned by monkeypatching
-   the loader to raise, with the ``parallel_transport`` arm as the control
-   that proves the trap is armed.
+   parallel-transport loader?  It must not: this mode deliberately reads only
+   the velocity stage and has no finite-link DeltaH derivative.  Pinned by
+   monkeypatching the loader to raise, with the ``parallel_transport`` arm as
+   the control that proves the trap is armed.
 3. **Head chain** — does the mode run the same S(z)/Drude/wing chain on
    the DFT p-matrix velocity, and does it still rotate that velocity into
    the current QP basis every iteration?  The velocity rotation is the
@@ -20,11 +19,7 @@ Three questions, one per section:
 
 Everything here is at the fixture scale of
 ``test_qsgw_parallel_transport_head.py`` (a handful of k points and bands),
-with no WFN and no artifact on disk.  The backend is NOT pinned to cpu the
-way that file's is: the transport arm of the equivalence cell takes
-``spectral_cartesian_derivative``, which needs the FFT FFI, and the host
-library on this site cannot load (``libsci_gnu.so.6`` is absent from the
-container) — so this suite runs where the driver runs.
+with no WFN and no artifact on disk.
 """
 
 from __future__ import annotations
@@ -109,6 +104,15 @@ def test_dft_velocity_parses_on_an_insulating_deck_too(tmp_path):
     cfg = _config(tmp_path, "sc_head_update = dft_velocity\n")
     assert cfg.sc.head_update == "dft_velocity"
     assert cfg.screening.occ_broadening_ev == 0.0
+
+
+def test_a_head_update_cannot_override_head_correction_off(tmp_path):
+    with pytest.raises(ValueError, match="does not override"):
+        _config(
+            tmp_path,
+            "qp_solver = self_consistent\n"
+            "head_correction = off\n"
+            "sc_head_update = dft_velocity\n")
 
 
 def test_a_fractional_deck_with_the_head_off_is_still_refused(tmp_path):
@@ -368,7 +372,7 @@ def test_a_real_delta_h_is_what_the_dft_velocity_mode_drops():
 
 
 def test_dft_velocity_rotates_into_the_qp_basis_every_iteration():
-    """The per-iteration U rotation is NOT dropped with the connection.
+    """The per-iteration U rotation is NOT dropped with the finite links.
 
     The R2/R3 tool route was one-shot, so its velocity was never rotated.
     A QSGW iteration's is: the mode feeds ``U^dag v U`` on the active block

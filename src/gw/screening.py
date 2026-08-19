@@ -740,8 +740,8 @@ def compute_screening_model(
     Ordinary modes return their in-memory ``{role: W_q}`` mapping.  MPA
     returns one disk-backed fit path under ``"mpa_fit"``; its shared
     frequency walk cannot be represented as independent screening requests.
-    ``static_only`` is the pre-SC restart seed used by ordinary modes; MPA
-    rebuilds its model inside each iteration and therefore returns nothing.
+    ``static_only`` is an explicit request for just the ordinary static role;
+    MPA has no independent static-role representation and returns nothing.
 
     THE ``screening_diagrams`` FORK LIVES HERE AND NOWHERE ELSE.  The role
     plan (:func:`screening_requests_for`) and the Σ dispatch are identical

@@ -116,4 +116,5 @@ def test_run_sc_driver_refuses_b0_nonzero():
             head_resolver=None, config=None, meta=meta,
             mesh_xy=None, sym=None, wfn=None, centroid_indices=None,
             band_slices=bs, input_dir=".",
+            tensors_filename="unused-before-b0-refusal.h5",
             enk_dft=np.zeros((2, 32)), print_fn=lambda *a, **k: None)

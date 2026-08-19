@@ -661,6 +661,20 @@ def write_w0_qmunu_to_h5(
                 "screening unfolds it; slicing the unfolded W instead would "
                 "make the stored block depend on an op-selection policy "
                 "nobody froze for this purpose.")
+        # PRE-FLIGHT BEFORE MUTATION.  ``_stamp_qirr`` repeats these checks at
+        # the metadata seam, but waiting until then would recreate/overwrite
+        # W0 first and only afterwards discover that its tables describe a
+        # different centroid set or logical extent.
+        from gw.restart_q_storage import assert_capture_matches
+        assert_capture_matches(
+            qirr.capture, qirr.resolution,
+            context="write_w0_qmunu_to_h5 preflight")
+        capture_n_rmu = int(qirr.capture.n_rmu_logical)
+        if capture_n_rmu != int(n_rmu_logical):
+            raise ValueError(
+                "write_w0_qmunu_to_h5 preflight: captured wedge declares "
+                f"n_rmu_logical={capture_n_rmu}, writer was told "
+                f"{int(n_rmu_logical)}; refusing before W0 mutation.")
         W0_qmunu = qirr.capture.X_ibz
 
     shape = _mu_logical_shape(W0_qmunu.shape, (-2, -1), n_rmu_logical)
