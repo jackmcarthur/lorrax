@@ -246,6 +246,64 @@ def test_q_count_not_a_multiple_of_the_chunk():
     assert _maxdiff(a.psi_rmu_Y, b.psi_rmu_Y) < 1e-10
 
 
+def test_centroid_keep_selects_each_chunk_before_bundle_materialization(
+        monkeypatch):
+    """Downfold fits at parent mu but emits only the child centroid rows.
+
+    RED TWIN for the 18x18 MoS2 failure: post-bundle slicing produces the
+    same values but first materializes two full-parent psi bundles.  The SSOT
+    must instead return child-width Y/X arrays directly, while every non-psi
+    result stays unchanged.
+    """
+    pytest.importorskip("jax")
+    import bandstructure.bse_setup as setup
+    mesh = _mesh_1x1()
+    parent = _run(mesh, batch_size=3, return_coeffs=True)
+    keep = np.asarray([5, 1, 4], dtype=np.int32)
+    lines = []
+    concat_mu_extents = []
+    concatenate = setup.jnp.concatenate
+
+    def _spy_concatenate(arrays, *args, **kwargs):
+        arrays = list(arrays)
+        if arrays and arrays[0].ndim == 4:
+            concat_mu_extents.append(tuple(int(a.shape[-1]) for a in arrays))
+        return concatenate(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(setup.jnp, "concatenate", _spy_concatenate)
+    child = _run(
+        mesh, batch_size=3, return_coeffs=True,
+        centroid_keep_idx=keep, log=lines.append)
+
+    assert parent.psi_rmu_Y.shape == (16, 2, 2, 6)
+    assert child.psi_rmu_Y.shape == (16, 2, 2, 3)
+    assert child.psi_rmuT_X.shape == (16, 3, 2, 2)
+    np.testing.assert_array_equal(
+        np.asarray(child.psi_rmu_Y),
+        np.take(np.asarray(parent.psi_rmu_Y), keep, axis=3))
+    np.testing.assert_array_equal(
+        np.asarray(child.psi_rmuT_X),
+        np.take(np.asarray(parent.psi_rmuT_X), keep, axis=1))
+    assert _maxdiff(parent.enk_full, child.enk_full) == 0.0
+    assert _maxdiff(parent.lam_fi, child.lam_fi) == 0.0
+    assert _maxdiff(parent.lam_all_fi, child.lam_all_fi) == 0.0
+    assert _maxdiff(parent.coeffs_fi, child.coeffs_fi) == 0.0
+    assert concat_mu_extents
+    assert all(mu == 3 for chunk in concat_mu_extents for mu in chunk)
+    assert "parent mu=6 -> output mu=3 in each q chunk" in " ".join(lines)
+
+
+def test_centroid_keep_refuses_duplicates_and_out_of_range_rows():
+    pytest.importorskip("jax")
+    mesh = _mesh_1x1()
+    with pytest.raises(ValueError, match="duplicate"):
+        _run(mesh, centroid_keep_idx=np.asarray([1, 1], dtype=np.int32))
+    with pytest.raises(ValueError, match=r"lie in \[0,6\)"):
+        _run(mesh, centroid_keep_idx=np.asarray([1, 6], dtype=np.int32))
+    with pytest.raises(ValueError, match="integer parent-row"):
+        _run(mesh, centroid_keep_idx=np.asarray([1.0, 2.0]))
+
+
 # ---------------------------------------------------------------------------
 #  3. eigenvalues accumulated to the FULL band count across chunks
 # ---------------------------------------------------------------------------

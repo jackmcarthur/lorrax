@@ -815,12 +815,12 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     device; at 40 path points the old device_get→np.pad→2×device_put moved
     ~1.7 GB through the host).
 
-    ``keep_idx`` (downfolded bundles only) is the column slice from the
-    parent ISDF basis the htransform fitted in to the basis the RESTART
-    stores — see :func:`resolve_isdf_basis` for why those differ.  It runs
-    inside the same jit, before the pad, so the parent-width ψ never lands
-    in a second host buffer and the μ axis reaches its sharding constraint
-    already at the small extent.
+    ``keep_idx`` is retained for callers holding a legacy parent-width
+    htransform bundle.  It applies the parent→child column slice before the
+    pad, but cannot undo that bundle's earlier parent-width q concatenation.
+    Production downfolds therefore pass the selection to
+    :func:`bandstructure.bse_setup.compute_wfns_fi` and call this function
+    with ``keep_idx=None``; the incoming bundle is already child-width.
 
     THE RESTART'S μ IS THE AUTHORITY, and the assertion below says so: the
     htransform's basis is an input to this function, ``n_rmu`` is what every
@@ -1750,12 +1750,13 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
+        centroid_keep_idx=keep_idx,
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
         distrib_la_batched_route=args.distrib_la_batched_route)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
-        keep_idx=keep_idx)
+        keep_idx=None)
     # Everything the htransform produced is now copied into the conduction
     # stacks and nothing below reads it again.  Drop it before the V_Q model
     # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED

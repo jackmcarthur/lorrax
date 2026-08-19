@@ -309,6 +309,7 @@ def compute_wfns_fi(
     batch_size: int | None = None,
     q_list=None,
     return_coeffs: bool = False,
+    centroid_keep_idx=None,
     eigh_backend: str = "auto",
     use_low_mem_eigh: bool = False,
     distrib_la_batched_route: str = "auto",
@@ -372,6 +373,15 @@ def compute_wfns_fi(
                    output — the per-q ζ-refit consumes them to rebuild ψ on
                    the full r-grid through the streamed α-basis (its chunk
                    kernels reshard as needed).
+        centroid_keep_idx: optional one-dimensional integer selection on the
+                   ``B_at_mu`` centroid axis.  The Galerkin fit and fH
+                   eigensolve remain in the full parent basis.  Each projected
+                   q chunk is selected to these retained centroid rows before
+                   it enters the chunk cache or global concatenate.  Keeping
+                   the established parent-width projection unchanged avoids
+                   changing its contraction kernel/order; at most one bounded
+                   parent-width q chunk exists.  ``None`` is the historical
+                   path, bit-for-bit and shape-for-shape.
         eigh_backend: which Hermitian eigensolver decomposes fH_q —
                    ``auto|off`` (default) keeps the q-BATCHED native path,
                    ``distributed|cusolvermp|slate|scalapack`` route ONE
@@ -408,8 +418,8 @@ def compute_wfns_fi(
 
     Returns:
         SimpleNamespace bundle (matching ``file_io.tagged_arrays`` convention):
-            .psi_rmu_Y:  (nk_fi, nb_fi, ns, n_μ)  P(None, None, None, 'y')
-            .psi_rmuT_X: (nk_fi, n_μ, nb_fi, ns)  P(None, 'x', None, None)
+            .psi_rmu_Y:  (nk_fi, nb_fi, ns, n_μ,out)  P(None, None, None, 'y')
+            .psi_rmuT_X: (nk_fi, n_μ,out, nb_fi, ns)  P(None, 'x', None, None)
             .enk_full:   (nk_fi, nb_fi)           recovered DFT energies (Ry)
                                                   via ``newton_inv`` of fH_q eigvals
             .lam_fi:     (nk_fi, nb_fi)           raw fH_q eigenvalues (= f(ε_n,q))
@@ -431,6 +441,27 @@ def compute_wfns_fi(
     rank = int(ctilde.shape[2])
     nspinor = int(B_at_mu.shape[1])
     n_mu = int(B_at_mu.shape[2])
+    keep_raw = (None if centroid_keep_idx is None else
+                np.asarray(centroid_keep_idx))
+    if keep_raw is not None and not np.issubdtype(keep_raw.dtype, np.integer):
+        raise ValueError(
+            "centroid_keep_idx must contain integer parent-row indices, "
+            f"got dtype {keep_raw.dtype}.")
+    if keep_raw is not None:
+        if keep_raw.ndim != 1 or keep_raw.size == 0:
+            raise ValueError(
+                "centroid_keep_idx must be a nonempty one-dimensional integer "
+                f"selection, got shape {keep_raw.shape}.")
+        if np.any(keep_raw < 0) or np.any(keep_raw >= n_mu):
+            raise ValueError(
+                f"centroid_keep_idx rows must lie in [0,{n_mu}); got range "
+                f"[{int(keep_raw.min())},{int(keep_raw.max())}].")
+        if np.unique(keep_raw).size != keep_raw.size:
+            raise ValueError(
+                "centroid_keep_idx contains duplicate parent rows.")
+    keep = (None if keep_raw is None else
+            np.asarray(keep_raw, dtype=np.int32))
+    n_mu_out = n_mu if keep is None else int(keep.size)
 
     b_min, b_max = int(band_window_fi[0]), int(band_window_fi[1])
     nb_fi = b_max - b_min
@@ -552,6 +583,9 @@ def compute_wfns_fi(
     # device count (gw_converged_12x12_80ry_2026-07-21 §5, next-step #2).
     rep = NamedSharding(mesh_xy, P())
     B_rep = jax.device_put(B_at_mu, rep)
+    if keep is not None:
+        log(f"  projection centroids: parent mu={n_mu} -> output "
+            f"mu={n_mu_out} in each q chunk before global concatenate")
     R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
@@ -829,6 +863,20 @@ def compute_wfns_fi(
         That sync fired once per q on the FFI arm (1456 host round trips on
         the reference deck).  Each loop now owns its own sync POLICY, at its
         own cadence, where the reason for it can be written down."""
+        # THE DOWNFOLD MEMORY BOUNDARY.  Preserve the established parent-mu
+        # projection contraction bit-for-bit, but let no parent-width chunk
+        # enter `psi_chunks`: concatenating every Q at parent width requested
+        # 16.97 GiB on the 18x18 MoS2 run, independently of P.  This bounded
+        # take leaves at most one parent-width q chunk live (~83.5 MiB there),
+        # while the retained cache and global concatenate scale with mu_S.
+        if keep is not None:
+            psi_s = jnp.take(psi_s, keep, axis=-1)
+            # The take is asynchronous.  Resolve it here so the next FFI
+            # chunk cannot overlap this chunk's parent-width projection;
+            # native already synchronizes immediately below.  This sync is
+            # downfold-only and leaves the historical None arm untouched.
+            if not native:
+                jax.block_until_ready(psi_s)
         lam_chunks.append(lam_s)
         psi_chunks.append(psi_s)
         lam_all_chunks.append(lam_all_s)
@@ -1027,9 +1075,11 @@ def compute_wfns_fi(
     #   psi_rmuT_X: (nk, n_μ, nb, ns)   P(None, 'x', None, None)   — n_μ on X
     # Both of these shard the μ axis (the k-means centroid count), which is
     # exactly the extent nothing rounds here.  Fit, do not assume.
-    out_Y = _fit(mesh_xy, P(None, None, None, 'y'), (nq, nb_fi, nspinor, n_mu),
+    out_Y = _fit(mesh_xy, P(None, None, None, 'y'),
+                 (nq, nb_fi, nspinor, n_mu_out),
                  "bse_setup.psi_rmu_Y")
-    out_X = _fit(mesh_xy, P(None, 'x', None, None), (nq, n_mu, nb_fi, nspinor),
+    out_X = _fit(mesh_xy, P(None, 'x', None, None),
+                 (nq, n_mu_out, nb_fi, nspinor),
                  "bse_setup.psi_rmuT_X")
 
     def _build_bundle():
@@ -1045,7 +1095,7 @@ def compute_wfns_fi(
     # closed-over shardings (out_Y / out_X) carry the fine-grid q count.
     psi_rmu_Y, psi_rmuT_X = _cached_kernel(
         ("make_bundle", _mesh_id, int(nq), int(nb_fi), int(nspinor),
-         int(n_mu)), _build_bundle)(psi_fi)
+         int(n_mu_out)), _build_bundle)(psi_fi)
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
     out = SimpleNamespace(
         psi_rmu_Y=psi_rmu_Y,
