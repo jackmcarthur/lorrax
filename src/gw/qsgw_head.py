@@ -116,18 +116,6 @@ class DftVelocityHeadData:
     validation: None = None
 
 
-def _read_small(io, name: str, shape: tuple[int, ...], dtype):
-    return np.asarray(
-        io.read_slab(
-            name,
-            shape=shape,
-            dtype=dtype,
-            partition_spec=P(*([None] * len(shape))),
-            as_numpy=True,
-        )
-    )
-
-
 def load_parallel_transport_head(
     path: str,
     *,
@@ -135,12 +123,18 @@ def load_parallel_transport_head(
     wfn,
     meta,
 ) -> ParallelTransportHeadData:
-    """Load and validate the preprocessing artifact through SlabIO only.
+    """Load and validate the preprocessing artifact without mixed ownership.
 
     Every cheap provenance/refusal is checked before either O(nk*nb^2)
     dataset is read.  The stored connection is manifold-dependent, so a
     strict subset or superset is rejected rather than sliced.
+
+    The metadata are rank-0/small datasets, which ``SlabIO.read_slab`` does
+    not support.  Read them with a short-lived serial h5py owner, close that
+    owner, and only then open SlabIO for the large distributed payloads.
     """
+    import h5py
+
     from file_io.parallel_transport import (
         CONNECTION_CART_DATASET,
         SCHEMA_VERSION,
@@ -149,84 +143,92 @@ def load_parallel_transport_head(
     from file_io.slab_io import SlabIO
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
 
+    int_names = (
+        "schema_version",
+        "connection_complete",
+        "velocity_validation_complete",
+        "velocity_validation_passed",
+        "band_start",
+        "band_stop",
+        "effective_nspinor",
+        "bispinor",
+    )
+    validation_names = (
+        "atol",
+        "rtol",
+        "max_abs",
+        "max_rel",
+        "max_abs_diagonal",
+        "max_abs_offdiagonal",
+    )
+    with h5py.File(path, "r") as raw:
+        ints = {name: int(raw[name][()]) for name in int_names}
+        kgrid = np.asarray(raw["kgrid"][()], dtype=np.int32)
+        reciprocal = np.asarray(
+            raw["reciprocal_lattice_cart"][()], dtype=np.float64
+        )
+        fingerprint_raw = np.asarray(
+            raw["wfn_fingerprint_utf8"][()], dtype=np.uint8
+        )
+        validation = {
+            key: float(raw[f"velocity_validation_{key}"][()])
+            for key in validation_names
+        }
+
+    try:
+        fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(
+            f"{path}: wfn_fingerprint_utf8 is not a 64-byte ASCII SHA-256 "
+            "dataset; regenerate with get_dipole_mtxels"
+        ) from exc
+
+    expected_nb = int(meta.b_id_4_user)
+    expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
+    expected_reciprocal = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    refusals = []
+    if ints["schema_version"] != int(SCHEMA_VERSION):
+        refusals.append(
+            f"schema_version={ints['schema_version']}, expected {int(SCHEMA_VERSION)}"
+        )
+    if ints["connection_complete"] != 1:
+        refusals.append("connection_complete is not 1")
+    if (
+        ints["velocity_validation_complete"] != 1
+        or ints["velocity_validation_passed"] != 1
+    ):
+        refusals.append(
+            "mandatory full-matrix DFT velocity validation is not complete/passing"
+        )
+    if ints["band_start"] != 0 or ints["band_stop"] != expected_nb:
+        refusals.append(
+            f"band manifold [{ints['band_start']},{ints['band_stop']}) != current "
+            f"full head manifold [0,{expected_nb})"
+        )
+    if ints["effective_nspinor"] != int(meta.nspinor):
+        refusals.append(
+            f"effective_nspinor={ints['effective_nspinor']} != current "
+            f"{int(meta.nspinor)}"
+        )
+    if bool(ints["bispinor"]) != bool(int(meta.nspinor) == 4):
+        refusals.append("bispinor convention differs from current run")
+    if not np.array_equal(kgrid, expected_kgrid):
+        refusals.append(f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
+    if not np.allclose(reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13):
+        refusals.append("Cartesian reciprocal lattice differs from the current WFN")
+    expected_fingerprint = wfn_fingerprint(wfn)
+    if fingerprint != expected_fingerprint:
+        refusals.append(
+            "WFN fingerprint differs (parallel-transport data are stale or "
+            "were generated from another DFT solution)"
+        )
+    if refusals:
+        raise ValueError(
+            f"{path}: refusing QSGW parallel-transport head:\n  - "
+            + "\n  - ".join(refusals)
+        )
+
     with SlabIO(path, mode="r", mesh=mesh) as io:
-
-        def scalar_i32(name):
-            return int(_read_small(io, name, (), np.int32).reshape(()))
-
-        schema = scalar_i32("schema_version")
-        complete = scalar_i32("connection_complete")
-        val_complete = scalar_i32("velocity_validation_complete")
-        val_passed = scalar_i32("velocity_validation_passed")
-        band_start = scalar_i32("band_start")
-        band_stop = scalar_i32("band_stop")
-        effective_nspinor = scalar_i32("effective_nspinor")
-        artifact_bispinor = scalar_i32("bispinor")
-        kgrid = _read_small(io, "kgrid", (3,), np.int32)
-        reciprocal = _read_small(io, "reciprocal_lattice_cart", (3, 3), np.float64)
-        fingerprint_raw = _read_small(io, "wfn_fingerprint_utf8", (64,), np.uint8)
-        try:
-            fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ValueError(
-                f"{path}: wfn_fingerprint_utf8 is not a 64-byte ASCII SHA-256 "
-                "dataset; regenerate with get_dipole_mtxels"
-            ) from exc
-
-        expected_nb = int(meta.b_id_4_user)
-        expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
-        expected_reciprocal = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
-        refusals = []
-        if schema != int(SCHEMA_VERSION):
-            refusals.append(f"schema_version={schema}, expected {int(SCHEMA_VERSION)}")
-        if complete != 1:
-            refusals.append("connection_complete is not 1")
-        if val_complete != 1 or val_passed != 1:
-            refusals.append(
-                "mandatory full-matrix DFT velocity validation is not complete/passing"
-            )
-        if band_start != 0 or band_stop != expected_nb:
-            refusals.append(
-                f"band manifold [{band_start},{band_stop}) != current full "
-                f"head manifold [0,{expected_nb})"
-            )
-        if effective_nspinor != int(meta.nspinor):
-            refusals.append(
-                f"effective_nspinor={effective_nspinor} != current {int(meta.nspinor)}"
-            )
-        if bool(artifact_bispinor) != bool(int(meta.nspinor) == 4):
-            refusals.append("bispinor convention differs from current run")
-        if not np.array_equal(kgrid, expected_kgrid):
-            refusals.append(f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
-        if not np.allclose(reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13):
-            refusals.append("Cartesian reciprocal lattice differs from the current WFN")
-        expected_fingerprint = wfn_fingerprint(wfn)
-        if fingerprint != expected_fingerprint:
-            refusals.append(
-                "WFN fingerprint differs (parallel-transport data are stale or "
-                "were generated from another DFT solution)"
-            )
-        if refusals:
-            raise ValueError(
-                f"{path}: refusing QSGW parallel-transport head:\n  - "
-                + "\n  - ".join(refusals)
-            )
-
-        validation = {}
-        for key in (
-            "atol",
-            "rtol",
-            "max_abs",
-            "max_rel",
-            "max_abs_diagonal",
-            "max_abs_offdiagonal",
-        ):
-            validation[key] = float(
-                _read_small(io, f"velocity_validation_{key}", (), np.float64).reshape(
-                    ()
-                )
-            )
-
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
         large_shape = (3, int(meta.nk_tot), nb_storage, nb_storage)
@@ -272,21 +274,13 @@ def load_dft_velocity_head(
     dft_velocity`` gave the driver the same route, and it moved here rather
     than being copied so the two cannot drift.
 
-    Two differences from :func:`load_parallel_transport_head`, both
+    The key difference from :func:`load_parallel_transport_head` is
     deliberate:
 
     * ``connection_complete`` / ``velocity_validation_*`` are NOT required.
       The velocity is written and checked by the dipole job on its own; the
       link, connection and velocity-identity stages exist to serve the
       covariant correction this mode does not take.
-    * the handful of small provenance values are read with plain h5py.
-      ``SlabIO.write_attr`` stores them as rank-0 datasets and the FFI
-      ``read_slab`` refuses an empty shape (claim 0188 blocker 1,
-      ``_slab_io_ffi.py:1050``), so this path must not go through
-      ``_read_small``.  Repairing that read is the parallel-transport
-      loader's own business (claim 0187 fixer); this mode is not blocked
-      behind it and does not touch it.
-
     Every other provenance refusal the PT loader emits is kept verbatim:
     schema, band manifold, k grid, reciprocal lattice, WFN fingerprint.
     """

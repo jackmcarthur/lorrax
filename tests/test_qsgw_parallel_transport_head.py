@@ -11,6 +11,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 
 from common.chi_from_dipole import compute_S_omega
@@ -19,6 +20,7 @@ from gw.qsgw_head import (
     assemble_head_manifold,
     head_wings_sharded,
     head_s_tensor_sharded,
+    load_parallel_transport_head,
     reduced_covector_to_cartesian,
     rotate_velocity_active_to_qp,
     rotate_velocity_to_qp,
@@ -41,6 +43,76 @@ def _haar(rng, n):
     q, r = np.linalg.qr(z)
     phase = np.diag(r)
     return q * (phase / np.abs(phase))[None, :]
+
+
+def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatch):
+    """Rank-0 metadata must not be sent through SlabIO's slab API."""
+    import sys
+
+    from common import parallel_transport as pt_common
+    from file_io.parallel_transport import SCHEMA_VERSION
+
+    fingerprint = "a" * 64
+    raw = {
+        name: np.asarray(value, dtype=np.int32)
+        for name, value in {
+            "schema_version": SCHEMA_VERSION,
+            "connection_complete": 1,
+            "velocity_validation_complete": 1,
+            "velocity_validation_passed": 0,
+            "band_start": 0,
+            "band_stop": 8,
+            "effective_nspinor": 1,
+            "bispinor": 0,
+        }.items()
+    }
+    raw["kgrid"] = np.asarray([2, 2, 2], dtype=np.int32)
+    raw["reciprocal_lattice_cart"] = np.eye(3)
+    raw["wfn_fingerprint_utf8"] = np.frombuffer(
+        fingerprint.encode("ascii"), dtype=np.uint8
+    )
+    raw.update(
+        {
+            f"velocity_validation_{key}": np.asarray(value, dtype=np.float64)
+            for key, value in {
+                "atol": 5.0e-4,
+                "rtol": 5.0e-3,
+                "max_abs": 1.0,
+                "max_rel": 2.0,
+                "max_abs_diagonal": 0.5,
+                "max_abs_offdiagonal": 0.75,
+            }.items()
+        }
+    )
+
+    class _Dataset:
+        def __init__(self, value):
+            self.value = value
+
+        def __getitem__(self, key):
+            assert key == ()
+            return self.value
+
+    class _File:
+        def __init__(self, path, mode):
+            assert path == "parallel_transport.h5"
+            assert mode == "r"
+
+        def __enter__(self):
+            return {name: _Dataset(value) for name, value in raw.items()}
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setitem(sys.modules, "h5py", SimpleNamespace(File=_File))
+
+    monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
+    wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
+    meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
+    with pytest.raises(ValueError, match="mandatory full-matrix DFT velocity"):
+        load_parallel_transport_head(
+            "parallel_transport.h5", mesh=_mesh(), wfn=wfn, meta=meta
+        )
 
 
 def test_reduced_covector_conversion_uses_row_basis_convention():
