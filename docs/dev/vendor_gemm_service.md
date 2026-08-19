@@ -148,8 +148,15 @@ LibSci does not).  **There is no build-time feature probe and no
 `dlsym` resolves gets one batched call per invocation; each that does not
 falls back **for that precision** to a loop of plain `cblas_?gemm` calls
 (standard CBLAS, threaded internally by the vendor, loop sequential by
-design so it does not fight the BLAS's own team).  One binary serves either
-vendor.  **Tested with Intel only so far** (Frontera MKL 2020.1).
+design). Whole plain-loop handler invocations are serialized: XLA can dispatch
+the four `split_reim` custom calls concurrently, and allowing four full
+OpenMP teams into Cray LibSci 25.09 produced an 18.18% relative error in the
+focused gate and a SIGSEGV in the first production Sigma contraction. The
+same gate passed at `OMP_NUM_THREADS=1`; the handler mutex then made it pass
+at the normal 32 threads and made the exact P=4 GN-PPM fixture complete with
+zero printed-precision drift over 2,484 checked cells. Batched entries do not
+take the mutex. One binary therefore serves either vendor. Tested providers:
+Frontera MKL 2020.1 (batched) and Perlmutter LibSci 25.09 (plain).
 
 Why the probe was deleted rather than fixed (owner order 2026-07-29, after
 it cost a gate cycle): `check_symbol_exists` links a try_compile
@@ -247,10 +254,8 @@ RED twins, `tests/test_contract_bands.py` 9/9, `tests/test_projection_lgemm.py`
 * No GPU measurement of this dial exists and none is possible — host table
   only.  `wk_REL/audit_gpu_gemm.log:3` ran on a GPU node but every row is
   `XLA:CPU dot_general` / bare MKL.
-* Measured domain of every number above: **one Frontera CLX node, 28 cores
-  per rank under `taskset`, Intel MKL 2020.1, SHM/`impl=mpi` collectives**.
-  No other vendor BLAS has been run.
-* The batched-vs-plain entry choice has only ever been exercised with the
-  batched entry present.  The plain-loop arm is compiled and shares the
-  broadcast rule and the pin with the batched arm (`:419`), but has not
-  been measured.
+* The performance numbers above remain scoped to **one Frontera CLX node,
+  28 cores per rank under `taskset`, Intel MKL 2020.1, SHM/`impl=mpi`
+  collectives**. Cray LibSci 25.09 now has correctness and execution evidence,
+  not a performance claim: on the tiny GN-PPM fixture the serialized FFI run
+  was slower than native XLA (`sigma.exec` 33.56 s versus 19.98 s).

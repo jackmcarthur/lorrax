@@ -38,8 +38,9 @@
 // WHICH ENTRY IS LIVE IS ANNOUNCED ON FIRST USE, UNCONDITIONALLY (see
 // announce_entry_once below) — a silent downgrade is impossible by
 // construction, which is the whole point of the redesign.
-// Works in principle with Intel MKL or Cray LibSci; TESTED WITH INTEL
-// ONLY so far (Frontera MKL 2020.1, batched entry — jobs 7879008/7879010).
+// Tested with Intel MKL's batched entry (Frontera MKL 2020.1, jobs
+// 7879008/7879010) and Cray LibSci's serialized plain entry (Perlmutter
+// LibSci 25.09, focused split-reim gate plus P=4 GN-PPM, 2026-08-18).
 //
 // WHY IT EXISTS: the primitive's large right contraction is the measured
 // Σ project_rs wall — XLA:CPU runs it through Eigen at 295 GF/s (promoted
@@ -93,6 +94,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -114,6 +116,19 @@ namespace lorrax_ffi::mklblas {
 namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
 using C64  = std::complex<float>;
+
+// XLA may schedule independent custom calls from one compiled computation on
+// different host threads.  That is harmless with MKL's batched entry, but the
+// plain-CBLAS fallback consists of several separately threaded vendor calls.
+// Cray LibSci 25.09 produced wrong values at OMP_NUM_THREADS=32 in the
+// four-call split_reim gate and segfaulted in the first production Sigma
+// contraction; the identical gate passed at OMP_NUM_THREADS=1.  Serialize
+// whole fallback invocations so one internally threaded BLAS team owns the
+// rank's cores at a time.  The batched entry remains concurrent and untouched.
+static std::mutex& plain_gemm_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
 
 // LP64 CBLAS integer.  MKL_INT under <mkl_cblas.h>; plain int for the
 // standard CBLAS headers (LibSci/OpenBLAS/BLIS lp64 — the only builds
@@ -264,8 +279,7 @@ static void announce_entry_once(ffi::DataType dt) {
         std::fprintf(stderr,
                      "[mklblas] GEMM entry (%s): plain cblas_%cgemm loop — "
                      "this BLAS does not provide cblas_%cgemm_batch, so the "
-                     "portable per-slot loop is used.  Correct, "
-                     "~1.6-1.9x below the batched entry on MKL.\n",
+                     "serialized portable per-slot loop is used.\n",
                      nm, letter, letter);
     }
     std::fflush(stderr);
@@ -471,6 +485,7 @@ static ffi::Error GemmBatchDispatch(
                      &alpha, ap.data(), &lda, bp.data(), &ldb,
                      &beta, cp.data(), &ldc, group_count, &group_size);
         } else {
+            std::lock_guard<std::mutex> lock(plain_gemm_mutex());
             for (int64_t i = 0; i < ba; ++i) {
                 plain(gm, gn, gk, a + i * m * k, lda,
                       b + (i % bb) * k * n, ldb, c + i * m * n, ldc);
@@ -496,6 +511,7 @@ static ffi::Error GemmBatchDispatch(
                      &alpha, ap.data(), &lda, bp.data(), &ldb,
                      &beta, cp.data(), &ldc, group_count, &group_size);
         } else {
+            std::lock_guard<std::mutex> lock(plain_gemm_mutex());
             for (int64_t i = 0; i < ba; ++i) {
                 plain(gm, gn, gk, &alpha, a + i * m * k, lda,
                       b + (i % bb) * k * n, ldb, &beta,
