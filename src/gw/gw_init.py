@@ -1061,8 +1061,26 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 		logical = min(edge, int(cfg.bands.chi if key.endswith("chi")
 		                        else cfg.bands.sigma))
 		if logical >= nb:
-			log(f"    {what} edge {logical} exempt (at or past the "
-			    f"{nb} bands this WFN carries — cuts nothing).")
+			detail = (
+				f"{what} is truncated at {logical} bands, exactly at/past the "
+				f"{nb}-band WFN extent.  Multiplet closure is NOT CHECKABLE: "
+				"the next physical band is absent, so this is absence of evidence, "
+				"not a clean boundary.  Supply a WFN with at least one spare band "
+				"above this sum edge to certify it.")
+			if mode == "strict":
+				raise _bd.BandWindowDegeneracyError(
+					f"{detail}  This edge was requested BY NAME (`{key}` = "
+					f"{logical}), so unverifiable closure is refused.  Increase the "
+					f"WFN band count, choose a lower certified `{key}`, or set "
+					f"{_BAND_DEGENERACY_ENV}=snap to continue diagnostically.")
+			if mode == "off":
+				log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
+				    "CHECKED.) ***")
+			else:
+				log(f"    *** {detail}  Continuing because this legacy umbrella "
+				    "edge is grandfathered to a warning"
+				    + (f" ({_BAND_DEGENERACY_ENV}={override} was set)."
+				       if override else ".") + " ***")
 			continue
 		gap_mev = float(gaps[logical]) * 13605.693122994
 		if gap_mev > _bd.DEGENERACY_TOL_RY * 13605.693122994:

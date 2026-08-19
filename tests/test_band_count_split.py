@@ -407,13 +407,14 @@ def _cfg_stub(chi, sigma, named, restart=False):
         restart=restart)
 
 
-def _check(chi, sigma, named, *, b4=64, env=None, lines=None):
+def _check(chi, sigma, named, *, b4=64, wfn_nb=None, env=None, lines=None):
     pytest.importorskip("jax")
     from gw import gw_init
     s = _slices(b2=8, b3=40, b4=b4,
                 b4_chi=b4 if chi >= sigma else chi,
                 b4_sigma=b4 if sigma >= chi else sigma)
-    wfn = types.SimpleNamespace(energies=_soc_spectrum(nb=b4))
+    wfn = types.SimpleNamespace(energies=_soc_spectrum(
+        nb=b4 if wfn_nb is None else wfn_nb))
     log = (lines if lines is not None else []).append
     old = os.environ.get("LORRAX_BAND_DEGENERACY")
     if env is None:
@@ -455,7 +456,9 @@ def test_a_clean_edge_on_the_other_count_is_not_a_pass_for_the_bad_one():
     pytest.importorskip("jax")
     from common.band_degeneracy import BandWindowDegeneracyError
     with pytest.raises(BandWindowDegeneracyError) as exc:
-        _check(64, 33, ("number_bands_chi", "number_bands_sigma"))
+        # Two spare WFN bands make chi=64 provably clean, so this cell tests
+        # the intended independent Sigma refusal rather than file-edge absence.
+        _check(64, 33, ("number_bands_chi", "number_bands_sigma"), wfn_nb=66)
     assert "number_bands_sigma" in str(exc.value)
 
 
@@ -492,6 +495,27 @@ def test_a_clean_pair_of_edges_prints_the_numbers_anyway():
     text = "\n".join(lines)
     assert "clean" in text and "min gap" in text
     assert "chi0/W band sum" in text and "Sigma band sum" in text
+
+
+def test_a_named_edge_at_the_wfn_extent_refuses_uncheckable_closure():
+    from common.band_degeneracy import BandWindowDegeneracyError
+
+    with pytest.raises(BandWindowDegeneracyError) as exc:
+        _check(64, 32, ("number_bands_chi", "number_bands_sigma"),
+               b4=64, wfn_nb=64)
+    text = str(exc.value)
+    assert "NOT CHECKABLE" in text
+    assert "one spare band" in text
+    assert "number_bands_chi" in text
+
+
+def test_an_umbrella_edge_at_the_wfn_extent_warns_without_claiming_clean():
+    lines = []
+    _check(64, 32, ("number_bands",), b4=64, wfn_nb=64, lines=lines)
+    text = "\n".join(lines)
+    assert "NOT CHECKABLE" in text
+    assert "grandfathered" in text
+    assert "exempt" not in text
 
 
 def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
