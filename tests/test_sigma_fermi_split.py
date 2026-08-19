@@ -432,6 +432,10 @@ def test_head_body_occupation_match_refuses_mismatch_and_unstamped():
 # ---------------------------------------------------------------------------
 
 from gw.cohsex_sigma import _make_cohsex_kernels, _resolve_Gij
+from gw.ppm_sigma import (
+    _compute_invalid_static_sigma,
+    _invalid_static_coh_by_bracket,
+)
 from gw.wavefunction_bundle import BandSlices, Wavefunctions
 
 
@@ -498,6 +502,60 @@ def _sigma_x_dense_reference(f, psi_xn, psi_xr, psi_yr, psi_yn, V_q):
                                 * f[i])
             out[m, n] = -acc
     return out
+
+
+def test_invalid_static_shared_spatial_matches_legacy_dense_cohsex():
+    """Mode-3 static fallback keeps the old SX+COH algebra at P=1.
+
+    This is deliberately a cross-implementation comparison: the reference is
+    the former decomposed static-COHSEX path, while the production result uses
+    the canonical fused spatial kernel and reduce-scatter projector.
+    """
+    wfns, meta, *_unused, Wc0_q = _sx_fixture()
+    mesh = _mesh_1x1()
+    invalid = np.asarray([[[True, False, True],
+                           [False, True, False],
+                           [True, False, True]]])
+    W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
+    sigma_sx_k, sigma_coh_k, _ = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot))
+    Gij = _resolve_Gij(None, meta, mesh, None)
+    with mesh:
+        legacy = np.asarray(jax.device_get(
+            sigma_sx_k(wfns, Gij, W_static)
+            + sigma_coh_k(wfns, W_static, jnp.zeros_like(W_static))))
+
+    got = _compute_invalid_static_sigma(
+        wfns, jnp.asarray(Wc0_q), jnp.asarray(invalid), meta, mesh)
+    scale = max(float(np.max(np.abs(legacy))), 1.0)
+    np.testing.assert_allclose(got, legacy, rtol=2e-12,
+                               atol=2e-12 * scale)
+
+
+def test_invalid_static_brackets_match_legacy_dense_cohsex():
+    """The memory-bounded bracket diagnostic preserves each disjoint COH part."""
+    wfns, meta, *_unused, Wc0_q = _sx_fixture()
+    mesh = _mesh_1x1()
+    invalid = np.asarray([[[True, True, False],
+                           [True, False, True],
+                           [False, True, True]]])
+    brackets = ((0, 1), (1, _SX_NB))
+    W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
+    _, sigma_coh_k, _ = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot))
+    legacy = []
+    with mesh:
+        for lo, hi in brackets:
+            legacy.append(np.asarray(jax.device_get(sigma_coh_k(
+                wfns, W_static, jnp.zeros_like(W_static),
+                ri_bands=(lo, hi)))))
+    legacy = np.stack(legacy)
+
+    got = _invalid_static_coh_by_bracket(
+        wfns, jnp.asarray(Wc0_q), jnp.asarray(invalid), meta, mesh, brackets)
+    scale = max(float(np.max(np.abs(legacy))), 1.0)
+    np.testing.assert_allclose(got, legacy, rtol=2e-12,
+                               atol=2e-12 * scale)
 
 
 def test_sigma_x_takes_diag_f_and_differs_from_the_integer_projector():
