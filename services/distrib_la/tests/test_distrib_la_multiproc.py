@@ -69,29 +69,15 @@ for _svc in ("lxkit", "distrib_la"):
     if os.path.isdir(_src) and _src not in sys.path:
         sys.path.insert(0, _src)
 
-# CLI multi-rank mode: jax.distributed.initialize must run before ANY
-# XLA-backend touch, so it happens at import time when this module is the
-# entry point of a multi-task launch.  Same order as the contract suite's
-# CLI mode, for the same measured reason (job 7885123): the jax CPU mpi
-# collectives plugin calls MPI_Init_thread unconditionally, so the SLATE
-# warm-up that also initializes MPI must stay on CUDA only.
+# CLI multi-rank mode uses the same runtime boundary as production drivers.
+# This keeps JAX initialization, square-mesh clique warm-up, transport
+# enforcement, FFI gates and ordered finalization in one source of truth.
 if __name__ == "__main__":
-    os.environ.setdefault("JAX_ENABLE_X64", "1")
-    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
-    if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
-        from lxkit.gate import platform_from_env
-        _plat = platform_from_env()
-        if _plat == "CUDA":
-            try:
-                from distrib_la.loader import get_lib as _get_lib
-                _get_lib(_plat).lrx_slate_init_mpi()
-            except Exception as _exc:                          # noqa: BLE001
-                print(f"slate_init_mpi skipped: {_exc}", flush=True)
-        import jax
-        if _plat == "CUDA":
-            jax.distributed.initialize(local_device_ids=[0])
-        else:
-            jax.distributed.initialize()
+    from lxkit.gate import platform_from_env
+    from runtime import initialize_communicator_stack
+    _plat = platform_from_env()
+    _RUNTIME = initialize_communicator_stack(
+        platform="gpu" if _plat == "CUDA" else "cpu")
 
 import distrib_la as D                                        # noqa: E402
 from lxkit.testing import hostile_extents                     # noqa: E402
@@ -881,4 +867,5 @@ def _cli_main():
 
 
 if __name__ == "__main__":
-    sys.exit(_cli_main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(_cli_main)

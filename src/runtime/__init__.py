@@ -152,6 +152,7 @@ def _import_jax():
 __all__ = [
     "initialize_communicator_stack",
     "finalize_process",
+    "run_main_and_finalize",
     "RuntimeStack",
     "collect_startup_facts",
     "format_startup_report",
@@ -787,22 +788,22 @@ def tune_glibc_malloc() -> bool:
 # outside the repo, so the choice has to stay visible in the launch script
 # (docs/dev/mpi_collectives.md).
 #
-# What this function does is make the resolved choice AUDIBLE.  jax's own
+# What this function does is make the resolved choice AUDIBLE and enforce the
+# correctness floor.  jax's own
 # default is gloo, and gloo is not merely slower here -- its reduce-scatter
 # SILENTLY CORRUPTS ~5% of executions with a plausible wrong value and a zero
-# exit code.  A forgotten export must therefore not be a silent event
-# (standing doctrine #3: a demotion may happen, but it must announce itself
-# from the rank it happens on).  One rank-0 line, no branching on transport
-# anywhere else in src/.
+# exit code.  A forgotten export is not a supported demotion: every rank
+# refuses before JAX distributed initialization.  One rank-0 success line,
+# no branching on transport anywhere else in src/.
 
 
 def announce_cpu_collectives() -> None:
-    """Print the resolved CPU collectives implementation once, from rank 0.
+    """Enforce MPI for multi-process CPU and print it once, from rank 0.
 
     No-op for single-process runs and for non-CPU platforms (GPU collectives
-    are NCCL's).  WARNS when a multi-process CPU run has landed on gloo,
-    because that is the corrupting reduce-scatter backend and the failure it
-    produces is silent (see docs/dev/mpi_collectives.md).
+    are NCCL's).  A multi-process CPU run refuses any non-MPI implementation
+    and an unset/nonexistent wrapper because gloo's measured failure is
+    silent data corruption (see docs/dev/mpi_collectives.md).
     """
     if _resolve_proc_count() <= 1:
         return
@@ -818,27 +819,23 @@ def announce_cpu_collectives() -> None:
         return
     impl = os.environ.get(
         "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "gloo").strip().lower() or "gloo"
-    if _resolve_proc_id() != 0:
-        return
-    if impl == "mpi":
-        wrap = os.environ.get("MPITRAMPOLINE_LIB", "")
-        print(f"[runtime] CPU collectives: mpi (MPItrampoline -> "
-              f"{wrap or '<MPITRAMPOLINE_LIB UNSET>'}).", flush=True)
-        if not wrap:
-            print("[runtime] WARNING: JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi "
-                  "with MPITRAMPOLINE_LIB unset — MPItrampoline has no "
-                  "wrapper to load.  See docs/dev/mpi_collectives.md.",
-                  flush=True)
-    else:
-        import sys
-        print(f"[runtime] WARNING: CPU collectives implementation is {impl!r}, "
-              "not 'mpi'.  gloo's reduce-scatter is MEASURED to return wrong "
-              "data silently (~5% of executions, plausible values, rc=0) and "
-              "is 14-30x slower on this fabric.  Export "
-              "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi plus MPITRAMPOLINE_LIB, "
-              "LORRAX_MPI_FORCE_THREAD_MAIN=1 and LORRAX_MPI_FINALIZE_FIX="
-              "skip_atexit — see docs/dev/mpi_collectives.md.",
-              file=sys.stderr, flush=True)
+    if impl != "mpi":
+        raise RuntimeError(
+            f"multi-process CPU collectives resolved to {impl!r}, not 'mpi'. "
+            "This is refused because gloo reduce-scatter is measured to "
+            "return plausible wrong data silently (~5% of executions, rc=0) "
+            "and is 14-30x slower on this fabric.  Use the machine CPU-MPI "
+            "launch recipe in docs/dev/mpi_collectives.md.")
+    wrap = os.environ.get("MPITRAMPOLINE_LIB", "")
+    if not wrap or not os.path.isfile(wrap):
+        raise RuntimeError(
+            "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi requires "
+            "MPITRAMPOLINE_LIB to name an existing adapter; use the machine "
+            "CPU-MPI launch recipe in docs/dev/mpi_collectives.md.  Got "
+            f"{wrap or '<unset>'!r}.")
+    if _resolve_proc_id() == 0:
+        print(f"[runtime] CPU collectives: mpi (MPItrampoline -> {wrap}).",
+              flush=True)
 
 
 def _resolve_proc_count() -> int:
@@ -1269,6 +1266,12 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        jit -- or its silent variant, a compile cache reporting
        ``enabled=True`` while writing zero entries.  Costs one
        ``inspect.signature`` per patched hook.
+    5c. :func:`_enforce_cpu_mpi_thread_multiple` -- after the live CPU client
+       has initialized MPI, query the selected MPItrampoline adapter on every
+       rank and refuse a grant below ``MPI_THREAD_MULTIPLE``.  The async
+       progress setting is only a request; this is the check that it worked.
+       It must precede clique construction because XLA can issue collectives
+       from executor threads.
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -1340,6 +1343,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     bootstrap(platform=platform)
     # -- 5b -----------------------------------------------------------------
     _enforce_supported_jax(say)
+    # -- 5c -----------------------------------------------------------------
+    _enforce_cpu_mpi_thread_multiple(say)
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -1439,9 +1444,9 @@ def finalize_process(rc: int = 0):
     The hard exit is not a workaround bolted on a mystery: the same
     mechanism (``os._exit`` after ``main()``) is what the fastloop's interim
     GW_WRAPPER proved green on the certified cold runs (job 7884936) while
-    the bare interpreter exit hung.  Call it from a driver's ``__main__``
-    block with the return code of ``main()``; ``gw.gw_jax`` — the one chain
-    driver measured to hang — is the adopter.
+    the bare interpreter exit hung.  Core drivers enter through
+    :func:`run_main_and_finalize`, which preserves failures and calls this
+    function in one place.
     """
     import atexit
     import sys
@@ -1488,6 +1493,78 @@ def finalize_process(rc: int = 0):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(int(rc))
+
+
+def run_main_and_finalize(main, argv=None) -> None:
+    """Run one CLI boundary and always enter :func:`finalize_process`.
+
+    Core drivers initialize JAX distributed state at module startup.  A bare
+    ``SystemExit(main())`` therefore is not a harmless Python convention: it
+    bypasses the measured, ordered MPI/JAX/FFI shutdown above.  Keeping the
+    return-code and exception normalization here prevents each driver from
+    growing a subtly different teardown wrapper.
+
+    ``argv`` is optional so both ``main()`` and ``main(argv)`` entry points
+    use the same boundary.  ``SystemExit`` raised by argparse or a nested
+    driver retains its integer status; a message-valued exit is printed and
+    becomes status 1.  Unexpected exceptions retain their traceback.  At P>1
+    an installed fail-fast hook owns unexpected exceptions and nonzero
+    ``SystemExit``: it exits immediately without collective teardown, because
+    peers may already be blocked in work this rank will never join.  Ordered
+    finalization is reserved for normal returns, zero-valued ``SystemExit``,
+    and P=1 failures.  This function normally does not return because either
+    path ends with ``os._exit``.
+    """
+    import operator
+    import sys
+    import traceback
+
+    try:
+        rc = main() if argv is None else main(argv)
+    except SystemExit as exc:
+        message_exit = False
+        if exc.code is None:
+            rc = 0
+        else:
+            try:
+                rc = operator.index(exc.code)
+            except TypeError:
+                message_exit = True
+                rc = 1
+        if (rc != 0 and _resolve_proc_count() > 1
+                and getattr(sys, "_lorrax_failfast_installed", False)):
+            # Driver validation commonly raises SystemExit(message).  Such a
+            # failure can be rank-local (filesystem, parse, or input state),
+            # so a nonzero exit has the same no-collective-teardown contract
+            # as an unexpected exception.
+            sys.excepthook(type(exc), exc, exc.__traceback__)
+            os._exit(1)
+        if message_exit:
+            print(exc.code, file=sys.stderr, flush=True)
+    except BaseException:                                  # CLI boundary
+        exc_info = sys.exc_info()
+        if (_resolve_proc_count() > 1
+                and getattr(sys, "_lorrax_failfast_installed", False)):
+            # Do not translate this into an rc and enter finalize_process():
+            # its effects barrier / distributed shutdown are collective and
+            # can hang when only one rank failed.  The installed hook prints
+            # the rank-tagged traceback, flushes both streams and os._exit(1).
+            sys.excepthook(*exc_info)
+            # The LORRAX hook does not return.  Keep the safety property if a
+            # test or embedding application replaced it after installation.
+            os._exit(1)
+        traceback.print_exception(*exc_info)
+        rc = 1
+    if rc is None:
+        rc = 0
+    else:
+        try:
+            rc = operator.index(rc)
+        except TypeError:
+            print(f"[runtime] driver returned non-integer status {rc!r}; "
+                  "exiting with status 1.", file=sys.stderr, flush=True)
+            rc = 1
+    finalize_process(rc)
 
 
 # ---------------------------------------------------------------------------
@@ -1559,6 +1636,61 @@ def _enforce_supported_jax(say) -> None:
     rather than swallowed.
     """
     _enforce_jax_support(announce=say)
+
+
+def _enforce_cpu_mpi_thread_multiple(say) -> None:
+    """Refuse a live multi-process CPU/MPI grant below thread-multiple.
+
+    ``MPICH_ASYNC_PROGRESS=1`` is a launch request, not evidence about the
+    thread level the MPI implementation actually granted.  JAX initializes
+    MPI while constructing the CPU client in :func:`bootstrap`; only after
+    that point may ``MPIABI_Query_thread`` be called.  Query the same pinned
+    adapter XLA selected, on every rank, before any communicator clique or
+    native FFI family can start collective work.
+
+    GPU jobs, P=1 CPU jobs, and non-MPI CPU jobs are outside this check.  The
+    latter is already refused earlier by :func:`announce_cpu_collectives` at
+    P>1; retaining the guard here keeps this function narrow.
+    """
+    import jax
+
+    if jax.default_backend() != "cpu" or int(jax.process_count()) <= 1:
+        return
+    if os.environ.get("JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip() != "mpi":
+        return
+
+    wrapper = os.environ.get("MPITRAMPOLINE_LIB", "").strip()
+    if not wrapper or not os.path.isabs(wrapper) or not os.path.isfile(wrapper):
+        raise RuntimeError(
+            "multi-process CPU/MPI startup cannot query its live thread "
+            f"grant: MPITRAMPOLINE_LIB={wrapper!r} is not an absolute file")
+
+    import ctypes
+
+    try:
+        adapter = ctypes.CDLL(wrapper, mode=ctypes.RTLD_LOCAL)
+        query = adapter.MPIABI_Query_thread
+        query.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        query.restype = ctypes.c_int
+        provided = ctypes.c_int(-1)
+        status = int(query(ctypes.byref(provided)))
+    except Exception as exc:                                  # noqa: BLE001
+        raise RuntimeError(
+            "multi-process CPU/MPI startup could not call "
+            f"MPIABI_Query_thread through {wrapper}: "
+            f"{type(exc).__name__}: {exc}") from exc
+    if status != 0:
+        raise RuntimeError(
+            "multi-process CPU/MPI startup: MPIABI_Query_thread returned "
+            f"status {status} through {wrapper}")
+    if provided.value < 3:  # MPI_THREAD_MULTIPLE
+        raise RuntimeError(
+            "multi-process CPU/MPI startup requires MPI_THREAD_MULTIPLE (3) "
+            "before XLA clique construction, but the live MPI grant is "
+            f"{provided.value}; on Perlmutter source cpu_mpi_env.sh and keep "
+            "its public MPICH_ASYNC_PROGRESS=1 setting")
+    say(f"[runtime] live CPU/MPI thread grant: MPI_THREAD_MULTIPLE "
+        f"({provided.value}), queried through {wrapper}.")
 
 
 def _enforce_required_ffi(mesh) -> None:
@@ -1765,6 +1897,12 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         "finalize_fix": os.environ.get("LORRAX_MPI_FINALIZE_FIX") or None,
         "force_thread_main": os.environ.get(
             "LORRAX_MPI_FORCE_THREAD_MAIN") or None,
+        "pmi_preloaded": any(
+            os.path.basename(entry) == "libpmi.so.0"
+            for entry in os.environ.get("LD_PRELOAD", "")
+            .replace(":", " ").split()),
+        "mpich_async_progress": os.environ.get(
+            "MPICH_ASYNC_PROGRESS") or None,
     }
 
     # -- allocator: the CLIENT, corroborated against the environment -------
@@ -1918,6 +2056,12 @@ def format_startup_report(f: dict) -> list:
             f"LORRAX_MPI_FORCE_THREAD_MAIN={c.get('force_thread_main')!r}; "
             f"the thread-main refusal is handled by warming the cliques from "
             f"the main thread, so the wrapper override is not required.")
+        if c.get("pmi_preloaded") or c.get("mpich_async_progress") is not None:
+            add(f"  The Cray CPU-MPI launch controls resolved to "
+                f"LD_PRELOAD containing libpmi.so.0="
+                f"{bool(c.get('pmi_preloaded'))} and "
+                f"MPICH_ASYNC_PROGRESS="
+                f"{c.get('mpich_async_progress')!r}.")
     else:
         why = ("set to that value" if c.get("impl_was_set")
                else "unset, and gloo is jax's own default")

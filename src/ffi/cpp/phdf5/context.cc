@@ -26,7 +26,6 @@
 //                                       Frontera — scorecard AI/AW)
 //   LORRAX_PHDF5_DUMP_HINTS       (0)   print the hints ROMIO retained
 
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -78,14 +77,14 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
 // concurrently with any main-thread / XLA-thread MPI traffic.  That
 // concurrency is only DEFINED at MPI_THREAD_MULTIPLE.  When *we* init MPI we
 // request MULTIPLE — but when someone else got there first (jax's MPI CPU
-// collectives via MPItrampoline request FUNNELED; an unpatched MPIwrapper
-// grants it), the granted level is whatever they asked for, and the measured
+// collectives via MPItrampoline request FUNNELED), the granted level depends
+// on the site MPI launch policy, and the measured
 // consequence at P=16 x 8 nodes was a ~29% provider-independent segfault/hang
 // rate at the zeta-write/V_q boundary — two threads of one rank concurrently
-// inside MPID_Progress_wait.  The certified fix is the THREAD_MULTIPLE-
-// patched MPIwrapper; this guard exists so the hazardous configuration
-// announces itself up front instead of dying minutes later with a backtrace
-// that names neither cause nor fix.
+// inside MPID_Progress_wait.  The certified launch must make the live grant
+// MULTIPLE: Frontera does so in its patched adapter and Perlmutter through
+// Cray async progress. This guard announces a hazardous grant up front instead
+// of dying minutes later with a backtrace that names neither cause nor fix.
 //
 // MOVED HERE from inside open_ctx (2026-07-30 FFI divergence audit).  It ran
 // only on the first open_file, so the documented eager-init entry point
@@ -100,11 +99,10 @@ static void throw_if_cuda(cudaError_t st, const char* what) {
 // argument, which is what let it live at the lower level.
 //
 // Mechanism shared with the slate twin in cpp/common/mpi_thread_guard.h
-// (2026-08-01 dedup); the hazard sentence and once-flag stay per family.
-static void warn_if_thread_level_insufficient() {
-    static std::atomic<bool> warned{false};
-    lorrax_ffi::mpiguard::warn_if_thread_level_insufficient(
-        "phdf5", "the phdf5 writer thread's collective MPI-IO", warned);
+// (2026-08-01 dedup); the hazard sentence stays per family.
+static void require_thread_multiple() {
+    lorrax_ffi::mpiguard::require_thread_multiple(
+        "phdf5", "the phdf5 writer thread's collective MPI-IO");
 }
 
 void ensure_mpi_initialized() {
@@ -124,7 +122,7 @@ void ensure_mpi_initialized() {
         // own destructors; ordering is fragile.  Our close_file path calls
         // MPI_Finalize explicitly when the last file closes (via a ref count).
     }
-    warn_if_thread_level_insufficient();
+    require_thread_multiple();
 }
 
 // Pull an integer tunable from env, falling back to default.

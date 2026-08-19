@@ -1460,4 +1460,5 @@ from common.collectives import (                       # noqa: E402,F401
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)

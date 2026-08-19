@@ -46,6 +46,8 @@ from common.units import RYD_TO_EV
 from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     BAND_EXTRAPOLATION_ESTIMATORS,
+    BRACKET_SCHEME_DEFAULT,
+    BRACKET_SCHEMES,
 )
 
 
@@ -1740,14 +1742,13 @@ _DEFAULTS = {
     "ppm_invalid_mode": "static_limit",
     # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
     # ON by default since 2026-08-16 (owner ruling).  ON evaluates the
-    # Sigma_c band sum at THREE band counts in one pass -- 80 %, 90 % and
-    # 100 % of the TOTAL **SIGMA** band count (``number_bands_sigma``, NOT
-    # ``number_bands_chi`` and NOT of the conduction range: see
-    # band_extrapolation.BRACKET_FRACTIONS for the measurement, and note
-    # that this line said "~50%, ~75% of the conduction range" while the
-    # code said neither), interior cuts preferring a degeneracy-clean
-    # boundary -- by building three DISJOINT band-bracket Green's functions
-    # per tau against one W(tau), fits S(N) = S_inf + A/N, and USES the
+    # Sigma_c band sum at THREE band counts in one pass.  The default
+    # bracket scheme is 80 %, 90 % and 100 % of the TOTAL **SIGMA** band
+    # count (``number_bands_sigma``, NOT ``number_bands_chi``); the explicit
+    # ``band_extrapolation_bracket_scheme`` below can instead select the
+    # conduction-half / k-mean-energy-midpoint geometry.  Both prefer
+    # degeneracy-clean interior boundaries, build three DISJOINT
+    # band-bracket Green's functions per tau against one W(tau), and USE the
     # extrapolated Sigma_c as the E_nk that self-consistent iterations see.
     # Costs ~3x the Sigma tau-loop wall: G(tau) lives in the centroid basis,
     # so the FFT chain and the psi projection are paid once per bracket
@@ -1811,6 +1812,12 @@ _DEFAULTS = {
     # held-out table and the owner rulings (beta is per-state and is never
     # pooled; the ladder comes from the DFT eigenvalues only).
     "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
+    # WHICH three compile-time band brackets feed the estimator.  Preserve
+    # the incumbent total-band 80/90/100 geometry unless a deck explicitly
+    # selects the conduction-coordinate experiment.  This is a COMPUTE
+    # choice, unlike band_extrapolation_estimator: changing it recompiles and
+    # re-runs Sigma.
+    "band_extrapolation_bracket_scheme": BRACKET_SCHEME_DEFAULT,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
     # when ``mpa_material_class = metal``; refused under insulator.  These
@@ -1903,6 +1910,7 @@ _NORMALIZE_STR = {
     "minimax_energy_reference",
     "sigma_omega_layout", "fermi_reference",
     "band_extrapolation_estimator",
+    "band_extrapolation_bracket_scheme",
     "occ_smearing_family",
     "w_dyson_solver",
     "ppm_invalid_mode",
@@ -2926,6 +2934,14 @@ class DynamicSigmaConfig:
     #: estimators read the same three points the same brackets produce, so
     #: this is a post-processing choice and switching it re-does no Sigma.
     band_extrapolation_estimator: str = BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT
+    #: WHICH compile-time cuts produce the three sums.  The legacy
+    #: ``total_fractions`` geometry remains the default; the explicit
+    #: ``conduction_energy_midpoint`` arm places N1 at half the included
+    #: conduction manifold and N2 at the k-mean DFT-energy midpoint.
+    band_extrapolation_bracket_scheme: str = BRACKET_SCHEME_DEFAULT
+    #: Did the deck name the scheme?  An explicitly named compute control may
+    #: not be silently ignored when extrapolation or all PPM stages are off.
+    band_extrapolation_bracket_scheme_explicit: bool = False
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:
@@ -2955,6 +2971,20 @@ class DynamicSigmaConfig:
                 f"basis) and 'band_index_only' (the incumbent two-parameter "
                 f"S_inf + A/N least squares).  Both consume the SAME three "
                 f"bracket sums; neither changes what is computed.")
+        if self.band_extrapolation_bracket_scheme not in BRACKET_SCHEMES:
+            raise ValueError(
+                f"band_extrapolation_bracket_scheme = "
+                f"{self.band_extrapolation_bracket_scheme!r} is not known; "
+                f"choose one of {BRACKET_SCHEMES}.  This key selects the "
+                f"three band sums that are computed, so no fallback is "
+                f"safe.")
+        if (self.band_extrapolation_bracket_scheme_explicit
+                and not self.band_extrapolation):
+            raise ValueError(
+                "band_extrapolation_bracket_scheme was explicitly named, "
+                "but use_band_extrapolation = false, so no bracket planner "
+                "would consume it.  Remove the scheme key or enable band "
+                "extrapolation.")
 
     def parsed_omega_patches_ev(self):
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
@@ -3942,6 +3972,11 @@ class LorraxConfig:
             band_extrapolation_estimator=str(
                 _g("band_extrapolation_estimator")
                 or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
+            band_extrapolation_bracket_scheme=str(
+                _g("band_extrapolation_bracket_scheme")
+                or BRACKET_SCHEME_DEFAULT).strip().lower(),
+            band_extrapolation_bracket_scheme_explicit=(
+                "band_extrapolation_bracket_scheme" in _named_keys),
             **dict(zip(
                 ("band_extrapolation", "band_extrapolation_explicit"),
                 resolve_band_extrapolation(

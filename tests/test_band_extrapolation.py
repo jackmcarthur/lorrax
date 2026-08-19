@@ -34,8 +34,10 @@ from common.band_degeneracy import (
     boundary_min_gaps,
     snap_cut_to_clean_boundary,
 )
+from common.units import RYD_TO_EV
 from gw.band_extrapolation import (
     BandExtrapolationRefused,
+    extrapolation_h5_payload,
     fit_band_extrapolation,
     format_extrapolation_report,
     plan_band_brackets,
@@ -266,6 +268,75 @@ def test_fractions_are_of_the_total_band_count_not_the_conduction_count():
         "fractions must be of N_max, not of n_cond"
 
 
+def test_conduction_energy_midpoint_is_conduction_relative_and_rectangular():
+    """The opt-in geometry is exactly the measured proposal.
+
+    N1 is half of the INCLUDED conduction bands, not half of all bands.  N2
+    is the nearest rectangular count in the k-mean DFT boundary-energy
+    ladder, not an E_ck mask with a different count at every k.
+    """
+    nk, nb, n_occ = 3, 200, 80
+    band = np.arange(nb, dtype=float)
+    # Non-linear spacing makes the energy midpoint visibly different from
+    # the equal-band-count midpoint; k offsets cancel only after the mean.
+    e = np.stack((band ** 2, band ** 2 + 0.2 * band,
+                  band ** 2 + 10.0), axis=0)
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=n_occ,
+        nb_logical=nb, nb_padded=nb,
+        bracket_scheme="conduction_energy_midpoint")
+
+    assert plan.bracket_scheme == "conduction_energy_midpoint"
+    assert plan.counts[0] == n_occ + round(0.5 * (nb - n_occ)) == 140
+    ebar = np.mean(e, axis=0)
+    target = 0.5 * (ebar[plan.counts[0] - 1] + ebar[nb - 1])
+    expected_n2 = min(
+        range(plan.counts[0] + 1, nb),
+        key=lambda n: (abs(ebar[n - 1] - target), n))
+    assert plan.counts[1] == expected_n2
+    assert plan.counts[1] != round(0.5 * (plan.counts[0] + nb)), \
+        "the middle is in ENERGY, not in band index"
+    assert len(plan.bounds) == 3, "one rectangular bracket plan serves all k"
+    assert np.allclose(
+        plan.boundary_mean_energy_ev,
+        [ebar[n - 1] * RYD_TO_EV for n in plan.counts])
+
+
+def test_conduction_energy_midpoint_chooses_nearest_clean_energy_boundary():
+    """Energy proximity is optimized over clean boundaries, after N1 snaps."""
+    nk, nb, n_occ = 4, 40, 10
+    band = np.arange(nb, dtype=float)
+    e = np.tile(band ** 2, (nk, 1))
+    # Raw N1 is 25.  Put it inside a four-band multiplet, so the actual
+    # midpoint must be recomputed from the snapped N1 rather than the raw one.
+    e[:, 23:27] = e[:, 23][:, None]
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=n_occ,
+        nb_logical=nb, nb_padded=nb,
+        bracket_scheme="conduction_energy_midpoint")
+    gaps = boundary_min_gaps(e, is_full_spectrum=True)
+    assert plan.counts[0] != 25, "the fixture must move the raw N1"
+    assert all(gaps[n] > DEGENERACY_TOL_RY for n in plan.counts[:-1])
+    ebar = np.mean(e, axis=0)
+    target = 0.5 * (ebar[plan.counts[0] - 1] + ebar[nb - 1])
+    candidates = [n for n in range(plan.counts[0] + 1, nb)
+                  if gaps[n] > DEGENERACY_TOL_RY]
+    expected = min(candidates,
+                   key=lambda n: (abs(ebar[n - 1] - target), n))
+    assert plan.counts[1] == expected
+
+
+def test_default_bracket_scheme_is_the_legacy_total_fraction_plan():
+    """Adding a named geometry must not reinterpret an existing deck."""
+    e = _si_like_spectrum()
+    kw = dict(enabled=True, enk_ry=e, n_occ=2,
+              nb_logical=e.shape[1], nb_padded=e.shape[1])
+    implicit = plan_band_brackets(**kw)
+    explicit = plan_band_brackets(**kw, bracket_scheme="total_fractions")
+    assert implicit == explicit
+    assert implicit.bracket_scheme == "total_fractions"
+
+
 def test_pad_bands_land_in_the_last_bracket():
     """A mesh-padded band axis must still be covered end to end."""
     e = _si_like_spectrum()
@@ -457,7 +528,7 @@ def test_disabled_returns_the_trivial_single_bracket_plan():
     assert plan.notes == (), "the trivial plan decides nothing worth noting"
 
 
-def _cohsex_dispatch(explicit, print_fn=None):
+def _cohsex_dispatch(explicit, print_fn=None, *, scheme_explicit=False):
     import types
     from gw.gw_config import ComputeMode
     from gw.sigma_dispatch import compute_sigma_xc
@@ -465,7 +536,11 @@ def _cohsex_dispatch(explicit, print_fn=None):
     cfg = types.SimpleNamespace(
         sigma=types.SimpleNamespace(
             band_extrapolation=True,
-            band_extrapolation_explicit=explicit))
+            band_extrapolation_explicit=explicit,
+            band_extrapolation_bracket_scheme=(
+                "conduction_energy_midpoint" if scheme_explicit
+                else "total_fractions"),
+            band_extrapolation_bracket_scheme_explicit=scheme_explicit))
     kw = {} if print_fn is None else {"print_fn": print_fn}
     return compute_sigma_xc(
         ComputeMode.COHSEX, wfns=None, V_q=None, W_by_role={},
@@ -483,6 +558,15 @@ def test_dispatch_refuses_an_EXPLICIT_key_on_a_non_ppm_mode():
     # The refusal must say the default would have behaved differently, or an
     # operator cannot tell why their neighbour's COHSEX run did not refuse.
     assert "default" in msg
+
+
+def test_dispatch_also_refuses_an_explicit_bracket_scheme_with_no_ppm_stage():
+    """A named compute geometry is no less explicit than the ON switch."""
+    with pytest.raises(NotImplementedError) as exc:
+        _cohsex_dispatch(explicit=False, scheme_explicit=True)
+    msg = str(exc.value)
+    assert "conduction_energy_midpoint" in msg
+    assert "NO stage of this run consumes it" in msg
 
 
 def test_dispatch_AUTO_DISABLES_a_defaulted_key_on_a_non_ppm_mode():
@@ -714,6 +798,24 @@ def test_payload_carries_the_fit_and_its_provenance():
     assert "consistent" in a["verdict"] or "TRUSTWORTHY" in a["verdict"]
     assert len(a["uncertainty_fraction_p90_p99"]) == 2
     assert "planner_notes" in a, "a snap fallback must be readable from the file"
+    assert "band_extrapolation_bracket_scheme" not in a, \
+        "the default artifact stays byte-compatible"
+
+
+def test_conduction_scheme_payload_does_not_claim_total_band_fractions():
+    e = np.tile(np.arange(40, dtype=float) ** 2, (2, 1))
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=10, nb_logical=40, nb_padded=40,
+        bracket_scheme="conduction_energy_midpoint")
+    N = np.asarray(plan.counts, dtype=float)
+    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    attrs = extrapolation_h5_payload(plan, fit)["attrs"]
+    assert attrs["band_extrapolation_bracket_scheme"] == \
+        "conduction_energy_midpoint"
+    assert np.allclose(attrs["bracket_boundary_mean_energy_ev"],
+                       plan.boundary_mean_energy_ev)
+    assert np.asarray(attrs["bracket_fractions"]).size == 0, \
+        "0.80/0.90 would be false provenance for the conduction scheme"
 
 
 def test_sinf_reaches_sigma_mnk_h5_and_off_vs_on_differ(tmp_path):

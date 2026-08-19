@@ -2481,5 +2481,5 @@ if __name__ == "__main__":
     # distributed shutdown and the atexit hooks in ONE stated order on every
     # rank and then ends with ``os._exit``.  Same adopter pattern as
     # ``gw.gw_jax``, which is the sibling driver that has never hung.
-    from runtime import finalize_process
-    finalize_process(main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)

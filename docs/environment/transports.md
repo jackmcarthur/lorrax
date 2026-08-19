@@ -12,10 +12,11 @@ this one is the map.*
 CPU collectives (JAX_CPU_COLLECTIVES_IMPLEMENTATION)
 ├── gloo   (jaxlib default)  — TCP only in this jaxlib; RETIRED for
 │                              multi-process production (silent corruption)
-└── mpi    (LORRAX production) — via MPItrampoline → LORRAX MPIwrapper
-                                 → Intel MPI → libfabric provider:
-                                 ├── mlx  (UCX/RDMA — the default; fast)
-                                 └── tcp  (rtx/mlx4 escape hatch only)
+└── mpi    (LORRAX production) — via MPItrampoline → MPIwrapper ABI adapter
+                                 ├── Frontera: patched adapter → Intel MPI
+                                 │             → mlx (default) or tcp escape
+                                 └── Perlmutter: unmodified adapter → Cray MPICH
+                                                 → Slingshot
 GPU collectives — NCCL (XLA:GPU), plus Cray-MPICH GTL for the FFI
                   libraries' own MPI on Perlmutter
 ```
@@ -51,26 +52,33 @@ When each is used today:
 
 ## 2. What `impl=mpi` requires
 
-All four are load-bearing; the certified composition is
-`config/frontera/templates/gw_dev.sbatch`:
+Three requirements are common to both CPU machines:
 
 | requirement | omit it and |
 |---|---|
 | `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | you are on gloo, i.e. on the corrupting reduce-scatter |
-| `MPITRAMPOLINE_LIB` → the patched MPIwrapper (`config/frontera/build_mpiwrapper.sh`) | MPItrampoline refuses loudly at startup; an **unpatched** wrapper loads silently and restores the ~29 % multi-node crash/hang class (AS.4b: XLA collectives on pool threads vs h5py/mpi4py MPI-IO on the main thread under a FUNNELED grant) |
+| `MPITRAMPOLINE_LIB` → a wrapper built for the site MPI | MPItrampoline refuses loudly at startup; pointing it directly at vendor `libmpi.so` is invalid because MPItrampoline expects MPIwrapper ABI symbols |
 | a `warm_mesh_cliques()` call on every mesh (a **code call site**, owned by `collectives.prepare_mesh()` and the mesh factories) | any clique first created inside a real jit dies on every rank with jaxlib's communicator refusal — 32 refusals at P=16 killed the BSE TDA Lanczos (job 7879458 / gate 7881216) |
-| `LORRAX_MPI_FINALIZE_FIX=skip_atexit` + the overlay `sitecustomize` | every run exits rc=1 **after succeeding** ("MPI routine after finalizing MPICH") |
+| `runtime.run_main_and_finalize()` at every core-driver boundary | ordinary interpreter teardown can make an MPI call after XLA has finalized and turn a successful run into rc=1 |
 
 `MPITRAMPOLINE_LIB` is deliberately **not** auto-defaulted from `src/`:
 it names a build artifact outside the repo, and the hazardous-vs-good
 choice must stay visible in the harness.
 
-The wrapper's scope has shrunk to one override: the always-on
-`MPI_THREAD_MULTIPLE` upgrade. The `MPI_Is_thread_main` override
-(`LORRAX_MPI_FORCE_THREAD_MAIN`) is **superseded** by
-`common.collectives.warm_mesh_cliques()` — leave it unset; setting it only
-masks a missing warm-up call site. Mechanism, evidence and the falsified
-alternatives: `docs/dev/mpi_collectives.md`.
+How `MPI_THREAD_MULTIPLE` is obtained is machine-specific.  Frontera's Intel
+MPI route still uses the always-on upgrade in its patched wrapper.  Perlmutter
+uses an unmodified upstream wrapper plus `MPICH_ASYNC_PROGRESS=1`, which
+Cray MPICH measured to promote XLA's explicit FUNNELED request to MULTIPLE.
+Perlmutter additionally requires the verified Cray
+`LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` before Python so
+Cray PMI is initialized before JAX coordination threads exist; `libpmi2.so.0`
+does not fix that crash.  Both exports are owned by
+`config/perlmutter/cpu_mpi_env.sh`.
+
+The `MPI_Is_thread_main` override (`LORRAX_MPI_FORCE_THREAD_MAIN`) is
+**superseded** everywhere by `common.collectives.warm_mesh_cliques()` — leave
+it unset; setting it only masks a missing warm-up call site. Mechanism,
+evidence and the machine-specific recipes: `docs/dev/mpi_collectives.md`.
 
 ## 3. The Intel MPI provider layer (Frontera)
 
@@ -95,15 +103,16 @@ hand-copy exports.
 
 ## 4. Coexistence with the FFI libraries' own MPI
 
-mpi4py, h5py and the FFI host `.so` link Intel `libmpi.so.12` directly and
-never route through MPItrampoline — they see neither wrapper override.
+The native FFI libraries link the site MPI directly and do not route through
+MPItrampoline — they see no MPIwrapper override.
 `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` call
 `MPI_Init_thread(MULTIPLE)` only when nothing initialized MPI first, so
-they coexist with XLA's init by construction. The phdf5 open **warns when
-the granted thread level is below MULTIPLE** — that warning firing means
-the wrapper is not on the path and the ~29 % race regime is back.
+they coexist with XLA's init by construction. They **abort the MPI world
+before their first family collective when the live grant is below MULTIPLE**.
+Multi-process CPU/MPI startup now queries the same live grant before XLA
+communicator-clique construction, so a bad grant normally refuses earlier.
 
-On Perlmutter, GPU-aware Cray MPICH (`MPICH_GPU_SUPPORT_ENABLED=1` +
-`libmpi_gtl_cuda.so.0` preload) serves the FFI libraries' collectives —
-Cray-specific knobs with no OpenMPI/UCX equivalent
-([Perlmutter](machines/perlmutter.md)).
+On Perlmutter GPU runs, GPU-aware Cray MPICH
+(`MPICH_GPU_SUPPORT_ENABLED=1` + `libmpi_gtl_cuda.so.0` preload) serves the
+FFI libraries' collectives. CPU runs use `MPICH_GPU_SUPPORT_ENABLED=0` and
+must not acquire the CUDA GTL ([Perlmutter](machines/perlmutter.md)).

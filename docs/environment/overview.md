@@ -12,7 +12,7 @@ This section replaces the old `ENVIRONMENT_COMPREHENSIVE.md`. The pages:
 | this page | the layered runtime stack, JAX configuration, troubleshooting |
 | [Collective transports](transports.md) | gloo vs `impl=mpi` vs NCCL, with the measured verdicts |
 | [Frontera (TACC)](machines/frontera.md) | machine facts, cold start, build recipes, vendoring ledger |
-| [Perlmutter (NERSC)](machines/perlmutter.md) | Shifter module, FFI staging, what is and is not tested there |
+| [Perlmutter (NERSC)](machines/perlmutter.md) | GPU and CPU-MPI launch, FFI staging, rank-thread affinity, and what is and is not tested there |
 
 Three references deliberately stay **outside** this section — see the
 [register](../index.md#register) for the full ownership map:
@@ -486,7 +486,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
 | `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` and the A–F planner report; lower `band_chunk_size`, `r_chunk_size`, or `gflat_chunk_size` for Peaks A/C/D, and `vq_g_chunk_size` only for the Vq kernel's inner G workspace; zero selects the live auto policies documented in [memory-model](../architecture/memory-model.md) |
 | `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated the pool — confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and no user `MEM_FRACTION` override (§2.1) |
-| every run exits rc=1 **after** succeeding (CPU/MPI) | the overlay `sitecustomize` + `LORRAX_MPI_FINALIZE_FIX=skip_atexit` are not on the path ([transports](transports.md)) |
+| a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |
 | stale JIT cache `KeyError` warnings | clear the directory `common.jax_compile_cache` actually used — that is `$ISDF_JAX_CACHE_DIR` (see §2), **not** `$JAX_COMPILATION_CACHE_DIR`. The run's startup block prints the resolved path; use that. |

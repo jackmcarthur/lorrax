@@ -49,7 +49,9 @@ catch mutation 3 (deleting one of six sites still left five); it is now a
 per-function minimum, which does.
 """
 import ast
+import ctypes
 import os
+import sys
 
 import pytest
 
@@ -58,6 +60,143 @@ import runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "src")
+
+
+@pytest.mark.parametrize("relative", [
+    "centroid/kmeans_cli.py",
+    "psp/get_dipole_mtxels.py",
+    "gw/kin_ion_io.py",
+    "gw/gw_jax.py",
+    "bse/bse_jax.py",
+    "bandstructure/htransform.py",
+    "bse/exciton_bands.py",
+])
+def test_every_core_driver_uses_the_shared_finalize_boundary(relative):
+    tree = ast.parse(open(os.path.join(_SRC, relative), encoding="utf-8").read())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_main_and_finalize"
+    ]
+    assert len(calls) == 1, relative
+
+
+@pytest.mark.parametrize("outcome, expected", [
+    (None, 0),
+    (7, 7),
+    (SystemExit(), 0),
+    (SystemExit(3), 3),
+    (SystemExit("bad input"), 1),
+    (RuntimeError("boom"), 1),
+])
+def test_shared_finalize_boundary_preserves_failure_status(
+        monkeypatch, capsys, outcome, expected):
+    seen = []
+    monkeypatch.setattr(runtime, "finalize_process", seen.append)
+    monkeypatch.setattr(runtime, "_resolve_proc_count", lambda: 1)
+
+    def main():
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    runtime.run_main_and_finalize(main)
+    assert seen == [expected]
+    captured = capsys.readouterr()
+    if isinstance(outcome, RuntimeError):
+        assert "RuntimeError: boom" in captured.err
+    if isinstance(outcome, SystemExit) and isinstance(outcome.code, str):
+        assert outcome.code in captured.err
+
+
+def test_shared_boundary_delegates_rank_local_failure_to_failfast(
+        monkeypatch):
+    """A P>1 RuntimeError must never enter collective ordered teardown."""
+    seen = []
+
+    class FailFastExit(Exception):
+        pass
+
+    def hook(exc_type, exc_value, exc_tb):
+        seen.append((exc_type, str(exc_value), exc_tb is not None))
+        raise FailFastExit
+
+    monkeypatch.setattr(runtime, "finalize_process",
+                        lambda rc: pytest.fail("ordered teardown was entered"))
+    monkeypatch.setattr(runtime, "_resolve_proc_count", lambda: 4)
+    monkeypatch.setattr(sys, "excepthook", hook)
+    monkeypatch.setattr(sys, "_lorrax_failfast_installed", True, raising=False)
+
+    with pytest.raises(FailFastExit):
+        runtime.run_main_and_finalize(
+            lambda: (_ for _ in ()).throw(RuntimeError("rank-local boom")))
+    assert seen == [(RuntimeError, "rank-local boom", True)]
+
+
+@pytest.mark.parametrize("exc", [SystemExit(3), SystemExit("bad input")])
+def test_shared_boundary_delegates_nonzero_system_exit_to_failfast(
+        monkeypatch, exc):
+    """A P>1 validation exit must not enter collective ordered teardown."""
+    seen = []
+
+    class FailFastExit(Exception):
+        pass
+
+    def hook(exc_type, exc_value, exc_tb):
+        seen.append((exc_type, str(exc_value), exc_tb is not None))
+        raise FailFastExit
+
+    monkeypatch.setattr(runtime, "finalize_process",
+                        lambda rc: pytest.fail("ordered teardown was entered"))
+    monkeypatch.setattr(runtime, "_resolve_proc_count", lambda: 4)
+    monkeypatch.setattr(sys, "excepthook", hook)
+    monkeypatch.setattr(sys, "_lorrax_failfast_installed", True, raising=False)
+
+    with pytest.raises(FailFastExit):
+        runtime.run_main_and_finalize(
+            lambda: (_ for _ in ()).throw(exc))
+    assert seen == [(SystemExit, str(exc), True)]
+
+
+@pytest.mark.parametrize("provided, should_pass", [(1, False), (2, False),
+                                                    (3, True)])
+def test_cpu_mpi_thread_gate_uses_the_live_grant(
+        monkeypatch, tmp_path, provided, should_pass):
+    wrapper = tmp_path / "libmpiwrapper.so"
+    wrapper.touch()
+    monkeypatch.setenv("JAX_CPU_COLLECTIVES_IMPLEMENTATION", "mpi")
+    monkeypatch.setenv("MPITRAMPOLINE_LIB", str(wrapper))
+
+    class FakeJax:
+        @staticmethod
+        def default_backend():
+            return "cpu"
+
+        @staticmethod
+        def process_count():
+            return 4
+
+    class Query:
+        argtypes = None
+        restype = None
+
+        def __call__(self, pointer):
+            ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int))[0] = provided
+            return 0
+
+    class Adapter:
+        MPIABI_Query_thread = Query()
+
+    monkeypatch.setitem(sys.modules, "jax", FakeJax)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: Adapter())
+    lines = []
+    if should_pass:
+        runtime._enforce_cpu_mpi_thread_multiple(lines.append)
+        assert lines and "MPI_THREAD_MULTIPLE (3)" in lines[0]
+    else:
+        with pytest.raises(RuntimeError, match="live MPI grant"):
+            runtime._enforce_cpu_mpi_thread_multiple(lines.append)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +433,35 @@ def test_mpi_transport_names_the_wrapper():
     out = _text(_facts())
     assert "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi" in out
     assert "/work2/libmpiwrapper.so" in out
+
+
+def test_live_cpu_transport_refuses_gloo_on_every_rank(monkeypatch):
+    monkeypatch.setenv("SLURM_NTASKS", "4")
+    monkeypatch.setenv("SLURM_PROCID", "3")
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    monkeypatch.setenv("JAX_CPU_COLLECTIVES_IMPLEMENTATION", "gloo")
+    with pytest.raises(RuntimeError, match="plausible wrong data silently"):
+        runtime.announce_cpu_collectives()
+
+
+def test_live_mpi_transport_refuses_missing_wrapper(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_NTASKS", "4")
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    monkeypatch.setenv("JAX_CPU_COLLECTIVES_IMPLEMENTATION", "mpi")
+    monkeypatch.setenv("MPITRAMPOLINE_LIB", str(tmp_path / "absent.so"))
+    with pytest.raises(RuntimeError, match="existing adapter"):
+        runtime.announce_cpu_collectives()
+
+
+def test_mpi_transport_reports_cray_launch_controls_when_present():
+    out = _text(_facts(collectives={
+        "applicable": True, "impl": "mpi", "impl_was_set": True,
+        "wrapper": "/global/libmpiwrapper.so", "finalize_fix": None,
+        "force_thread_main": None, "pmi_preloaded": True,
+        "mpich_async_progress": "1"}))
+    assert "LD_PRELOAD containing libpmi.so.0=True" in out
+    assert "MPICH_ASYNC_PROGRESS='1'" in out
 
 
 def test_mpi_without_a_wrapper_warns():

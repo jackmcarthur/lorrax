@@ -2140,5 +2140,5 @@ if __name__ == "__main__":
     # rank and then ends with ``os._exit``, so GC-driven ``__del__``s at
     # shutdown never run at all.  Same pattern as ``bse.exciton_bands``
     # (``b3813d8f``) and ``gw.gw_jax``, the sibling that has never hung.
-    from runtime import finalize_process
-    finalize_process(main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)
