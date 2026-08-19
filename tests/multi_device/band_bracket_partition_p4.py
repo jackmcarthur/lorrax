@@ -76,6 +76,7 @@ def main() -> None:
               flush=True)
 
     from gw.ppm_tau_kernel import _get_sigma_kij_kernel, _get_sigma_tau_kernel
+    from gw.band_extrapolation import plan_band_brackets
     from common.collectives import device_put_process_local
 
     nk, nb, n_mu, m = 8, 12, 8, 4
@@ -107,7 +108,19 @@ def main() -> None:
                 jnp.asarray(0.25, dtype=jnp.float64),
                 jnp.asarray(0.10, dtype=jnp.float64),
                 jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128))
-    brk3 = ((0, 5), (5, 9), (9, nb))
+    # Exercise the production opt-in planner rather than a hand-written
+    # arbitrary partition.  The kernel contract is still only the resolved
+    # bounds; this proves those bounds retain the P=4 leading-axis/sharding
+    # behaviour the estimator relies on.
+    plan = plan_band_brackets(
+        enabled=True,
+        enk_ry=np.tile(np.arange(nb, dtype=float) ** 2, (nk, 1)),
+        n_occ=4, nb_logical=nb, nb_padded=nb,
+        bracket_scheme="conduction_energy_midpoint")
+    brk3 = plan.bounds
+    if rank == 0:
+        print(f"[band-bracket-p4] scheme={plan.bracket_scheme} "
+              f"counts={plan.counts} bounds={plan.bounds}", flush=True)
 
     # ---- 1 + 3: partition, both channel plans, per addressable shard -----
     for merged_x in (True, False):
