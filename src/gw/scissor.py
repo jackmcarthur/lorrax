@@ -8,11 +8,21 @@ tensor; outside the grid we extrapolate the QP correction
 
     ΔE_nk := E_QP_nk − E_DFT_nk  =  ⟨n| Σ_xc − V_xc^DFT |n⟩_k
 
-by a pair of affine laws, refit at each SC iteration — one for the valence
-class and one for the conduction class:
+by class-dependent laws.  The conduction class keeps the affine law refit at
+each SC iteration,
 
-    ΔE_v(E) = α_v · E + β_v
-    ΔE_c(E) = α_c · E + β_c
+    E_QP,c(E_DFT) = α_c · E_DFT + β_c,
+
+while an out-of-range valence state is kept at its DFT position relative to
+the Fermi level,
+
+    E_QP,v − E_F,QP = E_DFT,v − E_F,DFT.
+
+Equivalently every such valence state receives the same rigid displacement
+``E_F,QP - E_F,DFT``.  :func:`fit_scissor` still reports a valence affine fit
+because it is a general diagnostic and has other consumers, but
+:func:`qsgw_out_of_range_energies` deliberately does not use that fit for the
+self-consistent active-window valence tail.
 
 Which bands are valence and which are conduction
 ------------------------------------------------
@@ -49,16 +59,16 @@ Fermi-crossing Kramers pair (bands 9-10) sat in the VALENCE class:
 
 :func:`classify_scissor_bands` derives the three classes from an
 ``OccupationState``'s ``f_kn``; the boundary indices it returns are what
-both the fit masks and :meth:`ScissorFit.predict` use, so a band is
-classified once per iteration and the fit and the prediction cannot
-disagree.
+both the fit masks and :func:`qsgw_out_of_range_energies` use, so a band is
+classified once per iteration and the fit and application cannot disagree.
 
 The scissor is applied at the **eigenvalue level** in the diagonal Σ(E)
-fixed-point: out-of-grid bands receive E_QP = E_DFT + (α·E_DFT + β); the
-QSGW Σ_xc that enters the QP Hamiltonian then evaluates the dynamic
-correlation at this scissor-corrected E_QP.  No matrix-level diagonal-add
-is exposed because the post-self-energy plumbing keeps H replicated, so a
-plain ``H.at[:, idx, idx].add(diag)`` suffices when the caller wants one.
+fixed-point: out-of-grid conduction bands receive the affine law and
+out-of-grid valence bands receive the Fermi displacement above.  The QSGW
+Σ_xc that enters the QP Hamiltonian then evaluates the dynamic correlation
+at this scissor-corrected E_QP.  No matrix-level diagonal-add is exposed
+because the post-self-energy plumbing keeps H replicated, so a plain
+``H.at[:, idx, idx].add(diag)`` suffices when the caller wants one.
 
 Per-band classification
 -----------------------
@@ -68,8 +78,9 @@ whole band is treated as out-of-grid — the diagonal Σ(E) fixed-point clipped
 Σ_c at the ω-boundary for the offending k, which contaminates the QP
 correction at neighbouring k via the band's k-dispersion.  Per-band
 classification gives a discontinuity-free scissor: out-of-grid bands receive
-the affine law uniformly across k, and the fit itself is restricted to data
-from in-grid bands so the contaminated points never enter.
+their class law uniformly across k (rigid Fermi displacement for valence,
+affine fit for conduction), and the fit itself is restricted to data from
+in-grid bands so the contaminated points never enter.
 
 The fit is a REDUCTION OVER k and therefore needs k WEIGHTS
 ----------------------------------------------------------
@@ -202,6 +213,57 @@ class ScissorFit:
             f"rmse={self.rmse_c_ev:.3f} eV)  "
             f"[α=1 ⇔ rigid shift; n = samples, w = full-BZ weight]"
         )
+
+
+def qsgw_out_of_range_energies(
+    E_dft_kn_ev: np.ndarray,
+    fit: ScissorFit,
+    valence_mask_kn: np.ndarray,
+    *,
+    fermi_displacement_ev: float,
+    crossing_mask_kn: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build active-window QSGW candidates for out-of-range diagonals.
+
+    This is the single application policy used by the self-consistent map:
+
+    * valence: ``E_QP = E_DFT + (E_F,QP - E_F,DFT)``;
+    * conduction: ``E_QP = fit.alpha_c * E_DFT + fit.beta_c_ev``;
+    * Fermi-crossing: ``E_QP = E_DFT`` (neither scissor class).
+
+    The valence fields in ``fit`` are intentionally not read.  They remain
+    useful fit diagnostics, but extrapolating a regression obtained from
+    higher-lying valence states into a deep out-of-range shell changes that
+    shell's binding relative to ``E_F``.  The rigid Fermi displacement keeps
+    ``E_band - E_F`` exactly invariant instead.
+
+    This function returns candidates for every entry.  The band-partition
+    primitive remains the sole owner of deciding which candidates are used:
+    protected/in-range diagonals retain the full QSGW Hamiltonian.
+    """
+    E = np.asarray(E_dft_kn_ev, dtype=np.float64)
+    valence = np.asarray(valence_mask_kn, dtype=bool)
+    if E.shape != valence.shape:
+        raise ValueError(
+            "qsgw_out_of_range_energies: E_DFT and valence mask must have "
+            f"the same shape; got {E.shape} and {valence.shape}.")
+    shift = float(fermi_displacement_ev)
+    if not np.isfinite(shift):
+        raise ValueError(
+            "qsgw_out_of_range_energies: fermi_displacement_ev must be "
+            f"finite; got {shift!r}.")
+
+    valence_qp = E + shift
+    conduction_qp = float(fit.alpha_c) * E + float(fit.beta_c_ev)
+    out = np.where(valence, valence_qp, conduction_qp)
+    if crossing_mask_kn is not None:
+        crossing = np.asarray(crossing_mask_kn, dtype=bool)
+        if crossing.shape != E.shape:
+            raise ValueError(
+                "qsgw_out_of_range_energies: E_DFT and crossing mask must "
+                f"have the same shape; got {E.shape} and {crossing.shape}.")
+        out = np.where(crossing, E, out)
+    return out
 
 
 def apply_conduction_scissor_to_tail(
@@ -717,4 +779,5 @@ __all__ = [
     "fit_scissor",
     "full_bz_k_weights",
     "k_star_weights",
+    "qsgw_out_of_range_energies",
 ]
