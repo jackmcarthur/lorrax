@@ -1015,7 +1015,8 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
 
 @pytest.mark.parametrize("solve", ("loewner", "companion", "thiele"))
 @pytest.mark.parametrize(
-    "head", ("dft_direct", "bgw_q0shift", "qsgw_direct", "qsgw_schur"))
+    "head", ("dft_direct", "bgw_q0shift", "bse_resolvent_micro",
+             "qsgw_direct", "qsgw_schur"))
 def test_pole_solver_head_models_are_certified_store_protocols(head, solve):
     """Every producer model tag must survive the reader allowlist."""
     assert f"{head}_{solve}" in MS._HEAD_FIT_MODELS
