@@ -411,7 +411,6 @@ class RereadPsiGStore(PsiGStore):
 def build_psi_G_store(
     *,
     wfn,
-    sym,
     mesh_xy: Mesh,
     meta,
     band_chunk_ranges,
@@ -424,12 +423,7 @@ def build_psi_G_store(
     ``backend='auto'`` picks the FFI phdf5 path when multi-rank GPU +
     mesh + .so present; falls back to eager h5py otherwise.  CPU and
     single-process tests get the eager path automatically.
-
-    ``sym`` is kept in the signature for caller-API back-compat but is
-    ignored — the loader builds its own ``SymMaps`` lazily from the WFN's
-    ``mf_header``.
     """
-    del sym
     loader = wfn  # reuse top-level WfnLoader; opening a second one would
                   # re-slurp wfns/coeffs into host RAM.
     if mode == "host_cache":

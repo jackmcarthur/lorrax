@@ -4,9 +4,9 @@ Design: ``reports/gw_refactor_map_2026-07-01/MEMORY_MODEL_DESIGN.md`` (§1a).
 Substrate: ``SHARDING_RULES.md`` (the trichotomy: μ² → all-P, μ×nb → √P,
 nb² → replicated).
 
-The whole model is two things summed:
+The fit-loop model is two things summed:
 
-    HWM(cr, bc, P) = persistent(P) + max( A, B, C, D, E )
+    HWM_fit(cr, bc, P) = persistent(P) + max( A, B, C, D )
 
 **persistent(P)** — resident across the entire r-chunk loop (the *floor*):
 
@@ -23,29 +23,33 @@ co-exist, so the HWM takes a ``max``, not a sum:
     B  CCT + Cholesky   C_q + full-(μ,μ) pair density
     C  fit_one_rchunk   slots·(nk,ns²,μ,cr) + Z_q (nq,μ,cr)   knob: chunk_r  ← binder
     D  accumulate       accumulate FFT box (cs, n_rtot)       knob: gflat_chunk_size
-    E  V_q per tile     V_acc + resharded ζ slabs   (own base, post-fit)
+Post-fit stages use their own smaller base because ``L_q`` and ``gflat_acc``
+have been released:
+
+    E  V_q per tile     V_acc + resident/resharded ζ slabs
+    F  tensor write     max(V/W0 tile, G-flat ζ tile)
 
 Two-phase picker (§2):
 
     Phase 1 — rank floor.  ``persistent(P)`` is un-chunkable; the smallest
               mesh ``P`` with ``persistent(P) ≤ util·budget`` is ``P_min``.
               If the requested ``P < P_min`` → infeasible.
-    Phase 2 — dial ``chunk_r`` down from ``n_rtot`` against Stage C's slope
-              so ``HWM ≤ util·budget``; report the binding stage.
+    Phase 2 — choose the four live chunks (band, r, q-solve and G-flat
+              accumulation), then report the binding stage across A–F.
 
 Bispinor (§1b): the fit loop (A–D) runs the charge channel only — the 3
 transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
 never the binder.  The model carries the spinor factor ``ns² = nspinor²``
 in the pair density and does not size the transverse channels separately.
 
-Everything above is closed-form shape algebra.  TWO terms are MEASURED (§6):
-the Stage-A/D FFT box (``_fft_box_bytes`` compiles the production FFT helper
-at the real shape/mesh and reads XLA's buffer peak *plus* the cuFFT plan
-workspace, via ``common.fft_helpers.query_fft_peak_bytes`` ->
-``runtime.aot_memory.aot_kernel_peak_bytes``) and the pair-density ``slots``
-count (3 GPU / 4 CPU, an XLA BufferAssignment fact).  Where a measurement is
-unavailable the model demotes to an analytic bound and ANNOUNCES it from the
-rank it happened on — an un-measured term here is a silent OOM later.
+Most terms above are closed-form shape algebra.  Stage A compiles the
+production FFT helper at the real shape/mesh and queries XLA's buffer peak
+plus cuFFT plan workspace through
+``common.fft_helpers.query_fft_peak_bytes``.  Stage D's two-box factor and
+the pair-density ``slots`` count (3 GPU / 4 CPU) are HLO-calibrated facts.
+Where the Stage-A query is unavailable the model demotes to an analytic bound
+and ANNOUNCES it from the rank it happened on — an unmeasured term here is a
+silent OOM later.
 """
 from __future__ import annotations
 
@@ -139,7 +143,7 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
 
 
 def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
-    """Per-rank bytes of the centroid-load FFT box (Stage A / D).
+    """Per-rank bytes of the centroid-load FFT box (Stage A).
 
     MEASURED whenever a real ``Mesh`` is available: compiles the production
     FFT helper at this shape/sharding and reads XLA's buffer peak PLUS the
@@ -166,7 +170,7 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
         why = f"mesh_xy is a {type(mesh_xy).__name__}, not a jax Mesh"
     # Analytic fallback (bands sharded over all P; ns + FFT axes replicated).
     _announce(f"fft-box-unmeasured:{why}",
-              f"Stage A/D FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
+              f"Stage A FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
               f"box-copy bound because {why}.  It does NOT include cuFFT plan "
               f"workspace, so this planner will UNDER-predict FFT-box stages")
     return _c128(bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR

@@ -918,7 +918,7 @@ def fit_zeta_to_h5(
     # then its host tiles are released before the r-chunk loop.
     from common.psi_G_store import build_psi_G_store
     psi_G_store = build_psi_G_store(
-        wfn=wfn, sym=sym, mesh_xy=mesh_xy, meta=meta,
+        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
         mode=gspace_mode,

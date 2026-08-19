@@ -2127,11 +2127,11 @@ def build_wavefunction_bundle(
 
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
-	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None, **_ignored,
+	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
 ):
 	"""ISDF pipeline (non-restart path reads top-to-bottom):
 
-	  1. ``compute_optimal_chunks`` → chunk plan (band/r/q chunk sizes).
+	  1. ``plan_gflat_chunks`` → band/r/q/G-flat chunk plan.
 	  2. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
 	  3. ``fit_zeta`` → ζ.h5 (consumes ψ slices for pair density).
 	  4. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).

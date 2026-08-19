@@ -3277,7 +3277,7 @@ class MemoryConfig:
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     zct_stage_cap_gb: float | None
-    gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
+    gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
 

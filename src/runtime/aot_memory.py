@@ -18,7 +18,8 @@ will build — no version drift between query and execution.
 Public API: :func:`aot_kernel_peak_bytes` ``(compiled, platform=None) ->
 AotPeakBreakdown``; compare ``.total`` against the per-rank budget.  The
 production caller is ``common.fft_helpers.query_fft_peak_bytes``, which is
-what the G-flat planner's Stage-A/D FFT-box term calls.
+what the G-flat planner's Stage-A FFT-box term calls.  Stage D uses its
+separately HLO-calibrated two-box factor.
 
 Works on CPU and GPU.  On a non-CUDA platform there are no cuFFT plans, so
 the scratch term is an exact 0 — NOT a demotion.  That has to be decided
