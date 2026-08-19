@@ -148,8 +148,6 @@ def compute_all_V_q(
     mc_average_vcoul_body: bool = True,
     bare_coulomb_cutoff: float | None = None,
     bgw_v_grid_fn=None,
-    mu_chunk_size: int | None = None,   # legacy arg (allgather path); ignored
-    q_batch_size: int | None = None,    # legacy arg (allgather path); ignored
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
@@ -168,8 +166,6 @@ def compute_all_V_q(
 
     Working-set memory is bounded by ``g_chunk_size`` (per-q G-chunk)
     and the mesh-sharded ζ slabs; there is no separate byte budget knob.
-    ``mu_chunk_size`` / ``q_batch_size`` are inert legacy args (no
-    caller passes them; the G-flat chooser is trivial).
     """
     # G-flat dispatch — when the loader carries the new per-q sphere
     # components, hand off to the G-flat orchestrator (sync per-q loop;

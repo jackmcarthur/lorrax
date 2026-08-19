@@ -176,12 +176,9 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    take" currently depends on an env var.  Raising it is already a
    deliberate, logged act — which is why it ranks below the (now-done)
    rcond/ridge promotion.
-2. `ISDF_CHUNK_TARGET_UTILIZATION` / `ISDF_ZCT_STAGE_CAP_GB` /
-   `ISDF_ZCT_STAGE_CAP_FRAC` → memory-section keys, for symmetry with
-   `band_chunk_size` / `r_chunk_size` / `gflat_chunk_size`, which are
-   already keys (planner dials in `gw_config.py`: utilization target
-   clamped to [0.85, 1.0]; absolute/fractional caps on the ζ-contraction
-   stage transient).
+2. `ISDF_CHUNK_TARGET_UTILIZATION` → a memory-section key, for symmetry
+   with `band_chunk_size` / `r_chunk_size` / `gflat_chunk_size`, which are
+   already keys (the planner clamps a positive override to [0.85, 1.0]).
 3. `LORRAX_WFN_BACKEND` (`""` → config/auto; forces `eager` \| `phdf5`,
    `services/wfn_loader/src/wfn_loader/loader.py`) → the `slab_io`/backend config
    section, so the read path is recorded alongside the write path.

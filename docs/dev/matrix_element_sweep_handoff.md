@@ -185,10 +185,9 @@ harder one already.
   deliberate: garbage in pad rows can pollute IFFT precision even when a mask
   would zero it at the einsum.
 * **Lifetime**: host buffers must stay valid for the whole enclosing jit —
-  the callback fires *asynchronously* inside the scan. `psi_G_store` relies on
-  `end_rchunk` running after `block_until_ready` in an `isdf_fitting.py`
-  `finally:`. Reproduce that discipline or you get a use-after-free with no
-  symptom at small scale.
+  the callback fires *asynchronously* inside the scan. `isdf_fitting.py`
+  blocks on the completed ψ(r) cache before closing `psi_G_store`. Reproduce
+  that discipline or you get a use-after-free with no symptom at small scale.
 
 **`with_sharding_constraint` as the collective.** Do not hand-roll the
 all-gather. Carry the n side at `P(None, ('x','y'), ...)` for `O ∘ ψ` and

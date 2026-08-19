@@ -158,7 +158,6 @@ def fit_zeta_to_h5(
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
     *,
-    gspace_mode: str = "host_cache",
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     distributed_cholesky: str = "auto",
@@ -215,12 +214,6 @@ def fit_zeta_to_h5(
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
-        gspace_mode: ``"host_cache"`` (default) loads all ψ(G) band-chunks
-                     into host RAM once at startup and pulls per-bc shards
-                     into the jit via io_callback.  ``"file_reread"`` drops
-                     the host cache between r-chunks and re-reads via
-                     phdf5 collective I/O.  In both modes the jit never
-                     holds more than one bc's ψ(G) on device.
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
 
@@ -882,11 +875,6 @@ def fit_zeta_to_h5(
     kgrid_arr = np.array(meta.kgrid)
     kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
 
-    # ``gspace_mode`` (cohsex.in ``gspace_mode``; see
-    # ``GspaceIO`` enum): ``host_cache`` is the default; ``file_reread``
-    # rebuilds the per-rank host ψ(G) buffer at each r-chunk for
-    # multi-TB WFN.h5 systems that can't hold ψ(G) resident.
-
     # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
     # size ``band_chunk_size`` plus one remainder chunk.  This gives
     # the read/FFT pipeline and the pair-density einsum exactly
@@ -918,25 +906,19 @@ def fit_zeta_to_h5(
     # then its host tiles are released before the r-chunk loop.
     from common.psi_G_store import build_psi_G_store
     psi_G_store = build_psi_G_store(
-        wfn=wfn, sym=sym, mesh_xy=mesh_xy, meta=meta,
+        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
-        mode=gspace_mode,
     )
 
     # Hoist the full-grid ψ(G)->ψ(r) transforms once.  The cache's band
     # axis is sharded over the complete ('x','y') mesh; no rank holds the
     # full window at P>1, and there is no μ axis (hence no N_μ² object).
-    # ``file_reread`` still has a bounded host lifetime: populate once for
-    # this build, block until every io_callback has drained, then free it.
+    # Block until every io_callback has drained before freeing the host tiles.
     with timing.section("zeta_fit.build_psi_r_cache"):
-        psi_G_store.begin_rchunk(0, n_rtot)
-        try:
-            psi_r_cache = build_psi_r_cache_sm(
-                psi_G_store, mesh_xy=mesh_xy)
-            psi_r_cache.block_until_ready()
-        finally:
-            psi_G_store.end_rchunk()
+        psi_r_cache = build_psi_r_cache_sm(
+            psi_G_store, mesh_xy=mesh_xy)
+        psi_r_cache.block_until_ready()
     _cache_local_bytes = sum(
         int(shard.data.size) * int(shard.data.dtype.itemsize)
         for shard in psi_r_cache.addressable_shards)
@@ -1309,8 +1291,7 @@ def fit_zeta_to_h5(
         from file_io.isdf_header import mark_zeta_done
         mark_zeta_done(output_file)
 
-    # Free the host tiles (host_cache mode only; file_reread's tiles
-    # are already empty after the final end_rchunk).  The phdf5 reader
+    # Idempotent after the post-cache-build close above.  The phdf5 reader
     # itself is cached at module level and survives.
     psi_G_store.close()
 

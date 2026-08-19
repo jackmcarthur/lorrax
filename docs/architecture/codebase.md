@@ -636,7 +636,7 @@ main                                       [gw/gw_jax.py]
 |------|-----------------|
 | **Main driver** | `gw/gw_jax.py : main` |
 | **Parse cohsex.in** | `gw/gw_config.py : LorraxConfig.from_input_file` |
-| **Chunk auto-sizing** | `gw/gw_init.py : compute_optimal_chunks`, `prepare_isdf_and_wavefunctions` |
+| **Chunk auto-sizing** | `gw/gflat_memory_model.py : plan_gflat_chunks`; called once by `gw/gw_init.py : prepare_isdf_and_wavefunctions` |
 | **Minimax / sigma quad config** | `gw/minimax_config.py : MinimaxConfig`, `SigmaQuadratureConfig` |
 | **Build `Meta`** | `common/meta.py : Meta.from_system` |
 | **Build wavefunction bundle** | `gw/wavefunction_bundle.py : build_wavefunctions_from_full` |

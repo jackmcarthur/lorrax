@@ -14,8 +14,8 @@ than adapted — they pinned the behaviour of code that no longer exists,
 and a test that survives the deletion of its subject is testing something
 else.  What remains, and is still worth pinning:
 
-1. Both retired deck keys are refused with a targeted removal message, so
-   an old deck cannot pretend it still selects an HDF5 route.
+1. Retired transport/lifecycle deck keys are refused with a targeted removal
+   message, so an old deck cannot pretend it still selects a deleted route.
 2. ``LorraxConfig`` no longer carries a transport selector at all.
 3. The MPI launcher/singleton probes, which moved from ``gw.gw_config``
    (L1) down to ``file_io._slab_io_ffi`` (L3) with the availability
@@ -65,9 +65,11 @@ def _config(tmp_path, extra: str = "", name: str = "slab_io.in",
     "slab_io = auto",
     "use_ffi_io = false",
     "use_ffi_io = true",
+    "gspace_mode = host_cache",
+    "gspace_mode = file_reread",
 ])
 def test_retired_transport_keys_are_refused(tmp_path, line):
-    """An old deck must remove selectors for HDF5 routes that no longer exist."""
+    """An old deck must remove selectors for routes that no longer exist."""
     with pytest.raises(ValueError, match="must be removed"):
         _config(tmp_path, line + "\n")
 
@@ -82,6 +84,8 @@ def test_config_carries_no_transport_selector(tmp_path):
     cfg = _config(tmp_path)
     assert not hasattr(cfg.backend, "slab_io")
     assert not hasattr(cfg, "use_ffi_io")
+    assert not hasattr(cfg.backend, "gspace_io")
+    assert not hasattr(cfg, "gspace_mode")
 
 
 def test_unknown_key_check_still_sees_real_typos(tmp_path):
@@ -100,6 +104,7 @@ def test_unknown_key_check_still_sees_real_typos(tmp_path):
 def test_gw_config_no_longer_defines_the_tier_vocabulary(tmp_path):
     """The enum, the router and the seven refusals are gone from L1."""
     for name in ("SlabIOBackend", "resolve_slab_io_backend",
+                 "GspaceIO",
                  "_route_cpu_slab_io", "_route_gpu_slab_io",
                  "_validate_slab_io_key", "_refuse_explicit_h5py_allgather",
                  "_refuse_slab_io_no_parallel_writer",

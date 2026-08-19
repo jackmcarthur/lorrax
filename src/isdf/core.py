@@ -4806,4 +4806,4 @@ def _band_norms_slice(
 # contiguous ``(nk, nb/P, ns, nx, ny, nz)`` numpy array — and the
 # kernel body slices per-bc (and optionally per-k) subsets via
 # :func:`common.psi_G_store.PsiGStore._slice_local_tile_bc`.  See that module
-# for the two lifecycle modes (host_cache vs file_reread).
+# for the one-time host-store lifetime.

@@ -283,11 +283,24 @@ def test_no_mesh_fallback_announces(capsys):
     fake_mesh = SimpleNamespace(shape={'x': 4, 'y': 4})
     box = gmm._fft_box_bytes(nk=8, bc=16, ns=2, fft_grid=(10, 10, 10),
                              mesh_xy=fake_mesh, p_xy=16)
-    # 16 bytes * bc * ns * n_rtot / p_xy * 4.0
-    assert box == pytest.approx(16 * 16 * 2 * 1000 / 16 * 4.0)
+    # 16 bytes * nk * bc * ns * n_rtot / p_xy * 4.0
+    assert box == pytest.approx(16 * 8 * 16 * 2 * 1000 / 16 * 4.0)
     out = capsys.readouterr().out
     assert "memory-model" in out and "UNDER-predict" in out, (
         f"the analytic fallback was silent; stdout was {out!r}")
+
+
+def test_no_mesh_fallback_scales_linearly_with_nk(capsys):
+    """The k axis is replicated, not absent from the FFT box."""
+    fake_mesh = SimpleNamespace(shape={'x': 2, 'y': 2})
+    one_k = gmm._fft_box_bytes(
+        nk=1, bc=8, ns=1, fft_grid=(8, 8, 8),
+        mesh_xy=fake_mesh, p_xy=4)
+    seven_k = gmm._fft_box_bytes(
+        nk=7, bc=8, ns=1, fft_grid=(8, 8, 8),
+        mesh_xy=fake_mesh, p_xy=4)
+    assert seven_k == pytest.approx(7 * one_k)
+    capsys.readouterr()
 
 
 def test_announce_once_speaks_then_dedupes(capsys):

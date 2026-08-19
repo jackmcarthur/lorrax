@@ -569,9 +569,9 @@ def test_zero_user_band_pad_in_shard_rejects_strided_band_slice():
 
 
 # ---------------------------------------------------------------------------
-# _slice_local_tile_bc — per-iter host-tile slicer used by the io_callback
-# inside the new c_q_from_psi_sm / z_q_from_psi_sm scan body (Round 6).
-# Built without going through HostPsiGStore so the test stays free of
+# _slice_local_tile_bc — per-iter host-tile slicer used by the one-time
+# ψ(r)-cache builder's io_callback (and the narrow no-cache reference path).
+# Built without going through PsiGStore.__init__ so the test stays free of
 # WfnLoader / Meta plumbing: subclasses PsiGStore, populates _host_tiles
 # directly with a random multi-bc ψ(G) tile, and exercises the slicer.
 # ---------------------------------------------------------------------------
@@ -605,10 +605,6 @@ class _FakePsiGStore(PsiGStore):
         for bpd in bpd_per_bc:
             offsets.append(offsets[-1] + bpd)
         self._bc_band_offsets = tuple(offsets)
-
-    def end_rchunk(self) -> None:
-        self._clear_tiles()
-
 
 def test_slice_local_tile_bc_returns_correct_band_window():
     """Slicer returns each bc's bands of the host tile, padded to bpd_max."""

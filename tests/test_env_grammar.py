@@ -1091,10 +1091,8 @@ def test_env_float_announces_a_bad_value():
     """``ISDF_CHUNK_TARGET_UTILIZATION`` used a bare
     ``except Exception: chunk_utilization = 0.0``.
 
-    Its two siblings twenty lines below (``ISDF_ZCT_STAGE_CAP_GB`` /
-    ``_FRAC``) already announce, with the comment "Swallowing this left the
-    user believing a cap was in force when it was not -- an OOM later, with
-    no clue."  Exactly the same is true of the utilization.
+    A bad value must be announced rather than leaving the user believing a
+    utilization override is in force.
     """
     assert hasattr(gw_config, "env_float")
     log = _Log()
@@ -1112,41 +1110,6 @@ def test_env_float_announces_a_bad_value():
             "ISDF_CHUNK_TARGET_UTILIZATION", 0.0, print_fn=log) == 0.0
     assert "LORRAX SANITY" in log.text, log.text
     assert "high" in log.text and "0.0" in log.text, log.text
-
-
-def test_zct_cap_resolver_states_every_reason_it_is_not_set():
-    assert hasattr(gw_config, "resolve_zct_stage_cap")
-    r = gw_config.resolve_zct_stage_cap
-    log = _Log()
-    # explicit GB wins, clamped to the budget
-    assert r("4", None, per_device_gb=10.0, total_gb=16.0, print_fn=log) == 4.0
-    assert r("40", None, per_device_gb=10.0, total_gb=16.0, print_fn=log) == 10.0
-    assert log.lines == []
-    # fraction of the physical card
-    assert r(None, "0.5", per_device_gb=10.0, total_gb=16.0,
-             print_fn=log) == 8.0
-    # a bad GB value announces
-    log = _Log()
-    assert r("big", None, per_device_gb=10.0, total_gb=16.0, print_fn=log) is None
-    assert "LORRAX SANITY" in log.text
-    # a bad fraction announces
-    log = _Log()
-    assert r(None, "half", per_device_gb=10.0, total_gb=16.0,
-             print_fn=log) is None
-    assert "LORRAX SANITY" in log.text
-    # ...and the CPU case: total_gb=0 means there is no card to take a
-    # fraction OF.  Previously the whole branch was skipped by an
-    # ``and jax.default_backend() in ("gpu","cuda")`` guard, so a user who
-    # set ISDF_ZCT_STAGE_CAP_FRAC on a CPU run got no cap and no message.
-    log = _Log()
-    assert r(None, "0.5", per_device_gb=10.0, total_gb=0.0,
-             print_fn=log) is None
-    assert "LORRAX SANITY" in log.text, log.text
-    assert "ISDF_ZCT_STAGE_CAP_FRAC" in log.text
-    # unset stays quiet
-    log = _Log()
-    assert r(None, None, per_device_gb=10.0, total_gb=0.0, print_fn=log) is None
-    assert log.lines == []
 
 
 def test_config_uses_the_announcing_numeric_helpers():

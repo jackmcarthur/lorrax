@@ -11,7 +11,7 @@ along the same axes the input file's section comments already use:
     config.sigma_grid  — ω-grid for Σ_c(ω) output
     config.sc          — self-consistency loop knobs (qp_solver = self_consistent)
     config.memory      — chunk sizing
-    config.backend     — FFI/IO backend selection (gspace_io / w_dyson_solver)
+    config.backend     — FFI/linalg backend selection
     config.debug       — debug-only flags & file paths
     config.bse         — BSE interpolation setup (htransform-driven)
     config.paths       — output filenames
@@ -150,10 +150,8 @@ def env_float(name: str, default: float, *, print_fn=print,
 
     The same defect class as :func:`env_bool`, one type along.  A
     ``try: float(...) except: default`` leaves the user believing a knob is
-    in force when it is not — the exact failure this file's
-    ``ISDF_ZCT_STAGE_CAP_GB`` handler already carries a comment about
-    ("an OOM later, with no clue"), and which its sibling
-    ``ISDF_CHUNK_TARGET_UTILIZATION`` was still committing.
+    in force when it is not — the exact failure the
+    ``ISDF_CHUNK_TARGET_UTILIZATION`` parser used to commit.
 
     ``refuse=True`` is for knobs that GATE correctness rather than tune
     performance (``LORRAX_FH_ORTHO_TOL``): running with the default while
@@ -180,52 +178,6 @@ def env_float(name: str, default: float, *, print_fn=print,
                      f"falling back to {default}.  The knob is NOT in "
                      f"force. ***")
         return default
-
-
-def resolve_zct_stage_cap(cap_raw, frac_raw, *, per_device_gb: float,
-                          total_gb: float, print_fn=print):
-    """Resolve the ζCᵀ stage cap in GB, or ``None`` when no cap applies.
-
-    Pure — the caller supplies ``total_gb`` (the physical card, ``0.0``
-    when there is no device to take a fraction of, i.e. the CPU backend).
-
-    Every path that ends in "no cap" says why.  The CPU path used to be
-    silent: the fraction branch sat behind
-    ``jax.default_backend() in ("gpu", "cuda")``, so a user who exported
-    ``ISDF_ZCT_STAGE_CAP_FRAC`` on a CPU run got no cap, no clamp and no
-    message — indistinguishable from the knob working.
-    """
-    if cap_raw and str(cap_raw).strip():
-        try:
-            return min(float(per_device_gb),
-                       max(0.0, float(cap_raw)))
-        except ValueError:
-            # Deliberately does NOT fall through to the _FRAC branch: an
-            # explicit absolute cap that cannot be parsed is a user error,
-            # and quietly substituting a different knob's answer for it
-            # would hide the typo behind a plausible number.
-            print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_GB="
-                     f"{cap_raw!r} is not a number; NO stage cap is in "
-                     f"force (ISDF_ZCT_STAGE_CAP_FRAC is not consulted as "
-                     f"a fallback for a malformed explicit cap). ***")
-            return None
-    if not (frac_raw and str(frac_raw).strip()):
-        return None
-    if float(total_gb) <= 0:
-        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
-                 f"{frac_raw!r} is a fraction of the DEVICE's physical "
-                 f"memory, and this backend reports none (total_gb=0) — "
-                 f"so NO stage cap is in force.  Use "
-                 f"ISDF_ZCT_STAGE_CAP_GB for an absolute cap. ***")
-        return None
-    try:
-        frac = max(0.10, min(0.95, float(frac_raw)))
-    except ValueError:
-        print_fn(f"  *** LORRAX SANITY: ISDF_ZCT_STAGE_CAP_FRAC="
-                 f"{frac_raw!r} is not a number; the stage cap is "
-                 f"NOT set. ***")
-        return None
-    return min(float(per_device_gb), frac * float(total_gb))
 
 
 # ---------------------------------------------------------------------------
@@ -774,24 +726,6 @@ class QPSolver(str, enum.Enum):
     FIXED_POINT = "fixed_point"
     SELF_CONSISTENT = "self_consistent"
 
-
-
-class GspaceIO(str, enum.Enum):
-    """How ψ(G) is moved into the ISDF r-chunk loop.
-
-    Both modes keep ψ(G) on host in per-rank band-sharded layout and
-    pull one band-chunk at a time into the jit via io_callback — never
-    more than one bc on device at a time.
-
-    - ``HOST_CACHE`` — read ψ(G) once at startup, keep resident in host
-      RAM for the full run.  Default; fastest.
-    - ``FILE_REREAD`` — rebuild the host buffer at each r-chunk via
-      phdf5 collective read; drop between r-chunks.  Zero persistent
-      host residency (needed for huge systems where host RAM can't
-      hold ψ(G)).
-    """
-    HOST_CACHE = "host_cache"
-    FILE_REREAD = "file_reread"
 
 
 #: The two W Dyson plans (``gw/w_isdf.py``) — the ONLY legal resolved
@@ -1385,17 +1319,6 @@ _DEFAULTS = {
     # NOTE: ``slab_io`` and ``use_ffi_io`` were REMOVED as deck keys on
     # 2026-08-06 — see ``_LEGACY_DECK_KEYS``.  There is one sharded-slab
     # transport and the deck does not choose it.
-    # ψ(G) source for the ISDF r-chunk loop.  Both modes keep ψ(G) on
-    # the HOST in per-rank band-sharded layout and pull one band-chunk
-    # at a time into the jit via io_callback — never more than one bc
-    # on device at a time.  Modes differ in host-side lifecycle:
-    #   "host_cache"  – read once at startup, keep resident in host
-    #                   RAM for the full run (default; fastest).
-    #   "file_reread" – rebuild the host buffer at each r-chunk via
-    #                   phdf5 collective read; drop between r-chunks.
-    #                   Zero persistent host residency (needed for
-    #                   huge systems where host RAM can't hold ψ(G)).
-    "gspace_mode": "host_cache",
     # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
     # per-scan-iter FFT box ``chunk_size · n_rtot``.
     # 0 (default) = one-shot; the gflat memory model overrides this
@@ -1957,6 +1880,7 @@ _LEGACY_DECK_KEYS = frozenset({
     # an old deck cannot silently appear to select a deleted HDF5 path.
     "slab_io",                      # refused (one transport now)
     "use_ffi_io",                   # refused (one transport now)
+    "gspace_mode",                  # refused (one ψ(G) lifecycle now)
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
@@ -2558,6 +2482,14 @@ def read_lorrax_input(filename: str) -> dict:
                     f"must be removed: there is one sharded-slab transport "
                     f"and the deck does not select an HDF5 implementation."
                 )
+        if section.get("gspace_mode", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'gspace_mode' is no longer supported and must "
+                "be removed: the fit builds one all-rank-sharded ψ(r) "
+                "cache, then releases the host ψ(G) tiles before the "
+                "r-chunk loop.  The former file_reread mode no longer "
+                "described a distinct execution path."
+            )
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
         # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
@@ -3267,31 +3199,21 @@ class MemoryConfig:
     """Per-device memory budget + chunk sizing + AOT chunk-chooser flag.
 
     ``memory_per_device_gb=0`` triggers GPU auto-detection at config
-    construction time.  ``chunk_target_utilization`` is sourced from the
-    ``ISDF_CHUNK_TARGET_UTILIZATION`` env var (default 0.97).
-    ``zct_stage_cap_gb`` similarly from
-    ``ISDF_ZCT_STAGE_CAP_GB`` / ``ISDF_ZCT_STAGE_CAP_FRAC``.
+    construction time.  ``chunk_target_utilization=0`` is the auto sentinel;
+    a positive ``ISDF_CHUNK_TARGET_UTILIZATION`` value overrides the
+    planner's spin-aware default after clamping to ``[0.85, 1.0]``.
     """
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
-    zct_stage_cap_gb: float | None
-    gflat_chunk_size: int         # 0 = one-shot (or planner-picked)
+    gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
 
 
 @dataclass(frozen=True)
 class BackendConfig:
-    """Three-axis backend selection: I/O + ψ(G) lifecycle + W Dyson plan.
-
-    All three knobs were previously orthogonal-sounding boolean/string
-    flags in different namespaces (``gspace_mode`` /
-    ``isdf_memory_mode``) that secretly toggled FFI paths.  Grouped here
-    so :meth:`summary` can print one line at startup describing what's
-    actually active per channel.
-    """
-    gspace_io: GspaceIO
+    """FFI/linalg backend selection resolved once at startup."""
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
     distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
     distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
@@ -3311,7 +3233,7 @@ class BackendConfig:
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
         return (
-            f"backend: gspace_io={self.gspace_io.value}, "
+            "backend: "
             + (f"w_dyson_solver={self.w_dyson_solver}, "
                if self.w_dyson_solver != "local" else "")
             + f"distributed_cholesky={self.distributed_cholesky}, "
@@ -3819,23 +3741,6 @@ class LorraxConfig:
         return self.omega_grid_ev / RYD_TO_EV
 
     # ------------------------------------------------------------------
-    #  Back-compat aliases — the FFI/IO group changed semantics (bool /
-    #  string → enum), so callers that still want the old names get
-    #  coerced views.  New code should use ``config.backend.<field>`` /
-    #  ``config.memory.<field>`` etc. directly.
-    # ------------------------------------------------------------------
-
-    # ``use_ffi_io`` (the property) is GONE with the tiers it
-    # distinguished.  It answered "is this a per-rank-parallel writer?",
-    # which now has one answer for every run, so a caller branching on it
-    # was branching on a constant.  2026-08-06.
-
-    @property
-    def gspace_mode(self) -> str:
-        """Legacy ``gspace_mode: str`` view of ``backend.gspace_io``."""
-        return self.backend.gspace_io.value
-
-    # ------------------------------------------------------------------
     #  Factory
     # ------------------------------------------------------------------
 
@@ -3873,25 +3778,6 @@ class LorraxConfig:
                                       print_fn=print_fn)
         if chunk_utilization > 0:
             chunk_utilization = max(0.85, min(1.0, chunk_utilization))
-
-        # --- ZCT stage cap from env ---
-        # ``total_gb`` is the PHYSICAL card; 0.0 when the backend has no
-        # device memory (CPU).  Passing it in keeps the decision — and
-        # every "no cap, and here is why" announcement — in one pure,
-        # testable place instead of behind a backend guard that used to
-        # skip the fraction branch in silence.
-        import jax
-        _zct_total_gb = 0.0
-        if jax.default_backend() in ("gpu", "cuda"):
-            from common.gpu_utils import get_device_memory_info
-            _zct_total_gb = float(
-                get_device_memory_info().get("total_gb", 0.0))
-        zct_stage_cap_gb = resolve_zct_stage_cap(
-            os.environ.get("ISDF_ZCT_STAGE_CAP_GB"),
-            os.environ.get("ISDF_ZCT_STAGE_CAP_FRAC"),
-            per_device_gb=memory_per_device_gb,
-            total_gb=_zct_total_gb,
-            print_fn=print_fn)
 
         def _g(key):
             return params.get(key, _DEFAULTS.get(key))
@@ -4104,7 +3990,6 @@ class LorraxConfig:
             chunk_target_utilization=chunk_utilization,
             band_chunk_size=int(_g("band_chunk_size")),
             r_chunk_override=int(_g("r_chunk_size")),
-            zct_stage_cap_gb=zct_stage_cap_gb,
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
         )
@@ -4255,7 +4140,6 @@ class LorraxConfig:
                 "the JAX backend is not CPU; use distributed_lu = "
                 "auto|off|cusolvermp on GPU runs.")
         backend = BackendConfig(
-            gspace_io=GspaceIO(str(_g("gspace_mode")).strip().lower()),
             w_dyson_solver=_w_dyson_solver,
             distributed_cholesky=_dist_chol,
             distributed_lu=_dist_lu,

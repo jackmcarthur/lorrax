@@ -484,7 +484,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 | symptom | cause / fix |
 |---|---|
 | `No GPU/TPU found, falling back to CPU` | `nvidia-smi`; `CUDA_VISIBLE_DEVICES`; jaxlib must be the CUDA build |
-| `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` in the deck; reduce `chunk_bands`/`chunk_q` or let `gw_init.compute_optimal_chunks` auto-size; per-stage formulas in [memory-model](../architecture/memory-model.md) |
+| `RESOURCE_EXHAUSTED: Out of memory` | check `memory_per_device_gb` and the A–F planner report; lower `band_chunk_size`, `r_chunk_size`, or `gflat_chunk_size` for Peaks A/C/D, and `vq_g_chunk_size` only for the Vq kernel's inner G workspace; zero selects the live auto policies documented in [memory-model](../architecture/memory-model.md) |
 | `cusolverMpSyevd: status=7` + NCCL error 1 | XLA pre-allocated the pool — confirm `XLA_PYTHON_CLIENT_PREALLOCATE=false` and no user `MEM_FRACTION` override (§2.1) |
 | a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |

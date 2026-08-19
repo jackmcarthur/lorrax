@@ -256,7 +256,6 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'band_range_left':      [int(band_range_left[0]), int(band_range_left[1])],
 		'band_range_right':     [int(band_range_right[0]), int(band_range_right[1])],
 		'bispinor':             bool(cfg.bispinor),
-		'gspace_mode':          str(cfg.gspace_mode),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
 		# EFFECTIVE (env-overridden) values, recorded via the SAME
@@ -1382,7 +1381,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
 			band_norms=_band_norms,
-			gspace_mode=cfg.gspace_mode,
 			distributed_cholesky=cfg.backend.distributed_cholesky,
 			distributed_lu=cfg.backend.distributed_lu,
 			distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
@@ -1606,8 +1604,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					bispinor=cfg.bispinor,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
-							band_norms=_band_norms,
-							gspace_mode=cfg.gspace_mode,
+					band_norms=_band_norms,
 					distributed_cholesky=cfg.backend.distributed_cholesky,
 					distributed_lu=cfg.backend.distributed_lu,
 					distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
@@ -2127,11 +2124,11 @@ def build_wavefunction_bundle(
 
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
-	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None, **_ignored,
+	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
 ):
 	"""ISDF pipeline (non-restart path reads top-to-bottom):
 
-	  1. ``compute_optimal_chunks`` → chunk plan (band/r/q chunk sizes).
+	  1. ``plan_gflat_chunks`` → band/r/q/G-flat chunk plan.
 	  2. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
 	  3. ``fit_zeta`` → ζ.h5 (consumes ψ slices for pair density).
 	  4. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).
@@ -2192,6 +2189,8 @@ def prepare_isdf_and_wavefunctions(
 				                     if mem.band_chunk_size > 0 else None),
 				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 				                           if mem.gflat_chunk_size > 0 else None),
+				distributed_zeta_solve=str(
+					cfg.backend.distributed_zeta_solve),
 				# Stage F writes per-rank hyperslabs; the planner therefore
 				# charges only the local sharded tile.
 			)

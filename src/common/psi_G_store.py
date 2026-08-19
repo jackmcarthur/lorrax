@@ -1,14 +1,14 @@
-"""Host-resident ψ(G-flat) store with on-demand FFT-to-r-chunk fetches.
+"""Host-resident ψ(G-flat) staging for the one-time ψ(r) cache build.
 
-The ISDF fit kernel consumes ψ(r) one band-chunk × one r-chunk at a
-time inside a Python-unrolled bc-loop.  Holding ψ in full FFT-box
+The one-time cache builder consumes ψ(G) one band chunk at a time, and the
+ISDF fit later slices ψ(r) by band chunk and r chunk.  Holding ψ in full FFT-box
 representation on host costs ``nb · ns · nx · ny · nz`` complex128 per
 rank — for CrI3-class systems that's tens of GB.  Holding ψ in G-flat
 representation instead costs ``nb · ns · ngkmax`` per rank, which is
 ~6-11% of the box for typical GW grids.
 
-This rewrite (P4c) replaces the legacy g_box host-cache with a
-**g_flat host-cache + on-demand to_rchunk** pipeline:
+This rewrite (P4c) replaces the legacy g_box host-cache with a G-flat
+staging pipeline:
 
 * :class:`PsiGStore` stores per-rank tiles of shape
   ``(nk, nb_local, ns, ngkmax)`` instead of ``(nk, nb_local, ns, nx,
@@ -16,24 +16,15 @@ This rewrite (P4c) replaces the legacy g_box host-cache with a
 * :meth:`PsiGStore._slice_local_tile_bc` returns one bc's per-rank
   band slab via ``io_callback``, padded to ``(nk, _bpd_max, ns,
   ngkmax)`` so the enclosing ``lax.scan`` body sees a static return
-  shape.  Consumers
-  (:func:`isdf.core.z_q_from_psi_sm`,
-  :func:`isdf.core.c_q_from_psi_sm`,
-  :func:`common.wfn_transforms.gflat_to_rmu`) iterate band-chunks
-  via ``lax.scan`` inside their ``shard_map`` body, pulling one bc
-  per iter via the slicer + per-iter ``lax.all_gather`` along the
-  band axis.  The FFT box is never materialised as a persistent
-  buffer — XLA's scan-internal allocator aliases it across iters.
+  shape.  :func:`isdf.core.build_psi_r_cache_sm` iterates band chunks via
+  ``lax.scan`` inside its ``shard_map`` body, pulling one bc per iteration
+  via the slicer.  The resulting ψ(r) cache is band-flat-sharded over the
+  full mesh.
 
-Lifecycle modes are unchanged:
-
-* :class:`HostPsiGStore`   – populate once at construction, keep
-                             resident for the full run.  Host
-                             footprint = ``nk · nb_total · ns ·
-                             ngkmax · 16 / P`` bytes per process.
-* :class:`RereadPsiGStore` – ``begin_rchunk`` repopulates; ``end_rchunk``
-                             frees.  Zero persistent residency between
-                             r-chunks.
+The store populates once, feeds the one-time ψ(r) cache build, and is
+released before the r-chunk loop.  Its host footprint is
+``nk · nb_total · ns · ngkmax · 16 / P`` bytes per process during that
+build only.
 
 The reader adapters (legacy h5py vs phdf5) collapse to a single
 :class:`wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
@@ -42,8 +33,6 @@ right path.
 from __future__ import annotations
 
 from functools import partial
-from typing import Literal
-
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -52,9 +41,8 @@ from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
-# Sharding spec for the ψ(G-flat) tile that the production kernel
-# consumes after io_callback.  (n_k, nb, ns, ngkmax) with the band axis
-# flat-sharded over (x, y).
+# Sharding spec for the ψ(G-flat) tile that the cache builder consumes after
+# io_callback: (n_k, nb, ns, ngkmax), band-flat-sharded over (x, y).
 _PSI_G_FLAT_SPEC = P(None, ('x', 'y'), None, None)
 
 
@@ -102,7 +90,7 @@ def _mesh_device_coords(mesh: Mesh) -> dict:
 
 
 class PsiGStore:
-    """Host-resident ψ(G-flat) store with on-device FFT-to-r-chunk fetches.
+    """Host-resident ψ(G-flat) staging for ``build_psi_r_cache_sm``.
 
     Per locally-addressable mesh cell ``(x, y)`` owns one contiguous
     host tile of shape ``(nk, nb_local, ns, ngkmax)``.  The band axis
@@ -112,11 +100,10 @@ class PsiGStore:
     g_box ``(nk, nb_local, ns, nx, ny, nz)`` shape.
 
     :meth:`_slice_local_tile_bc` is the per-iter host-tile slicer used
-    by the ``io_callback`` inside the ``lax.scan`` body of the
-    consumers.  Returns one bc's per-rank slab padded to
+    by the ``io_callback`` inside the cache builder's ``lax.scan`` body.
+    It returns one bc's per-rank slab padded to
     ``(nk, _bpd_max, ns, ngkmax)`` so the scan body sees a static
-    output shape every iter; downstream all_gather + L/R band-mask
-    consumes it.
+    output shape every iteration.
     """
 
     def __init__(
@@ -165,14 +152,18 @@ class PsiGStore:
         self._dtype = jnp.complex128
         self._coords = _mesh_device_coords(mesh_xy)
         # host_tiles[(x, y)] = one contiguous numpy array of shape
-        # _per_rank_shape, or absent before begin_rchunk fills it.
+        # _per_rank_shape, populated once below.
         self._host_tiles: dict = {}
 
         # Cache the box index (g_index) and Bloch-phase ingredients on
-        # device once — they're shared across every io_callback call
-        # regardless of which band-chunk or r-chunk is asked for.
+        # device once — they're shared across every cache-builder callback.
         self._g_index_dev: jax.Array | None = None
         self._kvecs_frac_dev: jax.Array | None = None
+
+        self._populate_from_loader()
+        if jax.process_index() == 0:
+            tile_gb = self._per_rank_shape_bytes() / 1e9
+            print(f"  ψ(G-flat) host cache: {tile_gb:.2f} GB/process resident")
 
     # ---------------------------------------------------------------------
     # Population — pulls from the WfnLoader, scatters into per-(x,y) tiles.
@@ -278,9 +269,9 @@ class PsiGStore:
     # ---------------------------------------------------------------------
     # Round 6 Phase 2 restoration of the helper originally added in
     # commit ``cdd0fba`` and removed in ``5cadd4b`` when the (now-buggy)
-    # flat-axis ``psi_G_device_full`` path took over.  Consumer is the
-    # io_callback inside ``z_q_from_psi_sm._local`` / ``c_q_from_psi_sm._local``'s
-    # ``lax.scan`` body (Round 5 unified plan §3.2 / §6.5).
+    # flat-axis ``psi_G_device_full`` path took over.  The production consumer
+    # is the io_callback inside ``build_psi_r_cache_sm``'s ``lax.scan`` body;
+    # ``z_q_from_psi_sm`` retains a compatibility-only direct consumer.
     #
     # Static-shape contract: ``io_callback`` requires its ``out_sds`` to
     # be static at trace time, AND ``lax.scan`` requires the body output
@@ -315,11 +306,9 @@ class PsiGStore:
             (math-neutral when consumed under a band mask).
 
         Lifetime contract: host tiles must remain valid for the full
-        duration of the enclosing kernel jit (the io_callback fires
-        asynchronously inside ``lax.scan``).  ``RereadPsiGStore.end_rchunk``
-        already runs **after** ``block_until_ready`` (see
-        ``isdf_fitting.py``'s ``finally:`` clause), so async callbacks
-        always complete before tiles are freed.
+        duration of the enclosing kernel jit because ``io_callback`` fires
+        asynchronously inside ``lax.scan``.  ``isdf_fitting.py`` blocks on
+        the completed ψ(r) cache before closing this store.
         """
         x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
         if not 0 <= bc < len(self.band_chunk_ranges):
@@ -338,13 +327,12 @@ class PsiGStore:
     def g_index(self) -> jax.Array:
         """Replicated ``(nk_tot, nx, ny, nz)`` int32 box-index tensor.
 
-        Staged on device by ``_populate_from_loader``; raises if accessed
-        before any ``begin_rchunk`` call.  Used by ``gflat_to_rchunk``.
+        Staged on device by ``_populate_from_loader``.  Used by
+        ``gflat_to_rchunk``.
         """
         if self._g_index_dev is None:
             raise RuntimeError(
-                "g_index: not staged; call begin_rchunk (or use a populated "
-                "store) first")
+                "g_index: store population did not stage the box index")
         return self._g_index_dev
 
     @property
@@ -352,95 +340,35 @@ class PsiGStore:
         """Replicated ``(nk_tot, 3)`` float64 fractional k-vectors."""
         if self._kvecs_frac_dev is None:
             raise RuntimeError(
-                "kvecs_frac: not staged; call begin_rchunk (or use a populated "
-                "store) first")
+                "kvecs_frac: store population did not stage k vectors")
         return self._kvecs_frac_dev
 
-    # ---------------------------------------------------------------------
-    # Lifecycle — subclasses override
-    # ---------------------------------------------------------------------
-    def begin_rchunk(self, r_start: int, r_end: int) -> None:
-        """Called by the Python driver before the fit_one_rchunk jit
-        runs.  Default: no-op (tiles populated once at construction).
-        ``RereadPsiGStore`` overrides to refresh the tiles."""
-
-    def end_rchunk(self) -> None:
-        """Called by the driver AFTER ``block_until_ready`` on the jit
-        output.  Default: no-op.  ``RereadPsiGStore`` overrides to free
-        host tiles before the next r-chunk."""
-
     def close(self) -> None:
-        """Release all host tiles and drop the loader reference."""
+        """Release all host tiles; the shared loader remains caller-owned."""
         self._clear_tiles()
-
-class HostPsiGStore(PsiGStore):
-    """ψ(G-flat) loaded once, kept resident on host for the full run.
-
-    Per-rank footprint: ``nk · nb_total · ns · ngkmax · 16 / P`` bytes.
-    For CrI3 80 Ry 6x6 with ngkmax≈70k, 1000 bands, 4 spinor (bispinor),
-    16-GPU mesh: ~28 GB / process — fits comfortably on Perlmutter
-    HBM80 hosts.  Same system in g_box form would be ~400 GB / process
-    (won't fit).  ~14× smaller than the legacy host-resident layout.
-    """
-
-    def __init__(self, *, loader, mesh_xy, band_chunk_ranges, meta,
-                  bispinor: bool = False):
-        super().__init__(
-            loader=loader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
-        self._populate_from_loader()
-        if jax.process_index() == 0:
-            tile_gb = self._per_rank_shape_bytes() / 1e9
-            print(f"  ψ(G-flat) host cache: {tile_gb:.2f} GB/process resident")
 
     def _per_rank_shape_bytes(self) -> int:
         return int(np.prod(self._per_rank_shape)) * 16  # complex128
 
 
-class RereadPsiGStore(PsiGStore):
-    """ψ(G-flat) re-read from the loader at every r-chunk; freed between."""
-
-    def begin_rchunk(self, r_start: int, r_end: int) -> None:
-        self._populate_from_loader()
-
-    def end_rchunk(self) -> None:
-        self._clear_tiles()
-
-
 def build_psi_G_store(
     *,
     wfn,
-    sym,
     mesh_xy: Mesh,
     meta,
     band_chunk_ranges,
     bispinor: bool = False,
-    mode: Literal["host_cache", "file_reread"] = "host_cache",
 ) -> PsiGStore:
-    """Construct the ψ(G-flat) store matching ``mode``.
+    """Construct the one ψ(G-flat) host store.
 
     Single backend choice: :class:`wfn_loader.WfnLoader`.
     ``backend='auto'`` picks the FFI phdf5 path when multi-rank GPU +
     mesh + .so present; falls back to eager h5py otherwise.  CPU and
     single-process tests get the eager path automatically.
-
-    ``sym`` is kept in the signature for caller-API back-compat but is
-    ignored — the loader builds its own ``SymMaps`` lazily from the WFN's
-    ``mf_header``.
     """
-    del sym
     loader = wfn  # reuse top-level WfnLoader; opening a second one would
                   # re-slurp wfns/coeffs into host RAM.
-    if mode == "host_cache":
-        return HostPsiGStore(
-            loader=loader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
-    if mode == "file_reread":
-        return RereadPsiGStore(
-            loader=loader, mesh_xy=mesh_xy,
-            band_chunk_ranges=band_chunk_ranges, meta=meta,
-            bispinor=bispinor)
-    raise ValueError(
-        f"ψ(G-flat) store mode must be 'host_cache' or 'file_reread', got {mode!r}")
+    return PsiGStore(
+        loader=loader, mesh_xy=mesh_xy,
+        band_chunk_ranges=band_chunk_ranges, meta=meta,
+        bispinor=bispinor)

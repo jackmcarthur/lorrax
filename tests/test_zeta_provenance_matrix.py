@@ -66,8 +66,7 @@ def _cfg(bispinor=True, family="ridge", tau=1e-10, tier="auto",
         transverse_zeta_rcond=tau,
         gamma_contract_mode="take",
     )
-    return SimpleNamespace(bispinor=bispinor, gspace_mode="host_cache",
-                           backend=backend)
+    return SimpleNamespace(bispinor=bispinor, backend=backend)
 
 
 def _tid(cfg, cents_T=CENTS_T, solver_kind="lu"):
