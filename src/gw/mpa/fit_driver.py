@@ -13,25 +13,22 @@ that was planted.  That claim spans both, so it is tested here.
 
 THE LOOP, WHICH IS THE WHOLE MODULE
 -----------------------------------
-``plan_column_walk`` -> for each ``(q, column block)``: collective SlabIO
-read -> row-local ``fit_mpa_poles_batched`` -> collective SlabIO write ->
-rank-zero ledger commit.  Nothing accumulates across blocks except the
-cost counters: the fit's OUTPUT is larger than its input at the
-scheduled ``n_p`` (``tiling`` derives the factor), so holding the poles
-until the last block would hold more than the samples that were already
-declared not to fit.
+``plan_column_walk`` -> open one fit payload writer -> for each ``(q, column
+block)``: collective SlabIO read -> row-local ``fit_mpa_poles_batched`` ->
+queue a collective SlabIO write -> close/drain the payload writer -> publish
+one rank-zero completion-ledger transaction.  No pole tensor accumulates
+across blocks: the persistent object is the file handle and six cached
+dataset handles, while SlabIO's bounded queue holds at most its declared
+small number of blocks.
 
-THE ORDER OF OPERATIONS INSIDE ONE BLOCK IS LOAD-BEARING.  The read
-comes first and the write comes last, with nothing partial in between,
-so a block that is refused — a busted column budget, an unready
-frequency slab — leaves the staged store byte-identical to what it was
-before the block started.  That is what makes a refused block RESUMABLE
-rather than corrupting: the ledger never learned about it, so the next
-walk simply fits it again.  :func:`fit_one_block` is exposed separately
-from :func:`run_fit_driver` for exactly this reason, and not only for
-the tests: a driver resuming a crashed run walks the blocks its ledger
-says are missing, which is a loop over ``fit_one_block`` and not a
-re-entry into ``run_fit_driver``.
+THE ORDER OF OPERATIONS INSIDE ONE BLOCK IS LOAD-BEARING.  The read comes
+first and the write comes last, so a block refused before its write leaves
+the staged store byte-identical.  In the production session, the on-disk
+ledger remains unchanged until every queued payload write has drained and
+the collective handle has closed; a failed session can therefore leave
+uncommitted payload bytes but can never certify them as consumable.  The
+one-block :func:`fit_one_block` spelling remains the surgical resume API and
+commits that one block before returning.
 
 WHAT THIS MODULE DOES NOT DO.  It does not unfold — poles fitted on the
 q wedge unfold the way W does, per q, and the staged store is explicit
@@ -244,6 +241,7 @@ def fit_one_block(
     rcond=1.0e-13,
     solve="loewner",
     header=None,
+    fit_writer=None,
 ):
     """Read one ``(q, column block)``, fit it, stage it.  Returns stats.
 
@@ -270,11 +268,16 @@ def fit_one_block(
     mesh_xy
         The run mesh.  The full ``('x', 'y')`` mesh shards the row axis;
         frequency and the scheduled column buffer remain replicated.
+    fit_writer
+        Optional live :class:`file_io.mpa_store.FitWriter`.  The production
+        driver supplies one for the whole schedule.  ``None`` uses the
+        one-block committed spelling for surgical resume callers.
 
     Returns
     -------
     dict
-        ``ledger`` (the store's completion ledger after this block) plus
+        ``ledger`` (the session ledger after this block; on-disk committed
+        when no ``fit_writer`` was supplied) plus
         the block's counters: columns, elements, bytes read, dispatches
         and the per-stage seconds.  :func:`run_fit_driver` sums these
         into the run's cost report.
@@ -351,11 +354,20 @@ def fit_one_block(
     finite_host = bool(np.asarray(finite.addressable_data(0)))
 
     t_write = time.perf_counter()
-    ledger = mpa_store.write_fit_block_collective(
-        fit_dest, q, cols, Omega, B, diag_block, mesh_xy=mesh_xy,
-        block_condition_max=maxima_host[0],
-        block_backward_error_max=maxima_host[1],
-        diagnostics_finite=finite_host)
+    write = (mpa_store.write_fit_block_collective
+             if fit_writer is None else fit_writer.write_block)
+    if fit_writer is None:
+        ledger = write(
+            fit_dest, q, cols, Omega, B, diag_block, mesh_xy=mesh_xy,
+            block_condition_max=maxima_host[0],
+            block_backward_error_max=maxima_host[1],
+            diagnostics_finite=finite_host)
+    else:
+        ledger = write(
+            q, cols, Omega, B, diag_block,
+            block_condition_max=maxima_host[0],
+            block_backward_error_max=maxima_host[1],
+            diagnostics_finite=finite_host)
     t_write = time.perf_counter() - t_write
 
     return {
@@ -483,30 +495,39 @@ def run_fit_driver(
     }
 
     ledger = None
-    for q, lo, hi in tiling.fit_schedule(n_q, n_mu, n_omega, tile_bytes):
-        stats = fit_one_block(
-            w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
-            mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
-            tile_bytes=tile_bytes, rcond=rcond,
-            solve=solve,
-            header=header)
-        ledger = stats["ledger"]
-        report["blocks_walked"] += 1
-        report["columns_read"] += stats["n_cols"]
-        report["elements_fitted"] += stats["n_elements"]
-        report["bytes_read"] += stats["bytes_read"]
-        report["peak_block_bytes"] = max(report["peak_block_bytes"],
-                                         stats["bytes_read"])
-        report["fit_dispatches"] += stats["fit_dispatches"]
-        report["pade_solves"] += stats["pade_solves"]
-        report["seconds"]["read"] += stats["seconds_read"]
-        report["seconds"]["fit"] += stats["seconds_fit"]
-        report["seconds"]["write"] += stats["seconds_write"]
+    t_write_lifecycle = time.perf_counter()
+    fit_writer = mpa_store.FitWriter(fit_dest, mesh_xy=mesh_xy)
+    report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
+    try:
+        for q, lo, hi in tiling.fit_schedule(
+                n_q, n_mu, n_omega, tile_bytes):
+            stats = fit_one_block(
+                w_src, w_name, fit_dest, q, np.arange(lo, hi), z, n,
+                mesh_xy=mesh_xy, n_cols_buffer=plan["n_cols"],
+                tile_bytes=tile_bytes, rcond=rcond,
+                solve=solve, header=header, fit_writer=fit_writer)
+            ledger = stats["ledger"]
+            report["blocks_walked"] += 1
+            report["columns_read"] += stats["n_cols"]
+            report["elements_fitted"] += stats["n_elements"]
+            report["bytes_read"] += stats["bytes_read"]
+            report["peak_block_bytes"] = max(report["peak_block_bytes"],
+                                             stats["bytes_read"])
+            report["fit_dispatches"] += stats["fit_dispatches"]
+            report["pade_solves"] += stats["pade_solves"]
+            report["seconds"]["read"] += stats["seconds_read"]
+            report["seconds"]["fit"] += stats["seconds_fit"]
+            report["seconds"]["write"] += stats["seconds_write"]
+    except BaseException:
+        fit_writer.close(commit=False)
+        raise
+    t_write_lifecycle = time.perf_counter()
+    ledger = fit_writer.close()
+    report["seconds"]["write"] += time.perf_counter() - t_write_lifecycle
 
     t_fin = time.perf_counter()
     from common.collectives import barrier, process_rank
-    before = mpa_store.fit_completion_ledger(fit_dest)
-    if not bool(np.asarray(before["blocks_done"]).all()):
+    if not bool(np.asarray(ledger["blocks_done"]).all()):
         raise ValueError(
             "run_fit_driver: refusing collective finalize because the fit "
             "ledger still has unfinished columns")

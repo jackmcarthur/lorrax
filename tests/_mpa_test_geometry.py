@@ -103,7 +103,12 @@ class HostSlabIO:
         return self
 
     def __exit__(self, *_):
-        self.file.close()
+        self.close()
+
+    def close(self):
+        file, self.file = getattr(self, "file", None), None
+        if file is not None:
+            file.close()
 
     def create_dataset(self, name, *, shape, dtype, **_):
         if name not in self.file:

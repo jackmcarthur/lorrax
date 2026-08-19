@@ -167,11 +167,18 @@ and after every SC store cycle (`hdf5_owner.probe`). Verbatim, JID
 **1027 cross-library alternations on ONE file in ONE iteration**, against
 the static audit's estimate of ~25 — the audit understated it by ~50×,
 and it understated it because it counted the Σ-side reads and missed the
-*writer*: `write_fit_block_collective` does five opens per block (four of
-them h5py: ledger, `diagnostic_keys`, the rank-0 commit, the ledger
-again), and the R6 deck runs 464 blocks per iteration. The dual-stack
-written-file count also grows every iteration (3 → 5 → 7), which is the
-"gets worse with iteration count" property A1 predicted, now measured.
+former *writer*: `write_fit_block_collective` did five opens per block (four
+of them h5py: ledger, `diagnostic_keys`, the rank-0 commit, the ledger again),
+and the R6 deck ran 464 blocks per iteration. The dual-stack written-file
+count also grew every iteration (3 → 5 → 7), which is the "gets worse with
+iteration count" property A1 predicted.
+
+The production fit walk now uses `mpa_store.FitWriter`: one collective
+payload handle across every block, six cached dataset handles, and one bulk
+ledger commit only after payload close.  The single-block helper retains its
+one-block transaction for surgical resume callers; it is not the production
+loop.  This removes the measured per-block alternation mechanism without
+changing the stripe policy or holding pole tensors across blocks.
 
 The probe counts **library instances, not shared objects**: `libhdf5_hl`
 and friends are thin wrappers over the core object they were built

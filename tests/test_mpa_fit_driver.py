@@ -195,6 +195,51 @@ def test_collective_fit_allocation_refuses_inode_preserving_mode(
             diagnostic_keys=("condition", "backward_error"), mode="a")
 
 
+def test_run_driver_holds_one_fit_payload_handle(
+        planted, tmp_path, mesh_xy, monkeypatch):
+    """The production walk opens the fit payload once, not once per block."""
+    import file_io.slab_io as slab_io
+
+    fit_path = tmp_path / "one_payload_session.h5"
+    opens = []
+
+    class CountingSlabIO(HostSlabIO):
+        def __init__(self, path, *, mode, mesh):
+            opens.append((str(path), mode))
+            super().__init__(path, mode=mode, mesh=mesh)
+
+    monkeypatch.setattr(slab_io, "SlabIO", CountingSlabIO)
+    ledger, report = fit_driver.run_fit_driver(
+        str(planted["w_path"]), _W_NAME, str(fit_path), planted["z"],
+        planted["n_p"], mesh_xy=mesh_xy)
+
+    fit_opens = [mode for path, mode in opens if path == str(fit_path)]
+    assert fit_opens == ["w", "a"]
+    assert report["blocks_walked"] > 1
+    assert ledger["journal"].shape[0] == report["blocks_walked"]
+
+
+def test_failed_fit_session_publishes_no_completion_ledger(
+        planted, tmp_path, mesh_xy):
+    """Queued payload bytes are not certified when the session aborts."""
+    fit_path = tmp_path / "aborted_payload_session.h5"
+    n_mu, n_q, n_p = planted["n_mu"], planted["n_q"], planted["n_p"]
+    _allocate_collective_fit(fit_path, n_q, n_mu, n_p, mesh_xy)
+    q, lo, hi = tiling.fit_schedule(n_q, n_mu, 2 * n_p)[0]
+
+    with pytest.raises(RuntimeError, match="abort after payload"):
+        with MS.FitWriter(str(fit_path), mesh_xy=mesh_xy) as writer:
+            fit_driver.fit_one_block(
+                str(planted["w_path"]), _W_NAME, str(fit_path), q,
+                np.arange(lo, hi), planted["z"], n_p, mesh_xy=mesh_xy,
+                fit_writer=writer)
+            raise RuntimeError("abort after payload")
+
+    ledger = MS.fit_completion_ledger(str(fit_path))
+    assert ledger["n_done"] == 0
+    assert ledger["journal"].shape == (0, 3)
+
+
 # ---------------------------------------------------------------------------
 # Geometry (the shared glide builder, this suite's seeds), the planted
 # field, and the W(omega) file

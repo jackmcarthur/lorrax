@@ -105,7 +105,9 @@ tables, one file — undefined the moment they overlap with a writer
   reason;
 * the alternation is COUNTED, per path, and reported: measured 2026-08-15
   at **1027 cross-library alternations on one file in one SC
-  iteration**, most of them this module's own fit-block writer.
+  iteration**, most of them the former reopen-per-block fit writer.  The
+  production walk now holds one :class:`FitWriter` payload handle and commits
+  its small ledger once, after that handle closes.
   ``LORRAX_HDF5_ONE_OWNER=strict`` turns the count into a refusal.
 
 Testing note: everything below is exercised host-side with plain h5py
@@ -2144,13 +2146,40 @@ def _commit_fit_block(led, iq, cols, lo, hi, cond_max, berr_max):
     :func:`read_fit_block` refuse on.  A sentinel in the journal would
     have made "which columns" a question with two answers.
     """
+    _commit_fit_blocks(
+        led, [(iq, np.asarray(cols, dtype=np.int64), lo, hi,
+               cond_max, berr_max)])
+
+
+def _commit_fit_blocks(led, records):
+    """Publish several landed payload blocks in one metadata transaction.
+
+    ``records`` contains ``(q, cols, lo, hi, condition_max,
+    backward_error_max)`` tuples in write order.  The payload writer calls
+    this only after its collective HDF5 handle has drained and closed, so the
+    ledger can never certify bytes that are still queued.  Updating
+    ``blocks_done`` and extending each journal dataset once is also the
+    difference between one O(n_blocks) metadata commit and replaying an
+    O(n_q*n_mu) read-modify-write for every block.
+    """
+    records = tuple(records)
+    if not records:
+        return
     done = np.asarray(led["blocks_done"][()], dtype=bool)
-    done[iq, cols] = True
+    journal = np.empty((len(records), 3), dtype=np.int64)
+    maxima = {
+        key: np.empty(len(records), dtype=np.float64)
+        for key in REQUIRED_DIAGNOSTICS
+    }
+    for i, (iq, cols, lo, hi, cond_max, berr_max) in enumerate(records):
+        done[int(iq), np.asarray(cols, dtype=np.int64)] = True
+        journal[i] = (int(iq), int(lo), int(hi))
+        maxima["condition"][i] = float(cond_max)
+        maxima["backward_error"][i] = float(berr_max)
     led["blocks_done"][...] = done
-    _append(led["block_journal"],
-            np.array([[iq, lo, hi]], dtype=np.int64))
-    for key, val in zip(REQUIRED_DIAGNOSTICS, (cond_max, berr_max)):
-        _append(led["block_" + key + "_max"], np.array([float(val)]))
+    _append(led["block_journal"], journal)
+    for key in REQUIRED_DIAGNOSTICS:
+        _append(led["block_" + key + "_max"], maxima[key])
 
 
 def _unit_scale(source_unit, to_unit, where):
@@ -2655,6 +2684,199 @@ def write_fit_block(
         return fit_completion_ledger(grp)
 
 
+class FitWriter:
+    """One collective payload handle for a complete pole-fit walk.
+
+    The fit output is larger than its one-tile working set, so blocks still
+    stream to disk as soon as they are fitted.  What persists is the FILE
+    HANDLE, not the pole tensors: one ``SlabIO(mode='a')`` owns all block
+    writes, caches the six dataset handles, drains at close, and only then
+    does rank zero publish the small completion ledger in one h5py
+    transaction.  A failed payload close publishes nothing.
+
+    COLLECTIVE over ``mesh_xy``.  Construct, call :meth:`write_block` in the
+    same order on every rank, then close collectively.  The context-manager
+    spelling commits only on a clean exit; an exceptional exit drains and
+    closes the payload but deliberately leaves its blocks uncommitted.
+
+    This lifetime is an I/O resource boundary, analogous to
+    :class:`PoleReader`; it does not accumulate any device array.  Pending
+    state is only the bool completion bitmap and one six-scalar host record
+    per block.
+    """
+
+    def __init__(self, dest, *, mesh_xy, mode="a"):
+        if mesh_xy is None:
+            raise ValueError(
+                "FitWriter requires mesh_xy: its payload handle is collective")
+        if mode != "a":
+            raise ValueError(
+                "FitWriter requires mode='a': allocation owns inode creation")
+        self.dest = os.fspath(dest)
+        self.mesh_xy = mesh_xy
+        self.ledger = fit_completion_ledger(self.dest)
+        if self.ledger["complete"]:
+            raise ValueError("FitWriter: store is finalized")
+        stamped = self.ledger.get("diagnostic_keys")
+        if stamped is None:
+            raise ValueError(
+                "FitWriter: allocated store has no diagnostic_keys stamp")
+        self.diagnostic_keys = tuple(stamped.split(","))
+        self._pending = []
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(self.dest, mode=mode, mesh=mesh_xy)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close(commit=exc_type is None)
+
+    def close(self, *, commit=True):
+        """Drain/close the payload, then publish all landed blocks once."""
+        io, self._io = getattr(self, "_io", None), None
+        if io is None:
+            return self.ledger
+        try:
+            io.close()
+        except BaseException:
+            # The payload may be partial, but the on-disk ledger still says
+            # none of this session's blocks are consumable.
+            self._pending = []
+            raise
+
+        from common.collectives import barrier, process_rank
+        pending = tuple(self._pending)
+        self._pending = []
+        if not commit:
+            self.ledger = fit_completion_ledger(self.dest)
+            return self.ledger
+        if pending and process_rank() == 0:
+            with _h5(self.dest, "a") as grp:
+                _commit_fit_blocks(_open_fit(grp), pending)
+        barrier("mpa_fit_payload_session_committed")
+        self.ledger = fit_completion_ledger(self.dest)
+        # The next driver operation is rank zero's final metadata write.
+        # Publish that every rank's serial reader has CLOSED first; a barrier
+        # before the reads would order nothing about their completion.
+        barrier("mpa_fit_payload_session_ledger_readers_closed")
+        return self.ledger
+
+    def write_block(
+        self,
+        q,
+        mu_cols,
+        Omega_p_block,
+        B_p_block,
+        diag_block,
+        *,
+        block_condition_max,
+        block_backward_error_max,
+        diagnostics_finite,
+    ):
+        """Queue one native row-sharded block on the persistent handle.
+
+        Pole blocks are ``(n_p,1,n_mu_padded,n_cols_buffer)`` on
+        ``P(None,None,('x','y'),None)``.  Diagnostics are
+        ``(1,n_mu_padded,n_cols_buffer)`` on ``P(None,('x','y'))``.
+        ``mu_cols`` is one contiguous range.
+
+        The three host diagnostics must be rank-identical; the fit kernel
+        obtains them with mesh reductions before this call.  Payload writes
+        are asynchronous.  The returned ledger is the session's in-memory
+        view; it becomes the on-disk authority only after :meth:`close`.
+        """
+        from jax.sharding import PartitionSpec as P
+
+        if self._io is None:
+            raise ValueError("FitWriter.write_block after close")
+        ledger = self.ledger
+        iq = int(q)
+        if not 0 <= iq < ledger["n_q"]:
+            raise IndexError(
+                f"FitWriter.write_block: q={iq} outside [0,{ledger['n_q']})")
+        cols = normalise_columns(mu_cols, ledger["n_mu"])
+        lo, hi, sel = _column_span(cols)
+        if sel is not None:
+            raise ValueError("FitWriter.write_block requires contiguous columns")
+        already = cols[np.asarray(ledger["blocks_done"][iq, cols], dtype=bool)]
+        if already.size:
+            raise ValueError(
+                f"FitWriter.write_block: q={iq} columns "
+                f"{already[:8].tolist()} are already fitted")
+        if not bool(diagnostics_finite):
+            raise ValueError(
+                "FitWriter.write_block: fit diagnostics contain non-finite "
+                "values; refusing to certify this block")
+
+        pole_spec = P(None, None, ("x", "y"), None)
+        # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
+        diag_spec = P(None, ("x", "y"))
+        Om, Bp = Omega_p_block, B_p_block
+        for arr in (Om, Bp):
+            _require_layout(
+                arr, self.mesh_xy, pole_spec,
+                "FitWriter.write_block requires Omega_p and B_p on "
+                "P(None,None,('x','y'),None)")
+        n_p, one, n_rows, width = map(int, Om.shape)
+        if tuple(Bp.shape) != tuple(Om.shape) or one != 1:
+            raise ValueError(
+                "FitWriter.write_block: pole blocks must agree and have "
+                "shape (n_p,1,n_mu_padded,n_cols_buffer)")
+        if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
+                or width < int(cols.size):
+            raise ValueError(
+                f"FitWriter.write_block: pole block {tuple(Om.shape)} is "
+                f"incompatible with n_p={ledger['n_p']}, "
+                f"n_mu={ledger['n_mu']}, columns={int(cols.size)}")
+        keys = tuple(sorted(diag_block))
+        if keys != self.diagnostic_keys:
+            raise ValueError(
+                f"FitWriter.write_block: diagnostics {keys} do not match "
+                f"allocated keys {','.join(self.diagnostic_keys)!r}")
+        for key, arr in diag_block.items():
+            if tuple(arr.shape) != (1, n_rows, width):
+                raise ValueError(
+                    f"FitWriter.write_block: diagnostic {key!r} has "
+                    f"shape {tuple(arr.shape)}, expected "
+                    f"{(1, n_rows, width)}")
+            _require_layout(
+                arr, self.mesh_xy, diag_spec,
+                f"FitWriter.write_block: diagnostic {key!r} must be "
+                "on P(None,('x','y'),None)")
+
+        valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
+        valid_diag = (1, ledger["n_mu"], int(cols.size))
+        global_pole = (n_p, ledger["n_q"], ledger["n_mu"],
+                       ledger["n_mu"])
+        global_diag = (ledger["n_q"], ledger["n_mu"], ledger["n_mu"])
+        self._io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
+                            global_shape=global_pole,
+                            valid_shape=valid_pole)
+        self._io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
+                            global_shape=global_pole,
+                            valid_shape=valid_pole)
+        for key in keys:
+            self._io.write_slab(
+                "fit_" + key, diag_block[key], offset=(iq, 0, lo),
+                global_shape=global_diag, valid_shape=valid_diag)
+
+        record = (iq, cols.copy(), lo, hi, float(block_condition_max),
+                  float(block_backward_error_max))
+        self._pending.append(record)
+        ledger["blocks_done"][iq, cols] = True
+        ledger["n_done"] = int(ledger["blocks_done"].sum())
+        row = np.asarray([[iq, lo, hi]], dtype=np.int64)
+        ledger["journal"] = np.concatenate((ledger["journal"], row), axis=0)
+        for key, value in zip(
+                REQUIRED_DIAGNOSTICS,
+                (block_condition_max, block_backward_error_max)):
+            name = "block_" + key + "_max"
+            ledger[name] = np.append(ledger[name], float(value))
+            ledger[key + "_max"] = float(np.max(ledger[name]))
+        return ledger
+
+
 def write_fit_block_collective(
     dest,
     q,
@@ -2668,126 +2890,20 @@ def write_fit_block_collective(
     block_backward_error_max,
     diagnostics_finite,
 ):
-    """Collectively write one native row-sharded fit block.
+    """Write and commit one block through a one-block :class:`FitWriter`.
 
-    Pole and diagnostic bytes never leave their owning devices.  Only after
-    all collective writes have closed does rank zero advance the small
-    completion ledger; a barrier publishes that commit to every rank.
-
-    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH.  Returns the
-    updated ledger, uniformly on every rank.
-
-    SHAPES AND SPECS, all enforced.  ``Omega_p_block`` and ``B_p_block`` are
-    ``(n_p, 1, n_mu_padded, n_cols_buffer)`` on
-    ``P(None, None, ('x', 'y'), None)``; each ``diag_block[key]`` is
-    ``(1, n_rows, width)`` on ``P(None, ('x', 'y'))`` (a two-entry spec for
-    a rank-3 array, relying on JAX canonicalization).  ``mu_cols`` must be
-    ONE CONTIGUOUS RANGE.
-
-    ``block_condition_max``, ``block_backward_error_max`` and
-    ``diagnostics_finite`` are host scalars that MUST BE IDENTICAL ON EVERY
-    RANK — only rank 0's are committed.  The driver satisfies that with a
-    ``lax.pmax``/``lax.pmin`` reduction before the call; nothing here checks
-    it.
-
-    THE COST, measured 2026-08-15 and disclosed because it is the dominant
-    term in the store's HDF5 traffic: **five opens per block, four of them
-    h5py** — the ledger read, a ``diagnostic_keys`` attr read, the FFI
-    write, the rank-0 commit, and the ledger read again.  At the R6 deck's
-    464 blocks per iteration that is ~1900 h5py and ~464 FFI opens on one
-    file per iteration, and it is the h5py→FFI→h5py alternation
-    :mod:`file_io.hdf5_owner` counts.  **This function therefore cannot run
-    under ``LORRAX_HDF5_ONE_OWNER=strict``**, which is the target state
-    audit A1 names; removing three of the four h5py opens is on the
-    follow-up list.
+    This remains the surgical/resume API used by :func:`fit_one_block` when
+    no session is supplied.  Production :func:`gw.mpa.fit_driver.run_fit_driver`
+    owns one :class:`FitWriter` across its whole schedule; calling this helper
+    in that loop would reintroduce the collective open/close defect.
     """
-    from jax.sharding import PartitionSpec as P
-
-    from common.collectives import barrier, process_rank
-    from file_io.slab_io import SlabIO
-
-    ledger = fit_completion_ledger(dest)
-    if ledger["complete"]:
-        raise ValueError("write_fit_block_collective: store is finalized")
-    iq = int(q)
-    if not 0 <= iq < ledger["n_q"]:
-        raise IndexError(
-            f"write_fit_block_collective: q={iq} outside [0,{ledger['n_q']})")
-    cols = normalise_columns(mu_cols, ledger["n_mu"])
-    lo, hi, sel = _column_span(cols)
-    if sel is not None:
-        raise ValueError("write_fit_block_collective requires contiguous columns")
-    already = cols[np.asarray(ledger["blocks_done"][iq, cols], dtype=bool)]
-    if already.size:
-        raise ValueError(
-            f"write_fit_block_collective: q={iq} columns "
-            f"{already[:8].tolist()} are already fitted")
-    if not bool(diagnostics_finite):
-        raise ValueError(
-            "write_fit_block_collective: fit diagnostics contain non-finite "
-            "values; refusing to certify this block")
-
-    pole_spec = P(None, None, ("x", "y"), None)
-    # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
-    diag_spec = P(None, ("x", "y"))
-
-    Om, Bp = Omega_p_block, B_p_block
-    for arr in (Om, Bp):
-        _require_layout(
-            arr, mesh_xy, pole_spec,
-            "write_fit_block_collective requires Omega_p and B_p on "
-            "P(None,None,('x','y'),None)")
-    n_p, one, n_rows, width = map(int, Om.shape)
-    if tuple(Bp.shape) != tuple(Om.shape) or one != 1:
-        raise ValueError(
-            "write_fit_block_collective: pole blocks must agree and have "
-            "shape (n_p,1,n_mu_padded,n_cols_buffer)")
-    if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
-            or width < int(cols.size):
-        raise ValueError(
-            f"write_fit_block_collective: pole block {tuple(Om.shape)} is "
-            f"incompatible with n_p={ledger['n_p']}, n_mu={ledger['n_mu']}, "
-            f"columns={int(cols.size)}")
-    keys = tuple(sorted(diag_block))
-    stamped = None
-    with _h5(dest, "r") as grp:
-        stamped = _qs().qirr_attr_str(_open_fit(grp), "diagnostic_keys")
-    if stamped != ",".join(keys):
-        raise ValueError(
-            f"write_fit_block_collective: diagnostics {keys} do not match "
-            f"allocated keys {stamped!r}")
-    for key, arr in diag_block.items():
-        if tuple(arr.shape) != (1, n_rows, width):
-            raise ValueError(
-                f"write_fit_block_collective: diagnostic {key!r} has "
-                f"shape {tuple(arr.shape)}, expected {(1, n_rows, width)}")
-        _require_layout(
-            arr, mesh_xy, diag_spec,
-            f"write_fit_block_collective: diagnostic {key!r} must be "
-            "on P(None,('x','y'),None)")
-
-    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
-        valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
-        valid_diag = (1, ledger["n_mu"], int(cols.size))
-        global_pole = (n_p, ledger["n_q"], ledger["n_mu"],
-                       ledger["n_mu"])
-        global_diag = (ledger["n_q"], ledger["n_mu"], ledger["n_mu"])
-        io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
-                      global_shape=global_pole, valid_shape=valid_pole)
-        io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
-                      global_shape=global_pole, valid_shape=valid_pole)
-        for key in keys:
-            io.write_slab("fit_" + key, diag_block[key],
-                          offset=(iq, 0, lo), global_shape=global_diag,
-                          valid_shape=valid_diag)
-
-    if process_rank() == 0:
-        with _h5(dest, "a") as grp:
-            _commit_fit_block(_open_fit(grp), iq, cols, lo, hi,
-                              block_condition_max,
-                              block_backward_error_max)
-    barrier(f"mpa_fit_block_{iq}_{lo}_{hi}_committed")
-    return fit_completion_ledger(dest)
+    with FitWriter(dest, mesh_xy=mesh_xy) as writer:
+        writer.write_block(
+            q, mu_cols, Omega_p_block, B_p_block, diag_block,
+            block_condition_max=block_condition_max,
+            block_backward_error_max=block_backward_error_max,
+            diagnostics_finite=diagnostics_finite)
+    return writer.ledger
 
 
 def _canonical_diagnostics(diag_block, n_rows, n_cols):
@@ -2893,6 +3009,8 @@ def fit_completion_ledger(src, *, mode="r"):
             "n_done": int(done.sum()),
             "n_total": int(done.size),
             "journal": journal,
+            "diagnostic_keys": qs.qirr_attr_str(
+                led, "diagnostic_keys"),
             "finalized_utc": qs.qirr_attr_str(grp, "mpa_fit_finalized_utc"),
             "certification": certification,
             "provenance": provenance,
