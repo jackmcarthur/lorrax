@@ -1328,8 +1328,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     #
     # WITHOUT THIS the stamp was simply absent, and every consumer that reads
     # it defensively fell back to bulk 3D: ``gw.coulomb.get_kernel(None)``
-    # returns ``Bulk3D``, and ``gw.head_densify._refuse_non_bulk(None)``
-    # returned without deciding anything.  The second one was the expensive
+    # returns ``Bulk3D``, and the former head-densify guard returned without
+    # deciding anything.  The second one was the expensive
     # case — on a slab deck the C1 head channel re-attached ``8π/|q|²``, the
     # untruncated 3D pole, where the true 2D head goes as ``8π·z_c/|q_∥|``,
     # and the error GROWS as the fine grid densifies.  See

@@ -4,9 +4,9 @@ WHAT IS BEING GATED.  The coarse→fine W densifier trigonometrically
 interpolates ``W_q``.  Before C1 its operand carried the Γ head as a Kronecker
 delta with a ~10³ meV geometric prefactor, and a band-limited interpolant
 cannot represent a delta: it produces a Dirichlet kernel that rings in sign
-across the whole fine zone and supplies none of the 1/q² rise the fine q inside
-the coarse Γ cell should carry.  C1 splits the head off before the densifier
-and re-attaches it analytically per fine q.
+across the whole fine zone and supplies neither the bulk 1/q² rise nor the
+slab 1/|q| cusp the fine q inside the coarse Γ cell should carry.  C1 splits
+the head off before the densifier and re-attaches it analytically per fine q.
 
 The cells below are ordered by what they establish, and every one of them has
 either an EXACT statement or a red twin:
@@ -15,9 +15,8 @@ either an EXACT statement or a red twin:
      ``[whead at Γ, 0 elsewhere]`` BITWISE, and the loader's bundle is
      byte-identical to the no-densification path.  Free, and it is what proves
      split-and-reattach is algebraically the identity.
-  2. **The partition** — the number of fine q in the coarse Γ cell is
-     ``[Λ_f : Λ_c] = ∏(nf/nc)`` exactly, on every lattice, with no tolerance.
-     Red twin: a geometric predicate with a tie rule, which over-counts.
+  2. **The partition** — nested grids use exact cosets; nonnested grids use the
+     exact LCM common-cell overlap and carry total weight ``N_f/N_c``.
   3. **The head sum rule** — the head channel's zone average is exact at
      ``m = 1``, converges under refinement, and the design's red twin
      (``gamma_cell='coarse'``: re-attach at the coarse mini-BZ scale) is
@@ -27,7 +26,8 @@ either an EXACT statement or a red twin:
      neither.  This is the defect, reproduced rather than described.
   5. **Hermiticity** — machine zero by construction, with the deliberately
      complex scalar as the red twin.
-  6. **Refusals** — bulk-3D only, no pointwise value at q = 0, no complex head.
+  6. **Dimension dispatch/refusals** — slab-2D uses the vcoul slab kernel;
+     cell-box 0D, q = 0 point values and complex heads are refused.
 
 Fixture-free and CPU-only: every number here comes from synthetic cells and
 the real production functions, so this runs on any box.
@@ -44,8 +44,9 @@ import jax.numpy as jnp                                        # noqa: E402
 from gw.head_densify import (                                  # noqa: E402
     EIGHT_PI, attach_head_channel, build_fine_head_scalars,
     coarse_gamma_cell_weights, fine_q_cart, gamma_cell_head_scalar,
-    head_channel_zone_average, head_scalar_pointwise)
-from vcoul import CoulombGeometry                              # noqa: E402
+    head_channel_zone_average, head_scalar_pointwise,
+    slab_head_scalar_pointwise)
+from vcoul import CoulombGeometry, Slab2D                      # noqa: E402
 
 pytestmark = pytest.mark.census
 
@@ -286,6 +287,39 @@ def test_the_kept_q_are_the_ones_nearest_gamma(kind):
             f"member is at {q2[members].min():.6e}")
 
 
+def test_nondivisor_8_to_12_has_the_exact_common_cell_overlap():
+    """The LCM construction gives the analytic square-cell overlap weights.
+
+    A floor-divided coset implementation sees ``12 // 8 == 1`` and keeps only
+    Γ.  The true common refinement is 24: each axial ±1/12 fine cell overlaps
+    one quarter of the coarse Γ cell and each nearest diagonal overlaps 1/16.
+    This is the discriminant for the 8x8→12x12 MoS2 request.
+    """
+    geom = _geom("sc")
+    cg, fg = (8, 8, 1), (12, 12, 1)
+    q = fine_q_cart(geom.bvec, fg)
+    w = coarse_gamma_cell_weights(q, cg, fg, bvec=geom.bvec)
+    assert w[0, 0, 0] == 1.0
+    for i, j in ((1, 0), (11, 0), (0, 1), (0, 11)):
+        assert w[i, j, 0] == 0.25
+    for i, j in ((1, 1), (1, 11), (11, 1), (11, 11)):
+        assert w[i, j, 0] == 0.0625
+    assert np.count_nonzero(w) == 9
+    assert w.sum() == 2.25
+
+
+def test_nondivisor_hex_overlap_preserves_total_weight_and_evenness():
+    """Skew-cell red twin: the 8→12 overlap remains a real Voronoi partition."""
+    geom = _geom("hex")
+    cg, fg = (8, 8, 1), (12, 12, 1)
+    w = coarse_gamma_cell_weights(
+        fine_q_cart(geom.bvec, fg), cg, fg, bvec=geom.bvec)
+    flipped = np.roll(np.flip(w, axis=(0, 1, 2)), shift=(1, 1, 1),
+                      axis=(0, 1, 2))
+    assert np.array_equal(w, flipped)
+    assert np.isclose(w.sum(), 2.25, rtol=0.0, atol=1e-14)
+
+
 def test_a_broken_partition_is_refused_not_absorbed():
     """RED TWIN: monkeypatch the mask to over-count → the builder REFUSES.
 
@@ -298,8 +332,8 @@ def test_a_broken_partition_is_refused_not_absorbed():
     cg, fg = (2, 2, 2), (4, 4, 4)
     good = hd.coarse_gamma_cell_weights
 
-    def over_counting(q_cart, coarse_grid, fine_grid):
-        w = good(q_cart, coarse_grid, fine_grid).copy()
+    def over_counting(q_cart, coarse_grid, fine_grid, **kwargs):
+        w = good(q_cart, coarse_grid, fine_grid, **kwargs).copy()
         # Give one q that carries no weight a full share, exactly as the
         # tie-break bug did — an over-count of one in ∏(nf/nc) = 8.
         zero = np.argwhere(w == 0.0)[0]
@@ -309,7 +343,7 @@ def test_a_broken_partition_is_refused_not_absorbed():
     gamma_ref = gamma_cell_head_scalar(geom, cg, _S_ISO)
     hd.coarse_gamma_cell_weights = over_counting
     try:
-        with pytest.raises(AssertionError, match="fundamental domain"):
+        with pytest.raises(AssertionError, match="fine-cell overlap"):
             hd.build_fine_head_scalars(
                 geom, cg, fg, _S_ISO, head_ref=_WHEAD, gamma_ref=gamma_ref,
                 ref_grid=cg, sys_dim=3)
@@ -500,21 +534,98 @@ def test_a_complex_head_scalar_is_refused_before_it_can_be_attached():
 
 
 # ===========================================================================
-# 6.  REFUSALS
+# 6.  DIMENSION DISPATCH AND REFUSALS
 # ===========================================================================
-def test_the_slab_is_refused_by_name_not_run_with_the_bulk_pole():
-    """sys_dim 2 → NotImplementedError naming the slab stage.
+def test_the_slab_pointwise_head_uses_vcoul_not_the_bulk_pole():
+    """Finite-q slab C1 equals vcoul's G=0 kernel plus the shared Dyson factor.
 
-    In 2D the head is a ``|q|`` cusp, not a ``1/q²`` pole, and the estimator
-    is ``slab_2d.q0_average``.  Running the 3D expression on a slab is a
-    wrong number with no shape error, so the refusal is the feature.
+    The bulk red twin is deliberately evaluated at the same q and must differ;
+    this test therefore goes red if dimension dispatch is replaced by the old
+    ``8π/q²`` expression while still returning a plausible scalar.
     """
     geom = _geom("hex")
-    cg, fg = (3, 3, 1), (6, 6, 1)
-    gamma_ref = gamma_cell_head_scalar(geom, cg, _S_ISO)
-    with pytest.raises(NotImplementedError, match="SLAB_2D"):
-        build_fine_head_scalars(geom, cg, fg, _S_ISO, head_ref=_WHEAD,
-                                gamma_ref=gamma_ref, ref_grid=cg, sys_dim=2)
+    q = fine_q_cart(geom.bvec, (12, 12, 1))[1, 0, 0]
+    got = float(slab_head_scalar_pointwise(geom, q, _S_ISO))
+    q_frac = q @ np.linalg.inv(geom.bvec)
+    bare = float(np.real(np.asarray(
+        Slab2D().v_qG(geom, q_frac, np.zeros((1, 3))))[0])) * geom.cell_volume
+    qSq = complex(q @ _S_ISO @ q)
+    want = float(np.real(bare / (1.0 - bare * qSq)))
+    assert np.isclose(got, want, rtol=2e-13)
+    bulk_twin = float(head_scalar_pointwise(q, _S_ISO))
+    assert abs(got - bulk_twin) > 0.1 * abs(got)
+
+
+def test_the_slab_head_has_one_over_q_not_bulk_one_over_q_squared_scaling():
+    """The service has the slab factor and 1/q cusp, not the bulk 1/q² pole."""
+    geom = _geom("hex")
+    q = np.array([1.0e-4, 0.0, 0.0])
+    zero_S = np.zeros((3, 3))
+    slab = float(slab_head_scalar_pointwise(geom, q, zero_S))
+    bulk = float(head_scalar_pointwise(q, zero_S))
+    q2 = float(q @ q)
+    zc = np.pi / geom.bvec[2, 2]
+    assert np.isclose(
+        slab * q2, EIGHT_PI * (1.0 - np.exp(-zc * np.linalg.norm(q[:2]))),
+        rtol=2e-12)
+    assert np.isclose(bulk * q2, EIGHT_PI, rtol=1e-15)
+    slab_ratio = (float(slab_head_scalar_pointwise(geom, q / 2, zero_S)) /
+                  slab)
+    bulk_ratio = (float(head_scalar_pointwise(q / 2, zero_S)) /
+                  bulk)
+    assert 1.99 < slab_ratio < 2.01
+    assert bulk_ratio == 4.0
+
+
+def test_slab_gamma_and_nondivisor_8_to_12_c1_use_the_service_channel():
+    """The requested slab path: service Γ + LCM overlap, unlike legacy."""
+    geom = _geom("sc")
+    cg, fg = (8, 8, 1), (12, 12, 1)
+    opts = dict(nsamples=2**8, method="sobol", qmc_reps=2)
+    gamma_c = gamma_cell_head_scalar(
+        geom, cg, _S_ISO, sys_dim=2, **opts)
+    direct_c = complex(Slab2D().q0_average(
+        geom, cg, S_cart=_S_ISO, **opts)[1]).real
+    assert gamma_c == direct_c
+
+    S_fine = build_fine_head_scalars(
+        geom, cg, fg, _S_ISO, head_ref=gamma_c, gamma_ref=gamma_c,
+        ref_grid=cg, sys_dim=2, **opts)
+    direct_f = complex(Slab2D().q0_average(
+        geom, fg, S_cart=_S_ISO, **opts)[1]).real
+    assert S_fine[0, 0, 0] == direct_f
+    q = fine_q_cart(geom.bvec, fg)
+    point = float(slab_head_scalar_pointwise(geom, q[1, 0, 0], _S_ISO))
+    assert np.isclose(S_fine[1, 0, 0], 0.25 * point, rtol=2e-13)
+    flipped = np.roll(np.flip(S_fine, axis=(0, 1, 2)), shift=(1, 1, 1),
+                      axis=(0, 1, 2))
+    assert np.array_equal(S_fine, flipped)
+    assert np.all(S_fine >= 0.0)
+    assert np.count_nonzero(S_fine) == 9
+
+    # The actual shipped trig densifier applied to the old injected delta is
+    # the red twin: it rings negative, leaks outside the nine overlapping
+    # cells, and leaves Γ at the coarse value.  This ensures the slab arm above
+    # did not quietly bypass dimension dispatch by selecting ``legacy``.
+    from bse.bse_io import pad_W_R_to_grid
+    delta = np.zeros((1, 1, *cg), dtype=np.complex128)
+    delta[0, 0, 0, 0, 0] = gamma_c
+    legacy = np.real(np.asarray(jnp.fft.fftn(
+        pad_W_R_to_grid(jnp.fft.ifftn(
+            jnp.asarray(delta), axes=(-3, -2, -1), norm="ortho"), fg),
+        axes=(-3, -2, -1), norm="ortho")))[0, 0]
+    overlap = coarse_gamma_cell_weights(q, cg, fg, bvec=geom.bvec) > 0
+    assert legacy.min() < -1e-8 * gamma_c
+    assert np.any(np.abs(legacy[~overlap]) > 1e-8 * gamma_c)
+    assert np.isclose(legacy[0, 0, 0], gamma_c, rtol=2e-13)
+    assert S_fine[0, 0, 0] > legacy[0, 0, 0]
+
+
+def test_cell_box_head_remains_refused():
+    geom = _geom("sc")
+    with pytest.raises(NotImplementedError, match="BOX_0D"):
+        gamma_cell_head_scalar(geom, (4, 4, 4), _S_ISO, sys_dim=0,
+                               nsamples=16, qmc_reps=1)
 
 
 def test_an_unstamped_sys_dim_is_refused_not_defaulted_to_bulk():
@@ -583,7 +694,7 @@ def test_the_bse_meta_is_stamped_with_the_decks_sys_dim():
                       for t in n.targets)]
     assert stamps, (
         "initialize_wfns no longer stamps ``sys_dim`` on the Meta it builds; "
-        "gw.head_densify's bulk-3D refusal then sees None on every BSE "
+        "gw.head_densify's dimension resolver then sees None on every BSE "
         "densification and cannot decide anything")
 
     # and it comes from the DECK, not from a literal
@@ -609,13 +720,13 @@ def test_w_head_densify_takes_only_the_two_modes():
         resolve_w_head_densify("interpolate")
 
 
-def test_the_grids_must_nest():
+def test_the_head_grid_may_be_nonnested_but_may_not_coarsen():
     geom = _geom("fcc")
-    gamma_ref = gamma_cell_head_scalar(geom, (3, 3, 3), _S_ISO)
-    with pytest.raises(ValueError, match="positive multiple"):
-        build_fine_head_scalars(geom, (3, 3, 3), (4, 4, 4), _S_ISO,
+    gamma_ref = gamma_cell_head_scalar(geom, (4, 4, 4), _S_ISO)
+    with pytest.raises(ValueError, match="at least coarse"):
+        build_fine_head_scalars(geom, (4, 4, 4), (3, 4, 4), _S_ISO,
                                 head_ref=_WHEAD, gamma_ref=gamma_ref,
-                                ref_grid=(3, 3, 3), sys_dim=3)
+                                ref_grid=(4, 4, 4), sys_dim=3)
 
 
 # ---------------------------------------------------------------------------

@@ -1577,10 +1577,12 @@ _DEFAULTS = {
     # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
     # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
     # kpm / resolvent) transparently runs on the fine grid.  Each fine length
-    # must be a positive multiple of the matching coarse length (coarse BZ ⊂
-    # fine BZ).  Empty (default) or == the coarse grid → the coarse ``data``
-    # bundle is returned byte-identically (fast path untouched).  Subsumes the
-    # exciton_bands ``--w-coarse-grid`` W-only flag for the direct term.
+    # must be at least the matching coarse length; integer nesting is not
+    # required (8x8x1→12x12x1 evaluates the same coarse Fourier polynomial).
+    # Empty (default) or == the coarse grid → the coarse ``data`` bundle is
+    # returned byte-identically (fast path untouched).  This is the native-
+    # coarse route for a nonnested target; exciton_bands ``--w-coarse-grid``
+    # instead decimates a native fine W and therefore remains nested-only.
     "bse_k_grid": "",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q

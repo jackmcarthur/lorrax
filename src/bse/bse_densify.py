@@ -1,19 +1,21 @@
 """Coarse k-grid to fine: the exact interpolation, and the one densifier.
 
-AUTHORITY RULE — coarse to fine is a ZERO-PAD IN REAL SPACE, and on the coarse
-sub-grid it is the identity.  Zero-padding the R-lattice is exact band-limited
-trigonometric interpolation in k, so a fine-grid ``W`` passes through the
-coarse samples it came from; when the requested grid equals the coarse one the
-bundle is returned untouched, byte for byte.  There is exactly one sharded
-implementation of that densification (``make_w_densifier``), the (μ, ν)
-sharding survives it end to end, and no step materialises a replicated
-N_μ²-class array.
+AUTHORITY RULE — coarse to fine is a ZERO-PAD IN REAL SPACE.  Zero-padding the
+R-lattice evaluates the exact band-limited trigonometric polynomial defined by
+the coarse samples on ANY finer uniform grid.  When the grids nest it passes
+through every coarse sample; for a non-divisor target (for example 8→12) it
+passes through the subset of points the two grids share.  When the requested
+grid equals the coarse one the bundle is returned untouched, byte for byte.
+There is exactly one sharded implementation of that densification
+(``make_w_densifier``), the (μ, ν) sharding survives it end to end, and no step
+materialises a replicated N_μ²-class array.
 
 WHAT THE INTERPOLANT IS ALLOWED TO SEE.  Only the smooth BODY.  W's Γ head is a
 Kronecker delta, and the trigonometric interpolant of a delta is a Dirichlet
 kernel — it smears a fraction of the head's ~10³ meV prefactor onto fine q that
-should carry none of it, and it cannot produce the 1/q² rise inside the coarse
-Γ cell at all.  So the loader DEFERS the rank-1 whead injection whenever a
+should carry none of it, and it cannot produce either the bulk 1/q² rise or
+the slab 1/|q| cusp inside the coarse Γ cell at all.  So the loader DEFERS the
+rank-1 whead injection whenever a
 densification is pending, this module densifies the head-excluded body, and
 ``build_w_head_channel`` re-attaches an analytic per-fine-q head from the one
 ratified integrand (``gw.head_densify``).  ``w_head_densify = legacy`` restores
@@ -54,9 +56,10 @@ def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
     COARSE BZ axis of length ``n_c = x.shape[axis]`` (i.e. an ``ifft`` over that
     BZ axis already happened).  We embed the ``n_c`` coarse Fourier coefficients
     into ``n_fine`` slots so that an ``fft`` back to ``n_fine`` BZ points is the
-    exact band-limited trigonometric interpolant of the coarse ``W(k)`` — which,
-    because the coarse BZ points are a subset of the fine ones (``n_fine`` a
-    multiple of ``n_c``), passes THROUGH the coarse samples exactly.
+    exact band-limited trigonometric interpolant of the coarse ``W(k)``.  The
+    coefficient embedding is defined for every ``n_fine >= n_c``; if the two
+    uniform grids nest it passes through all coarse samples, and otherwise it
+    passes through the points common to both grids.
 
     Per-element R-lattice index map (the crux).  numpy/JAX FFT order maps array
     index ``i∈[0,N)`` to the physical lattice-vector rep ``n = fftfreq(N)*N``:
@@ -85,10 +88,11 @@ def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
     n_c = x.shape[axis]
     if n_fine == n_c:
         return x
-    if n_fine < n_c or n_fine % n_c != 0:
+    if n_fine < n_c:
         raise ValueError(
-            f"_zeropad_R_axis: fine length {n_fine} must be a positive multiple "
-            f"of the coarse length {n_c} (coarse BZ points ⊂ fine BZ points).")
+            f"_zeropad_R_axis: fine length {n_fine} must be at least the "
+            f"coarse length {n_c}; spectral zero-padding cannot coarsen an "
+            f"axis.")
     s = (n_c + 1) // 2
     lo = jax.lax.slice_in_dim(x, 0, s, axis=axis)
     hi = jax.lax.slice_in_dim(x, s, n_c, axis=axis)
@@ -103,10 +107,10 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array,
     """Zero-pad a coarse-k-grid real-space ``W_R`` onto a finer k-lattice.
 
     Enables a CHEAP coarse-grid W (e.g. GW/W on 6×6) to drive the BSE direct
-    term on an arbitrarily FINE interpolated exciton sampling (e.g. 12×12):
-    zero-padding in R is EXACT trigonometric interpolation in k that agrees
-    with the coarse ``W(k)`` at the coarse sub-k-points that coincide with the
-    fine grid (they do when each fine length is a multiple of the coarse one).
+    term on an arbitrarily FINE interpolated exciton sampling (e.g. 8×8 W on a
+    12×12 exciton grid): zero-padding in R is EXACT trigonometric interpolation
+    in k.  It agrees with the coarse ``W(k)`` at every k-point common to the two
+    grids (all coarse points when the grids nest).
 
     Parameters
     ----------
@@ -116,8 +120,8 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array,
         axes (μ, ν, spin, …) are carried through untouched; only the trailing
         three (kx, ky, kz) R-axes are re-embedded.
     fine_grid : (nfx, nfy, nfz)
-        Target BZ grid.  Each ``nf`` must be a positive multiple of the matching
-        coarse length (so the coarse BZ ⊂ fine BZ).
+        Target BZ grid.  Each ``nf`` must be at least the matching coarse
+        length; integer nesting is not required.
 
     Returns
     -------
@@ -333,9 +337,9 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     ----------
     wfn, sym, meta : loader / symmetry table / system parameters
         ``wfn`` supplies the Coulomb geometry (``blat·bvec`` rows and Ω) via
-        :meth:`vcoul.CoulombGeometry.from_wfn`; ``meta.sys_dim`` gates the
-        bulk-3D-only refusal and is REQUIRED — a Meta without it is refused,
-        not assumed bulk (see the body); ``sym`` is read only by the
+        :meth:`vcoul.CoulombGeometry.from_wfn`; ``meta.sys_dim`` selects the
+        bulk-3D or slab-2D ``vcoul`` kernel and is REQUIRED — a Meta without it
+        is refused, not assumed bulk (see the body); ``sym`` is read only by the
         ``dipole.h5`` fallback route for ``S_cart`` (a restart that carries
         ``S_cart_head`` never touches it).  Both densification call sites
         already hold all three from their htransform leg, which is also where
@@ -362,9 +366,9 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
 
     params = params or {}
 
-    # ── DIMENSIONALITY FIRST, before the S tensor and before the 2.6M-sample
-    # Γ-cell integral: a slab deck must hear "this stage is bulk-3D only",
-    # not "your dipole.h5 is missing".
+    # ── DIMENSIONALITY FIRST, before the S tensor and before the Γ-cell
+    # integral: an unsupported/unstamped deck must hear that, not "your
+    # dipole.h5 is missing".
     #
     # ``Meta`` has no ``sys_dim`` field — it is STAMPED on the two Metas the
     # tree builds, by ``gw.gw_jax.main`` and by
@@ -382,13 +386,13 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
         raise ValueError(
             "w_head_densify = c1: the Meta handed to "
             "bse.bse_densify.build_w_head_channel carries no ``sys_dim``, so "
-            "gw.head_densify cannot tell a bulk deck from a slab and would "
-            "run the 3D pole on both.  ``Meta`` has no sys_dim field; it is "
+            "gw.head_densify cannot safely select a bulk or slab kernel.  "
+            "``Meta`` has no sys_dim field; it is "
             "stamped, by gw.gw_jax.main on the GW driver's Meta and by "
             "bandstructure.htransform.initialize_wfns on this caller's.  A "
             "Meta arriving here without it was built by a third site, and "
             "that site is the fix — do not default it to 3 here.")
-    head_densify._refuse_non_bulk(sys_dim)
+    sd = head_densify._validated_sys_dim(sys_dim)
 
     S_cart, prov = resolve_head_S_cart(
         restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
@@ -408,13 +412,14 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     geom = CoulombGeometry.from_wfn(wfn)
     analytic_sphere = bool(params.get("head_minibz_average", False))
     gamma_ref = head_densify.gamma_cell_head_scalar(
-        geom, ref_grid, S_cart, analytic_sphere=analytic_sphere)
+        geom, ref_grid, S_cart, sys_dim=sd,
+        analytic_sphere=analytic_sphere)
     ratio = float(whead) / gamma_ref
 
     S_fine = head_densify.build_fine_head_scalars(
         geom, coarse_grid, fine_grid, S_cart,
         head_ref=float(whead), gamma_ref=gamma_ref, ref_grid=ref_grid,
-        sys_dim=sys_dim,
+        sys_dim=sd,
         analytic_sphere=analytic_sphere, gamma_cell=gamma_cell)
 
     # THE SUM RULE, reported on the deck.  The head channel's zone average is
@@ -429,11 +434,13 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     cg = tuple(coarse_grid)
     gamma_coarse = (gamma_ref if tuple(ref_grid) == cg
                     else head_densify.gamma_cell_head_scalar(
-                        geom, cg, S_cart, analytic_sphere=analytic_sphere))
+                        geom, cg, S_cart, sys_dim=sd,
+                        analytic_sphere=analytic_sphere))
     n_c = cg[0] * cg[1] * cg[2]
     target = float(whead) * (gamma_coarse / gamma_ref) / n_c
     weight = head_densify.coarse_gamma_cell_weights(
-        head_densify.fine_q_cart(geom.bvec, fine_grid), cg, fine_grid)
+        head_densify.fine_q_cart(geom.bvec, fine_grid), cg, fine_grid,
+        bvec=geom.bvec)
     zone = head_densify.head_channel_zone_average(S_fine)
     log_fn(
         f"[w-head-c1] S_cart: {prov}; provenance ratio whead/⟨v/(1−vqSq)⟩ on "
@@ -442,9 +449,9 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     log_fn(
         f"[w-head-c1] head channel re-attached at "
         f"{int(np.count_nonzero(S_fine))} fine q carrying total weight "
-        f"{float(np.sum(weight)):.6f} (= [Λ_f:Λ_c] = "
-        f"{fine_grid[0]*fine_grid[1]*fine_grid[2] // n_c}; more points than "
-        f"weight means boundary q sharing 1/k), of "
+        f"{float(np.sum(weight)):.6f} (= N_f/N_c = "
+        f"{(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.6f}; more points than "
+        f"weight means boundary/common-cell sharing), of "
         f"{fine_grid[0]*fine_grid[1]*fine_grid[2]} fine q total")
     log_fn(
         f"[w-head-c1] S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected "
@@ -543,10 +550,11 @@ def _interpolate_bse_data_to_grid(
     coarse_grid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
     fine_grid = tuple(int(s) for s in fine_grid)
     for a, (f, c) in enumerate(zip(fine_grid, coarse_grid)):
-        if c <= 0 or f <= 0 or f % c != 0:
+        if c <= 0 or f < c:
             raise ValueError(
-                f"bse_k_grid axis {a}: fine {f} must be a positive multiple of "
-                f"the coarse restart grid {c} (coarse BZ ⊂ fine BZ).")
+                f"bse_k_grid axis {a}: fine {f} must be at least the coarse "
+                f"restart extent {c}; trigonometric densification cannot "
+                f"coarsen an axis.")
     n_val = int(data["n_val"]); n_cond = int(data["n_cond"])
     nv_pad = int(data["n_val_pad"]); nc_pad = int(data["n_cond_pad"])
     n_rmu = int(data["n_rmu"]); n_rmu_pad = int(data["n_rmu_pad"])
