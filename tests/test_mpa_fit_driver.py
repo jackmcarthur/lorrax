@@ -202,11 +202,16 @@ def test_run_driver_holds_one_fit_payload_handle(
 
     fit_path = tmp_path / "one_payload_session.h5"
     opens = []
+    syncs = []
 
     class CountingSlabIO(HostSlabIO):
         def __init__(self, path, *, mode, mesh):
             opens.append((str(path), mode))
             super().__init__(path, mode=mode, mesh=mesh)
+
+        def sync_writes(self):
+            syncs.append(str(self.file.filename))
+            super().sync_writes()
 
     monkeypatch.setattr(slab_io, "SlabIO", CountingSlabIO)
     ledger, report = fit_driver.run_fit_driver(
@@ -216,6 +221,7 @@ def test_run_driver_holds_one_fit_payload_handle(
     fit_opens = [mode for path, mode in opens if path == str(fit_path)]
     assert fit_opens == ["w", "a"]
     assert report["blocks_walked"] > 1
+    assert syncs.count(str(fit_path)) == report["blocks_walked"]
     assert ledger["journal"].shape[0] == report["blocks_walked"]
 
 

@@ -110,6 +110,9 @@ class HostSlabIO:
         if file is not None:
             file.close()
 
+    def sync_writes(self):
+        self.file.flush()
+
     def create_dataset(self, name, *, shape, dtype, **_):
         if name not in self.file:
             self.file.create_dataset(name, shape=shape, dtype=dtype)

@@ -174,11 +174,14 @@ count also grew every iteration (3 → 5 → 7), which is the "gets worse with
 iteration count" property A1 predicted.
 
 The production fit walk now uses `mpa_store.FitWriter`: one collective
-payload handle across every block, six cached dataset handles, and one bulk
-ledger commit only after payload close.  The single-block helper retains its
-one-block transaction for surgical resume callers; it is not the production
-loop.  This removes the measured per-block alternation mechanism without
-changing the stripe policy or holding pole tensors across blocks.
+payload handle across every block, six dataset handles opened before the
+first transfer, and one bulk ledger commit only after payload close.  The six
+writes of each block drain before the next W-sample read; this is the required
+cross-handle ownership transfer from the asynchronous writer, not a file
+reopen.  The single-block helper retains its one-block transaction for
+surgical resume callers; it is not the production loop.  This removes the
+measured per-block alternation mechanism without changing the stripe policy
+or holding pole tensors across blocks.
 
 The probe counts **library instances, not shared objects**: `libhdf5_hl`
 and friends are thin wrappers over the core object they were built

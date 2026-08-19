@@ -2690,9 +2690,18 @@ class FitWriter:
     The fit output is larger than its one-tile working set, so blocks still
     stream to disk as soon as they are fitted.  What persists is the FILE
     HANDLE, not the pole tensors: one ``SlabIO(mode='a')`` owns all block
-    writes, caches the six dataset handles, drains at close, and only then
-    does rank zero publish the small completion ledger in one h5py
-    transaction.  A failed payload close publishes nothing.
+    writes, caches the six dataset handles, and only then does rank zero
+    publish the small completion ledger in one h5py transaction.  A failed
+    payload close publishes nothing.
+
+    Each block is drained before :meth:`write_block` returns.  The next fit
+    block is read from the W-sample file through a different HDF5 handle;
+    allowing that read to overlap this handle's asynchronous H5Dwrite is
+    illegal even though the two inodes differ (parallel HDF5's VOL state is
+    process-global).  Pre-opening every output dataset before the first
+    write and using one drain per six-write block gives the service a strict
+    ``read W -> fit -> write+drain poles`` transaction order without
+    restoring any per-block file open or ledger transaction.
 
     COLLECTIVE over ``mesh_xy``.  Construct, call :meth:`write_block` in the
     same order on every rank, then close collectively.  The context-manager
@@ -2725,6 +2734,21 @@ class FitWriter:
         self._pending = []
         from file_io.slab_io import SlabIO
         self._io = SlabIO(self.dest, mode=mode, mesh=mesh_xy)
+        pole_shape = (self.ledger["n_p"], self.ledger["n_q"],
+                      self.ledger["n_mu"], self.ledger["n_mu"])
+        diag_shape = (self.ledger["n_q"], self.ledger["n_mu"],
+                      self.ledger["n_mu"])
+        # Allocation already created these datasets.  Register all handles
+        # up front, while no payload write is in flight, so the block stream
+        # contains transfers only: no H5Dopen/H5Dcreate may interleave with
+        # the asynchronous writer thread.
+        self._io.create_dataset("Omega_p", shape=pole_shape,
+                                dtype=np.complex128)
+        self._io.create_dataset("B_p", shape=pole_shape,
+                                dtype=np.complex128)
+        for key in self.diagnostic_keys:
+            self._io.create_dataset("fit_" + key, shape=diag_shape,
+                                    dtype=np.float64)
 
     def __enter__(self):
         return self
@@ -2860,6 +2884,13 @@ class FitWriter:
             self._io.write_slab(
                 "fit_" + key, diag_block[key], offset=(iq, 0, lo),
                 global_shape=global_diag, valid_shape=valid_diag)
+
+        # The next scheduled operation reads the W-sample inode through a
+        # separate HDF5 context.  SlabIO's cross-handle contract requires
+        # this writer to be quiescent first; this also makes the block's
+        # payload durability the transaction boundary while the ledger
+        # remains a single end-of-session commit.
+        self._io.sync_writes()
 
         record = (iq, cols.copy(), lo, hi, float(block_condition_max),
                   float(block_backward_error_max))

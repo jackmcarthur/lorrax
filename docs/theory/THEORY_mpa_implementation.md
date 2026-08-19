@@ -260,13 +260,14 @@ configuration; MPA does not own a second solve policy.
 The fit reads all $N_z=2N_p$ frequencies only for a bounded block of matrix
 columns. Rows and columns remain sharded over the process mesh. The default
 tile budget is chosen so that no process materializes an $N_\mu^2$ object.
-Each block is fitted, queued collectively to the q-wedge pole store, and
-released before the next block.  One SlabIO payload handle remains open for
-the complete q-major walk; after every queued write drains and that handle
-closes, one rank-zero metadata transaction publishes the complete block
-journal and completion bitmap.  A failed payload session therefore certifies
-none of its possibly partial bytes.  This same bounded path is valid when chi
-and W are written on every QSGW iteration.
+Each block is fitted, queued collectively to the q-wedge pole store, drained,
+and released before the next block.  The drain is required before the next
+W-file HDF5 read; it does not close the pole-store handle.  One SlabIO payload
+handle and its pre-opened dataset handles remain live for the complete
+q-major walk.  After that handle closes, one rank-zero metadata transaction
+publishes the complete block journal and completion bitmap.  A failed payload
+session therefore certifies none of its possibly partial bytes.  This same
+bounded path is valid when chi and W are written on every QSGW iteration.
 
 ## 6. The Loewner multipole model
 

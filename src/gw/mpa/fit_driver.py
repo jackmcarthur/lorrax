@@ -15,11 +15,11 @@ THE LOOP, WHICH IS THE WHOLE MODULE
 -----------------------------------
 ``plan_column_walk`` -> open one fit payload writer -> for each ``(q, column
 block)``: collective SlabIO read -> row-local ``fit_mpa_poles_batched`` ->
-queue a collective SlabIO write -> close/drain the payload writer -> publish
-one rank-zero completion-ledger transaction.  No pole tensor accumulates
-across blocks: the persistent object is the file handle and six cached
-dataset handles, while SlabIO's bounded queue holds at most its declared
-small number of blocks.
+queue and drain six collective SlabIO payload writes -> close the payload
+writer -> publish one rank-zero completion-ledger transaction.  No pole
+tensor accumulates across blocks: the persistent object is the file handle and six cached
+dataset handles.  The per-block drain is the required ownership transfer
+before the next W-file read; it is not a file reopen or ledger transaction.
 
 THE ORDER OF OPERATIONS INSIDE ONE BLOCK IS LOAD-BEARING.  The read comes
 first and the write comes last, so a block refused before its write leaves
