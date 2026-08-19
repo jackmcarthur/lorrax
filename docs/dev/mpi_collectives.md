@@ -162,7 +162,9 @@ repo. The patch adds two overrides and nothing else.
 commit with no patch and refuses a dirty upstream checkout.  The build uses
 Cray `cc`/`CC`/`ftn`, strips the GPU and Darshan modules, checks the required
 MPItrampoline ABI exports, rejects CUDA-GTL/Darshan dependencies, and runs the
-one-MPI dynamic-closure gate.
+one-MPI dynamic-closure gate. Production adapter builds force that gate on,
+refuse an inherited opt-out, and include the gate script itself in recipe
+cleanliness and provenance.
 
 Two Cray launch controls are load-bearing and are set by
 `config/perlmutter/cpu_mpi_env.sh`:
@@ -299,9 +301,10 @@ that is not a certified progress/XLA-thread affinity policy: XLA workers do
 not obey `OMP_NUM_THREADS`, so production affinity still needs a thread-census
 and async-on/off performance measurement.
 
-Release names include the adapter content hash and the builder/prelude/site
-recipe hashes. Rebuilding identical adapter bytes after changing the recipe
-therefore cannot silently reuse an older provenance manifest.
+Release names include the adapter content hash and the
+builder/prelude/site/one-MPI-gate recipe hashes, plus the complete manifest
+hash. Rebuilding identical adapter bytes after changing the recipe therefore
+cannot silently reuse an older provenance manifest.
 
 ### Frontera
 

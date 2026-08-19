@@ -21,6 +21,7 @@ for _lorrax_pm_source_pin in "${LORRAX_ROOT:-}" "${LORRAX_CHECKOUT:-}"; do
     fi
 done
 _lorrax_pm_site="$_lorrax_pm_root/config/perlmutter/site_config.sh"
+_lorrax_pm_one_mpi_gate="$_lorrax_pm_root/src/ffi/cpp/gate_one_mpi.sh"
 if [[ ! -r "$_lorrax_pm_site" ]]; then
     echo "[cpu_mpi_env.pm] ERROR: cannot read $_lorrax_pm_site" >&2
     return 2
@@ -52,10 +53,12 @@ _lorrax_pm_mpich="$(sed -n 's/^cray_mpich_version=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_builder_sha="$(sed -n 's/^builder_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_prelude_sha="$(sed -n 's/^prelude_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_site_sha="$(sed -n 's/^site_config_sha256=//p' "$_lorrax_pm_manifest")"
+_lorrax_pm_one_mpi_gate_sha="$(sed -n 's/^one_mpi_gate_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_actual_sha="$(sha256sum "$_lorrax_pm_so" | awk '{print $1}')"
 _lorrax_pm_want_builder_sha="$(sha256sum "$_lorrax_pm_root/config/perlmutter/build_mpiwrapper.sh" | awk '{print $1}')"
 _lorrax_pm_want_prelude_sha="$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')"
 _lorrax_pm_want_site_sha="$(sha256sum "$_lorrax_pm_site" | awk '{print $1}')"
+_lorrax_pm_want_one_mpi_gate_sha="$(sha256sum "$_lorrax_pm_one_mpi_gate" | awk '{print $1}')"
 if [[ "$_lorrax_pm_commit" != "$LORRAX_MPIWRAPPER_COMMIT_DEFAULT" || \
       "$_lorrax_pm_abi" != "$LORRAX_MPIWRAPPER_ABI_DEFAULT" || \
       -z "$_lorrax_pm_expected_sha" || \
@@ -65,7 +68,8 @@ if [[ "$_lorrax_pm_commit" != "$LORRAX_MPIWRAPPER_COMMIT_DEFAULT" || \
       "$_lorrax_pm_mpich" != "${LORRAX_PM_MPICH_DEFAULT##*/}" || \
       "$_lorrax_pm_builder_sha" != "$_lorrax_pm_want_builder_sha" || \
       "$_lorrax_pm_prelude_sha" != "$_lorrax_pm_want_prelude_sha" || \
-      "$_lorrax_pm_site_sha" != "$_lorrax_pm_want_site_sha" ]]; then
+      "$_lorrax_pm_site_sha" != "$_lorrax_pm_want_site_sha" || \
+      "$_lorrax_pm_one_mpi_gate_sha" != "$_lorrax_pm_want_one_mpi_gate_sha" ]]; then
     echo "[cpu_mpi_env.pm] ERROR: adapter provenance/toolchain/recipe check failed" >&2
     echo "[cpu_mpi_env.pm]   commit=$_lorrax_pm_commit ABI=$_lorrax_pm_abi MPICH=$_lorrax_pm_mpich" >&2
     echo "[cpu_mpi_env.pm]   upstream_modified=$_lorrax_pm_source_modified recipe_dirty=$_lorrax_pm_recipe_dirty" >&2
@@ -157,3 +161,5 @@ unset _lorrax_pm_source_modified _lorrax_pm_recipe_dirty _lorrax_pm_mpich
 unset _lorrax_pm_builder_sha _lorrax_pm_prelude_sha _lorrax_pm_site_sha
 unset _lorrax_pm_want_builder_sha _lorrax_pm_want_prelude_sha
 unset _lorrax_pm_want_site_sha _lorrax_pm_source_pin
+unset _lorrax_pm_one_mpi_gate _lorrax_pm_one_mpi_gate_sha
+unset _lorrax_pm_want_one_mpi_gate_sha

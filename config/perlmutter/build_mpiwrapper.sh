@@ -23,12 +23,17 @@ for _source_pin in "${LORRAX_ROOT:-}" "${LORRAX_CHECKOUT:-}"; do
 done
 LORRAX_ROOT="$_SCRIPT_ROOT"
 SITE_CONFIG="$LORRAX_ROOT/config/perlmutter/site_config.sh"
+ONE_MPI_GATE="$LORRAX_ROOT/src/ffi/cpp/gate_one_mpi.sh"
 if [[ ! -r "$SITE_CONFIG" ]]; then
     echo "[build_mpiw.pm] ERROR: cannot read $SITE_CONFIG" >&2
     exit 2
 fi
 # shellcheck disable=SC1090
 . "$SITE_CONFIG"
+if [[ ! -x "$ONE_MPI_GATE" ]]; then
+    echo "[build_mpiw.pm] ERROR: one-MPI closure gate is not executable: $ONE_MPI_GATE" >&2
+    exit 2
+fi
 MPIW_COMMIT="$LORRAX_MPIWRAPPER_COMMIT_DEFAULT"
 if [[ -n "${LORRAX_MPIWRAPPER_COMMIT:-}" && \
       "$LORRAX_MPIWRAPPER_COMMIT" != "$MPIW_COMMIT" ]]; then
@@ -36,6 +41,10 @@ if [[ -n "${LORRAX_MPIWRAPPER_COMMIT:-}" && \
     exit 2
 fi
 MPIW_ROOT="${LORRAX_MPIWRAPPER_ROOT:-$LORRAX_MPIWRAPPER_ROOT_DEFAULT}"
+if [[ -n "${LORRAX_GATE_ONE_MPI:-}" && "$LORRAX_GATE_ONE_MPI" != on ]]; then
+    echo "[build_mpiw.pm] ERROR: production adapter builds cannot disable the one-MPI closure gate" >&2
+    exit 2
+fi
 
 if [[ "${1:-}" != "" && "${1:-}" != "--fresh" ]]; then
     echo "[build_mpiw.pm] ERROR: unknown argument: $1" >&2
@@ -210,18 +219,20 @@ if grep -qE 'libmpi_gtl_cuda|libcuda|libcudart|libdarshan' <<<"$NEEDED"; then
     grep -E 'NEEDED.*(libmpi_gtl_cuda|libcuda|libcudart|libdarshan)' <<<"$NEEDED" >&2
     exit 1
 fi
-GATE_TAG=build_mpiw.pm "$LORRAX_ROOT/src/ffi/cpp/gate_one_mpi.sh" \
+LORRAX_GATE_ONE_MPI=on GATE_TAG=build_mpiw.pm "$ONE_MPI_GATE" \
     "$SO" 'libmpi_gnu_'
 
 ARTIFACT_SHA="$(sha256sum "$SO" | awk '{print $1}')"
 BUILDER_SHA="$(sha256sum "$LORRAX_ROOT/config/perlmutter/build_mpiwrapper.sh" | awk '{print $1}')"
 PRELUDE_SHA="$(sha256sum "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh" | awk '{print $1}')"
 SITE_SHA="$(sha256sum "$SITE_CONFIG" | awk '{print $1}')"
+ONE_MPI_GATE_SHA="$(sha256sum "$ONE_MPI_GATE" | awk '{print $1}')"
 REPO_HEAD="$(git -C "$LORRAX_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
 if [[ -n "$(git -C "$LORRAX_ROOT" status --porcelain -- \
         config/perlmutter/build_mpiwrapper.sh \
         config/perlmutter/cpu_mpi_env.sh \
-        config/perlmutter/site_config.sh 2>/dev/null || true)" ]]; then
+        config/perlmutter/site_config.sh \
+        src/ffi/cpp/gate_one_mpi.sh 2>/dev/null || true)" ]]; then
     RECIPE_DIRTY=true
 else
     RECIPE_DIRTY=false
@@ -231,7 +242,8 @@ if [[ "$RECIPE_DIRTY" != false ]]; then
     git -C "$LORRAX_ROOT" status --short -- \
         config/perlmutter/build_mpiwrapper.sh \
         config/perlmutter/cpu_mpi_env.sh \
-        config/perlmutter/site_config.sh >&2
+        config/perlmutter/site_config.sh \
+        src/ffi/cpp/gate_one_mpi.sh >&2
     exit 2
 fi
 {
@@ -251,6 +263,7 @@ fi
     echo "builder_sha256=$BUILDER_SHA"
     echo "prelude_sha256=$PRELUDE_SHA"
     echo "site_config_sha256=$SITE_SHA"
+    echo "one_mpi_gate_sha256=$ONE_MPI_GATE_SHA"
     module -t list 2>&1 | sed 's/^/module=/'
 } >"$CANDIDATE/build-manifest.txt"
 
@@ -259,7 +272,7 @@ fi
 # reuses the already-gated release.  Include the full manifest in the identity:
 # HEAD and the active module closure are provenance too, and otherwise their
 # changing while adapter/recipe bytes stay fixed creates a false collision.
-RECIPE_ID="${BUILDER_SHA:0:8}-${PRELUDE_SHA:0:8}-${SITE_SHA:0:8}"
+RECIPE_ID="${BUILDER_SHA:0:8}-${PRELUDE_SHA:0:8}-${SITE_SHA:0:8}-${ONE_MPI_GATE_SHA:0:8}"
 MANIFEST_SHA="$(sha256sum "$CANDIDATE/build-manifest.txt" | awk '{print $1}')"
 RELEASE="$RELEASES/${MPIW_COMMIT:0:12}-mpich-${CRAY_MPICH_VERSION}-${ARTIFACT_SHA:0:12}-${RECIPE_ID}-${MANIFEST_SHA:0:8}"
 if [[ -e "$RELEASE" ]]; then
@@ -297,4 +310,4 @@ echo "[build_mpiw.pm]   $ACTIVE/lib64/libmpiwrapper.so"
 echo "[build_mpiw.pm]   MPI ABI $ABI_MAJOR.$ABI_MINOR.$ABI_PATCH"
 echo "$ARTIFACT_SHA  $ACTIVE/lib64/libmpiwrapper.so"
 echo "[build_mpiw.pm] Source config/perlmutter/cpu_mpi_env.sh before Python."
-unset _SCRIPT_ROOT _source_pin
+unset _SCRIPT_ROOT _source_pin ONE_MPI_GATE ONE_MPI_GATE_SHA
