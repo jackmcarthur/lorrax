@@ -1681,13 +1681,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "parallel-transport head storage has "
                 f"{nb_storage} padded bands, but the SC wavefunction bundle "
                 f"has only {wfns_qp.enk.shape[1]}.")
-        # ``sc_head_update = dft_velocity`` carries no connection, so DeltaH
+        # ``sc_head_update = dft_velocity`` carries no links, so DeltaH
         # has no consumer: skip its assembly rather than building an
-        # O(nk*nb_storage^2) manifold and a spectral derivative for a term
+        # O(nk*nb_storage^2) manifold and finite-link derivative for a term
         # that is then dropped.  Everything below this point is shared.
-        connection_cart = pt.connection_cart
+        forward_links = pt.forward_links
         delta_head = None
-        if connection_cart is not None:
+        if forward_links is not None:
             H_active_full = (
                 state.H_qp_dft if ks.is_identity
                 else ks.broadcast(state.H_qp_dft))
@@ -1720,7 +1720,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
         iteration_head_response = build_iteration_head_response(
             delta_head,
-            connection_cart,
+            forward_links,
+            pt.forward_neighbors,
             pt.velocity_dft_cart,
             U_full,
             wfns_qp.enk[:, :nb_storage],
@@ -1743,7 +1744,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             eta_ry=(0.0 if mpa_mode else None),
         )
         velocity_kind = (
-            "QSGW covariant velocity" if connection_cart is not None
+            "QSGW finite-link covariant velocity" if forward_links is not None
             else "QP-rotated DFT p-matrix velocity")
         if mpa_mode:
             inputs.print_fn(

@@ -23,6 +23,7 @@ from common.parallel_transport import (
     build_g_wrap_lookup,
     build_neighbor_table,
     fourth_order_connection,
+    fourth_order_covariant_derivative,
     g_wrap_for_forward_step,
     g_wrap_for_step,
     make_cross_k_link,
@@ -32,7 +33,7 @@ from common.parallel_transport import (
 from file_io.slab_io import SlabIO
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -97,6 +98,7 @@ __all__ = [
     "line_index_table",
     "link_symmetry_reduction_applies",
     "initialize_parallel_transport_artifact",
+    "load_full_bz_links",
     "transported_frame",
     "validate_covariant_velocity",
     "validate_parallel_transport_artifact",
@@ -1222,7 +1224,7 @@ def complete_velocity_validation(
     kgrid,
     bvec_cart,
     energies_full,
-    connection_cart,
+    occupations_full,
     velocity_exact_cart,
     links_full,
     forward_neighbors,
@@ -1230,49 +1232,29 @@ def complete_velocity_validation(
     rtol: float,
     scope_blocks=(),
 ) -> dict[str, object]:
-    """Run and stamp the mandatory DFT covariant-velocity reconstruction.
+    """Run and stamp the finite-link DFT head-velocity gate.
 
-    The gate compares, per reduced direction ``i``,
-
-        spectral_derivative_i(H_t) - i [A_t, H_t]   vs   U^H v_exact U
-
-    with ``H_t = U^H diag(E) U``, ``U`` the frame parallel-transported along
-    ``b_i`` (:func:`transported_frame`) and ``A_t`` the connection built by
-    the one shared fourth-order service from the TRANSPORTED links.  Each
-    direction's reconstruction is rotated back with ``U ... U^H`` before the
-    comparison, so the residual is reported in the DFT band basis and the
-    per-band-block diagnostics below mean what their band labels say.
-
-    Why not ``H = diag(E)`` directly (claims 0183, 0187): with ``H``
-    diagonal the commutator's diagonal is ``A_nn (E_n - E_n) = 0``, so that
-    check never touches the connection at all and degenerates into an FFT
-    derivative of band-index-SORTED ``E_n(k)``, which is kinked wherever
-    bands cross.  Measured on the 48-band sodium artifact, 2026-08-15:
-    3.859e-2 on the never-crossing semicore and 1.4285 the moment the 3s
-    manifold enters at band 9.
-
-    The sorted-frame reconstruction is still computed, as a DIAGNOSTIC only,
-    so one run carries its own before/after evidence.  ``scope_blocks``
-    reports both restricted to leading band blocks — the scoping that
-    discriminated the crossing signature in the first place.
-
-    The spectral derivative import is lazy because ``gw.qsgw_head`` is
-    owned by the self-consistent-head lane. Both preprocessing and QSGW call
-    that one service spelling: one flat-k forward FFT, three inverse FFTs,
-    the signed ``i 2*pi R`` multiplier and reduced-to-Cartesian conversion.
+    Both this producer-side gate and QSGW call
+    :func:`common.parallel_transport.fourth_order_covariant_derivative`.
+    The acceptance observable is the static occupied-to-empty head tensor,
+    supplemented by the complex transition-velocity overlap so a conjugated
+    link orientation cannot pass a phase-blind quadratic response.  Full
+    matrix maxima and leading blocks remain diagnostics: high empty-empty
+    crossings do not enter an insulating head and cannot veto its artifact.
     """
     try:
-        from gw.qsgw_head import (covariant_cartesian_derivative,
-                                  reduced_covector_to_cartesian)
+        from gw.qsgw_head import (
+            head_s_tensor_sharded,
+            reduced_covector_to_cartesian,
+        )
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "parallel-transport validation requires "
-            "gw.qsgw_head.covariant_cartesian_derivative and "
-            "reduced_covector_to_cartesian; merge the QSGW head service "
-            "lane") from exc
+            "gw.qsgw_head.head_s_tensor_sharded and "
+            "reduced_covector_to_cartesian") from exc
 
     energies = jnp.asarray(energies_full)
-    A = jnp.asarray(connection_cart)
+    occupations = jnp.asarray(occupations_full)
     exact = jnp.asarray(velocity_exact_cart)
     links = jnp.asarray(links_full)
     grid = tuple(int(x) for x in kgrid)
@@ -1281,10 +1263,13 @@ def complete_velocity_validation(
         raise ValueError(
             f"energies_full must be (nk, nb); got {energies.shape}")
     nk, nb = int(energies.shape[0]), int(energies.shape[1])
-    if A.shape[:2] != (3, nk) or A.shape[-2:] != (nb, nb):
+    if tuple(occupations.shape) != (nk, nb):
         raise ValueError(
-            f"connection shape {A.shape} does not match energies "
+            f"occupations shape {occupations.shape} does not match energies "
             f"{energies.shape}")
+    if tuple(exact.shape) != (3, nk, nb, nb):
+        raise ValueError(
+            f"exact velocity must be (3,{nk},{nb},{nb}); got {exact.shape}")
     if tuple(links.shape) != (3, nk, nb, nb):
         raise ValueError(
             f"links_full must be (3, {nk}, {nb}, {nb}); got "
@@ -1294,97 +1279,106 @@ def complete_velocity_validation(
         raise ValueError(
             f"forward_neighbors must be ({nk}, 3); got {plus.shape}")
     h_sharding = NamedSharding(mesh, P(None, "x", "y"))
-    stack_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
     spacing = 1.0 / np.asarray(grid, dtype=np.float64)
-    identity_reciprocal = np.eye(3, dtype=np.float64)
 
     def _diagonal_hamiltonian(e):
-        return jax.vmap(jnp.diag)(e).astype(A.dtype)
+        return jax.vmap(jnp.diag)(e).astype(links.dtype)
 
     _diagonal_hamiltonian = jax.jit(
         _diagonal_hamiltonian, out_shardings=h_sharding)
-    H = _diagonal_hamiltonian(energies.astype(A.real.dtype))
-
-    # Diagnostic arm: the pre-0187 sorted-diagonal reconstruction, kept so a
-    # single run reports its own before/after without a second job.
-    sorted_frame = covariant_cartesian_derivative(
-        H, A, mesh=mesh, kgrid=grid, bvec_cart=reciprocal)
-
-    reduced_rows = []
-    holonomy = 0.0
-    for idir in range(3):
-        U, defect = transported_frame(
-            links[idir], plus, idir, grid[idir],
-            mesh=mesh, band_matmul=band_matmul)
-        holonomy = max(holonomy, defect)
-        U_h = _dagger(U)
-        transported_link = band_matmul(
-            band_matmul(U_h, links[idir]), U[plus[:, idir]])
-        # Only this direction's connection enters this direction's covariant
-        # derivative; the other two rows are the identity link, whose
-        # fourth-order connection is exactly zero.
-        link_stack = jnp.broadcast_to(
-            jnp.eye(nb, dtype=links.dtype), (3, nk, nb, nb))
-        link_stack = jax.lax.with_sharding_constraint(
-            link_stack.at[idir].set(transported_link), stack_sharding)
-        connection = fourth_order_connection(
-            link_stack, plus, spacing, band_matmul=band_matmul)
-        connection = jax.lax.with_sharding_constraint(
-            jnp.zeros_like(connection).at[idir].set(connection[idir]),
-            stack_sharding)
-        H_t = jax.lax.with_sharding_constraint(
-            band_matmul(band_matmul(U_h, H), U), h_sharding)
-        # bvec = 1 makes the shared service return d/d(kappa_i) directly; the
-        # three reduced rows are converted together once, below.
-        row = covariant_cartesian_derivative(
-            H_t, connection, mesh=mesh, kgrid=grid,
-            bvec_cart=identity_reciprocal)[idir]
-        reduced_rows.append(band_matmul(band_matmul(U, row), U_h))
-    transported = reduced_covector_to_cartesian(
-        jax.lax.with_sharding_constraint(
-            jnp.stack(reduced_rows, axis=0), stack_sharding),
-        reciprocal)
+    H = _diagonal_hamiltonian(energies.astype(links.real.dtype))
+    reduced = fourth_order_covariant_derivative(
+        H, links, plus, spacing, band_matmul=band_matmul)
+    reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
 
     metrics = _velocity_error_metrics(
-        transported, exact, atol=float(atol), rtol=float(rtol))
-    diagnostic = _velocity_error_metrics(
-        sorted_frame, exact, atol=float(atol), rtol=float(rtol))
-    metrics["transport_holonomy"] = float(holonomy)
-    for name in ("max_abs", "max_rel", "max_abs_diagonal",
-                 "max_abs_offdiagonal"):
-        metrics[f"{name}_sorted_frame"] = diagnostic[name]
-    metrics["passed_sorted_frame"] = diagnostic["passed"]
+        reconstructed, exact, atol=float(atol), rtol=float(rtol))
+    metrics["entrywise_passed"] = bool(metrics["passed"])
+
+    delta_e = energies[:, :, None] - energies[:, None, :]
+    occupation_difference = (
+        occupations[:, None, :] - occupations[:, :, None])
+    transition = (
+        (delta_e > 0.0) & (jnp.abs(occupation_difference) > 1.0e-10))
+    transition = transition[None]
+    exact_norm = jnp.sqrt(jnp.sum(
+        jnp.where(transition, jnp.abs(exact) ** 2, 0.0)))
+    reconstructed_norm = jnp.sqrt(jnp.sum(
+        jnp.where(transition, jnp.abs(reconstructed) ** 2, 0.0)))
+    transition_error = jnp.sqrt(jnp.sum(jnp.where(
+        transition, jnp.abs(reconstructed - exact) ** 2, 0.0)))
+    overlap = jnp.sum(jnp.where(
+        transition, jnp.conj(exact) * reconstructed, 0.0 + 0.0j))
+    overlap = overlap / jnp.maximum(
+        exact_norm * reconstructed_norm, jnp.asarray(1.0e-30))
+    metrics["transition_relative_l2"] = float(jax.device_get(
+        transition_error / jnp.maximum(exact_norm, 1.0e-30)))
+    metrics["transition_overlap_real"] = float(jax.device_get(jnp.real(overlap)))
+    metrics["transition_overlap_imag"] = float(jax.device_get(jnp.imag(overlap)))
+
+    response_kwargs = dict(
+        mesh=mesh,
+        nb_logical=nb,
+        cell_volume=1.0,
+        nk_tot=nk,
+        nspin=1,
+        nspinor=1,
+        eta_ry=0.0,
+    )
+    exact_response = head_s_tensor_sharded(
+        exact, energies, occupations, jnp.asarray([0.0 + 0.0j]),
+        **response_kwargs)[0]
+    reconstructed_response = head_s_tensor_sharded(
+        reconstructed, energies, occupations,
+        jnp.asarray([0.0 + 0.0j]), **response_kwargs)[0]
+    response_norm = jnp.linalg.norm(exact_response)
+    response_relative = (
+        jnp.linalg.norm(reconstructed_response - exact_response)
+        / jnp.maximum(response_norm, 1.0e-30))
+    exact_trace = jnp.real(jnp.trace(exact_response))
+    safe_exact_trace = jnp.where(
+        jnp.abs(exact_trace) > 1.0e-30,
+        exact_trace,
+        jnp.asarray(1.0e-30, dtype=exact_trace.dtype),
+    )
+    response_trace_ratio = (
+        jnp.real(jnp.trace(reconstructed_response)) / safe_exact_trace)
+    metrics["head_response_relative_frobenius"] = float(
+        jax.device_get(response_relative))
+    metrics["head_response_trace_ratio"] = float(
+        jax.device_get(response_trace_ratio))
+    metrics["passed"] = bool(
+        np.isfinite(metrics["head_response_relative_frobenius"])
+        and np.isfinite(metrics["transition_overlap_real"])
+        and metrics["head_response_relative_frobenius"] <= float(rtol)
+        and metrics["transition_overlap_real"] >= 1.0 - float(rtol)
+    )
+
     blocks = tuple(int(m) for m in scope_blocks if 0 < int(m) <= nb)
     if blocks:
         metrics["blocks"] = _block_scoped_metrics(
-            transported, exact, blocks, atol=float(atol), rtol=float(rtol))
-        metrics["blocks_sorted_frame"] = _block_scoped_metrics(
-            sorted_frame, exact, blocks, atol=float(atol), rtol=float(rtol))
+            reconstructed, exact, blocks, atol=float(atol), rtol=float(rtol))
         if jax.process_index() == 0:
-            print(f"  velocity validation, leading band blocks (nb={nb}, "
-                  f"nk={nk}); transport holonomy max|S-1|={holonomy:.6e}")
-            print("   bands  transported max_abs  diag        offdiag     "
-                  "| sorted-frame max_abs  diag        offdiag")
-            for new, old in zip(metrics["blocks"],
-                                metrics["blocks_sorted_frame"]):
-                print(f"   1..{new['bands']:<4d} {new['max_abs']:.6e}"
-                      f"        {new['max_abs_diagonal']:.4e}  "
-                      f"{new['max_abs_offdiagonal']:.4e}  | "
-                      f"{old['max_abs']:.6e}        "
-                      f"{old['max_abs_diagonal']:.4e}  "
-                      f"{old['max_abs_offdiagonal']:.4e}")
+            print(f"  finite-link velocity diagnostics (nb={nb}, nk={nk})")
+            print("   bands  max_abs      diag         offdiag      rel_l2 gate")
+            for row in metrics["blocks"]:
+                print(f"   1..{row['bands']:<4d} {row['max_abs']:.6e}  "
+                      f"{row['max_abs_diagonal']:.4e}  "
+                      f"{row['max_abs_offdiagonal']:.4e}  "
+                      f"{str(row['passed']):>5s}")
     write_velocity_validation(path, mesh=mesh, metrics=metrics)
     if not metrics["passed"]:
         refusal = RuntimeError(
-            "parallel-transport DFT velocity validation failed in the "
-            "transported frame: "
-            f"max_abs={metrics['max_abs']:.6e}, "
-            f"max_rel={metrics['max_rel']:.6e}, "
-            f"atol={metrics['atol']:.6e}, rtol={metrics['rtol']:.6e} "
-            f"(sorted-frame diagnostic max_abs="
-            f"{metrics['max_abs_sorted_frame']:.6e}, transport holonomy "
-            f"max|S-1|={holonomy:.6e})")
+            "parallel-transport finite-link DFT head validation failed: "
+            f"head_response_relative_frobenius="
+            f"{metrics['head_response_relative_frobenius']:.6e}, "
+            f"transition_overlap="
+            f"{metrics['transition_overlap_real']:+.6e}"
+            f"{metrics['transition_overlap_imag']:+.6e}j, "
+            f"required response <= {float(rtol):.6e} and overlap real >= "
+            f"{1.0 - float(rtol):.6e}; full-matrix diagnostic max_abs="
+            f"{metrics['max_abs']:.6e}")
         # A refusal that carries its own numbers: a caller scanning band
         # windows or tolerances should never have to re-run to read them.
         refusal.metrics = metrics
@@ -1392,7 +1386,14 @@ def complete_velocity_validation(
     return metrics
 
 
-def _full_bz_links(io, *, mesh, nk: int, nb_storage: int):
+def load_full_bz_links(
+    io,
+    *,
+    mesh,
+    nk: int,
+    nb_storage: int,
+    nb_logical: int,
+):
     """Read the stored links and return them as ``(3, nk, nb, nb)``.
 
     The link stage stores either one row per full-BZ point (bcc/fcc, where
@@ -1409,29 +1410,44 @@ def _full_bz_links(io, *, mesh, nk: int, nb_storage: int):
         LINKS_DATASET, shape=(n_source, 3, nb_storage, nb_storage),
         partition_spec=block_spec)
     if n_source == nk:
-        return jnp.moveaxis(stored, 1, 0)
-    try:
-        from symmetry_maps import apply_band_matrix_symmetry
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            "unfolding symmetry-reduced parallel-transport links requires "
-            "symmetry_maps.apply_band_matrix_symmetry; merge the symmetry "
-            "service lane") from exc
+        links = jnp.moveaxis(stored, 1, 0)
+    else:
+        try:
+            from symmetry_maps import apply_band_matrix_symmetry
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "unfolding symmetry-reduced parallel-transport links requires "
+                "symmetry_maps.apply_band_matrix_symmetry; merge the symmetry "
+                "service lane") from exc
 
-    def _table(name):
-        return np.asarray(io.read_slab(
-            f"directed_edge_{name}", shape=(nk, 3),
-            partition_spec=P(None, None), as_numpy=True))
+        def _table(name):
+            return np.asarray(io.read_slab(
+                f"directed_edge_{name}", shape=(nk, 3),
+                partition_spec=P(None, None), as_numpy=True))
 
-    selected = stored[_table("source_row"), _table("source_direction")]
-    unfolded = apply_band_matrix_symmetry(
-        selected,
-        antiunitary=_table("antiunitary"),
-        reverse=_table("reverse"),
-        sewing_start=None,
-        sewing_end=None,
-    )
-    return jnp.moveaxis(unfolded, 1, 0)
+        selected = stored[_table("source_row"), _table("source_direction")]
+        unfolded = apply_band_matrix_symmetry(
+            selected,
+            antiunitary=_table("antiunitary"),
+            reverse=_table("reverse"),
+            sewing_start=None,
+            sewing_end=None,
+        )
+        links = jnp.moveaxis(unfolded, 1, 0)
+
+    nb = int(nb_logical)
+    if not 0 < nb <= int(nb_storage):
+        raise ValueError(
+            f"logical link manifold {nb} outside storage {nb_storage}")
+    if int(nb_storage) > nb:
+        # The stored pad block is zero.  Identity links make a pad operator
+        # exactly inert under finite-link transport without changing any
+        # logical row or column.
+        pad = np.zeros((nb_storage, nb_storage), dtype=np.complex128)
+        rows = np.arange(nb, nb_storage)
+        pad[rows, rows] = 1.0
+        links = links + jnp.asarray(pad)[None, None]
+    return links
 
 
 def validate_parallel_transport_artifact(
@@ -1451,10 +1467,6 @@ def validate_parallel_transport_artifact(
     grid = tuple(int(x) for x in kgrid)
     nk = int(np.prod(grid))
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
-        connection = io.read_slab(
-            CONNECTION_CART_DATASET,
-            shape=(3, nk, nb_storage, nb_storage),
-            partition_spec=P(None, None, "x", "y"))
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET,
             shape=(3, nk, nb_storage, nb_storage),
@@ -1463,29 +1475,25 @@ def validate_parallel_transport_artifact(
             ENERGIES_DATASET,
             shape=(nk, nb_storage),
             partition_spec=P(None, ("x", "y")))
+        occupations = io.read_slab(
+            OCCUPATIONS_DATASET,
+            shape=(nk, nb_storage),
+            partition_spec=P(None, ("x", "y")))
         forward_neighbors = np.asarray(io.read_slab(
             "full_forward_neighbors", shape=(nk, 3),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
-        links = _full_bz_links(
-            io, mesh=mesh, nk=nk, nb_storage=nb_storage)
+        links = load_full_bz_links(
+            io, mesh=mesh, nk=nk, nb_storage=nb_storage,
+            nb_logical=nb)
     if nb <= 0 or nb > int(np.shape(energies)[1]):
         raise ValueError(
             f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")
-    if nb_storage > nb:
-        # The stored links are zero outside the logical manifold. Put the
-        # identity on the pad diagonal so the transported frame stays
-        # unitary there; energies, velocity and connection are all zero on
-        # those rows, so they contribute exactly zero error either way.
-        pad = np.zeros((nb_storage, nb_storage), dtype=np.complex128)
-        rows = np.arange(nb, nb_storage)
-        pad[rows, rows] = 1.0
-        links = links + jnp.asarray(pad)[None, None]
     if scope_blocks is None:
         scope_blocks = tuple(range(8, nb, 8)) + (nb,)
     return complete_velocity_validation(
         path, mesh=mesh, kgrid=grid, bvec_cart=bvec_cart,
         energies_full=energies,
-        connection_cart=connection,
+        occupations_full=occupations,
         velocity_exact_cart=velocity,
         links_full=links,
         forward_neighbors=forward_neighbors,
@@ -1617,11 +1625,12 @@ def _block_scoped_metrics(
 _VELOCITY_GATE_KEYS = (
     "atol", "rtol", "max_abs", "max_rel",
     "max_abs_diagonal", "max_abs_offdiagonal",
+    "transition_relative_l2", "transition_overlap_real",
+    "transition_overlap_imag", "head_response_relative_frobenius",
+    "head_response_trace_ratio",
 )
 _VELOCITY_DIAGNOSTIC_KEYS = (
-    "transport_holonomy",
-    "max_abs_sorted_frame", "max_rel_sorted_frame",
-    "max_abs_diagonal_sorted_frame", "max_abs_offdiagonal_sorted_frame",
+    "entrywise_passed",
 )
 
 

@@ -46,7 +46,7 @@ __all__ = [
     "build_iteration_head_response",
     "build_dft_head_response",
     "covariant_cartesian_derivative",
-    "covariant_structured_delta",
+    "covariant_link_derivative",
     "head_s_tensor_sharded",
     "head_wings_sharded",
     "static_head_wings_sharded",
@@ -79,7 +79,8 @@ _HEAD_WING_FREQUENCY_BLOCK = 8
 class ParallelTransportHeadData:
     """Validated, device-resident inputs held across the SC loop."""
 
-    connection_cart: jax.Array
+    forward_links: jax.Array
+    forward_neighbors: np.ndarray
     velocity_dft_cart: jax.Array
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
@@ -88,18 +89,18 @@ class ParallelTransportHeadData:
 
 @dataclass(frozen=True)
 class DftVelocityHeadData:
-    """The same head inputs MINUS the Berry connection.
+    """The same head inputs minus the finite links.
 
     ``sc_head_update = dft_velocity`` runs the metallic head chain on the
     exact DFT p-matrix velocity written by
     ``get_dipole_mtxels --parallel-transport`` and NOTHING else from that
-    artifact: no connection, so no covariant ``DΔH`` correction to the
+    artifact: no links, so no covariant ``DΔH`` correction to the
     velocity, so no dependence on the link/rotation stage.  The velocity is
     still rotated into the current QP basis every iteration by the same
     ``U`` the head carry threads — the approximation is confined to the
     ΔH-induced *change* of the velocity operator, which this mode drops.
 
-    ``connection_cart`` is a field, pinned at ``None``, so that every
+    ``forward_links`` is a field, pinned at ``None``, so that every
     consumer can ask one object the same question and branch on the answer
     instead of on the mode string.
 
@@ -112,7 +113,8 @@ class DftVelocityHeadData:
     velocity_dft_cart: jax.Array
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
-    connection_cart: None = None
+    forward_links: None = None
+    forward_neighbors: None = None
     validation: None = None
 
 
@@ -126,7 +128,7 @@ def load_parallel_transport_head(
     """Load and validate the preprocessing artifact without mixed ownership.
 
     Every cheap provenance/refusal is checked before either O(nk*nb^2)
-    dataset is read.  The stored connection is manifold-dependent, so a
+    dataset is read.  The stored links are manifold-dependent, so a
     strict subset or superset is rejected rather than sliced.
 
     The metadata are rank-0/small datasets, which ``SlabIO.read_slab`` does
@@ -136,9 +138,9 @@ def load_parallel_transport_head(
     import h5py
 
     from file_io.parallel_transport import (
-        CONNECTION_CART_DATASET,
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
+        load_full_bz_links,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
@@ -160,6 +162,11 @@ def load_parallel_transport_head(
         "max_rel",
         "max_abs_diagonal",
         "max_abs_offdiagonal",
+        "transition_relative_l2",
+        "transition_overlap_real",
+        "transition_overlap_imag",
+        "head_response_relative_frobenius",
+        "head_response_trace_ratio",
     )
     with h5py.File(path, "r") as raw:
         ints = {name: int(raw[name][()]) for name in int_names}
@@ -198,7 +205,7 @@ def load_parallel_transport_head(
         or ints["velocity_validation_passed"] != 1
     ):
         refusals.append(
-            "mandatory full-matrix DFT velocity validation is not complete/passing"
+            "mandatory finite-link DFT head validation is not complete/passing"
         )
     if ints["band_start"] != 0 or ints["band_stop"] != expected_nb:
         refusals.append(
@@ -232,8 +239,12 @@ def load_parallel_transport_head(
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
         large_shape = (3, int(meta.nk_tot), nb_storage, nb_storage)
-        connection = io.read_slab(
-            CONNECTION_CART_DATASET, shape=large_shape, partition_spec=spec
+        forward_neighbors = np.asarray(io.read_slab(
+            "full_forward_neighbors", shape=(int(meta.nk_tot), 3),
+            partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
+        links = load_full_bz_links(
+            io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=nb_storage,
+            nb_logical=expected_nb,
         )
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
@@ -241,18 +252,21 @@ def load_parallel_transport_head(
 
     expected_prefix = (3, int(meta.nk_tot))
     if (
-        tuple(connection.shape[:2]) != expected_prefix
-        or connection.shape != velocity.shape
-        or connection.shape[-2] != connection.shape[-1]
-        or int(connection.shape[-1]) < expected_nb
+        tuple(links.shape[:2]) != expected_prefix
+        or links.shape != velocity.shape
+        or links.shape[-2] != links.shape[-1]
+        or int(links.shape[-1]) < expected_nb
+        or forward_neighbors.shape != (int(meta.nk_tot), 3)
     ):
         raise ValueError(
             f"{path}: large PT dataset shapes are inconsistent: "
-            f"A={connection.shape}, v={velocity.shape}, expected prefix "
+            f"links={links.shape}, v={velocity.shape}, neighbors="
+            f"{forward_neighbors.shape}, expected prefix "
             f"{expected_prefix} and at least {expected_nb} bands."
         )
     return ParallelTransportHeadData(
-        connection_cart=connection,
+        forward_links=links,
+        forward_neighbors=forward_neighbors,
         velocity_dft_cart=velocity,
         nb_logical=expected_nb,
         reciprocal_lattice_cart=reciprocal,
@@ -279,7 +293,7 @@ def load_dft_velocity_head(
 
     * ``connection_complete`` / ``velocity_validation_*`` are NOT required.
       The velocity is written and checked by the dipole job on its own; the
-      link, connection and velocity-identity stages exist to serve the
+      link and velocity-validation stages exist to serve the
       covariant correction this mode does not take.
     Every other provenance refusal the PT loader emits is kept verbatim:
     schema, band manifold, k grid, reciprocal lattice, WFN fingerprint.
@@ -310,8 +324,12 @@ def load_dft_velocity_head(
         np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
     )
     refusals = []
-    if schema != int(SCHEMA_VERSION):
-        refusals.append(f"schema_version={schema}, expected {SCHEMA_VERSION}")
+    # Schema 3 changes only the link-consumer validation contract.  The DFT
+    # velocity payload and all provenance fields are byte-for-byte schema-2
+    # compatible, and this mode deliberately consumes no links.
+    if schema not in (2, int(SCHEMA_VERSION)):
+        refusals.append(
+            f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
     if (band_start, band_stop) != (0, nb):
         refusals.append(
             f"band manifold [{band_start},{band_stop}) != [0,{nb})"
@@ -517,58 +535,38 @@ def covariant_cartesian_derivative(
     return partial - 1j * _commutator_kernel(mesh)(A, H)
 
 
-def _structured_delta_kernel(mesh: Mesh, nb_active: int) -> Callable:
-    """Covariant derivative for active-block plus diagonal-tail Delta H."""
-    key = ("structured_delta", id(mesh), int(nb_active))
-    hit = _KERNEL_CACHE.get(key)
-    if hit is not None:
-        return hit
-    from common.parallel_transport import make_distributed_band_matmul
-
-    multiply = make_distributed_band_matmul(mesh, n_batch_axes=2)
-    na = int(nb_active)
-
-    @jax.jit
-    def _kernel(delta, A, partial):
-        diag = jnp.diagonal(delta, axis1=-2, axis2=-1)
-        active = delta[:, :na, :na]
-        active_offdiag = active - (
-            jnp.eye(na, dtype=active.dtype)[None]
-            * jnp.diagonal(active, axis1=-2, axis2=-1)[:, None, :]
-        )
-        K = jnp.broadcast_to(active_offdiag[None], (3,) + active_offdiag.shape)
-        AK = multiply(A[:, :, :, :na], K)
-        KA = multiply(K, A[:, :, :na, :])
-        comm = A * (diag[None, :, None, :] - diag[None, :, :, None])
-        comm = comm.at[:, :, :, :na].add(AK)
-        comm = comm.at[:, :, :na, :].add(-KA)
-        return partial - 1j * comm
-
-    _KERNEL_CACHE[key] = _kernel
-    return _kernel
-
-
-def covariant_structured_delta(
+def covariant_link_derivative(
     delta_h_dft,
-    connection_cart,
+    forward_links,
+    forward_neighbors,
     *,
-    U_active,
     mesh: Mesh,
     kgrid,
     bvec_cart,
 ):
-    """Efficient D DeltaH for a dense active block and diagonal tail.
+    """Return the direct finite-link covariant derivative of ``Delta H``.
 
-    The only band GEMMs have an active contracted dimension.  The diagonal
-    tail commutator is elementwise, avoiding O(nb_head^3) work.
+    Neighbouring operators are transported into the central DFT basis before
+    the fourth-order reduced-coordinate stencil is applied.  This is one
+    gauge-covariant discrete object; no separately differentiated Hamiltonian
+    and connection commutator have to cancel on a finite grid.
     """
-    delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
-    A = jnp.asarray(connection_cart, dtype=jnp.complex128)
-    na = int(U_active.shape[-1])
-    partial = spectral_cartesian_derivative(
-        delta, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart
+    from common.parallel_transport import (
+        fourth_order_covariant_derivative,
+        make_distributed_band_matmul,
     )
-    return _structured_delta_kernel(mesh, na)(delta, A, partial)
+
+    delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
+    links = jnp.asarray(forward_links, dtype=jnp.complex128)
+    spacing = 1.0 / np.asarray(tuple(int(n) for n in kgrid), dtype=np.float64)
+    reduced = fourth_order_covariant_derivative(
+        delta,
+        links,
+        np.asarray(forward_neighbors, dtype=np.int64),
+        spacing,
+        band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+    )
+    return reduced_covector_to_cartesian(reduced, bvec_cart)
 
 
 def _active_rotation_kernel(mesh: Mesh, nb_active: int) -> Callable:
@@ -1698,7 +1696,8 @@ def head_samples_from_s(
 
 def build_iteration_head_response(
     delta_h_dft,
-    connection_cart,
+    forward_links,
+    forward_neighbors,
     velocity_dft_cart,
     U_dft_to_qp,
     energies_qp_kn_ry,
@@ -1720,19 +1719,23 @@ def build_iteration_head_response(
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
-    ``connection_cart=None`` is ``sc_head_update = dft_velocity``: no Berry
-    connection is resident, so the covariant ``DΔH`` correction is dropped
+    ``forward_links=None`` is ``sc_head_update = dft_velocity``: no link
+    manifold is resident, so the covariant ``DΔH`` correction is dropped
     and the bare DFT p-matrix velocity enters.  ``delta_h_dft`` is then
     unused and may be None.  Everything downstream of the velocity —
     the per-iteration rotation into the QP basis, S(z), the Drude term, the
     ISDF wings, the static κ² — is the SAME code on both routes.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    if connection_cart is not None:
-        v_dft_basis = v_dft_basis + covariant_structured_delta(
+    if forward_links is not None:
+        if forward_neighbors is None:
+            raise ValueError(
+                "forward_neighbors are required when forward_links are present"
+            )
+        v_dft_basis = v_dft_basis + covariant_link_derivative(
             delta_h_dft,
-            connection_cart,
-            U_active=U_dft_to_qp,
+            forward_links,
+            forward_neighbors,
             mesh=mesh,
             kgrid=kgrid,
             bvec_cart=bvec_cart,
@@ -1900,7 +1903,8 @@ def build_dft_head_response(
 
 def build_iteration_head_samples(
     delta_h_dft,
-    connection_cart,
+    forward_links,
+    forward_neighbors,
     velocity_dft_cart,
     U_dft_to_qp,
     energies_qp_kn_ry,
@@ -1921,7 +1925,8 @@ def build_iteration_head_samples(
     """Backward-compatible direct-head builder used by small diagnostics."""
     response = build_iteration_head_response(
         delta_h_dft,
-        connection_cart,
+        forward_links,
+        forward_neighbors,
         velocity_dft_cart,
         U_dft_to_qp,
         energies_qp_kn_ry,

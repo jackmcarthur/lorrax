@@ -15,9 +15,10 @@ import pytest
 from jax.sharding import Mesh
 
 from common.chi_from_dipole import compute_S_omega
+from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
-    _structured_delta_kernel,
     assemble_head_manifold,
+    covariant_link_derivative,
     head_wings_sharded,
     head_s_tensor_sharded,
     load_parallel_transport_head,
@@ -81,6 +82,11 @@ def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatc
                 "max_rel": 2.0,
                 "max_abs_diagonal": 0.5,
                 "max_abs_offdiagonal": 0.75,
+                "transition_relative_l2": 0.1,
+                "transition_overlap_real": 0.99,
+                "transition_overlap_imag": 0.0,
+                "head_response_relative_frobenius": 1.0e-3,
+                "head_response_trace_ratio": 1.0,
             }.items()
         }
     )
@@ -109,7 +115,7 @@ def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatc
     monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
     wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
     meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
-    with pytest.raises(ValueError, match="mandatory full-matrix DFT velocity"):
+    with pytest.raises(ValueError, match="mandatory finite-link DFT head"):
         load_parallel_transport_head(
             "parallel_transport.h5", mesh=_mesh(), wfn=wfn, meta=meta
         )
@@ -324,28 +330,48 @@ def test_frequency_blocked_isdf_wings_match_direct_transition_sum():
     np.testing.assert_allclose(np.asarray(Z), Z_ref, rtol=8e-14, atol=8e-14)
 
 
-def test_structured_covariant_kernel_matches_dense_commutator():
+def test_finite_link_derivative_is_exactly_gauge_covariant():
     rng = np.random.default_rng(410)
-    nk, nb, na = 3, 8, 4
-    raw_a = rng.normal(size=(3, nk, nb, nb)) + 1j * rng.normal(size=(3, nk, nb, nb))
-    A = raw_a + np.swapaxes(raw_a.conj(), -1, -2)
-    raw_active = rng.normal(size=(nk, na, na)) + 1j * rng.normal(size=(nk, na, na))
-    active = raw_active + np.swapaxes(raw_active.conj(), -1, -2)
-    delta = np.zeros((nk, nb, nb), dtype=np.complex128)
-    delta[:, :na, :na] = active
-    delta[:, np.arange(na, nb), np.arange(na, nb)] = rng.normal(size=(nk, nb - na))
-    partial = rng.normal(size=(3, nk, nb, nb)) + 1j * rng.normal(size=(3, nk, nb, nb))
-
-    got = np.asarray(
-        _structured_delta_kernel(_mesh(), na)(
-            jnp.asarray(delta), jnp.asarray(A), jnp.asarray(partial)
+    grid = (2, 2, 2)
+    nk, nb = int(np.prod(grid)), 8
+    coords = np.stack(
+        np.meshgrid(*(np.arange(n) for n in grid), indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    plus = build_forward_neighbor_table(coords, grid)
+    links = np.broadcast_to(
+        np.eye(nb, dtype=np.complex128), (3, nk, nb, nb)
+    ).copy()
+    raw = rng.normal(size=(nk, nb, nb)) + 1j * rng.normal(size=(nk, nb, nb))
+    operator = raw + np.swapaxes(raw.conj(), -1, -2)
+    gauge = np.stack([_haar(rng, nb) for _ in range(nk)])
+    operator_gauge = np.einsum(
+        "kmi,kmn,knj->kij", gauge.conj(), operator, gauge, optimize=True
+    )
+    links_gauge = np.empty_like(links)
+    for idir in range(3):
+        links_gauge[idir] = np.einsum(
+            "kmi,kmn,knj->kij",
+            gauge.conj(), links[idir], gauge[plus[:, idir]], optimize=True
         )
+
+    kwargs = dict(
+        mesh=_mesh(), kgrid=grid,
+        bvec_cart=np.asarray([[1.7, 0.1, 0.0], [0.0, 1.2, 0.2], [0.1, 0.0, 0.9]])
     )
-    ref = partial - 1j * (
-        np.einsum("akim,kmj->akij", A, delta, optimize=True)
-        - np.einsum("kim,akmj->akij", delta, A, optimize=True)
+    reference = np.asarray(covariant_link_derivative(
+        jnp.asarray(operator), jnp.asarray(links), plus, **kwargs))
+    got = np.asarray(covariant_link_derivative(
+        jnp.asarray(operator_gauge), jnp.asarray(links_gauge), plus, **kwargs))
+    expected = np.einsum(
+        "kmi,akmn,knj->akij", gauge.conj(), reference, gauge, optimize=True
     )
-    np.testing.assert_allclose(got, ref, rtol=3e-14, atol=3e-14)
+    np.testing.assert_allclose(got, expected, rtol=2e-13, atol=2e-13)
+
+    # Red twin: rotating Delta H without co-rotating the links is not gauge
+    # covariant and must remain observably wrong.
+    wrong = np.asarray(covariant_link_derivative(
+        jnp.asarray(operator_gauge), jnp.asarray(links), plus, **kwargs))
+    assert np.max(np.abs(wrong - expected)) > 1.0e-2
 
 
 def test_active_rotation_matches_dense_block_diagonal_rotation():
