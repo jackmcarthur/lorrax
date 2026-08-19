@@ -811,6 +811,18 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
     return gap, n, shift
 
 
+def _local_vbm_index(*, nelec: int, nval: int, nb_keep: int) -> int:
+    """Return the VBM index in the loaded ``[nelec-nval, ...)`` window."""
+    band_start = int(nelec) - int(nval)
+    index = (int(nelec) - 1) - band_start
+    if not 0 <= index < int(nb_keep):
+        raise ValueError(
+            "htransform VBM is outside the loaded band window: "
+            f"nelec={nelec}, nval={nval}, local_index={index}, "
+            f"window_width={nb_keep}")
+    return index
+
+
 @partial(jax.jit, static_argnames=('top_band_index', 'a_band_index'))
 def _f_params_jit(enk_nb_nk: jax.Array, top_band_index: int,
                   a_band_index: int) -> jax.Array:
@@ -1734,10 +1746,13 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         energies_sorted = gather_to_host(energies_sorted_jax)
         timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
-        # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
-        fermi_band_idx = int(wfn.nelec) - 1
-        if 0 <= fermi_band_idx < energies_sorted.shape[1]:
-            fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
+        # ``energies_sorted`` is local to [nelec-nval, nelec+ncond), not a
+        # zero-based slice of every WFN band.  Convert the absolute VBM band
+        # to that local window before choosing the output energy reference.
+        fermi_band_idx = _local_vbm_index(
+            nelec=int(wfn.nelec), nval=int(meta.nval),
+            nb_keep=int(energies_sorted.shape[1]))
+        fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
         if not gamma_positions:
             # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
             # rows (they are exact zeros and would win the tie on any path

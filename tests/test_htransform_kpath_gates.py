@@ -50,12 +50,22 @@ def _synthetic(nk_grid=(2, 2, 1), nb=4, rank=32, n_mu=6, ns=2, seed=11):
 def _kpath_inputs(nk_grid=(2, 2, 1), nb=4, rank=32, nq=8):
     from types import SimpleNamespace
     ct, enk, _B, _ = _synthetic(nk_grid=nk_grid, nb=nb, rank=rank)
-    meta = SimpleNamespace(nkx=nk_grid[0], nky=nk_grid[1], nkz=nk_grid[2])
+    meta = SimpleNamespace(
+        nkx=nk_grid[0], nky=nk_grid[1], nkz=nk_grid[2], nval=2)
     wfn = SimpleNamespace(efermi=0.0, nelec=2)
     rng = np.random.default_rng(5)
     kpath = rng.uniform(-0.5, 0.5, size=(nq, 3))
     x_path = np.arange(nq, dtype=float)
     return meta, ct, enk, wfn, (kpath, x_path, [0], [None], [])
+
+
+def test_vbm_index_is_local_to_nonzero_band_window():
+    """A CrI3-like 20-band window starts at 120, so its VBM is column 9."""
+    from bandstructure.htransform import _local_vbm_index
+
+    assert _local_vbm_index(nelec=130, nval=10, nb_keep=20) == 9
+    with pytest.raises(ValueError, match="outside the loaded band window"):
+        _local_vbm_index(nelec=130, nval=0, nb_keep=20)
 
 
 @pytest.mark.parametrize("ndev", [1, 4])
