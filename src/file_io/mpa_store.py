@@ -195,13 +195,15 @@ FIT_TABLE_OWNER = "Omega_p"
 FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
 FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
 
-#: The two per-element fit diagnostics the format REQUIRES; everything
-#: else a fit measures is extra.  Single source for the names derived
-#: from them on disk — the ``fit_<k>`` datasets, the ``block_<k>_max``
-#: journal columns and the ``<k>_max_allowed`` certification attrs — so
-#: a third required diagnostic cannot be added at one site and missed at
-#: another.
-REQUIRED_DIAGNOSTICS = ("condition", "backward_error")
+#: Scalar metrics retained in the small completion ledger and enforced by
+#: :func:`validate_fit_store`.  They are computed for every element, reduced
+#: per block, and never need an ``(n_q, n_mu, n_mu)`` payload dataset.
+CERTIFICATION_METRICS = ("condition", "backward_error")
+
+#: The sole per-element diagnostic retained in production fit stores.  It is
+#: useful when localizing an ill-conditioned pole fit; all other fit health is
+#: reduced into :data:`CERTIFICATION_METRICS` before the payload write.
+PERSISTED_DIAGNOSTICS = ("condition",)
 
 #: Every scalar-head fit model :func:`read_head_fit` knows how to
 #: interpret.  The reader refuses an unknown model rather than serving
@@ -1935,7 +1937,7 @@ def _initialise_fit_metadata(
     led.create_dataset("blocks_done", data=np.zeros((n_q, n_mu), dtype=bool))
     led.create_dataset("block_journal", shape=(0, 3), maxshape=(None, 3),
                        dtype=np.int64)
-    for key in REQUIRED_DIAGNOSTICS:
+    for key in CERTIFICATION_METRICS:
         led.create_dataset("block_" + key + "_max", shape=(0,),
                            maxshape=(None,), dtype=np.float64)
     if diagnostic_keys is not None:
@@ -2023,12 +2025,14 @@ def allocate_fit_store(
             grp, n_q=n_q, n_mu=n_mu, n_p=n_p, energy_unit=energy_unit,
             grid_hash=grid_hash, table_hash=table_hash,
             centroid_hash=centroid_hash, unfold_tables=unfold_tables,
-            provenance=provenance, occupation_state=occupation_state)
+            provenance=provenance,
+            diagnostic_keys=PERSISTED_DIAGNOSTICS,
+            occupation_state=occupation_state)
         grp.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
         grp.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu),
                            dtype=dtype)
-        for key in REQUIRED_DIAGNOSTICS:
+        for key in PERSISTED_DIAGNOSTICS:
             grp.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
                                dtype=np.float64)
 
@@ -2036,7 +2040,7 @@ def allocate_fit_store(
 
 
 def allocate_fit_store_collective(
-    dest, *, mesh_xy, n_q, n_mu, n_p, diagnostic_keys,
+    dest, *, mesh_xy, n_q, n_mu, n_p,
     energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
     unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
     mode="w",
@@ -2053,12 +2057,11 @@ def allocate_fit_store_collective(
     COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO), and
     ``mode`` is REFUSED unless ``'w'`` — this call owns the inode.
 
-    ``diagnostic_keys`` is required and must be a superset of
-    :data:`REQUIRED_DIAGNOSTICS`; one ``fit_<key>`` dataset of
-    ``(n_q, n_mu, n_mu)`` float64 is created per key, so the set is fixed
-    at allocation and cannot grow later.  ``unfold_tables``,
-    ``occupation_state`` and the three identity hashes are stamped as the
-    serial twin documents them.
+    Only the per-element ``fit_condition`` map is retained.  Backward error
+    and the remaining fit-health quantities are reduced into the small
+    completion ledger before this payload write; they are not full tensor
+    datasets.  ``unfold_tables``, ``occupation_state`` and the three identity
+    hashes are stamped as the serial twin documents them.
 
     RETURNS :func:`fit_completion_ledger`, UNIFORMLY — every rank reads it
     back after the barrier, so this return does not depend on the rank
@@ -2083,11 +2086,7 @@ def allocate_fit_store_collective(
             "allocate_fit_store_collective requires mode='w': allocation "
             "must replace the inode so SlabIO can apply its rank-aware "
             "Lustre stripe policy")
-    keys = tuple(sorted(str(k) for k in diagnostic_keys))
-    if not set(REQUIRED_DIAGNOSTICS).issubset(keys):
-        raise ValueError(
-            "allocate_fit_store_collective requires "
-            + " and ".join(REQUIRED_DIAGNOSTICS) + " diagnostics")
+    keys = PERSISTED_DIAGNOSTICS
     dtype = np.complex128 if dtype is None else dtype
     with SlabIO(dest, mode="w", mesh=mesh_xy) as io:
         io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
@@ -2172,7 +2171,7 @@ def _commit_fit_blocks(led, records):
     journal = np.empty((len(records), 3), dtype=np.int64)
     maxima = {
         key: np.empty(len(records), dtype=np.float64)
-        for key in REQUIRED_DIAGNOSTICS
+        for key in CERTIFICATION_METRICS
     }
     for i, (iq, cols, lo, hi, cond_max, berr_max) in enumerate(records):
         done[int(iq), np.asarray(cols, dtype=np.int64)] = True
@@ -2181,7 +2180,7 @@ def _commit_fit_blocks(led, records):
         maxima["backward_error"][i] = float(berr_max)
     led["blocks_done"][...] = done
     _append(led["block_journal"], journal)
-    for key in REQUIRED_DIAGNOSTICS:
+    for key in CERTIFICATION_METRICS:
         _append(led["block_" + key + "_max"], maxima[key])
 
 
@@ -2598,8 +2597,9 @@ def write_fit_block(
         ``(N_μ_rows, len(mu_cols))`` float.  REQUIRED, not optional:
         the Σ stage's certification refuses poles whose fit did not meet
         its gates, and a pole whose conditioning nobody recorded cannot
-        be refused later — it can only be trusted.  Extra keys are
-        stored beside them under their own names.
+        be refused later — it can only be trusted.  Only the condition
+        map is persisted; backward error and any extra arrays are validated
+        here and then reduced/discarded.
 
     Returns the ledger dict, so a driver can log progress without a
     second open.
@@ -2635,25 +2635,17 @@ def write_fit_block(
                     f"Σ_p B_p e^{{−iΩ_p τ}} with p outermost.")
         diag = _canonical_diagnostics(diag_block, n_mu, int(cols.size))
 
-        # ONE DIAGNOSTIC SET PER STORE.  The first block fixes which
-        # quantities this fit measured; a later block that measured a
-        # different set would leave the odd-one-out's array full of
-        # zeros wherever the other blocks wrote — and a zero condition
-        # number is a PERFECTLY conditioned solve, so the Σ stage's
-        # certification would pass exactly the elements nobody measured.
-        keys = ",".join(sorted(diag))
+        # The payload schema is fixed at allocation.  Fit-health arrays not
+        # named in PERSISTED_DIAGNOSTICS are deliberately ephemeral; their
+        # block maxima still enter the certification ledger below.
+        keys = ",".join(PERSISTED_DIAGNOSTICS)
         stamped = qs.qirr_attr_str(led, "diagnostic_keys")
-        if stamped is None:
-            led.attrs["diagnostic_keys"] = keys
-        elif stamped != keys:
+        if stamped != keys:
             raise ValueError(
-                f"write_fit_block: this block reports diagnostics "
-                f"[{keys}] but the store's earlier blocks reported "
-                f"[{stamped}].  A quantity measured for some blocks and "
-                f"not others reads back as ZERO for the rest, and a "
-                f"zero condition number is a perfectly conditioned "
-                f"solve — the certification would pass precisely the "
-                f"elements nobody measured.")
+                f"write_fit_block: allocated diagnostic payload "
+                f"[{stamped}] does not match the production schema "
+                f"[{keys}].  Allocate a new fit store rather than mixing "
+                f"schemas in a partial file.")
 
         done = led["blocks_done"][()]
         already = cols[done[iq, cols]]
@@ -2670,16 +2662,8 @@ def write_fit_block(
         sel = slice(lo, hi) if sel is None else sel
         grp["Omega_p"][:, iq, :, sel] = Om
         grp["B_p"][:, iq, :, sel] = Bp
-        for key in REQUIRED_DIAGNOSTICS:
+        for key in PERSISTED_DIAGNOSTICS:
             grp["fit_" + key][iq, :, sel] = diag[key]
-        for key, arr in diag.items():
-            if key in REQUIRED_DIAGNOSTICS:
-                continue
-            name = "fit_" + key
-            if name not in grp:
-                grp.create_dataset(name, shape=(n_q, n_mu, n_mu),
-                                   dtype=np.float64)
-            grp[name][iq, :, sel] = arr
 
         _commit_fit_block(led, iq, cols, lo, hi,
                           np.max(diag["condition"]),
@@ -2693,7 +2677,7 @@ class FitWriter:
     The fit output is larger than its one-tile working set, so blocks still
     stream to disk as soon as they are fitted.  What persists is the FILE
     HANDLE, not the pole tensors: one ``SlabIO(mode='a')`` owns all block
-    writes, caches the six dataset handles, and only then does rank zero
+    writes, caches the three dataset handles, and only then does rank zero
     publish the small completion ledger in one h5py transaction.  A failed
     payload close publishes nothing.
 
@@ -2702,7 +2686,7 @@ class FitWriter:
     allowing that read to overlap this handle's asynchronous H5Dwrite is
     illegal even though the two inodes differ (parallel HDF5's VOL state is
     process-global).  Pre-opening every output dataset before the first
-    write and using one drain per six-write block gives the service a strict
+    write and using one drain per three-write block gives the service a strict
     ``read W -> fit -> write+drain poles`` transaction order without
     restoring any per-block file open or ledger transaction.
 
@@ -2734,6 +2718,11 @@ class FitWriter:
             raise ValueError(
                 "FitWriter: allocated store has no diagnostic_keys stamp")
         self.diagnostic_keys = tuple(stamped.split(","))
+        if self.diagnostic_keys != PERSISTED_DIAGNOSTICS:
+            raise ValueError(
+                "FitWriter: allocated diagnostic payload "
+                f"{self.diagnostic_keys!r} does not match production "
+                f"schema {PERSISTED_DIAGNOSTICS!r}")
         self._pending = []
         from file_io.slab_io import SlabIO
         self._io = SlabIO(self.dest, mode=mode, mesh=mesh_xy)
@@ -2903,7 +2892,7 @@ class FitWriter:
         row = np.asarray([[iq, lo, hi]], dtype=np.int64)
         ledger["journal"] = np.concatenate((ledger["journal"], row), axis=0)
         for key, value in zip(
-                REQUIRED_DIAGNOSTICS,
+                CERTIFICATION_METRICS,
                 (block_condition_max, block_backward_error_max)):
             name = "block_" + key + "_max"
             ledger[name] = np.append(ledger[name], float(value))
@@ -2947,13 +2936,16 @@ def _canonical_diagnostics(diag_block, n_rows, n_cols):
     certification is stated in the MPA theory chapter: "condition numbers
     and backward error, diagonal/off-diagonal and norm-resolved
     distributions"), so they are REQUIRED and everything else is extra.
+    All arrays are checked here, but only :data:`PERSISTED_DIAGNOSTICS` are
+    written as full tensors; the certification metrics are reduced into the
+    compact per-block ledger.
     """
     if not isinstance(diag_block, dict):
         raise TypeError(
             f"write_fit_block: diag_block must be a dict with "
             f"'condition' and 'backward_error'; got "
             f"{type(diag_block).__name__}")
-    missing = [k for k in REQUIRED_DIAGNOSTICS if k not in diag_block]
+    missing = [k for k in CERTIFICATION_METRICS if k not in diag_block]
     if missing:
         raise ValueError(
             f"write_fit_block: diag_block is missing {missing}.  The Σ "
@@ -3013,7 +3005,7 @@ def fit_completion_ledger(src, *, mode="r"):
         maxima = {
             key: np.asarray(led["block_" + key + "_max"][()],
                             dtype=np.float64)
-            for key in REQUIRED_DIAGNOSTICS
+            for key in CERTIFICATION_METRICS
         }
         certification = {
             str(key)[len("mpa_cert_"):]: grp.attrs[key]
@@ -3114,13 +3106,13 @@ def validate_fit_store(src, *, expected_identity=None,
             raise ValueError(
                 f"MPA fit identity mismatch for {key}: got {got!r}, "
                 f"expected {want!r}")
-    missing = [key + "_max_allowed" for key in REQUIRED_DIAGNOSTICS
+    missing = [key + "_max_allowed" for key in CERTIFICATION_METRICS
                if key + "_max_allowed" not in ledger["certification"]]
     if missing:
         raise ValueError(
             "MPA Sigma requires certified pole fits; the store is missing "
             + ", ".join(missing))
-    for metric_key in REQUIRED_DIAGNOSTICS:
+    for metric_key in CERTIFICATION_METRICS:
         key = metric_key + "_max_allowed"
         allowed = ledger["certification"][key]
         if not np.isfinite(float(allowed)) or float(allowed) <= 0.0:
@@ -3147,7 +3139,7 @@ def _require_certification(certification, dest):
     """
     cert = dict(certification or {})
     missing, bad = [], []
-    for key in REQUIRED_DIAGNOSTICS:
+    for key in CERTIFICATION_METRICS:
         name = key + "_max_allowed"
         if name not in cert:
             missing.append(name)
@@ -3170,7 +3162,7 @@ def _require_certification(certification, dest):
         f"  file  : {dest}\n"
         f"  got   : certification={certification!r} — {faults}.\n"
         f"  want  : a finite, positive "
-        + " and ".join(k + "_max_allowed" for k in REQUIRED_DIAGNOSTICS)
+        + " and ".join(k + "_max_allowed" for k in CERTIFICATION_METRICS)
         + ", the thresholds validate_fit_store enforces against the "
         "observed maxima.  Finalizing without them stamps a store that "
         "the validator refuses ('MPA Sigma requires certified pole "
@@ -3178,7 +3170,7 @@ def _require_certification(certification, dest):
         "refused and every writer refuses a finalized store.\n"
         "  fix   : pass certification={"
         + ", ".join(f"'{k}_max_allowed': <threshold>"
-                    for k in REQUIRED_DIAGNOSTICS)
+                    for k in CERTIFICATION_METRICS)
         + "}.  The fit driver's own values are the solver-consistency "
         "pair 1/rcond and sqrt(eps) (gw/mpa/fit_driver.py); a stage with "
         "no material tolerance of its own should reuse them rather than "
@@ -3204,7 +3196,7 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
     default only so the omission fails by name instead of as a
     ``TypeError``.  A ``certification`` that would not satisfy
     :func:`validate_fit_store` — absent, empty, or missing/garbage in any
-    ``<key>_max_allowed`` for :data:`REQUIRED_DIAGNOSTICS` — is REFUSED
+    ``<key>_max_allowed`` for :data:`CERTIFICATION_METRICS` — is REFUSED
     HERE, before the store is opened, because the resulting file would be
     unusable AND unrepairable: the validator refuses an uncertified store
     ("MPA Sigma requires certified pole fits"), a second
@@ -3255,7 +3247,7 @@ def finalize_fit_store(dest, *, certification=None, mode="a"):
                 "zeros are poles.")
         grp.attrs["mpa_fit_complete"] = True
         grp.attrs["mpa_fit_finalized_utc"] = _utc_now()
-        for key in REQUIRED_DIAGNOSTICS:
+        for key in CERTIFICATION_METRICS:
             vals = np.asarray(led["block_" + key + "_max"][()])
             grp.attrs["mpa_fit_" + key + "_max"] = np.float64(
                 vals.max() if vals.size else 0.0)
@@ -3327,13 +3319,16 @@ def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
         sel = slice(lo, hi) if sel is None else sel
         Om = np.asarray(grp["Omega_p"][:, iq, :, sel])
         Bp = np.asarray(grp["B_p"][:, iq, :, sel])
-        required_ds = tuple("fit_" + k for k in REQUIRED_DIAGNOSTICS)
-        diag = {k: np.asarray(grp["fit_" + k][iq, :, sel])
-                for k in REQUIRED_DIAGNOSTICS}
-        for key in grp:
-            if str(key).startswith("fit_") and key not in required_ds:
-                diag[str(key)[len("fit_"):]] = np.asarray(
-                    grp[key][iq, :, sel])
+        stamp = ledger["diagnostic_keys"] or ""
+        keys = tuple(key for key in stamp.split(",") if key)
+        diag = {}
+        for key in keys:
+            name = "fit_" + key
+            if name not in grp:
+                raise ValueError(
+                    f"read_fit_block: diagnostic_keys names {name!r}, "
+                    "but the dataset is absent")
+            diag[key] = np.asarray(grp[name][iq, :, sel])
         return Om, Bp, diag, ledger
 
 

@@ -920,15 +920,14 @@ def _staged_fit(path, n_q=2, n_mu=6, n_p=3, n_cols=2, stop_after=None,
     return truth, steps
 
 
-def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
-    """Every staged block comes back exactly, diagnostics included.
+def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
+    """Every staged block comes back exactly with its condition map.
 
     The diagnostics are the point, not decoration: the Σ stage refuses
     poles that fail certification, and a pole whose condition number and
-    backward error nobody recorded can only be trusted.  So they round
-    trip under the same bit-equality as the poles themselves, and the
-    file-level maxima the finalize stamps are asserted against the
-    blocks they were taken from.
+    backward error nobody recorded can only be trusted.  Condition therefore
+    round-trips under the same bit-equality as the poles; backward error is
+    reduced into the ledger rather than retained as a full tensor.
     """
     truth, _ = _staged_fit(tmpdir_path)
     MS.finalize_fit_store(
@@ -939,18 +938,24 @@ def test_b_and_omega_round_trip_with_diagnostics_intact(tmpdir_path):
         assert np.array_equal(gOm, Om), (q, lo, hi)
         assert np.array_equal(gBp, Bp), (q, lo, hi)
         assert np.array_equal(gdiag["condition"], diag["condition"])
-        assert np.array_equal(gdiag["backward_error"],
-                              diag["backward_error"])
+        assert set(gdiag) == {"condition"}
         assert ledger["complete"]
 
     Om, Bp, diag, ledger = MS.read_fit_tensors(tmpdir_path)
     assert Om.shape == (3, 2, 6, 6) and Bp.shape == Om.shape
-    assert set(diag) == {"condition", "backward_error"}
+    assert set(diag) == {"condition"}
     assert ledger["n_done"] == ledger["n_total"] == 2 * 6
     want_cond = max(float(d["condition"].max())
                     for _, _, d in truth.values())
+    want_backward = max(float(d["backward_error"].max())
+                        for _, _, d in truth.values())
     assert ledger["condition_max"] == pytest.approx(want_cond)
+    assert ledger["backward_error_max"] == pytest.approx(want_backward)
     with h5py.File(tmpdir_path, "r") as f:
+        assert "fit_condition" in f
+        assert "fit_backward_error" not in f
+        assert "fit_residual" not in f
+        assert "fit_n_valid" not in f
         assert f.attrs["mpa_fit_condition_max"] == pytest.approx(want_cond)
         assert f.attrs["mpa_cert_condition_max_allowed"] == 1e8
         assert f.attrs["mpa_fit_w_grid_hash"] == "sha256:deadbeef"
@@ -1270,39 +1275,29 @@ def test_the_diagnostics_are_required_and_must_be_finite(tmpdir_path):
     MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp, diag)       # TWIN
 
 
-def test_extra_diagnostics_survive_the_round_trip(tmpdir_path):
-    """A fit that measured more than two things may say so.
-
-    §B's diagnostic list is longer than condition and backward error —
-    held-out complex frequencies, perturbation refits, pruned-pole
-    counts — and a store that could only carry two would push the rest
-    into a side channel nobody reads.
-    """
+def test_extra_diagnostics_are_validated_but_not_persisted(tmpdir_path):
+    """Ephemeral fit-health arrays cannot expand the production schema."""
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
     Om, Bp, diag = _fit_block(2, 4, 4, seed=6)
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     _, _, got, _ = MS.read_fit_block(tmpdir_path, 0, list(range(4)))
-    assert np.array_equal(got["n_poles_pruned"], diag["n_poles_pruned"])
+    assert set(got) == {"condition"}
+    with h5py.File(tmpdir_path, "r") as f:
+        assert "fit_n_poles_pruned" not in f
 
 
-def test_the_diagnostic_set_may_not_change_mid_fit(tmpdir_path):
-    """RED: a quantity measured for some blocks reads as ZERO for the rest.
-
-    And a zero condition number is a perfectly conditioned solve, so the
-    Σ stage's certification would pass exactly the elements nobody
-    measured — the failure mode is not a gap, it is a green light.
-    """
+def test_ephemeral_diagnostics_may_change_without_changing_schema(tmpdir_path):
+    """Only the fixed condition payload crosses blocks; extras are ephemeral."""
     MS.allocate_fit_store(tmpdir_path, n_q=1, n_mu=4, n_p=2)
     Om, Bp, diag = _fit_block(2, 4, 2, seed=7)
     MS.write_fit_block(tmpdir_path, 0, [0, 1], Om, Bp,
                        dict(diag, held_out=np.zeros((4, 2))))
-    with pytest.raises(ValueError, match="earlier blocks reported"):
-        MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
-    MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp,             # TWIN
-                       dict(diag, held_out=np.ones((4, 2))))
+    MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
+    _, _, got, _ = MS.read_fit_tensors(tmpdir_path)
+    assert set(got) == {"condition"}
 
 
 def test_the_ledger_records_ranges_and_their_worst_diagnostics(

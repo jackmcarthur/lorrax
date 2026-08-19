@@ -332,8 +332,10 @@ After either pole finder, the same retarded-sheet guards, canonical ordering,
 and unconstrained all-$2N_p$-sample residue least-squares refit run. Exact-zero
 residues denote pruned poles and are ignored when Sigma geometry is planned.
 
-The fit stores a condition estimate, backward error, sample residual, and
-valid-pole count for every element. Finalization requires
+The fit computes a condition estimate, backward error, sample residual, and
+valid-pole count for every element. Only the condition map is retained as a
+full tensor for debugging. Condition and backward error are reduced per block
+into the compact completion ledger, and finalization requires
 
 $$
 \kappa\leq 1/r_{\mathrm{cond}},
@@ -342,8 +344,9 @@ $$
 $$
 
 using the solve's own $r_{\mathrm{cond}}$. These are numerical-stability
-guards, not an observable-accuracy proof. The sample residual is reported but
-does not replace a held-out W reconstruction or QP convergence test.
+guards, not an observable-accuracy proof. The sample residual participates in
+the in-memory finite-value refusal but is not stored; it does not replace a
+held-out W reconstruction or QP convergence test.
 
 Pole number is not an energy ordering. Any pole index can appear anywhere in
 the fourth quadrant, and all pole fields are fitted independently. The Sigma

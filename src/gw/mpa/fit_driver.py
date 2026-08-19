@@ -56,17 +56,6 @@ __all__ = [
     "run_fit_driver",
 ]
 
-#: The two diagnostics ``mpa_store.write_fit_block`` REQUIRES, plus the
-#: two this driver adds.  Fixed here rather than assembled per block
-#: because the store stamps the key set on the first block and refuses a
-#: later block that reports a different one — a quantity measured for
-#: some blocks and not others reads back as zero for the rest, and a
-#: zero condition number is a perfectly conditioned solve.
-_DIAGNOSTIC_KEYS = ("condition", "backward_error", "residual", "n_valid")
-_ALTERNATE_DIAGNOSTIC_KEYS = _DIAGNOSTIC_KEYS + (
-    "condition_support", "condition_denominator",
-    "backward_error_support", "backward_error_denominator")
-
 # Loewner and the linear companion diagnostic use the fully JAX-resident QR
 # root finder.  The Padé--Thiele diagnostic uses LAPACK/cuSOLVER ``geev``
 # because that is the root step in Yambo's published PT implementation; its
@@ -181,26 +170,24 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
         def _diag(x):
             return jnp.where(valid, x.reshape(n_rows, n_cols), 0.0)[None]
 
+        def _diag_finite(x):
+            shaped = x.reshape(n_rows, n_cols)
+            return jnp.all(jnp.isfinite(jnp.where(valid, shaped, 0.0)))
+
         condition = _diag(diag["cond_pade"])
-        condition_support = _diag(diag["cond_support"])
-        condition_denominator = _diag(diag["cond_denominator"])
         backward = _diag(diag["backward_error"])
-        backward_support = _diag(diag["backward_error_support"])
-        backward_denominator = _diag(diag["backward_error_denominator"])
-        residual = _diag(diag["max_abs_residual"])
-        n_valid = _diag(diag["n_valid"])
         Omega = jnp.where(valid[None, None], Omega, 0.0 + 0.0j)
         Bp = jnp.where(valid[None, None], Bp, 0.0 + 0.0j)
         finite = (
             jnp.all(jnp.isfinite(Omega)) & jnp.all(jnp.isfinite(Bp))
             & jnp.all(jnp.isfinite(condition))
-            & jnp.all(jnp.isfinite(condition_support))
-            & jnp.all(jnp.isfinite(condition_denominator))
             & jnp.all(jnp.isfinite(backward))
-            & jnp.all(jnp.isfinite(backward_support))
-            & jnp.all(jnp.isfinite(backward_denominator))
-            & jnp.all(jnp.isfinite(residual))
-            & jnp.all(jnp.isfinite(n_valid)))
+            & _diag_finite(diag["cond_support"])
+            & _diag_finite(diag["cond_denominator"])
+            & _diag_finite(diag["backward_error_support"])
+            & _diag_finite(diag["backward_error_denominator"])
+            & _diag_finite(diag["max_abs_residual"])
+            & _diag_finite(diag["n_valid"]))
         # One scalar-vector reduction, not a pmax plus a second synchronous
         # integer pmin.  Pole fits are otherwise completely row-local; this
         # is the only cross-rank communication in the compute kernel and it
@@ -212,16 +199,12 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve):
         )), row_axes)
         maxima = summary[:2]
         finite = (summary[2] == 0.0).astype(jnp.int32)
-        return (Omega, Bp, condition, condition_support,
-                condition_denominator, backward, backward_support,
-                backward_denominator, residual, n_valid, maxima, finite)
+        return Omega, Bp, condition, maxima, finite
 
     mapped = shard_map(
         _local, mesh=mesh_xy,
         in_specs=(block_spec, P(None), P(row_axes), P(), P()),
-        out_specs=(pole_spec, pole_spec, diag_spec, diag_spec, diag_spec,
-                   diag_spec, diag_spec, diag_spec, diag_spec, diag_spec,
-                   P(None), P()),
+        out_specs=(pole_spec, pole_spec, diag_spec, P(None), P()),
         check_vma=True)
     return jax.jit(mapped)
 
@@ -330,26 +313,12 @@ def fit_one_block(
     row_ids = device_put_process_local(
         np.arange(n_mu_padded, dtype=np.int32),
         NamedSharding(mesh_xy, P(("x", "y"))))
-    (Omega, B, condition, condition_support, condition_denominator,
-     backward, backward_support, backward_denominator, residual, n_valid,
-     maxima, finite) = kernel(
+    Omega, B, condition, maxima, finite = kernel(
         block, z_dev, row_ids, np.int32(n_mu), np.int32(n_cols))
     Omega.block_until_ready()
     t_fit = time.perf_counter() - t_fit
 
-    diag_block = {
-        "condition": condition,
-        "backward_error": backward,
-        "residual": residual,
-        "n_valid": n_valid,
-    }
-    if solve != "loewner":
-        diag_block.update({
-            "condition_support": condition_support,
-            "condition_denominator": condition_denominator,
-            "backward_error_support": backward_support,
-            "backward_error_denominator": backward_denominator,
-        })
+    diag_block = {"condition": condition}
     maxima_host = np.asarray(maxima.addressable_data(0), dtype=np.float64)
     finite_host = bool(np.asarray(finite.addressable_data(0)))
 
@@ -460,9 +429,6 @@ def run_fit_driver(
     })
     mpa_store.allocate_fit_store_collective(
         fit_dest, mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n,
-        diagnostic_keys=(
-            _DIAGNOSTIC_KEYS if solve == "loewner"
-            else _ALTERNATE_DIAGNOSTIC_KEYS),
         energy_unit=header["omega_units"],
         grid_hash=header["grid_hash"],
         table_hash=header["table_hash"],

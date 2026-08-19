@@ -26,10 +26,9 @@ THE PLANTED FIELD IS SMOOTH AND PHYSICAL ON PURPOSE.  Omega_p and B_p
 vary smoothly over (q, mu, nu) about a well-separated Si-like base set,
 every pole sits inside the admissible box with Gamma well under a, and
 the variation is symmetric under mu <-> nu so the synthesized W_q is
-symmetric the way the real one is.  No guard should fire anywhere in
-the field, and the suite asserts that it does not: a run in which the
-guards were quietly repairing the data would report a recovery number
-that says more about the guards than about the pipeline.
+symmetric the way the real one is.  The end-to-end recovery bar catches
+any guard that materially changes the planted field without retaining a
+full-size valid-pole-count map solely for that assertion.
 """
 
 from __future__ import annotations
@@ -145,9 +144,7 @@ def mesh_xy():
 
 def _allocate_collective_fit(path, n_q, n_mu, n_p, mesh_xy):
     return MS.allocate_fit_store_collective(
-        str(path), mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p,
-        diagnostic_keys=("condition", "backward_error", "residual",
-                         "n_valid"))
+        str(path), mesh_xy=mesh_xy, n_q=n_q, n_mu=n_mu, n_p=n_p)
 
 
 def test_collective_fit_inode_is_slabio_owned_before_metadata(
@@ -175,6 +172,9 @@ def test_collective_fit_inode_is_slabio_owned_before_metadata(
             if self._mode == "a":
                 assert "Omega_p" in group and "B_p" in group
                 assert "fit_condition" in group
+                assert "fit_backward_error" not in group
+                assert "fit_residual" not in group
+                assert "fit_n_valid" not in group
             return group
 
     monkeypatch.setattr(door, "QirrDest", MetadataMustAppend)
@@ -191,8 +191,7 @@ def test_collective_fit_allocation_refuses_inode_preserving_mode(
     with pytest.raises(ValueError, match="requires mode='w'.*stripe policy"):
         MS.allocate_fit_store_collective(
             str(tmp_path / "bad_append.h5"), mesh_xy=mesh_xy,
-            n_q=1, n_mu=3, n_p=2,
-            diagnostic_keys=("condition", "backward_error"), mode="a")
+            n_q=1, n_mu=3, n_p=2, mode="a")
 
 
 def test_run_driver_holds_one_fit_payload_handle(
@@ -203,6 +202,7 @@ def test_run_driver_holds_one_fit_payload_handle(
     fit_path = tmp_path / "one_payload_session.h5"
     opens = []
     syncs = []
+    writes = []
 
     class CountingSlabIO(HostSlabIO):
         def __init__(self, path, *, mode, mesh):
@@ -212,6 +212,10 @@ def test_run_driver_holds_one_fit_payload_handle(
         def sync_writes(self):
             syncs.append(str(self.file.filename))
             super().sync_writes()
+
+        def write_slab(self, name, value, **kwargs):
+            writes.append((str(self.file.filename), name))
+            super().write_slab(name, value, **kwargs)
 
     monkeypatch.setattr(slab_io, "SlabIO", CountingSlabIO)
     ledger, report = fit_driver.run_fit_driver(
@@ -223,6 +227,9 @@ def test_run_driver_holds_one_fit_payload_handle(
     assert report["blocks_walked"] > 1
     assert syncs.count(str(fit_path)) == report["blocks_walked"]
     assert ledger["journal"].shape[0] == report["blocks_walked"]
+    fit_writes = [name for path, name in writes if path == str(fit_path)]
+    assert len(fit_writes) == 3 * report["blocks_walked"]
+    assert set(fit_writes) == {"Omega_p", "B_p", "fit_condition"}
 
 
 def test_failed_fit_session_publishes_no_completion_ledger(
@@ -408,7 +415,7 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
               f"{planted['n_mu']} n_q={planted['n_q']}] "
               f"max|dOmega|={d_omega:.3e} max|dB|={d_b:.3e} "
               f"worst cond={diag['condition'].max():.3e} "
-              f"worst backward error={diag['backward_error'].max():.3e}")
+              f"worst backward error={ledger['backward_error_max']:.3e}")
 
     # The kernel's demonstrated recovery floor, through the whole
     # pipeline.  Not a looser number because the bytes went to disk:
@@ -417,8 +424,8 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     assert d_b < 1.0e-6
 
 
-def test_thiele_end_to_end_writes_extended_diagnostics(tmp_path, mesh_xy):
-    """PT must survive the disk driver, not only the scalar recurrence."""
+def test_thiele_end_to_end_keeps_only_condition_payload(tmp_path, mesh_xy):
+    """PT keeps its refusal metrics in memory without bloating the store."""
 
     w_path = tmp_path / "W_thiele.h5"
     field = _write_w_file(w_path)
@@ -431,11 +438,13 @@ def test_thiele_end_to_end_writes_extended_diagnostics(tmp_path, mesh_xy):
     assert report["solve"] == "thiele"
     assert report["eig"] == "lapack"
     _, _, diagnostics, _ = MS.read_fit_tensors(str(fit_path))
-    for key in (
-            "condition_support", "condition_denominator",
-            "backward_error_support", "backward_error_denominator"):
-        assert key in diagnostics
-        assert np.all(np.isfinite(diagnostics[key]))
+    assert set(diagnostics) == {"condition"}
+    assert np.all(np.isfinite(diagnostics["condition"]))
+    with h5py.File(fit_path, "r") as f:
+        assert "fit_backward_error" not in f
+        assert "fit_residual" not in f
+        assert "fit_n_valid" not in f
+        assert "fit_condition_support" not in f
 
 
 def test_p4_nondivisible_rows_are_padded_not_gathered(mesh_xy):
@@ -575,7 +584,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
               f"max|dB|={d_b:.3e} worst cond="
               f"{diag['condition'].max():.3e}")
 
-    assert np.all(diag["n_valid"] == float(n_p))
+    assert set(diag) == {"condition"}
 
     # The theory guide sec 3.6's law, evaluated on this run's own worst
     # conditioning rather than frozen into a constant.  The docstring
@@ -592,16 +601,13 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
         f"{floor:.3e}; the bar is {_COND_EPS_MARGIN_B:.0f}x")
 
 
-def test_no_guard_fires_anywhere_in_the_planted_field(planted, fitted):
-    """Every element keeps all n_p poles, so the gate measures the fit.
-
-    A field the guards were repairing would report a recovery number
-    that is a statement about the repairs.  ``n_valid`` is carried into
-    the store as a per-element diagnostic precisely so this is
-    checkable after the fact rather than only at fit time.
-    """
+def test_production_fit_persists_only_condition_map(planted, fitted):
+    """Full fit-health arrays do not silently return to production I/O."""
     _, _, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
-    assert np.all(diag["n_valid"] == float(planted["n_p"]))
+    assert set(diag) == {"condition"}
+    with h5py.File(fitted["path"], "r") as f:
+        assert set(k for k in f if str(k).startswith("fit_")) == {
+            "fit_condition"}
 
 
 def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
@@ -616,6 +622,8 @@ def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
     assert bool(ledger["blocks_done"].all())
     assert ledger["journal"].shape == (n_q * plan["n_blocks"], 3)
     assert ledger["block_condition_max"].size == n_q * plan["n_blocks"]
+    assert ledger["block_backward_error_max"].size == \
+        n_q * plan["n_blocks"]
     assert ledger["certification"] == {
         "condition_max_allowed": pytest.approx(1.0e13),
         "backward_error_max_allowed": pytest.approx(
@@ -623,14 +631,13 @@ def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
     }
 
     _, _, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
-    for key in ("condition", "backward_error", "residual", "n_valid"):
-        arr = diag[key]
-        assert arr.shape == (n_q, n_mu, n_mu), key
-        assert np.all(np.isfinite(arr)), key
-        # A zero condition number is a PERFECTLY conditioned solve, so
-        # an unwritten element is indistinguishable from a flawless one
-        # unless something positive was written everywhere.
-        assert np.all(arr > 0.0), key
+    assert set(diag) == {"condition"}
+    arr = diag["condition"]
+    assert arr.shape == (n_q, n_mu, n_mu)
+    assert np.all(np.isfinite(arr))
+    # A zero condition number is a PERFECTLY conditioned solve, so an
+    # unwritten element is indistinguishable from a flawless one.
+    assert np.all(arr > 0.0)
 
 
 def test_the_journal_spans_the_column_axis_exactly_once(planted, fitted):
