@@ -2875,8 +2875,12 @@ def load_head_velocity_source(
     print_fn(
         "  SC head: loaded validated parallel transport from "
         f"{pt_path} (nb={source.nb_logical}, "
-        f"velocity max_abs={vgate['max_abs']:.3e}, "
-        f"max_rel={vgate['max_rel']:.3e})")
+        "head-response rel="
+        f"{vgate['head_response_relative_frobenius']:.3e}, "
+        "transition overlap="
+        f"{vgate['transition_overlap_real']:+.6f}"
+        f"{vgate['transition_overlap_imag']:+.2e}j; "
+        f"full-matrix max_abs={vgate['max_abs']:.3e} diagnostic only)")
     return source
 
 
