@@ -137,6 +137,7 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
 from common.collectives import device_put_process_local
 from common.fft_helpers import make_sharded_ifftn_3d
 from common.provenance import lorrax_version, provenance_header
+from symmetry_maps import common_uniform_grid_indices
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
@@ -875,7 +876,10 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
 
 
-def _gate_stats_on_device(eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy):
+def _gate_stats_on_device(
+    eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy,
+    *, htransform_k_indices=None, stored_k_indices=None,
+):
     """Both gate numbers computed ON DEVICE; only replicated results read back.
 
     Returns ``(max|Δε_c|, Gram(nk, nc, nc))`` as REPLICATED arrays, read with
@@ -905,9 +909,23 @@ def _gate_stats_on_device(eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy):
     reshard, and adding zeros changes neither a norm nor an inner product.
     """
     rep = NamedSharding(mesh_xy, P())
+    ht_idx = (None if htransform_k_indices is None else
+              np.asarray(htransform_k_indices, dtype=np.int32))
+    st_idx = (None if stored_k_indices is None else
+              np.asarray(stored_k_indices, dtype=np.int32))
 
     @partial(jax.jit, out_shardings=(rep, rep, rep))
     def _f(e_ht, e_st, A, B):
+        # A bse_k_grid run stores native COARSE samples while htransform
+        # returns the FINE BSE lattice.  Select paired common-grid rows ON
+        # DEVICE before any subtraction or mu contraction.  The index tables
+        # are closed-over integer metadata from symmetry_maps, so this remains
+        # one jit and neither mu-sharded wavefunction is gathered.
+        if ht_idx is not None:
+            e_ht = jnp.take(e_ht, ht_idx, axis=0)
+            A = jnp.take(A, ht_idx, axis=0)
+            e_st = jnp.take(e_st, st_idx, axis=0)
+            B = jnp.take(B, st_idx, axis=0)
         # ORDER.  htransform returns eigenvalues ASCENDING (they come out of an
         # eigensolve); the stored restart holds them in DFT-BAND-INDEX order.
         # QP corrections reorder bands, so those two orders differ BY
@@ -955,8 +973,10 @@ def _local(x):
                       if hasattr(x, "addressable_data") else x)
 
 
-def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
-                              mesh_xy, log=print):
+def gate_htransform_vs_stored(
+    psi_cQ_gamma, eps_cQ_gamma, data, mesh_xy, *,
+    htransform_k_indices=None, stored_k_indices=None, log=print,
+):
     """On-grid consistency gate at a Γ path point: htransform conduction
     ε vs the stored restart ε (max |Δ|), and the gauge-free per-k subspace
     overlap min singular value of ⟨ψ_ht|ψ_stored⟩ (bands × bands, spin+μ
@@ -971,11 +991,52 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
     ``O(N_μ)`` all-gather per process inside a DIAGNOSTIC, and at P=16 under
     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` it does not work at any of
     three warm-ups.
+
+    A ``bse_k_grid`` densification gives the two operands different native
+    k lattices.  In that case ``htransform_k_indices`` and
+    ``stored_k_indices`` are the aligned exact intersection returned by
+    :func:`symmetry_maps.common_uniform_grid_indices`.  The gate is preserved
+    on those shared physical points; it is never disabled, prefix-trimmed, or
+    nearest-neighbour matched.
     """
+    paired = (htransform_k_indices is not None, stored_k_indices is not None)
+    if paired[0] != paired[1]:
+        raise ValueError(
+            "htransform@Gamma gate requires htransform_k_indices and "
+            "stored_k_indices together.")
+    if paired[0]:
+        ht_idx = np.asarray(htransform_k_indices, dtype=np.int32)
+        st_idx = np.asarray(stored_k_indices, dtype=np.int32)
+        if (ht_idx.ndim != 1 or st_idx.ndim != 1
+                or ht_idx.shape != st_idx.shape or ht_idx.size == 0):
+            raise ValueError(
+                "htransform@Gamma gate matched-k indices must be nonempty "
+                f"aligned vectors; got {ht_idx.shape} and {st_idx.shape}.")
+        n_ht = int(eps_cQ_gamma.shape[0])
+        n_st = int(data["eps_c"].shape[0])
+        if (np.any(ht_idx < 0) or np.any(ht_idx >= n_ht)
+                or np.any(st_idx < 0) or np.any(st_idx >= n_st)):
+            raise ValueError(
+                "htransform@Gamma gate matched-k index outside its native "
+                f"table: htransform rows={n_ht}, stored rows={n_st}, "
+                f"htransform range=[{int(ht_idx.min())},{int(ht_idx.max())}], "
+                f"stored range=[{int(st_idx.min())},{int(st_idx.max())}].")
+        log(f"  [gate] htransform@Gamma native-grid intersection: "
+            f"{ht_idx.size} matched k point(s) from htransform "
+            f"{n_ht} and stored {n_st}")
+    else:
+        ht_idx = st_idx = None
+        if int(eps_cQ_gamma.shape[0]) != int(data["eps_c"].shape[0]):
+            raise ValueError(
+                "htransform@Gamma gate received different native k-grid "
+                f"sizes ({int(eps_cQ_gamma.shape[0])} transformed vs "
+                f"{int(data['eps_c'].shape[0])} stored) without the canonical "
+                "common-grid index map.")
     nc = int(data["n_cond"])
     d_dev, d_idx_dev, G_dev = _gate_stats_on_device(
         eps_cQ_gamma, data["eps_c"], psi_cQ_gamma, data["psi_c_X"],
-        nc, mesh_xy)
+        nc, mesh_xy, htransform_k_indices=ht_idx,
+        stored_k_indices=st_idx)
     d_eps = float(_local(d_dev))
     d_eps_idx = float(_local(d_idx_dev))
     G = _local(G_dev)
@@ -998,7 +1059,10 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
         # the window boundary cutting a degenerate multiplet.  Different bugs,
         # different fixes, and the gate used to print a number that could be
         # either.
-        log(f"  [gate] overlap svals at the worst k (k={k_worst}): "
+        where = (f"matched row {k_worst}, htransform k={int(ht_idx[k_worst])}, "
+                 f"stored k={int(st_idx[k_worst])}"
+                 if ht_idx is not None else f"k={k_worst}")
+        log(f"  [gate] overlap svals at the worst k ({where}): "
             f"{np.array2string(np.asarray(sv_worst), precision=4)}")
     log(f"  [gate] band-index-wise |Δε_c| = {d_meV_idx:.3f} meV — this is "
         f"NOT an accuracy figure.  htransform returns energies ascending and "
@@ -1683,8 +1747,12 @@ def main(argv=None):
         # host ``svd`` per k.  A diagnostic is allowed to cost something; it
         # is not allowed to cost something invisibly.
         t0 = time.time()
+        stored_gate_k, htransform_gate_k = common_uniform_grid_indices(
+            kgrid_co_ct, (nkx, nky, nkz))
         gate_htransform_vs_stored(
-            psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy, log=log)
+            psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy,
+            htransform_k_indices=htransform_gate_k,
+            stored_k_indices=stored_gate_k, log=log)
         tick("gamma_gate", t0)
 
     # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid

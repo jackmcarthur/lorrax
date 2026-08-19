@@ -42,12 +42,59 @@ import pytest
 
 from _deck_stub import deck_available, read_deck
 from symmetry_maps import (SymMaps, centroid_source_map_and_wrap,
+                           common_uniform_grid_indices,
                            fft_grid_pullback_perm, find_irreducible_bz_points,
                            kgrid_shift_map,
                            recover_symmorphic_density_point_group,
                            spinor_rotation_for_sym_row, tau_phase_row,
                            unfold_psi)
 from symmetry_maps.maps import _I_SIGMA_Y
+
+
+# ---------------------------------------------------------------------------
+# common_uniform_grid_indices — exact native-grid intersection
+# ---------------------------------------------------------------------------
+
+def test_nonnested_8x8_to_12x12_has_the_exact_4x4_intersection():
+    """RED TWIN: 8→12 shares 4 points/axis, not all 8 and not a prefix."""
+    coarse_grid = np.array((8, 8, 1), dtype=np.int64)
+    fine_grid = np.array((12, 12, 1), dtype=np.int64)
+    coarse, fine = common_uniform_grid_indices(coarse_grid, fine_grid)
+
+    assert coarse.dtype == np.int32 and fine.dtype == np.int32
+    assert coarse.shape == fine.shape == (16,)
+    coarse_xyz = np.stack(np.unravel_index(coarse, coarse_grid), axis=1)
+    fine_xyz = np.stack(np.unravel_index(fine, fine_grid), axis=1)
+    assert np.all(coarse_xyz[:, :2] % 2 == 0)
+    assert np.all(fine_xyz[:, :2] % 3 == 0)
+    np.testing.assert_allclose(
+        coarse_xyz / coarse_grid[None, :],
+        fine_xyz / fine_grid[None, :], rtol=0.0, atol=0.0)
+
+    # A min(n_coarse,n_fine) prefix/trim is the defect's tempting bypass.
+    # It compares different physical k points immediately after Gamma.
+    prefix_n = min(int(np.prod(coarse_grid)), int(np.prod(fine_grid)))
+    prefix_coarse = np.stack(
+        np.unravel_index(np.arange(prefix_n), coarse_grid), axis=1)
+    prefix_fine = np.stack(
+        np.unravel_index(np.arange(prefix_n), fine_grid), axis=1)
+    assert not np.array_equal(
+        prefix_coarse / coarse_grid[None, :],
+        prefix_fine / fine_grid[None, :])
+
+
+def test_common_grid_map_keeps_every_point_when_grids_nest_or_match():
+    for coarse_grid, fine_grid in [((3, 2, 1), (6, 4, 1)),
+                                   ((5, 4, 2), (5, 4, 2))]:
+        coarse, fine = common_uniform_grid_indices(coarse_grid, fine_grid)
+        assert coarse.size == int(np.prod(coarse_grid))
+        np.testing.assert_array_equal(coarse, np.arange(coarse.size))
+        coarse_xyz = np.stack(
+            np.unravel_index(coarse, coarse_grid), axis=1)
+        fine_xyz = np.stack(np.unravel_index(fine, fine_grid), axis=1)
+        np.testing.assert_allclose(
+            coarse_xyz / np.asarray(coarse_grid)[None, :],
+            fine_xyz / np.asarray(fine_grid)[None, :], rtol=0.0, atol=0.0)
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,62 @@ def kgrid_shift_map(nkx, nky, nkz, q_off):
     return kpq_index, G_umk
 
 
+def common_uniform_grid_indices(grid_a, grid_b):
+    """Aligned C-order rows shared by two unshifted uniform BZ grids.
+
+    ``grid_a`` and ``grid_b`` describe fractional point sets
+    ``(i_x/N_x, i_y/N_y, i_z/N_z)`` in ``[0, 1)^3``.  Return two ``int32``
+    vectors ``(rows_a, rows_b)`` whose paired rows are the same fractional
+    coordinate, ordered by the common fractional grid in C order.
+
+    The construction is integer-only.  Along one axis, grids of lengths
+    ``N_a`` and ``N_b`` share ``gcd(N_a, N_b)`` points.  Common point ``t``
+    has native indices ``t*N_a/g`` and ``t*N_b/g``.  Thus 8→12 keeps the
+    four-point one-dimensional intersection, not a prefix, nearest-neighbour
+    match, or a fictitious eight-point nesting.
+
+    This helper deliberately covers *unshifted* grids only.  A shifted mesh
+    needs its shift in the contract and must not be silently treated as this
+    point set.
+    """
+    def _grid(name, value):
+        raw = np.asarray(value)
+        if raw.shape != (3,):
+            raise ValueError(
+                f"common_uniform_grid_indices: {name} must have shape (3,), "
+                f"got {raw.shape}.")
+        rounded = np.rint(raw)
+        if not np.allclose(raw, rounded, rtol=0.0, atol=0.0):
+            raise ValueError(
+                f"common_uniform_grid_indices: {name} must contain exact "
+                f"integer extents, got {raw.tolist()}.")
+        out = rounded.astype(np.int64)
+        if np.any(out <= 0):
+            raise ValueError(
+                f"common_uniform_grid_indices: {name} extents must be "
+                f"positive, got {out.tolist()}.")
+        return out
+
+    a = _grid("grid_a", grid_a)
+    b = _grid("grid_b", grid_b)
+    common = np.gcd(a, b)
+
+    axes_a = [np.arange(int(g), dtype=np.int64) * int(na // g)
+              for na, g in zip(a, common)]
+    axes_b = [np.arange(int(g), dtype=np.int64) * int(nb // g)
+              for nb, g in zip(b, common)]
+    rows_a_xyz = np.stack(
+        np.meshgrid(*axes_a, indexing="ij"), axis=-1).reshape(-1, 3)
+    rows_b_xyz = np.stack(
+        np.meshgrid(*axes_b, indexing="ij"), axis=-1).reshape(-1, 3)
+
+    def _flat(rows, grid):
+        return ((rows[:, 0] * grid[1] + rows[:, 1]) * grid[2]
+                + rows[:, 2]).astype(np.int32)
+
+    return _flat(rows_a_xyz, a), _flat(rows_b_xyz, b)
+
+
 def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None):
     """For each row of ``full_kgrid_int`` (a full-BZ point in integer kgrid
     coords), find which IBZ point + ``sym_mats_k`` row maps onto it.
