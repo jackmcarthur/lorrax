@@ -59,6 +59,7 @@ classify_scissor_bands = scissor.classify_scissor_bands
 fit_scissor = scissor.fit_scissor
 full_bz_k_weights = scissor.full_bz_k_weights
 ScissorBandClasses = scissor.ScissorBandClasses
+qsgw_out_of_range_energies = scissor.qsgw_out_of_range_energies
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +430,137 @@ def test_classes_are_width_agnostic_so_a_padded_occupation_table_is_safe():
         assert val_kn.shape == cross_kn.shape == (5, nb)
         assert int(val_kn[0].sum()) == 6
         assert int(cross_kn[0].sum()) == 2
+
+
+# ---------------------------------------------------------------------------
+# 5.  Active QSGW application: rigid low valence, affine conduction
+# ---------------------------------------------------------------------------
+
+def _nontrivial_application_fit():
+    """A fit whose valence regression is unmistakably not a rigid shift."""
+    E = np.array([[-20.0, -6.0, -1.0, 1.0, 5.0, 12.0]])
+    val = np.broadcast_to(
+        (np.arange(E.shape[1]) < 3)[None, :], E.shape)
+    # The trusted higher valence follows 1.6 E + 2, while conduction follows
+    # 1.25 E - 0.75.  Only bands 1:5 enter the fit; bands 0 and 5 are the
+    # low-valence/high-conduction extrapolation targets.
+    E_qp = np.where(val, 1.6 * E + 2.0, 1.25 * E - 0.75)
+    fit_mask = np.zeros_like(val)
+    fit_mask[:, 1:5] = True
+    fit = fit_scissor(
+        E, E_qp, valence_mask_kn=val, fit_mask_kn=fit_mask,
+        k_weights=full_bz_k_weights(E.shape[0]))
+    assert fit.alpha_v == pytest.approx(1.6, abs=1e-14)
+    assert fit.beta_v_ev == pytest.approx(2.0, abs=1e-14)
+    assert fit.alpha_c == pytest.approx(1.25, abs=1e-14)
+    assert fit.beta_c_ev == pytest.approx(-0.75, abs=1e-14)
+    return E, val, fit
+
+
+def test_active_qsgw_ignores_valence_regression_but_keeps_conduction_affine():
+    E, val, fit = _nontrivial_application_fit()
+    dfermi = 1.75
+    out = qsgw_out_of_range_energies(
+        E, fit, val, fermi_displacement_ev=dfermi)
+
+    # LOW VALENCE: exactly the Fermi displacement.  The fitted valence law
+    # predicts -30 eV for the -20 eV target, so this fails loudly if that
+    # deliberately nontrivial regression ever leaks back into application.
+    assert out[0, 0] == E[0, 0] + dfermi
+    assert out[0, 0] == pytest.approx(-18.25, abs=0.0)
+    assert out[0, 0] != pytest.approx(
+        fit.alpha_v * E[0, 0] + fit.beta_v_ev, abs=1.0)
+
+    # CONDUCTION: the existing fitted stretch/intercept is untouched.
+    assert out[0, 5] == pytest.approx(
+        fit.alpha_c * E[0, 5] + fit.beta_c_ev, abs=1e-14)
+    assert out[0, 5] != pytest.approx(E[0, 5] + dfermi, abs=1e-3)
+
+
+def test_candidate_fermi_change_is_applied_without_one_map_lag():
+    E, val, fit = _nontrivial_application_fit()
+    efermi_dft = 0.0
+    # This map's protected/in-window frontier moves from DFT (-1,+1), whose
+    # midgap is 0, to (0,+4), whose candidate midgap is +2 eV.
+    H_candidate_diag = np.array([[-999.0, -5.0, 0.0, 4.0, 6.0, 999.0]])
+    in_range = np.array([False, True, True, True, True, False])
+    # Exact map wiring: fit once, put valence at DFT (shift=0) and conduction
+    # at its FINAL affine value, apply the provisional partition, then solve
+    # the candidate Fermi from that post-partition spectrum.
+    provisional = qsgw_out_of_range_energies(
+        E, fit, val, fermi_displacement_ev=0.0)
+    H_probe_diag = np.where(
+        in_range[None, :], H_candidate_diag, provisional)
+    probe_eigenvalues = np.linalg.eigvalsh(np.diag(H_probe_diag[0]))
+    efermi_candidate = 0.5 * (
+        probe_eigenvalues[2] + probe_eigenvalues[3])
+    assert efermi_candidate == 2.0
+
+    scissor = qsgw_out_of_range_energies(
+        E, fit, val,
+        fermi_displacement_ev=efermi_candidate - efermi_dft)
+    assert scissor[0, 5] == provisional[0, 5]
+    final_diag = np.where(in_range[None, :], H_candidate_diag, scissor)
+    final_eigenvalues = np.linalg.eigvalsh(np.diag(final_diag[0]))
+    efermi_final = 0.5 * (final_eigenvalues[2] + final_eigenvalues[3])
+    assert efermi_final == efermi_candidate
+
+    # The out-of-range valence binding relative to THIS map's output Fermi is
+    # exactly the DFT binding.  Anchoring to the entry/DFT Fermi would leave
+    # it at -20 eV and fail this cell by the full +2 eV map displacement.
+    assert final_diag[0, 0] - efermi_final == (
+        E[0, 0] - efermi_dft)
+    lagged_low_valence = E[0, 0] + (efermi_dft - efermi_dft)
+    assert lagged_low_valence - efermi_candidate != E[0, 0] - efermi_dft
+
+    # Protected/in-window diagonals still come from the full candidate H;
+    # the high out-of-range conduction band still uses alpha_c/beta_c.
+    assert np.array_equal(final_diag[:, 1:5], H_candidate_diag[:, 1:5])
+    assert final_diag[0, 5] == pytest.approx(
+        fit.alpha_c * E[0, 5] + fit.beta_c_ev, abs=1e-14)
+
+
+def test_crossing_band_remains_identity_under_rigid_valence_policy():
+    E, val, fit = _nontrivial_application_fit()
+    crossing = np.zeros_like(val)
+    crossing[:, 2] = True
+    out = qsgw_out_of_range_energies(
+        E, fit, val, fermi_displacement_ev=3.0,
+        crossing_mask_kn=crossing)
+    assert out[0, 2] == E[0, 2]
+
+
+def test_sc_map_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
+    """Static seam gate: the pure policy must be fed F(H)'s own anchor."""
+    source = (_SCISSOR.parent / "sc_iteration.py").read_text()
+    start = source.index("# ``ks``, NOT A WEIGHT ARRAY.")
+    stop = source.index("H_qp_dft_new = apply_band_partition(", start)
+    block = source[start:stop]
+
+    fit = block.index("_scissor_E_qp_for_outofrange(")
+    probe = block.index("H_fermi_probe = apply_band_partition(")
+    anchor = block.index("_partitioned_candidate_efermi(")
+    displacement = block.index("fermi_displacement_ry = (")
+    final_policy = block.index("qsgw_out_of_range_energies(")
+    assert fit < probe < anchor < displacement < final_policy
+    assert "candidate_efermi_ry - float(inputs.efermi_dft_ry)" in block
+    assert "fermi_displacement_ry=0.0" in block
+    # Conduction is already final in the probe and the same fitted object is
+    # passed to the final policy; neither a second fit nor a copied affine law.
+    assert block.count("_scissor_E_qp_for_outofrange(") == 1
+    assert "scissor_E_qp_kn=scissor_provisional_ry" in block
+    assert "scissor_fit," in block
+    assert "solve_mp1_occupations(" not in block
+    assert "requires the complete " in block
+    assert "Fermi-crossing/frontier manifold inside the Sigma window" in block
+
+    # The final H is independently re-anchored and refused if the tail moved
+    # E_F, so the provisional non-circularity argument is executable.
+    final_start = stop
+    final_stop = source.index("# THE STAR-SPREAD GATE", final_start)
+    final_block = source[final_start:final_stop]
+    assert "final_efermi_ry = _partitioned_candidate_efermi(" in final_block
+    assert "final_efermi_ry, candidate_efermi_ry" in final_block
 
 
 def test_frac_tol_is_validated():
