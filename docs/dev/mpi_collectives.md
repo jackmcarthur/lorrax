@@ -270,19 +270,26 @@ JAX 0.9 module and source checkout and checks the live JAX generation before
 the driver starts:
 
 ```bash
-export LORRAX_ROOT=/path/to/lorrax
+export LORRAX_CHECKOUT=/path/to/lorrax
+export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CPUS_PER_TASK=16
-export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
 lx run --cpu -N 2 -n 4 -- bash -c '
   set -euo pipefail
+  export PATH="$CPU_JAX_VENV/bin:$PATH"
   export LORRAX_CPU_SKIP_GPU_PLUGINS=1
   export OMP_NUM_THREADS=14
-  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_CHECKOUT/tools/require_jax09.py"
   python3 -u -m gw.gw_jax -i gw.in
 '
 ```
+
+`LORRAX_CHECKOUT` is the source pin consumed by `lx` when the caller is in a
+data directory; setting only `PYTHONPATH` does not replace it. The explicit
+rank-shell `PATH` is the interpreter pin. The tracked metadata-only checker
+then refuses a JAX/JAXLIB series other than 0.9 without importing JAX.
 
 The prelude validates the adapter's pinned source, MPI ABI and SHA256 manifest;
 rejects stale Frontera overlays and conflicting MPI/PMI preloads; forces CPU,

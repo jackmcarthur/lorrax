@@ -61,6 +61,19 @@ if [[ ! -f "$SENTINEL" ]]; then
     : >"$SENTINEL"
 fi
 
+# Serialise the whole publication recipe.  The root is shared across compute
+# nodes; without a filesystem lock two candidates can both observe a missing
+# release and one ``mv`` becomes a nested directory inside the other release.
+if ! command -v flock >/dev/null 2>&1; then
+    echo "[build_mpiw.pm] ERROR: flock is required for atomic publication" >&2
+    exit 2
+fi
+exec 9>"$MPIW_ROOT/.build.lock"
+if ! flock -n 9; then
+    echo "[build_mpiw.pm] ERROR: another adapter build owns $MPIW_ROOT" >&2
+    exit 2
+fi
+
 STAGE="$MPIW_ROOT/stage"
 RELEASES="$MPIW_ROOT/releases"
 ACTIVE="$MPIW_ROOT/current"
@@ -76,16 +89,27 @@ if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     source /usr/share/lmod/lmod/init/bash
 fi
+if [[ -n "${LORRAX_PM_PRGENV:-}" && \
+      "$LORRAX_PM_PRGENV" != "$LORRAX_PM_PRGENV_DEFAULT" ]] || \
+   [[ -n "${LORRAX_PM_MPICH:-}" && \
+      "$LORRAX_PM_MPICH" != "$LORRAX_PM_MPICH_DEFAULT" ]] || \
+   [[ -n "${LORRAX_PM_CMAKE:-}" && \
+      "$LORRAX_PM_CMAKE" != "$LORRAX_PM_CMAKE_DEFAULT" ]] || \
+   [[ -n "${LORRAX_CMAKE:-}" ]]; then
+    echo "[build_mpiw.pm] ERROR: production adapter toolchain overrides are not certified" >&2
+    echo "[build_mpiw.pm] Use the versioned defaults in config/perlmutter/site_config.sh." >&2
+    exit 2
+fi
 module load \
-    "${LORRAX_PM_PRGENV:-$LORRAX_PM_PRGENV_DEFAULT}" \
-    "${LORRAX_PM_MPICH:-$LORRAX_PM_MPICH_DEFAULT}" \
-    "${LORRAX_PM_CMAKE:-$LORRAX_PM_CMAKE_DEFAULT}"
+    "$LORRAX_PM_PRGENV_DEFAULT" \
+    "$LORRAX_PM_MPICH_DEFAULT" \
+    "$LORRAX_PM_CMAKE_DEFAULT"
 # This is a CPU artifact.  CUDA GTL and Darshan in its DT_NEEDED closure make
 # it unusable in a plain CPU process and are removed before CMake.
 for unwanted_module in gpu craype-accel-nvidia80 cudatoolkit darshan; do
     module unload "$unwanted_module" 2>/dev/null || true
 done
-CMAKE="${LORRAX_CMAKE:-$(command -v cmake || true)}"
+CMAKE="$(command -v cmake || true)"
 if [[ -z "$CMAKE" ]]; then
     echo "[build_mpiw.pm] ERROR: cmake is not on PATH after module setup" >&2
     exit 2
@@ -98,6 +122,18 @@ for compiler in cc CC ftn; do
 done
 if [[ -z "${CRAY_MPICH_DIR:-}" || -z "${CRAY_MPICH_VERSION:-}" ]]; then
     echo "[build_mpiw.pm] ERROR: the versioned Cray MPICH module did not resolve" >&2
+    exit 2
+fi
+for required_module in "$LORRAX_PM_PRGENV_DEFAULT" \
+        "$LORRAX_PM_MPICH_DEFAULT" "$LORRAX_PM_CMAKE_DEFAULT"; do
+    if ! module is-loaded "$required_module"; then
+        echo "[build_mpiw.pm] ERROR: required module is not active: $required_module" >&2
+        module -t list >&2
+        exit 2
+    fi
+done
+if [[ "$CRAY_MPICH_VERSION" != "${LORRAX_PM_MPICH_DEFAULT##*/}" ]]; then
+    echo "[build_mpiw.pm] ERROR: active Cray MPICH $CRAY_MPICH_VERSION does not match $LORRAX_PM_MPICH_DEFAULT" >&2
     exit 2
 fi
 
@@ -213,8 +249,21 @@ if [[ -e "$RELEASE" ]]; then
         echo "[build_mpiw.pm] ERROR: immutable release collision at $RELEASE" >&2
         exit 1
     fi
+    if ! cmp -s "$CANDIDATE/build-manifest.txt" "$RELEASE/build-manifest.txt"; then
+        echo "[build_mpiw.pm] ERROR: existing release manifest differs at $RELEASE" >&2
+        exit 1
+    fi
+    if find "$RELEASE" -perm /222 -print -quit | grep -q .; then
+        echo "[build_mpiw.pm] ERROR: existing release is writable: $RELEASE" >&2
+        exit 1
+    fi
 else
     mv "$CANDIDATE" "$RELEASE"
+    chmod -R a-w "$RELEASE"
+fi
+if find "$RELEASE" -perm /222 -print -quit | grep -q .; then
+    echo "[build_mpiw.pm] ERROR: release publication did not become read-only" >&2
+    exit 1
 fi
 if [[ -e "$ACTIVE" && ! -L "$ACTIVE" ]]; then
     echo "[build_mpiw.pm] ERROR: active path exists but is not a symlink: $ACTIVE" >&2

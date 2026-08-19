@@ -1266,6 +1266,12 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        jit -- or its silent variant, a compile cache reporting
        ``enabled=True`` while writing zero entries.  Costs one
        ``inspect.signature`` per patched hook.
+    5c. :func:`_enforce_cpu_mpi_thread_multiple` -- after the live CPU client
+       has initialized MPI, query the selected MPItrampoline adapter on every
+       rank and refuse a grant below ``MPI_THREAD_MULTIPLE``.  The async
+       progress setting is only a request; this is the check that it worked.
+       It must precede clique construction because XLA can issue collectives
+       from executor threads.
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -1337,6 +1343,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     bootstrap(platform=platform)
     # -- 5b -----------------------------------------------------------------
     _enforce_supported_jax(say)
+    # -- 5c -----------------------------------------------------------------
+    _enforce_cpu_mpi_thread_multiple(say)
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -1499,9 +1507,12 @@ def run_main_and_finalize(main, argv=None) -> None:
     ``argv`` is optional so both ``main()`` and ``main(argv)`` entry points
     use the same boundary.  ``SystemExit`` raised by argparse or a nested
     driver retains its integer status; a message-valued exit is printed and
-    becomes status 1.  Unexpected exceptions retain their traceback.  This
-    function normally does not return because ``finalize_process`` ends with
-    ``os._exit``.
+    becomes status 1.  Unexpected exceptions retain their traceback.  At P>1
+    an installed fail-fast hook owns those exceptions: it exits immediately
+    without collective teardown, because peers may already be blocked in work
+    this rank will never join.  Ordered finalization is reserved for normal
+    returns, intentional ``SystemExit``, and P=1 failures.  This function
+    normally does not return because either path ends with ``os._exit``.
     """
     import operator
     import sys
@@ -1519,7 +1530,18 @@ def run_main_and_finalize(main, argv=None) -> None:
                 print(exc.code, file=sys.stderr, flush=True)
                 rc = 1
     except BaseException:                                  # CLI boundary
-        traceback.print_exc()
+        exc_info = sys.exc_info()
+        if (_resolve_proc_count() > 1
+                and getattr(sys, "_lorrax_failfast_installed", False)):
+            # Do not translate this into an rc and enter finalize_process():
+            # its effects barrier / distributed shutdown are collective and
+            # can hang when only one rank failed.  The installed hook prints
+            # the rank-tagged traceback, flushes both streams and os._exit(1).
+            sys.excepthook(*exc_info)
+            # The LORRAX hook does not return.  Keep the safety property if a
+            # test or embedding application replaced it after installation.
+            os._exit(1)
+        traceback.print_exception(*exc_info)
         rc = 1
     if rc is None:
         rc = 0
@@ -1602,6 +1624,61 @@ def _enforce_supported_jax(say) -> None:
     rather than swallowed.
     """
     _enforce_jax_support(announce=say)
+
+
+def _enforce_cpu_mpi_thread_multiple(say) -> None:
+    """Refuse a live multi-process CPU/MPI grant below thread-multiple.
+
+    ``MPICH_ASYNC_PROGRESS=1`` is a launch request, not evidence about the
+    thread level the MPI implementation actually granted.  JAX initializes
+    MPI while constructing the CPU client in :func:`bootstrap`; only after
+    that point may ``MPIABI_Query_thread`` be called.  Query the same pinned
+    adapter XLA selected, on every rank, before any communicator clique or
+    native FFI family can start collective work.
+
+    GPU jobs, P=1 CPU jobs, and non-MPI CPU jobs are outside this check.  The
+    latter is already refused earlier by :func:`announce_cpu_collectives` at
+    P>1; retaining the guard here keeps this function narrow.
+    """
+    import jax
+
+    if jax.default_backend() != "cpu" or int(jax.process_count()) <= 1:
+        return
+    if os.environ.get("JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip() != "mpi":
+        return
+
+    wrapper = os.environ.get("MPITRAMPOLINE_LIB", "").strip()
+    if not wrapper or not os.path.isabs(wrapper) or not os.path.isfile(wrapper):
+        raise RuntimeError(
+            "multi-process CPU/MPI startup cannot query its live thread "
+            f"grant: MPITRAMPOLINE_LIB={wrapper!r} is not an absolute file")
+
+    import ctypes
+
+    try:
+        adapter = ctypes.CDLL(wrapper, mode=ctypes.RTLD_LOCAL)
+        query = adapter.MPIABI_Query_thread
+        query.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        query.restype = ctypes.c_int
+        provided = ctypes.c_int(-1)
+        status = int(query(ctypes.byref(provided)))
+    except Exception as exc:                                  # noqa: BLE001
+        raise RuntimeError(
+            "multi-process CPU/MPI startup could not call "
+            f"MPIABI_Query_thread through {wrapper}: "
+            f"{type(exc).__name__}: {exc}") from exc
+    if status != 0:
+        raise RuntimeError(
+            "multi-process CPU/MPI startup: MPIABI_Query_thread returned "
+            f"status {status} through {wrapper}")
+    if provided.value < 3:  # MPI_THREAD_MULTIPLE
+        raise RuntimeError(
+            "multi-process CPU/MPI startup requires MPI_THREAD_MULTIPLE (3) "
+            "before XLA clique construction, but the live MPI grant is "
+            f"{provided.value}; on Perlmutter source cpu_mpi_env.sh and keep "
+            "its public MPICH_ASYNC_PROGRESS=1 setting")
+    say(f"[runtime] live CPU/MPI thread grant: MPI_THREAD_MULTIPLE "
+        f"({provided.value}), queried through {wrapper}.")
 
 
 def _enforce_required_ffi(mesh) -> None:

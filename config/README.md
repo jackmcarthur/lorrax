@@ -54,20 +54,28 @@ Build JAX's small MPIwrapper ABI adapter once, then source the CPU prelude
 inside every rank shell before Python:
 
 ```bash
+export LORRAX_CHECKOUT=/path/to/lorrax
+export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 lx run --cpu -N 1 -n 1 -- \
-  "$LORRAX_ROOT/config/perlmutter/build_mpiwrapper.sh" --fresh
+  "$LORRAX_CHECKOUT/config/perlmutter/build_mpiwrapper.sh" --fresh
 
 export LORRAX_CPUS_PER_TASK=16
-export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
 lx run --cpu -N 2 -n 4 -- bash -c '
   set -euo pipefail
+  export PATH="$CPU_JAX_VENV/bin:$PATH"
   export OMP_NUM_THREADS=14 LORRAX_CPU_SKIP_GPU_PLUGINS=1
-  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_CHECKOUT/tools/require_jax09.py"
   python3 -u -m gw.gw_jax -i cohsex.in
 '
 ```
+
+`LORRAX_CHECKOUT` is mandatory from a data/run directory: it makes `lx` and
+the explicit `PYTHONPATH` select the same source. `CPU_JAX_VENV` must name the
+JAX/JAXLIB 0.9 environment; the tracked preflight refuses any other series
+before JAX import or MPI initialization.
 
 The prelude keeps Cray MPICH as the MPI implementation, loads Cray PMI early,
 and requests its async progress thread. The example leaves requested affinity

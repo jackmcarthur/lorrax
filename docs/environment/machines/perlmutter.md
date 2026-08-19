@@ -230,19 +230,26 @@ For every core-driver multi-process CPU step, source the tracked launch
 prelude before Python/JAX:
 
 ```bash
-export LORRAX_ROOT=/path/to/lorrax
+export LORRAX_CHECKOUT=/path/to/lorrax
+export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CPUS_PER_TASK=16
-export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$LORRAX_CHECKOUT/src${PYTHONPATH:+:$PYTHONPATH}"
 lx run --cpu -N 2 -n 4 -- bash -c '
   set -euo pipefail
+  export PATH="$CPU_JAX_VENV/bin:$PATH"
   export LORRAX_CPU_SKIP_GPU_PLUGINS=1
   export OMP_NUM_THREADS=14
-  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_CHECKOUT/tools/require_jax09.py"
   python3 -u -m gw.gw_jax -i gw.in
 '
 ```
+
+Both pins are required. `LORRAX_CHECKOUT` prevents `lx` from falling back to
+the base module's source when invoked from a data directory, while
+`CPU_JAX_VENV` selects the tested CPU JAX environment inside the rank shell.
+The tracked preflight checks JAX and jaxlib before either is imported.
 
 The source inside the `lx` rank shell is the load-bearing one.  It sets the
 four-part Cray contract before JAX import:

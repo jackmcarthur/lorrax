@@ -107,9 +107,10 @@ The native FFI libraries link the site MPI directly and do not route through
 MPItrampoline — they see no MPIwrapper override.
 `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` call
 `MPI_Init_thread(MULTIPLE)` only when nothing initialized MPI first, so
-they coexist with XLA's init by construction. The phdf5 open **warns when
-the granted thread level is below MULTIPLE** — that warning firing means
-the wrapper is not on the path and the ~29 % race regime is back.
+they coexist with XLA's init by construction. They **abort the MPI world
+before their first family collective when the live grant is below MULTIPLE**.
+Multi-process CPU/MPI startup now queries the same live grant before XLA
+communicator-clique construction, so a bad grant normally refuses earlier.
 
 On Perlmutter GPU runs, GPU-aware Cray MPICH
 (`MPICH_GPU_SUPPORT_ENABLED=1` + `libmpi_gtl_cuda.so.0` preload) serves the
