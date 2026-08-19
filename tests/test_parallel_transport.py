@@ -66,18 +66,67 @@ def test_wfn_fingerprint_changes_with_fixed_gauge_file_identity(tmp_path):
     assert first != second
 
 
-def test_artifact_refuses_an_aliased_fourth_order_mesh_before_io():
+def test_full_transport_refuses_an_aliased_fourth_order_mesh_before_io(
+        monkeypatch):
     wfn = types.SimpleNamespace(kgrid=np.asarray([4, 6, 6]))
+    monkeypatch.setattr(
+        pt_io, "_require_service_apis",
+        lambda: (_ for _ in ()).throw(AssertionError("services were touched")))
     try:
-        initialize_parallel_transport_artifact(
+        pt_io.write_parallel_transport_artifact(
             "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
-            effective_nspinor=1, bispinor=False,
-            velocity_dft_kmajor=None, wfn_path="WFN.h5",
-            wfn_fingerprint="0" * 64)
+            bispinor=False)
     except ValueError as exc:
         assert "at least five" in str(exc) and "kgrid=(4, 6, 6)" in str(exc)
     else:
         raise AssertionError("undersampled fourth-order mesh was accepted")
+
+
+def test_exact_velocity_initialization_has_no_stencil_gate(monkeypatch):
+    """A 2D dft_velocity artifact stops before every finite-k operation."""
+    writes = []
+
+    class FakeSlabIO:
+        def __init__(self, path, mode, mesh):
+            writes.append(("open", path, mode, mesh))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def create_dataset(self, name, **kwargs):
+            writes.append(("create", name, kwargs["shape"]))
+
+        def write_slab(self, name, value):
+            writes.append(("slab", name, tuple(value.shape)))
+
+        def write_attr(self, name, value):
+            writes.append(("attr", name, np.shape(value)))
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    wfn = types.SimpleNamespace(
+        kgrid=np.asarray([9, 9, 1]), shift=np.zeros(3), bvec=np.eye(3),
+        blat=1.0)
+    sym = types.SimpleNamespace(
+        nk_tot=81, kirr_fullids=np.arange(81), irr_idx_k=np.arange(81),
+        sym_idx_k=np.zeros(81, dtype=np.int32))
+    monkeypatch.setattr(pt_io, "SlabIO", FakeSlabIO)
+    monkeypatch.setattr(
+        pt_io, "link_symmetry_reduction_applies", lambda sym, kgrid: False)
+    monkeypatch.setattr(
+        pt_io, "_full_band_tables",
+        lambda wfn, sym, nb: (np.zeros((81, nb)), np.zeros((81, nb))))
+
+    initialize_parallel_transport_artifact(
+        "velocity-only.h5", wfn=wfn, sym=sym, mesh=mesh, nbands=1,
+        effective_nspinor=2, bispinor=False,
+        velocity_dft_kmajor=jnp.zeros((81, 3, 1, 1), dtype=jnp.complex128),
+        wfn_path="WFN.h5", wfn_fingerprint="0" * 64)
+
+    assert ("slab", VELOCITY_DFT_DATASET, (3, 81, 1, 1)) in writes
+    assert ("attr", "connection_complete", ()) in writes
 
 
 def test_forward_neighbors_do_not_assume_flattening_order():

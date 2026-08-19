@@ -407,14 +407,6 @@ def initialize_parallel_transport_artifact(
     """
     nb = int(nbands)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
-    undersampled = [axis for axis, n in zip("xyz", kgrid) if n < 5]
-    if undersampled:
-        raise ValueError(
-            "parallel-transport preprocessing requires at least five "
-            "distinct mesh points along every Cartesian mesh direction for "
-            "the advertised fourth-order +/-2 stencil; got "
-            f"kgrid={kgrid} (undersampled axes "
-            f"{','.join(undersampled)}).")
     reduced = link_symmetry_reduction_applies(sym, kgrid)
     nk = int(sym.nk_tot)
     nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
@@ -1054,6 +1046,15 @@ def write_parallel_transport_artifact(
     w_av_second_neighbors: bool = False,
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file."""
+    kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+    undersampled = [axis for axis, n in zip("xyz", kgrid) if n < 5]
+    if undersampled:
+        raise ValueError(
+            "parallel-transport preprocessing requires at least five "
+            "distinct mesh points along every Cartesian mesh direction for "
+            "the advertised fourth-order +/-2 stencil; got "
+            f"kgrid={kgrid} (undersampled axes "
+            f"{','.join(undersampled)}).")
     plan_polar, edge_table, apply_symmetry, q_stencil_table = (
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))

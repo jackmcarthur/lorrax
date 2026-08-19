@@ -771,6 +771,15 @@ def main(argv=None):
 		     "dipole.h5 schema are unchanged.",
 	)
 	parser.add_argument(
+		"--dft-velocity-only",
+		action="store_true",
+		help="With --parallel-transport-out, write the exact DFT velocity "
+		     "transaction consumed by sc_head_update=dft_velocity and skip "
+		     "the finite-k link, connection, and validation stages. This mode "
+		     "does not require a +/-2 k stencil and is the supported producer "
+		     "for collapsed 2D k meshes.",
+	)
+	parser.add_argument(
 		"--w-av-only",
 		action="store_true",
 		help="Write only the finite-q W-av stencil selected by the two "
@@ -845,6 +854,8 @@ def main(argv=None):
 		):
 			if not np.isfinite(value) or float(value) < 0.0:
 				parser.error(f"{name} must be finite and non-negative")
+	elif args.dft_velocity_only:
+		parser.error("--dft-velocity-only requires --parallel-transport-out")
 
 	input_path = Path(args.input).resolve()
 	params = read_cohsex_input(str(input_path))
@@ -856,6 +867,11 @@ def main(argv=None):
 			"W_av_first_neighbors / W_av_second_neighbors require "
 			"--parallel-transport-out: it names the SlabIO stencil "
 			"artifact")
+	if args.dft_velocity_only and (
+			w_av_first_neighbors or w_av_second_neighbors):
+		parser.error(
+			"--dft-velocity-only cannot produce W_av neighbor stencils; "
+			"run the standalone --w-av-only producer instead")
 	if args.w_av_only and not (
 			w_av_first_neighbors or w_av_second_neighbors):
 		parser.error(
@@ -1315,8 +1331,9 @@ def main(argv=None):
 						wfn_path=str(wfn_path),
 						wfn_fingerprint=wfn_fingerprint(wfn),
 						rcond=float(args.parallel_transport_rcond))
-				write_pt_remainder = write_parallel_transport_artifact
-				validate_pt_artifact = validate_parallel_transport_artifact
+				if not args.dft_velocity_only:
+					write_pt_remainder = write_parallel_transport_artifact
+					validate_pt_artifact = validate_parallel_transport_artifact
 			# THE BOUNDARY, named rather than implied: the only consumer
 			# of the (nk, 3, nb, nb) table is the serial h5py write on
 			# rank 0 below, which cannot take a sharded operand.
@@ -1324,7 +1341,7 @@ def main(argv=None):
 			# runs in chunks so a peer's transient is one chunk.
 			dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
 		del H_v, psi_G
-		if pt_path is not None:
+		if write_pt_remainder is not None:
 			# The SlabIO velocity transaction above is closed and durable,
 			# and the all-k psi/H_v device arrays are now dead.  The link
 			# stream therefore holds only one central and one neighbour WFN
@@ -1349,6 +1366,10 @@ def main(argv=None):
 				f"max_abs={metrics['max_abs']:.6e}, "
 				f"max_rel={metrics['max_rel']:.6e}")
 			print(f"\nWrote parallel-transport data to {pt_path}")
+		elif pt_path is not None:
+			print(
+				"\nWrote exact DFT velocity-only data to "
+				f"{pt_path}; finite-k parallel transport was not requested")
 	if dip_k_major is not None:
 		dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
 	else:
