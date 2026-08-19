@@ -205,7 +205,8 @@ fi
 # Content-addressed immutable release, followed by an atomic symlink switch.
 # A failed candidate never touches ACTIVE.  A repeated identical build simply
 # reuses the already-gated release.
-RELEASE="$RELEASES/${MPIW_COMMIT:0:12}-mpich-${CRAY_MPICH_VERSION}-${ARTIFACT_SHA:0:12}"
+RECIPE_ID="${BUILDER_SHA:0:8}-${PRELUDE_SHA:0:8}-${SITE_SHA:0:8}"
+RELEASE="$RELEASES/${MPIW_COMMIT:0:12}-mpich-${CRAY_MPICH_VERSION}-${ARTIFACT_SHA:0:12}-${RECIPE_ID}"
 if [[ -e "$RELEASE" ]]; then
     EXISTING_SHA="$(sha256sum "$RELEASE/lib64/libmpiwrapper.so" | awk '{print $1}')"
     if [[ "$EXISTING_SHA" != "$ARTIFACT_SHA" ]]; then

@@ -293,6 +293,10 @@ that is not a certified progress/XLA-thread affinity policy: XLA workers do
 not obey `OMP_NUM_THREADS`, so production affinity still needs a thread-census
 and async-on/off performance measurement.
 
+Release names include the adapter content hash and the builder/prelude/site
+recipe hashes. Rebuilding identical adapter bytes after changing the recipe
+therefore cannot silently reuse an older provenance manifest.
+
 ### Frontera
 
 **Executable form: `config/frontera/templates/gw_dev.sbatch`** — the
