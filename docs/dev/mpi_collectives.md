@@ -271,6 +271,7 @@ the driver starts:
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/lorrax
+export LORRAX_ROOT="$LORRAX_CHECKOUT"
 export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 export LORRAX_CPUS_PER_TASK=16

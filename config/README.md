@@ -55,6 +55,7 @@ inside every rank shell before Python:
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/lorrax
+export LORRAX_ROOT="$LORRAX_CHECKOUT"
 export CPU_JAX_VENV=/path/to/jax-0.9.1-venv
 export LX_BASE_MODULE=lorrax_A
 lx run --cpu -N 1 -n 1 -- \

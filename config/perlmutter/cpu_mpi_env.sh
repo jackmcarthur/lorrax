@@ -11,7 +11,15 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 2
 fi
 
-_lorrax_pm_root="${LORRAX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_lorrax_pm_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+for _lorrax_pm_source_pin in "${LORRAX_ROOT:-}" "${LORRAX_CHECKOUT:-}"; do
+    if [[ -n "$_lorrax_pm_source_pin" && \
+          "$(realpath -m "$_lorrax_pm_source_pin")" != "$_lorrax_pm_root" ]]; then
+        echo "[cpu_mpi_env.pm] ERROR: inherited source pin disagrees with the sourced prelude" >&2
+        echo "[cpu_mpi_env.pm]   prelude=$_lorrax_pm_root pin=$(realpath -m "$_lorrax_pm_source_pin")" >&2
+        return 2
+    fi
+done
 _lorrax_pm_site="$_lorrax_pm_root/config/perlmutter/site_config.sh"
 if [[ ! -r "$_lorrax_pm_site" ]]; then
     echo "[cpu_mpi_env.pm] ERROR: cannot read $_lorrax_pm_site" >&2
@@ -148,4 +156,4 @@ unset _lorrax_pm_pmi _lorrax_pm_preloads
 unset _lorrax_pm_source_modified _lorrax_pm_recipe_dirty _lorrax_pm_mpich
 unset _lorrax_pm_builder_sha _lorrax_pm_prelude_sha _lorrax_pm_site_sha
 unset _lorrax_pm_want_builder_sha _lorrax_pm_want_prelude_sha
-unset _lorrax_pm_want_site_sha
+unset _lorrax_pm_want_site_sha _lorrax_pm_source_pin

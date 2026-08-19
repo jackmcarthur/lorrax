@@ -13,7 +13,15 @@
 set -euo pipefail
 
 MPIW_REPO="${LORRAX_MPIWRAPPER_REPO:-https://github.com/eschnett/MPIwrapper.git}"
-LORRAX_ROOT="${LORRAX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+for _source_pin in "${LORRAX_ROOT:-}" "${LORRAX_CHECKOUT:-}"; do
+    if [[ -n "$_source_pin" && "$(realpath -m "$_source_pin")" != "$_SCRIPT_ROOT" ]]; then
+        echo "[build_mpiw.pm] ERROR: inherited source pin disagrees with the invoked script" >&2
+        echo "[build_mpiw.pm]   script=$_SCRIPT_ROOT pin=$(realpath -m "$_source_pin")" >&2
+        exit 2
+    fi
+done
+LORRAX_ROOT="$_SCRIPT_ROOT"
 SITE_CONFIG="$LORRAX_ROOT/config/perlmutter/site_config.sh"
 if [[ ! -r "$SITE_CONFIG" ]]; then
     echo "[build_mpiw.pm] ERROR: cannot read $SITE_CONFIG" >&2
@@ -218,6 +226,14 @@ if [[ -n "$(git -C "$LORRAX_ROOT" status --porcelain -- \
 else
     RECIPE_DIRTY=false
 fi
+if [[ "$RECIPE_DIRTY" != false ]]; then
+    echo "[build_mpiw.pm] ERROR: adapter recipe files are modified; commit or restore them before publication" >&2
+    git -C "$LORRAX_ROOT" status --short -- \
+        config/perlmutter/build_mpiwrapper.sh \
+        config/perlmutter/cpu_mpi_env.sh \
+        config/perlmutter/site_config.sh >&2
+    exit 2
+fi
 {
     echo "source_repo=$MPIW_REPO"
     echo "source_commit=$MPIW_COMMIT"
@@ -278,3 +294,4 @@ echo "[build_mpiw.pm]   $ACTIVE/lib64/libmpiwrapper.so"
 echo "[build_mpiw.pm]   MPI ABI $ABI_MAJOR.$ABI_MINOR.$ABI_PATCH"
 echo "$ARTIFACT_SHA  $ACTIVE/lib64/libmpiwrapper.so"
 echo "[build_mpiw.pm] Source config/perlmutter/cpu_mpi_env.sh before Python."
+unset _SCRIPT_ROOT _source_pin
