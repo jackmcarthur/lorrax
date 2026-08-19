@@ -846,20 +846,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-	# ``runtime.finalize_process``, not a bare SystemExit: after a fully
-	# cold-compiled run the interpreter-teardown destruction of the XLA:CPU
-	# client deadlocks in pool shutdown (jobs 7884928/7884989 — this driver
-	# is the one measured to hang).  finalize_process performs every real
-	# teardown duty explicitly (effects barrier, distributed shutdown, the
-	# registered atexit hooks) and then ends the process before that
-	# destructor can run; see its docstring for the evidence.
-	from runtime import finalize_process
-	try:
-		_rc = main()
-	except SystemExit as _e:                              # argparse exits here
-		_rc = _e.code if isinstance(_e.code, int) else (0 if _e.code is None else 1)
-	except BaseException:
-		import traceback
-		traceback.print_exc()
-		_rc = 1
-	finalize_process(_rc if _rc is not None else 0)
+	from runtime import run_main_and_finalize
+	run_main_and_finalize(main)

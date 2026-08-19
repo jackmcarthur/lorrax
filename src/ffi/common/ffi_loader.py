@@ -60,14 +60,13 @@ MPI coexistence (scorecard AS): this library's handlers MPI_Init the
 process libmpi with ``MPI_THREAD_MULTIPLE`` if nothing else got there
 first.  Under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` jax's
 MPItrampoline runtime inits FIRST (requesting only FUNNELED), so that
-stack must run the THREAD_MULTIPLE-patched MPIwrapper as
-``MPITRAMPOLINE_LIB`` (+ ``LORRAX_MPI_FINALIZE_FIX=skip_atexit`` in
-the overlay sitecustomize) or the FFI's concurrent MPI threads race —
-measured ~29% multi-node failure rate (AS.4b).  LORRAX deliberately
-does NOT default ``MPITRAMPOLINE_LIB`` itself: it is a harness-level
-machine fact (a build artifact path), the unpatched build is a
-measured hazard, and ``cpp/phdf5/context.cc`` announces the hazardous
-level at open time.
+site must arrange a live ``MPI_THREAD_MULTIPLE`` grant before the FFI's
+concurrent MPI work starts — measured ~29% multi-node failure rate below
+that level (AS.4b). Frontera upgrades the request in its patched wrapper;
+Perlmutter uses an unmodified wrapper plus Cray async progress. LORRAX
+deliberately does NOT default ``MPITRAMPOLINE_LIB`` itself: it is a
+harness-level machine fact naming an adapter built for the site MPI.
+``cpp/phdf5/context.cc`` refuses an insufficient live grant at open time.
 """
 
 from __future__ import annotations
@@ -75,6 +74,7 @@ from __future__ import annotations
 import ctypes
 import glob
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, Optional
@@ -925,6 +925,37 @@ def loaded_platforms_in_order() -> list:
     return list(_LIBS)
 
 
+_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu_[0-9]+)?[.]so(?:[.]|$)")
+
+
+def _assert_one_mapped_mpi_runtime() -> None:
+    """Refuse a process in which more than one MPI runtime is already mapped.
+
+    The link-time ``gate_one_mpi.sh`` proves one artifact's dependency
+    closure.  It cannot see a foreign MPI loaded earlier by an inherited
+    Python overlay or preload.  Check the live address space immediately
+    after the FFI ``dlopen`` and before any native collective starts.
+    Filename aliases onto one real object are deduplicated by ``realpath``.
+    """
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            paths = {
+                os.path.realpath(line.rsplit(maxsplit=1)[-1])
+                for line in maps
+                if "/" in line
+                and _MPI_RUNTIME_BASENAME.match(
+                    os.path.basename(line.rsplit(maxsplit=1)[-1]))
+            }
+    except OSError:
+        return  # non-Linux diagnostic environment; build gate still applies
+    if len(paths) > 1:
+        raise FfiLibraryUnusable(
+            "more than one MPI runtime is mapped after loading the LORRAX "
+            "FFI library; MPI communicators from different runtimes are "
+            f"incompatible: {sorted(paths)}.  Remove foreign MPI preloads "
+            "and Python overlays, then use the machine launch recipe.")
+
+
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 
@@ -981,6 +1012,7 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
             f"directory is actually bind-mounted "
             f"(ldd {path} | grep 'not found')."
         ) from exc
+    _assert_one_mapped_mpi_runtime()
     # FIRST, before anything reads a symbol out of it.  See _check_abi.
     _check_abi(lib, platform, str(path))
     _set_argtypes(lib, platform)

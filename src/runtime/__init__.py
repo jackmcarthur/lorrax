@@ -152,6 +152,7 @@ def _import_jax():
 __all__ = [
     "initialize_communicator_stack",
     "finalize_process",
+    "run_main_and_finalize",
     "RuntimeStack",
     "collect_startup_facts",
     "format_startup_report",
@@ -787,22 +788,22 @@ def tune_glibc_malloc() -> bool:
 # outside the repo, so the choice has to stay visible in the launch script
 # (docs/dev/mpi_collectives.md).
 #
-# What this function does is make the resolved choice AUDIBLE.  jax's own
+# What this function does is make the resolved choice AUDIBLE and enforce the
+# correctness floor.  jax's own
 # default is gloo, and gloo is not merely slower here -- its reduce-scatter
 # SILENTLY CORRUPTS ~5% of executions with a plausible wrong value and a zero
-# exit code.  A forgotten export must therefore not be a silent event
-# (standing doctrine #3: a demotion may happen, but it must announce itself
-# from the rank it happens on).  One rank-0 line, no branching on transport
-# anywhere else in src/.
+# exit code.  A forgotten export is not a supported demotion: every rank
+# refuses before JAX distributed initialization.  One rank-0 success line,
+# no branching on transport anywhere else in src/.
 
 
 def announce_cpu_collectives() -> None:
-    """Print the resolved CPU collectives implementation once, from rank 0.
+    """Enforce MPI for multi-process CPU and print it once, from rank 0.
 
     No-op for single-process runs and for non-CPU platforms (GPU collectives
-    are NCCL's).  WARNS when a multi-process CPU run has landed on gloo,
-    because that is the corrupting reduce-scatter backend and the failure it
-    produces is silent (see docs/dev/mpi_collectives.md).
+    are NCCL's).  A multi-process CPU run refuses any non-MPI implementation
+    and an unset/nonexistent wrapper because gloo's measured failure is
+    silent data corruption (see docs/dev/mpi_collectives.md).
     """
     if _resolve_proc_count() <= 1:
         return
@@ -818,27 +819,23 @@ def announce_cpu_collectives() -> None:
         return
     impl = os.environ.get(
         "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "gloo").strip().lower() or "gloo"
-    if _resolve_proc_id() != 0:
-        return
-    if impl == "mpi":
-        wrap = os.environ.get("MPITRAMPOLINE_LIB", "")
-        print(f"[runtime] CPU collectives: mpi (MPItrampoline -> "
-              f"{wrap or '<MPITRAMPOLINE_LIB UNSET>'}).", flush=True)
-        if not wrap:
-            print("[runtime] WARNING: JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi "
-                  "with MPITRAMPOLINE_LIB unset — MPItrampoline has no "
-                  "wrapper to load.  See docs/dev/mpi_collectives.md.",
-                  flush=True)
-    else:
-        import sys
-        print(f"[runtime] WARNING: CPU collectives implementation is {impl!r}, "
-              "not 'mpi'.  gloo's reduce-scatter is MEASURED to return wrong "
-              "data silently (~5% of executions, plausible values, rc=0) and "
-              "is 14-30x slower on this fabric.  Export "
-              "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi plus MPITRAMPOLINE_LIB, "
-              "LORRAX_MPI_FORCE_THREAD_MAIN=1 and LORRAX_MPI_FINALIZE_FIX="
-              "skip_atexit — see docs/dev/mpi_collectives.md.",
-              file=sys.stderr, flush=True)
+    if impl != "mpi":
+        raise RuntimeError(
+            f"multi-process CPU collectives resolved to {impl!r}, not 'mpi'. "
+            "This is refused because gloo reduce-scatter is measured to "
+            "return plausible wrong data silently (~5% of executions, rc=0) "
+            "and is 14-30x slower on this fabric.  Use the machine CPU-MPI "
+            "launch recipe in docs/dev/mpi_collectives.md.")
+    wrap = os.environ.get("MPITRAMPOLINE_LIB", "")
+    if not wrap or not os.path.isfile(wrap):
+        raise RuntimeError(
+            "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi requires "
+            "MPITRAMPOLINE_LIB to name an existing adapter; use the machine "
+            "CPU-MPI launch recipe in docs/dev/mpi_collectives.md.  Got "
+            f"{wrap or '<unset>'!r}.")
+    if _resolve_proc_id() == 0:
+        print(f"[runtime] CPU collectives: mpi (MPItrampoline -> {wrap}).",
+              flush=True)
 
 
 def _resolve_proc_count() -> int:
@@ -1439,9 +1436,9 @@ def finalize_process(rc: int = 0):
     The hard exit is not a workaround bolted on a mystery: the same
     mechanism (``os._exit`` after ``main()``) is what the fastloop's interim
     GW_WRAPPER proved green on the certified cold runs (job 7884936) while
-    the bare interpreter exit hung.  Call it from a driver's ``__main__``
-    block with the return code of ``main()``; ``gw.gw_jax`` — the one chain
-    driver measured to hang — is the adopter.
+    the bare interpreter exit hung.  Core drivers enter through
+    :func:`run_main_and_finalize`, which preserves failures and calls this
+    function in one place.
     """
     import atexit
     import sys
@@ -1488,6 +1485,52 @@ def finalize_process(rc: int = 0):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(int(rc))
+
+
+def run_main_and_finalize(main, argv=None) -> None:
+    """Run one CLI boundary and always enter :func:`finalize_process`.
+
+    Core drivers initialize JAX distributed state at module startup.  A bare
+    ``SystemExit(main())`` therefore is not a harmless Python convention: it
+    bypasses the measured, ordered MPI/JAX/FFI shutdown above.  Keeping the
+    return-code and exception normalization here prevents each driver from
+    growing a subtly different teardown wrapper.
+
+    ``argv`` is optional so both ``main()`` and ``main(argv)`` entry points
+    use the same boundary.  ``SystemExit`` raised by argparse or a nested
+    driver retains its integer status; a message-valued exit is printed and
+    becomes status 1.  Unexpected exceptions retain their traceback.  This
+    function normally does not return because ``finalize_process`` ends with
+    ``os._exit``.
+    """
+    import operator
+    import sys
+    import traceback
+
+    try:
+        rc = main() if argv is None else main(argv)
+    except SystemExit as exc:
+        if exc.code is None:
+            rc = 0
+        else:
+            try:
+                rc = operator.index(exc.code)
+            except TypeError:
+                print(exc.code, file=sys.stderr, flush=True)
+                rc = 1
+    except BaseException:                                  # CLI boundary
+        traceback.print_exc()
+        rc = 1
+    if rc is None:
+        rc = 0
+    else:
+        try:
+            rc = operator.index(rc)
+        except TypeError:
+            print(f"[runtime] driver returned non-integer status {rc!r}; "
+                  "exiting with status 1.", file=sys.stderr, flush=True)
+            rc = 1
+    finalize_process(rc)
 
 
 # ---------------------------------------------------------------------------
@@ -1765,6 +1808,12 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         "finalize_fix": os.environ.get("LORRAX_MPI_FINALIZE_FIX") or None,
         "force_thread_main": os.environ.get(
             "LORRAX_MPI_FORCE_THREAD_MAIN") or None,
+        "pmi_preloaded": any(
+            os.path.basename(entry) == "libpmi.so.0"
+            for entry in os.environ.get("LD_PRELOAD", "")
+            .replace(":", " ").split()),
+        "mpich_async_progress": os.environ.get(
+            "MPICH_ASYNC_PROGRESS") or None,
     }
 
     # -- allocator: the CLIENT, corroborated against the environment -------
@@ -1918,6 +1967,12 @@ def format_startup_report(f: dict) -> list:
             f"LORRAX_MPI_FORCE_THREAD_MAIN={c.get('force_thread_main')!r}; "
             f"the thread-main refusal is handled by warming the cliques from "
             f"the main thread, so the wrapper override is not required.")
+        if c.get("pmi_preloaded") or c.get("mpich_async_progress") is not None:
+            add(f"  The Cray CPU-MPI launch controls resolved to "
+                f"LD_PRELOAD containing libpmi.so.0="
+                f"{bool(c.get('pmi_preloaded'))} and "
+                f"MPICH_ASYNC_PROGRESS="
+                f"{c.get('mpich_async_progress')!r}.")
     else:
         why = ("set to that value" if c.get("impl_was_set")
                else "unset, and gloo is jax's own default")

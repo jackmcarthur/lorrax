@@ -153,3 +153,19 @@ LORRAX_FFI_FFTW_DIR_DEFAULT="$HOME/software/lorrax_fftw_cray/stage"
 # Host SLATE install (bundled blaspp/lapackpp alongside).  Override with
 # LORRAX_SLATE_INSTALL_DIR before `module load`.
 LORRAX_SLATE_INSTALL_DIR_DEFAULT="$HOME/software/slate/install"
+
+# CPU MPI adapter for JAX's MPItrampoline backend.  This is an unmodified,
+# pinned upstream MPIwrapper build against Cray MPICH; the wrapper is a small
+# ABI adapter, not an MPI implementation.  The builder installs immutable,
+# content-addressed releases and atomically advances ``current`` only after
+# all gates pass, so a failed rebuild cannot remove the live adapter.
+LORRAX_MPIWRAPPER_ROOT_DEFAULT="$HOME/software/lorrax_mpiwrapper_cray"
+LORRAX_MPIWRAPPER_PREFIX_DEFAULT="$LORRAX_MPIWRAPPER_ROOT_DEFAULT/current"
+LORRAX_MPIWRAPPER_COMMIT_DEFAULT="966f4231c96153a08295fc7d0bcbd65e916a73fd"
+LORRAX_MPIWRAPPER_ABI_DEFAULT="2.10.0"
+
+# Reproducible host toolchain for that adapter.  Cray MPICH is still the MPI
+# implementation; MPIwrapper only translates MPItrampoline's stable ABI.
+LORRAX_PM_PRGENV_DEFAULT="PrgEnv-gnu/8.6.0"
+LORRAX_PM_MPICH_DEFAULT="cray-mpich/9.0.1"
+LORRAX_PM_CMAKE_DEFAULT="cmake/3.30.2"

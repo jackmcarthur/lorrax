@@ -12,7 +12,6 @@
 // the usual case: phdf5_init_mpi() runs early in the driver and SLATE
 // piggybacks.  Kept here anyway so this FFI is usable without phdf5.
 
-#include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -32,14 +31,14 @@ namespace lorrax_ffi::slate {
 // VERIFIED: `provided` was captured and discarded, and MPI_Query_thread
 // appeared nowhere in cpp/slate/.  Requesting MULTIPLE proves nothing,
 // because the request is a no-op whenever someone else initialised MPI
-// first: jax's MPI CPU collectives via MPItrampoline request FUNNELED, and
-// an unpatched MPIwrapper grants exactly that.  The measured consequence of
+// first: jax's MPI CPU collectives via MPItrampoline request FUNNELED.  The
+// measured consequence of
 // running concurrent MPI progress below MULTIPLE on this stack was a ~29%
 // provider-independent segfault/hang rate at P=16 x 8 nodes (3 segfaults +
-// 1 hang in 14 runs; scorecard AS.4b).  The certified fix is the
-// THREAD_MULTIPLE-patched MPIwrapper.  This guard makes the hazardous
-// configuration announce itself up front instead of dying minutes later
-// with a backtrace that names neither cause nor fix.
+// 1 hang in 14 runs; scorecard AS.4b).  The certified site launch must make
+// the live grant MULTIPLE (patched adapter on Frontera; Cray async progress on
+// Perlmutter). This guard refuses a hazardous configuration up front instead
+// of dying minutes later with a backtrace that names neither cause nor fix.
 //
 // Placement matters: the query runs on BOTH paths — after we initialise AND
 // after an early return because someone else already did.  The
@@ -48,11 +47,10 @@ namespace lorrax_ffi::slate {
 //
 // Mechanism shared with the phdf5 twin in cpp/common/mpi_thread_guard.h
 // (2026-08-01 dedup; the copies had begun to drift).  The family-specific
-// hazard sentence and the per-family once-flag stay here.
-static void warn_if_thread_level_insufficient() {
-    static std::atomic<bool> warned{false};
-    lorrax_ffi::mpiguard::warn_if_thread_level_insufficient(
-        "slate", "SLATE's internal OpenMP+MPI task engine", warned);
+// hazard sentence stays here.
+static void require_thread_multiple() {
+    lorrax_ffi::mpiguard::require_thread_multiple(
+        "slate", "SLATE's internal OpenMP+MPI task engine");
 }
 
 static void ensure_mpi_initialized() {
@@ -71,7 +69,7 @@ static void ensure_mpi_initialized() {
         // below answers the same question on both paths, and reading it
         // only here is precisely the bug this guard fixes.
     }
-    warn_if_thread_level_insufficient();
+    require_thread_multiple();
 }
 
 }  // namespace lorrax_ffi::slate

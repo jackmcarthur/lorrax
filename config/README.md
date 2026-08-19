@@ -48,6 +48,32 @@ lxrun python3 -u -m gw.gw_jax -i cohsex.in
 LORRAX_NGPU=1 lxrun python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
+### Multi-process CPU with Cray MPICH
+
+Build JAX's small MPIwrapper ABI adapter once, then source the CPU prelude
+inside every rank shell before Python:
+
+```bash
+export LX_BASE_MODULE=lorrax_A
+lx run --cpu -N 1 -n 1 -- \
+  "$LORRAX_ROOT/config/perlmutter/build_mpiwrapper.sh" --fresh
+
+export LORRAX_CPUS_PER_TASK=16
+export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+lx run --cpu -N 2 -n 4 -- bash -c '
+  set -euo pipefail
+  export OMP_NUM_THREADS=14 LORRAX_CPU_SKIP_GPU_PLUGINS=1
+  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  python3 -u -m gw.gw_jax -i cohsex.in
+'
+```
+
+The prelude keeps Cray MPICH as the MPI implementation, loads Cray PMI early,
+and requests its async progress thread. The example leaves requested affinity
+room, but progress/XLA thread placement is not yet affinity-certified. See
+[the Perlmutter CPU recipe](../docs/environment/machines/perlmutter.md#5-cpu-multi-process-runs-milan).
+
 ### Batch submission
 
 ```bash
@@ -240,6 +266,8 @@ config/
 │   └── lorrax/
 │       └── 0.1.0.lua          # Lmod modulefile template
 └── perlmutter/
+    ├── build_mpiwrapper.sh    # pinned upstream adapter against Cray MPICH
+    ├── cpu_mpi_env.sh         # source before Python in CPU MPI ranks
     ├── site_config.sh         # site-specific paths (edit this)
     ├── install.sh             # patches + installs the module
     └── run_gw.slurm           # batch job template
@@ -263,6 +291,7 @@ list; headline knobs:
 | `LORRAX_DARSHAN_LIB_DIR` | Optional I/O profiler lib dir (empty to skip) |
 | `LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR_DEFAULT` | Default host stage-dir roots |
 | `LORRAX_SLATE_INSTALL_DIR_DEFAULT` | Host SLATE install prefix |
+| `LORRAX_MPIWRAPPER_ROOT_DEFAULT` / `LORRAX_MPIWRAPPER_PREFIX_DEFAULT` | Immutable Cray MPIwrapper release root / atomic `current` prefix |
 
 To port:
 

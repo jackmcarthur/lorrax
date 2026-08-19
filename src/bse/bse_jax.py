@@ -341,7 +341,7 @@ def _preview_lanczos(
 
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(allow_abbrev=False, description="BSE JAX entry point")
@@ -548,7 +548,7 @@ if __name__ == "__main__":
     parser.add_argument("--ring-timing", action="store_true")
     parser.add_argument("--components", action="store_true")
     parser.add_argument("--debug-parallelism", action="store_true")
-    args, _ = parser.parse_known_args()
+    args, _ = parser.parse_known_args(argv)
 
     if args.ring_test:
         ring_matvec_smoke_test()
@@ -709,4 +709,9 @@ if __name__ == "__main__":
         degeneracy_tol_ry=args.degeneracy_tol_ry,
         tda=use_tda,
     )
-    raise SystemExit(0)
+    return 0
+
+
+if __name__ == "__main__":
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)

@@ -631,4 +631,5 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)

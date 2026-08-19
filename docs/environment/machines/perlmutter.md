@@ -12,17 +12,20 @@ has not been exercised recently.*
   `lxalloc`/`lxrun` module workflow were production-certified on
   Perlmutter (1–4 nodes × 4 A100). `lx` (§1) drives the same
   `select_gpu.sh` + Shifter + `in_container.sh` composition.
-* CPU multi-process MPI runs were validated end-to-end on Milan (§5):
-  Si 4×4×4 μ=384, x_only + full COHSEX, 1 node, 4 ranks × 8 threads —
-  in the **gloo/Cray-MPICH era**.
-* The 2026-07 campaign (the `impl=mpi` collectives migration, the
-  MPIwrapper, the mpi4py overlay, the runtime bundle, the host FFI
-  `.so`) ran **on Frontera**. None of that layered CPU stack has a
-  Perlmutter build or a Perlmutter measurement; on Cray the analogous
-  pieces (Cray MPICH thread grants, PMI, `sbcast`-vs-Lustre trade-offs)
-  would need their own bring-up. Treat
-  [transports](../transports.md) claims as Frontera-measured unless a
-  jobid says otherwise.
+* CPU multi-process `impl=mpi` is now validated on Milan with Cray MPICH
+  9.0.1.498 and JAX/JAXLIB 0.9.1.  A P=4 collective probe passed on one and
+  two nodes, including all three 2-D mesh cliques and exact
+  reduce-scatter; the two-node tracked-recipe proof is allocation 57261316,
+  step `lx-Xg1-205224-2180345-6630`.
+* The same tracked recipe passed at P=16 on four nodes with a 4×4 process
+  mesh and 16 logical CPU affinity slots per rank (256 across the step, not
+  256 physical cores or full-node occupancy), exact on every
+  allreduce/reduce-scatter segment and cleanly finalized: allocation
+  57261316, step `lx-Xg1-210631-2288631-7393`.
+* A frozen two-node P=4 GN-PPM GW calculation then completed in 93 s and
+  matched all 2,484 reference Sigma cells exactly (allocation 57261316,
+  step `lx-Xg1-204038-2097590-2094`).  This certifies the GW path at P=4;
+  it is not yet a large-physics-run scaling or performance claim.
 
 ## 1. Entry point: `lx` {#1-entry-point-lx}
 
@@ -211,6 +214,57 @@ swap the `shifter` invocation in `lxrun`/`lxshell`/`lxpre`;
 The former gloo-era recipe and its mpi4py/parallel-h5py SlabIO tier are
 retired. Current CPU runs require the host native FFI and use the same single
 parallel-HDF5 transport as GPU runs; the `slab_io` and `use_ffi_io` deck keys
-are refused. Use `lx run` for compute-node execution and follow the current
-[transport bring-up](../transports.md) before treating a multi-process CPU run
-as certified.
+are refused.
+
+Build the small MPI ABI adapter once on a CPU compute node.  This builds the
+exact pinned, **unmodified** upstream MPIwrapper against versioned Cray
+wrappers; Cray MPICH remains the MPI implementation. The candidate is gated
+in isolation and an immutable, content-addressed release becomes `current`
+atomically, so a failed rebuild cannot delete the active adapter.
+
+```bash
+config/perlmutter/build_mpiwrapper.sh --fresh
+```
+
+For every core-driver multi-process CPU step, source the tracked launch
+prelude before Python/JAX:
+
+```bash
+export LORRAX_ROOT=/path/to/lorrax
+export LX_BASE_MODULE=lorrax_A
+export LORRAX_CPUS_PER_TASK=16
+export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+lx run --cpu -N 2 -n 4 -- bash -c '
+  set -euo pipefail
+  export LORRAX_CPU_SKIP_GPU_PLUGINS=1
+  export OMP_NUM_THREADS=14
+  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  python3 -u -m gw.gw_jax -i gw.in
+'
+```
+
+The source inside the `lx` rank shell is the load-bearing one.  It sets the
+four-part Cray contract before JAX import:
+
+| setting | why |
+|---|---|
+| `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` | selects JAX's non-corrupting MPI backend |
+| `MPITRAMPOLINE_LIB=<unmodified Cray-built MPIwrapper>` | supplies the ABI adapter expected by JAX's bundled MPItrampoline |
+| `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` | loads the verified Cray PMI implementation before `jax.distributed` starts coordination threads; omitting it segfaults in `_pmi_spawn_init`; `libpmi2.so.0` is a measured negative |
+| `MPICH_ASYNC_PROGRESS=1` | HPE's public control; promotes XLA's explicit FUNNELED request to `MPI_THREAD_MULTIPLE`, required when XLA executor threads coexist with native MPI I/O/linalg |
+
+Async progress consumes a progress thread. The example requests two fewer
+OpenMP threads than affinity slots, but this is not a certified reservation:
+XLA workers do not obey `OMP_NUM_THREADS`, and progress-thread placement was
+not measured. The prelude also forces
+`MPICH_GPU_SUPPORT_ENABLED=0` and unsets the retired
+`LORRAX_MPI_FORCE_THREAD_MAIN`; communicator creation is owned by
+`common.collectives.warm_mesh_cliques()`.
+
+The PMI diagnosis and controls are allocation 57261316: no preload crashes in
+`PMI2_Init` (`lx-Xg1-203405-2056047-6411`), the stable SONAME preload passes
+(`lx-Xg1-204021-2096105-1906`), and `libpmi2.so.0` still crashes
+(`lx-Xg1-203924-2089729-3659`).  Full mechanism and machine split:
+[collective transports](../transports.md) and
+[`docs/dev/mpi_collectives.md`](../../dev/mpi_collectives.md).

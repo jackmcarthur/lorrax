@@ -1,15 +1,17 @@
 # JAX CPU collectives on MPI (`impl=mpi`) and the LORRAX MPIwrapper
 
-*How LORRAX runs `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` on Frontera: what
-the MPIwrapper overrides, why each one is necessary, and the launch recipe.*
+*How LORRAX runs `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`: the common JAX
+contract, the different Intel-MPI and Cray-MPICH thread-level mechanisms, and
+the two machine launch recipes.*
 
-## STATUS: the wrapper's scope has SHRUNK — override 2 is superseded
+## STATUS: thread-main override superseded; thread level is site-specific
 
-**A locally-patched MPI shim is a dependency this project should not ship.**
-Every user on every machine would have to build, version and understand it.
-That objection stands, and it has now been half-answered: **the
-`MPI_Is_thread_main` override is no longer needed.** What replaces it is a few
-lines of ordinary Python in this repo.
+**A locally-patched MPI shim is not a portable dependency this project should
+spread to every machine.** The `MPI_Is_thread_main` override is no longer
+needed anywhere; ordinary Python in this repo replaces it. Frontera retains a
+small patch only to upgrade Intel MPI's thread-level request. Perlmutter uses
+unmodified upstream MPIwrapper and obtains the required thread level from
+Cray MPICH's supported async-progress control.
 
 ### What replaced it: a main-thread mesh-clique warm-up
 
@@ -52,19 +54,20 @@ allocation table.
 
 ### What the wrapper is still for
 
-| override | status |
-|---|---|
-| **(1) `MPI_THREAD_MULTIPLE` upgrade** | **STILL REQUIRED.** Unrelated to the guard: XLA's collective *operations* run on pool threads concurrently with h5py/mpi4py collective MPI-IO on the main thread, and under a FUNNELED grant that is undefined behaviour — the AS.4b 4-failures-in-14-runs class. Retires only if jaxlib stops requesting `MPI_THREAD_FUNNELED` (or reads `provided` and refuses): a separate, upstream change. |
-| **(2) `MPI_Is_thread_main` / `LORRAX_MPI_FORCE_THREAD_MAIN`** | **SUPERSEDED** by `warm_mesh_cliques`. Keep the code path for now as a fallback and as the positive control in the gates, but production should run with the gate **unset**. Delete it once the warm-up has a scale record. |
+MPIwrapper is always required as the ABI adapter that JAX's bundled
+MPItrampoline loads.  It is not the MPI implementation.  The thread-level
+policy carried by that adapter is machine-specific:
 
-So the dependency does not vanish, but it shrinks from "a patched shim that
-decides whether BSE runs at all" to "a patched shim that fixes a thread-level
-request jaxlib gets wrong". The remaining exit is upstream: jaxlib requesting
-`MPI_THREAD_MULTIPLE`, and/or relaxing the `MPI_Is_thread_main` guard, which is
-arguably simply a bug — it is a *stricter* condition than `MPI_THREAD_MULTIPLE`
-requires, and XLA violates the FUNNELED contract everywhere else anyway (none
-of `AllReduce` / `ReduceScatter` / `AllGather` / ... carries a comparable
-guard).
+| machine | production composition |
+|---|---|
+| **Frontera / Intel MPI** | The locally patched adapter upgrades XLA's request to `MPI_THREAD_MULTIPLE`.  Its optional `MPI_Is_thread_main` override is **SUPERSEDED** by `warm_mesh_cliques`; production leaves `LORRAX_MPI_FORCE_THREAD_MAIN` unset. |
+| **Perlmutter / Cray MPICH** | The adapter is exact, unmodified upstream MPIwrapper. HPE's public `MPICH_ASYNC_PROGRESS=1` setting makes Cray MPICH grant MULTIPLE despite XLA requesting FUNNELED. No local MPIwrapper patch is used. |
+
+MULTIPLE remains required for the full application: XLA's collective
+operations can run on pool threads while native parallel-HDF5 or distributed
+linalg is using MPI.  The remaining upstream exit is jaxlib requesting
+`MPI_THREAD_MULTIPLE` itself (and checking `provided`), and/or relaxing its
+`MPI_Is_thread_main` communicator-creation guard.
 
 Full analysis of all four routes, including the falsified ones:
 `wk_REL/jax_threadmain_alternatives.md`.
@@ -139,19 +142,55 @@ enough to take the sequential executor and so passed with no warm-up at all.
 
 `MPI_Is_thread_main` in `libjax_common.so` is an MPItrampoline stub
 (`jmpq *MPIABI_Is_thread_main`) resolved at `dlopen` from the MPIwrapper named
-by `MPITRAMPOLINE_LIB` — a library **we build**. That is where the fix lives.
+by `MPITRAMPOLINE_LIB` — a library **we build**. On Frontera the adapter also
+carries the historical override; on Perlmutter the adapter is upstream and
+the guard is satisfied only by the in-tree clique warm-up.
 
 ## The wrapper
 
 *(Interim — see STATUS at the top.)*
 
-Built by `config/frontera/build_mpiwrapper.sh` from upstream MPIwrapper
+The Frontera adapter is built by `config/frontera/build_mpiwrapper.sh` from upstream MPIwrapper
 v2.11.1 (`eschnett/MPIwrapper`, commit `966f4231…`) plus exactly one patch,
 `config/frontera/mpiwrapper/lorrax_thread.patch`. Upstream is external source
 under its own licence and is fetched, not vendored; only the patch is in the
 repo. The patch adds two overrides and nothing else.
 
-### Override 1 — THREAD_MULTIPLE upgrade (always on)
+### Perlmutter: unmodified adapter plus Cray controls
+
+`config/perlmutter/build_mpiwrapper.sh` builds the same pinned MPIwrapper
+commit with no patch and refuses a dirty upstream checkout.  The build uses
+Cray `cc`/`CC`/`ftn`, strips the GPU and Darshan modules, checks the required
+MPItrampoline ABI exports, rejects CUDA-GTL/Darshan dependencies, and runs the
+one-MPI dynamic-closure gate.
+
+Two Cray launch controls are load-bearing and are set by
+`config/perlmutter/cpu_mpi_env.sh`:
+
+* `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0` must be in force before Python. Without it,
+  `jax.distributed.initialize()` starts coordination threads and the later MPI
+  initialization segfaults in `_pmi_spawn_init -> PMI2_Init`. Preloading
+  `libpmi2.so.0` does not fix it. The tracked prelude uses Cray's stable,
+  unversioned absolute symlink and verifies that it resolves under
+  `/opt/cray/pe`, so `LD_LIBRARY_PATH` cannot shadow it with a foreign PMI.
+* `MPICH_ASYNC_PROGRESS=1` makes Cray MPICH promote XLA's explicit
+  FUNNELED request to `MPI_THREAD_MULTIPLE`. The default-thread CVARs are
+  inert because XLA made an explicit request. Async progress creates a
+  progress thread; reserve a hardware thread per rank and benchmark its cost.
+
+Measured on allocation 57261316: one- and two-node P=4 clique/allreduce/
+reduce-scatter probes pass with `MPI_Query_thread=MULTIPLE`; a frozen two-node
+P=4 GN-PPM run is exact in 2,484/2,484 reference cells. The same tracked
+launcher also passes the collective proof at P=16/four nodes on a 4×4 mesh,
+with 16 logical CPU affinity slots per rank (256 across the step, not 256
+physical cores or full-node occupancy). The tracked P=4 proof is step
+`lx-Xg1-205224-2180345-6630`, P=16 is
+`lx-Xg1-210631-2288631-7393`, and GN-PPM is
+`lx-Xg1-204038-2097590-2094`. This certifies the collective/runtime layer at
+P=16 and the full GW path at P=4; it is not a large-physics-run performance
+certificate.
+
+### Frontera override 1 — THREAD_MULTIPLE upgrade (always on)
 
 `MPI_Init` / `MPI_Init_thread` forward to
 `PMPI_Init_thread(..., MPI_THREAD_MULTIPLE, ...)`. Requests are upgraded,
@@ -168,14 +207,15 @@ simultaneously inside `MPID_Progress_wait`. Upgrading the grant to MULTIPLE
 makes Intel MPI's global lock serialize them. P=4 single-node never failed
 (shm netmod).
 
-Rejected alternatives, for the record: `I_MPI_THREAD_LEVEL_DEFAULT=MULTIPLE`
-and `MPIR_CVAR_DEFAULT_THREAD_LEVEL=multiple` are **inert** (MPICH grants the
+Rejected alternatives on the Intel-MPI route, for the record:
+`I_MPI_THREAD_LEVEL_DEFAULT=MULTIPLE` and
+`MPIR_CVAR_DEFAULT_THREAD_LEVEL=multiple` are **inert** (MPICH grants the
 explicit request, not the default); an `LD_PRELOAD` interposer does not resolve
 through the trampoline's `dlopen`ed scope; `LORRAX_MPI_INIT_FIRST=mpi4py` does
 move the granted level but then hangs the trampoline on a pre-initialized MPI
 and is a documented DO-NOT-USE.
 
-### Override 2 — `MPI_Is_thread_main`, gated on `LORRAX_MPI_FORCE_THREAD_MAIN`
+### Frontera override 2 — `MPI_Is_thread_main`, gated on `LORRAX_MPI_FORCE_THREAD_MAIN`
 
 > **SUPERSEDED — do not enable in production.** `warm_mesh_cliques` (STATUS,
 > above) achieves the same thing in-repo, with no patched dependency, and
@@ -200,27 +240,60 @@ Blast radius is exactly XLA's CPU collectives. mpi4py, h5py and the FFI host
 `.so` all link Intel `libmpi.so.12` directly and never route through
 MPItrampoline, so they never see either override.
 
-### Building it
+### Building the adapters
 
 ```bash
 export LORRAX_ROOT=/path/to/lorrax
-config/frontera/build_mpiwrapper.sh --fresh      # LOGIN NODE, not the container
+config/frontera/build_mpiwrapper.sh --fresh      # Intel-MPI patched adapter
+config/perlmutter/build_mpiwrapper.sh --fresh    # Cray-MPICH upstream adapter
 ```
 
-MPIwrapper compiles Fortran bindings and the py312 container has no gfortran,
-so this is a login-node build. The script pins the upstream commit, applies the
-patch, and then verifies the overrides **in the machine code** rather than in
-the source: it disassembles `MPIABI_Init_thread` and asserts the `required`
+The Frontera script compiles Fortran bindings outside its py312 container,
+applies the tracked patch, and verifies its overrides **in the machine code**
+rather than in the source: it disassembles `MPIABI_Init_thread` and asserts the `required`
 argument is hard-set to 3 (`MPI_THREAD_MULTIPLE`), and disassembles
 `MPIABI_Is_thread_main` and asserts it reads the gate and still falls through
 to `PMPI_Is_thread_main` when unset. A wrapper that silently grants FUNNELED
 looks and loads exactly like a good one, so a source-level check is not enough.
 
-Set `LORRAX_MPIWRAPPER_REFERENCE_SO` to compare `.text` against a known-good
+Set `LORRAX_MPIWRAPPER_REFERENCE_SO` on Frontera to compare `.text` against a known-good
 build (whole-file equality is not achievable — the build CWD is embedded in
 `.note.gnu.build-id` and, on TACC, `.note.xalt.info`).
 
-## Launch recipe
+## Launch recipes
+
+### Perlmutter
+
+Build on a CPU compute node and source the prelude **inside every `lx` rank
+shell before Python**.  This is the canonical minimal launcher; it pins the
+JAX 0.9 module and source checkout and checks the live JAX generation before
+the driver starts:
+
+```bash
+export LORRAX_ROOT=/path/to/lorrax
+export LX_BASE_MODULE=lorrax_A
+export LORRAX_CPUS_PER_TASK=16
+export PYTHONPATH="$LORRAX_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+lx run --cpu -N 2 -n 4 -- bash -c '
+  set -euo pipefail
+  export LORRAX_CPU_SKIP_GPU_PLUGINS=1
+  export OMP_NUM_THREADS=14
+  . "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh"
+  python3 -u "$LORRAX_ROOT/tools/require_jax09.py"
+  python3 -u -m gw.gw_jax -i gw.in
+'
+```
+
+The prelude validates the adapter's pinned source, MPI ABI and SHA256 manifest;
+rejects stale Frontera overlays and conflicting MPI/PMI preloads; forces CPU,
+one JAX device per rank and `impl=mpi`; sets PMI/async-progress controls;
+disables Cray GPU support; and unsets `LORRAX_MPI_FORCE_THREAD_MAIN`. It does
+not choose an OpenMP team size. The example requests room for progress, but
+that is not a certified progress/XLA-thread affinity policy: XLA workers do
+not obey `OMP_NUM_THREADS`, so production affinity still needs a thread-census
+and async-on/off performance measurement.
+
+### Frontera
 
 **Executable form: `config/frontera/templates/gw_dev.sbatch`** — the
 certified launch block, vendored; the fragments below are its anatomy.
@@ -252,7 +325,7 @@ export LORRAX_MPI_PROVIDER=auto   # auto => FI_PROVIDER unset => mlx (default)
 # /hostlibs on the path shadows container glibc).
 ```
 
-All four collectives variables are load-bearing:
+The Frontera composition has these load-bearing pieces:
 
 | variable | omit it and |
 |---|---|
@@ -275,8 +348,9 @@ loudly when it is missing.
   resolved implementation once from rank 0 and warns if a multi-process CPU
   run has landed on gloo. It is the only place in `src/` that reads the
   collectives implementation at all, and it changes nothing but the log.
-  The MPI transport itself is Intel MPI's, selected by `FI_PROVIDER` /
-  `LORRAX_MPI_PROVIDER` — there is no NIC pin any more.
+  The MPI transport itself is selected by the site launch recipe: Intel MPI's
+  `FI_PROVIDER`/`LORRAX_MPI_PROVIDER` on Frontera and Cray MPICH/Slingshot on
+  Perlmutter.
 * `ffi/cpp/phdf5/context.cc` and `ffi/cpp/slate/context.cc` only call
   `MPI_Init_thread(MULTIPLE)` when nothing initialized MPI first, so they
   coexist with XLA's init by construction. The phdf5 open warns when the
