@@ -2877,7 +2877,7 @@ def load_head_velocity_source(
         f"{pt_path} (nb={source.nb_logical}, "
         "head-response rel="
         f"{vgate['head_response_relative_frobenius']:.3e}, "
-        "transition overlap="
+        "DFT transition overlap="
         f"{vgate['transition_overlap_real']:+.6f}"
         f"{vgate['transition_overlap_imag']:+.2e}j; "
         f"full-matrix max_abs={vgate['max_abs']:.3e} diagnostic only)")
