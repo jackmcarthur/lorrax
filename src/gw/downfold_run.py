@@ -214,6 +214,9 @@ def _read_geometry(filename: str) -> dict:
                       if "kgrid" in f else None),
             "band_window": (np.asarray(f["band_window"])[:].astype(np.int64)
                             if "band_window" in f else None),
+            "band_window_split": (
+                np.asarray(f["band_window_split"])[:].astype(np.int64)
+                if "band_window_split" in f else None),
             "nb": int(f["psi_full_y"].shape[1]),
             "nk": int(f["psi_full_y"].shape[0]),
             "nspinor": int(f["psi_full_y"].shape[2]),
@@ -720,18 +723,22 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
 
 
 class _BandSlices:
-    """The five-integer band-window stamp, carried through verbatim.
+    """The band-window stamps, carried through verbatim.
 
-    ``write_restart_state_to_h5`` wants an object with ``b0..b4`` and stamps
-    those five numbers so a later run under a CHANGED window refuses instead
-    of silently misindexing.  The downfold does not touch the band axis, so
-    the right stamp is the PARENT's, unchanged — a small bundle that claimed
-    a different window than the psi and enk it carries would be exactly the
-    lie the stamp exists to catch.
+    ``write_restart_state_to_h5`` wants ``b0..b4`` plus the separate
+    ``b4_chi`` / ``b4_sigma`` split introduced after the original five-value
+    stamp.  The downfold does not touch the band axis, so both stamps must be
+    inherited from the parent.  Old parents have no split dataset; their
+    canonical meaning is the writer/reader fallback ``(b4, b4)``.
     """
 
-    def __init__(self, five):
+    def __init__(self, five, split=None):
         self.b0, self.b1, self.b2, self.b3, self.b4 = (int(v) for v in five)
+        if split is None:
+            self.b4_chi = self.b4
+            self.b4_sigma = self.b4
+        else:
+            self.b4_chi, self.b4_sigma = (int(v) for v in split)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +1007,8 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
     barrier("downfold.mkdir")
     out_file = os.path.join(tmp_dir, f"isdf_tensors_{mu_S}.h5")
 
-    band_slices = (_BandSlices(geom["band_window"])
+    band_slices = (_BandSlices(geom["band_window"],
+                               geom.get("band_window_split"))
                    if geom["band_window"] is not None else None)
     policy = read_coulomb_policy_from_h5(
         resolve_restart_file(cfg.source_restart))

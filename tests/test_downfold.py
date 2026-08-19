@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 
+import h5py
 import numpy as np
 import pytest
 
@@ -1693,7 +1694,49 @@ def test_the_gate_does_NOT_scale_without_a_measured_kappa():
 
 
 # ---------------------------------------------------------------------------
-# 7.  Multi-device: the whole chain, P=1 against P>1
+# 7.  Restart band-window compatibility
+# ---------------------------------------------------------------------------
+
+def test_downfold_band_slices_preserves_chi_sigma_split():
+    """The child writer must carry the parent's separate chi/Sigma ceilings."""
+    from gw.downfold_run import _BandSlices
+
+    got = _BandSlices((0, 0, 26, 52, 608), (600, 608))
+    assert (got.b0, got.b1, got.b2, got.b3, got.b4) == (0, 0, 26, 52, 608)
+    assert (got.b4_chi, got.b4_sigma) == (600, 608)
+
+
+def test_downfold_band_slices_legacy_parent_uses_unsplit_fallback():
+    """An old five-value parent means the canonical unsplit ``(b4,b4)``."""
+    from gw.downfold_run import _BandSlices
+
+    got = _BandSlices((0, 0, 26, 52, 608))
+    assert (got.b4_chi, got.b4_sigma) == (608, 608)
+
+
+def test_downfold_geometry_reads_parent_chi_sigma_split(tmp_path):
+    """The shim cannot preserve a split that the geometry reader drops."""
+    from gw.downfold_run import _read_geometry
+
+    path = tmp_path / "parent.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("psi_full_y", shape=(1, 2, 1, 4), dtype=np.complex128)
+        v = f.create_dataset("V_qmunu", shape=(1, 4, 4), dtype=np.complex128)
+        v.attrs["V_ready"] = True
+        w = f.create_dataset("W0_qmunu", shape=(1, 4, 4), dtype=np.complex128)
+        w.attrs["W0_ready"] = True
+        f.create_dataset("kgrid", data=np.asarray((1, 1, 1), dtype=np.int64))
+        f.create_dataset("band_window", data=np.asarray(
+            (0, 0, 26, 52, 608), dtype=np.int64))
+        f.create_dataset("band_window_split", data=np.asarray(
+            (600, 608), dtype=np.int64))
+
+    geom = _read_geometry(str(path))
+    assert tuple(geom["band_window_split"]) == (600, 608)
+
+
+# ---------------------------------------------------------------------------
+# 8.  Multi-device: the whole chain, P=1 against P>1
 # ---------------------------------------------------------------------------
 
 def _mesh_invariance_payload():
