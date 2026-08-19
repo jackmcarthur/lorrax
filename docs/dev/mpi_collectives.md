@@ -178,16 +178,14 @@ Two Cray launch controls are load-bearing and are set by
   inert because XLA made an explicit request. Async progress creates a
   progress thread; reserve a hardware thread per rank and benchmark its cost.
 
-Measured on allocation 57261316: one- and two-node P=4 clique/allreduce/
-reduce-scatter probes pass with `MPI_Query_thread=MULTIPLE`; a frozen two-node
-P=4 GN-PPM run is exact in 2,484/2,484 reference cells. The same tracked
-launcher also passes the collective proof at P=16/four nodes on a 4×4 mesh,
-with 16 logical CPU affinity slots per rank (256 across the step, not 256
-physical cores or full-node occupancy). The tracked P=4 proof is step
-`lx-Xg1-205224-2180345-6630`, P=16 is
-`lx-Xg1-210631-2288631-7393`, and GN-PPM is
-`lx-Xg1-204038-2097590-2094`. This certifies the collective/runtime layer at
-P=16 and the full GW path at P=4; it is not a large-physics-run performance
+Measured on allocation 57261316: the post-audit P=4 collective proof is step
+`lx-Xg1-221900-433833-3385`; the frozen-source P=16/four-node proof is
+`lx-Xg1-222848-493981-5730`. Both report
+`MPI_Query_thread=MULTIPLE`, warm all three mesh cliques, and produce exact
+allreduce/reduce-scatter results. Frozen P=4 GN-PPM step
+`lx-Xg1-222309-460416-9952` is exact in 2,484/2,484 reference cells and takes
+109.907 s driver wall. This certifies the collective/runtime layer at P=16
+and the full GW path at P=4; it is not a large-physics-run performance
 certificate.
 
 ### Frontera override 1 — THREAD_MULTIPLE upgrade (always on)

@@ -16,15 +16,15 @@ has not been exercised recently.*
   9.0.1.498 and JAX/JAXLIB 0.9.1.  A P=4 collective probe passed on one and
   two nodes, including all three 2-D mesh cliques and exact
   reduce-scatter; the two-node tracked-recipe proof is allocation 57261316,
-  step `lx-Xg1-205224-2180345-6630`.
+  step `lx-Xg1-221900-433833-3385`.
 * The same tracked recipe passed at P=16 on four nodes with a 4×4 process
   mesh and 16 logical CPU affinity slots per rank (256 across the step, not
   256 physical cores or full-node occupancy), exact on every
   allreduce/reduce-scatter segment and cleanly finalized: allocation
-  57261316, step `lx-Xg1-210631-2288631-7393`.
-* A frozen two-node P=4 GN-PPM GW calculation then completed in 93 s and
+  57261316, step `lx-Xg1-222848-493981-5730`.
+* A frozen two-node P=4 GN-PPM GW calculation then completed in 109.907 s and
   matched all 2,484 reference Sigma cells exactly (allocation 57261316,
-  step `lx-Xg1-204038-2097590-2094`).  This certifies the GW path at P=4;
+  step `lx-Xg1-222309-460416-9952`).  This certifies the GW path at P=4;
   it is not yet a large-physics-run scaling or performance claim.
 
 ## 1. Entry point: `lx` {#1-entry-point-lx}

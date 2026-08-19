@@ -134,6 +134,31 @@ def test_shared_boundary_delegates_rank_local_failure_to_failfast(
     assert seen == [(RuntimeError, "rank-local boom", True)]
 
 
+@pytest.mark.parametrize("exc", [SystemExit(3), SystemExit("bad input")])
+def test_shared_boundary_delegates_nonzero_system_exit_to_failfast(
+        monkeypatch, exc):
+    """A P>1 validation exit must not enter collective ordered teardown."""
+    seen = []
+
+    class FailFastExit(Exception):
+        pass
+
+    def hook(exc_type, exc_value, exc_tb):
+        seen.append((exc_type, str(exc_value), exc_tb is not None))
+        raise FailFastExit
+
+    monkeypatch.setattr(runtime, "finalize_process",
+                        lambda rc: pytest.fail("ordered teardown was entered"))
+    monkeypatch.setattr(runtime, "_resolve_proc_count", lambda: 4)
+    monkeypatch.setattr(sys, "excepthook", hook)
+    monkeypatch.setattr(sys, "_lorrax_failfast_installed", True, raising=False)
+
+    with pytest.raises(FailFastExit):
+        runtime.run_main_and_finalize(
+            lambda: (_ for _ in ()).throw(exc))
+    assert seen == [(SystemExit, str(exc), True)]
+
+
 @pytest.mark.parametrize("provided, should_pass", [(1, False), (2, False),
                                                     (3, True)])
 def test_cpu_mpi_thread_gate_uses_the_live_grant(

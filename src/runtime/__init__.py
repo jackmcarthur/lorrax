@@ -1508,11 +1508,12 @@ def run_main_and_finalize(main, argv=None) -> None:
     use the same boundary.  ``SystemExit`` raised by argparse or a nested
     driver retains its integer status; a message-valued exit is printed and
     becomes status 1.  Unexpected exceptions retain their traceback.  At P>1
-    an installed fail-fast hook owns those exceptions: it exits immediately
-    without collective teardown, because peers may already be blocked in work
-    this rank will never join.  Ordered finalization is reserved for normal
-    returns, intentional ``SystemExit``, and P=1 failures.  This function
-    normally does not return because either path ends with ``os._exit``.
+    an installed fail-fast hook owns unexpected exceptions and nonzero
+    ``SystemExit``: it exits immediately without collective teardown, because
+    peers may already be blocked in work this rank will never join.  Ordered
+    finalization is reserved for normal returns, zero-valued ``SystemExit``,
+    and P=1 failures.  This function normally does not return because either
+    path ends with ``os._exit``.
     """
     import operator
     import sys
@@ -1521,14 +1522,25 @@ def run_main_and_finalize(main, argv=None) -> None:
     try:
         rc = main() if argv is None else main(argv)
     except SystemExit as exc:
+        message_exit = False
         if exc.code is None:
             rc = 0
         else:
             try:
                 rc = operator.index(exc.code)
             except TypeError:
-                print(exc.code, file=sys.stderr, flush=True)
+                message_exit = True
                 rc = 1
+        if (rc != 0 and _resolve_proc_count() > 1
+                and getattr(sys, "_lorrax_failfast_installed", False)):
+            # Driver validation commonly raises SystemExit(message).  Such a
+            # failure can be rank-local (filesystem, parse, or input state),
+            # so a nonzero exit has the same no-collective-teardown contract
+            # as an unexpected exception.
+            sys.excepthook(type(exc), exc, exc.__traceback__)
+            os._exit(1)
+        if message_exit:
+            print(exc.code, file=sys.stderr, flush=True)
     except BaseException:                                  # CLI boundary
         exc_info = sys.exc_info()
         if (_resolve_proc_count() > 1
