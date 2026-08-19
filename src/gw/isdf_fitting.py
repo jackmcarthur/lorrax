@@ -16,6 +16,7 @@ from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
+from runtime.padding import round_up
 
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
@@ -1071,7 +1072,14 @@ def fit_zeta_to_h5(
         for chunk_idx in range(num_chunks):
             r_start = chunk_idx * chunk_r
             r_end = min(r_start + chunk_r, n_rtot)
-            actual_n_rchunk = r_end - r_start
+            valid_n_rchunk = r_end - r_start
+            # Z_q is P(None, 'x', 'y'), so its r extent must divide the
+            # y-mesh.  Full chunks already satisfy this planner contract;
+            # the physical FFT-grid remainder need not.  Pad only that
+            # final remainder with exact-zero ψ columns, then remove the
+            # pad after solve before the r→G accumulator sees it.
+            actual_n_rchunk = round_up(
+                valid_n_rchunk, int(mesh_xy.shape['y']))
 
             _dbg_rchunk = env_bool("LORRAX_RCHUNK_DEBUG", False)
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
@@ -1095,6 +1103,7 @@ def fit_zeta_to_h5(
                     band_range_right=band_range_right,
                     band_range_full=band_range_full,
                     actual_n_rchunk=actual_n_rchunk,
+                    valid_n_rchunk=valid_n_rchunk,
                     q_chunk_size=q_chunk_size,
                     kvecs_frac=kvecs_frac,
                     vertex_mu_L=int(vertex_mu_L),
@@ -1106,6 +1115,8 @@ def fit_zeta_to_h5(
                     distrib_la_batched_route=distrib_la_batched_route,
                 )
                 zeta_chunk.block_until_ready()
+                if valid_n_rchunk < actual_n_rchunk:
+                    zeta_chunk = zeta_chunk[..., :valid_n_rchunk]
             _t_fit = time.perf_counter() - t0
             t_fit_total += _t_fit
             _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0

@@ -539,6 +539,7 @@ def z_q_from_psi_sm(
 	band_range_right: tuple[int, int],
 	r_start_dyn,
 	r_chunk_size: int,
+	r_chunk_valid_size: int | None = None,
 	gamma_L: tuple[jax.Array, jax.Array] | None = None,
 	gamma_R: tuple[jax.Array, jax.Array] | None = None,
 	kgrid: tuple[int, int, int],
@@ -595,8 +596,12 @@ def z_q_from_psi_sm(
 	    band_range_right    : (R_lo, R_hi) global R-window.
 	    fft_grid            : (nx, ny, nz).
 	    r_start_dyn         : int32 scalar — flat-r start of the chunk.
-	    r_chunk_size        : static int — full r-chunk extent.  Per
+	    r_chunk_size        : static int — padded r-chunk extent.  Per
 	                          rank slab is ``r_chunk_size // p_y``.
+	    r_chunk_valid_size  : logical cells in this chunk.  Defaults to
+	                          ``r_chunk_size``.  A short final chunk may be
+	                          zero-padded to the y-mesh divisor; those pad
+	                          columns are sliced by the caller after solve.
 	    gamma_L, gamma_R    : ``(perm, phase)`` tuples or ``None``
 	                          (= γ̃^0 = I).
 	    kgrid               : (nkx, nky, nkz).
@@ -614,8 +619,14 @@ def z_q_from_psi_sm(
 	nb_r = int(psi_r_X.shape[2])
 	ns = int(psi_l_X.shape[3])
 	n_zchunk = int(r_chunk_size)
+	n_zvalid = (n_zchunk if r_chunk_valid_size is None
+	            else int(r_chunk_valid_size))
 	p_x = int(mesh_xy.shape['x'])
 	p_y = int(mesh_xy.shape['y'])
+	if n_zvalid <= 0 or n_zvalid > n_zchunk:
+		raise ValueError(
+			f"z_q_from_psi_sm: r_chunk_valid_size={n_zvalid} must be in "
+			f"[1, r_chunk_size={n_zchunk}]")
 	if n_zchunk % p_y != 0:
 		raise ValueError(
 			f"z_q_from_psi_sm: r_chunk_size={n_zchunk} not divisible by "
@@ -642,7 +653,7 @@ def z_q_from_psi_sm(
 
 	cache_key = (
 		'z_q_from_psi_sm_streaming', id(mesh_xy), id(psi_G_store),
-		nk, n_rmu, n_zchunk, ns, nb_l, nb_r, nkx, nky, nkz,
+		nk, n_rmu, n_zchunk, n_zvalid, ns, nb_l, nb_r, nkx, nky, nkz,
 		lhs_id, rhs_id, bcr, (L_lo_g, L_hi_g), (R_lo_g, R_hi_g),
 		tuple(int(s) for s in fft_grid), pair_arm, pair_gamma_key,
 		use_psi_r_cache,
@@ -872,7 +883,7 @@ def z_q_from_psi_sm(
 				#     allocator → single slot of each.
 				if use_psi_r_cache:
 					psi_Y_bc_local_full_r = jax.lax.dynamic_slice_in_dim(
-						psi_r_cache_[bc_idx], r_start_, n_zchunk, axis=3)
+						psi_r_cache_[bc_idx], r_start_, n_zvalid, axis=3)
 				else:
 					psi_G_bc_local = _io_callback(
 						_slicer_host, _slicer_out_sds,
@@ -880,8 +891,18 @@ def z_q_from_psi_sm(
 						ordered=False)
 					psi_Y_bc_local_full_r = to_rchunk_inner(
 						psi_G_bc_local, g_index_dev, fft_grid_t,
-						r_start_, n_zchunk,
+						r_start_, n_zvalid,
 						kvecs_frac=kvecs_frac_dev, norm="ortho")
+				# The output r axis is sharded on 'y', so its traced extent
+				# must divide p_y.  Only the final outer chunk can be short.
+				# Pad AFTER the logical slice/phase so XLA cannot clamp an
+				# overlong dynamic slice back into physical data and so no
+				# Bloch-phase gather indexes beyond the FFT box.
+				if n_zvalid < n_zchunk:
+					psi_Y_bc_local_full_r = jnp.pad(
+						psi_Y_bc_local_full_r,
+						((0, 0), (0, 0), (0, 0),
+						 (0, n_zchunk - n_zvalid)))
 				# (3) Band-gather AND r-scatter in one shot.
 				#
 				#     The old code did all_gather(('x','y')) over bands at the
@@ -4475,6 +4496,7 @@ def _make_fit_one_rchunk_kernel(
     band_range_right: tuple[int, int],
     band_range_full: tuple[int, int],
     actual_n_rchunk: int,
+    valid_n_rchunk: int,
     q_chunk_size: int,
     kvecs_frac,
     psi_G_store,
@@ -4577,6 +4599,7 @@ def _make_fit_one_rchunk_kernel(
             band_range_right=band_range_right,
             r_start_dyn=r_start_dyn,
             r_chunk_size=actual_n_rchunk,
+            r_chunk_valid_size=valid_n_rchunk,
             gamma_L=gamma_mu,
             gamma_R=gamma_mu,
             kgrid=kgrid,
@@ -4669,6 +4692,7 @@ def fit_one_rchunk(
     actual_n_rchunk: int,
     q_chunk_size: int,
     kvecs_frac: np.ndarray,
+    valid_n_rchunk: int | None = None,
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
@@ -4692,9 +4716,16 @@ def fit_one_rchunk(
     # separately instead of trying to turn tracers into host attributes.
     is_charge = (int(vertex_mu_L) == 0)
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
+    if valid_n_rchunk is None:
+        valid_n_rchunk = int(actual_n_rchunk)
+    valid_n_rchunk = int(valid_n_rchunk)
+    if valid_n_rchunk <= 0 or valid_n_rchunk > int(actual_n_rchunk):
+        raise ValueError(
+            f"fit_one_rchunk: valid_n_rchunk={valid_n_rchunk} must be in "
+            f"[1, actual_n_rchunk={actual_n_rchunk}]")
     cache_key = (
         id(mesh_xy),
-        actual_n_rchunk,
+        actual_n_rchunk, valid_n_rchunk,
         tuple(tuple(b) for b in band_chunk_ranges),
         tuple(band_range_left), tuple(band_range_right),
         tuple(band_range_full),
@@ -4723,6 +4754,7 @@ def fit_one_rchunk(
             tuple(band_range_right),
             tuple(band_range_full),
             actual_n_rchunk,
+            valid_n_rchunk,
             q_chunk_size,
             kvecs_frac,
             psi_G_store,

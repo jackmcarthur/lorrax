@@ -415,6 +415,139 @@ def _worker_zq_band_invariance() -> int:
     return 0
 
 
+def _worker_zq_rtail_padding() -> int:
+    """Exercise a physical FFT-grid tail that does not divide ``p_y``.
+
+    The production failure was n_rtot=1,406,250, p_y=16: the final logical
+    68,394 cells were passed ragged to P(None,'x','y').  This tiny twin uses
+    n_rtot=27, p_y=2 and compares the logical three-cell tail against the
+    same unpadded tail on a 1x1 mesh.  Both the hoisted-cache production arm
+    and the streaming compatibility arm must agree, and their one padded
+    column must be exact zero.
+    """
+    import json
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from isdf.core import build_psi_r_cache_sm, z_q_from_psi_sm
+
+    devs = jax.devices()
+    if len(devs) < 2:
+        print(json.dumps({"skip": f"only {len(devs)} devices (<2)"}))
+        return 0
+
+    rng = np.random.default_rng(0x7A11)
+    fft_grid = (3, 3, 3)
+    n_rtot = 27
+    nk = 1
+    nb = 4
+    ns = 1
+    n_rmu = 2
+    band_chunks = ((0, 4),)
+    psi_G = (rng.standard_normal((nk, nb, ns, n_rtot))
+             + 1j * rng.standard_normal((nk, nb, ns, n_rtot))).astype(
+                 np.complex128)
+    g_index = np.arange(n_rtot, dtype=np.int32).reshape(
+        nk, *fft_grid)
+    kvecs = np.asarray([[0.13, -0.21, 0.07]], dtype=np.float64)
+    psi_l = (rng.standard_normal((nk, n_rmu, nb, ns))
+             + 1j * rng.standard_normal((nk, n_rmu, nb, ns))).astype(
+                 np.complex128)
+    psi_r = (rng.standard_normal((nk, n_rmu, nb, ns))
+             + 1j * rng.standard_normal((nk, n_rmu, nb, ns))).astype(
+                 np.complex128)
+
+    class _TailStore:
+        def __init__(self, mesh):
+            self._mesh = mesh
+            self._py = int(mesh.shape['y'])
+            self._p = int(mesh.size)
+            self.band_chunk_ranges = band_chunks
+            self._bpd_per_bc = (nb // self._p,)
+            self._bpd_max = nb // self._p
+            self._per_rank_shape = (nk, nb, ns, n_rtot)
+
+            class _Meta:
+                pass
+
+            self.meta = _Meta()
+            self.meta.fft_grid = fft_grid
+            self.meta.nk_tot = nk
+            self.meta.nspinor = ns
+            self._g = jax.device_put(
+                jnp.asarray(g_index),
+                NamedSharding(mesh, P(None, None, None, None)))
+            self._k = jax.device_put(
+                jnp.asarray(kvecs), NamedSharding(mesh, P(None, None)))
+
+        def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx):
+            assert int(bc_idx) == 0
+            rank = int(x_idx) * self._py + int(y_idx)
+            lo = rank * self._bpd_max
+            hi = lo + self._bpd_max
+            return np.asarray(psi_G[:, lo:hi])
+
+        @property
+        def g_index(self):
+            return self._g
+
+        @property
+        def kvecs_frac(self):
+            return self._k
+
+    def _inputs(mesh):
+        shard = NamedSharding(mesh, P(None, 'x', None, None))
+        return (jax.device_put(jnp.asarray(psi_l), shard),
+                jax.device_put(jnp.asarray(psi_r), shard))
+
+    mesh1 = Mesh(np.asarray(devs[:1]).reshape(1, 1), ('x', 'y'))
+    store1 = _TailStore(mesh1)
+    l1, r1 = _inputs(mesh1)
+    ref = z_q_from_psi_sm(
+        l1, r1, store1,
+        band_chunk_ranges=band_chunks,
+        band_range_left=(0, nb), band_range_right=(0, nb),
+        r_start_dyn=24, r_chunk_size=3,
+        kgrid=(1, 1, 1), mesh_xy=mesh1)
+    ref = np.asarray(jax.device_get(ref))
+
+    mesh2 = Mesh(np.asarray(devs[:2]).reshape(1, 2), ('x', 'y'))
+    store2 = _TailStore(mesh2)
+    l2, r2 = _inputs(mesh2)
+    cache = build_psi_r_cache_sm(store2, mesh_xy=mesh2)
+    cached = z_q_from_psi_sm(
+        l2, r2, store2, cache,
+        band_chunk_ranges=band_chunks,
+        band_range_left=(0, nb), band_range_right=(0, nb),
+        r_start_dyn=jnp.asarray(24, dtype=jnp.int32),
+        r_chunk_size=4, r_chunk_valid_size=3,
+        kgrid=(1, 1, 1), mesh_xy=mesh2)
+    streaming = z_q_from_psi_sm(
+        l2, r2, store2,
+        band_chunk_ranges=band_chunks,
+        band_range_left=(0, nb), band_range_right=(0, nb),
+        r_start_dyn=jnp.asarray(24, dtype=jnp.int32),
+        r_chunk_size=4, r_chunk_valid_size=3,
+        kgrid=(1, 1, 1), mesh_xy=mesh2)
+    cached = np.asarray(jax.device_get(cached))
+    streaming = np.asarray(jax.device_get(streaming))
+
+    def _rel(a, b):
+        return float(np.linalg.norm(a - b)
+                     / max(np.linalg.norm(b), 1e-300))
+
+    print(json.dumps({
+        "cached_vs_ref": _rel(cached[..., :3], ref),
+        "streaming_vs_ref": _rel(streaming[..., :3], ref),
+        "cached_vs_streaming": _rel(cached, streaming),
+        "cached_pad_max": float(np.max(np.abs(cached[..., 3:]))),
+        "streaming_pad_max": float(np.max(np.abs(streaming[..., 3:]))),
+    }))
+    return 0
+
+
 def _run_worker(tag: str, timeout: int = 600, env_extra: dict | None = None,
                 ndev: int | None = None):
     env = dict(os.environ)
@@ -555,6 +688,18 @@ def test_zq_band_gather_is_mesh_invariant():
         f"(bpd_per_bc per mesh: {out['bpd_per_bc']})")
 
 
+def test_zq_final_rchunk_is_zero_padded_to_the_y_mesh():
+    """The non-dividing physical tail is padded, solved, and sliced safely."""
+    out = _run_worker("worker_zq_rtail", ndev=2)
+    if "skip" in out:
+        pytest.skip(f"z_q r-tail padding gate: {out['skip']}")
+    assert out["cached_vs_ref"] <= 1e-10, out
+    assert out["streaming_vs_ref"] <= 1e-10, out
+    assert out["cached_vs_streaming"] <= 1e-12, out
+    assert out["cached_pad_max"] == 0.0, out
+    assert out["streaming_pad_max"] == 0.0, out
+
+
 def test_zeta_gather_tier_ladder_is_pinned():
     """``distributed_zeta_solve`` route-pin — the GATHER granularity of the
     ζ back-solve, orthogonal to ``charge_zeta_solve``'s factorization choice.
@@ -685,4 +830,6 @@ if __name__ == "__main__":
         sys.exit(_worker_qparallel())
     if len(sys.argv) > 1 and sys.argv[1] == "worker_zq_band":
         sys.exit(_worker_zq_band_invariance())
+    if len(sys.argv) > 1 and sys.argv[1] == "worker_zq_rtail":
+        sys.exit(_worker_zq_rtail_padding())
     sys.exit(test_zeta_fit_charge_factor_solve_is_mesh_invariant() or 0)
