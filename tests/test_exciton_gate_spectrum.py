@@ -93,3 +93,29 @@ def test_gamma_gate_refuses_mismatched_native_tables_without_a_map():
             jnp.ones((144, 1, 1, 1), dtype=jnp.complex128),
             jnp.zeros((144, 1)), data, eb._create_mesh_xy(1, 1),
             log=lambda _: None)
+
+
+def test_gamma_gate_refuses_mixed_coarse_energy_and_fine_psi_axes():
+    """RED TWIN: post-densification --eqp must not masquerade as a join.
+
+    The real 8→12 failure had a 64-row energy table applied after the BSE
+    loader had already rebuilt psi on 144 rows.  Even a valid coarse/fine
+    point map cannot make those two arrays one physical operand.
+    """
+    import jax.numpy as jnp
+    from symmetry_maps import common_uniform_grid_indices
+    import bse.exciton_bands as eb
+
+    stored_k, htransform_k = common_uniform_grid_indices(
+        (8, 8, 1), (12, 12, 1))
+    data = {
+        "n_cond": 1,
+        "eps_c": jnp.zeros((64, 1)),
+        "psi_c_X": jnp.ones((144, 1, 1, 1), dtype=jnp.complex128),
+    }
+    with pytest.raises(ValueError, match="internally inconsistent BSE bundle"):
+        eb.gate_htransform_vs_stored(
+            jnp.ones((144, 1, 1, 1), dtype=jnp.complex128),
+            jnp.zeros((144, 1)), data, eb._create_mesh_xy(1, 1),
+            htransform_k_indices=htransform_k,
+            stored_k_indices=stored_k, log=lambda _: None)

@@ -137,7 +137,6 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
 from common.collectives import device_put_process_local
 from common.fft_helpers import make_sharded_ifftn_3d
 from common.provenance import lorrax_version, provenance_header
-from symmetry_maps import common_uniform_grid_indices
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
@@ -916,11 +915,13 @@ def _gate_stats_on_device(
 
     @partial(jax.jit, out_shardings=(rep, rep, rep))
     def _f(e_ht, e_st, A, B):
-        # A bse_k_grid run stores native COARSE samples while htransform
-        # returns the FINE BSE lattice.  Select paired common-grid rows ON
-        # DEVICE before any subtraction or mu contraction.  The index tables
-        # are closed-over integer metadata from symmetry_maps, so this remains
-        # one jit and neither mu-sharded wavefunction is gathered.
+        # A diagnostic caller may hold two internally coherent native tables
+        # on different grids.  Select its paired physical rows ON DEVICE
+        # before any subtraction or mu contraction.  The index tables are
+        # closed-over integer metadata from symmetry_maps, so this remains one
+        # jit and neither mu-sharded wavefunction is gathered.  The production
+        # bse_k_grid path is NOT such a caller: its general loader has already
+        # rebuilt both operands on the fine grid and compares every row.
         if ht_idx is not None:
             e_ht = jnp.take(e_ht, ht_idx, axis=0)
             A = jnp.take(A, ht_idx, axis=0)
@@ -992,18 +993,34 @@ def gate_htransform_vs_stored(
     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` it does not work at any of
     three warm-ups.
 
-    A ``bse_k_grid`` densification gives the two operands different native
-    k lattices.  In that case ``htransform_k_indices`` and
-    ``stored_k_indices`` are the aligned exact intersection returned by
-    :func:`symmetry_maps.common_uniform_grid_indices`.  The gate is preserved
-    on those shared physical points; it is never disabled, prefix-trimmed, or
-    nearest-neighbour matched.
+    A lower-level diagnostic with two internally coherent native k lattices
+    may pass ``htransform_k_indices`` and ``stored_k_indices`` as the aligned
+    exact intersection returned by
+    :func:`symmetry_maps.common_uniform_grid_indices`.  This cannot repair a
+    bundle whose energy and wavefunction tables have different k axes; that
+    is refused before either index table is used.  The production
+    ``bse_k_grid`` path compares every fine-grid row because its general
+    loader has already densified the complete BSE bundle.
     """
     paired = (htransform_k_indices is not None, stored_k_indices is not None)
     if paired[0] != paired[1]:
         raise ValueError(
             "htransform@Gamma gate requires htransform_k_indices and "
             "stored_k_indices together.")
+    n_ht_eps = int(eps_cQ_gamma.shape[0])
+    n_ht_psi = int(psi_cQ_gamma.shape[0])
+    n_st_eps = int(data["eps_c"].shape[0])
+    n_st_psi = int(data["psi_c_X"].shape[0])
+    if n_ht_eps != n_ht_psi or n_st_eps != n_st_psi:
+        raise ValueError(
+            "htransform@Gamma gate found an internally inconsistent BSE "
+            "bundle: each energy table and its wavefunction table must share "
+            "one k axis, but htransform has "
+            f"eps={n_ht_eps}, psi={n_ht_psi} and stored/data has "
+            f"eps={n_st_eps}, psi={n_st_psi}.  A bse_k_grid run with --eqp "
+            "can cause exactly this if coarse restart energies are applied "
+            "after psi was densified; apply the QP ladder before "
+            "densification, or use WFN_qp.h5 without the redundant --eqp.")
     if paired[0]:
         ht_idx = np.asarray(htransform_k_indices, dtype=np.int32)
         st_idx = np.asarray(stored_k_indices, dtype=np.int32)
@@ -1012,8 +1029,8 @@ def gate_htransform_vs_stored(
             raise ValueError(
                 "htransform@Gamma gate matched-k indices must be nonempty "
                 f"aligned vectors; got {ht_idx.shape} and {st_idx.shape}.")
-        n_ht = int(eps_cQ_gamma.shape[0])
-        n_st = int(data["eps_c"].shape[0])
+        n_ht = n_ht_eps
+        n_st = n_st_eps
         if (np.any(ht_idx < 0) or np.any(ht_idx >= n_ht)
                 or np.any(st_idx < 0) or np.any(st_idx >= n_st)):
             raise ValueError(
@@ -1569,6 +1586,18 @@ def main(argv=None):
             mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry)
+        if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
+            raise ValueError(
+                "exciton_bands: --eqp rebuilt energies on the native restart "
+                f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
+                "had already densified the BSE wavefunctions to "
+                f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
+                "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
+                "remove --eqp: that file already carries the canonical QP "
+                "eigenvalues paired with its rotated wavefunctions.  A "
+                "mean-field WFN plus diagonal eqp corrections needs the eqp "
+                "ladder applied inside the htransform densification, not "
+                "patched onto its output here.")
         enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp, args.input)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
@@ -1747,12 +1776,16 @@ def main(argv=None):
         # host ``svd`` per k.  A diagnostic is allowed to cost something; it
         # is not allowed to cost something invisibly.
         t0 = time.time()
-        stored_gate_k, htransform_gate_k = common_uniform_grid_indices(
-            kgrid_co_ct, (nkx, nky, nkz))
+        # ``data`` is the POST-bse_k_grid bundle.  When densification is on,
+        # both its psi/eps and this Q=Gamma cache live on the FINE grid; the
+        # native coarse restart is no longer either operand.  Comparing a
+        # coarse/fine intersection here used the coarse energy cardinality
+        # left behind by the invalid post-densification --eqp path to index an
+        # already-fine psi table, turning an operand-provenance bug into a
+        # spurious subspace-overlap failure.  The gate below first verifies
+        # each psi/eps pair has one k axis, then compares all actual rows.
         gate_htransform_vs_stored(
-            psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy,
-            htransform_k_indices=htransform_gate_k,
-            stored_k_indices=stored_gate_k, log=log)
+            psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy, log=log)
         tick("gamma_gate", t0)
 
     # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid
