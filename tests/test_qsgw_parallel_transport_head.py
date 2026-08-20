@@ -152,21 +152,14 @@ def test_distributed_velocity_rotation_matches_explicit_u_dagger_v_u():
     assert np.max(np.abs(got - wrong)) > 1e-2
 
 
-def test_sharded_s_tensor_matches_legacy_dft_formula():
+def test_sharded_s_tensor_pads_unaligned_manifold_and_matches_dft_formula():
     rng = np.random.default_rng(813)
-    nk, nb, nb_pad, nocc = 4, 7, 8, 3
-    energies_logical = np.sort(rng.uniform(-0.8, 1.4, (nk, nb)), axis=1)
-    occ_logical = np.zeros((nk, nb))
-    occ_logical[:, :nocc] = 1.0
-    velocity_logical = rng.standard_normal((3, nk, nb, nb)) + 1j * rng.standard_normal(
+    nk, nb, nocc = 4, 7, 3
+    energies = np.sort(rng.uniform(-0.8, 1.4, (nk, nb)), axis=1)
+    occ = np.zeros((nk, nb))
+    occ[:, :nocc] = 1.0
+    velocity = rng.standard_normal((3, nk, nb, nb)) + 1j * rng.standard_normal(
         (3, nk, nb, nb)
-    )
-    energies = np.pad(
-        energies_logical, ((0, 0), (0, nb_pad - nb)), constant_values=1.0e6
-    )
-    occ = np.pad(occ_logical, ((0, 0), (0, nb_pad - nb)))
-    velocity = np.pad(
-        velocity_logical, ((0, 0), (0, 0), (0, nb_pad - nb), (0, nb_pad - nb))
     )
     omegas = np.asarray([0.0 + 0.0j, 0.0 + 0.61j])
     volume = 83.5
@@ -184,12 +177,12 @@ def test_sharded_s_tensor_matches_legacy_dft_formula():
             nspinor=1,
         )
     )
-    delta_e = energies_logical[:, :, None] - energies_logical[:, None, :]
+    delta_e = energies[:, :, None] - energies[:, None, :]
     ref = np.asarray(
         compute_S_omega(
-            jnp.asarray(velocity_logical),
+            jnp.asarray(velocity),
             jnp.asarray(delta_e),
-            jnp.asarray(occ_logical),
+            jnp.asarray(occ),
             volume,
             nk,
             1,
