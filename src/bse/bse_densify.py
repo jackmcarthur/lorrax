@@ -486,6 +486,7 @@ def _interpolate_bse_data_to_grid(
     *,
     head_channel: dict | None = None,
     distrib_la_batched_route: str | None = None,
+    htransform_a_band: int | None = None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -573,14 +574,11 @@ def _interpolate_bse_data_to_grid(
     # block is then a no-op and everything below is the program it always was.
     #
     # On a DOWNFOLDED bundle the two questions come apart, and the densifier
-    # has to answer them the same way ``exciton_bands`` already does (that
-    # driver's ``resolve_isdf_basis`` is the ONE owner of this contract and is
-    # called here rather than restated).  The Galerkin fit needs a basis
-    # spanning nk·nb, which is a completely different sizing criterion from
-    # the retained window's pair-density rank μ_S was chosen against — so the
-    # fit runs in the PARENT basis and its output is sliced to the kept rows,
-    # which is exact because the small basis's ψ-at-centroids IS that column
-    # slice (``mode = cur``).  Without this the pad below is asked for
+    # has to answer them through ``exciton_bands.resolve_isdf_basis``, the ONE
+    # owner of this contract.  The exact rank-0 arm fits in the parent basis
+    # and slices its output.  The explicit reduced arm applies the same
+    # ordered ``keep`` before fitting and is born at μ_S.  Without either
+    # deliberate route, the pad below is asked for
     # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
     # with an index error that names neither the downfold nor the basis.
     # Same defect class as PIPELINE_HEALTH row 4, which closed this for
@@ -595,8 +593,14 @@ def _interpolate_bse_data_to_grid(
     keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
 
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
+    _rank_multiplier = ht.resolve_galerkin_rank_multiplier(
+        params.get("htransform_rank_multiplier", 0.0))
+    _fit_subset = keep if _rank_multiplier > 0.0 else None
+    _output_keep = None if _fit_subset is not None else keep
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
-     enk_sigma) = ht.initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy)
+     enk_sigma) = ht.initialize_wfns(
+         input_file, params, log_fn, mesh_xy=mesh_xy,
+         centroid_subset_idx=_fit_subset)
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond
@@ -626,7 +630,9 @@ def _interpolate_bse_data_to_grid(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=coarse_grid, kgrid_fi=fine_grid,
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
-        centroid_keep_idx=keep,
+        a_band_index=htransform_a_band,
+        batch_size=int(params.get("wfn_fi_q_chunk", 0)),
+        centroid_keep_idx=_output_keep,
         distrib_la_batched_route=_distrib_la_batched_route)
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))

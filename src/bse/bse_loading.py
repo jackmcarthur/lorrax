@@ -859,6 +859,7 @@ def load_bse_data_from_restart_sharded(
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
     distrib_la_batched_route: str | None = None,
+    htransform_a_band: int | None = None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
 
@@ -1171,7 +1172,8 @@ def load_bse_data_from_restart_sharded(
         data = _interpolate_bse_data_to_grid(
             data, fine_grid, restart_file, input_file, mesh_xy,
             head_channel=head_channel,
-            distrib_la_batched_route=distrib_la_batched_route)
+            distrib_la_batched_route=distrib_la_batched_route,
+            htransform_a_band=htransform_a_band)
     return data
 
 

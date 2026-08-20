@@ -170,13 +170,90 @@ def resolve_fh_ortho_tol(log_fn=None) -> float:
     return tol
 
 
+def resolve_galerkin_rank_multiplier(value) -> float:
+    """Validate the opt-in cross-k Galerkin model-order multiplier.
+
+    ``0`` preserves the historical numerical-rank solve.  A positive value
+    means ``ceil(value * N_band)`` shared alpha directions, capped by the
+    numerical rank.  Values below one are refused: fewer alpha directions
+    than bands at one k cannot give the row-orthonormal coefficient block
+    required by :func:`build_fH_R`.
+
+    This is deliberately separate from ``rtol``.  The latter protects a
+    pseudo-inverse from numerical noise; this value is an explicit physical
+    model-order approximation that exploits redundancy between k points.
+    """
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"htransform_rank_multiplier={value!r} is not a finite number; "
+            "use 0 for the exact numerical-rank path or a value >= 1.") \
+            from None
+    if not np.isfinite(multiplier) or multiplier < 0.0:
+        raise ValueError(
+            f"htransform_rank_multiplier={value!r} must be finite and >= 0.")
+    if 0.0 < multiplier < 1.0:
+        raise ValueError(
+            f"htransform_rank_multiplier={multiplier:g} would retain fewer "
+            "directions than bands at one k.  Use 0 for the exact path or a "
+            "value >= 1.")
+    return multiplier
+
+
+def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
+    """Validate the ordered parent-to-child centroid row selection."""
+    idx = np.asarray(selection)
+    if idx.ndim != 1 or idx.dtype.kind not in "iu":
+        raise ValueError(
+            "htransform centroid subset must be a one-dimensional integer "
+            f"row list; got shape={idx.shape}, dtype={idx.dtype}.")
+    idx = idx.astype(np.int64, copy=False)
+    if idx.size == 0:
+        raise ValueError("htransform centroid subset may not be empty.")
+    if int(idx.min()) < 0 or int(idx.max()) >= int(n_parent):
+        raise ValueError(
+            "htransform centroid subset escapes its parent table: "
+            f"min/max={int(idx.min())}/{int(idx.max())}, parent rows="
+            f"{int(n_parent)}.")
+    if np.unique(idx).size != idx.size:
+        raise ValueError(
+            "htransform centroid subset contains duplicate parent rows; the "
+            "downfold basis must be a strict ordered subset.")
+    return idx
+
+
+def _lowdin_orthonormalize_band_rows(ctilde: jax.Array):
+    """Per-k polar/Löwdin row orthonormalization for a reduced shared span."""
+    gram = jnp.einsum('kna,kma->knm', ctilde, jnp.conj(ctilde),
+                      optimize=True)
+    gram = 0.5 * (gram + jnp.swapaxes(gram, -1, -2).conj())
+    evals, evecs = jnp.linalg.eigh(gram)
+    safe_evals = jnp.maximum(evals, jnp.finfo(evals.dtype).tiny)
+    invsqrt = jnp.einsum(
+        'kni,ki,kmi->knm', evecs, 1.0 / jnp.sqrt(safe_evals),
+        jnp.conj(evecs), optimize=True)
+    out = jnp.einsum('knm,kma->kna', invsqrt, ctilde, optimize=True)
+    eye = jnp.eye(ctilde.shape[1], dtype=ctilde.dtype)[None]
+    gram_out = jnp.einsum('kna,kma->knm', out, jnp.conj(out),
+                          optimize=True)
+    before = jnp.max(jnp.abs(gram - eye))
+    after = jnp.max(jnp.abs(gram_out - eye))
+    rel_move = jnp.max(
+        jnp.linalg.norm(out - ctilde, axis=(-2, -1)) /
+        jnp.maximum(jnp.linalg.norm(ctilde, axis=(-2, -1)),
+                    jnp.finfo(ctilde.real.dtype).tiny))
+    return out, jnp.min(evals), jnp.max(evals), before, after, rel_move
+
+
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
                              band_chunk_size: int = 64,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
-                             eigh_backend: str = "auto"):
+                             eigh_backend: str = "auto",
+                             rank_multiplier: float = 0.0):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -197,6 +274,11 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             same plan family (and deck key) as the fH_q eigh downstream;
             ``auto`` = native replicated eigh, ``distributed`` = ScaLAPACK
             pzheevd, one tile over the mesh.
+        rank_multiplier: 0 (default) carries the full numerical rank.  A
+            value >= 1 targets ``ceil(rank_multiplier * nb)`` shared alpha
+            directions, capped by the numerical rank, then Löwdin-
+            orthonormalizes each k's band rows.  This is an explicit
+            model-order approximation, not another spelling of ``rtol``.
         band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
             CEILING, not a fixed size: it is lowered so one streamed ψ chunk
             ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
@@ -225,6 +307,15 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     nk = meta.nk_tot
     nspinor = meta.nspinor
     n_mu = int(centroid_indices.shape[0])
+    rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
+    if rank_multiplier > 0.0 and return_full_proj:
+        raise ValueError(
+            "streaming_galerkin_solve: htransform_rank_multiplier cannot be "
+            "combined with return_full_proj/refit.  The reduced route applies "
+            "a k-dependent Löwdin map to ctilde, while W_proj is one global "
+            "full-r projector; pretending they share one alpha gauge would "
+            "give the refit wrong wavefunctions.  Use vq-mode=interp/ongrid "
+            "or htransform_rank_multiplier=0 for refit.")
 
     rep = NamedSharding(mesh_xy, P())               # fully replicated
     grid_xy = NamedSharding(mesh_xy, P('x', 'y'))   # (rank, rank) face
@@ -235,10 +326,13 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                         // max(1, bytes_per_band)))
     band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
 
+    _rank_policy = ("numerical (exact-span default)" if rank_multiplier == 0.0
+                    else f"target {rank_multiplier:g}*nb="
+                         f"{math.ceil(rank_multiplier * nb)}")
     log_fn(
         f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={meta.n_rtot}, "
         f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']}), "
-        f"band_chunk={band_chunk_size} "
+        f"band_chunk={band_chunk_size}, rank={_rank_policy} "
         f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
     )
     if band_chunk_size < nb:
@@ -346,8 +440,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     s_host = np.asarray(s)
 
     # ── The truncation criterion ──────────────────────────────────────────
-    # ``rank_phys`` is the ONLY place the retained subspace is decided, and
-    # the decision is a cap on how much the pseudo-inverse below (``inv_s``
+    # ``rank_numerical`` is the ONLY place numerical admissibility is decided,
+    # and the decision is a cap on how much the pseudo-inverse below (``inv_s``
     # = 1/σ) may amplify round-off: keep σ > σ_max/κ_cap with κ_cap = 1/rtol.
     # It is NOT a search for a gap — these are ISDF/Galerkin overlap spectra
     # and they are smooth by construction, with no knee to find.  See
@@ -355,7 +449,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # alternatives (discrepancy principle / L-curve / GCV) and the measured
     # reason each is refuted here, and for the §R19 table in which retaining
     # 41 % MORE rank moved a QP gap from 3.13 eV to −5049 eV.
-    rank_phys = rank_criterion.select_rank(s_host, rtol)
+    rank_numerical = rank_criterion.select_rank(s_host, rtol)
 
     # ── …and the criterion is not allowed to stop mid-multiplet ───────────
     # ``common/spectral_closure``, the sibling of the band-window guard.  A
@@ -370,12 +464,51 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # this criterion just enforced holds with room to spare; the padding
     # below then aligns whatever survives.  See that module's TWO-RULE FAMILY
     # on why the BAND-window guard rounds the other way and refuses instead.
-    rank_phys, _sc = spectral_closure.resolve_spectral_cut(
-        s_host, rank_phys, where="htransform psi@centroids Gram-eigh sigma",
+    rank_numerical, _sc_numerical = spectral_closure.resolve_spectral_cut(
+        s_host, rank_numerical,
+        where="htransform psi@centroids Gram-eigh sigma numerical rank",
         rcond=rtol, log=log_fn)
-    if not _sc["fired"]:
+    if not _sc_numerical["fired"]:
         log_fn(spectral_closure.describe_clean(
-            _sc, where="htransform psi@centroids sigma"))
+            _sc_numerical,
+            where="htransform psi@centroids sigma numerical rank"))
+
+    # ── Optional physical model-order cut (NOT the numerical rtol) ────────
+    # Periodic wavefunctions sampled at different k can be strongly redundant.
+    # The exact-span default above nevertheless retains up to nk*nb left-
+    # singular directions, which makes every later fH(q) solve cubic in nk*nb.
+    # An explicit multiplier requests a shared basis sized by bands PER k.
+    # This is deliberately opt-in and separately logged/gated: changing rtol
+    # to reach the same integer would falsely call a physical approximation
+    # "round-off", obscure its convergence axis, and trip the condition-number
+    # service's meaning.
+    rank_phys = rank_numerical
+    _sc_model = None
+    if rank_multiplier > 0.0:
+        requested = int(math.ceil(rank_multiplier * nb))
+        proposed = min(rank_numerical, requested)
+        rank_phys, _sc_model = spectral_closure.resolve_spectral_cut(
+            s_host, proposed,
+            where="htransform reduced cross-k Galerkin model rank",
+            rcond=rtol, log=log_fn)
+        if not _sc_model["fired"]:
+            log_fn(spectral_closure.describe_clean(
+                _sc_model,
+                where="htransform reduced cross-k Galerkin model rank"))
+        if rank_phys < nb:
+            raise ValueError(
+                "streaming_galerkin_solve: the reduced cross-k Galerkin "
+                f"cut retained rank {rank_phys} for {nb} bands per k after "
+                "spectral closure.  Per-k row orthonormality is impossible. "
+                "Increase htransform_rank_multiplier or use 0 for the "
+                "exact numerical-rank path.")
+        log_fn(
+            f"  [reduced-galerkin] EXPLICIT MODEL ORDER: requested "
+            f"ceil({rank_multiplier:g}*{nb})={requested}; numerical rank "
+            f"{rank_numerical} of {nk*nb}; retaining {rank_phys} shared "
+            f"cross-k directions ({rank_phys/nb:.2f} per band at one k, "
+            f"{rank_phys/(nk*nb):.1%} of the exact stacked-state span).  "
+            "This is an observable-convergence approximation, not rtol.")
 
     # ── Mesh alignment: PAD, never round the rank down ────────────────────
     # G, its Cholesky factor, ctilde, B and fH all live on a (rank, rank)
@@ -472,30 +605,66 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # ``violations()`` would read them as a device-grid round-down and refuse
     # the run.  They are not — the mesh had no part in choosing them — and
     # anything left over after this subtraction is still a real violation.
-    _trunc = rank_criterion.rank_report(
-        s_host, rtol, label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
-                            f"{nspinor*n_mu})",
-        quantity="singular values", rank_used=rank,
+    _numerical_report = rank_criterion.rank_report(
+        s_host, rtol,
+        label=f"htransform ψ@centroids numerical rank ({nk*nb}, "
+              f"{nspinor*n_mu})",
+        quantity="singular values", rank_used=rank_numerical,
         n_rows=nk * nb, n_cols=nspinor * n_mu,
-        n_dropped_closure=max(0, _sc["n_keep"] - _sc["n_keep_closed"]))
+        n_dropped_closure=max(
+            0, _sc_numerical["n_keep"] -
+            _sc_numerical["n_keep_closed"]))
+    _bad = _numerical_report.violations()
+    if _bad:
+        raise ValueError(
+            "streaming_galerkin_solve: the ψ-at-centroids numerical rank is "
+            "not self-consistent — " + "  ".join(_bad))
+
+    if rank_multiplier == 0.0:
+        # Historical report and accounting, unchanged on the default route.
+        _trunc = rank_criterion.rank_report(
+            s_host, rtol,
+            label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
+                  f"{nspinor*n_mu})",
+            quantity="singular values", rank_used=rank,
+            n_rows=nk * nb, n_cols=nspinor * n_mu,
+            n_dropped_closure=max(
+                0, _sc_numerical["n_keep"] -
+                _sc_numerical["n_keep_closed"]))
+        _closure_for_report = _sc_numerical
+    else:
+        # The model-order tail is not a GRID drop and must never be fed to
+        # rank_report as one.  Report the retained operator's conditioning;
+        # the explicit reduced-galerkin line above owns the physical tail.
+        _trunc = rank_criterion.rank_report(
+            s_host[:rank_phys], rtol,
+            label=f"htransform retained reduced Galerkin block ({rank_phys} "
+                  f"of numerical {rank_numerical})",
+            quantity="singular values", rank_used=rank,
+            n_rows=rank_phys, n_cols=rank_phys)
+        _closure_for_report = _sc_model
     log_fn(f"  Gram-eigh σ of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
            + (f" (+{n_pad} null pad → carried extent {rank}, "
               f"mesh-aligned to {align})" if n_pad else "")
            + f" ({time.time()-t1:.2f}s)")
     log_fn(_trunc.describe())
-    if _sc["fired"]:
+    if _closure_for_report is not None and _closure_for_report["fired"]:
         # The two guards stay orthogonal and the reader is told which took
         # what.  ``rank_report`` now carries the closure deficit in its own
         # column (see ``n_dropped_closure``), so this line names the block
         # rather than re-deriving the arithmetic.
+        _closure_drop = max(
+            0, _closure_for_report["n_keep"] -
+            _closure_for_report["n_keep_closed"])
         log_fn(f"  [rank]   of the directions not carried, "
-               f"{_trunc.n_dropped_closure} were "
+               f"{_closure_drop} were "
                f"DROPPED BY DEGENERACY CLOSURE — the members of a block of "
-               f"{len(_sc['members'])} that the cut at {_sc['n_keep']} "
-               f"straddled (relative span {_sc['span_rel']:.3e}).  They are "
+               f"{len(_closure_for_report['members'])} that the cut at "
+               f"{_closure_for_report['n_keep']} straddled (relative span "
+               f"{_closure_for_report['span_rel']:.3e}).  They are "
                f"real directions with sigma > 0, discarded so the retained "
                f"span is a representation of the point group; the other "
-               f"legal cut was {_sc['n_keep_kept']}, and the ruling of "
+               f"legal cut was {_closure_for_report['n_keep_kept']}, and the ruling of "
                f"2026-08-10 takes the lower.  The {n_pad} null pad above is "
                f"mesh alignment and unrelated.")
     _bad = _trunc.violations()
@@ -503,14 +672,15 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         raise ValueError(
             "streaming_galerkin_solve: the ψ-at-centroids truncation is not "
             "self-consistent — " + "  ".join(_bad))
-    if rank_phys < nk * nb:
-        log_fn(f"  [warn] ψ-at-centroids is RANK-DEFICIENT: {nk*nb} states vs "
-               f"numerical rank {rank_phys} (nspinor·n_μ = {nspinor*n_mu}).  The "
+    if rank_numerical < nk * nb:
+        log_fn(f"  [warn] ψ-at-centroids is NUMERICALLY RANK-DEFICIENT: "
+               f"{nk*nb} states vs numerical rank {rank_numerical} "
+               f"(nspinor·n_μ = {nspinor*n_mu}).  The "
                f"Galerkin basis cannot span the band window — fH energy "
                f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
-               f"≤ nspinor·n_μ, i.e. nb < {rank_phys/nk:.2f} here.  (The pad "
+               f"≤ nspinor·n_μ, i.e. nb < {rank_numerical/nk:.2f} here.  (The pad "
                f"directions are exactly null and add NO capacity — the "
-               f"capacity bound is on rank_phys, never on the carried "
+               f"capacity bound is on numerical rank, never on the carried "
                f"extent.)")
 
     # Null-extend to the carried extent.  The zeros here are what make every
@@ -752,6 +922,38 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     ctilde, ortho_err = _finalize(coeffs, L)
     ctilde = jax.device_put(ctilde, rep)
+    if rank_multiplier > 0.0:
+        # A truncated GLOBAL SVD is a least-squares shared span, but its band
+        # rows at one k are not exactly orthonormal.  fH's coarse-grid energy
+        # identity requires that local invariant.  The polar factor is the
+        # closest row-isometry and changes only this explicit approximate
+        # route; the historical numerical-rank coefficients never pass here.
+        _lowdin = jax.jit(
+            _lowdin_orthonormalize_band_rows,
+            out_shardings=(rep, rep, rep, rep, rep, rep))
+        (ctilde, _lowdin_lmin, _lowdin_lmax, _ortho_before,
+         _ortho_after, _lowdin_move) = _lowdin(ctilde)
+        _stats = [float(x) for x in jax.device_get(jnp.stack([
+            _lowdin_lmin, _lowdin_lmax, _ortho_before, _ortho_after,
+            _lowdin_move]))]
+        lmin, lmax, ortho_before, ortho_after, lowdin_move = _stats
+        if (not np.isfinite(lmin) or not np.isfinite(lmax) or lmax <= 0.0
+                or lmin <= 1.0e-12 * lmax):
+            raise ValueError(
+                "streaming_galerkin_solve: the requested reduced cross-k "
+                "basis does not span all bands at every k: the smallest/"
+                f"largest eigenvalue of C_k C_k^H is {lmin:.6e}/"
+                f"{lmax:.6e}.  The per-k Löwdin map would amplify by more "
+                "than 1e6.  Increase htransform_rank_multiplier (or use 0 "
+                "for the exact numerical-rank path).")
+        log_fn(
+            f"  [reduced-galerkin] per-k Löwdin row isometry: "
+            f"eig(C C^H) min/max={lmin:.6e}/{lmax:.6e}, "
+            f"max|C C^H-I| {ortho_before:.3e} -> {ortho_after:.3e}, "
+            f"max relative coefficient move={lowdin_move:.3e}.  The move is "
+            "the declared cross-k compression error; final acceptance comes "
+            "from the on-grid wavefunction and exciton-spectrum A/B gates.")
+        ortho_err = jnp.asarray(ortho_after)
 
     # B = L⁻¹ Vᴴ, μ-SHARDED end-to-end (replaces the replicated B_at_mu).
     # The triangular solve runs along the rank axis and is independent per μ
@@ -1013,7 +1215,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     #     rtol 1e-8 → rank 1562, ortho 6.31e-04, on-grid  6.9 meV
     #     rtol 1e-6 → rank 1494, ortho 1.04e-02, on-grid 80.3 meV
     #     rtol 1e-4 → rank 1086, ortho 2.61e-02, on-grid 219.3 meV
-    # The lever is n_μ (or a narrower window), never the truncation tolerance.
+    # The lever for the EXACT-SPAN route is n_μ (or a narrower window), never
+    # the truncation tolerance.  ``htransform_rank_multiplier`` is different:
+    # it declares a reduced cross-k MODEL and restores the row-isometry with a
+    # per-k polar factor before this gate.  Its accuracy is decided by an
+    # observable A/B, not by relabeling its cut as numerical noise.
     #
     # ``LORRAX_FH_ORTHO_TOL`` overrides; 0 disables. Never disable to make a
     # run finish — the failure it catches is a wrong number, not a crash.
@@ -1241,7 +1447,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None, return_full_proj: bool = False,
-                    n_guard_bands: int = 0):
+                    n_guard_bands: int = 0, centroid_subset_idx=None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1280,7 +1486,18 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     wfn_file = _resolve(params["wfn_file"])
     wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
-    _, centroid_indices, n_rmu = _shared_load_centroids(centroid_path, tuple(int(x) for x in wfn.fft_grid))
+    _, centroid_indices, n_rmu = _shared_load_centroids(
+        centroid_path, tuple(int(x) for x in wfn.fft_grid))
+    if centroid_subset_idx is not None:
+        _n_parent = int(n_rmu)
+        _subset = validate_centroid_subset_idx(
+            centroid_subset_idx, _n_parent)
+        centroid_indices = np.asarray(centroid_indices)[_subset]
+        n_rmu = int(_subset.size)
+        log_fn(
+            f"  [reduced-galerkin] centroid fit born in the downfold basis: "
+            f"ordered parent subset {_n_parent} -> {n_rmu} rows.  No "
+            "parent-width B_at_mu or projected wavefunction is formed.")
 
     nval = int(params["nval"])
     ncond = int(params["ncond"])
@@ -1392,6 +1609,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # got the native replicated Gram eigh anyway — the key was
             # parsed, defaulted, stored and read by nobody on this driver.
             eigh_backend=resolve_eigh_backend(params),
+            rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")

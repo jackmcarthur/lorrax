@@ -486,11 +486,11 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
     on the walk's silicon deck, where the fit failed the ``build_fH_R``
     orthonormality gate rather than merely losing accuracy.
 
-    So the basis to FIT in is the parent's, and the answer is then sliced to
-    the kept rows — which lands exactly on the columns the bundle stores,
-    because that slice is the downfold's own definition of them.  μ_S buys
-    the (μ, μ) tensors and the BSE matvec; it does not and cannot buy the
-    interpolation fit, and this function is where that is stated.
+    The exact-span route therefore fits in the parent and slices to the kept
+    rows.  The opt-in reduced shared model instead applies ``keep_idx`` before
+    the fit: its target rank is bounded by the child capacity and all centroid
+    objects are born at μ_S.  This function returns both authorities so the
+    caller makes that model-order-dependent choice explicitly.
 
     The parent's table comes off the bundle's own ``downfold_provenance``,
     not off the deck: a deck copied beside the small bundle names a file that
@@ -556,13 +556,12 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
                 f"parent's {mu_parent} — not the table this bundle was "
                 f"downfolded from; skipped.")
             continue
-        log(f"  [downfold] this bundle is a DOWNFOLD of {prov.get('parent_file', '?')} "
-            f"(mu {mu_parent} -> {n_rmu_bundle}).  The htransform leg refits "
-            f"psi in the PARENT basis from {path} ({whence}) and the result "
-            f"is sliced to the {keep_idx.shape[0]} kept centroid rows — the "
-            f"same column slice that defines the bundle's own psi_full_y.  "
-            f"mu_S sizes the (mu,mu) tensors and the BSE matvec; the "
-            f"interpolation fit is sized by nk*nb and cannot use it.")
+        log(f"  [downfold] this bundle is a DOWNFOLD of "
+            f"{prov.get('parent_file', '?')} (mu {mu_parent} -> "
+            f"{n_rmu_bundle}).  Resolved parent table {path} ({whence}) and "
+            f"its ordered {keep_idx.shape[0]}-row child subset.  The exact "
+            f"htransform fits in the parent then slices; an explicit reduced "
+            f"cross-k model fits directly on these child rows.")
         return path, keep_idx
 
     raise SystemExit(
@@ -1550,7 +1549,8 @@ def main(argv=None):
         load_v_full=(args.vq_mode in ("ongrid", "refit")),
         degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry,
-        distrib_la_batched_route=args.distrib_la_batched_route)
+        distrib_la_batched_route=args.distrib_la_batched_route,
+        htransform_a_band=args.a_band)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -1634,9 +1634,18 @@ def main(argv=None):
 
     # ── htransform setup + Q path ────────────────────────────────────────
     t0 = time.time()
+    _rank_multiplier = ht.resolve_galerkin_rank_multiplier(
+        params.get("htransform_rank_multiplier", 0.0))
+    # Rank 0 preserves the exact parent-fit-then-slice route.  The reduced
+    # shared model has no parent-capacity requirement, so build it directly
+    # at the downfold's ordered child rows and never form a parent-width B or
+    # projected wavefunction cache.
+    _fit_subset = keep_idx if _rank_multiplier > 0.0 else None
+    _output_keep = None if _fit_subset is not None else keep_idx
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
-     enk_sigma) = ht.initialize_wfns(args.input, params, log,
-                                     mesh_xy=mesh_xy)
+     enk_sigma) = ht.initialize_wfns(
+         args.input, params, log, mesh_xy=mesh_xy,
+         centroid_subset_idx=_fit_subset)
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
         # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
@@ -1750,7 +1759,8 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
-        centroid_keep_idx=keep_idx,
+        batch_size=int(params.get("wfn_fi_q_chunk", 0)),
+        centroid_keep_idx=_output_keep,
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
         distrib_la_batched_route=args.distrib_la_batched_route)
