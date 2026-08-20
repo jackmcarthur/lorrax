@@ -142,9 +142,10 @@ def trs_pair_coherent_unfold_sym_idx(
     Keep one member's selected spatial row and make the other member use the
     same row composed with time reversal.  ``unfold_isdf_operator`` then
     applies its derived conjugation rule, so q/-q reciprocity depends only on
-    TRS and not on an unrelated spatial gauge.  Irreducible representatives
-    and self-negative q rows are unchanged; no value is averaged or
-    projected.
+    TRS and not on an unrelated spatial gauge.  When every full-BZ q row was
+    solved independently there is no unfold relation to choose: return the
+    original rows unchanged.  Irreducible representatives and self-negative
+    q rows are unchanged; no value is averaged or projected.
 
     This policy was first shipped for ladder W in ``screening_bse``.  It is
     owned here because bare V, RPA W, and ladder W must use the same q-grid
@@ -171,6 +172,13 @@ def trs_pair_coherent_unfold_sym_idx(
 
     reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
     out = original.copy()
+    # An orbit-closed centroid set can still have no q reduction, for example
+    # when the WFN exposes only the identity spatial operation.  Every q is
+    # then a solved source row.  Rewiring q/-q would discard one independent
+    # result and the guard below correctly rejects their distinct parents;
+    # the owning policy is instead the identity map.
+    if len(reps) == n_full:
+        return out
     coords = np.stack(np.unravel_index(np.arange(n_full), grid), axis=1)
     neg = np.ravel_multi_index(
         tuple(((-coords) % np.asarray(grid, dtype=np.int64)).T), grid)

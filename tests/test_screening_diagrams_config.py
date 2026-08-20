@@ -1015,16 +1015,29 @@ def test_ladder_unfold_uses_one_spatial_gauge_for_each_q_pair():
         sym, [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3])
 
 
-def test_ladder_unfold_refuses_two_independently_solved_q_partners():
-    """A TRS composition is valid only when q and -q share one wedge row."""
+def test_ladder_unfold_keeps_a_fully_solved_q_table_unchanged():
+    """A full-BZ solve has no missing partner to reconstruct through TRS."""
+    import numpy as np
+    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
+
+    selected = np.asarray([0, 0, 0])
+    got = _trs_pair_coherent_unfold_sym_idx(
+        np.asarray([0, 1, 2]), selected,
+        kgrid=(3, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2]),
+        n_sym_spatial=1)
+    assert np.array_equal(got, selected)
+
+
+def test_ladder_unfold_refuses_distinct_parents_in_a_partial_wedge():
+    """A partial wedge cannot fabricate a q/-q relation across parents."""
     import numpy as np
     import pytest
     from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
 
     with pytest.raises(ValueError, match="do not fabricate reciprocity"):
         _trs_pair_coherent_unfold_sym_idx(
-            np.asarray([0, 1, 2]), np.asarray([0, 0, 0]),
-            kgrid=(3, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2]),
+            np.asarray([0, 1, 2, 2, 4]), np.asarray([0, 0, 0, 0, 0]),
+            kgrid=(5, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2, 4]),
             n_sym_spatial=1)
 
 
