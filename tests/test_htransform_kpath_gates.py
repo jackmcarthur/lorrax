@@ -85,7 +85,8 @@ def test_post_kpath_outputs_are_replicated(ndev):
     lines = []
     with mesh:
         res = h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk), wfn,
-                          kpath_data, lines.append, mesh, diagnostics=False)
+                          kpath_data, lines.append, mesh, diagnostics=False,
+                          n_return_bands=ct.shape[1] - 1)
     banner = " ".join(lines)
     assert "[gate] _post_kpath out spec:" in banner, banner
     spec = banner.split("[gate] _post_kpath out spec:")[1].split()[0]
@@ -120,7 +121,8 @@ def test_identity_metric_route_matches_the_cholesky_route():
         with mesh:
             outs.append(h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk),
                                     wfn, kpath_data, lines.append, mesh,
-                                    diagnostics=False))
+                                    diagnostics=False,
+                                    n_return_bands=ct.shape[1] - 1))
         banner = " ".join(lines)
         outs[-1] = (outs[-1], "identity" in banner.split("metric: ")[1][:10])
     (a, a_id), (b, b_id) = outs

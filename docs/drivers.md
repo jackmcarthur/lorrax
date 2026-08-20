@@ -208,7 +208,15 @@ Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and w
 
 Galerkin QP bandstructure interpolation to an arbitrary k-path from coarse-grid data: Galerkin-projects ψ onto the ISDF centroid basis (since 62ba395 a Gram-eigh of A Aᴴ — nk·nb square, N_μ-free, through the `ffi.linalg` eigh plan under the same `eigh_backend` deck key as fH_q — with Vᴴ/`B_at_mu` μ-sharded; rank ≤ nk·nb), builds the f-transformed Hamiltonian fH_k = Σ_n f(ε_nk) c_nk c_nkᴴ, IFFTs to lattice fH_R, then per path-q eigvalsh + Newton inversion of f recovers ε_n(q); with `--eqp-file` the anchoring ε are GW QP energies, giving the QP bandstructure.
 Consumes the same deck as gw_jax ([cohsex] keys + `K_POINTS {crystal_b}` path), `WFN.h5` (or `--wfn-file WFN_qp.h5`), `centroids_file`; writes `bandstructure.dat` (VBM shifted to 0, energies in Ry; rank 0 is the only writer). No restart file of its own — reuse means feeding it the same WFN/centroids/eqp inputs. Distributed-key coverage (`eigh_backend`, `use_low_mem_eigh`) and the per-rank memory story: `docs/dev/large_nmu_operation.md`.
-Band window is (nelec−nval, nelec+ncond) (`load_wfns_and_enk_for_sigma`) and must contain ALL valence bands — set `nval = nelec` (b300 deck: nval=26=nelec): the VBM/Fermi is taken from band index nelec−1 of the window-sorted path energies, correct only when the window starts at band 0, and the eqp override must supply every window band at every k.
+The RETURNED band window is (nelec−nval, nelec+ncond)
+(`load_wfns_and_enk_for_sigma`) and must contain the VBM; it need not start at
+absolute band zero.  The VBM/Fermi index is resolved relative to that absolute
+window start.  Standalone htransform fits `--guard-bands` additional conduction
+bands above the returned window, because the top of the fit window lies on the
+f-transform's zero shoulder and is not a valid output band.  The eqp override
+must supply every returned and guard band at every k.  `bandstructure.dat`
+records both the returned absolute window and the wider fit window in its
+header.
 
 Invoke: `python -m bandstructure.htransform -i ht.in --verbose [--eqp-file eqp_ht.dat]`; single-process CPU is ample at production size (rank ≤ nk·nb·nspinor ~1400), demonstrated by `/scratch2/08271/jackmc/mos2_4x4_test/gw_ht_b300.sbatch` (GW at P=16 via gw_dev.sbatch, then htransform twice at P=1/56 threads: DFT bands, then QP bands from the converted eqp file). Multi-process certified: P=16 wall 57→27 s (2.1×), `bandstructure.dat` byte-IDENTICAL to P=1 (BD.2, job 7884870; the thread-main refusal there is closed); post-Gram-eigh P=4 srun exact-0 vs baseline, one writer (job 7885093). Memory: the Gram-eigh removed the replicated A+SVD term — 1 proc × 4 host devices, μ 4962→18084: VmHWM slope +1.9 → +1.2 GB, wall 67 → 44 s; the remaining μ-bound is single-axis ψ sharding (large_nmu doc, "still replicated" list). Fastloop stages: `ht_dft`/`ht_qp` (~8+6 s), including the "Using EQP energies" log gate.
 
@@ -230,7 +238,7 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 
 | key / flag | default | meaning |
 |---|---|---|
-| `nval` / `ncond` | 5 / 5 | window (nelec−nval, nelec+ncond); nval MUST equal nelec (all valence bands) |
+| `nval` / `ncond` | 5 / 5 | returned window (nelec−nval, nelec+ncond); it must contain the VBM but need not contain lower core bands |
 | `htransform_rank_multiplier` | 0 (exact numerical rank) | opt-in shared cross-k model order, `ceil(multiplier*N_band)` for multiplier >=1; per-k Löwdin restores the f(H) row-isometry, but final band/BSE observables must be converged against 0. A downfolded reduced arm fits directly on the child's ordered centroid subset and avoids parent-width centroid outputs. |
 | `eigh_backend` (key) / `--eigh-backend` (CLI overrides) | auto | fH_q eigensolver for the get_centroids_fi handoff AND the Galerkin Gram-eigh (there `auto` = native replicated is fine — the tile is N_μ-free): auto\|off = q-batched native eigh; `distributed`/`cusolvermp`/`slate`/`scalapack` spread ONE (rank,rank) tile over the mesh (wide windows; square mesh, 1 proc/device) |
 | `use_low_mem_eigh` | false | same axis by intent: true + auto ⇒ distributed; true + off refused at parse |
@@ -238,10 +246,19 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `kgrid_fi` / `wfn_fi_min` / `wfn_fi_max` | "" / 0 / 0 | fine k-grid "nx ny nz"; sub-window on the htransform band axis (0 = full window) |
 | `wfn_fi_q_chunk` | 0 = N_q_coarse | fine-q chunk per f(H(q)) build; floor, rounded to device count |
 | `--a-band` | top band | band whose bandwidth sets the f-transform scale a |
+| `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
 | `--fh-diagnostics` | `auto` (follows `--verbose`) | `on`/`off` force the fH_k range stats, the Γ eigenvalue check against f(ε) and the Γ round-trip. They are 33% of the cache-cold h_transform stage (1.442 s, 7 XLA programs) and hold fH_k alive across the whole solve (576 MiB at the reference shape) — hence off unless asked for |
 | env `LORRAX_FH_ORTHO_TOL` / `LORRAX_GALERKIN_CHUNK_GIB` | 1e-6 / 6 | orthonormality gate cap (0 disables — never in production) / streamed ψ chunk budget |
 
-Failure modes: `build_fH_R` refusal "Galerkin coefficients are NOT orthonormal" = centroids cannot span the window — fix with more centroids or a narrower window, NEVER rtol (tightening rtol makes it worse, measured); FATAL on `--eqp-file` not found/parsed (use the converter); sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 20 Ry (a garbage GW eqp file fed forward).
+Failure modes: `build_fH_R` refusal "Galerkin coefficients are NOT
+orthonormal" on the exact-rank route means the centroid basis cannot carry the
+entire stacked cross-k numerical span; use more centroids, a narrower fit
+window, or an explicitly converged positive `htransform_rank_multiplier`,
+NEVER an `rtol` or orthogonality-tolerance override.  An `f-shoulder` refusal
+means a requested output band is absent from fH at some coarse k; add guard
+bands, do not disable the gate.  FATAL on `--eqp-file` not found/parsed;
+sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 20 Ry (a garbage GW eqp
+file fed forward).
 
 ## bse — `bse.bse_jax`
 

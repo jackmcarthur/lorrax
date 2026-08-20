@@ -200,7 +200,8 @@ def resolve_fi_fshoulder_tol(log_fn=None) -> float:
 
 
 def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
-                     rank: int | None = None):
+                     rank: int | None = None,
+                     where: str = "compute_wfns_fi"):
     """REFUSE when a RETURNED band is invisible to ``fH`` at some k.
 
     THE MECHANISM, in one sentence: ``f`` is identically zero for ε ≥
@@ -244,7 +245,7 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
     fmax = float(fa.max()) if fa.size else 0.0
     if fmax <= 0.0:
         raise ValueError(
-            "compute_wfns_fi: max|f(ε)| over the whole htransform window is "
+            f"{where}: max|f(ε)| over the whole htransform window is "
             "zero — every band is at or above the f-transform's shift, so fH "
             "is identically zero and its eigenvectors are pure noise.  This "
             "is an energy-array problem (a zeroed or sentinel enk_sigma), "
@@ -265,7 +266,7 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
         return worst
     if worst <= tol:
         raise ValueError(
-            f"compute_wfns_fi: band {worst_b} of the RETURNED window "
+            f"{where}: band {worst_b} of the RETURNED window "
             f"[{b_min}, {b_max}) is invisible to fH — "
             f"min_k |f(ε_{worst_b})|/max|f| = {worst:.6e} at or below the "
             f"{tol:.1e} floor, with {n_zero_k} exactly-zero (band, k) slot(s) "

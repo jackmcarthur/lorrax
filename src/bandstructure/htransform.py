@@ -1640,13 +1640,40 @@ def initialize_kpath(wfn, params):
     return kpath_frac, x_path, node_indices, node_labels, gamma_positions
 
 
+def resolve_local_vbm_index(nelec: int, band_start: int,
+                            n_return_bands: int) -> int:
+    """Return the VBM column inside one absolute contiguous band window."""
+    idx = int(nelec) - 1 - int(band_start)
+    if idx < 0 or idx >= int(n_return_bands):
+        raise ValueError(
+            "htransform: the returned absolute band window does not contain "
+            f"the VBM: nelec={int(nelec)}, band_start={int(band_start)}, "
+            f"n_return_bands={int(n_return_bands)} gives local index {idx}. "
+            "A bandstructure referenced to the VBM must retain that level.")
+    return idx
+
+
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
-                a_band_index: int | None = None, diagnostics: bool = True):
+                a_band_index: int | None = None, diagnostics: bool = True,
+                band_start: int = 0, n_return_bands: int | None = None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
     rank = ctilde.shape[2]
     kgrid = (meta.nkx, meta.nky, meta.nkz)
+    nb_keep = states if n_return_bands is None else int(n_return_bands)
+    if nb_keep <= 0 or nb_keep > states:
+        raise ValueError(
+            f"htransform: n_return_bands={nb_keep} must be in [1, {states}] "
+            "for the fitted Galerkin window.")
+    fermi_band_idx = resolve_local_vbm_index(
+        int(wfn.nelec), int(band_start), nb_keep)
+    n_guard_bands = int(states) - nb_keep
+    log_fn(
+        f"  [two-window] standalone htransform returns {nb_keep} band(s) "
+        f"from absolute window [{int(band_start)}, "
+        f"{int(band_start) + nb_keep}) and fits {states} band(s) "
+        f"({n_guard_bands} guard band(s) above).")
 
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
@@ -1656,6 +1683,17 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
     jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
+
+    # The top of the fit window is identically invisible to fH at the k where
+    # it sets ``shift``.  Returning that band gives an arbitrary null-space
+    # direction even when ctilde is exactly orthonormal.  The BSE consumer has
+    # enforced this two-window contract since the fifth-wall diagnosis; the
+    # standalone band writer must pass through the same gate before it can
+    # publish a curve.
+    from .bse_setup import _f_shoulder_gate
+    _f_shoulder_gate(
+        f_eps, 0, nb_keep, shift, log_fn, rank=rank,
+        where="htransform")
 
     # Diagnostics. Split into two small jits:
     #   _diag_stats_fast  — sharding-respecting reductions on the full fH_k
@@ -1857,8 +1895,6 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     del fH_k
 
     fermi_energy = float(wfn.efermi)
-    nb_keep = int(f_eps.shape[0])
-
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
     energies_on_path = None
     energies_sorted = None
@@ -1970,10 +2006,10 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         energies_sorted = gather_to_host(energies_sorted_jax)
         timing.record("ht.post_kpath", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
-        # Determine Fermi energy as the maximum along path of the wfn.nelec-th band (1-based -> 0-based)
-        fermi_band_idx = int(wfn.nelec) - 1
-        if 0 <= fermi_band_idx < energies_sorted.shape[1]:
-            fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
+        # The VBM index is LOCAL to the fitted band window.  Using the
+        # absolute electron count here silently selected a conduction level
+        # whenever the window started above band zero.
+        fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
         if not gamma_positions:
             # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
             # rows (they are exact zeros and would win the tie on any path
@@ -2002,6 +2038,9 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     return {
         "nk_total": nk,
         "nb_keep": nb_keep,
+        "nb_fit": int(states),
+        "band_start": int(band_start),
+        "n_guard_bands": n_guard_bands,
         "fermi_energy": fermi_energy,
         "energies_on_path": energies_on_path,
         "energies_sorted": energies_sorted,
@@ -2054,7 +2093,8 @@ def plot_bands(result):
     plt.show() 
 
 
-def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
+def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
+                        *, band_start: int = 0, nb_fit: int | None = None):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
     # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
@@ -2064,6 +2104,12 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path):
     kpoints = gather_to_host(kpath_frac)
     with open(output_path, 'w', encoding='utf8') as fh:
         fh.write('# idx_k idx_b kx ky kz s energy\n')
+        if nb_fit is not None:
+            fh.write(
+                f"# absolute_band_window=[{int(band_start)},"
+                f"{int(band_start) + energies.shape[1]}) "
+                f"fit_bands={int(nb_fit)} "
+                f"guard_bands={int(nb_fit) - energies.shape[1]}\n")
         for ik in range(energies.shape[0]):
             for ib in range(energies.shape[1]):
                 kx, ky, kz = kpoints[ik]
@@ -2108,6 +2154,13 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
+    parser.add_argument(
+        "--guard-bands", type=int, default=4,
+        help="Bands fitted above the requested nval+ncond output window. "
+             "The f-transform is identically zero at the top of its own "
+             "window, so standalone output requires interior returned bands. "
+             "Default: 4 (the measured shoulder depth). Zero is retained only "
+             "as a red/reproduction arm and will normally refuse.")
     parser.add_argument("--fh-diagnostics", default="auto",
                         choices=("auto", "on", "off"),
                         help="fH_k range stats, the Γ eigenvalue check against "
@@ -2170,6 +2223,7 @@ def main(argv=None):
     # path (bse_setup's no-fallback contract); passing only the resolved
     # library name would leave that refusal disarmed on this driver.
     use_low_mem_eigh = bool(params.get("use_low_mem_eigh", False))
+    n_return_bands = int(params["nval"]) + int(params["ncond"])
     
     # Override WFN file if provided via CLI
     if args.wfn_file is not None:
@@ -2180,7 +2234,8 @@ def main(argv=None):
 
     with timing.section("initialize_wfns"):
         wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
-            args.input, params, log, args.eqp_file)
+            args.input, params, log, args.eqp_file,
+            n_guard_bands=args.guard_bands)
     # ── Galerkin-input gate ───────────────────────────────────────────
     # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
     # construction) and ``enk_sigma`` is the band energies the whole
@@ -2212,7 +2267,9 @@ def main(argv=None):
                 else args.fh_diagnostics == "on")
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
-                             a_band_index=args.a_band, diagnostics=_diag_on)
+                             a_band_index=args.a_band, diagnostics=_diag_on,
+                             band_start=int(wfn.nelec) - int(params["nval"]),
+                             n_return_bands=n_return_bands)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
@@ -2279,6 +2336,8 @@ def main(argv=None):
             result['energies_sorted'],  # sorted & truncated to nb_keep, not raw eigenvalues
             kpath_data[0],
             kpath_data[1],
+            band_start=result["band_start"],
+            nb_fit=result["nb_fit"],
         )
 
     # ── Outputs barrier, then CLOSE THE LOADER EXPLICITLY ─────────────
@@ -2317,7 +2376,10 @@ def main(argv=None):
         print(f"  [htransform] WfnLoader.close() failed "
               f"({type(exc).__name__}: {exc}); continuing to exit")
 
-    summary = f"HT complete: {result['nb_keep']} bands, nk={result['nk_total']}, fermi={result['fermi_energy']:.6f} Ry"
+    summary = (f"HT complete: {result['nb_keep']} returned / "
+               f"{result['nb_fit']} fit bands "
+               f"({result['n_guard_bands']} guards), nk={result['nk_total']}, "
+               f"fermi={result['fermi_energy']:.6f} Ry")
     if result['path_range'] is not None:
         summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
     print(summary)
