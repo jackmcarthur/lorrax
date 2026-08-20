@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.shard_map import shard_map
 from common.units import RYD_TO_EV
 
 
@@ -626,13 +627,38 @@ def fold_cartesian_head_wings_sharded(
     n_lead = W_body_xy.ndim - 2
     if n_lead < 0 or Y_x.ndim != n_lead + 2 or Z_y.ndim != n_lead + 2:
         raise ValueError("Y, W_body, and Z must share their leading axes")
-    correction = jnp.einsum(
-        "...am,...mn,...nb->...ab", Y_x, W_body_xy, Z_y, optimize=True)
-    S_effective = S_direct + correction / jnp.asarray(cell_volume)
-    return jax.lax.with_sharding_constraint(
-        S_effective,
-        NamedSharding(mesh_xy, P(*([None] * n_lead), None, None)),
+    lead = [None] * n_lead
+
+    def _local_fold(s_direct, y_local, w_local, z_local, volume):
+        # Each rank owns exactly one (mu_X, nu_Y) body tile.  Contract that
+        # tile before communicating, then reduce only the Cartesian result.
+        # Leaving this as a global einsum lets XLA select a full-matrix
+        # temporary at large n_mu even though the public result is 3x3.
+        local = jnp.einsum(
+            "...am,...mn,...nb->...ab",
+            y_local, w_local, z_local, optimize=True)
+        correction = jax.lax.psum(local, ("x", "y"))
+        return s_direct + correction / volume
+
+    folded = shard_map(
+        _local_fold,
+        mesh=mesh_xy,
+        in_specs=(
+            P(*lead, None, None),
+            P(*lead, None, "x"),
+            P(*lead, "x", "y"),
+            P(*lead, "y", None),
+            P(),
+        ),
+        out_specs=P(*lead, None, None),
+    )(
+        S_direct,
+        Y_x,
+        W_body_xy,
+        Z_y,
+        jnp.asarray(cell_volume),
     )
+    return folded
 
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
