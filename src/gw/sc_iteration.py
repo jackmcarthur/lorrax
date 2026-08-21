@@ -240,6 +240,11 @@ class SCInputs:
     ``e_dft_active_kn_ry`` and ``valence_mask_active_kn`` feed the
     per-iteration scissor refit; they are constant across iterations
     (DFT band identities + occupation labels don't move).
+    ``efermi_dft_ry`` is the matching immutable DFT reference: the SC map's
+    fixed-band-cut midgap on an insulator, the initial fixed-N MP1 chemical
+    potential on a metal.
+    The low-valence policy compares it with each map candidate's Fermi level
+    so the whole out-of-range valence tail preserves ``E_band - E_F``.
     """
 
     wfns_dft: Wavefunctions
@@ -265,6 +270,12 @@ class SCInputs:
     partition: BandPartition
     e_dft_active_kn_ry: jax.Array      # (nk, nb_active) DFT energies for scissor fit
     valence_mask_active_kn: jax.Array  # (nk, nb_active) bool — for scissor val/cond split
+    # Canonical DFT Fermi reference for the active scissor.  On an insulator
+    # this is the SC map's own fixed-band-cut midgap (not the loader's possible
+    # VBM convention); on a metal it is the ONE fixed-N MP1 solve already used
+    # to anchor the Sigma window/partition.  Retained here so an SC map never
+    # re-solves the old endpoint of its Fermi displacement.
+    efermi_dft_ry: float
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
@@ -423,6 +434,17 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     occ_state, head_surface_weight_kn = _solve_head_occupations(
         inputs, inputs.wfns_dft.enk)
     if occ_state is not None:
+        if not np.isclose(
+            float(occ_state.mu_ry), float(inputs.efermi_dft_ry),
+            rtol=0.0, atol=1.0e-12,
+        ):
+            raise ValueError(
+                "SC DFT Fermi references disagree: the partition/window "
+                f"stored {float(inputs.efermi_dft_ry):.12e} Ry but the "
+                "canonical initial OccupationState solved "
+                f"{float(occ_state.mu_ry):.12e} Ry. The low-valence rigid "
+                "shift requires one DFT endpoint; do not choose between "
+                "two chemical potentials.")
         inputs.print_fn(
             "  SC head occupations: initialized BGW-MP1 state at "
             f"mu={occ_state.mu_ry * RYD_TO_EV:.8f} eV "
@@ -458,6 +480,17 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 f"{check_state.mu_ry * RYD_TO_EV:.8f} eV (wfn.efermi "
                 f"{inputs.wfn.efermi * RYD_TO_EV:.6f} eV is the midgap/VBM "
                 "convention, reported not asserted)")
+    else:
+        initial_efermi_ry = float(_midgap_efermi(
+            jnp.asarray(enk_dft_ry), int(inputs.meta.nelec)))
+        if not np.isclose(
+            initial_efermi_ry, float(inputs.efermi_dft_ry),
+            rtol=0.0, atol=1.0e-12,
+        ):
+            raise ValueError(
+                "SC DFT midgap references disagree: the initial active "
+                f"spectrum gives {initial_efermi_ry:.12e} Ry but SCInputs "
+                f"stored {float(inputs.efermi_dft_ry):.12e} Ry.")
     return SCState(
         H_qp_dft=device_put_process_local(H0, rep),
         iteration=0,
@@ -472,21 +505,25 @@ def _material_class(inputs) -> str:
     return str(getattr(mpa, "material_class", "insulator"))
 
 
-def _solve_head_occupations(
+def _solve_occupation_state(
     inputs: SCInputs,
     energies_kn_ry,
-) -> tuple[OccupationState | None, jax.Array | None]:
-    """Solve the per-iteration fixed-N MP1 occupation state.
+) -> OccupationState | None:
+    """Solve the canonical per-iteration fixed-N MP1 occupation state.
 
-    Returns ``(OccupationState, surface_weight_kn)`` — the one occupation
-    record the head consumes today and chi/Σ consume at Wave-2 wiring, plus
-    its derived tetrahedron Fermi-surface table.  The state's ``f_kn`` is
-    full-BZ because the parallel-transport velocity and head contraction are
-    full-BZ, padded to the PT storage width; padding is explicit and inert
-    (exact zeros move neither the count nor the hash's meaning) and the
-    solver sees exactly ``nb_logical`` physical bands.  A zero width returns
-    ``(None, None)`` so the historical step-occupation path is bit-for-bit
-    untouched.
+    The state's ``f_kn`` is full-BZ because the parallel-transport velocity
+    and head contraction are full-BZ, padded to the PT storage width; padding
+    is explicit and inert (exact zeros move neither the count nor the hash's
+    meaning) and the solver sees exactly ``nb_logical`` physical bands.  A
+    zero width returns ``None`` so the historical step-occupation path is
+    bit-for-bit untouched.
+
+    This is split from :func:`_solve_head_occupations` so the output-candidate
+    Fermi used by the low-valence scissor can call the SAME fixed-N solver
+    without also building an unused tetrahedron surface table.  There is one
+    implementation of the chemical-potential policy and two spectra that
+    legitimately need it: the map input (chi/head/Sigma) and F(H)'s candidate
+    output (the no-lag valence anchor).
     """
     # ``occ_broadening`` is the DIAL (0 ⇒ step occupations, historical path
     # untouched); ``config.occ_broadening_ry`` is the WIDTH.  They are the
@@ -494,7 +531,7 @@ def _solve_head_occupations(
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
     if width_ev == 0.0 or pt is None:
-        return None, None
+        return None
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if energies.ndim != 2:
@@ -543,6 +580,24 @@ def _solve_head_occupations(
     # The pad bands are exact zeros, so the padded table satisfies the same
     # fixed-N invariant the logical solve does.
     assert_fixed_n(occ_state, kweights, state_capacity=capacity)
+    return occ_state
+
+
+def _solve_head_occupations(
+    inputs: SCInputs,
+    energies_kn_ry,
+) -> tuple[OccupationState | None, jax.Array | None]:
+    """Solve the iteration occupation state and its head surface weights."""
+    occ_state = _solve_occupation_state(inputs, energies_kn_ry)
+    if occ_state is None:
+        return None, None
+
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    pt = inputs.parallel_transport
+    nb_logical = int(pt.nb_logical)
+    nb_storage = int(pt.velocity_dft_cart.shape[-1])
+    nk = int(energies.shape[0])
+    mu_ry = float(occ_state.mu_ry)
     # The Drude weight is a Fermi-surface integral, not a coarse-grid
     # sampling of the MP1 derivative.  On sodium 8^3 the latter moves the
     # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
@@ -716,6 +771,45 @@ def _diagonalize_and_get_efermi(
     eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy, u_spec)
     E, U = eigh_kshard(H)
     return E, U, _midgap_efermi(E, n_occ)
+
+
+def _partitioned_candidate_efermi(
+    H_partitioned: jax.Array,
+    *,
+    inputs: SCInputs,
+    kstar,
+    n_occ: int,
+    use_mp1: bool,
+) -> float:
+    """Canonical Fermi level of one already-partitioned map candidate.
+
+    Insulators use the map's existing fixed-band-cut midgap convention.
+    Metals route the candidate spectrum through the same
+    :func:`_solve_occupation_state` fixed-N MP1 implementation used at map
+    entry; no second chemical-potential policy is spelled here.
+    """
+    _, eigvalsh_candidate = _kshard_eigh_kernels(inputs.mesh_xy)
+    E_candidate_ry = eigvalsh_candidate(H_partitioned)
+    if not use_mp1:
+        return float(_midgap_efermi(E_candidate_ry, n_occ))
+
+    E_candidate_full = (
+        E_candidate_ry if kstar.is_identity
+        else kstar.broadcast(E_candidate_ry))
+    with inputs.mesh_xy:
+        enk_candidate = jax.lax.with_sharding_constraint(
+            jnp.asarray(inputs.wfns_dft.enk).at[
+                :, inputs.band_slices.sigma].set(
+                    jnp.asarray(
+                        E_candidate_full,
+                        dtype=inputs.wfns_dft.enk.dtype)),
+            NamedSharding(inputs.mesh_xy, P(None, None)))
+    candidate_occ_state = _solve_occupation_state(inputs, enk_candidate)
+    if candidate_occ_state is None:
+        raise RuntimeError(
+            "SC low-valence Fermi anchor: the map entry had an MP1 "
+            "occupation state but the candidate spectrum did not.")
+    return float(candidate_occ_state.mu_ry)
 
 
 # The largest share of the per-device memory budget one (nb, nb) tile is
@@ -1998,24 +2092,125 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if not ks.is_identity:
         e_dft_act = ks.select(e_dft_act)
         val_mask = ks.select(val_mask)
+
     # ``ks``, NOT A WEIGHT ARRAY.  The scissor refit is a REDUCTION over k
     # and the only one in the carry, so it needs star multiplicities, not
     # just the right k-set (§7 of the scaffold labels operands by k-set;
     # that rule is incomplete).  Handing the callee the SAME map that did
     # the ``select`` three lines up is what makes the weights impossible
-    # to get out of step with the rows.
-    scissor_E_qp_kn_ry, scissor_fit = _scissor_E_qp_for_outofrange(
+    # to get out of step with the rows.  Fit ONCE.  With dE_F=0 the returned
+    # provisional candidates already contain the FINAL affine conduction
+    # law, while valence stays at DFT for the non-circular Fermi probe below.
+    scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_act, val_mask,
         inputs.partition.in_range_mask, ks,
         band_classes=scissor_classes,
+        fermi_displacement_ry=0.0,
         print_fn=inputs.print_fn,
     )
+    scissor_E_qp_kn_ry = scissor_provisional_ry
+
+    # NO-LAG FERMI ANCHOR FOR THE LOW-VALENCE TAIL.  The map must preserve
+    # E_low - E_F against F(H)'s Fermi level, not the ENTRY Fermi that built
+    # this map's W/Sigma: using the latter would leave the scissored valence
+    # one complete map behind whenever the protected gap moves.
+    #
+    # Resolve E_F from a provisional partition in which out-of-range valence
+    # keeps E_DFT and out-of-range conduction ALREADY has the final affine
+    # law.  The valence provisional choice cannot affect E_F under the class
+    # contract: true valence is below the lowest crossing/frontier band, and
+    # the entire frontier is gated in-range below.  Thus replacing only that
+    # deep/full tail afterward leaves the same candidate Fermi.  We recompute
+    # E_F on the final H and enforce this statement rather than assume it.
+    fermi_displacement_ry = 0.0
+    if not bool(np.asarray(inputs.partition.in_range_mask, dtype=bool).all()):
+        in_range_np = np.asarray(
+            inputs.partition.in_range_mask, dtype=bool).reshape(-1)
+        if scissor_classes is not None and scissor_classes.n_crossing:
+            frontier = np.arange(
+                int(scissor_classes.valence_stop),
+                int(scissor_classes.conduction_start))
+        else:
+            # Gapped/fixed occupations: the occupied/unoccupied edge is the
+            # two-band frontier that owns the midgap convention.
+            frontier = np.asarray(
+                [max(0, n_occ - 1), min(n_occ, in_range_np.size - 1)],
+                dtype=np.int64)
+        bad_frontier = frontier[~in_range_np[frontier]]
+        if bad_frontier.size:
+            raise ValueError(
+                "SC low-valence Fermi anchor requires the complete "
+                "Fermi-crossing/frontier manifold inside the Sigma window; "
+                f"out-of-range active band(s) {bad_frontier.tolist()} would "
+                "make E_F(F(H)) depend on the scissor being anchored. Widen "
+                "sigma_omega_min/max_ev (and preserve whole multiplets).")
+        H_fermi_probe = apply_band_partition(
+            H_qp_dft_full,
+            protected_mask=inputs.partition.protected_mask,
+            in_range_mask=inputs.partition.in_range_mask,
+            scissor_E_qp_kn=scissor_provisional_ry,
+        )
+        candidate_efermi_ry = _partitioned_candidate_efermi(
+            H_fermi_probe,
+            inputs=inputs,
+            kstar=ks,
+            n_occ=n_occ,
+            use_mp1=entry_occ_state is not None,
+        )
+        fermi_displacement_ry = (
+            candidate_efermi_ry - float(inputs.efermi_dft_ry))
+
+        # Apply ONLY the newly known valence shift to the provisional table.
+        # qsgw_out_of_range_energies reads the same fitted alpha_c/beta_c, so
+        # the conduction candidates are identical to the probe -- there is no
+        # second fit and no second spelling of its affine law.
+        from .scissor import qsgw_out_of_range_energies
+        e_dft_np = np.asarray(e_dft_act, dtype=np.float64)
+        valence_kn = np.asarray(val_mask, dtype=bool)
+        crossing_kn = None
+        if scissor_classes is not None:
+            valence_kn, crossing_kn = scissor_classes.masks(e_dft_np.shape)
+        scissor_E_qp_kn_ry = jnp.asarray(
+            qsgw_out_of_range_energies(
+                e_dft_np * RYD_TO_EV,
+                scissor_fit,
+                valence_kn,
+                fermi_displacement_ev=(
+                    fermi_displacement_ry * RYD_TO_EV),
+                crossing_mask_kn=crossing_kn,
+            ) / RYD_TO_EV)
+        inputs.print_fn(
+            "    SC low-valence anchor: "
+            f"E_F(DFT)={float(inputs.efermi_dft_ry) * RYD_TO_EV:+.6f} eV, "
+            f"E_F(F(H))={candidate_efermi_ry * RYD_TO_EV:+.6f} eV, "
+            f"dE_F={fermi_displacement_ry * RYD_TO_EV:+.6f} eV")
+
     H_qp_dft_new = apply_band_partition(
         H_qp_dft_full,
         protected_mask=inputs.partition.protected_mask,
         in_range_mask=inputs.partition.in_range_mask,
         scissor_E_qp_kn=scissor_E_qp_kn_ry,
     )
+    if scissor_fit is not None:
+        final_efermi_ry = _partitioned_candidate_efermi(
+            H_qp_dft_new,
+            inputs=inputs,
+            kstar=ks,
+            n_occ=n_occ,
+            use_mp1=entry_occ_state is not None,
+        )
+        if not np.isclose(
+            final_efermi_ry, candidate_efermi_ry,
+            rtol=0.0, atol=1.0e-10,
+        ):
+            raise ValueError(
+                "SC low-valence Fermi anchor became circular: final "
+                f"E_F={final_efermi_ry * RYD_TO_EV:+.9f} eV differs from "
+                f"the provisional anchor "
+                f"{candidate_efermi_ry * RYD_TO_EV:+.9f} eV by "
+                f"{(final_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.3e} "
+                "eV. A scissored tail entered the frontier; widen the Sigma "
+                "window rather than anchoring through it.")
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
@@ -2035,12 +2230,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         _check_kstar_spread(
             ks, ks.broadcast(H_qp_dft_new), print_fn=inputs.print_fn)
 
-    # The occupation state was ENTRY-solved from this call's own spectrum
-    # and consumed by this call's chi/head/Sigma; no second solve happens
-    # here.  The carry below is DIAGNOSTIC continuity only (mu drift
-    # between consecutive map inputs) — the next call re-solves at its
-    # own entry, whatever trajectory (linear, rCROP trial/accept) handed
-    # it its H.
+    # The occupation state CARRIED below is the ENTRY solve consumed by this
+    # call's chi/head/Sigma.  The low-valence no-lag gate above also invokes
+    # that solver on provisional/final output spectra, but those scalar
+    # anchors are policy checks, not screening states and are deliberately
+    # dropped.  The carry remains DIAGNOSTIC continuity only (mu drift between
+    # consecutive map inputs) — the next call re-solves at its own entry,
+    # whatever trajectory (linear, rCROP trial/accept) handed it its H.
     if entry_occ_state is not None:
         drift = (abs(entry_occ_state.mu_ry - state.occupation_state.mu_ry)
                  if state.occupation_state is not None else float("nan"))
@@ -2111,7 +2307,9 @@ def _scissor_E_qp_for_outofrange(
     valence_mask_kn: jax.Array,
     in_range_mask: jax.Array,
     kstar,
+    *,
     band_classes=None,
+    fermi_displacement_ry: float,
     print_fn=None,
 ) -> tuple[jax.Array, object | None]:
     """Return ``E_QP_scissor[k, n]`` for use as the diagonal of bands
@@ -2119,9 +2317,12 @@ def _scissor_E_qp_for_outofrange(
 
     Mechanism: take the diagonal of ``H_qp_dft_full`` (the candidate
     QP energies if the iteration kept all off-diagonals), restrict to
-    in-range bands as the scissor's reference set, fit α/β per
-    val/cond, then evaluate ``E_QP = α·E_DFT + β`` for every (k, n).
-    The masking primitive will use this only at out-of-range entries.
+    in-range bands as the scissor's reference set, and fit α/β per
+    val/cond.  The conduction candidate remains
+    ``E_QP = α_c·E_DFT + β_c``.  The valence fit is diagnostic only: every
+    valence candidate is ``E_DFT + fermi_displacement_ry``, so its binding
+    relative to the candidate Fermi level is unchanged.  The masking
+    primitive will use these candidates only at out-of-range entries.
 
     Short-circuits to ``E_DFT`` (no correction) when every band is
     in-range — the all-protected default — so the per-iteration cost
@@ -2154,7 +2355,7 @@ def _scissor_E_qp_for_outofrange(
     identity (``bf57701b``) — a refusal to extrapolate rather than a
     Fermi-surface-anchored line.
     """
-    from .scissor import k_star_weights
+    from .scissor import k_star_weights, qsgw_out_of_range_energies
 
     e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
     in_range = np.asarray(in_range_mask, dtype=bool)
@@ -2186,13 +2387,20 @@ def _scissor_E_qp_for_outofrange(
     if print_fn is not None:
         # The two arms' agreement is readable here: ``n`` differs with the
         # k-set, ``w`` must not.
-        print_fn(f"    SC scissor: {fit.summary()}")
-    # ΔE = (α − 1) · E + β; E_QP = E_DFT + ΔE.  The SAME boundary indices
-    # that split the fit split the prediction, so a band cannot be fit as
-    # one class and extrapolated as another.
-    delta_ev = fit.predict(
-        e_dft_np * RYD_TO_EV, valence_kn, crossing_mask=crossing_kn)
-    return jnp.asarray((e_dft_np + delta_ev / RYD_TO_EV)), fit
+        print_fn(f"    SC scissor: {fit.summary()}; valence regression is "
+                 "diagnostic only")
+    # The SAME boundary indices that split the fit split the application, so
+    # a band cannot be fit as one class and extrapolated as another.  Crossing
+    # bands stay at E_DFT.  In practice they are protected/in-range, but the
+    # identity is the honest no-information fallback if one is not.
+    out_ev = qsgw_out_of_range_energies(
+        e_dft_np * RYD_TO_EV,
+        fit,
+        valence_kn,
+        fermi_displacement_ev=float(fermi_displacement_ry) * RYD_TO_EV,
+        crossing_mask_kn=crossing_kn,
+    )
+    return jnp.asarray(out_ev / RYD_TO_EV), fit
 
 
 def _write_sc_eqp_snapshot(
@@ -3132,8 +3340,16 @@ def run_sc_driver(
             state_capacity=float(spin_degeneracy_factor(wfn)),
             clamp_tol=float(config.occupation_clamp_tol))
         efermi_ev = float(_mu_ry) * RYD_TO_EV
+        efermi_dft_scissor_ry = float(_mu_ry)
     else:
         efermi_ev = float(wfn.efermi) * RYD_TO_EV
+        # The Sigma grid keeps its established loader reference above.  The
+        # LOW-VALENCE DISPLACEMENT is a different invariant: it compares the
+        # SC map's DFT and candidate Fermi levels, so both endpoints must use
+        # the map's fixed-band-cut midgap convention.  Reuse its sole helper;
+        # do not silently subtract a loader VBM from a candidate midgap.
+        efermi_dft_scissor_ry = float(
+            _midgap_efermi(e_dft_active_kn_ry, int(meta.nelec)))
     omega_min_ev = float(config.sigma.omega_min_ev) + efermi_ev
     omega_max_ev = float(config.sigma.omega_max_ev) + efermi_ev
     e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
@@ -3231,6 +3447,9 @@ def run_sc_driver(
         partition=partition,
         e_dft_active_kn_ry=e_dft_active_kn_ry,
         valence_mask_active_kn=val_mask_active,
+        # One SC convention at both endpoints: fixed-band midgap on an
+        # insulator, the existing initial fixed-N _mu_ry on a metal.
+        efermi_dft_ry=efermi_dft_scissor_ry,
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,

@@ -72,7 +72,7 @@ from .ppm_windows import (
     _CROSSING_A_MAX,
     crossing_regularization_floor,
 )
-from .ppm_tau_kernel import _get_sigma_tau_kernel
+from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
 from .ppm_accumulators import (
     _SigmaAccumulator,
     _TauAccumulator,
@@ -769,8 +769,7 @@ def _compute_invalid_static_sigma(
     occ → −½·W^c(0) (= B/Ω), unocc → +½·W^c(0) — the exact Ω→∞ limit of
     the two-branch pole sum ``B/(ω−E_l∓Ω)``.
 
-    Reuses the two static COHSEX contraction kernels verbatim
-    (``cohsex_sigma._make_cohsex_kernels``) with the masked static
+    Reuses the canonical Sigma spatial kernel with the masked static
     ``W^c(0)`` as the screening operand:
 
         Σ_static = sigma_sx(G_occ, W_static) + sigma_coh(W_static − 0)
@@ -791,12 +790,14 @@ def _compute_invalid_static_sigma(
     term runs over the OCCUPIED manifold, so on a metal the Fermi-shell
     bands must enter with their fractional weights.
     """
-    from .cohsex_sigma import _make_cohsex_kernels, build_Gij
+    from common.collectives import gather_to_host
+    from .cohsex_sigma import build_Gij
+    from .greens_function_kernel import build_G
 
-    sigma_sx_k, sigma_coh_k, _ = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot))
     Gij = build_Gij(meta, mesh_xy, occupation_state)
-    rep = NamedSharding(mesh_xy, P(None, None, None))
+    spatial = get_sigma_spatial_kernel(
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+    s = wfns.slices
 
     with mesh_xy:
         W_static = jnp.where(
@@ -804,17 +805,31 @@ def _compute_invalid_static_sigma(
             jnp.asarray(Wc0_q, dtype=jnp.complex128),
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
-        sig_static = (
-            sigma_sx_k(wfns, Gij, W_static)
-            + sigma_coh_k(wfns, W_static, jnp.zeros_like(W_static))
-        )
-        sig_static = jax.lax.with_sharding_constraint(sig_static, rep)
-        sig_static.block_until_ready()
+        W_prep = spatial.prep_w(W_static)
+        psi_xr, psi_yn, nb_real = pad_sigma_window(
+            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
 
-    # Replicated (None,None,None) ⇒ every process's first addressable shard
-    # IS the full tensor.  (_to_host_np's process_allgather would STACK a
-    # fully-replicated array across processes into (nproc, nk, nb, nb).)
-    return np.asarray(sig_static.addressable_data(0), dtype=np.complex128)
+        # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
+        # band tensor before building the next centroid-square G: this makes
+        # the one-G-at-a-time memory bound structural instead of leaving XLA
+        # free to overlap the occupied and RI contractions.  The production
+        # fused-FFI route additionally keeps the R-space G tile inside its
+        # bounded handler rather than materialising the decomposed FFT chain.
+        G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
+        sx_host = np.asarray(strip_sigma_window(
+            gather_to_host(sig_sx), nb_real), dtype=np.complex128)
+        del G_occ, sig_sx
+
+        G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
+        sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
+        ri_host = np.asarray(strip_sigma_window(
+            gather_to_host(sig_ri), nb_real), dtype=np.complex128)
+        del G_ri, sig_ri
+
+    # shared_conv(G_RI, W_static) = -<G_RI.W_static>, while static COH is
+    # +1/2<G_RI.W_static>; hence the minus one-half below.
+    return sx_host - 0.5 * ri_host
 
 
 def _invalid_static_coh_by_bracket(
@@ -861,11 +876,12 @@ def _invalid_static_coh_by_bracket(
     them to get Σ_COH at each of the plan's band counts, in the same order and
     by the same rule that turns the Σ_c brackets into band counts.
     """
-    from .cohsex_sigma import _make_cohsex_kernels
+    from common.collectives import gather_to_host
+    from .greens_function_kernel import build_G
 
-    _, sigma_coh_k, _ = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot))
-    rep = NamedSharding(mesh_xy, P(None, None, None))
+    spatial = get_sigma_spatial_kernel(
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+    s = wfns.slices
 
     out = []
     with mesh_xy:
@@ -874,14 +890,18 @@ def _invalid_static_coh_by_bracket(
             jnp.asarray(Wc0_q, dtype=jnp.complex128),
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
-        zero = jnp.zeros_like(W_static)
+        W_prep = spatial.prep_w(W_static)
+        psi_xr, psi_yn, nb_real = pad_sigma_window(
+            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
         for lo, hi in brackets:
-            coh = sigma_coh_k(wfns, W_static, zero,
-                              ri_bands=(int(lo), int(hi)))
-            coh = jax.lax.with_sharding_constraint(coh, rep)
-            coh.block_until_ready()
-            out.append(np.asarray(coh.addressable_data(0),
-                                  dtype=np.complex128))
+            G_ri = build_G(
+                wfns.xn(slice(int(lo), int(hi))),
+                wfns.yr(slice(int(lo), int(hi))))
+            sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
+            ri_host = np.asarray(strip_sigma_window(
+                gather_to_host(sig_ri), nb_real), dtype=np.complex128)
+            out.append(-0.5 * ri_host)
+            del G_ri, sig_ri
     return np.stack(out, axis=0)
 
 
