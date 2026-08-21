@@ -11,6 +11,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh
 
 from common.parallel_transport import (
@@ -488,7 +489,8 @@ def test_completion_sign_red_twin_stamps_failure_then_refuses(monkeypatch):
         pt_io, "write_velocity_validation",
         lambda path, *, mesh, metrics: stamps.append(metrics.copy()))
     with np.testing.assert_raises_regex(
-            RuntimeError, "DFT velocity validation failed"):
+            RuntimeError,
+            "parallel-transport finite-link DFT head validation failed"):
         complete_velocity_validation(
             "not-opened.h5", mesh=mesh, kgrid=(2, 1, 1),
             bvec_cart=np.eye(3), energies_full=energies,

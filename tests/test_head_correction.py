@@ -23,7 +23,8 @@ def _resolver(policy, monkeypatch, *, screened=True):
         correction=policy, wcoul0_source="s_tensor", wcoul0_eta=0.0,
         vhead=None, whead_0freq=None, whead_imfreq=None,
         head_minibz_average=False, bgw_metal_q0_treatment="exact")
-    config = SimpleNamespace(head=head, do_screened=screened)
+    config = SimpleNamespace(
+        head=head, do_screened=screened, nval=4, ncond=4, nband=8)
     direct = HeadSample(
         vc0=100.0 + 0.0j, wcoul0=25.0 + 0.0j,
         source="unit direct", omega=0.0j,
