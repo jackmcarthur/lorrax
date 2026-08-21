@@ -1613,10 +1613,12 @@ _DEFAULTS = {
     # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
     # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
     # kpm / resolvent) transparently runs on the fine grid.  Each fine length
-    # must be a positive multiple of the matching coarse length (coarse BZ ⊂
-    # fine BZ).  Empty (default) or == the coarse grid → the coarse ``data``
-    # bundle is returned byte-identically (fast path untouched).  Subsumes the
-    # exciton_bands ``--w-coarse-grid`` W-only flag for the direct term.
+    # must be at least the matching coarse length; integer nesting is not
+    # required (8x8x1→12x12x1 evaluates the same coarse Fourier polynomial).
+    # Empty (default) or == the coarse grid → the coarse ``data`` bundle is
+    # returned byte-identically (fast path untouched).  This is the native-
+    # coarse route for a nonnested target; exciton_bands ``--w-coarse-grid``
+    # instead decimates a native fine W and therefore remains nested-only.
     "bse_k_grid": "",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
@@ -1886,6 +1888,12 @@ _DEFAULTS = {
     "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
+    # 0 preserves the exact numerical-rank htransform span.  A value >= 1 is
+    # an explicit cross-k model-order approximation: retain approximately
+    # multiplier * (bands in the htransform window) shared alpha directions,
+    # then restore the per-k row-isometry required by f(H).  This is NOT an
+    # rtol alias and must be converged on the final observable.
+    "htransform_rank_multiplier": 0.0,
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.

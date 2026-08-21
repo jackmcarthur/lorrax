@@ -2,9 +2,9 @@
 
 ``bse.bse_io.pad_W_R_to_grid`` embeds a coarse-k-grid real-space ``W_R`` into a
 finer k-lattice by ZERO-PADDING in R.  The physics anchor: zero-padding in R is
-EXACT trigonometric interpolation in k that AGREES with the coarse ``W(k)`` at
-the coarse sub-k-points that coincide with the fine grid (they do when each fine
-length is a multiple of the coarse one, e.g. 12 = 2·6).
+EXACT trigonometric interpolation in k on any finer uniform grid.  It agrees
+with the coarse ``W(k)`` at all common points (every coarse point for nested
+grids; a strict subset for a non-divisor target such as 8→12).
 
 Fixture-free (synthetic random W tensors), so it runs on CPU with float64 and
 gates on modest hardware — NO 16-GPU / fixture dependency.
@@ -44,6 +44,19 @@ def _ifftn(x):
 
 def _fftn(x):
     return jnp.fft.fftn(x, axes=(-3, -2, -1), norm="ortho")
+
+
+def _direct_trig_from_R(W_R, fine_grid):
+    """Independent dense evaluation of the coarse Fourier polynomial."""
+    arr = np.asarray(W_R)
+    cg = arr.shape[-3:]
+    phases = []
+    for nc, nf in zip(cg, fine_grid):
+        reps = np.fft.fftfreq(nc) * nc
+        q = np.arange(nf, dtype=np.float64) / nf
+        phases.append(np.exp(-2j * np.pi * q[:, None] * reps[None, :]))
+    return (np.einsum("...abc,xa,yb,zc->...xyz", arr, *phases,
+                      optimize=True) / np.sqrt(np.prod(cg)))
 
 
 # (n_mu, n_nu, coarse_grid, fine_grid)
@@ -134,9 +147,41 @@ def test_zeropad_axis_index_map_odd():
     np.testing.assert_array_equal(y, expect)
 
 
-def test_rejects_non_multiple_grid():
+def test_nondivisor_8_to_12_matches_direct_trigonometric_evaluation():
+    """8→12 evaluates the same Fourier series; no nesting assumption enters.
+
+    The dense phase sum is independent of zero insertion and therefore goes
+    red if this path degenerates into nearest-neighbour/linear interpolation or
+    uses the target-grid frequencies for the coarse coefficients.
+    """
+    cg, fg = (8, 8, 1), (12, 12, 1)
+    W_q_c = _rand_wq((2, 3, *cg), seed=812)
+    W_R_c = _ifftn(W_q_c)
+    got = np.asarray(_fftn(pad_W_R_to_grid(W_R_c, fg)))
+    want = _direct_trig_from_R(W_R_c, fg)
+    np.testing.assert_allclose(got, want, rtol=2e-12, atol=2e-12)
+
+    # gcd(8,12)=4: indices (0,2,4,6) on the coarse grid coincide with
+    # (0,3,6,9) on the fine grid, and the interpolant passes through them.
+    ic = np.array([0, 2, 4, 6])
+    jf = np.array([0, 3, 6, 9])
+    np.testing.assert_allclose(
+        got[:, :, jf[:, None], jf[None, :], 0],
+        np.asarray(W_q_c)[:, :, ic[:, None], ic[None, :], 0],
+        rtol=2e-12, atol=2e-12)
+
+
+def test_zeropad_axis_index_map_nondivisor_even():
+    """8→12 keeps reps [0,1,2,3,-4,-3,-2,-1] and inserts four zeros."""
+    x = jnp.arange(1, 9, dtype=jnp.float64).reshape(1, 8)
+    y = np.asarray(_zeropad_R_axis(x, axis=1, n_fine=12)).ravel()
+    expect = np.array([1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8], dtype=float)
+    np.testing.assert_array_equal(y, expect)
+
+
+def test_rejects_coarser_grid_but_accepts_non_multiple_finer_grid():
     W_R = _rand_wq((2, 2, 6, 6, 1), seed=1)
-    with pytest.raises(ValueError):
-        pad_W_R_to_grid(W_R, (10, 12, 1))    # 10 not a multiple of 6
+    out = pad_W_R_to_grid(W_R, (10, 12, 1))
+    assert out.shape == (2, 2, 10, 12, 1)
     with pytest.raises(ValueError):
         pad_W_R_to_grid(W_R, (3, 6, 1))      # 3 < 6 (coarser, not finer)

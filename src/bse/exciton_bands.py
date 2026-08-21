@@ -486,11 +486,11 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
     on the walk's silicon deck, where the fit failed the ``build_fH_R``
     orthonormality gate rather than merely losing accuracy.
 
-    So the basis to FIT in is the parent's, and the answer is then sliced to
-    the kept rows — which lands exactly on the columns the bundle stores,
-    because that slice is the downfold's own definition of them.  μ_S buys
-    the (μ, μ) tensors and the BSE matvec; it does not and cannot buy the
-    interpolation fit, and this function is where that is stated.
+    The exact-span route therefore fits in the parent and slices to the kept
+    rows.  The opt-in reduced shared model instead applies ``keep_idx`` before
+    the fit: its target rank is bounded by the child capacity and all centroid
+    objects are born at μ_S.  This function returns both authorities so the
+    caller makes that model-order-dependent choice explicitly.
 
     The parent's table comes off the bundle's own ``downfold_provenance``,
     not off the deck: a deck copied beside the small bundle names a file that
@@ -556,13 +556,12 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
                 f"parent's {mu_parent} — not the table this bundle was "
                 f"downfolded from; skipped.")
             continue
-        log(f"  [downfold] this bundle is a DOWNFOLD of {prov.get('parent_file', '?')} "
-            f"(mu {mu_parent} -> {n_rmu_bundle}).  The htransform leg refits "
-            f"psi in the PARENT basis from {path} ({whence}) and the result "
-            f"is sliced to the {keep_idx.shape[0]} kept centroid rows — the "
-            f"same column slice that defines the bundle's own psi_full_y.  "
-            f"mu_S sizes the (mu,mu) tensors and the BSE matvec; the "
-            f"interpolation fit is sized by nk*nb and cannot use it.")
+        log(f"  [downfold] this bundle is a DOWNFOLD of "
+            f"{prov.get('parent_file', '?')} (mu {mu_parent} -> "
+            f"{n_rmu_bundle}).  Resolved parent table {path} ({whence}) and "
+            f"its ordered {keep_idx.shape[0]}-row child subset.  The exact "
+            f"htransform fits in the parent then slices; an explicit reduced "
+            f"cross-k model fits directly on these child rows.")
         return path, keep_idx
 
     raise SystemExit(
@@ -815,12 +814,12 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     device; at 40 path points the old device_get→np.pad→2×device_put moved
     ~1.7 GB through the host).
 
-    ``keep_idx`` (downfolded bundles only) is the column slice from the
-    parent ISDF basis the htransform fitted in to the basis the RESTART
-    stores — see :func:`resolve_isdf_basis` for why those differ.  It runs
-    inside the same jit, before the pad, so the parent-width ψ never lands
-    in a second host buffer and the μ axis reaches its sharding constraint
-    already at the small extent.
+    ``keep_idx`` is retained for callers holding a legacy parent-width
+    htransform bundle.  It applies the parent→child column slice before the
+    pad, but cannot undo that bundle's earlier parent-width q concatenation.
+    Production downfolds therefore pass the selection to
+    :func:`bandstructure.bse_setup.compute_wfns_fi` and call this function
+    with ``keep_idx=None``; the incoming bundle is already child-width.
 
     THE RESTART'S μ IS THE AUTHORITY, and the assertion below says so: the
     htransform's basis is an input to this function, ``n_rmu`` is what every
@@ -875,7 +874,10 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
 
 
-def _gate_stats_on_device(eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy):
+def _gate_stats_on_device(
+    eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy,
+    *, htransform_k_indices=None, stored_k_indices=None,
+):
     """Both gate numbers computed ON DEVICE; only replicated results read back.
 
     Returns ``(max|Δε_c|, Gram(nk, nc, nc))`` as REPLICATED arrays, read with
@@ -905,9 +907,25 @@ def _gate_stats_on_device(eps_ht, eps_st, psi_ht, psi_st, nc, mesh_xy):
     reshard, and adding zeros changes neither a norm nor an inner product.
     """
     rep = NamedSharding(mesh_xy, P())
+    ht_idx = (None if htransform_k_indices is None else
+              np.asarray(htransform_k_indices, dtype=np.int32))
+    st_idx = (None if stored_k_indices is None else
+              np.asarray(stored_k_indices, dtype=np.int32))
 
     @partial(jax.jit, out_shardings=(rep, rep, rep))
     def _f(e_ht, e_st, A, B):
+        # A diagnostic caller may hold two internally coherent native tables
+        # on different grids.  Select its paired physical rows ON DEVICE
+        # before any subtraction or mu contraction.  The index tables are
+        # closed-over integer metadata from symmetry_maps, so this remains one
+        # jit and neither mu-sharded wavefunction is gathered.  The production
+        # bse_k_grid path is NOT such a caller: its general loader has already
+        # rebuilt both operands on the fine grid and compares every row.
+        if ht_idx is not None:
+            e_ht = jnp.take(e_ht, ht_idx, axis=0)
+            A = jnp.take(A, ht_idx, axis=0)
+            e_st = jnp.take(e_st, st_idx, axis=0)
+            B = jnp.take(B, st_idx, axis=0)
         # ORDER.  htransform returns eigenvalues ASCENDING (they come out of an
         # eigensolve); the stored restart holds them in DFT-BAND-INDEX order.
         # QP corrections reorder bands, so those two orders differ BY
@@ -955,8 +973,10 @@ def _local(x):
                       if hasattr(x, "addressable_data") else x)
 
 
-def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
-                              mesh_xy, log=print):
+def gate_htransform_vs_stored(
+    psi_cQ_gamma, eps_cQ_gamma, data, mesh_xy, *,
+    htransform_k_indices=None, stored_k_indices=None, log=print,
+):
     """On-grid consistency gate at a Γ path point: htransform conduction
     ε vs the stored restart ε (max |Δ|), and the gauge-free per-k subspace
     overlap min singular value of ⟨ψ_ht|ψ_stored⟩ (bands × bands, spin+μ
@@ -971,11 +991,68 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
     ``O(N_μ)`` all-gather per process inside a DIAGNOSTIC, and at P=16 under
     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` it does not work at any of
     three warm-ups.
+
+    A lower-level diagnostic with two internally coherent native k lattices
+    may pass ``htransform_k_indices`` and ``stored_k_indices`` as the aligned
+    exact intersection returned by
+    :func:`symmetry_maps.common_uniform_grid_indices`.  This cannot repair a
+    bundle whose energy and wavefunction tables have different k axes; that
+    is refused before either index table is used.  The production
+    ``bse_k_grid`` path compares every fine-grid row because its general
+    loader has already densified the complete BSE bundle.
     """
+    paired = (htransform_k_indices is not None, stored_k_indices is not None)
+    if paired[0] != paired[1]:
+        raise ValueError(
+            "htransform@Gamma gate requires htransform_k_indices and "
+            "stored_k_indices together.")
+    n_ht_eps = int(eps_cQ_gamma.shape[0])
+    n_ht_psi = int(psi_cQ_gamma.shape[0])
+    n_st_eps = int(data["eps_c"].shape[0])
+    n_st_psi = int(data["psi_c_X"].shape[0])
+    if n_ht_eps != n_ht_psi or n_st_eps != n_st_psi:
+        raise ValueError(
+            "htransform@Gamma gate found an internally inconsistent BSE "
+            "bundle: each energy table and its wavefunction table must share "
+            "one k axis, but htransform has "
+            f"eps={n_ht_eps}, psi={n_ht_psi} and stored/data has "
+            f"eps={n_st_eps}, psi={n_st_psi}.  A bse_k_grid run with --eqp "
+            "can cause exactly this if coarse restart energies are applied "
+            "after psi was densified; apply the QP ladder before "
+            "densification, or use WFN_qp.h5 without the redundant --eqp.")
+    if paired[0]:
+        ht_idx = np.asarray(htransform_k_indices, dtype=np.int32)
+        st_idx = np.asarray(stored_k_indices, dtype=np.int32)
+        if (ht_idx.ndim != 1 or st_idx.ndim != 1
+                or ht_idx.shape != st_idx.shape or ht_idx.size == 0):
+            raise ValueError(
+                "htransform@Gamma gate matched-k indices must be nonempty "
+                f"aligned vectors; got {ht_idx.shape} and {st_idx.shape}.")
+        n_ht = n_ht_eps
+        n_st = n_st_eps
+        if (np.any(ht_idx < 0) or np.any(ht_idx >= n_ht)
+                or np.any(st_idx < 0) or np.any(st_idx >= n_st)):
+            raise ValueError(
+                "htransform@Gamma gate matched-k index outside its native "
+                f"table: htransform rows={n_ht}, stored rows={n_st}, "
+                f"htransform range=[{int(ht_idx.min())},{int(ht_idx.max())}], "
+                f"stored range=[{int(st_idx.min())},{int(st_idx.max())}].")
+        log(f"  [gate] htransform@Gamma native-grid intersection: "
+            f"{ht_idx.size} matched k point(s) from htransform "
+            f"{n_ht} and stored {n_st}")
+    else:
+        ht_idx = st_idx = None
+        if int(eps_cQ_gamma.shape[0]) != int(data["eps_c"].shape[0]):
+            raise ValueError(
+                "htransform@Gamma gate received different native k-grid "
+                f"sizes ({int(eps_cQ_gamma.shape[0])} transformed vs "
+                f"{int(data['eps_c'].shape[0])} stored) without the canonical "
+                "common-grid index map.")
     nc = int(data["n_cond"])
     d_dev, d_idx_dev, G_dev = _gate_stats_on_device(
         eps_cQ_gamma, data["eps_c"], psi_cQ_gamma, data["psi_c_X"],
-        nc, mesh_xy)
+        nc, mesh_xy, htransform_k_indices=ht_idx,
+        stored_k_indices=st_idx)
     d_eps = float(_local(d_dev))
     d_eps_idx = float(_local(d_idx_dev))
     G = _local(G_dev)
@@ -998,7 +1075,10 @@ def gate_htransform_vs_stored(psi_cQ_gamma, eps_cQ_gamma, data,
         # the window boundary cutting a degenerate multiplet.  Different bugs,
         # different fixes, and the gate used to print a number that could be
         # either.
-        log(f"  [gate] overlap svals at the worst k (k={k_worst}): "
+        where = (f"matched row {k_worst}, htransform k={int(ht_idx[k_worst])}, "
+                 f"stored k={int(st_idx[k_worst])}"
+                 if ht_idx is not None else f"k={k_worst}")
+        log(f"  [gate] overlap svals at the worst k ({where}): "
             f"{np.array2string(np.asarray(sv_worst), precision=4)}")
     log(f"  [gate] band-index-wise |Δε_c| = {d_meV_idx:.3f} meV — this is "
         f"NOT an accuracy figure.  htransform returns energies ascending and "
@@ -1469,7 +1549,8 @@ def main(argv=None):
         load_v_full=(args.vq_mode in ("ongrid", "refit")),
         degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry,
-        distrib_la_batched_route=args.distrib_la_batched_route)
+        distrib_la_batched_route=args.distrib_la_batched_route,
+        htransform_a_band=args.a_band)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -1505,6 +1586,18 @@ def main(argv=None):
             mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry)
+        if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
+            raise ValueError(
+                "exciton_bands: --eqp rebuilt energies on the native restart "
+                f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
+                "had already densified the BSE wavefunctions to "
+                f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
+                "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
+                "remove --eqp: that file already carries the canonical QP "
+                "eigenvalues paired with its rotated wavefunctions.  A "
+                "mean-field WFN plus diagonal eqp corrections needs the eqp "
+                "ladder applied inside the htransform densification, not "
+                "patched onto its output here.")
         enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp, args.input)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
@@ -1541,9 +1634,18 @@ def main(argv=None):
 
     # ── htransform setup + Q path ────────────────────────────────────────
     t0 = time.time()
+    _rank_multiplier = ht.resolve_galerkin_rank_multiplier(
+        params.get("htransform_rank_multiplier", 0.0))
+    # Rank 0 preserves the exact parent-fit-then-slice route.  The reduced
+    # shared model has no parent-capacity requirement, so build it directly
+    # at the downfold's ordered child rows and never form a parent-width B or
+    # projected wavefunction cache.
+    _fit_subset = keep_idx if _rank_multiplier > 0.0 else None
+    _output_keep = None if _fit_subset is not None else keep_idx
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
-     enk_sigma) = ht.initialize_wfns(args.input, params, log,
-                                     mesh_xy=mesh_xy)
+     enk_sigma) = ht.initialize_wfns(
+         args.input, params, log, mesh_xy=mesh_xy,
+         centroid_subset_idx=_fit_subset)
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
         # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
@@ -1657,12 +1759,14 @@ def main(argv=None):
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
+        batch_size=int(params.get("wfn_fi_q_chunk", 0)),
+        centroid_keep_idx=_output_keep,
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
         distrib_la_batched_route=args.distrib_la_batched_route)
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
-        keep_idx=keep_idx)
+        keep_idx=None)
     # Everything the htransform produced is now copied into the conduction
     # stacks and nothing below reads it again.  Drop it before the V_Q model
     # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
@@ -1683,6 +1787,14 @@ def main(argv=None):
         # host ``svd`` per k.  A diagnostic is allowed to cost something; it
         # is not allowed to cost something invisibly.
         t0 = time.time()
+        # ``data`` is the POST-bse_k_grid bundle.  When densification is on,
+        # both its psi/eps and this Q=Gamma cache live on the FINE grid; the
+        # native coarse restart is no longer either operand.  Comparing a
+        # coarse/fine intersection here used the coarse energy cardinality
+        # left behind by the invalid post-densification --eqp path to index an
+        # already-fine psi table, turning an operand-provenance bug into a
+        # spurious subspace-overlap failure.  The gate below first verifies
+        # each psi/eps pair has one k axis, then compares all actual rows.
         gate_htransform_vs_stored(
             psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy, log=log)
         tick("gamma_gate", t0)

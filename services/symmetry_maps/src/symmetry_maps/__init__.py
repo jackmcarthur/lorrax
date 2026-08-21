@@ -89,9 +89,11 @@ The surface
 ``unfold_psi`` / ``spinor_rotation_for_sym_row`` / ``tau_phase_row``
     The ψ-unfold rule, and the single sources of the spinor TRS
     augmentation and the τ phase.
-``kgrid_shift_map`` / ``find_irreducible_bz_points``
-    Pure integer k-grid algebra: the C-order fold with its umklapp G, and
-    the IBZ reduction (derive-IBZ and anchored-IBZ branches).
+``kgrid_shift_map`` / ``common_uniform_grid_indices`` /
+``find_irreducible_bz_points``
+    Pure integer k-grid algebra: the C-order fold with its umklapp G, the
+    exact intersection of two native uniform grids, and the IBZ reduction
+    (derive-IBZ and anchored-IBZ branches).
 ``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
 ``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
 ``fft_grid_pullback_perm`` / ``recover_symmorphic_density_point_group``
@@ -178,6 +180,7 @@ from symmetry_maps.directed_edges import (
 from symmetry_maps.maps import (
     KStarMap,
     SymMaps,
+    common_uniform_grid_indices,
     find_irreducible_bz_points,
     kgrid_shift_map,
     slice_q_full_to_ibz,
@@ -247,7 +250,8 @@ from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
     # tables
-    "SymMaps", "kgrid_shift_map", "find_irreducible_bz_points",
+    "SymMaps", "kgrid_shift_map", "common_uniform_grid_indices",
+    "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # directed band-matrix edges: pure table + the one symmetry action

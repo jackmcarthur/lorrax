@@ -43,9 +43,10 @@ re-attach per fine q::
     S_fine(q ∉ Γ_c)     =   0
 
 where ``Γ_c`` is the Voronoi cell of Γ with respect to the COARSE q-lattice.
-Both expressions come from ONE integrand — the one ``vcoul.Bulk3D.q0_average``
-already evaluates — averaged at Γ and evaluated pointwise elsewhere.  Nothing
-is derived anew and nothing is fitted.
+Both expressions come from ONE dimension-selected ``vcoul`` integrand —
+``Bulk3D.q0_average`` or ``Slab2D.q0_average`` — averaged at Γ and evaluated
+pointwise elsewhere.  Nothing is fitted and the slab bare factor is not
+re-derived here.
 
 SHAPE FROM THE INTEGRAND, SCALE FROM THE INJECTED HEAD
 ------------------------------------------------------
@@ -103,25 +104,28 @@ THE ONE APPROXIMATION, NAMED
 For fine q-points off the coarse grid the exact projector is
 ``g₀(q) = ζ̃_{q,μ}(G_q)``, and ζ exists only on the coarse grid.  This stage
 FREEZES the projector at ``g₀(Γ)`` for every fine point inside the coarse Γ
-cell.  That is an O(q·L) relative error on a term of magnitude O(1/q²) —
-controlled inside the cell and irrelevant outside it, and exactly the regime
-``THEORY_LT_HEAD_TENSOR.md`` §3.3 identifies as the cell average's validity
-domain.  The exact alternatives (``psp/finite_q_head_interp.compute_g_mu_at_q``,
-or ``jax.jacfwd`` on the closed-form b26p ζ̃ evaluator) are a later stage.
+cell.  That is an O(q·L) relative error on a term of magnitude O(1/q²) in
+bulk or O(1/|q|) in a slab — controlled inside the cell and irrelevant outside
+it, and exactly the regime ``THEORY_LT_HEAD_TENSOR.md`` §3.3 identifies as the
+cell average's validity domain.  The exact alternatives
+(``psp/finite_q_head_interp.compute_g_mu_at_q``, or ``jax.jacfwd`` on the
+closed-form b26p ζ̃ evaluator) are a later stage.
 The freeze enters at exactly one place: :func:`attach_head_channel`, which
 takes ONE ``g0`` pair and broadcasts it over every fine q.
 
 WHAT THIS MODULE DOES NOT DO
 ----------------------------
-* It does not modify the q=0 full-expression average.  ``Bulk3D.q0_average``
-  is CALLED here, at a different cell size, and never touched — that estimator
-  is ratified and is better than BerkeleyGW's 3D product-of-averages.
+* It does not modify the q=0 full-expression average.  The selected kernel's
+  ``q0_average`` is CALLED here, at a different cell size, and never touched.
+  In bulk that estimator is ratified and is better than BerkeleyGW's 3D
+  product-of-averages.
 * It adds no wing term.  The Γ-cell wing second moment ``N_ab = ⟨S q_a q_b⟩``
   is staged separately, measurement-first, because it moves the 0.41 meV
   cross-code parity.
-* It is bulk-3D only.  The slab twin needs ``slab_2d.q0_average`` and a
-  different trace identity; :func:`build_fine_head_scalars` refuses any other
-  ``sys_dim`` rather than silently using the 3D pole.
+* Bulk and slab use different bare kernels, selected through the ``vcoul``
+  service.  The slab Γ value is ``Slab2D.q0_average`` itself and its finite-q
+  value is the service's Ismail-Beigi kernel in the same screened denominator;
+  no second slab formula lives here.  Cell-box (0D) remains unsupported.
 """
 from __future__ import annotations
 
@@ -137,6 +141,7 @@ from vcoul import wrap_points_to_voronoi                      # noqa: E402
 
 __all__ = [
     "head_scalar_pointwise",
+    "slab_head_scalar_pointwise",
     "gamma_cell_head_scalar",
     "fine_q_cart",
     "coarse_gamma_cell_weights",
@@ -225,6 +230,52 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
     return np.real(val).reshape(lead)
 
 
+def slab_head_scalar_pointwise(
+    geometry: CoulombGeometry,
+    q_cart,
+    S_cart,
+) -> np.ndarray:
+    """Screened Ismail-Beigi slab head at finite Cartesian ``q``.
+
+    The bare factor is obtained from :func:`vcoul.v_qG_table` with the public
+    :class:`vcoul.Slab2D` kernel and ``G=0``, then multiplied by Ω because the
+    service's table convention includes ``1/Ω`` while head scalars do not.
+    Thus the only expression written here is the dimension-independent Dyson
+    denominator ``v/(1-v qᵀSq)``; the slab truncation itself remains owned by
+    the service.  This is exactly the pointwise integrand averaged by
+    :meth:`vcoul.Slab2D.q0_average` at Γ.
+    """
+    q_in = np.asarray(q_cart, dtype=np.float64)
+    if q_in.ndim == 0 or q_in.shape[-1] != 3:
+        raise ValueError(f"slab_head_scalar_pointwise: q_cart must be (...,3); "
+                         f"got {np.shape(q_cart)}")
+    lead = q_in.shape[:-1]
+    q = q_in.reshape(-1, 3)
+    q2 = np.einsum("qi,qi->q", q, q)
+    if np.any(q2 <= 0.0):
+        raise ValueError(
+            "slab_head_scalar_pointwise: q = 0 has no pointwise value; use "
+            "gamma_cell_head_scalar(..., sys_dim=2) for the Γ-cell average.")
+    S = np.asarray(S_cart, dtype=np.complex128)
+    if S.shape != (3, 3):
+        raise ValueError(f"slab_head_scalar_pointwise: S_cart must be (3,3); "
+                         f"got {S.shape}")
+
+    # q_cart = q_frac @ bvec (row convention).  Calling the service on a
+    # zero-G list keeps the Ismail-Beigi factor in its one source of truth.
+    q_frac = q @ np.linalg.inv(np.asarray(geometry.bvec, dtype=np.float64))
+    g0 = np.zeros((q.shape[0], 3, 1), dtype=np.float64)
+    v_over_omega = vcoul.v_qG_table(
+        vcoul.get_kernel(vcoul.SysDim.SLAB_2D), q_frac, g0,
+        geometry=geometry,
+    )[:, 0]
+    vq = np.asarray(v_over_omega, dtype=np.float64) * float(geometry.cell_volume)
+    qSq = np.einsum("qi,ij,qj->q", q, S, q)
+    val = vq / (1.0 - vq * qSq)
+    _refuse_complex(val, "slab_head_scalar_pointwise")
+    return np.real(val).reshape(lead)
+
+
 def _refuse_complex(val, where: str, rtol: float = 1e-10) -> None:
     """Refuse a head scalar with a physically meaningful imaginary part.
 
@@ -249,18 +300,20 @@ def _refuse_complex(val, where: str, rtol: float = 1e-10) -> None:
 
 
 def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
+                           sys_dim=3,
                            analytic_sphere: bool = False,
                            nsamples: int = 2**18,
                            method: str = "auto",
                            qmc_reps: int = 10) -> float:
     """``⟨ v/(1 − v qᵀS q) ⟩`` over the mini-BZ Voronoi cell of ``kgrid``.
 
-    A THIN CALL, NOT A REIMPLEMENTATION.  This is ``vcoul.Bulk3D.q0_average``
-    with the caller's ``kgrid`` — the ratified q=0 full-expression average,
-    consumed at a different cell size and not modified.  Passing the FINE grid
-    is the whole of C1's Γ treatment; passing the COARSE grid reproduces the
-    scalar the loader injects today, which is what makes the on-grid identity
-    free and the provenance check possible.
+    A THIN CALL, NOT A REIMPLEMENTATION.  This dispatches through
+    ``vcoul.get_kernel(sys_dim).q0_average`` with the caller's ``kgrid`` — the
+    ratified q=0 full-expression average, consumed at a different cell size and
+    not modified.  Passing the FINE grid is the whole of C1's Γ treatment;
+    passing the COARSE grid reproduces the scalar the loader injects today,
+    which is what makes the on-grid identity free and the provenance check
+    possible.
 
     ``analytic_sphere`` is the deck's ``head_minibz_average`` key: it adds the
     Baldereschi-Tosatti analytic sphere term and widens the Voronoi fold to
@@ -283,7 +336,8 @@ def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
     float
         Ry·bohr³, real (see :func:`_refuse_complex`).
     """
-    _, wcoul0 = vcoul.Bulk3D().q0_average(
+    sd = _validated_sys_dim(sys_dim)
+    _, wcoul0 = vcoul.get_kernel(sd).q0_average(
         geometry, tuple(int(s) for s in kgrid), S_cart=S_cart,
         nsamples=nsamples, method=method, qmc_reps=qmc_reps,
         analytic_sphere=analytic_sphere,
@@ -332,7 +386,97 @@ def fine_q_cart(bvec, fine_grid) -> np.ndarray:
     return q.reshape(nfx, nfy, nfz, 3)
 
 
-def coarse_gamma_cell_weights(q_cart, coarse_grid, fine_grid) -> np.ndarray:
+def coarse_gamma_cell_weights(q_cart, coarse_grid, fine_grid, *,
+                              bvec=None) -> np.ndarray:
+    """Fine-grid quadrature weights belonging to the coarse Γ Voronoi cell.
+
+    Nested grids retain the certified coset construction verbatim.  When the
+    grids do not nest, their point sets have no quotient lattice, so integer
+    residues on the fine grid are not a partition.  The exact common-refinement
+    construction is used instead:
+
+    1. on ``L_a = lcm(nc_a, nf_a)``, build the nested coarse-Γ footprint;
+    2. build the nested fine-Γ footprint on the same grid and translate it to
+       every fine-grid centre;
+    3. overlap the two footprints and divide by ``[Λ_L:Λ_f]``.
+
+    Thus a common-grid quadrature cell on a boundary is shared by both
+    Voronoi partitions, rather than won by an index tie-break.  For 8→12 in
+    one dimension the result is ``w(0)=1`` and ``w(±1/12)=1/4`` (total 1.5);
+    in two dimensions it totals ``12²/8² = 2.25``.  This is the fraction of
+    each fine mini-BZ cell covered by the coarse Γ cell, which is the weight a
+    pointwise head value must carry.
+
+    ``bvec`` is needed only for the non-nested common grid.  Keeping it
+    optional preserves every nested caller and makes an accidental nonnested
+    call without geometry refuse rather than silently revert to floor-division
+    cosets.
+    """
+    q = np.asarray(q_cart, dtype=np.float64)
+    fg = tuple(int(s) for s in fine_grid)
+    cg = tuple(int(s) for s in coarse_grid)
+    if q.shape != (*fg, 3):
+        raise ValueError(f"coarse_gamma_cell_weights: q_cart {q.shape} does "
+                         f"not match fine_grid {fg}")
+    if any(c <= 0 or f < c for f, c in zip(fg, cg)):
+        raise ValueError(
+            f"coarse_gamma_cell_weights: fine grid {fg} must be at least "
+            f"coarse grid {cg} on every axis.")
+    if all(f % c == 0 for f, c in zip(fg, cg)):
+        return _nested_coarse_gamma_cell_weights(q, cg, fg)
+    if bvec is None:
+        raise ValueError(
+            "coarse_gamma_cell_weights: non-nested grids need bvec so the "
+            "coarse and fine Voronoi footprints can be built on their LCM "
+            "common grid.")
+
+    common = tuple(int(np.lcm(c, f)) for c, f in zip(cg, fg))
+    n_common = int(np.prod(common))
+    n_fine = int(np.prod(fg))
+    pair_ops = n_common * n_fine
+    if n_common > 2_000_000 or pair_ops > 50_000_000:
+        raise ValueError(
+            f"coarse_gamma_cell_weights: the exact common refinement of "
+            f"{cg} and {fg} is {common} ({n_common} points), above the "
+            f"bounded host limit (N_common <= 2,000,000 and "
+            f"N_common*N_fine <= 50,000,000; this request is {pair_ops}).  "
+            f"Use a nearby nested BSE grid rather than turning a scalar-head "
+            f"step into an unbounded host loop.")
+    q_common = fine_q_cart(bvec, common)
+    coarse_on_common = _nested_coarse_gamma_cell_weights(
+        q_common, cg, common)
+    fine_on_common = _nested_coarse_gamma_cell_weights(
+        q_common, fg, common)
+
+    common_per_fine = tuple(L // f for L, f in zip(common, fg))
+    micro_per_fine = int(np.prod(common_per_fine))
+    out = np.zeros(fg, dtype=np.float64)
+    partition = np.zeros(common, dtype=np.float64)
+    axes = (0, 1, 2)
+    for fi in np.ndindex(fg):
+        shift = tuple(fi[a] * common_per_fine[a] for a in axes)
+        fine_cell = np.roll(fine_on_common, shift=shift, axis=axes)
+        partition += fine_cell
+        out[fi] = float(np.sum(coarse_on_common * fine_cell)) / micro_per_fine
+
+    if not np.allclose(partition, 1.0, rtol=0.0, atol=1e-12):
+        err = float(np.max(np.abs(partition - 1.0)))
+        raise AssertionError(
+            f"coarse_gamma_cell_weights: translated fine cells do not "
+            f"partition the common grid; max|Σcell−1|={err:.3e} for "
+            f"{fg} on {common}.")
+    expected = float(np.prod(fg)) / float(np.prod(cg))
+    if not np.isclose(float(np.sum(out)), expected, rtol=0.0,
+                      atol=1e-12 * max(1.0, expected)):
+        raise AssertionError(
+            f"coarse_gamma_cell_weights: common-grid overlap carries "
+            f"weight {float(np.sum(out))!r}, expected N_f/N_c={expected!r} "
+            f"for {cg} -> {fg}.")
+    return out
+
+
+def _nested_coarse_gamma_cell_weights(q_cart, coarse_grid,
+                                      fine_grid) -> np.ndarray:
     """How much of each fine q lies in the Γ Voronoi cell of the COARSE lattice.
 
     The coarse q-lattice ``Λ_c`` is generated by ``b_i / nc_i``, and its Γ
@@ -467,8 +611,9 @@ def build_fine_head_scalars(
     geometry : CoulombGeometry
         Cartesian reciprocal ROWS (1/bohr) and Ω (bohr³).
     coarse_grid, fine_grid : tuple[int, int, int]
-        ``fine`` must be a positive multiple of ``coarse`` on every axis —
-        the same containment the densifier requires (coarse BZ ⊂ fine BZ).
+        ``fine`` must be at least ``coarse`` on every axis.  Nested and
+        non-nested uniform grids are both supported; the latter uses the exact
+        LCM common-grid overlap in :func:`coarse_gamma_cell_weights`.
     S_cart : array_like, shape (3, 3)
     head_ref, gamma_ref, ref_grid
         THE ANCHOR PAIR AND THE GRID IT BELONGS TO.  ``head_ref`` is the head
@@ -494,12 +639,10 @@ def build_fine_head_scalars(
           the arm that simulates a coarse W must put back the head the fine
           run really had.
     sys_dim : REQUIRED — ``None`` refuses
-        Refused unless bulk 3D.  The slab twin is a separate stage: in 2D the
-        head is a ``|q|`` cusp rather than a ``1/q²`` pole and the estimator
-        is ``slab_2d.q0_average``, so silently running the 3D pole on a slab
-        would be a wrong number with no shape error.  The keyword keeps its
+        Bulk 3D and slab 2D are supported through their separate ``vcoul``
+        kernels.  Cell-box 0D remains unsupported.  The keyword keeps its
         ``None`` default only so the refusal can SAY which site failed to
-        supply it (:func:`_refuse_non_bulk`); omitting it is an error, not a
+        supply it (:func:`_validated_sys_dim`); omitting it is an error, not a
         request for bulk 3D.
     analytic_sphere, nsamples, method, qmc_reps
         Passed to :func:`gamma_cell_head_scalar`; must match the GW run.
@@ -521,35 +664,34 @@ def build_fine_head_scalars(
     if gamma_cell not in ("fine", "coarse"):
         raise ValueError(f"build_fine_head_scalars: gamma_cell must be 'fine' "
                          f"(C1) or 'coarse' (the red twin); got {gamma_cell!r}")
-    _refuse_non_bulk(sys_dim)
+    sd = _validated_sys_dim(sys_dim)
     cg = tuple(int(s) for s in coarse_grid)
     fg = tuple(int(s) for s in fine_grid)
     for a, (f, c) in enumerate(zip(fg, cg)):
-        if c <= 0 or f <= 0 or f % c != 0:
+        if c <= 0 or f < c:
             raise ValueError(
-                f"build_fine_head_scalars axis {a}: fine {f} must be a "
-                f"positive multiple of coarse {c} (coarse BZ ⊂ fine BZ).")
+                f"build_fine_head_scalars axis {a}: fine {f} must be at "
+                f"least coarse {c}; the head step cannot coarsen an axis.")
 
     q = fine_q_cart(geometry.bvec, fg)                        # (fx,fy,fz,3)
-    weight = coarse_gamma_cell_weights(q, cg, fg)             # (fx,fy,fz)
+    weight = coarse_gamma_cell_weights(
+        q, cg, fg, bvec=geometry.bvec)                         # (fx,fy,fz)
 
-    # FREE EXACT INVARIANT.  The weight in the coarse Γ cell totals the index
-    # [Λ_f : Λ_c] = ∏(nf_a/nc_a) — no lattice dependence, and no dependence on
-    # how many boundary q happened to tie.  Asserted rather than trusted
+    # FREE EXACT INVARIANT.  The weight in the coarse Γ cell totals its volume
+    # in fine-cell units, N_f/N_c = ∏(nf_a/nc_a) — no lattice dependence and
+    # no dependence on how many boundary/common-cell nodes are shared.  Asserted
+    # rather than trusted
     # because an over-count deposits extra heads at q the coarse tiles already
     # screen, and the resulting error is small enough per point to hide in any
     # norm.
-    n_expect = 1
-    for f, c in zip(fg, cg):
-        n_expect *= f // c
+    n_expect = float(np.prod(fg)) / float(np.prod(cg))
     total = float(np.sum(weight))
     if abs(total - n_expect) > 1e-12 * n_expect:
         raise AssertionError(
             f"build_fine_head_scalars: the coarse Γ cell holds weight "
-            f"{total!r} but [Λ_f : Λ_c] = {n_expect} for {cg} → {fg}.  The "
-            f"re-attachment domain is not a fundamental domain of the coarse "
-            f"lattice, so the head channel would be double-counted (or "
-            f"dropped).")
+            f"{total!r} but N_f/N_c = {n_expect} for {cg} → {fg}.  The "
+            f"fine-cell overlap does not cover exactly one coarse Γ cell, so "
+            f"the head channel would be double-counted (or dropped).")
     if weight[0, 0, 0] != 1.0:
         raise AssertionError(
             f"build_fine_head_scalars: Γ carries weight {weight[0, 0, 0]!r}, "
@@ -571,8 +713,11 @@ def build_fine_head_scalars(
     off_gamma = weight > 0.0
     off_gamma[0, 0, 0] = False
     if np.any(off_gamma):
-        S[off_gamma] = (head_scalar_pointwise(q[off_gamma], S_cart)
-                        * weight[off_gamma])
+        pointwise = (head_scalar_pointwise(q[off_gamma], S_cart)
+                     if sd is vcoul.SysDim.BULK_3D else
+                     slab_head_scalar_pointwise(
+                         geometry, q[off_gamma], S_cart))
+        S[off_gamma] = pointwise * weight[off_gamma]
 
     # Γ: the cell average over the FINE cell (C1) or the COARSE one (the red
     # twin).  When that grid IS ``ref_grid`` the caller's ``gamma_ref`` is
@@ -582,7 +727,8 @@ def build_fine_head_scalars(
     # determinism, and it is one fewer 2.6M-sample integral per run.
     gamma_grid = fg if gamma_cell == "fine" else cg
     S[0, 0, 0] = (gamma_r if gamma_grid == rg else gamma_cell_head_scalar(
-        geometry, gamma_grid, S_cart, analytic_sphere=analytic_sphere,
+        geometry, gamma_grid, S_cart, sys_dim=sd,
+        analytic_sphere=analytic_sphere,
         nsamples=nsamples, method=method, qmc_reps=qmc_reps))
 
     # THE ANCHOR, and the reason it is spelled as a ratio.  When the Γ entry
@@ -593,12 +739,13 @@ def build_fine_head_scalars(
     return float(head_ref) * (S / gamma_r)
 
 
-def _refuse_non_bulk(sys_dim) -> None:
-    """Bulk 3D only, said out loud.  See ``build_fine_head_scalars``.
+def _validated_sys_dim(sys_dim):
+    """Return a supported Coulomb dimensionality, refusing unknown and 0D.
 
-    ``None`` REFUSES.  It used to ``return`` — and that one line made the 2D
-    refusal below unreachable from the only two paths that ship: ``Meta`` has
-    no ``sys_dim`` field, so ``bse.bse_densify.build_w_head_channel``'s
+    ``None`` REFUSES.  The former bulk-only guard used to ``return`` — and that
+    one line made its 2D refusal unreachable from the only two paths that ship:
+    ``Meta`` has no ``sys_dim`` field, so
+    ``bse.bse_densify.build_w_head_channel``'s
     ``getattr(meta, "sys_dim", None)`` handed ``None`` for every BSE
     densification whose Meta nobody had stamped, and a slab deck got the 3D
     pole with no exception, no warning and a confident provenance ratio in the
@@ -610,9 +757,8 @@ def _refuse_non_bulk(sys_dim) -> None:
     """
     if sys_dim is None:
         raise ValueError(
-            "head_densify: sys_dim was not supplied, so the bulk-3D-only "
-            "refusal below cannot decide anything and the 3D pole "
-            "v(q) = 8π/|q|² would run on an unknown geometry.  ``Meta`` has "
+            "head_densify: sys_dim was not supplied, so the head kernel "
+            "cannot choose bulk 3D or slab 2D.  ``Meta`` has "
             "no sys_dim field: it is STAMPED, by gw.gw_jax.main on the GW "
             "driver's Meta and by bandstructure.htransform.initialize_wfns on "
             "the one the bandstructure leg and both BSE densification paths "
@@ -627,16 +773,13 @@ def _refuse_non_bulk(sys_dim) -> None:
     except (TypeError, ValueError):
         raise ValueError(f"head_densify: sys_dim={sys_dim!r} invalid; "
                          f"expected 0 (box), 2 (slab) or 3 (bulk).")
-    if sd is not SysDim.BULK_3D:
+    if sd is SysDim.BOX_0D:
         raise NotImplementedError(
-            f"head_densify: C1's head channel is the 3D bulk pole "
-            f"v(q) = 8π/|q|², and this run is sys_dim={sd.name}.  In 2D the "
-            f"head is a |q| CUSP, the estimator is slab_2d.q0_average, and "
-            f"the trace identity that gates it is a different closed form — "
-            f"so running the 3D expression here would be a wrong number with "
-            f"no shape error to catch it.  The slab twin is a separate stage; "
-            f"until it lands, use w_head_densify = legacy on this deck and "
-            f"read the coarse→fine result knowing the Γ head is interpolated.")
+            "head_densify: C1 does not support the cell-box (sys_dim=BOX_0D) "
+            "head.  Its q=0 Coulomb value is already finite and the split "
+            "against a separately injected divergent channel has no 0D "
+            "contract.")
+    return sd
 
 
 def head_channel_zone_average(S_grid) -> float:

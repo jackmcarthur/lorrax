@@ -210,7 +210,8 @@ Plan.
 
 | key | default | meaning |
 |---|---|---|
-| `bse_k_grid` | `""` | "NX NY NZ" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical. |
+| `bse_k_grid` | `""` | "NX NY NZ" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve. Each target extent must be at least the coarse extent; integer nesting is not required (for example 8x8x1→12x12x1). The q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical. |
+| `htransform_rank_multiplier` | `0.0` | Model order for the shared cross-k htransform alpha basis. `0` preserves the exact numerical-rank path (up to `N_k*N_band`). A value >=1 retains approximately `ceil(multiplier*N_band)` singular directions, closes a degenerate block rather than slicing it, and applies a per-k Löwdin row isometry so coarse-grid f(H) energies remain exact. On a downfolded restart, this reduced route fits directly at the child bundle's ordered centroid subset; it does not form a parent-width centroid object and slice afterward. This is an explicit observable-convergence approximation, not an `rtol` alias. It is incompatible with the full-r projector used by `vq-mode=refit`; use `interp`/`ongrid` or `0` there. |
 | `get_centroids_fi` | false | htransform -> BSE handoff: also compute fine-grid psi at the coarse centroids (bse_setup.compute_wfns_fi). |
 | `wfn_fi_min` | `0` | Sub-window lower edge on the htransform band axis (0-based). |
 | `wfn_fi_max` | `0` | Sub-window upper edge, exclusive; 0 = full window. |

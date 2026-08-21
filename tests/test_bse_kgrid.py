@@ -13,10 +13,9 @@ fine grid.  Unset or == coarse → the coarse bundle is returned byte-identicall
   3. **Densify** (fixture+GPU): a small 3×3→6×6 run returns a fine-grid bundle
      with the right shapes (nk=36, band/μ dims unchanged) and a W_q on the fine
      k-lattice, and it is solvable (finite, ordered, positive eigenvalues).
-  4. **The slab refuses** (fixture+GPU): the fixture IS a slab, and on the
-     DEFAULT head arm the same densification must REFUSE rather than
-     re-attach the bulk 3-D pole.  Cells 2 and 3 therefore name the
-     documented ``legacy`` arm — see ``LEGACY_HEAD``.
+  4. **Nonnested slab C1** (fixture+GPU): the fixture IS a 3×3 slab, and on
+     the DEFAULT head arm a 3×3→4×4 densification dispatches both Γ and
+     finite-q head values through the slab ``vcoul`` kernel and completes.
 
 All 1-GPU (no 16-GPU gating).
 """
@@ -32,6 +31,8 @@ jax = pytest.importorskip("jax")
 
 FXDIR = ("/pscratch/sd/j/jackm/lorrax_sandbox/runs/MoS2/00_mos2_3x3_cohsex/"
          "05_lorrax_cohsex_native")
+DIPOLE_FIXTURE = ("/pscratch/sd/j/jackm/lorrax_sandbox/runs/MoS2/"
+                  "00_mos2_3x3_cohsex/00_lorrax_cohsex/dipole.h5")
 
 # Modest htransform window (nband=40 <= 48) so the fine-grid conduction ENERGY
 # recovery stays accurate (10_lorrax_exciton_bands nband<=48 finding).
@@ -89,18 +90,14 @@ needs_mos2_fixture = pytest.mark.skipif(
     reason="MoS2 3x3 640-centroid fixture not present")
 
 
-#: THE SLAB HEAD ARM, and why three cells below have to name it.
+#: THE LEGACY CONTROL ARM, and why body-focused cells below name it.
 #:
 #: This fixture is MoS2: ``sys_dim = 2``.  The default ``w_head_densify = c1``
 #: re-attaches W's Γ head analytically per fine q from ``gw.head_densify``,
-#: whose integrand is the BULK pole ``8π/|q|²`` — and since 2026-08-17 that
-#: stage REFUSES a slab rather than running the 3-D expression on it (in 2D
-#: the head is a ``|q|`` cusp, so the error grew without bound as the fine
-#: grid densified).  The three densifying cells below gate ψ/ε/V_q0/W shapes
-#: and the exchange tile, none of which is the head channel, so they take the
-#: documented ``legacy`` arm and stay exactly as informative as they were.
-#: The refusal is gated on its own by
-#: ``test_the_slab_refuses_the_bulk_head_rather_than_running_it``.
+#: which now dispatches the bare factor and Γ average through ``Slab2D``.  The
+#: body/solvability cells retain the documented ``legacy`` arm as an explicit
+#: A/B control; the separate default-arm cell below proves the fixed slab C1
+#: composer reaches the real loader and returns a finite densified bundle.
 #:
 #: It is passed as an ARGUMENT, not written into the deck, and that is not a
 #: style choice: ``gw_config.read_lorrax_input`` builds params only out of
@@ -192,33 +189,39 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
 
 @needs_mos2_fixture
 @pytest.mark.gpu
-def test_the_slab_refuses_the_bulk_head_rather_than_running_it(tmp_path):
-    """A ``sys_dim = 2`` deck + ``bse_k_grid`` + the DEFAULT head arm REFUSES.
+def test_the_slab_c1_runs_through_the_dimension_selected_head(tmp_path):
+    """A slab deck + ``bse_k_grid`` completes on the DEFAULT C1 head arm.
 
     This is the shipping configuration the defect lived in, on a real slab
-    fixture: MoS2 3×3×1 densified to 6×6×1 with ``w_head_densify`` unset, so
-    it resolves to ``c1``.  Before 2026-08-17 this computed — it re-attached
-    the untruncated 3D pole ``8π/|q|²`` at every fine q inside the coarse Γ
-    cell, where the true 2D head goes as ``8π·z_c/|q_∥|``, and printed a
-    provenance ratio saying the head matched.  Nothing raised, and the error
-    grew as the fine grid densified.
-
-    Two things had to be true for that: ``Meta`` has no ``sys_dim`` field and
-    ``bandstructure.htransform.initialize_wfns`` did not stamp one, and
-    ``gw.head_densify._refuse_non_bulk`` returned on ``None``.  Both are
-    fixed; this cell is the end-to-end statement that the refusal now reaches
-    the deck.
+    fixture: MoS2 3×3×1 densified to nonnested 4×4×1 with
+    ``w_head_densify`` unset, so
+    it resolves to ``c1``.  The former stage correctly refused rather than run
+    its bulk pole on this geometry.  C1 now obtains the finite-q bare factor
+    from ``Slab2D`` and the Γ value from ``Slab2D.q0_average``; this cell is the
+    end-to-end statement that the replacement reaches the real loader rather
+    than selecting ``legacy`` or stopping at the old refusal.
     """
     harness.skip_unless_gpu(pytest)
     from bse.bse_w_exact import _create_mesh_xy
     run = _make_run(tmp_path)
+    if not os.path.exists(DIPOLE_FIXTURE):
+        pytest.skip("matching MoS2 3x3 dipole.h5 fixture not present")
+    # The historical restart predates ``S_cart_head``.  Its sibling
+    # ``00_lorrax_cohsex`` run uses the exact same WFN.h5 (same inode in the
+    # canonical fixture) and supplies the documented fallback tensor source.
+    # Link it into this disposable run rather than mutating the completed
+    # restart merely to backfill provenance.
+    os.symlink(DIPOLE_FIXTURE, run / "dipole.h5")
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     inp = run / "cohsex_kg.in"                 # w_head_densify unset → c1
     assert "w_head_densify" not in inp.read_text()
     assert "sys_dim = 2" in inp.read_text()
     mesh_xy = _create_mesh_xy(1, 1)
-    with pytest.raises(NotImplementedError, match="SLAB_2D"):
-        _load(restart, inp, mesh_xy, (6, 6, 1))    # no arm named → the default
+    df = _load(restart, inp, mesh_xy, (4, 4, 1))  # no arm named → default C1
+    assert (int(df["nkx"]), int(df["nky"]), int(df["nkz"])) == (4, 4, 1)
+    W = np.asarray(jax.device_get(df["W_q"]))
+    assert tuple(W.shape[-3:]) == (4, 4, 1)
+    assert np.all(np.isfinite(W))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

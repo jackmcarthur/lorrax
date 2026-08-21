@@ -1,0 +1,101 @@
+"""Opt-in reduced cross-k Galerkin model-order contract.
+
+The historical htransform carries the full numerical rank and remains the
+default.  These cells pin the distinct approximation requested by the input
+key: rank proportional to bands at one k, followed by a per-k polar factor so
+``build_fH_R`` keeps its row-isometry invariant.
+"""
+from __future__ import annotations
+
+import inspect
+
+import numpy as np
+import pytest
+
+
+def test_rank_multiplier_vocabulary_and_default():
+    pytest.importorskip("jax")
+    from bandstructure.htransform import resolve_galerkin_rank_multiplier
+    from gw.gw_config import _DEFAULTS
+
+    assert _DEFAULTS["htransform_rank_multiplier"] == 0.0
+    assert resolve_galerkin_rank_multiplier(0) == 0.0
+    assert resolve_galerkin_rank_multiplier("10") == 10.0
+    for bad in (-1, 0.5, float("nan"), "not-a-number"):
+        with pytest.raises(ValueError, match="htransform_rank_multiplier"):
+            resolve_galerkin_rank_multiplier(bad)
+
+
+def test_downfold_centroid_subset_is_ordered_strict_and_checked():
+    from bandstructure.htransform import validate_centroid_subset_idx
+
+    got = validate_centroid_subset_idx(np.asarray([7, 1, 9, 3]), 10)
+    assert np.array_equal(got, [7, 1, 9, 3])
+    for bad in ([], [1, 1], [-1, 2], [1, 10], [1.0, 2.0], [[1, 2]]):
+        with pytest.raises(ValueError, match="centroid subset"):
+            validate_centroid_subset_idx(np.asarray(bad), 10)
+
+
+def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import _lowdin_orthonormalize_band_rows
+
+    rng = np.random.default_rng(20260820)
+    nk, nb, rank = 5, 6, 40
+    c = (rng.standard_normal((nk, nb, rank))
+         + 1j * rng.standard_normal((nk, nb, rank)))
+    # Plant a well-conditioned but visibly non-isometric shared-span block.
+    c[:, 0] *= 0.35
+    gram_before = np.einsum("kna,kma->knm", c, np.conj(c), optimize=True)
+    before = float(np.max(np.abs(gram_before - np.eye(nb)[None])))
+    assert before > 1.0, "RED TWIN DID NOT GO RED: input was accidentally isometric"
+
+    out, lmin, lmax, before_dev, after_dev, move = (
+        _lowdin_orthonormalize_band_rows(jnp.asarray(c)))
+    out = np.asarray(out)
+    gram_after = np.einsum("kna,kma->knm", out, np.conj(out), optimize=True)
+    assert np.max(np.abs(gram_after - np.eye(nb)[None])) < 2.0e-13
+    assert float(after_dev) < 2.0e-13
+    assert float(before_dev) == pytest.approx(before, rel=2.0e-13)
+    assert 0.0 < float(lmin) <= float(lmax)
+    assert float(move) > 0.01
+
+
+def test_reduced_policy_is_opt_in_and_refit_is_refused():
+    pytest.importorskip("jax")
+    from bandstructure import htransform as ht
+
+    sig = inspect.signature(ht.streaming_galerkin_solve)
+    assert sig.parameters["rank_multiplier"].default == 0.0
+    src = inspect.getsource(ht.streaming_galerkin_solve)
+    assert "if rank_multiplier > 0.0 and return_full_proj" in src
+    assert "rank_multiplier=params.get" in inspect.getsource(ht.initialize_wfns)
+    # The default must not be routed through the approximate polar factor.
+    assert "if rank_multiplier > 0.0:" in src
+
+
+def test_bse_consumers_forward_the_q_chunk_key():
+    """The local-batch route is useful only if the documented width arrives."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "bse"
+    for name in ("bse_densify.py", "exciton_bands.py"):
+        src = (root / name).read_text()
+        assert 'batch_size=int(params.get("wfn_fi_q_chunk", 0))' in src, name
+        assert "centroid_subset_idx=_fit_subset" in src, name
+        assert "_output_keep = None if _fit_subset is not None" in src, name
+
+
+def test_exciton_a_band_reaches_both_htransform_calls():
+    """The densified stored leg and shifted-Q leg must share one shoulder."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "bse"
+    main_src = (root / "exciton_bands.py").read_text()
+    load_src = (root / "bse_loading.py").read_text()
+    dense_src = (root / "bse_densify.py").read_text()
+    assert "htransform_a_band=args.a_band" in main_src
+    assert "a_band_index=args.a_band" in main_src
+    assert "htransform_a_band=htransform_a_band" in load_src
+    assert "a_band_index=htransform_a_band" in dense_src
