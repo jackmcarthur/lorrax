@@ -130,7 +130,7 @@ setenv("HDF5_USE_FILE_LOCKING", "FALSE")
 -- XLA cleanly.  At MEM_FRACTION=0.95 with BFC, NCCL starves and surfaces
 -- as `NCCL error 1 unhandled cuda error` inside cusolverMpSyevd.
 setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "platform")
+setenv("XLA_PYTHON_CLIENT_ALLOCATOR",   "cuda_async")
 setenv("TF_GPU_ALLOCATOR",              "cuda_malloc_async")
 
 -- =========================================================================
@@ -182,7 +182,7 @@ local shifter_env_parts = {
     "--env=PYTHONPATH=" .. pypath,
     "--env=HDF5_USE_FILE_LOCKING=FALSE",
     "--env=XLA_PYTHON_CLIENT_PREALLOCATE=false",
-    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=platform",
+    "--env=XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async",
     "--env=TF_GPU_ALLOCATOR=cuda_malloc_async",
     "--env=LD_LIBRARY_PATH=" .. container_ldlib,
     -- Shifter's mpich module ships libmpi_gtl_cuda.so.0 built against
