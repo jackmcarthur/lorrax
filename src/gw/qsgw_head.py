@@ -28,6 +28,7 @@ conversion in LORRAX's Ry/bohr velocity convention.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import lcm
 from typing import Callable
 
 import jax
@@ -76,6 +77,28 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # The full Y/Z outputs are much smaller (three Cartesian rows/columns), and a
 # ring step visits every frequency block before circulating its band tile.
 _HEAD_WING_FREQUENCY_BLOCK = 8
+
+
+def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
+    """Zero-pad a logical head manifold for both processor-grid axes.
+
+    ``nb_logical`` remains the authoritative transition mask in every
+    consumer kernel. Padding here is storage only: it makes the two band
+    axes legal for ``P('x', 'y')`` without inventing physical states. A
+    common multiple is intentional because the wing ring uses one band
+    storage extent on both processor axes.
+    """
+    nb = int(v.shape[-1])
+    alignment = lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
+    nb_padded = ((nb + alignment - 1) // alignment) * alignment
+    if nb_padded == nb:
+        return v, e, f, surface
+    pad = nb_padded - nb
+    v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
+    e = jnp.pad(e, ((0, 0), (0, pad)))
+    f = jnp.pad(f, ((0, 0), (0, pad)))
+    surface = jnp.pad(surface, ((0, 0), (0, pad)))
+    return v, e, f, surface
 
 
 @dataclass(frozen=True)
@@ -1119,10 +1142,11 @@ def head_wings_sharded(
     ):
         raise ValueError(
             "centroid wavefunction k/spinor axes do not match the velocity")
-    if int(wfns.psi_xn.shape[-1]) < int(v.shape[-1]):
+    if (
+        int(wfns.psi_xn.shape[-1]) < int(v.shape[-1])
+        or int(wfns.psi_yn.shape[-1]) < int(v.shape[-1])
+    ):
         raise ValueError("centroid wavefunctions do not cover the head manifold")
-    psi_xn = wfns.psi_xn[..., : int(v.shape[-1])]
-    psi_yn = wfns.psi_yn[..., : int(v.shape[-1])]
     include_surface = surface_weight_kn is not None
     surface = (
         jnp.asarray(surface_weight_kn, dtype=jnp.float64)
@@ -1130,6 +1154,14 @@ def head_wings_sharded(
     if surface.shape != e.shape:
         raise ValueError(
             f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
+    v, e, f, surface = _pad_head_band_manifold(
+        v, e, f, surface, mesh=mesh)
+    psi_xn = jnp.asarray(wfns.psi_xn)[..., : int(v.shape[-1])]
+    psi_yn = jnp.asarray(wfns.psi_yn)[..., : int(v.shape[-1])]
+    psi_pad = int(v.shape[-1]) - int(psi_xn.shape[-1])
+    if psi_pad:
+        psi_xn = jnp.pad(psi_xn, ((0, 0), (0, 0), (0, 0), (0, psi_pad)))
+        psi_yn = jnp.pad(psi_yn, ((0, 0), (0, 0), (0, 0), (0, psi_pad)))
     spin_denominator = (
         float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
@@ -1273,6 +1305,8 @@ def head_drude_tensor_sharded(
         raise ValueError(
             f"need 0 < nb_logical <= stored nb, got "
             f"{nb_logical}, {v.shape[2]}.")
+    v, _e, _f, surface = _pad_head_band_manifold(
+        v, surface, surface, surface, mesh=mesh)
     pref = 2.0 / (
         float(cell_volume)
         * float(nk_tot)
@@ -1333,6 +1367,15 @@ def head_s_tensor_sharded(
             f"need 0 < nb_logical <= stored nb, got "
             f"{nb_logical}, {v.shape[2]}."
         )
+    include_surface = surface_weight_kn is not None
+    surface = (
+        jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+        if include_surface else jnp.zeros_like(e))
+    if surface.shape != e.shape:
+        raise ValueError(
+            f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
+    v, e, f, surface = _pad_head_band_manifold(
+        v, e, f, surface, mesh=mesh)
     pref = 4.0 / (
         float(cell_volume)
         * float(nk_tot)
@@ -1349,11 +1392,11 @@ def head_s_tensor_sharded(
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
     )
-    if surface_weight_kn is None:
+    if not include_surface:
         return interband
     drude = head_drude_tensor_sharded(
         v,
-        surface_weight_kn,
+        surface,
         mesh=mesh,
         nb_logical=int(nb_logical),
         cell_volume=float(cell_volume),

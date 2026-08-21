@@ -13,7 +13,7 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.head_correction import (
     HeadGNParams,
@@ -80,6 +80,39 @@ def test_cartesian_ywz_fold_matches_dense_bordered_dyson():
             1.0 - vbare * lam**2 * (qhat @ got_S[iz] @ qhat))
         np.testing.assert_allclose(reduced_head, dense_head, rtol=2e-13,
                                    atol=2e-11)
+
+
+def test_cartesian_ywz_fold_keeps_body_tiled_on_2d_mesh():
+    """The production fold reduces local tiles, never a replicated body."""
+    if len(jax.devices()) < 4:
+        import pytest
+        pytest.skip("requires four CPU test devices")
+
+    rng = np.random.default_rng(207)
+    n_z, n_mu = 2, 12
+    volume = 83.0
+    direct = _complex(rng, (n_z, 3, 3))
+    left = _complex(rng, (n_z, 3, n_mu))
+    body = _complex(rng, (n_z, n_mu, n_mu))
+    right = _complex(rng, (n_z, n_mu, 3))
+    expected = direct + np.einsum(
+        "...am,...mn,...nb->...ab", left, body, right,
+        optimize=True) / volume
+
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    put = jax.device_put
+    got = fold_cartesian_head_wings_sharded(
+        put(direct, NamedSharding(mesh, P(None, None, None))),
+        put(left, NamedSharding(mesh, P(None, None, "x"))),
+        put(body, NamedSharding(mesh, P(None, "x", "y"))),
+        put(right, NamedSharding(mesh, P(None, "y", None))),
+        volume,
+        mesh_xy=mesh,
+    )
+
+    assert got.sharding.spec == P(None, None, None)
+    np.testing.assert_allclose(np.asarray(got), expected, rtol=3e-13,
+                               atol=3e-13)
 
 
 def test_static_schur_fold_updates_thomas_fermi_kappa():
