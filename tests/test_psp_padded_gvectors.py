@@ -347,6 +347,26 @@ def test_provenance_guard_reports_an_unstamped_file(tmp_path):
     assert any("no provenance stamp" in ln for ln in lines)
 
 
+def test_provenance_guard_reports_legacy_fingerprint_as_unverifiable(tmp_path):
+    """A pre-content-scheme hash must not masquerade as a DFT mismatch."""
+    import h5py
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    p = tmp_path / "legacy_dipole.h5"
+    with h5py.File(str(p), "w") as h5:
+        h5.attrs["prov_wfn_sha256"] = "0" * 64
+        h5.attrs["prov_nval"] = 2
+        h5.attrs["prov_ncond"] = 3
+        h5.attrs["prov_nband"] = 8
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=_FakeWfn(), nval=2, ncond=3, nband=8,
+        print_fn=lines.append) is False
+    assert any("predates" in line and "cannot be compared" in line
+               for line in lines)
+    assert not any("DIFFERENT DFT solution" in line for line in lines)
+
+
 def test_wfn_fingerprint_moves_with_the_eigenvalues():
     from psp.get_dipole_mtxels import wfn_fingerprint
 

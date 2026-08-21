@@ -46,7 +46,7 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 band_sphere_spec, blocks_to_host,
                                 dipole_operator, sweep_matrix_elements)
-from common.parallel_transport import wfn_fingerprint
+from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -525,11 +525,13 @@ def compute_finite_q_mtxels(
 # right SHAPE with the wrong CONTENTS.  ``gw.head_correction`` already
 # checks the band COUNT and ``nk``; neither catches that case.
 #
-# The fingerprint is over the eigenvalue table and the k-list, i.e. the
-# two things that change whenever the underlying DFT solution changes,
-# and it is cheap because ``WfnLoader`` has both in memory already.
+# The fingerprint covers the in-memory eigenvalue/k-point header, the complete
+# on-disk mean-field header, and bounded samples of the G vectors and fixed-
+# gauge coefficients.  It is independent of the WFN's path and inode; see
+# ``common.parallel_transport.wfn_fingerprint`` for the exact coverage bound.
 
-_PROV_ATTRS = ("prov_wfn_sha256", "prov_nval", "prov_ncond", "prov_nband",
+_PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
+               "prov_nval", "prov_ncond", "prov_nband",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
                "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign")
 
@@ -598,6 +600,7 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     notice which arm it was handed.
     """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
+    h5.attrs["prov_wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
     h5.attrs["prov_wfn_file"] = str(wfn_path)
     h5.attrs["prov_nval"] = int(nval)
     h5.attrs["prov_ncond"] = int(ncond)
@@ -637,9 +640,28 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
                  f"`python -m psp.get_dipole_mtxels` to make it checkable.")
         return False
 
-    want = {"prov_wfn_sha256": wfn_fingerprint(wfn),
-            "prov_nval": int(nval), "prov_ncond": int(ncond),
+    got_scheme = attrs.get("prov_wfn_fingerprint_scheme")
+    if isinstance(got_scheme, bytes):
+        got_scheme = got_scheme.decode()
+    fingerprint_checkable = got_scheme == WFN_FINGERPRINT_SCHEME
+    if got_scheme is None:
+        print_fn(
+            "  [dipole provenance] the WFN fingerprint predates the "
+            f"location-independent {WFN_FINGERPRINT_SCHEME!r} scheme and "
+            "cannot be compared across checkouts; regenerate dipole.h5 with "
+            "`python -m psp.get_dipole_mtxels` to make the WFN identity "
+            "checkable.")
+    elif not fingerprint_checkable:
+        print_fn(
+            "  [dipole provenance] the WFN fingerprint uses unsupported "
+            f"scheme {got_scheme!r}, not {WFN_FINGERPRINT_SCHEME!r}; "
+            "regenerate dipole.h5 with `python -m psp.get_dipole_mtxels` "
+            "to make it checkable.")
+
+    want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
             "prov_nband": int(nband)}
+    if fingerprint_checkable:
+        want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     bad = [(k, attrs[k], v) for k, v in want.items()
            if k in attrs and _prov_ne(attrs[k], v)]
     if bad:
@@ -655,8 +677,11 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
             print_fn=print_fn)
         return False
 
-    print_fn(f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
-             f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)})")
+    if not fingerprint_checkable:
+        return False
+    print_fn(
+        f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
+        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)})")
     return True
 
 

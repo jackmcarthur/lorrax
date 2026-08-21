@@ -743,6 +743,12 @@ class HeadResolver:
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
         head = config.head
         self._params = {
+            # These are GW-run controls, not head sub-config fields.  The
+            # dipole provenance reader must compare against the consumer's
+            # requested window rather than reconstructing the writer defaults.
+            "nval": config.nval,
+            "ncond": config.ncond,
+            "nband": config.nband,
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
             "vhead": head.vhead,

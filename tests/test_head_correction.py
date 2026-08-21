@@ -1,3 +1,5 @@
+import types
+
 import numpy as np
 import pytest
 from types import SimpleNamespace
@@ -6,6 +8,7 @@ from gw.head_correction import (
     HeadResolver,
     HeadResponseKind,
     HeadSample,
+    _dipole_window_from_params,
     compute_static_head_terms,
     fit_head_ppm,
     fit_head_ppm_from_samples,
@@ -68,6 +71,25 @@ def test_diagnostic_and_off_policies_are_observable(monkeypatch):
     sample = off.at(0.0j)
     assert sample.response_kind is HeadResponseKind.OFF
     assert sample.vc0 == 0.0j and sample.wcoul0 == 0.0j
+
+
+def test_head_resolver_forwards_the_gw_run_dipole_window():
+    """The provenance message compares the reader's window, not defaults."""
+    head = types.SimpleNamespace(
+        wcoul0_source="s_tensor",
+        wcoul0_eta=0.0,
+        vhead=None,
+        whead_0freq=None,
+        whead_imfreq=None,
+        head_minibz_average=False,
+        bgw_metal_q0_treatment="off",
+    )
+    config = types.SimpleNamespace(
+        head=head, nval=8, ncond=32, nband=40)
+    wfn = types.SimpleNamespace(nbands=62, nelec=10)
+    resolver = HeadResolver(
+        config, ".", wfn, sym=None, meta=None, print_fn=lambda _msg: None)
+    assert _dipole_window_from_params(resolver._params, wfn) == (8, 32, 40)
 
 
 def test_compute_static_head_terms_matches_cohsex_formulas():

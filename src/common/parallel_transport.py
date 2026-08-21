@@ -15,7 +15,6 @@ graph: the raw overlap never crosses a Python dispatch boundary.
 """
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 
 import jax
@@ -37,10 +36,20 @@ __all__ = [
     "make_cross_k_overlap",
     "make_distributed_band_matmul",
     "make_cross_k_link",
+    "WFN_FINGERPRINT_SCHEME",
     "wfn_fingerprint",
 ]
 
 _BAND_MATMUL_CACHE = {}
+
+# This name is intentionally stable and printed by provenance checks in the
+# dipole-fingerprint regression.  Changing the sampled content below requires
+# a new scheme name so artifacts can state exactly what was compared.
+WFN_FINGERPRINT_SCHEME = (
+    "mean-field-content-v1:full-mf-header+bounded-wfns")
+_WFN_GVEC_SAMPLE_COUNT = 17
+_WFN_COEFF_BAND_SAMPLE_COUNT = 7
+_WFN_COEFF_G_SAMPLE_COUNT = 11
 
 
 def band_storage_extent(mesh, nbands: int) -> int:
@@ -61,34 +70,131 @@ def band_storage_extent(mesh, nbands: int) -> int:
     return round_up(int(nbands), divisor)
 
 
-def wfn_fingerprint(wfn) -> str:
-    """Cheap SHA-256 identity for the fixed-gauge WFN used by PT.
+def _fingerprint_update_value(digest, label: str, value) -> None:
+    """Add an ndarray-like value to ``digest`` without object-pointer bytes."""
+    array = np.asarray(value)
+    digest.update(label.encode("utf-8"))
+    digest.update(repr(tuple(int(n) for n in array.shape)).encode("ascii"))
+    digest.update(array.dtype.str.encode("ascii"))
+    if array.dtype.kind in ("O", "S", "U"):
+        # HDF5 text metadata can arrive as bytes, unicode, or object arrays.
+        # ``repr(array.tolist())`` is stable for those values; ``tobytes`` on
+        # an object array would instead digest process-local pointers.
+        digest.update(repr(array.tolist()).encode("utf-8"))
+    else:
+        digest.update(np.ascontiguousarray(array).tobytes())
 
-    Coefficients are too large to hash at startup. For a real loader the
-    resolved path and full stat identity conservatively stamp its gauge
-    generation; modifying, replacing, copying or moving it requires a new
-    artifact.
+
+def _fingerprint_sample_indices(size: int, count: int) -> np.ndarray:
+    """Return deterministic, endpoint-inclusive indices bounded by ``count``."""
+    if size <= 0:
+        return np.empty((0,), dtype=np.int64)
+    return np.unique(np.linspace(
+        0, size - 1, num=min(size, count), dtype=np.int64))
+
+
+def _fingerprint_h5_attrs(digest, label: str, obj) -> None:
+    for key in sorted(obj.attrs):
+        _fingerprint_update_value(
+            digest, f"attr:{label}:{key}", obj.attrs[key])
+
+
+def _fingerprint_wfn_file(digest, path) -> None:
+    """Hash semantic WFN content without hashing its pathname or inode."""
+    import h5py
+
+    with h5py.File(path, "r") as h5:
+        _fingerprint_h5_attrs(digest, "/", h5)
+
+        # The mean-field header is small relative to the coefficients, so its
+        # complete dataset and attribute content is part of the identity.
+        if "mf_header" in h5:
+            header_objects = [("mf_header", h5["mf_header"])]
+            h5["mf_header"].visititems(
+                lambda name, obj: header_objects.append(
+                    (f"mf_header/{name}", obj)))
+            for name, obj in sorted(header_objects, key=lambda pair: pair[0]):
+                _fingerprint_h5_attrs(digest, name, obj)
+                if isinstance(obj, h5py.Dataset):
+                    _fingerprint_update_value(
+                        digest, f"dataset:{name}", obj[()])
+
+        if "wfns" not in h5:
+            raise ValueError(f"WFN file {path!s} has no 'wfns' group")
+        wfns = h5["wfns"]
+        _fingerprint_h5_attrs(digest, "wfns", wfns)
+        for dataset_name in ("gvecs", "coeffs"):
+            if dataset_name not in wfns:
+                raise ValueError(
+                    f"WFN file {path!s} has no 'wfns/{dataset_name}' dataset")
+            dataset = wfns[dataset_name]
+            _fingerprint_h5_attrs(
+                digest, f"wfns/{dataset_name}", dataset)
+            _fingerprint_update_value(
+                digest, f"contract:wfns/{dataset_name}",
+                np.asarray(dataset.shape, dtype=np.int64))
+            digest.update(dataset.dtype.str.encode("ascii"))
+
+        gvecs = wfns["gvecs"]
+        if gvecs.ndim != 2:
+            raise ValueError(
+                f"WFN wfns/gvecs must be rank 2; got shape {gvecs.shape}")
+        for ig in _fingerprint_sample_indices(
+                gvecs.shape[0], _WFN_GVEC_SAMPLE_COUNT):
+            _fingerprint_update_value(
+                digest, f"sample:wfns/gvecs:{int(ig)}", gvecs[int(ig), :])
+
+        coeffs = wfns["coeffs"]
+        if coeffs.ndim != 4:
+            raise ValueError(
+                f"WFN wfns/coeffs must be rank 4; got shape {coeffs.shape}")
+        bands = _fingerprint_sample_indices(
+            coeffs.shape[0], _WFN_COEFF_BAND_SAMPLE_COUNT)
+        g_rows = _fingerprint_sample_indices(
+            coeffs.shape[2], _WFN_COEFF_G_SAMPLE_COUNT)
+        for ib in bands:
+            for ig in g_rows:
+                # Spinor and real/imag axes are small and are included whole.
+                _fingerprint_update_value(
+                    digest,
+                    f"sample:wfns/coeffs:{int(ib)}:{int(ig)}",
+                    coeffs[int(ib), :, int(ig), :],
+                )
+
+
+def wfn_fingerprint(wfn) -> str:
+    """Cheap, location-independent SHA-256 identity for a fixed-gauge WFN.
+
+    The digest includes the complete ``mf_header`` tree and bounded,
+    endpoint-inclusive samples of ``wfns/gvecs`` and ``wfns/coeffs``.  It
+    therefore detects every header change and changes in the sampled
+    wavefunction rows, while byte-identical copies have the same identity.
+
+    This deliberately is not a full coefficient checksum: a change confined
+    to unsampled G-vector or coefficient rows can collide.  Hashing all
+    coefficients at each consumer startup would make the provenance check as
+    expensive as reading the entire WFN.  Path, inode, timestamps, and HDF5
+    storage layout are not part of the mean-field identity.
     """
     import hashlib
 
     digest = hashlib.sha256()
-    for value in (
-        np.ascontiguousarray(np.asarray(wfn.energies, dtype=np.float64)),
-        np.ascontiguousarray(np.asarray(wfn.kpoints, dtype=np.float64)),
+    digest.update(WFN_FINGERPRINT_SCHEME.encode("ascii"))
+    for label, value in (
+        ("loaded:energies", np.asarray(wfn.energies, dtype=np.float64)),
+        ("loaded:kpoints", np.asarray(wfn.kpoints, dtype=np.float64)),
     ):
-        digest.update(str(value.shape).encode())
-        digest.update(value.tobytes())
-    digest.update(
-        str((int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands))).encode())
+        _fingerprint_update_value(digest, label, value)
+    _fingerprint_update_value(
+        digest, "loaded:counts",
+        np.asarray(
+            [int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands)],
+            dtype=np.int64),
+    )
+
     path = getattr(wfn, "path", None)
     if path is not None:
-        resolved = os.path.realpath(os.fspath(path))
-        stat = os.stat(resolved)
-        digest.update(resolved.encode("utf-8"))
-        digest.update(str((
-            int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
-            int(stat.st_mtime_ns), int(stat.st_ctime_ns),
-        )).encode())
+        _fingerprint_wfn_file(digest, path)
     return digest.hexdigest()
 
 
