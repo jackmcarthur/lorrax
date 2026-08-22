@@ -930,11 +930,6 @@ def compute_sigma_xc(
                 f"gathering the full cube on every rank, which is the "
                 f"P-independent collective the sharded layout exists to "
                 f"elide.  Set sigma_omega_layout = sharded.")
-        # fermi_reference: resolved by the one owned resolver, which also
-        # returns the provenance string the sigma_mnk.h5 stamp needs.
-        sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
-            config.sigma.fermi_reference,
-            occupation_state=occupation_state, wfn=wfn)
         # The effective Sigma broadening, from the SAME resolver the PPM
         # driver uses.  MPA used to take ``regularization_ev`` raw while
         # GN-PPM silently raised it to a window-dependent conditioning
@@ -960,6 +955,15 @@ def compute_sigma_xc(
             # would claim to guard (claim 0194: the assert here was
             # unsatisfiable while no writer path carried the state).
             # assert_occupation_stamps remains the cross-run reuse gate.
+        # fermi_reference: resolved by the one owned resolver, which also
+        # returns the provenance string the sigma_mnk.h5 stamp needs.
+        # AFTER the metal block on purpose: that block owns the more
+        # specific "metal needs an occupation_state" message, and the
+        # resolver's own refusal for the same case would otherwise pre-empt
+        # it with a less situated one.
+        sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
+            config.sigma.fermi_reference,
+            occupation_state=occupation_state, wfn=wfn)
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
