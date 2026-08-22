@@ -467,10 +467,16 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
         from file_io.epsreader import EPSReader
         from gw.vcoul import compute_q0_averages
 
-        eps0 = EPSReader(eps0_path)
+        # ``with``: EPSReader's matrix attributes are h5py dataset HANDLES
+        # since 2026-08-22 (it used to slurp the whole ``mats/matrix`` into
+        # host memory on every rank, for the six numbers this branch wants),
+        # so the file's lifetime is now the caller's to state.  ``epshead``
+        # is read in the constructor, so nothing here outlives the block.
+        with EPSReader(eps0_path) as eps0:
+            head = jnp.asarray(eps0.epshead, dtype=jnp.complex128)
         vc0_mean, wcoul0 = compute_q0_averages(
             wfn,
-            jnp.asarray(eps0.epshead, dtype=jnp.complex128),
+            head,
             meta,
             S_cart=None,
             analytic_sphere=_analytic_q0_sphere(params),
