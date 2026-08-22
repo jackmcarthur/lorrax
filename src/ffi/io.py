@@ -191,6 +191,13 @@ def close_file(path_or_handle) -> None:
                 platform = _FILE_CTXS[k][1]
                 _FILE_CTXS.pop(k, None)
         if ctx is not None and ctx != 0:
+            # Drop this ctx's memoised dataset ids FIRST.  H5Fclose
+            # invalidates every hid_t opened against the file, and the
+            # ctx address is about to become reusable — a memo entry that
+            # outlives the close is a stale ``ds_id`` waiting for the next
+            # ``open_file`` that lands on the same address
+            # (:func:`_forget_datasets_for_ctx`).
+            _forget_datasets_for_ctx(int(ctx))
             # platform=None (unknown handle) follows the JAX default
             # backend inside ffi_loader — hardcoding "CUDA" would fail on
             # a CPU node where only the host lib exists.
@@ -204,10 +211,12 @@ def _atexit_close_all() -> None:
     with _LOCK:
         for path, (ctx, platform, _mode) in list(_FILE_CTXS.items()):
             try:
+                _forget_datasets_for_ctx(int(ctx))
                 ffi_loader.phdf5_close(int(ctx), platform=platform)
             except Exception:
                 pass
         _FILE_CTXS.clear()
+        _DS_ID_MEMO.clear()
 
 
 atexit.register(_atexit_close_all)
@@ -509,9 +518,43 @@ def read_kchunk_union_sharded(
     return _reader
 
 
-@functools.lru_cache(maxsize=None)
+#: ``(ctx_handle, ds_name, mesh) -> hid_t`` for the k-chunk union reader.
+#: A PLAIN DICT, cleared by :func:`_forget_datasets_for_ctx` at every
+#: ``close_file``.  It used to be an ``lru_cache`` and that is a defect,
+#: not a style: see :func:`_open_dataset_memo`.
+_DS_ID_MEMO: Dict[Tuple[int, str, Mesh], int] = {}
+
+
+def _forget_datasets_for_ctx(ctx: int) -> None:
+    """Drop every memoised ``ds_id`` belonging to ``ctx``.
+
+    THE CTX HANDLE IS A HEAP ADDRESS, AND HEAP ADDRESSES ARE REUSED.
+    ``open_file`` returns ``reinterpret_cast<int64_t>(ctx)``; ``close_ctx``
+    ``delete``s that object.  A second ``open_file`` of the same path in
+    the same process — same allocation size, freed moments earlier —
+    very often gets the SAME address back from the allocator.  Every
+    ``hid_t`` minted against the first context was invalidated by its
+    ``H5Fclose``, so a cache keyed on the address alone hands the second
+    context the first one's dead dataset ids and the read handler refuses
+    with ``phdf5 read_kchunk_union: ds_id is invalid``.
+
+    MEASURED, and this is the failure it explains: JID 57269074, a second
+    ``bandstructure.htransform.streaming_galerkin_solve`` in one exciton
+    process, rank 3 raising exactly that message after the first 24x24
+    load had completed and closed; an identical FRESH-PROCESS retry passed
+    the same site.  Fresh process, fresh allocator, no address reuse — so
+    the "intermittent" in that register row is the allocator's freedom to
+    hand back a different address, not a race.
+
+    Called from ``close_file`` (and the atexit sweep), which is the only
+    place a ctx dies, so the memo cannot outlive the handle it describes.
+    """
+    for key in [k for k in _DS_ID_MEMO if k[0] == int(ctx)]:
+        _DS_ID_MEMO.pop(key, None)
+
+
 def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
-    """Memoised collective ``H5Dopen``.
+    """Memoised collective ``H5Dopen``, keyed to a LIVE ctx.
 
     Split out of :func:`_read_kchunk_union_sharded_cached` when
     ``fh``/``ds_name`` left that function's key.  It is kept as its own
@@ -520,8 +563,25 @@ def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
     and the dataset, a compiled module depends on the geometry.  Keeping
     it here holds the collective H5Dopen count at exactly one per
     ``(fh, ds_name, mesh)``, which is what the un-split code did.
+
+    IT IS NOT AN ``lru_cache``, deliberately.  An ``lru_cache`` has no
+    invalidation hook, and the key's first component is a reused heap
+    address — see :func:`_forget_datasets_for_ctx` for the measured
+    failure that combination produces.  The entry is dropped when the ctx
+    it belongs to is closed, so a stale id is unreachable rather than
+    merely unlikely.
     """
-    return _register_and_open_dataset(fh, ds_name, mesh)
+    # ``mesh`` is part of the key exactly as it was under ``lru_cache``:
+    # ``Mesh`` is hashable, and the collective open is routed by the mesh's
+    # platform.  Keep the OBJECT, not ``id(mesh)`` — an id is a reused
+    # address too, which is the bug this function is about.
+    key = (int(fh), str(ds_name), mesh)
+    got = _DS_ID_MEMO.get(key)
+    if got is not None:
+        return got
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
+    _DS_ID_MEMO[key] = int(ds_id)
+    return int(ds_id)
 
 
 @functools.lru_cache(maxsize=None)
