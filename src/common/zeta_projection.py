@@ -143,6 +143,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import rank_criterion
 from common import spectral_closure
 from common.collectives import warm_mesh_cliques
 from common.contract_bands import contract_bands_block_reshard
@@ -811,6 +812,35 @@ def least_squares_transfer(
             f"{1.0/float(rcond):.3e} the rcond={rcond:g} truncation was "
             f"supposed to enforce (closure slack {_slack:.6f}) — the retained "
             f"set is not the one the criterion selected.")
+    # THE GATE (docs/dev/rank_truncation_policy.md §2).  The cap check above
+    # asks whether the code did what it was told — κ_eff ≤ 1/rcond — and
+    # that is NECESSARY AND NOT SUFFICIENT: both registered ζ catastrophes
+    # satisfied it exactly.  This asks whether the regime is one anyone has
+    # certified, and it only applies where the cut BOUND.  Worst q, not the
+    # mean: a gate reported on an average cannot fire.
+    _bound_q = ranks < n_mu_s
+    if bool(np.any(_bound_q)):
+        _w_dropped = np.max(np.where(_bound_q, n_mu_s - ranks, 0))
+        rank_criterion.certify_numbers(
+            kappa_eff=float(np.nanmax(np.where(_bound_q, kappa, -np.inf))),
+            n_dropped=int(_w_dropped), n_total=n_mu_s,
+            # This route reduces over q before anything reaches host and does
+            # not carry the per-q trace, so the weight finding is not
+            # available here.  0.0 is the honest "not measured" value for a
+            # ceiling test that only fires upward; the kappa finding is the
+            # one this site can make.
+            discarded_weight=0.0,
+            kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
+            quantity="eigenvalues of G_S",
+            site="zeta_projection rank-truncated transfer",
+            mode=os.environ.get(rank_criterion.POLICY_MODE_ENV),
+            cause=(f"the small ζ basis is over-complete on the G-sphere: "
+                   f"μ_S={n_mu_s} with a retained rank as low as "
+                   f"{int(ranks.min())}, and the retained block runs down to "
+                   f"the rcond={rcond:g} cut."),
+            fix=("lower μ_S (the small basis is smaller than it looks), or "
+                 "raise rcond back onto the certified plateau."),
+            log=print_fn)
     if int(ranks.min()) == 0:
         raise ValueError(
             f"zeta_projection: rcond={rcond:g} retained ZERO directions at "

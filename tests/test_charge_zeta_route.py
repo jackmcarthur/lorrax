@@ -316,3 +316,86 @@ def test_the_token_seams_still_take_the_array_path_without_a_token():
     token = FactorToken(op="cholesky", backend="slate", mesh=_mesh(1, 1),
                         n=8, nbatch=3, _factor=object())
     assert core._factor_nbatch(token) == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# The rank-truncation GATE can fire where it is INSTALLED — including
+# inside a shard_map, which is where the q-parallel charge factor runs it.
+# ─────────────────────────────────────────────────────────────────────────
+
+_GATE_PROBE = r"""
+import numpy as np, jax, jax.numpy as jnp
+from jax.sharding import Mesh, PartitionSpec as P
+from common.shard_map import shard_map
+from common import rank_criterion
+from isdf.core import _certify_the_cut
+
+mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ('x', 'y'))
+
+def drive(spectrum):
+    rank_criterion.raise_if_pending(mode="off")
+    def body(lam):
+        keep = lam > (1e-10 * jnp.max(lam, axis=-1, keepdims=True))
+        _certify_the_cut(lam, keep, where="unit shard_map probe",
+                         kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
+                         rcond=1e-10)
+        return jnp.sum(lam, axis=-1)
+    fn = jax.jit(shard_map(body, mesh=mesh, in_specs=P(('x', 'y'), None),
+                           out_specs=P(('x', 'y')), check_vma=False))
+    jax.block_until_ready(fn(jnp.asarray(spectrum)))
+    return rank_criterion.pending()
+
+# BOUND at kappa_eff = 1e9, an order above the 1e8 certified ceiling.
+bad = np.asarray([[1e-30] * 4 + [1e-9] + [1.0] * 3], dtype=np.float64)
+found = drive(bad)
+assert found, "the gate recorded NOTHING from inside a shard_map"
+assert "unit shard_map probe" in found[0], found
+
+# CONTROL: the same kernel, a cut that binds well inside the certified
+# regime.  Silence here is what makes the arm above evidence.
+good = np.asarray([[1e-30] * 4 + [1e-3] + [1.0] * 3], dtype=np.float64)
+assert drive(good) == [], "the gate fired on a well-conditioned cut"
+rank_criterion.raise_if_pending(mode="off")
+print("GATE_PROBE_OK")
+"""
+
+
+def test_the_zeta_rank_gate_fires_inside_a_shard_map(tmp_path):
+    """A gate that cannot fire at its call site is not a gate.
+
+    ``_certify_the_cut`` records a firing through ``jax.debug.callback`` so
+    ``gw_init`` can refuse at the next host seam.  On the q-parallel schedule
+    ``_charge_factor_math`` — and therefore this gate — runs INSIDE a
+    ``shard_map``, which is a different execution context for a host callback
+    than a plain ``jit``.  ``_close_the_cut`` only reaches its callback under
+    the non-default ``strict``, so that path was effectively unexercised;
+    this one reaches its callback on the DEFAULT.  Drive it rather than hope.
+
+    IN A SUBPROCESS, and the reason is worth stating because it is a real
+    constraint on the gate.  MEASURED on this module (jax 0.9.1, GPU): with
+    no CPU device in the JAX backend, ``jax.debug.print``, ``jax.debug.
+    callback`` AND ``io_callback`` all raise "failed to find a local CPU
+    device to place the inputs on".  A production run never sees that —
+    ``runtime.initialize_communicator_stack`` sets ``JAX_PLATFORMS=
+    "cuda,cpu"`` (``runtime/__init__.py:395``), so a CPU device is always
+    present — but a pytest process that imports ``isdf.core`` without booting
+    the runtime does, and that is what makes the sibling cell
+    ``test_spectral_closure::test_the_padded_distributed_helper_ignores_the_\
+identity_pad`` red on this module at ``origin/main`` too.  So the probe runs
+    under ``JAX_PLATFORMS=cpu``, which is the same idiom
+    ``test_transverse_rank_truncate`` uses for its device-face workers.
+    """
+    import os
+    import subprocess
+    import sys
+
+    src = tmp_path / "gate_probe.py"
+    src.write_text(_GATE_PROBE)
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"
+    env["JAX_ENABLE_X64"] = "1"
+    res = subprocess.run([sys.executable, str(src)], env=env,
+                         capture_output=True, text=True, timeout=600)
+    assert res.returncode == 0 and "GATE_PROBE_OK" in res.stdout, (
+        f"gate probe failed rc={res.returncode}\n"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")

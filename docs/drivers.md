@@ -68,11 +68,19 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--orbit` / `--no-orbit` | auto (on if n_sym>1) | symmetry-closed centroid set from orbit representatives |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
 | `LORRAX_CENTROID_RANK_TOL` (env) | 0.01 | rank-gate tolerance; lowering it is a deliberate override |
+| `LORRAX_CENTROID_SELECT` (env) | `deliver` | what the select does when the pool is numerically flat but still has candidates; `strict` restores the 2026-08-07 refusal |
 
 Invariant: the selection window must span the sigma window `[0, nelec+ncond)` the GW run consumes; the default
 is a superset of any deck's `ncond`, so a shortfall means it was narrowed explicitly. Main refusal: "FATAL:
-pivoted-Cholesky rank deficiency" (certified rank < requested orbits) — widen `--prune-n-cond`, use
-`vc_x_vc`, or raise `--oversample`. Also fatal: FFT-grid mismatch rho vs WFN (needs ecutrho = 4*ecutwfc).
+pivoted-Cholesky rank deficiency" (certified rank < requested orbits) — check `--prune-n-cond` against the
+deck's sigma window first, since that gate is a PROXY for a prune-window mismatch and not a general accuracy
+statement; `vc_x_vc`, `--oversample`, or a lower N are the other levers, and `LORRAX_CENTROID_RANK_TOL` is the
+named override for a set you have MEASURED. Also fatal: FFT-grid mismatch rho vs WFN (needs ecutrho = 4*ecutwfc).
+
+Read the `[point rank]` lines, not only the `[rank gate]` PASS: in orbit mode the gate counts ORBITS and says
+nothing about the points in the file it blesses. Rank deficiency in the delivered POINT set is reported and
+does not refuse — it is measured anti-correlated with BerkeleyGW agreement on the Si anchor deck.
+Policy: [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) §7.
 
 ## dipole — `psp.get_dipole_mtxels`
 
@@ -163,7 +171,7 @@ P-scaling at P=16 (b300 deck, 2979c/300b): the ζ charge factor executes q-paral
 | `restart` | true | reuse `tmp/isdf_tensors_{n_rmu}.h5` (skip ζ-fit/V_q); stamp contract below |
 | `ppm_probe_chi_reuse` | off | opt-in `auto`: probe χ₀ folds into ONE fused τ sweep on static+k augmented nodes; pays only where per-node χ cost dominates (nets +1.2 s at b300 — planner cost; job 7885109) |
 | `hartree_source` | auto | THE G-space vs ISDF V_H switch: `stored` (v_hartree array in kin_ion.h5) \| `gspace` (exact FFT-grid rebuild) \| `isdf` (V_q[0] quadrature) \| legacy `folded` = V_H inside kin_ion values; auto resolves stored→folded→isdf |
-| `charge_zeta_solve` | rank_truncate | charge ζ CCT conditioner: rank-revealing eigh pseudo-inverse dropping λ < `zeta_rcond`·λmax (default 1e-8) vs bit-identical historical `cholesky` |
+| `charge_zeta_solve` | rank_truncate | charge ζ CCT conditioner: rank-revealing eigh pseudo-inverse dropping λ < `zeta_rcond`·λmax (default 1e-8) vs bit-identical historical `cholesky`. The cut is GATED, not merely announced: when it discards anything and the achieved κ_eff exceeds the certified 1e8, the run REFUSES — [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md), override `LORRAX_RANK_POLICY` |
 | `distributed_zeta_solve` | auto | ζ back-solve tier: `replicated` \| `per_q` \| `distributed` (nothing O(μ²) replicated; needs rank_truncate + square/1-D mesh); auto = replicated under 4 GiB gather cap, else per_q |
 | `w_dyson_solver` | auto=local | W Dyson plan: `local` per-q pivoted LU in the q-sharded map vs `distributed` 2-D block-cyclic backsolve (ScaLAPACK/cuSOLVERMp); refuses loudly, never downgrades |
 | `sigma_omega_layout` | replicated | Σ_c(ω,k,m,n) cube: `sharded` keeps (m,n) mesh-tiled end-to-end, for every `qp_solver`; refuses at resolve time when the σ window does not divide both mesh axes, or h5py_allgather at P>1. Under `self_consistent` the full-cube gather runs once per Σ evaluation, so that is the solver with the most to gain |
@@ -251,12 +259,20 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
 | `--fh-diagnostics` | `auto` (follows `--verbose`) | `on`/`off` force the fH_k range stats, the Γ eigenvalue check against f(ε) and the Γ round-trip. They are 33% of the cache-cold h_transform stage (1.442 s, 7 XLA programs) and hold fH_k alive across the whole solve (576 MiB at the reference shape) — hence off unless asked for |
 | env `LORRAX_FH_ORTHO_TOL` / `LORRAX_GALERKIN_CHUNK_GIB` | 1e-6 / 6 | orthonormality gate cap (0 disables — never in production) / streamed ψ chunk budget |
+| env `LORRAX_RANK_POLICY` | `refuse` | authority of the ψ@centroids truncation gate ([`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md)); `warn` continues and leaves a trace, `off` disarms |
 
 Failure modes: `build_fH_R` refusal "Galerkin coefficients are NOT
 orthonormal" on the exact-rank route means the centroid basis cannot carry the
 entire stacked cross-k numerical span; use more centroids, a narrower fit
 window, or an explicitly converged positive `htransform_rank_multiplier`,
-NEVER an `rtol` or orthogonality-tolerance override.  An `f-shoulder` refusal
+NEVER an `rtol` or orthogonality-tolerance override.  **Which of the three
+depends on WHY the span failed:** the exact route retains up to `nk*nb`
+directions, so on a dense metal k-grid it asks for a basis that grows with
+`N_k`, which the method's own contract does not (Wu et al. S1 puts the QRCP
+basis at 20-40*N_b, independent of N_k).  Measured: Na 512 k x 12 bands with
+the validated c1016 basis refuses at 2.324e-4 while the SAME basis completes
+at three bands — buying centroids is the wrong repair for that shape, and
+`htransform_rank_multiplier` is the right one.  An `f-shoulder` refusal
 means a requested output band is absent from fH at some coarse k; add guard
 bands, do not disable the gate.  FATAL on `--eqp-file` not found/parsed;
 sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 20 Ry (a garbage GW eqp

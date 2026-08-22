@@ -237,6 +237,40 @@ def resolve_fh_ortho_tol(log_fn=None) -> float:
     return tol
 
 
+def resolve_rank_policy_mode() -> str:
+    """``LORRAX_RANK_POLICY`` (default ``refuse``) — the truncation gate's authority.
+
+    The name and the grammar live once, in ``common/rank_criterion``, which is
+    L2 and must be a function of its arguments (``tests/test_layering.py``);
+    this driver does the lookup and hands the answer over.  Same shape as
+    :func:`resolve_fh_ortho_tol` two functions up, and it exists for the same
+    reason: an L1 library dial reaches the environment through EXACTLY ONE
+    named resolver, so a reader can find every env-dependent decision this
+    module makes by grepping for ``resolve``.
+
+    A mis-spelled mode REFUSES naming the variable — a gate disarmed by a
+    typo reads clean in the log, which is the worst possible reading of one.
+
+    WHY THE NAME IS SPELLED OUT HERE.  Everywhere else in the tree the lookup
+    is ``os.environ.get(rank_criterion.POLICY_MODE_ENV)`` — one source of
+    truth for the spelling.  This module is under the EXACT-SET env ratchet in
+    ``tests/test_layering.py``, whose AST scan reads the argument literally
+    and records a constant as ``<dynamic>``; pinning that would make the
+    ratchet stop naming the variable, which is the degenerate-value failure
+    ``TASTE.md`` #18 is about.  So the literal is written for the scanner and
+    checked against the constant immediately below, which makes a rename a
+    loud refusal at exactly one line instead of a silent second spelling.
+    """
+    if rank_criterion.POLICY_MODE_ENV != "LORRAX_RANK_POLICY":
+        raise RuntimeError(
+            f"resolve_rank_policy_mode: common/rank_criterion renamed its "
+            f"policy dial to {rank_criterion.POLICY_MODE_ENV!r}, but this "
+            f"resolver still reads 'LORRAX_RANK_POLICY' — the literal exists "
+            f"only so the L1 env ratchet can see the name.  Update both.")
+    return rank_criterion.resolve_policy_mode(
+        os.environ.get("LORRAX_RANK_POLICY"))
+
+
 def resolve_galerkin_rank_multiplier(value) -> float:
     """Validate the opt-in cross-k Galerkin model-order multiplier.
 
@@ -673,7 +707,21 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # alternatives (discrepancy principle / L-curve / GCV) and the measured
     # reason each is refuted here, and for the §R19 table in which retaining
     # 41 % MORE rank moved a QP gap from 3.13 eV to −5049 eV.
-    rank_numerical = rank_criterion.select_rank(s_host, rtol)
+    #
+    # THE STRUCTURAL CEILING, and why this route needs it more than any other.
+    # ``A`` is (nk·nb, nspinor·n_μ) but the spectrum above comes from an eigh
+    # of ``A Aᴴ`` at the LARGER of the two dimensions (see the NUMERICS note),
+    # so the null space of a tall rank-deficient A arrives as round-off-sized
+    # POSITIVE eigenvalues and a relative threshold COUNTS THEM.  Measured on
+    # Na bands 1–24: A is (12288, 2032) and rtol=1e-8 selected rank 2034 —
+    # two directions more than the matrix algebraically has — after which the
+    # capacity line printed the self-contradiction ``rank=2034`` beside
+    # ``nspinor·n_μ = 2032``.  ``min(rows, cols)`` is the ceiling; the report
+    # below refuses an UNCLAMPED overshoot so a future caller that drops this
+    # argument is not silently believed.
+    _rank_ceiling = min(nk * nb, nspinor * n_mu)
+    rank_numerical = rank_criterion.select_rank(
+        s_host, rtol, ceiling=_rank_ceiling)
 
     # ── …and the criterion is not allowed to stop mid-multiplet ───────────
     # ``common/spectral_closure``, the sibling of the band-window guard.  A
@@ -837,12 +885,33 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         n_rows=nk * nb, n_cols=nspinor * n_mu,
         n_dropped_closure=max(
             0, _sc_numerical["n_keep"] -
-            _sc_numerical["n_keep_closed"]))
+            _sc_numerical["n_keep_closed"]),
+        # ``rank_used`` here is a SELECTION, so the ceiling applies (the
+        # padded report below is a carried EXTENT and declares none).
+        rank_ceiling=_rank_ceiling,
+        kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM)
     _bad = _numerical_report.violations()
     if _bad:
         raise ValueError(
             "streaming_galerkin_solve: the ψ-at-centroids numerical rank is "
             "not self-consistent — " + "  ".join(_bad))
+    # THE GATE (docs/dev/rank_truncation_policy.md §2).  ``violations()``
+    # above asks whether the code did what it was told; this asks whether
+    # what it was told is a regime anyone certified.  Both registered
+    # catastrophes satisfied the first and failed the second.
+    rank_criterion.certify(
+        _numerical_report,
+        site="htransform ψ@centroids Gram-eigh σ",
+        mode=resolve_rank_policy_mode(),
+        cause=(f"the Galerkin basis is over-complete for this window: "
+               f"{nk * nb} stacked states against nspinor·n_μ = "
+               f"{nspinor * n_mu} interpolation columns, and the retained "
+               f"block runs all the way down to the rtol cut."),
+        fix=("reduce the band window, raise n_μ, or declare an explicit "
+             "reduced model order with htransform_rank_multiplier (>= 1; "
+             "ceil(m·nb) shared cross-k directions, N_k-independent by "
+             "construction)."),
+        log=log_fn)
 
     if rank_multiplier == 0.0:
         # Historical report and accounting, unchanged on the default route.
@@ -899,13 +968,17 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     if rank_numerical < nk * nb:
         log_fn(f"  [warn] ψ-at-centroids is NUMERICALLY RANK-DEFICIENT: "
                f"{nk*nb} states vs numerical rank {rank_numerical} "
-               f"(nspinor·n_μ = {nspinor*n_mu}).  The "
+               f"(structural ceiling min(nk·nb, nspinor·n_μ) = "
+               f"{_rank_ceiling}).  The "
                f"Galerkin basis cannot span the band window — fH energy "
                f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
                f"≤ nspinor·n_μ, i.e. nb < {rank_numerical/nk:.2f} here.  (The pad "
                f"directions are exactly null and add NO capacity — the "
                f"capacity bound is on numerical rank, never on the carried "
-               f"extent.)")
+               f"extent.  The rank quoted here is CLAMPED to the ceiling: a "
+               f"Gram route counts null-space round-off as positive "
+               f"eigenvalues, which is how this line once printed "
+               f"rank=2034 beside nspinor·n_μ=2032.)")
 
     # Null-extend to the carried extent.  The zeros here are what make every
     # pad row of Q — hence of G, ctilde, B and W_proj — exactly zero.
@@ -1499,8 +1572,22 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"{9.0e3 * _ortho:.2e} meV, silently.  Cause, in order of "
             f"likelihood: (1) ψ-at-centroids cannot span the band window — "
             f"check the rank line from streaming_galerkin_solve for "
-            f"rank < nk·nb, and fix it with MORE CENTROIDS or a NARROWER "
-            f"window, never with rtol; (2) the G accumulation summed Q Qᴴ "
+            f"rank < nk·nb.  THREE repairs, and which one applies depends on "
+            f"WHY the span failed: MORE CENTROIDS or a NARROWER window if the "
+            f"basis is genuinely too small for the bands; or an explicit "
+            f"reduced model order, htransform_rank_multiplier >= 1, if the "
+            f"span failed because nk·nb grew with the K-POINT COUNT.  The "
+            f"exact-span route retains up to nk·nb directions, so on a dense "
+            f"metal grid it demands a basis that grows with N_k, which the "
+            f"method's own scaling contract does not (Wu et al. S1 estimates "
+            f"the QRCP basis at 20–40·N_b, INDEPENDENT of N_k, and reports "
+            f"N_mu saturating as N_k grows).  Measured: Na 512 k × 12 bands "
+            f"with the validated c1016 basis retains the full column rank "
+            f"2032 and refuses here at 2.324e-4, while the SAME basis "
+            f"completes at three bands — buying centroids is the wrong "
+            f"repair for that shape.  Never rtol: same job, tightening the "
+            f"amplification cap made ortho WORSE (1e-8 → 6.31e-4, 1e-6 → "
+            f"1.04e-2, 1e-4 → 2.61e-2).  (2) the G accumulation summed Q Qᴴ "
             f"per band chunk instead of summing into Q first.  Override with "
             f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
 

@@ -16,6 +16,7 @@ import numpy as np
 import h5py
 
 import common.timing as timing
+from common import rank_criterion
 from common import spectral_closure
 from common import jax_profile
 # Named-barrier helper: annotates failures with the barrier name and
@@ -1466,6 +1467,39 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
 		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
 		         f"fell inside a degenerate block of C_q on any q.")
+
+	# ── THE ζ RANK CUT'S CERTIFICATION VERDICT, same seam, same reason ────
+	# ``spectral_closure`` asks WHERE the cut landed; this asks whether the
+	# cut was allowed to happen at this conditioning at all.  Until
+	# 2026-08-22 the ζ truncation printed n_keep/q and kappa/q and gated on
+	# NEITHER: a 1776-centroid Si 4×4×4 fit dropped 300+ modes per q at
+	# kappa 9.7e9 and delivered Σ_c MAE 54.4 eV at exit 0 with no banner.
+	# The gate fires inside the jitted kernels, which cannot raise, so it
+	# records through a host callback and refuses HERE — before ζ is
+	# consumed by W.  docs/dev/rank_truncation_policy.md owns the policy.
+	_rp_mode = rank_criterion.resolve_policy_mode(
+		os.environ.get(rank_criterion.POLICY_MODE_ENV))
+	_rp_fired = bool(rank_criterion.pending())
+	rank_criterion.raise_if_pending(
+		"the ζ fit's rank truncation", mode=_rp_mode, log=print_fn)
+	if _rp_mode == "off":
+		print_fn("    ζ rank-cut certification: gate is OFF "
+		         f"({rank_criterion.POLICY_MODE_ENV}=off) — NOT CHECKED, "
+		         f"which is an absence and not a pass.")
+	elif _rp_fired:
+		print_fn(f"    ζ rank-cut certification: FIRED above "
+		         f"(mode={_rp_mode}).  The cut bound outside the regime any "
+		         f"measurement certifies; the numbers are in the "
+		         f"[rank-policy] lines.")
+	else:
+		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
+		         f"certified κ ceiling "
+		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e} for the charge "
+		         f"Gram, discarded-weight ceiling "
+		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
+		         f"either the cut bound nothing, or it bound inside the "
+		         f"certified regime.  The transverse channel is "
+		         f"UNCERTIFIED and can only raise the weight finding.")
 
 	# Stamp what this ζ was fit FOR, so a later run can reuse it.  AFTER
 	# the fit (and therefore after ``mark_zeta_done`` inside

@@ -314,6 +314,19 @@ def pivoted_cholesky_select(
         # rank the divisor can no longer manufacture a blow-up.
         take = masked_d[p] > floor
         pivot_val = jnp.maximum(masked_d[p], floor)
+        # …AND THE CONTINUATION, which is a different question from the stop.
+        # ``take`` says "this pivot adds an independent DIRECTION"; ``avail``
+        # says "there is still a candidate to hand back".  Past the numerical
+        # rank the two diverge, and the selection keeps DELIVERING points
+        # (largest frozen residual first, ties to the lowest index — the same
+        # deterministic rule as above) while ``rank`` below keeps counting
+        # only the certified ones.  See ``refuse_unless_select_certified``
+        # for why a rank-deficient POOL is not an error: measured on the Si
+        # anchor deck, rank is ANTI-correlated with BerkeleyGW agreement.
+        # This is only safe because the clamp above already removed the
+        # 2026-08-07 blow-up: with ``take`` false, ``newcol`` is exactly zero,
+        # so ``d`` is unchanged and no divisor can run away.
+        avail = jnp.any(active)
 
         # L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] · conj(L[p, i])) / sqrt(d[p])
         prev_mask = (col_ids < j).astype(G.dtype)
@@ -325,7 +338,10 @@ def pivoted_cholesky_select(
         newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
 
         L = L.at[:, j].set(newcol)
-        piv = piv.at[j].set(jnp.where(take, p, -1).astype(jnp.int32))
+        # ``avail``, not ``take``: a delivered pivot is a real candidate index
+        # even when it certifies no new direction.  ``-1`` now means ONLY
+        # "the pool ran out", which is the structural refusal.
+        piv = piv.at[j].set(jnp.where(avail, p, -1).astype(jnp.int32))
         d_taken = d_taken.at[j].set(
             jnp.where(take, pivot_val, 0.0).astype(real_dtype))
 
@@ -349,7 +365,11 @@ def pivoted_cholesky_select(
         d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
         trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
         # Mark p (or its whole orbit, if orbit_id was provided) inactive.
-        kill_mask = (orbit_id == orbit_id[p]) & take
+        # ``avail``, not ``take``: without this the loop STALLS past the
+        # numerical rank — it re-picks the same p every remaining iteration
+        # and delivers nothing — which is what made the rank deficiency an
+        # unavoidable refusal rather than a reportable fact.
+        kill_mask = (orbit_id == orbit_id[p]) & avail
         d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
         active = active & ~kill_mask
 
@@ -375,6 +395,22 @@ def pivoted_cholesky_select(
 # The kernel's INFO, read on the host
 # ═══════════════════════════════════════════════════════════════════════
 
+#: What the select does when the pool is numerically flat BUT still has
+#: candidates to hand back.  ``deliver`` (default) hands back the requested
+#: set with a loud note naming the certified rank and its downstream cost;
+#: ``strict`` restores the 2026-08-07 refusal verbatim.  See
+#: :func:`refuse_unless_select_certified` guard (2b) and
+#: ``docs/dev/rank_truncation_policy.md`` §7 for why the default moved.
+#:
+#: Deliberately NOT ``LORRAX_RANK_POLICY``: that dial governs a truncation's
+#: CONDITIONING against a certified kappa ceiling, and this one governs
+#: whether a rank-deficient candidate POOL is an error.  Measured, they point
+#: opposite ways on the same deck, and one name for both would make either
+#: setting wrong for the other.
+SELECT_MODES = ("deliver", "strict")
+SELECT_MODE_DEFAULT: str = "deliver"
+SELECT_MODE_ENV = "LORRAX_CENTROID_SELECT"
+
 
 def refuse_unless_select_certified(
     piv,
@@ -388,15 +424,27 @@ def refuse_unless_select_certified(
     d0max: float,
     tol_rel: float | None = None,
 ) -> None:
-    """Raise unless the select delivered ``n_keep`` certified pivots.
+    """Raise unless the select delivered a set it is safe to write.
 
     A jitted kernel cannot raise, so it REPORTS and this REFUSES — the same
     division of labour LAPACK's ``pstrf`` makes with its ``INFO`` code, and
     the reason assessment R7 says to borrow ``distrib_la``'s refusal
-    discipline rather than its dispatch.  Three conditions, each of which
-    used to be a silent wrong answer that passed every downstream shape
-    check; the measured before-behaviour of all three is in the block
-    comment above :func:`pivoted_cholesky_select`.
+    discipline rather than its dispatch.  Each condition below used to be a
+    silent wrong answer that passed every downstream shape check; the
+    measured before-behaviour is in the block comment above
+    :func:`pivoted_cholesky_select`.
+
+    **WHAT REFUSES AND WHAT REPORTS (2026-08-22).**  Three things are
+    structurally unsafe and refuse: a non-PSD Gram (1), a pool that ran out
+    of candidates (2), and a pivot outside the candidate range (3).  A pool
+    that is merely numerically FLAT (2b) does not refuse: the delivered set
+    is well defined, the arithmetic is safe (the ``pivot_val`` clamp removed
+    the Inf/NaN blow-up that made 2026-08-07's refusal necessary), and rank
+    is measured ANTI-correlated with BerkeleyGW agreement on the deck where
+    it matters — the refusal blocked the most accurate configuration on
+    record while passing one 20-56x worse.  It reports, loudly, with the
+    downstream cost named, and ``LORRAX_CENTROID_SELECT=strict`` restores the
+    old refusal.  ``docs/dev/rank_truncation_policy.md`` §7 owns this.
 
     It is a free function, and public, for one reason: every one of these
     refusals needs a constructible-FALSE twin, and building one through
@@ -464,33 +512,24 @@ def refuse_unless_select_certified(
             f"conjugation, a k-weight, a band window), not that the "
             f"selection needs loosening.")
 
-    # (2) THE RECURRENCE STOPPED.  ``rank`` is a contract now: short means
-    # ``piv`` carries -1 sentinels and there is no set of the requested size
-    # to deliver.  The two causes get different text because the fixes are
-    # different — one is "the pool is too small", the other is "the pool is
-    # numerically flat", and the second is the one that has cost eV.
-    if rank_i < int(n_keep):
-        unit = "orbits" if orbit_id is not None else "points"
-        n_avail = (int(np.unique(np.asarray(orbit_id)).size)
-                   if orbit_id is not None else int(M))
-        if n_avail <= rank_i:
-            cause = (f"the candidate pool CONTAINS only {n_avail} {unit}, "
-                     f"so there was nothing left to pick.  Raise "
-                     f"--oversample for a richer pool, or lower N.")
-        else:
-            cause = (f"{n_avail} {unit} were available, but the residual "
-                     f"Schur diagonal fell to the noise floor {floor:.3e} "
-                     f"after {rank_i} of them — the pool is numerically "
-                     f"RANK-DEFICIENT, not short.  Widen the prune window "
-                     f"(--prune-n-cond, or --prune-window vc_x_vc) so the "
-                     f"Gram sees the pair densities Sigma actually "
-                     f"consumes, or lower N.")
+    # (2) THE POOL RAN OUT.  ``piv == -1`` now means exactly one thing — no
+    # active candidate remained — and that is structural: there is no set of
+    # the requested size in existence, so nothing can be delivered.
+    unit = "orbits" if orbit_id is not None else "points"
+    n_avail = (int(np.unique(np.asarray(orbit_id)).size)
+               if orbit_id is not None else int(M))
+    n_sel = int((piv_np >= 0).sum())
+    if n_sel < int(n_keep):
         raise RuntimeError(
             f"pivoted-Cholesky REFUSES: asked for {int(n_keep)} {unit}, "
-            f"certified {rank_i}.\n"
-            f"  cause : {cause}\n"
-            f"  effect: piv[{rank_i}:] is the -1 sentinel, so there is no "
-            f"set of {int(n_keep)} {unit} to return.\n"
+            f"delivered {n_sel}.\n"
+            f"  cause : the select ran out of ACTIVE candidates — there was "
+            f"nothing left to pick.  The pool holds {n_avail} {unit}; raise "
+            f"--oversample for a richer one, or lower N.  (If that count "
+            f"looks sufficient, a -1 sentinel survived the kernel's own "
+            f"contract, which is a defect in the kernel, not in the deck.)\n"
+            f"  effect: piv[{n_sel}:] is the -1 sentinel, so there is no set "
+            f"of {int(n_keep)} {unit} to return.\n"
             f"Before 2026-08-07 this ran to k_keep regardless.  Past the "
             f"numerical rank the divisor clamped to sqrt(eps) and the "
             f"factor blew up geometrically to Inf and then NaN (MEASURED: "
@@ -500,6 +539,64 @@ def refuse_unless_select_certified(
             f"the pad guard did not fire and nothing downstream noticed.  "
             f"In orbit mode the same exhaustion stayed finite and returned "
             f"index 0 repeated once per missing orbit.")
+
+    # (2b) THE POOL IS NUMERICALLY FLAT — a different fact, and NOT an error.
+    #
+    # WHY THIS STOPPED BEING A REFUSAL (2026-08-22).  Rebuilding the shipped
+    # Si 960-point anchor set's own documented recipe died here with "asked
+    # for 960 points, certified 799", and that set scores sigTOT MAE
+    # 0.644 meV — the best BerkeleyGW agreement on record for the deck —
+    # while the orbit-mode arm the SAME gate passes at 960 is 20-56x worse.
+    # So the refusal blocked the most accurate configuration measured and
+    # waved through a much worse one, purely because orbit mode counts the
+    # rank in ORBITS.  Retained rank is not basis quality, in either
+    # direction (TASTE rule 12; ladder_rung1_notes R19.1).
+    #
+    # AND IT IS NOW SAFE TO DELIVER, which it was not on 2026-08-07.  The
+    # refusal landed together with the ``pivot_val`` clamp, and it is the
+    # CLAMP that removed the Inf/NaN blow-up quoted above: past the rank
+    # ``take`` is false, ``newcol`` is exactly zero and ``d`` is unchanged,
+    # so no divisor can run away.  The selection continues by the same
+    # deterministic rule (largest frozen residual, ties to the lowest index)
+    # and ``rank`` still counts only certified directions.  The refusal is
+    # kept verbatim behind LORRAX_CENTROID_SELECT=strict.
+    #
+    # docs/dev/rank_truncation_policy.md §7 owns this ruling.
+    if rank_i < int(n_keep):
+        mode = (os.environ.get(SELECT_MODE_ENV) or SELECT_MODE_DEFAULT
+                ).strip().lower()
+        if mode not in SELECT_MODES:
+            raise ValueError(
+                f"{SELECT_MODE_ENV}={mode!r} is not one of {SELECT_MODES}.  "
+                f"A mis-spelled mode is not silently 'deliver'.")
+        note = (
+            f"pivoted-Cholesky: asked for {int(n_keep)} {unit}, DELIVERED "
+            f"{n_sel}, but only {rank_i} of them add an independent "
+            f"direction.\n"
+            f"  what   : {n_avail} {unit} were available and the residual "
+            f"Schur diagonal fell to the noise floor {floor:.3e} after "
+            f"{rank_i} of them — the pool is numerically RANK-DEFICIENT, "
+            f"not short.  The remaining {int(n_keep) - rank_i} were picked "
+            f"by the same deterministic rule (largest frozen residual, ties "
+            f"to the lowest index) and are QUADRATURE points, not certified "
+            f"directions.\n"
+            f"  effect : the zeta back-solve will truncate about "
+            f"{int(n_keep) - rank_i} modes per q.  That is expected of an "
+            f"over-complete interpolation set and is NOT by itself a defect "
+            f"— on the Si anchor deck the 960-point set with ~160 dependent "
+            f"points scores sigTOT MAE 0.644 meV, the best on record, while "
+            f"the rank-clean orbit-mode arm at the same N is 20-56x worse.\n"
+            f"  NOT the fix on this deck: widening the prune window "
+            f"(--prune-n-cond / --prune-window vc_x_vc) changes sigTOT by "
+            f"<2x here and never recovers the orbit-mode loss.  If you want "
+            f"a rank-clean set, LOWER N to {rank_i}.\n"
+            f"  strict : {SELECT_MODE_ENV}=strict restores the 2026-08-07 "
+            f"refusal.")
+        if mode == "strict":
+            raise RuntimeError("pivoted-Cholesky REFUSES ("
+                               + SELECT_MODE_ENV + "=strict):\n" + note)
+        for line in note.splitlines():
+            print("  [pivoted_cholesky] " + line)
 
     # (3) PAD ROWS AND SENTINELS.  HARD GUARD, not a comment: an
     # out-of-range index would silently index past the candidate list (or
@@ -579,6 +676,48 @@ def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
     # the log line are measured against one policy and can be compared.
     ev = np.linalg.eigvalsh(0.5 * (sub + sub.conj().T))
     return int((ev > tol * d0max).sum()), n_pts, ""
+
+
+def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
+                              tol_rel=None, verbose=True):
+    """Say the certification at the granularity of the FILE being written.
+
+    ONE implementation for both modes.  ``rank_selected`` is what the select
+    certified — ORBITS in orbit mode, POINTS in point mode — and ``unit``
+    names which, because a number whose unit is ambiguous is how
+    "18/18 directions certified — PASS" came to be said over a delivered set
+    of 768 points.
+
+    This reports; it never refuses.  A rank-deficient delivered set is a
+    fact about an over-complete interpolation basis and is measured
+    ANTI-correlated with BerkeleyGW agreement on the Si anchor deck — see
+    ``refuse_unless_select_certified`` guard (2b).
+    """
+    pt_rank, n_pts, why = point_granularity_rank(G, keep_mask, tol_rel=tol_rel)
+    if not verbose:
+        return
+    if pt_rank is None:
+        print(f"  [point rank] {rank_selected} {unit} certified, {n_pts} "
+              f"points delivered, independent directions NOT MEASURED — "
+              f"{why}.  That is an absence, not a pass.")
+        return
+    print(f"  [point rank] {rank_selected} {unit} certified, {n_pts} points "
+          f"delivered, {pt_rank} independent directions "
+          f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the points)")
+    if pt_rank < n_pts:
+        print(f"  [point rank] NOTE: {n_pts - pt_rank} of the "
+              f"{n_pts} delivered points add no independent "
+              f"direction at tol*max(diag G).  The zeta "
+              f"back-solve will truncate about that many modes "
+              f"per q; D3 shipped a 7 GiB restart file to learn "
+              f"the same thing downstream.  This is NOT by itself a defect: "
+              f"on the Si anchor deck the 960-point set with ~160 dependent "
+              f"points is the most accurate one measured.")
+    _note = point_rank_closure_note(G, keep_mask, pt_rank, tol_rel=tol_rel)
+    print(f"  [point rank] closure: " + (
+        _note if _note else
+        "the rank cut falls in a gap — no degenerate block is "
+        "sliced at this tolerance."))
 
 
 def point_rank_closure_note(G, keep_mask, rank, *, tol_rel=None):
@@ -871,6 +1010,21 @@ def prune_candidates_by_pivoted_cholesky(
 
     if orbit_id is None:
         keep_idx = np.asarray(cand_idx)[piv_np]
+        # R2 — certify at POINT granularity in POINT MODE TOO.
+        #
+        # It used to run only in orbit mode, on the reasoning that "in point
+        # mode ``rank`` is already the point count and there is nothing to
+        # reconcile".  That reasoning held while a rank-deficient point-mode
+        # select REFUSED — it could not deliver a set whose rank differed
+        # from its size.  Since guard (2b) delivers, the two numbers can now
+        # differ here as well, and the certification statement has to be made
+        # at the granularity of the FILE being written in BOTH modes.  Making
+        # it in only one is what let "18/18 directions certified — PASS" be
+        # said over a delivered set of 768 points.
+        _in_kept = np.zeros(int(M), dtype=bool)
+        _in_kept[piv_np[piv_np >= 0]] = True
+        _report_point_granularity(G, _in_kept, rank_i, unit="points",
+                                  tol_rel=tol_rel, verbose=verbose)
     else:
         # Unfold: kept = union of orbits of picked pivots.
         orbit_id_np = np.asarray(orbit_id)
@@ -910,32 +1064,10 @@ def prune_candidates_by_pivoted_cholesky(
             print(f"[pivoted_cholesky] orbit-aware: {len(piv_used)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
         # R2 — certify at POINT granularity, which is the granularity of the
-        # FILE being written.  Orbit mode only: in point mode ``rank`` is
-        # already the point count and there is nothing to reconcile.
-        pt_rank, n_pts, why = point_granularity_rank(
-            G, in_kept, tol_rel=tol_rel)
-        if verbose:
-            if pt_rank is None:
-                print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
-                      f"independent directions NOT MEASURED — {why}")
-            else:
-                print(f"  [point rank] {rank_i} orbits, {n_pts} points, "
-                      f"{pt_rank} independent directions "
-                      f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the "
-                      f"points)")
-                if pt_rank < n_pts:
-                    print(f"  [point rank] NOTE: {n_pts - pt_rank} of the "
-                          f"{n_pts} delivered points add no independent "
-                          f"direction at tol*max(diag G).  The zeta "
-                          f"back-solve will truncate about that many modes "
-                          f"per q; D3 shipped a 7 GiB restart file to learn "
-                          f"the same thing downstream.")
-                _note = point_rank_closure_note(G, in_kept, pt_rank,
-                                                tol_rel=tol_rel)
-                print(f"  [point rank] closure: " + (
-                    _note if _note else
-                    "the rank cut falls in a gap — no degenerate block is "
-                    "sliced at this tolerance."))
+        # FILE being written.  In ORBIT mode the select's ``rank`` counts
+        # orbits, so it is not comparable to the point count at all.
+        _report_point_granularity(G, in_kept, rank_i, unit="orbits",
+                                  tol_rel=tol_rel, verbose=verbose)
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
@@ -1087,6 +1219,11 @@ def make_sharded_pivoted_cholesky_select(
                 # another one skipped, and no collective goes unmatched.
                 take = global_pv > floor
                 pivot_val = jnp.maximum(global_pv, floor)
+                # THE CONTINUATION — see the reference kernel for the whole
+                # argument.  ``global_pv`` is ``-inf`` exactly when no shard
+                # holds an active candidate, so this bool is a pmax result
+                # too and is identical on every shard.
+                avail = global_pv > minus_inf
 
                 # Column p of G (no collective: G is row-sharded).
                 gcol_slab = G_slab[:, global_p]
@@ -1129,7 +1266,7 @@ def make_sharded_pivoted_cholesky_select(
                 newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
 
                 L = L.at[:, j].set(newcol)
-                piv = piv.at[j].set(jnp.where(take, global_p, jnp.int32(-1)))
+                piv = piv.at[j].set(jnp.where(avail, global_p, jnp.int32(-1)))
                 d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
 
                 # Schur update; the PSD detector reads the residual BEFORE
@@ -1156,7 +1293,7 @@ def make_sharded_pivoted_cholesky_select(
                 else:
                     # ``orbit_id_p`` came back on the FUSED psum above.
                     kill_mask = orbit_id_slab == orbit_id_p
-                kill_mask = kill_mask & take
+                kill_mask = kill_mask & avail
                 active = active & ~kill_mask
                 d = jnp.where(kill_mask, minus_inf,
                               jnp.where(take, d_new, d))

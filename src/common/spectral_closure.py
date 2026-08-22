@@ -190,6 +190,11 @@ docstring, and it is not repeated here.
 
 RELATION TO ``common/rank_criterion``
 -------------------------------------
+The whole policy — this module, ``rank_criterion`` and the band-axis twin
+``band_degeneracy`` — is written down once in
+``docs/dev/rank_truncation_policy.md``; read that for the site register and
+the certified κ ceiling.
+
 That module decides HOW MANY directions to keep and why (a cap on how much
 the pseudo-inverse may amplify round-off); this one decides WHERE that many
 is allowed to land.  They are orthogonal and deliberately not merged: every

@@ -1,5 +1,11 @@
 """Degeneracy-safe BSE band-window selection.
 
+The BAND-axis member of the truncation policy family — its spectral twin is
+``common/spectral_closure`` and the criterion both serve is
+``common/rank_criterion``.  A window rounds OUTWARD and a rank cut rounds
+INWARD, deliberately; ``docs/dev/rank_truncation_policy.md`` §5 states the
+discriminator once.
+
 THE PROBLEM.  ``--n-val N`` / ``--n-cond M`` pick a band window by COUNTING:
 the valence window is ``[n_occ - N, n_occ)`` and the conduction window is
 ``[n_occ, n_occ + M)``.  Counting knows nothing about the spectrum, so a

@@ -563,34 +563,75 @@ def main():
         # b1024 rung: rank 630 against 897 requested, printed in every log for
         # the whole campaign and read by nobody, while Σ_c produced a QP gap
         # of 0.36 eV against a true ~3.2-3.6 eV.  Refuse instead.
+        #
+        # STATE THE SENSITIVITY OF THE PROXY (2026-08-22).  On the b1024 rung
+        # the ROOT CAUSE was a band-window mismatch — the ISDF window was
+        # clamped small and then used large — and rank deficiency was its
+        # SYMPTOM (``docs/dev/isdf_basis_adequacy_at_large_nband.md``: the fix
+        # was re-selecting the SAME NUMBER of centroids against a
+        # representative window).  So this gate is a proxy for a window
+        # mismatch, and it is not sensitive to accuracy in general: measured
+        # on the Si anchor deck, the shipped 960-point set carries ~160
+        # numerically dependent points and scores sigTOT MAE 0.644 meV, the
+        # best BerkeleyGW agreement on record, while the rank-clean orbit-mode
+        # arm at the same N is 20-56x worse.  Rank is not basis quality in
+        # EITHER direction (TASTE rule 12; ladder_rung1_notes R19.1).  The
+        # refusal is kept because the window-mismatch failure it catches costs
+        # electron-volts and is invisible to every other gate — but its text
+        # now says what it is a proxy FOR, and no longer offers advice that is
+        # measured not to work on the deck that hits it.
+        # docs/dev/rank_truncation_policy.md §7.
+        _unit = 'orbits' if orbit_id_arr is not None else 'points'
         _rank_tol = float(os.environ.get("LORRAX_CENTROID_RANK_TOL", "0.01"))
         _rank_floor = int(np.ceil((1.0 - _rank_tol) * n_orbit_keep))
         if int(rank) < _rank_floor:
             raise SystemExit(
                 f"\nFATAL: pivoted-Cholesky rank deficiency — the candidate "
                 f"pool cannot supply the independence you asked for.\n"
-                f"  requested : {n_orbit_keep} "
-                f"{'orbits' if orbit_id_arr is not None else 'points'}\n"
-                f"  achieved  : {rank}   ({100.0 * rank / max(1, n_orbit_keep):.1f}%"
+                f"  requested : {n_orbit_keep} {_unit}\n"
+                f"  achieved  : {rank} {_unit}   "
+                f"({100.0 * rank / max(1, n_orbit_keep):.1f}%"
                 f", floor {_rank_floor} at tol {_rank_tol:g})\n"
                 f"  prune window: left=(0,{_n_val_eff}) right=(0,{_max_band}) "
                 f"[{args.prune_window}]\n"
-                f"The centroids that WOULD have been written are padded with "
-                f"numerically-null directions; an ISDF built on them will\n"
-                f"under-resolve Σ and can be wrong by electron-volts without "
-                f"failing any other gate.  Fix one of:\n"
-                f"  * widen the prune window  — --prune-n-cond <ncond of your "
-                f"deck>  (this is the usual cause; the default is now the\n"
-                f"    full WFN conduction window, so a shortfall here means "
-                f"the window was narrowed explicitly)\n"
-                f"  * use --prune-window vc_x_vc to include c×c pair "
-                f"densities (needed when ncond >> nval)\n"
-                f"  * raise --oversample so the candidate pool is richer, or "
-                f"lower N so you ask for fewer directions\n"
-                f"To override deliberately (NOT recommended for production): "
-                f"LORRAX_CENTROID_RANK_TOL=<fraction>.\n")
-        print(f"  [rank gate] {rank}/{n_orbit_keep} directions certified "
+                f"WHAT THIS GATE IS A PROXY FOR: a prune window that does not "
+                f"cover the pair densities Σ will consume.  That failure is\n"
+                f"worth electron-volts and is invisible to every other gate "
+                f"(b1024: rank 630/897, QP gap 0.36 eV against ~3.2-3.6 eV, "
+                f"root-caused\nto a clamped ISDF band window).  It is NOT a "
+                f"general accuracy statement: a rank-deficient set can be the "
+                f"most accurate one\nmeasured (Si anchor 960 points, ~160 "
+                f"dependent, sigTOT MAE 0.644 meV — the record best).\n"
+                f"Fix, in order of likelihood on a real deck:\n"
+                f"  * check the prune window matches the Σ window — "
+                f"--prune-n-cond <ncond of your deck>.  If you NARROWED it\n"
+                f"    deliberately, this is the gate telling you the cost.  "
+                f"(On the Si anchor deck, widening at fixed orbit setting\n"
+                f"    changes sigTOT by <2x and never recovers the orbit-mode "
+                f"loss, so widening is not always the answer.)\n"
+                f"  * --prune-window vc_x_vc to include c×c pair densities "
+                f"(needed when ncond >> nval)\n"
+                f"  * raise --oversample for a richer pool, or lower N to "
+                f"{rank} {_unit} for a rank-clean set\n"
+                f"  * LORRAX_CENTROID_RANK_TOL=<fraction> to accept a "
+                f"deficient set deliberately — the named override, and the\n"
+                f"    one to use when you have MEASURED that this set is the "
+                f"accurate one.\n")
+        print(f"  [rank gate] {rank}/{n_orbit_keep} {_unit} certified "
               f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
+        if orbit_id_arr is not None:
+            # SAY WHAT THIS PASS DOES NOT CERTIFY.  In orbit mode the select
+            # deflates by one direction per ORBIT while removing all n_sym
+            # members from contention, so this number is not comparable to
+            # the point count of the file about to be written — "42 of 42
+            # directions certified — PASS" was once said over 1908 points
+            # whose ζ back-solve then truncated ~24% of the modes per q.
+            # The delivered-granularity number is the `[point rank]` line
+            # printed by the select above.
+            print(f"  [rank gate] SCOPE: that PASS is stated in ORBITS.  It "
+                  f"certifies nothing about the {n_unique} POINTS this file "
+                  f"will contain — read the [point rank] line above for the "
+                  f"delivered-granularity number.")
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix

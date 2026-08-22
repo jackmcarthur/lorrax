@@ -242,3 +242,189 @@ def test_describe_is_loggable_and_names_every_required_field():
     for token in ("kept", "kappa_eff", "discarded", "margin", "noise-floor"):
         assert token in txt, f"{token!r} missing from the run diagnostic"
     assert not math.isnan(r.kappa_eff)
+
+
+# ---------------------------------------------------------------------------
+# 6. The STRUCTURAL rank ceiling — a Gram route counts null-space round-off
+# ---------------------------------------------------------------------------
+
+def _tall_gram_spectrum(cols=2032, nulls=2, null_level=1e-3):
+    """A spectrum shaped like the measured Na (12288, 2032) failure.
+
+    The Gram route diagonalises ``A Aᴴ`` at the LARGER dimension, so the null
+    space of a tall rank-deficient ``A`` arrives as small POSITIVE
+    eigenvalues.  At ``rtol=1e-8`` and ``null_level=1e-3`` they sit ABOVE the
+    cut, which is exactly how ``rank=2034`` was selected for a matrix that
+    algebraically holds 2032 — and how the capacity line that followed came
+    to print ``rank=2034`` beside ``nspinor*n_mu=2032``.
+    """
+    return [1.0 / (i + 1) for i in range(cols)] + [null_level] * nulls
+
+
+def test_the_ceiling_clamps_a_rank_that_counts_nullspace_roundoff():
+    s = _tall_gram_spectrum()
+    unclamped = rc.select_rank(s, 1e-8)
+    assert unclamped == 2034, (
+        f"the fixture no longer reproduces the measured overshoot "
+        f"({unclamped}); it must select MORE than the 2032 columns or this "
+        f"cell tests nothing")
+    assert rc.select_rank(s, 1e-8, ceiling=2032) == 2032
+
+
+def test_a_carried_rank_above_the_ceiling_is_a_violation():
+    """The gate, and it has to be reachable — the pre-fix call site's shape."""
+    s = _tall_gram_spectrum()
+    bad = rc.rank_report(s, 1e-8, rank_ceiling=2032,
+                         rank_used=rc.select_rank(s, 1e-8))
+    assert any("algebraically hold at most" in m for m in bad.violations()), \
+        bad.violations()
+
+
+def test_the_ceiling_violation_closes_when_the_call_site_clamps():
+    """CONTROL: the same input, clamped the way the call site now does."""
+    s = _tall_gram_spectrum()
+    ok = rc.rank_report(s, 1e-8, rank_ceiling=2032,
+                        rank_used=rc.select_rank(s, 1e-8, ceiling=2032))
+    assert not ok.violations(), ok.violations()
+    assert ok.rank_unclamped == 2034 and ok.rank_criterion == 2032
+    assert "CLAMPED the criterion from 2034" in ok.describe()
+
+
+def test_no_ceiling_is_reported_as_an_absence_not_a_pass():
+    r = rc.rank_report(_smooth(), 1e-8)
+    assert r.rank_ceiling is None
+    assert "none supplied" in r.describe()
+
+
+# ---------------------------------------------------------------------------
+# 7. THE GATE — certified amplification, and what it refuses to gate on
+# ---------------------------------------------------------------------------
+
+def _bound_cut(kappa):
+    """A spectrum whose criterion BINDS at exactly ``kappa`` achieved."""
+    # top = 1.0, retained tail at 1/kappa, then a decade of true nulls that
+    # the cut discards, so ``n_dropped_criterion > 0``.
+    return [1.0, 1.0 / kappa] + [1.0 / (kappa * 1e6)] * 8
+
+
+def test_certify_refuses_a_bound_cut_above_the_certified_ceiling():
+    r = rc.rank_report(_bound_cut(1e10), 1e-12,
+                       kappa_certified=rc.KAPPA_CERTIFIED_GRAM,
+                       quantity="eigenvalues")
+    assert r.n_dropped_criterion > 0
+    with pytest.raises(rc.RankPolicyError, match="CERTIFIED ceiling"):
+        rc.certify(r, site="unit fixture")
+
+
+def test_certify_passes_inside_the_certified_regime():
+    """CONTROL — the same shape, two decades below the ceiling."""
+    r = rc.rank_report(_bound_cut(1e6), 1e-12,
+                       kappa_certified=rc.KAPPA_CERTIFIED_GRAM,
+                       quantity="eigenvalues")
+    assert r.n_dropped_criterion > 0
+    assert rc.certify(r, site="unit fixture") == []
+
+
+def test_certify_does_not_fire_when_the_cut_BOUND_NOTHING():
+    """The clause that keeps the Si 960 anchor set reachable.
+
+    Nothing discarded means the criterion made no choice — the spectrum
+    ended on its own — so a refusal would be refusing the INPUT, not the
+    policy.  That is the anchor set's case at production settings (768 of
+    768 retained), and it carries the best BerkeleyGW agreement on record.
+    """
+    s = [1.0] + [1e-11] * 9          # kappa_eff = 1e11, far above 1e8 ...
+    r = rc.rank_report(s, 1e-13, kappa_certified=rc.KAPPA_CERTIFIED_GRAM)
+    assert r.n_dropped_criterion == 0, "the fixture must not truncate"
+    assert r.kappa_eff > rc.KAPPA_CERTIFIED_GRAM
+    assert rc.certify(r, site="unit fixture") == []
+
+
+def test_certify_says_an_uncertified_site_is_an_absence_not_a_pass():
+    r = rc.rank_report(_bound_cut(1e14), 1e-16, kappa_certified=None)
+    assert rc.certify(r, site="transverse") == []
+    assert "NONE for this site" in r.describe()
+
+
+def test_the_gate_modes_are_refuse_warn_off_and_a_typo_refuses():
+    r = rc.rank_report(_bound_cut(1e10), 1e-12,
+                       kappa_certified=rc.KAPPA_CERTIFIED_GRAM)
+    lines = []
+    assert rc.certify(r, site="s", mode="warn", log=lines.append)
+    assert any("rank-policy" in ln for ln in lines), lines
+    assert rc.certify(r, site="s", mode="off") != []      # returned, not acted
+    with pytest.raises(ValueError, match=rc.POLICY_MODE_ENV):
+        rc.resolve_policy_mode("warnn")
+    assert rc.resolve_policy_mode(None) == rc.DEFAULT_POLICY_MODE == "refuse"
+
+
+def test_discarded_weight_is_the_accuracy_statement_not_the_rank():
+    """A third of the RANK discarded, essentially none of the WEIGHT.
+
+    This is why drop fraction is refuted as a gate and this number is not:
+    MoS2 production discards 33 % of the rank at the certified rcond and is
+    correct, so any gate on the fraction fires on a good run.
+    """
+    s = [1.0 / (i + 1) for i in range(600)] + [1e-12] * 300
+    r = rc.rank_report(s, 1e-8, kappa_certified=rc.KAPPA_CERTIFIED_GRAM)
+    frac_rank = r.n_dropped_criterion / r.n_total
+    assert frac_rank > 0.3, frac_rank
+    assert r.discarded_weight < 1e-9, r.discarded_weight
+    assert rc.certify(r, site="unit fixture") == []
+
+
+def test_discarded_weight_can_fire(monkeypatch):
+    """CONTROL: a cut that DOES eat the operator's weight is caught."""
+    s = [1.0, 0.9, 0.8, 0.7]
+    r = rc.rank_report(s, 0.95, kappa_certified=None)   # keeps only 1.0
+    assert r.n_dropped_criterion == 3, r.n_dropped_criterion
+    assert r.discarded_weight > rc.DISCARDED_WEIGHT_MAX
+    with pytest.raises(rc.RankPolicyError, match="tr|operator"):
+        rc.certify(r, site="unit fixture")
+
+
+# ---------------------------------------------------------------------------
+# 8. Scale-aware probe independence — no absolute floors
+# ---------------------------------------------------------------------------
+
+def test_probe_independence_is_scale_free():
+    """The same GEOMETRY at three magnitudes must give the same verdict.
+
+    An absolute floor cannot do this, and that is the whole defect: a probe's
+    coefficient vector scales like |psi| at one sample point, which falls
+    like 1/sqrt(N_mu), so an absolute 1e-6 turns into a system-size-dependent
+    refusal.  Measured on a valid fully relativistic LiF WFN, it discarded
+    every Kramers probe of a TRIM block.
+    """
+    for scale in (1.0, 1e-4, 1e-12):
+        assert rc.probe_is_independent(0.5 * scale, 1.0 * scale, 1.0 * scale)
+        assert not rc.probe_is_independent(
+            1e-14 * scale, 1.0 * scale, 1.0 * scale)
+    # The old absolute floor's verdict on the middle case, for contrast:
+    assert 0.5 * 1e-12 < 1e-6, "the fixture no longer exhibits the defect"
+
+
+def test_probe_independence_uses_the_family_scale():
+    """A negligible probe cannot pass on its own relative test alone."""
+    assert not rc.probe_is_independent(1e-30, 1.1e-30, 1.0)
+    assert rc.probe_is_independent(1e-30, 1.1e-30, 0.0)   # no family scale
+    assert not rc.probe_is_independent(float("nan"), 1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Deferred refusal for cuts inside a jit
+# ---------------------------------------------------------------------------
+
+def test_pending_findings_refuse_at_the_host_seam_and_always_clear():
+    rc.raise_if_pending(mode="off")                    # clear residue
+    rc.note_device_finding("zeta rank_truncate", "kappa 9.7e9 vs 1e8")
+    assert rc.pending()
+    with pytest.raises(rc.RankPolicyError, match="certified regime"):
+        rc.raise_if_pending("the zeta fit", mode="refuse")
+    assert rc.pending() == [], (
+        "raise_if_pending must always clear — a later stage inheriting an "
+        "earlier stage's finding would refuse the wrong run")
+    lines = []
+    rc.note_device_finding("zeta rank_truncate", "again")
+    rc.raise_if_pending("the zeta fit", mode="warn", log=lines.append)
+    assert lines and rc.pending() == []

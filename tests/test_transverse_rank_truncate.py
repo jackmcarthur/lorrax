@@ -232,8 +232,25 @@ def _worker_gauge() -> int:
     # solve_zeta DONATES its RHS (the reshard's donate_argnums), so each
     # call gets a fresh device array — reusing one trips the deleted-
     # array guard (caught by job 7885328).
-    LU, piv = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
-                         solver_kind='lu')
+    # THE RIDGE ARM IS DELIBERATELY ILL-CONDITIONED — that is the fixture's
+    # whole point (a TRS-paired near-null current mode), so the 2026-08-22
+    # conditioning gate on the ridge path fires here: measured kappa_lb =
+    # 1.605e+12 from |diag U| at q=1, just above the 1e12 ceiling the
+    # register's bispinor row puts the harm at.  The gate is RIGHT and this
+    # comparison still needs the ridge factor, so the arm takes the NAMED
+    # override rather than the ceiling being loosened to fit a fixture.
+    # docs/dev/rank_truncation_policy.md section 4.
+    from common import rank_criterion as _rc
+    _prev_policy = os.environ.get(_rc.POLICY_MODE_ENV)
+    os.environ[_rc.POLICY_MODE_ENV] = "warn"
+    try:
+        LU, piv = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
+                             solver_kind='lu')
+    finally:
+        if _prev_policy is None:
+            os.environ.pop(_rc.POLICY_MODE_ENV, None)
+        else:
+            os.environ[_rc.POLICY_MODE_ENV] = _prev_policy
     Cp, _ = factor_c_q(C_dev, mesh, vertex_mu_L=1, n_rmu_logical=n_log,
                        solver_kind='transverse_rank_truncate',
                        transverse_zeta_rcond=tau)

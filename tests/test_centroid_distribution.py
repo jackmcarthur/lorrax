@@ -153,20 +153,33 @@ def _floor_of(G):
     return float(np.sqrt(np.finfo(np.float64).eps)) * _maxdiag(G)
 
 
-def test_select_stops_at_the_rank_floor_instead_of_diverging():
-    """Past the numerical rank: finite L, -1 sentinels, and a refusal.
+def test_select_delivers_past_the_rank_floor_without_diverging(capsys,
+                                                               monkeypatch):
+    """Past the numerical rank: finite L, DISTINCT delivered pivots, a note.
 
-    BEFORE (measured on this box, Gram of true rank 10 with k_keep=40):
-    ``pivot_val`` clamped to ``eps`` so ``denom = sqrt(eps) ~ 1.5e-8`` and
-    the column norms went 3.2e-07, ..., 5.2e+04, 2.2e+16, 1.1e+39, 1.4e+85,
-    inf, inf, nan — first non-finite column j=22, twelve iterations past the
-    true rank.  ``argmax`` over NaN then returned the first unpicked indices
-    IN ARRAY ORDER (``0 1 3 4 5 7 8 9 10 11 13 ...``), which are real
-    candidate indices, so nothing refused and ``trR_over_trG`` going NaN was
-    the only visible trace.
+    BEFORE THE CLAMP (measured on this box, Gram of true rank 10 with
+    k_keep=40): ``pivot_val`` clamped to ``eps`` so ``denom = sqrt(eps) ~
+    1.5e-8`` and the column norms went 3.2e-07, ..., 5.2e+04, 2.2e+16,
+    1.1e+39, 1.4e+85, inf, inf, nan — first non-finite column j=22, twelve
+    iterations past the true rank.  ``argmax`` over NaN then returned the
+    first unpicked indices IN ARRAY ORDER, which are real candidate indices,
+    so nothing refused and ``trR_over_trG`` going NaN was the only trace.
+
+    THE 2026-08-22 CHANGE, and why it is safe.  The clamp above is what
+    removed that blow-up, and it landed together with a refusal that is no
+    longer needed for arithmetic safety.  The select now CONTINUES past the
+    numerical rank by the same deterministic rule (largest frozen residual,
+    ties to the lowest index), delivers ``k_keep`` distinct real candidates,
+    and reports the certified rank instead of refusing on it — because rank
+    is measured ANTI-correlated with BerkeleyGW agreement on the Si anchor
+    deck, where the old refusal blocked the most accurate set on record.
+    ``-1`` now means ONLY "the pool ran out" (see the orbit-exhaustion cell,
+    whose refusal is unchanged), and the refusal is kept verbatim behind
+    ``LORRAX_CENTROID_SELECT=strict``.
     """
     from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                               refuse_unless_select_certified)
+                                               refuse_unless_select_certified,
+                                               SELECT_MODE_ENV)
 
     M, k_keep, true_rank = 64, 40, 10
     G = _psd_gram(M, rank=true_rank, seed=1)
@@ -180,26 +193,89 @@ def test_select_stops_at_the_rank_floor_instead_of_diverging():
         "L went non-finite: the divisor clamp is not holding the recurrence")
     assert np.all(np.isfinite(np.asarray(trR))), "trR_over_trG went non-finite"
     piv_np = np.asarray(piv)
-    assert np.all(piv_np[true_rank:] == -1), (
-        f"pivots past the rank are {piv_np[true_rank:][:8]}, not the -1 "
-        f"sentinel — the old index-ordered NaN pivots are back")
-    assert len(np.unique(piv_np[:true_rank])) == true_rank
+    # DELIVERED, not sentinel-filled — and every delivered pivot is a real,
+    # distinct candidate.  The old index-ordered NaN pivots would repeat.
+    assert np.all(piv_np >= 0), (
+        f"pivots past the rank are {piv_np[true_rank:][:8]} — the pool had "
+        f"{M} candidates and {k_keep} were asked for, so none should be the "
+        f"-1 exhaustion sentinel")
+    assert len(np.unique(piv_np)) == k_keep, (
+        "a candidate was delivered twice — the continuation is not marking "
+        "picked candidates inactive")
+    assert piv_np.max() < M, "a pivot escaped the candidate range"
+    # L's columns past the rank are EXACTLY zero: that is what makes
+    # continuing safe rather than a re-run of the 2026-08-07 blow-up.
+    assert np.all(np.asarray(L)[:, true_rank:] == 0), (
+        "L has non-zero columns past the certified rank — the `take` guard "
+        "is not zeroing the un-taken columns")
 
-    # THE REFUSAL, and it names the rank-deficiency cause rather than the
-    # exhaustion one: 64 points were available, only 10 were independent.
+    # DEFAULT: reports, does not refuse, and the note names both numbers.
+    monkeypatch.delenv(SELECT_MODE_ENV, raising=False)
+    refuse_unless_select_certified(
+        piv, int(rank), psd, n_keep=k_keep, M=M, orbit_id=None,
+        d0max=float(np.real(np.asarray(jnp.diag(G))).max()))
+    out = capsys.readouterr().out
+    assert "RANK-DEFICIENT" in out and f"DELIVERED {k_keep}" in out, (
+        f"the degrade note did not name the delivered count and the cause:\n"
+        f"{out}")
+
+    # STRICT: the 2026-08-07 refusal, verbatim, behind its named dial.
+    monkeypatch.setenv(SELECT_MODE_ENV, "strict")
     with pytest.raises(RuntimeError, match="RANK-DEFICIENT"):
         refuse_unless_select_certified(
             piv, int(rank), psd, n_keep=k_keep, M=M, orbit_id=None,
             d0max=float(np.real(np.asarray(jnp.diag(G))).max()))
+    # A mis-spelled mode is not silently the default.
+    monkeypatch.setenv(SELECT_MODE_ENV, "delivr")
+    with pytest.raises(ValueError, match=SELECT_MODE_ENV):
+        refuse_unless_select_certified(
+            piv, int(rank), psd, n_keep=k_keep, M=M, orbit_id=None,
+            d0max=float(np.real(np.asarray(jnp.diag(G))).max()))
+    monkeypatch.delenv(SELECT_MODE_ENV, raising=False)
 
-    # CONSTRUCTIBLE-FALSE TWIN: the same call on a full-rank Gram must
-    # return, or the refusal above proves only that the function raises.
+    # CONSTRUCTIBLE-FALSE TWIN: on a full-rank Gram nothing is reported at
+    # all, or the note above proves only that the function prints.
     Gok = _psd_gram(M, rank=M, seed=1)
     p2, _, r2, _, _, _, psd2 = pivoted_cholesky_select(Gok, k_keep)
     assert int(r2) == k_keep
+    capsys.readouterr()
     refuse_unless_select_certified(
         p2, int(r2), psd2, n_keep=k_keep, M=M, orbit_id=None,
         d0max=float(np.real(np.asarray(jnp.diag(Gok))).max()))
+    assert "RANK-DEFICIENT" not in capsys.readouterr().out, (
+        "a full-rank select produced the rank-deficiency note")
+
+
+def test_full_rank_select_is_bit_identical_across_the_continuation():
+    """The continuation may not touch a healthy select.
+
+    The change at 2026-08-22 only alters what happens PAST the numerical
+    rank.  On a pool with rank >= k_keep every iteration has ``take`` true,
+    so ``avail`` and ``take`` coincide and the emitted pivots, factor and
+    residuals must be exactly what they were.  This cell is the guard that
+    the continuation did not leak into the healthy path — a change that is
+    "obviously local" is the one worth measuring.
+    """
+    from src.centroid.pivoted_cholesky import pivoted_cholesky_select
+
+    M, k_keep = 48, 20
+    G = _psd_gram(M, rank=M, seed=5)
+    piv, L, rank, d_final, d_taken, trR, psd = pivoted_cholesky_select(
+        G, k_keep)
+    assert int(rank) == k_keep
+    # Every pivot taken, so d_taken is strictly above the floor and the
+    # certified rank equals the delivered count — the healthy contract.
+    assert np.all(np.asarray(d_taken) > _floor_of(G))
+    assert len(np.unique(np.asarray(piv))) == k_keep
+    # Reference identity: L[:, :k] L[:, :k]^H reproduces the leading rank-k
+    # pivoted Cholesky of G, so the arithmetic is unchanged, not merely the
+    # shapes.
+    Ln = np.asarray(L)
+    resid = np.asarray(G) - Ln @ Ln.conj().T
+    dr = np.real(np.diag(resid))
+    assert float(dr.max()) <= float(np.real(np.diag(np.asarray(G))).max()), (
+        "the Schur residual grew: the update is not the pivoted Cholesky "
+        "recurrence any more")
 
 
 def test_select_refuses_when_the_orbits_run_out():
@@ -376,11 +452,18 @@ def test_select_refuses_a_pivot_outside_the_candidate_range():
 
     refuse_unless_select_certified(ok, 4, (0.0, -1, -1), **kw)   # twin
 
-    for label, piv in (("pad row", np.array([0, 1, 2, 61], dtype=np.int32)),
-                       ("sentinel", np.array([0, 1, 2, -1], dtype=np.int32))):
-        with pytest.raises(RuntimeError, match="outside the candidate range"):
-            refuse_unless_select_certified(piv, 4, (0.0, -1, -1),
-                                           **kw), label
+    # A PAD ROW is owned by this guard: it is a real-looking index that is
+    # out of range, and nothing else would notice it.
+    with pytest.raises(RuntimeError, match="outside the candidate range"):
+        refuse_unless_select_certified(
+            np.array([0, 1, 2, 61], dtype=np.int32), 4, (0.0, -1, -1), **kw)
+    # A -1 SENTINEL is owned by guard (2) since 2026-08-22, because -1 now
+    # means exactly one thing — the select ran out of active candidates —
+    # and the delivered-count check reaches it first.  It is still refused,
+    # and refused for the right reason; only the message moved.
+    with pytest.raises(RuntimeError, match="nothing left to pick"):
+        refuse_unless_select_certified(
+            np.array([0, 1, 2, -1], dtype=np.int32), 4, (0.0, -1, -1), **kw)
 
 
 # ─────────────────────────────────────────────────────────────────────────

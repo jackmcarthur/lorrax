@@ -84,6 +84,7 @@ one sentence and a link.
 | **what the machine provides, and what breaks when a layer is missing** | [Environment overview](environment/overview.md) · [Frontera](environment/machines/frontera.md) · [Perlmutter](environment/machines/perlmutter.md) | the layered dependency tree, the shared JAX configuration, the three CUDA allocators, and the per-machine facts. |
 | **why CPU collectives run on `impl=mpi`** | [Collective transports](environment/transports.md) · [`docs/dev/mpi_collectives.md`](dev/mpi_collectives.md) | the gloo corruption evidence and the MPIwrapper recipe. |
 | **how to judge whether a claim or a check is any good** | [`docs/dev/QUALITY_PATTERNS.md`](dev/QUALITY_PATTERNS.md) | the ten failure classes and the assessment rubric. Cited by number (`#8`) from other pages. |
+| **when a rank/spectrum may be truncated, and what refuses if it may not** | [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) | the one criterion (`common/rank_criterion`), the degeneracy closure (`common/spectral_closure`) and its band-axis twin (`common/band_degeneracy`); the certified κ ceiling and its measurements; **what is refuted as a gate and must not be re-proposed**; the site register with each site's certification status; and the two dials. |
 
 > **No page here can tell you what a run resolved.** Several of these knobs
 > interact, and two of them (`XLA_PYTHON_CLIENT_ALLOCATOR`,
