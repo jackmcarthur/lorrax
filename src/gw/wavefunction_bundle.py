@@ -343,6 +343,40 @@ class Wavefunctions:
         self._require_legacy('yn')
         return self.psi_yn[:, :, :, bands]
 
+    @functools.partial(jax.jit, static_argnames=('bands',))
+    def band_mask(self, bands: slice) -> jax.Array:
+        """Boolean ``(nk, nb_full)`` band-identity mask, True inside
+        ``bands`` — the face-layout bring-up path for band windows
+        (report §3, obstacle 3).  ``psi_nmu``/``psi_mun`` span the FULL
+        loaded [b0,b4) range and cannot legally be sliced to an arbitrary
+        logical window (the band axis is mesh-sharded on one face or the
+        other, and a window need not be mesh-divisible).  A window is
+        instead expressed as a WEIGHT that is exactly zero outside it —
+        this mask is that weight's boolean form, meant for
+        ``greens_function_kernel.build_G_tau``'s ``mask=`` under
+        ``layout='face'`` (the SAME parameter legacy Σ already uses for
+        its own band-identity selector, ``mask_A``).
+
+        COST, named rather than hidden: every masked face call pays the
+        FULL nb_full GEMM, not the windowed one — the bring-up path
+        "repeats full-band GEMM work for val/cond and for every Sigma
+        bracket" (report §3's own words).  A future canonical distributed
+        ``pack_band_window`` would remove this; it does not exist yet.
+
+        Legal under EITHER layout (only ``self.enk``'s shape is read),
+        but only a face caller needs it — a legacy accessor already
+        returns the exact physical slice and has no residual bands to
+        zero.  Zero-weighted bands are NOT automatically safe for an
+        eigensolve or an occupation sum fed by this mask's caller; this
+        helper only guarantees the G/Σ *contraction* ignores them.
+        """
+        nb_full = int(self.enk.shape[1])
+        lo = int(bands.start or 0)
+        hi = int(bands.stop if bands.stop is not None else nb_full)
+        idx = jnp.arange(nb_full)
+        row = (idx >= lo) & (idx < hi)
+        return jnp.broadcast_to(row[None, :], self.enk.shape)
+
 
 # Register as JAX pytree so Wavefunctions can be passed to @jax.jit functions.
 # Array fields are traced; slices/layout (static metadata) are compile-time
@@ -886,11 +920,46 @@ def rotate_wavefunctions(
 # the AOT memory model) operate at the bundle's seam.
 # ---------------------------------------------------------------------------
 
-def project(psi_xr, psi_yn, sigma_k):
-    """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis."""
-    left = jnp.einsum('kmsx,ksxty->kmty',
-                      jnp.conj(psi_xr), sigma_k, optimize=True)
-    return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
+           face_shape=None, face_project_fn=None):
+    """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis.
+
+    ``layout='legacy'`` (default): the exact body this function has always
+    had — ``psi_xr``/``psi_yn`` are the legacy bundle fields.  UNCHANGED
+    by this parameter's addition (dead code eliminated at trace time for
+    every existing caller, none of which pass ``layout``).
+
+    ``layout='face'``: this is the "older COHSEX facade" the audit report
+    names (§5) — it now ROUTES rather than re-implements, through
+    ``common.contract_bands.contract_bands_block_reshard(layout='face')``,
+    the single owner of both the legacy and face band projection.
+    ``psi_xr``/``psi_yn`` are then actually ``psi_nmu``/``psi_mun`` (same
+    two argument SLOTS, same meaning across layouts: first operand
+    conjugated inside, second used as-is — see that module's docstring).
+    Pass a pre-built ``face_project_fn`` (from the SAME factory call, e.g.
+    built once inside a kernel factory alongside ``_Gv_fftn`` et al.) to
+    avoid rebuilding — and re-warming — two ``distrib_la.gemm_plan``s on
+    every call; ``mesh_xy``/``face_shape`` are the fallback that builds
+    one inline (correct but wasteful if called repeatedly).
+    """
+    if layout == 'legacy':
+        left = jnp.einsum('kmsx,ksxty->kmty',
+                          jnp.conj(psi_xr), sigma_k, optimize=True)
+        return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+    if layout != 'face':
+        raise ValueError(
+            f"project: layout must be 'legacy' or 'face', got {layout!r}")
+    fn = face_project_fn
+    if fn is None:
+        if mesh_xy is None or face_shape is None:
+            raise ValueError(
+                "project(layout='face') requires either face_project_fn=, "
+                "or both mesh_xy= and face_shape= to build one inline "
+                "(see common.contract_bands.contract_bands_block_reshard)")
+        from common.contract_bands import contract_bands_block_reshard
+        fn = contract_bands_block_reshard(
+            mesh_xy, layout='face', face_shape=face_shape)
+    return fn(psi_xr, sigma_k, psi_yn)
 
 
 def project_ri(psi_xr, psi_yn, sigma_k):
