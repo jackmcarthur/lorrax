@@ -515,23 +515,68 @@ def test_no_driver_composes_q_with_minus_q_on_its_own():
     unconditional composition.  The site this was written for is the three
     charge-channel unfolds, which each spelled the same two calls.
     """
-    offenders = []
+    offenders, scanned, matched = [], 0, []
     for rel, path in _src_modules():
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
+        scanned += 1
         if not any(n in src for n in _POLICY_NAMES):
             continue
+        matched.append(rel)
         if rel == _ADAPTER:
             continue
         names = _names_used(ast.parse(src, filename=path))
         if names & _POLICY_NAMES:
             offenders.append(rel)
+    # COVERAGE, ASSERTED.  Without these two lines a ratchet that walked an
+    # empty tree, or whose ``_SRC`` had moved, reads EXACTLY like one that
+    # examined every module and found nothing -- ``TASTE.md`` rule 18's
+    # corollary, and the shape that let ``test_env_registry`` scan 121 read
+    # sites and report nothing at 9/9 green.  So the scan must have seen a
+    # real tree, and it must have MATCHED the one module that does name the
+    # constructor: that is the detector working on production source rather
+    # than on a fixture.
+    assert scanned > 100, (
+        f"the ratchet examined only {scanned} modules under {_SRC} -- it is "
+        f"not looking at the tree it claims to gate")
+    assert _ADAPTER in matched, (
+        f"the ratchet matched {matched} and NOT {_ADAPTER}, which is the one "
+        f"module that must name ``build_qgrid_trs_policy``.  Either the "
+        f"adapter stopped being the door or the name matching is broken; "
+        f"either way a zero-offender result here means nothing.")
     assert not offenders, (
         f"{offenders} take a q-axis time-reversal decision without going "
         f"through ``gw.qgrid_symmetry.qgrid_trs_policy_for``, which is the "
         f"only place the MEASURED verdict (``SymMaps.trs_allowed``) is "
         f"read.  A site that composes q with -q itself is a site that will "
         f"do it on a ferromagnet again.")
+
+
+def test_the_ratchet_fires_on_the_real_adapter_when_the_exemption_is_lifted():
+    """The negative control, AIMED AT PRODUCTION SOURCE.
+
+    ``TASTE.md`` rule 18: a control that only ever sees a synthetic fixture
+    tests the function, not the gate.  The 2026-08-06 env-registry failure
+    had exactly one negative control and it was pointed at a made-up
+    string, so nothing ever watched the real page while ``covered()``
+    returned True for every name.
+
+    So this runs the ratchet's own detector -- ``_names_used`` over the
+    real ``gw/qgrid_symmetry.py`` -- with the exemption removed, and
+    requires it to flag the file.  If that fails, the detector cannot see
+    a policy call in a real module and every green run of the cell above
+    is vacuous.  It also pins WHICH name is found: the adapter is allowed
+    the constructor and must not name the two arms.
+    """
+    path = os.path.join(_SRC, _ADAPTER)
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    found = _names_used(ast.parse(src, filename=path)) & _POLICY_NAMES
+    assert found == {"build_qgrid_trs_policy"}, (
+        f"the detector found {sorted(found)} in the adapter; it must find "
+        f"exactly the constructor.  Finding NOTHING means the ratchet "
+        f"cannot fire on any real module; finding an ARM means the adapter "
+        f"has started calling the arms directly, which is the door leaking.")
 
 
 def test_the_adapter_reads_the_measured_verdict_and_nothing_else():
