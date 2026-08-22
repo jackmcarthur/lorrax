@@ -10,8 +10,10 @@ the ``Wavefunctions.layout`` tag; see ``reports/gwjax_low_mem_bands_audit_
 ``layout='legacy'`` (default) — psi_xn is direct (μ side), psi_yr is
 conjugated (ν side).  This matches the tested COHSEX convention
 throughout gw_jax.py and is BYTE-IDENTICAL to the code this module
-shipped before ``low_mem_bands`` existed: every legacy branch below is
-the original body, unmoved and untouched.
+shipped before ``low_mem_bands`` existed: :func:`_legacy_build_G` is the
+original ``build_G`` body verbatim, moved (not edited) into its own
+function so :func:`build_G` could gain a layout dispatch without
+touching it.
 
 ``layout='face'`` — the two-face carrier's ``psi_mun``/``psi_nmu``
 (``gw.wavefunction_bundle``, both un-conjugated, both full [b0,b4) band
