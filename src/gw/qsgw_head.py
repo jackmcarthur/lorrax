@@ -15,6 +15,60 @@ When current centroid wavefunctions are supplied it also builds the two
 q-linear head/body wings.  The wings stay centroid-sharded; only the final
 ``(n_omega, 3, 3)`` Schur-reduced tensor is replicated.
 
+Frequency streaming and the head-finalize lifetime boundary
+-------------------------------------------------------------
+``_s_tensor_kernel`` (feeding ``S_direct``) and ``_head_wing_kernel``
+(feeding ``Y_x``/``Z_y``) both hold a per-omega ``(nk, nx_local, ny_local)``
+band-pair temporary while contracting velocities into the tiny head/wing
+output.  The wing kernel has always bounded this at
+``_HEAD_WING_FREQUENCY_BLOCK`` frequencies per ring step; the S-tensor
+kernel did not -- it ran ``jax.vmap(_one)(omegas)`` over the FULL omega
+axis, an unbounded twin of the fold's one-device temporary commit
+d2d6d521 already fixed (same "XLA selects a full-matrix temporary even
+though the public result is tiny" failure mode, on the omega axis instead
+of the centroid one).  Fixed 2026-08-22
+(fix/head-fold-streamed-2026-08-22): ``_s_tensor_kernel`` now streams
+omega in the same block size via ``lax.scan``, so its compiled peak is
+flat past one block regardless of how many frequencies a caller (a
+GN-N-pole fit, a dense MPA walk) asks for -- verified by
+``tests/test_mpa_dynamic_head.py::
+test_s_tensor_kernel_temp_size_is_bounded_past_one_frequency_block``.
+
+``qsgw_head.py`` also had zero ``block_until_ready`` calls anywhere,
+unlike ``screening.py``'s per-stage sync discipline (chi.exec, W.exec,
+...).  Every array this module builds therefore stayed queued and
+unattributed on the device stream until the FIRST host readback anywhere
+downstream -- historically ``head_samples_from_s``'s
+``np.asarray(S_cart_omega)``, which is why an OOM whose true buffer lived
+anywhere upstream of it (in this module or earlier) always surfaced at
+that one line with no attribution.  ``build_dft_head_response`` and
+``finalize_iteration_head_samples`` now each end their own stage on an
+explicit ``jax.block_until_ready`` plus a
+``gw.isdf_fitting.mem_probe(...)`` call (env-gated on
+``LORRAX_MEM_DEBUG=1``, the SAME probe ``isdf_fitting``/``gw_init`` already
+use for the zeta-fit/V_q HBM lifecycle -- single source of truth, not a
+second memory-diagnostic helper).  This is a pure scheduling change: it
+does not alter any value, only when the allocator is charged for it and
+where a failure is reported from.
+
+Measured 2026-08-22 (see
+``runs/MoS2/86_bgw_lorrax_scaling_20260819/points/k9_c600_integ/lorrax/
+attempts/headfold_hlo_probe_20260822/``): at the production MoS2 9x9x1
+GN-PPM shape (nk=81, nb_logical=626, n_rmu=5288, n_omega=2, REAL 16-process
+4x4 A100 mesh -- matching the failing run exactly), the compiled peak of
+``_s_tensor_kernel`` + ``_head_wing_kernel`` + ``fold_cartesian_head_wings_
+sharded`` together is ~6 GiB, far short of the 87.77 GB
+(``bfc_allocator.cc`` "trying to allocate 81.74GiB") single-buffer request
+the production run hit at this same seam.  That request also exceeds the
+63.82 GB XLA pool this run reported at startup, so it cannot be explained
+by crowding from other live state either -- ONE buffer here is genuinely
+too large.  The three kernels audited above are RULED OUT as that buffer's
+source by this measurement; it was not isolated further within this
+session's scope.  The lifetime-boundary syncs and mem_probe calls above
+give the next production attempt (or the next agent) an attributable,
+measured live-array snapshot at each stage instead of the single
+unattributed sync point this module had before.
+
 Units and coordinates
 ---------------------
 Hamiltonians and frequencies are Ry.  ``bvec_cart`` has reciprocal lattice
@@ -941,7 +995,34 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             )
             return jax.lax.psum(local, (ax_x, ax_y))
 
-        return jax.vmap(_one)(omegas)
+        # Bounded frequency-by-band-pair temporary (mirrors
+        # ``_head_wing_kernel``'s ``_HEAD_WING_FREQUENCY_BLOCK`` ring: see
+        # the comment at its definition, which names the wing kernel as
+        # bounding "the ONLY" such temporary -- this one was the omitted
+        # twin).  ``jax.vmap(_one)(omegas)`` batches ``dE``/``weight``
+        # (shape ``(n_omega, nk, nx, ny)``) across the FULL omega axis at
+        # once; on XLA:GPU this is materialised as a standalone buffer
+        # before the reducing einsum, exactly the "global einsum lets XLA
+        # select a full-matrix temporary even though the public result is
+        # 3x3" failure mode commit d2d6d521 fixed for the Schur fold.
+        # Chunking the batch to a fixed block bounds that temporary at
+        # ``block`` frequencies regardless of how many omegas a future
+        # caller (an N-pole GN-PPM fit, a dense MPA frequency walk) asks
+        # for; today's GN-PPM/HL-PPM two-role case pads to one block and
+        # costs nothing extra.
+        n_omega = omegas.shape[0]
+        block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
+        n_padded = ((int(n_omega) + block - 1) // block) * block
+        pad = n_padded - int(n_omega)
+        omega_blocks = jnp.pad(
+            omegas, (0, pad), constant_values=jnp.asarray(1.0j, dtype=omegas.dtype)
+        ).reshape(-1, block)
+
+        def _block(_carry, omega_block):
+            return _carry, jax.vmap(_one)(omega_block)
+
+        _, out_blocks = jax.lax.scan(_block, None, omega_blocks, unroll=1)
+        return out_blocks.reshape(n_padded, 3, 3)[:n_omega]
 
     sm = shard_map(
         _local,
@@ -1763,6 +1844,22 @@ def finalize_iteration_head_samples(
                     from exc
             W_gamma.append(W_role[0])
         W_gamma = jnp.stack(W_gamma, axis=0)
+        # Hard lifetime boundary (KNOWN_LORRAX_ISSUES.md "the bounded full-
+        # head fold still needs a fresh-fit lifetime boundary"): force this
+        # tiny (n_omega, mu_X, mu_Y) Gamma extraction eagerly, INSTEAD of
+        # letting it stay queued behind whatever the caller does next.  Every
+        # other stage this array's inputs pass through (screening.py's
+        # chi/Dyson solves) already ends on an explicit
+        # ``block_until_ready()``; ``qsgw_head.py`` had none, so this whole
+        # module's only synchronization used to be the FIRST host readback
+        # in ``head_samples_from_s``, which is why an OOM anywhere upstream
+        # of it always surfaced there instead of at its own site.  This does
+        # not change the value or its sharding -- only when the allocator is
+        # asked to account for it -- so it is a pure scheduling change with
+        # no bit-exactness impact.
+        jax.block_until_ready(W_gamma)
+        from gw.isdf_fitting import mem_probe
+        mem_probe("qsgw_head.finalize_head_samples.pre_fold")
         if (
             int(W_gamma.shape[-2]) != int(response.Y_x.shape[-1])
             or int(W_gamma.shape[-1]) != int(response.Z_y.shape[-2])
@@ -1780,6 +1877,8 @@ def finalize_iteration_head_samples(
             float(meta.cell_volume),
             mesh_xy=mesh,
         )
+        jax.block_until_ready(S_effective)
+        mem_probe("qsgw_head.finalize_head_samples.post_fold")
     static_kappa2 = response.static_kappa2_bohr2
     if use_fold and static_kappa2 is not None:
         static_indices = [
@@ -1823,8 +1922,17 @@ def head_samples_from_s(
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
+    from gw.isdf_fitting import mem_probe
     from gw.vcoul import compute_q0_averages
 
+    # This is the first host readback of ``S_cart_omega`` for callers that
+    # do not already sync it (``finalize_iteration_head_samples`` now does,
+    # at its own site -- see the lifetime-boundary comment there).  Report
+    # what is live HERE too so a caller that skips that boundary (the
+    # per-sample ``finalize_iteration_head_sample`` diagnostic entry point,
+    # or a future one) still gets an attributable snapshot instead of a bare
+    # RESOURCE_EXHAUSTED at this line.
+    mem_probe("qsgw_head.head_samples_from_s.pre_readback")
     S_host = np.asarray(S_cart_omega, dtype=np.complex128)
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     if S_host.shape != (len(omegas), 3, 3):
@@ -2064,6 +2172,15 @@ def build_dft_head_response(
         mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
         eta_ry=float(config.head.wcoul0_eta))
+    # Hard lifetime boundary: this module previously had zero
+    # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
+    # discipline), so the direct head/wings built here stayed queued,
+    # unattributed, until whatever LATER stage first forced a host
+    # readback -- see the matching boundary + comment in
+    # ``finalize_iteration_head_samples``.  Pure scheduling change.
+    jax.block_until_ready((S, Y_x, Z_y))
+    from gw.isdf_fitting import mem_probe
+    mem_probe("qsgw_head.build_dft_head_response.post_response")
     e_host = np.asarray(energies)
     n_occ_local = max(0, min(int(meta.nelec) - b0, nb_logical))
     if 0 < n_occ_local < nb_logical:
