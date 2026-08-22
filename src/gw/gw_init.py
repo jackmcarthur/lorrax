@@ -733,6 +733,46 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	}
 
 
+def resolve_zeta_fit_edge(band_slices, zeta_nband):
+	"""The ζ-fit edge this run actually gets: an int that NARROWS, or ``None``.
+
+	**One resolver, three consumers, one banner.**  ``zeta_nband`` is a
+	LOGICAL band count written in a deck; the edge the fit is handed is
+	``band_slices.b4``, that count rounded up to the world size.  Those two
+	numbers differ on every deck whose ``nband`` does not divide the process
+	count, and until 2026-08-22 the difference was resolved in the parser,
+	which cannot see ``b4``:
+
+	    P=4, deck ``nband = zeta_nband = 14``  ->  parser erased the key as
+	    "redundant"  ->  fit ran on [0,16)  ->  refused, because band 16 cuts
+	    a multiplet.  The deck had asked for 14.
+	    (JID 57152792, ``runs/Si_scalar/11_scalar_v_rootcause_20260817/``)
+
+	So the comparison is made HERE, against the padded edge:
+
+	* ``None``               -> follow the loaded window; ``b4`` passes through
+	  untouched and the fit is bit-identical to every pre-2026-08-11 deck.
+	* ``== band_slices.b4``  -> the request IS the loaded window.  Nothing to
+	  narrow, so it collapses to the same "follow" path — this is the case the
+	  parser used to catch, and it still behaves identically whenever the
+	  deck's ``nband`` divides the world size.
+	* anything else          -> an explicit narrowing, honoured exactly.  Note
+	  this includes ``zeta_nband == nband < b4``: the deck named an edge, and
+	  :func:`zeta_fit_band_ranges` does not re-apply the pad to a requested
+	  edge ("honoured exactly or refused" — see its own docstring).
+
+	Pure and jax-free, so it is testable without a mesh; it takes
+	``band_slices`` rather than a config because ``b4`` is the only thing it
+	is allowed to compare against.
+	"""
+	if zeta_nband is None:
+		return None
+	edge = int(zeta_nband)
+	if edge == int(band_slices.b4):
+		return None
+	return edge
+
+
 def zeta_fit_band_ranges(band_slices, zeta_nband, *, log=print):
 	"""The two band ranges the ISDF ζ fit runs on: ``(left, right)``.
 
@@ -1154,15 +1194,21 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 	# ISDF left/right band windows (pair density needs asymmetric ranges),
 	# and the ``zeta_nband`` decoupling if the deck asked for one.
+	# ONE resolved edge, three consumers.  ``cfg.zeta_nband`` is the deck's
+	# logical request; ``resolve_zeta_fit_edge`` compares it against the
+	# PADDED ``band_slices.b4`` and returns None when there is nothing to
+	# narrow.  Reading ``cfg.zeta_nband`` directly below would let the three
+	# gates disagree about whether this run is decoupled at all.
+	zeta_edge = resolve_zeta_fit_edge(
+		band_slices, getattr(cfg, "zeta_nband", None))
 	band_range_left, band_range_right = zeta_fit_band_ranges(
-		band_slices, getattr(cfg, "zeta_nband", None), log=print_fn)
+		band_slices, zeta_edge, log=print_fn)
 	assert_isdf_window_is_the_max(
-		band_slices, band_range_right, getattr(cfg, "zeta_nband", None),
-		log=print_fn)
+		band_slices, band_range_right, zeta_edge, log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
-		getattr(cfg, "zeta_nband", None),
-		(int(cfg.zeta_nband) if getattr(cfg, "zeta_nband", None) is not None
+		zeta_edge,
+		(int(zeta_edge) if zeta_edge is not None
 		 else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4)),
 		log=print_fn)
 
@@ -2256,7 +2302,9 @@ def prepare_isdf_and_wavefunctions(
 			# Resolve the latter without logging; fit_zeta owns the one
 			# user-facing window announcement and its degeneracy checks.
 			_zeta_left, _zeta_right = zeta_fit_band_ranges(
-				band_slices, getattr(cfg, "zeta_nband", None),
+				band_slices,
+				resolve_zeta_fit_edge(
+					band_slices, getattr(cfg, "zeta_nband", None)),
 				log=lambda _message: None)
 			_zeta_fit_nb = (max(_zeta_left[1], _zeta_right[1])
 			                - min(_zeta_left[0], _zeta_right[0]))

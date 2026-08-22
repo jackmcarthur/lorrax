@@ -18,9 +18,13 @@ THE THREE THINGS THIS FILE HAS TO HOLD.
 
 1. **DEFAULT IDENTITY.**  A deck that does not name the key gets the ranges it
    always got — ``(b0, b3)`` and ``(b1, b4)``, the PADDED ``b4`` included.  Any
-   other outcome silently re-fits every ζ in the tree.  ``zeta_nband = nband``
-   collapses to "unset" at parse time for the same reason: it must not un-pad
-   ``b4`` through a redundant statement of the default.
+   other outcome silently re-fits every ζ in the tree.  ``zeta_nband`` equal to
+   that padded ``b4`` collapses to "unset" for the same reason.  It collapses
+   in ``resolve_zeta_fit_edge``, NOT in the parser: the parser compares against
+   the LOGICAL count and so erased an explicit ``nband = zeta_nband = 14``
+   whose real fit edge was the padded 16 (JID 57152792, P=4 scalar Si — the
+   run then refused because band 16 cuts a multiplet, and no banner ever said
+   the requested 14 had been dropped).
 2. **ILLEGAL EDGES REFUSE BY NAME.**  Every ζ-fit edge is checked STRICT,
    whether it came from ``nband``/``ncond`` or the newer ``zeta_nband`` key.
    A cut pair space is non-invariant regardless of which input selected it.
@@ -104,10 +108,20 @@ def test_the_padded_b4_is_passed_through_untouched():
     assert right[1] == 64
 
 
-def test_zeta_nband_equal_to_nband_collapses_to_unset_at_parse_time(tmp_path):
-    """A deck stating the default explicitly must take the DEFAULT path, pad
-    and all — otherwise ``zeta_nband = nband`` is a different calculation from
-    omitting the line, which is the opposite of what "default" means."""
+def test_an_explicit_zeta_nband_survives_the_parser_verbatim(tmp_path):
+    """THE PARSER NO LONGER ERASES ``zeta_nband == nband`` (2026-08-22).
+
+    It used to, reasoning that restating the default must take the default
+    path "pad and all".  But ``nband`` is the LOGICAL count and the edge the
+    fit gets is ``b4`` — that count rounded up to the world size — so the two
+    are the same number only when the world size divides ``nband``.  On P=4 a
+    deck with ``nband = zeta_nband = 14`` fitted [0,16) and refused, correctly,
+    because band 16 cuts a multiplet; nothing ever said the requested 14 had
+    been dropped (JID 57152792).
+
+    The collapse still happens, in ``resolve_zeta_fit_edge``, where ``b4`` is
+    known.  The parser's job is only to carry the request.
+    """
     pytest.importorskip("jax")
     from gw.gw_config import LorraxConfig, read_lorrax_input
 
@@ -117,9 +131,47 @@ def test_zeta_nband_equal_to_nband_collapses_to_unset_at_parse_time(tmp_path):
     params = read_lorrax_input(str(deck))
     assert params["zeta_nband"] == 60          # the deck said what it said
     cfg = LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
-    assert cfg.zeta_nband is None, (
-        "a redundant zeta_nband = nband must resolve to 'follow nband', or it "
-        "un-pads b4 and re-fits every zeta in the tree")
+    assert cfg.zeta_nband == 60, (
+        "the parser must not erase an explicit edge it cannot compare against "
+        "the padded b4")
+
+
+def test_the_edge_collapses_against_the_PADDED_b4_not_the_logical_count():
+    """The one comparison, made where the padded edge exists.
+
+    Divisible deck (nband 60, world 4 -> b4 = 60): the request IS the loaded
+    window, so it collapses and the fit is bit-identical to omitting the key.
+    Non-divisible deck (nband 14, world 4 -> b4 = 16): the request is BELOW
+    the loaded window and is honoured exactly — which is the whole defect.
+    """
+    gi = _init()
+    assert gi.resolve_zeta_fit_edge(_slices(b3=60, b4=60), 60) is None
+    assert gi.resolve_zeta_fit_edge(_slices(b3=60, b4=60), None) is None
+    assert gi.resolve_zeta_fit_edge(_slices(b1=0, b3=14, b4=16), 14) == 14
+    # and the narrowed edge reaches the ranges unrounded — the pad is never
+    # re-applied to a requested edge
+    left, right = gi.zeta_fit_band_ranges(
+        _slices(b1=0, b3=14, b4=16), 14, log=lambda *_: None)
+    assert left == (0, 14) and right == (0, 14)
+
+
+def test_the_startup_banner_prints_the_resolved_fit_edge():
+    """A banner reports resolved values only.
+
+    With ``nband=700`` / ``zeta_nband=160`` this line said "sized for 700
+    bands" while the resolver and the memory planner both acted on 160
+    (Perlmutter smoke 57236676.2, CrI3 700b).
+    """
+    pytest.importorskip("jax")
+    from gw.gw_config import BandCounts
+
+    counts = BandCounts(chi=700, sigma=700, named=frozenset({"number_bands"}))
+    assert "700" in counts.describe(None)
+    narrowed = counts.describe(160)
+    assert "sized for 160 bands" in narrowed, narrowed
+    assert "NARROWED from 700" in narrowed, narrowed
+    # the collapsed case must not claim a narrowing that did not happen
+    assert "NARROWED" not in counts.describe(700)
 
 
 def test_an_unset_key_is_none_and_a_set_one_is_an_int(tmp_path):
@@ -315,6 +367,19 @@ def test_fit_zeta_takes_its_ranges_from_the_resolver():
     assert "(band_slices.b1, band_slices.b4)" not in body, (
         "fit_zeta grew a second copy of the right band range; the resolver is "
         "the only place that arithmetic may live")
+    # ONE resolved edge, three consumers.  Reading the deck key at each gate
+    # is how the banner came to say 700 while the fit ran on 160: three sites,
+    # three chances to disagree about whether the run is decoupled.
+    #
+    # Counted over ``ast.unparse`` output, NOT the raw segment: the prose above
+    # the call names the key too, and a grep hit inside a comment is not a fact
+    # about the code (TASTE rule 17).
+    code = ast.unparse(fn)
+    assert code.count("resolve_zeta_fit_edge(") == 1, (
+        "fit_zeta must resolve the edge against the PADDED b4, exactly once")
+    assert code.count("zeta_nband") == 1, (
+        "the deck key is read exactly once, by the resolver; every gate below "
+        f"reads the resolved value (found {code.count('zeta_nband')})")
 
 
 def test_the_fit_window_travels_into_the_provenance_stamp():

@@ -93,6 +93,32 @@ def test_head_resolver_forwards_the_gw_run_dipole_window():
     assert _dipole_window_from_params(resolver._params, wfn) == (8, 32, 40)
 
 
+def test_an_absent_dipole_window_refuses_instead_of_defaulting_to_5_5():
+    """No band window means NO reference — never a fabricated 5/5/nbands.
+
+    The helper used to answer ``(5, 5, max(nbands, nelec+5))`` for a params
+    dict with no window in it, which is exactly what ``HeadResolver`` handed
+    it before the window was threaded: the provenance check then compared a
+    correctly-stamped 26/26/600 file against an invented 5/5/610 run and
+    accused it.  A reference the checker makes up cannot fail for the reason
+    it claims, so the absent case is a refusal.
+    """
+    wfn = types.SimpleNamespace(nbands=610, nelec=26)
+    with pytest.raises(ValueError, match="nval, ncond, nband"):
+        _dipole_window_from_params({}, wfn)
+    # The six head keys alone — the pre-fix ``HeadResolver._params`` — are
+    # still not a band window, and must not silently become one.
+    head_only = {"wcoul0_source": "s_tensor", "wcoul0_eta": 0.0,
+                 "vhead": None, "whead_0freq": None, "whead_imfreq": None,
+                 "head_minibz_average": False}
+    with pytest.raises(ValueError, match="band window is missing"):
+        _dipole_window_from_params(head_only, wfn)
+    # A partial window is no better than none: 26/26 with nband absent must
+    # not resolve nband from the WFN behind the deck's back.
+    with pytest.raises(ValueError, match="nband"):
+        _dipole_window_from_params({"nval": 26, "ncond": 26}, wfn)
+
+
 def test_compute_static_head_terms_matches_cohsex_formulas():
     head = compute_static_head_terms(
         vc0=12.0 + 0.0j,

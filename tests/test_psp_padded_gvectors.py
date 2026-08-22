@@ -486,3 +486,88 @@ def test_the_residency_scan_can_fail():
         _RESIDENT_SPELLINGS), "the scan does not detect the pattern it bans"
     assert [s for s in _STREAMING_SPELLINGS if s not in fake] == list(
         _STREAMING_SPELLINGS), "the scan would pass a source that streams nothing"
+
+
+# ===========================================================================
+# THE NON-DEFAULT-WINDOW RED TWIN
+# ===========================================================================
+# Two failures wore one message.  ``gw.head_correction._dipole_window_from_
+# params`` defaulted an absent window to 5/5/max(nbands, nelec+5), and
+# ``HeadResolver`` used to hand it ``config.head`` alone — six keys with no
+# band window in them — so EVERY deck whose window is not 5/5 was accused of
+# being stale.  Measured on the MoS2 production deck (JID 57269074): a
+# dipole.h5 built from the very same WFN and deck reported
+# ``prov_nval: file=26 run=5 ... prov_nband: file=600 run=610``.  Under
+# ``LORRAX_SANITY=strict`` that false warning is an unconditional refusal.
+#
+# The three cells below are the discriminator the register asked for: on ONE
+# non-default window, a correct file must PASS and a genuinely stale WFN must
+# still REFUSE.  Without both arms the guard's silence and its noise are
+# indistinguishable.
+
+#: Deliberately NOT 5/5 — that pair is the value the pre-fix helper invented,
+#: so a fixture written at 5/5 would agree with the defect and certify it.
+_NONDEFAULT_WINDOW = dict(nval=2, ncond=3, nband=8)
+
+
+def _head_params(**window):
+    """``HeadResolver._params`` as the resolver builds it, window included."""
+    return {"wcoul0_source": "s_tensor", "wcoul0_eta": 0.0,
+            "vhead": None, "whead_0freq": None, "whead_imfreq": None,
+            "head_minibz_average": False, **window}
+
+
+def test_a_non_default_window_dipole_passes_its_own_provenance_guard(tmp_path):
+    """GREEN arm: the file the deck itself produced is not accused."""
+    from gw.head_correction import _check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(p, wfn, **_NONDEFAULT_WINDOW)
+    lines = []
+    _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
+                             wfn=wfn, print_fn=lines.append)
+    assert any("provenance OK" in ln for ln in lines), lines
+    assert not any("DIFFERENT DFT solution" in ln for ln in lines), lines
+
+
+def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):
+    """RED arm: the guard has not been muted, only aimed.
+
+    Same non-default window on both sides, a different DFT solution behind
+    the file.  The complaint must name the fingerprint and NOT the window —
+    the pre-fix message named the window on every deck, which is how a real
+    stale-WFN report became unreadable.
+    """
+    from common import sanity
+    from gw.head_correction import _check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    old, new = _FakeWfn(seed=0), _FakeWfn(seed=1)
+    p = tmp_path / "dipole.h5"
+    _write_stamped(p, old, **_NONDEFAULT_WINDOW)
+    lines = []
+    _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
+                             wfn=new, print_fn=lines.append)
+    assert any("DIFFERENT DFT solution" in ln for ln in lines), lines
+    assert any("prov_wfn_sha256" in ln for ln in lines), lines
+    assert not any("prov_nval" in ln or "prov_ncond" in ln or "prov_nband" in ln
+                   for ln in lines), (
+        "a stale-WFN report must not also accuse the band window", lines)
+
+
+def test_the_head_checker_refuses_a_params_dict_with_no_window(tmp_path):
+    """The defect itself, pinned: no window reaching the checker is a REFUSAL.
+
+    This is the cell that fails on the pre-fix source, where the same call
+    silently resolved 5/5/8 and reported a mismatch against a correct file.
+    """
+    import pytest as _pytest
+    from gw.head_correction import _check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(p, wfn, **_NONDEFAULT_WINDOW)
+    with _pytest.raises(ValueError, match="band window is missing"):
+        _check_dipole_provenance(p, params=_head_params(), wfn=wfn,
+                                 print_fn=lambda *_a: None)

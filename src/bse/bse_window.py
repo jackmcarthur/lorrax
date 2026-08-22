@@ -455,6 +455,58 @@ def _parse_wfn_path(input_file: str) -> str:
     return wfn_file
 
 
+def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
+    """A QP WFN already carries its eigenvalues.  A second ladder is a defect.
+
+    ``write_qp_wfn_h5`` produces a WFN.h5 whose ψ and E are a MATCHED PAIR:
+    the rotated orbitals carry the QP eigenvalues that produced the rotation.
+    ``--eqp`` supplies a diagonal ladder written against **DFT band labels**,
+    so applying it on top of a QP WFN discards the canonical eigenvalues and
+    relabels the rotated orbitals with the mean-field ordering.  Every array
+    keeps the right shape, so nothing downstream notices.
+
+    Measured on the MoS2 run-82 parent smoke, JID 57269074 step ``.128``:
+    ``00_lorrax_gw/exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the
+    wrapper passes ``--eqp eqp1.dat``.  The existing shape guard in
+    ``exciton_bands`` sees this ONLY when a ``bse_k_grid`` densification has
+    already moved ψ to a different k axis; without densification the two
+    tables are the same size and the overwrite is invisible.
+
+    ASKED OF THE FILE, NOT OF ITS NAME.  The discriminator is the stamp
+    ``file_io.qp_wfn`` writes, not the string ``_qp`` in a path — a filename
+    is not a fact about contents, and this repo has paid for that reading
+    before.  ``read_qp_wfn_stamp`` returning ``None`` means UNVERIFIABLE (a
+    ``pw2bgw`` WFN, or one written before the stamp existed) and licenses
+    nothing, so it does NOT refuse: an absence is a claim about what was
+    searched.  Only a positive identification refuses.
+    """
+    from file_io.qp_wfn import QP_WFN_SCHEME, read_qp_wfn_stamp
+
+    wfn_path = _parse_wfn_path(input_file)
+    stamp = read_qp_wfn_stamp(wfn_path)
+    if stamp is None:
+        return
+    where = ""
+    if stamp.get("band_stop") is not None:
+        where = (f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
+                 f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
+    version_note = ""
+    if stamp["scheme"] != QP_WFN_SCHEME:
+        version_note = (f"  (That stamp is not {QP_WFN_SCHEME!r}: the file was "
+                        f"written by a different version of the QP writer.)")
+    raise ValueError(
+        f"--eqp {eqp_file} is redundant and destructive on this deck.  "
+        f"{wfn_path} is a LORRAX QP WFN (stamp {stamp['scheme']!r}{where}): "
+        f"its wavefunctions ARE the QP orbitals and its energies ARE the QP "
+        f"eigenvalues that produced them.  A second eqp ladder is written "
+        f"against DFT band LABELS, so applying it here discards the canonical "
+        f"eigenvalues and relabels the rotated orbitals with the mean-field "
+        f"ordering — with the right shapes, so nothing downstream notices.  "
+        f"Fix: drop --eqp.  To run a mean-field WFN with diagonal QP "
+        f"corrections instead, point wfn_file at the mean-field WFN.h5 and "
+        f"keep --eqp.{version_note}")
+
+
 def resolve_n_occ(
     enk_full: np.ndarray,
     *,

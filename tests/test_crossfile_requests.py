@@ -814,15 +814,39 @@ def test_dipole_provenance_checker_still_exists_with_that_signature():
         assert want in kwonly, (want, kwonly)
 
 
-def test_head_correction_window_matches_the_writers_derivation():
-    """The stamp records (nval, ncond, nband) as the WRITER derived them, so
-    the reader has to derive them the same way or the check is noise."""
+def test_the_head_reader_consumes_the_window_rather_than_mirroring_defaults():
+    """INVERTED 2026-08-22, and the inversion IS the fix.
+
+    This cell used to require that ``gw/head_correction.py`` contain the
+    writer's own default expressions — ``params.get("nval", 5)`` and friends
+    — on the reasoning that the reader "has to derive them the same way or
+    the check is noise".  The writer resolves those defaults against the
+    DECK.  The reader was handed ``config.head``, a six-key dict with no
+    band window in it, so the shared spelling produced a shared NUMBER only
+    on a 5/5 deck: the mirror was of the fallback, not of the derivation.
+    Measured on the MoS2 production deck (JID 57269074) — a dipole.h5 built
+    from the same WFN and the same deck reported ``file=26/26/600`` against
+    an invented ``run=5/5/610``, and under ``LORRAX_SANITY=strict`` that
+    false warning refuses a correct file.
+
+    So the reader must NOT carry a default at all.  It consumes the run's
+    RESOLVED window and refuses when one is absent; the writer keeps its
+    deck defaults, because resolving a deck is its job.
+    """
     src_r = _read("gw/head_correction.py")
     src_w = _read("psp/get_dipole_mtxels.py")
-    for frag in ('params.get("nval", 5)', 'params.get("ncond", 5)',
-                 'params.get("nband", None)'):
-        assert frag in src_r, "reader lost: %s" % frag
-        assert frag in src_w, "writer changed: %s — reader must follow" % frag
+    for frag in ('params.get("nval", 5)', 'params.get("ncond", 5)'):
+        assert frag in src_w, "writer changed: %s" % frag
+        assert frag not in src_r, (
+            "the head reader re-grew the writer's DEFAULT %s.  A provenance "
+            "reference the checker invents cannot fail for the reason it "
+            "claims: it accuses every deck whose window is not 5/5 and "
+            "vouches for nothing." % frag)
+    # and it refuses instead — the behaviour is pinned in
+    # tests/test_head_correction.py and tests/test_psp_padded_gvectors.py;
+    # here we only require that the refusal exists in the file at all.
+    assert "band window is missing" in src_r, (
+        "the reader dropped the refusal it replaced the defaults with")
 
 
 # ===========================================================================
