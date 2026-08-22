@@ -49,7 +49,8 @@ from common.units import RYD_TO_EV
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
     band_extrapolation_is_consumable,
-    mode_builds_channels, refuse_unimplemented_compute_mode,
+    mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
+    refuse_unimplemented_compute_mode,
     sigma_stage_modes)
 
 
@@ -673,6 +674,16 @@ def compute_sigma_xc(
     # entry check.  It is a dict lookup on a resolved enum, so it costs
     # nothing on the Σ path it guards.
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
+
+    # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
+    # low_mem_bands's other four unsupported combinations (head_correction,
+    # qp_solver, mpa_material_class, bispinor) already refused at config
+    # resolution, before this function -- or anything upstream of it --
+    # ever ran.  An explicit Gij is a call-time Python parameter with no
+    # deck key, so it is checked here instead: this is the only seam that
+    # ever sees both a resolved low_mem_bands and a live Gij operand
+    # together, and it still runs before any Gij-dependent allocation.
+    refuse_explicit_gij_under_low_mem_bands(config, Gij)
 
     # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
     # Two independent reasons, and the second is the load-bearing one.
