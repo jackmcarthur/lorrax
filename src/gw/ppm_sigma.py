@@ -971,6 +971,7 @@ def compute_sigma_c_ppm_omega_grid(
     sigma_cfg: DynamicSigmaConfig,
     quad: MinimaxConfig,
     omega_grid_ry: np.ndarray,
+    ansatz: str,
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
     print_fn=print,
@@ -1046,9 +1047,13 @@ def compute_sigma_c_ppm_omega_grid(
     # object contributes only its invalid-pole policy.
     regularization_width_ry = float(sigma_cfg.regularization_ev) / RYD_TO_EV
     edge_factor = float(sigma_cfg.window_edge_factor)
-    # The ansatz NAME, so the shared resolver decides `auto` the same way
-    # here and at the HDF5 writer (which reads `config.compute_mode`).
-    ansatz_name = f"{str(ppm_cfg.model).strip().lower()}_ppm"
+    # The ansatz NAME comes from ``compute_mode`` -- the CANONICAL axis --
+    # so the shared xi resolver and the sharded-window precondition decide
+    # the same way here and at the sigma_mnk.h5 writer, which reads
+    # ``config.compute_mode`` directly.  Deliberately NOT ``ppm_cfg.model``:
+    # that is one of the five legacy self-energy-axis keys, and every other
+    # runtime consumer in the tree already reads ``compute_mode.ppm_model``.
+    ansatz_name = str(getattr(ansatz, "value", ansatz)).strip().lower()
     regularization_floor_ev = getattr(
         sigma_cfg, "regularization_floor_ev", None)
 

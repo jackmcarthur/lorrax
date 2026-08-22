@@ -607,6 +607,7 @@ def compute_ppm_sigma_pipeline(
                 sigma_cfg=config.sigma,
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
+                ansatz=config.compute_mode,
                 occupation_state=occupation_state,
                 plan=plan,
                 print_fn=print_fn,

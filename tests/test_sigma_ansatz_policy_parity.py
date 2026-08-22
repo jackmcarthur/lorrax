@@ -82,7 +82,9 @@ def test_the_precondition_refuses_an_indivisible_window(mesh22):
 
     # Divides both axes -> silent.
     assert_sharded_sigma_window_divides_mesh(8, mesh22, ansatz="gn_ppm")
-    for nb in (7, 9, 70):
+    # ODD counts only: on a 2x2 mesh anything even divides both axes,
+    # so an even nb would be testing the silent branch by accident.
+    for nb in (7, 9, 15):
         with pytest.raises(ValueError) as exc:
             assert_sharded_sigma_window_divides_mesh(
                 nb, mesh22, ansatz="compute_mode = mpa")

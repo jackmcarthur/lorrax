@@ -325,6 +325,55 @@ class ComputeMode(str, enum.Enum):
         }.get(self)
 
 
+#: The LEGACY spellings of the self-energy axis, and the canonical key that
+#: replaces each.  ``compute_mode`` / ``qp_solver`` are the load-bearing axes
+#: (see :meth:`LorraxConfig.compute_mode` / :meth:`LorraxConfig.qp_solver`);
+#: these five booleans/strings are the vocabulary that predates them and that
+#: every deck in the tree still writes.
+#:
+#: They are still parsed and still honored -- a deck that names one keeps
+#: running -- but naming one now prints a deprecation note saying what to
+#: write instead.  A key honored in silence beside a canonical twin is how a
+#: tree ends up with two vocabularies for one axis and no way to tell which
+#: one a given run resolved through.
+#:
+#: RETIREMENT IS A SEPARATE DECISION and has not been taken; this row is the
+#: warning stage of it.  The migration shape is the tree's own
+#: (``nband`` -> ``number_bands``, ``sigma_band_extrapolation`` ->
+#: ``use_band_extrapolation``): note first, remove later.
+LEGACY_SIGMA_AXIS_KEYS: dict[str, str] = {
+    "do_screened": "compute_mode = x_only | cohsex | gn_ppm | hl_ppm | mpa",
+    "use_ppm_sigma": "compute_mode = gn_ppm | hl_ppm",
+    "ppm_model": "compute_mode = gn_ppm | hl_ppm",
+    "self_consistent": "qp_solver = self_consistent",
+    "sigma_at_dft_energies": "qp_solver = one_shot_dft (now the default)",
+}
+
+
+def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
+                                    *, print_fn=print) -> tuple[str, ...]:
+    """Print one deprecation note per LEGACY self-energy-axis key the deck named.
+
+    Returns the keys announced, so a caller (or a test) can assert on them
+    rather than scraping the log.  Nothing is refused and nothing resolves
+    differently: this is the warning stage of the migration described on
+    :data:`LEGACY_SIGMA_AXIS_KEYS`.
+    """
+    named = frozenset(str(k).strip().lower() for k in (named_keys or ()))
+    hit = tuple(k for k in LEGACY_SIGMA_AXIS_KEYS if k in named)
+    if not hit:
+        return ()
+    mode = getattr(resolved_mode, "value", resolved_mode)
+    solver = getattr(resolved_solver, "value", resolved_solver)
+    print_fn(
+        f"  [config provenance] this deck names {len(hit)} LEGACY "
+        f"self-energy-axis key(s); they are honored, and the canonical axes "
+        f"resolved to compute_mode = {mode}, qp_solver = {solver}.")
+    for key in hit:
+        print_fn(f"    {key} -> write {LEGACY_SIGMA_AXIS_KEYS[key]} instead")
+    return hit
+
+
 class SigmaChannel(str, enum.Enum):
     """One term of Σ that a compute mode either builds or does not.
 
@@ -4535,4 +4584,13 @@ class LorraxConfig:
         # returns from this call before either property is touched.
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
+        # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
+        # the other one.  Same position and same reason as the two refusals
+        # above: the announcement quotes the RESOLVED axes, which only the
+        # record can answer.  Honoring a legacy key in silence beside a
+        # canonical twin is how a tree ends up with two vocabularies for one
+        # axis and no way to tell which one a run went through.
+        announce_legacy_sigma_axis_keys(
+            _named_keys, resolved.compute_mode, resolved.qp_solver,
+            print_fn=print_fn)
         return resolved
