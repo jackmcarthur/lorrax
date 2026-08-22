@@ -1329,6 +1329,47 @@ def compute_ppm_head_sigma_diag(
     )
 
 
+def on_shell_occupied_head_sigma_ry(
+    head: HeadGNParams,
+    *,
+    cell_volume: float,
+    nk_tot: int,
+    eta: float = 1.0e-6,
+) -> float:
+    """Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F).
+
+    THE ONE PLACE the concise-log scalar comes from.  It is *derived from*
+    :func:`compute_ppm_head_sigma_diag` — the same kernel that builds the
+    tensor the ansatz-neutral finalizer injects — by evaluating it at a
+    synthetic single occupied state whose ω sits exactly on shell
+    (``δ = ω − (ε − E_F) = 0``).  Nothing here restates the closed form.
+
+    WHY IT EXISTS.  ``gw/ppm_pipeline.py`` used to print this number from a
+    hand-written ``-R_h/(Ω_h·V·N_k)``, while the kernel and the named
+    ``sig_c_head(Edft).Re`` output column evaluate ``+R_h/(Ω_h·V·N_k)``.
+    Measured on the Si 6×6×6 two-update controls (JID 57243214): the log
+    said ``-0.8071 eV`` where ``sigma_freq_debug.dat`` carried
+    ``+0.807048 eV`` for the same occupied state.  The physics array was
+    always right; the duplicated formula in the log had drifted in sign.
+    A second spelling of a formula is a second thing to keep in step, so
+    there is now only one.
+
+    Returns Ry.  ``0.0`` for a degenerate head (``R_h`` or ``Ω_h`` ≈ 0),
+    which is what the kernel returns there too.
+    """
+    val = compute_ppm_head_sigma_diag(
+        head,
+        omega_grid_ry=np.zeros(1, dtype=np.float64),
+        enk_ry=np.zeros((1, 1), dtype=np.float64),
+        efermi_ry=0.0,
+        n_occ=1,
+        cell_volume=cell_volume,
+        nk_tot=nk_tot,
+        eta=eta,
+    )
+    return float(np.real(val[0, 0, 0]))
+
+
 def compute_complex_pole_head_sigma_diag(
     *,
     omega_grid_ry: np.ndarray,
