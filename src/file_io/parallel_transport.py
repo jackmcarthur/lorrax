@@ -716,6 +716,34 @@ def _write_connection_stage(
             return jax.lax.with_sharding_constraint(out, block_sharding)
 
         connection_cart = _to_cart(connection_reduced)
+        # NEVER STAMP ``connection_complete = 1`` OVER AN ALL-ZERO BLOCK.
+        # The artifact is created with a zero ``berry_connection_cart`` and
+        # ``connection_complete = 0``, and until 2026-08-15 a bcc/fcc deck
+        # left it exactly that way — the velocity stage succeeded, the
+        # artifact was written, and the connection was silently a zero
+        # (nk,3,nb,nb) block (measured on the ACCEPTED 24-band canonical
+        # ``runs/Na/sodium_test_canonical/parallel_transport.h5``).  The
+        # full-BZ link path fixed the cause; this is the guard that the
+        # SYMPTOM can never be stamped as complete again, whatever the
+        # cause.  One reduction on an already-resident sharded array.
+        cart_scale = float(jax.device_get(jnp.max(jnp.abs(connection_cart))))
+        if not np.isfinite(cart_scale) or cart_scale == 0.0:
+            raise ValueError(
+                "PT-CONNECTION-ZERO refusal: the Berry connection assembled "
+                f"to max|A_cart| = {cart_scale}, i.e. an all-zero (or "
+                "non-finite) block, and an artifact stamped "
+                "connection_complete=1 over it is indistinguishable from a "
+                "completed one to every consumer.  Refusing to write it.  "
+                f"got: link stage "
+                f"{'symmetry-reduced' if reduced else 'full-BZ'}, "
+                f"{int(source_full.size)} source rows, nk_tot="
+                f"{int(sym.nk_tot)}.  want: a finite, nonzero connection.  "
+                "fix: check that the link stage actually streamed "
+                "wavefunctions for this deck (a bcc/fcc primitive cell has "
+                "no elementary-step symmetry reduction — see "
+                "link_symmetry_reduction_applies) before re-running the "
+                "connection stage.  doc: "
+                "docs/architecture/symmetry_register.md")
         connection_shape = (3, int(sym.nk_tot), nb, nb)
         io.write_slab(
             CONNECTION_REDUCED_DATASET, connection_reduced,
