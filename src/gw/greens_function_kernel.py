@@ -2,20 +2,62 @@
 
   G_μν(k) = Σ_{ij} ψ_i(μ) W_ij ψ*_j(ν)
 
-Convention: psi_xn is direct (μ side). psi_yr is conjugated (ν side).
-This matches the tested COHSEX convention throughout gw_jax.py.
+Two layouts, selected by the STATIC ``layout`` argument (never a traced
+value — a Python string a caller passes once per kernel build, exactly
+the ``Wavefunctions.layout`` tag; see ``reports/gwjax_low_mem_bands_audit_
+2026-08-22/report.md``):
+
+``layout='legacy'`` (default) — psi_xn is direct (μ side), psi_yr is
+conjugated (ν side).  This matches the tested COHSEX convention
+throughout gw_jax.py and is BYTE-IDENTICAL to the code this module
+shipped before ``low_mem_bands`` existed: every legacy branch below is
+the original body, unmoved and untouched.
+
+``layout='face'`` — the two-face carrier's ``psi_mun``/``psi_nmu``
+(``gw.wavefunction_bundle``, both un-conjugated, both full [b0,b4) band
+extent — see obstacle #3, band windows are not legal face matrices, and
+:func:`Wavefunctions.band_mask` is the bring-up substitute).  ``build_G``
+computes ``(psi_mun * w) @ conj(psi_nmu)`` as ONE planned N,N GEMM
+(``distrib_la.gemm_plan``, a ``GemmPlan`` the CALLER built once outside
+its hot loop — never resolved/probed here) rather than a dense-band einsum,
+because multi-rank cuBLASMp accepts only ``P(None,'x','y')`` matrices, and
+``psi_mun``/``psi_nmu`` are exactly those two 2-D-sharded orientations.
+
+GEMM-seam flatten order — a MEASURED correction to the audit report
+------------------------------------------------------------------
+The report's own verdict describes "flattening (s,mu) ... at the GEMM
+seam" without specifying which of the two sits major.  ``psi_mun``/
+``psi_nmu`` store the spinor axis ``s`` OUTER and the centroid axis
+``mu``/``nu`` INNER (``wavefunction_bundle.PSI_MUN_SPEC`` /
+``PSI_NMU_SPEC``: ``s`` is a REPLICATED axis, ``mu``/``nu`` is the
+MESH-SHARDED one).  Merging them in THAT order — replicated axis major,
+sharded axis minor — is **not** a free reshape: traced on an emulated 2x2
+mesh, it lowers to a genuine ``all-to-all`` collective, one per rank, at
+every G build.  Merging in the OTHER order — sharded axis major,
+replicated axis minor (a ``jnp.swapaxes`` then reshape) — is a provably
+free local reshape: zero collectives in the compiled HLO, bit-exact
+against a plain NumPy transpose+reshape, and every rank's local shard
+lands exactly where a genuinely chunked ``P(None,'x','y')`` array would
+put it.  Both claims are pinned as a positive/negative test pair in
+``tests/test_contract_bands.py``
+(``test_merge_split_spin_centroid_roundtrip_and_no_collective``,
+``test_merge_spin_centroid_storage_order_needs_an_all_to_all``).
+:func:`common.contract_bands.merge_spin_centroid` is
+this majority-order merge, shared with the face projector for the same
+reason (:mod:`common.contract_bands`'s own two-GEMM projection needs the
+identical fix on both O's spin pairs).  ns ∈ {1, 2} in every deck this
+module has been run against; the merge (not a per-spin loop) keeps the
+GENERAL spin-OFF-DIAGONAL G a spinor calculation needs — see the module's
+own einsum below, which does NOT contract s against t.
 """
 import jax.numpy as jnp
 
+from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
-def build_G(psi_xn, psi_yr, *, Gij=None, phases=None):
-    """Build G_μν(k).  Returns (nk, s, μ_X, s, μ_Y) flat-k.
 
-    psi_xn:  (nk, s, μ_X, nb) — direct (μ side)
-    psi_yr:  (nk, nb, s, μ_Y) — conjugated internally (ν side)
-    Gij:     (nk, nb, nb) or None — band-space matrix. None → identity.
-    phases:  (nk, nb) complex or None — per-band weights. None → ones.
-    """
+def _legacy_build_G(psi_xn, psi_yr, *, Gij=None, phases=None):
+    """The exact pre-``low_mem_bands`` body.  UNTOUCHED — do not edit this
+    function to add face-layout behaviour; add a sibling instead."""
     if Gij is not None and phases is not None:
         p = phases.astype(jnp.complex128)
         return jnp.einsum('ksxi,kij,kjty->ksxty',
@@ -29,6 +71,75 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None):
             psi_xn, phases.astype(jnp.complex128), jnp.conj(psi_yr), optimize=True)
     return jnp.einsum('ksxn,knty->ksxty',
         psi_xn, jnp.conj(psi_yr), optimize=True)
+
+
+def _face_build_G(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
+    """Face-layout G via one planned N,N GEMM.  See module docstring.
+
+    psi_mun: (nk, s, μ, n)  P(None, None, 'x', 'y') — un-conjugated, direct.
+    psi_nmu: (nk, n, s, μ)  P(None, 'x', None, 'y') — un-conjugated; this
+             function applies the conjugate (matching legacy's psi_yr
+             convention: the SECOND operand is conjugated internally).
+    gemm:    a ``distrib_la.GemmPlan`` built ONCE by the caller (typically
+             a kernel-factory closure, mirroring ``_Gv_fftn`` et al. in
+             ``w_isdf.py``) with ``m=k=n=mu*ns``... no: ``m=n=mu*ns``,
+             ``k=nb_full``, ``nq=nk``, matching this call's operand shapes
+             exactly — see :func:`distrib_la.gemm_plan`.  Resolving or
+             warming a plan HERE would defeat the entire point of a
+             planned surface (it would dlopen/probe/compile on every G
+             build, inside whatever ``lax.scan``/``jax.jit`` called this).
+    """
+    if Gij is not None:
+        raise NotImplementedError(
+            "build_G(layout='face'): an explicit dense Gij band-operator "
+            "is not ported for this layout (report obstacle #4's named "
+            "escape hatch — 'refuse that uncommon combination under "
+            "low_mem_bands=true by name').  Production diagonal-occupation "
+            "weights go through `phases` instead, which IS supported; a "
+            "genuinely dense (non-diagonal) band operator would need its "
+            "own face-sharded two-GEMM contract (like the projector's), "
+            "not this identity/diagonal-weight path.")
+    nk_, s_, mu_, n_ = psi_mun.shape
+    A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
+    if phases is not None:
+        w = phases.astype(A.dtype)                  # (nk, n)
+        A = A * w[:, None, :]
+    B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
+    G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
+    # Undo BOTH merges, restoring legacy's (k, s, μ_X, s', μ_Y) axis order.
+    # The row merge sits at axis 1, the (still-merged) column pair shifts
+    # from axis 2 to axis 3 once the first split inserts an axis.
+    G = split_spin_centroid(G_flat, 1, s_, mu_)       # (nk, s, mu, mu*s)
+    G = split_spin_centroid(G, 3, s_, mu_)            # (nk, s, mu, s', mu')
+    return G
+
+
+def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
+           gemm=None):
+    """Build G_μν(k).
+
+    ``layout='legacy'`` (default): returns (nk, s, μ_X, s, μ_Y) flat-k,
+    exactly as before — ``psi_xn``/``psi_yr`` are the legacy 4-copy bundle
+    fields, ``Gij``/``phases`` as documented on :func:`_legacy_build_G`.
+
+    ``layout='face'``: ``psi_xn``/``psi_yr`` are actually ``psi_mun``/
+    ``psi_nmu`` (the argument NAMES stay the SAME two slots — first operand
+    direct, second conjugated internally — across both layouts on purpose,
+    so a caller's call shape does not change shape when it switches
+    layout).  ``gemm`` (a ``distrib_la.GemmPlan``) is then required.  See
+    the module docstring for the GEMM-seam design and
+    :func:`_face_build_G` for the operand contract.
+    """
+    if layout == 'legacy':
+        return _legacy_build_G(psi_xn, psi_yr, Gij=Gij, phases=phases)
+    if layout != 'face':
+        raise ValueError(f"build_G: layout must be 'legacy' or 'face', got {layout!r}")
+    if gemm is None:
+        raise ValueError(
+            "build_G(layout='face') requires gemm=<distrib_la.GemmPlan>, "
+            "built ONCE outside this call (see distrib_la.gemm_plan and "
+            "this module's docstring) — never resolved here.")
+    return _face_build_G(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
@@ -109,7 +220,8 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
 
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
-                band_weight=None, E_min=None, E_max=None):
+                band_weight=None, E_min=None, E_max=None,
+                layout='legacy', gemm=None):
     """G(t)_k(μ, ν) = Σ_n ψ_n(μ) · exp(-t · (e_n - e_ref)) · ψ_n*(ν).
 
     Unified time-evolution G builder shared by χ₀ (imaginary-time) and
@@ -142,7 +254,14 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                  stays out of windowed_exp_iEt so that helper remains the
                  fused phase/window primitive.  Weights are never
                  square-rooted or clipped.
-
+    layout, gemm: forwarded verbatim to :func:`build_G` — see its
+                 docstring.  Under ``layout='face'`` ``enk``/``mask``/
+                 ``band_weight`` are expected at the FULL [b0,b4) extent
+                 (``Wavefunctions.band_mask`` is the bring-up helper for
+                 turning a logical band slice into this ``mask``, per
+                 report §3): this function's own phase math is IDENTICAL
+                 either way, only how the resulting weight reaches the ψ
+                 operands differs.
 
     Returns (nk, s, μ_X, s, μ_Y) flat-k.  Thin wrapper around ``build_G``
     with phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref),
@@ -161,4 +280,4 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-    return build_G(psi_xn, psi_yr, phases=phases)
+    return build_G(psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm)
