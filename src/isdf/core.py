@@ -3768,7 +3768,8 @@ def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
     ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.
     """
     Py = int(mesh_xy.shape['y'])
-    Z_pad, n_cols = pad_last_axis_to(Z_q, Py)
+    _zpad = pad_last_axis_to(Z_q, Py)
+    Z_pad, n_cols = _zpad.array, _zpad.logical   # LOGICAL, by name
     zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(run(Z_pad), mesh_xy)
     if int(Z_pad.shape[-1]) != n_cols:
         return zeta_out[:, :, :n_cols]

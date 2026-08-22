@@ -641,9 +641,11 @@ def check_padding_solve_at_logical(mesh, dtype, nq=2, n_log=13, n_pad=16,
     assert not X_pad[:, n_log:, :].any(), "pad rows not exact zeros"
     # NRHS-pad idiom: zero RHS columns -> zero solution columns, retained
     # columns bit-identical (per-column triangular solves are independent).
-    B_wide, n_orig = pad_last_axis_to(
+    _pad = pad_last_axis_to(
         _put(B_log, mesh, (None, "x", "y")), 5)   # 8 -> 10 columns
-    assert n_orig == nrhs
+    B_wide, n_orig = _pad.array, _pad.logical     # NAMED: the NRHS pad
+    assert n_orig == nrhs                          # wants the LOGICAL count
+    assert _pad.padded == 10
     B_wide_np = np.asarray(_gather(B_wide))
     assert B_wide_np.shape[-1] > nrhs, "pad divisor made the check a no-op"
     X_wide = _gather(dist_solve(A_log, B_wide_np))

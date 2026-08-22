@@ -2823,9 +2823,9 @@ def _run_rcrop(
     #      criterion — but it is NOT a 3-eps effect, and a test that pins
     #      this path to a few ULPs will fail at production shapes.
     #
-    # An nb that already divides pads by zero rows: ``pad_axis_to`` returns
+    # An nb that already divides pads by zero rows: ``pad_axis`` returns
     # the SAME array, so the production path is byte-identical to before.
-    from runtime.padding import pad_axis_to, round_up, spec_divisor
+    from runtime.padding import pad_axis, round_up, spec_divisor
 
     spec = _band_rotation_spec()
     px, py = (int(mesh.shape[a]) for a in mesh.axis_names)
@@ -2840,8 +2840,8 @@ def _run_rcrop(
     nb_pad = round_up(nb, band_div)
 
     def _pad_bands(A):
-        A, _ = pad_axis_to(A, band_div, axis=1)
-        A, _ = pad_axis_to(A, band_div, axis=2)
+        A = pad_axis(A, band_div, axis=1).array
+        A = pad_axis(A, band_div, axis=2).array
         return A
 
     entry_sh = NamedSharding(mesh, spec)

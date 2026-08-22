@@ -9,11 +9,24 @@ logical (unpadded) extent so they can be re-read on any process count
 the caller states nothing; readers re-pad by asking for the padded shape,
 via :func:`padded_mu_extent`).
 
-The pad zone is always zero-filled.  Downstream operators that contract
-along a padded axis (e.g. einsums in V_q tile, V·χ in W solve) see no
-contribution from the pad rows by construction; solves must run at the
-LOGICAL extent (see ``isdf/core.solve_zeta`` and
+The pad zone is zero-filled BY DEFAULT.  Downstream operators that
+contract along a padded axis (e.g. einsums in V_q tile, V·χ in W solve)
+see no contribution from the pad rows by construction; solves must run at
+the LOGICAL extent (see ``isdf/core.solve_zeta`` and
 ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``).
+
+A zero pad is inert for operators LINEAR or BILINEAR in the padded axis,
+and is a WRONG NUMBER for a diagonalisation — which is why
+:func:`pad_axis` takes a keyword-only ``fill``: the BSE ε axis is the
+diagonal of a diagonalisation and pads with a signed sentinel
+(``bse.bse_window.PAD_EPS_GUARD_RY``) so pad transitions land above the
+optical onset rather than under it.  ``psp/dft_operators.py`` pads
+``T_diag`` with ``1e10`` for the same reason, and ``sc_iteration``'s
+eigensolve refuses instead of padding.
+
+Since 2026-08-22 there is ONE pad helper (:func:`pad_axis`) and it
+returns a NAMED result, because the two it replaced returned opposite
+extents from the same tuple slot — see :class:`PadAxisResult`.
 
 NOT this module's contract: the G-axis ``ngkmax`` ragged padding
 (WFN.h5 ``wfns/coeffs`` style — fixed ``ngkmax`` with per-k ``ngk``
@@ -22,6 +35,8 @@ convention with per-row valid lengths, not a mesh-divisibility
 round-up; do not unify the two.
 """
 from __future__ import annotations
+
+from typing import NamedTuple
 
 
 def round_up(n: int, divisor: int) -> int:
@@ -158,27 +173,71 @@ def solve_at_logical(solve_fn, n_logical, mats, rhs=None, *, pad_axes=(-2,)):
     return jnp.pad(out, widths)
 
 
-def pad_axis_to(A, divisor, *, axis: int = -1):
-    """Zero-pad ``axis`` of ``A`` up to ``round_up(extent, divisor)``.
+class PadAxisResult(NamedTuple):
+    """What :func:`pad_axis` returns.  THE reason it is a named tuple.
 
-    THE mesh-divisibility pad for an array axis, shared by every consumer
-    that has to make an axis divide a device mesh.  Returns
-    ``(A_padded, n_orig)``; a no-op returning the SAME array when the
-    extent already divides, so divisible meshes stay byte-identical.
+    Before 2026-08-22 the tree had TWO mesh-divisibility pad helpers whose
+    second return value was the OPPOSITE extent from the same slot:
+    ``runtime.padding.pad_axis_to`` returned the LOGICAL extent,
+    ``bse.bse_window._pad_axis_to_multiple`` returned the PADDED one.  Both
+    were spelled ``A, n = helper(...)``, so a call site copied from the
+    wrong neighbour compiles, runs, and is wrong only when the extent was
+    not already a mesh multiple — invisible on every mesh-divisible
+    validated run.  That wrong answer already happened once in the BSE
+    (the comment recording it is in this file's git history).
 
-    Two established uses, and they are the same arithmetic:
+    So the arithmetic is single-sourced AND the ambiguity is removed at the
+    same time, which is the only safe way to unify the two: a caller has to
+    write ``.logical`` or ``.padded``.  Silently swapping either helper's
+    single return would have reintroduced the bug rather than fixed it
+    (register row `bse/common`, "Do not swap a single-value return").
+
+    Fields
+    ------
+    array
+        The padded array.  The SAME object when nothing was padded, so
+        divisible extents stay byte-identical.
+    logical
+        The pre-pad extent — how many rows carry data.
+    padded
+        The post-pad extent — ``array.shape[axis]``, and what a sharding
+        divisibility guard (e.g. ``bse_ring_comm``'s ``n_cond_pad % px ==
+        0``) must be handed.
+    """
+
+    array: object
+    logical: int
+    padded: int
+
+
+def pad_axis(A, divisor, *, axis: int = -1, fill: float = 0.0):
+    """Pad ``axis`` of ``A`` up to ``round_up(extent, divisor)``.
+
+    THE mesh-divisibility pad for an array axis — one implementation for
+    every consumer that has to make an axis divide a device mesh.  Returns
+    a :class:`PadAxisResult`; read ``.logical`` or ``.padded`` by name.
+
+    Three established uses, and they are the same arithmetic:
 
     * ``axis=-1`` (:func:`pad_last_axis_to`) — the NRHS pad for
       distributed solves whose block-cyclic RHS descriptor needs
       last-axis divisibility.  Zero RHS columns give zero solution
       columns.
-    * ``axis=1`` — the BAND pad.  ``psi`` is ``(n_k, nb, nspinor,
-      ngkmax)`` and band-flat sharding needs ``nb`` to divide the mesh.
-      Pad bands are ψ = 0, so every quantity linear or bilinear in ψ is
-      exactly zero on them: zero centroid samples in
+    * ``axis=1``, ``fill=0.0`` — the BAND pad.  ``psi`` is ``(n_k, nb,
+      nspinor, ngkmax)`` and band-flat sharding needs ``nb`` to divide the
+      mesh.  Pad bands are ψ = 0, so every quantity linear or bilinear in
+      ψ is exactly zero on them: zero centroid samples in
       ``wfn_transforms.gflat_to_rmu``, zero rows AND columns of
       ⟨m|O|n⟩ in ``common.mtxel_sweep``.  Nothing about the physics
       knows the pad is there.
+    * ``axis=1``, ``fill=±PAD_EPS_GUARD_RY`` — the BSE ε pad.  ε is the
+      diagonal of a diagonalisation, where a ZERO pad is not inert but a
+      wrong number (it puts pad transitions below the optical onset), so
+      the pad zone carries a signed sentinel instead.  ``fill`` is
+      KEYWORD-ONLY for that reason: a positionally-supplied fill lets a
+      call site sign the guard by accident, which is the one way to put
+      pad modes back under the onset.  ``eps_c`` pads ``+guard`` and
+      ``eps_v`` pads ``-guard``.
 
     The band case is not optional at production shapes: ``nb`` must
     divide ``∏ p_a``, and e.g. ``nb = 600`` on an 8×8 mesh does not
@@ -193,15 +252,20 @@ def pad_axis_to(A, divisor, *, axis: int = -1):
     n = int(A.shape[ax])
     n_pad = round_up(n, divisor)
     if n_pad == n:
-        return A, n
+        return PadAxisResult(A, n, n)
     widths = [(0, 0)] * A.ndim
     widths[ax] = (0, n_pad - n)
-    return jnp.pad(A, widths), n
+    return PadAxisResult(
+        jnp.pad(A, widths, mode="constant", constant_values=fill), n, n_pad)
 
 
 def pad_last_axis_to(A, divisor):
-    """``pad_axis_to(A, divisor, axis=-1)`` — kept as the named NRHS spelling."""
-    return pad_axis_to(A, divisor, axis=-1)
+    """``pad_axis(A, divisor, axis=-1)`` — the named NRHS spelling.
+
+    Returns the same :class:`PadAxisResult`; NRHS consumers want
+    ``.logical`` (the real column count to slice back to).
+    """
+    return pad_axis(A, divisor, axis=-1)
 
 
 def mesh_divisor(mesh_or_int) -> int:
@@ -264,7 +328,8 @@ __all__ = [
     "extra_mu_pad",
     "padded_mu_extent",
     "solve_at_logical",
-    "pad_axis_to",
+    "PadAxisResult",
+    "pad_axis",
     "pad_last_axis_to",
     "mesh_divisor",
     "spec_divisor",

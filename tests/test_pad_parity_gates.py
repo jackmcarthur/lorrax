@@ -150,33 +150,128 @@ def test_sentinel_eps_pad_keeps_every_pad_transition_out_of_the_window():
         "reachable from the logical block")
 
 
-def test_pad_axis_to_multiple_fill_is_keyword_only_and_signed():
-    """The seam itself: psi pads 0, eps pads +/-guard, extent is the PADDED one."""
-    from bse.bse_io import _pad_axis_to_multiple, PAD_EPS_GUARD_RY
+def test_pad_axis_fill_is_keyword_only_and_signed():
+    """The seam itself: psi pads 0, eps pads +/-guard, BOTH extents are named.
+
+    ``runtime.padding.pad_axis`` is the single implementation since
+    2026-08-22.  It replaced two helpers whose second tuple element was the
+    OPPOSITE extent from the same slot -- ``pad_axis_to`` returned the
+    LOGICAL one, ``bse_window._pad_axis_to_multiple`` the PADDED one -- and
+    the BSE helper's own comment recorded a wrong answer that came from
+    exactly that confusion.  The repair is not "pick a convention": it is
+    that a caller must NAME which extent it wants.
+    """
+    from runtime.padding import PadAxisResult, pad_axis
+    from bse.bse_io import PAD_EPS_GUARD_RY
 
     x = jnp.ones((2, 3, 5), dtype=jnp.complex128)
-    padded, extent = _pad_axis_to_multiple(x, axis=1, multiple=4)
-    assert extent == 4, "second return must be the PADDED extent (see comment)"
-    assert padded.shape[1] == 4
-    assert np.all(np.asarray(padded)[:, 3:, :] == 0.0), "psi pad must be zero"
+    r = pad_axis(x, 4, axis=1)
+    assert isinstance(r, PadAxisResult)
+    # BOTH extents, and they are DIFFERENT here -- which is the whole case
+    # the old single-value return could not express.
+    assert (r.logical, r.padded) == (3, 4)
+    assert r.array.shape[1] == 4
+    assert np.all(np.asarray(r.array)[:, 3:, :] == 0.0), "psi pad must be zero"
 
     e = jnp.zeros((2, 3), dtype=jnp.float64)
-    ep, _ = _pad_axis_to_multiple(e, axis=1, multiple=4,
-                                  fill=PAD_EPS_GUARD_RY)
-    assert np.all(np.asarray(ep)[:, 3:] == PAD_EPS_GUARD_RY)
-    em, _ = _pad_axis_to_multiple(e, axis=1, multiple=4,
-                                  fill=-PAD_EPS_GUARD_RY)
-    assert np.all(np.asarray(em)[:, 3:] == -PAD_EPS_GUARD_RY)
+    ep = pad_axis(e, 4, axis=1, fill=PAD_EPS_GUARD_RY)
+    assert np.all(np.asarray(ep.array)[:, 3:] == PAD_EPS_GUARD_RY)
+    em = pad_axis(e, 4, axis=1, fill=-PAD_EPS_GUARD_RY)
+    assert np.all(np.asarray(em.array)[:, 3:] == -PAD_EPS_GUARD_RY)
 
     # Keyword-only: a positional fill would let a call site sign the guard
     # by accident, which is the one way to put pad modes back under the
-    # onset.  Make that unspellable.
+    # onset.  Make that unspellable.  ``axis`` is keyword-only too, so a
+    # positional third argument cannot become the fill.
     with pytest.raises(TypeError):
-        _pad_axis_to_multiple(e, 1, 4, PAD_EPS_GUARD_RY)   # noqa: B026
+        pad_axis(e, 4, 1, PAD_EPS_GUARD_RY)   # noqa: B026
 
-    # Divisible extent: unchanged object, no pad, extent == logical.
-    same, ext = _pad_axis_to_multiple(x, axis=1, multiple=3)
-    assert ext == 3 and same is x
+    # Divisible extent: unchanged OBJECT (byte-identical production path),
+    # and the two extents coincide.
+    same = pad_axis(x, 3, axis=1)
+    assert same.logical == 3 and same.padded == 3 and same.array is x
+
+
+def test_pad_axis_is_bit_identical_to_both_helpers_it_replaced():
+    """The A/B that licensed the deletion.  BIT equality, not a tolerance.
+
+    Both deleted bodies are re-stated here VERBATIM (they are four lines
+    each) and driven over the cases that separate them: divisible and
+    indivisible extents, zero and signed fills, complex and real dtypes.
+    The parity class is bit equality because ``jnp.pad`` with a constant is
+    a copy, not an arithmetic operation -- there is no reduction whose
+    blocking could move (contrast the D10 ragged-vs-padded gate, which is
+    1e-12 relative for exactly that reason).
+    """
+    from runtime.padding import pad_axis
+    from bse.bse_io import PAD_EPS_GUARD_RY
+
+    def _deleted_bse_helper(x, axis, multiple, *, fill=0.0):
+        """``bse_window._pad_axis_to_multiple`` -> (padded, PADDED extent)."""
+        size = x.shape[axis]
+        pad = (-size) % multiple
+        if pad == 0:
+            return x, size
+        pad_width = [(0, 0)] * x.ndim
+        pad_width[axis] = (0, pad)
+        return jnp.pad(x, pad_width, mode="constant",
+                       constant_values=fill), size + pad
+
+    def _deleted_runtime_helper(A, divisor, *, axis=-1):
+        """``runtime.padding.pad_axis_to`` -> (padded, LOGICAL extent)."""
+        from runtime.padding import round_up
+        ax = int(axis) % int(A.ndim)
+        n = int(A.shape[ax])
+        n_pad = round_up(n, divisor)
+        if n_pad == n:
+            return A, n
+        widths = [(0, 0)] * A.ndim
+        widths[ax] = (0, n_pad - n)
+        return jnp.pad(A, widths), n
+
+    rng = np.random.default_rng(0)
+    cases = [
+        (jnp.asarray(rng.normal(size=(2, 5, 3))
+                     + 1j * rng.normal(size=(2, 5, 3))), 4, 1, 0.0),
+        (jnp.asarray(rng.normal(size=(2, 8, 3))), 4, 1, 0.0),      # divisible
+        (jnp.asarray(rng.normal(size=(3, 7))), 4, 1, PAD_EPS_GUARD_RY),
+        (jnp.asarray(rng.normal(size=(3, 7))), 4, 1, -PAD_EPS_GUARD_RY),
+        (jnp.asarray(rng.normal(size=(2, 3, 9))), 5, -1, 0.0),     # NRHS pad
+    ]
+    for A, div, axis, fill in cases:
+        new = pad_axis(A, div, axis=axis, fill=fill)
+        old_bse, old_bse_ext = _deleted_bse_helper(
+            A, axis % A.ndim, div, fill=fill)
+        assert np.array_equal(np.asarray(new.array), np.asarray(old_bse)), (
+            f"pad_axis diverged from the BSE helper at {A.shape} / {div}")
+        assert new.padded == old_bse_ext, "PADDED extent moved"
+        if fill == 0.0:
+            old_rt, old_rt_ext = _deleted_runtime_helper(A, div, axis=axis)
+            assert np.array_equal(np.asarray(new.array), np.asarray(old_rt))
+            assert new.logical == old_rt_ext, "LOGICAL extent moved"
+
+
+def test_there_is_exactly_one_mesh_divisibility_pad_helper():
+    """Source gate: the deleted twin must not come back under any name.
+
+    A second helper is not a style problem here -- the two that existed
+    returned opposite extents from the same slot, so a call site copied
+    from the wrong neighbour was wrong ONLY when the extent was not already
+    a mesh multiple.  That is invisible on every mesh-divisible validated
+    run, which is why this is a gate and not a review note.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    hits = []
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # Code tokens only (TASTE 17): the register narrative and the
+        # PadAxisResult docstring both name the dead helper on purpose.
+        code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+        if "def _pad_axis_to_multiple" in code or "def pad_axis_to(" in code:
+            hits.append(str(path.relative_to(src)))
+    assert hits == [], (
+        f"a second mesh-divisibility pad helper is back in {hits}; "
+        "runtime.padding.pad_axis is the one implementation")
 
 
 def test_init_bse_subspace_drops_the_pad_by_count_not_by_value():

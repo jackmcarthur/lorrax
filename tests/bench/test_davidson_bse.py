@@ -74,7 +74,8 @@ def _load_data_and_matvec(
     # than the user-requested n_val / n_cond — otherwise eps_v can be
     # wider than psi_v_X (when n_occ < n_val) and the matvec einsum fails.
     if eqp_file is not None:
-        from bse.bse_io import apply_eqp_corrections, _pad_axis_to_multiple
+        from bse.bse_io import apply_eqp_corrections, PAD_EPS_GUARD_RY
+        from runtime.padding import pad_axis
         n_val_eff = int(data["n_val"])
         n_cond_eff = int(data["n_cond"])
         with h5py.File(restart, "r") as f:
@@ -87,8 +88,16 @@ def _load_data_and_matvec(
         cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond_eff)
         eps_v_new = jnp.asarray(enk_full_np[:, val_idx])
         eps_c_new = jnp.asarray(enk_full_np[:, cond_idx])
-        eps_v_new, _ = _pad_axis_to_multiple(eps_v_new, axis=1, multiple=grid_y)
-        eps_c_new, _ = _pad_axis_to_multiple(eps_c_new, axis=1, multiple=grid_x)
+        # SIGNED sentinel, as at the production --eqp seam
+        # (``bse_window.apply_eqp_and_reslice_bands``).  This bench used a
+        # ZERO fill, which puts pad transitions at DeltaE = 0 -- BELOW the
+        # optical onset, i.e. exactly where Davidson looks -- so its
+        # eigenvalues were contaminated on any deck whose band count was
+        # not already a mesh multiple.
+        eps_v_new = pad_axis(eps_v_new, grid_y, axis=1,
+                             fill=-PAD_EPS_GUARD_RY).array
+        eps_c_new = pad_axis(eps_c_new, grid_x, axis=1,
+                             fill=PAD_EPS_GUARD_RY).array
         data["eps_v"] = eps_v_new
         data["eps_c"] = eps_c_new
 

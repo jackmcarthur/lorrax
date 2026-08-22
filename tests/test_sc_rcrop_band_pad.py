@@ -66,15 +66,15 @@ def test_the_band_divisor_comes_from_the_spec_not_from_the_mesh_axes():
 
 
 def test_the_pad_goes_through_the_shared_helper():
-    """``runtime.padding.pad_axis_to`` -- not a hand-rolled ``jnp.pad``.
+    """``runtime.padding.pad_axis`` -- not a hand-rolled ``jnp.pad``.
 
     The helper is what guarantees the no-op case returns the SAME array,
     which is what makes a divisible nb byte-identical to the pre-pad code.
     A local ``jnp.pad`` would allocate even at zero pad and lose that.
     """
     assert "from runtime.padding import" in _RCROP
-    assert "pad_axis_to(A, band_div, axis=1)" in _RCROP
-    assert "pad_axis_to(A, band_div, axis=2)" in _RCROP
+    assert "pad_axis(A, band_div, axis=1).array" in _RCROP
+    assert "pad_axis(A, band_div, axis=2).array" in _RCROP
     assert "jnp.pad(" not in _RCROP
 
 

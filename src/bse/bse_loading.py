@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from runtime.padding import padded_mu_extent
+from runtime.padding import pad_axis, padded_mu_extent
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
                                     resolve_band_window)
 
@@ -51,7 +51,7 @@ from .bse_densify import (_interpolate_bse_data_to_grid,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
 from .bse_serial import compute_pair_amplitude
-from .bse_window import (PAD_EPS_GUARD_RY, _log0, _pad_axis_to_multiple,
+from .bse_window import (PAD_EPS_GUARD_RY, _log0,
                          _parse_wfn_path, apply_eqp_corrections, resolve_n_occ)
 
 
@@ -1048,12 +1048,15 @@ def load_bse_data_from_restart_sharded(
     if pad_bands:
         # ψ pad = 0 (bilinear ⇒ inert, and it is what decouples the pad
         # block); ε pad = signed sentinel (diagonal of a diagonalisation).
-        psi_v_X, n_val_pad = _pad_axis_to_multiple(psi_v_X, axis=1, multiple=grid_y)
-        psi_c_X, n_cond_pad = _pad_axis_to_multiple(psi_c_X, axis=1, multiple=grid_x)
-        eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y,
-                                         fill=-PAD_EPS_GUARD_RY)
-        eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x,
-                                         fill=PAD_EPS_GUARD_RY)
+        _v = pad_axis(psi_v_X, grid_y, axis=1)
+        _c = pad_axis(psi_c_X, grid_x, axis=1)
+        # ``.padded`` by name: n_val_pad / n_cond_pad are the MESH-ROUNDED
+        # extents (bse_ring_comm asserts ``n_cond_pad % px == 0``), never
+        # the logical band counts.
+        psi_v_X, n_val_pad = _v.array, _v.padded
+        psi_c_X, n_cond_pad = _c.array, _c.padded
+        eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
+        eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
     else:
         n_val_pad = int(psi_v_X.shape[1])
         n_cond_pad = int(psi_c_X.shape[1])
@@ -1339,12 +1342,13 @@ def _load_ring_subset(
 
     psi_v = _pad_last_axis(psi_v, n_rmu_pad)
     psi_c = _pad_last_axis(psi_c, n_rmu_pad)
-    psi_v, n_val_pad = _pad_axis_to_multiple(psi_v, axis=1, multiple=py)
-    psi_c, n_cond_pad = _pad_axis_to_multiple(psi_c, axis=1, multiple=px)
-    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=py,
-                                     fill=-PAD_EPS_GUARD_RY)
-    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=px,
-                                     fill=PAD_EPS_GUARD_RY)
+    _v = pad_axis(psi_v, py, axis=1)
+    _c = pad_axis(psi_c, px, axis=1)
+    # ``.padded`` by name -- see the note at the sharded loader seam.
+    psi_v, n_val_pad = _v.array, _v.padded
+    psi_c, n_cond_pad = _c.array, _c.padded
+    eps_v = pad_axis(eps_v, py, axis=1, fill=-PAD_EPS_GUARD_RY).array
+    eps_c = pad_axis(eps_c, px, axis=1, fill=PAD_EPS_GUARD_RY).array
     V_q0 = V_qmunu[0]                       # flat-q (nq, μ, μ) post-shim
     V_q0 = _pad_last_two_axes(V_q0, n_rmu_pad)
     if W0_qmunu is not None:

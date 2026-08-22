@@ -279,7 +279,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
-from runtime.padding import pad_axis_to
+from runtime.padding import pad_axis
 
 
 __all__ = [
@@ -956,7 +956,7 @@ def sweep_matrix_elements(
     # exactly zero -- they are not "close to zero", they are the product of
     # an exact zero, so no downstream mask is needed and no tolerance is
     # spent on them.
-    psi, _ = pad_axis_to(psi, geom.p_prod, axis=1)
+    psi = pad_axis(psi, geom.p_prod, axis=1).array
 
     gvecs_j = jnp.asarray(gvecs, dtype=jnp.int32)
     gmask_j = jnp.asarray(gmask, dtype=jnp.float64)
