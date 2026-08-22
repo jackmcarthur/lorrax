@@ -1930,6 +1930,18 @@ class _FfiBackend(_DatasetGeometry):
             return cache[name]
 
         if self._loader.has_phdf5_metadata_api(self._platform()):
+            # DRAIN FIRST.  This route is a COLLECTIVE HDF5 operation — it
+            # routes through the same cached ``H5Dopen`` ``_ds_id`` uses —
+            # where the h5py route below was a local POSIX read.  So it
+            # inherits ``_ds_id``'s hazard verbatim: entering HDF5/MPI-IO
+            # on this file handle while the asynchronous writer thread is
+            # still inside it interleaves MPI's datatype-cache state, and
+            # a rank that opens while a peer writes mismatches the
+            # collective order.  ``read_slab`` / ``read_slabs`` /
+            # ``padded_shape_for`` already drain before reaching here;
+            # ``read_whole`` reaches it directly, which is why the drain
+            # belongs at THIS choke point rather than at each caller.
+            self._drain_pending()
             with _journal.op_scope("attr_r", self.path, stack=_J_FFI,
                                    ds=name, mode=self.mode, handle=self.fh):
                 shape, dtype_name = self._loader.phdf5_dataset_geometry(
@@ -1996,7 +2008,14 @@ class _FfiBackend(_DatasetGeometry):
         FOR SCALARS AND SMALL REPLICATED VECTORS.  See
         ``ffi_loader.phdf5_read_whole``; the payload must be O(1) in the
         design envelope because every rank materialises all of it.
+
+        COLLECTIVE in the same sense as :meth:`read_slab`: the geometry
+        query behind it is a collective ``H5Dopen``, so every rank calls
+        this with the same name, in the same order.  It drains queued
+        writes first for the reasons :meth:`read_slab` lists — nothing
+        here may enter HDF5 while the writer thread is inside it.
         """
+        self._drain_pending()
         shape, ds_dtype = self._dataset_geom(name)
         want = np.dtype(dtype) if dtype is not None else np.dtype(ds_dtype)
         if not self._loader.has_phdf5_metadata_api(self._platform()):
