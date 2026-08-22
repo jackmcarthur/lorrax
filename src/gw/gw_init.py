@@ -2231,12 +2231,34 @@ def prepare_isdf_and_wavefunctions(
 			if jax.process_index() == 0:
 				print0("")
 				print0(gflat_plan.format())
-			if gflat_plan.p_min > mesh_xy.devices.size:
-				print0(f"  [planner] WARNING: rank floor P_min="
-				       f"{gflat_plan.p_min} exceeds the {mesh_xy.devices.size} "
-				       f"ranks in this mesh; the persistent ÷P floor will not "
-				       f"fit the budget (expect OOM).  Add ranks or raise "
-				       f"memory_per_device_gb.")
+			# A plan the planner itself prices as infeasible is a REFUSAL,
+			# not a warning.  The 9x9/626b run printed "244% of budget
+			# (expect OOM)" here, proceeded, and OOMed at the first
+			# z_q_phase (JID 57281385 step .28) — the
+			# instrument-that-measures-and-proceeds class.  An explicit
+			# ``r_chunk_size`` keeps its documented run-level-workaround
+			# authority: with it set, the operator has asserted the
+			# chunking and only the warning prints.
+			_over = (gflat_plan.hwm_bytes > gflat_plan.budget_bytes)
+			_floor_broken = gflat_plan.p_min > mesh_xy.devices.size
+			if _floor_broken or _over:
+				_msg = (
+					f"[planner] the certified plan does not fit: "
+					f"HWM {gflat_plan.hwm_bytes / 1e9:.2f} GB/dev vs budget "
+					f"{gflat_plan.budget_bytes / 1e9:.2f} GB/dev "
+					f"(binder: {gflat_plan.bottleneck})"
+					+ (f"; rank floor P_min={gflat_plan.p_min} exceeds the "
+					   f"{mesh_xy.devices.size} ranks in this mesh — no "
+					   f"chunk choice can shrink the persistent ÷P floor"
+					   if _floor_broken else "")
+					+ ".  Add ranks, raise memory_per_device_gb, or set an "
+					  "explicit r_chunk_size (the register-documented "
+					  "workaround, which bypasses this gate).")
+				if mem.r_chunk_override > 0 and not _floor_broken:
+					print0(f"  {_msg}  Proceeding under the explicit "
+					       f"r_chunk_size={int(mem.r_chunk_override)}.")
+				else:
+					raise ValueError(_msg)
 			chunks = {
 				'band_chunk': int(gflat_plan.band_chunk),
 				'chunk_r': int(gflat_plan.r_chunk),

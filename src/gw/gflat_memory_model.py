@@ -37,6 +37,14 @@ Two-phase picker (§2):
     Phase 2 — choose the four live chunks (band, r, q-solve and G-flat
               accumulation), then report the binding stage across A–F.
 
+Stage-C additions (2026-08-22, planner escapes JID 57269074 / 57281385):
+the pair-density temps are ONE contiguous arena, additionally capped at
+``_ARENA_PLACEMENT_FRAC`` of the post-persistent headroom (placement,
+not sum); the full-BZ ``Z_q`` is charged as LIVE ACROSS the solve seam
+(``solve_t + Z_q``, a sum not a max); and the budget-derived r-chunk cap
+outranks the μ-wide performance floor.  ``r_chunk_override`` still wins
+over all of it — the register-documented run-level workaround.
+
 Bispinor (§1b): the fit loop (A–D) runs the charge channel only — the 3
 transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
 never the binder.  The model carries the spinor factor ``ns² = nspinor²``
@@ -104,6 +112,22 @@ _FFT_CUFFT_FACTOR = 4.0
 # scratch grows non-linearly (cs=1414 OOM'd at production CrI3 80Ry).
 GFLAT_CHUNK_SIZE_CAP = 100
 _GFLAT_CHUNK_FLOOR = 4  # cuFFT plan amortisation
+
+#: Fraction of the post-persistent target headroom the Stage-C pair-density
+#: temp arena may claim as ONE contiguous allocation.  The z_q executable's
+#: temps are placed as a single BFC request of exactly
+#: ``slots · nk · ns² · (μ/p_x) · (cr/p_y) · 16`` bytes — matched to the
+#: byte on both measured failures: 32,470,795,776 B at MoS2 8x8 full-BZ
+#: (JID 57269074 step lx-Xg4-005932, 30.24 GiB refused against a 63.82-GB
+#: pool whose HWM the planner had certified at 54.33 GB) and
+#: 27,262,282,752 B at the naturally-unreduced 9x9 81-q run (JID 57281385
+#: step .28).  In both, the sum fit but the SINGLE arena could not be
+#: placed against the fragmentation the freed Stage-B transients leave
+#: behind (the allocator map shows the free space split around ~44% in
+#: use).  0.80 of the post-persistent headroom is the measured failing
+#: ratio; 0.5 is the margin this model claims, stated as a placement
+#: heuristic rather than shape algebra.
+_ARENA_PLACEMENT_FRAC = 0.5
 
 
 def _factor_mesh(pp: int) -> tuple[int, int]:
@@ -470,13 +494,46 @@ def plan_gflat_chunks(
     # (the gathered band axis), so the two knobs are coupled.
     C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
                              p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
+    # The z_q executable's pair-density temps are ONE contiguous BFC
+    # arena of ``slots`` rank-5 carries; its per-cr slope is priced
+    # separately because it carries a PLACEMENT bound on top of the sum
+    # (see ``_ARENA_PLACEMENT_FRAC``).
+    arena_slope = slots * _c128(nk, ns, ns, mu, shard=p_xy)
     headroom_C = max(target - persistent_total, 0.0)
     if r_chunk_override and r_chunk_override > 0:
+        # The register-documented run-level workaround: an explicit
+        # r_chunk_size wins over every cap below, exactly as before.
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
         r_from_budget = int(headroom_C / C_slope) if C_slope > 0 else n_rtot
-        r_chunk = max(r_lo, min(n_rtot, r_from_budget))
-        r_chunk = max(r_chunk, math.ceil(n_rtot / max_chunks))
+        # Placement cap: the single Stage-C arena must fit the contiguous
+        # headroom, not just the sum.
+        r_from_arena = (int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
+                        if arena_slope > 0 else n_rtot)
+        r_budget_cap = min(r_from_budget, r_from_arena)
+        # Performance floors — chunks at least μ wide, at most
+        # ``max_chunks`` of them.  THE BUDGET OUTRANKS THE FLOORS: until
+        # 2026-08-22 ``r_lo = min(μ, n_rtot)`` silently overrode a
+        # smaller budget-derived width, which is how the 9x9/626b run
+        # was handed r_chunk=5296 (= μ) against a plan its own banner
+        # priced at 244% of budget (JID 57281385 step .28) — the
+        # instrument measured the overrun and proceeded.  A perf floor
+        # that busts the budget is an OOM, not a floor.
+        r_floor_perf = max(r_lo, math.ceil(n_rtot / max_chunks))
+        r_chunk = min(n_rtot, r_floor_perf)
+        if r_budget_cap < r_chunk:
+            capped = max(p_xy, r_budget_cap)
+            _announce(
+                "stage-c-rchunk-budget-cap",
+                f"Stage C r_chunk lowered {r_chunk} -> {capped} by the "
+                f"memory budget (sum cap {r_from_budget}, single-arena "
+                f"placement cap {r_from_arena} at "
+                f"{_ARENA_PLACEMENT_FRAC:.2f}x post-persistent headroom); "
+                f"the mu-wide performance floor does not outrank the "
+                f"budget.  Explicit r_chunk_size overrides this cap")
+            r_chunk = capped
+        else:
+            r_chunk = max(r_chunk, min(n_rtot, r_budget_cap))
         r_chunk = min(r_chunk, n_rtot)
     if p_xy > 1:
         r_chunk = max(p_xy, r_chunk - r_chunk % p_xy)
@@ -537,7 +594,17 @@ def plan_gflat_chunks(
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
     C_fit_t = C_slope * r_chunk
-    C_t = max(C_fit_t, solve_t)
+    # THE Z_q/SOLVE SEAM IS A SUM, NOT A MAX.  ``fit_one_rchunk`` hands
+    # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
+    # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
+    # DIFFERENT sharding, so donation cannot alias and Z_q coexists with
+    # the solve's two RHS stacks.  Whether full q storage is forced
+    # (LORRAX_FORCE_FULL_BZ) or the 81-q mesh is naturally unreduced,
+    # Z_q is built at the full BZ (z_q_from_psi_sm's contract) — the two
+    # measured escapes this seam-charge closes are JID 57269074 step
+    # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
+    zq_live = _c128(nq, mu, r_chunk, shard=p_xy)
+    C_t = max(C_fit_t, solve_t + zq_live)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
     # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit;
     # only ~2 ψ centroid copies are retained.  Transient = V_acc + the ζ
