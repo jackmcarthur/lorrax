@@ -2461,3 +2461,56 @@ misleading exit code.  Prose: `SIGMA_SCALING.md` §9.  The guarding cells are
 `tests/test_jax_profile_section_allowlist.py`, six of them; they pin the
 allowlist's behaviour, including that an empty or whitespace value means
 "unset" rather than "trace nothing", and they say nothing about the segfault.
+
+---
+
+## Found outside the suite — 2026-08-15, branch `feat/band-extrapolation-2026-08-15`
+
+### GN-PPM Σ_c crashes at P = 1: the trivial one-bracket plan slices the wrong axis of `mask_A`
+
+**Not a test cell.** Found by running the ordinary GN-PPM driver on a Si
+4×4×4 SYM/SOC deck (`nband = 28`, `ncond = 8`, 336 centroids) at **one
+process, one GPU**, with `sigma_band_extrapolation` at its default `false`.
+
+```
+File "src/gw/ppm_tau_kernel.py", line 464, in _bracketed
+    G_k = build_g(psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
+                  E_A[:, lo:hi], mask_A[:, lo:hi], E_ref_A, t_node)
+File "src/gw/greens_function_kernel.py", line 151, in build_G_tau
+    mask = jnp.reshape(mask, enk.shape)
+TypeError: cannot reshape array of shape (1, 28, 28) (size 784)
+             into shape (64, 28) (size 1792)
+```
+
+**Mechanism.** `src/gw/greens_function_kernel.py:145-151` already documents
+and normalises the case: on a **1×1** processor mesh the Σ branch delivers
+`mask_A` as `(1, nk, nb)` — the leading `nspin` axis a 2×2 mesh squeezes and a
+1×1 mesh does not. `src/gw/ppm_tau_kernel.py:465` slices that mask as
+`mask_A[:, lo:hi]`, which is correct only for a 2-D `(nk, nb)` mask; on the
+3-D P=1 form it slices the **k** axis instead of the band axis, turning
+`(1, 64, 28)` into `(1, 28, 28)`, and the normalising reshape one frame later
+then has no compatible target. `E_A[:, lo:hi]` on the same line is fine
+because `E_A` really is 2-D.
+
+**Why the default path reaches it.** `src/gw/band_extrapolation.py:210-211`
+returns `trivial_plan(...)` — a **length-1 bracket axis**, not `brackets =
+None` — when `sigma_band_extrapolation` is false, so `_bracketed` runs for
+every deck. `b31687d4`'s claim that "`sigma_band_extrapolation = false` (the
+default) gives the trivial one-bracket plan and the whole path below is
+bit-identical to the un-bracketed code" (`src/gw/ppm_pipeline.py:322-326`)
+holds at P ≥ 4 and **fails at P = 1**, where the un-bracketed code ran and the
+bracketed one raises.
+
+**Scope of this verification.** One deck, one geometry: GN-PPM, P=1/1×1 mesh,
+`sigma_band_extrapolation = false`. The same deck at P=4/2×2 completes, which
+is consistent with the squeeze explanation but does not by itself prove the
+mask shape is the only difference. Not checked: HL-PPM, MPA, the
+`sigma_band_extrapolation = true` path, or P=1 on any other mesh shape.
+
+**Not fixed here** — this session was measuring, not editing. The one-line
+shape normalisation would go next to the slice in `_bracketed`, matching what
+`build_G_tau` already does.
+
+Evidence:
+`/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/03_smallband_gnppm_2026-08-15/logs/lorrax_336c_p1.log`
+(traceback at lines 260-311).
